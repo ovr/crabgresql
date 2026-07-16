@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# internal crates
+crabgresql-executor = { path = "crates/crabgresql-executor" }
+crabgresql-memory-storage = { path = "crates/crabgresql-memory-storage" }
+crabgresql-parser = { path = "crates/crabgresql-parser" }
+crabgresql-protocol = { path = "crates/crabgresql-protocol" }
+crabgresql-storage-api = { path = "crates/crabgresql-storage-api" }
+crabgresql-types = { path = "crates/crabgresql-types" }
+
+# external
+bytes = "1"
+sqlparser = "0.62"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# dev
+tokio-postgres = "0.7"
