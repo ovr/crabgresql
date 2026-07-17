@@ -41,3 +41,24 @@ What exists today:
 
 Tests: `cargo test` — unit tests per crate plus end-to-end tests that drive a
 real driver (tokio-postgres) and raw-socket handshake checks.
+
+## PostgreSQL regression tests
+
+The PostgreSQL regression corpus (`src/test/regress`, pinned to a master
+commit) is vendored under [`vendor/postgres/`](vendor/postgres/README.md) —
+populate or bump it with `scripts/sync-regress.sh`. The pg_regress-style
+runner in `crabgresql-pg-regress` executes the scripts against an in-process
+server, emulating `psql -a -q` output, and diffs against `expected/*.out`:
+
+```console
+$ cargo run -p crabgresql-pg-regress --bin regress            # full schedule (compat %)
+$ cargo run -p crabgresql-pg-regress --bin regress -- --tests boolean,int4
+1 of 245 tests passed (0%).
+See target/regress/regression.diffs for details.
+```
+
+The score is the compatibility dashboard, so a near-zero percentage at M0 is
+expected and honest. Regression protection lives in `cargo test`: the
+crabgresql-authored smoke suite must always pass, plus every upstream test
+promoted to `crates/crabgresql-pg-regress/suites/upstream_must_pass.txt` as
+coverage grows.

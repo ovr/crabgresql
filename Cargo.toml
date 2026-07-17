@@ -12,15 +12,19 @@ license = "Apache-2.0"
 crabgresql-executor = { path = "crates/crabgresql-executor" }
 crabgresql-memory-storage = { path = "crates/crabgresql-memory-storage" }
 crabgresql-parser = { path = "crates/crabgresql-parser" }
+crabgresql-pg-regress = { path = "crates/crabgresql-pg-regress" }
 crabgresql-protocol = { path = "crates/crabgresql-protocol" }
+crabgresql-server = { path = "crates/crabgresql-server" }
 crabgresql-storage-api = { path = "crates/crabgresql-storage-api" }
 crabgresql-types = { path = "crates/crabgresql-types" }
 
 # external
 bytes = "1"
+clap = { version = "4", features = ["derive"] }
+similar = "2"
 sqlparser = "0.62"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

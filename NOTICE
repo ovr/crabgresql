@@ -1,0 +1,12 @@
+CrabgreSQL
+Copyright 2026 the CrabgreSQL authors
+
+This product includes test data from the PostgreSQL regression test suite,
+located under vendor/postgres/. Those files are:
+
+  Copyright (c) 1996-2026, PostgreSQL Global Development Group
+  Copyright (c) 1994, The Regents of the University of California
+
+and are distributed under the PostgreSQL License (see vendor/postgres/COPYRIGHT).
+They are used unmodified, as a test corpus only; no PostgreSQL source code is
+included in this product. See docs/ARCHITECTURE.md §7 for the clean-room policy.
