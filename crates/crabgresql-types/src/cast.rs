@@ -197,9 +197,9 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Numeric(n), PgType::Int2 | PgType::Int4 | PgType::Int8) => numeric_to_int(n, to),
 
         // ---- bit-string → integer (two's-complement of the target width) ----
-        (Value::Bit { len, bits }, PgType::Int2 | PgType::Int4 | PgType::Int8) => {
-            bit_to_int(*len, *bits, to)
-        }
+        // PG has bittoint4/bittoint8 only — there is no bit→smallint cast, so
+        // Int2 falls through to `cannot_coerce` below.
+        (Value::Bit { len, bits }, PgType::Int4 | PgType::Int8) => bit_to_int(*len, *bits, to),
 
         _ => Err(cannot_coerce(from, to)),
     }
@@ -215,10 +215,10 @@ fn numeric_to_f64(n: &NumericVal) -> f64 {
 /// `int2in`/`int4in`/`int8in`: trim, base-10, optional sign. A well-formed
 /// number that does not fit is `22003` (printing the literal); anything else is
 /// `22P02`. The error's type name comes from `ty`, so int2/int4/int8 print
-/// smallint/integer/bigint.
-// TODO: the binder's `parse_unknown` runs the same int input rules with a
-// position; a future refactor could share this acceptor across both.
-fn text_to_int(s: &str, ty: PgType) -> Result<Value, CastError> {
+/// smallint/integer/bigint. Shared with the binder's `parse_unknown`, which
+/// resolves unknown literals through the same acceptor (adding the cursor
+/// position on the `CastError` it returns).
+pub fn text_to_int(s: &str, ty: PgType) -> Result<Value, CastError> {
     use std::num::IntErrorKind;
     let map = |e: std::num::ParseIntError| match e.kind() {
         IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => value_out_of_range(ty, s),
@@ -293,105 +293,97 @@ fn numeric_to_int(n: &NumericVal, ty: PgType) -> Result<Value, CastError> {
     if core.eq_ignore_ascii_case("inf") || core.eq_ignore_ascii_case("infinity") {
         return Err(cannot_convert("infinity", ty));
     }
-    let v = round_decimal(s).map_err(|e| match e {
-        DecimalError::Overflow => out_of_range(ty),
-        // Unreachable for well-formed numerics (NumericVal::parse validated the
-        // text); map to out-of-range rather than invent a message.
-        DecimalError::Malformed => out_of_range(ty),
-    })?;
-    let (lo, hi) = match ty {
-        PgType::Int2 => (i16::MIN as i128, i16::MAX as i128),
-        PgType::Int4 => (i32::MIN as i128, i32::MAX as i128),
-        PgType::Int8 => (i64::MIN as i128, i64::MAX as i128),
+    // `round_decimal` reports every out-of-i128-range magnitude as `Err(())`;
+    // `try_from` then range-checks against the target width. Both map to PG's
+    // bare `<typename> out of range`.
+    let v = round_decimal(s).map_err(|()| out_of_range(ty))?;
+    match ty {
+        PgType::Int2 => i16::try_from(v).map(Value::Int2).map_err(|_| out_of_range(ty)),
+        PgType::Int4 => i32::try_from(v).map(Value::Int4).map_err(|_| out_of_range(ty)),
+        PgType::Int8 => i64::try_from(v).map(Value::Int8).map_err(|_| out_of_range(ty)),
         _ => unreachable!("numeric_to_int called with {ty:?}"),
-    };
-    if v < lo || v > hi {
-        return Err(out_of_range(ty));
     }
-    Ok(match ty {
-        PgType::Int2 => Value::Int2(v as i16),
-        PgType::Int4 => Value::Int4(v as i32),
-        PgType::Int8 => Value::Int8(v as i64),
-        _ => unreachable!(),
-    })
-}
-
-enum DecimalError {
-    Overflow,
-    Malformed,
 }
 
 /// Parse a decimal string (`[±]digits[.digits][(e|E)[±]digits]`) and round to
-/// the nearest integer, ties away from zero, into an `i128`. Overflowing the
-/// `i128` accumulator is reported as `Overflow` (the caller maps it to the
-/// target type's out-of-range error).
-fn round_decimal(s: &str) -> Result<i128, DecimalError> {
+/// the nearest integer, ties away from zero, into an `i128`. Any magnitude that
+/// overflows the `i128` accumulator returns `Err(())` (the caller maps it to the
+/// target type's out-of-range error). The input is a `NumericVal::Finite` text
+/// that `NumericVal::parse` already validated as a finite decimal, but the
+/// exponent it kept verbatim can be arbitrarily large, so this must not panic
+/// or loop unboundedly on e.g. `1e2147483647`.
+fn round_decimal(s: &str) -> Result<i128, ()> {
     let s = s.trim();
     let (neg, s) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, s.strip_prefix('+').unwrap_or(s)),
     };
-    let (mantissa, exp) = match s.split_once(['e', 'E']) {
-        Some((m, e)) => (m, e.parse::<i32>().map_err(|_| DecimalError::Malformed)?),
-        None => (s, 0),
+    let (mantissa, exp_str) = s.split_once(['e', 'E']).unwrap_or((s, ""));
+    // A too-long exponent cannot fit i64; clamp by sign so the `point`
+    // arithmetic below saturates instead of failing. A huge positive exponent
+    // overflows any finite value (unless it is zero); a huge negative one
+    // rounds every value to 0.
+    let exp: i64 = if exp_str.is_empty() {
+        0
+    } else {
+        exp_str
+            .parse::<i64>()
+            .unwrap_or(if exp_str.starts_with('-') { i64::MIN } else { i64::MAX })
     };
     let (int_str, frac_str) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if (int_str.is_empty() && frac_str.is_empty())
-        || !int_str.bytes().all(|b| b.is_ascii_digit())
-        || !frac_str.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(DecimalError::Malformed);
-    }
-    let digits: Vec<u8> = int_str
-        .bytes()
-        .chain(frac_str.bytes())
-        .map(|b| b - b'0')
-        .collect();
-    // The decimal point sits after `int_str` digits, shifted by the exponent.
-    let point = int_str.len() as i32 + exp;
+    let int_bytes = int_str.as_bytes();
+    let frac_bytes = frac_str.as_bytes();
+    let digit = |i: usize| -> i128 {
+        // Read the i-th significant digit (integer part then fraction) as 0..=9.
+        (if i < int_bytes.len() {
+            int_bytes[i] - b'0'
+        } else {
+            frac_bytes[i - int_bytes.len()] - b'0'
+        }) as i128
+    };
+    let total_digits = (int_bytes.len() + frac_bytes.len()) as i64;
+    // The decimal point sits after `int_str` digits, shifted by the exponent
+    // (i64, saturating — `int_str.len()` is tiny, `exp` is already clamped).
+    let point = (int_str.len() as i64).saturating_add(exp);
 
-    // Accumulate the integer part (indices 0..point), padding with zeros when
-    // the exponent pushes the point past the available digits.
+    // Integer value = the significant digits that fall before `point`, times
+    // 10 for each trailing-zero place the exponent pushed the point past.
+    let significant = point.clamp(0, total_digits);
     let mut acc: i128 = 0;
-    for i in 0..point.max(0) {
-        let d = digits.get(i as usize).copied().unwrap_or(0) as i128;
-        acc = acc
-            .checked_mul(10)
-            .and_then(|a| a.checked_add(d))
-            .ok_or(DecimalError::Overflow)?;
+    for i in 0..significant {
+        acc = acc.checked_mul(10).and_then(|a| a.checked_add(digit(i as usize))).ok_or(())?;
+    }
+    // Apply the padding factors only when the value is nonzero: a nonzero acc
+    // overflows the i128 within ~39 steps (bounded); a zero acc stays zero, so
+    // an astronomically large exponent (`0e2000000000`) can't spin the loop.
+    if acc != 0 {
+        for _ in 0..(point - total_digits).max(0) {
+            acc = acc.checked_mul(10).ok_or(())?;
+        }
     }
     // Round: the first dropped fractional digit decides (ties away from zero,
     // so any first digit >= 5 rounds the magnitude up).
-    let first_frac = if point < 0 {
-        0
+    let first_frac = if (0..total_digits).contains(&point) {
+        digit(point as usize)
     } else {
-        digits.get(point as usize).copied().unwrap_or(0)
+        0
     };
     if first_frac >= 5 {
-        acc = acc.checked_add(1).ok_or(DecimalError::Overflow)?;
+        acc = acc.checked_add(1).ok_or(())?;
     }
     Ok(if neg { -acc } else { acc })
 }
 
 /// Reinterpret a right-aligned bit string as the target integer's two's
 /// complement. A bit string wider than the target errors (`<typename> out of
-/// range`), matching PG's `bittoint4`/`bittoint8`.
+/// range`), matching PG's `bittoint4`/`bittoint8` (there is no bittoint2).
 fn bit_to_int(len: u16, bits: u64, ty: PgType) -> Result<Value, CastError> {
-    let width = match ty {
-        PgType::Int2 => 16,
-        PgType::Int4 => 32,
-        PgType::Int8 => 64,
+    match ty {
+        PgType::Int4 if len <= 32 => Ok(Value::Int4(bits as u32 as i32)),
+        PgType::Int8 if len <= 64 => Ok(Value::Int8(bits as i64)),
+        PgType::Int4 | PgType::Int8 => Err(out_of_range(ty)),
         _ => unreachable!("bit_to_int called with {ty:?}"),
-    };
-    if len as u32 > width {
-        return Err(out_of_range(ty));
     }
-    Ok(match ty {
-        PgType::Int2 => Value::Int2(bits as u16 as i16),
-        PgType::Int4 => Value::Int4(bits as u32 as i32),
-        PgType::Int8 => Value::Int8(bits as i64),
-        _ => unreachable!(),
-    })
 }
 
 #[cfg(test)]
@@ -552,6 +544,32 @@ mod tests {
         assert_eq!(e.message, "cannot convert infinity to smallint");
     }
 
+    // A numeric whose verbatim exponent is astronomically large must not panic
+    // (i32 overflow) or hang (unbounded padding loop) — it either overflows the
+    // integer or, being effectively zero, rounds to 0. Regression for the
+    // '1e2147483647'::numeric::int4 crash.
+    #[test]
+    fn numeric_to_int_huge_exponent_does_not_panic_or_hang() {
+        // Nonzero mantissa, huge positive exponent → out of range (bounded).
+        let e = cast(numeric("1e2147483647"), PgType::Int4).unwrap_err();
+        assert_eq!(e.sqlstate, "22003");
+        assert_eq!(e.message, "integer out of range");
+        // Exponent too large even for i64 → still bounded, still out of range.
+        assert_eq!(
+            cast(numeric("1e99999999999999999999"), PgType::Int8).unwrap_err().message,
+            "bigint out of range"
+        );
+        // Zero mantissa with a huge exponent is 0 — the padding loop must be
+        // skipped rather than spun ~2 billion times.
+        assert_eq!(cast(numeric("0e2000000000"), PgType::Int4).unwrap(), Value::Int4(0));
+        // Huge negative exponent rounds every value to 0.
+        assert_eq!(cast(numeric("1e-2000000000"), PgType::Int4).unwrap(), Value::Int4(0));
+        assert_eq!(
+            cast(numeric("1e-99999999999999999999"), PgType::Int4).unwrap(),
+            Value::Int4(0)
+        );
+    }
+
     #[test]
     fn bit_to_int_reinterprets_width() {
         assert_eq!(cast(Value::Bit { len: 3, bits: 0b101 }, PgType::Int4).unwrap(), Value::Int4(5));
@@ -566,10 +584,23 @@ mod tests {
             cast(Value::Bit { len: 16, bits: 0x8000 }, PgType::Int4).unwrap(),
             Value::Int4(32768)
         );
+        // int8 keeps the same reinterpret semantics.
+        assert_eq!(
+            cast(Value::Bit { len: 64, bits: u64::MAX }, PgType::Int8).unwrap(),
+            Value::Int8(-1)
+        );
         // Wider than the target → out of range.
         let e = cast(Value::Bit { len: 40, bits: 1 }, PgType::Int4).unwrap_err();
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(e.message, "integer out of range");
+    }
+
+    #[test]
+    fn bit_to_smallint_is_rejected() {
+        // PG has bittoint4/bittoint8 but no bit→smallint cast.
+        let e = cast(Value::Bit { len: 3, bits: 0b101 }, PgType::Int2).unwrap_err();
+        assert_eq!(e.sqlstate, "42846");
+        assert_eq!(e.message, "cannot cast type bit to smallint");
     }
 
     #[test]

@@ -818,39 +818,15 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             format!("invalid input syntax for type {}: \"{s}\"", ty.name()),
         )
     };
-    // PG's integer input functions distinguish a well-formed number that does
-    // not fit (22003) from malformed input (22P02).
-    let out_of_range = || {
-        BindError::new(
-            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
-            format!("value \"{s}\" is out of range for type {}", ty.name()),
-        )
-    };
-    let int_error = |e: &std::num::ParseIntError| {
-        use std::num::IntErrorKind;
-        match e.kind() {
-            IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => out_of_range(),
-            _ => invalid(),
-        }
-    };
     let float_error = |e: float::FloatParseError| BindError::new(e.sqlstate, e.message);
     match ty {
         PgType::Text => Ok(Value::Text(s.to_string())),
-        PgType::Int2 => s
-            .trim()
-            .parse::<i16>()
-            .map(Value::Int2)
-            .map_err(|e| int_error(&e)),
-        PgType::Int4 => s
-            .trim()
-            .parse::<i32>()
-            .map(Value::Int4)
-            .map_err(|e| int_error(&e)),
-        PgType::Int8 => s
-            .trim()
-            .parse::<i64>()
-            .map(Value::Int8)
-            .map_err(|e| int_error(&e)),
+        // Integer input (trim, base-10, 22003 overflow vs 22P02 malformed) is
+        // the same acceptor the executor's text→int cast uses; share it so the
+        // two never drift. resolve_unknown attaches the cursor position.
+        PgType::Int2 | PgType::Int4 | PgType::Int8 => {
+            cast::text_to_int(s, ty).map_err(|e| BindError::new(e.sqlstate, e.message))
+        }
         PgType::Float4 => float::float4in(s).map(Value::Float4).map_err(float_error),
         PgType::Float8 => float::float8in(s).map(Value::Float8).map_err(float_error),
         PgType::Numeric => NumericVal::parse(s)
