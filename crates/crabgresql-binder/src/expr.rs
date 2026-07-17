@@ -12,7 +12,7 @@
 use crabgresql_parser::{Span, ast};
 use crabgresql_protocol::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema};
-use crabgresql_types::{NumericVal, PgType, Value, cast, float, parse_bool};
+use crabgresql_types::{NumericVal, PgType, Value, cast, float, parse_bool, timestamp};
 
 use crate::BindError;
 use crate::functions::{ScalarFn, bind_function};
@@ -232,6 +232,7 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         } => bind_cast(expr, data_type, scope),
         ast::Expr::TypedString(ts) => bind_typed_string(ts),
         ast::Expr::Function(func) => bind_function(func, scope),
+        ast::Expr::Extract { field, expr, .. } => bind_extract(field, expr, scope),
         other => Err(unsupported_expr(other)),
     }
 }
@@ -321,6 +322,17 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         },
         DataType::Numeric(_) | DataType::Decimal(_) => PgType::Numeric,
         DataType::Bytea => PgType::Bytea,
+        // `timestamp` / `timestamp without time zone` (the precision modifier is
+        // ignored; full microsecond resolution is kept). `with time zone` is a
+        // distinct type we don't have yet.
+        DataType::Timestamp(_, tz) => match tz {
+            ast::TimezoneInfo::None | ast::TimezoneInfo::WithoutTimeZone => PgType::Timestamp,
+            ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz => {
+                return Err(BindError::feature_not_supported(
+                    "timestamp with time zone is not supported yet",
+                ));
+            }
+        },
         DataType::Text | DataType::Varchar(None) | DataType::CharacterVarying(None) => PgType::Text,
         DataType::Varchar(Some(_)) | DataType::CharacterVarying(Some(_)) => {
             return Err(BindError::feature_not_supported(
@@ -366,6 +378,72 @@ fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
         }
     };
     Ok(Binding::Typed(resolve_unknown(lit, span, target)?))
+}
+
+/// `EXTRACT(field FROM ts)`: PG's `date_part`-family sugar that returns
+/// `numeric`. We support it on `timestamp`; the field name is carried as a text
+/// constant argument and validated at run time (unknown units error there,
+/// matching `date_part`).
+fn bind_extract(
+    field: &ast::DateTimeField,
+    expr: &ast::Expr,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let unit = datetime_field_unit(field);
+    let arg = match bind_expr(expr, scope)? {
+        Binding::Typed(e) if e.ty() == PgType::Timestamp => e,
+        Binding::Typed(e) => {
+            return Err(BindError::new(
+                sqlstate::UNDEFINED_FUNCTION,
+                format!(
+                    "function pg_catalog.date_part(unknown, {}) does not exist",
+                    e.ty().name()
+                ),
+            ));
+        }
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Timestamp)?,
+    };
+    Ok(Binding::Typed(BoundExpr::FuncCall {
+        func: ScalarFn::Extract,
+        ret: PgType::Numeric,
+        args: vec![
+            BoundExpr::Const {
+                value: Value::Text(unit),
+                ty: PgType::Text,
+            },
+            arg,
+        ],
+    }))
+}
+
+/// The canonical unit string for an EXTRACT field, lowercased. Unknown/unusual
+/// spellings fall back to the parser's rendering (also lowercased), leaving the
+/// run-time `date_part` to reject truly unrecognized units.
+fn datetime_field_unit(field: &ast::DateTimeField) -> String {
+    use ast::DateTimeField::*;
+    match field {
+        Year | Years => "year",
+        Month | Months => "month",
+        Day | Days => "day",
+        Hour | Hours => "hour",
+        Minute | Minutes => "minute",
+        Second | Seconds => "second",
+        Millisecond | Milliseconds => "milliseconds",
+        Microsecond | Microseconds => "microseconds",
+        Decade => "decade",
+        Century => "century",
+        Millennium | Millenium => "millennium",
+        Quarter => "quarter",
+        Week(_) | Weeks => "week",
+        Dow => "dow",
+        Isodow => "isodow",
+        Doy => "doy",
+        Epoch => "epoch",
+        Isoyear => "isoyear",
+        Julian => "julian",
+        other => return other.to_string().to_lowercase(),
+    }
+    .to_string()
 }
 
 fn bind_compound(parts: &[ast::Ident], scope: &Scope) -> Result<BoundExpr, BindError> {
@@ -611,6 +689,7 @@ fn bind_binary(
                 | PgType::Float8
                 | PgType::Text
                 | PgType::Bytea
+                | PgType::Timestamp
         )
     };
     if !supported {
@@ -833,6 +912,9 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             .map(Value::Numeric)
             .ok_or_else(invalid),
         PgType::Bool => parse_bool(s).map(Value::Bool).ok_or_else(invalid),
+        PgType::Timestamp => timestamp::parse(s)
+            .map(Value::Timestamp)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Bytea | PgType::Bit | PgType::User(_) => Err(invalid()),
     }
 }
@@ -884,6 +966,8 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
             expr, data_type, ..
         } => column_name(expr).unwrap_or_else(|| type_output_name(data_type)),
         ast::Expr::TypedString(ts) => type_output_name(&ts.data_type),
+        // EXTRACT(... ) is named "extract" in PG, regardless of the field.
+        ast::Expr::Extract { .. } => "extract".into(),
         // A function's output column is named after the function.
         ast::Expr::Function(func) => func
             .name

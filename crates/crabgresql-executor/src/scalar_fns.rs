@@ -11,7 +11,7 @@ use std::hint::black_box;
 
 use crabgresql_binder::ScalarFn;
 use crabgresql_protocol::sqlstate;
-use crabgresql_types::{Value, float};
+use crabgresql_types::{Value, float, timestamp};
 
 use crate::ExecError;
 
@@ -52,6 +52,36 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             let value = text(&args[0]);
             let type_name = text(&args[1]);
             return Ok(Value::Bool(soft_input(type_name, value).is_ok()));
+        }
+        ScalarFn::DatePart => {
+            return timestamp::date_part(text(&args[0]), ts(&args[1]))
+                .map(Value::Float8)
+                .map_err(ts_err);
+        }
+        ScalarFn::Extract => {
+            return timestamp::extract(text(&args[0]), ts(&args[1]))
+                .map(Value::Numeric)
+                .map_err(ts_err);
+        }
+        ScalarFn::DateTrunc => {
+            return timestamp::date_trunc(text(&args[0]), ts(&args[1]))
+                .map(Value::Timestamp)
+                .map_err(ts_err);
+        }
+        ScalarFn::Isfinite => {
+            return Ok(Value::Bool(timestamp::is_finite(ts(&args[0]))));
+        }
+        ScalarFn::MakeTimestamp => {
+            return timestamp::make_timestamp(
+                i4(&args[0]) as i64,
+                i4(&args[1]) as i64,
+                i4(&args[2]) as i64,
+                i4(&args[3]) as i64,
+                i4(&args[4]) as i64,
+                f8(&args[5]),
+            )
+            .map(Value::Timestamp)
+            .map_err(ts_err);
         }
         _ => {}
     }
@@ -107,7 +137,14 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::Acosd => dacosd(a),
         ScalarFn::Atand => Ok(datand(a)),
         ScalarFn::Atan2d => Ok(datan2d(a, f8(&args[1]))),
-        ScalarFn::Float4Send | ScalarFn::Float8Send | ScalarFn::PgInputIsValid => unreachable!(),
+        ScalarFn::Float4Send
+        | ScalarFn::Float8Send
+        | ScalarFn::PgInputIsValid
+        | ScalarFn::DatePart
+        | ScalarFn::Extract
+        | ScalarFn::DateTrunc
+        | ScalarFn::Isfinite
+        | ScalarFn::MakeTimestamp => unreachable!(),
     };
     result.map(Value::Float8)
 }
@@ -388,6 +425,24 @@ fn text(v: &Value) -> &str {
         Value::Text(s) => s,
         other => unreachable!("expected text arg, got {other:?}"),
     }
+}
+
+fn ts(v: &Value) -> i64 {
+    match v {
+        Value::Timestamp(t) => *t,
+        other => unreachable!("expected timestamp arg, got {other:?}"),
+    }
+}
+
+fn i4(v: &Value) -> i32 {
+    match v {
+        Value::Int4(n) => *n,
+        other => unreachable!("expected int4 arg, got {other:?}"),
+    }
+}
+
+fn ts_err(e: timestamp::TimestampError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
 }
 
 #[cfg(test)]

@@ -48,6 +48,16 @@ pub enum ScalarFn {
     Float4Send,
     Float8Send,
     PgInputIsValid,
+    /// `date_part(text, timestamp) -> float8`.
+    DatePart,
+    /// `EXTRACT(field FROM timestamp) -> numeric`; the field is a text arg.
+    Extract,
+    /// `date_trunc(text, timestamp) -> timestamp`.
+    DateTrunc,
+    /// `isfinite(timestamp) -> bool`.
+    Isfinite,
+    /// `make_timestamp(int, int, int, int, int, float8) -> timestamp`.
+    MakeTimestamp,
 }
 
 struct Signature {
@@ -57,6 +67,9 @@ struct Signature {
 }
 
 const F8: PgType = PgType::Float8;
+const TS: PgType = PgType::Timestamp;
+const TEXT: PgType = PgType::Text;
+const I4: PgType = PgType::Int4;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -121,6 +134,26 @@ fn lookup(name: &str) -> &'static [Signature] {
             func: ScalarFn::PgInputIsValid,
             args: &[PgType::Text, PgType::Text],
             ret: PgType::Bool,
+        }],
+        "date_part" => &[Signature {
+            func: ScalarFn::DatePart,
+            args: &[TEXT, TS],
+            ret: F8,
+        }],
+        "date_trunc" => &[Signature {
+            func: ScalarFn::DateTrunc,
+            args: &[TEXT, TS],
+            ret: TS,
+        }],
+        "isfinite" => &[Signature {
+            func: ScalarFn::Isfinite,
+            args: &[TS],
+            ret: PgType::Bool,
+        }],
+        "make_timestamp" => &[Signature {
+            func: ScalarFn::MakeTimestamp,
+            args: &[I4, I4, I4, I4, I4, F8],
+            ret: TS,
         }],
         _ => &[],
     }
