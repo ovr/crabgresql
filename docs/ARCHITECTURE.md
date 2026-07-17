@@ -248,7 +248,7 @@ crates/
   crabgresql-memory-storage  # in-memory engine: API reference, tests, ephemeral
   crabgresql-plpgsql         # PL/pgSQL parser + interpreter
   crabgresql-server          # session, GUCs, wiring it all together; bin: crabgresql
-  crabgresql-testkit         # diff tests against PG, sqllogictest runner
+  crabgresql-pg-regress      # pg_regress-style runner; diff tests against PG
 ```
 
 ## 4. Compatibility verification strategy (this IS the product)

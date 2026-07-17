@@ -1,0 +1,26 @@
+--
+-- ERRORS
+-- Error rendering and session recovery: the connection stays usable after
+-- every kind of failure.
+--
+SELECT * FROM missing;
+ERROR:  relation "missing" does not exist
+SELEC 1;
+ERROR:  sql parser error: Expected: an SQL statement, found: SELEC at Line: 1, Column: 1
+SELECT 1 ORDER BY 1;
+ERROR:  ORDER BY is not supported yet
+SELECT 'still alive' AS status;
+   status    
+-------------
+ still alive
+(1 row)
+
+-- metacommands are not implemented; the runner emits a deterministic stub
+\d crabs
+\d: metacommand not supported by crabgresql regress runner
+SELECT 2 AS after_metacommand;
+ after_metacommand 
+-------------------
+                 2
+(1 row)
+
