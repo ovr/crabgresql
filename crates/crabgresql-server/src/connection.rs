@@ -43,11 +43,12 @@ pub async fn handle_connection(
     // StartupMessage. Cancel requests arrive on their own connection.
     let _params = loop {
         match reader.read_startup().await {
-            Ok(StartupRequest::Ssl) | Ok(StartupRequest::GssEnc) => {
+            Ok(None) => return Ok(()), // clean disconnect before startup
+            Ok(Some(StartupRequest::Ssl)) | Ok(Some(StartupRequest::GssEnc)) => {
                 writer.refuse_encryption().await?;
             }
-            Ok(StartupRequest::Cancel { .. }) => return Ok(()),
-            Ok(StartupRequest::Startup { params }) => break params,
+            Ok(Some(StartupRequest::Cancel { .. })) => return Ok(()),
+            Ok(Some(StartupRequest::Startup { params })) => break params,
             Err(ProtocolError::UnsupportedProtocolVersion(v)) => {
                 writer.error_response(
                     sqlstate::PROTOCOL_VIOLATION,
@@ -100,35 +101,13 @@ pub async fn handle_connection(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     &format!(
                         "protocol message '{}' is not supported yet (only the simple query protocol is implemented)",
-                        frontend_tag(&other) as char
+                        other.tag() as char
                     ),
                 );
                 writer.flush().await?;
                 skip_until_sync = true;
             }
         }
-    }
-}
-
-/// The wire tag byte for a frontend message, for the "not supported yet" error
-/// text. `Query`/`Sync`/`Terminate` are handled before this is reached.
-fn frontend_tag(message: &FrontendMessage) -> u8 {
-    match message {
-        FrontendMessage::Query(_) => b'Q',
-        FrontendMessage::Parse { .. } => b'P',
-        FrontendMessage::Bind { .. } => b'B',
-        FrontendMessage::Describe { .. } => b'D',
-        FrontendMessage::Execute { .. } => b'E',
-        FrontendMessage::Close { .. } => b'C',
-        FrontendMessage::Flush => b'H',
-        FrontendMessage::Sync => b'S',
-        FrontendMessage::PasswordMessage(_) => b'p',
-        FrontendMessage::CopyData(_) => b'd',
-        FrontendMessage::CopyDone => b'c',
-        FrontendMessage::CopyFail(_) => b'f',
-        FrontendMessage::FunctionCall { .. } => b'F',
-        FrontendMessage::Terminate => b'X',
-        FrontendMessage::Unknown { tag, .. } => *tag,
     }
 }
 
@@ -209,11 +188,7 @@ async fn write_result(
         QueryResult::Rows { columns, mut node } => {
             let fields: Vec<FieldDescription> = columns
                 .iter()
-                .map(|c| FieldDescription {
-                    name: c.name.clone(),
-                    type_oid: c.ty.oid(),
-                    type_len: c.ty.typlen(),
-                })
+                .map(|c| FieldDescription::new(c.name.clone(), c.ty.oid(), c.ty.typlen()))
                 .collect();
             writer.row_description(&fields);
             let mut count = 0u64;

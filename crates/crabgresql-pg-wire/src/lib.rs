@@ -26,13 +26,39 @@ pub const SSL_REQUEST_CODE: i32 = 80877103;
 pub const GSSENC_REQUEST_CODE: i32 = 80877104;
 pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 
-/// One column in a `RowDescription` message. Always reports text format and
-/// leaves the table/attribute origin zeroed (no catalog yet).
+/// One column in a `RowDescription` message. Carries every field on the wire so
+/// a client decoding a real server's RowDescription round-trips losslessly; the
+/// server builds query-result columns with [`FieldDescription::new`], which
+/// zeroes the catalog origin and reports text format (no catalog yet).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldDescription {
     pub name: String,
+    /// OID of the table the column belongs to, or 0 if not a simple column ref.
+    pub table_oid: u32,
+    /// Attribute number of the column within its table, or 0 if not a ref.
+    pub column_id: i16,
     pub type_oid: u32,
     pub type_len: i16,
+    /// Type-specific modifier (e.g. `numeric` precision/scale), or -1 if none.
+    pub type_modifier: i32,
+    /// Transfer format of this column's values (text or binary).
+    pub format: Format,
+}
+
+impl FieldDescription {
+    /// A column with no catalog origin: no table/attnum, no type modifier, text
+    /// format. Used for query results before a catalog exists.
+    pub fn new(name: String, type_oid: u32, type_len: i16) -> Self {
+        Self {
+            name,
+            table_oid: 0,
+            column_id: 0,
+            type_oid,
+            type_len,
+            type_modifier: -1,
+            format: Format::Text,
+        }
+    }
 }
 
 /// Transaction status carried in `ReadyForQuery`.

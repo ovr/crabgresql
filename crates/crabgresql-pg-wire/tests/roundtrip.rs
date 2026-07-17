@@ -65,7 +65,7 @@ async fn frontend_messages_survive_the_wire() {
     writer.flush().await.unwrap();
     drop(writer); // close the write half so the final read hits EOF
 
-    assert_eq!(reader.read_startup().await.unwrap(), startup);
+    assert_eq!(reader.read_startup().await.unwrap(), Some(startup));
     for expected in &messages {
         assert_eq!(reader.read_message().await.unwrap().as_ref(), Some(expected));
     }
@@ -88,11 +88,7 @@ async fn backend_messages_survive_the_wire() {
         unrecognized: vec!["_pq_.foo".to_string()],
     });
     writer.ready_for_query(TransactionStatus::Idle);
-    writer.row_description(&[FieldDescription {
-        name: "?column?".to_string(),
-        type_oid: 23,
-        type_len: 4,
-    }]);
+    writer.row_description(&[FieldDescription::new("?column?".to_string(), 23, 4)]);
     writer.data_row(&[Some("1".to_string()), None]);
     writer.write(&BackendMessage::CopyOutResponse(CopyResponse {
         format: Format::Binary,
@@ -124,11 +120,7 @@ async fn backend_messages_survive_the_wire() {
             unrecognized: vec!["_pq_.foo".to_string()],
         },
         BackendMessage::ReadyForQuery(TransactionStatus::Idle),
-        BackendMessage::RowDescription(vec![FieldDescription {
-            name: "?column?".to_string(),
-            type_oid: 23,
-            type_len: 4,
-        }]),
+        BackendMessage::RowDescription(vec![FieldDescription::new("?column?".to_string(), 23, 4)]),
         BackendMessage::DataRow(vec![Some(b"1".to_vec()), None]),
         BackendMessage::CopyOutResponse(CopyResponse {
             format: Format::Binary,

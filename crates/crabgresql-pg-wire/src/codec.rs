@@ -52,12 +52,18 @@ impl<R: AsyncRead + Unpin> FrontendReader<R> {
         Self { inner }
     }
 
-    /// Read one startup-phase packet (it has no tag byte). The caller loops:
-    /// after refusing `Ssl`/`GssEnc` the client sends another startup packet.
-    pub async fn read_startup(&mut self) -> Result<StartupRequest, ProtocolError> {
-        let len = self.inner.read_i32().await? as usize;
+    /// Read one startup-phase packet (it has no tag byte). `None` means the
+    /// client opened the connection and closed it without sending anything —
+    /// a clean disconnect (health checks, port scans), not an error. The caller
+    /// loops: after refusing `Ssl`/`GssEnc` the client sends another packet.
+    pub async fn read_startup(&mut self) -> Result<Option<StartupRequest>, ProtocolError> {
+        let len = match self.inner.read_i32().await {
+            Ok(len) => len as usize,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         let body = read_body(&mut self.inner, len, 8).await?;
-        StartupRequest::decode(&body)
+        Ok(Some(StartupRequest::decode(&body)?))
     }
 
     /// Read one regular (tagged) frontend message. `None` means the client
@@ -70,7 +76,16 @@ impl<R: AsyncRead + Unpin> FrontendReader<R> {
         };
         let len = self.inner.read_i32().await? as usize;
         let body = read_body(&mut self.inner, len, 4).await?;
-        Ok(Some(FrontendMessage::decode(tag, &body)?))
+        // The frame is fully consumed, so the stream stays in sync even when the
+        // body is malformed. Surface a body we can frame but not parse (bad
+        // target/format byte, truncation) as `Unknown` rather than a hard error,
+        // so the server answers it like any unsupported message and keeps the
+        // connection alive. Framing and IO errors above stay fatal.
+        let message = match FrontendMessage::decode(tag, &body) {
+            Ok(message) => message,
+            Err(_) => FrontendMessage::Unknown { tag, body },
+        };
+        Ok(Some(message))
     }
 }
 
@@ -275,7 +290,7 @@ mod tests {
         let bytes = out.to_vec();
 
         let mut reader = FrontendReader::new(bytes.as_slice());
-        match reader.read_startup().await.unwrap() {
+        match reader.read_startup().await.unwrap().unwrap() {
             StartupRequest::Startup { params } => assert_eq!(params["user"], "alice"),
             other => panic!("unexpected: {other:?}"),
         }
@@ -287,10 +302,30 @@ mod tests {
 
     #[tokio::test]
     async fn clean_eof_is_none_both_directions() {
+        // A client that connects and closes without sending is a clean
+        // disconnect at every read entry point, not an error.
         let mut fr = FrontendReader::new(&[][..]);
+        assert!(fr.read_startup().await.unwrap().is_none());
         assert!(fr.read_message().await.unwrap().is_none());
         let mut br = BackendReader::new(&[][..]);
         assert!(br.read_message().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_extended_body_becomes_unknown_not_error() {
+        // A Bind ('B') whose body is truncated must not fail the read (which
+        // would drop the connection); the frame is consumed and the message is
+        // surfaced as Unknown so the server can answer it and stay alive.
+        let mut out = BytesMut::new();
+        out.put_u8(b'B');
+        out.put_i32(4 + 3); // length covers itself + 3 body bytes
+        out.put_slice(b"xyz"); // not a valid Bind body
+        let bytes = out.to_vec();
+        let mut reader = FrontendReader::new(bytes.as_slice());
+        match reader.read_message().await.unwrap().unwrap() {
+            FrontendMessage::Unknown { tag, .. } => assert_eq!(tag, b'B'),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[tokio::test]

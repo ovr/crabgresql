@@ -113,6 +113,20 @@ impl<'a> Reader<'a> {
             Ok(Some(self.take(len as usize)?.to_vec()))
         }
     }
+
+    /// A non-negative `i16` element count. A negative value is a malformed or
+    /// oversized (wrapped past `i16::MAX`) message; reject it rather than
+    /// clamping to 0, which would silently drop the elements and then misread
+    /// the rest of the body.
+    fn count(&mut self) -> Result<usize, ProtocolError> {
+        let n = self.i16()?;
+        if n < 0 {
+            return Err(ProtocolError::Malformed(format!(
+                "negative element count {n}"
+            )));
+        }
+        Ok(n as usize)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,12 +194,25 @@ fn put_format_list(body: &mut BytesMut, formats: &[Format]) {
 }
 
 fn read_format_list(r: &mut Reader) -> Result<Vec<Format>, ProtocolError> {
-    let count = r.i16()?.max(0) as usize;
+    let count = r.count()?;
     let mut formats = Vec::with_capacity(count);
     for _ in 0..count {
         formats.push(Format::from_i16(r.i16()?)?);
     }
     Ok(formats)
+}
+
+/// Append a length-prefixed optional value: `i32` length then the bytes, with
+/// `None` written as length -1 (SQL NULL / "no value"). Mirrors the read side,
+/// [`Reader::opt_bytes`].
+fn put_opt_bytes(buf: &mut BytesMut, value: Option<&[u8]>) {
+    match value {
+        None => buf.put_i32(-1),
+        Some(bytes) => {
+            buf.put_i32(bytes.len() as i32);
+            buf.put_slice(bytes);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,84 +532,99 @@ pub enum FrontendMessage {
 }
 
 impl FrontendMessage {
+    /// The wire tag byte for this message. Single source of truth for the
+    /// variant→tag mapping, used by both [`encode`](Self::encode) and callers
+    /// that need the tag without serializing (e.g. an "unsupported message"
+    /// error).
+    pub fn tag(&self) -> u8 {
+        match self {
+            FrontendMessage::Query(_) => b'Q',
+            FrontendMessage::Parse { .. } => b'P',
+            FrontendMessage::Bind { .. } => b'B',
+            FrontendMessage::Describe { .. } => b'D',
+            FrontendMessage::Execute { .. } => b'E',
+            FrontendMessage::Close { .. } => b'C',
+            FrontendMessage::Flush => b'H',
+            FrontendMessage::Sync => b'S',
+            FrontendMessage::PasswordMessage(_) => b'p',
+            FrontendMessage::CopyData(_) => b'd',
+            FrontendMessage::CopyDone => b'c',
+            FrontendMessage::CopyFail(_) => b'f',
+            FrontendMessage::FunctionCall { .. } => b'F',
+            FrontendMessage::Terminate => b'X',
+            FrontendMessage::Unknown { tag, .. } => *tag,
+        }
+    }
+
     /// Append this message, fully framed (tag + length + body).
     pub fn encode(&self, buf: &mut BytesMut) {
+        framed(buf, self.tag(), |b| self.encode_body(b));
+    }
+
+    fn encode_body(&self, b: &mut BytesMut) {
         match self {
-            FrontendMessage::Query(sql) => framed(buf, b'Q', |b| put_cstr(b, sql)),
+            FrontendMessage::Query(sql) => put_cstr(b, sql),
             FrontendMessage::Parse {
                 name,
                 query,
                 param_types,
-            } => framed(buf, b'P', |b| {
+            } => {
                 put_cstr(b, name);
                 put_cstr(b, query);
                 b.put_i16(param_types.len() as i16);
                 for oid in param_types {
                     b.put_u32(*oid);
                 }
-            }),
+            }
             FrontendMessage::Bind {
                 portal,
                 statement,
                 param_formats,
                 params,
                 result_formats,
-            } => framed(buf, b'B', |b| {
+            } => {
                 put_cstr(b, portal);
                 put_cstr(b, statement);
                 put_format_list(b, param_formats);
                 b.put_i16(params.len() as i16);
                 for p in params {
-                    match p {
-                        None => b.put_i32(-1),
-                        Some(bytes) => {
-                            b.put_i32(bytes.len() as i32);
-                            b.put_slice(bytes);
-                        }
-                    }
+                    put_opt_bytes(b, p.as_deref());
                 }
                 put_format_list(b, result_formats);
-            }),
-            FrontendMessage::Describe { target, name } => framed(buf, b'D', |b| {
+            }
+            FrontendMessage::Describe { target, name } => {
                 b.put_u8(target.as_byte());
                 put_cstr(b, name);
-            }),
-            FrontendMessage::Execute { portal, max_rows } => framed(buf, b'E', |b| {
+            }
+            FrontendMessage::Execute { portal, max_rows } => {
                 put_cstr(b, portal);
                 b.put_i32(*max_rows);
-            }),
-            FrontendMessage::Close { target, name } => framed(buf, b'C', |b| {
+            }
+            FrontendMessage::Close { target, name } => {
                 b.put_u8(target.as_byte());
                 put_cstr(b, name);
-            }),
-            FrontendMessage::Flush => framed(buf, b'H', |_| {}),
-            FrontendMessage::Sync => framed(buf, b'S', |_| {}),
-            FrontendMessage::PasswordMessage(data) => framed(buf, b'p', |b| b.put_slice(data)),
-            FrontendMessage::CopyData(data) => framed(buf, b'd', |b| b.put_slice(data)),
-            FrontendMessage::CopyDone => framed(buf, b'c', |_| {}),
-            FrontendMessage::CopyFail(msg) => framed(buf, b'f', |b| put_cstr(b, msg)),
+            }
+            FrontendMessage::Flush | FrontendMessage::Sync | FrontendMessage::CopyDone => {}
+            FrontendMessage::PasswordMessage(data) | FrontendMessage::CopyData(data) => {
+                b.put_slice(data)
+            }
+            FrontendMessage::CopyFail(msg) => put_cstr(b, msg),
             FrontendMessage::FunctionCall {
                 oid,
                 arg_formats,
                 args,
                 result_format,
-            } => framed(buf, b'F', |b| {
+            } => {
                 b.put_u32(*oid);
                 put_format_list(b, arg_formats);
                 b.put_i16(args.len() as i16);
                 for a in args {
-                    match a {
-                        None => b.put_i32(-1),
-                        Some(bytes) => {
-                            b.put_i32(bytes.len() as i32);
-                            b.put_slice(bytes);
-                        }
-                    }
+                    put_opt_bytes(b, a.as_deref());
                 }
                 b.put_i16(result_format.as_i16());
-            }),
-            FrontendMessage::Terminate => framed(buf, b'X', |_| {}),
-            FrontendMessage::Unknown { tag, body } => framed(buf, *tag, |b| b.put_slice(body)),
+            }
+            FrontendMessage::Terminate => {}
+            FrontendMessage::Unknown { body, .. } => b.put_slice(body),
         }
     }
 
@@ -594,7 +636,7 @@ impl FrontendMessage {
             b'P' => {
                 let name = r.cstr()?;
                 let query = r.cstr()?;
-                let count = r.i16()?.max(0) as usize;
+                let count = r.count()?;
                 let mut param_types = Vec::with_capacity(count);
                 for _ in 0..count {
                     param_types.push(r.u32()?);
@@ -609,7 +651,7 @@ impl FrontendMessage {
                 let portal = r.cstr()?;
                 let statement = r.cstr()?;
                 let param_formats = read_format_list(&mut r)?;
-                let param_count = r.i16()?.max(0) as usize;
+                let param_count = r.count()?;
                 let mut params = Vec::with_capacity(param_count);
                 for _ in 0..param_count {
                     params.push(r.opt_bytes()?);
@@ -644,7 +686,7 @@ impl FrontendMessage {
             b'F' => {
                 let oid = r.u32()?;
                 let arg_formats = read_format_list(&mut r)?;
-                let arg_count = r.i16()?.max(0) as usize;
+                let arg_count = r.count()?;
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
                     args.push(r.opt_bytes()?);
@@ -820,13 +862,9 @@ impl BackendMessage {
                 put_cstr(b, channel);
                 put_cstr(b, payload);
             }),
-            BackendMessage::FunctionCallResponse(result) => framed(buf, b'V', |b| match result {
-                None => b.put_i32(-1),
-                Some(bytes) => {
-                    b.put_i32(bytes.len() as i32);
-                    b.put_slice(bytes);
-                }
-            }),
+            BackendMessage::FunctionCallResponse(result) => {
+                framed(buf, b'V', |b| put_opt_bytes(b, result.as_deref()))
+            }
         }
     }
 
@@ -854,26 +892,23 @@ impl BackendMessage {
                 BackendMessage::NegotiateProtocolVersion { minor, unrecognized }
             }
             b'T' => {
-                let count = r.i16()?.max(0) as usize;
+                let count = r.count()?;
                 let mut fields = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let name = r.cstr()?;
-                    let _table_oid = r.u32()?;
-                    let _attnum = r.i16()?;
-                    let type_oid = r.u32()?;
-                    let type_len = r.i16()?;
-                    let _typmod = r.i32()?;
-                    let _format = r.i16()?;
                     fields.push(FieldDescription {
-                        name,
-                        type_oid,
-                        type_len,
+                        name: r.cstr()?,
+                        table_oid: r.u32()?,
+                        column_id: r.i16()?,
+                        type_oid: r.u32()?,
+                        type_len: r.i16()?,
+                        type_modifier: r.i32()?,
+                        format: Format::from_i16(r.i16()?)?,
                     });
                 }
                 BackendMessage::RowDescription(fields)
             }
             b'D' => {
-                let count = r.i16()?.max(0) as usize;
+                let count = r.count()?;
                 let mut columns = Vec::with_capacity(count);
                 for _ in 0..count {
                     columns.push(r.opt_bytes()?);
@@ -888,7 +923,7 @@ impl BackendMessage {
             b's' => BackendMessage::PortalSuspended,
             b'n' => BackendMessage::NoData,
             b't' => {
-                let count = r.i16()?.max(0) as usize;
+                let count = r.count()?;
                 let mut oids = Vec::with_capacity(count);
                 for _ in 0..count {
                     oids.push(r.u32()?);
@@ -919,20 +954,21 @@ impl BackendMessage {
 }
 
 /// Encode a RowDescription (`T`). Shared by `BackendMessage` and the
-/// `BackendWriter` convenience method so the layout lives in one place. The
-/// table-oid / attribute-number / typmod / format fields are zeroed (text
-/// format, no catalog origin), matching what the decoder discards.
+/// `BackendWriter` convenience method so the layout lives in one place. Each
+/// field carries its own catalog origin / typmod / format, so a value decoded
+/// from a real server re-encodes to the same bytes; query results built by the
+/// server default those to "no origin / text" via [`FieldDescription::new`].
 pub(crate) fn put_row_description(buf: &mut BytesMut, fields: &[FieldDescription]) {
     framed(buf, b'T', |body| {
         body.put_i16(fields.len() as i16);
         for f in fields {
             put_cstr(body, &f.name);
-            body.put_u32(0); // table oid
-            body.put_i16(0); // attribute number
+            body.put_u32(f.table_oid);
+            body.put_i16(f.column_id);
             body.put_u32(f.type_oid);
             body.put_i16(f.type_len);
-            body.put_i32(-1); // typmod
-            body.put_i16(0); // format: text
+            body.put_i32(f.type_modifier);
+            body.put_i16(f.format.as_i16());
         }
     });
 }
@@ -947,13 +983,7 @@ pub(crate) fn put_data_row<'a>(
     framed(buf, b'D', |body| {
         body.put_i16(columns.len() as i16);
         for col in columns {
-            match col {
-                None => body.put_i32(-1),
-                Some(bytes) => {
-                    body.put_i32(bytes.len() as i32);
-                    body.put_slice(bytes);
-                }
-            }
+            put_opt_bytes(body, col);
         }
     });
 }
@@ -1113,15 +1143,18 @@ mod tests {
             unrecognized: vec!["_pq_.foo".to_string(), "_pq_.bar".to_string()],
         });
         rt_backend(BackendMessage::RowDescription(vec![
+            // A plain query-result column (no catalog origin, text format)...
+            FieldDescription::new("id".to_string(), 23, 4),
+            // ...and a fully-populated column as a real server would send it,
+            // proving table oid / attnum / typmod / binary format all survive.
             FieldDescription {
-                name: "id".to_string(),
-                type_oid: 23,
-                type_len: 4,
-            },
-            FieldDescription {
-                name: "name".to_string(),
-                type_oid: 25,
+                name: "amount".to_string(),
+                table_oid: 16384,
+                column_id: 2,
+                type_oid: 1700, // numeric
                 type_len: -1,
+                type_modifier: 655366, // numeric(10,2)
+                format: Format::Binary,
             },
         ]));
         rt_backend(BackendMessage::DataRow(vec![
