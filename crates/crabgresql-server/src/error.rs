@@ -8,6 +8,9 @@ pub struct PgError {
     /// 5-character SQLSTATE code.
     pub code: &'static str,
     pub message: String,
+    /// 1-based (line, column) of the offending token, when PG reports a cursor
+    /// position. Converted to a wire character offset when the error is sent.
+    pub location: Option<(u64, u64)>,
 }
 
 impl PgError {
@@ -15,6 +18,7 @@ impl PgError {
         Self {
             code,
             message: message.into(),
+            location: None,
         }
     }
 
@@ -39,7 +43,11 @@ impl From<StorageError> for PgError {
 
 impl From<crabgresql_binder::BindError> for PgError {
     fn from(e: crabgresql_binder::BindError) -> Self {
-        Self::new(e.code, e.message)
+        Self {
+            code: e.code,
+            message: e.message,
+            location: e.location,
+        }
     }
 }
 

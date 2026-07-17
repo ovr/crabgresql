@@ -9,10 +9,12 @@ use std::sync::Arc;
 use crabgresql_binder::{bind_delete, bind_insert, bind_query, bind_update};
 use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
 use crabgresql_parser::ast;
+use crabgresql_protocol::sqlstate;
 use crabgresql_storage_api::{Column, StorageError, TableEngine, TableSchema};
 use crabgresql_types::PgType;
 
 use crate::error::PgError;
+use crate::session::Session;
 
 pub enum QueryResult {
     /// A result set, streamed: the caller pulls tuples from the node and
@@ -29,6 +31,7 @@ pub enum QueryResult {
 pub fn execute_statement(
     engine: &Arc<dyn TableEngine>,
     stmt: &ast::Statement,
+    session: &mut Session,
 ) -> Result<QueryResult, PgError> {
     let logical = match stmt {
         ast::Statement::Query(query) => bind_query(engine, query)?,
@@ -36,8 +39,8 @@ pub fn execute_statement(
         ast::Statement::Update(update) => bind_update(engine, update)?,
         ast::Statement::Delete(delete) => bind_delete(engine, delete)?,
         ast::Statement::CreateTable(create) => return execute_create_table(engine, create),
-        // Accepted and ignored for driver compatibility (no GUC store yet).
-        ast::Statement::Set(_) => return Ok(QueryResult::Command { tag: "SET".into() }),
+        ast::Statement::Set(set) => return apply_set(set, session),
+        ast::Statement::Reset(reset) => return apply_reset(reset, session),
         other => {
             return Err(PgError::feature_not_supported(format!(
                 "statement is not supported yet: {}",
@@ -45,7 +48,7 @@ pub fn execute_statement(
             )));
         }
     };
-    let result = match execute(crabgresql_planner::plan(logical))? {
+    let result = match execute(crabgresql_planner::plan(logical), session.exec_context())? {
         Execution::Rows { columns, node } => QueryResult::Rows { columns, node },
         Execution::Inserted(n) => QueryResult::Command {
             tag: format!("INSERT 0 {n}"),
@@ -58,6 +61,86 @@ pub fn execute_statement(
         },
     };
     Ok(result)
+}
+
+/// `SET`: only `extra_float_digits` is honored; other GUCs are accepted and
+/// ignored (driver compatibility), as before.
+fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgError> {
+    if let ast::Set::SingleAssignment {
+        variable, values, ..
+    } = set
+        && single_ident_lower(variable).as_deref() == Some("extra_float_digits")
+    {
+        let v = set_value_to_i32(values)?;
+        if !(-15..=3).contains(&v) {
+            return Err(PgError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!(
+                    "{v} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)"
+                ),
+            ));
+        }
+        session.extra_float_digits = v;
+    }
+    Ok(QueryResult::Command { tag: "SET".into() })
+}
+
+/// `RESET extra_float_digits` / `RESET ALL` restore the default (1).
+fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<QueryResult, PgError> {
+    let reset_efd = match &reset.reset {
+        ast::Reset::ALL => true,
+        ast::Reset::ConfigurationParameter(name) => {
+            single_ident_lower(name).as_deref() == Some("extra_float_digits")
+        }
+    };
+    if reset_efd {
+        session.extra_float_digits = 1;
+    }
+    Ok(QueryResult::Command {
+        tag: "RESET".into(),
+    })
+}
+
+/// A single-part object name, lowercased (GUC names are case-insensitive).
+fn single_ident_lower(name: &ast::ObjectName) -> Option<String> {
+    if name.0.len() != 1 {
+        return None;
+    }
+    name.0[0].as_ident().map(normalize_ident)
+}
+
+fn set_value_to_i32(exprs: &[ast::Expr]) -> Result<i32, PgError> {
+    let [expr] = exprs else {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "parameter \"extra_float_digits\" requires an integer value",
+        ));
+    };
+    parse_i32_expr(expr).ok_or_else(|| {
+        PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "parameter \"extra_float_digits\" requires an integer value",
+        )
+    })
+}
+
+fn parse_i32_expr(expr: &ast::Expr) -> Option<i32> {
+    match expr {
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::Number(n, _) => n.parse().ok(),
+            ast::Value::SingleQuotedString(s) => s.trim().parse().ok(),
+            _ => None,
+        },
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => parse_i32_expr(expr).map(|v| -v),
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Plus,
+            expr,
+        } => parse_i32_expr(expr),
+        _ => None,
+    }
 }
 
 fn statement_kind(stmt: &ast::Statement) -> String {
@@ -125,24 +208,8 @@ fn execute_create_table(
     })
 }
 
+/// Shared with cast/typed-literal binding, so CREATE TABLE and `::` casts agree
+/// on the type name mapping.
 fn map_data_type(dt: &ast::DataType) -> Result<PgType, PgError> {
-    use ast::DataType;
-    Ok(match dt {
-        DataType::Bool | DataType::Boolean => PgType::Bool,
-        DataType::Int(_) | DataType::Integer(_) | DataType::Int4(_) => PgType::Int4,
-        DataType::BigInt(_) | DataType::Int8(_) => PgType::Int8,
-        DataType::Text | DataType::Varchar(None) | DataType::CharacterVarying(None) => PgType::Text,
-        // Accepting varchar(n) without enforcing the length (22001) would
-        // silently store over-long values; reject until typmod exists.
-        DataType::Varchar(Some(_)) | DataType::CharacterVarying(Some(_)) => {
-            return Err(PgError::feature_not_supported(
-                "varchar length limits are not supported yet",
-            ));
-        }
-        other => {
-            return Err(PgError::feature_not_supported(format!(
-                "type \"{other}\" is not supported yet"
-            )));
-        }
-    })
+    crabgresql_binder::map_data_type(dt).map_err(PgError::from)
 }

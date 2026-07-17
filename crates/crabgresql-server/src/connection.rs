@@ -10,8 +10,8 @@ use crabgresql_protocol::{
 use crabgresql_storage_api::TableEngine;
 use tokio::net::TcpStream;
 
-use crate::error::PgError;
 use crate::query::{QueryResult, execute_statement};
+use crate::session::Session;
 
 /// Fake backend pids for BackendKeyData: every connection needs a distinct
 /// one, but there are no processes to kill yet (cancel lands with M1+).
@@ -69,6 +69,10 @@ pub async fn handle_connection(
     writer.ready_for_query(TransactionStatus::Idle);
     writer.flush().await?;
 
+    // Per-connection session state (GUCs). A fresh connection resets them,
+    // matching how the regression runner gives each test its own session.
+    let mut session = Session::new();
+
     // After an error on an extended-protocol message, PG discards everything
     // until Sync and only then sends ReadyForQuery — one error, one RFQ per
     // Parse..Sync batch, or the driver's state machine desyncs.
@@ -83,7 +87,7 @@ pub async fn handle_connection(
             }
             Some(_) if skip_until_sync => {}
             Some(FrontendMessage::Query(sql)) => {
-                run_simple_query(&sql, &engine, &mut writer).await?;
+                run_simple_query(&sql, &engine, &mut session, &mut writer).await?;
                 // No transactions yet, so the session is always idle.
                 writer.ready_for_query(TransactionStatus::Idle);
                 writer.flush().await?;
@@ -114,6 +118,7 @@ const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 async fn run_simple_query(
     sql: &str,
     engine: &Arc<dyn TableEngine>,
+    session: &mut Session,
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
 ) -> Result<(), ProtocolError> {
     let statements = match crabgresql_parser::parse(sql) {
@@ -128,19 +133,36 @@ async fn run_simple_query(
         return Ok(());
     }
     for stmt in &statements {
-        match execute_statement(engine, stmt) {
+        let efd = session.extra_float_digits;
+        match execute_statement(engine, stmt, session) {
             Ok(result) => {
-                if write_result(writer, result).await? == WriteOutcome::Errored {
+                if write_result(writer, result, efd).await? == WriteOutcome::Errored {
                     return Ok(());
                 }
             }
-            Err(PgError { code, message }) => {
-                writer.error_response(code, &message);
+            Err(e) => {
+                let position = e.location.map(|(line, col)| char_position(sql, line, col));
+                writer.error_response_at(e.code, &e.message, position);
                 return Ok(());
             }
         }
     }
     Ok(())
+}
+
+/// Convert a 1-based (line, column) span start into the 1-based character
+/// offset the wire `P` field uses (measured over the whole query string). The
+/// runner sends one statement per Query message, so this matches psql's
+/// `LINE n:` rendering.
+fn char_position(sql: &str, line: u64, column: u64) -> usize {
+    let mut offset = 0usize;
+    for (i, text) in sql.split('\n').enumerate() {
+        if (i as u64) + 1 == line {
+            return offset + column as usize;
+        }
+        offset += text.chars().count() + 1; // + newline
+    }
+    offset + column as usize
 }
 
 #[derive(PartialEq, Eq)]
@@ -155,6 +177,7 @@ enum WriteOutcome {
 async fn write_result(
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
     result: QueryResult,
+    efd: i32,
 ) -> Result<WriteOutcome, ProtocolError> {
     match result {
         QueryResult::Command { tag } => writer.command_complete(&tag),
@@ -173,7 +196,7 @@ async fn write_result(
                 match node.next() {
                     Ok(Some(row)) => {
                         let cols: Vec<Option<String>> =
-                            row.iter().map(|v| v.encode_text()).collect();
+                            row.iter().map(|v| v.encode_text_with(efd)).collect();
                         writer.data_row(&cols);
                         count += 1;
                         if writer.buffered() >= STREAM_FLUSH_BYTES {

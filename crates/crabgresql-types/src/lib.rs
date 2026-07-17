@@ -1,32 +1,59 @@
 //! Type system: values and their wire encodings.
 //!
-//! M0 scope: bool / int4 / int8 / text with text-format encoding only.
-//! Binary encodings, numeric, datetime and the cast machinery arrive with M1+.
+//! Scope: bool / int2 / int4 / int8 / float4 / float8 / text with text-format
+//! encoding, plus the minimal `numeric` / `bytea` / `bit` and user-type support
+//! the float regression tests need. `float` and `cast` hold the PG-exact I/O
+//! and cast machinery.
+
+pub mod cast;
+pub mod float;
 
 /// OIDs of built-in types. Must match PostgreSQL's `pg_type.dat` — drivers
 /// hardcode these.
 pub mod oid {
     pub const BOOL: u32 = 16;
+    pub const BYTEA: u32 = 17;
     pub const INT8: u32 = 20;
+    pub const INT2: u32 = 21;
     pub const INT4: u32 = 23;
     pub const TEXT: u32 = 25;
+    pub const FLOAT4: u32 = 700;
+    pub const FLOAT8: u32 = 701;
+    pub const BIT: u32 = 1560;
+    pub const NUMERIC: u32 = 1700;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PgType {
     Bool,
+    Int2,
     Int4,
     Int8,
+    Float4,
+    Float8,
+    Numeric,
     Text,
+    Bytea,
+    Bit,
+    /// A user-defined type (`CREATE TYPE`); values are stored using the
+    /// backing built-in representation, so this only carries the assigned OID.
+    User(u32),
 }
 
 impl PgType {
     pub fn oid(self) -> u32 {
         match self {
             PgType::Bool => oid::BOOL,
+            PgType::Int2 => oid::INT2,
             PgType::Int4 => oid::INT4,
             PgType::Int8 => oid::INT8,
+            PgType::Float4 => oid::FLOAT4,
+            PgType::Float8 => oid::FLOAT8,
+            PgType::Numeric => oid::NUMERIC,
             PgType::Text => oid::TEXT,
+            PgType::Bytea => oid::BYTEA,
+            PgType::Bit => oid::BIT,
+            PgType::User(oid) => oid,
         }
     }
 
@@ -34,18 +61,91 @@ impl PgType {
     pub fn typlen(self) -> i16 {
         match self {
             PgType::Bool => 1,
+            PgType::Int2 => 2,
             PgType::Int4 => 4,
             PgType::Int8 => 8,
-            PgType::Text => -1,
+            PgType::Float4 => 4,
+            PgType::Float8 => 8,
+            PgType::Numeric | PgType::Text | PgType::Bytea | PgType::Bit => -1,
+            PgType::User(_) => -1,
         }
     }
 
+    /// Display name as it appears in error messages (`double precision`, ...).
     pub fn name(self) -> &'static str {
         match self {
             PgType::Bool => "boolean",
+            PgType::Int2 => "smallint",
             PgType::Int4 => "integer",
             PgType::Int8 => "bigint",
+            PgType::Float4 => "real",
+            PgType::Float8 => "double precision",
+            PgType::Numeric => "numeric",
             PgType::Text => "text",
+            PgType::Bytea => "bytea",
+            PgType::Bit => "bit",
+            PgType::User(_) => "user-defined",
+        }
+    }
+
+    /// Catalog `typname` (used for cast-derived column headers): `float4`, not
+    /// `real`. `'NaN'::float4` yields a column named `float4`.
+    pub fn typname(self) -> &'static str {
+        match self {
+            PgType::Bool => "bool",
+            PgType::Int2 => "int2",
+            PgType::Int4 => "int4",
+            PgType::Int8 => "int8",
+            PgType::Float4 => "float4",
+            PgType::Float8 => "float8",
+            PgType::Numeric => "numeric",
+            PgType::Text => "text",
+            PgType::Bytea => "bytea",
+            PgType::Bit => "bit",
+            PgType::User(_) => "user-defined",
+        }
+    }
+
+    pub fn is_numeric(self) -> bool {
+        matches!(
+            self,
+            PgType::Int2
+                | PgType::Int4
+                | PgType::Int8
+                | PgType::Float4
+                | PgType::Float8
+                | PgType::Numeric
+        )
+    }
+}
+
+/// Minimal `numeric`: only the cases these tests reach (`NaN`, decimal text).
+#[derive(Clone, Debug, PartialEq)]
+pub enum NumericVal {
+    NaN,
+    Finite(String),
+}
+
+impl NumericVal {
+    /// Parse `numeric` input text, returning `None` on malformed input (which
+    /// the caller reports as SQLSTATE 22P02). Accepts `NaN`, `±Infinity`, and
+    /// any decimal number; the finite text is kept verbatim (this stub does not
+    /// canonicalize scale).
+    pub fn parse(s: &str) -> Option<NumericVal> {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("nan") {
+            return Some(NumericVal::NaN);
+        }
+        let core = t.strip_prefix(['+', '-']).unwrap_or(t);
+        if core.eq_ignore_ascii_case("inf") || core.eq_ignore_ascii_case("infinity") {
+            return Some(NumericVal::Finite(t.to_string()));
+        }
+        // Use f64 as the syntactic acceptor: it rejects garbage ("abc") while
+        // accepting the decimal/exponent forms numeric allows.
+        if !t.is_empty() && t.parse::<f64>().is_ok() {
+            Some(NumericVal::Finite(t.to_string()))
+        } else {
+            None
         }
     }
 }
@@ -54,9 +154,17 @@ impl PgType {
 pub enum Value {
     Null,
     Bool(bool),
+    Int2(i16),
     Int4(i32),
     Int8(i64),
+    Float4(f32),
+    Float8(f64),
+    Numeric(NumericVal),
     Text(String),
+    Bytea(Vec<u8>),
+    /// A bit-string literal (`x'...'`): `len` bits packed right-aligned in
+    /// `bits`. Only produced by hex literals and consumed by bit→int casts.
+    Bit { len: u16, bits: u64 },
 }
 
 impl Value {
@@ -64,20 +172,48 @@ impl Value {
         match self {
             Value::Null => None,
             Value::Bool(_) => Some(PgType::Bool),
+            Value::Int2(_) => Some(PgType::Int2),
             Value::Int4(_) => Some(PgType::Int4),
             Value::Int8(_) => Some(PgType::Int8),
+            Value::Float4(_) => Some(PgType::Float4),
+            Value::Float8(_) => Some(PgType::Float8),
+            Value::Numeric(_) => Some(PgType::Numeric),
             Value::Text(_) => Some(PgType::Text),
+            Value::Bytea(_) => Some(PgType::Bytea),
+            Value::Bit { .. } => Some(PgType::Bit),
         }
     }
 
-    /// Text-format encoding as sent in `DataRow`; `None` encodes SQL NULL.
+    /// Text-format encoding at the default `extra_float_digits` (1).
     pub fn encode_text(&self) -> Option<String> {
+        self.encode_text_with(1)
+    }
+
+    /// Text-format encoding as sent in `DataRow`; `None` encodes SQL NULL.
+    /// `efd` is `extra_float_digits`, affecting only float output.
+    pub fn encode_text_with(&self, efd: i32) -> Option<String> {
         match self {
             Value::Null => None,
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
+            Value::Int2(v) => Some(v.to_string()),
             Value::Int4(v) => Some(v.to_string()),
             Value::Int8(v) => Some(v.to_string()),
+            Value::Float4(v) => Some(float::fmt_f32(*v, efd)),
+            Value::Float8(v) => Some(float::fmt_f64(*v, efd)),
+            Value::Numeric(NumericVal::NaN) => Some("NaN".to_string()),
+            Value::Numeric(NumericVal::Finite(s)) => Some(s.clone()),
             Value::Text(s) => Some(s.clone()),
+            Value::Bytea(bytes) => {
+                let mut out = String::with_capacity(2 + bytes.len() * 2);
+                out.push_str("\\x");
+                for b in bytes {
+                    out.push_str(&format!("{b:02x}"));
+                }
+                Some(out)
+            }
+            Value::Bit { len, bits } => {
+                Some(format!("{:0width$b}", bits, width = *len as usize))
+            }
         }
     }
 }
@@ -103,5 +239,17 @@ mod tests {
         assert_eq!(PgType::Int8.oid(), 20);
         assert_eq!(PgType::Int4.oid(), 23);
         assert_eq!(PgType::Text.oid(), 25);
+        assert_eq!(PgType::Float4.oid(), 700);
+        assert_eq!(PgType::Float8.oid(), 701);
+        assert_eq!(PgType::Int2.oid(), 21);
+        assert_eq!(PgType::Bytea.oid(), 17);
+    }
+
+    #[test]
+    fn bytea_hex_encoding() {
+        assert_eq!(
+            Value::Bytea(vec![0x00, 0x10, 0x00]).encode_text().as_deref(),
+            Some("\\x001000")
+        );
     }
 }

@@ -5,6 +5,7 @@
 mod connection;
 mod error;
 mod query;
+mod session;
 
 use std::sync::Arc;
 

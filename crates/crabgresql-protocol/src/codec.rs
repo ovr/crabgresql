@@ -218,15 +218,52 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
 
     /// ErrorResponse with severity ERROR. `code` is a 5-char SQLSTATE.
     pub fn error_response(&mut self, code: &str, message: &str) {
-        self.message(b'E', |body| {
+        self.error_like(b'E', "ERROR", code, message, None, None);
+    }
+
+    /// ErrorResponse carrying a cursor position (`P` field, 1-based character
+    /// offset) — rendered by clients as `LINE n: ... ^`.
+    pub fn error_response_at(&mut self, code: &str, message: &str, position: Option<usize>) {
+        self.error_like(b'E', "ERROR", code, message, None, position);
+    }
+
+    /// NoticeResponse (severity NOTICE) with optional DETAIL and position.
+    pub fn notice_response(
+        &mut self,
+        code: &str,
+        message: &str,
+        detail: Option<&str>,
+        position: Option<usize>,
+    ) {
+        self.error_like(b'N', "NOTICE", code, message, detail, position);
+    }
+
+    fn error_like(
+        &mut self,
+        tag: u8,
+        severity: &str,
+        code: &str,
+        message: &str,
+        detail: Option<&str>,
+        position: Option<usize>,
+    ) {
+        self.message(tag, |body| {
             body.put_u8(b'S');
-            put_cstr(body, "ERROR");
+            put_cstr(body, severity);
             body.put_u8(b'V');
-            put_cstr(body, "ERROR");
+            put_cstr(body, severity);
             body.put_u8(b'C');
             put_cstr(body, code);
             body.put_u8(b'M');
             put_cstr(body, message);
+            if let Some(detail) = detail {
+                body.put_u8(b'D');
+                put_cstr(body, detail);
+            }
+            if let Some(position) = position {
+                body.put_u8(b'P');
+                put_cstr(body, &position.to_string());
+            }
             body.put_u8(0);
         });
     }

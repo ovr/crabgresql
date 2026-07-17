@@ -4,6 +4,7 @@
 //! caught by differential testing (docs/ARCHITECTURE.md §1.1).
 
 pub use sqlparser::ast;
+pub use sqlparser::tokenizer::{Location, Span};
 
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;

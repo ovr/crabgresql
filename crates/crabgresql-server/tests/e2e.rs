@@ -160,10 +160,10 @@ async fn integer_out_of_range_on_insert() {
 async fn unsupported_clauses_error_instead_of_silently_dropping() {
     let client = connect(spawn_server().await).await;
     for sql in [
-        "SELECT 1 ORDER BY 1",
         "SELECT 1 LIMIT 1",
         "SELECT 1 GROUP BY 1",
         "SELECT 1 HAVING true",
+        "SELECT DISTINCT 1",
     ] {
         let err = client.simple_query(sql).await.unwrap_err();
         let db_err = err

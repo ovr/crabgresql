@@ -6,22 +6,24 @@
 
 use std::sync::Arc;
 
-use crabgresql_binder::{BoundExpr, LogicalPlan, OutputColumn};
+use crabgresql_binder::{BoundExpr, LogicalPlan, OutputColumn, SortKey};
 use crabgresql_storage_api::TableAm;
 
-/// An executable plan. `Select` describes the SeqScan → Filter → Projection
-/// pipeline the executor builds.
+/// An executable plan. `Select` describes the SeqScan → Filter → Projection →
+/// Sort pipeline the executor builds.
 pub enum PhysicalPlan {
     Values {
         columns: Vec<OutputColumn>,
         rows: Vec<Vec<BoundExpr>>,
         predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
     },
     Select {
         table: Arc<dyn TableAm>,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
     },
     Insert {
         table: Arc<dyn TableAm>,
@@ -44,21 +46,25 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             columns,
             rows,
             predicate,
+            sort,
         } => PhysicalPlan::Values {
             columns,
             rows,
             predicate,
+            sort,
         },
         LogicalPlan::Query {
             table,
             columns,
             projections,
             predicate,
+            sort,
         } => PhysicalPlan::Select {
             table,
             columns,
             projections,
             predicate,
+            sort,
         },
         LogicalPlan::Insert { table, rows } => PhysicalPlan::Insert { table, rows },
         LogicalPlan::Update {
@@ -125,6 +131,7 @@ mod tests {
             columns,
             rows,
             predicate,
+            ..
         } = plan_sql("SELECT 1")
         else {
             panic!("expected Values");
