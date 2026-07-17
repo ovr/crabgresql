@@ -12,7 +12,7 @@
 use crabgresql_parser::{Span, ast};
 use crabgresql_protocol::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema};
-use crabgresql_types::{NumericVal, PgType, Value, cast, float};
+use crabgresql_types::{NumericVal, PgType, Value, cast, float, parse_bool};
 
 use crate::BindError;
 use crate::functions::{ScalarFn, bind_function};
@@ -856,24 +856,8 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Numeric => NumericVal::parse(s)
             .map(Value::Numeric)
             .ok_or_else(invalid),
-        PgType::Bool => parse_bool_text(s).map(Value::Bool).ok_or_else(invalid),
+        PgType::Bool => parse_bool(s).map(Value::Bool).ok_or_else(invalid),
         PgType::Bytea | PgType::Bit | PgType::User(_) => Err(invalid()),
-    }
-}
-
-/// The spellings `boolin` accepts: any unambiguous case-insensitive prefix of
-/// true/false/yes/no/off, exact "on", and "1"/"0" (a bare "o" is ambiguous
-/// between on and off) — trimmed, as in PG.
-fn parse_bool_text(s: &str) -> Option<bool> {
-    let s = s.trim().to_ascii_lowercase();
-    match s.as_str() {
-        "" => None,
-        "1" | "on" => Some(true),
-        "0" => Some(false),
-        _ if "true".starts_with(&s) || "yes".starts_with(&s) => Some(true),
-        _ if "false".starts_with(&s) || "no".starts_with(&s) => Some(false),
-        _ if s.len() >= 2 && "off".starts_with(&s) => Some(false),
-        _ => None,
     }
 }
 
