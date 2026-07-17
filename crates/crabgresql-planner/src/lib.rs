@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crabgresql_binder::{BoundExpr, LogicalPlan, OutputColumn, SortKey};
+use crabgresql_binder::{BoundExpr, LogicalPlan, OutputColumn, SortKey, TableFn};
 use crabgresql_storage_api::TableAm;
 
 /// An executable plan. `Select` describes the SeqScan → Filter → Projection →
@@ -20,6 +20,21 @@ pub enum PhysicalPlan {
     },
     Select {
         table: Arc<dyn TableAm>,
+        columns: Vec<OutputColumn>,
+        projections: Vec<BoundExpr>,
+        predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
+    },
+    Subquery {
+        source: Box<PhysicalPlan>,
+        columns: Vec<OutputColumn>,
+        projections: Vec<BoundExpr>,
+        predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
+    },
+    TableFunction {
+        func: TableFn,
+        args: Vec<BoundExpr>,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -61,6 +76,34 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             sort,
         } => PhysicalPlan::Select {
             table,
+            columns,
+            projections,
+            predicate,
+            sort,
+        },
+        LogicalPlan::Subquery {
+            source,
+            columns,
+            projections,
+            predicate,
+            sort,
+        } => PhysicalPlan::Subquery {
+            source: Box::new(plan(*source)),
+            columns,
+            projections,
+            predicate,
+            sort,
+        },
+        LogicalPlan::TableFunction {
+            func,
+            args,
+            columns,
+            projections,
+            predicate,
+            sort,
+        } => PhysicalPlan::TableFunction {
+            func,
+            args,
             columns,
             projections,
             predicate,

@@ -13,7 +13,7 @@ mod special_fns;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crabgresql_binder::{BoundExpr, SortKey};
+use crabgresql_binder::{BoundExpr, SortKey, TableFn};
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_planner::PhysicalPlan;
 use crabgresql_storage_api::{TableAm, Tid, Tuple};
@@ -94,15 +94,47 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
             projections,
             predicate,
             sort,
+        } => project_pipeline(
+            Box::new(SeqScan::new(&table)),
+            projections,
+            predicate,
+            sort,
+            columns,
+            ctx,
+        ),
+        PhysicalPlan::Subquery {
+            source,
+            columns,
+            projections,
+            predicate,
+            sort,
         } => {
-            let mut node: Box<dyn ExecNode> = Box::new(SeqScan::new(&table));
-            if let Some(predicate) = predicate {
-                node = Box::new(Filter::new(node, predicate, ctx));
-            }
-            node = Box::new(Projection::new(node, projections, ctx));
-            node = maybe_sort(node, sort, &columns)?;
-            Ok(Execution::Rows { columns, node })
+            // Stream the source's rows straight into this level's pipeline. A
+            // single FROM reference needs no materialization; buffering waits
+            // for multi-reference CTEs and joins.
+            let Execution::Rows { node, .. } = execute(*source, ctx)? else {
+                return Err(ExecError::new(
+                    "XX000",
+                    "subquery source did not produce a row set",
+                ));
+            };
+            project_pipeline(node, projections, predicate, sort, columns, ctx)
         }
+        PhysicalPlan::TableFunction {
+            func,
+            args,
+            columns,
+            projections,
+            predicate,
+            sort,
+        } => project_pipeline(
+            Box::new(TableFunctionSource::new(func, args, ctx)),
+            projections,
+            predicate,
+            sort,
+            columns,
+            ctx,
+        ),
         PhysicalPlan::Insert { table, rows } => execute_insert(&table, &rows, ctx),
         PhysicalPlan::Update {
             table,
@@ -111,6 +143,27 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
         } => execute_update(&table, &predicate, &assignments, ctx),
         PhysicalPlan::Delete { table, predicate } => execute_delete(&table, &predicate, ctx),
     }
+}
+
+/// Wrap a source node in the standard `Filter -> Projection -> Sort` tail and
+/// package it as a streamable result set. Shared by table scans, subquery
+/// sources, and set-returning functions (every SELECT-shaped plan with a
+/// projection list).
+fn project_pipeline(
+    source: Box<dyn ExecNode>,
+    projections: Vec<BoundExpr>,
+    predicate: Option<BoundExpr>,
+    sort: Vec<SortKey>,
+    columns: Vec<OutputColumn>,
+    ctx: ExecContext,
+) -> Result<Execution, ExecError> {
+    let mut node = source;
+    if let Some(predicate) = predicate {
+        node = Box::new(Filter::new(node, predicate, ctx));
+    }
+    node = Box::new(Projection::new(node, projections, ctx));
+    node = maybe_sort(node, sort, &columns)?;
+    Ok(Execution::Rows { columns, node })
 }
 
 /// Statement atomicity without a transaction engine: evaluate everything
@@ -217,6 +270,64 @@ impl ExecNode for Values {
             .map(|expr| eval(expr, &[], self.ctx))
             .collect::<Result<_, _>>()?;
         Ok(Some(tuple))
+    }
+}
+
+/// A set-returning function in FROM position. Evaluates its arguments once and
+/// emits the function's rowset. `pg_input_error_info` yields exactly one row.
+pub struct TableFunctionSource {
+    func: TableFn,
+    args: Vec<BoundExpr>,
+    ctx: ExecContext,
+    done: bool,
+}
+
+impl TableFunctionSource {
+    pub fn new(func: TableFn, args: Vec<BoundExpr>, ctx: ExecContext) -> Self {
+        Self {
+            func,
+            args,
+            ctx,
+            done: false,
+        }
+    }
+}
+
+impl ExecNode for TableFunctionSource {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let values = self
+            .args
+            .iter()
+            .map(|expr| eval(expr, &[], self.ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tuple = match self.func {
+            TableFn::PgInputErrorInfo => pg_input_error_info_row(&values),
+        };
+        Ok(Some(tuple))
+    }
+}
+
+/// One row of `pg_input_error_info(value, type_name)`:
+/// `(message, detail, hint, sql_error_code)`. A valid input (or a NULL
+/// argument) yields all-NULL; an invalid one reports the message and SQLSTATE
+/// (detail/hint stay NULL for the types the corpus exercises).
+fn pg_input_error_info_row(args: &[Value]) -> Tuple {
+    let all_null = || vec![Value::Null, Value::Null, Value::Null, Value::Null];
+    let (Value::Text(value), Value::Text(type_name)) = (&args[0], &args[1]) else {
+        return all_null();
+    };
+    match scalar_fns::soft_input(type_name, value) {
+        Ok(()) => all_null(),
+        Err((sqlstate, message)) => vec![
+            Value::Text(message),
+            Value::Null,
+            Value::Null,
+            Value::Text(sqlstate.to_string()),
+        ],
     }
 }
 
@@ -728,5 +839,137 @@ mod tests {
         };
         assert_eq!(n, 2);
         assert_eq!(table.scan().count(), 1);
+    }
+
+    /// Parse → bind → plan → execute a query against a fresh engine.
+    fn run_rows(sql: &str) -> (Vec<OutputColumn>, Vec<Tuple>) {
+        run_rows_on(&(Arc::new(MemoryEngine::new()) as Arc<dyn TableEngine>), sql)
+    }
+
+    /// As [`run_rows`], but against a caller-provided engine (for queries over
+    /// real tables).
+    fn run_rows_on(engine: &Arc<dyn TableEngine>, sql: &str) -> (Vec<OutputColumn>, Vec<Tuple>) {
+        let stmts = crabgresql_parser::parse(sql).unwrap();
+        let crabgresql_parser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected a query");
+        };
+        let logical = crabgresql_binder::bind_query(engine, query).unwrap();
+        let physical = crabgresql_planner::plan(logical);
+        let Execution::Rows { columns, mut node } =
+            execute(physical, ExecContext::default()).unwrap()
+        else {
+            panic!("expected rows");
+        };
+        let mut rows = Vec::new();
+        while let Some(tuple) = node.next().unwrap() {
+            rows.push(tuple);
+        }
+        (columns, rows)
+    }
+
+    #[test]
+    fn pg_input_error_info_reports_range_error() {
+        let (columns, rows) =
+            run_rows("SELECT * FROM pg_input_error_info('1e400', 'float4')");
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Text("\"1e400\" is out of range for type real".into()),
+                Value::Null,
+                Value::Null,
+                Value::Text("22003".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn pg_input_error_info_is_all_null_for_valid_input() {
+        let (_columns, rows) =
+            run_rows("SELECT * FROM pg_input_error_info('34.5', 'float4')");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![Value::Null; 4]);
+    }
+
+    /// A `nums(n int4)` table seeded with 1, 2, 3.
+    fn engine_with_nums() -> Arc<dyn TableEngine> {
+        let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
+        let table = engine
+            .create_table(TableSchema {
+                name: "nums".into(),
+                columns: vec![Column {
+                    name: "n".into(),
+                    ty: PgType::Int4,
+                }],
+            })
+            .unwrap();
+        for n in [1, 2, 3] {
+            table.insert(vec![Value::Int4(n)]);
+        }
+        engine
+    }
+
+    #[test]
+    fn standalone_values_names_columns_and_keeps_rows() {
+        let (columns, rows) = run_rows("VALUES (1), (2), (3)");
+        assert_eq!(columns[0].name, "column1");
+        assert_eq!(columns[0].ty, PgType::Int4);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn values_column_unifies_to_common_type() {
+        // Mixed int4/int8 widens the whole column to int8.
+        let (columns, rows) = run_rows("VALUES (1), (9000000000)");
+        assert_eq!(columns[0].ty, PgType::Int8);
+        assert_eq!(rows[0], vec![Value::Int8(1)]);
+        assert_eq!(rows[1], vec![Value::Int8(9_000_000_000)]);
+    }
+
+    #[test]
+    fn derived_table_projects_and_filters() {
+        let (columns, rows) =
+            run_rows("SELECT y FROM (VALUES (1, 'a'), (2, 'b')) v(x, y) WHERE x > 1");
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "y");
+        assert_eq!(rows, vec![vec![Value::Text("b".into())]]);
+    }
+
+    #[test]
+    fn cte_of_values_is_scannable_by_name() {
+        let (columns, rows) =
+            run_rows("WITH t(x) AS (VALUES (1), (2)) SELECT x FROM t WHERE x = 2");
+        assert_eq!(columns[0].name, "x");
+        assert_eq!(rows, vec![vec![Value::Int4(2)]]);
+    }
+
+    #[test]
+    fn cte_over_table_and_ordering() {
+        let engine = engine_with_nums();
+        let (columns, rows) = run_rows_on(
+            &engine,
+            "WITH big AS (SELECT n FROM nums WHERE n >= 2) SELECT n FROM big ORDER BY 1 DESC",
+        );
+        assert_eq!(columns[0].name, "n");
+        assert_eq!(rows, vec![vec![Value::Int4(3)], vec![Value::Int4(2)]]);
+    }
+
+    #[test]
+    fn derived_table_over_real_table() {
+        let engine = engine_with_nums();
+        let (_columns, rows) = run_rows_on(
+            &engine,
+            "SELECT n FROM (SELECT n FROM nums WHERE n <> 2) s ORDER BY 1",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(1)], vec![Value::Int4(3)]]);
     }
 }

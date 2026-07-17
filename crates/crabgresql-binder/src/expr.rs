@@ -735,6 +735,59 @@ fn unify_types(
     Err(no_operator(lty.name(), op, rty.name()))
 }
 
+/// The common type of two column entries (`VALUES` rows / `UNION` arms),
+/// approximating PG's `select_common_type`: when exactly one side implicitly
+/// casts to the other, the column takes that target (so `real` + `int4` -> `real`,
+/// not `float8`). When neither or both cast implicitly, fall back to numeric
+/// preferred-type promotion (`float8` dominates). This deliberately differs from
+/// `unify_types` (operator resolution), where `real` + `int4` resolves to `float8`.
+fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
+    if a == b {
+        return Some(a);
+    }
+    match (implicit_castable(a, b), implicit_castable(b, a)) {
+        (true, false) => Some(b),
+        (false, true) => Some(a),
+        _ => common_numeric(a, b),
+    }
+}
+
+/// Resolve one column of a multi-row `VALUES` list to a common type and coerce
+/// every cell to it. Untyped literals adapt to the resolved type; a column that
+/// is entirely untyped resolves to `text`, as PG does for unknown `UNION`/
+/// `VALUES` columns. Incompatible concrete types are a `42804` error.
+pub(crate) fn unify_value_column(
+    bindings: Vec<Binding>,
+) -> Result<(PgType, Vec<BoundExpr>), BindError> {
+    let mut common: Option<PgType> = None;
+    for binding in &bindings {
+        if let Binding::Typed(e) = binding {
+            common = Some(match common {
+                None => e.ty(),
+                Some(prev) => merge_types(prev, e.ty()).ok_or_else(|| {
+                    BindError::new(
+                        sqlstate::DATATYPE_MISMATCH,
+                        format!(
+                            "VALUES types {} and {} cannot be matched",
+                            prev.name(),
+                            e.ty().name()
+                        ),
+                    )
+                })?,
+            });
+        }
+    }
+    let ty = common.unwrap_or(PgType::Text);
+    let exprs = bindings
+        .into_iter()
+        .map(|binding| match binding {
+            Binding::Unknown { lit, span } => resolve_unknown(lit, span, ty),
+            Binding::Typed(e) => coerce_expr(e, ty),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((ty, exprs))
+}
+
 /// The common type of two distinct numeric types, following PG's preferred-type
 /// resolution for the cases these tests exercise (float8 dominates; mixed int
 /// widens).
