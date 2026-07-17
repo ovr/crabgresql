@@ -141,6 +141,8 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::Bytea => bytea(l).cmp(bytea(r)),
         // false < true, as in PG.
         PgType::Bool => bool_of(l).cmp(&bool_of(r)),
+        // Microsecond order; the ±infinity sentinels sort naturally.
+        PgType::Timestamp => timestamp_of(l).cmp(&timestamp_of(r)),
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -224,6 +226,13 @@ fn bool_of(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
         other => unreachable!("expected bool, got {other:?}"),
+    }
+}
+
+fn timestamp_of(v: &Value) -> i64 {
+    match v {
+        Value::Timestamp(t) => *t,
+        other => unreachable!("expected timestamp, got {other:?}"),
     }
 }
 
