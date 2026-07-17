@@ -86,6 +86,16 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             .map(Value::Timestamp)
             .map_err(ts_err);
         }
+        // md5(text)/md5(bytea) hash the raw input bytes; both return the
+        // 32-char lowercase hex digest as text.
+        ScalarFn::Md5 => {
+            let bytes = match &args[0] {
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytea(b) => b.as_slice(),
+                other => unreachable!("expected text/bytea arg, got {other:?}"),
+            };
+            return Ok(Value::Text(crate::md5::md5_hex(bytes)));
+        }
         _ => {}
     }
     // The remaining functions are float8 → float8 (or float8×float8 → float8).
@@ -143,6 +153,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::Float4Send
         | ScalarFn::Float8Send
         | ScalarFn::PgInputIsValid
+        | ScalarFn::Md5
         | ScalarFn::DatePart
         | ScalarFn::Extract
         | ScalarFn::DateTrunc

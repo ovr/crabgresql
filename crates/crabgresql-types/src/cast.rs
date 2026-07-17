@@ -206,8 +206,89 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // Int2 falls through to `cannot_coerce` below.
         (Value::Bit { len, bits }, PgType::Int4 | PgType::Int8) => bit_to_int(*len, *bits, to),
 
+        // ---- text → bytea (byteain) ----
+        (Value::Text(s), PgType::Bytea) => byteain(s).map(Value::Bytea),
+
         _ => Err(cannot_coerce(from, to)),
     }
+}
+
+/// `byteain`: parse PG's bytea input syntax into raw bytes. A leading `\x`
+/// selects hex format (an even run of hex digits); otherwise the traditional
+/// escape format applies (`\\` → `\`, `\ooo` octal → that byte, any other byte
+/// literal). Malformed input is `22P02`. Shared with the binder's
+/// `parse_unknown` so the two never drift.
+pub fn byteain(s: &str) -> Result<Vec<u8>, CastError> {
+    let bytes = s.as_bytes();
+    if let Some(hex) = bytes.strip_prefix(b"\\x") {
+        // Hex format: pairs of hex digits, with whitespace between pairs
+        // ignored (matching PG's hex_decode).
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        let mut hi: Option<u8> = None;
+        for &c in hex {
+            if c.is_ascii_whitespace() {
+                // Whitespace is only allowed between pairs, not mid-byte.
+                if hi.is_some() {
+                    return Err(invalid_input(PgType::Bytea, s));
+                }
+                continue;
+            }
+            let nibble = hex_val(c).ok_or_else(|| invalid_input(PgType::Bytea, s))?;
+            match hi.take() {
+                None => hi = Some(nibble),
+                Some(h) => out.push((h << 4) | nibble),
+            }
+        }
+        // A dangling half-byte (odd number of hex digits) is invalid.
+        if hi.is_some() {
+            return Err(invalid_input(PgType::Bytea, s));
+        }
+        return Ok(out);
+    }
+    // Escape format.
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        // A backslash escape: `\\` or `\ooo` (three octal digits).
+        match bytes.get(i + 1) {
+            Some(b'\\') => {
+                out.push(b'\\');
+                i += 2;
+            }
+            Some(&c) if (b'0'..=b'3').contains(&c) => {
+                let (Some(&d1), Some(&d2)) = (bytes.get(i + 2), bytes.get(i + 3)) else {
+                    return Err(invalid_input(PgType::Bytea, s));
+                };
+                let (Some(o0), Some(o1), Some(o2)) =
+                    (octal_val(c), octal_val(d1), octal_val(d2))
+                else {
+                    return Err(invalid_input(PgType::Bytea, s));
+                };
+                out.push((o0 << 6) | (o1 << 3) | o2);
+                i += 4;
+            }
+            _ => return Err(invalid_input(PgType::Bytea, s)),
+        }
+    }
+    Ok(out)
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn octal_val(c: u8) -> Option<u8> {
+    (b'0'..=b'7').contains(&c).then(|| c - b'0')
 }
 
 fn numeric_to_f64(n: &NumericVal) -> f64 {
@@ -394,6 +475,26 @@ fn bit_to_int(len: u16, bits: u64, ty: PgType) -> Result<Value, CastError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byteain_escape_and_hex() {
+        // Plain ASCII (escape format, no backslashes) passes through.
+        assert_eq!(byteain("abc").unwrap(), b"abc");
+        assert_eq!(byteain("").unwrap(), b"");
+        // Escape sequences.
+        assert_eq!(byteain("\\\\").unwrap(), b"\\");
+        assert_eq!(byteain("a\\001b").unwrap(), vec![b'a', 1, b'b']);
+        // Hex format, with whitespace between pairs ignored (matches PG).
+        assert_eq!(byteain("\\xdead").unwrap(), vec![0xde, 0xad]);
+        assert_eq!(byteain("\\xDE AD").unwrap(), vec![0xde, 0xad]);
+        assert_eq!(byteain("\\x").unwrap(), b"");
+        // Malformed input is 22P02.
+        assert_eq!(byteain("\\xabc").unwrap_err().sqlstate, "22P02"); // odd nibbles
+        assert_eq!(byteain("\\xzz").unwrap_err().sqlstate, "22P02"); // non-hex
+        assert_eq!(byteain("\\x a b").unwrap_err().sqlstate, "22P02"); // mid-byte space
+        assert_eq!(byteain("\\9").unwrap_err().sqlstate, "22P02"); // bad escape
+        assert_eq!(byteain("\\").unwrap_err().sqlstate, "22P02"); // dangling backslash
+    }
 
     #[test]
     fn float_to_int_edges() {
