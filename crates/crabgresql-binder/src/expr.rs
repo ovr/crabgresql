@@ -10,7 +10,7 @@
 //! reproduce PG's *observable* behavior, pinned by the regression corpus.
 
 use crabgresql_parser::{Span, ast};
-use crabgresql_protocol::sqlstate;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema};
 use crabgresql_types::{NumericVal, PgType, Value, cast, float, parse_bool};
 

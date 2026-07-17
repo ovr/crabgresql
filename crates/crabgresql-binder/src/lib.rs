@@ -12,7 +12,7 @@ pub use functions::ScalarFn;
 pub use plan::{LogicalPlan, SortKey, bind_delete, bind_insert, bind_query, bind_update};
 
 use crabgresql_parser::Span;
-use crabgresql_protocol::sqlstate;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::StorageError;
 use crabgresql_types::PgType;
 

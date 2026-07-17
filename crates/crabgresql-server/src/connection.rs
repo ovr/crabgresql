@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use crabgresql_protocol::{
+use crabgresql_pg_wire::{
     BackendWriter, FieldDescription, FrontendMessage, FrontendReader, ProtocolError,
     StartupRequest, TransactionStatus, sqlstate,
 };
@@ -92,18 +92,43 @@ pub async fn handle_connection(
                 writer.ready_for_query(TransactionStatus::Idle);
                 writer.flush().await?;
             }
-            Some(FrontendMessage::Unsupported(tag)) => {
+            // The codec decodes the extended-query, COPY and function-call
+            // messages, but the engine only runs the simple-query protocol, so
+            // every other frontend message is answered like an unsupported one.
+            Some(other) => {
                 writer.error_response(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     &format!(
                         "protocol message '{}' is not supported yet (only the simple query protocol is implemented)",
-                        tag as char
+                        frontend_tag(&other) as char
                     ),
                 );
                 writer.flush().await?;
                 skip_until_sync = true;
             }
         }
+    }
+}
+
+/// The wire tag byte for a frontend message, for the "not supported yet" error
+/// text. `Query`/`Sync`/`Terminate` are handled before this is reached.
+fn frontend_tag(message: &FrontendMessage) -> u8 {
+    match message {
+        FrontendMessage::Query(_) => b'Q',
+        FrontendMessage::Parse { .. } => b'P',
+        FrontendMessage::Bind { .. } => b'B',
+        FrontendMessage::Describe { .. } => b'D',
+        FrontendMessage::Execute { .. } => b'E',
+        FrontendMessage::Close { .. } => b'C',
+        FrontendMessage::Flush => b'H',
+        FrontendMessage::Sync => b'S',
+        FrontendMessage::PasswordMessage(_) => b'p',
+        FrontendMessage::CopyData(_) => b'd',
+        FrontendMessage::CopyDone => b'c',
+        FrontendMessage::CopyFail(_) => b'f',
+        FrontendMessage::FunctionCall { .. } => b'F',
+        FrontendMessage::Terminate => b'X',
+        FrontendMessage::Unknown { tag, .. } => *tag,
     }
 }
 

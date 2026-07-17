@@ -8,7 +8,7 @@
 //! float8.
 
 use crabgresql_parser::ast;
-use crabgresql_protocol::sqlstate;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::PgType;
 
 use crate::BindError;
