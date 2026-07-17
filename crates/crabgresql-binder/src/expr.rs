@@ -602,7 +602,21 @@ fn bind_case(
     // Simple CASE evaluates the operand once at run time; we re-bind a clone of
     // it per WHEN to build `operand = value`. That is equivalent because our
     // scalar expressions are pure (no volatile functions reach here yet).
-    let operand = operand.map(|e| bind_expr(e, scope)).transpose()?;
+    //
+    // PG gives an untyped-literal operand its own type before comparing — an
+    // unknown resolves to text (its default), independent of the WHEN values —
+    // so `CASE NULL WHEN 1` is `text = integer` (operator does not exist), not
+    // an attempt to read the operand as integer. Resolve it here to reproduce
+    // that; a typed operand is left as-is.
+    let operand = match operand {
+        None => None,
+        Some(e) => Some(match bind_expr(e, scope)? {
+            Binding::Unknown { lit, span } => {
+                Binding::Typed(resolve_unknown(lit, span, PgType::Text)?)
+            }
+            typed => typed,
+        }),
+    };
 
     // Bind everything in source order (operand, then each WHEN's condition and
     // result, then ELSE) so bind-time errors surface where PG's do.

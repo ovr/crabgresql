@@ -1757,4 +1757,22 @@ mod tests {
         assert_eq!(e.code, "42804");
         assert_eq!(e.message, "CASE types text and integer cannot be matched");
     }
+
+    #[test]
+    fn simple_case_untyped_operand_resolves_to_text() {
+        // PG gives an untyped-literal operand its own type (text) before
+        // comparing, so a NULL or string operand against an integer WHEN value
+        // is `text = integer` (operator does not exist), not a read of the
+        // operand as integer.
+        for sql in [
+            "SELECT CASE NULL WHEN 1 THEN 'a' ELSE 'b' END",
+            "SELECT CASE 'x' WHEN 1 THEN 'a' END",
+        ] {
+            let e = bind_err(sql);
+            assert_eq!(e.code, "42883", "{sql}");
+            assert_eq!(e.message, "operator does not exist: text = integer", "{sql}");
+        }
+        // Two untyped literals still compare as text (unchanged).
+        assert!(bind_one("SELECT CASE 'x' WHEN 'y' THEN 1 ELSE 2 END").is_ok());
+    }
 }
