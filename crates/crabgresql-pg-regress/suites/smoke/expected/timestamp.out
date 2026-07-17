@@ -211,7 +211,33 @@ SELECT date_trunc('day', timestamp 'infinity') AS inf;
  infinity
 (1 row)
 
--- isfinite and make_timestamp
+-- fields of an infinite timestamp: monotonic fields are +/-Infinity, oscillating
+-- fields are NULL
+SELECT date_part('year', timestamp 'infinity') AS year,
+       date_part('month', timestamp 'infinity') AS month,
+       extract(epoch from timestamp '-infinity') AS neg_epoch,
+       extract(day from timestamp 'infinity') AS day;
+   year   | month | neg_epoch | day 
+----------+-------+-----------+-----
+ Infinity |       | -Infinity |    
+(1 row)
+
+-- more input forms: ISO 'T' with an attached zone, and the day-before-month and
+-- full-month-name verbose spellings
+SELECT timestamp '2001-09-22T18:19:20Z' AS zulu,
+       timestamp '2001-09-22T18:19:20-07:00' AS offset;
+        zulu         |       offset        
+---------------------+---------------------
+ 2001-09-22 18:19:20 | 2001-09-22 18:19:20
+(1 row)
+
+SELECT timestamp '10 Feb 1997' AS dmy, timestamp 'February 10 1997' AS full_name;
+         dmy         |      full_name      
+---------------------+---------------------
+ 1997-02-10 00:00:00 | 1997-02-10 00:00:00
+(1 row)
+
+-- isfinite and make_timestamp (24:00:00 rolls to the next day; sec 60 carries)
 SELECT isfinite(timestamp '2001-02-16') AS finite, isfinite(timestamp 'infinity') AS not_finite;
  finite | not_finite 
 --------+------------
@@ -223,6 +249,13 @@ SELECT make_timestamp(2013, 7, 15, 8, 15, 23.5) AS made,
          made          |        whole        
 -----------------------+---------------------
  2013-07-15 08:15:23.5 | 2013-07-15 08:15:23
+(1 row)
+
+SELECT make_timestamp(2013, 7, 15, 24, 0, 0) AS end_of_day,
+       make_timestamp(2013, 7, 15, 8, 15, 60) AS leap;
+     end_of_day      |        leap         
+---------------------+---------------------
+ 2013-07-16 00:00:00 | 2013-07-15 08:16:00
 (1 row)
 
 -- errors: unparseable input is 22007, an unknown unit is 22023; recovery works

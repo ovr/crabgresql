@@ -54,14 +54,17 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             return Ok(Value::Bool(soft_input(type_name, value).is_ok()));
         }
         ScalarFn::DatePart => {
-            return timestamp::date_part(text(&args[0]), ts(&args[1]))
-                .map(Value::Float8)
-                .map_err(ts_err);
+            // `None` is SQL NULL (an oscillating field on ±infinity).
+            return Ok(match timestamp::date_part(text(&args[0]), ts(&args[1])).map_err(ts_err)? {
+                Some(v) => Value::Float8(v),
+                None => Value::Null,
+            });
         }
         ScalarFn::Extract => {
-            return timestamp::extract(text(&args[0]), ts(&args[1]))
-                .map(Value::Numeric)
-                .map_err(ts_err);
+            return Ok(match timestamp::extract(text(&args[0]), ts(&args[1])).map_err(ts_err)? {
+                Some(n) => Value::Numeric(n),
+                None => Value::Null,
+            });
         }
         ScalarFn::DateTrunc => {
             return timestamp::date_trunc(text(&args[0]), ts(&args[1]))

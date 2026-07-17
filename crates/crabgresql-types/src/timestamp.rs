@@ -4,9 +4,9 @@
 //! Clean-room (see AGENTS.md): this reproduces PostgreSQL's *observable*
 //! behavior — the ISO output format, the field values, and the SQLSTATE/message
 //! of range and syntax errors — pinned by differential tests against real PG,
-//! implemented independently. The Julian-day conversions use the standard
-//! published calendar algorithm (Fliegel & Van Flandern, "Explanatory
-//! Supplement to the Astronomical Almanac"), not PG's source.
+//! implemented independently. The calendar conversions use Howard Hinnant's
+//! public-domain `days_from_civil`/`civil_from_days` algorithm
+//! (http://howardhinnant.github.io/date_algorithms.html), not PG's source.
 //!
 //! Representation: microseconds since the PostgreSQL epoch
 //! (2000-01-01 00:00:00), held in an `i64`. `i64::MIN`/`i64::MAX` are the
@@ -78,41 +78,51 @@ pub fn is_finite(micros: i64) -> bool {
     micros != NEG_INFINITY && micros != POS_INFINITY
 }
 
-// --- Julian-day calendar conversions (standard almanac algorithm) ----------
+// --- proleptic-Gregorian calendar conversions ------------------------------
+//
+// These use Howard Hinnant's public-domain `days_from_civil` /
+// `civil_from_days` algorithm (http://howardhinnant.github.io/date_algorithms.html),
+// which counts days from the Unix epoch (1970-01-01). We shift by
+// `UNIX_EPOCH_JDATE` to express the result as a Julian day number so the rest of
+// the module can keep speaking in Julian days.
 
-/// Gregorian (proleptic) `(year, month, day)` → Julian day number. `year` is
-/// the astronomical year (1 BC is year 0, 2 BC is -1, ...).
+/// Days from 1970-01-01 for a proleptic-Gregorian `(year, month, day)`, where
+/// `year` is astronomical (1 BC is year 0, 2 BC is -1, ...).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Inverse of [`days_from_civil`]: days-from-1970 → `(year, month, day)`.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Gregorian (proleptic) `(year, month, day)` → Julian day number.
 fn date2j(y: i64, m: i64, d: i64) -> i64 {
-    let (y, m) = if m > 2 { (y + 4800, m + 1) } else { (y + 4799, m + 13) };
-    let century = y / 100;
-    let mut julian = y * 365 - 32167;
-    julian += y / 4 - century + century / 4;
-    julian + 7834 * m / 256 + d
+    days_from_civil(y, m, d) + UNIX_EPOCH_JDATE
 }
 
 /// Inverse of [`date2j`]: Julian day number → `(year, month, day)`.
 fn j2date(jd: i64) -> (i64, i64, i64) {
-    let mut julian = jd + 32044;
-    let quad = julian / 146_097;
-    let extra = (julian - quad * 146_097) * 4 + 3;
-    julian += 60 + quad * 3 + extra / 146_097;
-    let quad = julian / 1461;
-    julian -= quad * 1461;
-    let mut y = julian * 4 / 1461;
-    julian = if y != 0 {
-        (julian + 305) % 365
-    } else {
-        (julian + 306) % 366
-    } + 123;
-    y += quad * 4;
-    let year = y - 4800;
-    let quad = julian * 2141 / 65_536;
-    let day = julian - 7834 * quad / 256;
-    let month = (quad + 10) % 12 + 1;
-    (year, month, day)
+    civil_from_days(jd - UNIX_EPOCH_JDATE)
 }
 
-/// Day of week, 0 = Sunday .. 6 = Saturday (PG's `j2day`).
+/// Day of week, 0 = Sunday .. 6 = Saturday. This is the plain modular relation
+/// between the Julian day number and the weekday.
 fn j2day(jd: i64) -> i64 {
     (jd + 1).rem_euclid(7)
 }
@@ -195,6 +205,20 @@ pub fn format(micros: i64) -> String {
 const MONTHS: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
 ];
+const MONTH_NAMES: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
 const WEEKDAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
 /// `timestamp_in`. Accepts the ISO 8601 forms, the traditional
@@ -237,6 +261,9 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
     let mut have_time = false;
     let mut bc = false;
     let mut have_date = false;
+    // Bare numeric fields (verbose form), as (value, digit count), resolved to
+    // day/year after the scan so their order does not matter.
+    let mut nums: Vec<(i64, usize)> = Vec::new();
 
     for field in &fields {
         let fl = field.to_ascii_lowercase();
@@ -286,20 +313,30 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
         }
         if field.bytes().all(|b| b.is_ascii_digit()) {
             let n: i64 = field.parse().map_err(|_| invalid_syntax(input))?;
-            // In the verbose form the day precedes the year: "Feb 10 ... 1997".
-            if month.is_some() && day.is_none() && year.is_none() {
-                day = Some(n);
-            } else if year.is_none() {
-                year = Some(n);
-            } else if day.is_none() {
-                day = Some(n);
-            } else {
-                return Err(invalid_syntax(input));
-            }
+            nums.push((n, field.len()));
             continue;
         }
         // Anything else (a bare time-zone abbreviation or numeric offset) is
         // decorative for this zone-less type and ignored.
+    }
+
+    // Resolve the bare numbers into day/year. The year is the 4+-digit or >31
+    // value; the remaining 1-2 digit value is the day. This is order-independent,
+    // so "Feb 10 1997" and "10 Feb 1997" both parse. A bare number alongside a
+    // full date token (which already fixed y/m/d) is invalid.
+    for (n, len) in nums {
+        if have_date {
+            return Err(invalid_syntax(input));
+        }
+        if year.is_none() && (len >= 4 || n > 31) {
+            year = Some(n);
+        } else if day.is_none() {
+            day = Some(n);
+        } else if year.is_none() {
+            year = Some(n);
+        } else {
+            return Err(invalid_syntax(input));
+        }
     }
 
     // A resolved calendar date is required; this rejects pure garbage.
@@ -312,6 +349,11 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
             return Err(field_out_of_range(input));
         }
         y = 1 - y;
+    }
+    // Bound the year to PG's timestamp range (4713 BC .. 294276 AD). This both
+    // matches PG's out-of-range error and keeps `encode` within i64.
+    if !(-4712..=294_276).contains(&y) {
+        return Err(field_out_of_range(input));
     }
     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
         return Err(field_out_of_range(input));
@@ -334,9 +376,15 @@ fn split_iso_t(s: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Match a month name: the exact 3-letter abbreviation or the full English
+/// name (case already folded). Only exact matches count — a token that merely
+/// starts with a month abbreviation (e.g. "marble") is not a month. Compares by
+/// value, never by byte-slicing, so non-ASCII input can't panic.
 fn month_index(name: &str) -> Option<i64> {
-    let short = if name.len() > 3 { &name[..3] } else { name };
-    MONTHS.iter().position(|m| *m == short).map(|i| i as i64 + 1)
+    if let Some(i) = MONTHS.iter().position(|m| *m == name) {
+        return Some(i as i64 + 1);
+    }
+    MONTH_NAMES.iter().position(|m| *m == name).map(|i| i as i64 + 1)
 }
 
 /// Parse a `HH:MM[:SS[.ffffff]]` time, optionally suffixed with `am`/`pm` and/or
@@ -354,6 +402,13 @@ fn parse_time(field: &str) -> Option<(i64, i64, i64, i64)> {
     } else if let Some(stripped) = lower.strip_suffix("am") {
         ampm = 1;
         body = &field[..stripped.len()];
+    }
+
+    // Strip an attached zone: the time is digits/colons/dot, so anything after
+    // it (a trailing `Z`, or a `+`/`-` offset joined without a space, as in the
+    // ISO 8601 form `18:19:20-07:00`) is the zone — decorative for this type.
+    if let Some(end) = body.find(|c: char| !(c.is_ascii_digit() || c == ':' || c == '.')) {
+        body = &body[..end];
     }
 
     let mut parts = body.split(':');
@@ -483,30 +538,47 @@ fn iso_week_year(jd: i64) -> (i64, i64) {
     (week, isoyear)
 }
 
-/// `date_part` (float8). Errors on an unrecognized unit; on `±infinity` only
-/// `epoch` is defined (`±Infinity`), other units raise the field-overflow error.
-pub fn date_part(unit: &str, micros: i64) -> Result<f64, TimestampError> {
-    let unit = canonical_unit(unit);
+/// Fields that increase monotonically with the timestamp. On `±infinity` PG
+/// returns `±Infinity` for these; every other (oscillating) known field returns
+/// NULL (`None` here).
+const MONOTONIC_UNITS: &[&str] = &[
+    "year",
+    "decade",
+    "century",
+    "millennium",
+    "isoyear",
+    "julian",
+    "epoch",
+];
+
+/// The value of a known field on a `±infinity` timestamp: `±Infinity` for a
+/// monotonic field, NULL (`None`) for an oscillating one. An unknown unit errors.
+fn non_finite<T>(unit: &str, micros: i64, inf: T, neg_inf: T) -> Result<Option<T>, TimestampError> {
+    if !KNOWN_UNITS.contains(&unit) {
+        return Err(units_not_recognized(unit));
+    }
+    if MONOTONIC_UNITS.contains(&unit) {
+        Ok(Some(if micros == POS_INFINITY { inf } else { neg_inf }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// `date_part` (float8). `Ok(None)` is SQL NULL (an oscillating field on
+/// `±infinity`); an unrecognized unit errors.
+pub fn date_part(unit: &str, micros: i64) -> Result<Option<f64>, TimestampError> {
+    date_part_canon(&canonical_unit(unit), micros)
+}
+
+/// [`date_part`] with the unit already canonicalized (so `extract` can share it
+/// without re-canonicalizing).
+fn date_part_canon(unit: &str, micros: i64) -> Result<Option<f64>, TimestampError> {
     if !is_finite(micros) {
-        return match unit.as_str() {
-            "epoch" => Ok(if micros == POS_INFINITY {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            }),
-            _ if KNOWN_UNITS.contains(&unit.as_str()) => Err(TimestampError {
-                sqlstate: DATETIME_FIELD_OVERFLOW,
-                message: format!(
-                    "cannot extract {} from a non-finite timestamp",
-                    &unit
-                ),
-            }),
-            _ => Err(units_not_recognized(&unit)),
-        };
+        return non_finite(unit, micros, f64::INFINITY, f64::NEG_INFINITY);
     }
     let tm = decode(micros);
     let jd = date2j(tm.year, tm.month, tm.day);
-    let value = match unit.as_str() {
+    let value = match unit {
         "microseconds" => (tm.sec * USECS_PER_SEC + tm.usec) as f64,
         "milliseconds" => (tm.sec * USECS_PER_SEC + tm.usec) as f64 / 1000.0,
         "second" => tm.sec as f64 + tm.usec as f64 / 1e6,
@@ -527,28 +599,32 @@ pub fn date_part(unit: &str, micros: i64) -> Result<f64, TimestampError> {
         "doy" => (jd - date2j(tm.year, 1, 1) + 1) as f64,
         "week" => iso_week_year(jd).0 as f64,
         "isoyear" => iso_week_year(jd).1 as f64,
-        "julian" => jd as f64 + (tm.hour as f64 * 3600.0 + tm.min as f64 * 60.0 + tm.sec as f64 + tm.usec as f64 / 1e6) / SECS_PER_DAY as f64,
+        "julian" => {
+            jd as f64
+                + (tm.hour as f64 * 3600.0
+                    + tm.min as f64 * 60.0
+                    + tm.sec as f64
+                    + tm.usec as f64 / 1e6)
+                    / SECS_PER_DAY as f64
+        }
         "epoch" => epoch_micros(micros) as f64 / 1e6,
-        _ => return Err(units_not_recognized(&unit)),
+        _ => return Err(units_not_recognized(unit)),
     };
-    Ok(value)
+    Ok(Some(value))
 }
 
 /// `extract` (numeric). Same fields as [`date_part`], but PG returns `numeric`
-/// with a per-field scale: sub-second fields keep fractional digits.
-pub fn extract(unit: &str, micros: i64) -> Result<NumericVal, TimestampError> {
+/// with a per-field scale: sub-second fields keep fractional digits. `Ok(None)`
+/// is SQL NULL (an oscillating field on `±infinity`).
+pub fn extract(unit: &str, micros: i64) -> Result<Option<NumericVal>, TimestampError> {
     let unit = canonical_unit(unit);
     if !is_finite(micros) {
-        return match unit.as_str() {
-            "epoch" => Ok(NumericVal::Finite(
-                if micros == POS_INFINITY { "Infinity" } else { "-Infinity" }.to_string(),
-            )),
-            _ if KNOWN_UNITS.contains(&unit.as_str()) => Err(TimestampError {
-                sqlstate: DATETIME_FIELD_OVERFLOW,
-                message: format!("cannot extract {} from a non-finite timestamp", &unit),
-            }),
-            _ => Err(units_not_recognized(&unit)),
-        };
+        return non_finite(
+            &unit,
+            micros,
+            NumericVal::Finite("Infinity".into()),
+            NumericVal::Finite("-Infinity".into()),
+        );
     }
     let tm = decode(micros);
     let total_sub_usec = tm.sec * USECS_PER_SEC + tm.usec;
@@ -558,10 +634,15 @@ pub fn extract(unit: &str, micros: i64) -> Result<NumericVal, TimestampError> {
         "milliseconds" => fixed_point(total_sub_usec, 3),
         "microseconds" => total_sub_usec.to_string(),
         "epoch" => fixed_point(epoch_micros(micros), 6),
-        // Everything else is an integer field: reuse date_part's integer value.
-        _ => (date_part(&unit, micros)? as i64).to_string(),
+        // PG returns a high-precision numeric here; we render the float8 Julian
+        // date (fractional, but not byte-identical to PG's exotic numeric scale).
+        "julian" => format!("{}", date_part_canon("julian", micros)?.expect("finite is Some")),
+        // Everything else is an integer field: reuse date_part's value (already
+        // canonical, so no re-canonicalization).
+        _ => (date_part_canon(&unit, micros)?.expect("finite integer field is Some") as i64)
+            .to_string(),
     };
-    Ok(NumericVal::Finite(s))
+    Ok(Some(NumericVal::Finite(s)))
 }
 
 /// Format `scaled` (the field value times `10^scale`) as a fixed-point decimal
@@ -794,24 +875,32 @@ pub fn make_timestamp(
             year, month, mday
         )
     };
+    // A negative (BC) year uses astronomical numbering internally: -1 == 1 BC.
+    let astro_year = if year < 0 { year + 1 } else { year };
     if year == 0
+        || !(-4712..=294_276).contains(&astro_year)
         || !(1..=12).contains(&month)
         || mday < 1
-        || mday > days_in_month(if year < 0 { year + 1 } else { year }, month)
+        || mday > days_in_month(astro_year, month)
     {
         return Err(TimestampError {
             sqlstate: DATETIME_FIELD_OVERFLOW,
             message: describe(),
         });
     }
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0.0..60.0).contains(&sec) {
+    // PG's time_overflows: hour 0..24, min 0..59, sec 0..60, with 24:00:00
+    // allowed only when min and sec are exactly zero (the end-of-day boundary
+    // carries into the next day). sec == 60 is a valid leap-second carry.
+    if !(0..=24).contains(&hour)
+        || !(0..=59).contains(&min)
+        || !(0.0..=60.0).contains(&sec)
+        || (hour == 24 && (min != 0 || sec != 0.0))
+    {
         return Err(TimestampError {
             sqlstate: DATETIME_FIELD_OVERFLOW,
             message: format!("time field value out of range: {hour}:{min:02}:{sec:09.6}"),
         });
     }
-    // A negative (BC) year uses astronomical numbering internally: -1 == 1 BC.
-    let astro_year = if year < 0 { year + 1 } else { year };
     let whole_sec = sec.trunc() as i64;
     let usec = (sec.fract() * 1e6).round() as i64;
     Ok(encode(Tm {
@@ -897,27 +986,25 @@ mod tests {
     #[test]
     fn date_part_fields() {
         let t = ts("2001-02-16 20:38:40.5");
-        assert_eq!(date_part("year", t).unwrap(), 2001.0);
-        assert_eq!(date_part("month", t).unwrap(), 2.0);
-        assert_eq!(date_part("day", t).unwrap(), 16.0);
-        assert_eq!(date_part("hour", t).unwrap(), 20.0);
-        assert_eq!(date_part("minute", t).unwrap(), 38.0);
-        assert_eq!(date_part("second", t).unwrap(), 40.5);
-        assert_eq!(date_part("dow", t).unwrap(), 5.0);
-        assert_eq!(date_part("isodow", t).unwrap(), 5.0);
-        assert_eq!(date_part("doy", t).unwrap(), 47.0);
-        assert_eq!(date_part("quarter", t).unwrap(), 1.0);
-        assert_eq!(date_part("week", t).unwrap(), 7.0);
-        assert_eq!(date_part("decade", t).unwrap(), 200.0);
-        assert_eq!(date_part("century", t).unwrap(), 21.0);
-        assert_eq!(date_part("millennium", t).unwrap(), 3.0);
-        assert_eq!(date_part("isoyear", t).unwrap(), 2001.0);
-        assert_eq!(date_part("microseconds", t).unwrap(), 40500000.0);
-        assert_eq!(date_part("milliseconds", t).unwrap(), 40500.0);
-        assert_eq!(
-            date_part("epoch", ts("2001-02-16 20:38:40")).unwrap(),
-            982355920.0
-        );
+        let dp = |u: &str| date_part(u, t).unwrap().unwrap();
+        assert_eq!(dp("year"), 2001.0);
+        assert_eq!(dp("month"), 2.0);
+        assert_eq!(dp("day"), 16.0);
+        assert_eq!(dp("hour"), 20.0);
+        assert_eq!(dp("minute"), 38.0);
+        assert_eq!(dp("second"), 40.5);
+        assert_eq!(dp("dow"), 5.0);
+        assert_eq!(dp("isodow"), 5.0);
+        assert_eq!(dp("doy"), 47.0);
+        assert_eq!(dp("quarter"), 1.0);
+        assert_eq!(dp("week"), 7.0);
+        assert_eq!(dp("decade"), 200.0);
+        assert_eq!(dp("century"), 21.0);
+        assert_eq!(dp("millennium"), 3.0);
+        assert_eq!(dp("isoyear"), 2001.0);
+        assert_eq!(dp("microseconds"), 40500000.0);
+        assert_eq!(dp("milliseconds"), 40500.0);
+        assert_eq!(date_part("epoch", ts("2001-02-16 20:38:40")).unwrap().unwrap(), 982355920.0);
     }
 
     #[test]
@@ -928,24 +1015,74 @@ mod tests {
     #[test]
     fn extract_scales() {
         let t = ts("2001-02-16 20:38:40.5");
-        assert_eq!(extract("year", t).unwrap(), NumericVal::Finite("2001".into()));
-        assert_eq!(extract("second", t).unwrap(), NumericVal::Finite("40.500000".into()));
+        let ex = |u: &str| extract(u, t).unwrap().unwrap();
+        assert_eq!(ex("year"), NumericVal::Finite("2001".into()));
+        assert_eq!(ex("second"), NumericVal::Finite("40.500000".into()));
+        assert_eq!(ex("milliseconds"), NumericVal::Finite("40500.000".into()));
+        assert_eq!(ex("microseconds"), NumericVal::Finite("40500000".into()));
         assert_eq!(
-            extract("milliseconds", t).unwrap(),
-            NumericVal::Finite("40500.000".into())
-        );
-        assert_eq!(
-            extract("microseconds", t).unwrap(),
-            NumericVal::Finite("40500000".into())
-        );
-        assert_eq!(
-            extract("epoch", ts("2001-02-16 20:38:40")).unwrap(),
+            extract("epoch", ts("2001-02-16 20:38:40")).unwrap().unwrap(),
             NumericVal::Finite("982355920.000000".into())
         );
+        assert_eq!(ex("epoch"), NumericVal::Finite("982355920.500000".into()));
+    }
+
+    #[test]
+    fn non_finite_fields_are_infinity_or_null() {
+        // Monotonic fields on ±infinity are ±Infinity; oscillating fields NULL.
+        assert_eq!(date_part("year", POS_INFINITY).unwrap(), Some(f64::INFINITY));
+        assert_eq!(date_part("epoch", NEG_INFINITY).unwrap(), Some(f64::NEG_INFINITY));
+        assert_eq!(date_part("month", POS_INFINITY).unwrap(), None);
+        assert_eq!(date_part("week", NEG_INFINITY).unwrap(), None);
         assert_eq!(
-            extract("epoch", t).unwrap(),
-            NumericVal::Finite("982355920.500000".into())
+            extract("year", POS_INFINITY).unwrap(),
+            Some(NumericVal::Finite("Infinity".into()))
         );
+        assert_eq!(extract("day", POS_INFINITY).unwrap(), None);
+        // An unknown unit still errors even on ±infinity.
+        assert_eq!(date_part("bogus", POS_INFINITY).unwrap_err().sqlstate, "22023");
+    }
+
+    #[test]
+    fn extract_julian_keeps_the_fraction() {
+        // The fractional day must survive (regression: was truncated to i64).
+        let s = match extract("julian", ts("2001-02-16 20:38:40")).unwrap().unwrap() {
+            NumericVal::Finite(s) => s,
+            other => panic!("expected finite, got {other:?}"),
+        };
+        assert!(s.starts_with("2451957.86"), "got {s}");
+    }
+
+    #[test]
+    fn parser_edge_cases() {
+        // Day-before-month verbose form.
+        assert_eq!(format(ts("10 Feb 1997")), "1997-02-10 00:00:00");
+        // ISO 'T' time with an attached zone (Z / numeric offset) is accepted.
+        assert_eq!(format(ts("2001-09-22T18:19:20Z")), "2001-09-22 18:19:20");
+        assert_eq!(format(ts("2001-09-22T18:19:20-07:00")), "2001-09-22 18:19:20");
+        // A full English month name works; a word merely prefixed by one does not.
+        assert_eq!(format(ts("February 10 1997")), "1997-02-10 00:00:00");
+        assert_eq!(parse("marble 5 2001").unwrap_err().sqlstate, "22007");
+        // Non-ASCII input must error, not panic (regression for &name[..3]).
+        assert_eq!(parse("aa\u{e9} 2001").unwrap_err().sqlstate, "22007");
+        // Out-of-range years error instead of overflowing i64.
+        assert_eq!(parse("5000000000-01-01").unwrap_err().sqlstate, "22008");
+    }
+
+    #[test]
+    fn make_timestamp_boundary_times() {
+        // 24:00:00 rolls into the next day; sec == 60 carries a minute.
+        assert_eq!(
+            format(make_timestamp(2013, 7, 15, 24, 0, 0.0).unwrap()),
+            "2013-07-16 00:00:00"
+        );
+        assert_eq!(
+            format(make_timestamp(2013, 7, 15, 8, 15, 60.0).unwrap()),
+            "2013-07-15 08:16:00"
+        );
+        // But 24:00 with a nonzero minute, or sec > 60, is still rejected.
+        assert!(make_timestamp(2013, 7, 15, 24, 1, 0.0).is_err());
+        assert!(make_timestamp(2013, 7, 15, 8, 15, 60.5).is_err());
     }
 
     #[test]

@@ -77,10 +77,25 @@ SELECT date_trunc('quarter', timestamp '2001-05-16') AS quarter,
 SELECT date_trunc('milliseconds', timestamp '2001-02-16 20:38:40.123456') AS ms;
 SELECT date_trunc('day', timestamp 'infinity') AS inf;
 
--- isfinite and make_timestamp
+-- fields of an infinite timestamp: monotonic fields are +/-Infinity, oscillating
+-- fields are NULL
+SELECT date_part('year', timestamp 'infinity') AS year,
+       date_part('month', timestamp 'infinity') AS month,
+       extract(epoch from timestamp '-infinity') AS neg_epoch,
+       extract(day from timestamp 'infinity') AS day;
+
+-- more input forms: ISO 'T' with an attached zone, and the day-before-month and
+-- full-month-name verbose spellings
+SELECT timestamp '2001-09-22T18:19:20Z' AS zulu,
+       timestamp '2001-09-22T18:19:20-07:00' AS offset;
+SELECT timestamp '10 Feb 1997' AS dmy, timestamp 'February 10 1997' AS full_name;
+
+-- isfinite and make_timestamp (24:00:00 rolls to the next day; sec 60 carries)
 SELECT isfinite(timestamp '2001-02-16') AS finite, isfinite(timestamp 'infinity') AS not_finite;
 SELECT make_timestamp(2013, 7, 15, 8, 15, 23.5) AS made,
        make_timestamp(2013, 7, 15, 8, 15, 23) AS whole;
+SELECT make_timestamp(2013, 7, 15, 24, 0, 0) AS end_of_day,
+       make_timestamp(2013, 7, 15, 8, 15, 60) AS leap;
 
 -- errors: unparseable input is 22007, an unknown unit is 22023; recovery works
 SELECT timestamp 'garbage';
