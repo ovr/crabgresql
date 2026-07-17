@@ -351,7 +351,7 @@ fn bind_values_query(
     let mut columns = Vec::with_capacity(width);
     let mut column_cells: Vec<Vec<BoundExpr>> = Vec::with_capacity(width);
     for (i, bindings) in columns_of_bindings.into_iter().enumerate() {
-        let (ty, cells) = unify_value_column(bindings)?;
+        let (ty, cells) = unify_value_column(bindings, "VALUES")?;
         columns.push(OutputColumn {
             name: format!("column{}", i + 1),
             ty,
@@ -1677,5 +1677,102 @@ mod tests {
         };
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "x");
+    }
+
+    fn case_column(sql: &str) -> (OutputColumn, BoundExpr) {
+        let LogicalPlan::Query {
+            columns,
+            projections,
+            ..
+        } = bind_one(sql).unwrap()
+        else {
+            panic!("expected Query");
+        };
+        (columns[0].clone(), projections[0].clone())
+    }
+
+    #[test]
+    fn case_default_column_name_is_case() {
+        let (col, expr) = case_column("SELECT CASE WHEN flag THEN id END FROM t");
+        assert_eq!(col.name, "case");
+        assert!(matches!(expr, BoundExpr::Case { .. }));
+    }
+
+    #[test]
+    fn case_result_branches_promote_to_common_type() {
+        // int4 THEN, int8 ELSE -> int8, with a Coerce inserted on the int4 arm.
+        let (col, expr) = case_column("SELECT CASE WHEN flag THEN id ELSE big END FROM t");
+        assert_eq!(col.ty, PgType::Int8);
+        let BoundExpr::Case { whens, else_, ty } = expr else {
+            panic!("expected Case");
+        };
+        assert_eq!(ty, PgType::Int8);
+        assert!(matches!(
+            &whens[0].1,
+            BoundExpr::Coerce { ty: PgType::Int8, .. }
+        ));
+        assert!(matches!(
+            else_.as_deref(),
+            Some(BoundExpr::ColumnRef { ty: PgType::Int8, .. })
+        ));
+    }
+
+    #[test]
+    fn all_untyped_case_branches_resolve_to_text() {
+        let (col, _) = case_column("SELECT CASE WHEN flag THEN NULL ELSE NULL END FROM t");
+        assert_eq!(col.ty, PgType::Text);
+    }
+
+    #[test]
+    fn simple_case_desugars_operand_to_equality() {
+        // CASE id WHEN 1 THEN ... becomes a boolean `id = 1` condition.
+        let (_, expr) = case_column("SELECT CASE id WHEN 1 THEN 'a' END FROM t");
+        let BoundExpr::Case { whens, .. } = expr else {
+            panic!("expected Case");
+        };
+        assert!(matches!(
+            &whens[0].0,
+            BoundExpr::Binary {
+                op: BinOp::Eq,
+                arg_ty: PgType::Int4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_boolean_when_condition_is_42804() {
+        let e = bind_err("SELECT CASE WHEN id THEN 1 END FROM t");
+        assert_eq!(e.code, "42804");
+        assert_eq!(
+            e.message,
+            "argument of CASE/WHEN must be type boolean, not type integer"
+        );
+    }
+
+    #[test]
+    fn incompatible_case_results_are_42804() {
+        // ELSE participates first in unification, matching PG's type order.
+        let e = bind_err("SELECT CASE WHEN flag THEN id ELSE name END FROM t");
+        assert_eq!(e.code, "42804");
+        assert_eq!(e.message, "CASE types text and integer cannot be matched");
+    }
+
+    #[test]
+    fn simple_case_untyped_operand_resolves_to_text() {
+        // PG gives an untyped-literal operand its own type (text) before
+        // comparing, so a NULL or string operand against an integer WHEN value
+        // is `text = integer` (operator does not exist), not a read of the
+        // operand as integer.
+        for sql in [
+            "SELECT CASE NULL WHEN 1 THEN 'a' ELSE 'b' END",
+            "SELECT CASE 'x' WHEN 1 THEN 'a' END",
+        ] {
+            let e = bind_err(sql);
+            assert_eq!(e.code, "42883", "{sql}");
+            assert_eq!(e.message, "operator does not exist: text = integer", "{sql}");
+        }
+        // Two untyped literals still compare as text (unchanged).
+        assert!(bind_one("SELECT CASE 'x' WHEN 'y' THEN 1 ELSE 2 END").is_ok());
     }
 }
