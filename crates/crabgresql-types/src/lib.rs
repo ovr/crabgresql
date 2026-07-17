@@ -150,6 +150,23 @@ impl NumericVal {
     }
 }
 
+/// `boolin`: the spellings PG's boolean input accepts — any unambiguous
+/// case-insensitive prefix of true/false/yes/no/off, exact "on", and "1"/"0"
+/// (a bare "o" is ambiguous between on and off) — trimmed. Shared by the
+/// binder (unknown-literal resolution) and `cast::cast_value` (text→bool).
+pub fn parse_bool(s: &str) -> Option<bool> {
+    let s = s.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "" => None,
+        "1" | "on" => Some(true),
+        "0" => Some(false),
+        _ if "true".starts_with(&s) || "yes".starts_with(&s) => Some(true),
+        _ if "false".starts_with(&s) || "no".starts_with(&s) => Some(false),
+        _ if s.len() >= 2 && "off".starts_with(&s) => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,

@@ -12,7 +12,7 @@
 use crabgresql_parser::{Span, ast};
 use crabgresql_protocol::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema};
-use crabgresql_types::{NumericVal, PgType, Value, cast, float};
+use crabgresql_types::{NumericVal, PgType, Value, cast, float, parse_bool};
 
 use crate::BindError;
 use crate::functions::{ScalarFn, bind_function};
@@ -818,62 +818,22 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             format!("invalid input syntax for type {}: \"{s}\"", ty.name()),
         )
     };
-    // PG's integer input functions distinguish a well-formed number that does
-    // not fit (22003) from malformed input (22P02).
-    let out_of_range = || {
-        BindError::new(
-            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
-            format!("value \"{s}\" is out of range for type {}", ty.name()),
-        )
-    };
-    let int_error = |e: &std::num::ParseIntError| {
-        use std::num::IntErrorKind;
-        match e.kind() {
-            IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => out_of_range(),
-            _ => invalid(),
-        }
-    };
     let float_error = |e: float::FloatParseError| BindError::new(e.sqlstate, e.message);
     match ty {
         PgType::Text => Ok(Value::Text(s.to_string())),
-        PgType::Int2 => s
-            .trim()
-            .parse::<i16>()
-            .map(Value::Int2)
-            .map_err(|e| int_error(&e)),
-        PgType::Int4 => s
-            .trim()
-            .parse::<i32>()
-            .map(Value::Int4)
-            .map_err(|e| int_error(&e)),
-        PgType::Int8 => s
-            .trim()
-            .parse::<i64>()
-            .map(Value::Int8)
-            .map_err(|e| int_error(&e)),
+        // Integer input (trim, base-10, 22003 overflow vs 22P02 malformed) is
+        // the same acceptor the executor's text→int cast uses; share it so the
+        // two never drift. resolve_unknown attaches the cursor position.
+        PgType::Int2 | PgType::Int4 | PgType::Int8 => {
+            cast::text_to_int(s, ty).map_err(|e| BindError::new(e.sqlstate, e.message))
+        }
         PgType::Float4 => float::float4in(s).map(Value::Float4).map_err(float_error),
         PgType::Float8 => float::float8in(s).map(Value::Float8).map_err(float_error),
         PgType::Numeric => NumericVal::parse(s)
             .map(Value::Numeric)
             .ok_or_else(invalid),
-        PgType::Bool => parse_bool_text(s).map(Value::Bool).ok_or_else(invalid),
+        PgType::Bool => parse_bool(s).map(Value::Bool).ok_or_else(invalid),
         PgType::Bytea | PgType::Bit | PgType::User(_) => Err(invalid()),
-    }
-}
-
-/// The spellings `boolin` accepts: any unambiguous case-insensitive prefix of
-/// true/false/yes/no/off, exact "on", and "1"/"0" (a bare "o" is ambiguous
-/// between on and off) — trimmed, as in PG.
-fn parse_bool_text(s: &str) -> Option<bool> {
-    let s = s.trim().to_ascii_lowercase();
-    match s.as_str() {
-        "" => None,
-        "1" | "on" => Some(true),
-        "0" => Some(false),
-        _ if "true".starts_with(&s) || "yes".starts_with(&s) => Some(true),
-        _ if "false".starts_with(&s) || "no".starts_with(&s) => Some(false),
-        _ if s.len() >= 2 && "off".starts_with(&s) => Some(false),
-        _ => None,
     }
 }
 

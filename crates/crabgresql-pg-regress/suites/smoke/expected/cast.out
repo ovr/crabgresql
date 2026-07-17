@@ -1,0 +1,58 @@
+--
+-- CAST
+-- CAST(expr AS type) and expr::type across the M0 scalar types, plus the
+-- error rendering on a bad cast. Output hand-checked against PostgreSQL's
+-- psql -a -q aligned format.
+--
+-- unknown literals take the cast's target type; both spellings are equivalent
+SELECT '123'::int4 AS i, 't'::bool AS b, '1.5'::float8 AS f;
+  i  | b |  f  
+-----+---+-----
+ 123 | t | 1.5
+(1 row)
+
+SELECT CAST('42' AS int8) AS big, CAST('-7' AS int2) AS small;
+ big | small 
+-----+-------
+  42 |    -7
+(1 row)
+
+-- integer -> numeric (exact) and float -> numeric (15 significant digits)
+SELECT 5::int4::numeric AS to_num, (1.5::float8)::numeric AS half,
+       (2::float8 / 3::float8)::numeric AS thirds;
+ to_num | half |      thirds       
+--------+------+-------------------
+      5 |  1.5 | 0.666666666666667
+(1 row)
+
+-- numeric -> integer rounds half away from zero
+SELECT 12.5::numeric::int4 AS up, (-12.5)::numeric::int4 AS down;
+ up | down 
+----+------
+ 13 |  -13
+(1 row)
+
+-- casts run per row over a text column
+CREATE TABLE labels (s text);
+INSERT INTO labels VALUES ('10'), ('20'), ('-3');
+SELECT s, s::int4 * 2 AS doubled FROM labels;
+ s  | doubled 
+----+---------
+ 10 |      20
+ 20 |      40
+ -3 |      -6
+(3 rows)
+
+-- a bad runtime cast reports PG's message and SQLSTATE; the session recovers
+CREATE TABLE oops (s text);
+INSERT INTO oops VALUES ('abc');
+SELECT s::int4 FROM oops;
+ERROR:  invalid input syntax for type integer: "abc"
+SELECT 'NaN'::numeric::int4;
+ERROR:  cannot convert NaN to integer
+SELECT 'alive' AS status;
+ status 
+--------
+ alive
+(1 row)
+

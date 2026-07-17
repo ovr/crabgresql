@@ -1,2 +1,3 @@
 test: basic
 test: errors
+test: cast
