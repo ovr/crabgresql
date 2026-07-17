@@ -9,7 +9,9 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # internal crates
+crabgresql-binder = { path = "crates/crabgresql-binder" }
 crabgresql-executor = { path = "crates/crabgresql-executor" }
+crabgresql-planner = { path = "crates/crabgresql-planner" }
 crabgresql-memory-storage = { path = "crates/crabgresql-memory-storage" }
 crabgresql-parser = { path = "crates/crabgresql-parser" }
 crabgresql-pg-regress = { path = "crates/crabgresql-pg-regress" }

@@ -311,6 +311,251 @@ async fn unenforceable_ddl_is_rejected() {
     }
 }
 
+/// The numeric suffix of the first CommandComplete tag (`UPDATE 2` → 2).
+fn command_count(messages: &[SimpleQueryMessage]) -> Option<u64> {
+    messages.iter().find_map(|m| match m {
+        SimpleQueryMessage::CommandComplete(n) => Some(*n),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn full_crud_cycle_with_where() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE crabs (id integer, name text)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO crabs VALUES (1, 'ferris'), (2, 'hermit'), (3, 'king')")
+        .await
+        .unwrap();
+
+    let messages = client
+        .simple_query("SELECT name FROM crabs WHERE id > 1")
+        .await
+        .unwrap();
+    let selected = rows(&messages);
+    assert_eq!(selected.len(), 2);
+    assert_eq!(selected[0].get(0), Some("hermit"));
+
+    let messages = client
+        .simple_query("UPDATE crabs SET name = 'crab' WHERE id > 1")
+        .await
+        .unwrap();
+    assert_eq!(command_count(&messages), Some(2), "tag must be UPDATE 2");
+
+    let messages = client
+        .simple_query("DELETE FROM crabs WHERE name = 'crab'")
+        .await
+        .unwrap();
+    assert_eq!(command_count(&messages), Some(2), "tag must be DELETE 2");
+
+    let messages = client.simple_query("SELECT * FROM crabs").await.unwrap();
+    let remaining = rows(&messages);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].get(1), Some("ferris"));
+}
+
+#[tokio::test]
+async fn update_and_delete_without_where_hit_all_rows() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await
+        .unwrap();
+
+    let messages = client.simple_query("UPDATE t SET id = 0").await.unwrap();
+    assert_eq!(command_count(&messages), Some(3));
+
+    let messages = client.simple_query("DELETE FROM t").await.unwrap();
+    assert_eq!(command_count(&messages), Some(3));
+    let messages = client.simple_query("SELECT * FROM t").await.unwrap();
+    assert_eq!(rows(&messages).len(), 0);
+}
+
+#[tokio::test]
+async fn null_rows_do_not_match_comparisons() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer, v integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10), (2, NULL)")
+        .await
+        .unwrap();
+
+    // Neither = nor <> matches a NULL: only IS NULL does.
+    for (sql, expected) in [
+        ("SELECT id FROM t WHERE v = 10", 1),
+        ("SELECT id FROM t WHERE v <> 10", 0),
+        ("SELECT id FROM t WHERE v IS NULL", 1),
+        ("SELECT id FROM t WHERE v IS NOT NULL", 1),
+    ] {
+        let messages = client.simple_query(sql).await.unwrap();
+        assert_eq!(rows(&messages).len(), expected, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn expressions_in_select_list() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (41)")
+        .await
+        .unwrap();
+
+    let messages = client
+        .simple_query("SELECT id + 1, id * 2 AS double FROM t")
+        .await
+        .unwrap();
+    let rows = rows(&messages);
+    assert_eq!(rows[0].columns()[0].name(), "?column?");
+    assert_eq!(rows[0].columns()[1].name(), "double");
+    assert_eq!(rows[0].get(0), Some("42"));
+    assert_eq!(rows[0].get(1), Some("82"));
+}
+
+#[tokio::test]
+async fn update_set_expressions_see_the_old_row() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a integer, b integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 2)")
+        .await
+        .unwrap();
+
+    // Both SET expressions evaluate against the OLD row: this swaps.
+    client
+        .simple_query("UPDATE t SET a = b, b = a")
+        .await
+        .unwrap();
+    let messages = client.simple_query("SELECT a, b FROM t").await.unwrap();
+    let rows = rows(&messages);
+    assert_eq!(rows[0].get(0), Some("2"));
+    assert_eq!(rows[0].get(1), Some("1"));
+}
+
+#[tokio::test]
+async fn failing_update_leaves_no_rows_modified() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer, v integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .unwrap();
+
+    // Fails on the id=2 row after id=1 evaluated fine.
+    let err = client
+        .simple_query("UPDATE t SET v = v / (id - 2)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::DIVISION_BY_ZERO
+    );
+
+    let messages = client
+        .simple_query("SELECT v FROM t WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&messages)[0].get(0),
+        Some("10"),
+        "statement must be atomic"
+    );
+}
+
+#[tokio::test]
+async fn mid_stream_error_aborts_remaining_statements() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (2), (0)")
+        .await
+        .unwrap();
+
+    // The error surfaces mid-stream, after RowDescription (and possibly the
+    // first row) went out; the trailing INSERT must not run.
+    let err = client
+        .simple_query("SELECT 10 / id FROM t; INSERT INTO t VALUES (7)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::DIVISION_BY_ZERO
+    );
+
+    let messages = client.simple_query("SELECT * FROM t").await.unwrap();
+    assert_eq!(rows(&messages).len(), 2, "aborted INSERT must not run");
+}
+
+#[tokio::test]
+async fn expression_type_errors_report_pg_sqlstates() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer, name text)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (2147483647, 'x')")
+        .await
+        .unwrap();
+
+    for (sql, code, message) in [
+        (
+            "SELECT id FROM t WHERE 1",
+            tokio_postgres::error::SqlState::DATATYPE_MISMATCH,
+            "argument of WHERE must be type boolean, not type integer",
+        ),
+        (
+            "SELECT id FROM t WHERE name = id",
+            tokio_postgres::error::SqlState::UNDEFINED_FUNCTION,
+            "operator does not exist: text = integer",
+        ),
+        (
+            "SELECT '1' + '2'",
+            tokio_postgres::error::SqlState::AMBIGUOUS_FUNCTION,
+            "operator is not unique: unknown + unknown",
+        ),
+    ] {
+        let err = client.simple_query(sql).await.unwrap_err();
+        let db_err = err.as_db_error().unwrap();
+        assert_eq!(db_err.code(), &code, "{sql}");
+        assert_eq!(db_err.message(), message, "{sql}");
+    }
+
+    // Runtime overflow through UPDATE arithmetic.
+    let err = client
+        .simple_query("UPDATE t SET id = id + 1")
+        .await
+        .unwrap_err();
+    let db_err = err.as_db_error().unwrap();
+    assert_eq!(
+        db_err.code(),
+        &tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE
+    );
+    assert_eq!(db_err.message(), "integer out of range");
+}
+
 async fn read_backend_message(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
     let tag = socket.read_u8().await.unwrap();
     let len = socket.read_i32().await.unwrap() as usize;

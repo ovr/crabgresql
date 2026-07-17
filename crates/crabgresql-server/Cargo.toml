@@ -9,7 +9,9 @@ name = "crabgresql"
 path = "src/main.rs"
 
 [dependencies]
+crabgresql-binder.workspace = true
 crabgresql-executor.workspace = true
+crabgresql-planner.workspace = true
 crabgresql-memory-storage.workspace = true
 crabgresql-parser.workspace = true
 crabgresql-protocol.workspace = true
