@@ -11,8 +11,8 @@ use crabgresql_parser::ast;
 use crabgresql_protocol::sqlstate;
 use crabgresql_types::PgType;
 
-use crate::BindError;
 use crate::expr::{Binding, BoundExpr, Scope, bind_expr, coerce_for_arg};
+use crate::{BindError, OutputColumn};
 
 /// A scalar function the executor can evaluate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,77 @@ struct Signature {
     func: ScalarFn,
     args: &'static [PgType],
     ret: PgType,
+}
+
+/// A set-returning function callable in `FROM` position. Unlike [`ScalarFn`],
+/// these produce a rowset (a fixed set of named output columns), so they are
+/// bound as a relation rather than an expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableFn {
+    /// `pg_input_error_info(value text, type_name text)` — the non-throwing
+    /// sibling of `pg_input_is_valid`, reporting why an input would fail.
+    PgInputErrorInfo,
+}
+
+impl TableFn {
+    /// The function's declared parameter types (for arity/coercion checks).
+    fn arg_types(self) -> &'static [PgType] {
+        match self {
+            TableFn::PgInputErrorInfo => &[PgType::Text, PgType::Text],
+        }
+    }
+
+    /// The fixed output columns of the rowset, in order.
+    pub fn columns(self) -> Vec<OutputColumn> {
+        let text = |name: &str| OutputColumn {
+            name: name.to_string(),
+            ty: PgType::Text,
+        };
+        match self {
+            TableFn::PgInputErrorInfo => vec![
+                text("message"),
+                text("detail"),
+                text("hint"),
+                text("sql_error_code"),
+            ],
+        }
+    }
+}
+
+/// Resolve a set-returning function by (already lowercased) name.
+pub fn lookup_table_fn(name: &str) -> Option<TableFn> {
+    match name {
+        "pg_input_error_info" => Some(TableFn::PgInputErrorInfo),
+        _ => None,
+    }
+}
+
+/// Bind a table function's call arguments to typed expressions, resolving the
+/// function and enforcing arity/coercion. `arg_exprs` are the raw call
+/// arguments (bound in the empty scope, as SRF arguments are constants here).
+pub(crate) fn bind_table_fn_call(
+    name: &str,
+    arg_exprs: &[ast::Expr],
+    scope: &Scope,
+) -> Result<(TableFn, Vec<BoundExpr>), BindError> {
+    let bindings = arg_exprs
+        .iter()
+        .map(|e| bind_expr(e, scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(func) = lookup_table_fn(name) else {
+        return Err(undefined_function(name, &bindings));
+    };
+    let params = func.arg_types();
+    if params.len() != bindings.len() {
+        return Err(undefined_function(name, &bindings));
+    }
+    // Exact-type first, then a coercing pass — same policy as scalar overloads.
+    for exact_only in [true, false] {
+        if let Some(args) = try_coerce_args(&bindings, params, exact_only) {
+            return Ok((func, args));
+        }
+    }
+    Err(undefined_function(name, &bindings))
 }
 
 const F8: PgType = PgType::Float8;
@@ -219,8 +290,16 @@ fn positional_args(args: &ast::FunctionArguments) -> Result<Vec<ast::Expr>, Bind
             "this function argument form is not supported yet",
         ));
     }
-    let mut out = Vec::with_capacity(list.args.len());
-    for arg in &list.args {
+    positional_arg_exprs(&list.args)
+}
+
+/// Extract plain positional argument expressions, rejecting named/wildcard
+/// forms. Shared by scalar calls and table-function (FROM-position) calls.
+pub(crate) fn positional_arg_exprs(
+    args: &[ast::FunctionArg],
+) -> Result<Vec<ast::Expr>, BindError> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
         match arg {
             ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => out.push(e.clone()),
             _ => {

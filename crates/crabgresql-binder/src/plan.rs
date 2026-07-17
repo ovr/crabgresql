@@ -4,18 +4,20 @@
 //! silently dropping a clause would return wrong results instead of an honest
 //! error.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crabgresql_parser::ast;
 use crabgresql_protocol::sqlstate;
-use crabgresql_storage_api::{TableAm, TableEngine};
+use crabgresql_storage_api::{Column, TableAm, TableEngine, TableSchema};
 use crabgresql_types::Value;
 
 use crate::expr::{
     BoundExpr, Scope, bind_expr, bind_scalar, coerce_to_column, normalize_ident, output_name,
-    to_bool_operand,
+    to_bool_operand, unify_value_column,
 };
-use crate::{BindError, OutputColumn};
+use crate::functions::{bind_table_fn_call, positional_arg_exprs};
+use crate::{BindError, OutputColumn, TableFn};
 
 /// A bound statement: names resolved, expressions typed, clauses vetted.
 /// Carries the opened `TableAm` so later stages never re-resolve the name.
@@ -28,9 +30,11 @@ pub struct SortKey {
     pub nulls_first: bool,
 }
 
+#[derive(Clone)]
 pub enum LogicalPlan {
-    /// FROM-less SELECT: one constant row. The predicate (`SELECT 1 WHERE
-    /// false`) contains no column references — it bound in the empty scope.
+    /// FROM-less SELECT (`SELECT 1`) or a standalone `VALUES` list: one or more
+    /// constant rows. A predicate (`SELECT 1 WHERE false`) contains no column
+    /// references — it bound in the empty scope.
     Values {
         columns: Vec<OutputColumn>,
         rows: Vec<Vec<BoundExpr>>,
@@ -40,6 +44,27 @@ pub enum LogicalPlan {
     /// Single-table SELECT with optional predicate.
     Query {
         table: Arc<dyn TableAm>,
+        columns: Vec<OutputColumn>,
+        projections: Vec<BoundExpr>,
+        predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
+    },
+    /// SELECT over a subquery source in FROM: a derived table (`(SELECT ...) s`)
+    /// or a CTE reference. `source` produces the input rows; the same
+    /// projection/predicate/sort pipeline as `Query` runs on top.
+    Subquery {
+        source: Box<LogicalPlan>,
+        columns: Vec<OutputColumn>,
+        projections: Vec<BoundExpr>,
+        predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
+    },
+    /// SELECT over a set-returning function in FROM position. The source rows
+    /// come from evaluating `func` with `args`; the same projection/predicate/
+    /// sort pipeline as `Query` runs on top.
+    TableFunction {
+        func: TableFn,
+        args: Vec<BoundExpr>,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -112,35 +137,296 @@ fn bind_where(
         .transpose()
 }
 
+/// A resolved CTE: its output columns and the plan that produces its rows.
+/// Cloned on each reference (single-FROM keeps this cheap in practice).
+#[derive(Clone)]
+struct CteRelation {
+    columns: Vec<OutputColumn>,
+    plan: LogicalPlan,
+}
+
+/// The set of CTE names visible while binding a query — the enclosing `WITH`
+/// plus any earlier siblings in the same clause.
+type CteEnv = HashMap<String, CteRelation>;
+
 pub fn bind_query(
     engine: &Arc<dyn TableEngine>,
     query: &ast::Query,
 ) -> Result<LogicalPlan, BindError> {
-    reject_unsupported_query_clauses(query)?;
-    let select = match query.body.as_ref() {
-        ast::SetExpr::Select(select) => select,
-        other => {
-            return Err(BindError::feature_not_supported(format!(
-                "query form is not supported yet: {other}"
-            )));
-        }
-    };
-    reject_unsupported_select_clauses(select)?;
+    bind_query_scoped(engine, query, &CteEnv::new())
+}
 
+/// Bind a query with a set of visible CTEs. Recurses for CTE bodies and derived
+/// tables, extending the environment with this query's own `WITH` clause.
+fn bind_query_scoped(
+    engine: &Arc<dyn TableEngine>,
+    query: &ast::Query,
+    outer: &CteEnv,
+) -> Result<LogicalPlan, BindError> {
+    let ctes = bind_ctes(engine, query, outer)?;
+    reject_unsupported_query_clauses(query)?;
+
+    match query.body.as_ref() {
+        ast::SetExpr::Select(select) => {
+            reject_unsupported_select_clauses(select)?;
+            bind_select(engine, select, &query.order_by, &ctes)
+        }
+        ast::SetExpr::Values(values) => bind_values_query(values, &query.order_by),
+        other => Err(BindError::feature_not_supported(format!(
+            "query form is not supported yet: {other}"
+        ))),
+    }
+}
+
+/// Bind this query's `WITH` clause (if any) into a fresh environment layered on
+/// `outer`. CTEs bind in order, each seeing earlier siblings; recursion and
+/// `WITH` on data-modifying bodies are not yet supported.
+fn bind_ctes(
+    engine: &Arc<dyn TableEngine>,
+    query: &ast::Query,
+    outer: &CteEnv,
+) -> Result<CteEnv, BindError> {
+    let mut ctes = outer.clone();
+    let Some(with) = &query.with else {
+        return Ok(ctes);
+    };
+    if with.recursive {
+        return Err(BindError::feature_not_supported(
+            "WITH RECURSIVE is not supported yet",
+        ));
+    }
+    for cte in &with.cte_tables {
+        let name = normalize_ident(&cte.alias.name);
+        let plan = bind_query_scoped(engine, &cte.query, &ctes)?;
+        let mut columns = output_columns_of(&plan)?;
+        apply_alias_columns(&mut columns, &cte.alias.columns)?;
+        ctes.insert(name, CteRelation { columns, plan });
+    }
+    Ok(ctes)
+}
+
+/// Bind the SELECT body (its FROM item, projections, WHERE, ORDER BY).
+fn bind_select(
+    engine: &Arc<dyn TableEngine>,
+    select: &ast::Select,
+    order_by: &Option<ast::OrderBy>,
+    ctes: &CteEnv,
+) -> Result<LogicalPlan, BindError> {
     match select.from.as_slice() {
-        [] => bind_values_select(select, &query.order_by),
+        [] => bind_values_select(select, order_by),
         [table] => {
             if !table.joins.is_empty() {
                 return Err(BindError::feature_not_supported(
                     "JOIN is not supported yet",
                 ));
             }
-            bind_table_select(engine, &table.relation, select, &query.order_by)
+            bind_from_select(engine, &table.relation, select, order_by, ctes)
         }
         _ => Err(BindError::feature_not_supported(
             "multiple FROM items are not supported yet",
         )),
     }
+}
+
+/// Dispatch a single FROM item to the right binder: a table function, a CTE
+/// reference, a derived table, or a base table.
+fn bind_from_select(
+    engine: &Arc<dyn TableEngine>,
+    relation: &ast::TableFactor,
+    select: &ast::Select,
+    order_by: &Option<ast::OrderBy>,
+    ctes: &CteEnv,
+) -> Result<LogicalPlan, BindError> {
+    match relation {
+        // A `Table` factor carrying call arguments is a set-returning function.
+        ast::TableFactor::Table {
+            name,
+            alias,
+            args: Some(fn_args),
+            ..
+        } => bind_table_function_select(name, fn_args, alias, select, order_by),
+        // A bare name may resolve to a CTE (which shadows a real table).
+        ast::TableFactor::Table {
+            name,
+            alias,
+            args: None,
+            ..
+        } => {
+            let tname = object_name_to_table_name(name)?;
+            if let Some(cte) = ctes.get(&tname) {
+                let qualifier = relation_qualifier(alias, &tname)?;
+                let mut columns = cte.columns.clone();
+                apply_relation_alias_columns(&mut columns, alias)?;
+                return bind_subquery_select(cte.plan.clone(), columns, qualifier, select, order_by);
+            }
+            bind_table_select(engine, relation, select, order_by)
+        }
+        ast::TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let Some(alias) = alias else {
+                return Err(BindError::new(
+                    sqlstate::SYNTAX_ERROR,
+                    "subquery in FROM must have an alias",
+                ));
+            };
+            let qualifier = normalize_ident(&alias.name);
+            let inner = bind_query_scoped(engine, subquery, ctes)?;
+            let mut columns = output_columns_of(&inner)?;
+            apply_alias_columns(&mut columns, &alias.columns)?;
+            bind_subquery_select(inner, columns, qualifier, select, order_by)
+        }
+        other => Err(BindError::feature_not_supported(format!(
+            "FROM item is not supported yet: {other}"
+        ))),
+    }
+}
+
+/// Bind a SELECT whose source is a subquery (a derived table or CTE reference).
+/// The source's output columns form a synthetic relation so the outer SELECT
+/// binds exactly as it would over a base table.
+fn bind_subquery_select(
+    source: LogicalPlan,
+    source_columns: Vec<OutputColumn>,
+    qualifier: String,
+    select: &ast::Select,
+    order_by: &Option<ast::OrderBy>,
+) -> Result<LogicalPlan, BindError> {
+    let schema = TableSchema {
+        name: qualifier.clone(),
+        columns: source_columns
+            .into_iter()
+            .map(|c| Column {
+                name: c.name,
+                ty: c.ty,
+            })
+            .collect(),
+    };
+    let body = bind_select_body(select, order_by, &schema, &qualifier)?;
+    Ok(LogicalPlan::Subquery {
+        source: Box::new(source),
+        columns: body.columns,
+        projections: body.projections,
+        predicate: body.predicate,
+        sort: body.sort,
+    })
+}
+
+/// A standalone `VALUES (...), (...)` list. Column names default to
+/// `column1..columnN`; each column resolves to a common type across all rows.
+fn bind_values_query(
+    values: &ast::Values,
+    order_by: &Option<ast::OrderBy>,
+) -> Result<LogicalPlan, BindError> {
+    if values.rows.is_empty() {
+        return Err(BindError::syntax("VALUES lists must not be empty"));
+    }
+    let width = values.rows[0].content.len();
+    let scope = Scope::empty();
+    // Bind every cell, grouping bindings by column for type unification.
+    let mut columns_of_bindings: Vec<Vec<crate::Binding>> = vec![Vec::new(); width];
+    for row in &values.rows {
+        if row.content.len() != width {
+            return Err(BindError::new(
+                sqlstate::SYNTAX_ERROR,
+                "VALUES lists must all be the same length",
+            ));
+        }
+        for (col, expr) in row.content.iter().enumerate() {
+            columns_of_bindings[col].push(bind_expr(expr, &scope)?);
+        }
+    }
+
+    let mut columns = Vec::with_capacity(width);
+    let mut column_cells: Vec<Vec<BoundExpr>> = Vec::with_capacity(width);
+    for (i, bindings) in columns_of_bindings.into_iter().enumerate() {
+        let (ty, cells) = unify_value_column(bindings)?;
+        columns.push(OutputColumn {
+            name: format!("column{}", i + 1),
+            ty,
+        });
+        column_cells.push(cells);
+    }
+    // Transpose column-major cells back into rows.
+    let rows = (0..values.rows.len())
+        .map(|r| column_cells.iter().map(|col| col[r].clone()).collect())
+        .collect();
+
+    let sort = bind_order_by(order_by, &columns)?;
+    Ok(LogicalPlan::Values {
+        columns,
+        rows,
+        predicate: None,
+        sort,
+    })
+}
+
+/// The output columns a query plan produces (for CTE/derived-table schemas).
+fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindError> {
+    match plan {
+        LogicalPlan::Values { columns, .. }
+        | LogicalPlan::Query { columns, .. }
+        | LogicalPlan::Subquery { columns, .. }
+        | LogicalPlan::TableFunction { columns, .. } => Ok(columns.clone()),
+        LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => {
+            Err(BindError::feature_not_supported(
+                "data-modifying statements in WITH are not supported yet",
+            ))
+        }
+    }
+}
+
+/// The qualifier a FROM item's columns are addressed by: its alias, else its
+/// name. Rejects a schema-qualified alias (none exists for these forms).
+fn relation_qualifier(
+    alias: &Option<ast::TableAlias>,
+    default: &str,
+) -> Result<String, BindError> {
+    match alias {
+        None => Ok(default.to_string()),
+        Some(alias) => Ok(normalize_ident(&alias.name)),
+    }
+}
+
+/// Apply an optional relation alias's column list to a rowset's columns.
+fn apply_relation_alias_columns(
+    columns: &mut [OutputColumn],
+    alias: &Option<ast::TableAlias>,
+) -> Result<(), BindError> {
+    match alias {
+        None => Ok(()),
+        Some(alias) => apply_alias_columns(columns, &alias.columns),
+    }
+}
+
+/// Rename a rowset's columns from an alias column list (`t(a, b, c)`); the count
+/// must match, and per-column type annotations are not supported.
+fn apply_alias_columns(
+    columns: &mut [OutputColumn],
+    alias_columns: &[ast::TableAliasColumnDef],
+) -> Result<(), BindError> {
+    if alias_columns.is_empty() {
+        return Ok(());
+    }
+    if alias_columns.iter().any(|c| c.data_type.is_some()) {
+        return Err(BindError::feature_not_supported(
+            "column type annotations in a table alias are not supported yet",
+        ));
+    }
+    if alias_columns.len() != columns.len() {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            format!(
+                "table alias has {} columns but the relation has {}",
+                alias_columns.len(),
+                columns.len()
+            ),
+        ));
+    }
+    for (col, def) in columns.iter_mut().zip(alias_columns) {
+        col.name = normalize_ident(&def.name);
+    }
+    Ok(())
 }
 
 /// Bind an ORDER BY clause against the already-built output columns. Only
@@ -192,9 +478,8 @@ fn bind_order_by(
 }
 
 fn reject_unsupported_query_clauses(query: &ast::Query) -> Result<(), BindError> {
-    let unsupported: Option<&str> = if query.with.is_some() {
-        Some("WITH")
-    } else if query.limit_clause.is_some() {
+    // WITH is handled by the caller (bind_ctes); it is not rejected here.
+    let unsupported: Option<&str> = if query.limit_clause.is_some() {
         Some("LIMIT/OFFSET")
     } else if query.fetch.is_some() {
         Some("FETCH")
@@ -281,24 +566,102 @@ fn bind_table_select(
 ) -> Result<LogicalPlan, BindError> {
     let (table, qualifier) = open_relation(engine, relation)?;
     let schema = table.schema().clone();
-    let scope = Scope::table(&schema, qualifier.clone());
+    let body = bind_select_body(select, order_by, &schema, &qualifier)?;
+    Ok(LogicalPlan::Query {
+        table,
+        columns: body.columns,
+        projections: body.projections,
+        predicate: body.predicate,
+        sort: body.sort,
+    })
+}
+
+/// Bind a set-returning function in FROM position. Its fixed output columns
+/// form a synthetic single-relation schema, so the SELECT list, WHERE and
+/// ORDER BY bind exactly as they would over a base table.
+fn bind_table_function_select(
+    name: &ast::ObjectName,
+    fn_args: &ast::TableFunctionArgs,
+    alias: &Option<ast::TableAlias>,
+    select: &ast::Select,
+    order_by: &Option<ast::OrderBy>,
+) -> Result<LogicalPlan, BindError> {
+    if fn_args.settings.is_some() {
+        return Err(BindError::feature_not_supported(
+            "table function SETTINGS are not supported yet",
+        ));
+    }
+    let fname = object_name_to_table_name(name)?;
+    let arg_exprs = positional_arg_exprs(&fn_args.args)?;
+    let (func, args) = bind_table_fn_call(&fname, &arg_exprs, &Scope::empty())?;
+
+    let qualifier = match alias {
+        None => fname,
+        Some(alias) => {
+            if !alias.columns.is_empty() {
+                return Err(BindError::feature_not_supported(
+                    "column aliases in FROM are not supported yet",
+                ));
+            }
+            normalize_ident(&alias.name)
+        }
+    };
+    let schema = TableSchema {
+        name: qualifier.clone(),
+        columns: func
+            .columns()
+            .into_iter()
+            .map(|c| Column {
+                name: c.name,
+                ty: c.ty,
+            })
+            .collect(),
+    };
+    let body = bind_select_body(select, order_by, &schema, &qualifier)?;
+    Ok(LogicalPlan::TableFunction {
+        func,
+        args,
+        columns: body.columns,
+        projections: body.projections,
+        predicate: body.predicate,
+        sort: body.sort,
+    })
+}
+
+/// The bound pieces of a SELECT over a single in-scope relation.
+struct SelectBody {
+    columns: Vec<OutputColumn>,
+    projections: Vec<BoundExpr>,
+    predicate: Option<BoundExpr>,
+    sort: Vec<SortKey>,
+}
+
+/// Bind a SELECT's projection list, WHERE and ORDER BY against a single
+/// in-scope relation (`schema` addressed by `qualifier`).
+fn bind_select_body(
+    select: &ast::Select,
+    order_by: &Option<ast::OrderBy>,
+    schema: &TableSchema,
+    qualifier: &str,
+) -> Result<SelectBody, BindError> {
+    let scope = Scope::table(schema, qualifier.to_string());
 
     let mut columns = Vec::new();
     let mut projections = Vec::new();
     for item in &select.projection {
         match classify_select_item(item)? {
             SelectField::Wildcard => {
-                expand_all(&schema, &mut columns, &mut projections);
+                expand_all(schema, &mut columns, &mut projections);
             }
             SelectField::QualifiedWildcard(q) => {
-                // `f.*` is only valid for the table's qualifier.
+                // `f.*` is only valid for the relation's qualifier.
                 if q != qualifier {
                     return Err(BindError::new(
                         sqlstate::UNDEFINED_TABLE,
                         format!("missing FROM-clause entry for table \"{q}\""),
                     ));
                 }
-                expand_all(&schema, &mut columns, &mut projections);
+                expand_all(schema, &mut columns, &mut projections);
             }
             SelectField::Expr(expr, alias) => {
                 let bound = bind_scalar(expr, &scope)?;
@@ -313,8 +676,7 @@ fn bind_table_select(
 
     let predicate = bind_where(&select.selection, &scope)?;
     let sort = bind_order_by(order_by, &columns)?;
-    Ok(LogicalPlan::Query {
-        table,
+    Ok(SelectBody {
         columns,
         projections,
         predicate,
@@ -1112,5 +1474,114 @@ mod tests {
         };
         assert_eq!(rows.len(), 1);
         assert!(predicate.is_some());
+    }
+
+    #[test]
+    fn set_returning_function_in_from_binds_columns() {
+        let LogicalPlan::TableFunction { func, columns, .. } =
+            bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4')").unwrap()
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(func, crate::TableFn::PgInputErrorInfo);
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
+        assert!(columns.iter().all(|c| c.ty == PgType::Text));
+    }
+
+    #[test]
+    fn set_returning_function_projects_and_filters() {
+        // A subset projection over the SRF's columns resolves like a table.
+        let LogicalPlan::TableFunction {
+            columns, predicate, ..
+        } = bind_one(
+            "SELECT sql_error_code FROM pg_input_error_info('1e400', 'float4') \
+             WHERE message IS NOT NULL",
+        )
+        .unwrap()
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "sql_error_code");
+        assert!(predicate.is_some());
+    }
+
+    #[test]
+    fn unknown_set_returning_function_is_42883() {
+        let e = bind_err("SELECT * FROM no_such_srf('x')");
+        assert_eq!(e.code, "42883");
+        assert_eq!(e.message, "function no_such_srf(unknown) does not exist");
+    }
+
+    #[test]
+    fn standalone_values_binds_to_values_plan() {
+        let LogicalPlan::Values { columns, rows, .. } =
+            bind_one("VALUES (1, 'a'), (2, 'b')").unwrap()
+        else {
+            panic!("expected Values");
+        };
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "column1");
+        assert_eq!(columns[1].name, "column2");
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn values_uneven_row_lengths_error() {
+        let e = bind_err("VALUES (1), (2, 3)");
+        assert_eq!(e.code, "42601");
+    }
+
+    #[test]
+    fn derived_table_binds_to_subquery_plan() {
+        let LogicalPlan::Subquery { columns, .. } =
+            bind_one("SELECT x FROM (VALUES (1), (2)) v(x)").unwrap()
+        else {
+            panic!("expected Subquery");
+        };
+        assert_eq!(columns[0].name, "x");
+    }
+
+    #[test]
+    fn derived_table_requires_alias() {
+        let e = bind_err("SELECT * FROM (VALUES (1))");
+        assert_eq!(e.code, "42601");
+        assert_eq!(e.message, "subquery in FROM must have an alias");
+    }
+
+    #[test]
+    fn cte_reference_resolves_to_subquery() {
+        let LogicalPlan::Subquery { columns, .. } =
+            bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t").unwrap()
+        else {
+            panic!("expected Subquery");
+        };
+        assert_eq!(columns[0].name, "x");
+    }
+
+    #[test]
+    fn cte_column_count_mismatch_errors() {
+        let e = bind_err("WITH t(a, b) AS (VALUES (1)) SELECT * FROM t");
+        assert_eq!(e.code, "42601");
+    }
+
+    #[test]
+    fn with_recursive_is_rejected() {
+        let e = bind_err("WITH RECURSIVE t(n) AS (VALUES (1)) SELECT n FROM t");
+        assert_eq!(e.code, "0A000");
+        assert_eq!(e.message, "WITH RECURSIVE is not supported yet");
+    }
+
+    #[test]
+    fn cte_shadows_a_real_table() {
+        // `t` here is the CTE, not the base table `t`; its column is `x`.
+        let LogicalPlan::Subquery { columns, .. } =
+            bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t").unwrap()
+        else {
+            panic!("expected Subquery");
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "x");
     }
 }
