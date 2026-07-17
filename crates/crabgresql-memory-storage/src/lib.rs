@@ -6,9 +6,12 @@
 //! and stays stable while writers copy-on-write.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crabgresql_storage_api::{StorageError, TableAm, TableEngine, TableSchema, Tuple};
+use crabgresql_storage_api::{
+    DeleteResult, StorageError, TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
+};
 
 #[derive(Default)]
 pub struct MemoryEngine {
@@ -30,6 +33,7 @@ impl TableEngine for MemoryEngine {
         let table = Arc::new(MemoryTable {
             schema: schema.clone(),
             rows: RwLock::new(Arc::new(Vec::new())),
+            next_tid: AtomicU64::new(0),
         });
         tables.insert(schema.name, table.clone());
         Ok(table)
@@ -47,23 +51,28 @@ impl TableEngine for MemoryEngine {
 
 pub struct MemoryTable {
     schema: TableSchema,
-    rows: RwLock<Arc<Vec<Tuple>>>,
+    /// Rows tagged with their tid, always sorted ascending by tid: tids are
+    /// allocated under the write lock and never reused, inserts append, and a
+    /// delete leaves a gap instead of renumbering survivors. Lookups binary
+    /// search on this invariant.
+    rows: RwLock<Arc<Vec<(Tid, Tuple)>>>,
+    next_tid: AtomicU64,
 }
 
 /// Iterates a shared snapshot, cloning one tuple per `next()` call instead of
 /// copying the whole table up front.
 struct SnapshotIter {
-    rows: Arc<Vec<Tuple>>,
+    rows: Arc<Vec<(Tid, Tuple)>>,
     pos: usize,
 }
 
 impl Iterator for SnapshotIter {
-    type Item = Tuple;
+    type Item = (Tid, Tuple);
 
-    fn next(&mut self) -> Option<Tuple> {
-        let tuple = self.rows.get(self.pos)?.clone();
+    fn next(&mut self) -> Option<(Tid, Tuple)> {
+        let row = self.rows.get(self.pos)?.clone();
         self.pos += 1;
-        Some(tuple)
+        Some(row)
     }
 }
 
@@ -72,15 +81,71 @@ impl TableAm for MemoryTable {
         &self.schema
     }
 
-    fn scan(&self) -> Box<dyn Iterator<Item = Tuple> + Send> {
+    fn scan(&self) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
         let rows = Arc::clone(&self.rows.read().unwrap());
         Box::new(SnapshotIter { rows, pos: 0 })
     }
 
-    fn insert(&self, tuple: Tuple) {
+    fn insert(&self, tuple: Tuple) -> Tid {
         // Copy-on-write: cheap append normally, clones the Vec only while a
         // concurrent scan still holds the previous snapshot.
-        Arc::make_mut(&mut *self.rows.write().unwrap()).push(tuple);
+        let mut rows = self.rows.write().unwrap();
+        // Allocate under the write lock: a tid handed out before locking
+        // could be appended after a later tid, breaking the sort invariant.
+        let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
+        Arc::make_mut(&mut *rows).push((tid, tuple));
+        tid
+    }
+
+    fn update(&self, tid: Tid, tuple: Tuple) -> UpdateResult {
+        let mut rows = self.rows.write().unwrap();
+        let rows = Arc::make_mut(&mut *rows);
+        match rows.binary_search_by_key(&tid, |(t, _)| *t) {
+            Ok(pos) => {
+                rows[pos].1 = tuple;
+                UpdateResult::Updated
+            }
+            Err(_) => UpdateResult::NotFound,
+        }
+    }
+
+    fn delete(&self, tid: Tid) -> DeleteResult {
+        let mut rows = self.rows.write().unwrap();
+        let rows = Arc::make_mut(&mut *rows);
+        match rows.binary_search_by_key(&tid, |(t, _)| *t) {
+            Ok(pos) => {
+                rows.remove(pos);
+                DeleteResult::Deleted
+            }
+            Err(_) => DeleteResult::NotFound,
+        }
+    }
+
+    /// One lock acquisition and at most one copy-on-write clone for the whole
+    /// batch — per-row calls would pay both per update.
+    fn update_many(&self, updates: Vec<(Tid, Tuple)>) -> u64 {
+        let mut rows = self.rows.write().unwrap();
+        let rows = Arc::make_mut(&mut *rows);
+        let mut applied = 0;
+        for (tid, tuple) in updates {
+            if let Ok(pos) = rows.binary_search_by_key(&tid, |(t, _)| *t) {
+                rows[pos].1 = tuple;
+                applied += 1;
+            }
+        }
+        applied
+    }
+
+    /// Single retain pass instead of per-tid removal (each `Vec::remove`
+    /// shifts the whole tail).
+    fn delete_many(&self, tids: Vec<Tid>) -> u64 {
+        let mut tids = tids;
+        tids.sort_unstable();
+        let mut rows = self.rows.write().unwrap();
+        let rows = Arc::make_mut(&mut *rows);
+        let before = rows.len();
+        rows.retain(|(t, _)| tids.binary_search(t).is_err());
+        (before - rows.len()) as u64
     }
 }
 
@@ -115,8 +180,63 @@ mod tests {
 
         let rows: Vec<_> = table.scan().collect();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], vec![Value::Int4(1), Value::Text("one".into())]);
-        assert_eq!(rows[1], vec![Value::Int4(2), Value::Null]);
+        assert_eq!(rows[0].1, vec![Value::Int4(1), Value::Text("one".into())]);
+        assert_eq!(rows[1].1, vec![Value::Int4(2), Value::Null]);
+    }
+
+    #[test]
+    fn insert_returns_monotonic_tids() {
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t")).unwrap();
+        let a = table.insert(vec![Value::Int4(1), Value::Null]);
+        let b = table.insert(vec![Value::Int4(2), Value::Null]);
+        assert!(b > a);
+        let tids: Vec<Tid> = table.scan().map(|(tid, _)| tid).collect();
+        assert_eq!(tids, vec![a, b]);
+    }
+
+    #[test]
+    fn update_replaces_row_in_place() {
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t")).unwrap();
+        let tid = table.insert(vec![Value::Int4(1), Value::Text("one".into())]);
+        assert_eq!(
+            table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())]),
+            UpdateResult::Updated
+        );
+        let rows: Vec<_> = table.scan().collect();
+        assert_eq!(
+            rows,
+            vec![(tid, vec![Value::Int4(1), Value::Text("uno".into())])]
+        );
+    }
+
+    #[test]
+    fn delete_leaves_other_tids_untouched() {
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t")).unwrap();
+        let a = table.insert(vec![Value::Int4(1), Value::Null]);
+        let b = table.insert(vec![Value::Int4(2), Value::Null]);
+        let c = table.insert(vec![Value::Int4(3), Value::Null]);
+        assert_eq!(table.delete(b), DeleteResult::Deleted);
+        let tids: Vec<Tid> = table.scan().map(|(tid, _)| tid).collect();
+        assert_eq!(tids, vec![a, c]);
+        // Tids are never reused: the next insert gets a fresh one.
+        let d = table.insert(vec![Value::Int4(4), Value::Null]);
+        assert!(d > c);
+    }
+
+    #[test]
+    fn update_and_delete_of_missing_tid_report_not_found() {
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t")).unwrap();
+        let tid = table.insert(vec![Value::Int4(1), Value::Null]);
+        assert_eq!(table.delete(tid), DeleteResult::Deleted);
+        assert_eq!(table.delete(tid), DeleteResult::NotFound);
+        assert_eq!(
+            table.update(tid, vec![Value::Int4(2), Value::Null]),
+            UpdateResult::NotFound
+        );
     }
 
     #[test]
@@ -139,12 +259,64 @@ mod tests {
     }
 
     #[test]
-    fn scan_is_stable_against_concurrent_insert() {
+    fn update_many_applies_batch_and_skips_missing() {
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t")).unwrap();
-        table.insert(vec![Value::Int4(1), Value::Null]);
+        let a = table.insert(vec![Value::Int4(1), Value::Null]);
+        let b = table.insert(vec![Value::Int4(2), Value::Null]);
+        table.delete(b);
+        let applied = table.update_many(vec![
+            (a, vec![Value::Int4(10), Value::Null]),
+            (b, vec![Value::Int4(20), Value::Null]),
+        ]);
+        assert_eq!(applied, 1);
+        let rows: Vec<_> = table.scan().collect();
+        assert_eq!(rows, vec![(a, vec![Value::Int4(10), Value::Null])]);
+    }
+
+    #[test]
+    fn delete_many_removes_batch_in_one_pass() {
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t")).unwrap();
+        let a = table.insert(vec![Value::Int4(1), Value::Null]);
+        let b = table.insert(vec![Value::Int4(2), Value::Null]);
+        let c = table.insert(vec![Value::Int4(3), Value::Null]);
+        table.delete(b);
+        assert_eq!(table.delete_many(vec![a, b, c]), 2);
+        assert_eq!(table.scan().count(), 0);
+    }
+
+    #[test]
+    fn concurrent_inserts_keep_rows_sorted_by_tid() {
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t")).unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for i in 0..250 {
+                        table.insert(vec![Value::Int4(i), Value::Null]);
+                    }
+                });
+            }
+        });
+        let tids: Vec<Tid> = table.scan().map(|(tid, _)| tid).collect();
+        assert_eq!(tids.len(), 1000);
+        assert!(
+            tids.windows(2).all(|w| w[0] < w[1]),
+            "rows must stay tid-sorted"
+        );
+    }
+
+    #[test]
+    fn scan_is_stable_against_concurrent_writes() {
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t")).unwrap();
+        let a = table.insert(vec![Value::Int4(1), Value::Null]);
         let scan = table.scan();
         table.insert(vec![Value::Int4(2), Value::Null]);
-        assert_eq!(scan.count(), 1);
+        table.update(a, vec![Value::Int4(99), Value::Null]);
+        table.delete(a);
+        let rows: Vec<_> = scan.collect();
+        assert_eq!(rows, vec![(a, vec![Value::Int4(1), Value::Null])]);
     }
 }

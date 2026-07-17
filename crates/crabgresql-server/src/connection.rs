@@ -129,7 +129,11 @@ async fn run_simple_query(
     }
     for stmt in &statements {
         match execute_statement(engine, stmt) {
-            Ok(result) => write_result(writer, result).await?,
+            Ok(result) => {
+                if write_result(writer, result).await? == WriteOutcome::Errored {
+                    return Ok(());
+                }
+            }
             Err(PgError { code, message }) => {
                 writer.error_response(code, &message);
                 return Ok(());
@@ -139,10 +143,19 @@ async fn run_simple_query(
     Ok(())
 }
 
+#[derive(PartialEq, Eq)]
+enum WriteOutcome {
+    Completed,
+    /// An execution error surfaced mid-stream: ErrorResponse was sent (after
+    /// any rows already on the wire, which stay sent — as in PG) and the
+    /// remaining statements of this Query message must be skipped.
+    Errored,
+}
+
 async fn write_result(
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
     result: QueryResult,
-) -> Result<(), ProtocolError> {
+) -> Result<WriteOutcome, ProtocolError> {
     match result {
         QueryResult::Command { tag } => writer.command_complete(&tag),
         QueryResult::Rows { columns, mut node } => {
@@ -156,16 +169,26 @@ async fn write_result(
                 .collect();
             writer.row_description(&fields);
             let mut count = 0u64;
-            while let Some(row) = node.next() {
-                let cols: Vec<Option<String>> = row.iter().map(|v| v.encode_text()).collect();
-                writer.data_row(&cols);
-                count += 1;
-                if writer.buffered() >= STREAM_FLUSH_BYTES {
-                    writer.flush().await?;
+            loop {
+                match node.next() {
+                    Ok(Some(row)) => {
+                        let cols: Vec<Option<String>> =
+                            row.iter().map(|v| v.encode_text()).collect();
+                        writer.data_row(&cols);
+                        count += 1;
+                        if writer.buffered() >= STREAM_FLUSH_BYTES {
+                            writer.flush().await?;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        writer.error_response(e.code, &e.message);
+                        return Ok(WriteOutcome::Errored);
+                    }
                 }
             }
             writer.command_complete(&format!("SELECT {count}"));
         }
     }
-    Ok(())
+    Ok(WriteOutcome::Completed)
 }

@@ -215,10 +215,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "crabgresql-executor"
+name = "crabgresql-binder"
 version = "0.1.0"
 dependencies = [
  "crabgresql-memory-storage",
+ "crabgresql-parser",
+ "crabgresql-protocol",
+ "crabgresql-storage-api",
+ "crabgresql-types",
+]
+
+[[package]]
+name = "crabgresql-executor"
+version = "0.1.0"
+dependencies = [
+ "crabgresql-binder",
+ "crabgresql-memory-storage",
+ "crabgresql-parser",
+ "crabgresql-planner",
+ "crabgresql-protocol",
  "crabgresql-storage-api",
  "crabgresql-types",
 ]
@@ -251,6 +266,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabgresql-planner"
+version = "0.1.0"
+dependencies = [
+ "crabgresql-binder",
+ "crabgresql-memory-storage",
+ "crabgresql-parser",
+ "crabgresql-storage-api",
+ "crabgresql-types",
+]
+
+[[package]]
 name = "crabgresql-protocol"
 version = "0.1.0"
 dependencies = [
@@ -263,9 +289,11 @@ dependencies = [
 name = "crabgresql-server"
 version = "0.1.0"
 dependencies = [
+ "crabgresql-binder",
  "crabgresql-executor",
  "crabgresql-memory-storage",
  "crabgresql-parser",
+ "crabgresql-planner",
  "crabgresql-protocol",
  "crabgresql-storage-api",
  "crabgresql-types",

@@ -3,21 +3,17 @@
 A PostgreSQL-compatible DBMS written in Rust. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
-**Status: M0 — "Hello, psql".** The pgwire v3 handshake and simple-query
-protocol work end-to-end against the in-memory storage engine:
+**Status: M1 in progress — CRUD.** The full parse → bind → plan → execute
+pipeline runs simple CRUD end-to-end against the in-memory storage engine:
 
 ```console
 $ cargo run -p crabgresql-server
 $ psql -h 127.0.0.1 -p 5433
-=> SELECT 1;
- ?column?
-----------
-        1
-(1 row)
-
 => CREATE TABLE crabs (id integer, name text);
-=> INSERT INTO crabs VALUES (1, 'ferris');
-=> SELECT * FROM crabs;
+=> INSERT INTO crabs VALUES (1, 'ferris'), (2, 'hermit');
+=> SELECT id + 1, name FROM crabs WHERE id <> 2;
+=> UPDATE crabs SET name = 'red' WHERE id = 1;
+=> DELETE FROM crabs WHERE name = 'red';
 ```
 
 What exists today:
@@ -27,17 +23,26 @@ What exists today:
   simple-query cycle with streamed result sets, `ErrorResponse` with real
   SQLSTATE codes. No TLS or SCRAM yet; extended-query messages fail cleanly
   (one error, skip until Sync, one ReadyForQuery — PG error recovery).
-- **SQL** (`crabgresql-parser` + `crabgresql-server`): sqlparser-rs with the
-  PG dialect; FROM-less `SELECT` over literals, single-table `SELECT`,
-  `CREATE TABLE [IF NOT EXISTS]`, atomic `INSERT ... VALUES` (with PG-style
-  untyped-literal coercion and NULL padding), no-op `SET`. int4/int8/text/bool
-  only. Anything parsed but not executed (WHERE, ORDER BY, GROUP BY, LIMIT,
-  JOIN, constraints, ...) errors with `0A000` instead of being silently
-  ignored.
+- **SQL** (`crabgresql-parser` → `crabgresql-binder` → `crabgresql-planner`):
+  sqlparser-rs with the PG dialect; the binder resolves names and infers
+  types with PG semantics (int4/int8 promotion, untyped-literal coercion,
+  `unknown` handling, PG error messages and SQLSTATEs), the planner maps the
+  logical plan 1:1 onto scan pipelines. Supported: FROM-less and single-table
+  `SELECT` with expressions and `WHERE`, `CREATE TABLE [IF NOT EXISTS]`,
+  atomic `INSERT ... VALUES`, `UPDATE ... SET ... [WHERE]`,
+  `DELETE FROM ... [WHERE]`, no-op `SET`. int4/int8/text/bool only. Anything
+  parsed but not executed (ORDER BY, GROUP BY, LIMIT, JOIN, constraints,
+  casts, ...) errors with `0A000` instead of being silently ignored.
+- **Expressions** (`crabgresql-executor::eval`): comparisons, `AND`/`OR`/`NOT`
+  with SQL three-valued NULL logic, `IS [NOT] NULL`, int4/int8 arithmetic
+  with PG overflow (`22003`) and division-by-zero (`22012`) behavior.
 - **Execution** (`crabgresql-executor`): Volcano iterator nodes — `Values`,
-  `SeqScan`, `Project`.
+  `SeqScan`, `Filter`, `Projection` — plus buffered (statement-atomic)
+  INSERT/UPDATE/DELETE.
 - **Storage** (`crabgresql-storage-api` + `crabgresql-memory-storage`): the
-  pluggable `TableEngine`/`TableAm` API and its in-memory reference engine.
+  pluggable `TableEngine`/`TableAm` API — tid-addressed scan/insert/update/
+  delete — and its in-memory reference engine (copy-on-write snapshots,
+  monotonic tids).
 
 Tests: `cargo test` — unit tests per crate plus end-to-end tests that drive a
 real driver (tokio-postgres) and raw-socket handshake checks.

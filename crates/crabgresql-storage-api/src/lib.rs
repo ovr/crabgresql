@@ -1,8 +1,9 @@
 //! Storage engine API: the `TableEngine` / `TableAm` extension point.
 //!
-//! M0 scope: create/open/scan/insert, no snapshots. When crabgresql-txn lands
-//! (M2), `scan`/`insert` grow snapshot and transaction parameters, and
-//! `update`/`delete`/`vacuum` join the trait — see docs/ARCHITECTURE.md §1.3.
+//! M1 scope: create/open/scan/insert/update/delete addressed by `Tid`, no
+//! snapshots. When crabgresql-txn lands (M2), the methods grow snapshot and
+//! transaction parameters and `update`/`delete` report conflict info for
+//! EvalPlanQual — see docs/ARCHITECTURE.md §1.3.
 
 use std::sync::Arc;
 
@@ -10,6 +11,10 @@ use crabgresql_types::{PgType, Value};
 
 /// A materialized row. Column order matches the table schema.
 pub type Tuple = Vec<Value>;
+
+/// Row identity: stable for the lifetime of a row, never reused within a
+/// table. An opaque scalar until pg-engine gives it (page, slot) structure.
+pub type Tid = u64;
 
 #[derive(Clone, Debug)]
 pub struct Column {
@@ -37,17 +42,65 @@ pub enum StorageError {
     TableNotFound(String),
 }
 
+/// Outcome of `TableAm::update`. `NotFound` (row vanished under us) is the
+/// M2 seam where EvalPlanQual conflict info will live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateResult {
+    Updated,
+    NotFound,
+}
+
+/// Outcome of `TableAm::delete`, mirroring [`UpdateResult`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteResult {
+    Deleted,
+    NotFound,
+}
+
 /// Table access: scans and modifications on one table.
 pub trait TableAm: Send + Sync {
     fn schema(&self) -> &TableSchema;
 
     /// Full scan. The iterator sees a stable snapshot of the table as of the
-    /// call (statement-level consistency until real MVCC snapshots exist).
-    fn scan(&self) -> Box<dyn Iterator<Item = Tuple> + Send>;
+    /// call (statement-level consistency until real MVCC snapshots exist), so
+    /// a DML statement never re-visits rows it modified itself.
+    fn scan(&self) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send>;
 
     /// The tuple must have exactly `schema().columns.len()` values in schema
     /// order — executors index tuples by schema position and rely on this.
-    fn insert(&self, tuple: Tuple);
+    fn insert(&self, tuple: Tuple) -> Tid;
+
+    /// Replace the row identified by `tid`. The tuple contract matches
+    /// [`TableAm::insert`].
+    fn update(&self, tid: Tid, tuple: Tuple) -> UpdateResult;
+
+    fn delete(&self, tid: Tid) -> DeleteResult;
+
+    /// Apply a batch of replacements, returning how many rows were found and
+    /// updated (vanished tids are skipped, not counted). Engines should
+    /// override this to apply the whole batch under one lock — per-row calls
+    /// make a large UPDATE quadratic.
+    fn update_many(&self, updates: Vec<(Tid, Tuple)>) -> u64 {
+        let mut applied = 0;
+        for (tid, tuple) in updates {
+            if self.update(tid, tuple) == UpdateResult::Updated {
+                applied += 1;
+            }
+        }
+        applied
+    }
+
+    /// Batch counterpart of [`TableAm::delete`], mirroring
+    /// [`TableAm::update_many`].
+    fn delete_many(&self, tids: Vec<Tid>) -> u64 {
+        let mut applied = 0;
+        for tid in tids {
+            if self.delete(tid) == DeleteResult::Deleted {
+                applied += 1;
+            }
+        }
+        applied
+    }
 }
 
 /// Engine factory: `CREATE TABLE ... USING <engine>`.
