@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crabgresql_binder::{bind_delete, bind_insert, bind_query, bind_update};
 use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
 use crabgresql_parser::ast;
-use crabgresql_protocol::sqlstate;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, StorageError, TableEngine, TableSchema};
 use crabgresql_types::PgType;
 

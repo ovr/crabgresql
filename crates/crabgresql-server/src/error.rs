@@ -1,6 +1,6 @@
 //! Errors reported to the client as `ErrorResponse` (SQLSTATE + message).
 
-use crabgresql_protocol::sqlstate;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::StorageError;
 
 #[derive(Debug)]

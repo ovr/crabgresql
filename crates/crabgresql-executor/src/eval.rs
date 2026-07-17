@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
-use crabgresql_protocol::sqlstate;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{PgType, Value, cast, float};
 
 use crate::{ExecContext, ExecError};

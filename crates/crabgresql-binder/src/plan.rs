@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crabgresql_parser::ast;
-use crabgresql_protocol::sqlstate;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, TableAm, TableEngine, TableSchema};
 use crabgresql_types::Value;
 
