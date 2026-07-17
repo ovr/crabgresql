@@ -93,15 +93,14 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
             projections,
             predicate,
             sort,
-        } => {
-            let mut node: Box<dyn ExecNode> = Box::new(SeqScan::new(&table));
-            if let Some(predicate) = predicate {
-                node = Box::new(Filter::new(node, predicate, ctx));
-            }
-            node = Box::new(Projection::new(node, projections, ctx));
-            node = maybe_sort(node, sort, &columns)?;
-            Ok(Execution::Rows { columns, node })
-        }
+        } => project_pipeline(
+            Box::new(SeqScan::new(&table)),
+            projections,
+            predicate,
+            sort,
+            columns,
+            ctx,
+        ),
         PhysicalPlan::Subquery {
             source,
             columns,
@@ -112,19 +111,13 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
             // Stream the source's rows straight into this level's pipeline. A
             // single FROM reference needs no materialization; buffering waits
             // for multi-reference CTEs and joins.
-            let Execution::Rows { mut node, .. } = execute(*source, ctx)?
-            else {
+            let Execution::Rows { node, .. } = execute(*source, ctx)? else {
                 return Err(ExecError::new(
                     "XX000",
                     "subquery source did not produce a row set",
                 ));
             };
-            if let Some(predicate) = predicate {
-                node = Box::new(Filter::new(node, predicate, ctx));
-            }
-            node = Box::new(Projection::new(node, projections, ctx));
-            node = maybe_sort(node, sort, &columns)?;
-            Ok(Execution::Rows { columns, node })
+            project_pipeline(node, projections, predicate, sort, columns, ctx)
         }
         PhysicalPlan::TableFunction {
             func,
@@ -133,15 +126,14 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
             projections,
             predicate,
             sort,
-        } => {
-            let mut node: Box<dyn ExecNode> = Box::new(TableFunctionSource::new(func, args, ctx));
-            if let Some(predicate) = predicate {
-                node = Box::new(Filter::new(node, predicate, ctx));
-            }
-            node = Box::new(Projection::new(node, projections, ctx));
-            node = maybe_sort(node, sort, &columns)?;
-            Ok(Execution::Rows { columns, node })
-        }
+        } => project_pipeline(
+            Box::new(TableFunctionSource::new(func, args, ctx)),
+            projections,
+            predicate,
+            sort,
+            columns,
+            ctx,
+        ),
         PhysicalPlan::Insert { table, rows } => execute_insert(&table, &rows, ctx),
         PhysicalPlan::Update {
             table,
@@ -150,6 +142,27 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
         } => execute_update(&table, &predicate, &assignments, ctx),
         PhysicalPlan::Delete { table, predicate } => execute_delete(&table, &predicate, ctx),
     }
+}
+
+/// Wrap a source node in the standard `Filter -> Projection -> Sort` tail and
+/// package it as a streamable result set. Shared by table scans, subquery
+/// sources, and set-returning functions (every SELECT-shaped plan with a
+/// projection list).
+fn project_pipeline(
+    source: Box<dyn ExecNode>,
+    projections: Vec<BoundExpr>,
+    predicate: Option<BoundExpr>,
+    sort: Vec<SortKey>,
+    columns: Vec<OutputColumn>,
+    ctx: ExecContext,
+) -> Result<Execution, ExecError> {
+    let mut node = source;
+    if let Some(predicate) = predicate {
+        node = Box::new(Filter::new(node, predicate, ctx));
+    }
+    node = Box::new(Projection::new(node, projections, ctx));
+    node = maybe_sort(node, sort, &columns)?;
+    Ok(Execution::Rows { columns, node })
 }
 
 /// Statement atomicity without a transaction engine: evaluate everything

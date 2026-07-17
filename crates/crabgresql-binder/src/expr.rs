@@ -735,10 +735,21 @@ fn unify_types(
     Err(no_operator(lty.name(), op, rty.name()))
 }
 
-/// The common type of two column entries (`VALUES` rows / `UNION` arms):
-/// identical types match; otherwise numeric promotion applies.
+/// The common type of two column entries (`VALUES` rows / `UNION` arms),
+/// approximating PG's `select_common_type`: when exactly one side implicitly
+/// casts to the other, the column takes that target (so `real` + `int4` -> `real`,
+/// not `float8`). When neither or both cast implicitly, fall back to numeric
+/// preferred-type promotion (`float8` dominates). This deliberately differs from
+/// `unify_types` (operator resolution), where `real` + `int4` resolves to `float8`.
 fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
-    if a == b { Some(a) } else { common_numeric(a, b) }
+    if a == b {
+        return Some(a);
+    }
+    match (implicit_castable(a, b), implicit_castable(b, a)) {
+        (true, false) => Some(b),
+        (false, true) => Some(a),
+        _ => common_numeric(a, b),
+    }
 }
 
 /// Resolve one column of a multi-row `VALUES` list to a common type and coerce
