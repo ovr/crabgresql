@@ -2,6 +2,8 @@
 
 pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
+pub const INVALID_DATETIME_FORMAT: &str = "22007";
+pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
 pub const DIVISION_BY_ZERO: &str = "22012";
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 pub const INVALID_PARAMETER_VALUE: &str = "22023";

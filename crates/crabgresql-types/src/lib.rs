@@ -7,6 +7,7 @@
 
 pub mod cast;
 pub mod float;
+pub mod timestamp;
 
 /// OIDs of built-in types. Must match PostgreSQL's `pg_type.dat` — drivers
 /// hardcode these.
@@ -19,6 +20,7 @@ pub mod oid {
     pub const TEXT: u32 = 25;
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
+    pub const TIMESTAMP: u32 = 1114;
     pub const BIT: u32 = 1560;
     pub const NUMERIC: u32 = 1700;
 }
@@ -35,6 +37,8 @@ pub enum PgType {
     Text,
     Bytea,
     Bit,
+    /// `timestamp without time zone`.
+    Timestamp,
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -53,6 +57,7 @@ impl PgType {
             PgType::Text => oid::TEXT,
             PgType::Bytea => oid::BYTEA,
             PgType::Bit => oid::BIT,
+            PgType::Timestamp => oid::TIMESTAMP,
             PgType::User(oid) => oid,
         }
     }
@@ -66,6 +71,7 @@ impl PgType {
             PgType::Int8 => 8,
             PgType::Float4 => 4,
             PgType::Float8 => 8,
+            PgType::Timestamp => 8,
             PgType::Numeric | PgType::Text | PgType::Bytea | PgType::Bit => -1,
             PgType::User(_) => -1,
         }
@@ -84,6 +90,7 @@ impl PgType {
             PgType::Text => "text",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
+            PgType::Timestamp => "timestamp without time zone",
             PgType::User(_) => "user-defined",
         }
     }
@@ -102,6 +109,7 @@ impl PgType {
             PgType::Text => "text",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
+            PgType::Timestamp => "timestamp",
             PgType::User(_) => "user-defined",
         }
     }
@@ -182,6 +190,10 @@ pub enum Value {
     /// A bit-string literal (`x'...'`): `len` bits packed right-aligned in
     /// `bits`. Only produced by hex literals and consumed by bit→int casts.
     Bit { len: u16, bits: u64 },
+    /// `timestamp without time zone`: microseconds since 2000-01-01, with
+    /// `i64::MIN`/`i64::MAX` as the `-infinity`/`infinity` sentinels. See
+    /// [`crate::timestamp`].
+    Timestamp(i64),
 }
 
 impl Value {
@@ -198,6 +210,7 @@ impl Value {
             Value::Text(_) => Some(PgType::Text),
             Value::Bytea(_) => Some(PgType::Bytea),
             Value::Bit { .. } => Some(PgType::Bit),
+            Value::Timestamp(_) => Some(PgType::Timestamp),
         }
     }
 
@@ -231,6 +244,7 @@ impl Value {
             Value::Bit { len, bits } => {
                 Some(format!("{:0width$b}", bits, width = *len as usize))
             }
+            Value::Timestamp(micros) => Some(timestamp::format(*micros)),
         }
     }
 }
