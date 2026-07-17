@@ -59,10 +59,12 @@ fn spells_infinity(trimmed: &str) -> bool {
     core.eq_ignore_ascii_case("inf") || core.eq_ignore_ascii_case("infinity")
 }
 
-/// The trimmed text contains a nonzero significand digit — used to tell a true
-/// zero (`0.0`) from a value that underflowed to zero (`10e-400`).
+/// The significand contains a nonzero digit — used to tell a true zero (`0.0`,
+/// `0e5`) from a value that underflowed to zero (`10e-400`). Only the mantissa
+/// counts: a nonzero exponent on a zero mantissa (`0e5`) is still zero.
 fn has_nonzero_digit(trimmed: &str) -> bool {
-    trimmed.bytes().any(|b| (b'1'..=b'9').contains(&b))
+    let significand = trimmed.split(['e', 'E']).next().unwrap_or(trimmed);
+    significand.bytes().any(|b| (b'1'..=b'9').contains(&b))
 }
 
 fn invalid_input(orig: &str, type_name: &str) -> FloatParseError {
@@ -368,6 +370,16 @@ mod tests {
         // float8 tolerates what float4 cannot.
         assert!(float8in("10e-70").is_ok());
         assert!(float8in("1.2345678901234e-200").is_ok());
+    }
+
+    #[test]
+    fn zero_mantissa_with_exponent_is_not_underflow() {
+        // A zero mantissa is exactly zero regardless of the exponent; only a
+        // nonzero value rounding to zero is an underflow error.
+        assert_eq!(float8in("0e5").unwrap(), 0.0);
+        assert_eq!(float8in("0e-400").unwrap(), 0.0);
+        assert_eq!(float8in("0.0e12").unwrap(), 0.0);
+        assert_eq!(float8in("10e-400").unwrap_err().sqlstate, "22003");
     }
 
     #[test]

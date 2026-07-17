@@ -214,7 +214,7 @@ fn positional_args(args: &ast::FunctionArguments) -> Result<Vec<ast::Expr>, Bind
             ));
         }
     };
-    if !list.duplicate_treatment.is_none() || !list.clauses.is_empty() {
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
         return Err(BindError::feature_not_supported(
             "this function argument form is not supported yet",
         ));
@@ -231,14 +231,4 @@ fn positional_args(args: &ast::FunctionArguments) -> Result<Vec<ast::Expr>, Bind
         }
     }
     Ok(out)
-}
-
-trait DuplicateTreatmentExt {
-    fn is_none(&self) -> bool;
-}
-
-impl DuplicateTreatmentExt for Option<ast::DuplicateTreatment> {
-    fn is_none(&self) -> bool {
-        Option::is_none(self)
-    }
 }

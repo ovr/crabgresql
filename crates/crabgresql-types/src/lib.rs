@@ -126,6 +126,30 @@ pub enum NumericVal {
     Finite(String),
 }
 
+impl NumericVal {
+    /// Parse `numeric` input text, returning `None` on malformed input (which
+    /// the caller reports as SQLSTATE 22P02). Accepts `NaN`, `±Infinity`, and
+    /// any decimal number; the finite text is kept verbatim (this stub does not
+    /// canonicalize scale).
+    pub fn parse(s: &str) -> Option<NumericVal> {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("nan") {
+            return Some(NumericVal::NaN);
+        }
+        let core = t.strip_prefix(['+', '-']).unwrap_or(t);
+        if core.eq_ignore_ascii_case("inf") || core.eq_ignore_ascii_case("infinity") {
+            return Some(NumericVal::Finite(t.to_string()));
+        }
+        // Use f64 as the syntactic acceptor: it rejects garbage ("abc") while
+        // accepting the decimal/exponent forms numeric allows.
+        if !t.is_empty() && t.parse::<f64>().is_ok() {
+            Some(NumericVal::Finite(t.to_string()))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,

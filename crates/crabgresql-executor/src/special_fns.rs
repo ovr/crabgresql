@@ -2,11 +2,11 @@
 //! `std` does not provide, needed by SQL `erf`/`erfc`/`gamma`/`lgamma`.
 //!
 //! Vendored (not a dependency on the whole `libm` crate) from the FreeBSD/msun
-//! implementations as ported by the `ryu`... err, the `libm` crate
-//! (github.com/rust-lang/libm). Only the special-function kernels that have no
-//! `std` equivalent are copied here; their internal `exp`/`pow`/`log`/`floor`/
-//! `fabs` calls are routed to Rust `std` (which are IEEE-correct or high-quality
-//! on our targets). See NOTICE for attribution.
+//! implementations as ported by the `libm` crate (github.com/rust-lang/libm).
+//! Only the special-function kernels that have no `std` equivalent are copied
+//! here; their internal `exp`/`pow`/`log`/`floor`/`fabs` calls are routed to
+//! Rust `std` (which are IEEE-correct or high-quality on our targets). See
+//! NOTICE for attribution.
 //!
 //! Original code:
 //!   origin: FreeBSD /usr/src/lib/msun/src/{s_erf,e_lgamma_r}.c and

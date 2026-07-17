@@ -1059,6 +1059,50 @@ mod tests {
     }
 
     #[test]
+    fn float_and_numeric_reject_unsupported_operators() {
+        // `%` is integer-only; float/numeric modulo does not exist in PG.
+        let e = bind_err("SELECT 1.5 % 2.0");
+        assert_eq!(e.code, "42883");
+        assert_eq!(
+            e.message,
+            "operator does not exist: double precision % double precision"
+        );
+        // numeric has no operators in this stub.
+        let e = bind_err("SELECT '1'::numeric < '2'::numeric");
+        assert_eq!(e.code, "42883");
+        assert_eq!(e.message, "operator does not exist: numeric < numeric");
+    }
+
+    #[test]
+    fn int2_arithmetic_binds() {
+        let LogicalPlan::Values { rows, .. } = bind_one("SELECT '1'::int2 + '2'::int2").unwrap()
+        else {
+            panic!("expected Values");
+        };
+        assert_eq!(rows[0][0].ty(), PgType::Int2);
+    }
+
+    #[test]
+    fn implicit_int_to_float4_function_arg_resolves() {
+        // float4send(integer) works via the implicit int4->float4 cast.
+        assert!(bind_one("SELECT float4send(1)").is_ok());
+    }
+
+    #[test]
+    fn cast_keeps_bare_column_name() {
+        let LogicalPlan::Query { columns, .. } = bind_one("SELECT id::int8 FROM t").unwrap() else {
+            panic!("expected Query");
+        };
+        assert_eq!(columns[0].name, "id");
+        // A constant/nested cast falls back to the target type name.
+        let LogicalPlan::Values { columns, .. } = bind_one("SELECT 'nan'::numeric::float4").unwrap()
+        else {
+            panic!("expected Values");
+        };
+        assert_eq!(columns[0].name, "float4");
+    }
+
+    #[test]
     fn select_where_without_table_binds_predicate() {
         let LogicalPlan::Values {
             rows, predicate, ..

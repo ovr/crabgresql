@@ -289,13 +289,13 @@ fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
             ty: PgType::Int8,
         });
     }
-    if n.contains(['.', 'e', 'E']) {
-        if let Ok(v) = n.parse::<f64>() {
-            return Ok(BoundExpr::Const {
-                value: Value::Float8(v),
-                ty: PgType::Float8,
-            });
-        }
+    if n.contains(['.', 'e', 'E'])
+        && let Ok(v) = n.parse::<f64>()
+    {
+        return Ok(BoundExpr::Const {
+            value: Value::Float8(v),
+            ty: PgType::Float8,
+        });
     }
     Err(BindError::feature_not_supported(format!(
         "numeric literal \"{n}\" is not supported yet"
@@ -587,7 +587,33 @@ fn bind_binary(
         }
     };
 
-    if op.is_arithmetic() && !arg_ty.is_numeric() {
+    // Admit only operators the executor actually implements for `arg_ty`, so a
+    // bind never produces a node the evaluator can't handle. PG resolves against
+    // a concrete operator catalog; this whitelist is our stand-in. Notably `%`
+    // is integer-only (no float/`numeric` modulo here) and `numeric` has no
+    // operators yet.
+    let supported = if op.is_arithmetic() {
+        let numeric_arith = matches!(
+            arg_ty,
+            PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Float4 | PgType::Float8
+        );
+        let mod_ok = op != BinOp::Mod
+            || matches!(arg_ty, PgType::Int2 | PgType::Int4 | PgType::Int8);
+        numeric_arith && mod_ok
+    } else {
+        matches!(
+            arg_ty,
+            PgType::Bool
+                | PgType::Int2
+                | PgType::Int4
+                | PgType::Int8
+                | PgType::Float4
+                | PgType::Float8
+                | PgType::Text
+                | PgType::Bytea
+        )
+    };
+    if !supported {
         return Err(no_operator(arg_ty.name(), op, arg_ty.name()));
     }
 
@@ -649,15 +675,35 @@ pub(crate) fn coerce_for_arg(
             if exact_only {
                 return None;
             }
-            if e.ty().is_numeric()
-                && target.is_numeric()
-                && common_numeric(e.ty(), target) == Some(target)
-            {
+            if implicit_castable(e.ty(), target) {
                 return coerce_expr(e, target).ok();
             }
             None
         }
     }
+}
+
+/// Whether `from` implicitly casts to `to` in a function-argument (or operator)
+/// context — the numeric-widening casts PG marks implicit, including int→float4
+/// (so e.g. `float4send(1)` resolves).
+fn implicit_castable(from: PgType, to: PgType) -> bool {
+    use PgType::*;
+    from == to
+        || matches!(
+            (from, to),
+            (Int2, Int4)
+                | (Int2, Int8)
+                | (Int4, Int8)
+                | (Int2, Float4)
+                | (Int4, Float4)
+                | (Int8, Float4)
+                | (Int2, Float8)
+                | (Int4, Float8)
+                | (Int8, Float8)
+                | (Float4, Float8)
+                | (Numeric, Float4)
+                | (Numeric, Float8)
+        )
 }
 
 fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
@@ -807,19 +853,11 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             .map_err(|e| int_error(&e)),
         PgType::Float4 => float::float4in(s).map(Value::Float4).map_err(float_error),
         PgType::Float8 => float::float8in(s).map(Value::Float8).map_err(float_error),
-        PgType::Numeric => Ok(Value::Numeric(numeric_in(s))),
+        PgType::Numeric => NumericVal::parse(s)
+            .map(Value::Numeric)
+            .ok_or_else(invalid),
         PgType::Bool => parse_bool_text(s).map(Value::Bool).ok_or_else(invalid),
         PgType::Bytea | PgType::Bit | PgType::User(_) => Err(invalid()),
-    }
-}
-
-/// Minimal `numeric` input: the forms these tests reach (`NaN`, decimal text).
-fn numeric_in(s: &str) -> NumericVal {
-    let t = s.trim();
-    if t.eq_ignore_ascii_case("nan") {
-        NumericVal::NaN
-    } else {
-        NumericVal::Finite(t.to_string())
     }
 }
 
@@ -878,12 +916,14 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
             .unwrap_or_else(|| "?column?".into()),
         ast::Expr::Nested(inner) => output_name(inner),
         ast::Expr::Value(v) if matches!(v.value, ast::Value::Boolean(_)) => "bool".into(),
-        ast::Expr::Cast { data_type, .. } => map_data_type(data_type)
-            .map(|ty| ty.typname().to_string())
-            .unwrap_or_else(|_| "?column?".into()),
-        ast::Expr::TypedString(ts) => map_data_type(&ts.data_type)
-            .map(|ty| ty.typname().to_string())
-            .unwrap_or_else(|_| "?column?".into()),
+        // PG keeps a bare column's name through a cast (`id::int8` → "id"), but
+        // uses the target type name when the argument has no inherent name
+        // (`(1+1)::int8`, `'nan'::numeric::float4` → the type). Only a direct
+        // column reference (strength 2) is preserved; a nested cast is not.
+        ast::Expr::Cast {
+            expr, data_type, ..
+        } => column_name(expr).unwrap_or_else(|| type_output_name(data_type)),
+        ast::Expr::TypedString(ts) => type_output_name(&ts.data_type),
         // A function's output column is named after the function.
         ast::Expr::Function(func) => func
             .name
@@ -894,4 +934,22 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
             .unwrap_or_else(|| "?column?".into()),
         _ => "?column?".into(),
     }
+}
+
+/// The name of a bare column reference (through parens), if any — PG's
+/// strength-2 name that survives an enclosing cast. A cast, value, or function
+/// argument has no such name.
+fn column_name(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::Identifier(ident) => Some(normalize_ident(ident)),
+        ast::Expr::CompoundIdentifier(parts) => parts.last().map(normalize_ident),
+        ast::Expr::Nested(inner) => column_name(inner),
+        _ => None,
+    }
+}
+
+fn type_output_name(data_type: &ast::DataType) -> String {
+    map_data_type(data_type)
+        .map(|ty| ty.typname().to_string())
+        .unwrap_or_else(|_| "?column?".into())
 }

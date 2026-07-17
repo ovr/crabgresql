@@ -135,23 +135,18 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Text(s), PgType::Float8) => float::float8in(s)
             .map(Value::Float8)
             .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
-        (Value::Text(s), PgType::Numeric) => Ok(Value::Numeric(numeric_in(s))),
+        (Value::Text(s), PgType::Numeric) => {
+            NumericVal::parse(s).map(Value::Numeric).ok_or_else(|| CastError {
+                sqlstate: "22P02",
+                message: format!("invalid input syntax for type numeric: \"{s}\""),
+            })
+        }
 
         // ---- numeric → float ----
         (Value::Numeric(n), PgType::Float4) => Ok(Value::Float4(numeric_to_f64(n) as f32)),
         (Value::Numeric(n), PgType::Float8) => Ok(Value::Float8(numeric_to_f64(n))),
 
         _ => Err(cannot_coerce(from, to)),
-    }
-}
-
-/// Minimal `numeric_in`: only the forms these tests reach (`NaN`, decimal).
-fn numeric_in(s: &str) -> NumericVal {
-    let t = s.trim();
-    if t.eq_ignore_ascii_case("nan") {
-        NumericVal::NaN
-    } else {
-        NumericVal::Finite(t.to_string())
     }
 }
 
@@ -204,5 +199,13 @@ mod tests {
         let n = cast_value(Value::Text("nan".into()), PgType::Numeric, 1).unwrap();
         let f = cast_value(n, PgType::Float4, 1).unwrap();
         assert_eq!(f.encode_text_with(1).as_deref(), Some("NaN"));
+    }
+
+    #[test]
+    fn numeric_rejects_garbage() {
+        let e = cast_value(Value::Text("abc".into()), PgType::Numeric, 1).unwrap_err();
+        assert_eq!(e.sqlstate, "22P02");
+        assert_eq!(e.message, "invalid input syntax for type numeric: \"abc\"");
+        assert!(cast_value(Value::Text("1.5".into()), PgType::Numeric, 1).is_ok());
     }
 }

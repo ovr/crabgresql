@@ -10,6 +10,7 @@
 use std::hint::black_box;
 
 use crabgresql_binder::ScalarFn;
+use crabgresql_protocol::sqlstate;
 use crabgresql_types::{Value, float};
 
 use crate::ExecError;
@@ -21,15 +22,15 @@ fn err(sqlstate: &'static str, message: impl Into<String>) -> ExecError {
 }
 
 fn overflow() -> ExecError {
-    err("22003", "value out of range: overflow")
+    err(sqlstate::NUMERIC_VALUE_OUT_OF_RANGE, "value out of range: overflow")
 }
 
 fn underflow() -> ExecError {
-    err("22003", "value out of range: underflow")
+    err(sqlstate::NUMERIC_VALUE_OUT_OF_RANGE, "value out of range: underflow")
 }
 
 fn out_of_range_input() -> ExecError {
-    err("22003", "input is out of range")
+    err(sqlstate::NUMERIC_VALUE_OUT_OF_RANGE, "input is out of range")
 }
 
 /// Evaluate a scalar function. All functions are STRICT: a NULL argument yields
@@ -61,12 +62,13 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::Round => Ok(a.round_ties_even()),
         ScalarFn::Ceil => Ok(a.ceil()),
         ScalarFn::Floor => Ok(a.floor()),
+        // Else branch returns the argument so sign(NaN)=NaN and sign(-0)=-0, as PG.
         ScalarFn::Sign => Ok(if a > 0.0 {
             1.0
         } else if a < 0.0 {
             -1.0
         } else {
-            0.0
+            a
         }),
         ScalarFn::Sqrt => float::f8_sqrt(a).map_err(float_err),
         ScalarFn::Cbrt => Ok(float::f8_cbrt(a)),
@@ -85,7 +87,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             }
         }
         ScalarFn::Atanh => {
-            if !(-1.0..=1.0).contains(&a) {
+            if a.is_nan() {
+                Ok(f64::NAN)
+            } else if !(-1.0..=1.0).contains(&a) {
                 Err(out_of_range_input())
             } else {
                 Ok(a.atanh())
@@ -132,10 +136,10 @@ fn dln(x: f64) -> Result<f64, ExecError> {
         return Ok(f64::NAN);
     }
     if x == 0.0 {
-        return Err(err("2201E", "cannot take logarithm of zero"));
+        return Err(err(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of zero"));
     }
     if x < 0.0 {
-        return Err(err("2201E", "cannot take logarithm of a negative number"));
+        return Err(err(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of a negative number"));
     }
     Ok(x.ln())
 }
@@ -199,13 +203,8 @@ fn cosd_q1(x: f64) -> f64 {
     }
 }
 
-fn dsind(x: f64) -> Result<f64, ExecError> {
-    if x.is_nan() {
-        return Ok(f64::NAN);
-    }
-    if x.is_infinite() {
-        return Err(out_of_range_input());
-    }
+/// sind over all reals via a period-360 reduction to the first quadrant.
+fn sind_reduced(x: f64) -> f64 {
     let mut sign = 1.0;
     let mut a = x % 360.0;
     if a < 0.0 {
@@ -219,7 +218,34 @@ fn dsind(x: f64) -> Result<f64, ExecError> {
     if a > 90.0 {
         a = 180.0 - a;
     }
-    Ok(sign * sind_q1(a))
+    sign * sind_q1(a)
+}
+
+/// cosd over all reals via a period-360 reduction to the first quadrant.
+fn cosd_reduced(x: f64) -> f64 {
+    let mut sign = 1.0;
+    let mut a = x % 360.0;
+    if a < 0.0 {
+        a = -a;
+    }
+    if a > 180.0 {
+        a = 360.0 - a;
+    }
+    if a > 90.0 {
+        a = 180.0 - a;
+        sign = -sign;
+    }
+    sign * cosd_q1(a)
+}
+
+fn dsind(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x.is_infinite() {
+        return Err(out_of_range_input());
+    }
+    Ok(sind_reduced(x))
 }
 
 fn dcosd(x: f64) -> Result<f64, ExecError> {
@@ -229,21 +255,14 @@ fn dcosd(x: f64) -> Result<f64, ExecError> {
     if x.is_infinite() {
         return Err(out_of_range_input());
     }
-    let mut sign = 1.0;
-    let mut a = x % 360.0;
-    if a < 0.0 {
-        a = -a;
-    }
-    if a > 180.0 {
-        a = 360.0 - a;
-    }
-    if a > 90.0 {
-        a = 180.0 - a;
-        sign = -sign;
-    }
-    Ok(sign * cosd_q1(a))
+    Ok(cosd_reduced(x))
 }
 
+// tand/cotd are computed as sind/cosd (and its reciprocal), each via the same
+// period-360 reduction, so the denominator's signed zero carries the correct
+// sign at the poles: e.g. cosd(270) = +0 gives tand(270) = -1/+0 = -Infinity,
+// where a period-180 tan reduction would lose that sign. Dividing by tan(45)/
+// cot(45) makes the ±1 endpoints exact.
 fn dtand(x: f64) -> Result<f64, ExecError> {
     if x.is_nan() {
         return Ok(f64::NAN);
@@ -251,18 +270,8 @@ fn dtand(x: f64) -> Result<f64, ExecError> {
     if x.is_infinite() {
         return Err(out_of_range_input());
     }
-    let mut sign = 1.0;
-    let mut a = x % 180.0;
-    if a < 0.0 {
-        a += 180.0;
-    }
-    if a > 90.0 {
-        a = 180.0 - a;
-        sign = -sign;
-    }
     let tan45 = sind_q1(45.0) / cosd_q1(45.0);
-    let tan = sind_q1(a) / cosd_q1(a);
-    let mut result = sign * (tan / tan45);
+    let mut result = (sind_reduced(x) / cosd_reduced(x)) / tan45;
     if result == 0.0 {
         result = 0.0; // force +0
     }
@@ -276,18 +285,8 @@ fn dcotd(x: f64) -> Result<f64, ExecError> {
     if x.is_infinite() {
         return Err(out_of_range_input());
     }
-    let mut sign = 1.0;
-    let mut a = x % 180.0;
-    if a < 0.0 {
-        a += 180.0;
-    }
-    if a > 90.0 {
-        a = 180.0 - a;
-        sign = -sign;
-    }
     let cot45 = cosd_q1(45.0) / sind_q1(45.0);
-    let cot = cosd_q1(a) / sind_q1(a);
-    let mut result = sign * (cot / cot45);
+    let mut result = (cosd_reduced(x) / sind_reduced(x)) / cot45;
     if result == 0.0 {
         result = 0.0; // force +0
     }
@@ -388,5 +387,52 @@ fn text(v: &Value) -> &str {
     match v {
         Value::Text(s) => s,
         other => unreachable!("expected text arg, got {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(f: ScalarFn, x: f64) -> f64 {
+        match eval_scalar(f, &[Value::Float8(x)]).unwrap() {
+            Value::Float8(v) => v,
+            other => panic!("expected float8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn degree_trig_exact_endpoints_and_pole_signs() {
+        // Exact special-angle values the IN-list tests depend on.
+        assert_eq!(call(ScalarFn::Sind, 30.0), 0.5);
+        assert_eq!(call(ScalarFn::Sind, 270.0), -1.0);
+        assert_eq!(call(ScalarFn::Cosd, 90.0), 0.0);
+        assert_eq!(call(ScalarFn::Tand, 45.0), 1.0);
+        assert_eq!(call(ScalarFn::Tand, 135.0), -1.0);
+        assert_eq!(call(ScalarFn::Tand, 225.0), 1.0);
+        // Pole signs: the period-360 reduction keeps them distinct.
+        assert_eq!(call(ScalarFn::Tand, 90.0), f64::INFINITY);
+        assert_eq!(call(ScalarFn::Tand, 270.0), f64::NEG_INFINITY);
+        assert_eq!(call(ScalarFn::Cotd, 0.0), f64::INFINITY);
+        assert_eq!(call(ScalarFn::Cotd, 180.0), f64::NEG_INFINITY);
+        // tand(180)/cotd(270) are +0, not -0.
+        assert!(call(ScalarFn::Tand, 180.0).is_sign_positive());
+        assert_eq!(call(ScalarFn::Tand, 180.0), 0.0);
+        assert!(call(ScalarFn::Cotd, 270.0).is_sign_positive());
+        assert_eq!(call(ScalarFn::Cotd, 270.0), 0.0);
+    }
+
+    #[test]
+    fn atanh_and_sign_preserve_nan() {
+        assert!(call(ScalarFn::Atanh, f64::NAN).is_nan());
+        assert_eq!(
+            eval_scalar(ScalarFn::Atanh, &[Value::Float8(2.0)])
+                .unwrap_err()
+                .code,
+            "22003"
+        );
+        assert!(call(ScalarFn::Sign, f64::NAN).is_nan());
+        // sign(-0.0) keeps the negative zero.
+        assert!(call(ScalarFn::Sign, -0.0).is_sign_negative());
     }
 }

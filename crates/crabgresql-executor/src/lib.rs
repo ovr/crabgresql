@@ -253,6 +253,9 @@ impl Sort {
         rows.sort_by(|a, b| {
             for key in &keys {
                 let (va, vb) = (&a[key.column], &b[key.column]);
+                // NULL placement follows nulls_first directly; only the value
+                // comparison is reversed for DESC. (Reversing the null branch
+                // too would flip NULLS FIRST/LAST for descending sorts.)
                 let ord = match (matches!(va, Value::Null), matches!(vb, Value::Null)) {
                     (true, true) => Ordering::Equal,
                     (true, false) => {
@@ -269,9 +272,11 @@ impl Sort {
                             Ordering::Less
                         }
                     }
-                    (false, false) => compare_values(types[key.column], va, vb),
+                    (false, false) => {
+                        let cmp = compare_values(types[key.column], va, vb);
+                        if key.asc { cmp } else { cmp.reverse() }
+                    }
                 };
-                let ord = if key.asc { ord } else { ord.reverse() };
                 if ord != Ordering::Equal {
                     return ord;
                 }

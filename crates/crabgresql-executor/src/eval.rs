@@ -106,6 +106,7 @@ fn eval_binary(
     }
     if op.is_arithmetic() {
         return match arg_ty {
+            PgType::Int2 => eval_arith_int2(op, int2(&l), int2(&r)),
             PgType::Int4 => eval_arith_int4(op, int4(&l), int4(&r)),
             PgType::Int8 => eval_arith_int8(op, int8(&l), int8(&r)),
             PgType::Float4 => eval_arith_f4(op, float4(&l), float4(&r)),
@@ -242,6 +243,30 @@ fn float_error(e: float::FloatError) -> ExecError {
 
 fn division_by_zero() -> ExecError {
     ExecError::new(sqlstate::DIVISION_BY_ZERO, "division by zero")
+}
+
+fn eval_arith_int2(op: BinOp, a: i16, b: i16) -> Result<Value, ExecError> {
+    let result = match op {
+        BinOp::Add => a.checked_add(b),
+        BinOp::Sub => a.checked_sub(b),
+        BinOp::Mul => a.checked_mul(b),
+        BinOp::Div => {
+            if b == 0 {
+                return Err(division_by_zero());
+            }
+            a.checked_div(b)
+        }
+        BinOp::Mod => {
+            if b == 0 {
+                return Err(division_by_zero());
+            }
+            return Ok(Value::Int2(a.checked_rem(b).unwrap_or(0)));
+        }
+        _ => unreachable!(),
+    };
+    result
+        .map(Value::Int2)
+        .ok_or_else(|| out_of_range(PgType::Int2))
 }
 
 fn eval_arith_int4(op: BinOp, a: i32, b: i32) -> Result<Value, ExecError> {
