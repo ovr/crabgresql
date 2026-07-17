@@ -48,6 +48,7 @@ pub enum ScalarFn {
     Float4Send,
     Float8Send,
     PgInputIsValid,
+    Md5,
 }
 
 struct Signature {
@@ -122,6 +123,21 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[PgType::Text, PgType::Text],
             ret: PgType::Bool,
         }],
+        // Two overloads. Text is listed first so a bare `md5('abc')` unknown
+        // literal resolves to text; a typed `bytea` argument never coerces to
+        // text (see `implicit_castable`), so `md5(x::bytea)` binds the bytea one.
+        "md5" => &[
+            Signature {
+                func: ScalarFn::Md5,
+                args: &[PgType::Text],
+                ret: PgType::Text,
+            },
+            Signature {
+                func: ScalarFn::Md5,
+                args: &[PgType::Bytea],
+                ret: PgType::Text,
+            },
+        ],
         _ => &[],
     }
 }

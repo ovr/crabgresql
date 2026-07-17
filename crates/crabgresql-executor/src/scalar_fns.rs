@@ -53,6 +53,16 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             let type_name = text(&args[1]);
             return Ok(Value::Bool(soft_input(type_name, value).is_ok()));
         }
+        // md5(text)/md5(bytea) hash the raw input bytes; both return the
+        // 32-char lowercase hex digest as text.
+        ScalarFn::Md5 => {
+            let bytes = match &args[0] {
+                Value::Text(s) => s.as_bytes(),
+                Value::Bytea(b) => b.as_slice(),
+                other => unreachable!("expected text/bytea arg, got {other:?}"),
+            };
+            return Ok(Value::Text(crate::md5::md5_hex(bytes)));
+        }
         _ => {}
     }
     // The remaining functions are float8 → float8 (or float8×float8 → float8).
@@ -107,7 +117,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::Acosd => dacosd(a),
         ScalarFn::Atand => Ok(datand(a)),
         ScalarFn::Atan2d => Ok(datan2d(a, f8(&args[1]))),
-        ScalarFn::Float4Send | ScalarFn::Float8Send | ScalarFn::PgInputIsValid => unreachable!(),
+        ScalarFn::Float4Send | ScalarFn::Float8Send | ScalarFn::PgInputIsValid | ScalarFn::Md5 => {
+            unreachable!()
+        }
     };
     result.map(Value::Float8)
 }
