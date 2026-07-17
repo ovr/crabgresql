@@ -1,0 +1,12 @@
+[package]
+name = "crabgresql-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crabgresql-storage-api.workspace = true
+crabgresql-types.workspace = true
+
+[dev-dependencies]
+crabgresql-memory-storage.workspace = true

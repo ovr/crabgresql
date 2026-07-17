@@ -1,0 +1,23 @@
+[package]
+name = "crabgresql-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "crabgresql"
+path = "src/main.rs"
+
+[dependencies]
+crabgresql-executor.workspace = true
+crabgresql-memory-storage.workspace = true
+crabgresql-parser.workspace = true
+crabgresql-protocol.workspace = true
+crabgresql-storage-api.workspace = true
+crabgresql-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio-postgres.workspace = true
