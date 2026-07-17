@@ -833,7 +833,11 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             .map(Value::Numeric)
             .ok_or_else(invalid),
         PgType::Bool => parse_bool(s).map(Value::Bool).ok_or_else(invalid),
-        PgType::Bytea | PgType::Bit | PgType::User(_) => Err(invalid()),
+        // bytea input (byteain) is shared with the executor's text→bytea cast.
+        PgType::Bytea => cast::byteain(s)
+            .map(Value::Bytea)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Bit | PgType::User(_) => Err(invalid()),
     }
 }
 

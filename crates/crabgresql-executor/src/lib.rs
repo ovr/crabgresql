@@ -6,6 +6,7 @@
 //! pull model only becomes the right shape for it once RETURNING exists.
 
 pub mod eval;
+mod md5;
 pub mod scalar_fns;
 mod special_fns;
 
