@@ -5,13 +5,17 @@
 //! context. [`Binding`] models exactly that: an expression is either typed or
 //! still unknown, and every operator/assignment site decides what unknown
 //! becomes (or rejects it the way PG does).
+//!
+//! Clean-room (see AGENTS.md): the resolution rules, coercions, and error text
+//! reproduce PG's *observable* behavior, pinned by the regression corpus.
 
-use crabgresql_parser::ast;
+use crabgresql_parser::{Span, ast};
 use crabgresql_protocol::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema};
-use crabgresql_types::{PgType, Value};
+use crabgresql_types::{NumericVal, PgType, Value, cast, float};
 
 use crate::BindError;
+use crate::functions::{ScalarFn, bind_function};
 
 /// Typed expression IR. Every node knows its result type; the evaluator
 /// dispatches on the recorded types and never re-infers them.
@@ -41,11 +45,17 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         negated: bool,
     },
-    /// Runtime cast between the integer types: int4→int8 widens, int8→int4
-    /// range-checks (SQLSTATE 22003).
+    /// Runtime cast, evaluated by `executor::eval::coerce_value` via the shared
+    /// `crabgresql_types::cast::cast_value`.
     Coerce {
         expr: Box<BoundExpr>,
         ty: PgType,
+    },
+    /// A scalar function call; `ret` is the result type.
+    FuncCall {
+        func: ScalarFn,
+        ret: PgType,
+        args: Vec<BoundExpr>,
     },
 }
 
@@ -53,6 +63,12 @@ pub enum BoundExpr {
 pub enum UnaryOp {
     Not,
     Neg,
+    /// `@` — absolute value; result type is the operand type.
+    Abs,
+    /// `|/` — square root (float8).
+    Sqrt,
+    /// `||/` — cube root (float8).
+    Cbrt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,13 +86,15 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    /// `^` — exponentiation (float8).
+    Pow,
 }
 
 impl BinOp {
     pub fn is_arithmetic(self) -> bool {
         matches!(
             self,
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
         )
     }
 
@@ -100,6 +118,7 @@ impl BinOp {
             BinOp::Mul => "*",
             BinOp::Div => "/",
             BinOp::Mod => "%",
+            BinOp::Pow => "^",
         }
     }
 }
@@ -112,10 +131,9 @@ impl BoundExpr {
             BoundExpr::Unary {
                 op: UnaryOp::Not, ..
             } => PgType::Bool,
-            BoundExpr::Unary {
-                op: UnaryOp::Neg,
-                expr,
-            } => expr.ty(),
+            // Neg/Abs keep the operand type; Sqrt/Cbrt operands were coerced to
+            // float8, so the operand type is already the result type.
+            BoundExpr::Unary { expr, .. } => expr.ty(),
             BoundExpr::Binary { op, arg_ty, .. } => {
                 if op.is_arithmetic() {
                     *arg_ty
@@ -125,16 +143,18 @@ impl BoundExpr {
             }
             BoundExpr::IsNull { .. } => PgType::Bool,
             BoundExpr::Coerce { ty, .. } => *ty,
+            BoundExpr::FuncCall { ret, .. } => *ret,
         }
     }
 }
 
 /// A binding result: typed, or an untyped literal awaiting context (PG's
-/// `unknown` pseudo-type). `None` is the `NULL` literal.
+/// `unknown` pseudo-type). `lit == None` is the `NULL` literal; `span` locates
+/// the literal for error positions.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Binding {
     Typed(BoundExpr),
-    Unknown(Option<String>),
+    Unknown { lit: Option<String>, span: Span },
 }
 
 /// Name-resolution scope: at most one table (M1), addressed by its name or
@@ -188,7 +208,7 @@ pub(crate) fn normalize_ident(ident: &ast::Ident) -> String {
 
 pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> {
     match expr {
-        ast::Expr::Value(v) => bind_value(&v.value),
+        ast::Expr::Value(v) => bind_value(v),
         // The DEFAULT keyword (INSERT VALUES / UPDATE SET) parses as a plain
         // identifier; without this check it would bind as a column reference
         // and mislead with `column "default" does not exist`. A real column
@@ -207,6 +227,11 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         ast::Expr::BinaryOp { left, op, right } => bind_binary(left, op, right, scope),
         ast::Expr::IsNull(inner) => bind_is_null(inner, scope, false),
         ast::Expr::IsNotNull(inner) => bind_is_null(inner, scope, true),
+        ast::Expr::Cast {
+            expr, data_type, ..
+        } => bind_cast(expr, data_type, scope),
+        ast::Expr::TypedString(ts) => bind_typed_string(ts),
+        ast::Expr::Function(func) => bind_function(func, scope),
         other => Err(unsupported_expr(other)),
     }
 }
@@ -216,7 +241,7 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
 pub fn bind_scalar(expr: &ast::Expr, scope: &Scope) -> Result<BoundExpr, BindError> {
     Ok(match bind_expr(expr, scope)? {
         Binding::Typed(e) => e,
-        Binding::Unknown(lit) => resolve_unknown(lit, PgType::Text)?,
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text)?,
     })
 }
 
@@ -224,26 +249,33 @@ fn unsupported_expr(expr: &ast::Expr) -> BindError {
     BindError::feature_not_supported(format!("expression is not supported yet: {expr}"))
 }
 
-fn bind_value(value: &ast::Value) -> Result<Binding, BindError> {
-    match value {
+fn bind_value(value: &ast::ValueWithSpan) -> Result<Binding, BindError> {
+    match &value.value {
         ast::Value::Number(n, _) => parse_number(n).map(Binding::Typed),
         ast::Value::SingleQuotedString(s)
         | ast::Value::DollarQuotedString(ast::DollarQuotedString { value: s, .. }) => {
-            Ok(Binding::Unknown(Some(s.clone())))
+            Ok(Binding::Unknown {
+                lit: Some(s.clone()),
+                span: value.span,
+            })
         }
         ast::Value::Boolean(b) => Ok(Binding::Typed(BoundExpr::Const {
             value: Value::Bool(*b),
             ty: PgType::Bool,
         })),
-        ast::Value::Null => Ok(Binding::Unknown(None)),
+        ast::Value::Null => Ok(Binding::Unknown {
+            lit: None,
+            span: value.span,
+        }),
         other => Err(BindError::feature_not_supported(format!(
             "literal is not supported yet: {other}"
         ))),
     }
 }
 
-/// Integer literals become int4 when they fit, int8 otherwise — PG semantics.
-/// Decimals need `numeric`, which is a later M1 type.
+/// Integer literals become int4 when they fit, int8 otherwise. Literals with a
+/// decimal point or exponent bind as float8 (PG uses `numeric`, but float8 is
+/// byte-exact for the values these tests use; see the plan's deviations).
 fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
     if let Ok(v) = n.parse::<i32>() {
         return Ok(BoundExpr::Const {
@@ -257,9 +289,83 @@ fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
             ty: PgType::Int8,
         });
     }
+    if n.contains(['.', 'e', 'E']) {
+        if let Ok(v) = n.parse::<f64>() {
+            return Ok(BoundExpr::Const {
+                value: Value::Float8(v),
+                ty: PgType::Float8,
+            });
+        }
+    }
     Err(BindError::feature_not_supported(format!(
-        "numeric literal \"{n}\" is not supported yet (numeric lands later in M1)"
+        "numeric literal \"{n}\" is not supported yet"
     )))
+}
+
+/// Map a SQL type name to a `PgType`. Shared by cast/typed-string binding and
+/// server-side CREATE TABLE.
+pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
+    use ast::DataType;
+    Ok(match dt {
+        DataType::Bool | DataType::Boolean => PgType::Bool,
+        DataType::SmallInt(_) | DataType::Int2(_) => PgType::Int2,
+        DataType::Int(_) | DataType::Integer(_) | DataType::Int4(_) => PgType::Int4,
+        DataType::BigInt(_) | DataType::Int8(_) => PgType::Int8,
+        DataType::Real | DataType::Float4 => PgType::Float4,
+        DataType::DoublePrecision | DataType::Float8 => PgType::Float8,
+        DataType::Double(_) => PgType::Float8,
+        // float(p): p <= 24 is single precision, else double (PG semantics).
+        DataType::Float(info) => match precision_of(info) {
+            Some(p) if p <= 24 => PgType::Float4,
+            _ => PgType::Float8,
+        },
+        DataType::Numeric(_) | DataType::Decimal(_) => PgType::Numeric,
+        DataType::Bytea => PgType::Bytea,
+        DataType::Text | DataType::Varchar(None) | DataType::CharacterVarying(None) => PgType::Text,
+        DataType::Varchar(Some(_)) | DataType::CharacterVarying(Some(_)) => {
+            return Err(BindError::feature_not_supported(
+                "varchar length limits are not supported yet",
+            ));
+        }
+        other => {
+            return Err(BindError::feature_not_supported(format!(
+                "type \"{other}\" is not supported yet"
+            )));
+        }
+    })
+}
+
+fn precision_of(info: &ast::ExactNumberInfo) -> Option<u64> {
+    match info {
+        ast::ExactNumberInfo::None => None,
+        ast::ExactNumberInfo::Precision(p) => Some(*p),
+        ast::ExactNumberInfo::PrecisionAndScale(p, _) => Some(*p),
+    }
+}
+
+fn bind_cast(
+    inner: &ast::Expr,
+    data_type: &ast::DataType,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let target = map_data_type(data_type)?;
+    match bind_expr(inner, scope)? {
+        Binding::Unknown { lit, span } => Ok(Binding::Typed(resolve_unknown(lit, span, target)?)),
+        Binding::Typed(e) => Ok(Binding::Typed(coerce_expr(e, target)?)),
+    }
+}
+
+fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
+    let target = map_data_type(&ts.data_type)?;
+    let (lit, span) = match &ts.value.value {
+        ast::Value::SingleQuotedString(s) => (Some(s.clone()), ts.value.span),
+        other => {
+            return Err(BindError::syntax(format!(
+                "invalid typed literal: {other}"
+            )));
+        }
+    };
+    Ok(Binding::Typed(resolve_unknown(lit, span, target)?))
 }
 
 fn bind_compound(parts: &[ast::Ident], scope: &Scope) -> Result<BoundExpr, BindError> {
@@ -278,6 +384,20 @@ fn bind_compound(parts: &[ast::Ident], scope: &Scope) -> Result<BoundExpr, BindE
     scope.resolve(&normalize_ident(column))
 }
 
+fn no_op_unary(sym: &str, ty: &str) -> BindError {
+    BindError::new(
+        sqlstate::UNDEFINED_FUNCTION,
+        format!("operator does not exist: {sym} {ty}"),
+    )
+}
+
+fn ambiguous_unary(sym: &str) -> BindError {
+    BindError::new(
+        sqlstate::AMBIGUOUS_FUNCTION,
+        format!("operator is not unique: {sym} unknown"),
+    )
+}
+
 fn bind_unary(
     op: ast::UnaryOperator,
     operand: &ast::Expr,
@@ -293,13 +413,13 @@ fn bind_unary(
     }
     match op {
         ast::UnaryOperator::Minus | ast::UnaryOperator::Plus => {
-            let symbol = if op == ast::UnaryOperator::Minus {
+            let sym = if op == ast::UnaryOperator::Minus {
                 "-"
             } else {
                 "+"
             };
             match bind_expr(operand, scope)? {
-                Binding::Typed(e) if matches!(e.ty(), PgType::Int4 | PgType::Int8) => {
+                Binding::Typed(e) if e.ty().is_numeric() => {
                     Ok(Binding::Typed(if op == ast::UnaryOperator::Minus {
                         BoundExpr::Unary {
                             op: UnaryOp::Neg,
@@ -310,18 +430,23 @@ fn bind_unary(
                         e
                     }))
                 }
-                Binding::Typed(e) => Err(BindError::new(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    format!("operator does not exist: {symbol} {}", e.ty().name()),
-                )),
+                Binding::Typed(e) => Err(no_op_unary(sym, e.ty().name())),
                 // Every numeric type has this operator, so an untyped literal
                 // cannot pick one — PG reports ambiguity.
-                Binding::Unknown(_) => Err(BindError::new(
-                    sqlstate::AMBIGUOUS_FUNCTION,
-                    format!("operator is not unique: {symbol} unknown"),
-                )),
+                Binding::Unknown { .. } => Err(ambiguous_unary(sym)),
             }
         }
+        // `@` absolute value: keeps the operand type.
+        ast::UnaryOperator::PGAbs => match bind_expr(operand, scope)? {
+            Binding::Typed(e) if e.ty().is_numeric() => Ok(Binding::Typed(BoundExpr::Unary {
+                op: UnaryOp::Abs,
+                expr: Box::new(e),
+            })),
+            Binding::Typed(e) => Err(no_op_unary("@", e.ty().name())),
+            Binding::Unknown { .. } => Err(ambiguous_unary("@")),
+        },
+        ast::UnaryOperator::PGSquareRoot => bind_prefix_float8(UnaryOp::Sqrt, "|/", operand, scope),
+        ast::UnaryOperator::PGCubeRoot => bind_prefix_float8(UnaryOp::Cbrt, "||/", operand, scope),
         ast::UnaryOperator::Not => {
             let operand = to_bool_operand(bind_expr(operand, scope)?, "NOT")?;
             Ok(Binding::Typed(BoundExpr::Unary {
@@ -335,10 +460,29 @@ fn bind_unary(
     }
 }
 
+/// `|/` / `||/`: coerce the operand to float8 (unknown → float8), producing a
+/// float8 result.
+fn bind_prefix_float8(
+    uop: UnaryOp,
+    sym: &str,
+    operand: &ast::Expr,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let expr = match bind_expr(operand, scope)? {
+        Binding::Typed(e) if e.ty().is_numeric() => coerce_expr(e, PgType::Float8)?,
+        Binding::Typed(e) => return Err(no_op_unary(sym, e.ty().name())),
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Float8)?,
+    };
+    Ok(Binding::Typed(BoundExpr::Unary {
+        op: uop,
+        expr: Box::new(expr),
+    }))
+}
+
 fn bind_is_null(inner: &ast::Expr, scope: &Scope, negated: bool) -> Result<Binding, BindError> {
     let expr = match bind_expr(inner, scope)? {
         Binding::Typed(e) => e,
-        Binding::Unknown(lit) => resolve_unknown(lit, PgType::Text)?,
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text)?,
     };
     Ok(Binding::Typed(BoundExpr::IsNull {
         expr: Box::new(expr),
@@ -366,6 +510,7 @@ fn bind_binary(
         ast::BinaryOperator::Multiply => BinOp::Mul,
         ast::BinaryOperator::Divide => BinOp::Div,
         ast::BinaryOperator::Modulo => BinOp::Mod,
+        ast::BinaryOperator::PGExp => BinOp::Pow,
         other => {
             return Err(BindError::feature_not_supported(format!(
                 "operator is not supported yet: {other}"
@@ -387,27 +532,41 @@ fn bind_binary(
         }));
     }
 
+    // `^` has only a float8 operator here: coerce both sides to float8.
+    if op == BinOp::Pow {
+        return bind_pow(lb, rb);
+    }
+
     // Comparison or arithmetic: settle both operands on one type. For
     // arithmetic, the typed side must offer the operator BEFORE the unknown
     // side is parsed as that type — PG reports `operator does not exist:
     // boolean + unknown`, never a coercion failure, when no operator applies.
     let (left, right, arg_ty) = match (lb, rb) {
         (Binding::Typed(l), Binding::Typed(r)) => unify_types(l, r, op)?,
-        (Binding::Typed(l), Binding::Unknown(lit)) => {
+        (Binding::Typed(l), Binding::Unknown { lit, span }) => {
             let ty = l.ty();
-            if op.is_arithmetic() && !matches!(ty, PgType::Int4 | PgType::Int8) {
+            if op.is_arithmetic() && !ty.is_numeric() {
                 return Err(no_operator(ty.name(), op, "unknown"));
             }
-            (l, resolve_unknown(lit, ty)?, ty)
+            (l, resolve_unknown(lit, span, ty)?, ty)
         }
-        (Binding::Unknown(lit), Binding::Typed(r)) => {
+        (Binding::Unknown { lit, span }, Binding::Typed(r)) => {
             let ty = r.ty();
-            if op.is_arithmetic() && !matches!(ty, PgType::Int4 | PgType::Int8) {
+            if op.is_arithmetic() && !ty.is_numeric() {
                 return Err(no_operator("unknown", op, ty.name()));
             }
-            (resolve_unknown(lit, ty)?, r, ty)
+            (resolve_unknown(lit, span, ty)?, r, ty)
         }
-        (Binding::Unknown(l), Binding::Unknown(r)) => {
+        (
+            Binding::Unknown {
+                lit: ll,
+                span: ls,
+            },
+            Binding::Unknown {
+                lit: rl,
+                span: rs,
+            },
+        ) => {
             if op.is_arithmetic() {
                 // Every numeric type offers the operator; unknown operands
                 // cannot pick one — PG reports ambiguity.
@@ -421,14 +580,14 @@ fn bind_binary(
             }
             // Comparing two untyped literals: PG falls back to text.
             (
-                resolve_unknown(l, PgType::Text)?,
-                resolve_unknown(r, PgType::Text)?,
+                resolve_unknown(ll, ls, PgType::Text)?,
+                resolve_unknown(rl, rs, PgType::Text)?,
                 PgType::Text,
             )
         }
     };
 
-    if op.is_arithmetic() && !matches!(arg_ty, PgType::Int4 | PgType::Int8) {
+    if op.is_arithmetic() && !arg_ty.is_numeric() {
         return Err(no_operator(arg_ty.name(), op, arg_ty.name()));
     }
 
@@ -438,6 +597,67 @@ fn bind_binary(
         left: Box::new(left),
         right: Box::new(right),
     }))
+}
+
+fn bind_pow(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
+    let numeric = |b: &Binding| {
+        matches!(b, Binding::Typed(e) if e.ty().is_numeric())
+            || matches!(b, Binding::Unknown { .. })
+    };
+    if !numeric(&lb) || !numeric(&rb) {
+        return Err(no_operator(&binding_type_label(&lb), BinOp::Pow, &binding_type_label(&rb)));
+    }
+    let left = pow_operand(lb)?;
+    let right = pow_operand(rb)?;
+    Ok(Binding::Typed(BoundExpr::Binary {
+        op: BinOp::Pow,
+        arg_ty: PgType::Float8,
+        left: Box::new(left),
+        right: Box::new(right),
+    }))
+}
+
+fn pow_operand(b: Binding) -> Result<BoundExpr, BindError> {
+    match b {
+        Binding::Typed(e) => coerce_expr(e, PgType::Float8),
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Float8),
+    }
+}
+
+pub(crate) fn binding_type_label(b: &Binding) -> String {
+    match b {
+        Binding::Typed(e) => e.ty().name().to_string(),
+        Binding::Unknown { .. } => "unknown".to_string(),
+    }
+}
+
+/// Coerce a function argument binding to `target`. Unknown literals resolve to
+/// `target`; a typed argument matches exactly, or (when `exact_only` is false)
+/// is promoted if `target` is its common type with `target` — reproducing PG's
+/// implicit numeric widening for function arguments.
+pub(crate) fn coerce_for_arg(
+    binding: Binding,
+    target: PgType,
+    exact_only: bool,
+) -> Option<BoundExpr> {
+    match binding {
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, target).ok(),
+        Binding::Typed(e) => {
+            if e.ty() == target {
+                return Some(e);
+            }
+            if exact_only {
+                return None;
+            }
+            if e.ty().is_numeric()
+                && target.is_numeric()
+                && common_numeric(e.ty(), target) == Some(target)
+            {
+                return coerce_expr(e, target).ok();
+            }
+            None
+        }
+    }
 }
 
 fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
@@ -450,45 +670,61 @@ fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
     )
 }
 
-/// Settle two typed operands on a common type: exact match, or int4/int8
-/// promotion via a `Coerce` on the int4 side. Anything else has no operator.
+/// Settle two typed operands on a common type: exact match, or numeric
+/// promotion via a `Coerce` on the narrower side.
 fn unify_types(
     left: BoundExpr,
     right: BoundExpr,
     op: BinOp,
 ) -> Result<(BoundExpr, BoundExpr, PgType), BindError> {
     let (lty, rty) = (left.ty(), right.ty());
-    match (lty, rty) {
-        _ if lty == rty => Ok((left, right, lty)),
-        (PgType::Int4, PgType::Int8) => Ok((coerce_expr(left, PgType::Int8)?, right, PgType::Int8)),
-        (PgType::Int8, PgType::Int4) => Ok((left, coerce_expr(right, PgType::Int8)?, PgType::Int8)),
-        _ => Err(no_operator(lty.name(), op, rty.name())),
+    if lty == rty {
+        return Ok((left, right, lty));
     }
+    if let Some(common) = common_numeric(lty, rty) {
+        let left = coerce_expr(left, common)?;
+        let right = coerce_expr(right, common)?;
+        return Ok((left, right, common));
+    }
+    Err(no_operator(lty.name(), op, rty.name()))
 }
 
-/// Constants coerce (and range-check) at bind time, as PG's planner does when
-/// it const-folds a cast — `UPDATE t SET id = 2147483648` errors even when no
-/// row matches. Anything else gets a runtime `Coerce`.
-///
-/// The int4/int8 semantics mirror the runtime side
-/// (`crabgresql_executor::eval::coerce_value`); they cannot share code because
-/// the executor depends on this crate.
+/// The common type of two distinct numeric types, following PG's preferred-type
+/// resolution for the cases these tests exercise (float8 dominates; mixed int
+/// widens).
+fn common_numeric(a: PgType, b: PgType) -> Option<PgType> {
+    if !a.is_numeric() || !b.is_numeric() {
+        return None;
+    }
+    Some(
+        if a == PgType::Float8 || b == PgType::Float8 {
+            PgType::Float8
+        } else if a == PgType::Float4 || b == PgType::Float4 {
+            // A float4 mixed with a different numeric type resolves to float8.
+            PgType::Float8
+        } else if a == PgType::Numeric || b == PgType::Numeric {
+            PgType::Float8
+        } else if a == PgType::Int8 || b == PgType::Int8 {
+            PgType::Int8
+        } else if a == PgType::Int4 || b == PgType::Int4 {
+            PgType::Int4
+        } else {
+            PgType::Int2
+        },
+    )
+}
+
+/// Coerce an expression to `ty`. Constant operands fold (and range-check) at
+/// bind time, as PG's planner does; non-constants (and any cast to text, which
+/// needs the session `extra_float_digits`) get a runtime `Coerce`.
 fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, BindError> {
+    if expr.ty() == ty {
+        return Ok(expr);
+    }
     match expr {
-        BoundExpr::Const { value, .. } => {
-            let value = match (value, ty) {
-                (Value::Int4(v), PgType::Int8) => Value::Int8(v as i64),
-                (Value::Int8(v), PgType::Int4) => match i32::try_from(v) {
-                    Ok(v) => Value::Int4(v),
-                    Err(_) => {
-                        return Err(BindError::new(
-                            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
-                            "integer out of range",
-                        ));
-                    }
-                },
-                (value, _) => value,
-            };
+        BoundExpr::Const { value, .. } if ty != PgType::Text => {
+            let value = cast::cast_value(value, ty, 1)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))?;
             Ok(BoundExpr::Const { value, ty })
         }
         expr => Ok(BoundExpr::Coerce {
@@ -510,16 +746,21 @@ pub(crate) fn to_bool_operand(binding: Binding, context: &str) -> Result<BoundEx
                 e.ty().name()
             ),
         )),
-        Binding::Unknown(lit) => resolve_unknown(lit, PgType::Bool),
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Bool),
     }
 }
 
-/// Give an untyped literal its type from context, parsing its text the way
-/// the type's input function would.
-pub(crate) fn resolve_unknown(lit: Option<String>, ty: PgType) -> Result<BoundExpr, BindError> {
+/// Give an untyped literal its type from context, parsing its text the way the
+/// type's input function would. A parse failure carries the literal's position
+/// (PG's cursor), matching the `LINE n: ... ^` output.
+pub(crate) fn resolve_unknown(
+    lit: Option<String>,
+    span: Span,
+    ty: PgType,
+) -> Result<BoundExpr, BindError> {
     let value = match lit {
         None => Value::Null,
-        Some(s) => parse_unknown(&s, ty)?,
+        Some(s) => parse_unknown(&s, ty).map_err(|e| e.at(span))?,
     };
     Ok(BoundExpr::Const { value, ty })
 }
@@ -546,8 +787,14 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             _ => invalid(),
         }
     };
+    let float_error = |e: float::FloatParseError| BindError::new(e.sqlstate, e.message);
     match ty {
         PgType::Text => Ok(Value::Text(s.to_string())),
+        PgType::Int2 => s
+            .trim()
+            .parse::<i16>()
+            .map(Value::Int2)
+            .map_err(|e| int_error(&e)),
         PgType::Int4 => s
             .trim()
             .parse::<i32>()
@@ -558,7 +805,21 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             .parse::<i64>()
             .map(Value::Int8)
             .map_err(|e| int_error(&e)),
+        PgType::Float4 => float::float4in(s).map(Value::Float4).map_err(float_error),
+        PgType::Float8 => float::float8in(s).map(Value::Float8).map_err(float_error),
+        PgType::Numeric => Ok(Value::Numeric(numeric_in(s))),
         PgType::Bool => parse_bool_text(s).map(Value::Bool).ok_or_else(invalid),
+        PgType::Bytea | PgType::Bit | PgType::User(_) => Err(invalid()),
+    }
+}
+
+/// Minimal `numeric` input: the forms these tests reach (`NaN`, decimal text).
+fn numeric_in(s: &str) -> NumericVal {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("nan") {
+        NumericVal::NaN
+    } else {
+        NumericVal::Finite(t.to_string())
     }
 }
 
@@ -582,31 +843,32 @@ fn parse_bool_text(s: &str) -> Option<bool> {
 /// with PG's column-context error message on a type mismatch.
 pub(crate) fn coerce_to_column(binding: Binding, column: &Column) -> Result<BoundExpr, BindError> {
     match binding {
-        Binding::Unknown(lit) => resolve_unknown(lit, column.ty),
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, column.ty),
         Binding::Typed(e) => {
             let ty = e.ty();
-            match (ty, column.ty) {
-                _ if ty == column.ty => Ok(e),
-                (PgType::Int4, PgType::Int8) | (PgType::Int8, PgType::Int4) => {
-                    coerce_expr(e, column.ty)
-                }
-                _ => Err(BindError::new(
-                    sqlstate::DATATYPE_MISMATCH,
-                    format!(
-                        "column \"{}\" is of type {} but expression is of type {}",
-                        column.name,
-                        column.ty.name(),
-                        ty.name()
-                    ),
-                )),
+            if ty == column.ty {
+                return Ok(e);
             }
+            if ty.is_numeric() && column.ty.is_numeric() {
+                return coerce_expr(e, column.ty);
+            }
+            Err(BindError::new(
+                sqlstate::DATATYPE_MISMATCH,
+                format!(
+                    "column \"{}\" is of type {} but expression is of type {}",
+                    column.name,
+                    column.ty.name(),
+                    ty.name()
+                ),
+            ))
         }
     }
 }
 
 /// The result-column name PG derives from an expression's syntax: column
-/// references keep their name (through parens), boolean literals are named
-/// after the type, everything else is `?column?`.
+/// references keep their name (through parens), casts take the target type's
+/// name, boolean literals are named after the type, everything else is
+/// `?column?`.
 pub(crate) fn output_name(expr: &ast::Expr) -> String {
     match expr {
         ast::Expr::Identifier(ident) => normalize_ident(ident),
@@ -616,6 +878,20 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
             .unwrap_or_else(|| "?column?".into()),
         ast::Expr::Nested(inner) => output_name(inner),
         ast::Expr::Value(v) if matches!(v.value, ast::Value::Boolean(_)) => "bool".into(),
+        ast::Expr::Cast { data_type, .. } => map_data_type(data_type)
+            .map(|ty| ty.typname().to_string())
+            .unwrap_or_else(|_| "?column?".into()),
+        ast::Expr::TypedString(ts) => map_data_type(&ts.data_type)
+            .map(|ty| ty.typname().to_string())
+            .unwrap_or_else(|_| "?column?".into()),
+        // A function's output column is named after the function.
+        ast::Expr::Function(func) => func
+            .name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(normalize_ident)
+            .unwrap_or_else(|| "?column?".into()),
         _ => "?column?".into(),
     }
 }

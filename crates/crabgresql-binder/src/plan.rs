@@ -19,6 +19,15 @@ use crate::{BindError, OutputColumn};
 
 /// A bound statement: names resolved, expressions typed, clauses vetted.
 /// Carries the opened `TableAm` so later stages never re-resolve the name.
+/// One ORDER BY key: an output-column index and its direction. NULLs order
+/// last for ASC, first for DESC (PG defaults).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SortKey {
+    pub column: usize,
+    pub asc: bool,
+    pub nulls_first: bool,
+}
+
 pub enum LogicalPlan {
     /// FROM-less SELECT: one constant row. The predicate (`SELECT 1 WHERE
     /// false`) contains no column references — it bound in the empty scope.
@@ -26,6 +35,7 @@ pub enum LogicalPlan {
         columns: Vec<OutputColumn>,
         rows: Vec<Vec<BoundExpr>>,
         predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
     },
     /// Single-table SELECT with optional predicate.
     Query {
@@ -33,6 +43,7 @@ pub enum LogicalPlan {
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
     },
     /// INSERT ... VALUES: rows are full-width in schema order, each cell
     /// already coerced to its column type.
@@ -117,14 +128,14 @@ pub fn bind_query(
     reject_unsupported_select_clauses(select)?;
 
     match select.from.as_slice() {
-        [] => bind_values_select(select),
+        [] => bind_values_select(select, &query.order_by),
         [table] => {
             if !table.joins.is_empty() {
                 return Err(BindError::feature_not_supported(
                     "JOIN is not supported yet",
                 ));
             }
-            bind_table_select(engine, &table.relation, select)
+            bind_table_select(engine, &table.relation, select, &query.order_by)
         }
         _ => Err(BindError::feature_not_supported(
             "multiple FROM items are not supported yet",
@@ -132,11 +143,57 @@ pub fn bind_query(
     }
 }
 
+/// Bind an ORDER BY clause against the already-built output columns. Only
+/// integer ordinals are supported (`ORDER BY 1`); other forms stay `0A000`.
+fn bind_order_by(
+    order_by: &Option<ast::OrderBy>,
+    columns: &[OutputColumn],
+) -> Result<Vec<SortKey>, BindError> {
+    let Some(order_by) = order_by else {
+        return Ok(Vec::new());
+    };
+    let exprs = match &order_by.kind {
+        ast::OrderByKind::Expressions(exprs) => exprs,
+        ast::OrderByKind::All(_) => {
+            return Err(BindError::feature_not_supported(
+                "ORDER BY ALL is not supported yet",
+            ));
+        }
+    };
+    let mut keys = Vec::with_capacity(exprs.len());
+    for oe in exprs {
+        let ordinal = match &oe.expr {
+            ast::Expr::Value(v) => match &v.value {
+                ast::Value::Number(n, _) => n.parse::<usize>().ok(),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(ordinal) = ordinal else {
+            return Err(BindError::feature_not_supported(
+                "ORDER BY expressions are not supported yet (only column ordinals)",
+            ));
+        };
+        if ordinal < 1 || ordinal > columns.len() {
+            return Err(BindError::new(
+                "42P10",
+                format!("ORDER BY position {ordinal} is not in select list"),
+            ));
+        }
+        let asc = oe.options.asc.unwrap_or(true);
+        let nulls_first = oe.options.nulls_first.unwrap_or(!asc);
+        keys.push(SortKey {
+            column: ordinal - 1,
+            asc,
+            nulls_first,
+        });
+    }
+    Ok(keys)
+}
+
 fn reject_unsupported_query_clauses(query: &ast::Query) -> Result<(), BindError> {
     let unsupported: Option<&str> = if query.with.is_some() {
         Some("WITH")
-    } else if query.order_by.is_some() {
-        Some("ORDER BY")
     } else if query.limit_clause.is_some() {
         Some("LIMIT/OFFSET")
     } else if query.fetch.is_some() {
@@ -186,13 +243,15 @@ fn reject_unsupported_select_clauses(select: &ast::Select) -> Result<(), BindErr
 
 /// FROM-less SELECT: one row of constant expressions. A WHERE is still legal
 /// (`SELECT 1 WHERE false`) and binds in the empty scope.
-fn bind_values_select(select: &ast::Select) -> Result<LogicalPlan, BindError> {
+fn bind_values_select(
+    select: &ast::Select,
+    order_by: &Option<ast::OrderBy>,
+) -> Result<LogicalPlan, BindError> {
     let scope = Scope::empty();
     let mut columns = Vec::new();
     let mut row = Vec::new();
     for item in &select.projection {
-        let (expr, alias) = unpack_select_item(item)?;
-        let Some(expr) = expr else {
+        let SelectField::Expr(expr, alias) = classify_select_item(item)? else {
             return Err(BindError::syntax(
                 "SELECT * with no tables specified is not valid",
             ));
@@ -205,10 +264,12 @@ fn bind_values_select(select: &ast::Select) -> Result<LogicalPlan, BindError> {
         row.push(bound);
     }
     let predicate = bind_where(&select.selection, &scope)?;
+    let sort = bind_order_by(order_by, &columns)?;
     Ok(LogicalPlan::Values {
         columns,
         rows: vec![row],
         predicate,
+        sort,
     })
 }
 
@@ -216,26 +277,30 @@ fn bind_table_select(
     engine: &Arc<dyn TableEngine>,
     relation: &ast::TableFactor,
     select: &ast::Select,
+    order_by: &Option<ast::OrderBy>,
 ) -> Result<LogicalPlan, BindError> {
     let (table, qualifier) = open_relation(engine, relation)?;
     let schema = table.schema().clone();
-    let scope = Scope::table(&schema, qualifier);
+    let scope = Scope::table(&schema, qualifier.clone());
 
     let mut columns = Vec::new();
     let mut projections = Vec::new();
     for item in &select.projection {
-        let (expr, alias) = unpack_select_item(item)?;
-        match expr {
-            None => {
-                for (index, col) in schema.columns.iter().enumerate() {
-                    columns.push(OutputColumn {
-                        name: col.name.clone(),
-                        ty: col.ty,
-                    });
-                    projections.push(BoundExpr::ColumnRef { index, ty: col.ty });
-                }
+        match classify_select_item(item)? {
+            SelectField::Wildcard => {
+                expand_all(&schema, &mut columns, &mut projections);
             }
-            Some(expr) => {
+            SelectField::QualifiedWildcard(q) => {
+                // `f.*` is only valid for the table's qualifier.
+                if q != qualifier {
+                    return Err(BindError::new(
+                        sqlstate::UNDEFINED_TABLE,
+                        format!("missing FROM-clause entry for table \"{q}\""),
+                    ));
+                }
+                expand_all(&schema, &mut columns, &mut projections);
+            }
+            SelectField::Expr(expr, alias) => {
                 let bound = bind_scalar(expr, &scope)?;
                 columns.push(OutputColumn {
                     name: alias.unwrap_or_else(|| output_name(expr)),
@@ -247,30 +312,58 @@ fn bind_table_select(
     }
 
     let predicate = bind_where(&select.selection, &scope)?;
+    let sort = bind_order_by(order_by, &columns)?;
     Ok(LogicalPlan::Query {
         table,
         columns,
         projections,
         predicate,
+        sort,
     })
 }
 
-/// Split a select item into its expression (`None` for `*`) and alias.
-fn unpack_select_item(
-    item: &ast::SelectItem,
-) -> Result<(Option<&ast::Expr>, Option<String>), BindError> {
+/// A projection list item after classification.
+enum SelectField<'a> {
+    Wildcard,
+    QualifiedWildcard(String),
+    Expr(&'a ast::Expr, Option<String>),
+}
+
+fn classify_select_item(item: &ast::SelectItem) -> Result<SelectField<'_>, BindError> {
     match item {
-        ast::SelectItem::Wildcard(_) => Ok((None, None)),
-        ast::SelectItem::UnnamedExpr(expr) => Ok((Some(expr), None)),
+        ast::SelectItem::Wildcard(_) => Ok(SelectField::Wildcard),
+        ast::SelectItem::UnnamedExpr(expr) => Ok(SelectField::Expr(expr, None)),
         ast::SelectItem::ExprWithAlias { expr, alias } => {
-            Ok((Some(expr), Some(normalize_ident(alias))))
+            Ok(SelectField::Expr(expr, Some(normalize_ident(alias))))
         }
-        ast::SelectItem::QualifiedWildcard(..) => Err(BindError::feature_not_supported(
-            "qualified * is not supported yet",
-        )),
+        ast::SelectItem::QualifiedWildcard(kind, _) => match kind {
+            ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                Ok(SelectField::QualifiedWildcard(object_name_to_table_name(
+                    name,
+                )?))
+            }
+            ast::SelectItemQualifiedWildcardKind::Expr(_) => Err(
+                BindError::feature_not_supported("qualified * on an expression is not supported yet"),
+            ),
+        },
         ast::SelectItem::ExprWithAliases { .. } => Err(BindError::feature_not_supported(
             "multiple aliases are not supported yet",
         )),
+    }
+}
+
+/// Append every column of `schema` as a `*` / `f.*` expansion.
+fn expand_all(
+    schema: &crabgresql_storage_api::TableSchema,
+    columns: &mut Vec<OutputColumn>,
+    projections: &mut Vec<BoundExpr>,
+) {
+    for (index, col) in schema.columns.iter().enumerate() {
+        columns.push(OutputColumn {
+            name: col.name.clone(),
+            ty: col.ty,
+        });
+        projections.push(BoundExpr::ColumnRef { index, ty: col.ty });
     }
 }
 
@@ -329,8 +422,14 @@ pub fn bind_insert(
     })?;
     // The INSERT source is a full query in PG: `VALUES (1),(2) LIMIT 1` is
     // legal and inserts one row. Ignoring these clauses would silently insert
-    // the wrong rows, so reject them like any other unexecuted clause.
+    // the wrong rows, so reject them like any other unexecuted clause. ORDER BY
+    // on an INSERT source is not executed here either.
     reject_unsupported_query_clauses(source)?;
+    if source.order_by.is_some() {
+        return Err(BindError::feature_not_supported(
+            "ORDER BY on an INSERT source is not supported yet",
+        ));
+    }
     let values = match source.body.as_ref() {
         ast::SetExpr::Values(values) => &values.rows,
         other => {
@@ -904,6 +1003,59 @@ mod tests {
         let e = bind_err("SELECT 'x' + name FROM t");
         assert_eq!(e.code, "42883");
         assert_eq!(e.message, "operator does not exist: unknown + text");
+    }
+
+    #[test]
+    fn decimal_literal_binds_as_float8() {
+        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5").unwrap() else {
+            panic!("expected Values");
+        };
+        assert_eq!(
+            rows[0][0],
+            BoundExpr::Const {
+                value: Value::Float8(1.5),
+                ty: PgType::Float8
+            }
+        );
+    }
+
+    #[test]
+    fn float_literal_cast_binds() {
+        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 'NaN'::float4").unwrap() else {
+            panic!("expected Values");
+        };
+        let BoundExpr::Const {
+            value: Value::Float4(v),
+            ty: PgType::Float4,
+        } = &rows[0][0]
+        else {
+            panic!("expected float4 const, got {:?}", rows[0][0]);
+        };
+        assert!(v.is_nan());
+    }
+
+    #[test]
+    fn bad_float_literal_carries_position() {
+        let e = bind_err("SELECT 'xyz'::float4");
+        assert_eq!(e.code, "22P02");
+        assert_eq!(e.message, "invalid input syntax for type real: \"xyz\"");
+        assert!(e.location.is_some());
+    }
+
+    #[test]
+    fn float_to_int_cast_overflow_is_22003_without_position() {
+        let e = bind_err("SELECT '32767.6'::float4::int2");
+        assert_eq!(e.code, "22003");
+        assert_eq!(e.message, "smallint out of range");
+        assert!(e.location.is_none());
+    }
+
+    #[test]
+    fn float_out_of_range_literal_has_position() {
+        let e = bind_err("SELECT '10e70'::float4");
+        assert_eq!(e.code, "22003");
+        assert_eq!(e.message, "\"10e70\" is out of range for type real");
+        assert!(e.location.is_some());
     }
 
     #[test]

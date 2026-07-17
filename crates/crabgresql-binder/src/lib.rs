@@ -4,11 +4,14 @@
 //! rejection (`0A000`) of everything parsed but not yet executable.
 
 mod expr;
+mod functions;
 mod plan;
 
-pub use expr::{BinOp, Binding, BoundExpr, Scope, UnaryOp, bind_expr, bind_scalar};
-pub use plan::{LogicalPlan, bind_delete, bind_insert, bind_query, bind_update};
+pub use expr::{BinOp, Binding, BoundExpr, Scope, UnaryOp, bind_expr, bind_scalar, map_data_type};
+pub use functions::ScalarFn;
+pub use plan::{LogicalPlan, SortKey, bind_delete, bind_insert, bind_query, bind_update};
 
+use crabgresql_parser::Span;
 use crabgresql_protocol::sqlstate;
 use crabgresql_storage_api::StorageError;
 use crabgresql_types::PgType;
@@ -26,6 +29,10 @@ pub struct BindError {
     /// 5-character SQLSTATE code.
     pub code: &'static str,
     pub message: String,
+    /// 1-based (line, column) of the offending token, when PG reports a
+    /// cursor position (`LINE n: ... ^`). Only set for literal input-function
+    /// failures, mirroring PG.
+    pub location: Option<(u64, u64)>,
 }
 
 impl BindError {
@@ -33,7 +40,17 @@ impl BindError {
         Self {
             code,
             message: message.into(),
+            location: None,
         }
+    }
+
+    /// Attach the cursor position from a token span (ignored if the span is
+    /// empty, i.e. line 0).
+    pub fn at(mut self, span: Span) -> Self {
+        if span.start.line != 0 {
+            self.location = Some((span.start.line, span.start.column));
+        }
+        self
     }
 
     pub fn feature_not_supported(message: impl Into<String>) -> Self {

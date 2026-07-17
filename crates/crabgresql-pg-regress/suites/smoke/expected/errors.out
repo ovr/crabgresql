@@ -7,8 +7,8 @@ SELECT * FROM missing;
 ERROR:  relation "missing" does not exist
 SELEC 1;
 ERROR:  sql parser error: Expected: an SQL statement, found: SELEC at Line: 1, Column: 1
-SELECT 1 ORDER BY 1;
-ERROR:  ORDER BY is not supported yet
+SELECT 1 LIMIT 1;
+ERROR:  LIMIT/OFFSET is not supported yet
 SELECT 'still alive' AS status;
    status    
 -------------
