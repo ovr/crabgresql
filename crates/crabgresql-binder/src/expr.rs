@@ -189,6 +189,17 @@ pub(crate) fn normalize_ident(ident: &ast::Ident) -> String {
 pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> {
     match expr {
         ast::Expr::Value(v) => bind_value(&v.value),
+        // The DEFAULT keyword (INSERT VALUES / UPDATE SET) parses as a plain
+        // identifier; without this check it would bind as a column reference
+        // and mislead with `column "default" does not exist`. A real column
+        // named "default" must be quoted, which keeps quote_style set.
+        ast::Expr::Identifier(ident)
+            if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("default") =>
+        {
+            Err(BindError::feature_not_supported(
+                "DEFAULT is not supported yet",
+            ))
+        }
         ast::Expr::Identifier(ident) => scope.resolve(&normalize_ident(ident)).map(Binding::Typed),
         ast::Expr::CompoundIdentifier(parts) => bind_compound(parts, scope).map(Binding::Typed),
         ast::Expr::Nested(inner) => bind_expr(inner, scope),
@@ -376,15 +387,24 @@ fn bind_binary(
         }));
     }
 
-    // Comparison or arithmetic: settle both operands on one type.
+    // Comparison or arithmetic: settle both operands on one type. For
+    // arithmetic, the typed side must offer the operator BEFORE the unknown
+    // side is parsed as that type — PG reports `operator does not exist:
+    // boolean + unknown`, never a coercion failure, when no operator applies.
     let (left, right, arg_ty) = match (lb, rb) {
         (Binding::Typed(l), Binding::Typed(r)) => unify_types(l, r, op)?,
         (Binding::Typed(l), Binding::Unknown(lit)) => {
             let ty = l.ty();
+            if op.is_arithmetic() && !matches!(ty, PgType::Int4 | PgType::Int8) {
+                return Err(no_operator(ty.name(), op, "unknown"));
+            }
             (l, resolve_unknown(lit, ty)?, ty)
         }
         (Binding::Unknown(lit), Binding::Typed(r)) => {
             let ty = r.ty();
+            if op.is_arithmetic() && !matches!(ty, PgType::Int4 | PgType::Int8) {
+                return Err(no_operator("unknown", op, ty.name()));
+            }
             (resolve_unknown(lit, ty)?, r, ty)
         }
         (Binding::Unknown(l), Binding::Unknown(r)) => {
@@ -409,15 +429,7 @@ fn bind_binary(
     };
 
     if op.is_arithmetic() && !matches!(arg_ty, PgType::Int4 | PgType::Int8) {
-        return Err(BindError::new(
-            sqlstate::UNDEFINED_FUNCTION,
-            format!(
-                "operator does not exist: {} {} {}",
-                arg_ty.name(),
-                op.sql_symbol(),
-                arg_ty.name()
-            ),
-        ));
+        return Err(no_operator(arg_ty.name(), op, arg_ty.name()));
     }
 
     Ok(Binding::Typed(BoundExpr::Binary {
@@ -426,6 +438,16 @@ fn bind_binary(
         left: Box::new(left),
         right: Box::new(right),
     }))
+}
+
+fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
+    BindError::new(
+        sqlstate::UNDEFINED_FUNCTION,
+        format!(
+            "operator does not exist: {left} {} {right}",
+            op.sql_symbol()
+        ),
+    )
 }
 
 /// Settle two typed operands on a common type: exact match, or int4/int8
@@ -438,34 +460,41 @@ fn unify_types(
     let (lty, rty) = (left.ty(), right.ty());
     match (lty, rty) {
         _ if lty == rty => Ok((left, right, lty)),
-        (PgType::Int4, PgType::Int8) => Ok((coerce_expr(left, PgType::Int8), right, PgType::Int8)),
-        (PgType::Int8, PgType::Int4) => Ok((left, coerce_expr(right, PgType::Int8), PgType::Int8)),
-        _ => Err(BindError::new(
-            sqlstate::UNDEFINED_FUNCTION,
-            format!(
-                "operator does not exist: {} {} {}",
-                lty.name(),
-                op.sql_symbol(),
-                rty.name()
-            ),
-        )),
+        (PgType::Int4, PgType::Int8) => Ok((coerce_expr(left, PgType::Int8)?, right, PgType::Int8)),
+        (PgType::Int8, PgType::Int4) => Ok((left, coerce_expr(right, PgType::Int8)?, PgType::Int8)),
+        _ => Err(no_operator(lty.name(), op, rty.name())),
     }
 }
 
-fn coerce_expr(expr: BoundExpr, ty: PgType) -> BoundExpr {
-    // Constants coerce at bind time; anything else gets a runtime Coerce.
+/// Constants coerce (and range-check) at bind time, as PG's planner does when
+/// it const-folds a cast — `UPDATE t SET id = 2147483648` errors even when no
+/// row matches. Anything else gets a runtime `Coerce`.
+///
+/// The int4/int8 semantics mirror the runtime side
+/// (`crabgresql_executor::eval::coerce_value`); they cannot share code because
+/// the executor depends on this crate.
+fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, BindError> {
     match expr {
-        BoundExpr::Const {
-            value: Value::Int4(v),
-            ..
-        } if ty == PgType::Int8 => BoundExpr::Const {
-            value: Value::Int8(v as i64),
-            ty,
-        },
-        expr => BoundExpr::Coerce {
+        BoundExpr::Const { value, .. } => {
+            let value = match (value, ty) {
+                (Value::Int4(v), PgType::Int8) => Value::Int8(v as i64),
+                (Value::Int8(v), PgType::Int4) => match i32::try_from(v) {
+                    Ok(v) => Value::Int4(v),
+                    Err(_) => {
+                        return Err(BindError::new(
+                            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+                            "integer out of range",
+                        ));
+                    }
+                },
+                (value, _) => value,
+            };
+            Ok(BoundExpr::Const { value, ty })
+        }
+        expr => Ok(BoundExpr::Coerce {
             expr: Box::new(expr),
             ty,
-        },
+        }),
     }
 }
 
@@ -502,27 +531,49 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             format!("invalid input syntax for type {}: \"{s}\"", ty.name()),
         )
     };
+    // PG's integer input functions distinguish a well-formed number that does
+    // not fit (22003) from malformed input (22P02).
+    let out_of_range = || {
+        BindError::new(
+            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+            format!("value \"{s}\" is out of range for type {}", ty.name()),
+        )
+    };
+    let int_error = |e: &std::num::ParseIntError| {
+        use std::num::IntErrorKind;
+        match e.kind() {
+            IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => out_of_range(),
+            _ => invalid(),
+        }
+    };
     match ty {
         PgType::Text => Ok(Value::Text(s.to_string())),
         PgType::Int4 => s
             .trim()
             .parse::<i32>()
             .map(Value::Int4)
-            .map_err(|_| invalid()),
+            .map_err(|e| int_error(&e)),
         PgType::Int8 => s
             .trim()
             .parse::<i64>()
             .map(Value::Int8)
-            .map_err(|_| invalid()),
+            .map_err(|e| int_error(&e)),
         PgType::Bool => parse_bool_text(s).map(Value::Bool).ok_or_else(invalid),
     }
 }
 
-/// The spellings `boolin` accepts, case-insensitively and trimmed.
+/// The spellings `boolin` accepts: any unambiguous case-insensitive prefix of
+/// true/false/yes/no/off, exact "on", and "1"/"0" (a bare "o" is ambiguous
+/// between on and off) — trimmed, as in PG.
 fn parse_bool_text(s: &str) -> Option<bool> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "t" | "true" | "yes" | "y" | "on" | "1" => Some(true),
-        "f" | "false" | "no" | "n" | "off" | "0" => Some(false),
+    let s = s.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "" => None,
+        "1" | "on" => Some(true),
+        "0" => Some(false),
+        _ if "true".starts_with(&s) || "yes".starts_with(&s) => Some(true),
+        _ if "false".starts_with(&s) || "no".starts_with(&s) => Some(false),
+        _ if s.len() >= 2 && "off".starts_with(&s) => Some(false),
         _ => None,
     }
 }
@@ -537,7 +588,7 @@ pub(crate) fn coerce_to_column(binding: Binding, column: &Column) -> Result<Boun
             match (ty, column.ty) {
                 _ if ty == column.ty => Ok(e),
                 (PgType::Int4, PgType::Int8) | (PgType::Int8, PgType::Int4) => {
-                    Ok(coerce_expr(e, column.ty))
+                    coerce_expr(e, column.ty)
                 }
                 _ => Err(BindError::new(
                     sqlstate::DATATYPE_MISMATCH,

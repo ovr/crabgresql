@@ -556,6 +556,107 @@ async fn expression_type_errors_report_pg_sqlstates() {
     assert_eq!(db_err.message(), "integer out of range");
 }
 
+#[tokio::test]
+async fn insert_source_clauses_and_ragged_values_are_rejected() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a integer, b integer)")
+        .await
+        .unwrap();
+
+    // The INSERT source is a full query in PG (`VALUES ... LIMIT 1` inserts
+    // one row); until that executes, it must be rejected, not ignored.
+    for sql in [
+        "INSERT INTO t (a) VALUES (1), (2) LIMIT 1",
+        "INSERT INTO t (a) VALUES (1), (2) ORDER BY 1",
+        "INSERT INTO t (a) VALUES (DEFAULT)",
+        "UPDATE t SET a = DEFAULT",
+    ] {
+        let err = client.simple_query(sql).await.unwrap_err();
+        assert_eq!(
+            err.as_db_error().unwrap().code(),
+            &tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED,
+            "{sql}"
+        );
+    }
+
+    let err = client
+        .simple_query("INSERT INTO t VALUES (1, 2), (3)")
+        .await
+        .unwrap_err();
+    let db_err = err.as_db_error().unwrap();
+    assert_eq!(
+        db_err.code(),
+        &tokio_postgres::error::SqlState::SYNTAX_ERROR
+    );
+    assert_eq!(db_err.message(), "VALUES lists must all be the same length");
+
+    let messages = client.simple_query("SELECT * FROM t").await.unwrap();
+    assert_eq!(
+        rows(&messages).len(),
+        0,
+        "no rejected INSERT may leave rows"
+    );
+}
+
+#[tokio::test]
+async fn constant_update_overflow_errors_even_with_no_matching_rows() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+
+    // PG const-folds the cast at plan time: the empty table must not turn
+    // the error into `UPDATE 0`.
+    let err = client
+        .simple_query("UPDATE t SET id = 2147483648")
+        .await
+        .unwrap_err();
+    let db_err = err.as_db_error().unwrap();
+    assert_eq!(
+        db_err.code(),
+        &tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE
+    );
+    assert_eq!(db_err.message(), "integer out of range");
+}
+
+#[tokio::test]
+async fn integer_literals_distinguish_out_of_range_from_malformed() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer, ok boolean)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'tru'), (2, 'of')")
+        .await
+        .unwrap();
+
+    // PG bool input accepts unambiguous prefixes.
+    let messages = client
+        .simple_query("SELECT id FROM t WHERE ok")
+        .await
+        .unwrap();
+    let matched = rows(&messages);
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].get(0), Some("1"));
+
+    let err = client
+        .simple_query("SELECT id FROM t WHERE id = '3000000000'")
+        .await
+        .unwrap_err();
+    let db_err = err.as_db_error().unwrap();
+    assert_eq!(
+        db_err.code(),
+        &tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE
+    );
+    assert_eq!(
+        db_err.message(),
+        "value \"3000000000\" is out of range for type integer"
+    );
+}
+
 async fn read_backend_message(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
     let tag = socket.read_u8().await.unwrap();
     let len = socket.read_i32().await.unwrap() as usize;

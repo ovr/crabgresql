@@ -327,6 +327,10 @@ pub fn bind_insert(
     let source = insert.source.as_deref().ok_or_else(|| {
         BindError::feature_not_supported("INSERT without VALUES is not supported yet")
     })?;
+    // The INSERT source is a full query in PG: `VALUES (1),(2) LIMIT 1` is
+    // legal and inserts one row. Ignoring these clauses would silently insert
+    // the wrong rows, so reject them like any other unexecuted clause.
+    reject_unsupported_query_clauses(source)?;
     let values = match source.body.as_ref() {
         ast::SetExpr::Values(values) => &values.rows,
         other => {
@@ -341,6 +345,13 @@ pub fn bind_insert(
     let scope = Scope::empty();
     let mut rows = Vec::with_capacity(values.len());
     for value_row in values {
+        // PG validates the VALUES clause shape before matching it against the
+        // target columns.
+        if value_row.len() != values[0].len() {
+            return Err(BindError::syntax(
+                "VALUES lists must all be the same length",
+            ));
+        }
         if value_row.len() > target_indices.len() {
             return Err(BindError::syntax(
                 "INSERT has more expressions than target columns",
@@ -818,10 +829,81 @@ mod tests {
             "DELETE FROM t USING t AS u",
             "DELETE FROM t RETURNING id",
             "INSERT INTO t (id) VALUES (1) RETURNING id",
+            // The INSERT source is a full query in PG: silently dropping its
+            // clauses would insert the wrong rows.
+            "INSERT INTO t (id) VALUES (1), (2) LIMIT 1",
+            "INSERT INTO t (id) VALUES (1), (2) ORDER BY 1",
+            // DEFAULT parses as an identifier; it must not bind as a column.
+            "INSERT INTO t (id) VALUES (DEFAULT)",
+            "UPDATE t SET id = DEFAULT",
         ] {
             let e = bind_err(sql);
             assert_eq!(e.code, "0A000", "for: {sql}");
         }
+    }
+
+    #[test]
+    fn ragged_values_lists_are_42601() {
+        let e = bind_err("INSERT INTO t VALUES (1, 2), (3)");
+        assert_eq!(e.code, "42601");
+        assert_eq!(e.message, "VALUES lists must all be the same length");
+    }
+
+    #[test]
+    fn out_of_range_literal_is_22003_not_22p02() {
+        let e = bind_err("SELECT id FROM t WHERE id = '3000000000'");
+        assert_eq!(e.code, "22003");
+        assert_eq!(
+            e.message,
+            "value \"3000000000\" is out of range for type integer"
+        );
+        // Malformed input keeps 22P02.
+        let e = bind_err("SELECT id FROM t WHERE id = '30x'");
+        assert_eq!(e.code, "22P02");
+    }
+
+    #[test]
+    fn constant_assignment_range_checks_at_bind_time() {
+        // PG const-folds the cast during planning: the error fires even when
+        // no row would match.
+        let e = bind_err("UPDATE t SET id = 2147483648");
+        assert_eq!(e.code, "22003");
+        assert_eq!(e.message, "integer out of range");
+    }
+
+    #[test]
+    fn bool_literals_accept_pg_prefixes() {
+        for (sql, expected) in [
+            ("UPDATE t SET flag = 'tru'", Value::Bool(true)),
+            ("UPDATE t SET flag = 'of'", Value::Bool(false)),
+            ("UPDATE t SET flag = 'ye'", Value::Bool(true)),
+            ("UPDATE t SET flag = 'N'", Value::Bool(false)),
+        ] {
+            let LogicalPlan::Update { assignments, .. } = bind_one(sql).unwrap() else {
+                panic!("expected Update for: {sql}");
+            };
+            assert_eq!(
+                assignments[0].1,
+                BoundExpr::Const {
+                    value: expected,
+                    ty: PgType::Bool
+                },
+                "{sql}"
+            );
+        }
+        // A bare "o" is ambiguous between on and off.
+        let e = bind_err("UPDATE t SET flag = 'o'");
+        assert_eq!(e.code, "22P02");
+    }
+
+    #[test]
+    fn arithmetic_on_non_numeric_with_unknown_is_42883() {
+        let e = bind_err("SELECT flag + 'x' FROM t");
+        assert_eq!(e.code, "42883");
+        assert_eq!(e.message, "operator does not exist: boolean + unknown");
+        let e = bind_err("SELECT 'x' + name FROM t");
+        assert_eq!(e.code, "42883");
+        assert_eq!(e.message, "operator does not exist: unknown + text");
     }
 
     #[test]

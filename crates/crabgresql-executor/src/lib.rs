@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crabgresql_binder::BoundExpr;
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_planner::PhysicalPlan;
-use crabgresql_storage_api::{DeleteResult, TableAm, Tid, Tuple, UpdateResult};
+use crabgresql_storage_api::{TableAm, Tid, Tuple};
 use crabgresql_types::Value;
 
 use eval::eval;
@@ -110,6 +110,11 @@ fn execute_insert(
     Ok(Execution::Inserted(inserted))
 }
 
+/// KNOWN M2 GAP — DML statements are not isolated from concurrent writers:
+/// predicates evaluate against the scan snapshot, whole tuples are written
+/// back, and a vanished row (NotFound) is skipped, not re-evaluated. Two
+/// concurrent UPDATEs of one row are last-writer-wins. Row locks, MVCC and
+/// the EvalPlanQual recheck that fix this arrive with crabgresql-txn in M2.
 fn execute_update(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
@@ -129,17 +134,10 @@ fn execute_update(
         }
         pending.push((tid, new));
     }
-    let mut updated = 0u64;
-    for (tid, tuple) in pending {
-        // A row deleted since the snapshot (NotFound) is simply not counted;
-        // this is where M2's EvalPlanQual recheck slots in.
-        if table.update(tid, tuple) == UpdateResult::Updated {
-            updated += 1;
-        }
-    }
-    Ok(Execution::Updated(updated))
+    Ok(Execution::Updated(table.update_many(pending)))
 }
 
+/// See the concurrency note on [`execute_update`].
 fn execute_delete(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
@@ -150,13 +148,7 @@ fn execute_delete(
             pending.push(tid);
         }
     }
-    let mut deleted = 0u64;
-    for tid in pending {
-        if table.delete(tid) == DeleteResult::Deleted {
-            deleted += 1;
-        }
-    }
-    Ok(Execution::Deleted(deleted))
+    Ok(Execution::Deleted(table.delete_many(pending)))
 }
 
 /// WHERE keeps a row only when the predicate is exactly true: false and NULL

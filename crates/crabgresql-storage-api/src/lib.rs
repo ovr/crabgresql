@@ -75,6 +75,32 @@ pub trait TableAm: Send + Sync {
     fn update(&self, tid: Tid, tuple: Tuple) -> UpdateResult;
 
     fn delete(&self, tid: Tid) -> DeleteResult;
+
+    /// Apply a batch of replacements, returning how many rows were found and
+    /// updated (vanished tids are skipped, not counted). Engines should
+    /// override this to apply the whole batch under one lock — per-row calls
+    /// make a large UPDATE quadratic.
+    fn update_many(&self, updates: Vec<(Tid, Tuple)>) -> u64 {
+        let mut applied = 0;
+        for (tid, tuple) in updates {
+            if self.update(tid, tuple) == UpdateResult::Updated {
+                applied += 1;
+            }
+        }
+        applied
+    }
+
+    /// Batch counterpart of [`TableAm::delete`], mirroring
+    /// [`TableAm::update_many`].
+    fn delete_many(&self, tids: Vec<Tid>) -> u64 {
+        let mut applied = 0;
+        for tid in tids {
+            if self.delete(tid) == DeleteResult::Deleted {
+                applied += 1;
+            }
+        }
+        applied
+    }
 }
 
 /// Engine factory: `CREATE TABLE ... USING <engine>`.
