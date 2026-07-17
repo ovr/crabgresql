@@ -591,6 +591,48 @@ mod tests {
     }
 
     #[test]
+    fn case_selects_first_true_branch_lazily() {
+        // CASE WHEN <cond1> THEN 10 WHEN <cond2> THEN 20 ELSE 30 END, over
+        // constant conditions; false/NULL skip, only the winner is returned.
+        let case = |c1: Option<bool>, c2: Option<bool>, else_: Option<BoundExpr>| BoundExpr::Case {
+            whens: vec![(boolean(c1), int4(10)), (boolean(c2), int4(20))],
+            else_: else_.map(Box::new),
+            ty: PgType::Int4,
+        };
+        let e30 = || Some(int4(30));
+        assert_eq!(
+            eval_const(&case(Some(true), Some(true), e30())).unwrap(),
+            Value::Int4(10)
+        );
+        assert_eq!(
+            eval_const(&case(Some(false), Some(true), e30())).unwrap(),
+            Value::Int4(20)
+        );
+        // NULL condition behaves like false: falls through to ELSE.
+        assert_eq!(
+            eval_const(&case(None, Some(false), e30())).unwrap(),
+            Value::Int4(30)
+        );
+        // No branch matches and no ELSE: NULL.
+        assert_eq!(
+            eval_const(&case(Some(false), None, None)).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn case_does_not_evaluate_unselected_results() {
+        // The losing branch divides by zero; a lazy CASE must never touch it.
+        let bomb = binary(BinOp::Div, PgType::Int4, int4(1), int4(0));
+        let expr = BoundExpr::Case {
+            whens: vec![(boolean(Some(true)), int4(1)), (boolean(Some(true)), bomb)],
+            else_: None,
+            ty: PgType::Int4,
+        };
+        assert_eq!(eval_const(&expr).unwrap(), Value::Int4(1));
+    }
+
+    #[test]
     fn arithmetic_overflow_is_22003() {
         let expr = binary(BinOp::Add, PgType::Int4, int4(i32::MAX), int4(1));
         let e = eval_const(&expr).unwrap_err();
