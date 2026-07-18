@@ -70,6 +70,18 @@ pub enum LogicalPlan {
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
     },
+    /// SELECT over the cartesian product of two or more FROM items (`FROM a, b`
+    /// or `a CROSS JOIN b`). `inputs` produce the per-relation rows, laid out
+    /// left-to-right in the combined row; the same projection/predicate/sort
+    /// pipeline as `Query` runs on top, with `ColumnRef`s indexing the combined
+    /// row.
+    Join {
+        inputs: Vec<JoinInput>,
+        columns: Vec<OutputColumn>,
+        projections: Vec<BoundExpr>,
+        predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
+    },
     /// INSERT ... VALUES: rows are full-width in schema order, each cell
     /// already coerced to its column type.
     Insert {
@@ -86,6 +98,16 @@ pub enum LogicalPlan {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
     },
+}
+
+/// One row source feeding a [`LogicalPlan::Join`]: a base table scan, a
+/// subplan (derived table, CTE reference, or `VALUES` in FROM), or a
+/// set-returning function.
+#[derive(Clone)]
+pub enum JoinInput {
+    Scan(Arc<dyn TableAm>),
+    Subplan(Box<LogicalPlan>),
+    TableFunction { func: TableFn, args: Vec<BoundExpr> },
 }
 
 fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, BindError> {
@@ -225,27 +247,47 @@ fn bind_ctes(
     Ok(ctes)
 }
 
-/// Bind the SELECT body (its FROM item, projections, WHERE, ORDER BY).
+/// Bind the SELECT body (its FROM items, projections, WHERE, ORDER BY).
+///
+/// The FROM clause is first flattened into a list of relations: comma-separated
+/// items and `CROSS JOIN`s both contribute a cartesian-product input. Any other
+/// join (`INNER`/`LEFT`/... with `ON`/`USING`/`NATURAL`) is still rejected.
 fn bind_select(
     engine: &Arc<dyn TableEngine>,
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
-    match select.from.as_slice() {
+    let relations = flatten_from(&select.from)?;
+    match relations.as_slice() {
         [] => bind_values_select(select, order_by),
-        [table] => {
-            if !table.joins.is_empty() {
-                return Err(BindError::feature_not_supported(
-                    "JOIN is not supported yet",
-                ));
-            }
-            bind_from_select(engine, &table.relation, select, order_by, ctes)
-        }
-        _ => Err(BindError::feature_not_supported(
-            "multiple FROM items are not supported yet",
-        )),
+        [relation] => bind_from_select(engine, relation, select, order_by, ctes),
+        _ => bind_cross_join(engine, &relations, select, order_by, ctes),
     }
+}
+
+/// Flatten `FROM` into a list of relations, treating comma-separated items and
+/// `CROSS JOIN`s alike (both are cartesian products). Any join carrying a
+/// condition — `INNER`/`LEFT`/`RIGHT`/`FULL` with `ON`/`USING`, or `NATURAL` —
+/// is not supported yet.
+fn flatten_from(from: &[ast::TableWithJoins]) -> Result<Vec<&ast::TableFactor>, BindError> {
+    let mut relations = Vec::new();
+    for item in from {
+        relations.push(&item.relation);
+        for join in &item.joins {
+            match &join.join_operator {
+                ast::JoinOperator::CrossJoin(ast::JoinConstraint::None) => {
+                    relations.push(&join.relation);
+                }
+                _ => {
+                    return Err(BindError::feature_not_supported(
+                        "JOIN is not supported yet",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(relations)
 }
 
 /// Dispatch a single FROM item to the right binder: a table function, a CTE
@@ -302,6 +344,181 @@ fn bind_from_select(
     }
 }
 
+/// A single FROM item resolved as a join input: its qualifier (alias, else
+/// name), the columns it exposes for name resolution, and the row source that
+/// produces its tuples.
+struct BoundFromItem {
+    qualifier: String,
+    columns: Vec<OutputColumn>,
+    input: JoinInput,
+}
+
+/// Resolve one FROM item to a [`BoundFromItem`] — the same dispatch as
+/// [`bind_from_select`], but producing a bare row source (no projection
+/// pipeline) so several can be combined into a cross join.
+fn bind_from_item(
+    engine: &Arc<dyn TableEngine>,
+    relation: &ast::TableFactor,
+    ctes: &CteEnv,
+) -> Result<BoundFromItem, BindError> {
+    match relation {
+        // A `Table` factor carrying call arguments is a set-returning function.
+        ast::TableFactor::Table {
+            name,
+            alias,
+            args: Some(fn_args),
+            ..
+        } => {
+            if fn_args.settings.is_some() {
+                return Err(BindError::feature_not_supported(
+                    "table function SETTINGS are not supported yet",
+                ));
+            }
+            let fname = object_name_to_table_name(name)?;
+            let arg_exprs = positional_arg_exprs(&fn_args.args)?;
+            let (func, args) = bind_table_fn_call(&fname, &arg_exprs, &Scope::empty())?;
+            let qualifier = aliased_qualifier(alias, fname)?;
+            let columns = func
+                .columns()
+                .into_iter()
+                .map(|c| OutputColumn {
+                    name: c.name,
+                    ty: c.ty,
+                })
+                .collect();
+            Ok(BoundFromItem {
+                qualifier,
+                columns,
+                input: JoinInput::TableFunction { func, args },
+            })
+        }
+        // A bare name may resolve to a CTE (which shadows a real table).
+        ast::TableFactor::Table {
+            name,
+            alias,
+            args: None,
+            ..
+        } => {
+            let tname = object_name_to_table_name(name)?;
+            if let Some(cte) = ctes.get(&tname) {
+                let qualifier = relation_qualifier(alias, &tname);
+                let mut columns = cte.columns.clone();
+                apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
+                return Ok(BoundFromItem {
+                    qualifier,
+                    columns,
+                    input: JoinInput::Subplan(Box::new(cte.plan.clone())),
+                });
+            }
+            let (table, qualifier) = open_relation(engine, relation)?;
+            let columns = table
+                .schema()
+                .columns
+                .iter()
+                .map(|c| OutputColumn {
+                    name: c.name.clone(),
+                    ty: c.ty,
+                })
+                .collect();
+            Ok(BoundFromItem {
+                qualifier,
+                columns,
+                input: JoinInput::Scan(table),
+            })
+        }
+        ast::TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let Some(alias) = alias else {
+                return Err(BindError::new(
+                    sqlstate::SYNTAX_ERROR,
+                    "subquery in FROM must have an alias",
+                ));
+            };
+            let qualifier = normalize_ident(&alias.name);
+            let inner = bind_query_scoped(engine, subquery, ctes)?;
+            let mut columns = output_columns_of(&inner)?;
+            apply_alias_columns(&mut columns, &alias.columns, &table_subject(&qualifier))?;
+            Ok(BoundFromItem {
+                qualifier,
+                columns,
+                input: JoinInput::Subplan(Box::new(inner)),
+            })
+        }
+        other => Err(BindError::feature_not_supported(format!(
+            "FROM item is not supported yet: {other}"
+        ))),
+    }
+}
+
+/// The qualifier for a base-table-shaped FROM item (base table or SRF): its
+/// alias when present, else `default`. A column-list alias (`f(a, b)`) is not
+/// supported on these items.
+fn aliased_qualifier(
+    alias: &Option<ast::TableAlias>,
+    default: String,
+) -> Result<String, BindError> {
+    match alias {
+        None => Ok(default),
+        Some(alias) => {
+            if !alias.columns.is_empty() {
+                return Err(BindError::feature_not_supported(
+                    "column aliases in FROM are not supported yet",
+                ));
+            }
+            Ok(normalize_ident(&alias.name))
+        }
+    }
+}
+
+/// Bind a SELECT over the cartesian product of two or more FROM items. Each
+/// item becomes a join input and a relation in a combined [`Scope`]; the
+/// projection/WHERE/ORDER BY then bind across all of them at once, with
+/// `ColumnRef`s indexing the concatenated row. Two items with the same
+/// qualifier are rejected (`42712`), as in PG.
+fn bind_cross_join(
+    engine: &Arc<dyn TableEngine>,
+    relations: &[&ast::TableFactor],
+    select: &ast::Select,
+    order_by: &Option<ast::OrderBy>,
+    ctes: &CteEnv,
+) -> Result<LogicalPlan, BindError> {
+    let mut inputs = Vec::with_capacity(relations.len());
+    let mut scope_rels: Vec<(String, Vec<Column>)> = Vec::with_capacity(relations.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for relation in relations {
+        let item = bind_from_item(engine, relation, ctes)?;
+        if !seen.insert(item.qualifier.clone()) {
+            return Err(BindError::new(
+                sqlstate::DUPLICATE_ALIAS,
+                format!(
+                    "table name \"{}\" specified more than once",
+                    item.qualifier
+                ),
+            ));
+        }
+        let columns = item
+            .columns
+            .iter()
+            .map(|c| Column {
+                name: c.name.clone(),
+                ty: c.ty,
+            })
+            .collect();
+        scope_rels.push((item.qualifier, columns));
+        inputs.push(item.input);
+    }
+    let scope = Scope::relations(scope_rels);
+    let body = bind_select_body(select, order_by, &scope)?;
+    Ok(LogicalPlan::Join {
+        inputs,
+        columns: body.columns,
+        projections: body.projections,
+        predicate: body.predicate,
+        sort: body.sort,
+    })
+}
+
 /// Bind a SELECT whose source is a subquery (a derived table or CTE reference).
 /// The source's output columns form a synthetic relation so the outer SELECT
 /// binds exactly as it would over a base table.
@@ -313,7 +530,8 @@ fn bind_subquery_select(
     order_by: &Option<ast::OrderBy>,
 ) -> Result<LogicalPlan, BindError> {
     let schema = synthetic_schema(&qualifier, source_columns);
-    let body = bind_select_body(select, order_by, &schema, &qualifier)?;
+    let scope = Scope::table(&schema, qualifier);
+    let body = bind_select_body(select, order_by, &scope)?;
     Ok(LogicalPlan::Subquery {
         source: Box::new(source),
         columns: body.columns,
@@ -385,7 +603,8 @@ fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindError>
         LogicalPlan::Values { columns, .. }
         | LogicalPlan::Query { columns, .. }
         | LogicalPlan::Subquery { columns, .. }
-        | LogicalPlan::TableFunction { columns, .. } => Ok(columns.clone()),
+        | LogicalPlan::TableFunction { columns, .. }
+        | LogicalPlan::Join { columns, .. } => Ok(columns.clone()),
         LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => {
             Err(BindError::feature_not_supported(
                 "data-modifying statements in WITH are not supported yet",
@@ -611,7 +830,8 @@ fn bind_table_select(
 ) -> Result<LogicalPlan, BindError> {
     let (table, qualifier) = open_relation(engine, relation)?;
     let schema = table.schema().clone();
-    let body = bind_select_body(select, order_by, &schema, &qualifier)?;
+    let scope = Scope::table(&schema, qualifier);
+    let body = bind_select_body(select, order_by, &scope)?;
     Ok(LogicalPlan::Query {
         table,
         columns: body.columns,
@@ -662,7 +882,8 @@ fn bind_table_function_select(
             })
             .collect(),
     };
-    let body = bind_select_body(select, order_by, &schema, &qualifier)?;
+    let scope = Scope::table(&schema, qualifier);
+    let body = bind_select_body(select, order_by, &scope)?;
     Ok(LogicalPlan::TableFunction {
         func,
         args,
@@ -681,35 +902,34 @@ struct SelectBody {
     sort: Vec<SortKey>,
 }
 
-/// Bind a SELECT's projection list, WHERE and ORDER BY against a single
-/// in-scope relation (`schema` addressed by `qualifier`).
+/// Bind a SELECT's projection list, WHERE and ORDER BY against the in-scope
+/// relation(s). One relation for a single-table SELECT / subquery / SRF, more
+/// for a cross join — `scope` handles wildcard expansion and column resolution
+/// uniformly across however many relations it holds.
 fn bind_select_body(
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
-    schema: &TableSchema,
-    qualifier: &str,
+    scope: &Scope,
 ) -> Result<SelectBody, BindError> {
-    let scope = Scope::table(schema, qualifier.to_string());
-
     let mut columns = Vec::new();
     let mut projections = Vec::new();
     for item in &select.projection {
         match classify_select_item(item)? {
             SelectField::Wildcard => {
-                expand_all(schema, &mut columns, &mut projections);
+                for (col, expr) in scope.expand_wildcard() {
+                    columns.push(col);
+                    projections.push(expr);
+                }
             }
             SelectField::QualifiedWildcard(q) => {
-                // `f.*` is only valid for the relation's qualifier.
-                if q != qualifier {
-                    return Err(BindError::new(
-                        sqlstate::UNDEFINED_TABLE,
-                        format!("missing FROM-clause entry for table \"{q}\""),
-                    ));
+                // `f.*` expands the columns of the relation named `f`.
+                for (col, expr) in scope.expand_qualified(&q)? {
+                    columns.push(col);
+                    projections.push(expr);
                 }
-                expand_all(schema, &mut columns, &mut projections);
             }
             SelectField::Expr(expr, alias) => {
-                let bound = bind_scalar(expr, &scope)?;
+                let bound = bind_scalar(expr, scope)?;
                 columns.push(OutputColumn {
                     name: alias.unwrap_or_else(|| output_name(expr)),
                     ty: bound.ty(),
@@ -719,7 +939,7 @@ fn bind_select_body(
         }
     }
 
-    let predicate = bind_where(&select.selection, &scope)?;
+    let predicate = bind_where(&select.selection, scope)?;
     let sort = bind_order_by(order_by, &columns)?;
     Ok(SelectBody {
         columns,
@@ -756,21 +976,6 @@ fn classify_select_item(item: &ast::SelectItem) -> Result<SelectField<'_>, BindE
         ast::SelectItem::ExprWithAliases { .. } => Err(BindError::feature_not_supported(
             "multiple aliases are not supported yet",
         )),
-    }
-}
-
-/// Append every column of `schema` as a `*` / `f.*` expansion.
-fn expand_all(
-    schema: &crabgresql_storage_api::TableSchema,
-    columns: &mut Vec<OutputColumn>,
-    projections: &mut Vec<BoundExpr>,
-) {
-    for (index, col) in schema.columns.iter().enumerate() {
-        columns.push(OutputColumn {
-            name: col.name.clone(),
-            ty: col.ty,
-        });
-        projections.push(BoundExpr::ColumnRef { index, ty: col.ty });
     }
 }
 
@@ -1778,5 +1983,124 @@ mod tests {
         }
         // Two untyped literals still compare as text (unchanged).
         assert!(bind_one("SELECT CASE 'x' WHEN 'y' THEN 1 ELSE 2 END").is_ok());
+    }
+
+    #[test]
+    fn cross_join_builds_join_plan_with_offsets() {
+        // Two derived tables: a(x) at offset 0, b(y) at offset 1.
+        let LogicalPlan::Join {
+            inputs,
+            columns,
+            projections,
+            ..
+        } = bind_one("SELECT a.x, b.y FROM (VALUES (1)) a(x), (VALUES (2)) b(y)").unwrap()
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(
+            projections[0],
+            BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4
+            }
+        );
+        assert_eq!(
+            projections[1],
+            BoundExpr::ColumnRef {
+                index: 1,
+                ty: PgType::Int4
+            }
+        );
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn cross_join_wildcard_expands_every_relation_in_order() {
+        let LogicalPlan::Join {
+            columns,
+            projections,
+            ..
+        } = bind_one("SELECT * FROM (VALUES (1, 2)) a(x, y), (VALUES (3)) b(z)").unwrap()
+        else {
+            panic!("expected Join");
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["x", "y", "z"]);
+        // b.z sits after a's two columns.
+        assert_eq!(
+            projections[2],
+            BoundExpr::ColumnRef {
+                index: 2,
+                ty: PgType::Int4
+            }
+        );
+    }
+
+    #[test]
+    fn cross_join_qualified_refs_use_combined_row_index() {
+        // `t` occupies indices 0..4 (id, big, name, flag); b.y follows at 4.
+        let LogicalPlan::Join { projections, .. } =
+            bind_one("SELECT t.id, b.y FROM t, (VALUES (2)) b(y)").unwrap()
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(
+            projections[0],
+            BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4
+            }
+        );
+        assert_eq!(
+            projections[1],
+            BoundExpr::ColumnRef {
+                index: 4,
+                ty: PgType::Int4
+            }
+        );
+    }
+
+    #[test]
+    fn ambiguous_unqualified_column_is_42702() {
+        let e = bind_err("SELECT x FROM (VALUES (1)) a(x), (VALUES (2)) b(x)");
+        assert_eq!(e.code, "42702");
+        assert_eq!(e.message, "column reference \"x\" is ambiguous");
+    }
+
+    #[test]
+    fn duplicate_from_qualifier_is_42712() {
+        let e = bind_err("SELECT * FROM t, t");
+        assert_eq!(e.code, "42712");
+        assert_eq!(e.message, "table name \"t\" specified more than once");
+    }
+
+    #[test]
+    fn explicit_cross_join_flattens_like_a_comma() {
+        let LogicalPlan::Join { inputs, .. } =
+            bind_one("SELECT * FROM (VALUES (1)) a(x) CROSS JOIN (VALUES (2)) b(y)").unwrap()
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(inputs.len(), 2);
+    }
+
+    #[test]
+    fn inner_join_with_condition_stays_0a000() {
+        let e = bind_err("SELECT * FROM t a JOIN t b ON a.id = b.id");
+        assert_eq!(e.code, "0A000");
+        assert_eq!(e.message, "JOIN is not supported yet");
+    }
+
+    #[test]
+    fn where_referencing_both_relations_binds() {
+        let LogicalPlan::Join { predicate, .. } =
+            bind_one("SELECT a.x FROM (VALUES (1)) a(x), (VALUES (1)) b(y) WHERE a.x = b.y")
+                .unwrap()
+        else {
+            panic!("expected Join");
+        };
+        assert!(predicate.is_some());
     }
 }

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crabgresql_binder::{BoundExpr, SortKey, TableFn};
 pub use crabgresql_binder::OutputColumn;
-use crabgresql_planner::PhysicalPlan;
+use crabgresql_planner::{PhysicalJoinInput, PhysicalPlan};
 use crabgresql_storage_api::{TableAm, Tid, Tuple};
 use crabgresql_types::{PgType, Value};
 
@@ -144,6 +144,20 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
             columns,
             ctx,
         ),
+        PhysicalPlan::Join {
+            inputs,
+            columns,
+            projections,
+            predicate,
+            sort,
+        } => {
+            let mut sources = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                sources.push(build_join_source(input, ctx)?);
+            }
+            let cross = Box::new(CrossJoin::new(sources)?);
+            project_pipeline(cross, projections, predicate, sort, columns, ctx)
+        }
         PhysicalPlan::Insert { table, rows } => execute_insert(&table, &rows, ctx),
         PhysicalPlan::Update {
             table,
@@ -337,6 +351,112 @@ fn pg_input_error_info_row(args: &[Value]) -> Tuple {
             Value::Null,
             Value::Text(sqlstate.to_string()),
         ],
+    }
+}
+
+/// Build the row source for one join input: a table scan, a set-returning
+/// function, or a recursively-executed subplan (derived table / CTE / VALUES).
+fn build_join_source(
+    input: PhysicalJoinInput,
+    ctx: ExecContext,
+) -> Result<Box<dyn ExecNode>, ExecError> {
+    Ok(match input {
+        PhysicalJoinInput::Scan(table) => Box::new(SeqScan::new(&table)),
+        PhysicalJoinInput::TableFunction { func, args } => {
+            Box::new(TableFunctionSource::new(func, args, ctx))
+        }
+        PhysicalJoinInput::Subplan(source) => {
+            let Execution::Rows { node, .. } = execute(*source, ctx)? else {
+                return Err(ExecError::new(
+                    "XX000",
+                    "join source did not produce a row set",
+                ));
+            };
+            node
+        }
+    })
+}
+
+/// Cartesian product of two or more inputs (`FROM a, b` / `a CROSS JOIN b`).
+///
+/// Nested-loop with inner materialization: the first input streams as the outer
+/// relation; the rest are buffered up front. Each emitted row is the outer
+/// tuple concatenated with one pick from every inner relation, iterated as an
+/// odometer whose rightmost (last) relation advances fastest — the row order PG
+/// produces for a comma/cross join.
+pub struct CrossJoin {
+    outer: Box<dyn ExecNode>,
+    inners: Vec<Vec<Tuple>>,
+    /// Current pick within each inner relation.
+    indices: Vec<usize>,
+    /// The outer tuple every emitted row is currently built on; `None` once the
+    /// outer relation is exhausted.
+    current_outer: Option<Tuple>,
+    started: bool,
+}
+
+impl CrossJoin {
+    /// `sources` are the join inputs in FROM order; the executor only builds a
+    /// join for two or more, so the first is the streamed outer and at least
+    /// one inner is materialized.
+    pub fn new(mut sources: Vec<Box<dyn ExecNode>>) -> Result<Self, ExecError> {
+        let outer = sources.remove(0);
+        let mut inners = Vec::with_capacity(sources.len());
+        for mut src in sources {
+            let mut rows = Vec::new();
+            while let Some(row) = src.next()? {
+                rows.push(row);
+            }
+            inners.push(rows);
+        }
+        let indices = vec![0; inners.len()];
+        Ok(Self {
+            outer,
+            inners,
+            indices,
+            current_outer: None,
+            started: false,
+        })
+    }
+
+    /// Advance the odometer over the inner relations, rightmost fastest.
+    /// Returns `true` if it advanced within the current outer row, `false` if
+    /// every inner index wrapped back to 0 (time for the next outer row).
+    fn advance(&mut self) -> bool {
+        for i in (0..self.inners.len()).rev() {
+            self.indices[i] += 1;
+            if self.indices[i] < self.inners[i].len() {
+                return true;
+            }
+            self.indices[i] = 0;
+        }
+        false
+    }
+}
+
+impl ExecNode for CrossJoin {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        // Any empty inner relation makes the whole product empty.
+        if self.inners.iter().any(|rows| rows.is_empty()) {
+            return Ok(None);
+        }
+        if !self.started {
+            self.started = true;
+            self.current_outer = self.outer.next()?;
+        }
+        let Some(outer) = self.current_outer.clone() else {
+            return Ok(None);
+        };
+        let mut combined = outer;
+        for (rows, &i) in self.inners.iter().zip(&self.indices) {
+            combined.extend_from_slice(&rows[i]);
+        }
+        // Move to the next combination for the following call.
+        if !self.advance() {
+            self.current_outer = self.outer.next()?;
+            self.indices.iter_mut().for_each(|i| *i = 0);
+        }
+        Ok(Some(combined))
     }
 }
 
@@ -1022,5 +1142,61 @@ mod tests {
             "SELECT n FROM (SELECT n FROM nums WHERE n <> 2) s ORDER BY 1",
         );
         assert_eq!(rows, vec![vec![Value::Int4(1)], vec![Value::Int4(3)]]);
+    }
+
+    #[test]
+    fn cross_join_of_values_is_cartesian_in_pg_order() {
+        // First relation outermost (slowest), last relation innermost (fastest).
+        let (columns, rows) =
+            run_rows("SELECT * FROM (VALUES (1), (2)) a(x), (VALUES (10), (20)) b(y)");
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["x", "y"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(10)],
+                vec![Value::Int4(1), Value::Int4(20)],
+                vec![Value::Int4(2), Value::Int4(10)],
+                vec![Value::Int4(2), Value::Int4(20)],
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_join_over_real_tables_with_join_predicate() {
+        let engine = engine_with_nums();
+        let (_columns, rows) = run_rows_on(
+            &engine,
+            "SELECT a.n, b.n FROM nums a, nums b WHERE a.n = b.n ORDER BY 1",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(1)],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(3), Value::Int4(3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_cross_join_matches_comma_semantics() {
+        let (_columns, rows) =
+            run_rows("SELECT * FROM (VALUES (1)) a(x) CROSS JOIN (VALUES (7), (8)) b(y)");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(7)],
+                vec![Value::Int4(1), Value::Int4(8)],
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_join_with_an_empty_relation_yields_no_rows() {
+        // The inner relation is empty, so the product is empty.
+        let (_columns, rows) =
+            run_rows("SELECT * FROM (VALUES (1), (2)) a(x), (SELECT 1 WHERE false) b(z)");
+        assert!(rows.is_empty());
     }
 }

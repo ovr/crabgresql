@@ -9,7 +9,7 @@ mod plan;
 
 pub use expr::{BinOp, Binding, BoundExpr, Scope, UnaryOp, bind_expr, bind_scalar, map_data_type};
 pub use functions::{ScalarFn, TableFn, lookup_table_fn};
-pub use plan::{LogicalPlan, SortKey, bind_delete, bind_insert, bind_query, bind_update};
+pub use plan::{JoinInput, LogicalPlan, SortKey, bind_delete, bind_insert, bind_query, bind_update};
 
 use crabgresql_parser::Span;
 use crabgresql_pg_wire::sqlstate;
