@@ -10,7 +10,9 @@ use crabgresql_binder::{LogicalPlan, bind_delete, bind_insert, bind_query, bind_
 use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
-use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog};
+use crabgresql_storage_api::{
+    Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog,
+};
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::PgType;
 
@@ -123,16 +125,32 @@ pub fn execute_statement(
     let system: Arc<dyn TableEngine> = {
         let global = engine.clone();
         let temp = session.temp.clone();
-        Arc::new(crabgresql_catalog::SystemCatalog::with_relations_fn(move || {
-            let mut rels = global.relations();
-            rels.extend(temp.relations());
-            rels
-        }))
+        let database = session.database.clone();
+        let owner = session.user.clone();
+        let temp_schema = session.temp_schema.clone();
+        Arc::new(
+            crabgresql_catalog::SystemCatalog::with_catalog_relations_fn(
+                database,
+                owner,
+                move || {
+                    let mut rels: Vec<_> = global
+                        .relations()
+                        .into_iter()
+                        .map(crabgresql_catalog::CatalogRelation::permanent)
+                        .collect();
+                    rels.extend(temp.relations().into_iter().map(|schema| {
+                        crabgresql_catalog::CatalogRelation::temporary(schema, temp_schema.clone())
+                    }));
+                    rels
+                },
+            ),
+        )
     };
     let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
         session.temp.clone(),
         engine.clone(),
         system,
+        session.temp_schema.clone(),
     ));
     // The global catalog is the binder's view of user-defined types and casts,
     // so an expression can cast to/from a `CREATE TYPE` name.
@@ -226,7 +244,11 @@ pub fn execute_statement(
         LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
     );
     let txn = build_txn(txnmgr, session, is_write);
-    let exec = match execute(crabgresql_planner::plan(logical), session.exec_context(), &txn) {
+    let exec = match execute(
+        crabgresql_planner::plan(logical),
+        session.exec_context(),
+        &txn,
+    ) {
         Ok(exec) => exec,
         Err(e) => {
             // Abort path: infallible, so the result is safe to drop.
@@ -268,7 +290,11 @@ fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool)
             txnmgr.context_with(xid, active.cid, snapshot, active.iso)
         }
         None => {
-            let xid = if is_write { txnmgr.allocate_xid() } else { Xid::INVALID };
+            let xid = if is_write {
+                txnmgr.allocate_xid()
+            } else {
+                Xid::INVALID
+            };
             txnmgr.context(xid, CommandId::FIRST)
         }
     }
@@ -311,7 +337,10 @@ fn finalize_statement(
 
 /// Map a WAL/commit I/O failure to a SQLSTATE 58030 system error.
 fn commit_io_error(e: std::io::Error) -> PgError {
-    PgError::new(sqlstate::IO_ERROR, format!("could not commit transaction: {e}"))
+    PgError::new(
+        sqlstate::IO_ERROR,
+        format!("could not commit transaction: {e}"),
+    )
 }
 
 /// `AND CHAIN` (commit/rollback then immediately open an identical block) is not
@@ -863,7 +892,11 @@ fn type_shape_from_options(
                         sqlstate::UNDEFINED_OBJECT,
                         format!("type \"{display}\" does not exist"),
                     );
-                    let start = name.0.first().and_then(|p| p.as_ident()).map(|i| i.span.start);
+                    let start = name
+                        .0
+                        .first()
+                        .and_then(|p| p.as_ident())
+                        .map(|i| i.span.start);
                     if let Some(start) = start {
                         if start.line != 0 {
                             err.location = Some((start.line, start.column));
@@ -935,7 +968,10 @@ fn execute_create_function(
     catalog: &GlobalCatalog,
     create: &ast::CreateFunction,
 ) -> Result<QueryResult, PgError> {
-    let lang = create.language.as_ref().map(|i| i.value.to_ascii_lowercase());
+    let lang = create
+        .language
+        .as_ref()
+        .map(|i| i.value.to_ascii_lowercase());
     if lang.as_deref() != Some("internal") {
         return Err(PgError::feature_not_supported(
             "CREATE FUNCTION is only supported for LANGUAGE internal",
@@ -1117,7 +1153,10 @@ mod tests {
         assert_eq!(err.code, sqlstate::UNDEFINED_OBJECT);
         assert_eq!(err.message, "type \"no_such_type\" does not exist");
         // Carries a cursor position so the client can render a LINE/caret excerpt.
-        assert!(err.location.is_some(), "unknown LIKE target must carry a position");
+        assert!(
+            err.location.is_some(),
+            "unknown LIKE target must carry a position"
+        );
     }
 
     #[test]

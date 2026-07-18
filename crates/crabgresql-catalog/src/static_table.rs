@@ -1,5 +1,5 @@
 //! A read-only [`TableAm`] backed by an in-memory row vector — the access
-//! method every `pg_catalog` relation is served through.
+//! method every system-catalog relation is served through.
 //!
 //! Catalog rows are synthetic: they have no MVCC version history, so a scan
 //! yields every row regardless of the caller's snapshot, and the mutating
@@ -23,7 +23,10 @@ pub struct StaticTable {
 
 impl StaticTable {
     pub fn new(schema: TableSchema, rows: Vec<Tuple>) -> Self {
-        Self { schema, rows: Arc::new(rows) }
+        Self {
+            schema,
+            rows: Arc::new(rows),
+        }
     }
 
     /// Build behind an `Arc<dyn TableAm>` for handing to the planner/executor.

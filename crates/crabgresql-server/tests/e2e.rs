@@ -19,16 +19,97 @@ async fn spawn_server() -> u16 {
 }
 
 async fn connect(port: u16) -> tokio_postgres::Client {
+    connect_as(port, "postgres", "postgres").await
+}
+
+async fn connect_as(port: u16, user: &str, database: &str) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::Config::new()
         .host("127.0.0.1")
         .port(port)
-        .user("postgres")
-        .dbname("postgres")
+        .user(user)
+        .dbname(database)
         .connect(NoTls)
         .await
         .expect("handshake should succeed");
     tokio::spawn(conn);
     client
+}
+
+#[tokio::test]
+async fn information_schema_reflects_live_relations_and_session_identity() {
+    let client = connect_as(spawn_server().await, "catalog_user", "catalog_db").await;
+    client
+        .simple_query("CREATE TABLE inventory (id int4, code varchar(8))")
+        .await
+        .unwrap();
+
+    let table_messages = client
+        .simple_query(
+            "SELECT table_catalog, table_schema, table_name, table_type \
+             FROM information_schema.tables WHERE table_name = 'inventory'",
+        )
+        .await
+        .unwrap();
+    let table_rows = rows(&table_messages);
+    assert_eq!(table_rows.len(), 1);
+    assert_eq!(table_rows[0].get(0), Some("catalog_db"));
+    assert_eq!(table_rows[0].get(1), Some("public"));
+    assert_eq!(table_rows[0].get(2), Some("inventory"));
+    assert_eq!(table_rows[0].get(3), Some("BASE TABLE"));
+
+    let column_messages = client
+        .simple_query(
+            "SELECT column_name, ordinal_position, data_type, character_maximum_length, \
+                    udt_catalog, udt_schema, udt_name, is_generated \
+             FROM information_schema.columns \
+             WHERE table_name = 'inventory' ORDER BY ordinal_position",
+        )
+        .await
+        .unwrap();
+    let columns = rows(&column_messages);
+    assert_eq!(columns.len(), 2);
+    assert_eq!(columns[0].get(0), Some("id"));
+    assert_eq!(columns[0].get(1), Some("1"));
+    assert_eq!(columns[0].get(2), Some("integer"));
+    assert_eq!(columns[1].get(0), Some("code"));
+    assert_eq!(columns[1].get(3), Some("8"));
+    assert_eq!(columns[1].get(4), Some("catalog_db"));
+    assert_eq!(columns[1].get(5), Some("pg_catalog"));
+    assert_eq!(columns[1].get(6), Some("varchar"));
+    assert_eq!(columns[1].get(7), Some("NEVER"));
+
+    client
+        .simple_query("CREATE TEMP TABLE scratch (v int4)")
+        .await
+        .unwrap();
+    let temp_messages = client
+        .simple_query(
+            "SELECT table_schema, table_type FROM information_schema.tables \
+             WHERE table_name = 'scratch'",
+        )
+        .await
+        .unwrap();
+    let temp = rows(&temp_messages);
+    assert_eq!(temp.len(), 1);
+    assert!(temp[0].get(0).unwrap().starts_with("pg_temp_"));
+    assert_eq!(temp[0].get(1), Some("LOCAL TEMPORARY"));
+
+    let err = client
+        .simple_query("SELECT * FROM tables")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code().expect("database error has SQLSTATE").code(),
+        "42P01"
+    );
+    let err = client
+        .simple_query("INSERT INTO information_schema.tables VALUES (1)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code().expect("database error has SQLSTATE").code(),
+        "42501"
+    );
 }
 
 fn rows(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> {
@@ -72,9 +153,7 @@ async fn select_literals_with_aliases() {
 async fn hex_string_literals_bind_display_and_cast() {
     let client = connect(spawn_server().await).await;
     let messages = client
-        .simple_query(
-            "SELECT X'00000001', X'FF', X'00000001'::int4, X'FFFFFFFF'::int4, X''",
-        )
+        .simple_query("SELECT X'00000001', X'FF', X'00000001'::int4, X'FFFFFFFF'::int4, X''")
         .await
         .unwrap();
     let rows = rows(&messages);
@@ -133,7 +212,10 @@ async fn order_by_name_expression_and_alias() {
 
     // ORDER BY a column name: sorted by `a` ascending → id 2 (a=1), id 3 (a=2),
     // id 1 (a=3).
-    let messages = client.simple_query("SELECT id FROM t ORDER BY a").await.unwrap();
+    let messages = client
+        .simple_query("SELECT id FROM t ORDER BY a")
+        .await
+        .unwrap();
     let ids: Vec<&str> = rows(&messages).iter().map(|r| r.get(0).unwrap()).collect();
     assert_eq!(ids, vec!["2", "3", "1"]);
 
@@ -267,7 +349,10 @@ async fn drop_table_resolves_temp_first() {
 
     // The permanent table is still there with its row.
     let msgs = simple_query_raw(&mut socket, "SELECT a FROM t").await;
-    assert!(msgs.iter().any(|(tag, _)| *tag == b'D'), "permanent row remains");
+    assert!(
+        msgs.iter().any(|(tag, _)| *tag == b'D'),
+        "permanent row remains"
+    );
 
     // Dropping again now removes the permanent table.
     let msgs = simple_query_raw(&mut socket, "DROP TABLE t").await;
@@ -362,9 +447,7 @@ async fn aggregates_over_a_table() {
 
     // GROUP BY + HAVING + ORDER BY.
     let messages = client
-        .simple_query(
-            "SELECT a, count(*), sum(b) FROM t GROUP BY a HAVING count(*) > 1 ORDER BY a",
-        )
+        .simple_query("SELECT a, count(*), sum(b) FROM t GROUP BY a HAVING count(*) > 1 ORDER BY a")
         .await
         .unwrap();
     let grouped = rows(&messages);
@@ -415,7 +498,10 @@ async fn limit_and_offset_slice_ordered_rows() {
         .simple_query("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1")
         .await
         .unwrap();
-    let got: Vec<_> = rows(&messages).iter().map(|r| r.get(0).unwrap().to_string()).collect();
+    let got: Vec<_> = rows(&messages)
+        .iter()
+        .map(|r| r.get(0).unwrap().to_string())
+        .collect();
     assert_eq!(got, ["1", "3"]);
 
     // OFFSET 0 is a no-op fence (the float4/float8 pattern): all rows, in order.
@@ -676,7 +762,10 @@ async fn rollback_undoes_inserts() {
         .await
         .unwrap();
     client.simple_query("BEGIN").await.unwrap();
-    client.simple_query("INSERT INTO t VALUES (1), (2)").await.unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1), (2)")
+        .await
+        .unwrap();
     // The transaction sees its own uncommitted inserts.
     assert_eq!(row_count(&client, "t").await, 2);
     client.simple_query("ROLLBACK").await.unwrap();
@@ -697,7 +786,10 @@ async fn rollback_restores_deleted_and_updated_rows() {
         .unwrap();
 
     client.simple_query("BEGIN").await.unwrap();
-    client.simple_query("DELETE FROM t WHERE id = 1").await.unwrap();
+    client
+        .simple_query("DELETE FROM t WHERE id = 1")
+        .await
+        .unwrap();
     client
         .simple_query("UPDATE t SET label = 'B' WHERE id = 2")
         .await
@@ -707,7 +799,10 @@ async fn rollback_restores_deleted_and_updated_rows() {
         .simple_query("SELECT label FROM t ORDER BY 1")
         .await
         .unwrap();
-    let seen: Vec<_> = rows(&msgs).iter().map(|r| r.get(0).unwrap().to_string()).collect();
+    let seen: Vec<_> = rows(&msgs)
+        .iter()
+        .map(|r| r.get(0).unwrap().to_string())
+        .collect();
     assert_eq!(seen, ["B"]);
 
     client.simple_query("ROLLBACK").await.unwrap();
@@ -716,7 +811,10 @@ async fn rollback_restores_deleted_and_updated_rows() {
         .simple_query("SELECT label FROM t ORDER BY 1")
         .await
         .unwrap();
-    let restored: Vec<_> = rows(&msgs).iter().map(|r| r.get(0).unwrap().to_string()).collect();
+    let restored: Vec<_> = rows(&msgs)
+        .iter()
+        .map(|r| r.get(0).unwrap().to_string())
+        .collect();
     assert_eq!(restored, ["a", "b"]);
 }
 
@@ -728,7 +826,10 @@ async fn commit_persists_changes() {
         .await
         .unwrap();
     client.simple_query("BEGIN").await.unwrap();
-    client.simple_query("INSERT INTO t VALUES (7)").await.unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (7)")
+        .await
+        .unwrap();
     client.simple_query("COMMIT").await.unwrap();
     let msgs = client.simple_query("SELECT id FROM t").await.unwrap();
     let r = rows(&msgs);
@@ -746,7 +847,10 @@ async fn uncommitted_changes_are_invisible_to_other_sessions() {
         .await
         .unwrap();
     writer.simple_query("BEGIN").await.unwrap();
-    writer.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+    writer
+        .simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .unwrap();
     // The writer sees its own row; a concurrent session does not.
     assert_eq!(row_count(&writer, "t").await, 1);
     assert_eq!(row_count(&reader, "t").await, 0);
@@ -766,7 +870,10 @@ async fn disconnect_mid_block_aborts_and_frees_the_row() {
     // old version's xmax), then disconnects without COMMIT/ROLLBACK.
     let b = connect(port).await;
     b.simple_query("BEGIN").await.unwrap();
-    assert_eq!(command_count(&b.simple_query("UPDATE t SET id = 2").await.unwrap()), Some(1));
+    assert_eq!(
+        command_count(&b.simple_query("UPDATE t SET id = 2").await.unwrap()),
+        Some(1)
+    );
     drop(b);
     // Give the server a moment to observe the disconnect and abort B's block.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;

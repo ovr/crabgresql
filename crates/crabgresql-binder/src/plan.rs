@@ -159,9 +159,7 @@ pub enum AggInput {
 /// Split a relation name into an optional schema qualifier and the relation
 /// name. `t` → `(None, "t")`; `pg_catalog.pg_type` → `(Some("pg_catalog"),
 /// "pg_type")`. A three-or-more-part name (cross-database) is still unsupported.
-fn split_relation_name(
-    name: &ast::ObjectName,
-) -> Result<(Option<String>, String), BindError> {
+fn split_relation_name(name: &ast::ObjectName) -> Result<(Option<String>, String), BindError> {
     let idents: Vec<&ast::Ident> = name.0.iter().filter_map(|p| p.as_ident()).collect();
     if idents.len() != name.0.len() {
         return Err(BindError::syntax(format!("invalid relation name: {name}")));
@@ -221,7 +219,7 @@ fn resolve_write_table(
         // Unqualified: temp then global — `open_table` never consults the
         // system catalog, so this cannot resolve to a read-only relation.
         None => engine.open_table(&table_name),
-        Some("pg_catalog") => {
+        Some("pg_catalog") | Some("information_schema") => {
             // Matches PG's observable error for a non-superuser writing a system
             // catalog (crabgresql has no roles, so this is the default posture).
             return Err(BindError::new(
@@ -373,14 +371,14 @@ fn bind_count_expr(expr: &ast::Expr, clause: &str) -> Result<Option<i64>, BindEr
     match const_i64(expr) {
         Some(Some(n)) if n < 0 => {
             let (code, kind) = if clause == "OFFSET" {
-                (sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, "OFFSET")
+                (
+                    sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+                    "OFFSET",
+                )
             } else {
                 (sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, "LIMIT")
             };
-            Err(BindError::new(
-                code,
-                format!("{kind} must not be negative"),
-            ))
+            Err(BindError::new(code, format!("{kind} must not be negative")))
         }
         Some(value) => Ok(value),
         None => Err(BindError::feature_not_supported(format!(
@@ -718,10 +716,7 @@ fn bind_cross_join(
         if !seen.insert(item.qualifier.clone()) {
             return Err(BindError::new(
                 sqlstate::DUPLICATE_ALIAS,
-                format!(
-                    "table name \"{}\" specified more than once",
-                    item.qualifier
-                ),
+                format!("table name \"{}\" specified more than once", item.qualifier),
             ));
         }
         scope_rels.push((item.qualifier, to_columns(&item.columns)));
@@ -1225,7 +1220,10 @@ fn bind_aggregation(
 ) -> Result<Option<Aggregation>, BindError> {
     // An aggregate in WHERE is always an error — WHERE filters rows before
     // grouping, so no aggregate value exists yet.
-    if predicate.as_ref().is_some_and(BoundExpr::contains_aggregate) {
+    if predicate
+        .as_ref()
+        .is_some_and(BoundExpr::contains_aggregate)
+    {
         return Err(BindError::new(
             sqlstate::GROUPING_ERROR,
             "aggregate functions are not allowed in WHERE",
@@ -1421,7 +1419,12 @@ fn rewrite_over_aggregate(
         c @ BoundExpr::Const { .. } => Ok(c),
         BoundExpr::Unary { op, expr } => Ok(BoundExpr::Unary {
             op,
-            expr: Box::new(rewrite_over_aggregate(*expr, group_exprs, aggregates, scope)?),
+            expr: Box::new(rewrite_over_aggregate(
+                *expr,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
         }),
         BoundExpr::Binary {
             op,
@@ -1431,15 +1434,35 @@ fn rewrite_over_aggregate(
         } => Ok(BoundExpr::Binary {
             op,
             arg_ty,
-            left: Box::new(rewrite_over_aggregate(*left, group_exprs, aggregates, scope)?),
-            right: Box::new(rewrite_over_aggregate(*right, group_exprs, aggregates, scope)?),
+            left: Box::new(rewrite_over_aggregate(
+                *left,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
+            right: Box::new(rewrite_over_aggregate(
+                *right,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
         }),
         BoundExpr::IsNull { expr, negated } => Ok(BoundExpr::IsNull {
-            expr: Box::new(rewrite_over_aggregate(*expr, group_exprs, aggregates, scope)?),
+            expr: Box::new(rewrite_over_aggregate(
+                *expr,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
             negated,
         }),
         BoundExpr::Coerce { expr, ty } => Ok(BoundExpr::Coerce {
-            expr: Box::new(rewrite_over_aggregate(*expr, group_exprs, aggregates, scope)?),
+            expr: Box::new(rewrite_over_aggregate(
+                *expr,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
             ty,
         }),
         BoundExpr::Reinterpret {
@@ -1447,7 +1470,12 @@ fn rewrite_over_aggregate(
             reported,
             rep,
         } => Ok(BoundExpr::Reinterpret {
-            expr: Box::new(rewrite_over_aggregate(*expr, group_exprs, aggregates, scope)?),
+            expr: Box::new(rewrite_over_aggregate(
+                *expr,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
             reported,
             rep,
         }),
@@ -1496,14 +1524,12 @@ fn classify_select_item(item: &ast::SelectItem) -> Result<SelectField<'_>, BindE
             Ok(SelectField::Expr(expr, Some(normalize_ident(alias))))
         }
         ast::SelectItem::QualifiedWildcard(kind, _) => match kind {
-            ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                Ok(SelectField::QualifiedWildcard(object_name_to_table_name(
-                    name,
-                )?))
-            }
-            ast::SelectItemQualifiedWildcardKind::Expr(_) => Err(
-                BindError::feature_not_supported("qualified * on an expression is not supported yet"),
+            ast::SelectItemQualifiedWildcardKind::ObjectName(name) => Ok(
+                SelectField::QualifiedWildcard(object_name_to_table_name(name)?),
             ),
+            ast::SelectItemQualifiedWildcardKind::Expr(_) => Err(BindError::feature_not_supported(
+                "qualified * on an expression is not supported yet",
+            )),
         },
         ast::SelectItem::ExprWithAliases { .. } => Err(BindError::feature_not_supported(
             "multiple aliases are not supported yet",
@@ -1780,8 +1806,7 @@ mod tests {
 
     fn bind_one(sql: &str) -> Result<LogicalPlan, BindError> {
         let engine = engine_with_table();
-        let catalog: Arc<dyn TypeCatalog> =
-            Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+        let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         let stmts = crabgresql_parser::parse(sql).unwrap();
         match &stmts[0] {
             ast::Statement::Query(q) => bind_query(&engine, &catalog, q),
@@ -1802,7 +1827,12 @@ mod tests {
     /// The pieces of a bound `Aggregate` plan.
     fn agg_of(
         sql: &str,
-    ) -> (Vec<BoundExpr>, Vec<crate::BoundAggregate>, Vec<BoundExpr>, Option<BoundExpr>) {
+    ) -> (
+        Vec<BoundExpr>,
+        Vec<crate::BoundAggregate>,
+        Vec<BoundExpr>,
+        Option<BoundExpr>,
+    ) {
         match bind_one(sql).unwrap() {
             LogicalPlan::Aggregate {
                 group_exprs,
@@ -1811,7 +1841,10 @@ mod tests {
                 having,
                 ..
             } => (group_exprs, aggregates, projections, having),
-            other => panic!("expected Aggregate for `{sql}`, got another plan variant: {}", plan_name(&other)),
+            other => panic!(
+                "expected Aggregate for `{sql}`, got another plan variant: {}",
+                plan_name(&other)
+            ),
         }
     }
 
@@ -1860,8 +1893,14 @@ mod tests {
         assert_eq!(
             projections,
             vec![
-                BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 },
-                BoundExpr::ColumnRef { index: 1, ty: PgType::Int4 },
+                BoundExpr::ColumnRef {
+                    index: 0,
+                    ty: PgType::Int4
+                },
+                BoundExpr::ColumnRef {
+                    index: 1,
+                    ty: PgType::Int4
+                },
             ]
         );
     }
@@ -1870,11 +1909,29 @@ mod tests {
     fn expression_over_aggregates_rewrites_each_call() {
         let (_g, aggregates, projections, _h) = agg_of("SELECT max(id) - min(id) FROM t");
         assert_eq!(aggregates.len(), 2);
-        let BoundExpr::Binary { op: BinOp::Sub, left, right, .. } = &projections[0] else {
+        let BoundExpr::Binary {
+            op: BinOp::Sub,
+            left,
+            right,
+            ..
+        } = &projections[0]
+        else {
             panic!("expected a subtraction over the two aggregate columns");
         };
-        assert_eq!(**left, BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 });
-        assert_eq!(**right, BoundExpr::ColumnRef { index: 1, ty: PgType::Int4 });
+        assert_eq!(
+            **left,
+            BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4
+            }
+        );
+        assert_eq!(
+            **right,
+            BoundExpr::ColumnRef {
+                index: 1,
+                ty: PgType::Int4
+            }
+        );
     }
 
     #[test]
@@ -1882,21 +1939,39 @@ mod tests {
         let (_g, aggregates, projections, _h) = agg_of("SELECT 'x', count(*) FROM t");
         assert_eq!(aggregates.len(), 1);
         assert!(matches!(projections[0], BoundExpr::Const { .. }));
-        assert_eq!(projections[1], BoundExpr::ColumnRef { index: 0, ty: PgType::Int8 });
+        assert_eq!(
+            projections[1],
+            BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int8
+            }
+        );
     }
 
     #[test]
     fn group_by_puts_keys_before_aggregates() {
         let (group_exprs, aggregates, projections, _h) =
             agg_of("SELECT id, count(*) FROM t GROUP BY id");
-        assert_eq!(group_exprs, vec![BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 }]);
+        assert_eq!(
+            group_exprs,
+            vec![BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4
+            }]
+        );
         assert_eq!(aggregates.len(), 1);
         // Group key is slot 0; the aggregate is slot 1 (after the keys).
         assert_eq!(
             projections,
             vec![
-                BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 },
-                BoundExpr::ColumnRef { index: 1, ty: PgType::Int8 },
+                BoundExpr::ColumnRef {
+                    index: 0,
+                    ty: PgType::Int4
+                },
+                BoundExpr::ColumnRef {
+                    index: 1,
+                    ty: PgType::Int8
+                },
             ]
         );
     }
@@ -1905,14 +1980,23 @@ mod tests {
     fn group_by_ordinal_references_select_expression() {
         // GROUP BY 1 groups by the first select expression (id), not the literal 1.
         let (group_exprs, _a, _p, _h) = agg_of("SELECT id, count(*) FROM t GROUP BY 1");
-        assert_eq!(group_exprs, vec![BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 }]);
+        assert_eq!(
+            group_exprs,
+            vec![BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4
+            }]
+        );
     }
 
     #[test]
     fn grouped_compound_expression_is_allowed() {
         // `id + 1` is legal because its column is a group key.
         let (_g, _a, projections, _h) = agg_of("SELECT id + 1 FROM t GROUP BY id");
-        assert!(matches!(projections[0], BoundExpr::Binary { op: BinOp::Add, .. }));
+        assert!(matches!(
+            projections[0],
+            BoundExpr::Binary { op: BinOp::Add, .. }
+        ));
     }
 
     #[test]
@@ -1924,7 +2008,13 @@ mod tests {
         let BoundExpr::Binary { left, .. } = having.expect("HAVING present") else {
             panic!("expected a comparison in HAVING");
         };
-        assert_eq!(*left, BoundExpr::ColumnRef { index: 1, ty: PgType::Int8 });
+        assert_eq!(
+            *left,
+            BoundExpr::ColumnRef {
+                index: 1,
+                ty: PgType::Int8
+            }
+        );
     }
 
     #[test]
@@ -1938,15 +2028,20 @@ mod tests {
     #[test]
     fn order_by_aggregate_binds_without_error() {
         // ORDER BY count(*) appends a hidden aggregate column; it must bind.
-        let (_g, aggregates, _p, _h) =
-            agg_of("SELECT id FROM t GROUP BY id ORDER BY count(*)");
+        let (_g, aggregates, _p, _h) = agg_of("SELECT id FROM t GROUP BY id ORDER BY count(*)");
         assert_eq!(aggregates.len(), 1);
     }
 
     #[test]
     fn ungrouped_column_is_a_grouping_error() {
-        assert_eq!(bind_err("SELECT id, count(*) FROM t").code, sqlstate::GROUPING_ERROR);
-        assert_eq!(bind_err("SELECT id FROM t GROUP BY big").code, sqlstate::GROUPING_ERROR);
+        assert_eq!(
+            bind_err("SELECT id, count(*) FROM t").code,
+            sqlstate::GROUPING_ERROR
+        );
+        assert_eq!(
+            bind_err("SELECT id FROM t GROUP BY big").code,
+            sqlstate::GROUPING_ERROR
+        );
     }
 
     #[test]
@@ -1959,7 +2054,10 @@ mod tests {
 
     #[test]
     fn nested_aggregate_is_rejected() {
-        assert_eq!(bind_err("SELECT max(min(id)) FROM t").code, sqlstate::GROUPING_ERROR);
+        assert_eq!(
+            bind_err("SELECT max(min(id)) FROM t").code,
+            sqlstate::GROUPING_ERROR
+        );
     }
 
     #[test]
@@ -1972,8 +2070,14 @@ mod tests {
 
     #[test]
     fn unsupported_aggregate_argument_is_undefined_function() {
-        assert_eq!(bind_err("SELECT sum(name) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
-        assert_eq!(bind_err("SELECT avg(name) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
+        assert_eq!(
+            bind_err("SELECT sum(name) FROM t").code,
+            sqlstate::UNDEFINED_FUNCTION
+        );
+        assert_eq!(
+            bind_err("SELECT avg(name) FROM t").code,
+            sqlstate::UNDEFINED_FUNCTION
+        );
     }
 
     #[test]
@@ -1995,15 +2099,27 @@ mod tests {
     #[test]
     fn min_max_reject_boolean() {
         // PG has no min/max(boolean) even though bool is orderable for ORDER BY.
-        assert_eq!(bind_err("SELECT max(flag) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
-        assert_eq!(bind_err("SELECT min(flag) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
+        assert_eq!(
+            bind_err("SELECT max(flag) FROM t").code,
+            sqlstate::UNDEFINED_FUNCTION
+        );
+        assert_eq!(
+            bind_err("SELECT min(flag) FROM t").code,
+            sqlstate::UNDEFINED_FUNCTION
+        );
     }
 
     #[test]
     fn group_by_resolves_output_alias() {
         // `z` is not an input column; it resolves to the select-list alias for id.
         let (group_exprs, _a, _p, _h) = agg_of("SELECT id AS z, count(*) FROM t GROUP BY z");
-        assert_eq!(group_exprs, vec![BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 }]);
+        assert_eq!(
+            group_exprs,
+            vec![BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4
+            }]
+        );
     }
 
     #[test]
@@ -2071,7 +2187,11 @@ mod tests {
         let expr = one_projection("SELECT 'a' || 'b'");
         assert!(matches!(
             expr,
-            BoundExpr::FuncCall { func: crate::ScalarFn::TextConcat, ret: PgType::Text, .. }
+            BoundExpr::FuncCall {
+                func: crate::ScalarFn::TextConcat,
+                ret: PgType::Text,
+                ..
+            }
         ));
     }
 
@@ -2087,29 +2207,47 @@ mod tests {
         assert_eq!(one_projection("SELECT 'a' LIKE 'a%'").ty(), PgType::Bool);
         assert!(matches!(
             one_projection("SELECT 'a' NOT LIKE 'b%'"),
-            BoundExpr::Unary { op: crate::UnaryOp::Not, .. }
+            BoundExpr::Unary {
+                op: crate::UnaryOp::Not,
+                ..
+            }
         ));
     }
 
     #[test]
     fn char_types_carry_their_type_and_length() {
-        assert_eq!(one_projection("SELECT 'abcdef'::varchar(3)").ty(), PgType::Varchar);
+        assert_eq!(
+            one_projection("SELECT 'abcdef'::varchar(3)").ty(),
+            PgType::Varchar
+        );
         // `char(3)` truncates a constant at bind time (explicit-cast semantics).
         assert_eq!(
             one_projection("SELECT 'abcdef'::char(3)"),
-            BoundExpr::Const { value: Value::Text("abc".into()), ty: PgType::Bpchar }
+            BoundExpr::Const {
+                value: Value::Text("abc".into()),
+                ty: PgType::Bpchar
+            }
         );
         // A bare `char` is `char(1)` and blank-pads a short constant.
         assert_eq!(
             one_projection("SELECT 'a'::char(3)"),
-            BoundExpr::Const { value: Value::Text("a  ".into()), ty: PgType::Bpchar }
+            BoundExpr::Const {
+                value: Value::Text("a  ".into()),
+                ty: PgType::Bpchar
+            }
         );
     }
 
     #[test]
     fn substring_and_position_desugar_to_functions() {
-        assert_eq!(one_projection("SELECT substring('abc' FROM 2 FOR 1)").ty(), PgType::Text);
-        assert_eq!(one_projection("SELECT position('b' IN 'abc')").ty(), PgType::Int4);
+        assert_eq!(
+            one_projection("SELECT substring('abc' FROM 2 FOR 1)").ty(),
+            PgType::Text
+        );
+        assert_eq!(
+            one_projection("SELECT position('b' IN 'abc')").ty(),
+            PgType::Int4
+        );
         assert_eq!(one_projection("SELECT length('abc')").ty(), PgType::Int4);
     }
 
@@ -2450,7 +2588,11 @@ mod tests {
         let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5").unwrap() else {
             panic!("expected Values");
         };
-        let BoundExpr::Const { value: Value::Numeric(n), ty: PgType::Numeric } = &rows[0][0] else {
+        let BoundExpr::Const {
+            value: Value::Numeric(n),
+            ty: PgType::Numeric,
+        } = &rows[0][0]
+        else {
             panic!("expected numeric const, got {:?}", rows[0][0]);
         };
         assert_eq!(n.to_display(), "1.5");
@@ -2461,20 +2603,34 @@ mod tests {
         // X'...' is a bit(n) value with n = 4 * hex digits, MSB-first bytes.
         assert_eq!(
             one_projection("SELECT X'00000001'"),
-            BoundExpr::Const { value: Value::Bit { len: 32, data: vec![0, 0, 0, 1] }, ty: PgType::Bit }
+            BoundExpr::Const {
+                value: Value::Bit {
+                    len: 32,
+                    data: vec![0, 0, 0, 1]
+                },
+                ty: PgType::Bit
+            }
         );
         // Lowercase hex parses too.
         assert_eq!(
             one_projection("SELECT X'ff'"),
-            BoundExpr::Const { value: Value::Bit { len: 8, data: vec![0xff] }, ty: PgType::Bit }
+            BoundExpr::Const {
+                value: Value::Bit {
+                    len: 8,
+                    data: vec![0xff]
+                },
+                ty: PgType::Bit
+            }
         );
     }
 
     #[test]
     fn wide_bit_literal_binds() {
         // Arbitrary width is supported (68 bits, past the old u64 backing).
-        let BoundExpr::Const { value: Value::Bit { len, .. }, ty: PgType::Bit } =
-            one_projection("SELECT X'FFFFFFFFFFFFFFFFF'")
+        let BoundExpr::Const {
+            value: Value::Bit { len, .. },
+            ty: PgType::Bit,
+        } = one_projection("SELECT X'FFFFFFFFFFFFFFFFF'")
         else {
             panic!("expected bit const");
         };
@@ -2493,7 +2649,10 @@ mod tests {
         ] {
             let e = bind_err(sql);
             assert_eq!(e.code, "22P02", "{sql}");
-            assert_eq!(e.message, format!("\"{bad}\" is not a valid hexadecimal digit"));
+            assert_eq!(
+                e.message,
+                format!("\"{bad}\" is not a valid hexadecimal digit")
+            );
         }
     }
 
@@ -2501,7 +2660,13 @@ mod tests {
     fn empty_hex_literal_binds_as_zero_width_bit() {
         assert_eq!(
             one_projection("SELECT X''"),
-            BoundExpr::Const { value: Value::Bit { len: 0, data: vec![] }, ty: PgType::Bit }
+            BoundExpr::Const {
+                value: Value::Bit {
+                    len: 0,
+                    data: vec![]
+                },
+                ty: PgType::Bit
+            }
         );
     }
 
@@ -2594,7 +2759,8 @@ mod tests {
         };
         assert_eq!(columns[0].name, "id");
         // A constant/nested cast falls back to the target type name.
-        let LogicalPlan::Values { columns, .. } = bind_one("SELECT 'nan'::numeric::float4").unwrap()
+        let LogicalPlan::Values { columns, .. } =
+            bind_one("SELECT 'nan'::numeric::float4").unwrap()
         else {
             panic!("expected Values");
         };
@@ -2910,11 +3076,17 @@ mod tests {
         assert_eq!(ty, PgType::Int8);
         assert!(matches!(
             &whens[0].1,
-            BoundExpr::Coerce { ty: PgType::Int8, .. }
+            BoundExpr::Coerce {
+                ty: PgType::Int8,
+                ..
+            }
         ));
         assert!(matches!(
             else_.as_deref(),
-            Some(BoundExpr::ColumnRef { ty: PgType::Int8, .. })
+            Some(BoundExpr::ColumnRef {
+                ty: PgType::Int8,
+                ..
+            })
         ));
     }
 
@@ -2971,7 +3143,10 @@ mod tests {
         ] {
             let e = bind_err(sql);
             assert_eq!(e.code, "42883", "{sql}");
-            assert_eq!(e.message, "operator does not exist: text = integer", "{sql}");
+            assert_eq!(
+                e.message, "operator does not exist: text = integer",
+                "{sql}"
+            );
         }
         // Two untyped literals still compare as text (unchanged).
         assert!(bind_one("SELECT CASE 'x' WHEN 'y' THEN 1 ELSE 2 END").is_ok());
@@ -3229,7 +3404,8 @@ mod tests {
 
     #[test]
     fn values_order_by_column_name_resolves() {
-        let LogicalPlan::Values { sort, .. } = bind_one("VALUES (3), (1) ORDER BY column1").unwrap()
+        let LogicalPlan::Values { sort, .. } =
+            bind_one("VALUES (3), (1) ORDER BY column1").unwrap()
         else {
             panic!("expected Values");
         };
