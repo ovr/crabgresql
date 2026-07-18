@@ -1,0 +1,992 @@
+//! String / character type operations.
+//!
+//! Clean-room (see AGENTS.md): every function reproduces PostgreSQL's
+//! *observable* result — the returned value and the SQLSTATE/message of any
+//! error — as observed from a running server (PG 18), never ported from PG's C
+//! source. Indexing is 1-based and character-based (not byte-based), matching
+//! `text`'s behavior in a UTF-8 database.
+
+/// SQLSTATE codes emitted by string functions. Kept local (like `interval.rs`)
+/// so `crabgresql-types` needs no dependency on the wire-protocol crate; the
+/// executor maps these onto `crabgresql_pg_wire::sqlstate::*`.
+mod sqlstate {
+    pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
+    pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
+    pub const SUBSTRING_ERROR: &str = "22011";
+    pub const INVALID_PARAMETER_VALUE: &str = "22023";
+    pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
+    pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+}
+
+/// An error raised by a string function, carrying PG's SQLSTATE and message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextError {
+    pub sqlstate: &'static str,
+    pub message: String,
+}
+
+impl TextError {
+    fn new(sqlstate: &'static str, message: impl Into<String>) -> Self {
+        TextError { sqlstate, message: message.into() }
+    }
+}
+
+type Result<T> = std::result::Result<T, TextError>;
+
+/// PostgreSQL's `MaxAllocSize` (1 GB − 1): the largest a single value may grow
+/// before `repeat`/`lpad`/`rpad` reject it, matching PG's `requested length too
+/// large` error instead of attempting a multi-gigabyte allocation.
+const MAX_ALLOC: i64 = 0x3FFF_FFFF;
+
+fn too_large() -> TextError {
+    TextError::new(sqlstate::PROGRAM_LIMIT_EXCEEDED, "requested length too large")
+}
+
+// --- length ----------------------------------------------------------------
+
+/// `length` / `char_length` / `character_length`: number of characters.
+pub fn char_length(s: &str) -> i32 {
+    s.chars().count() as i32
+}
+
+/// `octet_length`: number of bytes.
+pub fn octet_length(s: &str) -> i32 {
+    s.len() as i32
+}
+
+/// `bit_length`: number of bits (`octet_length * 8`).
+pub fn bit_length(s: &str) -> i32 {
+    (s.len() as i32).wrapping_mul(8)
+}
+
+// --- case ------------------------------------------------------------------
+
+/// `upper`: full Unicode uppercase mapping.
+pub fn upper(s: &str) -> String {
+    s.to_uppercase()
+}
+
+/// `lower`: full Unicode lowercase mapping.
+pub fn lower(s: &str) -> String {
+    s.to_lowercase()
+}
+
+/// `initcap`: uppercase the first letter of each word, lowercase the rest. A
+/// word is a run of alphanumeric characters separated by non-alphanumerics.
+pub fn initcap(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_alnum = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            if prev_alnum {
+                out.extend(c.to_lowercase());
+            } else {
+                out.extend(c.to_uppercase());
+            }
+            prev_alnum = true;
+        } else {
+            out.push(c);
+            prev_alnum = false;
+        }
+    }
+    out
+}
+
+// --- substring / position --------------------------------------------------
+
+/// `substr` / `substring`. `start` is 1-based; `len`, when present, must be
+/// non-negative (else SQLSTATE 22011). Positions are clamped to the string.
+pub fn substr(s: &str, start: i32, len: Option<i32>) -> Result<String> {
+    if let Some(l) = len
+        && l < 0
+    {
+        return Err(TextError::new(
+            sqlstate::SUBSTRING_ERROR,
+            "negative substring length not allowed",
+        ));
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let total = chars.len() as i64;
+    let start = start as i64;
+    // Exclusive 1-based upper bound: keep positions p with start <= p < end.
+    let end = match len {
+        Some(l) => start.saturating_add(l as i64),
+        None => total + 1,
+    };
+    let lo = start.max(1);
+    let hi = (end - 1).min(total); // inclusive
+    if lo > hi {
+        return Ok(String::new());
+    }
+    Ok(chars[(lo - 1) as usize..=(hi - 1) as usize].iter().collect())
+}
+
+/// `strpos(string, substring)` / `position(substring IN string)`: the 1-based
+/// character index of the first occurrence, 0 if absent. An empty needle → 1.
+pub fn strpos(haystack: &str, needle: &str) -> i32 {
+    if needle.is_empty() {
+        return 1;
+    }
+    match haystack.find(needle) {
+        Some(byte_idx) => haystack[..byte_idx].chars().count() as i32 + 1,
+        None => 0,
+    }
+}
+
+/// `overlay(string placing replacement from start [for count])`. `count`
+/// defaults to the replacement's character length. Equivalent to
+/// `substr(s,1,start-1) || replacement || substr(s, start+count)`.
+pub fn overlay(s: &str, replacement: &str, start: i32, count: Option<i32>) -> Result<String> {
+    let count = count.unwrap_or_else(|| char_length(replacement));
+    // `substr(s, 1, start-1)` with `start < 1` raises PG's negative-length error,
+    // so `start <= 0` is rejected exactly as PG's `text_overlay` does. A negative
+    // `start` maps to a negative length without risking i32 overflow.
+    let left_len = if start < 1 { -1 } else { start - 1 };
+    let left = substr(s, 1, Some(left_len))?;
+    let right = substr(s, start.saturating_add(count).max(1), None)?;
+    Ok(format!("{left}{replacement}{right}"))
+}
+
+// --- trim / pad ------------------------------------------------------------
+
+/// The side(s) to trim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimSide {
+    Leading,
+    Trailing,
+    Both,
+}
+
+/// `ltrim` / `rtrim` / `btrim`: remove leading/trailing characters that appear
+/// in `chars` (default a single space).
+pub fn trim(s: &str, chars: &str, side: TrimSide) -> String {
+    let in_set = |c: char| chars.contains(c);
+    match side {
+        TrimSide::Leading => s.trim_start_matches(in_set).to_string(),
+        TrimSide::Trailing => s.trim_end_matches(in_set).to_string(),
+        TrimSide::Both => s.trim_start_matches(in_set).trim_end_matches(in_set).to_string(),
+    }
+}
+
+/// `lpad` / `rpad`. When `len <= 0` the result is empty; when the string is
+/// longer than `len` it is truncated to the first `len` characters; otherwise
+/// it is padded with `fill` (an empty `fill` cannot pad, so the string is
+/// returned unchanged).
+pub fn pad(s: &str, len: i32, fill: &str, left: bool) -> Result<String> {
+    if len <= 0 {
+        return Ok(String::new());
+    }
+    let len = len as usize;
+    let s_chars: Vec<char> = s.chars().collect();
+    if s_chars.len() >= len {
+        return Ok(s_chars[..len].iter().collect());
+    }
+    let need = len - s_chars.len();
+    let fill_chars: Vec<char> = fill.chars().collect();
+    if fill_chars.is_empty() {
+        return Ok(s.to_string());
+    }
+    // Reject before allocating: compute the padding's byte length from the fill
+    // cycle rather than materializing a multi-gigabyte string (PG's MaxAllocSize).
+    let per_cycle_chars = fill_chars.len() as i64;
+    let full_cycles = need as i64 / per_cycle_chars;
+    let rem = (need as i64 % per_cycle_chars) as usize;
+    let rem_bytes: i64 = fill_chars[..rem].iter().map(|c| c.len_utf8() as i64).sum();
+    let padding_bytes = full_cycles * fill.len() as i64 + rem_bytes;
+    if s.len() as i64 + padding_bytes > MAX_ALLOC {
+        return Err(too_large());
+    }
+    let padding: String = fill_chars.iter().cycle().take(need).collect();
+    Ok(if left {
+        format!("{padding}{s}")
+    } else {
+        format!("{s}{padding}")
+    })
+}
+
+// --- replace / translate / repeat / reverse --------------------------------
+
+/// `replace(string, from, to)`: replace every non-overlapping occurrence. An
+/// empty `from` leaves the string unchanged (unlike a naive replace).
+pub fn replace(s: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return s.to_string();
+    }
+    s.replace(from, to)
+}
+
+/// `translate(string, from, to)`: replace each character present in `from` with
+/// the character at the same index in `to`; characters past the end of `to` are
+/// deleted.
+pub fn translate(s: &str, from: &str, to: &str) -> String {
+    let from_chars: Vec<char> = from.chars().collect();
+    let to_chars: Vec<char> = to.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match from_chars.iter().position(|&x| x == c) {
+            Some(i) if i < to_chars.len() => out.push(to_chars[i]),
+            Some(_) => {} // no replacement char: delete
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// `repeat(string, n)`: `n` copies, empty when `n <= 0`. Rejects a result larger
+/// than PG's `MaxAllocSize` instead of attempting the allocation.
+pub fn repeat(s: &str, n: i32) -> Result<String> {
+    if n <= 0 {
+        return Ok(String::new());
+    }
+    if s.len() as i64 * n as i64 > MAX_ALLOC {
+        return Err(too_large());
+    }
+    Ok(s.repeat(n as usize))
+}
+
+/// `reverse`: reverse the characters.
+pub fn reverse(s: &str) -> String {
+    s.chars().rev().collect()
+}
+
+/// `left(string, n)`: the first `n` characters; a negative `n` returns all but
+/// the last `|n|`.
+pub fn left(s: &str, n: i32) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let total = chars.len() as i64;
+    let take = if n >= 0 { (n as i64).min(total) } else { (total + n as i64).max(0) };
+    chars[..take as usize].iter().collect()
+}
+
+/// `right(string, n)`: the last `n` characters; a negative `n` returns all but
+/// the first `|n|`.
+pub fn right(s: &str, n: i32) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let total = chars.len() as i64;
+    let skip = if n >= 0 { (total - n as i64).max(0) } else { (-(n as i64)).min(total) };
+    chars[skip as usize..].iter().collect()
+}
+
+// --- character codes -------------------------------------------------------
+
+/// `ascii`: the code point of the first character, 0 for an empty string.
+pub fn ascii(s: &str) -> i32 {
+    s.chars().next().map(|c| c as i32).unwrap_or(0)
+}
+
+/// `chr(n)`: the one-character string for code point `n` (UTF-8). `n == 0` and
+/// out-of-range values raise PG's errors.
+pub fn chr(n: i32) -> Result<String> {
+    if n == 0 {
+        return Err(TextError::new(sqlstate::PROGRAM_LIMIT_EXCEEDED, "null character not permitted"));
+    }
+    if n < 0 {
+        return Err(TextError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "character number must be positive",
+        ));
+    }
+    // Above the Unicode maximum is "too large"; a code point inside the range
+    // that is still not a scalar value (a UTF-16 surrogate) is "not valid" — the
+    // two distinct PG messages.
+    if n as u32 > 0x10FFFF {
+        return Err(TextError::new(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            format!("requested character too large for encoding: {n}"),
+        ));
+    }
+    match char::from_u32(n as u32) {
+        Some(c) => Ok(c.to_string()),
+        None => Err(TextError::new(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            format!("requested character not valid for encoding: {n}"),
+        )),
+    }
+}
+
+/// `split_part(string, delimiter, n)`: the `n`-th field (1-based; negative
+/// counts from the end). `n == 0` is an error; out-of-range yields the empty
+/// string. An empty delimiter treats the whole string as one field.
+pub fn split_part(s: &str, delim: &str, n: i32) -> Result<String> {
+    if n == 0 {
+        return Err(TextError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "field position must not be zero",
+        ));
+    }
+    let parts: Vec<&str> = if delim.is_empty() { vec![s] } else { s.split(delim).collect() };
+    let idx: Option<usize> = if n > 0 {
+        Some((n - 1) as usize)
+    } else {
+        let from_end = (-n) as usize;
+        parts.len().checked_sub(from_end)
+    };
+    Ok(idx.and_then(|i| parts.get(i)).map(|x| x.to_string()).unwrap_or_default())
+}
+
+/// `starts_with(string, prefix)`.
+pub fn starts_with(s: &str, prefix: &str) -> bool {
+    s.starts_with(prefix)
+}
+
+/// `to_hex(int4)`: hexadecimal (unsigned two's-complement) representation.
+pub fn to_hex_i32(n: i32) -> String {
+    format!("{:x}", n as u32)
+}
+
+/// `to_hex(int8)`.
+pub fn to_hex_i64(n: i64) -> String {
+    format!("{:x}", n as u64)
+}
+
+// --- LIKE / ILIKE ----------------------------------------------------------
+
+enum LikeTok {
+    Any,       // %
+    One,       // _
+    Lit(char), // an ordinary (or escaped) literal character
+}
+
+/// Parse a LIKE pattern into tokens, honoring `escape` (which makes the next
+/// character a literal). A pattern ending in a bare escape character is an
+/// error, as in PG.
+fn parse_like(pattern: &str, escape: Option<char>) -> Result<Vec<LikeTok>> {
+    let mut toks = Vec::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next) => toks.push(LikeTok::Lit(next)),
+                None => {
+                    return Err(TextError::new(
+                        sqlstate::INVALID_ESCAPE_SEQUENCE,
+                        "LIKE pattern must not end with escape character",
+                    ));
+                }
+            }
+        } else if c == '%' {
+            toks.push(LikeTok::Any);
+        } else if c == '_' {
+            toks.push(LikeTok::One);
+        } else {
+            toks.push(LikeTok::Lit(c));
+        }
+    }
+    Ok(toks)
+}
+
+fn match_tokens(text: &[char], toks: &[LikeTok]) -> bool {
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < text.len() {
+        let matched = match toks.get(pi) {
+            Some(LikeTok::One) => true,
+            Some(LikeTok::Lit(c)) => *c == text[ti],
+            _ => false,
+        };
+        if matched {
+            pi += 1;
+            ti += 1;
+        } else if matches!(toks.get(pi), Some(LikeTok::Any)) {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while matches!(toks.get(pi), Some(LikeTok::Any)) {
+        pi += 1;
+    }
+    pi == toks.len()
+}
+
+/// `LIKE` (and `ILIKE` when `case_insensitive`). `escape` defaults to `\` at
+/// the call site; pass `None` here to disable escaping (`ESCAPE ''`).
+pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> Result<bool> {
+    if case_insensitive {
+        let s = s.to_lowercase();
+        let pattern = pattern.to_lowercase();
+        let escape = escape.and_then(|e| e.to_lowercase().next());
+        let toks = parse_like(&pattern, escape)?;
+        let text: Vec<char> = s.chars().collect();
+        Ok(match_tokens(&text, &toks))
+    } else {
+        let toks = parse_like(pattern, escape)?;
+        let text: Vec<char> = s.chars().collect();
+        Ok(match_tokens(&text, &toks))
+    }
+}
+
+// --- encode / decode -------------------------------------------------------
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// `encode(bytea, format)`: `hex`, `base64` (wrapped at 76 columns like PG), or
+/// `escape`.
+pub fn encode(bytes: &[u8], format: &str) -> Result<String> {
+    match format {
+        "hex" => Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
+        "base64" => Ok(encode_base64(bytes)),
+        "escape" => Ok(encode_escape(bytes)),
+        other => Err(TextError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("unrecognized encoding: \"{other}\""),
+        )),
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut col = 0;
+    let push = |out: &mut String, col: &mut usize, ch: char| {
+        // PG wraps base64 output every 76 characters with a newline.
+        if *col == 76 {
+            out.push('\n');
+            *col = 0;
+        }
+        out.push(ch);
+        *col += 1;
+    };
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        push(&mut out, &mut col, BASE64[(n >> 18) as usize & 63] as char);
+        push(&mut out, &mut col, BASE64[(n >> 12) as usize & 63] as char);
+        push(
+            &mut out,
+            &mut col,
+            if chunk.len() > 1 { BASE64[(n >> 6) as usize & 63] as char } else { '=' },
+        );
+        push(
+            &mut out,
+            &mut col,
+            if chunk.len() > 2 { BASE64[n as usize & 63] as char } else { '=' },
+        );
+    }
+    out
+}
+
+fn encode_escape(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in bytes {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\{b:03o}")),
+        }
+    }
+    out
+}
+
+/// `decode(text, format)`: inverse of [`encode`].
+pub fn decode(s: &str, format: &str) -> Result<Vec<u8>> {
+    match format {
+        "hex" => decode_hex(s),
+        "base64" => decode_base64(s),
+        "escape" => Ok(decode_escape(s)),
+        other => Err(TextError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("unrecognized encoding: \"{other}\""),
+        )),
+    }
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut hi: Option<u8> = None;
+    for c in s.bytes() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = hex_val(c).ok_or_else(|| {
+            TextError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("invalid hexadecimal digit: \"{}\"", c as char),
+            )
+        })?;
+        match hi.take() {
+            None => hi = Some(v),
+            Some(h) => out.push((h << 4) | v),
+        }
+    }
+    if hi.is_some() {
+        return Err(TextError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid hexadecimal data: odd number of digits",
+        ));
+    }
+    Ok(out)
+}
+
+fn base64_val(c: u8) -> Option<u8> {
+    BASE64.iter().position(|&x| x == c).map(|p| p as u8)
+}
+
+fn decode_base64(s: &str) -> Result<Vec<u8>> {
+    let end_seq =
+        || TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "invalid base64 end sequence");
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    let mut ndata = 0usize; // significant (non-pad) symbols seen
+    let mut npad = 0usize; // trailing '=' padding symbols
+    for c in s.bytes() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        if c == b'=' {
+            npad += 1;
+            continue;
+        }
+        // A data symbol after padding is a malformed sequence.
+        if npad > 0 {
+            return Err(end_seq());
+        }
+        let v = base64_val(c).ok_or_else(|| {
+            TextError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("invalid symbol \"{}\" found while decoding base64 sequence", c as char),
+            )
+        })?;
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        ndata += 1;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    // The full symbol count must be a multiple of 4, a group can't end on a lone
+    // data symbol, and at most two '=' pad it — otherwise PG rejects the input.
+    if (ndata + npad) % 4 != 0 || ndata % 4 == 1 || npad > 2 {
+        return Err(end_seq());
+    }
+    Ok(out)
+}
+
+fn decode_escape(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'\\' {
+                out.push(b'\\');
+                i += 2;
+                continue;
+            }
+            // \ooo octal escape
+            if i + 3 < bytes.len() + 1
+                && (b'0'..=b'7').contains(&bytes[i + 1])
+                && i + 3 < bytes.len() + 1
+            {
+                let oct = &bytes[i + 1..(i + 4).min(bytes.len())];
+                if oct.len() == 3 && oct.iter().all(|b| (b'0'..=b'7').contains(b)) {
+                    let val = (oct[0] - b'0') * 64 + (oct[1] - b'0') * 8 + (oct[2] - b'0');
+                    out.push(val);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+// --- quoting / format ------------------------------------------------------
+
+/// `quote_ident`: double-quote the identifier if it is not a bare lowercase
+/// identifier.
+pub fn quote_ident(s: &str) -> String {
+    let bare = !s.is_empty()
+        && s.chars().enumerate().all(|(i, c)| {
+            c == '_'
+                || c.is_ascii_lowercase()
+                || (i > 0 && c.is_ascii_digit())
+        });
+    if bare {
+        s.to_string()
+    } else {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+}
+
+/// `quote_literal`: single-quote the string, doubling embedded quotes; use an
+/// `E'...'` string and double backslashes when the input contains a backslash.
+pub fn quote_literal(s: &str) -> String {
+    let quotes = s.replace('\'', "''");
+    if s.contains('\\') {
+        format!("E'{}'", quotes.replace('\\', "\\\\"))
+    } else {
+        format!("'{quotes}'")
+    }
+}
+
+/// `quote_nullable`: `quote_literal`, or the literal `NULL` for a NULL input.
+pub fn quote_nullable(s: Option<&str>) -> String {
+    match s {
+        Some(s) => quote_literal(s),
+        None => "NULL".to_string(),
+    }
+}
+
+/// A `format()` argument: its text representation (`None` for SQL NULL).
+pub type FormatArg = Option<String>;
+
+/// `format(fmtstr, args...)`: supports `%s`, `%I`, `%L`, `%%`, positional
+/// `%n$` arguments, and a field width (`%10s`, `%-10s`, `%*s`, `%*n$s`).
+pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
+    let unterminated = || {
+        TextError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "unterminated format() type specifier",
+        )
+    };
+    // The argument at 1-based position `n` (0 is rejected as PG does).
+    let arg_at = |n: usize| -> Result<&FormatArg> {
+        if n == 0 {
+            return Err(TextError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "format specifies argument 0, but arguments are numbered from 1",
+            ));
+        }
+        args.get(n - 1).ok_or_else(|| {
+            TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "too few arguments for format()")
+        })
+    };
+    let mut out = String::new();
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    let mut auto = 1usize; // next auto-assigned 1-based argument
+    // Scan a run of digits followed by `$`; consume and return it as a 1-based
+    // position, or leave `i` unmoved when the run isn't an argument selector.
+    let scan_arg_pos = |chars: &[char], i: &mut usize| -> Option<usize> {
+        let start = *i;
+        while *i < chars.len() && chars[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i > start && *i < chars.len() && chars[*i] == '$' {
+            let n: usize = chars[start..*i].iter().collect::<String>().parse().unwrap_or(0);
+            *i += 1;
+            Some(n)
+        } else {
+            *i = start;
+            None
+        }
+    };
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= chars.len() {
+            return Err(unterminated());
+        }
+        if chars[i] == '%' {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        // [argpos '$']
+        let explicit = scan_arg_pos(&chars, &mut i);
+        // [flags] — only '-' (left-justify)
+        let mut left_justify = false;
+        while i < chars.len() && chars[i] == '-' {
+            left_justify = true;
+            i += 1;
+        }
+        // [width] — a literal digit run, or `*` / `*n$` reading an int argument
+        let mut width: Option<i64> = None;
+        if i < chars.len() && chars[i] == '*' {
+            i += 1;
+            let pos = scan_arg_pos(&chars, &mut i).unwrap_or_else(|| {
+                let a = auto;
+                auto += 1;
+                a
+            });
+            // A null width is treated as no width, matching PG.
+            let w: i64 = arg_at(pos)?.as_deref().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            width = Some(w);
+        } else if i < chars.len() && chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            width = chars[start..i].iter().collect::<String>().parse().ok();
+        }
+        // A negative width means left-justify to its absolute value.
+        if let Some(w) = width
+            && w < 0
+        {
+            left_justify = true;
+            width = Some(-w);
+        }
+        if i >= chars.len() {
+            return Err(unterminated());
+        }
+        let conv = chars[i];
+        i += 1;
+        let pos = explicit.unwrap_or_else(|| {
+            let a = auto;
+            auto += 1;
+            a
+        });
+        let arg = arg_at(pos)?;
+        let piece = match conv {
+            's' => arg.as_deref().unwrap_or("").to_string(),
+            'I' => match arg {
+                Some(v) => quote_ident(v),
+                None => {
+                    return Err(TextError::new(
+                        sqlstate::NULL_VALUE_NOT_ALLOWED,
+                        "null values cannot be formatted as an SQL identifier",
+                    ));
+                }
+            },
+            'L' => quote_nullable(arg.as_deref()),
+            other => {
+                return Err(TextError::new(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    format!("unrecognized format() type specifier \"{other}\""),
+                ));
+            }
+        };
+        // Pad the formatted piece to the requested field width with spaces.
+        let pad = width.map(|w| w as usize).unwrap_or(0).saturating_sub(char_length(&piece) as usize);
+        if pad > 0 && !left_justify {
+            out.extend(std::iter::repeat(' ').take(pad));
+        }
+        out.push_str(&piece);
+        if pad > 0 && left_justify {
+            out.extend(std::iter::repeat(' ').take(pad));
+        }
+    }
+    Ok(out)
+}
+
+// --- character-type length coercion (varchar / char / name) ----------------
+
+/// Truncate a value to `n` characters for an *explicit* cast to
+/// `varchar(n)`/`char(n)` — no length error, just truncation.
+pub fn truncate_chars(s: &str, n: i32) -> String {
+    if n <= 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n as usize {
+        s.to_string()
+    } else {
+        chars[..n as usize].iter().collect()
+    }
+}
+
+/// `varchar(n)` length coercion. In *explicit* cast context an over-long value
+/// is silently truncated; in *assignment/implicit* context it errors unless the
+/// excess characters are all spaces (then it is truncated).
+pub fn varchar_input(s: &str, n: i32, explicit: bool) -> Result<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n.max(0) as usize {
+        return Ok(s.to_string());
+    }
+    if explicit {
+        return Ok(chars[..n.max(0) as usize].iter().collect());
+    }
+    if chars[n.max(0) as usize..].iter().all(|&c| c == ' ') {
+        Ok(chars[..n.max(0) as usize].iter().collect())
+    } else {
+        Err(TextError::new(
+            sqlstate::STRING_DATA_RIGHT_TRUNCATION,
+            format!("value too long for type character varying({n})"),
+        ))
+    }
+}
+
+/// `char(n)` / `bpchar(n)` length coercion: blank-pad to `n`; over-long values
+/// truncate on explicit cast, and on assignment error unless the excess is all
+/// spaces.
+pub fn bpchar_input(s: &str, n: i32, explicit: bool) -> Result<String> {
+    let n = n.max(0) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() > n {
+        if !explicit && !chars[n..].iter().all(|&c| c == ' ') {
+            return Err(TextError::new(
+                sqlstate::STRING_DATA_RIGHT_TRUNCATION,
+                format!("value too long for type character({n})"),
+            ));
+        }
+        return Ok(chars[..n].iter().collect());
+    }
+    let mut out: String = s.to_string();
+    out.extend(std::iter::repeat(' ').take(n - chars.len()));
+    Ok(out)
+}
+
+/// The trailing-blank-insensitive text of a `bpchar` value (its cast to
+/// `text`, as used by `||` and `::text`).
+pub fn bpchar_rtrim(s: &str) -> String {
+    s.trim_end_matches(' ').to_string()
+}
+
+/// `name` input: truncate to 63 characters (`NAMEDATALEN - 1`).
+pub fn name_input(s: &str) -> String {
+    truncate_chars(s, 63)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lengths() {
+        assert_eq!(char_length("café"), 4);
+        assert_eq!(octet_length("é"), 2);
+        assert_eq!(bit_length("abc"), 24);
+    }
+
+    #[test]
+    fn case_and_initcap() {
+        assert_eq!(initcap("hi THERE o'brien"), "Hi There O'Brien");
+        assert_eq!(initcap("123abc def"), "123abc Def");
+    }
+
+    #[test]
+    fn substr_semantics() {
+        assert_eq!(substr("abcdef", 2, Some(3)).unwrap(), "bcd");
+        assert_eq!(substr("café", 2, None).unwrap(), "afé");
+        assert_eq!(substr("abcdef", 0, Some(2)).unwrap(), "a");
+        assert_eq!(substr("abc", 2, Some(-1)).unwrap_err().sqlstate, "22011");
+    }
+
+    #[test]
+    fn strpos_and_overlay() {
+        assert_eq!(strpos("abcabc", "bc"), 2);
+        assert_eq!(strpos("abc", ""), 1);
+        assert_eq!(strpos("abc", "z"), 0);
+        assert_eq!(overlay("Txxxxas", "hom", 2, Some(4)).unwrap(), "Thomas");
+        // A start of 0 (or below) is a negative-substring error, as in PG.
+        assert_eq!(overlay("abc", "X", 0, None).unwrap_err().sqlstate, "22011");
+    }
+
+    #[test]
+    fn pad_and_trim() {
+        assert_eq!(pad("abcdef", 3, " ", true).unwrap(), "abc");
+        assert_eq!(pad("ab", 5, "xy", false).unwrap(), "abxyx");
+        assert_eq!(pad("ab", 5, "", true).unwrap(), "ab");
+        assert_eq!(pad("abc", -1, " ", true).unwrap(), "");
+        // A length past MaxAllocSize is rejected instead of allocating.
+        assert_eq!(pad("a", 2_000_000_000, "x", true).unwrap_err().sqlstate, "54000");
+        assert_eq!(trim("xxabcxx", "x", TrimSide::Both), "abc");
+    }
+
+    #[test]
+    fn translate_replace_repeat() {
+        assert_eq!(translate("12345", "143", "ax"), "a2x5");
+        assert_eq!(replace("abcabc", "", "X"), "abcabc");
+        assert_eq!(repeat("x", -2).unwrap(), "");
+        assert_eq!(repeat("x", 3).unwrap(), "xxx");
+        assert_eq!(repeat("ab", 2_000_000_000).unwrap_err().sqlstate, "54000");
+        assert_eq!(reverse("café"), "éfac");
+    }
+
+    #[test]
+    fn left_right_split() {
+        assert_eq!(left("abc", -1), "ab");
+        assert_eq!(right("abc", -1), "bc");
+        assert_eq!(split_part("a,b,c", ",", -1).unwrap(), "c");
+        assert_eq!(split_part("abc", "", 1).unwrap(), "abc");
+        assert_eq!(split_part("a", ",", 0).unwrap_err().sqlstate, "22023");
+    }
+
+    #[test]
+    fn chr_and_ascii() {
+        assert_eq!(ascii(""), 0);
+        assert_eq!(chr(0).unwrap_err().sqlstate, "54000");
+        assert_eq!(chr(-1).unwrap_err().sqlstate, "22023");
+        assert_eq!(chr(1114112).unwrap_err().sqlstate, "54000");
+        // A surrogate code point is "not valid", distinct from "too large".
+        assert_eq!(chr(55296).unwrap_err().message, "requested character not valid for encoding: 55296");
+        assert_eq!(to_hex_i32(-1), "ffffffff");
+    }
+
+    #[test]
+    fn like_matching() {
+        assert!(like("abc", "a%", None, false).unwrap());
+        assert!(like("abc", "a_c", None, false).unwrap());
+        assert!(!like("abc", "a_", None, false).unwrap());
+        assert!(like("ABC", "abc", None, true).unwrap());
+        assert!(like("a%b", "a\\%b", Some('\\'), false).unwrap());
+        assert!(!like("axb", "a\\%b", Some('\\'), false).unwrap());
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        assert_eq!(encode(&[0x00, 0x10, 0x00], "hex").unwrap(), "001000");
+        assert_eq!(encode(b"abc", "base64").unwrap(), "YWJj");
+        assert_eq!(encode(b"a\x00b", "escape").unwrap(), "a\\000b");
+        assert_eq!(decode("YWJj", "base64").unwrap(), b"abc");
+        assert_eq!(decode("001000", "hex").unwrap(), vec![0x00, 0x10, 0x00]);
+        // Malformed base64 (missing padding / lone trailing symbol) is rejected.
+        assert_eq!(decode("abc", "base64").unwrap_err().message, "invalid base64 end sequence");
+        assert_eq!(
+            decode("a@b", "base64").unwrap_err().message,
+            "invalid symbol \"@\" found while decoding base64 sequence"
+        );
+        assert_eq!(
+            decode("xy", "hex").unwrap_err().message,
+            "invalid hexadecimal digit: \"x\""
+        );
+    }
+
+    #[test]
+    fn quoting_and_format() {
+        assert_eq!(quote_ident("foo bar"), "\"foo bar\"");
+        assert_eq!(quote_ident("foo"), "foo");
+        assert_eq!(quote_literal("a\\b'c"), "E'a\\\\b''c'");
+        assert_eq!(quote_nullable(None), "NULL");
+        assert_eq!(
+            format("%s-%I-%L", &[Some("a".into()), Some("b c".into()), Some("d'e".into())]).unwrap(),
+            "a-\"b c\"-'d''e'"
+        );
+        assert_eq!(format("%1$s %1$s", &[Some("x".into())]).unwrap(), "x x");
+        // Field width: right- and left-justified, and `*` reading a width arg.
+        assert_eq!(format("%5s|", &[Some("x".into())]).unwrap(), "    x|");
+        assert_eq!(format("%-5s|", &[Some("x".into())]).unwrap(), "x    |");
+        assert_eq!(format("%*s", &[Some("3".into()), Some("x".into())]).unwrap(), "  x");
+        assert_eq!(format("%%", &[]).unwrap(), "%");
+        assert_eq!(format("%", &[]).unwrap_err().message, "unterminated format() type specifier");
+        assert_eq!(
+            format("%0$s", &[Some("x".into())]).unwrap_err().message,
+            "format specifies argument 0, but arguments are numbered from 1"
+        );
+    }
+
+    #[test]
+    fn char_length_coercion() {
+        assert_eq!(bpchar_input("ab", 5, false).unwrap(), "ab   ");
+        assert_eq!(varchar_input("abcdef", 3, true).unwrap(), "abc");
+        assert_eq!(varchar_input("ab   ", 2, false).unwrap(), "ab");
+        assert_eq!(varchar_input("abcdef", 3, false).unwrap_err().sqlstate, "22001");
+        assert_eq!(bpchar_rtrim("ab   "), "ab");
+    }
+}

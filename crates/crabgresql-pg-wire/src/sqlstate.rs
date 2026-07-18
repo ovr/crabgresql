@@ -8,6 +8,7 @@ pub const INVALID_TIME_ZONE_DISPLACEMENT_VALUE: &str = "22009";
 pub const DIVISION_BY_ZERO: &str = "22012";
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 pub const INVALID_PARAMETER_VALUE: &str = "22023";
+pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
 pub const INVALID_ARGUMENT_FOR_LOG: &str = "2201E";
 pub const INVALID_ARGUMENT_FOR_POWER_FUNCTION: &str = "2201F";
 pub const SYNTAX_ERROR: &str = "42601";

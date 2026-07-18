@@ -379,8 +379,127 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
             else_result.as_deref(),
             scope,
         ),
+        // String special-syntax expressions desugar to the equivalent function.
+        ast::Expr::Substring { expr, substring_from, substring_for, .. } => {
+            bind_substring(expr, substring_from.as_deref(), substring_for.as_deref(), scope)
+        }
+        ast::Expr::Trim { expr, trim_where, trim_what, trim_characters } => {
+            bind_trim(expr, *trim_where, trim_what.as_deref(), trim_characters.as_deref(), scope)
+        }
+        ast::Expr::Position { expr, r#in } => {
+            // POSITION(sub IN str) == strpos(str, sub).
+            let sub = bind_expr(expr, scope)?;
+            let str_ = bind_expr(r#in, scope)?;
+            crate::functions::resolve_call("strpos", vec![str_, sub])
+        }
+        ast::Expr::Overlay { expr, overlay_what, overlay_from, overlay_for } => {
+            bind_overlay(expr, overlay_what, overlay_from, overlay_for.as_deref(), scope)
+        }
+        ast::Expr::Like { negated, any, expr, pattern, escape_char } => {
+            bind_like_node(expr, pattern, escape_char.as_ref(), *any, false, *negated, scope)
+        }
+        ast::Expr::ILike { negated, any, expr, pattern, escape_char } => {
+            bind_like_node(expr, pattern, escape_char.as_ref(), *any, true, *negated, scope)
+        }
         other => Err(unsupported_expr(other)),
     }
+}
+
+/// `SUBSTRING(x [FROM a] [FOR b])` → `substr(x, a[, b])`. With no `FROM`, PG
+/// defaults the start to 1.
+fn bind_substring(
+    expr: &ast::Expr,
+    from: Option<&ast::Expr>,
+    for_: Option<&ast::Expr>,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let subject = bind_expr(expr, scope)?;
+    let start = match from {
+        Some(e) => bind_expr(e, scope)?,
+        None => Binding::Typed(BoundExpr::Const { value: Value::Int4(1), ty: PgType::Int4 }),
+    };
+    let mut args = vec![subject, start];
+    if let Some(e) = for_ {
+        args.push(bind_expr(e, scope)?);
+    }
+    crate::functions::resolve_call("substr", args)
+}
+
+/// `TRIM([LEADING|TRAILING|BOTH] [chars FROM] x)` → `ltrim`/`rtrim`/`btrim`.
+fn bind_trim(
+    expr: &ast::Expr,
+    side: Option<ast::TrimWhereField>,
+    trim_what: Option<&ast::Expr>,
+    trim_characters: Option<&[ast::Expr]>,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let func = match side {
+        Some(ast::TrimWhereField::Leading) => "ltrim",
+        Some(ast::TrimWhereField::Trailing) => "rtrim",
+        Some(ast::TrimWhereField::Both) | None => "btrim",
+    };
+    let subject = bind_expr(expr, scope)?;
+    let mut args = vec![subject];
+    // `TRIM(chars FROM x)` and the `TRIM(x, chars)` comma form both give a
+    // characters argument.
+    if let Some(chars) = trim_what {
+        args.push(bind_expr(chars, scope)?);
+    } else if let Some([chars]) = trim_characters {
+        args.push(bind_expr(chars, scope)?);
+    } else if trim_characters.is_some_and(|c| !c.is_empty()) {
+        return Err(BindError::feature_not_supported(
+            "TRIM with multiple characters is not supported yet",
+        ));
+    }
+    crate::functions::resolve_call(func, args)
+}
+
+/// `OVERLAY(x PLACING r FROM a [FOR b])` → `overlay(x, r, a[, b])`.
+fn bind_overlay(
+    expr: &ast::Expr,
+    what: &ast::Expr,
+    from: &ast::Expr,
+    for_: Option<&ast::Expr>,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let mut args =
+        vec![bind_expr(expr, scope)?, bind_expr(what, scope)?, bind_expr(from, scope)?];
+    if let Some(e) = for_ {
+        args.push(bind_expr(e, scope)?);
+    }
+    crate::functions::resolve_call("overlay", args)
+}
+
+/// Bind a `LIKE`/`ILIKE` expression node (as opposed to the operator form).
+fn bind_like_node(
+    expr: &ast::Expr,
+    pattern: &ast::Expr,
+    escape_char: Option<&ast::ValueWithSpan>,
+    any: bool,
+    case_insensitive: bool,
+    negated: bool,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    if any {
+        return Err(BindError::feature_not_supported("LIKE ANY is not supported yet"));
+    }
+    let lb = bind_expr(expr, scope)?;
+    let rb = bind_expr(pattern, scope)?;
+    let escape = match escape_char {
+        Some(v) => match &v.value {
+            ast::Value::SingleQuotedString(s) => {
+                Some(Binding::Typed(BoundExpr::Const {
+                    value: Value::Text(s.clone()),
+                    ty: PgType::Text,
+                }))
+            }
+            other => {
+                return Err(BindError::syntax(format!("invalid ESCAPE literal: {other}")));
+            }
+        },
+        None => None,
+    };
+    bind_like(lb, rb, escape, case_insensitive, negated)
 }
 
 /// Bind at a spot with no surrounding type context (a SELECT-list item):
@@ -502,11 +621,24 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         // `interval` (any field qualifier / precision is accepted and ignored;
         // full resolution is kept, as with `timestamp(2)`).
         DataType::Interval { .. } => PgType::Interval,
-        DataType::Text | DataType::Varchar(None) | DataType::CharacterVarying(None) => PgType::Text,
-        DataType::Varchar(Some(_)) | DataType::CharacterVarying(Some(_)) => {
-            return Err(BindError::feature_not_supported(
-                "varchar length limits are not supported yet",
-            ));
+        DataType::Text => PgType::Text,
+        // `varchar`/`character varying` (with or without a length limit).
+        DataType::Varchar(_) | DataType::CharacterVarying(_) => PgType::Varchar,
+        // `char`/`character` (blank-padded; a bare `char` is `char(1)`).
+        DataType::Char(_) | DataType::Character(_) => PgType::Bpchar,
+        // `bpchar` (no length = unlimited, like text) and `name` arrive as
+        // custom type names.
+        DataType::Custom(obj, mods) if mods.is_empty() => {
+            match obj.0.last().and_then(|p| p.as_ident()).map(normalize_ident).as_deref() {
+                Some("bpchar") => PgType::Bpchar,
+                Some("varchar") => PgType::Varchar,
+                Some("name") => PgType::Name,
+                _ => {
+                    return Err(BindError::feature_not_supported(format!(
+                        "type \"{dt}\" is not supported yet"
+                    )));
+                }
+            }
         }
         other => {
             return Err(BindError::feature_not_supported(format!(
@@ -534,7 +666,8 @@ fn bind_cast(
         Binding::Unknown { lit, span } => resolve_unknown(lit, span, target)?,
         Binding::Typed(e) => coerce_expr(e, target)?,
     };
-    Ok(Binding::Typed(apply_numeric_typmod_if_any(expr, target, data_type)?))
+    let expr = apply_numeric_typmod_if_any(expr, target, data_type)?;
+    Ok(Binding::Typed(apply_length_typmod_if_any(expr, target, data_type)?))
 }
 
 fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
@@ -548,7 +681,8 @@ fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
         }
     };
     let expr = resolve_unknown(lit, span, target)?;
-    Ok(Binding::Typed(apply_numeric_typmod_if_any(expr, target, &ts.data_type)?))
+    let expr = apply_numeric_typmod_if_any(expr, target, &ts.data_type)?;
+    Ok(Binding::Typed(apply_length_typmod_if_any(expr, target, &ts.data_type)?))
 }
 
 /// The `(precision, scale)` of a `numeric(p[,s])` / `decimal(...)` type name,
@@ -595,6 +729,61 @@ fn apply_numeric_typmod_if_any(
             BoundExpr::Const { value: Value::Int4(scale), ty: PgType::Int4 },
         ],
     })
+}
+
+/// The declared character length of a `char(n)`/`varchar(n)` type name. A bare
+/// `char`/`character` defaults to length 1; a bare `varchar` has no limit.
+pub fn length_typmod(dt: &ast::DataType) -> Option<i32> {
+    use ast::DataType;
+    fn len(l: &Option<ast::CharacterLength>) -> Option<i32> {
+        match l {
+            Some(ast::CharacterLength::IntegerLength { length, .. }) => Some(*length as i32),
+            _ => None,
+        }
+    }
+    match dt {
+        DataType::Char(l) | DataType::Character(l) => Some(len(l).unwrap_or(1)),
+        DataType::Varchar(l) | DataType::CharacterVarying(l) => len(l),
+        _ => None,
+    }
+}
+
+/// Apply a `varchar(n)`/`char(n)` length coercion, or a `name` truncation, when
+/// the target is one of those types. Constant inputs fold at bind time.
+pub(crate) fn apply_length_typmod_if_any(
+    expr: BoundExpr,
+    target: PgType,
+    data_type: &ast::DataType,
+) -> Result<BoundExpr, BindError> {
+    let (func, typmod) = match target {
+        PgType::Varchar => match length_typmod(data_type) {
+            Some(n) => (ScalarFn::VarcharTypmod, Some(n)),
+            None => return Ok(expr),
+        },
+        PgType::Bpchar => match length_typmod(data_type) {
+            Some(n) => (ScalarFn::BpcharTypmod, Some(n)),
+            None => return Ok(expr),
+        },
+        // `name` always truncates to 63 characters, independent of any modifier.
+        PgType::Name => (ScalarFn::NameInput, None),
+        _ => return Ok(expr),
+    };
+    // Fold a constant text value now (explicit-cast semantics: truncate).
+    if let BoundExpr::Const { value: Value::Text(s), .. } = &expr {
+        let folded = match func {
+            ScalarFn::VarcharTypmod => crabgresql_types::text::truncate_chars(s, typmod.unwrap()),
+            ScalarFn::BpcharTypmod => crabgresql_types::text::bpchar_input(s, typmod.unwrap(), true)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))?,
+            ScalarFn::NameInput => crabgresql_types::text::name_input(s),
+            _ => unreachable!(),
+        };
+        return Ok(BoundExpr::Const { value: Value::Text(folded), ty: target });
+    }
+    let mut args = vec![expr];
+    if let Some(n) = typmod {
+        args.push(BoundExpr::Const { value: Value::Int4(n), ty: PgType::Int4 });
+    }
+    Ok(BoundExpr::FuncCall { func, ret: target, args })
 }
 
 /// `interval '...'` (with an optional SQL-standard field qualifier). The
@@ -998,6 +1187,24 @@ fn bind_binary(
     right: &ast::Expr,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
+    // `||` is not a `BinOp`; PG's `textcat`/`anytextcat` lower to a text concat.
+    if matches!(op, ast::BinaryOperator::StringConcat) {
+        let lb = bind_expr(left, scope)?;
+        let rb = bind_expr(right, scope)?;
+        return bind_string_concat(lb, rb);
+    }
+    // The `~~`/`~~*`/`!~~`/`!~~*` operator spellings of LIKE / ILIKE.
+    if let Some((ci, negated)) = match op {
+        ast::BinaryOperator::PGLikeMatch => Some((false, false)),
+        ast::BinaryOperator::PGILikeMatch => Some((true, false)),
+        ast::BinaryOperator::PGNotLikeMatch => Some((false, true)),
+        ast::BinaryOperator::PGNotILikeMatch => Some((true, true)),
+        _ => None,
+    } {
+        let lb = bind_expr(left, scope)?;
+        let rb = bind_expr(right, scope)?;
+        return bind_like(lb, rb, None, ci, negated);
+    }
     let op = match op {
         ast::BinaryOperator::Eq => BinOp::Eq,
         ast::BinaryOperator::NotEq => BinOp::NotEq,
@@ -1132,6 +1339,9 @@ fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindEr
                 | PgType::Float8
                 | PgType::Numeric
                 | PgType::Text
+                | PgType::Varchar
+                | PgType::Bpchar
+                | PgType::Name
                 | PgType::Bytea
                 | PgType::Date
                 | PgType::Time
@@ -1409,7 +1619,92 @@ fn implicit_castable(from: PgType, to: PgType) -> bool {
                 // resolve without dedicated date overloads.
                 | (Date, Timestamp)
                 | (Date, TimestampTz)
+                // varchar/bpchar/name are implicitly convertible to text (so a
+                // text function accepts them; `bpchar -> text` strips blanks).
+                | (Varchar, Text)
+                | (Bpchar, Text)
+                | (Name, Text)
         )
+}
+
+/// Coerce a binding to `text` for a string function/operator argument. An
+/// untyped literal (or NULL) becomes text; a typed value casts to text.
+pub(crate) fn to_text_operand(binding: Binding) -> Result<BoundExpr, BindError> {
+    match binding {
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text),
+        Binding::Typed(e) if e.ty() == PgType::Text => Ok(e),
+        Binding::Typed(e) => coerce_expr(e, PgType::Text),
+    }
+}
+
+/// True for the text-family types that share `text`'s value representation.
+pub(crate) fn is_text_family(ty: PgType) -> bool {
+    matches!(ty, PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name)
+}
+
+/// Coerce an argument for `concat`/`concat_ws`/`format`, which use each value's
+/// *output* representation. Text-family values are kept as-is (so a `bpchar`
+/// keeps its blank padding, unlike the trailing-blank-stripping `||`); other
+/// types are cast to their text form.
+pub(crate) fn to_concat_operand(binding: Binding) -> Result<BoundExpr, BindError> {
+    match binding {
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text),
+        Binding::Typed(e) if is_text_family(e.ty()) => Ok(e),
+        Binding::Typed(e) => coerce_expr(e, PgType::Text),
+    }
+}
+
+/// `a || b`: PG accepts `text || text` and `text || anynonarray` (either side),
+/// but not two non-text operands. At least one side must be text or an untyped
+/// literal; both are then coerced to text.
+fn bind_string_concat(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
+    let textish = |b: &Binding| {
+        matches!(b, Binding::Unknown { .. })
+            || matches!(b, Binding::Typed(e) if e.ty() == PgType::Text)
+    };
+    if !textish(&lb) && !textish(&rb) {
+        let (Binding::Typed(l), Binding::Typed(r)) = (&lb, &rb) else {
+            unreachable!("a non-textish binding is typed");
+        };
+        return Err(BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!("operator does not exist: {} || {}", l.ty().name(), r.ty().name()),
+        ));
+    }
+    let left = to_text_operand(lb)?;
+    let right = to_text_operand(rb)?;
+    Ok(Binding::Typed(BoundExpr::FuncCall {
+        func: ScalarFn::TextConcat,
+        ret: PgType::Text,
+        args: vec![left, right],
+    }))
+}
+
+/// `a [I]LIKE b [ESCAPE c]`: coerce operands to text and build the match call
+/// (the escape string, when present, is a third argument), wrapping a negated
+/// form in `NOT`.
+fn bind_like(
+    lb: Binding,
+    rb: Binding,
+    escape: Option<Binding>,
+    case_insensitive: bool,
+    negated: bool,
+) -> Result<Binding, BindError> {
+    let mut args = vec![to_text_operand(lb)?, to_text_operand(rb)?];
+    if let Some(escape) = escape {
+        args.push(to_text_operand(escape)?);
+    }
+    let call = BoundExpr::FuncCall {
+        func: if case_insensitive { ScalarFn::ILike } else { ScalarFn::Like },
+        ret: PgType::Bool,
+        args,
+    };
+    let expr = if negated {
+        BoundExpr::Unary { op: UnaryOp::Not, expr: Box::new(call) }
+    } else {
+        call
+    };
+    Ok(Binding::Typed(expr))
 }
 
 fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
@@ -1540,6 +1835,23 @@ fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, BindError> {
     if expr.ty() == ty {
         return Ok(expr);
     }
+    // `bpchar -> text` strips trailing blanks (PG's bpchar->text cast), which is
+    // how a padded `char(n)` value loses its padding under `||`, `::text`, and
+    // most text functions. It cannot be done in `cast_value` because a padded
+    // `bpchar` value is indistinguishable from `text` there.
+    if expr.ty() == PgType::Bpchar && ty == PgType::Text {
+        if let BoundExpr::Const { value: Value::Text(s), .. } = &expr {
+            return Ok(BoundExpr::Const {
+                value: Value::Text(s.trim_end_matches(' ').to_string()),
+                ty: PgType::Text,
+            });
+        }
+        return Ok(BoundExpr::FuncCall {
+            func: ScalarFn::BpcharToText,
+            ret: PgType::Text,
+            args: vec![expr],
+        });
+    }
     match expr {
         BoundExpr::Const { value, .. } if ty != PgType::Text => {
             let value = cast::cast_value(value, ty, 1)
@@ -1593,7 +1905,11 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
     };
     let float_error = |e: float::FloatParseError| BindError::new(e.sqlstate, e.message);
     match ty {
-        PgType::Text => Ok(Value::Text(s.to_string())),
+        // varchar / bpchar / name share text's value representation; any length
+        // limit is applied afterward as a typmod coercion.
+        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
+            Ok(Value::Text(s.to_string()))
+        }
         // Integer input (trim, base-10, 22003 overflow vs 22P02 malformed) is
         // the same acceptor the executor's text→int cast uses; share it so the
         // two never drift. resolve_unknown attaches the cursor position.
@@ -1639,36 +1955,69 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
 /// Coerce an expression for assignment into a column (INSERT / UPDATE SET),
 /// with PG's column-context error message on a type mismatch.
 pub(crate) fn coerce_to_column(binding: Binding, column: &Column) -> Result<BoundExpr, BindError> {
-    match binding {
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, column.ty),
+    let base = match binding {
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, column.ty)?,
         Binding::Typed(e) => {
             let ty = e.ty();
             if ty == column.ty {
-                return Ok(e);
-            }
-            if ty.is_numeric() && column.ty.is_numeric() {
-                return coerce_expr(e, column.ty);
-            }
+                e
+            } else if ty.is_numeric() && column.ty.is_numeric() {
+                coerce_expr(e, column.ty)?
+            // Any text-family type assigns to any other (text/varchar/char/name).
+            } else if is_text_family(ty) && is_text_family(column.ty) {
+                coerce_expr(e, column.ty)?
             // Assignment context also permits the implicit `timestamp ->
             // timestamptz` cast and its assignment-only reverse (both are plain
             // microsecond reinterprets under the UTC session zone), so inserting
             // a `timestamp` expression into a `timestamptz` column works, as in PG.
-            if implicit_castable(ty, column.ty)
+            } else if implicit_castable(ty, column.ty)
                 || matches!((ty, column.ty), (PgType::TimestampTz, PgType::Timestamp))
             {
-                return coerce_expr(e, column.ty);
+                coerce_expr(e, column.ty)?
+            } else {
+                return Err(BindError::new(
+                    sqlstate::DATATYPE_MISMATCH,
+                    format!(
+                        "column \"{}\" is of type {} but expression is of type {}",
+                        column.name,
+                        column.ty.name(),
+                        ty.name()
+                    ),
+                ));
             }
-            Err(BindError::new(
-                sqlstate::DATATYPE_MISMATCH,
-                format!(
-                    "column \"{}\" is of type {} but expression is of type {}",
-                    column.name,
-                    column.ty.name(),
-                    ty.name()
-                ),
-            ))
         }
+    };
+    apply_length_to_column(base, column)
+}
+
+/// Apply a column's `varchar(n)`/`char(n)`/`name` length coercion in assignment
+/// context (an over-long varchar/char errors unless the excess is blank).
+fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr, BindError> {
+    let func = match column.ty {
+        PgType::Varchar if column.typmod >= 0 => ScalarFn::VarcharTypmod,
+        PgType::Bpchar if column.typmod >= 0 => ScalarFn::BpcharTypmod,
+        PgType::Name => ScalarFn::NameInput,
+        _ => return Ok(expr),
+    };
+    // Fold a constant now (assignment semantics: error on non-blank overflow).
+    if let BoundExpr::Const { value: Value::Text(s), .. } = &expr {
+        let folded = match func {
+            ScalarFn::VarcharTypmod => crabgresql_types::text::varchar_input(s, column.typmod, false)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))?,
+            ScalarFn::BpcharTypmod => crabgresql_types::text::bpchar_input(s, column.typmod, false)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))?,
+            ScalarFn::NameInput => crabgresql_types::text::name_input(s),
+            _ => unreachable!(),
+        };
+        return Ok(BoundExpr::Const { value: Value::Text(folded), ty: column.ty });
     }
+    let mut args = vec![expr];
+    if func != ScalarFn::NameInput {
+        args.push(BoundExpr::Const { value: Value::Int4(column.typmod), ty: PgType::Int4 });
+        // Third arg 0 = assignment (error on overflow), not a truncating cast.
+        args.push(BoundExpr::Const { value: Value::Int4(0), ty: PgType::Int4 });
+    }
+    Ok(BoundExpr::FuncCall { func, ret: column.ty, args })
 }
 
 /// The result-column name PG derives from an expression's syntax: column
@@ -1703,6 +2052,16 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         // CEIL/FLOOR special syntax is named after the function.
         ast::Expr::Ceil { .. } => "ceil".into(),
         ast::Expr::Floor { .. } => "floor".into(),
+        // String special-syntax expressions are named after the function they
+        // desugar to (`TRIM` → its ltrim/rtrim/btrim variant).
+        ast::Expr::Substring { .. } => "substring".into(),
+        ast::Expr::Position { .. } => "position".into(),
+        ast::Expr::Overlay { .. } => "overlay".into(),
+        ast::Expr::Trim { trim_where, .. } => match trim_where {
+            Some(ast::TrimWhereField::Leading) => "ltrim".into(),
+            Some(ast::TrimWhereField::Trailing) => "rtrim".into(),
+            Some(ast::TrimWhereField::Both) | None => "btrim".into(),
+        },
         // A function's output column is named after the function.
         ast::Expr::Function(func) => func
             .name

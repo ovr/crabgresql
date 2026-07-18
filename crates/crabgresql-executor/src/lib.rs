@@ -1001,14 +1001,8 @@ mod tests {
             .create_table(TableSchema {
                 name: "t".into(),
                 columns: vec![
-                    Column {
-                        name: "id".into(),
-                        ty: PgType::Int4,
-                    },
-                    Column {
-                        name: "label".into(),
-                        ty: PgType::Text,
-                    },
+                    Column::new("id", PgType::Int4),
+                    Column::new("label", PgType::Text),
                 ],
             })
             .unwrap();
@@ -1478,10 +1472,7 @@ mod tests {
         let table = engine
             .create_table(TableSchema {
                 name: "nums".into(),
-                columns: vec![Column {
-                    name: "n".into(),
-                    ty: PgType::Int4,
-                }],
+                columns: vec![Column::new("n", PgType::Int4)],
             })
             .unwrap();
         for n in [1, 2, 3] {

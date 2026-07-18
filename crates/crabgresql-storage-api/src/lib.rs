@@ -20,6 +20,21 @@ pub type Tid = u64;
 pub struct Column {
     pub name: String,
     pub ty: PgType,
+    /// The declared type modifier (e.g. a `varchar(n)`/`char(n)` length), or
+    /// `-1` when the type has none. Applied to values on INSERT/UPDATE.
+    pub typmod: i32,
+}
+
+impl Column {
+    /// A column with no type modifier.
+    pub fn new(name: impl Into<String>, ty: PgType) -> Self {
+        Column { name: name.into(), ty, typmod: -1 }
+    }
+
+    /// A column carrying a declared type modifier.
+    pub fn with_typmod(name: impl Into<String>, ty: PgType, typmod: i32) -> Self {
+        Column { name: name.into(), ty, typmod }
+    }
 }
 
 #[derive(Clone, Debug)]

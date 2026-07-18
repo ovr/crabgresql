@@ -166,14 +166,8 @@ mod tests {
         TableSchema {
             name: name.to_string(),
             columns: vec![
-                Column {
-                    name: "id".into(),
-                    ty: PgType::Int4,
-                },
-                Column {
-                    name: "name".into(),
-                    ty: PgType::Text,
-                },
+                Column::new("id", PgType::Int4),
+                Column::new("name", PgType::Text),
             ],
         }
     }

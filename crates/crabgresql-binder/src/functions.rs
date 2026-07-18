@@ -201,6 +201,90 @@ pub enum ScalarFn {
     Log10F8,
     /// `mod(intN, intN) -> intN` (dispatches on the operand's integer width).
     ModInt,
+
+    // --- string functions (see `crabgresql_types::text`) ----
+    /// `text || text -> text` (the `||` operator / `textcat`).
+    TextConcat,
+    /// `length`/`char_length`/`character_length(text) -> int4`.
+    Length,
+    /// `octet_length(text) -> int4`.
+    OctetLength,
+    /// `bit_length(text) -> int4`.
+    BitLength,
+    /// `upper(text) -> text`.
+    Upper,
+    /// `lower(text) -> text`.
+    Lower,
+    /// `initcap(text) -> text`.
+    Initcap,
+    /// `substr`/`substring(text, int4 [, int4]) -> text`.
+    Substr,
+    /// `strpos(text, text) -> int4` (also `position(sub IN str)`).
+    StrPos,
+    /// `overlay(text, text, int4 [, int4]) -> text`.
+    Overlay,
+    /// `ltrim(text [, text]) -> text`.
+    Ltrim,
+    /// `rtrim(text [, text]) -> text`.
+    Rtrim,
+    /// `btrim(text [, text]) -> text` (also `trim(both ...)`).
+    Btrim,
+    /// `lpad(text, int4 [, text]) -> text`.
+    Lpad,
+    /// `rpad(text, int4 [, text]) -> text`.
+    Rpad,
+    /// `replace(text, text, text) -> text`.
+    Replace,
+    /// `translate(text, text, text) -> text`.
+    Translate,
+    /// `repeat(text, int4) -> text`.
+    Repeat,
+    /// `reverse(text) -> text`.
+    Reverse,
+    /// `left(text, int4) -> text`.
+    Left,
+    /// `right(text, int4) -> text`.
+    Right,
+    /// `ascii(text) -> int4`.
+    Ascii,
+    /// `chr(int4) -> text`.
+    Chr,
+    /// `split_part(text, text, int4) -> text`.
+    SplitPart,
+    /// `starts_with(text, text) -> bool`.
+    StartsWith,
+    /// `to_hex(int4) -> text`.
+    ToHex,
+    /// `to_hex(int8) -> text`.
+    ToHexInt8,
+    /// `concat(...) -> text` (variadic, non-strict: NULL args are skipped).
+    Concat,
+    /// `concat_ws(sep, ...) -> text` (variadic, non-strict; NULL sep -> NULL).
+    ConcatWs,
+    /// `format(text, ...) -> text` (variadic, non-strict).
+    Format,
+    /// `text LIKE text -> bool` (case-sensitive).
+    Like,
+    /// `text ILIKE text -> bool` (case-insensitive).
+    ILike,
+    /// `encode(bytea, text) -> text`.
+    Encode,
+    /// `decode(text, text) -> bytea`.
+    Decode,
+    /// `quote_ident(text) -> text`.
+    QuoteIdent,
+    /// `quote_literal(text) -> text`.
+    QuoteLiteral,
+    /// `quote_nullable(text) -> text`.
+    QuoteNullable,
+    /// Apply a `varchar(n)` length coercion at run time (`text`, `int4 n`).
+    VarcharTypmod,
+    /// Apply a `char(n)`/`bpchar(n)` blank-padding coercion (`text`, `int4 n`).
+    BpcharTypmod,
+    /// `name` input: truncate to 63 characters (`text`).
+    NameInput,
+    /// `bpchar -> text` coercion: strip trailing blanks.
+    BpcharToText,
 }
 
 struct Signature {
@@ -351,6 +435,9 @@ const NUM: PgType = PgType::Numeric;
 const DATE: PgType = PgType::Date;
 const TIME: PgType = PgType::Time;
 const TIMETZ: PgType = PgType::TimeTz;
+const I8: PgType = PgType::Int8;
+const BOOL: PgType = PgType::Bool;
+const BYTEA: PgType = PgType::Bytea;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -522,6 +609,73 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: PgType::Text,
             },
         ],
+        // --- string functions ---
+        "length" | "char_length" | "character_length" => {
+            &[Signature { func: ScalarFn::Length, args: &[TEXT], ret: I4 }]
+        }
+        // `octet_length` counts the padded bytes of a `bpchar` (via a dedicated
+        // overload), while `length`/`bit_length` see the trailing-blank-trimmed
+        // text value, matching PG's `bpcharoctetlen` vs `bpcharlen`/text paths.
+        "octet_length" => &[
+            Signature { func: ScalarFn::OctetLength, args: &[TEXT], ret: I4 },
+            Signature { func: ScalarFn::OctetLength, args: &[PgType::Bpchar], ret: I4 },
+        ],
+        "bit_length" => &[Signature { func: ScalarFn::BitLength, args: &[TEXT], ret: I4 }],
+        "upper" => &[Signature { func: ScalarFn::Upper, args: &[TEXT], ret: TEXT }],
+        "lower" => &[Signature { func: ScalarFn::Lower, args: &[TEXT], ret: TEXT }],
+        "initcap" => &[Signature { func: ScalarFn::Initcap, args: &[TEXT], ret: TEXT }],
+        "substr" | "substring" => &[
+            Signature { func: ScalarFn::Substr, args: &[TEXT, I4], ret: TEXT },
+            Signature { func: ScalarFn::Substr, args: &[TEXT, I4, I4], ret: TEXT },
+        ],
+        "strpos" => &[Signature { func: ScalarFn::StrPos, args: &[TEXT, TEXT], ret: I4 }],
+        "overlay" => &[
+            Signature { func: ScalarFn::Overlay, args: &[TEXT, TEXT, I4], ret: TEXT },
+            Signature { func: ScalarFn::Overlay, args: &[TEXT, TEXT, I4, I4], ret: TEXT },
+        ],
+        "ltrim" => &[
+            Signature { func: ScalarFn::Ltrim, args: &[TEXT], ret: TEXT },
+            Signature { func: ScalarFn::Ltrim, args: &[TEXT, TEXT], ret: TEXT },
+        ],
+        "rtrim" => &[
+            Signature { func: ScalarFn::Rtrim, args: &[TEXT], ret: TEXT },
+            Signature { func: ScalarFn::Rtrim, args: &[TEXT, TEXT], ret: TEXT },
+        ],
+        "btrim" => &[
+            Signature { func: ScalarFn::Btrim, args: &[TEXT], ret: TEXT },
+            Signature { func: ScalarFn::Btrim, args: &[TEXT, TEXT], ret: TEXT },
+        ],
+        "lpad" => &[
+            Signature { func: ScalarFn::Lpad, args: &[TEXT, I4], ret: TEXT },
+            Signature { func: ScalarFn::Lpad, args: &[TEXT, I4, TEXT], ret: TEXT },
+        ],
+        "rpad" => &[
+            Signature { func: ScalarFn::Rpad, args: &[TEXT, I4], ret: TEXT },
+            Signature { func: ScalarFn::Rpad, args: &[TEXT, I4, TEXT], ret: TEXT },
+        ],
+        "replace" => &[Signature { func: ScalarFn::Replace, args: &[TEXT, TEXT, TEXT], ret: TEXT }],
+        "translate" => {
+            &[Signature { func: ScalarFn::Translate, args: &[TEXT, TEXT, TEXT], ret: TEXT }]
+        }
+        "repeat" => &[Signature { func: ScalarFn::Repeat, args: &[TEXT, I4], ret: TEXT }],
+        "reverse" => &[Signature { func: ScalarFn::Reverse, args: &[TEXT], ret: TEXT }],
+        "left" => &[Signature { func: ScalarFn::Left, args: &[TEXT, I4], ret: TEXT }],
+        "right" => &[Signature { func: ScalarFn::Right, args: &[TEXT, I4], ret: TEXT }],
+        "ascii" => &[Signature { func: ScalarFn::Ascii, args: &[TEXT], ret: I4 }],
+        "chr" => &[Signature { func: ScalarFn::Chr, args: &[I4], ret: TEXT }],
+        "split_part" => {
+            &[Signature { func: ScalarFn::SplitPart, args: &[TEXT, TEXT, I4], ret: TEXT }]
+        }
+        "starts_with" => &[Signature { func: ScalarFn::StartsWith, args: &[TEXT, TEXT], ret: BOOL }],
+        "to_hex" => &[
+            Signature { func: ScalarFn::ToHex, args: &[I4], ret: TEXT },
+            Signature { func: ScalarFn::ToHexInt8, args: &[I8], ret: TEXT },
+        ],
+        "encode" => &[Signature { func: ScalarFn::Encode, args: &[BYTEA, TEXT], ret: TEXT }],
+        "decode" => &[Signature { func: ScalarFn::Decode, args: &[TEXT, TEXT], ret: BYTEA }],
+        "quote_ident" => &[Signature { func: ScalarFn::QuoteIdent, args: &[TEXT], ret: TEXT }],
+        "quote_literal" => &[Signature { func: ScalarFn::QuoteLiteral, args: &[TEXT], ret: TEXT }],
+        "quote_nullable" => &[Signature { func: ScalarFn::QuoteNullable, args: &[TEXT], ret: TEXT }],
         _ => &[],
     }
 }
@@ -554,6 +708,22 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
+
+    // `concat`/`concat_ws`/`format` are variadic and non-strict; they don't fit
+    // the fixed-arity overload table, so every argument is coerced to text and a
+    // single variadic `FuncCall` is built directly.
+    if let Some(func) = match name.as_str() {
+        "concat" => Some(ScalarFn::Concat),
+        "concat_ws" => Some(ScalarFn::ConcatWs),
+        "format" => Some(ScalarFn::Format),
+        _ => None,
+    } {
+        let args = bindings
+            .into_iter()
+            .map(crate::expr::to_concat_operand)
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Binding::Typed(BoundExpr::FuncCall { func, ret: PgType::Text, args }));
+    }
 
     resolve_call(&name, bindings)
 }

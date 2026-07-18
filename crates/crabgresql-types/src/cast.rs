@@ -155,10 +155,14 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         )
         .map(|r| Value::Int8(r as i64)),
 
-        // ---- anything → text (float uses efd) ----
-        (_, PgType::Text) => Ok(Value::Text(
-            v.encode_text_with(efd).unwrap_or_default(),
-        )),
+        // ---- anything → text / varchar / bpchar / name (float uses efd) ----
+        // These four share the `text` value representation; any length limit for
+        // varchar/bpchar is applied separately as a typmod coercion. A
+        // `bpchar -> text` trim is handled in the binder, not here, because a
+        // padded `bpchar` value is indistinguishable from `text` at this layer.
+        (_, PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name) => {
+            Ok(Value::Text(v.encode_text_with(efd).unwrap_or_default()))
+        }
 
         // ---- text → scalar (input functions) ----
         (Value::Text(s), PgType::Float4) => float::float4in(s)

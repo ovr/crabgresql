@@ -403,10 +403,10 @@ fn execute_create_table(
                 option.option
             )));
         }
-        columns.push(Column {
-            name: normalize_ident(&col.name),
-            ty: map_data_type(&col.data_type)?,
-        });
+        let ty = map_data_type(&col.data_type)?;
+        // Carry a varchar(n)/char(n) length so INSERT/UPDATE can pad/validate.
+        let typmod = crabgresql_binder::length_typmod(&col.data_type).unwrap_or(-1);
+        columns.push(Column::with_typmod(normalize_ident(&col.name), ty, typmod));
     }
     match engine.create_table(TableSchema { name, columns }) {
         Ok(_) => {}

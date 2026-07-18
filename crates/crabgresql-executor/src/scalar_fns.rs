@@ -12,8 +12,8 @@ use std::hint::black_box;
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Interval, Numeric, TimeTz, Value, date, float, interval, time, timestamp, timestamptz, timetz,
-    to_char,
+    Interval, Numeric, TimeTz, Value, date, float, interval, text, time, timestamp, timestamptz,
+    timetz, to_char,
 };
 
 use crate::ExecError;
@@ -39,10 +39,162 @@ fn out_of_range_input() -> ExecError {
 /// Evaluate a scalar function. All functions are STRICT: a NULL argument yields
 /// NULL without invoking the function.
 pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
+    // Non-strict string functions run even when arguments are NULL, so they are
+    // handled before the STRICT NULL short-circuit below.
+    match func {
+        ScalarFn::Concat => {
+            let mut out = String::new();
+            for a in args {
+                if let Some(s) = a.encode_text() {
+                    out.push_str(&s);
+                }
+            }
+            return Ok(Value::Text(out));
+        }
+        ScalarFn::ConcatWs => {
+            // A NULL separator yields NULL; the remaining NULL args are skipped.
+            let Some(sep) = args.first().and_then(|a| a.encode_text()) else {
+                return Ok(Value::Null);
+            };
+            let parts: Vec<String> =
+                args[1..].iter().filter_map(|a| a.encode_text()).collect();
+            return Ok(Value::Text(parts.join(&sep)));
+        }
+        ScalarFn::Format => {
+            // A NULL format string yields NULL.
+            let Some(fmt) = args.first().and_then(|a| a.encode_text()) else {
+                return Ok(Value::Null);
+            };
+            let fmt_args: Vec<text::FormatArg> =
+                args[1..].iter().map(|a| a.encode_text()).collect();
+            return text::format(&fmt, &fmt_args).map(Value::Text).map_err(text_err);
+        }
+        // quote_nullable is non-strict: a NULL argument becomes the text `NULL`.
+        ScalarFn::QuoteNullable => {
+            return Ok(Value::Text(text::quote_nullable(args[0].encode_text().as_deref())));
+        }
+        _ => {}
+    }
     if args.iter().any(|a| matches!(a, Value::Null)) {
         return Ok(Value::Null);
     }
     match func {
+        // --- string functions ---
+        ScalarFn::TextConcat => {
+            return Ok(Value::Text(format!("{}{}", text(&args[0]), text(&args[1]))));
+        }
+        ScalarFn::Length => return Ok(Value::Int4(text::char_length(text(&args[0])))),
+        ScalarFn::OctetLength => return Ok(Value::Int4(text::octet_length(text(&args[0])))),
+        ScalarFn::BitLength => return Ok(Value::Int4(text::bit_length(text(&args[0])))),
+        ScalarFn::Upper => return Ok(Value::Text(text::upper(text(&args[0])))),
+        ScalarFn::Lower => return Ok(Value::Text(text::lower(text(&args[0])))),
+        ScalarFn::Initcap => return Ok(Value::Text(text::initcap(text(&args[0])))),
+        ScalarFn::Substr => {
+            let len = args.get(2).map(i4);
+            return text::substr(text(&args[0]), i4(&args[1]), len)
+                .map(Value::Text)
+                .map_err(text_err);
+        }
+        ScalarFn::StrPos => {
+            return Ok(Value::Int4(text::strpos(text(&args[0]), text(&args[1]))));
+        }
+        ScalarFn::Overlay => {
+            let count = args.get(3).map(i4);
+            return text::overlay(text(&args[0]), text(&args[1]), i4(&args[2]), count)
+                .map(Value::Text)
+                .map_err(text_err);
+        }
+        ScalarFn::Ltrim | ScalarFn::Rtrim | ScalarFn::Btrim => {
+            let chars = args.get(1).map(|v| text(v)).unwrap_or(" ");
+            let side = match func {
+                ScalarFn::Ltrim => text::TrimSide::Leading,
+                ScalarFn::Rtrim => text::TrimSide::Trailing,
+                _ => text::TrimSide::Both,
+            };
+            return Ok(Value::Text(text::trim(text(&args[0]), chars, side)));
+        }
+        ScalarFn::Lpad | ScalarFn::Rpad => {
+            let fill = args.get(2).map(|v| text(v)).unwrap_or(" ");
+            let left = matches!(func, ScalarFn::Lpad);
+            return text::pad(text(&args[0]), i4(&args[1]), fill, left)
+                .map(Value::Text)
+                .map_err(text_err);
+        }
+        ScalarFn::Replace => {
+            return Ok(Value::Text(text::replace(text(&args[0]), text(&args[1]), text(&args[2]))));
+        }
+        ScalarFn::Translate => {
+            return Ok(Value::Text(text::translate(text(&args[0]), text(&args[1]), text(&args[2]))));
+        }
+        ScalarFn::Repeat => {
+            return text::repeat(text(&args[0]), i4(&args[1])).map(Value::Text).map_err(text_err);
+        }
+        ScalarFn::Reverse => return Ok(Value::Text(text::reverse(text(&args[0])))),
+        ScalarFn::Left => return Ok(Value::Text(text::left(text(&args[0]), i4(&args[1])))),
+        ScalarFn::Right => return Ok(Value::Text(text::right(text(&args[0]), i4(&args[1])))),
+        ScalarFn::Ascii => return Ok(Value::Int4(text::ascii(text(&args[0])))),
+        ScalarFn::Chr => return text::chr(i4(&args[0])).map(Value::Text).map_err(text_err),
+        ScalarFn::SplitPart => {
+            return text::split_part(text(&args[0]), text(&args[1]), i4(&args[2]))
+                .map(Value::Text)
+                .map_err(text_err);
+        }
+        ScalarFn::StartsWith => {
+            return Ok(Value::Bool(text::starts_with(text(&args[0]), text(&args[1]))));
+        }
+        ScalarFn::ToHex => return Ok(Value::Text(text::to_hex_i32(i4(&args[0])))),
+        ScalarFn::ToHexInt8 => return Ok(Value::Text(text::to_hex_i64(i8(&args[0])))),
+        ScalarFn::Like | ScalarFn::ILike => {
+            let ci = matches!(func, ScalarFn::ILike);
+            // No ESCAPE clause defaults to `\`; `ESCAPE ''` disables escaping.
+            let escape = match args.get(2) {
+                None => Some('\\'),
+                Some(v) => {
+                    let s = text(v);
+                    if s.chars().count() > 1 {
+                        return Err(err(
+                            sqlstate::INVALID_ESCAPE_SEQUENCE,
+                            "invalid escape string",
+                        )
+                        .with_detail(Some(
+                            "Escape string must be empty or one character.".to_string(),
+                        )));
+                    }
+                    s.chars().next()
+                }
+            };
+            return text::like(text(&args[0]), text(&args[1]), escape, ci)
+                .map(Value::Bool)
+                .map_err(text_err);
+        }
+        ScalarFn::Encode => {
+            return text::encode(bytea(&args[0]), text(&args[1]))
+                .map(Value::Text)
+                .map_err(text_err);
+        }
+        ScalarFn::Decode => {
+            return text::decode(text(&args[0]), text(&args[1]))
+                .map(Value::Bytea)
+                .map_err(text_err);
+        }
+        ScalarFn::QuoteIdent => return Ok(Value::Text(text::quote_ident(text(&args[0])))),
+        ScalarFn::QuoteLiteral => return Ok(Value::Text(text::quote_literal(text(&args[0])))),
+        ScalarFn::VarcharTypmod => {
+            // A third arg of 0 selects assignment semantics (error on overflow);
+            // an explicit `::varchar(n)` cast (no third arg) truncates silently.
+            let explicit = args.get(2).map(|v| i4(v) != 0).unwrap_or(true);
+            return text::varchar_input(text(&args[0]), i4(&args[1]), explicit)
+                .map(Value::Text)
+                .map_err(text_err);
+        }
+        ScalarFn::BpcharTypmod => {
+            let explicit = args.get(2).map(|v| i4(v) != 0).unwrap_or(true);
+            return text::bpchar_input(text(&args[0]), i4(&args[1]), explicit)
+                .map(Value::Text)
+                .map_err(text_err);
+        }
+        ScalarFn::NameInput => return Ok(Value::Text(text::name_input(text(&args[0])))),
+        ScalarFn::BpcharToText => return Ok(Value::Text(text::bpchar_rtrim(text(&args[0])))),
         ScalarFn::Float4Send => {
             let f = f4(&args[0]);
             return Ok(Value::Bytea(f.to_be_bytes().to_vec()));
@@ -414,78 +566,14 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::Acosd => dacosd(a),
         ScalarFn::Atand => Ok(datand(a)),
         ScalarFn::Atan2d => Ok(datan2d(a, f8(&args[1]))),
-        ScalarFn::Float4Send
-        | ScalarFn::Float8Send
-        | ScalarFn::PgInputIsValid
-        | ScalarFn::Md5
-        | ScalarFn::DatePart
-        | ScalarFn::Extract
-        | ScalarFn::DateTrunc
-        | ScalarFn::Isfinite
-        | ScalarFn::MakeTimestamp
-        | ScalarFn::IntervalNeg
-        | ScalarFn::IntervalPl
-        | ScalarFn::IntervalMi
-        | ScalarFn::IntervalMul
-        | ScalarFn::IntervalDiv
-        | ScalarFn::TimestampPlInterval
-        | ScalarFn::TimestampMiInterval
-        | ScalarFn::TimestampMi
-        | ScalarFn::DatePartInterval
-        | ScalarFn::ExtractInterval
-        | ScalarFn::DateTruncInterval
-        | ScalarFn::IsfiniteInterval
-        | ScalarFn::MakeInterval
-        | ScalarFn::JustifyDays
-        | ScalarFn::JustifyHours
-        | ScalarFn::JustifyInterval
-        | ScalarFn::Age
-        | ScalarFn::ToCharInterval
-        | ScalarFn::DatePartTz
-        | ScalarFn::ExtractTz
-        | ScalarFn::DateTruncTz
-        | ScalarFn::IsfiniteTz
-        | ScalarFn::MakeTimestampTz
-        | ScalarFn::TimezoneToTz
-        | ScalarFn::TimezoneToTs
-        | ScalarFn::DatePlDays
-        | ScalarFn::DateMiDays
-        | ScalarFn::DateMi
-        | ScalarFn::DatePlInterval
-        | ScalarFn::DateMiInterval
-        | ScalarFn::DatePlTime
-        | ScalarFn::DatePlTimeTz
-        | ScalarFn::DatePartDate
-        | ScalarFn::ExtractDate
-        | ScalarFn::IsfiniteDate
-        | ScalarFn::MakeDate
-        | ScalarFn::TimePlInterval
-        | ScalarFn::TimeMiInterval
-        | ScalarFn::TimeMi
-        | ScalarFn::DatePartTime
-        | ScalarFn::ExtractTime
-        | ScalarFn::MakeTime
-        | ScalarFn::TimeTzPlInterval
-        | ScalarFn::TimeTzMiInterval
-        | ScalarFn::DatePartTimeTz
-        | ScalarFn::ExtractTimeTz
-        | ScalarFn::NumRound
-        | ScalarFn::NumTrunc
-        | ScalarFn::NumCeil
-        | ScalarFn::NumFloor
-        | ScalarFn::NumAbs
-        | ScalarFn::NumSign
-        | ScalarFn::NumMod
-        | ScalarFn::NumSqrt
-        | ScalarFn::NumLn
-        | ScalarFn::NumLog10
-        | ScalarFn::NumLog
-        | ScalarFn::NumExp
-        | ScalarFn::NumPower
-        | ScalarFn::NumApplyTypmod
-        | ScalarFn::ModInt => unreachable!("numeric functions return early"),
+        // Every non-float8 function returns early in the first `match` above.
+        other => unreachable!("non-float8 function reached the float8 tail: {other:?}"),
     };
     result.map(Value::Float8)
+}
+
+fn text_err(e: text::TextError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
 }
 
 fn float_err(e: float::FloatError) -> ExecError {
@@ -853,6 +941,20 @@ fn i4(v: &Value) -> i32 {
     match v {
         Value::Int4(n) => *n,
         other => unreachable!("expected int4 arg, got {other:?}"),
+    }
+}
+
+fn i8(v: &Value) -> i64 {
+    match v {
+        Value::Int8(n) => *n,
+        other => unreachable!("expected int8 arg, got {other:?}"),
+    }
+}
+
+fn bytea(v: &Value) -> &[u8] {
+    match v {
+        Value::Bytea(b) => b,
+        other => unreachable!("expected bytea arg, got {other:?}"),
     }
 }
 

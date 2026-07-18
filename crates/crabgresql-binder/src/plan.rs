@@ -325,10 +325,7 @@ fn bind_from_select(
 fn to_columns(columns: &[OutputColumn]) -> Vec<Column> {
     columns
         .iter()
-        .map(|c| Column {
-            name: c.name.clone(),
-            ty: c.ty,
-        })
+        .map(|c| Column::new(c.name.clone(), c.ty))
         .collect()
 }
 
@@ -1112,22 +1109,10 @@ mod tests {
             .create_table(TableSchema {
                 name: "t".into(),
                 columns: vec![
-                    Column {
-                        name: "id".into(),
-                        ty: PgType::Int4,
-                    },
-                    Column {
-                        name: "big".into(),
-                        ty: PgType::Int8,
-                    },
-                    Column {
-                        name: "name".into(),
-                        ty: PgType::Text,
-                    },
-                    Column {
-                        name: "flag".into(),
-                        ty: PgType::Bool,
-                    },
+                    Column::new("id", PgType::Int4),
+                    Column::new("big", PgType::Int8),
+                    Column::new("name", PgType::Text),
+                    Column::new("flag", PgType::Bool),
                 ],
             })
             .unwrap();
@@ -1179,6 +1164,61 @@ mod tests {
         let e = bind_err("SELECT nope FROM t");
         assert_eq!(e.code, "42703");
         assert_eq!(e.message, "column \"nope\" does not exist");
+    }
+
+    /// The first projected expression of a bound FROM-less `SELECT`.
+    fn one_projection(sql: &str) -> BoundExpr {
+        let LogicalPlan::Values { mut rows, .. } = bind_one(sql).unwrap() else {
+            panic!("expected Values");
+        };
+        rows.remove(0).remove(0)
+    }
+
+    #[test]
+    fn string_concat_lowers_to_text_concat() {
+        let expr = one_projection("SELECT 'a' || 'b'");
+        assert!(matches!(
+            expr,
+            BoundExpr::FuncCall { func: crate::ScalarFn::TextConcat, ret: PgType::Text, .. }
+        ));
+    }
+
+    #[test]
+    fn concat_of_two_non_text_is_undefined_operator() {
+        let e = bind_err("SELECT 1 || 2");
+        assert_eq!(e.code, "42883");
+        assert_eq!(e.message, "operator does not exist: integer || integer");
+    }
+
+    #[test]
+    fn like_binds_to_bool_and_not_wraps() {
+        assert_eq!(one_projection("SELECT 'a' LIKE 'a%'").ty(), PgType::Bool);
+        assert!(matches!(
+            one_projection("SELECT 'a' NOT LIKE 'b%'"),
+            BoundExpr::Unary { op: crate::UnaryOp::Not, .. }
+        ));
+    }
+
+    #[test]
+    fn char_types_carry_their_type_and_length() {
+        assert_eq!(one_projection("SELECT 'abcdef'::varchar(3)").ty(), PgType::Varchar);
+        // `char(3)` truncates a constant at bind time (explicit-cast semantics).
+        assert_eq!(
+            one_projection("SELECT 'abcdef'::char(3)"),
+            BoundExpr::Const { value: Value::Text("abc".into()), ty: PgType::Bpchar }
+        );
+        // A bare `char` is `char(1)` and blank-pads a short constant.
+        assert_eq!(
+            one_projection("SELECT 'a'::char(3)"),
+            BoundExpr::Const { value: Value::Text("a  ".into()), ty: PgType::Bpchar }
+        );
+    }
+
+    #[test]
+    fn substring_and_position_desugar_to_functions() {
+        assert_eq!(one_projection("SELECT substring('abc' FROM 2 FOR 1)").ty(), PgType::Text);
+        assert_eq!(one_projection("SELECT position('b' IN 'abc')").ty(), PgType::Int4);
+        assert_eq!(one_projection("SELECT length('abc')").ty(), PgType::Int4);
     }
 
     #[test]

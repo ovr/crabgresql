@@ -163,7 +163,11 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::Float4 => float::f4_cmp(float4(l), float4(r)),
         PgType::Float8 => float::f8_cmp(float8(l), float8(r)),
         // Byte-order comparison: C-collation semantics until collations land.
-        PgType::Text => text(l).cmp(text(r)),
+        // varchar and name compare like text; bpchar ignores trailing blanks.
+        PgType::Text | PgType::Varchar | PgType::Name => text(l).cmp(text(r)),
+        PgType::Bpchar => {
+            text(l).trim_end_matches(' ').cmp(text(r).trim_end_matches(' '))
+        }
         PgType::Bytea => bytea(l).cmp(bytea(r)),
         // false < true, as in PG.
         PgType::Bool => bool_of(l).cmp(&bool_of(r)),
