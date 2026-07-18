@@ -2965,6 +2965,18 @@ impl<'a> Parser<'a> {
                 trim_where = Some(self.parse_trim_where()?);
             }
         }
+        // `TRIM(LEADING FROM x)` — a side with no characters to trim (defaults to
+        // spaces), so `FROM` follows the side keyword directly.
+        if trim_where.is_some() && self.parse_keyword(Keyword::FROM) {
+            let expr = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            return Ok(Expr::Trim {
+                expr: Box::new(expr),
+                trim_where,
+                trim_what: None,
+                trim_characters: None,
+            });
+        }
         let expr = self.parse_expr()?;
         if self.parse_keyword(Keyword::FROM) {
             let trim_what = Box::new(expr);

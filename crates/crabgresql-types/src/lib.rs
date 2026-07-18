@@ -10,6 +10,7 @@ pub mod date;
 pub mod float;
 pub mod interval;
 pub mod numeric;
+pub mod text;
 pub mod time;
 pub mod timestamp;
 pub mod timestamptz;
@@ -25,10 +26,13 @@ pub use timetz::TimeTz;
 pub mod oid {
     pub const BOOL: u32 = 16;
     pub const BYTEA: u32 = 17;
+    pub const NAME: u32 = 19;
     pub const INT8: u32 = 20;
     pub const INT2: u32 = 21;
     pub const INT4: u32 = 23;
     pub const TEXT: u32 = 25;
+    pub const BPCHAR: u32 = 1042;
+    pub const VARCHAR: u32 = 1043;
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
     pub const DATE: u32 = 1082;
@@ -51,6 +55,14 @@ pub enum PgType {
     Float8,
     Numeric,
     Text,
+    /// `character varying` / `varchar`. Shares the `text` value representation;
+    /// a length limit is applied as a coercion, never stored on the type.
+    Varchar,
+    /// `character` / `char` / `bpchar`. Values are blank-padded to their
+    /// declared length at coercion time.
+    Bpchar,
+    /// `name`: a 63-character identifier type backed by `text`.
+    Name,
     Bytea,
     Bit,
     /// `date`.
@@ -81,6 +93,9 @@ impl PgType {
             PgType::Float8 => oid::FLOAT8,
             PgType::Numeric => oid::NUMERIC,
             PgType::Text => oid::TEXT,
+            PgType::Varchar => oid::VARCHAR,
+            PgType::Bpchar => oid::BPCHAR,
+            PgType::Name => oid::NAME,
             PgType::Bytea => oid::BYTEA,
             PgType::Bit => oid::BIT,
             PgType::Date => oid::DATE,
@@ -108,7 +123,14 @@ impl PgType {
             PgType::Timestamp => 8,
             PgType::TimestampTz => 8,
             PgType::Interval => 16,
-            PgType::Numeric | PgType::Text | PgType::Bytea | PgType::Bit => -1,
+            // `name` is a fixed 64-byte type; the rest are varlena.
+            PgType::Name => 64,
+            PgType::Numeric
+            | PgType::Text
+            | PgType::Varchar
+            | PgType::Bpchar
+            | PgType::Bytea
+            | PgType::Bit => -1,
             PgType::User(_) => -1,
         }
     }
@@ -124,6 +146,9 @@ impl PgType {
             PgType::Float8 => "double precision",
             PgType::Numeric => "numeric",
             PgType::Text => "text",
+            PgType::Varchar => "character varying",
+            PgType::Bpchar => "character",
+            PgType::Name => "name",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
             PgType::Date => "date",
@@ -148,6 +173,9 @@ impl PgType {
             PgType::Float8 => "float8",
             PgType::Numeric => "numeric",
             PgType::Text => "text",
+            PgType::Varchar => "varchar",
+            PgType::Bpchar => "bpchar",
+            PgType::Name => "name",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
             PgType::Date => "date",

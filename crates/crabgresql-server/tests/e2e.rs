@@ -300,7 +300,6 @@ async fn unenforceable_ddl_is_rejected() {
     for sql in [
         "CREATE TABLE c (id integer PRIMARY KEY)",
         "CREATE TABLE c (id integer NOT NULL)",
-        "CREATE TABLE c (s varchar(10))",
     ] {
         let err = client.simple_query(sql).await.unwrap_err();
         assert_eq!(

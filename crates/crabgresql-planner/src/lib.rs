@@ -181,18 +181,9 @@ mod tests {
             .create_table(TableSchema {
                 name: "t".into(),
                 columns: vec![
-                    Column {
-                        name: "id".into(),
-                        ty: PgType::Int4,
-                    },
-                    Column {
-                        name: "big".into(),
-                        ty: PgType::Int8,
-                    },
-                    Column {
-                        name: "name".into(),
-                        ty: PgType::Text,
-                    },
+                    Column::new("id", PgType::Int4),
+                    Column::new("big", PgType::Int8),
+                    Column::new("name", PgType::Text),
                 ],
             })
             .unwrap();
