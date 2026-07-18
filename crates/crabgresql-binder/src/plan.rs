@@ -1248,7 +1248,16 @@ fn bind_aggregation(
 
     let mut aggregates: Vec<BoundAggregate> = Vec::new();
     for proj in projections.iter_mut() {
-        *proj = rewrite_over_aggregate(proj.clone(), &group_exprs, &mut aggregates, scope)?;
+        // Move the projection out (rewrite consumes it and rebuilds a fresh
+        // tree) rather than cloning the whole expression only to drop it.
+        let taken = std::mem::replace(
+            proj,
+            BoundExpr::Const {
+                value: Value::Null,
+                ty: PgType::Bool,
+            },
+        );
+        *proj = rewrite_over_aggregate(taken, &group_exprs, &mut aggregates, scope)?;
     }
     let having = having
         .map(|h| rewrite_over_aggregate(h, &group_exprs, &mut aggregates, scope))
@@ -1289,7 +1298,7 @@ fn bind_group_by(
             }
             projections[ordinal - 1].clone()
         } else {
-            bind_scalar(expr, scope)?
+            bind_group_key(expr, scope, columns, projections)?
         };
         if bound.contains_aggregate() {
             return Err(BindError::new(
@@ -1297,9 +1306,56 @@ fn bind_group_by(
                 "aggregate functions are not allowed in GROUP BY",
             ));
         }
+        // The executor groups with `compare_values`, which cannot order every
+        // type (`bit`, user types); reject such a key at bind time rather than
+        // panicking mid-group.
+        if !crate::expr::is_orderable(bound.ty()) {
+            return Err(BindError::feature_not_supported(format!(
+                "GROUP BY on type {} is not supported yet",
+                bound.ty().name()
+            )));
+        }
         keys.push(bound);
     }
     Ok(keys)
+}
+
+/// Bind one non-ordinal GROUP BY key. PG resolves a bare name as an input column
+/// first (via the scope), then falls back to a select-list output alias — so
+/// `SELECT a AS z FROM t GROUP BY z` groups by `a`. Qualified names and
+/// expressions bind against the scope only, as in PG.
+fn bind_group_key(
+    expr: &ast::Expr,
+    scope: &Scope,
+    columns: &[OutputColumn],
+    projections: &[BoundExpr],
+) -> Result<BoundExpr, BindError> {
+    match bind_scalar(expr, scope) {
+        Ok(bound) => Ok(bound),
+        // Only a bare, unresolved name falls back to an output alias.
+        Err(e) if e.code == sqlstate::UNDEFINED_COLUMN => {
+            if let ast::Expr::Identifier(ident) = expr {
+                let name = normalize_ident(ident);
+                let mut hit: Option<usize> = None;
+                for (i, col) in columns.iter().enumerate() {
+                    if col.name == name {
+                        if hit.is_some() {
+                            return Err(BindError::new(
+                                sqlstate::AMBIGUOUS_COLUMN,
+                                format!("GROUP BY \"{name}\" is ambiguous"),
+                            ));
+                        }
+                        hit = Some(i);
+                    }
+                }
+                if let Some(i) = hit {
+                    return Ok(projections[i].clone());
+                }
+            }
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// A bare unsigned integer literal used as a GROUP BY ordinal, if any. `1 + 1` is
@@ -1339,7 +1395,6 @@ fn rewrite_over_aggregate(
             arg,
             input_ty,
             ret,
-            distinct,
         } => {
             if arg.as_ref().is_some_and(|a| a.contains_aggregate()) {
                 return Err(BindError::new(
@@ -1353,7 +1408,6 @@ fn rewrite_over_aggregate(
                 arg: arg.map(|a| *a),
                 input_ty,
                 ret,
-                distinct,
             });
             Ok(BoundExpr::ColumnRef { index, ty: ret })
         }
@@ -1936,6 +1990,44 @@ mod tests {
             bind_err("SELECT id, count(*) FROM t GROUP BY 5").code,
             sqlstate::INVALID_COLUMN_REFERENCE
         );
+    }
+
+    #[test]
+    fn min_max_reject_boolean() {
+        // PG has no min/max(boolean) even though bool is orderable for ORDER BY.
+        assert_eq!(bind_err("SELECT max(flag) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
+        assert_eq!(bind_err("SELECT min(flag) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
+    }
+
+    #[test]
+    fn group_by_resolves_output_alias() {
+        // `z` is not an input column; it resolves to the select-list alias for id.
+        let (group_exprs, _a, _p, _h) = agg_of("SELECT id AS z, count(*) FROM t GROUP BY z");
+        assert_eq!(group_exprs, vec![BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 }]);
+    }
+
+    #[test]
+    fn parameterless_count_has_pg_message() {
+        let e = bind_err("SELECT count()");
+        assert_eq!(e.code, sqlstate::WRONG_OBJECT_TYPE);
+        assert_eq!(
+            e.message,
+            "count(*) must be used to call a parameterless aggregate function"
+        );
+    }
+
+    #[test]
+    fn wrong_arity_aggregate_names_argument_types() {
+        let e = bind_err("SELECT min(id, big) FROM t");
+        assert_eq!(e.code, sqlstate::UNDEFINED_FUNCTION);
+        assert_eq!(e.message, "function min(integer, bigint) does not exist");
+    }
+
+    #[test]
+    fn wildcard_non_count_aggregate_is_undefined() {
+        let e = bind_err("SELECT sum(*) FROM t");
+        assert_eq!(e.code, sqlstate::UNDEFINED_FUNCTION);
+        assert_eq!(e.message, "function sum() does not exist");
     }
 
     #[test]

@@ -508,9 +508,11 @@ pub(crate) fn agg_return_type(func: AggFn, input_ty: PgType) -> Result<PgType, B
         // COUNT is handled by the caller (arg-less for `*`); COUNT(expr) counts
         // non-null values of any type and returns bigint.
         AggFn::Count => Ok(PgType::Int8),
-        // MIN/MAX return the argument type, for any type the executor can order.
+        // MIN/MAX return the argument type. PG defines them for every orderable
+        // type *except* boolean (users reach for bool_and/bool_or there), so
+        // `is_orderable` — which includes bool for ORDER BY — is too broad here.
         AggFn::Min | AggFn::Max => {
-            if crate::expr::is_orderable(input_ty) {
+            if input_ty != PgType::Bool && crate::expr::is_orderable(input_ty) {
                 Ok(input_ty)
             } else {
                 Err(unsupported())
@@ -1043,25 +1045,60 @@ fn bind_aggregate(
             arg: None,
             input_ty: PgType::Int8,
             ret: PgType::Int8,
-            distinct: false,
         }));
     }
 
-    // Every supported aggregate is unary. Bind the single argument (an unknown
-    // literal resolves to text, as in a bare projection).
+    // A row-wildcard argument to any other aggregate (`sum(*)`) has no overload;
+    // PG reports it like a zero-argument call.
+    if list.args.iter().any(|a| {
+        matches!(
+            a,
+            ast::FunctionArg::Unnamed(
+                ast::FunctionArgExpr::Wildcard | ast::FunctionArgExpr::QualifiedWildcard(_)
+            )
+        )
+    }) {
+        return Err(BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!("function {name}() does not exist"),
+        ));
+    }
+    // A parameterless call: `count()` has PG's dedicated hint; the rest are just
+    // an unresolved zero-argument overload.
+    if list.args.is_empty() {
+        return Err(if agg == AggFn::Count {
+            BindError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "count(*) must be used to call a parameterless aggregate function",
+            )
+        } else {
+            BindError::new(
+                sqlstate::UNDEFINED_FUNCTION,
+                format!("function {name}() does not exist"),
+            )
+        });
+    }
+
+    // Every supported aggregate is unary. Bind each argument (an unknown literal
+    // resolves to text, as in a bare projection) so a wrong-arity error can name
+    // the actual argument types, as PG does.
     let arg_exprs = positional_arg_exprs(&list.args)?;
-    let [arg_expr] = arg_exprs.as_slice() else {
-        let types = arg_exprs
+    let mut bound = arg_exprs
+        .iter()
+        .map(|e| crate::expr::bind_scalar(e, scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    if bound.len() != 1 {
+        let types = bound
             .iter()
-            .map(|_| "?")
+            .map(|b| b.ty().name())
             .collect::<Vec<_>>()
             .join(", ");
         return Err(BindError::new(
             sqlstate::UNDEFINED_FUNCTION,
             format!("function {name}({types}) does not exist"),
         ));
-    };
-    let arg = crate::expr::bind_scalar(arg_expr, scope)?;
+    }
+    let arg = bound.pop().expect("exactly one argument");
     let input_ty = arg.ty();
     let ret = agg_return_type(agg, input_ty)?;
     Ok(Binding::Typed(BoundExpr::Aggregate {
@@ -1069,7 +1106,6 @@ fn bind_aggregate(
         arg: Some(Box::new(arg)),
         input_ty,
         ret,
-        distinct: false,
     }))
 }
 

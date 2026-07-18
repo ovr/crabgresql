@@ -8,6 +8,8 @@
 //! (or all-NULL) group.
 
 use std::cmp::Ordering;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crabgresql_binder::{AggFn, BoundAggregate};
 use crabgresql_types::{Numeric, PgType, Value, float};
@@ -176,6 +178,93 @@ impl Accumulator {
                 }
             }
         })
+    }
+}
+
+/// A hash of a group key that is *consistent with [`keys_equal`]*: two keys that
+/// group together always hash equal (collisions between distinct keys are fine —
+/// the caller resolves them with `keys_equal`). This lets the aggregate node find
+/// a row's group in O(1) instead of scanning every group.
+///
+/// Floats canonicalize `-0.0`→`0.0` and every `NaN` to one bit pattern (matching
+/// PG's grouping equality); numeric hashes via its `f64` value (equal numerics of
+/// different scale share it). Types whose equality is not a raw-field comparison
+/// (`timetz`, `interval`, `inet`, `cidr`) contribute nothing and land in a shared
+/// bucket that `keys_equal` then disambiguates.
+pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for (ty, v) in tys.iter().zip(values) {
+        if matches!(v, Value::Null) {
+            0u8.hash(&mut h);
+            continue;
+        }
+        1u8.hash(&mut h);
+        match ty {
+            PgType::Bool => {
+                if let Value::Bool(b) = v {
+                    b.hash(&mut h);
+                }
+            }
+            PgType::Int2 | PgType::Int4 | PgType::Int8 => as_i64(v).hash(&mut h),
+            PgType::Float4 | PgType::Float8 => canonical_f64(as_f64(v)).to_bits().hash(&mut h),
+            PgType::Numeric => canonical_f64(as_numeric(v).to_f64()).to_bits().hash(&mut h),
+            PgType::Text | PgType::Varchar | PgType::Name => text_of(v).hash(&mut h),
+            // bpchar ignores trailing blanks, as `compare_values` does.
+            PgType::Bpchar => text_of(v).trim_end_matches(' ').hash(&mut h),
+            PgType::Bytea => {
+                if let Value::Bytea(b) = v {
+                    b.hash(&mut h);
+                }
+            }
+            PgType::Date => {
+                if let Value::Date(d) = v {
+                    d.hash(&mut h);
+                }
+            }
+            PgType::Time => {
+                if let Value::Time(t) = v {
+                    t.hash(&mut h);
+                }
+            }
+            PgType::Timestamp => {
+                if let Value::Timestamp(t) = v {
+                    t.hash(&mut h);
+                }
+            }
+            PgType::TimestampTz => {
+                if let Value::TimestampTz(t) = v {
+                    t.hash(&mut h);
+                }
+            }
+            PgType::Uuid => {
+                if let Value::Uuid(u) = v {
+                    u.hash(&mut h);
+                }
+            }
+            // timetz/interval/inet/cidr (and anything else): equality is not a
+            // raw-field compare, so contribute nothing and rely on `keys_equal`.
+            _ => {}
+        }
+    }
+    h.finish()
+}
+
+/// Canonicalize a float for hashing so grouping-equal values hash equal:
+/// `-0.0`→`0.0` and every `NaN`→one representative.
+fn canonical_f64(x: f64) -> f64 {
+    if x.is_nan() {
+        f64::NAN
+    } else if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
+}
+
+fn text_of(v: &Value) -> &str {
+    match v {
+        Value::Text(s) => s,
+        _ => "",
     }
 }
 

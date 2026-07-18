@@ -22,6 +22,7 @@ pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
 pub const UNDEFINED_OBJECT: &str = "42704";
 pub const UNDEFINED_FUNCTION: &str = "42883";
 pub const AMBIGUOUS_FUNCTION: &str = "42725";
+pub const WRONG_OBJECT_TYPE: &str = "42809";
 pub const DUPLICATE_COLUMN: &str = "42701";
 pub const DUPLICATE_OBJECT: &str = "42710";
 pub const DUPLICATE_FUNCTION: &str = "42723";

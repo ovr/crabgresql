@@ -13,6 +13,7 @@ pub mod scalar_fns;
 mod special_fns;
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crabgresql_binder::{BoundAggregate, BoundExpr, SortKey, TableFn};
@@ -686,6 +687,10 @@ impl Aggregate {
     fn build(&mut self) -> Result<std::vec::IntoIter<Tuple>, ExecError> {
         let key_tys: Vec<_> = self.group_exprs.iter().map(BoundExpr::ty).collect();
         let mut groups: Vec<AggGroup> = Vec::new();
+        // Hash of each group's key → the indices of groups sharing that hash, so
+        // a row finds its group in ~O(1); `keys_equal` resolves hash collisions.
+        // Groups stay in first-seen order (accumulation follows scan order).
+        let mut lookup: HashMap<u64, Vec<usize>> = HashMap::new();
         // The implicit single group needs one seeded group so an empty input
         // still produces a row.
         if self.group_exprs.is_empty() {
@@ -703,12 +708,15 @@ impl Aggregate {
                     .iter()
                     .map(|e| eval(e, &row, self.ctx))
                     .collect::<Result<Vec<_>, _>>()?;
-                match groups
+                let bucket = lookup.entry(agg::hash_key(&key_tys, &key)).or_default();
+                match bucket
                     .iter()
-                    .position(|g| agg::keys_equal(&key_tys, &g.key, &key))
+                    .copied()
+                    .find(|&i| agg::keys_equal(&key_tys, &groups[i].key, &key))
                 {
                     Some(i) => i,
                     None => {
+                        let i = groups.len();
                         groups.push(AggGroup {
                             key,
                             accumulators: self
@@ -717,7 +725,8 @@ impl Aggregate {
                                 .map(agg::Accumulator::new)
                                 .collect(),
                         });
-                        groups.len() - 1
+                        bucket.push(i);
+                        i
                     }
                 }
             };
@@ -1642,6 +1651,60 @@ mod tests {
         let engine = agg_engine();
         let (_c, rows) = run_rows_on(&engine, "SELECT max(b) - min(b) AS span FROM t");
         assert_eq!(rows, vec![vec![Value::Int4(15)]]);
+    }
+
+    #[test]
+    fn group_by_null_key_forms_one_group() {
+        // Rows with a NULL group key group together (NULL == NULL), distinct from
+        // the non-NULL groups. Exercises the hash-grouping NULL path.
+        let engine = MemoryEngine::new();
+        let table = engine
+            .create_table(TableSchema {
+                name: "g".into(),
+                columns: vec![Column::new("k", PgType::Int4), Column::new("v", PgType::Int4)],
+            })
+            .unwrap();
+        let txn = wtxn();
+        for (k, v) in [(Some(1), 10), (None, 20), (Some(1), 5), (None, 7)] {
+            let k = k.map(Value::Int4).unwrap_or(Value::Null);
+            table.insert(vec![k, Value::Int4(v)], &txn);
+        }
+        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        // ORDER BY k with NULLS LAST-for-ASC (PG default) so the row order is fixed.
+        let (_c, rows) = run_rows_on(&engine, "SELECT k, count(*), sum(v) FROM g GROUP BY k ORDER BY k");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int8(2), Value::Int8(15)],
+                vec![Value::Null, Value::Int8(2), Value::Int8(27)],
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_float_treats_neg_zero_and_nan_like_pg() {
+        // -0.0 groups with 0.0, and NaN groups with NaN — the hash and keys_equal
+        // must agree on both. Two 0.0-family rows, two NaN rows.
+        let engine = MemoryEngine::new();
+        let table = engine
+            .create_table(TableSchema {
+                name: "f".into(),
+                columns: vec![Column::new("x", PgType::Float8)],
+            })
+            .unwrap();
+        let txn = wtxn();
+        for x in [0.0_f64, -0.0, f64::NAN, f64::NAN] {
+            table.insert(vec![Value::Float8(x)], &txn);
+        }
+        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        let (_c, rows) = run_rows_on(&engine, "SELECT count(*) FROM f GROUP BY x");
+        // Exactly two groups (the 0.0 family and the NaN family), each of size 2.
+        let mut counts: Vec<Value> = rows.into_iter().map(|r| r[0].clone()).collect();
+        counts.sort_by_key(|v| match v {
+            Value::Int8(n) => *n,
+            _ => -1,
+        });
+        assert_eq!(counts, vec![Value::Int8(2), Value::Int8(2)]);
     }
 
     #[test]

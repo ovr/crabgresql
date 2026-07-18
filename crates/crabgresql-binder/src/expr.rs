@@ -106,7 +106,6 @@ pub enum BoundExpr {
         input_ty: PgType,
         /// The aggregate's result type (see `agg_return_type`).
         ret: PgType,
-        distinct: bool,
     },
 }
 
@@ -120,7 +119,6 @@ pub struct BoundAggregate {
     pub arg: Option<BoundExpr>,
     pub input_ty: PgType,
     pub ret: PgType,
-    pub distinct: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
