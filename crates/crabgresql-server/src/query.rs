@@ -256,6 +256,10 @@ fn finalize_statement(
                 if ok {
                     // The commit fsyncs the WAL on the durable engine; a failure
                     // there is a system error, surfaced to the client.
+                    // TODO(perf): this blocking fsync runs on the tokio reactor
+                    // worker. Move statement execution onto a blocking pool (or
+                    // guard with block_in_place on multi-thread runtimes) so
+                    // concurrent committers don't stall the accept loop.
                     txnmgr.commit(txn.xid).map_err(commit_io_error)?;
                 } else {
                     txnmgr.abort(txn.xid);

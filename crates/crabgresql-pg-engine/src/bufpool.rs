@@ -142,7 +142,13 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Drop every cached page for a relation (used by TRUNCATE).
+    /// Drop every cached page for a relation (used by TRUNCATE). Unmaps and
+    /// cleans the frames but never touches `pins`: a frame a concurrent
+    /// `PinnedPage` still holds keeps `pins > 0`, so it is not chosen as an
+    /// eviction victim (no cross-relation aliasing) and its holder's `Drop`
+    /// decrements normally (no underflow). Once the holder drops, the frame is
+    /// clean and unmapped, hence reusable. (TRUNCATE remains non-transactional,
+    /// as documented — this only removes the crash/aliasing.)
     pub fn forget_relation(&self, rel: RelFileNode) {
         let mut map = self.map.lock().unwrap();
         for frame in &self.frames {
@@ -152,7 +158,6 @@ impl BufferPool {
                     map.remove(&tag);
                 }
                 fr.dirty = false;
-                fr.pins = 0;
                 fr.ref_bit = false;
             }
         }
@@ -192,7 +197,9 @@ impl<'a> PinnedPage<'a> {
 impl Drop for PinnedPage<'_> {
     fn drop(&mut self) {
         let mut fr = self.pool.frames[self.idx].lock().unwrap();
-        fr.pins -= 1;
+        // saturating: a concurrent forget_relation must never drive this to
+        // underflow even though it no longer resets pins.
+        fr.pins = fr.pins.saturating_sub(1);
         fr.ref_bit = true;
     }
 }
@@ -240,5 +247,28 @@ mod tests {
             p.modify(|page| page::add_item(page, b"x").unwrap());
         }
         held.read(|page| assert_eq!(page::get_item(page, 1).unwrap(), b"keep"));
+    }
+
+    #[test]
+    fn forget_relation_while_pinned_is_safe() {
+        let (_d, bp) = pool(4);
+        let rel = RelFileNode(1);
+        // Hold a pin on block 0 while the relation is forgotten (TRUNCATE).
+        let held = bp.pin(rel, 0).unwrap();
+        held.modify(|page| page::add_item(page, b"stale").unwrap());
+        bp.forget_relation(rel);
+        // Churn other pins: the still-pinned frame must not be reused underneath
+        // the live PinnedPage (no aliasing).
+        for b in 1..8 {
+            let p = bp.pin(RelFileNode(2), b).unwrap();
+            p.modify(|page| page::add_item(page, b"other").unwrap());
+        }
+        held.read(|page| assert_eq!(page::get_item(page, 1).unwrap(), b"stale"));
+        // Dropping the pin after forget must not underflow the pin count.
+        drop(held);
+        // A fresh pin of the forgotten block reads an initialized (empty) page,
+        // not the stale contents.
+        let fresh = bp.pin(rel, 0).unwrap();
+        fresh.read(|page| assert!(page::get_item(page, 1).is_none()));
     }
 }

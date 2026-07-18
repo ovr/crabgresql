@@ -105,6 +105,15 @@ impl RelCatalog {
             f.sync_data()?;
         }
         std::fs::rename(&tmp, &self.path)?;
+        // fsync the directory so the rename (and the relfilenode counter it
+        // carries) is durable; otherwise a crash can lose a committed table's
+        // catalog entry and revert `next`, letting a later CREATE reuse the
+        // relfilenode and collide with the orphaned data file.
+        if let Some(dir) = self.path.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            d.sync_all()?;
+        }
         Ok(())
     }
 }

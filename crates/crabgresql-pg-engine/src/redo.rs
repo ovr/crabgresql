@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use crabgresql_storage_api::Tid;
 use crabgresql_wal::{Lsn, RedoContext, RmgrRedo, WalError};
 
 use crate::EngineInner;
@@ -60,21 +59,6 @@ impl RmgrRedo for HeapRedo {
                 self.apply(rel, block, ctx.lsn, |pg| {
                     if let Some(item) = page::get_item_mut(pg, off) {
                         tuple::stamp_xmax(item, xmax, cmax);
-                    }
-                })?;
-            }
-            rec::HEAP_UPDATE => {
-                let rel = r.rel();
-                let ob = r.u32();
-                let oo = r.u16();
-                let xmax = r.xid();
-                let cmax = r.cid();
-                let nb = r.u32();
-                let no = r.u16();
-                self.apply(rel, ob, ctx.lsn, |pg| {
-                    if let Some(item) = page::get_item_mut(pg, oo) {
-                        tuple::stamp_xmax(item, xmax, cmax);
-                        tuple::set_ctid(item, Tid { block: nb, offset: no });
                     }
                 })?;
             }

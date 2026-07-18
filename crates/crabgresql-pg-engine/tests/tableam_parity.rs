@@ -317,6 +317,33 @@ fn concurrent_inserts_are_all_visible_with_distinct_tids() {
 }
 
 #[test]
+fn concurrent_updates_of_one_row_never_duplicate_it() {
+    // Regression: update stamps the old version atomically before placing the new
+    // one, so two racing updaters can't both leave a live successor. Each trial
+    // uses a fresh single-row table so the live count is unambiguous.
+    let h = setup();
+    for trial in 0..40 {
+        let table = h.engine.create_table(schema(&format!("t{trial}"))).unwrap();
+        let tid = insert_committed(&h.tm, &*table, vec![Value::Int4(0), Value::Text("v0".into())]);
+        std::thread::scope(|s| {
+            let table = &table;
+            let tm = &h.tm;
+            for w in 0..2i32 {
+                s.spawn(move || {
+                    let xid = tm.allocate_xid();
+                    let txn = tm.context(xid, CommandId::FIRST);
+                    table.update(tid, vec![Value::Int4(1000 + w), Value::Text("vN".into())], &txn);
+                    tm.commit(xid).unwrap();
+                });
+            }
+        });
+        let rows: Vec<Value> = table.scan(&read(&h.tm)).map(|(_, t)| t[0].clone()).collect();
+        assert_eq!(rows.len(), 1, "trial {trial}: exactly one live version, got {rows:?}");
+        assert!(matches!(rows[0], Value::Int4(1000) | Value::Int4(1001)));
+    }
+}
+
+#[test]
 fn scan_is_stable_against_concurrent_writes() {
     let h = setup();
     let table = h.engine.create_table(schema("t")).unwrap();

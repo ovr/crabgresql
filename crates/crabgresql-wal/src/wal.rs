@@ -1,7 +1,7 @@
 //! The append/flush WAL stream with group-commit fsync.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -132,12 +132,17 @@ impl Wal {
             // Become the flusher for everything appended so far.
             inner.flushing = true;
             let bytes = std::mem::take(&mut inner.unwritten);
-            let target = inner.written + bytes.len() as u64;
+            let start = inner.written;
+            let target = start + bytes.len() as u64;
             drop(inner);
 
+            // Positioned write at the logical offset `start`, never the OS file
+            // cursor: after a reopen the cursor is 0 but the log continues at
+            // `written`, and on a partial-write retry the cursor is desynced —
+            // both would otherwise corrupt the stream.
             let write_result = (|| -> Result<(), WalError> {
-                let mut file = self.file.lock().unwrap();
-                file.write_all(&bytes)?;
+                let file = self.file.lock().unwrap();
+                file.write_all_at(&bytes, start)?;
                 file.sync_data()?;
                 Ok(())
             })();
@@ -226,5 +231,76 @@ mod tests {
                 assert!(wal.flushed_lsn() >= lsn, "flush must be durable on return");
             }
         });
+    }
+
+    /// Decode every record in the on-disk WAL, returning `(xid, payload)` pairs.
+    fn read_all(dir: &Path) -> Vec<(Xid, Vec<u8>)> {
+        let bytes = std::fs::read(wal_path(dir)).unwrap();
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while let Some((rec, len)) = WalRecord::decode(&bytes[pos..]) {
+            out.push((rec.xid, rec.payload.to_vec()));
+            pos += len;
+        }
+        out
+    }
+
+    #[test]
+    fn appending_after_reopen_preserves_earlier_records() {
+        // Regression: flush must write at the logical offset, not the reset OS
+        // cursor, or the first append after a reopen clobbers the log head.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let wal = Wal::open(dir.path()).unwrap();
+            wal.append(RmgrId::HEAP, 0, Xid(3), b"first");
+            let l = wal.append(RmgrId::HEAP, 0, Xid(4), b"second");
+            wal.flush(l).unwrap();
+        }
+        {
+            // Reopen (cursor at 0, written at end-of-file) and append more.
+            let wal = Wal::open(dir.path()).unwrap();
+            wal.append(RmgrId::HEAP, 0, Xid(5), b"third");
+            let l = wal.append(RmgrId::HEAP, 0, Xid(6), b"fourth");
+            wal.flush(l).unwrap();
+        }
+        // All four records from both sessions must decode intact and in order.
+        assert_eq!(
+            read_all(dir.path()),
+            vec![
+                (Xid(3), b"first".to_vec()),
+                (Xid(4), b"second".to_vec()),
+                (Xid(5), b"third".to_vec()),
+                (Xid(6), b"fourth".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_to_discards_a_torn_tail_before_appending() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let valid_end;
+        {
+            let wal = Wal::open(dir.path()).unwrap();
+            wal.append(RmgrId::HEAP, 0, Xid(3), b"good");
+            valid_end = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3), &[]);
+            wal.flush(valid_end).unwrap();
+        }
+        // A crash leaves raw garbage on disk past the last valid record.
+        {
+            let mut f = OpenOptions::new().append(true).open(wal_path(dir.path())).unwrap();
+            f.write_all(&[0xAB; 37]).unwrap();
+        }
+        {
+            let wal = Wal::open(dir.path()).unwrap();
+            // Recovery computes `valid_end`; clamp to it (truncating the garbage),
+            // then continue appending cleanly.
+            wal.reset_to(valid_end).unwrap();
+            let l = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(10), &[]);
+            wal.flush(l).unwrap();
+        }
+        let recs = read_all(dir.path());
+        let xids: Vec<Xid> = recs.iter().map(|(x, _)| *x).collect();
+        assert_eq!(xids, vec![Xid(3), Xid(3), Xid(10)], "torn tail dropped, new record appended cleanly");
     }
 }

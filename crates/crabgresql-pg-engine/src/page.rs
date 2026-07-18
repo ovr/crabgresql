@@ -228,8 +228,10 @@ fn compute_checksum(p: &Page, blockno: u32) -> u16 {
     c = crc32c::crc32c_append(c, &p[OFF_CHECKSUM + 2..]);
     c ^= blockno;
     let folded = ((c >> 16) as u16) ^ (c as u16);
-    // Avoid a zero checksum so an all-zero (never-written) page is distinguishable.
-    folded | 0x0001
+    // Map into 1..=65535 so an all-zero (never-written) page stays distinguishable,
+    // without masking a whole detection bit the way `| 1` would (PostgreSQL's
+    // pg_checksum_page uses the same `(x % 65535) + 1`).
+    ((folded as u32 % 65535) + 1) as u16
 }
 
 /// Stamp the page's checksum for block `blockno` in place (called just before
@@ -296,6 +298,18 @@ mod tests {
         // The UNUSED slot is reused by the next insert.
         let reused = add_item(&mut p, b"dddd").unwrap();
         assert_eq!(reused, b);
+    }
+
+    #[test]
+    fn checksum_is_never_zero() {
+        // The zero-avoidance must never yield 0 (which would alias an all-zero
+        // page), across varied content and block numbers.
+        let mut p = new_page();
+        for b in 0..512u32 {
+            p[100] = (b & 0xff) as u8;
+            p[4000] = (b >> 1) as u8;
+            assert_ne!(compute_checksum(&p, b), 0);
+        }
     }
 
     #[test]

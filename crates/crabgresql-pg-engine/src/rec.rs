@@ -8,7 +8,8 @@ use crate::smgr::RelFileNode;
 // `info` byte opcodes for [`crabgresql_wal::RmgrId::HEAP`] records.
 pub const HEAP_INSERT: u8 = 1;
 pub const HEAP_DELETE: u8 = 2;
-pub const HEAP_UPDATE: u8 = 3;
+// opcode 3 (HEAP_UPDATE) retired: an update logs its old-version stamp as a
+// HEAP_DELETE and its new version as a HEAP_INSERT (see heap::update).
 pub const HEAP_VACUUM: u8 = 4;
 pub const HEAP_TRUNCATE: u8 = 5;
 
@@ -85,31 +86,6 @@ pub fn delete(rel: RelFileNode, block: u32, off: u16, xmax: Xid, cmax: CommandId
     w.u16(off);
     w.u64(xmax.0);
     w.u32(cmax.0);
-    w.0
-}
-
-/// The old-version stamp of an UPDATE: mark it deleted by `(xmax, cmax)` and
-/// point its forward `ctid` at the new version. The new version itself is logged
-/// as a separate self-contained [`insert`] record, so no single record has to
-/// touch two pages atomically.
-#[allow(clippy::too_many_arguments)]
-pub fn update_old(
-    rel: RelFileNode,
-    old_block: u32,
-    old_off: u16,
-    xmax: Xid,
-    cmax: CommandId,
-    new_block: u32,
-    new_off: u16,
-) -> Vec<u8> {
-    let mut w = W(Vec::new());
-    w.u32(rel.0);
-    w.u32(old_block);
-    w.u16(old_off);
-    w.u64(xmax.0);
-    w.u32(cmax.0);
-    w.u32(new_block);
-    w.u16(new_off);
     w.0
 }
 

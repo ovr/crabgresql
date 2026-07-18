@@ -392,8 +392,15 @@ impl TransactionManager {
     /// durable. Returns the I/O error if the WAL flush fails.
     pub fn commit(&self, xid: Xid) -> std::io::Result<()> {
         if xid.is_valid() {
-            if let Some(sink) = &self.sink {
-                sink.log_commit(xid)?;
+            if let Some(sink) = &self.sink
+                && let Err(e) = sink.log_commit(xid)
+            {
+                // A commit whose WAL never reached disk did not happen: abort the
+                // transaction so its XID is retired (otherwise it stays in the
+                // in-flight set forever, pinning the snapshot xmin horizon) and
+                // its versions become dead. Then surface the I/O error.
+                self.abort(xid);
+                return Err(e);
             }
             self.clog.set_committed(xid);
             self.xids.complete(xid);
@@ -570,6 +577,26 @@ mod tests {
         tm.commit(xid).unwrap();
         let after = tm.context(Xid::INVALID, CommandId::FIRST);
         assert!(satisfies_mvcc(&hdr, &after.snapshot, &after.clog, after.xid, after.cid));
+    }
+
+    struct FailingSink;
+    impl CommitSink for FailingSink {
+        fn log_commit(&self, _xid: Xid) -> std::io::Result<()> {
+            Err(std::io::Error::other("wal down"))
+        }
+        fn log_abort(&self, _xid: Xid) {}
+    }
+
+    #[test]
+    fn failed_commit_retires_the_xid() {
+        // A commit whose WAL flush fails must not leak the XID in the in-flight
+        // set (which would pin the snapshot horizon forever).
+        let sink: Arc<dyn CommitSink> = Arc::new(FailingSink);
+        let tm = TransactionManager::new_recovered(sink, Arc::new(Clog::new()), Xid::FIRST_NORMAL);
+        let xid = tm.allocate_xid();
+        assert!(tm.commit(xid).is_err());
+        assert_eq!(tm.clog().status(xid), XactStatus::Aborted);
+        assert!(!tm.snapshot().in_progress(xid), "XID must be retired from the in-flight set");
     }
 
     #[test]

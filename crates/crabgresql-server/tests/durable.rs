@@ -128,3 +128,36 @@ async fn committed_data_survives_restart() {
         shutdown(client, handle).await;
     }
 }
+
+#[tokio::test]
+async fn writes_after_a_restart_survive_the_next_restart() {
+    // Regression for the WAL-append-after-reopen corruption: the second boot must
+    // append+commit to an already-populated WAL, and the third boot must still
+    // recover both boots' rows.
+    let dir = tempfile::tempdir().unwrap();
+
+    // Boot 1: create + insert.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client.simple_query("CREATE TABLE t (id int)").await.unwrap();
+        client.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+        shutdown(client, handle).await;
+    }
+    // Boot 2: this append+commit goes into a non-empty (reopened) WAL.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client.simple_query("INSERT INTO t VALUES (2)").await.unwrap();
+        shutdown(client, handle).await;
+    }
+    // Boot 3: recovery replays a WAL that was appended to after a reopen.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await.unwrap();
+        let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+        assert_eq!(got, vec![Some("1"), Some("2")]);
+        shutdown(client, handle).await;
+    }
+}

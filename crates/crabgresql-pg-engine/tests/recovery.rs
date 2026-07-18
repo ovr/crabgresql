@@ -27,6 +27,9 @@ fn open(dir: &Path) -> (PgEngine, TransactionManager) {
     let engine = PgEngine::new(dir, Arc::clone(&wal), &mut reg).unwrap();
     let clog = Arc::new(Clog::new());
     let res = recover(dir, &reg, &clog).unwrap();
+    // Mirror the production startup (open_pg_engine): clamp the WAL to the last
+    // valid record before appending, so multi-restart cycles stay consistent.
+    wal.reset_to(res.end_of_wal).unwrap();
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
     let tm = TransactionManager::new_recovered(sink, clog, res.next_xid);
     (engine, tm)
@@ -156,4 +159,33 @@ fn replaying_the_same_wal_twice_is_idempotent() {
     let table2 = engine2.open_table("t").unwrap();
     // Still exactly 50 rows — no duplication from the second replay.
     assert_eq!(visible_ids(&tm2, &*table2).len(), 50);
+}
+
+#[test]
+fn writes_survive_across_multiple_restarts() {
+    // Regression for the WAL-append-after-reopen corruption: every boot writes
+    // and commits, so the WAL is appended to (not just read) after each reopen.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, tm) = open(dir.path());
+        let table = engine.create_table(schema()).unwrap();
+        let x = tm.allocate_xid();
+        insert(&*table, &tm.context(x, CommandId::FIRST), 1, "boot1");
+        tm.commit(x).unwrap();
+    }
+    {
+        let (engine, tm) = open(dir.path());
+        let table = engine.open_table("t").unwrap();
+        assert_eq!(visible_ids(&tm, &*table), vec![1]);
+        let x = tm.allocate_xid();
+        insert(&*table, &tm.context(x, CommandId::FIRST), 2, "boot2");
+        tm.commit(x).unwrap();
+    }
+    {
+        // Third boot: recovery must replay a WAL that was appended to after a
+        // reopen — both boots' rows must be present.
+        let (engine, tm) = open(dir.path());
+        let table = engine.open_table("t").unwrap();
+        assert_eq!(visible_ids(&tm, &*table), vec![1, 2]);
+    }
 }

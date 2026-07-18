@@ -89,6 +89,35 @@ impl HeapTable {
             self.insert_hint.store(fresh, Ordering::Relaxed);
         }
     }
+
+    /// Atomically mark the version at `tid` deleted by `txn`, under the page's
+    /// write lock, logging a HEAP_DELETE. Returns `true` if it was live and got
+    /// stamped, `false` if the tid is gone or already deleted. This single
+    /// critical section is the serialization point shared by `delete` and
+    /// `update`, so concurrent modifications of the same row cannot both succeed.
+    fn stamp_deleted(&self, tid: Tid, txn: &TxnContext) -> bool {
+        if tid.block >= Self::io(self.engine.bufpool.smgr().nblocks(self.rel)) {
+            return false;
+        }
+        let page = Self::io(self.engine.bufpool.pin(self.rel, tid.block));
+        page.modify(|pg| {
+            let Some(item) = page::get_item_mut(pg, tid.offset) else {
+                return false;
+            };
+            if !is_live(&tuple::decode_header(item).hdr, &txn.clog) {
+                return false;
+            }
+            tuple::stamp_xmax(item, txn.xid, txn.cid);
+            let lsn = self.engine.wal.append(
+                RmgrId::HEAP,
+                rec::HEAP_DELETE,
+                txn.xid,
+                &rec::delete(self.rel, tid.block, tid.offset, txn.xid, txn.cid),
+            );
+            page::set_lsn(pg, lsn.0);
+            true
+        })
+    }
 }
 
 /// A version is still updatable/deletable unless a committed transaction deleted
@@ -140,72 +169,30 @@ impl TableAm for HeapTable {
     }
 
     fn update(&self, tid: Tid, tuple: Tuple, txn: &TxnContext) -> UpdateResult {
-        // Liveness check on the old version before we place anything, so a
-        // vanished row never leaves an orphan new version behind.
-        let old_live = {
-            let page = Self::io(self.engine.bufpool.pin(self.rel, tid.block));
-            page.read(|pg| {
-                page::get_item(pg, tid.offset)
-                    .map(|b| is_live(&tuple::decode_header(b).hdr, &txn.clog))
-            })
-        };
-        match old_live {
-            Some(true) => {}
-            _ => return UpdateResult::NotFound,
+        // Stamp the old version deleted-by-us FIRST, atomically under its page
+        // lock (`stamp_deleted` is the serialization point). Two concurrent
+        // updaters of the same row therefore serialize: the loser sees xmax
+        // already set, gets `false`, and inserts no new version — so the row
+        // never ends up with two live successors. Only after winning that race do
+        // we place the new version.
+        if !self.stamp_deleted(tid, txn) {
+            return UpdateResult::NotFound;
         }
-
-        // Place the new version (its own self-contained HEAP_INSERT).
+        // The old tuple's forward ctid is left pointing at itself; the
+        // update-chain link is only consumed by EvalPlanQual, which is deferred
+        // (P6).
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
         let new_bytes = tuple::encode_tuple(&tuple, &hdr, Tid { block: 0, offset: 0 });
-        let new_tid = self.place(txn.xid, &new_bytes);
-
-        // Stamp the old version deleted-by-us and forward-link it to the new one.
-        let page = Self::io(self.engine.bufpool.pin(self.rel, tid.block));
-        page.modify(|pg| {
-            let item = page::get_item_mut(pg, tid.offset).unwrap();
-            tuple::stamp_xmax(item, txn.xid, txn.cid);
-            tuple::set_ctid(item, new_tid);
-            let lsn = self.engine.wal.append(
-                RmgrId::HEAP,
-                rec::HEAP_UPDATE,
-                txn.xid,
-                &rec::update_old(
-                    self.rel,
-                    tid.block,
-                    tid.offset,
-                    txn.xid,
-                    txn.cid,
-                    new_tid.block,
-                    new_tid.offset,
-                ),
-            );
-            page::set_lsn(pg, lsn.0);
-        });
+        self.place(txn.xid, &new_bytes);
         UpdateResult::Updated
     }
 
     fn delete(&self, tid: Tid, txn: &TxnContext) -> DeleteResult {
-        if tid.block >= Self::io(self.engine.bufpool.smgr().nblocks(self.rel)) {
-            return DeleteResult::NotFound;
-        }
-        let page = Self::io(self.engine.bufpool.pin(self.rel, tid.block));
-        page.modify(|pg| {
-            let Some(item) = page::get_item_mut(pg, tid.offset) else {
-                return DeleteResult::NotFound;
-            };
-            if !is_live(&tuple::decode_header(item).hdr, &txn.clog) {
-                return DeleteResult::NotFound;
-            }
-            tuple::stamp_xmax(item, txn.xid, txn.cid);
-            let lsn = self.engine.wal.append(
-                RmgrId::HEAP,
-                rec::HEAP_DELETE,
-                txn.xid,
-                &rec::delete(self.rel, tid.block, tid.offset, txn.xid, txn.cid),
-            );
-            page::set_lsn(pg, lsn.0);
+        if self.stamp_deleted(tid, txn) {
             DeleteResult::Deleted
-        })
+        } else {
+            DeleteResult::NotFound
+        }
     }
 
     fn truncate(&self, txn: &TxnContext) {
