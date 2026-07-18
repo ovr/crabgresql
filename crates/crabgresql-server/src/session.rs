@@ -1,5 +1,7 @@
-//! Per-connection session state (GUCs). Grows a temp-table catalog in a later
-//! milestone; for now it carries the settings runtime evaluation depends on.
+//! Per-connection session state: GUCs, the temp-table catalog, and the current
+//! transaction. The wire-facing control-flow status (`tx_status`, the RFQ
+//! `I`/`T`/`E` byte) and the data-level transaction ([`ActiveTxn`], the XID and
+//! snapshot MVCC runs against) are tracked side by side.
 
 use std::sync::Arc;
 
@@ -7,15 +9,50 @@ use crabgresql_executor::ExecContext;
 use crabgresql_memory_storage::MemoryEngine;
 use crabgresql_pg_wire::TransactionStatus;
 use crabgresql_storage_api::TableEngine;
+use crabgresql_txn::{CommandId, IsolationLevel, Snapshot, TransactionManager, Xid};
+
+/// The data-level state of an explicit `BEGIN … COMMIT/ROLLBACK` block. Separate
+/// from [`TransactionStatus`], which is the wire control-flow byte: this holds
+/// what MVCC needs.
+pub struct ActiveTxn {
+    /// The block's XID, allocated lazily on its first write. Read-only
+    /// transactions never consume one, matching PostgreSQL.
+    pub xid: Option<Xid>,
+    pub iso: IsolationLevel,
+    /// REPEATABLE READ (and above) freeze one snapshot for the whole block, set
+    /// on the first statement; READ COMMITTED leaves this `None` and takes a
+    /// fresh snapshot per statement.
+    pub snapshot: Option<Snapshot>,
+    /// Command counter: each statement in the block runs at the next `cid`, so a
+    /// later statement sees earlier ones' writes.
+    pub cid: CommandId,
+}
+
+impl ActiveTxn {
+    pub fn new(iso: IsolationLevel) -> Self {
+        ActiveTxn {
+            xid: None,
+            iso,
+            snapshot: None,
+            cid: CommandId::FIRST,
+        }
+    }
+}
 
 pub struct Session {
     /// `extra_float_digits` GUC — controls float→text output precision.
     pub extra_float_digits: i32,
     /// Current transaction state, reported in every `ReadyForQuery`. `Idle`
     /// outside a block, `InTransaction` after `BEGIN`, `Failed` once a statement
-    /// errors inside a block (only `COMMIT`/`ROLLBACK` clear it). Real MVCC
-    /// rollback of data is M2; this only tracks the control-flow state.
+    /// errors inside a block (only `COMMIT`/`ROLLBACK` clear it).
     pub tx_status: TransactionStatus,
+    /// The data-level transaction backing an explicit block: `Some` between
+    /// `BEGIN` and its `COMMIT`/`ROLLBACK`, `None` under autocommit (each
+    /// statement is then its own implicit transaction).
+    pub xact: Option<ActiveTxn>,
+    /// The shared transaction manager, held so an abandoned block can be aborted
+    /// when the session is dropped (see the [`Drop`] impl).
+    pub txnmgr: Arc<TransactionManager>,
     /// Session-local temp-table catalog (PG's `pg_temp`). Searched before the
     /// shared global engine, so a `CREATE TEMP TABLE` shadows a same-named
     /// permanent table. Dropped with the session on disconnect — that is the
@@ -24,11 +61,13 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new() -> Self {
+    pub fn new(txnmgr: Arc<TransactionManager>) -> Self {
         // PG's default since v12.
         Self {
             extra_float_digits: 1,
             tx_status: TransactionStatus::Idle,
+            xact: None,
+            txnmgr,
             temp: Arc::new(MemoryEngine::new()),
         }
     }
@@ -40,8 +79,15 @@ impl Session {
     }
 }
 
-impl Default for Session {
-    fn default() -> Self {
-        Self::new()
+impl Drop for Session {
+    /// If the client disconnects with an explicit block still open, abort its
+    /// XID so its writes become dead and the XID is retired from the in-flight
+    /// set — otherwise it would pin the snapshot horizon forever and leave the
+    /// rows it touched un-modifiable. Autocommit statements are already finalized
+    /// at the statement boundary, so only an open block needs this.
+    fn drop(&mut self) {
+        if let Some(active) = self.xact.take() {
+            self.txnmgr.abort(active.xid.unwrap_or(Xid::INVALID));
+        }
     }
 }

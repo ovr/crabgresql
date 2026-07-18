@@ -1,20 +1,55 @@
 //! Storage engine API: the `TableEngine` / `TableAm` extension point.
 //!
-//! M1 scope: create/open/scan/insert/update/delete addressed by `Tid`, no
-//! snapshots. When crabgresql-txn lands (M2), the methods grow snapshot and
-//! transaction parameters and `update`/`delete` report conflict info for
-//! EvalPlanQual — see docs/ARCHITECTURE.md §1.3.
+//! Every data method carries a [`TxnContext`]: the engine judges visibility
+//! against the caller's snapshot and stamps writes with the caller's XID, so
+//! **MVCC lives in the engine while snapshots and XIDs stay the core's job**
+//! (docs/ARCHITECTURE.md §1.3). `crabgresql-memory-storage` is the reference
+//! implementation of this contract; `crabgresql-pg-engine` (the durable heap
+//! engine) is the canonical consumer the shapes here are designed for — hence a
+//! real `(block, offset)` [`Tid`] rather than an opaque scalar.
 
 use std::sync::Arc;
 
+use crabgresql_txn::{Clog, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
+
+pub use crabgresql_txn as txn;
 
 /// A materialized row. Column order matches the table schema.
 pub type Tuple = Vec<Value>;
 
-/// Row identity: stable for the lifetime of a row, never reused within a
-/// table. An opaque scalar until pg-engine gives it (page, slot) structure.
-pub type Tid = u64;
+/// Row identity — PostgreSQL's `ctid`: the physical `(block, offset)` address of
+/// a tuple version. Stable for a version's lifetime and never reused while the
+/// version lives. The heap engine fills both fields from the page it lands on;
+/// the in-memory engine synthesizes them from a monotonic counter (`block` the
+/// high bits, `offset` the low), so its tids are just as opaque but share the
+/// type the heap engine needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Tid {
+    pub block: u32,
+    pub offset: u16,
+}
+
+impl Tid {
+    pub const fn new(block: u32, offset: u16) -> Self {
+        Tid { block, offset }
+    }
+
+    /// A single monotonic key over `(block, offset)` — the sort/lookup order for
+    /// engines that keep versions in one ordered vector.
+    pub const fn packed(self) -> u64 {
+        ((self.block as u64) << 16) | self.offset as u64
+    }
+
+    /// Inverse of [`Tid::packed`]: pack a monotonic counter into a `(block,
+    /// offset)` pair (used by the in-memory engine).
+    pub const fn from_packed(n: u64) -> Self {
+        Tid {
+            block: (n >> 16) as u32,
+            offset: (n & 0xffff) as u16,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Column {
@@ -57,12 +92,19 @@ pub enum StorageError {
     TableNotFound(String),
 }
 
-/// Outcome of `TableAm::update`. `NotFound` (row vanished under us) is the
-/// M2 seam where EvalPlanQual conflict info will live.
+/// Outcome of `TableAm::update`.
+///
+/// `Conflict` is the EvalPlanQual / serialization seam: the row the caller
+/// meant to update was updated or deleted by another transaction that committed
+/// after the caller's snapshot. `updater` is that transaction (whom to wait on
+/// or abort against); `latest` is the newest live version's tid to re-read
+/// under READ COMMITTED. The in-memory engine does not yet raise it — conflict
+/// handling arrives with the isolation work (P6) — but the shape is fixed here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateResult {
     Updated,
     NotFound,
+    Conflict { updater: Xid, latest: Option<Tid> },
 }
 
 /// Outcome of `TableAm::delete`, mirroring [`UpdateResult`].
@@ -70,35 +112,45 @@ pub enum UpdateResult {
 pub enum DeleteResult {
     Deleted,
     NotFound,
+    Conflict { updater: Xid, latest: Option<Tid> },
 }
 
-/// Table access: scans and modifications on one table.
+/// Table access: scans and modifications on one table, all judged against the
+/// caller's [`TxnContext`].
 pub trait TableAm: Send + Sync {
     fn schema(&self) -> &TableSchema;
 
-    /// Full scan. The iterator sees a stable snapshot of the table as of the
-    /// call (statement-level consistency until real MVCC snapshots exist), so
-    /// a DML statement never re-visits rows it modified itself.
-    fn scan(&self) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send>;
+    /// Full scan yielding only the versions visible to `txn`'s snapshot. The
+    /// iterator captures the snapshot up front, so a DML statement never
+    /// re-visits rows it modified itself (the reader's own new versions carry
+    /// the reader's command id and stay invisible to the same command).
+    fn scan(&self, txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send>;
 
-    /// The tuple must have exactly `schema().columns.len()` values in schema
-    /// order — executors index tuples by schema position and rely on this.
-    fn insert(&self, tuple: Tuple) -> Tid;
+    /// Fetch one version by tid if it is visible to `txn` — the re-read
+    /// EvalPlanQual needs after a conflict, and a point lookup for indexes.
+    fn fetch(&self, tid: Tid, txn: &TxnContext) -> Option<Tuple>;
 
-    /// Replace the row identified by `tid`. The tuple contract matches
-    /// [`TableAm::insert`].
-    fn update(&self, tid: Tid, tuple: Tuple) -> UpdateResult;
+    /// Insert a new version stamped with `txn`'s XID. The tuple must have
+    /// exactly `schema().columns.len()` values in schema order — executors index
+    /// tuples by schema position and rely on this.
+    fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Tid;
 
-    fn delete(&self, tid: Tid) -> DeleteResult;
+    /// Replace the version identified by `tid`: the old version is marked
+    /// deleted by `txn` and a new version holding `tuple` is inserted. The tuple
+    /// contract matches [`TableAm::insert`].
+    fn update(&self, tid: Tid, tuple: Tuple, txn: &TxnContext) -> UpdateResult;
+
+    /// Mark the version identified by `tid` deleted by `txn`.
+    fn delete(&self, tid: Tid, txn: &TxnContext) -> DeleteResult;
 
     /// Apply a batch of replacements, returning how many rows were found and
     /// updated (vanished tids are skipped, not counted). Engines should
     /// override this to apply the whole batch under one lock — per-row calls
     /// make a large UPDATE quadratic.
-    fn update_many(&self, updates: Vec<(Tid, Tuple)>) -> u64 {
+    fn update_many(&self, updates: Vec<(Tid, Tuple)>, txn: &TxnContext) -> u64 {
         let mut applied = 0;
         for (tid, tuple) in updates {
-            if self.update(tid, tuple) == UpdateResult::Updated {
+            if self.update(tid, tuple, txn) == UpdateResult::Updated {
                 applied += 1;
             }
         }
@@ -107,10 +159,10 @@ pub trait TableAm: Send + Sync {
 
     /// Batch counterpart of [`TableAm::delete`], mirroring
     /// [`TableAm::update_many`].
-    fn delete_many(&self, tids: Vec<Tid>) -> u64 {
+    fn delete_many(&self, tids: Vec<Tid>, txn: &TxnContext) -> u64 {
         let mut applied = 0;
         for tid in tids {
-            if self.delete(tid) == DeleteResult::Deleted {
+            if self.delete(tid, txn) == DeleteResult::Deleted {
                 applied += 1;
             }
         }
@@ -120,10 +172,17 @@ pub trait TableAm: Send + Sync {
     /// Remove every row (TRUNCATE). Row identity is not preserved: engines need
     /// not keep tids reusable after a truncate. The default scans and deletes;
     /// engines should override with a whole-table reset.
-    fn truncate(&self) {
-        let tids: Vec<Tid> = self.scan().map(|(tid, _)| tid).collect();
-        self.delete_many(tids);
+    fn truncate(&self, txn: &TxnContext) {
+        let tids: Vec<Tid> = self.scan(txn).map(|(tid, _)| tid).collect();
+        self.delete_many(tids, txn);
     }
+
+    /// Reclaim versions dead to every transaction at or before `oldest`. A
+    /// version is reclaimable only if its deleter **committed** — `clog` decides
+    /// that; a version stamped by an aborted or in-flight deleter is still live.
+    /// The default is a no-op: the in-memory engine keeps dead versions until it
+    /// is asked to vacuum, and there is no background vacuum before M5.
+    fn vacuum(&self, _oldest: Xid, _clog: &Clog) {}
 }
 
 /// Engine factory: `CREATE TABLE ... USING <engine>`.

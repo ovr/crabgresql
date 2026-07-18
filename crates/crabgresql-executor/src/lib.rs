@@ -18,6 +18,7 @@ use crabgresql_binder::{BoundExpr, SortKey, TableFn};
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_planner::{PhysicalJoinInput, PhysicalPlan};
 use crabgresql_storage_api::{TableAm, Tid, Tuple};
+use crabgresql_txn::TxnContext;
 use crabgresql_types::Value;
 
 use eval::eval;
@@ -84,7 +85,11 @@ pub enum Execution {
     Deleted(u64),
 }
 
-pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecError> {
+pub fn execute(
+    plan: PhysicalPlan,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<Execution, ExecError> {
     match plan {
         PhysicalPlan::Values {
             columns,
@@ -106,7 +111,7 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
             predicate,
             sort,
         } => project_pipeline(
-            Box::new(SeqScan::new(&table)),
+            Box::new(SeqScan::new(&table, txn)),
             projections,
             predicate,
             sort,
@@ -123,7 +128,7 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
             // Stream the source's rows straight into this level's pipeline. A
             // single FROM reference needs no materialization; buffering waits
             // for multi-reference CTEs and joins.
-            let Execution::Rows { node, .. } = execute(*source, ctx)? else {
+            let Execution::Rows { node, .. } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
                     "subquery source did not produce a row set",
@@ -155,18 +160,18 @@ pub fn execute(plan: PhysicalPlan, ctx: ExecContext) -> Result<Execution, ExecEr
         } => {
             let mut sources = Vec::with_capacity(inputs.len());
             for input in inputs {
-                sources.push(build_join_source(input, ctx)?);
+                sources.push(build_join_source(input, ctx, txn)?);
             }
             let cross = Box::new(CrossJoin::new(sources)?);
             project_pipeline(cross, projections, predicate, sort, columns, ctx)
         }
-        PhysicalPlan::Insert { table, rows } => execute_insert(&table, &rows, ctx),
+        PhysicalPlan::Insert { table, rows } => execute_insert(&table, &rows, ctx, txn),
         PhysicalPlan::Update {
             table,
             predicate,
             assignments,
-        } => execute_update(&table, &predicate, &assignments, ctx),
-        PhysicalPlan::Delete { table, predicate } => execute_delete(&table, &predicate, ctx),
+        } => execute_update(&table, &predicate, &assignments, ctx, txn),
+        PhysicalPlan::Delete { table, predicate } => execute_delete(&table, &predicate, ctx, txn),
     }
 }
 
@@ -197,13 +202,15 @@ fn project_pipeline(
     Ok(Execution::Rows { columns, node })
 }
 
-/// Statement atomicity without a transaction engine: evaluate everything
-/// first, mutate only after nothing can fail. A failure in a later row must
-/// not leave earlier rows behind.
+/// Statement atomicity: evaluate everything first, mutate only after nothing
+/// can fail, so a failure in a later row leaves no earlier rows behind. The
+/// writes are stamped with `txn`'s XID and become durable/visible only when the
+/// transaction commits.
 fn execute_insert(
     table: &Arc<dyn TableAm>,
     rows: &[Vec<BoundExpr>],
     ctx: ExecContext,
+    txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let mut tuples: Vec<Tuple> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -215,26 +222,26 @@ fn execute_insert(
     }
     let inserted = tuples.len() as u64;
     for tuple in tuples {
-        table.insert(tuple);
+        table.insert(tuple, txn);
     }
     Ok(Execution::Inserted(inserted))
 }
 
-/// KNOWN M2 GAP — DML statements are not isolated from concurrent writers:
-/// predicates evaluate against the scan snapshot, whole tuples are written
-/// back, and a vanished row (NotFound) is skipped, not re-evaluated. Two
-/// concurrent UPDATEs of one row are last-writer-wins. Row locks, MVCC and
-/// the EvalPlanQual recheck that fix this arrive with crabgresql-txn in M2.
+/// The scan sees `txn`'s snapshot, and the new versions it writes carry `txn`'s
+/// command id, so the statement never re-visits rows it wrote itself (no
+/// Halloween problem). A row that vanished under us (`NotFound`) is skipped, not
+/// counted. Cross-transaction write-write conflicts still resolve last-writer-
+/// wins here — EvalPlanQual (READ COMMITTED) and the 40001 abort (REPEATABLE
+/// READ) that make this correct arrive with the isolation work (P6).
 fn execute_update(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
     ctx: ExecContext,
+    txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    // The scan snapshot is stable, so the statement never re-visits rows it
-    // wrote itself (no Halloween problem).
     let mut pending: Vec<(Tid, Tuple)> = Vec::new();
-    for (tid, old) in table.scan() {
+    for (tid, old) in table.scan(txn) {
         if !predicate_holds(predicate, &old, ctx)? {
             continue;
         }
@@ -245,7 +252,7 @@ fn execute_update(
         }
         pending.push((tid, new));
     }
-    Ok(Execution::Updated(table.update_many(pending)))
+    Ok(Execution::Updated(table.update_many(pending, txn)))
 }
 
 /// See the concurrency note on [`execute_update`].
@@ -253,14 +260,15 @@ fn execute_delete(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     ctx: ExecContext,
+    txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let mut pending: Vec<Tid> = Vec::new();
-    for (tid, tuple) in table.scan() {
+    for (tid, tuple) in table.scan(txn) {
         if predicate_holds(predicate, &tuple, ctx)? {
             pending.push(tid);
         }
     }
-    Ok(Execution::Deleted(table.delete_many(pending)))
+    Ok(Execution::Deleted(table.delete_many(pending, txn)))
 }
 
 /// WHERE keeps a row only when the predicate is exactly true: false and NULL
@@ -387,14 +395,15 @@ fn pg_input_error_info_row(args: &[Value]) -> Tuple {
 fn build_join_source(
     input: PhysicalJoinInput,
     ctx: ExecContext,
+    txn: &TxnContext,
 ) -> Result<Box<dyn ExecNode>, ExecError> {
     Ok(match input {
-        PhysicalJoinInput::Scan(table) => Box::new(SeqScan::new(&table)),
+        PhysicalJoinInput::Scan(table) => Box::new(SeqScan::new(&table, txn)),
         PhysicalJoinInput::TableFunction { func, args } => {
             Box::new(TableFunctionSource::new(func, args, ctx))
         }
         PhysicalJoinInput::Subplan(source) => {
-            let Execution::Rows { node, .. } = execute(*source, ctx)? else {
+            let Execution::Rows { node, .. } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
                     "join source did not produce a row set",
@@ -593,9 +602,9 @@ pub struct SeqScan {
 }
 
 impl SeqScan {
-    pub fn new(table: &Arc<dyn TableAm>) -> Self {
+    pub fn new(table: &Arc<dyn TableAm>, txn: &TxnContext) -> Self {
         Self {
-            iter: Box::new(table.scan().map(|(_, tuple)| tuple)),
+            iter: Box::new(table.scan(txn).map(|(_, tuple)| tuple)),
         }
     }
 }
@@ -770,8 +779,34 @@ mod tests {
     use crabgresql_binder::{BinOp, UnaryOp};
     use crabgresql_memory_storage::MemoryEngine;
     use crabgresql_storage_api::{Column, TableEngine, TableSchema};
+    use crabgresql_txn::{CommandId, TransactionManager, TxnContext, Xid};
     use crabgresql_types::PgType;
     use eval::coerce_value;
+
+    thread_local! {
+        /// One transaction manager per test thread (libtest runs each test on its
+        /// own thread), so `wtxn`/`rtxn` share a commit log within a test but stay
+        /// isolated across tests. These tests exercise executor mechanics, not MVCC
+        /// visibility, so a write just commits immediately and a read sees it.
+        static TM: TransactionManager = TransactionManager::new();
+    }
+
+    /// A committed writer context: seeds/DML whose versions are visible to any
+    /// later read. Commits the XID up front, so a row stamped with it (or an old
+    /// version it deletes) is immediately committed.
+    fn wtxn() -> TxnContext {
+        TM.with(|tm| {
+            let xid = tm.allocate_xid();
+            tm.commit(xid);
+            tm.context(xid, CommandId::FIRST)
+        })
+    }
+
+    /// A reader with no XID of its own and a fresh snapshot that sees every
+    /// committed version.
+    fn rtxn() -> TxnContext {
+        TM.with(|tm| tm.context(Xid::INVALID, CommandId::FIRST))
+    }
 
     fn int4(v: i32) -> BoundExpr {
         BoundExpr::Const {
@@ -1015,9 +1050,10 @@ mod tests {
                 ],
             })
             .unwrap();
-        table.insert(vec![Value::Int4(1), Value::Text("one".into())]);
-        table.insert(vec![Value::Int4(2), Value::Text("two".into())]);
-        table.insert(vec![Value::Int4(3), Value::Null]);
+        let txn = wtxn();
+        table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
+        table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
+        table.insert(vec![Value::Int4(3), Value::Null], &txn);
         table
     }
 
@@ -1042,7 +1078,7 @@ mod tests {
             },
             int4(2),
         );
-        let mut node = Filter::new(Box::new(SeqScan::new(&table)), predicate, ExecContext::default());
+        let mut node = Filter::new(Box::new(SeqScan::new(&table, &rtxn())), predicate, ExecContext::default());
         assert_eq!(collect(&mut node).len(), 2);
 
         // WHERE label < 'zzz' — NULL label makes the predicate NULL: dropped.
@@ -1058,7 +1094,7 @@ mod tests {
                 ty: PgType::Text,
             },
         );
-        let mut node = Filter::new(Box::new(SeqScan::new(&table)), predicate, ExecContext::default());
+        let mut node = Filter::new(Box::new(SeqScan::new(&table, &rtxn())), predicate, ExecContext::default());
         assert_eq!(collect(&mut node).len(), 2);
     }
 
@@ -1074,7 +1110,7 @@ mod tests {
             },
             int4(10),
         )];
-        let mut node = Projection::new(Box::new(SeqScan::new(&table)), exprs, ExecContext::default());
+        let mut node = Projection::new(Box::new(SeqScan::new(&table, &rtxn())), exprs, ExecContext::default());
         assert_eq!(
             collect(&mut node),
             vec![
@@ -1102,7 +1138,8 @@ mod tests {
                 ty: PgType::Text,
             },
         ];
-        let projection = Projection::new(Box::new(SeqScan::new(&table)), exprs, ExecContext::default());
+        let projection =
+            Projection::new(Box::new(SeqScan::new(&table, &rtxn())), exprs, ExecContext::default());
         // ORDER BY label ASC: NULL (id 3) sorts last (NULLS LAST default), then
         // 'one' (id 1), 'two' (id 2).
         let key = SortKey {
@@ -1139,11 +1176,11 @@ mod tests {
                 int4(1),
             ),
         )];
-        let Execution::Updated(n) = execute_update(&table, &None, &assignments, ExecContext::default()).unwrap() else {
+        let Execution::Updated(n) = execute_update(&table, &None, &assignments, ExecContext::default(), &wtxn()).unwrap() else {
             panic!("expected Updated");
         };
         assert_eq!(n, 3);
-        let ids: Vec<Value> = table.scan().map(|(_, t)| t[0].clone()).collect();
+        let ids: Vec<Value> = table.scan(&rtxn()).map(|(_, t)| t[0].clone()).collect();
         assert_eq!(ids, vec![Value::Int4(2), Value::Int4(3), Value::Int4(4)]);
     }
 
@@ -1171,11 +1208,11 @@ mod tests {
                 ),
             ),
         )];
-        let Err(e) = execute_update(&table, &None, &assignments, ExecContext::default()) else {
+        let Err(e) = execute_update(&table, &None, &assignments, ExecContext::default(), &wtxn()) else {
             panic!("expected error");
         };
         assert_eq!(e.code, "22012");
-        let ids: Vec<Value> = table.scan().map(|(_, t)| t[0].clone()).collect();
+        let ids: Vec<Value> = table.scan(&rtxn()).map(|(_, t)| t[0].clone()).collect();
         assert_eq!(ids, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
     }
 
@@ -1191,11 +1228,11 @@ mod tests {
             },
             int4(1),
         ));
-        let Execution::Deleted(n) = execute_delete(&table, &predicate, ExecContext::default()).unwrap() else {
+        let Execution::Deleted(n) = execute_delete(&table, &predicate, ExecContext::default(), &wtxn()).unwrap() else {
             panic!("expected Deleted");
         };
         assert_eq!(n, 2);
-        assert_eq!(table.scan().count(), 1);
+        assert_eq!(table.scan(&rtxn()).count(), 1);
     }
 
     /// Parse → bind → plan → execute a query against a fresh engine.
@@ -1213,7 +1250,7 @@ mod tests {
         let logical = crabgresql_binder::bind_query(engine, query).unwrap();
         let physical = crabgresql_planner::plan(logical);
         let Execution::Rows { columns, mut node } =
-            execute(physical, ExecContext::default()).unwrap()
+            execute(physical, ExecContext::default(), &rtxn()).unwrap()
         else {
             panic!("expected rows");
         };
@@ -1261,7 +1298,7 @@ mod tests {
         let logical = crabgresql_binder::bind_query(&engine, query).unwrap();
         let physical = crabgresql_planner::plan(logical);
         let Execution::Rows { mut node, .. } =
-            execute(physical, ExecContext::default()).unwrap()
+            execute(physical, ExecContext::default(), &rtxn()).unwrap()
         else {
             panic!("expected rows");
         };
@@ -1522,8 +1559,9 @@ mod tests {
                 columns: vec![Column::new("n", PgType::Int4)],
             })
             .unwrap();
+        let txn = wtxn();
         for n in [1, 2, 3] {
-            table.insert(vec![Value::Int4(n)]);
+            table.insert(vec![Value::Int4(n)], &txn);
         }
         engine
     }

@@ -449,6 +449,132 @@ async fn full_crud_cycle_with_where() {
     assert_eq!(remaining[0].get(1), Some("ferris"));
 }
 
+/// The count of visible rows in `t`.
+async fn row_count(client: &tokio_postgres::Client, table: &str) -> usize {
+    let messages = client
+        .simple_query(&format!("SELECT * FROM {table}"))
+        .await
+        .unwrap();
+    rows(&messages).len()
+}
+
+#[tokio::test]
+async fn rollback_undoes_inserts() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN").await.unwrap();
+    client.simple_query("INSERT INTO t VALUES (1), (2)").await.unwrap();
+    // The transaction sees its own uncommitted inserts.
+    assert_eq!(row_count(&client, "t").await, 2);
+    client.simple_query("ROLLBACK").await.unwrap();
+    // After rollback the rows are gone — real MVCC undo, not just control flow.
+    assert_eq!(row_count(&client, "t").await, 0);
+}
+
+#[tokio::test]
+async fn rollback_restores_deleted_and_updated_rows() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer, label text)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
+
+    client.simple_query("BEGIN").await.unwrap();
+    client.simple_query("DELETE FROM t WHERE id = 1").await.unwrap();
+    client
+        .simple_query("UPDATE t SET label = 'B' WHERE id = 2")
+        .await
+        .unwrap();
+    // Inside the block the changes are visible: id=1 gone, id=2 now 'B'.
+    let msgs = client
+        .simple_query("SELECT label FROM t ORDER BY 1")
+        .await
+        .unwrap();
+    let seen: Vec<_> = rows(&msgs).iter().map(|r| r.get(0).unwrap().to_string()).collect();
+    assert_eq!(seen, ["B"]);
+
+    client.simple_query("ROLLBACK").await.unwrap();
+    // Both the delete and the update are undone.
+    let msgs = client
+        .simple_query("SELECT label FROM t ORDER BY 1")
+        .await
+        .unwrap();
+    let restored: Vec<_> = rows(&msgs).iter().map(|r| r.get(0).unwrap().to_string()).collect();
+    assert_eq!(restored, ["a", "b"]);
+}
+
+#[tokio::test]
+async fn commit_persists_changes() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN").await.unwrap();
+    client.simple_query("INSERT INTO t VALUES (7)").await.unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+    let msgs = client.simple_query("SELECT id FROM t").await.unwrap();
+    let r = rows(&msgs);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].get(0), Some("7"));
+}
+
+#[tokio::test]
+async fn uncommitted_changes_are_invisible_to_other_sessions() {
+    let port = spawn_server().await;
+    let writer = connect(port).await;
+    let reader = connect(port).await;
+    writer
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    writer.simple_query("BEGIN").await.unwrap();
+    writer.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+    // The writer sees its own row; a concurrent session does not.
+    assert_eq!(row_count(&writer, "t").await, 1);
+    assert_eq!(row_count(&reader, "t").await, 0);
+    writer.simple_query("COMMIT").await.unwrap();
+    // Once committed, the other session sees it.
+    assert_eq!(row_count(&reader, "t").await, 1);
+}
+
+#[tokio::test]
+async fn disconnect_mid_block_aborts_and_frees_the_row() {
+    let port = spawn_server().await;
+    let a = connect(port).await;
+    a.simple_query("CREATE TABLE t (id integer)").await.unwrap();
+    a.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+
+    // B opens a block and updates the row (allocating an XID and stamping the
+    // old version's xmax), then disconnects without COMMIT/ROLLBACK.
+    let b = connect(port).await;
+    b.simple_query("BEGIN").await.unwrap();
+    assert_eq!(command_count(&b.simple_query("UPDATE t SET id = 2").await.unwrap()), Some(1));
+    drop(b);
+    // Give the server a moment to observe the disconnect and abort B's block.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // C can still update the row: B's abort-on-drop made the original version
+    // live again. Without the fix, B's XID stays in-flight, the row is not
+    // is_live, and this reports UPDATE 0.
+    let c = connect(port).await;
+    let msg = c.simple_query("UPDATE t SET id = 3").await.unwrap();
+    assert_eq!(
+        command_count(&msg),
+        Some(1),
+        "row must be updatable after B's abandoned block aborts on disconnect"
+    );
+    let sel = c.simple_query("SELECT id FROM t").await.unwrap();
+    assert_eq!(rows(&sel)[0].get(0), Some("3"));
+}
+
 #[tokio::test]
 async fn update_and_delete_without_where_hit_all_rows() {
     let client = connect(spawn_server().await).await;
