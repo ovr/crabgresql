@@ -9,7 +9,9 @@ pub mod cast;
 pub mod float;
 pub mod interval;
 pub mod timestamp;
+pub mod timestamptz;
 pub mod to_char;
+pub mod tz;
 
 pub use interval::Interval;
 
@@ -25,6 +27,7 @@ pub mod oid {
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
     pub const TIMESTAMP: u32 = 1114;
+    pub const TIMESTAMPTZ: u32 = 1184;
     pub const INTERVAL: u32 = 1186;
     pub const BIT: u32 = 1560;
     pub const NUMERIC: u32 = 1700;
@@ -44,6 +47,8 @@ pub enum PgType {
     Bit,
     /// `timestamp without time zone`.
     Timestamp,
+    /// `timestamp with time zone`.
+    TimestampTz,
     /// `interval`.
     Interval,
     /// A user-defined type (`CREATE TYPE`); values are stored using the
@@ -65,6 +70,7 @@ impl PgType {
             PgType::Bytea => oid::BYTEA,
             PgType::Bit => oid::BIT,
             PgType::Timestamp => oid::TIMESTAMP,
+            PgType::TimestampTz => oid::TIMESTAMPTZ,
             PgType::Interval => oid::INTERVAL,
             PgType::User(oid) => oid,
         }
@@ -80,6 +86,7 @@ impl PgType {
             PgType::Float4 => 4,
             PgType::Float8 => 8,
             PgType::Timestamp => 8,
+            PgType::TimestampTz => 8,
             PgType::Interval => 16,
             PgType::Numeric | PgType::Text | PgType::Bytea | PgType::Bit => -1,
             PgType::User(_) => -1,
@@ -100,6 +107,7 @@ impl PgType {
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
             PgType::Timestamp => "timestamp without time zone",
+            PgType::TimestampTz => "timestamp with time zone",
             PgType::Interval => "interval",
             PgType::User(_) => "user-defined",
         }
@@ -120,6 +128,7 @@ impl PgType {
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
             PgType::Timestamp => "timestamp",
+            PgType::TimestampTz => "timestamptz",
             PgType::Interval => "interval",
             PgType::User(_) => "user-defined",
         }
@@ -205,6 +214,9 @@ pub enum Value {
     /// `i64::MIN`/`i64::MAX` as the `-infinity`/`infinity` sentinels. See
     /// [`crate::timestamp`].
     Timestamp(i64),
+    /// `timestamp with time zone`: microseconds since 2000-01-01 in UTC, with
+    /// the same `i64::MIN`/`i64::MAX` sentinels. See [`crate::timestamptz`].
+    TimestampTz(i64),
     /// `interval`: PG's `{ months, days, usec }` split. See [`crate::interval`].
     Interval(Interval),
 }
@@ -224,6 +236,7 @@ impl Value {
             Value::Bytea(_) => Some(PgType::Bytea),
             Value::Bit { .. } => Some(PgType::Bit),
             Value::Timestamp(_) => Some(PgType::Timestamp),
+            Value::TimestampTz(_) => Some(PgType::TimestampTz),
             Value::Interval(_) => Some(PgType::Interval),
         }
     }
@@ -259,6 +272,7 @@ impl Value {
                 Some(format!("{:0width$b}", bits, width = *len as usize))
             }
             Value::Timestamp(micros) => Some(timestamp::format(*micros)),
+            Value::TimestampTz(micros) => Some(timestamptz::format(*micros)),
             Value::Interval(iv) => Some(interval::format(*iv)),
         }
     }

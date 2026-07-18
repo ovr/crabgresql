@@ -26,9 +26,11 @@ use crate::interval::{self, Interval};
 
 // SQLSTATEs, kept as literals here (the types crate does not depend on the
 // protocol crate; the binder/executor map these to `sqlstate::*`).
-const INVALID_DATETIME_FORMAT: &str = "22007";
-const DATETIME_FIELD_OVERFLOW: &str = "22008";
-const INVALID_PARAMETER_VALUE: &str = "22023";
+pub(crate) const INVALID_DATETIME_FORMAT: &str = "22007";
+pub(crate) const DATETIME_FIELD_OVERFLOW: &str = "22008";
+pub(crate) const INVALID_PARAMETER_VALUE: &str = "22023";
+/// `time zone displacement out of range` — a numeric offset beyond ±15:59:59.
+pub(crate) const INVALID_TIME_ZONE_DISPLACEMENT: &str = "22009";
 
 /// `-infinity` / `+infinity` sentinels, matching PG's `DT_NOBEGIN`/`DT_NOEND`.
 pub const NEG_INFINITY: i64 = i64::MIN;
@@ -130,18 +132,24 @@ fn j2day(jd: i64) -> i64 {
 
 /// Broken-down finite timestamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Tm {
-    year: i64,
-    month: i64,
-    day: i64,
-    hour: i64,
-    min: i64,
-    sec: i64,
-    usec: i64,
+pub(crate) struct Tm {
+    pub year: i64,
+    pub month: i64,
+    pub day: i64,
+    pub hour: i64,
+    pub min: i64,
+    pub sec: i64,
+    pub usec: i64,
+}
+
+/// Construct a [`Tm`] from calendar fields (astronomical year). Used by
+/// `timestamptz` to encode its range boundaries.
+pub(crate) fn tm(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64, usec: i64) -> Tm {
+    Tm { year, month, day, hour, min, sec, usec }
 }
 
 /// Split a finite microsecond timestamp into calendar fields.
-fn decode(micros: i64) -> Tm {
+pub(crate) fn decode(micros: i64) -> Tm {
     let mut time = micros % USECS_PER_DAY;
     let mut date = micros / USECS_PER_DAY;
     if time < 0 {
@@ -159,7 +167,7 @@ fn decode(micros: i64) -> Tm {
 }
 
 /// Reassemble calendar fields into a microsecond timestamp.
-fn encode(tm: Tm) -> i64 {
+pub(crate) fn encode(tm: Tm) -> i64 {
     let date = date2j(tm.year, tm.month, tm.day) - POSTGRES_EPOCH_JDATE;
     date * USECS_PER_DAY
         + tm.hour * USECS_PER_HOUR
@@ -178,6 +186,15 @@ pub fn format(micros: i64) -> String {
     if micros == NEG_INFINITY {
         return "-infinity".to_string();
     }
+    let (body, bc) = format_parts(micros);
+    if bc { format!("{body} BC") } else { body }
+}
+
+/// The ISO date/time body of a finite timestamp (no ` BC` suffix) and whether
+/// the year is BC. `timestamptz::format` uses this to splice its `+00` offset
+/// before the ` BC` suffix, matching PG's `… 4714+00 BC` ordering. Callers must
+/// not pass the ±infinity sentinels.
+pub(crate) fn format_parts(micros: i64) -> (String, bool) {
     let tm = decode(micros);
     // Years <= 0 are BC: astronomical year 0 is 1 BC, -1 is 2 BC, ...
     let (year, bc) = if tm.year <= 0 {
@@ -195,10 +212,7 @@ pub fn format(micros: i64) -> String {
         out.push('.');
         out.push_str(frac.trim_end_matches('0'));
     }
-    if bc {
-        out.push_str(" BC");
-    }
-    out
+    (out, bc)
 }
 
 // --- input (timestamp_in, a practical subset) ------------------------------
@@ -222,18 +236,32 @@ const MONTH_NAMES: [&str; 12] = [
 ];
 const WEEKDAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
-/// `timestamp_in`. Accepts the ISO 8601 forms, the traditional
-/// `[Dow] Mon DD [HH:MM:SS[.f]] YYYY [zone]` form, `YYYYMMDD` compact dates, and
-/// the `infinity`/`-infinity`/`epoch` specials. A trailing time-zone token is
-/// accepted and ignored (this type carries no zone). Syntactically unparseable
-/// input is `22007`; a well-formed value with an out-of-range field is `22008`.
-pub fn parse(input: &str) -> Result<i64, TimestampError> {
+/// Outcome of the shared input scan, used by both `timestamp` and
+/// `timestamptz`. The final timestamp-range check is left to the caller
+/// (`timestamp` bounds the civil value; `timestamptz` the post-offset UTC
+/// value), and `timestamp` discards the zone token.
+pub(crate) enum Parsed {
+    /// A special value (`infinity`/`-infinity`/`epoch`), already in micros.
+    Micros(i64),
+    /// A calendar time with an astronomical year (BC already folded), plus the
+    /// trailing zone token if one was present. Field ranges are validated by
+    /// [`validate_fields`]; the year range is not checked here.
+    Calendar { tm: Tm, zone: Option<String> },
+}
+
+/// The shared scan behind `timestamp::parse` and `timestamptz::parse`. Accepts
+/// the ISO 8601 forms, the traditional `[Dow] Mon DD [HH:MM:SS[.f]] YYYY [zone]`
+/// form, `YYYYMMDD` compact dates, and the `infinity`/`-infinity`/`epoch`
+/// specials. A trailing time-zone token (a `±HH[:MM]` offset, an attached `Z`,
+/// or a bare abbreviation / IANA name) is returned in `zone` rather than
+/// discarded. Syntactically unparseable input is `22007`.
+pub(crate) fn parse_parts(input: &str) -> Result<Parsed, TimestampError> {
     let trimmed = input.trim();
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
-        "infinity" | "+infinity" => return Ok(POS_INFINITY),
-        "-infinity" => return Ok(NEG_INFINITY),
-        "epoch" => return Ok(EPOCH_MINUS_PG_DAYS * USECS_PER_DAY),
+        "infinity" | "+infinity" => return Ok(Parsed::Micros(POS_INFINITY)),
+        "-infinity" => return Ok(Parsed::Micros(NEG_INFINITY)),
+        "epoch" => return Ok(Parsed::Micros(EPOCH_MINUS_PG_DAYS * USECS_PER_DAY)),
         _ => {}
     }
 
@@ -262,6 +290,9 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
     let mut have_time = false;
     let mut bc = false;
     let mut have_date = false;
+    // The trailing time-zone token, if any (last one wins). `timestamp` ignores
+    // it; `timestamptz` resolves it to a UTC offset.
+    let mut zone: Option<String> = None;
     // Bare numeric fields (verbose form), as (value, digit count), resolved to
     // day/year after the scan so their order does not matter.
     let mut nums: Vec<(i64, usize)> = Vec::new();
@@ -287,19 +318,24 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
         }
         if field.contains(':') {
             // A `:`-bearing token that starts with a sign is a zone offset
-            // (`-07:00`), decorative for this zone-less type — ignore it.
+            // (`-07:00`): the zone for `timestamptz`, decorative for `timestamp`.
             if field.starts_with(['+', '-']) {
+                zone = Some(field.clone());
                 continue;
             }
             if have_time {
                 return Err(invalid_syntax(input));
             }
-            let (h, mi, s, us) = parse_time(field).ok_or_else(|| invalid_syntax(input))?;
+            let (h, mi, s, us, z) = parse_time(field).ok_or_else(|| invalid_syntax(input))?;
             hour = h;
             min = mi;
             sec = s;
             usec = us;
             have_time = true;
+            // An attached zone (`18:19:20-07:00`, `...Z`) travels with the time.
+            if z.is_some() {
+                zone = z;
+            }
             continue;
         }
         if let Some((y, m, d)) = parse_date_token(field) {
@@ -312,13 +348,33 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
             have_date = true;
             continue;
         }
+        // A date with a glued zone and no time, e.g. `2001-02-16+00` or
+        // `2001-02-16Z`. A date contains no `+`, and a trailing `Z` is
+        // unambiguous, so these safely split into date + zone. (A glued
+        // negative offset like `2001-02-16-08` is ambiguous with the date
+        // separators; write it space-separated instead.)
+        if let Some((date, z)) = split_date_zone(field)
+            && let Some((y, m, d)) = parse_date_token(date)
+        {
+            if have_date {
+                return Err(invalid_syntax(input));
+            }
+            year = Some(y);
+            month = Some(m);
+            day = Some(d);
+            have_date = true;
+            zone = Some(z);
+            continue;
+        }
         if field.bytes().all(|b| b.is_ascii_digit()) {
             let n: i64 = field.parse().map_err(|_| invalid_syntax(input))?;
             nums.push((n, field.len()));
             continue;
         }
-        // Anything else (a bare time-zone abbreviation or numeric offset) is
-        // decorative for this zone-less type and ignored.
+        // Anything else is a bare time-zone token (an abbreviation like `PST` or
+        // an IANA name like `America/New_York`): the zone for `timestamptz`,
+        // decorative for `timestamp`.
+        zone = Some(field.clone());
     }
 
     // Resolve the bare numbers into day/year. The year is the 4+-digit or >31
@@ -351,18 +407,41 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
         }
         y = 1 - y;
     }
-    // Bound the year to PG's timestamp range (4713 BC .. 294276 AD). This both
-    // matches PG's out-of-range error and keeps `encode` within i64.
-    if !(-4712..=294_276).contains(&y) {
+    Ok(Parsed::Calendar {
+        tm: Tm { year: y, month: m, day: d, hour, min, sec, usec },
+        zone,
+    })
+}
+
+/// Range-check the calendar fields (month/day/hour/min/sec) of a scanned time.
+/// Shared by both types; the year range is checked separately by the caller.
+pub(crate) fn validate_fields(tm: &Tm, input: &str) -> Result<(), TimestampError> {
+    if !(1..=12).contains(&tm.month) || tm.day < 1 || tm.day > days_in_month(tm.year, tm.month) {
         return Err(field_out_of_range(input));
     }
-    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+    if tm.hour > 23 || tm.min > 59 || tm.sec > 59 {
         return Err(field_out_of_range(input));
     }
-    if hour > 23 || min > 59 || sec > 59 {
-        return Err(field_out_of_range(input));
+    Ok(())
+}
+
+/// `timestamp_in`. A trailing time zone is accepted and ignored (this type
+/// carries no zone). Syntactically unparseable input is `22007`; a well-formed
+/// value with an out-of-range field is `22008`.
+pub fn parse(input: &str) -> Result<i64, TimestampError> {
+    match parse_parts(input)? {
+        Parsed::Micros(m) => Ok(m),
+        Parsed::Calendar { tm, .. } => {
+            // Bound the year to PG's timestamp range (4713 BC .. 294276 AD).
+            // This both matches PG's out-of-range error and keeps `encode`
+            // within i64. (Checked before the field ranges, as PG does.)
+            if !(-4712..=294_276).contains(&tm.year) {
+                return Err(field_out_of_range(input));
+            }
+            validate_fields(&tm, input)?;
+            Ok(encode(tm))
+        }
     }
-    Ok(encode(Tm { year: y, month: m, day: d, hour, min, sec, usec }))
 }
 
 /// Split "YYYY-MM-DD" from "HH:MM:SS" when joined by an ISO `T`.
@@ -389,8 +468,10 @@ fn month_index(name: &str) -> Option<i64> {
 }
 
 /// Parse a `HH:MM[:SS[.ffffff]]` time, optionally suffixed with `am`/`pm` and/or
-/// a trailing zone that is ignored. Returns `(hour, min, sec, usec)`.
-fn parse_time(field: &str) -> Option<(i64, i64, i64, i64)> {
+/// a trailing zone. Returns `(hour, min, sec, usec, zone)`, where `zone` is the
+/// attached zone token (`Z`, `-07:00`) if one was present — `timestamp` ignores
+/// it, `timestamptz` resolves it.
+fn parse_time(field: &str) -> Option<(i64, i64, i64, i64, Option<String>)> {
     // Strip a leading sign-less zone offset attached to the seconds, keeping the
     // digits/dot/colons; a bare abbreviation was already split off as its own
     // whitespace field, so here we only handle an am/pm suffix.
@@ -407,8 +488,10 @@ fn parse_time(field: &str) -> Option<(i64, i64, i64, i64)> {
 
     // Strip an attached zone: the time is digits/colons/dot, so anything after
     // it (a trailing `Z`, or a `+`/`-` offset joined without a space, as in the
-    // ISO 8601 form `18:19:20-07:00`) is the zone — decorative for this type.
+    // ISO 8601 form `18:19:20-07:00`) is the zone.
+    let mut zone: Option<String> = None;
     if let Some(end) = body.find(|c: char| !(c.is_ascii_digit() || c == ':' || c == '.')) {
+        zone = Some(body[end..].to_string());
         body = &body[..end];
     }
 
@@ -443,7 +526,7 @@ fn parse_time(field: &str) -> Option<(i64, i64, i64, i64)> {
         }
         _ => hour,
     };
-    Some((hour, min, sec, usec))
+    Some((hour, min, sec, usec, zone))
 }
 
 /// Fractional-seconds string → microseconds, rounding a 7th+ digit half-up.
@@ -468,6 +551,31 @@ pub(crate) fn parse_fraction(frac: &str) -> Option<i64> {
         micros += 1;
     }
     Some(micros)
+}
+
+/// Split a date field with a glued zone but no time — `2001-02-16+00`
+/// (offset starts at the unambiguous `+`) or `2001-02-16Z`/`...z` (trailing
+/// `Z`) — into `(date, zone)`. Returns `None` when there is no such suffix.
+///
+/// A glued zone with no time can only be a numeric offset (`+HH[:MM[:SS]]`) or
+/// `Z`; a named zone or abbreviation is always whitespace-separated. So the
+/// `+` remainder must be an offset shape (digits and colons) — otherwise
+/// `2001-02-16+garbage` would be wrongly accepted (PG rejects it as `22007`).
+fn split_date_zone(field: &str) -> Option<(&str, String)> {
+    if let Some(plus) = field.find('+') {
+        let rest = &field[plus + 1..];
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+            return Some((&field[..plus], field[plus..].to_string()));
+        }
+        return None;
+    }
+    if let Some(core) = field.strip_suffix(['Z', 'z']) {
+        // Only when the remainder looks like a date, not e.g. a bare "z".
+        if core.bytes().any(|b| b.is_ascii_digit()) {
+            return Some((core, "Z".to_string()));
+        }
+    }
+    None
 }
 
 /// Parse a date token: ISO `YYYY-MM-DD` (dash or slash separated). Returns
@@ -1157,6 +1265,17 @@ mod tests {
             "1997-06-10 17:32:01"
         );
         assert_eq!(format(ts("Mon Feb 10 17:32:01 1997 PST")), "1997-02-10 17:32:01");
+    }
+
+    #[test]
+    fn glued_date_zone() {
+        // A date with a glued numeric offset / `Z` parses (the zone is ignored
+        // by this zone-less type), matching PG.
+        assert_eq!(format(ts("2001-02-16+00")), "2001-02-16 00:00:00");
+        assert_eq!(format(ts("2001-02-16Z")), "2001-02-16 00:00:00");
+        // But a bogus glued suffix is a syntax error, not a silently-ignored
+        // zone (PG rejects `2001-02-16+garbage`).
+        assert_eq!(parse("2001-02-16+garbage").unwrap_err().sqlstate, INVALID_DATETIME_FORMAT);
     }
 
     #[test]

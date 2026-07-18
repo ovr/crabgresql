@@ -99,6 +99,22 @@ pub enum ScalarFn {
     Age,
     /// `to_char(interval, text) -> text`.
     ToCharInterval,
+
+    // --- timestamptz operators/functions ---
+    /// `date_part(text, timestamptz) -> float8`.
+    DatePartTz,
+    /// `EXTRACT(field FROM timestamptz) -> numeric`; the field is a text arg.
+    ExtractTz,
+    /// `date_trunc(text, timestamptz) -> timestamptz`.
+    DateTruncTz,
+    /// `isfinite(timestamptz) -> bool`.
+    IsfiniteTz,
+    /// `make_timestamptz(int×5, float8[, text]) -> timestamptz`.
+    MakeTimestampTz,
+    /// `timezone(text, timestamp) -> timestamptz` (`ts AT TIME ZONE zone`).
+    TimezoneToTz,
+    /// `timezone(text, timestamptz) -> timestamp` (`tstz AT TIME ZONE zone`).
+    TimezoneToTs,
 }
 
 struct Signature {
@@ -180,6 +196,7 @@ pub(crate) fn bind_table_fn_call(
 
 const F8: PgType = PgType::Float8;
 const TS: PgType = PgType::Timestamp;
+const TSTZ: PgType = PgType::TimestampTz;
 const TEXT: PgType = PgType::Text;
 const I4: PgType = PgType::Int4;
 const IV: PgType = PgType::Interval;
@@ -251,14 +268,17 @@ fn lookup(name: &str) -> &'static [Signature] {
         "date_part" => &[
             Signature { func: ScalarFn::DatePart, args: &[TEXT, TS], ret: F8 },
             Signature { func: ScalarFn::DatePartInterval, args: &[TEXT, IV], ret: F8 },
+            Signature { func: ScalarFn::DatePartTz, args: &[TEXT, TSTZ], ret: F8 },
         ],
         "date_trunc" => &[
             Signature { func: ScalarFn::DateTrunc, args: &[TEXT, TS], ret: TS },
             Signature { func: ScalarFn::DateTruncInterval, args: &[TEXT, IV], ret: IV },
+            Signature { func: ScalarFn::DateTruncTz, args: &[TEXT, TSTZ], ret: TSTZ },
         ],
         "isfinite" => &[
             Signature { func: ScalarFn::Isfinite, args: &[TS], ret: PgType::Bool },
             Signature { func: ScalarFn::IsfiniteInterval, args: &[IV], ret: PgType::Bool },
+            Signature { func: ScalarFn::IsfiniteTz, args: &[TSTZ], ret: PgType::Bool },
         ],
         "make_timestamp" => &[Signature {
             func: ScalarFn::MakeTimestamp,
@@ -275,6 +295,19 @@ fn lookup(name: &str) -> &'static [Signature] {
         "justify_interval" => &[Signature { func: ScalarFn::JustifyInterval, args: &[IV], ret: IV }],
         "age" => &[Signature { func: ScalarFn::Age, args: &[TS, TS], ret: IV }],
         "to_char" => &[Signature { func: ScalarFn::ToCharInterval, args: &[IV, TEXT], ret: TEXT }],
+        "make_timestamptz" => &[
+            Signature { func: ScalarFn::MakeTimestampTz, args: &[I4, I4, I4, I4, I4, F8], ret: TSTZ },
+            Signature {
+                func: ScalarFn::MakeTimestampTz,
+                args: &[I4, I4, I4, I4, I4, F8, TEXT],
+                ret: TSTZ,
+            },
+        ],
+        // The function form of `AT TIME ZONE`: `timezone(zone, value)`.
+        "timezone" => &[
+            Signature { func: ScalarFn::TimezoneToTz, args: &[TEXT, TS], ret: TSTZ },
+            Signature { func: ScalarFn::TimezoneToTs, args: &[TEXT, TSTZ], ret: TS },
+        ],
         // Two overloads. Text is listed first so a bare `md5('abc')` unknown
         // literal resolves to text; a typed `bytea` argument never coerces to
         // text (see `implicit_castable`), so `md5(x::bytea)` binds the bytea one.

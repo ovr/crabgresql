@@ -12,7 +12,9 @@
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema};
-use crabgresql_types::{NumericVal, PgType, Value, cast, float, interval, parse_bool, timestamp};
+use crabgresql_types::{
+    NumericVal, PgType, Value, cast, float, interval, parse_bool, timestamp, timestamptz,
+};
 
 use crate::BindError;
 use crate::functions::{ScalarFn, bind_function};
@@ -244,6 +246,9 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         ast::Expr::Function(func) => bind_function(func, scope),
         ast::Expr::Extract { field, expr, .. } => bind_extract(field, expr, scope),
         ast::Expr::Interval(iv) => bind_interval(iv),
+        ast::Expr::AtTimeZone { timestamp, time_zone } => {
+            bind_at_time_zone(timestamp, time_zone, scope)
+        }
         ast::Expr::Case {
             operand,
             conditions,
@@ -344,16 +349,11 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         },
         DataType::Numeric(_) | DataType::Decimal(_) => PgType::Numeric,
         DataType::Bytea => PgType::Bytea,
-        // `timestamp` / `timestamp without time zone` (the precision modifier is
-        // ignored; full microsecond resolution is kept). `with time zone` is a
-        // distinct type we don't have yet.
+        // `timestamp` / `timestamp with time zone` (the precision modifier is
+        // ignored; full microsecond resolution is kept).
         DataType::Timestamp(_, tz) => match tz {
             ast::TimezoneInfo::None | ast::TimezoneInfo::WithoutTimeZone => PgType::Timestamp,
-            ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz => {
-                return Err(BindError::feature_not_supported(
-                    "timestamp with time zone is not supported yet",
-                ));
-            }
+            ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz => PgType::TimestampTz,
         },
         // `interval` (any field qualifier / precision is accepted and ignored;
         // full resolution is kept, as with `timestamp(2)`).
@@ -456,11 +456,13 @@ fn bind_extract(
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     let unit = datetime_field_unit(field);
-    // Resolve the operand type; interval and timestamp each have their own
-    // extract. An untyped literal defaults to timestamp, as PG does.
+    // The operand type selects the overload; interval, timestamp, and
+    // timestamptz each have their own extract. An untyped literal defaults to
+    // `timestamp`, matching PG.
     let (func, arg) = match bind_expr(expr, scope)? {
         Binding::Typed(e) if e.ty() == PgType::Timestamp => (ScalarFn::Extract, e),
         Binding::Typed(e) if e.ty() == PgType::Interval => (ScalarFn::ExtractInterval, e),
+        Binding::Typed(e) if e.ty() == PgType::TimestampTz => (ScalarFn::ExtractTz, e),
         Binding::Typed(e) => {
             return Err(BindError::new(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -470,7 +472,9 @@ fn bind_extract(
                 ),
             ));
         }
-        Binding::Unknown { lit, span } => (ScalarFn::Extract, resolve_unknown(lit, span, PgType::Timestamp)?),
+        Binding::Unknown { lit, span } => {
+            (ScalarFn::Extract, resolve_unknown(lit, span, PgType::Timestamp)?)
+        }
     };
     Ok(Binding::Typed(BoundExpr::FuncCall {
         func,
@@ -482,6 +486,59 @@ fn bind_extract(
             },
             arg,
         ],
+    }))
+}
+
+/// `<value> AT TIME ZONE <zone>`. The overload is chosen by the value's type: a
+/// zone-less `timestamp` wall clock interpreted in `zone` yields a `timestamptz`
+/// (UTC) instant; a `timestamptz` instant shown in `zone` yields a zone-less
+/// `timestamp`. Lowers to the `timezone(zone_text, value)` function form (PG's
+/// implementation of the syntax); the result column is named `timezone`.
+fn bind_at_time_zone(
+    value: &ast::Expr,
+    zone: &ast::Expr,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let zone_arg = match bind_expr(zone, scope)? {
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text)?,
+        Binding::Typed(e) if e.ty() == PgType::Text => e,
+        Binding::Typed(e) => {
+            return Err(BindError::new(
+                sqlstate::UNDEFINED_FUNCTION,
+                format!(
+                    "function pg_catalog.timezone({}, ...) does not exist",
+                    e.ty().name()
+                ),
+            ));
+        }
+    };
+    // An untyped value literal defaults to `timestamp` (→ timestamptz), as PG does.
+    let (func, ret, value_arg) = match bind_expr(value, scope)? {
+        Binding::Typed(e) if e.ty() == PgType::Timestamp => {
+            (ScalarFn::TimezoneToTz, PgType::TimestampTz, e)
+        }
+        Binding::Typed(e) if e.ty() == PgType::TimestampTz => {
+            (ScalarFn::TimezoneToTs, PgType::Timestamp, e)
+        }
+        Binding::Typed(e) => {
+            return Err(BindError::new(
+                sqlstate::UNDEFINED_FUNCTION,
+                format!(
+                    "function pg_catalog.timezone(text, {}) does not exist",
+                    e.ty().name()
+                ),
+            ));
+        }
+        Binding::Unknown { lit, span } => (
+            ScalarFn::TimezoneToTz,
+            PgType::TimestampTz,
+            resolve_unknown(lit, span, PgType::Timestamp)?,
+        ),
+    };
+    Ok(Binding::Typed(BoundExpr::FuncCall {
+        func,
+        ret,
+        args: vec![zone_arg, value_arg],
     }))
 }
 
@@ -857,6 +914,7 @@ fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindEr
                 | PgType::Bytea
                 | PgType::Timestamp
                 | PgType::Interval
+                | PgType::TimestampTz
         )
     };
     if !supported {
@@ -1041,6 +1099,9 @@ fn implicit_castable(from: PgType, to: PgType) -> bool {
                 | (Float4, Float8)
                 | (Numeric, Float4)
                 | (Numeric, Float8)
+                // `timestamp -> timestamptz` is an implicit cast in PG; the
+                // reverse is assignment-only (reached via an explicit cast).
+                | (Timestamp, TimestampTz)
         )
 }
 
@@ -1069,6 +1130,16 @@ fn unify_types(
         let left = coerce_expr(left, common)?;
         let right = coerce_expr(right, common)?;
         return Ok((left, right, common));
+    }
+    // Non-numeric implicit cast (e.g. `timestamp` -> `timestamptz`): when one
+    // side implicitly casts to the other, compare in that common type, as PG
+    // does (`tstz = timestamp`). Numeric pairs are already handled above, so
+    // this only fires for the datetime cast and never changes numeric results.
+    if implicit_castable(lty, rty) {
+        return Ok((coerce_expr(left, rty)?, right, rty));
+    }
+    if implicit_castable(rty, lty) {
+        return Ok((left, coerce_expr(right, lty)?, lty));
     }
     Err(no_operator(lty.name(), op, rty.name()))
 }
@@ -1233,6 +1304,9 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Interval => interval::parse(s)
             .map(Value::Interval)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::TimestampTz => timestamptz::parse(s)
+            .map(Value::TimestampTz)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         // bytea input (byteain) is shared with the executor's text→bytea cast.
         PgType::Bytea => cast::byteain(s)
             .map(Value::Bytea)
@@ -1252,6 +1326,15 @@ pub(crate) fn coerce_to_column(binding: Binding, column: &Column) -> Result<Boun
                 return Ok(e);
             }
             if ty.is_numeric() && column.ty.is_numeric() {
+                return coerce_expr(e, column.ty);
+            }
+            // Assignment context also permits the implicit `timestamp ->
+            // timestamptz` cast and its assignment-only reverse (both are plain
+            // microsecond reinterprets under the UTC session zone), so inserting
+            // a `timestamp` expression into a `timestamptz` column works, as in PG.
+            if implicit_castable(ty, column.ty)
+                || matches!((ty, column.ty), (PgType::TimestampTz, PgType::Timestamp))
+            {
                 return coerce_expr(e, column.ty);
             }
             Err(BindError::new(
@@ -1292,6 +1375,8 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         ast::Expr::Interval(_) => "interval".into(),
         // EXTRACT(... ) is named "extract" in PG, regardless of the field.
         ast::Expr::Extract { .. } => "extract".into(),
+        // `x AT TIME ZONE y` lowers to timezone(); PG names the column "timezone".
+        ast::Expr::AtTimeZone { .. } => "timezone".into(),
         // A bare CASE expression is named "case" in PG.
         ast::Expr::Case { .. } => "case".into(),
         // A function's output column is named after the function.
