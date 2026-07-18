@@ -553,12 +553,13 @@ fn unsupported_expr(expr: &ast::Expr) -> BindError {
 
 /// Types the executor's `compare_values` can order. Both comparison operators
 /// (`=`, `<`, …) and ORDER BY require this — binding a sort or comparison on any
-/// other type would produce a node the evaluator can't handle. `bit` is absent
-/// until bit comparison lands, even though PG orders it.
+/// other type would produce a node the evaluator can't handle.
 pub(crate) fn is_orderable(ty: PgType) -> bool {
     matches!(
         ty,
         PgType::Bool
+            | PgType::Bit
+            | PgType::Varbit
             | PgType::Int2
             | PgType::Int4
             | PgType::Int8
@@ -602,44 +603,33 @@ fn bind_value(value: &ast::ValueWithSpan) -> Result<Binding, BindError> {
             lit: None,
             span: value.span,
         }),
+        // `B'...'` is a `bit(n)` literal (n binary digits); `X'...'` a `bit(4n)`
+        // literal (4 bits per hex digit). PG's `bit_in` rejects a bad digit with
+        // a data exception (22P02) naming the offender, at the literal's cursor.
+        ast::Value::SingleQuotedByteStringLiteral(s) => bind_bit_literal(
+            crabgresql_types::bit::from_binary(s),
+            value.span,
+        ),
         ast::Value::HexStringLiteral(s) => {
-            // X'...' is a bit(n) value with n = 4 * hex digits, right-aligned in
-            // `bits`. The tokenizer does not validate the content, so reject any
-            // non-hex character first, matching PG's `bit_in`: a data exception
-            // (22P02) naming the first offending character. This also rejects the
-            // leading `+`/`-` that `u64::from_str_radix` would otherwise accept.
-            if let Some(bad) = s.chars().find(|c| !c.is_ascii_hexdigit()) {
-                return Err(BindError::new(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    format!("\"{bad}\" is not a valid hexadecimal digit"),
-                ));
-            }
-            // Value::Bit stores bits in a u64, so we cap at 16 hex digits (64
-            // bits) — PG supports arbitrary width, but that's out of scope here.
-            if s.len() > 16 {
-                return Err(BindError::feature_not_supported(format!(
-                    "hex string literal wider than 64 bits is not supported yet: X'{s}'"
-                )));
-            }
-            // Every character validated as an ASCII hex digit above, and the
-            // width fits u64, so parsing cannot fail (empty string is bit(0)).
-            let bits = if s.is_empty() {
-                0
-            } else {
-                u64::from_str_radix(s, 16).expect("validated hex digits within 64 bits")
-            };
-            Ok(Binding::Typed(BoundExpr::Const {
-                value: Value::Bit {
-                    len: (s.len() * 4) as u16,
-                    bits,
-                },
-                ty: PgType::Bit,
-            }))
+            bind_bit_literal(crabgresql_types::bit::from_hex(s), value.span)
         }
         other => Err(BindError::feature_not_supported(format!(
             "literal is not supported yet: {other}"
         ))),
     }
+}
+
+/// Build a `bit` constant from a parsed `B'...'`/`X'...'` literal, attaching the
+/// literal's cursor position to a bad-digit error (so it renders `LINE n: ^`).
+fn bind_bit_literal(
+    parsed: Result<(u32, Vec<u8>), crabgresql_types::bit::BitError>,
+    span: Span,
+) -> Result<Binding, BindError> {
+    let (len, data) = parsed.map_err(|e| BindError::new(e.sqlstate, e.message).at(span))?;
+    Ok(Binding::Typed(BoundExpr::Const {
+        value: Value::Bit { len, data },
+        ty: PgType::Bit,
+    }))
 }
 
 /// Integer literals become int4 when they fit, int8 otherwise. Literals with a
@@ -719,6 +709,10 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         DataType::Varchar(_) | DataType::CharacterVarying(_) => PgType::Varchar,
         // `char`/`character` (blank-padded; a bare `char` is `char(1)`).
         DataType::Char(_) | DataType::Character(_) => PgType::Bpchar,
+        // `bit(n)` (fixed) and `bit varying(n)` / `varbit` (variable); the length
+        // is enforced separately as a typmod coercion.
+        DataType::Bit(_) => PgType::Bit,
+        DataType::BitVarying(_) | DataType::VarBit(_) => PgType::Varbit,
         // `bpchar` (no length = unlimited, like text) and `name` arrive as
         // custom type names.
         DataType::Custom(obj, mods) if mods.is_empty() => {
@@ -899,6 +893,9 @@ pub fn length_typmod(dt: &ast::DataType) -> Option<i32> {
     match dt {
         DataType::Char(l) | DataType::Character(l) => Some(len(l).unwrap_or(1)),
         DataType::Varchar(l) | DataType::CharacterVarying(l) => len(l),
+        // `bit(n)` defaults to `bit(1)`; `bit varying` with no length is unlimited.
+        DataType::Bit(n) => Some(n.map(|n| n as i32).unwrap_or(1)),
+        DataType::BitVarying(n) | DataType::VarBit(n) => n.map(|n| n as i32),
         _ => None,
     }
 }
@@ -919,11 +916,19 @@ pub(crate) fn apply_length_typmod_if_any(
             Some(n) => (ScalarFn::BpcharTypmod, Some(n)),
             None => return Ok(expr),
         },
+        PgType::Bit => match length_typmod(data_type) {
+            Some(n) => (ScalarFn::BitTypmod, Some(n)),
+            None => return Ok(expr),
+        },
+        PgType::Varbit => match length_typmod(data_type) {
+            Some(n) => (ScalarFn::VarbitTypmod, Some(n)),
+            None => return Ok(expr),
+        },
         // `name` always truncates to 63 characters, independent of any modifier.
         PgType::Name => (ScalarFn::NameInput, None),
         _ => return Ok(expr),
     };
-    // Fold a constant text value now (explicit-cast semantics: truncate).
+    // Fold a constant value now (explicit-cast semantics: truncate/pad).
     if let BoundExpr::Const { value: Value::Text(s), .. } = &expr {
         let folded = match func {
             ScalarFn::VarcharTypmod => crabgresql_types::text::truncate_chars(s, typmod.unwrap()),
@@ -933,6 +938,12 @@ pub(crate) fn apply_length_typmod_if_any(
             _ => unreachable!(),
         };
         return Ok(BoundExpr::Const { value: Value::Text(folded), ty: target });
+    }
+    if let BoundExpr::Const { value: Value::Bit { len, data }, .. } = &expr {
+        let (len, data) =
+            crabgresql_types::bit::coerce(*len, data, typmod.unwrap(), target == PgType::Varbit, true)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))?;
+        return Ok(BoundExpr::Const { value: Value::Bit { len, data }, ty: target });
     }
     let mut args = vec![expr];
     if let Some(n) = typmod {
@@ -1240,12 +1251,22 @@ fn bind_unary(
                 expr: Box::new(operand),
             }))
         }
-        // `~inet` — bitwise NOT of the address (masklen preserved).
+        // `~inet` — bitwise NOT of the address (masklen preserved); `~bit` — the
+        // bitwise complement of a bit string (length preserved).
         ast::UnaryOperator::BitwiseNot => match bind_expr(operand, scope)? {
             Binding::Typed(e) if matches!(e.ty(), PgType::Inet | PgType::Cidr) => {
                 Ok(Binding::Typed(BoundExpr::FuncCall {
                     func: ScalarFn::InetNot,
                     ret: PgType::Inet,
+                    args: vec![e],
+                }))
+            }
+            Binding::Typed(e) if matches!(e.ty(), PgType::Bit | PgType::Varbit) => {
+                // PG's `~` is defined only on `bit` (a varbit operand is cast in),
+                // so the result type is `bit`.
+                Ok(Binding::Typed(BoundExpr::FuncCall {
+                    func: ScalarFn::BitNot,
+                    ret: PgType::Bit,
                     args: vec![e],
                 }))
             }
@@ -1405,10 +1426,24 @@ fn bind_binary(
     right: &ast::Expr,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
-    // `||` is not a `BinOp`; PG's `textcat`/`anytextcat` lower to a text concat.
+    // `||` is not a `BinOp`; PG's `textcat`/`anytextcat` lower to a text concat,
+    // and `bitcat` to a bit-string concat when either side is a bit string.
     if matches!(op, ast::BinaryOperator::StringConcat) {
         let lb = bind_expr(left, scope)?;
         let rb = bind_expr(right, scope)?;
+        // Route to bit concatenation only when neither side is a concrete
+        // non-bit type — i.e. both operands are bit strings or untyped literals,
+        // and at least one is a bit string. `bit || text` instead falls to the
+        // text concat (PG's `anytextcat`), rendering the bit as its 0/1 string.
+        let bit_or_unknown = |b: &Binding| {
+            is_bit_family(binding_typed_ty(b)) || matches!(b, Binding::Unknown { .. })
+        };
+        if (is_bit_family(binding_typed_ty(&lb)) || is_bit_family(binding_typed_ty(&rb)))
+            && bit_or_unknown(&lb)
+            && bit_or_unknown(&rb)
+        {
+            return bind_bit_concat(lb, rb);
+        }
         return bind_string_concat(lb, rb);
     }
     // The `~~`/`~~*`/`!~~`/`!~~*` operator spellings of LIKE / ILIKE.
@@ -1431,6 +1466,13 @@ fn bind_binary(
     // fit the single-`arg_ty` `Binary` node; they lower to `ScalarFn` calls.
     // Tried before the generic mapping so `<<`/`>>`/`&`/`|`/`&&` reach here.
     if let Some(binding) = resolve_network_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
+    // bit/varbit bitwise (`& | #`) and shift (`<< >>`) operators also lower to
+    // `ScalarFn` calls. Tried after the network path so an inet operand still
+    // wins; falls through so integer `&`/`|`/`<<` keep their error.
+    if let Some(binding) = resolve_bit_op(op, &lb, &rb)? {
         return Ok(binding);
     }
 
@@ -1899,6 +1941,106 @@ fn resolve_network_op(
     }
 }
 
+/// Whether `ty` is a bit-string type (`bit` or `bit varying`).
+fn is_bit_family(ty: Option<PgType>) -> bool {
+    matches!(ty, Some(PgType::Bit | PgType::Varbit))
+}
+
+/// A bit-string operand: a typed `bit`/`varbit` expression as-is (they share the
+/// runtime value), or an untyped literal parsed as `bit`. Anything else is an
+/// "operator does not exist" error via the caller.
+fn bit_operand(b: &Binding) -> Option<Result<BoundExpr, BindError>> {
+    match b {
+        Binding::Typed(e) if is_bit_family(Some(e.ty())) => Some(Ok(e.clone())),
+        Binding::Typed(_) => None,
+        Binding::Unknown { lit, span } => Some(resolve_unknown(lit.clone(), *span, PgType::Bit)),
+    }
+}
+
+/// `bit || bit` (or with an untyped literal): a `bit varying` concatenation.
+fn bind_bit_concat(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
+    let (Some(a), Some(b)) = (bit_operand(&lb), bit_operand(&rb)) else {
+        return Err(BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!(
+                "operator does not exist: {} || {}",
+                binding_type_label(&lb),
+                binding_type_label(&rb)
+            ),
+        ));
+    };
+    Ok(Binding::Typed(BoundExpr::FuncCall {
+        func: ScalarFn::BitConcat,
+        ret: PgType::Varbit,
+        args: vec![a?, b?],
+    }))
+}
+
+/// bit/varbit bitwise and shift operators lower to `ScalarFn` calls. Returns
+/// `Ok(None)` when the operator/operands are not a bit operation, so the generic
+/// path (and its "operator does not exist" error) still applies.
+fn resolve_bit_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+) -> Result<Option<Binding>, BindError> {
+    use ast::BinaryOperator as B;
+    let lt = binding_typed_ty(lb);
+    let rt = binding_typed_ty(rb);
+    if !is_bit_family(lt) && !is_bit_family(rt) {
+        return Ok(None);
+    }
+    let no_op = || {
+        BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!(
+                "operator does not exist: {} {op} {}",
+                binding_type_label(lb),
+                binding_type_label(rb)
+            ),
+        )
+    };
+    // Bitwise `& | #` and the shifts below are defined only on `bit` in PG (a
+    // varbit operand is cast in), so the result type is always `bit`.
+    let bitwise = match op {
+        B::BitwiseAnd => Some(ScalarFn::BitAnd),
+        B::BitwiseOr => Some(ScalarFn::BitOr),
+        B::PGBitwiseXor => Some(ScalarFn::BitXor),
+        _ => None,
+    };
+    if let Some(func) = bitwise {
+        let (Some(a), Some(b)) = (bit_operand(lb), bit_operand(rb)) else {
+            return Err(no_op());
+        };
+        return Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret: PgType::Bit,
+            args: vec![a?, b?],
+        })));
+    }
+    // Shifts `<< >>`: `bit << int4`, keeping the bit length; result type `bit`.
+    let shift = match op {
+        B::PGBitwiseShiftLeft => Some(ScalarFn::BitShl),
+        B::PGBitwiseShiftRight => Some(ScalarFn::BitShr),
+        _ => None,
+    };
+    if let Some(func) = shift {
+        if !is_bit_family(lt) {
+            return Err(no_op());
+        }
+        let Some(a) = bit_operand(lb) else {
+            return Err(no_op());
+        };
+        let amount = resolve_operand(rb, PgType::Int4)?;
+        return Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret: PgType::Bit,
+            args: vec![a?, amount],
+        })));
+    }
+    Ok(None)
+}
+
 /// Materialize an operand at `target`: an untyped literal is parsed as `target`,
 /// a typed operand is coerced (used for the numeric `* /` factor → float8).
 fn resolve_operand(b: &Binding, target: PgType) -> Result<BoundExpr, BindError> {
@@ -2029,6 +2171,11 @@ fn implicit_castable(from: PgType, to: PgType) -> bool {
                 | (Int2, Oid)
                 | (Int4, Oid)
                 | (Int8, Oid)
+                // `bit` and `bit varying` are mutually implicitly convertible in
+                // PG (binary-coercible with a length coercion), so a `bit`
+                // literal resolves a `varbit` overload and vice versa.
+                | (Bit, Varbit)
+                | (Varbit, Bit)
         )
 }
 
@@ -2164,7 +2311,11 @@ fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
     match (implicit_castable(a, b), implicit_castable(b, a)) {
         (true, false) => Some(b),
         (false, true) => Some(a),
-        _ => common_numeric(a, b),
+        // Mutually castable: today only `bit` <-> `bit varying`, whose common
+        // type is `bit varying` (the preferred type of the bit-string category),
+        // as PG's `select_common_type` resolves it.
+        (true, true) => Some(PgType::Varbit),
+        (false, false) => common_numeric(a, b),
     }
 }
 
@@ -2368,7 +2519,12 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Money => money::parse(s)
             .map(Value::Money)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
-        PgType::Bit | PgType::User(_) => Err(invalid()),
+        // `bit_in`/`varbit_in`: default binary, `x`-prefixed hex. The typmod (the
+        // declared length) is applied afterward by the caller's coercion.
+        PgType::Bit | PgType::Varbit => crabgresql_types::bit::input(s)
+            .map(|(len, data)| Value::Bit { len, data })
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::User(_) => Err(invalid()),
     }
 }
 
@@ -2385,6 +2541,10 @@ pub(crate) fn coerce_to_column(binding: Binding, column: &Column) -> Result<Boun
                 coerce_expr(e, column.ty)?
             // Any text-family type assigns to any other (text/varchar/char/name).
             } else if is_text_family(ty) && is_text_family(column.ty) {
+                coerce_expr(e, column.ty)?
+            // `bit` and `bit varying` assign to each other (shared value); the
+            // length rule is applied by `apply_length_to_column`.
+            } else if is_bit_family(Some(ty)) && is_bit_family(Some(column.ty)) {
                 coerce_expr(e, column.ty)?
             // Assignment context also permits the implicit `timestamp ->
             // timestamptz` cast and its assignment-only reverse (both are plain
@@ -2416,6 +2576,8 @@ fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr,
     let func = match column.ty {
         PgType::Varchar if column.typmod >= 0 => ScalarFn::VarcharTypmod,
         PgType::Bpchar if column.typmod >= 0 => ScalarFn::BpcharTypmod,
+        PgType::Bit if column.typmod >= 0 => ScalarFn::BitTypmod,
+        PgType::Varbit if column.typmod >= 0 => ScalarFn::VarbitTypmod,
         PgType::Name => ScalarFn::NameInput,
         _ => return Ok(expr),
     };
@@ -2430,6 +2592,17 @@ fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr,
             _ => unreachable!(),
         };
         return Ok(BoundExpr::Const { value: Value::Text(folded), ty: column.ty });
+    }
+    if let BoundExpr::Const { value: Value::Bit { len, data }, .. } = &expr {
+        let (len, data) = crabgresql_types::bit::coerce(
+            *len,
+            data,
+            column.typmod,
+            column.ty == PgType::Varbit,
+            false,
+        )
+        .map_err(|e| BindError::new(e.sqlstate, e.message))?;
+        return Ok(BoundExpr::Const { value: Value::Bit { len, data }, ty: column.ty });
     }
     let mut args = vec![expr];
     if func != ScalarFn::NameInput {

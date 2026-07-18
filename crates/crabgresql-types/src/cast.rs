@@ -267,7 +267,16 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- bit-string → integer (two's-complement of the target width) ----
         // PG has bittoint4/bittoint8 only — there is no bit→smallint cast, so
         // Int2 falls through to `cannot_coerce` below.
-        (Value::Bit { len, bits }, PgType::Int4 | PgType::Int8) => bit_to_int(*len, *bits, to),
+        (Value::Bit { len, data }, PgType::Int4 | PgType::Int8) => bit_to_int(*len, data, to),
+
+        // ---- text → bit / varbit (bit_in / varbit_in) ----
+        (Value::Text(s), PgType::Bit | PgType::Varbit) => crate::bit::input(s)
+            .map(|(len, data)| Value::Bit { len, data })
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- bit ↔ varbit: identity on the value (they share the storage);
+        // any length rule is applied separately as a typmod coercion. ----
+        (Value::Bit { .. }, PgType::Bit | PgType::Varbit) => Ok(v),
 
         // ---- text → bytea (byteain) ----
         (Value::Text(s), PgType::Bytea) => byteain(s).map(Value::Bytea),
@@ -529,10 +538,10 @@ fn numeric_to_int(n: &Numeric, ty: PgType) -> Result<Value, CastError> {
 /// Reinterpret a right-aligned bit string as the target integer's two's
 /// complement. A bit string wider than the target errors (`<typename> out of
 /// range`), matching PG's `bittoint4`/`bittoint8` (there is no bittoint2).
-fn bit_to_int(len: u16, bits: u64, ty: PgType) -> Result<Value, CastError> {
+fn bit_to_int(len: u32, data: &[u8], ty: PgType) -> Result<Value, CastError> {
     match ty {
-        PgType::Int4 if len <= 32 => Ok(Value::Int4(bits as u32 as i32)),
-        PgType::Int8 if len <= 64 => Ok(Value::Int8(bits as i64)),
+        PgType::Int4 if len <= 32 => Ok(Value::Int4(crate::bit::to_u64(len, data) as u32 as i32)),
+        PgType::Int8 if len <= 64 => Ok(Value::Int8(crate::bit::to_u64(len, data) as i64)),
         PgType::Int4 | PgType::Int8 => Err(out_of_range(ty)),
         _ => unreachable!("bit_to_int called with {ty:?}"),
     }
@@ -757,27 +766,23 @@ mod tests {
         }
     }
 
+    fn bits(s: &str) -> Value {
+        let (len, data) = crate::bit::from_binary(s).unwrap();
+        Value::Bit { len, data }
+    }
+
     #[test]
     fn bit_to_int_reinterprets_width() {
-        assert_eq!(cast(Value::Bit { len: 3, bits: 0b101 }, PgType::Int4).unwrap(), Value::Int4(5));
-        assert_eq!(cast(Value::Bit { len: 4, bits: 0b1111 }, PgType::Int4).unwrap(), Value::Int4(15));
+        assert_eq!(cast(bits("101"), PgType::Int4).unwrap(), Value::Int4(5));
+        assert_eq!(cast(bits("1111"), PgType::Int4).unwrap(), Value::Int4(15));
         // 32 set bits fill int4's width → two's-complement -1.
-        assert_eq!(
-            cast(Value::Bit { len: 32, bits: 0xFFFF_FFFF }, PgType::Int4).unwrap(),
-            Value::Int4(-1)
-        );
+        assert_eq!(cast(bits(&"1".repeat(32)), PgType::Int4).unwrap(), Value::Int4(-1));
         // A 16-bit value is zero-extended (positive) into the wider int4.
-        assert_eq!(
-            cast(Value::Bit { len: 16, bits: 0x8000 }, PgType::Int4).unwrap(),
-            Value::Int4(32768)
-        );
+        assert_eq!(cast(bits("1000000000000000"), PgType::Int4).unwrap(), Value::Int4(32768));
         // int8 keeps the same reinterpret semantics.
-        assert_eq!(
-            cast(Value::Bit { len: 64, bits: u64::MAX }, PgType::Int8).unwrap(),
-            Value::Int8(-1)
-        );
+        assert_eq!(cast(bits(&"1".repeat(64)), PgType::Int8).unwrap(), Value::Int8(-1));
         // Wider than the target → out of range.
-        let e = cast(Value::Bit { len: 40, bits: 1 }, PgType::Int4).unwrap_err();
+        let e = cast(bits(&"1".repeat(40)), PgType::Int4).unwrap_err();
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(e.message, "integer out of range");
     }
@@ -785,7 +790,7 @@ mod tests {
     #[test]
     fn bit_to_smallint_is_rejected() {
         // PG has bittoint4/bittoint8 but no bit→smallint cast.
-        let e = cast(Value::Bit { len: 3, bits: 0b101 }, PgType::Int2).unwrap_err();
+        let e = cast(bits("101"), PgType::Int2).unwrap_err();
         assert_eq!(e.sqlstate, "42846");
         assert_eq!(e.message, "cannot cast type bit to smallint");
     }

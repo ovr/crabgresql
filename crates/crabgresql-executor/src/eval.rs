@@ -11,8 +11,8 @@ use std::cmp::Ordering;
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, PgType, TimeTz, Value, cast, date, float, interval, money, net, time,
-    timetz,
+    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, cast, date, float, interval, money, net,
+    time, timetz,
 };
 
 use crate::{ExecContext, ExecError};
@@ -194,6 +194,12 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::Money => money::cmp(money_of(l), money_of(r)),
         // oid: unsigned 32-bit order (PG's `oidcmp`).
         PgType::Oid => oid_of(l).cmp(&oid_of(r)),
+        // bit/varbit: common-prefix bit order, then shorter first (`bit_cmp`).
+        PgType::Bit | PgType::Varbit => {
+            let (la, da) = bit_of(l);
+            let (lb, db) = bit_of(r);
+            bit::cmp(la, da, lb, db)
+        }
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -312,6 +318,13 @@ fn inet_of(v: &Value) -> &Inet {
     match v {
         Value::Inet(i) | Value::Cidr(i) => i,
         other => unreachable!("expected inet/cidr, got {other:?}"),
+    }
+}
+
+fn bit_of(v: &Value) -> (u32, &[u8]) {
+    match v {
+        Value::Bit { len, data } => (*len, data),
+        other => unreachable!("expected bit, got {other:?}"),
     }
 }
 

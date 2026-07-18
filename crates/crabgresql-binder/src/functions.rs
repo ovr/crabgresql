@@ -343,6 +343,39 @@ pub enum ScalarFn {
     CashLarger,
     /// `cashsmaller(money, money) -> money`.
     CashSmaller,
+    // --- bit / varbit ---
+    /// `~bit` (bitwise NOT).
+    BitNot,
+    /// `bit & bit` (bitwise AND); errors on differing sizes.
+    BitAnd,
+    /// `bit | bit` (bitwise OR); errors on differing sizes.
+    BitOr,
+    /// `bit # bit` (bitwise XOR); errors on differing sizes.
+    BitXor,
+    /// `bit || bit` (concatenation).
+    BitConcat,
+    /// `bit << int4` (shift left, keeping length).
+    BitShl,
+    /// `bit >> int4` (shift right, keeping length).
+    BitShr,
+    /// `length(bit) -> int4` (the number of bits).
+    BitLen,
+    /// `bit_count(bit) -> int8` (the number of set bits).
+    BitCount,
+    /// `get_bit(bit, int4) -> int4`.
+    GetBit,
+    /// `set_bit(bit, int4, int4) -> bit`.
+    SetBit,
+    /// `substring(bit, int4[, int4]) -> bit`.
+    SubstrBit,
+    /// `position(bit IN bit) -> int4` (`strpos(bit, bit)`).
+    BitPosition,
+    /// `overlay(bit, bit, int4[, int4]) -> bit`.
+    OverlayBit,
+    /// Apply a `bit(n)` length coercion (`bit`, `int4 n`[, `int4` explicit flag]).
+    BitTypmod,
+    /// Apply a `bit varying(n)` length coercion (`bit`, `int4 n`[, flag]).
+    VarbitTypmod,
 }
 
 struct Signature {
@@ -499,6 +532,8 @@ const BYTEA: PgType = PgType::Bytea;
 const INET: PgType = PgType::Inet;
 const CIDR: PgType = PgType::Cidr;
 const MONEY: PgType = PgType::Money;
+const BIT: PgType = PgType::Bit;
+const VARBIT: PgType = PgType::Varbit;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -677,7 +712,15 @@ fn lookup(name: &str) -> &'static [Signature] {
             },
         ],
         // --- string functions ---
-        "length" | "char_length" | "character_length" => {
+        // `length(bit)`/`length(varbit)` count bits, not characters. PG has only
+        // `length(bit)` in the bit-string family; `char_length`/`character_length`
+        // stay text-only (a bit argument there is `function does not exist`).
+        "length" => &[
+            Signature { func: ScalarFn::Length, args: &[TEXT], ret: I4 },
+            Signature { func: ScalarFn::BitLen, args: &[BIT], ret: I4 },
+            Signature { func: ScalarFn::BitLen, args: &[VARBIT], ret: I4 },
+        ],
+        "char_length" | "character_length" => {
             &[Signature { func: ScalarFn::Length, args: &[TEXT], ret: I4 }]
         }
         // `octet_length` counts the padded bytes of a `bpchar` (via a dedicated
@@ -687,18 +730,46 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature { func: ScalarFn::OctetLength, args: &[TEXT], ret: I4 },
             Signature { func: ScalarFn::OctetLength, args: &[PgType::Bpchar], ret: I4 },
         ],
-        "bit_length" => &[Signature { func: ScalarFn::BitLength, args: &[TEXT], ret: I4 }],
+        // `bit_length(bit)` is the number of bits, like `length(bit)`.
+        "bit_length" => &[
+            Signature { func: ScalarFn::BitLength, args: &[TEXT], ret: I4 },
+            Signature { func: ScalarFn::BitLen, args: &[BIT], ret: I4 },
+            Signature { func: ScalarFn::BitLen, args: &[VARBIT], ret: I4 },
+        ],
         "upper" => &[Signature { func: ScalarFn::Upper, args: &[TEXT], ret: TEXT }],
         "lower" => &[Signature { func: ScalarFn::Lower, args: &[TEXT], ret: TEXT }],
         "initcap" => &[Signature { func: ScalarFn::Initcap, args: &[TEXT], ret: TEXT }],
         "substr" | "substring" => &[
             Signature { func: ScalarFn::Substr, args: &[TEXT, I4], ret: TEXT },
             Signature { func: ScalarFn::Substr, args: &[TEXT, I4, I4], ret: TEXT },
+            Signature { func: ScalarFn::SubstrBit, args: &[BIT, I4], ret: BIT },
+            Signature { func: ScalarFn::SubstrBit, args: &[BIT, I4, I4], ret: BIT },
+            Signature { func: ScalarFn::SubstrBit, args: &[VARBIT, I4], ret: VARBIT },
+            Signature { func: ScalarFn::SubstrBit, args: &[VARBIT, I4, I4], ret: VARBIT },
         ],
-        "strpos" => &[Signature { func: ScalarFn::StrPos, args: &[TEXT, TEXT], ret: I4 }],
+        "strpos" => &[
+            Signature { func: ScalarFn::StrPos, args: &[TEXT, TEXT], ret: I4 },
+            // `POSITION(bit IN bit)` desugars to `strpos(str, sub)`.
+            Signature { func: ScalarFn::BitPosition, args: &[BIT, BIT], ret: I4 },
+            Signature { func: ScalarFn::BitPosition, args: &[VARBIT, VARBIT], ret: I4 },
+        ],
         "overlay" => &[
             Signature { func: ScalarFn::Overlay, args: &[TEXT, TEXT, I4], ret: TEXT },
             Signature { func: ScalarFn::Overlay, args: &[TEXT, TEXT, I4, I4], ret: TEXT },
+            Signature { func: ScalarFn::OverlayBit, args: &[BIT, BIT, I4], ret: BIT },
+            Signature { func: ScalarFn::OverlayBit, args: &[BIT, BIT, I4, I4], ret: BIT },
+        ],
+        "get_bit" => &[
+            Signature { func: ScalarFn::GetBit, args: &[BIT, I4], ret: I4 },
+            Signature { func: ScalarFn::GetBit, args: &[VARBIT, I4], ret: I4 },
+        ],
+        "set_bit" => &[
+            Signature { func: ScalarFn::SetBit, args: &[BIT, I4, I4], ret: BIT },
+            Signature { func: ScalarFn::SetBit, args: &[VARBIT, I4, I4], ret: VARBIT },
+        ],
+        "bit_count" => &[
+            Signature { func: ScalarFn::BitCount, args: &[BIT], ret: I8 },
+            Signature { func: ScalarFn::BitCount, args: &[VARBIT], ret: I8 },
         ],
         "ltrim" => &[
             Signature { func: ScalarFn::Ltrim, args: &[TEXT], ret: TEXT },

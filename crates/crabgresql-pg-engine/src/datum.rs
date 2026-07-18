@@ -81,10 +81,10 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.push(T_BYTEA);
             put_var(out, b);
         }
-        Value::Bit { len, bits } => {
+        Value::Bit { len, data } => {
             out.push(T_BIT);
             out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&bits.to_le_bytes());
+            put_var(out, data);
         }
         Value::Date(d) => {
             out.push(T_DATE);
@@ -149,9 +149,6 @@ impl<'a> Reader<'a> {
         self.pos += n;
         s
     }
-    fn u16(&mut self) -> u16 {
-        u16::from_le_bytes(self.take(2).try_into().unwrap())
-    }
     fn u32(&mut self) -> u32 {
         u32::from_le_bytes(self.take(4).try_into().unwrap())
     }
@@ -197,9 +194,9 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         T_TEXT => Value::Text(String::from_utf8(r.var().to_vec()).expect("text is valid utf-8")),
         T_BYTEA => Value::Bytea(r.var().to_vec()),
         T_BIT => {
-            let len = r.u16();
-            let bits = r.u64();
-            Value::Bit { len, bits }
+            let len = r.u32();
+            let data = r.var().to_vec();
+            Value::Bit { len, data }
         }
         T_DATE => Value::Date(r.i32()),
         T_TIME => Value::Time(r.i64()),
@@ -255,7 +252,9 @@ mod tests {
         roundtrip(Value::Text(String::new()));
         roundtrip(Value::Text("héllo world".into()));
         roundtrip(Value::Bytea(vec![0, 1, 2, 255]));
-        roundtrip(Value::Bit { len: 8, bits: 0b1010_1010 });
+        roundtrip(Value::Bit { len: 8, data: vec![0b1010_1010] });
+        roundtrip(Value::Bit { len: 0, data: vec![] });
+        roundtrip(Value::Bit { len: 1000, data: vec![0xA5; 125] });
         roundtrip(Value::Date(-5));
         roundtrip(Value::Time(86_399_000_000));
         roundtrip(Value::TimeTz(TimeTz { usec: 1, zone: -3600 }));
