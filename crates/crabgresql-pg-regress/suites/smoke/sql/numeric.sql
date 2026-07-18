@@ -60,6 +60,8 @@ SELECT trunc(1.6) AS t0, trunc(-1.6) AS tneg, trunc(1234.5678, 2) AS t2;
 SELECT ceil(-1.5) AS c1, ceiling(1.1) AS c2, floor(-1.5) AS f1, floor(1.9) AS f2;
 SELECT sign(-2.3) AS s1, sign(0.0) AS s2, sign(4.2) AS s3;
 SELECT mod(11, 4.0) AS m1, mod(-5.5, 2) AS m2;
+-- mod on integers keeps the integer type (only a numeric argument returns numeric)
+SELECT mod(11, 4) AS int_mod, mod(-7, 3) AS neg_mod;
 
 -- sqrt on numeric (correctly rounded) and its domain error; a numeric-typed
 -- argument selects the numeric overload (an integer argument would resolve to

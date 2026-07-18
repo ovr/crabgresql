@@ -75,7 +75,7 @@ impl NumErr {
 }
 
 fn floor_div(a: i64, b: i64) -> i64 {
-    (a.div_euclid(b)) as i64
+    a.div_euclid(b)
 }
 
 impl Numeric {
@@ -264,11 +264,17 @@ impl Numeric {
         out
     }
 
+    /// Decimal position of the least-significant stored digit. For an empty
+    /// (zero) coefficient this is `weight + 1`, which the magnitude helpers
+    /// treat as contributing nothing.
+    fn low(&self) -> i32 {
+        self.weight - (self.digits.len() as i32 - 1)
+    }
+
     /// The base-10 digit at decimal position `pos` (0 = units), or 0 if outside
     /// the stored coefficient.
     fn digit_at(&self, pos: i32) -> u8 {
-        let low = self.weight - (self.digits.len() as i32 - 1);
-        if self.digits.is_empty() || pos < low || pos > self.weight {
+        if self.digits.is_empty() || pos < self.low() || pos > self.weight {
             0
         } else {
             self.digits[(self.weight - pos) as usize]
@@ -498,8 +504,8 @@ impl Numeric {
             return Numeric::zero(rscale);
         }
         let neg = self.is_neg() != other.is_neg();
-        let a_low = self.weight - (self.digits.len() as i32 - 1);
-        let b_low = other.weight - (other.digits.len() as i32 - 1);
+        let a_low = self.low();
+        let b_low = other.low();
         // quotient*10^rscale = A*10^(a_low - b_low + rscale) / B
         let shift = a_low - b_low + rscale;
         let mut num = self.digits.clone();
@@ -670,8 +676,7 @@ impl Numeric {
             acc = acc.checked_mul(10)?.checked_add(d as i128)?;
         }
         // Pad for any zero positions between the last stored digit and units.
-        let low = r.weight - (r.digits.len() as i32 - 1);
-        for _ in 0..low {
+        for _ in 0..r.low() {
             acc = acc.checked_mul(10)?;
         }
         if r.is_neg() { acc.checked_neg() } else { Some(acc) }
@@ -690,7 +695,7 @@ impl Numeric {
             return 0.0;
         }
         let digitstr: String = self.digits.iter().map(|d| (b'0' + d) as char).collect();
-        let low = self.weight - (self.digits.len() as i32 - 1);
+        let low = self.low();
         let s = format!("{}{}e{}", if self.is_neg() { "-" } else { "" }, digitstr, low);
         s.parse().unwrap_or(f64::NAN)
     }
@@ -730,7 +735,7 @@ impl Numeric {
     fn sqrt_to_scale(&self, rscale: i32) -> Numeric {
         // value = A * 10^a_low ; want round(sqrt(value) * 10^rscale).
         // sqrt(value)*10^rscale = sqrt(A * 10^(a_low + 2*rscale)).
-        let a_low = self.weight - (self.digits.len() as i32 - 1);
+        let a_low = self.low();
         let shift = a_low + 2 * rscale;
         // Radicand must be an integer: pad or (rarely) drop low digits. shift
         // is >= 0 here because rscale >= 0 and a_low is small in practice; if
@@ -889,7 +894,7 @@ impl Numeric {
             return None;
         }
         // A fractional digit exists when the lowest stored position is < 0.
-        let low = self.weight - (self.digits.len() as i32 - 1);
+        let low = self.low();
         if !self.is_zero() && low < 0 {
             return None;
         }
@@ -1052,8 +1057,16 @@ impl Numeric {
     }
 }
 
-/// ln(10) to `guard` fractional digits.
+/// ln(10) to at least `guard` fractional digits. The common transcendental
+/// calls (log10, exp, and power's non-integer path) request a modest guard, so
+/// ln(10) is computed once at a generous scale and cached; only an unusually
+/// large guard recomputes it.
 fn ln10(guard: i32) -> Numeric {
+    const CACHED_SCALE: i32 = 120;
+    if guard <= CACHED_SCALE {
+        static LN10: std::sync::OnceLock<Numeric> = std::sync::OnceLock::new();
+        return LN10.get_or_init(|| Numeric::from_i128(10).ln_internal(CACHED_SCALE)).clone();
+    }
     Numeric::from_i128(10).ln_internal(guard)
 }
 
@@ -1104,8 +1117,8 @@ fn cmp_mag(a: &Numeric, b: &Numeric) -> std::cmp::Ordering {
 
 /// Sum the magnitudes; returns `(digits MSB-first, low position)`.
 fn add_mag(a: &Numeric, b: &Numeric) -> (Vec<u8>, i32) {
-    let a_low = a.weight - (a.digits.len() as i32 - 1);
-    let b_low = b.weight - (b.digits.len() as i32 - 1);
+    let a_low = a.low();
+    let b_low = b.low();
     let low = a_low.min(b_low);
     let hi = a.weight.max(b.weight);
     let n = (hi - low + 1) as usize;
@@ -1124,24 +1137,19 @@ fn add_mag(a: &Numeric, b: &Numeric) -> (Vec<u8>, i32) {
         *slot = v % 10;
         carry = v / 10;
     }
-    let mut digits: Vec<u8> = acc.iter().rev().map(|&x| x as u8).collect();
-    let mut top = String::new();
-    while carry > 0 {
-        top.push((b'0' + (carry % 10) as u8) as char);
-        carry /= 10;
+    // Summing two base-10 coefficients leaves at most a single carry digit.
+    let mut digits: Vec<u8> = Vec::with_capacity(acc.len() + 1);
+    if carry > 0 {
+        digits.push(carry as u8);
     }
-    if !top.is_empty() {
-        let mut prefix: Vec<u8> = top.bytes().map(|b| b - b'0').collect();
-        prefix.extend(digits);
-        digits = prefix;
-    }
+    digits.extend(acc.iter().rev().map(|&x| x as u8));
     (digits, low)
 }
 
 /// Subtract magnitudes assuming `|a| >= |b|`; returns `(digits MSB-first, low)`.
 fn sub_mag(a: &Numeric, b: &Numeric) -> (Vec<u8>, i32) {
-    let a_low = a.weight - (a.digits.len() as i32 - 1);
-    let b_low = b.weight - (b.digits.len() as i32 - 1);
+    let a_low = a.low();
+    let b_low = b.low();
     let low = a_low.min(b_low);
     let hi = a.weight.max(b.weight);
     let n = (hi - low + 1) as usize;
@@ -1164,8 +1172,8 @@ fn sub_mag(a: &Numeric, b: &Numeric) -> (Vec<u8>, i32) {
 
 /// Multiply magnitudes; returns `(digits MSB-first, low position)`.
 fn mul_mag(a: &Numeric, b: &Numeric) -> (Vec<u8>, i32) {
-    let a_low = a.weight - (a.digits.len() as i32 - 1);
-    let b_low = b.weight - (b.digits.len() as i32 - 1);
+    let a_low = a.low();
+    let b_low = b.low();
     let low = a_low + b_low;
     let la = a.digits.len();
     let lb = b.digits.len();
@@ -1268,6 +1276,9 @@ fn mul_small_be(a: &[u8], m: u8) -> Vec<u8> {
 /// `(quotient, remainder)`, both big-endian and trimmed. `den` must be nonzero.
 fn long_divide(num: &[u8], den: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let den = trim_leading(den);
+    // The ten multiples `den*0 ..= den*9`, computed once and reused for every
+    // quotient digit's trial (instead of recomputing `den*q` per digit).
+    let multiples: [Vec<u8>; 10] = std::array::from_fn(|q| mul_small_be(den, q as u8));
     let mut quotient = Vec::with_capacity(num.len());
     let mut rem: Vec<u8> = Vec::new();
     for &digit in num {
@@ -1277,10 +1288,10 @@ fn long_divide(num: &[u8], den: &[u8]) -> (Vec<u8>, Vec<u8>) {
         rem = if trimmed.is_empty() { vec![0] } else { trimmed };
         // Largest q in 0..=9 with den*q <= rem.
         let mut q = 0u8;
-        while q < 9 && cmp_be(&mul_small_be(den, q + 1), &rem) != std::cmp::Ordering::Greater {
+        while q < 9 && cmp_be(&multiples[(q + 1) as usize], &rem) != std::cmp::Ordering::Greater {
             q += 1;
         }
-        rem = sub_be(&rem, &mul_small_be(den, q));
+        rem = sub_be(&rem, &multiples[q as usize]);
         quotient.push(q);
     }
     let qt = trim_leading(&quotient).to_vec();
@@ -1499,6 +1510,26 @@ mod tests {
         assert_eq!(n("Infinity").power(&n("2")).unwrap().to_display(), "Infinity");
         assert_eq!(n("2").power(&n("Infinity")).unwrap().to_display(), "Infinity");
         assert_eq!(n("2").power(&n("-Infinity")).unwrap().to_display(), "0");
+    }
+
+    #[test]
+    fn arithmetic_and_rounding_edge_cases() {
+        // Rounding that carries into a new leading digit.
+        assert_eq!(n("9.99").round(1).to_display(), "10.0");
+        assert_eq!(n("0.0099").round(2).to_display(), "0.01");
+        assert_eq!(n("99.99").round(0).to_display(), "100");
+        // Subtraction chaining borrows across many digits.
+        assert_eq!(arith("1000000", '-', "999999.0"), "1.0");
+        assert_eq!(arith("100", '-', "99.9999"), "0.0001");
+        // Long division with a multi-digit / internal-zero divisor.
+        assert_eq!(arith("100070", '/', "1007"), "99.3743793445878848");
+        // Perfect-square sqrt is exact (scale from the input's magnitude).
+        assert_eq!(n("152399025").sqrt().unwrap().to_display(), "12345.00000000000");
+        // Big multiplication stays exact.
+        assert_eq!(
+            arith("12345678901234567890", '*', "98765432109876543210"),
+            "1219326311370217952237463801111263526900"
+        );
     }
 
     #[test]

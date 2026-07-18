@@ -155,6 +155,23 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::NumMod => {
             return num(&args[0]).modulo(num(&args[1])).map(Value::Numeric).map_err(num_err);
         }
+        // `mod(intN, intN)`: remainder truncated toward zero (`MIN % -1 = 0`),
+        // division by zero is 22012 — same semantics as the `%` operator.
+        ScalarFn::ModInt => {
+            let zero = || err(sqlstate::DIVISION_BY_ZERO, "division by zero");
+            return match (&args[0], &args[1]) {
+                (Value::Int2(a), Value::Int2(b)) => {
+                    if *b == 0 { Err(zero()) } else { Ok(Value::Int2(a.checked_rem(*b).unwrap_or(0))) }
+                }
+                (Value::Int4(a), Value::Int4(b)) => {
+                    if *b == 0 { Err(zero()) } else { Ok(Value::Int4(a.checked_rem(*b).unwrap_or(0))) }
+                }
+                (Value::Int8(a), Value::Int8(b)) => {
+                    if *b == 0 { Err(zero()) } else { Ok(Value::Int8(a.checked_rem(*b).unwrap_or(0))) }
+                }
+                (a, b) => unreachable!("mod(int) on {a:?}, {b:?}"),
+            };
+        }
         ScalarFn::NumSqrt => {
             return num(&args[0]).sqrt().map(Value::Numeric).map_err(num_err);
         }
@@ -364,7 +381,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         | ScalarFn::NumLog
         | ScalarFn::NumExp
         | ScalarFn::NumPower
-        | ScalarFn::NumApplyTypmod => unreachable!("numeric functions return early"),
+        | ScalarFn::NumApplyTypmod
+        | ScalarFn::ModInt => unreachable!("numeric functions return early"),
     };
     result.map(Value::Float8)
 }

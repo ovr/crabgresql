@@ -150,6 +150,8 @@ pub enum ScalarFn {
     AbsF8,
     /// `log(float8) -> float8` (base 10).
     Log10F8,
+    /// `mod(intN, intN) -> intN` (dispatches on the operand's integer width).
+    ModInt,
 }
 
 struct Signature {
@@ -283,7 +285,14 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature { func: ScalarFn::NumAbs, args: &[NUM], ret: NUM },
             Signature { func: ScalarFn::AbsF8, args: &[F8], ret: F8 },
         ],
-        "mod" => &[Signature { func: ScalarFn::NumMod, args: &[NUM, NUM], ret: NUM }],
+        // Integer overloads keep the argument type (like PG); a numeric argument
+        // binds the numeric overload exactly.
+        "mod" => &[
+            Signature { func: ScalarFn::ModInt, args: &[PgType::Int2, PgType::Int2], ret: PgType::Int2 },
+            Signature { func: ScalarFn::ModInt, args: &[I4, I4], ret: I4 },
+            Signature { func: ScalarFn::ModInt, args: &[PgType::Int8, PgType::Int8], ret: PgType::Int8 },
+            Signature { func: ScalarFn::NumMod, args: &[NUM, NUM], ret: NUM },
+        ],
         "cbrt" => unary_f8!(ScalarFn::Cbrt),
         "exp" => num_and_f8!(ScalarFn::NumExp, ScalarFn::Exp),
         "ln" => num_and_f8!(ScalarFn::NumLn, ScalarFn::Ln),

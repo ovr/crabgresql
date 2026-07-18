@@ -169,6 +169,13 @@ SELECT mod(11, 4.0) AS m1, mod(-5.5, 2) AS m2;
  3.0 | -1.5
 (1 row)
 
+-- mod on integers keeps the integer type (only a numeric argument returns numeric)
+SELECT mod(11, 4) AS int_mod, mod(-7, 3) AS neg_mod;
+ int_mod | neg_mod 
+---------+---------
+       3 |      -1
+(1 row)
+
 -- sqrt on numeric (correctly rounded) and its domain error; a numeric-typed
 -- argument selects the numeric overload (an integer argument would resolve to
 -- the float8 sqrt, as in PG)
