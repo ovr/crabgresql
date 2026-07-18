@@ -101,6 +101,14 @@ pub trait TableAm: Send + Sync {
         }
         applied
     }
+
+    /// Remove every row (TRUNCATE). Row identity is not preserved: engines need
+    /// not keep tids reusable after a truncate. The default scans and deletes;
+    /// engines should override with a whole-table reset.
+    fn truncate(&self) {
+        let tids: Vec<Tid> = self.scan().map(|(tid, _)| tid).collect();
+        self.delete_many(tids);
+    }
 }
 
 /// Engine factory: `CREATE TABLE ... USING <engine>`.

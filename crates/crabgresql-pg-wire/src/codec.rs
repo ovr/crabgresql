@@ -233,6 +233,14 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
         self.write(&BackendMessage::NoticeResponse(fields));
     }
 
+    /// NoticeResponse with severity WARNING — e.g. "there is no transaction in
+    /// progress" on a redundant COMMIT/ROLLBACK.
+    pub fn warning_response(&mut self, code: &str, message: &str) {
+        self.write(&BackendMessage::NoticeResponse(ErrorFields::warning(
+            code, message,
+        )));
+    }
+
     /// Bytes queued but not yet flushed — lets callers flush in batches when
     /// streaming large result sets.
     pub fn buffered(&self) -> usize {

@@ -25,3 +25,6 @@ pub const GROUPING_ERROR: &str = "42803";
 pub const UNDEFINED_TABLE: &str = "42P01";
 pub const DUPLICATE_TABLE: &str = "42P07";
 pub const PROTOCOL_VIOLATION: &str = "08P01";
+pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
+pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
+pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";

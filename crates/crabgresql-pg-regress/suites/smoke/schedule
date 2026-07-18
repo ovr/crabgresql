@@ -4,3 +4,4 @@ test: cast
 test: timestamp
 test: timestamptz
 test: case
+test: transactions

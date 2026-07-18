@@ -83,14 +83,13 @@ pub async fn handle_connection(
             None | Some(FrontendMessage::Terminate) => return Ok(()),
             Some(FrontendMessage::Sync) => {
                 skip_until_sync = false;
-                writer.ready_for_query(TransactionStatus::Idle);
+                writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
             Some(_) if skip_until_sync => {}
             Some(FrontendMessage::Query(sql)) => {
                 run_simple_query(&sql, &engine, &mut session, &mut writer).await?;
-                // No transactions yet, so the session is always idle.
-                writer.ready_for_query(TransactionStatus::Idle);
+                writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
             // The codec decodes the extended-query, COPY and function-call
@@ -105,6 +104,8 @@ pub async fn handle_connection(
                     ),
                 );
                 writer.flush().await?;
+                // An error inside a block aborts it: the next Sync must report 'E'.
+                mark_transaction_failed(&mut session);
                 skip_until_sync = true;
             }
         }
@@ -116,9 +117,10 @@ pub async fn handle_connection(
 const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 
 /// One `Query` message: parse, run every statement, stream the responses.
-/// An execution error aborts the remaining statements, as in PG. (PG also
-/// rolls back the earlier statements' effects — that needs the M2
-/// transaction engine.)
+/// An execution error aborts the remaining statements, as in PG, and — inside
+/// an explicit transaction block — puts the session in the failed state so the
+/// next ReadyForQuery reports `E`. (PG also rolls back the earlier statements'
+/// data effects; that undo needs the M2 transaction engine.)
 async fn run_simple_query(
     sql: &str,
     engine: &Arc<dyn TableEngine>,
@@ -129,6 +131,8 @@ async fn run_simple_query(
         Ok(statements) => statements,
         Err(e) => {
             writer.error_response(sqlstate::SYNTAX_ERROR, &e.to_string());
+            // A syntax error inside a block aborts it, as in PG.
+            mark_transaction_failed(session);
             return Ok(());
         }
     };
@@ -141,17 +145,28 @@ async fn run_simple_query(
         match execute_statement(engine, stmt, session) {
             Ok(result) => {
                 if write_result(writer, result, efd).await? == WriteOutcome::Errored {
+                    mark_transaction_failed(session);
                     return Ok(());
                 }
             }
             Err(e) => {
                 let position = e.location.map(|(line, col)| char_position(sql, line, col));
                 writer.error_response_at(e.code, &e.message, position);
+                mark_transaction_failed(session);
                 return Ok(());
             }
         }
     }
     Ok(())
+}
+
+/// After a reported error, an open transaction block enters the failed state
+/// (`E`); an error outside a block leaves the status untouched (the implicit
+/// transaction ends at the statement boundary).
+fn mark_transaction_failed(session: &mut Session) {
+    if session.tx_status == TransactionStatus::InTransaction {
+        session.tx_status = TransactionStatus::Failed;
+    }
 }
 
 /// Convert a 1-based (line, column) span start into the 1-based character
@@ -184,7 +199,13 @@ async fn write_result(
     efd: i32,
 ) -> Result<WriteOutcome, ProtocolError> {
     match result {
-        QueryResult::Command { tag } => writer.command_complete(&tag),
+        QueryResult::Command { tag, notices } => {
+            // PG order: any WARNING notices, then CommandComplete.
+            for notice in &notices {
+                writer.warning_response(notice.code, &notice.message);
+            }
+            writer.command_complete(&tag);
+        }
         QueryResult::Rows { columns, mut node } => {
             let fields: Vec<FieldDescription> = columns
                 .iter()
