@@ -191,3 +191,55 @@ pub trait TableEngine: Send + Sync {
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError>;
 }
+
+/// A resolved `CREATE TYPE`: its OID and the builtin representation its values
+/// are physically stored as (from a `LIKE` clause), or `None` when the type
+/// declared only an `INTERNALLENGTH` and has no known backing builtin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserType {
+    pub oid: u32,
+    pub backing: Option<PgType>,
+}
+
+/// A registered `CREATE CAST (source AS target)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserCast {
+    /// `WITHOUT FUNCTION` — a binary-coercible cast that reinterprets the value's
+    /// bit pattern rather than running a conversion function.
+    pub without_function: bool,
+}
+
+/// Read-only view of the server's user-defined types and casts, so the query
+/// binder can resolve a `CREATE TYPE` name in an expression cast and apply a
+/// user-defined cast. The DDL layer (`GlobalCatalog`) implements this; callers
+/// with no user types (binder unit tests) use [`EmptyTypeCatalog`].
+pub trait TypeCatalog: Send + Sync {
+    /// Resolve a `CREATE TYPE` name (case-insensitive) to its OID and backing.
+    fn resolve_type(&self, name: &str) -> Option<UserType>;
+
+    /// The `CREATE CAST (source AS target)` for this ordered pair, if one was
+    /// registered. `source`/`target` are either builtins or `PgType::User(oid)`.
+    fn find_cast(&self, source: PgType, target: PgType) -> Option<UserCast>;
+
+    /// The backing builtin representation of a type: the type itself for a
+    /// builtin, or a user type's `LIKE` rep. Falls back to `ty` when unknown.
+    fn backing_rep(&self, ty: PgType) -> PgType;
+}
+
+/// A [`TypeCatalog`] with no user-defined types or casts — the default for
+/// callers (and binder unit tests) that never register any.
+pub struct EmptyTypeCatalog;
+
+impl TypeCatalog for EmptyTypeCatalog {
+    fn resolve_type(&self, _name: &str) -> Option<UserType> {
+        None
+    }
+
+    fn find_cast(&self, _source: PgType, _target: PgType) -> Option<UserCast> {
+        None
+    }
+
+    fn backing_rep(&self, ty: PgType) -> PgType {
+        ty
+    }
+}

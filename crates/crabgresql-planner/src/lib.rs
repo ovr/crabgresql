@@ -172,11 +172,12 @@ mod tests {
     use crabgresql_binder::{BinOp, bind_delete, bind_insert, bind_query, bind_update};
     use crabgresql_memory_storage::MemoryEngine;
     use crabgresql_parser::ast;
-    use crabgresql_storage_api::{Column, TableEngine, TableSchema};
+    use crabgresql_storage_api::{Column, EmptyTypeCatalog, TableEngine, TableSchema, TypeCatalog};
     use crabgresql_types::{PgType, Value};
 
     fn plan_sql(sql: &str) -> PhysicalPlan {
         let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
+        let catalog: Arc<dyn TypeCatalog> = Arc::new(EmptyTypeCatalog);
         engine
             .create_table(TableSchema {
                 name: "t".into(),
@@ -189,10 +190,10 @@ mod tests {
             .unwrap();
         let stmts = crabgresql_parser::parse(sql).unwrap();
         let logical = match &stmts[0] {
-            ast::Statement::Query(q) => bind_query(&engine, q),
-            ast::Statement::Insert(i) => bind_insert(&engine, i),
-            ast::Statement::Update(u) => bind_update(&engine, u),
-            ast::Statement::Delete(d) => bind_delete(&engine, d),
+            ast::Statement::Query(q) => bind_query(&engine, &catalog, q),
+            ast::Statement::Insert(i) => bind_insert(&engine, &catalog, i),
+            ast::Statement::Update(u) => bind_update(&engine, &catalog, u),
+            ast::Statement::Delete(d) => bind_delete(&engine, &catalog, d),
             other => panic!("unexpected statement: {other}"),
         }
         .unwrap();

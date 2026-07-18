@@ -9,9 +9,11 @@
 //! Clean-room (see AGENTS.md): the resolution rules, coercions, and error text
 //! reproduce PG's *observable* behavior, pinned by the regression corpus.
 
+use std::sync::Arc;
+
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{Column, TableSchema};
+use crabgresql_storage_api::{Column, TableSchema, TypeCatalog, UserCast};
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
     Numeric, PgType, Value, cast, date, float, interval, parse_bool, time, timestamp, timestamptz,
@@ -54,6 +56,16 @@ pub enum BoundExpr {
     Coerce {
         expr: Box<BoundExpr>,
         ty: PgType,
+    },
+    /// A binary-coercible (`CREATE CAST ... WITHOUT FUNCTION`) cast: reinterpret
+    /// the operand's bit pattern as `rep` (a builtin) at runtime via
+    /// `crabgresql_types::cast::reinterpret_value`. `reported` is the cast's
+    /// declared result type — possibly a `PgType::User(oid)` — while `rep` is the
+    /// concrete builtin the value is physically stored as.
+    Reinterpret {
+        expr: Box<BoundExpr>,
+        reported: PgType,
+        rep: PgType,
     },
     /// A scalar function call; `ret` is the result type.
     FuncCall {
@@ -165,6 +177,7 @@ impl BoundExpr {
             }
             BoundExpr::IsNull { .. } => PgType::Bool,
             BoundExpr::Coerce { ty, .. } => *ty,
+            BoundExpr::Reinterpret { reported, .. } => *reported,
             BoundExpr::FuncCall { ret, .. } => *ret,
             BoundExpr::Case { ty, .. } => *ty,
             BoundExpr::Srf { ret, .. } => *ret,
@@ -203,28 +216,32 @@ pub struct ScopeRel {
 /// with an alias the bare table name is not a valid qualifier — as in PG.
 pub struct Scope {
     rels: Vec<ScopeRel>,
+    /// User-defined type/cast view, so an expression cast to/from a `CREATE TYPE`
+    /// name resolves and a `WITHOUT FUNCTION` cast can be applied.
+    catalog: Arc<dyn TypeCatalog>,
 }
 
 impl Scope {
     /// No tables in scope: FROM-less SELECT, INSERT VALUES.
-    pub fn empty() -> Scope {
-        Scope { rels: Vec::new() }
+    pub fn empty(catalog: &Arc<dyn TypeCatalog>) -> Scope {
+        Scope { rels: Vec::new(), catalog: catalog.clone() }
     }
 
-    pub fn table(schema: &TableSchema, qualifier: String) -> Scope {
+    pub fn table(schema: &TableSchema, qualifier: String, catalog: &Arc<dyn TypeCatalog>) -> Scope {
         Scope {
             rels: vec![ScopeRel {
                 qualifier,
                 columns: schema.columns.clone(),
                 offset: 0,
             }],
+            catalog: catalog.clone(),
         }
     }
 
     /// A multi-relation scope for a cross join. Each `(qualifier, columns)` pair
     /// becomes a relation; offsets are assigned left-to-right so a column's
     /// index is its position in the concatenated row.
-    pub fn relations(items: Vec<(String, Vec<Column>)>) -> Scope {
+    pub fn relations(items: Vec<(String, Vec<Column>)>, catalog: &Arc<dyn TypeCatalog>) -> Scope {
         let mut offset = 0;
         let mut rels = Vec::with_capacity(items.len());
         for (qualifier, columns) in items {
@@ -236,7 +253,12 @@ impl Scope {
             });
             offset += width;
         }
-        Scope { rels }
+        Scope { rels, catalog: catalog.clone() }
+    }
+
+    /// The user-defined type/cast view carried through binding.
+    pub fn catalog(&self) -> &Arc<dyn TypeCatalog> {
+        &self.catalog
     }
 
     /// Resolve an unqualified column name. A name that matches exactly one
@@ -730,13 +752,73 @@ fn bind_cast(
     data_type: &ast::DataType,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
-    let target = map_data_type(data_type)?;
+    let target = match map_data_type(data_type) {
+        Ok(t) => t,
+        // Not a builtin type name — it may be a `CREATE TYPE` name; resolve it
+        // against the catalog, else surface the original "not supported" error.
+        Err(e) => match custom_type_name(data_type).and_then(|n| scope.catalog().resolve_type(&n)) {
+            Some(ut) => PgType::User(ut.oid),
+            None => return Err(e),
+        },
+    };
     let expr = match bind_expr(inner, scope)? {
         Binding::Unknown { lit, span } => resolve_unknown(lit, span, target)?,
-        Binding::Typed(e) => coerce_expr(e, target)?,
+        Binding::Typed(e) => coerce_cast(e, target, scope)?,
     };
     let expr = apply_numeric_typmod_if_any(expr, target, data_type)?;
     Ok(Binding::Typed(apply_length_typmod_if_any(expr, target, data_type)?))
+}
+
+/// The (normalized) name of a bare `DataType::Custom` type reference — e.g. the
+/// `xfloat4` in `x::xfloat4` — used to look a `CREATE TYPE` name up in the
+/// catalog. `None` for anything that is not a plain custom name.
+fn custom_type_name(dt: &ast::DataType) -> Option<String> {
+    match dt {
+        ast::DataType::Custom(obj, mods) if mods.is_empty() => {
+            obj.0.last().and_then(|p| p.as_ident()).map(normalize_ident)
+        }
+        _ => None,
+    }
+}
+
+/// Coerce `expr` to an explicit-cast `target`. When a user-defined type is on
+/// either side, the catalog decides whether the cast exists and how it runs
+/// (a `WITHOUT FUNCTION` cast reinterprets the bit pattern); otherwise this is
+/// the ordinary builtin coercion.
+fn coerce_cast(expr: BoundExpr, target: PgType, scope: &Scope) -> Result<BoundExpr, BindError> {
+    if matches!(expr.ty(), PgType::User(_)) || matches!(target, PgType::User(_)) {
+        return coerce_user_cast(expr, target, scope);
+    }
+    coerce_expr(expr, target)
+}
+
+/// Apply a cast where at least one side is a user-defined type. Only casts
+/// registered via `CREATE CAST` are allowed; a `WITHOUT FUNCTION` one lowers to
+/// a `Reinterpret` over the target's backing builtin.
+fn coerce_user_cast(
+    expr: BoundExpr,
+    target: PgType,
+    scope: &Scope,
+) -> Result<BoundExpr, BindError> {
+    let source = expr.ty();
+    if source == target {
+        return Ok(expr);
+    }
+    match scope.catalog().find_cast(source, target) {
+        Some(UserCast { without_function: true }) => Ok(BoundExpr::Reinterpret {
+            expr: Box::new(expr),
+            reported: target,
+            rep: scope.catalog().backing_rep(target),
+        }),
+        // WITH FUNCTION / WITH INOUT are rejected at `CREATE CAST`; guard anyway.
+        Some(UserCast { without_function: false }) => Err(BindError::feature_not_supported(
+            "cast with a conversion function is not supported yet",
+        )),
+        None => Err(BindError::new(
+            sqlstate::CANNOT_COERCE,
+            format!("cannot cast type {} to {}", source.name(), target.name()),
+        )),
+    }
 }
 
 fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {

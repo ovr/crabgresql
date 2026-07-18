@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_storage_api::{TypeCatalog, UserCast, UserType};
 use crabgresql_types::PgType;
 
 use crate::error::PgError;
@@ -90,12 +91,15 @@ enum DepId {
 }
 
 struct TypeEntry {
-    #[allow(dead_code)]
     oid: u32,
     /// `false` while the type is a bare shell (`CREATE TYPE name;`).
     defined: bool,
     /// Physical width (`pg_type.typlen`); -1 for variable-length.
     typlen: i32,
+    /// Backing builtin representation (from a `LIKE` clause), so a
+    /// `WITHOUT FUNCTION` cast can reinterpret values as this type. `None` when
+    /// the type declared only an `INTERNALLENGTH`.
+    backing: Option<PgType>,
     /// Objects that depend on this type, in creation order — the cascade set.
     dependents: Vec<DepId>,
 }
@@ -118,6 +122,8 @@ struct CastEntry {
     oid: u32,
     source: TypeRef,
     target: TypeRef,
+    /// `WITHOUT FUNCTION` — a binary-coercible (bit-reinterpret) cast.
+    without_function: bool,
 }
 
 impl CastEntry {
@@ -164,6 +170,25 @@ impl CatalogInner {
     fn cast(&self, oid: u32) -> Option<&CastEntry> {
         self.casts.iter().find(|c| c.oid == oid)
     }
+
+    /// The name of a user type by OID (reverse of the `types` map).
+    fn type_name_by_oid(&self, oid: u32) -> Option<&str> {
+        self.types
+            .iter()
+            .find(|(_, e)| e.oid == oid)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// A query-time `PgType` as the catalog's [`TypeRef`], so it can be matched
+    /// against a stored cast's source/target. `None` when a user OID is unknown.
+    fn type_ref_of(&self, ty: PgType) -> Option<TypeRef> {
+        match ty {
+            PgType::User(oid) => self
+                .type_name_by_oid(oid)
+                .map(|name| TypeRef::User(name.to_string())),
+            other => Some(TypeRef::Builtin(other)),
+        }
+    }
 }
 
 /// The shared user-object catalog. Cloned (as an `Arc`) into every connection.
@@ -198,6 +223,11 @@ impl GlobalCatalog {
         self.inner.read().unwrap().types.get(name).map(|e| e.typlen)
     }
 
+    /// Backing builtin of a user type, propagated when another type is `LIKE` it.
+    pub fn user_type_backing(&self, name: &str) -> Option<PgType> {
+        self.inner.read().unwrap().types.get(name).and_then(|e| e.backing)
+    }
+
     /// `CREATE TYPE name;` — register a shell type. Re-declaring any existing
     /// type (shell or fully defined) is a duplicate-object error, as in PG.
     pub fn create_shell_type(&self, name: &str) -> Result<Vec<CatalogNotice>, PgError> {
@@ -215,6 +245,7 @@ impl GlobalCatalog {
                 oid,
                 defined: false,
                 typlen: -1,
+                backing: None,
                 dependents: Vec::new(),
             },
         );
@@ -222,9 +253,15 @@ impl GlobalCatalog {
     }
 
     /// `CREATE TYPE name (...)` — fill in a previously declared shell (or create
-    /// a defined type directly). `typlen` is derived from the LIKE/INTERNALLENGTH
-    /// options by the caller.
-    pub fn define_type(&self, name: &str, typlen: i32) -> Result<Vec<CatalogNotice>, PgError> {
+    /// a defined type directly). `typlen`/`backing` are derived from the
+    /// LIKE/INTERNALLENGTH options by the caller; `backing` is the `LIKE` builtin
+    /// used for query-time `WITHOUT FUNCTION` casts.
+    pub fn define_type(
+        &self,
+        name: &str,
+        typlen: i32,
+        backing: Option<PgType>,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
         let mut cat = self.inner.write().unwrap();
         match cat.types.get_mut(name) {
             Some(entry) if entry.defined => Err(PgError::new(
@@ -234,6 +271,7 @@ impl GlobalCatalog {
             Some(entry) => {
                 entry.defined = true;
                 entry.typlen = typlen;
+                entry.backing = backing;
                 Ok(Vec::new())
             }
             None => {
@@ -244,6 +282,7 @@ impl GlobalCatalog {
                         oid,
                         defined: true,
                         typlen,
+                        backing,
                         dependents: Vec::new(),
                     },
                 );
@@ -381,6 +420,7 @@ impl GlobalCatalog {
             oid,
             source,
             target,
+            without_function,
         });
         Ok(Vec::new())
     }
@@ -438,6 +478,45 @@ impl GlobalCatalog {
                     target.display_name()
                 ),
             )),
+        }
+    }
+}
+
+/// Query-time view: lets the binder resolve a user type name in a cast target
+/// and apply a registered `WITHOUT FUNCTION` cast. Read-only (each method takes
+/// a read lock); binding never holds a write lock, so there is no re-entrancy.
+impl TypeCatalog for GlobalCatalog {
+    fn resolve_type(&self, name: &str) -> Option<UserType> {
+        let cat = self.inner.read().unwrap();
+        cat.types.get(name).map(|e| UserType {
+            oid: e.oid,
+            backing: e.backing,
+        })
+    }
+
+    fn find_cast(&self, source: PgType, target: PgType) -> Option<UserCast> {
+        let cat = self.inner.read().unwrap();
+        let source = cat.type_ref_of(source)?;
+        let target = cat.type_ref_of(target)?;
+        cat.casts
+            .iter()
+            .find(|c| c.source == source && c.target == target)
+            .map(|c| UserCast {
+                without_function: c.without_function,
+            })
+    }
+
+    fn backing_rep(&self, ty: PgType) -> PgType {
+        match ty {
+            PgType::User(oid) => {
+                let cat = self.inner.read().unwrap();
+                cat.types
+                    .values()
+                    .find(|e| e.oid == oid)
+                    .and_then(|e| e.backing)
+                    .unwrap_or(ty)
+            }
+            other => other,
         }
     }
 }
@@ -609,7 +688,7 @@ mod tests {
         // The argument NOTICE carries the type token's (line, column) for the
         // client's `LINE n:` caret; the return-type NOTICE (above) does not.
         assert_eq!(out_notices[0].position, Some((1, 28)));
-        cat.define_type("xfloat8", 8).unwrap();
+        cat.define_type("xfloat8", 8, Some(PgType::Int8)).unwrap();
         cat.create_cast(
             TypeRef::User("xfloat8".into()),
             TypeRef::Builtin(PgType::Int8),

@@ -1247,7 +1247,9 @@ mod tests {
         let crabgresql_parser::ast::Statement::Query(query) = &stmts[0] else {
             panic!("expected a query");
         };
-        let logical = crabgresql_binder::bind_query(engine, query).unwrap();
+        let catalog: Arc<dyn crabgresql_storage_api::TypeCatalog> =
+            Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+        let logical = crabgresql_binder::bind_query(engine, &catalog, query).unwrap();
         let physical = crabgresql_planner::plan(logical);
         let Execution::Rows { columns, mut node } =
             execute(physical, ExecContext::default(), &rtxn()).unwrap()
@@ -1295,7 +1297,9 @@ mod tests {
         let crabgresql_parser::ast::Statement::Query(query) = &stmts[0] else {
             panic!("expected a query");
         };
-        let logical = crabgresql_binder::bind_query(&engine, query).unwrap();
+        let catalog: Arc<dyn crabgresql_storage_api::TypeCatalog> =
+            Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+        let logical = crabgresql_binder::bind_query(&engine, &catalog, query).unwrap();
         let physical = crabgresql_planner::plan(logical);
         let Execution::Rows { mut node, .. } =
             execute(physical, ExecContext::default(), &rtxn()).unwrap()

@@ -32,6 +32,8 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, 
             Ok(Value::Bool(is_null != *negated))
         }
         BoundExpr::Coerce { expr, ty } => coerce_value(eval(expr, row, ctx)?, *ty, ctx),
+        BoundExpr::Reinterpret { expr, rep, .. } => cast::reinterpret_value(eval(expr, row, ctx)?, *rep)
+            .map_err(|e| ExecError::new(e.sqlstate, e.message)),
         BoundExpr::FuncCall { func, args, .. } => {
             let arg_values = args
                 .iter()
