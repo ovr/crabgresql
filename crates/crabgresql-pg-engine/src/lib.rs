@@ -119,20 +119,27 @@ impl TableEngine for PgEngine {
     }
 
     fn drop_table(&self, name: &str) -> Result<(), StorageError> {
-        let mut tables = self.tables.write().unwrap();
-        // The persistent catalog is the source of truth for existence; a missing
-        // entry there is the 42P01 case. Removing it first makes the drop durable
-        // before we touch the (rebuildable) in-memory map and physical file.
-        let rel = self
-            .catalog
-            .remove(name)
-            .expect("relation catalog write failed");
-        let Some(rel) = rel else {
-            return Err(StorageError::TableNotFound(name.to_string()));
+        // Remove the durable catalog entry and the in-memory handle together
+        // under the tables lock, so `open_table` never observes a half-dropped
+        // relation. The persistent catalog is the source of truth for existence:
+        // a missing entry there is the 42P01 case.
+        let rel = {
+            let mut tables = self.tables.write().unwrap();
+            let rel = self
+                .catalog
+                .remove(name)
+                .expect("relation catalog write failed");
+            let Some(rel) = rel else {
+                return Err(StorageError::TableNotFound(name.to_string()));
+            };
+            tables.remove(name);
+            rel
         };
-        tables.remove(name);
-        // Evict the relation's buffered pages so a later checkpoint can't write
-        // them back to the file we are about to unlink, then delete the file.
+        // Physical cleanup runs after the tables lock is released, so an IO error
+        // unlinking the file panics only this statement rather than poisoning the
+        // lock and disabling every other table operation. Evict the relation's
+        // buffered pages first so a later checkpoint can't write them back to the
+        // file we are about to unlink.
         self.inner.bufpool.forget_relation(rel);
         self.inner
             .bufpool

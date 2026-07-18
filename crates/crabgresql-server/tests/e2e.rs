@@ -234,6 +234,26 @@ async fn drop_table_lifecycle() {
 }
 
 #[tokio::test]
+async fn drop_table_rejects_duplicate_names() {
+    let mut socket = raw_session(spawn_server().await).await;
+    simple_query_raw(&mut socket, "CREATE TABLE t (a int)").await;
+
+    // A target named twice is rejected before anything is dropped, matching PG.
+    let msgs = simple_query_raw(&mut socket, "DROP TABLE t, t").await;
+    let err = fields(
+        msgs.iter()
+            .find(|(tag, _)| *tag == b'E')
+            .expect("must report an error"),
+    );
+    assert_eq!(err.code(), "42710");
+    assert_eq!(err.message(), "table \"t\" specified more than once");
+
+    // The table is untouched: the rejected DROP dropped nothing.
+    let msgs = simple_query_raw(&mut socket, "DROP TABLE t").await;
+    assert_eq!(command_tags(&msgs), ["DROP TABLE"]);
+}
+
+#[tokio::test]
 async fn drop_table_resolves_temp_first() {
     let mut socket = raw_session(spawn_server().await).await;
 

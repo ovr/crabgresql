@@ -896,6 +896,17 @@ fn execute_drop_table(
         .iter()
         .map(object_name_to_table_name)
         .collect::<Result<Vec<_>, _>>()?;
+    // A target named twice is rejected up front, before anything is dropped, as
+    // in PG — otherwise the second pass would re-drop (and, if a temp table
+    // shadows a permanent one, silently drop the permanent table too).
+    for (i, name) in tnames.iter().enumerate() {
+        if tnames[..i].contains(name) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("table \"{name}\" specified more than once"),
+            ));
+        }
+    }
     // Phase 1: validate. A missing target without IF EXISTS aborts the whole
     // statement before anything is dropped; with IF EXISTS it becomes a skip
     // NOTICE. PG spells the missing-object noun "table" here, not "relation".
