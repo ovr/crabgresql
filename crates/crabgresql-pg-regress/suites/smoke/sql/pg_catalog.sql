@@ -46,3 +46,16 @@ SELECT castsource, casttarget, castcontext
   FROM pg_cast
  WHERE castsource IN (20, 23) AND casttarget IN (20, 23)
  ORDER BY castsource, casttarget;
+-- a schema-qualified write reaches the permanent relation (INSERT accepts the
+-- public. qualifier symmetrically with SELECT/UPDATE)
+CREATE TABLE pgcat_pub (v int);
+INSERT INTO public.pgcat_pub VALUES (7);
+UPDATE public.pgcat_pub SET v = v + 1;
+SELECT v FROM public.pgcat_pub;
+-- a temp relation is reflected into pg_class
+CREATE TEMP TABLE pgcat_tmp (z int);
+SELECT relname, relnatts FROM pg_class WHERE relname = 'pgcat_tmp';
+-- a qualified miss reports the schema in the 42P01 message, as PG does
+SELECT * FROM pg_catalog.no_such_catalog;
+-- writing a system catalog is refused
+INSERT INTO pg_catalog.pg_type VALUES (1);

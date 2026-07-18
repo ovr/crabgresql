@@ -160,7 +160,7 @@ pub fn pg_class_schema() -> TableSchema {
 /// `public` (namespace 2200), are ordinary heaps (`relkind = 'r'`, `relam = 2`)
 /// and permanent (`relpersistence = 'p'`); the synthetic OIDs are stable within
 /// one catalog snapshot so a join to `pg_attribute.attrelid` lines up.
-pub fn pg_class_rows(relations: &[(u32, &TableSchema)]) -> Vec<Vec<Value>> {
+pub fn pg_class_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
     relations
         .iter()
         .map(|(oid, schema)| {
@@ -200,7 +200,7 @@ pub fn pg_attribute_schema() -> TableSchema {
 
 /// Build `pg_attribute` rows: one per column of each relation, `attnum` 1-based
 /// (user columns only), typed from the column's `PgType` (`atttypid`/`attlen`).
-pub fn pg_attribute_rows(relations: &[(u32, &TableSchema)]) -> Vec<Vec<Value>> {
+pub fn pg_attribute_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
     for (oid, schema) in relations {
         for (i, c) in schema.columns.iter().enumerate() {

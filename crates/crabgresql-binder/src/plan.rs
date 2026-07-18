@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{Column, TableAm, TableEngine, TypeCatalog};
+use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TypeCatalog};
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
@@ -157,31 +157,57 @@ fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, BindError
     }
 }
 
-/// Resolve a `FROM`/`UPDATE`/`DELETE` target: the table plus the qualifier its
-/// columns may be addressed by (the alias when present, as in PG). The engine's
-/// `resolve` honors the search path, so an unqualified `pg_type` reaches
-/// `pg_catalog` and `pg_catalog.pg_type` routes there directly. A column-list
-/// alias is rejected via [`aliased_qualifier`] — it is meaningful only for
-/// `FROM` items, which bind through [`bind_from_item`].
-fn open_relation(
-    engine: &Arc<dyn TableEngine>,
-    relation: &ast::TableFactor,
-) -> Result<(Arc<dyn TableAm>, String), BindError> {
-    let ast::TableFactor::Table { name, alias, .. } = relation else {
-        return Err(BindError::feature_not_supported(format!(
-            "FROM item is not supported yet: {relation}"
-        )));
-    };
-    let (schema, table_name) = split_relation_name(name)?;
-    let qualifier = aliased_qualifier(alias, table_name.clone())?;
-    let table = engine.resolve(schema.as_deref(), &table_name)?;
-    Ok((table, qualifier))
+/// The relation name for a user-facing error, schema-qualified exactly as the
+/// user wrote it — so a miss reports `relation "pg_catalog.pg_type" does not
+/// exist`, matching PG rather than dropping the schema.
+fn display_relation_name(schema: Option<&str>, name: &str) -> String {
+    match schema {
+        Some(s) => format!("{s}.{name}"),
+        None => name.to_string(),
+    }
 }
 
-/// Resolve an `UPDATE`/`DELETE` target. Writes go through `open_table` (user
-/// data only), never the search-path-aware `resolve`, so a mutation can never
-/// reach the read-only system catalog. A schema qualifier other than the
-/// default `public` is unsupported for a write target.
+/// Rewrite a `TableNotFound` so its relation name carries the schema qualifier
+/// the user typed (other storage errors pass through unchanged).
+fn not_found_as_written(e: StorageError, schema: Option<&str>, name: &str) -> BindError {
+    match e {
+        StorageError::TableNotFound(_) => {
+            StorageError::TableNotFound(display_relation_name(schema, name)).into()
+        }
+        other => other.into(),
+    }
+}
+
+/// Resolve a write target (INSERT/UPDATE/DELETE) and its bare relation name.
+/// A write never reaches the read-only system catalog: an unqualified name
+/// searches temp then global (never `pg_catalog`), `public.` targets the
+/// permanent relation only, `pg_temp.` the session temp store, and a write to
+/// `pg_catalog` (or any other schema) is refused.
+fn resolve_write_table(
+    engine: &Arc<dyn TableEngine>,
+    name: &ast::ObjectName,
+) -> Result<(Arc<dyn TableAm>, String), BindError> {
+    let (schema, table_name) = split_relation_name(name)?;
+    let table = match schema.as_deref() {
+        // Unqualified: temp then global — `open_table` never consults the
+        // system catalog, so this cannot resolve to a read-only relation.
+        None => engine.open_table(&table_name),
+        Some("pg_catalog") => {
+            // Matches PG's observable error for a non-superuser writing a system
+            // catalog (crabgresql has no roles, so this is the default posture).
+            return Err(BindError::new(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                format!("permission denied for table {table_name}"),
+            ));
+        }
+        // `public.` -> global only, `pg_temp.` -> temp only, other -> not found.
+        Some(_) => engine.resolve(schema.as_deref(), &table_name),
+    };
+    let table = table.map_err(|e| not_found_as_written(e, schema.as_deref(), &table_name))?;
+    Ok((table, table_name))
+}
+
+/// Resolve an `UPDATE`/`DELETE` target plus the qualifier for its columns.
 fn open_write_relation(
     engine: &Arc<dyn TableEngine>,
     relation: &ast::TableFactor,
@@ -191,16 +217,8 @@ fn open_write_relation(
             "target is not supported yet: {relation}"
         )));
     };
-    let (schema, table_name) = split_relation_name(name)?;
-    if let Some(s) = &schema
-        && s != "public"
-    {
-        return Err(BindError::feature_not_supported(format!(
-            "cannot modify relation in schema \"{s}\""
-        )));
-    }
-    let qualifier = aliased_qualifier(alias, table_name.clone())?;
-    let table = engine.open_table(&table_name)?;
+    let (table, table_name) = resolve_write_table(engine, name)?;
+    let qualifier = aliased_qualifier(alias, table_name)?;
     Ok((table, qualifier))
 }
 
@@ -563,7 +581,12 @@ fn bind_from_item(
                     input: JoinInput::Subplan(Box::new(cte.plan.clone())),
                 });
             }
-            let table = engine.open_table(&tname)?;
+            // Read resolution honors the search path: an unqualified `pg_type`
+            // reaches `pg_catalog`, and `pg_catalog.pg_type` routes there
+            // directly (a qualified miss keeps its schema in the error text).
+            let table = engine
+                .resolve(cte_schema.as_deref(), &tname)
+                .map_err(|e| not_found_as_written(e, cte_schema.as_deref(), &tname))?;
             let qualifier = relation_qualifier(alias, &tname);
             let mut columns: Vec<OutputColumn> = table
                 .schema()
@@ -1138,8 +1161,8 @@ pub fn bind_insert(
     catalog: &Arc<dyn TypeCatalog>,
     insert: &ast::Insert,
 ) -> Result<LogicalPlan, BindError> {
-    let name = match &insert.table {
-        ast::TableObject::TableName(name) => object_name_to_table_name(name)?,
+    let target = match &insert.table {
+        ast::TableObject::TableName(name) => name,
         other => {
             return Err(BindError::feature_not_supported(format!(
                 "INSERT target is not supported yet: {other}"
@@ -1156,7 +1179,10 @@ pub fn bind_insert(
             "ON CONFLICT is not supported yet",
         ));
     }
-    let table = engine.open_table(&name)?;
+    // Same write-target routing as UPDATE/DELETE: `public.t` reaches the
+    // permanent relation, a write to `pg_catalog` is refused, and the system
+    // catalog is never a write target.
+    let (table, name) = resolve_write_table(engine, target)?;
     let schema = table.schema().clone();
 
     // Map the column list (or its absence) to positions in the table schema.

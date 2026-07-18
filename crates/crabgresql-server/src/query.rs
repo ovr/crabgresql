@@ -115,10 +115,20 @@ pub fn execute_statement(
     // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
     // so it keeps the raw engine + session below.
     // The read-only system catalog (`pg_catalog`), rebuilt per statement so its
-    // rows reflect current server state: live user relations are reflected into
-    // pg_class/pg_attribute. It sits behind temp + global on the search path.
-    let system: Arc<dyn TableEngine> =
-        Arc::new(crabgresql_catalog::SystemCatalog::with_relations(engine.relations()));
+    // rows reflect current server state: live user relations (permanent + this
+    // session's temp tables) are reflected into pg_class/pg_attribute. The
+    // relation enumeration is lazy — only a query that actually opens
+    // pg_class/pg_attribute pays for it. It sits behind temp + global on the
+    // search path.
+    let system: Arc<dyn TableEngine> = {
+        let global = engine.clone();
+        let temp = session.temp.clone();
+        Arc::new(crabgresql_catalog::SystemCatalog::with_relations_fn(move || {
+            let mut rels = global.relations();
+            rels.extend(temp.relations());
+            rels
+        }))
+    };
     let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
         session.temp.clone(),
         engine.clone(),

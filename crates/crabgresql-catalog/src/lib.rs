@@ -24,7 +24,7 @@
 mod schema;
 mod static_table;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::{StorageError, TableAm, TableEngine, TableSchema};
 use crabgresql_types::Value;
@@ -77,21 +77,24 @@ pub struct PgCastRow {
 include!(concat!(env!("OUT_DIR"), "/pg_type_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 
-/// The names of the relations [`SystemCatalog`] can serve. Used by resolvers to
-/// decide whether an unqualified name belongs to `pg_catalog`.
-pub fn is_system_relation(name: &str) -> bool {
-    matches!(
-        name,
-        "pg_type" | "pg_namespace" | "pg_class" | "pg_attribute" | "pg_cast"
-    )
-}
+/// Produces the live user relations to reflect into `pg_class`/`pg_attribute`.
+/// Boxed so it can capture the server engines and run lazily — only a query that
+/// actually opens `pg_class`/`pg_attribute` pays the cost of enumerating them.
+type RelationsFn = Box<dyn Fn() -> Vec<TableSchema> + Send + Sync>;
 
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so
-/// its rows reflect current server state: `relations` are the live user
-/// relations, reflected into `pg_class`/`pg_attribute`.
-#[derive(Default)]
+/// its rows reflect current server state; live user relations are supplied by a
+/// closure that is invoked at most once (and only when `pg_class`/`pg_attribute`
+/// is opened), memoized in `oids`.
 pub struct SystemCatalog {
-    relations: Vec<TableSchema>,
+    relations: RelationsFn,
+    oids: OnceLock<Vec<(u32, TableSchema)>>,
+}
+
+impl Default for SystemCatalog {
+    fn default() -> Self {
+        Self::with_relations_fn(Vec::new)
+    }
 }
 
 impl SystemCatalog {
@@ -100,23 +103,31 @@ impl SystemCatalog {
         Self::default()
     }
 
-    /// A catalog reflecting the given live user relations into
+    /// A catalog reflecting a fixed set of live user relations into
     /// `pg_class`/`pg_attribute`.
     pub fn with_relations(relations: Vec<TableSchema>) -> Self {
-        Self { relations }
+        Self::with_relations_fn(move || relations.clone())
     }
 
-    /// Assign a stable synthetic OID to each user relation. Sorted by name so
-    /// `pg_class` and `pg_attribute` (built by separate `open_table` calls)
-    /// agree on every relation's OID, keeping their join consistent.
-    fn relation_oids(&self) -> Vec<(u32, &TableSchema)> {
-        let mut sorted: Vec<&TableSchema> = self.relations.iter().collect();
-        sorted.sort_by(|a, b| a.name.cmp(&b.name));
-        sorted
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| (FIRST_REL_OID + i as u32, s))
-            .collect()
+    /// A catalog that enumerates its live user relations lazily via `f` (invoked
+    /// at most once, only if a relation-backed catalog is opened).
+    pub fn with_relations_fn(f: impl Fn() -> Vec<TableSchema> + Send + Sync + 'static) -> Self {
+        Self { relations: Box::new(f), oids: OnceLock::new() }
+    }
+
+    /// Assign a stable synthetic OID to each user relation, computed once and
+    /// memoized. Sorted by name so `pg_class` and `pg_attribute` (built by
+    /// separate `open_table` calls) agree on every relation's OID, keeping their
+    /// join consistent.
+    fn relation_oids(&self) -> &[(u32, TableSchema)] {
+        self.oids.get_or_init(|| {
+            let mut rels = (self.relations)();
+            rels.sort_by(|a, b| a.name.cmp(&b.name));
+            rels.into_iter()
+                .enumerate()
+                .map(|(i, s)| (FIRST_REL_OID + i as u32, s))
+                .collect()
+        })
     }
 
     /// Build the requested relation's rows + schema, or `None` if unknown.
@@ -125,11 +136,11 @@ impl SystemCatalog {
             "pg_type" => Some((schema::pg_type_schema(), schema::pg_type_builtin_rows())),
             "pg_namespace" => Some((schema::pg_namespace_schema(), schema::pg_namespace_rows())),
             "pg_class" => {
-                Some((schema::pg_class_schema(), schema::pg_class_rows(&self.relation_oids())))
+                Some((schema::pg_class_schema(), schema::pg_class_rows(self.relation_oids())))
             }
             "pg_attribute" => Some((
                 schema::pg_attribute_schema(),
-                schema::pg_attribute_rows(&self.relation_oids()),
+                schema::pg_attribute_rows(self.relation_oids()),
             )),
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
             _ => None,
@@ -244,6 +255,46 @@ mod tests {
         assert_eq!(alpha_attrs[0][anum], Value::Int2(1));
         assert_eq!(alpha_attrs[0][atypid], Value::Oid(23)); // int4
         assert_eq!(alpha_attrs[1][atypid], Value::Oid(25)); // text
+    }
+
+    #[test]
+    fn pg_type_rows_agree_with_pgtype_for_modeled_types() {
+        use crabgresql_types::PgType;
+        // Types crabgresql models: their .dat-generated pg_type row must agree
+        // with the authoritative PgType::oid()/typlen() used everywhere else, or
+        // a pg_attribute.atttypid -> pg_type.oid join silently mismatches.
+        let modeled = [
+            ("bool", PgType::Bool),
+            ("int2", PgType::Int2),
+            ("int4", PgType::Int4),
+            ("int8", PgType::Int8),
+            ("float4", PgType::Float4),
+            ("float8", PgType::Float8),
+            ("numeric", PgType::Numeric),
+            ("text", PgType::Text),
+            ("varchar", PgType::Varchar),
+            ("bpchar", PgType::Bpchar),
+            ("name", PgType::Name),
+            ("oid", PgType::Oid),
+            ("bytea", PgType::Bytea),
+            ("date", PgType::Date),
+            ("time", PgType::Time),
+            ("timetz", PgType::TimeTz),
+            ("timestamp", PgType::Timestamp),
+            ("timestamptz", PgType::TimestampTz),
+            ("interval", PgType::Interval),
+            ("uuid", PgType::Uuid),
+            ("inet", PgType::Inet),
+            ("cidr", PgType::Cidr),
+        ];
+        for (typname, ty) in modeled {
+            let row = PG_TYPE_ROWS
+                .iter()
+                .find(|r| r.typname == typname)
+                .unwrap_or_else(|| panic!("pg_type.dat has a row for {typname}"));
+            assert_eq!(row.oid, ty.oid(), "{typname} oid drift (.dat vs PgType)");
+            assert_eq!(row.typlen, ty.typlen(), "{typname} typlen drift (.dat vs PgType)");
+        }
     }
 
     #[test]

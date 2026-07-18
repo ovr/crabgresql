@@ -104,3 +104,28 @@ SELECT castsource, casttarget, castcontext
          23 |         20 | i
 (2 rows)
 
+-- a schema-qualified write reaches the permanent relation (INSERT accepts the
+-- public. qualifier symmetrically with SELECT/UPDATE)
+CREATE TABLE pgcat_pub (v int);
+INSERT INTO public.pgcat_pub VALUES (7);
+UPDATE public.pgcat_pub SET v = v + 1;
+SELECT v FROM public.pgcat_pub;
+ v 
+---
+ 8
+(1 row)
+
+-- a temp relation is reflected into pg_class
+CREATE TEMP TABLE pgcat_tmp (z int);
+SELECT relname, relnatts FROM pg_class WHERE relname = 'pgcat_tmp';
+  relname  | relnatts 
+-----------+----------
+ pgcat_tmp |        1
+(1 row)
+
+-- a qualified miss reports the schema in the 42P01 message, as PG does
+SELECT * FROM pg_catalog.no_such_catalog;
+ERROR:  relation "pg_catalog.no_such_catalog" does not exist
+-- writing a system catalog is refused
+INSERT INTO pg_catalog.pg_type VALUES (1);
+ERROR:  permission denied for table pg_type

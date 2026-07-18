@@ -46,15 +46,21 @@ impl TableEngine for SessionCatalog {
     }
 
     /// Search-path-aware read resolution. An unqualified name searches temp →
-    /// global → system (so `pg_catalog` is implicitly on the path, after user
-    /// relations). A schema qualifier routes to exactly one namespace.
+    /// system → global, mirroring PostgreSQL's implicit order (`pg_temp`, then
+    /// `pg_catalog`, then the path): so `pg_catalog` wins over a like-named user
+    /// relation in `public`, as in PG. A schema qualifier routes to exactly one
+    /// namespace.
     fn resolve(
         &self,
         schema: Option<&str>,
         name: &str,
     ) -> Result<Arc<dyn TableAm>, StorageError> {
         match schema {
-            None => Self::or_else_not_found(self.open_table(name), || self.system.open_table(name)),
+            None => Self::or_else_not_found(self.temp.open_table(name), || {
+                Self::or_else_not_found(self.system.open_table(name), || {
+                    self.global.open_table(name)
+                })
+            }),
             Some("pg_catalog") => self.system.open_table(name),
             Some("public") => self.global.open_table(name),
             Some("pg_temp") => self.temp.open_table(name),

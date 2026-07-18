@@ -310,12 +310,14 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Money(c), PgType::Numeric) => Ok(Value::Numeric(money_to_numeric(*c))),
 
         // ---- integer <-> oid ----
-        // PG's int4->oid/int8->oid wrap through the unsigned 32-bit range (an
-        // out-of-range int8 wraps rather than erroring, matching `int8_oid`);
-        // oid->int8 is exact, oid->int4 reinterprets the bit pattern.
+        // int2/int4 always fit the unsigned 32-bit range once reinterpreted, and
+        // a negative wraps (PG's `(-1)::oid` is 4294967295). int8 can exceed the
+        // range, so it is bounds-checked: a magnitude past 32 bits is `22003 OID
+        // out of range` rather than a silent truncation. oid->int8 is exact,
+        // oid->int4 reinterprets the bit pattern.
         (Value::Int2(n), PgType::Oid) => Ok(Value::Oid(*n as u32)),
         (Value::Int4(n), PgType::Oid) => Ok(Value::Oid(*n as u32)),
-        (Value::Int8(n), PgType::Oid) => Ok(Value::Oid(*n as u32)),
+        (Value::Int8(n), PgType::Oid) => int8_to_oid(*n),
         (Value::Oid(n), PgType::Int8) => Ok(Value::Int8(*n as i64)),
         (Value::Oid(n), PgType::Int4) => Ok(Value::Int4(*n as i32)),
 
@@ -468,19 +470,41 @@ pub fn text_to_int(s: &str, ty: PgType) -> Result<Value, CastError> {
     }
 }
 
-/// `oidin`: parse an unsigned 32-bit object identifier from text. Malformed
-/// input is `22P02`; a magnitude past `u32::MAX` is `22003` (`value "…" is out
-/// of range for type oid`). Shared by the binder's `parse_unknown` so `'42'::oid`
-/// and an untyped literal in an oid context never drift.
+/// `oidin`: parse an object identifier from text. Like PG's input function, an
+/// optional leading sign is accepted and a negative wraps into the unsigned
+/// range (`'-1'::oid` = 4294967295), while a magnitude past 32 bits is `22003`
+/// (`value "…" is out of range for type oid`) and any non-numeric text is
+/// `22P02`. Shared by the binder's `parse_unknown` so `'42'::oid` and an untyped
+/// literal in an oid context never drift.
 pub fn text_to_oid(s: &str) -> Result<Value, CastError> {
     use std::num::IntErrorKind;
     let t = s.trim();
-    t.parse::<u32>().map(Value::Oid).map_err(|e| match e.kind() {
-        IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
-            value_out_of_range(PgType::Oid, s)
+    match t.parse::<i64>() {
+        Ok(n) if oid_in_range(n) => Ok(Value::Oid(n as u32)),
+        // Parsed as a number but too large/small to be a 32-bit oid.
+        Ok(_) => Err(value_out_of_range(PgType::Oid, s)),
+        Err(e) if matches!(e.kind(), IntErrorKind::PosOverflow | IntErrorKind::NegOverflow) => {
+            Err(value_out_of_range(PgType::Oid, s))
         }
-        _ => invalid_input(PgType::Oid, s),
-    })
+        Err(_) => Err(invalid_input(PgType::Oid, s)),
+    }
+}
+
+/// `int8 -> oid`: reinterpret into the unsigned 32-bit range, wrapping a
+/// negative (as `int4 -> oid` does), but reject a magnitude past 32 bits with
+/// `22003` rather than silently truncating.
+fn int8_to_oid(n: i64) -> Result<Value, CastError> {
+    if oid_in_range(n) {
+        Ok(Value::Oid(n as u32))
+    } else {
+        Err(out_of_range(PgType::Oid))
+    }
+}
+
+/// Whether a signed value maps to an oid without losing its magnitude: any
+/// unsigned 32-bit value, plus the negatives that wrap into that range.
+fn oid_in_range(n: i64) -> bool {
+    (-(u32::MAX as i64)..=u32::MAX as i64).contains(&n)
 }
 
 /// `numeric_int2`/`_int4`/`_int8`: round half away from zero, then range-check.
@@ -801,5 +825,29 @@ mod tests {
         let e = cast(Value::Bool(true), PgType::Int4).unwrap_err();
         assert_eq!(e.sqlstate, "42846");
         assert_eq!(e.message, "cannot cast type boolean to integer");
+    }
+
+    #[test]
+    fn int8_to_oid_wraps_negatives_but_rejects_out_of_range() {
+        // In range: exact.
+        assert_eq!(cast(Value::Int8(2200), PgType::Oid).unwrap(), Value::Oid(2200));
+        // Negative wraps like PG's `(-1)::oid` = 4294967295.
+        assert_eq!(cast(Value::Int8(-1), PgType::Oid).unwrap(), Value::Oid(u32::MAX));
+        assert_eq!(cast(Value::Int8(u32::MAX as i64), PgType::Oid).unwrap(), Value::Oid(u32::MAX));
+        // Past the 32-bit range errors (22003) instead of silently truncating.
+        let e = cast(Value::Int8(u32::MAX as i64 + 1), PgType::Oid).unwrap_err();
+        assert_eq!(e.sqlstate, "22003");
+    }
+
+    #[test]
+    fn text_to_oid_accepts_negatives_and_bounds() {
+        assert_eq!(text_to_oid("42").unwrap(), Value::Oid(42));
+        assert_eq!(text_to_oid("  2200 ").unwrap(), Value::Oid(2200));
+        // oidin accepts a leading minus and wraps (PG: '-1'::oid = 4294967295).
+        assert_eq!(text_to_oid("-1").unwrap(), Value::Oid(u32::MAX));
+        // Magnitude past 32 bits is out of range, not a truncated success.
+        assert_eq!(text_to_oid("4294967296").unwrap_err().sqlstate, "22003");
+        // Non-numeric is 22P02.
+        assert_eq!(text_to_oid("abc").unwrap_err().sqlstate, "22P02");
     }
 }
