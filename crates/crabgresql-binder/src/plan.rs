@@ -1390,6 +1390,7 @@ fn rewrite_over_aggregate(
     match expr {
         BoundExpr::Aggregate {
             func,
+            distinct,
             arg,
             input_ty,
             ret,
@@ -1403,6 +1404,7 @@ fn rewrite_over_aggregate(
             let index = group_exprs.len() + aggregates.len();
             aggregates.push(BoundAggregate {
                 func,
+                distinct,
                 arg: arg.map(|a| *a),
                 input_ty,
                 ret,
@@ -1906,6 +1908,25 @@ mod tests {
     }
 
     #[test]
+    fn distinct_and_all_aggregate_treatments_are_preserved() {
+        let (_g, aggregates, _p, _h) =
+            agg_of("SELECT count(DISTINCT id), sum(ALL id), avg(id) FROM t");
+        assert_eq!(aggregates.len(), 3);
+        assert!(aggregates[0].distinct);
+        assert!(!aggregates[1].distinct);
+        assert!(!aggregates[2].distinct);
+    }
+
+    #[test]
+    fn duplicate_treatment_with_wildcard_is_a_syntax_error() {
+        for sql in ["SELECT count(DISTINCT *) FROM t", "SELECT count(ALL *) FROM t"] {
+            let err = bind_err(sql);
+            assert_eq!(err.code, sqlstate::SYNTAX_ERROR);
+            assert_eq!(err.message, "syntax error at or near \"*\"");
+        }
+    }
+
+    #[test]
     fn expression_over_aggregates_rewrites_each_call() {
         let (_g, aggregates, projections, _h) = agg_of("SELECT max(id) - min(id) FROM t");
         assert_eq!(aggregates.len(), 2);
@@ -2077,14 +2098,6 @@ mod tests {
         assert_eq!(
             bind_err("SELECT avg(name) FROM t").code,
             sqlstate::UNDEFINED_FUNCTION
-        );
-    }
-
-    #[test]
-    fn distinct_aggregate_is_unsupported() {
-        assert_eq!(
-            bind_err("SELECT count(DISTINCT id) FROM t").code,
-            sqlstate::FEATURE_NOT_SUPPORTED
         );
     }
 

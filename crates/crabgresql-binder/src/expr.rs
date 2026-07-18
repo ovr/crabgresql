@@ -98,6 +98,9 @@ pub enum BoundExpr {
     /// before planning. Evaluating it as a scalar is a bug (see `executor::eval`).
     Aggregate {
         func: AggFn,
+        /// Whether duplicate non-NULL input values are eliminated before this
+        /// aggregate accumulates them.
+        distinct: bool,
         /// `None` for `COUNT(*)` (count every row); the per-row argument
         /// expression otherwise.
         arg: Option<Box<BoundExpr>>,
@@ -115,6 +118,9 @@ pub enum BoundExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundAggregate {
     pub func: AggFn,
+    /// Whether duplicate non-NULL input values are eliminated per group before
+    /// accumulation.
+    pub distinct: bool,
     /// Evaluated per source row; `None` = `COUNT(*)`.
     pub arg: Option<BoundExpr>,
     pub input_ty: PgType,

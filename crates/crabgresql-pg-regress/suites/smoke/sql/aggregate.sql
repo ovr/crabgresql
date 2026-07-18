@@ -46,5 +46,6 @@ SELECT count(*) FROM agg WHERE count(*) > 1;
 SELECT max(min(val)) FROM agg;
 -- errors: no sum over text
 SELECT sum(txt) FROM agg;
--- errors: DISTINCT inside an aggregate is not supported yet
-SELECT count(DISTINCT grp) FROM agg;
+-- DISTINCT eliminates duplicate non-NULL aggregate inputs
+SELECT count(DISTINCT grp), sum(DISTINCT grp), avg(DISTINCT grp), min(DISTINCT grp), max(DISTINCT grp) FROM agg;
+-- End aggregate tests.

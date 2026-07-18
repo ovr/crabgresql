@@ -665,6 +665,9 @@ pub struct Aggregate {
 struct AggGroup {
     key: Vec<Value>,
     accumulators: Vec<agg::Accumulator>,
+    /// One optional seen-value set per aggregate. Non-DISTINCT aggregates have
+    /// no set and therefore retain their streaming accumulation behavior.
+    distinct_values: Vec<Option<agg::DistinctValues>>,
 }
 
 impl Aggregate {
@@ -697,6 +700,11 @@ impl Aggregate {
             groups.push(AggGroup {
                 key: Vec::new(),
                 accumulators: self.aggregates.iter().map(agg::Accumulator::new).collect(),
+                distinct_values: self
+                    .aggregates
+                    .iter()
+                    .map(|agg| agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty)))
+                    .collect(),
             });
         }
         while let Some(row) = self.child.next()? {
@@ -724,16 +732,23 @@ impl Aggregate {
                                 .iter()
                                 .map(agg::Accumulator::new)
                                 .collect(),
+                            distinct_values: self
+                                .aggregates
+                                .iter()
+                                .map(|agg| agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty)))
+                                .collect(),
                         });
                         bucket.push(i);
                         i
                     }
                 }
             };
-            for (agg, acc) in self
+            let group = &mut groups[idx];
+            for ((agg, acc), distinct_values) in self
                 .aggregates
                 .iter()
-                .zip(groups[idx].accumulators.iter_mut())
+                .zip(group.accumulators.iter_mut())
+                .zip(group.distinct_values.iter_mut())
             {
                 match &agg.arg {
                     // COUNT(*) counts every row, skipping no NULLs.
@@ -742,7 +757,9 @@ impl Aggregate {
                         let v = eval(arg, &row, self.ctx)?;
                         // Every aggregate but COUNT(*) ignores NULL inputs.
                         if !matches!(v, Value::Null) {
-                            acc.accumulate(v)?;
+                            if distinct_values.as_mut().is_none_or(|seen| seen.insert(&v)) {
+                                acc.accumulate(v)?;
+                            }
                         }
                     }
                 }
@@ -1597,6 +1614,63 @@ mod tests {
     }
 
     #[test]
+    fn distinct_aggregates_deduplicate_per_group_and_per_call() {
+        let engine = MemoryEngine::new();
+        let table = engine
+            .create_table(TableSchema {
+                name: "d".into(),
+                columns: vec![Column::new("g", PgType::Int4), Column::new("v", PgType::Int4)],
+            })
+            .unwrap();
+        let txn = wtxn();
+        for (g, v) in [
+            (1, Some(10)),
+            (1, Some(10)),
+            (1, None),
+            (2, Some(5)),
+            (2, Some(5)),
+            (2, None),
+        ] {
+            table.insert(
+                vec![Value::Int4(g), v.map(Value::Int4).unwrap_or(Value::Null)],
+                &txn,
+            );
+        }
+        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT g, count(DISTINCT v), sum(DISTINCT v), avg(DISTINCT v), min(DISTINCT v), max(DISTINCT v) FROM d GROUP BY g ORDER BY g",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            &rows[0][..3],
+            &[Value::Int4(1), Value::Int8(1), Value::Int8(10)]
+        );
+        assert_eq!(&rows[0][4..], &[Value::Int4(10), Value::Int4(10)]);
+        assert_eq!(
+            &rows[1][..3],
+            &[Value::Int4(2), Value::Int8(1), Value::Int8(5)]
+        );
+        assert_eq!(&rows[1][4..], &[Value::Int4(5), Value::Int4(5)]);
+        let Value::Numeric(avg_one) = &rows[0][3] else {
+            panic!("avg(int) should be numeric, got {:?}", rows[0][3]);
+        };
+        let Value::Numeric(avg_two) = &rows[1][3] else {
+            panic!("avg(int) should be numeric, got {:?}", rows[1][3]);
+        };
+        assert_eq!(avg_one.to_display(), "10.0000000000000000");
+        assert_eq!(avg_two.to_display(), "5.0000000000000000");
+
+        // The two calls use independent seen-value sets, even when their
+        // inputs have the same type and values.
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT count(DISTINCT g), sum(DISTINCT g) FROM d",
+        );
+        assert_eq!(rows, vec![vec![Value::Int8(2), Value::Int8(3)]]);
+    }
+
+    #[test]
     fn empty_group_is_zero_count_and_null_sum() {
         let engine = agg_engine();
         let (_c, rows) = run_rows_on(&engine, "SELECT count(*), sum(b), min(b) FROM t WHERE a > 100");
@@ -1705,6 +1779,9 @@ mod tests {
             _ => -1,
         });
         assert_eq!(counts, vec![Value::Int8(2), Value::Int8(2)]);
+
+        let (_c, rows) = run_rows_on(&engine, "SELECT count(DISTINCT x) FROM f");
+        assert_eq!(rows, vec![vec![Value::Int8(2)]]);
     }
 
     #[test]

@@ -124,6 +124,11 @@ ERROR:  aggregate function calls cannot be nested
 -- errors: no sum over text
 SELECT sum(txt) FROM agg;
 ERROR:  function sum(text) does not exist
--- errors: DISTINCT inside an aggregate is not supported yet
-SELECT count(DISTINCT grp) FROM agg;
-ERROR:  DISTINCT in aggregate functions is not supported yet
+-- DISTINCT eliminates duplicate non-NULL aggregate inputs
+SELECT count(DISTINCT grp), sum(DISTINCT grp), avg(DISTINCT grp), min(DISTINCT grp), max(DISTINCT grp) FROM agg;
+ count | sum |        avg         | min | max 
+-------+-----+--------------------+-----+-----
+     3 |   6 | 2.0000000000000000 |   1 |   3
+(1 row)
+
+-- End aggregate tests.
