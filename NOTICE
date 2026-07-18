@@ -57,6 +57,15 @@ licensed under Unlicense OR MIT. Jiff bundles a compiled copy of the IANA Time
 Zone Database (public domain, github.com/eggert/tz) via the
 `tzdb-bundle-always` feature.
 
+This product depends on the `crc32c` crate (used by crabgresql-wal for WAL
+record integrity and by crabgresql-pg-engine for 8 KB page checksums, both using
+the CRC-32C / Castagnoli polynomial that PostgreSQL documents for its WAL):
+
+  Copyright (c) The crc32c authors (github.com/zowens/crc32c)
+
+licensed under Apache-2.0 OR MIT. It is an ordinary Cargo dependency, not
+vendored; no PostgreSQL source is involved.
+
 The time-zone abbreviation table in crates/crabgresql-types/src/tz.rs (e.g.
 `PST` = -08:00, `MSK` -> Europe/Moscow) reproduces values from PostgreSQL's
 `src/timezone/tznames/Default` data file — borrowed as data, not source, under

@@ -95,7 +95,18 @@ Contract with the core:
   while pg-engine keeps them in tuple headers.
 - **WAL is a core service** (like resource managers in PG): an engine registers
   its record types and redo handlers. `crabgresql-memory-storage` simply does
-  not write WAL (its tables are effectively UNLOGGED).
+  not write WAL (its tables are effectively UNLOGGED). The core contract is the
+  **write-ahead rule**: a dirty data page stamped with LSN `L` may not be written
+  back to its file until the WAL is flushed up to `L` (`Wal::flushed_lsn() >= L`);
+  the buffer pool enforces it by flushing WAL before evicting a dirty page, and a
+  COMMIT fsyncs the WAL up to its commit record. Recovery is **redo-only** (no
+  undo — uncommitted versions are simply invisible and later vacuumed), replaying
+  each record through its rmgr's LSN-gated redo handler.
+  Implemented in `crabgresql-wal` (+ the heap engine's redo). Deferred from the
+  first cut, all correct-but-unbounded/unoptimized without them: a durable SLRU
+  CLOG and checkpoint-bounded recovery (recovery currently replays the whole
+  WAL), full-page writes for torn-page protection beyond page checksums, and WAL
+  segment recycling.
 - Syntactically, extensibility is exposed the standard PG way:
   `CREATE TABLE ... USING pg_engine | memory` (and
   `default_table_access_method`).

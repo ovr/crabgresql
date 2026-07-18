@@ -14,13 +14,17 @@ crabgresql-executor.workspace = true
 crabgresql-planner.workspace = true
 crabgresql-memory-storage.workspace = true
 crabgresql-parser.workspace = true
+crabgresql-pg-engine.workspace = true
 crabgresql-pg-wire.workspace = true
 crabgresql-storage-api.workspace = true
 crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
+crabgresql-wal.workspace = true
+clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio-postgres.workspace = true
