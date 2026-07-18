@@ -3615,21 +3615,6 @@ pub enum Statement {
     /// ```
     CreateTable(CreateTable),
     /// ```sql
-    /// CREATE VIRTUAL TABLE .. USING <module_name> (<module_args>)`
-    /// ```
-    /// Sqlite specific statement
-    CreateVirtualTable {
-        #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
-        /// Name of the virtual table module instance.
-        name: ObjectName,
-        /// `true` when `IF NOT EXISTS` was specified.
-        if_not_exists: bool,
-        /// Module name used by the virtual table.
-        module_name: Ident,
-        /// Arguments passed to the module.
-        module_args: Vec<Ident>,
-    },
-    /// ```sql
     /// `CREATE INDEX`
     /// ```
     CreateIndex(CreateIndex),
@@ -3638,26 +3623,6 @@ pub enum Statement {
     /// ```
     /// See [PostgreSQL](https://www.postgresql.org/docs/current/sql-createrole.html)
     CreateRole(CreateRole),
-    /// ```sql
-    /// CREATE SECRET
-    /// ```
-    /// See [DuckDB](https://duckdb.org/docs/sql/statements/create_secret.html)
-    CreateSecret {
-        /// `true` when `OR REPLACE` was specified.
-        or_replace: bool,
-        /// Optional `TEMPORARY` flag.
-        temporary: Option<bool>,
-        /// `true` when `IF NOT EXISTS` was present.
-        if_not_exists: bool,
-        /// Optional secret name.
-        name: Option<Ident>,
-        /// Optional storage specifier identifier.
-        storage_specifier: Option<Ident>,
-        /// The secret type identifier.
-        secret_type: Ident,
-        /// Additional secret options.
-        options: Vec<SecretOption>,
-    },
     /// A `CREATE SERVER` statement.
     CreateServer(CreateServerStatement),
     /// ```sql
@@ -3665,11 +3630,6 @@ pub enum Statement {
     /// ```
     /// See [PostgreSQL](https://www.postgresql.org/docs/current/sql-createpolicy.html)
     CreatePolicy(CreatePolicy),
-    /// ```sql
-    /// CREATE CONNECTOR
-    /// ```
-    /// See [Hive](https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=27362034#LanguageManualDDL-CreateDataConnectorCreateConnector)
-    CreateConnector(CreateConnector),
     /// ```sql
     /// CREATE OPERATOR
     /// ```
@@ -3764,24 +3724,6 @@ pub enum Statement {
     /// (Postgresql-specific)
     AlterPolicy(AlterPolicy),
     /// ```sql
-    /// ALTER CONNECTOR connector_name SET DCPROPERTIES(property_name=property_value, ...);
-    /// or
-    /// ALTER CONNECTOR connector_name SET URL new_url;
-    /// or
-    /// ALTER CONNECTOR connector_name SET OWNER [USER|ROLE] user_or_role;
-    /// ```
-    /// (Hive-specific)
-    AlterConnector {
-        /// Name of the connector to alter.
-        name: Ident,
-        /// Optional connector properties to set.
-        properties: Option<Vec<SqlOption>>,
-        /// Optional new URL for the connector.
-        url: Option<String>,
-        /// Optional new owner specification.
-        owner: Option<ddl::AlterConnectorOwner>,
-    },
-    /// ```sql
     /// DROP [TABLE, VIEW, ...]
     /// ```
     Drop {
@@ -3829,34 +3771,11 @@ pub enum Statement {
         /// Optional drop behavior (`CASCADE` or `RESTRICT`).
         drop_behavior: Option<DropBehavior>,
     },
-    /// ```sql
-    /// DROP SECRET
-    /// ```
-    DropSecret {
-        /// `true` when `IF EXISTS` was present.
-        if_exists: bool,
-        /// Optional `TEMPORARY` marker.
-        temporary: Option<bool>,
-        /// Name of the secret to drop.
-        name: Ident,
-        /// Optional storage specifier identifier.
-        storage_specifier: Option<Ident>,
-    },
     ///```sql
     /// DROP POLICY
     /// ```
     /// See [PostgreSQL](https://www.postgresql.org/docs/current/sql-droppolicy.html)
     DropPolicy(DropPolicy),
-    /// ```sql
-    /// DROP CONNECTOR
-    /// ```
-    /// See [Hive](https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=27362034#LanguageManualDDL-DropConnector)
-    DropConnector {
-        /// `true` when `IF EXISTS` was present.
-        if_exists: bool,
-        /// Name of the connector to drop.
-        name: Ident,
-    },
     /// ```sql
     /// DECLARE
     /// ```
@@ -4296,24 +4215,6 @@ pub enum Statement {
         body: ConditionalStatements,
     },
     /// ```sql
-    /// CREATE MACRO
-    /// ```
-    ///
-    /// Supported variants:
-    /// 1. [DuckDB](https://duckdb.org/docs/sql/statements/create_macro)
-    CreateMacro {
-        /// `OR REPLACE` flag.
-        or_replace: bool,
-        /// Whether macro is temporary.
-        temporary: bool,
-        /// Macro name.
-        name: ObjectName,
-        /// Optional macro arguments.
-        args: Option<Vec<MacroArg>>,
-        /// Macro definition body.
-        definition: MacroDefinition,
-    },
-    /// ```sql
     /// GRANT privileges ON objects TO grantees
     /// ```
     Grant(Grant),
@@ -4507,16 +4408,6 @@ pub enum Statement {
         /// Optional payload string.
         payload: Option<String>,
     },
-    /// ```sql
-    /// CREATE [OR REPLACE] USER <user> [IF NOT EXISTS]
-    /// ```
-    /// [Snowflake](https://docs.snowflake.com/en/sql-reference/sql/create-user)
-    CreateUser(CreateUser),
-    /// ```sql
-    /// ALTER USER \[ IF EXISTS \] \[ <name> \]
-    /// ```
-    /// [Snowflake](https://docs.snowflake.com/en/sql-reference/sql/alter-user)
-    AlterUser(AlterUser),
     /// Re-sorts rows and reclaims space in either a specified table or all tables in the current database
     ///
     /// ```sql
@@ -4909,48 +4800,8 @@ impl fmt::Display for Statement {
 
                 write!(f, " AS {body}")
             }
-            Statement::CreateMacro {
-                or_replace,
-                temporary,
-                name,
-                args,
-                definition,
-            } => {
-                write!(
-                    f,
-                    "CREATE {or_replace}{temp}MACRO {name}",
-                    temp = if *temporary { "TEMPORARY " } else { "" },
-                    or_replace = if *or_replace { "OR REPLACE " } else { "" },
-                )?;
-                if let Some(args) = args {
-                    write!(f, "({})", display_comma_separated(args))?;
-                }
-                match definition {
-                    MacroDefinition::Expr(expr) => write!(f, " AS {expr}")?,
-                    MacroDefinition::Table(query) => write!(f, " AS TABLE {query}")?,
-                }
-                Ok(())
-            }
             Statement::CreateView(create_view) => create_view.fmt(f),
             Statement::CreateTable(create_table) => create_table.fmt(f),
-            Statement::CreateVirtualTable {
-                name,
-                if_not_exists,
-                module_name,
-                module_args,
-            } => {
-                write!(
-                    f,
-                    "CREATE VIRTUAL TABLE {if_not_exists}{name} USING {module_name}",
-                    if_not_exists = if *if_not_exists { "IF NOT EXISTS " } else { "" },
-                    name = name,
-                    module_name = module_name
-                )?;
-                if !module_args.is_empty() {
-                    write!(f, " ({})", display_comma_separated(module_args))?;
-                }
-                Ok(())
-            }
             Statement::CreateIndex(create_index) => create_index.fmt(f),
             Statement::CreateExtension(create_extension) => write!(f, "{create_extension}"),
             Statement::CreateCollation(create_collation) => write!(f, "{create_collation}"),
@@ -4963,46 +4814,10 @@ impl fmt::Display for Statement {
                 write!(f, "{drop_operator_class}")
             }
             Statement::CreateRole(create_role) => write!(f, "{create_role}"),
-            Statement::CreateSecret {
-                or_replace,
-                temporary,
-                if_not_exists,
-                name,
-                storage_specifier,
-                secret_type,
-                options,
-            } => {
-                write!(
-                    f,
-                    "CREATE {or_replace}",
-                    or_replace = if *or_replace { "OR REPLACE " } else { "" },
-                )?;
-                if let Some(t) = temporary {
-                    write!(f, "{}", if *t { "TEMPORARY " } else { "PERSISTENT " })?;
-                }
-                write!(
-                    f,
-                    "SECRET {if_not_exists}",
-                    if_not_exists = if *if_not_exists { "IF NOT EXISTS " } else { "" },
-                )?;
-                if let Some(n) = name {
-                    write!(f, "{n} ")?;
-                };
-                if let Some(s) = storage_specifier {
-                    write!(f, "IN {s} ")?;
-                }
-                write!(f, "( TYPE {secret_type}",)?;
-                if !options.is_empty() {
-                    write!(f, ", {o}", o = display_comma_separated(options))?;
-                }
-                write!(f, " )")?;
-                Ok(())
-            }
             Statement::CreateServer(stmt) => {
                 write!(f, "{stmt}")
             }
             Statement::CreatePolicy(policy) => write!(f, "{policy}"),
-            Statement::CreateConnector(create_connector) => create_connector.fmt(f),
             Statement::CreateOperator(create_operator) => create_operator.fmt(f),
             Statement::CreateOperatorFamily(create_operator_family) => {
                 create_operator_family.fmt(f)
@@ -5043,28 +4858,6 @@ impl fmt::Display for Statement {
                 write!(f, "ALTER ROLE {name} {operation}")
             }
             Statement::AlterPolicy(alter_policy) => write!(f, "{alter_policy}"),
-            Statement::AlterConnector {
-                name,
-                properties,
-                url,
-                owner,
-            } => {
-                write!(f, "ALTER CONNECTOR {name}")?;
-                if let Some(properties) = properties {
-                    write!(
-                        f,
-                        " SET DCPROPERTIES({})",
-                        display_comma_separated(properties)
-                    )?;
-                }
-                if let Some(url) = url {
-                    write!(f, " SET URL '{url}'")?;
-                }
-                if let Some(owner) = owner {
-                    write!(f, " SET OWNER {owner}")?;
-                }
-                Ok(())
-            }
             Statement::Drop {
                 object_type,
                 if_exists,
@@ -5123,35 +4916,7 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Statement::DropSecret {
-                if_exists,
-                temporary,
-                name,
-                storage_specifier,
-            } => {
-                write!(f, "DROP ")?;
-                if let Some(t) = temporary {
-                    write!(f, "{}", if *t { "TEMPORARY " } else { "PERSISTENT " })?;
-                }
-                write!(
-                    f,
-                    "SECRET {if_exists}{name}",
-                    if_exists = if *if_exists { "IF EXISTS " } else { "" },
-                )?;
-                if let Some(s) = storage_specifier {
-                    write!(f, " FROM {s}")?;
-                }
-                Ok(())
-            }
             Statement::DropPolicy(policy) => write!(f, "{policy}"),
-            Statement::DropConnector { if_exists, name } => {
-                write!(
-                    f,
-                    "DROP CONNECTOR {if_exists}{name}",
-                    if_exists = if *if_exists { "IF EXISTS " } else { "" }
-                )?;
-                Ok(())
-            }
             Statement::Discard { object_type } => {
                 write!(f, "DISCARD {object_type}")?;
                 Ok(())
@@ -5553,10 +5318,8 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Statement::CreateUser(s) => write!(f, "{s}"),
             Statement::AlterSchema(s) => write!(f, "{s}"),
             Statement::Vacuum(s) => write!(f, "{s}"),
-            Statement::AlterUser(s) => write!(f, "{s}"),
             Statement::Reset(s) => write!(f, "{s}"),
         }
     }
@@ -11340,12 +11103,6 @@ impl From<CreateServerStatement> for Statement {
     }
 }
 
-impl From<CreateConnector> for Statement {
-    fn from(c: CreateConnector) -> Self {
-        Self::CreateConnector(c)
-    }
-}
-
 impl From<CreateOperator> for Statement {
     fn from(c: CreateOperator) -> Self {
         Self::CreateOperator(c)
@@ -11412,12 +11169,6 @@ impl From<Merge> for Statement {
     }
 }
 
-impl From<AlterUser> for Statement {
-    fn from(a: AlterUser) -> Self {
-        Self::AlterUser(a)
-    }
-}
-
 impl From<DropDomain> for Statement {
     fn from(d: DropDomain) -> Self {
         Self::DropDomain(d)
@@ -11475,12 +11226,6 @@ impl From<DropOperatorClass> for Statement {
 impl From<CreateDomain> for Statement {
     fn from(c: CreateDomain) -> Self {
         Self::CreateDomain(c)
-    }
-}
-
-impl From<CreateUser> for Statement {
-    fn from(c: CreateUser) -> Self {
-        Self::CreateUser(c)
     }
 }
 

@@ -256,7 +256,6 @@ impl Spanned for Values {
 /// # partial span
 ///
 /// Missing spans:
-/// - [Statement::CreateSecret]
 /// - [Statement::CreateRole]
 /// - [Statement::AlterType]
 /// - [Statement::AlterOperator]
@@ -264,7 +263,6 @@ impl Spanned for Values {
 /// - [Statement::Drop]
 /// - [Statement::DropFunction]
 /// - [Statement::DropProcedure]
-/// - [Statement::DropSecret]
 /// - [Statement::Declare]
 /// - [Statement::CreateExtension]
 /// - [Statement::CreateCollation]
@@ -290,7 +288,6 @@ impl Spanned for Values {
 /// - [Statement::CreateTrigger]
 /// - [Statement::DropTrigger]
 /// - [Statement::CreateProcedure]
-/// - [Statement::CreateMacro]
 /// - [Statement::Grant]
 /// - [Statement::Revoke]
 /// - [Statement::Deallocate]
@@ -332,16 +329,6 @@ impl Spanned for Statement {
             Statement::Delete(delete) => delete.span(),
             Statement::CreateView(create_view) => create_view.span(),
             Statement::CreateTable(create_table) => create_table.span(),
-            Statement::CreateVirtualTable {
-                name,
-                if_not_exists: _,
-                module_name,
-                module_args,
-            } => union_spans(
-                core::iter::once(name.span())
-                    .chain(core::iter::once(module_name.span))
-                    .chain(module_args.iter().map(|i| i.span)),
-            ),
             Statement::CreateIndex(create_index) => create_index.span(),
             Statement::CreateRole(create_role) => create_role.span(),
             Statement::CreateExtension(create_extension) => create_extension.span(),
@@ -350,9 +337,7 @@ impl Spanned for Statement {
             Statement::DropOperator(drop_operator) => drop_operator.span(),
             Statement::DropOperatorFamily(drop_operator_family) => drop_operator_family.span(),
             Statement::DropOperatorClass(drop_operator_class) => drop_operator_class.span(),
-            Statement::CreateSecret { .. } => Span::empty(),
             Statement::CreateServer { .. } => Span::empty(),
-            Statement::CreateConnector { .. } => Span::empty(),
             Statement::CreateOperator(create_operator) => create_operator.span(),
             Statement::CreateOperatorFamily(create_operator_family) => {
                 create_operator_family.span()
@@ -383,7 +368,6 @@ impl Spanned for Statement {
             Statement::DropFunction(drop_function) => drop_function.span(),
             Statement::DropDomain { .. } => Span::empty(),
             Statement::DropProcedure { .. } => Span::empty(),
-            Statement::DropSecret { .. } => Span::empty(),
             Statement::Declare { .. } => Span::empty(),
             Statement::Fetch { .. } => Span::empty(),
             Statement::Discard { .. } => Span::empty(),
@@ -409,7 +393,6 @@ impl Spanned for Statement {
             Statement::CreateTrigger { .. } => Span::empty(),
             Statement::DropTrigger { .. } => Span::empty(),
             Statement::CreateProcedure { .. } => Span::empty(),
-            Statement::CreateMacro { .. } => Span::empty(),
             Statement::Grant { .. } => Span::empty(),
             Statement::Revoke { .. } => Span::empty(),
             Statement::Deallocate { .. } => Span::empty(),
@@ -425,9 +408,7 @@ impl Spanned for Statement {
             Statement::Lock(_) => Span::empty(),
             Statement::CreatePolicy { .. } => Span::empty(),
             Statement::AlterPolicy { .. } => Span::empty(),
-            Statement::AlterConnector { .. } => Span::empty(),
             Statement::DropPolicy { .. } => Span::empty(),
-            Statement::DropConnector { .. } => Span::empty(),
             Statement::ShowCatalogs { .. } => Span::empty(),
             Statement::ShowDatabases { .. } => Span::empty(),
             Statement::ShowProcessList { .. } => Span::empty(),
@@ -436,10 +417,8 @@ impl Spanned for Statement {
             Statement::LISTEN { .. } => Span::empty(),
             Statement::NOTIFY { .. } => Span::empty(),
             Statement::UNLISTEN { .. } => Span::empty(),
-            Statement::CreateUser(..) => Span::empty(),
             Statement::AlterSchema(s) => s.span(),
             Statement::Vacuum(..) => Span::empty(),
-            Statement::AlterUser(..) => Span::empty(),
             Statement::Reset(..) => Span::empty(),
         }
     }

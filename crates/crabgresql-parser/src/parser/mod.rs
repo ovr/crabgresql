@@ -35,12 +35,7 @@ use IsOptional::*;
 use crate::ast::*;
 use crate::ast::{
     comments,
-    helpers::{
-        key_value_options::{
-            KeyValueOption, KeyValueOptionKind, KeyValueOptions, KeyValueOptionsDelimiter,
-        },
-        stmt_create_table::{CreateTableBuilder, CreateTableConfiguration},
-    },
+    helpers::stmt_create_table::{CreateTableBuilder, CreateTableConfiguration},
 };
 use crate::dialect::*;
 use crate::keywords::{Keyword, ALL_KEYWORDS};
@@ -4832,8 +4827,6 @@ impl<'a> Parser<'a> {
         let temporary = self
             .parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY])
             .is_some();
-        let persistent = false
-            && self.parse_one_of_keywords(&[Keyword::PERSISTENT]).is_some();
         let create_view_params = self.parse_create_view_params()?;
         if self.peek_keywords(&[Keyword::SNAPSHOT, Keyword::TABLE]) {
             self.parse_create_snapshot_table().map(Into::into)
@@ -4861,12 +4854,6 @@ impl<'a> Parser<'a> {
         } else if self.parse_keywords(&[Keyword::CONSTRAINT, Keyword::TRIGGER]) {
             self.parse_create_trigger(temporary, or_alter, or_replace, true)
                 .map(Into::into)
-        } else if self.parse_keyword(Keyword::MACRO) {
-            self.parse_create_macro(or_replace, temporary)
-        } else if self.parse_keyword(Keyword::SECRET) {
-            self.parse_create_secret(or_replace, temporary, persistent)
-        } else if self.parse_keyword(Keyword::USER) {
-            self.parse_create_user(or_replace).map(Into::into)
         } else if or_replace {
             self.expected_ref(
                 "[EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE",
@@ -4878,8 +4865,6 @@ impl<'a> Parser<'a> {
             self.parse_create_index(false).map(Into::into)
         } else if self.parse_keywords(&[Keyword::UNIQUE, Keyword::INDEX]) {
             self.parse_create_index(true).map(Into::into)
-        } else if self.parse_keyword(Keyword::VIRTUAL) {
-            self.parse_create_virtual_table()
         } else if self.parse_keyword(Keyword::SCHEMA) {
             self.parse_create_schema()
         } else if self.parse_keyword(Keyword::DATABASE) {
@@ -4894,8 +4879,6 @@ impl<'a> Parser<'a> {
             self.parse_create_type()
         } else if self.parse_keyword(Keyword::PROCEDURE) {
             self.parse_create_procedure(or_alter)
-        } else if self.parse_keyword(Keyword::CONNECTOR) {
-            self.parse_create_connector().map(Into::into)
         } else if self.parse_keyword(Keyword::OPERATOR) {
             // Check if this is CREATE OPERATOR FAMILY or CREATE OPERATOR CLASS
             if self.parse_keyword(Keyword::FAMILY) {
@@ -4912,92 +4895,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_create_user(&mut self, or_replace: bool) -> Result<CreateUser, ParserError> {
-        let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-        let name = self.parse_identifier()?;
-        let options = self
-            .parse_key_value_options(false, &[Keyword::WITH, Keyword::TAG])?
-            .options;
-        let with_tags = self.parse_keyword(Keyword::WITH);
-        let tags = if self.parse_keyword(Keyword::TAG) {
-            self.parse_key_value_options(true, &[])?.options
-        } else {
-            vec![]
-        };
-        Ok(CreateUser {
-            or_replace,
-            if_not_exists,
-            name,
-            options: KeyValueOptions {
-                options,
-                delimiter: KeyValueOptionsDelimiter::Space,
-            },
-            with_tags,
-            tags: KeyValueOptions {
-                options: tags,
-                delimiter: KeyValueOptionsDelimiter::Comma,
-            },
-        })
-    }
 
-    /// See [DuckDB Docs](https://duckdb.org/docs/sql/statements/create_secret.html) for more details.
-    pub fn parse_create_secret(
-        &mut self,
-        or_replace: bool,
-        temporary: bool,
-        persistent: bool,
-    ) -> Result<Statement, ParserError> {
-        let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-
-        let mut storage_specifier = None;
-        let mut name = None;
-        if self.peek_token_ref().token != Token::LParen {
-            if self.parse_keyword(Keyword::IN) {
-                storage_specifier = self.parse_identifier().ok()
-            } else {
-                name = self.parse_identifier().ok();
-            }
-
-            // Storage specifier may follow the name
-            if storage_specifier.is_none()
-                && self.peek_token_ref().token != Token::LParen
-                && self.parse_keyword(Keyword::IN)
-            {
-                storage_specifier = self.parse_identifier().ok();
-            }
-        }
-
-        self.expect_token(&Token::LParen)?;
-        self.expect_keyword_is(Keyword::TYPE)?;
-        let secret_type = self.parse_identifier()?;
-
-        let mut options = Vec::new();
-        if self.consume_token(&Token::Comma) {
-            options.append(&mut self.parse_comma_separated(|p| {
-                let key = p.parse_identifier()?;
-                let value = p.parse_identifier()?;
-                Ok(SecretOption { key, value })
-            })?);
-        }
-        self.expect_token(&Token::RParen)?;
-
-        let temp = match (temporary, persistent) {
-            (true, false) => Some(true),
-            (false, true) => Some(false),
-            (false, false) => None,
-            _ => self.expected_ref("TEMPORARY or PERSISTENT", self.peek_token_ref())?,
-        };
-
-        Ok(Statement::CreateSecret {
-            or_replace,
-            temporary: temp,
-            if_not_exists,
-            name,
-            storage_specifier,
-            secret_type,
-            options,
-        })
-    }
 
 
     /// Parse 'AS' before as query,such as `WITH XXX AS SELECT XXX` oer `CACHE TABLE AS SELECT XXX`
@@ -5015,25 +4913,6 @@ impl<'a> Parser<'a> {
     }
 
 
-    /// SQLite-specific `CREATE VIRTUAL TABLE`
-    pub fn parse_create_virtual_table(&mut self) -> Result<Statement, ParserError> {
-        self.expect_keyword_is(Keyword::TABLE)?;
-        let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-        let table_name = self.parse_object_name(false)?;
-        self.expect_keyword_is(Keyword::USING)?;
-        let module_name = self.parse_identifier()?;
-        // SQLite docs note that module "arguments syntax is sufficiently
-        // general that the arguments can be made to appear as column
-        // definitions in a traditional CREATE TABLE statement", but
-        // we don't implement that.
-        let module_args = self.parse_parenthesized_column_list(Optional, false)?;
-        Ok(Statement::CreateVirtualTable {
-            name: table_name,
-            if_not_exists,
-            module_name,
-            module_args,
-        })
-    }
 
     /// Parse a `CREATE SCHEMA` statement.
     pub fn parse_create_schema(&mut self) -> Result<Statement, ParserError> {
@@ -5707,53 +5586,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse a `CREATE MACRO` statement.
-    pub fn parse_create_macro(
-        &mut self,
-        or_replace: bool,
-        temporary: bool,
-    ) -> Result<Statement, ParserError> {
-        if dialect_of!(self is GenericDialect) {
-            let name = self.parse_object_name(false)?;
-            self.expect_token(&Token::LParen)?;
-            let args = if self.consume_token(&Token::RParen) {
-                self.prev_token();
-                None
-            } else {
-                Some(self.parse_comma_separated(Parser::parse_macro_arg)?)
-            };
 
-            self.expect_token(&Token::RParen)?;
-            self.expect_keyword_is(Keyword::AS)?;
-
-            Ok(Statement::CreateMacro {
-                or_replace,
-                temporary,
-                name,
-                args,
-                definition: if self.parse_keyword(Keyword::TABLE) {
-                    MacroDefinition::Table(self.parse_query()?)
-                } else {
-                    MacroDefinition::Expr(self.parse_expr()?)
-                },
-            })
-        } else {
-            self.prev_token();
-            self.expected_ref("an object type after CREATE", self.peek_token_ref())
-        }
-    }
-
-    fn parse_macro_arg(&mut self) -> Result<MacroArg, ParserError> {
-        let name = self.parse_identifier()?;
-
-        let default_expr =
-            if self.consume_token(&Token::Assignment) || self.consume_token(&Token::RArrow) {
-                Some(self.parse_expr()?)
-            } else {
-                None
-            };
-        Ok(MacroArg { name, default_expr })
-    }
 
     /// Parse a `CREATE EXTERNAL TABLE` statement.
     pub fn parse_create_external_table(
@@ -6389,48 +6222,6 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// ```sql
-    /// CREATE CONNECTOR [IF NOT EXISTS] connector_name
-    /// [TYPE datasource_type]
-    /// [URL datasource_url]
-    /// [COMMENT connector_comment]
-    /// [WITH DCPROPERTIES(property_name=property_value, ...)]
-    /// ```
-    ///
-    /// [Hive Documentation](https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=27362034#LanguageManualDDL-CreateDataConnectorCreateConnector)
-    pub fn parse_create_connector(&mut self) -> Result<CreateConnector, ParserError> {
-        let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-        let name = self.parse_identifier()?;
-
-        let connector_type = if self.parse_keyword(Keyword::TYPE) {
-            Some(self.parse_literal_string()?)
-        } else {
-            None
-        };
-
-        let url = if self.parse_keyword(Keyword::URL) {
-            Some(self.parse_literal_string()?)
-        } else {
-            None
-        };
-
-        let comment = self.parse_optional_inline_comment()?;
-
-        let with_dcproperties =
-            match self.parse_options_with_keywords(&[Keyword::WITH, Keyword::DCPROPERTIES])? {
-                properties if !properties.is_empty() => Some(properties),
-                _ => None,
-            };
-
-        Ok(CreateConnector {
-            name,
-            if_not_exists,
-            connector_type,
-            url,
-            comment,
-            with_dcproperties,
-        })
-    }
 
     /// Parse an operator name, which can contain special characters like +, -, <, >, =
     /// that are tokenized as operator tokens rather than identifiers.
@@ -6717,8 +6508,6 @@ impl<'a> Parser<'a> {
         // MySQL dialect supports `TEMPORARY`
         let temporary = dialect_of!(self is GenericDialect)
             && self.parse_keyword(Keyword::TEMPORARY);
-        let persistent = false
-            && self.parse_one_of_keywords(&[Keyword::PERSISTENT]).is_some();
 
         let object_type = if self.parse_keyword(Keyword::TABLE) {
             ObjectType::Table
@@ -6738,26 +6527,18 @@ impl<'a> Parser<'a> {
             ObjectType::Database
         } else if self.parse_keyword(Keyword::SEQUENCE) {
             ObjectType::Sequence
-        } else if self.parse_keyword(Keyword::STAGE) {
-            ObjectType::Stage
         } else if self.parse_keyword(Keyword::TYPE) {
             ObjectType::Type
         } else if self.parse_keyword(Keyword::USER) {
             ObjectType::User
-        } else if self.parse_keyword(Keyword::STREAM) {
-            ObjectType::Stream
         } else if self.parse_keyword(Keyword::FUNCTION) {
             return self.parse_drop_function().map(Into::into);
         } else if self.parse_keyword(Keyword::POLICY) {
             return self.parse_drop_policy().map(Into::into);
-        } else if self.parse_keyword(Keyword::CONNECTOR) {
-            return self.parse_drop_connector();
         } else if self.parse_keyword(Keyword::DOMAIN) {
             return self.parse_drop_domain().map(Into::into);
         } else if self.parse_keyword(Keyword::PROCEDURE) {
             return self.parse_drop_procedure();
-        } else if self.parse_keyword(Keyword::SECRET) {
-            return self.parse_drop_secret(temporary, persistent);
         } else if self.parse_keyword(Keyword::TRIGGER) {
             return self.parse_drop_trigger().map(Into::into);
         } else if self.parse_keyword(Keyword::EXTENSION) {
@@ -6853,16 +6634,6 @@ impl<'a> Parser<'a> {
             drop_behavior,
         })
     }
-    /// ```sql
-    /// DROP CONNECTOR [IF EXISTS] name
-    /// ```
-    ///
-    /// See [Hive](https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=27362034#LanguageManualDDL-DropConnector)
-    fn parse_drop_connector(&mut self) -> Result<Statement, ParserError> {
-        let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
-        let name = self.parse_identifier()?;
-        Ok(Statement::DropConnector { if_exists, name })
-    }
 
     /// ```sql
     /// DROP DOMAIN [ IF EXISTS ] name [ CASCADE | RESTRICT ]
@@ -6911,33 +6682,6 @@ impl<'a> Parser<'a> {
         Ok(FunctionDesc { name, args })
     }
 
-    /// See [DuckDB Docs](https://duckdb.org/docs/sql/statements/create_secret.html) for more details.
-    fn parse_drop_secret(
-        &mut self,
-        temporary: bool,
-        persistent: bool,
-    ) -> Result<Statement, ParserError> {
-        let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
-        let name = self.parse_identifier()?;
-        let storage_specifier = if self.parse_keyword(Keyword::FROM) {
-            self.parse_identifier().ok()
-        } else {
-            None
-        };
-        let temp = match (temporary, persistent) {
-            (true, false) => Some(true),
-            (false, true) => Some(false),
-            (false, false) => None,
-            _ => self.expected_ref("TEMPORARY or PERSISTENT", self.peek_token_ref())?,
-        };
-
-        Ok(Statement::DropSecret {
-            if_exists,
-            temporary: temp,
-            name,
-            storage_specifier,
-        })
-    }
 
     /// Parse a `DECLARE` statement.
     ///
@@ -10037,10 +9781,8 @@ impl<'a> Parser<'a> {
             Keyword::AGGREGATE,
             Keyword::ROLE,
             Keyword::POLICY,
-            Keyword::CONNECTOR,
             Keyword::ICEBERG,
             Keyword::SCHEMA,
-            Keyword::USER,
             Keyword::OPERATOR,
         ])?;
         match object_type {
@@ -10088,11 +9830,9 @@ impl<'a> Parser<'a> {
             }
             Keyword::ROLE => self.parse_alter_role(),
             Keyword::POLICY => self.parse_alter_policy().map(Into::into),
-            Keyword::CONNECTOR => self.parse_alter_connector(),
-            Keyword::USER => self.parse_alter_user().map(Into::into),
             // unreachable because expect_one_of_keywords used above
             unexpected_keyword => Err(ParserError::ParserError(
-                format!("Internal parser error: expected any of {{VIEW, TYPE, COLLATION, TABLE, INDEX, FUNCTION, AGGREGATE, ROLE, POLICY, CONNECTOR, ICEBERG, SCHEMA, USER, OPERATOR}}, got {unexpected_keyword:?}"),
+                format!("Internal parser error: expected any of {{VIEW, TYPE, COLLATION, TABLE, INDEX, FUNCTION, AGGREGATE, ROLE, POLICY, ICEBERG, SCHEMA, OPERATOR}}, got {unexpected_keyword:?}"),
             )),
         }
     }
@@ -19158,111 +18898,7 @@ impl<'a> Parser<'a> {
         matches!(self.state, ColumnDefinition)
     }
 
-    /// Parses options provided in key-value format.
-    ///
-    /// * `parenthesized` - true if the options are enclosed in parenthesis
-    /// * `end_words` - a list of keywords that any of them indicates the end of the options section
-    pub(crate) fn parse_key_value_options(
-        &mut self,
-        parenthesized: bool,
-        end_words: &[Keyword],
-    ) -> Result<KeyValueOptions, ParserError> {
-        let mut options: Vec<KeyValueOption> = Vec::new();
-        let mut delimiter = KeyValueOptionsDelimiter::Space;
-        if parenthesized {
-            self.expect_token(&Token::LParen)?;
-        }
-        loop {
-            match self.next_token().token {
-                Token::RParen => {
-                    if parenthesized {
-                        break;
-                    } else {
-                        return self.expected_ref(" another option or EOF", self.peek_token_ref());
-                    }
-                }
-                Token::EOF | Token::SemiColon => break,
-                Token::Comma => {
-                    delimiter = KeyValueOptionsDelimiter::Comma;
-                    continue;
-                }
-                Token::Word(w) if !end_words.contains(&w.keyword) => {
-                    options.push(self.parse_key_value_option(&w)?)
-                }
-                Token::Word(w) if end_words.contains(&w.keyword) => {
-                    self.prev_token();
-                    break;
-                }
-                _ => {
-                    return self.expected_ref(
-                        "another option, EOF, SemiColon, Comma or ')'",
-                        self.peek_token_ref(),
-                    )
-                }
-            };
-        }
 
-        Ok(KeyValueOptions { delimiter, options })
-    }
-
-    /// Parses a `KEY = VALUE` construct based on the specified key
-    pub(crate) fn parse_key_value_option(
-        &mut self,
-        key: &Word,
-    ) -> Result<KeyValueOption, ParserError> {
-        self.expect_token(&Token::Eq)?;
-        let peeked_token = self.peek_token();
-        match peeked_token.token {
-            Token::SingleQuotedString(_) => Ok(KeyValueOption {
-                option_name: key.value.clone(),
-                option_value: KeyValueOptionKind::Single(self.parse_value()?),
-            }),
-            Token::Word(word)
-                if word.keyword == Keyword::TRUE || word.keyword == Keyword::FALSE =>
-            {
-                Ok(KeyValueOption {
-                    option_name: key.value.clone(),
-                    option_value: KeyValueOptionKind::Single(self.parse_value()?),
-                })
-            }
-            Token::Number(..) => Ok(KeyValueOption {
-                option_name: key.value.clone(),
-                option_value: KeyValueOptionKind::Single(self.parse_value()?),
-            }),
-            Token::Word(word) => {
-                self.next_token();
-                Ok(KeyValueOption {
-                    option_name: key.value.clone(),
-                    option_value: KeyValueOptionKind::Single(
-                        Value::Placeholder(word.value.clone()).with_span(peeked_token.span),
-                    ),
-                })
-            }
-            Token::LParen => {
-                // Can be a list of values or a list of key value properties.
-                // Try to parse a list of values and if that fails, try to parse
-                // a list of key-value properties.
-                match self.maybe_parse(|parser| {
-                    parser.expect_token(&Token::LParen)?;
-                    let values = parser.parse_comma_separated0(|p| p.parse_value(), Token::RParen);
-                    parser.expect_token(&Token::RParen)?;
-                    values
-                })? {
-                    Some(values) => Ok(KeyValueOption {
-                        option_name: key.value.clone(),
-                        option_value: KeyValueOptionKind::Multi(values),
-                    }),
-                    None => Ok(KeyValueOption {
-                        option_name: key.value.clone(),
-                        option_value: KeyValueOptionKind::KeyValueOptions(Box::new(
-                            self.parse_key_value_options(true, &[])?,
-                        )),
-                    }),
-                }
-            }
-            _ => self.expected_ref("expected option value", self.peek_token_ref()),
-        }
-    }
 
     /// Parses a RESET statement
     fn parse_reset(&mut self) -> Result<ResetStatement, ParserError> {
