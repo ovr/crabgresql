@@ -2060,9 +2060,13 @@ fn resolve_bit_op(
     Ok(None)
 }
 
-/// `macaddr`/`macaddr8` `&`/`|`: when either operand is a mac type, resolve the
-/// other at that type (an untyped literal parses as the mac type, EUI-64
-/// expanding for `macaddr8`) and lower to the width-dispatched `ScalarFn`.
+/// `macaddr`/`macaddr8` `&`/`|`: lower to the width-dispatched `ScalarFn`. PG has
+/// only `macaddr & macaddr` and `macaddr8 & macaddr8` — no cross-width operator
+/// and no implicit `macaddr`<->`macaddr8` — so both operands must settle on the
+/// *same* mac type. The typed side fixes that type; an untyped literal adopts it
+/// (EUI-64 expanding for `macaddr8`). Two typed operands of different mac widths,
+/// or a mac paired with any other typed value, have no operator: report PG's
+/// `operator does not exist` rather than silently coercing one side.
 fn resolve_macaddr_op(
     op: &ast::BinaryOperator,
     lb: &Binding,
@@ -2074,14 +2078,32 @@ fn resolve_macaddr_op(
         B::BitwiseOr => ScalarFn::MacaddrOr,
         _ => return Ok(None),
     };
+    let lt = binding_typed_ty(lb);
+    let rt = binding_typed_ty(rb);
     let is_mac = |t: Option<PgType>| matches!(t, Some(PgType::Macaddr | PgType::Macaddr8));
-    let mac_ty = if is_mac(binding_typed_ty(lb)) {
-        binding_typed_ty(lb).unwrap()
-    } else if is_mac(binding_typed_ty(rb)) {
-        binding_typed_ty(rb).unwrap()
-    } else {
+    // Not our operator unless at least one side is a mac type.
+    if !is_mac(lt) && !is_mac(rt) {
         return Ok(None);
+    }
+    // The mac type both operands must share, taken from a typed mac operand.
+    // Two typed mac operands of different widths have no operator.
+    let mac_ty = match (lt, rt) {
+        (Some(l), Some(r)) if is_mac(lt) && is_mac(rt) => {
+            if l != r {
+                return Err(net_no_operator(lb, op, rb));
+            }
+            l
+        }
+        (Some(l), _) if is_mac(lt) => l,
+        (_, Some(r)) if is_mac(rt) => r,
+        _ => unreachable!("at least one operand is a mac type"),
     };
+    // The partner must be the same-typed mac (handled above) or an untyped
+    // literal; a typed non-mac partner (e.g. `macaddr & integer`) has no operator.
+    let typed_non_mac = |t: Option<PgType>| t.is_some() && !is_mac(t);
+    if typed_non_mac(lt) || typed_non_mac(rt) {
+        return Err(net_no_operator(lb, op, rb));
+    }
     let a = resolve_operand(lb, mac_ty)?;
     let b = resolve_operand(rb, mac_ty)?;
     Ok(Some(Binding::Typed(BoundExpr::FuncCall {

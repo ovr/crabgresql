@@ -524,6 +524,14 @@ fn execute_create_index(
             )));
         }
     }
+    // A UNIQUE index is a uniqueness constraint. Accepting it as a no-op would
+    // let duplicate rows in (PG raises 23505), the same hazard execute_create_table
+    // guards against for column constraints, so reject it rather than ignore it.
+    if create.unique {
+        return Err(PgError::feature_not_supported(
+            "CREATE UNIQUE INDEX is not supported yet",
+        ));
+    }
     if create.predicate.is_some() {
         return Err(PgError::feature_not_supported(
             "partial indexes are not supported yet",
