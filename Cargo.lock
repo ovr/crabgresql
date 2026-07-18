@@ -220,7 +220,7 @@ version = "0.1.0"
 dependencies = [
  "crabgresql-memory-storage",
  "crabgresql-parser",
- "crabgresql-protocol",
+ "crabgresql-pg-wire",
  "crabgresql-storage-api",
  "crabgresql-types",
 ]
@@ -232,8 +232,8 @@ dependencies = [
  "crabgresql-binder",
  "crabgresql-memory-storage",
  "crabgresql-parser",
+ "crabgresql-pg-wire",
  "crabgresql-planner",
- "crabgresql-protocol",
  "crabgresql-storage-api",
  "crabgresql-types",
 ]
@@ -266,6 +266,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabgresql-pg-wire"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "crabgresql-planner"
 version = "0.1.0"
 dependencies = [
@@ -277,15 +286,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crabgresql-protocol"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "crabgresql-server"
 version = "0.1.0"
 dependencies = [
@@ -293,8 +293,8 @@ dependencies = [
  "crabgresql-executor",
  "crabgresql-memory-storage",
  "crabgresql-parser",
+ "crabgresql-pg-wire",
  "crabgresql-planner",
- "crabgresql-protocol",
  "crabgresql-storage-api",
  "crabgresql-types",
  "tokio",

@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 crabgresql-parser.workspace = true
-crabgresql-protocol.workspace = true
+crabgresql-pg-wire.workspace = true
 crabgresql-storage-api.workspace = true
 crabgresql-types.workspace = true
 

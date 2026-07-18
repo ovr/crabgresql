@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use crabgresql_protocol::{
+use crabgresql_pg_wire::{
     BackendWriter, FieldDescription, FrontendMessage, FrontendReader, ProtocolError,
     StartupRequest, TransactionStatus, sqlstate,
 };
@@ -43,11 +43,12 @@ pub async fn handle_connection(
     // StartupMessage. Cancel requests arrive on their own connection.
     let _params = loop {
         match reader.read_startup().await {
-            Ok(StartupRequest::Ssl) | Ok(StartupRequest::GssEnc) => {
+            Ok(None) => return Ok(()), // clean disconnect before startup
+            Ok(Some(StartupRequest::Ssl)) | Ok(Some(StartupRequest::GssEnc)) => {
                 writer.refuse_encryption().await?;
             }
-            Ok(StartupRequest::Cancel { .. }) => return Ok(()),
-            Ok(StartupRequest::Startup { params }) => break params,
+            Ok(Some(StartupRequest::Cancel { .. })) => return Ok(()),
+            Ok(Some(StartupRequest::Startup { params })) => break params,
             Err(ProtocolError::UnsupportedProtocolVersion(v)) => {
                 writer.error_response(
                     sqlstate::PROTOCOL_VIOLATION,
@@ -92,12 +93,15 @@ pub async fn handle_connection(
                 writer.ready_for_query(TransactionStatus::Idle);
                 writer.flush().await?;
             }
-            Some(FrontendMessage::Unsupported(tag)) => {
+            // The codec decodes the extended-query, COPY and function-call
+            // messages, but the engine only runs the simple-query protocol, so
+            // every other frontend message is answered like an unsupported one.
+            Some(other) => {
                 writer.error_response(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     &format!(
                         "protocol message '{}' is not supported yet (only the simple query protocol is implemented)",
-                        tag as char
+                        other.tag() as char
                     ),
                 );
                 writer.flush().await?;
@@ -184,11 +188,7 @@ async fn write_result(
         QueryResult::Rows { columns, mut node } => {
             let fields: Vec<FieldDescription> = columns
                 .iter()
-                .map(|c| FieldDescription {
-                    name: c.name.clone(),
-                    type_oid: c.ty.oid(),
-                    type_len: c.ty.typlen(),
-                })
+                .map(|c| FieldDescription::new(c.name.clone(), c.ty.oid(), c.ty.typlen()))
                 .collect();
             writer.row_description(&fields);
             let mut count = 0u64;

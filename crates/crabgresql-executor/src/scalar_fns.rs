@@ -10,7 +10,7 @@
 use std::hint::black_box;
 
 use crabgresql_binder::ScalarFn;
-use crabgresql_protocol::sqlstate;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{Interval, Value, float, interval, timestamp, to_char};
 
 use crate::ExecError;

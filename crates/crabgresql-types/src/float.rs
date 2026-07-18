@@ -26,7 +26,7 @@ pub struct FloatError {
     pub message: &'static str,
 }
 
-// SQLSTATE codes used here (mirrors crabgresql_protocol::sqlstate, kept as
+// SQLSTATE codes used here (mirrors crabgresql_pg_wire::sqlstate, kept as
 // literals so this crate needs no protocol dependency).
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";

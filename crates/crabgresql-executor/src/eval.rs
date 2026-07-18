@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
-use crabgresql_protocol::sqlstate;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{Interval, PgType, Value, cast, float, interval};
 
 use crate::{ExecContext, ExecError};
@@ -36,6 +36,20 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, 
                 .map(|a| eval(a, row, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             crate::scalar_fns::eval_scalar(*func, &arg_values)
+        }
+        // CASE tests conditions top-to-bottom and evaluates only the winning
+        // branch's result (false and NULL conditions both skip); a missing ELSE
+        // yields NULL.
+        BoundExpr::Case { whens, else_, .. } => {
+            for (cond, result) in whens {
+                if matches!(eval(cond, row, ctx)?, Value::Bool(true)) {
+                    return eval(result, row, ctx);
+                }
+            }
+            match else_ {
+                Some(e) => eval(e, row, ctx),
+                None => Ok(Value::Null),
+            }
         }
     }
 }
