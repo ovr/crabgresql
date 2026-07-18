@@ -17,7 +17,7 @@ use crate::expr::{
     output_name, to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
-use crate::{BindError, OutputColumn, TableFn};
+use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
 
 /// A bound statement: names resolved, expressions typed, clauses vetted.
 /// Carries the opened `TableAm` so later stages never re-resolve the name.
@@ -99,6 +99,25 @@ pub enum LogicalPlan {
         /// `None` = `OFFSET 0` (clause absent).
         offset: Option<i64>,
     },
+    /// Aggregation over a single row source: `GROUP BY` / `HAVING` and/or
+    /// aggregate calls in the target list. The physical pipeline is
+    /// `input → Filter(predicate) → Aggregate → [Filter(having)] → Projection →
+    /// Sort`: `predicate` (WHERE) filters the source *before* aggregation, the
+    /// aggregate node emits one row per group laid out `[group keys…, aggregates…]`,
+    /// `having` filters those rows, and `projections`/`sort` (whose aggregate and
+    /// grouped-column references were rewritten to `ColumnRef`s into that row)
+    /// produce the visible output. An empty `group_exprs` is the implicit single
+    /// group (`SELECT count(*) …` — always one output row).
+    Aggregate {
+        input: AggInput,
+        predicate: Option<BoundExpr>,
+        group_exprs: Vec<BoundExpr>,
+        aggregates: Vec<BoundAggregate>,
+        having: Option<BoundExpr>,
+        columns: Vec<OutputColumn>,
+        projections: Vec<BoundExpr>,
+        sort: Vec<SortKey>,
+    },
     /// INSERT ... VALUES: rows are full-width in schema order, each cell
     /// already coerced to its column type.
     Insert {
@@ -125,6 +144,16 @@ pub enum JoinInput {
     Scan(Arc<dyn TableAm>),
     Subplan(Box<LogicalPlan>),
     TableFunction { func: TableFn, args: Vec<BoundExpr> },
+}
+
+/// The row source feeding a [`LogicalPlan::Aggregate`]. `Scan` is a single base
+/// table; `SingleRow` is the one virtual row of a FROM-less aggregate
+/// (`SELECT count(*)`). The enum is the extension point for aggregates over
+/// joins / subqueries / SRFs, which are rejected for now.
+#[derive(Clone)]
+pub enum AggInput {
+    Scan(Arc<dyn TableAm>),
+    SingleRow,
 }
 
 /// Split a relation name into an optional schema qualifier and the relation
@@ -475,6 +504,25 @@ fn bind_from_select(
     let item = bind_from_item(engine, catalog, relation, ctes)?;
     let scope = Scope::relations(vec![(item.qualifier, to_columns(&item.columns))], catalog);
     let body = bind_select_body(select, order_by, &scope)?;
+    // An aggregating SELECT wraps the source in an Aggregate node. Only a base
+    // table scan is supported as the source for now.
+    if let Some(agg) = body.aggregation {
+        let JoinInput::Scan(table) = item.input else {
+            return Err(BindError::feature_not_supported(
+                "aggregates over this FROM form are not supported yet",
+            ));
+        };
+        return Ok(LogicalPlan::Aggregate {
+            input: AggInput::Scan(table),
+            predicate: body.predicate,
+            group_exprs: agg.group_exprs,
+            aggregates: agg.aggregates,
+            having: agg.having,
+            columns: body.columns,
+            projections: body.projections,
+            sort: body.sort,
+        });
+    }
     Ok(match item.input {
         JoinInput::Scan(table) => LogicalPlan::Query {
             table,
@@ -681,6 +729,11 @@ fn bind_cross_join(
     }
     let scope = Scope::relations(scope_rels, catalog);
     let body = bind_select_body(select, order_by, &scope)?;
+    if body.aggregation.is_some() {
+        return Err(BindError::feature_not_supported(
+            "aggregates over a join are not supported yet",
+        ));
+    }
     Ok(LogicalPlan::Join {
         inputs,
         columns: body.columns,
@@ -757,6 +810,7 @@ fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindError>
         | LogicalPlan::Query { columns, .. }
         | LogicalPlan::Subquery { columns, .. }
         | LogicalPlan::TableFunction { columns, .. }
+        | LogicalPlan::Aggregate { columns, .. }
         | LogicalPlan::Join { columns, .. } => Ok(columns.clone()),
         // LIMIT/OFFSET is a transparent wrapper: it exposes its source's columns.
         LogicalPlan::Limit { source, .. } => output_columns_of(source),
@@ -986,18 +1040,17 @@ fn reject_unsupported_query_clauses(query: &ast::Query) -> Result<(), BindError>
 }
 
 fn reject_unsupported_select_clauses(select: &ast::Select) -> Result<(), BindError> {
-    let group_by_present = match &select.group_by {
-        ast::GroupByExpr::Expressions(exprs, modifiers) => {
-            !exprs.is_empty() || !modifiers.is_empty()
-        }
+    // GROUP BY and HAVING are handled by the aggregation binder; only the
+    // grouping-set extensions (ROLLUP / CUBE / GROUPING SETS / GROUP BY ALL)
+    // remain unsupported.
+    let grouping_sets_unsupported = match &select.group_by {
+        ast::GroupByExpr::Expressions(_, modifiers) => !modifiers.is_empty(),
         ast::GroupByExpr::All(_) => true,
     };
     let unsupported: Option<&str> = if select.distinct.is_some() {
         Some("DISTINCT")
-    } else if group_by_present {
-        Some("GROUP BY")
-    } else if select.having.is_some() {
-        Some("HAVING")
+    } else if grouping_sets_unsupported {
+        Some("GROUP BY ROLLUP/CUBE/GROUPING SETS")
     } else if !select.named_window.is_empty() {
         Some("WINDOW")
     } else if select.qualify.is_some() {
@@ -1044,6 +1097,20 @@ fn bind_values_select(
     // Values node's empty-row evaluation. Hidden columns are never SRFs, so the
     // SRF check below is unaffected.
     let sort = bind_order_by(order_by, &columns, &scope, &mut row, true)?;
+    // A FROM-less aggregate (`SELECT count(*)`, or a HAVING/GROUP BY) runs over
+    // the single virtual row. `count(*)` returns 1, `WHERE false` makes it 0.
+    if let Some(agg) = bind_aggregation(select, &scope, &columns, &mut row, &predicate)? {
+        return Ok(LogicalPlan::Aggregate {
+            input: AggInput::SingleRow,
+            predicate,
+            group_exprs: agg.group_exprs,
+            aggregates: agg.aggregates,
+            having: agg.having,
+            columns,
+            projections: row,
+            sort,
+        });
+    }
     // A FROM-less SELECT with a set-returning function in the target list
     // (`SELECT generate_series(1, 5)`) expands into rows, so it cannot be a
     // constant `Values`. Run the projection pipeline over a single dummy input
@@ -1077,6 +1144,18 @@ struct SelectBody {
     projections: Vec<BoundExpr>,
     predicate: Option<BoundExpr>,
     sort: Vec<SortKey>,
+    /// Present when the SELECT aggregates (`GROUP BY`/`HAVING`, or an aggregate
+    /// in the target list / ORDER BY). `projections` and `sort` have then been
+    /// rewritten to reference the aggregate output row.
+    aggregation: Option<Aggregation>,
+}
+
+/// The grouping/aggregation part of a bound SELECT, extracted from its
+/// expressions. Feeds a [`LogicalPlan::Aggregate`].
+struct Aggregation {
+    group_exprs: Vec<BoundExpr>,
+    aggregates: Vec<BoundAggregate>,
+    having: Option<BoundExpr>,
 }
 
 /// Bind a SELECT's projection list, WHERE and ORDER BY against the in-scope
@@ -1118,12 +1197,288 @@ fn bind_select_body(
 
     let predicate = bind_where(&select.selection, scope)?;
     let sort = bind_order_by(order_by, &columns, scope, &mut projections, true)?;
+    // ORDER BY expressions were appended to `projections` as hidden columns, so
+    // aggregate detection/rewrite below covers `ORDER BY count(*)` too.
+    let aggregation = bind_aggregation(select, scope, &columns, &mut projections, &predicate)?;
     Ok(SelectBody {
         columns,
         projections,
         predicate,
         sort,
+        aggregation,
     })
+}
+
+/// Detect and bind a SELECT's aggregation. Returns `None` for a non-aggregating
+/// SELECT (leaving `projections` untouched). When the query aggregates — it has
+/// a `GROUP BY`, a `HAVING`, or any aggregate call in its target list / ORDER BY
+/// — this binds the group keys and HAVING, extracts every aggregate into an
+/// ordered list, and rewrites `projections` (and the returned HAVING) so each
+/// aggregate call and each grouped sub-expression becomes a `ColumnRef` into the
+/// aggregate output row `[group keys…, aggregates…]`.
+fn bind_aggregation(
+    select: &ast::Select,
+    scope: &Scope,
+    columns: &[OutputColumn],
+    projections: &mut [BoundExpr],
+    predicate: &Option<BoundExpr>,
+) -> Result<Option<Aggregation>, BindError> {
+    // An aggregate in WHERE is always an error — WHERE filters rows before
+    // grouping, so no aggregate value exists yet.
+    if predicate.as_ref().is_some_and(BoundExpr::contains_aggregate) {
+        return Err(BindError::new(
+            sqlstate::GROUPING_ERROR,
+            "aggregate functions are not allowed in WHERE",
+        ));
+    }
+
+    let group_exprs = bind_group_by(&select.group_by, scope, columns, projections)?;
+    let having = select
+        .having
+        .as_ref()
+        .map(|h| bind_expr(h, scope).and_then(|b| to_bool_operand(b, "HAVING")))
+        .transpose()?;
+
+    let aggregating = !group_exprs.is_empty()
+        || having.is_some()
+        || projections.iter().any(BoundExpr::contains_aggregate);
+    if !aggregating {
+        return Ok(None);
+    }
+
+    let mut aggregates: Vec<BoundAggregate> = Vec::new();
+    for proj in projections.iter_mut() {
+        // Move the projection out (rewrite consumes it and rebuilds a fresh
+        // tree) rather than cloning the whole expression only to drop it.
+        let taken = std::mem::replace(
+            proj,
+            BoundExpr::Const {
+                value: Value::Null,
+                ty: PgType::Bool,
+            },
+        );
+        *proj = rewrite_over_aggregate(taken, &group_exprs, &mut aggregates, scope)?;
+    }
+    let having = having
+        .map(|h| rewrite_over_aggregate(h, &group_exprs, &mut aggregates, scope))
+        .transpose()?;
+    Ok(Some(Aggregation {
+        group_exprs,
+        aggregates,
+        having,
+    }))
+}
+
+/// Bind the `GROUP BY` keys against the FROM `scope`. Supports plain expressions
+/// (including bare columns) and 1-based output-column ordinals (`GROUP BY 1`);
+/// grouping-set modifiers were already rejected. An aggregate inside a group key
+/// is an error, as in PG.
+fn bind_group_by(
+    group_by: &ast::GroupByExpr,
+    scope: &Scope,
+    columns: &[OutputColumn],
+    projections: &[BoundExpr],
+) -> Result<Vec<BoundExpr>, BindError> {
+    let exprs = match group_by {
+        ast::GroupByExpr::Expressions(exprs, _) => exprs,
+        // GroupByExpr::All was rejected in reject_unsupported_select_clauses.
+        ast::GroupByExpr::All(_) => return Ok(Vec::new()),
+    };
+    let mut keys = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        // A bare unsigned integer is a 1-based output-column ordinal
+        // (`GROUP BY 1`), grouping by that select-list expression — not the
+        // literal integer. Mirrors `order_by_target`'s ordinal handling.
+        let bound = if let Some(ordinal) = group_by_ordinal(expr) {
+            if ordinal < 1 || ordinal > columns.len() {
+                return Err(BindError::new(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    format!("GROUP BY position {ordinal} is not in select list"),
+                ));
+            }
+            projections[ordinal - 1].clone()
+        } else {
+            bind_group_key(expr, scope, columns, projections)?
+        };
+        if bound.contains_aggregate() {
+            return Err(BindError::new(
+                sqlstate::GROUPING_ERROR,
+                "aggregate functions are not allowed in GROUP BY",
+            ));
+        }
+        // The executor groups with `compare_values`, which cannot order every
+        // type (`bit`, user types); reject such a key at bind time rather than
+        // panicking mid-group.
+        if !crate::expr::is_orderable(bound.ty()) {
+            return Err(BindError::feature_not_supported(format!(
+                "GROUP BY on type {} is not supported yet",
+                bound.ty().name()
+            )));
+        }
+        keys.push(bound);
+    }
+    Ok(keys)
+}
+
+/// Bind one non-ordinal GROUP BY key. PG resolves a bare name as an input column
+/// first (via the scope), then falls back to a select-list output alias — so
+/// `SELECT a AS z FROM t GROUP BY z` groups by `a`. Qualified names and
+/// expressions bind against the scope only, as in PG.
+fn bind_group_key(
+    expr: &ast::Expr,
+    scope: &Scope,
+    columns: &[OutputColumn],
+    projections: &[BoundExpr],
+) -> Result<BoundExpr, BindError> {
+    match bind_scalar(expr, scope) {
+        Ok(bound) => Ok(bound),
+        // Only a bare, unresolved name falls back to an output alias.
+        Err(e) if e.code == sqlstate::UNDEFINED_COLUMN => {
+            if let ast::Expr::Identifier(ident) = expr {
+                let name = normalize_ident(ident);
+                let mut hit: Option<usize> = None;
+                for (i, col) in columns.iter().enumerate() {
+                    if col.name == name {
+                        if hit.is_some() {
+                            return Err(BindError::new(
+                                sqlstate::AMBIGUOUS_COLUMN,
+                                format!("GROUP BY \"{name}\" is ambiguous"),
+                            ));
+                        }
+                        hit = Some(i);
+                    }
+                }
+                if let Some(i) = hit {
+                    return Ok(projections[i].clone());
+                }
+            }
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A bare unsigned integer literal used as a GROUP BY ordinal, if any. `1 + 1` is
+/// an expression, not ordinal 2, so only a plain `Value::Number` qualifies.
+fn group_by_ordinal(expr: &ast::Expr) -> Option<usize> {
+    if let ast::Expr::Value(v) = expr
+        && let ast::Value::Number(n, _) = &v.value
+    {
+        return n.parse::<usize>().ok();
+    }
+    None
+}
+
+/// Rewrite an expression bound against the source scope into one over the
+/// aggregate output row: a sub-expression equal to a group key becomes a
+/// `ColumnRef` into that key's slot; an aggregate marker is appended to
+/// `aggregates` and becomes a `ColumnRef` into its slot (after the group keys);
+/// any remaining bare column reference is the "must appear in GROUP BY" error.
+fn rewrite_over_aggregate(
+    expr: BoundExpr,
+    group_exprs: &[BoundExpr],
+    aggregates: &mut Vec<BoundAggregate>,
+    scope: &Scope,
+) -> Result<BoundExpr, BindError> {
+    // A whole sub-expression that is one of the group keys is projected straight
+    // from the aggregate row — this is what makes `a`, `a + 1` (under GROUP BY a)
+    // and `date_trunc(...)` (under GROUP BY date_trunc(...)) legal.
+    if let Some(slot) = group_exprs.iter().position(|k| *k == expr) {
+        return Ok(BoundExpr::ColumnRef {
+            index: slot,
+            ty: expr.ty(),
+        });
+    }
+    match expr {
+        BoundExpr::Aggregate {
+            func,
+            arg,
+            input_ty,
+            ret,
+        } => {
+            if arg.as_ref().is_some_and(|a| a.contains_aggregate()) {
+                return Err(BindError::new(
+                    sqlstate::GROUPING_ERROR,
+                    "aggregate function calls cannot be nested",
+                ));
+            }
+            let index = group_exprs.len() + aggregates.len();
+            aggregates.push(BoundAggregate {
+                func,
+                arg: arg.map(|a| *a),
+                input_ty,
+                ret,
+            });
+            Ok(BoundExpr::ColumnRef { index, ty: ret })
+        }
+        BoundExpr::ColumnRef { index, .. } => Err(BindError::new(
+            sqlstate::GROUPING_ERROR,
+            format!(
+                "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                scope.column_label(index)
+            ),
+        )),
+        c @ BoundExpr::Const { .. } => Ok(c),
+        BoundExpr::Unary { op, expr } => Ok(BoundExpr::Unary {
+            op,
+            expr: Box::new(rewrite_over_aggregate(*expr, group_exprs, aggregates, scope)?),
+        }),
+        BoundExpr::Binary {
+            op,
+            arg_ty,
+            left,
+            right,
+        } => Ok(BoundExpr::Binary {
+            op,
+            arg_ty,
+            left: Box::new(rewrite_over_aggregate(*left, group_exprs, aggregates, scope)?),
+            right: Box::new(rewrite_over_aggregate(*right, group_exprs, aggregates, scope)?),
+        }),
+        BoundExpr::IsNull { expr, negated } => Ok(BoundExpr::IsNull {
+            expr: Box::new(rewrite_over_aggregate(*expr, group_exprs, aggregates, scope)?),
+            negated,
+        }),
+        BoundExpr::Coerce { expr, ty } => Ok(BoundExpr::Coerce {
+            expr: Box::new(rewrite_over_aggregate(*expr, group_exprs, aggregates, scope)?),
+            ty,
+        }),
+        BoundExpr::Reinterpret {
+            expr,
+            reported,
+            rep,
+        } => Ok(BoundExpr::Reinterpret {
+            expr: Box::new(rewrite_over_aggregate(*expr, group_exprs, aggregates, scope)?),
+            reported,
+            rep,
+        }),
+        BoundExpr::FuncCall { func, ret, args } => {
+            let args = args
+                .into_iter()
+                .map(|a| rewrite_over_aggregate(a, group_exprs, aggregates, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::FuncCall { func, ret, args })
+        }
+        BoundExpr::Case { whens, else_, ty } => {
+            let whens = whens
+                .into_iter()
+                .map(|(c, r)| {
+                    Ok((
+                        rewrite_over_aggregate(c, group_exprs, aggregates, scope)?,
+                        rewrite_over_aggregate(r, group_exprs, aggregates, scope)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, BindError>>()?;
+            let else_ = else_
+                .map(|e| rewrite_over_aggregate(*e, group_exprs, aggregates, scope).map(Box::new))
+                .transpose()?;
+            Ok(BoundExpr::Case { whens, else_, ty })
+        }
+        // A set-returning function combined with aggregation is not meaningful
+        // (PG: "set-returning functions are not allowed in ..."); reject cleanly.
+        BoundExpr::Srf { .. } => Err(BindError::feature_not_supported(
+            "set-returning functions with aggregation are not supported yet",
+        )),
+    }
 }
 
 /// A projection list item after classification.
@@ -1442,6 +1797,237 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected bind error for: {sql}"),
         }
+    }
+
+    /// The pieces of a bound `Aggregate` plan.
+    fn agg_of(
+        sql: &str,
+    ) -> (Vec<BoundExpr>, Vec<crate::BoundAggregate>, Vec<BoundExpr>, Option<BoundExpr>) {
+        match bind_one(sql).unwrap() {
+            LogicalPlan::Aggregate {
+                group_exprs,
+                aggregates,
+                projections,
+                having,
+                ..
+            } => (group_exprs, aggregates, projections, having),
+            other => panic!("expected Aggregate for `{sql}`, got another plan variant: {}", plan_name(&other)),
+        }
+    }
+
+    fn plan_name(p: &LogicalPlan) -> &'static str {
+        match p {
+            LogicalPlan::Values { .. } => "Values",
+            LogicalPlan::Query { .. } => "Query",
+            LogicalPlan::Subquery { .. } => "Subquery",
+            LogicalPlan::TableFunction { .. } => "TableFunction",
+            LogicalPlan::Join { .. } => "Join",
+            LogicalPlan::Aggregate { .. } => "Aggregate",
+            LogicalPlan::Limit { .. } => "Limit",
+            LogicalPlan::Insert { .. } => "Insert",
+            LogicalPlan::Update { .. } => "Update",
+            LogicalPlan::Delete { .. } => "Delete",
+        }
+    }
+
+    #[test]
+    fn count_star_becomes_a_single_aggregate() {
+        let (group_exprs, aggregates, projections, having) = agg_of("SELECT count(*) FROM t");
+        assert!(group_exprs.is_empty());
+        assert!(having.is_none());
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(aggregates[0].func, crate::AggFn::Count);
+        assert!(aggregates[0].arg.is_none());
+        assert_eq!(aggregates[0].ret, PgType::Int8);
+        // The projection reads the single aggregate slot.
+        assert_eq!(
+            projections,
+            vec![BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int8
+            }]
+        );
+    }
+
+    #[test]
+    fn min_and_max_extract_two_aggregates() {
+        let (_g, aggregates, projections, _h) = agg_of("SELECT min(id), max(id) FROM t");
+        assert_eq!(aggregates.len(), 2);
+        assert_eq!(aggregates[0].func, crate::AggFn::Min);
+        assert_eq!(aggregates[1].func, crate::AggFn::Max);
+        // MIN/MAX keep the argument type.
+        assert_eq!(aggregates[0].ret, PgType::Int4);
+        assert_eq!(
+            projections,
+            vec![
+                BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 },
+                BoundExpr::ColumnRef { index: 1, ty: PgType::Int4 },
+            ]
+        );
+    }
+
+    #[test]
+    fn expression_over_aggregates_rewrites_each_call() {
+        let (_g, aggregates, projections, _h) = agg_of("SELECT max(id) - min(id) FROM t");
+        assert_eq!(aggregates.len(), 2);
+        let BoundExpr::Binary { op: BinOp::Sub, left, right, .. } = &projections[0] else {
+            panic!("expected a subtraction over the two aggregate columns");
+        };
+        assert_eq!(**left, BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 });
+        assert_eq!(**right, BoundExpr::ColumnRef { index: 1, ty: PgType::Int4 });
+    }
+
+    #[test]
+    fn constant_mixed_with_aggregate_is_kept() {
+        let (_g, aggregates, projections, _h) = agg_of("SELECT 'x', count(*) FROM t");
+        assert_eq!(aggregates.len(), 1);
+        assert!(matches!(projections[0], BoundExpr::Const { .. }));
+        assert_eq!(projections[1], BoundExpr::ColumnRef { index: 0, ty: PgType::Int8 });
+    }
+
+    #[test]
+    fn group_by_puts_keys_before_aggregates() {
+        let (group_exprs, aggregates, projections, _h) =
+            agg_of("SELECT id, count(*) FROM t GROUP BY id");
+        assert_eq!(group_exprs, vec![BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 }]);
+        assert_eq!(aggregates.len(), 1);
+        // Group key is slot 0; the aggregate is slot 1 (after the keys).
+        assert_eq!(
+            projections,
+            vec![
+                BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 },
+                BoundExpr::ColumnRef { index: 1, ty: PgType::Int8 },
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_ordinal_references_select_expression() {
+        // GROUP BY 1 groups by the first select expression (id), not the literal 1.
+        let (group_exprs, _a, _p, _h) = agg_of("SELECT id, count(*) FROM t GROUP BY 1");
+        assert_eq!(group_exprs, vec![BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 }]);
+    }
+
+    #[test]
+    fn grouped_compound_expression_is_allowed() {
+        // `id + 1` is legal because its column is a group key.
+        let (_g, _a, projections, _h) = agg_of("SELECT id + 1 FROM t GROUP BY id");
+        assert!(matches!(projections[0], BoundExpr::Binary { op: BinOp::Add, .. }));
+    }
+
+    #[test]
+    fn having_forces_aggregation_and_is_rewritten() {
+        let (_g, aggregates, _p, having) =
+            agg_of("SELECT id FROM t GROUP BY id HAVING count(*) > 1");
+        assert_eq!(aggregates.len(), 1);
+        // HAVING references the aggregate slot (after the one group key).
+        let BoundExpr::Binary { left, .. } = having.expect("HAVING present") else {
+            panic!("expected a comparison in HAVING");
+        };
+        assert_eq!(*left, BoundExpr::ColumnRef { index: 1, ty: PgType::Int8 });
+    }
+
+    #[test]
+    fn sum_and_avg_return_types() {
+        assert_eq!(agg_of("SELECT sum(id) FROM t").1[0].ret, PgType::Int8);
+        assert_eq!(agg_of("SELECT sum(big) FROM t").1[0].ret, PgType::Numeric);
+        assert_eq!(agg_of("SELECT avg(id) FROM t").1[0].ret, PgType::Numeric);
+        assert_eq!(agg_of("SELECT avg(big) FROM t").1[0].ret, PgType::Numeric);
+    }
+
+    #[test]
+    fn order_by_aggregate_binds_without_error() {
+        // ORDER BY count(*) appends a hidden aggregate column; it must bind.
+        let (_g, aggregates, _p, _h) =
+            agg_of("SELECT id FROM t GROUP BY id ORDER BY count(*)");
+        assert_eq!(aggregates.len(), 1);
+    }
+
+    #[test]
+    fn ungrouped_column_is_a_grouping_error() {
+        assert_eq!(bind_err("SELECT id, count(*) FROM t").code, sqlstate::GROUPING_ERROR);
+        assert_eq!(bind_err("SELECT id FROM t GROUP BY big").code, sqlstate::GROUPING_ERROR);
+    }
+
+    #[test]
+    fn aggregate_in_where_is_rejected() {
+        assert_eq!(
+            bind_err("SELECT count(*) FROM t WHERE count(*) > 1").code,
+            sqlstate::GROUPING_ERROR
+        );
+    }
+
+    #[test]
+    fn nested_aggregate_is_rejected() {
+        assert_eq!(bind_err("SELECT max(min(id)) FROM t").code, sqlstate::GROUPING_ERROR);
+    }
+
+    #[test]
+    fn aggregate_in_group_by_is_rejected() {
+        assert_eq!(
+            bind_err("SELECT count(*) FROM t GROUP BY count(*)").code,
+            sqlstate::GROUPING_ERROR
+        );
+    }
+
+    #[test]
+    fn unsupported_aggregate_argument_is_undefined_function() {
+        assert_eq!(bind_err("SELECT sum(name) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
+        assert_eq!(bind_err("SELECT avg(name) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
+    }
+
+    #[test]
+    fn distinct_aggregate_is_unsupported() {
+        assert_eq!(
+            bind_err("SELECT count(DISTINCT id) FROM t").code,
+            sqlstate::FEATURE_NOT_SUPPORTED
+        );
+    }
+
+    #[test]
+    fn group_by_ordinal_out_of_range_is_rejected() {
+        assert_eq!(
+            bind_err("SELECT id, count(*) FROM t GROUP BY 5").code,
+            sqlstate::INVALID_COLUMN_REFERENCE
+        );
+    }
+
+    #[test]
+    fn min_max_reject_boolean() {
+        // PG has no min/max(boolean) even though bool is orderable for ORDER BY.
+        assert_eq!(bind_err("SELECT max(flag) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
+        assert_eq!(bind_err("SELECT min(flag) FROM t").code, sqlstate::UNDEFINED_FUNCTION);
+    }
+
+    #[test]
+    fn group_by_resolves_output_alias() {
+        // `z` is not an input column; it resolves to the select-list alias for id.
+        let (group_exprs, _a, _p, _h) = agg_of("SELECT id AS z, count(*) FROM t GROUP BY z");
+        assert_eq!(group_exprs, vec![BoundExpr::ColumnRef { index: 0, ty: PgType::Int4 }]);
+    }
+
+    #[test]
+    fn parameterless_count_has_pg_message() {
+        let e = bind_err("SELECT count()");
+        assert_eq!(e.code, sqlstate::WRONG_OBJECT_TYPE);
+        assert_eq!(
+            e.message,
+            "count(*) must be used to call a parameterless aggregate function"
+        );
+    }
+
+    #[test]
+    fn wrong_arity_aggregate_names_argument_types() {
+        let e = bind_err("SELECT min(id, big) FROM t");
+        assert_eq!(e.code, sqlstate::UNDEFINED_FUNCTION);
+        assert_eq!(e.message, "function min(integer, bigint) does not exist");
+    }
+
+    #[test]
+    fn wildcard_non_count_aggregate_is_undefined() {
+        let e = bind_err("SELECT sum(*) FROM t");
+        assert_eq!(e.code, sqlstate::UNDEFINED_FUNCTION);
+        assert_eq!(e.message, "function sum() does not exist");
     }
 
     #[test]

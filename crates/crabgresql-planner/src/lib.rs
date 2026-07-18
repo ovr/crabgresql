@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use crabgresql_binder::{BoundExpr, JoinInput, LogicalPlan, OutputColumn, SortKey, TableFn};
+use crabgresql_binder::{
+    AggInput, BoundAggregate, BoundExpr, JoinInput, LogicalPlan, OutputColumn, SortKey, TableFn,
+};
 use crabgresql_storage_api::TableAm;
 
 /// An executable plan. `Select` describes the SeqScan → Filter → Projection →
@@ -49,6 +51,20 @@ pub enum PhysicalPlan {
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
     },
+    /// Grouped aggregation. Mirrors [`LogicalPlan::Aggregate`]: the executor
+    /// filters `input` by `predicate`, groups by `group_exprs`, accumulates the
+    /// `aggregates`, filters groups by `having`, then runs the standard
+    /// projection/sort tail.
+    Aggregate {
+        input: PhysicalAggInput,
+        predicate: Option<BoundExpr>,
+        group_exprs: Vec<BoundExpr>,
+        aggregates: Vec<BoundAggregate>,
+        having: Option<BoundExpr>,
+        columns: Vec<OutputColumn>,
+        projections: Vec<BoundExpr>,
+        sort: Vec<SortKey>,
+    },
     /// LIMIT/OFFSET above a source plan (after its sort). Mirrors
     /// [`LogicalPlan::Limit`].
     Limit {
@@ -77,6 +93,12 @@ pub enum PhysicalJoinInput {
     Scan(Arc<dyn TableAm>),
     Subplan(Box<PhysicalPlan>),
     TableFunction { func: TableFn, args: Vec<BoundExpr> },
+}
+
+/// The row source of a [`PhysicalPlan::Aggregate`], mirroring [`AggInput`].
+pub enum PhysicalAggInput {
+    Scan(Arc<dyn TableAm>),
+    SingleRow,
 }
 
 fn plan_join_input(input: JoinInput) -> PhysicalJoinInput {
@@ -154,6 +176,28 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             columns,
             projections,
             predicate,
+            sort,
+        },
+        LogicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            columns,
+            projections,
+            sort,
+        } => PhysicalPlan::Aggregate {
+            input: match input {
+                AggInput::Scan(table) => PhysicalAggInput::Scan(table),
+                AggInput::SingleRow => PhysicalAggInput::SingleRow,
+            },
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            columns,
+            projections,
             sort,
         },
         LogicalPlan::Limit {
@@ -356,6 +400,42 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         // t's three columns plus v's one.
         assert_eq!(columns.len(), 4);
+    }
+
+    #[test]
+    fn aggregate_query_maps_to_physical_aggregate() {
+        let PhysicalPlan::Aggregate {
+            group_exprs,
+            aggregates,
+            projections,
+            ..
+        } = plan_sql("SELECT count(*) FROM t")
+        else {
+            panic!("expected Aggregate");
+        };
+        assert!(group_exprs.is_empty());
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(
+            projections,
+            vec![BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int8
+            }]
+        );
+    }
+
+    #[test]
+    fn grouped_aggregate_maps_to_physical_aggregate() {
+        let PhysicalPlan::Aggregate {
+            group_exprs,
+            aggregates,
+            ..
+        } = plan_sql("SELECT id, count(*) FROM t GROUP BY id")
+        else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(group_exprs.len(), 1);
+        assert_eq!(aggregates.len(), 1);
     }
 
     #[test]

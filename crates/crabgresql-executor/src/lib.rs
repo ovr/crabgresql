@@ -5,6 +5,7 @@
 //! rather than plan nodes: it yields a row count, not a row stream, and the
 //! pull model only becomes the right shape for it once RETURNING exists.
 
+mod agg;
 pub mod eval;
 mod generate_series;
 mod md5;
@@ -12,11 +13,12 @@ pub mod scalar_fns;
 mod special_fns;
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crabgresql_binder::{BoundExpr, SortKey, TableFn};
+use crabgresql_binder::{BoundAggregate, BoundExpr, SortKey, TableFn};
 pub use crabgresql_binder::OutputColumn;
-use crabgresql_planner::{PhysicalJoinInput, PhysicalPlan};
+use crabgresql_planner::{PhysicalAggInput, PhysicalJoinInput, PhysicalPlan};
 use crabgresql_storage_api::{TableAm, Tid, Tuple};
 use crabgresql_txn::TxnContext;
 use crabgresql_types::Value;
@@ -180,6 +182,38 @@ pub fn execute(
                 columns,
                 node: Box::new(Limit::new(node, limit, offset)),
             })
+        }
+        PhysicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            columns,
+            projections,
+            sort,
+        } => {
+            // Source rows: a base table scan or the single virtual row of a
+            // FROM-less aggregate.
+            let source: Box<dyn ExecNode> = match input {
+                PhysicalAggInput::Scan(table) => Box::new(SeqScan::new(&table, txn)),
+                PhysicalAggInput::SingleRow => {
+                    Box::new(Values::new(vec![vec![]], ctx))
+                }
+            };
+            // WHERE filters rows before aggregation.
+            let mut node: Box<dyn ExecNode> = match predicate {
+                Some(predicate) => Box::new(Filter::new(source, predicate, ctx)),
+                None => source,
+            };
+            node = Box::new(Aggregate::new(node, group_exprs, aggregates, ctx));
+            // HAVING filters the per-group rows.
+            if let Some(having) = having {
+                node = Box::new(Filter::new(node, having, ctx));
+            }
+            // The projection list and ORDER BY were rewritten to reference the
+            // aggregate output row, so the standard tail finishes the job.
+            project_pipeline(node, projections, None, sort, columns, ctx)
         }
         PhysicalPlan::Insert { table, rows } => execute_insert(&table, &rows, ctx, txn),
         PhysicalPlan::Update {
@@ -609,6 +643,129 @@ impl Sort {
 impl ExecNode for Sort {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
         Ok(self.rows.next())
+    }
+}
+
+/// Grouped aggregation. On the first pull it buffers every child row, groups
+/// them by the NULL-aware equality of the group-key expressions in first-seen
+/// order — so per-group accumulation follows scan order, matching PG's hash
+/// aggregate — and emits one row per group laid out `[group keys…, aggregates…]`.
+/// An empty group-key list is the implicit single group: exactly one output row
+/// even over no input (`SELECT count(*)` → 0).
+pub struct Aggregate {
+    child: Box<dyn ExecNode>,
+    group_exprs: Vec<BoundExpr>,
+    aggregates: Vec<BoundAggregate>,
+    ctx: ExecContext,
+    /// Output rows, built lazily on the first `next()`.
+    output: Option<std::vec::IntoIter<Tuple>>,
+}
+
+/// One accumulating group: its key values and one accumulator per aggregate.
+struct AggGroup {
+    key: Vec<Value>,
+    accumulators: Vec<agg::Accumulator>,
+}
+
+impl Aggregate {
+    pub fn new(
+        child: Box<dyn ExecNode>,
+        group_exprs: Vec<BoundExpr>,
+        aggregates: Vec<BoundAggregate>,
+        ctx: ExecContext,
+    ) -> Self {
+        Self {
+            child,
+            group_exprs,
+            aggregates,
+            ctx,
+            output: None,
+        }
+    }
+
+    /// Drain the child, accumulate per group, and materialize the output rows.
+    fn build(&mut self) -> Result<std::vec::IntoIter<Tuple>, ExecError> {
+        let key_tys: Vec<_> = self.group_exprs.iter().map(BoundExpr::ty).collect();
+        let mut groups: Vec<AggGroup> = Vec::new();
+        // Hash of each group's key → the indices of groups sharing that hash, so
+        // a row finds its group in ~O(1); `keys_equal` resolves hash collisions.
+        // Groups stay in first-seen order (accumulation follows scan order).
+        let mut lookup: HashMap<u64, Vec<usize>> = HashMap::new();
+        // The implicit single group needs one seeded group so an empty input
+        // still produces a row.
+        if self.group_exprs.is_empty() {
+            groups.push(AggGroup {
+                key: Vec::new(),
+                accumulators: self.aggregates.iter().map(agg::Accumulator::new).collect(),
+            });
+        }
+        while let Some(row) = self.child.next()? {
+            let idx = if self.group_exprs.is_empty() {
+                0
+            } else {
+                let key = self
+                    .group_exprs
+                    .iter()
+                    .map(|e| eval(e, &row, self.ctx))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let bucket = lookup.entry(agg::hash_key(&key_tys, &key)).or_default();
+                match bucket
+                    .iter()
+                    .copied()
+                    .find(|&i| agg::keys_equal(&key_tys, &groups[i].key, &key))
+                {
+                    Some(i) => i,
+                    None => {
+                        let i = groups.len();
+                        groups.push(AggGroup {
+                            key,
+                            accumulators: self
+                                .aggregates
+                                .iter()
+                                .map(agg::Accumulator::new)
+                                .collect(),
+                        });
+                        bucket.push(i);
+                        i
+                    }
+                }
+            };
+            for (agg, acc) in self
+                .aggregates
+                .iter()
+                .zip(groups[idx].accumulators.iter_mut())
+            {
+                match &agg.arg {
+                    // COUNT(*) counts every row, skipping no NULLs.
+                    None => acc.count_row(),
+                    Some(arg) => {
+                        let v = eval(arg, &row, self.ctx)?;
+                        // Every aggregate but COUNT(*) ignores NULL inputs.
+                        if !matches!(v, Value::Null) {
+                            acc.accumulate(v)?;
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(groups.len());
+        for group in groups {
+            let mut tuple = group.key;
+            for acc in group.accumulators {
+                tuple.push(acc.finalize()?);
+            }
+            out.push(tuple);
+        }
+        Ok(out.into_iter())
+    }
+}
+
+impl ExecNode for Aggregate {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        if self.output.is_none() {
+            self.output = Some(self.build()?);
+        }
+        Ok(self.output.as_mut().unwrap().next())
     }
 }
 
@@ -1399,6 +1556,155 @@ mod tests {
             rows.push(tuple);
         }
         (columns, rows)
+    }
+
+    /// An engine with `t(a int, b int)` seeded with two groups (a=1,2) plus a
+    /// singleton (a=3), and one NULL `b`.
+    fn agg_engine() -> Arc<dyn TableEngine> {
+        let engine = MemoryEngine::new();
+        let table = engine
+            .create_table(TableSchema {
+                name: "t".into(),
+                columns: vec![Column::new("a", PgType::Int4), Column::new("b", PgType::Int4)],
+            })
+            .unwrap();
+        let txn = wtxn();
+        let seed: [(i32, Option<i32>); 5] =
+            [(1, Some(10)), (1, Some(20)), (2, Some(5)), (2, None), (3, Some(7))];
+        for (a, b) in seed {
+            let b = b.map(Value::Int4).unwrap_or(Value::Null);
+            table.insert(vec![Value::Int4(a), b], &txn);
+        }
+        Arc::new(engine)
+    }
+
+    #[test]
+    fn whole_table_aggregates_ignore_nulls() {
+        let engine = agg_engine();
+        let (_c, rows) =
+            run_rows_on(&engine, "SELECT count(*), count(b), min(b), max(b), sum(b) FROM t");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Int8(5),  // count(*) — every row
+                Value::Int8(4),  // count(b) — NULL skipped
+                Value::Int4(5),  // min(b)
+                Value::Int4(20), // max(b)
+                Value::Int8(42), // sum(b): int4 widens to bigint
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_group_is_zero_count_and_null_sum() {
+        let engine = agg_engine();
+        let (_c, rows) = run_rows_on(&engine, "SELECT count(*), sum(b), min(b) FROM t WHERE a > 100");
+        // The implicit group still yields one row.
+        assert_eq!(rows, vec![vec![Value::Int8(0), Value::Null, Value::Null]]);
+    }
+
+    #[test]
+    fn avg_of_integers_is_numeric() {
+        let engine = agg_engine();
+        let (_c, rows) = run_rows_on(&engine, "SELECT avg(b) FROM t");
+        // 42 / 4 = 10.5, as numeric.
+        let Value::Numeric(n) = &rows[0][0] else {
+            panic!("avg(int) should be numeric, got {:?}", rows[0][0]);
+        };
+        assert_eq!(n.to_display(), "10.5000000000000000");
+    }
+
+    #[test]
+    fn group_by_produces_one_row_per_group() {
+        let engine = agg_engine();
+        let (_c, rows) =
+            run_rows_on(&engine, "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY a");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int8(2), Value::Int8(30)],
+                vec![Value::Int4(2), Value::Int8(2), Value::Int8(5)],
+                vec![Value::Int4(3), Value::Int8(1), Value::Int8(7)],
+            ]
+        );
+    }
+
+    #[test]
+    fn having_filters_groups() {
+        let engine = agg_engine();
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT a FROM t GROUP BY a HAVING count(*) > 1 ORDER BY a",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]);
+    }
+
+    #[test]
+    fn from_less_count_star_is_one() {
+        let (_c, rows) = run_rows("SELECT count(*)");
+        assert_eq!(rows, vec![vec![Value::Int8(1)]]);
+    }
+
+    #[test]
+    fn max_minus_min_over_aggregate_row() {
+        let engine = agg_engine();
+        let (_c, rows) = run_rows_on(&engine, "SELECT max(b) - min(b) AS span FROM t");
+        assert_eq!(rows, vec![vec![Value::Int4(15)]]);
+    }
+
+    #[test]
+    fn group_by_null_key_forms_one_group() {
+        // Rows with a NULL group key group together (NULL == NULL), distinct from
+        // the non-NULL groups. Exercises the hash-grouping NULL path.
+        let engine = MemoryEngine::new();
+        let table = engine
+            .create_table(TableSchema {
+                name: "g".into(),
+                columns: vec![Column::new("k", PgType::Int4), Column::new("v", PgType::Int4)],
+            })
+            .unwrap();
+        let txn = wtxn();
+        for (k, v) in [(Some(1), 10), (None, 20), (Some(1), 5), (None, 7)] {
+            let k = k.map(Value::Int4).unwrap_or(Value::Null);
+            table.insert(vec![k, Value::Int4(v)], &txn);
+        }
+        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        // ORDER BY k with NULLS LAST-for-ASC (PG default) so the row order is fixed.
+        let (_c, rows) = run_rows_on(&engine, "SELECT k, count(*), sum(v) FROM g GROUP BY k ORDER BY k");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int8(2), Value::Int8(15)],
+                vec![Value::Null, Value::Int8(2), Value::Int8(27)],
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_float_treats_neg_zero_and_nan_like_pg() {
+        // -0.0 groups with 0.0, and NaN groups with NaN — the hash and keys_equal
+        // must agree on both. Two 0.0-family rows, two NaN rows.
+        let engine = MemoryEngine::new();
+        let table = engine
+            .create_table(TableSchema {
+                name: "f".into(),
+                columns: vec![Column::new("x", PgType::Float8)],
+            })
+            .unwrap();
+        let txn = wtxn();
+        for x in [0.0_f64, -0.0, f64::NAN, f64::NAN] {
+            table.insert(vec![Value::Float8(x)], &txn);
+        }
+        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        let (_c, rows) = run_rows_on(&engine, "SELECT count(*) FROM f GROUP BY x");
+        // Exactly two groups (the 0.0 family and the NaN family), each of size 2.
+        let mut counts: Vec<Value> = rows.into_iter().map(|r| r[0].clone()).collect();
+        counts.sort_by_key(|v| match v {
+            Value::Int8(n) => *n,
+            _ => -1,
+        });
+        assert_eq!(counts, vec![Value::Int8(2), Value::Int8(2)]);
     }
 
     #[test]
