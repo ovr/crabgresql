@@ -86,6 +86,19 @@ pub enum LogicalPlan {
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
     },
+    /// LIMIT/OFFSET applied above a SELECT body — after its ORDER BY, since PG
+    /// evaluates the count clauses on the ordered result. `source` produces the
+    /// (ordered) rows; this node skips `offset` of them and stops after `limit`.
+    /// A wrapper rather than a field on every SELECT variant: LIMIT/OFFSET is a
+    /// query-level construct that sits above the whole select, mirroring PG's
+    /// Limit plan node above the sort.
+    Limit {
+        source: Box<LogicalPlan>,
+        /// `None` = no limit (`LIMIT ALL` or clause absent).
+        limit: Option<i64>,
+        /// `None` = `OFFSET 0` (clause absent).
+        offset: Option<i64>,
+    },
     /// INSERT ... VALUES: rows are full-width in schema order, each cell
     /// already coerced to its column type.
     Insert {
@@ -200,7 +213,7 @@ fn bind_query_body(
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
     reject_unsupported_query_clauses(query)?;
-    match query.body.as_ref() {
+    let inner = match query.body.as_ref() {
         ast::SetExpr::Select(select) => {
             reject_unsupported_select_clauses(select)?;
             bind_select(engine, catalog, select, &query.order_by, ctes)
@@ -209,6 +222,97 @@ fn bind_query_body(
         other => Err(BindError::feature_not_supported(format!(
             "query form is not supported yet: {other}"
         ))),
+    }?;
+    // LIMIT/OFFSET wrap the bound body so they apply after its ORDER BY.
+    match &query.limit_clause {
+        Some(clause) => {
+            let (limit, offset) = bind_limit_offset(clause)?;
+            Ok(LogicalPlan::Limit {
+                source: Box::new(inner),
+                limit,
+                offset,
+            })
+        }
+        None => Ok(inner),
+    }
+}
+
+/// Fold a `LIMIT`/`OFFSET` clause into constant row counts. PG evaluates these as
+/// `bigint` expressions; we support constant integers (the only form the tests
+/// and typical queries need). `LIMIT ALL`, a `NULL` count, or an absent clause
+/// all mean "no bound" (`None`). Negative counts are rejected with PG's wording.
+fn bind_limit_offset(clause: &ast::LimitClause) -> Result<(Option<i64>, Option<i64>), BindError> {
+    let ast::LimitClause::LimitOffset {
+        limit,
+        offset,
+        limit_by,
+    } = clause
+    else {
+        // MySQL `LIMIT <offset>, <limit>` — not PG syntax.
+        return Err(BindError::feature_not_supported(
+            "LIMIT <offset>, <limit> is not supported yet",
+        ));
+    };
+    if !limit_by.is_empty() {
+        return Err(BindError::feature_not_supported(
+            "LIMIT ... BY is not supported yet",
+        ));
+    }
+    let limit = limit
+        .as_ref()
+        .map(|e| bind_count_expr(e, "LIMIT"))
+        .transpose()?
+        .flatten();
+    let offset = offset
+        .as_ref()
+        .map(|o| bind_count_expr(&o.value, "OFFSET"))
+        .transpose()?
+        .flatten();
+    Ok((limit, offset))
+}
+
+/// Evaluate a single LIMIT/OFFSET count expression to a non-negative `i64`.
+/// Returns `None` for a `NULL` literal (PG: no limit / offset 0). Non-constant
+/// expressions are rejected as unsupported; negatives with PG's SQLSTATE.
+fn bind_count_expr(expr: &ast::Expr, clause: &str) -> Result<Option<i64>, BindError> {
+    match const_i64(expr) {
+        Some(Some(n)) if n < 0 => {
+            let (code, kind) = if clause == "OFFSET" {
+                (sqlstate::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, "OFFSET")
+            } else {
+                (sqlstate::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, "LIMIT")
+            };
+            Err(BindError::new(
+                code,
+                format!("{kind} must not be negative"),
+            ))
+        }
+        Some(value) => Ok(value),
+        None => Err(BindError::feature_not_supported(format!(
+            "non-constant {clause} is not supported yet"
+        ))),
+    }
+}
+
+/// Constant-fold `expr` to an integer count. `Some(None)` is a recognized `NULL`
+/// literal; `Some(Some(n))` a constant integer; `None` means not a constant we
+/// evaluate. Handles integer literals and nested unary `+`/`-`.
+fn const_i64(expr: &ast::Expr) -> Option<Option<i64>> {
+    match expr {
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::Number(n, _) => n.parse().ok().map(Some),
+            ast::Value::Null => Some(None),
+            _ => None,
+        },
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => const_i64(expr).map(|v| v.map(|n| -n)),
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Plus,
+            expr,
+        } => const_i64(expr),
+        _ => None,
     }
 }
 
@@ -576,6 +680,8 @@ fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindError>
         | LogicalPlan::Subquery { columns, .. }
         | LogicalPlan::TableFunction { columns, .. }
         | LogicalPlan::Join { columns, .. } => Ok(columns.clone()),
+        // LIMIT/OFFSET is a transparent wrapper: it exposes its source's columns.
+        LogicalPlan::Limit { source, .. } => output_columns_of(source),
         LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => {
             Err(BindError::feature_not_supported(
                 "data-modifying statements in WITH are not supported yet",
@@ -780,10 +886,9 @@ fn order_by_target(
 }
 
 fn reject_unsupported_query_clauses(query: &ast::Query) -> Result<(), BindError> {
-    // WITH is handled by the caller (bind_ctes); it is not rejected here.
-    let unsupported: Option<&str> = if query.limit_clause.is_some() {
-        Some("LIMIT/OFFSET")
-    } else if query.fetch.is_some() {
+    // WITH is handled by the caller (bind_ctes) and LIMIT/OFFSET by the caller
+    // (bind_limit_offset); neither is rejected here.
+    let unsupported: Option<&str> = if query.fetch.is_some() {
         Some("FETCH")
     } else if !query.locks.is_empty() {
         Some("FOR UPDATE/SHARE")
@@ -1039,6 +1144,14 @@ pub fn bind_insert(
     if source.order_by.is_some() {
         return Err(BindError::feature_not_supported(
             "ORDER BY on an INSERT source is not supported yet",
+        ));
+    }
+    // `VALUES (1),(2) LIMIT 1` is a legal INSERT source in PG that inserts one
+    // row; this path does not execute the limit, so reject it rather than
+    // silently insert the wrong rows.
+    if source.limit_clause.is_some() {
+        return Err(BindError::feature_not_supported(
+            "LIMIT/OFFSET on an INSERT source is not supported yet",
         ));
     }
     let values = match source.body.as_ref() {
@@ -1579,7 +1692,6 @@ mod tests {
     #[test]
     fn unsupported_forms_stay_0a000() {
         for sql in [
-            "SELECT id FROM t LIMIT 1",
             "UPDATE t SET (id, name) = (1, 'x')",
             "UPDATE t SET id = 1 RETURNING id",
             "DELETE FROM t USING t AS u",
@@ -2458,6 +2570,68 @@ mod tests {
         // A standalone VALUES list has no projection tuple to hang a hidden
         // column on, so expression sort keys are still unsupported.
         let e = bind_err("VALUES (3), (1) ORDER BY column1 + 1");
+        assert_eq!(e.code, "0A000");
+    }
+
+    #[test]
+    fn limit_offset_wraps_body() {
+        let LogicalPlan::Limit {
+            source,
+            limit,
+            offset,
+        } = bind_one("SELECT id FROM t LIMIT 5 OFFSET 2").unwrap()
+        else {
+            panic!("expected Limit");
+        };
+        assert_eq!(limit, Some(5));
+        assert_eq!(offset, Some(2));
+        assert!(matches!(*source, LogicalPlan::Query { .. }));
+    }
+
+    #[test]
+    fn offset_zero_is_a_bare_offset() {
+        // The float4/float8 optimization-fence shape: `OFFSET 0`, no LIMIT.
+        let LogicalPlan::Limit { limit, offset, .. } =
+            bind_one("SELECT id FROM t OFFSET 0").unwrap()
+        else {
+            panic!("expected Limit");
+        };
+        assert_eq!(limit, None);
+        assert_eq!(offset, Some(0));
+    }
+
+    #[test]
+    fn limit_all_is_no_bound() {
+        // `LIMIT ALL OFFSET 3` carries only the offset; the limit is unbounded.
+        let LogicalPlan::Limit { limit, offset, .. } =
+            bind_one("SELECT id FROM t LIMIT ALL OFFSET 3").unwrap()
+        else {
+            panic!("expected Limit");
+        };
+        assert_eq!(limit, None);
+        assert_eq!(offset, Some(3));
+    }
+
+    #[test]
+    fn offset_in_derived_table_wraps_subplan() {
+        // `OFFSET 0` inside a FROM subquery binds as a Limit at that level.
+        let LogicalPlan::Subquery { source, .. } =
+            bind_one("SELECT * FROM (SELECT id FROM t OFFSET 0) s").unwrap()
+        else {
+            panic!("expected Subquery");
+        };
+        assert!(matches!(*source, LogicalPlan::Limit { .. }));
+    }
+
+    #[test]
+    fn negative_limit_and_offset_rejected() {
+        assert_eq!(bind_err("SELECT id FROM t LIMIT -1").code, "2201W");
+        assert_eq!(bind_err("SELECT id FROM t OFFSET -1").code, "2201X");
+    }
+
+    #[test]
+    fn non_constant_limit_stays_0a000() {
+        let e = bind_err("SELECT id FROM t LIMIT id");
         assert_eq!(e.code, "0A000");
     }
 }

@@ -2,4 +2,5 @@
 # `cargo test -p crabgresql-pg-regress` fails if any test listed here regresses.
 # Promote tests here as SQL coverage grows; one name per line.
 comments
+float4
 md5

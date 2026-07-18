@@ -220,7 +220,7 @@ async fn integer_out_of_range_on_insert() {
 async fn unsupported_clauses_error_instead_of_silently_dropping() {
     let client = connect(spawn_server().await).await;
     for sql in [
-        "SELECT 1 LIMIT 1",
+        "SELECT 1 FETCH FIRST 1 ROW ONLY",
         "SELECT 1 GROUP BY 1",
         "SELECT 1 HAVING true",
         "SELECT DISTINCT 1",
@@ -235,6 +235,34 @@ async fn unsupported_clauses_error_instead_of_silently_dropping() {
             "{sql}"
         );
     }
+}
+
+#[tokio::test]
+async fn limit_and_offset_slice_ordered_rows() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (3), (1), (4), (1), (5), (9)")
+        .await
+        .unwrap();
+
+    // LIMIT/OFFSET apply after ORDER BY: sorted ids are 1,1,3,4,5,9.
+    let messages = client
+        .simple_query("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1")
+        .await
+        .unwrap();
+    let got: Vec<_> = rows(&messages).iter().map(|r| r.get(0).unwrap().to_string()).collect();
+    assert_eq!(got, ["1", "3"]);
+
+    // OFFSET 0 is a no-op fence (the float4/float8 pattern): all rows, in order.
+    let messages = client
+        .simple_query("SELECT id FROM t ORDER BY id OFFSET 0")
+        .await
+        .unwrap();
+    assert_eq!(rows(&messages).len(), 6);
 }
 
 #[tokio::test]
