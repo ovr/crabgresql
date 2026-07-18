@@ -20,6 +20,8 @@ const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 const STRING_DATA_LENGTH_MISMATCH: &str = "22026";
 const SUBSTRING_ERROR: &str = "22011";
 const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
+const INVALID_PARAMETER_VALUE: &str = "22023";
+const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 
 /// A bit-string error, carrying the SQLSTATE and message PG reports.
 #[derive(Clone, Debug, PartialEq)]
@@ -258,13 +260,17 @@ pub fn get_bit(len: u32, data: &[u8], n: i32) -> Result<i32, BitError> {
     Ok(((data[n / 8] >> (7 - (n % 8))) & 1) as i32)
 }
 
-/// `set_bit(bit, n, newvalue)` — set the bit at 0-based index `n`.
+/// `set_bit(bit, n, newvalue)` — set the bit at 0-based index `n`. `newvalue`
+/// must be 0 or 1 (like PG's `bitsetbit`), else `22023`.
 pub fn set_bit(len: u32, data: &[u8], n: i32, value: i32) -> Result<(u32, Vec<u8>), BitError> {
     if n < 0 || n as u32 >= len {
         return Err(index_out_of_range(n, len));
     }
+    if value != 0 && value != 1 {
+        return Err(BitError::new(INVALID_PARAMETER_VALUE, "new bit must be 0 or 1"));
+    }
     let mut bits = to_bits(len, data);
-    bits[n as usize] = value != 0;
+    bits[n as usize] = value == 1;
     Ok(from_bits(&bits))
 }
 
@@ -344,9 +350,18 @@ pub fn overlay(
     sl: Option<i32>,
 ) -> Result<(u32, Vec<u8>), BitError> {
     let sl = sl.unwrap_or(repl_len as i32);
-    // head = str[1 .. sp-1], tail = str[sp+sl .. end]
+    // A non-positive start would reduce to a negative head length; PG rejects it
+    // up front (this also avoids the `sp - 1` underflow for very negative `sp`).
+    if sp <= 0 {
+        return Err(BitError::new(SUBSTRING_ERROR, "negative substring length not allowed"));
+    }
+    // `sp + sl` can overflow i32; PG guards it with an explicit range error.
+    let sp_pl_sl = sp
+        .checked_add(sl)
+        .ok_or_else(|| BitError::new(NUMERIC_VALUE_OUT_OF_RANGE, "integer out of range"))?;
+    // head = str[1 .. sp-1], tail = str[sp+sl .. end]  (`sp >= 1`, so `sp - 1` is safe)
     let (hl, hd) = substring(str_len, str_data, 1, Some(sp - 1))?;
-    let (tl, td) = substring(str_len, str_data, sp + sl, None)?;
+    let (tl, td) = substring(str_len, str_data, sp_pl_sl, None)?;
     let (ml, md) = concat(hl, &hd, repl_len, repl_data);
     Ok(concat(ml, &md, tl, &td))
 }
@@ -464,6 +479,9 @@ mod tests {
             set_bit(l, &d, 16, 1).unwrap_err().message,
             "bit index 16 out of valid range (0..15)"
         );
+        // A newvalue other than 0 or 1 is rejected (PG's bitsetbit).
+        assert_eq!(set_bit(l, &d, 3, 5).unwrap_err().message, "new bit must be 0 or 1");
+        assert_eq!(set_bit(l, &d, 3, 5).unwrap_err().sqlstate, "22023");
     }
 
     #[test]
@@ -475,5 +493,21 @@ mod tests {
         let (ol, od) = overlay(l, &d, from_binary("101").unwrap().0, &from_binary("101").unwrap().1, 6, None).unwrap();
         assert_eq!(s(ol, &od), "0101010100");
         assert_eq!(bit_count(l, &d), 5);
+    }
+
+    #[test]
+    fn overlay_overflow_and_bad_start() {
+        let (l, d) = from_binary("10101").unwrap();
+        let (rl, rd) = from_binary("1").unwrap();
+        // `sp + sl` must not overflow i32 (would panic in debug); PG raises 22003.
+        let e = overlay(l, &d, rl, &rd, 2, Some(i32::MAX)).unwrap_err();
+        assert_eq!(e.sqlstate, "22003");
+        assert_eq!(e.message, "integer out of range");
+        // A non-positive start is a substring error, not an i32 underflow panic.
+        assert_eq!(
+            overlay(l, &d, rl, &rd, 0, None).unwrap_err().message,
+            "negative substring length not allowed"
+        );
+        overlay(l, &d, rl, &rd, i32::MIN, None).unwrap_err();
     }
 }

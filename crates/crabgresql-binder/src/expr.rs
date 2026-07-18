@@ -1262,10 +1262,11 @@ fn bind_unary(
                 }))
             }
             Binding::Typed(e) if matches!(e.ty(), PgType::Bit | PgType::Varbit) => {
-                let ret = e.ty();
+                // PG's `~` is defined only on `bit` (a varbit operand is cast in),
+                // so the result type is `bit`.
                 Ok(Binding::Typed(BoundExpr::FuncCall {
                     func: ScalarFn::BitNot,
-                    ret,
+                    ret: PgType::Bit,
                     args: vec![e],
                 }))
             }
@@ -1430,7 +1431,17 @@ fn bind_binary(
     if matches!(op, ast::BinaryOperator::StringConcat) {
         let lb = bind_expr(left, scope)?;
         let rb = bind_expr(right, scope)?;
-        if is_bit_family(binding_typed_ty(&lb)) || is_bit_family(binding_typed_ty(&rb)) {
+        // Route to bit concatenation only when neither side is a concrete
+        // non-bit type — i.e. both operands are bit strings or untyped literals,
+        // and at least one is a bit string. `bit || text` instead falls to the
+        // text concat (PG's `anytextcat`), rendering the bit as its 0/1 string.
+        let bit_or_unknown = |b: &Binding| {
+            is_bit_family(binding_typed_ty(b)) || matches!(b, Binding::Unknown { .. })
+        };
+        if (is_bit_family(binding_typed_ty(&lb)) || is_bit_family(binding_typed_ty(&rb)))
+            && bit_or_unknown(&lb)
+            && bit_or_unknown(&rb)
+        {
             return bind_bit_concat(lb, rb);
         }
         return bind_string_concat(lb, rb);
@@ -1989,8 +2000,8 @@ fn resolve_bit_op(
             ),
         )
     };
-    // Bitwise `& | #`: both operands are bit strings; the result keeps the left
-    // operand's type.
+    // Bitwise `& | #` and the shifts below are defined only on `bit` in PG (a
+    // varbit operand is cast in), so the result type is always `bit`.
     let bitwise = match op {
         B::BitwiseAnd => Some(ScalarFn::BitAnd),
         B::BitwiseOr => Some(ScalarFn::BitOr),
@@ -2001,14 +2012,13 @@ fn resolve_bit_op(
         let (Some(a), Some(b)) = (bit_operand(lb), bit_operand(rb)) else {
             return Err(no_op());
         };
-        let ret = if is_bit_family(lt) { lt.unwrap() } else { PgType::Bit };
         return Ok(Some(Binding::Typed(BoundExpr::FuncCall {
             func,
-            ret,
+            ret: PgType::Bit,
             args: vec![a?, b?],
         })));
     }
-    // Shifts `<< >>`: `bit << int4`, keeping the bit length/type.
+    // Shifts `<< >>`: `bit << int4`, keeping the bit length; result type `bit`.
     let shift = match op {
         B::PGBitwiseShiftLeft => Some(ScalarFn::BitShl),
         B::PGBitwiseShiftRight => Some(ScalarFn::BitShr),
@@ -2024,7 +2034,7 @@ fn resolve_bit_op(
         let amount = resolve_operand(rb, PgType::Int4)?;
         return Ok(Some(Binding::Typed(BoundExpr::FuncCall {
             func,
-            ret: lt.unwrap(),
+            ret: PgType::Bit,
             args: vec![a?, amount],
         })));
     }
@@ -2301,7 +2311,11 @@ fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
     match (implicit_castable(a, b), implicit_castable(b, a)) {
         (true, false) => Some(b),
         (false, true) => Some(a),
-        _ => common_numeric(a, b),
+        // Mutually castable: today only `bit` <-> `bit varying`, whose common
+        // type is `bit varying` (the preferred type of the bit-string category),
+        // as PG's `select_common_type` resolves it.
+        (true, true) => Some(PgType::Varbit),
+        (false, false) => common_numeric(a, b),
     }
 }
 

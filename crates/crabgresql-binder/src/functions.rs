@@ -712,12 +712,17 @@ fn lookup(name: &str) -> &'static [Signature] {
             },
         ],
         // --- string functions ---
-        "length" | "char_length" | "character_length" => &[
+        // `length(bit)`/`length(varbit)` count bits, not characters. PG has only
+        // `length(bit)` in the bit-string family; `char_length`/`character_length`
+        // stay text-only (a bit argument there is `function does not exist`).
+        "length" => &[
             Signature { func: ScalarFn::Length, args: &[TEXT], ret: I4 },
-            // `length(bit)`/`length(varbit)` count bits, not characters.
             Signature { func: ScalarFn::BitLen, args: &[BIT], ret: I4 },
             Signature { func: ScalarFn::BitLen, args: &[VARBIT], ret: I4 },
         ],
+        "char_length" | "character_length" => {
+            &[Signature { func: ScalarFn::Length, args: &[TEXT], ret: I4 }]
+        }
         // `octet_length` counts the padded bytes of a `bpchar` (via a dedicated
         // overload), while `length`/`bit_length` see the trailing-blank-trimmed
         // text value, matching PG's `bpcharoctetlen` vs `bpcharlen`/text paths.
@@ -725,7 +730,12 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature { func: ScalarFn::OctetLength, args: &[TEXT], ret: I4 },
             Signature { func: ScalarFn::OctetLength, args: &[PgType::Bpchar], ret: I4 },
         ],
-        "bit_length" => &[Signature { func: ScalarFn::BitLength, args: &[TEXT], ret: I4 }],
+        // `bit_length(bit)` is the number of bits, like `length(bit)`.
+        "bit_length" => &[
+            Signature { func: ScalarFn::BitLength, args: &[TEXT], ret: I4 },
+            Signature { func: ScalarFn::BitLen, args: &[BIT], ret: I4 },
+            Signature { func: ScalarFn::BitLen, args: &[VARBIT], ret: I4 },
+        ],
         "upper" => &[Signature { func: ScalarFn::Upper, args: &[TEXT], ret: TEXT }],
         "lower" => &[Signature { func: ScalarFn::Lower, args: &[TEXT], ret: TEXT }],
         "initcap" => &[Signature { func: ScalarFn::Initcap, args: &[TEXT], ret: TEXT }],
