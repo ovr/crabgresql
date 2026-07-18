@@ -115,6 +115,41 @@ pub enum ScalarFn {
     TimezoneToTz,
     /// `timezone(text, timestamptz) -> timestamp` (`tstz AT TIME ZONE zone`).
     TimezoneToTs,
+    // ---- numeric-typed math (arg and result are `numeric`) ----
+    /// `round(numeric [, int4]) -> numeric` (round half away from zero).
+    NumRound,
+    /// `trunc(numeric [, int4]) -> numeric` (toward zero).
+    NumTrunc,
+    /// `ceil(numeric) -> numeric`.
+    NumCeil,
+    /// `floor(numeric) -> numeric`.
+    NumFloor,
+    /// `abs(numeric) -> numeric`.
+    NumAbs,
+    /// `sign(numeric) -> numeric`.
+    NumSign,
+    /// `mod(numeric, numeric) -> numeric`.
+    NumMod,
+    /// `sqrt(numeric) -> numeric`.
+    NumSqrt,
+    /// `ln(numeric) -> numeric`.
+    NumLn,
+    /// `log(numeric) -> numeric` (base 10).
+    NumLog10,
+    /// `log(numeric, numeric) -> numeric` (base, value).
+    NumLog,
+    /// `exp(numeric) -> numeric`.
+    NumExp,
+    /// `power(numeric, numeric) -> numeric`, also the `^` operator.
+    NumPower,
+    /// Apply a `numeric(precision, scale)` type modifier at run time. Args are
+    /// `(numeric, int4 precision, int4 scale)`; the length coercion PG inserts
+    /// for `x::numeric(p,s)`.
+    NumApplyTypmod,
+    /// `abs(float8) -> float8`.
+    AbsF8,
+    /// `log(float8) -> float8` (base 10).
+    Log10F8,
 }
 
 struct Signature {
@@ -200,6 +235,7 @@ const TSTZ: PgType = PgType::TimestampTz;
 const TEXT: PgType = PgType::Text;
 const I4: PgType = PgType::Int4;
 const IV: PgType = PgType::Interval;
+const NUM: PgType = PgType::Numeric;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -213,16 +249,52 @@ fn lookup(name: &str) -> &'static [Signature] {
             }]
         };
     }
+    // A float8 overload and a `numeric`-returns-`numeric` one. The float8 entry
+    // is first so that an integer argument (which casts implicitly to either)
+    // resolves to float8, as PG's preferred-type rule does; a `numeric` argument
+    // still binds the numeric overload through the exact-type resolution pass.
+    macro_rules! num_and_f8 {
+        ($num:expr, $f8:expr) => {
+            &[
+                Signature { func: $f8, args: &[F8], ret: F8 },
+                Signature { func: $num, args: &[NUM], ret: NUM },
+            ]
+        };
+    }
     match name {
-        "trunc" => unary_f8!(ScalarFn::Trunc),
-        "round" => unary_f8!(ScalarFn::Round),
-        "ceil" | "ceiling" => unary_f8!(ScalarFn::Ceil),
-        "floor" => unary_f8!(ScalarFn::Floor),
-        "sign" => unary_f8!(ScalarFn::Sign),
-        "sqrt" => unary_f8!(ScalarFn::Sqrt),
+        "trunc" => &[
+            Signature { func: ScalarFn::Trunc, args: &[F8], ret: F8 },
+            Signature { func: ScalarFn::NumTrunc, args: &[NUM], ret: NUM },
+            Signature { func: ScalarFn::NumTrunc, args: &[NUM, I4], ret: NUM },
+        ],
+        "round" => &[
+            Signature { func: ScalarFn::Round, args: &[F8], ret: F8 },
+            Signature { func: ScalarFn::NumRound, args: &[NUM], ret: NUM },
+            Signature { func: ScalarFn::NumRound, args: &[NUM, I4], ret: NUM },
+        ],
+        "ceil" | "ceiling" => num_and_f8!(ScalarFn::NumCeil, ScalarFn::Ceil),
+        "floor" => num_and_f8!(ScalarFn::NumFloor, ScalarFn::Floor),
+        "sign" => num_and_f8!(ScalarFn::NumSign, ScalarFn::Sign),
+        "sqrt" => num_and_f8!(ScalarFn::NumSqrt, ScalarFn::Sqrt),
+        // numeric first: an integer argument keeps its exact value through
+        // int -> numeric (PG's abs(int) is exact too); a float argument binds
+        // the float8 overload.
+        "abs" => &[
+            Signature { func: ScalarFn::NumAbs, args: &[NUM], ret: NUM },
+            Signature { func: ScalarFn::AbsF8, args: &[F8], ret: F8 },
+        ],
+        "mod" => &[Signature { func: ScalarFn::NumMod, args: &[NUM, NUM], ret: NUM }],
         "cbrt" => unary_f8!(ScalarFn::Cbrt),
-        "exp" => unary_f8!(ScalarFn::Exp),
-        "ln" => unary_f8!(ScalarFn::Ln),
+        "exp" => num_and_f8!(ScalarFn::NumExp, ScalarFn::Exp),
+        "ln" => num_and_f8!(ScalarFn::NumLn, ScalarFn::Ln),
+        // float8 first (an integer/float argument resolves to float8, as in PG);
+        // a `numeric` argument still binds the numeric overload exactly. The
+        // two-arg `log(base, value)` is numeric-only.
+        "log" | "log10" => &[
+            Signature { func: ScalarFn::Log10F8, args: &[F8], ret: F8 },
+            Signature { func: ScalarFn::NumLog10, args: &[NUM], ret: NUM },
+            Signature { func: ScalarFn::NumLog, args: &[NUM, NUM], ret: NUM },
+        ],
         "sinh" => unary_f8!(ScalarFn::Sinh),
         "cosh" => unary_f8!(ScalarFn::Cosh),
         "tanh" => unary_f8!(ScalarFn::Tanh),
@@ -240,11 +312,10 @@ fn lookup(name: &str) -> &'static [Signature] {
         "asind" => unary_f8!(ScalarFn::Asind),
         "acosd" => unary_f8!(ScalarFn::Acosd),
         "atand" => unary_f8!(ScalarFn::Atand),
-        "power" | "pow" => &[Signature {
-            func: ScalarFn::Power,
-            args: &[F8, F8],
-            ret: F8,
-        }],
+        "power" | "pow" => &[
+            Signature { func: ScalarFn::Power, args: &[F8, F8], ret: F8 },
+            Signature { func: ScalarFn::NumPower, args: &[NUM, NUM], ret: NUM },
+        ],
         "atan2d" => &[Signature {
             func: ScalarFn::Atan2d,
             args: &[F8, F8],
@@ -356,27 +427,72 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let sigs = lookup(&name);
+    resolve_call(&name, bindings)
+}
+
+/// Resolve an overload for `name` given already-bound arguments, then build the
+/// `FuncCall` node. Shared by ordinary function calls and the `CEIL`/`FLOOR`
+/// special-syntax expressions.
+pub(crate) fn resolve_call(name: &str, bindings: Vec<Binding>) -> Result<Binding, BindError> {
+    let sigs = lookup(name);
     if sigs.is_empty() {
-        return Err(undefined_function(&name, &bindings));
+        return Err(undefined_function(name, &bindings));
     }
-    // Prefer an exact-arity signature whose args all coerce; try exact-type
-    // matches before ones needing a coercion.
-    for pass in [true, false] {
-        for sig in sigs {
-            if sig.args.len() != bindings.len() {
-                continue;
-            }
-            if let Some(args) = try_coerce_args(&bindings, sig.args, pass) {
-                return Ok(Binding::Typed(BoundExpr::FuncCall {
-                    func: sig.func,
-                    ret: sig.ret,
-                    args,
-                }));
+    // First try an all-exact-type match. Then, among the signatures whose args
+    // all coerce, pick the one keeping the most arguments at their exact type —
+    // so `power(numeric, int)` prefers `power(numeric, numeric)` over the float8
+    // overload, as PG's preferred-type resolution does. Ties keep list order
+    // (float8 listed first, the preferred numeric-category type).
+    for sig in sigs {
+        if sig.args.len() == bindings.len()
+            && let Some(args) = try_coerce_args(&bindings, sig.args, true)
+        {
+            return Ok(Binding::Typed(BoundExpr::FuncCall { func: sig.func, ret: sig.ret, args }));
+        }
+    }
+    let mut best: Option<(usize, &Signature, Vec<BoundExpr>)> = None;
+    for sig in sigs {
+        if sig.args.len() != bindings.len() {
+            continue;
+        }
+        if let Some(args) = try_coerce_args(&bindings, sig.args, false) {
+            let exact = bindings
+                .iter()
+                .zip(sig.args)
+                .filter(|(b, target)| matches!(b, Binding::Typed(e) if e.ty() == **target))
+                .count();
+            if best.as_ref().is_none_or(|(b, _, _)| exact > *b) {
+                best = Some((exact, sig, args));
             }
         }
     }
-    Err(undefined_function(&name, &bindings))
+    match best {
+        Some((_, sig, args)) => {
+            Ok(Binding::Typed(BoundExpr::FuncCall { func: sig.func, ret: sig.ret, args }))
+        }
+        None => Err(undefined_function(name, &bindings)),
+    }
+}
+
+/// Bind a `CEIL(x)` / `FLOOR(x)` expression (sqlparser parses these as dedicated
+/// AST nodes rather than function calls). The `TO`/scale forms are not
+/// supported; the plain form resolves the same overloads as `ceil(...)`.
+pub(crate) fn bind_ceil_floor(
+    name: &str,
+    expr: &ast::Expr,
+    field: &ast::CeilFloorKind,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    if !matches!(
+        field,
+        ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)
+    ) {
+        return Err(BindError::feature_not_supported(format!(
+            "{name}(... TO ...) is not supported yet"
+        )));
+    }
+    let arg = bind_expr(expr, scope)?;
+    resolve_call(name, vec![arg])
 }
 
 /// Try to coerce every binding to the signature's parameter types. When

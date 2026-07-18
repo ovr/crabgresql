@@ -12,8 +12,9 @@
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema};
+use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
-    NumericVal, PgType, Value, cast, float, interval, parse_bool, timestamp, timestamptz,
+    Numeric, PgType, Value, cast, float, interval, parse_bool, timestamp, timestamptz,
 };
 
 use crate::BindError;
@@ -244,6 +245,12 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         } => bind_cast(expr, data_type, scope),
         ast::Expr::TypedString(ts) => bind_typed_string(ts),
         ast::Expr::Function(func) => bind_function(func, scope),
+        ast::Expr::Ceil { expr, field } => {
+            crate::functions::bind_ceil_floor("ceil", expr, field, scope)
+        }
+        ast::Expr::Floor { expr, field } => {
+            crate::functions::bind_ceil_floor("floor", expr, field, scope)
+        }
         ast::Expr::Extract { field, expr, .. } => bind_extract(field, expr, scope),
         ast::Expr::Interval(iv) => bind_interval(iv),
         ast::Expr::AtTimeZone { timestamp, time_zone } => {
@@ -302,8 +309,8 @@ fn bind_value(value: &ast::ValueWithSpan) -> Result<Binding, BindError> {
 }
 
 /// Integer literals become int4 when they fit, int8 otherwise. Literals with a
-/// decimal point or exponent bind as float8 (PG uses `numeric`, but float8 is
-/// byte-exact for the values these tests use; see the plan's deviations).
+/// decimal point or exponent bind as `numeric`, as PG does — a numeric constant
+/// keeps its exact value and display scale.
 fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
     if let Ok(v) = n.parse::<i32>() {
         return Ok(BoundExpr::Const {
@@ -317,17 +324,21 @@ fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
             ty: PgType::Int8,
         });
     }
-    if n.contains(['.', 'e', 'E'])
-        && let Ok(v) = n.parse::<f64>()
-    {
-        return Ok(BoundExpr::Const {
-            value: Value::Float8(v),
-            ty: PgType::Float8,
-        });
+    // A whole-number literal too large for int8, or one with a decimal point or
+    // exponent, is `numeric` (PG's `numeric` type for any unsuffixed decimal).
+    match Numeric::parse(n) {
+        Ok(value) => Ok(BoundExpr::Const {
+            value: Value::Numeric(value),
+            ty: PgType::Numeric,
+        }),
+        Err(ParseError::Overflow) => Err(BindError::new(
+            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+            "value overflows numeric format",
+        )),
+        Err(ParseError::Syntax) => Err(BindError::feature_not_supported(format!(
+            "numeric literal \"{n}\" is not supported yet"
+        ))),
     }
-    Err(BindError::feature_not_supported(format!(
-        "numeric literal \"{n}\" is not supported yet"
-    )))
 }
 
 /// Map a SQL type name to a `PgType`. Shared by cast/typed-string binding and
@@ -386,10 +397,11 @@ fn bind_cast(
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     let target = map_data_type(data_type)?;
-    match bind_expr(inner, scope)? {
-        Binding::Unknown { lit, span } => Ok(Binding::Typed(resolve_unknown(lit, span, target)?)),
-        Binding::Typed(e) => Ok(Binding::Typed(coerce_expr(e, target)?)),
-    }
+    let expr = match bind_expr(inner, scope)? {
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, target)?,
+        Binding::Typed(e) => coerce_expr(e, target)?,
+    };
+    Ok(Binding::Typed(apply_numeric_typmod_if_any(expr, target, data_type)?))
 }
 
 fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
@@ -402,7 +414,54 @@ fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
             )));
         }
     };
-    Ok(Binding::Typed(resolve_unknown(lit, span, target)?))
+    let expr = resolve_unknown(lit, span, target)?;
+    Ok(Binding::Typed(apply_numeric_typmod_if_any(expr, target, &ts.data_type)?))
+}
+
+/// The `(precision, scale)` of a `numeric(p[,s])` / `decimal(...)` type name,
+/// or `None` for an unconstrained `numeric`. A bare `numeric(p)` has scale 0.
+fn numeric_typmod(dt: &ast::DataType) -> Option<(i32, i32)> {
+    use ast::{DataType, ExactNumberInfo};
+    let info = match dt {
+        DataType::Numeric(i) | DataType::Decimal(i) => i,
+        _ => return None,
+    };
+    match info {
+        ExactNumberInfo::None => None,
+        ExactNumberInfo::Precision(p) => Some((*p as i32, 0)),
+        ExactNumberInfo::PrecisionAndScale(p, s) => Some((*p as i32, *s as i32)),
+    }
+}
+
+/// When `target` is `numeric` and `data_type` carries a `(p,s)` modifier, apply
+/// it — folding constants at bind time (so overflow errors here, with PG's
+/// DETAIL) and inserting a runtime length-coercion for non-constants.
+fn apply_numeric_typmod_if_any(
+    expr: BoundExpr,
+    target: PgType,
+    data_type: &ast::DataType,
+) -> Result<BoundExpr, BindError> {
+    if target != PgType::Numeric {
+        return Ok(expr);
+    }
+    let Some((precision, scale)) = numeric_typmod(data_type) else {
+        return Ok(expr);
+    };
+    if let BoundExpr::Const { value: Value::Numeric(n), .. } = &expr {
+        let applied = n
+            .apply_typmod(precision, scale)
+            .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail))?;
+        return Ok(BoundExpr::Const { value: Value::Numeric(applied), ty: PgType::Numeric });
+    }
+    Ok(BoundExpr::FuncCall {
+        func: ScalarFn::NumApplyTypmod,
+        ret: PgType::Numeric,
+        args: vec![
+            expr,
+            BoundExpr::Const { value: Value::Int4(precision), ty: PgType::Int4 },
+            BoundExpr::Const { value: Value::Int4(scale), ty: PgType::Int4 },
+        ],
+    })
 }
 
 /// `interval '...'` (with an optional SQL-standard field qualifier). The
@@ -890,16 +949,20 @@ fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindEr
 
     // Admit only operators the executor actually implements for `arg_ty`, so a
     // bind never produces a node the evaluator can't handle. PG resolves against
-    // a concrete operator catalog; this whitelist is our stand-in. Notably `%`
-    // is integer-only (no float/`numeric` modulo here) and `numeric` has no
-    // operators yet.
+    // a concrete operator catalog; this whitelist is our stand-in. `%` exists
+    // for the integer types and `numeric` (PG has `numeric_mod`), but not float.
     let supported = if op.is_arithmetic() {
         let numeric_arith = matches!(
             arg_ty,
-            PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Float4 | PgType::Float8
+            PgType::Int2
+                | PgType::Int4
+                | PgType::Int8
+                | PgType::Float4
+                | PgType::Float8
+                | PgType::Numeric
         );
         let mod_ok = op != BinOp::Mod
-            || matches!(arg_ty, PgType::Int2 | PgType::Int4 | PgType::Int8);
+            || matches!(arg_ty, PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Numeric);
         numeric_arith && mod_ok
     } else {
         matches!(
@@ -910,6 +973,7 @@ fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindEr
                 | PgType::Int8
                 | PgType::Float4
                 | PgType::Float8
+                | PgType::Numeric
                 | PgType::Text
                 | PgType::Bytea
                 | PgType::Timestamp
@@ -1029,8 +1093,25 @@ fn bind_pow(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
     if !numeric(&lb) || !numeric(&rb) {
         return Err(no_operator(&binding_type_label(&lb), BinOp::Pow, &binding_type_label(&rb)));
     }
-    let left = pow_operand(lb)?;
-    let right = pow_operand(rb)?;
+    // PG's `^` exists for `float8` and `numeric`. A float operand selects the
+    // float8 operator; otherwise a numeric operand selects numeric (returning
+    // numeric); with only ints/unknowns it falls back to float8 (as PG does).
+    let is_float = |b: &Binding| {
+        matches!(b, Binding::Typed(e) if matches!(e.ty(), PgType::Float4 | PgType::Float8))
+    };
+    let is_num = |b: &Binding| matches!(b, Binding::Typed(e) if e.ty() == PgType::Numeric);
+    if !is_float(&lb) && !is_float(&rb) && (is_num(&lb) || is_num(&rb)) {
+        // numeric ^ numeric -> numeric, via the power() function.
+        let left = pow_operand(lb, PgType::Numeric)?;
+        let right = pow_operand(rb, PgType::Numeric)?;
+        return Ok(Binding::Typed(BoundExpr::FuncCall {
+            func: ScalarFn::NumPower,
+            ret: PgType::Numeric,
+            args: vec![left, right],
+        }));
+    }
+    let left = pow_operand(lb, PgType::Float8)?;
+    let right = pow_operand(rb, PgType::Float8)?;
     Ok(Binding::Typed(BoundExpr::Binary {
         op: BinOp::Pow,
         arg_ty: PgType::Float8,
@@ -1039,10 +1120,10 @@ fn bind_pow(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
     }))
 }
 
-fn pow_operand(b: Binding) -> Result<BoundExpr, BindError> {
+fn pow_operand(b: Binding, target: PgType) -> Result<BoundExpr, BindError> {
     match b {
-        Binding::Typed(e) => coerce_expr(e, PgType::Float8),
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Float8),
+        Binding::Typed(e) => coerce_expr(e, target),
+        Binding::Unknown { lit, span } => resolve_unknown(lit, span, target),
     }
 }
 
@@ -1097,6 +1178,9 @@ fn implicit_castable(from: PgType, to: PgType) -> bool {
                 | (Int4, Float8)
                 | (Int8, Float8)
                 | (Float4, Float8)
+                | (Int2, Numeric)
+                | (Int4, Numeric)
+                | (Int8, Numeric)
                 | (Numeric, Float4)
                 | (Numeric, Float8)
                 // `timestamp -> timestamptz` is an implicit cast in PG; the
@@ -1211,10 +1295,11 @@ fn common_numeric(a: PgType, b: PgType) -> Option<PgType> {
         if a == PgType::Float8 || b == PgType::Float8 {
             PgType::Float8
         } else if a == PgType::Float4 || b == PgType::Float4 {
-            // A float4 mixed with a different numeric type resolves to float8.
+            // A float mixed with any other numeric type resolves to float8.
             PgType::Float8
         } else if a == PgType::Numeric || b == PgType::Numeric {
-            PgType::Float8
+            // `numeric` dominates the integer types (int → numeric is exact).
+            PgType::Numeric
         } else if a == PgType::Int8 || b == PgType::Int8 {
             PgType::Int8
         } else if a == PgType::Int4 || b == PgType::Int4 {
@@ -1294,9 +1379,13 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         }
         PgType::Float4 => float::float4in(s).map(Value::Float4).map_err(float_error),
         PgType::Float8 => float::float8in(s).map(Value::Float8).map_err(float_error),
-        PgType::Numeric => NumericVal::parse(s)
-            .map(Value::Numeric)
-            .ok_or_else(invalid),
+        PgType::Numeric => Numeric::parse(s).map(Value::Numeric).map_err(|e| match e {
+            ParseError::Syntax => invalid(),
+            ParseError::Overflow => BindError::new(
+                sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+                "value overflows numeric format",
+            ),
+        }),
         PgType::Bool => parse_bool(s).map(Value::Bool).ok_or_else(invalid),
         PgType::Timestamp => timestamp::parse(s)
             .map(Value::Timestamp)
@@ -1379,6 +1468,9 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         ast::Expr::AtTimeZone { .. } => "timezone".into(),
         // A bare CASE expression is named "case" in PG.
         ast::Expr::Case { .. } => "case".into(),
+        // CEIL/FLOOR special syntax is named after the function.
+        ast::Expr::Ceil { .. } => "ceil".into(),
+        ast::Expr::Floor { .. } => "floor".into(),
         // A function's output column is named after the function.
         ast::Expr::Function(func) => func
             .name

@@ -10,7 +10,7 @@
 //! `TimeZone` yet), so the offset is always `+00`. Zone resolution and DST live
 //! in [`crate::tz`]; the calendar core is shared with [`crate::timestamp`].
 
-use crate::NumericVal;
+use crate::Numeric;
 use crate::timestamp::{
     self, DATETIME_FIELD_OVERFLOW, INVALID_DATETIME_FORMAT, INVALID_PARAMETER_VALUE,
     INVALID_TIME_ZONE_DISPLACEMENT, NEG_INFINITY, POS_INFINITY, Parsed, TimestampError, decode,
@@ -204,10 +204,10 @@ pub fn date_part(unit: &str, micros: i64) -> Result<Option<f64>, TimestampError>
 }
 
 /// `EXTRACT(field FROM timestamptz) -> numeric`. `Ok(None)` is SQL NULL.
-pub fn extract(unit: &str, micros: i64) -> Result<Option<NumericVal>, TimestampError> {
+pub fn extract(unit: &str, micros: i64) -> Result<Option<Numeric>, TimestampError> {
     if is_tz_field(unit) {
         return Ok(if is_finite(micros) {
-            Some(NumericVal::Finite("0".to_string()))
+            Some(Numeric::from_i128(0))
         } else {
             None
         });

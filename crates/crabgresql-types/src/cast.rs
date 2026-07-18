@@ -3,7 +3,8 @@
 //! reproduces PG's *observable* cast results — including the SQLSTATE/message on
 //! range errors — as pinned by the regression corpus, implemented independently.
 
-use crate::{NumericVal, PgType, Value, float, interval, parse_bool, timestamp, timestamptz};
+use crate::numeric::ParseError;
+use crate::{Numeric, PgType, Value, float, interval, parse_bool, timestamp, timestamptz};
 
 /// SQLSTATE + message for a failed cast.
 #[derive(Clone, Debug, PartialEq)]
@@ -164,15 +165,12 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             .map(Value::Float8)
             .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
         (Value::Text(s), PgType::Numeric) => {
-            NumericVal::parse(s).map(Value::Numeric).ok_or_else(|| CastError {
-                sqlstate: "22P02",
-                message: format!("invalid input syntax for type numeric: \"{s}\""),
-            })
+            Numeric::parse(s).map(Value::Numeric).map_err(|e| numeric_parse_error(e, s))
         }
 
         // ---- numeric → float ----
-        (Value::Numeric(n), PgType::Float4) => Ok(Value::Float4(numeric_to_f64(n) as f32)),
-        (Value::Numeric(n), PgType::Float8) => Ok(Value::Float8(numeric_to_f64(n))),
+        (Value::Numeric(n), PgType::Float4) => Ok(Value::Float4(n.to_f64() as f32)),
+        (Value::Numeric(n), PgType::Float8) => Ok(Value::Float8(n.to_f64())),
 
         // ---- text → integer (int input functions) ----
         (Value::Text(s), PgType::Int2 | PgType::Int4 | PgType::Int8) => text_to_int(s, to),
@@ -209,15 +207,15 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
 
 
         // ---- integer → numeric (exact) ----
-        (Value::Int2(n), PgType::Numeric) => Ok(Value::Numeric(NumericVal::Finite(n.to_string()))),
-        (Value::Int4(n), PgType::Numeric) => Ok(Value::Numeric(NumericVal::Finite(n.to_string()))),
-        (Value::Int8(n), PgType::Numeric) => Ok(Value::Numeric(NumericVal::Finite(n.to_string()))),
+        (Value::Int2(n), PgType::Numeric) => Ok(Value::Numeric(Numeric::from_i128(*n as i128))),
+        (Value::Int4(n), PgType::Numeric) => Ok(Value::Numeric(Numeric::from_i128(*n as i128))),
+        (Value::Int8(n), PgType::Numeric) => Ok(Value::Numeric(Numeric::from_i128(*n as i128))),
 
         // ---- float → numeric ----
         // PG's float→numeric keeps DBL_DIG (15) / FLT_DIG (6) significant digits
         // and always prints numeric in plain decimal.
-        (Value::Float4(f), PgType::Numeric) => Ok(Value::Numeric(float_to_numeric(*f as f64, 6))),
-        (Value::Float8(f), PgType::Numeric) => Ok(Value::Numeric(float_to_numeric(*f, 15))),
+        (Value::Float4(f), PgType::Numeric) => Ok(Value::Numeric(Numeric::from_f64_sig(*f as f64, 6))),
+        (Value::Float8(f), PgType::Numeric) => Ok(Value::Numeric(Numeric::from_f64_sig(*f, 15))),
 
         // ---- numeric → integer (round half away from zero + range check) ----
         (Value::Numeric(n), PgType::Int2 | PgType::Int4 | PgType::Int8) => numeric_to_int(n, to),
@@ -312,10 +310,19 @@ fn octal_val(c: u8) -> Option<u8> {
     (b'0'..=b'7').contains(&c).then(|| c - b'0')
 }
 
-fn numeric_to_f64(n: &NumericVal) -> f64 {
-    match n {
-        NumericVal::NaN => f64::NAN,
-        NumericVal::Finite(s) => s.parse().unwrap_or(f64::NAN),
+/// Map a numeric input-parse failure to PG's error: malformed text is `22P02`
+/// (echoing the literal), an out-of-range magnitude is `22003 value overflows
+/// numeric format`.
+fn numeric_parse_error(e: ParseError, s: &str) -> CastError {
+    match e {
+        ParseError::Syntax => CastError {
+            sqlstate: INVALID_TEXT_REPRESENTATION,
+            message: format!("invalid input syntax for type numeric: \"{s}\""),
+        },
+        ParseError::Overflow => CastError {
+            sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
+            message: "value overflows numeric format".to_string(),
+        },
     }
 }
 
@@ -340,145 +347,23 @@ pub fn text_to_int(s: &str, ty: PgType) -> Result<Value, CastError> {
     }
 }
 
-/// `float8_numeric`/`float4_numeric`: render the float with `sig` significant
-/// digits and hand it to numeric, which always prints plain decimal (no
-/// exponent). NaN and ±infinity carry through as numeric's own spellings.
-fn float_to_numeric(v: f64, sig: usize) -> NumericVal {
-    if v.is_nan() {
-        return NumericVal::NaN;
-    }
-    if v.is_infinite() {
-        let s = if v < 0.0 { "-Infinity" } else { "Infinity" };
-        return NumericVal::Finite(s.to_string());
-    }
-    if v == 0.0 {
-        // Rust would render -0.0 as "-0"; numeric has no signed zero.
-        return NumericVal::Finite("0".to_string());
-    }
-    // `{:.*e}` gives exactly `sig` significant digits (1 before the point,
-    // `sig - 1` after); expanding that to plain decimal matches numeric_out,
-    // regardless of whether PG's %g would have chosen %e or %f form.
-    NumericVal::Finite(sci_to_plain(&format!("{:.*e}", sig - 1, v)))
-}
-
-/// Expand Rust scientific notation (`-6.66e-1`) into a plain decimal string,
-/// stripping insignificant trailing zeros.
-fn sci_to_plain(sci: &str) -> String {
-    let (mantissa, exp) = sci.split_once('e').expect("scientific notation");
-    let exp: i32 = exp.parse().expect("exponent");
-    let neg = mantissa.starts_with('-');
-    let mantissa = mantissa.trim_start_matches('-');
-    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-
-    let mut digits: String = int_part.chars().chain(frac_part.chars()).collect();
-    // The decimal point sits after `int_part` digits, then shifts by `exp`.
-    let point = int_part.len() as i32 + exp;
-    // Trailing zeros past the point are insignificant; keep at least one digit.
-    let keep = digits.trim_end_matches('0').len().max(1);
-    digits.truncate(keep);
-
-    let out = if point <= 0 {
-        format!("0.{}{}", "0".repeat((-point) as usize), digits)
-    } else if point as usize >= digits.len() {
-        format!("{}{}", digits, "0".repeat(point as usize - digits.len()))
-    } else {
-        let p = point as usize;
-        format!("{}.{}", &digits[..p], &digits[p..])
-    };
-    if neg { format!("-{out}") } else { out }
-}
-
 /// `numeric_int2`/`_int4`/`_int8`: round half away from zero, then range-check.
-/// NaN/infinity have no integer image (`0A000`); overflow is the bare
-/// `<typename> out of range` (`22003`), matching PG's numeric→int messages.
-fn numeric_to_int(n: &NumericVal, ty: PgType) -> Result<Value, CastError> {
-    let s = match n {
-        NumericVal::NaN => return Err(cannot_convert("NaN", ty)),
-        NumericVal::Finite(s) => s.as_str(),
-    };
-    let core = s.trim().strip_prefix(['+', '-']).unwrap_or(s.trim());
-    if core.eq_ignore_ascii_case("inf") || core.eq_ignore_ascii_case("infinity") {
+/// NaN/infinity have no integer image (`0A000`); an out-of-range magnitude is
+/// the bare `<typename> out of range` (`22003`), matching PG's numeric→int.
+fn numeric_to_int(n: &Numeric, ty: PgType) -> Result<Value, CastError> {
+    if n.is_nan() {
+        return Err(cannot_convert("NaN", ty));
+    }
+    if n.is_infinite() {
         return Err(cannot_convert("infinity", ty));
     }
-    // `round_decimal` reports every out-of-i128-range magnitude as `Err(())`;
-    // `try_from` then range-checks against the target width. Both map to PG's
-    // bare `<typename> out of range`.
-    let v = round_decimal(s).map_err(|()| out_of_range(ty))?;
+    let v = n.to_i128().ok_or_else(|| out_of_range(ty))?;
     match ty {
         PgType::Int2 => i16::try_from(v).map(Value::Int2).map_err(|_| out_of_range(ty)),
         PgType::Int4 => i32::try_from(v).map(Value::Int4).map_err(|_| out_of_range(ty)),
         PgType::Int8 => i64::try_from(v).map(Value::Int8).map_err(|_| out_of_range(ty)),
         _ => unreachable!("numeric_to_int called with {ty:?}"),
     }
-}
-
-/// Parse a decimal string (`[±]digits[.digits][(e|E)[±]digits]`) and round to
-/// the nearest integer, ties away from zero, into an `i128`. Any magnitude that
-/// overflows the `i128` accumulator returns `Err(())` (the caller maps it to the
-/// target type's out-of-range error). The input is a `NumericVal::Finite` text
-/// that `NumericVal::parse` already validated as a finite decimal, but the
-/// exponent it kept verbatim can be arbitrarily large, so this must not panic
-/// or loop unboundedly on e.g. `1e2147483647`.
-fn round_decimal(s: &str) -> Result<i128, ()> {
-    let s = s.trim();
-    let (neg, s) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (mantissa, exp_str) = s.split_once(['e', 'E']).unwrap_or((s, ""));
-    // A too-long exponent cannot fit i64; clamp by sign so the `point`
-    // arithmetic below saturates instead of failing. A huge positive exponent
-    // overflows any finite value (unless it is zero); a huge negative one
-    // rounds every value to 0.
-    let exp: i64 = if exp_str.is_empty() {
-        0
-    } else {
-        exp_str
-            .parse::<i64>()
-            .unwrap_or(if exp_str.starts_with('-') { i64::MIN } else { i64::MAX })
-    };
-    let (int_str, frac_str) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let int_bytes = int_str.as_bytes();
-    let frac_bytes = frac_str.as_bytes();
-    let digit = |i: usize| -> i128 {
-        // Read the i-th significant digit (integer part then fraction) as 0..=9.
-        (if i < int_bytes.len() {
-            int_bytes[i] - b'0'
-        } else {
-            frac_bytes[i - int_bytes.len()] - b'0'
-        }) as i128
-    };
-    let total_digits = (int_bytes.len() + frac_bytes.len()) as i64;
-    // The decimal point sits after `int_str` digits, shifted by the exponent
-    // (i64, saturating — `int_str.len()` is tiny, `exp` is already clamped).
-    let point = (int_str.len() as i64).saturating_add(exp);
-
-    // Integer value = the significant digits that fall before `point`, times
-    // 10 for each trailing-zero place the exponent pushed the point past.
-    let significant = point.clamp(0, total_digits);
-    let mut acc: i128 = 0;
-    for i in 0..significant {
-        acc = acc.checked_mul(10).and_then(|a| a.checked_add(digit(i as usize))).ok_or(())?;
-    }
-    // Apply the padding factors only when the value is nonzero: a nonzero acc
-    // overflows the i128 within ~39 steps (bounded); a zero acc stays zero, so
-    // an astronomically large exponent (`0e2000000000`) can't spin the loop.
-    if acc != 0 {
-        for _ in 0..(point - total_digits).max(0) {
-            acc = acc.checked_mul(10).ok_or(())?;
-        }
-    }
-    // Round: the first dropped fractional digit decides (ties away from zero,
-    // so any first digit >= 5 rounds the magnitude up).
-    let first_frac = if (0..total_digits).contains(&point) {
-        digit(point as usize)
-    } else {
-        0
-    };
-    if first_frac >= 5 {
-        acc = acc.checked_add(1).ok_or(())?;
-    }
-    Ok(if neg { -acc } else { acc })
 }
 
 /// Reinterpret a right-aligned bit string as the target integer's two's
@@ -606,11 +491,11 @@ mod tests {
     fn int_to_numeric_is_exact() {
         assert_eq!(
             cast(Value::Int4(5), PgType::Numeric).unwrap(),
-            Value::Numeric(NumericVal::Finite("5".into()))
+            Value::Numeric(Numeric::from_i128(5))
         );
         assert_eq!(
             cast(Value::Int8(-9), PgType::Numeric).unwrap(),
-            Value::Numeric(NumericVal::Finite("-9".into()))
+            Value::Numeric(Numeric::from_i128(-9))
         );
     }
 
@@ -638,7 +523,7 @@ mod tests {
     }
 
     fn numeric(s: &str) -> Value {
-        Value::Numeric(NumericVal::parse(s).unwrap())
+        Value::Numeric(Numeric::parse(s).unwrap())
     }
 
     #[test]
@@ -663,7 +548,7 @@ mod tests {
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(e.message, "integer out of range");
         assert_eq!(cast(numeric("1e30"), PgType::Int8).unwrap_err().message, "bigint out of range");
-        let e = cast(Value::Numeric(NumericVal::NaN), PgType::Int4).unwrap_err();
+        let e = cast(Value::Numeric(Numeric::nan()), PgType::Int4).unwrap_err();
         assert_eq!(e.sqlstate, "0A000");
         assert_eq!(e.message, "cannot convert NaN to integer");
         let e = cast(numeric("infinity"), PgType::Int2).unwrap_err();
@@ -671,30 +556,23 @@ mod tests {
         assert_eq!(e.message, "cannot convert infinity to smallint");
     }
 
-    // A numeric whose verbatim exponent is astronomically large must not panic
-    // (i32 overflow) or hang (unbounded padding loop) — it either overflows the
-    // integer or, being effectively zero, rounds to 0. Regression for the
-    // '1e2147483647'::numeric::int4 crash.
+    // A numeric literal whose exponent puts it beyond numeric's storable range
+    // is rejected at the text→numeric cast with `22003 value overflows numeric
+    // format` (matching PG), rather than reaching the int conversion. The parse
+    // must not allocate the astronomically many digits the exponent implies.
     #[test]
-    fn numeric_to_int_huge_exponent_does_not_panic_or_hang() {
-        // Nonzero mantissa, huge positive exponent → out of range (bounded).
-        let e = cast(numeric("1e2147483647"), PgType::Int4).unwrap_err();
-        assert_eq!(e.sqlstate, "22003");
-        assert_eq!(e.message, "integer out of range");
-        // Exponent too large even for i64 → still bounded, still out of range.
-        assert_eq!(
-            cast(numeric("1e99999999999999999999"), PgType::Int8).unwrap_err().message,
-            "bigint out of range"
-        );
-        // Zero mantissa with a huge exponent is 0 — the padding loop must be
-        // skipped rather than spun ~2 billion times.
-        assert_eq!(cast(numeric("0e2000000000"), PgType::Int4).unwrap(), Value::Int4(0));
-        // Huge negative exponent rounds every value to 0.
-        assert_eq!(cast(numeric("1e-2000000000"), PgType::Int4).unwrap(), Value::Int4(0));
-        assert_eq!(
-            cast(numeric("1e-99999999999999999999"), PgType::Int4).unwrap(),
-            Value::Int4(0)
-        );
+    fn numeric_input_overflow_is_rejected_before_int_cast() {
+        for lit in [
+            "1e2147483647",
+            "1e99999999999999999999",
+            "0e2000000000",
+            "1e-2000000000",
+            "1e-99999999999999999999",
+        ] {
+            let e = cast(Value::Text(lit.into()), PgType::Numeric).unwrap_err();
+            assert_eq!(e.sqlstate, "22003", "{lit}");
+            assert_eq!(e.message, "value overflows numeric format", "{lit}");
+        }
     }
 
     #[test]

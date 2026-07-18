@@ -1421,17 +1421,14 @@ mod tests {
     }
 
     #[test]
-    fn decimal_literal_binds_as_float8() {
+    fn decimal_literal_binds_as_numeric() {
         let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5").unwrap() else {
             panic!("expected Values");
         };
-        assert_eq!(
-            rows[0][0],
-            BoundExpr::Const {
-                value: Value::Float8(1.5),
-                ty: PgType::Float8
-            }
-        );
+        let BoundExpr::Const { value: Value::Numeric(n), ty: PgType::Numeric } = &rows[0][0] else {
+            panic!("expected numeric const, got {:?}", rows[0][0]);
+        };
+        assert_eq!(n.to_display(), "1.5");
     }
 
     #[test]
@@ -1474,18 +1471,25 @@ mod tests {
     }
 
     #[test]
-    fn float_and_numeric_reject_unsupported_operators() {
-        // `%` is integer-only; float/numeric modulo does not exist in PG.
-        let e = bind_err("SELECT 1.5 % 2.0");
+    fn float_modulo_is_rejected() {
+        // `%` exists for the integer types and numeric, but not float.
+        let e = bind_err("SELECT '1.5'::float8 % '2.0'::float8");
         assert_eq!(e.code, "42883");
         assert_eq!(
             e.message,
             "operator does not exist: double precision % double precision"
         );
-        // numeric has no operators in this stub.
-        let e = bind_err("SELECT '1'::numeric < '2'::numeric");
-        assert_eq!(e.code, "42883");
-        assert_eq!(e.message, "operator does not exist: numeric < numeric");
+    }
+
+    #[test]
+    fn numeric_operators_bind() {
+        // Comparison, arithmetic, and modulo all resolve for numeric now.
+        assert!(bind_one("SELECT '1'::numeric < '2'::numeric").is_ok());
+        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5 + 2.25").unwrap() else {
+            panic!("expected Values");
+        };
+        assert_eq!(rows[0][0].ty(), PgType::Numeric);
+        assert!(bind_one("SELECT 5.5 % 2.0").is_ok());
     }
 
     #[test]

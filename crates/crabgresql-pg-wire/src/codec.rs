@@ -208,7 +208,21 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
     /// ErrorResponse carrying a cursor position (`P` field, 1-based character
     /// offset) — rendered by clients as `LINE n: ... ^`.
     pub fn error_response_at(&mut self, code: &str, message: &str, position: Option<usize>) {
+        self.error_response_full(code, message, None, position);
+    }
+
+    /// ErrorResponse with an optional DETAIL line and cursor position.
+    pub fn error_response_full(
+        &mut self,
+        code: &str,
+        message: &str,
+        detail: Option<&str>,
+        position: Option<usize>,
+    ) {
         let mut fields = ErrorFields::error(code, message);
+        if let Some(detail) = detail {
+            fields = fields.with_detail(detail);
+        }
         if let Some(position) = position {
             fields = fields.with_position(position);
         }

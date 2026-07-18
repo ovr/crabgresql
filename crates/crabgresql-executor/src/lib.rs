@@ -46,6 +46,8 @@ pub struct ExecError {
     /// 5-character SQLSTATE code.
     pub code: &'static str,
     pub message: String,
+    /// Optional DETAIL line (e.g. numeric field overflow explains the p/s).
+    pub detail: Option<String>,
 }
 
 impl ExecError {
@@ -53,7 +55,14 @@ impl ExecError {
         Self {
             code,
             message: message.into(),
+            detail: None,
         }
+    }
+
+    /// Attach a DETAIL line.
+    pub fn with_detail(mut self, detail: Option<String>) -> Self {
+        self.detail = detail;
+        self
     }
 }
 

@@ -8,6 +8,7 @@
 pub mod cast;
 pub mod float;
 pub mod interval;
+pub mod numeric;
 pub mod timestamp;
 pub mod timestamptz;
 pub mod to_char;
@@ -147,36 +148,7 @@ impl PgType {
     }
 }
 
-/// Minimal `numeric`: only the cases these tests reach (`NaN`, decimal text).
-#[derive(Clone, Debug, PartialEq)]
-pub enum NumericVal {
-    NaN,
-    Finite(String),
-}
-
-impl NumericVal {
-    /// Parse `numeric` input text, returning `None` on malformed input (which
-    /// the caller reports as SQLSTATE 22P02). Accepts `NaN`, `±Infinity`, and
-    /// any decimal number; the finite text is kept verbatim (this stub does not
-    /// canonicalize scale).
-    pub fn parse(s: &str) -> Option<NumericVal> {
-        let t = s.trim();
-        if t.eq_ignore_ascii_case("nan") {
-            return Some(NumericVal::NaN);
-        }
-        let core = t.strip_prefix(['+', '-']).unwrap_or(t);
-        if core.eq_ignore_ascii_case("inf") || core.eq_ignore_ascii_case("infinity") {
-            return Some(NumericVal::Finite(t.to_string()));
-        }
-        // Use f64 as the syntactic acceptor: it rejects garbage ("abc") while
-        // accepting the decimal/exponent forms numeric allows.
-        if !t.is_empty() && t.parse::<f64>().is_ok() {
-            Some(NumericVal::Finite(t.to_string()))
-        } else {
-            None
-        }
-    }
-}
+pub use numeric::Numeric;
 
 /// `boolin`: the spellings PG's boolean input accepts — any unambiguous
 /// case-insensitive prefix of true/false/yes/no/off, exact "on", and "1"/"0"
@@ -204,7 +176,7 @@ pub enum Value {
     Int8(i64),
     Float4(f32),
     Float8(f64),
-    Numeric(NumericVal),
+    Numeric(Numeric),
     Text(String),
     Bytea(Vec<u8>),
     /// A bit-string literal (`x'...'`): `len` bits packed right-aligned in
@@ -257,8 +229,7 @@ impl Value {
             Value::Int8(v) => Some(v.to_string()),
             Value::Float4(v) => Some(float::fmt_f32(*v, efd)),
             Value::Float8(v) => Some(float::fmt_f64(*v, efd)),
-            Value::Numeric(NumericVal::NaN) => Some("NaN".to_string()),
-            Value::Numeric(NumericVal::Finite(s)) => Some(s.clone()),
+            Value::Numeric(n) => Some(n.to_display()),
             Value::Text(s) => Some(s.clone()),
             Value::Bytea(bytes) => {
                 let mut out = String::with_capacity(2 + bytes.len() * 2);

@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_types::{Interval, PgType, Value, cast, float, interval};
+use crabgresql_types::{Interval, Numeric, PgType, Value, cast, float, interval};
 
 use crate::{ExecContext, ExecError};
 
@@ -79,6 +79,7 @@ fn eval_unary(op: UnaryOp, operand: Value) -> Result<Value, ExecError> {
             .ok_or_else(|| out_of_range(PgType::Int2)),
         (UnaryOp::Neg, Value::Float4(v)) => Ok(Value::Float4(-v)),
         (UnaryOp::Neg, Value::Float8(v)) => Ok(Value::Float8(-v)),
+        (UnaryOp::Neg, Value::Numeric(v)) => Ok(Value::Numeric(v.neg())),
         (UnaryOp::Abs, Value::Int2(v)) => v
             .checked_abs()
             .map(Value::Int2)
@@ -93,6 +94,7 @@ fn eval_unary(op: UnaryOp, operand: Value) -> Result<Value, ExecError> {
             .ok_or_else(|| out_of_range(PgType::Int8)),
         (UnaryOp::Abs, Value::Float4(v)) => Ok(Value::Float4(v.abs())),
         (UnaryOp::Abs, Value::Float8(v)) => Ok(Value::Float8(v.abs())),
+        (UnaryOp::Abs, Value::Numeric(v)) => Ok(Value::Numeric(v.abs())),
         (UnaryOp::Sqrt, Value::Float8(v)) => {
             float::f8_sqrt(v).map(Value::Float8).map_err(float_error)
         }
@@ -125,6 +127,7 @@ fn eval_binary(
             PgType::Int8 => eval_arith_int8(op, int8(&l), int8(&r)),
             PgType::Float4 => eval_arith_f4(op, float4(&l), float4(&r)),
             PgType::Float8 => eval_arith_f8(op, float8(&l), float8(&r)),
+            PgType::Numeric => eval_arith_numeric(op, numeric(&l), numeric(&r)),
             other => unreachable!("binder let arithmetic through on {other:?}"),
         };
     }
@@ -160,6 +163,8 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::TimestampTz => timestamptz_of(l).cmp(&timestamptz_of(r)),
         // Canonical-span order (30-day months, 24-hour days), infinities first/last.
         PgType::Interval => interval::cmp(interval_of(l), interval_of(r)),
+        // Arbitrary-precision total order; NaN sorts greatest (== itself).
+        PgType::Numeric => numeric(l).cmp(numeric(r)),
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -222,6 +227,13 @@ fn float8(v: &Value) -> f64 {
     match v {
         Value::Float8(v) => *v,
         other => unreachable!("expected float8, got {other:?}"),
+    }
+}
+
+fn numeric(v: &Value) -> &Numeric {
+    match v {
+        Value::Numeric(n) => n,
+        other => unreachable!("expected numeric, got {other:?}"),
     }
 }
 
@@ -380,4 +392,20 @@ fn eval_arith_f8(op: BinOp, a: f64, b: f64) -> Result<Value, ExecError> {
         other => unreachable!("float8 arithmetic {other:?}"),
     };
     r.map(Value::Float8).map_err(float_error)
+}
+
+fn eval_arith_numeric(op: BinOp, a: &Numeric, b: &Numeric) -> Result<Value, ExecError> {
+    let r = match op {
+        BinOp::Add => a.add(b),
+        BinOp::Sub => a.sub(b),
+        BinOp::Mul => a.mul(b),
+        BinOp::Div => a.div(b).map_err(numeric_error)?,
+        BinOp::Mod => a.modulo(b).map_err(numeric_error)?,
+        other => unreachable!("numeric arithmetic {other:?}"),
+    };
+    Ok(Value::Numeric(r))
+}
+
+fn numeric_error(e: crabgresql_types::numeric::NumErr) -> ExecError {
+    ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
 }
