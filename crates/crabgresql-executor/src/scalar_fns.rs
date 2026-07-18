@@ -11,7 +11,7 @@ use std::hint::black_box;
 
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_types::{Value, float, timestamp};
+use crabgresql_types::{Value, float, timestamp, timestamptz};
 
 use crate::ExecError;
 
@@ -86,6 +86,57 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             .map(Value::Timestamp)
             .map_err(ts_err);
         }
+        ScalarFn::DatePartTz => {
+            return Ok(
+                match timestamptz::date_part(text(&args[0]), tstz(&args[1])).map_err(ts_err)? {
+                    Some(v) => Value::Float8(v),
+                    None => Value::Null,
+                },
+            );
+        }
+        ScalarFn::ExtractTz => {
+            return Ok(
+                match timestamptz::extract(text(&args[0]), tstz(&args[1])).map_err(ts_err)? {
+                    Some(n) => Value::Numeric(n),
+                    None => Value::Null,
+                },
+            );
+        }
+        ScalarFn::DateTruncTz => {
+            return timestamptz::date_trunc(text(&args[0]), tstz(&args[1]))
+                .map(Value::TimestampTz)
+                .map_err(ts_err);
+        }
+        ScalarFn::IsfiniteTz => {
+            return Ok(Value::Bool(timestamptz::is_finite_tstz(tstz(&args[0]))));
+        }
+        ScalarFn::MakeTimestampTz => {
+            // The 7th argument (a text zone) is optional.
+            let zone = args.get(6).map(|a| text(a));
+            return timestamptz::make_timestamptz(
+                i4(&args[0]) as i64,
+                i4(&args[1]) as i64,
+                i4(&args[2]) as i64,
+                i4(&args[3]) as i64,
+                i4(&args[4]) as i64,
+                f8(&args[5]),
+                zone,
+            )
+            .map(Value::TimestampTz)
+            .map_err(ts_err);
+        }
+        ScalarFn::TimezoneToTz => {
+            // timezone(zone, timestamp) -> timestamptz.
+            return timestamptz::timestamp_at_zone(text(&args[0]), ts(&args[1]))
+                .map(Value::TimestampTz)
+                .map_err(ts_err);
+        }
+        ScalarFn::TimezoneToTs => {
+            // timezone(zone, timestamptz) -> timestamp.
+            return timestamptz::at_zone_to_timestamp(text(&args[0]), tstz(&args[1]))
+                .map(Value::Timestamp)
+                .map_err(ts_err);
+        }
         // md5(text)/md5(bytea) hash the raw input bytes; both return the
         // 32-char lowercase hex digest as text.
         ScalarFn::Md5 => {
@@ -158,7 +209,14 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         | ScalarFn::Extract
         | ScalarFn::DateTrunc
         | ScalarFn::Isfinite
-        | ScalarFn::MakeTimestamp => unreachable!(),
+        | ScalarFn::MakeTimestamp
+        | ScalarFn::DatePartTz
+        | ScalarFn::ExtractTz
+        | ScalarFn::DateTruncTz
+        | ScalarFn::IsfiniteTz
+        | ScalarFn::MakeTimestampTz
+        | ScalarFn::TimezoneToTz
+        | ScalarFn::TimezoneToTs => unreachable!(),
     };
     result.map(Value::Float8)
 }
@@ -415,6 +473,9 @@ pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, Str
         "float8" | "double precision" => float::float8in(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
+        "timestamptz" | "timestamp with time zone" => timestamptz::parse(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
         // Other types: not exercised; treat as valid.
         _ => Ok(()),
     }
@@ -445,6 +506,13 @@ fn ts(v: &Value) -> i64 {
     match v {
         Value::Timestamp(t) => *t,
         other => unreachable!("expected timestamp arg, got {other:?}"),
+    }
+}
+
+fn tstz(v: &Value) -> i64 {
+    match v {
+        Value::TimestampTz(t) => *t,
+        other => unreachable!("expected timestamptz arg, got {other:?}"),
     }
 }
 

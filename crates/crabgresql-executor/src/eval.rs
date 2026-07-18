@@ -143,6 +143,7 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::Bool => bool_of(l).cmp(&bool_of(r)),
         // Microsecond order; the ±infinity sentinels sort naturally.
         PgType::Timestamp => timestamp_of(l).cmp(&timestamp_of(r)),
+        PgType::TimestampTz => timestamptz_of(l).cmp(&timestamptz_of(r)),
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -233,6 +234,13 @@ fn timestamp_of(v: &Value) -> i64 {
     match v {
         Value::Timestamp(t) => *t,
         other => unreachable!("expected timestamp, got {other:?}"),
+    }
+}
+
+fn timestamptz_of(v: &Value) -> i64 {
+    match v {
+        Value::TimestampTz(t) => *t,
+        other => unreachable!("expected timestamptz, got {other:?}"),
     }
 }
 
