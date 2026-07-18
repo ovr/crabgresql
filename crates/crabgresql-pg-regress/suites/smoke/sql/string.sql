@@ -90,7 +90,16 @@ SELECT '[' || c || ']' AS c, '[' || v || ']' AS v, octet_length(c) AS c_octets F
 INSERT INTO str_t (c) VALUES ('toolong');
 INSERT INTO str_t (v) VALUES ('abcdef');
 
--- errors: chr(0), negative substring length, split_part field 0
+-- format() field widths (right/left-justified, and a `*` width argument)
+SELECT format('[%5s]', 'x') AS w1, format('[%-5s]', 'x') AS w2, format('[%*s]', 4, 'y') AS w3;
+
+-- errors: chr(0)/surrogate, negative substring length, split_part field 0,
+-- overlay start below 1, oversized result, and malformed encode/decode input
 SELECT chr(0);
+SELECT chr(55296);
 SELECT substr('abc', 1, -1);
 SELECT split_part('a,b', ',', 0);
+SELECT overlay('abc' PLACING 'X' FROM 0);
+SELECT repeat('a', 2147483647);
+SELECT decode('a@b', 'base64');
+SELECT decode('xyz', 'hex');

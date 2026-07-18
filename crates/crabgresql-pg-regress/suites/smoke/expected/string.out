@@ -215,10 +215,28 @@ INSERT INTO str_t (c) VALUES ('toolong');
 ERROR:  value too long for type character(5)
 INSERT INTO str_t (v) VALUES ('abcdef');
 ERROR:  value too long for type character varying(3)
--- errors: chr(0), negative substring length, split_part field 0
+-- format() field widths (right/left-justified, and a `*` width argument)
+SELECT format('[%5s]', 'x') AS w1, format('[%-5s]', 'x') AS w2, format('[%*s]', 4, 'y') AS w3;
+   w1    |   w2    |   w3   
+---------+---------+--------
+ [    x] | [x    ] | [   y]
+(1 row)
+
+-- errors: chr(0)/surrogate, negative substring length, split_part field 0,
+-- overlay start below 1, oversized result, and malformed encode/decode input
 SELECT chr(0);
 ERROR:  null character not permitted
+SELECT chr(55296);
+ERROR:  requested character not valid for encoding: 55296
 SELECT substr('abc', 1, -1);
 ERROR:  negative substring length not allowed
 SELECT split_part('a,b', ',', 0);
 ERROR:  field position must not be zero
+SELECT overlay('abc' PLACING 'X' FROM 0);
+ERROR:  negative substring length not allowed
+SELECT repeat('a', 2147483647);
+ERROR:  requested length too large
+SELECT decode('a@b', 'base64');
+ERROR:  invalid symbol "@" found while decoding base64 sequence
+SELECT decode('xyz', 'hex');
+ERROR:  invalid hexadecimal digit: "x"

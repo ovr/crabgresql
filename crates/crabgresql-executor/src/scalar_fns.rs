@@ -116,7 +116,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::Lpad | ScalarFn::Rpad => {
             let fill = args.get(2).map(|v| text(v)).unwrap_or(" ");
             let left = matches!(func, ScalarFn::Lpad);
-            return Ok(Value::Text(text::pad(text(&args[0]), i4(&args[1]), fill, left)));
+            return text::pad(text(&args[0]), i4(&args[1]), fill, left)
+                .map(Value::Text)
+                .map_err(text_err);
         }
         ScalarFn::Replace => {
             return Ok(Value::Text(text::replace(text(&args[0]), text(&args[1]), text(&args[2]))));
@@ -124,7 +126,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::Translate => {
             return Ok(Value::Text(text::translate(text(&args[0]), text(&args[1]), text(&args[2]))));
         }
-        ScalarFn::Repeat => return Ok(Value::Text(text::repeat(text(&args[0]), i4(&args[1])))),
+        ScalarFn::Repeat => {
+            return text::repeat(text(&args[0]), i4(&args[1])).map(Value::Text).map_err(text_err);
+        }
         ScalarFn::Reverse => return Ok(Value::Text(text::reverse(text(&args[0])))),
         ScalarFn::Left => return Ok(Value::Text(text::left(text(&args[0]), i4(&args[1])))),
         ScalarFn::Right => return Ok(Value::Text(text::right(text(&args[0]), i4(&args[1])))),

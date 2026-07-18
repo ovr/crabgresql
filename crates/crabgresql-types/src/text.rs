@@ -33,6 +33,15 @@ impl TextError {
 
 type Result<T> = std::result::Result<T, TextError>;
 
+/// PostgreSQL's `MaxAllocSize` (1 GB − 1): the largest a single value may grow
+/// before `repeat`/`lpad`/`rpad` reject it, matching PG's `requested length too
+/// large` error instead of attempting a multi-gigabyte allocation.
+const MAX_ALLOC: i64 = 0x3FFF_FFFF;
+
+fn too_large() -> TextError {
+    TextError::new(sqlstate::PROGRAM_LIMIT_EXCEEDED, "requested length too large")
+}
+
 // --- length ----------------------------------------------------------------
 
 /// `length` / `char_length` / `character_length`: number of characters.
@@ -129,7 +138,11 @@ pub fn strpos(haystack: &str, needle: &str) -> i32 {
 /// `substr(s,1,start-1) || replacement || substr(s, start+count)`.
 pub fn overlay(s: &str, replacement: &str, start: i32, count: Option<i32>) -> Result<String> {
     let count = count.unwrap_or_else(|| char_length(replacement));
-    let left = substr(s, 1, Some((start - 1).max(0)))?;
+    // `substr(s, 1, start-1)` with `start < 1` raises PG's negative-length error,
+    // so `start <= 0` is rejected exactly as PG's `text_overlay` does. A negative
+    // `start` maps to a negative length without risking i32 overflow.
+    let left_len = if start < 1 { -1 } else { start - 1 };
+    let left = substr(s, 1, Some(left_len))?;
     let right = substr(s, start.saturating_add(count).max(1), None)?;
     Ok(format!("{left}{replacement}{right}"))
 }
@@ -159,26 +172,36 @@ pub fn trim(s: &str, chars: &str, side: TrimSide) -> String {
 /// longer than `len` it is truncated to the first `len` characters; otherwise
 /// it is padded with `fill` (an empty `fill` cannot pad, so the string is
 /// returned unchanged).
-pub fn pad(s: &str, len: i32, fill: &str, left: bool) -> String {
+pub fn pad(s: &str, len: i32, fill: &str, left: bool) -> Result<String> {
     if len <= 0 {
-        return String::new();
+        return Ok(String::new());
     }
     let len = len as usize;
     let s_chars: Vec<char> = s.chars().collect();
     if s_chars.len() >= len {
-        return s_chars[..len].iter().collect();
+        return Ok(s_chars[..len].iter().collect());
     }
     let need = len - s_chars.len();
     let fill_chars: Vec<char> = fill.chars().collect();
     if fill_chars.is_empty() {
-        return s.to_string();
+        return Ok(s.to_string());
+    }
+    // Reject before allocating: compute the padding's byte length from the fill
+    // cycle rather than materializing a multi-gigabyte string (PG's MaxAllocSize).
+    let per_cycle_chars = fill_chars.len() as i64;
+    let full_cycles = need as i64 / per_cycle_chars;
+    let rem = (need as i64 % per_cycle_chars) as usize;
+    let rem_bytes: i64 = fill_chars[..rem].iter().map(|c| c.len_utf8() as i64).sum();
+    let padding_bytes = full_cycles * fill.len() as i64 + rem_bytes;
+    if s.len() as i64 + padding_bytes > MAX_ALLOC {
+        return Err(too_large());
     }
     let padding: String = fill_chars.iter().cycle().take(need).collect();
-    if left {
+    Ok(if left {
         format!("{padding}{s}")
     } else {
         format!("{s}{padding}")
-    }
+    })
 }
 
 // --- replace / translate / repeat / reverse --------------------------------
@@ -209,12 +232,16 @@ pub fn translate(s: &str, from: &str, to: &str) -> String {
     out
 }
 
-/// `repeat(string, n)`: `n` copies, empty when `n <= 0`.
-pub fn repeat(s: &str, n: i32) -> String {
+/// `repeat(string, n)`: `n` copies, empty when `n <= 0`. Rejects a result larger
+/// than PG's `MaxAllocSize` instead of attempting the allocation.
+pub fn repeat(s: &str, n: i32) -> Result<String> {
     if n <= 0 {
-        return String::new();
+        return Ok(String::new());
     }
-    s.repeat(n as usize)
+    if s.len() as i64 * n as i64 > MAX_ALLOC {
+        return Err(too_large());
+    }
+    Ok(s.repeat(n as usize))
 }
 
 /// `reverse`: reverse the characters.
@@ -259,11 +286,20 @@ pub fn chr(n: i32) -> Result<String> {
             "character number must be positive",
         ));
     }
+    // Above the Unicode maximum is "too large"; a code point inside the range
+    // that is still not a scalar value (a UTF-16 surrogate) is "not valid" — the
+    // two distinct PG messages.
+    if n as u32 > 0x10FFFF {
+        return Err(TextError::new(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            format!("requested character too large for encoding: {n}"),
+        ));
+    }
     match char::from_u32(n as u32) {
         Some(c) => Ok(c.to_string()),
         None => Err(TextError::new(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            format!("requested character too large for encoding: {n}"),
+            format!("requested character not valid for encoding: {n}"),
         )),
     }
 }
@@ -480,7 +516,10 @@ fn decode_hex(s: &str) -> Result<Vec<u8>> {
             continue;
         }
         let v = hex_val(c).ok_or_else(|| {
-            TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "invalid hexadecimal digit")
+            TextError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("invalid hexadecimal digit: \"{}\"", c as char),
+            )
         })?;
         match hi.take() {
             None => hi = Some(v),
@@ -501,22 +540,43 @@ fn base64_val(c: u8) -> Option<u8> {
 }
 
 fn decode_base64(s: &str) -> Result<Vec<u8>> {
+    let end_seq =
+        || TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "invalid base64 end sequence");
     let mut out = Vec::new();
     let mut buf = 0u32;
     let mut bits = 0u32;
+    let mut ndata = 0usize; // significant (non-pad) symbols seen
+    let mut npad = 0usize; // trailing '=' padding symbols
     for c in s.bytes() {
-        if c.is_ascii_whitespace() || c == b'=' {
+        if c.is_ascii_whitespace() {
             continue;
         }
+        if c == b'=' {
+            npad += 1;
+            continue;
+        }
+        // A data symbol after padding is a malformed sequence.
+        if npad > 0 {
+            return Err(end_seq());
+        }
         let v = base64_val(c).ok_or_else(|| {
-            TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "invalid symbol found in base64 data")
+            TextError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("invalid symbol \"{}\" found while decoding base64 sequence", c as char),
+            )
         })?;
         buf = (buf << 6) | v as u32;
         bits += 6;
+        ndata += 1;
         if bits >= 8 {
             bits -= 8;
             out.push((buf >> bits) as u8);
         }
+    }
+    // The full symbol count must be a multiple of 4, a group can't end on a lone
+    // data symbol, and at most two '=' pad it — otherwise PG rejects the input.
+    if (ndata + npad) % 4 != 0 || ndata % 4 == 1 || npad > 2 {
+        return Err(end_seq());
     }
     Ok(out)
 }
@@ -592,13 +652,47 @@ pub fn quote_nullable(s: Option<&str>) -> String {
 /// A `format()` argument: its text representation (`None` for SQL NULL).
 pub type FormatArg = Option<String>;
 
-/// `format(fmtstr, args...)`: supports `%s`, `%I`, `%L`, `%%`, and positional
-/// `%n$` specifiers.
+/// `format(fmtstr, args...)`: supports `%s`, `%I`, `%L`, `%%`, positional
+/// `%n$` arguments, and a field width (`%10s`, `%-10s`, `%*s`, `%*n$s`).
 pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
+    let unterminated = || {
+        TextError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "unterminated format() type specifier",
+        )
+    };
+    // The argument at 1-based position `n` (0 is rejected as PG does).
+    let arg_at = |n: usize| -> Result<&FormatArg> {
+        if n == 0 {
+            return Err(TextError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "format specifies argument 0, but arguments are numbered from 1",
+            ));
+        }
+        args.get(n - 1).ok_or_else(|| {
+            TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "too few arguments for format()")
+        })
+    };
     let mut out = String::new();
     let chars: Vec<char> = fmt.chars().collect();
     let mut i = 0;
-    let mut auto = 0usize; // next auto-assigned argument (0-based)
+    let mut auto = 1usize; // next auto-assigned 1-based argument
+    // Scan a run of digits followed by `$`; consume and return it as a 1-based
+    // position, or leave `i` unmoved when the run isn't an argument selector.
+    let scan_arg_pos = |chars: &[char], i: &mut usize| -> Option<usize> {
+        let start = *i;
+        while *i < chars.len() && chars[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i > start && *i < chars.len() && chars[*i] == '$' {
+            let n: usize = chars[start..*i].iter().collect::<String>().parse().unwrap_or(0);
+            *i += 1;
+            Some(n)
+        } else {
+            *i = start;
+            None
+        }
+    };
     while i < chars.len() {
         if chars[i] != '%' {
             out.push(chars[i]);
@@ -607,64 +701,62 @@ pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
         }
         i += 1;
         if i >= chars.len() {
-            return Err(TextError::new(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "unterminated format specifier",
-            ));
+            return Err(unterminated());
         }
-        // Optional explicit argument position: digits followed by '$'.
-        let mut explicit: Option<usize> = None;
-        if chars[i].is_ascii_digit() {
+        if chars[i] == '%' {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        // [argpos '$']
+        let explicit = scan_arg_pos(&chars, &mut i);
+        // [flags] — only '-' (left-justify)
+        let mut left_justify = false;
+        while i < chars.len() && chars[i] == '-' {
+            left_justify = true;
+            i += 1;
+        }
+        // [width] — a literal digit run, or `*` / `*n$` reading an int argument
+        let mut width: Option<i64> = None;
+        if i < chars.len() && chars[i] == '*' {
+            i += 1;
+            let pos = scan_arg_pos(&chars, &mut i).unwrap_or_else(|| {
+                let a = auto;
+                auto += 1;
+                a
+            });
+            // A null width is treated as no width, matching PG.
+            let w: i64 = arg_at(pos)?.as_deref().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            width = Some(w);
+        } else if i < chars.len() && chars[i].is_ascii_digit() {
             let start = i;
             while i < chars.len() && chars[i].is_ascii_digit() {
                 i += 1;
             }
-            if i < chars.len() && chars[i] == '$' {
-                let n: usize = chars[start..i].iter().collect::<String>().parse().map_err(|_| {
-                    TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "invalid format specifier")
-                })?;
-                explicit = Some(n);
-                i += 1;
-            } else {
-                return Err(TextError::new(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "width or precision is not supported in format",
-                ));
-            }
+            width = chars[start..i].iter().collect::<String>().parse().ok();
+        }
+        // A negative width means left-justify to its absolute value.
+        if let Some(w) = width
+            && w < 0
+        {
+            left_justify = true;
+            width = Some(-w);
         }
         if i >= chars.len() {
-            return Err(TextError::new(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "unterminated format specifier",
-            ));
+            return Err(unterminated());
         }
         let conv = chars[i];
         i += 1;
-        if conv == '%' {
-            out.push('%');
-            continue;
-        }
-        let idx = match explicit {
-            Some(n) if n >= 1 => n - 1,
-            Some(_) => {
-                return Err(TextError::new(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "format specifier argument number must be greater than zero",
-                ));
-            }
-            None => {
-                let a = auto;
-                auto += 1;
-                a
-            }
-        };
-        let arg = args.get(idx).ok_or_else(|| {
-            TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "too few arguments for format()")
-        })?;
-        match conv {
-            's' => out.push_str(arg.as_deref().unwrap_or("")),
+        let pos = explicit.unwrap_or_else(|| {
+            let a = auto;
+            auto += 1;
+            a
+        });
+        let arg = arg_at(pos)?;
+        let piece = match conv {
+            's' => arg.as_deref().unwrap_or("").to_string(),
             'I' => match arg {
-                Some(v) => out.push_str(&quote_ident(v)),
+                Some(v) => quote_ident(v),
                 None => {
                     return Err(TextError::new(
                         sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -672,13 +764,22 @@ pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
                     ));
                 }
             },
-            'L' => out.push_str(&quote_nullable(arg.as_deref())),
+            'L' => quote_nullable(arg.as_deref()),
             other => {
                 return Err(TextError::new(
                     sqlstate::INVALID_PARAMETER_VALUE,
                     format!("unrecognized format() type specifier \"{other}\""),
                 ));
             }
+        };
+        // Pad the formatted piece to the requested field width with spaces.
+        let pad = width.map(|w| w as usize).unwrap_or(0).saturating_sub(char_length(&piece) as usize);
+        if pad > 0 && !left_justify {
+            out.extend(std::iter::repeat(' ').take(pad));
+        }
+        out.push_str(&piece);
+        if pad > 0 && left_justify {
+            out.extend(std::iter::repeat(' ').take(pad));
         }
     }
     Ok(out)
@@ -783,14 +884,18 @@ mod tests {
         assert_eq!(strpos("abc", ""), 1);
         assert_eq!(strpos("abc", "z"), 0);
         assert_eq!(overlay("Txxxxas", "hom", 2, Some(4)).unwrap(), "Thomas");
+        // A start of 0 (or below) is a negative-substring error, as in PG.
+        assert_eq!(overlay("abc", "X", 0, None).unwrap_err().sqlstate, "22011");
     }
 
     #[test]
     fn pad_and_trim() {
-        assert_eq!(pad("abcdef", 3, " ", true), "abc");
-        assert_eq!(pad("ab", 5, "xy", false), "abxyx");
-        assert_eq!(pad("ab", 5, "", true), "ab");
-        assert_eq!(pad("abc", -1, " ", true), "");
+        assert_eq!(pad("abcdef", 3, " ", true).unwrap(), "abc");
+        assert_eq!(pad("ab", 5, "xy", false).unwrap(), "abxyx");
+        assert_eq!(pad("ab", 5, "", true).unwrap(), "ab");
+        assert_eq!(pad("abc", -1, " ", true).unwrap(), "");
+        // A length past MaxAllocSize is rejected instead of allocating.
+        assert_eq!(pad("a", 2_000_000_000, "x", true).unwrap_err().sqlstate, "54000");
         assert_eq!(trim("xxabcxx", "x", TrimSide::Both), "abc");
     }
 
@@ -798,7 +903,9 @@ mod tests {
     fn translate_replace_repeat() {
         assert_eq!(translate("12345", "143", "ax"), "a2x5");
         assert_eq!(replace("abcabc", "", "X"), "abcabc");
-        assert_eq!(repeat("x", -2), "");
+        assert_eq!(repeat("x", -2).unwrap(), "");
+        assert_eq!(repeat("x", 3).unwrap(), "xxx");
+        assert_eq!(repeat("ab", 2_000_000_000).unwrap_err().sqlstate, "54000");
         assert_eq!(reverse("café"), "éfac");
     }
 
@@ -817,6 +924,8 @@ mod tests {
         assert_eq!(chr(0).unwrap_err().sqlstate, "54000");
         assert_eq!(chr(-1).unwrap_err().sqlstate, "22023");
         assert_eq!(chr(1114112).unwrap_err().sqlstate, "54000");
+        // A surrogate code point is "not valid", distinct from "too large".
+        assert_eq!(chr(55296).unwrap_err().message, "requested character not valid for encoding: 55296");
         assert_eq!(to_hex_i32(-1), "ffffffff");
     }
 
@@ -837,6 +946,16 @@ mod tests {
         assert_eq!(encode(b"a\x00b", "escape").unwrap(), "a\\000b");
         assert_eq!(decode("YWJj", "base64").unwrap(), b"abc");
         assert_eq!(decode("001000", "hex").unwrap(), vec![0x00, 0x10, 0x00]);
+        // Malformed base64 (missing padding / lone trailing symbol) is rejected.
+        assert_eq!(decode("abc", "base64").unwrap_err().message, "invalid base64 end sequence");
+        assert_eq!(
+            decode("a@b", "base64").unwrap_err().message,
+            "invalid symbol \"@\" found while decoding base64 sequence"
+        );
+        assert_eq!(
+            decode("xy", "hex").unwrap_err().message,
+            "invalid hexadecimal digit: \"x\""
+        );
     }
 
     #[test]
@@ -850,6 +969,16 @@ mod tests {
             "a-\"b c\"-'d''e'"
         );
         assert_eq!(format("%1$s %1$s", &[Some("x".into())]).unwrap(), "x x");
+        // Field width: right- and left-justified, and `*` reading a width arg.
+        assert_eq!(format("%5s|", &[Some("x".into())]).unwrap(), "    x|");
+        assert_eq!(format("%-5s|", &[Some("x".into())]).unwrap(), "x    |");
+        assert_eq!(format("%*s", &[Some("3".into()), Some("x".into())]).unwrap(), "  x");
+        assert_eq!(format("%%", &[]).unwrap(), "%");
+        assert_eq!(format("%", &[]).unwrap_err().message, "unterminated format() type specifier");
+        assert_eq!(
+            format("%0$s", &[Some("x".into())]).unwrap_err().message,
+            "format specifies argument 0, but arguments are numbered from 1"
+        );
     }
 
     #[test]
