@@ -18,7 +18,7 @@ use crabgresql_types::{
 };
 
 use crate::BindError;
-use crate::functions::{ScalarFn, bind_function};
+use crate::functions::{ScalarFn, TableFn, bind_function, bind_srf_projection};
 
 /// Typed expression IR. Every node knows its result type; the evaluator
 /// dispatches on the recorded types and never re-infers them.
@@ -68,6 +68,15 @@ pub enum BoundExpr {
         whens: Vec<(BoundExpr, BoundExpr)>,
         else_: Option<Box<BoundExpr>>,
         ty: PgType,
+    },
+    /// A set-returning function in the SELECT target list; `ret` is the element
+    /// (per-row output) type. This is a marker that is only legal at the top
+    /// level of a projection: the `ProjectSet` executor node expands it into
+    /// rows. Evaluating it as a scalar is an error (see `executor::eval`).
+    Srf {
+        func: TableFn,
+        ret: PgType,
+        args: Vec<BoundExpr>,
     },
 }
 
@@ -157,7 +166,14 @@ impl BoundExpr {
             BoundExpr::Coerce { ty, .. } => *ty,
             BoundExpr::FuncCall { ret, .. } => *ret,
             BoundExpr::Case { ty, .. } => *ty,
+            BoundExpr::Srf { ret, .. } => *ret,
         }
+    }
+
+    /// Whether this is a set-returning function marker (only legal at the top
+    /// level of a projection list).
+    pub fn is_srf(&self) -> bool {
+        matches!(self, BoundExpr::Srf { .. })
     }
 }
 
@@ -373,6 +389,19 @@ pub fn bind_scalar(expr: &ast::Expr, scope: &Scope) -> Result<BoundExpr, BindErr
         Binding::Typed(e) => e,
         Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text)?,
     })
+}
+
+/// Bind a SELECT-list item. A top-level call to a set-returning function
+/// (currently `generate_series`) binds to a [`BoundExpr::Srf`] marker that the
+/// executor's `ProjectSet` node expands into rows; everything else binds as an
+/// ordinary scalar via [`bind_scalar`].
+pub fn bind_projection(expr: &ast::Expr, scope: &Scope) -> Result<BoundExpr, BindError> {
+    if let ast::Expr::Function(func) = expr
+        && let Some(srf) = bind_srf_projection(func, scope)?
+    {
+        return Ok(srf);
+    }
+    bind_scalar(expr, scope)
 }
 
 fn unsupported_expr(expr: &ast::Expr) -> BindError {

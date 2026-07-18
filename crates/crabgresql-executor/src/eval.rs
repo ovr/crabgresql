@@ -51,6 +51,13 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, 
                 None => Ok(Value::Null),
             }
         }
+        // An SRF marker only expands via the `ProjectSet` node; reaching scalar
+        // evaluation means it appeared where a set is not allowed (WHERE, an
+        // operator argument, ORDER BY, ...). PG reports this as 0A000.
+        BoundExpr::Srf { .. } => Err(ExecError::new(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "set-valued function called in context that cannot accept a set",
+        )),
     }
 }
 
