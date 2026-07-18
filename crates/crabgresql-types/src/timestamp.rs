@@ -447,7 +447,7 @@ fn parse_time(field: &str) -> Option<(i64, i64, i64, i64)> {
 }
 
 /// Fractional-seconds string → microseconds, rounding a 7th+ digit half-up.
-fn parse_fraction(frac: &str) -> Option<i64> {
+pub(crate) fn parse_fraction(frac: &str) -> Option<i64> {
     if frac.is_empty() {
         return Some(0);
     }
@@ -649,7 +649,7 @@ pub fn extract(unit: &str, micros: i64) -> Result<Option<NumericVal>, TimestampE
 /// Format `scaled` (the field value times `10^scale`) as a fixed-point decimal
 /// with `scale` fractional digits, keeping sign. E.g. `40500000` at scale 6 is
 /// `40.500000`; at scale 3 it is `40500.000`; at scale 0 it is `40500000`.
-fn fixed_point(scaled: i64, scale: usize) -> String {
+pub(crate) fn fixed_point(scaled: i64, scale: usize) -> String {
     let neg = scaled < 0;
     let abs = scaled.unsigned_abs();
     let denom = 10u64.pow(scale as u32);
@@ -940,6 +940,25 @@ fn inf_sign(micros: i64) -> Option<i32> {
     }
 }
 
+/// Rewrap an interval-layer error as a timestamp-layer one (same code/message).
+fn from_interval_err(e: interval::IntervalError) -> TimestampError {
+    TimestampError { sqlstate: e.sqlstate, message: e.message }
+}
+
+/// The symbolic difference `timestamp_mi`/`timestamp_age` produce when either
+/// operand is infinite: same-sign infinities are undefined (error), otherwise
+/// the result is the interval infinity of the dominating (first) operand.
+/// `None` means both operands are finite.
+fn infinite_diff(dt1: i64, dt2: i64) -> Option<Result<Interval, TimestampError>> {
+    let inf = |positive: bool| if positive { interval::POS_INFINITY } else { interval::NEG_INFINITY };
+    match (inf_sign(dt1), inf_sign(dt2)) {
+        (Some(a), Some(b)) if a == b => Some(Err(interval_out_of_range())),
+        (Some(a), _) => Some(Ok(inf(a > 0))),
+        (None, Some(b)) => Some(Ok(inf(b < 0))),
+        (None, None) => None,
+    }
+}
+
 /// Ensure a computed timestamp is within PG's supported year range.
 fn check_range(micros: i64) -> Result<i64, TimestampError> {
     let year = decode(micros).year;
@@ -954,7 +973,7 @@ fn check_range(micros: i64) -> Result<i64, TimestampError> {
 pub fn pl_interval(micros: i64, span: Interval) -> Result<i64, TimestampError> {
     // An infinite timestamp swallows a finite interval; an infinite interval
     // pushes a finite timestamp to that infinity. Opposite infinities conflict.
-    match (inf_sign(micros), span_inf_sign(span)) {
+    match (inf_sign(micros), span.infinity_sign()) {
         (Some(a), Some(b)) if a != b => return Err(timestamp_out_of_range()),
         (Some(_), _) => return Ok(micros),
         (None, Some(b)) => return Ok(if b > 0 { POS_INFINITY } else { NEG_INFINITY }),
@@ -970,8 +989,15 @@ pub fn pl_interval(micros: i64, span: Interval) -> Result<i64, TimestampError> {
             tm.day = dim;
         }
     }
-    let result = encode(tm)
-        .checked_add(span.days as i64 * USECS_PER_DAY)
+    // Reject an out-of-range year *before* `encode`, whose `date2j * USECS_PER_DAY`
+    // would otherwise overflow i64 and panic. `span.days` is scaled with
+    // `checked_mul` for the same reason.
+    if !(-4712..=294_276).contains(&tm.year) {
+        return Err(timestamp_out_of_range());
+    }
+    let result = (span.days as i64)
+        .checked_mul(USECS_PER_DAY)
+        .and_then(|day_usec| encode(tm).checked_add(day_usec))
         .and_then(|r| r.checked_add(span.usec))
         .ok_or_else(timestamp_out_of_range)?;
     check_range(result)
@@ -979,54 +1005,25 @@ pub fn pl_interval(micros: i64, span: Interval) -> Result<i64, TimestampError> {
 
 /// `timestamp - interval` (`timestamp_mi_interval`): the negation of the add.
 pub fn mi_interval(micros: i64, span: Interval) -> Result<i64, TimestampError> {
-    let neg = interval::negate(span).map_err(|e| TimestampError {
-        sqlstate: e.sqlstate,
-        message: e.message,
-    })?;
+    let neg = interval::negate(span).map_err(from_interval_err)?;
     pl_interval(micros, neg)
 }
 
 /// `timestamp - timestamp` (`timestamp_mi`): the microsecond difference, then
 /// `justify_hours` (PG applies it here for historical compatibility).
 pub fn mi(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
-    match (inf_sign(dt1), inf_sign(dt2)) {
-        (Some(a), Some(b)) => {
-            return if a == b {
-                Err(interval_out_of_range())
-            } else {
-                Ok(if a > 0 { interval::POS_INFINITY } else { interval::NEG_INFINITY })
-            };
-        }
-        (Some(a), None) => {
-            return Ok(if a > 0 { interval::POS_INFINITY } else { interval::NEG_INFINITY });
-        }
-        (None, Some(b)) => {
-            return Ok(if b > 0 { interval::NEG_INFINITY } else { interval::POS_INFINITY });
-        }
-        (None, None) => {}
+    if let Some(result) = infinite_diff(dt1, dt2) {
+        return result;
     }
     let usec = dt1.checked_sub(dt2).ok_or_else(interval_out_of_range)?;
-    Ok(interval::justify_hours(Interval { months: 0, days: 0, usec }))
+    interval::justify_hours(Interval { months: 0, days: 0, usec }).map_err(from_interval_err)
 }
 
 /// `age(dt1, dt2)`: the symbolic (year/month/day) difference PG's `timestamp_age`
 /// produces, borrowing from the appropriate month length.
 pub fn age(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
-    match (inf_sign(dt1), inf_sign(dt2)) {
-        (Some(a), Some(b)) => {
-            return if a == b {
-                Err(interval_out_of_range())
-            } else {
-                Ok(if a > 0 { interval::POS_INFINITY } else { interval::NEG_INFINITY })
-            };
-        }
-        (Some(a), None) => {
-            return Ok(if a > 0 { interval::POS_INFINITY } else { interval::NEG_INFINITY });
-        }
-        (None, Some(b)) => {
-            return Ok(if b > 0 { interval::NEG_INFINITY } else { interval::POS_INFINITY });
-        }
-        (None, None) => {}
+    if let Some(result) = infinite_diff(dt1, dt2) {
+        return result;
     }
     let tm1 = decode(dt1);
     let tm2 = decode(dt2);
@@ -1077,15 +1074,6 @@ pub fn age(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
     Ok(Interval { months, days: mday as i32, usec })
 }
 
-fn span_inf_sign(span: Interval) -> Option<i32> {
-    if span == interval::POS_INFINITY {
-        Some(1)
-    } else if span == interval::NEG_INFINITY {
-        Some(-1)
-    } else {
-        None
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1126,6 +1114,19 @@ mod tests {
         assert_eq!(mi(POS_INFINITY, ts("1995-08-06 12:12:12")).unwrap(), interval::POS_INFINITY);
         assert!(mi(POS_INFINITY, POS_INFINITY).is_err());
         assert_eq!(age(POS_INFINITY, ts("2020-01-01")).unwrap(), interval::POS_INFINITY);
+    }
+
+    #[test]
+    fn pl_interval_overflow_errors_instead_of_panicking() {
+        // Regression: a month span that pushes the year far out of range used to
+        // overflow i64 inside `encode` and panic; it must now return a clean
+        // "timestamp out of range" error. Same for an enormous day span.
+        assert_eq!(
+            pl_interval(ts("2001-01-01"), span("2000000000 mons")).unwrap_err().message,
+            "timestamp out of range"
+        );
+        let huge_days = Interval { months: 0, days: i32::MAX, usec: 0 };
+        assert!(pl_interval(ts("2001-01-01"), huge_days).is_err());
     }
 
     #[test]

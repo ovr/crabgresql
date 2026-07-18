@@ -919,7 +919,12 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             (Some(T), Some(T)) => call(ScalarFn::TimestampMi, I, typed(lb), typed(rb)),
             (Some(I), None) => call(ScalarFn::IntervalMi, I, typed(lb), resolve_operand(rb, I)?),
             (None, Some(I)) => call(ScalarFn::IntervalMi, I, resolve_operand(lb, I)?, typed(rb)),
-            (Some(T), None) => call(ScalarFn::TimestampMiInterval, T, typed(lb), resolve_operand(rb, I)?),
+            // For `timestamp - unknown`, PG resolves the literal to `timestamp`
+            // (the preferred type), yielding timestamp - timestamp -> interval —
+            // so `ts - '1 day'` errors as an invalid timestamp, matching PG,
+            // while `ts - '<date>'` and `<date> - ts` produce an interval.
+            (Some(T), None) => call(ScalarFn::TimestampMi, I, typed(lb), resolve_operand(rb, T)?),
+            (None, Some(T)) => call(ScalarFn::TimestampMi, I, resolve_operand(lb, T)?, typed(rb)),
             _ => Ok(None),
         },
         BinOp::Mul => match (lt, rt) {

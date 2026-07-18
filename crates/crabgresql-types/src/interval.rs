@@ -59,14 +59,12 @@ pub const NEG_INFINITY: Interval = Interval {
 };
 
 impl Interval {
-    pub const ZERO: Interval = Interval { months: 0, days: 0, usec: 0 };
-
     pub fn is_finite(self) -> bool {
         self != POS_INFINITY && self != NEG_INFINITY
     }
 
     /// `Some(1)` for `+infinity`, `Some(-1)` for `-infinity`, `None` if finite.
-    fn infinity_sign(self) -> Option<i32> {
+    pub(crate) fn infinity_sign(self) -> Option<i32> {
         if self == POS_INFINITY {
             Some(1)
         } else if self == NEG_INFINITY {
@@ -167,8 +165,8 @@ pub fn format(iv: Interval) -> String {
     out
 }
 
-/// Append one leading field (year/mon/day) in PG's `AddPostgresIntPart` style:
-/// a separating space once a field has been emitted, an explicit `+` when a
+/// Append one leading field (year/mon/day) in PostgreSQL's postgres-IntervalStyle
+/// output: a separating space once a field has been emitted, an explicit `+` when a
 /// prior field was negative but this one is positive, and a plural `s` unless
 /// the value is exactly `1`.
 fn add_postgres_part(out: &mut String, value: i64, unit: &str, is_zero: &mut bool, is_before: &mut bool) {
@@ -187,7 +185,7 @@ fn add_postgres_part(out: &mut String, value: i64, unit: &str, is_zero: &mut boo
 }
 
 /// Whole seconds + fractional microseconds → `SS[.ffffff]` with trailing zeros
-/// trimmed (matching PG's `AppendSeconds`).
+/// trimmed (matching PostgreSQL's interval seconds output).
 fn append_seconds(out: &mut String, sec: i64, fsec: i64) {
     out.push_str(&format!("{sec:02}"));
     if fsec != 0 {
@@ -276,7 +274,7 @@ pub fn mul(iv: Interval, factor: f64) -> Result<Interval, IntervalError> {
         let pos = (sign > 0) == (factor > 0.0);
         return Ok(if pos { POS_INFINITY } else { NEG_INFINITY });
     }
-    scale(iv, factor, |x| x * factor)
+    scale(iv, |x| x * factor)
 }
 
 pub fn div(iv: Interval, factor: f64) -> Result<Interval, IntervalError> {
@@ -290,13 +288,14 @@ pub fn div(iv: Interval, factor: f64) -> Result<Interval, IntervalError> {
         let pos = (sign > 0) == (factor > 0.0);
         return Ok(if pos { POS_INFINITY } else { NEG_INFINITY });
     }
-    scale(iv, factor, |x| x / factor)
+    scale(iv, |x| x / factor)
 }
 
-/// Shared core of `interval_mul`/`interval_div`: apply `op` (multiply or divide
-/// by `factor`) to each field, cascading the fractional months and days that
-/// integer truncation drops down into the time field (PG's algorithm).
-fn scale(iv: Interval, _factor: f64, op: impl Fn(f64) -> f64) -> Result<Interval, IntervalError> {
+/// Shared core of interval multiply/divide: apply `op` (multiply or divide by
+/// the factor already captured in `op`) to each field, cascading the fractional
+/// months and days that integer truncation drops down into the time field, so
+/// the result matches what PostgreSQL's interval `*`/`/` operators produce.
+fn scale(iv: Interval, op: impl Fn(f64) -> f64) -> Result<Interval, IntervalError> {
     let month_f = op(iv.months as f64);
     let day_f = op(iv.days as f64);
     let months = to_i32(month_f)?;
@@ -321,7 +320,9 @@ fn scale(iv: Interval, _factor: f64, op: impl Fn(f64) -> f64) -> Result<Interval
         .checked_add(month_remainder_days.trunc() as i32)
         .ok_or_else(out_of_range)?;
     let time = (op(iv.usec as f64) + sec_remainder * USECS_PER_SEC as f64).round_ties_even();
-    if !time.is_finite() || time > i64::MAX as f64 || time < i64::MIN as f64 {
+    // `i64::MAX as f64` rounds up to 2^63, so use `>=` to reject a value at that
+    // boundary that the `as i64` cast would otherwise saturate.
+    if !time.is_finite() || time >= -(i64::MIN as f64) || time < i64::MIN as f64 {
         return Err(out_of_range());
     }
     Ok(Interval { months, days, usec: time as i64 })
@@ -334,48 +335,56 @@ fn to_i32(x: f64) -> Result<i32, IntervalError> {
     Ok(x as i32)
 }
 
-/// PG's `TSROUND`: round a seconds value to the nearest microsecond.
+/// Add an `i64` delta to an `i32` field, erroring (rather than wrapping) if the
+/// result leaves `i32` range — the justify/carry helpers use this so an overflow
+/// becomes "interval out of range" instead of a silent wraparound.
+fn add_i32(base: i32, delta: i64) -> Result<i32, IntervalError> {
+    i32::try_from(base as i64 + delta).map_err(|_| out_of_range())
+}
+
+/// Round a seconds value to the nearest microsecond (PostgreSQL rounds interval
+/// sub-second results to microsecond precision).
 fn round_micros(sec: f64) -> f64 {
     (sec * 1_000_000.0).round_ties_even() / 1_000_000.0
 }
 
 // --- justify_days / justify_hours / justify_interval -----------------------
 
-pub fn justify_hours(iv: Interval) -> Interval {
+pub fn justify_hours(iv: Interval) -> Result<Interval, IntervalError> {
     if !iv.is_finite() {
-        return iv;
+        return Ok(iv);
     }
     let mut r = iv;
     let wholeday = r.usec / USECS_PER_DAY;
     r.usec -= wholeday * USECS_PER_DAY;
-    r.days = r.days.wrapping_add(wholeday as i32);
+    r.days = add_i32(r.days, wholeday)?;
     reconcile_day_time(&mut r);
-    r
+    Ok(r)
 }
 
-pub fn justify_days(iv: Interval) -> Interval {
+pub fn justify_days(iv: Interval) -> Result<Interval, IntervalError> {
     if !iv.is_finite() {
-        return iv;
+        return Ok(iv);
     }
     let mut r = iv;
     let wholemonth = (r.days as i64) / DAYS_PER_MONTH;
     r.days -= (wholemonth * DAYS_PER_MONTH) as i32;
-    r.months = r.months.wrapping_add(wholemonth as i32);
+    r.months = add_i32(r.months, wholemonth)?;
     reconcile_month_day(&mut r);
-    r
+    Ok(r)
 }
 
-pub fn justify_interval(iv: Interval) -> Interval {
+pub fn justify_interval(iv: Interval) -> Result<Interval, IntervalError> {
     if !iv.is_finite() {
-        return iv;
+        return Ok(iv);
     }
     let mut r = iv;
     let wholeday = r.usec / USECS_PER_DAY;
     r.usec -= wholeday * USECS_PER_DAY;
-    r.days = r.days.wrapping_add(wholeday as i32);
+    r.days = add_i32(r.days, wholeday)?;
     let wholemonth = (r.days as i64) / DAYS_PER_MONTH;
     r.days -= (wholemonth * DAYS_PER_MONTH) as i32;
-    r.months = r.months.wrapping_add(wholemonth as i32);
+    r.months = add_i32(r.months, wholemonth)?;
     // Reconcile so all three fields share a sign (month over day over time).
     if r.months > 0 && (r.days < 0 || (r.days == 0 && r.usec < 0)) {
         r.days += DAYS_PER_MONTH as i32;
@@ -385,7 +394,7 @@ pub fn justify_interval(iv: Interval) -> Interval {
         r.months += 1;
     }
     reconcile_day_time(&mut r);
-    r
+    Ok(r)
 }
 
 fn reconcile_day_time(r: &mut Interval) {
@@ -512,8 +521,8 @@ pub fn extract(unit: &str, iv: Interval) -> Result<Option<NumericVal>, IntervalE
     let (_, _, sec, fsec) = split_time(iv.usec);
     let sub_usec = sec * USECS_PER_SEC + fsec;
     let s = match unit.as_str() {
-        "second" => fixed_point(sub_usec, 6),
-        "milliseconds" => fixed_point(sub_usec, 3),
+        "second" => crate::timestamp::fixed_point(sub_usec, 6),
+        "milliseconds" => crate::timestamp::fixed_point(sub_usec, 3),
         "microseconds" => sub_usec.to_string(),
         "epoch" => format!("{:.6}", epoch_seconds(iv)),
         _ => (date_part(&unit, iv)?.expect("finite integer field is Some") as i64).to_string(),
@@ -544,19 +553,6 @@ fn epoch_seconds(iv: Interval) -> f64 {
         + iv.usec as f64 / 1e6
 }
 
-/// Format `scaled` (a field value times `10^scale`) as fixed-point with `scale`
-/// fractional digits, keeping sign.
-fn fixed_point(scaled: i64, scale: usize) -> String {
-    let neg = scaled < 0;
-    let abs = scaled.unsigned_abs();
-    let denom = 10u64.pow(scale as u32);
-    let mut out = String::new();
-    if neg {
-        out.push('-');
-    }
-    out.push_str(&format!("{}.{:0width$}", abs / denom, abs % denom, width = scale));
-    out
-}
 
 // --- date_trunc ------------------------------------------------------------
 
@@ -725,11 +721,11 @@ pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, Interv
     let mut acc = Acc::default();
     if is_iso8601(trimmed) {
         parse_iso8601(trimmed, input, &mut acc)?;
-        return acc.finish();
+        return acc.finish(input);
     }
 
     let mut ago = false;
-    let mut pending: Option<(i64, f64)> = None;
+    let mut pending: Option<(i128, f64)> = None;
     for tok in trimmed.split_whitespace() {
         let tl = tok.to_ascii_lowercase();
         if tl == "ago" {
@@ -775,7 +771,7 @@ pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, Interv
     if ago {
         acc.negate();
     }
-    acc.finish()
+    acc.finish(input)
 }
 
 /// The `i128` accumulator the parser fills; `finish` range-checks it down to
@@ -802,17 +798,20 @@ impl Acc {
         self.days = -self.days;
         self.usec = -self.usec;
     }
-    fn finish(self) -> Result<Interval, IntervalError> {
+    /// Narrow the accumulator to the stored field widths. A field that does not
+    /// fit is PG's "interval field value out of range" (22015), carrying the
+    /// original input text.
+    fn finish(self, input: &str) -> Result<Interval, IntervalError> {
         Ok(Interval {
-            months: i32::try_from(self.months).map_err(|_| out_of_range())?,
-            days: i32::try_from(self.days).map_err(|_| out_of_range())?,
-            usec: i64::try_from(self.usec).map_err(|_| out_of_range())?,
+            months: i32::try_from(self.months).map_err(|_| field_value_out_of_range(input))?,
+            days: i32::try_from(self.days).map_err(|_| field_value_out_of_range(input))?,
+            usec: i64::try_from(self.usec).map_err(|_| field_value_out_of_range(input))?,
         })
     }
 }
 
 fn flush_pending(
-    pending: &mut Option<(i64, f64)>,
+    pending: &mut Option<(i128, f64)>,
     default: Unit,
     acc: &mut Acc,
     _input: &str,
@@ -824,34 +823,36 @@ fn flush_pending(
 }
 
 /// Apply a `(whole, frac)` number in `unit` to the accumulator, cascading any
-/// fractional part into finer units exactly as PG's `DecodeInterval` does.
-fn apply(n: (i64, f64), unit: Unit, acc: &mut Acc) {
+/// fractional part into finer units the same way PG's interval input does. The
+/// whole part is `i128` so an out-of-range field is caught by `Acc::finish`
+/// rather than overflowing here.
+fn apply(n: (i128, f64), unit: Unit, acc: &mut Acc) {
     let (val, fval) = n;
     match unit {
-        Unit::Microsecond => acc.add_usec(val as i128 + fval.round_ties_even() as i128),
+        Unit::Microsecond => acc.add_usec(val + fval.round_ties_even() as i128),
         Unit::Millisecond => acc.add_usec(((val as f64 + fval) * 1000.0).round_ties_even() as i128),
         Unit::Second => {
-            acc.add_usec(val as i128 * USECS_PER_SEC as i128);
+            acc.add_usec(val * USECS_PER_SEC as i128);
             acc.add_usec((fval * USECS_PER_SEC as f64).round_ties_even() as i128);
         }
         Unit::Minute => {
-            acc.add_usec(val as i128 * USECS_PER_MINUTE as i128);
+            acc.add_usec(val * USECS_PER_MINUTE as i128);
             adjust_fract_seconds(fval, 60.0, acc);
         }
         Unit::Hour => {
-            acc.add_usec(val as i128 * USECS_PER_HOUR as i128);
+            acc.add_usec(val * USECS_PER_HOUR as i128);
             adjust_fract_seconds(fval, 3600.0, acc);
         }
         Unit::Day => {
-            acc.add_days(val as i128);
+            acc.add_days(val);
             adjust_fract_seconds(fval, SECS_PER_DAY as f64, acc);
         }
         Unit::Week => {
-            acc.add_days(val as i128 * 7);
+            acc.add_days(val * 7);
             adjust_fract_days(fval, 7.0, acc);
         }
         Unit::Month => {
-            acc.add_months(val as i128);
+            acc.add_months(val);
             adjust_fract_days(fval, DAYS_PER_MONTH as f64, acc);
         }
         Unit::Year => apply_scaled_months(val, fval, MONTHS_PER_YEAR, acc),
@@ -863,8 +864,8 @@ fn apply(n: (i64, f64), unit: Unit, acc: &mut Acc) {
 
 /// Year/decade/century/millennium: the whole part scales to months exactly, the
 /// fraction to a (truncated) month count, as PG does (no finer cascade).
-fn apply_scaled_months(val: i64, fval: f64, months_per: i64, acc: &mut Acc) {
-    acc.add_months(val as i128 * months_per as i128);
+fn apply_scaled_months(val: i128, fval: f64, months_per: i64, acc: &mut Acc) {
+    acc.add_months(val * months_per as i128);
     if fval != 0.0 {
         acc.add_months((fval * months_per as f64) as i128);
     }
@@ -896,17 +897,27 @@ fn split_num_unit(tok: &str) -> (&str, &str) {
 
 /// Parse a signed decimal into `(whole, frac)` where both carry the sign
 /// (`-1.5` → `(-1, -0.5)`), so a fractional value with a zero whole keeps it.
-fn parse_number(s: &str, input: &str) -> Result<(i64, f64), IntervalError> {
+/// The whole part is `i128` so a value beyond `i64` is a field-overflow (22015),
+/// not a syntax error, and still narrows to the stored width in `Acc::finish`.
+fn parse_number(s: &str, input: &str) -> Result<(i128, f64), IntervalError> {
     let neg = s.starts_with('-');
     let body = s.trim_start_matches(['+', '-']);
     if body.is_empty() {
         return Err(invalid_syntax(input));
     }
     let (int_str, frac_str) = body.split_once('.').unwrap_or((body, ""));
-    let int_part: i64 = if int_str.is_empty() {
+    let int_part: i128 = if int_str.is_empty() {
         0
     } else {
-        int_str.parse().map_err(|_| invalid_syntax(input))?
+        int_str.parse().map_err(|_| {
+            // All-digit but unparseable means it overflowed i128 — a field value
+            // out of range, as PG reports; anything else is a syntax error.
+            if int_str.bytes().all(|b| b.is_ascii_digit()) {
+                field_value_out_of_range(input)
+            } else {
+                invalid_syntax(input)
+            }
+        })?
     };
     let frac: f64 = if frac_str.is_empty() {
         0.0
@@ -936,7 +947,7 @@ fn parse_time_token(tok: &str, input: &str) -> Result<i64, IntervalError> {
             let (whole, frac) = secpart.split_once('.').unwrap_or((secpart, ""));
             (
                 whole.parse().map_err(|_| syntax())?,
-                parse_fraction(frac).ok_or_else(syntax)?,
+                crate::timestamp::parse_fraction(frac).ok_or_else(syntax)?,
             )
         }
     };
@@ -946,31 +957,14 @@ fn parse_time_token(tok: &str, input: &str) -> Result<i64, IntervalError> {
     if min > 59 || sec > 60 {
         return Err(field_value_out_of_range(input));
     }
-    let usec = hour * USECS_PER_HOUR + min * USECS_PER_MINUTE + sec * USECS_PER_SEC + fsec;
+    // Compute in i128 so a large hours field (`hour * USECS_PER_HOUR`) can't
+    // overflow i64 and panic; a result beyond i64 is a field-value overflow.
+    let usec = hour as i128 * USECS_PER_HOUR as i128
+        + min as i128 * USECS_PER_MINUTE as i128
+        + sec as i128 * USECS_PER_SEC as i128
+        + fsec as i128;
+    let usec = i64::try_from(usec).map_err(|_| field_value_out_of_range(input))?;
     Ok(if neg { -usec } else { usec })
-}
-
-/// Fractional-seconds string → microseconds, rounding a 7th+ digit half-up.
-fn parse_fraction(frac: &str) -> Option<i64> {
-    if frac.is_empty() {
-        return Some(0);
-    }
-    if !frac.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let mut micros = 0i64;
-    for i in 0..6 {
-        micros *= 10;
-        if let Some(b) = frac.as_bytes().get(i) {
-            micros += (b - b'0') as i64;
-        }
-    }
-    if let Some(&b) = frac.as_bytes().get(6)
-        && b >= b'5'
-    {
-        micros += 1;
-    }
-    Some(micros)
 }
 
 /// The SQL-standard `Y-M` year-month token → total months (a leading `-` makes
@@ -1104,7 +1098,7 @@ mod tests {
         assert!(add(POS_INFINITY, NEG_INFINITY).is_err());
         assert_eq!(mul(POS_INFINITY, 2.0).unwrap(), POS_INFINITY);
         assert!(mul(POS_INFINITY, 0.0).is_err());
-        assert_eq!(justify_interval(POS_INFINITY), POS_INFINITY);
+        assert_eq!(justify_interval(POS_INFINITY).unwrap(), POS_INFINITY);
     }
 
     #[test]
@@ -1129,9 +1123,12 @@ mod tests {
 
     #[test]
     fn justify() {
-        assert_eq!(format(justify_days(iv("35 days"))), "1 mon 5 days");
-        assert_eq!(format(justify_hours(iv("27 hours"))), "1 day 03:00:00");
-        assert_eq!(format(justify_interval(iv("1 mon 33 days 27 hours"))), "2 mons 4 days 03:00:00");
+        assert_eq!(format(justify_days(iv("35 days")).unwrap()), "1 mon 5 days");
+        assert_eq!(format(justify_hours(iv("27 hours")).unwrap()), "1 day 03:00:00");
+        assert_eq!(
+            format(justify_interval(iv("1 mon 33 days 27 hours")).unwrap()),
+            "2 mons 4 days 03:00:00"
+        );
     }
 
     #[test]
@@ -1172,8 +1169,27 @@ mod tests {
     #[test]
     fn errors() {
         assert_eq!(parse("garbage").unwrap_err().sqlstate, "22007");
-        assert_eq!(parse("2147483648 mons").unwrap_err().sqlstate, "22008");
+        // A field beyond i32 is PG's "interval field value out of range" (22015).
+        assert_eq!(parse("2147483648 mons").unwrap_err().sqlstate, "22015");
         assert_eq!(format(iv("2147483647 mons")), "178956970 years 7 mons");
+    }
+
+    #[test]
+    fn overflow_errors_instead_of_panicking() {
+        // Regression: these all used to overflow i64/i32 and panic (or wrap);
+        // each must now return a clean error, matching PG.
+        // A huge hours field in the colon form (was: i64 overflow panic).
+        assert_eq!(parse("3000000000:00:00").unwrap_err().sqlstate, "22015");
+        // A bare integer beyond i64 (was: reported as 22007 syntax error).
+        assert_eq!(parse("99999999999999999999 days").unwrap_err().sqlstate, "22015");
+        // A field beyond i32 (was: silently narrowed).
+        assert_eq!(parse("3000000000 days").unwrap_err().sqlstate, "22015");
+        assert_eq!(parse("3000000000 mons").unwrap_err().sqlstate, "22015");
+        // justify carrying past i32 (was: wrapping_add → silent wrong value).
+        let big = Interval { months: 0, days: i32::MAX, usec: USECS_PER_DAY };
+        assert!(justify_hours(big).is_err());
+        let big_days = Interval { months: i32::MAX, days: 40, usec: 0 };
+        assert!(justify_days(big_days).is_err());
     }
 
     #[test]

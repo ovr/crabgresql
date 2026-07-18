@@ -155,10 +155,14 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             .map(Value::Interval)
             .map_err(iv_err);
         }
-        ScalarFn::JustifyDays => return Ok(Value::Interval(interval::justify_days(iv(&args[0])))),
-        ScalarFn::JustifyHours => return Ok(Value::Interval(interval::justify_hours(iv(&args[0])))),
+        ScalarFn::JustifyDays => {
+            return interval::justify_days(iv(&args[0])).map(Value::Interval).map_err(iv_err);
+        }
+        ScalarFn::JustifyHours => {
+            return interval::justify_hours(iv(&args[0])).map(Value::Interval).map_err(iv_err);
+        }
         ScalarFn::JustifyInterval => {
-            return Ok(Value::Interval(interval::justify_interval(iv(&args[0]))));
+            return interval::justify_interval(iv(&args[0])).map(Value::Interval).map_err(iv_err);
         }
         ScalarFn::Age => {
             return timestamp::age(ts(&args[0]), ts(&args[1])).map(Value::Interval).map_err(ts_err);
