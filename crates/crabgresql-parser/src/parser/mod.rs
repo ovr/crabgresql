@@ -5288,6 +5288,10 @@ impl<'a> Parser<'a> {
 
         // parse: [ argname ] argtype
         let mut name = None;
+        // Start location of the argument's type token, for the "argument type …
+        // is only a shell" NOTICE caret. For a bare (unnamed) argument — the
+        // only case that reaches that NOTICE — this is exactly the type token.
+        let type_start = self.peek_token().span.start;
         let mut data_type = self.parse_data_type()?;
 
         // To check whether the first token is a name or a type, we need to
@@ -5330,6 +5334,7 @@ impl<'a> Parser<'a> {
             mode,
             name,
             data_type,
+            data_type_span: Span::new(type_start, type_start),
             default_expr,
         })
     }
@@ -5393,6 +5398,7 @@ impl<'a> Parser<'a> {
             mode,
             name,
             data_type,
+            data_type_span: Span::empty(),
             default_expr: None,
         })
     }

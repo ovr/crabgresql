@@ -8565,6 +8565,10 @@ pub struct OperateFunctionArg {
     pub name: Option<Ident>,
     /// The data type of the argument.
     pub data_type: DataType,
+    /// Source span of the data type token (its start `Location` is where PG
+    /// points a "argument type … is only a shell" NOTICE caret). Empty when the
+    /// argument was built programmatically rather than parsed.
+    pub data_type_span: Span,
     /// Optional default expression for the argument.
     pub default_expr: Option<Expr>,
 }
@@ -8576,6 +8580,7 @@ impl OperateFunctionArg {
             mode: None,
             name: None,
             data_type,
+            data_type_span: Span::empty(),
             default_expr: None,
         }
     }
@@ -8586,6 +8591,7 @@ impl OperateFunctionArg {
             mode: None,
             name: Some(name.into()),
             data_type,
+            data_type_span: Span::empty(),
             default_expr: None,
         }
     }

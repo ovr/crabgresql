@@ -55,6 +55,11 @@ impl TypeRef {
 pub struct CatalogNotice {
     pub message: String,
     pub detail: Option<String>,
+    /// 1-based (line, column) of the token this NOTICE points at, when PG
+    /// renders a `LINE n:` cursor excerpt (e.g. the argument type of an
+    /// "argument type … is only a shell" NOTICE). Converted to a wire character
+    /// offset when the NOTICE is sent.
+    pub position: Option<(u64, u64)>,
 }
 
 impl CatalogNotice {
@@ -62,11 +67,17 @@ impl CatalogNotice {
         Self {
             message: message.into(),
             detail: None,
+            position: None,
         }
     }
 
     fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    fn with_position(mut self, position: (u64, u64)) -> Self {
+        self.position = Some(position);
         self
     }
 }
@@ -244,10 +255,12 @@ impl GlobalCatalog {
     /// `CREATE FUNCTION ... LANGUAGE internal AS '<internal_name>'`. Validates the
     /// internal name, registers the function, records its type dependencies, and
     /// returns any "argument/return type is only a shell" NOTICEs.
+    /// `args` pairs each argument type with the 1-based (line, column) of its
+    /// type token, when known — used to point the argument-shell NOTICE's caret.
     pub fn create_function(
         &self,
         name: &str,
-        args: Vec<TypeRef>,
+        args: Vec<(TypeRef, Option<(u64, u64)>)>,
         ret: TypeRef,
         internal_name: &str,
     ) -> Result<Vec<CatalogNotice>, PgError> {
@@ -258,11 +271,13 @@ impl GlobalCatalog {
             ));
         }
 
+        let arg_types: Vec<TypeRef> = args.iter().map(|(ty, _)| ty.clone()).collect();
+
         let mut cat = self.inner.write().unwrap();
 
         // A function may not be redefined with the same name and argument types.
-        if cat.funcs.iter().any(|f| f.name == name && f.args == args) {
-            let arglist: Vec<String> = args.iter().map(TypeRef::display_name).collect();
+        if cat.funcs.iter().any(|f| f.name == name && f.args == arg_types) {
+            let arglist: Vec<String> = arg_types.iter().map(TypeRef::display_name).collect();
             return Err(PgError::new(
                 sqlstate::DUPLICATE_FUNCTION,
                 format!(
@@ -275,6 +290,8 @@ impl GlobalCatalog {
         let mut notices = Vec::new();
 
         // PG reports a shell reference for the return type first, then arguments.
+        // The return-type NOTICE carries no cursor position (PG prints no caret
+        // for it); each argument NOTICE points at its type token.
         if let TypeRef::User(tname) = &ret
             && cat.types.get(tname).is_some_and(|e| !e.defined)
         {
@@ -282,19 +299,22 @@ impl GlobalCatalog {
                 "return type {tname} is only a shell"
             )));
         }
-        for arg in &args {
+        for (arg, position) in &args {
             if let TypeRef::User(tname) = arg
                 && cat.types.get(tname).is_some_and(|e| !e.defined)
             {
-                notices.push(CatalogNotice::new(format!(
-                    "argument type {tname} is only a shell"
-                )));
+                let mut notice =
+                    CatalogNotice::new(format!("argument type {tname} is only a shell"));
+                if let Some(pos) = position {
+                    notice = notice.with_position(*pos);
+                }
+                notices.push(notice);
             }
         }
 
         let oid = cat.alloc_oid();
         // Every user type mentioned in the signature depends on this function.
-        for tref in std::iter::once(&ret).chain(args.iter()) {
+        for tref in std::iter::once(&ret).chain(arg_types.iter()) {
             if let TypeRef::User(tname) = tref {
                 cat.add_dependent(tname, DepId::Func(oid));
             }
@@ -302,7 +322,7 @@ impl GlobalCatalog {
         cat.funcs.push(FuncEntry {
             oid,
             name: name.to_string(),
-            args,
+            args: arg_types,
         });
         Ok(notices)
     }
@@ -568,7 +588,7 @@ mod tests {
         let in_notices = cat
             .create_function(
                 "xfloat8in",
-                vec![TypeRef::Cstring],
+                vec![(TypeRef::Cstring, None)],
                 TypeRef::User("xfloat8".into()),
                 "int8in",
             )
@@ -577,7 +597,7 @@ mod tests {
         let out_notices = cat
             .create_function(
                 "xfloat8out",
-                vec![TypeRef::User("xfloat8".into())],
+                vec![(TypeRef::User("xfloat8".into()), Some((1, 28)))],
                 TypeRef::Cstring,
                 "int8out",
             )
@@ -586,6 +606,9 @@ mod tests {
             out_notices[0].message,
             "argument type xfloat8 is only a shell"
         );
+        // The argument NOTICE carries the type token's (line, column) for the
+        // client's `LINE n:` caret; the return-type NOTICE (above) does not.
+        assert_eq!(out_notices[0].position, Some((1, 28)));
         cat.define_type("xfloat8", 8).unwrap();
         cat.create_cast(
             TypeRef::User("xfloat8".into()),
@@ -619,7 +642,7 @@ mod tests {
         cat.create_shell_type("solo").unwrap();
         cat.create_function(
             "solo_in",
-            vec![TypeRef::Cstring],
+            vec![(TypeRef::Cstring, None)],
             TypeRef::User("solo".into()),
             "int8in",
         )
@@ -710,7 +733,7 @@ mod tests {
     fn unknown_internal_function_is_rejected() {
         let cat = GlobalCatalog::new();
         let err = cat
-            .create_function("f", vec![TypeRef::Cstring], TypeRef::Builtin(PgType::Int8), "nope")
+            .create_function("f", vec![(TypeRef::Cstring, None)], TypeRef::Builtin(PgType::Int8), "nope")
             .unwrap_err();
         assert_eq!(err.code, sqlstate::UNDEFINED_FUNCTION);
         assert_eq!(err.message, "there is no built-in function named \"nope\"");
@@ -724,7 +747,7 @@ mod tests {
         assert!(
             cat.create_function(
                 "xd_in",
-                vec![TypeRef::Cstring],
+                vec![(TypeRef::Cstring, None)],
                 TypeRef::User("xd".into()),
                 "date_in",
             )

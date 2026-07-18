@@ -3,8 +3,8 @@
 -- Bootstraps a user-defined base type the way PostgreSQL's own catalog does: a
 -- shell type, its internal C I/O functions, the filled-in base type, a binary-
 -- coercible cast, then a cascading drop. Output hand-checked against PostgreSQL
--- (psql -a -q); the argument-shell NOTICE's LINE/caret is omitted, matching the
--- runner's notice rendering.
+-- (psql -a -q), including the argument-shell NOTICE's LINE/caret excerpt (the
+-- long CREATE FUNCTION line is truncated to 60 columns with a trailing `...`).
 --
 -- A bare CREATE TYPE makes a placeholder "shell" type (no NOTICE of its own).
 CREATE TYPE xfloat8;

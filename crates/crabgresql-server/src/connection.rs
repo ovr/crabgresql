@@ -151,7 +151,7 @@ async fn run_simple_query(
         let efd = session.extra_float_digits;
         match execute_statement(engine, catalog, txnmgr, stmt, session) {
             Ok(result) => {
-                if write_result(writer, result, efd).await? == WriteOutcome::Errored {
+                if write_result(writer, result, efd, sql).await? == WriteOutcome::Errored {
                     mark_transaction_failed(session);
                     return Ok(());
                 }
@@ -210,6 +210,7 @@ async fn write_result(
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
     result: QueryResult,
     efd: i32,
+    sql: &str,
 ) -> Result<WriteOutcome, ProtocolError> {
     match result {
         QueryResult::Command { tag, notices } => {
@@ -221,7 +222,9 @@ async fn write_result(
                         notice.code,
                         &notice.message,
                         notice.detail.as_deref(),
-                        None,
+                        notice
+                            .location
+                            .map(|(line, col)| char_position(sql, line, col)),
                     ),
                 }
             }

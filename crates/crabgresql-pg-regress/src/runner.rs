@@ -199,7 +199,7 @@ fn render_events(out: &mut String, events: &[QueryEvent], query: &str) {
             }
             QueryEvent::EmptyQuery => {}
             QueryEvent::Error(error) => out.push_str(&format::format_error(error, query)),
-            QueryEvent::Notice(notice) => out.push_str(&format::format_notice(notice)),
+            QueryEvent::Notice(notice) => out.push_str(&format::format_notice(notice, query)),
         }
     }
 }
