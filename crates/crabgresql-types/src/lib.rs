@@ -337,7 +337,13 @@ impl Value {
                 Some(out)
             }
             Value::Bit { len, bits } => {
-                Some(format!("{:0width$b}", bits, width = *len as usize))
+                // A zero-length bit string (`X''`) prints as the empty string;
+                // Rust's `{:b}` would otherwise emit a lone "0" for the value.
+                Some(if *len == 0 {
+                    String::new()
+                } else {
+                    format!("{:0width$b}", bits, width = *len as usize)
+                })
             }
             Value::Date(d) => Some(date::format(*d)),
             Value::Time(usec) => Some(time::format(*usec)),

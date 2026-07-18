@@ -73,7 +73,7 @@ async fn hex_string_literals_bind_display_and_cast() {
     let client = connect(spawn_server().await).await;
     let messages = client
         .simple_query(
-            "SELECT X'00000001', X'FF', X'00000001'::int4, X'FFFFFFFF'::int4",
+            "SELECT X'00000001', X'FF', X'00000001'::int4, X'FFFFFFFF'::int4, X''",
         )
         .await
         .unwrap();
@@ -85,6 +85,8 @@ async fn hex_string_literals_bind_display_and_cast() {
     // bit -> int4 reinterprets the bits as two's-complement.
     assert_eq!(row.get(2), Some("1"));
     assert_eq!(row.get(3), Some("-1"));
+    // A zero-length bit string prints as the empty string, as in PG.
+    assert_eq!(row.get(4), Some(""));
 }
 
 #[tokio::test]

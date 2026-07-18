@@ -529,6 +529,37 @@ fn unsupported_expr(expr: &ast::Expr) -> BindError {
     BindError::feature_not_supported(format!("expression is not supported yet: {expr}"))
 }
 
+/// Types the executor's `compare_values` can order. Both comparison operators
+/// (`=`, `<`, …) and ORDER BY require this — binding a sort or comparison on any
+/// other type would produce a node the evaluator can't handle. `bit` is absent
+/// until bit comparison lands, even though PG orders it.
+pub(crate) fn is_orderable(ty: PgType) -> bool {
+    matches!(
+        ty,
+        PgType::Bool
+            | PgType::Int2
+            | PgType::Int4
+            | PgType::Int8
+            | PgType::Float4
+            | PgType::Float8
+            | PgType::Numeric
+            | PgType::Text
+            | PgType::Varchar
+            | PgType::Bpchar
+            | PgType::Name
+            | PgType::Bytea
+            | PgType::Date
+            | PgType::Time
+            | PgType::TimeTz
+            | PgType::Timestamp
+            | PgType::Interval
+            | PgType::TimestampTz
+            | PgType::Uuid
+            | PgType::Inet
+            | PgType::Cidr
+    )
+}
+
 fn bind_value(value: &ast::ValueWithSpan) -> Result<Binding, BindError> {
     match &value.value {
         ast::Value::Number(n, _) => parse_number(n).map(Binding::Typed),
@@ -549,19 +580,29 @@ fn bind_value(value: &ast::ValueWithSpan) -> Result<Binding, BindError> {
         }),
         ast::Value::HexStringLiteral(s) => {
             // X'...' is a bit(n) value with n = 4 * hex digits, right-aligned in
-            // `bits`. Value::Bit stores bits in a u64, so we cap at 16 hex digits
-            // (64 bits) — PG supports arbitrary width, but that's out of scope here.
+            // `bits`. The tokenizer does not validate the content, so reject any
+            // non-hex character first, matching PG's `bit_in`: a data exception
+            // (22P02) naming the first offending character. This also rejects the
+            // leading `+`/`-` that `u64::from_str_radix` would otherwise accept.
+            if let Some(bad) = s.chars().find(|c| !c.is_ascii_hexdigit()) {
+                return Err(BindError::new(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    format!("\"{bad}\" is not a valid hexadecimal digit"),
+                ));
+            }
+            // Value::Bit stores bits in a u64, so we cap at 16 hex digits (64
+            // bits) — PG supports arbitrary width, but that's out of scope here.
             if s.len() > 16 {
                 return Err(BindError::feature_not_supported(format!(
                     "hex string literal wider than 64 bits is not supported yet: X'{s}'"
                 )));
             }
+            // Every character validated as an ASCII hex digit above, and the
+            // width fits u64, so parsing cannot fail (empty string is bit(0)).
             let bits = if s.is_empty() {
                 0
             } else {
-                u64::from_str_radix(s, 16).map_err(|_| {
-                    BindError::feature_not_supported(format!("invalid hex string literal: X'{s}'"))
-                })?
+                u64::from_str_radix(s, 16).expect("validated hex digits within 64 bits")
             };
             Ok(Binding::Typed(BoundExpr::Const {
                 value: Value::Bit {
@@ -1417,30 +1458,7 @@ fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindEr
             || matches!(arg_ty, PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Numeric);
         numeric_arith && mod_ok
     } else {
-        matches!(
-            arg_ty,
-            PgType::Bool
-                | PgType::Int2
-                | PgType::Int4
-                | PgType::Int8
-                | PgType::Float4
-                | PgType::Float8
-                | PgType::Numeric
-                | PgType::Text
-                | PgType::Varchar
-                | PgType::Bpchar
-                | PgType::Name
-                | PgType::Bytea
-                | PgType::Date
-                | PgType::Time
-                | PgType::TimeTz
-                | PgType::Timestamp
-                | PgType::Interval
-                | PgType::TimestampTz
-                | PgType::Uuid
-                | PgType::Inet
-                | PgType::Cidr
-        )
+        is_orderable(arg_ty)
     };
     if !supported {
         return Err(no_operator(arg_ty.name(), op, arg_ty.name()));
