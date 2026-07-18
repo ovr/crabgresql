@@ -1,0 +1,288 @@
+--
+-- TIMESTAMPTZ
+-- timestamp with time zone: input parsing (offsets, named zones, abbreviations),
+-- UTC output (+00), comparisons, casts, the field functions, make_timestamptz,
+-- and AT TIME ZONE. The display zone is UTC, so output always shows a +00
+-- offset. Output hand-checked against PostgreSQL's aligned format.
+--
+-- Render everything in UTC so the output is deterministic.
+SET timezone = 'UTC';
+-- output formatting: ISO datestyle with a +00 offset, fractional seconds trimmed
+SELECT timestamptz '2001-02-16 20:38:40+00' AS plain;
+         plain          
+------------------------
+ 2001-02-16 20:38:40+00
+(1 row)
+
+SELECT timestamptz '2001-02-16 20:38:40.5+00' AS half,
+       timestamptz '2001-02-16 20:38:40.999999+00' AS micros,
+       timestamptz '2001-02-16 20:38:40.000001+00' AS tiny;
+           half           |            micros             |             tiny              
+--------------------------+-------------------------------+-------------------------------
+ 2001-02-16 20:38:40.5+00 | 2001-02-16 20:38:40.999999+00 | 2001-02-16 20:38:40.000001+00
+(1 row)
+
+-- a trailing offset is converted to UTC; several spellings of -08:00
+SELECT timestamptz '1997-02-10 17:32:01-08' AS off_hh,
+       timestamptz '1997-02-10 17:32:01-0800' AS off_hhmm,
+       timestamptz '1997-02-10 17:32:01 -08:00' AS off_colon;
+         off_hh         |        off_hhmm        |       off_colon        
+------------------------+------------------------+------------------------
+ 1997-02-11 01:32:01+00 | 1997-02-11 01:32:01+00 | 1997-02-11 01:32:01+00
+(1 row)
+
+-- ISO 8601 'T' with an attached offset or Z
+SELECT timestamptz '2001-09-22T18:19:20-07:00' AS iso_off,
+       timestamptz '2001-09-22T18:19:20Z' AS iso_zulu;
+        iso_off         |        iso_zulu        
+------------------------+------------------------
+ 2001-09-23 01:19:20+00 | 2001-09-22 18:19:20+00
+(1 row)
+
+-- named zones and abbreviations resolve (DST-aware); rendered back in UTC
+SELECT timestamptz '1997-02-10 17:32:01 America/New_York' AS est,
+       timestamptz '1997-07-10 17:32:01 America/New_York' AS edt,
+       timestamptz '1997-02-10 17:32:01 PST' AS pst,
+       timestamptz '1997-02-10 17:32:01 UTC' AS utc;
+          est           |          edt           |          pst           |          utc           
+------------------------+------------------------+------------------------+------------------------
+ 1997-02-10 22:32:01+00 | 1997-07-10 21:32:01+00 | 1997-02-11 01:32:01+00 | 1997-02-10 17:32:01+00
+(1 row)
+
+-- a date with no time defaults to midnight UTC
+SELECT timestamptz '1997-01-02' AS date_only;
+       date_only        
+------------------------
+ 1997-01-02 00:00:00+00
+(1 row)
+
+-- special values and a BC year
+SELECT timestamptz 'infinity' AS pos, timestamptz '-infinity' AS neg, timestamptz 'epoch' AS unix;
+   pos    |    neg    |          unix          
+----------+-----------+------------------------
+ infinity | -infinity | 1970-01-01 00:00:00+00
+(1 row)
+
+SELECT timestamptz '0097-02-16 20:00:00+00 BC' AS bc;
+            bc             
+---------------------------
+ 0097-02-16 20:00:00+00 BC
+(1 row)
+
+SELECT timestamptz 'infinity' = timestamptz '+infinity' AS inf_eq;
+ inf_eq 
+--------
+ t
+(1 row)
+
+-- the default column name of a typed literal is the type name
+SELECT timestamptz '2001-02-16 20:38:40+00';
+      timestamptz       
+------------------------
+ 2001-02-16 20:38:40+00
+(1 row)
+
+-- comparisons drive WHERE and ORDER BY; offsets are normalized before comparing
+SELECT timestamptz '2001-01-01 00:00:00-08' = timestamptz '2001-01-01 08:00:00+00' AS eq,
+       timestamptz '2001-01-01+00' < timestamptz '2002-01-01+00' AS lt,
+       timestamptz '-infinity' < timestamptz '2000-01-01+00' AS neg_inf_first;
+ eq | lt | neg_inf_first 
+----+----+---------------
+ t  | t  | t
+(1 row)
+
+-- casts both directions; timestamp<->timestamptz reinterpret in UTC
+SELECT '2001-02-16 20:38:40-05'::timestamptz AS from_text;
+       from_text        
+------------------------
+ 2001-02-17 01:38:40+00
+(1 row)
+
+SELECT (timestamptz '2001-02-16 20:38:40+00')::text AS to_text;
+        to_text         
+------------------------
+ 2001-02-16 20:38:40+00
+(1 row)
+
+SELECT (timestamp '2001-02-16 20:38:40')::timestamptz AS ts_to_tstz;
+       ts_to_tstz       
+------------------------
+ 2001-02-16 20:38:40+00
+(1 row)
+
+SELECT (timestamptz '2001-02-16 20:38:40+00')::timestamp AS tstz_to_ts;
+     tstz_to_ts      
+---------------------
+ 2001-02-16 20:38:40
+(1 row)
+
+-- a timestamptz column: insert, filter, order
+CREATE TABLE tstz_tbl (id int4, d1 timestamptz);
+INSERT INTO tstz_tbl VALUES (1, '1997-01-02 03:04:05-08'), (2, '2001-09-22 18:19:20+00'),
+                            (3, '1997-02-10 17:32:01 America/New_York');
+SELECT id, d1 FROM tstz_tbl WHERE d1 < timestamptz '2000-01-01+00' ORDER BY 2;
+ id |           d1           
+----+------------------------
+  1 | 1997-01-02 11:04:05+00
+  3 | 1997-02-10 22:32:01+00
+(2 rows)
+
+SELECT id FROM tstz_tbl WHERE d1 = timestamptz '2001-09-22 18:19:20+00';
+ id 
+----
+  2
+(1 row)
+
+-- date_part (float8): calendar fields read from the UTC wall clock
+SELECT date_part('year', timestamptz '2001-02-16 20:38:40+00') AS year,
+       date_part('hour', timestamptz '2001-02-16 20:38:40+00') AS hour,
+       date_part('epoch', timestamptz '2001-02-16 20:38:40+00') AS epoch;
+ year | hour |   epoch   
+------+------+-----------
+ 2001 |   20 | 982355920
+(1 row)
+
+-- the timezone group is 0 under the UTC display zone
+SELECT date_part('timezone', timestamptz '2001-02-16 20:38:40+00') AS tz,
+       date_part('timezone_hour', timestamptz '2001-02-16 20:38:40+00') AS tzh,
+       date_part('timezone_minute', timestamptz '2001-02-16 20:38:40+00') AS tzm;
+ tz | tzh | tzm 
+----+-----+-----
+  0 |   0 |   0
+(1 row)
+
+-- extract (numeric) and the default column name "extract"
+SELECT extract(second from timestamptz '2001-02-16 20:38:40.5+00') AS second,
+       extract(epoch from timestamptz '2001-02-16 20:38:40.5+00') AS epoch;
+  second   |      epoch       
+-----------+------------------
+ 40.500000 | 982355920.500000
+(1 row)
+
+SELECT extract(year from timestamptz '2001-02-16 20:38:40+00');
+ extract 
+---------
+    2001
+(1 row)
+
+-- date_trunc returns timestamptz (still +00)
+SELECT date_trunc('hour', timestamptz '2001-02-16 20:38:40.5+00') AS hour,
+       date_trunc('day', timestamptz '2001-02-16 20:38:40.5+00') AS day;
+          hour          |          day           
+------------------------+------------------------
+ 2001-02-16 20:00:00+00 | 2001-02-16 00:00:00+00
+(1 row)
+
+SELECT date_trunc('day', timestamptz 'infinity') AS inf;
+   inf    
+----------
+ infinity
+(1 row)
+
+-- fields of an infinite value: monotonic fields are +/-Infinity, oscillating NULL
+SELECT date_part('year', timestamptz 'infinity') AS year,
+       extract(epoch from timestamptz '-infinity') AS neg_epoch,
+       extract(day from timestamptz 'infinity') AS day;
+   year   | neg_epoch | day 
+----------+-----------+-----
+ Infinity | -Infinity |    
+(1 row)
+
+-- isfinite and make_timestamptz (6-arg is UTC; 7-arg applies the zone)
+SELECT isfinite(timestamptz '2001-02-16+00') AS finite, isfinite(timestamptz 'infinity') AS not_finite;
+ finite | not_finite 
+--------+------------
+ t      | f
+(1 row)
+
+SELECT make_timestamptz(2013, 7, 15, 8, 15, 23.5) AS made_utc,
+       make_timestamptz(2013, 7, 15, 17, 15, 23, 'America/New_York') AS made_edt;
+         made_utc         |        made_edt        
+--------------------------+------------------------
+ 2013-07-15 08:15:23.5+00 | 2013-07-15 21:15:23+00
+(1 row)
+
+-- AT TIME ZONE both directions, and the timezone() function form
+SELECT timestamp '2001-02-16 20:38:40' AT TIME ZONE 'America/New_York' AS ts_at_zone;
+       ts_at_zone       
+------------------------
+ 2001-02-17 01:38:40+00
+(1 row)
+
+SELECT timestamptz '2001-02-16 20:38:40+00' AT TIME ZONE 'America/New_York' AS tstz_at_zone;
+    tstz_at_zone     
+---------------------
+ 2001-02-16 15:38:40
+(1 row)
+
+SELECT timezone('America/New_York', timestamp '2001-02-16 20:38:40') AS fn_to_tstz,
+       timezone('America/New_York', timestamptz '2001-02-16 20:38:40+00') AS fn_to_ts;
+       fn_to_tstz       |      fn_to_ts       
+------------------------+---------------------
+ 2001-02-17 01:38:40+00 | 2001-02-16 15:38:40
+(1 row)
+
+-- a DST-varying zone across the 2011 Moscow spring-forward gap (+3 -> +4)
+SELECT timestamptz '2011-03-27 01:00:00 Europe/Moscow' AS msk_before_gap,
+       timestamptz '2011-03-27 03:00:00 Europe/Moscow' AS msk_after_gap;
+     msk_before_gap     |     msk_after_gap      
+------------------------+------------------------
+ 2011-03-26 22:00:00+00 | 2011-03-26 23:00:00+00
+(1 row)
+
+-- the non-throwing input API
+SELECT pg_input_is_valid('2001-02-16 20:38:40+00', 'timestamptz') AS ok,
+       pg_input_is_valid('garbage', 'timestamptz') AS bad,
+       pg_input_is_valid('2001-01-01 00:00 Nowhere/Nozone', 'timestamptz') AS bad_zone;
+ ok | bad | bad_zone 
+----+-----+----------
+ t  | f   | f
+(1 row)
+
+-- cross-type timestamp/timestamptz comparison and assignment resolve via the
+-- implicit cast (identity under the UTC display zone), as in PG
+SELECT timestamptz '2000-01-01 08:00:00+00' = timestamp '2000-01-01 08:00:00' AS tstz_eq_ts,
+       timestamp '2000-01-01 00:00:00' < timestamptz '2000-06-01 00:00:00+00' AS ts_lt_tstz;
+ tstz_eq_ts | ts_lt_tstz 
+------------+------------
+ t          | t
+(1 row)
+
+CREATE TABLE tstz_asgn (d1 timestamptz);
+INSERT INTO tstz_asgn VALUES (timestamp '2002-05-05 05:05:05');
+SELECT d1 FROM tstz_asgn;
+           d1           
+------------------------
+ 2002-05-05 05:05:05+00
+(1 row)
+
+-- out-of-range: a year past the range, an offset/constructor pushing past the
+-- boundary — all report 22008 rather than overflowing
+SELECT timestamptz '300000-01-01';
+ERROR:  timestamp out of range: "300000-01-01"
+LINE 1: SELECT timestamptz '300000-01-01';
+                           ^
+SELECT make_timestamptz(294276, 12, 31, 23, 0, 0, '-10');
+ERROR:  timestamp out of range
+SELECT timestamp '294276-12-31 23:59:59' AT TIME ZONE 'America/New_York';
+ERROR:  timestamp out of range
+-- errors: unparseable input 22007, unknown unit 22023, unknown zone; a bogus
+-- glued zone is a syntax error (not a silently-ignored zone); recovery works
+SELECT timestamptz 'garbage';
+ERROR:  invalid input syntax for type timestamp with time zone: "garbage"
+LINE 1: SELECT timestamptz 'garbage';
+                           ^
+SELECT timestamptz '2001-02-16+garbage';
+ERROR:  invalid input syntax for type timestamp with time zone: "2001-02-16+garbage"
+LINE 1: SELECT timestamptz '2001-02-16+garbage';
+                           ^
+SELECT date_part('bogus', timestamptz '2001-02-16+00');
+ERROR:  timestamp with time zone units "bogus" not recognized
+SELECT make_timestamptz(2013, 7, 15, 8, 15, 23, 'Nowhere/Nozone');
+ERROR:  time zone "Nowhere/Nozone" not recognized
+SELECT 'still alive' AS status;
+   status    
+-------------
+ still alive
+(1 row)
+

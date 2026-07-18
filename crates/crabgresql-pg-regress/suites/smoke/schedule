@@ -2,4 +2,5 @@ test: basic
 test: errors
 test: cast
 test: timestamp
+test: timestamptz
 test: case

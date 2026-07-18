@@ -23,6 +23,7 @@ pg-ryu = { path = "vendor/ryu" }
 # external
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 similar = "2"
 sqlparser = "0.62"
 thiserror = "2"

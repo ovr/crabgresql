@@ -3,7 +3,7 @@
 //! reproduces PG's *observable* cast results — including the SQLSTATE/message on
 //! range errors — as pinned by the regression corpus, implemented independently.
 
-use crate::{NumericVal, PgType, Value, float, parse_bool, timestamp};
+use crate::{NumericVal, PgType, Value, float, parse_bool, timestamp, timestamptz};
 
 /// SQLSTATE + message for a failed cast.
 #[derive(Clone, Debug, PartialEq)]
@@ -186,6 +186,21 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Text(s), PgType::Timestamp) => timestamp::parse(s)
             .map(Value::Timestamp)
             .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- text → timestamptz (timestamptz_in) ----
+        (Value::Text(s), PgType::TimestampTz) => timestamptz::parse(s)
+            .map(Value::TimestampTz)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- timestamp ↔ timestamptz ----
+        // With the session zone fixed to UTC these are an identity on the raw
+        // microseconds (the wall clock equals the UTC instant), infinities
+        // included. WARNING: this is correct ONLY because the session/display
+        // zone is always UTC. When a real `TimeZone` GUC is added these arms
+        // must convert using it — they will NOT fail on their own, so revisit
+        // here (and `timestamptz::{parse,format,make_timestamptz}`) at that time.
+        (Value::Timestamp(m), PgType::TimestampTz) => Ok(Value::TimestampTz(*m)),
+        (Value::TimestampTz(m), PgType::Timestamp) => Ok(Value::Timestamp(*m)),
 
         // ---- integer → numeric (exact) ----
         (Value::Int2(n), PgType::Numeric) => Ok(Value::Numeric(NumericVal::Finite(n.to_string()))),
