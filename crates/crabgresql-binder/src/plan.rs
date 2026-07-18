@@ -677,6 +677,15 @@ fn bind_order_by(
     for oe in exprs {
         // Resolve the item to (projected-tuple index, comparison type).
         let (column, ty) = order_by_target(&oe.expr, columns, scope, projections, allow_hidden)?;
+        // The executor's sort compares keys with `compare_values`, which panics
+        // on a type it can't order (e.g. `bit`). Reject such a key at bind time
+        // rather than aborting mid-sort.
+        if !crate::expr::is_orderable(ty) {
+            return Err(BindError::feature_not_supported(format!(
+                "ORDER BY on type {} is not supported yet",
+                ty.name()
+            )));
+        }
         let asc = oe.options.asc.unwrap_or(true);
         let nulls_first = oe.options.nulls_first.unwrap_or(!asc);
         keys.push(SortKey {
@@ -1647,6 +1656,60 @@ mod tests {
             panic!("expected numeric const, got {:?}", rows[0][0]);
         };
         assert_eq!(n.to_display(), "1.5");
+    }
+
+    #[test]
+    fn hex_literal_binds_as_bit() {
+        // X'...' is a bit(n) value with n = 4 * hex digits.
+        assert_eq!(
+            one_projection("SELECT X'00000001'"),
+            BoundExpr::Const { value: Value::Bit { len: 32, bits: 1 }, ty: PgType::Bit }
+        );
+        // Lowercase hex parses too.
+        assert_eq!(
+            one_projection("SELECT X'ff'"),
+            BoundExpr::Const { value: Value::Bit { len: 8, bits: 0xff }, ty: PgType::Bit }
+        );
+    }
+
+    #[test]
+    fn hex_literal_too_wide_is_rejected() {
+        // 17 hex digits = 68 bits, past the u64 backing of Value::Bit.
+        let e = bind_err("SELECT X'FFFFFFFFFFFFFFFFF'");
+        assert_eq!(e.code, "0A000");
+    }
+
+    #[test]
+    fn hex_literal_with_bad_digit_is_data_exception() {
+        // PG's bit_in reports 22P02 naming the first non-hex character; a leading
+        // sign (which u64::from_str_radix would accept) is rejected the same way.
+        for (sql, bad) in [
+            ("SELECT X'GG'", "G"),
+            ("SELECT X'+1'", "+"),
+            ("SELECT X'-1'", "-"),
+            ("SELECT X'1 2'", " "),
+        ] {
+            let e = bind_err(sql);
+            assert_eq!(e.code, "22P02", "{sql}");
+            assert_eq!(e.message, format!("\"{bad}\" is not a valid hexadecimal digit"));
+        }
+    }
+
+    #[test]
+    fn empty_hex_literal_binds_as_zero_width_bit() {
+        assert_eq!(
+            one_projection("SELECT X''"),
+            BoundExpr::Const { value: Value::Bit { len: 0, bits: 0 }, ty: PgType::Bit }
+        );
+    }
+
+    #[test]
+    fn order_by_on_bit_is_rejected_not_panicking() {
+        // `bit` has no executor comparison, so ORDER BY on it must fail at bind
+        // time rather than reaching the Sort node's `unreachable!`.
+        let e = bind_err("SELECT X'FF' ORDER BY 1");
+        assert_eq!(e.code, "0A000");
+        assert_eq!(e.message, "ORDER BY on type bit is not supported yet");
     }
 
     #[test]
