@@ -813,24 +813,14 @@ fn ready_status(msgs: &[(u8, Vec<u8>)]) -> u8 {
         .expect("a ReadyForQuery must terminate the batch")
 }
 
-/// Read one field (e.g. `C` sqlstate, `V` severity) out of an
-/// ErrorResponse / NoticeResponse body.
-fn field(body: &[u8], want: u8) -> Option<String> {
-    let mut i = 0;
-    while i < body.len() && body[i] != 0 {
-        let code = body[i];
-        i += 1;
-        let start = i;
-        while i < body.len() && body[i] != 0 {
-            i += 1;
-        }
-        let value = String::from_utf8_lossy(&body[start..i]).to_string();
-        i += 1; // skip the field's NUL terminator
-        if code == want {
-            return Some(value);
-        }
+/// Decode an ErrorResponse / NoticeResponse `(tag, body)` into its fields using
+/// the wire codec, so the tests read errors the same way a client does.
+fn fields(msg: &(u8, Vec<u8>)) -> crabgresql_pg_wire::ErrorFields {
+    match crabgresql_pg_wire::BackendMessage::decode(msg.0, &msg.1).unwrap() {
+        crabgresql_pg_wire::BackendMessage::ErrorResponse(f)
+        | crabgresql_pg_wire::BackendMessage::NoticeResponse(f) => f,
+        other => panic!("expected an ErrorResponse/NoticeResponse, got {other:?}"),
     }
-    None
 }
 
 #[tokio::test]
@@ -844,13 +834,14 @@ async fn transaction_status_and_tags_track_the_block() {
     let msgs = simple_query_raw(&mut socket, "SELECT 1").await;
     assert_eq!(ready_status(&msgs), b'T', "still inside the block");
 
-    let msgs = simple_query_raw(&mut socket, "COMMIT").await;
+    // `END` is an alias for COMMIT and completes with the COMMIT tag.
+    let msgs = simple_query_raw(&mut socket, "END").await;
     assert_eq!(command_tags(&msgs), ["COMMIT"]);
     assert_eq!(ready_status(&msgs), b'I');
 
-    // START TRANSACTION also completes with tag BEGIN and enters the block.
+    // START TRANSACTION enters the block but keeps its own distinct tag.
     let msgs = simple_query_raw(&mut socket, "START TRANSACTION").await;
-    assert_eq!(command_tags(&msgs), ["BEGIN"]);
+    assert_eq!(command_tags(&msgs), ["START TRANSACTION"]);
     assert_eq!(ready_status(&msgs), b'T');
 
     let msgs = simple_query_raw(&mut socket, "ROLLBACK").await;
@@ -873,7 +864,7 @@ async fn aborted_block_rejects_until_it_ends() {
         .iter()
         .find(|(tag, _)| *tag == b'E')
         .expect("must report an error");
-    assert_eq!(field(&err.1, b'C').as_deref(), Some("25P02"));
+    assert_eq!(fields(err).code(), "25P02");
     assert!(
         !msgs.iter().any(|(tag, _)| *tag == b'D'),
         "no rows in an aborted block"
@@ -914,12 +905,10 @@ async fn redundant_transaction_commands_warn() {
         .iter()
         .find(|(tag, _)| *tag == b'N')
         .expect("a warning is expected");
-    assert_eq!(field(&notice.1, b'C').as_deref(), Some("25P01"));
-    assert_eq!(field(&notice.1, b'V').as_deref(), Some("WARNING"));
-    assert_eq!(
-        field(&notice.1, b'M').as_deref(),
-        Some("there is no transaction in progress")
-    );
+    let notice = fields(notice);
+    assert_eq!(notice.code(), "25P01");
+    assert_eq!(notice.severity(), "WARNING");
+    assert_eq!(notice.message(), "there is no transaction in progress");
     assert_eq!(command_tags(&msgs), ["COMMIT"]);
     assert_eq!(ready_status(&msgs), b'I');
 
@@ -930,13 +919,66 @@ async fn redundant_transaction_commands_warn() {
         .iter()
         .find(|(tag, _)| *tag == b'N')
         .expect("a warning is expected");
-    assert_eq!(field(&notice.1, b'C').as_deref(), Some("25001"));
+    let notice = fields(notice);
+    assert_eq!(notice.code(), "25001");
     assert_eq!(
-        field(&notice.1, b'M').as_deref(),
-        Some("there is already a transaction in progress")
+        notice.message(),
+        "there is already a transaction in progress"
     );
     assert_eq!(command_tags(&msgs), ["BEGIN"]);
     assert_eq!(ready_status(&msgs), b'T');
+}
+
+#[tokio::test]
+async fn syntax_error_inside_block_aborts_it() {
+    let mut socket = raw_session(spawn_server().await).await;
+    simple_query_raw(&mut socket, "BEGIN").await;
+
+    // A parse error inside the block aborts it, just like an execution error.
+    let msgs = simple_query_raw(&mut socket, "SELCT 1").await;
+    let err = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'E')
+        .expect("must error");
+    assert_eq!(fields(err).code(), "42601");
+    assert_eq!(ready_status(&msgs), b'E');
+
+    // The next statement is then rejected until the block ends.
+    let msgs = simple_query_raw(&mut socket, "SELECT 1").await;
+    let err = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'E')
+        .expect("must error");
+    assert_eq!(fields(err).code(), "25P02");
+    assert_eq!(ready_status(&msgs), b'E');
+
+    simple_query_raw(&mut socket, "ROLLBACK").await;
+    let msgs = simple_query_raw(&mut socket, "SELECT 1").await;
+    assert_eq!(ready_status(&msgs), b'I');
+}
+
+#[tokio::test]
+async fn unsupported_begin_mode_inside_block_warns_without_aborting() {
+    let mut socket = raw_session(spawn_server().await).await;
+    simple_query_raw(&mut socket, "BEGIN").await;
+
+    // Inside a block PG ignores a nested BEGIN's arguments and only warns — an
+    // unsupported mode must not turn into an error that aborts the block.
+    let msgs = simple_query_raw(&mut socket, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+    let notice = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'N')
+        .expect("a warning is expected");
+    assert_eq!(fields(notice).code(), "25001");
+    assert!(!msgs.iter().any(|(tag, _)| *tag == b'E'), "must not error");
+    assert_eq!(command_tags(&msgs), ["BEGIN"]);
+    assert_eq!(ready_status(&msgs), b'T', "the block stays open");
+
+    // The block is still usable.
+    let msgs = simple_query_raw(&mut socket, "SELECT 1").await;
+    assert!(msgs.iter().any(|(tag, _)| *tag == b'D'));
+    assert_eq!(ready_status(&msgs), b'T');
+    simple_query_raw(&mut socket, "COMMIT").await;
 }
 
 #[tokio::test]

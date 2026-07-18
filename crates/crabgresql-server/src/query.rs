@@ -75,6 +75,7 @@ pub fn execute_statement(
         ast::Statement::Reset(reset) => return apply_reset(reset, session),
         ast::Statement::StartTransaction {
             modes,
+            begin,
             modifier,
             statements,
             exception,
@@ -84,6 +85,7 @@ pub fn execute_statement(
             return begin_transaction(
                 session,
                 modes,
+                *begin,
                 modifier,
                 statements,
                 exception,
@@ -113,44 +115,55 @@ pub fn execute_statement(
     Ok(result)
 }
 
+/// `AND CHAIN` (commit/rollback then immediately open an identical block) is not
+/// implemented yet; shared by the BEGIN/COMMIT/ROLLBACK handlers.
+fn and_chain_unsupported() -> PgError {
+    PgError::feature_not_supported("AND CHAIN is not supported yet")
+}
+
 /// `BEGIN` / `START TRANSACTION` (bare forms only). Enters the transaction
 /// block; a redundant BEGIN warns but stays in the block. Real data rollback is
 /// M2 — this only tracks the control-flow state.
 fn begin_transaction(
     session: &mut Session,
     modes: &[ast::TransactionMode],
+    begin: bool,
     modifier: &Option<ast::TransactionModifier>,
     statements: &[ast::Statement],
     exception: &Option<Vec<ast::ExceptionWhen>>,
     has_end_keyword: bool,
 ) -> Result<QueryResult, PgError> {
+    // `BEGIN ... END` is a procedural (atomic) block, not transaction control —
+    // reject it regardless of the current state.
+    if !statements.is_empty() || exception.is_some() || has_end_keyword {
+        return Err(PgError::feature_not_supported(
+            "BEGIN ... END atomic blocks are not supported yet",
+        ));
+    }
+    // PG completes `BEGIN` and `START TRANSACTION` with distinct tags.
+    let tag = if begin { "BEGIN" } else { "START TRANSACTION" };
+    // Inside a block PG ignores the command's arguments and only warns, so an
+    // unsupported mode must not abort an already-open transaction.
+    if session.tx_status == TransactionStatus::InTransaction {
+        return Ok(QueryResult::Command {
+            tag: tag.into(),
+            notices: vec![Notice {
+                code: sqlstate::ACTIVE_SQL_TRANSACTION,
+                message: "there is already a transaction in progress".into(),
+            }],
+        });
+    }
+    // Opening a new block: unsupported modes/modifiers are an honest 0A000.
     if !modes.is_empty() {
         return Err(PgError::feature_not_supported(
             "transaction modes (isolation level / read write) are not supported yet",
         ));
     }
     if modifier.is_some() {
-        return Err(PgError::feature_not_supported(
-            "AND CHAIN is not supported yet",
-        ));
-    }
-    if !statements.is_empty() || exception.is_some() || has_end_keyword {
-        return Err(PgError::feature_not_supported(
-            "BEGIN ... END atomic blocks are not supported yet",
-        ));
-    }
-    let mut notices = Vec::new();
-    if session.tx_status == TransactionStatus::InTransaction {
-        notices.push(Notice {
-            code: sqlstate::ACTIVE_SQL_TRANSACTION,
-            message: "there is already a transaction in progress".into(),
-        });
+        return Err(and_chain_unsupported());
     }
     session.tx_status = TransactionStatus::InTransaction;
-    Ok(QueryResult::Command {
-        tag: "BEGIN".into(),
-        notices,
-    })
+    Ok(QueryResult::command(tag))
 }
 
 /// `COMMIT` / `END`. Ends the block. A COMMIT of a failed block is reported as
@@ -161,9 +174,7 @@ fn commit_transaction(
     modifier: &Option<ast::TransactionModifier>,
 ) -> Result<QueryResult, PgError> {
     if chain {
-        return Err(PgError::feature_not_supported(
-            "AND CHAIN is not supported yet",
-        ));
+        return Err(and_chain_unsupported());
     }
     if modifier.is_some() {
         return Err(PgError::feature_not_supported(
@@ -189,17 +200,15 @@ fn commit_transaction(
     })
 }
 
-/// `ROLLBACK` / `ABORT`. Ends the block (in any state); with no block open it
-/// warns. Note: committed in-memory data is not undone yet — that is M2.
+/// `ROLLBACK`. Ends the block (in any state); with no block open it warns.
+/// Note: committed in-memory data is not undone yet — that is M2.
 fn rollback_transaction(
     session: &mut Session,
     chain: bool,
     savepoint: &Option<ast::Ident>,
 ) -> Result<QueryResult, PgError> {
     if chain {
-        return Err(PgError::feature_not_supported(
-            "AND CHAIN is not supported yet",
-        ));
+        return Err(and_chain_unsupported());
     }
     if savepoint.is_some() {
         return Err(PgError::feature_not_supported(

@@ -104,6 +104,8 @@ pub async fn handle_connection(
                     ),
                 );
                 writer.flush().await?;
+                // An error inside a block aborts it: the next Sync must report 'E'.
+                mark_transaction_failed(&mut session);
                 skip_until_sync = true;
             }
         }
@@ -129,6 +131,8 @@ async fn run_simple_query(
         Ok(statements) => statements,
         Err(e) => {
             writer.error_response(sqlstate::SYNTAX_ERROR, &e.to_string());
+            // A syntax error inside a block aborts it, as in PG.
+            mark_transaction_failed(session);
             return Ok(());
         }
     };
