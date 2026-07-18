@@ -13,6 +13,7 @@ pub const INVALID_ARGUMENT_FOR_POWER_FUNCTION: &str = "2201F";
 pub const SYNTAX_ERROR: &str = "42601";
 pub const DUPLICATE_ALIAS: &str = "42712";
 pub const UNDEFINED_COLUMN: &str = "42703";
+pub const AMBIGUOUS_COLUMN: &str = "42702";
 pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
 pub const UNDEFINED_OBJECT: &str = "42704";
 pub const UNDEFINED_FUNCTION: &str = "42883";

@@ -170,44 +170,139 @@ pub enum Binding {
     Unknown { lit: Option<String>, span: Span },
 }
 
-/// Name-resolution scope: at most one table (M1), addressed by its name or
-/// alias. With an alias the bare table name is not a valid qualifier — as in
-/// PG.
-pub struct Scope<'a> {
-    schema: Option<&'a TableSchema>,
-    qualifier: Option<String>,
+/// One relation in a name-resolution scope: its qualifier (alias, else table
+/// name), its columns, and the base index its columns occupy in the combined
+/// row (0 for a single relation; the running total across FROM items in a
+/// cross join).
+pub struct ScopeRel {
+    qualifier: String,
+    columns: Vec<Column>,
+    offset: usize,
 }
 
-impl<'a> Scope<'a> {
+/// Name-resolution scope: an ordered list of relations (empty for a FROM-less
+/// SELECT / INSERT VALUES, one for a single-table SELECT, more for a cross
+/// join). A qualified reference addresses one relation by its name or alias;
+/// with an alias the bare table name is not a valid qualifier — as in PG.
+pub struct Scope {
+    rels: Vec<ScopeRel>,
+}
+
+impl Scope {
     /// No tables in scope: FROM-less SELECT, INSERT VALUES.
-    pub fn empty() -> Scope<'static> {
+    pub fn empty() -> Scope {
+        Scope { rels: Vec::new() }
+    }
+
+    pub fn table(schema: &TableSchema, qualifier: String) -> Scope {
         Scope {
-            schema: None,
-            qualifier: None,
+            rels: vec![ScopeRel {
+                qualifier,
+                columns: schema.columns.clone(),
+                offset: 0,
+            }],
         }
     }
 
-    pub fn table(schema: &'a TableSchema, qualifier: String) -> Scope<'a> {
-        Scope {
-            schema: Some(schema),
-            qualifier: Some(qualifier),
+    /// A multi-relation scope for a cross join. Each `(qualifier, columns)` pair
+    /// becomes a relation; offsets are assigned left-to-right so a column's
+    /// index is its position in the concatenated row.
+    pub fn relations(items: Vec<(String, Vec<Column>)>) -> Scope {
+        let mut offset = 0;
+        let mut rels = Vec::with_capacity(items.len());
+        for (qualifier, columns) in items {
+            let width = columns.len();
+            rels.push(ScopeRel {
+                qualifier,
+                columns,
+                offset,
+            });
+            offset += width;
         }
+        Scope { rels }
     }
 
+    /// Resolve an unqualified column name. A name that matches exactly one
+    /// column binds to its combined-row index; more than one match — whether
+    /// across relations or duplicated within one (e.g. an alias list `v(x, x)`)
+    /// — is `42702` (ambiguous); no match is `42703`.
     fn resolve(&self, name: &str) -> Result<BoundExpr, BindError> {
-        let index = self
-            .schema
-            .and_then(|schema| schema.column_index(name))
+        let mut found: Option<(usize, PgType)> = None;
+        for rel in &self.rels {
+            for (local, col) in rel.columns.iter().enumerate() {
+                if col.name == name {
+                    if found.is_some() {
+                        return Err(BindError::new(
+                            sqlstate::AMBIGUOUS_COLUMN,
+                            format!("column reference \"{name}\" is ambiguous"),
+                        ));
+                    }
+                    found = Some((rel.offset + local, col.ty));
+                }
+            }
+        }
+        let (index, ty) = found.ok_or_else(|| {
+            BindError::new(
+                sqlstate::UNDEFINED_COLUMN,
+                format!("column \"{name}\" does not exist"),
+            )
+        })?;
+        Ok(BoundExpr::ColumnRef { index, ty })
+    }
+
+    /// Find the relation addressed by `qualifier` (alias or table name), or the
+    /// `42P01` "missing FROM-clause entry" error PG reports when no such
+    /// relation is in scope.
+    fn relation(&self, qualifier: &str) -> Result<&ScopeRel, BindError> {
+        self.rels
+            .iter()
+            .find(|r| r.qualifier == qualifier)
             .ok_or_else(|| {
                 BindError::new(
-                    sqlstate::UNDEFINED_COLUMN,
-                    format!("column \"{name}\" does not exist"),
+                    sqlstate::UNDEFINED_TABLE,
+                    format!("missing FROM-clause entry for table \"{qualifier}\""),
                 )
-            })?;
-        Ok(BoundExpr::ColumnRef {
-            index,
-            ty: self.schema.unwrap().columns[index].ty,
-        })
+            })
+    }
+
+    /// Expand `*`: every relation's columns in FROM order, each as an output
+    /// column paired with a `ColumnRef` at its combined-row index. Duplicate
+    /// output names are allowed, as in PG.
+    pub fn expand_wildcard(&self) -> Vec<(crate::OutputColumn, BoundExpr)> {
+        let mut out = Vec::new();
+        for rel in &self.rels {
+            expand_rel(rel, &mut out);
+        }
+        out
+    }
+
+    /// Expand `q.*`: the columns of the relation addressed by `q`, or `42P01`
+    /// if `q` is not in scope.
+    pub fn expand_qualified(
+        &self,
+        qualifier: &str,
+    ) -> Result<Vec<(crate::OutputColumn, BoundExpr)>, BindError> {
+        let rel = self.relation(qualifier)?;
+        let mut out = Vec::new();
+        expand_rel(rel, &mut out);
+        Ok(out)
+    }
+}
+
+/// Append every column of `rel` as an `(output column, ColumnRef)` pair at its
+/// combined-row index.
+fn expand_rel(rel: &ScopeRel, out: &mut Vec<(crate::OutputColumn, BoundExpr)>) {
+    for (i, col) in rel.columns.iter().enumerate() {
+        out.push((
+            crate::OutputColumn {
+                name: col.name.clone(),
+                ty: col.ty,
+            },
+            BoundExpr::ColumnRef {
+                index: rel.offset + i,
+                ty: col.ty,
+            },
+        ));
     }
 }
 
@@ -638,13 +733,34 @@ fn bind_compound(parts: &[ast::Ident], scope: &Scope) -> Result<BoundExpr, BindE
         ));
     };
     let qualifier = normalize_ident(qualifier);
-    if scope.qualifier.as_deref() != Some(qualifier.as_str()) {
-        return Err(BindError::new(
-            sqlstate::UNDEFINED_TABLE,
-            format!("missing FROM-clause entry for table \"{qualifier}\""),
-        ));
+    let rel = scope.relation(&qualifier)?;
+    let column = normalize_ident(column);
+    // A qualified reference is still ambiguous if the relation exposes the name
+    // more than once (e.g. an alias list `v(x, x)`), matching PG's 42702.
+    let mut local: Option<usize> = None;
+    for (i, col) in rel.columns.iter().enumerate() {
+        if col.name == column {
+            if local.is_some() {
+                return Err(BindError::new(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    format!("column reference \"{column}\" is ambiguous"),
+                ));
+            }
+            local = Some(i);
+        }
     }
-    scope.resolve(&normalize_ident(column))
+    // PG names the missing column with its qualifier, unquoted: `column q.c does
+    // not exist` (contrast the unqualified form `column "c" does not exist`).
+    let local = local.ok_or_else(|| {
+        BindError::new(
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column {qualifier}.{column} does not exist"),
+        )
+    })?;
+    Ok(BoundExpr::ColumnRef {
+        index: rel.offset + local,
+        ty: rel.columns[local].ty,
+    })
 }
 
 fn no_op_unary(sym: &str, ty: &str) -> BindError {

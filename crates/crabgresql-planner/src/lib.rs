@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crabgresql_binder::{BoundExpr, LogicalPlan, OutputColumn, SortKey, TableFn};
+use crabgresql_binder::{BoundExpr, JoinInput, LogicalPlan, OutputColumn, SortKey, TableFn};
 use crabgresql_storage_api::TableAm;
 
 /// An executable plan. `Select` describes the SeqScan → Filter → Projection →
@@ -40,6 +40,15 @@ pub enum PhysicalPlan {
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
     },
+    /// Cartesian product of two or more inputs, then the standard
+    /// Filter → Projection → Sort tail. Mirrors [`LogicalPlan::Join`].
+    Join {
+        inputs: Vec<PhysicalJoinInput>,
+        columns: Vec<OutputColumn>,
+        projections: Vec<BoundExpr>,
+        predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
+    },
     Insert {
         table: Arc<dyn TableAm>,
         rows: Vec<Vec<BoundExpr>>,
@@ -53,6 +62,24 @@ pub enum PhysicalPlan {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
     },
+}
+
+/// A join input, mirroring [`JoinInput`] but with the subplan already lowered
+/// to a [`PhysicalPlan`].
+pub enum PhysicalJoinInput {
+    Scan(Arc<dyn TableAm>),
+    Subplan(Box<PhysicalPlan>),
+    TableFunction { func: TableFn, args: Vec<BoundExpr> },
+}
+
+fn plan_join_input(input: JoinInput) -> PhysicalJoinInput {
+    match input {
+        JoinInput::Scan(table) => PhysicalJoinInput::Scan(table),
+        JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(plan(*source))),
+        JoinInput::TableFunction { func, args } => {
+            PhysicalJoinInput::TableFunction { func, args }
+        }
+    }
 }
 
 pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
@@ -104,6 +131,19 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         } => PhysicalPlan::TableFunction {
             func,
             args,
+            columns,
+            projections,
+            predicate,
+            sort,
+        },
+        LogicalPlan::Join {
+            inputs,
+            columns,
+            projections,
+            predicate,
+            sort,
+        } => PhysicalPlan::Join {
+            inputs: inputs.into_iter().map(plan_join_input).collect(),
             columns,
             projections,
             predicate,
@@ -296,6 +336,18 @@ mod tests {
             panic!("expected Delete");
         };
         assert!(predicate.is_none());
+    }
+
+    #[test]
+    fn cross_join_maps_to_physical_join() {
+        let PhysicalPlan::Join { inputs, columns, .. } =
+            plan_sql("SELECT * FROM t, (VALUES (1)) v(x)")
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(inputs.len(), 2);
+        // t's three columns plus v's one.
+        assert_eq!(columns.len(), 4);
     }
 
     #[test]
