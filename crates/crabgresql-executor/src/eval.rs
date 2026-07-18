@@ -63,6 +63,13 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, 
             sqlstate::FEATURE_NOT_SUPPORTED,
             "set-valued function called in context that cannot accept a set",
         )),
+        // Aggregate markers are always rewritten to `ColumnRef`s (into the
+        // aggregate node's output row) before planning; one reaching scalar
+        // evaluation is a binder bug.
+        BoundExpr::Aggregate { .. } => Err(ExecError::new(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "aggregate function called in a context that cannot accept one",
+        )),
     }
 }
 

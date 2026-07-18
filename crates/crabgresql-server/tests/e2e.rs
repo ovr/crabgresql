@@ -312,12 +312,9 @@ async fn integer_out_of_range_on_insert() {
 #[tokio::test]
 async fn unsupported_clauses_error_instead_of_silently_dropping() {
     let client = connect(spawn_server().await).await;
-    for sql in [
-        "SELECT 1 FETCH FIRST 1 ROW ONLY",
-        "SELECT 1 GROUP BY 1",
-        "SELECT 1 HAVING true",
-        "SELECT DISTINCT 1",
-    ] {
+    // GROUP BY / HAVING are supported now (see aggregate tests); the rest still
+    // error rather than being silently dropped.
+    for sql in ["SELECT 1 FETCH FIRST 1 ROW ONLY", "SELECT DISTINCT 1"] {
         let err = client.simple_query(sql).await.unwrap_err();
         let db_err = err
             .as_db_error()
@@ -328,6 +325,77 @@ async fn unsupported_clauses_error_instead_of_silently_dropping() {
             "{sql}"
         );
     }
+}
+
+#[tokio::test]
+async fn aggregates_over_a_table() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a integer, b integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10), (1, 20), (2, 5), (2, NULL)")
+        .await
+        .unwrap();
+
+    // Whole-table aggregates: one row, count/min/max/sum over all rows.
+    let messages = client
+        .simple_query("SELECT count(*), min(b), max(b), sum(b) FROM t")
+        .await
+        .unwrap();
+    let whole = rows(&messages);
+    assert_eq!(whole.len(), 1);
+    assert_eq!(whole[0].get(0), Some("4")); // count(*) counts every row
+    assert_eq!(whole[0].get(1), Some("5")); // min ignores NULL
+    assert_eq!(whole[0].get(2), Some("20"));
+    assert_eq!(whole[0].get(3), Some("35"));
+
+    // count(expr) skips NULLs where count(*) does not.
+    let messages = client
+        .simple_query("SELECT count(b), count(*) FROM t")
+        .await
+        .unwrap();
+    let counts = rows(&messages);
+    assert_eq!(counts[0].get(0), Some("3"));
+    assert_eq!(counts[0].get(1), Some("4"));
+
+    // GROUP BY + HAVING + ORDER BY.
+    let messages = client
+        .simple_query(
+            "SELECT a, count(*), sum(b) FROM t GROUP BY a HAVING count(*) > 1 ORDER BY a",
+        )
+        .await
+        .unwrap();
+    let grouped = rows(&messages);
+    assert_eq!(grouped.len(), 2);
+    assert_eq!(
+        (grouped[0].get(0), grouped[0].get(1), grouped[0].get(2)),
+        (Some("1"), Some("2"), Some("30"))
+    );
+    assert_eq!(
+        (grouped[1].get(0), grouped[1].get(1), grouped[1].get(2)),
+        (Some("2"), Some("2"), Some("5"))
+    );
+
+    // An empty group: sum is NULL, count is 0.
+    let messages = client
+        .simple_query("SELECT count(*), sum(b) FROM t WHERE a > 100")
+        .await
+        .unwrap();
+    let empty = rows(&messages);
+    assert_eq!(empty[0].get(0), Some("0"));
+    assert_eq!(empty[0].get(1), None); // NULL
+
+    // Ungrouped column outside an aggregate is an error.
+    let err = client
+        .simple_query("SELECT a, count(*) FROM t")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::GROUPING_ERROR,
+    );
 }
 
 #[tokio::test]

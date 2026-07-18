@@ -21,7 +21,7 @@ use crabgresql_types::{
 };
 
 use crate::BindError;
-use crate::functions::{ScalarFn, TableFn, bind_function, bind_srf_projection};
+use crate::functions::{AggFn, ScalarFn, TableFn, bind_function, bind_srf_projection};
 
 /// Typed expression IR. Every node knows its result type; the evaluator
 /// dispatches on the recorded types and never re-infers them.
@@ -91,6 +91,36 @@ pub enum BoundExpr {
         ret: PgType,
         args: Vec<BoundExpr>,
     },
+    /// An aggregate call (`min(x)`, `count(*)`, …). A transient marker: it may
+    /// appear anywhere in a target-list / HAVING / ORDER BY expression, but the
+    /// binder extracts every aggregate into a [`crate::LogicalPlan::Aggregate`]
+    /// and rewrites the marker to a `ColumnRef` into the aggregate's output row
+    /// before planning. Evaluating it as a scalar is a bug (see `executor::eval`).
+    Aggregate {
+        func: AggFn,
+        /// `None` for `COUNT(*)` (count every row); the per-row argument
+        /// expression otherwise.
+        arg: Option<Box<BoundExpr>>,
+        /// The argument's (pre-aggregation) type — drives accumulator dispatch.
+        /// Unused for `COUNT(*)`.
+        input_ty: PgType,
+        /// The aggregate's result type (see `agg_return_type`).
+        ret: PgType,
+        distinct: bool,
+    },
+}
+
+/// One aggregate call extracted from a query's expressions, occupying one slot
+/// of the aggregate node's output row (after the group keys). Produced by the
+/// binder's aggregate-extraction pass from a [`BoundExpr::Aggregate`] marker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundAggregate {
+    pub func: AggFn,
+    /// Evaluated per source row; `None` = `COUNT(*)`.
+    pub arg: Option<BoundExpr>,
+    pub input_ty: PgType,
+    pub ret: PgType,
+    pub distinct: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +211,7 @@ impl BoundExpr {
             BoundExpr::FuncCall { ret, .. } => *ret,
             BoundExpr::Case { ty, .. } => *ty,
             BoundExpr::Srf { ret, .. } => *ret,
+            BoundExpr::Aggregate { ret, .. } => *ret,
         }
     }
 
@@ -188,6 +219,35 @@ impl BoundExpr {
     /// level of a projection list).
     pub fn is_srf(&self) -> bool {
         matches!(self, BoundExpr::Srf { .. })
+    }
+
+    /// Whether this node itself is an aggregate marker.
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, BoundExpr::Aggregate { .. })
+    }
+
+    /// Whether this expression tree contains an aggregate marker anywhere.
+    pub fn contains_aggregate(&self) -> bool {
+        match self {
+            BoundExpr::Aggregate { .. } => true,
+            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } => false,
+            BoundExpr::Unary { expr, .. } => expr.contains_aggregate(),
+            BoundExpr::Binary { left, right, .. } => {
+                left.contains_aggregate() || right.contains_aggregate()
+            }
+            BoundExpr::IsNull { expr, .. } => expr.contains_aggregate(),
+            BoundExpr::Coerce { expr, .. } => expr.contains_aggregate(),
+            BoundExpr::Reinterpret { expr, .. } => expr.contains_aggregate(),
+            BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+                args.iter().any(BoundExpr::contains_aggregate)
+            }
+            BoundExpr::Case { whens, else_, .. } => {
+                whens
+                    .iter()
+                    .any(|(c, r)| c.contains_aggregate() || r.contains_aggregate())
+                    || else_.as_ref().is_some_and(|e| e.contains_aggregate())
+            }
+        }
     }
 }
 
@@ -313,6 +373,18 @@ impl Scope {
             expand_rel(rel, &mut out);
         }
         out
+    }
+
+    /// The `qualifier.name` label of the column at a combined-row `index`, as PG
+    /// spells it in the "must appear in the GROUP BY clause" error. Falls back to
+    /// `?column?` if the index is past every relation (should not happen).
+    pub fn column_label(&self, index: usize) -> String {
+        for rel in &self.rels {
+            if index >= rel.offset && index < rel.offset + rel.columns.len() {
+                return format!("{}.{}", rel.qualifier, rel.columns[index - rel.offset].name);
+            }
+        }
+        "?column?".to_string()
     }
 
     /// Expand `q.*`: the columns of the relation addressed by `q`, or `42P01`
