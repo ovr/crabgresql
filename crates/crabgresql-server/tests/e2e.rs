@@ -348,6 +348,12 @@ async fn unenforceable_ddl_is_rejected() {
     for sql in [
         "CREATE TABLE c (id integer PRIMARY KEY)",
         "CREATE TABLE c (id integer NOT NULL)",
+        // Clauses we can't honor must be rejected, not silently dropped: CTAS
+        // would discard the SELECT, and ON COMMIT needs the M2 txn engine.
+        "CREATE TABLE c AS SELECT 1 AS x",
+        "CREATE TEMP TABLE c AS SELECT 1 AS x",
+        "CREATE TEMP TABLE c (x int) ON COMMIT DROP",
+        "CREATE TEMP TABLE c (x int) ON COMMIT DELETE ROWS",
     ] {
         let err = client.simple_query(sql).await.unwrap_err();
         assert_eq!(

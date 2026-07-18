@@ -397,6 +397,20 @@ fn execute_create_table(
     session: &Session,
 ) -> Result<QueryResult, PgError> {
     let name = object_name_to_table_name(&create.name)?;
+    // Clauses we can't honor must be rejected, not silently dropped: CREATE
+    // TABLE AS would otherwise create an empty table (the SELECT is discarded),
+    // and ON COMMIT DROP/DELETE ROWS needs the M2 transaction engine — accepting
+    // it would leave a plain session-lifetime table that diverges from PG.
+    if create.query.is_some() {
+        return Err(PgError::feature_not_supported(
+            "CREATE TABLE ... AS is not supported yet",
+        ));
+    }
+    if create.on_commit.is_some() {
+        return Err(PgError::feature_not_supported(
+            "CREATE TABLE ... ON COMMIT is not supported yet",
+        ));
+    }
     if let Some(constraint) = create.constraints.first() {
         return Err(PgError::feature_not_supported(format!(
             "table constraints are not supported yet: {constraint}"
