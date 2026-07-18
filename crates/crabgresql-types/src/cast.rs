@@ -272,6 +272,22 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- text → bytea (byteain) ----
         (Value::Text(s), PgType::Bytea) => byteain(s).map(Value::Bytea),
 
+        // ---- text → uuid (uuid_in) ----
+        (Value::Text(s), PgType::Uuid) => crate::uuid::parse(s)
+            .map(Value::Uuid)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- text → inet / cidr (inet_in / cidr_in) ----
+        (Value::Text(s), PgType::Inet) => crate::net::inet_in(s)
+            .map(Value::Inet)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Cidr) => crate::net::cidr_in(s)
+            .map(Value::Cidr)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- cidr → inet (implicit in PG; the network keeps its masklen) ----
+        (Value::Cidr(v), PgType::Inet) => Ok(Value::Inet(*v)),
+
         _ => Err(cannot_coerce(from, to)),
     }
 }

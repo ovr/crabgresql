@@ -11363,6 +11363,8 @@ impl<'a> Parser<'a> {
                 }
                 Keyword::VARBIT => Ok(DataType::VarBit(self.parse_optional_precision()?)),
                 Keyword::UUID => Ok(DataType::Uuid),
+                Keyword::INET => Ok(DataType::Inet),
+                Keyword::CIDR => Ok(DataType::Cidr),
                 Keyword::DATE => Ok(DataType::Date),
                 Keyword::TIMESTAMP => {
                     let precision = self.parse_optional_precision()?;

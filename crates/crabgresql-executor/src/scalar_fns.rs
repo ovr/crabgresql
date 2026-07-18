@@ -12,8 +12,8 @@ use std::hint::black_box;
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Interval, Numeric, TimeTz, Value, date, float, interval, text, time, timestamp, timestamptz,
-    timetz, to_char,
+    Inet, Interval, Numeric, TimeTz, Value, date, float, interval, net, text, time, timestamp,
+    timestamptz, timetz, to_char,
 };
 
 use crate::ExecError;
@@ -379,6 +379,41 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::TimestampMi => {
             return timestamp::mi(ts(&args[0]), ts(&args[1])).map(Value::Interval).map_err(ts_err);
         }
+
+        // --- inet/cidr operators ---
+        ScalarFn::NetworkContainedBy => {
+            return Ok(Value::Bool(net::contained_by(inet(&args[0]), inet(&args[1]))));
+        }
+        ScalarFn::NetworkContains => {
+            return Ok(Value::Bool(net::contains(inet(&args[0]), inet(&args[1]))));
+        }
+        ScalarFn::NetworkOverlaps => {
+            return Ok(Value::Bool(net::overlaps(inet(&args[0]), inet(&args[1]))));
+        }
+        ScalarFn::InetAnd => {
+            return net::bit_and(inet(&args[0]), inet(&args[1])).map(Value::Inet).map_err(net_err);
+        }
+        ScalarFn::InetOr => {
+            return net::bit_or(inet(&args[0]), inet(&args[1])).map(Value::Inet).map_err(net_err);
+        }
+        ScalarFn::InetNot => return Ok(Value::Inet(net::bit_not(inet(&args[0])))),
+        ScalarFn::InetPlInt8 => {
+            return net::add_offset(inet(&args[0]), i8(&args[1])).map(Value::Inet).map_err(net_err);
+        }
+        ScalarFn::InetMiInt8 => {
+            return net::sub_offset(inet(&args[0]), i8(&args[1])).map(Value::Inet).map_err(net_err);
+        }
+        ScalarFn::InetMi => {
+            return net::diff(inet(&args[0]), inet(&args[1])).map(Value::Int8).map_err(net_err);
+        }
+
+        // --- inet/cidr functions ---
+        ScalarFn::Host => return Ok(Value::Text(net::host(inet(&args[0])))),
+        ScalarFn::Masklen => return Ok(Value::Int4(net::masklen(inet(&args[0])))),
+        ScalarFn::Family => return Ok(Value::Int4(net::family(inet(&args[0])))),
+        ScalarFn::Network => return Ok(Value::Cidr(net::network(inet(&args[0])))),
+        ScalarFn::AbbrevInet => return Ok(Value::Text(net::abbrev_inet(inet(&args[0])))),
+        ScalarFn::AbbrevCidr => return Ok(Value::Text(net::abbrev_cidr(inet(&args[0])))),
 
         // --- interval functions ---
         ScalarFn::DatePartInterval => {
@@ -967,6 +1002,17 @@ fn num(v: &Value) -> &Numeric {
         Value::Numeric(n) => n,
         other => unreachable!("expected numeric arg, got {other:?}"),
     }
+}
+
+fn inet(v: &Value) -> &Inet {
+    match v {
+        Value::Inet(i) | Value::Cidr(i) => i,
+        other => unreachable!("expected inet/cidr arg, got {other:?}"),
+    }
+}
+
+fn net_err(e: net::NetError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))
 }
 
 fn num_err(e: crabgresql_types::numeric::NumErr) -> ExecError {

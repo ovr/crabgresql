@@ -622,6 +622,9 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         // `interval` (any field qualifier / precision is accepted and ignored;
         // full resolution is kept, as with `timestamp(2)`).
         DataType::Interval { .. } => PgType::Interval,
+        DataType::Uuid => PgType::Uuid,
+        DataType::Inet => PgType::Inet,
+        DataType::Cidr => PgType::Cidr,
         DataType::Text => PgType::Text,
         // `varchar`/`character varying` (with or without a length limit).
         DataType::Varchar(_) | DataType::CharacterVarying(_) => PgType::Varchar,
@@ -1075,6 +1078,18 @@ fn bind_unary(
                 expr: Box::new(operand),
             }))
         }
+        // `~inet` — bitwise NOT of the address (masklen preserved).
+        ast::UnaryOperator::BitwiseNot => match bind_expr(operand, scope)? {
+            Binding::Typed(e) if matches!(e.ty(), PgType::Inet | PgType::Cidr) => {
+                Ok(Binding::Typed(BoundExpr::FuncCall {
+                    func: ScalarFn::InetNot,
+                    ret: PgType::Inet,
+                    args: vec![e],
+                }))
+            }
+            Binding::Typed(e) => Err(no_op_unary("~", e.ty().name())),
+            Binding::Unknown { .. } => Err(ambiguous_unary("~")),
+        },
         other => Err(BindError::feature_not_supported(format!(
             "operator is not supported yet: {other}"
         ))),
@@ -1246,6 +1261,17 @@ fn bind_binary(
         let rb = bind_expr(right, scope)?;
         return bind_like(lb, rb, None, ci, negated);
     }
+
+    let lb = bind_expr(left, scope)?;
+    let rb = bind_expr(right, scope)?;
+
+    // inet/cidr operators (containment, overlap, bitwise, host arithmetic) don't
+    // fit the single-`arg_ty` `Binary` node; they lower to `ScalarFn` calls.
+    // Tried before the generic mapping so `<<`/`>>`/`&`/`|`/`&&` reach here.
+    if let Some(binding) = resolve_network_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
     let op = match op {
         ast::BinaryOperator::Eq => BinOp::Eq,
         ast::BinaryOperator::NotEq => BinOp::NotEq,
@@ -1267,9 +1293,6 @@ fn bind_binary(
             )));
         }
     };
-
-    let lb = bind_expr(left, scope)?;
-    let rb = bind_expr(right, scope)?;
     bind_binary_op(op, lb, rb)
 }
 
@@ -1390,6 +1413,9 @@ fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindEr
                 | PgType::Timestamp
                 | PgType::Interval
                 | PgType::TimestampTz
+                | PgType::Uuid
+                | PgType::Inet
+                | PgType::Cidr
         )
     };
     if !supported {
@@ -1544,6 +1570,123 @@ fn binding_typed_ty(b: &Binding) -> Option<PgType> {
     }
 }
 
+fn is_net_ty(t: Option<PgType>) -> bool {
+    matches!(t, Some(PgType::Inet | PgType::Cidr))
+}
+
+/// The type name PG shows for an operand in an "operator does not exist"
+/// message; an untyped literal is `unknown`.
+fn operand_name(b: &Binding) -> &'static str {
+    binding_typed_ty(b).map_or("unknown", |t| t.name())
+}
+
+/// `operator does not exist: <lname> <op> <rname>`, with the real operand names
+/// in their actual order.
+fn net_no_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> BindError {
+    BindError::new(
+        sqlstate::UNDEFINED_FUNCTION,
+        format!("operator does not exist: {} {op} {}", operand_name(lb), operand_name(rb)),
+    )
+}
+
+/// Materialize a network operand: a typed inet/cidr as is (both read through
+/// `inet_of`), an untyped literal parsed as `inet`. `None` for a typed non-net
+/// operand, so the caller can report the full "operator does not exist" error.
+fn net_operand(b: &Binding) -> Option<Result<BoundExpr, BindError>> {
+    match b {
+        Binding::Typed(e) if is_net_ty(Some(e.ty())) => Some(Ok(e.clone())),
+        Binding::Unknown { lit, span } => Some(resolve_unknown(lit.clone(), *span, PgType::Inet)),
+        Binding::Typed(_) => None,
+    }
+}
+
+/// Materialize the integer side of inet host arithmetic: a typed int2/int4/int8
+/// coerced to int8, or an untyped literal parsed as int8. `None` for any other
+/// typed operand — PG has only `inet ± bigint` (narrower ints widen), so e.g.
+/// `inet + numeric`/`inet + text` must report "operator does not exist" rather
+/// than silently coercing/truncating.
+fn int_operand(b: &Binding) -> Option<Result<BoundExpr, BindError>> {
+    match b {
+        Binding::Typed(e) if matches!(e.ty(), PgType::Int2 | PgType::Int4 | PgType::Int8) => {
+            Some(resolve_operand(b, PgType::Int8))
+        }
+        Binding::Unknown { .. } => Some(resolve_operand(b, PgType::Int8)),
+        Binding::Typed(_) => None,
+    }
+}
+
+/// inet/cidr-specific operators lower to `ScalarFn` calls (as `resolve_temporal`
+/// does for the temporal operators). Returns `Ok(None)` when the operator and
+/// operands are not a network operation, so the generic operator path — and its
+/// errors — still applies.
+fn resolve_network_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+) -> Result<Option<Binding>, BindError> {
+    use ast::BinaryOperator as B;
+    let lt = binding_typed_ty(lb);
+    let rt = binding_typed_ty(rb);
+    let any_net = is_net_ty(lt) || is_net_ty(rt);
+    let call = |func, ret, a, b| {
+        Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret,
+            args: vec![a, b],
+        })))
+    };
+
+    // Containment / overlap (`<<` `>>` `&&`) and bitwise (`&` `|`) take two
+    // inet-family operands (result bool / inet). Without any net operand, fall
+    // through so integer `&`/`|`/`<<` still error as before.
+    let net_net = match op {
+        B::PGBitwiseShiftLeft => Some((ScalarFn::NetworkContainedBy, PgType::Bool)),
+        B::PGBitwiseShiftRight => Some((ScalarFn::NetworkContains, PgType::Bool)),
+        B::PGOverlap => Some((ScalarFn::NetworkOverlaps, PgType::Bool)),
+        B::BitwiseAnd => Some((ScalarFn::InetAnd, PgType::Inet)),
+        B::BitwiseOr => Some((ScalarFn::InetOr, PgType::Inet)),
+        _ => None,
+    };
+    if let Some((func, ret)) = net_net {
+        if !any_net {
+            return Ok(None);
+        }
+        let (Some(a), Some(b)) = (net_operand(lb), net_operand(rb)) else {
+            return Err(net_no_operator(lb, op, rb));
+        };
+        return call(func, ret, a?, b?);
+    }
+
+    // Host arithmetic: `inet ± int8` (commutative for `+`), `inet - inet`.
+    match op {
+        B::Plus if is_net_ty(lt) && !is_net_ty(rt) => {
+            let (Some(a), Some(n)) = (net_operand(lb), int_operand(rb)) else {
+                return Err(net_no_operator(lb, op, rb));
+            };
+            call(ScalarFn::InetPlInt8, PgType::Inet, a?, n?)
+        }
+        B::Plus if is_net_ty(rt) && !is_net_ty(lt) => {
+            let (Some(a), Some(n)) = (net_operand(rb), int_operand(lb)) else {
+                return Err(net_no_operator(lb, op, rb));
+            };
+            call(ScalarFn::InetPlInt8, PgType::Inet, a?, n?)
+        }
+        B::Minus if is_net_ty(lt) && is_net_ty(rt) => {
+            let (Some(a), Some(b)) = (net_operand(lb), net_operand(rb)) else {
+                return Err(net_no_operator(lb, op, rb));
+            };
+            call(ScalarFn::InetMi, PgType::Int8, a?, b?)
+        }
+        B::Minus if is_net_ty(lt) => {
+            let (Some(a), Some(n)) = (net_operand(lb), int_operand(rb)) else {
+                return Err(net_no_operator(lb, op, rb));
+            };
+            call(ScalarFn::InetMiInt8, PgType::Inet, a?, n?)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Materialize an operand at `target`: an untyped literal is parsed as `target`,
 /// a typed operand is coerced (used for the numeric `* /` factor → float8).
 fn resolve_operand(b: &Binding, target: PgType) -> Result<BoundExpr, BindError> {
@@ -1665,6 +1808,9 @@ fn implicit_castable(from: PgType, to: PgType) -> bool {
                 | (Varchar, Text)
                 | (Bpchar, Text)
                 | (Name, Text)
+                // `cidr -> inet` is an implicit cast in PG, so the inet
+                // functions/operators accept a cidr argument.
+                | (Cidr, Inet)
         )
 }
 
@@ -1989,6 +2135,17 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Bytea => cast::byteain(s)
             .map(Value::Bytea)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Uuid => crabgresql_types::uuid::parse(s)
+            .map(Value::Uuid)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Inet => crabgresql_types::net::inet_in(s)
+            .map(Value::Inet)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Cidr => crabgresql_types::net::cidr_in(s)
+            .map(Value::Cidr)
+            .map_err(|e| {
+                BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))
+            }),
         PgType::Bit | PgType::User(_) => Err(invalid()),
     }
 }

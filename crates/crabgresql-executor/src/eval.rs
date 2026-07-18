@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Interval, Numeric, PgType, TimeTz, Value, cast, date, float, interval, time, timetz,
+    Inet, Interval, Numeric, PgType, TimeTz, Value, cast, date, float, interval, net, time, timetz,
 };
 
 use crate::{ExecContext, ExecError};
@@ -183,6 +183,10 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::Date => date::cmp(date_of(l), date_of(r)),
         PgType::Time => time::cmp(time_of(l), time_of(r)),
         PgType::TimeTz => timetz::cmp(timetz_of(l), timetz_of(r)),
+        // uuid: raw byte order (PG's `uuid_cmp`).
+        PgType::Uuid => uuid_of(l).cmp(uuid_of(r)),
+        // inet/cidr: family, common-prefix bits, masklen, address (`network_cmp`).
+        PgType::Inet | PgType::Cidr => net::network_cmp(inet_of(l), inet_of(r)),
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -273,6 +277,20 @@ fn bool_of(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
         other => unreachable!("expected bool, got {other:?}"),
+    }
+}
+
+fn uuid_of(v: &Value) -> &[u8; 16] {
+    match v {
+        Value::Uuid(b) => b,
+        other => unreachable!("expected uuid, got {other:?}"),
+    }
+}
+
+fn inet_of(v: &Value) -> &Inet {
+    match v {
+        Value::Inet(i) | Value::Cidr(i) => i,
+        other => unreachable!("expected inet/cidr, got {other:?}"),
     }
 }
 

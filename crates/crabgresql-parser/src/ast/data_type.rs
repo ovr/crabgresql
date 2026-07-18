@@ -51,6 +51,10 @@ pub enum DataType {
     Varchar(Option<CharacterLength>),
     /// Uuid type.
     Uuid,
+    /// PostgreSQL `inet` type: an IPv4/IPv6 host or network address.
+    Inet,
+    /// PostgreSQL `cidr` type: an IPv4/IPv6 network specification.
+    Cidr,
     /// Large character object with optional length,
     /// e.g. CHARACTER LARGE OBJECT, CHARACTER LARGE OBJECT(1000), [SQL Standard].
     ///
@@ -233,6 +237,8 @@ impl fmt::Display for DataType {
             DataType::CharVarying(size) => format_character_string_type(f, "CHAR VARYING", size),
             DataType::Varchar(size) => format_character_string_type(f, "VARCHAR", size),
             DataType::Uuid => write!(f, "UUID"),
+            DataType::Inet => write!(f, "INET"),
+            DataType::Cidr => write!(f, "CIDR"),
             DataType::CharacterLargeObject(size) => {
                 format_type_with_optional_length(f, "CHARACTER LARGE OBJECT", size, false)
             }

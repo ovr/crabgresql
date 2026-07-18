@@ -60,6 +60,40 @@ pub enum ScalarFn {
     /// `make_timestamp(int, int, int, int, int, float8) -> timestamp`.
     MakeTimestamp,
 
+    // --- inet/cidr operators (built directly by the binder) ---
+    /// `a << b` — `a` is contained by `b` (`->` bool).
+    NetworkContainedBy,
+    /// `a >> b` — `a` contains `b` (`->` bool).
+    NetworkContains,
+    /// `a && b` — the networks overlap (`->` bool).
+    NetworkOverlaps,
+    /// `inet & inet -> inet` (`inetand`).
+    InetAnd,
+    /// `inet | inet -> inet` (`inetor`).
+    InetOr,
+    /// `~inet -> inet` (`inetnot`).
+    InetNot,
+    /// `inet + int8 -> inet` (`inetpl`).
+    InetPlInt8,
+    /// `inet - int8 -> inet` (`inetmi_int8`).
+    InetMiInt8,
+    /// `inet - inet -> int8` (`inetmi`).
+    InetMi,
+
+    // --- inet/cidr functions ---
+    /// `host(inet) -> text`.
+    Host,
+    /// `masklen(inet) -> int4`.
+    Masklen,
+    /// `family(inet) -> int4`.
+    Family,
+    /// `network(inet) -> cidr`.
+    Network,
+    /// `abbrev(inet) -> text`.
+    AbbrevInet,
+    /// `abbrev(cidr) -> text`.
+    AbbrevCidr,
+
     // --- interval operators (built directly by the binder, not via `lookup`) ---
     /// unary `- interval`.
     IntervalNeg,
@@ -438,6 +472,8 @@ const TIMETZ: PgType = PgType::TimeTz;
 const I8: PgType = PgType::Int8;
 const BOOL: PgType = PgType::Bool;
 const BYTEA: PgType = PgType::Bytea;
+const INET: PgType = PgType::Inet;
+const CIDR: PgType = PgType::Cidr;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -676,6 +712,20 @@ fn lookup(name: &str) -> &'static [Signature] {
         "quote_ident" => &[Signature { func: ScalarFn::QuoteIdent, args: &[TEXT], ret: TEXT }],
         "quote_literal" => &[Signature { func: ScalarFn::QuoteLiteral, args: &[TEXT], ret: TEXT }],
         "quote_nullable" => &[Signature { func: ScalarFn::QuoteNullable, args: &[TEXT], ret: TEXT }],
+        // inet/cidr accessors. A `cidr` argument coerces to the `inet` overload
+        // via the implicit cidr->inet cast, matching PG (whose inet functions
+        // accept cidr). `abbrev` keeps a distinct cidr overload because its
+        // output differs (`10.1/16` vs `10.1.0.0/16`); the inet overload is
+        // listed first so an untyped literal resolves to inet (PG's preferred
+        // type in the inet/cidr category), while a typed cidr still binds cidr.
+        "host" => &[Signature { func: ScalarFn::Host, args: &[INET], ret: TEXT }],
+        "masklen" => &[Signature { func: ScalarFn::Masklen, args: &[INET], ret: I4 }],
+        "family" => &[Signature { func: ScalarFn::Family, args: &[INET], ret: I4 }],
+        "network" => &[Signature { func: ScalarFn::Network, args: &[INET], ret: CIDR }],
+        "abbrev" => &[
+            Signature { func: ScalarFn::AbbrevInet, args: &[INET], ret: TEXT },
+            Signature { func: ScalarFn::AbbrevCidr, args: &[CIDR], ret: TEXT },
+        ],
         _ => &[],
     }
 }

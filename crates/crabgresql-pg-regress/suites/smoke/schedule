@@ -13,3 +13,6 @@ test: numeric
 test: join
 test: generate_series
 test: string
+test: uuid
+test: inet
+test: cidr
