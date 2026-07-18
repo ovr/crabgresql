@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crabgresql_txn::{TxnContext, Xid};
+use crabgresql_txn::{Clog, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
 
 pub use crabgresql_txn as txn;
@@ -177,10 +177,12 @@ pub trait TableAm: Send + Sync {
         self.delete_many(tids, txn);
     }
 
-    /// Reclaim versions dead to every transaction at or before `oldest`. The
-    /// default is a no-op — the in-memory engine keeps dead versions until it is
-    /// asked to vacuum, and there is no background vacuum before M5.
-    fn vacuum(&self, _oldest: Xid) {}
+    /// Reclaim versions dead to every transaction at or before `oldest`. A
+    /// version is reclaimable only if its deleter **committed** — `clog` decides
+    /// that; a version stamped by an aborted or in-flight deleter is still live.
+    /// The default is a no-op: the in-memory engine keeps dead versions until it
+    /// is asked to vacuum, and there is no background vacuum before M5.
+    fn vacuum(&self, _oldest: Xid, _clog: &Clog) {}
 }
 
 /// Engine factory: `CREATE TABLE ... USING <engine>`.

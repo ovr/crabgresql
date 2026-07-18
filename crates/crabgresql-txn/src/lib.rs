@@ -175,9 +175,16 @@ impl XidManager {
 
     /// Assign a fresh XID and mark it running. Called lazily on a transaction's
     /// first write — read-only transactions never consume an XID.
+    ///
+    /// The counter bump and the `active` insert happen under one lock so they are
+    /// atomic with respect to [`XidManager::take_snapshot`] (which also reads
+    /// `next` while holding `active`). Otherwise a snapshot could observe `next`
+    /// already advanced past an XID that is not yet published in `active` and
+    /// wrongly treat that still-running transaction as finished.
     pub fn allocate(&self) -> Xid {
+        let mut active = self.active.lock().unwrap();
         let xid = Xid(self.next.fetch_add(1, Ordering::SeqCst));
-        self.active.lock().unwrap().insert(xid);
+        active.insert(xid);
         xid
     }
 
@@ -216,17 +223,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// A snapshot that sees every committed transaction and no in-flight one:
-    /// the visibility a fresh read gets when nothing else is running. Handy for
-    /// bootstrap reads and tests.
-    pub fn everything() -> Self {
-        Snapshot {
-            xmin: Xid::FIRST_NORMAL,
-            xmax: Xid(u64::MAX),
-            xip: Vec::new(),
-        }
-    }
-
     /// Whether `xid` was still in flight relative to this snapshot — i.e. its
     /// effects must be treated as invisible even if the CLOG now says committed
     /// (it may have committed *after* the snapshot).
@@ -264,38 +260,6 @@ pub struct TxnContext {
     pub snapshot: Snapshot,
     pub iso: IsolationLevel,
     pub clog: Arc<Clog>,
-}
-
-impl TxnContext {
-    /// A standalone context whose writes are frozen — [`Xid::FROZEN`], so
-    /// unconditionally visible — and whose reads see every committed version.
-    /// Used for bootstrap catalog seeding (as PostgreSQL uses
-    /// `FrozenTransactionId`) and for callers that do not participate in a real
-    /// transaction yet. It carries its own empty [`Clog`]; frozen versions never
-    /// consult it.
-    pub fn frozen() -> Self {
-        TxnContext {
-            xid: Xid::FROZEN,
-            cid: CommandId::FIRST,
-            snapshot: Snapshot::everything(),
-            iso: IsolationLevel::ReadCommitted,
-            clog: Arc::new(Clog::new()),
-        }
-    }
-
-    /// A read-only context with no XID of its own that sees every committed (and
-    /// frozen) version. Pairs with [`TxnContext::frozen`] for bootstrap reads
-    /// and tests. Uses [`Xid::INVALID`], never [`Xid::FROZEN`], so it does not
-    /// "own" frozen deletes.
-    pub fn read_all() -> Self {
-        TxnContext {
-            xid: Xid::INVALID,
-            cid: CommandId::FIRST,
-            snapshot: Snapshot::everything(),
-            iso: IsolationLevel::ReadCommitted,
-            clog: Arc::new(Clog::new()),
-        }
-    }
 }
 
 /// The one MVCC visibility rule. A version described by `hdr` is visible to a

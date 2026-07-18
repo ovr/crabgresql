@@ -546,6 +546,36 @@ async fn uncommitted_changes_are_invisible_to_other_sessions() {
 }
 
 #[tokio::test]
+async fn disconnect_mid_block_aborts_and_frees_the_row() {
+    let port = spawn_server().await;
+    let a = connect(port).await;
+    a.simple_query("CREATE TABLE t (id integer)").await.unwrap();
+    a.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+
+    // B opens a block and updates the row (allocating an XID and stamping the
+    // old version's xmax), then disconnects without COMMIT/ROLLBACK.
+    let b = connect(port).await;
+    b.simple_query("BEGIN").await.unwrap();
+    assert_eq!(command_count(&b.simple_query("UPDATE t SET id = 2").await.unwrap()), Some(1));
+    drop(b);
+    // Give the server a moment to observe the disconnect and abort B's block.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // C can still update the row: B's abort-on-drop made the original version
+    // live again. Without the fix, B's XID stays in-flight, the row is not
+    // is_live, and this reports UPDATE 0.
+    let c = connect(port).await;
+    let msg = c.simple_query("UPDATE t SET id = 3").await.unwrap();
+    assert_eq!(
+        command_count(&msg),
+        Some(1),
+        "row must be updatable after B's abandoned block aborts on disconnect"
+    );
+    let sel = c.simple_query("SELECT id FROM t").await.unwrap();
+    assert_eq!(rows(&sel)[0].get(0), Some("3"));
+}
+
+#[tokio::test]
 async fn update_and_delete_without_where_hit_all_rows() {
     let client = connect(spawn_server().await).await;
     client

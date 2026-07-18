@@ -244,13 +244,15 @@ impl TableAm for MemoryTable {
         *rows = Arc::new(Vec::new());
     }
 
-    /// Reclaim versions that are dead to everyone: deleted by a committed
-    /// transaction at or before `oldest`. A single retain pass under the lock.
-    fn vacuum(&self, oldest: crabgresql_txn::Xid) {
+    /// Reclaim versions that are dead to everyone: deleted by a **committed**
+    /// transaction at or before `oldest`. A single retain pass under the lock. A
+    /// version whose deleter aborted (or is still in flight) is live and must be
+    /// kept — hence the CLOG check, not just `xmax < oldest`.
+    fn vacuum(&self, oldest: crabgresql_txn::Xid, clog: &Clog) {
         let mut rows = self.rows.write().unwrap();
         let rows = Arc::make_mut(&mut *rows);
         rows.retain(|v| {
-            !(v.header.xmax.is_valid() && v.header.xmax < oldest)
+            !(v.header.xmax.is_valid() && v.header.xmax < oldest && clog.is_committed(v.header.xmax))
         });
     }
 }
@@ -404,6 +406,23 @@ mod tests {
         let txn = tm.context(xid, CommandId::FIRST);
         table.delete(a, &txn);
         tm.abort(xid);
+        assert_eq!(ids(&tm, &*table), vec![Value::Int4(1)]);
+    }
+
+    #[test]
+    fn vacuum_keeps_live_row_whose_deleter_aborted() {
+        let tm = TransactionManager::new();
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t")).unwrap();
+        let a = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
+        // Delete the row, then abort the deleter: the row is live again.
+        let x = tm.allocate_xid();
+        table.delete(a, &tm.context(x, CommandId::FIRST));
+        tm.abort(x);
+        // Vacuum with a horizon well past the aborted deleter must NOT reclaim
+        // the still-live row (the deleter never committed).
+        let horizon = tm.allocate_xid();
+        table.vacuum(horizon, tm.clog());
         assert_eq!(ids(&tm, &*table), vec![Value::Int4(1)]);
     }
 

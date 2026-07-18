@@ -779,19 +779,33 @@ mod tests {
     use crabgresql_binder::{BinOp, UnaryOp};
     use crabgresql_memory_storage::MemoryEngine;
     use crabgresql_storage_api::{Column, TableEngine, TableSchema};
-    use crabgresql_txn::TxnContext;
+    use crabgresql_txn::{CommandId, TransactionManager, TxnContext, Xid};
     use crabgresql_types::PgType;
     use eval::coerce_value;
 
-    /// A frozen writer: seeds/DML whose versions are unconditionally visible.
-    /// These tests exercise executor mechanics, not MVCC visibility.
-    fn wtxn() -> TxnContext {
-        TxnContext::frozen()
+    thread_local! {
+        /// One transaction manager per test thread (libtest runs each test on its
+        /// own thread), so `wtxn`/`rtxn` share a commit log within a test but stay
+        /// isolated across tests. These tests exercise executor mechanics, not MVCC
+        /// visibility, so a write just commits immediately and a read sees it.
+        static TM: TransactionManager = TransactionManager::new();
     }
 
-    /// A reader that sees every committed/frozen version (no XID of its own).
+    /// A committed writer context: seeds/DML whose versions are visible to any
+    /// later read. Commits the XID up front, so a row stamped with it (or an old
+    /// version it deletes) is immediately committed.
+    fn wtxn() -> TxnContext {
+        TM.with(|tm| {
+            let xid = tm.allocate_xid();
+            tm.commit(xid);
+            tm.context(xid, CommandId::FIRST)
+        })
+    }
+
+    /// A reader with no XID of its own and a fresh snapshot that sees every
+    /// committed version.
     fn rtxn() -> TxnContext {
-        TxnContext::read_all()
+        TM.with(|tm| tm.context(Xid::INVALID, CommandId::FIRST))
     }
 
     fn int4(v: i32) -> BoundExpr {
@@ -1124,7 +1138,8 @@ mod tests {
                 ty: PgType::Text,
             },
         ];
-        let projection = Projection::new(Box::new(SeqScan::new(&table)), exprs, ExecContext::default());
+        let projection =
+            Projection::new(Box::new(SeqScan::new(&table, &rtxn())), exprs, ExecContext::default());
         // ORDER BY label ASC: NULL (id 3) sorts last (NULLS LAST default), then
         // 'one' (id 1), 'two' (id 2).
         let key = SortKey {

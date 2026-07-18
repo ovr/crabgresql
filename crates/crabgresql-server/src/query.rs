@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crabgresql_binder::{bind_delete, bind_insert, bind_query, bind_update};
+use crabgresql_binder::{LogicalPlan, bind_delete, bind_insert, bind_query, bind_update};
 use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
@@ -182,10 +182,12 @@ pub fn execute_statement(
         }
     };
     // A write statement needs an XID to stamp its versions; a read runs with
-    // none. The context carries the snapshot visibility is judged against.
+    // none. Decide from the bound plan, not the surface AST: the binder already
+    // resolved the statement to an Insert/Update/Delete node, so a new writing
+    // statement kind can't accidentally run XID-less and produce invisible rows.
     let is_write = matches!(
-        stmt,
-        ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_)
+        logical,
+        LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
     );
     let txn = build_txn(txnmgr, session, is_write);
     let exec = match execute(crabgresql_planner::plan(logical), session.exec_context(), &txn) {

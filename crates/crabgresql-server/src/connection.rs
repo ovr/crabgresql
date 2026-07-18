@@ -76,7 +76,7 @@ pub async fn handle_connection(
 
     // Per-connection session state (GUCs). A fresh connection resets them,
     // matching how the regression runner gives each test its own session.
-    let mut session = Session::new();
+    let mut session = Session::new(txnmgr.clone());
 
     // After an error on an extended-protocol message, PG discards everything
     // until Sync and only then sends ReadyForQuery — one error, one RFQ per

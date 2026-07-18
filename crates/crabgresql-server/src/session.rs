@@ -9,7 +9,7 @@ use crabgresql_executor::ExecContext;
 use crabgresql_memory_storage::MemoryEngine;
 use crabgresql_pg_wire::TransactionStatus;
 use crabgresql_storage_api::TableEngine;
-use crabgresql_txn::{CommandId, IsolationLevel, Snapshot, Xid};
+use crabgresql_txn::{CommandId, IsolationLevel, Snapshot, TransactionManager, Xid};
 
 /// The data-level state of an explicit `BEGIN … COMMIT/ROLLBACK` block. Separate
 /// from [`TransactionStatus`], which is the wire control-flow byte: this holds
@@ -50,6 +50,9 @@ pub struct Session {
     /// `BEGIN` and its `COMMIT`/`ROLLBACK`, `None` under autocommit (each
     /// statement is then its own implicit transaction).
     pub xact: Option<ActiveTxn>,
+    /// The shared transaction manager, held so an abandoned block can be aborted
+    /// when the session is dropped (see the [`Drop`] impl).
+    pub txnmgr: Arc<TransactionManager>,
     /// Session-local temp-table catalog (PG's `pg_temp`). Searched before the
     /// shared global engine, so a `CREATE TEMP TABLE` shadows a same-named
     /// permanent table. Dropped with the session on disconnect — that is the
@@ -58,12 +61,13 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new() -> Self {
+    pub fn new(txnmgr: Arc<TransactionManager>) -> Self {
         // PG's default since v12.
         Self {
             extra_float_digits: 1,
             tx_status: TransactionStatus::Idle,
             xact: None,
+            txnmgr,
             temp: Arc::new(MemoryEngine::new()),
         }
     }
@@ -75,8 +79,15 @@ impl Session {
     }
 }
 
-impl Default for Session {
-    fn default() -> Self {
-        Self::new()
+impl Drop for Session {
+    /// If the client disconnects with an explicit block still open, abort its
+    /// XID so its writes become dead and the XID is retired from the in-flight
+    /// set — otherwise it would pin the snapshot horizon forever and leave the
+    /// rows it touched un-modifiable. Autocommit statements are already finalized
+    /// at the statement boundary, so only an open block needs this.
+    fn drop(&mut self) {
+        if let Some(active) = self.xact.take() {
+            self.txnmgr.abort(active.xid.unwrap_or(Xid::INVALID));
+        }
     }
 }
