@@ -3547,11 +3547,6 @@ pub enum Statement {
     /// Truncate (Hive)
     Truncate(Truncate),
     /// ```sql
-    /// MSCK
-    /// ```
-    /// Msck (Hive)
-    Msck(Msck),
-    /// ```sql
     /// SELECT
     /// ```
     Query(Box<Query>),
@@ -3560,32 +3555,11 @@ pub enum Statement {
     /// ```
     Insert(Insert),
     /// ```sql
-    /// INSTALL
-    /// ```
-    Install {
-        /// Only for DuckDB
-        extension_name: Ident,
-    },
-    /// ```sql
     /// LOAD
     /// ```
     Load {
         /// Only for DuckDB
         extension_name: Ident,
-    },
-    // TODO: Support ROW FORMAT
-    /// LOAD DATA from a directory or query source.
-    Directory {
-        /// Whether to overwrite existing files.
-        overwrite: bool,
-        /// Whether the directory is local to the server.
-        local: bool,
-        /// Path to the directory or files.
-        path: String,
-        /// Optional file format for the data.
-        file_format: Option<FileFormat>,
-        /// Source query providing data to load.
-        source: Box<Query>,
     },
     /// A `CASE` statement.
     Case(CaseStatement),
@@ -3616,11 +3590,6 @@ pub enum Statement {
         /// VALUES a vector of values to be copied
         values: Vec<Option<String>>,
     },
-    /// ```sql
-    /// OPEN cursor_name
-    /// ```
-    /// Opens a cursor.
-    Open(OpenStatement),
     /// ```sql
     /// CLOSE
     /// ```
@@ -3813,31 +3782,6 @@ pub enum Statement {
         owner: Option<ddl::AlterConnectorOwner>,
     },
     /// ```sql
-    /// ATTACH DATABASE 'path/to/file' AS alias
-    /// ```
-    /// (SQLite-specific)
-    AttachDatabase {
-        /// The name to bind to the newly attached database
-        schema_name: Ident,
-        /// An expression that indicates the path to the database file
-        database_file_name: Expr,
-        /// true if the syntax is 'ATTACH DATABASE', false if it's just 'ATTACH'
-        database: bool,
-    },
-    /// (DuckDB-specific)
-    /// ```sql
-    /// DETACH db_alias;
-    /// ```
-    /// See <https://duckdb.org/docs/sql/statements/attach.html>
-    DetachDuckDBDatabase {
-        /// `true` when `IF EXISTS` was present.
-        if_exists: bool,
-        /// `true` if the syntax used `DETACH DATABASE` rather than `DETACH`.
-        database: bool,
-        /// Alias of the database to detach.
-        database_alias: Ident,
-    },
-    /// ```sql
     /// DROP [TABLE, VIEW, ...]
     /// ```
     Drop {
@@ -3979,26 +3923,6 @@ pub enum Statement {
         position: FetchPosition,
         /// Optional target table to fetch rows into.
         into: Option<ObjectName>,
-    },
-    /// ```sql
-    /// FLUSH [NO_WRITE_TO_BINLOG | LOCAL] flush_option [, flush_option] ... | tables_option
-    /// ```
-    ///
-    /// Note: this is a Mysql-specific statement,
-    /// but may also compatible with other SQL.
-    Flush {
-        /// The specific flush option or object to flush.
-        object_type: FlushType,
-        /// Optional flush location (dialect-specific).
-        location: Option<FlushLocation>,
-        /// Optional channel name used for flush operations.
-        channel: Option<String>,
-        /// Whether a read lock was requested.
-        read_lock: bool,
-        /// Whether this is an export flush operation.
-        export: bool,
-        /// Optional list of tables involved in the flush.
-        tables: Vec<ObjectName>,
     },
     /// ```sql
     /// DISCARD [ ALL | PLANS | SEQUENCES | TEMPORARY | TEMP ]
@@ -4390,22 +4314,9 @@ pub enum Statement {
         definition: MacroDefinition,
     },
     /// ```sql
-    /// ASSERT <condition> [AS <message>]
-    /// ```
-    Assert {
-        /// Assertion condition expression.
-        condition: Expr,
-        /// Optional message expression.
-        message: Option<Expr>,
-    },
-    /// ```sql
     /// GRANT privileges ON objects TO grantees
     /// ```
     Grant(Grant),
-    /// ```sql
-    /// DENY privileges ON object TO grantees
-    /// ```
-    Deny(DenyStatement),
     /// ```sql
     /// REVOKE privileges ON objects FROM grantees
     /// ```
@@ -4461,19 +4372,6 @@ pub enum Statement {
         data_types: Vec<DataType>,
         /// Statement being prepared.
         statement: Box<Statement>,
-    },
-    /// ```sql
-    /// KILL [CONNECTION | QUERY | MUTATION]
-    /// ```
-    ///
-    /// See <https://clickhouse.com/docs/en/sql-reference/statements/kill/>
-    /// See <https://dev.mysql.com/doc/refman/8.0/en/kill.html>
-    Kill {
-        /// Optional kill modifier (CONNECTION, QUERY, MUTATION).
-        modifier: Option<KillType>,
-        // processlist_id
-        /// The id of the process to kill.
-        id: u64,
     },
     /// ```sql
     /// [EXPLAIN | DESC | DESCRIBE] TABLE
@@ -4543,36 +4441,6 @@ pub enum Statement {
     /// [MSSQL](https://learn.microsoft.com/en-us/sql/t-sql/statements/merge-transact-sql?view=sql-server-ver16)
     Merge(Merge),
     /// ```sql
-    /// CACHE [ FLAG ] TABLE <table_name> [ OPTIONS('K1' = 'V1', 'K2' = V2) ] [ AS ] [ <query> ]
-    /// ```
-    ///
-    /// See [Spark SQL docs] for more details.
-    ///
-    /// [Spark SQL docs]: https://docs.databricks.com/spark/latest/spark-sql/language-manual/sql-ref-syntax-aux-cache-cache-table.html
-    Cache {
-        /// Table flag
-        table_flag: Option<ObjectName>,
-        /// Table name
-        #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
-        table_name: ObjectName,
-        /// `true` if `AS` keyword was present before the query.
-        has_as: bool,
-        /// Table confs
-        options: Vec<SqlOption>,
-        /// Cache table as a Query
-        query: Option<Box<Query>>,
-    },
-    /// ```sql
-    /// UNCACHE TABLE [ IF EXISTS ]  <table_name>
-    /// ```
-    UNCache {
-        /// Table name
-        #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
-        table_name: ObjectName,
-        /// `true` when `IF EXISTS` was present.
-        if_exists: bool,
-    },
-    /// ```sql
     /// CREATE [ { TEMPORARY | TEMP } ] SEQUENCE [ IF NOT EXISTS ] <sequence_name>
     /// ```
     /// Define a new sequence:
@@ -4602,82 +4470,11 @@ pub enum Statement {
         representation: Option<UserDefinedTypeRepresentation>,
     },
     /// ```sql
-    /// PRAGMA <schema-name>.<pragma-name> = <pragma-value>
-    /// ```
-    Pragma {
-        /// Pragma name (possibly qualified).
-        name: ObjectName,
-        /// Optional pragma value.
-        value: Option<ValueWithSpan>,
-        /// Whether the pragma used `=`.
-        is_eq: bool,
-    },
-    /// ```sql
     /// LOCK [ TABLE ] [ ONLY ] name [ * ] [, ...] [ IN lockmode MODE ] [ NOWAIT ]
     /// ```
     ///
     /// See <https://www.postgresql.org/docs/current/sql-lock.html>
     Lock(Lock),
-    /// Unloads the result of a query to file
-    ///
-    /// [Athena](https://docs.aws.amazon.com/athena/latest/ug/unload.html):
-    /// ```sql
-    /// UNLOAD(statement) TO <destination> [ WITH options ]
-    /// ```
-    ///
-    /// [Redshift](https://docs.aws.amazon.com/redshift/latest/dg/r_UNLOAD.html):
-    /// ```sql
-    /// UNLOAD('statement') TO <destination> [ OPTIONS ]
-    /// ```
-    Unload {
-        /// Optional query AST to unload.
-        query: Option<Box<Query>>,
-        /// Optional original query text.
-        query_text: Option<String>,
-        /// Destination identifier.
-        to: Ident,
-        /// Optional IAM role/auth information.
-        auth: Option<IamRoleKind>,
-        /// Additional `WITH` options.
-        with: Vec<SqlOption>,
-        /// Legacy copy-style options.
-        options: Vec<CopyLegacyOption>,
-    },
-    /// ClickHouse:
-    /// ```sql
-    /// OPTIMIZE TABLE [db.]name [ON CLUSTER cluster] [PARTITION partition | PARTITION ID 'partition_id'] [FINAL] [DEDUPLICATE [BY expression]]
-    /// ```
-    /// See ClickHouse <https://clickhouse.com/docs/en/sql-reference/statements/optimize>
-    ///
-    /// Databricks:
-    /// ```sql
-    /// OPTIMIZE table_name [WHERE predicate] [ZORDER BY (col_name1 [, ...])]
-    /// ```
-    /// See Databricks <https://docs.databricks.com/en/sql/language-manual/delta-optimize.html>
-    OptimizeTable {
-        /// Table name to optimize.
-        name: ObjectName,
-        /// Whether the `TABLE` keyword was present (ClickHouse uses `OPTIMIZE TABLE`, Databricks uses `OPTIMIZE`).
-        has_table_keyword: bool,
-        /// Optional cluster identifier.
-        /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/optimize)
-        on_cluster: Option<Ident>,
-        /// Optional partition spec.
-        /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/optimize)
-        partition: Option<Partition>,
-        /// Whether `FINAL` was specified.
-        /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/optimize)
-        include_final: bool,
-        /// Optional deduplication settings.
-        /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/optimize)
-        deduplicate: Option<Deduplicate>,
-        /// Optional WHERE predicate.
-        /// [Databricks](https://docs.databricks.com/en/sql/language-manual/delta-optimize.html)
-        predicate: Option<Expr>,
-        /// Optional ZORDER BY columns.
-        /// [Databricks](https://docs.databricks.com/en/sql/language-manual/delta-optimize.html)
-        zorder: Option<Vec<Expr>>,
-    },
     /// ```sql
     /// LISTEN
     /// ```
@@ -4710,80 +4507,6 @@ pub enum Statement {
         /// Optional payload string.
         payload: Option<String>,
     },
-    /// ```sql
-    /// LOAD DATA [LOCAL] INPATH 'filepath' [OVERWRITE] INTO TABLE tablename
-    /// [PARTITION (partcol1=val1, partcol2=val2 ...)]
-    /// [INPUTFORMAT 'inputformat' SERDE 'serde']
-    /// ```
-    /// Loading files into tables
-    ///
-    /// See Hive <https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=27362036#LanguageManualDML-Loadingfilesintotables>
-    LoadData {
-        /// Whether `LOCAL` is present.
-        local: bool,
-        /// Input path for files to load.
-        inpath: String,
-        /// Whether `OVERWRITE` was specified.
-        overwrite: bool,
-        /// Target table name to load into.
-        table_name: ObjectName,
-        /// Optional partition specification.
-        partitioned: Option<Vec<Expr>>,
-        /// Optional table format information.
-        table_format: Option<HiveLoadDataFormat>,
-    },
-    /// ```sql
-    /// Rename TABLE tbl_name TO new_tbl_name[, tbl_name2 TO new_tbl_name2] ...
-    /// ```
-    /// Renames one or more tables
-    ///
-    /// See Mysql <https://dev.mysql.com/doc/refman/9.1/en/rename-table.html>
-    RenameTable(Vec<RenameTable>),
-    /// RaiseError (MSSQL)
-    /// RAISERROR ( { msg_id | msg_str | @local_variable }
-    /// { , severity , state }
-    /// [ , argument [ , ...n ] ] )
-    /// [ WITH option [ , ...n ] ]
-    /// See <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/raiserror-transact-sql?view=sql-server-ver16>
-    RaisError {
-        /// Error message expression or identifier.
-        message: Box<Expr>,
-        /// Severity expression.
-        severity: Box<Expr>,
-        /// State expression.
-        state: Box<Expr>,
-        /// Substitution arguments for the message.
-        arguments: Vec<Expr>,
-        /// Additional `WITH` options for RAISERROR.
-        options: Vec<RaisErrorOption>,
-    },
-    /// A MSSQL `THROW` statement.
-    Throw(ThrowStatement),
-    /// ```sql
-    /// PRINT msg_str | @local_variable | string_expr
-    /// ```
-    ///
-    /// See: <https://learn.microsoft.com/en-us/sql/t-sql/statements/print-transact-sql>
-    Print(PrintStatement),
-    /// MSSQL `WAITFOR` statement.
-    ///
-    /// See: <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/waitfor-transact-sql>
-    WaitFor(WaitForStatement),
-    /// ```sql
-    /// RETURN [ expression ]
-    /// ```
-    ///
-    /// See [ReturnStatement]
-    Return(ReturnStatement),
-    /// Export data statement
-    ///
-    /// Example:
-    /// ```sql
-    /// EXPORT DATA OPTIONS(uri='gs://bucket/folder/*', format='PARQUET', overwrite=true) AS
-    /// SELECT field1, field2 FROM mydataset.table1 ORDER BY field1 LIMIT 10
-    /// ```
-    /// [BigQuery](https://cloud.google.com/bigquery/docs/reference/standard-sql/export-statements)
-    ExportData(ExportData),
     /// ```sql
     /// CREATE [OR REPLACE] USER <user> [IF NOT EXISTS]
     /// ```
@@ -4826,12 +4549,6 @@ impl From<ddl::Truncate> for Statement {
 impl From<Lock> for Statement {
     fn from(lock: Lock) -> Self {
         Statement::Lock(lock)
-    }
-}
-
-impl From<ddl::Msck> for Statement {
-    fn from(msck: ddl::Msck) -> Self {
-        Statement::Msck(msck)
     }
 }
 
@@ -4911,46 +4628,6 @@ impl fmt::Display for Statement {
     #[allow(clippy::cognitive_complexity)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Statement::Flush {
-                object_type,
-                location,
-                channel,
-                read_lock,
-                export,
-                tables,
-            } => {
-                write!(f, "FLUSH")?;
-                if let Some(location) = location {
-                    f.write_str(" ")?;
-                    location.fmt(f)?;
-                }
-                write!(f, " {object_type}")?;
-
-                if let Some(channel) = channel {
-                    write!(f, " FOR CHANNEL {channel}")?;
-                }
-
-                write!(
-                    f,
-                    "{tables}{read}{export}",
-                    tables = if !tables.is_empty() {
-                        format!(" {}", display_comma_separated(tables))
-                    } else {
-                        String::new()
-                    },
-                    export = if *export { " FOR EXPORT" } else { "" },
-                    read = if *read_lock { " WITH READ LOCK" } else { "" }
-                )
-            }
-            Statement::Kill { modifier, id } => {
-                write!(f, "KILL ")?;
-
-                if let Some(m) = modifier {
-                    write!(f, "{m} ")?;
-                }
-
-                write!(f, "{id}")
-            }
             Statement::ExplainTable {
                 describe_alias,
                 hive_format,
@@ -5023,26 +4700,6 @@ impl fmt::Display for Statement {
 
                 Ok(())
             }
-            Statement::Directory {
-                overwrite,
-                local,
-                path,
-                file_format,
-                source,
-            } => {
-                write!(
-                    f,
-                    "INSERT{overwrite}{local} DIRECTORY '{path}'",
-                    overwrite = if *overwrite { " OVERWRITE" } else { "" },
-                    local = if *local { " LOCAL" } else { "" },
-                    path = path
-                )?;
-                if let Some(ref ff) = file_format {
-                    write!(f, " STORED AS {ff}")?
-                }
-                write!(f, " {source}")
-            }
-            Statement::Msck(msck) => msck.fmt(f),
             Statement::Truncate(truncate) => truncate.fmt(f),
             Statement::Case(stmt) => {
                 write!(f, "{stmt}")
@@ -5056,32 +4713,8 @@ impl fmt::Display for Statement {
             Statement::Raise(stmt) => {
                 write!(f, "{stmt}")
             }
-            Statement::AttachDatabase {
-                schema_name,
-                database_file_name,
-                database,
-            } => {
-                let keyword = if *database { "DATABASE " } else { "" };
-                write!(f, "ATTACH {keyword}{database_file_name} AS {schema_name}")
-            }
-            Statement::DetachDuckDBDatabase {
-                if_exists,
-                database,
-                database_alias,
-            } => {
-                write!(
-                    f,
-                    "DETACH{database}{if_exists} {database_alias}",
-                    database = if *database { " DATABASE" } else { "" },
-                    if_exists = if *if_exists { " IF EXISTS" } else { "" },
-                )?;
-                Ok(())
-            }
             Statement::Analyze(analyze) => analyze.fmt(f),
             Statement::Insert(insert) => insert.fmt(f),
-            Statement::Install {
-                extension_name: name,
-            } => write!(f, "INSTALL {name}"),
 
             Statement::Load {
                 extension_name: name,
@@ -5135,7 +4768,6 @@ impl fmt::Display for Statement {
             }
             Statement::Update(update) => update.fmt(f),
             Statement::Delete(delete) => delete.fmt(f),
-            Statement::Open(open) => open.fmt(f),
             Statement::Close { cursor } => {
                 write!(f, "CLOSE {cursor}")?;
 
@@ -5301,36 +4933,6 @@ impl fmt::Display for Statement {
             }
             Statement::CreateView(create_view) => create_view.fmt(f),
             Statement::CreateTable(create_table) => create_table.fmt(f),
-            Statement::LoadData {
-                local,
-                inpath,
-                overwrite,
-                table_name,
-                partitioned,
-                table_format,
-            } => {
-                write!(
-                    f,
-                    "LOAD DATA {local}INPATH '{inpath}' {overwrite}INTO TABLE {table_name}",
-                    local = if *local { "LOCAL " } else { "" },
-                    inpath = inpath,
-                    overwrite = if *overwrite { "OVERWRITE " } else { "" },
-                    table_name = table_name,
-                )?;
-                if let Some(ref parts) = &partitioned {
-                    if !parts.is_empty() {
-                        write!(f, " PARTITION ({})", display_comma_separated(parts))?;
-                    }
-                }
-                if let Some(HiveLoadDataFormat {
-                    serde,
-                    input_format,
-                }) = &table_format
-                {
-                    write!(f, " INPUTFORMAT {input_format} SERDE {serde}")?;
-                }
-                Ok(())
-            }
             Statement::CreateVirtualTable {
                 name,
                 if_not_exists,
@@ -5812,15 +5414,7 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Statement::Assert { condition, message } => {
-                write!(f, "ASSERT {condition}")?;
-                if let Some(m) = message {
-                    write!(f, " AS {m}")?;
-                }
-                Ok(())
-            }
             Statement::Grant(grant) => write!(f, "{grant}"),
-            Statement::Deny(s) => write!(f, "{s}"),
             Statement::Revoke(revoke) => write!(f, "{revoke}"),
             Statement::Deallocate { name, prepare } => write!(
                 f,
@@ -5902,40 +5496,6 @@ impl fmt::Display for Statement {
                 write!(f, "RELEASE SAVEPOINT {name}")
             }
             Statement::Merge(merge) => merge.fmt(f),
-            Statement::Cache {
-                table_name,
-                table_flag,
-                has_as,
-                options,
-                query,
-            } => {
-                if let Some(table_flag) = table_flag {
-                    write!(f, "CACHE {table_flag} TABLE {table_name}")?;
-                } else {
-                    write!(f, "CACHE TABLE {table_name}")?;
-                }
-
-                if !options.is_empty() {
-                    write!(f, " OPTIONS({})", display_comma_separated(options))?;
-                }
-
-                match (*has_as, query) {
-                    (true, Some(query)) => write!(f, " AS {query}"),
-                    (true, None) => f.write_str(" AS"),
-                    (false, Some(query)) => write!(f, " {query}"),
-                    (false, None) => Ok(()),
-                }
-            }
-            Statement::UNCache {
-                table_name,
-                if_exists,
-            } => {
-                if *if_exists {
-                    write!(f, "UNCACHE TABLE IF EXISTS {table_name}")
-                } else {
-                    write!(f, "UNCACHE TABLE {table_name}")
-                }
-            }
             Statement::CreateSequence {
                 temporary,
                 if_not_exists,
@@ -5977,81 +5537,7 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Statement::Pragma { name, value, is_eq } => {
-                write!(f, "PRAGMA {name}")?;
-                if value.is_some() {
-                    let val = value.as_ref().unwrap();
-                    if *is_eq {
-                        write!(f, " = {val}")?;
-                    } else {
-                        write!(f, "({val})")?;
-                    }
-                }
-                Ok(())
-            }
             Statement::Lock(lock) => lock.fmt(f),
-            Statement::Unload {
-                query,
-                query_text,
-                to,
-                auth,
-                with,
-                options,
-            } => {
-                write!(f, "UNLOAD(")?;
-                if let Some(query) = query {
-                    write!(f, "{query}")?;
-                }
-                if let Some(query_text) = query_text {
-                    write!(f, "'{query_text}'")?;
-                }
-                write!(f, ") TO {to}")?;
-                if let Some(auth) = auth {
-                    write!(f, " IAM_ROLE {auth}")?;
-                }
-                if !with.is_empty() {
-                    write!(f, " WITH ({})", display_comma_separated(with))?;
-                }
-                if !options.is_empty() {
-                    write!(f, " {}", display_separated(options, " "))?;
-                }
-                Ok(())
-            }
-            Statement::OptimizeTable {
-                name,
-                has_table_keyword,
-                on_cluster,
-                partition,
-                include_final,
-                deduplicate,
-                predicate,
-                zorder,
-            } => {
-                write!(f, "OPTIMIZE")?;
-                if *has_table_keyword {
-                    write!(f, " TABLE")?;
-                }
-                write!(f, " {name}")?;
-                if let Some(on_cluster) = on_cluster {
-                    write!(f, " ON CLUSTER {on_cluster}")?;
-                }
-                if let Some(partition) = partition {
-                    write!(f, " {partition}")?;
-                }
-                if *include_final {
-                    write!(f, " FINAL")?;
-                }
-                if let Some(deduplicate) = deduplicate {
-                    write!(f, " {deduplicate}")?;
-                }
-                if let Some(predicate) = predicate {
-                    write!(f, " WHERE {predicate}")?;
-                }
-                if let Some(zorder) = zorder {
-                    write!(f, " ZORDER BY ({})", display_comma_separated(zorder))?;
-                }
-                Ok(())
-            }
             Statement::LISTEN { channel } => {
                 write!(f, "LISTEN {channel}")?;
                 Ok(())
@@ -6067,31 +5553,6 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Statement::RenameTable(rename_tables) => {
-                write!(f, "RENAME TABLE {}", display_comma_separated(rename_tables))
-            }
-            Statement::RaisError {
-                message,
-                severity,
-                state,
-                arguments,
-                options,
-            } => {
-                write!(f, "RAISERROR({message}, {severity}, {state}")?;
-                if !arguments.is_empty() {
-                    write!(f, ", {}", display_comma_separated(arguments))?;
-                }
-                write!(f, ")")?;
-                if !options.is_empty() {
-                    write!(f, " WITH {}", display_comma_separated(options))?;
-                }
-                Ok(())
-            }
-            Statement::Throw(s) => write!(f, "{s}"),
-            Statement::Print(s) => write!(f, "{s}"),
-            Statement::WaitFor(s) => write!(f, "{s}"),
-            Statement::Return(r) => write!(f, "{r}"),
-            Statement::ExportData(e) => write!(f, "{e}"),
             Statement::CreateUser(s) => write!(f, "{s}"),
             Statement::AlterSchema(s) => write!(f, "{s}"),
             Statement::Vacuum(s) => write!(f, "{s}"),
@@ -11849,21 +11310,9 @@ impl From<RaiseStatement> for Statement {
     }
 }
 
-impl From<ThrowStatement> for Statement {
-    fn from(t: ThrowStatement) -> Self {
-        Self::Throw(t)
-    }
-}
-
 impl From<Function> for Statement {
     fn from(f: Function) -> Self {
         Self::Call(f)
-    }
-}
-
-impl From<OpenStatement> for Statement {
-    fn from(o: OpenStatement) -> Self {
-        Self::Open(o)
     }
 }
 
@@ -12023,45 +11472,9 @@ impl From<DropOperatorClass> for Statement {
     }
 }
 
-impl From<DenyStatement> for Statement {
-    fn from(d: DenyStatement) -> Self {
-        Self::Deny(d)
-    }
-}
-
 impl From<CreateDomain> for Statement {
     fn from(c: CreateDomain) -> Self {
         Self::CreateDomain(c)
-    }
-}
-
-impl From<RenameTable> for Statement {
-    fn from(r: RenameTable) -> Self {
-        vec![r].into()
-    }
-}
-
-impl From<Vec<RenameTable>> for Statement {
-    fn from(r: Vec<RenameTable>) -> Self {
-        Self::RenameTable(r)
-    }
-}
-
-impl From<PrintStatement> for Statement {
-    fn from(p: PrintStatement) -> Self {
-        Self::Print(p)
-    }
-}
-
-impl From<ReturnStatement> for Statement {
-    fn from(r: ReturnStatement) -> Self {
-        Self::Return(r)
-    }
-}
-
-impl From<ExportData> for Statement {
-    fn from(e: ExportData) -> Self {
-        Self::ExportData(e)
     }
 }
 

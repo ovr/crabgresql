@@ -249,17 +249,8 @@ impl Dialect for GenericDialect {
         true
     }
 
-    fn supports_optimize_table(&self) -> bool {
-        true
-    }
 
-    fn supports_install(&self) -> bool {
-        true
-    }
 
-    fn supports_detach(&self) -> bool {
-        true
-    }
 
     fn supports_prewhere(&self) -> bool {
         true

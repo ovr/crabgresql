@@ -1155,10 +1155,6 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Returns true if the dialect supports the `LOAD DATA` statement
-    fn supports_load_data(&self) -> bool {
-        false
-    }
 
     /// Returns true if the dialect supports the `LOAD extension` statement
     fn supports_load_extension(&self) -> bool {
@@ -1568,41 +1564,8 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Returns true if this dialect supports the `OPTIMIZE TABLE` statement.
-    ///
-    /// Example:
-    /// ```sql
-    /// OPTIMIZE TABLE table_name;
-    /// ```
-    ///
-    /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/optimize)
-    fn supports_optimize_table(&self) -> bool {
-        false
-    }
 
-    /// Returns true if this dialect supports the `INSTALL` statement.
-    ///
-    /// Example:
-    /// ```sql
-    /// INSTALL extension_name;
-    /// ```
-    ///
-    /// [DuckDB](https://duckdb.org/docs/extensions/overview)
-    fn supports_install(&self) -> bool {
-        false
-    }
 
-    /// Returns true if this dialect supports the `DETACH` statement.
-    ///
-    /// Example:
-    /// ```sql
-    /// DETACH DATABASE db_name;
-    /// ```
-    ///
-    /// [DuckDB](https://duckdb.org/docs/sql/statements/attach#detach-syntax)
-    fn supports_detach(&self) -> bool {
-        false
-    }
 
     /// Returns true if this dialect supports the `PREWHERE` clause
     /// in `SELECT` statements.
