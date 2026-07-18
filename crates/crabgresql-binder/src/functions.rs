@@ -715,14 +715,16 @@ fn lookup(name: &str) -> &'static [Signature] {
         // inet/cidr accessors. A `cidr` argument coerces to the `inet` overload
         // via the implicit cidr->inet cast, matching PG (whose inet functions
         // accept cidr). `abbrev` keeps a distinct cidr overload because its
-        // output differs (`10.1/16` vs `10.1.0.0/16`).
+        // output differs (`10.1/16` vs `10.1.0.0/16`); the inet overload is
+        // listed first so an untyped literal resolves to inet (PG's preferred
+        // type in the inet/cidr category), while a typed cidr still binds cidr.
         "host" => &[Signature { func: ScalarFn::Host, args: &[INET], ret: TEXT }],
         "masklen" => &[Signature { func: ScalarFn::Masklen, args: &[INET], ret: I4 }],
         "family" => &[Signature { func: ScalarFn::Family, args: &[INET], ret: I4 }],
         "network" => &[Signature { func: ScalarFn::Network, args: &[INET], ret: CIDR }],
         "abbrev" => &[
-            Signature { func: ScalarFn::AbbrevCidr, args: &[CIDR], ret: TEXT },
             Signature { func: ScalarFn::AbbrevInet, args: &[INET], ret: TEXT },
+            Signature { func: ScalarFn::AbbrevCidr, args: &[CIDR], ret: TEXT },
         ],
         _ => &[],
     }

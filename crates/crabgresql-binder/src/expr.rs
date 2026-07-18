@@ -1574,17 +1574,44 @@ fn is_net_ty(t: Option<PgType>) -> bool {
     matches!(t, Some(PgType::Inet | PgType::Cidr))
 }
 
-/// Materialize an operand of a network operator: a typed inet/cidr stays as is
-/// (comparisons/ops read both through `inet_of`), an untyped literal is parsed
-/// as `inet`, and any other type is an "operator does not exist" error.
-fn net_operand(b: &Binding, op: &ast::BinaryOperator) -> Result<BoundExpr, BindError> {
+/// The type name PG shows for an operand in an "operator does not exist"
+/// message; an untyped literal is `unknown`.
+fn operand_name(b: &Binding) -> &'static str {
+    binding_typed_ty(b).map_or("unknown", |t| t.name())
+}
+
+/// `operator does not exist: <lname> <op> <rname>`, with the real operand names
+/// in their actual order.
+fn net_no_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> BindError {
+    BindError::new(
+        sqlstate::UNDEFINED_FUNCTION,
+        format!("operator does not exist: {} {op} {}", operand_name(lb), operand_name(rb)),
+    )
+}
+
+/// Materialize a network operand: a typed inet/cidr as is (both read through
+/// `inet_of`), an untyped literal parsed as `inet`. `None` for a typed non-net
+/// operand, so the caller can report the full "operator does not exist" error.
+fn net_operand(b: &Binding) -> Option<Result<BoundExpr, BindError>> {
     match b {
-        Binding::Typed(e) if is_net_ty(Some(e.ty())) => Ok(e.clone()),
-        Binding::Typed(e) => Err(BindError::new(
-            sqlstate::UNDEFINED_FUNCTION,
-            format!("operator does not exist: inet {op} {}", e.ty().name()),
-        )),
-        Binding::Unknown { lit, span } => resolve_unknown(lit.clone(), *span, PgType::Inet),
+        Binding::Typed(e) if is_net_ty(Some(e.ty())) => Some(Ok(e.clone())),
+        Binding::Unknown { lit, span } => Some(resolve_unknown(lit.clone(), *span, PgType::Inet)),
+        Binding::Typed(_) => None,
+    }
+}
+
+/// Materialize the integer side of inet host arithmetic: a typed int2/int4/int8
+/// coerced to int8, or an untyped literal parsed as int8. `None` for any other
+/// typed operand — PG has only `inet ± bigint` (narrower ints widen), so e.g.
+/// `inet + numeric`/`inet + text` must report "operator does not exist" rather
+/// than silently coercing/truncating.
+fn int_operand(b: &Binding) -> Option<Result<BoundExpr, BindError>> {
+    match b {
+        Binding::Typed(e) if matches!(e.ty(), PgType::Int2 | PgType::Int4 | PgType::Int8) => {
+            Some(resolve_operand(b, PgType::Int8))
+        }
+        Binding::Unknown { .. } => Some(resolve_operand(b, PgType::Int8)),
+        Binding::Typed(_) => None,
     }
 }
 
@@ -1609,59 +1636,53 @@ fn resolve_network_op(
         })))
     };
 
-    // Containment / overlap (`<<` `>>` `&&`) and bitwise (`&` `|`) require an
-    // inet-family operand; without one, fall through so integer `&`/`|`/`<<`
-    // still error as before.
-    let boolean = match op {
-        B::PGBitwiseShiftLeft => Some(ScalarFn::NetworkContainedBy),
-        B::PGBitwiseShiftRight => Some(ScalarFn::NetworkContains),
-        B::PGOverlap => Some(ScalarFn::NetworkOverlaps),
+    // Containment / overlap (`<<` `>>` `&&`) and bitwise (`&` `|`) take two
+    // inet-family operands (result bool / inet). Without any net operand, fall
+    // through so integer `&`/`|`/`<<` still error as before.
+    let net_net = match op {
+        B::PGBitwiseShiftLeft => Some((ScalarFn::NetworkContainedBy, PgType::Bool)),
+        B::PGBitwiseShiftRight => Some((ScalarFn::NetworkContains, PgType::Bool)),
+        B::PGOverlap => Some((ScalarFn::NetworkOverlaps, PgType::Bool)),
+        B::BitwiseAnd => Some((ScalarFn::InetAnd, PgType::Inet)),
+        B::BitwiseOr => Some((ScalarFn::InetOr, PgType::Inet)),
         _ => None,
     };
-    if let Some(func) = boolean {
+    if let Some((func, ret)) = net_net {
         if !any_net {
             return Ok(None);
         }
-        return call(func, PgType::Bool, net_operand(lb, op)?, net_operand(rb, op)?);
-    }
-    let bitwise = match op {
-        B::BitwiseAnd => Some(ScalarFn::InetAnd),
-        B::BitwiseOr => Some(ScalarFn::InetOr),
-        _ => None,
-    };
-    if let Some(func) = bitwise {
-        if !any_net {
-            return Ok(None);
-        }
-        return call(func, PgType::Inet, net_operand(lb, op)?, net_operand(rb, op)?);
+        let (Some(a), Some(b)) = (net_operand(lb), net_operand(rb)) else {
+            return Err(net_no_operator(lb, op, rb));
+        };
+        return call(func, ret, a?, b?);
     }
 
-    // Host arithmetic: `inet ± int8`, `inet - inet`.
+    // Host arithmetic: `inet ± int8` (commutative for `+`), `inet - inet`.
     match op {
-        B::Plus if is_net_ty(lt) && !is_net_ty(rt) => call(
-            ScalarFn::InetPlInt8,
-            PgType::Inet,
-            net_operand(lb, op)?,
-            resolve_operand(rb, PgType::Int8)?,
-        ),
-        B::Plus if is_net_ty(rt) && !is_net_ty(lt) => call(
-            ScalarFn::InetPlInt8,
-            PgType::Inet,
-            net_operand(rb, op)?,
-            resolve_operand(lb, PgType::Int8)?,
-        ),
-        B::Minus if is_net_ty(lt) && is_net_ty(rt) => call(
-            ScalarFn::InetMi,
-            PgType::Int8,
-            net_operand(lb, op)?,
-            net_operand(rb, op)?,
-        ),
-        B::Minus if is_net_ty(lt) => call(
-            ScalarFn::InetMiInt8,
-            PgType::Inet,
-            net_operand(lb, op)?,
-            resolve_operand(rb, PgType::Int8)?,
-        ),
+        B::Plus if is_net_ty(lt) && !is_net_ty(rt) => {
+            let (Some(a), Some(n)) = (net_operand(lb), int_operand(rb)) else {
+                return Err(net_no_operator(lb, op, rb));
+            };
+            call(ScalarFn::InetPlInt8, PgType::Inet, a?, n?)
+        }
+        B::Plus if is_net_ty(rt) && !is_net_ty(lt) => {
+            let (Some(a), Some(n)) = (net_operand(rb), int_operand(lb)) else {
+                return Err(net_no_operator(lb, op, rb));
+            };
+            call(ScalarFn::InetPlInt8, PgType::Inet, a?, n?)
+        }
+        B::Minus if is_net_ty(lt) && is_net_ty(rt) => {
+            let (Some(a), Some(b)) = (net_operand(lb), net_operand(rb)) else {
+                return Err(net_no_operator(lb, op, rb));
+            };
+            call(ScalarFn::InetMi, PgType::Int8, a?, b?)
+        }
+        B::Minus if is_net_ty(lt) => {
+            let (Some(a), Some(n)) = (net_operand(lb), int_operand(rb)) else {
+                return Err(net_no_operator(lb, op, rb));
+            };
+            call(ScalarFn::InetMiInt8, PgType::Inet, a?, n?)
+        }
         _ => Ok(None),
     }
 }

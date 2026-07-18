@@ -48,6 +48,17 @@ SELECT host(inet '10.0.0.5/8')     AS host,
        network(inet '192.168.1.5/24') AS network,
        abbrev(inet '10.0.0.5/8')   AS abbrev;
 
+-- leading-zero octets are decimal (not octal), as in PG
+SELECT inet '192.168.001.1';
+
 -- invalid input is 22P02
 SELECT inet '999.1.1.1';
 SELECT inet '10.0.0.1/33';
+-- a leading '+' is not accepted
+SELECT inet '+1.2.3.4';
+
+-- host arithmetic only pairs inet with an integer; other right-hand types have
+-- no operator (rather than silently truncating)
+SELECT inet '10.0.0.1' + 3.5;
+-- and the "operator does not exist" message keeps the real operand order
+SELECT 'abc'::text << inet '10.0.0.0/8';

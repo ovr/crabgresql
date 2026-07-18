@@ -112,11 +112,11 @@ fn parse_ipv4(s: &str) -> Option<([u8; 4], usize)> {
     let mut out = [0u8; 4];
     let mut n = 0;
     for part in s.split('.') {
-        if n >= 4 || part.is_empty() || part.len() > 3 {
-            return None;
-        }
-        if part.len() > 1 && part.starts_with('0') {
-            // PG rejects leading zeros in inet octets.
+        // Each octet is 1..=3 decimal digits. PG's input treats leading zeros as
+        // decimal (`001` → 1, not octal) and accepts no sign/other characters, so
+        // reject anything that is not a bare run of ASCII digits.
+        if n >= 4 || part.is_empty() || part.len() > 3 || !part.bytes().all(|b| b.is_ascii_digit())
+        {
             return None;
         }
         let v: u16 = part.parse().ok()?;
@@ -130,6 +130,22 @@ fn parse_ipv4(s: &str) -> Option<([u8; 4], usize)> {
         return None;
     }
     Some((out, n))
+}
+
+/// PG's default masklen for a bare `cidr` (no `/bits`): the historical class of
+/// the first octet, widened to cover the octets actually written. Reproduces
+/// PG's observable output for `cidr '128'` (/16), `cidr '192'` (/24), etc.
+/// (The lone multicast-base literal `cidr '224'` is PG's one `/4` special case,
+/// not modeled here.)
+fn cidr_default_bits(first: u8, octets: usize) -> u8 {
+    let classful: u8 = match first {
+        0..=127 => 8,   // class A
+        128..=191 => 16, // class B
+        192..=223 => 24, // class C
+        224..=239 => 4,  // class D (multicast)
+        240..=255 => 32, // class E
+    };
+    classful.max((octets * 8) as u8)
 }
 
 /// Shared body of `inet_in`/`cidr_in`. `cidr` selects the stricter host-bits
@@ -160,15 +176,20 @@ fn parse_common(input: &str, cidr: bool) -> Result<Inet, NetError> {
     let max = if is_ipv6 { 128u8 } else { 32u8 };
     let bits = match mask_str {
         Some(m) => {
+            // The mask is a bare run of decimal digits (no sign), 0..=max.
+            if m.is_empty() || !m.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid(input));
+            }
             let b: u8 = m.parse().map_err(|_| invalid(input))?;
             if b > max {
                 return Err(invalid(input));
             }
             b
         }
-        // A bare `cidr` infers its masklen from the octets written (`10` → /8,
+        // A bare `cidr` infers its masklen from the first octet's historical
+        // class, widened to the octets written (`10` → /8, `128` → /16,
         // `192.168.1` → /24); a bare `inet` uses the full host mask.
-        None if cidr && !is_ipv6 => (octets * 8) as u8,
+        None if cidr && !is_ipv6 => cidr_default_bits(addr[0], octets),
         None => max,
     };
 
@@ -376,9 +397,15 @@ pub fn diff(a: &Inet, b: &Inet) -> Result<i64, NetError> {
     if av >= bv {
         i64::try_from(av - bv).map_err(|_| out_of_range())
     } else {
-        i64::try_from(bv - av)
-            .map(|d| -d)
-            .map_err(|_| out_of_range())
+        // The negative side reaches one further than `i64::MAX`: a magnitude of
+        // exactly 2^63 is the valid result `i64::MIN`. `(2^63 as i64)` wraps to
+        // `i64::MIN`, whose `wrapping_neg` is itself, giving the right value.
+        let d = bv - av;
+        if d <= 1u128 << 63 {
+            Ok((d as i64).wrapping_neg())
+        } else {
+            Err(out_of_range())
+        }
     }
 }
 
@@ -409,17 +436,57 @@ pub fn abbrev_inet(v: &Inet) -> String {
     inet_out(v)
 }
 
-/// `abbrev(cidr)`: drop trailing all-zero octets from the network address
-/// (`10.1.0.0/16` → `10.1/16`); IPv6 keeps the compressed form.
+/// `abbrev(cidr)`: the shortest unambiguous form of the network, dropping the
+/// address portion beyond the mask (`10.1.0.0/16` → `10.1/16`,
+/// `2001:db8::/32` → `2001:db8/32`), then the `/bits` suffix.
 pub fn abbrev_cidr(v: &Inet) -> String {
     let net = v.masked();
-    if net.is_ipv6 {
-        return format!("{}/{}", addr_str(&net), net.bits);
+    let addr = if net.is_ipv6 {
+        abbrev_ipv6(&net.addr, net.bits)
+    } else {
+        // Keep only the octets covered by the mask (rounded up), min one.
+        let octets = (net.bits as usize).div_ceil(8).max(1);
+        net.addr[..octets].iter().map(|b| b.to_string()).collect::<Vec<_>>().join(".")
+    };
+    format!("{}/{}", addr, net.bits)
+}
+
+/// PG's `inet_cidr_ntop` IPv6 rendering: show only the `ceil(bits/16)` groups
+/// covered by the mask. A zero-length prefix is `::`; a single group appends
+/// `::`; two or more groups use the standard `::` zero-run compression.
+fn abbrev_ipv6(addr: &[u8; 16], bits: u8) -> String {
+    let n = (bits as usize).div_ceil(16);
+    let group = |i: usize| ((addr[i * 2] as u16) << 8) | addr[i * 2 + 1] as u16;
+    if n == 0 {
+        return "::".to_string();
     }
-    // Keep only the octets covered by the mask (rounded up), min one.
-    let octets = (net.bits as usize).div_ceil(8).max(1);
-    let shown: Vec<String> = net.addr[..octets].iter().map(|b| b.to_string()).collect();
-    format!("{}/{}", shown.join("."), net.bits)
+    if n == 1 {
+        return format!("{:x}::", group(0));
+    }
+    let words: Vec<u16> = (0..n).map(group).collect();
+    // Longest run of zero groups (length ≥ 1), leftmost on ties.
+    let (mut best_start, mut best_len) = (0usize, 0usize);
+    let mut i = 0;
+    while i < words.len() {
+        if words[i] == 0 {
+            let start = i;
+            while i < words.len() && words[i] == 0 {
+                i += 1;
+            }
+            if i - start > best_len {
+                best_len = i - start;
+                best_start = start;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let hex = |ws: &[u16]| ws.iter().map(|w| format!("{w:x}")).collect::<Vec<_>>().join(":");
+    if best_len == 0 {
+        hex(&words)
+    } else {
+        format!("{}::{}", hex(&words[..best_start]), hex(&words[best_start + best_len..]))
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +529,50 @@ mod tests {
         assert_eq!(inet_in("999.1.1.1").unwrap_err().sqlstate, "22P02");
         assert_eq!(inet_in("1.2.3.4/33").unwrap_err().sqlstate, "22P02");
         assert_eq!(inet_in("garbage").unwrap_err().sqlstate, "22P02");
+        // A leading '+' is rejected in both octets and the mask (Rust's parse
+        // would otherwise accept it, unlike PG).
+        assert_eq!(inet_in("+1.2.3.4").unwrap_err().sqlstate, "22P02");
+        assert_eq!(inet_in("1.2.3.4/+8").unwrap_err().sqlstate, "22P02");
+    }
+
+    #[test]
+    fn leading_zero_octets_are_decimal() {
+        // PG treats leading zeros as decimal, not octal, and accepts them.
+        assert_eq!(inet_out(&inet("192.168.001.1")), "192.168.1.1");
+        assert_eq!(inet_out(&inet("010.0.0.1")), "10.0.0.1");
+    }
+
+    #[test]
+    fn cidr_default_masklen_is_classful() {
+        // A bare cidr's masklen follows the first octet's class, widened to the
+        // octets written (not a flat octets*8).
+        assert_eq!(cidr_out(&cidr("10")), "10.0.0.0/8");
+        assert_eq!(cidr_out(&cidr("128")), "128.0.0.0/16");
+        assert_eq!(cidr_out(&cidr("192")), "192.0.0.0/24");
+        assert_eq!(cidr_out(&cidr("240")), "240.0.0.0/32");
+        assert_eq!(cidr_out(&cidr("10.1")), "10.1.0.0/16");
+        assert_eq!(cidr_out(&cidr("192.168.1")), "192.168.1.0/24");
+    }
+
+    #[test]
+    fn abbrev_ipv6_truncates_to_mask() {
+        assert_eq!(abbrev_cidr(&cidr("2001:db8::/32")), "2001:db8/32");
+        assert_eq!(abbrev_cidr(&cidr("2001:db8:0:1::/64")), "2001:db8::1/64");
+        assert_eq!(abbrev_cidr(&cidr("ffff::/16")), "ffff::/16");
+        assert_eq!(abbrev_cidr(&cidr("2001:db8:1:2:3::/80")), "2001:db8:1:2:3/80");
+        assert_eq!(abbrev_cidr(&cidr("::/0")), "::/0");
+        assert_eq!(abbrev_cidr(&cidr("0:1::/32")), "::1/32");
+    }
+
+    #[test]
+    fn diff_reaches_i64_min() {
+        // A negative difference of exactly 2^63 is the valid result i64::MIN.
+        let a = inet("::");
+        let b = inet("::8000:0:0:0"); // 2^63
+        assert_eq!(diff(&a, &b).unwrap(), i64::MIN);
+        // One past that overflows.
+        let c = inet("::8000:0:0:1");
+        assert_eq!(diff(&a, &c).unwrap_err().sqlstate, "22003");
     }
 
     #[test]
