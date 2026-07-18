@@ -2,6 +2,7 @@ test: basic
 test: order_by
 test: errors
 test: cast
+test: create_type
 test: date
 test: time
 test: timetz

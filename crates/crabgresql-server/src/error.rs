@@ -10,6 +10,8 @@ pub struct PgError {
     pub message: String,
     /// Optional DETAIL line.
     pub detail: Option<String>,
+    /// Optional HINT line.
+    pub hint: Option<String>,
     /// 1-based (line, column) of the offending token, when PG reports a cursor
     /// position. Converted to a wire character offset when the error is sent.
     pub location: Option<(u64, u64)>,
@@ -21,6 +23,7 @@ impl PgError {
             code,
             message: message.into(),
             detail: None,
+            hint: None,
             location: None,
         }
     }
@@ -31,6 +34,18 @@ impl PgError {
 
     pub fn syntax(message: impl Into<String>) -> Self {
         Self::new(sqlstate::SYNTAX_ERROR, message)
+    }
+
+    /// Attach a DETAIL line.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Attach a HINT line.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
     }
 }
 
@@ -50,6 +65,7 @@ impl From<crabgresql_binder::BindError> for PgError {
             code: e.code,
             message: e.message,
             detail: e.detail,
+            hint: None,
             location: e.location,
         }
     }
@@ -61,6 +77,7 @@ impl From<crabgresql_executor::ExecError> for PgError {
             code: e.code,
             message: e.message,
             detail: e.detail,
+            hint: None,
             location: None,
         }
     }

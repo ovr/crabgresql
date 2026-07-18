@@ -15,13 +15,49 @@ use crabgresql_types::PgType;
 
 use crate::catalog::SessionCatalog;
 use crate::error::PgError;
+use crate::global_catalog::{CatalogNotice, GlobalCatalog, TypeRef};
 use crate::session::Session;
 
-/// A non-error message (severity WARNING) sent before a command's
-/// CommandComplete — e.g. "there is no transaction in progress".
+/// Severity of a non-error message sent before a command's CommandComplete.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NoticeSeverity {
+    /// A true `NOTICE` (e.g. "drop cascades to N other objects").
+    Notice,
+    /// A `WARNING` (e.g. "there is no transaction in progress").
+    Warning,
+}
+
+/// A non-error message sent before a command's CommandComplete.
 pub struct Notice {
+    pub severity: NoticeSeverity,
     pub code: &'static str,
     pub message: String,
+    pub detail: Option<String>,
+}
+
+impl Notice {
+    /// A `WARNING`-severity message (no DETAIL), as used by transaction control.
+    fn warning(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            severity: NoticeSeverity::Warning,
+            code,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    /// A `NOTICE`-severity message with an optional DETAIL line.
+    #[allow(clippy::self_named_constructors)]
+    fn notice(message: impl Into<String>, detail: Option<String>) -> Self {
+        Self {
+            severity: NoticeSeverity::Notice,
+            // psql does not print the SQLSTATE of a NOTICE; PG uses
+            // successful_completion (00000) for these.
+            code: "00000",
+            message: message.into(),
+            detail,
+        }
+    }
 }
 
 pub enum QueryResult {
@@ -50,6 +86,7 @@ impl QueryResult {
 
 pub fn execute_statement(
     engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
     stmt: &ast::Statement,
     session: &mut Session,
 ) -> Result<QueryResult, PgError> {
@@ -79,6 +116,32 @@ pub fn execute_statement(
         ast::Statement::CreateTable(create) => {
             return execute_create_table(engine, create, session);
         }
+        ast::Statement::CreateType {
+            name,
+            representation,
+        } => return execute_create_type(global_catalog, name, representation),
+        ast::Statement::CreateFunction(create) => {
+            return execute_create_function(global_catalog, create);
+        }
+        ast::Statement::CreateCast {
+            source,
+            target,
+            method,
+            ..
+        } => return execute_create_cast(global_catalog, source, target, method),
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Type,
+            names,
+            cascade,
+            if_exists,
+            ..
+        } => return execute_drop_type(global_catalog, names, *cascade, *if_exists),
+        ast::Statement::DropCast {
+            if_exists,
+            source,
+            target,
+            ..
+        } => return execute_drop_cast(global_catalog, source, target, *if_exists),
         ast::Statement::Set(set) => return apply_set(set, session),
         ast::Statement::Reset(reset) => return apply_reset(reset, session),
         ast::Statement::StartTransaction {
@@ -155,10 +218,10 @@ fn begin_transaction(
     if session.tx_status == TransactionStatus::InTransaction {
         return Ok(QueryResult::Command {
             tag: tag.into(),
-            notices: vec![Notice {
-                code: sqlstate::ACTIVE_SQL_TRANSACTION,
-                message: "there is already a transaction in progress".into(),
-            }],
+            notices: vec![Notice::warning(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "there is already a transaction in progress",
+            )],
         });
     }
     // Opening a new block: unsupported modes/modifiers are an honest 0A000.
@@ -193,10 +256,10 @@ fn commit_transaction(
     let tag = match session.tx_status {
         TransactionStatus::Failed => "ROLLBACK",
         TransactionStatus::Idle => {
-            notices.push(Notice {
-                code: sqlstate::NO_ACTIVE_SQL_TRANSACTION,
-                message: "there is no transaction in progress".into(),
-            });
+            notices.push(Notice::warning(
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                "there is no transaction in progress",
+            ));
             "COMMIT"
         }
         TransactionStatus::InTransaction => "COMMIT",
@@ -225,10 +288,10 @@ fn rollback_transaction(
     }
     let mut notices = Vec::new();
     if session.tx_status == TransactionStatus::Idle {
-        notices.push(Notice {
-            code: sqlstate::NO_ACTIVE_SQL_TRANSACTION,
-            message: "there is no transaction in progress".into(),
-        });
+        notices.push(Notice::warning(
+            sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+            "there is no transaction in progress",
+        ));
     }
     session.tx_status = TransactionStatus::Idle;
     Ok(QueryResult::Command {
@@ -379,16 +442,23 @@ fn normalize_ident(ident: &ast::Ident) -> String {
     }
 }
 
-fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, PgError> {
+/// A single-part object name, lowercased. `noun` names the object class for the
+/// error text ("relation", "type", "function"). Qualified names are not yet
+/// supported.
+fn single_object_name(name: &ast::ObjectName, noun: &str) -> Result<String, PgError> {
     if name.0.len() != 1 {
         return Err(PgError::feature_not_supported(format!(
-            "qualified relation names are not supported yet: {name}"
+            "qualified {noun} names are not supported yet: {name}"
         )));
     }
     match name.0[0].as_ident() {
         Some(ident) => Ok(normalize_ident(ident)),
-        None => Err(PgError::syntax(format!("invalid relation name: {name}"))),
+        None => Err(PgError::syntax(format!("invalid {noun} name: {name}"))),
     }
+}
+
+fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, PgError> {
+    single_object_name(name, "relation")
 }
 
 fn execute_create_table(
@@ -451,4 +521,246 @@ fn execute_create_table(
 /// on the type name mapping.
 fn map_data_type(dt: &ast::DataType) -> Result<PgType, PgError> {
     crabgresql_binder::map_data_type(dt).map_err(PgError::from)
+}
+
+/// Wrap catalog-produced notices as NOTICE-severity messages for the wire.
+fn to_notices(notices: Vec<CatalogNotice>) -> Vec<Notice> {
+    notices
+        .into_iter()
+        .map(|n| Notice::notice(n.message, n.detail))
+        .collect()
+}
+
+/// The single lowercased name of a bare custom type (e.g. `xfloat8`, `cstring`),
+/// or `None` for a built-in `DataType` variant.
+fn datatype_simple_name(dt: &ast::DataType) -> Option<String> {
+    match dt {
+        ast::DataType::Custom(obj, mods) if mods.is_empty() && obj.0.len() == 1 => {
+            obj.0[0].as_ident().map(normalize_ident)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a SQL type name to a catalog [`TypeRef`]: the `cstring` pseudo-type, a
+/// user-defined type (consulting the catalog), or a built-in type. A bare name
+/// that is neither a user type nor a known built-in is an undefined-object error
+/// (42704), matching PG — not a "not supported" feature gap.
+fn resolve_type_ref(catalog: &GlobalCatalog, dt: &ast::DataType) -> Result<TypeRef, PgError> {
+    if let Some(name) = datatype_simple_name(dt) {
+        if name == "cstring" {
+            return Ok(TypeRef::Cstring);
+        }
+        if catalog.is_user_type(&name) {
+            return Ok(TypeRef::User(name));
+        }
+        // A bare custom name is either a built-in spelled as a custom identifier
+        // (bpchar/varchar/name) or a genuinely unknown type.
+        return match crabgresql_binder::map_data_type(dt) {
+            Ok(pg) => Ok(TypeRef::Builtin(pg)),
+            Err(_) => Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("type \"{name}\" does not exist"),
+            )),
+        };
+    }
+    Ok(TypeRef::Builtin(map_data_type(dt)?))
+}
+
+/// The built-in type a catalog type name refers to (for a `LIKE` clause), so its
+/// `pg_type.typlen` can be read from the authoritative `PgType::typlen()` rather
+/// than a second width table.
+fn builtin_type_by_name(name: &str) -> Option<PgType> {
+    Some(match name {
+        "int8" | "bigint" => PgType::Int8,
+        "int4" | "integer" | "int" => PgType::Int4,
+        "int2" | "smallint" => PgType::Int2,
+        "float8" | "double precision" => PgType::Float8,
+        "float4" | "real" => PgType::Float4,
+        "numeric" | "decimal" => PgType::Numeric,
+        "bool" | "boolean" => PgType::Bool,
+        "bytea" => PgType::Bytea,
+        "text" => PgType::Text,
+        "varchar" | "character varying" => PgType::Varchar,
+        "bpchar" | "char" | "character" => PgType::Bpchar,
+        "name" => PgType::Name,
+        "bit" => PgType::Bit,
+        "date" => PgType::Date,
+        "time" => PgType::Time,
+        "timetz" => PgType::TimeTz,
+        "timestamp" => PgType::Timestamp,
+        "timestamptz" => PgType::TimestampTz,
+        "interval" => PgType::Interval,
+        _ => return None,
+    })
+}
+
+/// Derive a base type's physical width (`pg_type.typlen`) from its CREATE TYPE
+/// options: `INTERNALLENGTH` or `LIKE`. Defaults to variable (-1).
+fn typlen_from_options(
+    catalog: &GlobalCatalog,
+    options: &[ast::UserDefinedTypeSqlDefinitionOption],
+) -> i32 {
+    use ast::UserDefinedTypeSqlDefinitionOption as Opt;
+    let mut typlen = -1;
+    for opt in options {
+        match opt {
+            Opt::InternalLength(ast::UserDefinedTypeInternalLength::Fixed(n)) => typlen = *n as i32,
+            Opt::InternalLength(ast::UserDefinedTypeInternalLength::Variable) => typlen = -1,
+            Opt::Like(name) => {
+                if let Some(n) = name.0.last().and_then(|p| p.as_ident()).map(normalize_ident)
+                    && let Some(len) = catalog
+                        .user_type_typlen(&n)
+                        .or_else(|| builtin_type_by_name(&n).map(|t| t.typlen() as i32))
+                {
+                    typlen = len;
+                }
+            }
+            _ => {}
+        }
+    }
+    typlen
+}
+
+/// `CREATE TYPE name;` (shell) or `CREATE TYPE name (INPUT=..., OUTPUT=..., ...)`.
+fn execute_create_type(
+    catalog: &GlobalCatalog,
+    name: &ast::ObjectName,
+    representation: &Option<ast::UserDefinedTypeRepresentation>,
+) -> Result<QueryResult, PgError> {
+    let tname = single_object_name(name, "type")?;
+    let notices = match representation {
+        None => catalog.create_shell_type(&tname)?,
+        Some(ast::UserDefinedTypeRepresentation::SqlDefinition { options }) => {
+            let typlen = typlen_from_options(catalog, options);
+            catalog.define_type(&tname, typlen)?
+        }
+        Some(_) => {
+            return Err(PgError::feature_not_supported(
+                "CREATE TYPE AS (composite / enum / range) is not supported yet",
+            ));
+        }
+    };
+    Ok(QueryResult::Command {
+        tag: "CREATE TYPE".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// The `AS '<builtin>'` internal function name of a `LANGUAGE internal` function.
+fn function_internal_name(create: &ast::CreateFunction) -> Result<String, PgError> {
+    match &create.function_body {
+        Some(ast::CreateFunctionBody::AsBeforeOptions { body, .. })
+        | Some(ast::CreateFunctionBody::AsAfterOptions(body)) => string_literal(body),
+        _ => Err(PgError::feature_not_supported(
+            "CREATE FUNCTION LANGUAGE internal requires AS '<builtin>'",
+        )),
+    }
+}
+
+/// Extract a single-quoted (or dollar-quoted) string literal expression.
+fn string_literal(expr: &ast::Expr) -> Result<String, PgError> {
+    match expr {
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::SingleQuotedString(s) => Ok(s.clone()),
+            ast::Value::DollarQuotedString(d) => Ok(d.value.clone()),
+            other => Err(PgError::syntax(format!(
+                "expected a string literal, found: {other}"
+            ))),
+        },
+        other => Err(PgError::syntax(format!(
+            "expected a string literal, found: {other}"
+        ))),
+    }
+}
+
+/// `CREATE FUNCTION ... LANGUAGE internal AS '<builtin>'`.
+fn execute_create_function(
+    catalog: &GlobalCatalog,
+    create: &ast::CreateFunction,
+) -> Result<QueryResult, PgError> {
+    let lang = create.language.as_ref().map(|i| i.value.to_ascii_lowercase());
+    if lang.as_deref() != Some("internal") {
+        return Err(PgError::feature_not_supported(
+            "CREATE FUNCTION is only supported for LANGUAGE internal",
+        ));
+    }
+    let internal_name = function_internal_name(create)?;
+    let name = single_object_name(&create.name, "function")?;
+    let ret = match &create.return_type {
+        Some(ast::FunctionReturnType::DataType(dt)) => resolve_type_ref(catalog, dt)?,
+        Some(ast::FunctionReturnType::SetOf(_)) => {
+            return Err(PgError::feature_not_supported(
+                "SETOF return types are not supported yet",
+            ));
+        }
+        None => {
+            return Err(PgError::feature_not_supported(
+                "CREATE FUNCTION without RETURNS is not supported yet",
+            ));
+        }
+    };
+    let mut args = Vec::new();
+    for arg in create.args.iter().flatten() {
+        args.push(resolve_type_ref(catalog, &arg.data_type)?);
+    }
+    let notices = catalog.create_function(&name, args, ret, &internal_name)?;
+    Ok(QueryResult::Command {
+        tag: "CREATE FUNCTION".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// `CREATE CAST (source AS target) ...`.
+fn execute_create_cast(
+    catalog: &GlobalCatalog,
+    source: &ast::DataType,
+    target: &ast::DataType,
+    method: &ast::CastMethod,
+) -> Result<QueryResult, PgError> {
+    let source_ref = resolve_type_ref(catalog, source)?;
+    let target_ref = resolve_type_ref(catalog, target)?;
+    let without_function = matches!(method, ast::CastMethod::WithoutFunction);
+    let notices = catalog.create_cast(source_ref, target_ref, without_function)?;
+    Ok(QueryResult::Command {
+        tag: "CREATE CAST".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// `DROP TYPE name [, ...] [CASCADE|RESTRICT]`. All names are resolved and
+/// validated before any type is removed, so a failure on one target leaves the
+/// others intact (PG runs a multi-target DROP atomically).
+fn execute_drop_type(
+    catalog: &GlobalCatalog,
+    names: &[ast::ObjectName],
+    cascade: bool,
+    if_exists: bool,
+) -> Result<QueryResult, PgError> {
+    let tnames = names
+        .iter()
+        .map(|name| single_object_name(name, "type"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let refs: Vec<&str> = tnames.iter().map(String::as_str).collect();
+    let notices = catalog.drop_types(&refs, cascade, if_exists)?;
+    Ok(QueryResult::Command {
+        tag: "DROP TYPE".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// `DROP CAST (source AS target) [CASCADE|RESTRICT]`.
+fn execute_drop_cast(
+    catalog: &GlobalCatalog,
+    source: &ast::DataType,
+    target: &ast::DataType,
+    if_exists: bool,
+) -> Result<QueryResult, PgError> {
+    let source_ref = resolve_type_ref(catalog, source)?;
+    let target_ref = resolve_type_ref(catalog, target)?;
+    let notices = catalog.drop_cast(source_ref, target_ref, if_exists)?;
+    Ok(QueryResult::Command {
+        tag: "DROP CAST".into(),
+        notices: to_notices(notices),
+    })
 }

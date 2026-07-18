@@ -63,7 +63,8 @@ pub use self::ddl::{
     AlterPolicyOperation, AlterSchema, AlterSchemaOperation, AlterTable, AlterTableAlgorithm,
     AlterTableLock, AlterTableOperation, AlterTableType, AlterType, AlterTypeAddValue,
     AlterTypeAddValuePosition, AlterTypeOperation, AlterTypeRename, AlterTypeRenameValue,
-    ClusteredBy, ColumnDef, ColumnOption, ColumnOptionDef, ColumnOptions, ColumnPolicy,
+    CastContext, CastMethod, ClusteredBy, ColumnDef, ColumnOption, ColumnOptionDef, ColumnOptions,
+    ColumnPolicy,
     ColumnPolicyProperty, ConstraintCharacteristics, CreateCollation, CreateCollationDefinition,
     CreateConnector, CreateDomain, CreateExtension, CreateFunction, CreateIndex, CreateOperator,
     CreateOperatorClass, CreateOperatorFamily, CreatePolicy, CreatePolicyCommand, CreatePolicyType,
@@ -4208,6 +4209,39 @@ pub enum Statement {
         representation: Option<UserDefinedTypeRepresentation>,
     },
     /// ```sql
+    /// CREATE CAST (source_type AS target_type)
+    ///   { WITH FUNCTION function_name [ (argument_type [, ...]) ]
+    ///   | WITHOUT FUNCTION
+    ///   | WITH INOUT } [ AS ASSIGNMENT | AS IMPLICIT ]
+    /// ```
+    ///
+    /// See <https://www.postgresql.org/docs/current/sql-createcast.html>
+    CreateCast {
+        /// The source type of the cast.
+        source: DataType,
+        /// The target type of the cast.
+        target: DataType,
+        /// How the conversion is performed.
+        method: CastMethod,
+        /// The context in which the cast may be invoked.
+        context: CastContext,
+    },
+    /// ```sql
+    /// DROP CAST [ IF EXISTS ] (source_type AS target_type) [ CASCADE | RESTRICT ]
+    /// ```
+    ///
+    /// See <https://www.postgresql.org/docs/current/sql-dropcast.html>
+    DropCast {
+        /// `IF EXISTS`.
+        if_exists: bool,
+        /// The source type of the cast.
+        source: DataType,
+        /// The target type of the cast.
+        target: DataType,
+        /// `CASCADE` or `RESTRICT`.
+        behavior: Option<DropBehavior>,
+    },
+    /// ```sql
     /// LOCK [ TABLE ] [ ONLY ] name [ * ] [, ...] [ IN lockmode MODE ] [ NOWAIT ]
     /// ```
     ///
@@ -4988,6 +5022,34 @@ impl fmt::Display for Statement {
                 write!(f, "CREATE TYPE {name}")?;
                 if let Some(repr) = representation {
                     write!(f, " {repr}")?;
+                }
+                Ok(())
+            }
+            Statement::CreateCast {
+                source,
+                target,
+                method,
+                context,
+            } => {
+                write!(f, "CREATE CAST ({source} AS {target}) {method}")?;
+                if !matches!(context, CastContext::Explicit) {
+                    write!(f, " {context}")?;
+                }
+                Ok(())
+            }
+            Statement::DropCast {
+                if_exists,
+                source,
+                target,
+                behavior,
+            } => {
+                write!(f, "DROP CAST ")?;
+                if *if_exists {
+                    write!(f, "IF EXISTS ")?;
+                }
+                write!(f, "({source} AS {target})")?;
+                if let Some(behavior) = behavior {
+                    write!(f, " {behavior}")?;
                 }
                 Ok(())
             }

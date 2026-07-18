@@ -4826,9 +4826,98 @@ impl<'a> Parser<'a> {
             }
         } else if self.parse_keyword(Keyword::SERVER) {
             self.parse_pg_create_server()
+        } else if self.parse_keyword(Keyword::CAST) {
+            self.parse_create_cast()
         } else {
             self.expected_ref("an object type after CREATE", self.peek_token_ref())
         }
+    }
+
+    /// Parse `CREATE CAST` statement.
+    ///
+    /// ```sql
+    /// CREATE CAST (source_type AS target_type)
+    ///   { WITH FUNCTION function_name [ (argument_type [, ...]) ]
+    ///   | WITHOUT FUNCTION
+    ///   | WITH INOUT } [ AS ASSIGNMENT | AS IMPLICIT ]
+    /// ```
+    ///
+    /// See [PostgreSQL](https://www.postgresql.org/docs/current/sql-createcast.html)
+    fn parse_create_cast(&mut self) -> Result<Statement, ParserError> {
+        self.expect_token(&Token::LParen)?;
+        let source = self.parse_data_type()?;
+        self.expect_keyword_is(Keyword::AS)?;
+        let target = self.parse_data_type()?;
+        self.expect_token(&Token::RParen)?;
+
+        let method = if self.parse_keywords(&[Keyword::WITHOUT, Keyword::FUNCTION]) {
+            CastMethod::WithoutFunction
+        } else if self.parse_keywords(&[Keyword::WITH, Keyword::INOUT]) {
+            CastMethod::WithInout
+        } else if self.parse_keywords(&[Keyword::WITH, Keyword::FUNCTION]) {
+            let name = self.parse_object_name(false)?;
+            let args = if self.consume_token(&Token::LParen) {
+                let args = self.parse_comma_separated(Parser::parse_data_type)?;
+                self.expect_token(&Token::RParen)?;
+                Some(args)
+            } else {
+                None
+            };
+            CastMethod::WithFunction { name, args }
+        } else {
+            return self.expected_ref(
+                "WITH FUNCTION, WITHOUT FUNCTION, or WITH INOUT",
+                self.peek_token_ref(),
+            );
+        };
+
+        // `AS ASSIGNMENT` / `AS IMPLICIT` — ASSIGNMENT and IMPLICIT are not
+        // keywords, so read the following word and match it case-insensitively.
+        let context = if self.parse_keyword(Keyword::AS) {
+            let word = self.parse_identifier()?;
+            match word.value.to_ascii_lowercase().as_str() {
+                "assignment" => CastContext::Assignment,
+                "implicit" => CastContext::Implicit,
+                _ => {
+                    return self.expected_ref(
+                        "ASSIGNMENT or IMPLICIT after AS",
+                        self.peek_token_ref(),
+                    );
+                }
+            }
+        } else {
+            CastContext::Explicit
+        };
+
+        Ok(Statement::CreateCast {
+            source,
+            target,
+            method,
+            context,
+        })
+    }
+
+    /// Parse `DROP CAST` statement.
+    ///
+    /// ```sql
+    /// DROP CAST [ IF EXISTS ] (source_type AS target_type) [ CASCADE | RESTRICT ]
+    /// ```
+    ///
+    /// See [PostgreSQL](https://www.postgresql.org/docs/current/sql-dropcast.html)
+    fn parse_drop_cast(&mut self) -> Result<Statement, ParserError> {
+        let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        self.expect_token(&Token::LParen)?;
+        let source = self.parse_data_type()?;
+        self.expect_keyword_is(Keyword::AS)?;
+        let target = self.parse_data_type()?;
+        self.expect_token(&Token::RParen)?;
+        let behavior = self.parse_optional_drop_behavior();
+        Ok(Statement::DropCast {
+            if_exists,
+            source,
+            target,
+            behavior,
+        })
     }
 
 
@@ -6488,6 +6577,8 @@ impl<'a> Parser<'a> {
             } else {
                 self.parse_drop_operator()
             };
+        } else if self.parse_keyword(Keyword::CAST) {
+            return self.parse_drop_cast();
         } else {
             return self.expected_ref(
                 "COLLATION, CONNECTOR, DATABASE, EXTENSION, FUNCTION, INDEX, OPERATOR, POLICY, PROCEDURE, ROLE, SCHEMA, SECRET, SEQUENCE, STAGE, TABLE, TRIGGER, TYPE, VIEW, MATERIALIZED VIEW or USER after DROP",
@@ -17320,6 +17411,37 @@ mod tests {
     use crate::test_utils::{all_dialects, TestedDialects};
 
     use super::*;
+
+    #[test]
+    fn parse_create_cast_round_trips() {
+        let dialects = all_dialects();
+        for sql in [
+            "CREATE CAST (xfloat8 AS BIGINT) WITHOUT FUNCTION",
+            "CREATE CAST (xfloat8 AS BIGINT) WITH INOUT",
+            "CREATE CAST (foo AS bar) WITH FUNCTION foo_to_bar AS ASSIGNMENT",
+            "CREATE CAST (foo AS bar) WITH FUNCTION foo_to_bar(foo) AS IMPLICIT",
+        ] {
+            assert!(matches!(
+                dialects.verified_stmt(sql),
+                Statement::CreateCast { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_drop_cast_round_trips() {
+        let dialects = all_dialects();
+        for sql in [
+            "DROP CAST (xfloat8 AS BIGINT)",
+            "DROP CAST IF EXISTS (foo AS bar) CASCADE",
+            "DROP CAST (foo AS bar) RESTRICT",
+        ] {
+            assert!(matches!(
+                dialects.verified_stmt(sql),
+                Statement::DropCast { .. }
+            ));
+        }
+    }
 
     #[test]
     fn test_prev_index() {

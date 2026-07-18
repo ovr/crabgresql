@@ -385,6 +385,8 @@ impl Spanned for Statement {
             Statement::Merge(merge) => merge.span(),
             Statement::CreateSequence { .. } => Span::empty(),
             Statement::CreateType { .. } => Span::empty(),
+            Statement::CreateCast { .. } => Span::empty(),
+            Statement::DropCast { .. } => Span::empty(),
             Statement::Lock(_) => Span::empty(),
             Statement::CreatePolicy { .. } => Span::empty(),
             Statement::AlterPolicy { .. } => Span::empty(),

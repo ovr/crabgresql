@@ -2357,6 +2357,63 @@ impl fmt::Display for DropBehavior {
     }
 }
 
+/// The function specification of a `CREATE CAST` statement.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum CastMethod {
+    /// `WITH FUNCTION function_name [ (argument_type [, ...]) ]`
+    WithFunction {
+        /// The conversion function's name.
+        name: ObjectName,
+        /// The optional explicit argument-type list.
+        args: Option<Vec<DataType>>,
+    },
+    /// `WITHOUT FUNCTION` — a binary-coercible cast.
+    WithoutFunction,
+    /// `WITH INOUT` — a cast implemented via the types' I/O functions.
+    WithInout,
+}
+
+impl fmt::Display for CastMethod {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            CastMethod::WithFunction { name, args } => {
+                write!(f, "WITH FUNCTION {name}")?;
+                if let Some(args) = args {
+                    write!(f, "({})", display_comma_separated(args))?;
+                }
+                Ok(())
+            }
+            CastMethod::WithoutFunction => f.write_str("WITHOUT FUNCTION"),
+            CastMethod::WithInout => f.write_str("WITH INOUT"),
+        }
+    }
+}
+
+/// The invocation context of a `CREATE CAST` statement.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum CastContext {
+    /// Default — the cast may only be invoked explicitly.
+    Explicit,
+    /// `AS ASSIGNMENT` — the cast may also be invoked implicitly in assignment.
+    Assignment,
+    /// `AS IMPLICIT` — the cast may be invoked implicitly in any context.
+    Implicit,
+}
+
+impl fmt::Display for CastContext {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            CastContext::Explicit => "",
+            CastContext::Assignment => "AS ASSIGNMENT",
+            CastContext::Implicit => "AS IMPLICIT",
+        })
+    }
+}
+
 /// SQL user defined type definition
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

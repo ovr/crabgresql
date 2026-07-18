@@ -219,9 +219,24 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
         detail: Option<&str>,
         position: Option<usize>,
     ) {
+        self.error_response_detailed(code, message, detail, None, position);
+    }
+
+    /// ErrorResponse with optional DETAIL, HINT, and cursor position.
+    pub fn error_response_detailed(
+        &mut self,
+        code: &str,
+        message: &str,
+        detail: Option<&str>,
+        hint: Option<&str>,
+        position: Option<usize>,
+    ) {
         let mut fields = ErrorFields::error(code, message);
         if let Some(detail) = detail {
             fields = fields.with_detail(detail);
+        }
+        if let Some(hint) = hint {
+            fields = fields.with_hint(hint);
         }
         if let Some(position) = position {
             fields = fields.with_position(position);
