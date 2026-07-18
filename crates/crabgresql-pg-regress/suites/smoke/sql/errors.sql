@@ -5,7 +5,7 @@
 --
 SELECT * FROM missing;
 SELEC 1;
-SELECT 1 LIMIT 1;
+SELECT 1 FETCH FIRST 1 ROW ONLY;
 SELECT 'still alive' AS status;
 -- metacommands are not implemented; the runner emits a deterministic stub
 \d crabs

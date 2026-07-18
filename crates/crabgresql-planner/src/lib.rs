@@ -49,6 +49,13 @@ pub enum PhysicalPlan {
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
     },
+    /// LIMIT/OFFSET above a source plan (after its sort). Mirrors
+    /// [`LogicalPlan::Limit`].
+    Limit {
+        source: Box<PhysicalPlan>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
     Insert {
         table: Arc<dyn TableAm>,
         rows: Vec<Vec<BoundExpr>>,
@@ -148,6 +155,15 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             projections,
             predicate,
             sort,
+        },
+        LogicalPlan::Limit {
+            source,
+            limit,
+            offset,
+        } => PhysicalPlan::Limit {
+            source: Box::new(plan(*source)),
+            limit,
+            offset,
         },
         LogicalPlan::Insert { table, rows } => PhysicalPlan::Insert { table, rows },
         LogicalPlan::Update {
