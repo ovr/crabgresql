@@ -270,14 +270,7 @@ impl Spanned for Values {
 /// - [Statement::Fetch]
 /// - [Statement::Discard]
 /// - [Statement::Set]
-/// - [Statement::ShowFunctions]
 /// - [Statement::ShowVariable]
-/// - [Statement::ShowStatus]
-/// - [Statement::ShowVariables]
-/// - [Statement::ShowCreate]
-/// - [Statement::ShowColumns]
-/// - [Statement::ShowTables]
-/// - [Statement::ShowCollation]
 /// - [Statement::StartTransaction]
 /// - [Statement::Comment]
 /// - [Statement::Commit]
@@ -372,15 +365,7 @@ impl Spanned for Statement {
             Statement::Fetch { .. } => Span::empty(),
             Statement::Discard { .. } => Span::empty(),
             Statement::Set(_) => Span::empty(),
-            Statement::ShowFunctions { .. } => Span::empty(),
             Statement::ShowVariable { .. } => Span::empty(),
-            Statement::ShowStatus { .. } => Span::empty(),
-            Statement::ShowVariables { .. } => Span::empty(),
-            Statement::ShowCreate { .. } => Span::empty(),
-            Statement::ShowColumns { .. } => Span::empty(),
-            Statement::ShowTables { .. } => Span::empty(),
-            Statement::ShowCollation { .. } => Span::empty(),
-            Statement::ShowCharset { .. } => Span::empty(),
             Statement::Use(u) => u.span(),
             Statement::StartTransaction { .. } => Span::empty(),
             Statement::Comment { .. } => Span::empty(),
@@ -409,11 +394,6 @@ impl Spanned for Statement {
             Statement::CreatePolicy { .. } => Span::empty(),
             Statement::AlterPolicy { .. } => Span::empty(),
             Statement::DropPolicy { .. } => Span::empty(),
-            Statement::ShowCatalogs { .. } => Span::empty(),
-            Statement::ShowDatabases { .. } => Span::empty(),
-            Statement::ShowProcessList { .. } => Span::empty(),
-            Statement::ShowSchemas { .. } => Span::empty(),
-            Statement::ShowViews { .. } => Span::empty(),
             Statement::LISTEN { .. } => Span::empty(),
             Statement::NOTIFY { .. } => Span::empty(),
             Statement::UNLISTEN { .. } => Span::empty(),
