@@ -11498,47 +11498,9 @@ impl<'a> Parser<'a> {
         Ok(IdentWithAlias { ident, alias })
     }
 
-    /// Parse `identifier [AS] identifier` where the AS keyword is optional
-    fn parse_identifier_with_optional_alias(&mut self) -> Result<IdentWithAlias, ParserError> {
-        let ident = self.parse_identifier()?;
-        let _after_as = self.parse_keyword(Keyword::AS);
-        let alias = self.parse_identifier()?;
-        Ok(IdentWithAlias { ident, alias })
-    }
 
-    /// Parse comma-separated list of parenthesized queries for pipe operators
-    fn parse_pipe_operator_queries(&mut self) -> Result<Vec<Query>, ParserError> {
-        self.parse_comma_separated(|parser| {
-            parser.expect_token(&Token::LParen)?;
-            let query = parser.parse_query()?;
-            parser.expect_token(&Token::RParen)?;
-            Ok(*query)
-        })
-    }
 
-    /// Parse set quantifier for pipe operators that require DISTINCT. E.g. INTERSECT and EXCEPT
-    fn parse_distinct_required_set_quantifier(
-        &mut self,
-        operator_name: &str,
-    ) -> Result<SetQuantifier, ParserError> {
-        let quantifier = self.parse_set_quantifier(&Some(SetOperator::Intersect));
-        match quantifier {
-            SetQuantifier::Distinct | SetQuantifier::DistinctByName => Ok(quantifier),
-            _ => Err(ParserError::ParserError(format!(
-                "{operator_name} pipe operator requires DISTINCT modifier",
-            ))),
-        }
-    }
 
-    /// Parse optional identifier alias (with or without AS keyword)
-    fn parse_identifier_optional_alias(&mut self) -> Result<Option<Ident>, ParserError> {
-        if self.parse_keyword(Keyword::AS) {
-            Ok(Some(self.parse_identifier()?))
-        } else {
-            // Check if the next token is an identifier (implicit alias)
-            self.maybe_parse(|parser| parser.parse_identifier())
-        }
-    }
 
     /// Optionally parses an alias for a select list item
     fn maybe_parse_select_item_alias(&mut self) -> Result<Option<Ident>, ParserError> {
@@ -12584,10 +12546,6 @@ impl<'a> Parser<'a> {
                 limit_clause: None,
                 fetch: None,
                 locks: vec![],
-                for_clause: None,
-                settings: None,
-                format_clause: None,
-                pipe_operators: vec![],
             }
             .into())
         } else if self.parse_keyword(Keyword::UPDATE) {
@@ -12598,10 +12556,6 @@ impl<'a> Parser<'a> {
                 limit_clause: None,
                 fetch: None,
                 locks: vec![],
-                for_clause: None,
-                settings: None,
-                format_clause: None,
-                pipe_operators: vec![],
             }
             .into())
         } else if self.parse_keyword(Keyword::DELETE) {
@@ -12612,10 +12566,6 @@ impl<'a> Parser<'a> {
                 order_by: None,
                 fetch: None,
                 locks: vec![],
-                for_clause: None,
-                settings: None,
-                format_clause: None,
-                pipe_operators: vec![],
             }
             .into())
         } else if self.parse_keyword(Keyword::MERGE) {
@@ -12626,10 +12576,6 @@ impl<'a> Parser<'a> {
                 order_by: None,
                 fetch: None,
                 locks: vec![],
-                for_clause: None,
-                settings: None,
-                format_clause: None,
-                pipe_operators: vec![],
             }
             .into())
         } else {
@@ -12639,41 +12585,16 @@ impl<'a> Parser<'a> {
 
             let limit_clause = self.parse_optional_limit_clause()?;
 
-            let settings = self.parse_settings()?;
-
             let fetch = if self.parse_keyword(Keyword::FETCH) {
                 Some(self.parse_fetch()?)
             } else {
                 None
             };
 
-            let mut for_clause = None;
             let mut locks = Vec::new();
             while self.parse_keyword(Keyword::FOR) {
-                if let Some(parsed_for_clause) = self.parse_for_clause()? {
-                    for_clause = Some(parsed_for_clause);
-                    break;
-                } else {
-                    locks.push(self.parse_lock()?);
-                }
+                locks.push(self.parse_lock()?);
             }
-            let format_clause =
-                if self.dialect.supports_select_format() && self.parse_keyword(Keyword::FORMAT) {
-                    if self.parse_keyword(Keyword::NULL) {
-                        Some(FormatClause::Null)
-                    } else {
-                        let ident = self.parse_identifier()?;
-                        Some(FormatClause::Identifier(ident))
-                    }
-                } else {
-                    None
-                };
-
-            let pipe_operators = if self.dialect.supports_pipe_operator() {
-                self.parse_pipe_operators()?
-            } else {
-                Vec::new()
-            };
 
             Ok(Query {
                 with,
@@ -12682,233 +12603,11 @@ impl<'a> Parser<'a> {
                 limit_clause,
                 fetch,
                 locks,
-                for_clause,
-                settings,
-                format_clause,
-                pipe_operators,
             }
             .into())
         }
     }
 
-    fn parse_pipe_operators(&mut self) -> Result<Vec<PipeOperator>, ParserError> {
-        let mut pipe_operators = Vec::new();
-
-        while self.consume_token(&Token::VerticalBarRightAngleBracket) {
-            let kw = self.expect_one_of_keywords(&[
-                Keyword::SELECT,
-                Keyword::EXTEND,
-                Keyword::SET,
-                Keyword::DROP,
-                Keyword::AS,
-                Keyword::WHERE,
-                Keyword::LIMIT,
-                Keyword::AGGREGATE,
-                Keyword::ORDER,
-                Keyword::TABLESAMPLE,
-                Keyword::RENAME,
-                Keyword::UNION,
-                Keyword::INTERSECT,
-                Keyword::EXCEPT,
-                Keyword::CALL,
-                Keyword::PIVOT,
-                Keyword::UNPIVOT,
-                Keyword::JOIN,
-                Keyword::INNER,
-                Keyword::LEFT,
-                Keyword::RIGHT,
-                Keyword::FULL,
-                Keyword::CROSS,
-            ])?;
-            match kw {
-                Keyword::SELECT => {
-                    let exprs = self.parse_comma_separated(Parser::parse_select_item)?;
-                    pipe_operators.push(PipeOperator::Select { exprs })
-                }
-                Keyword::EXTEND => {
-                    let exprs = self.parse_comma_separated(Parser::parse_select_item)?;
-                    pipe_operators.push(PipeOperator::Extend { exprs })
-                }
-                Keyword::SET => {
-                    let assignments = self.parse_comma_separated(Parser::parse_assignment)?;
-                    pipe_operators.push(PipeOperator::Set { assignments })
-                }
-                Keyword::DROP => {
-                    let columns = self.parse_identifiers()?;
-                    pipe_operators.push(PipeOperator::Drop { columns })
-                }
-                Keyword::AS => {
-                    let alias = self.parse_identifier()?;
-                    pipe_operators.push(PipeOperator::As { alias })
-                }
-                Keyword::WHERE => {
-                    let expr = self.parse_expr()?;
-                    pipe_operators.push(PipeOperator::Where { expr })
-                }
-                Keyword::LIMIT => {
-                    let expr = self.parse_expr()?;
-                    let offset = if self.parse_keyword(Keyword::OFFSET) {
-                        Some(self.parse_expr()?)
-                    } else {
-                        None
-                    };
-                    pipe_operators.push(PipeOperator::Limit { expr, offset })
-                }
-                Keyword::AGGREGATE => {
-                    let full_table_exprs = if self.peek_keyword(Keyword::GROUP) {
-                        vec![]
-                    } else {
-                        self.parse_comma_separated(|parser| {
-                            parser.parse_expr_with_alias_and_order_by()
-                        })?
-                    };
-
-                    let group_by_expr = if self.parse_keywords(&[Keyword::GROUP, Keyword::BY]) {
-                        self.parse_comma_separated(|parser| {
-                            parser.parse_expr_with_alias_and_order_by()
-                        })?
-                    } else {
-                        vec![]
-                    };
-
-                    pipe_operators.push(PipeOperator::Aggregate {
-                        full_table_exprs,
-                        group_by_expr,
-                    })
-                }
-                Keyword::ORDER => {
-                    self.expect_one_of_keywords(&[Keyword::BY])?;
-                    let exprs = self.parse_comma_separated(Parser::parse_order_by_expr)?;
-                    pipe_operators.push(PipeOperator::OrderBy { exprs })
-                }
-                Keyword::TABLESAMPLE => {
-                    let sample = self.parse_table_sample(TableSampleModifier::TableSample)?;
-                    pipe_operators.push(PipeOperator::TableSample { sample });
-                }
-                Keyword::RENAME => {
-                    let mappings =
-                        self.parse_comma_separated(Parser::parse_identifier_with_optional_alias)?;
-                    pipe_operators.push(PipeOperator::Rename { mappings });
-                }
-                Keyword::UNION => {
-                    let set_quantifier = self.parse_set_quantifier(&Some(SetOperator::Union));
-                    let queries = self.parse_pipe_operator_queries()?;
-                    pipe_operators.push(PipeOperator::Union {
-                        set_quantifier,
-                        queries,
-                    });
-                }
-                Keyword::INTERSECT => {
-                    let set_quantifier =
-                        self.parse_distinct_required_set_quantifier("INTERSECT")?;
-                    let queries = self.parse_pipe_operator_queries()?;
-                    pipe_operators.push(PipeOperator::Intersect {
-                        set_quantifier,
-                        queries,
-                    });
-                }
-                Keyword::EXCEPT => {
-                    let set_quantifier = self.parse_distinct_required_set_quantifier("EXCEPT")?;
-                    let queries = self.parse_pipe_operator_queries()?;
-                    pipe_operators.push(PipeOperator::Except {
-                        set_quantifier,
-                        queries,
-                    });
-                }
-                Keyword::CALL => {
-                    let function_name = self.parse_object_name(false)?;
-                    let function_expr = self.parse_function(function_name)?;
-                    if let Expr::Function(function) = function_expr {
-                        let alias = self.parse_identifier_optional_alias()?;
-                        pipe_operators.push(PipeOperator::Call { function, alias });
-                    } else {
-                        return Err(ParserError::ParserError(
-                            "Expected function call after CALL".to_string(),
-                        ));
-                    }
-                }
-                Keyword::PIVOT => {
-                    self.expect_token(&Token::LParen)?;
-                    let aggregate_functions =
-                        self.parse_comma_separated(Self::parse_pivot_aggregate_function)?;
-                    self.expect_keyword_is(Keyword::FOR)?;
-                    let value_column = self.parse_period_separated(|p| p.parse_identifier())?;
-                    self.expect_keyword_is(Keyword::IN)?;
-
-                    self.expect_token(&Token::LParen)?;
-                    let value_source = if self.parse_keyword(Keyword::ANY) {
-                        let order_by = if self.parse_keywords(&[Keyword::ORDER, Keyword::BY]) {
-                            self.parse_comma_separated(Parser::parse_order_by_expr)?
-                        } else {
-                            vec![]
-                        };
-                        PivotValueSource::Any(order_by)
-                    } else if self.peek_sub_query() {
-                        PivotValueSource::Subquery(self.parse_query()?)
-                    } else {
-                        PivotValueSource::List(
-                            self.parse_comma_separated(Self::parse_expr_with_alias)?,
-                        )
-                    };
-                    self.expect_token(&Token::RParen)?;
-                    self.expect_token(&Token::RParen)?;
-
-                    let alias = self.parse_identifier_optional_alias()?;
-
-                    pipe_operators.push(PipeOperator::Pivot {
-                        aggregate_functions,
-                        value_column,
-                        value_source,
-                        alias,
-                    });
-                }
-                Keyword::UNPIVOT => {
-                    self.expect_token(&Token::LParen)?;
-                    let value_column = self.parse_identifier()?;
-                    self.expect_keyword(Keyword::FOR)?;
-                    let name_column = self.parse_identifier()?;
-                    self.expect_keyword(Keyword::IN)?;
-
-                    self.expect_token(&Token::LParen)?;
-                    let unpivot_columns = self.parse_comma_separated(Parser::parse_identifier)?;
-                    self.expect_token(&Token::RParen)?;
-
-                    self.expect_token(&Token::RParen)?;
-
-                    let alias = self.parse_identifier_optional_alias()?;
-
-                    pipe_operators.push(PipeOperator::Unpivot {
-                        value_column,
-                        name_column,
-                        unpivot_columns,
-                        alias,
-                    });
-                }
-                Keyword::JOIN
-                | Keyword::INNER
-                | Keyword::LEFT
-                | Keyword::RIGHT
-                | Keyword::FULL
-                | Keyword::CROSS => {
-                    self.prev_token();
-                    let mut joins = self.parse_joins()?;
-                    if joins.len() != 1 {
-                        return Err(ParserError::ParserError(
-                            "Join pipe operator must have a single join".to_string(),
-                        ));
-                    }
-                    let join = joins.swap_remove(0);
-                    pipe_operators.push(PipeOperator::Join(join))
-                }
-                unhandled => {
-                    return Err(ParserError::ParserError(format!(
-                    "`expect_one_of_keywords` further up allowed unhandled keyword: {unhandled:?}"
-                )))
-                }
-            }
-        }
-        Ok(pipe_operators)
-    }
 
     fn parse_settings(&mut self) -> Result<Option<Vec<Setting>>, ParserError> {
         let settings = if self.dialect.supports_settings() && self.parse_keyword(Keyword::SETTINGS)
@@ -12926,107 +12625,8 @@ impl<'a> Parser<'a> {
         Ok(settings)
     }
 
-    /// Parse a mssql `FOR [XML | JSON | BROWSE]` clause
-    pub fn parse_for_clause(&mut self) -> Result<Option<ForClause>, ParserError> {
-        if self.parse_keyword(Keyword::XML) {
-            Ok(Some(self.parse_for_xml()?))
-        } else if self.parse_keyword(Keyword::JSON) {
-            Ok(Some(self.parse_for_json()?))
-        } else if self.parse_keyword(Keyword::BROWSE) {
-            Ok(Some(ForClause::Browse))
-        } else {
-            Ok(None)
-        }
-    }
 
-    /// Parse a mssql `FOR XML` clause
-    pub fn parse_for_xml(&mut self) -> Result<ForClause, ParserError> {
-        let for_xml = if self.parse_keyword(Keyword::RAW) {
-            let mut element_name = None;
-            if self.peek_token_ref().token == Token::LParen {
-                self.expect_token(&Token::LParen)?;
-                element_name = Some(self.parse_literal_string()?);
-                self.expect_token(&Token::RParen)?;
-            }
-            ForXml::Raw(element_name)
-        } else if self.parse_keyword(Keyword::AUTO) {
-            ForXml::Auto
-        } else if self.parse_keyword(Keyword::EXPLICIT) {
-            ForXml::Explicit
-        } else if self.parse_keyword(Keyword::PATH) {
-            let mut element_name = None;
-            if self.peek_token_ref().token == Token::LParen {
-                self.expect_token(&Token::LParen)?;
-                element_name = Some(self.parse_literal_string()?);
-                self.expect_token(&Token::RParen)?;
-            }
-            ForXml::Path(element_name)
-        } else {
-            return Err(ParserError::ParserError(
-                "Expected FOR XML [RAW | AUTO | EXPLICIT | PATH ]".to_string(),
-            ));
-        };
-        let mut elements = false;
-        let mut binary_base64 = false;
-        let mut root = None;
-        let mut r#type = false;
-        while self.peek_token_ref().token == Token::Comma {
-            self.next_token();
-            if self.parse_keyword(Keyword::ELEMENTS) {
-                elements = true;
-            } else if self.parse_keyword(Keyword::BINARY) {
-                self.expect_keyword_is(Keyword::BASE64)?;
-                binary_base64 = true;
-            } else if self.parse_keyword(Keyword::ROOT) {
-                self.expect_token(&Token::LParen)?;
-                root = Some(self.parse_literal_string()?);
-                self.expect_token(&Token::RParen)?;
-            } else if self.parse_keyword(Keyword::TYPE) {
-                r#type = true;
-            }
-        }
-        Ok(ForClause::Xml {
-            for_xml,
-            elements,
-            binary_base64,
-            root,
-            r#type,
-        })
-    }
 
-    /// Parse a mssql `FOR JSON` clause
-    pub fn parse_for_json(&mut self) -> Result<ForClause, ParserError> {
-        let for_json = if self.parse_keyword(Keyword::AUTO) {
-            ForJson::Auto
-        } else if self.parse_keyword(Keyword::PATH) {
-            ForJson::Path
-        } else {
-            return Err(ParserError::ParserError(
-                "Expected FOR JSON [AUTO | PATH ]".to_string(),
-            ));
-        };
-        let mut root = None;
-        let mut include_null_values = false;
-        let mut without_array_wrapper = false;
-        while self.peek_token_ref().token == Token::Comma {
-            self.next_token();
-            if self.parse_keyword(Keyword::ROOT) {
-                self.expect_token(&Token::LParen)?;
-                root = Some(self.parse_literal_string()?);
-                self.expect_token(&Token::RParen)?;
-            } else if self.parse_keyword(Keyword::INCLUDE_NULL_VALUES) {
-                include_null_values = true;
-            } else if self.parse_keyword(Keyword::WITHOUT_ARRAY_WRAPPER) {
-                without_array_wrapper = true;
-            }
-        }
-        Ok(ForClause::Json {
-            for_json,
-            root,
-            include_null_values,
-            without_array_wrapper,
-        })
-    }
 
     /// Parse a CTE (`alias [( col1, col2, ... )] [AS] (subquery)`)
     pub fn parse_cte(&mut self) -> Result<Cte, ParserError> {
@@ -14400,10 +14000,6 @@ impl<'a> Parser<'a> {
                     limit_clause: None,
                     fetch: None,
                     locks: vec![],
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                    pipe_operators: vec![],
                 }),
                 alias,
                 sample: None,
@@ -14527,23 +14123,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a Snowflake stage reference as a table factor.
-    /// Handles syntax like: `@mystage1 (file_format => 'myformat', pattern => '...')`
-    fn parse_pivot_aggregate_function(&mut self) -> Result<ExprWithAlias, ParserError> {
-        let function_name = match self.next_token().token {
-            Token::Word(w) => Ok(w.value),
-            _ => self.expected_ref("a function identifier", self.peek_token_ref()),
-        }?;
-        let expr = self.parse_function(ObjectName::from(vec![Ident::new(function_name)]))?;
-        let alias = {
-            fn validator(explicit: bool, kw: &Keyword, parser: &mut Parser) -> bool {
-                // ~ for a PIVOT aggregate function the alias must not be a "FOR"; in any dialect
-                kw != &Keyword::FOR && parser.dialect.is_select_item_alias(explicit, kw, parser)
-            }
-            self.parse_optional_alias_inner(None, validator)?
-        };
-        Ok(ExprWithAlias { expr, alias })
-    }
 
     ///
     /// See: <https://docs.snowflake.com/en/user-guide/querying-stage>

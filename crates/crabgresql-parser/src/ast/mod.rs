@@ -88,14 +88,14 @@ pub use self::dml::{
 pub use self::operator::{BinaryOperator, UnaryOperator};
 pub use self::query::{
     AfterMatchSkip, ConnectByKind, Cte, CteAsMaterialized, Distinct, EmptyMatchesMode,
-    ExceptSelectItem, ExcludeSelectItem, ExprWithAlias, ExprWithAliasAndOrderBy, Fetch, ForClause,
-    ForJson, ForXml, FormatClause, GroupByExpr, GroupByWithModifier, IdentWithAlias,
+    ExceptSelectItem, ExcludeSelectItem, ExprWithAlias, ExprWithAliasAndOrderBy, Fetch,
+    FormatClause, GroupByExpr, GroupByWithModifier, IdentWithAlias,
     IlikeSelectItem, InputFormatClause, Interpolate, InterpolateExpr, Join, JoinConstraint,
     JoinOperator, JsonTableColumn, JsonTableColumnErrorHandling, JsonTableNamedColumn,
     JsonTableNestedColumn, LateralView, LimitClause, LockClause, LockType, MatchRecognizePattern,
     MatchRecognizeSymbol, Measure, NamedWindowDefinition, NamedWindowExpr, NonBlock, Offset,
     OffsetRows, OpenJsonTableColumn, OrderBy, OrderByExpr, OrderByKind, OrderByOptions,
-    PipeOperator, PivotValueSource, ProjectionSelect, Query, RenameSelectItem,
+    PivotValueSource, ProjectionSelect, Query, RenameSelectItem,
     RepetitionQuantifier, ReplaceSelectElement, ReplaceSelectItem, RowsPerMatch, Select,
     SelectFlavor, SelectInto, SelectItem, SelectItemQualifiedWildcardKind, SelectModifiers,
     SetExpr, SetOperator, SetQuantifier, Setting, SymbolDefinition, Table, TableAlias,

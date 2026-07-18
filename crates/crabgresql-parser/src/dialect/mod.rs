@@ -1630,17 +1630,6 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Returns true if this dialect supports the `FORMAT` clause in `SELECT` statements.
-    ///
-    /// Example:
-    /// ```sql
-    /// SELECT * FROM table FORMAT JSON;
-    /// ```
-    ///
-    /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/select/format)
-    fn supports_select_format(&self) -> bool {
-        false
-    }
 
     /// Returns true if the dialect supports the two-argument comma-separated
     /// form of the `TRIM` function: `TRIM(expr, characters)`.
