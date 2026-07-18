@@ -256,14 +256,12 @@ impl Spanned for Values {
 /// # partial span
 ///
 /// Missing spans:
-/// - [Statement::CopyIntoSnowflake]
 /// - [Statement::CreateSecret]
 /// - [Statement::CreateRole]
 /// - [Statement::AlterType]
 /// - [Statement::AlterOperator]
 /// - [Statement::AlterRole]
 /// - [Statement::AttachDatabase]
-/// - [Statement::AttachDuckDBDatabase]
 /// - [Statement::DetachDuckDBDatabase]
 /// - [Statement::Drop]
 /// - [Statement::DropFunction]
@@ -296,7 +294,6 @@ impl Spanned for Values {
 /// - [Statement::DropTrigger]
 /// - [Statement::CreateProcedure]
 /// - [Statement::CreateMacro]
-/// - [Statement::CreateStage]
 /// - [Statement::Assert]
 /// - [Statement::Grant]
 /// - [Statement::Revoke]
@@ -314,8 +311,6 @@ impl Spanned for Values {
 /// - [Statement::CreateType]
 /// - [Statement::Pragma]
 /// - [Statement::Lock]
-/// - [Statement::LockTables]
-/// - [Statement::UnlockTables]
 /// - [Statement::Unload]
 /// - [Statement::OptimizeTable]
 impl Spanned for Statement {
@@ -348,22 +343,6 @@ impl Spanned for Statement {
                 legacy_options: _,
                 values: _,
             } => source.span(),
-            Statement::CopyIntoSnowflake {
-                into: _,
-                into_columns: _,
-                from_obj: _,
-                from_obj_alias: _,
-                stage_params: _,
-                from_transformations: _,
-                files: _,
-                pattern: _,
-                file_format: _,
-                copy_options: _,
-                validation_mode: _,
-                kind: _,
-                from_query: _,
-                partition: _,
-            } => Span::empty(),
             Statement::Open(open) => open.span(),
             Statement::Close { cursor } => match cursor {
                 CloseCursor::All => Span::empty(),
@@ -420,9 +399,7 @@ impl Spanned for Statement {
             Statement::AlterOperatorFamily { .. } => Span::empty(),
             Statement::AlterOperatorClass { .. } => Span::empty(),
             Statement::AlterRole { .. } => Span::empty(),
-            Statement::AlterSession { .. } => Span::empty(),
             Statement::AttachDatabase { .. } => Span::empty(),
-            Statement::AttachDuckDBDatabase { .. } => Span::empty(),
             Statement::DetachDuckDBDatabase { .. } => Span::empty(),
             Statement::Drop { .. } => Span::empty(),
             Statement::DropFunction(drop_function) => drop_function.span(),
@@ -456,7 +433,6 @@ impl Spanned for Statement {
             Statement::DropTrigger { .. } => Span::empty(),
             Statement::CreateProcedure { .. } => Span::empty(),
             Statement::CreateMacro { .. } => Span::empty(),
-            Statement::CreateStage { .. } => Span::empty(),
             Statement::Assert { .. } => Span::empty(),
             Statement::Grant { .. } => Span::empty(),
             Statement::Deny { .. } => Span::empty(),
@@ -476,8 +452,6 @@ impl Spanned for Statement {
             Statement::CreateType { .. } => Span::empty(),
             Statement::Pragma { .. } => Span::empty(),
             Statement::Lock(_) => Span::empty(),
-            Statement::LockTables { .. } => Span::empty(),
-            Statement::UnlockTables => Span::empty(),
             Statement::Unload { .. } => Span::empty(),
             Statement::OptimizeTable { .. } => Span::empty(),
             Statement::CreatePolicy { .. } => Span::empty(),
@@ -489,7 +463,6 @@ impl Spanned for Statement {
             Statement::ShowDatabases { .. } => Span::empty(),
             Statement::ShowProcessList { .. } => Span::empty(),
             Statement::ShowSchemas { .. } => Span::empty(),
-            Statement::ShowObjects { .. } => Span::empty(),
             Statement::ShowViews { .. } => Span::empty(),
             Statement::LISTEN { .. } => Span::empty(),
             Statement::NOTIFY { .. } => Span::empty(),
@@ -501,7 +474,6 @@ impl Spanned for Statement {
             Statement::Print { .. } => Span::empty(),
             Statement::WaitFor(_) => Span::empty(),
             Statement::Return { .. } => Span::empty(),
-            Statement::List(..) | Statement::Remove(..) => Span::empty(),
             Statement::ExportData(ExportData {
                 options,
                 query,

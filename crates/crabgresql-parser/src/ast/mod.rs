@@ -24,10 +24,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use helpers::{
-    attached_token::AttachedToken,
-    stmt_data_loading::{FileStagingCommand, StageLoadSelectItemKind},
-};
+use helpers::attached_token::AttachedToken;
 
 use core::cmp::Ordering;
 use core::ops::{Deref, DerefMut};
@@ -123,7 +120,6 @@ pub use self::value::{
 };
 
 use crate::ast::helpers::key_value_options::KeyValueOptions;
-use crate::ast::helpers::stmt_data_loading::StageParamsObject;
 
 #[cfg(feature = "visitor")]
 pub use visitor::*;
@@ -3621,47 +3617,6 @@ pub enum Statement {
         values: Vec<Option<String>>,
     },
     /// ```sql
-    /// COPY INTO <table> | <location>
-    /// ```
-    /// See:
-    /// <https://docs.snowflake.com/en/sql-reference/sql/copy-into-table>
-    /// <https://docs.snowflake.com/en/sql-reference/sql/copy-into-location>
-    ///
-    /// Copy Into syntax available for Snowflake is different than the one implemented in
-    /// Postgres. Although they share common prefix, it is reasonable to implement them
-    /// in different enums. This can be refactored later once custom dialects
-    /// are allowed to have custom Statements.
-    CopyIntoSnowflake {
-        /// Kind of COPY INTO operation (table or location).
-        kind: CopyIntoSnowflakeKind,
-        /// Target object for the COPY INTO operation.
-        into: ObjectName,
-        /// Optional list of target columns.
-        into_columns: Option<Vec<Ident>>,
-        /// Optional source object name (staged data).
-        from_obj: Option<ObjectName>,
-        /// Optional alias for the source object.
-        from_obj_alias: Option<Ident>,
-        /// Stage-specific parameters (e.g., credentials, path).
-        stage_params: StageParamsObject,
-        /// Optional list of transformations applied when loading.
-        from_transformations: Option<Vec<StageLoadSelectItemKind>>,
-        /// Optional source query instead of a staged object.
-        from_query: Option<Box<Query>>,
-        /// Optional list of specific file names to load.
-        files: Option<Vec<String>>,
-        /// Optional filename matching pattern.
-        pattern: Option<String>,
-        /// File format options.
-        file_format: KeyValueOptions,
-        /// Additional copy options.
-        copy_options: KeyValueOptions,
-        /// Optional validation mode string.
-        validation_mode: Option<String>,
-        /// Optional partition expression for loading.
-        partition: Option<Box<Expr>>,
-    },
-    /// ```sql
     /// OPEN cursor_name
     /// ```
     /// Opens a cursor.
@@ -3858,17 +3813,6 @@ pub enum Statement {
         owner: Option<ddl::AlterConnectorOwner>,
     },
     /// ```sql
-    /// ALTER SESSION SET sessionParam
-    /// ALTER SESSION UNSET <param_name> [ , <param_name> , ... ]
-    /// ```
-    /// See <https://docs.snowflake.com/en/sql-reference/sql/alter-session>
-    AlterSession {
-        /// true is to set for the session parameters, false is to unset
-        set: bool,
-        /// The session parameters to set or unset
-        session_params: KeyValueOptions,
-    },
-    /// ```sql
     /// ATTACH DATABASE 'path/to/file' AS alias
     /// ```
     /// (SQLite-specific)
@@ -3879,23 +3823,6 @@ pub enum Statement {
         database_file_name: Expr,
         /// true if the syntax is 'ATTACH DATABASE', false if it's just 'ATTACH'
         database: bool,
-    },
-    /// (DuckDB-specific)
-    /// ```sql
-    /// ATTACH 'sqlite_file.db' AS sqlite_db (READ_ONLY, TYPE SQLITE);
-    /// ```
-    /// See <https://duckdb.org/docs/sql/statements/attach.html>
-    AttachDuckDBDatabase {
-        /// `true` when `IF NOT EXISTS` was present.
-        if_not_exists: bool,
-        /// `true` if the syntax used `ATTACH DATABASE` rather than `ATTACH`.
-        database: bool,
-        /// The path identifier to the database file being attached.
-        database_path: Ident,
-        /// Optional alias assigned to the attached database.
-        database_alias: Option<Ident>,
-        /// Dialect-specific attach options (e.g., `READ_ONLY`).
-        attach_options: Vec<AttachDuckDBDatabaseOption>,
     },
     /// (DuckDB-specific)
     /// ```sql
@@ -4197,12 +4124,6 @@ pub enum Statement {
     /// Show the available character sets (alias `CHARSET`).
     ShowCharset(ShowCharset),
     /// ```sql
-    /// SHOW OBJECTS LIKE 'line%' IN mydb.public
-    /// ```
-    /// Snowflake-specific statement
-    /// <https://docs.snowflake.com/en/sql-reference/sql/show-objects>
-    ShowObjects(ShowObjects),
-    /// ```sql
     /// SHOW TABLES
     /// ```
     ShowTables {
@@ -4469,30 +4390,6 @@ pub enum Statement {
         definition: MacroDefinition,
     },
     /// ```sql
-    /// CREATE STAGE
-    /// ```
-    /// See <https://docs.snowflake.com/en/sql-reference/sql/create-stage>
-    CreateStage {
-        /// `OR REPLACE` flag for stage.
-        or_replace: bool,
-        /// Whether stage is temporary.
-        temporary: bool,
-        /// `IF NOT EXISTS` flag.
-        if_not_exists: bool,
-        /// Stage name.
-        name: ObjectName,
-        /// Stage parameters.
-        stage_params: StageParamsObject,
-        /// Directory table parameters.
-        directory_table_params: KeyValueOptions,
-        /// File format options.
-        file_format: KeyValueOptions,
-        /// Copy options for stage.
-        copy_options: KeyValueOptions,
-        /// Optional comment.
-        comment: Option<String>,
-    },
-    /// ```sql
     /// ASSERT <condition> [AS <message>]
     /// ```
     Assert {
@@ -4721,19 +4618,6 @@ pub enum Statement {
     ///
     /// See <https://www.postgresql.org/docs/current/sql-lock.html>
     Lock(Lock),
-    /// ```sql
-    /// LOCK TABLES <table_name> [READ [LOCAL] | [LOW_PRIORITY] WRITE]
-    /// ```
-    /// Note: this is a MySQL-specific statement. See <https://dev.mysql.com/doc/refman/8.0/en/lock-tables.html>
-    LockTables {
-        /// List of tables to lock with modes.
-        tables: Vec<LockTable>,
-    },
-    /// ```sql
-    /// UNLOCK TABLES
-    /// ```
-    /// Note: this is a MySQL-specific statement. See <https://dev.mysql.com/doc/refman/8.0/en/lock-tables.html>
-    UnlockTables,
     /// Unloads the result of a query to file
     ///
     /// [Athena](https://docs.aws.amazon.com/athena/latest/ug/unload.html):
@@ -4855,12 +4739,6 @@ pub enum Statement {
     ///
     /// See Mysql <https://dev.mysql.com/doc/refman/9.1/en/rename-table.html>
     RenameTable(Vec<RenameTable>),
-    /// Snowflake `LIST`
-    /// See: <https://docs.snowflake.com/en/sql-reference/sql/list>
-    List(FileStagingCommand),
-    /// Snowflake `REMOVE`
-    /// See: <https://docs.snowflake.com/en/sql-reference/sql/remove>
-    Remove(FileStagingCommand),
     /// RaiseError (MSSQL)
     /// RAISERROR ( { msg_id | msg_str | @local_variable }
     /// { , severity , state }
@@ -5185,27 +5063,6 @@ impl fmt::Display for Statement {
             } => {
                 let keyword = if *database { "DATABASE " } else { "" };
                 write!(f, "ATTACH {keyword}{database_file_name} AS {schema_name}")
-            }
-            Statement::AttachDuckDBDatabase {
-                if_not_exists,
-                database,
-                database_path,
-                database_alias,
-                attach_options,
-            } => {
-                write!(
-                    f,
-                    "ATTACH{database}{if_not_exists} {database_path}",
-                    database = if *database { " DATABASE" } else { "" },
-                    if_not_exists = if *if_not_exists { " IF NOT EXISTS" } else { "" },
-                )?;
-                if let Some(alias) = database_alias {
-                    write!(f, " AS {alias}")?;
-                }
-                if !attach_options.is_empty() {
-                    write!(f, " ({})", display_comma_separated(attach_options))?;
-                }
-                Ok(())
             }
             Statement::DetachDuckDBDatabase {
                 if_exists,
@@ -5606,29 +5463,6 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Statement::AlterSession {
-                set,
-                session_params,
-            } => {
-                write!(
-                    f,
-                    "ALTER SESSION {set}",
-                    set = if *set { "SET" } else { "UNSET" }
-                )?;
-                if !session_params.options.is_empty() {
-                    if *set {
-                        write!(f, " {session_params}")?;
-                    } else {
-                        let options = session_params
-                            .options
-                            .iter()
-                            .map(|p| p.option_name.clone())
-                            .collect::<Vec<_>>();
-                        write!(f, " {}", display_separated(&options, ", "))?;
-                    }
-                }
-                Ok(())
-            }
             Statement::Drop {
                 object_type,
                 if_exists,
@@ -5825,17 +5659,6 @@ impl fmt::Display for Statement {
                     "SHOW {terse}SCHEMAS{history}{show_options}",
                     terse = if *terse { "TERSE " } else { "" },
                     history = if *history { " HISTORY" } else { "" },
-                )?;
-                Ok(())
-            }
-            Statement::ShowObjects(ShowObjects {
-                terse,
-                show_options,
-            }) => {
-                write!(
-                    f,
-                    "SHOW {terse}OBJECTS{show_options}",
-                    terse = if *terse { "TERSE " } else { "" },
                 )?;
                 Ok(())
             }
@@ -6144,110 +5967,6 @@ impl fmt::Display for Statement {
                 }
                 write!(f, "")
             }
-            Statement::CreateStage {
-                or_replace,
-                temporary,
-                if_not_exists,
-                name,
-                stage_params,
-                directory_table_params,
-                file_format,
-                copy_options,
-                comment,
-                ..
-            } => {
-                write!(
-                    f,
-                    "CREATE {or_replace}{temp}STAGE {if_not_exists}{name}{stage_params}",
-                    temp = if *temporary { "TEMPORARY " } else { "" },
-                    or_replace = if *or_replace { "OR REPLACE " } else { "" },
-                    if_not_exists = if *if_not_exists { "IF NOT EXISTS " } else { "" },
-                )?;
-                if !directory_table_params.options.is_empty() {
-                    write!(f, " DIRECTORY=({directory_table_params})")?;
-                }
-                if !file_format.options.is_empty() {
-                    write!(f, " FILE_FORMAT=({file_format})")?;
-                }
-                if !copy_options.options.is_empty() {
-                    write!(f, " COPY_OPTIONS=({copy_options})")?;
-                }
-                if comment.is_some() {
-                    write!(f, " COMMENT='{}'", comment.as_ref().unwrap())?;
-                }
-                Ok(())
-            }
-            Statement::CopyIntoSnowflake {
-                kind,
-                into,
-                into_columns,
-                from_obj,
-                from_obj_alias,
-                stage_params,
-                from_transformations,
-                from_query,
-                files,
-                pattern,
-                file_format,
-                copy_options,
-                validation_mode,
-                partition,
-            } => {
-                write!(f, "COPY INTO {into}")?;
-                if let Some(into_columns) = into_columns {
-                    write!(f, " ({})", display_comma_separated(into_columns))?;
-                }
-                if let Some(from_transformations) = from_transformations {
-                    // Data load with transformation
-                    if let Some(from_stage) = from_obj {
-                        write!(
-                            f,
-                            " FROM (SELECT {} FROM {}{}",
-                            display_separated(from_transformations, ", "),
-                            from_stage,
-                            stage_params
-                        )?;
-                    }
-                    if let Some(from_obj_alias) = from_obj_alias {
-                        write!(f, " AS {from_obj_alias}")?;
-                    }
-                    write!(f, ")")?;
-                } else if let Some(from_obj) = from_obj {
-                    // Standard data load
-                    write!(f, " FROM {from_obj}{stage_params}")?;
-                    if let Some(from_obj_alias) = from_obj_alias {
-                        write!(f, " AS {from_obj_alias}")?;
-                    }
-                } else if let Some(from_query) = from_query {
-                    // Data unload from query
-                    write!(f, " FROM ({from_query})")?;
-                }
-
-                if let Some(files) = files {
-                    write!(f, " FILES = ('{}')", display_separated(files, "', '"))?;
-                }
-                if let Some(pattern) = pattern {
-                    write!(f, " PATTERN = '{pattern}'")?;
-                }
-                if let Some(partition) = partition {
-                    write!(f, " PARTITION BY {partition}")?;
-                }
-                if !file_format.options.is_empty() {
-                    write!(f, " FILE_FORMAT=({file_format})")?;
-                }
-                if !copy_options.options.is_empty() {
-                    match kind {
-                        CopyIntoSnowflakeKind::Table => {
-                            write!(f, " COPY_OPTIONS=({copy_options})")?
-                        }
-                        CopyIntoSnowflakeKind::Location => write!(f, " {copy_options}")?,
-                    }
-                }
-                if let Some(validation_mode) = validation_mode {
-                    write!(f, " VALIDATION_MODE = {validation_mode}")?;
-                }
-                Ok(())
-            }
             Statement::CreateType {
                 name,
                 representation,
@@ -6271,12 +5990,6 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Statement::Lock(lock) => lock.fmt(f),
-            Statement::LockTables { tables } => {
-                write!(f, "LOCK TABLES {}", display_comma_separated(tables))
-            }
-            Statement::UnlockTables => {
-                write!(f, "UNLOCK TABLES")
-            }
             Statement::Unload {
                 query,
                 query_text,
@@ -6378,8 +6091,6 @@ impl fmt::Display for Statement {
             Statement::Print(s) => write!(f, "{s}"),
             Statement::WaitFor(s) => write!(f, "{s}"),
             Statement::Return(r) => write!(f, "{r}"),
-            Statement::List(command) => write!(f, "LIST {command}"),
-            Statement::Remove(command) => write!(f, "REMOVE {command}"),
             Statement::ExportData(e) => write!(f, "{e}"),
             Statement::CreateUser(s) => write!(f, "{s}"),
             Statement::AlterSchema(s) => write!(f, "{s}"),
@@ -12267,12 +11978,6 @@ impl From<DropDomain> for Statement {
 impl From<ShowCharset> for Statement {
     fn from(s: ShowCharset) -> Self {
         Self::ShowCharset(s)
-    }
-}
-
-impl From<ShowObjects> for Statement {
-    fn from(s: ShowObjects) -> Self {
-        Self::ShowObjects(s)
     }
 }
 
