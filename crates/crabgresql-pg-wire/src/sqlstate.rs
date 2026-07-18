@@ -21,6 +21,7 @@ pub const UNDEFINED_FUNCTION: &str = "42883";
 pub const AMBIGUOUS_FUNCTION: &str = "42725";
 pub const DUPLICATE_COLUMN: &str = "42701";
 pub const DUPLICATE_OBJECT: &str = "42710";
+pub const DUPLICATE_FUNCTION: &str = "42723";
 pub const CANNOT_COERCE: &str = "42846";
 pub const DATATYPE_MISMATCH: &str = "42804";
 pub const GROUPING_ERROR: &str = "42803";

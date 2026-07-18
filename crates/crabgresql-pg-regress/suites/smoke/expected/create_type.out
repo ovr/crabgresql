@@ -50,3 +50,33 @@ DROP TYPE xshort CASCADE;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to function xshort_in(cstring)
 drop cascades to function xshort_out(xshort)
+-- A single dependent is named inline, with no count and no DETAIL.
+CREATE TYPE solo;
+CREATE FUNCTION solo_in(cstring) RETURNS solo AS 'int8in' LANGUAGE internal IMMUTABLE STRICT;
+NOTICE:  return type solo is only a shell
+DROP TYPE solo CASCADE;
+NOTICE:  drop cascades to function solo_in(cstring)
+-- Re-declaring an existing type is a duplicate-object error.
+CREATE TYPE dup;
+CREATE TYPE dup;
+ERROR:  type "dup" already exists
+DROP TYPE dup;
+-- A duplicate cast for the same type pair is rejected (so it is not
+-- double-counted in a later cascade).
+CREATE TYPE xc;
+CREATE FUNCTION xc_in(cstring) RETURNS xc AS 'int8in' LANGUAGE internal IMMUTABLE STRICT;
+NOTICE:  return type xc is only a shell
+CREATE FUNCTION xc_out(xc) RETURNS cstring AS 'int8out' LANGUAGE internal IMMUTABLE STRICT;
+NOTICE:  argument type xc is only a shell
+CREATE TYPE xc (input = xc_in, output = xc_out, like = int8);
+CREATE CAST (xc AS int8) WITHOUT FUNCTION;
+CREATE CAST (xc AS int8) WITHOUT FUNCTION;
+ERROR:  cast from type xc to type bigint already exists
+DROP TYPE xc CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to function xc_in(cstring)
+drop cascades to function xc_out(xc)
+drop cascades to cast from xc to bigint
+-- An unknown type name in a cast is an undefined-object error.
+CREATE CAST (nosuchtype AS int8) WITHOUT FUNCTION;
+ERROR:  type "nosuchtype" does not exist

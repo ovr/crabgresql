@@ -16,7 +16,8 @@ use crabgresql_types::PgType;
 
 use crate::error::PgError;
 
-/// PG's `FirstNormalObjectId`: user object OIDs are allocated from here up.
+/// User-created objects get OIDs at or above 16384; lower values are reserved
+/// for built-ins, matching the OID ranges observed from a running server.
 const FIRST_USER_OID: u32 = 16384;
 
 /// A type as referenced from a function signature or a cast: a built-in type, a
@@ -29,8 +30,8 @@ pub enum TypeRef {
 }
 
 impl TypeRef {
-    /// The name PG uses for this type in dependency / cascade messages
-    /// (`format_type_be`): `bigint` for int8, the type name for a user type.
+    /// The name as PG spells it in dependency / cascade messages: `bigint` for
+    /// int8, and the type's own name for a user type (observed behaviour).
     fn display_name(&self) -> String {
         match self {
             TypeRef::Builtin(t) => t.name().to_string(),
@@ -186,19 +187,15 @@ impl GlobalCatalog {
         self.inner.read().unwrap().types.get(name).map(|e| e.typlen)
     }
 
-    /// `CREATE TYPE name;` — register a shell type. A redefinition of an existing
-    /// shell is a no-op; a name already fully defined is a duplicate error.
+    /// `CREATE TYPE name;` — register a shell type. Re-declaring any existing
+    /// type (shell or fully defined) is a duplicate-object error, as in PG.
     pub fn create_shell_type(&self, name: &str) -> Result<Vec<CatalogNotice>, PgError> {
         let mut cat = self.inner.write().unwrap();
-        if let Some(existing) = cat.types.get(name) {
-            if existing.defined {
-                return Err(PgError::new(
-                    sqlstate::DUPLICATE_OBJECT,
-                    format!("type \"{name}\" already exists"),
-                ));
-            }
-            // Re-declaring a shell is harmless.
-            return Ok(Vec::new());
+        if cat.types.contains_key(name) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("type \"{name}\" already exists"),
+            ));
         }
         let oid = cat.alloc_oid();
         cat.types.insert(
@@ -262,6 +259,19 @@ impl GlobalCatalog {
         }
 
         let mut cat = self.inner.write().unwrap();
+
+        // A function may not be redefined with the same name and argument types.
+        if cat.funcs.iter().any(|f| f.name == name && f.args == args) {
+            let arglist: Vec<String> = args.iter().map(TypeRef::display_name).collect();
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_FUNCTION,
+                format!(
+                    "function {name}({}) already exists with same argument types",
+                    arglist.join(", ")
+                ),
+            ));
+        }
+
         let mut notices = Vec::new();
 
         // PG reports a shell reference for the return type first, then arguments.
@@ -286,8 +296,7 @@ impl GlobalCatalog {
         // Every user type mentioned in the signature depends on this function.
         for tref in std::iter::once(&ret).chain(args.iter()) {
             if let TypeRef::User(tname) = tref {
-                let tname = tname.clone();
-                cat.add_dependent(&tname, DepId::Func(oid));
+                cat.add_dependent(tname, DepId::Func(oid));
             }
         }
         cat.funcs.push(FuncEntry {
@@ -311,7 +320,25 @@ impl GlobalCatalog {
                 "CREATE CAST WITH FUNCTION / WITH INOUT is not supported yet",
             ));
         }
+        if source == target {
+            return Err(PgError::new(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "source data type and target data type are the same",
+            ));
+        }
         let mut cat = self.inner.write().unwrap();
+
+        // A cast for this type pair may only be defined once.
+        if cat.casts.iter().any(|c| c.source == source && c.target == target) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!(
+                    "cast from type {} to type {} already exists",
+                    source.display_name(),
+                    target.display_name()
+                ),
+            ));
+        }
 
         // A binary-coercible cast requires physically identical representations;
         // PG checks typlen/typbyval/typalign, which for our types reduces to width.
@@ -327,8 +354,7 @@ impl GlobalCatalog {
         let oid = cat.alloc_oid();
         for tref in [&source, &target] {
             if let TypeRef::User(tname) = tref {
-                let tname = tname.clone();
-                cat.add_dependent(&tname, DepId::Cast(oid));
+                cat.add_dependent(tname, DepId::Cast(oid));
             }
         }
         cat.casts.push(CastEntry {
@@ -339,65 +365,25 @@ impl GlobalCatalog {
         Ok(Vec::new())
     }
 
-    /// `DROP TYPE name [CASCADE|RESTRICT]`. Reproduces PG's cascade NOTICE/DETAIL,
-    /// the RESTRICT dependency error (with HINT), and the missing-type behaviour.
-    pub fn drop_type(
+    /// `DROP TYPE a, b, ... [CASCADE|RESTRICT]`. Every target is validated before
+    /// any is removed, so a failure on one name leaves the whole statement's
+    /// targets intact — PG evaluates a multi-target DROP atomically. Reproduces
+    /// PG's cascade NOTICE/DETAIL, the RESTRICT dependency error (with HINT), and
+    /// the missing-type behaviour.
+    pub fn drop_types(
         &self,
-        name: &str,
+        names: &[&str],
         cascade: bool,
         if_exists: bool,
     ) -> Result<Vec<CatalogNotice>, PgError> {
         let mut cat = self.inner.write().unwrap();
-        let Some(entry) = cat.types.get(name) else {
-            if if_exists {
-                return Ok(vec![CatalogNotice::new(format!(
-                    "type \"{name}\" does not exist, skipping"
-                ))]);
-            }
-            return Err(PgError::new(
-                sqlstate::UNDEFINED_OBJECT,
-                format!("type \"{name}\" does not exist"),
-            ));
-        };
-
-        let dependents = entry.dependents.clone();
-        if !dependents.is_empty() && !cascade {
-            // RESTRICT (the default): refuse, listing each dependent.
-            let lines: Vec<String> = dependents
-                .iter()
-                .map(|dep| format!("{} depends on type {name}", cat.describe_dep(*dep)))
-                .collect();
-            return Err(PgError::new(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                format!("cannot drop type {name} because other objects depend on it"),
-            )
-            .with_detail(lines.join("\n"))
-            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+        for name in names {
+            cat.validate_drop_type(name, cascade, if_exists)?;
         }
-
-        // Collect the cascade description before removing anything.
-        let notices = if dependents.is_empty() {
-            Vec::new()
-        } else {
-            let lines: Vec<String> = dependents
-                .iter()
-                .map(|dep| format!("drop cascades to {}", cat.describe_dep(*dep)))
-                .collect();
-            let n = dependents.len();
-            vec![
-                CatalogNotice::new(format!("drop cascades to {n} other objects"))
-                    .with_detail(lines.join("\n")),
-            ]
-        };
-
-        // Remove the dependents, then the type itself.
-        for dep in &dependents {
-            match dep {
-                DepId::Func(oid) => cat.remove_func(*oid),
-                DepId::Cast(oid) => cat.remove_cast(*oid),
-            }
+        let mut notices = Vec::new();
+        for name in names {
+            notices.extend(cat.perform_drop_type(name));
         }
-        cat.types.remove(name);
         Ok(notices)
     }
 
@@ -420,7 +406,7 @@ impl GlobalCatalog {
                 Ok(Vec::new())
             }
             None if if_exists => Ok(vec![CatalogNotice::new(format!(
-                "cast from {} to {} does not exist, skipping",
+                "cast from type {} to type {} does not exist, skipping",
                 source.display_name(),
                 target.display_name()
             ))]),
@@ -437,6 +423,78 @@ impl GlobalCatalog {
 }
 
 impl CatalogInner {
+    /// Check that `name` can be dropped, without mutating: errors on a missing
+    /// type (unless `if_exists`), or — under RESTRICT — on remaining dependents.
+    fn validate_drop_type(
+        &self,
+        name: &str,
+        cascade: bool,
+        if_exists: bool,
+    ) -> Result<(), PgError> {
+        let Some(entry) = self.types.get(name) else {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("type \"{name}\" does not exist"),
+            ));
+        };
+        if !entry.dependents.is_empty() && !cascade {
+            let lines: Vec<String> = entry
+                .dependents
+                .iter()
+                .map(|dep| format!("{} depends on type {name}", self.describe_dep(*dep)))
+                .collect();
+            return Err(PgError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop type {name} because other objects depend on it"),
+            )
+            .with_detail(lines.join("\n"))
+            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+        }
+        Ok(())
+    }
+
+    /// Remove a (previously validated) type and its dependents, returning the
+    /// cascade or missing-type NOTICE(s). For a single dependent PG names it
+    /// inline with no count/DETAIL; for several it prints the count plus a DETAIL
+    /// block — reproduce both.
+    fn perform_drop_type(&mut self, name: &str) -> Vec<CatalogNotice> {
+        let Some(entry) = self.types.get(name) else {
+            // Validated with `if_exists`: the type is simply absent.
+            return vec![CatalogNotice::new(format!(
+                "type \"{name}\" does not exist, skipping"
+            ))];
+        };
+        let dependents = entry.dependents.clone();
+        let notices = match dependents.as_slice() {
+            [] => Vec::new(),
+            [dep] => vec![CatalogNotice::new(format!(
+                "drop cascades to {}",
+                self.describe_dep(*dep)
+            ))],
+            deps => {
+                let lines: Vec<String> = deps
+                    .iter()
+                    .map(|dep| format!("drop cascades to {}", self.describe_dep(*dep)))
+                    .collect();
+                vec![
+                    CatalogNotice::new(format!("drop cascades to {} other objects", deps.len()))
+                        .with_detail(lines.join("\n")),
+                ]
+            }
+        };
+        for dep in &dependents {
+            match dep {
+                DepId::Func(oid) => self.remove_func(*oid),
+                DepId::Cast(oid) => self.remove_cast(*oid),
+            }
+        }
+        self.types.remove(name);
+        notices
+    }
+
     fn describe_dep(&self, dep: DepId) -> String {
         match dep {
             DepId::Func(oid) => self
@@ -465,31 +523,36 @@ impl CatalogInner {
     }
 }
 
-/// The `LANGUAGE internal` built-in functions crabgresql recognises. PG has
-/// hundreds; this is the curated subset needed to bootstrap the supported user
-/// types (chiefly the integer/text I/O functions). An unrecognised name draws
-/// PG's "there is no built-in function named" error, as it would in PG.
+/// The `LANGUAGE internal` built-in functions crabgresql recognises: the text
+/// I/O functions of every scalar type crabgresql supports, so a user type can be
+/// bootstrapped over any of them (as PG allows). PG has hundreds more; an
+/// unrecognised name draws PG's "there is no built-in function named" error, as
+/// it would in PG. Keep this in step with the supported `PgType` set.
 fn is_known_internal(name: &str) -> bool {
     matches!(
         name,
-        "int2in"
-            | "int2out"
-            | "int4in"
-            | "int4out"
-            | "int8in"
-            | "int8out"
-            | "float4in"
-            | "float4out"
-            | "float8in"
-            | "float8out"
-            | "textin"
-            | "textout"
-            | "boolin"
-            | "boolout"
-            | "byteain"
-            | "byteaout"
-            | "numeric_in"
-            | "numeric_out"
+        // integer / floating-point / numeric / boolean / bytea
+        "int2in" | "int2out"
+            | "int4in" | "int4out"
+            | "int8in" | "int8out"
+            | "float4in" | "float4out"
+            | "float8in" | "float8out"
+            | "numeric_in" | "numeric_out"
+            | "boolin" | "boolout"
+            | "byteain" | "byteaout"
+            // character strings
+            | "textin" | "textout"
+            | "varcharin" | "varcharout"
+            | "bpcharin" | "bpcharout"
+            | "namein" | "nameout"
+            | "bit_in" | "bit_out"
+            // date / time
+            | "date_in" | "date_out"
+            | "time_in" | "time_out"
+            | "timetz_in" | "timetz_out"
+            | "timestamp_in" | "timestamp_out"
+            | "timestamptz_in" | "timestamptz_out"
+            | "interval_in" | "interval_out"
     )
 }
 
@@ -536,7 +599,7 @@ mod tests {
     #[test]
     fn drop_cascade_lists_dependents_in_creation_order() {
         let cat = bootstrap_xfloat8();
-        let notices = cat.drop_type("xfloat8", true, false).unwrap();
+        let notices = cat.drop_types(&["xfloat8"], true, false).unwrap();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].message, "drop cascades to 3 other objects");
         assert_eq!(
@@ -550,9 +613,30 @@ mod tests {
     }
 
     #[test]
+    fn drop_cascade_single_dependent_has_no_count_or_detail() {
+        // Exactly one dependent: PG names it inline with no count and no DETAIL.
+        let cat = GlobalCatalog::new();
+        cat.create_shell_type("solo").unwrap();
+        cat.create_function(
+            "solo_in",
+            vec![TypeRef::Cstring],
+            TypeRef::User("solo".into()),
+            "int8in",
+        )
+        .unwrap();
+        let notices = cat.drop_types(&["solo"], true, false).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].message,
+            "drop cascades to function solo_in(cstring)"
+        );
+        assert!(notices[0].detail.is_none());
+    }
+
+    #[test]
     fn drop_restrict_refuses_with_hint() {
         let cat = bootstrap_xfloat8();
-        let err = cat.drop_type("xfloat8", false, false).unwrap_err();
+        let err = cat.drop_types(&["xfloat8"], false, false).unwrap_err();
         assert_eq!(err.code, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST);
         assert_eq!(
             err.message,
@@ -570,6 +654,59 @@ mod tests {
     }
 
     #[test]
+    fn multi_target_drop_is_atomic() {
+        // `DROP TYPE xfloat8, nope;` must leave xfloat8 intact when a later name
+        // does not exist — PG evaluates the whole statement atomically.
+        let cat = bootstrap_xfloat8();
+        let err = cat.drop_types(&["xfloat8", "nope"], true, false).unwrap_err();
+        assert_eq!(err.code, sqlstate::UNDEFINED_OBJECT);
+        assert!(cat.is_user_type("xfloat8"));
+    }
+
+    #[test]
+    fn redeclaring_a_type_is_a_duplicate_error() {
+        let cat = GlobalCatalog::new();
+        cat.create_shell_type("foo").unwrap();
+        let err = cat.create_shell_type("foo").unwrap_err();
+        assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(err.message, "type \"foo\" already exists");
+    }
+
+    #[test]
+    fn duplicate_cast_is_rejected() {
+        let cat = bootstrap_xfloat8();
+        let err = cat
+            .create_cast(
+                TypeRef::User("xfloat8".into()),
+                TypeRef::Builtin(PgType::Int8),
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(
+            err.message,
+            "cast from type xfloat8 to type bigint already exists"
+        );
+    }
+
+    #[test]
+    fn self_cast_is_rejected() {
+        let cat = GlobalCatalog::new();
+        let err = cat
+            .create_cast(
+                TypeRef::Builtin(PgType::Int8),
+                TypeRef::Builtin(PgType::Int8),
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, sqlstate::INVALID_OBJECT_DEFINITION);
+        assert_eq!(
+            err.message,
+            "source data type and target data type are the same"
+        );
+    }
+
+    #[test]
     fn unknown_internal_function_is_rejected() {
         let cat = GlobalCatalog::new();
         let err = cat
@@ -577,6 +714,22 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, sqlstate::UNDEFINED_FUNCTION);
         assert_eq!(err.message, "there is no built-in function named \"nope\"");
+    }
+
+    #[test]
+    fn date_io_internals_are_accepted() {
+        // A type can be bootstrapped over any supported type's I/O internals.
+        let cat = GlobalCatalog::new();
+        cat.create_shell_type("xd").unwrap();
+        assert!(
+            cat.create_function(
+                "xd_in",
+                vec![TypeRef::Cstring],
+                TypeRef::User("xd".into()),
+                "date_in",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -595,9 +748,9 @@ mod tests {
     #[test]
     fn missing_type_drop_reports_error_or_skips() {
         let cat = GlobalCatalog::new();
-        assert!(cat.drop_type("nope", false, false).is_err());
+        assert!(cat.drop_types(&["nope"], false, false).is_err());
         // IF EXISTS turns the miss into a skip NOTICE.
-        let notices = cat.drop_type("nope", false, true).unwrap();
+        let notices = cat.drop_types(&["nope"], false, true).unwrap();
         assert_eq!(notices[0].message, "type \"nope\" does not exist, skipping");
     }
 }

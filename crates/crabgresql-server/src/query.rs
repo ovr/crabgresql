@@ -442,16 +442,23 @@ fn normalize_ident(ident: &ast::Ident) -> String {
     }
 }
 
-fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, PgError> {
+/// A single-part object name, lowercased. `noun` names the object class for the
+/// error text ("relation", "type", "function"). Qualified names are not yet
+/// supported.
+fn single_object_name(name: &ast::ObjectName, noun: &str) -> Result<String, PgError> {
     if name.0.len() != 1 {
         return Err(PgError::feature_not_supported(format!(
-            "qualified relation names are not supported yet: {name}"
+            "qualified {noun} names are not supported yet: {name}"
         )));
     }
     match name.0[0].as_ident() {
         Some(ident) => Ok(normalize_ident(ident)),
-        None => Err(PgError::syntax(format!("invalid relation name: {name}"))),
+        None => Err(PgError::syntax(format!("invalid {noun} name: {name}"))),
     }
+}
+
+fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, PgError> {
+    single_object_name(name, "relation")
 }
 
 fn execute_create_table(
@@ -524,20 +531,6 @@ fn to_notices(notices: Vec<CatalogNotice>) -> Vec<Notice> {
         .collect()
 }
 
-/// A single-part object name (type/function), lowercased. Qualified names are
-/// not supported yet.
-fn single_ident_name(name: &ast::ObjectName) -> Result<String, PgError> {
-    if name.0.len() != 1 {
-        return Err(PgError::feature_not_supported(format!(
-            "qualified names are not supported yet: {name}"
-        )));
-    }
-    match name.0[0].as_ident() {
-        Some(ident) => Ok(normalize_ident(ident)),
-        None => Err(PgError::syntax(format!("invalid name: {name}"))),
-    }
-}
-
 /// The single lowercased name of a bare custom type (e.g. `xfloat8`, `cstring`),
 /// or `None` for a built-in `DataType` variant.
 fn datatype_simple_name(dt: &ast::DataType) -> Option<String> {
@@ -550,7 +543,9 @@ fn datatype_simple_name(dt: &ast::DataType) -> Option<String> {
 }
 
 /// Resolve a SQL type name to a catalog [`TypeRef`]: the `cstring` pseudo-type, a
-/// user-defined type (consulting the catalog), or a built-in type.
+/// user-defined type (consulting the catalog), or a built-in type. A bare name
+/// that is neither a user type nor a known built-in is an undefined-object error
+/// (42704), matching PG — not a "not supported" feature gap.
 fn resolve_type_ref(catalog: &GlobalCatalog, dt: &ast::DataType) -> Result<TypeRef, PgError> {
     if let Some(name) = datatype_simple_name(dt) {
         if name == "cstring" {
@@ -559,19 +554,43 @@ fn resolve_type_ref(catalog: &GlobalCatalog, dt: &ast::DataType) -> Result<TypeR
         if catalog.is_user_type(&name) {
             return Ok(TypeRef::User(name));
         }
+        // A bare custom name is either a built-in spelled as a custom identifier
+        // (bpchar/varchar/name) or a genuinely unknown type.
+        return match crabgresql_binder::map_data_type(dt) {
+            Ok(pg) => Ok(TypeRef::Builtin(pg)),
+            Err(_) => Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("type \"{name}\" does not exist"),
+            )),
+        };
     }
     Ok(TypeRef::Builtin(map_data_type(dt)?))
 }
 
-/// Physical width of a built-in type named in a `LIKE` clause, by catalog name.
-fn builtin_typlen_by_name(name: &str) -> Option<i32> {
+/// The built-in type a catalog type name refers to (for a `LIKE` clause), so its
+/// `pg_type.typlen` can be read from the authoritative `PgType::typlen()` rather
+/// than a second width table.
+fn builtin_type_by_name(name: &str) -> Option<PgType> {
     Some(match name {
-        "int8" | "bigint" => 8,
-        "int4" | "integer" | "int" => 4,
-        "int2" | "smallint" => 2,
-        "float8" | "double precision" => 8,
-        "float4" | "real" => 4,
-        "bool" | "boolean" => 1,
+        "int8" | "bigint" => PgType::Int8,
+        "int4" | "integer" | "int" => PgType::Int4,
+        "int2" | "smallint" => PgType::Int2,
+        "float8" | "double precision" => PgType::Float8,
+        "float4" | "real" => PgType::Float4,
+        "numeric" | "decimal" => PgType::Numeric,
+        "bool" | "boolean" => PgType::Bool,
+        "bytea" => PgType::Bytea,
+        "text" => PgType::Text,
+        "varchar" | "character varying" => PgType::Varchar,
+        "bpchar" | "char" | "character" => PgType::Bpchar,
+        "name" => PgType::Name,
+        "bit" => PgType::Bit,
+        "date" => PgType::Date,
+        "time" => PgType::Time,
+        "timetz" => PgType::TimeTz,
+        "timestamp" => PgType::Timestamp,
+        "timestamptz" => PgType::TimestampTz,
+        "interval" => PgType::Interval,
         _ => return None,
     })
 }
@@ -590,8 +609,9 @@ fn typlen_from_options(
             Opt::InternalLength(ast::UserDefinedTypeInternalLength::Variable) => typlen = -1,
             Opt::Like(name) => {
                 if let Some(n) = name.0.last().and_then(|p| p.as_ident()).map(normalize_ident)
-                    && let Some(len) =
-                        catalog.user_type_typlen(&n).or_else(|| builtin_typlen_by_name(&n))
+                    && let Some(len) = catalog
+                        .user_type_typlen(&n)
+                        .or_else(|| builtin_type_by_name(&n).map(|t| t.typlen() as i32))
                 {
                     typlen = len;
                 }
@@ -608,7 +628,7 @@ fn execute_create_type(
     name: &ast::ObjectName,
     representation: &Option<ast::UserDefinedTypeRepresentation>,
 ) -> Result<QueryResult, PgError> {
-    let tname = single_ident_name(name)?;
+    let tname = single_object_name(name, "type")?;
     let notices = match representation {
         None => catalog.create_shell_type(&tname)?,
         Some(ast::UserDefinedTypeRepresentation::SqlDefinition { options }) => {
@@ -666,7 +686,7 @@ fn execute_create_function(
         ));
     }
     let internal_name = function_internal_name(create)?;
-    let name = single_ident_name(&create.name)?;
+    let name = single_object_name(&create.name, "function")?;
     let ret = match &create.return_type {
         Some(ast::FunctionReturnType::DataType(dt)) => resolve_type_ref(catalog, dt)?,
         Some(ast::FunctionReturnType::SetOf(_)) => {
@@ -708,21 +728,24 @@ fn execute_create_cast(
     })
 }
 
-/// `DROP TYPE name [, ...] [CASCADE|RESTRICT]`.
+/// `DROP TYPE name [, ...] [CASCADE|RESTRICT]`. All names are resolved and
+/// validated before any type is removed, so a failure on one target leaves the
+/// others intact (PG runs a multi-target DROP atomically).
 fn execute_drop_type(
     catalog: &GlobalCatalog,
     names: &[ast::ObjectName],
     cascade: bool,
     if_exists: bool,
 ) -> Result<QueryResult, PgError> {
-    let mut notices = Vec::new();
-    for name in names {
-        let tname = single_ident_name(name)?;
-        notices.extend(to_notices(catalog.drop_type(&tname, cascade, if_exists)?));
-    }
+    let tnames = names
+        .iter()
+        .map(|name| single_object_name(name, "type"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let refs: Vec<&str> = tnames.iter().map(String::as_str).collect();
+    let notices = catalog.drop_types(&refs, cascade, if_exists)?;
     Ok(QueryResult::Command {
         tag: "DROP TYPE".into(),
-        notices,
+        notices: to_notices(notices),
     })
 }
 

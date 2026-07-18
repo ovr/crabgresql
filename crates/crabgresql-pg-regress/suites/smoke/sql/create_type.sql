@@ -32,3 +32,22 @@ DROP TYPE xfloat8;
 -- CASCADE drops the type and everything that depends on it, with a NOTICE.
 DROP TYPE xfloat8 CASCADE;
 DROP TYPE xshort CASCADE;
+-- A single dependent is named inline, with no count and no DETAIL.
+CREATE TYPE solo;
+CREATE FUNCTION solo_in(cstring) RETURNS solo AS 'int8in' LANGUAGE internal IMMUTABLE STRICT;
+DROP TYPE solo CASCADE;
+-- Re-declaring an existing type is a duplicate-object error.
+CREATE TYPE dup;
+CREATE TYPE dup;
+DROP TYPE dup;
+-- A duplicate cast for the same type pair is rejected (so it is not
+-- double-counted in a later cascade).
+CREATE TYPE xc;
+CREATE FUNCTION xc_in(cstring) RETURNS xc AS 'int8in' LANGUAGE internal IMMUTABLE STRICT;
+CREATE FUNCTION xc_out(xc) RETURNS cstring AS 'int8out' LANGUAGE internal IMMUTABLE STRICT;
+CREATE TYPE xc (input = xc_in, output = xc_out, like = int8);
+CREATE CAST (xc AS int8) WITHOUT FUNCTION;
+CREATE CAST (xc AS int8) WITHOUT FUNCTION;
+DROP TYPE xc CASCADE;
+-- An unknown type name in a cast is an undefined-object error.
+CREATE CAST (nosuchtype AS int8) WITHOUT FUNCTION;
