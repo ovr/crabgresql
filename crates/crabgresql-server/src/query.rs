@@ -13,6 +13,7 @@ use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TableSchema};
 use crabgresql_types::PgType;
 
+use crate::catalog::SessionCatalog;
 use crate::error::PgError;
 use crate::session::Session;
 
@@ -65,12 +66,19 @@ pub fn execute_statement(
             "current transaction is aborted, commands ignored until end of transaction block",
         ));
     }
+    // Resolution overlay: the session's temp catalog shadows the shared global
+    // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
+    // so it keeps the raw engine + session below.
+    let catalog: Arc<dyn TableEngine> =
+        Arc::new(SessionCatalog::new(session.temp.clone(), engine.clone()));
     let logical = match stmt {
-        ast::Statement::Query(query) => bind_query(engine, query)?,
-        ast::Statement::Insert(insert) => bind_insert(engine, insert)?,
-        ast::Statement::Update(update) => bind_update(engine, update)?,
-        ast::Statement::Delete(delete) => bind_delete(engine, delete)?,
-        ast::Statement::CreateTable(create) => return execute_create_table(engine, create),
+        ast::Statement::Query(query) => bind_query(&catalog, query)?,
+        ast::Statement::Insert(insert) => bind_insert(&catalog, insert)?,
+        ast::Statement::Update(update) => bind_update(&catalog, update)?,
+        ast::Statement::Delete(delete) => bind_delete(&catalog, delete)?,
+        ast::Statement::CreateTable(create) => {
+            return execute_create_table(engine, create, session);
+        }
         ast::Statement::Set(set) => return apply_set(set, session),
         ast::Statement::Reset(reset) => return apply_reset(reset, session),
         ast::Statement::StartTransaction {
@@ -98,7 +106,7 @@ pub fn execute_statement(
         ast::Statement::Rollback { chain, savepoint } => {
             return rollback_transaction(session, *chain, savepoint);
         }
-        ast::Statement::Truncate(truncate) => return execute_truncate(engine, truncate),
+        ast::Statement::Truncate(truncate) => return execute_truncate(&catalog, truncate),
         other => {
             return Err(PgError::feature_not_supported(format!(
                 "statement is not supported yet: {}",
@@ -386,6 +394,7 @@ fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, PgError> 
 fn execute_create_table(
     engine: &Arc<dyn TableEngine>,
     create: &ast::CreateTable,
+    session: &Session,
 ) -> Result<QueryResult, PgError> {
     let name = object_name_to_table_name(&create.name)?;
     if let Some(constraint) = create.constraints.first() {
@@ -408,7 +417,14 @@ fn execute_create_table(
         let typmod = crabgresql_binder::length_typmod(&col.data_type).unwrap_or(-1);
         columns.push(Column::with_typmod(normalize_ident(&col.name), ty, typmod));
     }
-    match engine.create_table(TableSchema { name, columns }) {
+    // TEMP tables go in the session-local catalog, which shadows a same-named
+    // permanent table; its separate keyspace means shadowing never raises 42P07.
+    let target = if create.temporary {
+        &session.temp
+    } else {
+        engine
+    };
+    match target.create_table(TableSchema { name, columns }) {
         Ok(_) => {}
         // PG succeeds with a notice; NoticeResponse itself is still todo.
         Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {}

@@ -2,6 +2,7 @@
 //! together. The binary lives in `main.rs`; this library entry point exists
 //! so integration tests can run a server in-process on an ephemeral port.
 
+mod catalog;
 mod connection;
 mod error;
 mod query;
