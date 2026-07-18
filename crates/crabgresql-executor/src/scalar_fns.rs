@@ -12,7 +12,8 @@ use std::hint::black_box;
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Interval, Numeric, Value, float, interval, timestamp, timestamptz, to_char,
+    Interval, Numeric, TimeTz, Value, date, float, interval, time, timestamp, timestamptz, timetz,
+    to_char,
 };
 
 use crate::ExecError;
@@ -278,6 +279,82 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 None => Value::Null,
             });
         }
+
+        // --- date operators/functions ---
+        ScalarFn::DatePlDays => {
+            return date::add_days(dt(&args[0]), i4(&args[1])).map(Value::Date).map_err(date_err);
+        }
+        ScalarFn::DateMiDays => {
+            return date::add_days(dt(&args[0]), -i4(&args[1])).map(Value::Date).map_err(date_err);
+        }
+        ScalarFn::DateMi => {
+            return date::sub_date(dt(&args[0]), dt(&args[1])).map(Value::Int4).map_err(date_err);
+        }
+        ScalarFn::DatePlInterval => {
+            return date::pl_interval(dt(&args[0]), iv(&args[1])).map(Value::Timestamp).map_err(date_err);
+        }
+        ScalarFn::DateMiInterval => {
+            return date::mi_interval(dt(&args[0]), iv(&args[1])).map(Value::Timestamp).map_err(date_err);
+        }
+        ScalarFn::DatePlTime => {
+            return date::pl_time(dt(&args[0]), tm(&args[1])).map(Value::Timestamp).map_err(date_err);
+        }
+        ScalarFn::DatePartDate => {
+            return Ok(match date::date_part(text(&args[0]), dt(&args[1])).map_err(date_err)? {
+                Some(v) => Value::Float8(v),
+                None => Value::Null,
+            });
+        }
+        ScalarFn::ExtractDate => {
+            return Ok(match date::extract(text(&args[0]), dt(&args[1])).map_err(date_err)? {
+                Some(n) => Value::Numeric(n),
+                None => Value::Null,
+            });
+        }
+        ScalarFn::IsfiniteDate => {
+            return Ok(Value::Bool(date::is_finite(dt(&args[0]))));
+        }
+        ScalarFn::MakeDate => {
+            return date::make_date(i4(&args[0]) as i64, i4(&args[1]) as i64, i4(&args[2]) as i64)
+                .map(Value::Date)
+                .map_err(date_err);
+        }
+
+        // --- time operators/functions ---
+        ScalarFn::TimePlInterval => {
+            return Ok(Value::Time(time::pl_interval(tm(&args[0]), iv(&args[1]))));
+        }
+        ScalarFn::TimeMiInterval => {
+            return Ok(Value::Time(time::mi_interval(tm(&args[0]), iv(&args[1]))));
+        }
+        ScalarFn::TimeMi => {
+            return Ok(Value::Interval(time::mi(tm(&args[0]), tm(&args[1]))));
+        }
+        ScalarFn::DatePartTime => {
+            return time::date_part(text(&args[0]), tm(&args[1])).map(Value::Float8).map_err(time_err);
+        }
+        ScalarFn::ExtractTime => {
+            return time::extract(text(&args[0]), tm(&args[1])).map(Value::Numeric).map_err(time_err);
+        }
+        ScalarFn::MakeTime => {
+            return time::make_time(i4(&args[0]) as i64, i4(&args[1]) as i64, f8(&args[2]))
+                .map(Value::Time)
+                .map_err(time_err);
+        }
+
+        // --- timetz operators/functions ---
+        ScalarFn::TimeTzPlInterval => {
+            return Ok(Value::TimeTz(timetz::pl_interval(ttz(&args[0]), iv(&args[1]))));
+        }
+        ScalarFn::TimeTzMiInterval => {
+            return Ok(Value::TimeTz(timetz::mi_interval(ttz(&args[0]), iv(&args[1]))));
+        }
+        ScalarFn::DatePartTimeTz => {
+            return timetz::date_part(text(&args[0]), ttz(&args[1])).map(Value::Float8).map_err(timetz_err);
+        }
+        ScalarFn::ExtractTimeTz => {
+            return timetz::extract(text(&args[0]), ttz(&args[1])).map(Value::Numeric).map_err(timetz_err);
+        }
         _ => {}
     }
     // The remaining functions are float8 → float8 (or float8×float8 → float8).
@@ -368,6 +445,26 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         | ScalarFn::MakeTimestampTz
         | ScalarFn::TimezoneToTz
         | ScalarFn::TimezoneToTs
+        | ScalarFn::DatePlDays
+        | ScalarFn::DateMiDays
+        | ScalarFn::DateMi
+        | ScalarFn::DatePlInterval
+        | ScalarFn::DateMiInterval
+        | ScalarFn::DatePlTime
+        | ScalarFn::DatePartDate
+        | ScalarFn::ExtractDate
+        | ScalarFn::IsfiniteDate
+        | ScalarFn::MakeDate
+        | ScalarFn::TimePlInterval
+        | ScalarFn::TimeMiInterval
+        | ScalarFn::TimeMi
+        | ScalarFn::DatePartTime
+        | ScalarFn::ExtractTime
+        | ScalarFn::MakeTime
+        | ScalarFn::TimeTzPlInterval
+        | ScalarFn::TimeTzMiInterval
+        | ScalarFn::DatePartTimeTz
+        | ScalarFn::ExtractTimeTz
         | ScalarFn::NumRound
         | ScalarFn::NumTrunc
         | ScalarFn::NumCeil
@@ -656,6 +753,13 @@ pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, Str
         "timestamptz" | "timestamp with time zone" => timestamptz::parse(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
+        "date" => date::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message)),
+        "time" | "time without time zone" => {
+            time::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message))
+        }
+        "timetz" | "time with time zone" => {
+            timetz::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message))
+        }
         // Other types: not exercised; treat as valid.
         _ => Ok(()),
     }
@@ -705,6 +809,39 @@ fn tstz(v: &Value) -> i64 {
         Value::TimestampTz(t) => *t,
         other => unreachable!("expected timestamptz arg, got {other:?}"),
     }
+}
+
+fn dt(v: &Value) -> i32 {
+    match v {
+        Value::Date(d) => *d,
+        other => unreachable!("expected date arg, got {other:?}"),
+    }
+}
+
+fn tm(v: &Value) -> i64 {
+    match v {
+        Value::Time(t) => *t,
+        other => unreachable!("expected time arg, got {other:?}"),
+    }
+}
+
+fn ttz(v: &Value) -> TimeTz {
+    match v {
+        Value::TimeTz(t) => *t,
+        other => unreachable!("expected timetz arg, got {other:?}"),
+    }
+}
+
+fn date_err(e: crabgresql_types::date::DateError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
+}
+
+fn time_err(e: crabgresql_types::time::TimeError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
+}
+
+fn timetz_err(e: crabgresql_types::timetz::TimeTzError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
 }
 
 

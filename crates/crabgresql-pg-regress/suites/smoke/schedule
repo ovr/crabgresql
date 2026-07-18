@@ -1,6 +1,9 @@
 test: basic
 test: errors
 test: cast
+test: date
+test: time
+test: timetz
 test: timestamp
 test: timestamptz
 test: interval
