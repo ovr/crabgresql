@@ -216,6 +216,7 @@ fn pgtype_from_oid(o: u32) -> PgType {
         oid::OID => PgType::Oid,
         oid::BYTEA => PgType::Bytea,
         oid::BIT => PgType::Bit,
+        oid::VARBIT => PgType::Varbit,
         oid::DATE => PgType::Date,
         oid::TIME => PgType::Time,
         oid::TIMETZ => PgType::TimeTz,

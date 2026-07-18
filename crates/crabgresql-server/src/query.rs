@@ -747,6 +747,7 @@ fn builtin_type_by_name(name: &str) -> Option<PgType> {
         "name" => PgType::Name,
         "oid" => PgType::Oid,
         "bit" => PgType::Bit,
+        "varbit" | "bit varying" => PgType::Varbit,
         "date" => PgType::Date,
         "time" => PgType::Time,
         "timetz" => PgType::TimeTz,

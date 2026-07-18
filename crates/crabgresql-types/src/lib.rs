@@ -5,6 +5,7 @@
 //! the float regression tests need. `float` and `cast` hold the PG-exact I/O
 //! and cast machinery.
 
+pub mod bit;
 pub mod cast;
 pub mod date;
 pub mod float;
@@ -50,6 +51,7 @@ pub mod oid {
     pub const INTERVAL: u32 = 1186;
     pub const TIMETZ: u32 = 1266;
     pub const BIT: u32 = 1560;
+    pub const VARBIT: u32 = 1562;
     pub const NUMERIC: u32 = 1700;
     pub const CIDR: u32 = 650;
     pub const INET: u32 = 869;
@@ -80,7 +82,13 @@ pub enum PgType {
     /// print as unsigned decimals. Backs `pg_catalog` OID/`reg*` columns.
     Oid,
     Bytea,
+    /// `bit(n)`: a fixed-length bit string. The declared length is enforced as a
+    /// coercion; the runtime value carries its own length.
     Bit,
+    /// `bit varying(n)` / `varbit`: a variable-length bit string. Shares
+    /// [`Value::Bit`] with `bit`; the static type distinguishes the length rules
+    /// (max vs exact) and the error/`\d` spelling.
+    Varbit,
     /// `date`.
     Date,
     /// `time without time zone`.
@@ -122,6 +130,7 @@ impl PgType {
             PgType::Oid => oid::OID,
             PgType::Bytea => oid::BYTEA,
             PgType::Bit => oid::BIT,
+            PgType::Varbit => oid::VARBIT,
             PgType::Date => oid::DATE,
             PgType::Time => oid::TIME,
             PgType::TimeTz => oid::TIMETZ,
@@ -161,6 +170,7 @@ impl PgType {
             | PgType::Bpchar
             | PgType::Bytea
             | PgType::Bit
+            | PgType::Varbit
             | PgType::Inet
             | PgType::Cidr => -1,
             PgType::User(_) => -1,
@@ -185,6 +195,7 @@ impl PgType {
             PgType::Oid => "oid",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
+            PgType::Varbit => "bit varying",
             PgType::Date => "date",
             PgType::Time => "time without time zone",
             PgType::TimeTz => "time with time zone",
@@ -217,6 +228,7 @@ impl PgType {
             PgType::Oid => "oid",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
+            PgType::Varbit => "varbit",
             PgType::Date => "date",
             PgType::Time => "time",
             PgType::TimeTz => "timetz",
@@ -279,9 +291,9 @@ pub enum Value {
     Oid(u32),
     Text(String),
     Bytea(Vec<u8>),
-    /// A bit-string literal (`x'...'`): `len` bits packed right-aligned in
-    /// `bits`. Only produced by hex literals and consumed by bit→int casts.
-    Bit { len: u16, bits: u64 },
+    /// A `bit`/`bit varying` value: `len` bits packed most-significant-bit-first
+    /// in `data` (`ceil(len/8)` bytes, trailing pad bits zero). See [`crate::bit`].
+    Bit { len: u32, data: Vec<u8> },
     /// `date`: signed days since 2000-01-01, with `i32::MIN`/`i32::MAX` as the
     /// `-infinity`/`infinity` sentinels. See [`crate::date`].
     Date(i32),
@@ -363,15 +375,7 @@ impl Value {
                 }
                 Some(out)
             }
-            Value::Bit { len, bits } => {
-                // A zero-length bit string (`X''`) prints as the empty string;
-                // Rust's `{:b}` would otherwise emit a lone "0" for the value.
-                Some(if *len == 0 {
-                    String::new()
-                } else {
-                    format!("{:0width$b}", bits, width = *len as usize)
-                })
-            }
+            Value::Bit { len, data } => Some(bit::format(*len, data)),
             Value::Date(d) => Some(date::format(*d)),
             Value::Time(usec) => Some(time::format(*usec)),
             Value::TimeTz(v) => Some(timetz::format(*v)),

@@ -12,7 +12,7 @@ use std::hint::black_box;
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, TimeTz, Value, date, float, interval, money, net, text, time,
+    Inet, Interval, Numeric, TimeTz, Value, bit, date, float, interval, money, net, text, time,
     timestamp, timestamptz, timetz, to_char,
 };
 
@@ -195,6 +195,88 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         ScalarFn::NameInput => return Ok(Value::Text(text::name_input(text(&args[0])))),
         ScalarFn::BpcharToText => return Ok(Value::Text(text::bpchar_rtrim(text(&args[0])))),
+        // --- bit / varbit ---
+        ScalarFn::BitNot => {
+            let (len, data) = bits(&args[0]);
+            let (len, data) = bit::not(len, data);
+            return Ok(Value::Bit { len, data });
+        }
+        ScalarFn::BitAnd | ScalarFn::BitOr | ScalarFn::BitXor => {
+            let (la, da) = bits(&args[0]);
+            let (lb, db) = bits(&args[1]);
+            let r = match func {
+                ScalarFn::BitAnd => bit::and(la, da, lb, db),
+                ScalarFn::BitOr => bit::or(la, da, lb, db),
+                _ => bit::xor(la, da, lb, db),
+            };
+            return r.map(|(len, data)| Value::Bit { len, data }).map_err(bit_err);
+        }
+        ScalarFn::BitConcat => {
+            let (la, da) = bits(&args[0]);
+            let (lb, db) = bits(&args[1]);
+            let (len, data) = bit::concat(la, da, lb, db);
+            return Ok(Value::Bit { len, data });
+        }
+        ScalarFn::BitShl | ScalarFn::BitShr => {
+            let (len, data) = bits(&args[0]);
+            let n = i4(&args[1]);
+            let (len, data) = if matches!(func, ScalarFn::BitShl) {
+                bit::shift_left(len, data, n)
+            } else {
+                bit::shift_right(len, data, n)
+            };
+            return Ok(Value::Bit { len, data });
+        }
+        ScalarFn::BitLen => return Ok(Value::Int4(bit::length(bits(&args[0]).0))),
+        ScalarFn::BitCount => {
+            let (len, data) = bits(&args[0]);
+            return Ok(Value::Int8(bit::bit_count(len, data)));
+        }
+        ScalarFn::GetBit => {
+            let (len, data) = bits(&args[0]);
+            return bit::get_bit(len, data, i4(&args[1])).map(Value::Int4).map_err(bit_err);
+        }
+        ScalarFn::SetBit => {
+            let (len, data) = bits(&args[0]);
+            return bit::set_bit(len, data, i4(&args[1]), i4(&args[2]))
+                .map(|(len, data)| Value::Bit { len, data })
+                .map_err(bit_err);
+        }
+        ScalarFn::SubstrBit => {
+            let (len, data) = bits(&args[0]);
+            let count = args.get(2).map(i4);
+            return bit::substring(len, data, i4(&args[1]), count)
+                .map(|(len, data)| Value::Bit { len, data })
+                .map_err(bit_err);
+        }
+        ScalarFn::BitPosition => {
+            let (sl, sd) = bits(&args[0]);
+            let (ul, ud) = bits(&args[1]);
+            return Ok(Value::Int4(bit::position(sl, sd, ul, ud)));
+        }
+        ScalarFn::OverlayBit => {
+            let (sl, sd) = bits(&args[0]);
+            let (rl, rd) = bits(&args[1]);
+            let count = args.get(3).map(i4);
+            return bit::overlay(sl, sd, rl, rd, i4(&args[2]), count)
+                .map(|(len, data)| Value::Bit { len, data })
+                .map_err(bit_err);
+        }
+        ScalarFn::BitTypmod | ScalarFn::VarbitTypmod => {
+            // A third arg of 0 selects assignment semantics (error on mismatch);
+            // an explicit `::bit(n)` cast (no third arg) truncates/pads.
+            let (len, data) = bits(&args[0]);
+            let explicit = args.get(2).map(|v| i4(v) != 0).unwrap_or(true);
+            return bit::coerce(
+                len,
+                data,
+                i4(&args[1]),
+                matches!(func, ScalarFn::VarbitTypmod),
+                explicit,
+            )
+            .map(|(len, data)| Value::Bit { len, data })
+            .map_err(bit_err);
+        }
         ScalarFn::Float4Send => {
             let f = f4(&args[0]);
             return Ok(Value::Bytea(f.to_be_bytes().to_vec()));
@@ -644,6 +726,17 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
 
 fn text_err(e: text::TextError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
+}
+
+fn bit_err(e: bit::BitError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
+}
+
+fn bits(v: &Value) -> (u32, &[u8]) {
+    match v {
+        Value::Bit { len, data } => (*len, data),
+        other => unreachable!("expected bit arg, got {other:?}"),
+    }
 }
 
 fn float_err(e: float::FloatError) -> ExecError {
