@@ -357,3 +357,36 @@ fn scan_is_stable_against_concurrent_writes() {
     let rows: Vec<_> = scan.collect();
     assert_eq!(rows, vec![(a, vec![Value::Int4(1), Value::Null])]);
 }
+
+#[test]
+fn drop_table_unlinks_file_and_frees_name() {
+    let h = setup();
+    let table = h.engine.create_table(schema("t")).unwrap();
+    insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Text("one".into())]);
+    // The first relation is relfilenode 1; its heap file exists after the insert.
+    let base = h._dir.path().join("base");
+    assert!(base.join("1").exists());
+    drop(table);
+
+    h.engine.drop_table("t").unwrap();
+    // The heap file is unlinked and the name is gone.
+    assert!(!base.join("1").exists());
+    assert!(matches!(
+        h.engine.open_table("t"),
+        Err(crabgresql_storage_api::StorageError::TableNotFound(_))
+    ));
+    // Dropping again reports the missing table.
+    assert!(matches!(
+        h.engine.drop_table("t"),
+        Err(crabgresql_storage_api::StorageError::TableNotFound(_))
+    ));
+
+    // Re-creating the name succeeds and gets a fresh relfilenode (2), never
+    // reusing the dropped one — the catalog's counter stays monotonic.
+    let t2 = h.engine.create_table(schema("t")).unwrap();
+    insert_committed(&h.tm, &*t2, vec![Value::Int4(2), Value::Null]);
+    assert!(base.join("2").exists());
+    assert!(!base.join("1").exists());
+    let rows: Vec<Value> = t2.scan(&read(&h.tm)).map(|(_, t)| t[0].clone()).collect();
+    assert_eq!(rows, vec![Value::Int4(2)]);
+}

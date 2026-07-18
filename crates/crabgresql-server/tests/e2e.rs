@@ -188,6 +188,79 @@ async fn undefined_table_reports_sqlstate_42p01() {
 }
 
 #[tokio::test]
+async fn drop_table_lifecycle() {
+    let mut socket = raw_session(spawn_server().await).await;
+
+    // A successful drop returns the bare `DROP TABLE` command tag.
+    simple_query_raw(&mut socket, "CREATE TABLE t (a int)").await;
+    let msgs = simple_query_raw(&mut socket, "DROP TABLE t").await;
+    assert_eq!(command_tags(&msgs), ["DROP TABLE"]);
+    assert_eq!(ready_status(&msgs), b'I');
+
+    // The relation is really gone.
+    let msgs = simple_query_raw(&mut socket, "SELECT * FROM t").await;
+    let err = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'E')
+        .expect("must report an error");
+    assert_eq!(fields(err).code(), "42P01");
+
+    // Dropping a missing table without IF EXISTS errors 42P01. PG uses the noun
+    // "table" here (not "relation").
+    let msgs = simple_query_raw(&mut socket, "DROP TABLE t").await;
+    let err = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'E')
+        .expect("must report an error");
+    let err = fields(err);
+    assert_eq!(err.code(), "42P01");
+    assert_eq!(err.message(), "table \"t\" does not exist");
+
+    // DROP TABLE IF EXISTS of a missing table warns and still succeeds.
+    let msgs = simple_query_raw(&mut socket, "DROP TABLE IF EXISTS t").await;
+    let notice = fields(
+        msgs.iter()
+            .find(|(tag, _)| *tag == b'N')
+            .expect("a NOTICE is expected"),
+    );
+    assert_eq!(notice.severity(), "NOTICE");
+    assert_eq!(notice.message(), "table \"t\" does not exist, skipping");
+    assert_eq!(command_tags(&msgs), ["DROP TABLE"]);
+    assert_eq!(ready_status(&msgs), b'I');
+
+    // The name is free to reuse after a drop.
+    let msgs = simple_query_raw(&mut socket, "CREATE TABLE t (a int)").await;
+    assert_eq!(command_tags(&msgs), ["CREATE TABLE"]);
+}
+
+#[tokio::test]
+async fn drop_table_resolves_temp_first() {
+    let mut socket = raw_session(spawn_server().await).await;
+
+    // A temp table shadows a same-named permanent one; DROP resolves temp-first,
+    // so it removes the temp table and leaves the permanent one intact.
+    simple_query_raw(&mut socket, "CREATE TABLE t (a int)").await;
+    simple_query_raw(&mut socket, "INSERT INTO t VALUES (1)").await;
+    simple_query_raw(&mut socket, "CREATE TEMP TABLE t (a int)").await;
+    let msgs = simple_query_raw(&mut socket, "DROP TABLE t").await;
+    assert_eq!(command_tags(&msgs), ["DROP TABLE"]);
+
+    // The permanent table is still there with its row.
+    let msgs = simple_query_raw(&mut socket, "SELECT a FROM t").await;
+    assert!(msgs.iter().any(|(tag, _)| *tag == b'D'), "permanent row remains");
+
+    // Dropping again now removes the permanent table.
+    let msgs = simple_query_raw(&mut socket, "DROP TABLE t").await;
+    assert_eq!(command_tags(&msgs), ["DROP TABLE"]);
+    let msgs = simple_query_raw(&mut socket, "SELECT a FROM t").await;
+    let err = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'E')
+        .expect("relation is gone");
+    assert_eq!(fields(err).code(), "42P01");
+}
+
+#[tokio::test]
 async fn syntax_error_reports_sqlstate_42601() {
     let client = connect(spawn_server().await).await;
     let err = client.simple_query("SELEC 1").await.unwrap_err();

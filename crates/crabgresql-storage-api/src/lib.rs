@@ -190,6 +190,9 @@ pub trait TableEngine: Send + Sync {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError>;
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError>;
+
+    /// Remove a table and all its data. `TableNotFound` if it doesn't exist.
+    fn drop_table(&self, name: &str) -> Result<(), StorageError>;
 }
 
 /// A resolved `CREATE TYPE`: its OID and the builtin representation its values

@@ -141,6 +141,12 @@ pub fn execute_statement(
             ..
         } => return execute_create_cast(global_catalog, source, target, method),
         ast::Statement::Drop {
+            object_type: ast::ObjectType::Table,
+            names,
+            if_exists,
+            ..
+        } => return execute_drop_table(&catalog, names, *if_exists),
+        ast::Statement::Drop {
             object_type: ast::ObjectType::Type,
             names,
             cascade,
@@ -873,6 +879,53 @@ fn execute_create_cast(
     Ok(QueryResult::Command {
         tag: "CREATE CAST".into(),
         notices: to_notices(notices),
+    })
+}
+
+/// `DROP TABLE name [, ...] [IF EXISTS] [CASCADE|RESTRICT]`. Resolves against the
+/// temp-first overlay so a session temp table is dropped ahead of a same-named
+/// permanent one. All targets are validated before any is dropped, so a multi-name
+/// DROP is atomic like PG. `CASCADE`/`RESTRICT` are accepted and ignored: no object
+/// depends on a table in this engine, so both simply drop the named tables.
+fn execute_drop_table(
+    catalog: &Arc<dyn TableEngine>,
+    names: &[ast::ObjectName],
+    if_exists: bool,
+) -> Result<QueryResult, PgError> {
+    let tnames = names
+        .iter()
+        .map(object_name_to_table_name)
+        .collect::<Result<Vec<_>, _>>()?;
+    // Phase 1: validate. A missing target without IF EXISTS aborts the whole
+    // statement before anything is dropped; with IF EXISTS it becomes a skip
+    // NOTICE. PG spells the missing-object noun "table" here, not "relation".
+    let mut notices = Vec::new();
+    let mut to_drop = Vec::new();
+    for name in &tnames {
+        match catalog.open_table(name) {
+            Ok(_) => to_drop.push(name),
+            Err(StorageError::TableNotFound(_)) if if_exists => {
+                notices.push(Notice::notice(
+                    format!("table \"{name}\" does not exist, skipping"),
+                    None,
+                ));
+            }
+            Err(StorageError::TableNotFound(_)) => {
+                return Err(PgError::new(
+                    sqlstate::UNDEFINED_TABLE,
+                    format!("table \"{name}\" does not exist"),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Phase 2: drop the validated survivors.
+    for name in to_drop {
+        catalog.drop_table(name)?;
+    }
+    Ok(QueryResult::Command {
+        tag: "DROP TABLE".into(),
+        notices,
     })
 }
 
