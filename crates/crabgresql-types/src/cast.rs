@@ -3,7 +3,7 @@
 //! reproduces PG's *observable* cast results — including the SQLSTATE/message on
 //! range errors — as pinned by the regression corpus, implemented independently.
 
-use crate::{NumericVal, PgType, Value, float, parse_bool, timestamp, timestamptz};
+use crate::{NumericVal, PgType, Value, float, interval, parse_bool, timestamp, timestamptz};
 
 /// SQLSTATE + message for a failed cast.
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +187,11 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             .map(Value::Timestamp)
             .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
 
+        // ---- text → interval (interval_in) ----
+        (Value::Text(s), PgType::Interval) => interval::parse(s)
+            .map(Value::Interval)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
         // ---- text → timestamptz (timestamptz_in) ----
         (Value::Text(s), PgType::TimestampTz) => timestamptz::parse(s)
             .map(Value::TimestampTz)
@@ -201,6 +206,7 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // here (and `timestamptz::{parse,format,make_timestamptz}`) at that time.
         (Value::Timestamp(m), PgType::TimestampTz) => Ok(Value::TimestampTz(*m)),
         (Value::TimestampTz(m), PgType::Timestamp) => Ok(Value::Timestamp(*m)),
+
 
         // ---- integer → numeric (exact) ----
         (Value::Int2(n), PgType::Numeric) => Ok(Value::Numeric(NumericVal::Finite(n.to_string()))),

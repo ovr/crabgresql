@@ -3,5 +3,6 @@ test: errors
 test: cast
 test: timestamp
 test: timestamptz
+test: interval
 test: case
 test: transactions
