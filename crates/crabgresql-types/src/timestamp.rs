@@ -752,10 +752,11 @@ pub fn extract(unit: &str, micros: i64) -> Result<Option<Numeric>, TimestampErro
 /// Format `scaled` (the field value times `10^scale`) as a fixed-point decimal
 /// with `scale` fractional digits, keeping sign. E.g. `40500000` at scale 6 is
 /// `40.500000`; at scale 3 it is `40500.000`; at scale 0 it is `40500000`.
-pub(crate) fn fixed_point(scaled: i64, scale: usize) -> String {
+pub(crate) fn fixed_point(scaled: impl Into<i128>, scale: usize) -> String {
+    let scaled: i128 = scaled.into();
     let neg = scaled < 0;
     let abs = scaled.unsigned_abs();
-    let denom = 10u64.pow(scale as u32);
+    let denom = 10u128.pow(scale as u32);
     let int_part = abs / denom;
     let frac_part = abs % denom;
     let mut out = String::new();
@@ -772,9 +773,11 @@ pub(crate) fn fixed_point(scaled: i64, scale: usize) -> String {
 
 /// Seconds-since-Unix-epoch expressed in microseconds. The PG epoch is
 /// `EPOCH_MINUS_PG_DAYS` (= -10957) days from the Unix epoch, so shifting by the
-/// negative of that lands on Unix time.
-fn epoch_micros(micros: i64) -> i64 {
-    micros - EPOCH_MINUS_PG_DAYS * USECS_PER_DAY
+/// negative of that lands on Unix time. Computed in `i128`: near the top of the
+/// timestamp range `micros` is close to `i64::MAX`, so the shift would overflow
+/// `i64` (PG likewise falls back to wide arithmetic here).
+fn epoch_micros(micros: i64) -> i128 {
+    micros as i128 - EPOCH_MINUS_PG_DAYS as i128 * USECS_PER_DAY as i128
 }
 
 pub(crate) fn decade(year: i64) -> i64 {
@@ -1346,6 +1349,15 @@ mod tests {
             "982355920.000000"
         );
         assert_eq!(ex("epoch"), "982355920.500000");
+    }
+
+    #[test]
+    fn extract_epoch_near_range_limit_does_not_overflow() {
+        // Regression: near the top of the timestamp range `micros` is close to
+        // `i64::MAX`, so shifting to the Unix epoch overflowed `i64` and panicked.
+        let t = ts("294276-12-31 23:59:59");
+        assert_eq!(extract("epoch", t).unwrap().unwrap().to_display(), "9224318015999.000000");
+        assert_eq!(date_part("epoch", t).unwrap(), Some(9224318015999.0));
     }
 
     #[test]
