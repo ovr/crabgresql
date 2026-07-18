@@ -238,70 +238,9 @@ impl fmt::Display for AlterRoleOperation {
     }
 }
 
-/// A `USE` (`Statement::Use`) operation
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-pub enum Use {
-    /// Switch to the given catalog (e.g. `USE CATALOG ...`).
-    Catalog(ObjectName),
-    /// Switch to the given schema (e.g. `USE SCHEMA ...`).
-    Schema(ObjectName),
-    /// Switch to the given database (e.g. `USE DATABASE ...`).
-    Database(ObjectName),
-    /// Switch to the given warehouse (e.g. `USE WAREHOUSE ...`).
-    Warehouse(ObjectName),
-    /// Switch to the given role (e.g. `USE ROLE ...`).
-    Role(ObjectName),
-    /// Use secondary roles specification (e.g. `USE SECONDARY ROLES ...`).
-    SecondaryRoles(SecondaryRoles),
-    /// Use the specified object (e.g. `USE foo.bar`).
-    Object(ObjectName),
-    /// Reset to default (e.g. `USE DEFAULT`).
-    Default,
-}
 
-impl fmt::Display for Use {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("USE ")?;
-        match self {
-            Use::Catalog(name) => write!(f, "CATALOG {name}"),
-            Use::Schema(name) => write!(f, "SCHEMA {name}"),
-            Use::Database(name) => write!(f, "DATABASE {name}"),
-            Use::Warehouse(name) => write!(f, "WAREHOUSE {name}"),
-            Use::Role(name) => write!(f, "ROLE {name}"),
-            Use::SecondaryRoles(secondary_roles) => {
-                write!(f, "SECONDARY ROLES {secondary_roles}")
-            }
-            Use::Object(name) => write!(f, "{name}"),
-            Use::Default => write!(f, "DEFAULT"),
-        }
-    }
-}
 
-/// Snowflake `SECONDARY ROLES` USE variant
-/// See: <https://docs.snowflake.com/en/sql-reference/sql/use-secondary-roles>
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-pub enum SecondaryRoles {
-    /// Use all secondary roles.
-    All,
-    /// Use no secondary roles.
-    None,
-    /// Explicit list of secondary roles.
-    List(Vec<Ident>),
-}
 
-impl fmt::Display for SecondaryRoles {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            SecondaryRoles::All => write!(f, "ALL"),
-            SecondaryRoles::None => write!(f, "NONE"),
-            SecondaryRoles::List(roles) => write!(f, "{}", display_comma_separated(roles)),
-        }
-    }
-}
 
 /// CREATE ROLE statement
 /// See [PostgreSQL](https://www.postgresql.org/docs/current/sql-createrole.html)

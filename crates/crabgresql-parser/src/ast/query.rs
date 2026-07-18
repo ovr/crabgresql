@@ -50,22 +50,6 @@ pub struct Query {
     pub fetch: Option<Fetch>,
     /// `FOR { UPDATE | SHARE } [ OF table_name ] [ SKIP LOCKED | NOWAIT ]`
     pub locks: Vec<LockClause>,
-    /// `FOR XML { RAW | AUTO | EXPLICIT | PATH } [ , ELEMENTS ]`
-    /// `FOR JSON { AUTO | PATH } [ , INCLUDE_NULL_VALUES ]`
-    /// (MSSQL-specific)
-    pub for_clause: Option<ForClause>,
-    /// ClickHouse syntax: `SELECT * FROM t SETTINGS key1 = value1, key2 = value2`
-    ///
-    /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/select#settings-in-select-query)
-    pub settings: Option<Vec<Setting>>,
-    /// `SELECT * FROM t FORMAT JSONCompact`
-    ///
-    /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/select/format)
-    /// (ClickHouse-specific)
-    pub format_clause: Option<FormatClause>,
-
-    /// Pipe operator
-    pub pipe_operators: Vec<PipeOperator>,
 }
 
 impl fmt::Display for Query {
@@ -83,10 +67,6 @@ impl fmt::Display for Query {
         if let Some(ref limit_clause) = self.limit_clause {
             limit_clause.fmt(f)?;
         }
-        if let Some(ref settings) = self.settings {
-            f.write_str(" SETTINGS ")?;
-            display_comma_separated(settings).fmt(f)?;
-        }
         if let Some(ref fetch) = self.fetch {
             f.write_str(" ")?;
             fetch.fmt(f)?;
@@ -94,18 +74,6 @@ impl fmt::Display for Query {
         if !self.locks.is_empty() {
             f.write_str(" ")?;
             display_separated(&self.locks, " ").fmt(f)?;
-        }
-        if let Some(ref for_clause) = self.for_clause {
-            f.write_str(" ")?;
-            for_clause.fmt(f)?;
-        }
-        if let Some(ref format) = self.format_clause {
-            f.write_str(" ")?;
-            format.fmt(f)?;
-        }
-        for pipe_operator in &self.pipe_operators {
-            f.write_str(" |> ")?;
-            pipe_operator.fmt(f)?;
         }
         Ok(())
     }
@@ -457,10 +425,6 @@ pub struct Select {
     ///
     /// See [MySQL SELECT](https://dev.mysql.com/doc/refman/8.4/en/select.html).
     pub select_modifiers: Option<SelectModifiers>,
-    /// MSSQL syntax: `TOP (<N>) [ PERCENT ] [ WITH TIES ]`
-    pub top: Option<Top>,
-    /// Whether the top was located before `ALL`/`DISTINCT`
-    pub top_before_distinct: bool,
     /// projection expressions
     pub projection: Vec<SelectItem>,
     /// Excluded columns from the projection expression which are not specified
@@ -502,8 +466,6 @@ pub struct Select {
     /// WINDOW before QUALIFY.
     /// We accept either positioning and flag the accepted variant.
     pub window_before_qualify: bool,
-    /// BigQuery syntax: `SELECT AS VALUE | SELECT AS STRUCT`
-    pub value_table_mode: Option<ValueTableMode>,
     /// Was this a FROM-first query?
     pub flavor: SelectFlavor,
 }
@@ -527,26 +489,9 @@ impl fmt::Display for Select {
             hint.fmt(f)?;
         }
 
-        if let Some(value_table_mode) = self.value_table_mode {
-            f.write_str(" ")?;
-            value_table_mode.fmt(f)?;
-        }
-
-        if let Some(ref top) = self.top {
-            if self.top_before_distinct {
-                f.write_str(" ")?;
-                top.fmt(f)?;
-            }
-        }
         if let Some(ref distinct) = self.distinct {
             f.write_str(" ")?;
             distinct.fmt(f)?;
-        }
-        if let Some(ref top) = self.top {
-            if !self.top_before_distinct {
-                f.write_str(" ")?;
-                top.fmt(f)?;
-            }
         }
 
         if let Some(ref select_modifiers) = self.select_modifiers {
@@ -1549,54 +1494,6 @@ pub enum TableFactor {
         /// Whether `WITH ORDINALITY` was specified to include ordinality.
         with_ordinality: bool,
     },
-    /// The `JSON_TABLE` table-valued function.
-    /// Part of the SQL standard, but implemented only by MySQL, Oracle, and DB2.
-    ///
-    /// <https://modern-sql.com/blog/2017-06/whats-new-in-sql-2016#json_table>
-    /// <https://dev.mysql.com/doc/refman/8.0/en/json-table-functions.html#function_json-table>
-    ///
-    /// ```sql
-    /// SELECT * FROM JSON_TABLE(
-    ///    '[{"a": 1, "b": 2}, {"a": 3, "b": 4}]',
-    ///    '$[*]' COLUMNS(
-    ///        a INT PATH '$.a' DEFAULT '0' ON EMPTY,
-    ///        b INT PATH '$.b' NULL ON ERROR
-    ///     )
-    /// ) AS jt;
-    /// ````
-    JsonTable {
-        /// The JSON expression to be evaluated. It must evaluate to a json string
-        json_expr: Expr,
-        /// The path to the array or object to be iterated over.
-        /// It must evaluate to a json array or object.
-        json_path: ValueWithSpan,
-        /// The columns to be extracted from each element of the array or object.
-        /// Each column must have a name and a type.
-        columns: Vec<JsonTableColumn>,
-        /// The alias for the table.
-        alias: Option<TableAlias>,
-    },
-    /// The MSSQL's `OPENJSON` table-valued function.
-    ///
-    /// ```sql
-    /// OPENJSON( jsonExpression [ , path ] )  [ <with_clause> ]
-    ///
-    /// <with_clause> ::= WITH ( { colName type [ column_path ] [ AS JSON ] } [ ,...n ] )
-    /// ````
-    ///
-    /// Reference: <https://learn.microsoft.com/en-us/sql/t-sql/functions/openjson-transact-sql?view=sql-server-ver16#syntax>
-    OpenJsonTable {
-        /// The JSON expression to be evaluated. It must evaluate to a json string
-        json_expr: Expr,
-        /// The path to the array or object to be iterated over.
-        /// It must evaluate to a json array or object.
-        json_path: Option<ValueWithSpan>,
-        /// The columns to be extracted from each element of the array or object.
-        /// Each column must have a name and a type.
-        columns: Vec<OpenJsonTableColumn>,
-        /// The alias for the table.
-        alias: Option<TableAlias>,
-    },
     /// Represents a parenthesized table factor. The SQL spec only allows a
     /// join expression (`(foo <JOIN> bar [ <JOIN> baz ... ])`) to be nested,
     /// possibly several times.
@@ -1607,74 +1504,6 @@ pub enum TableFactor {
         /// The nested join expression contained in parentheses.
         table_with_joins: Box<TableWithJoins>,
         /// Optional alias for the nested join.
-        alias: Option<TableAlias>,
-    },
-    /// Represents PIVOT operation on a table.
-    /// For example `FROM monthly_sales PIVOT(sum(amount) FOR MONTH IN ('JAN', 'FEB'))`
-    ///
-    /// [BigQuery](https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#pivot_operator)
-    /// [Snowflake](https://docs.snowflake.com/en/sql-reference/constructs/pivot)
-    /// [Oracle](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/SELECT.html#GUID-CFA006CA-6FF1-4972-821E-6996142A51C6__GUID-68257B27-1C4C-4C47-8140-5C60E0E65D35)
-    Pivot {
-        /// The input table to pivot.
-        table: Box<TableFactor>,
-        /// Aggregate expressions used as pivot values (optionally aliased).
-        aggregate_functions: Vec<ExprWithAlias>, // Function expression
-        /// Columns producing the values to be pivoted.
-        value_column: Vec<Expr>,
-        /// Source of pivot values (e.g. list of literals or columns).
-        value_source: PivotValueSource,
-        /// Optional expression providing a default when a pivot produces NULL.
-        default_on_null: Option<Expr>,
-        /// Optional alias for the pivoted table.
-        alias: Option<TableAlias>,
-    },
-    /// An UNPIVOT operation on a table.
-    ///
-    /// Syntax:
-    /// ```sql
-    /// table UNPIVOT [ { INCLUDE | EXCLUDE } NULLS ] (value FOR name IN (column1, [ column2, ... ])) [ alias ]
-    /// ```
-    ///
-    /// [Snowflake](https://docs.snowflake.com/en/sql-reference/constructs/unpivot)
-    /// [Databricks](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-syntax-qry-select-unpivot)
-    /// [BigQuery](https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#unpivot_operator)
-    /// [Oracle](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/SELECT.html#GUID-CFA006CA-6FF1-4972-821E-6996142A51C6__GUID-9B4E0389-413C-4014-94A1-0A0571BDF7E1)
-    Unpivot {
-        /// The input table to unpivot.
-        table: Box<TableFactor>,
-        /// Expression producing the unpivoted value.
-        value: Expr,
-        /// Identifier used for the generated column name.
-        name: Ident,
-        /// Columns or expressions to unpivot, optionally aliased.
-        columns: Vec<ExprWithAlias>,
-        /// Whether to include or exclude NULLs during unpivot.
-        null_inclusion: Option<NullInclusion>,
-        /// Optional alias for the resulting table.
-        alias: Option<TableAlias>,
-    },
-    /// A `MATCH_RECOGNIZE` operation on a table.
-    ///
-    /// See <https://docs.snowflake.com/en/sql-reference/constructs/match_recognize>.
-    MatchRecognize {
-        /// The input table to apply `MATCH_RECOGNIZE` on.
-        table: Box<TableFactor>,
-        /// `PARTITION BY <expr> [, ... ]`
-        partition_by: Vec<Expr>,
-        /// `ORDER BY <expr> [, ... ]`
-        order_by: Vec<OrderByExpr>,
-        /// `MEASURES <expr> [AS] <alias> [, ... ]`
-        measures: Vec<Measure>,
-        /// `ONE ROW PER MATCH | ALL ROWS PER MATCH [ <option> ]`
-        rows_per_match: Option<RowsPerMatch>,
-        /// `AFTER MATCH SKIP <option>`
-        after_match_skip: Option<AfterMatchSkip>,
-        /// `PATTERN ( <pattern> )`
-        pattern: MatchRecognizePattern,
-        /// `DEFINE <symbol> AS <expr> [, ... ]`
-        symbols: Vec<SymbolDefinition>,
-        /// The alias for the table.
         alias: Option<TableAlias>,
     },
     /// The `XMLTABLE` table-valued function.
@@ -1706,31 +1535,6 @@ pub enum TableFactor {
         /// The columns to be extracted from each generated row.
         columns: Vec<XmlTableColumn>,
         /// The alias for the table.
-        alias: Option<TableAlias>,
-    },
-    /// Snowflake's SEMANTIC_VIEW function for semantic models.
-    ///
-    /// <https://docs.snowflake.com/en/sql-reference/constructs/semantic_view>
-    ///
-    /// ```sql
-    /// SELECT * FROM SEMANTIC_VIEW(
-    ///     tpch_analysis
-    ///     DIMENSIONS customer.customer_market_segment
-    ///     METRICS orders.order_average_value
-    /// );
-    /// ```
-    SemanticView {
-        /// The name of the semantic model
-        name: ObjectName,
-        /// List of dimensions or expression referring to dimensions (e.g. DATE_PART('year', col))
-        dimensions: Vec<Expr>,
-        /// List of metrics (references to objects like orders.value, value, orders.*)
-        metrics: Vec<Expr>,
-        /// List of facts or expressions referring to facts or dimensions.
-        facts: Vec<Expr>,
-        /// WHERE clause for filtering
-        where_clause: Option<Expr>,
-        /// The alias for the table
         alias: Option<TableAlias>,
     },
 }
@@ -1944,40 +1748,7 @@ impl fmt::Display for TableSample {
     }
 }
 
-/// The source of values in a `PIVOT` operation.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-pub enum PivotValueSource {
-    /// Pivot on a static list of values.
-    ///
-    /// See <https://docs.snowflake.com/en/sql-reference/constructs/pivot#pivot-on-a-specified-list-of-column-values-for-the-pivot-column>.
-    List(Vec<ExprWithAlias>),
-    /// Pivot on all distinct values of the pivot column.
-    ///
-    /// See <https://docs.snowflake.com/en/sql-reference/constructs/pivot#pivot-on-all-distinct-column-values-automatically-with-dynamic-pivot>.
-    Any(Vec<OrderByExpr>),
-    /// Pivot on all values returned by a subquery.
-    ///
-    /// See <https://docs.snowflake.com/en/sql-reference/constructs/pivot#pivot-on-column-values-using-a-subquery-with-dynamic-pivot>.
-    Subquery(Box<Query>),
-}
 
-impl fmt::Display for PivotValueSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PivotValueSource::List(values) => write!(f, "{}", display_comma_separated(values)),
-            PivotValueSource::Any(order_by) => {
-                write!(f, "ANY")?;
-                if !order_by.is_empty() {
-                    write!(f, " ORDER BY {}", display_comma_separated(order_by))?;
-                }
-                Ok(())
-            }
-            PivotValueSource::Subquery(query) => write!(f, "{query}"),
-        }
-    }
-}
 
 /// An item in the `MEASURES` subclause of a `MATCH_RECOGNIZE` operation.
 ///
@@ -2326,132 +2097,11 @@ impl fmt::Display for TableFactor {
                 }
                 Ok(())
             }
-            TableFactor::JsonTable {
-                json_expr,
-                json_path,
-                columns,
-                alias,
-            } => {
-                write!(
-                    f,
-                    "JSON_TABLE({json_expr}, {json_path} COLUMNS({columns}))",
-                    columns = display_comma_separated(columns)
-                )?;
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
-            TableFactor::OpenJsonTable {
-                json_expr,
-                json_path,
-                columns,
-                alias,
-            } => {
-                write!(f, "OPENJSON({json_expr}")?;
-                if let Some(json_path) = json_path {
-                    write!(f, ", {json_path}")?;
-                }
-                write!(f, ")")?;
-                if !columns.is_empty() {
-                    write!(f, " WITH ({})", display_comma_separated(columns))?;
-                }
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
             TableFactor::NestedJoin {
                 table_with_joins,
                 alias,
             } => {
                 write!(f, "({table_with_joins})")?;
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
-            TableFactor::Pivot {
-                table,
-                aggregate_functions,
-                value_column,
-                value_source,
-                default_on_null,
-                alias,
-            } => {
-                write!(
-                    f,
-                    "{table} PIVOT({} FOR ",
-                    display_comma_separated(aggregate_functions),
-                )?;
-                if value_column.len() == 1 {
-                    write!(f, "{}", value_column[0])?;
-                } else {
-                    write!(f, "({})", display_comma_separated(value_column))?;
-                }
-                write!(f, " IN ({value_source})")?;
-                if let Some(expr) = default_on_null {
-                    write!(f, " DEFAULT ON NULL ({expr})")?;
-                }
-                write!(f, ")")?;
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
-            TableFactor::Unpivot {
-                table,
-                null_inclusion,
-                value,
-                name,
-                columns,
-                alias,
-            } => {
-                write!(f, "{table} UNPIVOT")?;
-                if let Some(null_inclusion) = null_inclusion {
-                    write!(f, " {null_inclusion} ")?;
-                }
-                write!(
-                    f,
-                    "({} FOR {} IN ({}))",
-                    value,
-                    name,
-                    display_comma_separated(columns)
-                )?;
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
-            TableFactor::MatchRecognize {
-                table,
-                partition_by,
-                order_by,
-                measures,
-                rows_per_match,
-                after_match_skip,
-                pattern,
-                symbols,
-                alias,
-            } => {
-                write!(f, "{table} MATCH_RECOGNIZE(")?;
-                if !partition_by.is_empty() {
-                    write!(f, "PARTITION BY {} ", display_comma_separated(partition_by))?;
-                }
-                if !order_by.is_empty() {
-                    write!(f, "ORDER BY {} ", display_comma_separated(order_by))?;
-                }
-                if !measures.is_empty() {
-                    write!(f, "MEASURES {} ", display_comma_separated(measures))?;
-                }
-                if let Some(rows_per_match) = rows_per_match {
-                    write!(f, "{rows_per_match} ")?;
-                }
-                if let Some(after_match_skip) = after_match_skip {
-                    write!(f, "{after_match_skip} ")?;
-                }
-                write!(f, "PATTERN ({pattern}) ")?;
-                write!(f, "DEFINE {})", display_comma_separated(symbols))?;
                 if let Some(alias) = alias {
                     write!(f, " {alias}")?;
                 }
@@ -2480,40 +2130,6 @@ impl fmt::Display for TableFactor {
                 if let Some(alias) = alias {
                     write!(f, " {alias}")?;
                 }
-                Ok(())
-            }
-            TableFactor::SemanticView {
-                name,
-                dimensions,
-                metrics,
-                facts,
-                where_clause,
-                alias,
-            } => {
-                write!(f, "SEMANTIC_VIEW({name}")?;
-
-                if !dimensions.is_empty() {
-                    write!(f, " DIMENSIONS {}", display_comma_separated(dimensions))?;
-                }
-
-                if !metrics.is_empty() {
-                    write!(f, " METRICS {}", display_comma_separated(metrics))?;
-                }
-
-                if !facts.is_empty() {
-                    write!(f, " FACTS {}", display_comma_separated(facts))?;
-                }
-
-                if let Some(where_clause) = where_clause {
-                    write!(f, " WHERE {where_clause}")?;
-                }
-
-                write!(f, ")")?;
-
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-
                 Ok(())
             }
         }
@@ -3140,345 +2756,8 @@ impl fmt::Display for OffsetRows {
     }
 }
 
-/// Pipe syntax, first introduced in Google BigQuery.
-/// Example:
-///
-/// ```sql
-/// FROM Produce
-/// |> WHERE sales > 0
-/// |> AGGREGATE SUM(sales) AS total_sales, COUNT(*) AS num_sales
-///    GROUP BY item;
-/// ```
-///
-/// See <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#pipe_syntax>
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-pub enum PipeOperator {
-    /// Limits the number of rows to return in a query, with an optional OFFSET clause to skip over rows.
-    ///
-    /// Syntax: `|> LIMIT <n> [OFFSET <m>]`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#limit_pipe_operator>
-    Limit {
-        /// The expression specifying the number of rows to return.
-        expr: Expr,
-        /// Optional offset expression provided inline with `LIMIT`.
-        offset: Option<Expr>,
-    },
-    /// Filters the results of the input table.
-    ///
-    /// Syntax: `|> WHERE <condition>`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#where_pipe_operator>
-    Where {
-        /// The filter expression.
-        expr: Expr,
-    },
-    /// `ORDER BY <expr> [ASC|DESC], ...`
-    OrderBy {
-        /// The ordering expressions.
-        exprs: Vec<OrderByExpr>,
-    },
-    /// Produces a new table with the listed columns, similar to the outermost SELECT clause in a table subquery in standard syntax.
-    ///
-    /// Syntax `|> SELECT <expr> [[AS] alias], ...`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#select_pipe_operator>
-    Select {
-        /// The select items to produce.
-        exprs: Vec<SelectItem>,
-    },
-    /// Propagates the existing table and adds computed columns, similar to SELECT *, new_column in standard syntax.
-    ///
-    /// Syntax: `|> EXTEND <expr> [[AS] alias], ...`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#extend_pipe_operator>
-    Extend {
-        /// Expressions defining added columns.
-        exprs: Vec<SelectItem>,
-    },
-    /// Replaces the value of a column in the current table, similar to SELECT * REPLACE (expression AS column) in standard syntax.
-    ///
-    /// Syntax: `|> SET <column> = <expression>, ...`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#set_pipe_operator>
-    Set {
-        /// Assignments to apply (`column = expr`).
-        assignments: Vec<Assignment>,
-    },
-    /// Removes listed columns from the current table, similar to SELECT * EXCEPT (column) in standard syntax.
-    ///
-    /// Syntax: `|> DROP <column>, ...`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#drop_pipe_operator>
-    Drop {
-        /// Columns to drop.
-        columns: Vec<Ident>,
-    },
-    /// Introduces a table alias for the input table, similar to applying the AS alias clause on a table subquery in standard syntax.
-    ///
-    /// Syntax: `|> AS <alias>`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#as_pipe_operator>
-    As {
-        /// Alias to assign to the input table.
-        alias: Ident,
-    },
-    /// Performs aggregation on data across grouped rows or an entire table.
-    ///
-    /// Syntax: `|> AGGREGATE <agg_expr> [[AS] alias], ...`
-    ///
-    /// Syntax:
-    /// ```norust
-    /// |> AGGREGATE [<agg_expr> [[AS] alias], ...]
-    /// GROUP BY <grouping_expr> [AS alias], ...
-    /// ```
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#aggregate_pipe_operator>
-    Aggregate {
-        /// Expressions computed for each row prior to grouping.
-        full_table_exprs: Vec<ExprWithAliasAndOrderBy>,
-        /// Grouping expressions for aggregation.
-        group_by_expr: Vec<ExprWithAliasAndOrderBy>,
-    },
-    /// Selects a random sample of rows from the input table.
-    /// Syntax: `|> TABLESAMPLE SYSTEM (10 PERCENT)
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#tablesample_pipe_operator>
-    TableSample {
-        /// Sampling clause describing the sample.
-        sample: Box<TableSample>,
-    },
-    /// Renames columns in the input table.
-    ///
-    /// Syntax: `|> RENAME old_name AS new_name, ...`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#rename_pipe_operator>
-    Rename {
-        /// Mappings of old to new identifiers.
-        mappings: Vec<IdentWithAlias>,
-    },
-    /// Combines the input table with one or more tables using UNION.
-    ///
-    /// Syntax: `|> UNION [ALL|DISTINCT] (<query>), (<query>), ...`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#union_pipe_operator>
-    Union {
-        /// Set quantifier (`ALL` or `DISTINCT`).
-        set_quantifier: SetQuantifier,
-        /// The queries to combine with `UNION`.
-        queries: Vec<Query>,
-    },
-    /// Returns only the rows that are present in both the input table and the specified tables.
-    ///
-    /// Syntax: `|> INTERSECT [DISTINCT] (<query>), (<query>), ...`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#intersect_pipe_operator>
-    Intersect {
-        /// Set quantifier for the `INTERSECT` operator.
-        set_quantifier: SetQuantifier,
-        /// The queries to intersect.
-        queries: Vec<Query>,
-    },
-    /// Returns only the rows that are present in the input table but not in the specified tables.
-    ///
-    /// Syntax: `|> EXCEPT DISTINCT (<query>), (<query>), ...`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#except_pipe_operator>
-    Except {
-        /// Set quantifier for the `EXCEPT` operator.
-        set_quantifier: SetQuantifier,
-        /// The queries to exclude from the input set.
-        queries: Vec<Query>,
-    },
-    /// Calls a table function or procedure that returns a table.
-    ///
-    /// Syntax: `|> CALL function_name(args) [AS alias]`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#call_pipe_operator>
-    Call {
-        /// The function or procedure to call which returns a table.
-        function: Function,
-        /// Optional alias for the result table.
-        alias: Option<Ident>,
-    },
-    /// Pivots data from rows to columns.
-    ///
-    /// Syntax: `|> PIVOT(aggregate_function(column) FOR pivot_column IN (value1, value2, ...)) [AS alias]`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#pivot_pipe_operator>
-    Pivot {
-        /// Aggregate functions to compute during pivot.
-        aggregate_functions: Vec<ExprWithAlias>,
-        /// Column(s) that provide the pivot values.
-        value_column: Vec<Ident>,
-        /// The source of pivot values (literal list or subquery).
-        value_source: PivotValueSource,
-        /// Optional alias for the output.
-        alias: Option<Ident>,
-    },
-    /// The `UNPIVOT` pipe operator transforms columns into rows.
-    ///
-    /// Syntax:
-    /// ```sql
-    /// |> UNPIVOT(value_column FOR name_column IN (column1, column2, ...)) [alias]
-    /// ```
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#unpivot_pipe_operator>
-    Unpivot {
-        /// Output column that will receive the unpivoted value.
-        value_column: Ident,
-        /// Column name holding the unpivoted column name.
-        name_column: Ident,
-        /// Columns to unpivot.
-        unpivot_columns: Vec<Ident>,
-        /// Optional alias for the unpivot result.
-        alias: Option<Ident>,
-    },
-    /// Joins the input table with another table.
-    ///
-    /// Syntax: `|> [JOIN_TYPE] JOIN <table> [alias] ON <condition>` or `|> [JOIN_TYPE] JOIN <table> [alias] USING (<columns>)`
-    ///
-    /// See more at <https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax#join_pipe_operator>
-    Join(Join),
-}
 
-impl fmt::Display for PipeOperator {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            PipeOperator::Select { exprs } => {
-                write!(f, "SELECT {}", display_comma_separated(exprs.as_slice()))
-            }
-            PipeOperator::Extend { exprs } => {
-                write!(f, "EXTEND {}", display_comma_separated(exprs.as_slice()))
-            }
-            PipeOperator::Set { assignments } => {
-                write!(f, "SET {}", display_comma_separated(assignments.as_slice()))
-            }
-            PipeOperator::Drop { columns } => {
-                write!(f, "DROP {}", display_comma_separated(columns.as_slice()))
-            }
-            PipeOperator::As { alias } => {
-                write!(f, "AS {alias}")
-            }
-            PipeOperator::Limit { expr, offset } => {
-                write!(f, "LIMIT {expr}")?;
-                if let Some(offset) = offset {
-                    write!(f, " OFFSET {offset}")?;
-                }
-                Ok(())
-            }
-            PipeOperator::Aggregate {
-                full_table_exprs,
-                group_by_expr,
-            } => {
-                write!(f, "AGGREGATE")?;
-                if !full_table_exprs.is_empty() {
-                    write!(
-                        f,
-                        " {}",
-                        display_comma_separated(full_table_exprs.as_slice())
-                    )?;
-                }
-                if !group_by_expr.is_empty() {
-                    write!(f, " GROUP BY {}", display_comma_separated(group_by_expr))?;
-                }
-                Ok(())
-            }
 
-            PipeOperator::Where { expr } => {
-                write!(f, "WHERE {expr}")
-            }
-            PipeOperator::OrderBy { exprs } => {
-                write!(f, "ORDER BY {}", display_comma_separated(exprs.as_slice()))
-            }
-
-            PipeOperator::TableSample { sample } => {
-                write!(f, "{sample}")
-            }
-            PipeOperator::Rename { mappings } => {
-                write!(f, "RENAME {}", display_comma_separated(mappings))
-            }
-            PipeOperator::Union {
-                set_quantifier,
-                queries,
-            } => Self::fmt_set_operation(f, "UNION", set_quantifier, queries),
-            PipeOperator::Intersect {
-                set_quantifier,
-                queries,
-            } => Self::fmt_set_operation(f, "INTERSECT", set_quantifier, queries),
-            PipeOperator::Except {
-                set_quantifier,
-                queries,
-            } => Self::fmt_set_operation(f, "EXCEPT", set_quantifier, queries),
-            PipeOperator::Call { function, alias } => {
-                write!(f, "CALL {function}")?;
-                Self::fmt_optional_alias(f, alias)
-            }
-            PipeOperator::Pivot {
-                aggregate_functions,
-                value_column,
-                value_source,
-                alias,
-            } => {
-                write!(
-                    f,
-                    "PIVOT({} FOR {} IN ({}))",
-                    display_comma_separated(aggregate_functions),
-                    Expr::CompoundIdentifier(value_column.to_vec()),
-                    value_source
-                )?;
-                Self::fmt_optional_alias(f, alias)
-            }
-            PipeOperator::Unpivot {
-                value_column,
-                name_column,
-                unpivot_columns,
-                alias,
-            } => {
-                write!(
-                    f,
-                    "UNPIVOT({} FOR {} IN ({}))",
-                    value_column,
-                    name_column,
-                    display_comma_separated(unpivot_columns)
-                )?;
-                Self::fmt_optional_alias(f, alias)
-            }
-            PipeOperator::Join(join) => write!(f, "{join}"),
-        }
-    }
-}
-
-impl PipeOperator {
-    /// Helper function to format optional alias for pipe operators
-    fn fmt_optional_alias(f: &mut fmt::Formatter<'_>, alias: &Option<Ident>) -> fmt::Result {
-        if let Some(alias) = alias {
-            write!(f, " AS {alias}")?;
-        }
-        Ok(())
-    }
-
-    /// Helper function to format set operations (UNION, INTERSECT, EXCEPT) with queries
-    fn fmt_set_operation(
-        f: &mut fmt::Formatter<'_>,
-        operation: &str,
-        set_quantifier: &SetQuantifier,
-        queries: &[Query],
-    ) -> fmt::Result {
-        write!(f, "{operation}")?;
-        match set_quantifier {
-            SetQuantifier::None => {}
-            _ => {
-                write!(f, " {set_quantifier}")?;
-            }
-        }
-        write!(f, " ")?;
-        let parenthesized_queries: Vec<String> =
-            queries.iter().map(|query| format!("({query})")).collect();
-        write!(f, "{}", display_comma_separated(&parenthesized_queries))
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -3604,47 +2883,8 @@ impl fmt::Display for Distinct {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// MSSQL `TOP` clause options.
-pub struct Top {
-    /// SQL semantic equivalent of LIMIT but with same structure as FETCH.
-    /// MSSQL only.
-    pub with_ties: bool,
-    /// Apply `PERCENT` extension.
-    pub percent: bool,
-    /// The optional quantity (expression or constant) following `TOP`.
-    pub quantity: Option<TopQuantity>,
-}
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Quantity used in a `TOP` clause: either an expression or a constant.
-pub enum TopQuantity {
-    /// A parenthesized expression (MSSQL syntax: `TOP (expr)`).
-    Expr(Expr),
-    /// An unparenthesized integer constant: `TOP 10`.
-    Constant(u64),
-}
 
-impl fmt::Display for Top {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let extension = if self.with_ties { " WITH TIES" } else { "" };
-        if let Some(ref quantity) = self.quantity {
-            let percent = if self.percent { " PERCENT" } else { "" };
-            match quantity {
-                TopQuantity::Expr(quantity) => write!(f, "TOP ({quantity}){percent}{extension}"),
-                TopQuantity::Constant(quantity) => {
-                    write!(f, "TOP {quantity}{percent}{extension}")
-                }
-            }
-        } else {
-            write!(f, "TOP{extension}")
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -3828,146 +3068,11 @@ impl fmt::Display for InputFormatClause {
     }
 }
 
-/// `FOR XML` or `FOR JSON` clause (MSSQL): formats the output of a query as XML or JSON.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-pub enum ForClause {
-    /// `FOR BROWSE` clause.
-    Browse,
-    /// `FOR JSON ...` clause and its options.
-    Json {
-        /// JSON mode (`AUTO` or `PATH`).
-        for_json: ForJson,
-        /// Optional `ROOT('...')` parameter.
-        root: Option<String>,
-        /// `INCLUDE_NULL_VALUES` flag.
-        include_null_values: bool,
-        /// `WITHOUT_ARRAY_WRAPPER` flag.
-        without_array_wrapper: bool,
-    },
-    /// `FOR XML ...` clause and its options.
-    Xml {
-        /// XML mode (`RAW`, `AUTO`, `EXPLICIT`, `PATH`).
-        for_xml: ForXml,
-        /// `ELEMENTS` flag.
-        elements: bool,
-        /// `BINARY BASE64` flag.
-        binary_base64: bool,
-        /// Optional `ROOT('...')` parameter.
-        root: Option<String>,
-        /// `TYPE` flag.
-        r#type: bool,
-    },
-}
 
-impl fmt::Display for ForClause {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ForClause::Browse => write!(f, "FOR BROWSE"),
-            ForClause::Json {
-                for_json,
-                root,
-                include_null_values,
-                without_array_wrapper,
-            } => {
-                write!(f, "FOR JSON ")?;
-                write!(f, "{for_json}")?;
-                if let Some(root) = root {
-                    write!(f, ", ROOT('{root}')")?;
-                }
-                if *include_null_values {
-                    write!(f, ", INCLUDE_NULL_VALUES")?;
-                }
-                if *without_array_wrapper {
-                    write!(f, ", WITHOUT_ARRAY_WRAPPER")?;
-                }
-                Ok(())
-            }
-            ForClause::Xml {
-                for_xml,
-                elements,
-                binary_base64,
-                root,
-                r#type,
-            } => {
-                write!(f, "FOR XML ")?;
-                write!(f, "{for_xml}")?;
-                if *binary_base64 {
-                    write!(f, ", BINARY BASE64")?;
-                }
-                if *r#type {
-                    write!(f, ", TYPE")?;
-                }
-                if let Some(root) = root {
-                    write!(f, ", ROOT('{root}')")?;
-                }
-                if *elements {
-                    write!(f, ", ELEMENTS")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Modes for `FOR XML` clause.
-pub enum ForXml {
-    /// `RAW` mode with optional root name: `RAW('root')`.
-    Raw(Option<String>),
-    /// `AUTO` mode.
-    Auto,
-    /// `EXPLICIT` mode.
-    Explicit,
-    /// `PATH` mode with optional root: `PATH('root')`.
-    Path(Option<String>),
-}
 
-impl fmt::Display for ForXml {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ForXml::Raw(root) => {
-                write!(f, "RAW")?;
-                if let Some(root) = root {
-                    write!(f, "('{root}')")?;
-                }
-                Ok(())
-            }
-            ForXml::Auto => write!(f, "AUTO"),
-            ForXml::Explicit => write!(f, "EXPLICIT"),
-            ForXml::Path(root) => {
-                write!(f, "PATH")?;
-                if let Some(root) = root {
-                    write!(f, "('{root}')")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-/// Modes for `FOR JSON` clause.
-pub enum ForJson {
-    /// `AUTO` mode.
-    Auto,
-    /// `PATH` mode.
-    Path,
-}
 
-impl fmt::Display for ForJson {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ForJson::Auto => write!(f, "AUTO"),
-            ForJson::Path => write!(f, "PATH"),
-        }
-    }
-}
 
 /// A single column definition in MySQL's `JSON_TABLE` table valued function.
 ///
@@ -4146,37 +3251,7 @@ impl fmt::Display for OpenJsonTableColumn {
     }
 }
 
-/// BigQuery supports ValueTables which have 2 modes:
-/// `SELECT [ALL | DISTINCT] AS STRUCT`
-/// `SELECT [ALL | DISTINCT] AS VALUE`
-///
-/// <https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#value_tables>
-/// <https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#select_list>
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Mode of BigQuery value tables, e.g. `AS STRUCT` or `AS VALUE`.
-pub enum ValueTableMode {
-    /// `AS STRUCT`
-    AsStruct,
-    /// `AS VALUE`
-    AsValue,
-    /// `DISTINCT AS STRUCT`
-    DistinctAsStruct,
-    /// `DISTINCT AS VALUE`
-    DistinctAsValue,
-}
 
-impl fmt::Display for ValueTableMode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ValueTableMode::AsStruct => write!(f, "AS STRUCT"),
-            ValueTableMode::AsValue => write!(f, "AS VALUE"),
-            ValueTableMode::DistinctAsStruct => write!(f, "DISTINCT AS STRUCT"),
-            ValueTableMode::DistinctAsValue => write!(f, "DISTINCT AS VALUE"),
-        }
-    }
-}
 
 /// The `FROM` clause of an `UPDATE TABLE` statement
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]

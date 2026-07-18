@@ -19,7 +19,7 @@ use crate::{
     ast::{
         ddl::AlterSchema, query::SelectItemQualifiedWildcardKind, AlterSchemaOperation, AlterTable,
         ColumnOptions, CreateOperator, CreateOperatorClass, CreateOperatorFamily, CreateView,
-        ExportData, Owner, TypedString,
+        Owner, TypedString,
     },
     tokenizer::TokenWithSpan,
 };
@@ -28,7 +28,7 @@ use core::iter;
 use crate::tokenizer::Span;
 
 use super::{
-    comments, dcl::SecondaryRoles, value::ValueWithSpan, AccessExpr, AlterColumnOperation,
+    comments, value::ValueWithSpan, AccessExpr, AlterColumnOperation,
     AlterIndexOperation, AlterTableOperation, Analyze, Array, Assignment, AssignmentTarget,
     AttachedToken, BeginEndStatements, CaseStatement, CloseCursor, ClusteredIndex, ColumnDef,
     ColumnOption, ColumnOptionDef, ConditionalStatementBlock, ConditionalStatements,
@@ -42,11 +42,11 @@ use super::{
     MergeInsertKind, MergeUpdateExpr, NamedParenthesizedList, NamedWindowDefinition, ObjectName,
     ObjectNamePart, Offset, OnConflict, OnConflictAction, OnInsert, OpenStatement, OrderBy,
     OrderByExpr, OrderByKind, OutputClause, Parens, Partition, PartitionBoundValue,
-    PivotValueSource, ProjectionSelect, Query, RaiseStatement, RaiseStatementValue,
+    ProjectionSelect, Query, RaiseStatement, RaiseStatementValue,
     ReferentialAction, RenameSelectItem, ReplaceSelectElement, ReplaceSelectItem, Select,
     SelectInto, SelectItem, SetExpr, SqlOption, Statement, Subscript, SymbolDefinition, TableAlias,
     TableAliasColumnDef, TableConstraint, TableFactor, TableObject, TableOptionsClustered,
-    TableWithJoins, Update, UpdateTableFromKind, Use, Values, ViewColumnDef, WhileStatement,
+    TableWithJoins, Update, UpdateTableFromKind, Values, ViewColumnDef, WhileStatement,
     WildcardAdditionalOptions, With, WithFill,
 };
 
@@ -120,11 +120,7 @@ impl Spanned for Query {
             order_by,
             limit_clause,
             fetch,
-            locks: _,          // todo
-            for_clause: _,     // todo, mssql specific
-            settings: _,       // todo, clickhouse specific
-            format_clause: _,  // todo, clickhouse specific
-            pipe_operators: _, // todo bigquery specific
+            locks: _, // todo
         } = self;
 
         union_spans(
@@ -256,35 +252,21 @@ impl Spanned for Values {
 /// # partial span
 ///
 /// Missing spans:
-/// - [Statement::CopyIntoSnowflake]
-/// - [Statement::CreateSecret]
 /// - [Statement::CreateRole]
 /// - [Statement::AlterType]
 /// - [Statement::AlterOperator]
 /// - [Statement::AlterRole]
-/// - [Statement::AttachDatabase]
-/// - [Statement::AttachDuckDBDatabase]
-/// - [Statement::DetachDuckDBDatabase]
 /// - [Statement::Drop]
 /// - [Statement::DropFunction]
 /// - [Statement::DropProcedure]
-/// - [Statement::DropSecret]
 /// - [Statement::Declare]
 /// - [Statement::CreateExtension]
 /// - [Statement::CreateCollation]
 /// - [Statement::AlterCollation]
 /// - [Statement::Fetch]
-/// - [Statement::Flush]
 /// - [Statement::Discard]
 /// - [Statement::Set]
-/// - [Statement::ShowFunctions]
 /// - [Statement::ShowVariable]
-/// - [Statement::ShowStatus]
-/// - [Statement::ShowVariables]
-/// - [Statement::ShowCreate]
-/// - [Statement::ShowColumns]
-/// - [Statement::ShowTables]
-/// - [Statement::ShowCollation]
 /// - [Statement::StartTransaction]
 /// - [Statement::Comment]
 /// - [Statement::Commit]
@@ -295,46 +277,26 @@ impl Spanned for Values {
 /// - [Statement::CreateTrigger]
 /// - [Statement::DropTrigger]
 /// - [Statement::CreateProcedure]
-/// - [Statement::CreateMacro]
-/// - [Statement::CreateStage]
-/// - [Statement::Assert]
 /// - [Statement::Grant]
 /// - [Statement::Revoke]
 /// - [Statement::Deallocate]
 /// - [Statement::Execute]
 /// - [Statement::Prepare]
-/// - [Statement::Kill]
 /// - [Statement::ExplainTable]
 /// - [Statement::Explain]
 /// - [Statement::Savepoint]
 /// - [Statement::ReleaseSavepoint]
-/// - [Statement::Cache]
-/// - [Statement::UNCache]
 /// - [Statement::CreateSequence]
 /// - [Statement::CreateType]
-/// - [Statement::Pragma]
 /// - [Statement::Lock]
-/// - [Statement::LockTables]
-/// - [Statement::UnlockTables]
-/// - [Statement::Unload]
-/// - [Statement::OptimizeTable]
 impl Spanned for Statement {
     fn span(&self) -> Span {
         match self {
             Statement::Analyze(analyze) => analyze.span(),
             Statement::Truncate(truncate) => truncate.span(),
-            Statement::Msck(msck) => msck.span(),
             Statement::Query(query) => query.span(),
             Statement::Insert(insert) => insert.span(),
-            Statement::Install { extension_name } => extension_name.span,
             Statement::Load { extension_name } => extension_name.span,
-            Statement::Directory {
-                overwrite: _,
-                local: _,
-                path: _,
-                file_format: _,
-                source,
-            } => source.span(),
             Statement::Case(stmt) => stmt.span(),
             Statement::If(stmt) => stmt.span(),
             Statement::While(stmt) => stmt.span(),
@@ -348,23 +310,6 @@ impl Spanned for Statement {
                 legacy_options: _,
                 values: _,
             } => source.span(),
-            Statement::CopyIntoSnowflake {
-                into: _,
-                into_columns: _,
-                from_obj: _,
-                from_obj_alias: _,
-                stage_params: _,
-                from_transformations: _,
-                files: _,
-                pattern: _,
-                file_format: _,
-                copy_options: _,
-                validation_mode: _,
-                kind: _,
-                from_query: _,
-                partition: _,
-            } => Span::empty(),
-            Statement::Open(open) => open.span(),
             Statement::Close { cursor } => match cursor {
                 CloseCursor::All => Span::empty(),
                 CloseCursor::Specific { name } => name.span,
@@ -373,16 +318,6 @@ impl Spanned for Statement {
             Statement::Delete(delete) => delete.span(),
             Statement::CreateView(create_view) => create_view.span(),
             Statement::CreateTable(create_table) => create_table.span(),
-            Statement::CreateVirtualTable {
-                name,
-                if_not_exists: _,
-                module_name,
-                module_args,
-            } => union_spans(
-                core::iter::once(name.span())
-                    .chain(core::iter::once(module_name.span))
-                    .chain(module_args.iter().map(|i| i.span)),
-            ),
             Statement::CreateIndex(create_index) => create_index.span(),
             Statement::CreateRole(create_role) => create_role.span(),
             Statement::CreateExtension(create_extension) => create_extension.span(),
@@ -391,9 +326,7 @@ impl Spanned for Statement {
             Statement::DropOperator(drop_operator) => drop_operator.span(),
             Statement::DropOperatorFamily(drop_operator_family) => drop_operator_family.span(),
             Statement::DropOperatorClass(drop_operator_class) => drop_operator_class.span(),
-            Statement::CreateSecret { .. } => Span::empty(),
             Statement::CreateServer { .. } => Span::empty(),
-            Statement::CreateConnector { .. } => Span::empty(),
             Statement::CreateOperator(create_operator) => create_operator.span(),
             Statement::CreateOperatorFamily(create_operator_family) => {
                 create_operator_family.span()
@@ -420,30 +353,15 @@ impl Spanned for Statement {
             Statement::AlterOperatorFamily { .. } => Span::empty(),
             Statement::AlterOperatorClass { .. } => Span::empty(),
             Statement::AlterRole { .. } => Span::empty(),
-            Statement::AlterSession { .. } => Span::empty(),
-            Statement::AttachDatabase { .. } => Span::empty(),
-            Statement::AttachDuckDBDatabase { .. } => Span::empty(),
-            Statement::DetachDuckDBDatabase { .. } => Span::empty(),
             Statement::Drop { .. } => Span::empty(),
             Statement::DropFunction(drop_function) => drop_function.span(),
             Statement::DropDomain { .. } => Span::empty(),
             Statement::DropProcedure { .. } => Span::empty(),
-            Statement::DropSecret { .. } => Span::empty(),
             Statement::Declare { .. } => Span::empty(),
             Statement::Fetch { .. } => Span::empty(),
-            Statement::Flush { .. } => Span::empty(),
             Statement::Discard { .. } => Span::empty(),
             Statement::Set(_) => Span::empty(),
-            Statement::ShowFunctions { .. } => Span::empty(),
             Statement::ShowVariable { .. } => Span::empty(),
-            Statement::ShowStatus { .. } => Span::empty(),
-            Statement::ShowVariables { .. } => Span::empty(),
-            Statement::ShowCreate { .. } => Span::empty(),
-            Statement::ShowColumns { .. } => Span::empty(),
-            Statement::ShowTables { .. } => Span::empty(),
-            Statement::ShowCollation { .. } => Span::empty(),
-            Statement::ShowCharset { .. } => Span::empty(),
-            Statement::Use(u) => u.span(),
             Statement::StartTransaction { .. } => Span::empty(),
             Statement::Comment { .. } => Span::empty(),
             Statement::Commit { .. } => Span::empty(),
@@ -455,92 +373,32 @@ impl Spanned for Statement {
             Statement::CreateTrigger { .. } => Span::empty(),
             Statement::DropTrigger { .. } => Span::empty(),
             Statement::CreateProcedure { .. } => Span::empty(),
-            Statement::CreateMacro { .. } => Span::empty(),
-            Statement::CreateStage { .. } => Span::empty(),
-            Statement::Assert { .. } => Span::empty(),
             Statement::Grant { .. } => Span::empty(),
-            Statement::Deny { .. } => Span::empty(),
             Statement::Revoke { .. } => Span::empty(),
             Statement::Deallocate { .. } => Span::empty(),
             Statement::Execute { .. } => Span::empty(),
             Statement::Prepare { .. } => Span::empty(),
-            Statement::Kill { .. } => Span::empty(),
             Statement::ExplainTable { .. } => Span::empty(),
             Statement::Explain { .. } => Span::empty(),
             Statement::Savepoint { .. } => Span::empty(),
             Statement::ReleaseSavepoint { .. } => Span::empty(),
             Statement::Merge(merge) => merge.span(),
-            Statement::Cache { .. } => Span::empty(),
-            Statement::UNCache { .. } => Span::empty(),
             Statement::CreateSequence { .. } => Span::empty(),
             Statement::CreateType { .. } => Span::empty(),
-            Statement::Pragma { .. } => Span::empty(),
             Statement::Lock(_) => Span::empty(),
-            Statement::LockTables { .. } => Span::empty(),
-            Statement::UnlockTables => Span::empty(),
-            Statement::Unload { .. } => Span::empty(),
-            Statement::OptimizeTable { .. } => Span::empty(),
             Statement::CreatePolicy { .. } => Span::empty(),
             Statement::AlterPolicy { .. } => Span::empty(),
-            Statement::AlterConnector { .. } => Span::empty(),
             Statement::DropPolicy { .. } => Span::empty(),
-            Statement::DropConnector { .. } => Span::empty(),
-            Statement::ShowCatalogs { .. } => Span::empty(),
-            Statement::ShowDatabases { .. } => Span::empty(),
-            Statement::ShowProcessList { .. } => Span::empty(),
-            Statement::ShowSchemas { .. } => Span::empty(),
-            Statement::ShowObjects { .. } => Span::empty(),
-            Statement::ShowViews { .. } => Span::empty(),
             Statement::LISTEN { .. } => Span::empty(),
             Statement::NOTIFY { .. } => Span::empty(),
-            Statement::LoadData { .. } => Span::empty(),
             Statement::UNLISTEN { .. } => Span::empty(),
-            Statement::RenameTable { .. } => Span::empty(),
-            Statement::RaisError { .. } => Span::empty(),
-            Statement::Throw(_) => Span::empty(),
-            Statement::Print { .. } => Span::empty(),
-            Statement::WaitFor(_) => Span::empty(),
-            Statement::Return { .. } => Span::empty(),
-            Statement::List(..) | Statement::Remove(..) => Span::empty(),
-            Statement::ExportData(ExportData {
-                options,
-                query,
-                connection,
-            }) => union_spans(
-                options
-                    .iter()
-                    .map(|i| i.span())
-                    .chain(core::iter::once(query.span()))
-                    .chain(connection.iter().map(|i| i.span())),
-            ),
-            Statement::CreateUser(..) => Span::empty(),
             Statement::AlterSchema(s) => s.span(),
             Statement::Vacuum(..) => Span::empty(),
-            Statement::AlterUser(..) => Span::empty(),
             Statement::Reset(..) => Span::empty(),
         }
     }
 }
 
-impl Spanned for Use {
-    fn span(&self) -> Span {
-        match self {
-            Use::Catalog(object_name) => object_name.span(),
-            Use::Schema(object_name) => object_name.span(),
-            Use::Database(object_name) => object_name.span(),
-            Use::Warehouse(object_name) => object_name.span(),
-            Use::Role(object_name) => object_name.span(),
-            Use::SecondaryRoles(secondary_roles) => {
-                if let SecondaryRoles::List(roles) = secondary_roles {
-                    return union_spans(roles.iter().map(|i| i.span));
-                }
-                Span::empty()
-            }
-            Use::Object(object_name) => object_name.span(),
-            Use::Default => Span::empty(),
-        }
-    }
-}
 
 impl Spanned for CreateTable {
     fn span(&self) -> Span {
@@ -1937,7 +1795,6 @@ impl Spanned for ReplaceSelectElement {
 /// # partial span
 ///
 /// Missing spans:
-/// - [TableFactor::JsonTable]
 impl Spanned for TableFactor {
     fn span(&self) -> Span {
         match self {
@@ -2006,87 +1863,11 @@ impl Spanned for TableFactor {
                     .chain(args.iter().map(|i| i.span()))
                     .chain(alias.as_ref().map(|alias| alias.span())),
             ),
-            TableFactor::JsonTable { .. } => Span::empty(),
             TableFactor::XmlTable { .. } => Span::empty(),
-            TableFactor::Pivot {
-                table,
-                aggregate_functions,
-                value_column,
-                value_source,
-                default_on_null,
-                alias,
-            } => union_spans(
-                core::iter::once(table.span())
-                    .chain(aggregate_functions.iter().map(|i| i.span()))
-                    .chain(value_column.iter().map(|i| i.span()))
-                    .chain(core::iter::once(value_source.span()))
-                    .chain(default_on_null.as_ref().map(|i| i.span()))
-                    .chain(alias.as_ref().map(|i| i.span())),
-            ),
-            TableFactor::Unpivot {
-                table,
-                value,
-                null_inclusion: _,
-                name,
-                columns,
-                alias,
-            } => union_spans(
-                core::iter::once(table.span())
-                    .chain(core::iter::once(value.span()))
-                    .chain(core::iter::once(name.span))
-                    .chain(columns.iter().map(|ilist| ilist.span()))
-                    .chain(alias.as_ref().map(|alias| alias.span())),
-            ),
-            TableFactor::MatchRecognize {
-                table,
-                partition_by,
-                order_by,
-                measures,
-                rows_per_match: _,
-                after_match_skip: _,
-                pattern,
-                symbols,
-                alias,
-            } => union_spans(
-                core::iter::once(table.span())
-                    .chain(partition_by.iter().map(|i| i.span()))
-                    .chain(order_by.iter().map(|i| i.span()))
-                    .chain(measures.iter().map(|i| i.span()))
-                    .chain(core::iter::once(pattern.span()))
-                    .chain(symbols.iter().map(|i| i.span()))
-                    .chain(alias.as_ref().map(|i| i.span())),
-            ),
-            TableFactor::SemanticView {
-                name,
-                dimensions,
-                metrics,
-                facts,
-                where_clause,
-                alias,
-            } => union_spans(
-                name.0
-                    .iter()
-                    .map(|i| i.span())
-                    .chain(dimensions.iter().map(|d| d.span()))
-                    .chain(metrics.iter().map(|m| m.span()))
-                    .chain(facts.iter().map(|f| f.span()))
-                    .chain(where_clause.as_ref().map(|e| e.span()))
-                    .chain(alias.as_ref().map(|a| a.span())),
-            ),
-            TableFactor::OpenJsonTable { .. } => Span::empty(),
         }
     }
 }
 
-impl Spanned for PivotValueSource {
-    fn span(&self) -> Span {
-        match self {
-            PivotValueSource::List(vec) => union_spans(vec.iter().map(|i| i.span())),
-            PivotValueSource::Any(vec) => union_spans(vec.iter().map(|i| i.span())),
-            PivotValueSource::Subquery(query) => query.span(),
-        }
-    }
-}
 
 impl Spanned for ExprWithAlias {
     fn span(&self) -> Span {
@@ -2290,7 +2071,6 @@ impl Spanned for Select {
             optimizer_hints: _,
             distinct: _, // todo
             select_modifiers: _,
-            top: _, // todo, mysql specific
             projection,
             exclude: _,
             into,
@@ -2306,9 +2086,7 @@ impl Spanned for Select {
             named_window,
             qualify,
             window_before_qualify: _, // bool
-            value_table_mode: _,      // todo, BigQuery specific
             connect_by,
-            top_before_distinct: _,
             flavor: _,
         } = self;
 
@@ -2797,30 +2575,6 @@ ALTER TABLE users
 
         assert_eq!(stmt_span.start, (2, 11).into());
         assert_eq!(stmt_span.end, (4, 12).into());
-    }
-
-    #[test]
-    fn test_replace_statement_span() {
-        let sql = r#"
-/* foo */ REPLACE INTO
-    cities(name,population)
-SELECT
-    name,
-    population
-FROM
-   cities
-WHERE id = 1
-;"#;
-
-        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql).unwrap();
-        assert_eq!(1, r.len());
-
-        dbg!(&r[0]);
-
-        let stmt_span = r[0].span();
-
-        assert_eq!(stmt_span.start, (2, 11).into());
-        assert_eq!(stmt_span.end, (9, 13).into());
     }
 
     #[test]

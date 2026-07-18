@@ -663,19 +663,6 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Return true if the dialect supports pipe operator.
-    ///
-    /// Example:
-    /// ```sql
-    /// SELECT *
-    /// FROM table
-    /// |> limit 1
-    /// ```
-    ///
-    /// See <https://cloud.google.com/bigquery/docs/pipe-syntax-guide#basic_syntax>
-    fn supports_pipe_operator(&self) -> bool {
-        false
-    }
 
     /// Does the dialect support MySQL-style `'user'@'host'` grantee syntax?
     fn supports_user_host_grantee(&self) -> bool {
@@ -1155,21 +1142,12 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Returns true if the dialect supports the `LOAD DATA` statement
-    fn supports_load_data(&self) -> bool {
-        false
-    }
 
     /// Returns true if the dialect supports the `LOAD extension` statement
     fn supports_load_extension(&self) -> bool {
         false
     }
 
-    /// Returns true if this dialect expects the `TOP` option
-    /// before the `ALL`/`DISTINCT` options in a `SELECT` statement.
-    fn supports_top_before_distinct(&self) -> bool {
-        false
-    }
 
     /// Returns true if the dialect supports boolean literals (`true` and `false`).
     /// For example, in MSSQL these are treated as identifiers rather than boolean literals.
@@ -1568,41 +1546,8 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Returns true if this dialect supports the `OPTIMIZE TABLE` statement.
-    ///
-    /// Example:
-    /// ```sql
-    /// OPTIMIZE TABLE table_name;
-    /// ```
-    ///
-    /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/optimize)
-    fn supports_optimize_table(&self) -> bool {
-        false
-    }
 
-    /// Returns true if this dialect supports the `INSTALL` statement.
-    ///
-    /// Example:
-    /// ```sql
-    /// INSTALL extension_name;
-    /// ```
-    ///
-    /// [DuckDB](https://duckdb.org/docs/extensions/overview)
-    fn supports_install(&self) -> bool {
-        false
-    }
 
-    /// Returns true if this dialect supports the `DETACH` statement.
-    ///
-    /// Example:
-    /// ```sql
-    /// DETACH DATABASE db_name;
-    /// ```
-    ///
-    /// [DuckDB](https://duckdb.org/docs/sql/statements/attach#detach-syntax)
-    fn supports_detach(&self) -> bool {
-        false
-    }
 
     /// Returns true if this dialect supports the `PREWHERE` clause
     /// in `SELECT` statements.
@@ -1667,17 +1612,6 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Returns true if this dialect supports the `FORMAT` clause in `SELECT` statements.
-    ///
-    /// Example:
-    /// ```sql
-    /// SELECT * FROM table FORMAT JSON;
-    /// ```
-    ///
-    /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/select/format)
-    fn supports_select_format(&self) -> bool {
-        false
-    }
 
     /// Returns true if the dialect supports the two-argument comma-separated
     /// form of the `TRIM` function: `TRIM(expr, characters)`.
