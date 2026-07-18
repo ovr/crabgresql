@@ -64,3 +64,30 @@ ERROR:  column reference "x" is ambiguous
 -- the same qualifier twice is rejected
 SELECT * FROM t1, t1;
 ERROR:  table name "t1" specified more than once
+-- a column-list alias renames a base table's columns positionally
+SELECT c1, c2 FROM t1 AS r(c1, c2) ORDER BY c1;
+ c1 | c2  
+----+-----
+  1 | one
+  2 | two
+(2 rows)
+
+-- fewer aliases than columns rename only the leading columns; the rest keep
+-- their original names
+SELECT * FROM t1 AS r(c1) ORDER BY 1;
+ c1 | label 
+----+-------
+  1 | one
+  2 | two
+(2 rows)
+
+-- the renamed columns drive WHERE and the projection
+SELECT c2 FROM t1 AS r(c1, c2) WHERE c1 = 2;
+ c2  
+-----
+ two
+(1 row)
+
+-- more column aliases than the table has columns is an error
+SELECT * FROM t1 AS r(a, b, c);
+ERROR:  table "r" has 2 columns available but 3 columns specified

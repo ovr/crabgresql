@@ -24,6 +24,10 @@ SELECT generate_series(4000000000, 4000000002);
 -- filtering and ordering over the FROM-position rows
 SELECT generate_series FROM generate_series(1, 6) WHERE generate_series % 2 = 0;
 SELECT * FROM generate_series(1, 4) ORDER BY 1 DESC;
+-- a column-list alias in FROM renames the single output column
+SELECT g FROM generate_series(1, 3) AS s(g) ORDER BY 1;
+-- more column aliases than the function produces is an error
+SELECT * FROM generate_series(1, 3) AS s(a, b);
 -- numeric overload: a fractional step; the start keeps its scale
 SELECT generate_series(1, 3, 0.5);
 -- numeric two-arg form defaults the step to 1
