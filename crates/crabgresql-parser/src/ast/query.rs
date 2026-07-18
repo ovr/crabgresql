@@ -425,10 +425,6 @@ pub struct Select {
     ///
     /// See [MySQL SELECT](https://dev.mysql.com/doc/refman/8.4/en/select.html).
     pub select_modifiers: Option<SelectModifiers>,
-    /// MSSQL syntax: `TOP (<N>) [ PERCENT ] [ WITH TIES ]`
-    pub top: Option<Top>,
-    /// Whether the top was located before `ALL`/`DISTINCT`
-    pub top_before_distinct: bool,
     /// projection expressions
     pub projection: Vec<SelectItem>,
     /// Excluded columns from the projection expression which are not specified
@@ -470,8 +466,6 @@ pub struct Select {
     /// WINDOW before QUALIFY.
     /// We accept either positioning and flag the accepted variant.
     pub window_before_qualify: bool,
-    /// BigQuery syntax: `SELECT AS VALUE | SELECT AS STRUCT`
-    pub value_table_mode: Option<ValueTableMode>,
     /// Was this a FROM-first query?
     pub flavor: SelectFlavor,
 }
@@ -495,26 +489,9 @@ impl fmt::Display for Select {
             hint.fmt(f)?;
         }
 
-        if let Some(value_table_mode) = self.value_table_mode {
-            f.write_str(" ")?;
-            value_table_mode.fmt(f)?;
-        }
-
-        if let Some(ref top) = self.top {
-            if self.top_before_distinct {
-                f.write_str(" ")?;
-                top.fmt(f)?;
-            }
-        }
         if let Some(ref distinct) = self.distinct {
             f.write_str(" ")?;
             distinct.fmt(f)?;
-        }
-        if let Some(ref top) = self.top {
-            if !self.top_before_distinct {
-                f.write_str(" ")?;
-                top.fmt(f)?;
-            }
         }
 
         if let Some(ref select_modifiers) = self.select_modifiers {
@@ -2939,47 +2916,8 @@ impl fmt::Display for Distinct {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// MSSQL `TOP` clause options.
-pub struct Top {
-    /// SQL semantic equivalent of LIMIT but with same structure as FETCH.
-    /// MSSQL only.
-    pub with_ties: bool,
-    /// Apply `PERCENT` extension.
-    pub percent: bool,
-    /// The optional quantity (expression or constant) following `TOP`.
-    pub quantity: Option<TopQuantity>,
-}
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Quantity used in a `TOP` clause: either an expression or a constant.
-pub enum TopQuantity {
-    /// A parenthesized expression (MSSQL syntax: `TOP (expr)`).
-    Expr(Expr),
-    /// An unparenthesized integer constant: `TOP 10`.
-    Constant(u64),
-}
 
-impl fmt::Display for Top {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let extension = if self.with_ties { " WITH TIES" } else { "" };
-        if let Some(ref quantity) = self.quantity {
-            let percent = if self.percent { " PERCENT" } else { "" };
-            match quantity {
-                TopQuantity::Expr(quantity) => write!(f, "TOP ({quantity}){percent}{extension}"),
-                TopQuantity::Constant(quantity) => {
-                    write!(f, "TOP {quantity}{percent}{extension}")
-                }
-            }
-        } else {
-            write!(f, "TOP{extension}")
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -3346,37 +3284,7 @@ impl fmt::Display for OpenJsonTableColumn {
     }
 }
 
-/// BigQuery supports ValueTables which have 2 modes:
-/// `SELECT [ALL | DISTINCT] AS STRUCT`
-/// `SELECT [ALL | DISTINCT] AS VALUE`
-///
-/// <https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#value_tables>
-/// <https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#select_list>
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Mode of BigQuery value tables, e.g. `AS STRUCT` or `AS VALUE`.
-pub enum ValueTableMode {
-    /// `AS STRUCT`
-    AsStruct,
-    /// `AS VALUE`
-    AsValue,
-    /// `DISTINCT AS STRUCT`
-    DistinctAsStruct,
-    /// `DISTINCT AS VALUE`
-    DistinctAsValue,
-}
 
-impl fmt::Display for ValueTableMode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ValueTableMode::AsStruct => write!(f, "AS STRUCT"),
-            ValueTableMode::AsValue => write!(f, "AS VALUE"),
-            ValueTableMode::DistinctAsStruct => write!(f, "DISTINCT AS STRUCT"),
-            ValueTableMode::DistinctAsValue => write!(f, "DISTINCT AS VALUE"),
-        }
-    }
-}
 
 /// The `FROM` clause of an `UPDATE TABLE` statement
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]

@@ -12831,8 +12831,6 @@ impl<'a> Parser<'a> {
                     optimizer_hints: vec![],
                     distinct: None,
                     select_modifiers: None,
-                    top: None,
-                    top_before_distinct: false,
                     projection: vec![],
                     exclude: None,
                     into: None,
@@ -12848,7 +12846,6 @@ impl<'a> Parser<'a> {
                     named_window: vec![],
                     window_before_qualify: false,
                     qualify: None,
-                    value_table_mode: None,
                     connect_by: vec![],
                     flavor: SelectFlavor::FromFirstNoSelect,
                 });
@@ -12858,7 +12855,6 @@ impl<'a> Parser<'a> {
 
         let select_token = self.expect_keyword(Keyword::SELECT)?;
         let optimizer_hints = self.maybe_parse_optimizer_hints()?;
-        let value_table_mode = self.parse_value_table_mode()?;
 
         let (select_modifiers, distinct_select_modifier) =
             if self.dialect.supports_select_modifiers() {
@@ -12867,22 +12863,11 @@ impl<'a> Parser<'a> {
                 (None, None)
             };
 
-        let mut top_before_distinct = false;
-        let mut top = None;
-        if self.dialect.supports_top_before_distinct() && self.parse_keyword(Keyword::TOP) {
-            top = Some(self.parse_top()?);
-            top_before_distinct = true;
-        }
-
         let distinct = if distinct_select_modifier.is_some() {
             distinct_select_modifier
         } else {
             self.parse_all_or_distinct()?
         };
-
-        if !self.dialect.supports_top_before_distinct() && self.parse_keyword(Keyword::TOP) {
-            top = Some(self.parse_top()?);
-        }
 
         let projection =
             if self.dialect.supports_empty_projections() && self.peek_keyword(Keyword::FROM) {
@@ -13019,8 +13004,6 @@ impl<'a> Parser<'a> {
             optimizer_hints,
             distinct,
             select_modifiers,
-            top,
-            top_before_distinct,
             projection,
             exclude,
             into,
@@ -13036,7 +13019,6 @@ impl<'a> Parser<'a> {
             named_window: named_windows,
             window_before_qualify,
             qualify,
-            value_table_mode,
             connect_by,
             flavor: if from_first {
                 SelectFlavor::FromFirst
@@ -13169,9 +13151,6 @@ impl<'a> Parser<'a> {
         Ok((select_modifiers, distinct))
     }
 
-    fn parse_value_table_mode(&mut self) -> Result<Option<ValueTableMode>, ParserError> {
-        Ok(None)
-    }
 
     /// Invoke `f` after first setting the parser's `ParserState` to `state`.
     ///
@@ -16143,32 +16122,6 @@ impl<'a> Parser<'a> {
         Ok(InterpolateExpr { column, expr })
     }
 
-    /// Parse a TOP clause, MSSQL equivalent of LIMIT,
-    /// that follows after `SELECT [DISTINCT]`.
-    pub fn parse_top(&mut self) -> Result<Top, ParserError> {
-        let quantity = if self.consume_token(&Token::LParen) {
-            let quantity = self.parse_expr()?;
-            self.expect_token(&Token::RParen)?;
-            Some(TopQuantity::Expr(quantity))
-        } else {
-            let next_token = self.next_token();
-            let quantity = match next_token.token {
-                Token::Number(s, _) => Self::parse::<u64>(s, next_token.span.start)?,
-                _ => self.expected("literal int", next_token)?,
-            };
-            Some(TopQuantity::Constant(quantity))
-        };
-
-        let percent = self.parse_keyword(Keyword::PERCENT);
-
-        let with_ties = self.parse_keywords(&[Keyword::WITH, Keyword::TIES]);
-
-        Ok(Top {
-            with_ties,
-            percent,
-            quantity,
-        })
-    }
 
     /// Parse a LIMIT clause
     pub fn parse_limit(&mut self) -> Result<Option<Expr>, ParserError> {

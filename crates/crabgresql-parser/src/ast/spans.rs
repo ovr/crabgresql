@@ -2080,7 +2080,6 @@ impl Spanned for Select {
             optimizer_hints: _,
             distinct: _, // todo
             select_modifiers: _,
-            top: _, // todo, mysql specific
             projection,
             exclude: _,
             into,
@@ -2096,9 +2095,7 @@ impl Spanned for Select {
             named_window,
             qualify,
             window_before_qualify: _, // bool
-            value_table_mode: _,      // todo, BigQuery specific
             connect_by,
-            top_before_distinct: _,
             flavor: _,
         } = self;
 
