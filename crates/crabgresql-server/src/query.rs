@@ -114,8 +114,16 @@ pub fn execute_statement(
     // Resolution overlay: the session's temp catalog shadows the shared global
     // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
     // so it keeps the raw engine + session below.
-    let catalog: Arc<dyn TableEngine> =
-        Arc::new(SessionCatalog::new(session.temp.clone(), engine.clone()));
+    // The read-only system catalog (`pg_catalog`), rebuilt per statement so its
+    // rows reflect current server state: live user relations are reflected into
+    // pg_class/pg_attribute. It sits behind temp + global on the search path.
+    let system: Arc<dyn TableEngine> =
+        Arc::new(crabgresql_catalog::SystemCatalog::with_relations(engine.relations()));
+    let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
+        session.temp.clone(),
+        engine.clone(),
+        system,
+    ));
     // The global catalog is the binder's view of user-defined types and casts,
     // so an expression can cast to/from a `CREATE TYPE` name.
     let type_catalog: Arc<dyn TypeCatalog> = global_catalog.clone();
@@ -727,6 +735,7 @@ fn builtin_type_by_name(name: &str) -> Option<PgType> {
         "varchar" | "character varying" => PgType::Varchar,
         "bpchar" | "char" | "character" => PgType::Bpchar,
         "name" => PgType::Name,
+        "oid" => PgType::Oid,
         "bit" => PgType::Bit,
         "date" => PgType::Date,
         "time" => PgType::Time,

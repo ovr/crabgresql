@@ -1,0 +1,268 @@
+//! Build-time codegen for `pg_catalog`'s built-in rows.
+//!
+//! Reads PostgreSQL's vendored catalog *data* files
+//! (`vendor/postgres/catalog/*.dat`) and emits typed row arrays the crate
+//! includes at compile time. The `.dat` format is a Perl array-of-hashes; the
+//! parser here reads that DATA only — it is an original scanner, NOT a port of
+//! PostgreSQL's `Catalog.pm`. Fields a `.dat` entry omits are filled from the
+//! per-catalog default tables below (authored from the public catalog docs),
+//! so codegen never reads PostgreSQL's C headers.
+//!
+//! See `docs/ARCHITECTURE.md` §7 and `AGENTS.md`: vendoring catalog `.dat` data
+//! and generating from it is the sanctioned path; attribution is in `NOTICE`.
+
+use std::collections::HashMap;
+use std::env;
+use std::fmt::Write as _;
+use std::path::PathBuf;
+
+fn main() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let catalog_dir = manifest.join("../../vendor/postgres/catalog");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    let type_entries = read_dat(&catalog_dir, "pg_type.dat");
+    let cast_entries = read_dat(&catalog_dir, "pg_cast.dat");
+
+    // Base type name -> OID, used to resolve name references in pg_type
+    // (`typelem`) and pg_cast (`castsource`/`casttarget`).
+    let name_to_oid: HashMap<&str, u32> = type_entries
+        .iter()
+        .filter_map(|e| Some((get(e, "typname")?, oid_field(e, "oid"))))
+        .collect();
+
+    std::fs::write(out_dir.join("pg_type_rows.rs"), gen_pg_type(&type_entries, &name_to_oid))
+        .unwrap();
+    std::fs::write(out_dir.join("pg_cast_rows.rs"), gen_pg_cast(&cast_entries, &name_to_oid))
+        .unwrap();
+}
+
+fn read_dat(dir: &std::path::Path, file: &str) -> Vec<Entry> {
+    let path = dir.join(file);
+    println!("cargo:rerun-if-changed={}", path.display());
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    parse_dat(&src)
+}
+
+/// One `.dat` entry: its `key => value` pairs with quotes stripped.
+type Entry = HashMap<String, String>;
+
+/// Parse a PostgreSQL `.dat` file (a Perl array of `{ key => 'value', ... }`
+/// hashes) into a list of key→value maps. Comments (`#` to end of line, outside
+/// quotes) and the surrounding `[` `]` are ignored. Single-quoted values may
+/// contain `\'`/`\\` escapes.
+fn parse_dat(src: &str) -> Vec<Entry> {
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    let n = bytes.len();
+    let mut entries = Vec::new();
+
+    while i < n {
+        match bytes[i] {
+            b'#' => {
+                // Comment to end of line.
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'{' => {
+                let (entry, next) = parse_entry(bytes, i + 1);
+                entries.push(entry);
+                i = next;
+            }
+            _ => i += 1,
+        }
+    }
+    entries
+}
+
+/// Parse one `{ ... }` body starting at `start` (just past the `{`), returning
+/// the entry and the index just past the closing `}`.
+fn parse_entry(bytes: &[u8], start: usize) -> (Entry, usize) {
+    let mut entry = Entry::new();
+    let mut i = start;
+    let n = bytes.len();
+    loop {
+        i = skip_ws_and_commas(bytes, i);
+        if i >= n || bytes[i] == b'}' {
+            return (entry, i + 1);
+        }
+        // A key: identifier chars up to whitespace or '='.
+        let key_start = i;
+        while i < n && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let key = std::str::from_utf8(&bytes[key_start..i]).unwrap().to_string();
+        // '=>'
+        i = skip_ws_and_commas(bytes, i);
+        if i + 1 < n && bytes[i] == b'=' && bytes[i + 1] == b'>' {
+            i += 2;
+        }
+        i = skip_ws_and_commas(bytes, i);
+        // Value: quoted string or bareword (e.g. `_null_`).
+        let value = if i < n && bytes[i] == b'\'' {
+            let (v, next) = parse_quoted(bytes, i + 1);
+            i = next;
+            v
+        } else {
+            let vs = i;
+            while i < n
+                && bytes[i] != b','
+                && bytes[i] != b'}'
+                && !bytes[i].is_ascii_whitespace()
+            {
+                i += 1;
+            }
+            std::str::from_utf8(&bytes[vs..i]).unwrap().to_string()
+        };
+        entry.insert(key, value);
+    }
+}
+
+fn skip_ws_and_commas(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+        i += 1;
+    }
+    i
+}
+
+/// Parse a single-quoted value starting past the opening quote; returns the
+/// unescaped content and the index past the closing quote.
+fn parse_quoted(bytes: &[u8], start: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut i = start;
+    let n = bytes.len();
+    while i < n {
+        match bytes[i] {
+            b'\\' if i + 1 < n => {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+            }
+            b'\'' => return (out, i + 1),
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    (out, i)
+}
+
+/// Symbolic `typlen` constants used in `pg_type.dat` (resolved by `genbki.pl`
+/// upstream). We fix the 64-bit values, matching the `server_version` we report.
+fn resolve_typlen(s: &str) -> i16 {
+    match s {
+        "NAMEDATALEN" => 64,
+        "SIZEOF_POINTER" => 8,
+        other => other
+            .parse()
+            .unwrap_or_else(|_| panic!("unexpected typlen {other:?}")),
+    }
+}
+
+fn get<'a>(e: &'a Entry, key: &str) -> Option<&'a str> {
+    e.get(key).map(String::as_str).filter(|v| *v != "_null_")
+}
+
+fn oid_field(e: &Entry, key: &str) -> u32 {
+    get(e, key).map(|v| v.parse().unwrap()).unwrap_or(0)
+}
+
+fn bool_field(e: &Entry, key: &str, default: bool) -> bool {
+    match get(e, key) {
+        Some("t") => true,
+        Some("f") => false,
+        None => default,
+        Some(other) => panic!("bad bool {key}={other:?}"),
+    }
+}
+
+fn str_field<'a>(e: &'a Entry, key: &str, default: &'a str) -> &'a str {
+    get(e, key).unwrap_or(default)
+}
+
+/// Emit `PG_TYPE_ROWS: &[PgTypeRow]` from the base-type entries in
+/// `pg_type.dat`. Auto-generated array types (from `array_type_oid`) are not
+/// emitted as their own rows yet; a base type's `typarray` still records the
+/// array OID. Omitted columns fall back to PostgreSQL's `pg_type` BKI defaults.
+fn gen_pg_type(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
+    let mut out = String::new();
+    out.push_str("// @generated by build.rs from vendor/postgres/catalog/pg_type.dat\n");
+    out.push_str("pub static PG_TYPE_ROWS: &[PgTypeRow] = &[\n");
+    for e in entries {
+        let oid = oid_field(e, "oid");
+        let typname = str_field(e, "typname", "");
+        assert!(oid != 0 && !typname.is_empty(), "pg_type entry missing oid/typname");
+        let typlen = resolve_typlen(str_field(e, "typlen", "0"));
+        // typelem: element type by name (0 when the type is not an array/vector).
+        let typelem = get(e, "typelem")
+            .map(|n| name_to_oid.get(n).copied().unwrap_or(0))
+            .unwrap_or(0);
+        let row = format!(
+            "    PgTypeRow {{ oid: {oid}, typname: {typname:?}, typnamespace: 11, \
+typowner: 10, typlen: {typlen}, typbyval: {typbyval}, typtype: {typtype:?}, \
+typcategory: {typcategory:?}, typispreferred: {typispreferred}, typisdefined: true, \
+typdelim: {typdelim:?}, typrelid: {typrelid}, typelem: {typelem}, typarray: {typarray}, \
+typinput: {typinput:?}, typoutput: {typoutput:?}, typreceive: {typreceive:?}, \
+typsend: {typsend:?}, typalign: {typalign:?}, typstorage: {typstorage:?} }},\n",
+            typbyval = bool_field(e, "typbyval", false),
+            typtype = str_field(e, "typtype", "b"),
+            typcategory = str_field(e, "typcategory", "X"),
+            typispreferred = bool_field(e, "typispreferred", false),
+            typdelim = str_field(e, "typdelim", ","),
+            // typrelid references a catalog relation's pg_class OID, which we do
+            // not codegen yet — 0 until pg_class OIDs are available (only the
+            // handful of catalog composite types carry a nonzero value).
+            typrelid = 0,
+            typarray = oid_field(e, "array_type_oid"),
+            typinput = str_field(e, "typinput", "-"),
+            typoutput = str_field(e, "typoutput", "-"),
+            typreceive = str_field(e, "typreceive", "-"),
+            typsend = str_field(e, "typsend", "-"),
+            typalign = str_field(e, "typalign", "i"),
+            typstorage = str_field(e, "typstorage", "p"),
+        );
+        out.push_str(&row);
+    }
+    out.push_str("];\n");
+    let _ = writeln!(out); // trailing newline
+    out
+}
+
+/// Emit `PG_CAST_ROWS: &[PgCastRow]` from `pg_cast.dat`. `castsource`/
+/// `casttarget` are written as type names (resolved here against `pg_type`);
+/// a cast whose source or target is a type crabgresql does not expose is
+/// skipped, so the emitted `pg_cast` stays consistent with the exposed
+/// `pg_type`. OIDs are synthetic (upstream assigns none). `castfunc` is kept as
+/// the `.dat` text (a `regprocedure` reference) rather than a resolved OID.
+fn gen_pg_cast(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
+    // Casts have no manual OIDs upstream; assign stable synthetic ones above the
+    // built-in floor so they never collide with a real object OID.
+    const FIRST_CAST_OID: u32 = 10000;
+    let mut out = String::new();
+    out.push_str("// @generated by build.rs from vendor/postgres/catalog/pg_cast.dat\n");
+    out.push_str("pub static PG_CAST_ROWS: &[PgCastRow] = &[\n");
+    let mut next_oid = FIRST_CAST_OID;
+    for e in entries {
+        let (Some(source), Some(target)) = (
+            get(e, "castsource").and_then(|n| name_to_oid.get(n).copied()),
+            get(e, "casttarget").and_then(|n| name_to_oid.get(n).copied()),
+        ) else {
+            continue; // references a type we do not expose
+        };
+        let row = format!(
+            "    PgCastRow {{ oid: {oid}, castsource: {source}, casttarget: {target}, \
+castfunc: {castfunc:?}, castcontext: {castcontext:?}, castmethod: {castmethod:?} }},\n",
+            oid = next_oid,
+            castfunc = str_field(e, "castfunc", "-"),
+            castcontext = str_field(e, "castcontext", "e"),
+            castmethod = str_field(e, "castmethod", "f"),
+        );
+        next_oid += 1;
+        out.push_str(&row);
+    }
+    out.push_str("];\n");
+    let _ = writeln!(out);
+    out
+}

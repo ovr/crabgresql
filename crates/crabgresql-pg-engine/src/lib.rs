@@ -148,4 +148,8 @@ impl TableEngine for PgEngine {
             .expect("relation file unlink failed");
         Ok(())
     }
+
+    fn relations(&self) -> Vec<TableSchema> {
+        self.tables.read().unwrap().values().map(|t| t.schema().clone()).collect()
+    }
 }

@@ -127,22 +127,42 @@ pub enum JoinInput {
     TableFunction { func: TableFn, args: Vec<BoundExpr> },
 }
 
-fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, BindError> {
-    if name.0.len() != 1 {
-        return Err(BindError::feature_not_supported(format!(
-            "qualified relation names are not supported yet: {name}"
-        )));
+/// Split a relation name into an optional schema qualifier and the relation
+/// name. `t` → `(None, "t")`; `pg_catalog.pg_type` → `(Some("pg_catalog"),
+/// "pg_type")`. A three-or-more-part name (cross-database) is still unsupported.
+fn split_relation_name(
+    name: &ast::ObjectName,
+) -> Result<(Option<String>, String), BindError> {
+    let idents: Vec<&ast::Ident> = name.0.iter().filter_map(|p| p.as_ident()).collect();
+    if idents.len() != name.0.len() {
+        return Err(BindError::syntax(format!("invalid relation name: {name}")));
     }
-    match name.0[0].as_ident() {
-        Some(ident) => Ok(normalize_ident(ident)),
-        None => Err(BindError::syntax(format!("invalid relation name: {name}"))),
+    match idents.as_slice() {
+        [rel] => Ok((None, normalize_ident(rel))),
+        [schema, rel] => Ok((Some(normalize_ident(schema)), normalize_ident(rel))),
+        _ => Err(BindError::feature_not_supported(format!(
+            "cross-database relation names are not supported yet: {name}"
+        ))),
     }
 }
 
-/// Resolve an `UPDATE`/`DELETE` target: the table plus the qualifier its
-/// columns may be addressed by (the alias when present, as in PG). A column-list
-/// alias is rejected here — it is meaningful only for `FROM` items, which bind
-/// through [`bind_from_item`] instead.
+/// A single-part relation name (no schema qualifier allowed) — for contexts
+/// like CTE names and qualified wildcards where a schema makes no sense.
+fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, BindError> {
+    match split_relation_name(name)? {
+        (None, rel) => Ok(rel),
+        (Some(_), _) => Err(BindError::feature_not_supported(format!(
+            "qualified name is not supported here: {name}"
+        ))),
+    }
+}
+
+/// Resolve a `FROM`/`UPDATE`/`DELETE` target: the table plus the qualifier its
+/// columns may be addressed by (the alias when present, as in PG). The engine's
+/// `resolve` honors the search path, so an unqualified `pg_type` reaches
+/// `pg_catalog` and `pg_catalog.pg_type` routes there directly. A column-list
+/// alias is rejected via [`aliased_qualifier`] — it is meaningful only for
+/// `FROM` items, which bind through [`bind_from_item`].
 fn open_relation(
     engine: &Arc<dyn TableEngine>,
     relation: &ast::TableFactor,
@@ -152,7 +172,33 @@ fn open_relation(
             "FROM item is not supported yet: {relation}"
         )));
     };
-    let table_name = object_name_to_table_name(name)?;
+    let (schema, table_name) = split_relation_name(name)?;
+    let qualifier = aliased_qualifier(alias, table_name.clone())?;
+    let table = engine.resolve(schema.as_deref(), &table_name)?;
+    Ok((table, qualifier))
+}
+
+/// Resolve an `UPDATE`/`DELETE` target. Writes go through `open_table` (user
+/// data only), never the search-path-aware `resolve`, so a mutation can never
+/// reach the read-only system catalog. A schema qualifier other than the
+/// default `public` is unsupported for a write target.
+fn open_write_relation(
+    engine: &Arc<dyn TableEngine>,
+    relation: &ast::TableFactor,
+) -> Result<(Arc<dyn TableAm>, String), BindError> {
+    let ast::TableFactor::Table { name, alias, .. } = relation else {
+        return Err(BindError::feature_not_supported(format!(
+            "target is not supported yet: {relation}"
+        )));
+    };
+    let (schema, table_name) = split_relation_name(name)?;
+    if let Some(s) = &schema
+        && s != "public"
+    {
+        return Err(BindError::feature_not_supported(format!(
+            "cannot modify relation in schema \"{s}\""
+        )));
+    }
     let qualifier = aliased_qualifier(alias, table_name.clone())?;
     let table = engine.open_table(&table_name)?;
     Ok((table, qualifier))
@@ -502,8 +548,12 @@ fn bind_from_item(
             args: None,
             ..
         } => {
-            let tname = object_name_to_table_name(name)?;
-            if let Some(cte) = ctes.get(&tname) {
+            // A CTE reference is always a bare (unqualified) name; a schema
+            // qualifier means it is a real relation, so skip the CTE lookup.
+            let (cte_schema, tname) = split_relation_name(name)?;
+            if cte_schema.is_none()
+                && let Some(cte) = ctes.get(&tname)
+            {
                 let qualifier = relation_qualifier(alias, &tname);
                 let mut columns = cte.columns.clone();
                 apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
@@ -1240,7 +1290,7 @@ pub fn bind_update(
         )));
     }
 
-    let (table, qualifier) = open_relation(engine, &update.table.relation)?;
+    let (table, qualifier) = open_write_relation(engine, &update.table.relation)?;
     let schema = table.schema().clone();
     let table_name = schema.name.clone();
     let scope = Scope::table(&schema, qualifier, catalog);
@@ -1316,7 +1366,7 @@ pub fn bind_delete(
         ));
     }
 
-    let (table, qualifier) = open_relation(engine, &target.relation)?;
+    let (table, qualifier) = open_write_relation(engine, &target.relation)?;
     let schema = table.schema().clone();
     let scope = Scope::table(&schema, qualifier, catalog);
     let predicate = bind_where(&delete.selection, &scope)?;

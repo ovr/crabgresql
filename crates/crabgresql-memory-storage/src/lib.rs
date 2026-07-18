@@ -60,6 +60,10 @@ impl TableEngine for MemoryEngine {
             .map(|_| ())
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
+
+    fn relations(&self) -> Vec<TableSchema> {
+        self.tables.read().unwrap().values().map(|t| t.schema.clone()).collect()
+    }
 }
 
 /// One row version: its identity, MVCC header, and column values.

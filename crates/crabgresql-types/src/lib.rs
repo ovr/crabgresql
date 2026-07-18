@@ -32,6 +32,9 @@ pub mod oid {
     pub const BYTEA: u32 = 17;
     pub const NAME: u32 = 19;
     pub const INT8: u32 = 20;
+    /// `oid`: PostgreSQL's object-identifier type (unsigned 32-bit). Pervasive
+    /// across `pg_catalog` (every `oid`/`reg*` column), so worth a real type.
+    pub const OID: u32 = 26;
     pub const INT2: u32 = 21;
     pub const INT4: u32 = 23;
     pub const TEXT: u32 = 25;
@@ -73,6 +76,9 @@ pub enum PgType {
     Bpchar,
     /// `name`: a 63-character identifier type backed by `text`.
     Name,
+    /// `oid`: an unsigned 32-bit object identifier. Fixed 4-byte type; values
+    /// print as unsigned decimals. Backs `pg_catalog` OID/`reg*` columns.
+    Oid,
     Bytea,
     Bit,
     /// `date`.
@@ -113,6 +119,7 @@ impl PgType {
             PgType::Varchar => oid::VARCHAR,
             PgType::Bpchar => oid::BPCHAR,
             PgType::Name => oid::NAME,
+            PgType::Oid => oid::OID,
             PgType::Bytea => oid::BYTEA,
             PgType::Bit => oid::BIT,
             PgType::Date => oid::DATE,
@@ -145,6 +152,7 @@ impl PgType {
             PgType::Money => 8,
             PgType::Interval => 16,
             PgType::Uuid => 16,
+            PgType::Oid => 4,
             // `name` is a fixed 64-byte type; the rest are varlena.
             PgType::Name => 64,
             PgType::Numeric
@@ -174,6 +182,7 @@ impl PgType {
             PgType::Varchar => "character varying",
             PgType::Bpchar => "character",
             PgType::Name => "name",
+            PgType::Oid => "oid",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
             PgType::Date => "date",
@@ -205,6 +214,7 @@ impl PgType {
             PgType::Varchar => "varchar",
             PgType::Bpchar => "bpchar",
             PgType::Name => "name",
+            PgType::Oid => "oid",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
             PgType::Date => "date",
@@ -264,6 +274,9 @@ pub enum Value {
     Numeric(Numeric),
     /// `money`: a signed count of hundredths (cents). See [`crate::money`].
     Money(i64),
+    /// `oid`: an unsigned 32-bit object identifier. Prints as an unsigned
+    /// decimal; carries the referenced OID for `reg*`-style catalog columns.
+    Oid(u32),
     Text(String),
     Bytea(Vec<u8>),
     /// A bit-string literal (`x'...'`): `len` bits packed right-aligned in
@@ -306,6 +319,7 @@ impl Value {
             Value::Float8(_) => Some(PgType::Float8),
             Value::Numeric(_) => Some(PgType::Numeric),
             Value::Money(_) => Some(PgType::Money),
+            Value::Oid(_) => Some(PgType::Oid),
             Value::Text(_) => Some(PgType::Text),
             Value::Bytea(_) => Some(PgType::Bytea),
             Value::Bit { .. } => Some(PgType::Bit),
@@ -339,6 +353,7 @@ impl Value {
             Value::Float8(v) => Some(float::fmt_f64(*v, efd)),
             Value::Numeric(n) => Some(n.to_display()),
             Value::Money(c) => Some(money::format(*c)),
+            Value::Oid(v) => Some(v.to_string()),
             Value::Text(s) => Some(s.clone()),
             Value::Bytea(bytes) => {
                 let mut out = String::with_capacity(2 + bytes.len() * 2);
@@ -395,6 +410,19 @@ mod tests {
         assert_eq!(PgType::Float8.oid(), 701);
         assert_eq!(PgType::Int2.oid(), 21);
         assert_eq!(PgType::Bytea.oid(), 17);
+        assert_eq!(PgType::Oid.oid(), 26);
+    }
+
+    #[test]
+    fn oid_encodes_as_unsigned_decimal() {
+        assert_eq!(Value::Oid(2200).encode_text().as_deref(), Some("2200"));
+        // Past i32::MAX: an oid is unsigned, so it must not print negative.
+        assert_eq!(
+            Value::Oid(u32::MAX).encode_text().as_deref(),
+            Some("4294967295")
+        );
+        assert_eq!(PgType::Oid.typname(), "oid");
+        assert_eq!(PgType::Oid.typlen(), 4);
     }
 
     #[test]

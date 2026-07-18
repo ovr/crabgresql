@@ -252,6 +252,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabgresql-catalog"
+version = "0.1.0"
+dependencies = [
+ "crabgresql-storage-api",
+ "crabgresql-txn",
+ "crabgresql-types",
+]
+
+[[package]]
 name = "crabgresql-executor"
 version = "0.1.0"
 dependencies = [
@@ -338,6 +347,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crabgresql-binder",
+ "crabgresql-catalog",
  "crabgresql-executor",
  "crabgresql-memory-storage",
  "crabgresql-parser",

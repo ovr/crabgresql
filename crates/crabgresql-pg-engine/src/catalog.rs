@@ -213,6 +213,7 @@ fn pgtype_from_oid(o: u32) -> PgType {
         oid::VARCHAR => PgType::Varchar,
         oid::BPCHAR => PgType::Bpchar,
         oid::NAME => PgType::Name,
+        oid::OID => PgType::Oid,
         oid::BYTEA => PgType::Bytea,
         oid::BIT => PgType::Bit,
         oid::DATE => PgType::Date,

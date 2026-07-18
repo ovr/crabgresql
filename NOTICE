@@ -12,6 +12,14 @@ They are used unmodified, as a test corpus only; no PostgreSQL source code is
 included in this product. See docs/ARCHITECTURE.md §7 and AGENTS.md for the
 clean-room policy.
 
+This product also includes PostgreSQL's system-catalog data files
+(vendor/postgres/catalog/*.dat: pg_type, pg_proc, pg_cast, pg_namespace) under
+the same copyright and PostgreSQL License. crates/crabgresql-catalog generates
+pg_catalog's built-in rows from this DATA at build time; the `.dat` parser is an
+original scanner, not a port of PostgreSQL's Catalog.pm. Borrowing catalog data
+(and generating from pg_type.dat/pg_proc.dat) is the clean-room-sanctioned path
+per AGENTS.md; no PostgreSQL source code is included.
+
 This product includes a fork of the `ryu` crate under vendor/ryu, used for
 shortest-decimal float formatting:
 

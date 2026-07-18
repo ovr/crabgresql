@@ -7,6 +7,19 @@ permitted by the clean-room policy in `docs/ARCHITECTURE.md` §7, with
 attribution in the repo-root `NOTICE` file. The upstream license is in
 `COPYRIGHT` (the PostgreSQL License).
 
+It also holds `catalog/` — PostgreSQL's system-catalog **data** files
+(`src/include/catalog/*.dat`: `pg_type`, `pg_proc`, `pg_cast`, `pg_namespace`).
+These seed `pg_catalog`'s built-in rows: `crates/crabgresql-catalog` codegens
+from them at build time. Only the `.dat` DATA is vendored — never the C headers
+or the Perl `Catalog.pm` parser. The pin is recorded in `CATALOG_COMMIT`
+(kept equal to `REGRESS_COMMIT`).
+
+To (re)populate or bump the catalog data:
+
+```sh
+./scripts/sync-catalog.sh   # reads the pin from REGRESS_COMMIT
+```
+
 ## Provenance
 
 The files come from the `postgres/postgres` GitHub mirror at the commit

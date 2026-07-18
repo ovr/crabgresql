@@ -309,6 +309,19 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- money → numeric (always two fractional digits) ----
         (Value::Money(c), PgType::Numeric) => Ok(Value::Numeric(money_to_numeric(*c))),
 
+        // ---- integer <-> oid ----
+        // PG's int4->oid/int8->oid wrap through the unsigned 32-bit range (an
+        // out-of-range int8 wraps rather than erroring, matching `int8_oid`);
+        // oid->int8 is exact, oid->int4 reinterprets the bit pattern.
+        (Value::Int2(n), PgType::Oid) => Ok(Value::Oid(*n as u32)),
+        (Value::Int4(n), PgType::Oid) => Ok(Value::Oid(*n as u32)),
+        (Value::Int8(n), PgType::Oid) => Ok(Value::Oid(*n as u32)),
+        (Value::Oid(n), PgType::Int8) => Ok(Value::Int8(*n as i64)),
+        (Value::Oid(n), PgType::Int4) => Ok(Value::Int4(*n as i32)),
+
+        // ---- text -> oid (oidin: unsigned decimal, wrapping) ----
+        (Value::Text(s), PgType::Oid) => text_to_oid(s),
+
         _ => Err(cannot_coerce(from, to)),
     }
 }
@@ -453,6 +466,21 @@ pub fn text_to_int(s: &str, ty: PgType) -> Result<Value, CastError> {
         PgType::Int8 => t.parse::<i64>().map(Value::Int8).map_err(map),
         _ => unreachable!("text_to_int called with {ty:?}"),
     }
+}
+
+/// `oidin`: parse an unsigned 32-bit object identifier from text. Malformed
+/// input is `22P02`; a magnitude past `u32::MAX` is `22003` (`value "…" is out
+/// of range for type oid`). Shared by the binder's `parse_unknown` so `'42'::oid`
+/// and an untyped literal in an oid context never drift.
+pub fn text_to_oid(s: &str) -> Result<Value, CastError> {
+    use std::num::IntErrorKind;
+    let t = s.trim();
+    t.parse::<u32>().map(Value::Oid).map_err(|e| match e.kind() {
+        IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
+            value_out_of_range(PgType::Oid, s)
+        }
+        _ => invalid_input(PgType::Oid, s),
+    })
 }
 
 /// `numeric_int2`/`_int4`/`_int8`: round half away from zero, then range-check.

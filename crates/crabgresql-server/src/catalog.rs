@@ -1,33 +1,64 @@
 //! Per-statement name resolution overlay: a session's temp catalog shadows the
-//! shared global engine, matching PG's `pg_temp`-first search.
+//! shared global engine (PG's `pg_temp`-first search), and the read-only system
+//! catalog (`pg_catalog`) sits behind both on the search path.
 
 use std::sync::Arc;
 
 use crabgresql_storage_api::{StorageError, TableAm, TableEngine, TableSchema};
 
 /// Resolves relations against a session-local temp store first, then the shared
-/// global engine — so a `CREATE TEMP TABLE t` hides a permanent `t` of the same
-/// name for the life of the session. Holds two cheap `Arc` clones; build one per
-/// statement.
+/// global engine, then the read-only system catalog — so a `CREATE TEMP TABLE t`
+/// hides a permanent `t`, and `pg_catalog` relations (`pg_type`, …) resolve when
+/// nothing user-defined shadows them. Holds three cheap `Arc` clones; build one
+/// per statement.
 pub struct SessionCatalog {
     temp: Arc<dyn TableEngine>,
     global: Arc<dyn TableEngine>,
+    system: Arc<dyn TableEngine>,
 }
 
 impl SessionCatalog {
-    pub fn new(temp: Arc<dyn TableEngine>, global: Arc<dyn TableEngine>) -> Self {
-        Self { temp, global }
+    pub fn new(
+        temp: Arc<dyn TableEngine>,
+        global: Arc<dyn TableEngine>,
+        system: Arc<dyn TableEngine>,
+    ) -> Self {
+        Self { temp, global, system }
+    }
+
+    /// Fall through `TableNotFound` to `next`, but surface any other error.
+    fn or_else_not_found(
+        first: Result<Arc<dyn TableAm>, StorageError>,
+        next: impl FnOnce() -> Result<Arc<dyn TableAm>, StorageError>,
+    ) -> Result<Arc<dyn TableAm>, StorageError> {
+        match first {
+            Err(StorageError::TableNotFound(_)) => next(),
+            other => other,
+        }
     }
 }
 
 impl TableEngine for SessionCatalog {
+    /// Unqualified, write-safe lookup: temp then global only. Writes resolve
+    /// through this, so a mutation never reaches the read-only system catalog.
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
-        match self.temp.open_table(name) {
-            // Not a temp table: fall through to the permanent namespace. A real
-            // miss there yields the same `TableNotFound(name)` / 42P01 text.
-            Err(StorageError::TableNotFound(_)) => self.global.open_table(name),
-            // Temp hit, or a genuine error from the temp store.
-            other => other,
+        Self::or_else_not_found(self.temp.open_table(name), || self.global.open_table(name))
+    }
+
+    /// Search-path-aware read resolution. An unqualified name searches temp →
+    /// global → system (so `pg_catalog` is implicitly on the path, after user
+    /// relations). A schema qualifier routes to exactly one namespace.
+    fn resolve(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<Arc<dyn TableAm>, StorageError> {
+        match schema {
+            None => Self::or_else_not_found(self.open_table(name), || self.system.open_table(name)),
+            Some("pg_catalog") => self.system.open_table(name),
+            Some("public") => self.global.open_table(name),
+            Some("pg_temp") => self.temp.open_table(name),
+            Some(_) => Err(StorageError::TableNotFound(name.to_string())),
         }
     }
 
@@ -45,5 +76,9 @@ impl TableEngine for SessionCatalog {
             Err(StorageError::TableNotFound(_)) => self.global.drop_table(name),
             other => other,
         }
+    }
+
+    fn relations(&self) -> Vec<TableSchema> {
+        self.global.relations()
     }
 }
