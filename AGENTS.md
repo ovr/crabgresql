@@ -33,3 +33,15 @@ for the entire codebase:
 - When a comment needs to explain why a value or branch exists, point to the
   behavior it reproduces (e.g. "matches `float8out` at `extra_float_digits = 0`",
   with a regression-test citation), not to PG's implementation.
+
+## Regression test scoreboard
+
+- When you land work that changes how many regression tests pass — promoting a
+  test to `crates/crabgresql-pg-regress/suites/upstream_must_pass.txt`, or
+  making more of the suite green — **update the passed-tests counter** that
+  tracks compatibility progress (the score in `README.md`) in the same change.
+  A stale counter misreports the project's state.
+- **Count tests by their number, not by file.** The score is the count of
+  individual tests that pass, not the count of `.sql` files: a partially-passing
+  file contributes only the tests that actually pass, and is never rounded up to
+  a whole file or dropped to zero. Report the honest per-test total.
