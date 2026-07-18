@@ -23,6 +23,18 @@ vendor/ryu/LICENSE-Boost). Our fork changes one configuration constant
 (`accept_bounds = false`) so the output matches PostgreSQL's observable float
 representation; no PostgreSQL source is involved.
 
+This product includes a hard fork of the `sqlparser` crate (Apache DataFusion's
+sqlparser-rs), vendored in-tree as the source of crates/crabgresql-parser
+(the ast/, dialect/, parser/ modules and supporting files):
+
+  Copyright the Apache Software Foundation and the sqlparser-rs authors
+  (github.com/apache/datafusion-sqlparser-rs)
+
+licensed under Apache-2.0 (the same license as this project); the per-file Apache
+license headers are preserved. The fork point is upstream tag v0.62.0 (see
+crates/crabgresql-parser/UPSTREAM). Our copy diverges over time to add
+PostgreSQL-specific grammar not present upstream.
+
 This product includes the special functions erf, erfc, tgamma and lgamma
 (crates/crabgresql-executor/src/special_fns.rs), vendored from the FreeBSD/msun
 math library as ported by the `libm` crate (github.com/rust-lang/libm):

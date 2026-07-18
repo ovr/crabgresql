@@ -1,0 +1,13 @@
+The SQL parser under src/ (the ast/, dialect/, parser/ trees plus tokenizer.rs,
+keywords.rs, display_utils.rs, test_utils.rs, and the crate scaffolding in
+lib.rs) is an in-tree hard fork of Apache DataFusion's sqlparser-rs.
+
+  project: https://github.com/apache/datafusion-sqlparser-rs
+  tag:     v0.62.0
+  commit:  3dd0e30d8bb1d2a6775f62d2b84839b60133effb
+
+Fork point is a near-verbatim copy of the tag's src/ (upstream's tests/, derive/,
+and examples/ were not vendored; the sqlparser_derive proc-macro is left as an
+unused optional dependency). CrabgreSQL-specific additions live in later commits;
+diffing src/ against this tag shows our divergence. Re-sync by replacing src/
+from a newer tag and updating the commit above.
