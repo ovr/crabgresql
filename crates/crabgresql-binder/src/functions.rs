@@ -997,7 +997,7 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
 /// [`BoundExpr::Aggregate`] marker. The binder's extraction pass later moves it
 /// into a [`crate::LogicalPlan::Aggregate`] node and replaces the marker with a
 /// `ColumnRef`. `FILTER`/`OVER`/`WITHIN GROUP` were already rejected by the
-/// caller; `DISTINCT` and per-aggregate `ORDER BY` are rejected here.
+/// caller; per-aggregate `ORDER BY` is rejected here.
 fn bind_aggregate(
     agg: AggFn,
     name: &str,
@@ -1021,15 +1021,26 @@ fn bind_aggregate(
             ));
         }
     };
-    if matches!(list.duplicate_treatment, Some(ast::DuplicateTreatment::Distinct)) {
-        return Err(BindError::feature_not_supported(
-            "DISTINCT in aggregate functions is not supported yet",
-        ));
-    }
+    let distinct = matches!(list.duplicate_treatment, Some(ast::DuplicateTreatment::Distinct));
     if !list.clauses.is_empty() {
         return Err(BindError::feature_not_supported(
             "aggregate ORDER BY / WITHIN GROUP is not supported yet",
         ));
+    }
+
+    let has_wildcard = list.args.iter().any(|a| {
+        matches!(
+            a,
+            ast::FunctionArg::Unnamed(
+                ast::FunctionArgExpr::Wildcard | ast::FunctionArgExpr::QualifiedWildcard(_)
+            )
+        )
+    });
+    // `ALL`/`DISTINCT` only apply to expression arguments; PostgreSQL rejects
+    // `count(DISTINCT *)` during parsing. Our parser retains this form, so keep
+    // the observable syntax error at bind time.
+    if list.duplicate_treatment.is_some() && has_wildcard {
+        return Err(BindError::syntax("syntax error at or near \"*\""));
     }
 
     // `count(*)` — the only aggregate taking the row-wildcard argument. It counts
@@ -1042,6 +1053,7 @@ fn bind_aggregate(
     {
         return Ok(Binding::Typed(BoundExpr::Aggregate {
             func: AggFn::Count,
+            distinct,
             arg: None,
             input_ty: PgType::Int8,
             ret: PgType::Int8,
@@ -1050,14 +1062,7 @@ fn bind_aggregate(
 
     // A row-wildcard argument to any other aggregate (`sum(*)`) has no overload;
     // PG reports it like a zero-argument call.
-    if list.args.iter().any(|a| {
-        matches!(
-            a,
-            ast::FunctionArg::Unnamed(
-                ast::FunctionArgExpr::Wildcard | ast::FunctionArgExpr::QualifiedWildcard(_)
-            )
-        )
-    }) {
+    if has_wildcard {
         return Err(BindError::new(
             sqlstate::UNDEFINED_FUNCTION,
             format!("function {name}() does not exist"),
@@ -1103,6 +1108,7 @@ fn bind_aggregate(
     let ret = agg_return_type(agg, input_ty)?;
     Ok(Binding::Typed(BoundExpr::Aggregate {
         func: agg,
+        distinct,
         arg: Some(Box::new(arg)),
         input_ty,
         ret,

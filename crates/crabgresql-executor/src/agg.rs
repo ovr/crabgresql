@@ -9,13 +9,48 @@
 
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crabgresql_binder::{AggFn, BoundAggregate};
-use crabgresql_types::{Numeric, PgType, Value, float};
+use crabgresql_types::{float, Numeric, PgType, Value};
 
-use crate::ExecError;
 use crate::eval::compare_values;
+use crate::ExecError;
+
+/// The non-NULL input values already accepted by one `DISTINCT` aggregate in
+/// one group. It uses the same type-aware equality and compatible hash as
+/// grouping, so duplicate elimination matches PostgreSQL's value semantics.
+pub struct DistinctValues {
+    ty: PgType,
+    buckets: HashMap<u64, Vec<Value>>,
+}
+
+impl DistinctValues {
+    pub fn new(ty: PgType) -> Self {
+        Self {
+            ty,
+            buckets: HashMap::new(),
+        }
+    }
+
+    /// Record `value` if it has not appeared before, returning whether the
+    /// caller should pass it to the aggregate accumulator.
+    pub fn insert(&mut self, value: &Value) -> bool {
+        let tys = [self.ty];
+        let values = std::slice::from_ref(value);
+        let bucket = self.buckets.entry(hash_key(&tys, values)).or_default();
+        if bucket
+            .iter()
+            .any(|seen| keys_equal(&tys, std::slice::from_ref(seen), values))
+        {
+            false
+        } else {
+            bucket.push(value.clone());
+            true
+        }
+    }
+}
 
 /// The running state of one aggregate over one group.
 pub struct Accumulator {
