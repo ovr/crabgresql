@@ -90,8 +90,13 @@ pub fn format_error(error: &ErrorFields, query: &str) -> String {
     out
 }
 
-pub fn format_notice(notice: &ErrorFields) -> String {
+pub fn format_notice(notice: &ErrorFields, query: &str) -> String {
     let mut out = format!("{}:  {}\n", notice.severity(), notice.message());
+    if let Some(position) = notice.get(b'P').and_then(|p| p.parse::<usize>().ok())
+        && position > 0
+    {
+        out.push_str(&position_excerpt(query, position));
+    }
     push_field(&mut out, "DETAIL", notice.get(b'D'));
     push_field(&mut out, "HINT", notice.get(b'H'));
     out
@@ -110,20 +115,88 @@ fn push_field(out: &mut String, label: &str, value: Option<&str>) {
     }
 }
 
-/// `LINE n: <the query line>` and a caret under the 1-based character
-/// `position` (counted over the whole query text).
+/// `LINE n: <query line>` and a caret under the cursor, where `position` is a
+/// 1-based character offset over the whole query text. Ports libpq's
+/// `reportErrorPosition` (fe-protocol3.c), including its truncation of an
+/// over-long line to a 60-column window with leading/trailing `...`. Screen
+/// columns are taken as character counts — the wide-character display-width gap
+/// noted in the module docs; the regression corpus is single-byte here.
 fn position_excerpt(query: &str, position: usize) -> String {
-    let mut remaining = position - 1;
-    for (line_no, line) in query.lines().enumerate() {
-        let len = line.chars().count();
-        if remaining <= len {
-            let prefix = format!("LINE {}: ", line_no + 1);
-            let caret_at = prefix.chars().count() + remaining;
-            return format!("{prefix}{line}\n{}^\n", " ".repeat(caret_at));
-        }
-        remaining -= len + 1;
+    const DISPLAY_SIZE: usize = 60; // screen width limit, in columns
+    const MIN_RIGHT_CUT: usize = 10; // keep at least this far from EOL
+
+    if position == 0 {
+        return String::new();
     }
-    String::new()
+    // libpq renders tabs as a single space; do the same so widths line up.
+    let chars: Vec<char> = query
+        .chars()
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .collect();
+    let total = chars.len();
+    let loc = position - 1; // 0-based cursor index
+    if loc > total {
+        return String::new();
+    }
+
+    // Locate the line containing `loc`: its 1-based number and the [ibeg, iend)
+    // character range (iend at the terminating newline, or end of text).
+    let mut loc_line = 1usize;
+    let mut ibeg = 0usize;
+    let mut iend = total;
+    for cno in 0..total {
+        let ch = chars[cno];
+        if ch == '\r' || ch == '\n' {
+            if cno < loc {
+                // A \n immediately after \r does not start a new line.
+                if ch == '\r' || cno == 0 || chars[cno - 1] != '\r' {
+                    loc_line += 1;
+                }
+                ibeg = cno + 1;
+            } else {
+                iend = cno;
+                break;
+            }
+        }
+    }
+
+    // Truncate the line to a DISPLAY_SIZE window keeping the cursor visible.
+    let mut beg_trunc = false;
+    let mut end_trunc = false;
+    if iend - ibeg > DISPLAY_SIZE {
+        if ibeg + DISPLAY_SIZE >= loc + MIN_RIGHT_CUT {
+            // Cutting only the right end is enough.
+            while iend - ibeg > DISPLAY_SIZE {
+                iend -= 1;
+            }
+            end_trunc = true;
+        } else {
+            while loc + MIN_RIGHT_CUT < iend {
+                iend -= 1;
+                end_trunc = true;
+            }
+            while iend - ibeg > DISPLAY_SIZE {
+                ibeg += 1;
+                beg_trunc = true;
+            }
+        }
+    }
+
+    let prefix = format!("LINE {loc_line}: ");
+    let mut out = prefix.clone();
+    if beg_trunc {
+        out.push_str("...");
+    }
+    out.extend(&chars[ibeg..iend]);
+    if end_trunc {
+        out.push_str("...");
+    }
+    out.push('\n');
+
+    let caret_col = prefix.chars().count() + if beg_trunc { 3 } else { 0 } + (loc - ibeg);
+    out.push_str(&" ".repeat(caret_col));
+    out.push_str("^\n");
+    out
 }
 
 #[cfg(test)]
@@ -231,6 +304,28 @@ mod tests {
              LINE 1: SELECT bool 'test' AS error;\n\
              \u{20}                   ^\n"
         );
+    }
+
+    #[test]
+    fn notice_with_position_truncates_long_line_like_libpq() {
+        // The exact case from float4.sql: the argument-shell NOTICE points at
+        // the `xfloat4` argument (char 28), and the 68-column line is cut to a
+        // 60-column window with a trailing `...`. Matches
+        // vendor/postgres/regress/expected/float4.out.
+        let fields = error_fields(&[
+            (b'V', "NOTICE"),
+            (b'M', "argument type xfloat4 is only a shell"),
+            (b'P', "28"),
+        ]);
+        let query = "create function xfloat4out(xfloat4) returns cstring immutable strict\n  language internal as 'int4out';";
+        // Caret sits under `xfloat4`: 8 cols of "LINE 1: " + 27 cols to the `x`.
+        let expected = format!(
+            "NOTICE:  argument type xfloat4 is only a shell\n\
+             LINE 1: create function xfloat4out(xfloat4) returns cstring immutabl...\n\
+             {}^\n",
+            " ".repeat(35)
+        );
+        assert_eq!(format_notice(&fields, query), expected);
     }
 
     #[test]

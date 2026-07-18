@@ -3,8 +3,8 @@
 -- Bootstraps a user-defined base type the way PostgreSQL's own catalog does: a
 -- shell type, its internal C I/O functions, the filled-in base type, a binary-
 -- coercible cast, then a cascading drop. Output hand-checked against PostgreSQL
--- (psql -a -q); the argument-shell NOTICE's LINE/caret is omitted, matching the
--- runner's notice rendering.
+-- (psql -a -q), including the argument-shell NOTICE's LINE/caret excerpt (the
+-- long CREATE FUNCTION line is truncated to 60 columns with a trailing `...`).
 --
 -- A bare CREATE TYPE makes a placeholder "shell" type (no NOTICE of its own).
 CREATE TYPE xfloat8;
@@ -13,6 +13,8 @@ CREATE FUNCTION xfloat8in(cstring) RETURNS xfloat8 AS 'int8in' LANGUAGE internal
 NOTICE:  return type xfloat8 is only a shell
 CREATE FUNCTION xfloat8out(xfloat8) RETURNS cstring AS 'int8out' LANGUAGE internal IMMUTABLE STRICT;
 NOTICE:  argument type xfloat8 is only a shell
+LINE 1: CREATE FUNCTION xfloat8out(xfloat8) RETURNS cstring AS 'int8...
+                                   ^
 -- Filling in the shell turns it into a real base type (LIKE int8: 8-byte width).
 CREATE TYPE xfloat8 (
    input = xfloat8in,
@@ -30,6 +32,8 @@ CREATE FUNCTION xshort_in(cstring) RETURNS xshort AS 'int2in' LANGUAGE internal 
 NOTICE:  return type xshort is only a shell
 CREATE FUNCTION xshort_out(xshort) RETURNS cstring AS 'int2out' LANGUAGE internal IMMUTABLE STRICT;
 NOTICE:  argument type xshort is only a shell
+LINE 1: CREATE FUNCTION xshort_out(xshort) RETURNS cstring AS 'int2o...
+                                   ^
 CREATE TYPE xshort (input = xshort_in, output = xshort_out, like = int2);
 CREATE CAST (xshort AS int8) WITHOUT FUNCTION;
 ERROR:  source and target data types are not physically compatible
@@ -68,6 +72,8 @@ CREATE FUNCTION xc_in(cstring) RETURNS xc AS 'int8in' LANGUAGE internal IMMUTABL
 NOTICE:  return type xc is only a shell
 CREATE FUNCTION xc_out(xc) RETURNS cstring AS 'int8out' LANGUAGE internal IMMUTABLE STRICT;
 NOTICE:  argument type xc is only a shell
+LINE 1: CREATE FUNCTION xc_out(xc) RETURNS cstring AS 'int8out' LANG...
+                               ^
 CREATE TYPE xc (input = xc_in, output = xc_out, like = int8);
 CREATE CAST (xc AS int8) WITHOUT FUNCTION;
 CREATE CAST (xc AS int8) WITHOUT FUNCTION;

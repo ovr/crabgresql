@@ -34,6 +34,10 @@ pub struct Notice {
     pub code: &'static str,
     pub message: String,
     pub detail: Option<String>,
+    /// 1-based (line, column) of the token this NOTICE points at, when PG
+    /// renders a `LINE n:` cursor excerpt. Converted to a wire character offset
+    /// when the NOTICE is sent.
+    pub location: Option<(u64, u64)>,
 }
 
 impl Notice {
@@ -44,6 +48,7 @@ impl Notice {
             code,
             message: message.into(),
             detail: None,
+            location: None,
         }
     }
 
@@ -57,6 +62,7 @@ impl Notice {
             code: "00000",
             message: message.into(),
             detail,
+            location: None,
         }
     }
 }
@@ -637,7 +643,10 @@ fn map_data_type(dt: &ast::DataType) -> Result<PgType, PgError> {
 fn to_notices(notices: Vec<CatalogNotice>) -> Vec<Notice> {
     notices
         .into_iter()
-        .map(|n| Notice::notice(n.message, n.detail))
+        .map(|n| Notice {
+            location: n.position,
+            ..Notice::notice(n.message, n.detail)
+        })
         .collect()
 }
 
@@ -812,7 +821,11 @@ fn execute_create_function(
     };
     let mut args = Vec::new();
     for arg in create.args.iter().flatten() {
-        args.push(resolve_type_ref(catalog, &arg.data_type)?);
+        // An empty span (line 0) means the arg was built without source
+        // location; only parsed, bare arguments carry a caret position.
+        let start = arg.data_type_span.start;
+        let position = (start.line != 0).then_some((start.line, start.column));
+        args.push((resolve_type_ref(catalog, &arg.data_type)?, position));
     }
     let notices = catalog.create_function(&name, args, ret, &internal_name)?;
     Ok(QueryResult::Command {
