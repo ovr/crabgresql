@@ -11,7 +11,8 @@ use std::cmp::Ordering;
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, PgType, TimeTz, Value, cast, date, float, interval, net, time, timetz,
+    Inet, Interval, Numeric, PgType, TimeTz, Value, cast, date, float, interval, money, net, time,
+    timetz,
 };
 
 use crate::{ExecContext, ExecError};
@@ -189,6 +190,8 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::Uuid => uuid_of(l).cmp(uuid_of(r)),
         // inet/cidr: family, common-prefix bits, masklen, address (`network_cmp`).
         PgType::Inet | PgType::Cidr => net::network_cmp(inet_of(l), inet_of(r)),
+        // money: the natural i64 (cents) order.
+        PgType::Money => money::cmp(money_of(l), money_of(r)),
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -258,6 +261,13 @@ fn numeric(v: &Value) -> &Numeric {
     match v {
         Value::Numeric(n) => n,
         other => unreachable!("expected numeric, got {other:?}"),
+    }
+}
+
+fn money_of(v: &Value) -> i64 {
+    match v {
+        Value::Money(c) => *c,
+        other => unreachable!("expected money, got {other:?}"),
     }
 }
 

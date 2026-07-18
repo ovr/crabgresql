@@ -9,6 +9,7 @@ pub mod cast;
 pub mod date;
 pub mod float;
 pub mod interval;
+pub mod money;
 pub mod net;
 pub mod numeric;
 pub mod text;
@@ -38,6 +39,7 @@ pub mod oid {
     pub const VARCHAR: u32 = 1043;
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
+    pub const MONEY: u32 = 790;
     pub const DATE: u32 = 1082;
     pub const TIME: u32 = 1083;
     pub const TIMESTAMP: u32 = 1114;
@@ -60,6 +62,8 @@ pub enum PgType {
     Float4,
     Float8,
     Numeric,
+    /// `money` (a.k.a. `cash`): an `i64` count of hundredths. See [`crate::money`].
+    Money,
     Text,
     /// `character varying` / `varchar`. Shares the `text` value representation;
     /// a length limit is applied as a coercion, never stored on the type.
@@ -104,6 +108,7 @@ impl PgType {
             PgType::Float4 => oid::FLOAT4,
             PgType::Float8 => oid::FLOAT8,
             PgType::Numeric => oid::NUMERIC,
+            PgType::Money => oid::MONEY,
             PgType::Text => oid::TEXT,
             PgType::Varchar => oid::VARCHAR,
             PgType::Bpchar => oid::BPCHAR,
@@ -137,6 +142,7 @@ impl PgType {
             PgType::TimeTz => 12,
             PgType::Timestamp => 8,
             PgType::TimestampTz => 8,
+            PgType::Money => 8,
             PgType::Interval => 16,
             PgType::Uuid => 16,
             // `name` is a fixed 64-byte type; the rest are varlena.
@@ -163,6 +169,7 @@ impl PgType {
             PgType::Float4 => "real",
             PgType::Float8 => "double precision",
             PgType::Numeric => "numeric",
+            PgType::Money => "money",
             PgType::Text => "text",
             PgType::Varchar => "character varying",
             PgType::Bpchar => "character",
@@ -193,6 +200,7 @@ impl PgType {
             PgType::Float4 => "float4",
             PgType::Float8 => "float8",
             PgType::Numeric => "numeric",
+            PgType::Money => "money",
             PgType::Text => "text",
             PgType::Varchar => "varchar",
             PgType::Bpchar => "bpchar",
@@ -254,6 +262,8 @@ pub enum Value {
     Float4(f32),
     Float8(f64),
     Numeric(Numeric),
+    /// `money`: a signed count of hundredths (cents). See [`crate::money`].
+    Money(i64),
     Text(String),
     Bytea(Vec<u8>),
     /// A bit-string literal (`x'...'`): `len` bits packed right-aligned in
@@ -295,6 +305,7 @@ impl Value {
             Value::Float4(_) => Some(PgType::Float4),
             Value::Float8(_) => Some(PgType::Float8),
             Value::Numeric(_) => Some(PgType::Numeric),
+            Value::Money(_) => Some(PgType::Money),
             Value::Text(_) => Some(PgType::Text),
             Value::Bytea(_) => Some(PgType::Bytea),
             Value::Bit { .. } => Some(PgType::Bit),
@@ -327,6 +338,7 @@ impl Value {
             Value::Float4(v) => Some(float::fmt_f32(*v, efd)),
             Value::Float8(v) => Some(float::fmt_f64(*v, efd)),
             Value::Numeric(n) => Some(n.to_display()),
+            Value::Money(c) => Some(money::format(*c)),
             Value::Text(s) => Some(s.clone()),
             Value::Bytea(bytes) => {
                 let mut out = String::with_capacity(2 + bytes.len() * 2);

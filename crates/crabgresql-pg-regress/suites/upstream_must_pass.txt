@@ -4,3 +4,4 @@
 comments
 float4
 md5
+money

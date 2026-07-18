@@ -224,6 +224,7 @@ fn pgtype_from_oid(o: u32) -> PgType {
         oid::UUID => PgType::Uuid,
         oid::INET => PgType::Inet,
         oid::CIDR => PgType::Cidr,
+        oid::MONEY => PgType::Money,
         other => PgType::User(other),
     }
 }

@@ -5,8 +5,8 @@
 
 use crate::numeric::ParseError;
 use crate::{
-    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, parse_bool, time, timestamp,
-    timestamptz, timetz,
+    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, money, parse_bool, time,
+    timestamp, timestamptz, timetz,
 };
 
 /// SQLSTATE + message for a failed cast.
@@ -288,8 +288,56 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- cidr → inet (implicit in PG; the network keeps its masklen) ----
         (Value::Cidr(v), PgType::Inet) => Ok(Value::Inet(*v)),
 
+        // ---- text → money (cash_in): $, thousands, parentheses-as-negative ----
+        (Value::Text(s), PgType::Money) => money::parse(s)
+            .map(Value::Money)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- int4/int8/numeric → money (whole units scaled to hundredths) ----
+        // PG has no int2 → money cast; int2 literals reach money after widening
+        // to int4, so that arm falls through to `cannot_coerce`.
+        (Value::Int4(n), PgType::Money) => (*n as i64)
+            .checked_mul(100)
+            .map(Value::Money)
+            .ok_or_else(|| out_of_range(PgType::Money)),
+        (Value::Int8(n), PgType::Money) => n
+            .checked_mul(100)
+            .map(Value::Money)
+            .ok_or_else(|| out_of_range(PgType::Money)),
+        (Value::Numeric(n), PgType::Money) => numeric_to_money(n),
+
+        // ---- money → numeric (always two fractional digits) ----
+        (Value::Money(c), PgType::Numeric) => Ok(Value::Numeric(money_to_numeric(*c))),
+
         _ => Err(cannot_coerce(from, to)),
     }
+}
+
+/// `numeric_cash`: scale a numeric by 100, round to the nearest cent (half away
+/// from zero, like `numeric`'s round), and range-check into `i64` money.
+/// NaN/±infinity have no money image (`cannot convert ... to money`, 0A000), as
+/// with the numeric→integer casts.
+fn numeric_to_money(n: &Numeric) -> Result<Value, CastError> {
+    if n.is_nan() {
+        return Err(cannot_convert("NaN", PgType::Money));
+    }
+    if n.is_infinite() {
+        return Err(cannot_convert("infinity", PgType::Money));
+    }
+    let cents = n
+        .mul(&Numeric::from_i128(100))
+        .round(0)
+        .to_i128()
+        .ok_or_else(|| out_of_range(PgType::Money))?;
+    i64::try_from(cents).map(Value::Money).map_err(|_| out_of_range(PgType::Money))
+}
+
+/// `cash_numeric`: exact value `cents / 100` rendered with display scale 2
+/// (built from text so the scale is always two, e.g. `123.00`).
+fn money_to_numeric(cents: i64) -> Numeric {
+    let mag = (cents as i128).unsigned_abs();
+    let s = format!("{}{}.{:02}", if cents < 0 { "-" } else { "" }, mag / 100, mag % 100);
+    Numeric::parse(&s).expect("money renders to a valid numeric")
 }
 
 /// `byteain`: parse PG's bytea input syntax into raw bytes. A leading `\x`
