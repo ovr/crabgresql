@@ -9,6 +9,7 @@ pub mod cast;
 pub mod date;
 pub mod float;
 pub mod interval;
+pub mod net;
 pub mod numeric;
 pub mod text;
 pub mod time;
@@ -17,8 +18,10 @@ pub mod timestamptz;
 pub mod timetz;
 pub mod to_char;
 pub mod tz;
+pub mod uuid;
 
 pub use interval::Interval;
+pub use net::Inet;
 pub use timetz::TimeTz;
 
 /// OIDs of built-in types. Must match PostgreSQL's `pg_type.dat` — drivers
@@ -43,6 +46,9 @@ pub mod oid {
     pub const TIMETZ: u32 = 1266;
     pub const BIT: u32 = 1560;
     pub const NUMERIC: u32 = 1700;
+    pub const CIDR: u32 = 650;
+    pub const INET: u32 = 869;
+    pub const UUID: u32 = 2950;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +83,12 @@ pub enum PgType {
     TimestampTz,
     /// `interval`.
     Interval,
+    /// `uuid`: 16 raw bytes. See [`crate::uuid`].
+    Uuid,
+    /// `inet`: an IPv4/IPv6 host or network address. See [`crate::net`].
+    Inet,
+    /// `cidr`: an IPv4/IPv6 network specification. See [`crate::net`].
+    Cidr,
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -104,6 +116,9 @@ impl PgType {
             PgType::Timestamp => oid::TIMESTAMP,
             PgType::TimestampTz => oid::TIMESTAMPTZ,
             PgType::Interval => oid::INTERVAL,
+            PgType::Uuid => oid::UUID,
+            PgType::Inet => oid::INET,
+            PgType::Cidr => oid::CIDR,
             PgType::User(oid) => oid,
         }
     }
@@ -123,6 +138,7 @@ impl PgType {
             PgType::Timestamp => 8,
             PgType::TimestampTz => 8,
             PgType::Interval => 16,
+            PgType::Uuid => 16,
             // `name` is a fixed 64-byte type; the rest are varlena.
             PgType::Name => 64,
             PgType::Numeric
@@ -130,7 +146,9 @@ impl PgType {
             | PgType::Varchar
             | PgType::Bpchar
             | PgType::Bytea
-            | PgType::Bit => -1,
+            | PgType::Bit
+            | PgType::Inet
+            | PgType::Cidr => -1,
             PgType::User(_) => -1,
         }
     }
@@ -157,6 +175,9 @@ impl PgType {
             PgType::Timestamp => "timestamp without time zone",
             PgType::TimestampTz => "timestamp with time zone",
             PgType::Interval => "interval",
+            PgType::Uuid => "uuid",
+            PgType::Inet => "inet",
+            PgType::Cidr => "cidr",
             PgType::User(_) => "user-defined",
         }
     }
@@ -184,6 +205,9 @@ impl PgType {
             PgType::Timestamp => "timestamp",
             PgType::TimestampTz => "timestamptz",
             PgType::Interval => "interval",
+            PgType::Uuid => "uuid",
+            PgType::Inet => "inet",
+            PgType::Cidr => "cidr",
             PgType::User(_) => "user-defined",
         }
     }
@@ -252,6 +276,12 @@ pub enum Value {
     TimestampTz(i64),
     /// `interval`: PG's `{ months, days, usec }` split. See [`crate::interval`].
     Interval(Interval),
+    /// `uuid`: 16 raw bytes in network order. See [`crate::uuid`].
+    Uuid([u8; 16]),
+    /// `inet`: an IPv4/IPv6 host or network address. See [`crate::net`].
+    Inet(Inet),
+    /// `cidr`: an IPv4/IPv6 network specification. See [`crate::net`].
+    Cidr(Inet),
 }
 
 impl Value {
@@ -274,6 +304,9 @@ impl Value {
             Value::Timestamp(_) => Some(PgType::Timestamp),
             Value::TimestampTz(_) => Some(PgType::TimestampTz),
             Value::Interval(_) => Some(PgType::Interval),
+            Value::Uuid(_) => Some(PgType::Uuid),
+            Value::Inet(_) => Some(PgType::Inet),
+            Value::Cidr(_) => Some(PgType::Cidr),
         }
     }
 
@@ -312,6 +345,9 @@ impl Value {
             Value::Timestamp(micros) => Some(timestamp::format(*micros)),
             Value::TimestampTz(micros) => Some(timestamptz::format(*micros)),
             Value::Interval(iv) => Some(interval::format(*iv)),
+            Value::Uuid(b) => Some(uuid::format(b)),
+            Value::Inet(v) => Some(net::inet_out(v)),
+            Value::Cidr(v) => Some(net::cidr_out(v)),
         }
     }
 }
