@@ -139,8 +139,10 @@ fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, BindError
     }
 }
 
-/// Resolve a `FROM`/`UPDATE`/`DELETE` target: the table plus the qualifier
-/// its columns may be addressed by (the alias when present, as in PG).
+/// Resolve an `UPDATE`/`DELETE` target: the table plus the qualifier its
+/// columns may be addressed by (the alias when present, as in PG). A column-list
+/// alias is rejected here — it is meaningful only for `FROM` items, which bind
+/// through [`bind_from_item`] instead.
 fn open_relation(
     engine: &Arc<dyn TableEngine>,
     relation: &ast::TableFactor,
@@ -477,8 +479,8 @@ fn bind_from_item(
             let fname = object_name_to_table_name(name)?;
             let arg_exprs = positional_arg_exprs(&fn_args.args)?;
             let (func, args) = bind_table_fn_call(&fname, &arg_exprs, &Scope::empty(catalog))?;
-            let qualifier = aliased_qualifier(alias, fname)?;
-            let columns = func
+            let qualifier = relation_qualifier(alias, &fname);
+            let mut columns: Vec<OutputColumn> = func
                 .columns()
                 .into_iter()
                 .map(|c| OutputColumn {
@@ -486,6 +488,7 @@ fn bind_from_item(
                     ty: c.ty,
                 })
                 .collect();
+            apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
             Ok(BoundFromItem {
                 qualifier,
                 columns,
@@ -510,8 +513,9 @@ fn bind_from_item(
                     input: JoinInput::Subplan(Box::new(cte.plan.clone())),
                 });
             }
-            let (table, qualifier) = open_relation(engine, relation)?;
-            let columns = table
+            let table = engine.open_table(&tname)?;
+            let qualifier = relation_qualifier(alias, &tname);
+            let mut columns: Vec<OutputColumn> = table
                 .schema()
                 .columns
                 .iter()
@@ -520,6 +524,7 @@ fn bind_from_item(
                     ty: c.ty,
                 })
                 .collect();
+            apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
             Ok(BoundFromItem {
                 qualifier,
                 columns,
@@ -551,9 +556,9 @@ fn bind_from_item(
     }
 }
 
-/// The qualifier for a base-table-shaped FROM item (base table or SRF): its
-/// alias when present, else `default`. A column-list alias (`f(a, b)`) is not
-/// supported on these items.
+/// The qualifier for an `UPDATE`/`DELETE` target relation: its alias when
+/// present, else `default`. A column-list alias (`f(a, b)`) is not valid on a
+/// modify target (only on `FROM` items), so it is rejected here.
 fn aliased_qualifier(
     alias: &Option<ast::TableAlias>,
     default: String,
@@ -562,8 +567,8 @@ fn aliased_qualifier(
         None => Ok(default),
         Some(alias) => {
             if !alias.columns.is_empty() {
-                return Err(BindError::feature_not_supported(
-                    "column aliases in FROM are not supported yet",
+                return Err(BindError::syntax(
+                    "column aliases are not allowed on an UPDATE/DELETE target",
                 ));
             }
             Ok(normalize_ident(&alias.name))
@@ -720,10 +725,11 @@ fn apply_relation_alias_columns(
     }
 }
 
-/// Rename a rowset's columns from an alias column list (`t(a, b, c)`); the count
-/// must match, and per-column type annotations are not supported. `subject` is
-/// the relation phrasing PG uses in the column-count error (see [`table_subject`]
-/// / [`with_query_subject`]).
+/// Rename a rowset's columns from an alias column list (`t(a, b, c)`). As in PG,
+/// the list may be shorter than the rowset — the leading columns are renamed and
+/// the rest keep their names — but a longer list is an error. Per-column type
+/// annotations are not supported. `subject` is the relation phrasing PG uses in
+/// the column-count error (see [`table_subject`] / [`with_query_subject`]).
 fn apply_alias_columns(
     columns: &mut [OutputColumn],
     alias_columns: &[ast::TableAliasColumnDef],
@@ -737,7 +743,10 @@ fn apply_alias_columns(
             "column type annotations in a table alias are not supported yet",
         ));
     }
-    if alias_columns.len() != columns.len() {
+    // PG allows fewer aliases than columns — the leading columns are renamed and
+    // the rest keep their original names — but rejects an alias list that is
+    // *longer* than the rowset.
+    if alias_columns.len() > columns.len() {
         // Matches PG's ERRCODE_INVALID_COLUMN_REFERENCE (42P10) and wording, e.g.
         // `table "v" has 1 columns available but 2 columns specified`.
         return Err(BindError::new(

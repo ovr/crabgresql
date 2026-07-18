@@ -27,3 +27,12 @@ SELECT t1.nope FROM t1, t2;
 SELECT x FROM (VALUES (1, 2)) v(x, x);
 -- the same qualifier twice is rejected
 SELECT * FROM t1, t1;
+-- a column-list alias renames a base table's columns positionally
+SELECT c1, c2 FROM t1 AS r(c1, c2) ORDER BY c1;
+-- fewer aliases than columns rename only the leading columns; the rest keep
+-- their original names
+SELECT * FROM t1 AS r(c1) ORDER BY 1;
+-- the renamed columns drive WHERE and the projection
+SELECT c2 FROM t1 AS r(c1, c2) WHERE c1 = 2;
+-- more column aliases than the table has columns is an error
+SELECT * FROM t1 AS r(a, b, c);
