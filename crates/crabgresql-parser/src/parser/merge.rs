@@ -20,7 +20,7 @@ use crate::{
         Merge, MergeAction, MergeClause, MergeClauseKind, MergeInsertExpr, MergeInsertKind,
         MergeUpdateExpr, ObjectName, OutputClause, SetExpr,
     },
-    dialect::{BigQueryDialect, GenericDialect, MySqlDialect},
+    dialect::GenericDialect,
     keywords::Keyword,
     parser::IsOptional,
     tokenizer::TokenWithSpan,
@@ -167,10 +167,10 @@ impl Parser<'_> {
                     };
 
                     let insert_token = self.get_current_token().clone();
-                    let is_mysql = dialect_of!(self is MySqlDialect);
+                    let is_mysql = false;
 
                     let columns = self.parse_merge_clause_insert_columns(is_mysql)?;
-                    let (kind, kind_token) = if dialect_of!(self is BigQueryDialect | GenericDialect)
+                    let (kind, kind_token) = if dialect_of!(self is GenericDialect)
                         && self.parse_keyword(Keyword::ROW)
                     {
                         (MergeInsertKind::Row, self.get_current_token().clone())

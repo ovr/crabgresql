@@ -472,9 +472,7 @@ pub enum DataType {
     ///
     /// [ClickHouse]: https://clickhouse.com/docs/en/sql-reference/data-types/lowcardinality
     LowCardinality(Box<DataType>),
-    /// No type specified - only used with
-    /// [`SQLiteDialect`](crate::dialect::SQLiteDialect), from statements such
-    /// as `CREATE TABLE t1 (a)`.
+    /// No type specified, from statements such as `CREATE TABLE t1 (a)`.
     Unspecified,
     /// Trigger data type, returned by functions associated with triggers, see [PostgreSQL].
     ///

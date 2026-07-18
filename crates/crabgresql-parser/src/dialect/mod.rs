@@ -15,22 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod ansi;
-mod bigquery;
-mod clickhouse;
-mod databricks;
-mod duckdb;
 mod generic;
-mod hive;
-mod mssql;
-mod mysql;
-mod oracle;
 mod postgresql;
-mod redshift;
-mod snowflake;
-mod spark;
-mod sqlite;
-mod teradata;
 
 use core::any::{Any, TypeId};
 use core::fmt::Debug;
@@ -39,23 +25,8 @@ use core::str::Chars;
 
 use log::debug;
 
-pub use self::ansi::AnsiDialect;
-pub use self::bigquery::BigQueryDialect;
-pub use self::clickhouse::ClickHouseDialect;
-pub use self::databricks::DatabricksDialect;
-pub use self::duckdb::DuckDbDialect;
 pub use self::generic::GenericDialect;
-pub use self::hive::HiveDialect;
-pub use self::mssql::MsSqlDialect;
-pub use self::mysql::MySqlDialect;
-pub use self::oracle::OracleDialect;
 pub use self::postgresql::PostgreSqlDialect;
-pub use self::redshift::RedshiftSqlDialect;
-pub use self::snowflake::parse_snowflake_stage_name;
-pub use self::snowflake::SnowflakeDialect;
-pub use self::spark::SparkSqlDialect;
-pub use self::sqlite::SQLiteDialect;
-pub use self::teradata::TeradataDialect;
 
 /// Macro for streamlining the creation of derived `Dialect` objects.
 /// The generated struct includes `new()` and `default()` constructors.
@@ -150,7 +121,7 @@ use alloc::boxed::Box;
 /// 1. user defined [`Dialect`]s can customize the parsing behavior
 /// 2. The differences between dialects can be clearly documented in the trait
 ///
-/// `dialect_of!(parser is SQLiteDialect | GenericDialect)` evaluates
+/// `dialect_of!(parser is PostgreSqlDialect | GenericDialect)` evaluates
 /// to `true` if `parser.dialect` is one of the [`Dialect`]s specified.
 macro_rules! dialect_of {
     ( $parsed_dialect: ident is $($dialect_type: ty)|+ ) => {
@@ -176,28 +147,26 @@ macro_rules! dialect_is {
 /// encapsulates the parsing differences between dialects.
 ///
 /// [`GenericDialect`] is the most permissive dialect, and parses the union of
-/// all the other dialects, when there is no ambiguity. However, it does not
-/// currently allow `CREATE TABLE` statements without types specified for all
-/// columns; use [`SQLiteDialect`] if you require that.
+/// all the other dialects, when there is no ambiguity.
 ///
 /// # Examples
 /// Most users create a [`Dialect`] directly, as shown on the [module
 /// level documentation]:
 ///
 /// ```
-/// # use sqlparser::dialect::AnsiDialect;
-/// let dialect = AnsiDialect {};
+/// # use sqlparser::dialect::PostgreSqlDialect;
+/// let dialect = PostgreSqlDialect {};
 /// ```
 ///
 /// It is also possible to dynamically create a [`Dialect`] from its
 /// name. For example:
 ///
 /// ```
-/// # use sqlparser::dialect::{AnsiDialect, dialect_from_str};
-/// let dialect = dialect_from_str("ansi").unwrap();
+/// # use sqlparser::dialect::{PostgreSqlDialect, dialect_from_str};
+/// let dialect = dialect_from_str("postgresql").unwrap();
 ///
-/// // Parsed dialect is an instance of `AnsiDialect`:
-/// assert!(dialect.is::<AnsiDialect>());
+/// // Parsed dialect is an instance of `PostgreSqlDialect`:
+/// assert!(dialect.is::<PostgreSqlDialect>());
 /// ```
 ///
 /// [module level documentation]: crate
@@ -1846,21 +1815,7 @@ pub fn dialect_from_str(dialect_name: impl AsRef<str>) -> Option<Box<dyn Dialect
     let dialect_name = dialect_name.as_ref();
     match dialect_name.to_lowercase().as_str() {
         "generic" => Some(Box::new(GenericDialect)),
-        "mysql" => Some(Box::new(MySqlDialect {})),
         "postgresql" | "postgres" => Some(Box::new(PostgreSqlDialect {})),
-        "hive" => Some(Box::new(HiveDialect {})),
-        "sqlite" => Some(Box::new(SQLiteDialect {})),
-        "snowflake" => Some(Box::new(SnowflakeDialect)),
-        "redshift" => Some(Box::new(RedshiftSqlDialect {})),
-        "mssql" => Some(Box::new(MsSqlDialect {})),
-        "clickhouse" => Some(Box::new(ClickHouseDialect {})),
-        "bigquery" => Some(Box::new(BigQueryDialect)),
-        "ansi" => Some(Box::new(AnsiDialect {})),
-        "duckdb" => Some(Box::new(DuckDbDialect {})),
-        "databricks" => Some(Box::new(DatabricksDialect {})),
-        "spark" | "sparksql" => Some(Box::new(SparkSqlDialect {})),
-        "oracle" => Some(Box::new(OracleDialect {})),
-        "teradata" => Some(Box::new(TeradataDialect {})),
         _ => None,
     }
 }
@@ -1876,49 +1831,32 @@ mod tests {
     #[test]
     fn test_is_dialect() {
         let generic_dialect: &dyn Dialect = &GenericDialect {};
-        let ansi_dialect: &dyn Dialect = &AnsiDialect {};
+        let postgresql_dialect: &dyn Dialect = &PostgreSqlDialect {};
 
         let generic_holder = DialectHolder {
             dialect: generic_dialect,
         };
-        let ansi_holder = DialectHolder {
-            dialect: ansi_dialect,
+        let postgresql_holder = DialectHolder {
+            dialect: postgresql_dialect,
         };
 
-        assert!(dialect_of!(generic_holder is GenericDialect |  AnsiDialect),);
-        assert!(!dialect_of!(generic_holder is  AnsiDialect));
-        assert!(dialect_of!(ansi_holder is AnsiDialect));
-        assert!(dialect_of!(ansi_holder is GenericDialect | AnsiDialect));
-        assert!(!dialect_of!(ansi_holder is GenericDialect | MsSqlDialect));
+        assert!(dialect_of!(generic_holder is GenericDialect |  PostgreSqlDialect),);
+        assert!(!dialect_of!(generic_holder is  PostgreSqlDialect));
+        assert!(dialect_of!(postgresql_holder is PostgreSqlDialect));
+        assert!(dialect_of!(postgresql_holder is GenericDialect | PostgreSqlDialect));
+        assert!(!dialect_of!(postgresql_holder is GenericDialect));
     }
 
     #[test]
     fn test_dialect_from_str() {
         assert!(parse_dialect("generic").is::<GenericDialect>());
-        assert!(parse_dialect("mysql").is::<MySqlDialect>());
-        assert!(parse_dialect("MySql").is::<MySqlDialect>());
         assert!(parse_dialect("postgresql").is::<PostgreSqlDialect>());
         assert!(parse_dialect("postgres").is::<PostgreSqlDialect>());
-        assert!(parse_dialect("hive").is::<HiveDialect>());
-        assert!(parse_dialect("sqlite").is::<SQLiteDialect>());
-        assert!(parse_dialect("snowflake").is::<SnowflakeDialect>());
-        assert!(parse_dialect("SnowFlake").is::<SnowflakeDialect>());
-        assert!(parse_dialect("MsSql").is::<MsSqlDialect>());
-        assert!(parse_dialect("clickhouse").is::<ClickHouseDialect>());
-        assert!(parse_dialect("ClickHouse").is::<ClickHouseDialect>());
-        assert!(parse_dialect("bigquery").is::<BigQueryDialect>());
-        assert!(parse_dialect("BigQuery").is::<BigQueryDialect>());
-        assert!(parse_dialect("ansi").is::<AnsiDialect>());
-        assert!(parse_dialect("ANSI").is::<AnsiDialect>());
-        assert!(parse_dialect("duckdb").is::<DuckDbDialect>());
-        assert!(parse_dialect("DuckDb").is::<DuckDbDialect>());
-        assert!(parse_dialect("DataBricks").is::<DatabricksDialect>());
-        assert!(parse_dialect("databricks").is::<DatabricksDialect>());
-        assert!(parse_dialect("teradata").is::<TeradataDialect>());
-        assert!(parse_dialect("Teradata").is::<TeradataDialect>());
+        assert!(parse_dialect("PostgreSQL").is::<PostgreSqlDialect>());
 
         // error cases
         assert!(dialect_from_str("Unknown").is_none());
+        assert!(dialect_from_str("mysql").is_none());
         assert!(dialect_from_str("").is_none());
     }
 
@@ -1951,7 +1889,6 @@ mod tests {
     fn identifier_quote_style() {
         let tests: Vec<(&dyn Dialect, &str, Option<char>)> = vec![
             (&GenericDialect {}, "id", None),
-            (&SQLiteDialect {}, "id", Some('`')),
             (&PostgreSqlDialect {}, "id", Some('"')),
         ];
 
@@ -1968,7 +1905,7 @@ mod tests {
         /// would tweak the behavior of the dialect. For the test case,
         /// it wraps all methods unaltered.
         #[derive(Debug)]
-        struct WrappedDialect(MySqlDialect);
+        struct WrappedDialect(PostgreSqlDialect);
 
         impl Dialect for WrappedDialect {
             fn dialect(&self) -> std::any::TypeId {
@@ -2057,10 +1994,9 @@ mod tests {
             }
         }
 
-        #[allow(clippy::needless_raw_string_hashes)]
-        let statement = r#"SELECT 'Wayne\'s World'"#;
-        let res1 = Parser::parse_sql(&MySqlDialect {}, statement);
-        let res2 = Parser::parse_sql(&WrappedDialect(MySqlDialect {}), statement);
+        let statement = r#"SELECT 'Wayne''s World'"#;
+        let res1 = Parser::parse_sql(&PostgreSqlDialect {}, statement);
+        let res2 = Parser::parse_sql(&WrappedDialect(PostgreSqlDialect {}), statement);
         assert!(res1.is_ok());
         assert_eq!(res1, res2);
     }
