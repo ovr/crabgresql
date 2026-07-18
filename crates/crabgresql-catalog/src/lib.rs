@@ -1,4 +1,5 @@
-//! `pg_catalog` system catalogs, served as read-only relations.
+//! `pg_catalog` and `information_schema` system catalogs, served as read-only
+//! relations.
 //!
 //! The core seam: a bound `SELECT` lowers to a scan over an `Arc<dyn TableAm>`,
 //! and the executor treats every access method alike. So each supported
@@ -77,10 +78,37 @@ pub struct PgCastRow {
 include!(concat!(env!("OUT_DIR"), "/pg_type_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 
-/// Produces the live user relations to reflect into `pg_class`/`pg_attribute`.
+/// A live relation exposed through the system catalogs.
+#[derive(Clone, Debug)]
+pub struct CatalogRelation {
+    pub schema: TableSchema,
+    pub namespace: String,
+    pub temporary: bool,
+}
+
+impl CatalogRelation {
+    pub fn permanent(schema: TableSchema) -> Self {
+        Self {
+            schema,
+            namespace: "public".to_string(),
+            temporary: false,
+        }
+    }
+
+    pub fn temporary(schema: TableSchema, namespace: impl Into<String>) -> Self {
+        Self {
+            schema,
+            namespace: namespace.into(),
+            temporary: true,
+        }
+    }
+}
+
+/// Produces the live user relations to reflect into `pg_class`/`pg_attribute`
+/// and `information_schema`.
 /// Boxed so it can capture the server engines and run lazily — only a query that
 /// actually opens `pg_class`/`pg_attribute` pays the cost of enumerating them.
-type RelationsFn = Box<dyn Fn() -> Vec<TableSchema> + Send + Sync>;
+type RelationsFn = Box<dyn Fn() -> Vec<CatalogRelation> + Send + Sync>;
 
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so
 /// its rows reflect current server state; live user relations are supplied by a
@@ -88,6 +116,9 @@ type RelationsFn = Box<dyn Fn() -> Vec<TableSchema> + Send + Sync>;
 /// is opened), memoized in `oids`.
 pub struct SystemCatalog {
     relations: RelationsFn,
+    database: String,
+    owner: String,
+    live_relations: OnceLock<Vec<CatalogRelation>>,
     oids: OnceLock<Vec<(u32, TableSchema)>>,
 }
 
@@ -112,7 +143,29 @@ impl SystemCatalog {
     /// A catalog that enumerates its live user relations lazily via `f` (invoked
     /// at most once, only if a relation-backed catalog is opened).
     pub fn with_relations_fn(f: impl Fn() -> Vec<TableSchema> + Send + Sync + 'static) -> Self {
-        Self { relations: Box::new(f), oids: OnceLock::new() }
+        Self::with_catalog_relations_fn("postgres", "postgres", move || {
+            f().into_iter().map(CatalogRelation::permanent).collect()
+        })
+    }
+
+    /// A catalog with session identity and live relation metadata for the
+    /// information schema. The callback is memoized per catalog snapshot.
+    pub fn with_catalog_relations_fn(
+        database: impl Into<String>,
+        owner: impl Into<String>,
+        f: impl Fn() -> Vec<CatalogRelation> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            relations: Box::new(f),
+            database: database.into(),
+            owner: owner.into(),
+            live_relations: OnceLock::new(),
+            oids: OnceLock::new(),
+        }
+    }
+
+    fn live_relations(&self) -> &[CatalogRelation] {
+        self.live_relations.get_or_init(|| (self.relations)())
     }
 
     /// Assign a stable synthetic OID to each user relation, computed once and
@@ -121,23 +174,28 @@ impl SystemCatalog {
     /// join consistent.
     fn relation_oids(&self) -> &[(u32, TableSchema)] {
         self.oids.get_or_init(|| {
-            let mut rels = (self.relations)();
-            rels.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
             rels.into_iter()
                 .enumerate()
-                .map(|(i, s)| (FIRST_REL_OID + i as u32, s))
+                .map(|(i, r)| (FIRST_REL_OID + i as u32, r.schema))
                 .collect()
         })
     }
 
     /// Build the requested relation's rows + schema, or `None` if unknown.
-    fn build(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
+    fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         match name {
             "pg_type" => Some((schema::pg_type_schema(), schema::pg_type_builtin_rows())),
             "pg_namespace" => Some((schema::pg_namespace_schema(), schema::pg_namespace_rows())),
-            "pg_class" => {
-                Some((schema::pg_class_schema(), schema::pg_class_rows(self.relation_oids())))
-            }
+            "pg_class" => Some((
+                schema::pg_class_schema(),
+                schema::pg_class_rows(self.relation_oids()),
+            )),
             "pg_attribute" => Some((
                 schema::pg_attribute_schema(),
                 schema::pg_attribute_rows(self.relation_oids()),
@@ -146,16 +204,57 @@ impl SystemCatalog {
             _ => None,
         }
     }
+
+    fn build_information_schema(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
+        match name {
+            "schemata" => Some((
+                schema::information_schema_schemata_schema(),
+                schema::information_schema_schemata_rows(
+                    &self.database,
+                    &self.owner,
+                    self.live_relations(),
+                ),
+            )),
+            "tables" => Some((
+                schema::information_schema_tables_schema(),
+                schema::information_schema_tables_rows(&self.database, self.live_relations()),
+            )),
+            "columns" => Some((
+                schema::information_schema_columns_schema(),
+                schema::information_schema_columns_rows(&self.database, self.live_relations()),
+            )),
+            _ => None,
+        }
+    }
 }
 
 impl TableEngine for SystemCatalog {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
         // The session catalog never routes CREATE here (DDL targets user data).
-        unreachable!("cannot create relation \"{}\" in the system catalog", schema.name)
+        unreachable!(
+            "cannot create relation \"{}\" in the system catalog",
+            schema.name
+        )
     }
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
-        match self.build(name) {
+        match self.build_pg_catalog(name) {
+            Some((schema, rows)) => Ok(StaticTable::arc(schema, rows)),
+            None => Err(StorageError::TableNotFound(name.to_string())),
+        }
+    }
+
+    fn resolve(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Arc<dyn TableAm>, StorageError> {
+        let relation = match namespace {
+            None | Some("pg_catalog") => self.build_pg_catalog(name),
+            Some("information_schema") => self.build_information_schema(name),
+            Some(_) => None,
+        };
+        match relation {
             Some((schema, rows)) => Ok(StaticTable::arc(schema, rows)),
             None => Err(StorageError::TableNotFound(name.to_string())),
         }
@@ -194,7 +293,10 @@ mod tests {
         assert_eq!(type_col(&by_name("text"), &schema, "oid"), Value::Oid(25));
         assert_eq!(type_col(&by_name("bool"), &schema, "oid"), Value::Oid(16));
         // Metadata columns carry through from pg_type.dat.
-        assert_eq!(type_col(&by_name("int4"), &schema, "typlen"), Value::Int2(4));
+        assert_eq!(
+            type_col(&by_name("int4"), &schema, "typlen"),
+            Value::Int2(4)
+        );
         assert_eq!(
             type_col(&by_name("bool"), &schema, "typinput"),
             Value::Text("boolin".to_string())
@@ -224,7 +326,7 @@ mod tests {
         let cat = SystemCatalog::with_relations(rels);
 
         let class_schema = schema::pg_class_schema();
-        let class = cat.build("pg_class").unwrap().1;
+        let class = cat.build_pg_catalog("pg_class").unwrap().1;
         let oid_of = |relname: &str| {
             let i = class_schema.column_index("relname").unwrap();
             let o = class_schema.column_index("oid").unwrap();
@@ -240,7 +342,7 @@ mod tests {
 
         // pg_attribute's attrelid must match pg_class.oid for the same relation.
         let attr_schema = schema::pg_attribute_schema();
-        let attr = cat.build("pg_attribute").unwrap().1;
+        let attr = cat.build_pg_catalog("pg_attribute").unwrap().1;
         let arel = attr_schema.column_index("attrelid").unwrap();
         let aname = attr_schema.column_index("attname").unwrap();
         let anum = attr_schema.column_index("attnum").unwrap();
@@ -293,7 +395,11 @@ mod tests {
                 .find(|r| r.typname == typname)
                 .unwrap_or_else(|| panic!("pg_type.dat has a row for {typname}"));
             assert_eq!(row.oid, ty.oid(), "{typname} oid drift (.dat vs PgType)");
-            assert_eq!(row.typlen, ty.typlen(), "{typname} typlen drift (.dat vs PgType)");
+            assert_eq!(
+                row.typlen,
+                ty.typlen(),
+                "{typname} typlen drift (.dat vs PgType)"
+            );
         }
     }
 
@@ -311,7 +417,10 @@ mod tests {
             .expect("int4->int8 cast present");
         assert_eq!(int4_to_int8[ctx], Value::Text("i".to_string()));
         // Every emitted cast references exposed types (nonzero, resolved OIDs).
-        assert!(rows.iter().all(|r| r[src] != Value::Oid(0) && r[tgt] != Value::Oid(0)));
+        assert!(
+            rows.iter()
+                .all(|r| r[src] != Value::Oid(0) && r[tgt] != Value::Oid(0))
+        );
     }
 
     #[test]
@@ -324,5 +433,86 @@ mod tests {
             cat.open_table("pg_nonexistent"),
             Err(StorageError::TableNotFound(_))
         ));
+    }
+
+    #[test]
+    fn information_schema_reflects_relation_metadata() {
+        use crabgresql_storage_api::{Column, TableSchema};
+        use crabgresql_types::PgType;
+
+        let cat = SystemCatalog::with_catalog_relations_fn("appdb", "appuser", || {
+            vec![
+                CatalogRelation::permanent(TableSchema {
+                    name: "widgets".to_string(),
+                    columns: vec![
+                        Column::new("id", PgType::Int4),
+                        Column::with_typmod("label", PgType::Varchar, 12),
+                    ],
+                }),
+                CatalogRelation::temporary(
+                    TableSchema {
+                        name: "scratch".to_string(),
+                        columns: vec![Column::new("created_at", PgType::TimestampTz)],
+                    },
+                    "pg_temp_42",
+                ),
+            ]
+        });
+
+        let (tables_schema, tables) = cat.build_information_schema("tables").unwrap();
+        assert_eq!(tables_schema.columns.len(), 12);
+        let catalog = tables_schema.column_index("table_catalog").unwrap();
+        let namespace = tables_schema.column_index("table_schema").unwrap();
+        let name = tables_schema.column_index("table_name").unwrap();
+        let kind = tables_schema.column_index("table_type").unwrap();
+        assert!(tables.iter().any(|row| {
+            row[catalog] == Value::Text("appdb".to_string())
+                && row[namespace] == Value::Text("public".to_string())
+                && row[name] == Value::Text("widgets".to_string())
+                && row[kind] == Value::Text("BASE TABLE".to_string())
+        }));
+        assert!(tables.iter().any(|row| {
+            row[namespace] == Value::Text("pg_temp_42".to_string())
+                && row[name] == Value::Text("scratch".to_string())
+                && row[kind] == Value::Text("LOCAL TEMPORARY".to_string())
+        }));
+
+        let (columns_schema, columns) = cat.build_information_schema("columns").unwrap();
+        assert_eq!(columns_schema.columns.len(), 44);
+        assert!(
+            columns
+                .iter()
+                .all(|row| row.len() == columns_schema.columns.len())
+        );
+        let table_name = columns_schema.column_index("table_name").unwrap();
+        let column_name = columns_schema.column_index("column_name").unwrap();
+        let ordinal = columns_schema.column_index("ordinal_position").unwrap();
+        let data_type = columns_schema.column_index("data_type").unwrap();
+        let char_length = columns_schema
+            .column_index("character_maximum_length")
+            .unwrap();
+        let udt_schema = columns_schema.column_index("udt_schema").unwrap();
+        let is_generated = columns_schema.column_index("is_generated").unwrap();
+        let label = columns
+            .iter()
+            .find(|row| {
+                row[table_name] == Value::Text("widgets".to_string())
+                    && row[column_name] == Value::Text("label".to_string())
+            })
+            .unwrap();
+        assert_eq!(label[ordinal], Value::Int4(2));
+        assert_eq!(
+            label[data_type],
+            Value::Text("character varying".to_string())
+        );
+        assert_eq!(label[char_length], Value::Int4(12));
+        assert_eq!(label[udt_schema], Value::Text("pg_catalog".to_string()));
+        assert_eq!(label[is_generated], Value::Text("NEVER".to_string()));
+
+        let (_, schemata) = cat.build_information_schema("schemata").unwrap();
+        assert!(schemata.iter().any(|row| {
+            row[1] == Value::Text("pg_temp_42".to_string())
+                && row[2] == Value::Text("appuser".to_string())
+        }));
     }
 }

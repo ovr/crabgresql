@@ -1,6 +1,7 @@
 //! Per-statement name resolution overlay: a session's temp catalog shadows the
 //! shared global engine (PG's `pg_temp`-first search), and the read-only system
-//! catalog (`pg_catalog`) sits behind both on the search path.
+//! catalogs (`pg_catalog` and schema-qualified `information_schema`) sit behind
+//! both on the search path.
 
 use std::sync::Arc;
 
@@ -9,12 +10,13 @@ use crabgresql_storage_api::{StorageError, TableAm, TableEngine, TableSchema};
 /// Resolves relations against a session-local temp store first, then the shared
 /// global engine, then the read-only system catalog — so a `CREATE TEMP TABLE t`
 /// hides a permanent `t`, and `pg_catalog` relations (`pg_type`, …) resolve when
-/// nothing user-defined shadows them. Holds three cheap `Arc` clones; build one
-/// per statement.
+/// nothing user-defined shadows them. `information_schema` is available only
+/// when schema-qualified. Holds three cheap `Arc` clones; build one per statement.
 pub struct SessionCatalog {
     temp: Arc<dyn TableEngine>,
     global: Arc<dyn TableEngine>,
     system: Arc<dyn TableEngine>,
+    temp_schema: String,
 }
 
 impl SessionCatalog {
@@ -22,8 +24,14 @@ impl SessionCatalog {
         temp: Arc<dyn TableEngine>,
         global: Arc<dyn TableEngine>,
         system: Arc<dyn TableEngine>,
+        temp_schema: impl Into<String>,
     ) -> Self {
-        Self { temp, global, system }
+        Self {
+            temp,
+            global,
+            system,
+            temp_schema: temp_schema.into(),
+        }
     }
 
     /// Fall through `TableNotFound` to `next`, but surface any other error.
@@ -50,20 +58,17 @@ impl TableEngine for SessionCatalog {
     /// `pg_catalog`, then the path): so `pg_catalog` wins over a like-named user
     /// relation in `public`, as in PG. A schema qualifier routes to exactly one
     /// namespace.
-    fn resolve(
-        &self,
-        schema: Option<&str>,
-        name: &str,
-    ) -> Result<Arc<dyn TableAm>, StorageError> {
+    fn resolve(&self, schema: Option<&str>, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
         match schema {
             None => Self::or_else_not_found(self.temp.open_table(name), || {
                 Self::or_else_not_found(self.system.open_table(name), || {
                     self.global.open_table(name)
                 })
             }),
-            Some("pg_catalog") => self.system.open_table(name),
+            Some("pg_catalog") | Some("information_schema") => self.system.resolve(schema, name),
             Some("public") => self.global.open_table(name),
             Some("pg_temp") => self.temp.open_table(name),
+            Some(namespace) if namespace == self.temp_schema => self.temp.open_table(name),
             Some(_) => Err(StorageError::TableNotFound(name.to_string())),
         }
     }

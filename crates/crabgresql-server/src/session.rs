@@ -40,6 +40,13 @@ impl ActiveTxn {
 }
 
 pub struct Session {
+    /// Database and role accepted during startup. The server currently has one
+    /// physical database, but these are still the current connection identity
+    /// reported by information-schema metadata.
+    pub database: String,
+    pub user: String,
+    /// Concrete namespace assigned to this connection's temporary relations.
+    pub temp_schema: String,
     /// `extra_float_digits` GUC — controls float→text output precision.
     pub extra_float_digits: i32,
     /// Current transaction state, reported in every `ReadyForQuery`. `Idle`
@@ -61,9 +68,17 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(txnmgr: Arc<TransactionManager>) -> Self {
+    pub fn with_identity(
+        txnmgr: Arc<TransactionManager>,
+        database: impl Into<String>,
+        user: impl Into<String>,
+        temp_schema: impl Into<String>,
+    ) -> Self {
         // PG's default since v12.
         Self {
+            database: database.into(),
+            user: user.into(),
+            temp_schema: temp_schema.into(),
             extra_float_digits: 1,
             tx_status: TransactionStatus::Idle,
             xact: None,

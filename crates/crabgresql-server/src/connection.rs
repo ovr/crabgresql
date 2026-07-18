@@ -45,7 +45,7 @@ pub async fn handle_connection(
 
     // Startup phase: refuse encryption upgrades until the client sends a real
     // StartupMessage. Cancel requests arrive on their own connection.
-    let _params = loop {
+    let params = loop {
         match reader.read_startup().await {
             Ok(None) => return Ok(()), // clean disconnect before startup
             Ok(Some(StartupRequest::Ssl)) | Ok(Some(StartupRequest::GssEnc)) => {
@@ -70,13 +70,27 @@ pub async fn handle_connection(
     for (name, value) in STARTUP_PARAMETERS {
         writer.parameter_status(name, value);
     }
-    writer.backend_key_data(NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed), 0);
+    let backend_id = NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed);
+    writer.backend_key_data(backend_id, 0);
     writer.ready_for_query(TransactionStatus::Idle);
     writer.flush().await?;
 
     // Per-connection session state (GUCs). A fresh connection resets them,
     // matching how the regression runner gives each test its own session.
-    let mut session = Session::new(txnmgr.clone());
+    let user = params
+        .get("user")
+        .cloned()
+        .unwrap_or_else(|| "postgres".to_string());
+    let database = params
+        .get("database")
+        .cloned()
+        .unwrap_or_else(|| user.clone());
+    let mut session = Session::with_identity(
+        txnmgr.clone(),
+        database,
+        user,
+        format!("pg_temp_{backend_id}"),
+    );
 
     // After an error on an extended-protocol message, PG discards everything
     // until Sync and only then sends ReadyForQuery — one error, one RFQ per
@@ -217,7 +231,9 @@ async fn write_result(
             // PG order: any NOTICE/WARNING messages, then CommandComplete.
             for notice in &notices {
                 match notice.severity {
-                    NoticeSeverity::Warning => writer.warning_response(notice.code, &notice.message),
+                    NoticeSeverity::Warning => {
+                        writer.warning_response(notice.code, &notice.message)
+                    }
                     NoticeSeverity::Notice => writer.notice_response(
                         notice.code,
                         &notice.message,
