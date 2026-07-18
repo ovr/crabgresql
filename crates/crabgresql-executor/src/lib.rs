@@ -6,6 +6,7 @@
 //! pull model only becomes the right shape for it once RETURNING exists.
 
 pub mod eval;
+mod generate_series;
 mod md5;
 pub mod scalar_fns;
 mod special_fns;
@@ -21,6 +22,7 @@ use crabgresql_types::{PgType, Value};
 
 use eval::eval;
 pub use eval::{coerce_value, compare_values};
+use generate_series::Series;
 
 /// Session state that runtime evaluation depends on. Currently just
 /// `extra_float_digits`, which controls float→text output precision.
@@ -184,7 +186,13 @@ fn project_pipeline(
     if let Some(predicate) = predicate {
         node = Box::new(Filter::new(node, predicate, ctx));
     }
-    node = Box::new(Projection::new(node, projections, ctx));
+    // A set-returning function in the target list turns one input row into many,
+    // so it needs `ProjectSet` rather than the one-in/one-out `Projection`.
+    node = if projections.iter().any(BoundExpr::is_srf) {
+        Box::new(ProjectSet::new(node, projections, ctx))
+    } else {
+        Box::new(Projection::new(node, projections, ctx))
+    };
     node = maybe_sort(node, sort, &columns)?;
     Ok(Execution::Rows { columns, node })
 }
@@ -296,13 +304,22 @@ impl ExecNode for Values {
     }
 }
 
-/// A set-returning function in FROM position. Evaluates its arguments once and
-/// emits the function's rowset. `pg_input_error_info` yields exactly one row.
+/// A set-returning function in FROM position. Evaluates its arguments once (on
+/// the first pull) and streams the function's rowset. `pg_input_error_info`
+/// yields exactly one row; `generate_series` yields one row per value.
 pub struct TableFunctionSource {
     func: TableFn,
     args: Vec<BoundExpr>,
     ctx: ExecContext,
-    done: bool,
+    /// Iteration state, initialized lazily from the evaluated arguments.
+    state: Option<TableFnState>,
+}
+
+enum TableFnState {
+    /// `pg_input_error_info`: a single pending row, then exhausted.
+    Single(Option<Tuple>),
+    /// `generate_series`: a lazy integer range.
+    Series(Series),
 }
 
 impl TableFunctionSource {
@@ -311,26 +328,37 @@ impl TableFunctionSource {
             func,
             args,
             ctx,
-            done: false,
+            state: None,
         }
+    }
+
+    /// Evaluate the (constant) arguments once and build the iteration state.
+    fn init(&mut self) -> Result<&mut TableFnState, ExecError> {
+        if self.state.is_none() {
+            let values = self
+                .args
+                .iter()
+                .map(|expr| eval(expr, &[], self.ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.state = Some(match self.func {
+                TableFn::PgInputErrorInfo => {
+                    TableFnState::Single(Some(pg_input_error_info_row(&values)))
+                }
+                TableFn::GenerateSeries(elem) => {
+                    TableFnState::Series(Series::from_args(elem, &values)?)
+                }
+            });
+        }
+        Ok(self.state.as_mut().unwrap())
     }
 }
 
 impl ExecNode for TableFunctionSource {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        if self.done {
-            return Ok(None);
+        match self.init()? {
+            TableFnState::Single(row) => Ok(row.take()),
+            TableFnState::Series(series) => Ok(series.next_value().map(|v| vec![v])),
         }
-        self.done = true;
-        let values = self
-            .args
-            .iter()
-            .map(|expr| eval(expr, &[], self.ctx))
-            .collect::<Result<Vec<_>, _>>()?;
-        let tuple = match self.func {
-            TableFn::PgInputErrorInfo => pg_input_error_info_row(&values),
-        };
-        Ok(Some(tuple))
     }
 }
 
@@ -621,6 +649,106 @@ impl ExecNode for Projection {
             .map(|expr| eval(expr, &row, self.ctx))
             .collect::<Result<_, _>>()?;
         Ok(Some(projected))
+    }
+}
+
+/// Projection with one or more set-returning functions in the target list. Each
+/// input row expands to as many output rows as the longest SRF produces; shorter
+/// SRFs are NULL-padded once exhausted (PG's `ROWS FROM` semantics since PG 10)
+/// and scalar columns repeat. An input row whose SRFs are all empty yields no
+/// output rows.
+pub struct ProjectSet {
+    child: Box<dyn ExecNode>,
+    exprs: Vec<BoundExpr>,
+    ctx: ExecContext,
+    /// Expansion state for the current input row; `None` before the first pull
+    /// and between fully-expanded input rows.
+    current: Option<RowExpansion>,
+}
+
+/// The per-Srf iterators for one input row, parallel to `exprs` (scalar slots
+/// are `None`), plus the input row scalar projections evaluate against.
+struct RowExpansion {
+    input: Tuple,
+    series: Vec<Option<Series>>,
+}
+
+impl ProjectSet {
+    pub fn new(child: Box<dyn ExecNode>, exprs: Vec<BoundExpr>, ctx: ExecContext) -> Self {
+        Self {
+            child,
+            exprs,
+            ctx,
+            current: None,
+        }
+    }
+
+    /// Build the per-Srf series for a fresh input row.
+    fn expand(&self, input: Tuple) -> Result<RowExpansion, ExecError> {
+        let mut series = Vec::with_capacity(self.exprs.len());
+        for expr in &self.exprs {
+            match expr {
+                BoundExpr::Srf { func, args, .. } => {
+                    let values = args
+                        .iter()
+                        .map(|a| eval(a, &input, self.ctx))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    series.push(Some(build_series(*func, &values)?));
+                }
+                _ => series.push(None),
+            }
+        }
+        Ok(RowExpansion { input, series })
+    }
+}
+
+impl ExecNode for ProjectSet {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        loop {
+            if self.current.is_none() {
+                let Some(input) = self.child.next()? else {
+                    return Ok(None);
+                };
+                self.current = Some(self.expand(input)?);
+            }
+            let exp = self.current.as_mut().unwrap();
+
+            // Advance every SRF once; the input row is exhausted when they all are.
+            let mut srf_vals: Vec<Option<Value>> = Vec::with_capacity(exp.series.len());
+            let mut any = false;
+            for slot in exp.series.iter_mut() {
+                let value = slot.as_mut().and_then(Series::next_value);
+                any |= value.is_some();
+                srf_vals.push(value);
+            }
+            if !any {
+                self.current = None;
+                continue;
+            }
+
+            let input = exp.input.clone();
+            let mut out = Vec::with_capacity(self.exprs.len());
+            for (expr, srf_val) in self.exprs.iter().zip(srf_vals) {
+                match expr {
+                    // Exhausted SRFs pad with NULL to match the longest.
+                    BoundExpr::Srf { .. } => out.push(srf_val.unwrap_or(Value::Null)),
+                    _ => out.push(eval(expr, &input, self.ctx)?),
+                }
+            }
+            return Ok(Some(out));
+        }
+    }
+}
+
+/// Build the range iterator for a target-list SRF. Only `generate_series` is a
+/// set-returning projection today.
+fn build_series(func: TableFn, values: &[Value]) -> Result<Series, ExecError> {
+    match func {
+        TableFn::GenerateSeries(elem) => Series::from_args(elem, values),
+        TableFn::PgInputErrorInfo => Err(ExecError::new(
+            crabgresql_pg_wire::sqlstate::FEATURE_NOT_SUPPORTED,
+            "set-returning function is not supported in this context",
+        )),
     }
 }
 
@@ -1076,6 +1204,106 @@ mod tests {
             run_rows("SELECT * FROM pg_input_error_info('34.5', 'float4')");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], vec![Value::Null; 4]);
+    }
+
+    /// Drain a query, returning the first runtime error (SRF errors surface on
+    /// the first `next()`, not at plan time).
+    fn run_err(sql: &str) -> ExecError {
+        let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
+        let stmts = crabgresql_parser::parse(sql).unwrap();
+        let crabgresql_parser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected a query");
+        };
+        let logical = crabgresql_binder::bind_query(&engine, query).unwrap();
+        let physical = crabgresql_planner::plan(logical);
+        let Execution::Rows { mut node, .. } =
+            execute(physical, ExecContext::default()).unwrap()
+        else {
+            panic!("expected rows");
+        };
+        loop {
+            match node.next() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected a runtime error for: {sql}"),
+                Err(e) => return e,
+            }
+        }
+    }
+
+    /// The single `generate_series` column, extracted from result tuples.
+    fn series_col(rows: &[Tuple]) -> Vec<Value> {
+        rows.iter().map(|r| r[0].clone()).collect()
+    }
+
+    #[test]
+    fn generate_series_from_yields_int4_range() {
+        let (columns, rows) = run_rows("SELECT * FROM generate_series(1, 5)");
+        assert_eq!(columns[0].name, "generate_series");
+        assert_eq!(columns[0].ty, PgType::Int4);
+        assert_eq!(
+            series_col(&rows),
+            (1..=5).map(Value::Int4).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn generate_series_target_list_yields_rows() {
+        let (columns, rows) = run_rows("SELECT generate_series(1, 5)");
+        assert_eq!(columns[0].name, "generate_series");
+        assert_eq!(
+            series_col(&rows),
+            (1..=5).map(Value::Int4).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn generate_series_step_and_direction() {
+        let (_c, rows) = run_rows("SELECT generate_series(1, 10, 3)");
+        assert_eq!(series_col(&rows), [1, 4, 7, 10].map(Value::Int4));
+        // A descending series with a negative step.
+        let (_c, rows) = run_rows("SELECT generate_series(5, 1, -2)");
+        assert_eq!(series_col(&rows), [5, 3, 1].map(Value::Int4));
+    }
+
+    #[test]
+    fn generate_series_empty_ranges_yield_no_rows() {
+        // Ascending series with start > stop.
+        let (_c, rows) = run_rows("SELECT generate_series(5, 1)");
+        assert!(rows.is_empty());
+        // Positive step in the wrong direction.
+        let (_c, rows) = run_rows("SELECT generate_series(5, 1, 1)");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn generate_series_zero_step_is_22023() {
+        let e = run_err("SELECT generate_series(1, 5, 0)");
+        assert_eq!(e.code, "22023");
+        assert_eq!(e.message, "step size cannot equal zero");
+    }
+
+    #[test]
+    fn generate_series_int8_range() {
+        let (columns, rows) = run_rows("SELECT generate_series(1, 5000000001, 2500000000)");
+        assert_eq!(columns[0].ty, PgType::Int8);
+        assert_eq!(
+            series_col(&rows),
+            [1_i64, 2_500_000_001, 5_000_000_001].map(Value::Int8)
+        );
+    }
+
+    #[test]
+    fn generate_series_mixed_with_scalar_over_table() {
+        let engine = engine_with_nums(); // nums(n int4) = 1, 2, 3
+        let (columns, rows) = run_rows_on(&engine, "SELECT n, generate_series(1, 2) FROM nums");
+        assert_eq!(columns.len(), 2);
+        // Each of the 3 input rows expands to 2 output rows (scalar repeats).
+        assert_eq!(rows.len(), 6);
+        let pairs: Vec<(Value, Value)> =
+            rows.iter().map(|r| (r[0].clone(), r[1].clone())).collect();
+        assert!(pairs.contains(&(Value::Int4(1), Value::Int4(1))));
+        assert!(pairs.contains(&(Value::Int4(1), Value::Int4(2))));
+        assert!(pairs.contains(&(Value::Int4(3), Value::Int4(2))));
     }
 
     /// A `nums(n int4)` table seeded with 1, 2, 3.

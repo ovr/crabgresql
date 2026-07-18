@@ -13,7 +13,7 @@ use crabgresql_storage_api::{Column, TableAm, TableEngine};
 use crabgresql_types::Value;
 
 use crate::expr::{
-    BoundExpr, Scope, bind_expr, bind_scalar, coerce_to_column, normalize_ident, output_name,
+    BoundExpr, Scope, bind_expr, bind_projection, coerce_to_column, normalize_ident, output_name,
     to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
@@ -748,7 +748,7 @@ fn bind_values_select(
                 "SELECT * with no tables specified is not valid",
             ));
         };
-        let bound = bind_scalar(expr, &scope)?;
+        let bound = bind_projection(expr, &scope)?;
         columns.push(OutputColumn {
             name: alias.unwrap_or_else(|| output_name(expr)),
             ty: bound.ty(),
@@ -757,6 +757,25 @@ fn bind_values_select(
     }
     let predicate = bind_where(&select.selection, &scope)?;
     let sort = bind_order_by(order_by, &columns)?;
+    // A FROM-less SELECT with a set-returning function in the target list
+    // (`SELECT generate_series(1, 5)`) expands into rows, so it cannot be a
+    // constant `Values`. Run the projection pipeline over a single dummy input
+    // row: `ProjectSet` then expands each SRF. Mirrors PG's Result + ProjectSet.
+    if row.iter().any(BoundExpr::is_srf) {
+        let source = LogicalPlan::Values {
+            columns: Vec::new(),
+            rows: vec![vec![]],
+            predicate: None,
+            sort: Vec::new(),
+        };
+        return Ok(LogicalPlan::Subquery {
+            source: Box::new(source),
+            columns,
+            projections: row,
+            predicate,
+            sort,
+        });
+    }
     Ok(LogicalPlan::Values {
         columns,
         rows: vec![row],
@@ -800,7 +819,7 @@ fn bind_select_body(
                 }
             }
             SelectField::Expr(expr, alias) => {
-                let bound = bind_scalar(expr, scope)?;
+                let bound = bind_projection(expr, scope)?;
                 columns.push(OutputColumn {
                     name: alias.unwrap_or_else(|| output_name(expr)),
                     ty: bound.ty(),
@@ -1645,6 +1664,79 @@ mod tests {
         let e = bind_err("SELECT * FROM no_such_srf('x')");
         assert_eq!(e.code, "42883");
         assert_eq!(e.message, "function no_such_srf(unknown) does not exist");
+    }
+
+    #[test]
+    fn generate_series_in_from_binds_int4_column() {
+        let LogicalPlan::TableFunction { func, columns, .. } =
+            bind_one("SELECT * FROM generate_series(1, 5)").unwrap()
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int4));
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "generate_series");
+        assert_eq!(columns[0].ty, PgType::Int4);
+    }
+
+    #[test]
+    fn generate_series_widens_to_int8() {
+        // A bigint bound widens the whole series to int8.
+        let LogicalPlan::TableFunction { func, columns, .. } =
+            bind_one("SELECT * FROM generate_series(1, 5000000000)").unwrap()
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int8));
+        assert_eq!(columns[0].ty, PgType::Int8);
+    }
+
+    #[test]
+    fn generate_series_three_arg_step_binds() {
+        let LogicalPlan::TableFunction { func, args, .. } =
+            bind_one("SELECT * FROM generate_series(1, 10, 3)").unwrap()
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int4));
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn generate_series_wrong_arity_is_42883() {
+        let e = bind_err("SELECT * FROM generate_series(1)");
+        assert_eq!(e.code, "42883");
+    }
+
+    #[test]
+    fn generate_series_in_target_list_is_srf_projection() {
+        // A FROM-less SRF in the target list expands over a single dummy row.
+        let LogicalPlan::Subquery {
+            columns,
+            projections,
+            source,
+            ..
+        } = bind_one("SELECT generate_series(1, 5)").unwrap()
+        else {
+            panic!("expected Subquery over a single-row source");
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "generate_series");
+        assert_eq!(columns[0].ty, PgType::Int4);
+        assert!(matches!(projections[0], BoundExpr::Srf { .. }));
+        assert!(matches!(*source, LogicalPlan::Values { .. }));
+    }
+
+    #[test]
+    fn generate_series_in_target_list_over_table() {
+        // Mixed scalar + SRF projection over a base table stays a Query.
+        let LogicalPlan::Query { projections, .. } =
+            bind_one("SELECT id, generate_series(1, 2) FROM t").unwrap()
+        else {
+            panic!("expected Query");
+        };
+        assert!(matches!(projections[0], BoundExpr::ColumnRef { .. }));
+        assert!(matches!(projections[1], BoundExpr::Srf { .. }));
     }
 
     #[test]

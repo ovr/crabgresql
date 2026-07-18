@@ -168,17 +168,23 @@ pub enum TableFn {
     /// `pg_input_error_info(value text, type_name text)` — the non-throwing
     /// sibling of `pg_input_is_valid`, reporting why an input would fail.
     PgInputErrorInfo,
+    /// `generate_series(start, stop [, step])` over an integer element type
+    /// (`int4` or `int8`, carried here). Yields one row per value in the range.
+    GenerateSeries(PgType),
 }
 
 impl TableFn {
     /// The function's declared parameter types (for arity/coercion checks).
+    /// `GenerateSeries` is polymorphic (int4/int8, 2- or 3-arg) and resolves via
+    /// [`resolve_generate_series`] instead, so it has no fixed signature here.
     fn arg_types(self) -> &'static [PgType] {
         match self {
             TableFn::PgInputErrorInfo => &[PgType::Text, PgType::Text],
+            TableFn::GenerateSeries(_) => &[],
         }
     }
 
-    /// The fixed output columns of the rowset, in order.
+    /// The output columns of the rowset, in order.
     pub fn columns(self) -> Vec<OutputColumn> {
         let text = |name: &str| OutputColumn {
             name: name.to_string(),
@@ -191,6 +197,11 @@ impl TableFn {
                 text("hint"),
                 text("sql_error_code"),
             ],
+            // A single column named after the function, of the element type.
+            TableFn::GenerateSeries(elem) => vec![OutputColumn {
+                name: "generate_series".to_string(),
+                ty: elem,
+            }],
         }
     }
 }
@@ -215,6 +226,12 @@ pub(crate) fn bind_table_fn_call(
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
+    // `generate_series` is polymorphic on its integer element type and has two
+    // arities, so it resolves outside the fixed-signature table below.
+    if name == "generate_series" {
+        let (elem, args) = resolve_generate_series(&bindings)?;
+        return Ok((TableFn::GenerateSeries(elem), args));
+    }
     let Some(func) = lookup_table_fn(name) else {
         return Err(undefined_function(name, &bindings));
     };
@@ -229,6 +246,31 @@ pub(crate) fn bind_table_fn_call(
         }
     }
     Err(undefined_function(name, &bindings))
+}
+
+/// Resolve a `generate_series(start, stop [, step])` call to its integer element
+/// type and coerced arguments. Supported element types are `int4` and `int8`
+/// (numeric/timestamp overloads are not implemented yet); every argument takes
+/// the element type. Returns a `42883` "does not exist" error for any other
+/// arity or argument type. Shared by FROM-position and target-list binding.
+pub(crate) fn resolve_generate_series(
+    bindings: &[Binding],
+) -> Result<(PgType, Vec<BoundExpr>), BindError> {
+    if bindings.len() != 2 && bindings.len() != 3 {
+        return Err(undefined_function("generate_series", bindings));
+    }
+    // int4 before int8, exact-type before coercing — so `generate_series(1, 5)`
+    // (int4 literals) stays int4, while a bigint argument widens the series to
+    // int8. Mirrors the scalar overload policy in `bind_function`.
+    for elem in [PgType::Int4, PgType::Int8] {
+        let params = vec![elem; bindings.len()];
+        for exact_only in [true, false] {
+            if let Some(args) = try_coerce_args(bindings, &params, exact_only) {
+                return Ok((elem, args));
+            }
+        }
+    }
+    Err(undefined_function("generate_series", bindings))
 }
 
 const F8: PgType = PgType::Float8;
@@ -502,6 +544,42 @@ pub(crate) fn bind_ceil_floor(
     }
     let arg = bind_expr(expr, scope)?;
     resolve_call(name, vec![arg])
+}
+
+/// If `func` is a top-level call to a set-returning function usable in the
+/// SELECT target list (currently `generate_series`), bind it to a
+/// [`BoundExpr::Srf`] marker. Returns `Ok(None)` when it is not such a call, so
+/// the caller can bind it as an ordinary scalar instead.
+pub(crate) fn bind_srf_projection(
+    func: &ast::Function,
+    scope: &Scope,
+) -> Result<Option<BoundExpr>, BindError> {
+    // Only plain positional calls can be set-returning here; window/filter/etc.
+    // forms are never set-returning in a target list.
+    if func.over.is_some()
+        || func.filter.is_some()
+        || !func.within_group.is_empty()
+        || func.null_treatment.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(name) = function_name(&func.name) else {
+        return Ok(None);
+    };
+    if name != "generate_series" {
+        return Ok(None);
+    }
+    let arg_exprs = positional_args(&func.args)?;
+    let bindings = arg_exprs
+        .iter()
+        .map(|e| bind_expr(e, scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (elem, args) = resolve_generate_series(&bindings)?;
+    Ok(Some(BoundExpr::Srf {
+        func: TableFn::GenerateSeries(elem),
+        ret: elem,
+        args,
+    }))
 }
 
 /// Try to coerce every binding to the signature's parameter types. When

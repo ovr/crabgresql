@@ -8,3 +8,4 @@ test: case
 test: transactions
 test: numeric
 test: join
+test: generate_series
