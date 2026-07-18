@@ -12,7 +12,7 @@
 use crabgresql_parser::{Span, ast};
 use crabgresql_protocol::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema};
-use crabgresql_types::{NumericVal, PgType, Value, cast, float, parse_bool, timestamp};
+use crabgresql_types::{NumericVal, PgType, Value, cast, float, interval, parse_bool, timestamp};
 
 use crate::BindError;
 use crate::functions::{ScalarFn, bind_function};
@@ -233,6 +233,7 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         ast::Expr::TypedString(ts) => bind_typed_string(ts),
         ast::Expr::Function(func) => bind_function(func, scope),
         ast::Expr::Extract { field, expr, .. } => bind_extract(field, expr, scope),
+        ast::Expr::Interval(iv) => bind_interval(iv),
         other => Err(unsupported_expr(other)),
     }
 }
@@ -333,6 +334,9 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                 ));
             }
         },
+        // `interval` (any field qualifier / precision is accepted and ignored;
+        // full resolution is kept, as with `timestamp(2)`).
+        DataType::Interval { .. } => PgType::Interval,
         DataType::Text | DataType::Varchar(None) | DataType::CharacterVarying(None) => PgType::Text,
         DataType::Varchar(Some(_)) | DataType::CharacterVarying(Some(_)) => {
             return Err(BindError::feature_not_supported(
@@ -380,6 +384,47 @@ fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
     Ok(Binding::Typed(resolve_unknown(lit, span, target)?))
 }
 
+/// `interval '...'` (with an optional SQL-standard field qualifier). The
+/// literal string is parsed by `interval_in`; a leading field (`INTERVAL '1'
+/// DAY`) sets the default unit for a bare number, and any precision is ignored.
+fn bind_interval(node: &ast::Interval) -> Result<Binding, BindError> {
+    let (s, span) = match &*node.value {
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::SingleQuotedString(s) => (s.clone(), v.span),
+            other => {
+                return Err(BindError::syntax(format!("invalid interval literal: {other}")));
+            }
+        },
+        other => return Err(unsupported_expr(other)),
+    };
+    let default = node
+        .leading_field
+        .as_ref()
+        .map(datetime_field_to_unit)
+        .unwrap_or(interval::Unit::Second);
+    let iv = interval::parse_with_default(&s, default)
+        .map_err(|e| BindError::new(e.sqlstate, e.message).at(span))?;
+    Ok(Binding::Typed(BoundExpr::Const {
+        value: Value::Interval(iv),
+        ty: PgType::Interval,
+    }))
+}
+
+/// Map a SQL-standard interval leading field to the default unit for a bare
+/// number; anything unusual falls back to seconds (PG's default).
+fn datetime_field_to_unit(field: &ast::DateTimeField) -> interval::Unit {
+    use ast::DateTimeField::*;
+    match field {
+        Year | Years => interval::Unit::Year,
+        Month | Months => interval::Unit::Month,
+        Week(_) | Weeks => interval::Unit::Week,
+        Day | Days => interval::Unit::Day,
+        Hour | Hours => interval::Unit::Hour,
+        Minute | Minutes => interval::Unit::Minute,
+        _ => interval::Unit::Second,
+    }
+}
+
 /// `EXTRACT(field FROM ts)`: PG's `date_part`-family sugar that returns
 /// `numeric`. We support it on `timestamp`; the field name is carried as a text
 /// constant argument and validated at run time (unknown units error there,
@@ -390,8 +435,11 @@ fn bind_extract(
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     let unit = datetime_field_unit(field);
-    let arg = match bind_expr(expr, scope)? {
-        Binding::Typed(e) if e.ty() == PgType::Timestamp => e,
+    // Resolve the operand type; interval and timestamp each have their own
+    // extract. An untyped literal defaults to timestamp, as PG does.
+    let (func, arg) = match bind_expr(expr, scope)? {
+        Binding::Typed(e) if e.ty() == PgType::Timestamp => (ScalarFn::Extract, e),
+        Binding::Typed(e) if e.ty() == PgType::Interval => (ScalarFn::ExtractInterval, e),
         Binding::Typed(e) => {
             return Err(BindError::new(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -401,10 +449,10 @@ fn bind_extract(
                 ),
             ));
         }
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Timestamp)?,
+        Binding::Unknown { lit, span } => (ScalarFn::Extract, resolve_unknown(lit, span, PgType::Timestamp)?),
     };
     Ok(Binding::Typed(BoundExpr::FuncCall {
-        func: ScalarFn::Extract,
+        func,
         ret: PgType::Numeric,
         args: vec![
             BoundExpr::Const {
@@ -506,6 +554,17 @@ fn bind_unary(
                     } else {
                         // Unary + is the identity on numeric types.
                         e
+                    }))
+                }
+                // `- interval` negates every field. PG has no unary `+ interval`
+                // operator, so that falls through to the error arm below.
+                Binding::Typed(e)
+                    if e.ty() == PgType::Interval && op == ast::UnaryOperator::Minus =>
+                {
+                    Ok(Binding::Typed(BoundExpr::FuncCall {
+                        func: ScalarFn::IntervalNeg,
+                        ret: PgType::Interval,
+                        args: vec![e],
                     }))
                 }
                 Binding::Typed(e) => Err(no_op_unary(sym, e.ty().name())),
@@ -615,6 +674,14 @@ fn bind_binary(
         return bind_pow(lb, rb);
     }
 
+    // Mixed-type temporal arithmetic (`ts - ts`, `ts ± interval`, `interval ±
+    // interval`, `interval * / number`) doesn't fit the single-`arg_ty` `Binary`
+    // node, so it lowers to a function call. Comparisons and same-type cases fall
+    // through to the generic path below.
+    if let Some(binding) = resolve_temporal(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
     // Comparison or arithmetic: settle both operands on one type. For
     // arithmetic, the typed side must offer the operator BEFORE the unknown
     // side is parsed as that type — PG reports `operator does not exist:
@@ -690,6 +757,7 @@ fn bind_binary(
                 | PgType::Text
                 | PgType::Bytea
                 | PgType::Timestamp
+                | PgType::Interval
         )
     };
     if !supported {
@@ -702,6 +770,93 @@ fn bind_binary(
         left: Box::new(left),
         right: Box::new(right),
     }))
+}
+
+/// Resolve mixed-type temporal arithmetic to a function call, or `Ok(None)` to
+/// let the generic (same-type / comparison) path handle it — including the
+/// `operator does not exist` error for combinations with no operator (e.g.
+/// `interval * interval`). An untyped literal opposite a temporal operand takes
+/// the partner type: interval for `±`, float8 for the `* /` factor.
+fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Binding>, BindError> {
+    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+        return Ok(None);
+    }
+    let lt = binding_typed_ty(lb);
+    let rt = binding_typed_ty(rb);
+    let is_temporal = |t: Option<PgType>| matches!(t, Some(PgType::Interval | PgType::Timestamp));
+    if !is_temporal(lt) && !is_temporal(rt) {
+        return Ok(None);
+    }
+
+    use PgType::{Interval as I, Timestamp as T};
+    let typed = |b: &Binding| match b {
+        Binding::Typed(e) => e.clone(),
+        Binding::Unknown { .. } => unreachable!("typed side is Typed"),
+    };
+    let call = |func, ret, a: BoundExpr, b: BoundExpr| {
+        Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret,
+            args: vec![a, b],
+        })))
+    };
+    // A numeric operand (or an untyped literal) can be the `* /` factor.
+    let factor_ok = |t: Option<PgType>| matches!(t, Some(ty) if ty.is_numeric()) || t.is_none();
+
+    match op {
+        BinOp::Add => match (lt, rt) {
+            (Some(I), Some(I)) => call(ScalarFn::IntervalPl, I, typed(lb), typed(rb)),
+            (Some(T), Some(I)) => call(ScalarFn::TimestampPlInterval, T, typed(lb), typed(rb)),
+            (Some(I), Some(T)) => call(ScalarFn::TimestampPlInterval, T, typed(rb), typed(lb)),
+            (Some(I), None) => call(ScalarFn::IntervalPl, I, typed(lb), resolve_operand(rb, I)?),
+            (None, Some(I)) => call(ScalarFn::IntervalPl, I, resolve_operand(lb, I)?, typed(rb)),
+            (Some(T), None) => call(ScalarFn::TimestampPlInterval, T, typed(lb), resolve_operand(rb, I)?),
+            (None, Some(T)) => call(ScalarFn::TimestampPlInterval, T, typed(rb), resolve_operand(lb, I)?),
+            _ => Ok(None),
+        },
+        BinOp::Sub => match (lt, rt) {
+            (Some(I), Some(I)) => call(ScalarFn::IntervalMi, I, typed(lb), typed(rb)),
+            (Some(T), Some(I)) => call(ScalarFn::TimestampMiInterval, T, typed(lb), typed(rb)),
+            (Some(T), Some(T)) => call(ScalarFn::TimestampMi, I, typed(lb), typed(rb)),
+            (Some(I), None) => call(ScalarFn::IntervalMi, I, typed(lb), resolve_operand(rb, I)?),
+            (None, Some(I)) => call(ScalarFn::IntervalMi, I, resolve_operand(lb, I)?, typed(rb)),
+            (Some(T), None) => call(ScalarFn::TimestampMiInterval, T, typed(lb), resolve_operand(rb, I)?),
+            _ => Ok(None),
+        },
+        BinOp::Mul => match (lt, rt) {
+            (Some(I), _) if factor_ok(rt) => {
+                call(ScalarFn::IntervalMul, I, typed(lb), resolve_operand(rb, PgType::Float8)?)
+            }
+            (_, Some(I)) if factor_ok(lt) => {
+                call(ScalarFn::IntervalMul, I, typed(rb), resolve_operand(lb, PgType::Float8)?)
+            }
+            _ => Ok(None),
+        },
+        BinOp::Div => match (lt, rt) {
+            (Some(I), _) if factor_ok(rt) => {
+                call(ScalarFn::IntervalDiv, I, typed(lb), resolve_operand(rb, PgType::Float8)?)
+            }
+            _ => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+fn binding_typed_ty(b: &Binding) -> Option<PgType> {
+    match b {
+        Binding::Typed(e) => Some(e.ty()),
+        Binding::Unknown { .. } => None,
+    }
+}
+
+/// Materialize an operand at `target`: an untyped literal is parsed as `target`,
+/// a typed operand is coerced (used for the numeric `* /` factor → float8).
+fn resolve_operand(b: &Binding, target: PgType) -> Result<BoundExpr, BindError> {
+    match b {
+        Binding::Typed(e) if e.ty() == target => Ok(e.clone()),
+        Binding::Typed(e) => coerce_expr(e.clone(), target),
+        Binding::Unknown { lit, span } => resolve_unknown(lit.clone(), *span, target),
+    }
 }
 
 fn bind_pow(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
@@ -968,6 +1123,9 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Timestamp => timestamp::parse(s)
             .map(Value::Timestamp)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Interval => interval::parse(s)
+            .map(Value::Interval)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         // bytea input (byteain) is shared with the executor's text→bytea cast.
         PgType::Bytea => cast::byteain(s)
             .map(Value::Bytea)
@@ -1023,6 +1181,8 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
             expr, data_type, ..
         } => column_name(expr).unwrap_or_else(|| type_output_name(data_type)),
         ast::Expr::TypedString(ts) => type_output_name(&ts.data_type),
+        // `interval '...'` is named after the type, like a typed literal.
+        ast::Expr::Interval(_) => "interval".into(),
         // EXTRACT(... ) is named "extract" in PG, regardless of the field.
         ast::Expr::Extract { .. } => "extract".into(),
         // A function's output column is named after the function.

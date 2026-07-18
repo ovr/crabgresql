@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
 use crabgresql_protocol::sqlstate;
-use crabgresql_types::{PgType, Value, cast, float};
+use crabgresql_types::{Interval, PgType, Value, cast, float, interval};
 
 use crate::{ExecContext, ExecError};
 
@@ -143,6 +143,8 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::Bool => bool_of(l).cmp(&bool_of(r)),
         // Microsecond order; the ±infinity sentinels sort naturally.
         PgType::Timestamp => timestamp_of(l).cmp(&timestamp_of(r)),
+        // Canonical-span order (30-day months, 24-hour days), infinities first/last.
+        PgType::Interval => interval::cmp(interval_of(l), interval_of(r)),
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -233,6 +235,13 @@ fn timestamp_of(v: &Value) -> i64 {
     match v {
         Value::Timestamp(t) => *t,
         other => unreachable!("expected timestamp, got {other:?}"),
+    }
+}
+
+fn interval_of(v: &Value) -> Interval {
+    match v {
+        Value::Interval(iv) => *iv,
+        other => unreachable!("expected interval, got {other:?}"),
     }
 }
 

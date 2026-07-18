@@ -3,7 +3,7 @@
 //! reproduces PG's *observable* cast results — including the SQLSTATE/message on
 //! range errors — as pinned by the regression corpus, implemented independently.
 
-use crate::{NumericVal, PgType, Value, float, parse_bool, timestamp};
+use crate::{NumericVal, PgType, Value, float, interval, parse_bool, timestamp};
 
 /// SQLSTATE + message for a failed cast.
 #[derive(Clone, Debug, PartialEq)]
@@ -185,6 +185,11 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- text → timestamp (timestamp_in) ----
         (Value::Text(s), PgType::Timestamp) => timestamp::parse(s)
             .map(Value::Timestamp)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- text → interval (interval_in) ----
+        (Value::Text(s), PgType::Interval) => interval::parse(s)
+            .map(Value::Interval)
             .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
 
         // ---- integer → numeric (exact) ----

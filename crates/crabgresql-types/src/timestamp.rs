@@ -22,6 +22,7 @@
 //! are not supported.
 
 use crate::NumericVal;
+use crate::interval::{self, Interval};
 
 // SQLSTATEs, kept as literals here (the types crate does not depend on the
 // protocol crate; the binder/executor map these to `sqlstate::*`).
@@ -914,12 +915,217 @@ pub fn make_timestamp(
     }))
 }
 
+// --- timestamp / interval arithmetic ---------------------------------------
+
+fn timestamp_out_of_range() -> TimestampError {
+    TimestampError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        message: "timestamp out of range".to_string(),
+    }
+}
+
+fn interval_out_of_range() -> TimestampError {
+    TimestampError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        message: "interval out of range".to_string(),
+    }
+}
+
+/// `Some(1)`/`Some(-1)` for `±infinity`, `None` for a finite timestamp.
+fn inf_sign(micros: i64) -> Option<i32> {
+    match micros {
+        POS_INFINITY => Some(1),
+        NEG_INFINITY => Some(-1),
+        _ => None,
+    }
+}
+
+/// Ensure a computed timestamp is within PG's supported year range.
+fn check_range(micros: i64) -> Result<i64, TimestampError> {
+    let year = decode(micros).year;
+    if !(-4712..=294_276).contains(&year) {
+        return Err(timestamp_out_of_range());
+    }
+    Ok(micros)
+}
+
+/// `timestamp + interval` (`timestamp_pl_interval`): add whole months
+/// calendar-wise (clamping the day of month), then days, then the sub-day time.
+pub fn pl_interval(micros: i64, span: Interval) -> Result<i64, TimestampError> {
+    // An infinite timestamp swallows a finite interval; an infinite interval
+    // pushes a finite timestamp to that infinity. Opposite infinities conflict.
+    match (inf_sign(micros), span_inf_sign(span)) {
+        (Some(a), Some(b)) if a != b => return Err(timestamp_out_of_range()),
+        (Some(_), _) => return Ok(micros),
+        (None, Some(b)) => return Ok(if b > 0 { POS_INFINITY } else { NEG_INFINITY }),
+        (None, None) => {}
+    }
+    let mut tm = decode(micros);
+    if span.months != 0 {
+        let m = tm.month + span.months as i64;
+        tm.year += (m - 1).div_euclid(12);
+        tm.month = (m - 1).rem_euclid(12) + 1;
+        let dim = days_in_month(tm.year, tm.month);
+        if tm.day > dim {
+            tm.day = dim;
+        }
+    }
+    let result = encode(tm)
+        .checked_add(span.days as i64 * USECS_PER_DAY)
+        .and_then(|r| r.checked_add(span.usec))
+        .ok_or_else(timestamp_out_of_range)?;
+    check_range(result)
+}
+
+/// `timestamp - interval` (`timestamp_mi_interval`): the negation of the add.
+pub fn mi_interval(micros: i64, span: Interval) -> Result<i64, TimestampError> {
+    let neg = interval::negate(span).map_err(|e| TimestampError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+    })?;
+    pl_interval(micros, neg)
+}
+
+/// `timestamp - timestamp` (`timestamp_mi`): the microsecond difference, then
+/// `justify_hours` (PG applies it here for historical compatibility).
+pub fn mi(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
+    match (inf_sign(dt1), inf_sign(dt2)) {
+        (Some(a), Some(b)) => {
+            return if a == b {
+                Err(interval_out_of_range())
+            } else {
+                Ok(if a > 0 { interval::POS_INFINITY } else { interval::NEG_INFINITY })
+            };
+        }
+        (Some(a), None) => {
+            return Ok(if a > 0 { interval::POS_INFINITY } else { interval::NEG_INFINITY });
+        }
+        (None, Some(b)) => {
+            return Ok(if b > 0 { interval::NEG_INFINITY } else { interval::POS_INFINITY });
+        }
+        (None, None) => {}
+    }
+    let usec = dt1.checked_sub(dt2).ok_or_else(interval_out_of_range)?;
+    Ok(interval::justify_hours(Interval { months: 0, days: 0, usec }))
+}
+
+/// `age(dt1, dt2)`: the symbolic (year/month/day) difference PG's `timestamp_age`
+/// produces, borrowing from the appropriate month length.
+pub fn age(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
+    match (inf_sign(dt1), inf_sign(dt2)) {
+        (Some(a), Some(b)) => {
+            return if a == b {
+                Err(interval_out_of_range())
+            } else {
+                Ok(if a > 0 { interval::POS_INFINITY } else { interval::NEG_INFINITY })
+            };
+        }
+        (Some(a), None) => {
+            return Ok(if a > 0 { interval::POS_INFINITY } else { interval::NEG_INFINITY });
+        }
+        (None, Some(b)) => {
+            return Ok(if b > 0 { interval::NEG_INFINITY } else { interval::POS_INFINITY });
+        }
+        (None, None) => {}
+    }
+    let tm1 = decode(dt1);
+    let tm2 = decode(dt2);
+    let flip = dt1 < dt2;
+    let s = if flip { -1 } else { 1 };
+    let mut fsec = s * (tm1.usec - tm2.usec);
+    let mut sec = s * (tm1.sec - tm2.sec);
+    let mut min = s * (tm1.min - tm2.min);
+    let mut hour = s * (tm1.hour - tm2.hour);
+    let mut mday = s * (tm1.day - tm2.day);
+    let mut mon = s * (tm1.month - tm2.month);
+    let mut year = s * (tm1.year - tm2.year);
+    // Propagate negatives into higher-order fields; days borrow a whole month
+    // of the earlier operand's month.
+    while fsec < 0 {
+        fsec += USECS_PER_SEC;
+        sec -= 1;
+    }
+    while sec < 0 {
+        sec += 60;
+        min -= 1;
+    }
+    while min < 0 {
+        min += 60;
+        hour -= 1;
+    }
+    while hour < 0 {
+        hour += 24;
+        mday -= 1;
+    }
+    while mday < 0 {
+        let (by, bm) = if flip { (tm1.year, tm1.month) } else { (tm2.year, tm2.month) };
+        mday += days_in_month(by, bm);
+        mon -= 1;
+    }
+    while mon < 0 {
+        mon += 12;
+        year -= 1;
+    }
+    // Re-apply the sign that was flipped for the dt1 < dt2 case.
+    let (fsec, sec, min, hour, mday, mon, year) = if flip {
+        (-fsec, -sec, -min, -hour, -mday, -mon, -year)
+    } else {
+        (fsec, sec, min, hour, mday, mon, year)
+    };
+    let months = i32::try_from(year * 12 + mon).map_err(|_| interval_out_of_range())?;
+    let usec = hour * USECS_PER_HOUR + min * USECS_PER_MINUTE + sec * USECS_PER_SEC + fsec;
+    Ok(Interval { months, days: mday as i32, usec })
+}
+
+fn span_inf_sign(span: Interval) -> Option<i32> {
+    if span == interval::POS_INFINITY {
+        Some(1)
+    } else if span == interval::NEG_INFINITY {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ts(s: &str) -> i64 {
         parse(s).unwrap()
+    }
+
+    fn span(s: &str) -> Interval {
+        interval::parse(s).unwrap()
+    }
+
+    #[test]
+    fn timestamp_interval_arithmetic() {
+        let fmt_iv = interval::format;
+        assert_eq!(
+            format(pl_interval(ts("2001-01-01 12:00:00"), span("1 mon 3 days 4 hours")).unwrap()),
+            "2001-02-04 16:00:00"
+        );
+        assert_eq!(
+            format(pl_interval(ts("2001-03-31"), span("1 mon")).unwrap()),
+            "2001-04-30 00:00:00"
+        );
+        assert_eq!(
+            format(mi_interval(ts("2001-01-01"), span("1 day")).unwrap()),
+            "2000-12-31 00:00:00"
+        );
+        assert_eq!(fmt_iv(mi(ts("2001-01-01"), ts("1997-01-02")).unwrap()), "1460 days");
+        assert_eq!(
+            fmt_iv(mi(ts("2001-09-22 18:19:20"), ts("2001-09-22 12:00:00")).unwrap()),
+            "06:19:20"
+        );
+        assert_eq!(fmt_iv(age(ts("2001-04-10"), ts("1957-06-13")).unwrap()), "43 years 9 mons 27 days");
+        assert_eq!(fmt_iv(age(ts("2010-01-01"), ts("2009-03-15")).unwrap()), "9 mons 17 days");
+        // Infinite operands (PG18 semantics).
+        assert_eq!(pl_interval(POS_INFINITY, span("1 day")).unwrap(), POS_INFINITY);
+        assert_eq!(mi(POS_INFINITY, ts("1995-08-06 12:12:12")).unwrap(), interval::POS_INFINITY);
+        assert!(mi(POS_INFINITY, POS_INFINITY).is_err());
+        assert_eq!(age(POS_INFINITY, ts("2020-01-01")).unwrap(), interval::POS_INFINITY);
     }
 
     #[test]

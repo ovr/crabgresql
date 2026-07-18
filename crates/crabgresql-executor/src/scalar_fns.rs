@@ -11,7 +11,7 @@ use std::hint::black_box;
 
 use crabgresql_binder::ScalarFn;
 use crabgresql_protocol::sqlstate;
-use crabgresql_types::{Value, float, timestamp};
+use crabgresql_types::{Interval, Value, float, interval, timestamp, to_char};
 
 use crate::ExecError;
 
@@ -96,6 +96,80 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             };
             return Ok(Value::Text(crate::md5::md5_hex(bytes)));
         }
+
+        // --- interval operators ---
+        ScalarFn::IntervalNeg => {
+            return interval::negate(iv(&args[0])).map(Value::Interval).map_err(iv_err);
+        }
+        ScalarFn::IntervalPl => {
+            return interval::add(iv(&args[0]), iv(&args[1])).map(Value::Interval).map_err(iv_err);
+        }
+        ScalarFn::IntervalMi => {
+            return interval::sub(iv(&args[0]), iv(&args[1])).map(Value::Interval).map_err(iv_err);
+        }
+        ScalarFn::IntervalMul => {
+            return interval::mul(iv(&args[0]), f8(&args[1])).map(Value::Interval).map_err(iv_err);
+        }
+        ScalarFn::IntervalDiv => {
+            return interval::div(iv(&args[0]), f8(&args[1])).map(Value::Interval).map_err(iv_err);
+        }
+        ScalarFn::TimestampPlInterval => {
+            return timestamp::pl_interval(ts(&args[0]), iv(&args[1])).map(Value::Timestamp).map_err(ts_err);
+        }
+        ScalarFn::TimestampMiInterval => {
+            return timestamp::mi_interval(ts(&args[0]), iv(&args[1])).map(Value::Timestamp).map_err(ts_err);
+        }
+        ScalarFn::TimestampMi => {
+            return timestamp::mi(ts(&args[0]), ts(&args[1])).map(Value::Interval).map_err(ts_err);
+        }
+
+        // --- interval functions ---
+        ScalarFn::DatePartInterval => {
+            return Ok(match interval::date_part(text(&args[0]), iv(&args[1])).map_err(iv_err)? {
+                Some(v) => Value::Float8(v),
+                None => Value::Null,
+            });
+        }
+        ScalarFn::ExtractInterval => {
+            return Ok(match interval::extract(text(&args[0]), iv(&args[1])).map_err(iv_err)? {
+                Some(n) => Value::Numeric(n),
+                None => Value::Null,
+            });
+        }
+        ScalarFn::DateTruncInterval => {
+            return interval::date_trunc(text(&args[0]), iv(&args[1])).map(Value::Interval).map_err(iv_err);
+        }
+        ScalarFn::IsfiniteInterval => {
+            return Ok(Value::Bool(iv(&args[0]).is_finite()));
+        }
+        ScalarFn::MakeInterval => {
+            return interval::make_interval(
+                i4(&args[0]) as i64,
+                i4(&args[1]) as i64,
+                i4(&args[2]) as i64,
+                i4(&args[3]) as i64,
+                i4(&args[4]) as i64,
+                i4(&args[5]) as i64,
+                f8(&args[6]),
+            )
+            .map(Value::Interval)
+            .map_err(iv_err);
+        }
+        ScalarFn::JustifyDays => return Ok(Value::Interval(interval::justify_days(iv(&args[0])))),
+        ScalarFn::JustifyHours => return Ok(Value::Interval(interval::justify_hours(iv(&args[0])))),
+        ScalarFn::JustifyInterval => {
+            return Ok(Value::Interval(interval::justify_interval(iv(&args[0]))));
+        }
+        ScalarFn::Age => {
+            return timestamp::age(ts(&args[0]), ts(&args[1])).map(Value::Interval).map_err(ts_err);
+        }
+        ScalarFn::ToCharInterval => {
+            // A non-finite interval yields NULL, matching PG.
+            return Ok(match to_char::interval(iv(&args[0]), text(&args[1])) {
+                Some(s) => Value::Text(s),
+                None => Value::Null,
+            });
+        }
         _ => {}
     }
     // The remaining functions are float8 → float8 (or float8×float8 → float8).
@@ -158,7 +232,25 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         | ScalarFn::Extract
         | ScalarFn::DateTrunc
         | ScalarFn::Isfinite
-        | ScalarFn::MakeTimestamp => unreachable!(),
+        | ScalarFn::MakeTimestamp
+        | ScalarFn::IntervalNeg
+        | ScalarFn::IntervalPl
+        | ScalarFn::IntervalMi
+        | ScalarFn::IntervalMul
+        | ScalarFn::IntervalDiv
+        | ScalarFn::TimestampPlInterval
+        | ScalarFn::TimestampMiInterval
+        | ScalarFn::TimestampMi
+        | ScalarFn::DatePartInterval
+        | ScalarFn::ExtractInterval
+        | ScalarFn::DateTruncInterval
+        | ScalarFn::IsfiniteInterval
+        | ScalarFn::MakeInterval
+        | ScalarFn::JustifyDays
+        | ScalarFn::JustifyHours
+        | ScalarFn::JustifyInterval
+        | ScalarFn::Age
+        | ScalarFn::ToCharInterval => unreachable!(),
     };
     result.map(Value::Float8)
 }
@@ -446,6 +538,17 @@ fn ts(v: &Value) -> i64 {
         Value::Timestamp(t) => *t,
         other => unreachable!("expected timestamp arg, got {other:?}"),
     }
+}
+
+fn iv(v: &Value) -> Interval {
+    match v {
+        Value::Interval(iv) => *iv,
+        other => unreachable!("expected interval arg, got {other:?}"),
+    }
+}
+
+fn iv_err(e: crabgresql_types::interval::IntervalError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
 }
 
 fn i4(v: &Value) -> i32 {

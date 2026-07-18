@@ -59,6 +59,46 @@ pub enum ScalarFn {
     Isfinite,
     /// `make_timestamp(int, int, int, int, int, float8) -> timestamp`.
     MakeTimestamp,
+
+    // --- interval operators (built directly by the binder, not via `lookup`) ---
+    /// unary `- interval`.
+    IntervalNeg,
+    /// `interval + interval`.
+    IntervalPl,
+    /// `interval - interval`.
+    IntervalMi,
+    /// `interval * float8` (factor is arg 1).
+    IntervalMul,
+    /// `interval / float8`.
+    IntervalDiv,
+    /// `timestamp + interval -> timestamp`.
+    TimestampPlInterval,
+    /// `timestamp - interval -> timestamp`.
+    TimestampMiInterval,
+    /// `timestamp - timestamp -> interval`.
+    TimestampMi,
+
+    // --- interval functions ---
+    /// `date_part(text, interval) -> float8`.
+    DatePartInterval,
+    /// `EXTRACT(field FROM interval) -> numeric`.
+    ExtractInterval,
+    /// `date_trunc(text, interval) -> interval`.
+    DateTruncInterval,
+    /// `isfinite(interval) -> bool`.
+    IsfiniteInterval,
+    /// `make_interval(int, int, int, int, int, int, float8) -> interval`.
+    MakeInterval,
+    /// `justify_days(interval) -> interval`.
+    JustifyDays,
+    /// `justify_hours(interval) -> interval`.
+    JustifyHours,
+    /// `justify_interval(interval) -> interval`.
+    JustifyInterval,
+    /// `age(timestamp, timestamp) -> interval`.
+    Age,
+    /// `to_char(interval, text) -> text`.
+    ToCharInterval,
 }
 
 struct Signature {
@@ -142,6 +182,7 @@ const F8: PgType = PgType::Float8;
 const TS: PgType = PgType::Timestamp;
 const TEXT: PgType = PgType::Text;
 const I4: PgType = PgType::Int4;
+const IV: PgType = PgType::Interval;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -207,26 +248,33 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[PgType::Text, PgType::Text],
             ret: PgType::Bool,
         }],
-        "date_part" => &[Signature {
-            func: ScalarFn::DatePart,
-            args: &[TEXT, TS],
-            ret: F8,
-        }],
-        "date_trunc" => &[Signature {
-            func: ScalarFn::DateTrunc,
-            args: &[TEXT, TS],
-            ret: TS,
-        }],
-        "isfinite" => &[Signature {
-            func: ScalarFn::Isfinite,
-            args: &[TS],
-            ret: PgType::Bool,
-        }],
+        "date_part" => &[
+            Signature { func: ScalarFn::DatePart, args: &[TEXT, TS], ret: F8 },
+            Signature { func: ScalarFn::DatePartInterval, args: &[TEXT, IV], ret: F8 },
+        ],
+        "date_trunc" => &[
+            Signature { func: ScalarFn::DateTrunc, args: &[TEXT, TS], ret: TS },
+            Signature { func: ScalarFn::DateTruncInterval, args: &[TEXT, IV], ret: IV },
+        ],
+        "isfinite" => &[
+            Signature { func: ScalarFn::Isfinite, args: &[TS], ret: PgType::Bool },
+            Signature { func: ScalarFn::IsfiniteInterval, args: &[IV], ret: PgType::Bool },
+        ],
         "make_timestamp" => &[Signature {
             func: ScalarFn::MakeTimestamp,
             args: &[I4, I4, I4, I4, I4, F8],
             ret: TS,
         }],
+        "make_interval" => &[Signature {
+            func: ScalarFn::MakeInterval,
+            args: &[I4, I4, I4, I4, I4, I4, F8],
+            ret: IV,
+        }],
+        "justify_days" => &[Signature { func: ScalarFn::JustifyDays, args: &[IV], ret: IV }],
+        "justify_hours" => &[Signature { func: ScalarFn::JustifyHours, args: &[IV], ret: IV }],
+        "justify_interval" => &[Signature { func: ScalarFn::JustifyInterval, args: &[IV], ret: IV }],
+        "age" => &[Signature { func: ScalarFn::Age, args: &[TS, TS], ret: IV }],
+        "to_char" => &[Signature { func: ScalarFn::ToCharInterval, args: &[IV, TEXT], ret: TEXT }],
         // Two overloads. Text is listed first so a bare `md5('abc')` unknown
         // literal resolves to text; a typed `bytea` argument never coerces to
         // text (see `implicit_castable`), so `md5(x::bytea)` binds the bytea one.
