@@ -44,6 +44,13 @@ SELECT '13:30:00'::time AS from_text;
  13:30:00
 (1 row)
 
+-- a numeric zone offset glued to the time is accepted and ignored
+SELECT time '13:30:00-04' AS glued_zone;
+ glued_zone 
+------------
+ 13:30:00
+(1 row)
+
 SELECT (time '13:30:00')::text AS to_text;
  to_text  
 ----------

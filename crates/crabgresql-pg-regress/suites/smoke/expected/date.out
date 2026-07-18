@@ -114,6 +114,19 @@ SELECT date '2020-08-11' + time '13:30:00' AS plus_time;
  2020-08-11 13:30:00
 (1 row)
 
+-- date - timestamp -> interval (date widens to midnight); date + timetz -> timestamptz
+SELECT date '2020-01-02' - timestamp '2020-01-01 12:00' AS d_minus_ts;
+ d_minus_ts 
+------------
+ 12:00:00
+(1 row)
+
+SELECT date '2020-08-11' + timetz '13:30:00-04' AS d_plus_timetz;
+     d_plus_timetz      
+------------------------
+ 2020-08-11 17:30:00+00
+(1 row)
+
 -- date_part (float8) across the supported fields
 SELECT date_part('year', date '2020-08-11') AS year,
        date_part('month', date '2020-08-11') AS month,
@@ -198,6 +211,15 @@ SELECT date '2000-02-30';
 ERROR:  date/time field value out of range: "2000-02-30"
 LINE 1: SELECT date '2000-02-30';
                     ^
+-- a date past the timestamp range widens with a clean error, not a crash
+SELECT (date '1000000-01-01')::timestamp;
+ERROR:  date out of range for timestamp
+-- date - (int MIN) does not overflow the negation; reports out of range
+SELECT date '2000-01-01' - (-2147483648);
+ERROR:  date out of range
+-- there is no date + bigint operator
+SELECT date '2000-01-01' + 5::int8;
+ERROR:  operator does not exist: date + bigint
 SELECT extract(hour from date '2020-08-11');
 ERROR:  unit "hour" not supported for type date
 SELECT extract(fortnight from date '2020-08-11');

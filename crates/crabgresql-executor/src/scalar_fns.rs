@@ -285,7 +285,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             return date::add_days(dt(&args[0]), i4(&args[1])).map(Value::Date).map_err(date_err);
         }
         ScalarFn::DateMiDays => {
-            return date::add_days(dt(&args[0]), -i4(&args[1])).map(Value::Date).map_err(date_err);
+            return date::sub_days(dt(&args[0]), i4(&args[1])).map(Value::Date).map_err(date_err);
         }
         ScalarFn::DateMi => {
             return date::sub_date(dt(&args[0]), dt(&args[1])).map(Value::Int4).map_err(date_err);
@@ -298,6 +298,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         ScalarFn::DatePlTime => {
             return date::pl_time(dt(&args[0]), tm(&args[1])).map(Value::Timestamp).map_err(date_err);
+        }
+        ScalarFn::DatePlTimeTz => {
+            return date::pl_timetz(dt(&args[0]), ttz(&args[1])).map(Value::TimestampTz).map_err(date_err);
         }
         ScalarFn::DatePartDate => {
             return Ok(match date::date_part(text(&args[0]), dt(&args[1])).map_err(date_err)? {
@@ -451,6 +454,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         | ScalarFn::DatePlInterval
         | ScalarFn::DateMiInterval
         | ScalarFn::DatePlTime
+        | ScalarFn::DatePlTimeTz
         | ScalarFn::DatePartDate
         | ScalarFn::ExtractDate
         | ScalarFn::IsfiniteDate

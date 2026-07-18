@@ -36,6 +36,9 @@ SELECT date '2000-01-01' + 31 AS plus_31, date '2000-03-01' - 1 AS minus_1;
 SELECT date '2001-01-01' + interval '1 day 2 hours' AS plus_interval;
 SELECT date '2001-01-01' - interval '1 day' AS minus_interval;
 SELECT date '2020-08-11' + time '13:30:00' AS plus_time;
+-- date - timestamp -> interval (date widens to midnight); date + timetz -> timestamptz
+SELECT date '2020-01-02' - timestamp '2020-01-01 12:00' AS d_minus_ts;
+SELECT date '2020-08-11' + timetz '13:30:00-04' AS d_plus_timetz;
 
 -- date_part (float8) across the supported fields
 SELECT date_part('year', date '2020-08-11') AS year,
@@ -67,6 +70,12 @@ SELECT make_date(2013, 7, 15) AS mk, make_date(-44, 3, 15) AS mk_bc;
 -- recovery still works
 SELECT date 'garbage';
 SELECT date '2000-02-30';
+-- a date past the timestamp range widens with a clean error, not a crash
+SELECT (date '1000000-01-01')::timestamp;
+-- date - (int MIN) does not overflow the negation; reports out of range
+SELECT date '2000-01-01' - (-2147483648);
+-- there is no date + bigint operator
+SELECT date '2000-01-01' + 5::int8;
 SELECT extract(hour from date '2020-08-11');
 SELECT extract(fortnight from date '2020-08-11');
 SELECT make_date(2013, 2, 30);

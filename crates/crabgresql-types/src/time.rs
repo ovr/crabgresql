@@ -98,7 +98,13 @@ pub fn parse(input: &str) -> Result<i64, TimeError> {
             if time_tok.is_some() {
                 return Err(invalid_syntax(input));
             }
-            time_tok = Some(tok);
+            // A numeric offset glued to the time (`13:30:00-04`, `13:30:00+05:30`)
+            // is accepted and ignored — this type carries no zone. It begins at
+            // the first sign after the time digits.
+            time_tok = Some(match tok.find(['+', '-']) {
+                Some(pos) => &tok[..pos],
+                None => tok,
+            });
             continue;
         }
         // A `YYYY-MM-DD` date token is decorative for `time`.

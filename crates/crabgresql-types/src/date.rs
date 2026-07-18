@@ -32,7 +32,8 @@ const INVALID_DATETIME_FORMAT: &str = "22007";
 const DATETIME_FIELD_OVERFLOW: &str = "22008";
 const INVALID_PARAMETER_VALUE: &str = "22023";
 
-/// `-infinity` / `+infinity` sentinels, matching PG's `DATEVAL_NOBEGIN`/`NOEND`.
+/// `-infinity` / `+infinity` sentinels: `'-infinity'::date` sorts before and
+/// `'infinity'::date` after every finite date, and `isfinite` reports false.
 pub const NEG_INFINITY: i32 = i32::MIN;
 pub const POS_INFINITY: i32 = i32::MAX;
 
@@ -162,6 +163,17 @@ pub fn add_days(d: i32, n: i32) -> Result<i32, DateError> {
     to_date_value(sum).ok_or_else(out_of_range)
 }
 
+/// `date - int4` (`date_mii`): shift back by whole days. A separate entry point
+/// (rather than `add_days(d, -n)`) so `n == i32::MIN` does not overflow on
+/// negation; the subtraction is done in `i64`.
+pub fn sub_days(d: i32, n: i32) -> Result<i32, DateError> {
+    if !is_finite(d) {
+        return Ok(d);
+    }
+    let diff = d as i64 - n as i64;
+    to_date_value(diff).ok_or_else(out_of_range)
+}
+
 /// `date - date` (`date_mi`): the difference in days, as `int4`.
 pub fn sub_date(a: i32, b: i32) -> Result<i32, DateError> {
     if !is_finite(a) || !is_finite(b) {
@@ -173,16 +185,32 @@ pub fn sub_date(a: i32, b: i32) -> Result<i32, DateError> {
     Ok(a - b)
 }
 
+/// `date field value out of range for timestamp` — a finite date whose midnight
+/// falls outside the `timestamp` microsecond range (PG's `date2timestamp`).
+fn out_of_range_for_timestamp() -> DateError {
+    DateError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        message: "date out of range for timestamp".to_string(),
+    }
+}
+
+const USECS_PER_DAY: i64 = SECS_PER_DAY * 1_000_000;
+
 /// A finite date as microseconds since 2000-01-01 (midnight), or the matching
-/// timestamp ±infinity sentinel.
-pub fn to_timestamp_micros(d: i32) -> i64 {
+/// timestamp ±infinity sentinel. Errors when the date is representable as a
+/// `date` but its midnight overflows the `timestamp` range (dates run to year
+/// 5874897, far past `timestamp`'s 294276) — matching PG's `date out of range
+/// for timestamp`.
+pub fn to_timestamp_micros(d: i32) -> Result<i64, DateError> {
     if d == POS_INFINITY {
-        return timestamp::POS_INFINITY;
+        return Ok(timestamp::POS_INFINITY);
     }
     if d == NEG_INFINITY {
-        return timestamp::NEG_INFINITY;
+        return Ok(timestamp::NEG_INFINITY);
     }
-    d as i64 * (SECS_PER_DAY * 1_000_000)
+    (d as i64)
+        .checked_mul(USECS_PER_DAY)
+        .ok_or_else(out_of_range_for_timestamp)
 }
 
 /// The calendar date of a timestamp (`timestamp::to_date` direction): the
@@ -201,20 +229,34 @@ pub fn from_timestamp_micros(micros: i64) -> i32 {
 /// `date + interval` / `date - interval` → `timestamp`: widen the date to
 /// midnight, then apply the timestamp/interval arithmetic.
 pub fn pl_interval(d: i32, span: Interval) -> Result<i64, DateError> {
-    timestamp::pl_interval(to_timestamp_micros(d), span).map_err(from_ts_err)
+    timestamp::pl_interval(to_timestamp_micros(d)?, span).map_err(from_ts_err)
 }
 
 pub fn mi_interval(d: i32, span: Interval) -> Result<i64, DateError> {
-    timestamp::mi_interval(to_timestamp_micros(d), span).map_err(from_ts_err)
+    timestamp::mi_interval(to_timestamp_micros(d)?, span).map_err(from_ts_err)
 }
 
 /// `date + time` → `timestamp`: midnight of the date plus the time-of-day.
 pub fn pl_time(d: i32, time_usec: i64) -> Result<i64, DateError> {
+    let micros = to_timestamp_micros(d)?;
     if !is_finite(d) {
-        return Ok(to_timestamp_micros(d));
+        return Ok(micros);
     }
-    to_timestamp_micros(d)
-        .checked_add(time_usec)
+    micros.checked_add(time_usec).ok_or_else(out_of_range)
+}
+
+/// `date + timetz` → `timestamptz`: the UTC instant of the date's midnight plus
+/// the zoned time-of-day (`local usec + zone-west offset`). Matches PG's
+/// `datetimetz_timestamptz`.
+pub fn pl_timetz(d: i32, t: crate::TimeTz) -> Result<i64, DateError> {
+    let micros = to_timestamp_micros(d)?;
+    if !is_finite(d) {
+        return Ok(micros);
+    }
+    // `t.zone` is seconds west of UTC, so adding it shifts the local time to UTC.
+    micros
+        .checked_add(t.usec)
+        .and_then(|m| m.checked_add(t.zone as i64 * 1_000_000))
         .ok_or_else(out_of_range)
 }
 

@@ -222,10 +222,12 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- date ↔ timestamp / timestamptz ----
         // A date widens to midnight; the UTC identity (session zone is UTC)
         // carries it to timestamptz too. The reverse takes the calendar date.
-        (Value::Date(d), PgType::Timestamp) => Ok(Value::Timestamp(date::to_timestamp_micros(*d))),
-        (Value::Date(d), PgType::TimestampTz) => {
-            Ok(Value::TimestampTz(date::to_timestamp_micros(*d)))
-        }
+        (Value::Date(d), PgType::Timestamp) => date::to_timestamp_micros(*d)
+            .map(Value::Timestamp)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Date(d), PgType::TimestampTz) => date::to_timestamp_micros(*d)
+            .map(Value::TimestampTz)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
         (Value::Timestamp(m), PgType::Date) => Ok(Value::Date(date::from_timestamp_micros(*m))),
         (Value::TimestampTz(m), PgType::Date) => Ok(Value::Date(date::from_timestamp_micros(*m))),
 

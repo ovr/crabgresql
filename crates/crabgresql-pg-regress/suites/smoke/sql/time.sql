@@ -16,6 +16,8 @@ SELECT time '01:00' < time '02:00' AS lt, time '12:00' = time '12:00:00' AS eq;
 
 -- casts, including time <-> interval
 SELECT '13:30:00'::time AS from_text;
+-- a numeric zone offset glued to the time is accepted and ignored
+SELECT time '13:30:00-04' AS glued_zone;
 SELECT (time '13:30:00')::text AS to_text;
 SELECT (time '13:30:00')::interval AS to_interval;
 SELECT (interval '13:30:00')::time AS from_interval;

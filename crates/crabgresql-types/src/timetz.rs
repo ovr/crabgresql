@@ -7,8 +7,9 @@
 //! by differential tests against real PG, implemented independently.
 //!
 //! Representation: [`TimeTz`] carries the local time-of-day (`usec`, `[0,
-//! 86_400_000_000]`) plus `zone`, the offset in **seconds west of UTC**
-//! (PG's `TimeTzADT.zone` convention: a `-07` display offset stores `+25200`).
+//! 86_400_000_000]`) plus `zone`, the offset in **seconds west of UTC** — a
+//! value that displays as `-07` stores `+25200`, chosen so ordering by the UTC
+//! instant is `usec + zone*USECS_PER_SEC` (pinned by the ordering tests).
 //!
 //! Deviations from PG, acceptable while no passing test needs them: a numeric
 //! offset (`-07`, `+05:30`) is honored, but resolving a named zone or dynamic

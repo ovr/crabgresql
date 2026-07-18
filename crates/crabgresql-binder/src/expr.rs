@@ -1152,7 +1152,9 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
     }
 
     use PgType::{Date as D, Interval as I, Time as TI, TimeTz as TZ, Timestamp as T};
-    let is_int = |t: Option<PgType>| matches!(t, Some(PgType::Int2 | PgType::Int4 | PgType::Int8));
+    // Only int2/int4 pair with `date` (PG has `date + int4`; int2 widens to it).
+    // int8 has no `date + bigint` operator, so it must fall through to an error.
+    let is_int = |t: Option<PgType>| matches!(t, Some(PgType::Int2 | PgType::Int4));
     let typed = |b: &Binding| match b {
         Binding::Typed(e) => e.clone(),
         Binding::Unknown { .. } => unreachable!("typed side is Typed"),
@@ -1187,6 +1189,13 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             (Some(I), Some(D)) => call(ScalarFn::DatePlInterval, T, typed(rb), typed(lb)),
             (Some(D), Some(TI)) => call(ScalarFn::DatePlTime, T, typed(lb), typed(rb)),
             (Some(TI), Some(D)) => call(ScalarFn::DatePlTime, T, typed(rb), typed(lb)),
+            // date + timetz -> timestamptz.
+            (Some(D), Some(TZ)) => {
+                call(ScalarFn::DatePlTimeTz, PgType::TimestampTz, typed(lb), typed(rb))
+            }
+            (Some(TZ), Some(D)) => {
+                call(ScalarFn::DatePlTimeTz, PgType::TimestampTz, typed(rb), typed(lb))
+            }
             // time + interval -> time; timetz + interval -> timetz.
             (Some(TI), Some(I)) => call(ScalarFn::TimePlInterval, TI, typed(lb), typed(rb)),
             (Some(I), Some(TI)) => call(ScalarFn::TimePlInterval, TI, typed(rb), typed(lb)),
@@ -1212,6 +1221,15 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
                 call(ScalarFn::DateMiDays, D, typed(lb), resolve_operand(rb, PgType::Int4)?)
             }
             (Some(D), Some(I)) => call(ScalarFn::DateMiInterval, T, typed(lb), typed(rb)),
+            // date - timestamp / timestamp - date -> interval: widen the date to
+            // a timestamp (midnight) and take the timestamp difference, as PG's
+            // implicit date->timestamp cast does.
+            (Some(D), Some(T)) => {
+                call(ScalarFn::TimestampMi, I, resolve_operand(lb, T)?, typed(rb))
+            }
+            (Some(T), Some(D)) => {
+                call(ScalarFn::TimestampMi, I, typed(lb), resolve_operand(rb, T)?)
+            }
             (Some(D), None) => call(ScalarFn::DateMi, PgType::Int4, typed(lb), resolve_operand(rb, D)?),
             (None, Some(D)) => call(ScalarFn::DateMi, PgType::Int4, resolve_operand(lb, D)?, typed(rb)),
             // time - time -> interval; time - interval -> time; timetz - interval -> timetz.

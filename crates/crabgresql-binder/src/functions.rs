@@ -129,6 +129,8 @@ pub enum ScalarFn {
     DateMiInterval,
     /// `date + time -> timestamp`.
     DatePlTime,
+    /// `date + timetz -> timestamptz`.
+    DatePlTimeTz,
     /// `date_part(text, date) -> float8`.
     DatePartDate,
     /// `EXTRACT(field FROM date) -> numeric`.
