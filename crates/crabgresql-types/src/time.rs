@@ -175,12 +175,15 @@ fn parse_hms(tok: &str) -> Option<(i64, i64, i64, i64)> {
 /// `time + interval` (`time_pl_interval`): add the interval's time-of-day part
 /// (its month/day fields are irrelevant to a bare time) and wrap into the day.
 pub fn pl_interval(usec: i64, span: Interval) -> i64 {
-    (usec + span.usec).rem_euclid(USECS_PER_DAY)
+    // Fold the interval into a single day first: for a large interval `span.usec`
+    // can be near `i64::MAX`, so adding it directly would overflow. Modular
+    // reduction commutes with the add, so the result is unchanged.
+    (usec + span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY)
 }
 
 /// `time - interval` (`time_mi_interval`): the negation of the add.
 pub fn mi_interval(usec: i64, span: Interval) -> i64 {
-    (usec - span.usec).rem_euclid(USECS_PER_DAY)
+    (usec - span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY)
 }
 
 /// `time - time` (`time_mi_time`): the microsecond difference, as an interval
@@ -352,6 +355,12 @@ mod tests {
         let base = t("10:00:00");
         assert_eq!(format(pl_interval(base, interval("01:30:00"))), "11:30:00");
         assert_eq!(mi(t("10:00:00"), t("08:00:00")).usec, 2 * USECS_PER_HOUR);
+
+        // A huge interval must fold into the day, not overflow i64.
+        let huge = Interval { months: 0, days: 0, usec: i64::MAX };
+        let folded = i64::MAX.rem_euclid(USECS_PER_DAY);
+        assert_eq!(pl_interval(base, huge), (base + folded).rem_euclid(USECS_PER_DAY));
+        assert_eq!(mi_interval(base, huge), (base - folded).rem_euclid(USECS_PER_DAY));
     }
 
     #[test]

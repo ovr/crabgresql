@@ -200,12 +200,14 @@ fn is_date_token(tok: &str) -> bool {
 
 /// `timetz + interval`: shift the local time-of-day, keeping the zone.
 pub fn pl_interval(v: TimeTz, span: Interval) -> TimeTz {
-    TimeTz { usec: (v.usec + span.usec).rem_euclid(USECS_PER_DAY), zone: v.zone }
+    // Reduce the interval mod a day before adding to avoid i64 overflow on large
+    // intervals; modular reduction commutes with the add (see time::pl_interval).
+    TimeTz { usec: (v.usec + span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY), zone: v.zone }
 }
 
 /// `timetz - interval`: the negation of the add.
 pub fn mi_interval(v: TimeTz, span: Interval) -> TimeTz {
-    TimeTz { usec: (v.usec - span.usec).rem_euclid(USECS_PER_DAY), zone: v.zone }
+    TimeTz { usec: (v.usec - span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY), zone: v.zone }
 }
 
 // --- field extraction (date_part / extract) --------------------------------
