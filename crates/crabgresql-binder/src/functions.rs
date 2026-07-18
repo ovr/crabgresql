@@ -94,6 +94,19 @@ pub enum ScalarFn {
     /// `abbrev(cidr) -> text`.
     AbbrevCidr,
 
+    // --- macaddr / macaddr8 operators + functions (width-dispatched at
+    // runtime; the result type is carried in the `BoundExpr`). ---
+    /// `~macaddr` / `~macaddr8` — one's complement.
+    MacaddrNot,
+    /// `macaddr & macaddr` / `macaddr8 & macaddr8` — bytewise AND.
+    MacaddrAnd,
+    /// `macaddr | macaddr` / `macaddr8 | macaddr8` — bytewise OR.
+    MacaddrOr,
+    /// `trunc(macaddr)` / `trunc(macaddr8)` — zero the low bytes.
+    MacaddrTrunc,
+    /// `macaddr8_set7bit(macaddr8) -> macaddr8`.
+    Macaddr8Set7bit,
+
     // --- interval operators (built directly by the binder, not via `lookup`) ---
     /// unary `- interval`.
     IntervalNeg,
@@ -534,6 +547,8 @@ const CIDR: PgType = PgType::Cidr;
 const MONEY: PgType = PgType::Money;
 const BIT: PgType = PgType::Bit;
 const VARBIT: PgType = PgType::Varbit;
+const MACADDR: PgType = PgType::Macaddr;
+const MACADDR8: PgType = PgType::Macaddr8;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -564,7 +579,14 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature { func: ScalarFn::Trunc, args: &[F8], ret: F8 },
             Signature { func: ScalarFn::NumTrunc, args: &[NUM], ret: NUM },
             Signature { func: ScalarFn::NumTrunc, args: &[NUM, I4], ret: NUM },
+            Signature { func: ScalarFn::MacaddrTrunc, args: &[MACADDR], ret: MACADDR },
+            Signature { func: ScalarFn::MacaddrTrunc, args: &[MACADDR8], ret: MACADDR8 },
         ],
+        "macaddr8_set7bit" => &[Signature {
+            func: ScalarFn::Macaddr8Set7bit,
+            args: &[MACADDR8],
+            ret: MACADDR8,
+        }],
         "round" => &[
             Signature { func: ScalarFn::Round, args: &[F8], ret: F8 },
             Signature { func: ScalarFn::NumRound, args: &[NUM], ret: NUM },

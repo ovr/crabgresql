@@ -582,6 +582,8 @@ pub(crate) fn is_orderable(ty: PgType) -> bool {
             | PgType::Inet
             | PgType::Cidr
             | PgType::Money
+            | PgType::Macaddr
+            | PgType::Macaddr8
     )
 }
 
@@ -722,6 +724,8 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                 Some("name") => PgType::Name,
                 Some("money") => PgType::Money,
                 Some("oid") => PgType::Oid,
+                Some("macaddr") => PgType::Macaddr,
+                Some("macaddr8") => PgType::Macaddr8,
                 _ => {
                     return Err(BindError::feature_not_supported(format!(
                         "type \"{dt}\" is not supported yet"
@@ -1270,6 +1274,15 @@ fn bind_unary(
                     args: vec![e],
                 }))
             }
+            // `~macaddr` / `~macaddr8` — one's complement, same type back.
+            Binding::Typed(e) if matches!(e.ty(), PgType::Macaddr | PgType::Macaddr8) => {
+                let ret = e.ty();
+                Ok(Binding::Typed(BoundExpr::FuncCall {
+                    func: ScalarFn::MacaddrNot,
+                    ret,
+                    args: vec![e],
+                }))
+            }
             Binding::Typed(e) => Err(no_op_unary("~", e.ty().name())),
             Binding::Unknown { .. } => Err(ambiguous_unary("~")),
         },
@@ -1473,6 +1486,12 @@ fn bind_binary(
     // `ScalarFn` calls. Tried after the network path so an inet operand still
     // wins; falls through so integer `&`/`|`/`<<` keep their error.
     if let Some(binding) = resolve_bit_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
+    // `macaddr`/`macaddr8` bitwise `&`/`|` — like the inet operators, they don't
+    // fit the single-`arg_ty` `Binary` node and lower to `ScalarFn` calls.
+    if let Some(binding) = resolve_macaddr_op(op, &lb, &rb)? {
         return Ok(binding);
     }
 
@@ -2041,6 +2060,59 @@ fn resolve_bit_op(
     Ok(None)
 }
 
+/// `macaddr`/`macaddr8` `&`/`|`: lower to the width-dispatched `ScalarFn`. PG has
+/// only `macaddr & macaddr` and `macaddr8 & macaddr8` — no cross-width operator
+/// and no implicit `macaddr`<->`macaddr8` — so both operands must settle on the
+/// *same* mac type. The typed side fixes that type; an untyped literal adopts it
+/// (EUI-64 expanding for `macaddr8`). Two typed operands of different mac widths,
+/// or a mac paired with any other typed value, have no operator: report PG's
+/// `operator does not exist` rather than silently coercing one side.
+fn resolve_macaddr_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+) -> Result<Option<Binding>, BindError> {
+    use ast::BinaryOperator as B;
+    let func = match op {
+        B::BitwiseAnd => ScalarFn::MacaddrAnd,
+        B::BitwiseOr => ScalarFn::MacaddrOr,
+        _ => return Ok(None),
+    };
+    let lt = binding_typed_ty(lb);
+    let rt = binding_typed_ty(rb);
+    let is_mac = |t: Option<PgType>| matches!(t, Some(PgType::Macaddr | PgType::Macaddr8));
+    // Not our operator unless at least one side is a mac type.
+    if !is_mac(lt) && !is_mac(rt) {
+        return Ok(None);
+    }
+    // The mac type both operands must share, taken from a typed mac operand.
+    // Two typed mac operands of different widths have no operator.
+    let mac_ty = match (lt, rt) {
+        (Some(l), Some(r)) if is_mac(lt) && is_mac(rt) => {
+            if l != r {
+                return Err(net_no_operator(lb, op, rb));
+            }
+            l
+        }
+        (Some(l), _) if is_mac(lt) => l,
+        (_, Some(r)) if is_mac(rt) => r,
+        _ => unreachable!("at least one operand is a mac type"),
+    };
+    // The partner must be the same-typed mac (handled above) or an untyped
+    // literal; a typed non-mac partner (e.g. `macaddr & integer`) has no operator.
+    let typed_non_mac = |t: Option<PgType>| t.is_some() && !is_mac(t);
+    if typed_non_mac(lt) || typed_non_mac(rt) {
+        return Err(net_no_operator(lb, op, rb));
+    }
+    let a = resolve_operand(lb, mac_ty)?;
+    let b = resolve_operand(rb, mac_ty)?;
+    Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+        func,
+        ret: mac_ty,
+        args: vec![a, b],
+    })))
+}
+
 /// Materialize an operand at `target`: an untyped literal is parsed as `target`,
 /// a typed operand is coerced (used for the numeric `* /` factor → float8).
 fn resolve_operand(b: &Binding, target: PgType) -> Result<BoundExpr, BindError> {
@@ -2523,6 +2595,12 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         // declared length) is applied afterward by the caller's coercion.
         PgType::Bit | PgType::Varbit => crabgresql_types::bit::input(s)
             .map(|(len, data)| Value::Bit { len, data })
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Macaddr => crabgresql_types::macaddr::parse_macaddr(s)
+            .map(Value::Macaddr)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Macaddr8 => crabgresql_types::macaddr::parse_macaddr8(s)
+            .map(Value::Macaddr8)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::User(_) => Err(invalid()),
     }

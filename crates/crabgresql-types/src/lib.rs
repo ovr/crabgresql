@@ -10,6 +10,7 @@ pub mod cast;
 pub mod date;
 pub mod float;
 pub mod interval;
+pub mod macaddr;
 pub mod money;
 pub mod net;
 pub mod numeric;
@@ -55,6 +56,8 @@ pub mod oid {
     pub const NUMERIC: u32 = 1700;
     pub const CIDR: u32 = 650;
     pub const INET: u32 = 869;
+    pub const MACADDR: u32 = 829;
+    pub const MACADDR8: u32 = 774;
     pub const UUID: u32 = 2950;
 }
 
@@ -107,6 +110,10 @@ pub enum PgType {
     Inet,
     /// `cidr`: an IPv4/IPv6 network specification. See [`crate::net`].
     Cidr,
+    /// `macaddr`: a 6-byte MAC address. See [`crate::macaddr`].
+    Macaddr,
+    /// `macaddr8`: an 8-byte MAC address (EUI-64). See [`crate::macaddr`].
+    Macaddr8,
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -140,6 +147,8 @@ impl PgType {
             PgType::Uuid => oid::UUID,
             PgType::Inet => oid::INET,
             PgType::Cidr => oid::CIDR,
+            PgType::Macaddr => oid::MACADDR,
+            PgType::Macaddr8 => oid::MACADDR8,
             PgType::User(oid) => oid,
         }
     }
@@ -162,6 +171,8 @@ impl PgType {
             PgType::Interval => 16,
             PgType::Uuid => 16,
             PgType::Oid => 4,
+            PgType::Macaddr => 6,
+            PgType::Macaddr8 => 8,
             // `name` is a fixed 64-byte type; the rest are varlena.
             PgType::Name => 64,
             PgType::Numeric
@@ -205,6 +216,8 @@ impl PgType {
             PgType::Uuid => "uuid",
             PgType::Inet => "inet",
             PgType::Cidr => "cidr",
+            PgType::Macaddr => "macaddr",
+            PgType::Macaddr8 => "macaddr8",
             PgType::User(_) => "user-defined",
         }
     }
@@ -238,6 +251,8 @@ impl PgType {
             PgType::Uuid => "uuid",
             PgType::Inet => "inet",
             PgType::Cidr => "cidr",
+            PgType::Macaddr => "macaddr",
+            PgType::Macaddr8 => "macaddr8",
             PgType::User(_) => "user-defined",
         }
     }
@@ -317,6 +332,10 @@ pub enum Value {
     Inet(Inet),
     /// `cidr`: an IPv4/IPv6 network specification. See [`crate::net`].
     Cidr(Inet),
+    /// `macaddr`: 6 raw bytes. See [`crate::macaddr`].
+    Macaddr([u8; 6]),
+    /// `macaddr8`: 8 raw bytes (EUI-64). See [`crate::macaddr`].
+    Macaddr8([u8; 8]),
 }
 
 impl Value {
@@ -344,6 +363,8 @@ impl Value {
             Value::Uuid(_) => Some(PgType::Uuid),
             Value::Inet(_) => Some(PgType::Inet),
             Value::Cidr(_) => Some(PgType::Cidr),
+            Value::Macaddr(_) => Some(PgType::Macaddr),
+            Value::Macaddr8(_) => Some(PgType::Macaddr8),
         }
     }
 
@@ -385,6 +406,8 @@ impl Value {
             Value::Uuid(b) => Some(uuid::format(b)),
             Value::Inet(v) => Some(net::inet_out(v)),
             Value::Cidr(v) => Some(net::cidr_out(v)),
+            Value::Macaddr(b) => Some(macaddr::format6(b)),
+            Value::Macaddr8(b) => Some(macaddr::format8(b)),
         }
     }
 }

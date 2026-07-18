@@ -227,6 +227,8 @@ fn pgtype_from_oid(o: u32) -> PgType {
         oid::INET => PgType::Inet,
         oid::CIDR => PgType::Cidr,
         oid::MONEY => PgType::Money,
+        oid::MACADDR => PgType::Macaddr,
+        oid::MACADDR8 => PgType::Macaddr8,
         other => PgType::User(other),
     }
 }

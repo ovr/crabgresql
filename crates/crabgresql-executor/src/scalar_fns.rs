@@ -12,8 +12,8 @@ use std::hint::black_box;
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, TimeTz, Value, bit, date, float, interval, money, net, text, time,
-    timestamp, timestamptz, timetz, to_char,
+    Inet, Interval, Numeric, TimeTz, Value, bit, date, float, interval, macaddr, money, net, text,
+    time, timestamp, timestamptz, timetz, to_char,
 };
 
 use crate::ExecError;
@@ -496,6 +496,42 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::Network => return Ok(Value::Cidr(net::network(inet(&args[0])))),
         ScalarFn::AbbrevInet => return Ok(Value::Text(net::abbrev_inet(inet(&args[0])))),
         ScalarFn::AbbrevCidr => return Ok(Value::Text(net::abbrev_cidr(inet(&args[0])))),
+
+        // --- macaddr / macaddr8 operators + functions (width-dispatched) ---
+        ScalarFn::MacaddrNot => {
+            return Ok(match &args[0] {
+                Value::Macaddr(b) => Value::Macaddr(macaddr::not6(b)),
+                Value::Macaddr8(b) => Value::Macaddr8(macaddr::not8(b)),
+                other => unreachable!("expected macaddr/macaddr8, got {other:?}"),
+            });
+        }
+        ScalarFn::MacaddrAnd => {
+            return Ok(match (&args[0], &args[1]) {
+                (Value::Macaddr(a), Value::Macaddr(b)) => Value::Macaddr(macaddr::and6(a, b)),
+                (Value::Macaddr8(a), Value::Macaddr8(b)) => Value::Macaddr8(macaddr::and8(a, b)),
+                other => unreachable!("expected matching macaddr args, got {other:?}"),
+            });
+        }
+        ScalarFn::MacaddrOr => {
+            return Ok(match (&args[0], &args[1]) {
+                (Value::Macaddr(a), Value::Macaddr(b)) => Value::Macaddr(macaddr::or6(a, b)),
+                (Value::Macaddr8(a), Value::Macaddr8(b)) => Value::Macaddr8(macaddr::or8(a, b)),
+                other => unreachable!("expected matching macaddr args, got {other:?}"),
+            });
+        }
+        ScalarFn::MacaddrTrunc => {
+            return Ok(match &args[0] {
+                Value::Macaddr(b) => Value::Macaddr(macaddr::trunc6(b)),
+                Value::Macaddr8(b) => Value::Macaddr8(macaddr::trunc8(b)),
+                other => unreachable!("expected macaddr/macaddr8, got {other:?}"),
+            });
+        }
+        ScalarFn::Macaddr8Set7bit => {
+            return Ok(match &args[0] {
+                Value::Macaddr8(b) => Value::Macaddr8(macaddr::set7bit(b)),
+                other => unreachable!("expected macaddr8, got {other:?}"),
+            });
+        }
 
         // --- interval functions ---
         ScalarFn::DatePartInterval => {
@@ -1016,6 +1052,12 @@ pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, Str
             timetz::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message))
         }
         "money" => money::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message)),
+        "macaddr" => macaddr::parse_macaddr(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
+        "macaddr8" => macaddr::parse_macaddr8(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
         // Other types: not exercised; treat as valid.
         _ => Ok(()),
     }

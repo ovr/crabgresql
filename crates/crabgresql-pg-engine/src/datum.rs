@@ -31,6 +31,8 @@ const T_INET: u8 = 18;
 const T_CIDR: u8 = 19;
 const T_MONEY: u8 = 20;
 const T_OID: u8 = 21;
+const T_MACADDR: u8 = 22;
+const T_MACADDR8: u8 = 23;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -129,6 +131,14 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.push(T_MONEY);
             out.extend_from_slice(&c.to_le_bytes());
         }
+        Value::Macaddr(b) => {
+            out.push(T_MACADDR);
+            out.extend_from_slice(b);
+        }
+        Value::Macaddr8(b) => {
+            out.push(T_MACADDR8);
+            out.extend_from_slice(b);
+        }
     }
 }
 
@@ -221,6 +231,16 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         T_INET => r.net(false),
         T_CIDR => r.net(true),
         T_MONEY => Value::Money(r.i64()),
+        T_MACADDR => {
+            let mut b = [0u8; 6];
+            b.copy_from_slice(r.take(6));
+            Value::Macaddr(b)
+        }
+        T_MACADDR8 => {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(r.take(8));
+            Value::Macaddr8(b)
+        }
         other => panic!("corrupt datum tag {other}"),
     };
     *pos = r.pos;
@@ -264,6 +284,8 @@ mod tests {
         roundtrip(Value::Uuid([9u8; 16]));
         roundtrip(Value::Money(i64::MIN));
         roundtrip(Value::Money(12345));
+        roundtrip(Value::Macaddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]));
+        roundtrip(Value::Macaddr8([0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03]));
     }
 
     #[test]
