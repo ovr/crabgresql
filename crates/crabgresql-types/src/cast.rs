@@ -195,8 +195,10 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- timestamp ↔ timestamptz ----
         // With the session zone fixed to UTC these are an identity on the raw
         // microseconds (the wall clock equals the UTC instant), infinities
-        // included. Kept explicit so a future non-UTC session breaks loudly here
-        // rather than silently returning the wrong instant.
+        // included. WARNING: this is correct ONLY because the session/display
+        // zone is always UTC. When a real `TimeZone` GUC is added these arms
+        // must convert using it — they will NOT fail on their own, so revisit
+        // here (and `timestamptz::{parse,format,make_timestamptz}`) at that time.
         (Value::Timestamp(m), PgType::TimestampTz) => Ok(Value::TimestampTz(*m)),
         (Value::TimestampTz(m), PgType::Timestamp) => Ok(Value::Timestamp(*m)),
 

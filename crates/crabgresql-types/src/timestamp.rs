@@ -555,9 +555,18 @@ fn parse_fraction(frac: &str) -> Option<i64> {
 /// Split a date field with a glued zone but no time — `2001-02-16+00`
 /// (offset starts at the unambiguous `+`) or `2001-02-16Z`/`...z` (trailing
 /// `Z`) — into `(date, zone)`. Returns `None` when there is no such suffix.
+///
+/// A glued zone with no time can only be a numeric offset (`+HH[:MM[:SS]]`) or
+/// `Z`; a named zone or abbreviation is always whitespace-separated. So the
+/// `+` remainder must be an offset shape (digits and colons) — otherwise
+/// `2001-02-16+garbage` would be wrongly accepted (PG rejects it as `22007`).
 fn split_date_zone(field: &str) -> Option<(&str, String)> {
     if let Some(plus) = field.find('+') {
-        return Some((&field[..plus], field[plus..].to_string()));
+        let rest = &field[plus + 1..];
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+            return Some((&field[..plus], field[plus..].to_string()));
+        }
+        return None;
     }
     if let Some(core) = field.strip_suffix(['Z', 'z']) {
         // Only when the remainder looks like a date, not e.g. a bare "z".
@@ -1049,6 +1058,17 @@ mod tests {
             "1997-06-10 17:32:01"
         );
         assert_eq!(format(ts("Mon Feb 10 17:32:01 1997 PST")), "1997-02-10 17:32:01");
+    }
+
+    #[test]
+    fn glued_date_zone() {
+        // A date with a glued numeric offset / `Z` parses (the zone is ignored
+        // by this zone-less type), matching PG.
+        assert_eq!(format(ts("2001-02-16+00")), "2001-02-16 00:00:00");
+        assert_eq!(format(ts("2001-02-16Z")), "2001-02-16 00:00:00");
+        // But a bogus glued suffix is a syntax error, not a silently-ignored
+        // zone (PG rejects `2001-02-16+garbage`).
+        assert_eq!(parse("2001-02-16+garbage").unwrap_err().sqlstate, INVALID_DATETIME_FORMAT);
     }
 
     #[test]

@@ -112,7 +112,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         ScalarFn::MakeTimestampTz => {
             // The 7th argument (a text zone) is optional.
-            let zone = args.get(6).map(|a| text(a));
+            let zone = args.get(6).map(text);
             return timestamptz::make_timestamptz(
                 i4(&args[0]) as i64,
                 i4(&args[1]) as i64,

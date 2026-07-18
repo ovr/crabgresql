@@ -176,11 +176,15 @@ fn parse_fixed(token: &str) -> Option<Result<i32, ZoneError>> {
     if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit() || b == b':') {
         return None;
     }
-    let (h, m, s) = if body.contains(':') {
+    // Parse the hour/minute/second components as `i64`: the colon-form hour is
+    // otherwise unbounded, so computing `h * 3600` in a narrower type would
+    // overflow (panic in debug) before the displacement check below. A body that
+    // does not fit in `i64` falls through as unrecognized.
+    let (h, m, s): (i64, i64, i64) = if body.contains(':') {
         let mut it = body.split(':');
-        let h: i32 = it.next()?.parse().ok()?;
-        let m: i32 = it.next().map(|p| p.parse()).transpose().ok()?.unwrap_or(0);
-        let s: i32 = it.next().map(|p| p.parse()).transpose().ok()?.unwrap_or(0);
+        let h = it.next()?.parse().ok()?;
+        let m = it.next().map(|p| p.parse()).transpose().ok()?.unwrap_or(0);
+        let s = it.next().map(|p| p.parse()).transpose().ok()?.unwrap_or(0);
         if it.next().is_some() {
             return Some(Err(ZoneError::NotRecognized(token.to_string())));
         }
@@ -201,11 +205,13 @@ fn parse_fixed(token: &str) -> Option<Result<i32, ZoneError>> {
     if !(0..60).contains(&m) || !(0..60).contains(&s) {
         return Some(Err(ZoneError::DisplacementOutOfRange(token.to_string())));
     }
-    let secs = sign * (h * 3600 + m * 60 + s);
-    if secs.abs() > MAX_TZ_DISPLACEMENT_SECS {
+    // `h` is bounded only by `i64`; do the arithmetic in `i64` and reject an
+    // out-of-range magnitude rather than overflowing.
+    let secs = sign as i64 * (h * 3600 + m * 60 + s);
+    if secs.abs() > MAX_TZ_DISPLACEMENT_SECS as i64 {
         return Some(Err(ZoneError::DisplacementOutOfRange(token.to_string())));
     }
-    Some(Ok(secs))
+    Some(Ok(secs as i32))
 }
 
 /// How an abbreviation resolves.
@@ -269,6 +275,14 @@ mod tests {
         ));
         // ±15:59:59 is the last accepted magnitude.
         assert_eq!(fixed(&resolve_zone("+15:59:59").unwrap()), 15 * 3600 + 59 * 60 + 59);
+        // A huge colon-form hour must be rejected as out-of-range, not overflow
+        // `h * 3600` (which panicked in debug before the fix).
+        for tok in ["+600000:00", "-600000:00", "+2000000000:00", "+99"] {
+            assert!(
+                matches!(resolve_zone(tok), Err(ZoneError::DisplacementOutOfRange(_))),
+                "{tok}"
+            );
+        }
     }
 
     #[test]

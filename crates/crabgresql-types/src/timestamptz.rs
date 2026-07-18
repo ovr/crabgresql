@@ -49,6 +49,31 @@ fn out_of_range(input: &str) -> TimestampError {
     }
 }
 
+/// The valueless `timestamp out of range` error PG raises when an offset or a
+/// constructor pushes an instant past the representable range (no quoted input).
+fn out_of_range_bare() -> TimestampError {
+    TimestampError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        message: "timestamp out of range".to_string(),
+    }
+}
+
+/// `date/time field value out of range` — PG's error when a *field* (here the
+/// year) overflows its `int` decoder, distinct from the value-range
+/// `out_of_range`. The boundary is `i32` (verified against PG).
+fn field_out_of_range(input: &str) -> TimestampError {
+    TimestampError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        message: format!("date/time field value out of range: \"{input}\""),
+    }
+}
+
+/// Whether a stored microsecond value is within PG's timestamp range,
+/// `[4714-11-24 00:00:00 BC, 294276-12-31 23:59:59.999999]` (both types share it).
+fn in_range(micros: i64) -> bool {
+    micros >= min_micros() && micros < end_micros()
+}
+
 /// Re-label a `22023` unit error delegated to `timestamp` with the `timestamp
 /// with time zone` type name (`timestamp units "x"` -> `timestamp with time
 /// zone units "x"`), matching PG.
@@ -96,6 +121,19 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
         Parsed::Calendar { tm, zone } => (tm, zone),
     };
     validate_fields(&tm, input)?;
+    // Bound the year before `encode` (which multiplies by USECS_PER_DAY) so a
+    // wildly out-of-range year cannot overflow i64. The astronomical span
+    // `-4713..=294_276` covers PG's full range (4714 BC .. 294276 AD); the exact
+    // sub-year boundary is enforced by the post-offset `in_range` check below.
+    // PG distinguishes a year that overflows its `int` field decoder
+    // ("date/time field value out of range") from one merely past the timestamp
+    // range ("timestamp out of range"); the boundary is `i32`.
+    if !(-4713..=294_276).contains(&tm.year) {
+        if tm.year < i32::MIN as i64 || tm.year > i32::MAX as i64 {
+            return Err(field_out_of_range(input));
+        }
+        return Err(out_of_range(input));
+    }
     let civil = encode(tm);
     let off_secs = match zone {
         None => 0,
@@ -112,7 +150,7 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
         }
     };
     let utc = civil - off_secs as i64 * USECS_PER_SEC;
-    if utc < min_micros() || utc >= end_micros() {
+    if !in_range(utc) {
         return Err(out_of_range(input));
     }
     Ok(utc)
@@ -207,7 +245,13 @@ pub fn make_timestamptz(
             tz::offset_for_local(&zone, tmlite(civil))
         }
     };
-    Ok(civil - off_secs as i64 * USECS_PER_SEC)
+    let utc = civil - off_secs as i64 * USECS_PER_SEC;
+    // Applying the zone offset can push the instant past the representable
+    // range even though the civil value was in range (PG errors here).
+    if !in_range(utc) {
+        return Err(out_of_range_bare());
+    }
+    Ok(utc)
 }
 
 /// `timestamptz AT TIME ZONE zone` (= `timezone(zone, timestamptz)`): the wall
@@ -219,7 +263,11 @@ pub fn at_zone_to_timestamp(zone: &str, micros: i64) -> Result<i64, TimestampErr
     }
     let zone = tz::resolve_zone(zone).map_err(zone_error)?;
     let off_secs = tz::offset_for_instant(&zone, micros);
-    Ok(micros + off_secs as i64 * USECS_PER_SEC)
+    let wall = micros + off_secs as i64 * USECS_PER_SEC;
+    if !in_range(wall) {
+        return Err(out_of_range_bare());
+    }
+    Ok(wall)
 }
 
 /// `timestamp AT TIME ZONE zone` (= `timezone(zone, timestamp)`): interpret the
@@ -231,7 +279,11 @@ pub fn timestamp_at_zone(zone: &str, micros: i64) -> Result<i64, TimestampError>
     }
     let zone = tz::resolve_zone(zone).map_err(zone_error)?;
     let off_secs = tz::offset_for_local(&zone, tmlite(micros));
-    Ok(micros - off_secs as i64 * USECS_PER_SEC)
+    let utc = micros - off_secs as i64 * USECS_PER_SEC;
+    if !in_range(utc) {
+        return Err(out_of_range_bare());
+    }
+    Ok(utc)
 }
 
 #[cfg(test)]
@@ -334,5 +386,79 @@ mod tests {
         assert_eq!(date_part("timezone", v).unwrap(), Some(0.0));
         assert_eq!(date_part("timezone_hour", v).unwrap(), Some(0.0));
         assert_eq!(date_part("hour", v).unwrap(), Some(20.0));
+    }
+
+    // A wildly out-of-range year must be rejected with 22008 *before* `encode`,
+    // which would otherwise overflow i64 (`date * USECS_PER_DAY`) and panic in
+    // debug / wrap in release. Regression for the missing pre-encode year guard.
+    #[test]
+    fn huge_year_does_not_overflow() {
+        // In i32 field range but past the timestamp range: "timestamp out of range".
+        for input in ["999999-01-01", "300000-01-01 00:00:00+00"] {
+            let e = parse(input).expect_err(input);
+            assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW, "{input}");
+            assert_eq!(e.message, format!("timestamp out of range: \"{input}\""), "{input}");
+        }
+        // Beyond the i32 field range: "date/time field value out of range"
+        // (must not overflow i64 in `encode`). Both signs.
+        for input in ["5000000000-01-01", "5000000000-01-01 BC"] {
+            let e = parse(input).expect_err(input);
+            assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW, "{input}");
+            assert_eq!(
+                e.message,
+                format!("date/time field value out of range: \"{input}\""),
+                "{input}"
+            );
+        }
+    }
+
+    // A huge colon-form offset hour must not overflow the offset arithmetic
+    // (`h * 3600`); it is rejected as a displacement out of range (22009).
+    // Regression for the i32 multiply overflow in `tz::parse_fixed`.
+    #[test]
+    fn huge_offset_does_not_overflow() {
+        for input in [
+            "2001-01-01 12:00:00 +600000:00",
+            "2001-01-01 12:00:00 -600000:00",
+            "2001-01-01 12:00:00 +99:00",
+        ] {
+            let e = parse(input).expect_err(input);
+            assert_eq!(
+                e.sqlstate,
+                crate::timestamp::INVALID_TIME_ZONE_DISPLACEMENT,
+                "{input}"
+            );
+        }
+    }
+
+    // Applying an offset can push an in-range civil value past the boundary;
+    // that must error rather than return a silent out-of-band value.
+    #[test]
+    fn offset_overflow_is_rejected() {
+        // make_timestamptz: civil is in range, but the -10h zone pushes it past
+        // the upper boundary.
+        assert_eq!(
+            make_timestamptz(294276, 12, 31, 23, 0, 0.0, Some("-10"))
+                .unwrap_err()
+                .sqlstate,
+            DATETIME_FIELD_OVERFLOW
+        );
+        // AT TIME ZONE past the upper boundary (timestamp -> timestamptz).
+        let near_max = timestamp::parse("294276-12-31 23:59:59").unwrap();
+        assert_eq!(
+            timestamp_at_zone("America/New_York", near_max)
+                .unwrap_err()
+                .sqlstate,
+            DATETIME_FIELD_OVERFLOW
+        );
+    }
+
+    // A date with a glued `+` zone is only accepted when the remainder is a
+    // numeric offset; `+garbage` is a syntax error (matches PG), not a value.
+    #[test]
+    fn glued_date_zone_requires_numeric_offset() {
+        assert_eq!(format(p("2001-02-16+00")), "2001-02-16 00:00:00+00");
+        let e = parse("2001-02-16+garbage").unwrap_err();
+        assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT);
     }
 }

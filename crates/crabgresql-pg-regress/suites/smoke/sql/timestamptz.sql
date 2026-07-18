@@ -97,8 +97,24 @@ SELECT pg_input_is_valid('2001-02-16 20:38:40+00', 'timestamptz') AS ok,
        pg_input_is_valid('garbage', 'timestamptz') AS bad,
        pg_input_is_valid('2001-01-01 00:00 Nowhere/Nozone', 'timestamptz') AS bad_zone;
 
--- errors: unparseable input 22007, unknown unit 22023, unknown zone; recovery works
+-- cross-type timestamp/timestamptz comparison and assignment resolve via the
+-- implicit cast (identity under the UTC display zone), as in PG
+SELECT timestamptz '2000-01-01 08:00:00+00' = timestamp '2000-01-01 08:00:00' AS tstz_eq_ts,
+       timestamp '2000-01-01 00:00:00' < timestamptz '2000-06-01 00:00:00+00' AS ts_lt_tstz;
+CREATE TABLE tstz_asgn (d1 timestamptz);
+INSERT INTO tstz_asgn VALUES (timestamp '2002-05-05 05:05:05');
+SELECT d1 FROM tstz_asgn;
+
+-- out-of-range: a year past the range, an offset/constructor pushing past the
+-- boundary — all report 22008 rather than overflowing
+SELECT timestamptz '300000-01-01';
+SELECT make_timestamptz(294276, 12, 31, 23, 0, 0, '-10');
+SELECT timestamp '294276-12-31 23:59:59' AT TIME ZONE 'America/New_York';
+
+-- errors: unparseable input 22007, unknown unit 22023, unknown zone; a bogus
+-- glued zone is a syntax error (not a silently-ignored zone); recovery works
 SELECT timestamptz 'garbage';
+SELECT timestamptz '2001-02-16+garbage';
 SELECT date_part('bogus', timestamptz '2001-02-16+00');
 SELECT make_timestamptz(2013, 7, 15, 8, 15, 23, 'Nowhere/Nozone');
 SELECT 'still alive' AS status;

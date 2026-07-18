@@ -970,6 +970,16 @@ fn unify_types(
         let right = coerce_expr(right, common)?;
         return Ok((left, right, common));
     }
+    // Non-numeric implicit cast (e.g. `timestamp` -> `timestamptz`): when one
+    // side implicitly casts to the other, compare in that common type, as PG
+    // does (`tstz = timestamp`). Numeric pairs are already handled above, so
+    // this only fires for the datetime cast and never changes numeric results.
+    if implicit_castable(lty, rty) {
+        return Ok((coerce_expr(left, rty)?, right, rty));
+    }
+    if implicit_castable(rty, lty) {
+        return Ok((left, coerce_expr(right, lty)?, lty));
+    }
     Err(no_operator(lty.name(), op, rty.name()))
 }
 
@@ -1152,6 +1162,15 @@ pub(crate) fn coerce_to_column(binding: Binding, column: &Column) -> Result<Boun
                 return Ok(e);
             }
             if ty.is_numeric() && column.ty.is_numeric() {
+                return coerce_expr(e, column.ty);
+            }
+            // Assignment context also permits the implicit `timestamp ->
+            // timestamptz` cast and its assignment-only reverse (both are plain
+            // microsecond reinterprets under the UTC session zone), so inserting
+            // a `timestamp` expression into a `timestamptz` column works, as in PG.
+            if implicit_castable(ty, column.ty)
+                || matches!((ty, column.ty), (PgType::TimestampTz, PgType::Timestamp))
+            {
                 return coerce_expr(e, column.ty);
             }
             Err(BindError::new(
