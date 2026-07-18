@@ -631,7 +631,6 @@ impl<'a> Parser<'a> {
                 Keyword::CLOSE => self.parse_close(),
                 Keyword::SET => self.parse_set(),
                 Keyword::SHOW => self.parse_show(),
-                Keyword::USE => self.parse_use(),
                 Keyword::GRANT => self.parse_grant().map(Into::into),
                 Keyword::REVOKE => self.parse_revoke().map(Into::into),
                 Keyword::START => self.parse_start_transaction(),
@@ -14363,40 +14362,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a `USE` statement (database/catalog/schema/warehouse/role selection).
-    pub fn parse_use(&mut self) -> Result<Statement, ParserError> {
-        // No specific keywords are recognized after `USE` for the Generic or
-        // PostgreSQL dialects.
-        let parsed_keyword: Option<Keyword> = None;
 
-        let result = if matches!(parsed_keyword, Some(Keyword::SECONDARY)) {
-            self.parse_secondary_roles()?
-        } else {
-            let obj_name = self.parse_object_name(false)?;
-            match parsed_keyword {
-                Some(Keyword::CATALOG) => Use::Catalog(obj_name),
-                Some(Keyword::DATABASE) => Use::Database(obj_name),
-                Some(Keyword::SCHEMA) => Use::Schema(obj_name),
-                Some(Keyword::WAREHOUSE) => Use::Warehouse(obj_name),
-                Some(Keyword::ROLE) => Use::Role(obj_name),
-                _ => Use::Object(obj_name),
-            }
-        };
-
-        Ok(Statement::Use(result))
-    }
-
-    fn parse_secondary_roles(&mut self) -> Result<Use, ParserError> {
-        self.expect_one_of_keywords(&[Keyword::ROLES, Keyword::ROLE])?;
-        if self.parse_keyword(Keyword::NONE) {
-            Ok(Use::SecondaryRoles(SecondaryRoles::None))
-        } else if self.parse_keyword(Keyword::ALL) {
-            Ok(Use::SecondaryRoles(SecondaryRoles::All))
-        } else {
-            let roles = self.parse_comma_separated(|parser| parser.parse_identifier())?;
-            Ok(Use::SecondaryRoles(SecondaryRoles::List(roles)))
-        }
-    }
 
     /// Parse a table factor followed by any join clauses, returning `TableWithJoins`.
     pub fn parse_table_and_joins(&mut self) -> Result<TableWithJoins, ParserError> {

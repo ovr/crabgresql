@@ -28,7 +28,7 @@ use core::iter;
 use crate::tokenizer::Span;
 
 use super::{
-    comments, dcl::SecondaryRoles, value::ValueWithSpan, AccessExpr, AlterColumnOperation,
+    comments, value::ValueWithSpan, AccessExpr, AlterColumnOperation,
     AlterIndexOperation, AlterTableOperation, Analyze, Array, Assignment, AssignmentTarget,
     AttachedToken, BeginEndStatements, CaseStatement, CloseCursor, ClusteredIndex, ColumnDef,
     ColumnOption, ColumnOptionDef, ConditionalStatementBlock, ConditionalStatements,
@@ -46,7 +46,7 @@ use super::{
     ReferentialAction, RenameSelectItem, ReplaceSelectElement, ReplaceSelectItem, Select,
     SelectInto, SelectItem, SetExpr, SqlOption, Statement, Subscript, SymbolDefinition, TableAlias,
     TableAliasColumnDef, TableConstraint, TableFactor, TableObject, TableOptionsClustered,
-    TableWithJoins, Update, UpdateTableFromKind, Use, Values, ViewColumnDef, WhileStatement,
+    TableWithJoins, Update, UpdateTableFromKind, Values, ViewColumnDef, WhileStatement,
     WildcardAdditionalOptions, With, WithFill,
 };
 
@@ -366,7 +366,6 @@ impl Spanned for Statement {
             Statement::Discard { .. } => Span::empty(),
             Statement::Set(_) => Span::empty(),
             Statement::ShowVariable { .. } => Span::empty(),
-            Statement::Use(u) => u.span(),
             Statement::StartTransaction { .. } => Span::empty(),
             Statement::Comment { .. } => Span::empty(),
             Statement::Commit { .. } => Span::empty(),
@@ -404,25 +403,6 @@ impl Spanned for Statement {
     }
 }
 
-impl Spanned for Use {
-    fn span(&self) -> Span {
-        match self {
-            Use::Catalog(object_name) => object_name.span(),
-            Use::Schema(object_name) => object_name.span(),
-            Use::Database(object_name) => object_name.span(),
-            Use::Warehouse(object_name) => object_name.span(),
-            Use::Role(object_name) => object_name.span(),
-            Use::SecondaryRoles(secondary_roles) => {
-                if let SecondaryRoles::List(roles) = secondary_roles {
-                    return union_spans(roles.iter().map(|i| i.span));
-                }
-                Span::empty()
-            }
-            Use::Object(object_name) => object_name.span(),
-            Use::Default => Span::empty(),
-        }
-    }
-}
 
 impl Spanned for CreateTable {
     fn span(&self) -> Span {

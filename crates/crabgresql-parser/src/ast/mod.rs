@@ -53,8 +53,7 @@ pub use self::data_type::{
     ExactNumberInfo, IntervalFields, StructBracketKind, TimezoneInfo,
 };
 pub use self::dcl::{
-    AlterRoleOperation, CreateRole, Grant, ResetConfig, Revoke, RoleOption, SecondaryRoles,
-    SetConfigValue, Use,
+    AlterRoleOperation, CreateRole, Grant, ResetConfig, Revoke, RoleOption, SetConfigValue,
 };
 pub use self::ddl::{
     Alignment, AlterCollation, AlterCollationOperation, AlterColumnOperation, AlterConnectorOwner,
@@ -3863,10 +3862,6 @@ pub enum Statement {
         variable: Vec<Ident>,
     },
     /// ```sql
-    /// `USE ...`
-    /// ```
-    Use(Use),
-    /// ```sql
     /// START  [ TRANSACTION | WORK ] | START TRANSACTION } ...
     /// ```
     /// If `begin` is false.
@@ -4788,7 +4783,6 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Statement::Use(use_expr) => use_expr.fmt(f),
             Statement::StartTransaction {
                 modes,
                 begin: syntax_begin,
@@ -10884,12 +10878,6 @@ impl From<Merge> for Statement {
 impl From<DropDomain> for Statement {
     fn from(d: DropDomain) -> Self {
         Self::DropDomain(d)
-    }
-}
-
-impl From<Use> for Statement {
-    fn from(u: Use) -> Self {
-        Self::Use(u)
     }
 }
 
