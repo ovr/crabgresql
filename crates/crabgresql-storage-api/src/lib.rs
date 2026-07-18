@@ -193,6 +193,29 @@ pub trait TableEngine: Send + Sync {
 
     /// Remove a table and all its data. `TableNotFound` if it doesn't exist.
     fn drop_table(&self, name: &str) -> Result<(), StorageError>;
+
+    /// Resolve a possibly schema-qualified relation. The default ignores any
+    /// schema (`None` behaves like [`TableEngine::open_table`]; a `Some(_)`
+    /// qualifier is unknown to a plain data engine, so it is not found) — only a
+    /// schema-aware resolver (the server's session catalog) overrides this to
+    /// route `pg_catalog.*` to the system catalog and honor the search path.
+    fn resolve(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<Arc<dyn TableAm>, StorageError> {
+        match schema {
+            None => self.open_table(name),
+            Some(_) => Err(StorageError::TableNotFound(name.to_string())),
+        }
+    }
+
+    /// Enumerate the engine's user relations (name + schema) for catalog
+    /// reflection (`pg_class`/`pg_attribute`). The default is empty; data
+    /// engines that keep a relation registry override it.
+    fn relations(&self) -> Vec<TableSchema> {
+        Vec::new()
+    }
 }
 
 /// A resolved `CREATE TYPE`: its OID and the builtin representation its values

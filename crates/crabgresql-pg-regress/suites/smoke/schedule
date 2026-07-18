@@ -19,3 +19,4 @@ test: string
 test: uuid
 test: inet
 test: cidr
+test: pg_catalog

@@ -569,6 +569,7 @@ pub(crate) fn is_orderable(ty: PgType) -> bool {
             | PgType::Varchar
             | PgType::Bpchar
             | PgType::Name
+            | PgType::Oid
             | PgType::Bytea
             | PgType::Date
             | PgType::Time
@@ -726,6 +727,7 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                 Some("varchar") => PgType::Varchar,
                 Some("name") => PgType::Name,
                 Some("money") => PgType::Money,
+                Some("oid") => PgType::Oid,
                 _ => {
                     return Err(BindError::feature_not_supported(format!(
                         "type \"{dt}\" is not supported yet"
@@ -2021,6 +2023,12 @@ fn implicit_castable(from: PgType, to: PgType) -> bool {
                 // `cidr -> inet` is an implicit cast in PG, so the inet
                 // functions/operators accept a cidr argument.
                 | (Cidr, Inet)
+                // int -> oid is implicit in PG (`oideq` resolves `oid = 42`);
+                // used so catalog predicates/joins compare oid columns to int
+                // literals and each other.
+                | (Int2, Oid)
+                | (Int4, Oid)
+                | (Int8, Oid)
         )
 }
 
@@ -2313,6 +2321,7 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Int2 | PgType::Int4 | PgType::Int8 => {
             cast::text_to_int(s, ty).map_err(|e| BindError::new(e.sqlstate, e.message))
         }
+        PgType::Oid => cast::text_to_oid(s).map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Float4 => float::float4in(s).map(Value::Float4).map_err(float_error),
         PgType::Float8 => float::float8in(s).map(Value::Float8).map_err(float_error),
         PgType::Numeric => Numeric::parse(s).map(Value::Numeric).map_err(|e| match e {

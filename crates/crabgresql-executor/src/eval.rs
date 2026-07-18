@@ -192,6 +192,8 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::Inet | PgType::Cidr => net::network_cmp(inet_of(l), inet_of(r)),
         // money: the natural i64 (cents) order.
         PgType::Money => money::cmp(money_of(l), money_of(r)),
+        // oid: unsigned 32-bit order (PG's `oidcmp`).
+        PgType::Oid => oid_of(l).cmp(&oid_of(r)),
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -233,6 +235,13 @@ fn int4(v: &Value) -> i32 {
     match v {
         Value::Int4(v) => *v,
         other => unreachable!("expected int4, got {other:?}"),
+    }
+}
+
+fn oid_of(v: &Value) -> u32 {
+    match v {
+        Value::Oid(v) => *v,
+        other => unreachable!("expected oid, got {other:?}"),
     }
 }
 

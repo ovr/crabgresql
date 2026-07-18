@@ -30,6 +30,7 @@ const T_UUID: u8 = 17;
 const T_INET: u8 = 18;
 const T_CIDR: u8 = 19;
 const T_MONEY: u8 = 20;
+const T_OID: u8 = 21;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -50,6 +51,10 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         }
         Value::Int4(x) => {
             out.push(T_INT4);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::Oid(x) => {
+            out.push(T_OID);
             out.extend_from_slice(&x.to_le_bytes());
         }
         Value::Int8(x) => {
@@ -181,6 +186,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         T_BOOL => Value::Bool(r.take(1)[0] != 0),
         T_INT2 => Value::Int2(i16::from_le_bytes(r.take(2).try_into().unwrap())),
         T_INT4 => Value::Int4(r.i32()),
+        T_OID => Value::Oid(r.u32()),
         T_INT8 => Value::Int8(r.i64()),
         T_FLOAT4 => Value::Float4(f32::from_bits(r.u32())),
         T_FLOAT8 => Value::Float8(f64::from_bits(r.u64())),

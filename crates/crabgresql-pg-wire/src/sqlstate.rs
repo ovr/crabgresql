@@ -13,6 +13,7 @@ pub const INVALID_ARGUMENT_FOR_LOG: &str = "2201E";
 pub const INVALID_ARGUMENT_FOR_POWER_FUNCTION: &str = "2201F";
 pub const INVALID_ROW_COUNT_IN_LIMIT_CLAUSE: &str = "2201W";
 pub const INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE: &str = "2201X";
+pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
 pub const SYNTAX_ERROR: &str = "42601";
 pub const DUPLICATE_ALIAS: &str = "42712";
 pub const UNDEFINED_COLUMN: &str = "42703";
