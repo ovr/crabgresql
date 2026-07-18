@@ -52,6 +52,14 @@ impl TableEngine for MemoryEngine {
             .map(|t| t as Arc<dyn TableAm>)
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
+
+    fn drop_table(&self, name: &str) -> Result<(), StorageError> {
+        let mut tables = self.tables.write().unwrap();
+        tables
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
+    }
 }
 
 /// One row version: its identity, MVCC header, and column values.
@@ -463,6 +471,30 @@ mod tests {
         let engine = MemoryEngine::new();
         assert!(matches!(
             engine.open_table("nope"),
+            Err(StorageError::TableNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn drop_table_removes_it_and_allows_recreate() {
+        let engine = MemoryEngine::new();
+        engine.create_table(schema("t")).unwrap();
+        engine.drop_table("t").unwrap();
+        // Gone after drop.
+        assert!(matches!(
+            engine.open_table("t"),
+            Err(StorageError::TableNotFound(_))
+        ));
+        // The name is free to reuse.
+        engine.create_table(schema("t")).unwrap();
+        assert!(engine.open_table("t").is_ok());
+    }
+
+    #[test]
+    fn drop_missing_table_fails() {
+        let engine = MemoryEngine::new();
+        assert!(matches!(
+            engine.drop_table("nope"),
             Err(StorageError::TableNotFound(_))
         ));
     }

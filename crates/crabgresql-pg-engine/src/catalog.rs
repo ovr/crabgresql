@@ -96,6 +96,20 @@ impl RelCatalog {
         Ok(RelFileNode(rel))
     }
 
+    /// Remove `name` from the catalog and persist, returning its relfilenode (or
+    /// `None` if it was not present). `next` is deliberately left untouched: it
+    /// stays monotonic so a freed relfilenode is never reused, which keeps the
+    /// durability invariant (see `persist`) intact even after a DROP.
+    pub fn remove(&self, name: &str) -> std::io::Result<Option<RelFileNode>> {
+        let mut state = self.state.lock().unwrap();
+        let Some(pos) = state.rels.iter().position(|r| r.name == name) else {
+            return Ok(None);
+        };
+        let rel = state.rels.remove(pos).rel;
+        self.persist(&state)?;
+        Ok(Some(RelFileNode(rel)))
+    }
+
     fn persist(&self, state: &State) -> std::io::Result<()> {
         let bytes = encode(state);
         let tmp = self.path.with_extension("tmp");

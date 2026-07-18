@@ -37,4 +37,13 @@ impl TableEngine for SessionCatalog {
         // through the overlay, where permanent is the safe default.
         self.global.create_table(schema)
     }
+
+    fn drop_table(&self, name: &str) -> Result<(), StorageError> {
+        // Temp-first, mirroring `open_table`: a `DROP TABLE t` drops the session's
+        // temp `t` if one shadows a permanent one, else the permanent table.
+        match self.temp.drop_table(name) {
+            Err(StorageError::TableNotFound(_)) => self.global.drop_table(name),
+            other => other,
+        }
+    }
 }

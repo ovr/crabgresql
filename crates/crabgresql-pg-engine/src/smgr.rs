@@ -107,6 +107,20 @@ impl StorageManager {
         g.sync_data()
     }
 
+    /// Delete a relation's file (DROP TABLE). Drops the cached handle first so the
+    /// underlying inode is released, then unlinks. A missing file (the relation was
+    /// never extended to disk) is not an error. The caller must evict the
+    /// relation's buffered pages before calling this so nothing writes it back.
+    pub fn unlink(&self, rel: RelFileNode) -> std::io::Result<()> {
+        self.files.lock().unwrap().remove(&rel.0);
+        let path = self.base.join(rel.0.to_string());
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// fsync a relation's file (called at checkpoint, after its dirty pages are
     /// written, so the data is durable before the checkpoint record).
     pub fn sync(&self, rel: RelFileNode) -> std::io::Result<()> {
