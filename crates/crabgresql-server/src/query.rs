@@ -745,7 +745,7 @@ fn builtin_type_by_name(name: &str) -> Option<PgType> {
 fn type_shape_from_options(
     catalog: &GlobalCatalog,
     options: &[ast::UserDefinedTypeSqlDefinitionOption],
-) -> (i32, Option<PgType>) {
+) -> Result<(i32, Option<PgType>), PgError> {
     use ast::UserDefinedTypeSqlDefinitionOption as Opt;
     let mut typlen = -1;
     let mut backing = None;
@@ -754,22 +754,49 @@ fn type_shape_from_options(
             Opt::InternalLength(ast::UserDefinedTypeInternalLength::Fixed(n)) => typlen = *n as i32,
             Opt::InternalLength(ast::UserDefinedTypeInternalLength::Variable) => typlen = -1,
             Opt::Like(name) => {
-                if let Some(n) = name.0.last().and_then(|p| p.as_ident()).map(normalize_ident) {
-                    // `LIKE builtin` copies its width and representation; `LIKE
-                    // usertype` inherits the user type's width and backing.
-                    if let Some(t) = builtin_type_by_name(&n) {
-                        typlen = t.typlen() as i32;
-                        backing = Some(t);
-                    } else if let Some(len) = catalog.user_type_typlen(&n) {
-                        typlen = len;
-                        backing = catalog.user_type_backing(&n);
+                // `LIKE builtin` copies its width and representation; `LIKE
+                // usertype` inherits the user type's width and backing. Only an
+                // unqualified name can resolve — crabgresql has no schema
+                // namespaces, so a schema-qualified target never names a
+                // builtin/user type (cf. `single_object_name`, which likewise
+                // rejects qualified names for the type being created).
+                let n = match name.0.as_slice() {
+                    [part] => part.as_ident().map(normalize_ident),
+                    _ => None,
+                };
+                if let Some(t) = n.as_deref().and_then(builtin_type_by_name) {
+                    typlen = t.typlen() as i32;
+                    backing = Some(t);
+                } else if let Some(len) = n.as_deref().and_then(|n| catalog.user_type_typlen(n)) {
+                    typlen = len;
+                    backing = catalog.user_type_backing(n.as_deref().unwrap());
+                } else {
+                    // An unresolvable target is an undefined-object error
+                    // (42704), matching PG — reported verbatim (qualifier
+                    // included), with a caret at the start of the name.
+                    let display = name
+                        .0
+                        .iter()
+                        .map(|p| p.as_ident().map(normalize_ident).unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let mut err = PgError::new(
+                        sqlstate::UNDEFINED_OBJECT,
+                        format!("type \"{display}\" does not exist"),
+                    );
+                    let start = name.0.first().and_then(|p| p.as_ident()).map(|i| i.span.start);
+                    if let Some(start) = start {
+                        if start.line != 0 {
+                            err.location = Some((start.line, start.column));
+                        }
                     }
+                    return Err(err);
                 }
             }
             _ => {}
         }
     }
-    (typlen, backing)
+    Ok((typlen, backing))
 }
 
 /// `CREATE TYPE name;` (shell) or `CREATE TYPE name (INPUT=..., OUTPUT=..., ...)`.
@@ -782,7 +809,7 @@ fn execute_create_type(
     let notices = match representation {
         None => catalog.create_shell_type(&tname)?,
         Some(ast::UserDefinedTypeRepresentation::SqlDefinition { options }) => {
-            let (typlen, backing) = type_shape_from_options(catalog, options);
+            let (typlen, backing) = type_shape_from_options(catalog, options)?;
             catalog.define_type(&tname, typlen, backing)?
         }
         Some(_) => {
@@ -975,4 +1002,55 @@ fn execute_drop_cast(
         tag: "DROP CAST".into(),
         notices: to_notices(notices),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extract the base-type option list from a parsed `CREATE TYPE name (...)`.
+    fn create_type_options(sql: &str) -> Vec<ast::UserDefinedTypeSqlDefinitionOption> {
+        let stmts = crabgresql_parser::parse(sql).expect("parse");
+        match &stmts[0] {
+            ast::Statement::CreateType {
+                representation: Some(ast::UserDefinedTypeRepresentation::SqlDefinition { options }),
+                ..
+            } => options.clone(),
+            other => panic!("expected CREATE TYPE base definition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn like_builtin_target_sets_width_and_backing() {
+        let catalog = GlobalCatalog::new();
+        let options = create_type_options("CREATE TYPE t (input = ti, output = tou, like = int8)");
+        let (typlen, backing) = type_shape_from_options(&catalog, &options).expect("ok");
+        assert_eq!(typlen, 8);
+        assert_eq!(backing, Some(PgType::Int8));
+    }
+
+    #[test]
+    fn unknown_like_target_is_undefined_object_with_caret() {
+        let catalog = GlobalCatalog::new();
+        let options =
+            create_type_options("CREATE TYPE t (input = ti, output = tou, like = no_such_type)");
+        let err = type_shape_from_options(&catalog, &options).expect_err("must reject");
+        assert_eq!(err.code, sqlstate::UNDEFINED_OBJECT);
+        assert_eq!(err.message, "type \"no_such_type\" does not exist");
+        // Carries a cursor position so the client can render a LINE/caret excerpt.
+        assert!(err.location.is_some(), "unknown LIKE target must carry a position");
+    }
+
+    #[test]
+    fn qualified_like_target_does_not_resolve_and_echoes_full_name() {
+        let catalog = GlobalCatalog::new();
+        // `int8` is a builtin, but crabgresql has no schema namespaces, so a
+        // schema-qualified target must not resolve to it (PG rejects
+        // `public.int8`), and the error echoes the full qualified name.
+        let options =
+            create_type_options("CREATE TYPE t (input = ti, output = tou, like = public.int8)");
+        let err = type_shape_from_options(&catalog, &options).expect_err("must reject");
+        assert_eq!(err.code, sqlstate::UNDEFINED_OBJECT);
+        assert_eq!(err.message, "type \"public.int8\" does not exist");
+    }
 }
