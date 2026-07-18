@@ -11261,105 +11261,61 @@ impl<'a> Parser<'a> {
                 Keyword::FLOAT => {
                     let precision = self.parse_exact_number_optional_precision_scale()?;
 
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::FloatUnsigned(precision))
-                    } else {
-                        Ok(DataType::Float(precision))
-                    }
+                    Ok(DataType::Float(precision))
                 }
                 Keyword::REAL => {
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::RealUnsigned)
-                    } else {
-                        Ok(DataType::Real)
-                    }
+                    Ok(DataType::Real)
                 }
                 Keyword::FLOAT4 => Ok(DataType::Float4),
                 Keyword::FLOAT8 => Ok(DataType::Float8),
                 Keyword::DOUBLE => {
                     if self.parse_keyword(Keyword::PRECISION) {
-                        if self.parse_keyword(Keyword::UNSIGNED) {
-                            Ok(DataType::DoublePrecisionUnsigned)
-                        } else {
-                            Ok(DataType::DoublePrecision)
-                        }
+                        Ok(DataType::DoublePrecision)
                     } else {
                         let precision = self.parse_exact_number_optional_precision_scale()?;
 
-                        if self.parse_keyword(Keyword::UNSIGNED) {
-                            Ok(DataType::DoubleUnsigned(precision))
-                        } else {
-                            Ok(DataType::Double(precision))
-                        }
+                        Ok(DataType::Double(precision))
                     }
                 }
                 Keyword::INT2 => {
                     let optional_precision = self.parse_optional_precision();
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::Int2Unsigned(optional_precision?))
-                    } else {
-                        Ok(DataType::Int2(optional_precision?))
-                    }
+                    Ok(DataType::Int2(optional_precision?))
                 }
                 Keyword::SMALLINT => {
                     let optional_precision = self.parse_optional_precision();
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::SmallIntUnsigned(optional_precision?))
-                    } else {
-                        if dialect.supports_data_type_signed_suffix() {
-                            let _ = self.parse_keyword(Keyword::SIGNED);
-                        }
-                        Ok(DataType::SmallInt(optional_precision?))
+                    if dialect.supports_data_type_signed_suffix() {
+                        let _ = self.parse_keyword(Keyword::SIGNED);
                     }
+                    Ok(DataType::SmallInt(optional_precision?))
                 }
                 Keyword::INT => {
                     let optional_precision = self.parse_optional_precision();
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::IntUnsigned(optional_precision?))
-                    } else {
-                        if dialect.supports_data_type_signed_suffix() {
-                            let _ = self.parse_keyword(Keyword::SIGNED);
-                        }
-                        Ok(DataType::Int(optional_precision?))
+                    if dialect.supports_data_type_signed_suffix() {
+                        let _ = self.parse_keyword(Keyword::SIGNED);
                     }
+                    Ok(DataType::Int(optional_precision?))
                 }
                 Keyword::INT4 => {
                     let optional_precision = self.parse_optional_precision();
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::Int4Unsigned(optional_precision?))
-                    } else {
-                        Ok(DataType::Int4(optional_precision?))
-                    }
+                    Ok(DataType::Int4(optional_precision?))
                 }
                 Keyword::INT8 => {
                     let optional_precision = self.parse_optional_precision();
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::Int8Unsigned(optional_precision?))
-                    } else {
-                        Ok(DataType::Int8(optional_precision?))
-                    }
+                    Ok(DataType::Int8(optional_precision?))
                 }
                 Keyword::INTEGER => {
                     let optional_precision = self.parse_optional_precision();
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::IntegerUnsigned(optional_precision?))
-                    } else {
-                        if dialect.supports_data_type_signed_suffix() {
-                            let _ = self.parse_keyword(Keyword::SIGNED);
-                        }
-                        Ok(DataType::Integer(optional_precision?))
+                    if dialect.supports_data_type_signed_suffix() {
+                        let _ = self.parse_keyword(Keyword::SIGNED);
                     }
+                    Ok(DataType::Integer(optional_precision?))
                 }
                 Keyword::BIGINT => {
                     let optional_precision = self.parse_optional_precision();
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::BigIntUnsigned(optional_precision?))
-                    } else {
-                        if dialect.supports_data_type_signed_suffix() {
-                            let _ = self.parse_keyword(Keyword::SIGNED);
-                        }
-                        Ok(DataType::BigInt(optional_precision?))
+                    if dialect.supports_data_type_signed_suffix() {
+                        let _ = self.parse_keyword(Keyword::SIGNED);
                     }
+                    Ok(DataType::BigInt(optional_precision?))
                 }
                 Keyword::VARCHAR => Ok(DataType::Varchar(self.parse_optional_character_length()?)),
                 Keyword::CHARACTER => {
@@ -11469,20 +11425,12 @@ impl<'a> Parser<'a> {
                 Keyword::DECIMAL => {
                     let precision = self.parse_exact_number_optional_precision_scale()?;
 
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::DecimalUnsigned(precision))
-                    } else {
-                        Ok(DataType::Decimal(precision))
-                    }
+                    Ok(DataType::Decimal(precision))
                 }
                 Keyword::DEC => {
                     let precision = self.parse_exact_number_optional_precision_scale()?;
 
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::DecUnsigned(precision))
-                    } else {
-                        Ok(DataType::Dec(precision))
-                    }
+                    Ok(DataType::Dec(precision))
                 }
                 Keyword::ARRAY => {
                     if self.dialect.supports_array_typedef_without_element_type() {
