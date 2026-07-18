@@ -16,9 +16,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crabgresql_binder::{BoundAggregate, BoundExpr, SortKey, TableFn};
+use crabgresql_binder::{BoundAggregate, BoundExpr, JoinKind, SortKey, TableFn};
 pub use crabgresql_binder::OutputColumn;
-use crabgresql_planner::{PhysicalAggInput, PhysicalJoinInput, PhysicalPlan};
+use crabgresql_planner::{PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan};
 use crabgresql_storage_api::{TableAm, Tid, Tuple};
 use crabgresql_txn::TxnContext;
 use crabgresql_types::Value;
@@ -154,18 +154,14 @@ pub fn execute(
             ctx,
         ),
         PhysicalPlan::Join {
-            inputs,
+            source,
             columns,
             projections,
             predicate,
             sort,
         } => {
-            let mut sources = Vec::with_capacity(inputs.len());
-            for input in inputs {
-                sources.push(build_join_source(input, ctx, txn)?);
-            }
-            let cross = Box::new(CrossJoin::new(sources)?);
-            project_pipeline(cross, projections, predicate, sort, columns, ctx)
+            let joined = build_join_expr(source, ctx, txn)?;
+            project_pipeline(joined, projections, predicate, sort, columns, ctx)
         }
         PhysicalPlan::Limit {
             source,
@@ -197,6 +193,7 @@ pub fn execute(
             // FROM-less aggregate.
             let source: Box<dyn ExecNode> = match input {
                 PhysicalAggInput::Scan(table) => Box::new(SeqScan::new(&table, txn)),
+                PhysicalAggInput::Join(source) => build_join_expr(source, ctx, txn)?,
                 PhysicalAggInput::SingleRow => {
                     Box::new(Values::new(vec![vec![]], ctx))
                 }
@@ -464,100 +461,170 @@ fn build_join_source(
     })
 }
 
-/// Cartesian product of two or more inputs (`FROM a, b` / `a CROSS JOIN b`).
-///
-/// Nested-loop with inner materialization: the first input streams as the outer
-/// relation; the rest are buffered up front. Each emitted row is the outer
-/// tuple concatenated with one pick from every inner relation, iterated as an
-/// odometer whose rightmost (last) relation advances fastest — the row order PG
-/// produces for a comma/cross join.
-pub struct CrossJoin {
-    outer: Box<dyn ExecNode>,
-    inners: Vec<Vec<Tuple>>,
-    /// Current pick within each inner relation.
-    indices: Vec<usize>,
-    /// The outer tuple every emitted row is currently built on; `None` once the
-    /// outer relation is exhausted (or the product is empty).
-    current_outer: Option<Tuple>,
-    /// Combined width of one pick from every inner relation, for exact
-    /// allocation of each emitted row (0 when the product is empty).
-    inner_width: usize,
+/// Recursively build a physical join tree. Leaf construction is shared with
+/// standalone subquery/table-function sources; each binary node streams its
+/// left side and materializes its right side.
+fn build_join_expr(
+    source: PhysicalJoinExpr,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<Box<dyn ExecNode>, ExecError> {
+    match source {
+        PhysicalJoinExpr::Input { input, .. } => build_join_source(input, ctx, txn),
+        PhysicalJoinExpr::Join {
+            left,
+            right,
+            kind,
+            predicate,
+        } => {
+            let left_width = left.width();
+            let right_width = right.width();
+            let left = build_join_expr(*left, ctx, txn)?;
+            let right = build_join_expr(*right, ctx, txn)?;
+            Ok(Box::new(NestedLoopJoin::new(
+                left,
+                right,
+                left_width,
+                right_width,
+                kind,
+                predicate,
+                ctx,
+            )?))
+        }
+    }
 }
 
-impl CrossJoin {
-    /// `sources` are the join inputs in FROM order: the first streams as the
-    /// outer relation, the rest are materialized up front. An empty inner makes
-    /// the whole product empty, so the outer is only pulled when every inner has
-    /// rows. The binder only emits a `Join` for two or more relations, but one
-    /// input is handled (it just streams) and zero is a hard error rather than a
-    /// panic.
-    pub fn new(mut sources: Vec<Box<dyn ExecNode>>) -> Result<Self, ExecError> {
-        if sources.is_empty() {
-            return Err(ExecError::new(
-                "XX000",
-                "cross join requires at least one input",
-            ));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinPhase {
+    LeftRows,
+    UnmatchedRight,
+    Done,
+}
+
+/// Binary nested-loop join with right-side materialization. For right/full
+/// joins, `right_matched` records which materialized rows participated in at
+/// least one match so they can be null-extended after the left stream ends.
+pub struct NestedLoopJoin {
+    left: Box<dyn ExecNode>,
+    right_rows: Vec<Tuple>,
+    right_matched: Vec<bool>,
+    left_width: usize,
+    right_width: usize,
+    kind: JoinKind,
+    predicate: Option<BoundExpr>,
+    ctx: ExecContext,
+    phase: JoinPhase,
+    current_left: Option<Tuple>,
+    current_left_matched: bool,
+    right_index: usize,
+}
+
+impl NestedLoopJoin {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        left: Box<dyn ExecNode>,
+        mut right: Box<dyn ExecNode>,
+        left_width: usize,
+        right_width: usize,
+        kind: JoinKind,
+        predicate: Option<BoundExpr>,
+        ctx: ExecContext,
+    ) -> Result<Self, ExecError> {
+        let mut right_rows = Vec::new();
+        while let Some(row) = right.next()? {
+            right_rows.push(row);
         }
-        let mut outer = sources.remove(0);
-        let mut inners = Vec::with_capacity(sources.len());
-        for mut src in sources {
-            let mut rows = Vec::new();
-            while let Some(row) = src.next()? {
-                rows.push(row);
-            }
-            inners.push(rows);
-        }
-        // Prime the outer stream and the per-row width only when a product
-        // exists; an empty inner leaves `current_outer` = None so `next` yields
-        // nothing.
-        let (current_outer, inner_width) = if inners.iter().all(|rows| !rows.is_empty()) {
-            let width = inners.iter().map(|rows| rows[0].len()).sum();
-            (outer.next()?, width)
-        } else {
-            (None, 0)
-        };
-        let indices = vec![0; inners.len()];
+        let right_matched = vec![false; right_rows.len()];
         Ok(Self {
-            outer,
-            inners,
-            indices,
-            current_outer,
-            inner_width,
+            left,
+            right_rows,
+            right_matched,
+            left_width,
+            right_width,
+            kind,
+            predicate,
+            ctx,
+            phase: JoinPhase::LeftRows,
+            current_left: None,
+            current_left_matched: false,
+            right_index: 0,
         })
     }
 
-    /// Advance the odometer over the inner relations, rightmost fastest.
-    /// Returns `true` if it advanced within the current outer row, `false` if
-    /// every inner index wrapped back to 0 (time for the next outer row).
-    fn advance(&mut self) -> bool {
-        for i in (0..self.inners.len()).rev() {
-            self.indices[i] += 1;
-            if self.indices[i] < self.inners[i].len() {
-                return true;
-            }
-            self.indices[i] = 0;
-        }
-        false
+    fn preserves_left(&self) -> bool {
+        matches!(self.kind, JoinKind::Left | JoinKind::Full)
+    }
+
+    fn preserves_right(&self) -> bool {
+        matches!(self.kind, JoinKind::Right | JoinKind::Full)
+    }
+
+    fn combined_row(&self, left: &[Value], right: &[Value]) -> Tuple {
+        let mut row = Vec::with_capacity(self.left_width + self.right_width);
+        row.extend_from_slice(left);
+        row.extend_from_slice(right);
+        row
     }
 }
 
-impl ExecNode for CrossJoin {
+impl ExecNode for NestedLoopJoin {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        let Some(outer) = self.current_outer.as_ref() else {
-            return Ok(None);
-        };
-        let mut combined = Vec::with_capacity(outer.len() + self.inner_width);
-        combined.extend_from_slice(outer);
-        for (rows, &i) in self.inners.iter().zip(&self.indices) {
-            combined.extend_from_slice(&rows[i]);
+        loop {
+            match self.phase {
+                JoinPhase::LeftRows => {
+                    if self.current_left.is_none() {
+                        self.current_left = self.left.next()?;
+                        let Some(_) = self.current_left else {
+                            self.phase = if self.preserves_right() {
+                                JoinPhase::UnmatchedRight
+                            } else {
+                                JoinPhase::Done
+                            };
+                            self.right_index = 0;
+                            continue;
+                        };
+                        self.current_left_matched = false;
+                        self.right_index = 0;
+                    }
+
+                    while self.right_index < self.right_rows.len() {
+                        let right_index = self.right_index;
+                        self.right_index += 1;
+                        let row = self.combined_row(
+                            self.current_left.as_ref().unwrap(),
+                            &self.right_rows[right_index],
+                        );
+                        let matched = self.kind == JoinKind::Cross
+                            || predicate_holds(&self.predicate, &row, self.ctx)?;
+                        if matched {
+                            self.current_left_matched = true;
+                            self.right_matched[right_index] = true;
+                            return Ok(Some(row));
+                        }
+                    }
+
+                    if !self.current_left_matched && self.preserves_left() {
+                        let mut row = self.current_left.take().unwrap();
+                        row.extend(std::iter::repeat_n(Value::Null, self.right_width));
+                        return Ok(Some(row));
+                    }
+                    self.current_left = None;
+                }
+                JoinPhase::UnmatchedRight => {
+                    while self.right_index < self.right_rows.len() {
+                        let right_index = self.right_index;
+                        self.right_index += 1;
+                        if !self.right_matched[right_index] {
+                            let mut row = vec![Value::Null; self.left_width];
+                            row.extend_from_slice(&self.right_rows[right_index]);
+                            return Ok(Some(row));
+                        }
+                    }
+                    self.phase = JoinPhase::Done;
+                }
+                JoinPhase::Done => return Ok(None),
+            }
         }
-        // Move to the next combination for the following call; on odometer wrap,
-        // pull the next outer row and reset the inner picks.
-        if !self.advance() {
-            self.current_outer = self.outer.next()?;
-            self.indices.iter_mut().for_each(|i| *i = 0);
-        }
-        Ok(Some(combined))
     }
 }
 
@@ -2210,12 +2277,130 @@ mod tests {
     }
 
     #[test]
-    fn cross_join_new_rejects_empty_inputs() {
-        // The binder never emits a zero-input Join, but the node reports an
-        // error rather than panicking on `remove(0)`.
-        let Err(err) = CrossJoin::new(Vec::new()) else {
-            panic!("expected an error for zero inputs");
+    fn inner_join_matches_duplicates_and_rejects_null_predicates() {
+        let (_columns, rows) = run_rows(
+            "SELECT a.x, b.y \
+             FROM (VALUES (1), (2), (NULL)) a(x) \
+             JOIN (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn left_right_and_full_join_null_extend_unmatched_rows() {
+        let values =
+            "(VALUES (1), (2), (NULL)) a(x) JOIN_KIND \
+             (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y";
+        let query = |kind: &str| {
+            format!(
+                "SELECT a.x, b.y FROM {}",
+                values.replace("JOIN_KIND", kind)
+            )
         };
-        assert_eq!(err.code, "XX000");
+
+        let (_, left) = run_rows(&query("LEFT JOIN"));
+        assert_eq!(
+            left,
+            vec![
+                vec![Value::Int4(1), Value::Null],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Null, Value::Null],
+            ]
+        );
+
+        let (_, right) = run_rows(&query("RIGHT JOIN"));
+        assert_eq!(
+            right,
+            vec![
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Null, Value::Int4(3)],
+                vec![Value::Null, Value::Null],
+            ]
+        );
+
+        let (_, full) = run_rows(&query("FULL JOIN"));
+        assert_eq!(
+            full,
+            vec![
+                vec![Value::Int4(1), Value::Null],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Null, Value::Null],
+                vec![Value::Null, Value::Int4(3)],
+                vec![Value::Null, Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn outer_join_handles_empty_preserved_side() {
+        let (_, right) = run_rows(
+            "SELECT a.x, b.y FROM (SELECT 1 WHERE false) a(x) \
+             RIGHT JOIN (VALUES (7), (8)) b(y) ON true",
+        );
+        assert_eq!(
+            right,
+            vec![
+                vec![Value::Null, Value::Int4(7)],
+                vec![Value::Null, Value::Int4(8)],
+            ]
+        );
+        let (_, left) = run_rows(
+            "SELECT a.x, b.y FROM (VALUES (7), (8)) a(x) \
+             LEFT JOIN (SELECT 1 WHERE false) b(y) ON true",
+        );
+        assert_eq!(
+            left,
+            vec![
+                vec![Value::Int4(7), Value::Null],
+                vec![Value::Int4(8), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn chained_outer_join_predicate_sees_null_extended_left_row() {
+        let (_, rows) = run_rows(
+            "SELECT a.x, b.y, c.z FROM (VALUES (1)) a(x) \
+             LEFT JOIN (VALUES (9)) b(y) ON false \
+             JOIN (VALUES (2)) c(z) ON b.y IS NULL",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int4(1), Value::Null, Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    fn aggregates_and_grouping_consume_outer_join_rows() {
+        let (_, rows) = run_rows(
+            "SELECT count(*), count(b.y) \
+             FROM (VALUES (1), (2), (NULL)) a(x) \
+             LEFT JOIN (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y",
+        );
+        assert_eq!(rows, vec![vec![Value::Int8(4), Value::Int8(2)]]);
+
+        let (_, grouped) = run_rows(
+            "SELECT a.x, count(b.y) \
+             FROM (VALUES (1), (2), (NULL)) a(x) \
+             LEFT JOIN (VALUES (2), (2)) b(y) ON a.x = b.y \
+             GROUP BY a.x HAVING count(*) >= 1 ORDER BY a.x",
+        );
+        assert_eq!(
+            grouped,
+            vec![
+                vec![Value::Int4(1), Value::Int8(0)],
+                vec![Value::Int4(2), Value::Int8(2)],
+                vec![Value::Null, Value::Int8(0)],
+            ]
+        );
     }
 }
