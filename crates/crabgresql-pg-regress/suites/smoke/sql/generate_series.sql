@@ -1,9 +1,11 @@
 --
 -- GENERATE_SERIES
--- The set-returning function generate_series over int4/int8, in both the target
--- list and FROM position. Output hand-checked against PostgreSQL's aligned
--- format.
+-- The set-returning function generate_series over int4/int8/numeric and
+-- timestamp/timestamptz (stepped by an interval), in both the target list and
+-- FROM position. Output hand-checked against PostgreSQL's aligned format.
 --
+-- Render timestamptz in UTC so the output is deterministic.
+SET timezone = 'UTC';
 -- target-list form: one row per value in the range
 SELECT generate_series(1, 5);
 -- FROM position: the column is named after the function
@@ -38,5 +40,10 @@ SELECT generate_series(timestamptz '2020-01-01 00:00+00', timestamptz '2020-01-0
 SELECT generate_series(1, 5, 0);
 SELECT generate_series(1.0, 3.0, 0.0);
 SELECT generate_series(timestamp '2020-01-01', timestamp '2020-01-05', interval '0');
--- a NaN numeric bound is an error
+-- NaN and infinite numeric bounds/step are errors
 SELECT generate_series('NaN'::numeric, 3);
+SELECT generate_series(1, 'infinity'::numeric);
+SELECT generate_series(1, 5, 'infinity'::numeric);
+-- but a NULL argument short-circuits to no rows before any such validation
+SELECT generate_series(NULL::int, 5, 0);
+SELECT generate_series(NULL::numeric, 'NaN'::numeric);

@@ -1351,6 +1351,46 @@ mod tests {
     }
 
     #[test]
+    fn generate_series_numeric_infinite_bounds_error_22023() {
+        // Infinite bounds/step are rejected (bounds "cannot be infinity", the
+        // step "cannot be infinite") rather than looping forever.
+        for (sql, msg) in [
+            (
+                "SELECT generate_series('infinity'::numeric, 3)",
+                "start value cannot be infinity",
+            ),
+            (
+                "SELECT generate_series(1, 'infinity'::numeric)",
+                "stop value cannot be infinity",
+            ),
+            (
+                "SELECT generate_series(1, 3, 'infinity'::numeric)",
+                "step size cannot be infinity",
+            ),
+        ] {
+            let e = run_err(sql);
+            assert_eq!(e.code, "22023", "{sql}");
+            assert_eq!(e.message, msg, "{sql}");
+        }
+    }
+
+    #[test]
+    fn generate_series_null_argument_short_circuits_before_validation() {
+        // `generate_series` is strict: a NULL argument yields 0 rows before any
+        // NaN / infinity / zero-step validation fires.
+        for sql in [
+            "SELECT generate_series(NULL::int, 5, 0)",
+            "SELECT generate_series(NULL::numeric, 'NaN'::numeric)",
+            "SELECT generate_series(NULL::numeric, 'infinity'::numeric)",
+            "SELECT generate_series(1, 3, NULL::numeric)",
+            "SELECT generate_series(NULL::timestamp, timestamp '2020-01-05', interval '0')",
+        ] {
+            let (_c, rows) = run_rows(sql);
+            assert!(rows.is_empty(), "{sql} should yield no rows");
+        }
+    }
+
+    #[test]
     fn generate_series_timestamp_forward_and_backward() {
         let (columns, rows) = run_rows(
             "SELECT generate_series(timestamp '2020-01-01', timestamp '2020-01-04', \

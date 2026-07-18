@@ -25,10 +25,12 @@ use crate::ExecError;
 /// per row until the range is exhausted.
 pub enum Series {
     /// `int4`/`int8`: an `i64` accumulator (`elem` selects the output width).
+    /// `forward` is the step's sign.
     Int {
         cur: i64,
         stop: i64,
         step: i64,
+        forward: bool,
         elem: PgType,
         done: bool,
     },
@@ -82,13 +84,14 @@ impl Series {
                 cur,
                 stop,
                 step,
+                forward,
                 elem,
                 done,
             } => {
                 if *done {
                     return Ok(None);
                 }
-                let in_range = if *step > 0 { *cur <= *stop } else { *cur >= *stop };
+                let in_range = if *forward { *cur <= *stop } else { *cur >= *stop };
                 if !in_range {
                     *done = true;
                     return Ok(None);
@@ -181,33 +184,40 @@ fn int_series(elem: PgType, args: &[Value]) -> Result<Series, ExecError> {
         Some(v) => as_i64(v),
         None => Some(1),
     };
-    if step == Some(0) {
-        return Err(zero_step());
-    }
+    // Strict function: a NULL argument yields no rows, before validating the step.
     let (Some(cur), Some(stop), Some(step)) = (start, stop, step) else {
         return Ok(Series::Empty);
     };
+    if step == 0 {
+        return Err(zero_step());
+    }
     Ok(Series::Int {
         cur,
         stop,
+        forward: step > 0,
         step,
         elem,
         done: false,
     })
 }
 
-/// The `numeric` overload. Rejects NaN bounds/step (distinct PG messages) and a
-/// zero step; the default 2-arg step is `1`.
+/// The `numeric` overload; the default 2-arg step is `1`.
 fn numeric_series(args: &[Value]) -> Result<Series, ExecError> {
-    let start = as_numeric(&args[0], "start value")?;
-    let stop = as_numeric(&args[1], "stop value")?;
+    let start = as_numeric(&args[0]);
+    let stop = as_numeric(&args[1]);
     let step = match args.get(2) {
-        Some(v) => as_numeric(v, "step size")?,
+        Some(v) => as_numeric(v),
         None => Some(Numeric::from_i128(1)),
     };
+    // Strict function: a NULL argument yields no rows, before rejecting a NaN,
+    // infinite, or zero bound/step (all of which PG validates only on non-NULL
+    // input).
     let (Some(cur), Some(stop), Some(step)) = (start, stop, step) else {
         return Ok(Series::Empty);
     };
+    reject_nonfinite(&cur, "start value")?;
+    reject_nonfinite(&stop, "stop value")?;
+    reject_nonfinite(&step, "step size")?;
     let forward = match step.cmp(&Numeric::from_i128(0)) {
         Ordering::Greater => true,
         Ordering::Less => false,
@@ -276,17 +286,32 @@ fn as_i64(v: &Value) -> Option<i64> {
     }
 }
 
-/// Read a numeric argument, rejecting NaN with `role` in the message (PG uses
-/// "start value cannot be NaN" etc.). `None` for NULL.
-fn as_numeric(v: &Value, role: &str) -> Result<Option<Numeric>, ExecError> {
+/// Read a numeric argument; `None` for NULL.
+fn as_numeric(v: &Value) -> Option<Numeric> {
     match v {
-        Value::Numeric(n) if n.is_nan() => Err(ExecError::new(
+        Value::Numeric(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+/// Reject a NaN or infinite numeric bound/step, reproducing PG's per-role
+/// messages, e.g. `"start value cannot be NaN"` / `"step size cannot be
+/// infinity"`. (The interval-step overload uses `"infinite"` instead and is
+/// handled in [`timestamp_series`].)
+fn reject_nonfinite(n: &Numeric, role: &str) -> Result<(), ExecError> {
+    if n.is_nan() {
+        return Err(ExecError::new(
             sqlstate::INVALID_PARAMETER_VALUE,
             format!("{role} cannot be NaN"),
-        )),
-        Value::Numeric(n) => Ok(Some(n.clone())),
-        _ => Ok(None),
+        ));
     }
+    if n.is_infinite() {
+        return Err(ExecError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("{role} cannot be infinity"),
+        ));
+    }
+    Ok(())
 }
 
 /// Read a timestamp/timestamptz argument as its raw `i64` micros; `None` for NULL.
