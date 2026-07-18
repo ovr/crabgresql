@@ -1799,7 +1799,6 @@ impl Spanned for ReplaceSelectElement {
 /// # partial span
 ///
 /// Missing spans:
-/// - [TableFactor::JsonTable]
 impl Spanned for TableFactor {
     fn span(&self) -> Span {
         match self {
@@ -1868,74 +1867,7 @@ impl Spanned for TableFactor {
                     .chain(args.iter().map(|i| i.span()))
                     .chain(alias.as_ref().map(|alias| alias.span())),
             ),
-            TableFactor::JsonTable { .. } => Span::empty(),
             TableFactor::XmlTable { .. } => Span::empty(),
-            TableFactor::Pivot {
-                table,
-                aggregate_functions,
-                value_column,
-                value_source,
-                default_on_null,
-                alias,
-            } => union_spans(
-                core::iter::once(table.span())
-                    .chain(aggregate_functions.iter().map(|i| i.span()))
-                    .chain(value_column.iter().map(|i| i.span()))
-                    .chain(core::iter::once(value_source.span()))
-                    .chain(default_on_null.as_ref().map(|i| i.span()))
-                    .chain(alias.as_ref().map(|i| i.span())),
-            ),
-            TableFactor::Unpivot {
-                table,
-                value,
-                null_inclusion: _,
-                name,
-                columns,
-                alias,
-            } => union_spans(
-                core::iter::once(table.span())
-                    .chain(core::iter::once(value.span()))
-                    .chain(core::iter::once(name.span))
-                    .chain(columns.iter().map(|ilist| ilist.span()))
-                    .chain(alias.as_ref().map(|alias| alias.span())),
-            ),
-            TableFactor::MatchRecognize {
-                table,
-                partition_by,
-                order_by,
-                measures,
-                rows_per_match: _,
-                after_match_skip: _,
-                pattern,
-                symbols,
-                alias,
-            } => union_spans(
-                core::iter::once(table.span())
-                    .chain(partition_by.iter().map(|i| i.span()))
-                    .chain(order_by.iter().map(|i| i.span()))
-                    .chain(measures.iter().map(|i| i.span()))
-                    .chain(core::iter::once(pattern.span()))
-                    .chain(symbols.iter().map(|i| i.span()))
-                    .chain(alias.as_ref().map(|i| i.span())),
-            ),
-            TableFactor::SemanticView {
-                name,
-                dimensions,
-                metrics,
-                facts,
-                where_clause,
-                alias,
-            } => union_spans(
-                name.0
-                    .iter()
-                    .map(|i| i.span())
-                    .chain(dimensions.iter().map(|d| d.span()))
-                    .chain(metrics.iter().map(|m| m.span()))
-                    .chain(facts.iter().map(|f| f.span()))
-                    .chain(where_clause.as_ref().map(|e| e.span()))
-                    .chain(alias.as_ref().map(|a| a.span())),
-            ),
-            TableFactor::OpenJsonTable { .. } => Span::empty(),
         }
     }
 }

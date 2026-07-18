@@ -1549,54 +1549,6 @@ pub enum TableFactor {
         /// Whether `WITH ORDINALITY` was specified to include ordinality.
         with_ordinality: bool,
     },
-    /// The `JSON_TABLE` table-valued function.
-    /// Part of the SQL standard, but implemented only by MySQL, Oracle, and DB2.
-    ///
-    /// <https://modern-sql.com/blog/2017-06/whats-new-in-sql-2016#json_table>
-    /// <https://dev.mysql.com/doc/refman/8.0/en/json-table-functions.html#function_json-table>
-    ///
-    /// ```sql
-    /// SELECT * FROM JSON_TABLE(
-    ///    '[{"a": 1, "b": 2}, {"a": 3, "b": 4}]',
-    ///    '$[*]' COLUMNS(
-    ///        a INT PATH '$.a' DEFAULT '0' ON EMPTY,
-    ///        b INT PATH '$.b' NULL ON ERROR
-    ///     )
-    /// ) AS jt;
-    /// ````
-    JsonTable {
-        /// The JSON expression to be evaluated. It must evaluate to a json string
-        json_expr: Expr,
-        /// The path to the array or object to be iterated over.
-        /// It must evaluate to a json array or object.
-        json_path: ValueWithSpan,
-        /// The columns to be extracted from each element of the array or object.
-        /// Each column must have a name and a type.
-        columns: Vec<JsonTableColumn>,
-        /// The alias for the table.
-        alias: Option<TableAlias>,
-    },
-    /// The MSSQL's `OPENJSON` table-valued function.
-    ///
-    /// ```sql
-    /// OPENJSON( jsonExpression [ , path ] )  [ <with_clause> ]
-    ///
-    /// <with_clause> ::= WITH ( { colName type [ column_path ] [ AS JSON ] } [ ,...n ] )
-    /// ````
-    ///
-    /// Reference: <https://learn.microsoft.com/en-us/sql/t-sql/functions/openjson-transact-sql?view=sql-server-ver16#syntax>
-    OpenJsonTable {
-        /// The JSON expression to be evaluated. It must evaluate to a json string
-        json_expr: Expr,
-        /// The path to the array or object to be iterated over.
-        /// It must evaluate to a json array or object.
-        json_path: Option<ValueWithSpan>,
-        /// The columns to be extracted from each element of the array or object.
-        /// Each column must have a name and a type.
-        columns: Vec<OpenJsonTableColumn>,
-        /// The alias for the table.
-        alias: Option<TableAlias>,
-    },
     /// Represents a parenthesized table factor. The SQL spec only allows a
     /// join expression (`(foo <JOIN> bar [ <JOIN> baz ... ])`) to be nested,
     /// possibly several times.
@@ -1607,74 +1559,6 @@ pub enum TableFactor {
         /// The nested join expression contained in parentheses.
         table_with_joins: Box<TableWithJoins>,
         /// Optional alias for the nested join.
-        alias: Option<TableAlias>,
-    },
-    /// Represents PIVOT operation on a table.
-    /// For example `FROM monthly_sales PIVOT(sum(amount) FOR MONTH IN ('JAN', 'FEB'))`
-    ///
-    /// [BigQuery](https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#pivot_operator)
-    /// [Snowflake](https://docs.snowflake.com/en/sql-reference/constructs/pivot)
-    /// [Oracle](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/SELECT.html#GUID-CFA006CA-6FF1-4972-821E-6996142A51C6__GUID-68257B27-1C4C-4C47-8140-5C60E0E65D35)
-    Pivot {
-        /// The input table to pivot.
-        table: Box<TableFactor>,
-        /// Aggregate expressions used as pivot values (optionally aliased).
-        aggregate_functions: Vec<ExprWithAlias>, // Function expression
-        /// Columns producing the values to be pivoted.
-        value_column: Vec<Expr>,
-        /// Source of pivot values (e.g. list of literals or columns).
-        value_source: PivotValueSource,
-        /// Optional expression providing a default when a pivot produces NULL.
-        default_on_null: Option<Expr>,
-        /// Optional alias for the pivoted table.
-        alias: Option<TableAlias>,
-    },
-    /// An UNPIVOT operation on a table.
-    ///
-    /// Syntax:
-    /// ```sql
-    /// table UNPIVOT [ { INCLUDE | EXCLUDE } NULLS ] (value FOR name IN (column1, [ column2, ... ])) [ alias ]
-    /// ```
-    ///
-    /// [Snowflake](https://docs.snowflake.com/en/sql-reference/constructs/unpivot)
-    /// [Databricks](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-syntax-qry-select-unpivot)
-    /// [BigQuery](https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#unpivot_operator)
-    /// [Oracle](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/SELECT.html#GUID-CFA006CA-6FF1-4972-821E-6996142A51C6__GUID-9B4E0389-413C-4014-94A1-0A0571BDF7E1)
-    Unpivot {
-        /// The input table to unpivot.
-        table: Box<TableFactor>,
-        /// Expression producing the unpivoted value.
-        value: Expr,
-        /// Identifier used for the generated column name.
-        name: Ident,
-        /// Columns or expressions to unpivot, optionally aliased.
-        columns: Vec<ExprWithAlias>,
-        /// Whether to include or exclude NULLs during unpivot.
-        null_inclusion: Option<NullInclusion>,
-        /// Optional alias for the resulting table.
-        alias: Option<TableAlias>,
-    },
-    /// A `MATCH_RECOGNIZE` operation on a table.
-    ///
-    /// See <https://docs.snowflake.com/en/sql-reference/constructs/match_recognize>.
-    MatchRecognize {
-        /// The input table to apply `MATCH_RECOGNIZE` on.
-        table: Box<TableFactor>,
-        /// `PARTITION BY <expr> [, ... ]`
-        partition_by: Vec<Expr>,
-        /// `ORDER BY <expr> [, ... ]`
-        order_by: Vec<OrderByExpr>,
-        /// `MEASURES <expr> [AS] <alias> [, ... ]`
-        measures: Vec<Measure>,
-        /// `ONE ROW PER MATCH | ALL ROWS PER MATCH [ <option> ]`
-        rows_per_match: Option<RowsPerMatch>,
-        /// `AFTER MATCH SKIP <option>`
-        after_match_skip: Option<AfterMatchSkip>,
-        /// `PATTERN ( <pattern> )`
-        pattern: MatchRecognizePattern,
-        /// `DEFINE <symbol> AS <expr> [, ... ]`
-        symbols: Vec<SymbolDefinition>,
-        /// The alias for the table.
         alias: Option<TableAlias>,
     },
     /// The `XMLTABLE` table-valued function.
@@ -1706,31 +1590,6 @@ pub enum TableFactor {
         /// The columns to be extracted from each generated row.
         columns: Vec<XmlTableColumn>,
         /// The alias for the table.
-        alias: Option<TableAlias>,
-    },
-    /// Snowflake's SEMANTIC_VIEW function for semantic models.
-    ///
-    /// <https://docs.snowflake.com/en/sql-reference/constructs/semantic_view>
-    ///
-    /// ```sql
-    /// SELECT * FROM SEMANTIC_VIEW(
-    ///     tpch_analysis
-    ///     DIMENSIONS customer.customer_market_segment
-    ///     METRICS orders.order_average_value
-    /// );
-    /// ```
-    SemanticView {
-        /// The name of the semantic model
-        name: ObjectName,
-        /// List of dimensions or expression referring to dimensions (e.g. DATE_PART('year', col))
-        dimensions: Vec<Expr>,
-        /// List of metrics (references to objects like orders.value, value, orders.*)
-        metrics: Vec<Expr>,
-        /// List of facts or expressions referring to facts or dimensions.
-        facts: Vec<Expr>,
-        /// WHERE clause for filtering
-        where_clause: Option<Expr>,
-        /// The alias for the table
         alias: Option<TableAlias>,
     },
 }
@@ -2326,132 +2185,11 @@ impl fmt::Display for TableFactor {
                 }
                 Ok(())
             }
-            TableFactor::JsonTable {
-                json_expr,
-                json_path,
-                columns,
-                alias,
-            } => {
-                write!(
-                    f,
-                    "JSON_TABLE({json_expr}, {json_path} COLUMNS({columns}))",
-                    columns = display_comma_separated(columns)
-                )?;
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
-            TableFactor::OpenJsonTable {
-                json_expr,
-                json_path,
-                columns,
-                alias,
-            } => {
-                write!(f, "OPENJSON({json_expr}")?;
-                if let Some(json_path) = json_path {
-                    write!(f, ", {json_path}")?;
-                }
-                write!(f, ")")?;
-                if !columns.is_empty() {
-                    write!(f, " WITH ({})", display_comma_separated(columns))?;
-                }
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
             TableFactor::NestedJoin {
                 table_with_joins,
                 alias,
             } => {
                 write!(f, "({table_with_joins})")?;
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
-            TableFactor::Pivot {
-                table,
-                aggregate_functions,
-                value_column,
-                value_source,
-                default_on_null,
-                alias,
-            } => {
-                write!(
-                    f,
-                    "{table} PIVOT({} FOR ",
-                    display_comma_separated(aggregate_functions),
-                )?;
-                if value_column.len() == 1 {
-                    write!(f, "{}", value_column[0])?;
-                } else {
-                    write!(f, "({})", display_comma_separated(value_column))?;
-                }
-                write!(f, " IN ({value_source})")?;
-                if let Some(expr) = default_on_null {
-                    write!(f, " DEFAULT ON NULL ({expr})")?;
-                }
-                write!(f, ")")?;
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
-            TableFactor::Unpivot {
-                table,
-                null_inclusion,
-                value,
-                name,
-                columns,
-                alias,
-            } => {
-                write!(f, "{table} UNPIVOT")?;
-                if let Some(null_inclusion) = null_inclusion {
-                    write!(f, " {null_inclusion} ")?;
-                }
-                write!(
-                    f,
-                    "({} FOR {} IN ({}))",
-                    value,
-                    name,
-                    display_comma_separated(columns)
-                )?;
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-                Ok(())
-            }
-            TableFactor::MatchRecognize {
-                table,
-                partition_by,
-                order_by,
-                measures,
-                rows_per_match,
-                after_match_skip,
-                pattern,
-                symbols,
-                alias,
-            } => {
-                write!(f, "{table} MATCH_RECOGNIZE(")?;
-                if !partition_by.is_empty() {
-                    write!(f, "PARTITION BY {} ", display_comma_separated(partition_by))?;
-                }
-                if !order_by.is_empty() {
-                    write!(f, "ORDER BY {} ", display_comma_separated(order_by))?;
-                }
-                if !measures.is_empty() {
-                    write!(f, "MEASURES {} ", display_comma_separated(measures))?;
-                }
-                if let Some(rows_per_match) = rows_per_match {
-                    write!(f, "{rows_per_match} ")?;
-                }
-                if let Some(after_match_skip) = after_match_skip {
-                    write!(f, "{after_match_skip} ")?;
-                }
-                write!(f, "PATTERN ({pattern}) ")?;
-                write!(f, "DEFINE {})", display_comma_separated(symbols))?;
                 if let Some(alias) = alias {
                     write!(f, " {alias}")?;
                 }
@@ -2480,40 +2218,6 @@ impl fmt::Display for TableFactor {
                 if let Some(alias) = alias {
                     write!(f, " {alias}")?;
                 }
-                Ok(())
-            }
-            TableFactor::SemanticView {
-                name,
-                dimensions,
-                metrics,
-                facts,
-                where_clause,
-                alias,
-            } => {
-                write!(f, "SEMANTIC_VIEW({name}")?;
-
-                if !dimensions.is_empty() {
-                    write!(f, " DIMENSIONS {}", display_comma_separated(dimensions))?;
-                }
-
-                if !metrics.is_empty() {
-                    write!(f, " METRICS {}", display_comma_separated(metrics))?;
-                }
-
-                if !facts.is_empty() {
-                    write!(f, " FACTS {}", display_comma_separated(facts))?;
-                }
-
-                if let Some(where_clause) = where_clause {
-                    write!(f, " WHERE {where_clause}")?;
-                }
-
-                write!(f, ")")?;
-
-                if let Some(alias) = alias {
-                    write!(f, " {alias}")?;
-                }
-
                 Ok(())
             }
         }

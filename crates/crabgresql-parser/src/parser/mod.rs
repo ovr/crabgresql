@@ -4257,13 +4257,6 @@ impl<'a> Parser<'a> {
         self.keyword_with_tokens(expected, tokens, true)
     }
 
-    /// Peeks to see if the current token is the `expected` keyword followed by specified tokens
-    /// without consuming them.
-    ///
-    /// See [Self::parse_keyword_with_tokens] for details.
-    pub(crate) fn peek_keyword_with_tokens(&mut self, expected: Keyword, tokens: &[Token]) -> bool {
-        self.keyword_with_tokens(expected, tokens, false)
-    }
 
     fn keyword_with_tokens(&mut self, expected: Keyword, tokens: &[Token], consume: bool) -> bool {
         match &self.peek_token_ref().token {
@@ -14304,19 +14297,9 @@ impl<'a> Parser<'a> {
             // `parse_derived_table_factor` below will return success after parsing the
             // subquery, followed by the closing ')', and the alias of the derived table.
             // In the example above this is case (3).
-            if let Some(mut table) =
+            if let Some(table) =
                 self.maybe_parse(|parser| parser.parse_derived_table_factor(NotLateral))?
             {
-                while let Some(kw) = self.parse_one_of_keywords(&[Keyword::PIVOT, Keyword::UNPIVOT])
-                {
-                    table = match kw {
-                        Keyword::PIVOT => self.parse_pivot_table_factor(table)?,
-                        Keyword::UNPIVOT => self.parse_unpivot_table_factor(table)?,
-                        unexpected_keyword => return Err(ParserError::ParserError(
-                            format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in pivot/unpivot"),
-                        )),
-                    }
-                }
                 return Ok(table);
             }
 
@@ -14366,14 +14349,8 @@ impl<'a> Parser<'a> {
                         | TableFactor::Table { alias, .. }
                         | TableFactor::Function { alias, .. }
                         | TableFactor::UNNEST { alias, .. }
-                        | TableFactor::JsonTable { alias, .. }
                         | TableFactor::XmlTable { alias, .. }
-                        | TableFactor::OpenJsonTable { alias, .. }
                         | TableFactor::TableFunction { alias, .. }
-                        | TableFactor::Pivot { alias, .. }
-                        | TableFactor::Unpivot { alias, .. }
-                        | TableFactor::MatchRecognize { alias, .. }
-                        | TableFactor::SemanticView { alias, .. }
                         | TableFactor::NestedJoin { alias, .. } => {
                             // but not `FROM (mytable AS alias1) AS alias2`.
                             if let Some(inner_alias) = alias {
@@ -14467,32 +14444,9 @@ impl<'a> Parser<'a> {
                 with_offset_alias,
                 with_ordinality,
             })
-        } else if self.parse_keyword_with_tokens(Keyword::JSON_TABLE, &[Token::LParen]) {
-            let json_expr = self.parse_expr()?;
-            self.expect_token(&Token::Comma)?;
-            let json_path = self.parse_value()?;
-            self.expect_keyword_is(Keyword::COLUMNS)?;
-            self.expect_token(&Token::LParen)?;
-            let columns = self.parse_comma_separated(Parser::parse_json_table_column_def)?;
-            self.expect_token(&Token::RParen)?;
-            self.expect_token(&Token::RParen)?;
-            let alias = self.maybe_parse_table_alias()?;
-            Ok(TableFactor::JsonTable {
-                json_expr,
-                json_path,
-                columns,
-                alias,
-            })
-        } else if self.parse_keyword_with_tokens(Keyword::OPENJSON, &[Token::LParen]) {
-            self.prev_token();
-            self.parse_open_json_table_factor()
         } else if self.parse_keyword_with_tokens(Keyword::XMLTABLE, &[Token::LParen]) {
             self.prev_token();
             self.parse_xml_table_factor()
-        } else if self.dialect.supports_semantic_view_table_factor()
-            && self.peek_keyword_with_tokens(Keyword::SEMANTIC_VIEW, &[Token::LParen])
-        {
-            self.parse_semantic_view_table_factor()
         } else {
             let name = self.parse_object_name(true)?;
 
@@ -14556,7 +14510,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            let mut table = TableFactor::Table {
+            let table = TableFactor::Table {
                 name,
                 alias,
                 args,
@@ -14569,28 +14523,28 @@ impl<'a> Parser<'a> {
                 index_hints,
             };
 
-            while let Some(kw) = self.parse_one_of_keywords(&[Keyword::PIVOT, Keyword::UNPIVOT]) {
-                table = match kw {
-                    Keyword::PIVOT => self.parse_pivot_table_factor(table)?,
-                    Keyword::UNPIVOT => self.parse_unpivot_table_factor(table)?,
-                    unexpected_keyword => return Err(ParserError::ParserError(
-                        format!("Internal parser error: unexpected keyword `{unexpected_keyword}` in pivot/unpivot"),
-                    )),
-                }
-            }
-
-            if self.dialect.supports_match_recognize()
-                && self.parse_keyword(Keyword::MATCH_RECOGNIZE)
-            {
-                table = self.parse_match_recognize(table)?;
-            }
-
             Ok(table)
         }
     }
 
     /// Parse a Snowflake stage reference as a table factor.
     /// Handles syntax like: `@mystage1 (file_format => 'myformat', pattern => '...')`
+    fn parse_pivot_aggregate_function(&mut self) -> Result<ExprWithAlias, ParserError> {
+        let function_name = match self.next_token().token {
+            Token::Word(w) => Ok(w.value),
+            _ => self.expected_ref("a function identifier", self.peek_token_ref()),
+        }?;
+        let expr = self.parse_function(ObjectName::from(vec![Ident::new(function_name)]))?;
+        let alias = {
+            fn validator(explicit: bool, kw: &Keyword, parser: &mut Parser) -> bool {
+                // ~ for a PIVOT aggregate function the alias must not be a "FOR"; in any dialect
+                kw != &Keyword::FOR && parser.dialect.is_select_item_alias(explicit, kw, parser)
+            }
+            self.parse_optional_alias_inner(None, validator)?
+        };
+        Ok(ExprWithAlias { expr, alias })
+    }
+
     ///
     /// See: <https://docs.snowflake.com/en/user-guide/querying-stage>
     fn maybe_parse_table_sample(&mut self) -> Result<Option<Box<TableSample>>, ParserError> {
@@ -14709,33 +14663,6 @@ impl<'a> Parser<'a> {
         Ok(TableSampleSeed { modifier, value })
     }
 
-    /// Parses `OPENJSON( jsonExpression [ , path ] )  [ <with_clause> ]` clause,
-    /// assuming the `OPENJSON` keyword was already consumed.
-    fn parse_open_json_table_factor(&mut self) -> Result<TableFactor, ParserError> {
-        self.expect_token(&Token::LParen)?;
-        let json_expr = self.parse_expr()?;
-        let json_path = if self.consume_token(&Token::Comma) {
-            Some(self.parse_value()?)
-        } else {
-            None
-        };
-        self.expect_token(&Token::RParen)?;
-        let columns = if self.parse_keyword(Keyword::WITH) {
-            self.expect_token(&Token::LParen)?;
-            let columns = self.parse_comma_separated(Parser::parse_openjson_table_column_def)?;
-            self.expect_token(&Token::RParen)?;
-            columns
-        } else {
-            Vec::new()
-        };
-        let alias = self.maybe_parse_table_alias()?;
-        Ok(TableFactor::OpenJsonTable {
-            json_expr,
-            json_path,
-            columns,
-            alias,
-        })
-    }
 
     fn parse_xml_table_factor(&mut self) -> Result<TableFactor, ParserError> {
         self.expect_token(&Token::LParen)?;
@@ -14830,299 +14757,11 @@ impl<'a> Parser<'a> {
         Ok(XmlPassingClause { arguments })
     }
 
-    /// Parse a [TableFactor::SemanticView]
-    fn parse_semantic_view_table_factor(&mut self) -> Result<TableFactor, ParserError> {
-        self.expect_keyword(Keyword::SEMANTIC_VIEW)?;
-        self.expect_token(&Token::LParen)?;
 
-        let name = self.parse_object_name(true)?;
 
-        // Parse DIMENSIONS, METRICS, FACTS and WHERE clauses in flexible order
-        let mut dimensions = Vec::new();
-        let mut metrics = Vec::new();
-        let mut facts = Vec::new();
-        let mut where_clause = None;
 
-        while self.peek_token_ref().token != Token::RParen {
-            if self.parse_keyword(Keyword::DIMENSIONS) {
-                if !dimensions.is_empty() {
-                    return Err(ParserError::ParserError(
-                        "DIMENSIONS clause can only be specified once".to_string(),
-                    ));
-                }
-                dimensions = self.parse_comma_separated(Parser::parse_wildcard_expr)?;
-            } else if self.parse_keyword(Keyword::METRICS) {
-                if !metrics.is_empty() {
-                    return Err(ParserError::ParserError(
-                        "METRICS clause can only be specified once".to_string(),
-                    ));
-                }
-                metrics = self.parse_comma_separated(Parser::parse_wildcard_expr)?;
-            } else if self.parse_keyword(Keyword::FACTS) {
-                if !facts.is_empty() {
-                    return Err(ParserError::ParserError(
-                        "FACTS clause can only be specified once".to_string(),
-                    ));
-                }
-                facts = self.parse_comma_separated(Parser::parse_wildcard_expr)?;
-            } else if self.parse_keyword(Keyword::WHERE) {
-                if where_clause.is_some() {
-                    return Err(ParserError::ParserError(
-                        "WHERE clause can only be specified once".to_string(),
-                    ));
-                }
-                where_clause = Some(self.parse_expr()?);
-            } else {
-                let tok = self.peek_token_ref();
-                return parser_err!(
-                    format!(
-                        "Expected one of DIMENSIONS, METRICS, FACTS or WHERE, got {}",
-                        tok.token
-                    ),
-                    tok.span.start
-                )?;
-            }
-        }
 
-        self.expect_token(&Token::RParen)?;
 
-        let alias = self.maybe_parse_table_alias()?;
-
-        Ok(TableFactor::SemanticView {
-            name,
-            dimensions,
-            metrics,
-            facts,
-            where_clause,
-            alias,
-        })
-    }
-
-    fn parse_match_recognize(&mut self, table: TableFactor) -> Result<TableFactor, ParserError> {
-        self.expect_token(&Token::LParen)?;
-
-        let partition_by = if self.parse_keywords(&[Keyword::PARTITION, Keyword::BY]) {
-            self.parse_comma_separated(Parser::parse_expr)?
-        } else {
-            vec![]
-        };
-
-        let order_by = if self.parse_keywords(&[Keyword::ORDER, Keyword::BY]) {
-            self.parse_comma_separated(Parser::parse_order_by_expr)?
-        } else {
-            vec![]
-        };
-
-        let measures = if self.parse_keyword(Keyword::MEASURES) {
-            self.parse_comma_separated(|p| {
-                let expr = p.parse_expr()?;
-                let _ = p.parse_keyword(Keyword::AS);
-                let alias = p.parse_identifier()?;
-                Ok(Measure { expr, alias })
-            })?
-        } else {
-            vec![]
-        };
-
-        let rows_per_match =
-            if self.parse_keywords(&[Keyword::ONE, Keyword::ROW, Keyword::PER, Keyword::MATCH]) {
-                Some(RowsPerMatch::OneRow)
-            } else if self.parse_keywords(&[
-                Keyword::ALL,
-                Keyword::ROWS,
-                Keyword::PER,
-                Keyword::MATCH,
-            ]) {
-                Some(RowsPerMatch::AllRows(
-                    if self.parse_keywords(&[Keyword::SHOW, Keyword::EMPTY, Keyword::MATCHES]) {
-                        Some(EmptyMatchesMode::Show)
-                    } else if self.parse_keywords(&[
-                        Keyword::OMIT,
-                        Keyword::EMPTY,
-                        Keyword::MATCHES,
-                    ]) {
-                        Some(EmptyMatchesMode::Omit)
-                    } else if self.parse_keywords(&[
-                        Keyword::WITH,
-                        Keyword::UNMATCHED,
-                        Keyword::ROWS,
-                    ]) {
-                        Some(EmptyMatchesMode::WithUnmatched)
-                    } else {
-                        None
-                    },
-                ))
-            } else {
-                None
-            };
-
-        let after_match_skip =
-            if self.parse_keywords(&[Keyword::AFTER, Keyword::MATCH, Keyword::SKIP]) {
-                if self.parse_keywords(&[Keyword::PAST, Keyword::LAST, Keyword::ROW]) {
-                    Some(AfterMatchSkip::PastLastRow)
-                } else if self.parse_keywords(&[Keyword::TO, Keyword::NEXT, Keyword::ROW]) {
-                    Some(AfterMatchSkip::ToNextRow)
-                } else if self.parse_keywords(&[Keyword::TO, Keyword::FIRST]) {
-                    Some(AfterMatchSkip::ToFirst(self.parse_identifier()?))
-                } else if self.parse_keywords(&[Keyword::TO, Keyword::LAST]) {
-                    Some(AfterMatchSkip::ToLast(self.parse_identifier()?))
-                } else {
-                    let found = self.next_token();
-                    return self.expected("after match skip option", found);
-                }
-            } else {
-                None
-            };
-
-        self.expect_keyword_is(Keyword::PATTERN)?;
-        let pattern = self.parse_parenthesized(Self::parse_pattern)?;
-
-        self.expect_keyword_is(Keyword::DEFINE)?;
-
-        let symbols = self.parse_comma_separated(|p| {
-            let symbol = p.parse_identifier()?;
-            p.expect_keyword_is(Keyword::AS)?;
-            let definition = p.parse_expr()?;
-            Ok(SymbolDefinition { symbol, definition })
-        })?;
-
-        self.expect_token(&Token::RParen)?;
-
-        let alias = self.maybe_parse_table_alias()?;
-
-        Ok(TableFactor::MatchRecognize {
-            table: Box::new(table),
-            partition_by,
-            order_by,
-            measures,
-            rows_per_match,
-            after_match_skip,
-            pattern,
-            symbols,
-            alias,
-        })
-    }
-
-    fn parse_base_pattern(&mut self) -> Result<MatchRecognizePattern, ParserError> {
-        match self.next_token().token {
-            Token::Caret => Ok(MatchRecognizePattern::Symbol(MatchRecognizeSymbol::Start)),
-            Token::Placeholder(s) if s == "$" => {
-                Ok(MatchRecognizePattern::Symbol(MatchRecognizeSymbol::End))
-            }
-            Token::LBrace => {
-                self.expect_token(&Token::Minus)?;
-                let symbol = self.parse_identifier().map(MatchRecognizeSymbol::Named)?;
-                self.expect_token(&Token::Minus)?;
-                self.expect_token(&Token::RBrace)?;
-                Ok(MatchRecognizePattern::Exclude(symbol))
-            }
-            Token::Word(Word {
-                value,
-                quote_style: None,
-                ..
-            }) if value == "PERMUTE" => {
-                self.expect_token(&Token::LParen)?;
-                let symbols = self.parse_comma_separated(|p| {
-                    p.parse_identifier().map(MatchRecognizeSymbol::Named)
-                })?;
-                self.expect_token(&Token::RParen)?;
-                Ok(MatchRecognizePattern::Permute(symbols))
-            }
-            Token::LParen => {
-                let pattern = self.parse_pattern()?;
-                self.expect_token(&Token::RParen)?;
-                Ok(MatchRecognizePattern::Group(Box::new(pattern)))
-            }
-            _ => {
-                self.prev_token();
-                self.parse_identifier()
-                    .map(MatchRecognizeSymbol::Named)
-                    .map(MatchRecognizePattern::Symbol)
-            }
-        }
-    }
-
-    fn parse_repetition_pattern(&mut self) -> Result<MatchRecognizePattern, ParserError> {
-        let mut pattern = self.parse_base_pattern()?;
-        loop {
-            let token = self.next_token();
-            let quantifier = match token.token {
-                Token::Mul => RepetitionQuantifier::ZeroOrMore,
-                Token::Plus => RepetitionQuantifier::OneOrMore,
-                Token::Placeholder(s) if s == "?" => RepetitionQuantifier::AtMostOne,
-                Token::LBrace => {
-                    // quantifier is a range like {n} or {n,} or {,m} or {n,m}
-                    let token = self.next_token();
-                    match token.token {
-                        Token::Comma => {
-                            let next_token = self.next_token();
-                            let Token::Number(n, _) = next_token.token else {
-                                return self.expected("literal number", next_token);
-                            };
-                            self.expect_token(&Token::RBrace)?;
-                            RepetitionQuantifier::AtMost(Self::parse(n, token.span.start)?)
-                        }
-                        Token::Number(n, _) if self.consume_token(&Token::Comma) => {
-                            let next_token = self.next_token();
-                            match next_token.token {
-                                Token::Number(m, _) => {
-                                    self.expect_token(&Token::RBrace)?;
-                                    RepetitionQuantifier::Range(
-                                        Self::parse(n, token.span.start)?,
-                                        Self::parse(m, token.span.start)?,
-                                    )
-                                }
-                                Token::RBrace => {
-                                    RepetitionQuantifier::AtLeast(Self::parse(n, token.span.start)?)
-                                }
-                                _ => {
-                                    return self.expected("} or upper bound", next_token);
-                                }
-                            }
-                        }
-                        Token::Number(n, _) => {
-                            self.expect_token(&Token::RBrace)?;
-                            RepetitionQuantifier::Exactly(Self::parse(n, token.span.start)?)
-                        }
-                        _ => return self.expected("quantifier range", token),
-                    }
-                }
-                _ => {
-                    self.prev_token();
-                    break;
-                }
-            };
-            pattern = MatchRecognizePattern::Repetition(Box::new(pattern), quantifier);
-        }
-        Ok(pattern)
-    }
-
-    fn parse_concat_pattern(&mut self) -> Result<MatchRecognizePattern, ParserError> {
-        let mut patterns = vec![self.parse_repetition_pattern()?];
-        while !matches!(self.peek_token_ref().token, Token::RParen | Token::Pipe) {
-            patterns.push(self.parse_repetition_pattern()?);
-        }
-        match <[MatchRecognizePattern; 1]>::try_from(patterns) {
-            Ok([pattern]) => Ok(pattern),
-            Err(patterns) => Ok(MatchRecognizePattern::Concat(patterns)),
-        }
-    }
-
-    fn parse_pattern(&mut self) -> Result<MatchRecognizePattern, ParserError> {
-        let pattern = self.parse_concat_pattern()?;
-        if self.consume_token(&Token::Pipe) {
-            match self.parse_pattern()? {
-                // flatten nested alternations
-                MatchRecognizePattern::Alternation(mut patterns) => {
-                    patterns.insert(0, pattern);
-                    Ok(MatchRecognizePattern::Alternation(patterns))
-                }
-                next => Ok(MatchRecognizePattern::Alternation(vec![pattern, next])),
-            }
-        } else {
-            Ok(pattern)
-        }
-    }
 
     /// Parses a the timestamp version specifier (i.e. query historical data)
     pub fn maybe_parse_table_version(&mut self) -> Result<Option<TableVersion>, ParserError> {
@@ -15172,49 +14811,6 @@ impl<'a> Parser<'a> {
         Ok(TableVersion::Changes { changes, at, end })
     }
 
-    /// Parses MySQL's JSON_TABLE column definition.
-    /// For example: `id INT EXISTS PATH '$' DEFAULT '0' ON EMPTY ERROR ON ERROR`
-    pub fn parse_json_table_column_def(&mut self) -> Result<JsonTableColumn, ParserError> {
-        if self.parse_keyword(Keyword::NESTED) {
-            let _has_path_keyword = self.parse_keyword(Keyword::PATH);
-            let path = self.parse_value()?;
-            self.expect_keyword_is(Keyword::COLUMNS)?;
-            let columns = self.parse_parenthesized(|p| {
-                p.parse_comma_separated(Self::parse_json_table_column_def)
-            })?;
-            return Ok(JsonTableColumn::Nested(JsonTableNestedColumn {
-                path,
-                columns,
-            }));
-        }
-        let name = self.parse_identifier()?;
-        if self.parse_keyword(Keyword::FOR) {
-            self.expect_keyword_is(Keyword::ORDINALITY)?;
-            return Ok(JsonTableColumn::ForOrdinality(name));
-        }
-        let r#type = self.parse_data_type()?;
-        let exists = self.parse_keyword(Keyword::EXISTS);
-        self.expect_keyword_is(Keyword::PATH)?;
-        let path = self.parse_value()?;
-        let mut on_empty = None;
-        let mut on_error = None;
-        while let Some(error_handling) = self.parse_json_table_column_error_handling()? {
-            if self.parse_keyword(Keyword::EMPTY) {
-                on_empty = Some(error_handling);
-            } else {
-                self.expect_keyword_is(Keyword::ERROR)?;
-                on_error = Some(error_handling);
-            }
-        }
-        Ok(JsonTableColumn::Named(JsonTableNamedColumn {
-            name,
-            r#type,
-            path,
-            exists,
-            on_empty,
-            on_error,
-        }))
-    }
 
     /// Parses MSSQL's `OPENJSON WITH` column definition.
     ///
@@ -15244,21 +14840,6 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_json_table_column_error_handling(
-        &mut self,
-    ) -> Result<Option<JsonTableColumnErrorHandling>, ParserError> {
-        let res = if self.parse_keyword(Keyword::NULL) {
-            JsonTableColumnErrorHandling::Null
-        } else if self.parse_keyword(Keyword::ERROR) {
-            JsonTableColumnErrorHandling::Error
-        } else if self.parse_keyword(Keyword::DEFAULT) {
-            JsonTableColumnErrorHandling::Default(self.parse_value()?)
-        } else {
-            return Ok(None);
-        };
-        self.expect_keyword_is(Keyword::ON)?;
-        Ok(Some(res))
-    }
 
     /// Parse a derived table factor (a parenthesized subquery), handling optional LATERAL.
     pub fn parse_derived_table_factor(
@@ -15318,122 +14899,9 @@ impl<'a> Parser<'a> {
         Ok(ExprWithAlias { expr, alias })
     }
 
-    /// Parse an expression followed by an optional alias; Unlike
-    /// [Self::parse_expr_with_alias] the "AS" keyword between the expression
-    /// and the alias is optional.
-    fn parse_expr_with_alias_optional_as_keyword(&mut self) -> Result<ExprWithAlias, ParserError> {
-        let expr = self.parse_expr()?;
-        let alias = self.parse_identifier_optional_alias()?;
-        Ok(ExprWithAlias { expr, alias })
-    }
 
-    /// Parses a plain function call with an optional alias for the `PIVOT` clause
-    fn parse_pivot_aggregate_function(&mut self) -> Result<ExprWithAlias, ParserError> {
-        let function_name = match self.next_token().token {
-            Token::Word(w) => Ok(w.value),
-            _ => self.expected_ref("a function identifier", self.peek_token_ref()),
-        }?;
-        let expr = self.parse_function(ObjectName::from(vec![Ident::new(function_name)]))?;
-        let alias = {
-            fn validator(explicit: bool, kw: &Keyword, parser: &mut Parser) -> bool {
-                // ~ for a PIVOT aggregate function the alias must not be a "FOR"; in any dialect
-                kw != &Keyword::FOR && parser.dialect.is_select_item_alias(explicit, kw, parser)
-            }
-            self.parse_optional_alias_inner(None, validator)?
-        };
-        Ok(ExprWithAlias { expr, alias })
-    }
 
-    /// Parse a PIVOT table factor (ClickHouse/Oracle style pivot), returning a TableFactor.
-    pub fn parse_pivot_table_factor(
-        &mut self,
-        table: TableFactor,
-    ) -> Result<TableFactor, ParserError> {
-        self.expect_token(&Token::LParen)?;
-        let aggregate_functions =
-            self.parse_comma_separated(Self::parse_pivot_aggregate_function)?;
-        self.expect_keyword_is(Keyword::FOR)?;
-        let value_column = if self.peek_token_ref().token == Token::LParen {
-            self.parse_parenthesized_column_list_inner(Mandatory, false, |p| {
-                p.parse_subexpr(self.dialect.prec_value(Precedence::Between))
-            })?
-        } else {
-            vec![self.parse_subexpr(self.dialect.prec_value(Precedence::Between))?]
-        };
-        self.expect_keyword_is(Keyword::IN)?;
 
-        self.expect_token(&Token::LParen)?;
-        let value_source = if self.parse_keyword(Keyword::ANY) {
-            let order_by = if self.parse_keywords(&[Keyword::ORDER, Keyword::BY]) {
-                self.parse_comma_separated(Parser::parse_order_by_expr)?
-            } else {
-                vec![]
-            };
-            PivotValueSource::Any(order_by)
-        } else if self.peek_sub_query() {
-            PivotValueSource::Subquery(self.parse_query()?)
-        } else {
-            PivotValueSource::List(
-                self.parse_comma_separated(Self::parse_expr_with_alias_optional_as_keyword)?,
-            )
-        };
-        self.expect_token(&Token::RParen)?;
-
-        let default_on_null =
-            if self.parse_keywords(&[Keyword::DEFAULT, Keyword::ON, Keyword::NULL]) {
-                self.expect_token(&Token::LParen)?;
-                let expr = self.parse_expr()?;
-                self.expect_token(&Token::RParen)?;
-                Some(expr)
-            } else {
-                None
-            };
-
-        self.expect_token(&Token::RParen)?;
-        let alias = self.maybe_parse_table_alias()?;
-        Ok(TableFactor::Pivot {
-            table: Box::new(table),
-            aggregate_functions,
-            value_column,
-            value_source,
-            default_on_null,
-            alias,
-        })
-    }
-
-    /// Parse an UNPIVOT table factor, returning a TableFactor.
-    pub fn parse_unpivot_table_factor(
-        &mut self,
-        table: TableFactor,
-    ) -> Result<TableFactor, ParserError> {
-        let null_inclusion = if self.parse_keyword(Keyword::INCLUDE) {
-            self.expect_keyword_is(Keyword::NULLS)?;
-            Some(NullInclusion::IncludeNulls)
-        } else if self.parse_keyword(Keyword::EXCLUDE) {
-            self.expect_keyword_is(Keyword::NULLS)?;
-            Some(NullInclusion::ExcludeNulls)
-        } else {
-            None
-        };
-        self.expect_token(&Token::LParen)?;
-        let value = self.parse_expr()?;
-        self.expect_keyword_is(Keyword::FOR)?;
-        let name = self.parse_identifier()?;
-        self.expect_keyword_is(Keyword::IN)?;
-        let columns = self.parse_parenthesized_column_list_inner(Mandatory, false, |p| {
-            p.parse_expr_with_alias()
-        })?;
-        self.expect_token(&Token::RParen)?;
-        let alias = self.maybe_parse_table_alias()?;
-        Ok(TableFactor::Unpivot {
-            table: Box::new(table),
-            value,
-            null_inclusion,
-            name,
-            columns,
-            alias,
-        })
-    }
 
     /// Parse a JOIN constraint (`NATURAL`, `ON <expr>`, `USING (...)`, or no constraint).
     pub fn parse_join_constraint(&mut self, natural: bool) -> Result<JoinConstraint, ParserError> {
