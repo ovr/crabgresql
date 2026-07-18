@@ -12,8 +12,8 @@ use std::hint::black_box;
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, TimeTz, Value, date, float, interval, net, text, time, timestamp,
-    timestamptz, timetz, to_char,
+    Inet, Interval, Numeric, TimeTz, Value, date, float, interval, money, net, text, time,
+    timestamp, timestamptz, timetz, to_char,
 };
 
 use crate::ExecError;
@@ -545,6 +545,41 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::ExtractTimeTz => {
             return timetz::extract(text(&args[0]), ttz(&args[1])).map(Value::Numeric).map_err(timetz_err);
         }
+
+        // --- money operators/functions ---
+        ScalarFn::CashUm => {
+            return money::neg(money_of(&args[0])).map(Value::Money).map_err(cash_err);
+        }
+        ScalarFn::CashPl => {
+            return money::add(money_of(&args[0]), money_of(&args[1])).map(Value::Money).map_err(cash_err);
+        }
+        ScalarFn::CashMi => {
+            return money::sub(money_of(&args[0]), money_of(&args[1])).map(Value::Money).map_err(cash_err);
+        }
+        ScalarFn::CashMulInt => {
+            return money::mul_int(money_of(&args[0]), i8(&args[1])).map(Value::Money).map_err(cash_err);
+        }
+        ScalarFn::CashMulFlt => {
+            return money::mul_float(money_of(&args[0]), f8(&args[1])).map(Value::Money).map_err(cash_err);
+        }
+        ScalarFn::CashDivInt => {
+            return money::div_int(money_of(&args[0]), i8(&args[1])).map(Value::Money).map_err(cash_err);
+        }
+        ScalarFn::CashDivFlt => {
+            return money::div_float(money_of(&args[0]), f8(&args[1])).map(Value::Money).map_err(cash_err);
+        }
+        ScalarFn::CashDivCash => {
+            return money::div_cash(money_of(&args[0]), money_of(&args[1])).map(Value::Float8).map_err(cash_err);
+        }
+        ScalarFn::CashWords => {
+            return Ok(Value::Text(money::words(money_of(&args[0]))));
+        }
+        ScalarFn::CashLarger => {
+            return Ok(Value::Money(money::larger(money_of(&args[0]), money_of(&args[1]))));
+        }
+        ScalarFn::CashSmaller => {
+            return Ok(Value::Money(money::smaller(money_of(&args[0]), money_of(&args[1]))));
+        }
         _ => {}
     }
     // The remaining functions are float8 → float8 (or float8×float8 → float8).
@@ -887,6 +922,7 @@ pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, Str
         "timetz" | "time with time zone" => {
             timetz::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message))
         }
+        "money" => money::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message)),
         // Other types: not exercised; treat as valid.
         _ => Ok(()),
     }
@@ -977,6 +1013,17 @@ fn i4(v: &Value) -> i32 {
         Value::Int4(n) => *n,
         other => unreachable!("expected int4 arg, got {other:?}"),
     }
+}
+
+fn money_of(v: &Value) -> i64 {
+    match v {
+        Value::Money(c) => *c,
+        other => unreachable!("expected money arg, got {other:?}"),
+    }
+}
+
+fn cash_err(e: crabgresql_types::money::MoneyError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
 }
 
 fn i8(v: &Value) -> i64 {

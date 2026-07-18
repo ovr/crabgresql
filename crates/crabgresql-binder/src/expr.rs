@@ -16,8 +16,8 @@ use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema, TypeCatalog, UserCast};
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
-    Numeric, PgType, Value, cast, date, float, interval, parse_bool, time, timestamp, timestamptz,
-    timetz,
+    Numeric, PgType, Value, cast, date, float, interval, money, parse_bool, time, timestamp,
+    timestamptz, timetz,
 };
 
 use crate::BindError;
@@ -579,6 +579,7 @@ pub(crate) fn is_orderable(ty: PgType) -> bool {
             | PgType::Uuid
             | PgType::Inet
             | PgType::Cidr
+            | PgType::Money
     )
 }
 
@@ -724,6 +725,7 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                 Some("bpchar") => PgType::Bpchar,
                 Some("varchar") => PgType::Varchar,
                 Some("name") => PgType::Name,
+                Some("money") => PgType::Money,
                 _ => {
                     return Err(BindError::feature_not_supported(format!(
                         "type \"{dt}\" is not supported yet"
@@ -1201,6 +1203,17 @@ fn bind_unary(
                         args: vec![e],
                     }))
                 }
+                // `- money` (`cash_um`); PG has no unary `+ money`, so that falls
+                // through to the error arm below.
+                Binding::Typed(e)
+                    if e.ty() == PgType::Money && op == ast::UnaryOperator::Minus =>
+                {
+                    Ok(Binding::Typed(BoundExpr::FuncCall {
+                        func: ScalarFn::CashUm,
+                        ret: PgType::Money,
+                        args: vec![e],
+                    }))
+                }
                 Binding::Typed(e) => Err(no_op_unary(sym, e.ty().name())),
                 // Every numeric type has this operator, so an untyped literal
                 // cannot pick one — PG reports ambiguity.
@@ -1472,6 +1485,13 @@ fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindEr
         return Ok(binding);
     }
 
+    // Money arithmetic (money ± money, money * / int/float, money / money) is
+    // not on the generic numeric path (money isn't `is_numeric`), so it lowers
+    // to `ScalarFn` calls here. Comparisons fall through to the generic path.
+    if let Some(binding) = resolve_money_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
     // Comparison or arithmetic: settle both operands on one type. For
     // arithmetic, the typed side must offer the operator BEFORE the unknown
     // side is parsed as that type — PG reports `operator does not exist:
@@ -1691,6 +1711,72 @@ fn binding_typed_ty(b: &Binding) -> Option<PgType> {
     match b {
         Binding::Typed(e) => Some(e.ty()),
         Binding::Unknown { .. } => None,
+    }
+}
+
+/// Money arithmetic. `money` is deliberately not `is_numeric`, so it never
+/// reaches the generic numeric path; its operators lower to `ScalarFn` calls
+/// here, as `resolve_temporal`/`resolve_network_op` do for their types:
+/// `money ± money -> money`; `money * intN` / `intN * money` / `money * floatN`
+/// / `floatN * money -> money`; `money / intN -> money`; `money / floatN ->
+/// money`; `money / money -> float8`. Returns `Ok(None)` when neither side is
+/// money or the op/operand pair has no money operator, so the generic path (and
+/// its comparisons and "operator does not exist" error) still applies. Every
+/// call puts the money operand first and the factor/divisor second.
+fn resolve_money_op(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Binding>, BindError> {
+    use PgType::Money as M;
+    let lt = binding_typed_ty(lb);
+    let rt = binding_typed_ty(rb);
+    if lt != Some(M) && rt != Some(M) {
+        return Ok(None);
+    }
+    let is_int = |t: Option<PgType>| matches!(t, Some(PgType::Int2 | PgType::Int4 | PgType::Int8));
+    let is_flt = |t: Option<PgType>| matches!(t, Some(PgType::Float4 | PgType::Float8));
+    let typed = |b: &Binding| match b {
+        Binding::Typed(e) => e.clone(),
+        Binding::Unknown { .. } => unreachable!("typed side is Typed"),
+    };
+    let call = |func, ret, a: BoundExpr, b: BoundExpr| {
+        Ok(Some(Binding::Typed(BoundExpr::FuncCall { func, ret, args: vec![a, b] })))
+    };
+    match op {
+        // money ± money; an untyped literal opposite money is parsed as money.
+        // money ± int/float has no operator in PG — fall through to the error.
+        BinOp::Add | BinOp::Sub => {
+            let func = if op == BinOp::Add { ScalarFn::CashPl } else { ScalarFn::CashMi };
+            match (lt, rt) {
+                (Some(M), Some(M)) => call(func, M, typed(lb), typed(rb)),
+                (Some(M), None) => call(func, M, typed(lb), resolve_operand(rb, M)?),
+                (None, Some(M)) => call(func, M, resolve_operand(lb, M)?, typed(rb)),
+                _ => Ok(None),
+            }
+        }
+        BinOp::Mul => match (lt, rt) {
+            (Some(M), _) if is_int(rt) => {
+                call(ScalarFn::CashMulInt, M, typed(lb), resolve_operand(rb, PgType::Int8)?)
+            }
+            (_, Some(M)) if is_int(lt) => {
+                call(ScalarFn::CashMulInt, M, typed(rb), resolve_operand(lb, PgType::Int8)?)
+            }
+            (Some(M), _) if is_flt(rt) => {
+                call(ScalarFn::CashMulFlt, M, typed(lb), resolve_operand(rb, PgType::Float8)?)
+            }
+            (_, Some(M)) if is_flt(lt) => {
+                call(ScalarFn::CashMulFlt, M, typed(rb), resolve_operand(lb, PgType::Float8)?)
+            }
+            _ => Ok(None),
+        },
+        BinOp::Div => match (lt, rt) {
+            (Some(M), Some(M)) => call(ScalarFn::CashDivCash, PgType::Float8, typed(lb), typed(rb)),
+            (Some(M), _) if is_int(rt) => {
+                call(ScalarFn::CashDivInt, M, typed(lb), resolve_operand(rb, PgType::Int8)?)
+            }
+            (Some(M), _) if is_flt(rt) => {
+                call(ScalarFn::CashDivFlt, M, typed(lb), resolve_operand(rb, PgType::Float8)?)
+            }
+            _ => Ok(None),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -2270,6 +2356,9 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             .map_err(|e| {
                 BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))
             }),
+        PgType::Money => money::parse(s)
+            .map(Value::Money)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Bit | PgType::User(_) => Err(invalid()),
     }
 }

@@ -29,6 +29,7 @@ const T_INTERVAL: u8 = 16;
 const T_UUID: u8 = 17;
 const T_INET: u8 = 18;
 const T_CIDR: u8 = 19;
+const T_MONEY: u8 = 20;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -118,6 +119,10 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         Value::Cidr(a) => {
             out.push(T_CIDR);
             put_net(out, a);
+        }
+        Value::Money(c) => {
+            out.push(T_MONEY);
+            out.extend_from_slice(&c.to_le_bytes());
         }
     }
 }
@@ -212,6 +217,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         }
         T_INET => r.net(false),
         T_CIDR => r.net(true),
+        T_MONEY => Value::Money(r.i64()),
         other => panic!("corrupt datum tag {other}"),
     };
     *pos = r.pos;
@@ -251,6 +257,8 @@ mod tests {
         roundtrip(Value::TimestampTz(i64::MAX));
         roundtrip(Value::Interval(Interval { months: -13, days: 2, usec: -999 }));
         roundtrip(Value::Uuid([9u8; 16]));
+        roundtrip(Value::Money(i64::MIN));
+        roundtrip(Value::Money(12345));
     }
 
     #[test]

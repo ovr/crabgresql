@@ -319,6 +319,30 @@ pub enum ScalarFn {
     NameInput,
     /// `bpchar -> text` coercion: strip trailing blanks.
     BpcharToText,
+
+    // --- money operators/functions (built by the binder unless noted) ---
+    /// unary `- money` (`cash_um`).
+    CashUm,
+    /// `money + money -> money`.
+    CashPl,
+    /// `money - money -> money`.
+    CashMi,
+    /// `money * intN -> money` / `intN * money -> money` (factor widened to int8).
+    CashMulInt,
+    /// `money * floatN -> money` / `floatN * money -> money` (factor as float8).
+    CashMulFlt,
+    /// `money / intN -> money` (integer division, truncating).
+    CashDivInt,
+    /// `money / floatN -> money` (float division, rounded).
+    CashDivFlt,
+    /// `money / money -> float8`.
+    CashDivCash,
+    /// `cash_words(money) -> text`.
+    CashWords,
+    /// `cashlarger(money, money) -> money`.
+    CashLarger,
+    /// `cashsmaller(money, money) -> money`.
+    CashSmaller,
 }
 
 struct Signature {
@@ -474,6 +498,7 @@ const BOOL: PgType = PgType::Bool;
 const BYTEA: PgType = PgType::Bytea;
 const INET: PgType = PgType::Inet;
 const CIDR: PgType = PgType::Cidr;
+const MONEY: PgType = PgType::Money;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -529,6 +554,12 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature { func: ScalarFn::ModInt, args: &[PgType::Int8, PgType::Int8], ret: PgType::Int8 },
             Signature { func: ScalarFn::NumMod, args: &[NUM, NUM], ret: NUM },
         ],
+        // money helper functions.
+        "cash_words" => &[Signature { func: ScalarFn::CashWords, args: &[MONEY], ret: TEXT }],
+        "cashlarger" => &[Signature { func: ScalarFn::CashLarger, args: &[MONEY, MONEY], ret: MONEY }],
+        "cashsmaller" => {
+            &[Signature { func: ScalarFn::CashSmaller, args: &[MONEY, MONEY], ret: MONEY }]
+        }
         "cbrt" => unary_f8!(ScalarFn::Cbrt),
         "exp" => num_and_f8!(ScalarFn::NumExp, ScalarFn::Exp),
         "ln" => num_and_f8!(ScalarFn::NumLn, ScalarFn::Ln),
