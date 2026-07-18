@@ -10,22 +10,26 @@ use std::sync::Arc;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, TableAm, TableEngine};
-use crabgresql_types::Value;
+use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
-    BoundExpr, Scope, bind_expr, bind_projection, coerce_to_column, normalize_ident, output_name,
-    to_bool_operand, unify_value_column,
+    BoundExpr, Scope, bind_expr, bind_projection, bind_scalar, coerce_to_column, normalize_ident,
+    output_name, to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, OutputColumn, TableFn};
 
 /// A bound statement: names resolved, expressions typed, clauses vetted.
 /// Carries the opened `TableAm` so later stages never re-resolve the name.
-/// One ORDER BY key: an output-column index and its direction. NULLs order
-/// last for ASC, first for DESC (PG defaults).
+/// One ORDER BY key: an index into the projected tuple, the type its values
+/// compare as, and its direction. `column` may address a hidden ("resjunk")
+/// column appended past the visible output width when ORDER BY references an
+/// expression not in the select list. NULLs order last for ASC, first for DESC
+/// (PG defaults).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SortKey {
     pub column: usize,
+    pub ty: PgType,
     pub asc: bool,
     pub nulls_first: bool,
 }
@@ -543,7 +547,10 @@ fn bind_values_query(
         })
         .collect();
 
-    let sort = bind_order_by(order_by, &columns)?;
+    // A standalone VALUES list has no projection tuple to append hidden sort
+    // columns to (cells evaluate against an empty row), so only ordinals and
+    // `columnN` names resolve; expressions stay `0A000`.
+    let sort = bind_order_by(order_by, &columns, &scope, &mut Vec::new(), false)?;
     Ok(LogicalPlan::Values {
         columns,
         rows,
@@ -633,11 +640,27 @@ fn apply_alias_columns(
     Ok(())
 }
 
-/// Bind an ORDER BY clause against the already-built output columns. Only
-/// integer ordinals are supported (`ORDER BY 1`); other forms stay `0A000`.
+/// Bind an ORDER BY clause into sort keys indexing the projected tuple.
+///
+/// Each item resolves in PG's SQL92/SQL99 precedence:
+/// 1. a bare unsigned integer → an output-column ordinal (`ORDER BY 1`);
+/// 2. a bare, unqualified identifier matching an output column name → that
+///    column (`ORDER BY total`); ambiguous names error `42702`;
+/// 3. otherwise the whole expression binds against the FROM `scope` — output
+///    aliases are deliberately *not* visible inside an expression, so
+///    `SELECT 1 AS a ORDER BY a+1` errors like PG. A bound expression already in
+///    `projections` is reused; anything else is appended as a hidden
+///    ("resjunk") column that the executor sorts on and then trims.
+///
+/// `allow_hidden` gates case 3's expression binding: a standalone `VALUES` list
+/// has no projection tuple to append to (its cells evaluate against an empty
+/// row), so it only permits cases 1–2 and rejects expressions with `0A000`.
 fn bind_order_by(
     order_by: &Option<ast::OrderBy>,
     columns: &[OutputColumn],
+    scope: &Scope,
+    projections: &mut Vec<BoundExpr>,
+    allow_hidden: bool,
 ) -> Result<Vec<SortKey>, BindError> {
     let Some(order_by) = order_by else {
         return Ok(Vec::new());
@@ -652,33 +675,90 @@ fn bind_order_by(
     };
     let mut keys = Vec::with_capacity(exprs.len());
     for oe in exprs {
-        let ordinal = match &oe.expr {
-            ast::Expr::Value(v) => match &v.value {
-                ast::Value::Number(n, _) => n.parse::<usize>().ok(),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some(ordinal) = ordinal else {
-            return Err(BindError::feature_not_supported(
-                "ORDER BY expressions are not supported yet (only column ordinals)",
-            ));
-        };
+        // Resolve the item to (projected-tuple index, comparison type).
+        let (column, ty) = order_by_target(&oe.expr, columns, scope, projections, allow_hidden)?;
+        let asc = oe.options.asc.unwrap_or(true);
+        let nulls_first = oe.options.nulls_first.unwrap_or(!asc);
+        keys.push(SortKey {
+            column,
+            ty,
+            asc,
+            nulls_first,
+        });
+    }
+    Ok(keys)
+}
+
+/// Resolve one ORDER BY item to `(column index into the projected tuple, type)`,
+/// appending a hidden projection when the item is an expression not already
+/// present. See [`bind_order_by`] for the precedence.
+fn order_by_target(
+    expr: &ast::Expr,
+    columns: &[OutputColumn],
+    scope: &Scope,
+    projections: &mut Vec<BoundExpr>,
+    allow_hidden: bool,
+) -> Result<(usize, PgType), BindError> {
+    // (1) A bare unsigned integer literal is an output-column ordinal. `1+1` is
+    // an expression, not ordinal 2, so only a plain `Value::Number` qualifies.
+    if let ast::Expr::Value(v) = expr
+        && let ast::Value::Number(n, _) = &v.value
+        && let Ok(ordinal) = n.parse::<usize>()
+    {
         if ordinal < 1 || ordinal > columns.len() {
             return Err(BindError::new(
                 sqlstate::INVALID_COLUMN_REFERENCE,
                 format!("ORDER BY position {ordinal} is not in select list"),
             ));
         }
-        let asc = oe.options.asc.unwrap_or(true);
-        let nulls_first = oe.options.nulls_first.unwrap_or(!asc);
-        keys.push(SortKey {
-            column: ordinal - 1,
-            asc,
-            nulls_first,
-        });
+        return Ok((ordinal - 1, columns[ordinal - 1].ty));
     }
-    Ok(keys)
+
+    // (2) A bare, unqualified identifier matches an output column name first.
+    // Qualified names (`t.x`) skip this and bind as expressions, as in PG.
+    if let ast::Expr::Identifier(ident) = expr {
+        let name = normalize_ident(ident);
+        let mut hit: Option<usize> = None;
+        for (i, col) in columns.iter().enumerate() {
+            if col.name == name {
+                if hit.is_some() {
+                    return Err(BindError::new(
+                        sqlstate::AMBIGUOUS_COLUMN,
+                        format!("ORDER BY \"{name}\" is ambiguous"),
+                    ));
+                }
+                hit = Some(i);
+            }
+        }
+        if let Some(i) = hit {
+            return Ok((i, columns[i].ty));
+        }
+        // Fall through: a name not in the select list may still be an input
+        // column resolvable against the scope (`SELECT a FROM t ORDER BY b`).
+    }
+
+    // (3) Bind the expression against the FROM scope.
+    if !allow_hidden {
+        return Err(BindError::feature_not_supported(
+            "ORDER BY expressions are not supported yet (only column ordinals)",
+        ));
+    }
+    let bound = bind_scalar(expr, scope)?;
+    if bound.is_srf() {
+        // PG: "set-returning functions are not allowed in ORDER BY".
+        return Err(BindError::feature_not_supported(
+            "set-returning functions are not allowed in ORDER BY",
+        ));
+    }
+    let ty = bound.ty();
+    // Reuse an equal projection (PG's target-entry reuse) — scan the growing
+    // list so a later key can reuse an earlier key's hidden column too.
+    if let Some(i) = projections.iter().position(|p| *p == bound) {
+        return Ok((i, ty));
+    }
+    let index = projections.len();
+    projections.push(bound);
+    Ok((index, ty))
 }
 
 fn reject_unsupported_query_clauses(query: &ast::Query) -> Result<(), BindError> {
@@ -753,7 +833,11 @@ fn bind_values_select(
         row.push(bound);
     }
     let predicate = bind_where(&select.selection, &scope)?;
-    let sort = bind_order_by(order_by, &columns)?;
+    // The empty scope means any hidden ORDER BY expression is column-free
+    // (`ORDER BY random()`), so appending it to `row` stays safe against the
+    // Values node's empty-row evaluation. Hidden columns are never SRFs, so the
+    // SRF check below is unaffected.
+    let sort = bind_order_by(order_by, &columns, &scope, &mut row, true)?;
     // A FROM-less SELECT with a set-returning function in the target list
     // (`SELECT generate_series(1, 5)`) expands into rows, so it cannot be a
     // constant `Values`. Run the projection pipeline over a single dummy input
@@ -827,7 +911,7 @@ fn bind_select_body(
     }
 
     let predicate = bind_where(&select.selection, scope)?;
-    let sort = bind_order_by(order_by, &columns)?;
+    let sort = bind_order_by(order_by, &columns, scope, &mut projections, true)?;
     Ok(SelectBody {
         columns,
         projections,
@@ -1471,7 +1555,6 @@ mod tests {
     #[test]
     fn unsupported_forms_stay_0a000() {
         for sql in [
-            "SELECT id FROM t ORDER BY id",
             "SELECT id FROM t LIMIT 1",
             "UPDATE t SET (id, name) = (1, 'x')",
             "UPDATE t SET id = 1 RETURNING id",
@@ -2170,5 +2253,133 @@ mod tests {
         let e = bind_err("SELECT x.nope FROM t x");
         assert_eq!(e.code, "42703");
         assert_eq!(e.message, "column x.nope does not exist");
+    }
+
+    /// A single-table SELECT's projections and sort keys.
+    fn query_parts(sql: &str) -> (Vec<BoundExpr>, Vec<SortKey>) {
+        match bind_one(sql).unwrap() {
+            LogicalPlan::Query {
+                projections, sort, ..
+            } => (projections, sort),
+            _ => panic!("expected Query for {sql}, got another plan variant"),
+        }
+    }
+
+    #[test]
+    fn order_by_ordinal_carries_type_and_direction() {
+        // `ORDER BY 2 DESC` → second output column (id, int4), descending, and
+        // the PG default NULLS FIRST for a descending sort.
+        let (projections, sort) = query_parts("SELECT name, id FROM t ORDER BY 2 DESC");
+        assert_eq!(projections.len(), 2, "no hidden column for an ordinal");
+        assert_eq!(
+            sort,
+            vec![SortKey {
+                column: 1,
+                ty: PgType::Int4,
+                asc: false,
+                nulls_first: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn order_by_output_name_resolves_to_visible_column() {
+        // A bare name matches a select-list output name first (SQL92).
+        let (projections, sort) = query_parts("SELECT name, id FROM t ORDER BY name");
+        assert_eq!(projections.len(), 2);
+        assert_eq!(
+            sort,
+            vec![SortKey {
+                column: 0,
+                ty: PgType::Text,
+                asc: true,
+                nulls_first: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn order_by_alias_resolves_to_its_column() {
+        let (projections, sort) = query_parts("SELECT id + big AS s FROM t ORDER BY s");
+        assert_eq!(projections.len(), 1);
+        assert_eq!(sort[0].column, 0);
+        assert_eq!(sort[0].ty, PgType::Int8);
+    }
+
+    #[test]
+    fn order_by_nonselected_column_appends_hidden() {
+        // `big` is not in the select list, so it becomes a hidden column past
+        // the single visible output. Its type drives comparison.
+        let (projections, sort) = query_parts("SELECT id FROM t ORDER BY big");
+        assert_eq!(projections.len(), 2, "one hidden column appended");
+        assert_eq!(
+            projections[1],
+            BoundExpr::ColumnRef {
+                index: 1,
+                ty: PgType::Int8
+            }
+        );
+        assert_eq!(sort[0].column, 1);
+        assert_eq!(sort[0].ty, PgType::Int8);
+    }
+
+    #[test]
+    fn order_by_expression_reuses_equal_projection() {
+        // `ORDER BY id + big` equals the sole projection `id + big`, so it is
+        // reused rather than appended (PG's target-entry reuse).
+        let (projections, sort) = query_parts("SELECT id + big AS s FROM t ORDER BY id + big");
+        assert_eq!(projections.len(), 1, "reused, not appended");
+        assert_eq!(sort[0].column, 0);
+    }
+
+    #[test]
+    fn order_by_qualified_name_binds_as_expression() {
+        // A qualified name skips the output-name match and binds against the
+        // FROM scope, appending a hidden column when not selected.
+        let (projections, sort) = query_parts("SELECT id FROM t ORDER BY t.name");
+        assert_eq!(projections.len(), 2);
+        assert_eq!(sort[0].column, 1);
+        assert_eq!(sort[0].ty, PgType::Text);
+    }
+
+    #[test]
+    fn order_by_ambiguous_output_name_is_42702() {
+        let e = bind_err("SELECT id AS c, big AS c FROM t ORDER BY c");
+        assert_eq!(e.code, "42702");
+        assert_eq!(e.message, "ORDER BY \"c\" is ambiguous");
+    }
+
+    #[test]
+    fn order_by_alias_not_visible_inside_expression() {
+        // A top-level bare alias resolves, but inside an expression the alias is
+        // invisible — PG reports the underlying column as undefined.
+        let e = bind_err("SELECT 1 AS a ORDER BY a + 1");
+        assert_eq!(e.code, "42703");
+    }
+
+    #[test]
+    fn order_by_upper_of_column_binds() {
+        let (projections, sort) = query_parts("SELECT id FROM t ORDER BY upper(name)");
+        assert_eq!(projections.len(), 2);
+        assert_eq!(sort[0].column, 1);
+        assert_eq!(sort[0].ty, PgType::Text);
+    }
+
+    #[test]
+    fn values_order_by_column_name_resolves() {
+        let LogicalPlan::Values { sort, .. } = bind_one("VALUES (3), (1) ORDER BY column1").unwrap()
+        else {
+            panic!("expected Values");
+        };
+        assert_eq!(sort[0].column, 0);
+        assert_eq!(sort[0].ty, PgType::Int4);
+    }
+
+    #[test]
+    fn values_order_by_expression_stays_0a000() {
+        // A standalone VALUES list has no projection tuple to hang a hidden
+        // column on, so expression sort keys are still unsupported.
+        let e = bind_err("VALUES (3), (1) ORDER BY column1 + 1");
+        assert_eq!(e.code, "0A000");
     }
 }

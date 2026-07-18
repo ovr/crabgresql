@@ -99,6 +99,45 @@ async fn create_insert_select_on_memory_engine() {
 }
 
 #[tokio::test]
+async fn order_by_name_expression_and_alias() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer, a integer, b integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1, 3, 10), (2, 1, 40), (3, 2, 20)")
+        .await
+        .unwrap();
+
+    // ORDER BY a column name: sorted by `a` ascending → id 2 (a=1), id 3 (a=2),
+    // id 1 (a=3).
+    let messages = client.simple_query("SELECT id FROM t ORDER BY a").await.unwrap();
+    let ids: Vec<&str> = rows(&messages).iter().map(|r| r.get(0).unwrap()).collect();
+    assert_eq!(ids, vec!["2", "3", "1"]);
+
+    // ORDER BY an expression over a non-selected column (a + b): a+b is 13, 41,
+    // 22 for ids 1,2,3 → ascending order ids 1,3,2.
+    let messages = client
+        .simple_query("SELECT id FROM t ORDER BY a + b")
+        .await
+        .unwrap();
+    let ordered = rows(&messages);
+    let ids: Vec<&str> = ordered.iter().map(|r| r.get(0).unwrap()).collect();
+    assert_eq!(ids, vec!["1", "3", "2"]);
+    // Only the single visible column is returned (the sort column is hidden).
+    assert_eq!(ordered[0].len(), 1);
+
+    // ORDER BY an output alias, descending: total = a+b, largest first → 2,3,1.
+    let messages = client
+        .simple_query("SELECT id, a + b AS total FROM t ORDER BY total DESC")
+        .await
+        .unwrap();
+    let ids: Vec<&str> = rows(&messages).iter().map(|r| r.get(0).unwrap()).collect();
+    assert_eq!(ids, vec!["2", "3", "1"]);
+}
+
+#[tokio::test]
 async fn multiple_statements_in_one_query() {
     let client = connect(spawn_server().await).await;
     let messages = client.simple_query("SELECT 1; SELECT 2").await.unwrap();

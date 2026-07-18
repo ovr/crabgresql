@@ -18,7 +18,7 @@ use crabgresql_binder::{BoundExpr, SortKey, TableFn};
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_planner::{PhysicalJoinInput, PhysicalPlan};
 use crabgresql_storage_api::{TableAm, Tid, Tuple};
-use crabgresql_types::{PgType, Value};
+use crabgresql_types::Value;
 
 use eval::eval;
 pub use eval::{coerce_value, compare_values};
@@ -502,7 +502,9 @@ impl ExecNode for CrossJoin {
     }
 }
 
-/// Wrap `node` in a `Sort` when there are ORDER BY keys.
+/// Wrap `node` in a `Sort` when there are ORDER BY keys. `columns` is the
+/// client-visible output width; sort keys may address hidden ("resjunk")
+/// columns past it, which the sort trims before emitting.
 fn maybe_sort(
     node: Box<dyn ExecNode>,
     sort: Vec<SortKey>,
@@ -511,12 +513,13 @@ fn maybe_sort(
     if sort.is_empty() {
         return Ok(node);
     }
-    let types: Vec<PgType> = columns.iter().map(|c| c.ty).collect();
-    Ok(Box::new(Sort::new(node, sort, types)?))
+    Ok(Box::new(Sort::new(node, sort, columns.len())?))
 }
 
 /// Materializing sort (ORDER BY). NULLs order per `SortKey.nulls_first`;
-/// non-null values compare via the type's total order.
+/// non-null values compare via the key's type total order. Keys may reference
+/// hidden columns appended past `visible_width`; those are dropped from each
+/// emitted tuple so only the client-visible columns leave the node.
 pub struct Sort {
     rows: std::vec::IntoIter<Tuple>,
 }
@@ -525,7 +528,7 @@ impl Sort {
     pub fn new(
         mut child: Box<dyn ExecNode>,
         keys: Vec<SortKey>,
-        types: Vec<PgType>,
+        visible_width: usize,
     ) -> Result<Self, ExecError> {
         let mut rows: Vec<Tuple> = Vec::new();
         while let Some(row) = child.next()? {
@@ -556,7 +559,7 @@ impl Sort {
                         }
                     }
                     (false, false) => {
-                        let cmp = compare_values(types[key.column], va, vb);
+                        let cmp = compare_values(key.ty, va, vb);
                         if key.asc { cmp } else { cmp.reverse() }
                     }
                 };
@@ -566,6 +569,12 @@ impl Sort {
             }
             Ordering::Equal
         });
+        // Drop hidden sort-only columns so downstream (the wire layer, an outer
+        // subquery) sees exactly the visible output width. Comparison above
+        // already read them; they are no longer needed.
+        for row in &mut rows {
+            row.truncate(visible_width);
+        }
         Ok(Self {
             rows: rows.into_iter(),
         })
@@ -1073,6 +1082,44 @@ mod tests {
                 vec![Value::Int4(12)],
                 vec![Value::Int4(13)],
             ]
+        );
+    }
+
+    #[test]
+    fn sort_orders_by_hidden_column_then_trims() {
+        // Project only `id` (visible), but sort on a hidden trailing column
+        // holding `label` (a resjunk column that ORDER BY references but the
+        // client never sees). The sort must order by the hidden value's type
+        // and then drop it, emitting a single visible column.
+        let table = test_table();
+        let exprs = vec![
+            BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4,
+            },
+            BoundExpr::ColumnRef {
+                index: 1,
+                ty: PgType::Text,
+            },
+        ];
+        let projection = Projection::new(Box::new(SeqScan::new(&table)), exprs, ExecContext::default());
+        // ORDER BY label ASC: NULL (id 3) sorts last (NULLS LAST default), then
+        // 'one' (id 1), 'two' (id 2).
+        let key = SortKey {
+            column: 1,
+            ty: PgType::Text,
+            asc: true,
+            nulls_first: false,
+        };
+        let mut node = Sort::new(Box::new(projection), vec![key], 1).unwrap();
+        assert_eq!(
+            collect(&mut node),
+            vec![
+                vec![Value::Int4(1)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(3)],
+            ],
+            "rows ordered by hidden label, trimmed to the single visible column"
         );
     }
 
