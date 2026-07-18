@@ -49,8 +49,8 @@ use crate::{
 };
 
 pub use self::data_type::{
-    ArrayElemTypeDef, BinaryLength, CharLengthUnits, CharacterLength, DataType, EnumMember,
-    ExactNumberInfo, IntervalFields, StructBracketKind, TimezoneInfo,
+    ArrayElemTypeDef, BinaryLength, CharLengthUnits, CharacterLength, DataType, ExactNumberInfo,
+    IntervalFields, TimezoneInfo,
 };
 pub use self::dcl::{
     AlterRoleOperation, CreateRole, Grant, ResetConfig, Revoke, RoleOption, SetConfigValue,
@@ -580,24 +580,7 @@ impl fmt::Display for StructField {
     }
 }
 
-/// A field definition within a union
-///
-/// [DuckDB]: https://duckdb.org/docs/sql/data_types/union.html
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-pub struct UnionField {
-    /// Name of the union field.
-    pub field_name: Ident,
-    /// Type of the union field.
-    pub field_type: DataType,
-}
 
-impl fmt::Display for UnionField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.field_name, self.field_type)
-    }
-}
 
 /// A dictionary field within a dictionary.
 ///

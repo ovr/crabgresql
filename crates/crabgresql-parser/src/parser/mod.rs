@@ -3238,31 +3238,6 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// DuckDB specific: Parse a Union type definition as a sequence of field-value pairs.
-    ///
-    /// Syntax:
-    ///
-    /// ```sql
-    /// UNION(field_name field_type[,...])
-    /// ```
-    ///
-    /// [1]: https://duckdb.org/docs/sql/data_types/union.html
-    fn parse_union_type_def(&mut self) -> Result<Vec<UnionField>, ParserError> {
-        self.expect_keyword_is(Keyword::UNION)?;
-
-        self.expect_token(&Token::LParen)?;
-
-        let fields = self.parse_comma_separated(|p| {
-            Ok(UnionField {
-                field_name: p.parse_identifier()?,
-                field_type: p.parse_data_type()?,
-            })
-        })?;
-
-        self.expect_token(&Token::RParen)?;
-
-        Ok(fields)
-    }
 
     /// DuckDB and ClickHouse specific: Parse a duckdb [dictionary] or a clickhouse [map] setting
     ///
@@ -3346,50 +3321,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse clickhouse [map]
-    ///
-    /// Syntax
-    ///
-    /// ```sql
-    /// Map(key_data_type, value_data_type)
-    /// ```
-    ///
-    /// [map]: https://clickhouse.com/docs/en/sql-reference/data-types/map
-    fn parse_click_house_map_def(&mut self) -> Result<(DataType, DataType), ParserError> {
-        self.expect_keyword_is(Keyword::MAP)?;
-        self.expect_token(&Token::LParen)?;
-        let key_data_type = self.parse_data_type()?;
-        self.expect_token(&Token::Comma)?;
-        let value_data_type = self.parse_data_type()?;
-        self.expect_token(&Token::RParen)?;
 
-        Ok((key_data_type, value_data_type))
-    }
-
-    /// Parse clickhouse [tuple]
-    ///
-    /// Syntax
-    ///
-    /// ```sql
-    /// Tuple([field_name] field_type, ...)
-    /// ```
-    ///
-    /// [tuple]: https://clickhouse.com/docs/en/sql-reference/data-types/tuple
-    fn parse_click_house_tuple_def(&mut self) -> Result<Vec<StructField>, ParserError> {
-        self.expect_keyword_is(Keyword::TUPLE)?;
-        self.expect_token(&Token::LParen)?;
-        let mut field_defs = vec![];
-        loop {
-            let (def, _) = self.parse_struct_field_def()?;
-            field_defs.push(def);
-            if !self.consume_token(&Token::Comma) {
-                break;
-            }
-        }
-        self.expect_token(&Token::RParen)?;
-
-        Ok(field_defs)
-    }
 
     /// For nested types that use the angle bracket syntax, this matches either
     /// `>`, `>>` or nothing depending on which variant is expected (specified by the previously
@@ -11299,23 +11231,6 @@ impl<'a> Parser<'a> {
         self.expected_ref("unicode normalization form", self.peek_token_ref())
     }
 
-    /// Parse parenthesized enum members, used with `ENUM(...)` type definitions.
-    pub fn parse_enum_values(&mut self) -> Result<Vec<EnumMember>, ParserError> {
-        self.expect_token(&Token::LParen)?;
-        let values = self.parse_comma_separated(|parser| {
-            let name = parser.parse_literal_string()?;
-            let e = if parser.consume_token(&Token::Eq) {
-                let value = parser.parse_number()?;
-                EnumMember::NamedValue(name, value)
-            } else {
-                EnumMember::Name(name)
-            };
-            Ok(e)
-        })?;
-        self.expect_token(&Token::RParen)?;
-
-        Ok(values)
-    }
 
     /// Parse a SQL datatype (in the context of a CREATE TABLE statement for example)
     pub fn parse_data_type(&mut self) -> Result<DataType, ParserError> {
@@ -11360,8 +11275,6 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Keyword::FLOAT4 => Ok(DataType::Float4),
-                Keyword::FLOAT32 => Ok(DataType::Float32),
-                Keyword::FLOAT64 => Ok(DataType::Float64),
                 Keyword::FLOAT8 => Ok(DataType::Float8),
                 Keyword::DOUBLE => {
                     if self.parse_keyword(Keyword::PRECISION) {
@@ -11378,17 +11291,6 @@ impl<'a> Parser<'a> {
                         } else {
                             Ok(DataType::Double(precision))
                         }
-                    }
-                }
-                Keyword::TINYINT => {
-                    let optional_precision = self.parse_optional_precision();
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::TinyIntUnsigned(optional_precision?))
-                    } else {
-                        if dialect.supports_data_type_signed_suffix() {
-                            let _ = self.parse_keyword(Keyword::SIGNED);
-                        }
-                        Ok(DataType::TinyInt(optional_precision?))
                     }
                 }
                 Keyword::INT2 => {
@@ -11408,17 +11310,6 @@ impl<'a> Parser<'a> {
                             let _ = self.parse_keyword(Keyword::SIGNED);
                         }
                         Ok(DataType::SmallInt(optional_precision?))
-                    }
-                }
-                Keyword::MEDIUMINT => {
-                    let optional_precision = self.parse_optional_precision();
-                    if self.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::MediumIntUnsigned(optional_precision?))
-                    } else {
-                        if dialect.supports_data_type_signed_suffix() {
-                            let _ = self.parse_keyword(Keyword::SIGNED);
-                        }
-                        Ok(DataType::MediumInt(optional_precision?))
                     }
                 }
                 Keyword::INT => {
@@ -11448,11 +11339,6 @@ impl<'a> Parser<'a> {
                         Ok(DataType::Int8(optional_precision?))
                     }
                 }
-                Keyword::INT16 => Ok(DataType::Int16),
-                Keyword::INT32 => Ok(DataType::Int32),
-                Keyword::INT64 => Ok(DataType::Int64),
-                Keyword::INT128 => Ok(DataType::Int128),
-                Keyword::INT256 => Ok(DataType::Int256),
                 Keyword::INTEGER => {
                     let optional_precision = self.parse_optional_precision();
                     if self.parse_keyword(Keyword::UNSIGNED) {
@@ -11475,21 +11361,7 @@ impl<'a> Parser<'a> {
                         Ok(DataType::BigInt(optional_precision?))
                     }
                 }
-                Keyword::HUGEINT => Ok(DataType::HugeInt),
-                Keyword::UBIGINT => Ok(DataType::UBigInt),
-                Keyword::UHUGEINT => Ok(DataType::UHugeInt),
-                Keyword::USMALLINT => Ok(DataType::USmallInt),
-                Keyword::UTINYINT => Ok(DataType::UTinyInt),
-                Keyword::UINT8 => Ok(DataType::UInt8),
-                Keyword::UINT16 => Ok(DataType::UInt16),
-                Keyword::UINT32 => Ok(DataType::UInt32),
-                Keyword::UINT64 => Ok(DataType::UInt64),
-                Keyword::UINT128 => Ok(DataType::UInt128),
-                Keyword::UINT256 => Ok(DataType::UInt256),
                 Keyword::VARCHAR => Ok(DataType::Varchar(self.parse_optional_character_length()?)),
-                Keyword::NVARCHAR => {
-                    Ok(DataType::Nvarchar(self.parse_optional_character_length()?))
-                }
                 Keyword::CHARACTER => {
                     if self.parse_keyword(Keyword::VARYING) {
                         Ok(DataType::CharacterVarying(
@@ -11518,13 +11390,9 @@ impl<'a> Parser<'a> {
                 Keyword::BINARY => Ok(DataType::Binary(self.parse_optional_precision()?)),
                 Keyword::VARBINARY => Ok(DataType::Varbinary(self.parse_optional_binary_length()?)),
                 Keyword::BLOB => Ok(DataType::Blob(self.parse_optional_precision()?)),
-                Keyword::TINYBLOB => Ok(DataType::TinyBlob),
-                Keyword::MEDIUMBLOB => Ok(DataType::MediumBlob),
-                Keyword::LONGBLOB => Ok(DataType::LongBlob),
                 Keyword::LONG if self.dialect.supports_long_type_as_bigint() => {
                     Ok(DataType::BigInt(None))
                 }
-                Keyword::BYTES => Ok(DataType::Bytes(self.parse_optional_precision()?)),
                 Keyword::BIT => {
                     if self.parse_keyword(Keyword::VARYING) {
                         Ok(DataType::BitVarying(self.parse_optional_precision()?))
@@ -11535,13 +11403,6 @@ impl<'a> Parser<'a> {
                 Keyword::VARBIT => Ok(DataType::VarBit(self.parse_optional_precision()?)),
                 Keyword::UUID => Ok(DataType::Uuid),
                 Keyword::DATE => Ok(DataType::Date),
-                Keyword::DATE32 => Ok(DataType::Date32),
-                Keyword::DATETIME => Ok(DataType::Datetime(self.parse_optional_precision()?)),
-                Keyword::DATETIME64 => {
-                    self.prev_token();
-                    let (precision, time_zone) = self.parse_datetime_64()?;
-                    Ok(DataType::Datetime64(precision, time_zone))
-                }
                 Keyword::TIMESTAMP => {
                     let precision = self.parse_optional_precision()?;
                     let tz = if self.parse_keyword(Keyword::WITH) {
@@ -11559,9 +11420,6 @@ impl<'a> Parser<'a> {
                     self.parse_optional_precision()?,
                     TimezoneInfo::Tz,
                 )),
-                Keyword::TIMESTAMP_NTZ => {
-                    Ok(DataType::TimestampNtz(self.parse_optional_precision()?))
-                }
                 Keyword::TIME => {
                     let precision = self.parse_optional_precision()?;
                     let tz = if self.parse_keyword(Keyword::WITH) {
@@ -11594,13 +11452,6 @@ impl<'a> Parser<'a> {
                 Keyword::JSON => Ok(DataType::JSON),
                 Keyword::JSONB => Ok(DataType::JSONB),
                 Keyword::REGCLASS => Ok(DataType::Regclass),
-                Keyword::STRING => Ok(DataType::String(self.parse_optional_precision()?)),
-                Keyword::FIXEDSTRING => {
-                    self.expect_token(&Token::LParen)?;
-                    let character_length = self.parse_literal_uint()?;
-                    self.expect_token(&Token::RParen)?;
-                    Ok(DataType::FixedString(character_length))
-                }
                 Keyword::TEXT => {
                     if let Some(modifiers) = self.parse_optional_type_modifiers()? {
                         Ok(DataType::Custom(
@@ -11611,9 +11462,6 @@ impl<'a> Parser<'a> {
                         Ok(DataType::Text)
                     }
                 }
-                Keyword::TINYTEXT => Ok(DataType::TinyText),
-                Keyword::MEDIUMTEXT => Ok(DataType::MediumText),
-                Keyword::LONGTEXT => Ok(DataType::LongText),
                 Keyword::BYTEA => Ok(DataType::Bytea),
                 Keyword::NUMERIC => Ok(DataType::Numeric(
                     self.parse_exact_number_optional_precision_scale()?,
@@ -11636,16 +11484,6 @@ impl<'a> Parser<'a> {
                         Ok(DataType::Dec(precision))
                     }
                 }
-                Keyword::BIGNUMERIC => Ok(DataType::BigNumeric(
-                    self.parse_exact_number_optional_precision_scale()?,
-                )),
-                Keyword::BIGDECIMAL => Ok(DataType::BigDecimal(
-                    self.parse_exact_number_optional_precision_scale()?,
-                )),
-                Keyword::ENUM => Ok(DataType::Enum(self.parse_enum_values()?, None)),
-                Keyword::ENUM8 => Ok(DataType::Enum(self.parse_enum_values()?, Some(8))),
-                Keyword::ENUM16 => Ok(DataType::Enum(self.parse_enum_values()?, Some(16))),
-                Keyword::SET => Ok(DataType::Set(self.parse_string_values()?)),
                 Keyword::ARRAY => {
                     if self.dialect.supports_array_typedef_without_element_type() {
                         Ok(DataType::Array(ArrayElemTypeDef::None))
@@ -11658,62 +11496,7 @@ impl<'a> Parser<'a> {
                         ))))
                     }
                 }
-                Keyword::STRUCT if self.dialect.supports_struct_literal() => {
-                    self.prev_token();
-                    let (field_defs, _trailing_bracket) =
-                        self.parse_struct_type_def(Self::parse_struct_field_def)?;
-                    trailing_bracket = _trailing_bracket;
-                    Ok(DataType::Struct(
-                        field_defs,
-                        StructBracketKind::AngleBrackets,
-                    ))
-                }
-                Keyword::UNION if dialect_is!(dialect is GenericDialect) => {
-                    self.prev_token();
-                    let fields = self.parse_union_type_def()?;
-                    Ok(DataType::Union(fields))
-                }
-                Keyword::NULLABLE if dialect_is!(dialect is GenericDialect) => {
-                    Ok(self.parse_sub_type(DataType::Nullable)?)
-                }
-                Keyword::LOWCARDINALITY if dialect_is!(dialect is GenericDialect) => {
-                    Ok(self.parse_sub_type(DataType::LowCardinality)?)
-                }
-                Keyword::MAP if self.dialect.supports_map_literal_with_angle_brackets() => {
-                    self.expect_token(&Token::Lt)?;
-                    let key_data_type = self.parse_data_type()?;
-                    self.expect_token(&Token::Comma)?;
-                    let (value_data_type, _trailing_bracket) = self.parse_data_type_helper()?;
-                    trailing_bracket = self.expect_closing_angle_bracket(_trailing_bracket)?;
-                    Ok(DataType::Map(
-                        Box::new(key_data_type),
-                        Box::new(value_data_type),
-                    ))
-                }
-                Keyword::MAP if dialect_is!(dialect is GenericDialect) => {
-                    self.prev_token();
-                    let (key_data_type, value_data_type) = self.parse_click_house_map_def()?;
-                    Ok(DataType::Map(
-                        Box::new(key_data_type),
-                        Box::new(value_data_type),
-                    ))
-                }
-                Keyword::NESTED if dialect_is!(dialect is GenericDialect) => {
-                    self.expect_token(&Token::LParen)?;
-                    let field_defs = self.parse_comma_separated(Parser::parse_column_def)?;
-                    self.expect_token(&Token::RParen)?;
-                    Ok(DataType::Nested(field_defs))
-                }
-                Keyword::TUPLE if dialect_is!(dialect is GenericDialect) => {
-                    self.prev_token();
-                    let field_defs = self.parse_click_house_tuple_def()?;
-                    Ok(DataType::Tuple(field_defs))
-                }
                 Keyword::TRIGGER => Ok(DataType::Trigger),
-                Keyword::ANY if self.peek_keyword(Keyword::TYPE) => {
-                    let _ = self.parse_keyword(Keyword::TYPE);
-                    Ok(DataType::AnyType)
-                }
                 Keyword::TABLE => {
                     // an LParen after the TABLE keyword indicates that table columns are being defined
                     // whereas no LParen indicates an anonymous table expression will be returned
@@ -11722,20 +11505,6 @@ impl<'a> Parser<'a> {
                         Ok(DataType::Table(Some(columns)))
                     } else {
                         Ok(DataType::Table(None))
-                    }
-                }
-                Keyword::SIGNED => {
-                    if self.parse_keyword(Keyword::INTEGER) {
-                        Ok(DataType::SignedInteger)
-                    } else {
-                        Ok(DataType::Signed)
-                    }
-                }
-                Keyword::UNSIGNED => {
-                    if self.parse_keyword(Keyword::INTEGER) {
-                        Ok(DataType::UnsignedInteger)
-                    } else {
-                        Ok(DataType::Unsigned)
                     }
                 }
                 Keyword::TSVECTOR if dialect_is!(dialect is PostgreSqlDialect | GenericDialect) => {
@@ -11779,25 +11548,6 @@ impl<'a> Parser<'a> {
         Ok(columns)
     }
 
-    /// Parse a parenthesized, comma-separated list of single-quoted strings.
-    pub fn parse_string_values(&mut self) -> Result<Vec<String>, ParserError> {
-        self.expect_token(&Token::LParen)?;
-        let mut values = Vec::new();
-        loop {
-            let next_token = self.next_token();
-            match next_token.token {
-                Token::SingleQuotedString(value) => values.push(value),
-                _ => self.expected("a string", next_token)?,
-            }
-            let next_token = self.next_token();
-            match next_token.token {
-                Token::Comma => (),
-                Token::RParen => break,
-                _ => self.expected(", or }", next_token)?,
-            }
-        }
-        Ok(values)
-    }
 
     /// Strictly parse `identifier AS identifier`
     pub fn parse_identifier_with_alias(&mut self) -> Result<IdentWithAlias, ParserError> {
@@ -12581,25 +12331,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse datetime64 [1]
-    /// Syntax
-    /// ```sql
-    /// DateTime64(precision[, timezone])
-    /// ```
-    ///
-    /// [1]: https://clickhouse.com/docs/en/sql-reference/data-types/datetime64
-    pub fn parse_datetime_64(&mut self) -> Result<(u64, Option<String>), ParserError> {
-        self.expect_keyword_is(Keyword::DATETIME64)?;
-        self.expect_token(&Token::LParen)?;
-        let precision = self.parse_literal_uint()?;
-        let time_zone = if self.consume_token(&Token::Comma) {
-            Some(self.parse_literal_string()?)
-        } else {
-            None
-        };
-        self.expect_token(&Token::RParen)?;
-        Ok((precision, time_zone))
-    }
 
     /// Parse an optional character length specification `(n | MAX [CHARACTERS|OCTETS])`.
     pub fn parse_optional_character_length(
@@ -12739,16 +12470,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a parenthesized sub data type
-    fn parse_sub_type<F>(&mut self, parent_type: F) -> Result<DataType, ParserError>
-    where
-        F: FnOnce(Box<DataType>) -> DataType,
-    {
-        self.expect_token(&Token::LParen)?;
-        let inside_type = self.parse_data_type()?;
-        self.expect_token(&Token::RParen)?;
-        Ok(parent_type(inside_type.into()))
-    }
 
     /// Parse a DELETE statement, returning a `Box`ed SetExpr
     ///
