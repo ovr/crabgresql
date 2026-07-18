@@ -295,11 +295,65 @@ async fn create_table_if_not_exists_is_idempotent() {
 }
 
 #[tokio::test]
+async fn temp_table_shadows_permanent_within_the_session_only() {
+    let port = spawn_server().await;
+
+    // A permanent table lives in the shared engine.
+    let a = connect(port).await;
+    a.simple_query("CREATE TABLE t (v integer)").await.unwrap();
+    a.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+
+    // A same-named TEMP table shadows it for this session — no 42P07, and all
+    // DML now resolves to the temp table.
+    a.simple_query("CREATE TEMP TABLE t (v integer)")
+        .await
+        .unwrap();
+    a.simple_query("INSERT INTO t VALUES (2), (3)")
+        .await
+        .unwrap();
+
+    let temp_msgs = a.simple_query("SELECT v FROM t").await.unwrap();
+    let temp_rows = rows(&temp_msgs);
+    assert_eq!(temp_rows.len(), 2, "SELECT hits the temp table");
+    assert_eq!(temp_rows[0].get(0), Some("2"));
+    assert_eq!(temp_rows[1].get(0), Some("3"));
+
+    // UPDATE and TRUNCATE hit the temp table too, never the shadowed permanent one.
+    let msgs = a.simple_query("UPDATE t SET v = v * -1").await.unwrap();
+    assert_eq!(command_count(&msgs), Some(2), "UPDATE hits the 2 temp rows");
+    a.simple_query("TRUNCATE t").await.unwrap();
+    assert_eq!(
+        rows(&a.simple_query("SELECT v FROM t").await.unwrap()).len(),
+        0,
+        "TRUNCATE emptied the temp table"
+    );
+
+    // A second, fresh session has no temp store: it sees only the permanent
+    // table (still holding its original row), proving the temp table is
+    // session-scoped and left the permanent one untouched.
+    let b = connect(port).await;
+    let perm_msgs = b.simple_query("SELECT v FROM t").await.unwrap();
+    let perm_rows = rows(&perm_msgs);
+    assert_eq!(perm_rows.len(), 1);
+    assert_eq!(
+        perm_rows[0].get(0),
+        Some("1"),
+        "the permanent table was never shadowed for this session"
+    );
+}
+
+#[tokio::test]
 async fn unenforceable_ddl_is_rejected() {
     let client = connect(spawn_server().await).await;
     for sql in [
         "CREATE TABLE c (id integer PRIMARY KEY)",
         "CREATE TABLE c (id integer NOT NULL)",
+        // Clauses we can't honor must be rejected, not silently dropped: CTAS
+        // would discard the SELECT, and ON COMMIT needs the M2 txn engine.
+        "CREATE TABLE c AS SELECT 1 AS x",
+        "CREATE TEMP TABLE c AS SELECT 1 AS x",
+        "CREATE TEMP TABLE c (x int) ON COMMIT DROP",
+        "CREATE TEMP TABLE c (x int) ON COMMIT DELETE ROWS",
     ] {
         let err = client.simple_query(sql).await.unwrap_err();
         assert_eq!(
