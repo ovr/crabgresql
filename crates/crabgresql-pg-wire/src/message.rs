@@ -239,6 +239,12 @@ impl ErrorFields {
         Self::with_severity("NOTICE", code, message)
     }
 
+    /// A WARNING with the mandatory severity / sqlstate / message fields.
+    /// Delivered as a NoticeResponse on the wire, like NOTICE.
+    pub fn warning(code: &str, message: &str) -> Self {
+        Self::with_severity("WARNING", code, message)
+    }
+
     fn with_severity(severity: &str, code: &str, message: &str) -> Self {
         Self {
             fields: vec![
@@ -1190,6 +1196,10 @@ mod tests {
         rt_backend(BackendMessage::NoticeResponse(ErrorFields::notice(
             "00000",
             "table will be created",
+        )));
+        rt_backend(BackendMessage::NoticeResponse(ErrorFields::warning(
+            "25P01",
+            "there is no transaction in progress",
         )));
         rt_backend(BackendMessage::NotificationResponse {
             pid: 99,

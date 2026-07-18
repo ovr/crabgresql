@@ -9,12 +9,19 @@ use std::sync::Arc;
 use crabgresql_binder::{bind_delete, bind_insert, bind_query, bind_update};
 use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
 use crabgresql_parser::ast;
-use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{Column, StorageError, TableEngine, TableSchema};
+use crabgresql_pg_wire::{TransactionStatus, sqlstate};
+use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TableSchema};
 use crabgresql_types::PgType;
 
 use crate::error::PgError;
 use crate::session::Session;
+
+/// A non-error message (severity WARNING) sent before a command's
+/// CommandComplete — e.g. "there is no transaction in progress".
+pub struct Notice {
+    pub code: &'static str,
+    pub message: String,
+}
 
 pub enum QueryResult {
     /// A result set, streamed: the caller pulls tuples from the node and
@@ -25,7 +32,19 @@ pub enum QueryResult {
     },
     Command {
         tag: String,
+        /// Warnings to emit before the CommandComplete, in order.
+        notices: Vec<Notice>,
     },
+}
+
+impl QueryResult {
+    /// A command result with no accompanying warnings.
+    fn command(tag: impl Into<String>) -> Self {
+        QueryResult::Command {
+            tag: tag.into(),
+            notices: Vec::new(),
+        }
+    }
 }
 
 pub fn execute_statement(
@@ -33,6 +52,19 @@ pub fn execute_statement(
     stmt: &ast::Statement,
     session: &mut Session,
 ) -> Result<QueryResult, PgError> {
+    // In an aborted transaction block, PG rejects everything but COMMIT/ROLLBACK
+    // until the block ends.
+    if session.tx_status == TransactionStatus::Failed
+        && !matches!(
+            stmt,
+            ast::Statement::Commit { .. } | ast::Statement::Rollback { .. }
+        )
+    {
+        return Err(PgError::new(
+            sqlstate::IN_FAILED_SQL_TRANSACTION,
+            "current transaction is aborted, commands ignored until end of transaction block",
+        ));
+    }
     let logical = match stmt {
         ast::Statement::Query(query) => bind_query(engine, query)?,
         ast::Statement::Insert(insert) => bind_insert(engine, insert)?,
@@ -41,6 +73,30 @@ pub fn execute_statement(
         ast::Statement::CreateTable(create) => return execute_create_table(engine, create),
         ast::Statement::Set(set) => return apply_set(set, session),
         ast::Statement::Reset(reset) => return apply_reset(reset, session),
+        ast::Statement::StartTransaction {
+            modes,
+            modifier,
+            statements,
+            exception,
+            has_end_keyword,
+            ..
+        } => {
+            return begin_transaction(
+                session,
+                modes,
+                modifier,
+                statements,
+                exception,
+                *has_end_keyword,
+            );
+        }
+        ast::Statement::Commit {
+            chain, modifier, ..
+        } => return commit_transaction(session, *chain, modifier),
+        ast::Statement::Rollback { chain, savepoint } => {
+            return rollback_transaction(session, *chain, savepoint);
+        }
+        ast::Statement::Truncate(truncate) => return execute_truncate(engine, truncate),
         other => {
             return Err(PgError::feature_not_supported(format!(
                 "statement is not supported yet: {}",
@@ -50,17 +106,165 @@ pub fn execute_statement(
     };
     let result = match execute(crabgresql_planner::plan(logical), session.exec_context())? {
         Execution::Rows { columns, node } => QueryResult::Rows { columns, node },
-        Execution::Inserted(n) => QueryResult::Command {
-            tag: format!("INSERT 0 {n}"),
-        },
-        Execution::Updated(n) => QueryResult::Command {
-            tag: format!("UPDATE {n}"),
-        },
-        Execution::Deleted(n) => QueryResult::Command {
-            tag: format!("DELETE {n}"),
-        },
+        Execution::Inserted(n) => QueryResult::command(format!("INSERT 0 {n}")),
+        Execution::Updated(n) => QueryResult::command(format!("UPDATE {n}")),
+        Execution::Deleted(n) => QueryResult::command(format!("DELETE {n}")),
     };
     Ok(result)
+}
+
+/// `BEGIN` / `START TRANSACTION` (bare forms only). Enters the transaction
+/// block; a redundant BEGIN warns but stays in the block. Real data rollback is
+/// M2 — this only tracks the control-flow state.
+fn begin_transaction(
+    session: &mut Session,
+    modes: &[ast::TransactionMode],
+    modifier: &Option<ast::TransactionModifier>,
+    statements: &[ast::Statement],
+    exception: &Option<Vec<ast::ExceptionWhen>>,
+    has_end_keyword: bool,
+) -> Result<QueryResult, PgError> {
+    if !modes.is_empty() {
+        return Err(PgError::feature_not_supported(
+            "transaction modes (isolation level / read write) are not supported yet",
+        ));
+    }
+    if modifier.is_some() {
+        return Err(PgError::feature_not_supported(
+            "AND CHAIN is not supported yet",
+        ));
+    }
+    if !statements.is_empty() || exception.is_some() || has_end_keyword {
+        return Err(PgError::feature_not_supported(
+            "BEGIN ... END atomic blocks are not supported yet",
+        ));
+    }
+    let mut notices = Vec::new();
+    if session.tx_status == TransactionStatus::InTransaction {
+        notices.push(Notice {
+            code: sqlstate::ACTIVE_SQL_TRANSACTION,
+            message: "there is already a transaction in progress".into(),
+        });
+    }
+    session.tx_status = TransactionStatus::InTransaction;
+    Ok(QueryResult::Command {
+        tag: "BEGIN".into(),
+        notices,
+    })
+}
+
+/// `COMMIT` / `END`. Ends the block. A COMMIT of a failed block is reported as
+/// ROLLBACK, and a COMMIT with no block open warns — both as in PG.
+fn commit_transaction(
+    session: &mut Session,
+    chain: bool,
+    modifier: &Option<ast::TransactionModifier>,
+) -> Result<QueryResult, PgError> {
+    if chain {
+        return Err(PgError::feature_not_supported(
+            "AND CHAIN is not supported yet",
+        ));
+    }
+    if modifier.is_some() {
+        return Err(PgError::feature_not_supported(
+            "transaction modifiers are not supported yet",
+        ));
+    }
+    let mut notices = Vec::new();
+    let tag = match session.tx_status {
+        TransactionStatus::Failed => "ROLLBACK",
+        TransactionStatus::Idle => {
+            notices.push(Notice {
+                code: sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                message: "there is no transaction in progress".into(),
+            });
+            "COMMIT"
+        }
+        TransactionStatus::InTransaction => "COMMIT",
+    };
+    session.tx_status = TransactionStatus::Idle;
+    Ok(QueryResult::Command {
+        tag: tag.into(),
+        notices,
+    })
+}
+
+/// `ROLLBACK` / `ABORT`. Ends the block (in any state); with no block open it
+/// warns. Note: committed in-memory data is not undone yet — that is M2.
+fn rollback_transaction(
+    session: &mut Session,
+    chain: bool,
+    savepoint: &Option<ast::Ident>,
+) -> Result<QueryResult, PgError> {
+    if chain {
+        return Err(PgError::feature_not_supported(
+            "AND CHAIN is not supported yet",
+        ));
+    }
+    if savepoint.is_some() {
+        return Err(PgError::feature_not_supported(
+            "ROLLBACK TO SAVEPOINT is not supported yet",
+        ));
+    }
+    let mut notices = Vec::new();
+    if session.tx_status == TransactionStatus::Idle {
+        notices.push(Notice {
+            code: sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+            message: "there is no transaction in progress".into(),
+        });
+    }
+    session.tx_status = TransactionStatus::Idle;
+    Ok(QueryResult::Command {
+        tag: "ROLLBACK".into(),
+        notices,
+    })
+}
+
+/// `TRUNCATE [TABLE] name [, ...]` (bare form only). All named tables are
+/// resolved before any is emptied, so a missing table fails the whole statement.
+fn execute_truncate(
+    engine: &Arc<dyn TableEngine>,
+    truncate: &ast::Truncate,
+) -> Result<QueryResult, PgError> {
+    if truncate.cascade.is_some() {
+        return Err(PgError::feature_not_supported(
+            "TRUNCATE ... CASCADE/RESTRICT is not supported yet",
+        ));
+    }
+    if truncate.identity.is_some() {
+        return Err(PgError::feature_not_supported(
+            "TRUNCATE ... RESTART/CONTINUE IDENTITY is not supported yet",
+        ));
+    }
+    if truncate.if_exists {
+        return Err(PgError::feature_not_supported(
+            "TRUNCATE ... IF EXISTS is not supported yet",
+        ));
+    }
+    if truncate.partitions.is_some() {
+        return Err(PgError::feature_not_supported(
+            "TRUNCATE of a partition list is not supported yet",
+        ));
+    }
+    if truncate.on_cluster.is_some() {
+        return Err(PgError::feature_not_supported(
+            "TRUNCATE ... ON CLUSTER is not supported yet",
+        ));
+    }
+    let mut tables: Vec<Arc<dyn TableAm>> = Vec::with_capacity(truncate.table_names.len());
+    for target in &truncate.table_names {
+        if target.only || target.has_asterisk {
+            return Err(PgError::feature_not_supported(
+                "TRUNCATE ONLY / descendant selection is not supported yet",
+            ));
+        }
+        let name = object_name_to_table_name(&target.name)?;
+        tables.push(engine.open_table(&name)?);
+    }
+    for table in &tables {
+        table.truncate();
+    }
+    Ok(QueryResult::command("TRUNCATE TABLE"))
 }
 
 /// `SET`: only `extra_float_digits` is honored; other GUCs are accepted and
@@ -82,7 +286,7 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
         }
         session.extra_float_digits = v;
     }
-    Ok(QueryResult::Command { tag: "SET".into() })
+    Ok(QueryResult::command("SET"))
 }
 
 /// `RESET extra_float_digits` / `RESET ALL` restore the default (1).
@@ -96,9 +300,7 @@ fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<Que
     if reset_efd {
         session.extra_float_digits = 1;
     }
-    Ok(QueryResult::Command {
-        tag: "RESET".into(),
-    })
+    Ok(QueryResult::command("RESET"))
 }
 
 /// A single-part object name, lowercased (GUC names are case-insensitive).
@@ -203,9 +405,7 @@ fn execute_create_table(
         Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {}
         Err(e) => return Err(e.into()),
     }
-    Ok(QueryResult::Command {
-        tag: "CREATE TABLE".into(),
-    })
+    Ok(QueryResult::command("CREATE TABLE"))
 }
 
 /// Shared with cast/typed-literal binding, so CREATE TABLE and `::` casts agree

@@ -3,3 +3,4 @@ test: errors
 test: cast
 test: timestamp
 test: case
+test: transactions

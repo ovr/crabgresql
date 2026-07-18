@@ -775,3 +775,257 @@ async fn ssl_request_is_refused_then_startup_proceeds() {
         }
     }
 }
+
+// --- Transactions: raw-socket helpers (tokio-postgres only exposes the numeric
+// command count, not the tag text or the ReadyForQuery status byte) ---
+
+/// Send a simple `Query` and collect every backend `(tag, body)` up to and
+/// including the terminating ReadyForQuery.
+async fn simple_query_raw(socket: &mut tokio::net::TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+    let mut q = sql.as_bytes().to_vec();
+    q.push(0);
+    socket.write_all(&frontend_message(b'Q', &q)).await.unwrap();
+    let mut out = Vec::new();
+    loop {
+        let (tag, body) = read_backend_message(socket).await;
+        let done = tag == b'Z';
+        out.push((tag, body));
+        if done {
+            return out;
+        }
+    }
+}
+
+/// CommandComplete (`C`) tag strings, in order (NUL terminator stripped).
+fn command_tags(msgs: &[(u8, Vec<u8>)]) -> Vec<String> {
+    msgs.iter()
+        .filter(|(tag, _)| *tag == b'C')
+        .map(|(_, body)| String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(body)).into())
+        .collect()
+}
+
+/// The status byte of the terminating ReadyForQuery (`I`/`T`/`E`).
+fn ready_status(msgs: &[(u8, Vec<u8>)]) -> u8 {
+    msgs.iter()
+        .rev()
+        .find(|(tag, _)| *tag == b'Z')
+        .map(|(_, body)| body[0])
+        .expect("a ReadyForQuery must terminate the batch")
+}
+
+/// Read one field (e.g. `C` sqlstate, `V` severity) out of an
+/// ErrorResponse / NoticeResponse body.
+fn field(body: &[u8], want: u8) -> Option<String> {
+    let mut i = 0;
+    while i < body.len() && body[i] != 0 {
+        let code = body[i];
+        i += 1;
+        let start = i;
+        while i < body.len() && body[i] != 0 {
+            i += 1;
+        }
+        let value = String::from_utf8_lossy(&body[start..i]).to_string();
+        i += 1; // skip the field's NUL terminator
+        if code == want {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn transaction_status_and_tags_track_the_block() {
+    let mut socket = raw_session(spawn_server().await).await;
+
+    let msgs = simple_query_raw(&mut socket, "BEGIN").await;
+    assert_eq!(command_tags(&msgs), ["BEGIN"]);
+    assert_eq!(ready_status(&msgs), b'T');
+
+    let msgs = simple_query_raw(&mut socket, "SELECT 1").await;
+    assert_eq!(ready_status(&msgs), b'T', "still inside the block");
+
+    let msgs = simple_query_raw(&mut socket, "COMMIT").await;
+    assert_eq!(command_tags(&msgs), ["COMMIT"]);
+    assert_eq!(ready_status(&msgs), b'I');
+
+    // START TRANSACTION also completes with tag BEGIN and enters the block.
+    let msgs = simple_query_raw(&mut socket, "START TRANSACTION").await;
+    assert_eq!(command_tags(&msgs), ["BEGIN"]);
+    assert_eq!(ready_status(&msgs), b'T');
+
+    let msgs = simple_query_raw(&mut socket, "ROLLBACK").await;
+    assert_eq!(command_tags(&msgs), ["ROLLBACK"]);
+    assert_eq!(ready_status(&msgs), b'I');
+}
+
+#[tokio::test]
+async fn aborted_block_rejects_until_it_ends() {
+    let mut socket = raw_session(spawn_server().await).await;
+    simple_query_raw(&mut socket, "BEGIN").await;
+
+    // An error inside the block moves it to the failed state ('E').
+    let msgs = simple_query_raw(&mut socket, "SELECT * FROM missing").await;
+    assert_eq!(ready_status(&msgs), b'E');
+
+    // Everything but COMMIT/ROLLBACK is now rejected with 25P02.
+    let msgs = simple_query_raw(&mut socket, "SELECT 1").await;
+    let err = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'E')
+        .expect("must report an error");
+    assert_eq!(field(&err.1, b'C').as_deref(), Some("25P02"));
+    assert!(
+        !msgs.iter().any(|(tag, _)| *tag == b'D'),
+        "no rows in an aborted block"
+    );
+    assert_eq!(ready_status(&msgs), b'E');
+
+    // ROLLBACK clears the block and the session is usable again.
+    let msgs = simple_query_raw(&mut socket, "ROLLBACK").await;
+    assert_eq!(command_tags(&msgs), ["ROLLBACK"]);
+    assert_eq!(ready_status(&msgs), b'I');
+    let msgs = simple_query_raw(&mut socket, "SELECT 1").await;
+    assert!(msgs.iter().any(|(tag, _)| *tag == b'D'));
+    assert_eq!(ready_status(&msgs), b'I');
+}
+
+#[tokio::test]
+async fn commit_of_a_failed_block_reports_rollback() {
+    let mut socket = raw_session(spawn_server().await).await;
+    simple_query_raw(&mut socket, "BEGIN").await;
+    simple_query_raw(&mut socket, "SELECT * FROM missing").await; // aborts the block
+
+    let msgs = simple_query_raw(&mut socket, "COMMIT").await;
+    assert_eq!(
+        command_tags(&msgs),
+        ["ROLLBACK"],
+        "COMMIT of a failed block is a rollback"
+    );
+    assert_eq!(ready_status(&msgs), b'I');
+}
+
+#[tokio::test]
+async fn redundant_transaction_commands_warn() {
+    let mut socket = raw_session(spawn_server().await).await;
+
+    // COMMIT with no block open warns (25P01, severity WARNING) but succeeds.
+    let msgs = simple_query_raw(&mut socket, "COMMIT").await;
+    let notice = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'N')
+        .expect("a warning is expected");
+    assert_eq!(field(&notice.1, b'C').as_deref(), Some("25P01"));
+    assert_eq!(field(&notice.1, b'V').as_deref(), Some("WARNING"));
+    assert_eq!(
+        field(&notice.1, b'M').as_deref(),
+        Some("there is no transaction in progress")
+    );
+    assert_eq!(command_tags(&msgs), ["COMMIT"]);
+    assert_eq!(ready_status(&msgs), b'I');
+
+    // A nested BEGIN warns (25001) but stays in the block.
+    simple_query_raw(&mut socket, "BEGIN").await;
+    let msgs = simple_query_raw(&mut socket, "BEGIN").await;
+    let notice = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'N')
+        .expect("a warning is expected");
+    assert_eq!(field(&notice.1, b'C').as_deref(), Some("25001"));
+    assert_eq!(
+        field(&notice.1, b'M').as_deref(),
+        Some("there is already a transaction in progress")
+    );
+    assert_eq!(command_tags(&msgs), ["BEGIN"]);
+    assert_eq!(ready_status(&msgs), b'T');
+}
+
+#[tokio::test]
+async fn truncate_empties_tables() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await
+        .unwrap();
+
+    client.simple_query("TRUNCATE t").await.unwrap();
+    assert_eq!(
+        rows(&client.simple_query("SELECT * FROM t").await.unwrap()).len(),
+        0
+    );
+
+    // The `TRUNCATE TABLE` keyword form works too.
+    client
+        .simple_query("INSERT INTO t VALUES (9)")
+        .await
+        .unwrap();
+    client.simple_query("TRUNCATE TABLE t").await.unwrap();
+    assert_eq!(
+        rows(&client.simple_query("SELECT * FROM t").await.unwrap()).len(),
+        0
+    );
+
+    // A missing table fails the statement with 42P01.
+    let err = client.simple_query("TRUNCATE nope").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::UNDEFINED_TABLE
+    );
+}
+
+#[tokio::test]
+async fn truncate_resolves_every_table_before_emptying() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE a (id integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO a VALUES (1)")
+        .await
+        .unwrap();
+
+    // The second name is missing: the whole statement fails and `a` is untouched.
+    let err = client
+        .simple_query("TRUNCATE a, missing")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::UNDEFINED_TABLE
+    );
+    assert_eq!(
+        rows(&client.simple_query("SELECT * FROM a").await.unwrap()).len(),
+        1,
+        "no table may be emptied when any named table is missing"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_transaction_forms_are_rejected() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    for sql in [
+        "BEGIN ISOLATION LEVEL SERIALIZABLE",
+        "BEGIN TRANSACTION READ ONLY",
+        "SAVEPOINT s",
+        "ROLLBACK TO SAVEPOINT s",
+        "TRUNCATE t CASCADE",
+        "TRUNCATE t RESTART IDENTITY",
+    ] {
+        let err = client.simple_query(sql).await.unwrap_err();
+        assert_eq!(
+            err.as_db_error()
+                .unwrap_or_else(|| panic!("{sql} should error"))
+                .code(),
+            &tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED,
+            "{sql}"
+        );
+    }
+}

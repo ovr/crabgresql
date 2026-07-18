@@ -136,6 +136,13 @@ impl TableAm for MemoryTable {
         applied
     }
 
+    /// Drop the whole snapshot in one step. `next_tid` keeps advancing so tids
+    /// stay monotonic and never-reused across the truncate.
+    fn truncate(&self) {
+        let mut rows = self.rows.write().unwrap();
+        *rows = Arc::new(Vec::new());
+    }
+
     /// Single retain pass instead of per-tid removal (each `Vec::remove`
     /// shifts the whole tail).
     fn delete_many(&self, tids: Vec<Tid>) -> u64 {
@@ -284,6 +291,21 @@ mod tests {
         table.delete(b);
         assert_eq!(table.delete_many(vec![a, b, c]), 2);
         assert_eq!(table.scan().count(), 0);
+    }
+
+    #[test]
+    fn truncate_empties_table_and_keeps_tids_monotonic() {
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t")).unwrap();
+        table.insert(vec![Value::Int4(1), Value::Null]);
+        let b = table.insert(vec![Value::Int4(2), Value::Null]);
+        table.truncate();
+        assert_eq!(table.scan().count(), 0);
+        // Tids are not reused: a post-truncate insert still advances.
+        let c = table.insert(vec![Value::Int4(3), Value::Null]);
+        assert!(c > b);
+        let rows: Vec<_> = table.scan().collect();
+        assert_eq!(rows, vec![(c, vec![Value::Int4(3), Value::Null])]);
     }
 
     #[test]
