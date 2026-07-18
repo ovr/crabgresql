@@ -10,7 +10,8 @@ use crabgresql_pg_wire::{
 use crabgresql_storage_api::TableEngine;
 use tokio::net::TcpStream;
 
-use crate::query::{QueryResult, execute_statement};
+use crate::global_catalog::GlobalCatalog;
+use crate::query::{NoticeSeverity, QueryResult, execute_statement};
 use crate::session::Session;
 
 /// Fake backend pids for BackendKeyData: every connection needs a distinct
@@ -33,6 +34,7 @@ const STARTUP_PARAMETERS: &[(&str, &str)] = &[
 pub async fn handle_connection(
     socket: TcpStream,
     engine: Arc<dyn TableEngine>,
+    catalog: Arc<GlobalCatalog>,
 ) -> Result<(), ProtocolError> {
     socket.set_nodelay(true).ok();
     let (read_half, write_half) = socket.into_split();
@@ -88,7 +90,7 @@ pub async fn handle_connection(
             }
             Some(_) if skip_until_sync => {}
             Some(FrontendMessage::Query(sql)) => {
-                run_simple_query(&sql, &engine, &mut session, &mut writer).await?;
+                run_simple_query(&sql, &engine, &catalog, &mut session, &mut writer).await?;
                 writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
@@ -124,6 +126,7 @@ const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 async fn run_simple_query(
     sql: &str,
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<GlobalCatalog>,
     session: &mut Session,
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
 ) -> Result<(), ProtocolError> {
@@ -142,7 +145,7 @@ async fn run_simple_query(
     }
     for stmt in &statements {
         let efd = session.extra_float_digits;
-        match execute_statement(engine, stmt, session) {
+        match execute_statement(engine, catalog, stmt, session) {
             Ok(result) => {
                 if write_result(writer, result, efd).await? == WriteOutcome::Errored {
                     mark_transaction_failed(session);
@@ -151,7 +154,13 @@ async fn run_simple_query(
             }
             Err(e) => {
                 let position = e.location.map(|(line, col)| char_position(sql, line, col));
-                writer.error_response_full(e.code, &e.message, e.detail.as_deref(), position);
+                writer.error_response_detailed(
+                    e.code,
+                    &e.message,
+                    e.detail.as_deref(),
+                    e.hint.as_deref(),
+                    position,
+                );
                 mark_transaction_failed(session);
                 return Ok(());
             }
@@ -200,9 +209,17 @@ async fn write_result(
 ) -> Result<WriteOutcome, ProtocolError> {
     match result {
         QueryResult::Command { tag, notices } => {
-            // PG order: any WARNING notices, then CommandComplete.
+            // PG order: any NOTICE/WARNING messages, then CommandComplete.
             for notice in &notices {
-                writer.warning_response(notice.code, &notice.message);
+                match notice.severity {
+                    NoticeSeverity::Warning => writer.warning_response(notice.code, &notice.message),
+                    NoticeSeverity::Notice => writer.notice_response(
+                        notice.code,
+                        &notice.message,
+                        notice.detail.as_deref(),
+                        None,
+                    ),
+                }
             }
             writer.command_complete(&tag);
         }

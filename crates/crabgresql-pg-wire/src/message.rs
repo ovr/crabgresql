@@ -262,6 +262,12 @@ impl ErrorFields {
         self
     }
 
+    /// Append a HINT (`H`) field.
+    pub fn with_hint(mut self, hint: &str) -> Self {
+        self.fields.push((b'H', hint.to_string()));
+        self
+    }
+
     /// Append a cursor POSITION (`P`) field — a 1-based character offset.
     pub fn with_position(mut self, position: usize) -> Self {
         self.fields.push((b'P', position.to_string()));

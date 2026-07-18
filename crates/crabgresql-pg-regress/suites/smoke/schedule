@@ -1,6 +1,7 @@
 test: basic
 test: errors
 test: cast
+test: create_type
 test: date
 test: time
 test: timetz
