@@ -43,8 +43,8 @@ const USECS_PER_SEC: i64 = 1_000_000;
 const SECS_PER_DAY: i64 = 86_400;
 
 /// Julian day of 2000-01-01 (the PG epoch) and 1970-01-01 (the Unix epoch).
-const POSTGRES_EPOCH_JDATE: i64 = 2_451_545;
-const UNIX_EPOCH_JDATE: i64 = 2_440_588;
+pub(crate) const POSTGRES_EPOCH_JDATE: i64 = 2_451_545;
+pub(crate) const UNIX_EPOCH_JDATE: i64 = 2_440_588;
 /// Days from the Unix epoch to the PG epoch; `epoch`'s value and the offset
 /// used to convert a timestamp to seconds-since-1970 for the `epoch` field.
 const EPOCH_MINUS_PG_DAYS: i64 = UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE; // -10957
@@ -115,18 +115,18 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// Gregorian (proleptic) `(year, month, day)` → Julian day number.
-fn date2j(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn date2j(y: i64, m: i64, d: i64) -> i64 {
     days_from_civil(y, m, d) + UNIX_EPOCH_JDATE
 }
 
 /// Inverse of [`date2j`]: Julian day number → `(year, month, day)`.
-fn j2date(jd: i64) -> (i64, i64, i64) {
+pub(crate) fn j2date(jd: i64) -> (i64, i64, i64) {
     civil_from_days(jd - UNIX_EPOCH_JDATE)
 }
 
 /// Day of week, 0 = Sunday .. 6 = Saturday. This is the plain modular relation
 /// between the Julian day number and the weekday.
-fn j2day(jd: i64) -> i64 {
+pub(crate) fn j2day(jd: i64) -> i64 {
     (jd + 1).rem_euclid(7)
 }
 
@@ -611,7 +611,7 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-fn days_in_month(y: i64, m: i64) -> i64 {
+pub(crate) fn days_in_month(y: i64, m: i64) -> i64 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -629,7 +629,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 // --- field extraction (date_part / extract) --------------------------------
 
 /// ISO 8601 `(week, isoyear)` for a Julian day.
-fn iso_week_year(jd: i64) -> (i64, i64) {
+pub(crate) fn iso_week_year(jd: i64) -> (i64, i64) {
     let isodow = {
         let d = j2day(jd);
         if d == 0 { 7 } else { d }
@@ -777,7 +777,7 @@ fn epoch_micros(micros: i64) -> i64 {
     micros - EPOCH_MINUS_PG_DAYS * USECS_PER_DAY
 }
 
-fn decade(year: i64) -> i64 {
+pub(crate) fn decade(year: i64) -> i64 {
     if year >= 0 {
         year / 10
     } else {
@@ -785,7 +785,7 @@ fn decade(year: i64) -> i64 {
     }
 }
 
-fn century(year: i64) -> i64 {
+pub(crate) fn century(year: i64) -> i64 {
     if year > 0 {
         (year + 99) / 100
     } else {
@@ -793,7 +793,7 @@ fn century(year: i64) -> i64 {
     }
 }
 
-fn millennium(year: i64) -> i64 {
+pub(crate) fn millennium(year: i64) -> i64 {
     if year > 0 {
         (year + 999) / 1000
     } else {

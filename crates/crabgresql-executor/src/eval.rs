@@ -10,7 +10,9 @@ use std::cmp::Ordering;
 
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_types::{Interval, Numeric, PgType, Value, cast, float, interval};
+use crabgresql_types::{
+    Interval, Numeric, PgType, TimeTz, Value, cast, date, float, interval, time, timetz,
+};
 
 use crate::{ExecContext, ExecError};
 
@@ -172,6 +174,11 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         PgType::Interval => interval::cmp(interval_of(l), interval_of(r)),
         // Arbitrary-precision total order; NaN sorts greatest (== itself).
         PgType::Numeric => numeric(l).cmp(numeric(r)),
+        // Day order (the ±infinity sentinels sort naturally); microsecond order;
+        // UTC-instant-then-zone order.
+        PgType::Date => date::cmp(date_of(l), date_of(r)),
+        PgType::Time => time::cmp(time_of(l), time_of(r)),
+        PgType::TimeTz => timetz::cmp(timetz_of(l), timetz_of(r)),
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -283,6 +290,27 @@ fn timestamptz_of(v: &Value) -> i64 {
     match v {
         Value::TimestampTz(t) => *t,
         other => unreachable!("expected timestamptz, got {other:?}"),
+    }
+}
+
+fn date_of(v: &Value) -> i32 {
+    match v {
+        Value::Date(d) => *d,
+        other => unreachable!("expected date, got {other:?}"),
+    }
+}
+
+fn time_of(v: &Value) -> i64 {
+    match v {
+        Value::Time(t) => *t,
+        other => unreachable!("expected time, got {other:?}"),
+    }
+}
+
+fn timetz_of(v: &Value) -> TimeTz {
+    match v {
+        Value::TimeTz(t) => *t,
+        other => unreachable!("expected timetz, got {other:?}"),
     }
 }
 

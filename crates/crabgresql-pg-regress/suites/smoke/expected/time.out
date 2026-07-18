@@ -1,0 +1,155 @@
+--
+-- TIME
+-- time without time zone: input parsing, HH:MM:SS output, comparisons, casts,
+-- interval arithmetic, and the field functions (date_part / extract /
+-- make_time). Output hand-checked against PostgreSQL's aligned format.
+--
+-- output; a trailing time zone is accepted and ignored; 24:00:00 is allowed
+SELECT time '13:30:25.575401' AS micros, time '00:00' AS midnight, time '24:00:00' AS end_of_day;
+     micros      | midnight | end_of_day 
+-----------------+----------+------------
+ 13:30:25.575401 | 00:00:00 | 24:00:00
+(1 row)
+
+SELECT time '23:59:59.999999' AS max_frac, time '02:03 PST' AS zone_ignored;
+    max_frac     | zone_ignored 
+-----------------+--------------
+ 23:59:59.999999 | 02:03:00
+(1 row)
+
+-- rounding: a 7th fractional digit / a leap second carries to the next day
+SELECT time '23:59:59.9999999' AS rounds_up, time '23:59:60' AS leap_carry;
+ rounds_up | leap_carry 
+-----------+------------
+ 24:00:00  | 24:00:00
+(1 row)
+
+SELECT time '13:30:25.575401';
+      time       
+-----------------
+ 13:30:25.575401
+(1 row)
+
+-- comparisons
+SELECT time '01:00' < time '02:00' AS lt, time '12:00' = time '12:00:00' AS eq;
+ lt | eq 
+----+----
+ t  | t
+(1 row)
+
+-- casts, including time <-> interval
+SELECT '13:30:00'::time AS from_text;
+ from_text 
+-----------
+ 13:30:00
+(1 row)
+
+-- a numeric zone offset glued to the time is accepted and ignored
+SELECT time '13:30:00-04' AS glued_zone;
+ glued_zone 
+------------
+ 13:30:00
+(1 row)
+
+SELECT (time '13:30:00')::text AS to_text;
+ to_text  
+----------
+ 13:30:00
+(1 row)
+
+SELECT (time '13:30:00')::interval AS to_interval;
+ to_interval 
+-------------
+ 13:30:00
+(1 row)
+
+SELECT (interval '13:30:00')::time AS from_interval;
+ from_interval 
+---------------
+ 13:30:00
+(1 row)
+
+-- a time column: insert, filter, order
+CREATE TABLE time_tbl (id int4, t time);
+INSERT INTO time_tbl VALUES (1, '00:00'), (2, '12:00'), (3, '23:59:59'), (4, '11:59:59.99 PM');
+SELECT id, t FROM time_tbl WHERE t > time '05:06:07' ORDER BY 2;
+ id |      t      
+----+-------------
+  2 | 12:00:00
+  3 | 23:59:59
+  4 | 23:59:59.99
+(3 rows)
+
+-- interval arithmetic wraps within the day; time - time -> interval
+SELECT time '10:00:00' + interval '1 hour 30 minutes' AS plus,
+       time '10:00:00' - interval '2 hours' AS minus;
+   plus   |  minus   
+----------+----------
+ 11:30:00 | 08:00:00
+(1 row)
+
+SELECT time '23:30:00' + interval '1 hour' AS wrap;
+   wrap   
+----------
+ 00:30:00
+(1 row)
+
+SELECT time '13:30:00' - time '08:00:00' AS diff;
+   diff   
+----------
+ 05:30:00
+(1 row)
+
+-- extract (numeric) with PG's per-field scale, and date_part (float8)
+SELECT extract(hour from time '13:30:25.575401') AS hour,
+       extract(minute from time '13:30:25.575401') AS minute,
+       extract(second from time '13:30:25.575401') AS second;
+ hour | minute |  second   
+------+--------+-----------
+   13 |     30 | 25.575401
+(1 row)
+
+SELECT extract(microsecond from time '13:30:25.575401') AS us,
+       extract(millisecond from time '13:30:25.575401') AS ms,
+       extract(epoch from time '13:30:25.575401') AS epoch;
+    us    |    ms     |    epoch     
+----------+-----------+--------------
+ 25575401 | 25575.401 | 48625.575401
+(1 row)
+
+SELECT date_part('hour', time '13:30:25.575401') AS hour,
+       date_part('epoch', time '13:30:25.575401') AS epoch;
+ hour |    epoch     
+------+--------------
+   13 | 48625.575401
+(1 row)
+
+-- make_time
+SELECT make_time(8, 20, 0.0) AS mk;
+    mk    
+----------
+ 08:20:00
+(1 row)
+
+-- errors: field out of range (22008), unsupported/unknown unit (22023);
+-- recovery still works
+SELECT time '25:00:00';
+ERROR:  date/time field value out of range: "25:00:00"
+LINE 1: SELECT time '25:00:00';
+                    ^
+SELECT time '24:00:00.01';
+ERROR:  date/time field value out of range: "24:00:00.01"
+LINE 1: SELECT time '24:00:00.01';
+                    ^
+SELECT extract(day from time '13:30:00');
+ERROR:  unit "day" not supported for type time without time zone
+SELECT extract(fortnight from time '13:30:00');
+ERROR:  unit "fortnight" not recognized for type time without time zone
+SELECT make_time(10, 55, 100.1);
+ERROR:  time field value out of range: 10:55:100.1
+SELECT 'still alive' AS status;
+   status    
+-------------
+ still alive
+(1 row)
+

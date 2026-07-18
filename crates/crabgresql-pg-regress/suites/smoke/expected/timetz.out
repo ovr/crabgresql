@@ -1,0 +1,111 @@
+--
+-- TIMETZ (time with time zone)
+-- input with numeric UTC offsets, HH:MM:SS+TZ output, UTC-instant ordering,
+-- casts, interval arithmetic, and the field functions. Numeric offsets are used
+-- throughout for determinism. Output hand-checked against PostgreSQL.
+--
+SELECT timetz '13:30:25.575401-04' AS neg, timetz '12:00:00+05:30' AS half, timetz '00:00+00' AS utc;
+        neg         |      half      |     utc     
+--------------------+----------------+-------------
+ 13:30:25.575401-04 | 12:00:00+05:30 | 00:00:00+00
+(1 row)
+
+SELECT timetz '24:00:00-07' AS end_of_day, timetz '23:59:60 -07' AS leap_carry;
+ end_of_day  | leap_carry  
+-------------+-------------
+ 24:00:00-07 | 24:00:00-07
+(1 row)
+
+SELECT timetz '13:30:25.575401-04';
+       timetz       
+--------------------
+ 13:30:25.575401-04
+(1 row)
+
+-- ordering is by the UTC instant (05:06:07-07 == 12:06:07 UTC)
+SELECT timetz '05:06:07-07' > timetz '05:06:07+00' AS gt_utc,
+       timetz '12:00:00+00' = timetz '12:00:00+00' AS eq;
+ gt_utc | eq 
+--------+----
+ t      | t
+(1 row)
+
+-- casts, including timetz <-> time (dropping / attaching the zone)
+SELECT '13:30:00-04'::timetz AS from_text;
+  from_text  
+-------------
+ 13:30:00-04
+(1 row)
+
+SELECT (timetz '13:30:00-04')::text AS to_text;
+   to_text   
+-------------
+ 13:30:00-04
+(1 row)
+
+SELECT (timetz '13:30:00-04')::time AS to_time;
+ to_time  
+----------
+ 13:30:00
+(1 row)
+
+SELECT (time '13:30:00')::timetz AS from_time;
+  from_time  
+-------------
+ 13:30:00+00
+(1 row)
+
+-- a timetz column: insert, order by the UTC instant
+CREATE TABLE timetz_tbl (id int4, t timetz);
+INSERT INTO timetz_tbl VALUES (1, '01:00-07'), (2, '08:00-04'), (3, '12:00+00');
+SELECT id, t FROM timetz_tbl ORDER BY 2;
+ id |      t      
+----+-------------
+  1 | 01:00:00-07
+  3 | 12:00:00+00
+  2 | 08:00:00-04
+(3 rows)
+
+-- interval arithmetic keeps the zone
+SELECT timetz '10:00:00-04' + interval '1 hour 30 minutes' AS plus,
+       timetz '10:00:00-04' - interval '2 hours' AS minus;
+    plus     |    minus    
+-------------+-------------
+ 11:30:00-04 | 08:00:00-04
+(1 row)
+
+-- extract (numeric): local time-of-day fields plus the zone fields
+SELECT extract(hour from timetz '13:30:25.575401-04') AS hour,
+       extract(timezone from timetz '13:30:25.575401-04:30') AS tz,
+       extract(timezone_hour from timetz '13:30:25.575401-04:30') AS tzh,
+       extract(timezone_minute from timetz '13:30:25.575401-04:30') AS tzm;
+ hour |   tz   | tzh | tzm 
+------+--------+-----+-----
+   13 | -16200 |  -4 | -30
+(1 row)
+
+SELECT extract(epoch from timetz '13:30:25.575401-04') AS epoch;
+    epoch     
+--------------
+ 63025.575401
+(1 row)
+
+SELECT date_part('hour', timetz '13:30:25.575401-04') AS hour;
+ hour 
+------
+   13
+(1 row)
+
+-- errors: field out of range (22008), unsupported unit (22023); recovery works
+SELECT timetz '24:00:00.01-07';
+ERROR:  date/time field value out of range: "24:00:00.01-07"
+LINE 1: SELECT timetz '24:00:00.01-07';
+                      ^
+SELECT extract(day from timetz '13:30:00-04');
+ERROR:  unit "day" not supported for type time with time zone
+SELECT 'still alive' AS status;
+   status    
+-------------
+ still alive
+(1 row)
+

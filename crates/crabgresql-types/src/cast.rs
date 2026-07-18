@@ -4,7 +4,10 @@
 //! range errors — as pinned by the regression corpus, implemented independently.
 
 use crate::numeric::ParseError;
-use crate::{Numeric, PgType, Value, float, interval, parse_bool, timestamp, timestamptz};
+use crate::{
+    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, parse_bool, time, timestamp,
+    timestamptz, timetz,
+};
 
 /// SQLSTATE + message for a failed cast.
 #[derive(Clone, Debug, PartialEq)]
@@ -205,6 +208,43 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Timestamp(m), PgType::TimestampTz) => Ok(Value::TimestampTz(*m)),
         (Value::TimestampTz(m), PgType::Timestamp) => Ok(Value::Timestamp(*m)),
 
+        // ---- text → date / time / timetz (input functions) ----
+        (Value::Text(s), PgType::Date) => date::parse(s)
+            .map(Value::Date)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Time) => time::parse(s)
+            .map(Value::Time)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::TimeTz) => timetz::parse(s)
+            .map(Value::TimeTz)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- date ↔ timestamp / timestamptz ----
+        // A date widens to midnight; the UTC identity (session zone is UTC)
+        // carries it to timestamptz too. The reverse takes the calendar date.
+        (Value::Date(d), PgType::Timestamp) => date::to_timestamp_micros(*d)
+            .map(Value::Timestamp)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Date(d), PgType::TimestampTz) => date::to_timestamp_micros(*d)
+            .map(Value::TimestampTz)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Timestamp(m), PgType::Date) => Ok(Value::Date(date::from_timestamp_micros(*m))),
+        (Value::TimestampTz(m), PgType::Date) => Ok(Value::Date(date::from_timestamp_micros(*m))),
+
+        // ---- time ↔ interval ----
+        // time → interval keeps the microseconds as the time-of-day span;
+        // interval → time takes the time-of-day part (mod one day).
+        (Value::Time(usec), PgType::Interval) => {
+            Ok(Value::Interval(Interval { months: 0, days: 0, usec: *usec }))
+        }
+        (Value::Interval(iv), PgType::Time) => {
+            Ok(Value::Time(iv.usec.rem_euclid(86_400_000_000)))
+        }
+
+        // ---- time ↔ timetz ----
+        // time → timetz attaches the session zone (UTC); timetz → time drops it.
+        (Value::Time(usec), PgType::TimeTz) => Ok(Value::TimeTz(TimeTz { usec: *usec, zone: 0 })),
+        (Value::TimeTz(v), PgType::Time) => Ok(Value::Time(v.usec)),
 
         // ---- integer → numeric (exact) ----
         (Value::Int2(n), PgType::Numeric) => Ok(Value::Numeric(Numeric::from_i128(*n as i128))),

@@ -6,15 +6,19 @@
 //! and cast machinery.
 
 pub mod cast;
+pub mod date;
 pub mod float;
 pub mod interval;
 pub mod numeric;
+pub mod time;
 pub mod timestamp;
 pub mod timestamptz;
+pub mod timetz;
 pub mod to_char;
 pub mod tz;
 
 pub use interval::Interval;
+pub use timetz::TimeTz;
 
 /// OIDs of built-in types. Must match PostgreSQL's `pg_type.dat` — drivers
 /// hardcode these.
@@ -27,9 +31,12 @@ pub mod oid {
     pub const TEXT: u32 = 25;
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
+    pub const DATE: u32 = 1082;
+    pub const TIME: u32 = 1083;
     pub const TIMESTAMP: u32 = 1114;
     pub const TIMESTAMPTZ: u32 = 1184;
     pub const INTERVAL: u32 = 1186;
+    pub const TIMETZ: u32 = 1266;
     pub const BIT: u32 = 1560;
     pub const NUMERIC: u32 = 1700;
 }
@@ -46,6 +53,12 @@ pub enum PgType {
     Text,
     Bytea,
     Bit,
+    /// `date`.
+    Date,
+    /// `time without time zone`.
+    Time,
+    /// `time with time zone`.
+    TimeTz,
     /// `timestamp without time zone`.
     Timestamp,
     /// `timestamp with time zone`.
@@ -70,6 +83,9 @@ impl PgType {
             PgType::Text => oid::TEXT,
             PgType::Bytea => oid::BYTEA,
             PgType::Bit => oid::BIT,
+            PgType::Date => oid::DATE,
+            PgType::Time => oid::TIME,
+            PgType::TimeTz => oid::TIMETZ,
             PgType::Timestamp => oid::TIMESTAMP,
             PgType::TimestampTz => oid::TIMESTAMPTZ,
             PgType::Interval => oid::INTERVAL,
@@ -86,6 +102,9 @@ impl PgType {
             PgType::Int8 => 8,
             PgType::Float4 => 4,
             PgType::Float8 => 8,
+            PgType::Date => 4,
+            PgType::Time => 8,
+            PgType::TimeTz => 12,
             PgType::Timestamp => 8,
             PgType::TimestampTz => 8,
             PgType::Interval => 16,
@@ -107,6 +126,9 @@ impl PgType {
             PgType::Text => "text",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
+            PgType::Date => "date",
+            PgType::Time => "time without time zone",
+            PgType::TimeTz => "time with time zone",
             PgType::Timestamp => "timestamp without time zone",
             PgType::TimestampTz => "timestamp with time zone",
             PgType::Interval => "interval",
@@ -128,6 +150,9 @@ impl PgType {
             PgType::Text => "text",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
+            PgType::Date => "date",
+            PgType::Time => "time",
+            PgType::TimeTz => "timetz",
             PgType::Timestamp => "timestamp",
             PgType::TimestampTz => "timestamptz",
             PgType::Interval => "interval",
@@ -182,6 +207,14 @@ pub enum Value {
     /// A bit-string literal (`x'...'`): `len` bits packed right-aligned in
     /// `bits`. Only produced by hex literals and consumed by bit→int casts.
     Bit { len: u16, bits: u64 },
+    /// `date`: signed days since 2000-01-01, with `i32::MIN`/`i32::MAX` as the
+    /// `-infinity`/`infinity` sentinels. See [`crate::date`].
+    Date(i32),
+    /// `time without time zone`: microseconds since midnight. See [`crate::time`].
+    Time(i64),
+    /// `time with time zone`: local time-of-day plus a UTC offset. See
+    /// [`crate::timetz`].
+    TimeTz(TimeTz),
     /// `timestamp without time zone`: microseconds since 2000-01-01, with
     /// `i64::MIN`/`i64::MAX` as the `-infinity`/`infinity` sentinels. See
     /// [`crate::timestamp`].
@@ -207,6 +240,9 @@ impl Value {
             Value::Text(_) => Some(PgType::Text),
             Value::Bytea(_) => Some(PgType::Bytea),
             Value::Bit { .. } => Some(PgType::Bit),
+            Value::Date(_) => Some(PgType::Date),
+            Value::Time(_) => Some(PgType::Time),
+            Value::TimeTz(_) => Some(PgType::TimeTz),
             Value::Timestamp(_) => Some(PgType::Timestamp),
             Value::TimestampTz(_) => Some(PgType::TimestampTz),
             Value::Interval(_) => Some(PgType::Interval),
@@ -242,6 +278,9 @@ impl Value {
             Value::Bit { len, bits } => {
                 Some(format!("{:0width$b}", bits, width = *len as usize))
             }
+            Value::Date(d) => Some(date::format(*d)),
+            Value::Time(usec) => Some(time::format(*usec)),
+            Value::TimeTz(v) => Some(timetz::format(*v)),
             Value::Timestamp(micros) => Some(timestamp::format(*micros)),
             Value::TimestampTz(micros) => Some(timestamptz::format(*micros)),
             Value::Interval(iv) => Some(interval::format(*iv)),

@@ -115,6 +115,55 @@ pub enum ScalarFn {
     TimezoneToTz,
     /// `timezone(text, timestamptz) -> timestamp` (`tstz AT TIME ZONE zone`).
     TimezoneToTs,
+
+    // --- date operators/functions (built by the binder unless noted) ---
+    /// `date + int4 -> date`.
+    DatePlDays,
+    /// `date - int4 -> date`.
+    DateMiDays,
+    /// `date - date -> int4`.
+    DateMi,
+    /// `date + interval -> timestamp`.
+    DatePlInterval,
+    /// `date - interval -> timestamp`.
+    DateMiInterval,
+    /// `date + time -> timestamp`.
+    DatePlTime,
+    /// `date + timetz -> timestamptz`.
+    DatePlTimeTz,
+    /// `date_part(text, date) -> float8`.
+    DatePartDate,
+    /// `EXTRACT(field FROM date) -> numeric`.
+    ExtractDate,
+    /// `isfinite(date) -> bool`.
+    IsfiniteDate,
+    /// `make_date(int, int, int) -> date`.
+    MakeDate,
+
+    // --- time operators/functions ---
+    /// `time + interval -> time`.
+    TimePlInterval,
+    /// `time - interval -> time`.
+    TimeMiInterval,
+    /// `time - time -> interval`.
+    TimeMi,
+    /// `date_part(text, time) -> float8`.
+    DatePartTime,
+    /// `EXTRACT(field FROM time) -> numeric`.
+    ExtractTime,
+    /// `make_time(int, int, float8) -> time`.
+    MakeTime,
+
+    // --- timetz operators/functions ---
+    /// `timetz + interval -> timetz`.
+    TimeTzPlInterval,
+    /// `timetz - interval -> timetz`.
+    TimeTzMiInterval,
+    /// `date_part(text, timetz) -> float8`.
+    DatePartTimeTz,
+    /// `EXTRACT(field FROM timetz) -> numeric`.
+    ExtractTimeTz,
+
     // ---- numeric-typed math (arg and result are `numeric`) ----
     /// `round(numeric [, int4]) -> numeric` (round half away from zero).
     NumRound,
@@ -299,6 +348,9 @@ const TEXT: PgType = PgType::Text;
 const I4: PgType = PgType::Int4;
 const IV: PgType = PgType::Interval;
 const NUM: PgType = PgType::Numeric;
+const DATE: PgType = PgType::Date;
+const TIME: PgType = PgType::Time;
+const TIMETZ: PgType = PgType::TimeTz;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -410,6 +462,9 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature { func: ScalarFn::DatePart, args: &[TEXT, TS], ret: F8 },
             Signature { func: ScalarFn::DatePartInterval, args: &[TEXT, IV], ret: F8 },
             Signature { func: ScalarFn::DatePartTz, args: &[TEXT, TSTZ], ret: F8 },
+            Signature { func: ScalarFn::DatePartDate, args: &[TEXT, DATE], ret: F8 },
+            Signature { func: ScalarFn::DatePartTime, args: &[TEXT, TIME], ret: F8 },
+            Signature { func: ScalarFn::DatePartTimeTz, args: &[TEXT, TIMETZ], ret: F8 },
         ],
         "date_trunc" => &[
             Signature { func: ScalarFn::DateTrunc, args: &[TEXT, TS], ret: TS },
@@ -420,7 +475,10 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature { func: ScalarFn::Isfinite, args: &[TS], ret: PgType::Bool },
             Signature { func: ScalarFn::IsfiniteInterval, args: &[IV], ret: PgType::Bool },
             Signature { func: ScalarFn::IsfiniteTz, args: &[TSTZ], ret: PgType::Bool },
+            Signature { func: ScalarFn::IsfiniteDate, args: &[DATE], ret: PgType::Bool },
         ],
+        "make_date" => &[Signature { func: ScalarFn::MakeDate, args: &[I4, I4, I4], ret: DATE }],
+        "make_time" => &[Signature { func: ScalarFn::MakeTime, args: &[I4, I4, F8], ret: TIME }],
         "make_timestamp" => &[Signature {
             func: ScalarFn::MakeTimestamp,
             args: &[I4, I4, I4, I4, I4, F8],

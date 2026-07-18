@@ -14,7 +14,8 @@ use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, TableSchema};
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
-    Numeric, PgType, Value, cast, float, interval, parse_bool, timestamp, timestamptz,
+    Numeric, PgType, Value, cast, date, float, interval, parse_bool, time, timestamp, timestamptz,
+    timetz,
 };
 
 use crate::BindError;
@@ -484,6 +485,14 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         },
         DataType::Numeric(_) | DataType::Decimal(_) => PgType::Numeric,
         DataType::Bytea => PgType::Bytea,
+        // `date`.
+        DataType::Date => PgType::Date,
+        // `time` / `time with time zone` (the precision modifier is accepted and
+        // ignored; full microsecond resolution is kept).
+        DataType::Time(_, tz) => match tz {
+            ast::TimezoneInfo::None | ast::TimezoneInfo::WithoutTimeZone => PgType::Time,
+            ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz => PgType::TimeTz,
+        },
         // `timestamp` / `timestamp with time zone` (the precision modifier is
         // ignored; full microsecond resolution is kept).
         DataType::Timestamp(_, tz) => match tz {
@@ -646,6 +655,9 @@ fn bind_extract(
         Binding::Typed(e) if e.ty() == PgType::Timestamp => (ScalarFn::Extract, e),
         Binding::Typed(e) if e.ty() == PgType::Interval => (ScalarFn::ExtractInterval, e),
         Binding::Typed(e) if e.ty() == PgType::TimestampTz => (ScalarFn::ExtractTz, e),
+        Binding::Typed(e) if e.ty() == PgType::Date => (ScalarFn::ExtractDate, e),
+        Binding::Typed(e) if e.ty() == PgType::Time => (ScalarFn::ExtractTime, e),
+        Binding::Typed(e) if e.ty() == PgType::TimeTz => (ScalarFn::ExtractTimeTz, e),
         Binding::Typed(e) => {
             return Err(BindError::new(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -1121,6 +1133,9 @@ fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindEr
                 | PgType::Numeric
                 | PgType::Text
                 | PgType::Bytea
+                | PgType::Date
+                | PgType::Time
+                | PgType::TimeTz
                 | PgType::Timestamp
                 | PgType::Interval
                 | PgType::TimestampTz
@@ -1149,12 +1164,26 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
     }
     let lt = binding_typed_ty(lb);
     let rt = binding_typed_ty(rb);
-    let is_temporal = |t: Option<PgType>| matches!(t, Some(PgType::Interval | PgType::Timestamp));
+    let is_temporal = |t: Option<PgType>| {
+        matches!(
+            t,
+            Some(
+                PgType::Interval
+                    | PgType::Timestamp
+                    | PgType::Date
+                    | PgType::Time
+                    | PgType::TimeTz
+            )
+        )
+    };
     if !is_temporal(lt) && !is_temporal(rt) {
         return Ok(None);
     }
 
-    use PgType::{Interval as I, Timestamp as T};
+    use PgType::{Date as D, Interval as I, Time as TI, TimeTz as TZ, Timestamp as T};
+    // Only int2/int4 pair with `date` (PG has `date + int4`; int2 widens to it).
+    // int8 has no `date + bigint` operator, so it must fall through to an error.
+    let is_int = |t: Option<PgType>| matches!(t, Some(PgType::Int2 | PgType::Int4));
     let typed = |b: &Binding| match b {
         Binding::Typed(e) => e.clone(),
         Binding::Unknown { .. } => unreachable!("typed side is Typed"),
@@ -1178,6 +1207,29 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             (None, Some(I)) => call(ScalarFn::IntervalPl, I, resolve_operand(lb, I)?, typed(rb)),
             (Some(T), None) => call(ScalarFn::TimestampPlInterval, T, typed(lb), resolve_operand(rb, I)?),
             (None, Some(T)) => call(ScalarFn::TimestampPlInterval, T, typed(rb), resolve_operand(lb, I)?),
+            // date + int -> date; date + interval -> timestamp; date + time -> timestamp.
+            (Some(D), _) if is_int(rt) => {
+                call(ScalarFn::DatePlDays, D, typed(lb), resolve_operand(rb, PgType::Int4)?)
+            }
+            (_, Some(D)) if is_int(lt) => {
+                call(ScalarFn::DatePlDays, D, typed(rb), resolve_operand(lb, PgType::Int4)?)
+            }
+            (Some(D), Some(I)) => call(ScalarFn::DatePlInterval, T, typed(lb), typed(rb)),
+            (Some(I), Some(D)) => call(ScalarFn::DatePlInterval, T, typed(rb), typed(lb)),
+            (Some(D), Some(TI)) => call(ScalarFn::DatePlTime, T, typed(lb), typed(rb)),
+            (Some(TI), Some(D)) => call(ScalarFn::DatePlTime, T, typed(rb), typed(lb)),
+            // date + timetz -> timestamptz.
+            (Some(D), Some(TZ)) => {
+                call(ScalarFn::DatePlTimeTz, PgType::TimestampTz, typed(lb), typed(rb))
+            }
+            (Some(TZ), Some(D)) => {
+                call(ScalarFn::DatePlTimeTz, PgType::TimestampTz, typed(rb), typed(lb))
+            }
+            // time + interval -> time; timetz + interval -> timetz.
+            (Some(TI), Some(I)) => call(ScalarFn::TimePlInterval, TI, typed(lb), typed(rb)),
+            (Some(I), Some(TI)) => call(ScalarFn::TimePlInterval, TI, typed(rb), typed(lb)),
+            (Some(TZ), Some(I)) => call(ScalarFn::TimeTzPlInterval, TZ, typed(lb), typed(rb)),
+            (Some(I), Some(TZ)) => call(ScalarFn::TimeTzPlInterval, TZ, typed(rb), typed(lb)),
             _ => Ok(None),
         },
         BinOp::Sub => match (lt, rt) {
@@ -1192,6 +1244,27 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             // while `ts - '<date>'` and `<date> - ts` produce an interval.
             (Some(T), None) => call(ScalarFn::TimestampMi, I, typed(lb), resolve_operand(rb, T)?),
             (None, Some(T)) => call(ScalarFn::TimestampMi, I, resolve_operand(lb, T)?, typed(rb)),
+            // date - date -> int4; date - int -> date; date - interval -> timestamp.
+            (Some(D), Some(D)) => call(ScalarFn::DateMi, PgType::Int4, typed(lb), typed(rb)),
+            (Some(D), _) if is_int(rt) => {
+                call(ScalarFn::DateMiDays, D, typed(lb), resolve_operand(rb, PgType::Int4)?)
+            }
+            (Some(D), Some(I)) => call(ScalarFn::DateMiInterval, T, typed(lb), typed(rb)),
+            // date - timestamp / timestamp - date -> interval: widen the date to
+            // a timestamp (midnight) and take the timestamp difference, as PG's
+            // implicit date->timestamp cast does.
+            (Some(D), Some(T)) => {
+                call(ScalarFn::TimestampMi, I, resolve_operand(lb, T)?, typed(rb))
+            }
+            (Some(T), Some(D)) => {
+                call(ScalarFn::TimestampMi, I, typed(lb), resolve_operand(rb, T)?)
+            }
+            (Some(D), None) => call(ScalarFn::DateMi, PgType::Int4, typed(lb), resolve_operand(rb, D)?),
+            (None, Some(D)) => call(ScalarFn::DateMi, PgType::Int4, resolve_operand(lb, D)?, typed(rb)),
+            // time - time -> interval; time - interval -> time; timetz - interval -> timetz.
+            (Some(TI), Some(TI)) => call(ScalarFn::TimeMi, I, typed(lb), typed(rb)),
+            (Some(TI), Some(I)) => call(ScalarFn::TimeMiInterval, TI, typed(lb), typed(rb)),
+            (Some(TZ), Some(I)) => call(ScalarFn::TimeTzMiInterval, TZ, typed(lb), typed(rb)),
             _ => Ok(None),
         },
         BinOp::Mul => match (lt, rt) {
@@ -1331,6 +1404,11 @@ fn implicit_castable(from: PgType, to: PgType) -> bool {
                 // `timestamp -> timestamptz` is an implicit cast in PG; the
                 // reverse is assignment-only (reached via an explicit cast).
                 | (Timestamp, TimestampTz)
+                // `date` implicitly widens to `timestamp`/`timestamptz` (PG),
+                // so date/timestamp comparisons and `date_trunc(text, date)`
+                // resolve without dedicated date overloads.
+                | (Date, Timestamp)
+                | (Date, TimestampTz)
         )
 }
 
@@ -1532,6 +1610,15 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             ),
         }),
         PgType::Bool => parse_bool(s).map(Value::Bool).ok_or_else(invalid),
+        PgType::Date => date::parse(s)
+            .map(Value::Date)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Time => time::parse(s)
+            .map(Value::Time)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::TimeTz => timetz::parse(s)
+            .map(Value::TimeTz)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Timestamp => timestamp::parse(s)
             .map(Value::Timestamp)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),

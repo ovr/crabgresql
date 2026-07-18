@@ -1,0 +1,234 @@
+--
+-- DATE
+-- date: input parsing, ISO output, comparisons, casts, integer/interval
+-- arithmetic, and the field functions (date_part / extract / isfinite /
+-- make_date). Output hand-checked against PostgreSQL's aligned format.
+--
+-- typed-literal output; the ISO and verbose input forms
+SELECT date '1999-01-08' AS iso, date 'January 8, 1999' AS verbose;
+    iso     |  verbose   
+------------+------------
+ 1999-01-08 | 1999-01-08
+(1 row)
+
+SELECT date '2000-02-29' AS leap, date '0044-03-15 BC' AS bc;
+    leap    |      bc       
+------------+---------------
+ 2000-02-29 | 0044-03-15 BC
+(1 row)
+
+-- special values
+SELECT date 'infinity' AS pos, date '-infinity' AS neg, date 'epoch' AS unix;
+   pos    |    neg    |    unix    
+----------+-----------+------------
+ infinity | -infinity | 1970-01-01
+(1 row)
+
+-- the default column name of a typed literal is the type name
+SELECT date '2020-08-11';
+    date    
+------------
+ 2020-08-11
+(1 row)
+
+-- comparisons drive WHERE and ORDER BY; the infinity sentinels sort naturally
+SELECT date '2000-01-01' = date '2000-01-01' AS eq,
+       date '1999-01-08' < date '2000-01-01' AS lt,
+       date '-infinity' < date '2000-01-01' AS neg_first,
+       date 'infinity' > date '2000-01-01' AS pos_last;
+ eq | lt | neg_first | pos_last 
+----+----+-----------+----------
+ t  | t  | t         | t
+(1 row)
+
+-- casts both directions; date widens to timestamp, a timestamp narrows to its date
+SELECT '2020-08-11'::date AS from_text;
+ from_text  
+------------
+ 2020-08-11
+(1 row)
+
+SELECT (date '2020-08-11')::text AS to_text;
+  to_text   
+------------
+ 2020-08-11
+(1 row)
+
+SELECT (date '2020-08-11')::timestamp AS to_ts;
+        to_ts        
+---------------------
+ 2020-08-11 00:00:00
+(1 row)
+
+SELECT (timestamp '2020-08-11 13:30:00')::date AS from_ts;
+  from_ts   
+------------
+ 2020-08-11
+(1 row)
+
+-- a date column: insert, filter, order
+CREATE TABLE date_tbl (id int4, d date);
+INSERT INTO date_tbl VALUES (1, '1957-04-09'), (2, '1996-02-29'), (3, '2000-01-01'), (4, '2040-04-10');
+SELECT id, d FROM date_tbl WHERE d < date '2000-01-01' ORDER BY 2;
+ id |     d      
+----+------------
+  1 | 1957-04-09
+  2 | 1996-02-29
+(2 rows)
+
+SELECT id FROM date_tbl WHERE d >= date '1996-01-01' AND d <= date '2001-01-01' ORDER BY 1;
+ id 
+----
+  2
+  3
+(2 rows)
+
+-- simple math: date - date -> int, date +/- int -> date, date +/- interval -> timestamp
+SELECT date '2000-01-02' - date '2000-01-01' AS one_day;
+ one_day 
+---------
+       1
+(1 row)
+
+SELECT date '2000-01-01' + 31 AS plus_31, date '2000-03-01' - 1 AS minus_1;
+  plus_31   |  minus_1   
+------------+------------
+ 2000-02-01 | 2000-02-29
+(1 row)
+
+SELECT date '2001-01-01' + interval '1 day 2 hours' AS plus_interval;
+    plus_interval    
+---------------------
+ 2001-01-02 02:00:00
+(1 row)
+
+SELECT date '2001-01-01' - interval '1 day' AS minus_interval;
+   minus_interval    
+---------------------
+ 2000-12-31 00:00:00
+(1 row)
+
+SELECT date '2020-08-11' + time '13:30:00' AS plus_time;
+      plus_time      
+---------------------
+ 2020-08-11 13:30:00
+(1 row)
+
+-- date - timestamp -> interval (date widens to midnight); date + timetz -> timestamptz
+SELECT date '2020-01-02' - timestamp '2020-01-01 12:00' AS d_minus_ts;
+ d_minus_ts 
+------------
+ 12:00:00
+(1 row)
+
+SELECT date '2020-08-11' + timetz '13:30:00-04' AS d_plus_timetz;
+     d_plus_timetz      
+------------------------
+ 2020-08-11 17:30:00+00
+(1 row)
+
+-- date_part (float8) across the supported fields
+SELECT date_part('year', date '2020-08-11') AS year,
+       date_part('month', date '2020-08-11') AS month,
+       date_part('day', date '2020-08-11') AS day;
+ year | month | day 
+------+-------+-----
+ 2020 |     8 |  11
+(1 row)
+
+SELECT date_part('quarter', date '2020-08-11') AS quarter,
+       date_part('week', date '2020-08-11') AS week,
+       date_part('isoyear', date '2020-08-11') AS isoyear;
+ quarter | week | isoyear 
+---------+------+---------
+       3 |   33 |    2020
+(1 row)
+
+SELECT date_part('dow', date '2020-08-11') AS dow,
+       date_part('isodow', date '2020-08-11') AS isodow,
+       date_part('doy', date '2020-08-11') AS doy;
+ dow | isodow | doy 
+-----+--------+-----
+   2 |      2 | 224
+(1 row)
+
+SELECT date_part('decade', date '2020-08-11') AS decade,
+       date_part('century', date '2020-08-11') AS century,
+       date_part('millennium', date '2020-08-11') AS millennium;
+ decade | century | millennium 
+--------+---------+------------
+    202 |      21 |          3
+(1 row)
+
+-- extract (numeric): epoch and julian are integer-valued for a date
+SELECT extract(epoch from date '2020-08-11') AS epoch,
+       extract(julian from date '2020-08-11') AS julian;
+   epoch    | julian  
+------------+---------
+ 1597104000 | 2459073
+(1 row)
+
+SELECT extract(year from date '2020-08-11 BC') AS bc_year;
+ bc_year 
+---------
+   -2020
+(1 row)
+
+-- non-finite date: monotonic fields -> +/-Infinity, oscillating -> NULL
+SELECT extract(epoch from date 'infinity') AS pos_epoch,
+       extract(year from date 'infinity') AS pos_year;
+ pos_epoch | pos_year 
+-----------+----------
+  Infinity | Infinity
+(1 row)
+
+SELECT extract(day from date 'infinity') AS osc_day;
+ osc_day 
+---------
+        
+(1 row)
+
+-- isfinite and make_date
+SELECT isfinite(date '2020-08-11') AS finite, isfinite(date 'infinity') AS inf;
+ finite | inf 
+--------+-----
+ t      | f
+(1 row)
+
+SELECT make_date(2013, 7, 15) AS mk, make_date(-44, 3, 15) AS mk_bc;
+     mk     |     mk_bc     
+------------+---------------
+ 2013-07-15 | 0044-03-15 BC
+(1 row)
+
+-- errors: bad input (22007), field out of range (22008), bad unit (22023);
+-- recovery still works
+SELECT date 'garbage';
+ERROR:  invalid input syntax for type date: "garbage"
+LINE 1: SELECT date 'garbage';
+                    ^
+SELECT date '2000-02-30';
+ERROR:  date/time field value out of range: "2000-02-30"
+LINE 1: SELECT date '2000-02-30';
+                    ^
+-- a date past the timestamp range widens with a clean error, not a crash
+SELECT (date '1000000-01-01')::timestamp;
+ERROR:  date out of range for timestamp
+-- date - (int MIN) does not overflow the negation; reports out of range
+SELECT date '2000-01-01' - (-2147483648);
+ERROR:  date out of range
+-- there is no date + bigint operator
+SELECT date '2000-01-01' + 5::int8;
+ERROR:  operator does not exist: date + bigint
+SELECT extract(hour from date '2020-08-11');
+ERROR:  unit "hour" not supported for type date
+SELECT extract(fortnight from date '2020-08-11');
+ERROR:  unit "fortnight" not recognized for type date
+SELECT make_date(2013, 2, 30);
+ERROR:  date field value out of range: 2013-02-30
+SELECT 'still alive' AS status;
+   status    
+-------------
+ still alive
+(1 row)
+
