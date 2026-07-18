@@ -33,3 +33,5 @@ pub const PROTOCOL_VIOLATION: &str = "08P01";
 pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
 pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
 pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
+/// Class 58 — system error: a WAL/data-file I/O failure (e.g. commit fsync).
+pub const IO_ERROR: &str = "58030";

@@ -280,7 +280,7 @@ mod tests {
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         let tid = table.insert(tuple, &txn);
-        tm.commit(xid);
+        tm.commit(xid).unwrap();
         tid
     }
 
@@ -333,7 +333,7 @@ mod tests {
         // ...but the inserting transaction's own later command can.
         let self_read = tm.context(xid, CommandId(1));
         assert_eq!(table.scan(&self_read).count(), 1);
-        tm.commit(xid);
+        tm.commit(xid).unwrap();
         assert_eq!(table.scan(&read(&tm)).count(), 1);
     }
 
@@ -361,7 +361,7 @@ mod tests {
             table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())], &txn),
             UpdateResult::Updated
         );
-        tm.commit(xid);
+        tm.commit(xid).unwrap();
         let rows: Vec<_> = table.scan(&read(&tm)).map(|(_, t)| t).collect();
         assert_eq!(rows, vec![vec![Value::Int4(1), Value::Text("uno".into())]]);
     }
@@ -392,7 +392,7 @@ mod tests {
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         assert_eq!(table.delete(b, &txn), DeleteResult::Deleted);
-        tm.commit(xid);
+        tm.commit(xid).unwrap();
         assert_eq!(ids(&tm, &*table), vec![Value::Int4(1), Value::Int4(3)]);
     }
 
@@ -436,7 +436,7 @@ mod tests {
         let txn = tm.context(xid, CommandId::FIRST);
         assert_eq!(table.delete(tid, &txn), DeleteResult::Deleted);
         // Already deleted by this (committed-once-we-commit) txn: gone.
-        tm.commit(xid);
+        tm.commit(xid).unwrap();
         let x2 = tm.allocate_xid();
         let t2 = tm.context(x2, CommandId::FIRST);
         assert_eq!(table.delete(tid, &t2), DeleteResult::NotFound);
@@ -477,7 +477,7 @@ mod tests {
         // Delete b in its own committed txn first.
         let dx = tm.allocate_xid();
         table.delete(b, &tm.context(dx, CommandId::FIRST));
-        tm.commit(dx);
+        tm.commit(dx).unwrap();
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         let applied = table.update_many(
@@ -487,7 +487,7 @@ mod tests {
             ],
             &txn,
         );
-        tm.commit(xid);
+        tm.commit(xid).unwrap();
         assert_eq!(applied, 1);
         assert_eq!(ids(&tm, &*table), vec![Value::Int4(10)]);
     }
@@ -502,11 +502,11 @@ mod tests {
         let c = insert_committed(&tm, &*table, vec![Value::Int4(3), Value::Null]);
         let dx = tm.allocate_xid();
         table.delete(b, &tm.context(dx, CommandId::FIRST));
-        tm.commit(dx);
+        tm.commit(dx).unwrap();
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         assert_eq!(table.delete_many(vec![a, b, c], &txn), 2);
-        tm.commit(xid);
+        tm.commit(xid).unwrap();
         assert_eq!(table.scan(&read(&tm)).count(), 0);
     }
 
@@ -519,7 +519,7 @@ mod tests {
         let b = insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Null]);
         let tx = tm.allocate_xid();
         table.truncate(&tm.context(tx, CommandId::FIRST));
-        tm.commit(tx);
+        tm.commit(tx).unwrap();
         assert_eq!(table.scan(&read(&tm)).count(), 0);
         let c = insert_committed(&tm, &*table, vec![Value::Int4(3), Value::Null]);
         assert!(c > b);
@@ -538,7 +538,7 @@ mod tests {
                         let xid = tm.allocate_xid();
                         let txn = tm.context(xid, CommandId::FIRST);
                         table.insert(vec![Value::Int4(i), Value::Null], &txn);
-                        tm.commit(xid);
+                        tm.commit(xid).unwrap();
                     }
                 });
             }
@@ -565,7 +565,7 @@ mod tests {
         let txn = tm.context(xid, CommandId::FIRST);
         table.update(a, vec![Value::Int4(99), Value::Null], &txn);
         table.delete(a, &txn);
-        tm.commit(xid);
+        tm.commit(xid).unwrap();
         let rows: Vec<_> = scan.collect();
         assert_eq!(rows, vec![(a, vec![Value::Int4(1), Value::Null])]);
     }

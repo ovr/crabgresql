@@ -797,7 +797,7 @@ mod tests {
     fn wtxn() -> TxnContext {
         TM.with(|tm| {
             let xid = tm.allocate_xid();
-            tm.commit(xid);
+            tm.commit(xid).unwrap();
             tm.context(xid, CommandId::FIRST)
         })
     }

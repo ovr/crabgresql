@@ -194,6 +194,18 @@ impl XidManager {
         self.active.lock().unwrap().remove(&xid);
     }
 
+    /// Build an allocator whose next XID is `next`, used after crash recovery so
+    /// the first freshly issued XID sits above every transaction recovered from
+    /// the WAL (otherwise a reissued XID would alias a recovered one). No XIDs
+    /// are marked running — recovery has already retired every transaction it
+    /// replayed.
+    pub fn with_next(next: Xid) -> Self {
+        XidManager {
+            next: AtomicU64::new(next.0.max(Xid::FIRST_NORMAL.0)),
+            active: Mutex::new(BTreeSet::new()),
+        }
+    }
+
     /// Capture the set of transactions in flight right now. Everything `>= xmax`
     /// had not started; everything `< xmin` had already finished.
     pub fn take_snapshot(&self) -> Snapshot {
@@ -311,6 +323,23 @@ pub fn satisfies_mvcc(
     true
 }
 
+/// Where the transaction manager records the durable fate of a transaction.
+///
+/// This is the seam that lets durability live in a separate crate without a
+/// dependency cycle: `crabgresql-txn` defines the trait, `crabgresql-wal`
+/// implements it over its WAL (append a commit/abort record, fsync at commit).
+/// When no sink is attached (the in-memory engine, existing tests) commit/abort
+/// are purely in-memory, exactly as before.
+///
+/// `log_commit` is the durability boundary: it must not return `Ok` until the
+/// commit record is on stable storage (append + fsync). `log_abort` needs no
+/// fsync — a transaction whose commit never reached disk is simply not committed
+/// at recovery, and redo-only recovery needs no undo.
+pub trait CommitSink: Send + Sync {
+    fn log_commit(&self, xid: Xid) -> std::io::Result<()>;
+    fn log_abort(&self, xid: Xid);
+}
+
 /// The core's transaction service, shared by the whole server: it hands out
 /// XIDs, records commit/abort in the [`Clog`], and mints [`TxnContext`]s with a
 /// fresh snapshot. One instance is shared across all connections (XIDs and the
@@ -319,11 +348,25 @@ pub fn satisfies_mvcc(
 pub struct TransactionManager {
     xids: XidManager,
     clog: Arc<Clog>,
+    /// Durable commit log, when running on a durable engine; `None` keeps the
+    /// pre-durability in-memory behavior for the memory engine and unit tests.
+    sink: Option<Arc<dyn CommitSink>>,
 }
 
 impl TransactionManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a durable manager after crash recovery: attach the WAL-backed
+    /// [`CommitSink`], reuse the CLOG recovery rebuilt, and seed the XID
+    /// allocator above every recovered transaction.
+    pub fn new_recovered(sink: Arc<dyn CommitSink>, clog: Arc<Clog>, next_xid: Xid) -> Self {
+        TransactionManager {
+            xids: XidManager::with_next(next_xid),
+            clog,
+            sink: Some(sink),
+        }
     }
 
     /// The shared commit log (engines consult it through [`TxnContext::clog`]).
@@ -342,18 +385,31 @@ impl TransactionManager {
         self.xids.take_snapshot()
     }
 
-    /// Record `xid` committed and retire it from the in-flight set.
-    pub fn commit(&self, xid: Xid) {
+    /// Record `xid` committed and retire it from the in-flight set. On a durable
+    /// manager the commit record is appended and fsynced *before* the in-memory
+    /// CLOG is updated, so a crash between the two is repaired by replaying the
+    /// commit record; the fsync is the point after which the transaction is
+    /// durable. Returns the I/O error if the WAL flush fails.
+    pub fn commit(&self, xid: Xid) -> std::io::Result<()> {
         if xid.is_valid() {
+            if let Some(sink) = &self.sink {
+                sink.log_commit(xid)?;
+            }
             self.clog.set_committed(xid);
             self.xids.complete(xid);
         }
+        Ok(())
     }
 
     /// Record `xid` aborted and retire it — its versions become dead with no
-    /// undo (the MVCC advantage: an uncommitted version is simply invisible).
+    /// undo (the MVCC advantage: an uncommitted version is simply invisible). No
+    /// fsync is needed: an abort that never reaches disk is indistinguishable
+    /// from a crash before commit, and both leave the versions invisible.
     pub fn abort(&self, xid: Xid) {
         if xid.is_valid() {
+            if let Some(sink) = &self.sink {
+                sink.log_abort(xid);
+            }
             self.clog.set_aborted(xid);
             self.xids.complete(xid);
         }
@@ -511,7 +567,7 @@ mod tests {
         let before = tm.context(Xid::INVALID, CommandId::FIRST);
         assert!(!satisfies_mvcc(&hdr, &before.snapshot, &before.clog, before.xid, before.cid));
         // After commit, a newly taken snapshot can.
-        tm.commit(xid);
+        tm.commit(xid).unwrap();
         let after = tm.context(Xid::INVALID, CommandId::FIRST);
         assert!(satisfies_mvcc(&hdr, &after.snapshot, &after.clog, after.xid, after.cid));
     }

@@ -14,16 +14,19 @@ crabgresql-executor = { path = "crates/crabgresql-executor" }
 crabgresql-planner = { path = "crates/crabgresql-planner" }
 crabgresql-memory-storage = { path = "crates/crabgresql-memory-storage" }
 crabgresql-parser = { path = "crates/crabgresql-parser" }
+crabgresql-pg-engine = { path = "crates/crabgresql-pg-engine" }
 crabgresql-pg-wire = { path = "crates/crabgresql-pg-wire" }
 crabgresql-server = { path = "crates/crabgresql-server" }
 crabgresql-storage-api = { path = "crates/crabgresql-storage-api" }
 crabgresql-txn = { path = "crates/crabgresql-txn" }
 crabgresql-types = { path = "crates/crabgresql-types" }
+crabgresql-wal = { path = "crates/crabgresql-wal" }
 pg-ryu = { path = "vendor/ryu" }
 
 # external
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+crc32c = "0.6"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 similar = "2"
 thiserror = "2"
@@ -32,4 +35,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # dev
+tempfile = "3"
 tokio-postgres = "0.7"

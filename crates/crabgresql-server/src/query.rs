@@ -193,11 +193,12 @@ pub fn execute_statement(
     let exec = match execute(crabgresql_planner::plan(logical), session.exec_context(), &txn) {
         Ok(exec) => exec,
         Err(e) => {
-            finalize_statement(txnmgr, session, &txn, is_write, false);
+            // Abort path: infallible, so the result is safe to drop.
+            let _ = finalize_statement(txnmgr, session, &txn, is_write, false);
             return Err(e.into());
         }
     };
-    finalize_statement(txnmgr, session, &txn, is_write, true);
+    finalize_statement(txnmgr, session, &txn, is_write, true)?;
     let result = match exec {
         Execution::Rows { columns, node } => QueryResult::Rows { columns, node },
         Execution::Inserted(n) => QueryResult::command(format!("INSERT 0 {n}")),
@@ -248,12 +249,14 @@ fn finalize_statement(
     txn: &TxnContext,
     is_write: bool,
     ok: bool,
-) {
+) -> Result<(), PgError> {
     match &mut session.xact {
         None => {
             if is_write {
                 if ok {
-                    txnmgr.commit(txn.xid);
+                    // The commit fsyncs the WAL on the durable engine; a failure
+                    // there is a system error, surfaced to the client.
+                    txnmgr.commit(txn.xid).map_err(commit_io_error)?;
                 } else {
                     txnmgr.abort(txn.xid);
                 }
@@ -263,6 +266,12 @@ fn finalize_statement(
             active.cid = CommandId(active.cid.0 + 1);
         }
     }
+    Ok(())
+}
+
+/// Map a WAL/commit I/O failure to a SQLSTATE 58030 system error.
+fn commit_io_error(e: std::io::Error) -> PgError {
+    PgError::new(sqlstate::IO_ERROR, format!("could not commit transaction: {e}"))
 }
 
 /// `AND CHAIN` (commit/rollback then immediately open an identical block) is not
@@ -352,7 +361,9 @@ fn commit_transaction(
         }
         TransactionStatus::InTransaction => {
             if let Some(active) = session.xact.take() {
-                txnmgr.commit(active.xid.unwrap_or(Xid::INVALID));
+                txnmgr
+                    .commit(active.xid.unwrap_or(Xid::INVALID))
+                    .map_err(commit_io_error)?;
             }
             "COMMIT"
         }
@@ -453,7 +464,7 @@ fn execute_truncate(
     for table in &tables {
         table.truncate(&txn);
     }
-    finalize_statement(txnmgr, session, &txn, true, true);
+    finalize_statement(txnmgr, session, &txn, true, true)?;
     Ok(QueryResult::command("TRUNCATE TABLE"))
 }
 
