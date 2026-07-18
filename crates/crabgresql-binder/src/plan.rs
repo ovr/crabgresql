@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{Column, TableAm, TableEngine};
+use crabgresql_storage_api::{Column, TableAm, TableEngine, TypeCatalog};
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
@@ -167,15 +167,17 @@ type CteEnv = HashMap<String, CteRelation>;
 
 pub fn bind_query(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     query: &ast::Query,
 ) -> Result<LogicalPlan, BindError> {
-    bind_query_scoped(engine, query, &CteEnv::new())
+    bind_query_scoped(engine, catalog, query, &CteEnv::new())
 }
 
 /// Bind a query with a set of visible CTEs. Recurses for CTE bodies and derived
 /// tables, extending the environment with this query's own `WITH` clause.
 fn bind_query_scoped(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     query: &ast::Query,
     outer: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
@@ -183,16 +185,17 @@ fn bind_query_scoped(
     // common no-CTE case binds against `outer` directly.
     match &query.with {
         Some(with) => {
-            let ctes = bind_ctes(engine, with, outer)?;
-            bind_query_body(engine, query, &ctes)
+            let ctes = bind_ctes(engine, catalog, with, outer)?;
+            bind_query_body(engine, catalog, query, &ctes)
         }
-        None => bind_query_body(engine, query, outer),
+        None => bind_query_body(engine, catalog, query, outer),
     }
 }
 
 /// Bind a query's body (SELECT or VALUES) against a resolved CTE environment.
 fn bind_query_body(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     query: &ast::Query,
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
@@ -200,9 +203,9 @@ fn bind_query_body(
     match query.body.as_ref() {
         ast::SetExpr::Select(select) => {
             reject_unsupported_select_clauses(select)?;
-            bind_select(engine, select, &query.order_by, ctes)
+            bind_select(engine, catalog, select, &query.order_by, ctes)
         }
-        ast::SetExpr::Values(values) => bind_values_query(values, &query.order_by),
+        ast::SetExpr::Values(values) => bind_values_query(catalog, values, &query.order_by),
         other => Err(BindError::feature_not_supported(format!(
             "query form is not supported yet: {other}"
         ))),
@@ -214,6 +217,7 @@ fn bind_query_body(
 /// bodies are not yet supported. Duplicate names within one clause are rejected.
 fn bind_ctes(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     with: &ast::With,
     outer: &CteEnv,
 ) -> Result<CteEnv, BindError> {
@@ -233,7 +237,7 @@ fn bind_ctes(
                 format!("WITH query name \"{name}\" specified more than once"),
             ));
         }
-        let plan = bind_query_scoped(engine, &cte.query, &ctes)?;
+        let plan = bind_query_scoped(engine, catalog, &cte.query, &ctes)?;
         let mut columns = output_columns_of(&plan)?;
         apply_alias_columns(&mut columns, &cte.alias.columns, &with_query_subject(&name))?;
         ctes.insert(name, CteRelation { columns, plan });
@@ -248,15 +252,16 @@ fn bind_ctes(
 /// join (`INNER`/`LEFT`/... with `ON`/`USING`/`NATURAL`) is still rejected.
 fn bind_select(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
     let relations = flatten_from(&select.from)?;
     match relations.as_slice() {
-        [] => bind_values_select(select, order_by),
-        [relation] => bind_from_select(engine, relation, select, order_by, ctes),
-        _ => bind_cross_join(engine, &relations, select, order_by, ctes),
+        [] => bind_values_select(catalog, select, order_by),
+        [relation] => bind_from_select(engine, catalog, relation, select, order_by, ctes),
+        _ => bind_cross_join(engine, catalog, &relations, select, order_by, ctes),
     }
 }
 
@@ -291,13 +296,14 @@ fn flatten_from(from: &[ast::TableWithJoins]) -> Result<Vec<&ast::TableFactor>, 
 /// only the dispatch is shared with the cross-join path.
 fn bind_from_select(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     relation: &ast::TableFactor,
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
-    let item = bind_from_item(engine, relation, ctes)?;
-    let scope = Scope::relations(vec![(item.qualifier, to_columns(&item.columns))]);
+    let item = bind_from_item(engine, catalog, relation, ctes)?;
+    let scope = Scope::relations(vec![(item.qualifier, to_columns(&item.columns))], catalog);
     let body = bind_select_body(select, order_by, &scope)?;
     Ok(match item.input {
         JoinInput::Scan(table) => LogicalPlan::Query {
@@ -347,6 +353,7 @@ struct BoundFromItem {
 /// pipeline) so several can be combined into a cross join.
 fn bind_from_item(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     relation: &ast::TableFactor,
     ctes: &CteEnv,
 ) -> Result<BoundFromItem, BindError> {
@@ -365,7 +372,7 @@ fn bind_from_item(
             }
             let fname = object_name_to_table_name(name)?;
             let arg_exprs = positional_arg_exprs(&fn_args.args)?;
-            let (func, args) = bind_table_fn_call(&fname, &arg_exprs, &Scope::empty())?;
+            let (func, args) = bind_table_fn_call(&fname, &arg_exprs, &Scope::empty(catalog))?;
             let qualifier = aliased_qualifier(alias, fname)?;
             let columns = func
                 .columns()
@@ -425,7 +432,7 @@ fn bind_from_item(
                 ));
             };
             let qualifier = normalize_ident(&alias.name);
-            let inner = bind_query_scoped(engine, subquery, ctes)?;
+            let inner = bind_query_scoped(engine, catalog, subquery, ctes)?;
             let mut columns = output_columns_of(&inner)?;
             apply_alias_columns(&mut columns, &alias.columns, &table_subject(&qualifier))?;
             Ok(BoundFromItem {
@@ -467,6 +474,7 @@ fn aliased_qualifier(
 /// qualifier are rejected (`42712`), as in PG.
 fn bind_cross_join(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     relations: &[&ast::TableFactor],
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
@@ -476,7 +484,7 @@ fn bind_cross_join(
     let mut scope_rels: Vec<(String, Vec<Column>)> = Vec::with_capacity(relations.len());
     let mut seen: HashSet<String> = HashSet::new();
     for relation in relations {
-        let item = bind_from_item(engine, relation, ctes)?;
+        let item = bind_from_item(engine, catalog, relation, ctes)?;
         if !seen.insert(item.qualifier.clone()) {
             return Err(BindError::new(
                 sqlstate::DUPLICATE_ALIAS,
@@ -489,7 +497,7 @@ fn bind_cross_join(
         scope_rels.push((item.qualifier, to_columns(&item.columns)));
         inputs.push(item.input);
     }
-    let scope = Scope::relations(scope_rels);
+    let scope = Scope::relations(scope_rels, catalog);
     let body = bind_select_body(select, order_by, &scope)?;
     Ok(LogicalPlan::Join {
         inputs,
@@ -503,6 +511,7 @@ fn bind_cross_join(
 /// A standalone `VALUES (...), (...)` list. Column names default to
 /// `column1..columnN`; each column resolves to a common type across all rows.
 fn bind_values_query(
+    catalog: &Arc<dyn TypeCatalog>,
     values: &ast::Values,
     order_by: &Option<ast::OrderBy>,
 ) -> Result<LogicalPlan, BindError> {
@@ -510,7 +519,7 @@ fn bind_values_query(
         return Err(BindError::syntax("VALUES lists must not be empty"));
     }
     let width = values.rows[0].content.len();
-    let scope = Scope::empty();
+    let scope = Scope::empty(catalog);
     // Bind every cell, grouping bindings by column for type unification.
     let mut columns_of_bindings: Vec<Vec<crate::Binding>> = vec![Vec::new(); width];
     for row in &values.rows {
@@ -822,10 +831,11 @@ fn reject_unsupported_select_clauses(select: &ast::Select) -> Result<(), BindErr
 /// FROM-less SELECT: one row of constant expressions. A WHERE is still legal
 /// (`SELECT 1 WHERE false`) and binds in the empty scope.
 fn bind_values_select(
+    catalog: &Arc<dyn TypeCatalog>,
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
 ) -> Result<LogicalPlan, BindError> {
-    let scope = Scope::empty();
+    let scope = Scope::empty(catalog);
     let mut columns = Vec::new();
     let mut row = Vec::new();
     for item in &select.projection {
@@ -961,6 +971,7 @@ fn classify_select_item(item: &ast::SelectItem) -> Result<SelectField<'_>, BindE
 
 pub fn bind_insert(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     insert: &ast::Insert,
 ) -> Result<LogicalPlan, BindError> {
     let name = match &insert.table {
@@ -1041,7 +1052,7 @@ pub fn bind_insert(
 
     // VALUES cells bind in the empty scope: a column reference in VALUES is
     // an undefined column, as in PG.
-    let scope = Scope::empty();
+    let scope = Scope::empty(catalog);
     let mut rows = Vec::with_capacity(values.len());
     for value_row in values {
         // PG validates the VALUES clause shape before matching it against the
@@ -1083,6 +1094,7 @@ pub fn bind_insert(
 
 pub fn bind_update(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     update: &ast::Update,
 ) -> Result<LogicalPlan, BindError> {
     let unsupported: Option<&str> = if update.from.is_some() {
@@ -1109,7 +1121,7 @@ pub fn bind_update(
     let (table, qualifier) = open_relation(engine, &update.table.relation)?;
     let schema = table.schema().clone();
     let table_name = schema.name.clone();
-    let scope = Scope::table(&schema, qualifier);
+    let scope = Scope::table(&schema, qualifier, catalog);
 
     // SET expressions bind against the table schema: they all see the OLD
     // row, so `SET a = b, b = a` swaps.
@@ -1149,6 +1161,7 @@ pub fn bind_update(
 
 pub fn bind_delete(
     engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
     delete: &ast::Delete,
 ) -> Result<LogicalPlan, BindError> {
     let unsupported: Option<&str> = if !delete.tables.is_empty() {
@@ -1183,7 +1196,7 @@ pub fn bind_delete(
 
     let (table, qualifier) = open_relation(engine, &target.relation)?;
     let schema = table.schema().clone();
-    let scope = Scope::table(&schema, qualifier);
+    let scope = Scope::table(&schema, qualifier, catalog);
     let predicate = bind_where(&delete.selection, &scope)?;
     Ok(LogicalPlan::Delete { table, predicate })
 }
@@ -1214,12 +1227,14 @@ mod tests {
 
     fn bind_one(sql: &str) -> Result<LogicalPlan, BindError> {
         let engine = engine_with_table();
+        let catalog: Arc<dyn TypeCatalog> =
+            Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         let stmts = crabgresql_parser::parse(sql).unwrap();
         match &stmts[0] {
-            ast::Statement::Query(q) => bind_query(&engine, q),
-            ast::Statement::Insert(i) => bind_insert(&engine, i),
-            ast::Statement::Update(u) => bind_update(&engine, u),
-            ast::Statement::Delete(d) => bind_delete(&engine, d),
+            ast::Statement::Query(q) => bind_query(&engine, &catalog, q),
+            ast::Statement::Insert(i) => bind_insert(&engine, &catalog, i),
+            ast::Statement::Update(u) => bind_update(&engine, &catalog, u),
+            ast::Statement::Delete(d) => bind_delete(&engine, &catalog, d),
             other => panic!("unexpected statement: {other}"),
         }
     }

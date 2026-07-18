@@ -438,6 +438,28 @@ fn bit_to_int(len: u16, bits: u64, ty: PgType) -> Result<Value, CastError> {
     }
 }
 
+/// Reinterpret a value's bit pattern as the backing builtin `rep` — the runtime
+/// of a `CREATE CAST ... WITHOUT FUNCTION` (binary-coercible) cast. Widths are
+/// validated equal when the cast is created, so only same-width pairs reach
+/// here: int4↔float4 and int8↔float8 swap the interpretation of the same 32/64
+/// bits, and a value already in `rep`'s representation (e.g. `xfloat4`→`float4`,
+/// both f32) passes through unchanged.
+pub fn reinterpret_value(v: Value, rep: PgType) -> Result<Value, CastError> {
+    match (v, rep) {
+        (Value::Null, _) => Ok(Value::Null),
+        (Value::Int4(n), PgType::Float4) => Ok(Value::Float4(f32::from_bits(n as u32))),
+        (Value::Float4(f), PgType::Int4) => Ok(Value::Int4(f.to_bits() as i32)),
+        (Value::Int8(n), PgType::Float8) => Ok(Value::Float8(f64::from_bits(n as u64))),
+        (Value::Float8(f), PgType::Int8) => Ok(Value::Int8(f.to_bits() as i64)),
+        // Already the target representation (identical backing rep): relabel only.
+        (v @ (Value::Int4(_) | Value::Float4(_) | Value::Int8(_) | Value::Float8(_)), _) => Ok(v),
+        (v, to) => Err(cannot_coerce(
+            v.pg_type().expect("non-null value has a type"),
+            to,
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +688,36 @@ mod tests {
         let e = cast(Value::Bit { len: 3, bits: 0b101 }, PgType::Int2).unwrap_err();
         assert_eq!(e.sqlstate, "42846");
         assert_eq!(e.message, "cannot cast type bit to smallint");
+    }
+
+    #[test]
+    fn reinterpret_swaps_int_float_bits() {
+        // int4 → float4: the bit pattern of 1 is the smallest subnormal float.
+        assert_eq!(
+            reinterpret_value(Value::Int4(1), PgType::Float4).unwrap(),
+            Value::Float4(f32::from_bits(1))
+        );
+        // float4 → int4 is the inverse.
+        assert_eq!(
+            reinterpret_value(Value::Float4(f32::from_bits(1)), PgType::Int4).unwrap(),
+            Value::Int4(1)
+        );
+        // int8 ↔ float8 over 64 bits.
+        assert_eq!(
+            reinterpret_value(Value::Int8(4607182418800017408), PgType::Float8).unwrap(),
+            Value::Float8(1.0)
+        );
+        assert_eq!(
+            reinterpret_value(Value::Float8(1.0), PgType::Int8).unwrap(),
+            Value::Int8(4607182418800017408)
+        );
+        // Same representation (e.g. xfloat4→float4): identity relabel.
+        assert_eq!(
+            reinterpret_value(Value::Float4(1.5), PgType::Float4).unwrap(),
+            Value::Float4(1.5)
+        );
+        // NULL passes through.
+        assert_eq!(reinterpret_value(Value::Null, PgType::Float4).unwrap(), Value::Null);
     }
 
     #[test]

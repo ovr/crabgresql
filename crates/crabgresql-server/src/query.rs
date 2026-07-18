@@ -10,7 +10,7 @@ use crabgresql_binder::{LogicalPlan, bind_delete, bind_insert, bind_query, bind_
 use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
-use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TableSchema};
+use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog};
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::PgType;
 
@@ -116,11 +116,14 @@ pub fn execute_statement(
     // so it keeps the raw engine + session below.
     let catalog: Arc<dyn TableEngine> =
         Arc::new(SessionCatalog::new(session.temp.clone(), engine.clone()));
+    // The global catalog is the binder's view of user-defined types and casts,
+    // so an expression can cast to/from a `CREATE TYPE` name.
+    let type_catalog: Arc<dyn TypeCatalog> = global_catalog.clone();
     let logical = match stmt {
-        ast::Statement::Query(query) => bind_query(&catalog, query)?,
-        ast::Statement::Insert(insert) => bind_insert(&catalog, insert)?,
-        ast::Statement::Update(update) => bind_update(&catalog, update)?,
-        ast::Statement::Delete(delete) => bind_delete(&catalog, delete)?,
+        ast::Statement::Query(query) => bind_query(&catalog, &type_catalog, query)?,
+        ast::Statement::Insert(insert) => bind_insert(&catalog, &type_catalog, insert)?,
+        ast::Statement::Update(update) => bind_update(&catalog, &type_catalog, update)?,
+        ast::Statement::Delete(delete) => bind_delete(&catalog, &type_catalog, delete)?,
         ast::Statement::CreateTable(create) => {
             return execute_create_table(engine, create, session);
         }
@@ -714,31 +717,38 @@ fn builtin_type_by_name(name: &str) -> Option<PgType> {
     })
 }
 
-/// Derive a base type's physical width (`pg_type.typlen`) from its CREATE TYPE
-/// options: `INTERNALLENGTH` or `LIKE`. Defaults to variable (-1).
-fn typlen_from_options(
+/// Derive a base type's physical width (`pg_type.typlen`) and backing builtin
+/// from its CREATE TYPE options: `INTERNALLENGTH` or `LIKE`. The backing (the
+/// `LIKE` type's representation) drives query-time `WITHOUT FUNCTION` casts;
+/// `INTERNALLENGTH` alone yields no backing. Defaults to variable width (-1).
+fn type_shape_from_options(
     catalog: &GlobalCatalog,
     options: &[ast::UserDefinedTypeSqlDefinitionOption],
-) -> i32 {
+) -> (i32, Option<PgType>) {
     use ast::UserDefinedTypeSqlDefinitionOption as Opt;
     let mut typlen = -1;
+    let mut backing = None;
     for opt in options {
         match opt {
             Opt::InternalLength(ast::UserDefinedTypeInternalLength::Fixed(n)) => typlen = *n as i32,
             Opt::InternalLength(ast::UserDefinedTypeInternalLength::Variable) => typlen = -1,
             Opt::Like(name) => {
-                if let Some(n) = name.0.last().and_then(|p| p.as_ident()).map(normalize_ident)
-                    && let Some(len) = catalog
-                        .user_type_typlen(&n)
-                        .or_else(|| builtin_type_by_name(&n).map(|t| t.typlen() as i32))
-                {
-                    typlen = len;
+                if let Some(n) = name.0.last().and_then(|p| p.as_ident()).map(normalize_ident) {
+                    // `LIKE builtin` copies its width and representation; `LIKE
+                    // usertype` inherits the user type's width and backing.
+                    if let Some(t) = builtin_type_by_name(&n) {
+                        typlen = t.typlen() as i32;
+                        backing = Some(t);
+                    } else if let Some(len) = catalog.user_type_typlen(&n) {
+                        typlen = len;
+                        backing = catalog.user_type_backing(&n);
+                    }
                 }
             }
             _ => {}
         }
     }
-    typlen
+    (typlen, backing)
 }
 
 /// `CREATE TYPE name;` (shell) or `CREATE TYPE name (INPUT=..., OUTPUT=..., ...)`.
@@ -751,8 +761,8 @@ fn execute_create_type(
     let notices = match representation {
         None => catalog.create_shell_type(&tname)?,
         Some(ast::UserDefinedTypeRepresentation::SqlDefinition { options }) => {
-            let typlen = typlen_from_options(catalog, options);
-            catalog.define_type(&tname, typlen)?
+            let (typlen, backing) = type_shape_from_options(catalog, options);
+            catalog.define_type(&tname, typlen, backing)?
         }
         Some(_) => {
             return Err(PgError::feature_not_supported(
