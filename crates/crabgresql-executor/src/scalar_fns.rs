@@ -11,7 +11,9 @@ use std::hint::black_box;
 
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_types::{Interval, Value, float, interval, timestamp, timestamptz, to_char};
+use crabgresql_types::{
+    Interval, Numeric, Value, float, interval, timestamp, timestamptz, to_char,
+};
 
 use crate::ExecError;
 
@@ -137,6 +139,57 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 .map(Value::Timestamp)
                 .map_err(ts_err);
         }
+        // Numeric-typed math: the argument(s) and result are `numeric`.
+        ScalarFn::NumRound => {
+            let s = args.get(1).map(i4).unwrap_or(0);
+            return Ok(Value::Numeric(num(&args[0]).round(s)));
+        }
+        ScalarFn::NumTrunc => {
+            let s = args.get(1).map(i4).unwrap_or(0);
+            return Ok(Value::Numeric(num(&args[0]).trunc(s)));
+        }
+        ScalarFn::NumCeil => return Ok(Value::Numeric(num(&args[0]).ceil())),
+        ScalarFn::NumFloor => return Ok(Value::Numeric(num(&args[0]).floor())),
+        ScalarFn::NumAbs => return Ok(Value::Numeric(num(&args[0]).abs())),
+        ScalarFn::NumSign => return Ok(Value::Numeric(num(&args[0]).signum())),
+        ScalarFn::NumMod => {
+            return num(&args[0]).modulo(num(&args[1])).map(Value::Numeric).map_err(num_err);
+        }
+        // `mod(intN, intN)`: remainder truncated toward zero (`MIN % -1 = 0`),
+        // division by zero is 22012 — same semantics as the `%` operator.
+        ScalarFn::ModInt => {
+            let zero = || err(sqlstate::DIVISION_BY_ZERO, "division by zero");
+            return match (&args[0], &args[1]) {
+                (Value::Int2(a), Value::Int2(b)) => {
+                    if *b == 0 { Err(zero()) } else { Ok(Value::Int2(a.checked_rem(*b).unwrap_or(0))) }
+                }
+                (Value::Int4(a), Value::Int4(b)) => {
+                    if *b == 0 { Err(zero()) } else { Ok(Value::Int4(a.checked_rem(*b).unwrap_or(0))) }
+                }
+                (Value::Int8(a), Value::Int8(b)) => {
+                    if *b == 0 { Err(zero()) } else { Ok(Value::Int8(a.checked_rem(*b).unwrap_or(0))) }
+                }
+                (a, b) => unreachable!("mod(int) on {a:?}, {b:?}"),
+            };
+        }
+        ScalarFn::NumSqrt => {
+            return num(&args[0]).sqrt().map(Value::Numeric).map_err(num_err);
+        }
+        ScalarFn::NumLn => return num(&args[0]).ln().map(Value::Numeric).map_err(num_err),
+        ScalarFn::NumLog10 => return num(&args[0]).log10().map(Value::Numeric).map_err(num_err),
+        ScalarFn::NumLog => {
+            return num(&args[0]).log_base(num(&args[1])).map(Value::Numeric).map_err(num_err);
+        }
+        ScalarFn::NumExp => return num(&args[0]).exp().map(Value::Numeric).map_err(num_err),
+        ScalarFn::NumPower => {
+            return num(&args[0]).power(num(&args[1])).map(Value::Numeric).map_err(num_err);
+        }
+        ScalarFn::NumApplyTypmod => {
+            return num(&args[0])
+                .apply_typmod(i4(&args[1]), i4(&args[2]))
+                .map(Value::Numeric)
+                .map_err(num_err);
+        }
         // md5(text)/md5(bytea) hash the raw input bytes; both return the
         // 32-char lowercase hex digest as text.
         ScalarFn::Md5 => {
@@ -246,6 +299,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::Cbrt => Ok(float::f8_cbrt(a)),
         ScalarFn::Exp => dexp(a),
         ScalarFn::Ln => dln(a),
+        ScalarFn::Log10F8 => dlog10(a),
+        ScalarFn::AbsF8 => Ok(a.abs()),
         ScalarFn::Power => float::f8_pow(a, f8(&args[1])).map_err(float_err),
         ScalarFn::Sinh => Ok(a.sinh()),
         ScalarFn::Cosh => Ok(a.cosh()),
@@ -312,7 +367,22 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         | ScalarFn::IsfiniteTz
         | ScalarFn::MakeTimestampTz
         | ScalarFn::TimezoneToTz
-        | ScalarFn::TimezoneToTs => unreachable!(),
+        | ScalarFn::TimezoneToTs
+        | ScalarFn::NumRound
+        | ScalarFn::NumTrunc
+        | ScalarFn::NumCeil
+        | ScalarFn::NumFloor
+        | ScalarFn::NumAbs
+        | ScalarFn::NumSign
+        | ScalarFn::NumMod
+        | ScalarFn::NumSqrt
+        | ScalarFn::NumLn
+        | ScalarFn::NumLog10
+        | ScalarFn::NumLog
+        | ScalarFn::NumExp
+        | ScalarFn::NumPower
+        | ScalarFn::NumApplyTypmod
+        | ScalarFn::ModInt => unreachable!("numeric functions return early"),
     };
     result.map(Value::Float8)
 }
@@ -347,6 +417,20 @@ fn dln(x: f64) -> Result<f64, ExecError> {
         return Err(err(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of a negative number"));
     }
     Ok(x.ln())
+}
+
+/// `dlog10`: base-10 logarithm with PG's domain errors.
+fn dlog10(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x == 0.0 {
+        return Err(err(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of zero"));
+    }
+    if x < 0.0 {
+        return Err(err(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of a negative number"));
+    }
+    Ok(x.log10())
 }
 
 fn dgamma(x: f64) -> Result<f64, ExecError> {
@@ -633,6 +717,17 @@ fn i4(v: &Value) -> i32 {
 
 fn ts_err(e: timestamp::TimestampError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
+}
+
+fn num(v: &Value) -> &Numeric {
+    match v {
+        Value::Numeric(n) => n,
+        other => unreachable!("expected numeric arg, got {other:?}"),
+    }
+}
+
+fn num_err(e: crabgresql_types::numeric::NumErr) -> ExecError {
+    ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
 }
 
 #[cfg(test)]

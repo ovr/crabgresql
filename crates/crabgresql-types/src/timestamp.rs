@@ -21,7 +21,7 @@
 //! current-relative specials (`now`/`today`/...) need a transaction clock and
 //! are not supported.
 
-use crate::NumericVal;
+use crate::Numeric;
 use crate::interval::{self, Interval};
 
 // SQLSTATEs, kept as literals here (the types crate does not depend on the
@@ -725,15 +725,10 @@ fn date_part_canon(unit: &str, micros: i64) -> Result<Option<f64>, TimestampErro
 /// `extract` (numeric). Same fields as [`date_part`], but PG returns `numeric`
 /// with a per-field scale: sub-second fields keep fractional digits. `Ok(None)`
 /// is SQL NULL (an oscillating field on `±infinity`).
-pub fn extract(unit: &str, micros: i64) -> Result<Option<NumericVal>, TimestampError> {
+pub fn extract(unit: &str, micros: i64) -> Result<Option<Numeric>, TimestampError> {
     let unit = canonical_unit(unit);
     if !is_finite(micros) {
-        return non_finite(
-            &unit,
-            micros,
-            NumericVal::Finite("Infinity".into()),
-            NumericVal::Finite("-Infinity".into()),
-        );
+        return non_finite(&unit, micros, Numeric::pos_inf(), Numeric::neg_inf());
     }
     let tm = decode(micros);
     let total_sub_usec = tm.sec * USECS_PER_SEC + tm.usec;
@@ -751,7 +746,7 @@ pub fn extract(unit: &str, micros: i64) -> Result<Option<NumericVal>, TimestampE
         _ => (date_part_canon(&unit, micros)?.expect("finite integer field is Some") as i64)
             .to_string(),
     };
-    Ok(Some(NumericVal::Finite(s)))
+    Ok(Some(Numeric::parse(&s).expect("extract renders a valid numeric literal")))
 }
 
 /// Format `scaled` (the field value times `10^scale`) as a fixed-point decimal
@@ -1341,16 +1336,16 @@ mod tests {
     #[test]
     fn extract_scales() {
         let t = ts("2001-02-16 20:38:40.5");
-        let ex = |u: &str| extract(u, t).unwrap().unwrap();
-        assert_eq!(ex("year"), NumericVal::Finite("2001".into()));
-        assert_eq!(ex("second"), NumericVal::Finite("40.500000".into()));
-        assert_eq!(ex("milliseconds"), NumericVal::Finite("40500.000".into()));
-        assert_eq!(ex("microseconds"), NumericVal::Finite("40500000".into()));
+        let ex = |u: &str| extract(u, t).unwrap().unwrap().to_display();
+        assert_eq!(ex("year"), "2001");
+        assert_eq!(ex("second"), "40.500000");
+        assert_eq!(ex("milliseconds"), "40500.000");
+        assert_eq!(ex("microseconds"), "40500000");
         assert_eq!(
-            extract("epoch", ts("2001-02-16 20:38:40")).unwrap().unwrap(),
-            NumericVal::Finite("982355920.000000".into())
+            extract("epoch", ts("2001-02-16 20:38:40")).unwrap().unwrap().to_display(),
+            "982355920.000000"
         );
-        assert_eq!(ex("epoch"), NumericVal::Finite("982355920.500000".into()));
+        assert_eq!(ex("epoch"), "982355920.500000");
     }
 
     #[test]
@@ -1361,8 +1356,8 @@ mod tests {
         assert_eq!(date_part("month", POS_INFINITY).unwrap(), None);
         assert_eq!(date_part("week", NEG_INFINITY).unwrap(), None);
         assert_eq!(
-            extract("year", POS_INFINITY).unwrap(),
-            Some(NumericVal::Finite("Infinity".into()))
+            extract("year", POS_INFINITY).unwrap().unwrap().to_display(),
+            "Infinity"
         );
         assert_eq!(extract("day", POS_INFINITY).unwrap(), None);
         // An unknown unit still errors even on ±infinity.
@@ -1372,10 +1367,7 @@ mod tests {
     #[test]
     fn extract_julian_keeps_the_fraction() {
         // The fractional day must survive (regression: was truncated to i64).
-        let s = match extract("julian", ts("2001-02-16 20:38:40")).unwrap().unwrap() {
-            NumericVal::Finite(s) => s,
-            other => panic!("expected finite, got {other:?}"),
-        };
+        let s = extract("julian", ts("2001-02-16 20:38:40")).unwrap().unwrap().to_display();
         assert!(s.starts_with("2451957.86"), "got {s}");
     }
 

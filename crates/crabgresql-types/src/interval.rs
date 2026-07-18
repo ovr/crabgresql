@@ -15,7 +15,7 @@
 
 use std::cmp::Ordering;
 
-use crate::NumericVal;
+use crate::Numeric;
 
 // SQLSTATEs, kept as literals (the types crate has no dependency on the
 // protocol crate; the binder/executor map these to `sqlstate::*`).
@@ -508,15 +508,10 @@ pub fn date_part(unit: &str, iv: Interval) -> Result<Option<f64>, IntervalError>
 
 /// `extract` (numeric). Same fields as [`date_part`], but with PG's per-field
 /// scale on the sub-second and epoch values.
-pub fn extract(unit: &str, iv: Interval) -> Result<Option<NumericVal>, IntervalError> {
+pub fn extract(unit: &str, iv: Interval) -> Result<Option<Numeric>, IntervalError> {
     let unit = canonical_unit(unit);
     if let Some(sign) = iv.infinity_sign() {
-        return non_finite(
-            &unit,
-            sign,
-            NumericVal::Finite("Infinity".into()),
-            NumericVal::Finite("-Infinity".into()),
-        );
+        return non_finite(&unit, sign, Numeric::pos_inf(), Numeric::neg_inf());
     }
     let (_, _, sec, fsec) = split_time(iv.usec);
     let sub_usec = sec * USECS_PER_SEC + fsec;
@@ -527,7 +522,7 @@ pub fn extract(unit: &str, iv: Interval) -> Result<Option<NumericVal>, IntervalE
         "epoch" => format!("{:.6}", epoch_seconds(iv)),
         _ => (date_part(&unit, iv)?.expect("finite integer field is Some") as i64).to_string(),
     };
-    Ok(Some(NumericVal::Finite(s)))
+    Ok(Some(Numeric::parse(&s).expect("extract renders a valid numeric literal")))
 }
 
 /// The value of a known field on a `±infinity` interval.
@@ -1142,11 +1137,11 @@ mod tests {
         assert_eq!(dp("epoch", "1 year 2 mons 3 days 04:05:06"), 37015506.0);
         assert_eq!(dp("epoch", "1 day 02:03:04"), 93784.0);
         assert_eq!(dp("minute", "-1 day -02:03:04"), -3.0);
-        let ex = |u: &str, s: &str| extract(u, iv(s)).unwrap().unwrap();
-        assert_eq!(ex("second", "00:00:04.5"), NumericVal::Finite("4.500000".into()));
-        assert_eq!(ex("milliseconds", "00:00:04.5"), NumericVal::Finite("4500.000".into()));
-        assert_eq!(ex("microseconds", "00:00:04.5"), NumericVal::Finite("4500000".into()));
-        assert_eq!(ex("epoch", "1 day 02:03:04"), NumericVal::Finite("93784.000000".into()));
+        let ex = |u: &str, s: &str| extract(u, iv(s)).unwrap().unwrap().to_display();
+        assert_eq!(ex("second", "00:00:04.5"), "4.500000");
+        assert_eq!(ex("milliseconds", "00:00:04.5"), "4500.000");
+        assert_eq!(ex("microseconds", "00:00:04.5"), "4500000");
+        assert_eq!(ex("epoch", "1 day 02:03:04"), "93784.000000");
         // Infinite intervals: monotonic fields are ±Infinity, others NULL.
         assert_eq!(date_part("year", POS_INFINITY).unwrap(), Some(f64::INFINITY));
         assert_eq!(date_part("epoch", NEG_INFINITY).unwrap(), Some(f64::NEG_INFINITY));

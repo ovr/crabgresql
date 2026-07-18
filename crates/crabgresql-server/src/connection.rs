@@ -151,7 +151,7 @@ async fn run_simple_query(
             }
             Err(e) => {
                 let position = e.location.map(|(line, col)| char_position(sql, line, col));
-                writer.error_response_at(e.code, &e.message, position);
+                writer.error_response_full(e.code, &e.message, e.detail.as_deref(), position);
                 mark_transaction_failed(session);
                 return Ok(());
             }
@@ -226,7 +226,7 @@ async fn write_result(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        writer.error_response(e.code, &e.message);
+                        writer.error_response_full(e.code, &e.message, e.detail.as_deref(), None);
                         return Ok(WriteOutcome::Errored);
                     }
                 }

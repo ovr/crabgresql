@@ -29,6 +29,8 @@ pub struct BindError {
     /// 5-character SQLSTATE code.
     pub code: &'static str,
     pub message: String,
+    /// Optional DETAIL line (e.g. numeric field overflow explains the p/s).
+    pub detail: Option<String>,
     /// 1-based (line, column) of the offending token, when PG reports a
     /// cursor position (`LINE n: ... ^`). Only set for literal input-function
     /// failures, mirroring PG.
@@ -40,8 +42,15 @@ impl BindError {
         Self {
             code,
             message: message.into(),
+            detail: None,
             location: None,
         }
+    }
+
+    /// Attach a DETAIL line.
+    pub fn with_detail(mut self, detail: Option<String>) -> Self {
+        self.detail = detail;
+        self
     }
 
     /// Attach the cursor position from a token span (ignored if the span is
