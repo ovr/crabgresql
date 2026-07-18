@@ -8,6 +8,7 @@ use crabgresql_pg_wire::{
     StartupRequest, TransactionStatus, sqlstate,
 };
 use crabgresql_storage_api::TableEngine;
+use crabgresql_txn::TransactionManager;
 use tokio::net::TcpStream;
 
 use crate::global_catalog::GlobalCatalog;
@@ -35,6 +36,7 @@ pub async fn handle_connection(
     socket: TcpStream,
     engine: Arc<dyn TableEngine>,
     catalog: Arc<GlobalCatalog>,
+    txnmgr: Arc<TransactionManager>,
 ) -> Result<(), ProtocolError> {
     socket.set_nodelay(true).ok();
     let (read_half, write_half) = socket.into_split();
@@ -90,7 +92,8 @@ pub async fn handle_connection(
             }
             Some(_) if skip_until_sync => {}
             Some(FrontendMessage::Query(sql)) => {
-                run_simple_query(&sql, &engine, &catalog, &mut session, &mut writer).await?;
+                run_simple_query(&sql, &engine, &catalog, &txnmgr, &mut session, &mut writer)
+                    .await?;
                 writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
@@ -127,6 +130,7 @@ async fn run_simple_query(
     sql: &str,
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
 ) -> Result<(), ProtocolError> {
@@ -145,7 +149,7 @@ async fn run_simple_query(
     }
     for stmt in &statements {
         let efd = session.extra_float_digits;
-        match execute_statement(engine, catalog, stmt, session) {
+        match execute_statement(engine, catalog, txnmgr, stmt, session) {
             Ok(result) => {
                 if write_result(writer, result, efd).await? == WriteOutcome::Errored {
                     mark_transaction_failed(session);

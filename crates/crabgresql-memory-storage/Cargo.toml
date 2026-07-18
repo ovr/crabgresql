@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 crabgresql-storage-api.workspace = true
+crabgresql-txn.workspace = true
 crabgresql-types.workspace = true

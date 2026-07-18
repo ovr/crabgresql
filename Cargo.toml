@@ -17,6 +17,7 @@ crabgresql-parser = { path = "crates/crabgresql-parser" }
 crabgresql-pg-wire = { path = "crates/crabgresql-pg-wire" }
 crabgresql-server = { path = "crates/crabgresql-server" }
 crabgresql-storage-api = { path = "crates/crabgresql-storage-api" }
+crabgresql-txn = { path = "crates/crabgresql-txn" }
 crabgresql-types = { path = "crates/crabgresql-types" }
 pg-ryu = { path = "vendor/ryu" }
 

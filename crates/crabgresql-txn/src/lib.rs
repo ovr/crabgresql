@@ -1,0 +1,564 @@
+//! Transaction core: XIDs, commit log (CLOG), snapshots and the single MVCC
+//! visibility rule shared by every storage engine.
+//!
+//! This crate is the *core* side of the storage contract described in
+//! `docs/ARCHITECTURE.md §1.3`: **snapshots and XIDs are the core's job; storing
+//! versions and answering visibility is the engine's job.** An engine keeps a
+//! [`TupleHeader`] per version and asks [`satisfies_mvcc`] whether a version is
+//! visible to a given [`Snapshot`] — so the visibility semantics live in exactly
+//! one place and both `crabgresql-memory-storage` and the future
+//! `crabgresql-pg-engine` reuse them.
+//!
+//! The rule reproduces PostgreSQL's observable `HeapTupleSatisfiesMVCC`
+//! behaviour (a version is visible when its inserter is committed-and-in-snapshot
+//! and its deleter is not); it is written independently from PG's C source per
+//! the clean-room policy in `AGENTS.md`.
+
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// A transaction identifier. Unlike PostgreSQL's 32-bit XIDs this is 64-bit, a
+/// deliberate deviation (see `docs/ARCHITECTURE.md §5`): no wraparound, no
+/// freeze, no anti-wraparound VACUUM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Xid(pub u64);
+
+impl Xid {
+    /// The invalid/unset XID (`InvalidTransactionId`). A live tuple that has
+    /// never been deleted carries this in `xmax`.
+    pub const INVALID: Xid = Xid(0);
+    /// A frozen inserter: always treated as committed and visible to every
+    /// snapshot. Reserved for a future VACUUM FREEZE; unused by the in-memory
+    /// engine, but the visibility rule honours it.
+    pub const FROZEN: Xid = Xid(2);
+    /// The first XID handed out to a real transaction. Values below this are
+    /// reserved (`INVALID`, `FROZEN`), mirroring PG's `FirstNormalTransactionId`.
+    pub const FIRST_NORMAL: Xid = Xid(3);
+
+    pub fn is_valid(self) -> bool {
+        self != Xid::INVALID
+    }
+}
+
+/// A command counter within one transaction: statement N of a transaction sees
+/// rows written by commands `< cid` but not by itself or later commands, which
+/// is how a single `UPDATE` avoids re-processing rows it just wrote (the
+/// "Halloween problem").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CommandId(pub u32);
+
+impl CommandId {
+    pub const FIRST: CommandId = CommandId(0);
+}
+
+/// Commit state of a transaction, as recorded in the [`Clog`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XactStatus {
+    /// Still running, or never recorded (the default for an unknown XID).
+    InProgress,
+    Committed,
+    Aborted,
+    /// A subtransaction that committed to its parent but whose top-level
+    /// transaction has not yet committed. Reserved for savepoints (P6).
+    SubCommitted,
+}
+
+/// Hint bits cached on a version so visibility need not re-consult the CLOG once
+/// a transaction's fate is known. Correctness never depends on them — they are a
+/// cache the engine may set lazily — so the in-memory engine leaves them clear
+/// and [`satisfies_mvcc`] falls back to the CLOG.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Infomask(pub u16);
+
+impl Infomask {
+    pub const XMIN_COMMITTED: u16 = 1 << 0;
+    pub const XMIN_INVALID: u16 = 1 << 1;
+    pub const XMAX_COMMITTED: u16 = 1 << 2;
+    pub const XMAX_INVALID: u16 = 1 << 3;
+
+    pub fn contains(self, bit: u16) -> bool {
+        self.0 & bit != 0
+    }
+}
+
+/// The MVCC bookkeeping an engine stores alongside each row version. In the heap
+/// engine these fields live in the on-page tuple header; in the memory engine
+/// they sit beside the tuple in a `Vec`.
+#[derive(Clone, Copy, Debug)]
+pub struct TupleHeader {
+    /// Inserting transaction.
+    pub xmin: Xid,
+    /// Deleting transaction, or [`Xid::INVALID`] while the version is live.
+    pub xmax: Xid,
+    /// Command that created the version (visibility of own inserts).
+    pub cmin: CommandId,
+    /// Command that deleted the version (visibility of own deletes); only
+    /// meaningful once `xmax` is set.
+    pub cmax: CommandId,
+    pub infomask: Infomask,
+}
+
+impl TupleHeader {
+    /// A freshly inserted, live version stamped by `(xid, cid)`.
+    pub fn inserted(xid: Xid, cid: CommandId) -> Self {
+        TupleHeader {
+            xmin: xid,
+            xmax: Xid::INVALID,
+            cmin: cid,
+            cmax: CommandId::FIRST,
+            infomask: Infomask::default(),
+        }
+    }
+}
+
+/// The commit log: the authoritative fate of every transaction. This first
+/// implementation is in-memory (lost on restart, like the memory engine);
+/// durability lands with WAL in P4. An XID absent from the map is treated as
+/// [`XactStatus::InProgress`].
+#[derive(Debug, Default)]
+pub struct Clog {
+    // Sparse; a durable SLRU-style bitmap replaces this in P4.
+    status: Mutex<std::collections::HashMap<Xid, XactStatus>>,
+}
+
+impl Clog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn status(&self, xid: Xid) -> XactStatus {
+        if xid == Xid::FROZEN {
+            return XactStatus::Committed;
+        }
+        self.status
+            .lock()
+            .unwrap()
+            .get(&xid)
+            .copied()
+            .unwrap_or(XactStatus::InProgress)
+    }
+
+    pub fn is_committed(&self, xid: Xid) -> bool {
+        self.status(xid) == XactStatus::Committed
+    }
+
+    pub fn set_committed(&self, xid: Xid) {
+        self.status.lock().unwrap().insert(xid, XactStatus::Committed);
+    }
+
+    pub fn set_aborted(&self, xid: Xid) {
+        self.status.lock().unwrap().insert(xid, XactStatus::Aborted);
+    }
+}
+
+/// Allocates XIDs and tracks which are still running, so a [`Snapshot`] can
+/// record the in-flight set (PG's `ProcArray`).
+pub struct XidManager {
+    next: AtomicU64,
+    active: Mutex<BTreeSet<Xid>>,
+}
+
+impl Default for XidManager {
+    fn default() -> Self {
+        XidManager {
+            next: AtomicU64::new(Xid::FIRST_NORMAL.0),
+            active: Mutex::new(BTreeSet::new()),
+        }
+    }
+}
+
+impl XidManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Assign a fresh XID and mark it running. Called lazily on a transaction's
+    /// first write — read-only transactions never consume an XID.
+    pub fn allocate(&self) -> Xid {
+        let xid = Xid(self.next.fetch_add(1, Ordering::SeqCst));
+        self.active.lock().unwrap().insert(xid);
+        xid
+    }
+
+    /// Mark an XID no longer running (after its CLOG status is set). Snapshots
+    /// taken afterwards no longer list it as in-flight.
+    pub fn complete(&self, xid: Xid) {
+        self.active.lock().unwrap().remove(&xid);
+    }
+
+    /// Capture the set of transactions in flight right now. Everything `>= xmax`
+    /// had not started; everything `< xmin` had already finished.
+    pub fn take_snapshot(&self) -> Snapshot {
+        let active = self.active.lock().unwrap();
+        let xmax = Xid(self.next.load(Ordering::SeqCst));
+        let xmin = active.iter().next().copied().unwrap_or(xmax);
+        Snapshot {
+            xmin,
+            xmax,
+            xip: active.iter().copied().collect(),
+        }
+    }
+}
+
+/// A point-in-time view of transaction visibility: `[xmin, xmax)` with the
+/// still-running XIDs (`xip`) punched out. Mirrors the `(xmin, xmax, xip_list)`
+/// of PG's snapshots.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    /// Smallest XID still running when the snapshot was taken; anything below is
+    /// guaranteed complete.
+    pub xmin: Xid,
+    /// First XID not yet assigned; anything `>=` this started after the snapshot.
+    pub xmax: Xid,
+    /// XIDs that were in flight in `[xmin, xmax)` at snapshot time.
+    pub xip: Vec<Xid>,
+}
+
+impl Snapshot {
+    /// A snapshot that sees every committed transaction and no in-flight one:
+    /// the visibility a fresh read gets when nothing else is running. Handy for
+    /// bootstrap reads and tests.
+    pub fn everything() -> Self {
+        Snapshot {
+            xmin: Xid::FIRST_NORMAL,
+            xmax: Xid(u64::MAX),
+            xip: Vec::new(),
+        }
+    }
+
+    /// Whether `xid` was still in flight relative to this snapshot — i.e. its
+    /// effects must be treated as invisible even if the CLOG now says committed
+    /// (it may have committed *after* the snapshot).
+    pub fn in_progress(&self, xid: Xid) -> bool {
+        if xid >= self.xmax {
+            return true;
+        }
+        if xid < self.xmin {
+            return false;
+        }
+        self.xip.binary_search(&xid).is_ok()
+    }
+}
+
+/// SQL transaction isolation. `READ UNCOMMITTED` is an alias for `READ COMMITTED`
+/// (PG never permits dirty reads); `SERIALIZABLE` reuses `RepeatableRead`
+/// visibility until SSI lands in M3.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IsolationLevel {
+    #[default]
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+/// What flows into an engine on every scan and write: who is asking (`xid`,
+/// `cid`), the snapshot their visibility is judged against, and a handle to the
+/// commit log so the engine can resolve other transactions' fates without a
+/// second parameter. `xid` is [`Xid::INVALID`] until the transaction's first
+/// write allocates one.
+#[derive(Clone, Debug)]
+pub struct TxnContext {
+    pub xid: Xid,
+    pub cid: CommandId,
+    pub snapshot: Snapshot,
+    pub iso: IsolationLevel,
+    pub clog: Arc<Clog>,
+}
+
+impl TxnContext {
+    /// A standalone context whose writes are frozen — [`Xid::FROZEN`], so
+    /// unconditionally visible — and whose reads see every committed version.
+    /// Used for bootstrap catalog seeding (as PostgreSQL uses
+    /// `FrozenTransactionId`) and for callers that do not participate in a real
+    /// transaction yet. It carries its own empty [`Clog`]; frozen versions never
+    /// consult it.
+    pub fn frozen() -> Self {
+        TxnContext {
+            xid: Xid::FROZEN,
+            cid: CommandId::FIRST,
+            snapshot: Snapshot::everything(),
+            iso: IsolationLevel::ReadCommitted,
+            clog: Arc::new(Clog::new()),
+        }
+    }
+
+    /// A read-only context with no XID of its own that sees every committed (and
+    /// frozen) version. Pairs with [`TxnContext::frozen`] for bootstrap reads
+    /// and tests. Uses [`Xid::INVALID`], never [`Xid::FROZEN`], so it does not
+    /// "own" frozen deletes.
+    pub fn read_all() -> Self {
+        TxnContext {
+            xid: Xid::INVALID,
+            cid: CommandId::FIRST,
+            snapshot: Snapshot::everything(),
+            iso: IsolationLevel::ReadCommitted,
+            clog: Arc::new(Clog::new()),
+        }
+    }
+}
+
+/// The one MVCC visibility rule. A version described by `hdr` is visible to a
+/// reader identified by `(my_xid, my_cid)` under snapshot `snap` (consulting
+/// `clog` for other transactions' fates) exactly when its inserter counts as
+/// committed-and-visible and its deleter does not.
+///
+/// Reproduces PostgreSQL's observable `HeapTupleSatisfiesMVCC` outcome; written
+/// clean-room from the documented semantics.
+pub fn satisfies_mvcc(
+    hdr: &TupleHeader,
+    snap: &Snapshot,
+    clog: &Clog,
+    my_xid: Xid,
+    my_cid: CommandId,
+) -> bool {
+    // --- Is the inserting transaction's effect visible? ---
+    if hdr.xmin == Xid::FROZEN {
+        // Frozen inserts are visible to everyone.
+    } else if my_xid.is_valid() && hdr.xmin == my_xid {
+        // Our own insert: visible only if an earlier command in this
+        // transaction created it (not this command or a later one).
+        if hdr.cmin >= my_cid {
+            return false;
+        }
+    } else {
+        // Another transaction's insert: it must be committed *and* have been
+        // complete as of our snapshot.
+        if !clog.is_committed(hdr.xmin) || snap.in_progress(hdr.xmin) {
+            return false;
+        }
+    }
+
+    // The insert is visible. --- Has a visible delete removed it? ---
+    if !hdr.xmax.is_valid() {
+        return true; // never deleted
+    }
+
+    if my_xid.is_valid() && hdr.xmax == my_xid {
+        // Our own delete hides the row only from the deleting command onward.
+        return hdr.cmax >= my_cid;
+    }
+
+    // Another transaction's delete removes the row only if that transaction is
+    // committed and visible in our snapshot; otherwise the row is still live.
+    if clog.is_committed(hdr.xmax) && !snap.in_progress(hdr.xmax) {
+        return false;
+    }
+    true
+}
+
+/// The core's transaction service, shared by the whole server: it hands out
+/// XIDs, records commit/abort in the [`Clog`], and mints [`TxnContext`]s with a
+/// fresh snapshot. One instance is shared across all connections (XIDs and the
+/// commit log are process-global).
+#[derive(Default)]
+pub struct TransactionManager {
+    xids: XidManager,
+    clog: Arc<Clog>,
+}
+
+impl TransactionManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The shared commit log (engines consult it through [`TxnContext::clog`]).
+    pub fn clog(&self) -> &Arc<Clog> {
+        &self.clog
+    }
+
+    /// Assign a fresh XID and mark it running. Called on a transaction's first
+    /// write.
+    pub fn allocate_xid(&self) -> Xid {
+        self.xids.allocate()
+    }
+
+    /// Capture the current in-flight set.
+    pub fn snapshot(&self) -> Snapshot {
+        self.xids.take_snapshot()
+    }
+
+    /// Record `xid` committed and retire it from the in-flight set.
+    pub fn commit(&self, xid: Xid) {
+        if xid.is_valid() {
+            self.clog.set_committed(xid);
+            self.xids.complete(xid);
+        }
+    }
+
+    /// Record `xid` aborted and retire it — its versions become dead with no
+    /// undo (the MVCC advantage: an uncommitted version is simply invisible).
+    pub fn abort(&self, xid: Xid) {
+        if xid.is_valid() {
+            self.clog.set_aborted(xid);
+            self.xids.complete(xid);
+        }
+    }
+
+    /// Build a context taking a fresh snapshot now (READ COMMITTED default).
+    pub fn context(&self, xid: Xid, cid: CommandId) -> TxnContext {
+        self.context_with(xid, cid, self.snapshot(), IsolationLevel::ReadCommitted)
+    }
+
+    /// Build a context from an explicit snapshot and isolation level — for
+    /// REPEATABLE READ, which reuses one snapshot for the whole transaction.
+    pub fn context_with(
+        &self,
+        xid: Xid,
+        cid: CommandId,
+        snapshot: Snapshot,
+        iso: IsolationLevel,
+    ) -> TxnContext {
+        TxnContext {
+            xid,
+            cid,
+            snapshot,
+            iso,
+            clog: Arc::clone(&self.clog),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Is `hdr` visible to reader `(xid, cid)` under `snap`?
+    fn visible(hdr: &TupleHeader, snap: &Snapshot, clog: &Clog, xid: Xid, cid: u32) -> bool {
+        satisfies_mvcc(hdr, snap, clog, xid, CommandId(cid))
+    }
+
+    #[test]
+    fn allocate_is_monotonic_and_tracks_active() {
+        let xm = XidManager::new();
+        let a = xm.allocate();
+        let b = xm.allocate();
+        assert!(b > a);
+        let snap = xm.take_snapshot();
+        assert!(snap.in_progress(a));
+        assert!(snap.in_progress(b));
+        xm.complete(a);
+        xm.complete(b);
+        // A fresh snapshot no longer lists them.
+        let snap2 = xm.take_snapshot();
+        assert!(!snap2.in_progress(a));
+        assert!(!snap2.in_progress(b));
+    }
+
+    #[test]
+    fn committed_insert_is_visible_deleted_row_is_not() {
+        let clog = Clog::new();
+        let inserter = Xid(3);
+        clog.set_committed(inserter);
+        // Snapshot taken now: inserter already complete.
+        let snap = Snapshot { xmin: Xid(4), xmax: Xid(4), xip: vec![] };
+
+        let live = TupleHeader::inserted(inserter, CommandId(0));
+        assert!(visible(&live, &snap, &clog, Xid::INVALID, 0));
+
+        // Delete it with a committed transaction that is also complete.
+        let deleter = Xid(4);
+        clog.set_committed(deleter);
+        let snap2 = Snapshot { xmin: Xid(5), xmax: Xid(5), xip: vec![] };
+        let mut dead = live;
+        dead.xmax = deleter;
+        assert!(!visible(&dead, &snap2, &clog, Xid::INVALID, 0));
+    }
+
+    #[test]
+    fn in_progress_insert_is_invisible_to_others() {
+        let clog = Clog::new();
+        let other = Xid(3); // never committed -> InProgress
+        let snap = Snapshot { xmin: Xid(3), xmax: Xid(4), xip: vec![Xid(3)] };
+        let hdr = TupleHeader::inserted(other, CommandId(0));
+        assert!(!visible(&hdr, &snap, &clog, Xid(7), 0));
+    }
+
+    #[test]
+    fn aborted_insert_is_invisible_even_if_snapshot_would_allow() {
+        let clog = Clog::new();
+        let other = Xid(3);
+        clog.set_aborted(other);
+        let snap = Snapshot { xmin: Xid(4), xmax: Xid(4), xip: vec![] };
+        let hdr = TupleHeader::inserted(other, CommandId(0));
+        assert!(!visible(&hdr, &snap, &clog, Xid::INVALID, 0));
+    }
+
+    #[test]
+    fn own_insert_visible_only_from_a_later_command() {
+        let clog = Clog::new();
+        let me = Xid(3);
+        let snap = Snapshot { xmin: Xid(3), xmax: Xid(4), xip: vec![Xid(3)] };
+        // Inserted by command 0.
+        let hdr = TupleHeader::inserted(me, CommandId(0));
+        // The inserting command itself does not see the row...
+        assert!(!visible(&hdr, &snap, &clog, me, 0));
+        // ...but a later command in the same transaction does.
+        assert!(visible(&hdr, &snap, &clog, me, 1));
+    }
+
+    #[test]
+    fn own_delete_hides_row_only_from_later_commands() {
+        let clog = Clog::new();
+        let me = Xid(3);
+        let snap = Snapshot { xmin: Xid(3), xmax: Xid(4), xip: vec![Xid(3)] };
+        // Inserted by command 0, deleted by command 1, same transaction.
+        let mut hdr = TupleHeader::inserted(me, CommandId(0));
+        hdr.xmax = me;
+        hdr.cmax = CommandId(1);
+        // The deleting command's own scan still sees the row it deletes
+        // (curcid == cmax) — this is what avoids the Halloween problem.
+        assert!(visible(&hdr, &snap, &clog, me, 1));
+        // A later command in the same transaction no longer sees it.
+        assert!(!visible(&hdr, &snap, &clog, me, 2));
+    }
+
+    #[test]
+    fn delete_by_in_progress_txn_leaves_row_visible() {
+        let clog = Clog::new();
+        let inserter = Xid(3);
+        clog.set_committed(inserter);
+        let deleter = Xid(4); // in progress
+        let snap = Snapshot { xmin: Xid(4), xmax: Xid(5), xip: vec![Xid(4)] };
+        let mut hdr = TupleHeader::inserted(inserter, CommandId(0));
+        hdr.xmax = deleter;
+        // Deleter not committed -> row still visible.
+        assert!(visible(&hdr, &snap, &clog, Xid(9), 0));
+    }
+
+    #[test]
+    fn commit_after_snapshot_is_not_visible() {
+        let clog = Clog::new();
+        let inserter = Xid(5);
+        // Snapshot taken while inserter still in flight.
+        let snap = Snapshot { xmin: Xid(5), xmax: Xid(6), xip: vec![Xid(5)] };
+        let hdr = TupleHeader::inserted(inserter, CommandId(0));
+        // Even though it commits now, the snapshot still hides it.
+        clog.set_committed(inserter);
+        assert!(!visible(&hdr, &snap, &clog, Xid::INVALID, 0));
+    }
+
+    #[test]
+    fn transaction_manager_commit_makes_writes_visible() {
+        let tm = TransactionManager::new();
+        let xid = tm.allocate_xid();
+        let hdr = TupleHeader::inserted(xid, CommandId(0));
+        // Before commit, another reader's fresh snapshot cannot see it.
+        let before = tm.context(Xid::INVALID, CommandId::FIRST);
+        assert!(!satisfies_mvcc(&hdr, &before.snapshot, &before.clog, before.xid, before.cid));
+        // After commit, a newly taken snapshot can.
+        tm.commit(xid);
+        let after = tm.context(Xid::INVALID, CommandId::FIRST);
+        assert!(satisfies_mvcc(&hdr, &after.snapshot, &after.clog, after.xid, after.cid));
+    }
+
+    #[test]
+    fn transaction_manager_abort_keeps_writes_invisible() {
+        let tm = TransactionManager::new();
+        let xid = tm.allocate_xid();
+        let hdr = TupleHeader::inserted(xid, CommandId(0));
+        tm.abort(xid);
+        let after = tm.context(Xid::INVALID, CommandId::FIRST);
+        assert!(!satisfies_mvcc(&hdr, &after.snapshot, &after.clog, after.xid, after.cid));
+    }
+}

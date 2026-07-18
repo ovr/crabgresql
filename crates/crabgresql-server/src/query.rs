@@ -11,12 +11,13 @@ use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TableSchema};
+use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::PgType;
 
 use crate::catalog::SessionCatalog;
 use crate::error::PgError;
 use crate::global_catalog::{CatalogNotice, GlobalCatalog, TypeRef};
-use crate::session::Session;
+use crate::session::{ActiveTxn, Session};
 
 /// Severity of a non-error message sent before a command's CommandComplete.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,6 +88,7 @@ impl QueryResult {
 pub fn execute_statement(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
     stmt: &ast::Statement,
     session: &mut Session,
 ) -> Result<QueryResult, PgError> {
@@ -165,11 +167,13 @@ pub fn execute_statement(
         }
         ast::Statement::Commit {
             chain, modifier, ..
-        } => return commit_transaction(session, *chain, modifier),
+        } => return commit_transaction(txnmgr, session, *chain, modifier),
         ast::Statement::Rollback { chain, savepoint } => {
-            return rollback_transaction(session, *chain, savepoint);
+            return rollback_transaction(txnmgr, session, *chain, savepoint);
         }
-        ast::Statement::Truncate(truncate) => return execute_truncate(&catalog, truncate),
+        ast::Statement::Truncate(truncate) => {
+            return execute_truncate(&catalog, txnmgr, session, truncate);
+        }
         other => {
             return Err(PgError::feature_not_supported(format!(
                 "statement is not supported yet: {}",
@@ -177,13 +181,86 @@ pub fn execute_statement(
             )));
         }
     };
-    let result = match execute(crabgresql_planner::plan(logical), session.exec_context())? {
+    // A write statement needs an XID to stamp its versions; a read runs with
+    // none. The context carries the snapshot visibility is judged against.
+    let is_write = matches!(
+        stmt,
+        ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_)
+    );
+    let txn = build_txn(txnmgr, session, is_write);
+    let exec = match execute(crabgresql_planner::plan(logical), session.exec_context(), &txn) {
+        Ok(exec) => exec,
+        Err(e) => {
+            finalize_statement(txnmgr, session, &txn, is_write, false);
+            return Err(e.into());
+        }
+    };
+    finalize_statement(txnmgr, session, &txn, is_write, true);
+    let result = match exec {
         Execution::Rows { columns, node } => QueryResult::Rows { columns, node },
         Execution::Inserted(n) => QueryResult::command(format!("INSERT 0 {n}")),
         Execution::Updated(n) => QueryResult::command(format!("UPDATE {n}")),
         Execution::Deleted(n) => QueryResult::command(format!("DELETE {n}")),
     };
     Ok(result)
+}
+
+/// Build the [`TxnContext`] a statement executes under. Under autocommit each
+/// statement is its own implicit transaction (a write allocates a throwaway XID,
+/// a read uses none); inside an explicit block the XID is allocated lazily on
+/// the first write and reused, and the snapshot policy follows the isolation
+/// level (fresh per statement for READ COMMITTED, frozen once for REPEATABLE
+/// READ and above).
+fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool) -> TxnContext {
+    match &mut session.xact {
+        Some(active) => {
+            let xid = if is_write {
+                *active.xid.get_or_insert_with(|| txnmgr.allocate_xid())
+            } else {
+                active.xid.unwrap_or(Xid::INVALID)
+            };
+            let snapshot = match active.iso {
+                IsolationLevel::ReadCommitted => txnmgr.snapshot(),
+                IsolationLevel::RepeatableRead | IsolationLevel::Serializable => active
+                    .snapshot
+                    .get_or_insert_with(|| txnmgr.snapshot())
+                    .clone(),
+            };
+            txnmgr.context_with(xid, active.cid, snapshot, active.iso)
+        }
+        None => {
+            let xid = if is_write { txnmgr.allocate_xid() } else { Xid::INVALID };
+            txnmgr.context(xid, CommandId::FIRST)
+        }
+    }
+}
+
+/// Close out a statement's transaction bookkeeping. Under autocommit a write
+/// commits (or aborts on error) immediately — its effects are meant to persist
+/// at the statement boundary. Inside a block nothing is finalized here; the XID
+/// lives until `COMMIT`/`ROLLBACK`. The command counter advances so the next
+/// statement in a block sees this one's writes.
+fn finalize_statement(
+    txnmgr: &TransactionManager,
+    session: &mut Session,
+    txn: &TxnContext,
+    is_write: bool,
+    ok: bool,
+) {
+    match &mut session.xact {
+        None => {
+            if is_write {
+                if ok {
+                    txnmgr.commit(txn.xid);
+                } else {
+                    txnmgr.abort(txn.xid);
+                }
+            }
+        }
+        Some(active) => {
+            active.cid = CommandId(active.cid.0 + 1);
+        }
+    }
 }
 
 /// `AND CHAIN` (commit/rollback then immediately open an identical block) is not
@@ -234,12 +311,16 @@ fn begin_transaction(
         return Err(and_chain_unsupported());
     }
     session.tx_status = TransactionStatus::InTransaction;
+    // Open the data-level transaction. Isolation levels are still rejected above
+    // (P6), so every block is READ COMMITTED for now.
+    session.xact = Some(ActiveTxn::new(IsolationLevel::ReadCommitted));
     Ok(QueryResult::command(tag))
 }
 
 /// `COMMIT` / `END`. Ends the block. A COMMIT of a failed block is reported as
 /// ROLLBACK, and a COMMIT with no block open warns — both as in PG.
 fn commit_transaction(
+    txnmgr: &TransactionManager,
     session: &mut Session,
     chain: bool,
     modifier: &Option<ast::TransactionModifier>,
@@ -254,7 +335,12 @@ fn commit_transaction(
     }
     let mut notices = Vec::new();
     let tag = match session.tx_status {
-        TransactionStatus::Failed => "ROLLBACK",
+        // A COMMIT of a failed block rolls back: abort the block's XID so its
+        // writes become dead.
+        TransactionStatus::Failed => {
+            abort_active(txnmgr, session);
+            "ROLLBACK"
+        }
         TransactionStatus::Idle => {
             notices.push(Notice::warning(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -262,7 +348,12 @@ fn commit_transaction(
             ));
             "COMMIT"
         }
-        TransactionStatus::InTransaction => "COMMIT",
+        TransactionStatus::InTransaction => {
+            if let Some(active) = session.xact.take() {
+                txnmgr.commit(active.xid.unwrap_or(Xid::INVALID));
+            }
+            "COMMIT"
+        }
     };
     session.tx_status = TransactionStatus::Idle;
     Ok(QueryResult::Command {
@@ -274,6 +365,7 @@ fn commit_transaction(
 /// `ROLLBACK`. Ends the block (in any state); with no block open it warns.
 /// Note: committed in-memory data is not undone yet — that is M2.
 fn rollback_transaction(
+    txnmgr: &TransactionManager,
     session: &mut Session,
     chain: bool,
     savepoint: &Option<ast::Ident>,
@@ -293,6 +385,8 @@ fn rollback_transaction(
             "there is no transaction in progress",
         ));
     }
+    // Abort the block's XID: every version it wrote becomes dead, with no undo.
+    abort_active(txnmgr, session);
     session.tx_status = TransactionStatus::Idle;
     Ok(QueryResult::Command {
         tag: "ROLLBACK".into(),
@@ -300,10 +394,19 @@ fn rollback_transaction(
     })
 }
 
+/// Abort and clear the session's active transaction, if any.
+fn abort_active(txnmgr: &TransactionManager, session: &mut Session) {
+    if let Some(active) = session.xact.take() {
+        txnmgr.abort(active.xid.unwrap_or(Xid::INVALID));
+    }
+}
+
 /// `TRUNCATE [TABLE] name [, ...]` (bare form only). All named tables are
 /// resolved before any is emptied, so a missing table fails the whole statement.
 fn execute_truncate(
     engine: &Arc<dyn TableEngine>,
+    txnmgr: &Arc<TransactionManager>,
+    session: &mut Session,
     truncate: &ast::Truncate,
 ) -> Result<QueryResult, PgError> {
     if truncate.cascade.is_some() {
@@ -341,9 +444,14 @@ fn execute_truncate(
         let name = object_name_to_table_name(&target.name)?;
         tables.push(engine.open_table(&name)?);
     }
+    // TRUNCATE is a write: run it under a real transaction so autocommit commits
+    // it. (The in-memory engine clears eagerly and ignores the context; truncate
+    // becomes fully transactional with the heap engine.)
+    let txn = build_txn(txnmgr, session, true);
     for table in &tables {
-        table.truncate();
+        table.truncate(&txn);
     }
+    finalize_statement(txnmgr, session, &txn, true, true);
     Ok(QueryResult::command("TRUNCATE TABLE"))
 }
 

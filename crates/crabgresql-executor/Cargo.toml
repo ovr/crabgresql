@@ -9,6 +9,7 @@ crabgresql-binder.workspace = true
 crabgresql-planner.workspace = true
 crabgresql-pg-wire.workspace = true
 crabgresql-storage-api.workspace = true
+crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
 
 [dev-dependencies]

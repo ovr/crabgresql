@@ -1,0 +1,7 @@
+[package]
+name = "crabgresql-txn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
