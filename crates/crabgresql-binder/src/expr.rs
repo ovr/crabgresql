@@ -547,6 +547,30 @@ fn bind_value(value: &ast::ValueWithSpan) -> Result<Binding, BindError> {
             lit: None,
             span: value.span,
         }),
+        ast::Value::HexStringLiteral(s) => {
+            // X'...' is a bit(n) value with n = 4 * hex digits, right-aligned in
+            // `bits`. Value::Bit stores bits in a u64, so we cap at 16 hex digits
+            // (64 bits) — PG supports arbitrary width, but that's out of scope here.
+            if s.len() > 16 {
+                return Err(BindError::feature_not_supported(format!(
+                    "hex string literal wider than 64 bits is not supported yet: X'{s}'"
+                )));
+            }
+            let bits = if s.is_empty() {
+                0
+            } else {
+                u64::from_str_radix(s, 16).map_err(|_| {
+                    BindError::feature_not_supported(format!("invalid hex string literal: X'{s}'"))
+                })?
+            };
+            Ok(Binding::Typed(BoundExpr::Const {
+                value: Value::Bit {
+                    len: (s.len() * 4) as u16,
+                    bits,
+                },
+                ty: PgType::Bit,
+            }))
+        }
         other => Err(BindError::feature_not_supported(format!(
             "literal is not supported yet: {other}"
         ))),

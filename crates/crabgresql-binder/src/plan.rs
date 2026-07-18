@@ -1650,6 +1650,27 @@ mod tests {
     }
 
     #[test]
+    fn hex_literal_binds_as_bit() {
+        // X'...' is a bit(n) value with n = 4 * hex digits.
+        assert_eq!(
+            one_projection("SELECT X'00000001'"),
+            BoundExpr::Const { value: Value::Bit { len: 32, bits: 1 }, ty: PgType::Bit }
+        );
+        // Lowercase hex parses too.
+        assert_eq!(
+            one_projection("SELECT X'ff'"),
+            BoundExpr::Const { value: Value::Bit { len: 8, bits: 0xff }, ty: PgType::Bit }
+        );
+    }
+
+    #[test]
+    fn hex_literal_too_wide_is_rejected() {
+        // 17 hex digits = 68 bits, past the u64 backing of Value::Bit.
+        let e = bind_err("SELECT X'FFFFFFFFFFFFFFFFF'");
+        assert_eq!(e.code, "0A000");
+    }
+
+    #[test]
     fn float_literal_cast_binds() {
         let LogicalPlan::Values { rows, .. } = bind_one("SELECT 'NaN'::float4").unwrap() else {
             panic!("expected Values");

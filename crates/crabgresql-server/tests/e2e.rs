@@ -69,6 +69,25 @@ async fn select_literals_with_aliases() {
 }
 
 #[tokio::test]
+async fn hex_string_literals_bind_display_and_cast() {
+    let client = connect(spawn_server().await).await;
+    let messages = client
+        .simple_query(
+            "SELECT X'00000001', X'FF', X'00000001'::int4, X'FFFFFFFF'::int4",
+        )
+        .await
+        .unwrap();
+    let rows = rows(&messages);
+    let row = rows[0];
+    // X'...' is bit(n), displayed as a zero-padded binary string.
+    assert_eq!(row.get(0), Some("00000000000000000000000000000001"));
+    assert_eq!(row.get(1), Some("11111111"));
+    // bit -> int4 reinterprets the bits as two's-complement.
+    assert_eq!(row.get(2), Some("1"));
+    assert_eq!(row.get(3), Some("-1"));
+}
+
+#[tokio::test]
 async fn create_insert_select_on_memory_engine() {
     let client = connect(spawn_server().await).await;
     client
