@@ -11879,9 +11879,7 @@ impl<'a> Parser<'a> {
                 Token::Word(w) => {
                     idents.push(w.to_ident(token.span));
                 }
-                Token::EOF | Token::Eq | Token::SemiColon | Token::VerticalBarRightAngleBracket => {
-                    break
-                }
+                Token::EOF | Token::Eq | Token::SemiColon => break,
                 _ => {}
             }
             self.advance_token();

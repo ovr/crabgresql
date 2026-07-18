@@ -1748,40 +1748,7 @@ impl fmt::Display for TableSample {
     }
 }
 
-/// The source of values in a `PIVOT` operation.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-pub enum PivotValueSource {
-    /// Pivot on a static list of values.
-    ///
-    /// See <https://docs.snowflake.com/en/sql-reference/constructs/pivot#pivot-on-a-specified-list-of-column-values-for-the-pivot-column>.
-    List(Vec<ExprWithAlias>),
-    /// Pivot on all distinct values of the pivot column.
-    ///
-    /// See <https://docs.snowflake.com/en/sql-reference/constructs/pivot#pivot-on-all-distinct-column-values-automatically-with-dynamic-pivot>.
-    Any(Vec<OrderByExpr>),
-    /// Pivot on all values returned by a subquery.
-    ///
-    /// See <https://docs.snowflake.com/en/sql-reference/constructs/pivot#pivot-on-column-values-using-a-subquery-with-dynamic-pivot>.
-    Subquery(Box<Query>),
-}
 
-impl fmt::Display for PivotValueSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PivotValueSource::List(values) => write!(f, "{}", display_comma_separated(values)),
-            PivotValueSource::Any(order_by) => {
-                write!(f, "ANY")?;
-                if !order_by.is_empty() {
-                    write!(f, " ORDER BY {}", display_comma_separated(order_by))?;
-                }
-                Ok(())
-            }
-            PivotValueSource::Subquery(query) => write!(f, "{query}"),
-        }
-    }
-}
 
 /// An item in the `MEASURES` subclause of a `MATCH_RECOGNIZE` operation.
 ///

@@ -42,7 +42,7 @@ use super::{
     MergeInsertKind, MergeUpdateExpr, NamedParenthesizedList, NamedWindowDefinition, ObjectName,
     ObjectNamePart, Offset, OnConflict, OnConflictAction, OnInsert, OpenStatement, OrderBy,
     OrderByExpr, OrderByKind, OutputClause, Parens, Partition, PartitionBoundValue,
-    PivotValueSource, ProjectionSelect, Query, RaiseStatement, RaiseStatementValue,
+    ProjectionSelect, Query, RaiseStatement, RaiseStatementValue,
     ReferentialAction, RenameSelectItem, ReplaceSelectElement, ReplaceSelectItem, Select,
     SelectInto, SelectItem, SetExpr, SqlOption, Statement, Subscript, SymbolDefinition, TableAlias,
     TableAliasColumnDef, TableConstraint, TableFactor, TableObject, TableOptionsClustered,
@@ -1868,15 +1868,6 @@ impl Spanned for TableFactor {
     }
 }
 
-impl Spanned for PivotValueSource {
-    fn span(&self) -> Span {
-        match self {
-            PivotValueSource::List(vec) => union_spans(vec.iter().map(|i| i.span())),
-            PivotValueSource::Any(vec) => union_spans(vec.iter().map(|i| i.span())),
-            PivotValueSource::Subquery(query) => query.span(),
-        }
-    }
-}
 
 impl Spanned for ExprWithAlias {
     fn span(&self) -> Span {
