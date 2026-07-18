@@ -207,6 +207,9 @@ pub fn execute_statement(
         ast::Statement::Truncate(truncate) => {
             return execute_truncate(&catalog, txnmgr, session, truncate);
         }
+        ast::Statement::CreateIndex(create) => {
+            return execute_create_index(&catalog, create);
+        }
         other => {
             return Err(PgError::feature_not_supported(format!(
                 "statement is not supported yet: {}",
@@ -505,6 +508,52 @@ fn execute_truncate(
     Ok(QueryResult::command("TRUNCATE TABLE"))
 }
 
+/// `CREATE INDEX`: validated no-op. The in-memory / pg engines don't need a
+/// real index for output parity, so this checks the target table and columns
+/// exist (matching PG's errors) and accepts `USING btree|hash`, then returns the
+/// `CREATE INDEX` command tag. Unsupported access methods and clauses error.
+fn execute_create_index(
+    engine: &Arc<dyn TableEngine>,
+    create: &ast::CreateIndex,
+) -> Result<QueryResult, PgError> {
+    match &create.using {
+        None | Some(ast::IndexType::BTree) | Some(ast::IndexType::Hash) => {}
+        Some(other) => {
+            return Err(PgError::feature_not_supported(format!(
+                "index access method \"{other}\" is not supported yet"
+            )));
+        }
+    }
+    if create.predicate.is_some() {
+        return Err(PgError::feature_not_supported(
+            "partial indexes are not supported yet",
+        ));
+    }
+    let name = object_name_to_table_name(&create.table_name)?;
+    let table = engine.open_table(&name)?;
+    for col in &create.columns {
+        let ident = match &col.column.expr {
+            ast::Expr::Identifier(ident) => normalize_ident(ident),
+            ast::Expr::CompoundIdentifier(parts) => match parts.last() {
+                Some(ident) => normalize_ident(ident),
+                None => return Err(PgError::syntax("invalid index column")),
+            },
+            _ => {
+                return Err(PgError::feature_not_supported(
+                    "expression indexes are not supported yet",
+                ));
+            }
+        };
+        if table.schema().column_index(&ident).is_none() {
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_COLUMN,
+                format!("column \"{ident}\" does not exist"),
+            ));
+        }
+    }
+    Ok(QueryResult::command("CREATE INDEX"))
+}
+
 /// `SET`: only `extra_float_digits` is honored; other GUCs are accepted and
 /// ignored (driver compatibility), as before.
 fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgError> {
@@ -754,6 +803,8 @@ fn builtin_type_by_name(name: &str) -> Option<PgType> {
         "timestamp" => PgType::Timestamp,
         "timestamptz" => PgType::TimestampTz,
         "interval" => PgType::Interval,
+        "macaddr" => PgType::Macaddr,
+        "macaddr8" => PgType::Macaddr8,
         _ => return None,
     })
 }

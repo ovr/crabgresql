@@ -3,5 +3,7 @@
 # Promote tests here as SQL coverage grows; one name per line.
 comments
 float4
+macaddr
+macaddr8
 md5
 money

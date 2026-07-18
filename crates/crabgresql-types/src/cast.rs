@@ -333,6 +333,20 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- text -> oid (oidin: unsigned decimal, wrapping) ----
         (Value::Text(s), PgType::Oid) => text_to_oid(s),
 
+        // ---- text → macaddr / macaddr8 (macaddr_in / macaddr8_in) ----
+        (Value::Text(s), PgType::Macaddr) => crate::macaddr::parse_macaddr(s)
+            .map(Value::Macaddr)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Macaddr8) => crate::macaddr::parse_macaddr8(s)
+            .map(Value::Macaddr8)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- macaddr <-> macaddr8 ----
+        (Value::Macaddr(b), PgType::Macaddr8) => Ok(Value::Macaddr8(crate::macaddr::expand6to8(b))),
+        (Value::Macaddr8(b), PgType::Macaddr) => crate::macaddr::narrow8to6(b)
+            .map(Value::Macaddr)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
         _ => Err(cannot_coerce(from, to)),
     }
 }

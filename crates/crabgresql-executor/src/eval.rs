@@ -200,6 +200,8 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
             let (lb, db) = bit_of(r);
             bit::cmp(la, da, lb, db)
         }
+        // macaddr/macaddr8: raw byte order (PG's `macaddr_cmp`).
+        PgType::Macaddr | PgType::Macaddr8 => macaddr_bytes(l).cmp(macaddr_bytes(r)),
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -325,6 +327,14 @@ fn bit_of(v: &Value) -> (u32, &[u8]) {
     match v {
         Value::Bit { len, data } => (*len, data),
         other => unreachable!("expected bit, got {other:?}"),
+    }
+}
+
+fn macaddr_bytes(v: &Value) -> &[u8] {
+    match v {
+        Value::Macaddr(b) => b,
+        Value::Macaddr8(b) => b,
+        other => unreachable!("expected macaddr/macaddr8, got {other:?}"),
     }
 }
 
