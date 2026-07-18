@@ -13,7 +13,8 @@ pub use expr::{
 };
 pub use functions::{AggFn, ScalarFn, TableFn, lookup_table_fn};
 pub use plan::{
-    AggInput, JoinInput, LogicalPlan, SortKey, bind_delete, bind_insert, bind_query, bind_update,
+    AggInput, JoinExpr, JoinInput, JoinKind, LogicalPlan, SortKey, bind_delete, bind_insert,
+    bind_query, bind_update,
 };
 
 use crabgresql_parser::Span;

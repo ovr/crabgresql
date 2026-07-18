@@ -74,13 +74,11 @@ pub enum LogicalPlan {
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
     },
-    /// SELECT over the cartesian product of two or more FROM items (`FROM a, b`
-    /// or `a CROSS JOIN b`). `inputs` produce the per-relation rows, laid out
-    /// left-to-right in the combined row; the same projection/predicate/sort
-    /// pipeline as `Query` runs on top, with `ColumnRef`s indexing the combined
-    /// row.
+    /// SELECT over a recursive join tree. Leaf rows are laid out left-to-right
+    /// in the combined row; the same projection/predicate/sort pipeline as
+    /// `Query` runs on top, with `ColumnRef`s indexing that combined row.
     Join {
-        inputs: Vec<JoinInput>,
+        source: JoinExpr,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -146,13 +144,50 @@ pub enum JoinInput {
     TableFunction { func: TableFn, args: Vec<BoundExpr> },
 }
 
+/// The SQL join semantics applied by one binary [`JoinExpr::Join`] node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind {
+    Cross,
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// A recursively bound FROM source. Every leaf records its output width so an
+/// outer join can synthesize a correctly-sized all-NULL row even when that side
+/// has no tuples. Join predicates address the concatenated `left || right` row.
+#[derive(Clone)]
+pub enum JoinExpr {
+    Input {
+        input: JoinInput,
+        width: usize,
+    },
+    Join {
+        left: Box<JoinExpr>,
+        right: Box<JoinExpr>,
+        kind: JoinKind,
+        /// `None` only for `CROSS JOIN` / comma joins.
+        predicate: Option<BoundExpr>,
+    },
+}
+
+impl JoinExpr {
+    pub fn width(&self) -> usize {
+        match self {
+            JoinExpr::Input { width, .. } => *width,
+            JoinExpr::Join { left, right, .. } => left.width() + right.width(),
+        }
+    }
+}
+
 /// The row source feeding a [`LogicalPlan::Aggregate`]. `Scan` is a single base
-/// table; `SingleRow` is the one virtual row of a FROM-less aggregate
-/// (`SELECT count(*)`). The enum is the extension point for aggregates over
-/// joins / subqueries / SRFs, which are rejected for now.
+/// table; `Join` is a recursively joined FROM source; `SingleRow` is the one
+/// virtual row of a FROM-less aggregate (`SELECT count(*)`).
 #[derive(Clone)]
 pub enum AggInput {
     Scan(Arc<dyn TableAm>),
+    Join(JoinExpr),
     SingleRow,
 }
 
@@ -443,10 +478,6 @@ fn bind_ctes(
 }
 
 /// Bind the SELECT body (its FROM items, projections, WHERE, ORDER BY).
-///
-/// The FROM clause is first flattened into a list of relations: comma-separated
-/// items and `CROSS JOIN`s both contribute a cartesian-product input. Any other
-/// join (`INNER`/`LEFT`/... with `ON`/`USING`/`NATURAL`) is still rejected.
 fn bind_select(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -454,64 +485,28 @@ fn bind_select(
     order_by: &Option<ast::OrderBy>,
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
-    let relations = flatten_from(&select.from)?;
-    match relations.as_slice() {
-        [] => bind_values_select(catalog, select, order_by),
-        [relation] => bind_from_select(engine, catalog, relation, select, order_by, ctes),
-        _ => bind_cross_join(engine, catalog, &relations, select, order_by, ctes),
+    if select.from.is_empty() {
+        return bind_values_select(catalog, select, order_by);
     }
-}
-
-/// Flatten `FROM` into a list of relations, treating comma-separated items and
-/// `CROSS JOIN`s alike (both are cartesian products). Any join carrying a
-/// condition — `INNER`/`LEFT`/`RIGHT`/`FULL` with `ON`/`USING`, or `NATURAL` —
-/// is not supported yet.
-fn flatten_from(from: &[ast::TableWithJoins]) -> Result<Vec<&ast::TableFactor>, BindError> {
-    let mut relations = Vec::new();
-    for item in from {
-        relations.push(&item.relation);
-        for join in &item.joins {
-            match &join.join_operator {
-                ast::JoinOperator::CrossJoin(ast::JoinConstraint::None) => {
-                    relations.push(&join.relation);
-                }
-                _ => {
-                    return Err(BindError::feature_not_supported(
-                        "JOIN is not supported yet",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(relations)
-}
-
-/// Bind a SELECT over a single FROM item. Resolves the item to a row source
-/// with [`bind_from_item`], binds the projection/WHERE/ORDER BY against its
-/// one-relation scope, then wraps the source in the matching plan variant. The
-/// single-item plan shapes (`Query`/`Subquery`/`TableFunction`) are preserved;
-/// only the dispatch is shared with the cross-join path.
-fn bind_from_select(
-    engine: &Arc<dyn TableEngine>,
-    catalog: &Arc<dyn TypeCatalog>,
-    relation: &ast::TableFactor,
-    select: &ast::Select,
-    order_by: &Option<ast::OrderBy>,
-    ctes: &CteEnv,
-) -> Result<LogicalPlan, BindError> {
-    let item = bind_from_item(engine, catalog, relation, ctes)?;
-    let scope = Scope::relations(vec![(item.qualifier, to_columns(&item.columns))], catalog);
+    let BoundFrom { source, relations } =
+        bind_from_clause(engine, catalog, &select.from, ctes)?;
+    let scope = Scope::relations(relations, catalog);
     let body = bind_select_body(select, order_by, &scope)?;
-    // An aggregating SELECT wraps the source in an Aggregate node. Only a base
-    // table scan is supported as the source for now.
     if let Some(agg) = body.aggregation {
-        let JoinInput::Scan(table) = item.input else {
-            return Err(BindError::feature_not_supported(
-                "aggregates over this FROM form are not supported yet",
-            ));
+        let input = match source {
+            JoinExpr::Input {
+                input: JoinInput::Scan(table),
+                ..
+            } => AggInput::Scan(table),
+            source @ JoinExpr::Join { .. } => AggInput::Join(source),
+            JoinExpr::Input { .. } => {
+                return Err(BindError::feature_not_supported(
+                    "aggregates over this FROM form are not supported yet",
+                ));
+            }
         };
         return Ok(LogicalPlan::Aggregate {
-            input: AggInput::Scan(table),
+            input,
             predicate: body.predicate,
             group_exprs: agg.group_exprs,
             aggregates: agg.aggregates,
@@ -521,7 +516,22 @@ fn bind_from_select(
             sort: body.sort,
         });
     }
-    Ok(match item.input {
+    Ok(match source {
+        JoinExpr::Input { input, .. } => finish_single_select(input, body),
+        source @ JoinExpr::Join { .. } => LogicalPlan::Join {
+            source,
+            columns: body.columns,
+            projections: body.projections,
+            predicate: body.predicate,
+            sort: body.sort,
+        },
+    })
+}
+
+/// Preserve the compact single-source plan variants when FROM contains no
+/// comma or explicit join.
+fn finish_single_select(input: JoinInput, body: SelectBody) -> LogicalPlan {
+    match input {
         JoinInput::Scan(table) => LogicalPlan::Query {
             table,
             columns: body.columns,
@@ -544,7 +554,7 @@ fn bind_from_select(
             predicate: body.predicate,
             sort: body.sort,
         },
-    })
+    }
 }
 
 /// Convert a rowset's output columns into storage `Column`s for a [`Scope`].
@@ -564,9 +574,29 @@ struct BoundFromItem {
     input: JoinInput,
 }
 
-/// Resolve one FROM item to a [`BoundFromItem`] — the same dispatch as
-/// [`bind_from_select`], but producing a bare row source (no projection
-/// pipeline) so several can be combined into a cross join.
+/// A bound FROM clause (or one comma-delimited `TableWithJoins` group): its
+/// executable row-source tree and the flat relation namespace exposed to
+/// projection/WHERE/GROUP BY binding.
+struct BoundFrom {
+    source: JoinExpr,
+    relations: Vec<(String, Vec<Column>)>,
+}
+
+impl BoundFromItem {
+    fn into_bound_from(self) -> BoundFrom {
+        let width = self.columns.len();
+        BoundFrom {
+            source: JoinExpr::Input {
+                input: self.input,
+                width,
+            },
+            relations: vec![(self.qualifier, to_columns(&self.columns))],
+        }
+    }
+}
+
+/// Resolve one FROM item to a [`BoundFromItem`], producing a bare row source
+/// (no projection pipeline) so several can be combined into a join tree.
 fn bind_from_item(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -695,47 +725,149 @@ fn aliased_qualifier(
     }
 }
 
-/// Bind a SELECT over the cartesian product of two or more FROM items. Each
-/// item becomes a join input and a relation in a combined [`Scope`]; the
-/// projection/WHERE/ORDER BY then bind across all of them at once, with
-/// `ColumnRef`s indexing the concatenated row. Two items with the same
-/// qualifier are rejected (`42712`), as in PG.
-fn bind_cross_join(
+/// Bind all comma-separated FROM groups. Each group owns its JOIN/ON namespace;
+/// only after its explicit join chain is complete is it combined with prior
+/// groups by a cross join. This makes `a, b JOIN c ON a.x = c.x` reject `a` in
+/// ON, matching SQL's join nesting rules.
+fn bind_from_clause(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
-    relations: &[&ast::TableFactor],
-    select: &ast::Select,
-    order_by: &Option<ast::OrderBy>,
+    from: &[ast::TableWithJoins],
     ctes: &CteEnv,
-) -> Result<LogicalPlan, BindError> {
-    let mut inputs = Vec::with_capacity(relations.len());
-    let mut scope_rels: Vec<(String, Vec<Column>)> = Vec::with_capacity(relations.len());
+) -> Result<BoundFrom, BindError> {
+    let mut combined: Option<JoinExpr> = None;
+    let mut relations = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for relation in relations {
-        let item = bind_from_item(engine, catalog, relation, ctes)?;
-        if !seen.insert(item.qualifier.clone()) {
-            return Err(BindError::new(
-                sqlstate::DUPLICATE_ALIAS,
-                format!("table name \"{}\" specified more than once", item.qualifier),
+    for table in from {
+        let group = bind_table_with_joins(engine, catalog, table, ctes)?;
+        for (qualifier, _) in &group.relations {
+            ensure_unique_qualifier(&mut seen, qualifier)?;
+        }
+        relations.extend(group.relations);
+        combined = Some(match combined {
+            None => group.source,
+            Some(left) => JoinExpr::Join {
+                left: Box::new(left),
+                right: Box::new(group.source),
+                kind: JoinKind::Cross,
+                predicate: None,
+            },
+        });
+    }
+    Ok(BoundFrom {
+        source: combined.expect("non-empty FROM checked by bind_select"),
+        relations,
+    })
+}
+
+/// Bind one left-associative explicit join chain. Each ON clause sees the
+/// accumulated left side and the newly-added right factor, but no relations
+/// from other comma-delimited FROM groups.
+fn bind_table_with_joins(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    table: &ast::TableWithJoins,
+    ctes: &CteEnv,
+) -> Result<BoundFrom, BindError> {
+    let mut bound = bind_from_item(engine, catalog, &table.relation, ctes)?.into_bound_from();
+    let mut seen: HashSet<String> = bound
+        .relations
+        .iter()
+        .map(|(qualifier, _)| qualifier.clone())
+        .collect();
+
+    for join in &table.joins {
+        if join.global {
+            return Err(BindError::feature_not_supported(
+                "GLOBAL JOIN is not supported yet",
             ));
         }
-        scope_rels.push((item.qualifier, to_columns(&item.columns)));
-        inputs.push(item.input);
+        let right = bind_from_item(engine, catalog, &join.relation, ctes)?.into_bound_from();
+        let right_qualifier = &right.relations[0].0;
+        ensure_unique_qualifier(&mut seen, right_qualifier)?;
+
+        let (kind, on) = join_kind_and_on(&join.join_operator)?;
+        let predicate = if let Some(on) = on {
+            let mut on_relations = bound.relations.clone();
+            on_relations.extend(right.relations.clone());
+            let scope = Scope::relations(on_relations, catalog);
+            let binding = bind_expr(on, &scope)?;
+            if matches!(
+                &binding,
+                crate::Binding::Typed(expr) if expr.contains_aggregate()
+            ) {
+                return Err(BindError::new(
+                    sqlstate::GROUPING_ERROR,
+                    "aggregate functions are not allowed in JOIN conditions",
+                ));
+            }
+            Some(to_bool_operand(binding, "JOIN/ON")?)
+        } else {
+            None
+        };
+        bound.source = JoinExpr::Join {
+            left: Box::new(bound.source),
+            right: Box::new(right.source),
+            kind,
+            predicate,
+        };
+        bound.relations.extend(right.relations);
     }
-    let scope = Scope::relations(scope_rels, catalog);
-    let body = bind_select_body(select, order_by, &scope)?;
-    if body.aggregation.is_some() {
-        return Err(BindError::feature_not_supported(
-            "aggregates over a join are not supported yet",
-        ));
+    Ok(bound)
+}
+
+fn ensure_unique_qualifier(
+    seen: &mut HashSet<String>,
+    qualifier: &str,
+) -> Result<(), BindError> {
+    if seen.insert(qualifier.to_string()) {
+        Ok(())
+    } else {
+        Err(BindError::new(
+            sqlstate::DUPLICATE_ALIAS,
+            format!("table name \"{qualifier}\" specified more than once"),
+        ))
     }
-    Ok(LogicalPlan::Join {
-        inputs,
-        columns: body.columns,
-        projections: body.projections,
-        predicate: body.predicate,
-        sort: body.sort,
-    })
+}
+
+/// Accept the PostgreSQL ON-join surface implemented by the executor. USING
+/// and NATURAL need a merged-column namespace and remain a separate feature.
+fn join_kind_and_on(
+    operator: &ast::JoinOperator,
+) -> Result<(JoinKind, Option<&ast::Expr>), BindError> {
+    use ast::{JoinConstraint, JoinOperator};
+
+    fn with_on(
+        kind: JoinKind,
+        constraint: &JoinConstraint,
+    ) -> Result<(JoinKind, Option<&ast::Expr>), BindError> {
+        match constraint {
+            JoinConstraint::On(expr) => Ok((kind, Some(expr))),
+            JoinConstraint::Using(_) => Err(BindError::feature_not_supported(
+                "JOIN USING is not supported yet",
+            )),
+            JoinConstraint::Natural => Err(BindError::feature_not_supported(
+                "NATURAL JOIN is not supported yet",
+            )),
+            JoinConstraint::None => Err(BindError::feature_not_supported(
+                "JOIN without ON is not supported yet",
+            )),
+        }
+    }
+
+    match operator {
+        JoinOperator::Join(c) | JoinOperator::Inner(c) => with_on(JoinKind::Inner, c),
+        JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => with_on(JoinKind::Left, c),
+        JoinOperator::Right(c) | JoinOperator::RightOuter(c) => with_on(JoinKind::Right, c),
+        JoinOperator::FullOuter(c) => with_on(JoinKind::Full, c),
+        JoinOperator::CrossJoin(JoinConstraint::None) => Ok((JoinKind::Cross, None)),
+        JoinOperator::CrossJoin(_) => Err(BindError::feature_not_supported(
+            "CROSS JOIN constraints are not supported yet",
+        )),
+        _ => Err(BindError::feature_not_supported(
+            "join operator is not supported yet",
+        )),
+    }
 }
 
 /// A standalone `VALUES (...), (...)` list. Column names default to
@@ -3169,7 +3301,7 @@ mod tests {
     fn cross_join_builds_join_plan_with_offsets() {
         // Two derived tables: a(x) at offset 0, b(y) at offset 1.
         let LogicalPlan::Join {
-            inputs,
+            source,
             columns,
             projections,
             ..
@@ -3177,7 +3309,14 @@ mod tests {
         else {
             panic!("expected Join");
         };
-        assert_eq!(inputs.len(), 2);
+        assert!(matches!(
+            source,
+            JoinExpr::Join {
+                kind: JoinKind::Cross,
+                predicate: None,
+                ..
+            }
+        ));
         assert_eq!(
             projections[0],
             BoundExpr::ColumnRef {
@@ -3258,19 +3397,147 @@ mod tests {
 
     #[test]
     fn explicit_cross_join_flattens_like_a_comma() {
-        let LogicalPlan::Join { inputs, .. } =
+        let LogicalPlan::Join { source, .. } =
             bind_one("SELECT * FROM (VALUES (1)) a(x) CROSS JOIN (VALUES (2)) b(y)").unwrap()
         else {
             panic!("expected Join");
         };
-        assert_eq!(inputs.len(), 2);
+        assert!(matches!(
+            source,
+            JoinExpr::Join {
+                kind: JoinKind::Cross,
+                predicate: None,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn inner_join_with_condition_stays_0a000() {
-        let e = bind_err("SELECT * FROM t a JOIN t b ON a.id = b.id");
-        assert_eq!(e.code, "0A000");
-        assert_eq!(e.message, "JOIN is not supported yet");
+    fn on_join_kinds_bind_boolean_predicates() {
+        for (sql, expected) in [
+            ("SELECT * FROM t a JOIN t b ON a.id = b.id", JoinKind::Inner),
+            ("SELECT * FROM t a LEFT JOIN t b ON a.id = b.id", JoinKind::Left),
+            ("SELECT * FROM t a RIGHT OUTER JOIN t b ON a.id = b.id", JoinKind::Right),
+            ("SELECT * FROM t a FULL JOIN t b ON a.id = b.id", JoinKind::Full),
+        ] {
+            let LogicalPlan::Join { source, .. } = bind_one(sql).unwrap() else {
+                panic!("expected Join for {sql}");
+            };
+            let JoinExpr::Join {
+                kind, predicate, ..
+            } = source
+            else {
+                panic!("expected binary join for {sql}");
+            };
+            assert_eq!(kind, expected, "{sql}");
+            assert!(matches!(
+                predicate,
+                Some(BoundExpr::Binary {
+                    op: BinOp::Eq,
+                    arg_ty: PgType::Int4,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn chained_join_is_left_associative_and_offsets_keep_growing() {
+        let LogicalPlan::Join {
+            source,
+            projections,
+            ..
+        } = bind_one(
+            "SELECT c.z FROM (VALUES (1)) a(x) \
+             LEFT JOIN (VALUES (1)) b(y) ON a.x = b.y \
+             JOIN (VALUES (1)) c(z) ON b.y = c.z",
+        )
+        .unwrap()
+        else {
+            panic!("expected Join");
+        };
+        let JoinExpr::Join {
+            left,
+            kind: JoinKind::Inner,
+            ..
+        } = source
+        else {
+            panic!("expected top inner join");
+        };
+        assert!(matches!(
+            *left,
+            JoinExpr::Join {
+                kind: JoinKind::Left,
+                ..
+            }
+        ));
+        assert_eq!(
+            projections[0],
+            BoundExpr::ColumnRef {
+                index: 2,
+                ty: PgType::Int4
+            }
+        );
+    }
+
+    #[test]
+    fn join_on_scope_excludes_prior_comma_group() {
+        let e = bind_err(
+            "SELECT * FROM (VALUES (1)) a(x), \
+             (VALUES (1)) b(y) JOIN (VALUES (1)) c(z) ON a.x = c.z",
+        );
+        assert_eq!(e.code, "42P01");
+        assert_eq!(e.message, "missing FROM-clause entry for table \"a\"");
+    }
+
+    #[test]
+    fn join_on_must_be_boolean() {
+        let e = bind_err("SELECT * FROM t a JOIN t b ON a.id");
+        assert_eq!(e.code, "42804");
+        assert_eq!(
+            e.message,
+            "argument of JOIN/ON must be type boolean, not type integer"
+        );
+    }
+
+    #[test]
+    fn aggregate_in_join_on_is_rejected() {
+        let e = bind_err("SELECT * FROM t a JOIN t b ON count(*) > 0");
+        assert_eq!(e.code, "42803");
+        assert_eq!(
+            e.message,
+            "aggregate functions are not allowed in JOIN conditions"
+        );
+    }
+
+    #[test]
+    fn using_and_natural_join_remain_0a000() {
+        let using = bind_err("SELECT * FROM t a JOIN t b USING (id)");
+        assert_eq!(using.code, "0A000");
+        assert_eq!(using.message, "JOIN USING is not supported yet");
+        let natural = bind_err("SELECT * FROM t a NATURAL JOIN t b");
+        assert_eq!(natural.code, "0A000");
+        assert_eq!(natural.message, "NATURAL JOIN is not supported yet");
+    }
+
+    #[test]
+    fn aggregate_accepts_join_input() {
+        let LogicalPlan::Aggregate {
+            input: AggInput::Join(source),
+            aggregates,
+            ..
+        } = bind_one("SELECT count(*) FROM t a LEFT JOIN t b ON a.id = b.id").unwrap()
+        else {
+            panic!("expected Aggregate over Join");
+        };
+        assert_eq!(aggregates.len(), 1);
+        assert!(matches!(
+            source,
+            JoinExpr::Join {
+                kind: JoinKind::Left,
+                ..
+            }
+        ));
     }
 
     #[test]

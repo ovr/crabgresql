@@ -27,18 +27,20 @@ What exists today:
   sqlparser-rs with the PG dialect; the binder resolves names and infers
   types with PG semantics (int4/int8 promotion, untyped-literal coercion,
   `unknown` handling, PG error messages and SQLSTATEs), the planner maps the
-  logical plan 1:1 onto scan pipelines. Supported: FROM-less and single-table
-  `SELECT` with expressions and `WHERE`, `CREATE TABLE [IF NOT EXISTS]`,
+  logical plan onto scan pipelines. Supported: FROM-less and table-backed
+  `SELECT` with expressions, filtering, ordering, limits, grouping/aggregates,
+  comma/`CROSS JOIN`, and `INNER`/`LEFT`/`RIGHT`/`FULL JOIN ... ON`;
+  `CREATE TABLE [IF NOT EXISTS]`,
   atomic `INSERT ... VALUES`, `UPDATE ... SET ... [WHERE]`,
-  `DELETE FROM ... [WHERE]`, no-op `SET`. int4/int8/text/bool only. Anything
-  parsed but not executed (ORDER BY, GROUP BY, LIMIT, JOIN, constraints,
-  casts, ...) errors with `0A000` instead of being silently ignored.
+  `DELETE FROM ... [WHERE]`, and no-op `SET`. Anything parsed but not executed
+  (including `JOIN USING`/`NATURAL JOIN` and constraints) errors with `0A000`
+  instead of being silently ignored.
 - **Expressions** (`crabgresql-executor::eval`): comparisons, `AND`/`OR`/`NOT`
   with SQL three-valued NULL logic, `IS [NOT] NULL`, int4/int8 arithmetic
   with PG overflow (`22003`) and division-by-zero (`22012`) behavior.
 - **Execution** (`crabgresql-executor`): Volcano iterator nodes — `Values`,
-  `SeqScan`, `Filter`, `Projection` — plus buffered (statement-atomic)
-  INSERT/UPDATE/DELETE.
+  `SeqScan`, `Filter`, `Projection`, nested-loop joins, aggregation, sorting,
+  and limits — plus buffered (statement-atomic) INSERT/UPDATE/DELETE.
 - **Storage** (`crabgresql-storage-api` + `crabgresql-memory-storage`): the
   pluggable `TableEngine`/`TableAm` API — tid-addressed scan/insert/update/
   delete — and its in-memory reference engine (copy-on-write snapshots,

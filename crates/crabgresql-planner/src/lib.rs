@@ -7,7 +7,8 @@
 use std::sync::Arc;
 
 use crabgresql_binder::{
-    AggInput, BoundAggregate, BoundExpr, JoinInput, LogicalPlan, OutputColumn, SortKey, TableFn,
+    AggInput, BoundAggregate, BoundExpr, JoinExpr, JoinInput, JoinKind, LogicalPlan, OutputColumn,
+    SortKey, TableFn,
 };
 use crabgresql_storage_api::TableAm;
 
@@ -42,10 +43,10 @@ pub enum PhysicalPlan {
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
     },
-    /// Cartesian product of two or more inputs, then the standard
-    /// Filter → Projection → Sort tail. Mirrors [`LogicalPlan::Join`].
+    /// Recursive joined row source, then the standard Filter → Projection →
+    /// Sort tail. Mirrors [`LogicalPlan::Join`].
     Join {
-        inputs: Vec<PhysicalJoinInput>,
+        source: PhysicalJoinExpr,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -95,9 +96,33 @@ pub enum PhysicalJoinInput {
     TableFunction { func: TableFn, args: Vec<BoundExpr> },
 }
 
+/// A [`JoinExpr`] whose leaf subplans have already been physically planned.
+pub enum PhysicalJoinExpr {
+    Input {
+        input: PhysicalJoinInput,
+        width: usize,
+    },
+    Join {
+        left: Box<PhysicalJoinExpr>,
+        right: Box<PhysicalJoinExpr>,
+        kind: JoinKind,
+        predicate: Option<BoundExpr>,
+    },
+}
+
+impl PhysicalJoinExpr {
+    pub fn width(&self) -> usize {
+        match self {
+            PhysicalJoinExpr::Input { width, .. } => *width,
+            PhysicalJoinExpr::Join { left, right, .. } => left.width() + right.width(),
+        }
+    }
+}
+
 /// The row source of a [`PhysicalPlan::Aggregate`], mirroring [`AggInput`].
 pub enum PhysicalAggInput {
     Scan(Arc<dyn TableAm>),
+    Join(PhysicalJoinExpr),
     SingleRow,
 }
 
@@ -108,6 +133,26 @@ fn plan_join_input(input: JoinInput) -> PhysicalJoinInput {
         JoinInput::TableFunction { func, args } => {
             PhysicalJoinInput::TableFunction { func, args }
         }
+    }
+}
+
+fn plan_join_expr(source: JoinExpr) -> PhysicalJoinExpr {
+    match source {
+        JoinExpr::Input { input, width } => PhysicalJoinExpr::Input {
+            input: plan_join_input(input),
+            width,
+        },
+        JoinExpr::Join {
+            left,
+            right,
+            kind,
+            predicate,
+        } => PhysicalJoinExpr::Join {
+            left: Box::new(plan_join_expr(*left)),
+            right: Box::new(plan_join_expr(*right)),
+            kind,
+            predicate,
+        },
     }
 }
 
@@ -166,13 +211,13 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             sort,
         },
         LogicalPlan::Join {
-            inputs,
+            source,
             columns,
             projections,
             predicate,
             sort,
         } => PhysicalPlan::Join {
-            inputs: inputs.into_iter().map(plan_join_input).collect(),
+            source: plan_join_expr(source),
             columns,
             projections,
             predicate,
@@ -190,6 +235,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         } => PhysicalPlan::Aggregate {
             input: match input {
                 AggInput::Scan(table) => PhysicalAggInput::Scan(table),
+                AggInput::Join(source) => PhysicalAggInput::Join(plan_join_expr(source)),
                 AggInput::SingleRow => PhysicalAggInput::SingleRow,
             },
             predicate,
@@ -392,14 +438,40 @@ mod tests {
 
     #[test]
     fn cross_join_maps_to_physical_join() {
-        let PhysicalPlan::Join { inputs, columns, .. } =
+        let PhysicalPlan::Join { source, columns, .. } =
             plan_sql("SELECT * FROM t, (VALUES (1)) v(x)")
         else {
             panic!("expected Join");
         };
-        assert_eq!(inputs.len(), 2);
+        assert!(matches!(
+            source,
+            PhysicalJoinExpr::Join {
+                kind: JoinKind::Cross,
+                predicate: None,
+                ..
+            }
+        ));
         // t's three columns plus v's one.
         assert_eq!(columns.len(), 4);
+    }
+
+    #[test]
+    fn outer_join_and_aggregate_input_map_recursively() {
+        let PhysicalPlan::Aggregate {
+            input: PhysicalAggInput::Join(source),
+            ..
+        } = plan_sql("SELECT count(*) FROM t a FULL JOIN t b ON a.id = b.id")
+        else {
+            panic!("expected Aggregate over Join");
+        };
+        assert!(matches!(
+            source,
+            PhysicalJoinExpr::Join {
+                kind: JoinKind::Full,
+                predicate: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]

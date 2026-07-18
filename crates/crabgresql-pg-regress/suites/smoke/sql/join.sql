@@ -36,3 +36,36 @@ SELECT * FROM t1 AS r(c1) ORDER BY 1;
 SELECT c2 FROM t1 AS r(c1, c2) WHERE c1 = 2;
 -- more column aliases than the table has columns is an error
 SELECT * FROM t1 AS r(a, b, c);
+
+-- explicit INNER JOIN ... ON preserves duplicate matches and does not match
+-- NULL join keys
+SELECT a.x, b.y
+FROM (VALUES (1), (2), (NULL)) a(x)
+INNER JOIN (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y
+ORDER BY a.x NULLS LAST, b.y NULLS LAST;
+-- LEFT JOIN null-extends unmatched rows from the left input
+SELECT a.x, b.y
+FROM (VALUES (1), (2), (NULL)) a(x)
+LEFT JOIN (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y
+ORDER BY a.x NULLS LAST, b.y NULLS LAST;
+-- RIGHT OUTER JOIN null-extends unmatched rows from the right input
+SELECT a.x, b.y
+FROM (VALUES (1), (2), (NULL)) a(x)
+RIGHT OUTER JOIN (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y
+ORDER BY a.x NULLS LAST, b.y NULLS LAST;
+-- FULL OUTER JOIN preserves unmatched rows from both inputs
+SELECT a.x, b.y
+FROM (VALUES (1), (2), (NULL)) a(x)
+FULL OUTER JOIN (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y
+ORDER BY a.x NULLS LAST, b.y NULLS LAST;
+-- a later join in the chain sees the null-extended output of the prior join
+SELECT a.x, b.y, c.z
+FROM (VALUES (1)) a(x)
+LEFT JOIN (VALUES (9)) b(y) ON false
+JOIN (VALUES (2)) c(z) ON b.y IS NULL
+ORDER BY 1, 3;
+-- joins are valid aggregate inputs; count(expr) ignores null-extended values
+SELECT count(*), count(b.y)
+FROM (VALUES (1), (2), (NULL)) a(x)
+LEFT JOIN (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y;
+-- end ON-join coverage
