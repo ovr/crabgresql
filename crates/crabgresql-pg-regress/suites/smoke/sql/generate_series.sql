@@ -22,5 +22,21 @@ SELECT generate_series(4000000000, 4000000002);
 -- filtering and ordering over the FROM-position rows
 SELECT generate_series FROM generate_series(1, 6) WHERE generate_series % 2 = 0;
 SELECT * FROM generate_series(1, 4) ORDER BY 1 DESC;
--- a zero step is an error
+-- numeric overload: a fractional step; the start keeps its scale
+SELECT generate_series(1, 3, 0.5);
+-- numeric two-arg form defaults the step to 1
+SELECT generate_series(1.5, 3);
+-- numeric counting down with a negative step
+SELECT generate_series(3.0, 1.0, -0.5);
+-- timestamp stepped by an interval (3-arg only)
+SELECT * FROM generate_series(timestamp '2020-01-01', timestamp '2020-01-04', interval '1 day');
+-- a whole-month step clamps the day of month, incrementally
+SELECT generate_series(timestamp '2020-01-31', timestamp '2020-04-30', interval '1 month');
+-- timestamptz (UTC session) stepped by an interval
+SELECT generate_series(timestamptz '2020-01-01 00:00+00', timestamptz '2020-01-03 00:00+00', interval '1 day');
+-- a zero step is an error, for every overload
 SELECT generate_series(1, 5, 0);
+SELECT generate_series(1.0, 3.0, 0.0);
+SELECT generate_series(timestamp '2020-01-01', timestamp '2020-01-05', interval '0');
+-- a NaN numeric bound is an error
+SELECT generate_series('NaN'::numeric, 3);

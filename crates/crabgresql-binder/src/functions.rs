@@ -248,25 +248,44 @@ pub(crate) fn bind_table_fn_call(
     Err(undefined_function(name, &bindings))
 }
 
-/// Resolve a `generate_series(start, stop [, step])` call to its integer element
-/// type and coerced arguments. Supported element types are `int4` and `int8`
-/// (numeric/timestamp overloads are not implemented yet); every argument takes
-/// the element type. Returns a `42883` "does not exist" error for any other
-/// arity or argument type. Shared by FROM-position and target-list binding.
+/// Resolve a `generate_series(start, stop [, step])` call to its element type
+/// and coerced arguments. Supported overloads:
+/// - `int4`/`int8`/`numeric` — 2 or 3 args, all of the element type;
+/// - `timestamp`/`timestamptz` — 3 args `(elem, elem, interval)`.
+///
+/// The element type is the output column's type. Returns a `42883` "does not
+/// exist" error for any other arity or argument type. Shared by FROM-position
+/// and target-list binding.
 pub(crate) fn resolve_generate_series(
     bindings: &[Binding],
 ) -> Result<(PgType, Vec<BoundExpr>), BindError> {
-    if bindings.len() != 2 && bindings.len() != 3 {
+    let arity = bindings.len();
+    if arity != 2 && arity != 3 {
         return Err(undefined_function("generate_series", bindings));
     }
-    // int4 before int8, exact-type before coercing — so `generate_series(1, 5)`
-    // (int4 literals) stays int4, while a bigint argument widens the series to
-    // int8. Mirrors the scalar overload policy in `bind_function`.
-    for elem in [PgType::Int4, PgType::Int8] {
-        let params = vec![elem; bindings.len()];
+    // Uniform numeric overloads: every argument (bounds and step) is the element
+    // type. int4 before int8 before numeric, and exact-type before coercing — so
+    // `generate_series(1, 5)` (int4 literals) stays int4, a bigint bound widens
+    // to int8, and a decimal argument (typed numeric) picks numeric. Mirrors the
+    // scalar overload policy in `bind_function`.
+    for elem in [PgType::Int4, PgType::Int8, PgType::Numeric] {
+        let params = vec![elem; arity];
         for exact_only in [true, false] {
             if let Some(args) = try_coerce_args(bindings, &params, exact_only) {
                 return Ok((elem, args));
+            }
+        }
+    }
+    // Temporal overloads: 3 args `(elem, elem, interval)`, stepping a timestamp
+    // by an interval. A 2-arg timestamp call matches nothing here and falls
+    // through to the `42883` error, as in PG.
+    if arity == 3 {
+        for elem in [TS, TSTZ] {
+            let params = [elem, elem, IV];
+            for exact_only in [true, false] {
+                if let Some(args) = try_coerce_args(bindings, &params, exact_only) {
+                    return Ok((elem, args));
+                }
             }
         }
     }

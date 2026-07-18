@@ -1739,6 +1739,50 @@ mod tests {
         assert!(matches!(projections[1], BoundExpr::Srf { .. }));
     }
 
+    fn table_fn(sql: &str) -> (crate::TableFn, Vec<OutputColumn>) {
+        let LogicalPlan::TableFunction { func, columns, .. } = bind_one(sql).unwrap() else {
+            panic!("expected TableFunction");
+        };
+        (func, columns)
+    }
+
+    #[test]
+    fn generate_series_numeric_overload_binds() {
+        // A decimal argument (typed numeric) selects the numeric overload.
+        let (func, columns) = table_fn("SELECT * FROM generate_series(1, 3, 0.5)");
+        assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Numeric));
+        assert_eq!(columns[0].name, "generate_series");
+        assert_eq!(columns[0].ty, PgType::Numeric);
+    }
+
+    #[test]
+    fn generate_series_timestamp_overload_binds() {
+        let (func, columns) = table_fn(
+            "SELECT * FROM generate_series(timestamp '2020-01-01', \
+             timestamp '2020-01-05', interval '1 day')",
+        );
+        assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Timestamp));
+        assert_eq!(columns[0].ty, PgType::Timestamp);
+    }
+
+    #[test]
+    fn generate_series_timestamptz_overload_binds() {
+        let (func, _columns) = table_fn(
+            "SELECT * FROM generate_series(timestamptz '2020-01-01+00', \
+             timestamptz '2020-01-05+00', interval '1 day')",
+        );
+        assert_eq!(func, crate::TableFn::GenerateSeries(PgType::TimestampTz));
+    }
+
+    #[test]
+    fn generate_series_timestamp_requires_three_args() {
+        // The timestamp overload has no 2-arg form: PG rejects it as 42883.
+        let e = bind_err(
+            "SELECT * FROM generate_series(timestamp '2020-01-01', timestamp '2020-01-05')",
+        );
+        assert_eq!(e.code, "42883");
+    }
+
     #[test]
     fn standalone_values_binds_to_values_plan() {
         let LogicalPlan::Values { columns, rows, .. } =

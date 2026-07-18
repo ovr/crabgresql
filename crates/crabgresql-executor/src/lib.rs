@@ -357,7 +357,7 @@ impl ExecNode for TableFunctionSource {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
         match self.init()? {
             TableFnState::Single(row) => Ok(row.take()),
-            TableFnState::Series(series) => Ok(series.next_value().map(|v| vec![v])),
+            TableFnState::Series(series) => Ok(series.next_value()?.map(|v| vec![v])),
         }
     }
 }
@@ -717,7 +717,10 @@ impl ExecNode for ProjectSet {
             let mut srf_vals: Vec<Option<Value>> = Vec::with_capacity(exp.series.len());
             let mut any = false;
             for slot in exp.series.iter_mut() {
-                let value = slot.as_mut().and_then(Series::next_value);
+                let value = match slot {
+                    Some(series) => series.next_value()?,
+                    None => None,
+                };
                 any |= value.is_some();
                 srf_vals.push(value);
             }
@@ -1304,6 +1307,129 @@ mod tests {
         assert!(pairs.contains(&(Value::Int4(1), Value::Int4(1))));
         assert!(pairs.contains(&(Value::Int4(1), Value::Int4(2))));
         assert!(pairs.contains(&(Value::Int4(3), Value::Int4(2))));
+    }
+
+    /// The single generate_series column, rendered as PG-formatted text.
+    fn series_text(rows: &[Tuple]) -> Vec<String> {
+        rows.iter()
+            .map(|r| r[0].encode_text_with(1).unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn generate_series_numeric_range_keeps_scale() {
+        // The start keeps its scale ("1"); adding 0.5 gives scale 1 thereafter.
+        let (columns, rows) = run_rows("SELECT generate_series(1, 3, 0.5)");
+        assert_eq!(columns[0].ty, PgType::Numeric);
+        assert_eq!(series_text(&rows), ["1", "1.5", "2.0", "2.5", "3.0"]);
+    }
+
+    #[test]
+    fn generate_series_numeric_default_step_and_backward() {
+        // 2-arg numeric defaults the step to 1.
+        let (_c, rows) = run_rows("SELECT generate_series(1.5, 3)");
+        assert_eq!(series_text(&rows), ["1.5", "2.5"]);
+        // A negative numeric step counts down.
+        let (_c, rows) = run_rows("SELECT generate_series(3.0, 1.0, -0.5)");
+        assert_eq!(series_text(&rows), ["3.0", "2.5", "2.0", "1.5", "1.0"]);
+    }
+
+    #[test]
+    fn generate_series_numeric_nan_bounds_error_22023() {
+        for (sql, msg) in [
+            ("SELECT generate_series('NaN'::numeric, 3)", "start value cannot be NaN"),
+            ("SELECT generate_series(1, 'NaN'::numeric)", "stop value cannot be NaN"),
+            (
+                "SELECT generate_series(1, 3, 'NaN'::numeric)",
+                "step size cannot be NaN",
+            ),
+        ] {
+            let e = run_err(sql);
+            assert_eq!(e.code, "22023", "{sql}");
+            assert_eq!(e.message, msg, "{sql}");
+        }
+    }
+
+    #[test]
+    fn generate_series_timestamp_forward_and_backward() {
+        let (columns, rows) = run_rows(
+            "SELECT generate_series(timestamp '2020-01-01', timestamp '2020-01-04', \
+             interval '1 day')",
+        );
+        assert_eq!(columns[0].ty, PgType::Timestamp);
+        assert_eq!(
+            series_text(&rows),
+            [
+                "2020-01-01 00:00:00",
+                "2020-01-02 00:00:00",
+                "2020-01-03 00:00:00",
+                "2020-01-04 00:00:00",
+            ]
+        );
+        // A negative interval steps backward.
+        let (_c, rows) = run_rows(
+            "SELECT generate_series(timestamp '2020-01-03', timestamp '2020-01-01', \
+             interval '-1 day')",
+        );
+        assert_eq!(
+            series_text(&rows),
+            ["2020-01-03 00:00:00", "2020-01-02 00:00:00", "2020-01-01 00:00:00"]
+        );
+    }
+
+    #[test]
+    fn generate_series_timestamp_month_step_clamps_day() {
+        // pl_interval clamps the day-of-month, incrementally from cur.
+        let (_c, rows) = run_rows(
+            "SELECT generate_series(timestamp '2020-01-31', timestamp '2020-04-30', \
+             interval '1 month')",
+        );
+        assert_eq!(
+            series_text(&rows),
+            [
+                "2020-01-31 00:00:00",
+                "2020-02-29 00:00:00",
+                "2020-03-29 00:00:00",
+                "2020-04-29 00:00:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn generate_series_timestamp_zero_interval_is_22023() {
+        let e = run_err(
+            "SELECT generate_series(timestamp '2020-01-01', timestamp '2020-01-05', interval '0')",
+        );
+        assert_eq!(e.code, "22023");
+        assert_eq!(e.message, "step size cannot equal zero");
+    }
+
+    #[test]
+    fn generate_series_timestamp_overflow_is_22008() {
+        // Stepping past the max timestamp raises rather than silently stopping.
+        let e = run_err(
+            "SELECT generate_series(timestamp '294276-12-30', timestamp '294276-12-31', \
+             interval '1 day')",
+        );
+        assert_eq!(e.code, "22008");
+        assert_eq!(e.message, "timestamp out of range");
+    }
+
+    #[test]
+    fn generate_series_timestamptz_forward_range() {
+        let (columns, rows) = run_rows(
+            "SELECT generate_series(timestamptz '2020-01-01 00:00+00', \
+             timestamptz '2020-01-03 00:00+00', interval '1 day')",
+        );
+        assert_eq!(columns[0].ty, PgType::TimestampTz);
+        assert_eq!(
+            series_text(&rows),
+            [
+                "2020-01-01 00:00:00+00",
+                "2020-01-02 00:00:00+00",
+                "2020-01-03 00:00:00+00",
+            ]
+        );
     }
 
     /// A `nums(n int4)` table seeded with 1, 2, 3.
