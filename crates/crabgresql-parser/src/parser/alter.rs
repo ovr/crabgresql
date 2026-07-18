@@ -24,7 +24,7 @@ use crate::{
         AlterUserPassword, AlterUserRemoveRoleDelegation, AlterUserSetPolicy, Expr, MfaMethodKind,
         Password, ResetConfig, RoleOption, SetConfigValue, Statement, UserPolicyKind,
     },
-    dialect::{MsSqlDialect, PostgreSqlDialect},
+    dialect::PostgreSqlDialect,
     keywords::Keyword,
     tokenizer::Token,
 };
@@ -34,12 +34,10 @@ impl Parser<'_> {
     pub fn parse_alter_role(&mut self) -> Result<Statement, ParserError> {
         if dialect_of!(self is PostgreSqlDialect) {
             return self.parse_pg_alter_role();
-        } else if dialect_of!(self is MsSqlDialect) {
-            return self.parse_mssql_alter_role();
         }
 
         Err(ParserError::ParserError(
-            "ALTER ROLE is only support for PostgreSqlDialect, MsSqlDialect".into(),
+            "ALTER ROLE is only support for PostgreSqlDialect".into(),
         ))
     }
 
@@ -342,32 +340,6 @@ impl Parser<'_> {
         } else {
             self.expected_ref("PASSKEY, TOTP or DUO", self.peek_token_ref())
         }
-    }
-
-    fn parse_mssql_alter_role(&mut self) -> Result<Statement, ParserError> {
-        let role_name = self.parse_identifier()?;
-
-        let operation = if self.parse_keywords(&[Keyword::ADD, Keyword::MEMBER]) {
-            let member_name = self.parse_identifier()?;
-            AlterRoleOperation::AddMember { member_name }
-        } else if self.parse_keywords(&[Keyword::DROP, Keyword::MEMBER]) {
-            let member_name = self.parse_identifier()?;
-            AlterRoleOperation::DropMember { member_name }
-        } else if self.parse_keywords(&[Keyword::WITH, Keyword::NAME]) {
-            if self.consume_token(&Token::Eq) {
-                let role_name = self.parse_identifier()?;
-                AlterRoleOperation::RenameRole { role_name }
-            } else {
-                return self.expected_ref("= after WITH NAME ", self.peek_token_ref());
-            }
-        } else {
-            return self.expected_ref("'ADD' or 'DROP' or 'WITH NAME'", self.peek_token_ref());
-        };
-
-        Ok(Statement::AlterRole {
-            name: role_name,
-            operation,
-        })
     }
 
     fn parse_pg_alter_role(&mut self) -> Result<Statement, ParserError> {

@@ -280,19 +280,6 @@ pub fn all_dialects() -> TestedDialects {
     TestedDialects::new(vec![
         Box::new(GenericDialect {}),
         Box::new(PostgreSqlDialect {}),
-        Box::new(MsSqlDialect {}),
-        Box::new(AnsiDialect {}),
-        Box::new(SnowflakeDialect {}),
-        Box::new(HiveDialect {}),
-        Box::new(RedshiftSqlDialect {}),
-        Box::new(MySqlDialect {}),
-        Box::new(BigQueryDialect {}),
-        Box::new(SQLiteDialect {}),
-        Box::new(DuckDbDialect {}),
-        Box::new(DatabricksDialect {}),
-        Box::new(ClickHouseDialect {}),
-        Box::new(OracleDialect {}),
-        Box::new(TeradataDialect {}),
     ])
 }
 

@@ -41,15 +41,9 @@ use serde::{Deserialize, Serialize};
 use sqlparser_derive::{Visit, VisitMut};
 
 use crate::dialect::Dialect;
-use crate::dialect::{
-    BigQueryDialect, DuckDbDialect, GenericDialect, MySqlDialect, PostgreSqlDialect,
-    SnowflakeDialect,
-};
+use crate::dialect::{GenericDialect, PostgreSqlDialect};
 use crate::keywords::{Keyword, ALL_KEYWORDS, ALL_KEYWORDS_INDEX};
-use crate::{
-    ast::{DollarQuotedString, QuoteDelimitedString},
-    dialect::HiveDialect,
-};
+use crate::ast::{DollarQuotedString, QuoteDelimitedString};
 
 /// SQL Token enumeration
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -1082,7 +1076,7 @@ impl<'a> Tokenizer<'a> {
                     Ok(Some(Token::Whitespace(Whitespace::Newline)))
                 }
                 // BigQuery and MySQL use b or B for byte string literal, Postgres for bit strings
-                b @ 'B' | b @ 'b' if dialect_of!(self is BigQueryDialect | PostgreSqlDialect | MySqlDialect | GenericDialect) =>
+                b @ 'B' | b @ 'b' if dialect_of!(self is PostgreSqlDialect | GenericDialect) =>
                 {
                     chars.next(); // consume
                     match chars.peek() {
@@ -1122,7 +1116,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 // BigQuery uses r or R for raw string literal
-                b @ 'R' | b @ 'r' if dialect_of!(self is BigQueryDialect | GenericDialect) => {
+                b @ 'R' | b @ 'r' if dialect_of!(self is GenericDialect) => {
                     chars.next(); // consume
                     match chars.peek() {
                         Some('\'') => self
@@ -1517,15 +1511,7 @@ impl<'a> Tokenizer<'a> {
                             chars.next(); // consume the '*', starting a multi-line comment
                             self.tokenize_multiline_comment(chars)
                         }
-                        Some('/') if dialect_of!(self is SnowflakeDialect) => {
-                            chars.next(); // consume the second '/', starting a snowflake single-line comment
-                            let comment = self.tokenize_single_line_comment(chars);
-                            Ok(Some(Token::Whitespace(Whitespace::SingleLineComment {
-                                prefix: "//".to_owned(),
-                                comment,
-                            })))
-                        }
-                        Some('/') if dialect_of!(self is DuckDbDialect | GenericDialect) => {
+                        Some('/') if dialect_of!(self is GenericDialect) => {
                             self.consume_and_return(chars, Token::DuckIntDiv)
                         }
                         // a regular '/' operator
@@ -1726,15 +1712,6 @@ impl<'a> Tokenizer<'a> {
                 }
                 '{' => self.consume_and_return(chars, Token::LBrace),
                 '}' => self.consume_and_return(chars, Token::RBrace),
-                '#' if dialect_of!(self is SnowflakeDialect | BigQueryDialect | MySqlDialect | HiveDialect) =>
-                {
-                    chars.next(); // consume the '#', starting a snowflake single-line comment
-                    let comment = self.tokenize_single_line_comment(chars);
-                    Ok(Some(Token::Whitespace(Whitespace::SingleLineComment {
-                        prefix: "#".to_owned(),
-                        comment,
-                    })))
-                }
                 '~' => {
                     chars.next(); // consume
                     match chars.peek() {
@@ -2645,11 +2622,8 @@ fn take_char_from_hex_digits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dialect::{
-        BigQueryDialect, ClickHouseDialect, HiveDialect, MsSqlDialect, MySqlDialect,
-        PostgreSqlDialect, SQLiteDialect,
-    };
-    use crate::test_utils::{all_dialects, all_dialects_except, all_dialects_where};
+    use crate::dialect::PostgreSqlDialect;
+    use crate::test_utils::{all_dialects, all_dialects_where};
     use core::fmt::Debug;
 
     #[test]
@@ -2725,28 +2699,6 @@ mod tests {
         ];
 
         compare(expected, actual);
-    }
-
-    #[test]
-    fn tokenize_clickhouse_double_equal() {
-        let sql = String::from("SELECT foo=='1'");
-        let dialect = ClickHouseDialect {};
-        let mut tokenizer = Tokenizer::new(&dialect, &sql);
-        let tokens = tokenizer.tokenize().unwrap();
-
-        let expected = vec![
-            Token::make_keyword("SELECT"),
-            Token::Whitespace(Whitespace::Space),
-            Token::Word(Word {
-                value: "foo".to_string(),
-                quote_style: None,
-                keyword: Keyword::NoKeyword,
-            }),
-            Token::DoubleEq,
-            Token::SingleQuotedString("1".to_string()),
-        ];
-
-        compare(expected, tokens);
     }
 
     #[test]
@@ -3214,30 +3166,6 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_dollar_placeholder() {
-        let sql = String::from("SELECT $$, $$ABC$$, $ABC$, $ABC");
-        let dialect = SQLiteDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::make_keyword("SELECT"),
-                Token::Whitespace(Whitespace::Space),
-                Token::Placeholder("$$".into()),
-                Token::Comma,
-                Token::Whitespace(Whitespace::Space),
-                Token::Placeholder("$$ABC$$".into()),
-                Token::Comma,
-                Token::Whitespace(Whitespace::Space),
-                Token::Placeholder("$ABC$".into()),
-                Token::Comma,
-                Token::Whitespace(Whitespace::Space),
-                Token::Placeholder("$ABC".into()),
-            ]
-        );
-    }
-
-    #[test]
     fn tokenize_nested_dollar_quoted_strings() {
         let sql = String::from("SELECT $tag$dollar $nested$ string$tag$");
         let dialect = GenericDialect {};
@@ -3488,24 +3416,6 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_nested_comments_if_not_supported() {
-        all_dialects_except(|d| d.supports_nested_comments()).tokenizes_to(
-            "SELECT 1/*/* nested comment */*/0",
-            vec![
-                Token::make_keyword("SELECT"),
-                Token::Whitespace(Whitespace::Space),
-                Token::Number("1".to_string(), false),
-                Token::Whitespace(Whitespace::MultiLineComment(
-                    "/* nested comment ".to_string(),
-                )),
-                Token::Mul,
-                Token::Div,
-                Token::Number("0".to_string(), false),
-            ],
-        );
-    }
-
-    #[test]
     fn tokenize_multiline_comment_with_even_asterisks() {
         let sql = String::from("\n/** Comment **/\n");
 
@@ -3563,27 +3473,6 @@ mod tests {
             Token::Whitespace(Whitespace::Newline),
             Token::make_word("line4", None),
             Token::Whitespace(Whitespace::Newline),
-        ];
-        compare(expected, tokens);
-    }
-
-    #[test]
-    fn tokenize_mssql_top() {
-        let sql = "SELECT TOP 5 [bar] FROM foo";
-        let dialect = MsSqlDialect {};
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
-        let expected = vec![
-            Token::make_keyword("SELECT"),
-            Token::Whitespace(Whitespace::Space),
-            Token::make_keyword("TOP"),
-            Token::Whitespace(Whitespace::Space),
-            Token::Number(String::from("5"), false),
-            Token::Whitespace(Whitespace::Space),
-            Token::make_word("bar", Some('[')),
-            Token::Whitespace(Whitespace::Space),
-            Token::make_keyword("FROM"),
-            Token::Whitespace(Whitespace::Space),
-            Token::make_word("foo", None),
         ];
         compare(expected, tokens);
     }
@@ -3682,9 +3571,9 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_snowflake_div() {
+    fn tokenize_single_slash_division() {
         let sql = r#"field/1000"#;
-        let dialect = SnowflakeDialect {};
+        let dialect = GenericDialect {};
         let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
         let expected = vec![
             Token::make_word(r#"field"#, None),
@@ -3852,8 +3741,6 @@ mod tests {
         }
 
         tokenize_numeric_prefix_inner(&NumericPrefixDialect {});
-        tokenize_numeric_prefix_inner(&HiveDialect {});
-        tokenize_numeric_prefix_inner(&MySqlDialect {});
     }
 
     fn tokenize_numeric_prefix_inner(dialect: &dyn Dialect) {
@@ -3872,210 +3759,8 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_quoted_string_escape() {
-        let dialect = SnowflakeDialect {};
-        for (sql, expected, expected_unescaped) in [
-            (r#"'%a\'%b'"#, r#"%a\'%b"#, r#"%a'%b"#),
-            (r#"'a\'\'b\'c\'d'"#, r#"a\'\'b\'c\'d"#, r#"a''b'c'd"#),
-            (r#"'\\'"#, r#"\\"#, r#"\"#),
-            (
-                r#"'\0\a\b\f\n\r\t\Z'"#,
-                r#"\0\a\b\f\n\r\t\Z"#,
-                "\0\u{7}\u{8}\u{c}\n\r\t\u{1a}",
-            ),
-            (r#"'\"'"#, r#"\""#, "\""),
-            (r#"'\\a\\b\'c'"#, r#"\\a\\b\'c"#, r#"\a\b'c"#),
-            (r#"'\'abcd'"#, r#"\'abcd"#, r#"'abcd"#),
-            (r#"'''a''b'"#, r#"''a''b"#, r#"'a'b"#),
-            (r#"'\q'"#, r#"\q"#, r#"q"#),
-            (r#"'\%\_'"#, r#"\%\_"#, r#"%_"#),
-            (r#"'\\%\\_'"#, r#"\\%\\_"#, r#"\%\_"#),
-        ] {
-            let tokens = Tokenizer::new(&dialect, sql)
-                .with_unescape(false)
-                .tokenize()
-                .unwrap();
-            let expected = vec![Token::SingleQuotedString(expected.to_string())];
-            compare(expected, tokens);
-
-            let tokens = Tokenizer::new(&dialect, sql)
-                .with_unescape(true)
-                .tokenize()
-                .unwrap();
-            let expected = vec![Token::SingleQuotedString(expected_unescaped.to_string())];
-            compare(expected, tokens);
-        }
-
-        for sql in [r#"'\'"#, r#"'ab\'"#] {
-            let mut tokenizer = Tokenizer::new(&dialect, sql);
-            assert_eq!(
-                "Unterminated string literal",
-                tokenizer.tokenize().unwrap_err().message.as_str(),
-            );
-        }
-
-        // Non-escape dialect
-        for (sql, expected) in [(r#"'\'"#, r#"\"#), (r#"'ab\'"#, r#"ab\"#)] {
-            let dialect = GenericDialect {};
-            let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
-
-            let expected = vec![Token::SingleQuotedString(expected.to_string())];
-
-            compare(expected, tokens);
-        }
-
-        // MySQL special case for LIKE escapes
-        for (sql, expected) in [(r#"'\%'"#, r#"\%"#), (r#"'\_'"#, r#"\_"#)] {
-            let dialect = MySqlDialect {};
-            let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
-
-            let expected = vec![Token::SingleQuotedString(expected.to_string())];
-
-            compare(expected, tokens);
-        }
-    }
-
-    #[test]
-    fn tokenize_triple_quoted_string() {
-        fn check<F>(
-            q: char, // The quote character to test
-            r: char, // An alternate quote character.
-            quote_token: F,
-        ) where
-            F: Fn(String) -> Token,
-        {
-            let dialect = BigQueryDialect {};
-
-            for (sql, expected, expected_unescaped) in [
-                // Empty string
-                (format!(r#"{q}{q}{q}{q}{q}{q}"#), "".into(), "".into()),
-                // Should not count escaped quote as end of string.
-                (
-                    format!(r#"{q}{q}{q}ab{q}{q}\{q}{q}cd{q}{q}{q}"#),
-                    format!(r#"ab{q}{q}\{q}{q}cd"#),
-                    format!(r#"ab{q}{q}{q}{q}cd"#),
-                ),
-                // Simple string
-                (
-                    format!(r#"{q}{q}{q}abc{q}{q}{q}"#),
-                    "abc".into(),
-                    "abc".into(),
-                ),
-                // Mix single-double quotes unescaped.
-                (
-                    format!(r#"{q}{q}{q}ab{r}{r}{r}c{r}def{r}{r}{r}{q}{q}{q}"#),
-                    format!("ab{r}{r}{r}c{r}def{r}{r}{r}"),
-                    format!("ab{r}{r}{r}c{r}def{r}{r}{r}"),
-                ),
-                // Escaped quote.
-                (
-                    format!(r#"{q}{q}{q}ab{q}{q}c{q}{q}\{q}de{q}{q}f{q}{q}{q}"#),
-                    format!(r#"ab{q}{q}c{q}{q}\{q}de{q}{q}f"#),
-                    format!(r#"ab{q}{q}c{q}{q}{q}de{q}{q}f"#),
-                ),
-                // backslash-escaped quote characters.
-                (
-                    format!(r#"{q}{q}{q}a\'\'b\'c\'d{q}{q}{q}"#),
-                    r#"a\'\'b\'c\'d"#.into(),
-                    r#"a''b'c'd"#.into(),
-                ),
-                // backslash-escaped characters
-                (
-                    format!(r#"{q}{q}{q}abc\0\n\rdef{q}{q}{q}"#),
-                    r#"abc\0\n\rdef"#.into(),
-                    "abc\0\n\rdef".into(),
-                ),
-            ] {
-                let tokens = Tokenizer::new(&dialect, sql.as_str())
-                    .with_unescape(false)
-                    .tokenize()
-                    .unwrap();
-                let expected = vec![quote_token(expected.to_string())];
-                compare(expected, tokens);
-
-                let tokens = Tokenizer::new(&dialect, sql.as_str())
-                    .with_unescape(true)
-                    .tokenize()
-                    .unwrap();
-                let expected = vec![quote_token(expected_unescaped.to_string())];
-                compare(expected, tokens);
-            }
-
-            for sql in [
-                format!(r#"{q}{q}{q}{q}{q}\{q}"#),
-                format!(r#"{q}{q}{q}abc{q}{q}\{q}"#),
-                format!(r#"{q}{q}{q}{q}"#),
-                format!(r#"{q}{q}{q}{r}{r}"#),
-                format!(r#"{q}{q}{q}abc{q}"#),
-                format!(r#"{q}{q}{q}abc{q}{q}"#),
-                format!(r#"{q}{q}{q}abc"#),
-            ] {
-                let dialect = BigQueryDialect {};
-                let mut tokenizer = Tokenizer::new(&dialect, sql.as_str());
-                assert_eq!(
-                    "Unterminated string literal",
-                    tokenizer.tokenize().unwrap_err().message.as_str(),
-                );
-            }
-        }
-
-        check('"', '\'', Token::TripleDoubleQuotedString);
-
-        check('\'', '"', Token::TripleSingleQuotedString);
-
-        let dialect = BigQueryDialect {};
-
-        let sql = r#"""''"#;
-        let tokens = Tokenizer::new(&dialect, sql)
-            .with_unescape(true)
-            .tokenize()
-            .unwrap();
-        let expected = vec![
-            Token::DoubleQuotedString("".to_string()),
-            Token::SingleQuotedString("".to_string()),
-        ];
-        compare(expected, tokens);
-
-        let sql = r#"''"""#;
-        let tokens = Tokenizer::new(&dialect, sql)
-            .with_unescape(true)
-            .tokenize()
-            .unwrap();
-        let expected = vec![
-            Token::SingleQuotedString("".to_string()),
-            Token::DoubleQuotedString("".to_string()),
-        ];
-        compare(expected, tokens);
-
-        // Non-triple quoted string dialect
-        let dialect = SnowflakeDialect {};
-        let sql = r#"''''''"#;
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
-        let expected = vec![Token::SingleQuotedString("''".to_string())];
-        compare(expected, tokens);
-    }
-
-    #[test]
-    fn test_mysql_users_grantees() {
-        let dialect = MySqlDialect {};
-
-        let sql = "CREATE USER `root`@`%`";
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
-        let expected = vec![
-            Token::make_keyword("CREATE"),
-            Token::Whitespace(Whitespace::Space),
-            Token::make_keyword("USER"),
-            Token::Whitespace(Whitespace::Space),
-            Token::make_word("root", Some('`')),
-            Token::AtSign,
-            Token::make_word("%", Some('`')),
-        ];
-        compare(expected, tokens);
-    }
-
-    #[test]
     fn test_postgres_abs_without_space_and_string_literal() {
-        let dialect = MySqlDialect {};
+        let dialect = PostgreSqlDialect {};
 
         let sql = "SELECT @'1'";
         let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
@@ -4090,7 +3775,7 @@ mod tests {
 
     #[test]
     fn test_postgres_abs_without_space_and_quoted_column() {
-        let dialect = MySqlDialect {};
+        let dialect = PostgreSqlDialect {};
 
         let sql = r#"SELECT @"bar" FROM foo"#;
         let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
@@ -4098,7 +3783,7 @@ mod tests {
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
             Token::AtSign,
-            Token::DoubleQuotedString("bar".to_string()),
+            Token::make_word("bar", Some('"')),
             Token::Whitespace(Whitespace::Space),
             Token::make_keyword("FROM"),
             Token::Whitespace(Whitespace::Space),
@@ -4121,42 +3806,6 @@ mod tests {
     }
 
     #[test]
-    fn test_national_strings_backslash_escape_supported() {
-        all_dialects_where(|dialect| dialect.supports_string_literal_backslash_escape())
-            .tokenizes_to(
-                "select n'''''\\''",
-                vec![
-                    Token::make_keyword("select"),
-                    Token::Whitespace(Whitespace::Space),
-                    Token::NationalStringLiteral("'''".to_string()),
-                ],
-            );
-    }
-
-    #[test]
-    fn test_string_escape_constant_not_supported() {
-        all_dialects_where(|dialect| !dialect.supports_string_escape_constant()).tokenizes_to(
-            "select e'...'",
-            vec![
-                Token::make_keyword("select"),
-                Token::Whitespace(Whitespace::Space),
-                Token::make_word("e", None),
-                Token::SingleQuotedString("...".to_string()),
-            ],
-        );
-
-        all_dialects_where(|dialect| !dialect.supports_string_escape_constant()).tokenizes_to(
-            "select E'...'",
-            vec![
-                Token::make_keyword("select"),
-                Token::Whitespace(Whitespace::Space),
-                Token::make_word("E", None),
-                Token::SingleQuotedString("...".to_string()),
-            ],
-        );
-    }
-
-    #[test]
     fn test_string_escape_constant_supported() {
         all_dialects_where(|dialect| dialect.supports_string_escape_constant()).tokenizes_to(
             "select e'\\''",
@@ -4173,63 +3822,6 @@ mod tests {
                 Token::make_keyword("select"),
                 Token::Whitespace(Whitespace::Space),
                 Token::EscapedStringLiteral("'".to_string()),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_whitespace_required_after_single_line_comment() {
-        all_dialects_where(|dialect| dialect.requires_single_line_comment_whitespace())
-            .tokenizes_to(
-                "SELECT --'abc'",
-                vec![
-                    Token::make_keyword("SELECT"),
-                    Token::Whitespace(Whitespace::Space),
-                    Token::Minus,
-                    Token::Minus,
-                    Token::SingleQuotedString("abc".to_string()),
-                ],
-            );
-
-        all_dialects_where(|dialect| dialect.requires_single_line_comment_whitespace())
-            .tokenizes_to(
-                "SELECT -- 'abc'",
-                vec![
-                    Token::make_keyword("SELECT"),
-                    Token::Whitespace(Whitespace::Space),
-                    Token::Whitespace(Whitespace::SingleLineComment {
-                        prefix: "--".to_string(),
-                        comment: " 'abc'".to_string(),
-                    }),
-                ],
-            );
-
-        all_dialects_where(|dialect| dialect.requires_single_line_comment_whitespace())
-            .tokenizes_to(
-                "SELECT --",
-                vec![
-                    Token::make_keyword("SELECT"),
-                    Token::Whitespace(Whitespace::Space),
-                    Token::Minus,
-                    Token::Minus,
-                ],
-            );
-
-        all_dialects_where(|d| d.requires_single_line_comment_whitespace()).tokenizes_to(
-            "--\n-- Table structure for table...\n--\n",
-            vec![
-                Token::Whitespace(Whitespace::SingleLineComment {
-                    prefix: "--".to_string(),
-                    comment: "\n".to_string(),
-                }),
-                Token::Whitespace(Whitespace::SingleLineComment {
-                    prefix: "--".to_string(),
-                    comment: " Table structure for table...\n".to_string(),
-                }),
-                Token::Whitespace(Whitespace::SingleLineComment {
-                    prefix: "--".to_string(),
-                    comment: "\n".to_string(),
-                }),
             ],
         );
     }
@@ -4274,33 +3866,6 @@ mod tests {
                     }),
                 ],
             );
-    }
-
-    #[test]
-    fn test_tokenize_identifiers_numeric_prefix() {
-        all_dialects_where(|dialect| dialect.supports_numeric_prefix())
-            .tokenizes_to("123abc", vec![Token::make_word("123abc", None)]);
-
-        all_dialects_where(|dialect| dialect.supports_numeric_prefix())
-            .tokenizes_to("12e34", vec![Token::Number("12e34".to_string(), false)]);
-
-        all_dialects_where(|dialect| dialect.supports_numeric_prefix()).tokenizes_to(
-            "t.12e34",
-            vec![
-                Token::make_word("t", None),
-                Token::Period,
-                Token::make_word("12e34", None),
-            ],
-        );
-
-        all_dialects_where(|dialect| dialect.supports_numeric_prefix()).tokenizes_to(
-            "t.1two3",
-            vec![
-                Token::make_word("t", None),
-                Token::Period,
-                Token::make_word("1two3", None),
-            ],
-        );
     }
 
     #[test]
@@ -4355,88 +3920,6 @@ mod tests {
                 Token::Whitespace(Whitespace::Space),
                 Token::make_word("y", None),
             ],
-        );
-    }
-
-    #[test]
-    fn tokenize_multiline_comment_with_comment_hint() {
-        let sql = String::from("0/*! word */1");
-
-        let dialect = MySqlDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
-        let expected = vec![
-            Token::Number("0".to_string(), false),
-            Token::Whitespace(Whitespace::Space),
-            Token::Word(Word {
-                value: "word".to_string(),
-                quote_style: None,
-                keyword: Keyword::NoKeyword,
-            }),
-            Token::Whitespace(Whitespace::Space),
-            Token::Number("1".to_string(), false),
-        ];
-        compare(expected, tokens);
-    }
-
-    #[test]
-    fn tokenize_multiline_comment_with_comment_hint_and_version() {
-        let sql_multi = String::from("0 /*!50110 KEY_BLOCK_SIZE = 1024*/ 1");
-        let dialect = MySqlDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql_multi).tokenize().unwrap();
-        let expected = vec![
-            Token::Number("0".to_string(), false),
-            Token::Whitespace(Whitespace::Space),
-            Token::Whitespace(Whitespace::Space),
-            Token::Word(Word {
-                value: "KEY_BLOCK_SIZE".to_string(),
-                quote_style: None,
-                keyword: Keyword::KEY_BLOCK_SIZE,
-            }),
-            Token::Whitespace(Whitespace::Space),
-            Token::Eq,
-            Token::Whitespace(Whitespace::Space),
-            Token::Number("1024".to_string(), false),
-            Token::Whitespace(Whitespace::Space),
-            Token::Number("1".to_string(), false),
-        ];
-        compare(expected, tokens);
-
-        let tokens = Tokenizer::new(&dialect, "0 /*!50110 */ 1")
-            .tokenize()
-            .unwrap();
-        compare(
-            vec![
-                Token::Number("0".to_string(), false),
-                Token::Whitespace(Whitespace::Space),
-                Token::Whitespace(Whitespace::Space),
-                Token::Whitespace(Whitespace::Space),
-                Token::Number("1".to_string(), false),
-            ],
-            tokens,
-        );
-
-        let tokens = Tokenizer::new(&dialect, "0 /*!*/ 1").tokenize().unwrap();
-        compare(
-            vec![
-                Token::Number("0".to_string(), false),
-                Token::Whitespace(Whitespace::Space),
-                Token::Whitespace(Whitespace::Space),
-                Token::Number("1".to_string(), false),
-            ],
-            tokens,
-        );
-        let tokens = Tokenizer::new(&dialect, "0 /*!   */ 1").tokenize().unwrap();
-        compare(
-            vec![
-                Token::Number("0".to_string(), false),
-                Token::Whitespace(Whitespace::Space),
-                Token::Whitespace(Whitespace::Space),
-                Token::Whitespace(Whitespace::Space),
-                Token::Whitespace(Whitespace::Space),
-                Token::Whitespace(Whitespace::Space),
-                Token::Number("1".to_string(), false),
-            ],
-            tokens,
         );
     }
 

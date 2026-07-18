@@ -22,7 +22,10 @@
 //! (see `UPSTREAM`). We vendor it so PostgreSQL-specific grammar can be added
 //! directly instead of waiting on upstream review; divergences are caught by
 //! differential testing (docs/ARCHITECTURE.md §1.1). The upstream `ast`,
-//! `dialect`, `parser`, `tokenizer` and `keywords` modules are re-exported as-is;
+//! `parser`, `tokenizer` and `keywords` modules are re-exported; the `dialect`
+//! module has been pruned to only [`dialect::GenericDialect`] and
+//! [`dialect::PostgreSqlDialect`] (CrabgreSQL only parses PostgreSQL), and the
+//! dialect-specific grammar for the other dialects has been removed.
 //! [`parse`] is the CrabgreSQL entry point (PostgreSQL dialect).
 
 #![cfg_attr(not(feature = "std"), no_std)]
