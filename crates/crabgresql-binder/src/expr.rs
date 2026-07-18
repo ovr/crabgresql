@@ -57,6 +57,15 @@ pub enum BoundExpr {
         ret: PgType,
         args: Vec<BoundExpr>,
     },
+    /// `CASE`: WHEN conditions are boolean and evaluated top-to-bottom; the
+    /// first one that is *true* selects its result. `else_` is present only for
+    /// an explicit ELSE (a missing ELSE yields NULL). Every result is already
+    /// coerced to `ty`, the unified result type.
+    Case {
+        whens: Vec<(BoundExpr, BoundExpr)>,
+        else_: Option<Box<BoundExpr>>,
+        ty: PgType,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +153,7 @@ impl BoundExpr {
             BoundExpr::IsNull { .. } => PgType::Bool,
             BoundExpr::Coerce { ty, .. } => *ty,
             BoundExpr::FuncCall { ret, .. } => *ret,
+            BoundExpr::Case { ty, .. } => *ty,
         }
     }
 }
@@ -236,6 +246,17 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         ast::Expr::AtTimeZone { timestamp, time_zone } => {
             bind_at_time_zone(timestamp, time_zone, scope)
         }
+        ast::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => bind_case(
+            operand.as_deref(),
+            conditions,
+            else_result.as_deref(),
+            scope,
+        ),
         other => Err(unsupported_expr(other)),
     }
 }
@@ -624,6 +645,77 @@ fn bind_is_null(inner: &ast::Expr, scope: &Scope, negated: bool) -> Result<Bindi
     }))
 }
 
+/// `CASE`: both the searched form (`CASE WHEN cond THEN r ...`) and the simple
+/// form (`CASE operand WHEN v THEN r ...`, sugar for `CASE WHEN operand = v`).
+/// Conditions are forced to boolean; all `THEN`/`ELSE` results resolve to one
+/// common type the same way a `VALUES`/`UNION` column does.
+fn bind_case(
+    operand: Option<&ast::Expr>,
+    conditions: &[ast::CaseWhen],
+    else_result: Option<&ast::Expr>,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    // Simple CASE evaluates the operand once at run time; we re-bind a clone of
+    // it per WHEN to build `operand = value`. That is equivalent because our
+    // scalar expressions are pure (no volatile functions reach here yet).
+    //
+    // PG gives an untyped-literal operand its own type before comparing — an
+    // unknown resolves to text (its default), independent of the WHEN values —
+    // so `CASE NULL WHEN 1` is `text = integer` (operator does not exist), not
+    // an attempt to read the operand as integer. Resolve it here to reproduce
+    // that; a typed operand is left as-is.
+    let operand = match operand {
+        None => None,
+        Some(e) => Some(match bind_expr(e, scope)? {
+            Binding::Unknown { lit, span } => {
+                Binding::Typed(resolve_unknown(lit, span, PgType::Text)?)
+            }
+            typed => typed,
+        }),
+    };
+
+    // Bind everything in source order (operand, then each WHEN's condition and
+    // result, then ELSE) so bind-time errors surface where PG's do.
+    let mut conds = Vec::with_capacity(conditions.len());
+    let mut then_bindings = Vec::with_capacity(conditions.len());
+    for when in conditions {
+        let cond = match &operand {
+            None => to_bool_operand(bind_expr(&when.condition, scope)?, "CASE/WHEN")?,
+            Some(op) => {
+                let value = bind_expr(&when.condition, scope)?;
+                match bind_binary_op(BinOp::Eq, op.clone(), value)? {
+                    Binding::Typed(e) => e,
+                    // `=` always resolves to a typed boolean expression.
+                    Binding::Unknown { .. } => unreachable!("= yields a typed bool"),
+                }
+            }
+        };
+        conds.push(cond);
+        then_bindings.push(bind_expr(&when.result, scope)?);
+    }
+    // A missing ELSE is NULL, which is compatible with any type and needs no
+    // coercion node.
+    let else_binding = else_result.map(|e| bind_expr(e, scope)).transpose()?;
+    let has_else = else_binding.is_some();
+
+    // Result-type unification lists the ELSE result first, then the WHEN
+    // results, matching the operand order PG uses for its "CASE types A and B
+    // cannot be matched" message.
+    let mut result_bindings = Vec::with_capacity(then_bindings.len() + 1);
+    result_bindings.extend(else_binding);
+    result_bindings.extend(then_bindings);
+    let (ty, mut results) = unify_value_column(result_bindings, "CASE")?;
+
+    let else_ = if has_else {
+        Some(Box::new(results.remove(0)))
+    } else {
+        None
+    };
+    let whens = conds.into_iter().zip(results).collect();
+
+    Ok(Binding::Typed(BoundExpr::Case { whens, else_, ty }))
+}
+
 fn bind_binary(
     left: &ast::Expr,
     op: &ast::BinaryOperator,
@@ -654,7 +746,14 @@ fn bind_binary(
 
     let lb = bind_expr(left, scope)?;
     let rb = bind_expr(right, scope)?;
+    bind_binary_op(op, lb, rb)
+}
 
+/// Resolve a binary operator over two already-bound operands. Split out from
+/// `bind_binary` so a simple `CASE operand WHEN v` can reuse the exact `=`
+/// resolution (unknown-literal handling, numeric promotion, "operator does not
+/// exist" errors) that a written `operand = v` gets.
+fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindError> {
     if op.is_logic() {
         let left = to_bool_operand(lb, op.sql_symbol())?;
         let right = to_bool_operand(rb, op.sql_symbol())?;
@@ -891,12 +990,15 @@ fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
     }
 }
 
-/// Resolve one column of a multi-row `VALUES` list to a common type and coerce
-/// every cell to it. Untyped literals adapt to the resolved type; a column that
-/// is entirely untyped resolves to `text`, as PG does for unknown `UNION`/
-/// `VALUES` columns. Incompatible concrete types are a `42804` error.
+/// Resolve a set of expressions (one `VALUES`/`UNION` column, or a `CASE`'s
+/// result branches) to a common type and coerce every one to it. Untyped
+/// literals adapt to the resolved type; an entirely untyped set resolves to
+/// `text`, as PG does for unknown `UNION`/`VALUES`/`CASE`. Incompatible concrete
+/// types are a `42804` error, prefixed with `label` (`VALUES` / `CASE`) to match
+/// PG's wording.
 pub(crate) fn unify_value_column(
     bindings: Vec<Binding>,
+    label: &str,
 ) -> Result<(PgType, Vec<BoundExpr>), BindError> {
     let mut common: Option<PgType> = None;
     for binding in &bindings {
@@ -907,7 +1009,7 @@ pub(crate) fn unify_value_column(
                     BindError::new(
                         sqlstate::DATATYPE_MISMATCH,
                         format!(
-                            "VALUES types {} and {} cannot be matched",
+                            "{label} types {} and {} cannot be matched",
                             prev.name(),
                             e.ty().name()
                         ),
@@ -1090,6 +1192,8 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         ast::Expr::Extract { .. } => "extract".into(),
         // `x AT TIME ZONE y` lowers to timezone(); PG names the column "timezone".
         ast::Expr::AtTimeZone { .. } => "timezone".into(),
+        // A bare CASE expression is named "case" in PG.
+        ast::Expr::Case { .. } => "case".into(),
         // A function's output column is named after the function.
         ast::Expr::Function(func) => func
             .name

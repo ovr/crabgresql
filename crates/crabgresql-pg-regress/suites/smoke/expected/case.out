@@ -1,0 +1,84 @@
+--
+-- CASE
+-- Searched and simple CASE expressions: branch selection, laziness, result-type
+-- unification, and error cases, checked against psql's aligned format.
+--
+-- searched CASE in the SELECT list; the default column name is "case"
+SELECT CASE WHEN true THEN 'yes' WHEN false THEN 'no' END;
+ case 
+------
+ yes
+(1 row)
+
+-- first true branch wins; later true branches are ignored
+SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END AS pick;
+ pick 
+------
+ b
+(1 row)
+
+-- a NULL condition behaves like false and falls through to ELSE
+SELECT CASE WHEN NULL THEN 'x' ELSE 'y' END AS via_else;
+ via_else 
+----------
+ y
+(1 row)
+
+-- no branch matches and no ELSE: result is NULL (renders empty)
+SELECT CASE WHEN false THEN 1 END AS none;
+ none 
+------
+     
+(1 row)
+
+-- simple CASE: operand compared for equality against each WHEN value
+SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'many' END AS word;
+ word 
+------
+ two
+(1 row)
+
+-- result branches of differing numeric types unify to the common type
+SELECT CASE WHEN true THEN 1 ELSE 2.5 END AS promoted;
+ promoted 
+----------
+        1
+(1 row)
+
+-- CASE over a table column, once per row
+CREATE TABLE grades (name text, score integer);
+INSERT INTO grades VALUES ('a', 91), ('b', 72), ('c', 55), ('d', NULL);
+SELECT name,
+       CASE WHEN score >= 90 THEN 'A'
+            WHEN score >= 70 THEN 'B'
+            WHEN score IS NULL THEN 'n/a'
+            ELSE 'F' END AS grade
+  FROM grades;
+ name | grade 
+------+-------
+ a    | A
+ b    | B
+ c    | F
+ d    | n/a
+(4 rows)
+
+-- CASE in a WHERE predicate
+SELECT name FROM grades
+ WHERE CASE WHEN score IS NULL THEN false ELSE score >= 70 END;
+ name 
+------
+ a
+ b
+(2 rows)
+
+-- error: a searched WHEN condition must be boolean
+SELECT CASE WHEN 1 THEN 'x' END;
+ERROR:  argument of CASE/WHEN must be type boolean, not type integer
+-- error: incompatible concrete result types cannot be matched
+SELECT CASE WHEN true THEN 1 ELSE true END;
+ERROR:  CASE types boolean and integer cannot be matched
+-- error: an untyped result literal that does not fit the resolved type
+SELECT CASE WHEN true THEN 1 ELSE 'x' END;
+ERROR:  invalid input syntax for type integer: "x"
+LINE 1: SELECT CASE WHEN true THEN 1 ELSE 'x' END;
+                                          ^
