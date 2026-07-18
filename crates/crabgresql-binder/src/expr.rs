@@ -401,6 +401,7 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         ast::Expr::ILike { negated, any, expr, pattern, escape_char } => {
             bind_like_node(expr, pattern, escape_char.as_ref(), *any, true, *negated, scope)
         }
+        ast::Expr::InList { expr, list, negated } => bind_in_list(expr, list, *negated, scope),
         other => Err(unsupported_expr(other)),
     }
 }
@@ -1179,6 +1180,46 @@ fn bind_case(
     let whens = conds.into_iter().zip(results).collect();
 
     Ok(Binding::Typed(BoundExpr::Case { whens, else_, ty }))
+}
+
+/// `x IN (a, b, c)` desugars to `x = a OR x = b OR x = c`; `x NOT IN (...)` to
+/// `x <> a AND x <> b AND x <> c`. Both reproduce PG's three-valued logic (a
+/// NULL element yields NULL, not false — the executor's Kleene `OR`/`AND`) and
+/// per-element type resolution: each comparison is bound through the shared
+/// `bind_binary_op`, so the left operand's unknown-literal typing, numeric
+/// promotion, and `operator does not exist` / `invalid input syntax` errors all
+/// match a written `x = a`. The left `Binding` is left unresolved and cloned per
+/// element (like a simple `CASE operand`), so `'5' IN (5, 6)` types `'5'` from
+/// the list as int4 rather than defaulting it to text.
+fn bind_in_list(
+    expr: &ast::Expr,
+    list: &[ast::Expr],
+    negated: bool,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let left = bind_expr(expr, scope)?;
+    let (cmp, chain) = if negated {
+        (BinOp::NotEq, BinOp::And)
+    } else {
+        (BinOp::Eq, BinOp::Or)
+    };
+    let mut acc: Option<Binding> = None;
+    for item in list {
+        let rb = bind_expr(item, scope)?;
+        let comparison = bind_binary_op(cmp, left.clone(), rb)?;
+        acc = Some(match acc {
+            None => comparison,
+            Some(prev) => bind_binary_op(chain, prev, comparison)?,
+        });
+    }
+    // An empty list is a parser syntax error (`IN ()`), so this is unreachable;
+    // fold to the constant PG's `= ANY '{}'` yields rather than panic.
+    Ok(acc.unwrap_or_else(|| {
+        Binding::Typed(BoundExpr::Const {
+            value: Value::Bool(negated),
+            ty: PgType::Bool,
+        })
+    }))
 }
 
 fn bind_binary(

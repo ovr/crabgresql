@@ -111,5 +111,20 @@ SELECT 12345.6::numeric(5,2);
 SELECT 'Infinity'::numeric(4,4);
 SELECT 'NaN'::numeric(4,4) AS nan_ok;
 
+-- <expr> IN (list) desugars to an OR chain of equality (NOT IN to an AND chain
+-- of inequality). The degree trig functions return exact half-integer values,
+-- so membership is a precise equality test; list literals unify with the tested
+-- expression's type (int vs numeric, float8 for the trig result).
+SELECT sind(30) IN (0.5) AS s30, cosd(60) IN (0.5) AS c60, tand(45) IN (1) AS t45;
+SELECT 2 IN (1, 2, 3) AS in3, 5 NOT IN (1, 2, 3) AS notin3;
+SELECT 1 IN (1.0, 2.5) AS mixed_numeric;
+-- three-valued (Kleene) logic: a NULL element yields NULL, not false, when no
+-- other element matches; NOT IN with a NULL element is never true
+SELECT 1 IN (2, NULL) AS null_no_match, 1 IN (1, NULL) AS match_with_null,
+       1 NOT IN (2, NULL) AS notin_null;
+-- an unknown literal in the list takes the tested expression's type, so a
+-- non-integer text errors like a plain `1 = 'abc'`
+SELECT 1 IN ('abc');
+
 -- recovery after the errors above still works
 SELECT 'still alive' AS status;

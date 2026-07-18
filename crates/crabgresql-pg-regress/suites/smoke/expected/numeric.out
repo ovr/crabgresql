@@ -301,6 +301,43 @@ SELECT 'NaN'::numeric(4,4) AS nan_ok;
     NaN
 (1 row)
 
+-- <expr> IN (list) desugars to an OR chain of equality (NOT IN to an AND chain
+-- of inequality). The degree trig functions return exact half-integer values,
+-- so membership is a precise equality test; list literals unify with the tested
+-- expression's type (int vs numeric, float8 for the trig result).
+SELECT sind(30) IN (0.5) AS s30, cosd(60) IN (0.5) AS c60, tand(45) IN (1) AS t45;
+ s30 | c60 | t45 
+-----+-----+-----
+ t   | t   | t
+(1 row)
+
+SELECT 2 IN (1, 2, 3) AS in3, 5 NOT IN (1, 2, 3) AS notin3;
+ in3 | notin3 
+-----+--------
+ t   | t
+(1 row)
+
+SELECT 1 IN (1.0, 2.5) AS mixed_numeric;
+ mixed_numeric 
+---------------
+ t
+(1 row)
+
+-- three-valued (Kleene) logic: a NULL element yields NULL, not false, when no
+-- other element matches; NOT IN with a NULL element is never true
+SELECT 1 IN (2, NULL) AS null_no_match, 1 IN (1, NULL) AS match_with_null,
+       1 NOT IN (2, NULL) AS notin_null;
+ null_no_match | match_with_null | notin_null 
+---------------+-----------------+------------
+               | t               | 
+(1 row)
+
+-- an unknown literal in the list takes the tested expression's type, so a
+-- non-integer text errors like a plain `1 = 'abc'`
+SELECT 1 IN ('abc');
+ERROR:  invalid input syntax for type integer: "abc"
+LINE 1: SELECT 1 IN ('abc');
+                     ^
 -- recovery after the errors above still works
 SELECT 'still alive' AS status;
    status    
