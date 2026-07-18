@@ -390,17 +390,28 @@ pub struct CrossJoin {
     /// Current pick within each inner relation.
     indices: Vec<usize>,
     /// The outer tuple every emitted row is currently built on; `None` once the
-    /// outer relation is exhausted.
+    /// outer relation is exhausted (or the product is empty).
     current_outer: Option<Tuple>,
-    started: bool,
+    /// Combined width of one pick from every inner relation, for exact
+    /// allocation of each emitted row (0 when the product is empty).
+    inner_width: usize,
 }
 
 impl CrossJoin {
-    /// `sources` are the join inputs in FROM order; the executor only builds a
-    /// join for two or more, so the first is the streamed outer and at least
-    /// one inner is materialized.
+    /// `sources` are the join inputs in FROM order: the first streams as the
+    /// outer relation, the rest are materialized up front. An empty inner makes
+    /// the whole product empty, so the outer is only pulled when every inner has
+    /// rows. The binder only emits a `Join` for two or more relations, but one
+    /// input is handled (it just streams) and zero is a hard error rather than a
+    /// panic.
     pub fn new(mut sources: Vec<Box<dyn ExecNode>>) -> Result<Self, ExecError> {
-        let outer = sources.remove(0);
+        if sources.is_empty() {
+            return Err(ExecError::new(
+                "XX000",
+                "cross join requires at least one input",
+            ));
+        }
+        let mut outer = sources.remove(0);
         let mut inners = Vec::with_capacity(sources.len());
         for mut src in sources {
             let mut rows = Vec::new();
@@ -409,13 +420,22 @@ impl CrossJoin {
             }
             inners.push(rows);
         }
+        // Prime the outer stream and the per-row width only when a product
+        // exists; an empty inner leaves `current_outer` = None so `next` yields
+        // nothing.
+        let (current_outer, inner_width) = if inners.iter().all(|rows| !rows.is_empty()) {
+            let width = inners.iter().map(|rows| rows[0].len()).sum();
+            (outer.next()?, width)
+        } else {
+            (None, 0)
+        };
         let indices = vec![0; inners.len()];
         Ok(Self {
             outer,
             inners,
             indices,
-            current_outer: None,
-            started: false,
+            current_outer,
+            inner_width,
         })
     }
 
@@ -436,22 +456,16 @@ impl CrossJoin {
 
 impl ExecNode for CrossJoin {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        // Any empty inner relation makes the whole product empty.
-        if self.inners.iter().any(|rows| rows.is_empty()) {
-            return Ok(None);
-        }
-        if !self.started {
-            self.started = true;
-            self.current_outer = self.outer.next()?;
-        }
-        let Some(outer) = self.current_outer.clone() else {
+        let Some(outer) = self.current_outer.as_ref() else {
             return Ok(None);
         };
-        let mut combined = outer;
+        let mut combined = Vec::with_capacity(outer.len() + self.inner_width);
+        combined.extend_from_slice(outer);
         for (rows, &i) in self.inners.iter().zip(&self.indices) {
             combined.extend_from_slice(&rows[i]);
         }
-        // Move to the next combination for the following call.
+        // Move to the next combination for the following call; on odometer wrap,
+        // pull the next outer row and reset the inner picks.
         if !self.advance() {
             self.current_outer = self.outer.next()?;
             self.indices.iter_mut().for_each(|i| *i = 0);
@@ -1198,5 +1212,15 @@ mod tests {
         let (_columns, rows) =
             run_rows("SELECT * FROM (VALUES (1), (2)) a(x), (SELECT 1 WHERE false) b(z)");
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn cross_join_new_rejects_empty_inputs() {
+        // The binder never emits a zero-input Join, but the node reports an
+        // error rather than panicking on `remove(0)`.
+        let Err(err) = CrossJoin::new(Vec::new()) else {
+            panic!("expected an error for zero inputs");
+        };
+        assert_eq!(err.code, "XX000");
     }
 }

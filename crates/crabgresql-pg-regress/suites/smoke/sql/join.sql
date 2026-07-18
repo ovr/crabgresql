@@ -21,5 +21,9 @@ SELECT t1.label, t2.tag FROM t1, t2 WHERE t1.id = t2.id ORDER BY 1;
 SELECT t2.* FROM t1, t2 WHERE t1.id = t2.id AND t1.id = 1;
 -- an unqualified column present in both relations is ambiguous
 SELECT id FROM t1, t2;
+-- a qualified reference to a missing column names the qualifier
+SELECT t1.nope FROM t1, t2;
+-- a duplicate column alias makes a reference ambiguous
+SELECT x FROM (VALUES (1, 2)) v(x, x);
 -- the same qualifier twice is rejected
 SELECT * FROM t1, t1;

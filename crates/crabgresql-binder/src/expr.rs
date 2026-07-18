@@ -222,20 +222,23 @@ impl Scope {
         Scope { rels }
     }
 
-    /// Resolve an unqualified column name. A name found in exactly one relation
-    /// binds to its combined-row index; found in more than one is `42702`
-    /// (ambiguous); found in none is `42703`.
+    /// Resolve an unqualified column name. A name that matches exactly one
+    /// column binds to its combined-row index; more than one match — whether
+    /// across relations or duplicated within one (e.g. an alias list `v(x, x)`)
+    /// — is `42702` (ambiguous); no match is `42703`.
     fn resolve(&self, name: &str) -> Result<BoundExpr, BindError> {
         let mut found: Option<(usize, PgType)> = None;
         for rel in &self.rels {
-            if let Some(local) = rel.columns.iter().position(|c| c.name == name) {
-                if found.is_some() {
-                    return Err(BindError::new(
-                        sqlstate::AMBIGUOUS_COLUMN,
-                        format!("column reference \"{name}\" is ambiguous"),
-                    ));
+            for (local, col) in rel.columns.iter().enumerate() {
+                if col.name == name {
+                    if found.is_some() {
+                        return Err(BindError::new(
+                            sqlstate::AMBIGUOUS_COLUMN,
+                            format!("column reference \"{name}\" is ambiguous"),
+                        ));
+                    }
+                    found = Some((rel.offset + local, col.ty));
                 }
-                found = Some((rel.offset + local, rel.columns[local].ty));
             }
         }
         let (index, ty) = found.ok_or_else(|| {
@@ -732,16 +735,28 @@ fn bind_compound(parts: &[ast::Ident], scope: &Scope) -> Result<BoundExpr, BindE
     let qualifier = normalize_ident(qualifier);
     let rel = scope.relation(&qualifier)?;
     let column = normalize_ident(column);
-    let local = rel
-        .columns
-        .iter()
-        .position(|c| c.name == column)
-        .ok_or_else(|| {
-            BindError::new(
-                sqlstate::UNDEFINED_COLUMN,
-                format!("column \"{column}\" does not exist"),
-            )
-        })?;
+    // A qualified reference is still ambiguous if the relation exposes the name
+    // more than once (e.g. an alias list `v(x, x)`), matching PG's 42702.
+    let mut local: Option<usize> = None;
+    for (i, col) in rel.columns.iter().enumerate() {
+        if col.name == column {
+            if local.is_some() {
+                return Err(BindError::new(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    format!("column reference \"{column}\" is ambiguous"),
+                ));
+            }
+            local = Some(i);
+        }
+    }
+    // PG names the missing column with its qualifier, unquoted: `column q.c does
+    // not exist` (contrast the unqualified form `column "c" does not exist`).
+    let local = local.ok_or_else(|| {
+        BindError::new(
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column {qualifier}.{column} does not exist"),
+        )
+    })?;
     Ok(BoundExpr::ColumnRef {
         index: rel.offset + local,
         ty: rel.columns[local].ty,
