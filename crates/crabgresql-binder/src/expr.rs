@@ -1506,28 +1506,89 @@ fn bind_in_list(
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     let left = bind_expr(expr, scope)?;
+    let items = list
+        .iter()
+        .map(|item| bind_expr(item, scope))
+        .collect::<Result<Vec<_>, _>>()?;
     let (cmp, chain) = if negated {
         (BinOp::NotEq, BinOp::And)
     } else {
         (BinOp::Eq, BinOp::Or)
     };
+    // An empty list is a parser syntax error (`IN ()`), so this is unreachable;
+    // fold to the constant PG's `= ANY '{}'` yields rather than panic.
+    if items.is_empty() {
+        return Ok(Binding::Typed(BoundExpr::Const {
+            value: Value::Bool(negated),
+            ty: PgType::Bool,
+        }));
+    }
+
+    // PG lowers `x IN (list)` to `x = ANY(ARRAY[list])`: the list is coerced to
+    // one common type (its array element type, which excludes the tested
+    // expression), then each `x = element` resolves as an operator — so the left
+    // keeps its own type and the comparison still promotes (`int`/`real` ->
+    // `float8`, temporal/money handling), matching `x = v`. Coercing the elements
+    // to the list type first is observable: an int that overflows a float4
+    // mantissa rounds when the list type is `real`, exactly as PG's array does.
+    let elem_target = match in_list_type(&items) {
+        ListType::Uniform(ty) => Some(ty),
+        // `x IN (NULL)` settles the untyped elements on the tested expression's
+        // type (`text` when it too is untyped), so `1 IN (NULL)` compares in int
+        // and `NULL IN (NULL)` in text — never the two-unknown ambiguity error.
+        ListType::AllUnknown => Some(binding_typed_ty(&left).unwrap_or(PgType::Text)),
+        // An incompatible list leaves each element as-is so the pair resolves on
+        // its own — PG's OR fallback and its `operator does not exist` error.
+        ListType::Incompatible => None,
+    };
     let mut acc: Option<Binding> = None;
-    for item in list {
-        let rb = bind_expr(item, scope)?;
-        let comparison = bind_binary_op(cmp, left.clone(), rb)?;
+    for item in &items {
+        let right = match elem_target {
+            Some(ty) => Binding::Typed(resolve_operand(item, ty)?),
+            None => item.clone(),
+        };
+        let comparison = bind_binary_op(cmp, left.clone(), right)?;
         acc = Some(match acc {
             None => comparison,
             Some(prev) => bind_binary_op(chain, prev, comparison)?,
         });
     }
-    // An empty list is a parser syntax error (`IN ()`), so this is unreachable;
-    // fold to the constant PG's `= ANY '{}'` yields rather than panic.
-    Ok(acc.unwrap_or_else(|| {
-        Binding::Typed(BoundExpr::Const {
-            value: Value::Bool(negated),
-            ty: PgType::Bool,
-        })
-    }))
+    Ok(acc.expect("non-empty list yields at least one comparison"))
+}
+
+/// How an `IN` list resolves to the element type of PG's `= ANY(ARRAY[...])`.
+enum ListType {
+    /// The typed elements share this common type; coerce every element to it.
+    Uniform(PgType),
+    /// No typed elements (`x IN (NULL)`); the caller falls back to the tested
+    /// expression's type (or `text` when it too is untyped).
+    AllUnknown,
+    /// The typed elements have no common type; leave each element as-is so the
+    /// pair resolves on its own, reproducing PG's `operator does not exist` error.
+    Incompatible,
+}
+
+/// Fold `merge_types` (PG's `select_common_type`) over the `IN` list's typed
+/// elements — the array element type of PG's `= ANY(ARRAY[...])`, which excludes
+/// the tested expression (so `x IN (1, 0::float4)` rounds the `1` to `real` as
+/// PG's array does).
+fn in_list_type(items: &[Binding]) -> ListType {
+    let mut common: Option<PgType> = None;
+    for b in items {
+        if let Some(ty) = binding_typed_ty(b) {
+            common = Some(match common {
+                None => ty,
+                Some(prev) => match merge_types(prev, ty) {
+                    Some(m) => m,
+                    None => return ListType::Incompatible,
+                },
+            });
+        }
+    }
+    match common {
+        Some(ty) => ListType::Uniform(ty),
+        None => ListType::AllUnknown,
+    }
 }
 
 fn bind_binary(
