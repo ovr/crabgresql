@@ -170,6 +170,34 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 .map(Value::Bool)
                 .map_err(text_err);
         }
+        ScalarFn::RegexMatch | ScalarFn::RegexIMatch => {
+            let ci = matches!(func, ScalarFn::RegexIMatch);
+            return text::regex_match(text(&args[0]), text(&args[1]), ci)
+                .map(Value::Bool)
+                .map_err(text_err);
+        }
+        ScalarFn::SimilarTo => {
+            // No ESCAPE clause defaults to `\`; `ESCAPE ''` disables escaping.
+            let escape = match args.get(2) {
+                None => Some('\\'),
+                Some(v) => {
+                    let s = text(v);
+                    if s.chars().count() > 1 {
+                        return Err(err(
+                            sqlstate::INVALID_ESCAPE_SEQUENCE,
+                            "invalid escape string",
+                        )
+                        .with_detail(Some(
+                            "Escape string must be empty or one character.".to_string(),
+                        )));
+                    }
+                    s.chars().next()
+                }
+            };
+            return text::similar_to_match(text(&args[0]), text(&args[1]), escape)
+                .map(Value::Bool)
+                .map_err(text_err);
+        }
         ScalarFn::Encode => {
             return text::encode(bytea(&args[0]), text(&args[1]))
                 .map(Value::Text)

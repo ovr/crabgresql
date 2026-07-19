@@ -15,6 +15,7 @@ mod sqlstate {
     pub const SUBSTRING_ERROR: &str = "22011";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
     pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
+    pub const INVALID_REGULAR_EXPRESSION: &str = "2201B";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
 }
 
@@ -421,6 +422,85 @@ pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool
         let text: Vec<char> = s.chars().collect();
         Ok(match_tokens(&text, &toks))
     }
+}
+
+// --- regex (`~` / `~*`) and SIMILAR TO -------------------------------------
+
+/// Turn a `regex` crate compile failure into PG's `invalid regular expression`
+/// error (SQLSTATE `2201B`). PG's detail text differs from the `regex` crate's,
+/// but the SQLSTATE and message prefix match observed PG behavior.
+fn invalid_regex(e: regex::Error) -> TextError {
+    // The crate's `Display` is multi-line; collapse to a single line so the
+    // message reads like PG's one-line `invalid regular expression: ...`.
+    let detail = e.to_string().split('\n').collect::<Vec<_>>().join(" ");
+    TextError::new(
+        sqlstate::INVALID_REGULAR_EXPRESSION,
+        format!("invalid regular expression: {detail}"),
+    )
+}
+
+/// POSIX regex match, backing the `~` (case-sensitive) and `~*`
+/// (case-insensitive) operators. The match is *unanchored*: `~` succeeds when
+/// the pattern matches anywhere in `s`, as in PG.
+pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<bool> {
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(invalid_regex)?;
+    Ok(re.is_match(s))
+}
+
+/// `SIMILAR TO`: an SQL-standard pattern language distinct from both LIKE and
+/// POSIX regex. It is case-sensitive and matches the *whole* string (unlike
+/// `~`). We translate it to a POSIX regex and delegate to the `regex` crate.
+pub fn similar_to_match(s: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
+    let translated = similar_to_regex(pattern, escape)?;
+    let re = regex::Regex::new(&translated).map_err(invalid_regex)?;
+    Ok(re.is_match(s))
+}
+
+/// Translate a `SIMILAR TO` pattern into an anchored POSIX regex string.
+///
+/// SQL-regex metacharacters (`| * + ? { } ( ) [ ]`) pass through unchanged;
+/// `%` becomes `.*` and `_` becomes `.`; every other character is emitted as a
+/// literal (regex-escaped when special). The escape character (default `\`)
+/// makes the following character a literal. The result is wrapped in `^(?:...)$`
+/// so the match spans the entire string.
+fn similar_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
+    // Characters that are literals in SIMILAR TO but special in a POSIX regex,
+    // so they must be backslash-escaped when they appear as ordinary text.
+    fn push_literal(out: &mut String, c: char) {
+        if matches!(c, '.' | '^' | '$' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+
+    let mut out = String::from("^(?:");
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next) => push_literal(&mut out, next),
+                None => {
+                    return Err(TextError::new(
+                        sqlstate::INVALID_ESCAPE_SEQUENCE,
+                        "invalid SQL regular expression: escape character must not be the last character",
+                    ));
+                }
+            }
+        } else {
+            match c {
+                '%' => out.push_str(".*"),
+                '_' => out.push('.'),
+                // SQL-regex metacharacters are shared with POSIX regex.
+                '|' | '*' | '+' | '?' | '{' | '}' | '(' | ')' | '[' | ']' => out.push(c),
+                other => push_literal(&mut out, other),
+            }
+        }
+    }
+    out.push_str(")$");
+    Ok(out)
 }
 
 // --- encode / decode -------------------------------------------------------
@@ -937,6 +1017,40 @@ mod tests {
         assert!(like("ABC", "abc", None, true).unwrap());
         assert!(like("a%b", "a\\%b", Some('\\'), false).unwrap());
         assert!(!like("axb", "a\\%b", Some('\\'), false).unwrap());
+    }
+
+    #[test]
+    fn regex_matching() {
+        // `~` is an unanchored (substring) match.
+        assert!(regex_match("abc", "b", false).unwrap());
+        assert!(regex_match("abc", "^a", false).unwrap());
+        assert!(!regex_match("abc", "^b", false).unwrap());
+        assert!(!regex_match("abc", "z", false).unwrap());
+        // `~*` is case-insensitive.
+        assert!(regex_match("ABC", "abc", true).unwrap());
+        assert!(!regex_match("ABC", "abc", false).unwrap());
+        // A malformed pattern raises `invalid regular expression` (2201B).
+        let e = regex_match("abc", "a(", false).unwrap_err();
+        assert_eq!(e.sqlstate, "2201B");
+        assert!(e.message.starts_with("invalid regular expression:"));
+    }
+
+    #[test]
+    fn similar_to_matching() {
+        // SIMILAR TO matches the whole string (anchored).
+        assert!(similar_to_match("abc", "a%", Some('\\')).unwrap());
+        assert!(!similar_to_match("abc", "a", Some('\\')).unwrap());
+        assert!(similar_to_match("abc", "a_c", Some('\\')).unwrap());
+        // Alternation and grouping are SQL-regex metacharacters.
+        assert!(similar_to_match("abc", "(a|z)%", Some('\\')).unwrap());
+        // A literal `.` must not act as a wildcard.
+        assert!(!similar_to_match("axc", "a.c", Some('\\')).unwrap());
+        assert!(similar_to_match("a.c", "a.c", Some('\\')).unwrap());
+        // The escape character makes the next character a literal.
+        assert!(similar_to_match("a%c", "a\\%c", Some('\\')).unwrap());
+        assert!(!similar_to_match("axc", "a\\%c", Some('\\')).unwrap());
+        // A trailing bare escape is an error.
+        assert_eq!(similar_to_match("abc", "abc\\", Some('\\')).unwrap_err().sqlstate, "22025");
     }
 
     #[test]
