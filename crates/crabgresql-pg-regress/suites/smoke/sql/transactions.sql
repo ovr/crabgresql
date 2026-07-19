@@ -1,8 +1,9 @@
 --
 -- TRANSACTIONS
--- Control-flow only: block status, warnings, and the aborted-transaction
--- state. Data rollback is not yet implemented (that is the M2 MVCC engine), so
--- this fixture never relies on ROLLBACK undoing writes.
+-- Block status and warnings, the aborted-transaction state, isolation levels,
+-- access modes, and SET TRANSACTION. Cross-session MVCC rollback/visibility is
+-- exercised by the server e2e tests (real undo); this single-session fixture
+-- covers the control-flow and transaction-mode surface.
 --
 -- COMMIT / ROLLBACK with no open block warn but still succeed.
 COMMIT;
@@ -24,3 +25,25 @@ CREATE TABLE t (id integer);
 INSERT INTO t VALUES (1), (2), (3);
 TRUNCATE TABLE t;
 SELECT * FROM t;
+-- Isolation levels are accepted on BEGIN and may be changed with SET
+-- TRANSACTION before the first query in the block.
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT 1 AS one;
+COMMIT;
+-- SET TRANSACTION after a query in the block is rejected (25001).
+BEGIN;
+SELECT 1 AS one;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+ROLLBACK;
+-- SET TRANSACTION outside a block is rejected (25P01).
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+-- A READ ONLY block allows reads but rejects writes (25006).
+BEGIN READ ONLY;
+SELECT * FROM t;
+INSERT INTO t VALUES (1);
+ROLLBACK;
+-- The session default isolation is settable and resettable.
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET default_transaction_isolation = 'read committed';
+RESET default_transaction_isolation;

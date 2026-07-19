@@ -19,6 +19,9 @@ pub struct ActiveTxn {
     /// transactions never consume one, matching PostgreSQL.
     pub xid: Option<Xid>,
     pub iso: IsolationLevel,
+    /// `READ ONLY` access mode: writes in this block are rejected with SQLSTATE
+    /// 25006. Set from the block's transaction modes (or the session default).
+    pub read_only: bool,
     /// REPEATABLE READ (and above) freeze one snapshot for the whole block, set
     /// on the first statement; READ COMMITTED leaves this `None` and takes a
     /// fresh snapshot per statement.
@@ -26,15 +29,23 @@ pub struct ActiveTxn {
     /// Command counter: each statement in the block runs at the next `cid`, so a
     /// later statement sees earlier ones' writes.
     pub cid: CommandId,
+    /// Whether a snapshot-taking statement has run in this block. `SET
+    /// TRANSACTION` may only change the isolation level before the first such
+    /// query (PG raises 25001 afterwards).
+    pub has_run_query: bool,
 }
 
 impl ActiveTxn {
-    pub fn new(iso: IsolationLevel) -> Self {
+    /// Open a block with the given isolation level and access mode (seeded from
+    /// the session defaults, then overridden by the block's transaction modes).
+    pub fn new(iso: IsolationLevel, read_only: bool) -> Self {
         ActiveTxn {
             xid: None,
             iso,
+            read_only,
             snapshot: None,
             cid: CommandId::FIRST,
+            has_run_query: false,
         }
     }
 }
@@ -49,6 +60,13 @@ pub struct Session {
     pub temp_schema: String,
     /// `extra_float_digits` GUC — controls float→text output precision.
     pub extra_float_digits: i32,
+    /// `default_transaction_isolation` GUC — the isolation level a new block
+    /// inherits when it names none. Set by `SET SESSION CHARACTERISTICS AS
+    /// TRANSACTION …` or a plain `SET default_transaction_isolation = …`.
+    pub default_iso: IsolationLevel,
+    /// `default_transaction_read_only` GUC — the access mode a new block inherits
+    /// when it names none.
+    pub default_read_only: bool,
     /// Current transaction state, reported in every `ReadyForQuery`. `Idle`
     /// outside a block, `InTransaction` after `BEGIN`, `Failed` once a statement
     /// errors inside a block (only `COMMIT`/`ROLLBACK` clear it).
@@ -80,6 +98,8 @@ impl Session {
             user: user.into(),
             temp_schema: temp_schema.into(),
             extra_float_digits: 1,
+            default_iso: IsolationLevel::ReadCommitted,
+            default_read_only: false,
             tx_status: TransactionStatus::Idle,
             xact: None,
             txnmgr,
