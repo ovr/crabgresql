@@ -1485,28 +1485,75 @@ fn bind_in_list(
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     let left = bind_expr(expr, scope)?;
+    let items = list
+        .iter()
+        .map(|item| bind_expr(item, scope))
+        .collect::<Result<Vec<_>, _>>()?;
     let (cmp, chain) = if negated {
         (BinOp::NotEq, BinOp::And)
     } else {
         (BinOp::Eq, BinOp::Or)
     };
-    let mut acc: Option<Binding> = None;
-    for item in list {
-        let rb = bind_expr(item, scope)?;
-        let comparison = bind_binary_op(cmp, left.clone(), rb)?;
-        acc = Some(match acc {
-            None => comparison,
-            Some(prev) => bind_binary_op(chain, prev, comparison)?,
-        });
-    }
     // An empty list is a parser syntax error (`IN ()`), so this is unreachable;
     // fold to the constant PG's `= ANY '{}'` yields rather than panic.
-    Ok(acc.unwrap_or_else(|| {
-        Binding::Typed(BoundExpr::Const {
+    if items.is_empty() {
+        return Ok(Binding::Typed(BoundExpr::Const {
             value: Value::Bool(negated),
             ty: PgType::Bool,
-        })
-    }))
+        }));
+    }
+
+    // PG's `transformAExprIn` resolves a single common type across the tested
+    // expression and the whole list (its `= ANY(ARRAY[...])` element type), and
+    // compares every element in that type. When the list has no common type it
+    // falls back to a per-pair OR-of-equals, whose per-pair operator resolution
+    // reproduces PG's `operator does not exist: X = Y` error for that case.
+    let mut acc: Option<Binding> = None;
+    match in_common_type(&left, &items) {
+        Some(ty) => {
+            // Coerce the left operand once and each element to the common type,
+            // then reuse `bind_binary_op` so temporal/money `=` handling still
+            // applies. With both sides already at `ty` the unify step is a no-op.
+            let left = Binding::Typed(resolve_operand(&left, ty)?);
+            for item in &items {
+                let right = Binding::Typed(resolve_operand(item, ty)?);
+                let comparison = bind_binary_op(cmp, left.clone(), right)?;
+                acc = Some(match acc {
+                    None => comparison,
+                    Some(prev) => bind_binary_op(chain, prev, comparison)?,
+                });
+            }
+        }
+        None => {
+            for item in items {
+                let comparison = bind_binary_op(cmp, left.clone(), item)?;
+                acc = Some(match acc {
+                    None => comparison,
+                    Some(prev) => bind_binary_op(chain, prev, comparison)?,
+                });
+            }
+        }
+    }
+    Ok(acc.expect("non-empty list yields at least one comparison"))
+}
+
+/// The common type PG's `transformAExprIn` resolves across the tested expression
+/// and the whole `IN` list — the element type of its `= ANY(ARRAY[...])` form —
+/// folding `merge_types` (PG's `select_common_type`). `None` when a pair has no
+/// common type: an incompatible list PG resolves through its per-pair
+/// OR-of-equals fallback instead. An all-unknown set (`NULL IN (NULL)`) defaults
+/// to `text`, as PG does for unknown literals.
+fn in_common_type(left: &Binding, items: &[Binding]) -> Option<PgType> {
+    let mut common: Option<PgType> = None;
+    for b in std::iter::once(left).chain(items) {
+        if let Some(ty) = binding_typed_ty(b) {
+            common = Some(match common {
+                None => ty,
+                Some(prev) => merge_types(prev, ty)?,
+            });
+        }
+    }
+    Some(common.unwrap_or(PgType::Text))
 }
 
 fn bind_binary(

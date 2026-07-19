@@ -1,0 +1,40 @@
+--
+-- IN / NOT IN
+-- Value-list membership: literal and expression lists, three-valued logic with
+-- NULL, implicit type coercion to a common type, and incompatible/empty lists,
+-- checked against psql's aligned format.
+--
+-- literal list membership; NOT IN is the negation
+SELECT 2 IN (1, 2, 3) AS in3, 5 NOT IN (1, 2, 3) AS notin3;
+-- the tested expression and the list entries may be arbitrary expressions
+SELECT 3 IN (1 + 1, 2 + 1, 10) AS expr_list, 7 NOT IN (1 + 1, 2 + 1) AS notin_expr;
+-- three-valued logic: no match plus a NULL in the list yields NULL, not false
+SELECT 1 IN (2, NULL) AS in_null_nomatch;
+-- a real match short-circuits the NULL and returns true
+SELECT 1 IN (1, NULL) AS in_null_match;
+-- NOT IN with an unmatched NULL is NULL; a matched value makes it false
+SELECT 1 NOT IN (2, NULL) AS notin_null_nomatch, 1 NOT IN (1, NULL) AS notin_null_match;
+-- a NULL on the left makes the whole test NULL
+SELECT NULL IN (1, 2) AS null_left, NULL NOT IN (1, 2) AS null_left_notin;
+-- implicit coercion: int tested against a numeric list resolves to the common type
+SELECT 1 IN (1.0, 2.5) AS int_numeric;
+-- an untyped literal on the left adopts the list's common type
+SELECT '2' IN (1, 2, 3) AS text_lit_left;
+-- mixed integer widths and varchar/text also unify to a common type
+SELECT 2 IN (1::int8, 2::int8) AS int_int8, 'b'::varchar IN ('a', 'b') AS varchar_text;
+-- membership over a table column, evaluated once per row (NULL id -> NULL)
+CREATE TABLE nums (id integer, label text);
+INSERT INTO nums VALUES (1, 'a'), (2, 'b'), (3, 'c'), (NULL, 'd');
+SELECT label, id IN (1, 3) AS in13 FROM nums ORDER BY label;
+-- IN in a WHERE predicate keeps only rows testing true (NULL id dropped)
+SELECT label FROM nums WHERE id IN (1, 3) ORDER BY label;
+-- NOT IN likewise drops the NULL-id row (NULL <> 2 is NULL, not true)
+SELECT label FROM nums WHERE id NOT IN (2) ORDER BY label;
+-- a NULL in a NOT IN list makes every row NULL, so none pass
+SELECT label FROM nums WHERE id NOT IN (2, NULL) ORDER BY label;
+-- error: no common type for the list falls back to per-pair equality
+SELECT 1 IN (1, 'foo'::text);
+-- error: an untyped list literal that does not fit the resolved type
+SELECT 1 IN (2, 'x');
+-- error: an empty list is a syntax error
+SELECT 1 IN ();
