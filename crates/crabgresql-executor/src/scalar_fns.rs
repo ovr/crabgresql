@@ -11,9 +11,10 @@ use std::hint::black_box;
 
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_binder::GeoFn;
 use crabgresql_types::{
-    Inet, Interval, Numeric, TimeTz, Value, bit, date, float, interval, macaddr, money, net, text,
-    time, timestamp, timestamptz, timetz, to_char,
+    Inet, Interval, Numeric, TimeTz, Value, bit, date, float, geo, interval, macaddr, money, net,
+    text, time, timestamp, timestamptz, timetz, to_char,
 };
 
 use crate::ExecError;
@@ -79,6 +80,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         return Ok(Value::Null);
     }
     match func {
+        // --- geometric (point / lseg) ---
+        ScalarFn::Geo(g) => return eval_geo(g, args),
         // --- string functions ---
         ScalarFn::TextConcat => {
             return Ok(Value::Text(format!("{}{}", text(&args[0]), text(&args[1]))));
@@ -1058,6 +1061,8 @@ pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, Str
         "macaddr8" => macaddr::parse_macaddr8(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
+        "point" => geo::parse_point(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message)),
+        "lseg" => geo::parse_lseg(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message)),
         // Other types: not exercised; treat as valid.
         _ => Ok(()),
     }
@@ -1075,6 +1080,98 @@ fn f8(v: &Value) -> f64 {
         Value::Float8(v) => *v,
         other => unreachable!("expected float8 arg, got {other:?}"),
     }
+}
+
+fn point_of(v: &Value) -> [f64; 2] {
+    match v {
+        Value::Point(p) => *p,
+        other => unreachable!("expected point arg, got {other:?}"),
+    }
+}
+
+fn lseg_of(v: &Value) -> [f64; 4] {
+    match v {
+        Value::Lseg(l) => *l,
+        other => unreachable!("expected lseg arg, got {other:?}"),
+    }
+}
+
+/// Evaluate a geometric (`point`/`lseg`) operator or function. Arguments arrive
+/// in the fixed order documented on each [`GeoFn`]; a geometric error (range /
+/// divide-by-zero) maps to its SQLSTATE. `#`'s no-intersection case is NULL.
+fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
+    let geo_err = |e: geo::GeoError| err(e.sqlstate, e.message);
+    Ok(match g {
+        GeoFn::PointConstruct => Value::Point([f8(&args[0]), f8(&args[1])]),
+        GeoFn::PointDist => {
+            Value::Float8(geo::point_distance(&point_of(&args[0]), &point_of(&args[1])))
+        }
+        GeoFn::PointLeft => Value::Bool(geo::point_left(&point_of(&args[0]), &point_of(&args[1]))),
+        GeoFn::PointRight => Value::Bool(geo::point_right(&point_of(&args[0]), &point_of(&args[1]))),
+        GeoFn::PointAbove => Value::Bool(geo::point_above(&point_of(&args[0]), &point_of(&args[1]))),
+        GeoFn::PointBelow => Value::Bool(geo::point_below(&point_of(&args[0]), &point_of(&args[1]))),
+        GeoFn::PointEq => Value::Bool(geo::point_eq(&point_of(&args[0]), &point_of(&args[1]))),
+        GeoFn::PointHoriz => {
+            Value::Bool(geo::point_horizontal(&point_of(&args[0]), &point_of(&args[1])))
+        }
+        GeoFn::PointVert => {
+            Value::Bool(geo::point_vertical(&point_of(&args[0]), &point_of(&args[1])))
+        }
+        GeoFn::PointAdd => {
+            Value::Point(geo::point_add(&point_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::PointSub => {
+            Value::Point(geo::point_sub(&point_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::PointMul => {
+            Value::Point(geo::point_mul(&point_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::PointDiv => {
+            Value::Point(geo::point_div(&point_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::PointSlope => {
+            Value::Float8(geo::point_slope(&point_of(&args[0]), &point_of(&args[1])))
+        }
+        GeoFn::DistPointSeg => {
+            Value::Float8(geo::dist_point_seg(&point_of(&args[0]), &lseg_of(&args[1])))
+        }
+        GeoFn::PointOnSeg => {
+            Value::Bool(geo::point_on_seg(&point_of(&args[0]), &lseg_of(&args[1])))
+        }
+        GeoFn::ClosePointSeg => {
+            Value::Point(geo::close_point_seg(&point_of(&args[0]), &lseg_of(&args[1])))
+        }
+        GeoFn::LsegConstruct => {
+            Value::Lseg(geo::lseg_from_points(&point_of(&args[0]), &point_of(&args[1])))
+        }
+        GeoFn::LsegLength => Value::Float8(geo::lseg_length(&lseg_of(&args[0]))),
+        GeoFn::LsegCenter => Value::Point(geo::lseg_center(&lseg_of(&args[0]))),
+        GeoFn::LsegVert => Value::Bool(geo::lseg_vertical(&lseg_of(&args[0]))),
+        GeoFn::LsegHoriz => Value::Bool(geo::lseg_horizontal(&lseg_of(&args[0]))),
+        GeoFn::LsegEq => Value::Bool(geo::lseg_eq(&lseg_of(&args[0]), &lseg_of(&args[1]))),
+        GeoFn::LsegNe => Value::Bool(geo::lseg_ne(&lseg_of(&args[0]), &lseg_of(&args[1]))),
+        GeoFn::LsegLt => Value::Bool(geo::lseg_lt(&lseg_of(&args[0]), &lseg_of(&args[1]))),
+        GeoFn::LsegLe => Value::Bool(geo::lseg_le(&lseg_of(&args[0]), &lseg_of(&args[1]))),
+        GeoFn::LsegGt => Value::Bool(geo::lseg_gt(&lseg_of(&args[0]), &lseg_of(&args[1]))),
+        GeoFn::LsegGe => Value::Bool(geo::lseg_ge(&lseg_of(&args[0]), &lseg_of(&args[1]))),
+        GeoFn::LsegParallel => {
+            Value::Bool(geo::lseg_parallel(&lseg_of(&args[0]), &lseg_of(&args[1])))
+        }
+        GeoFn::LsegPerpendicular => {
+            Value::Bool(geo::lseg_perpendicular(&lseg_of(&args[0]), &lseg_of(&args[1])))
+        }
+        GeoFn::LsegInterpt => match geo::lseg_interpt(&lseg_of(&args[0]), &lseg_of(&args[1])) {
+            Some(p) => Value::Point(p),
+            None => Value::Null,
+        },
+        GeoFn::CloseSegSeg => match geo::close_seg_seg(&lseg_of(&args[0]), &lseg_of(&args[1])) {
+            Some(p) => Value::Point(p),
+            None => Value::Null,
+        },
+        GeoFn::DistSegSeg => {
+            Value::Float8(geo::dist_seg_seg(&lseg_of(&args[0]), &lseg_of(&args[1])))
+        }
+    })
 }
 
 fn text(v: &Value) -> &str {

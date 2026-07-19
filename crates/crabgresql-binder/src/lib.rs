@@ -11,7 +11,7 @@ pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, Scope, UnaryOp, bind_column_default, bind_expr,
     bind_scalar, coerce_to_column, length_typmod, map_data_type,
 };
-pub use functions::{AggFn, ScalarFn, TableFn, lookup_table_fn};
+pub use functions::{AggFn, GeoFn, ScalarFn, TableFn, lookup_table_fn};
 pub use plan::{
     AggInput, JoinExpr, JoinInput, JoinKind, LogicalPlan, SortKey, bind_delete, bind_insert,
     bind_query, bind_update,
