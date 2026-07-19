@@ -18,6 +18,7 @@ test: join
 test: generate_series
 test: string
 test: uuid
+test: geo
 test: inet
 test: cidr
 test: pg_catalog

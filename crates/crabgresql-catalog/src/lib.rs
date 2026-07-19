@@ -388,6 +388,8 @@ mod tests {
             ("uuid", PgType::Uuid),
             ("inet", PgType::Inet),
             ("cidr", PgType::Cidr),
+            ("point", PgType::Point),
+            ("lseg", PgType::Lseg),
         ];
         for (typname, ty) in modeled {
             let row = PG_TYPE_ROWS

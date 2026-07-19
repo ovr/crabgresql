@@ -389,6 +389,82 @@ pub enum ScalarFn {
     BitTypmod,
     /// Apply a `bit varying(n)` length coercion (`bit`, `int4 n`[, flag]).
     VarbitTypmod,
+    // --- geometric (point / lseg) ---
+    /// A geometric operator/function; the specific operation is the payload.
+    Geo(GeoFn),
+}
+
+/// A geometric (`point` / `lseg`) operation. Operators lower to these via
+/// `resolve_geometric_op`/`resolve_geometric_unary`; named functions register
+/// them in [`lookup`]. Argument order is fixed per variant (see each doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeoFn {
+    /// `point(float8, float8) -> point`.
+    PointConstruct,
+    /// `p1 <-> p2` point distance (`-> float8`).
+    PointDist,
+    /// `p1 << p2` (strictly left).
+    PointLeft,
+    /// `p1 >> p2` (strictly right).
+    PointRight,
+    /// `p1 |>> p2` (strictly above).
+    PointAbove,
+    /// `p1 <<| p2` (strictly below).
+    PointBelow,
+    /// `p1 ~= p2` (same as).
+    PointEq,
+    /// `p1 ?- p2` / `ishorizontal(p1, p2)` (share a y).
+    PointHoriz,
+    /// `p1 ?| p2` / `isvertical(p1, p2)` (share an x).
+    PointVert,
+    /// `p1 + p2` translate (`-> point`).
+    PointAdd,
+    /// `p1 - p2` translate (`-> point`).
+    PointSub,
+    /// `p1 * p2` complex multiply (`-> point`).
+    PointMul,
+    /// `p1 / p2` complex divide (`-> point`).
+    PointDiv,
+    /// `slope(p1, p2) -> float8`.
+    PointSlope,
+    /// `point <-> lseg` distance (`-> float8`); args are `[point, lseg]`.
+    DistPointSeg,
+    /// `point <@ lseg` (point lies on the segment); args are `[point, lseg]`.
+    PointOnSeg,
+    /// `point ## lseg` closest point on the segment; args are `[point, lseg]`.
+    ClosePointSeg,
+    /// `lseg(point, point) -> lseg`.
+    LsegConstruct,
+    /// `@-@ lseg` length (`-> float8`).
+    LsegLength,
+    /// `@@ lseg` center / `lseg::point` (`-> point`).
+    LsegCenter,
+    /// `?| lseg` vertical.
+    LsegVert,
+    /// `?- lseg` horizontal.
+    LsegHoriz,
+    /// `l1 = l2` (endpoints fuzzily equal).
+    LsegEq,
+    /// `l1 <> l2`.
+    LsegNe,
+    /// `l1 < l2` (by length).
+    LsegLt,
+    /// `l1 <= l2` (by length).
+    LsegLe,
+    /// `l1 > l2` (by length).
+    LsegGt,
+    /// `l1 >= l2` (by length).
+    LsegGe,
+    /// `l1 ?|| l2` parallel.
+    LsegParallel,
+    /// `l1 ?-| l2` perpendicular.
+    LsegPerpendicular,
+    /// `l1 # l2` intersection point (`-> point`, NULL if none).
+    LsegInterpt,
+    /// `l1 ## l2` closest point on `l2` to `l1` (`-> point`).
+    CloseSegSeg,
+    /// `l1 <-> l2` segment distance (`-> float8`).
+    DistSegSeg,
 }
 
 struct Signature {
@@ -635,6 +711,8 @@ const BIT: PgType = PgType::Bit;
 const VARBIT: PgType = PgType::Varbit;
 const MACADDR: PgType = PgType::Macaddr;
 const MACADDR8: PgType = PgType::Macaddr8;
+const POINT: PgType = PgType::Point;
+const LSEG: PgType = PgType::Lseg;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -936,6 +1014,12 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature { func: ScalarFn::AbbrevInet, args: &[INET], ret: TEXT },
             Signature { func: ScalarFn::AbbrevCidr, args: &[CIDR], ret: TEXT },
         ],
+        // --- geometric constructors / accessors ---
+        "point" => &[Signature { func: ScalarFn::Geo(GeoFn::PointConstruct), args: &[F8, F8], ret: POINT }],
+        "lseg" => &[Signature { func: ScalarFn::Geo(GeoFn::LsegConstruct), args: &[POINT, POINT], ret: LSEG }],
+        "slope" => &[Signature { func: ScalarFn::Geo(GeoFn::PointSlope), args: &[POINT, POINT], ret: F8 }],
+        "ishorizontal" => &[Signature { func: ScalarFn::Geo(GeoFn::PointHoriz), args: &[POINT, POINT], ret: BOOL }],
+        "isvertical" => &[Signature { func: ScalarFn::Geo(GeoFn::PointVert), args: &[POINT, POINT], ret: BOOL }],
         _ => &[],
     }
 }

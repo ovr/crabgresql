@@ -9,6 +9,7 @@ pub mod bit;
 pub mod cast;
 pub mod date;
 pub mod float;
+pub mod geo;
 pub mod interval;
 pub mod macaddr;
 pub mod money;
@@ -59,6 +60,10 @@ pub mod oid {
     pub const MACADDR: u32 = 829;
     pub const MACADDR8: u32 = 774;
     pub const UUID: u32 = 2950;
+    /// `point`: a geometric `(x, y)` pair of float8. See [`crate::geo`].
+    pub const POINT: u32 = 600;
+    /// `lseg`: a geometric line segment (two points). See [`crate::geo`].
+    pub const LSEG: u32 = 601;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +119,11 @@ pub enum PgType {
     Macaddr,
     /// `macaddr8`: an 8-byte MAC address (EUI-64). See [`crate::macaddr`].
     Macaddr8,
+    /// `point`: a geometric `(x, y)` pair. Fixed 16-byte type. See [`crate::geo`].
+    Point,
+    /// `lseg`: a geometric line segment (two points). Fixed 32-byte type.
+    /// See [`crate::geo`].
+    Lseg,
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -149,6 +159,8 @@ impl PgType {
             PgType::Cidr => oid::CIDR,
             PgType::Macaddr => oid::MACADDR,
             PgType::Macaddr8 => oid::MACADDR8,
+            PgType::Point => oid::POINT,
+            PgType::Lseg => oid::LSEG,
             PgType::User(oid) => oid,
         }
     }
@@ -173,6 +185,8 @@ impl PgType {
             PgType::Oid => 4,
             PgType::Macaddr => 6,
             PgType::Macaddr8 => 8,
+            PgType::Point => 16,
+            PgType::Lseg => 32,
             // `name` is a fixed 64-byte type; the rest are varlena.
             PgType::Name => 64,
             PgType::Numeric
@@ -218,6 +232,8 @@ impl PgType {
             PgType::Cidr => "cidr",
             PgType::Macaddr => "macaddr",
             PgType::Macaddr8 => "macaddr8",
+            PgType::Point => "point",
+            PgType::Lseg => "lseg",
             PgType::User(_) => "user-defined",
         }
     }
@@ -253,6 +269,8 @@ impl PgType {
             PgType::Cidr => "cidr",
             PgType::Macaddr => "macaddr",
             PgType::Macaddr8 => "macaddr8",
+            PgType::Point => "point",
+            PgType::Lseg => "lseg",
             PgType::User(_) => "user-defined",
         }
     }
@@ -336,6 +354,10 @@ pub enum Value {
     Macaddr([u8; 6]),
     /// `macaddr8`: 8 raw bytes (EUI-64). See [`crate::macaddr`].
     Macaddr8([u8; 8]),
+    /// `point`: an `(x, y)` pair of float8. See [`crate::geo`].
+    Point([f64; 2]),
+    /// `lseg`: a line segment `[(x1,y1),(x2,y2)]` of float8. See [`crate::geo`].
+    Lseg([f64; 4]),
 }
 
 impl Value {
@@ -365,6 +387,8 @@ impl Value {
             Value::Cidr(_) => Some(PgType::Cidr),
             Value::Macaddr(_) => Some(PgType::Macaddr),
             Value::Macaddr8(_) => Some(PgType::Macaddr8),
+            Value::Point(_) => Some(PgType::Point),
+            Value::Lseg(_) => Some(PgType::Lseg),
         }
     }
 
@@ -408,6 +432,8 @@ impl Value {
             Value::Cidr(v) => Some(net::cidr_out(v)),
             Value::Macaddr(b) => Some(macaddr::format6(b)),
             Value::Macaddr8(b) => Some(macaddr::format8(b)),
+            Value::Point(p) => Some(geo::format_point(p, efd)),
+            Value::Lseg(l) => Some(geo::format_lseg(l, efd)),
         }
     }
 }

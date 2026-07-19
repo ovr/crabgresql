@@ -347,6 +347,17 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             .map(Value::Macaddr)
             .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
 
+        // ---- text → point / lseg (point_in / lseg_in) ----
+        (Value::Text(s), PgType::Point) => crate::geo::parse_point(s)
+            .map(Value::Point)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Lseg) => crate::geo::parse_lseg(s)
+            .map(Value::Lseg)
+            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+
+        // ---- lseg → point (lseg_center): the segment's midpoint ----
+        (Value::Lseg(l), PgType::Point) => Ok(Value::Point(crate::geo::lseg_center(l))),
+
         _ => Err(cannot_coerce(from, to)),
     }
 }

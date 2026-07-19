@@ -791,6 +791,16 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         // is enforced separately as a typmod coercion.
         DataType::Bit(_) => PgType::Bit,
         DataType::BitVarying(_) | DataType::VarBit(_) => PgType::Varbit,
+        // Geometric types. `point`/`lseg` are modeled; the rest are not yet.
+        DataType::GeometricType(kind) => match kind {
+            ast::GeometricTypeKind::Point => PgType::Point,
+            ast::GeometricTypeKind::LineSegment => PgType::Lseg,
+            other => {
+                return Err(BindError::feature_not_supported(format!(
+                    "type \"{other}\" is not supported yet"
+                )));
+            }
+        },
         // `bpchar` (no length = unlimited, like text) and `name` arrive as
         // custom type names.
         DataType::Custom(obj, mods) if mods.is_empty() => {
@@ -802,6 +812,10 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                 Some("oid") => PgType::Oid,
                 Some("macaddr") => PgType::Macaddr,
                 Some("macaddr8") => PgType::Macaddr8,
+                // `point`/`lseg` reach here as bareword type names (`::point`,
+                // `f1 point`); the `point '...'`/`GeometricType` path is separate.
+                Some("point") => PgType::Point,
+                Some("lseg") => PgType::Lseg,
                 _ => {
                     return Err(BindError::feature_not_supported(format!(
                         "type \"{dt}\" is not supported yet"
@@ -1362,10 +1376,43 @@ fn bind_unary(
             Binding::Typed(e) => Err(no_op_unary("~", e.ty().name())),
             Binding::Unknown { .. } => Err(ambiguous_unary("~")),
         },
+        // Unary geometric operators over `lseg`: `@-@` length, `@@` center,
+        // `?-` horizontal, `?|` vertical. (Other geometric operands are added
+        // with their types.)
+        ast::UnaryOperator::AtDashAt
+        | ast::UnaryOperator::DoubleAt
+        | ast::UnaryOperator::QuestionDash
+        | ast::UnaryOperator::QuestionPipe => {
+            resolve_geometric_unary(op, bind_expr(operand, scope)?)
+        }
         other => Err(BindError::feature_not_supported(format!(
             "operator is not supported yet: {other}"
         ))),
     }
+}
+
+/// Unary geometric operators (`@-@`, `@@`, `?-`, `?|`) over `lseg`. Returns the
+/// "operator does not exist" error for a non-geometric or untyped operand.
+fn resolve_geometric_unary(op: ast::UnaryOperator, operand: Binding) -> Result<Binding, BindError> {
+    use crate::functions::GeoFn;
+    let sym = op.to_string();
+    let e = match operand {
+        Binding::Typed(e) if e.ty() == PgType::Lseg => e,
+        Binding::Typed(e) => return Err(no_op_unary(&sym, e.ty().name())),
+        Binding::Unknown { .. } => return Err(ambiguous_unary(&sym)),
+    };
+    let (func, ret) = match op {
+        ast::UnaryOperator::AtDashAt => (GeoFn::LsegLength, PgType::Float8),
+        ast::UnaryOperator::DoubleAt => (GeoFn::LsegCenter, PgType::Point),
+        ast::UnaryOperator::QuestionDash => (GeoFn::LsegHoriz, PgType::Bool),
+        ast::UnaryOperator::QuestionPipe => (GeoFn::LsegVert, PgType::Bool),
+        _ => unreachable!("resolve_geometric_unary only handles the geometric unary operators"),
+    };
+    Ok(Binding::Typed(BoundExpr::FuncCall {
+        func: ScalarFn::Geo(func),
+        ret,
+        args: vec![e],
+    }))
 }
 
 /// `|/` / `||/`: coerce the operand to float8 (unknown → float8), producing a
@@ -1568,6 +1615,14 @@ fn bind_binary(
     // `macaddr`/`macaddr8` bitwise `&`/`|` — like the inet operators, they don't
     // fit the single-`arg_ty` `Binary` node and lower to `ScalarFn` calls.
     if let Some(binding) = resolve_macaddr_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
+    // Geometric operators (`point`/`lseg` distance, containment, arithmetic,
+    // comparisons) don't fit the single-`arg_ty` `Binary` node either; they
+    // lower to `ScalarFn::Geo` calls. Tried before the generic mapping so
+    // `<<`/`>>`/`=`/`<` etc. reach here when a geometric operand is present.
+    if let Some(binding) = resolve_geometric_op(op, &lb, &rb)? {
         return Ok(binding);
     }
 
@@ -2031,6 +2086,137 @@ fn resolve_network_op(
                 return Err(net_no_operator(lb, op, rb));
             };
             call(ScalarFn::InetMiInt8, PgType::Inet, a?, n?)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Whether `ty` is a geometric type modeled here (`point` or `lseg`).
+fn is_geo_ty(ty: Option<PgType>) -> bool {
+    matches!(ty, Some(PgType::Point | PgType::Lseg))
+}
+
+/// Geometric (`point`/`lseg`) binary operators lower to `ScalarFn::Geo` calls,
+/// as `resolve_network_op` does for the inet operators. Returns `Ok(None)` when
+/// no geometric operand is present (so the generic path and its errors apply) or
+/// when the operator/operand-type combination has no geometric operator.
+fn resolve_geometric_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+) -> Result<Option<Binding>, BindError> {
+    use ast::BinaryOperator as B;
+    use crate::functions::GeoFn;
+    let lt = binding_typed_ty(lb);
+    let rt = binding_typed_ty(rb);
+    if !is_geo_ty(lt) && !is_geo_ty(rt) {
+        return Ok(None);
+    }
+    // An untyped literal mirrors the other (geometric) side's type.
+    let left_ty = lt.or(rt);
+    let right_ty = rt.or(lt);
+    // Both operands must land on a geometric type for any of these operators.
+    if !is_geo_ty(left_ty) || !is_geo_ty(right_ty) {
+        return Ok(None);
+    }
+    let l = |t: PgType| resolve_operand(lb, t);
+    let r = |t: PgType| resolve_operand(rb, t);
+    let call = |func, ret, args: Vec<BoundExpr>| {
+        Ok(Some(Binding::Typed(BoundExpr::FuncCall { func, ret, args })))
+    };
+    let geo = |f: GeoFn| ScalarFn::Geo(f);
+
+    use PgType::{Lseg, Point};
+    let combo = (left_ty.unwrap(), right_ty.unwrap());
+    match op {
+        // Distance — point↔point, point↔lseg, lseg↔lseg.
+        B::LtDashGt => match combo {
+            (Point, Point) => call(geo(GeoFn::PointDist), PgType::Float8, vec![l(Point)?, r(Point)?]),
+            (Point, Lseg) => {
+                call(geo(GeoFn::DistPointSeg), PgType::Float8, vec![l(Point)?, r(Lseg)?])
+            }
+            (Lseg, Point) => {
+                call(geo(GeoFn::DistPointSeg), PgType::Float8, vec![r(Point)?, l(Lseg)?])
+            }
+            (Lseg, Lseg) => call(geo(GeoFn::DistSegSeg), PgType::Float8, vec![l(Lseg)?, r(Lseg)?]),
+            _ => Ok(None),
+        },
+        // Point positional / same-as / horizontal / vertical predicates.
+        B::PGBitwiseShiftLeft if combo == (Point, Point) => {
+            call(geo(GeoFn::PointLeft), PgType::Bool, vec![l(Point)?, r(Point)?])
+        }
+        B::PGBitwiseShiftRight if combo == (Point, Point) => {
+            call(geo(GeoFn::PointRight), PgType::Bool, vec![l(Point)?, r(Point)?])
+        }
+        B::PipeGtGt if combo == (Point, Point) => {
+            call(geo(GeoFn::PointAbove), PgType::Bool, vec![l(Point)?, r(Point)?])
+        }
+        B::LtLtPipe if combo == (Point, Point) => {
+            call(geo(GeoFn::PointBelow), PgType::Bool, vec![l(Point)?, r(Point)?])
+        }
+        B::TildeEq if combo == (Point, Point) => {
+            call(geo(GeoFn::PointEq), PgType::Bool, vec![l(Point)?, r(Point)?])
+        }
+        B::QuestionDash if combo == (Point, Point) => {
+            call(geo(GeoFn::PointHoriz), PgType::Bool, vec![l(Point)?, r(Point)?])
+        }
+        B::QuestionPipe if combo == (Point, Point) => {
+            call(geo(GeoFn::PointVert), PgType::Bool, vec![l(Point)?, r(Point)?])
+        }
+        // Point arithmetic (`-> point`).
+        B::Plus if combo == (Point, Point) => {
+            call(geo(GeoFn::PointAdd), PgType::Point, vec![l(Point)?, r(Point)?])
+        }
+        B::Minus if combo == (Point, Point) => {
+            call(geo(GeoFn::PointSub), PgType::Point, vec![l(Point)?, r(Point)?])
+        }
+        B::Multiply if combo == (Point, Point) => {
+            call(geo(GeoFn::PointMul), PgType::Point, vec![l(Point)?, r(Point)?])
+        }
+        B::Divide if combo == (Point, Point) => {
+            call(geo(GeoFn::PointDiv), PgType::Point, vec![l(Point)?, r(Point)?])
+        }
+        // `point <@ lseg` (point lies on the segment).
+        B::ArrowAt if combo == (Point, Lseg) => {
+            call(geo(GeoFn::PointOnSeg), PgType::Bool, vec![l(Point)?, r(Lseg)?])
+        }
+        // `##` closest point: point→lseg or lseg→lseg (result on the 2nd operand).
+        B::DoubleHash => match combo {
+            (Point, Lseg) => {
+                call(geo(GeoFn::ClosePointSeg), PgType::Point, vec![l(Point)?, r(Lseg)?])
+            }
+            (Lseg, Lseg) => call(geo(GeoFn::CloseSegSeg), PgType::Point, vec![l(Lseg)?, r(Lseg)?]),
+            _ => Ok(None),
+        },
+        // `#` intersection point of two segments (NULL if none).
+        B::PGBitwiseXor if combo == (Lseg, Lseg) => {
+            call(geo(GeoFn::LsegInterpt), PgType::Point, vec![l(Lseg)?, r(Lseg)?])
+        }
+        // lseg parallel / perpendicular.
+        B::QuestionDoublePipe if combo == (Lseg, Lseg) => {
+            call(geo(GeoFn::LsegParallel), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
+        }
+        B::QuestionDashPipe if combo == (Lseg, Lseg) => {
+            call(geo(GeoFn::LsegPerpendicular), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
+        }
+        // lseg b-tree comparisons (`=`/`<>` by endpoints, the rest by length).
+        B::Eq if combo == (Lseg, Lseg) => {
+            call(geo(GeoFn::LsegEq), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
+        }
+        B::NotEq if combo == (Lseg, Lseg) => {
+            call(geo(GeoFn::LsegNe), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
+        }
+        B::Lt if combo == (Lseg, Lseg) => {
+            call(geo(GeoFn::LsegLt), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
+        }
+        B::LtEq if combo == (Lseg, Lseg) => {
+            call(geo(GeoFn::LsegLe), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
+        }
+        B::Gt if combo == (Lseg, Lseg) => {
+            call(geo(GeoFn::LsegGt), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
+        }
+        B::GtEq if combo == (Lseg, Lseg) => {
+            call(geo(GeoFn::LsegGe), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
         }
         _ => Ok(None),
     }
@@ -2677,6 +2863,12 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Macaddr8 => crabgresql_types::macaddr::parse_macaddr8(s)
             .map(Value::Macaddr8)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Point => crabgresql_types::geo::parse_point(s)
+            .map(Value::Point)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Lseg => crabgresql_types::geo::parse_lseg(s)
+            .map(Value::Lseg)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::User(_) => Err(invalid()),
     }
