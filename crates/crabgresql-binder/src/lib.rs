@@ -9,12 +9,15 @@ mod plan;
 
 pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, Scope, UnaryOp, bind_column_default, bind_expr,
-    bind_scalar, coerce_to_column, length_typmod, map_data_type,
+    bind_scalar, coerce_to_column, length_typmod, map_data_type, param_ctx_extended,
+    param_ctx_none, param_types, require_all_resolved, ParamCtx, ParamState,
 };
 pub use functions::{AggFn, GeoFn, ScalarFn, TableFn, lookup_table_fn};
 pub use plan::{
-    AggInput, JoinExpr, JoinInput, JoinKind, LogicalPlan, SortKey, bind_delete, bind_insert,
-    bind_query, bind_update,
+    AggInput, JoinExpr, JoinInput, JoinKind, LogicalPlan, SortKey, bind_delete,
+    bind_delete_with_params, bind_insert, bind_insert_with_params, bind_query,
+    bind_query_with_params, bind_update, bind_update_with_params, output_columns_of,
+    substitute_params,
 };
 
 use crabgresql_parser::Span;

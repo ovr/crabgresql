@@ -34,6 +34,18 @@ pub const DUPLICATE_TABLE: &str = "42P07";
 pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
 pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
 pub const PROTOCOL_VIOLATION: &str = "08P01";
+/// `26000` — a Bind/Describe names a prepared statement that does not exist.
+pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
+/// `34000` — an Execute/Describe names a portal (cursor) that does not exist.
+pub const INVALID_CURSOR_NAME: &str = "34000";
+/// `42P02` — a `$n` placeholder with no such parameter (e.g. in a simple query).
+pub const UNDEFINED_PARAMETER: &str = "42P02";
+/// `42P18` — a parameter's type could not be determined / is inconsistent.
+pub const INDETERMINATE_DATATYPE: &str = "42P18";
+/// `22P03` — a binary parameter value the type's receive function rejects.
+pub const INVALID_BINARY_REPRESENTATION: &str = "22P03";
+/// `XX000` — an internal invariant was violated (should be unreachable).
+pub const INTERNAL_ERROR: &str = "XX000";
 pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
 pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
 pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";

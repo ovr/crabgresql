@@ -21,6 +21,14 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, 
     match expr {
         BoundExpr::Const { value, .. } => Ok(value.clone()),
         BoundExpr::ColumnRef { index, .. } => Ok(row[*index].clone()),
+        // A `$n` placeholder is replaced with its bound `Const` value by
+        // `substitute_params` before a portal executes, so evaluation never sees
+        // one. Reaching here means the extended-protocol driver skipped that step
+        // — an internal invariant violation, not a user error.
+        BoundExpr::Param { index, .. } => Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            format!("parameter ${} was not bound before execution", index + 1),
+        )),
         BoundExpr::Unary { op, expr } => eval_unary(*op, eval(expr, row, ctx)?),
         BoundExpr::Binary {
             op,

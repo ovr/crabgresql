@@ -7,7 +7,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crabgresql_binder::{LogicalPlan, bind_delete, bind_insert, bind_query, bind_update};
+use crabgresql_binder::{
+    LogicalPlan, bind_delete_with_params, bind_insert_with_params, bind_query_with_params,
+    bind_update_with_params, output_columns_of, param_ctx_extended, param_ctx_none, param_types,
+    require_all_resolved, substitute_params,
+};
 use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
@@ -16,7 +20,7 @@ use crabgresql_storage_api::{
     TableEngine, TableSchema, TypeCatalog,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
-use crabgresql_types::PgType;
+use crabgresql_types::{PgType, Value};
 
 use crate::catalog::SessionCatalog;
 use crate::error::PgError;
@@ -95,51 +99,48 @@ impl QueryResult {
     }
 }
 
-pub fn execute_statement(
+/// Parameters supplied to a statement. A simple (`Q`) query passes
+/// [`BoundParams::none`]; the extended protocol passes the types resolved at
+/// `Parse` and the values decoded at `Bind`.
+pub struct BoundParams {
+    /// Resolved type per `$n` placeholder (index = n − 1). Empty for a simple
+    /// query.
+    pub types: Vec<PgType>,
+    /// Decoded value per `$n`, parallel to `types`.
+    pub values: Vec<Value>,
+    /// Whether `$n` placeholders are permitted. A simple query sets this false,
+    /// so a stray `$n` is rejected with `42P02` rather than inferred.
+    pub extended: bool,
+}
+
+impl BoundParams {
+    /// No parameters, and none permitted — the simple-query default.
+    pub fn none() -> Self {
+        Self {
+            types: Vec::new(),
+            values: Vec::new(),
+            extended: false,
+        }
+    }
+}
+
+/// What `Parse`/`Describe` needs about a statement without executing it: the
+/// resolved parameter types (for `ParameterDescription`) and the result column
+/// shape (`None` = `NoData`: a utility or data-modifying statement).
+pub struct Analyzed {
+    pub param_types: Vec<PgType>,
+    pub result_columns: Option<Vec<OutputColumn>>,
+}
+
+/// Build the binder's two catalog views for this session: the `pg_temp`-first
+/// relation overlay (temp shadows permanent, both behind the read-only
+/// `pg_catalog`) and the user-type/cast view. Shared by `execute_statement` and
+/// `analyze_statement` so binding sees identical name resolution either way.
+fn bind_catalogs(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
-    txnmgr: &Arc<TransactionManager>,
-    stmt: &ast::Statement,
-    session: &mut Session,
-) -> Result<QueryResult, PgError> {
-    // In an aborted transaction block, PG rejects everything but COMMIT/ROLLBACK
-    // until the block ends.
-    if session.tx_status == TransactionStatus::Failed
-        && !matches!(
-            stmt,
-            ast::Statement::Commit { .. } | ast::Statement::Rollback { .. }
-        )
-    {
-        return Err(PgError::new(
-            sqlstate::IN_FAILED_SQL_TRANSACTION,
-            "current transaction is aborted, commands ignored until end of transaction block",
-        ));
-    }
-    // PG's "SET TRANSACTION ISOLATION LEVEL must be called before any query" rule
-    // keys off whether a snapshot-taking statement has run in this block.
-    // Transaction control and SET/RESET take no snapshot; every other statement
-    // (SELECT, DML, and DDL like CREATE/DROP) does — so mark the block here, at
-    // the statement boundary, rather than only on the DML path.
-    if let Some(active) = session.xact.as_mut()
-        && statement_takes_snapshot(stmt)
-    {
-        active.has_run_query = true;
-    }
-    // A read-only transaction rejects data-changing DDL up front, before name
-    // resolution: PG reports 25006 for `DROP TABLE missing` rather than the
-    // undefined-table error. (DML is checked after binding below, because PG
-    // resolves the target relation first for INSERT/UPDATE/DELETE.)
-    if read_only_active(session)
-        && let Some(command) = read_only_prohibited_ddl(stmt)
-    {
-        return Err(PgError::new(
-            sqlstate::READ_ONLY_SQL_TRANSACTION,
-            format!("cannot execute {command} in a read-only transaction"),
-        ));
-    }
-    // Resolution overlay: the session's temp catalog shadows the shared global
-    // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
-    // so it keeps the raw engine + session below.
+    session: &Session,
+) -> (Arc<dyn TableEngine>, Arc<dyn TypeCatalog>) {
     // The read-only system catalog (`pg_catalog`), rebuilt per statement so its
     // rows reflect current server state: live user relations (permanent + this
     // session's temp tables) are reflected into pg_class/pg_attribute. The
@@ -184,11 +185,148 @@ pub fn execute_statement(
     // The global catalog is the binder's view of user-defined types and casts,
     // so an expression can cast to/from a `CREATE TYPE` name.
     let type_catalog: Arc<dyn TypeCatalog> = global_catalog.clone();
+    (catalog, type_catalog)
+}
+
+/// Bind a DQL/DML statement against `catalog`, threading `$n` placeholders
+/// through `params`. Returns the resolved logical plan with every `Param`
+/// already replaced by its bound value (so downstream planning/execution is
+/// parameter-free); a non-DQL/DML statement returns `Ok(None)` for the caller
+/// to handle inline. `require_params` gates whether all placeholders must have
+/// resolved (extended protocol) — a simple query has none.
+fn bind_dml_with_params(
+    catalog: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    stmt: &ast::Statement,
+    params: &BoundParams,
+) -> Result<Option<LogicalPlan>, PgError> {
+    let ctx = if params.extended {
+        param_ctx_extended(params.types.iter().map(|t| Some(*t)).collect())
+    } else {
+        param_ctx_none()
+    };
     let logical = match stmt {
-        ast::Statement::Query(query) => bind_query(&catalog, &type_catalog, query)?,
-        ast::Statement::Insert(insert) => bind_insert(&catalog, &type_catalog, insert)?,
-        ast::Statement::Update(update) => bind_update(&catalog, &type_catalog, update)?,
-        ast::Statement::Delete(delete) => bind_delete(&catalog, &type_catalog, delete)?,
+        ast::Statement::Query(query) => bind_query_with_params(catalog, type_catalog, query, &ctx)?,
+        ast::Statement::Insert(insert) => {
+            bind_insert_with_params(catalog, type_catalog, insert, &ctx)?
+        }
+        ast::Statement::Update(update) => {
+            bind_update_with_params(catalog, type_catalog, update, &ctx)?
+        }
+        ast::Statement::Delete(delete) => {
+            bind_delete_with_params(catalog, type_catalog, delete, &ctx)?
+        }
+        _ => return Ok(None),
+    };
+    if params.extended {
+        // Every placeholder must have received a type; then fold the bound
+        // values in so the plan no longer mentions parameters.
+        require_all_resolved(&ctx)?;
+        let mut logical = logical;
+        substitute_params(&mut logical, &params.values);
+        return Ok(Some(logical));
+    }
+    Ok(Some(logical))
+}
+
+/// Analyze a statement for `Parse`/`Describe`: resolve its parameter types and
+/// result-column shape without executing. `declared` holds the parameter type
+/// OIDs a `Parse` message supplied, mapped to types (`None` = infer).
+pub fn analyze_statement(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    stmt: &ast::Statement,
+    declared: Vec<Option<PgType>>,
+    session: &Session,
+) -> Result<Analyzed, PgError> {
+    let (catalog, type_catalog) = bind_catalogs(engine, global_catalog, session);
+    let ctx = param_ctx_extended(declared);
+    let logical = match stmt {
+        ast::Statement::Query(query) => bind_query_with_params(&catalog, &type_catalog, query, &ctx)?,
+        ast::Statement::Insert(insert) => {
+            bind_insert_with_params(&catalog, &type_catalog, insert, &ctx)?
+        }
+        ast::Statement::Update(update) => {
+            bind_update_with_params(&catalog, &type_catalog, update, &ctx)?
+        }
+        ast::Statement::Delete(delete) => {
+            bind_delete_with_params(&catalog, &type_catalog, delete, &ctx)?
+        }
+        // Utility statements (DDL/SET/transaction control) take no parameters and
+        // return no rows; their errors surface at Execute, as in PG.
+        _ => {
+            return Ok(Analyzed {
+                param_types: Vec::new(),
+                result_columns: None,
+            });
+        }
+    };
+    require_all_resolved(&ctx)?;
+    // A `Parse` may leave trailing parameters undeclared and unused; PG reports a
+    // type for every parameter up to the highest referenced. `param_types` grew
+    // to that count during binding, and `require_all_resolved` proved each is
+    // `Some`.
+    let param_types = param_types(&ctx).into_iter().flatten().collect();
+    // A DQL plan has a row shape; a data-modifying plan does not (no RETURNING),
+    // which `output_columns_of` reports as an error we fold to `None` (NoData).
+    let result_columns = output_columns_of(&logical).ok();
+    Ok(Analyzed {
+        param_types,
+        result_columns,
+    })
+}
+
+pub fn execute_statement(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    stmt: &ast::Statement,
+    session: &mut Session,
+    params: &BoundParams,
+) -> Result<QueryResult, PgError> {
+    // In an aborted transaction block, PG rejects everything but COMMIT/ROLLBACK
+    // until the block ends.
+    if session.tx_status == TransactionStatus::Failed
+        && !matches!(
+            stmt,
+            ast::Statement::Commit { .. } | ast::Statement::Rollback { .. }
+        )
+    {
+        return Err(PgError::new(
+            sqlstate::IN_FAILED_SQL_TRANSACTION,
+            "current transaction is aborted, commands ignored until end of transaction block",
+        ));
+    }
+    // PG's "SET TRANSACTION ISOLATION LEVEL must be called before any query" rule
+    // keys off whether a snapshot-taking statement has run in this block.
+    // Transaction control and SET/RESET take no snapshot; every other statement
+    // (SELECT, DML, and DDL like CREATE/DROP) does — so mark the block here, at
+    // the statement boundary, rather than only on the DML path.
+    if let Some(active) = session.xact.as_mut()
+        && statement_takes_snapshot(stmt)
+    {
+        active.has_run_query = true;
+    }
+    // A read-only transaction rejects data-changing DDL up front, before name
+    // resolution: PG reports 25006 for `DROP TABLE missing` rather than the
+    // undefined-table error. (DML is checked after binding below, because PG
+    // resolves the target relation first for INSERT/UPDATE/DELETE.)
+    if read_only_active(session)
+        && let Some(command) = read_only_prohibited_ddl(stmt)
+    {
+        return Err(PgError::new(
+            sqlstate::READ_ONLY_SQL_TRANSACTION,
+            format!("cannot execute {command} in a read-only transaction"),
+        ));
+    }
+    // Resolution overlay: the session's temp catalog shadows the shared global
+    // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
+    // so it keeps the raw engine + session below.
+    let (catalog, type_catalog) = bind_catalogs(engine, global_catalog, session);
+    let logical = match bind_dml_with_params(&catalog, &type_catalog, stmt, params)? {
+        Some(logical) => logical,
+        // Not DQL/DML: fall through to the utility-statement handlers below.
+        None => match stmt {
         ast::Statement::CreateTable(create) => {
             return execute_create_table(engine, &type_catalog, create, session);
         }
@@ -263,6 +401,7 @@ pub fn execute_statement(
                 statement_kind(other)
             )));
         }
+        },
     };
     // A write statement needs an XID to stamp its versions; a read runs with
     // none. Decide from the bound plan, not the surface AST: the binder already

@@ -4,16 +4,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crabgresql_pg_wire::{
-    BackendWriter, FieldDescription, FrontendMessage, FrontendReader, ProtocolError,
-    StartupRequest, TransactionStatus, sqlstate,
+    BackendMessage, BackendWriter, FieldDescription, Format, FrontendMessage, FrontendReader,
+    ProtocolError, StartupRequest, Target, TransactionStatus, sqlstate,
 };
+use crabgresql_executor::OutputColumn;
 use crabgresql_storage_api::TableEngine;
 use crabgresql_txn::TransactionManager;
+use crabgresql_types::cast::CastError;
+use crabgresql_types::{PgType, Value, wire};
 use tokio::net::TcpStream;
 
+use crate::error::PgError;
 use crate::global_catalog::GlobalCatalog;
-use crate::query::{NoticeSeverity, QueryResult, execute_statement};
-use crate::session::Session;
+use crate::query::{
+    Analyzed, BoundParams, Notice, NoticeSeverity, QueryResult, analyze_statement,
+    execute_statement,
+};
+use crate::session::{Portal, PreparedStatement, Session, SuspendedRows};
 
 /// Fake backend pids for BackendKeyData: every connection needs a distinct
 /// one, but there are no processes to kill yet (cancel lands with M1+).
@@ -94,16 +101,22 @@ pub async fn handle_connection(
 
     // After an error on an extended-protocol message, PG discards everything
     // until Sync and only then sends ReadyForQuery — one error, one RFQ per
-    // Parse..Sync batch, or the driver's state machine desyncs.
+    // Parse..Sync batch, or the driver's state machine desyncs. Extended-query
+    // replies are buffered and flushed at Sync/Flush (or after a simple Query),
+    // so the whole batch travels in one write, as libpq expects.
     let mut skip_until_sync = false;
     loop {
         match reader.read_message().await? {
             None | Some(FrontendMessage::Terminate) => return Ok(()),
+            // Sync ends an extended-query batch: clear any error state and send
+            // exactly one ReadyForQuery. It is honored even while skipping — that
+            // is what ends the skip.
             Some(FrontendMessage::Sync) => {
                 skip_until_sync = false;
                 writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
+            // Between an error and the next Sync, every message is dropped.
             Some(_) if skip_until_sync => {}
             Some(FrontendMessage::Query(sql)) => {
                 run_simple_query(&sql, &engine, &catalog, &txnmgr, &mut session, &mut writer)
@@ -111,23 +124,107 @@ pub async fn handle_connection(
                 writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
-            // The codec decodes the extended-query, COPY and function-call
-            // messages, but the engine only runs the simple-query protocol, so
-            // every other frontend message is answered like an unsupported one.
-            Some(other) => {
-                writer.error_response(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    &format!(
-                        "protocol message '{}' is not supported yet (only the simple query protocol is implemented)",
-                        other.tag() as char
-                    ),
+            Some(FrontendMessage::Parse {
+                name,
+                query,
+                param_types,
+            }) => {
+                let outcome =
+                    handle_parse(&engine, &catalog, &mut session, &mut writer, &name, &query, &param_types);
+                report(&mut writer, &mut session, &mut skip_until_sync, outcome, Some(&query));
+            }
+            Some(FrontendMessage::Bind {
+                portal,
+                statement,
+                param_formats,
+                params,
+                result_formats,
+            }) => {
+                let outcome = handle_bind(
+                    &mut session,
+                    &mut writer,
+                    portal,
+                    &statement,
+                    &param_formats,
+                    &params,
+                    result_formats,
                 );
-                writer.flush().await?;
-                // An error inside a block aborts it: the next Sync must report 'E'.
-                mark_transaction_failed(&mut session);
-                skip_until_sync = true;
+                report(&mut writer, &mut session, &mut skip_until_sync, outcome, None);
+            }
+            Some(FrontendMessage::Describe { target, name }) => {
+                let outcome = handle_describe(&mut session, &mut writer, target, &name);
+                report(&mut writer, &mut session, &mut skip_until_sync, outcome, None);
+            }
+            Some(FrontendMessage::Execute { portal, max_rows }) => {
+                let outcome = handle_execute(
+                    &engine,
+                    &catalog,
+                    &txnmgr,
+                    &mut session,
+                    &mut writer,
+                    &portal,
+                    max_rows,
+                );
+                report(&mut writer, &mut session, &mut skip_until_sync, outcome, None);
+            }
+            Some(FrontendMessage::Close { target, name }) => {
+                // Close never fails: an unknown name is not an error (PG).
+                match target {
+                    Target::Statement => {
+                        session.prepared.remove(&name);
+                    }
+                    Target::Portal => {
+                        session.portals.remove(&name);
+                    }
+                }
+                writer.write(&BackendMessage::CloseComplete);
+            }
+            // Flush forces buffered replies onto the wire without ending the
+            // batch — no ReadyForQuery, no state change.
+            Some(FrontendMessage::Flush) => writer.flush().await?,
+            // COPY, function-call and password messages have no place in this
+            // flow; answer like any unsupported message and recover at Sync.
+            Some(other) => {
+                report(
+                    &mut writer,
+                    &mut session,
+                    &mut skip_until_sync,
+                    Err(PgError::feature_not_supported(format!(
+                        "protocol message '{}' is not supported yet",
+                        other.tag() as char
+                    ))),
+                    None,
+                );
             }
         }
+    }
+}
+
+/// Report the outcome of an extended-query handler. On success the handler has
+/// already buffered its completion reply; on error, emit exactly one
+/// ErrorResponse, mark an open transaction failed, and start skipping until the
+/// next Sync — the protocol's "one error per batch" rule. `sql`, when present,
+/// lets a bind-time cursor position resolve to a wire character offset.
+fn report(
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    session: &mut Session,
+    skip_until_sync: &mut bool,
+    outcome: Result<(), PgError>,
+    sql: Option<&str>,
+) {
+    if let Err(e) = outcome {
+        let position = e
+            .location
+            .and_then(|(line, col)| sql.map(|s| char_position(s, line, col)));
+        writer.error_response_detailed(
+            e.code,
+            &e.message,
+            e.detail.as_deref(),
+            e.hint.as_deref(),
+            position,
+        );
+        mark_transaction_failed(session);
+        *skip_until_sync = true;
     }
 }
 
@@ -164,7 +261,7 @@ async fn run_simple_query(
     }
     for stmt in &statements {
         let efd = session.extra_float_digits;
-        match execute_statement(engine, catalog, txnmgr, stmt, session) {
+        match execute_statement(engine, catalog, txnmgr, stmt, session, &BoundParams::none()) {
             Ok(result) => {
                 if write_result(writer, result, efd, sql).await? == WriteOutcome::Errored {
                     mark_transaction_failed(session);
@@ -230,21 +327,7 @@ async fn write_result(
     match result {
         QueryResult::Command { tag, notices } => {
             // PG order: any NOTICE/WARNING messages, then CommandComplete.
-            for notice in &notices {
-                match notice.severity {
-                    NoticeSeverity::Warning => {
-                        writer.warning_response(notice.code, &notice.message)
-                    }
-                    NoticeSeverity::Notice => writer.notice_response(
-                        notice.code,
-                        &notice.message,
-                        notice.detail.as_deref(),
-                        notice
-                            .location
-                            .map(|(line, col)| char_position(sql, line, col)),
-                    ),
-                }
-            }
+            emit_notices(writer, &notices, Some(sql));
             writer.command_complete(&tag);
         }
         QueryResult::Rows { columns, mut node } => {
@@ -276,4 +359,403 @@ async fn write_result(
         }
     }
     Ok(WriteOutcome::Completed)
+}
+
+/// Emit any NOTICE/WARNING messages that precede a command's CommandComplete, in
+/// order. `sql`, when present, resolves a notice's cursor position to a wire
+/// character offset (the simple-query path has the text; extended Execute does
+/// not, and passes `None`).
+fn emit_notices(
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    notices: &[Notice],
+    sql: Option<&str>,
+) {
+    for notice in notices {
+        match notice.severity {
+            NoticeSeverity::Warning => writer.warning_response(notice.code, &notice.message),
+            NoticeSeverity::Notice => writer.notice_response(
+                notice.code,
+                &notice.message,
+                notice.detail.as_deref(),
+                notice
+                    .location
+                    .and_then(|(line, col)| sql.map(|s| char_position(s, line, col))),
+            ),
+        }
+    }
+}
+
+/// Map a value-layer cast/decode failure to a client `ErrorResponse`.
+fn cast_error(e: CastError) -> PgError {
+    PgError::new(e.sqlstate, e.message)
+}
+
+/// The transfer format for column/parameter `i` from a Bind format list: 0
+/// entries means all-text, 1 entry applies to every column, otherwise one entry
+/// per column — the encoding the `Bind` message uses for both parameter and
+/// result formats.
+fn format_at(formats: &[Format], i: usize) -> Format {
+    match formats.len() {
+        0 => Format::Text,
+        1 => formats[0],
+        _ => formats[i],
+    }
+}
+
+/// Build a `RowDescription`'s fields from a statement's output columns, applying
+/// the requested per-column result `formats`. Query results carry no catalog
+/// origin or typmod, matching the simple-query path.
+fn field_descriptions(cols: &[OutputColumn], formats: &[Format]) -> Vec<FieldDescription> {
+    cols.iter()
+        .enumerate()
+        .map(|(i, c)| FieldDescription {
+            name: c.name.clone(),
+            table_oid: 0,
+            column_id: 0,
+            type_oid: c.ty.oid(),
+            type_len: c.ty.typlen(),
+            type_modifier: -1,
+            format: format_at(formats, i),
+        })
+        .collect()
+}
+
+/// Encode one result row's columns in the portal's requested formats. A binary
+/// request for a type without a binary output routine is an honest `0A000`.
+fn encode_row(
+    row: &[Value],
+    formats: &[Format],
+    efd: i32,
+) -> Result<Vec<Option<Vec<u8>>>, PgError> {
+    row.iter()
+        .enumerate()
+        .map(|(i, v)| match format_at(formats, i) {
+            Format::Text => Ok(v.encode_text_with(efd).map(String::into_bytes)),
+            Format::Binary => v.encode_binary().map_err(cast_error),
+        })
+        .collect()
+}
+
+/// Parse (`P`): parse and analyze one statement into a prepared statement.
+/// Extended-query Parse allows at most one command; parse-analysis runs here so
+/// Describe and Bind have the parameter types and result shape.
+fn handle_parse(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    session: &mut Session,
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    name: &str,
+    query: &str,
+    param_oids: &[u32],
+) -> Result<(), PgError> {
+    let mut statements =
+        crabgresql_parser::parse(query).map_err(|e| PgError::syntax(e.to_string()))?;
+    if statements.len() > 1 {
+        return Err(PgError::syntax(
+            "cannot insert multiple commands into a prepared statement",
+        ));
+    }
+    // 0 or 1 statement; an empty query string prepares to `None`.
+    let stmt = statements.pop();
+    // Map declared parameter type OIDs: 0 = unspecified (infer from context),
+    // otherwise a built-in type; an unknown OID is an undefined_object, as in PG.
+    let declared = param_oids
+        .iter()
+        .map(|&oid| {
+            if oid == 0 {
+                Ok(None)
+            } else {
+                PgType::from_oid(oid).map(Some).ok_or_else(|| {
+                    PgError::new(
+                        sqlstate::UNDEFINED_OBJECT,
+                        format!("type with OID {oid} does not exist"),
+                    )
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (param_types, result_columns) = match &stmt {
+        Some(stmt) => {
+            let Analyzed {
+                param_types,
+                result_columns,
+            } = analyze_statement(engine, global_catalog, stmt, declared, session)?;
+            (param_types, result_columns)
+        }
+        None => (Vec::new(), None),
+    };
+    session.prepared.insert(
+        name.to_string(),
+        PreparedStatement {
+            stmt,
+            param_types,
+            result_columns,
+        },
+    );
+    writer.write(&BackendMessage::ParseComplete);
+    Ok(())
+}
+
+/// Bind (`B`): create a portal by decoding the parameter values a prepared
+/// statement requires and recording the requested result formats.
+fn handle_bind(
+    session: &mut Session,
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    portal: String,
+    statement: &str,
+    param_formats: &[Format],
+    params: &[Option<Vec<u8>>],
+    result_formats: Vec<Format>,
+) -> Result<(), PgError> {
+    let prepared = session.prepared.get(statement).ok_or_else(|| {
+        PgError::new(
+            sqlstate::INVALID_SQL_STATEMENT_NAME,
+            format!("prepared statement \"{statement}\" does not exist"),
+        )
+    })?;
+    if params.len() != prepared.param_types.len() {
+        return Err(PgError::new(
+            sqlstate::PROTOCOL_VIOLATION,
+            format!(
+                "bind message supplies {} parameters, but prepared statement \"{statement}\" requires {}",
+                params.len(),
+                prepared.param_types.len()
+            ),
+        ));
+    }
+    let mut values = Vec::with_capacity(params.len());
+    for (i, bytes) in params.iter().enumerate() {
+        let ty = prepared.param_types[i];
+        let value = match bytes {
+            None => Value::Null,
+            Some(bytes) => match format_at(param_formats, i) {
+                Format::Text => {
+                    let text = std::str::from_utf8(bytes).map_err(|_| {
+                        PgError::new(
+                            sqlstate::INVALID_TEXT_REPRESENTATION,
+                            "invalid byte sequence for encoding \"UTF8\"",
+                        )
+                    })?;
+                    wire::decode_text(ty, text).map_err(cast_error)?
+                }
+                Format::Binary => wire::decode_binary(ty, bytes).map_err(cast_error)?,
+            },
+        };
+        values.push(value);
+    }
+    session.portals.insert(
+        portal,
+        Portal {
+            statement: statement.to_string(),
+            params: values,
+            result_formats,
+            suspended: None,
+        },
+    );
+    writer.write(&BackendMessage::BindComplete);
+    Ok(())
+}
+
+/// Describe (`D`): report a statement's parameters + result shape, or a portal's
+/// result shape. A statement with no result rows answers `NoData`.
+fn handle_describe(
+    session: &mut Session,
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    target: Target,
+    name: &str,
+) -> Result<(), PgError> {
+    match target {
+        Target::Statement => {
+            let prepared = session.prepared.get(name).ok_or_else(|| {
+                PgError::new(
+                    sqlstate::INVALID_SQL_STATEMENT_NAME,
+                    format!("prepared statement \"{name}\" does not exist"),
+                )
+            })?;
+            let oids = prepared.param_types.iter().map(|t| t.oid()).collect();
+            writer.write(&BackendMessage::ParameterDescription(oids));
+            // Before Bind the result formats are unknown, so RowDescription
+            // reports text format (0), as PG does for a statement Describe.
+            match &prepared.result_columns {
+                Some(cols) => writer.write(&BackendMessage::RowDescription(field_descriptions(
+                    cols,
+                    &[],
+                ))),
+                None => writer.write(&BackendMessage::NoData),
+            }
+        }
+        Target::Portal => {
+            let portal = session.portals.get(name).ok_or_else(|| {
+                PgError::new(
+                    sqlstate::INVALID_CURSOR_NAME,
+                    format!("portal \"{name}\" does not exist"),
+                )
+            })?;
+            let prepared = session.prepared.get(&portal.statement).ok_or_else(|| {
+                PgError::new(
+                    sqlstate::INTERNAL_ERROR,
+                    "portal references a dropped prepared statement",
+                )
+            })?;
+            match &prepared.result_columns {
+                Some(cols) => writer.write(&BackendMessage::RowDescription(field_descriptions(
+                    cols,
+                    &portal.result_formats,
+                ))),
+                None => writer.write(&BackendMessage::NoData),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Execute (`E`): run a portal, streaming its rows in the requested formats. A
+/// row limit (`max_rows > 0`) suspends the portal after that many rows; a later
+/// Execute resumes it. Does not send RowDescription — that is Describe's job.
+fn handle_execute(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    session: &mut Session,
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    portal_name: &str,
+    max_rows: i32,
+) -> Result<(), PgError> {
+    if !session.portals.contains_key(portal_name) {
+        return Err(PgError::new(
+            sqlstate::INVALID_CURSOR_NAME,
+            format!("portal \"{portal_name}\" does not exist"),
+        ));
+    }
+    // A portal a previous row-limited Execute left suspended resumes from its
+    // buffered rows, without re-running the query.
+    if session.portals[portal_name].suspended.is_some() {
+        return resume_portal(session, writer, portal_name, max_rows);
+    }
+    // Fresh execution. Copy out what `execute_statement` needs, since it borrows
+    // the whole session; cloning the parsed statement keeps the prepared
+    // statement reusable across executions.
+    let stmt_name = session.portals[portal_name].statement.clone();
+    let param_values = session.portals[portal_name].params.clone();
+    let result_formats = session.portals[portal_name].result_formats.clone();
+    let (stmt, param_types) = {
+        let prepared = session.prepared.get(&stmt_name).ok_or_else(|| {
+            PgError::new(
+                sqlstate::INTERNAL_ERROR,
+                "portal references a dropped prepared statement",
+            )
+        })?;
+        (prepared.stmt.clone(), prepared.param_types.clone())
+    };
+    let Some(stmt) = stmt else {
+        writer.write(&BackendMessage::EmptyQueryResponse);
+        return Ok(());
+    };
+    let efd = session.extra_float_digits;
+    let params = BoundParams {
+        types: param_types,
+        values: param_values,
+        extended: true,
+    };
+    let result = execute_statement(engine, global_catalog, txnmgr, &stmt, session, &params)?;
+    stream_execute(session, writer, portal_name, result, &result_formats, efd, max_rows)
+}
+
+/// Stream a freshly executed portal's result. Rows are encoded per the portal's
+/// result formats; a row limit materializes the remainder into the portal and
+/// answers PortalSuspended.
+fn stream_execute(
+    session: &mut Session,
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    portal_name: &str,
+    result: QueryResult,
+    formats: &[Format],
+    efd: i32,
+    max_rows: i32,
+) -> Result<(), PgError> {
+    match result {
+        QueryResult::Command { tag, notices } => {
+            emit_notices(writer, &notices, None);
+            writer.command_complete(&tag);
+            Ok(())
+        }
+        QueryResult::Rows { columns: _, mut node } => {
+            let limit = (max_rows > 0).then_some(max_rows as usize);
+            let mut count = 0usize;
+            loop {
+                if limit == Some(count) {
+                    // Row limit reached: drain the rest into the portal so it can
+                    // resume without holding the live iterator across messages.
+                    let mut rest = Vec::new();
+                    loop {
+                        match node.next() {
+                            Ok(Some(row)) => rest.push(row),
+                            Ok(None) => break,
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    if rest.is_empty() {
+                        writer.command_complete(&format!("SELECT {count}"));
+                    } else {
+                        if let Some(portal) = session.portals.get_mut(portal_name) {
+                            portal.suspended = Some(SuspendedRows {
+                                rows: rest,
+                                next: 0,
+                                delivered: count,
+                            });
+                        }
+                        writer.write(&BackendMessage::PortalSuspended);
+                    }
+                    return Ok(());
+                }
+                match node.next() {
+                    Ok(Some(row)) => {
+                        writer.write(&BackendMessage::DataRow(encode_row(&row, formats, efd)?));
+                        count += 1;
+                    }
+                    Ok(None) => {
+                        writer.command_complete(&format!("SELECT {count}"));
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    }
+}
+
+/// Resume a suspended portal: deliver up to `max_rows` more buffered rows, then
+/// PortalSuspended (still more) or CommandComplete with the running total.
+fn resume_portal(
+    session: &mut Session,
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    portal_name: &str,
+    max_rows: i32,
+) -> Result<(), PgError> {
+    let efd = session.extra_float_digits;
+    let formats = session.portals[portal_name].result_formats.clone();
+    let limit = if max_rows > 0 { max_rows as usize } else { usize::MAX };
+    let portal = session.portals.get_mut(portal_name).unwrap();
+    let sus = portal.suspended.as_mut().unwrap();
+    let mut served = 0usize;
+    while sus.next < sus.rows.len() && served < limit {
+        // `writer` is independent of `session`, so writing while the portal is
+        // mutably borrowed is fine. Encode before advancing so a failure leaves
+        // the cursor consistent (only reachable if the first Execute already
+        // succeeded, so in practice it never fails here).
+        let cols = encode_row(&sus.rows[sus.next], &formats, efd)?;
+        writer.write(&BackendMessage::DataRow(cols));
+        sus.next += 1;
+        sus.delivered += 1;
+        served += 1;
+    }
+    let drained = sus.next >= sus.rows.len();
+    let delivered = sus.delivered;
+    if drained {
+        session.portals.get_mut(portal_name).unwrap().suspended = None;
+        writer.command_complete(&format!("SELECT {delivered}"));
+    } else {
+        writer.write(&BackendMessage::PortalSuspended);
+    }
+    Ok(())
 }

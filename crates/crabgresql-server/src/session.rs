@@ -3,13 +3,59 @@
 //! `I`/`T`/`E` byte) and the data-level transaction ([`ActiveTxn`], the XID and
 //! snapshot MVCC runs against) are tracked side by side.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crabgresql_executor::ExecContext;
+use crabgresql_executor::{ExecContext, OutputColumn};
 use crabgresql_memory_storage::MemoryEngine;
-use crabgresql_pg_wire::TransactionStatus;
+use crabgresql_parser::ast;
+use crabgresql_pg_wire::{Format, TransactionStatus};
 use crabgresql_storage_api::TableEngine;
 use crabgresql_txn::{CommandId, IsolationLevel, Snapshot, TransactionManager, Xid};
+use crabgresql_types::{PgType, Value};
+
+/// A prepared statement (extended protocol `Parse`). Parse-analysis runs once,
+/// here, so `Describe` can answer without executing and `Bind` knows each
+/// parameter's type. Re-binding at `Execute` uses these resolved types, so the
+/// plan is deterministic across executions.
+pub struct PreparedStatement {
+    /// The parsed statement; `None` for an empty query string (its `Execute`
+    /// answers `EmptyQueryResponse`).
+    pub stmt: Option<ast::Statement>,
+    /// Resolved type per `$n` placeholder (index = n − 1), reported verbatim by
+    /// `ParameterDescription`.
+    pub param_types: Vec<PgType>,
+    /// Result-column shape, or `None` for a statement that returns no rows
+    /// (utility or data-modifying) — `Describe` then answers `NoData`.
+    pub result_columns: Option<Vec<OutputColumn>>,
+}
+
+/// A portal (extended protocol `Bind`): a prepared statement plus concrete
+/// parameter values and the client's requested result formats.
+pub struct Portal {
+    /// Name of the prepared statement this portal was bound from.
+    pub statement: String,
+    /// Decoded parameter values, parallel to the statement's `param_types`.
+    pub params: Vec<Value>,
+    /// Per-column result formats. Length 0 = all text, 1 = applies to every
+    /// column, otherwise one entry per column (as the `Bind` message encodes).
+    pub result_formats: Vec<Format>,
+    /// A row-limited `Execute` (`max_rows > 0`) materializes the whole result
+    /// here and delivers it in chunks across successive `Execute`s, sending
+    /// `PortalSuspended` until it is drained. `None` until first suspended.
+    pub suspended: Option<SuspendedRows>,
+}
+
+/// The remaining rows of a portal suspended by a row-limited `Execute`.
+pub struct SuspendedRows {
+    /// The rows not yet delivered, materialized when the portal first suspended.
+    pub rows: Vec<Vec<Value>>,
+    /// Index of the next row to deliver.
+    pub next: usize,
+    /// Total rows already delivered across every Execute of this portal, so the
+    /// final CommandComplete reports the whole portal's `SELECT n`.
+    pub delivered: usize,
+}
 
 /// The data-level state of an explicit `BEGIN … COMMIT/ROLLBACK` block. Separate
 /// from [`TransactionStatus`], which is the wire control-flow byte: this holds
@@ -83,6 +129,11 @@ pub struct Session {
     /// permanent table. Dropped with the session on disconnect — that is the
     /// temp tables' teardown.
     pub temp: Arc<dyn TableEngine>,
+    /// Extended-protocol prepared statements, keyed by name (`""` = the unnamed
+    /// statement, which `Parse` overwrites each time).
+    pub prepared: HashMap<String, PreparedStatement>,
+    /// Extended-protocol portals, keyed by name (`""` = the unnamed portal).
+    pub portals: HashMap<String, Portal>,
 }
 
 impl Session {
@@ -104,6 +155,8 @@ impl Session {
             xact: None,
             txnmgr,
             temp: Arc::new(MemoryEngine::new()),
+            prepared: HashMap::new(),
+            portals: HashMap::new(),
         }
     }
 

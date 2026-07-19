@@ -122,6 +122,93 @@ fn rows(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow>
         .collect()
 }
 
+/// tokio-postgres drives the extended protocol: it sends Parse with no declared
+/// parameter types and relies on the server to infer them and return binary
+/// results. A parameterized arithmetic query must round-trip through
+/// inference + binary decode.
+#[tokio::test]
+async fn extended_query_infers_params_and_returns_binary() {
+    let client = connect(spawn_server().await).await;
+    let row = client
+        .query_one("SELECT $1::int4 + $2::int4 AS sum", &[&1i32, &2i32])
+        .await
+        .unwrap();
+    let sum: i32 = row.get("sum");
+    assert_eq!(sum, 3);
+
+    // A bigint result exercises 8-byte binary output.
+    let row = client
+        .query_one("SELECT $1::int8 AS v", &[&42i64])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>("v"), 42);
+
+    // Text and bool parameters + results.
+    let row = client
+        .query_one("SELECT $1::text AS t, $2::bool AS b", &[&"hi", &true])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, &str>("t"), "hi");
+    assert!(row.get::<_, bool>("b"));
+}
+
+/// A parameter typed only by its use against a table column: the server infers
+/// `$1` from the compared column, with no cast in the SQL.
+#[tokio::test]
+async fn extended_query_infers_param_from_column_context() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE nums (id int4)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO nums VALUES (5), (7), (9)")
+        .await
+        .unwrap();
+
+    let rows = client
+        .query("SELECT id FROM nums WHERE id = $1", &[&7i32])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("id"), 7);
+}
+
+/// A prepared statement is reused across executions with different values, and a
+/// NULL parameter round-trips.
+#[tokio::test]
+async fn prepared_statement_reused_and_null_param() {
+    let client = connect(spawn_server().await).await;
+    let stmt = client.prepare("SELECT $1::int8 AS v").await.unwrap();
+    assert_eq!(client.query_one(&stmt, &[&10i64]).await.unwrap().get::<_, i64>("v"), 10);
+    assert_eq!(client.query_one(&stmt, &[&20i64]).await.unwrap().get::<_, i64>("v"), 20);
+
+    let row = client
+        .query_one("SELECT $1::int4 AS v", &[&Option::<i32>::None])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<i32>>("v"), None);
+}
+
+/// A parameter whose type cannot be determined is reported (42P18), and the
+/// connection stays usable.
+#[tokio::test]
+async fn undeterminable_param_type_errors() {
+    let client = connect(spawn_server().await).await;
+    let err = client
+        .query("SELECT $1", &[&1i32])
+        .await
+        .expect_err("bare $1 has no type context");
+    assert_eq!(
+        err.code().expect("has SQLSTATE").code(),
+        "42P18",
+        "could not determine data type of parameter"
+    );
+    // Still usable.
+    let row = client.query_one("SELECT $1::int4 AS v", &[&5i32]).await.unwrap();
+    assert_eq!(row.get::<_, i32>("v"), 5);
+}
+
 #[tokio::test]
 async fn select_one() {
     let client = connect(spawn_server().await).await;
@@ -1698,28 +1785,66 @@ fn frontend_message(tag: u8, body: &[u8]) -> Vec<u8> {
     msg
 }
 
-/// A failed extended-protocol batch must produce exactly one ErrorResponse
-/// and one ReadyForQuery (at Sync) — per-message replies desync drivers.
+/// Collect every backend `(tag, body)` up to and including the terminating
+/// ReadyForQuery, after the caller has written an extended-query batch.
+async fn read_until_ready(socket: &mut tokio::net::TcpStream) -> Vec<(u8, Vec<u8>)> {
+    let mut out = Vec::new();
+    loop {
+        let (tag, body) = read_backend_message(socket).await;
+        let done = tag == b'Z';
+        out.push((tag, body));
+        if done {
+            return out;
+        }
+    }
+}
+
+/// A valid Parse/Bind/Describe/Execute/Sync batch runs end to end: ParseComplete,
+/// BindComplete, RowDescription (from Describe portal), the row, CommandComplete,
+/// and one ReadyForQuery.
+#[tokio::test]
+async fn extended_protocol_runs_a_full_batch() {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    let mut batch = Vec::new();
+    batch.extend(frontend_message(b'P', b"\0SELECT 1\0\x00\x00")); // Parse (no params)
+    batch.extend(frontend_message(b'B', b"\0\0\x00\x00\x00\x00\x00\x00")); // Bind
+    batch.extend(frontend_message(b'D', b"P\0")); // Describe portal
+    batch.extend(frontend_message(b'E', b"\0\x00\x00\x00\x00")); // Execute (unlimited)
+    batch.extend(frontend_message(b'S', b"")); // Sync
+    socket.write_all(&batch).await.unwrap();
+
+    let msgs = read_until_ready(&mut socket).await;
+    let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+    assert_eq!(tags, [b'1', b'2', b'T', b'D', b'C', b'Z']);
+    // The DataRow carries the single text column "1".
+    let data = &msgs.iter().find(|(t, _)| *t == b'D').unwrap().1;
+    assert_eq!(&data[..], &[0, 1, 0, 0, 0, 1, b'1']); // 1 col, len 1, "1"
+    assert_eq!(msgs.last().unwrap().1, [b'I']);
+}
+
+/// A failed extended-protocol batch must produce exactly one ErrorResponse and
+/// one ReadyForQuery (at Sync) — per-message replies desync drivers. Here Bind
+/// names a prepared statement that was never created.
 #[tokio::test]
 async fn extended_protocol_errors_once_and_recovers_at_sync() {
     let port = spawn_server().await;
     let mut socket = raw_session(port).await;
 
     let mut batch = Vec::new();
-    batch.extend(frontend_message(b'P', b"\0SELECT 1\0\x00\x00")); // Parse
-    batch.extend(frontend_message(b'B', b"\0\0\x00\x00\x00\x00\x00\x00")); // Bind
-    batch.extend(frontend_message(b'D', b"P\0")); // Describe portal
-    batch.extend(frontend_message(b'E', b"\0\x00\x00\x00\x00")); // Execute
+    batch.extend(frontend_message(b'B', b"\0nope\0\x00\x00\x00\x00\x00\x00")); // Bind to "nope"
+    batch.extend(frontend_message(b'D', b"P\0")); // Describe portal (skipped)
+    batch.extend(frontend_message(b'E', b"\0\x00\x00\x00\x00")); // Execute (skipped)
     batch.extend(frontend_message(b'S', b"")); // Sync
     socket.write_all(&batch).await.unwrap();
 
-    let (tag, _) = read_backend_message(&mut socket).await;
-    assert_eq!(tag, b'E', "first reply must be a single ErrorResponse");
     let (tag, body) = read_backend_message(&mut socket).await;
-    assert_eq!(
-        tag, b'Z',
-        "Bind/Describe/Execute must be skipped until Sync"
-    );
+    assert_eq!(tag, b'E', "first reply must be a single ErrorResponse");
+    // SQLSTATE 26000 (invalid_sql_statement_name).
+    assert!(body.windows(6).any(|w| w == b"26000\0"));
+    let (tag, body) = read_backend_message(&mut socket).await;
+    assert_eq!(tag, b'Z', "Describe/Execute must be skipped until Sync");
     assert_eq!(body, [b'I']);
 
     // The session must remain usable for simple queries afterwards.
@@ -1727,15 +1852,48 @@ async fn extended_protocol_errors_once_and_recovers_at_sync() {
         .write_all(&frontend_message(b'Q', b"SELECT 1\0"))
         .await
         .unwrap();
-    let mut tags = Vec::new();
-    loop {
-        let (tag, _) = read_backend_message(&mut socket).await;
-        tags.push(tag);
-        if tag == b'Z' {
-            break;
-        }
-    }
+    let tags: Vec<u8> = read_until_ready(&mut socket)
+        .await
+        .iter()
+        .map(|(t, _)| *t)
+        .collect();
     assert_eq!(tags, [b'T', b'D', b'C', b'Z']);
+}
+
+/// Describe on a prepared statement reports its parameter types then the result
+/// columns; Close then drops it so a later Describe errors (and recovers).
+#[tokio::test]
+async fn describe_statement_reports_params_then_close_drops_it() {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    // Parse `SELECT $1::int4` as statement "s" (no declared types — the `::int4`
+    // cast forces inference); Describe the statement; Sync.
+    let mut batch = Vec::new();
+    batch.extend(frontend_message(b'P', b"s\0SELECT $1::int4\0\x00\x00"));
+    batch.extend(frontend_message(b'D', b"Ss\0")); // Describe statement "s"
+    batch.extend(frontend_message(b'S', b""));
+    socket.write_all(&batch).await.unwrap();
+
+    let msgs = read_until_ready(&mut socket).await;
+    let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+    // ParseComplete, ParameterDescription, RowDescription, ReadyForQuery.
+    assert_eq!(tags, [b'1', b't', b'T', b'Z']);
+    // ParameterDescription: one parameter, OID 23 (int4).
+    let params = &msgs.iter().find(|(t, _)| *t == b't').unwrap().1;
+    assert_eq!(&params[..], &[0, 1, 0, 0, 0, 23]);
+
+    // Close statement "s", then Describe it again → 26000, recover at Sync.
+    let mut batch = Vec::new();
+    batch.extend(frontend_message(b'C', b"Ss\0")); // Close statement "s"
+    batch.extend(frontend_message(b'D', b"Ss\0")); // Describe closed statement → error
+    batch.extend(frontend_message(b'S', b""));
+    socket.write_all(&batch).await.unwrap();
+
+    let msgs = read_until_ready(&mut socket).await;
+    let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+    // CloseComplete, ErrorResponse, ReadyForQuery.
+    assert_eq!(tags, [b'3', b'E', b'Z']);
 }
 
 /// psql and libpq open with SSLRequest; the server must answer `N` and then

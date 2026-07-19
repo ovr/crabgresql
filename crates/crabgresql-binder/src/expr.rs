@@ -23,6 +23,105 @@ use crabgresql_types::{
 use crate::BindError;
 use crate::functions::{AggFn, ScalarFn, TableFn, bind_function, bind_srf_projection};
 
+/// Shared, mutable parameter-inference state for one statement. A `$n`
+/// occurrence anywhere in the statement — target list, WHERE, a subquery, a CTE
+/// — refers to the same slot here, so a type deduced at one site is visible at
+/// every other. Held behind `Rc<RefCell<…>>` because the binder threads a single
+/// context through the whole tree (see [`Scope`]) while several sites borrow it.
+pub type ParamCtx = std::rc::Rc<std::cell::RefCell<ParamState>>;
+
+/// Per-statement bind-parameter types, indexed by parameter number minus one.
+/// `None` in a slot means the type is not yet known; the extended protocol may
+/// seed some slots from the client's declared OID list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParamState {
+    /// `types[i]` is the type of `$(i+1)`; `None` until inferred/declared.
+    types: Vec<Option<PgType>>,
+    /// Whether `$n` placeholders are permitted at all. A simple-query bind sets
+    /// this false, so any `$n` is PG's `42P02` "there is no parameter $n".
+    allow: bool,
+}
+
+impl ParamState {
+    /// Register a `$n` (1-based) occurrence, growing the slot vector as needed
+    /// and returning its 0-based index. When placeholders are not allowed (a
+    /// simple query), this is PG's `42P02` "there is no parameter $n".
+    fn reference(&mut self, n1: usize) -> Result<usize, BindError> {
+        if !self.allow {
+            return Err(BindError::new(
+                "42P02",
+                format!("there is no parameter ${n1}"),
+            ));
+        }
+        let index = n1 - 1;
+        if index >= self.types.len() {
+            self.types.resize(index + 1, None);
+        }
+        Ok(index)
+    }
+
+    /// Record that parameter `index` was used in a context of type `ty`. A slot
+    /// that already carries a *different* concrete type is PG's `42P18`
+    /// "inconsistent types deduced for parameter $n".
+    fn resolve(&mut self, index: usize, ty: PgType) -> Result<(), BindError> {
+        if index >= self.types.len() {
+            self.types.resize(index + 1, None);
+        }
+        match self.types[index] {
+            Some(existing) if existing != ty => Err(BindError::new(
+                "42P18",
+                format!("inconsistent types deduced for parameter ${}", index + 1),
+            )),
+            _ => {
+                self.types[index] = Some(ty);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A parameter context for the extended query protocol: placeholders are
+/// allowed, and `declared` seeds the initially-known types (a `None` slot is
+/// left to be inferred from context, as PG does for an unspecified OID).
+pub fn param_ctx_extended(declared: Vec<Option<PgType>>) -> ParamCtx {
+    std::rc::Rc::new(std::cell::RefCell::new(ParamState {
+        types: declared,
+        allow: true,
+    }))
+}
+
+/// A parameter context for the simple query protocol: any `$n` is an error
+/// (`42P02`), matching PG, which only accepts parameters via `Parse`/`Bind`.
+pub fn param_ctx_none() -> ParamCtx {
+    std::rc::Rc::new(std::cell::RefCell::new(ParamState {
+        types: Vec::new(),
+        allow: false,
+    }))
+}
+
+/// The current inferred/declared parameter types (index = parameter number − 1).
+/// The caller reads this after a successful bind to describe the statement's
+/// parameters; a `None` slot is a parameter whose type could not be determined.
+pub fn param_types(ctx: &ParamCtx) -> Vec<Option<PgType>> {
+    ctx.borrow().types.clone()
+}
+
+/// Fail with PG's `42P18` "could not determine data type of parameter $n" for
+/// the first parameter whose type is still unknown after binding. The extended
+/// protocol calls this before describing a statement.
+pub fn require_all_resolved(ctx: &ParamCtx) -> Result<(), BindError> {
+    let state = ctx.borrow();
+    for (i, ty) in state.types.iter().enumerate() {
+        if ty.is_none() {
+            return Err(BindError::new(
+                "42P18",
+                format!("could not determine data type of parameter ${}", i + 1),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Typed expression IR. Every node knows its result type; the evaluator
 /// dispatches on the recorded types and never re-infers them.
 #[derive(Clone, Debug, PartialEq)]
@@ -32,6 +131,15 @@ pub enum BoundExpr {
         ty: PgType,
     },
     ColumnRef {
+        index: usize,
+        ty: PgType,
+    },
+    /// A bind-parameter placeholder (`$1`, `$2`, …) from the extended query
+    /// protocol. `index` is the 0-based parameter number and `ty` the type
+    /// inferred from context (or declared by the client). Like a `ColumnRef`,
+    /// this is a per-execution runtime value, not a constant — it is supplied by
+    /// the Bind message and must never be constant-folded.
+    Param {
         index: usize,
         ty: PgType,
     },
@@ -196,6 +304,7 @@ impl BoundExpr {
         match self {
             BoundExpr::Const { ty, .. } => *ty,
             BoundExpr::ColumnRef { ty, .. } => *ty,
+            BoundExpr::Param { ty, .. } => *ty,
             BoundExpr::Unary {
                 op: UnaryOp::Not, ..
             } => PgType::Bool,
@@ -240,9 +349,10 @@ impl BoundExpr {
                     .any(|(condition, result)| condition.contains_srf() || result.contains_srf())
                     || else_.as_ref().is_some_and(|expr| expr.contains_srf())
             }
-            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Aggregate { .. } => {
-                false
-            }
+            BoundExpr::Const { .. }
+            | BoundExpr::ColumnRef { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::Aggregate { .. } => false,
         }
     }
 
@@ -255,7 +365,7 @@ impl BoundExpr {
     pub fn contains_aggregate(&self) -> bool {
         match self {
             BoundExpr::Aggregate { .. } => true,
-            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } => false,
+            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => false,
             BoundExpr::Unary { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_aggregate() || right.contains_aggregate()
@@ -282,7 +392,15 @@ impl BoundExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Binding {
     Typed(BoundExpr),
-    Unknown { lit: Option<String>, span: Span },
+    /// An untyped literal, `NULL`, or a still-untyped bind parameter awaiting
+    /// context. `param` is `Some((index, ctx))` when this unknown is a `$n`
+    /// placeholder: resolving it records the deduced type in the shared context
+    /// and produces a [`BoundExpr::Param`] instead of a folded `Const`.
+    Unknown {
+        lit: Option<String>,
+        span: Span,
+        param: Option<(usize, ParamCtx)>,
+    },
 }
 
 /// One relation in a name-resolution scope: its qualifier (alias, else table
@@ -348,15 +466,29 @@ pub struct Scope {
     /// User-defined type/cast view, so an expression cast to/from a `CREATE TYPE`
     /// name resolves and a `WITHOUT FUNCTION` cast can be applied.
     catalog: Arc<dyn TypeCatalog>,
+    /// The statement's shared bind-parameter context. The same handle flows into
+    /// every nested scope (subqueries, CTEs, derived tables) so a `$n` unifies
+    /// its type across the whole statement.
+    params: ParamCtx,
 }
 
 impl Scope {
     /// No tables in scope: FROM-less SELECT, INSERT VALUES.
-    pub fn empty(catalog: &Arc<dyn TypeCatalog>) -> Scope {
-        Scope { rels: Vec::new(), visible: None, catalog: catalog.clone() }
+    pub fn empty(catalog: &Arc<dyn TypeCatalog>, params: &ParamCtx) -> Scope {
+        Scope {
+            rels: Vec::new(),
+            visible: None,
+            catalog: catalog.clone(),
+            params: params.clone(),
+        }
     }
 
-    pub fn table(schema: &TableSchema, qualifier: String, catalog: &Arc<dyn TypeCatalog>) -> Scope {
+    pub fn table(
+        schema: &TableSchema,
+        qualifier: String,
+        catalog: &Arc<dyn TypeCatalog>,
+        params: &ParamCtx,
+    ) -> Scope {
         Scope {
             rels: vec![ScopeRel {
                 qualifier,
@@ -365,14 +497,19 @@ impl Scope {
             }],
             visible: None,
             catalog: catalog.clone(),
+            params: params.clone(),
         }
     }
 
     /// A multi-relation scope for a cross join. Each `(qualifier, columns)` pair
     /// becomes a relation; offsets are assigned left-to-right so a column's
     /// index is its position in the concatenated row.
-    pub fn relations(items: Vec<(String, Vec<Column>)>, catalog: &Arc<dyn TypeCatalog>) -> Scope {
-        Self::relations_with_visible(items, None, catalog)
+    pub fn relations(
+        items: Vec<(String, Vec<Column>)>,
+        catalog: &Arc<dyn TypeCatalog>,
+        params: &ParamCtx,
+    ) -> Scope {
+        Self::relations_with_visible(items, None, catalog, params)
     }
 
     /// Like [`Scope::relations`], but with an explicit merged-column view for a
@@ -383,6 +520,7 @@ impl Scope {
         items: Vec<(String, Vec<Column>)>,
         visible: Option<Vec<VisibleColumn>>,
         catalog: &Arc<dyn TypeCatalog>,
+        params: &ParamCtx,
     ) -> Scope {
         let mut offset = 0;
         let mut rels = Vec::with_capacity(items.len());
@@ -395,12 +533,22 @@ impl Scope {
             });
             offset += width;
         }
-        Scope { rels, visible, catalog: catalog.clone() }
+        Scope {
+            rels,
+            visible,
+            catalog: catalog.clone(),
+            params: params.clone(),
+        }
     }
 
     /// The user-defined type/cast view carried through binding.
     pub fn catalog(&self) -> &Arc<dyn TypeCatalog> {
         &self.catalog
+    }
+
+    /// The statement's shared bind-parameter context.
+    pub fn params(&self) -> &ParamCtx {
+        &self.params
     }
 
     /// Resolve an unqualified column name. A name that matches exactly one
@@ -542,7 +690,7 @@ pub(crate) fn normalize_ident(ident: &ast::Ident) -> String {
 
 pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> {
     match expr {
-        ast::Expr::Value(v) => bind_value(v),
+        ast::Expr::Value(v) => bind_value(v, scope),
         // The DEFAULT keyword (INSERT VALUES / UPDATE SET) parses as a plain
         // identifier; without this check it would bind as a column reference
         // and mislead with `column "default" does not exist`. A real column
@@ -720,7 +868,16 @@ fn bind_like_node(
 pub fn bind_scalar(expr: &ast::Expr, scope: &Scope) -> Result<BoundExpr, BindError> {
     Ok(match bind_expr(expr, scope)? {
         Binding::Typed(e) => e,
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text)?,
+        // A bare untyped literal defaults to text; but a bind parameter with no
+        // surrounding context has no type to take, so PG errors 42P18 rather
+        // than silently choosing text.
+        Binding::Unknown { param: Some((index, _)), .. } => {
+            return Err(BindError::new(
+                "42P18",
+                format!("could not determine data type of parameter ${}", index + 1),
+            ));
+        }
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text)?,
     })
 }
 
@@ -777,14 +934,16 @@ pub(crate) fn is_orderable(ty: PgType) -> bool {
     )
 }
 
-fn bind_value(value: &ast::ValueWithSpan) -> Result<Binding, BindError> {
+fn bind_value(value: &ast::ValueWithSpan, scope: &Scope) -> Result<Binding, BindError> {
     match &value.value {
+        ast::Value::Placeholder(s) => bind_placeholder(s, value.span, scope),
         ast::Value::Number(n, _) => parse_number(n).map(Binding::Typed),
         ast::Value::SingleQuotedString(s)
         | ast::Value::DollarQuotedString(ast::DollarQuotedString { value: s, .. }) => {
             Ok(Binding::Unknown {
                 lit: Some(s.clone()),
                 span: value.span,
+                param: None,
             })
         }
         ast::Value::Boolean(b) => Ok(Binding::Typed(BoundExpr::Const {
@@ -794,6 +953,7 @@ fn bind_value(value: &ast::ValueWithSpan) -> Result<Binding, BindError> {
         ast::Value::Null => Ok(Binding::Unknown {
             lit: None,
             span: value.span,
+            param: None,
         }),
         // `B'...'` is a `bit(n)` literal (n binary digits); `X'...'` a `bit(4n)`
         // literal (4 bits per hex digit). PG's `bit_in` rejects a bad digit with
@@ -809,6 +969,31 @@ fn bind_value(value: &ast::ValueWithSpan) -> Result<Binding, BindError> {
             "literal is not supported yet: {other}"
         ))),
     }
+}
+
+/// Bind a `$n` placeholder. The trailing number is the 1-based parameter; PG
+/// rejects `$0`/non-numeric with a syntax error. A placeholder is registered in
+/// the shared context (an error there when the simple protocol forbids
+/// parameters). If the parameter's type is already known — declared by the
+/// client or inferred at an earlier site — it binds straight to a typed
+/// [`BoundExpr::Param`]; otherwise it stays an `Unknown` carrying the param
+/// marker, to be typed by the first context that resolves it.
+fn bind_placeholder(s: &str, span: Span, scope: &Scope) -> Result<Binding, BindError> {
+    let n1: usize = s
+        .strip_prefix('$')
+        .and_then(|d| d.parse().ok())
+        .filter(|&n| n > 0)
+        .ok_or_else(|| BindError::syntax(format!("invalid parameter number: {s}")))?;
+    let index = scope.params().borrow_mut().reference(n1)?;
+    let known = scope.params().borrow().types.get(index).copied().flatten();
+    if let Some(ty) = known {
+        return Ok(Binding::Typed(BoundExpr::Param { index, ty }));
+    }
+    Ok(Binding::Unknown {
+        lit: None,
+        span,
+        param: Some((index, scope.params().clone())),
+    })
 }
 
 /// Build a `bit` constant from a parsed `B'...'`/`X'...'` literal, attaching the
@@ -968,7 +1153,7 @@ fn bind_cast(
         },
     };
     let expr = match bind_expr(inner, scope)? {
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, target)?,
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, target)?,
         Binding::Typed(e) => coerce_cast(e, target, scope)?,
     };
     let expr = apply_numeric_typmod_if_any(expr, target, data_type)?;
@@ -1037,7 +1222,7 @@ fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
             )));
         }
     };
-    let expr = resolve_unknown(lit, span, target)?;
+    let expr = resolve_unknown(lit, span, None, target)?;
     let expr = apply_numeric_typmod_if_any(expr, target, &ts.data_type)?;
     Ok(Binding::Typed(apply_length_typmod_if_any(expr, target, &ts.data_type)?))
 }
@@ -1230,8 +1415,8 @@ fn bind_extract(
                 ),
             ));
         }
-        Binding::Unknown { lit, span } => {
-            (ScalarFn::Extract, resolve_unknown(lit, span, PgType::Timestamp)?)
+        Binding::Unknown { lit, span, param } => {
+            (ScalarFn::Extract, resolve_unknown(lit, span, param, PgType::Timestamp)?)
         }
     };
     Ok(Binding::Typed(BoundExpr::FuncCall {
@@ -1258,7 +1443,7 @@ fn bind_at_time_zone(
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     let zone_arg = match bind_expr(zone, scope)? {
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text)?,
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text)?,
         Binding::Typed(e) if e.ty() == PgType::Text => e,
         Binding::Typed(e) => {
             return Err(BindError::new(
@@ -1287,10 +1472,10 @@ fn bind_at_time_zone(
                 ),
             ));
         }
-        Binding::Unknown { lit, span } => (
+        Binding::Unknown { lit, span, param } => (
             ScalarFn::TimezoneToTz,
             PgType::TimestampTz,
-            resolve_unknown(lit, span, PgType::Timestamp)?,
+            resolve_unknown(lit, span, param, PgType::Timestamp)?,
         ),
     };
     Ok(Binding::Typed(BoundExpr::FuncCall {
@@ -1540,7 +1725,7 @@ fn bind_prefix_float8(
     let expr = match bind_expr(operand, scope)? {
         Binding::Typed(e) if e.ty().is_numeric() => coerce_expr(e, PgType::Float8)?,
         Binding::Typed(e) => return Err(no_op_unary(sym, e.ty().name())),
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Float8)?,
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Float8)?,
     };
     Ok(Binding::Typed(BoundExpr::Unary {
         op: uop,
@@ -1551,7 +1736,7 @@ fn bind_prefix_float8(
 fn bind_is_null(inner: &ast::Expr, scope: &Scope, negated: bool) -> Result<Binding, BindError> {
     let expr = match bind_expr(inner, scope)? {
         Binding::Typed(e) => e,
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text)?,
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text)?,
     };
     Ok(Binding::Typed(BoundExpr::IsNull {
         expr: Box::new(expr),
@@ -1581,8 +1766,8 @@ fn bind_case(
     let operand = match operand {
         None => None,
         Some(e) => Some(match bind_expr(e, scope)? {
-            Binding::Unknown { lit, span } => {
-                Binding::Typed(resolve_unknown(lit, span, PgType::Text)?)
+            Binding::Unknown { lit, span, param } => {
+                Binding::Typed(resolve_unknown(lit, span, param, PgType::Text)?)
             }
             typed => typed,
         }),
@@ -1879,28 +2064,30 @@ pub(crate) fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Bind
     // boolean + unknown`, never a coercion failure, when no operator applies.
     let (left, right, arg_ty) = match (lb, rb) {
         (Binding::Typed(l), Binding::Typed(r)) => unify_types(l, r, op)?,
-        (Binding::Typed(l), Binding::Unknown { lit, span }) => {
+        (Binding::Typed(l), Binding::Unknown { lit, span, param }) => {
             let ty = l.ty();
             if op.is_arithmetic() && !ty.is_numeric() {
                 return Err(no_operator(ty.name(), op, "unknown"));
             }
-            (l, resolve_unknown(lit, span, ty)?, ty)
+            (l, resolve_unknown(lit, span, param, ty)?, ty)
         }
-        (Binding::Unknown { lit, span }, Binding::Typed(r)) => {
+        (Binding::Unknown { lit, span, param }, Binding::Typed(r)) => {
             let ty = r.ty();
             if op.is_arithmetic() && !ty.is_numeric() {
                 return Err(no_operator("unknown", op, ty.name()));
             }
-            (resolve_unknown(lit, span, ty)?, r, ty)
+            (resolve_unknown(lit, span, param, ty)?, r, ty)
         }
         (
             Binding::Unknown {
                 lit: ll,
                 span: ls,
+                param: lp,
             },
             Binding::Unknown {
                 lit: rl,
                 span: rs,
+                param: rp,
             },
         ) => {
             if op.is_arithmetic() {
@@ -1916,8 +2103,8 @@ pub(crate) fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Bind
             }
             // Comparing two untyped literals: PG falls back to text.
             (
-                resolve_unknown(ll, ls, PgType::Text)?,
-                resolve_unknown(rl, rs, PgType::Text)?,
+                resolve_unknown(ll, ls, lp, PgType::Text)?,
+                resolve_unknown(rl, rs, rp, PgType::Text)?,
                 PgType::Text,
             )
         }
@@ -2186,7 +2373,9 @@ fn net_no_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> Bind
 fn net_operand(b: &Binding) -> Option<Result<BoundExpr, BindError>> {
     match b {
         Binding::Typed(e) if is_net_ty(Some(e.ty())) => Some(Ok(e.clone())),
-        Binding::Unknown { lit, span } => Some(resolve_unknown(lit.clone(), *span, PgType::Inet)),
+        Binding::Unknown { lit, span, param } => {
+            Some(resolve_unknown(lit.clone(), *span, param.clone(), PgType::Inet))
+        }
         Binding::Typed(_) => None,
     }
 }
@@ -2421,7 +2610,9 @@ fn bit_operand(b: &Binding) -> Option<Result<BoundExpr, BindError>> {
     match b {
         Binding::Typed(e) if is_bit_family(Some(e.ty())) => Some(Ok(e.clone())),
         Binding::Typed(_) => None,
-        Binding::Unknown { lit, span } => Some(resolve_unknown(lit.clone(), *span, PgType::Bit)),
+        Binding::Unknown { lit, span, param } => {
+            Some(resolve_unknown(lit.clone(), *span, param.clone(), PgType::Bit))
+        }
     }
 }
 
@@ -2568,7 +2759,9 @@ fn resolve_operand(b: &Binding, target: PgType) -> Result<BoundExpr, BindError> 
     match b {
         Binding::Typed(e) if e.ty() == target => Ok(e.clone()),
         Binding::Typed(e) => coerce_expr(e.clone(), target),
-        Binding::Unknown { lit, span } => resolve_unknown(lit.clone(), *span, target),
+        Binding::Unknown { lit, span, param } => {
+            resolve_unknown(lit.clone(), *span, param.clone(), target)
+        }
     }
 }
 
@@ -2610,7 +2803,7 @@ fn bind_pow(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
 fn pow_operand(b: Binding, target: PgType) -> Result<BoundExpr, BindError> {
     match b {
         Binding::Typed(e) => coerce_expr(e, target),
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, target),
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, target),
     }
 }
 
@@ -2631,7 +2824,7 @@ pub(crate) fn coerce_for_arg(
     exact_only: bool,
 ) -> Option<BoundExpr> {
     match binding {
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, target).ok(),
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, target).ok(),
         Binding::Typed(e) => {
             if e.ty() == target {
                 return Some(e);
@@ -2704,7 +2897,7 @@ fn implicit_castable(from: PgType, to: PgType) -> bool {
 /// untyped literal (or NULL) becomes text; a typed value casts to text.
 pub(crate) fn to_text_operand(binding: Binding) -> Result<BoundExpr, BindError> {
     match binding {
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text),
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text),
         Binding::Typed(e) if e.ty() == PgType::Text => Ok(e),
         Binding::Typed(e) => coerce_expr(e, PgType::Text),
     }
@@ -2721,7 +2914,7 @@ pub(crate) fn is_text_family(ty: PgType) -> bool {
 /// types are cast to their text form.
 pub(crate) fn to_concat_operand(binding: Binding) -> Result<BoundExpr, BindError> {
     match binding {
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Text),
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text),
         Binding::Typed(e) if is_text_family(e.ty()) => Ok(e),
         Binding::Typed(e) => coerce_expr(e, PgType::Text),
     }
@@ -2927,7 +3120,7 @@ pub(crate) fn unify_value_column(
     let exprs = bindings
         .into_iter()
         .map(|binding| match binding {
-            Binding::Unknown { lit, span } => resolve_unknown(lit, span, ty),
+            Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, ty),
             Binding::Typed(e) => coerce_expr(e, ty),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3009,7 +3202,7 @@ pub(crate) fn to_bool_operand(binding: Binding, context: &str) -> Result<BoundEx
                 e.ty().name()
             ),
         )),
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, PgType::Bool),
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Bool),
     }
 }
 
@@ -3019,8 +3212,16 @@ pub(crate) fn to_bool_operand(binding: Binding, context: &str) -> Result<BoundEx
 pub(crate) fn resolve_unknown(
     lit: Option<String>,
     span: Span,
+    param: Option<(usize, ParamCtx)>,
     ty: PgType,
 ) -> Result<BoundExpr, BindError> {
+    // A bind parameter takes its type from this context: record the deduction
+    // (conflicting deductions are 42P18) and emit a runtime `Param`, never a
+    // folded constant.
+    if let Some((index, ctx)) = param {
+        ctx.borrow_mut().resolve(index, ty)?;
+        return Ok(BoundExpr::Param { index, ty });
+    }
     let value = match lit {
         None => Value::Null,
         Some(s) => parse_unknown(&s, ty).map_err(|e| e.at(span))?,
@@ -3120,7 +3321,7 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
 /// with PG's column-context error message on a type mismatch.
 pub fn coerce_to_column(binding: Binding, column: &Column) -> Result<BoundExpr, BindError> {
     let base = match binding {
-        Binding::Unknown { lit, span } => resolve_unknown(lit, span, column.ty)?,
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, column.ty)?,
         Binding::Typed(e) => {
             let ty = e.ty();
             if ty == column.ty {
@@ -3165,7 +3366,8 @@ pub fn bind_column_default(
     column: &Column,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<BoundExpr, BindError> {
-    let scope = Scope::empty(catalog);
+    let params = param_ctx_none();
+    let scope = Scope::empty(catalog, &params);
     let bound = coerce_to_column(bind_expr(expr, &scope)?, column)?;
     if bound.contains_srf() {
         return Err(BindError::feature_not_supported(
