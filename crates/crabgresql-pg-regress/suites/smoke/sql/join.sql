@@ -69,3 +69,55 @@ SELECT count(*), count(b.y)
 FROM (VALUES (1), (2), (NULL)) a(x)
 LEFT JOIN (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y;
 -- end ON-join coverage
+
+-- JOIN ... USING merges the join column: it appears once, first, then each
+-- input's remaining columns. On base tables:
+SELECT * FROM t1 JOIN t2 USING (id) ORDER BY id;
+-- the merged column resolves unqualified and each side stays addressable
+SELECT id, a.id, b.id, a.x, b.y
+FROM (VALUES (1, 10)) a(id, x)
+JOIN (VALUES (1, 100)) b(id, y) USING (id);
+-- a multi-column USING equates every listed column
+SELECT *
+FROM (VALUES (1, 1, 'p'), (1, 2, 'q')) a(g, h, v)
+JOIN (VALUES (1, 1, 'z')) b(g, h, w) USING (g, h)
+ORDER BY g, h;
+-- LEFT JOIN USING null-extends the right side; the merged column keeps the
+-- left value on unmatched rows
+SELECT *
+FROM (VALUES (1), (2)) a(id)
+LEFT JOIN (VALUES (1, 100), (3, 300)) b(id, y) USING (id)
+ORDER BY id;
+-- RIGHT JOIN USING: the merged column takes the right value
+SELECT *
+FROM (VALUES (1, 10)) a(id, x)
+RIGHT JOIN (VALUES (1), (3)) b(id) USING (id)
+ORDER BY id;
+-- FULL JOIN USING: the merged column is COALESCE(left, right), so it is never
+-- the null-extended side
+SELECT *
+FROM (VALUES (1, 10), (2, 20)) a(id, x)
+FULL JOIN (VALUES (1, 100), (3, 300)) b(id, y) USING (id)
+ORDER BY id;
+-- NATURAL JOIN derives USING from every common column name
+SELECT *
+FROM (VALUES (1, 'a'), (2, 'b')) a(id, label)
+NATURAL JOIN (VALUES (1, 'a'), (1, 'x')) b(id, label)
+ORDER BY id, label;
+-- NATURAL JOIN with no common column name is a cross product
+SELECT *
+FROM (VALUES (1), (2)) a(x)
+NATURAL JOIN (VALUES (10), (20)) b(y)
+ORDER BY x, y;
+-- a USING join in a later comma group resolves against the shifted combined row
+SELECT *
+FROM (VALUES (1)) t0(k),
+     (VALUES (5, 50)) a(id, x) JOIN (VALUES (5, 500)) b(id, y) USING (id)
+ORDER BY k;
+-- a USING column absent from the right input names the right table
+SELECT * FROM t1 JOIN t2 USING (label);
+-- a USING column absent from the left input names the left table
+SELECT * FROM t1 JOIN t2 USING (tag);
+-- a USING column that is ambiguous within one input is rejected
+SELECT * FROM (VALUES (1, 2)) a(x, x) JOIN (VALUES (1)) b(x) USING (x);
+-- end USING/NATURAL coverage

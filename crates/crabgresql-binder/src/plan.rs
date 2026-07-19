@@ -13,8 +13,9 @@ use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TypeCat
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
-    BoundExpr, Scope, bind_column_default, bind_expr, bind_projection, bind_scalar,
-    coerce_to_column, normalize_ident, output_name, to_bool_operand, unify_value_column,
+    BinOp, Binding, BoundExpr, Scope, VisibleColumn, bind_binary_op, bind_column_default,
+    bind_expr, bind_projection, bind_scalar, coerce_to_column, normalize_ident, output_name,
+    to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -488,9 +489,12 @@ fn bind_select(
     if select.from.is_empty() {
         return bind_values_select(catalog, select, order_by);
     }
-    let BoundFrom { source, relations } =
-        bind_from_clause(engine, catalog, &select.from, ctes)?;
-    let scope = Scope::relations(relations, catalog);
+    let BoundFrom {
+        source,
+        relations,
+        visible,
+    } = bind_from_clause(engine, catalog, &select.from, ctes)?;
+    let scope = Scope::relations_with_visible(relations, visible, catalog);
     let body = bind_select_body(select, order_by, &scope)?;
     if let Some(agg) = body.aggregation {
         let input = match source {
@@ -580,6 +584,11 @@ struct BoundFromItem {
 struct BoundFrom {
     source: JoinExpr,
     relations: Vec<(String, Vec<Column>)>,
+    /// The merged-column view when a `USING`/`NATURAL` join is present; `None`
+    /// keeps the plain "every relation's columns in order" behavior. Exprs index
+    /// into this FROM's own combined row (base 0); [`bind_from_clause`] shifts
+    /// them when it cross-joins several comma groups.
+    visible: Option<Vec<VisibleColumn>>,
 }
 
 impl BoundFromItem {
@@ -591,6 +600,7 @@ impl BoundFromItem {
                 width,
             },
             relations: vec![(self.qualifier, to_columns(&self.columns))],
+            visible: None,
         }
     }
 }
@@ -736,19 +746,44 @@ fn bind_from_clause(
     ctes: &CteEnv,
 ) -> Result<BoundFrom, BindError> {
     let mut combined: Option<JoinExpr> = None;
-    let mut relations = Vec::new();
+    let mut relations: Vec<(String, Vec<Column>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // Accumulated merged-column view across comma groups. Stays `None` while no
+    // group merges columns; once one does, it is materialized (plain views fill
+    // in for the non-merging groups) with combined-row-global indices.
+    let mut visible: Option<Vec<VisibleColumn>> = None;
+    let mut width = 0usize;
     for table in from {
-        let group = bind_table_with_joins(engine, catalog, table, ctes)?;
-        for (qualifier, _) in &group.relations {
+        let BoundFrom {
+            source: group_source,
+            relations: group_relations,
+            visible: group_visible,
+        } = bind_table_with_joins(engine, catalog, table, ctes)?;
+        for (qualifier, _) in &group_relations {
             ensure_unique_qualifier(&mut seen, qualifier)?;
         }
-        relations.extend(group.relations);
+        let group_width = group_source.width();
+        // Fold this group's view into the running one, shifting its base-0
+        // indices to their global position (`width`).
+        match (&mut visible, group_visible) {
+            (Some(acc), Some(gv)) => {
+                acc.extend(gv.into_iter().map(|c| shift_visible(c, width)));
+            }
+            (Some(acc), None) => acc.extend(default_visible(&group_relations, width)),
+            (None, Some(gv)) => {
+                let mut acc = default_visible(&relations, 0);
+                acc.extend(gv.into_iter().map(|c| shift_visible(c, width)));
+                visible = Some(acc);
+            }
+            (None, None) => {}
+        }
+        relations.extend(group_relations);
+        width += group_width;
         combined = Some(match combined {
-            None => group.source,
+            None => group_source,
             Some(left) => JoinExpr::Join {
                 left: Box::new(left),
-                right: Box::new(group.source),
+                right: Box::new(group_source),
                 kind: JoinKind::Cross,
                 predicate: None,
             },
@@ -757,12 +792,102 @@ fn bind_from_clause(
     Ok(BoundFrom {
         source: combined.expect("non-empty FROM checked by bind_select"),
         relations,
+        visible,
     })
 }
 
-/// Bind one left-associative explicit join chain. Each ON clause sees the
+/// Relocate a merged column from a comma group's base-0 layout to its global
+/// position by adding `delta` to every `ColumnRef` in its expression.
+fn shift_visible(col: VisibleColumn, delta: usize) -> VisibleColumn {
+    VisibleColumn {
+        name: col.name,
+        expr: shift_column_refs(&col.expr, delta),
+    }
+}
+
+/// Add `delta` to every `ColumnRef` index in `expr`. Used only to combine a
+/// comma group's merged-column view with the groups laid out before it.
+fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::ColumnRef { index, ty } => BoundExpr::ColumnRef {
+            index: index + delta,
+            ty: *ty,
+        },
+        BoundExpr::Const { value, ty } => BoundExpr::Const {
+            value: value.clone(),
+            ty: *ty,
+        },
+        BoundExpr::Unary { op, expr } => BoundExpr::Unary {
+            op: *op,
+            expr: Box::new(shift_column_refs(expr, delta)),
+        },
+        BoundExpr::Binary {
+            op,
+            arg_ty,
+            left,
+            right,
+        } => BoundExpr::Binary {
+            op: *op,
+            arg_ty: *arg_ty,
+            left: Box::new(shift_column_refs(left, delta)),
+            right: Box::new(shift_column_refs(right, delta)),
+        },
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(shift_column_refs(expr, delta)),
+            negated: *negated,
+        },
+        BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {
+            expr: Box::new(shift_column_refs(expr, delta)),
+            ty: *ty,
+        },
+        BoundExpr::Reinterpret {
+            expr,
+            reported,
+            rep,
+        } => BoundExpr::Reinterpret {
+            expr: Box::new(shift_column_refs(expr, delta)),
+            reported: *reported,
+            rep: *rep,
+        },
+        BoundExpr::FuncCall { func, ret, args } => BoundExpr::FuncCall {
+            func: *func,
+            ret: *ret,
+            args: args.iter().map(|a| shift_column_refs(a, delta)).collect(),
+        },
+        BoundExpr::Case { whens, else_, ty } => BoundExpr::Case {
+            whens: whens
+                .iter()
+                .map(|(w, r)| (shift_column_refs(w, delta), shift_column_refs(r, delta)))
+                .collect(),
+            else_: else_.as_ref().map(|e| Box::new(shift_column_refs(e, delta))),
+            ty: *ty,
+        },
+        BoundExpr::Srf { func, ret, args } => BoundExpr::Srf {
+            func: *func,
+            ret: *ret,
+            args: args.iter().map(|a| shift_column_refs(a, delta)).collect(),
+        },
+        BoundExpr::Aggregate {
+            func,
+            distinct,
+            arg,
+            input_ty,
+            ret,
+        } => BoundExpr::Aggregate {
+            func: *func,
+            distinct: *distinct,
+            arg: arg.as_ref().map(|a| Box::new(shift_column_refs(a, delta))),
+            input_ty: *input_ty,
+            ret: *ret,
+        },
+    }
+}
+
+/// Bind one left-associative explicit join chain. Each ON/USING clause sees the
 /// accumulated left side and the newly-added right factor, but no relations
-/// from other comma-delimited FROM groups.
+/// from other comma-delimited FROM groups. A `USING`/`NATURAL` join also builds
+/// a merged-column view (`visible`) so its join columns resolve once, before
+/// the rest; a chain with only `ON`/`CROSS` joins keeps that view `None`.
 fn bind_table_with_joins(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -775,6 +900,12 @@ fn bind_table_with_joins(
         .iter()
         .map(|(qualifier, _)| qualifier.clone())
         .collect();
+    // The running merged-column view over the accumulated left side, indexed
+    // into this group's combined row (base 0). It only diverges from the plain
+    // relation layout once a USING/NATURAL join merges columns; `merged` tracks
+    // whether that has happened so an all-`ON` chain stays on the fast path.
+    let mut visible = default_visible(&bound.relations, 0);
+    let mut merged = false;
 
     for join in &table.joins {
         if join.global {
@@ -786,24 +917,50 @@ fn bind_table_with_joins(
         let right_qualifier = &right.relations[0].0;
         ensure_unique_qualifier(&mut seen, right_qualifier)?;
 
-        let (kind, on) = join_kind_and_on(&join.join_operator)?;
-        let predicate = if let Some(on) = on {
-            let mut on_relations = bound.relations.clone();
-            on_relations.extend(right.relations.clone());
-            let scope = Scope::relations(on_relations, catalog);
-            let binding = bind_expr(on, &scope)?;
-            if matches!(
-                &binding,
-                crate::Binding::Typed(expr) if expr.contains_aggregate()
-            ) {
-                return Err(BindError::new(
-                    sqlstate::GROUPING_ERROR,
-                    "aggregate functions are not allowed in JOIN conditions",
-                ));
+        let left_width = bound.source.width();
+        let right_visible = default_visible(&right.relations, left_width);
+
+        let (kind, predicate) = match join_kind_and_constraint(&join.join_operator)? {
+            JoinBinding::Cross => {
+                visible.extend(right_visible);
+                (JoinKind::Cross, None)
             }
-            Some(to_bool_operand(binding, "JOIN/ON")?)
-        } else {
-            None
+            JoinBinding::On(kind, on) => {
+                let mut on_relations = bound.relations.clone();
+                on_relations.extend(right.relations.clone());
+                // A prior USING/NATURAL join makes the merged view govern
+                // unqualified names inside this ON clause too.
+                let on_visible = merged.then(|| {
+                    let mut v = visible.clone();
+                    v.extend(right_visible.clone());
+                    v
+                });
+                let scope = Scope::relations_with_visible(on_relations, on_visible, catalog);
+                let binding = bind_expr(on, &scope)?;
+                if matches!(&binding, Binding::Typed(expr) if expr.contains_aggregate()) {
+                    return Err(BindError::new(
+                        sqlstate::GROUPING_ERROR,
+                        "aggregate functions are not allowed in JOIN conditions",
+                    ));
+                }
+                visible.extend(right_visible);
+                (kind, Some(to_bool_operand(binding, "JOIN/ON")?))
+            }
+            JoinBinding::Using(kind, names) => {
+                let (predicate, new_visible) =
+                    build_merged_join(kind, &names, &visible, &right, left_width)?;
+                visible = new_visible;
+                merged = true;
+                (kind, predicate)
+            }
+            JoinBinding::Natural(kind) => {
+                let names = natural_join_names(&visible, &right);
+                let (predicate, new_visible) =
+                    build_merged_join(kind, &names, &visible, &right, left_width)?;
+                visible = new_visible;
+                merged = true;
+                (kind, predicate)
+            }
         };
         bound.source = JoinExpr::Join {
             left: Box::new(bound.source),
@@ -813,7 +970,148 @@ fn bind_table_with_joins(
         };
         bound.relations.extend(right.relations);
     }
+    bound.visible = merged.then_some(visible);
     Ok(bound)
+}
+
+/// The plain visible view for a run of relations laid out from `base` in the
+/// combined row: every column as a `ColumnRef`, in order — exactly what
+/// unqualified resolution and `*` produce without any merged join columns.
+fn default_visible(relations: &[(String, Vec<Column>)], base: usize) -> Vec<VisibleColumn> {
+    let mut out = Vec::new();
+    let mut index = base;
+    for (_qualifier, columns) in relations {
+        for col in columns {
+            out.push(VisibleColumn {
+                name: col.name.clone(),
+                expr: BoundExpr::ColumnRef { index, ty: col.ty },
+            });
+            index += 1;
+        }
+    }
+    out
+}
+
+/// The columns a `NATURAL` join equates: every name present in both the
+/// accumulated left view and the right input, in left-to-right order, once
+/// each. An empty result means no common columns — a plain cross product.
+fn natural_join_names(left: &[VisibleColumn], right: &BoundFrom) -> Vec<String> {
+    let right_names: HashSet<&str> = right
+        .relations
+        .iter()
+        .flat_map(|(_, cols)| cols.iter())
+        .map(|c| c.name.as_str())
+        .collect();
+    let mut names: Vec<String> = Vec::new();
+    for col in left {
+        if right_names.contains(col.name.as_str()) && !names.iter().any(|n| n == &col.name) {
+            names.push(col.name.clone());
+        }
+    }
+    names
+}
+
+/// Locate a join column by `name` in one side's view: exactly one match returns
+/// its combined-row expression; zero or many raise the errors PG reports for a
+/// `USING`/`NATURAL` column on the given `side` ("left"/"right").
+fn lookup_join_column<'a>(
+    cols: &'a [VisibleColumn],
+    name: &str,
+    side: &str,
+) -> Result<&'a BoundExpr, BindError> {
+    let mut found: Option<&BoundExpr> = None;
+    for col in cols {
+        if col.name == name {
+            if found.is_some() {
+                return Err(BindError::new(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    format!(
+                        "common column name \"{name}\" appears more than once in {side} table"
+                    ),
+                ));
+            }
+            found = Some(&col.expr);
+        }
+    }
+    found.ok_or_else(|| {
+        BindError::new(
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column \"{name}\" specified in USING clause does not exist in {side} table"),
+        )
+    })
+}
+
+/// Build a `USING`/`NATURAL` join's ON predicate and merged-column view. For
+/// each join name the left and right copies are equated (with the usual
+/// comparison coercion); the merged output column carries the left value
+/// (inner/left), the right value (right), or `COALESCE(left, right)` (full), so
+/// it is never the NULL-extended side. The new view lists the merged columns
+/// first, then each side's remaining columns — matching PG's `SELECT *` order.
+fn build_merged_join(
+    kind: JoinKind,
+    names: &[String],
+    left: &[VisibleColumn],
+    right: &BoundFrom,
+    left_width: usize,
+) -> Result<(Option<BoundExpr>, Vec<VisibleColumn>), BindError> {
+    let right_visible = default_visible(&right.relations, left_width);
+    let mut predicate: Option<BoundExpr> = None;
+    let mut merged_cols: Vec<VisibleColumn> = Vec::new();
+
+    for name in names {
+        let left_expr = lookup_join_column(left, name, "left")?.clone();
+        let right_expr = lookup_join_column(&right_visible, name, "right")?.clone();
+        let eq = bind_binary_op(BinOp::Eq, Binding::Typed(left_expr), Binding::Typed(right_expr))?;
+        let Binding::Typed(eq_expr) = eq else {
+            unreachable!("equality of typed operands is always typed");
+        };
+        let BoundExpr::Binary {
+            arg_ty,
+            left: le,
+            right: re,
+            ..
+        } = &eq_expr
+        else {
+            unreachable!("equality lowers to a Binary node");
+        };
+        let (arg_ty, le, re) = (*arg_ty, (**le).clone(), (**re).clone());
+        let merged = match kind {
+            JoinKind::Right => re,
+            // COALESCE(left, right): the matched rows agree, and each unmatched
+            // side keeps the non-NULL value.
+            JoinKind::Full => BoundExpr::Case {
+                whens: vec![(
+                    BoundExpr::IsNull {
+                        expr: Box::new(le.clone()),
+                        negated: true,
+                    },
+                    le,
+                )],
+                else_: Some(Box::new(re)),
+                ty: arg_ty,
+            },
+            _ => le,
+        };
+        merged_cols.push(VisibleColumn {
+            name: name.clone(),
+            expr: merged,
+        });
+        predicate = Some(match predicate {
+            None => eq_expr,
+            Some(prev) => BoundExpr::Binary {
+                op: BinOp::And,
+                arg_ty: PgType::Bool,
+                left: Box::new(prev),
+                right: Box::new(eq_expr),
+            },
+        });
+    }
+
+    let is_join_name = |name: &str| names.iter().any(|n| n == name);
+    let mut new_visible = merged_cols;
+    new_visible.extend(left.iter().filter(|c| !is_join_name(&c.name)).cloned());
+    new_visible.extend(right_visible.into_iter().filter(|c| !is_join_name(&c.name)));
+    Ok((predicate, new_visible))
 }
 
 fn ensure_unique_qualifier(
@@ -830,25 +1128,43 @@ fn ensure_unique_qualifier(
     }
 }
 
-/// Accept the PostgreSQL ON-join surface implemented by the executor. USING
-/// and NATURAL need a merged-column namespace and remain a separate feature.
-fn join_kind_and_on(
+/// One explicit join's kind and how its rows are matched, resolved from the
+/// AST. `On` carries the predicate expression for later binding; `Using` the
+/// (normalized) join column names; `Natural` derives its names from the inputs;
+/// `Cross` matches every pair.
+enum JoinBinding<'a> {
+    Cross,
+    On(JoinKind, &'a ast::Expr),
+    Using(JoinKind, Vec<String>),
+    Natural(JoinKind),
+}
+
+/// A `USING (...)` column name: a bare identifier, normalized like any column
+/// reference. A schema-qualified name here is rejected the way it is elsewhere.
+fn using_column_name(name: &ast::ObjectName) -> Result<String, BindError> {
+    object_name_to_table_name(name)
+}
+
+/// Map an AST join operator to the kind and match strategy the binder builds.
+fn join_kind_and_constraint(
     operator: &ast::JoinOperator,
-) -> Result<(JoinKind, Option<&ast::Expr>), BindError> {
+) -> Result<JoinBinding<'_>, BindError> {
     use ast::{JoinConstraint, JoinOperator};
 
-    fn with_on(
+    fn constrained(
         kind: JoinKind,
         constraint: &JoinConstraint,
-    ) -> Result<(JoinKind, Option<&ast::Expr>), BindError> {
+    ) -> Result<JoinBinding<'_>, BindError> {
         match constraint {
-            JoinConstraint::On(expr) => Ok((kind, Some(expr))),
-            JoinConstraint::Using(_) => Err(BindError::feature_not_supported(
-                "JOIN USING is not supported yet",
-            )),
-            JoinConstraint::Natural => Err(BindError::feature_not_supported(
-                "NATURAL JOIN is not supported yet",
-            )),
+            JoinConstraint::On(expr) => Ok(JoinBinding::On(kind, expr)),
+            JoinConstraint::Using(names) => {
+                let cols = names
+                    .iter()
+                    .map(using_column_name)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(JoinBinding::Using(kind, cols))
+            }
+            JoinConstraint::Natural => Ok(JoinBinding::Natural(kind)),
             JoinConstraint::None => Err(BindError::feature_not_supported(
                 "JOIN without ON is not supported yet",
             )),
@@ -856,11 +1172,11 @@ fn join_kind_and_on(
     }
 
     match operator {
-        JoinOperator::Join(c) | JoinOperator::Inner(c) => with_on(JoinKind::Inner, c),
-        JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => with_on(JoinKind::Left, c),
-        JoinOperator::Right(c) | JoinOperator::RightOuter(c) => with_on(JoinKind::Right, c),
-        JoinOperator::FullOuter(c) => with_on(JoinKind::Full, c),
-        JoinOperator::CrossJoin(JoinConstraint::None) => Ok((JoinKind::Cross, None)),
+        JoinOperator::Join(c) | JoinOperator::Inner(c) => constrained(JoinKind::Inner, c),
+        JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => constrained(JoinKind::Left, c),
+        JoinOperator::Right(c) | JoinOperator::RightOuter(c) => constrained(JoinKind::Right, c),
+        JoinOperator::FullOuter(c) => constrained(JoinKind::Full, c),
+        JoinOperator::CrossJoin(JoinConstraint::None) => Ok(JoinBinding::Cross),
         JoinOperator::CrossJoin(_) => Err(BindError::feature_not_supported(
             "CROSS JOIN constraints are not supported yet",
         )),
@@ -3576,13 +3892,181 @@ mod tests {
     }
 
     #[test]
-    fn using_and_natural_join_remain_0a000() {
-        let using = bind_err("SELECT * FROM t a JOIN t b USING (id)");
-        assert_eq!(using.code, "0A000");
-        assert_eq!(using.message, "JOIN USING is not supported yet");
-        let natural = bind_err("SELECT * FROM t a NATURAL JOIN t b");
-        assert_eq!(natural.code, "0A000");
-        assert_eq!(natural.message, "NATURAL JOIN is not supported yet");
+    fn using_join_merges_column_and_builds_equality() {
+        // `id` is merged (once, first); the other three columns of each side
+        // follow — 1 + 3 + 3 = 7 output columns.
+        let LogicalPlan::Join {
+            source,
+            columns,
+            projections,
+            ..
+        } = bind_one("SELECT * FROM t a JOIN t b USING (id)").unwrap()
+        else {
+            panic!("expected Join");
+        };
+        assert!(matches!(
+            source,
+            JoinExpr::Join {
+                kind: JoinKind::Inner,
+                predicate: Some(BoundExpr::Binary {
+                    op: BinOp::Eq,
+                    arg_ty: PgType::Int4,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert_eq!(columns.len(), 7);
+        assert_eq!(columns[0].name, "id");
+        // The merged column carries the left side's value (index 0).
+        assert_eq!(
+            projections[0],
+            BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4
+            }
+        );
+    }
+
+    #[test]
+    fn using_merged_column_is_unqualified_while_sides_stay_addressable() {
+        let LogicalPlan::Join { projections, .. } =
+            bind_one("SELECT id, a.id, b.id FROM t a JOIN t b USING (id)").unwrap()
+        else {
+            panic!("expected Join");
+        };
+        // Unqualified `id` and `a.id` are the left copy (index 0); `b.id` the
+        // right copy (index 4).
+        let left = BoundExpr::ColumnRef {
+            index: 0,
+            ty: PgType::Int4,
+        };
+        let right = BoundExpr::ColumnRef {
+            index: 4,
+            ty: PgType::Int4,
+        };
+        assert_eq!(projections, vec![left.clone(), left, right]);
+    }
+
+    #[test]
+    fn using_full_join_merges_with_coalesce() {
+        let LogicalPlan::Join { projections, .. } =
+            bind_one("SELECT id FROM t a FULL JOIN t b USING (id)").unwrap()
+        else {
+            panic!("expected Join");
+        };
+        // A full join's merged column is COALESCE(left, right), lowered to CASE.
+        assert!(matches!(
+            projections[0],
+            BoundExpr::Case {
+                ty: PgType::Int4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn natural_join_equates_every_common_column() {
+        let LogicalPlan::Join {
+            source, columns, ..
+        } = bind_one("SELECT * FROM t a NATURAL JOIN t b").unwrap()
+        else {
+            panic!("expected Join");
+        };
+        // All four columns are shared, so all four merge and the predicate ANDs
+        // four equalities; no columns remain.
+        assert_eq!(columns.len(), 4);
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "big", "name", "flag"]);
+        assert!(matches!(
+            source,
+            JoinExpr::Join {
+                kind: JoinKind::Inner,
+                predicate: Some(BoundExpr::Binary { op: BinOp::And, .. }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn natural_join_without_common_columns_is_a_cross_product() {
+        let LogicalPlan::Join {
+            source, columns, ..
+        } = bind_one("SELECT * FROM (VALUES (1)) a(x) NATURAL JOIN (VALUES (2)) b(y)").unwrap()
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(columns.len(), 2);
+        assert!(matches!(
+            source,
+            JoinExpr::Join {
+                kind: JoinKind::Inner,
+                predicate: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn using_column_missing_on_a_side_is_42703() {
+        let right = bind_err("SELECT * FROM t a JOIN (VALUES (1)) b(x) USING (id)");
+        assert_eq!(right.code, "42703");
+        assert_eq!(
+            right.message,
+            "column \"id\" specified in USING clause does not exist in right table"
+        );
+        let left = bind_err("SELECT * FROM (VALUES (1)) a(x) JOIN t b USING (id)");
+        assert_eq!(left.code, "42703");
+        assert_eq!(
+            left.message,
+            "column \"id\" specified in USING clause does not exist in left table"
+        );
+    }
+
+    #[test]
+    fn using_join_in_a_later_comma_group_shifts_merged_indices() {
+        // `t` (4 columns) is the first comma group, so the merged `id` and the
+        // rest of the USING group live at combined-row offsets 4 and up.
+        let LogicalPlan::Join {
+            columns,
+            projections,
+            ..
+        } = bind_one(
+            "SELECT * FROM t, \
+             (VALUES (5, 50)) a(id, x) JOIN (VALUES (5, 500)) b(id, y) USING (id)",
+        )
+        .unwrap()
+        else {
+            panic!("expected Join");
+        };
+        // t's 4 columns, then merged id, a.x, b.y — 7 in all.
+        assert_eq!(columns.len(), 7);
+        // The merged `id` carries a.id, shifted past t to index 4.
+        assert_eq!(
+            projections[4],
+            BoundExpr::ColumnRef {
+                index: 4,
+                ty: PgType::Int4
+            }
+        );
+        // b.y is a's width past that (a occupies 4,5; b occupies 6,7).
+        assert_eq!(
+            projections[6],
+            BoundExpr::ColumnRef {
+                index: 7,
+                ty: PgType::Int4
+            }
+        );
+    }
+
+    #[test]
+    fn using_column_ambiguous_on_a_side_is_42702() {
+        let e = bind_err("SELECT * FROM (VALUES (1, 2)) a(x, x) JOIN (VALUES (1)) b(x) USING (x)");
+        assert_eq!(e.code, "42702");
+        assert_eq!(
+            e.message,
+            "common column name \"x\" appears more than once in left table"
+        );
     }
 
     #[test]
