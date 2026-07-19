@@ -27,7 +27,9 @@ mod static_table;
 
 use std::sync::{Arc, OnceLock};
 
-use crabgresql_storage_api::{StorageError, TableAm, TableEngine, TableSchema};
+use crabgresql_storage_api::{
+    IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
+};
 use crabgresql_types::Value;
 
 pub use static_table::StaticTable;
@@ -36,6 +38,14 @@ pub use static_table::StaticTable;
 /// user-object floor; the exact values are synthetic (we have no persistent
 /// `pg_class` OIDs yet) but stable within one catalog snapshot.
 const FIRST_REL_OID: u32 = 16384;
+
+#[derive(Clone)]
+struct CatalogIndex {
+    oid: u32,
+    table_oid: u32,
+    table_schema: TableSchema,
+    metadata: IndexMetadata,
+}
 
 /// A built-in `pg_type` row, generated from `pg_type.dat`. Field types mirror
 /// the runtime column types in [`schema::pg_type_schema`]; string fields are the
@@ -82,6 +92,7 @@ include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 #[derive(Clone, Debug)]
 pub struct CatalogRelation {
     pub schema: TableSchema,
+    pub indexes: Vec<IndexMetadata>,
     pub namespace: String,
     pub temporary: bool,
 }
@@ -90,6 +101,16 @@ impl CatalogRelation {
     pub fn permanent(schema: TableSchema) -> Self {
         Self {
             schema,
+            indexes: Vec::new(),
+            namespace: "public".to_string(),
+            temporary: false,
+        }
+    }
+
+    pub fn permanent_metadata(metadata: RelationMetadata) -> Self {
+        Self {
+            schema: metadata.schema,
+            indexes: metadata.indexes,
             namespace: "public".to_string(),
             temporary: false,
         }
@@ -98,6 +119,7 @@ impl CatalogRelation {
     pub fn temporary(schema: TableSchema, namespace: impl Into<String>) -> Self {
         Self {
             schema,
+            indexes: Vec::new(),
             namespace: namespace.into(),
             temporary: true,
         }
@@ -120,6 +142,7 @@ pub struct SystemCatalog {
     owner: String,
     live_relations: OnceLock<Vec<CatalogRelation>>,
     oids: OnceLock<Vec<(u32, TableSchema)>>,
+    index_oids: OnceLock<Vec<CatalogIndex>>,
 }
 
 impl Default for SystemCatalog {
@@ -161,6 +184,7 @@ impl SystemCatalog {
             owner: owner.into(),
             live_relations: OnceLock::new(),
             oids: OnceLock::new(),
+            index_oids: OnceLock::new(),
         }
     }
 
@@ -187,6 +211,38 @@ impl SystemCatalog {
         })
     }
 
+    fn index_oids(&self) -> &[CatalogIndex] {
+        self.index_oids.get_or_init(|| {
+            let mut relations = self.live_relations().to_vec();
+            relations.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            let first_index_oid = FIRST_REL_OID + relations.len() as u32;
+            let mut pending = Vec::new();
+            for (position, relation) in relations.into_iter().enumerate() {
+                let table_oid = FIRST_REL_OID + position as u32;
+                for index in relation.indexes {
+                    pending.push((table_oid, relation.schema.clone(), index));
+                }
+            }
+            pending.sort_by(|a, b| a.2.name.cmp(&b.2.name));
+            pending
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(position, (table_oid, table_schema, metadata))| CatalogIndex {
+                        oid: first_index_oid + position as u32,
+                        table_oid,
+                        table_schema,
+                        metadata,
+                    },
+                )
+                .collect()
+        })
+    }
+
     /// Build the requested relation's rows + schema, or `None` if unknown.
     fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         match name {
@@ -194,11 +250,23 @@ impl SystemCatalog {
             "pg_namespace" => Some((schema::pg_namespace_schema(), schema::pg_namespace_rows())),
             "pg_class" => Some((
                 schema::pg_class_schema(),
-                schema::pg_class_rows(self.relation_oids()),
+                schema::pg_class_rows(self.relation_oids(), self.index_oids()),
             )),
             "pg_attribute" => Some((
                 schema::pg_attribute_schema(),
-                schema::pg_attribute_rows(self.relation_oids()),
+                schema::pg_attribute_rows(self.relation_oids(), self.index_oids()),
+            )),
+            "pg_attrdef" => Some((
+                schema::pg_attrdef_schema(),
+                schema::pg_attrdef_rows(self.relation_oids()),
+            )),
+            "pg_constraint" => Some((
+                schema::pg_constraint_schema(),
+                schema::pg_constraint_rows(self.relation_oids(), self.index_oids()),
+            )),
+            "pg_index" => Some((
+                schema::pg_index_schema(),
+                schema::pg_index_rows(self.index_oids()),
             )),
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
             _ => None,

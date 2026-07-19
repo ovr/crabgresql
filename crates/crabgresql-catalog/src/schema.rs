@@ -8,10 +8,10 @@
 //! `regproc` I/O columns as the referenced function's `text` name (which is what
 //! PostgreSQL's `regprocout` prints anyway).
 
-use crabgresql_storage_api::{Column, TableSchema};
+use crabgresql_storage_api::{Column, IndexConstraint, IndexMethod, TableSchema};
 use crabgresql_types::{PgType, Value};
 
-use crate::{CatalogRelation, PG_CAST_ROWS, PG_TYPE_ROWS};
+use crate::{CatalogIndex, CatalogRelation, PG_CAST_ROWS, PG_TYPE_ROWS};
 
 /// A `"char"`/`regproc` column: a single- or short-name catalog column we render
 /// as `text` for now. Kept as a named alias so the deviation is greppable.
@@ -160,8 +160,11 @@ pub fn pg_class_schema() -> TableSchema {
 /// `public` (namespace 2200), are ordinary heaps (`relkind = 'r'`, `relam = 2`)
 /// and permanent (`relpersistence = 'p'`); the synthetic OIDs are stable within
 /// one catalog snapshot so a join to `pg_attribute.attrelid` lines up.
-pub fn pg_class_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
-    relations
+pub fn pg_class_rows(
+    relations: &[(u32, TableSchema)],
+    indexes: &[CatalogIndex],
+) -> Vec<Vec<Value>> {
+    let mut rows: Vec<Vec<Value>> = relations
         .iter()
         .map(|(oid, schema)| {
             vec![
@@ -172,12 +175,30 @@ pub fn pg_class_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
                 Value::Oid(10),
                 Value::Oid(HEAP_AM_OID),
                 Value::Int2(schema.columns.len() as i16),
-                Value::Bool(false),
+                Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
                 Value::Text("p".to_string()),
                 Value::Text("r".to_string()),
             ]
         })
-        .collect()
+        .collect();
+    rows.extend(indexes.iter().map(|index| {
+        vec![
+            Value::Oid(index.oid),
+            Value::Text(index.metadata.name.clone()),
+            Value::Oid(2200),
+            Value::Oid(0),
+            Value::Oid(10),
+            Value::Oid(match index.metadata.method {
+                IndexMethod::BTree => 403,
+                IndexMethod::Hash => 405,
+            }),
+            Value::Int2(index.metadata.keys.len() as i16),
+            Value::Bool(false),
+            Value::Text("p".to_string()),
+            Value::Text("i".to_string()),
+        ]
+    }));
+    rows
 }
 
 /// `pg_catalog.pg_attribute` — a curated subset of columns for user relations'
@@ -193,6 +214,7 @@ pub fn pg_attribute_schema() -> TableSchema {
             col("attnum", PgType::Int2),
             col("atttypmod", PgType::Int4),
             col("attnotnull", PgType::Bool),
+            col("atthasdef", PgType::Bool),
             col("attisdropped", PgType::Bool),
         ],
     }
@@ -200,7 +222,10 @@ pub fn pg_attribute_schema() -> TableSchema {
 
 /// Build `pg_attribute` rows: one per column of each relation, `attnum` 1-based
 /// (user columns only), typed from the column's `PgType` (`atttypid`/`attlen`).
-pub fn pg_attribute_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
+pub fn pg_attribute_rows(
+    relations: &[(u32, TableSchema)],
+    indexes: &[CatalogIndex],
+) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
     for (oid, schema) in relations {
         for (i, c) in schema.columns.iter().enumerate() {
@@ -211,12 +236,216 @@ pub fn pg_attribute_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
                 Value::Int2(c.ty.typlen()),
                 Value::Int2((i + 1) as i16),
                 Value::Int4(c.typmod),
+                Value::Bool(!c.nullable),
+                Value::Bool(c.default.is_some()),
+                Value::Bool(false),
+            ]);
+        }
+    }
+    for index in indexes {
+        for (position, key) in index.metadata.keys.iter().enumerate() {
+            let column = &index.table_schema.columns[key.column];
+            rows.push(vec![
+                Value::Oid(index.oid),
+                Value::Text(column.name.clone()),
+                Value::Oid(column.ty.oid()),
+                Value::Int2(column.ty.typlen()),
+                Value::Int2((position + 1) as i16),
+                Value::Int4(column.typmod),
+                Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(false),
             ]);
         }
     }
     rows
+}
+
+pub fn pg_attrdef_schema() -> TableSchema {
+    TableSchema {
+        name: "pg_attrdef".to_string(),
+        columns: vec![
+            col("oid", PgType::Oid),
+            col("adrelid", PgType::Oid),
+            col("adnum", PgType::Int2),
+            col("adbin", PgType::Text),
+        ],
+    }
+}
+
+pub fn pg_attrdef_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
+    let mut next_oid = 30000_u32;
+    let mut rows = Vec::new();
+    for (table_oid, schema) in relations {
+        for (position, column) in schema.columns.iter().enumerate() {
+            if let Some(default) = &column.default {
+                rows.push(vec![
+                    Value::Oid(next_oid),
+                    Value::Oid(*table_oid),
+                    Value::Int2((position + 1) as i16),
+                    Value::Text(default.clone()),
+                ]);
+                next_oid += 1;
+            }
+        }
+    }
+    rows
+}
+
+pub fn pg_constraint_schema() -> TableSchema {
+    TableSchema {
+        name: "pg_constraint".to_string(),
+        columns: vec![
+            col("oid", PgType::Oid),
+            col("conname", PgType::Name),
+            col("connamespace", PgType::Oid),
+            col("contype", CHARLIKE),
+            col("condeferrable", PgType::Bool),
+            col("condeferred", PgType::Bool),
+            col("convalidated", PgType::Bool),
+            col("conrelid", PgType::Oid),
+            col("conindid", PgType::Oid),
+            // int2[] is represented as PG array text until catalog arrays land.
+            col("conkey", PgType::Text),
+        ],
+    }
+}
+
+pub fn pg_constraint_rows(
+    relations: &[(u32, TableSchema)],
+    indexes: &[CatalogIndex],
+) -> Vec<Vec<Value>> {
+    let mut next_oid = 31000_u32;
+    let mut rows = Vec::new();
+    for (table_oid, schema) in relations {
+        for (position, column) in schema.columns.iter().enumerate() {
+            if let Some(name) = &column.not_null_constraint {
+                rows.push(constraint_row(
+                    next_oid,
+                    name,
+                    "n",
+                    *table_oid,
+                    0,
+                    &[position],
+                ));
+                next_oid += 1;
+            }
+        }
+    }
+    for index in indexes {
+        if let Some(constraint) = index.metadata.constraint {
+            rows.push(constraint_row(
+                next_oid,
+                &index.metadata.name,
+                match constraint {
+                    IndexConstraint::PrimaryKey => "p",
+                    IndexConstraint::Unique => "u",
+                },
+                index.table_oid,
+                index.oid,
+                &index
+                    .metadata
+                    .keys
+                    .iter()
+                    .map(|key| key.column)
+                    .collect::<Vec<_>>(),
+            ));
+            next_oid += 1;
+        }
+    }
+    rows
+}
+
+fn constraint_row(
+    oid: u32,
+    name: &str,
+    kind: &str,
+    table_oid: u32,
+    index_oid: u32,
+    columns: &[usize],
+) -> Vec<Value> {
+    vec![
+        Value::Oid(oid),
+        Value::Text(name.to_string()),
+        Value::Oid(2200),
+        Value::Text(kind.to_string()),
+        Value::Bool(false),
+        Value::Bool(false),
+        Value::Bool(true),
+        Value::Oid(table_oid),
+        Value::Oid(index_oid),
+        Value::Text(format!(
+            "{{{}}}",
+            columns
+                .iter()
+                .map(|column| (column + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
+    ]
+}
+
+pub fn pg_index_schema() -> TableSchema {
+    TableSchema {
+        name: "pg_index".to_string(),
+        columns: vec![
+            col("indexrelid", PgType::Oid),
+            col("indrelid", PgType::Oid),
+            col("indnatts", PgType::Int2),
+            col("indnkeyatts", PgType::Int2),
+            col("indisunique", PgType::Bool),
+            col("indnullsnotdistinct", PgType::Bool),
+            col("indisprimary", PgType::Bool),
+            col("indimmediate", PgType::Bool),
+            col("indisvalid", PgType::Bool),
+            col("indkey", PgType::Text),
+            col("indoption", PgType::Text),
+        ],
+    }
+}
+
+pub fn pg_index_rows(indexes: &[CatalogIndex]) -> Vec<Vec<Value>> {
+    indexes
+        .iter()
+        .map(|index| {
+            let indkey = index
+                .metadata
+                .keys
+                .iter()
+                .map(|key| (key.column + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let indoption = index
+                .metadata
+                .keys
+                .iter()
+                .map(|key| {
+                    let mut option = 0;
+                    if key.descending {
+                        option |= 1;
+                    }
+                    if key.nulls_first {
+                        option |= 2;
+                    }
+                    option.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            vec![
+                Value::Oid(index.oid),
+                Value::Oid(index.table_oid),
+                Value::Int2(index.metadata.keys.len() as i16),
+                Value::Int2(index.metadata.keys.len() as i16),
+                Value::Bool(index.metadata.unique),
+                Value::Bool(!index.metadata.nulls_distinct),
+                Value::Bool(index.metadata.constraint == Some(IndexConstraint::PrimaryKey)),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Text(indkey),
+                Value::Text(indoption),
+            ]
+        })
+        .collect()
 }
 
 /// Fixed `pg_namespace` rows: the reserved catalog/toast schemas plus `public`.
@@ -445,8 +674,12 @@ pub fn information_schema_columns_rows(
                         Value::Text(relation.schema.name.clone()),
                         Value::Text(column.name.clone()),
                         Value::Int4((index + 1) as i32),
-                        Value::Null,
-                        Value::Text("YES".to_string()),
+                        column
+                            .default
+                            .as_ref()
+                            .map(|default| Value::Text(default.clone()))
+                            .unwrap_or(Value::Null),
+                        Value::Text(if column.nullable { "YES" } else { "NO" }.to_string()),
                         Value::Text(column.ty.name().to_string()),
                         character_length,
                         character_octets,

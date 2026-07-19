@@ -7,13 +7,13 @@
 //! lock: change the page, append the WAL record, stamp `pd_lsn` with the record
 //! LSN, mark the page dirty — so the page can never reach disk ahead of its log.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    DeleteResult, TableAm, TableSchema, Tid, Tuple, UpdateResult,
+    DeleteResult, IndexMetadata, TableAm, TableSchema, Tid, Tuple, UpdateResult,
 };
-use crabgresql_txn::{Clog, TupleHeader, TxnContext, Xid, XactStatus, satisfies_mvcc};
+use crabgresql_txn::{Clog, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
 use crabgresql_wal::RmgrId;
 
 use crate::EngineInner;
@@ -31,11 +31,27 @@ pub struct HeapTable {
     engine: Arc<EngineInner>,
     /// Last block we inserted into — where the next insert tries first.
     insert_hint: AtomicU32,
+    indexes: RwLock<Vec<IndexMetadata>>,
 }
 
 impl HeapTable {
-    pub fn new(engine: Arc<EngineInner>, rel: RelFileNode, schema: TableSchema) -> HeapTable {
-        HeapTable { schema, rel, engine, insert_hint: AtomicU32::new(0) }
+    pub fn new(
+        engine: Arc<EngineInner>,
+        rel: RelFileNode,
+        schema: TableSchema,
+        indexes: Vec<IndexMetadata>,
+    ) -> HeapTable {
+        HeapTable {
+            schema,
+            rel,
+            engine,
+            insert_hint: AtomicU32::new(0),
+            indexes: RwLock::new(indexes),
+        }
+    }
+
+    pub fn add_index(&self, index: IndexMetadata) {
+        self.indexes.write().unwrap().push(index);
     }
 
     #[allow(dead_code)] // used by tooling/tests and future index AM wiring
@@ -68,7 +84,10 @@ impl HeapTable {
             let page = Self::io(self.engine.bufpool.pin(self.rel, target));
             let placed = page.modify(|pg| {
                 let off = page::add_item(pg, tuple_bytes)?;
-                let tid = Tid { block: target, offset: off };
+                let tid = Tid {
+                    block: target,
+                    offset: off,
+                };
                 tuple::set_ctid(page::get_item_mut(pg, off).unwrap(), tid);
                 let final_bytes = page::get_item(pg, off).unwrap().to_vec();
                 let lsn = self.engine.wal.append(
@@ -132,6 +151,10 @@ impl TableAm for HeapTable {
         &self.schema
     }
 
+    fn indexes(&self) -> Vec<IndexMetadata> {
+        self.indexes.read().unwrap().clone()
+    }
+
     fn scan(&self, txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
         let nblocks = Self::io(self.engine.bufpool.smgr().nblocks(self.rel));
         Box::new(HeapScan {
@@ -164,7 +187,14 @@ impl TableAm for HeapTable {
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Tid {
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
-        let bytes = tuple::encode_tuple(&tuple, &hdr, Tid { block: 0, offset: 0 });
+        let bytes = tuple::encode_tuple(
+            &tuple,
+            &hdr,
+            Tid {
+                block: 0,
+                offset: 0,
+            },
+        );
         self.place(txn.xid, &bytes)
     }
 
@@ -182,7 +212,14 @@ impl TableAm for HeapTable {
         // update-chain link is only consumed by EvalPlanQual, which is deferred
         // (P6).
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
-        let new_bytes = tuple::encode_tuple(&tuple, &hdr, Tid { block: 0, offset: 0 });
+        let new_bytes = tuple::encode_tuple(
+            &tuple,
+            &hdr,
+            Tid {
+                block: 0,
+                offset: 0,
+            },
+        );
         self.place(txn.xid, &new_bytes);
         UpdateResult::Updated
     }
@@ -199,7 +236,12 @@ impl TableAm for HeapTable {
         // Durably log the truncate before destroying data. Not transactional in
         // v1 (a rollback will not bring rows back), matching the memory engine's
         // documented limitation.
-        let lsn = self.engine.wal.append(RmgrId::HEAP, rec::HEAP_TRUNCATE, txn.xid, &rec::truncate(self.rel));
+        let lsn = self.engine.wal.append(
+            RmgrId::HEAP,
+            rec::HEAP_TRUNCATE,
+            txn.xid,
+            &rec::truncate(self.rel),
+        );
         Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
         self.engine.bufpool.forget_relation(self.rel);
         Self::io(self.engine.bufpool.smgr().truncate(self.rel));

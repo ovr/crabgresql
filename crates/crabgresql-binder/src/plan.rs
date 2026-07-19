@@ -13,8 +13,8 @@ use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TypeCat
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
-    BoundExpr, Scope, bind_expr, bind_projection, bind_scalar, coerce_to_column, normalize_ident,
-    output_name, to_bool_operand, unify_value_column,
+    BoundExpr, Scope, bind_column_default, bind_expr, bind_projection, bind_scalar,
+    coerce_to_column, normalize_ident, output_name, to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -1671,6 +1671,42 @@ fn classify_select_item(item: &ast::SelectItem) -> Result<SelectField<'_>, BindE
     }
 }
 
+fn is_default_keyword(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Identifier(ident)
+            if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("default")
+    )
+}
+
+/// Reparse and bind a persisted default. Storing canonical SQL keeps the
+/// storage API independent of the parser/binder IR while still evaluating the
+/// expression for every inserted/updated row.
+fn default_for_column(
+    column: &Column,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<BoundExpr, BindError> {
+    let Some(sql) = &column.default else {
+        return Ok(BoundExpr::Const {
+            value: Value::Null,
+            ty: column.ty,
+        });
+    };
+    let statements = crabgresql_parser::parse(&format!("SELECT {sql}"))
+        .map_err(|e| BindError::syntax(format!("invalid stored default expression: {e}")))?;
+    let expr = match statements.as_slice() {
+        [ast::Statement::Query(query)] => match query.body.as_ref() {
+            ast::SetExpr::Select(select) => match select.projection.as_slice() {
+                [ast::SelectItem::UnnamedExpr(expr)] => expr,
+                _ => return Err(BindError::syntax("invalid stored default expression")),
+            },
+            _ => return Err(BindError::syntax("invalid stored default expression")),
+        },
+        _ => return Err(BindError::syntax("invalid stored default expression")),
+    };
+    bind_column_default(expr, column, catalog)
+}
+
 pub fn bind_insert(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -1699,6 +1735,11 @@ pub fn bind_insert(
     // catalog is never a write target.
     let (table, name) = resolve_write_table(engine, target)?;
     let schema = table.schema().clone();
+    let defaults = schema
+        .columns
+        .iter()
+        .map(|column| default_for_column(column, catalog))
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Map the column list (or its absence) to positions in the table schema.
     let explicit_columns = !insert.columns.is_empty();
@@ -1725,52 +1766,60 @@ pub fn bind_insert(
         indices
     };
 
-    let source = insert.source.as_deref().ok_or_else(|| {
-        BindError::feature_not_supported("INSERT without VALUES is not supported yet")
-    })?;
+    let default_values_form = insert.source.is_none();
+    let mut value_rows: Vec<&[ast::Expr]> = Vec::new();
+    let empty: &[ast::Expr] = &[];
+    if default_values_form {
+        value_rows.push(empty);
+    }
+    let source = insert.source.as_deref();
     // The INSERT source is a full query in PG: `VALUES (1),(2) LIMIT 1` is
     // legal and inserts one row. Ignoring these clauses would silently insert
     // the wrong rows, so reject them like any other unexecuted clause. ORDER BY
     // on an INSERT source is not executed here either.
-    reject_unsupported_query_clauses(source)?;
-    // A WITH on the INSERT source (`INSERT ... WITH c AS (...) VALUES ...`) is not
-    // executed here; reject it rather than silently dropping the CTE. (Top-level
-    // WITH is handled by bind_ctes, but the INSERT path never reaches it.)
-    if source.with.is_some() {
-        return Err(BindError::feature_not_supported(
-            "WITH on INSERT is not supported yet",
-        ));
-    }
-    if source.order_by.is_some() {
-        return Err(BindError::feature_not_supported(
-            "ORDER BY on an INSERT source is not supported yet",
-        ));
-    }
-    // `VALUES (1),(2) LIMIT 1` is a legal INSERT source in PG that inserts one
-    // row; this path does not execute the limit, so reject it rather than
-    // silently insert the wrong rows.
-    if source.limit_clause.is_some() {
-        return Err(BindError::feature_not_supported(
-            "LIMIT/OFFSET on an INSERT source is not supported yet",
-        ));
-    }
-    let values = match source.body.as_ref() {
-        ast::SetExpr::Values(values) => &values.rows,
-        other => {
-            return Err(BindError::feature_not_supported(format!(
-                "INSERT source is not supported yet: {other}"
-            )));
+    if let Some(source) = source {
+        reject_unsupported_query_clauses(source)?;
+        // A WITH on the INSERT source (`INSERT ... WITH c AS (...) VALUES ...`) is not
+        // executed here; reject it rather than silently dropping the CTE. (Top-level
+        // WITH is handled by bind_ctes, but the INSERT path never reaches it.)
+        if source.with.is_some() {
+            return Err(BindError::feature_not_supported(
+                "WITH on INSERT is not supported yet",
+            ));
         }
-    };
+        if source.order_by.is_some() {
+            return Err(BindError::feature_not_supported(
+                "ORDER BY on an INSERT source is not supported yet",
+            ));
+        }
+        // `VALUES (1),(2) LIMIT 1` is a legal INSERT source in PG that inserts one
+        // row; this path does not execute the limit, so reject it rather than
+        // silently insert the wrong rows.
+        if source.limit_clause.is_some() {
+            return Err(BindError::feature_not_supported(
+                "LIMIT/OFFSET on an INSERT source is not supported yet",
+            ));
+        }
+        let values = match source.body.as_ref() {
+            ast::SetExpr::Values(values) => &values.rows,
+            other => {
+                return Err(BindError::feature_not_supported(format!(
+                    "INSERT source is not supported yet: {other}"
+                )));
+            }
+        };
+        value_rows.extend(values.iter().map(|row| row.content.as_slice()));
+    }
 
     // VALUES cells bind in the empty scope: a column reference in VALUES is
     // an undefined column, as in PG.
     let scope = Scope::empty(catalog);
-    let mut rows = Vec::with_capacity(values.len());
-    for value_row in values {
+    let first_width = value_rows.first().map_or(0, |row| row.len());
+    let mut rows = Vec::with_capacity(value_rows.len());
+    for value_row in value_rows {
         // PG validates the VALUES clause shape before matching it against the
         // target columns.
-        if value_row.len() != values[0].len() {
+        if value_row.len() != first_width {
             return Err(BindError::syntax(
                 "VALUES lists must all be the same length",
             ));
@@ -1782,22 +1831,19 @@ pub fn bind_insert(
         }
         // With an explicit column list PG requires an exact match; without
         // one, missing trailing columns default to NULL.
-        if explicit_columns && value_row.len() < target_indices.len() {
+        if !default_values_form && explicit_columns && value_row.len() < target_indices.len() {
             return Err(BindError::syntax(
                 "INSERT has more target columns than expressions",
             ));
         }
-        let mut row: Vec<BoundExpr> = schema
-            .columns
-            .iter()
-            .map(|col| BoundExpr::Const {
-                value: Value::Null,
-                ty: col.ty,
-            })
-            .collect();
+        let mut row = defaults.clone();
         for (expr, &idx) in value_row.iter().zip(&target_indices) {
-            let binding = bind_expr(expr, &scope)?;
-            row[idx] = coerce_to_column(binding, &schema.columns[idx])?;
+            row[idx] = if is_default_keyword(expr) {
+                defaults[idx].clone()
+            } else {
+                let binding = bind_expr(expr, &scope)?;
+                coerce_to_column(binding, &schema.columns[idx])?
+            };
         }
         rows.push(row);
     }
@@ -1860,8 +1906,13 @@ pub fn bind_update(
                 "multiple assignments to same column \"{column}\""
             )));
         }
-        let binding = bind_expr(&assignment.value, &scope)?;
-        assignments.push((idx, coerce_to_column(binding, &schema.columns[idx])?));
+        let value = if is_default_keyword(&assignment.value) {
+            default_for_column(&schema.columns[idx], catalog)?
+        } else {
+            let binding = bind_expr(&assignment.value, &scope)?;
+            coerce_to_column(binding, &schema.columns[idx])?
+        };
+        assignments.push((idx, value));
     }
 
     let predicate = bind_where(&update.selection, &scope)?;
@@ -2655,13 +2706,27 @@ mod tests {
             // clauses would insert the wrong rows.
             "INSERT INTO t (id) VALUES (1), (2) LIMIT 1",
             "INSERT INTO t (id) VALUES (1), (2) ORDER BY 1",
-            // DEFAULT parses as an identifier; it must not bind as a column.
-            "INSERT INTO t (id) VALUES (DEFAULT)",
-            "UPDATE t SET id = DEFAULT",
         ] {
             let e = bind_err(sql);
             assert_eq!(e.code, "0A000", "for: {sql}");
         }
+    }
+
+    #[test]
+    fn default_keyword_binds_as_typed_null_without_a_declared_default() {
+        let LogicalPlan::Insert { rows, .. } =
+            bind_one("INSERT INTO t (id) VALUES (DEFAULT)").unwrap()
+        else {
+            panic!("expected Insert");
+        };
+        assert_eq!(
+            rows[0][0],
+            BoundExpr::Const {
+                value: Value::Null,
+                ty: PgType::Int4,
+            }
+        );
+        assert!(bind_one("UPDATE t SET id = DEFAULT").is_ok());
     }
 
     #[test]

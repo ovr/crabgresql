@@ -4,6 +4,7 @@
 //! (CREATE TABLE) and session commands (SET) execute directly here until the
 //! catalog and GUC store exist.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crabgresql_binder::{LogicalPlan, bind_delete, bind_insert, bind_query, bind_update};
@@ -11,7 +12,8 @@ use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
-    Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog,
+    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, StorageError, TableAm,
+    TableEngine, TableSchema, TypeCatalog,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::PgType;
@@ -134,12 +136,17 @@ pub fn execute_statement(
                 owner,
                 move || {
                     let mut rels: Vec<_> = global
-                        .relations()
+                        .relation_metadata()
                         .into_iter()
-                        .map(crabgresql_catalog::CatalogRelation::permanent)
+                        .map(crabgresql_catalog::CatalogRelation::permanent_metadata)
                         .collect();
-                    rels.extend(temp.relations().into_iter().map(|schema| {
-                        crabgresql_catalog::CatalogRelation::temporary(schema, temp_schema.clone())
+                    rels.extend(temp.relation_metadata().into_iter().map(|metadata| {
+                        let mut relation = crabgresql_catalog::CatalogRelation::temporary(
+                            metadata.schema,
+                            temp_schema.clone(),
+                        );
+                        relation.indexes = metadata.indexes;
+                        relation
                     }));
                     rels
                 },
@@ -161,7 +168,7 @@ pub fn execute_statement(
         ast::Statement::Update(update) => bind_update(&catalog, &type_catalog, update)?,
         ast::Statement::Delete(delete) => bind_delete(&catalog, &type_catalog, delete)?,
         ast::Statement::CreateTable(create) => {
-            return execute_create_table(engine, create, session);
+            return execute_create_table(engine, &type_catalog, create, session);
         }
         ast::Statement::CreateType {
             name,
@@ -226,7 +233,7 @@ pub fn execute_statement(
             return execute_truncate(&catalog, txnmgr, session, truncate);
         }
         ast::Statement::CreateIndex(create) => {
-            return execute_create_index(&catalog, create);
+            return execute_create_index(&catalog, txnmgr, session, create);
         }
         other => {
             return Err(PgError::feature_not_supported(format!(
@@ -537,58 +544,148 @@ fn execute_truncate(
     Ok(QueryResult::command("TRUNCATE TABLE"))
 }
 
-/// `CREATE INDEX`: validated no-op. The in-memory / pg engines don't need a
-/// real index for output parity, so this checks the target table and columns
-/// exist (matching PG's errors) and accepts `USING btree|hash`, then returns the
-/// `CREATE INDEX` command tag. Unsupported access methods and clauses error.
+/// Register a semantic index. It is reflected through the catalogs and UNIQUE
+/// indexes validate existing and future rows; physical lookup/IndexScan waits
+/// for the B-tree access-method milestone.
 fn execute_create_index(
     engine: &Arc<dyn TableEngine>,
+    txnmgr: &TransactionManager,
+    session: &mut Session,
     create: &ast::CreateIndex,
 ) -> Result<QueryResult, PgError> {
-    match &create.using {
-        None | Some(ast::IndexType::BTree) | Some(ast::IndexType::Hash) => {}
+    let method = match &create.using {
+        None | Some(ast::IndexType::BTree) => IndexMethod::BTree,
+        Some(ast::IndexType::Hash) => IndexMethod::Hash,
         Some(other) => {
             return Err(PgError::feature_not_supported(format!(
                 "index access method \"{other}\" is not supported yet"
             )));
         }
-    }
-    // A UNIQUE index is a uniqueness constraint. Accepting it as a no-op would
-    // let duplicate rows in (PG raises 23505), the same hazard execute_create_table
-    // guards against for column constraints, so reject it rather than ignore it.
-    if create.unique {
+    };
+    if create.unique && method == IndexMethod::Hash {
         return Err(PgError::feature_not_supported(
-            "CREATE UNIQUE INDEX is not supported yet",
+            "access method \"hash\" does not support unique indexes",
         ));
     }
-    if create.predicate.is_some() {
+    if create.concurrently
+        || !create.include.is_empty()
+        || !create.with.is_empty()
+        || !create.index_options.is_empty()
+        || !create.alter_options.is_empty()
+        || create.predicate.is_some()
+    {
         return Err(PgError::feature_not_supported(
-            "partial indexes are not supported yet",
+            "this CREATE INDEX form is not supported yet",
         ));
     }
-    let name = object_name_to_table_name(&create.table_name)?;
-    let table = engine.open_table(&name)?;
-    for col in &create.columns {
-        let ident = match &col.column.expr {
-            ast::Expr::Identifier(ident) => normalize_ident(ident),
-            ast::Expr::CompoundIdentifier(parts) => match parts.last() {
-                Some(ident) => normalize_ident(ident),
-                None => return Err(PgError::syntax("invalid index column")),
-            },
-            _ => {
-                return Err(PgError::feature_not_supported(
-                    "expression indexes are not supported yet",
+    if create.nulls_distinct.is_some() && !create.unique {
+        return Err(PgError::feature_not_supported(
+            "NULLS [NOT] DISTINCT requires a unique index",
+        ));
+    }
+    let index_name = create
+        .name
+        .as_ref()
+        .ok_or_else(|| PgError::syntax("CREATE INDEX requires an index name"))
+        .and_then(object_name_to_table_name)?;
+    let table_name = object_name_to_table_name(&create.table_name)?;
+    if engine.index_name_exists(&table_name, &index_name) {
+        if create.if_not_exists {
+            let mut result = QueryResult::command("CREATE INDEX");
+            if let QueryResult::Command { notices, .. } = &mut result {
+                notices.push(Notice::notice(
+                    format!("relation \"{index_name}\" already exists, skipping"),
+                    None,
                 ));
             }
-        };
-        if table.schema().column_index(&ident).is_none() {
-            return Err(PgError::new(
-                sqlstate::UNDEFINED_COLUMN,
-                format!("column \"{ident}\" does not exist"),
-            ));
+            return Ok(result);
         }
+        return Err(PgError::new(
+            sqlstate::DUPLICATE_TABLE,
+            format!("relation \"{index_name}\" already exists"),
+        ));
     }
+    let table = engine.open_table(&table_name)?;
+    let keys = simple_index_keys(table.schema(), &create.columns)?;
+    let index = IndexMetadata {
+        name: index_name.clone(),
+        method,
+        keys,
+        unique: create.unique,
+        nulls_distinct: create.nulls_distinct.unwrap_or(true),
+        constraint: None,
+    };
+    if create.unique {
+        let txn = build_txn(txnmgr, session, false);
+        validate_unique_index_build(&table, &index, &txn)?;
+    }
+    engine.create_index(&table_name, index)?;
     Ok(QueryResult::command("CREATE INDEX"))
+}
+
+fn validate_unique_index_build(
+    table: &Arc<dyn TableAm>,
+    index: &IndexMetadata,
+    txn: &TxnContext,
+) -> Result<(), PgError> {
+    let schema = table.schema();
+    let mut seen: Vec<crabgresql_storage_api::Tuple> = Vec::new();
+    for (_, tuple) in table.scan(txn) {
+        if index.nulls_distinct
+            && index
+                .keys
+                .iter()
+                .any(|key| matches!(tuple[key.column], crabgresql_types::Value::Null))
+        {
+            continue;
+        }
+        if seen
+            .iter()
+            .any(|other| index_rows_equal(schema, index, &tuple, other))
+        {
+            let names = index
+                .keys
+                .iter()
+                .map(|key| schema.columns[key.column].name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let values = index
+                .keys
+                .iter()
+                .map(|key| {
+                    tuple[key.column]
+                        .encode_text()
+                        .unwrap_or_else(|| "null".to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(PgError::new(
+                "23505",
+                format!("could not create unique index \"{}\"", index.name),
+            )
+            .with_detail(format!("Key ({names})=({values}) is duplicated.")));
+        }
+        seen.push(tuple);
+    }
+    Ok(())
+}
+
+fn index_rows_equal(
+    schema: &TableSchema,
+    index: &IndexMetadata,
+    left: &[crabgresql_types::Value],
+    right: &[crabgresql_types::Value],
+) -> bool {
+    index.keys.iter().all(|key| {
+        let left = &left[key.column];
+        let right = &right[key.column];
+        match (left, right) {
+            (crabgresql_types::Value::Null, crabgresql_types::Value::Null) => true,
+            (crabgresql_types::Value::Null, _) | (_, crabgresql_types::Value::Null) => false,
+            _ => crabgresql_executor::compare_values(schema.columns[key.column].ty, left, right)
+                .is_eq(),
+        }
+    })
 }
 
 /// `SET`: only `extra_float_digits` is honored; other GUCs are accepted and
@@ -707,10 +804,16 @@ fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, PgError> 
 
 fn execute_create_table(
     engine: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
     create: &ast::CreateTable,
     session: &Session,
 ) -> Result<QueryResult, PgError> {
     let name = object_name_to_table_name(&create.name)?;
+    let target = if create.temporary {
+        &session.temp
+    } else {
+        engine
+    };
     // Clauses we can't honor must be rejected, not silently dropped: CREATE
     // TABLE AS would otherwise create an empty table (the SELECT is discarded),
     // and ON COMMIT DROP/DELETE ROWS needs the M2 transaction engine — accepting
@@ -725,40 +828,330 @@ fn execute_create_table(
             "CREATE TABLE ... ON COMMIT is not supported yet",
         ));
     }
-    if let Some(constraint) = create.constraints.first() {
-        return Err(PgError::feature_not_supported(format!(
-            "table constraints are not supported yet: {constraint}"
-        )));
+    #[derive(Clone)]
+    struct PendingIndex {
+        explicit_name: Option<String>,
+        columns: Vec<ast::IndexColumn>,
+        unique: bool,
+        nulls_distinct: bool,
+        constraint: IndexConstraint,
+        characteristics: Option<ast::ConstraintCharacteristics>,
     }
+
     let mut columns = Vec::new();
+    let mut pending = Vec::<PendingIndex>::new();
+    let mut constraint_names = HashSet::new();
     for col in &create.columns {
-        // Constraints we can't enforce must not be accepted: a silently
-        // dropped NOT NULL / PRIMARY KEY would let invalid data in.
-        if let Some(option) = col.options.first() {
-            return Err(PgError::feature_not_supported(format!(
-                "column constraints are not supported yet: {}",
-                option.option
-            )));
-        }
         let ty = map_data_type(&col.data_type)?;
-        // Carry a varchar(n)/char(n) length so INSERT/UPDATE can pad/validate.
         let typmod = crabgresql_binder::length_typmod(&col.data_type).unwrap_or(-1);
-        columns.push(Column::with_typmod(normalize_ident(&col.name), ty, typmod));
+        let column_name = normalize_ident(&col.name);
+        let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
+        for option in &col.options {
+            match &option.option {
+                ast::ColumnOption::Null => {}
+                ast::ColumnOption::NotNull => {
+                    if !column.nullable {
+                        return Err(PgError::new(
+                            "42710",
+                            format!(
+                                "NOT NULL constraint specified more than once for column \"{column_name}\" of table \"{name}\""
+                            ),
+                        ));
+                    }
+                    column.nullable = false;
+                    let constraint_name =
+                        option
+                            .name
+                            .as_ref()
+                            .map(normalize_ident)
+                            .unwrap_or_else(|| {
+                                fresh_local_name(
+                                    &constraint_names,
+                                    &format!("{name}_{column_name}_not_null"),
+                                )
+                            });
+                    if !constraint_names.insert(constraint_name.clone()) {
+                        return Err(PgError::new(
+                            "42710",
+                            format!(
+                                "constraint \"{constraint_name}\" for relation \"{name}\" already exists"
+                            ),
+                        ));
+                    }
+                    column.not_null_constraint = Some(constraint_name);
+                }
+                ast::ColumnOption::Default(expr) => {
+                    if column.default.is_some() {
+                        return Err(PgError::syntax(format!(
+                            "multiple default values specified for column \"{column_name}\" of table \"{name}\""
+                        )));
+                    }
+                    crabgresql_binder::bind_column_default(expr, &column, type_catalog)?;
+                    column.default = Some(expr.to_string());
+                }
+                ast::ColumnOption::PrimaryKey(pk) => {
+                    reject_primary_key_options(pk)?;
+                    pending.push(PendingIndex {
+                        explicit_name: option.name.as_ref().map(normalize_ident),
+                        columns: vec![ast::IndexColumn::from(col.name.clone())],
+                        unique: true,
+                        nulls_distinct: true,
+                        constraint: IndexConstraint::PrimaryKey,
+                        characteristics: pk.characteristics,
+                    });
+                }
+                ast::ColumnOption::Unique(unique) => {
+                    reject_unique_options(unique)?;
+                    pending.push(PendingIndex {
+                        explicit_name: option.name.as_ref().map(normalize_ident),
+                        columns: vec![ast::IndexColumn::from(col.name.clone())],
+                        unique: true,
+                        nulls_distinct: !matches!(
+                            unique.nulls_distinct,
+                            ast::NullsDistinctOption::NotDistinct
+                        ),
+                        constraint: IndexConstraint::Unique,
+                        characteristics: unique.characteristics,
+                    });
+                }
+                other => {
+                    return Err(PgError::feature_not_supported(format!(
+                        "column constraint is not supported yet: {other}"
+                    )));
+                }
+            }
+        }
+        columns.push(column);
+    }
+
+    for constraint in &create.constraints {
+        match constraint {
+            ast::TableConstraint::PrimaryKey(pk) => {
+                reject_primary_key_options(pk)?;
+                pending.push(PendingIndex {
+                    explicit_name: pk.name.as_ref().map(normalize_ident),
+                    columns: pk.columns.clone(),
+                    unique: true,
+                    nulls_distinct: true,
+                    constraint: IndexConstraint::PrimaryKey,
+                    characteristics: pk.characteristics,
+                });
+            }
+            ast::TableConstraint::Unique(unique) => {
+                reject_unique_options(unique)?;
+                pending.push(PendingIndex {
+                    explicit_name: unique.name.as_ref().map(normalize_ident),
+                    columns: unique.columns.clone(),
+                    unique: true,
+                    nulls_distinct: !matches!(
+                        unique.nulls_distinct,
+                        ast::NullsDistinctOption::NotDistinct
+                    ),
+                    constraint: IndexConstraint::Unique,
+                    characteristics: unique.characteristics,
+                });
+            }
+            other => {
+                return Err(PgError::feature_not_supported(format!(
+                    "table constraint is not supported yet: {other}"
+                )));
+            }
+        }
+    }
+
+    if pending
+        .iter()
+        .filter(|p| p.constraint == IndexConstraint::PrimaryKey)
+        .count()
+        > 1
+    {
+        return Err(PgError::new(
+            "42P16",
+            format!("multiple primary keys for table \"{name}\" are not allowed"),
+        ));
+    }
+
+    let schema = TableSchema {
+        name: name.clone(),
+        columns,
+    };
+    let mut indexes = Vec::new();
+    for p in pending {
+        reject_deferred_characteristics(p.characteristics)?;
+        let keys = simple_index_keys(&schema, &p.columns)?;
+        // PG names a UNIQUE constraint after every key column, e.g.
+        // `t_a_b_key`; only PRIMARY KEY collapses to `t_pkey`.
+        let base = match p.constraint {
+            IndexConstraint::PrimaryKey => format!("{name}_pkey"),
+            IndexConstraint::Unique => {
+                let mut base = name.clone();
+                for key in &keys {
+                    base.push('_');
+                    base.push_str(&schema.columns[key.column].name);
+                }
+                base.push_str("_key");
+                base
+            }
+        };
+        let index_name = p
+            .explicit_name
+            .unwrap_or_else(|| fresh_relation_name(target, &constraint_names, &base));
+        if !constraint_names.insert(index_name.clone()) {
+            return Err(PgError::new(
+                "42710",
+                format!("constraint \"{index_name}\" for relation \"{name}\" already exists"),
+            ));
+        }
+        indexes.push(IndexMetadata {
+            name: index_name,
+            method: IndexMethod::BTree,
+            keys,
+            unique: p.unique,
+            nulls_distinct: p.nulls_distinct,
+            constraint: Some(p.constraint),
+        });
     }
     // TEMP tables go in the session-local catalog, which shadows a same-named
     // permanent table; its separate keyspace means shadowing never raises 42P07.
-    let target = if create.temporary {
-        &session.temp
-    } else {
-        engine
-    };
-    match target.create_table(TableSchema { name, columns }) {
-        Ok(_) => {}
+    let mut schema = schema;
+    for index in &indexes {
+        if index.constraint == Some(IndexConstraint::PrimaryKey) {
+            for key in &index.keys {
+                schema.columns[key.column].nullable = false;
+            }
+        }
+    }
+    match target.create_table(schema) {
+        Ok(_) => {
+            for index in indexes {
+                if let Err(e) = target.create_index(&name, index) {
+                    let _ = target.drop_table(&name);
+                    return Err(e.into());
+                }
+            }
+        }
         // PG succeeds with a notice; NoticeResponse itself is still todo.
         Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {}
         Err(e) => return Err(e.into()),
     }
     Ok(QueryResult::command("CREATE TABLE"))
+}
+
+fn reject_deferred_characteristics(
+    characteristics: Option<ast::ConstraintCharacteristics>,
+) -> Result<(), PgError> {
+    if let Some(c) = characteristics
+        && (c.deferrable == Some(true) || c.initially.is_some() || c.enforced == Some(false))
+    {
+        return Err(PgError::feature_not_supported(
+            "deferrable or not-enforced constraints are not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_primary_key_options(constraint: &ast::PrimaryKeyConstraint) -> Result<(), PgError> {
+    if constraint.index_name.is_some()
+        || !constraint.index_options.is_empty()
+        || !matches!(constraint.index_type, None | Some(ast::IndexType::BTree))
+    {
+        return Err(PgError::feature_not_supported(
+            "this PRIMARY KEY index form is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unique_options(constraint: &ast::UniqueConstraint) -> Result<(), PgError> {
+    if constraint.index_name.is_some()
+        || !constraint.index_options.is_empty()
+        || !constraint.index_type_display.is_none()
+        || !matches!(constraint.index_type, None | Some(ast::IndexType::BTree))
+    {
+        return Err(PgError::feature_not_supported(
+            "this UNIQUE index form is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+fn simple_index_keys(
+    schema: &TableSchema,
+    columns: &[ast::IndexColumn],
+) -> Result<Vec<IndexKey>, PgError> {
+    let mut keys = Vec::with_capacity(columns.len());
+    for col in columns {
+        if col.operator_class.is_some() || col.column.with_fill.is_some() {
+            return Err(PgError::feature_not_supported(
+                "index operator classes and WITH FILL are not supported yet",
+            ));
+        }
+        let ident = match &col.column.expr {
+            ast::Expr::Identifier(ident) => normalize_ident(ident),
+            _ => {
+                return Err(PgError::feature_not_supported(
+                    "expression indexes are not supported yet",
+                ));
+            }
+        };
+        let column = schema.column_index(&ident).ok_or_else(|| {
+            PgError::new(
+                sqlstate::UNDEFINED_COLUMN,
+                format!("column \"{ident}\" named in key does not exist"),
+            )
+        })?;
+        keys.push(IndexKey {
+            column,
+            descending: col.column.options.asc == Some(false),
+            nulls_first: col
+                .column
+                .options
+                .nulls_first
+                .unwrap_or(col.column.options.asc == Some(false)),
+        });
+    }
+    if keys.is_empty() {
+        return Err(PgError::syntax("index must have at least one column"));
+    }
+    Ok(keys)
+}
+
+fn fresh_relation_name(
+    engine: &Arc<dyn TableEngine>,
+    local: &HashSet<String>,
+    base: &str,
+) -> String {
+    let exists = |candidate: &str| {
+        local.contains(candidate)
+            || engine.open_table(candidate).is_ok()
+            || engine
+                .relation_metadata()
+                .iter()
+                .any(|relation| relation.indexes.iter().any(|index| index.name == candidate))
+    };
+    if !exists(base) {
+        return base.to_string();
+    }
+    for suffix in 1_u64.. {
+        let candidate = format!("{base}{suffix}");
+        if !exists(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn fresh_local_name(local: &HashSet<String>, base: &str) -> String {
+    if !local.contains(base) {
+        return base.to_string();
+    }
+    for suffix in 1_u64.. {
+        let candidate = format!("{base}{suffix}");
+        if !local.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 /// Shared with cast/typed-literal binding, so CREATE TABLE and `::` casts agree

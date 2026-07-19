@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crabgresql_binder::{BoundAggregate, BoundExpr, JoinKind, SortKey, TableFn};
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_planner::{PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan};
-use crabgresql_storage_api::{TableAm, Tid, Tuple};
+use crabgresql_storage_api::{IndexMetadata, TableAm, Tid, Tuple};
 use crabgresql_txn::TxnContext;
 use crabgresql_types::Value;
 
@@ -260,12 +260,24 @@ fn execute_insert(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let mut tuples: Vec<Tuple> = Vec::with_capacity(rows.len());
+    // Existing rows are only consulted to enforce UNIQUE keys; a table with no
+    // unique index never needs the scan (NOT NULL checks only the new row).
+    let has_unique = table.indexes().iter().any(|index| index.unique);
+    let mut visible: Vec<Tuple> = if has_unique {
+        table.scan(txn).map(|(_, tuple)| tuple).collect()
+    } else {
+        Vec::new()
+    };
     for row in rows {
-        tuples.push(
-            row.iter()
-                .map(|expr| eval(expr, &[], ctx))
-                .collect::<Result<_, _>>()?,
-        );
+        let tuple = row
+            .iter()
+            .map(|expr| eval(expr, &[], ctx))
+            .collect::<Result<_, _>>()?;
+        validate_constraints(table, &tuple, visible.iter(), ctx)?;
+        if has_unique {
+            visible.push(tuple.clone());
+        }
+        tuples.push(tuple);
     }
     let inserted = tuples.len() as u64;
     for tuple in tuples {
@@ -287,8 +299,17 @@ fn execute_update(
     ctx: ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    let original: Vec<(Tid, Tuple)> = table.scan(txn).collect();
+    // `simulated` mirrors the post-update table so a UNIQUE check sees other
+    // rows' new values; it is only needed when a unique index exists.
+    let has_unique = table.indexes().iter().any(|index| index.unique);
+    let mut simulated = if has_unique {
+        original.clone()
+    } else {
+        Vec::new()
+    };
     let mut pending: Vec<(Tid, Tuple)> = Vec::new();
-    for (tid, old) in table.scan(txn) {
+    for (tid, old) in original {
         if !predicate_holds(predicate, &old, ctx)? {
             continue;
         }
@@ -297,9 +318,130 @@ fn execute_update(
         for (index, expr) in assignments {
             new[*index] = eval(expr, &old, ctx)?;
         }
+        if has_unique {
+            let Some(pos) = simulated
+                .iter()
+                .position(|(candidate, _)| *candidate == tid)
+            else {
+                continue;
+            };
+            let (_, removed) = simulated.remove(pos);
+            if let Err(error) =
+                validate_constraints(table, &new, simulated.iter().map(|(_, t)| t), ctx)
+            {
+                simulated.insert(pos, (tid, removed));
+                return Err(error);
+            }
+            simulated.insert(pos, (tid, new.clone()));
+        } else {
+            validate_constraints(table, &new, std::iter::empty(), ctx)?;
+        }
         pending.push((tid, new));
     }
     Ok(Execution::Updated(table.update_many(pending, txn)))
+}
+
+fn validate_constraints<'a>(
+    table: &Arc<dyn TableAm>,
+    tuple: &Tuple,
+    existing: impl Iterator<Item = &'a Tuple>,
+    ctx: ExecContext,
+) -> Result<(), ExecError> {
+    let schema = table.schema();
+    for (column, value) in schema.columns.iter().zip(tuple) {
+        if !column.nullable && matches!(value, Value::Null) {
+            return Err(ExecError::new(
+                "23502",
+                format!(
+                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                    column.name, schema.name
+                ),
+            )
+            .with_detail(Some(format!(
+                "Failing row contains ({}).",
+                display_tuple(tuple, ctx)
+            ))));
+        }
+    }
+
+    let existing: Vec<&Tuple> = existing.collect();
+    for index in table.indexes().iter().filter(|index| index.unique) {
+        if unique_key_skipped(index, tuple) {
+            continue;
+        }
+        if existing
+            .iter()
+            .any(|other| unique_keys_equal(schema, index, tuple, other))
+        {
+            let names = index
+                .keys
+                .iter()
+                .map(|key| schema.columns[key.column].name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let values = index
+                .keys
+                .iter()
+                .map(|key| display_value(&tuple[key.column], ctx))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ExecError::new(
+                "23505",
+                format!(
+                    "duplicate key value violates unique constraint \"{}\"",
+                    index.name
+                ),
+            )
+            .with_detail(Some(format!("Key ({names})=({values}) already exists."))));
+        }
+    }
+    Ok(())
+}
+
+fn unique_key_skipped(index: &IndexMetadata, tuple: &Tuple) -> bool {
+    index.nulls_distinct
+        && index
+            .keys
+            .iter()
+            .any(|key| matches!(tuple[key.column], Value::Null))
+}
+
+fn unique_keys_equal(
+    schema: &crabgresql_storage_api::TableSchema,
+    index: &IndexMetadata,
+    left: &Tuple,
+    right: &Tuple,
+) -> bool {
+    let tys = index
+        .keys
+        .iter()
+        .map(|key| schema.columns[key.column].ty)
+        .collect::<Vec<_>>();
+    let left = index
+        .keys
+        .iter()
+        .map(|key| left[key.column].clone())
+        .collect::<Vec<_>>();
+    let right = index
+        .keys
+        .iter()
+        .map(|key| right[key.column].clone())
+        .collect::<Vec<_>>();
+    agg::keys_equal(&tys, &left, &right)
+}
+
+fn display_value(value: &Value, ctx: ExecContext) -> String {
+    value
+        .encode_text_with(ctx.extra_float_digits)
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn display_tuple(tuple: &Tuple, ctx: ExecContext) -> String {
+    tuple
+        .iter()
+        .map(|value| display_value(value, ctx))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// See the concurrency note on [`execute_update`].

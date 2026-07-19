@@ -28,8 +28,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use crabgresql_storage_api::{StorageError, TableAm, TableEngine, TableSchema};
-use crabgresql_wal::{RmgrId, RmgrRegistry, Wal, write_control, ControlFile};
+use crabgresql_storage_api::{
+    IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
+};
+use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, write_control};
 
 use crate::bufpool::BufferPool;
 use crate::catalog::RelCatalog;
@@ -70,12 +72,20 @@ impl PgEngine {
         let smgr = Arc::new(StorageManager::open(data_dir)?);
         let bufpool = BufferPool::new(DEFAULT_FRAMES, smgr, Arc::clone(&wal));
         let inner = Arc::new(EngineInner { bufpool, wal });
-        registry.register(RmgrId::HEAP, Arc::new(HeapRedo { engine: Arc::clone(&inner) }));
+        registry.register(
+            RmgrId::HEAP,
+            Arc::new(HeapRedo {
+                engine: Arc::clone(&inner),
+            }),
+        );
 
         let catalog = RelCatalog::load(data_dir)?;
         let mut tables = HashMap::new();
-        for (name, rel, schema) in catalog.schemas() {
-            tables.insert(name, Arc::new(HeapTable::new(Arc::clone(&inner), rel, schema)));
+        for (name, rel, schema, indexes) in catalog.schemas() {
+            tables.insert(
+                name,
+                Arc::new(HeapTable::new(Arc::clone(&inner), rel, schema, indexes)),
+            );
         }
         Ok(PgEngine {
             inner,
@@ -90,8 +100,14 @@ impl PgEngine {
     /// clean shutdown so the data files are current.
     pub fn checkpoint(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
         self.inner.bufpool.flush_all()?;
-        write_control(&self.data_dir, &ControlFile { next_xid, clean_shutdown: true })
-            .map_err(std::io::Error::other)?;
+        write_control(
+            &self.data_dir,
+            &ControlFile {
+                next_xid,
+                clean_shutdown: true,
+            },
+        )
+        .map_err(std::io::Error::other)?;
         Ok(())
     }
 }
@@ -99,11 +115,24 @@ impl PgEngine {
 impl TableEngine for PgEngine {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
         let mut tables = self.tables.write().unwrap();
-        if tables.contains_key(&schema.name) || self.catalog.contains(&schema.name) {
+        if tables.contains_key(&schema.name)
+            || self.catalog.contains(&schema.name)
+            || tables
+                .values()
+                .any(|t| t.indexes().iter().any(|i| i.name == schema.name))
+        {
             return Err(StorageError::TableAlreadyExists(schema.name));
         }
-        let rel = self.catalog.create(&schema).expect("relation catalog write failed");
-        let table = Arc::new(HeapTable::new(Arc::clone(&self.inner), rel, schema.clone()));
+        let rel = self
+            .catalog
+            .create(&schema)
+            .expect("relation catalog write failed");
+        let table = Arc::new(HeapTable::new(
+            Arc::clone(&self.inner),
+            rel,
+            schema.clone(),
+            Vec::new(),
+        ));
         tables.insert(schema.name, Arc::clone(&table));
         Ok(table as Arc<dyn TableAm>)
     }
@@ -149,7 +178,43 @@ impl TableEngine for PgEngine {
         Ok(())
     }
 
+    fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
+        let tables = self.tables.read().unwrap();
+        if tables.contains_key(&index.name)
+            || tables
+                .values()
+                .any(|t| t.indexes().iter().any(|i| i.name == index.name))
+        {
+            return Err(StorageError::RelationAlreadyExists(index.name));
+        }
+        let target = tables
+            .get(table)
+            .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
+        self.catalog
+            .add_index(table, index.clone())
+            .expect("relation catalog write failed");
+        target.add_index(index);
+        Ok(())
+    }
+
     fn relations(&self) -> Vec<TableSchema> {
-        self.tables.read().unwrap().values().map(|t| t.schema().clone()).collect()
+        self.tables
+            .read()
+            .unwrap()
+            .values()
+            .map(|t| t.schema().clone())
+            .collect()
+    }
+
+    fn relation_metadata(&self) -> Vec<RelationMetadata> {
+        self.tables
+            .read()
+            .unwrap()
+            .values()
+            .map(|t| RelationMetadata {
+                schema: t.schema().clone(),
+                indexes: t.indexes(),
+            })
+            .collect()
     }
 }

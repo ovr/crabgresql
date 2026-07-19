@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use crabgresql_storage_api::{StorageError, TableAm, TableEngine, TableSchema};
+use crabgresql_storage_api::{
+    IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
+};
 
 /// Resolves relations against a session-local temp store first, then the shared
 /// global engine, then the read-only system catalog — so a `CREATE TEMP TABLE t`
@@ -89,7 +91,27 @@ impl TableEngine for SessionCatalog {
         }
     }
 
+    fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
+        if self.temp.open_table(table).is_ok() {
+            self.temp.create_index(table, index)
+        } else {
+            self.global.create_index(table, index)
+        }
+    }
+
+    fn index_name_exists(&self, table: &str, index_name: &str) -> bool {
+        if self.temp.open_table(table).is_ok() {
+            self.temp.index_name_exists(table, index_name)
+        } else {
+            self.global.index_name_exists(table, index_name)
+        }
+    }
+
     fn relations(&self) -> Vec<TableSchema> {
         self.global.relations()
+    }
+
+    fn relation_metadata(&self) -> Vec<RelationMetadata> {
+        self.global.relation_metadata()
     }
 }

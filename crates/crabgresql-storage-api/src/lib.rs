@@ -58,18 +58,83 @@ pub struct Column {
     /// The declared type modifier (e.g. a `varchar(n)`/`char(n)` length), or
     /// `-1` when the type has none. Applied to values on INSERT/UPDATE.
     pub typmod: i32,
+    /// Whether SQL NULL is accepted. A PRIMARY KEY also sets this to false.
+    pub nullable: bool,
+    /// The name of an explicit NOT NULL constraint. PRIMARY KEY-implied
+    /// non-nullability has no separate entry here.
+    pub not_null_constraint: Option<String>,
+    /// Canonical SQL text of the column default. The binder reparses and binds
+    /// it once per DML statement, then the executor evaluates it per row.
+    pub default: Option<String>,
 }
 
 impl Column {
     /// A column with no type modifier.
     pub fn new(name: impl Into<String>, ty: PgType) -> Self {
-        Column { name: name.into(), ty, typmod: -1 }
+        Column {
+            name: name.into(),
+            ty,
+            typmod: -1,
+            nullable: true,
+            not_null_constraint: None,
+            default: None,
+        }
     }
 
     /// A column carrying a declared type modifier.
     pub fn with_typmod(name: impl Into<String>, ty: PgType, typmod: i32) -> Self {
-        Column { name: name.into(), ty, typmod }
+        Column {
+            name: name.into(),
+            ty,
+            typmod,
+            nullable: true,
+            not_null_constraint: None,
+            default: None,
+        }
     }
+}
+
+/// Access method recorded for a semantic index. Physical index access arrives
+/// later; this metadata already reproduces DDL, catalogs, and uniqueness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexMethod {
+    BTree,
+    Hash,
+}
+
+/// A simple column key in an index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexKey {
+    pub column: usize,
+    pub descending: bool,
+    pub nulls_first: bool,
+}
+
+/// A table constraint backed by an index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexConstraint {
+    PrimaryKey,
+    Unique,
+}
+
+/// Metadata for an index relation. Only simple column indexes are represented;
+/// unsupported expression/partial/include forms are rejected by DDL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexMetadata {
+    pub name: String,
+    pub method: IndexMethod,
+    pub keys: Vec<IndexKey>,
+    pub unique: bool,
+    /// `true` is PostgreSQL's default: a key containing NULL does not conflict.
+    pub nulls_distinct: bool,
+    pub constraint: Option<IndexConstraint>,
+}
+
+/// A user relation together with its mutable index metadata.
+#[derive(Clone, Debug)]
+pub struct RelationMetadata {
+    pub schema: TableSchema,
+    pub indexes: Vec<IndexMetadata>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +155,10 @@ pub enum StorageError {
     TableAlreadyExists(String),
     #[error("relation \"{0}\" does not exist")]
     TableNotFound(String),
+    #[error("relation \"{0}\" already exists")]
+    RelationAlreadyExists(String),
+    #[error("index target relation \"{0}\" does not exist")]
+    IndexTableNotFound(String),
 }
 
 /// Outcome of `TableAm::update`.
@@ -119,6 +188,11 @@ pub enum DeleteResult {
 /// caller's [`TxnContext`].
 pub trait TableAm: Send + Sync {
     fn schema(&self) -> &TableSchema;
+
+    /// Semantic indexes currently attached to this table.
+    fn indexes(&self) -> Vec<IndexMetadata> {
+        Vec::new()
+    }
 
     /// Full scan yielding only the versions visible to `txn`'s snapshot. The
     /// iterator captures the snapshot up front, so a DML statement never
@@ -194,16 +268,31 @@ pub trait TableEngine: Send + Sync {
     /// Remove a table and all its data. `TableNotFound` if it doesn't exist.
     fn drop_table(&self, name: &str) -> Result<(), StorageError>;
 
+    /// Register a semantic index after the caller has validated its keys and,
+    /// for UNIQUE, the table's existing contents.
+    fn create_index(&self, _table: &str, index: IndexMetadata) -> Result<(), StorageError> {
+        Err(StorageError::RelationAlreadyExists(index.name))
+    }
+
+    /// Whether `index_name` is occupied in the namespace of `table`. The table
+    /// parameter matters for session overlays where temp and public may use the
+    /// same relation name.
+    fn index_name_exists(&self, _table: &str, index_name: &str) -> bool {
+        self.open_table(index_name).is_ok()
+            || self.relation_metadata().iter().any(|relation| {
+                relation
+                    .indexes
+                    .iter()
+                    .any(|index| index.name == index_name)
+            })
+    }
+
     /// Resolve a possibly schema-qualified relation. The default ignores any
     /// schema (`None` behaves like [`TableEngine::open_table`]; a `Some(_)`
     /// qualifier is unknown to a plain data engine, so it is not found) — only a
     /// schema-aware resolver (the server's session catalog) overrides this to
     /// route `pg_catalog.*` to the system catalog and honor the search path.
-    fn resolve(
-        &self,
-        schema: Option<&str>,
-        name: &str,
-    ) -> Result<Arc<dyn TableAm>, StorageError> {
+    fn resolve(&self, schema: Option<&str>, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
         match schema {
             None => self.open_table(name),
             Some(_) => Err(StorageError::TableNotFound(name.to_string())),
@@ -215,6 +304,19 @@ pub trait TableEngine: Send + Sync {
     /// engines that keep a relation registry override it.
     fn relations(&self) -> Vec<TableSchema> {
         Vec::new()
+    }
+
+    /// Enumerate user relations including live index metadata for catalog
+    /// reflection. Engines with tables override this; the fallback preserves
+    /// compatibility for read-only/system engines.
+    fn relation_metadata(&self) -> Vec<RelationMetadata> {
+        self.relations()
+            .into_iter()
+            .map(|schema| RelationMetadata {
+                schema,
+                indexes: Vec::new(),
+            })
+            .collect()
     }
 }
 

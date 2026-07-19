@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    DeleteResult, StorageError, TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
+    DeleteResult, IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
+    Tid, Tuple, UpdateResult,
 };
 use crabgresql_txn::{Clog, TupleHeader, TxnContext, XactStatus, satisfies_mvcc};
 
@@ -32,13 +33,22 @@ impl MemoryEngine {
 impl TableEngine for MemoryEngine {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
         let mut tables = self.tables.write().unwrap();
-        if tables.contains_key(&schema.name) {
+        if tables.contains_key(&schema.name)
+            || tables.values().any(|t| {
+                t.indexes
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i.name == schema.name)
+            })
+        {
             return Err(StorageError::TableAlreadyExists(schema.name));
         }
         let table = Arc::new(MemoryTable {
             schema: schema.clone(),
             rows: RwLock::new(Arc::new(Vec::new())),
             next_tid: AtomicU64::new(0),
+            indexes: RwLock::new(Vec::new()),
         });
         tables.insert(schema.name, table.clone());
         Ok(table)
@@ -61,8 +71,45 @@ impl TableEngine for MemoryEngine {
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
 
+    fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
+        let tables = self.tables.read().unwrap();
+        if tables.contains_key(&index.name)
+            || tables.values().any(|t| {
+                t.indexes
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i.name == index.name)
+            })
+        {
+            return Err(StorageError::RelationAlreadyExists(index.name));
+        }
+        let target = tables
+            .get(table)
+            .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
+        target.indexes.write().unwrap().push(index);
+        Ok(())
+    }
+
     fn relations(&self) -> Vec<TableSchema> {
-        self.tables.read().unwrap().values().map(|t| t.schema.clone()).collect()
+        self.tables
+            .read()
+            .unwrap()
+            .values()
+            .map(|t| t.schema.clone())
+            .collect()
+    }
+
+    fn relation_metadata(&self) -> Vec<RelationMetadata> {
+        self.tables
+            .read()
+            .unwrap()
+            .values()
+            .map(|t| RelationMetadata {
+                schema: t.schema.clone(),
+                indexes: t.indexes.read().unwrap().clone(),
+            })
+            .collect()
     }
 }
 
@@ -82,6 +129,7 @@ pub struct MemoryTable {
     /// search on it.
     rows: RwLock<Arc<Vec<Version>>>,
     next_tid: AtomicU64,
+    indexes: RwLock<Vec<IndexMetadata>>,
 }
 
 impl MemoryTable {
@@ -134,6 +182,10 @@ impl Iterator for MvccScan {
 impl TableAm for MemoryTable {
     fn schema(&self) -> &TableSchema {
         &self.schema
+    }
+
+    fn indexes(&self) -> Vec<IndexMetadata> {
+        self.indexes.read().unwrap().clone()
     }
 
     fn scan(&self, txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
@@ -264,7 +316,9 @@ impl TableAm for MemoryTable {
         let mut rows = self.rows.write().unwrap();
         let rows = Arc::make_mut(&mut *rows);
         rows.retain(|v| {
-            !(v.header.xmax.is_valid() && v.header.xmax < oldest && clog.is_committed(v.header.xmax))
+            !(v.header.xmax.is_valid()
+                && v.header.xmax < oldest
+                && clog.is_committed(v.header.xmax))
         });
     }
 }
@@ -311,7 +365,11 @@ mod tests {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t")).unwrap();
-        insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("one".into())]);
+        insert_committed(
+            &tm,
+            &*table,
+            vec![Value::Int4(1), Value::Text("one".into())],
+        );
         insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Null]);
 
         let rows: Vec<_> = table.scan(&read(&tm)).collect();
@@ -366,7 +424,11 @@ mod tests {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t")).unwrap();
-        let tid = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("one".into())]);
+        let tid = insert_committed(
+            &tm,
+            &*table,
+            vec![Value::Int4(1), Value::Text("one".into())],
+        );
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         assert_eq!(
@@ -383,7 +445,11 @@ mod tests {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t")).unwrap();
-        let tid = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("one".into())]);
+        let tid = insert_committed(
+            &tm,
+            &*table,
+            vec![Value::Int4(1), Value::Text("one".into())],
+        );
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())], &txn);
@@ -457,7 +523,10 @@ mod tests {
             UpdateResult::NotFound
         );
         // A never-allocated tid is also NotFound.
-        assert_eq!(table.delete(Tid::from_packed(999), &t2), DeleteResult::NotFound);
+        assert_eq!(
+            table.delete(Tid::from_packed(999), &t2),
+            DeleteResult::NotFound
+        );
     }
 
     #[test]
