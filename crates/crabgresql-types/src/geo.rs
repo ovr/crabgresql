@@ -8,7 +8,9 @@
 //! Coordinates are `float8`, parsed with [`crate::float::float8in`] (so bad
 //! numbers get PG's `22P02`/`22003`) and formatted with
 //! [`crate::float::fmt_f64`] (honoring `extra_float_digits`), matching
-//! `float8out`. Comparisons use PG's fuzzy `EPSILON = 1e-6` (the `FP*` macros).
+//! `float8out`. Comparisons are fuzzy: two coordinates within `EPSILON = 1e-6`
+//! read as equal, reproducing PG's observed geometric comparison behavior
+//! (e.g. `point '(0,0)' ~= point '(0.0000009,0.0000009)'` is true).
 
 use crate::float::{f8_add, f8_div, f8_mul, f8_sub};
 
@@ -16,7 +18,8 @@ use crate::float::{f8_add, f8_div, f8_mul, f8_sub};
 // crate). Mirrors `crabgresql_pg_wire::sqlstate`.
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 
-/// PG's fuzzy comparison tolerance for the geometric types (`geo_decls.h`).
+/// The fuzz tolerance for geometric comparisons; two coordinates closer than
+/// this read as equal, matching PG's observable output.
 const EPSILON: f64 = 1.0e-6;
 
 fn fp_eq(a: f64, b: f64) -> bool {
@@ -51,12 +54,16 @@ fn syntax(type_name: &str, orig: &str) -> GeoError {
     }
 }
 
-fn from_float_err(e: crate::float::FloatError) -> GeoError {
-    GeoError { sqlstate: e.sqlstate, message: e.message.to_string() }
+impl From<crate::float::FloatError> for GeoError {
+    fn from(e: crate::float::FloatError) -> GeoError {
+        GeoError { sqlstate: e.sqlstate, message: e.message.to_string() }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Input parsing — mirrors geo_ops.c's single_decode / pair_decode / path_decode
+// Input parsing: one coordinate, then an optional-parenthesized point, then a
+// bracketed / grouped point list — reproducing the spellings PG accepts for
+// point/lseg input (`(x,y)`, `x,y`, `[(..),(..)]`, `((..),(..))`, `x,y,x,y`).
 // ---------------------------------------------------------------------------
 
 /// A byte cursor over the (ASCII) input string. All the delimiters and float
@@ -103,14 +110,16 @@ fn scan_float_token(rest: &str) -> usize {
     if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
         i += 1;
     }
-    let lower = rest[i..].to_ascii_lowercase();
-    if lower.starts_with("infinity") {
+    // `infinity` / `inf` / `nan` (case-insensitive), checked without allocating.
+    let word = &b[i..];
+    let starts_with_ci = |w: &[u8], kw: &[u8]| w.len() >= kw.len() && w[..kw.len()].eq_ignore_ascii_case(kw);
+    if starts_with_ci(word, b"infinity") {
         return i + 8;
     }
-    if lower.starts_with("inf") {
+    if starts_with_ci(word, b"inf") {
         return i + 3;
     }
-    if lower.starts_with("nan") {
+    if starts_with_ci(word, b"nan") {
         return i + 3;
     }
     let mut saw_digit = false;
@@ -248,8 +257,8 @@ fn path_decode(
 // point
 // ---------------------------------------------------------------------------
 
-/// `point_in`: parse `(x,y)` or `x,y` (optional surrounding parens, whitespace
-/// tolerant). Reproduces `pair_decode(..., "point")`.
+/// Parse a `point`: `(x,y)` or `x,y` (surrounding parens optional, whitespace
+/// tolerant), matching the spellings PG's point input accepts.
 pub fn parse_point(orig: &str) -> Result<[f64; 2], GeoError> {
     let mut cur = Cur::new(orig);
     let p = pair_decode(&mut cur, "point", orig)?;
@@ -260,7 +269,7 @@ pub fn parse_point(orig: &str) -> Result<[f64; 2], GeoError> {
     Ok(p)
 }
 
-/// `point_out`: `(x,y)` with `float8out` coordinate formatting.
+/// Format a `point` as `(x,y)`, each coordinate rendered like `float8out`.
 pub fn format_point(p: &[f64; 2], efd: i32) -> String {
     format!(
         "({},{})",
@@ -273,14 +282,14 @@ pub fn format_point(p: &[f64; 2], efd: i32) -> String {
 // lseg
 // ---------------------------------------------------------------------------
 
-/// `lseg_in`: parse `[(x1,y1),(x2,y2)]` and the other accepted spellings
+/// Parse an `lseg`: `[(x1,y1),(x2,y2)]` and the other accepted spellings
 /// (`((..),(..))`, `(..),(..)`, `x1,y1,x2,y2`, `[x1,y1,x2,y2]`).
 pub fn parse_lseg(orig: &str) -> Result<[f64; 4], GeoError> {
     let (_open, pts) = path_decode(orig, true, 2, "lseg")?;
     Ok([pts[0][0], pts[0][1], pts[1][0], pts[1][1]])
 }
 
-/// `lseg_out`: `[(x1,y1),(x2,y2)]`.
+/// Format an `lseg` as `[(x1,y1),(x2,y2)]`.
 pub fn format_lseg(l: &[f64; 4], efd: i32) -> String {
     format!(
         "[({},{}),({},{})]",
@@ -335,69 +344,34 @@ pub fn point_vertical(a: &[f64; 2], b: &[f64; 2]) -> bool {
 
 /// `+` translate: componentwise add (checked for float overflow).
 pub fn point_add(a: &[f64; 2], b: &[f64; 2]) -> Result<[f64; 2], GeoError> {
-    Ok([
-        f8_add(a[0], b[0]).map_err(from_float_err)?,
-        f8_add(a[1], b[1]).map_err(from_float_err)?,
-    ])
+    Ok([f8_add(a[0], b[0])?, f8_add(a[1], b[1])?])
 }
 /// `-` translate: componentwise subtract.
 pub fn point_sub(a: &[f64; 2], b: &[f64; 2]) -> Result<[f64; 2], GeoError> {
-    Ok([
-        f8_sub(a[0], b[0]).map_err(from_float_err)?,
-        f8_sub(a[1], b[1]).map_err(from_float_err)?,
-    ])
+    Ok([f8_sub(a[0], b[0])?, f8_sub(a[1], b[1])?])
 }
 /// `*` complex multiply: `(x1x2 - y1y2, x1y2 + y1x2)`.
 pub fn point_mul(a: &[f64; 2], b: &[f64; 2]) -> Result<[f64; 2], GeoError> {
-    let x = f8_sub(
-        f8_mul(a[0], b[0]).map_err(from_float_err)?,
-        f8_mul(a[1], b[1]).map_err(from_float_err)?,
-    )
-    .map_err(from_float_err)?;
-    let y = f8_add(
-        f8_mul(a[0], b[1]).map_err(from_float_err)?,
-        f8_mul(a[1], b[0]).map_err(from_float_err)?,
-    )
-    .map_err(from_float_err)?;
+    let x = f8_sub(f8_mul(a[0], b[0])?, f8_mul(a[1], b[1])?)?;
+    let y = f8_add(f8_mul(a[0], b[1])?, f8_mul(a[1], b[0])?)?;
     Ok([x, y])
 }
 /// `/` complex divide: `a * conj(b) / |b|^2`.
 pub fn point_div(a: &[f64; 2], b: &[f64; 2]) -> Result<[f64; 2], GeoError> {
-    let div = f8_add(
-        f8_mul(b[0], b[0]).map_err(from_float_err)?,
-        f8_mul(b[1], b[1]).map_err(from_float_err)?,
-    )
-    .map_err(from_float_err)?;
-    let x = f8_div(
-        f8_add(
-            f8_mul(a[0], b[0]).map_err(from_float_err)?,
-            f8_mul(a[1], b[1]).map_err(from_float_err)?,
-        )
-        .map_err(from_float_err)?,
-        div,
-    )
-    .map_err(from_float_err)?;
-    let y = f8_div(
-        f8_sub(
-            f8_mul(a[1], b[0]).map_err(from_float_err)?,
-            f8_mul(a[0], b[1]).map_err(from_float_err)?,
-        )
-        .map_err(from_float_err)?,
-        div,
-    )
-    .map_err(from_float_err)?;
+    let div = f8_add(f8_mul(b[0], b[0])?, f8_mul(b[1], b[1])?)?;
+    let x = f8_div(f8_add(f8_mul(a[0], b[0])?, f8_mul(a[1], b[1])?)?, div)?;
+    let y = f8_div(f8_sub(f8_mul(a[1], b[0])?, f8_mul(a[0], b[1])?)?, div)?;
     Ok([x, y])
 }
 
-/// `slope(p1, p2)`: `(y2-y1)/(x2-x1)`; vertical lines yield `Infinity`, and a
-/// degenerate pair (same point) yields `NaN` — matching PG's `point_slope`.
+/// `slope(p1, p2)`: the slope of the line through the two points. Any pair
+/// sharing an x (including two equal points) yields `Infinity`, and a fuzzily
+/// horizontal pair yields exactly `0`, matching PG's observed `slope()` output.
 pub fn point_slope(a: &[f64; 2], b: &[f64; 2]) -> f64 {
     if fp_eq(a[0], b[0]) {
-        if fp_eq(a[1], b[1]) {
-            f64::NAN
-        } else {
-            f64::INFINITY
-        }
+        f64::INFINITY
+    } else if fp_eq(a[1], b[1]) {
+        0.0
     } else {
         (a[1] - b[1]) / (a[0] - b[0])
     }
@@ -458,27 +432,32 @@ pub fn lseg_ge(a: &[f64; 4], b: &[f64; 4]) -> bool {
     fp_ge(lseg_length(a), lseg_length(b))
 }
 
-/// Slopes are (fuzzily) parallel? Handles vertical segments.
-fn lseg_parallel_raw(a: &[f64; 4], b: &[f64; 4]) -> bool {
-    // Cross product of the direction vectors is (near) zero.
-    let ax = a[2] - a[0];
-    let ay = a[3] - a[1];
-    let bx = b[2] - b[0];
-    let by = b[3] - b[1];
-    fp_eq(ax * by, ay * bx)
+/// Slope of a non-vertical segment (`dy/dx`). Callers must guard against a
+/// vertical segment first, where the slope is undefined.
+fn seg_slope(l: &[f64; 4]) -> f64 {
+    (l[3] - l[1]) / (l[2] - l[0])
 }
 
-/// `?||` parallel.
+/// `?||` parallel. Compared by slope (not by an absolute-scale cross product),
+/// so it is coordinate-magnitude independent, matching PG: two segments with
+/// the same fuzzy slope are parallel, and two vertical segments are parallel.
 pub fn lseg_parallel(a: &[f64; 4], b: &[f64; 4]) -> bool {
-    lseg_parallel_raw(a, b)
+    let (av, bv) = (lseg_vertical(a), lseg_vertical(b));
+    if av || bv {
+        return av && bv;
+    }
+    fp_eq(seg_slope(a), seg_slope(b))
 }
-/// `?-|` perpendicular: direction vectors' dot product is (near) zero.
+/// `?-|` perpendicular. A vertical segment is perpendicular to a horizontal one;
+/// otherwise the slopes are negative reciprocals (`slope_a * slope_b ~= -1`).
 pub fn lseg_perpendicular(a: &[f64; 4], b: &[f64; 4]) -> bool {
-    let ax = a[2] - a[0];
-    let ay = a[3] - a[1];
-    let bx = b[2] - b[0];
-    let by = b[3] - b[1];
-    fp_eq(ax * bx + ay * by, 0.0)
+    if lseg_vertical(a) {
+        return lseg_horizontal(b);
+    }
+    if lseg_vertical(b) {
+        return lseg_horizontal(a);
+    }
+    fp_eq(seg_slope(a) * seg_slope(b), -1.0)
 }
 
 /// Closest point on segment `l` to point `p`.
@@ -528,18 +507,23 @@ pub fn lseg_interpt(a: &[f64; 4], b: &[f64; 4]) -> Option<[f64; 2]> {
     }
 }
 
-/// `l1 ## l2`: the point on `l2` closest to `l1`. If they intersect, that is the
-/// intersection point; otherwise the nearest of the endpoint projections.
-pub fn close_seg_seg(a: &[f64; 4], b: &[f64; 4]) -> [f64; 2] {
+/// `l1 ## l2`: the point on `l2` closest to `l1`. Parallel segments have no
+/// single closest point, so the result is `None` (PG's `##` returns NULL). If
+/// they intersect, that is the intersection point; otherwise it is the nearer
+/// of `l1`'s two endpoint projections onto `l2`.
+pub fn close_seg_seg(a: &[f64; 4], b: &[f64; 4]) -> Option<[f64; 2]> {
+    if lseg_parallel(a, b) {
+        return None;
+    }
     if let Some(p) = lseg_interpt(a, b) {
-        return p;
+        return Some(p);
     }
     // Candidates on b: projections of a's two endpoints onto b.
     let c1 = close_point_seg(&lseg_p0(a), b);
     let c2 = close_point_seg(&lseg_p1(a), b);
     let d1 = dist_point_seg(&c1, a);
     let d2 = dist_point_seg(&c2, a);
-    if d1 <= d2 { c1 } else { c2 }
+    Some(if d1 <= d2 { c1 } else { c2 })
 }
 
 /// `l1 <-> l2` segment distance (0 if they intersect).
@@ -622,6 +606,16 @@ mod tests {
     }
 
     #[test]
+    fn point_slope_cases() {
+        assert_eq!(point_slope(&[0.0, 0.0], &[2.0, 1.0]), 0.5);
+        // Vertical and coincident pairs both yield Infinity (PG's slope()).
+        assert_eq!(point_slope(&[1.0, 2.0], &[1.0, 9.0]), f64::INFINITY);
+        assert_eq!(point_slope(&[1.0, 1.0], &[1.0, 1.0]), f64::INFINITY);
+        // A fuzzily-horizontal pair is exactly 0, not a tiny nonzero slope.
+        assert_eq!(point_slope(&[0.0, 0.0], &[1_000_000.0, 0.000_000_5]), 0.0);
+    }
+
+    #[test]
     fn lseg_ops() {
         assert_eq!(lseg_center(&[1.0, 2.0, 3.0, 4.0]), [2.0, 3.0]);
         assert_eq!(lseg_length(&[0.0, 0.0, 3.0, 4.0]), 5.0);
@@ -638,5 +632,22 @@ mod tests {
         );
         assert_eq!(lseg_interpt(&[0.0, 0.0, 2.0, 0.0], &[0.0, 1.0, 2.0, 1.0]), None);
         assert_eq!(close_point_seg(&[0.0, 5.0], &[0.0, 0.0, 10.0, 0.0]), [0.0, 0.0]);
+        // `##` is NULL (None) for parallel segments, a point otherwise.
+        assert_eq!(close_seg_seg(&[0.0, 0.0, 1.0, 0.0], &[0.0, 2.0, 1.0, 2.0]), None);
+        assert_eq!(
+            close_seg_seg(&[0.0, 0.0, 2.0, 0.0], &[1.0, 1.0, 1.0, 3.0]),
+            Some([1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn lseg_parallel_perpendicular_are_scale_invariant() {
+        // Slope-based comparison stays correct at large coordinate magnitudes,
+        // where an absolute cross/dot product would drift past EPSILON.
+        assert!(lseg_parallel(&[0.0, 0.0, 1e6, 1.0], &[0.0, 0.0, 1e6, 1.000_000_1]));
+        assert!(lseg_perpendicular(&[0.0, 0.0, 1000.0, 1.0], &[0.0, 0.0, 1.0, -999.999_5]));
+        // Two vertical segments are parallel; vertical ⟂ horizontal.
+        assert!(lseg_parallel(&[0.0, 0.0, 0.0, 5.0], &[3.0, 0.0, 3.0, 10.0]));
+        assert!(lseg_perpendicular(&[0.0, 0.0, 0.0, 5.0], &[0.0, 0.0, 5.0, 0.0]));
     }
 }

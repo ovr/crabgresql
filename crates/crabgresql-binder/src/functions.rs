@@ -1189,6 +1189,15 @@ fn bind_aggregate(
     }
     let arg = bound.pop().expect("exactly one argument");
     let input_ty = arg.ty();
+    // A DISTINCT aggregate must compare its inputs for equality; a type with no
+    // usable equality (e.g. `point`/`lseg`, which are not orderable) reports
+    // PG's error rather than reaching the executor's comparison and panicking.
+    if distinct && !crate::expr::is_orderable(input_ty) {
+        return Err(BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!("could not identify an equality operator for type {}", input_ty.name()),
+        ));
+    }
     let ret = agg_return_type(agg, input_ty)?;
     Ok(Binding::Typed(BoundExpr::Aggregate {
         func: agg,

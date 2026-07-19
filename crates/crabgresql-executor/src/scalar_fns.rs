@@ -1164,9 +1164,10 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
             Some(p) => Value::Point(p),
             None => Value::Null,
         },
-        GeoFn::CloseSegSeg => {
-            Value::Point(geo::close_seg_seg(&lseg_of(&args[0]), &lseg_of(&args[1])))
-        }
+        GeoFn::CloseSegSeg => match geo::close_seg_seg(&lseg_of(&args[0]), &lseg_of(&args[1])) {
+            Some(p) => Value::Point(p),
+            None => Value::Null,
+        },
         GeoFn::DistSegSeg => {
             Value::Float8(geo::dist_seg_seg(&lseg_of(&args[0]), &lseg_of(&args[1])))
         }
