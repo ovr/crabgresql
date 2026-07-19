@@ -71,6 +71,10 @@ SELECT 'abc' ~ 'b' AS r1, 'abc' ~ '^a' AS r2, 'abc' ~ '^b' AS r3,
 SELECT 'abc' SIMILAR TO '(b|a)%' AS s1, 'abc' SIMILAR TO 'a_c' AS s2,
        'abc' SIMILAR TO 'a' AS s3, 'abc' NOT SIMILAR TO 'x%' AS s4,
        'a%c' SIMILAR TO 'a$%c' ESCAPE '$' AS s5;
+-- SIMILAR TO bracket expressions, quantifier bounds, and escaped metacharacters
+SELECT 'b' SIMILAR TO '[^a]' AS b1, '%' SIMILAR TO '[%_]' AS b2,
+       'aa' SIMILAR TO 'a{2}' AS b3, 'a{c' SIMILAR TO 'a{c' AS b4,
+       'a|b' SIMILAR TO 'a\|b' AS b5;
 
 -- encode / decode
 SELECT encode('\x001000'::bytea, 'hex') AS e_hex, encode('abc'::bytea, 'base64') AS e_b64,
