@@ -42,6 +42,10 @@ pub struct ParamState {
     allow: bool,
 }
 
+/// Upper bound on a parameter number `$n`. The Bind message carries the values
+/// in an `i16`-counted array, so no more than this many can ever be supplied.
+const MAX_PARAMS: usize = 65535;
+
 impl ParamState {
     /// Register a `$n` (1-based) occurrence, growing the slot vector as needed
     /// and returning its 0-based index. When placeholders are not allowed (a
@@ -50,6 +54,17 @@ impl ParamState {
         if !self.allow {
             return Err(BindError::new(
                 "42P02",
+                format!("there is no parameter ${n1}"),
+            ));
+        }
+        // A parameter number is bounded by the wire protocol (Bind delivers at
+        // most 65535 parameter values), so a larger `$n` can never be supplied.
+        // Reject it up front rather than resizing the slot vector to an
+        // attacker-chosen length — `SELECT $2000000000` would otherwise allocate
+        // gigabytes.
+        if n1 > MAX_PARAMS {
+            return Err(BindError::new(
+                "54000",
                 format!("there is no parameter ${n1}"),
             ));
         }
@@ -2824,6 +2839,29 @@ pub(crate) fn coerce_for_arg(
     exact_only: bool,
 ) -> Option<BoundExpr> {
     match binding {
+        // A parameter's type is deduced by the *side effect* of `resolve_unknown`
+        // (it records the type in the shared context). Overload resolution tries
+        // this speculatively for every candidate signature, so resolving a
+        // parameter during the exact-only pass would pin it to whichever
+        // signature is tried first. Decline an unresolved parameter as an "exact"
+        // match and let the typed arguments drive the choice in the fallback
+        // pass; a literal (no param) still folds to its exact target as before.
+        Binding::Unknown {
+            lit,
+            span,
+            param: Some(param),
+        } if exact_only => {
+            // A parameter already fixed to `target` by an earlier occurrence is a
+            // genuine exact match and must not be dropped. Read the slot into a
+            // local so the shared borrow is released before `resolve_unknown`
+            // takes it mutably.
+            let already = param.1.borrow().types.get(param.0).copied().flatten();
+            if already == Some(target) {
+                resolve_unknown(lit, span, Some(param), target).ok()
+            } else {
+                None
+            }
+        }
         Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, target).ok(),
         Binding::Typed(e) => {
             if e.ty() == target {

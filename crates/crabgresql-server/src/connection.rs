@@ -393,12 +393,27 @@ fn cast_error(e: CastError) -> PgError {
 /// The transfer format for column/parameter `i` from a Bind format list: 0
 /// entries means all-text, 1 entry applies to every column, otherwise one entry
 /// per column — the encoding the `Bind` message uses for both parameter and
-/// result formats.
+/// result formats. The caller must have validated the list length with
+/// [`check_format_count`]; otherwise the `_` arm can index out of bounds.
 fn format_at(formats: &[Format], i: usize) -> Format {
     match formats.len() {
         0 => Format::Text,
         1 => formats[0],
         _ => formats[i],
+    }
+}
+
+/// Reject a `Bind` format list whose length is neither 0, 1, nor exactly
+/// `count`, before anything indexes it by position. `kind` names the list
+/// ("parameter" / "result") for the error, as PG phrases it.
+fn check_format_count(len: usize, count: usize, kind: &str) -> Result<(), PgError> {
+    if len <= 1 || len == count {
+        Ok(())
+    } else {
+        Err(PgError::new(
+            sqlstate::PROTOCOL_VIOLATION,
+            format!("bind message has {len} {kind} formats but {count} {kind}s"),
+        ))
     }
 }
 
@@ -453,6 +468,15 @@ fn handle_parse(
     if statements.len() > 1 {
         return Err(PgError::syntax(
             "cannot insert multiple commands into a prepared statement",
+        ));
+    }
+    // A named prepared statement may not be redefined while it exists (PG
+    // 42P05); the unnamed statement ("") is always replaced. Check before doing
+    // the analysis work.
+    if !name.is_empty() && session.prepared.contains_key(name) {
+        return Err(PgError::new(
+            sqlstate::DUPLICATE_PREPARED_STATEMENT,
+            format!("prepared statement \"{name}\" already exists"),
         ));
     }
     // 0 or 1 statement; an empty query string prepares to `None`.
@@ -523,6 +547,12 @@ fn handle_bind(
             ),
         ));
     }
+    // A format list must be empty (all text), a single entry (applies to all),
+    // or exactly one per parameter/column; any other count would index past the
+    // list. `format_at` and the result encoders rely on this being checked here.
+    check_format_count(param_formats.len(), params.len(), "parameter")?;
+    let result_columns = prepared.result_columns.as_ref().map_or(0, Vec::len);
+    check_format_count(result_formats.len(), result_columns, "result")?;
     let mut values = Vec::with_capacity(params.len());
     for (i, bytes) in params.iter().enumerate() {
         let ty = prepared.param_types[i];
@@ -683,35 +713,25 @@ fn stream_execute(
             let limit = (max_rows > 0).then_some(max_rows as usize);
             let mut count = 0usize;
             loop {
-                if limit == Some(count) {
-                    // Row limit reached: drain the rest into the portal so it can
-                    // resume without holding the live iterator across messages.
-                    let mut rest = Vec::new();
-                    loop {
-                        match node.next() {
-                            Ok(Some(row)) => rest.push(row),
-                            Ok(None) => break,
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                    if rest.is_empty() {
-                        writer.command_complete(&format!("SELECT {count}"));
-                    } else {
-                        if let Some(portal) = session.portals.get_mut(portal_name) {
-                            portal.suspended = Some(SuspendedRows {
-                                rows: rest,
-                                next: 0,
-                                delivered: count,
-                            });
-                        }
-                        writer.write(&BackendMessage::PortalSuspended);
-                    }
-                    return Ok(());
-                }
                 match node.next() {
                     Ok(Some(row)) => {
                         writer.write(&BackendMessage::DataRow(encode_row(&row, formats, efd)?));
                         count += 1;
+                        if limit == Some(count) {
+                            // Row budget reached, result not yet exhausted: keep
+                            // the live iterator on the portal and resume it on the
+                            // next Execute — streaming, not buffering. A result of
+                            // exactly `max_rows` rows suspends here and the next
+                            // Execute returns `SELECT 0` (a valid PG sequence).
+                            if let Some(portal) = session.portals.get_mut(portal_name) {
+                                portal.suspended = Some(SuspendedRows {
+                                    node,
+                                    delivered: count,
+                                });
+                            }
+                            writer.write(&BackendMessage::PortalSuspended);
+                            return Ok(());
+                        }
                     }
                     Ok(None) => {
                         writer.command_complete(&format!("SELECT {count}"));
@@ -724,8 +744,9 @@ fn stream_execute(
     }
 }
 
-/// Resume a suspended portal: deliver up to `max_rows` more buffered rows, then
-/// PortalSuspended (still more) or CommandComplete with the running total.
+/// Resume a suspended portal: pull up to `max_rows` more rows from its live
+/// iterator, then PortalSuspended (still more) or CommandComplete with the
+/// running total (exhausted).
 fn resume_portal(
     session: &mut Session,
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
@@ -735,23 +756,32 @@ fn resume_portal(
     let efd = session.extra_float_digits;
     let formats = session.portals[portal_name].result_formats.clone();
     let limit = if max_rows > 0 { max_rows as usize } else { usize::MAX };
-    let portal = session.portals.get_mut(portal_name).unwrap();
-    let sus = portal.suspended.as_mut().unwrap();
+    let sus = session
+        .portals
+        .get_mut(portal_name)
+        .unwrap()
+        .suspended
+        .as_mut()
+        .unwrap();
     let mut served = 0usize;
-    while sus.next < sus.rows.len() && served < limit {
-        // `writer` is independent of `session`, so writing while the portal is
-        // mutably borrowed is fine. Encode before advancing so a failure leaves
-        // the cursor consistent (only reachable if the first Execute already
-        // succeeded, so in practice it never fails here).
-        let cols = encode_row(&sus.rows[sus.next], &formats, efd)?;
-        writer.write(&BackendMessage::DataRow(cols));
-        sus.next += 1;
-        sus.delivered += 1;
-        served += 1;
-    }
-    let drained = sus.next >= sus.rows.len();
+    // `writer` is independent of `session`, so writing while the portal is
+    // mutably borrowed is fine.
+    let exhausted = loop {
+        if served >= limit {
+            break false;
+        }
+        match sus.node.next() {
+            Ok(Some(row)) => {
+                writer.write(&BackendMessage::DataRow(encode_row(&row, &formats, efd)?));
+                sus.delivered += 1;
+                served += 1;
+            }
+            Ok(None) => break true,
+            Err(e) => return Err(e.into()),
+        }
+    };
     let delivered = sus.delivered;
-    if drained {
+    if exhausted {
         session.portals.get_mut(portal_name).unwrap().suspended = None;
         writer.command_complete(&format!("SELECT {delivered}"));
     } else {

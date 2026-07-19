@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crabgresql_executor::{ExecContext, OutputColumn};
+use crabgresql_executor::{ExecContext, ExecNode, OutputColumn};
 use crabgresql_memory_storage::MemoryEngine;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{Format, TransactionStatus};
@@ -40,20 +40,21 @@ pub struct Portal {
     /// Per-column result formats. Length 0 = all text, 1 = applies to every
     /// column, otherwise one entry per column (as the `Bind` message encodes).
     pub result_formats: Vec<Format>,
-    /// A row-limited `Execute` (`max_rows > 0`) materializes the whole result
-    /// here and delivers it in chunks across successive `Execute`s, sending
-    /// `PortalSuspended` until it is drained. `None` until first suspended.
+    /// A row-limited `Execute` (`max_rows > 0`) that did not exhaust the result
+    /// keeps its live iterator here and resumes it on the next `Execute`, so the
+    /// remaining rows are streamed lazily rather than buffered. `None` until the
+    /// portal first suspends.
     pub suspended: Option<SuspendedRows>,
 }
 
-/// The remaining rows of a portal suspended by a row-limited `Execute`.
+/// A portal suspended by a row-limited `Execute`: the still-running result
+/// iterator and how many rows it has already delivered.
 pub struct SuspendedRows {
-    /// The rows not yet delivered, materialized when the portal first suspended.
-    pub rows: Vec<Vec<Value>>,
-    /// Index of the next row to deliver.
-    pub next: usize,
-    /// Total rows already delivered across every Execute of this portal, so the
-    /// final CommandComplete reports the whole portal's `SELECT n`.
+    /// The result iterator, paused mid-stream. Owns its snapshot, so resuming it
+    /// later sees the same rows.
+    pub node: Box<dyn ExecNode>,
+    /// Total rows already delivered across every `Execute` of this portal, so the
+    /// final `CommandComplete` reports the whole portal's `SELECT n`.
     pub delivered: usize,
 }
 

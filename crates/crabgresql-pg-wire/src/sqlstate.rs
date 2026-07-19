@@ -36,6 +36,8 @@ pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
 pub const PROTOCOL_VIOLATION: &str = "08P01";
 /// `26000` — a Bind/Describe names a prepared statement that does not exist.
 pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
+/// `42P05` — Parse names a prepared statement that already exists.
+pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
 /// `34000` — an Execute/Describe names a portal (cursor) that does not exist.
 pub const INVALID_CURSOR_NAME: &str = "34000";
 /// `42P02` — a `$n` placeholder with no such parameter (e.g. in a simple query).

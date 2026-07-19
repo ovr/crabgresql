@@ -1824,6 +1824,66 @@ async fn extended_protocol_runs_a_full_batch() {
     assert_eq!(msgs.last().unwrap().1, [b'I']);
 }
 
+/// A Bind whose result-format count is neither 0, 1, nor the column count must
+/// be rejected (08P01) instead of panicking on an out-of-bounds format index.
+#[tokio::test]
+async fn bind_rejects_mismatched_format_count() {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    let mut batch = Vec::new();
+    batch.extend(frontend_message(b'P', b"\0SELECT 1\0\x00\x00")); // Parse: 1 column
+    // Bind portal "" stmt "": 0 param formats, 0 params, 2 result formats.
+    batch.extend(frontend_message(
+        b'B',
+        b"\0\0\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00",
+    ));
+    batch.extend(frontend_message(b'S', b""));
+    socket.write_all(&batch).await.unwrap();
+
+    let msgs = read_until_ready(&mut socket).await;
+    let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+    assert_eq!(tags, [b'1', b'E', b'Z'], "ParseComplete, error, RFQ");
+    // 08P01 protocol_violation, not a crashed connection.
+    let err = &msgs.iter().find(|(t, _)| *t == b'E').unwrap().1;
+    assert!(err.windows(6).any(|w| w == b"08P01\0"));
+}
+
+/// Re-Parsing an existing *named* prepared statement is 42P05; the unnamed
+/// statement is silently replaced.
+#[tokio::test]
+async fn reparse_named_statement_errors_42p05() {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    let mut batch = Vec::new();
+    batch.extend(frontend_message(b'P', b"s\0SELECT 1\0\x00\x00")); // Parse "s"
+    batch.extend(frontend_message(b'P', b"s\0SELECT 2\0\x00\x00")); // Parse "s" again
+    batch.extend(frontend_message(b'S', b""));
+    socket.write_all(&batch).await.unwrap();
+
+    let msgs = read_until_ready(&mut socket).await;
+    let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+    assert_eq!(tags, [b'1', b'E', b'Z']);
+    let err = &msgs.iter().find(|(t, _)| *t == b'E').unwrap().1;
+    assert!(err.windows(6).any(|w| w == b"42P05\0"));
+}
+
+/// An out-of-range parameter number must be rejected, not resized into a
+/// multi-gigabyte allocation.
+#[tokio::test]
+async fn huge_parameter_number_is_rejected_not_allocated() {
+    let client = connect(spawn_server().await).await;
+    let err = client
+        .prepare("SELECT $2000000000::int4")
+        .await
+        .expect_err("parameter number is out of range");
+    assert_eq!(err.code().expect("has SQLSTATE").code(), "54000");
+    // Connection still usable.
+    let row = client.query_one("SELECT $1::int4 AS v", &[&7i32]).await.unwrap();
+    assert_eq!(row.get::<_, i32>("v"), 7);
+}
+
 /// A failed extended-protocol batch must produce exactly one ErrorResponse and
 /// one ReadyForQuery (at Sync) — per-message replies desync drivers. Here Bind
 /// names a prepared statement that was never created.

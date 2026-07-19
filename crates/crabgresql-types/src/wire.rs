@@ -36,12 +36,12 @@ fn no_binary(ty: PgType) -> CastError {
 /// literal fail and succeed identically.
 pub fn decode_text(ty: PgType, s: &str) -> Result<Value, CastError> {
     match ty {
-        // The string types share text's representation; a bind parameter carries
-        // no typmod, so there is no length to enforce here (as in PG, where an
-        // untyped `$1::bpchar` is not blank-padded).
-        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
-            Ok(Value::Text(s.to_string()))
-        }
+        // `name` truncates to 63 characters (`namein`), as PG does.
+        PgType::Name => Ok(Value::Text(crate::text::name_input(s))),
+        // The other string types share text's representation; a bind parameter
+        // carries no typmod, so there is no length to enforce here (as in PG,
+        // where an untyped `$1::bpchar` is not blank-padded).
+        PgType::Text | PgType::Varchar | PgType::Bpchar => Ok(Value::Text(s.to_string())),
         _ => cast::cast_value(Value::Text(s.to_string()), ty, 1),
     }
 }
@@ -57,11 +57,8 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
         }
     };
     Ok(match ty {
-        PgType::Bool => match fixed(1)?[0] {
-            0 => Value::Bool(false),
-            1 => Value::Bool(true),
-            _ => return Err(invalid_binary(ty)),
-        },
+        // PG's `boolrecv` treats any nonzero byte as true, not only 1.
+        PgType::Bool => Value::Bool(fixed(1)?[0] != 0),
         PgType::Int2 => Value::Int2(i16::from_be_bytes(fixed(2)?.try_into().unwrap())),
         PgType::Int4 => Value::Int4(i32::from_be_bytes(fixed(4)?.try_into().unwrap())),
         PgType::Int8 => Value::Int8(i64::from_be_bytes(fixed(8)?.try_into().unwrap())),
@@ -72,9 +69,15 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
         PgType::Float8 => {
             Value::Float8(f64::from_bits(u64::from_be_bytes(fixed(8)?.try_into().unwrap())))
         }
-        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => Value::Text(
-            String::from_utf8(b.to_vec()).map_err(|_| invalid_binary(ty))?,
-        ),
+        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
+            let s = String::from_utf8(b.to_vec()).map_err(|_| invalid_binary(ty))?;
+            // `name` truncates to 63 characters (`namerecv`); the rest keep their
+            // full length.
+            match ty {
+                PgType::Name => Value::Text(crate::text::name_input(&s)),
+                _ => Value::Text(s),
+            }
+        }
         PgType::Bytea => Value::Bytea(b.to_vec()),
         other => return Err(no_binary(other)),
     })
@@ -124,9 +127,21 @@ mod tests {
     }
 
     #[test]
-    fn bool_binary_rejects_bad_byte() {
-        assert!(decode_binary(PgType::Bool, &[2]).is_err());
+    fn bool_binary_accepts_any_nonzero_and_rejects_short() {
+        // PG's boolrecv: any nonzero byte is true.
+        assert_eq!(decode_binary(PgType::Bool, &[0]).unwrap(), Value::Bool(false));
+        assert_eq!(decode_binary(PgType::Bool, &[1]).unwrap(), Value::Bool(true));
+        assert_eq!(decode_binary(PgType::Bool, &[2]).unwrap(), Value::Bool(true));
         assert!(decode_binary(PgType::Int4, &[0, 0, 0]).is_err()); // short
+    }
+
+    #[test]
+    fn name_param_truncates_to_63_chars() {
+        let long = "x".repeat(100);
+        let Value::Text(t) = decode_text(PgType::Name, &long).unwrap() else {
+            panic!("name decodes to text");
+        };
+        assert_eq!(t.chars().count(), 63);
     }
 
     #[test]
