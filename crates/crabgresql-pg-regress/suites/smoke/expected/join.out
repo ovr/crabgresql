@@ -271,4 +271,7 @@ ERROR:  column "tag" specified in USING clause does not exist in left table
 -- a USING column that is ambiguous within one input is rejected
 SELECT * FROM (VALUES (1, 2)) a(x, x) JOIN (VALUES (1)) b(x) USING (x);
 ERROR:  common column name "x" appears more than once in left table
+-- a column named twice in the same USING list is rejected
+SELECT * FROM t1 JOIN t2 USING (id, id);
+ERROR:  column name "id" appears more than once in USING clause
 -- end USING/NATURAL coverage

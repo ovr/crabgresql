@@ -120,4 +120,6 @@ SELECT * FROM t1 JOIN t2 USING (label);
 SELECT * FROM t1 JOIN t2 USING (tag);
 -- a USING column that is ambiguous within one input is rejected
 SELECT * FROM (VALUES (1, 2)) a(x, x) JOIN (VALUES (1)) b(x) USING (x);
+-- a column named twice in the same USING list is rejected
+SELECT * FROM t1 JOIN t2 USING (id, id);
 -- end USING/NATURAL coverage

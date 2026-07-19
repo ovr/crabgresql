@@ -306,6 +306,33 @@ pub struct VisibleColumn {
     pub expr: BoundExpr,
 }
 
+/// The outcome of looking a name up in a merged-column view: exactly one match,
+/// none, or several. Callers map each case to their own error wording (a bare
+/// column reference vs. a `USING`/`NATURAL` join column).
+pub(crate) enum VisibleLookup<'a> {
+    Found(&'a BoundExpr),
+    Missing,
+    Ambiguous,
+}
+
+/// Find `name` among a merged view's columns, distinguishing no match from more
+/// than one so the caller can raise the right `42703`/`42702`.
+pub(crate) fn lookup_visible<'a>(cols: &'a [VisibleColumn], name: &str) -> VisibleLookup<'a> {
+    let mut found: Option<&BoundExpr> = None;
+    for col in cols {
+        if col.name == name {
+            if found.is_some() {
+                return VisibleLookup::Ambiguous;
+            }
+            found = Some(&col.expr);
+        }
+    }
+    match found {
+        Some(expr) => VisibleLookup::Found(expr),
+        None => VisibleLookup::Missing,
+    }
+}
+
 /// Name-resolution scope: an ordered list of relations (empty for a FROM-less
 /// SELECT / INSERT VALUES, one for a single-table SELECT, more for a cross
 /// join). A qualified reference addresses one relation by its name or alias;
@@ -385,24 +412,17 @@ impl Scope {
         // columns: the join column appears once (never ambiguous), the merged
         // expression carrying its combined-row value.
         if let Some(visible) = &self.visible {
-            let mut found: Option<&BoundExpr> = None;
-            for col in visible {
-                if col.name == name {
-                    if found.is_some() {
-                        return Err(BindError::new(
-                            sqlstate::AMBIGUOUS_COLUMN,
-                            format!("column reference \"{name}\" is ambiguous"),
-                        ));
-                    }
-                    found = Some(&col.expr);
-                }
-            }
-            return found.cloned().ok_or_else(|| {
-                BindError::new(
+            return match lookup_visible(visible, name) {
+                VisibleLookup::Found(expr) => Ok(expr.clone()),
+                VisibleLookup::Ambiguous => Err(BindError::new(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    format!("column reference \"{name}\" is ambiguous"),
+                )),
+                VisibleLookup::Missing => Err(BindError::new(
                     sqlstate::UNDEFINED_COLUMN,
                     format!("column \"{name}\" does not exist"),
-                )
-            });
+                )),
+            };
         }
         let mut found: Option<(usize, PgType)> = None;
         for rel in &self.rels {
@@ -2790,7 +2810,7 @@ fn unify_types(
 /// not `float8`). When neither or both cast implicitly, fall back to numeric
 /// preferred-type promotion (`float8` dominates). This deliberately differs from
 /// `unify_types` (operator resolution), where `real` + `int4` resolves to `float8`.
-fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
+pub(crate) fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
     if a == b {
         return Some(a);
     }
@@ -2873,7 +2893,7 @@ fn common_numeric(a: PgType, b: PgType) -> Option<PgType> {
 /// Coerce an expression to `ty`. Constant operands fold (and range-check) at
 /// bind time, as PG's planner does; non-constants (and any cast to text, which
 /// needs the session `extra_float_digits`) get a runtime `Coerce`.
-fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, BindError> {
+pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, BindError> {
     if expr.ty() == ty {
         return Ok(expr);
     }

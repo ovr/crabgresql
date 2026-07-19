@@ -13,9 +13,9 @@ use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TypeCat
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
-    BinOp, Binding, BoundExpr, Scope, VisibleColumn, bind_binary_op, bind_column_default,
-    bind_expr, bind_projection, bind_scalar, coerce_to_column, normalize_ident, output_name,
-    to_bool_operand, unify_value_column,
+    BinOp, Binding, BoundExpr, Scope, VisibleColumn, VisibleLookup, bind_binary_op,
+    bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column,
+    lookup_visible, merge_types, normalize_ident, output_name, to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -900,12 +900,13 @@ fn bind_table_with_joins(
         .iter()
         .map(|(qualifier, _)| qualifier.clone())
         .collect();
-    // The running merged-column view over the accumulated left side, indexed
-    // into this group's combined row (base 0). It only diverges from the plain
-    // relation layout once a USING/NATURAL join merges columns; `merged` tracks
-    // whether that has happened so an all-`ON` chain stays on the fast path.
-    let mut visible = default_visible(&bound.relations, 0);
-    let mut merged = false;
+    // Width of the accumulated left side in the group's combined row, tracked
+    // incrementally (each Input is O(1), so no repeated tree walks).
+    let mut left_width = bound.source.width();
+    // The merged-column view over the accumulated left side, indexed into this
+    // group's combined row (base 0). Materialized only once a USING/NATURAL join
+    // needs it; an all-`ON`/`CROSS` chain leaves it `None` and allocates nothing.
+    let mut visible: Option<Vec<VisibleColumn>> = None;
 
     for join in &table.joins {
         if join.global {
@@ -916,13 +917,13 @@ fn bind_table_with_joins(
         let right = bind_from_item(engine, catalog, &join.relation, ctes)?.into_bound_from();
         let right_qualifier = &right.relations[0].0;
         ensure_unique_qualifier(&mut seen, right_qualifier)?;
-
-        let left_width = bound.source.width();
-        let right_visible = default_visible(&right.relations, left_width);
+        let right_width = right.source.width();
 
         let (kind, predicate) = match join_kind_and_constraint(&join.join_operator)? {
             JoinBinding::Cross => {
-                visible.extend(right_visible);
+                if let Some(v) = &mut visible {
+                    v.extend(default_visible(&right.relations, left_width));
+                }
                 (JoinKind::Cross, None)
             }
             JoinBinding::On(kind, on) => {
@@ -930,10 +931,10 @@ fn bind_table_with_joins(
                 on_relations.extend(right.relations.clone());
                 // A prior USING/NATURAL join makes the merged view govern
                 // unqualified names inside this ON clause too.
-                let on_visible = merged.then(|| {
-                    let mut v = visible.clone();
-                    v.extend(right_visible.clone());
-                    v
+                let on_visible = visible.as_ref().map(|v| {
+                    let mut ov = v.clone();
+                    ov.extend(default_visible(&right.relations, left_width));
+                    ov
                 });
                 let scope = Scope::relations_with_visible(on_relations, on_visible, catalog);
                 let binding = bind_expr(on, &scope)?;
@@ -943,22 +944,28 @@ fn bind_table_with_joins(
                         "aggregate functions are not allowed in JOIN conditions",
                     ));
                 }
-                visible.extend(right_visible);
+                if let Some(v) = &mut visible {
+                    v.extend(default_visible(&right.relations, left_width));
+                }
                 (kind, Some(to_bool_operand(binding, "JOIN/ON")?))
             }
             JoinBinding::Using(kind, names) => {
+                let left_view = visible
+                    .take()
+                    .unwrap_or_else(|| default_visible(&bound.relations, 0));
                 let (predicate, new_visible) =
-                    build_merged_join(kind, &names, &visible, &right, left_width)?;
-                visible = new_visible;
-                merged = true;
+                    build_merged_join(kind, &names, &left_view, &right, left_width)?;
+                visible = Some(new_visible);
                 (kind, predicate)
             }
             JoinBinding::Natural(kind) => {
-                let names = natural_join_names(&visible, &right);
+                let left_view = visible
+                    .take()
+                    .unwrap_or_else(|| default_visible(&bound.relations, 0));
+                let names = natural_join_names(&left_view, &right);
                 let (predicate, new_visible) =
-                    build_merged_join(kind, &names, &visible, &right, left_width)?;
-                visible = new_visible;
-                merged = true;
+                    build_merged_join(kind, &names, &left_view, &right, left_width)?;
+                visible = Some(new_visible);
                 (kind, predicate)
             }
         };
@@ -969,8 +976,9 @@ fn bind_table_with_joins(
             predicate,
         };
         bound.relations.extend(right.relations);
+        left_width += right_width;
     }
-    bound.visible = merged.then_some(visible);
+    bound.visible = visible;
     Ok(bound)
 }
 
@@ -1019,26 +1027,17 @@ fn lookup_join_column<'a>(
     name: &str,
     side: &str,
 ) -> Result<&'a BoundExpr, BindError> {
-    let mut found: Option<&BoundExpr> = None;
-    for col in cols {
-        if col.name == name {
-            if found.is_some() {
-                return Err(BindError::new(
-                    sqlstate::AMBIGUOUS_COLUMN,
-                    format!(
-                        "common column name \"{name}\" appears more than once in {side} table"
-                    ),
-                ));
-            }
-            found = Some(&col.expr);
-        }
-    }
-    found.ok_or_else(|| {
-        BindError::new(
+    match lookup_visible(cols, name) {
+        VisibleLookup::Found(expr) => Ok(expr),
+        VisibleLookup::Ambiguous => Err(BindError::new(
+            sqlstate::AMBIGUOUS_COLUMN,
+            format!("common column name \"{name}\" appears more than once in {side} table"),
+        )),
+        VisibleLookup::Missing => Err(BindError::new(
             sqlstate::UNDEFINED_COLUMN,
             format!("column \"{name}\" specified in USING clause does not exist in {side} table"),
-        )
-    })
+        )),
+    }
 }
 
 /// Build a `USING`/`NATURAL` join's ON predicate and merged-column view. For
@@ -1061,20 +1060,35 @@ fn build_merged_join(
     for name in names {
         let left_expr = lookup_join_column(left, name, "left")?.clone();
         let right_expr = lookup_join_column(&right_visible, name, "right")?.clone();
-        let eq = bind_binary_op(BinOp::Eq, Binding::Typed(left_expr), Binding::Typed(right_expr))?;
+        let (left_ty, right_ty) = (left_expr.ty(), right_expr.ty());
+
+        // The join predicate compares the two copies with the engine's ordinary
+        // comparison coercion (which may promote, e.g. `real = int4` compares as
+        // float8) — orthogonal to the merged column's output type below.
+        let eq = bind_binary_op(
+            BinOp::Eq,
+            Binding::Typed(left_expr.clone()),
+            Binding::Typed(right_expr.clone()),
+        )?;
         let Binding::Typed(eq_expr) = eq else {
             unreachable!("equality of typed operands is always typed");
         };
-        let BoundExpr::Binary {
-            arg_ty,
-            left: le,
-            right: re,
-            ..
-        } = &eq_expr
-        else {
-            unreachable!("equality lowers to a Binary node");
-        };
-        let (arg_ty, le, re) = (*arg_ty, (**le).clone(), (**re).clone());
+
+        // PG types the merged column by `select_common_type` (so `real + int4`
+        // -> real), which differs from the comparison's promoted type. Since the
+        // equality above already succeeded, a common type always exists.
+        let merged_ty = merge_types(left_ty, right_ty).ok_or_else(|| {
+            BindError::new(
+                sqlstate::DATATYPE_MISMATCH,
+                format!(
+                    "USING column \"{name}\" has no common type for {} and {}",
+                    left_ty.name(),
+                    right_ty.name()
+                ),
+            )
+        })?;
+        let le = coerce_expr(left_expr, merged_ty)?;
+        let re = coerce_expr(right_expr, merged_ty)?;
         let merged = match kind {
             JoinKind::Right => re,
             // COALESCE(left, right): the matched rows agree, and each unmatched
@@ -1088,7 +1102,7 @@ fn build_merged_join(
                     le,
                 )],
                 else_: Some(Box::new(re)),
-                ty: arg_ty,
+                ty: merged_ty,
             },
             _ => le,
         };
@@ -1162,6 +1176,15 @@ fn join_kind_and_constraint(
                     .iter()
                     .map(using_column_name)
                     .collect::<Result<Vec<_>, _>>()?;
+                // A name may not appear twice in the same USING list.
+                for (i, name) in cols.iter().enumerate() {
+                    if cols[..i].contains(name) {
+                        return Err(BindError::new(
+                            sqlstate::DUPLICATE_COLUMN,
+                            format!("column name \"{name}\" appears more than once in USING clause"),
+                        ));
+                    }
+                }
                 Ok(JoinBinding::Using(kind, cols))
             }
             JoinConstraint::Natural => Ok(JoinBinding::Natural(kind)),
@@ -4057,6 +4080,29 @@ mod tests {
                 ty: PgType::Int4
             }
         );
+    }
+
+    #[test]
+    fn duplicate_using_column_is_42701() {
+        let e = bind_err("SELECT * FROM t a JOIN t b USING (id, id)");
+        assert_eq!(e.code, "42701");
+        assert_eq!(
+            e.message,
+            "column name \"id\" appears more than once in USING clause"
+        );
+    }
+
+    #[test]
+    fn using_merged_column_uses_common_type_not_comparison_type() {
+        // real + int4: PG's select_common_type resolves the merged column to
+        // real, even though the equality comparison promotes to float8.
+        let LogicalPlan::Join { projections, .. } =
+            bind_one("SELECT x FROM (VALUES (1.0::real)) a(x) JOIN (VALUES (1)) b(x) USING (x)")
+                .unwrap()
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(projections[0].ty(), PgType::Float4);
     }
 
     #[test]
