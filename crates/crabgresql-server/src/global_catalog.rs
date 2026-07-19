@@ -535,10 +535,27 @@ impl GlobalCatalog {
 impl TypeCatalog for GlobalCatalog {
     fn resolve_type(&self, name: &str) -> Option<UserType> {
         let cat = self.inner.read().unwrap();
-        cat.types.get(name).map(|e| UserType {
+        cat.types.get(name).filter(|e| e.defined).map(|e| UserType {
             oid: e.oid,
             backing: e.backing,
         })
+    }
+
+    fn is_shell_type(&self, name: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .types
+            .get(name)
+            .is_some_and(|e| !e.defined)
+    }
+
+    fn user_type_name(&self, oid: u32) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .type_name_by_oid(oid)
+            .map(str::to_string)
     }
 
     fn find_cast(&self, source: PgType, target: PgType) -> Option<UserCast> {
@@ -592,7 +609,7 @@ impl GlobalCatalog {
     /// types (not yet defined) are excluded, matching PG's `typisdefined`.
     pub fn user_types(&self) -> Vec<UserTypeInfo> {
         let cat = self.inner.read().unwrap();
-        cat.types
+        let mut types: Vec<_> = cat.types
             .iter()
             .filter(|(_, e)| e.defined)
             .map(|(name, e)| UserTypeInfo {
@@ -600,7 +617,9 @@ impl GlobalCatalog {
                 name: name.clone(),
                 enum_labels: e.enum_labels.clone(),
             })
-            .collect()
+            .collect();
+        types.sort_by_key(|t| t.oid);
+        types
     }
 }
 
@@ -855,6 +874,26 @@ mod tests {
         let err = cat.create_shell_type("foo").unwrap_err();
         assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(err.message, "type \"foo\" already exists");
+    }
+
+    #[test]
+    fn shell_types_do_not_resolve_for_queries() {
+        let cat = GlobalCatalog::new();
+        cat.create_shell_type("foo").unwrap();
+        assert!(cat.is_shell_type("foo"));
+        assert!(cat.resolve_type("foo").is_none());
+        cat.define_type("foo", 8, Some(PgType::Int8)).unwrap();
+        assert!(!cat.is_shell_type("foo"));
+        assert!(cat.resolve_type("foo").is_some());
+    }
+
+    #[test]
+    fn user_type_enumeration_follows_oid_order() {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("zeta", vec!["z".into()]).unwrap();
+        cat.create_enum_type("alpha", vec!["a".into()]).unwrap();
+        let names: Vec<_> = cat.user_types().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["zeta", "alpha"]);
     }
 
     #[test]

@@ -1611,8 +1611,16 @@ fn resolve_column_type(
     match map_data_type(dt) {
         Ok(t) => Ok(t),
         Err(orig) => match datatype_simple_name(dt) {
+            Some(name) if type_catalog.is_shell_type(&name) => Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("type \"{name}\" is only a shell"),
+            )),
             Some(name) => match type_catalog.resolve_type(&name) {
-                Some(ut) => Ok(PgType::User(ut.oid)),
+                Some(ut) if type_catalog.enum_info(ut.oid).is_some() => Ok(PgType::User(ut.oid)),
+                Some(_) => Err(PgError::feature_not_supported(format!(
+                    "type \"{name}\" is not supported yet"
+                ))),
+                None if crabgresql_catalog::is_builtin_type_name(&name) => Err(orig),
                 None => Err(PgError::new(
                     sqlstate::UNDEFINED_OBJECT,
                     format!("type \"{name}\" does not exist"),
@@ -1774,6 +1782,12 @@ fn execute_create_type(
     representation: &Option<ast::UserDefinedTypeRepresentation>,
 ) -> Result<QueryResult, PgError> {
     let tname = single_object_name(name, "type")?;
+    if crabgresql_catalog::is_builtin_type_name(&tname) {
+        return Err(PgError::new(
+            sqlstate::DUPLICATE_OBJECT,
+            format!("type \"{tname}\" already exists"),
+        ));
+    }
     let notices = match representation {
         None => catalog.create_shell_type(&tname)?,
         Some(ast::UserDefinedTypeRepresentation::SqlDefinition { options }) => {

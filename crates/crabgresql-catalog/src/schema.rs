@@ -15,7 +15,7 @@ use crate::{CatalogIndex, CatalogRelation, CatalogUserType, PG_CAST_ROWS, PG_TYP
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
 /// built-in ranges so a per-label OID never collides with a type/relation OID.
-const FIRST_ENUM_OID: u32 = 90000;
+const FIRST_ENUM_OID: u32 = 0x8000_0000;
 
 /// A `"char"`/`regproc` column: a single- or short-name catalog column we render
 /// as `text` for now. Kept as a named alias so the deviation is greppable.

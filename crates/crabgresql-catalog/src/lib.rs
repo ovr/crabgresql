@@ -34,10 +34,11 @@ use crabgresql_types::Value;
 
 pub use static_table::StaticTable;
 
-/// First OID handed to a user relation in `pg_class`. Matches PostgreSQL's
-/// user-object floor; the exact values are synthetic (we have no persistent
-/// `pg_class` OIDs yet) but stable within one catalog snapshot.
-const FIRST_REL_OID: u32 = 16384;
+/// First OID handed to a synthetic user relation in `pg_class`. Runtime type,
+/// function, and cast OIDs grow upward from PostgreSQL's user-object floor, so
+/// relations use a separate high partition until storage owns persistent OIDs.
+/// This preserves catalog-wide uniqueness in every reflected snapshot.
+const FIRST_REL_OID: u32 = 0x4000_0000;
 
 #[derive(Clone)]
 struct CatalogIndex {
@@ -87,6 +88,14 @@ pub struct PgCastRow {
 
 include!(concat!(env!("OUT_DIR"), "/pg_type_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
+
+/// Whether `name` is the catalog name of a PostgreSQL built-in type, including
+/// types crabgresql recognizes but does not implement yet (for example
+/// `point`). This distinguishes an unsupported built-in from a nonexistent
+/// user type without maintaining a second hand-written name list.
+pub fn is_builtin_type_name(name: &str) -> bool {
+    PG_TYPE_ROWS.iter().any(|row| row.typname == name)
+}
 
 /// A live relation exposed through the system catalogs.
 #[derive(Clone, Debug)]
@@ -411,6 +420,13 @@ mod tests {
         );
         // Every row is full-width.
         assert!(rows.iter().all(|r| r.len() == schema.columns.len()));
+    }
+
+    #[test]
+    fn built_in_name_lookup_includes_unimplemented_types() {
+        assert!(is_builtin_type_name("int4"));
+        assert!(is_builtin_type_name("point"));
+        assert!(!is_builtin_type_name("definitely_not_a_pg_type"));
     }
 
     #[test]

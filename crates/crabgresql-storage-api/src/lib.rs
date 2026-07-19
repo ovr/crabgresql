@@ -352,8 +352,21 @@ pub struct UserCast {
 /// user-defined cast. The DDL layer (`GlobalCatalog`) implements this; callers
 /// with no user types (binder unit tests) use [`EmptyTypeCatalog`].
 pub trait TypeCatalog: Send + Sync {
-    /// Resolve a `CREATE TYPE` name (case-insensitive) to its OID and backing.
+    /// Resolve a fully-defined `CREATE TYPE` name (case-insensitive) to its OID
+    /// and backing. Shell types are deliberately excluded from query-time type
+    /// resolution.
     fn resolve_type(&self, name: &str) -> Option<UserType>;
+
+    /// Whether `name` exists only as a `CREATE TYPE name;` shell. DDL can refer
+    /// to shells while table columns and expressions must reject them.
+    fn is_shell_type(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// The catalog name for a user type OID, for PG-compatible diagnostics.
+    fn user_type_name(&self, _oid: u32) -> Option<String> {
+        None
+    }
 
     /// The `CREATE CAST (source AS target)` for this ordered pair, if one was
     /// registered. `source`/`target` are either builtins or `PgType::User(oid)`.

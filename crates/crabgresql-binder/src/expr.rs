@@ -916,7 +916,7 @@ fn unsupported_expr(expr: &ast::Expr) -> BindError {
 /// Types the executor's `compare_values` can order. Both comparison operators
 /// (`=`, `<`, …) and ORDER BY require this — binding a sort or comparison on any
 /// other type would produce a node the evaluator can't handle.
-pub(crate) fn is_orderable(ty: PgType) -> bool {
+pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
     matches!(
         ty,
         PgType::Bool
@@ -946,11 +946,7 @@ pub(crate) fn is_orderable(ty: PgType) -> bool {
             | PgType::Money
             | PgType::Macaddr
             | PgType::Macaddr8
-            // Enums order by definition-order ordinal (carried in the value);
-            // `LIKE`-backed base types delegate to their backing builtin. Both
-            // are handled by the executor's `compare_values` `User` arm.
-            | PgType::User(_)
-    )
+    ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
 }
 
 fn bind_value(value: &ast::ValueWithSpan, scope: &Scope) -> Result<Binding, BindError> {
@@ -1218,11 +1214,12 @@ fn coerce_user_cast(
     }
     let catalog = scope.catalog();
 
-    // Enum → text family renders the label (PG's `enum_out`); this is a built-in
-    // assignment cast, not a `CREATE CAST`, so it bypasses the registry below.
+    // Enum → text renders the label (PG's `enum_out`); the other text-family
+    // targets do not have this cast, so they must use an explicitly registered
+    // conversion just like any other user-type pair.
     if let PgType::User(oid) = source
         && catalog.enum_info(oid).is_some()
-        && is_text_family(target)
+        && target == PgType::Text
     {
         return coerce_expr(expr, target);
     }
@@ -1259,7 +1256,11 @@ fn coerce_user_cast(
         )),
         None => Err(BindError::new(
             sqlstate::CANNOT_COERCE,
-            format!("cannot cast type {} to {}", source.name(), target.name()),
+            format!(
+                "cannot cast type {} to {}",
+                type_label(source, catalog.as_ref()),
+                type_label(target, catalog.as_ref())
+            ),
         )),
     }
 }
@@ -2122,11 +2123,11 @@ pub(crate) fn bind_binary_op(
     // side is parsed as that type — PG reports `operator does not exist:
     // boolean + unknown`, never a coercion failure, when no operator applies.
     let (left, right, arg_ty) = match (lb, rb) {
-        (Binding::Typed(l), Binding::Typed(r)) => unify_types(l, r, op)?,
+        (Binding::Typed(l), Binding::Typed(r)) => unify_types(l, r, op, catalog)?,
         (Binding::Typed(l), Binding::Unknown { lit, span, param }) => {
             let ty = l.ty();
             if op.is_arithmetic() && !ty.is_numeric() {
-                return Err(no_operator(ty.name(), op, "unknown"));
+                return Err(no_operator(&type_label(ty, catalog), op, "unknown"));
             }
             let r = resolve_unknown_ctx(catalog, lit, span, param, ty)?;
             (l, r, ty)
@@ -2134,7 +2135,7 @@ pub(crate) fn bind_binary_op(
         (Binding::Unknown { lit, span, param }, Binding::Typed(r)) => {
             let ty = r.ty();
             if op.is_arithmetic() && !ty.is_numeric() {
-                return Err(no_operator("unknown", op, ty.name()));
+                return Err(no_operator("unknown", op, &type_label(ty, catalog)));
             }
             let l = resolve_unknown_ctx(catalog, lit, span, param, ty)?;
             (l, r, ty)
@@ -2189,10 +2190,11 @@ pub(crate) fn bind_binary_op(
             || matches!(arg_ty, PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Numeric);
         numeric_arith && mod_ok
     } else {
-        is_orderable(arg_ty)
+        is_orderable(arg_ty, catalog)
     };
     if !supported {
-        return Err(no_operator(arg_ty.name(), op, arg_ty.name()));
+        let name = type_label(arg_ty, catalog);
+        return Err(no_operator(&name, op, &name));
     }
 
     Ok(Binding::Typed(BoundExpr::Binary {
@@ -3128,6 +3130,7 @@ fn unify_types(
     left: BoundExpr,
     right: BoundExpr,
     op: BinOp,
+    catalog: &dyn TypeCatalog,
 ) -> Result<(BoundExpr, BoundExpr, PgType), BindError> {
     let (lty, rty) = (left.ty(), right.ty());
     if lty == rty {
@@ -3148,7 +3151,18 @@ fn unify_types(
     if implicit_castable(rty, lty) {
         return Ok((left, coerce_expr(right, lty)?, lty));
     }
-    Err(no_operator(lty.name(), op, rty.name()))
+    Err(no_operator(&type_label(lty, catalog), op, &type_label(rty, catalog)))
+}
+
+/// Display a user type by its catalog name instead of the generic
+/// `user-defined` placeholder used by catalog-free [`PgType::name`].
+pub(crate) fn type_label(ty: PgType, catalog: &dyn TypeCatalog) -> String {
+    match ty {
+        PgType::User(oid) => catalog
+            .user_type_name(oid)
+            .unwrap_or_else(|| ty.name().to_string()),
+        _ => ty.name().to_string(),
+    }
 }
 
 /// The common type of two column entries (`VALUES` rows / `UNION` arms),
@@ -3493,8 +3507,8 @@ pub fn coerce_to_column(
                     format!(
                         "column \"{}\" is of type {} but expression is of type {}",
                         column.name,
-                        column.ty.name(),
-                        ty.name()
+                        type_label(column.ty, scope.catalog().as_ref()),
+                        type_label(ty, scope.catalog().as_ref())
                     ),
                 ));
             }

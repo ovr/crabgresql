@@ -1604,10 +1604,10 @@ fn bind_order_by(
         // The executor's sort compares keys with `compare_values`, which panics
         // on a type it can't order. Reject such a key at bind time rather than
         // aborting mid-sort.
-        if !crate::expr::is_orderable(ty) {
+        if !crate::expr::is_orderable(ty, scope.catalog().as_ref()) {
             return Err(BindError::feature_not_supported(format!(
                 "ORDER BY on type {} is not supported yet",
-                ty.name()
+                crate::expr::type_label(ty, scope.catalog().as_ref())
             )));
         }
         let asc = oe.options.asc.unwrap_or(true);
@@ -1986,10 +1986,10 @@ fn bind_group_by(
         // The executor groups with `compare_values`, which cannot order every
         // type (`bit`, user types); reject such a key at bind time rather than
         // panicking mid-group.
-        if !crate::expr::is_orderable(bound.ty()) {
+        if !crate::expr::is_orderable(bound.ty(), scope.catalog().as_ref()) {
             return Err(BindError::feature_not_supported(format!(
                 "GROUP BY on type {} is not supported yet",
-                bound.ty().name()
+                crate::expr::type_label(bound.ty(), scope.catalog().as_ref())
             )));
         }
         keys.push(bound);

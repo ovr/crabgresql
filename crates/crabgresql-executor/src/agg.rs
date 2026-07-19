@@ -276,6 +276,14 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     u.hash(&mut h);
                 }
             }
+            PgType::User(type_oid) => {
+                if let Value::Enum { type_oid: value_oid, ordinal, .. } = v
+                    && value_oid == type_oid
+                {
+                    type_oid.hash(&mut h);
+                    ordinal.hash(&mut h);
+                }
+            }
             // timetz/interval/inet/cidr (and anything else): equality is not a
             // raw-field compare, so contribute nothing and rely on `keys_equal`.
             _ => {}
@@ -351,6 +359,25 @@ fn as_numeric(v: &Value) -> Numeric {
 
 fn bigint_out_of_range() -> ExecError {
     ExecError::new("22003", "bigint out of range")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash_key;
+    use crabgresql_types::{PgType, Value};
+
+    #[test]
+    fn enum_hash_uses_definition_ordinal() {
+        let ty = [PgType::User(16384)];
+        let value = |ordinal: u32, label: &str| [Value::Enum {
+            type_oid: 16384,
+            ordinal,
+            label: label.to_string(),
+        }];
+
+        assert_ne!(hash_key(&ty, &value(0, "red")), hash_key(&ty, &value(1, "green")));
+        assert_eq!(hash_key(&ty, &value(0, "red")), hash_key(&ty, &value(0, "red")));
+    }
 }
 
 fn float_error(e: float::FloatError) -> ExecError {
