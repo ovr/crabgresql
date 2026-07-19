@@ -217,6 +217,17 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         }
         // macaddr/macaddr8: raw byte order (PG's `macaddr_cmp`).
         PgType::Macaddr | PgType::Macaddr8 => macaddr_bytes(l).cmp(macaddr_bytes(r)),
+        // A user type is either an enum (ordered by its definition-order ordinal,
+        // carried in the value so no catalog is needed) or a `LIKE`-backed base
+        // type, whose values are stored as the backing builtin — delegate to it.
+        PgType::User(_) => match (l, r) {
+            (Value::Enum { ordinal: a, .. }, Value::Enum { ordinal: b, .. }) => a.cmp(b),
+            _ => compare_values(
+                l.pg_type().expect("comparison operand is not null"),
+                l,
+                r,
+            ),
+        },
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -524,4 +535,28 @@ fn eval_arith_numeric(op: BinOp, a: &Numeric, b: &Numeric) -> Result<Value, Exec
 
 fn numeric_error(e: crabgresql_types::numeric::NumErr) -> ExecError {
     ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
+}
+
+#[cfg(test)]
+mod enum_cmp_tests {
+    use super::compare_values;
+    use crabgresql_types::{PgType, Value};
+    use std::cmp::Ordering;
+
+    fn e(ordinal: u32, label: &str) -> Value {
+        Value::Enum {
+            type_oid: 16384,
+            ordinal,
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn enum_orders_by_definition_ordinal_not_label() {
+        let ty = PgType::User(16384);
+        // 'red'(0) < 'green'(3), even though "green" < "red" alphabetically.
+        assert_eq!(compare_values(ty, &e(0, "red"), &e(3, "green")), Ordering::Less);
+        assert_eq!(compare_values(ty, &e(3, "green"), &e(0, "red")), Ordering::Greater);
+        assert_eq!(compare_values(ty, &e(2, "yellow"), &e(2, "yellow")), Ordering::Equal);
+    }
 }

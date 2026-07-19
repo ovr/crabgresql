@@ -397,6 +397,17 @@ pub enum Value {
     Point([f64; 2]),
     /// `lseg`: a line segment `[(x1,y1),(x2,y2)]` of float8. See [`crate::geo`].
     Lseg([f64; 4]),
+    /// A `CREATE TYPE ... AS ENUM` value. `type_oid` is the enum's type OID (so
+    /// [`Value::pg_type`] reports `PgType::User(type_oid)`); `ordinal` is the
+    /// 0-based position of the label in the enum's definition, which is also its
+    /// sort order (enums order by definition, not alphabetically); `label` is the
+    /// text spelling, used for output and `enum → text`. Carrying the ordinal in
+    /// the value lets the executor order enums without any catalog access.
+    Enum {
+        type_oid: u32,
+        ordinal: u32,
+        label: String,
+    },
 }
 
 impl Value {
@@ -428,6 +439,7 @@ impl Value {
             Value::Macaddr8(_) => Some(PgType::Macaddr8),
             Value::Point(_) => Some(PgType::Point),
             Value::Lseg(_) => Some(PgType::Lseg),
+            Value::Enum { type_oid, .. } => Some(PgType::User(*type_oid)),
         }
     }
 
@@ -473,6 +485,8 @@ impl Value {
             Value::Macaddr8(b) => Some(macaddr::format8(b)),
             Value::Point(p) => Some(geo::format_point(p, efd)),
             Value::Lseg(l) => Some(geo::format_lseg(l, efd)),
+            // An enum prints as its label (PG's `enum_out`).
+            Value::Enum { label, .. } => Some(label.clone()),
         }
     }
 }

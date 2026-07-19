@@ -126,11 +126,25 @@ impl CatalogRelation {
     }
 }
 
+/// A user-defined type reflected into `pg_type` (and, for enums, `pg_enum`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogUserType {
+    pub oid: u32,
+    pub name: String,
+    /// The enum labels in definition (= sort) order, or `None` for a non-enum
+    /// user type (which is not reflected into `pg_type`/`pg_enum` yet).
+    pub enum_labels: Option<Vec<String>>,
+}
+
 /// Produces the live user relations to reflect into `pg_class`/`pg_attribute`
 /// and `information_schema`.
 /// Boxed so it can capture the server engines and run lazily — only a query that
 /// actually opens `pg_class`/`pg_attribute` pays the cost of enumerating them.
 type RelationsFn = Box<dyn Fn() -> Vec<CatalogRelation> + Send + Sync>;
+
+/// Produces the user-defined types to reflect into `pg_type`/`pg_enum`. Boxed and
+/// lazy like [`RelationsFn`] — only a query that opens `pg_type`/`pg_enum` pays.
+type UserTypesFn = Box<dyn Fn() -> Vec<CatalogUserType> + Send + Sync>;
 
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so
 /// its rows reflect current server state; live user relations are supplied by a
@@ -138,11 +152,13 @@ type RelationsFn = Box<dyn Fn() -> Vec<CatalogRelation> + Send + Sync>;
 /// is opened), memoized in `oids`.
 pub struct SystemCatalog {
     relations: RelationsFn,
+    user_types_fn: UserTypesFn,
     database: String,
     owner: String,
     live_relations: OnceLock<Vec<CatalogRelation>>,
     oids: OnceLock<Vec<(u32, TableSchema)>>,
     index_oids: OnceLock<Vec<CatalogIndex>>,
+    user_types: OnceLock<Vec<CatalogUserType>>,
 }
 
 impl Default for SystemCatalog {
@@ -180,16 +196,32 @@ impl SystemCatalog {
     ) -> Self {
         Self {
             relations: Box::new(f),
+            user_types_fn: Box::new(Vec::new),
             database: database.into(),
             owner: owner.into(),
             live_relations: OnceLock::new(),
             oids: OnceLock::new(),
             index_oids: OnceLock::new(),
+            user_types: OnceLock::new(),
         }
+    }
+
+    /// Attach a provider of user-defined types to reflect into `pg_type`/`pg_enum`
+    /// (invoked at most once, only if one of those relations is opened).
+    pub fn with_user_types_fn(
+        mut self,
+        f: impl Fn() -> Vec<CatalogUserType> + Send + Sync + 'static,
+    ) -> Self {
+        self.user_types_fn = Box::new(f);
+        self
     }
 
     fn live_relations(&self) -> &[CatalogRelation] {
         self.live_relations.get_or_init(|| (self.relations)())
+    }
+
+    fn user_types(&self) -> &[CatalogUserType] {
+        self.user_types.get_or_init(|| (self.user_types_fn)())
     }
 
     /// Assign a stable synthetic OID to each user relation, computed once and
@@ -246,7 +278,15 @@ impl SystemCatalog {
     /// Build the requested relation's rows + schema, or `None` if unknown.
     fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         match name {
-            "pg_type" => Some((schema::pg_type_schema(), schema::pg_type_builtin_rows())),
+            "pg_type" => {
+                let mut rows = schema::pg_type_builtin_rows();
+                rows.extend(schema::pg_type_user_rows(self.user_types()));
+                Some((schema::pg_type_schema(), rows))
+            }
+            "pg_enum" => Some((
+                schema::pg_enum_schema(),
+                schema::pg_enum_rows(self.user_types()),
+            )),
             "pg_namespace" => Some((schema::pg_namespace_schema(), schema::pg_namespace_rows())),
             "pg_class" => Some((
                 schema::pg_class_schema(),

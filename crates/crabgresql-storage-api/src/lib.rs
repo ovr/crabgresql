@@ -329,6 +329,16 @@ pub struct UserType {
     pub backing: Option<PgType>,
 }
 
+/// The labels of a `CREATE TYPE ... AS ENUM`, in definition (= sort) order, plus
+/// the type's own name — enough for the binder to turn a text literal into a
+/// [`crabgresql_types::Value::Enum`] and to render the `invalid input value for
+/// enum <name>` error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumInfo {
+    pub name: String,
+    pub labels: Vec<String>,
+}
+
 /// A registered `CREATE CAST (source AS target)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserCast {
@@ -352,6 +362,13 @@ pub trait TypeCatalog: Send + Sync {
     /// The backing builtin representation of a type: the type itself for a
     /// builtin, or a user type's `LIKE` rep. Falls back to `ty` when unknown.
     fn backing_rep(&self, ty: PgType) -> PgType;
+
+    /// The labels of the enum type with this OID, or `None` if the OID is not a
+    /// `CREATE TYPE ... AS ENUM`. `Some(..)` is the binder's "is this an enum?"
+    /// test for a `PgType::User(oid)`.
+    fn enum_info(&self, _oid: u32) -> Option<EnumInfo> {
+        None
+    }
 }
 
 /// A [`TypeCatalog`] with no user-defined types or casts — the default for

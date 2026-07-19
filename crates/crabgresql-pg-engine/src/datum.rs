@@ -35,6 +35,7 @@ const T_MACADDR: u8 = 22;
 const T_MACADDR8: u8 = 23;
 const T_POINT: u8 = 24;
 const T_LSEG: u8 = 25;
+const T_ENUM: u8 = 26;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -153,6 +154,12 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
                 out.extend_from_slice(&c.to_bits().to_le_bytes());
             }
         }
+        Value::Enum { type_oid, ordinal, label } => {
+            out.push(T_ENUM);
+            out.extend_from_slice(&type_oid.to_le_bytes());
+            out.extend_from_slice(&ordinal.to_le_bytes());
+            put_var(out, label.as_bytes());
+        }
     }
 }
 
@@ -262,6 +269,12 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             f64::from_bits(r.u64()),
             f64::from_bits(r.u64()),
         ]),
+        T_ENUM => {
+            let type_oid = r.u32();
+            let ordinal = r.u32();
+            let label = String::from_utf8(r.var().to_vec()).expect("enum label is valid utf-8");
+            Value::Enum { type_oid, ordinal, label }
+        }
         other => panic!("corrupt datum tag {other}"),
     };
     *pos = r.pos;
@@ -311,6 +324,8 @@ mod tests {
         roundtrip(Value::Point([f64::INFINITY, -1e300]));
         roundtrip(Value::Lseg([1.0, 2.0, 3.0, 4.0]));
         roundtrip(Value::Lseg([-1e6, 200.0, 3e5, -40.0]));
+        roundtrip(Value::Enum { type_oid: 16384, ordinal: 0, label: "red".into() });
+        roundtrip(Value::Enum { type_oid: 99999, ordinal: 42, label: String::new() });
     }
 
     #[test]

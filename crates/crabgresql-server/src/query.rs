@@ -153,6 +153,8 @@ fn bind_catalogs(
         let database = session.database.clone();
         let owner = session.user.clone();
         let temp_schema = session.temp_schema.clone();
+        // User-defined types are reflected into pg_type/pg_enum on demand.
+        let types = global_catalog.clone();
         Arc::new(
             crabgresql_catalog::SystemCatalog::with_catalog_relations_fn(
                 database,
@@ -173,7 +175,18 @@ fn bind_catalogs(
                     }));
                     rels
                 },
-            ),
+            )
+            .with_user_types_fn(move || {
+                types
+                    .user_types()
+                    .into_iter()
+                    .map(|t| crabgresql_catalog::CatalogUserType {
+                        oid: t.oid,
+                        name: t.name,
+                        enum_labels: t.enum_labels,
+                    })
+                    .collect()
+            }),
         )
     };
     let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
@@ -1269,7 +1282,7 @@ fn execute_create_table(
     let mut pending = Vec::<PendingIndex>::new();
     let mut constraint_names = HashSet::new();
     for col in &create.columns {
-        let ty = map_data_type(&col.data_type)?;
+        let ty = resolve_column_type(type_catalog, &col.data_type)?;
         let typmod = crabgresql_binder::length_typmod(&col.data_type).unwrap_or(-1);
         let column_name = normalize_ident(&col.name);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
@@ -1587,6 +1600,29 @@ fn map_data_type(dt: &ast::DataType) -> Result<PgType, PgError> {
     crabgresql_binder::map_data_type(dt).map_err(PgError::from)
 }
 
+/// Resolve a column's declared type: a built-in, or — when the name is a bare
+/// custom identifier — a `CREATE TYPE` name from the catalog (e.g. an enum),
+/// yielding `PgType::User(oid)`. A bare name that is neither is an
+/// undefined-object error (42704), matching PG (and `resolve_type_ref`).
+fn resolve_column_type(
+    type_catalog: &Arc<dyn TypeCatalog>,
+    dt: &ast::DataType,
+) -> Result<PgType, PgError> {
+    match map_data_type(dt) {
+        Ok(t) => Ok(t),
+        Err(orig) => match datatype_simple_name(dt) {
+            Some(name) => match type_catalog.resolve_type(&name) {
+                Some(ut) => Ok(PgType::User(ut.oid)),
+                None => Err(PgError::new(
+                    sqlstate::UNDEFINED_OBJECT,
+                    format!("type \"{name}\" does not exist"),
+                )),
+            },
+            None => Err(orig),
+        },
+    }
+}
+
 /// Wrap catalog-produced notices as NOTICE-severity messages for the wire.
 fn to_notices(notices: Vec<CatalogNotice>) -> Vec<Notice> {
     notices
@@ -1744,9 +1780,15 @@ fn execute_create_type(
             let (typlen, backing) = type_shape_from_options(catalog, options)?;
             catalog.define_type(&tname, typlen, backing)?
         }
+        Some(ast::UserDefinedTypeRepresentation::Enum { labels }) => {
+            // Labels are stored verbatim (case-sensitive) — an enum label is a
+            // string constant in PG, not an identifier, so it is never folded.
+            let labels = labels.iter().map(|i| i.value.clone()).collect();
+            catalog.create_enum_type(&tname, labels)?
+        }
         Some(_) => {
             return Err(PgError::feature_not_supported(
-                "CREATE TYPE AS (composite / enum / range) is not supported yet",
+                "CREATE TYPE AS (composite / range) is not supported yet",
             ));
         }
     };

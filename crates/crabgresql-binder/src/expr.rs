@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{Column, TableSchema, TypeCatalog, UserCast};
+use crabgresql_storage_api::{Column, EnumInfo, TableSchema, TypeCatalog, UserCast};
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
     Numeric, PgType, Value, cast, date, float, interval, money, parse_bool, time, timestamp,
@@ -946,6 +946,10 @@ pub(crate) fn is_orderable(ty: PgType) -> bool {
             | PgType::Money
             | PgType::Macaddr
             | PgType::Macaddr8
+            // Enums order by definition-order ordinal (carried in the value);
+            // `LIKE`-backed base types delegate to their backing builtin. Both
+            // are handled by the executor's `compare_values` `User` arm.
+            | PgType::User(_)
     )
 }
 
@@ -1168,7 +1172,9 @@ fn bind_cast(
         },
     };
     let expr = match bind_expr(inner, scope)? {
-        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, target)?,
+        Binding::Unknown { lit, span, param } => {
+            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, target)?
+        }
         Binding::Typed(e) => coerce_cast(e, target, scope)?,
     };
     let expr = apply_numeric_typmod_if_any(expr, target, data_type)?;
@@ -1210,7 +1216,38 @@ fn coerce_user_cast(
     if source == target {
         return Ok(expr);
     }
-    match scope.catalog().find_cast(source, target) {
+    let catalog = scope.catalog();
+
+    // Enum → text family renders the label (PG's `enum_out`); this is a built-in
+    // assignment cast, not a `CREATE CAST`, so it bypasses the registry below.
+    if let PgType::User(oid) = source
+        && catalog.enum_info(oid).is_some()
+        && is_text_family(target)
+    {
+        return coerce_expr(expr, target);
+    }
+    // Text family → enum maps the label to its ordinal. Only a constant text
+    // value can resolve at bind time; a runtime `textcol::myenum` cast has no
+    // catalog to consult in the executor and is not supported yet.
+    if is_text_family(source)
+        && let PgType::User(oid) = target
+        && let Some(info) = catalog.enum_info(oid)
+    {
+        return match expr {
+            BoundExpr::Const { value: Value::Text(s), .. } => {
+                enum_const(oid, &info, Some(s), Span::empty())
+            }
+            BoundExpr::Const { value: Value::Null, .. } => Ok(BoundExpr::Const {
+                value: Value::Null,
+                ty: target,
+            }),
+            _ => Err(BindError::feature_not_supported(
+                "casting a non-constant text expression to an enum is not supported yet",
+            )),
+        };
+    }
+
+    match catalog.find_cast(source, target) {
         Some(UserCast { without_function: true }) => Ok(BoundExpr::Reinterpret {
             expr: Box::new(expr),
             reported: target,
@@ -1797,7 +1834,7 @@ fn bind_case(
             None => to_bool_operand(bind_expr(&when.condition, scope)?, "CASE/WHEN")?,
             Some(op) => {
                 let value = bind_expr(&when.condition, scope)?;
-                match bind_binary_op(BinOp::Eq, op.clone(), value)? {
+                match bind_binary_op(BinOp::Eq, op.clone(), value, scope.catalog().as_ref())? {
                     Binding::Typed(e) => e,
                     // `=` always resolves to a typed boolean expression.
                     Binding::Unknown { .. } => unreachable!("= yields a typed bool"),
@@ -1887,10 +1924,12 @@ fn bind_in_list(
             Some(ty) => Binding::Typed(resolve_operand(item, ty)?),
             None => item.clone(),
         };
-        let comparison = bind_binary_op(cmp, left.clone(), right)?;
+        let comparison = bind_binary_op(cmp, left.clone(), right, scope.catalog().as_ref())?;
         acc = Some(match acc {
             None => comparison,
-            Some(prev) => bind_binary_op(chain, prev, comparison)?,
+            Some(prev) => {
+                bind_binary_op(chain, prev, comparison, scope.catalog().as_ref())?
+            }
         });
     }
     Ok(acc.expect("non-empty list yields at least one comparison"))
@@ -2034,14 +2073,19 @@ fn bind_binary(
             )));
         }
     };
-    bind_binary_op(op, lb, rb)
+    bind_binary_op(op, lb, rb, scope.catalog().as_ref())
 }
 
 /// Resolve a binary operator over two already-bound operands. Split out from
 /// `bind_binary` so a simple `CASE operand WHEN v` can reuse the exact `=`
 /// resolution (unknown-literal handling, numeric promotion, "operator does not
 /// exist" errors) that a written `operand = v` gets.
-pub(crate) fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindError> {
+pub(crate) fn bind_binary_op(
+    op: BinOp,
+    lb: Binding,
+    rb: Binding,
+    catalog: &dyn TypeCatalog,
+) -> Result<Binding, BindError> {
     if op.is_logic() {
         let left = to_bool_operand(lb, op.sql_symbol())?;
         let right = to_bool_operand(rb, op.sql_symbol())?;
@@ -2084,14 +2128,16 @@ pub(crate) fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Bind
             if op.is_arithmetic() && !ty.is_numeric() {
                 return Err(no_operator(ty.name(), op, "unknown"));
             }
-            (l, resolve_unknown(lit, span, param, ty)?, ty)
+            let r = resolve_unknown_ctx(catalog, lit, span, param, ty)?;
+            (l, r, ty)
         }
         (Binding::Unknown { lit, span, param }, Binding::Typed(r)) => {
             let ty = r.ty();
             if op.is_arithmetic() && !ty.is_numeric() {
                 return Err(no_operator("unknown", op, ty.name()));
             }
-            (resolve_unknown(lit, span, param, ty)?, r, ty)
+            let l = resolve_unknown_ctx(catalog, lit, span, param, ty)?;
+            (l, r, ty)
         }
         (
             Binding::Unknown {
@@ -3355,11 +3401,71 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
     }
 }
 
+/// `resolve_unknown`, but aware of user-defined enum targets: a text literal
+/// destined for an enum becomes a [`Value::Enum`] via a catalog label lookup
+/// (an unknown label is PG's `invalid input value for enum` error). Every other
+/// target defers to the catalog-free [`resolve_unknown`].
+pub(crate) fn resolve_unknown_ctx(
+    catalog: &dyn TypeCatalog,
+    lit: Option<String>,
+    span: Span,
+    param: Option<(usize, ParamCtx)>,
+    ty: PgType,
+) -> Result<BoundExpr, BindError> {
+    if param.is_some() {
+        return resolve_unknown(lit, span, param, ty);
+    }
+    if let PgType::User(oid) = ty
+        && let Some(info) = catalog.enum_info(oid)
+    {
+        return enum_const(oid, &info, lit, span);
+    }
+    resolve_unknown(lit, span, None, ty)
+}
+
+/// Build an enum constant from a text literal by mapping the label to its
+/// definition-order ordinal. A label not in the enum is PG's `enum_in` error
+/// (22P02), carrying the literal's cursor position for the `LINE n: ^` caret.
+fn enum_const(
+    oid: u32,
+    info: &EnumInfo,
+    lit: Option<String>,
+    span: Span,
+) -> Result<BoundExpr, BindError> {
+    let value = match lit {
+        None => Value::Null,
+        Some(s) => match info.labels.iter().position(|l| *l == s) {
+            Some(ord) => Value::Enum {
+                type_oid: oid,
+                ordinal: ord as u32,
+                label: s,
+            },
+            None => {
+                return Err(BindError::new(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    format!("invalid input value for enum {}: \"{s}\"", info.name),
+                )
+                .at(span));
+            }
+        },
+    };
+    Ok(BoundExpr::Const {
+        value,
+        ty: PgType::User(oid),
+    })
+}
+
 /// Coerce an expression for assignment into a column (INSERT / UPDATE SET),
 /// with PG's column-context error message on a type mismatch.
-pub fn coerce_to_column(binding: Binding, column: &Column) -> Result<BoundExpr, BindError> {
+pub fn coerce_to_column(
+    binding: Binding,
+    column: &Column,
+    scope: &Scope,
+) -> Result<BoundExpr, BindError> {
     let base = match binding {
-        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, column.ty)?,
+        Binding::Unknown { lit, span, param } => {
+            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, column.ty)?
+        }
         Binding::Typed(e) => {
             let ty = e.ty();
             if ty == column.ty {
@@ -3406,7 +3512,7 @@ pub fn bind_column_default(
 ) -> Result<BoundExpr, BindError> {
     let params = param_ctx_none();
     let scope = Scope::empty(catalog, &params);
-    let bound = coerce_to_column(bind_expr(expr, &scope)?, column)?;
+    let bound = coerce_to_column(bind_expr(expr, &scope)?, column, &scope)?;
     if bound.contains_srf() {
         return Err(BindError::feature_not_supported(
             "set-returning functions are not allowed in DEFAULT expressions",
@@ -3531,7 +3637,9 @@ fn column_name(expr: &ast::Expr) -> Option<String> {
 }
 
 fn type_output_name(data_type: &ast::DataType) -> String {
-    map_data_type(data_type)
-        .map(|ty| ty.typname().to_string())
-        .unwrap_or_else(|_| "?column?".into())
+    map_data_type(data_type).map(|ty| ty.typname().to_string()).unwrap_or_else(|_| {
+        // A user-defined type (e.g. an enum) is named after the type itself, as
+        // PG does (`'red'::rainbow` → column "rainbow").
+        custom_type_name(data_type).unwrap_or_else(|| "?column?".into())
+    })
 }
