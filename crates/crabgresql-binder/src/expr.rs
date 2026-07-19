@@ -295,12 +295,56 @@ pub struct ScopeRel {
     offset: usize,
 }
 
+/// One column of a merged join namespace (`JOIN … USING` / `NATURAL JOIN`): the
+/// name it is resolved by and the expression, over the combined row, that
+/// produces its value. For inner/left joins that is the left input's column,
+/// for right joins the right input's, and for full joins `COALESCE(left,
+/// right)` — so the merged column is never the NULL-extended side.
+#[derive(Clone)]
+pub struct VisibleColumn {
+    pub name: String,
+    pub expr: BoundExpr,
+}
+
+/// The outcome of looking a name up in a merged-column view: exactly one match,
+/// none, or several. Callers map each case to their own error wording (a bare
+/// column reference vs. a `USING`/`NATURAL` join column).
+pub(crate) enum VisibleLookup<'a> {
+    Found(&'a BoundExpr),
+    Missing,
+    Ambiguous,
+}
+
+/// Find `name` among a merged view's columns, distinguishing no match from more
+/// than one so the caller can raise the right `42703`/`42702`.
+pub(crate) fn lookup_visible<'a>(cols: &'a [VisibleColumn], name: &str) -> VisibleLookup<'a> {
+    let mut found: Option<&BoundExpr> = None;
+    for col in cols {
+        if col.name == name {
+            if found.is_some() {
+                return VisibleLookup::Ambiguous;
+            }
+            found = Some(&col.expr);
+        }
+    }
+    match found {
+        Some(expr) => VisibleLookup::Found(expr),
+        None => VisibleLookup::Missing,
+    }
+}
+
 /// Name-resolution scope: an ordered list of relations (empty for a FROM-less
 /// SELECT / INSERT VALUES, one for a single-table SELECT, more for a cross
 /// join). A qualified reference addresses one relation by its name or alias;
 /// with an alias the bare table name is not a valid qualifier — as in PG.
 pub struct Scope {
     rels: Vec<ScopeRel>,
+    /// The unqualified-resolution and `*`-expansion view when a `USING`/`NATURAL`
+    /// join has merged columns. `None` keeps the plain behavior (every relation's
+    /// columns in order); `Some` lists the visible columns exactly, with join
+    /// columns merged once. Qualified `q.c` references always use `rels`, so each
+    /// side's own copy of a join column stays addressable.
+    visible: Option<Vec<VisibleColumn>>,
     /// User-defined type/cast view, so an expression cast to/from a `CREATE TYPE`
     /// name resolves and a `WITHOUT FUNCTION` cast can be applied.
     catalog: Arc<dyn TypeCatalog>,
@@ -309,7 +353,7 @@ pub struct Scope {
 impl Scope {
     /// No tables in scope: FROM-less SELECT, INSERT VALUES.
     pub fn empty(catalog: &Arc<dyn TypeCatalog>) -> Scope {
-        Scope { rels: Vec::new(), catalog: catalog.clone() }
+        Scope { rels: Vec::new(), visible: None, catalog: catalog.clone() }
     }
 
     pub fn table(schema: &TableSchema, qualifier: String, catalog: &Arc<dyn TypeCatalog>) -> Scope {
@@ -319,6 +363,7 @@ impl Scope {
                 columns: schema.columns.clone(),
                 offset: 0,
             }],
+            visible: None,
             catalog: catalog.clone(),
         }
     }
@@ -327,6 +372,18 @@ impl Scope {
     /// becomes a relation; offsets are assigned left-to-right so a column's
     /// index is its position in the concatenated row.
     pub fn relations(items: Vec<(String, Vec<Column>)>, catalog: &Arc<dyn TypeCatalog>) -> Scope {
+        Self::relations_with_visible(items, None, catalog)
+    }
+
+    /// Like [`Scope::relations`], but with an explicit merged-column view for a
+    /// FROM clause that contains a `USING`/`NATURAL` join. The `rels` are still
+    /// built from `items` (so qualified `q.c` resolves each side's own column);
+    /// `visible`, when `Some`, drives unqualified resolution and `*` expansion.
+    pub fn relations_with_visible(
+        items: Vec<(String, Vec<Column>)>,
+        visible: Option<Vec<VisibleColumn>>,
+        catalog: &Arc<dyn TypeCatalog>,
+    ) -> Scope {
         let mut offset = 0;
         let mut rels = Vec::with_capacity(items.len());
         for (qualifier, columns) in items {
@@ -338,7 +395,7 @@ impl Scope {
             });
             offset += width;
         }
-        Scope { rels, catalog: catalog.clone() }
+        Scope { rels, visible, catalog: catalog.clone() }
     }
 
     /// The user-defined type/cast view carried through binding.
@@ -351,6 +408,22 @@ impl Scope {
     /// across relations or duplicated within one (e.g. an alias list `v(x, x)`)
     /// — is `42702` (ambiguous); no match is `42703`.
     fn resolve(&self, name: &str) -> Result<BoundExpr, BindError> {
+        // A merged join namespace resolves unqualified names against its visible
+        // columns: the join column appears once (never ambiguous), the merged
+        // expression carrying its combined-row value.
+        if let Some(visible) = &self.visible {
+            return match lookup_visible(visible, name) {
+                VisibleLookup::Found(expr) => Ok(expr.clone()),
+                VisibleLookup::Ambiguous => Err(BindError::new(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    format!("column reference \"{name}\" is ambiguous"),
+                )),
+                VisibleLookup::Missing => Err(BindError::new(
+                    sqlstate::UNDEFINED_COLUMN,
+                    format!("column \"{name}\" does not exist"),
+                )),
+            };
+        }
         let mut found: Option<(usize, PgType)> = None;
         for rel in &self.rels {
             for (local, col) in rel.columns.iter().enumerate() {
@@ -393,6 +466,23 @@ impl Scope {
     /// column paired with a `ColumnRef` at its combined-row index. Duplicate
     /// output names are allowed, as in PG.
     pub fn expand_wildcard(&self) -> Vec<(crate::OutputColumn, BoundExpr)> {
+        // With a merged join namespace, `*` follows the visible columns: merged
+        // join columns first (in clause order), then each input's remaining
+        // columns — the join column appearing exactly once, as in PG.
+        if let Some(visible) = &self.visible {
+            return visible
+                .iter()
+                .map(|col| {
+                    (
+                        crate::OutputColumn {
+                            name: col.name.clone(),
+                            ty: col.expr.ty(),
+                        },
+                        col.expr.clone(),
+                    )
+                })
+                .collect();
+        }
         let mut out = Vec::new();
         for rel in &self.rels {
             expand_rel(rel, &mut out);
@@ -1736,7 +1826,7 @@ fn bind_binary(
 /// `bind_binary` so a simple `CASE operand WHEN v` can reuse the exact `=`
 /// resolution (unknown-literal handling, numeric promotion, "operator does not
 /// exist" errors) that a written `operand = v` gets.
-fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindError> {
+pub(crate) fn bind_binary_op(op: BinOp, lb: Binding, rb: Binding) -> Result<Binding, BindError> {
     if op.is_logic() {
         let left = to_bool_operand(lb, op.sql_symbol())?;
         let right = to_bool_operand(rb, op.sql_symbol())?;
@@ -2720,7 +2810,7 @@ fn unify_types(
 /// not `float8`). When neither or both cast implicitly, fall back to numeric
 /// preferred-type promotion (`float8` dominates). This deliberately differs from
 /// `unify_types` (operator resolution), where `real` + `int4` resolves to `float8`.
-fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
+pub(crate) fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
     if a == b {
         return Some(a);
     }
@@ -2803,7 +2893,7 @@ fn common_numeric(a: PgType, b: PgType) -> Option<PgType> {
 /// Coerce an expression to `ty`. Constant operands fold (and range-check) at
 /// bind time, as PG's planner does; non-constants (and any cast to text, which
 /// needs the session `extra_float_digits`) get a runtime `Coerce`.
-fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, BindError> {
+pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, BindError> {
     if expr.ty() == ty {
         return Ok(expr);
     }
