@@ -23,6 +23,7 @@ pub mod timetz;
 pub mod to_char;
 pub mod tz;
 pub mod uuid;
+pub mod wire;
 
 pub use interval::Interval;
 pub use net::Inet;
@@ -163,6 +164,44 @@ impl PgType {
             PgType::Lseg => oid::LSEG,
             PgType::User(oid) => oid,
         }
+    }
+
+    /// Resolve a built-in type OID back to its [`PgType`], the reverse of
+    /// [`PgType::oid`]. Used to map the parameter type OIDs a `Parse` message
+    /// declares. Returns `None` for `0` ("unspecified", to be inferred) and any
+    /// OID this build has no built-in type for. User-type OIDs are not resolved
+    /// here — a `Parse` cannot name a `CREATE TYPE` OID as a parameter type.
+    pub fn from_oid(oid: u32) -> Option<PgType> {
+        Some(match oid {
+            oid::BOOL => PgType::Bool,
+            oid::INT2 => PgType::Int2,
+            oid::INT4 => PgType::Int4,
+            oid::INT8 => PgType::Int8,
+            oid::FLOAT4 => PgType::Float4,
+            oid::FLOAT8 => PgType::Float8,
+            oid::NUMERIC => PgType::Numeric,
+            oid::MONEY => PgType::Money,
+            oid::TEXT => PgType::Text,
+            oid::VARCHAR => PgType::Varchar,
+            oid::BPCHAR => PgType::Bpchar,
+            oid::NAME => PgType::Name,
+            oid::OID => PgType::Oid,
+            oid::BYTEA => PgType::Bytea,
+            oid::BIT => PgType::Bit,
+            oid::VARBIT => PgType::Varbit,
+            oid::DATE => PgType::Date,
+            oid::TIME => PgType::Time,
+            oid::TIMETZ => PgType::TimeTz,
+            oid::TIMESTAMP => PgType::Timestamp,
+            oid::TIMESTAMPTZ => PgType::TimestampTz,
+            oid::INTERVAL => PgType::Interval,
+            oid::UUID => PgType::Uuid,
+            oid::INET => PgType::Inet,
+            oid::CIDR => PgType::Cidr,
+            oid::MACADDR => PgType::Macaddr,
+            oid::MACADDR8 => PgType::Macaddr8,
+            _ => return None,
+        })
     }
 
     /// `pg_type.typlen`: byte width for fixed-size types, -1 for varlena.

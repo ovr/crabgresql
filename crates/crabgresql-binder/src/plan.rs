@@ -13,9 +13,10 @@ use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TypeCat
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
-    BinOp, Binding, BoundExpr, Scope, VisibleColumn, VisibleLookup, bind_binary_op,
+    BinOp, Binding, BoundExpr, ParamCtx, Scope, VisibleColumn, VisibleLookup, bind_binary_op,
     bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column,
-    lookup_visible, merge_types, normalize_ident, output_name, to_bool_operand, unify_value_column,
+    lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none, to_bool_operand,
+    unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -307,12 +308,196 @@ struct CteRelation {
 /// plus any earlier siblings in the same clause.
 type CteEnv = HashMap<String, CteRelation>;
 
+/// Replace every `$n` placeholder ([`BoundExpr::Param`]) in a bound plan with a
+/// constant carrying the value bound for that parameter, in place. Run by the
+/// extended-query executor after a portal's parameters are decoded, so the
+/// downstream planner/executor see an ordinary parameter-free plan and need no
+/// notion of a parameter list. `params` is indexed by parameter number − 1; a
+/// `Param` whose index is past the list is left untouched (the executor reports
+/// the missing binding), which cannot happen once Bind validates the count.
+pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
+    match plan {
+        LogicalPlan::Values {
+            rows, predicate, ..
+        } => {
+            for row in rows {
+                subst_exprs(row, params);
+            }
+            subst_opt(predicate, params);
+        }
+        LogicalPlan::Query {
+            projections,
+            predicate,
+            ..
+        } => {
+            subst_exprs(projections, params);
+            subst_opt(predicate, params);
+        }
+        LogicalPlan::Subquery {
+            source,
+            projections,
+            predicate,
+            ..
+        } => {
+            substitute_params(source, params);
+            subst_exprs(projections, params);
+            subst_opt(predicate, params);
+        }
+        LogicalPlan::TableFunction {
+            args,
+            projections,
+            predicate,
+            ..
+        } => {
+            subst_exprs(args, params);
+            subst_exprs(projections, params);
+            subst_opt(predicate, params);
+        }
+        LogicalPlan::Join {
+            source,
+            projections,
+            predicate,
+            ..
+        } => {
+            subst_join(source, params);
+            subst_exprs(projections, params);
+            subst_opt(predicate, params);
+        }
+        LogicalPlan::Limit { source, .. } => substitute_params(source, params),
+        LogicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            projections,
+            ..
+        } => {
+            if let AggInput::Join(join) = input {
+                subst_join(join, params);
+            }
+            subst_opt(predicate, params);
+            subst_exprs(group_exprs, params);
+            for agg in aggregates {
+                if let Some(arg) = &mut agg.arg {
+                    subst_expr(arg, params);
+                }
+            }
+            subst_opt(having, params);
+            subst_exprs(projections, params);
+        }
+        LogicalPlan::Insert { rows, .. } => {
+            for row in rows {
+                subst_exprs(row, params);
+            }
+        }
+        LogicalPlan::Update {
+            predicate,
+            assignments,
+            ..
+        } => {
+            subst_opt(predicate, params);
+            for (_, expr) in assignments {
+                subst_expr(expr, params);
+            }
+        }
+        LogicalPlan::Delete { predicate, .. } => subst_opt(predicate, params),
+    }
+}
+
+fn subst_join(join: &mut JoinExpr, params: &[Value]) {
+    match join {
+        JoinExpr::Input { input, .. } => match input {
+            JoinInput::Scan(_) => {}
+            JoinInput::Subplan(plan) => substitute_params(plan, params),
+            JoinInput::TableFunction { args, .. } => subst_exprs(args, params),
+        },
+        JoinExpr::Join {
+            left,
+            right,
+            predicate,
+            ..
+        } => {
+            subst_join(left, params);
+            subst_join(right, params);
+            subst_opt(predicate, params);
+        }
+    }
+}
+
+fn subst_opt(expr: &mut Option<BoundExpr>, params: &[Value]) {
+    if let Some(e) = expr {
+        subst_expr(e, params);
+    }
+}
+
+fn subst_exprs(exprs: &mut [BoundExpr], params: &[Value]) {
+    for e in exprs {
+        subst_expr(e, params);
+    }
+}
+
+/// Rewrite one expression tree in place, replacing each `Param` leaf with the
+/// bound value as a `Const`. The value was decoded using the parameter's
+/// resolved type, so it already matches the node's `ty`.
+fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
+    match expr {
+        BoundExpr::Param { index, ty } => {
+            if let Some(value) = params.get(*index) {
+                *expr = BoundExpr::Const {
+                    value: value.clone(),
+                    ty: *ty,
+                };
+            }
+        }
+        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } => {}
+        BoundExpr::Unary { expr, .. } => subst_expr(expr, params),
+        BoundExpr::Binary { left, right, .. } => {
+            subst_expr(left, params);
+            subst_expr(right, params);
+        }
+        BoundExpr::IsNull { expr, .. } => subst_expr(expr, params),
+        BoundExpr::Coerce { expr, .. } => subst_expr(expr, params),
+        BoundExpr::Reinterpret { expr, .. } => subst_expr(expr, params),
+        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+            subst_exprs(args, params)
+        }
+        BoundExpr::Case { whens, else_, .. } => {
+            for (cond, result) in whens {
+                subst_expr(cond, params);
+                subst_expr(result, params);
+            }
+            if let Some(e) = else_ {
+                subst_expr(e, params);
+            }
+        }
+        BoundExpr::Aggregate { arg, .. } => {
+            if let Some(arg) = arg {
+                subst_expr(arg, params);
+            }
+        }
+    }
+}
+
 pub fn bind_query(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
     query: &ast::Query,
 ) -> Result<LogicalPlan, BindError> {
-    bind_query_scoped(engine, catalog, query, &CteEnv::new())
+    bind_query_with_params(engine, catalog, query, &param_ctx_none())
+}
+
+/// Bind a top-level query for the extended query protocol, threading a shared
+/// parameter context so `$n` placeholders are typed from context (and unify
+/// across the whole statement). The caller reads the inferred types via
+/// [`crate::param_types`] after a successful bind.
+pub fn bind_query_with_params(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    query: &ast::Query,
+    params: &ParamCtx,
+) -> Result<LogicalPlan, BindError> {
+    bind_query_scoped(engine, catalog, params, query, &CteEnv::new())
 }
 
 /// Bind a query with a set of visible CTEs. Recurses for CTE bodies and derived
@@ -320,6 +505,7 @@ pub fn bind_query(
 fn bind_query_scoped(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     query: &ast::Query,
     outer: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
@@ -327,10 +513,10 @@ fn bind_query_scoped(
     // common no-CTE case binds against `outer` directly.
     match &query.with {
         Some(with) => {
-            let ctes = bind_ctes(engine, catalog, with, outer)?;
-            bind_query_body(engine, catalog, query, &ctes)
+            let ctes = bind_ctes(engine, catalog, params, with, outer)?;
+            bind_query_body(engine, catalog, params, query, &ctes)
         }
-        None => bind_query_body(engine, catalog, query, outer),
+        None => bind_query_body(engine, catalog, params, query, outer),
     }
 }
 
@@ -338,6 +524,7 @@ fn bind_query_scoped(
 fn bind_query_body(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     query: &ast::Query,
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
@@ -345,9 +532,9 @@ fn bind_query_body(
     let inner = match query.body.as_ref() {
         ast::SetExpr::Select(select) => {
             reject_unsupported_select_clauses(select)?;
-            bind_select(engine, catalog, select, &query.order_by, ctes)
+            bind_select(engine, catalog, params, select, &query.order_by, ctes)
         }
-        ast::SetExpr::Values(values) => bind_values_query(catalog, values, &query.order_by),
+        ast::SetExpr::Values(values) => bind_values_query(catalog, params, values, &query.order_by),
         other => Err(BindError::feature_not_supported(format!(
             "query form is not supported yet: {other}"
         ))),
@@ -451,6 +638,7 @@ fn const_i64(expr: &ast::Expr) -> Option<Option<i64>> {
 fn bind_ctes(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     with: &ast::With,
     outer: &CteEnv,
 ) -> Result<CteEnv, BindError> {
@@ -470,7 +658,7 @@ fn bind_ctes(
                 format!("WITH query name \"{name}\" specified more than once"),
             ));
         }
-        let plan = bind_query_scoped(engine, catalog, &cte.query, &ctes)?;
+        let plan = bind_query_scoped(engine, catalog, params, &cte.query, &ctes)?;
         let mut columns = output_columns_of(&plan)?;
         apply_alias_columns(&mut columns, &cte.alias.columns, &with_query_subject(&name))?;
         ctes.insert(name, CteRelation { columns, plan });
@@ -482,19 +670,20 @@ fn bind_ctes(
 fn bind_select(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
     if select.from.is_empty() {
-        return bind_values_select(catalog, select, order_by);
+        return bind_values_select(catalog, params, select, order_by);
     }
     let BoundFrom {
         source,
         relations,
         visible,
-    } = bind_from_clause(engine, catalog, &select.from, ctes)?;
-    let scope = Scope::relations_with_visible(relations, visible, catalog);
+    } = bind_from_clause(engine, catalog, params, &select.from, ctes)?;
+    let scope = Scope::relations_with_visible(relations, visible, catalog, params);
     let body = bind_select_body(select, order_by, &scope)?;
     if let Some(agg) = body.aggregation {
         let input = match source {
@@ -610,6 +799,7 @@ impl BoundFromItem {
 fn bind_from_item(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     relation: &ast::TableFactor,
     ctes: &CteEnv,
 ) -> Result<BoundFromItem, BindError> {
@@ -628,7 +818,8 @@ fn bind_from_item(
             }
             let fname = object_name_to_table_name(name)?;
             let arg_exprs = positional_arg_exprs(&fn_args.args)?;
-            let (func, args) = bind_table_fn_call(&fname, &arg_exprs, &Scope::empty(catalog))?;
+            let (func, args) =
+                bind_table_fn_call(&fname, &arg_exprs, &Scope::empty(catalog, params))?;
             let qualifier = relation_qualifier(alias, &fname);
             let mut columns: Vec<OutputColumn> = func
                 .columns()
@@ -700,7 +891,7 @@ fn bind_from_item(
                 ));
             };
             let qualifier = normalize_ident(&alias.name);
-            let inner = bind_query_scoped(engine, catalog, subquery, ctes)?;
+            let inner = bind_query_scoped(engine, catalog, params, subquery, ctes)?;
             let mut columns = output_columns_of(&inner)?;
             apply_alias_columns(&mut columns, &alias.columns, &table_subject(&qualifier))?;
             Ok(BoundFromItem {
@@ -742,6 +933,7 @@ fn aliased_qualifier(
 fn bind_from_clause(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     from: &[ast::TableWithJoins],
     ctes: &CteEnv,
 ) -> Result<BoundFrom, BindError> {
@@ -758,7 +950,7 @@ fn bind_from_clause(
             source: group_source,
             relations: group_relations,
             visible: group_visible,
-        } = bind_table_with_joins(engine, catalog, table, ctes)?;
+        } = bind_table_with_joins(engine, catalog, params, table, ctes)?;
         for (qualifier, _) in &group_relations {
             ensure_unique_qualifier(&mut seen, qualifier)?;
         }
@@ -815,6 +1007,10 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
         },
         BoundExpr::Const { value, ty } => BoundExpr::Const {
             value: value.clone(),
+            ty: *ty,
+        },
+        BoundExpr::Param { index, ty } => BoundExpr::Param {
+            index: *index,
             ty: *ty,
         },
         BoundExpr::Unary { op, expr } => BoundExpr::Unary {
@@ -891,10 +1087,12 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
 fn bind_table_with_joins(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     table: &ast::TableWithJoins,
     ctes: &CteEnv,
 ) -> Result<BoundFrom, BindError> {
-    let mut bound = bind_from_item(engine, catalog, &table.relation, ctes)?.into_bound_from();
+    let mut bound =
+        bind_from_item(engine, catalog, params, &table.relation, ctes)?.into_bound_from();
     let mut seen: HashSet<String> = bound
         .relations
         .iter()
@@ -914,7 +1112,8 @@ fn bind_table_with_joins(
                 "GLOBAL JOIN is not supported yet",
             ));
         }
-        let right = bind_from_item(engine, catalog, &join.relation, ctes)?.into_bound_from();
+        let right =
+            bind_from_item(engine, catalog, params, &join.relation, ctes)?.into_bound_from();
         let right_qualifier = &right.relations[0].0;
         ensure_unique_qualifier(&mut seen, right_qualifier)?;
         let right_width = right.source.width();
@@ -936,7 +1135,8 @@ fn bind_table_with_joins(
                     ov.extend(default_visible(&right.relations, left_width));
                     ov
                 });
-                let scope = Scope::relations_with_visible(on_relations, on_visible, catalog);
+                let scope =
+                    Scope::relations_with_visible(on_relations, on_visible, catalog, params);
                 let binding = bind_expr(on, &scope)?;
                 if matches!(&binding, Binding::Typed(expr) if expr.contains_aggregate()) {
                     return Err(BindError::new(
@@ -1213,6 +1413,7 @@ fn join_kind_and_constraint(
 /// `column1..columnN`; each column resolves to a common type across all rows.
 fn bind_values_query(
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     values: &ast::Values,
     order_by: &Option<ast::OrderBy>,
 ) -> Result<LogicalPlan, BindError> {
@@ -1220,7 +1421,7 @@ fn bind_values_query(
         return Err(BindError::syntax("VALUES lists must not be empty"));
     }
     let width = values.rows[0].content.len();
-    let scope = Scope::empty(catalog);
+    let scope = Scope::empty(catalog, params);
     // Bind every cell, grouping bindings by column for type unification.
     let mut columns_of_bindings: Vec<Vec<crate::Binding>> = vec![Vec::new(); width];
     for row in &values.rows {
@@ -1269,8 +1470,12 @@ fn bind_values_query(
     })
 }
 
-/// The output columns a query plan produces (for CTE/derived-table schemas).
-fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindError> {
+/// The output columns a query plan produces (for CTE/derived-table schemas,
+/// and the extended protocol's `Describe`, which needs a statement's
+/// `RowDescription` without executing it). A data-modifying plan has no result
+/// row shape (no `RETURNING` yet) and returns an error the caller treats as
+/// "NoData".
+pub fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindError> {
     match plan {
         LogicalPlan::Values { columns, .. }
         | LogicalPlan::Query { columns, .. }
@@ -1538,10 +1743,11 @@ fn reject_unsupported_select_clauses(select: &ast::Select) -> Result<(), BindErr
 /// (`SELECT 1 WHERE false`) and binds in the empty scope.
 fn bind_values_select(
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
 ) -> Result<LogicalPlan, BindError> {
-    let scope = Scope::empty(catalog);
+    let scope = Scope::empty(catalog, params);
     let mut columns = Vec::new();
     let mut row = Vec::new();
     for item in &select.projection {
@@ -1889,7 +2095,9 @@ fn rewrite_over_aggregate(
                 scope.column_label(index)
             ),
         )),
-        c @ BoundExpr::Const { .. } => Ok(c),
+        // A bind parameter is a per-execution constant (like `Const`): it is the
+        // same value for every group, so it passes through unchanged.
+        c @ (BoundExpr::Const { .. } | BoundExpr::Param { .. }) => Ok(c),
         BoundExpr::Unary { op, expr } => Ok(BoundExpr::Unary {
             op,
             expr: Box::new(rewrite_over_aggregate(
@@ -2051,6 +2259,18 @@ pub fn bind_insert(
     catalog: &Arc<dyn TypeCatalog>,
     insert: &ast::Insert,
 ) -> Result<LogicalPlan, BindError> {
+    bind_insert_with_params(engine, catalog, insert, &param_ctx_none())
+}
+
+/// [`bind_insert`] for the extended query protocol: `$n` placeholders in the
+/// VALUES cells take their type from the target column and unify across the
+/// statement via the shared `params` context.
+pub fn bind_insert_with_params(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    insert: &ast::Insert,
+    params: &ParamCtx,
+) -> Result<LogicalPlan, BindError> {
     let target = match &insert.table {
         ast::TableObject::TableName(name) => name,
         other => {
@@ -2152,7 +2372,7 @@ pub fn bind_insert(
 
     // VALUES cells bind in the empty scope: a column reference in VALUES is
     // an undefined column, as in PG.
-    let scope = Scope::empty(catalog);
+    let scope = Scope::empty(catalog, params);
     let first_width = value_rows.first().map_or(0, |row| row.len());
     let mut rows = Vec::with_capacity(value_rows.len());
     for value_row in value_rows {
@@ -2195,6 +2415,17 @@ pub fn bind_update(
     catalog: &Arc<dyn TypeCatalog>,
     update: &ast::Update,
 ) -> Result<LogicalPlan, BindError> {
+    bind_update_with_params(engine, catalog, update, &param_ctx_none())
+}
+
+/// [`bind_update`] for the extended query protocol: `$n` placeholders in SET
+/// and WHERE take their type from context via the shared `params`.
+pub fn bind_update_with_params(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    update: &ast::Update,
+    params: &ParamCtx,
+) -> Result<LogicalPlan, BindError> {
     let unsupported: Option<&str> = if update.from.is_some() {
         Some("UPDATE ... FROM")
     } else if update.returning.is_some() {
@@ -2219,7 +2450,7 @@ pub fn bind_update(
     let (table, qualifier) = open_write_relation(engine, &update.table.relation)?;
     let schema = table.schema().clone();
     let table_name = schema.name.clone();
-    let scope = Scope::table(&schema, qualifier, catalog);
+    let scope = Scope::table(&schema, qualifier, catalog, params);
 
     // SET expressions bind against the table schema: they all see the OLD
     // row, so `SET a = b, b = a` swaps.
@@ -2267,6 +2498,17 @@ pub fn bind_delete(
     catalog: &Arc<dyn TypeCatalog>,
     delete: &ast::Delete,
 ) -> Result<LogicalPlan, BindError> {
+    bind_delete_with_params(engine, catalog, delete, &param_ctx_none())
+}
+
+/// [`bind_delete`] for the extended query protocol: `$n` placeholders in the
+/// WHERE clause take their type from context via the shared `params`.
+pub fn bind_delete_with_params(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    delete: &ast::Delete,
+    params: &ParamCtx,
+) -> Result<LogicalPlan, BindError> {
     let unsupported: Option<&str> = if !delete.tables.is_empty() {
         Some("multi-table DELETE")
     } else if delete.using.is_some() {
@@ -2299,7 +2541,7 @@ pub fn bind_delete(
 
     let (table, qualifier) = open_write_relation(engine, &target.relation)?;
     let schema = table.schema().clone();
-    let scope = Scope::table(&schema, qualifier, catalog);
+    let scope = Scope::table(&schema, qualifier, catalog, params);
     let predicate = bind_where(&delete.selection, &scope)?;
     Ok(LogicalPlan::Delete { table, predicate })
 }
@@ -4356,5 +4598,103 @@ mod tests {
     fn non_constant_limit_stays_0a000() {
         let e = bind_err("SELECT id FROM t LIMIT id");
         assert_eq!(e.code, "0A000");
+    }
+
+    // --- bind-parameter ($1, $2, …) inference -------------------------------
+
+    use crate::expr::{ParamCtx, param_ctx_extended, param_types};
+
+    /// Bind `sql` for the extended protocol with the given declared parameter
+    /// types, returning both the plan result and the shared context (so tests
+    /// can read back the inferred types).
+    fn bind_params(sql: &str, declared: Vec<Option<PgType>>) -> (Result<LogicalPlan, BindError>, ParamCtx) {
+        let engine = engine_with_table();
+        let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+        let ctx = param_ctx_extended(declared);
+        let stmts = crabgresql_parser::parse(sql).unwrap();
+        let plan = match &stmts[0] {
+            ast::Statement::Query(q) => bind_query_with_params(&engine, &catalog, q, &ctx),
+            other => panic!("unexpected statement: {other}"),
+        };
+        (plan, ctx)
+    }
+
+    #[test]
+    fn declared_param_binds_and_reports_its_type() {
+        // A client-declared int4 `$1` binds directly to a Param node.
+        let (plan, ctx) = bind_params("SELECT $1", vec![Some(PgType::Int4)]);
+        let plan = plan.expect("declared $1 binds");
+        assert_eq!(param_types(&ctx), vec![Some(PgType::Int4)]);
+        let LogicalPlan::Values { rows, .. } = plan else {
+            panic!("expected Values for a FROM-less SELECT");
+        };
+        assert_eq!(
+            rows[0][0],
+            BoundExpr::Param { index: 0, ty: PgType::Int4 }
+        );
+    }
+
+    #[test]
+    fn undeclared_param_infers_type_from_comparison() {
+        // `$1 = big` against `big int8` deduces $1 as int8.
+        let (plan, ctx) = bind_params("SELECT $1 = big FROM t", vec![]);
+        plan.expect("$1 = big binds");
+        assert_eq!(param_types(&ctx), vec![Some(PgType::Int8)]);
+    }
+
+    #[test]
+    fn undeclared_param_infers_type_from_cast() {
+        let (plan, ctx) = bind_params("SELECT $1::int4", vec![]);
+        plan.expect("$1::int4 binds");
+        assert_eq!(param_types(&ctx), vec![Some(PgType::Int4)]);
+    }
+
+    #[test]
+    fn param_reused_across_sites_unifies() {
+        // The same `$1` appears twice; both sites agree on int8.
+        let (plan, ctx) = bind_params("SELECT $1 = big, $1 = big FROM t", vec![]);
+        plan.expect("repeated $1 binds");
+        assert_eq!(param_types(&ctx), vec![Some(PgType::Int8)]);
+    }
+
+    /// The bind error for a param query, panicking if it unexpectedly succeeds
+    /// (`LogicalPlan` has no `Debug`, so `Result::expect_err` is unavailable).
+    fn param_err(sql: &str, declared: Vec<Option<PgType>>) -> BindError {
+        match bind_params(sql, declared).0 {
+            Err(e) => e,
+            Ok(_) => panic!("expected a bind error for: {sql}"),
+        }
+    }
+
+    #[test]
+    fn undetermined_param_is_42p18() {
+        // A bare `$1` with no context and no declaration cannot be typed.
+        let err = param_err("SELECT $1", vec![]);
+        assert_eq!(err.code, "42P18");
+        assert_eq!(
+            err.message,
+            "could not determine data type of parameter $1"
+        );
+    }
+
+    #[test]
+    fn conflicting_param_deductions_are_42p18() {
+        // `$1 IN (big, name)` clones the still-untyped `$1` for each comparison,
+        // so one arm deduces int8 and the other text before either is fixed —
+        // an inconsistency PG reports as 42P18.
+        let err = param_err("SELECT $1 IN (big, name) FROM t", vec![]);
+        assert_eq!(err.code, "42P18");
+        assert_eq!(
+            err.message,
+            "inconsistent types deduced for parameter $1"
+        );
+    }
+
+    #[test]
+    fn param_in_simple_query_is_42p02() {
+        // The simple-query entry point forbids parameters entirely.
+        let err = bind_err("SELECT $1");
+        assert_eq!(err.code, "42P02");
+        assert_eq!(err.message, "there is no parameter $1");
     }
 }
