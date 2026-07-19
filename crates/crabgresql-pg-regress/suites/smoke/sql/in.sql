@@ -22,6 +22,15 @@ SELECT 1 IN (1.0, 2.5) AS int_numeric;
 SELECT '2' IN (1, 2, 3) AS text_lit_left;
 -- mixed integer widths and varchar/text also unify to a common type
 SELECT 2 IN (1::int8, 2::int8) AS int_int8, 'b'::varchar IN ('a', 'b') AS varchar_text;
+-- the tested expression keeps its own type: `real` vs an integer element compares
+-- in float8 (like `x = v`), not float4, so a value past the float4 mantissa differs
+SELECT 16777217::real IN (16777217) AS real_vs_int, 16777217 IN (16777217::real) AS int_vs_real;
+-- the list itself resolves to one type first (PG's ARRAY[...] element type): the
+-- integer rounds into `real`, so it no longer equals the un-rounded tested int
+SELECT 16777217 IN (16777217, 0::float4) AS list_rounds, 42 IN (42, 1::float4) AS exact_ok;
+-- temporal lists unify too: a date compared against a timestamp list widens to timestamp
+SELECT DATE '2020-01-01' IN (DATE '2020-06-01', DATE '2020-01-01') AS date_in,
+       DATE '2020-01-01' IN (TIMESTAMP '2020-01-01 00:00:00') AS date_ts;
 -- membership over a table column, evaluated once per row (NULL id -> NULL)
 CREATE TABLE nums (id integer, label text);
 INSERT INTO nums VALUES (1, 'a'), (2, 'b'), (3, 'c'), (NULL, 'd');
@@ -34,6 +43,8 @@ SELECT label FROM nums WHERE id NOT IN (2) ORDER BY label;
 SELECT label FROM nums WHERE id NOT IN (2, NULL) ORDER BY label;
 -- error: no common type for the list falls back to per-pair equality
 SELECT 1 IN (1, 'foo'::text);
+-- error: NOT IN takes the same fallback, chaining <> instead of =
+SELECT 1 NOT IN (1, 'foo'::text);
 -- error: an untyped list literal that does not fit the resolved type
 SELECT 1 IN (2, 'x');
 -- error: an empty list is a syntax error

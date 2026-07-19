@@ -1503,57 +1503,71 @@ fn bind_in_list(
         }));
     }
 
-    // PG's `transformAExprIn` resolves a single common type across the tested
-    // expression and the whole list (its `= ANY(ARRAY[...])` element type), and
-    // compares every element in that type. When the list has no common type it
-    // falls back to a per-pair OR-of-equals, whose per-pair operator resolution
-    // reproduces PG's `operator does not exist: X = Y` error for that case.
+    // PG lowers `x IN (list)` to `x = ANY(ARRAY[list])`: the list is coerced to
+    // one common type (its array element type, which excludes the tested
+    // expression), then each `x = element` resolves as an operator — so the left
+    // keeps its own type and the comparison still promotes (`int`/`real` ->
+    // `float8`, temporal/money handling), matching `x = v`. Coercing the elements
+    // to the list type first is observable: an int that overflows a float4
+    // mantissa rounds when the list type is `real`, exactly as PG's array does.
+    let elem_target = match in_list_type(&items) {
+        ListType::Uniform(ty) => Some(ty),
+        // `x IN (NULL)` settles the untyped elements on the tested expression's
+        // type (`text` when it too is untyped), so `1 IN (NULL)` compares in int
+        // and `NULL IN (NULL)` in text — never the two-unknown ambiguity error.
+        ListType::AllUnknown => Some(binding_typed_ty(&left).unwrap_or(PgType::Text)),
+        // An incompatible list leaves each element as-is so the pair resolves on
+        // its own — PG's OR fallback and its `operator does not exist` error.
+        ListType::Incompatible => None,
+    };
     let mut acc: Option<Binding> = None;
-    match in_common_type(&left, &items) {
-        Some(ty) => {
-            // Coerce the left operand once and each element to the common type,
-            // then reuse `bind_binary_op` so temporal/money `=` handling still
-            // applies. With both sides already at `ty` the unify step is a no-op.
-            let left = Binding::Typed(resolve_operand(&left, ty)?);
-            for item in &items {
-                let right = Binding::Typed(resolve_operand(item, ty)?);
-                let comparison = bind_binary_op(cmp, left.clone(), right)?;
-                acc = Some(match acc {
-                    None => comparison,
-                    Some(prev) => bind_binary_op(chain, prev, comparison)?,
-                });
-            }
-        }
-        None => {
-            for item in items {
-                let comparison = bind_binary_op(cmp, left.clone(), item)?;
-                acc = Some(match acc {
-                    None => comparison,
-                    Some(prev) => bind_binary_op(chain, prev, comparison)?,
-                });
-            }
-        }
+    for item in &items {
+        let right = match elem_target {
+            Some(ty) => Binding::Typed(resolve_operand(item, ty)?),
+            None => item.clone(),
+        };
+        let comparison = bind_binary_op(cmp, left.clone(), right)?;
+        acc = Some(match acc {
+            None => comparison,
+            Some(prev) => bind_binary_op(chain, prev, comparison)?,
+        });
     }
     Ok(acc.expect("non-empty list yields at least one comparison"))
 }
 
-/// The common type PG's `transformAExprIn` resolves across the tested expression
-/// and the whole `IN` list — the element type of its `= ANY(ARRAY[...])` form —
-/// folding `merge_types` (PG's `select_common_type`). `None` when a pair has no
-/// common type: an incompatible list PG resolves through its per-pair
-/// OR-of-equals fallback instead. An all-unknown set (`NULL IN (NULL)`) defaults
-/// to `text`, as PG does for unknown literals.
-fn in_common_type(left: &Binding, items: &[Binding]) -> Option<PgType> {
+/// How an `IN` list resolves to the element type of PG's `= ANY(ARRAY[...])`.
+enum ListType {
+    /// The typed elements share this common type; coerce every element to it.
+    Uniform(PgType),
+    /// No typed elements (`x IN (NULL)`); the caller falls back to the tested
+    /// expression's type (or `text` when it too is untyped).
+    AllUnknown,
+    /// The typed elements have no common type; leave each element as-is so the
+    /// pair resolves on its own, reproducing PG's `operator does not exist` error.
+    Incompatible,
+}
+
+/// Fold `merge_types` (PG's `select_common_type`) over the `IN` list's typed
+/// elements — the array element type of PG's `= ANY(ARRAY[...])`, which excludes
+/// the tested expression (so `x IN (1, 0::float4)` rounds the `1` to `real` as
+/// PG's array does).
+fn in_list_type(items: &[Binding]) -> ListType {
     let mut common: Option<PgType> = None;
-    for b in std::iter::once(left).chain(items) {
+    for b in items {
         if let Some(ty) = binding_typed_ty(b) {
             common = Some(match common {
                 None => ty,
-                Some(prev) => merge_types(prev, ty)?,
+                Some(prev) => match merge_types(prev, ty) {
+                    Some(m) => m,
+                    None => return ListType::Incompatible,
+                },
             });
         }
     }
-    Some(common.unwrap_or(PgType::Text))
+    match common {
+        Some(ty) => ListType::Uniform(ty),
+        None => ListType::AllUnknown,
+    }
 }
 
 fn bind_binary(
