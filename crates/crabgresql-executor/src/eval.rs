@@ -217,6 +217,26 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         }
         // macaddr/macaddr8: raw byte order (PG's `macaddr_cmp`).
         PgType::Macaddr | PgType::Macaddr8 => macaddr_bytes(l).cmp(macaddr_bytes(r)),
+        // Query-time user-type ordering is currently defined only for enums.
+        // Keep this total for defensive callers: malformed/mixed values use
+        // their actual non-user representation or type OID, never an unchecked
+        // NULL unwrap or recursive redispatch through `PgType::User`.
+        PgType::User(_) => match (l, r) {
+            (
+                Value::Enum { type_oid: a_ty, ordinal: a, .. },
+                Value::Enum { type_oid: b_ty, ordinal: b, .. },
+            ) => a_ty.cmp(b_ty).then_with(|| a.cmp(b)),
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
+            _ => match (l.pg_type(), r.pg_type()) {
+                (Some(a), Some(b)) if a == b && !matches!(a, PgType::User(_)) => {
+                    compare_values(a, l, r)
+                }
+                (Some(a), Some(b)) => a.oid().cmp(&b.oid()),
+                _ => Ordering::Equal,
+            },
+        },
         other => unreachable!("comparison not supported for {other:?}"),
     }
 }
@@ -524,4 +544,47 @@ fn eval_arith_numeric(op: BinOp, a: &Numeric, b: &Numeric) -> Result<Value, Exec
 
 fn numeric_error(e: crabgresql_types::numeric::NumErr) -> ExecError {
     ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
+}
+
+#[cfg(test)]
+mod enum_cmp_tests {
+    use super::compare_values;
+    use crabgresql_types::{PgType, Value};
+    use std::cmp::Ordering;
+
+    fn e(ordinal: u32, label: &str) -> Value {
+        Value::Enum {
+            type_oid: 16384,
+            ordinal,
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn enum_orders_by_definition_ordinal_not_label() {
+        let ty = PgType::User(16384);
+        // 'red'(0) < 'green'(3), even though "green" < "red" alphabetically.
+        assert_eq!(compare_values(ty, &e(0, "red"), &e(3, "green")), Ordering::Less);
+        assert_eq!(compare_values(ty, &e(3, "green"), &e(0, "red")), Ordering::Greater);
+        assert_eq!(compare_values(ty, &e(2, "yellow"), &e(2, "yellow")), Ordering::Equal);
+    }
+
+    #[test]
+    fn malformed_user_comparisons_are_total() {
+        let ty = PgType::User(16384);
+        assert_eq!(compare_values(ty, &Value::Null, &e(0, "red")), Ordering::Less);
+        assert_eq!(compare_values(ty, &e(0, "red"), &Value::Int4(1)), Ordering::Greater);
+        assert_eq!(
+            compare_values(
+                ty,
+                &e(0, "red"),
+                &Value::Enum {
+                    type_oid: 16385,
+                    ordinal: 0,
+                    label: "other".into(),
+                },
+            ),
+            Ordering::Less
+        );
+    }
 }

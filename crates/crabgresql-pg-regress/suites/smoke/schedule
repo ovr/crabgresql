@@ -4,6 +4,7 @@ test: aggregate
 test: errors
 test: cast
 test: create_type
+test: enum
 test: drop_table
 test: date
 test: time

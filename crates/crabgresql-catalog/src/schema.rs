@@ -11,7 +11,11 @@
 use crabgresql_storage_api::{Column, IndexConstraint, IndexMethod, TableSchema};
 use crabgresql_types::{PgType, Value};
 
-use crate::{CatalogIndex, CatalogRelation, PG_CAST_ROWS, PG_TYPE_ROWS};
+use crate::{CatalogIndex, CatalogRelation, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS};
+
+/// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
+/// built-in ranges so a per-label OID never collides with a type/relation OID.
+const FIRST_ENUM_OID: u32 = 0x8000_0000;
 
 /// A `"char"`/`regproc` column: a single- or short-name catalog column we render
 /// as `text` for now. Kept as a named alias so the deviation is greppable.
@@ -82,6 +86,83 @@ pub fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
             ]
         })
         .collect()
+}
+
+/// The `pg_type` rows for user-defined enum types, appended after
+/// [`pg_type_builtin_rows`]. Only enums are reflected (`typtype = 'e'`); other
+/// `CREATE TYPE` shapes are not surfaced here yet. Column order matches
+/// [`pg_type_schema`].
+pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
+    user_types
+        .iter()
+        .filter(|t| t.enum_labels.is_some())
+        .map(|t| {
+            vec![
+                Value::Oid(t.oid),
+                Value::Text(t.name.clone()),
+                // pg_catalog namespace / bootstrap superuser, as elsewhere.
+                Value::Oid(11),
+                Value::Oid(10),
+                // Enums are a fixed 4-byte, pass-by-value, OID-backed type.
+                Value::Int2(4),
+                Value::Bool(true),
+                Value::Text("e".to_string()),
+                Value::Text("E".to_string()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".to_string()),
+                Value::Oid(0),
+                Value::Oid(0),
+                Value::Oid(0),
+                Value::Text("enum_in".to_string()),
+                Value::Text("enum_out".to_string()),
+                Value::Text("enum_recv".to_string()),
+                Value::Text("enum_send".to_string()),
+                Value::Text("i".to_string()),
+                Value::Text("p".to_string()),
+            ]
+        })
+        .collect()
+}
+
+/// `pg_catalog.pg_enum` — one row per (enum type, label). `enumsortorder` is the
+/// 1-based definition position (PG stores a float4 so labels can be inserted
+/// between existing ones; a freshly created enum uses 1, 2, 3, …).
+pub fn pg_enum_schema() -> TableSchema {
+    TableSchema {
+        name: "pg_enum".to_string(),
+        columns: vec![
+            col("oid", PgType::Oid),
+            col("enumtypid", PgType::Oid),
+            col("enumsortorder", PgType::Float4),
+            col("enumlabel", PgType::Name),
+        ],
+    }
+}
+
+/// The `pg_enum` rows for every user-defined enum type, in a stable order (by
+/// type OID, then definition order). Per-label OIDs are synthetic.
+pub fn pg_enum_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
+    let mut enums: Vec<&CatalogUserType> = user_types
+        .iter()
+        .filter(|t| t.enum_labels.is_some())
+        .collect();
+    enums.sort_by_key(|t| t.oid);
+    let mut rows = Vec::new();
+    let mut next_oid = FIRST_ENUM_OID;
+    for t in enums {
+        let labels = t.enum_labels.as_deref().unwrap_or_default();
+        for (i, label) in labels.iter().enumerate() {
+            rows.push(vec![
+                Value::Oid(next_oid),
+                Value::Oid(t.oid),
+                Value::Float4((i + 1) as f32),
+                Value::Text(label.clone()),
+            ]);
+            next_oid += 1;
+        }
+    }
+    rows
 }
 
 /// `pg_catalog.pg_cast` — the built-in casts between types crabgresql exposes.

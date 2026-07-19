@@ -1154,7 +1154,7 @@ fn bind_table_with_joins(
                     .take()
                     .unwrap_or_else(|| default_visible(&bound.relations, 0));
                 let (predicate, new_visible) =
-                    build_merged_join(kind, &names, &left_view, &right, left_width)?;
+                    build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
                 visible = Some(new_visible);
                 (kind, predicate)
             }
@@ -1164,7 +1164,7 @@ fn bind_table_with_joins(
                     .unwrap_or_else(|| default_visible(&bound.relations, 0));
                 let names = natural_join_names(&left_view, &right);
                 let (predicate, new_visible) =
-                    build_merged_join(kind, &names, &left_view, &right, left_width)?;
+                    build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
                 visible = Some(new_visible);
                 (kind, predicate)
             }
@@ -1252,6 +1252,7 @@ fn build_merged_join(
     left: &[VisibleColumn],
     right: &BoundFrom,
     left_width: usize,
+    catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(Option<BoundExpr>, Vec<VisibleColumn>), BindError> {
     let right_visible = default_visible(&right.relations, left_width);
     let mut predicate: Option<BoundExpr> = None;
@@ -1269,6 +1270,7 @@ fn build_merged_join(
             BinOp::Eq,
             Binding::Typed(left_expr.clone()),
             Binding::Typed(right_expr.clone()),
+            catalog.as_ref(),
         )?;
         let Binding::Typed(eq_expr) = eq else {
             unreachable!("equality of typed operands is always typed");
@@ -1602,10 +1604,10 @@ fn bind_order_by(
         // The executor's sort compares keys with `compare_values`, which panics
         // on a type it can't order. Reject such a key at bind time rather than
         // aborting mid-sort.
-        if !crate::expr::is_orderable(ty) {
+        if !crate::expr::is_orderable(ty, scope.catalog().as_ref()) {
             return Err(BindError::feature_not_supported(format!(
                 "ORDER BY on type {} is not supported yet",
-                ty.name()
+                crate::expr::type_label(ty, scope.catalog().as_ref())
             )));
         }
         let asc = oe.options.asc.unwrap_or(true);
@@ -1984,10 +1986,10 @@ fn bind_group_by(
         // The executor groups with `compare_values`, which cannot order every
         // type (`bit`, user types); reject such a key at bind time rather than
         // panicking mid-group.
-        if !crate::expr::is_orderable(bound.ty()) {
+        if !crate::expr::is_orderable(bound.ty(), scope.catalog().as_ref()) {
             return Err(BindError::feature_not_supported(format!(
                 "GROUP BY on type {} is not supported yet",
-                bound.ty().name()
+                crate::expr::type_label(bound.ty(), scope.catalog().as_ref())
             )));
         }
         keys.push(bound);
@@ -2401,7 +2403,7 @@ pub fn bind_insert_with_params(
                 defaults[idx].clone()
             } else {
                 let binding = bind_expr(expr, &scope)?;
-                coerce_to_column(binding, &schema.columns[idx])?
+                coerce_to_column(binding, &schema.columns[idx], &scope)?
             };
         }
         rows.push(row);
@@ -2480,7 +2482,7 @@ pub fn bind_update_with_params(
             default_for_column(&schema.columns[idx], catalog)?
         } else {
             let binding = bind_expr(&assignment.value, &scope)?;
-            coerce_to_column(binding, &schema.columns[idx])?
+            coerce_to_column(binding, &schema.columns[idx], &scope)?
         };
         assignments.push((idx, value));
     }

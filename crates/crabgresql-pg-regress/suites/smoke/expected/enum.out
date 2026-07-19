@@ -1,0 +1,145 @@
+--
+-- ENUM types
+-- A CREATE TYPE ... AS ENUM, used as a column type, with text<->enum casts,
+-- comparisons and ORDER BY in definition (not alphabetical) order, min/max, and
+-- pg_type / pg_enum catalog reflection. Output hand-checked against PostgreSQL
+-- (psql -a -q).
+--
+CREATE TYPE rainbow AS ENUM ('red', 'orange', 'yellow', 'green', 'blue', 'purple');
+-- A label may not repeat within the definition.
+CREATE TYPE bad_enum AS ENUM ('a', 'b', 'a');
+ERROR:  enum label "a" used more than once
+-- Enum text input: a valid label yields the value; an unknown one is an error.
+SELECT 'red'::rainbow;
+ rainbow 
+---------
+ red
+(1 row)
+
+SELECT 'mauve'::rainbow;
+ERROR:  invalid input value for enum rainbow: "mauve"
+LINE 1: SELECT 'mauve'::rainbow;
+               ^
+-- Reflected into pg_type as a defined enum (typtype = 'e').
+SELECT typname, typtype, typcategory, typlen, typbyval
+FROM pg_type WHERE typname = 'rainbow';
+ typname | typtype | typcategory | typlen | typbyval 
+---------+---------+-------------+--------+----------
+ rainbow | e       | E           |      4 | t
+(1 row)
+
+-- ... and its labels into pg_enum, in definition order.
+SELECT e.enumlabel, e.enumsortorder
+FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+WHERE t.typname = 'rainbow'
+ORDER BY e.enumsortorder;
+ enumlabel | enumsortorder 
+-----------+---------------
+ red       |             1
+ orange    |             2
+ yellow    |             3
+ green     |             4
+ blue      |             5
+ purple    |             6
+(6 rows)
+
+--
+-- As a column type.
+--
+CREATE TABLE enumtest (id int, col rainbow);
+INSERT INTO enumtest VALUES (1, 'red'), (2, 'orange'), (3, 'yellow'), (4, 'green');
+-- An out-of-range label is rejected on insert.
+INSERT INTO enumtest VALUES (5, 'chartreuse');
+ERROR:  invalid input value for enum rainbow: "chartreuse"
+LINE 1: INSERT INTO enumtest VALUES (5, 'chartreuse');
+                                        ^
+SELECT * FROM enumtest ORDER BY id;
+ id |  col   
+----+--------
+  1 | red
+  2 | orange
+  3 | yellow
+  4 | green
+(4 rows)
+
+--
+-- Comparisons and ORDER BY follow definition order, not alphabetical.
+--
+SELECT * FROM enumtest WHERE col = 'orange';
+ id |  col   
+----+--------
+  2 | orange
+(1 row)
+
+SELECT * FROM enumtest WHERE col <> 'orange' ORDER BY id;
+ id |  col   
+----+--------
+  1 | red
+  3 | yellow
+  4 | green
+(3 rows)
+
+SELECT * FROM enumtest WHERE col > 'yellow' ORDER BY id;
+ id |  col  
+----+-------
+  4 | green
+(1 row)
+
+SELECT * FROM enumtest WHERE col < 'green' ORDER BY id;
+ id |  col   
+----+--------
+  1 | red
+  2 | orange
+  3 | yellow
+(3 rows)
+
+SELECT col FROM enumtest ORDER BY col;
+  col   
+--------
+ red
+ orange
+ yellow
+ green
+(4 rows)
+
+--
+-- Casts to and from text.
+--
+SELECT 'red'::rainbow::text || 'hithere';
+  ?column?  
+------------
+ redhithere
+(1 row)
+
+SELECT 'blue'::text::rainbow;
+ rainbow 
+---------
+ blue
+(1 row)
+
+--
+-- Aggregates order by the enum's definition order.
+--
+SELECT min(col), max(col) FROM enumtest;
+ min |  max  
+-----+-------
+ red | green
+(1 row)
+
+SELECT max(col) FROM enumtest WHERE col < 'green';
+  max   
+--------
+ yellow
+(1 row)
+
+--
+-- Cleanup.
+--
+DROP TABLE enumtest;
+DROP TYPE rainbow;
+SELECT COUNT(*) FROM pg_type WHERE typname = 'rainbow';
+ count 
+-------
+     0
+(1 row)
+

@@ -36,6 +36,109 @@ async fn connect_as(port: u16, user: &str, database: &str) -> tokio_postgres::Cl
 }
 
 #[tokio::test]
+async fn enum_catalog_and_type_boundaries_match_pg() {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    client.simple_query("CREATE TYPE shell_only").await.unwrap();
+    let err = client
+        .simple_query("CREATE TABLE shell_table (value shell_only)")
+        .await
+        .unwrap_err();
+    assert_eq!(err.as_db_error().unwrap().code(), &SqlState::UNDEFINED_OBJECT);
+    assert_eq!(
+        err.as_db_error().unwrap().message(),
+        "type \"shell_only\" is only a shell"
+    );
+
+    let err = client
+        .simple_query("CREATE TYPE int4 AS ENUM ('shadow')")
+        .await
+        .unwrap_err();
+    assert_eq!(err.as_db_error().unwrap().code(), &SqlState::DUPLICATE_OBJECT);
+
+    let err = client
+        .simple_query("CREATE TABLE unsupported (value box)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().unwrap().code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    client
+        .simple_query("CREATE TYPE rainbow AS ENUM ('red', 'green')")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE TABLE enumtest (value rainbow)")
+        .await
+        .unwrap();
+
+    let oid_overlap = client
+        .simple_query(
+            "SELECT count(*) FROM pg_type t JOIN pg_class c ON t.oid = c.oid \
+             WHERE t.typname = 'rainbow' AND c.relname = 'enumtest'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows(&oid_overlap)[0].get(0), Some("0"));
+
+    for target in ["varchar", "name", "bpchar"] {
+        let sql = format!("SELECT 'red'::rainbow::{target}");
+        let err = client.simple_query(&sql).await.unwrap_err();
+        assert_eq!(err.as_db_error().unwrap().code(), &SqlState::CANNOT_COERCE);
+    }
+    client
+        .simple_query("SELECT 'red'::rainbow::text")
+        .await
+        .unwrap();
+
+    let err = client
+        .simple_query("SELECT 'red'::rainbow > 1")
+        .await
+        .unwrap_err();
+    assert_eq!(err.as_db_error().unwrap().code(), &SqlState::UNDEFINED_FUNCTION);
+    assert_eq!(
+        err.as_db_error().unwrap().message(),
+        "operator does not exist: rainbow > integer"
+    );
+
+    client.simple_query("CREATE TYPE zeta AS ENUM ('z')").await.unwrap();
+    client.simple_query("CREATE TYPE alpha AS ENUM ('a')").await.unwrap();
+    let ordered = client
+        .simple_query(
+            "SELECT typname FROM pg_type WHERE typname = 'zeta' OR typname = 'alpha'",
+        )
+        .await
+        .unwrap();
+    let ordered = rows(&ordered);
+    assert_eq!(ordered[0].get(0), Some("zeta"));
+    assert_eq!(ordered[1].get(0), Some("alpha"));
+
+    client.simple_query("CREATE TYPE xbase").await.unwrap();
+    client
+        .simple_query(
+            "CREATE FUNCTION xbase_in(cstring) RETURNS xbase AS 'int8in' LANGUAGE internal; \
+             CREATE FUNCTION xbase_out(xbase) RETURNS cstring AS 'int8out' LANGUAGE internal; \
+             CREATE TYPE xbase (input = xbase_in, output = xbase_out, like = int8); \
+             CREATE CAST (int8 AS xbase) WITHOUT FUNCTION",
+        )
+        .await
+        .unwrap();
+    let err = client
+        .simple_query("SELECT 1::int8::xbase > 0::int8::xbase")
+        .await
+        .unwrap_err();
+    assert_eq!(err.as_db_error().unwrap().code(), &SqlState::UNDEFINED_FUNCTION);
+    assert_eq!(
+        err.as_db_error().unwrap().message(),
+        "operator does not exist: xbase > xbase"
+    );
+}
+
+#[tokio::test]
 async fn information_schema_reflects_live_relations_and_session_identity() {
     let client = connect_as(spawn_server().await, "catalog_user", "catalog_db").await;
     client

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{TypeCatalog, UserCast, UserType};
+use crabgresql_storage_api::{EnumInfo, TypeCatalog, UserCast, UserType};
 use crabgresql_types::PgType;
 
 use crate::error::PgError;
@@ -100,6 +100,9 @@ struct TypeEntry {
     /// `WITHOUT FUNCTION` cast can reinterpret values as this type. `None` when
     /// the type declared only an `INTERNALLENGTH`.
     backing: Option<PgType>,
+    /// The labels of a `CREATE TYPE ... AS ENUM`, in definition (= sort) order.
+    /// `None` for shell and base types; `Some(..)` marks the type as an enum.
+    enum_labels: Option<Vec<String>>,
     /// Objects that depend on this type, in creation order — the cascade set.
     dependents: Vec<DepId>,
 }
@@ -246,6 +249,7 @@ impl GlobalCatalog {
                 defined: false,
                 typlen: -1,
                 backing: None,
+                enum_labels: None,
                 dependents: Vec::new(),
             },
         );
@@ -283,12 +287,55 @@ impl GlobalCatalog {
                         defined: true,
                         typlen,
                         backing,
+                        enum_labels: None,
                         dependents: Vec::new(),
                     },
                 );
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// `CREATE TYPE name AS ENUM ('a', 'b', ...)`. Labels are stored verbatim
+    /// (case-sensitive) in definition order, which is also their sort order.
+    /// Re-declaring an existing type is a duplicate-object error; a label that
+    /// repeats within the list is rejected as PG's `enum_in` bootstrap does.
+    pub fn create_enum_type(
+        &self,
+        name: &str,
+        labels: Vec<String>,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self.inner.write().unwrap();
+        if cat.types.contains_key(name) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("type \"{name}\" already exists"),
+            ));
+        }
+        // A label may not appear twice; PG reports the first repeat by name.
+        let mut seen = std::collections::HashSet::with_capacity(labels.len());
+        for label in &labels {
+            if !seen.insert(label.as_str()) {
+                return Err(PgError::new(
+                    sqlstate::DUPLICATE_OBJECT,
+                    format!("enum label \"{label}\" used more than once"),
+                ));
+            }
+        }
+        let oid = cat.alloc_oid();
+        cat.types.insert(
+            name.to_string(),
+            TypeEntry {
+                oid,
+                defined: true,
+                // PG enums are a fixed 4-byte OID-backed type.
+                typlen: 4,
+                backing: None,
+                enum_labels: Some(labels),
+                dependents: Vec::new(),
+            },
+        );
+        Ok(Vec::new())
     }
 
     /// `CREATE FUNCTION ... LANGUAGE internal AS '<internal_name>'`. Validates the
@@ -488,10 +535,27 @@ impl GlobalCatalog {
 impl TypeCatalog for GlobalCatalog {
     fn resolve_type(&self, name: &str) -> Option<UserType> {
         let cat = self.inner.read().unwrap();
-        cat.types.get(name).map(|e| UserType {
+        cat.types.get(name).filter(|e| e.defined).map(|e| UserType {
             oid: e.oid,
             backing: e.backing,
         })
+    }
+
+    fn is_shell_type(&self, name: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .types
+            .get(name)
+            .is_some_and(|e| !e.defined)
+    }
+
+    fn user_type_name(&self, oid: u32) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .type_name_by_oid(oid)
+            .map(str::to_string)
     }
 
     fn find_cast(&self, source: PgType, target: PgType) -> Option<UserCast> {
@@ -518,6 +582,44 @@ impl TypeCatalog for GlobalCatalog {
             }
             other => other,
         }
+    }
+
+    fn enum_info(&self, oid: u32) -> Option<EnumInfo> {
+        let cat = self.inner.read().unwrap();
+        let (name, entry) = cat.types.iter().find(|(_, e)| e.oid == oid)?;
+        entry.enum_labels.as_ref().map(|labels| EnumInfo {
+            name: name.clone(),
+            labels: labels.clone(),
+        })
+    }
+}
+
+/// A user-defined type as surfaced to the system-catalog (`pg_type`/`pg_enum`)
+/// introspection layer: its OID, name, and — when it is an enum — its labels in
+/// definition order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserTypeInfo {
+    pub oid: u32,
+    pub name: String,
+    pub enum_labels: Option<Vec<String>>,
+}
+
+impl GlobalCatalog {
+    /// Every registered user type, for `pg_type`/`pg_enum` reflection. Shell
+    /// types (not yet defined) are excluded, matching PG's `typisdefined`.
+    pub fn user_types(&self) -> Vec<UserTypeInfo> {
+        let cat = self.inner.read().unwrap();
+        let mut types: Vec<_> = cat.types
+            .iter()
+            .filter(|(_, e)| e.defined)
+            .map(|(name, e)| UserTypeInfo {
+                oid: e.oid,
+                name: name.clone(),
+                enum_labels: e.enum_labels.clone(),
+            })
+            .collect();
+        types.sort_by_key(|t| t.oid);
+        types
     }
 }
 
@@ -775,6 +877,26 @@ mod tests {
     }
 
     #[test]
+    fn shell_types_do_not_resolve_for_queries() {
+        let cat = GlobalCatalog::new();
+        cat.create_shell_type("foo").unwrap();
+        assert!(cat.is_shell_type("foo"));
+        assert!(cat.resolve_type("foo").is_none());
+        cat.define_type("foo", 8, Some(PgType::Int8)).unwrap();
+        assert!(!cat.is_shell_type("foo"));
+        assert!(cat.resolve_type("foo").is_some());
+    }
+
+    #[test]
+    fn user_type_enumeration_follows_oid_order() {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("zeta", vec!["z".into()]).unwrap();
+        cat.create_enum_type("alpha", vec!["a".into()]).unwrap();
+        let names: Vec<_> = cat.user_types().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["zeta", "alpha"]);
+    }
+
+    #[test]
     fn duplicate_cast_is_rejected() {
         let cat = bootstrap_xfloat8();
         let err = cat
@@ -845,6 +967,49 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code, sqlstate::INVALID_OBJECT_DEFINITION);
+    }
+
+    #[test]
+    fn create_enum_type_and_enum_info_roundtrip() {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("rainbow", vec!["red".into(), "green".into(), "blue".into()])
+            .unwrap();
+        assert!(cat.is_user_type("rainbow"));
+        let oid = cat.resolve_type("rainbow").unwrap().oid;
+        let info = cat.enum_info(oid).unwrap();
+        assert_eq!(info.name, "rainbow");
+        assert_eq!(info.labels, vec!["red", "green", "blue"]);
+        // A non-enum OID (or a base user type) has no enum_info.
+        assert!(cat.enum_info(oid + 1).is_none());
+        // Surfaced to the pg_type/pg_enum reflection layer.
+        let rows = cat.user_types();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "rainbow");
+        assert_eq!(
+            rows[0].enum_labels.as_deref(),
+            Some(&["red".to_string(), "green".to_string(), "blue".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn create_enum_duplicate_label_rejected() {
+        let cat = GlobalCatalog::new();
+        let err = cat
+            .create_enum_type("dup", vec!["a".into(), "b".into(), "a".into()])
+            .unwrap_err();
+        assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(err.message, "enum label \"a\" used more than once");
+        // A rejected definition registers nothing.
+        assert!(!cat.is_user_type("dup"));
+    }
+
+    #[test]
+    fn create_enum_duplicate_name_rejected() {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("e", vec!["a".into()]).unwrap();
+        let err = cat.create_enum_type("e", vec!["b".into()]).unwrap_err();
+        assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(err.message, "type \"e\" already exists");
     }
 
     #[test]

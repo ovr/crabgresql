@@ -575,14 +575,18 @@ pub fn lookup_agg(name: &str) -> Option<AggFn> {
 /// `42883 function <name>(<type>) does not exist` error when the aggregate has
 /// no overload for the argument type (e.g. `min(bit)`, `sum(text)`), matching
 /// PG's report of an unresolved aggregate.
-pub(crate) fn agg_return_type(func: AggFn, input_ty: PgType) -> Result<PgType, BindError> {
+pub(crate) fn agg_return_type(
+    func: AggFn,
+    input_ty: PgType,
+    scope: &Scope,
+) -> Result<PgType, BindError> {
     let unsupported = || {
         BindError::new(
             sqlstate::UNDEFINED_FUNCTION,
             format!(
                 "function {}({}) does not exist",
                 func.name(),
-                input_ty.name()
+                crate::expr::type_label(input_ty, scope.catalog().as_ref())
             ),
         )
     };
@@ -594,7 +598,9 @@ pub(crate) fn agg_return_type(func: AggFn, input_ty: PgType) -> Result<PgType, B
         // type *except* boolean (users reach for bool_and/bool_or there), so
         // `is_orderable` — which includes bool for ORDER BY — is too broad here.
         AggFn::Min | AggFn::Max => {
-            if input_ty != PgType::Bool && crate::expr::is_orderable(input_ty) {
+            if input_ty != PgType::Bool
+                && crate::expr::is_orderable(input_ty, scope.catalog().as_ref())
+            {
                 Ok(input_ty)
             } else {
                 Err(unsupported())
@@ -1198,13 +1204,16 @@ fn bind_aggregate(
     // A DISTINCT aggregate must compare its inputs for equality; a type with no
     // usable equality (e.g. `point`/`lseg`, which are not orderable) reports
     // PG's error rather than reaching the executor's comparison and panicking.
-    if distinct && !crate::expr::is_orderable(input_ty) {
+    if distinct && !crate::expr::is_orderable(input_ty, scope.catalog().as_ref()) {
         return Err(BindError::new(
             sqlstate::UNDEFINED_FUNCTION,
-            format!("could not identify an equality operator for type {}", input_ty.name()),
+            format!(
+                "could not identify an equality operator for type {}",
+                crate::expr::type_label(input_ty, scope.catalog().as_ref())
+            ),
         ));
     }
-    let ret = agg_return_type(agg, input_ty)?;
+    let ret = agg_return_type(agg, input_ty, scope)?;
     Ok(Binding::Typed(BoundExpr::Aggregate {
         func: agg,
         distinct,
