@@ -61,10 +61,10 @@ SELECT 1 AS one;
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 ERROR:  SET TRANSACTION ISOLATION LEVEL must be called before any query
 ROLLBACK;
--- SET TRANSACTION outside a block is rejected (25P01).
+-- SET TRANSACTION outside a block warns but still succeeds.
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
-ERROR:  SET TRANSACTION can only be used in transaction blocks
--- A READ ONLY block allows reads but rejects writes (25006).
+WARNING:  SET TRANSACTION can only be used in transaction blocks
+-- A READ ONLY block allows reads but rejects writes (25006), DML and DDL alike.
 BEGIN READ ONLY;
 SELECT * FROM t;
  id 
@@ -74,7 +74,12 @@ SELECT * FROM t;
 INSERT INTO t VALUES (1);
 ERROR:  cannot execute INSERT in a read-only transaction
 ROLLBACK;
--- The session default isolation is settable and resettable.
+BEGIN READ ONLY;
+CREATE TABLE ro_ddl (x int);
+ERROR:  cannot execute CREATE TABLE in a read-only transaction
+ROLLBACK;
+-- The session default isolation is settable, and DEFAULT/RESET restore it.
 SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 SET default_transaction_isolation = 'read committed';
+SET default_transaction_isolation = DEFAULT;
 RESET default_transaction_isolation;

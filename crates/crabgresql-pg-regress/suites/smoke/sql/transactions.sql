@@ -36,14 +36,18 @@ BEGIN;
 SELECT 1 AS one;
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 ROLLBACK;
--- SET TRANSACTION outside a block is rejected (25P01).
+-- SET TRANSACTION outside a block warns but still succeeds.
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
--- A READ ONLY block allows reads but rejects writes (25006).
+-- A READ ONLY block allows reads but rejects writes (25006), DML and DDL alike.
 BEGIN READ ONLY;
 SELECT * FROM t;
 INSERT INTO t VALUES (1);
 ROLLBACK;
--- The session default isolation is settable and resettable.
+BEGIN READ ONLY;
+CREATE TABLE ro_ddl (x int);
+ROLLBACK;
+-- The session default isolation is settable, and DEFAULT/RESET restore it.
 SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 SET default_transaction_isolation = 'read committed';
+SET default_transaction_isolation = DEFAULT;
 RESET default_transaction_isolation;

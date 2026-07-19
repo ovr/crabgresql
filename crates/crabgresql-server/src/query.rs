@@ -115,6 +115,28 @@ pub fn execute_statement(
             "current transaction is aborted, commands ignored until end of transaction block",
         ));
     }
+    // PG's "SET TRANSACTION ISOLATION LEVEL must be called before any query" rule
+    // keys off whether a snapshot-taking statement has run in this block.
+    // Transaction control and SET/RESET take no snapshot; every other statement
+    // (SELECT, DML, and DDL like CREATE/DROP) does — so mark the block here, at
+    // the statement boundary, rather than only on the DML path.
+    if let Some(active) = session.xact.as_mut()
+        && statement_takes_snapshot(stmt)
+    {
+        active.has_run_query = true;
+    }
+    // A read-only transaction rejects data-changing DDL up front, before name
+    // resolution: PG reports 25006 for `DROP TABLE missing` rather than the
+    // undefined-table error. (DML is checked after binding below, because PG
+    // resolves the target relation first for INSERT/UPDATE/DELETE.)
+    if read_only_active(session)
+        && let Some(command) = read_only_prohibited_ddl(stmt)
+    {
+        return Err(PgError::new(
+            sqlstate::READ_ONLY_SQL_TRANSACTION,
+            format!("cannot execute {command} in a read-only transaction"),
+        ));
+    }
     // Resolution overlay: the session's temp catalog shadows the shared global
     // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
     // so it keeps the raw engine + session below.
@@ -351,9 +373,6 @@ fn finalize_statement(
         }
         Some(active) => {
             active.cid = CommandId(active.cid.0 + 1);
-            // A statement that took a snapshot has now run: a later `SET
-            // TRANSACTION ISOLATION LEVEL` in this block must be rejected (25001).
-            active.has_run_query = true;
         }
     }
     Ok(())
@@ -422,6 +441,46 @@ fn read_only_active(session: &Session) -> bool {
         Some(active) => active.read_only,
         None => session.default_read_only,
     }
+}
+
+/// Whether executing `stmt` acquires a snapshot (PG's `FirstSnapshotSet`).
+/// Transaction control and `SET`/`RESET` take none; every other statement —
+/// queries, DML, and DDL — does. Used to enforce the "SET TRANSACTION ISOLATION
+/// LEVEL before any query" rule uniformly across statement kinds.
+fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
+    !matches!(
+        stmt,
+        ast::Statement::StartTransaction { .. }
+            | ast::Statement::Commit { .. }
+            | ast::Statement::Rollback { .. }
+            | ast::Statement::Set(_)
+            | ast::Statement::Reset(_)
+    )
+}
+
+/// The PG command name for a data-changing DDL/utility statement that a
+/// read-only transaction must reject (25006) *before* name resolution, or `None`
+/// if the statement is not one of them. DML (INSERT/UPDATE/DELETE) is excluded:
+/// PG resolves the target relation first there, so it is checked after binding.
+fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
+    Some(match stmt {
+        ast::Statement::CreateTable(_) => "CREATE TABLE",
+        ast::Statement::CreateIndex(_) => "CREATE INDEX",
+        ast::Statement::CreateType { .. } => "CREATE TYPE",
+        ast::Statement::CreateFunction(_) => "CREATE FUNCTION",
+        ast::Statement::CreateCast { .. } => "CREATE CAST",
+        ast::Statement::Truncate(_) => "TRUNCATE TABLE",
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Table,
+            ..
+        } => "DROP TABLE",
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Type,
+            ..
+        } => "DROP TYPE",
+        ast::Statement::DropCast { .. } => "DROP CAST",
+        _ => return None,
+    })
 }
 
 /// `BEGIN` / `START TRANSACTION`. Enters the transaction block, seeding its
@@ -567,15 +626,6 @@ fn execute_truncate(
     session: &mut Session,
     truncate: &ast::Truncate,
 ) -> Result<QueryResult, PgError> {
-    // TRUNCATE is a write; reject it in a READ ONLY transaction (25006). Other
-    // DDL in a read-only block is not yet guarded — a follow-up (PG rejects the
-    // full set of data-changing utility statements).
-    if read_only_active(session) {
-        return Err(PgError::new(
-            sqlstate::READ_ONLY_SQL_TRANSACTION,
-            "cannot execute TRUNCATE TABLE in a read-only transaction",
-        ));
-    }
     if truncate.cascade.is_some() {
         return Err(PgError::feature_not_supported(
             "TRUNCATE ... CASCADE/RESTRICT is not supported yet",
@@ -781,24 +831,37 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
         ast::Set::SingleAssignment {
             variable, values, ..
         } => match single_ident_lower(variable).as_deref() {
+            // `SET x = DEFAULT` restores each GUC's boot value (PG accepts it and
+            // resets rather than erroring on the "DEFAULT" token).
             Some("extra_float_digits") => {
-                let v = set_value_to_i32(values)?;
-                if !(-15..=3).contains(&v) {
-                    return Err(PgError::new(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        format!(
-                            "{v} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)"
-                        ),
-                    ));
-                }
-                session.extra_float_digits = v;
+                session.extra_float_digits = if is_set_default(values) {
+                    1
+                } else {
+                    let v = set_value_to_i32(values)?;
+                    if !(-15..=3).contains(&v) {
+                        return Err(PgError::new(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            format!(
+                                "{v} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)"
+                            ),
+                        ));
+                    }
+                    v
+                };
             }
             Some("default_transaction_isolation") => {
-                session.default_iso = parse_default_isolation(values)?;
+                session.default_iso = if is_set_default(values) {
+                    IsolationLevel::ReadCommitted
+                } else {
+                    parse_default_isolation(values)?
+                };
             }
             Some("default_transaction_read_only") => {
-                session.default_read_only =
-                    parse_set_bool(values, "default_transaction_read_only")?;
+                session.default_read_only = if is_set_default(values) {
+                    false
+                } else {
+                    parse_set_bool(values, "default_transaction_read_only")?
+                };
             }
             _ => {}
         },
@@ -833,34 +896,32 @@ fn apply_set_transaction(
         }
         return Ok(QueryResult::command("SET"));
     }
-    // Current transaction: valid only inside a block, and only before any query
-    // has taken a snapshot. (A failed block is already rejected upstream in
-    // `execute_statement` with 25P02, so only Idle and InTransaction reach here.)
-    match session.tx_status {
-        TransactionStatus::InTransaction => {
-            let active = session
-                .xact
-                .as_mut()
-                .expect("InTransaction status implies an open ActiveTxn");
-            if active.has_run_query {
-                return Err(PgError::new(
-                    sqlstate::ACTIVE_SQL_TRANSACTION,
-                    "SET TRANSACTION ISOLATION LEVEL must be called before any query",
-                ));
-            }
-            if let Some(iso) = iso {
-                active.iso = iso;
-            }
-            if let Some(read_only) = read_only {
-                active.read_only = read_only;
-            }
-        }
-        _ => {
-            return Err(PgError::new(
+    // Current transaction. Outside a block PG only WARNs and still succeeds; a
+    // failed block is already rejected upstream (25P02), so the non-block case
+    // reaching here is Idle.
+    let Some(active) = session.xact.as_mut() else {
+        return Ok(QueryResult::Command {
+            tag: "SET".into(),
+            notices: vec![Notice::warning(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                 "SET TRANSACTION can only be used in transaction blocks",
-            ));
-        }
+            )],
+        });
+    };
+    // Only the isolation level is snapshot-gated: PG rejects a post-query
+    // ISOLATION LEVEL change with 25001 but still lets READ ONLY/WRITE change any
+    // time in the block.
+    if iso.is_some() && active.has_run_query {
+        return Err(PgError::new(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+        ));
+    }
+    if let Some(iso) = iso {
+        active.iso = iso;
+    }
+    if let Some(read_only) = read_only {
+        active.read_only = read_only;
     }
     Ok(QueryResult::command("SET"))
 }
@@ -886,22 +947,29 @@ fn parse_default_isolation(values: &[ast::Expr]) -> Result<IsolationLevel, PgErr
     }
 }
 
-/// Parse a Boolean GUC value (`on`/`off`/`true`/`false`/…). An unrecognized
-/// value is an invalid-parameter error (22023).
+/// Parse a Boolean GUC value using PG's boolean spellings (any unambiguous
+/// prefix of true/false/yes/no/off, `on`, `1`/`0`). An unrecognized value is an
+/// invalid-parameter error (22023).
 fn parse_set_bool(values: &[ast::Expr], param: &str) -> Result<bool, PgError> {
-    match set_value_to_string(values)
+    set_value_to_string(values)
         .as_deref()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("on" | "true" | "t" | "yes" | "1") => Ok(true),
-        Some("off" | "false" | "f" | "no" | "0") => Ok(false),
-        _ => Err(PgError::new(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            format!("parameter \"{param}\" requires a Boolean value"),
-        )),
-    }
+        .and_then(crabgresql_types::parse_bool)
+        .ok_or_else(|| {
+            PgError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("parameter \"{param}\" requires a Boolean value"),
+            )
+        })
+}
+
+/// Whether a `SET var = value` names the literal `DEFAULT` keyword, which resets
+/// the GUC to its boot value.
+fn is_set_default(values: &[ast::Expr]) -> bool {
+    matches!(
+        values,
+        [ast::Expr::Identifier(ident)]
+            if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("default")
+    )
 }
 
 /// The single scalar value of a `SET var = value`, rendered as a string. Covers
