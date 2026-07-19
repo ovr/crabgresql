@@ -979,13 +979,19 @@ fn execute_create_table(
     for p in pending {
         reject_deferred_characteristics(p.characteristics)?;
         let keys = simple_index_keys(&schema, &p.columns)?;
-        let first_column = keys
-            .first()
-            .map(|k| schema.columns[k.column].name.as_str())
-            .unwrap_or("key");
+        // PG names a UNIQUE constraint after every key column, e.g.
+        // `t_a_b_key`; only PRIMARY KEY collapses to `t_pkey`.
         let base = match p.constraint {
             IndexConstraint::PrimaryKey => format!("{name}_pkey"),
-            IndexConstraint::Unique => format!("{name}_{first_column}_key"),
+            IndexConstraint::Unique => {
+                let mut base = name.clone();
+                for key in &keys {
+                    base.push('_');
+                    base.push_str(&schema.columns[key.column].name);
+                }
+                base.push_str("_key");
+                base
+            }
         };
         let index_name = p
             .explicit_name

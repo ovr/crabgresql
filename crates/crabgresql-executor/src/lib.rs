@@ -260,14 +260,23 @@ fn execute_insert(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let mut tuples: Vec<Tuple> = Vec::with_capacity(rows.len());
-    let mut visible: Vec<Tuple> = table.scan(txn).map(|(_, tuple)| tuple).collect();
+    // Existing rows are only consulted to enforce UNIQUE keys; a table with no
+    // unique index never needs the scan (NOT NULL checks only the new row).
+    let has_unique = table.indexes().iter().any(|index| index.unique);
+    let mut visible: Vec<Tuple> = if has_unique {
+        table.scan(txn).map(|(_, tuple)| tuple).collect()
+    } else {
+        Vec::new()
+    };
     for row in rows {
         let tuple = row
             .iter()
             .map(|expr| eval(expr, &[], ctx))
             .collect::<Result<_, _>>()?;
         validate_constraints(table, &tuple, visible.iter(), ctx)?;
-        visible.push(tuple.clone());
+        if has_unique {
+            visible.push(tuple.clone());
+        }
         tuples.push(tuple);
     }
     let inserted = tuples.len() as u64;
@@ -291,7 +300,14 @@ fn execute_update(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let original: Vec<(Tid, Tuple)> = table.scan(txn).collect();
-    let mut simulated = original.clone();
+    // `simulated` mirrors the post-update table so a UNIQUE check sees other
+    // rows' new values; it is only needed when a unique index exists.
+    let has_unique = table.indexes().iter().any(|index| index.unique);
+    let mut simulated = if has_unique {
+        original.clone()
+    } else {
+        Vec::new()
+    };
     let mut pending: Vec<(Tid, Tuple)> = Vec::new();
     for (tid, old) in original {
         if !predicate_holds(predicate, &old, ctx)? {
@@ -302,19 +318,24 @@ fn execute_update(
         for (index, expr) in assignments {
             new[*index] = eval(expr, &old, ctx)?;
         }
-        let Some(pos) = simulated
-            .iter()
-            .position(|(candidate, _)| *candidate == tid)
-        else {
-            continue;
-        };
-        let (_, removed) = simulated.remove(pos);
-        if let Err(error) = validate_constraints(table, &new, simulated.iter().map(|(_, t)| t), ctx)
-        {
-            simulated.insert(pos, (tid, removed));
-            return Err(error);
+        if has_unique {
+            let Some(pos) = simulated
+                .iter()
+                .position(|(candidate, _)| *candidate == tid)
+            else {
+                continue;
+            };
+            let (_, removed) = simulated.remove(pos);
+            if let Err(error) =
+                validate_constraints(table, &new, simulated.iter().map(|(_, t)| t), ctx)
+            {
+                simulated.insert(pos, (tid, removed));
+                return Err(error);
+            }
+            simulated.insert(pos, (tid, new.clone()));
+        } else {
+            validate_constraints(table, &new, std::iter::empty(), ctx)?;
         }
-        simulated.insert(pos, (tid, new.clone()));
         pending.push((tid, new));
     }
     Ok(Execution::Updated(table.update_many(pending, txn)))
