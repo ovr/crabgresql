@@ -138,8 +138,9 @@ const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 /// One `Query` message: parse, run every statement, stream the responses.
 /// An execution error aborts the remaining statements, as in PG, and — inside
 /// an explicit transaction block — puts the session in the failed state so the
-/// next ReadyForQuery reports `E`. (PG also rolls back the earlier statements'
-/// data effects; that undo needs the M2 transaction engine.)
+/// next ReadyForQuery reports `E`; the block's eventual ROLLBACK (or COMMIT,
+/// reported as ROLLBACK) then aborts its XID, undoing the earlier statements'
+/// data effects via MVCC.
 async fn run_simple_query(
     sql: &str,
     engine: &Arc<dyn TableEngine>,

@@ -115,6 +115,28 @@ pub fn execute_statement(
             "current transaction is aborted, commands ignored until end of transaction block",
         ));
     }
+    // PG's "SET TRANSACTION ISOLATION LEVEL must be called before any query" rule
+    // keys off whether a snapshot-taking statement has run in this block.
+    // Transaction control and SET/RESET take no snapshot; every other statement
+    // (SELECT, DML, and DDL like CREATE/DROP) does — so mark the block here, at
+    // the statement boundary, rather than only on the DML path.
+    if let Some(active) = session.xact.as_mut()
+        && statement_takes_snapshot(stmt)
+    {
+        active.has_run_query = true;
+    }
+    // A read-only transaction rejects data-changing DDL up front, before name
+    // resolution: PG reports 25006 for `DROP TABLE missing` rather than the
+    // undefined-table error. (DML is checked after binding below, because PG
+    // resolves the target relation first for INSERT/UPDATE/DELETE.)
+    if read_only_active(session)
+        && let Some(command) = read_only_prohibited_ddl(stmt)
+    {
+        return Err(PgError::new(
+            sqlstate::READ_ONLY_SQL_TRANSACTION,
+            format!("cannot execute {command} in a read-only transaction"),
+        ));
+    }
     // Resolution overlay: the session's temp catalog shadows the shared global
     // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
     // so it keeps the raw engine + session below.
@@ -250,6 +272,20 @@ pub fn execute_statement(
         logical,
         LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
     );
+    // A write in a READ ONLY transaction (or under the read-only session default)
+    // is rejected before it stamps any version, matching PG's 25006.
+    if is_write && read_only_active(session) {
+        let verb = match logical {
+            LogicalPlan::Insert { .. } => "INSERT",
+            LogicalPlan::Update { .. } => "UPDATE",
+            LogicalPlan::Delete { .. } => "DELETE",
+            _ => unreachable!("is_write implies a DML plan"),
+        };
+        return Err(PgError::new(
+            sqlstate::READ_ONLY_SQL_TRANSACTION,
+            format!("cannot execute {verb} in a read-only transaction"),
+        ));
+    }
     let txn = build_txn(txnmgr, session, is_write);
     let exec = match execute(
         crabgresql_planner::plan(logical),
@@ -356,9 +392,102 @@ fn and_chain_unsupported() -> PgError {
     PgError::feature_not_supported("AND CHAIN is not supported yet")
 }
 
-/// `BEGIN` / `START TRANSACTION` (bare forms only). Enters the transaction
-/// block; a redundant BEGIN warns but stays in the block. Real data rollback is
-/// M2 — this only tracks the control-flow state.
+/// Map the parser's SQL isolation level to the core [`IsolationLevel`]. `READ
+/// UNCOMMITTED` aliases READ COMMITTED (PG never permits dirty reads);
+/// `SERIALIZABLE` maps to REPEATABLE READ-strength visibility for now (true SSI
+/// is M3, per the `IsolationLevel::Serializable` note in `crabgresql-txn`).
+/// `SNAPSHOT` (a non-standard extension) is not supported.
+fn map_isolation_level(level: ast::TransactionIsolationLevel) -> Result<IsolationLevel, PgError> {
+    use ast::TransactionIsolationLevel as Sql;
+    Ok(match level {
+        Sql::ReadUncommitted | Sql::ReadCommitted => IsolationLevel::ReadCommitted,
+        Sql::RepeatableRead => IsolationLevel::RepeatableRead,
+        Sql::Serializable => IsolationLevel::Serializable,
+        Sql::Snapshot => {
+            return Err(PgError::feature_not_supported(
+                "SNAPSHOT isolation level is not supported",
+            ));
+        }
+    })
+}
+
+/// Fold a list of transaction modes into an optional isolation level and an
+/// optional read-only flag. A `None` means the mode was not named (so the caller
+/// keeps its default); repeated modes are last-wins, as in PG.
+fn apply_modes(
+    modes: &[ast::TransactionMode],
+) -> Result<(Option<IsolationLevel>, Option<bool>), PgError> {
+    let mut iso = None;
+    let mut read_only = None;
+    for mode in modes {
+        match mode {
+            ast::TransactionMode::IsolationLevel(level) => iso = Some(map_isolation_level(*level)?),
+            ast::TransactionMode::AccessMode(ast::TransactionAccessMode::ReadOnly) => {
+                read_only = Some(true);
+            }
+            ast::TransactionMode::AccessMode(ast::TransactionAccessMode::ReadWrite) => {
+                read_only = Some(false);
+            }
+        }
+    }
+    Ok((iso, read_only))
+}
+
+/// Whether the statement about to run is in a read-only context: an explicit
+/// `READ ONLY` block, or (under autocommit) the `default_transaction_read_only`
+/// GUC. Writes in such a context are rejected with SQLSTATE 25006.
+fn read_only_active(session: &Session) -> bool {
+    match &session.xact {
+        Some(active) => active.read_only,
+        None => session.default_read_only,
+    }
+}
+
+/// Whether executing `stmt` acquires a snapshot (PG's `FirstSnapshotSet`).
+/// Transaction control and `SET`/`RESET` take none; every other statement —
+/// queries, DML, and DDL — does. Used to enforce the "SET TRANSACTION ISOLATION
+/// LEVEL before any query" rule uniformly across statement kinds.
+fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
+    !matches!(
+        stmt,
+        ast::Statement::StartTransaction { .. }
+            | ast::Statement::Commit { .. }
+            | ast::Statement::Rollback { .. }
+            | ast::Statement::Set(_)
+            | ast::Statement::Reset(_)
+    )
+}
+
+/// The PG command name for a data-changing DDL/utility statement that a
+/// read-only transaction must reject (25006) *before* name resolution, or `None`
+/// if the statement is not one of them. DML (INSERT/UPDATE/DELETE) is excluded:
+/// PG resolves the target relation first there, so it is checked after binding.
+fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
+    Some(match stmt {
+        ast::Statement::CreateTable(_) => "CREATE TABLE",
+        ast::Statement::CreateIndex(_) => "CREATE INDEX",
+        ast::Statement::CreateType { .. } => "CREATE TYPE",
+        ast::Statement::CreateFunction(_) => "CREATE FUNCTION",
+        ast::Statement::CreateCast { .. } => "CREATE CAST",
+        ast::Statement::Truncate(_) => "TRUNCATE TABLE",
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Table,
+            ..
+        } => "DROP TABLE",
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Type,
+            ..
+        } => "DROP TYPE",
+        ast::Statement::DropCast { .. } => "DROP CAST",
+        _ => return None,
+    })
+}
+
+/// `BEGIN` / `START TRANSACTION`. Enters the transaction block, seeding its
+/// isolation level and access mode from the transaction modes (falling back to
+/// the session defaults). A redundant BEGIN warns but stays in the block. Data
+/// rollback and MVCC snapshots are already wired through [`ActiveTxn`]; the
+/// block's XID is allocated lazily on its first write.
 fn begin_transaction(
     session: &mut Session,
     modes: &[ast::TransactionMode],
@@ -388,19 +517,17 @@ fn begin_transaction(
             )],
         });
     }
-    // Opening a new block: unsupported modes/modifiers are an honest 0A000.
-    if !modes.is_empty() {
-        return Err(PgError::feature_not_supported(
-            "transaction modes (isolation level / read write) are not supported yet",
-        ));
-    }
     if modifier.is_some() {
         return Err(and_chain_unsupported());
     }
+    // Resolve modes before mutating any state, so an unsupported mode (SNAPSHOT)
+    // fails without half-opening a block. Named modes override the session
+    // defaults; unnamed ones inherit them.
+    let (mode_iso, mode_read_only) = apply_modes(modes)?;
+    let iso = mode_iso.unwrap_or(session.default_iso);
+    let read_only = mode_read_only.unwrap_or(session.default_read_only);
     session.tx_status = TransactionStatus::InTransaction;
-    // Open the data-level transaction. Isolation levels are still rejected above
-    // (P6), so every block is READ COMMITTED for now.
-    session.xact = Some(ActiveTxn::new(IsolationLevel::ReadCommitted));
+    session.xact = Some(ActiveTxn::new(iso, read_only));
     Ok(QueryResult::command(tag))
 }
 
@@ -452,7 +579,8 @@ fn commit_transaction(
 }
 
 /// `ROLLBACK`. Ends the block (in any state); with no block open it warns.
-/// Note: committed in-memory data is not undone yet — that is M2.
+/// Aborting the block's XID makes every version it wrote dead (MVCC undo, no
+/// physical rollback needed), and vacuum later reclaims them.
 fn rollback_transaction(
     txnmgr: &TransactionManager,
     session: &mut Session,
@@ -688,38 +816,198 @@ fn index_rows_equal(
     })
 }
 
-/// `SET`: only `extra_float_digits` is honored; other GUCs are accepted and
-/// ignored (driver compatibility), as before.
+/// `SET`: honors `extra_float_digits`, `default_transaction_isolation`,
+/// `default_transaction_read_only`, and the `SET TRANSACTION` family; other GUCs
+/// are accepted and ignored (driver compatibility), as before.
 fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgError> {
-    if let ast::Set::SingleAssignment {
-        variable, values, ..
-    } = set
-        && single_ident_lower(variable).as_deref() == Some("extra_float_digits")
-    {
-        let v = set_value_to_i32(values)?;
-        if !(-15..=3).contains(&v) {
-            return Err(PgError::new(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                format!(
-                    "{v} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)"
-                ),
-            ));
+    match set {
+        ast::Set::SetTransaction {
+            modes,
+            snapshot,
+            session: is_session,
+        } => {
+            return apply_set_transaction(session, modes, snapshot.is_some(), *is_session);
         }
-        session.extra_float_digits = v;
+        ast::Set::SingleAssignment {
+            variable, values, ..
+        } => match single_ident_lower(variable).as_deref() {
+            // `SET x = DEFAULT` restores each GUC's boot value (PG accepts it and
+            // resets rather than erroring on the "DEFAULT" token).
+            Some("extra_float_digits") => {
+                session.extra_float_digits = if is_set_default(values) {
+                    1
+                } else {
+                    let v = set_value_to_i32(values)?;
+                    if !(-15..=3).contains(&v) {
+                        return Err(PgError::new(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            format!(
+                                "{v} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)"
+                            ),
+                        ));
+                    }
+                    v
+                };
+            }
+            Some("default_transaction_isolation") => {
+                session.default_iso = if is_set_default(values) {
+                    IsolationLevel::ReadCommitted
+                } else {
+                    parse_default_isolation(values)?
+                };
+            }
+            Some("default_transaction_read_only") => {
+                session.default_read_only = if is_set_default(values) {
+                    false
+                } else {
+                    parse_set_bool(values, "default_transaction_read_only")?
+                };
+            }
+            _ => {}
+        },
+        _ => {}
     }
     Ok(QueryResult::command("SET"))
 }
 
-/// `RESET extra_float_digits` / `RESET ALL` restore the default (1).
-fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<QueryResult, PgError> {
-    let reset_efd = match &reset.reset {
-        ast::Reset::ALL => true,
-        ast::Reset::ConfigurationParameter(name) => {
-            single_ident_lower(name).as_deref() == Some("extra_float_digits")
+/// `SET TRANSACTION …` (the current transaction) or `SET SESSION CHARACTERISTICS
+/// AS TRANSACTION …` (the session default). Both feed the isolation level and
+/// access mode into the same [`ActiveTxn`] / session-default state a BEGIN block
+/// reads, so no new visibility machinery is needed.
+fn apply_set_transaction(
+    session: &mut Session,
+    modes: &[ast::TransactionMode],
+    has_snapshot: bool,
+    is_session: bool,
+) -> Result<QueryResult, PgError> {
+    if has_snapshot {
+        return Err(PgError::feature_not_supported(
+            "SET TRANSACTION SNAPSHOT is not supported yet",
+        ));
+    }
+    let (iso, read_only) = apply_modes(modes)?;
+    if is_session {
+        // SET SESSION CHARACTERISTICS: change the defaults new blocks inherit.
+        if let Some(iso) = iso {
+            session.default_iso = iso;
         }
+        if let Some(read_only) = read_only {
+            session.default_read_only = read_only;
+        }
+        return Ok(QueryResult::command("SET"));
+    }
+    // Current transaction. Outside a block PG only WARNs and still succeeds; a
+    // failed block is already rejected upstream (25P02), so the non-block case
+    // reaching here is Idle.
+    let Some(active) = session.xact.as_mut() else {
+        return Ok(QueryResult::Command {
+            tag: "SET".into(),
+            notices: vec![Notice::warning(
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                "SET TRANSACTION can only be used in transaction blocks",
+            )],
+        });
     };
-    if reset_efd {
+    // Only the isolation level is snapshot-gated: PG rejects a post-query
+    // ISOLATION LEVEL change with 25001 but still lets READ ONLY/WRITE change any
+    // time in the block.
+    if iso.is_some() && active.has_run_query {
+        return Err(PgError::new(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+        ));
+    }
+    if let Some(iso) = iso {
+        active.iso = iso;
+    }
+    if let Some(read_only) = read_only {
+        active.read_only = read_only;
+    }
+    Ok(QueryResult::command("SET"))
+}
+
+/// Parse the value of `default_transaction_isolation`. Accepts PG's spellings
+/// (`read committed`/`repeatable read`/`serializable`, `read uncommitted` as an
+/// alias); an unrecognized value is an invalid-parameter error (22023).
+fn parse_default_isolation(values: &[ast::Expr]) -> Result<IsolationLevel, PgError> {
+    let raw = set_value_to_string(values);
+    match raw.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
+        Some(ref s) if s == "read uncommitted" || s == "read committed" => {
+            Ok(IsolationLevel::ReadCommitted)
+        }
+        Some(ref s) if s == "repeatable read" => Ok(IsolationLevel::RepeatableRead),
+        Some(ref s) if s == "serializable" => Ok(IsolationLevel::Serializable),
+        _ => Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!(
+                "invalid value for parameter \"default_transaction_isolation\": \"{}\"",
+                raw.unwrap_or_default()
+            ),
+        )),
+    }
+}
+
+/// Parse a Boolean GUC value using PG's boolean spellings (any unambiguous
+/// prefix of true/false/yes/no/off, `on`, `1`/`0`). An unrecognized value is an
+/// invalid-parameter error (22023).
+fn parse_set_bool(values: &[ast::Expr], param: &str) -> Result<bool, PgError> {
+    set_value_to_string(values)
+        .as_deref()
+        .and_then(crabgresql_types::parse_bool)
+        .ok_or_else(|| {
+            PgError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("parameter \"{param}\" requires a Boolean value"),
+            )
+        })
+}
+
+/// Whether a `SET var = value` names the literal `DEFAULT` keyword, which resets
+/// the GUC to its boot value.
+fn is_set_default(values: &[ast::Expr]) -> bool {
+    matches!(
+        values,
+        [ast::Expr::Identifier(ident)]
+            if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("default")
+    )
+}
+
+/// The single scalar value of a `SET var = value`, rendered as a string. Covers
+/// the literal and bare-identifier forms both `default_transaction_*` GUCs use.
+fn set_value_to_string(exprs: &[ast::Expr]) -> Option<String> {
+    let [expr] = exprs else {
+        return None;
+    };
+    match expr {
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::SingleQuotedString(s) => Some(s.clone()),
+            ast::Value::DollarQuotedString(d) => Some(d.value.clone()),
+            ast::Value::Number(n, _) => Some(n.clone()),
+            ast::Value::Boolean(b) => Some(b.to_string()),
+            _ => None,
+        },
+        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
+        _ => None,
+    }
+}
+
+/// `RESET <param>` / `RESET ALL` restore the session defaults:
+/// `extra_float_digits`=1, `default_transaction_isolation`=READ COMMITTED,
+/// `default_transaction_read_only`=off.
+fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<QueryResult, PgError> {
+    let (all, name) = match &reset.reset {
+        ast::Reset::ALL => (true, None),
+        ast::Reset::ConfigurationParameter(name) => (false, single_ident_lower(name)),
+    };
+    let hit = |param: &str| all || name.as_deref() == Some(param);
+    if hit("extra_float_digits") {
         session.extra_float_digits = 1;
+    }
+    if hit("default_transaction_isolation") {
+        session.default_iso = IsolationLevel::ReadCommitted;
+    }
+    if hit("default_transaction_read_only") {
+        session.default_read_only = false;
     }
     Ok(QueryResult::command("RESET"))
 }

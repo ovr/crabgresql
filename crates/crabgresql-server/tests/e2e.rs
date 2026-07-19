@@ -1063,6 +1063,289 @@ async fn disconnect_mid_block_aborts_and_frees_the_row() {
 }
 
 #[tokio::test]
+async fn repeatable_read_freezes_the_snapshot() {
+    let port = spawn_server().await;
+    let a = connect(port).await;
+    let b = connect(port).await;
+    a.simple_query("CREATE TABLE t (id integer)").await.unwrap();
+    a.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+
+    a.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    // The first read freezes the block's snapshot (before B's insert).
+    assert_eq!(row_count(&a, "t").await, 1);
+    b.simple_query("INSERT INTO t VALUES (2)").await.unwrap();
+    // RR reuses that snapshot: B's later commit stays invisible to A.
+    assert_eq!(row_count(&a, "t").await, 1);
+    a.simple_query("COMMIT").await.unwrap();
+    // A fresh block sees B's committed row.
+    assert_eq!(row_count(&a, "t").await, 2);
+}
+
+#[tokio::test]
+async fn read_committed_sees_concurrent_commits() {
+    let port = spawn_server().await;
+    let a = connect(port).await;
+    let b = connect(port).await;
+    a.simple_query("CREATE TABLE t (id integer)").await.unwrap();
+    a.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+
+    a.simple_query("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await
+        .unwrap();
+    assert_eq!(row_count(&a, "t").await, 1);
+    b.simple_query("INSERT INTO t VALUES (2)").await.unwrap();
+    // RC takes a fresh snapshot per statement, so A now sees B's committed row.
+    assert_eq!(row_count(&a, "t").await, 2);
+    a.simple_query("COMMIT").await.unwrap();
+}
+
+#[tokio::test]
+async fn set_transaction_sets_isolation_before_any_query() {
+    let port = spawn_server().await;
+    let a = connect(port).await;
+    let b = connect(port).await;
+    a.simple_query("CREATE TABLE t (id integer)").await.unwrap();
+    a.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+
+    a.simple_query("BEGIN").await.unwrap();
+    a.simple_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    assert_eq!(row_count(&a, "t").await, 1); // freezes the snapshot
+    b.simple_query("INSERT INTO t VALUES (2)").await.unwrap();
+    assert_eq!(row_count(&a, "t").await, 1); // RR: still frozen
+    a.simple_query("COMMIT").await.unwrap();
+}
+
+#[tokio::test]
+async fn set_transaction_after_a_query_errors_25001() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN").await.unwrap();
+    client.simple_query("SELECT * FROM t").await.unwrap();
+    let err = client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("should be a server error");
+    assert_eq!(
+        db.code(),
+        &tokio_postgres::error::SqlState::ACTIVE_SQL_TRANSACTION
+    );
+    assert_eq!(
+        db.message(),
+        "SET TRANSACTION ISOLATION LEVEL must be called before any query"
+    );
+    client.simple_query("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
+async fn set_transaction_outside_a_block_warns_but_succeeds() {
+    // PG warns and still completes with tag SET (no error, session stays idle) —
+    // it does not raise 25P01. Checked over the raw wire so the NOTICE frame is
+    // visible.
+    let mut socket = raw_session(spawn_server().await).await;
+    let msgs = simple_query_raw(&mut socket, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await;
+    let notice = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'N')
+        .expect("a warning is expected");
+    assert_eq!(fields(notice).code(), "25P01");
+    assert!(!msgs.iter().any(|(tag, _)| *tag == b'E'), "must not error");
+    assert_eq!(command_tags(&msgs), ["SET"]);
+    assert_eq!(ready_status(&msgs), b'I', "session stays idle");
+}
+
+#[tokio::test]
+async fn set_transaction_read_only_after_a_query_is_allowed() {
+    // Only ISOLATION LEVEL is snapshot-gated; READ ONLY can be set any time.
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN").await.unwrap();
+    client.simple_query("SELECT * FROM t").await.unwrap();
+    client
+        .simple_query("SET TRANSACTION READ ONLY")
+        .await
+        .expect("SET TRANSACTION READ ONLY is allowed after a query");
+    // It took effect: a write is now rejected.
+    let err = client
+        .simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("server error").code(),
+        &tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION
+    );
+    client.simple_query("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
+async fn set_transaction_isolation_after_ddl_errors_25001() {
+    // A DDL statement takes a snapshot, so a later ISOLATION LEVEL change is
+    // rejected just as it would be after a SELECT.
+    let client = connect(spawn_server().await).await;
+    client.simple_query("BEGIN").await.unwrap();
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    let err = client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("server error").code(),
+        &tokio_postgres::error::SqlState::ACTIVE_SQL_TRANSACTION
+    );
+    client.simple_query("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
+async fn set_guc_to_default_resets_it() {
+    let client = connect(spawn_server().await).await;
+    // = DEFAULT resets rather than erroring on the "DEFAULT" token.
+    client
+        .simple_query("SET default_transaction_isolation = DEFAULT")
+        .await
+        .expect("= DEFAULT resets default_transaction_isolation");
+    client
+        .simple_query("SET default_transaction_read_only = DEFAULT")
+        .await
+        .expect("= DEFAULT resets default_transaction_read_only");
+    client
+        .simple_query("SET extra_float_digits = DEFAULT")
+        .await
+        .expect("= DEFAULT resets extra_float_digits");
+}
+
+#[tokio::test]
+async fn read_only_transaction_rejects_writes_25006() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN READ ONLY").await.unwrap();
+    let err = client
+        .simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("should be a server error");
+    assert_eq!(
+        db.code(),
+        &tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION
+    );
+    assert_eq!(
+        db.message(),
+        "cannot execute INSERT in a read-only transaction"
+    );
+    client.simple_query("ROLLBACK").await.unwrap();
+    // Reads are still allowed in a read-only block.
+    client.simple_query("BEGIN READ ONLY").await.unwrap();
+    assert_eq!(row_count(&client, "t").await, 0);
+    client.simple_query("COMMIT").await.unwrap();
+}
+
+#[tokio::test]
+async fn read_only_transaction_rejects_ddl_before_resolution() {
+    // DDL is rejected up front (25006) — even for a missing target, the
+    // read-only error precedes the undefined-object error, as in PG.
+    let client = connect(spawn_server().await).await;
+    client.simple_query("BEGIN READ ONLY").await.unwrap();
+    let err = client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("server error");
+    assert_eq!(
+        db.code(),
+        &tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION
+    );
+    assert_eq!(
+        db.message(),
+        "cannot execute CREATE TABLE in a read-only transaction"
+    );
+    client.simple_query("ROLLBACK").await.unwrap();
+
+    // DROP of a missing table also reports 25006, not 42P01.
+    client.simple_query("BEGIN READ ONLY").await.unwrap();
+    let err = client.simple_query("DROP TABLE nope").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("server error").code(),
+        &tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION
+    );
+    client.simple_query("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
+async fn session_default_isolation_applies_to_new_blocks() {
+    let port = spawn_server().await;
+    let a = connect(port).await;
+    let b = connect(port).await;
+    a.simple_query("CREATE TABLE t (id integer)").await.unwrap();
+    a.simple_query("INSERT INTO t VALUES (1)").await.unwrap();
+
+    // SET SESSION CHARACTERISTICS makes a subsequent bare BEGIN block RR.
+    a.simple_query("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    a.simple_query("BEGIN").await.unwrap();
+    assert_eq!(row_count(&a, "t").await, 1); // freeze
+    b.simple_query("INSERT INTO t VALUES (2)").await.unwrap();
+    assert_eq!(row_count(&a, "t").await, 1); // RR freeze from the session default
+    a.simple_query("COMMIT").await.unwrap();
+
+    // The plain GUC spelling switches the default back to READ COMMITTED.
+    a.simple_query("SET default_transaction_isolation = 'read committed'")
+        .await
+        .unwrap();
+    a.simple_query("BEGIN").await.unwrap();
+    assert_eq!(row_count(&a, "t").await, 2);
+    b.simple_query("INSERT INTO t VALUES (3)").await.unwrap();
+    assert_eq!(row_count(&a, "t").await, 3); // RC sees the concurrent commit
+    a.simple_query("COMMIT").await.unwrap();
+}
+
+#[tokio::test]
+async fn default_read_only_guc_blocks_autocommit_writes() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer)")
+        .await
+        .unwrap();
+    client
+        .simple_query("SET default_transaction_read_only = on")
+        .await
+        .unwrap();
+    let err = client
+        .simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("server error").code(),
+        &tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION
+    );
+    // Turning it back off restores writes.
+    client
+        .simple_query("SET default_transaction_read_only = off")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t VALUES (1)")
+        .await
+        .unwrap();
+    assert_eq!(row_count(&client, "t").await, 1);
+}
+
+#[tokio::test]
 async fn update_and_delete_without_where_hit_all_rows() {
     let client = connect(spawn_server().await).await;
     client
@@ -1757,8 +2040,9 @@ async fn unsupported_transaction_forms_are_rejected() {
         .await
         .unwrap();
     for sql in [
-        "BEGIN ISOLATION LEVEL SERIALIZABLE",
-        "BEGIN TRANSACTION READ ONLY",
+        // ISOLATION LEVEL / READ ONLY are now honored; SNAPSHOT isolation and
+        // SET TRANSACTION SNAPSHOT remain unsupported modes.
+        "BEGIN ISOLATION LEVEL SNAPSHOT",
         "SAVEPOINT s",
         "ROLLBACK TO SAVEPOINT s",
         "TRUNCATE t CASCADE",
