@@ -150,6 +150,25 @@ async fn select_literals_with_aliases() {
 }
 
 #[tokio::test]
+async fn regex_and_similar_to_operators() {
+    let client = connect(spawn_server().await).await;
+    let messages = client
+        .simple_query(
+            "SELECT 'abc' ~ '^a' AS m, 'ABC' ~* 'abc' AS ci, 'abc' !~ 'z' AS nm, \
+             'abc' SIMILAR TO '(b|a)%' AS sim, 'abc' NOT SIMILAR TO 'x%' AS nsim",
+        )
+        .await
+        .unwrap();
+    let rows = rows(&messages);
+    let row = rows[0];
+    let names: Vec<_> = row.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["m", "ci", "nm", "sim", "nsim"]);
+    for i in 0..5 {
+        assert_eq!(row.get(i), Some("t"));
+    }
+}
+
+#[tokio::test]
 async fn hex_string_literals_bind_display_and_cast() {
     let client = connect(spawn_server().await).await;
     let messages = client

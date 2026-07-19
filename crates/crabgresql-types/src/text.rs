@@ -15,6 +15,7 @@ mod sqlstate {
     pub const SUBSTRING_ERROR: &str = "22011";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
     pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
+    pub const INVALID_REGULAR_EXPRESSION: &str = "2201B";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
 }
 
@@ -421,6 +422,175 @@ pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool
         let text: Vec<char> = s.chars().collect();
         Ok(match_tokens(&text, &toks))
     }
+}
+
+// --- regex (`~` / `~*`) and SIMILAR TO -------------------------------------
+
+/// Turn a `regex` crate compile failure into PG's `invalid regular expression`
+/// error (SQLSTATE `2201B`). PG's detail text differs from the `regex` crate's,
+/// but the SQLSTATE and message prefix match observed PG behavior.
+fn invalid_regex(e: regex::Error) -> TextError {
+    // The crate's `Display` is multi-line; collapse to a single line so the
+    // message reads like PG's one-line `invalid regular expression: ...`.
+    let detail = e.to_string().split('\n').collect::<Vec<_>>().join(" ");
+    TextError::new(
+        sqlstate::INVALID_REGULAR_EXPRESSION,
+        format!("invalid regular expression: {detail}"),
+    )
+}
+
+/// POSIX regex match, backing the `~` (case-sensitive) and `~*`
+/// (case-insensitive) operators. The match is *unanchored*: `~` succeeds when
+/// the pattern matches anywhere in `s`, as in PG.
+pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<bool> {
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(invalid_regex)?;
+    Ok(re.is_match(s))
+}
+
+/// `SIMILAR TO`: an SQL-standard pattern language distinct from both LIKE and
+/// POSIX regex. It is case-sensitive and matches the *whole* string (unlike
+/// `~`). We translate it to a POSIX regex and delegate to the `regex` crate.
+pub fn similar_to_match(s: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
+    let translated = similar_to_regex(pattern, escape)?;
+    let re = regex::Regex::new(&translated).map_err(invalid_regex)?;
+    Ok(re.is_match(s))
+}
+
+/// Emit `c` as a regex literal, escaping it when it is a regex metacharacter
+/// (`regex::escape` covers the full set: `. + * ? ( ) | [ ] { } ^ $ \`).
+fn push_literal(out: &mut String, c: char) {
+    // `regex::escape` is the authoritative metacharacter set, so a literal char
+    // stays a literal even as the regex grammar grows.
+    let mut buf = [0u8; 4];
+    out.push_str(&regex::escape(c.encode_utf8(&mut buf)));
+}
+
+/// Copy a bracket expression `[...]` verbatim from `chars` (positioned just
+/// after the opening `[`) into `out`. Inside a bracket expression the SIMILAR TO
+/// wildcards `%`/`_` and the escape character lose their meaning — PG hands the
+/// contents to its regex engine as a POSIX character class — so we pass them
+/// through unchanged (only tracking where the class ends). A leading `^` and a
+/// `]` in first position are literal members, and `[:name:]`/`[.x.]`/`[=x=]`
+/// sub-expressions are copied whole. An unterminated class is left unbalanced so
+/// the regex compiler rejects it, matching PG's `brackets [] not balanced`.
+fn copy_bracket(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
+    out.push('[');
+    if chars.peek() == Some(&'^') {
+        out.push('^');
+        chars.next();
+    }
+    if chars.peek() == Some(&']') {
+        out.push(']');
+        chars.next();
+    }
+    while let Some(c) = chars.next() {
+        match c {
+            ']' => {
+                out.push(']');
+                return;
+            }
+            '[' if matches!(chars.peek(), Some(':' | '.' | '=')) => {
+                // A POSIX class/collating/equivalence sub-expression: copy it
+                // through its matching `:]` / `.]` / `=]` so the inner `]` does
+                // not prematurely close the outer class.
+                let kind = *chars.peek().unwrap();
+                out.push('[');
+                out.push(kind);
+                chars.next();
+                while let Some(cc) = chars.next() {
+                    out.push(cc);
+                    if cc == kind && chars.peek() == Some(&']') {
+                        out.push(']');
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+}
+
+/// If a valid regex bound (`{m}`, `{m,}`, `{m,n}`) follows the just-consumed
+/// `{`, copy it through the closing `}` and return; otherwise emit a literal
+/// `{`, leaving the following characters for the caller. PG treats a `{` that
+/// does not open a bound as an ordinary character.
+fn push_brace(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
+    let mut look = chars.clone();
+    let mut bound = String::new();
+    let digits = |it: &mut std::iter::Peekable<std::str::Chars>, buf: &mut String| {
+        let mut any = false;
+        while let Some(&d) = it.peek() {
+            if d.is_ascii_digit() {
+                buf.push(d);
+                it.next();
+                any = true;
+            } else {
+                break;
+            }
+        }
+        any
+    };
+    if !digits(&mut look, &mut bound) {
+        push_literal(out, '{');
+        return;
+    }
+    if look.peek() == Some(&',') {
+        bound.push(',');
+        look.next();
+        digits(&mut look, &mut bound);
+    }
+    if look.peek() == Some(&'}') {
+        look.next();
+        out.push('{');
+        out.push_str(&bound);
+        out.push('}');
+        *chars = look;
+    } else {
+        push_literal(out, '{');
+    }
+}
+
+/// Translate a `SIMILAR TO` pattern into an anchored POSIX regex string.
+///
+/// `%` becomes `.*` and `_` becomes `.` (both match any character, including a
+/// newline — hence the leading `(?s)`); the SQL-regex metacharacters `| * + ? (
+/// )` and valid `{...}` bounds pass through; bracket expressions `[...]` are
+/// copied verbatim (see [`copy_bracket`]); every other character is emitted as a
+/// regex literal. The escape character (default `\`) makes the following
+/// character a literal. The result is wrapped in `(?s)^(?:...)$` so the match
+/// spans the whole string.
+fn similar_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
+    let mut out = String::from("(?s)^(?:");
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next) => push_literal(&mut out, next),
+                None => {
+                    return Err(TextError::new(
+                        sqlstate::INVALID_ESCAPE_SEQUENCE,
+                        "invalid SQL regular expression: escape character must not be the last character",
+                    ));
+                }
+            }
+        } else {
+            match c {
+                '%' => out.push_str(".*"),
+                '_' => out.push('.'),
+                // SQL-regex metacharacters shared with POSIX regex.
+                '|' | '*' | '+' | '?' | '(' | ')' => out.push(c),
+                '[' => copy_bracket(&mut chars, &mut out),
+                '{' => push_brace(&mut chars, &mut out),
+                other => push_literal(&mut out, other),
+            }
+        }
+    }
+    out.push_str(")$");
+    Ok(out)
 }
 
 // --- encode / decode -------------------------------------------------------
@@ -937,6 +1107,75 @@ mod tests {
         assert!(like("ABC", "abc", None, true).unwrap());
         assert!(like("a%b", "a\\%b", Some('\\'), false).unwrap());
         assert!(!like("axb", "a\\%b", Some('\\'), false).unwrap());
+    }
+
+    #[test]
+    fn regex_matching() {
+        // `~` is an unanchored (substring) match.
+        assert!(regex_match("abc", "b", false).unwrap());
+        assert!(regex_match("abc", "^a", false).unwrap());
+        assert!(!regex_match("abc", "^b", false).unwrap());
+        assert!(!regex_match("abc", "z", false).unwrap());
+        // `~*` is case-insensitive.
+        assert!(regex_match("ABC", "abc", true).unwrap());
+        assert!(!regex_match("ABC", "abc", false).unwrap());
+        // A malformed pattern raises `invalid regular expression` (2201B).
+        let e = regex_match("abc", "a(", false).unwrap_err();
+        assert_eq!(e.sqlstate, "2201B");
+        assert!(e.message.starts_with("invalid regular expression:"));
+    }
+
+    #[test]
+    fn similar_to_matching() {
+        // SIMILAR TO matches the whole string (anchored).
+        assert!(similar_to_match("abc", "a%", Some('\\')).unwrap());
+        assert!(!similar_to_match("abc", "a", Some('\\')).unwrap());
+        assert!(similar_to_match("abc", "a_c", Some('\\')).unwrap());
+        // Alternation and grouping are SQL-regex metacharacters.
+        assert!(similar_to_match("abc", "(a|z)%", Some('\\')).unwrap());
+        // A literal `.` must not act as a wildcard.
+        assert!(!similar_to_match("axc", "a.c", Some('\\')).unwrap());
+        assert!(similar_to_match("a.c", "a.c", Some('\\')).unwrap());
+        // The escape character makes the next character a literal.
+        assert!(similar_to_match("a%c", "a\\%c", Some('\\')).unwrap());
+        assert!(!similar_to_match("axc", "a\\%c", Some('\\')).unwrap());
+        // Escaping a metacharacter shared with regex keeps it literal (not raw).
+        assert!(similar_to_match("a|b", "a\\|b", Some('\\')).unwrap());
+        assert!(!similar_to_match("a", "a\\|b", Some('\\')).unwrap());
+        assert!(similar_to_match("(", "\\(", Some('\\')).unwrap());
+        // A trailing bare escape is an error.
+        assert_eq!(similar_to_match("abc", "abc\\", Some('\\')).unwrap_err().sqlstate, "22025");
+    }
+
+    #[test]
+    fn similar_to_bracket_expressions() {
+        // Inside `[...]`, `%` and `_` are literal members, not wildcards.
+        assert!(similar_to_match("%", "[%_]", Some('\\')).unwrap());
+        assert!(similar_to_match("_", "[%_]", Some('\\')).unwrap());
+        assert!(!similar_to_match("x", "[%_]", Some('\\')).unwrap());
+        assert!(similar_to_match("_", "[_]", Some('\\')).unwrap());
+        assert!(!similar_to_match(".", "[_]", Some('\\')).unwrap());
+        // Negated classes work (a leading `^` is class negation, not a literal).
+        assert!(similar_to_match("b", "[^a]", Some('\\')).unwrap());
+        assert!(!similar_to_match("a", "[^a]", Some('\\')).unwrap());
+        // Ranges and POSIX classes pass through.
+        assert!(similar_to_match("-", "[a-]", Some('\\')).unwrap());
+        assert!(similar_to_match("a", "[[:alpha:]]", Some('\\')).unwrap());
+        assert!(!similar_to_match("1", "[[:alpha:]]", Some('\\')).unwrap());
+        // An unbalanced bracket is rejected, as in PG.
+        assert_eq!(similar_to_match("a", "a[", Some('\\')).unwrap_err().sqlstate, "2201B");
+    }
+
+    #[test]
+    fn similar_to_newline_and_braces() {
+        // `%` and `_` match any character, including a newline.
+        assert!(similar_to_match("a\nb", "a%b", Some('\\')).unwrap());
+        assert!(similar_to_match("a\nb", "a_b", Some('\\')).unwrap());
+        // A valid bound is a quantifier; an invalid `{` is a literal.
+        assert!(similar_to_match("aa", "a{2}", Some('\\')).unwrap());
+        assert!(!similar_to_match("a", "a{2}", Some('\\')).unwrap());
+        assert!(similar_to_match("a{c", "a{c", Some('\\')).unwrap());
+        assert!(!similar_to_match("ac", "a{c", Some('\\')).unwrap());
     }
 
     #[test]

@@ -152,6 +152,32 @@ SELECT 'a%b' LIKE 'a\%b' AS esc1, 'axb' LIKE 'a\%b' AS esc2,
  t    | f    | t
 (1 row)
 
+-- POSIX regex operators: ~ / ~* / !~, with anchors and case-insensitivity
+SELECT 'abc' ~ 'b' AS r1, 'abc' ~ '^a' AS r2, 'abc' ~ '^b' AS r3,
+       'ABC' ~* 'abc' AS r4, 'abc' !~ 'z' AS r5;
+ r1 | r2 | r3 | r4 | r5 
+----+----+----+----+----
+ t  | t  | f  | t  | t
+(1 row)
+
+-- SIMILAR TO: whole-string match, alternation, _ wildcard, NOT, ESCAPE
+SELECT 'abc' SIMILAR TO '(b|a)%' AS s1, 'abc' SIMILAR TO 'a_c' AS s2,
+       'abc' SIMILAR TO 'a' AS s3, 'abc' NOT SIMILAR TO 'x%' AS s4,
+       'a%c' SIMILAR TO 'a$%c' ESCAPE '$' AS s5;
+ s1 | s2 | s3 | s4 | s5 
+----+----+----+----+----
+ t  | t  | f  | t  | t
+(1 row)
+
+-- SIMILAR TO bracket expressions, quantifier bounds, and escaped metacharacters
+SELECT 'b' SIMILAR TO '[^a]' AS b1, '%' SIMILAR TO '[%_]' AS b2,
+       'aa' SIMILAR TO 'a{2}' AS b3, 'a{c' SIMILAR TO 'a{c' AS b4,
+       'a|b' SIMILAR TO 'a\|b' AS b5;
+ b1 | b2 | b3 | b4 | b5 
+----+----+----+----+----
+ t  | t  | t  | t  | t
+(1 row)
+
 -- encode / decode
 SELECT encode('\x001000'::bytea, 'hex') AS e_hex, encode('abc'::bytea, 'base64') AS e_b64,
        encode('a\000b'::bytea, 'escape') AS e_esc;

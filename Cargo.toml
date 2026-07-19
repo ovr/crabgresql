@@ -29,6 +29,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+regex = "1"
 similar = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }

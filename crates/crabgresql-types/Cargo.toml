@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 pg-ryu = { workspace = true }
 jiff = { workspace = true }
+regex = { workspace = true }

@@ -610,6 +610,9 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         ast::Expr::ILike { negated, any, expr, pattern, escape_char } => {
             bind_like_node(expr, pattern, escape_char.as_ref(), *any, true, *negated, scope)
         }
+        ast::Expr::SimilarTo { negated, expr, pattern, escape_char } => {
+            bind_similar_to(expr, pattern, escape_char.as_ref(), *negated, scope)
+        }
         ast::Expr::InList { expr, list, negated } => bind_in_list(expr, list, *negated, scope),
         other => Err(unsupported_expr(other)),
     }
@@ -1766,6 +1769,18 @@ fn bind_binary(
         let rb = bind_expr(right, scope)?;
         return bind_like(lb, rb, None, ci, negated);
     }
+    // The POSIX regex operators `~` / `~*` / `!~` / `!~*`.
+    if let Some((ci, negated)) = match op {
+        ast::BinaryOperator::PGRegexMatch => Some((false, false)),
+        ast::BinaryOperator::PGRegexIMatch => Some((true, false)),
+        ast::BinaryOperator::PGRegexNotMatch => Some((false, true)),
+        ast::BinaryOperator::PGRegexNotIMatch => Some((true, true)),
+        _ => None,
+    } {
+        let lb = bind_expr(left, scope)?;
+        let rb = bind_expr(right, scope)?;
+        return bind_regex(lb, rb, ci, negated);
+    }
 
     let lb = bind_expr(left, scope)?;
     let rb = bind_expr(right, scope)?;
@@ -2757,6 +2772,61 @@ fn bind_like(
         ret: PgType::Bool,
         args,
     };
+    let expr = if negated {
+        BoundExpr::Unary { op: UnaryOp::Not, expr: Box::new(call) }
+    } else {
+        call
+    };
+    Ok(Binding::Typed(expr))
+}
+
+/// `a ~ b` / `a ~* b` (and their negations): coerce operands to text and build
+/// the POSIX regex match call, wrapping a negated form (`!~` / `!~*`) in `NOT`.
+fn bind_regex(
+    lb: Binding,
+    rb: Binding,
+    case_insensitive: bool,
+    negated: bool,
+) -> Result<Binding, BindError> {
+    let args = vec![to_text_operand(lb)?, to_text_operand(rb)?];
+    let call = BoundExpr::FuncCall {
+        func: if case_insensitive { ScalarFn::RegexIMatch } else { ScalarFn::RegexMatch },
+        ret: PgType::Bool,
+        args,
+    };
+    let expr = if negated {
+        BoundExpr::Unary { op: UnaryOp::Not, expr: Box::new(call) }
+    } else {
+        call
+    };
+    Ok(Binding::Typed(expr))
+}
+
+/// `a SIMILAR TO b [ESCAPE c]`: coerce operands to text and build the match
+/// call (the escape string, when present, is a third argument), wrapping a
+/// negated form in `NOT`.
+fn bind_similar_to(
+    expr: &ast::Expr,
+    pattern: &ast::Expr,
+    escape_char: Option<&ast::ValueWithSpan>,
+    negated: bool,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let mut args = vec![
+        to_text_operand(bind_expr(expr, scope)?)?,
+        to_text_operand(bind_expr(pattern, scope)?)?,
+    ];
+    if let Some(v) = escape_char {
+        match &v.value {
+            ast::Value::SingleQuotedString(s) => {
+                args.push(BoundExpr::Const { value: Value::Text(s.clone()), ty: PgType::Text });
+            }
+            other => {
+                return Err(BindError::syntax(format!("invalid ESCAPE literal: {other}")));
+            }
+        }
+    }
+    let call = BoundExpr::FuncCall { func: ScalarFn::SimilarTo, ret: PgType::Bool, args };
     let expr = if negated {
         BoundExpr::Unary { op: UnaryOp::Not, expr: Box::new(call) }
     } else {

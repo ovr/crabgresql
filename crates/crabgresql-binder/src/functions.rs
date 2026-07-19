@@ -314,6 +314,12 @@ pub enum ScalarFn {
     Like,
     /// `text ILIKE text -> bool` (case-insensitive).
     ILike,
+    /// `text ~ text -> bool` (POSIX regex, case-sensitive).
+    RegexMatch,
+    /// `text ~* text -> bool` (POSIX regex, case-insensitive).
+    RegexIMatch,
+    /// `text SIMILAR TO text [ESCAPE text] -> bool`.
+    SimilarTo,
     /// `encode(bytea, text) -> text`.
     Encode,
     /// `decode(text, text) -> bytea`.
