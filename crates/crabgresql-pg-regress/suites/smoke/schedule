@@ -22,3 +22,4 @@ test: inet
 test: cidr
 test: pg_catalog
 test: information_schema
+test: constraints

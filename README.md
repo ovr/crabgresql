@@ -30,17 +30,20 @@ What exists today:
   logical plan onto scan pipelines. Supported: FROM-less and table-backed
   `SELECT` with expressions, filtering, ordering, limits, grouping/aggregates,
   comma/`CROSS JOIN`, and `INNER`/`LEFT`/`RIGHT`/`FULL JOIN ... ON`;
-  `CREATE TABLE [IF NOT EXISTS]`,
+  `CREATE TABLE [IF NOT EXISTS]` with `NOT NULL`, per-row `DEFAULT`, and
+  `PRIMARY KEY`/`UNIQUE` constraints, semantic `CREATE [UNIQUE] INDEX`,
   atomic `INSERT ... VALUES`, `UPDATE ... SET ... [WHERE]`,
   `DELETE FROM ... [WHERE]`, and no-op `SET`. Anything parsed but not executed
-  (including `JOIN USING`/`NATURAL JOIN` and constraints) errors with `0A000`
+  (including `JOIN USING`/`NATURAL JOIN`, foreign keys, checks, and advanced
+  index forms) errors with `0A000`
   instead of being silently ignored.
 - **Expressions** (`crabgresql-executor::eval`): comparisons, `AND`/`OR`/`NOT`
   with SQL three-valued NULL logic, `IS [NOT] NULL`, int4/int8 arithmetic
   with PG overflow (`22003`) and division-by-zero (`22012`) behavior.
 - **Execution** (`crabgresql-executor`): Volcano iterator nodes — `Values`,
   `SeqScan`, `Filter`, `Projection`, nested-loop joins, aggregation, sorting,
-  and limits — plus buffered (statement-atomic) INSERT/UPDATE/DELETE.
+  and limits — plus buffered (statement-atomic) INSERT/UPDATE/DELETE with
+  NOT NULL and immediate composite-uniqueness validation.
 - **Storage** (`crabgresql-storage-api` + `crabgresql-memory-storage`): the
   pluggable `TableEngine`/`TableAm` API — tid-addressed scan/insert/update/
   delete — and its in-memory reference engine (copy-on-write snapshots,

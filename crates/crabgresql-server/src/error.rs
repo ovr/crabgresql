@@ -52,8 +52,12 @@ impl PgError {
 impl From<StorageError> for PgError {
     fn from(e: StorageError) -> Self {
         let code = match &e {
-            StorageError::TableNotFound(_) => sqlstate::UNDEFINED_TABLE,
-            StorageError::TableAlreadyExists(_) => sqlstate::DUPLICATE_TABLE,
+            StorageError::TableNotFound(_) | StorageError::IndexTableNotFound(_) => {
+                sqlstate::UNDEFINED_TABLE
+            }
+            StorageError::TableAlreadyExists(_) | StorageError::RelationAlreadyExists(_) => {
+                sqlstate::DUPLICATE_TABLE
+            }
         };
         Self::new(code, e.to_string())
     }

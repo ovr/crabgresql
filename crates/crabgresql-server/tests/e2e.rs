@@ -681,8 +681,6 @@ async fn temp_table_shadows_permanent_within_the_session_only() {
 async fn unenforceable_ddl_is_rejected() {
     let client = connect(spawn_server().await).await;
     for sql in [
-        "CREATE TABLE c (id integer PRIMARY KEY)",
-        "CREATE TABLE c (id integer NOT NULL)",
         // Clauses we can't honor must be rejected, not silently dropped: CTAS
         // would discard the SELECT, and ON COMMIT needs the M2 txn engine.
         "CREATE TABLE c AS SELECT 1 AS x",
@@ -697,6 +695,178 @@ async fn unenforceable_ddl_is_rejected() {
             "{sql}"
         );
     }
+}
+
+#[tokio::test]
+async fn defaults_constraints_and_semantic_indexes() {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE c (\
+                id integer PRIMARY KEY, \
+                u integer UNIQUE, \
+                n integer CONSTRAINT c_n_nn NOT NULL, \
+                d integer DEFAULT (1 + 2))",
+        )
+        .await
+        .unwrap();
+
+    client
+        .simple_query("INSERT INTO c (id, n) VALUES (1, 10)")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "INSERT INTO c (id, u, n, d) VALUES \
+             (2, NULL, 20, DEFAULT), (3, NULL, 30, 7)",
+        )
+        .await
+        .unwrap();
+    client
+        .simple_query("UPDATE c SET d = DEFAULT WHERE id = 3")
+        .await
+        .unwrap();
+    let value_messages = client
+        .simple_query("SELECT id, d FROM c ORDER BY id")
+        .await
+        .unwrap();
+    let values = rows(&value_messages);
+    assert_eq!(values.len(), 3);
+    assert!(values.iter().all(|row| row.get(1) == Some("3")));
+
+    let update_duplicate = client.simple_query("UPDATE c SET u = 9").await.unwrap_err();
+    assert_eq!(
+        update_duplicate.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+    );
+    let unchanged_messages = client
+        .simple_query("SELECT count(*) FROM c WHERE u IS NULL")
+        .await
+        .unwrap();
+    assert_eq!(rows(&unchanged_messages)[0].get(0), Some("3"));
+
+    let duplicate = client
+        .simple_query("INSERT INTO c (id, u, n) VALUES (4, 9, 40), (5, 9, 50)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        duplicate.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+    );
+    assert_eq!(
+        rows(&client.simple_query("SELECT id FROM c").await.unwrap()).len(),
+        3,
+        "failed multi-row INSERT is atomic"
+    );
+
+    let not_null = client
+        .simple_query("INSERT INTO c (id, n) VALUES (4, NULL)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        not_null.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION
+    );
+
+    client
+        .simple_query(
+            "CREATE TABLE defaults_only (a integer DEFAULT (2 * 3), b text DEFAULT upper('x'))",
+        )
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO defaults_only DEFAULT VALUES")
+        .await
+        .unwrap();
+    let default_messages = client
+        .simple_query("SELECT a, b FROM defaults_only")
+        .await
+        .unwrap();
+    let default_rows = rows(&default_messages);
+    assert_eq!(default_rows[0].get(0), Some("6"));
+    assert_eq!(default_rows[0].get(1), Some("X"));
+
+    client
+        .simple_query("CREATE TABLE null_equal (a integer, UNIQUE NULLS NOT DISTINCT (a))")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO null_equal VALUES (NULL)")
+        .await
+        .unwrap();
+    let null_duplicate = client
+        .simple_query("INSERT INTO null_equal VALUES (NULL)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        null_duplicate.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+    );
+
+    client
+        .simple_query("CREATE TABLE ix (a integer, b text)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO ix VALUES (1, 'x'), (1, 'y')")
+        .await
+        .unwrap();
+    let build = client
+        .simple_query("CREATE UNIQUE INDEX ix_a_idx ON ix(a)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        build.as_db_error().unwrap().code(),
+        &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+    );
+    client
+        .simple_query("CREATE INDEX ix_b_idx ON ix(b)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE INDEX IF NOT EXISTS ix_b_idx ON ix(b)")
+        .await
+        .unwrap();
+
+    let column_messages = client
+        .simple_query(
+            "SELECT column_name, column_default, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_name = 'c' ORDER BY column_name",
+        )
+        .await
+        .unwrap();
+    let columns = rows(&column_messages);
+    let d = columns.iter().find(|row| row.get(0) == Some("d")).unwrap();
+    assert_eq!(d.get(1), Some("(1 + 2)"));
+    let id = columns.iter().find(|row| row.get(0) == Some("id")).unwrap();
+    assert_eq!(id.get(2), Some("NO"));
+
+    let index_messages = client
+        .simple_query("SELECT indexrelid, indisunique FROM pg_index ORDER BY indexrelid")
+        .await
+        .unwrap();
+    let indexes = rows(&index_messages);
+    assert_eq!(
+        indexes.len(),
+        4,
+        "PK, UNIQUE constraints, and explicit index are reflected"
+    );
+    let constraint_messages = client
+        .simple_query("SELECT count(*) FROM pg_constraint")
+        .await
+        .unwrap();
+    assert_eq!(rows(&constraint_messages)[0].get(0), Some("4"));
+    let default_messages = client
+        .simple_query("SELECT count(*) FROM pg_attrdef")
+        .await
+        .unwrap();
+    assert_eq!(rows(&default_messages)[0].get(0), Some("3"));
+    let class_messages = client
+        .simple_query("SELECT count(*) FROM pg_class WHERE relkind = 'i'")
+        .await
+        .unwrap();
+    assert_eq!(rows(&class_messages)[0].get(0), Some("4"));
 }
 
 /// The numeric suffix of the first CommandComplete tag (`UPDATE 2` → 2).
@@ -1104,8 +1274,6 @@ async fn insert_source_clauses_and_ragged_values_are_rejected() {
     for sql in [
         "INSERT INTO t (a) VALUES (1), (2) LIMIT 1",
         "INSERT INTO t (a) VALUES (1), (2) ORDER BY 1",
-        "INSERT INTO t (a) VALUES (DEFAULT)",
-        "UPDATE t SET a = DEFAULT",
     ] {
         let err = client.simple_query(sql).await.unwrap_err();
         assert_eq!(

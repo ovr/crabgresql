@@ -8,8 +8,8 @@ mod functions;
 mod plan;
 
 pub use expr::{
-    BinOp, Binding, BoundAggregate, BoundExpr, Scope, UnaryOp, bind_expr, bind_scalar,
-    length_typmod, map_data_type,
+    BinOp, Binding, BoundAggregate, BoundExpr, Scope, UnaryOp, bind_column_default, bind_expr,
+    bind_scalar, coerce_to_column, length_typmod, map_data_type,
 };
 pub use functions::{AggFn, ScalarFn, TableFn, lookup_table_fn};
 pub use plan::{
@@ -80,8 +80,12 @@ impl BindError {
 impl From<StorageError> for BindError {
     fn from(e: StorageError) -> Self {
         let code = match &e {
-            StorageError::TableNotFound(_) => sqlstate::UNDEFINED_TABLE,
-            StorageError::TableAlreadyExists(_) => sqlstate::DUPLICATE_TABLE,
+            StorageError::TableNotFound(_) | StorageError::IndexTableNotFound(_) => {
+                sqlstate::UNDEFINED_TABLE
+            }
+            StorageError::TableAlreadyExists(_) | StorageError::RelationAlreadyExists(_) => {
+                sqlstate::DUPLICATE_TABLE
+            }
         };
         Self::new(code, e.to_string())
     }

@@ -225,6 +225,27 @@ impl BoundExpr {
         matches!(self, BoundExpr::Srf { .. })
     }
 
+    pub fn contains_srf(&self) -> bool {
+        match self {
+            BoundExpr::Srf { .. } => true,
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.contains_srf(),
+            BoundExpr::Binary { left, right, .. } => left.contains_srf() || right.contains_srf(),
+            BoundExpr::FuncCall { args, .. } => args.iter().any(BoundExpr::contains_srf),
+            BoundExpr::Case { whens, else_, .. } => {
+                whens
+                    .iter()
+                    .any(|(condition, result)| condition.contains_srf() || result.contains_srf())
+                    || else_.as_ref().is_some_and(|expr| expr.contains_srf())
+            }
+            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Aggregate { .. } => {
+                false
+            }
+        }
+    }
+
     /// Whether this node itself is an aggregate marker.
     pub fn is_aggregate(&self) -> bool {
         matches!(self, BoundExpr::Aggregate { .. })
@@ -2684,7 +2705,7 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
 
 /// Coerce an expression for assignment into a column (INSERT / UPDATE SET),
 /// with PG's column-context error message on a type mismatch.
-pub(crate) fn coerce_to_column(binding: Binding, column: &Column) -> Result<BoundExpr, BindError> {
+pub fn coerce_to_column(binding: Binding, column: &Column) -> Result<BoundExpr, BindError> {
     let base = match binding {
         Binding::Unknown { lit, span } => resolve_unknown(lit, span, column.ty)?,
         Binding::Typed(e) => {
@@ -2722,6 +2743,29 @@ pub(crate) fn coerce_to_column(binding: Binding, column: &Column) -> Result<Boun
         }
     };
     apply_length_to_column(base, column)
+}
+
+/// Bind and assignment-coerce a column default in an empty scope. PostgreSQL
+/// defaults cannot reference columns of the row being created.
+pub fn bind_column_default(
+    expr: &ast::Expr,
+    column: &Column,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<BoundExpr, BindError> {
+    let scope = Scope::empty(catalog);
+    let bound = coerce_to_column(bind_expr(expr, &scope)?, column)?;
+    if bound.contains_srf() {
+        return Err(BindError::feature_not_supported(
+            "set-returning functions are not allowed in DEFAULT expressions",
+        ));
+    }
+    if bound.contains_aggregate() {
+        return Err(BindError::new(
+            sqlstate::GROUPING_ERROR,
+            "aggregate functions are not allowed in DEFAULT expressions",
+        ));
+    }
+    Ok(bound)
 }
 
 /// Apply a column's `varchar(n)`/`char(n)`/`name` length coercion in assignment
