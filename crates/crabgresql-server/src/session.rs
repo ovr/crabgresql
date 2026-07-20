@@ -166,18 +166,46 @@ pub struct SessionSeqState {
 pub struct SessionSequences {
     engine: Arc<dyn TableEngine>,
     state: Arc<Mutex<SessionSeqState>>,
+    /// Whether the current statement runs read-only: `nextval`/`setval` mutate,
+    /// so they are rejected (25006) just like a DML write.
+    read_only: bool,
 }
 
 impl SessionSequences {
-    pub fn new(engine: Arc<dyn TableEngine>, state: Arc<Mutex<SessionSeqState>>) -> Self {
-        Self { engine, state }
+    pub fn new(
+        engine: Arc<dyn TableEngine>,
+        state: Arc<Mutex<SessionSeqState>>,
+        read_only: bool,
+    ) -> Self {
+        Self {
+            engine,
+            state,
+            read_only,
+        }
     }
 
-    /// Map the engine's `NotFound` to PG's 42P01 for a sequence name.
-    fn not_found(name: &str) -> ExecError {
+    /// The engine's `NotFound` maps to PG's 42P01 for a truly absent name, but to
+    /// 42809 `"x" is not a sequence` when the name is a live table or view — PG
+    /// opens the relation and rejects the wrong relkind.
+    fn not_found(&self, name: &str) -> ExecError {
+        if self.engine.open_table(name).is_ok() || self.engine.resolve_view(None, name).is_some() {
+            ExecError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not a sequence"),
+            )
+        } else {
+            ExecError::new(
+                sqlstate::UNDEFINED_TABLE,
+                format!("relation \"{name}\" does not exist"),
+            )
+        }
+    }
+
+    /// PG's 25006 for a sequence-advancing function in a read-only transaction.
+    fn read_only_error(func: &str) -> ExecError {
         ExecError::new(
-            sqlstate::UNDEFINED_TABLE,
-            format!("relation \"{name}\" does not exist"),
+            sqlstate::READ_ONLY_SQL_TRANSACTION,
+            format!("cannot execute {func}() in a read-only transaction"),
         )
     }
 
@@ -205,6 +233,9 @@ impl SessionSequences {
 
 impl SequenceOps for SessionSequences {
     fn nextval(&self, name: &str) -> Result<i64, ExecError> {
+        if self.read_only {
+            return Err(Self::read_only_error("nextval"));
+        }
         match self.engine.sequence_nextval(name) {
             SequenceAdvance::Value(v) => {
                 let mut state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
@@ -212,40 +243,55 @@ impl SequenceOps for SessionSequences {
                 state.lastval = Some(v);
                 Ok(v)
             }
-            SequenceAdvance::NotFound => Err(Self::not_found(name)),
+            SequenceAdvance::NotFound => Err(self.not_found(name)),
             SequenceAdvance::Overflow => Err(self.limit_error(name, true)),
             SequenceAdvance::Underflow => Err(self.limit_error(name, false)),
         }
     }
 
     fn currval(&self, name: &str) -> Result<i64, ExecError> {
-        let state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
-        if let Some(v) = state.currval.get(name) {
-            return Ok(*v);
-        }
-        // Not yet advanced in this session: a non-existent sequence is 42P01,
-        // an existing-but-unused one is 55000.
+        // The sequence must still exist — PG opens the relation — so a dropped
+        // one is 42P01 (or 42809 for a wrong relkind) even if this session
+        // advanced it earlier; only then is the session's cached value consulted.
         if self.engine.sequence(name).is_none() {
-            Err(Self::not_found(name))
-        } else {
-            Err(ExecError::new(
+            return Err(self.not_found(name));
+        }
+        let state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+        match state.currval.get(name) {
+            Some(v) => Ok(*v),
+            None => Err(ExecError::new(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 format!("currval of sequence \"{name}\" is not yet defined in this session"),
-            ))
+            )),
         }
     }
 
     fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, ExecError> {
+        if self.read_only {
+            return Err(Self::read_only_error("setval"));
+        }
+        let Some(def) = self.engine.sequence(name) else {
+            return Err(self.not_found(name));
+        };
+        if value < def.min || value > def.max {
+            return Err(ExecError::new(
+                sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+                format!(
+                    "setval: value {value} is out of bounds for sequence \"{name}\" ({}..{})",
+                    def.min, def.max
+                ),
+            ));
+        }
         match self.engine.sequence_setval(name, value, is_called) {
             SequenceAdvance::Value(v) => {
                 let mut state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
                 state.currval.insert(name.to_string(), v);
-                state.lastval = Some(v);
+                // setval does NOT define lastval: PG's lastval reflects only the
+                // most recent nextval in the session.
                 Ok(v)
             }
-            SequenceAdvance::NotFound => Err(Self::not_found(name)),
-            // setval does not advance, so it cannot overflow.
-            _ => Err(Self::not_found(name)),
+            // Concurrently dropped between the existence check and the write.
+            _ => Err(self.not_found(name)),
         }
     }
 
@@ -302,12 +348,17 @@ impl Session {
     /// The execution context wired to advance sequences through `engine`, used
     /// for the statement-execution path (so a `nextval` default or an explicit
     /// `nextval()` can run and update this session's `currval`/`lastval`).
-    pub fn exec_context_with_sequences(&self, engine: &Arc<dyn TableEngine>) -> ExecContext {
+    pub fn exec_context_with_sequences(
+        &self,
+        engine: &Arc<dyn TableEngine>,
+        read_only: bool,
+    ) -> ExecContext {
         ExecContext {
             extra_float_digits: self.extra_float_digits,
             sequences: Some(Arc::new(SessionSequences::new(
                 Arc::clone(engine),
                 Arc::clone(&self.seq_state),
+                read_only,
             ))),
         }
     }

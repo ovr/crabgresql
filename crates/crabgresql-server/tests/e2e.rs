@@ -3145,3 +3145,106 @@ async fn serial_column_and_sequence_reflection() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Regression coverage for the sequence-semantics fixes: setval/lastval,
+/// setval bounds + NULL strictness, CREATE SEQUENCE type-range validation,
+/// read-only rejection, wrong-object-type, currval-after-drop, namespace
+/// collisions, and DROP SEQUENCE dependency blocking. Asserts SQLSTATEs so it is
+/// stable across PostgreSQL versions.
+#[tokio::test]
+async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    // setval does NOT define lastval; lastval reflects only the last nextval.
+    client
+        .batch_execute("CREATE SEQUENCE a; CREATE SEQUENCE b MINVALUE 1 MAXVALUE 10")
+        .await?;
+    let n = client.query_one("SELECT nextval('a') AS v", &[]).await?.get::<_, i64>("v");
+    client.query_one("SELECT setval('b', 7) AS v", &[]).await?; // must not touch lastval
+    assert_eq!(
+        client.query_one("SELECT lastval() AS v", &[]).await?.get::<_, i64>("v"),
+        n,
+        "lastval must reflect the nextval on a, not the setval on b"
+    );
+    // ...but setval DOES define currval for its sequence.
+    assert_eq!(
+        client.query_one("SELECT currval('b') AS v", &[]).await?.get::<_, i64>("v"),
+        7
+    );
+
+    // setval out of the sequence's own [min,max] is 22003.
+    let e = client.query_one("SELECT setval('b', 999)", &[]).await.unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::NUMERIC_VALUE_OUT_OF_RANGE);
+
+    // setval with a NULL third argument is a NULL no-op (no side effect).
+    let is_null: bool = client
+        .query_one("SELECT setval('b', 3, NULL) IS NULL AS n", &[])
+        .await?
+        .get("n");
+    assert!(is_null);
+    // currval still 7 (the NULL setval did nothing).
+    assert_eq!(
+        client.query_one("SELECT currval('b') AS v", &[]).await?.get::<_, i64>("v"),
+        7
+    );
+
+    // CREATE SEQUENCE with a bound outside the declared type is 22023.
+    let e = client
+        .batch_execute("CREATE SEQUENCE toobig AS smallint MAXVALUE 100000")
+        .await
+        .unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::INVALID_PARAMETER_VALUE);
+
+    // nextval on a table (existing non-sequence relation) is 42809, not 42P01.
+    client.batch_execute("CREATE TABLE tab (id int)").await?;
+    let e = client.query_one("SELECT nextval('tab')", &[]).await.unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::WRONG_OBJECT_TYPE);
+
+    // currval after DROP errors 42P01 (no stale cached value).
+    client.batch_execute("CREATE SEQUENCE gone; ").await?;
+    client.query_one("SELECT nextval('gone') AS v", &[]).await?;
+    client.batch_execute("DROP SEQUENCE gone").await?;
+    let e = client.query_one("SELECT currval('gone')", &[]).await.unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::UNDEFINED_TABLE);
+
+    // An index cannot take a sequence's name (shared relation namespace).
+    let e = client
+        .batch_execute("CREATE INDEX a ON tab (id)")
+        .await
+        .unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::DUPLICATE_TABLE);
+
+    // DROP SEQUENCE of a serial-owned sequence is blocked under RESTRICT (2BP01).
+    client.batch_execute("CREATE TABLE ser (id serial)").await?;
+    let e = client.batch_execute("DROP SEQUENCE ser_id_seq").await.unwrap_err();
+    assert_eq!(
+        e.as_db_error().unwrap().code(),
+        &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
+    );
+    // CASCADE drops it.
+    client.batch_execute("DROP SEQUENCE ser_id_seq CASCADE").await?;
+    Ok(())
+}
+
+/// nextval() / setval() are rejected in a read-only transaction (25006), even
+/// though a bare SELECT is not a DML write.
+#[tokio::test]
+async fn sequence_write_rejected_read_only() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE SEQUENCE s").await?;
+    client.batch_execute("BEGIN TRANSACTION READ ONLY").await?;
+    let e = client.query_one("SELECT nextval('s')", &[]).await.unwrap_err();
+    assert_eq!(
+        e.as_db_error().unwrap().code(),
+        &SqlState::READ_ONLY_SQL_TRANSACTION
+    );
+    client.batch_execute("ROLLBACK").await?;
+    // The counter did not advance despite the rejected nextval.
+    assert_eq!(
+        client.query_one("SELECT nextval('s') AS v", &[]).await?.get::<_, i64>("v"),
+        1
+    );
+    Ok(())
+}

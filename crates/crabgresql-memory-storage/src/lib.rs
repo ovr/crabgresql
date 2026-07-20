@@ -291,6 +291,16 @@ impl TableEngine for MemoryEngine {
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&index.name)
+            || self
+                .views
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(&index.name)
+            || self
+                .sequences
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(&index.name)
             || tables.values().any(|t| {
                 t.indexes
                     .read()

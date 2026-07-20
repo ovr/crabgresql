@@ -616,13 +616,15 @@ pub fn execute_statement(
             format!("cannot execute {verb} in a read-only transaction"),
         ));
     }
+    let read_only = read_only_active(session);
     let txn = build_txn(txnmgr, session, is_write);
     // Sequence functions (`nextval` in a `serial` default or written explicitly)
     // advance non-transactional counters in the shared engine and update this
     // session's `currval`/`lastval`, so the execution context carries a handle to
     // both. Sequences resolve against the global engine (temp sequences are
-    // unsupported), matching temp-view handling.
-    let exec_ctx = session.exec_context_with_sequences(engine);
+    // unsupported), matching temp-view handling. The read-only flag lets a bare
+    // `SELECT nextval(...)` be rejected (25006) even though it is not a DML write.
+    let exec_ctx = session.exec_context_with_sequences(engine, read_only);
     let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
@@ -2666,6 +2668,15 @@ fn seq_type_bounds(ty: PgType) -> (i64, i64) {
     }
 }
 
+/// PostgreSQL's spelling of a sequence data type, for out-of-range diagnostics.
+fn seq_type_name(ty: PgType) -> &'static str {
+    match ty {
+        PgType::Int2 => "smallint",
+        PgType::Int4 => "integer",
+        _ => "bigint",
+    }
+}
+
 /// Pick a relation name not already used by a table, view, index, or sequence
 /// (nor by `extra`, names reserved earlier in the same statement), appending a
 /// numeric suffix as PostgreSQL does for auto-named serial sequences.
@@ -2675,6 +2686,10 @@ fn unique_relation_name(engine: &Arc<dyn TableEngine>, extra: &[String], base: &
             || engine.sequence(n).is_some()
             || engine.open_table(n).is_ok()
             || engine.resolve_view(None, n).is_some()
+            || engine
+                .relation_metadata()
+                .iter()
+                .any(|r| r.indexes.iter().any(|i| i.name == n))
     };
     if !taken(base) {
         return base.to_string();
@@ -2763,6 +2778,26 @@ fn build_sequence_definition(
     let ascending = increment > 0;
     let min = min.unwrap_or(if ascending { 1 } else { type_min });
     let max = max.unwrap_or(if ascending { type_max } else { -1 });
+    // An explicit MIN/MAX outside the backing integer type's range is rejected
+    // (PG checks this before the MIN<MAX relation). MINVALUE is reported first.
+    if min < type_min || min > type_max {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!(
+                "MINVALUE ({min}) is out of range for sequence data type {}",
+                seq_type_name(data_type)
+            ),
+        ));
+    }
+    if max < type_min || max > type_max {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!(
+                "MAXVALUE ({max}) is out of range for sequence data type {}",
+                seq_type_name(data_type)
+            ),
+        ));
+    }
     if min >= max {
         return Err(PgError::new(
             sqlstate::INVALID_PARAMETER_VALUE,
@@ -2851,13 +2886,14 @@ fn execute_create_sequence(
 }
 
 /// `DROP SEQUENCE name [, ...] [CASCADE|RESTRICT]`. Mirrors [`execute_drop_view`]'s
-/// two-phase validate/drop and wrong-object-type detection. Reverse OWNED BY
-/// dependencies (a table default that references the sequence) are not tracked,
-/// so CASCADE/RESTRICT are accepted but a dependent default is not blocked (v1).
+/// two-phase validate/drop and wrong-object-type detection. Under RESTRICT a
+/// sequence still owned by a live table's `serial` column is blocked (2BP01);
+/// CASCADE drops it anyway. (Reverse dependencies on *manually* written
+/// `nextval(...)` defaults, which have no OWNED BY link, remain untracked.)
 fn execute_drop_sequence(
     catalog: &Arc<dyn TableEngine>,
     names: &[ast::ObjectName],
-    _cascade: bool,
+    cascade: bool,
     if_exists: bool,
 ) -> Result<QueryResult, PgError> {
     let snames = names
@@ -2899,6 +2935,40 @@ fn execute_drop_sequence(
                 sqlstate::UNDEFINED_TABLE,
                 format!("sequence \"{name}\" does not exist"),
             ));
+        }
+    }
+    // RESTRICT: a sequence owned by a still-existing table (a `serial` column's
+    // sequence) has a dependent default and cannot be dropped directly.
+    if !cascade {
+        for name in &to_drop {
+            let Some(def) = catalog.sequence(name) else {
+                continue;
+            };
+            let Some(owner) = def.owned_by.as_deref() else {
+                continue;
+            };
+            let Ok(table) = catalog.open_table(owner) else {
+                continue;
+            };
+            let column = table
+                .schema()
+                .columns
+                .iter()
+                .find(|c| {
+                    c.default
+                        .as_deref()
+                        .is_some_and(|d| d.contains(&format!("nextval('{name}')")))
+                })
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            return Err(PgError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop sequence {name} because other objects depend on it"),
+            )
+            .with_detail(format!(
+                "default value for column {column} of table {owner} depends on sequence {name}"
+            ))
+            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
         }
     }
     for name in &to_drop {

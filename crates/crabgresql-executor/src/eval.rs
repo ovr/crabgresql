@@ -136,11 +136,16 @@ fn eval_sequence_fn(
             name => ops.currval(seq_name(name)).map(Value::Int8),
         },
         ScalarFn::Setval => {
+            // setval is STRICT: a NULL in any argument (including the optional
+            // `is_called`) yields NULL with no side effect.
+            let is_called = match args.get(2) {
+                None => true,
+                Some(Value::Bool(b)) => *b,
+                _ => return Some(Ok(Value::Null)),
+            };
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 Ok(Value::Null)
             } else {
-                // The optional third argument (`is_called`) defaults to true.
-                let is_called = args.get(2).is_none_or(|v| matches!(v, Value::Bool(true)));
                 ops.setval(seq_name(&args[0]), int8(&args[1]), is_called)
                     .map(Value::Int8)
             }

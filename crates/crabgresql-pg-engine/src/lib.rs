@@ -443,6 +443,8 @@ impl TableEngine for PgEngine {
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&index.name)
+            || self.catalog.contains_view(&index.name)
+            || self.catalog.contains_sequence(&index.name)
             || tables
                 .values()
                 .any(|t| t.indexes().iter().any(|i| i.name == index.name))
