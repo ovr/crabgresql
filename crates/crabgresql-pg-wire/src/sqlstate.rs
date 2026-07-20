@@ -1,6 +1,8 @@
 //! SQLSTATE error codes (PostgreSQL Appendix A). Only the codes we emit.
 
 pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
+/// `21000` — a scalar subquery used as an expression returned more than one row.
+pub const CARDINALITY_VIOLATION: &str = "21000";
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 pub const INVALID_DATETIME_FORMAT: &str = "22007";
 pub const DATETIME_FIELD_OVERFLOW: &str = "22008";

@@ -8,7 +8,7 @@ mod functions;
 mod plan;
 
 pub use expr::{
-    BinOp, Binding, BoundAggregate, BoundExpr, ParamCtx, ParamState, Scope, UnaryOp,
+    BinOp, Binding, BoundAggregate, BoundExpr, ParamCtx, ParamState, Scope, Subplan, UnaryOp,
     bind_column_default, bind_expr, bind_scalar, coerce_to_column, length_typmod, map_data_type,
     param_ctx_extended, param_ctx_none, param_types, require_all_resolved,
 };

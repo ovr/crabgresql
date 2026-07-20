@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{
-    BoundAggregate, BoundExpr, DistinctKey, JoinKind, Returning, SortKey, TableFn,
+    BinOp, BoundAggregate, BoundExpr, DistinctKey, JoinKind, LogicalPlan, Returning, SortKey,
+    TableFn, UnaryOp,
 };
 use crabgresql_planner::{
     HashKey, PhysicalAggInput, PhysicalInsertSource, PhysicalJoinExpr, PhysicalJoinInput,
@@ -124,10 +125,13 @@ pub enum DmlVerb {
 }
 
 pub fn execute(
-    plan: PhysicalPlan,
+    mut plan: PhysicalPlan,
     ctx: ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    // Fold every non-correlated subquery to a constant/comparison before any node
+    // evaluates an expression, so `eval` never sees a subquery marker.
+    resolve_subqueries(&mut plan, ctx, txn)?;
     match plan {
         PhysicalPlan::Values {
             columns,
@@ -296,6 +300,481 @@ pub fn execute(
             predicate,
             returning,
         } => execute_delete(&table, &predicate, returning, ctx, txn),
+    }
+}
+
+/// Fold every non-correlated subquery expression in `plan` to a plain
+/// [`BoundExpr`] the evaluator handles: a scalar subquery to a `Const`, `EXISTS`
+/// to a boolean `Const`, and `IN (SELECT …)` to an OR-chain of equality
+/// comparisons (wrapped in `NOT` when negated). Each subplan runs exactly once —
+/// a non-correlated subquery does not depend on the outer row — via a recursive
+/// `plan` + `execute`. Walks nested source plans so one top-level call covers the
+/// whole tree; runs before any node evaluates an expression, so `eval` never sees
+/// a subquery marker.
+fn resolve_subqueries(
+    plan: &mut PhysicalPlan,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<(), ExecError> {
+    match plan {
+        PhysicalPlan::Values {
+            rows, predicate, ..
+        } => {
+            for row in rows {
+                resolve_exprs(row, ctx, txn)?;
+            }
+            resolve_opt(predicate, ctx, txn)?;
+        }
+        PhysicalPlan::Select {
+            projections,
+            predicate,
+            ..
+        } => {
+            resolve_exprs(projections, ctx, txn)?;
+            resolve_opt(predicate, ctx, txn)?;
+        }
+        PhysicalPlan::IndexScan {
+            key,
+            projections,
+            predicate,
+            ..
+        } => {
+            for (_, value) in key.iter_mut() {
+                resolve_expr(value, ctx, txn)?;
+            }
+            resolve_exprs(projections, ctx, txn)?;
+            resolve_opt(predicate, ctx, txn)?;
+        }
+        PhysicalPlan::Subquery {
+            source,
+            projections,
+            predicate,
+            ..
+        } => {
+            resolve_subqueries(source, ctx, txn)?;
+            resolve_exprs(projections, ctx, txn)?;
+            resolve_opt(predicate, ctx, txn)?;
+        }
+        PhysicalPlan::TableFunction {
+            args,
+            projections,
+            predicate,
+            ..
+        } => {
+            resolve_exprs(args, ctx, txn)?;
+            resolve_exprs(projections, ctx, txn)?;
+            resolve_opt(predicate, ctx, txn)?;
+        }
+        PhysicalPlan::Join {
+            source,
+            projections,
+            predicate,
+            ..
+        } => {
+            resolve_join(source, ctx, txn)?;
+            resolve_exprs(projections, ctx, txn)?;
+            resolve_opt(predicate, ctx, txn)?;
+        }
+        PhysicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            projections,
+            ..
+        } => {
+            if let PhysicalAggInput::Join(join) = input {
+                resolve_join(join, ctx, txn)?;
+            }
+            resolve_opt(predicate, ctx, txn)?;
+            resolve_exprs(group_exprs, ctx, txn)?;
+            for agg in aggregates.iter_mut() {
+                if let Some(arg) = &mut agg.arg {
+                    resolve_expr(arg, ctx, txn)?;
+                }
+            }
+            resolve_opt(having, ctx, txn)?;
+            resolve_exprs(projections, ctx, txn)?;
+        }
+        PhysicalPlan::Limit { source, .. } => resolve_subqueries(source, ctx, txn)?,
+        PhysicalPlan::Insert {
+            source, returning, ..
+        } => {
+            match source {
+                PhysicalInsertSource::Values(rows) => {
+                    for row in rows {
+                        resolve_exprs(row, ctx, txn)?;
+                    }
+                }
+                PhysicalInsertSource::Query { input, projections } => {
+                    resolve_subqueries(input, ctx, txn)?;
+                    resolve_exprs(projections, ctx, txn)?;
+                }
+            }
+            resolve_returning(returning, ctx, txn)?;
+        }
+        PhysicalPlan::Update {
+            predicate,
+            assignments,
+            returning,
+            ..
+        } => {
+            resolve_opt(predicate, ctx, txn)?;
+            for (_, value) in assignments.iter_mut() {
+                resolve_expr(value, ctx, txn)?;
+            }
+            resolve_returning(returning, ctx, txn)?;
+        }
+        PhysicalPlan::Delete {
+            predicate,
+            returning,
+            ..
+        } => {
+            resolve_opt(predicate, ctx, txn)?;
+            resolve_returning(returning, ctx, txn)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_exprs(
+    exprs: &mut [BoundExpr],
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<(), ExecError> {
+    for e in exprs {
+        resolve_expr(e, ctx, txn)?;
+    }
+    Ok(())
+}
+
+fn resolve_opt(
+    expr: &mut Option<BoundExpr>,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<(), ExecError> {
+    if let Some(e) = expr {
+        resolve_expr(e, ctx, txn)?;
+    }
+    Ok(())
+}
+
+fn resolve_returning(
+    returning: &mut Option<Returning>,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<(), ExecError> {
+    if let Some(r) = returning {
+        resolve_exprs(&mut r.projections, ctx, txn)?;
+    }
+    Ok(())
+}
+
+fn resolve_join(
+    join: &mut PhysicalJoinExpr,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<(), ExecError> {
+    match join {
+        PhysicalJoinExpr::Input { input, .. } => match input {
+            PhysicalJoinInput::Scan(_) => {}
+            PhysicalJoinInput::Subplan(source) => resolve_subqueries(source, ctx, txn)?,
+            PhysicalJoinInput::TableFunction { args, .. } => resolve_exprs(args, ctx, txn)?,
+        },
+        PhysicalJoinExpr::Join {
+            left,
+            right,
+            predicate,
+            hash_keys,
+            ..
+        } => {
+            resolve_join(left, ctx, txn)?;
+            resolve_join(right, ctx, txn)?;
+            resolve_opt(predicate, ctx, txn)?;
+            for key in hash_keys.iter_mut() {
+                resolve_expr(&mut key.left, ctx, txn)?;
+                resolve_expr(&mut key.right, ctx, txn)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recurse an expression tree, resolving nested subqueries bottom-up, then fold
+/// this node if it is itself a subquery marker.
+fn resolve_expr(expr: &mut BoundExpr, ctx: ExecContext, txn: &TxnContext) -> Result<(), ExecError> {
+    match expr {
+        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => {}
+        BoundExpr::Unary { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::Coerce { expr, .. }
+        | BoundExpr::Reinterpret { expr, .. } => resolve_expr(expr, ctx, txn)?,
+        BoundExpr::Binary { left, right, .. } => {
+            resolve_expr(left, ctx, txn)?;
+            resolve_expr(right, ctx, txn)?;
+        }
+        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+            resolve_exprs(args, ctx, txn)?;
+        }
+        BoundExpr::Case { whens, else_, .. } => {
+            for (cond, result) in whens.iter_mut() {
+                resolve_expr(cond, ctx, txn)?;
+                resolve_expr(result, ctx, txn)?;
+            }
+            if let Some(e) = else_ {
+                resolve_expr(e, ctx, txn)?;
+            }
+        }
+        BoundExpr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                resolve_expr(a, ctx, txn)?;
+            }
+        }
+        // The IN needle (in `cmp`) may itself hold a subquery; fold those first.
+        BoundExpr::InSubquery { cmp, .. } => resolve_expr(cmp, ctx, txn)?,
+        BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
+    }
+    if matches!(
+        expr,
+        BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } | BoundExpr::InSubquery { .. }
+    ) {
+        let taken = std::mem::replace(
+            expr,
+            BoundExpr::Const {
+                value: Value::Null,
+                ty: PgType::Bool,
+            },
+        );
+        *expr = fold_subquery(taken, ctx, txn)?;
+    }
+    Ok(())
+}
+
+/// Run a subquery marker's subplan once and fold it to a plain expression.
+fn fold_subquery(
+    expr: BoundExpr,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<BoundExpr, ExecError> {
+    match expr {
+        BoundExpr::ScalarSubquery { subplan, ty } => {
+            let rows = run_subplan(*subplan.0, ctx, txn)?;
+            match rows.len() {
+                0 => Ok(BoundExpr::Const {
+                    value: Value::Null,
+                    ty,
+                }),
+                1 => {
+                    let value = match rows.into_iter().next() {
+                        Some(row) => row.into_iter().next().unwrap_or(Value::Null),
+                        None => Value::Null,
+                    };
+                    // Settle the value on the declared output type: the projection
+                    // usually already produces it, but a set-op / promoted column
+                    // could yield a narrower variant, and the outer operator was
+                    // bound against `ty`.
+                    Ok(BoundExpr::Const {
+                        value: coerce_value(value, ty, ctx)?,
+                        ty,
+                    })
+                }
+                _ => Err(ExecError::new(
+                    crabgresql_pg_wire::sqlstate::CARDINALITY_VIOLATION,
+                    "more than one row returned by a subquery used as an expression",
+                )),
+            }
+        }
+        BoundExpr::Exists { subplan, negated } => {
+            // EXISTS only needs to know whether a row exists, so stop at the first
+            // one rather than draining the whole subplan; the binder already
+            // stripped the target list to a constant so no per-row projection
+            // (or its errors) is evaluated. NOT EXISTS inverts the test.
+            let exists = subplan_has_rows(*subplan.0, ctx, txn)?;
+            Ok(BoundExpr::Const {
+                value: Value::Bool(exists != negated),
+                ty: PgType::Bool,
+            })
+        }
+        BoundExpr::InSubquery {
+            subplan,
+            negated,
+            cmp,
+        } => {
+            let rows = run_subplan(*subplan.0, ctx, txn)?;
+            let in_expr = build_in_chain(&cmp, rows, ctx)?;
+            Ok(if negated {
+                BoundExpr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(in_expr),
+                }
+            } else {
+                in_expr
+            })
+        }
+        // Not a subquery marker (unreachable — the caller matched one).
+        other => Ok(other),
+    }
+}
+
+/// Plan and execute a subplan, draining its result set into materialized rows.
+fn run_subplan(
+    logical: LogicalPlan,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<Vec<Tuple>, ExecError> {
+    match execute(crabgresql_planner::plan(logical), ctx, txn)? {
+        Execution::Rows { node, .. } => drain(node),
+        _ => Err(ExecError::new(
+            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+            "subquery did not produce a result set",
+        )),
+    }
+}
+
+/// Whether a subplan yields at least one row, stopping at the first — for
+/// `EXISTS`, which needs existence only, not the rows themselves.
+fn subplan_has_rows(
+    logical: LogicalPlan,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<bool, ExecError> {
+    match execute(crabgresql_planner::plan(logical), ctx, txn)? {
+        Execution::Rows { mut node, .. } => Ok(node.next()?.is_some()),
+        _ => Err(ExecError::new(
+            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+            "subquery did not produce a result set",
+        )),
+    }
+}
+
+fn drain(mut node: Box<dyn ExecNode>) -> Result<Vec<Tuple>, ExecError> {
+    let mut out = Vec::new();
+    while let Some(tuple) = node.next()? {
+        out.push(tuple);
+    }
+    Ok(out)
+}
+
+/// Fold `x IN (values)` to the OR-of-equalities PG lowers `x IN (list)` to: one
+/// `x = value` comparison per candidate, combined with OR. `cmp` is the bound
+/// `x = <hole>` template; each candidate value is substituted into its RHS hole,
+/// preserving the operand coercions the binder resolved. The comparisons are
+/// combined into a **balanced** OR tree so `eval` (and `Drop`) recurse in
+/// O(log n), not O(n) — a subquery can return far more rows than a hand-written
+/// IN list. An empty set folds to `false` (the caller wraps `NOT IN` in `NOT`).
+fn build_in_chain(
+    cmp: &BoundExpr,
+    rows: Vec<Tuple>,
+    ctx: ExecContext,
+) -> Result<BoundExpr, ExecError> {
+    let BoundExpr::Binary {
+        op,
+        arg_ty,
+        left,
+        right,
+    } = cmp
+    else {
+        return Err(ExecError::new(
+            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+            "IN (SELECT …) comparison template was not a binary comparison",
+        ));
+    };
+    let mut comparisons = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        let value = if row.is_empty() {
+            Value::Null
+        } else {
+            row.swap_remove(0)
+        };
+        comparisons.push(BoundExpr::Binary {
+            op: *op,
+            arg_ty: *arg_ty,
+            left: left.clone(),
+            right: Box::new(substitute_hole(right, value, ctx)?),
+        });
+    }
+    Ok(balanced_or(comparisons))
+}
+
+/// Combine boolean expressions into a balanced `OR` tree (depth ⌈log₂ n⌉). An
+/// empty input is `false`. Kept balanced so evaluating / dropping the tree never
+/// recurses linearly in the number of candidates.
+fn balanced_or(mut nodes: Vec<BoundExpr>) -> BoundExpr {
+    if nodes.is_empty() {
+        return BoundExpr::Const {
+            value: Value::Bool(false),
+            ty: PgType::Bool,
+        };
+    }
+    while nodes.len() > 1 {
+        let mut merged = Vec::with_capacity(nodes.len().div_ceil(2));
+        let mut it = nodes.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => merged.push(BoundExpr::Binary {
+                    op: BinOp::Or,
+                    arg_ty: PgType::Bool,
+                    left: Box::new(a),
+                    right: Box::new(b),
+                }),
+                None => merged.push(a),
+            }
+        }
+        nodes = merged;
+    }
+    // Exactly one node remains (input was non-empty).
+    nodes.swap_remove(0)
+}
+
+/// Substitute a candidate value into the IN comparison template's `<hole>` — the
+/// unique NULL `Const` the binder placed on the RHS — and coerce it to that
+/// hole's declared type. The hole may sit under a `Coerce`, a `Reinterpret`, or
+/// a coercion `FuncCall` (e.g. `bpchar → text` lowers to `FuncCall{BpcharToText}`
+/// rather than a `Coerce`), so descend through all of them; only the NULL
+/// placeholder is replaced, leaving any constant function arguments (typmods)
+/// intact.
+fn substitute_hole(
+    expr: &BoundExpr,
+    value: Value,
+    ctx: ExecContext,
+) -> Result<BoundExpr, ExecError> {
+    match expr {
+        // The placeholder: a NULL `Const` carrying the hole's declared type.
+        BoundExpr::Const {
+            value: Value::Null,
+            ty,
+        } => Ok(BoundExpr::Const {
+            value: coerce_value(value, *ty, ctx)?,
+            ty: *ty,
+        }),
+        // Any other constant (e.g. a coercion function's typmod argument) stays.
+        BoundExpr::Const { .. } => Ok(expr.clone()),
+        BoundExpr::Coerce { expr, ty } => Ok(BoundExpr::Coerce {
+            expr: Box::new(substitute_hole(expr, value, ctx)?),
+            ty: *ty,
+        }),
+        BoundExpr::Reinterpret {
+            expr,
+            reported,
+            rep,
+        } => Ok(BoundExpr::Reinterpret {
+            expr: Box::new(substitute_hole(expr, value, ctx)?),
+            reported: *reported,
+            rep: *rep,
+        }),
+        BoundExpr::FuncCall { func, ret, args } => {
+            let args = args
+                .iter()
+                .map(|a| substitute_hole(a, value.clone(), ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::FuncCall {
+                func: *func,
+                ret: *ret,
+                args,
+            })
+        }
+        other => Ok(other.clone()),
     }
 }
 

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{Column, EnumInfo, TableSchema, TypeCatalog, UserCast};
+use crabgresql_storage_api::{Column, EnumInfo, TableEngine, TableSchema, TypeCatalog, UserCast};
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
     Numeric, PgType, Value, cast, date, float, interval, money, parse_bool, time, timestamp,
@@ -137,6 +137,27 @@ pub fn require_all_resolved(ctx: &ParamCtx) -> Result<(), BindError> {
     Ok(())
 }
 
+/// A subquery's bound plan, embedded in a [`BoundExpr`]. Wrapped so `BoundExpr`
+/// keeps its `Debug`/`PartialEq` derives without imposing them on
+/// [`crate::LogicalPlan`], which holds trait objects (`Arc<dyn TableAm>`) that
+/// implement neither. Two embedded subplans never compare equal: structural plan
+/// equality is needed nowhere, and treating them as distinct keeps optimizations
+/// that dedup expressions (e.g. ORDER BY target reuse) conservatively correct.
+#[derive(Clone)]
+pub struct Subplan(pub Box<crate::plan::LogicalPlan>);
+
+impl std::fmt::Debug for Subplan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Subplan(..)")
+    }
+}
+
+impl PartialEq for Subplan {
+    fn eq(&self, _: &Self) -> bool {
+        false
+    }
+}
+
 /// Typed expression IR. Every node knows its result type; the evaluator
 /// dispatches on the recorded types and never re-infers them.
 #[derive(Clone, Debug, PartialEq)]
@@ -232,6 +253,34 @@ pub enum BoundExpr {
         input_ty: PgType,
         /// The aggregate's result type (see `agg_return_type`).
         ret: PgType,
+    },
+    /// A scalar subquery `(SELECT …)`: `subplan` yields exactly one column. A
+    /// transient marker for non-correlated subqueries — the executor's
+    /// `resolve_subqueries` pass runs the subplan once and folds this node to a
+    /// `Const` (0 rows → NULL, 1 row → that value, >1 rows → `21000`) before
+    /// evaluation. `ty` is the single output column's type.
+    ScalarSubquery {
+        subplan: Subplan,
+        ty: PgType,
+    },
+    /// `[NOT] EXISTS (SELECT …)`: folds (in `resolve_subqueries`) to a bool
+    /// `Const` — whether `subplan` yields any row, negated when `negated`.
+    Exists {
+        subplan: Subplan,
+        negated: bool,
+    },
+    /// `x [NOT] IN (SELECT …)`: the one-column `subplan` supplies the candidate
+    /// set. `cmp` is the bound comparison template `x = <hole>` — a
+    /// `Binary { op: Eq, arg_ty, left, right }` where `right` is a NULL `Const`
+    /// of the subquery column's type (possibly `Coerce`-wrapped). At execution
+    /// each candidate value is substituted into that `Const` and the comparisons
+    /// are OR-chained; `NOT IN` wraps the result in `NOT` (Kleene-equivalent to
+    /// `x <> ALL`). Reproduces `x IN (list)` (`bind_in_list`), including its
+    /// three-valued NULL semantics.
+    InSubquery {
+        subplan: Subplan,
+        negated: bool,
+        cmp: Box<BoundExpr>,
     },
 }
 
@@ -340,6 +389,8 @@ impl BoundExpr {
             BoundExpr::Case { ty, .. } => *ty,
             BoundExpr::Srf { ret, .. } => *ret,
             BoundExpr::Aggregate { ret, .. } => *ret,
+            BoundExpr::ScalarSubquery { ty, .. } => *ty,
+            BoundExpr::Exists { .. } | BoundExpr::InSubquery { .. } => PgType::Bool,
         }
     }
 
@@ -364,10 +415,15 @@ impl BoundExpr {
                     .any(|(condition, result)| condition.contains_srf() || result.contains_srf())
                     || else_.as_ref().is_some_and(|expr| expr.contains_srf())
             }
+            // A subquery's own SRFs stay inside its subplan; nothing propagates
+            // out to the enclosing projection.
+            BoundExpr::InSubquery { cmp, .. } => cmp.contains_srf(),
             BoundExpr::Const { .. }
             | BoundExpr::ColumnRef { .. }
             | BoundExpr::Param { .. }
-            | BoundExpr::Aggregate { .. } => false,
+            | BoundExpr::Aggregate { .. }
+            | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::Exists { .. } => false,
         }
     }
 
@@ -399,6 +455,10 @@ impl BoundExpr {
                     .any(|(c, r)| c.contains_aggregate() || r.contains_aggregate())
                     || else_.as_ref().is_some_and(|e| e.contains_aggregate())
             }
+            // The needle (in `cmp`) is an outer expression, so an aggregate there
+            // propagates; a subquery's own body is a separate query and doesn't.
+            BoundExpr::InSubquery { cmp, .. } => cmp.contains_aggregate(),
+            BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => false,
         }
     }
 
@@ -443,6 +503,10 @@ impl BoundExpr {
                         fold(a, acc);
                     }
                 }
+                // Non-correlated subplans reference no outer column; only the IN
+                // needle (in `cmp`) can. Scalar/EXISTS contribute nothing.
+                BoundExpr::InSubquery { cmp, .. } => fold(cmp, acc),
+                BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
             }
         }
         let mut acc = None;
@@ -535,6 +599,18 @@ pub struct Scope {
     /// every nested scope (subqueries, CTEs, derived tables) so a `$n` unifies
     /// its type across the whole statement.
     params: ParamCtx,
+    /// What an expression subquery (`(SELECT …)`, `EXISTS`, `IN (SELECT …)`)
+    /// needs to bind its body: the table engine (to resolve scans) and the CTEs
+    /// visible at this query level. `None` in contexts where a subquery cannot
+    /// appear (column defaults, INSERT VALUES rows), which then reject one.
+    subquery: Option<std::rc::Rc<SubqueryContext>>,
+}
+
+/// The handle a [`Scope`] carries so `bind_expr` can bind a nested query. Shared
+/// (`Rc`) so cheaply threaded into the transient scopes built per clause.
+pub(crate) struct SubqueryContext {
+    engine: Arc<dyn TableEngine>,
+    ctes: crate::plan::CteEnv,
 }
 
 impl Scope {
@@ -545,6 +621,7 @@ impl Scope {
             visible: None,
             catalog: catalog.clone(),
             params: params.clone(),
+            subquery: None,
         }
     }
 
@@ -563,6 +640,7 @@ impl Scope {
             visible: None,
             catalog: catalog.clone(),
             params: params.clone(),
+            subquery: None,
         }
     }
 
@@ -603,7 +681,24 @@ impl Scope {
             visible,
             catalog: catalog.clone(),
             params: params.clone(),
+            subquery: None,
         }
+    }
+
+    /// Attach the context needed to bind expression subqueries against this
+    /// scope's query level: the table engine and the visible CTEs. Set by the
+    /// clause binders (SELECT projection/WHERE/HAVING, JOIN ON) that have both in
+    /// hand; scopes without it reject a subquery as unsupported in that position.
+    pub(crate) fn with_subqueries(
+        mut self,
+        engine: &Arc<dyn TableEngine>,
+        ctes: &crate::plan::CteEnv,
+    ) -> Scope {
+        self.subquery = Some(std::rc::Rc::new(SubqueryContext {
+            engine: engine.clone(),
+            ctes: ctes.clone(),
+        }));
+        self
     }
 
     /// The user-defined type/cast view carried through binding.
@@ -890,8 +985,114 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
             list,
             negated,
         } => bind_in_list(expr, list, *negated, scope),
+        ast::Expr::Subquery(query) => bind_scalar_subquery(query, scope),
+        ast::Expr::Exists { subquery, negated } => bind_exists(subquery, *negated, scope),
+        ast::Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => bind_in_subquery(expr, subquery, *negated, scope),
         other => Err(unsupported_expr(other)),
     }
+}
+
+/// Bind a nested query into a [`LogicalPlan`] against the enclosing scope's
+/// subquery context (table engine + visible CTEs). The subquery is bound in an
+/// independent name scope: it sees no outer columns, so a correlated reference
+/// resolves to nothing and errors `42703` — correlated subqueries are a later
+/// stage.
+fn bind_subquery_plan(
+    query: &ast::Query,
+    scope: &Scope,
+) -> Result<(crate::plan::LogicalPlan, Vec<crate::OutputColumn>), BindError> {
+    let ctx = scope.subquery.as_ref().ok_or_else(|| {
+        BindError::feature_not_supported("subqueries are not supported in this context")
+    })?;
+    let plan = crate::plan::bind_query_scoped(
+        &ctx.engine,
+        &scope.catalog,
+        &scope.params,
+        query,
+        &ctx.ctes,
+    )?;
+    let columns = crate::plan::output_columns_of(&plan)?;
+    Ok((plan, columns))
+}
+
+/// `(SELECT …)` as a scalar: the subquery must produce exactly one column; its
+/// type is the expression's type. Runs once at execution and folds to that
+/// value (0 rows → NULL, >1 rows → `21000`).
+fn bind_scalar_subquery(query: &ast::Query, scope: &Scope) -> Result<Binding, BindError> {
+    let (plan, columns) = bind_subquery_plan(query, scope)?;
+    let [col] = columns.as_slice() else {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            "subquery must return only one column",
+        ));
+    };
+    Ok(Binding::Typed(BoundExpr::ScalarSubquery {
+        subplan: Subplan(Box::new(plan)),
+        ty: col.ty,
+    }))
+}
+
+/// `[NOT] EXISTS (SELECT …)` → a bool test on whether the subquery yields rows.
+/// The projected columns are irrelevant (PG ignores them), so the target list is
+/// replaced with a constant: the executor then only checks for a first row and
+/// never evaluates the original projection (which could error or be expensive).
+fn bind_exists(query: &ast::Query, negated: bool, scope: &Scope) -> Result<Binding, BindError> {
+    let (plan, _columns) = bind_subquery_plan(query, scope)?;
+    Ok(Binding::Typed(BoundExpr::Exists {
+        subplan: Subplan(Box::new(crate::plan::strip_to_existence(plan))),
+        negated,
+    }))
+}
+
+/// `x [NOT] IN (SELECT …)`: the one-column subquery supplies the candidate set.
+/// Builds the `x = <hole>` comparison template once (capturing the same operand
+/// promotion/coercion `x IN (list)` uses); the executor substitutes each
+/// candidate value into the hole. A subquery with more than one column errors.
+fn bind_in_subquery(
+    expr: &ast::Expr,
+    query: &ast::Query,
+    negated: bool,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let (plan, columns) = bind_subquery_plan(query, scope)?;
+    let [col] = columns.as_slice() else {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            "subquery has too many columns",
+        ));
+    };
+    let elem_ty = col.ty;
+    let needle = bind_expr(expr, scope)?;
+    // A NULL constant of the subquery's column type stands in for a candidate
+    // value; binding `needle = <hole>` resolves the comparison operator and every
+    // coercion exactly as PG's `= ANY(ARRAY[...])` would, and validates that an
+    // `=` operator exists between the two types.
+    let hole = Binding::Typed(BoundExpr::Const {
+        value: Value::Null,
+        ty: elem_ty,
+    });
+    let cmp = bind_binary_op(
+        BinOp::Eq,
+        needle,
+        hole,
+        Span::empty(),
+        scope.catalog().as_ref(),
+    )?;
+    let Binding::Typed(cmp) = cmp else {
+        // `=` between two typed operands always yields a typed comparison.
+        return Err(BindError::feature_not_supported(
+            "IN (SELECT …) with these operand types is not supported yet",
+        ));
+    };
+    Ok(Binding::Typed(BoundExpr::InSubquery {
+        subplan: Subplan(Box::new(plan)),
+        negated,
+        cmp: Box::new(cmp),
+    }))
 }
 
 /// `SUBSTRING(x [FROM a] [FOR b])` → `substr(x, a[, b])`. With no `FROM`, PG
@@ -4061,6 +4262,26 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
             .and_then(|p| p.as_ident())
             .map(normalize_ident)
             .unwrap_or_else(|| "?column?".into()),
+        // `EXISTS (…)` is named "exists" in PG.
+        ast::Expr::Exists { .. } => "exists".into(),
+        // A scalar `(SELECT …)` takes the name of the subquery's single output
+        // column (`(SELECT max(x))` → "max", `(SELECT y)` → "y").
+        ast::Expr::Subquery(query) => subquery_output_name(query),
+        _ => "?column?".into(),
+    }
+}
+
+/// The output-column name of a scalar `(SELECT …)`: the name of the subquery's
+/// first (and only) target-list column — an alias if present, else the item
+/// expression's own [`output_name`]. Anything that isn't a plain `SELECT`
+/// (e.g. `VALUES`) or whose first item is a wildcard falls back to `?column?`.
+fn subquery_output_name(query: &ast::Query) -> String {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return "?column?".into();
+    };
+    match select.projection.first() {
+        Some(ast::SelectItem::UnnamedExpr(expr)) => output_name(expr),
+        Some(ast::SelectItem::ExprWithAlias { alias, .. }) => normalize_ident(alias),
         _ => "?column?".into(),
     }
 }

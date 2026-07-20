@@ -349,6 +349,133 @@ fn rows(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow>
         .collect()
 }
 
+#[tokio::test]
+async fn subqueries_in_expressions_match_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE sq (id int, val int)")
+        .await?;
+    client
+        .simple_query("INSERT INTO sq VALUES (1, 10), (2, 20), (3, 30)")
+        .await?;
+
+    // Scalar subquery in the target list.
+    let msgs = client
+        .simple_query("SELECT (SELECT max(val) FROM sq) AS m")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("m"), Some("30"));
+
+    // A scalar subquery with no rows is NULL.
+    let msgs = client
+        .simple_query("SELECT (SELECT val FROM sq WHERE id = 99) AS m")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("m"), None);
+
+    // EXISTS / NOT EXISTS.
+    let msgs = client
+        .simple_query(
+            "SELECT id FROM sq WHERE EXISTS (SELECT 1 FROM sq WHERE val = 20) ORDER BY id",
+        )
+        .await?;
+    assert_eq!(rows(&msgs).len(), 3);
+
+    // IN (SELECT ...) as a WHERE predicate.
+    let msgs = client
+        .simple_query(
+            "SELECT id FROM sq WHERE val IN (SELECT val FROM sq WHERE val <> 20) ORDER BY id",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("id")).collect();
+    assert_eq!(got, vec![Some("1"), Some("3")]);
+
+    // NOT IN (SELECT ...).
+    let msgs = client
+        .simple_query(
+            "SELECT id FROM sq WHERE val NOT IN (SELECT val FROM sq WHERE val = 20) ORDER BY id",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("id")).collect();
+    assert_eq!(got, vec![Some("1"), Some("3")]);
+
+    // A scalar subquery returning more than one row is a cardinality violation.
+    let err = client
+        .simple_query("SELECT (SELECT val FROM sq)")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::CARDINALITY_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "more than one row returned by a subquery used as an expression"
+    );
+
+    Ok(())
+}
+
+/// Regression coverage for the subquery review fixes: a large `IN (SELECT …)`
+/// must not overflow the stack, `text IN (SELECT char(n))` must compare across
+/// string types, `EXISTS` must ignore its target list, and subqueries must work
+/// in `UPDATE`/`DELETE`.
+#[tokio::test]
+async fn subquery_review_fixes() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // Large IN subquery: folds to a balanced OR tree, so no stack overflow.
+    let msgs = client
+        .simple_query(
+            "SELECT i FROM generate_series(1, 3) g(i) \
+             WHERE i IN (SELECT gs FROM generate_series(1, 50000) x(gs)) ORDER BY i",
+        )
+        .await?;
+    assert_eq!(rows(&msgs).len(), 3);
+
+    // text IN (SELECT char(n)): the candidate coercion must not drop the value.
+    client.simple_query("CREATE TABLE txt (t text)").await?;
+    client.simple_query("CREATE TABLE chr (c char(3))").await?;
+    client
+        .simple_query("INSERT INTO txt VALUES ('foo')")
+        .await?;
+    client
+        .simple_query("INSERT INTO chr VALUES ('foo')")
+        .await?;
+    let msgs = client
+        .simple_query("SELECT t IN (SELECT c FROM chr) AS matched FROM txt")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("matched"), Some("t"));
+
+    // EXISTS ignores the subquery target list (a 1/0 there must not error).
+    let msgs = client
+        .simple_query("SELECT EXISTS (SELECT 1 / 0 FROM txt) AS e")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("e"), Some("t"));
+
+    // Subqueries in DML predicates/assignments.
+    client
+        .simple_query("CREATE TABLE dm (id int, val int)")
+        .await?;
+    client
+        .simple_query("INSERT INTO dm VALUES (1, 10), (2, 20), (3, 30)")
+        .await?;
+    client
+        .simple_query("DELETE FROM dm WHERE val IN (SELECT val FROM dm WHERE val > 25)")
+        .await?;
+    client
+        .simple_query("UPDATE dm SET val = (SELECT max(val) FROM dm WHERE val < 25) WHERE id = 1")
+        .await?;
+    let msgs = client
+        .simple_query("SELECT id, val FROM dm ORDER BY id")
+        .await?;
+    let got: Vec<_> = rows(&msgs)
+        .iter()
+        .map(|r| (r.get("id"), r.get("val")))
+        .collect();
+    assert_eq!(got, vec![(Some("1"), Some("20")), (Some("2"), Some("20"))]);
+
+    Ok(())
+}
+
 /// tokio-postgres drives the extended protocol: it sends Parse with no declared
 /// parameter types and relies on the server to infer them and return binary
 /// results. A parameterized arithmetic query must round-trip through

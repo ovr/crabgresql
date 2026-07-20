@@ -666,12 +666,16 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
                 && else_.as_ref().map_or(true, |e| is_row_constant(e))
         }
         // ColumnRef/Param reference per-row/per-execution state; FuncCall/Srf may
-        // be volatile; Aggregate never appears in a bindable WHERE key.
+        // be volatile; Aggregate never appears in a bindable WHERE key. A subquery
+        // is still an unresolved subplan at plan time, so never hoist it as a key.
         BoundExpr::ColumnRef { .. }
         | BoundExpr::Param { .. }
         | BoundExpr::FuncCall { .. }
         | BoundExpr::Srf { .. }
-        | BoundExpr::Aggregate { .. } => false,
+        | BoundExpr::Aggregate { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::InSubquery { .. } => false,
     }
 }
 

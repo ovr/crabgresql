@@ -394,14 +394,14 @@ fn bind_where(
 /// A resolved CTE: its output columns and the plan that produces its rows.
 /// Cloned on each reference (single-FROM keeps this cheap in practice).
 #[derive(Clone)]
-struct CteRelation {
+pub(crate) struct CteRelation {
     columns: Vec<OutputColumn>,
     plan: LogicalPlan,
 }
 
 /// The set of CTE names visible while binding a query — the enclosing `WITH`
 /// plus any earlier siblings in the same clause.
-type CteEnv = HashMap<String, CteRelation>;
+pub(crate) type CteEnv = HashMap<String, CteRelation>;
 
 /// Replace every `$n` placeholder ([`BoundExpr::Param`]) in a bound plan with a
 /// constant carrying the value bound for that parameter, in place. Run by the
@@ -595,6 +595,15 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
                 subst_expr(arg, params);
             }
         }
+        // A `$n` may appear inside the subquery body, and (for IN) inside the
+        // needle carried by the comparison template.
+        BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
+            substitute_params(&mut subplan.0, params);
+        }
+        BoundExpr::InSubquery { subplan, cmp, .. } => {
+            substitute_params(&mut subplan.0, params);
+            subst_expr(cmp, params);
+        }
     }
 }
 
@@ -621,7 +630,7 @@ pub fn bind_query_with_params(
 
 /// Bind a query with a set of visible CTEs. Recurses for CTE bodies and derived
 /// tables, extending the environment with this query's own `WITH` clause.
-fn bind_query_scoped(
+pub(crate) fn bind_query_scoped(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
     params: &ParamCtx,
@@ -798,14 +807,15 @@ fn bind_select(
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
     if select.from.is_empty() {
-        return bind_values_select(catalog, params, select, order_by);
+        return bind_values_select(engine, catalog, params, select, order_by, ctes);
     }
     let BoundFrom {
         source,
         relations,
         visible,
     } = bind_from_clause(engine, catalog, params, &select.from, ctes)?;
-    let scope = Scope::relations_with_visible(relations, visible, catalog, params);
+    let scope = Scope::relations_with_visible(relations, visible, catalog, params)
+        .with_subqueries(engine, ctes);
     let body = bind_select_body(select, order_by, &scope)?;
     if let Some(agg) = body.aggregation {
         let input = match source {
@@ -1371,6 +1381,26 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
             input_ty: *input_ty,
             ret: *ret,
         },
+        // The subplan's own `ColumnRef`s index its own rows, not this outer row,
+        // so they are never shifted. Only the IN needle (in `cmp`) references the
+        // outer row and moves with it.
+        BoundExpr::ScalarSubquery { subplan, ty } => BoundExpr::ScalarSubquery {
+            subplan: subplan.clone(),
+            ty: *ty,
+        },
+        BoundExpr::Exists { subplan, negated } => BoundExpr::Exists {
+            subplan: subplan.clone(),
+            negated: *negated,
+        },
+        BoundExpr::InSubquery {
+            subplan,
+            negated,
+            cmp,
+        } => BoundExpr::InSubquery {
+            subplan: subplan.clone(),
+            negated: *negated,
+            cmp: Box::new(shift_column_refs(cmp, delta)),
+        },
     }
 }
 
@@ -1431,7 +1461,8 @@ fn bind_table_with_joins(
                     ov
                 });
                 let scope =
-                    Scope::relations_with_visible(on_relations, on_visible, catalog, params);
+                    Scope::relations_with_visible(on_relations, on_visible, catalog, params)
+                        .with_subqueries(engine, ctes);
                 let binding = bind_expr(on, &scope)?;
                 if matches!(&binding, Binding::Typed(expr) if expr.contains_aggregate()) {
                     return Err(BindError::new(
@@ -1792,6 +1823,128 @@ pub fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindEr
     }
 }
 
+/// Rewrite an `EXISTS` subquery's target list to a single constant `1`, so the
+/// executor only tests for a first row and never evaluates the original
+/// projection (which PG's semi-join also skips — matching `EXISTS(SELECT 1/0 …)`
+/// returning true rather than erroring). Row count is preserved because a
+/// scalar projection is one-in/one-out; when a projection is set-returning the
+/// output count depends on it, so the plan is left untouched (the executor still
+/// stops at the first produced row). `ORDER BY`/`DISTINCT` are dropped: they
+/// cannot change whether any row exists.
+pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
+    fn one_row() -> Vec<BoundExpr> {
+        vec![BoundExpr::Const {
+            value: Value::Int4(1),
+            ty: PgType::Int4,
+        }]
+    }
+    fn one_col() -> Vec<OutputColumn> {
+        vec![OutputColumn {
+            name: "?column?".into(),
+            ty: PgType::Int4,
+        }]
+    }
+    fn has_srf(projections: &[BoundExpr]) -> bool {
+        projections.iter().any(BoundExpr::contains_srf)
+    }
+    match plan {
+        LogicalPlan::Query {
+            table,
+            projections,
+            predicate,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::Query {
+            table,
+            columns: one_col(),
+            projections: one_row(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Subquery {
+            source,
+            projections,
+            predicate,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::Subquery {
+            source,
+            columns: one_col(),
+            projections: one_row(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Join {
+            source,
+            projections,
+            predicate,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::Join {
+            source,
+            columns: one_col(),
+            projections: one_row(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::TableFunction {
+            func,
+            args,
+            projections,
+            predicate,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::TableFunction {
+            func,
+            args,
+            columns: one_col(),
+            projections: one_row(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            projections,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            columns: one_col(),
+            projections: one_row(),
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Values {
+            rows, predicate, ..
+        } => LogicalPlan::Values {
+            columns: one_col(),
+            rows: rows.into_iter().map(|_| one_row()).collect(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Limit {
+            source,
+            limit,
+            offset,
+        } => LogicalPlan::Limit {
+            source: Box::new(strip_to_existence(*source)),
+            limit,
+            offset,
+        },
+        // A set-returning projection (guards above fell through) or a DML body in
+        // WITH: leave as-is; the executor's first-row check is still correct.
+        other => other,
+    }
+}
+
 /// The qualifier a FROM item's columns are addressed by: its alias, else its
 /// name.
 fn relation_qualifier(alias: &Option<ast::TableAlias>, default: &str) -> String {
@@ -2126,12 +2279,14 @@ fn reject_unsupported_select_clauses(select: &ast::Select) -> Result<(), BindErr
 /// FROM-less SELECT: one row of constant expressions. A WHERE is still legal
 /// (`SELECT 1 WHERE false`) and binds in the empty scope.
 fn bind_values_select(
+    engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
     params: &ParamCtx,
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
+    ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
-    let scope = Scope::empty(catalog, params);
+    let scope = Scope::empty(catalog, params).with_subqueries(engine, ctes);
     let mut columns = Vec::new();
     let mut row = Vec::new();
     for item in &select.projection {
@@ -2632,6 +2787,19 @@ fn rewrite_over_aggregate(
         BoundExpr::Srf { .. } => Err(BindError::feature_not_supported(
             "set-returning functions with aggregation are not supported yet",
         )),
+        // A non-correlated subquery is a per-group constant, so scalar/EXISTS pass
+        // through unchanged. For IN, the needle carried by `cmp` is an outer
+        // expression that may hold an aggregate or grouped column, so rewrite it.
+        c @ (BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. }) => Ok(c),
+        BoundExpr::InSubquery {
+            subplan,
+            negated,
+            cmp,
+        } => Ok(BoundExpr::InSubquery {
+            subplan,
+            negated,
+            cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
+        }),
     }
 }
 
@@ -2833,8 +3001,9 @@ pub fn bind_insert_with_params(
         }
 
         // VALUES cells bind in the empty scope: a column reference in VALUES is
-        // an undefined column, as in PG.
-        let scope = Scope::empty(catalog, params);
+        // an undefined column, as in PG. A cell may still hold a subquery; INSERT
+        // takes no WITH, so the CTE environment is empty.
+        let scope = Scope::empty(catalog, params).with_subqueries(engine, &CteEnv::new());
         let first_width = value_rows.first().map_or(0, |row| row.len());
         let mut rows = Vec::with_capacity(value_rows.len());
         for value_row in value_rows {
@@ -2876,7 +3045,7 @@ pub fn bind_insert_with_params(
     // needs a fresh table scope.
     let returning = bind_returning(
         &insert.returning,
-        &Scope::table(&schema, name, catalog, params),
+        &Scope::table(&schema, name, catalog, params).with_subqueries(engine, &CteEnv::new()),
     )?;
 
     Ok(LogicalPlan::Insert {
@@ -2924,7 +3093,10 @@ pub fn bind_update_with_params(
     let (table, qualifier) = open_write_relation(engine, &update.table.relation, WriteVerb::Update)?;
     let schema = table.schema().clone();
     let table_name = schema.name.clone();
-    let scope = Scope::table(&schema, qualifier, catalog, params);
+    // SET / WHERE / RETURNING may all contain subqueries; UPDATE takes no WITH,
+    // so the CTE environment is empty.
+    let scope =
+        Scope::table(&schema, qualifier, catalog, params).with_subqueries(engine, &CteEnv::new());
 
     // SET expressions bind against the table schema: they all see the OLD
     // row, so `SET a = b, b = a` swaps.
@@ -3017,7 +3189,9 @@ pub fn bind_delete_with_params(
 
     let (table, qualifier) = open_write_relation(engine, &target.relation, WriteVerb::Delete)?;
     let schema = table.schema().clone();
-    let scope = Scope::table(&schema, qualifier, catalog, params);
+    // WHERE / RETURNING may contain subqueries; DELETE takes no WITH.
+    let scope =
+        Scope::table(&schema, qualifier, catalog, params).with_subqueries(engine, &CteEnv::new());
     let predicate = bind_where(&delete.selection, &scope)?;
     // RETURNING references the deleted (OLD) row, which the executor feeds.
     let returning = bind_returning(&delete.returning, &scope)?;
@@ -4621,6 +4795,139 @@ mod tests {
         assert_eq!(columns[0].name, "x");
 
         Ok(())
+    }
+
+    #[test]
+    fn scalar_subquery_binds_with_column_type() -> anyhow::Result<()> {
+        // A FROM-less SELECT is a Values plan; its one projection is the marker.
+        let LogicalPlan::Values { rows, .. } = bound("SELECT (SELECT big FROM t)") else {
+            panic!("expected Values");
+        };
+        assert!(matches!(
+            rows[0][0],
+            BoundExpr::ScalarSubquery {
+                ty: PgType::Int8,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn exists_binds_to_marker() {
+        let LogicalPlan::Query { predicate, .. } =
+            bound("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t)")
+        else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            predicate,
+            Some(BoundExpr::Exists { negated: false, .. })
+        ));
+    }
+
+    #[test]
+    fn not_exists_sets_negated() {
+        let LogicalPlan::Query { predicate, .. } =
+            bound("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM t)")
+        else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            predicate,
+            Some(BoundExpr::Exists { negated: true, .. })
+        ));
+    }
+
+    #[test]
+    fn in_subquery_binds_to_marker() {
+        let LogicalPlan::Query { predicate, .. } =
+            bound("SELECT id FROM t WHERE id IN (SELECT id FROM t)")
+        else {
+            panic!("expected Query");
+        };
+        let Some(BoundExpr::InSubquery { negated, cmp, .. }) = predicate else {
+            panic!("expected InSubquery predicate");
+        };
+        assert!(!negated);
+        // The comparison template is `id = <hole>`, an equality Binary.
+        assert!(matches!(*cmp, BoundExpr::Binary { op: BinOp::Eq, .. }));
+    }
+
+    #[test]
+    fn scalar_subquery_multiple_columns_errors() {
+        let e = bind_err("SELECT (SELECT id, big FROM t)");
+        assert_eq!(e.code, "42601");
+        assert_eq!(e.message, "subquery must return only one column");
+    }
+
+    #[test]
+    fn in_subquery_multiple_columns_errors() {
+        let e = bind_err("SELECT id FROM t WHERE id IN (SELECT id, big FROM t)");
+        assert_eq!(e.code, "42601");
+        assert_eq!(e.message, "subquery has too many columns");
+    }
+
+    #[test]
+    fn correlated_reference_is_rejected() {
+        // Stage 1 binds each subquery in an isolated scope, so an outer relation
+        // is not visible — a qualified outer reference is a missing-FROM error.
+        // (Correlated subqueries are a later stage.)
+        let e = bind_err("SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t WHERE id = x.id)");
+        assert_eq!(e.code, "42P01");
+    }
+
+    #[test]
+    fn scalar_subquery_column_named_after_inner_column() {
+        let LogicalPlan::Values { columns, .. } = bound("SELECT (SELECT max(id) FROM t)") else {
+            panic!("expected Values");
+        };
+        assert_eq!(columns[0].name, "max");
+    }
+
+    #[test]
+    fn exists_column_named_exists() {
+        let LogicalPlan::Values { columns, .. } = bound("SELECT EXISTS (SELECT 1 FROM t)") else {
+            panic!("expected Values");
+        };
+        assert_eq!(columns[0].name, "exists");
+    }
+
+    #[test]
+    fn exists_strips_target_list_to_a_constant() -> anyhow::Result<()> {
+        // The EXISTS subplan's projection is replaced with a constant so the
+        // original target list (here a division by zero) is never evaluated.
+        let LogicalPlan::Values { rows, .. } = bound("SELECT EXISTS (SELECT id / 0 FROM t)") else {
+            panic!("expected Values");
+        };
+        let BoundExpr::Exists { subplan, .. } = &rows[0][0] else {
+            panic!("expected Exists");
+        };
+        let LogicalPlan::Query { projections, .. } = subplan.0.as_ref() else {
+            panic!("expected Query subplan");
+        };
+        assert!(matches!(projections.as_slice(), [BoundExpr::Const { .. }]));
+        Ok(())
+    }
+
+    #[test]
+    fn update_set_accepts_subquery() {
+        let LogicalPlan::Update { assignments, .. } =
+            bound("UPDATE t SET id = (SELECT max(id) FROM t)")
+        else {
+            panic!("expected Update");
+        };
+        assert!(matches!(assignments[0].1, BoundExpr::ScalarSubquery { .. }));
+    }
+
+    #[test]
+    fn delete_where_accepts_in_subquery() {
+        let LogicalPlan::Delete { predicate, .. } =
+            bound("DELETE FROM t WHERE id IN (SELECT id FROM t)")
+        else {
+            panic!("expected Delete");
+        };
+        assert!(matches!(predicate, Some(BoundExpr::InSubquery { .. })));
     }
 
     fn case_column(sql: &str) -> (OutputColumn, BoundExpr) {

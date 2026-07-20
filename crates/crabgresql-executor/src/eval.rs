@@ -80,6 +80,15 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, 
             sqlstate::FEATURE_NOT_SUPPORTED,
             "aggregate function called in a context that cannot accept one",
         )),
+        // Subquery markers are folded to constants/comparisons by
+        // `resolve_subqueries` before any node evaluates an expression; one
+        // reaching here means that pass was skipped — an internal invariant break.
+        BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::InSubquery { .. } => Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "subquery was not resolved before execution",
+        )),
     }
 }
 

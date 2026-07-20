@@ -34,3 +34,4 @@ test: information_schema
 test: constraints
 test: returning
 test: insert_select
+test: subquery
