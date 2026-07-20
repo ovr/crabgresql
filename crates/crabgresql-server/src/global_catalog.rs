@@ -174,6 +174,28 @@ impl CatalogInner {
         self.casts.iter().find(|c| c.oid == oid)
     }
 
+    /// Rewrite every stored `TypeRef::User(from)` to `TypeRef::User(to)` in the
+    /// function and cast signatures. These reference user types by name (not
+    /// OID), so a `ALTER TYPE ... RENAME TO` must carry the rename into them.
+    fn rename_type_refs(&mut self, from: &str, to: &str) {
+        fn rewrite(r: &mut TypeRef, from: &str, to: &str) {
+            if let TypeRef::User(name) = r
+                && name == from
+            {
+                *name = to.to_string();
+            }
+        }
+        for func in &mut self.funcs {
+            for arg in &mut func.args {
+                rewrite(arg, from, to);
+            }
+        }
+        for cast in &mut self.casts {
+            rewrite(&mut cast.source, from, to);
+            rewrite(&mut cast.target, from, to);
+        }
+    }
+
     /// The name of a user type by OID (reverse of the `types` map).
     fn type_name_by_oid(&self, oid: u32) -> Option<&str> {
         self.types
@@ -383,9 +405,10 @@ impl GlobalCatalog {
     /// `ALTER TYPE old RENAME TO new`. Works for any user type (enum or base):
     /// only the `types` map key changes and the OID is preserved, so existing
     /// `pg_type`/`pg_enum` rows and stored `Value::Enum { type_oid }` stay valid.
-    /// Renaming to a name that already exists (including `old` itself) is a
-    /// duplicate-object error, as in PG. Builtin-name collisions are rejected by
-    /// the caller before we get here.
+    /// The existence of `old` is checked before the target-name collision, so a
+    /// missing source reports "does not exist" (not the target's "already
+    /// exists"), matching PG. A `new` that collides with a builtin name or an
+    /// existing user type (including `old` itself) is a duplicate-object error.
     pub fn rename_type(&self, old: &str, new: &str) -> Result<Vec<CatalogNotice>, PgError> {
         let mut cat = self
             .inner
@@ -397,12 +420,16 @@ impl GlobalCatalog {
                 format!("type \"{old}\" does not exist"),
             ));
         }
-        if cat.types.contains_key(new) {
+        if crabgresql_catalog::is_builtin_type_name(new) || cat.types.contains_key(new) {
             return Err(PgError::new(
                 sqlstate::DUPLICATE_OBJECT,
                 format!("type \"{new}\" already exists"),
             ));
         }
+        // Function and cast signatures store their argument/source/target types
+        // by name (`TypeRef::User`), not by OID, so the rename must follow the
+        // name into them or those objects stop resolving against this type.
+        cat.rename_type_refs(old, new);
         let entry = cat.types.remove(old).expect("type present after check");
         cat.types.insert(new.to_string(), entry);
         Ok(Vec::new())
@@ -1273,6 +1300,37 @@ mod tests {
         let collide = cat.rename_type("a", "b").unwrap_err();
         assert_eq!(collide.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(collide.message, "type \"b\" already exists");
+        // A target that collides with a builtin name is a duplicate-object error.
+        let builtin = cat.rename_type("a", "int4").unwrap_err();
+        assert_eq!(builtin.code, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(builtin.message, "type \"int4\" already exists");
+        // Source existence is checked before the target collision: a missing
+        // source with a builtin target still reports the source, not the target.
+        let order = cat.rename_type("nope", "int4").unwrap_err();
+        assert_eq!(order.code, sqlstate::UNDEFINED_OBJECT);
+        assert_eq!(order.message, "type \"nope\" does not exist");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_type_follows_the_name_into_cast_signatures() -> anyhow::Result<()> {
+        // Casts store their source/target by name (TypeRef::User), so a rename
+        // must carry into them or find_cast (keyed on the current OID->name) stops
+        // matching a cast created under the old name.
+        let cat = GlobalCatalog::new();
+        cat.define_type("t", 4, Some(PgType::Int4))?;
+        let oid = cat.resolve_type("t").expect("resolves").oid;
+        cat.create_cast(
+            TypeRef::User("t".into()),
+            TypeRef::Builtin(PgType::Int4),
+            true,
+        )?;
+        assert!(cat.find_cast(PgType::User(oid), PgType::Int4).is_some());
+        cat.rename_type("t", "u")?;
+        // Same OID, and the cast still resolves after the rename.
+        assert_eq!(cat.resolve_type("u").expect("resolves").oid, oid);
+        assert!(cat.find_cast(PgType::User(oid), PgType::Int4).is_some());
 
         Ok(())
     }

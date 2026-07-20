@@ -1821,6 +1821,22 @@ fn execute_create_type(
     })
 }
 
+/// Reject an enum-only `ALTER TYPE` operation targeting a builtin type. Builtins
+/// exist but are never enums, so PG reports `<type> is not an enum`
+/// (WRONG_OBJECT_TYPE) rather than the catalog's "type does not exist" (builtins
+/// are absent from the user-type map). The name is rendered as PG's `format_type_be`
+/// spelling (e.g. `integer`, not `int4`) when known.
+fn reject_non_enum_builtin(name: &str) -> Result<(), PgError> {
+    if crabgresql_catalog::is_builtin_type_name(name) {
+        let display = builtin_type_by_name(name).map_or_else(|| name.to_string(), |t| t.name().to_string());
+        return Err(PgError::new(
+            sqlstate::WRONG_OBJECT_TYPE,
+            format!("{display} is not an enum"),
+        ));
+    }
+    Ok(())
+}
+
 /// `ALTER TYPE`. Supports `RENAME TO` (any user type) and, for enums,
 /// `ADD VALUE` and `RENAME VALUE`. The mutation and its PG error text/SQLSTATE
 /// live on [`GlobalCatalog`]; here we only normalize the AST names.
@@ -1831,16 +1847,12 @@ fn execute_alter_type(
     let tname = single_object_name(&alter.name, "type")?;
     let notices = match &alter.operation {
         ast::AlterTypeOperation::Rename(rename) => {
-            let new_name = normalize_ident(&rename.new_name);
-            if crabgresql_catalog::is_builtin_type_name(&new_name) {
-                return Err(PgError::new(
-                    sqlstate::DUPLICATE_OBJECT,
-                    format!("type \"{new_name}\" already exists"),
-                ));
-            }
-            catalog.rename_type(&tname, &new_name)?
+            // The builtin-name collision of the target is enforced inside
+            // rename_type, after it confirms the source type exists.
+            catalog.rename_type(&tname, &normalize_ident(&rename.new_name))?
         }
         ast::AlterTypeOperation::AddValue(add) => {
+            reject_non_enum_builtin(&tname)?;
             // Enum labels are string constants, not identifiers — stored verbatim.
             let position = match &add.position {
                 Some(ast::AlterTypeAddValuePosition::Before(n)) => Some((true, n.value.clone())),
@@ -1850,6 +1862,7 @@ fn execute_alter_type(
             catalog.add_enum_value(&tname, &add.value.value, add.if_not_exists, position)?
         }
         ast::AlterTypeOperation::RenameValue(rename) => {
+            reject_non_enum_builtin(&tname)?;
             catalog.rename_enum_value(&tname, &rename.from.value, &rename.to.value)?
         }
     };

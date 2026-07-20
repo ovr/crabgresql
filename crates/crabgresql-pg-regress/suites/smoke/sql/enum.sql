@@ -82,6 +82,13 @@ SELECT typname FROM pg_type WHERE typname IN ('planets', 'bodies');
 SELECT * FROM solar ORDER BY body;
 -- Renaming onto a name that already exists is an error.
 ALTER TYPE bodies RENAME TO bodies;
+-- Renaming a type that does not exist reports the source, even when the target
+-- name would collide with a builtin.
+ALTER TYPE nonesuch RENAME TO int4;
+-- ADD VALUE / RENAME VALUE on a builtin (non-enum) type is a wrong-object error,
+-- with PostgreSQL's spelling of the type name.
+ALTER TYPE int4 ADD VALUE 'x';
+ALTER TYPE text RENAME VALUE 'a' TO 'b';
 --
 -- Cleanup.
 --
