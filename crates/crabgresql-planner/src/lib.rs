@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use crabgresql_binder::{
-    AggInput, BinOp, BoundAggregate, BoundExpr, JoinExpr, JoinInput, JoinKind, LogicalPlan,
-    OutputColumn, SortKey, TableFn,
+    AggInput, BinOp, BoundAggregate, BoundExpr, DistinctKey, JoinExpr, JoinInput, JoinKind,
+    LogicalPlan, OutputColumn, SortKey, TableFn,
 };
 use crabgresql_storage_api::{IndexConstraint, IndexMetadata, TableAm, TableSchema};
 use crabgresql_types::PgType;
@@ -21,6 +21,7 @@ pub enum PhysicalPlan {
         rows: Vec<Vec<BoundExpr>>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     Select {
         table: Arc<dyn TableAm>,
@@ -28,6 +29,7 @@ pub enum PhysicalPlan {
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// A single-table read served by an equality probe on `index_name`: the
     /// executor evaluates each `key` value once and asks the engine for the
@@ -46,6 +48,7 @@ pub enum PhysicalPlan {
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     Subquery {
         source: Box<PhysicalPlan>,
@@ -53,6 +56,7 @@ pub enum PhysicalPlan {
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     TableFunction {
         func: TableFn,
@@ -61,6 +65,7 @@ pub enum PhysicalPlan {
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// Recursive joined row source, then the standard Filter → Projection →
     /// Sort tail. Mirrors [`LogicalPlan::Join`].
@@ -70,6 +75,7 @@ pub enum PhysicalPlan {
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// Grouped aggregation. Mirrors [`LogicalPlan::Aggregate`]: the executor
     /// filters `input` by `predicate`, groups by `group_exprs`, accumulates the
@@ -84,6 +90,7 @@ pub enum PhysicalPlan {
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// LIMIT/OFFSET above a source plan (after its sort). Mirrors
     /// [`LogicalPlan::Limit`].
@@ -337,11 +344,13 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             rows,
             predicate,
             sort,
+            distinct,
         } => PhysicalPlan::Values {
             columns,
             rows,
             predicate,
             sort,
+            distinct,
         },
         LogicalPlan::Query {
             table,
@@ -349,6 +358,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             projections,
             predicate,
             sort,
+            distinct,
         } => match choose_access(&table, predicate) {
             AccessPath::Index {
                 index_name,
@@ -362,6 +372,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
                 projections,
                 predicate: residual,
                 sort,
+                distinct,
             },
             AccessPath::Scan { predicate } => PhysicalPlan::Select {
                 table,
@@ -369,6 +380,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
                 projections,
                 predicate,
                 sort,
+                distinct,
             },
         },
         LogicalPlan::Subquery {
@@ -377,12 +389,14 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             projections,
             predicate,
             sort,
+            distinct,
         } => PhysicalPlan::Subquery {
             source: Box::new(plan(*source)),
             columns,
             projections,
             predicate,
             sort,
+            distinct,
         },
         LogicalPlan::TableFunction {
             func,
@@ -391,6 +405,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             projections,
             predicate,
             sort,
+            distinct,
         } => PhysicalPlan::TableFunction {
             func,
             args,
@@ -398,6 +413,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             projections,
             predicate,
             sort,
+            distinct,
         },
         LogicalPlan::Join {
             source,
@@ -405,12 +421,14 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             projections,
             predicate,
             sort,
+            distinct,
         } => PhysicalPlan::Join {
             source: plan_join_expr(source),
             columns,
             projections,
             predicate,
             sort,
+            distinct,
         },
         LogicalPlan::Aggregate {
             input,
@@ -421,6 +439,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             columns,
             projections,
             sort,
+            distinct,
         } => PhysicalPlan::Aggregate {
             input: match input {
                 AggInput::Scan(table) => PhysicalAggInput::Scan(table),
@@ -434,6 +453,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             columns,
             projections,
             sort,
+            distinct,
         },
         LogicalPlan::Limit {
             source,

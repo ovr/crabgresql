@@ -631,9 +631,13 @@ async fn integer_out_of_range_on_insert() -> anyhow::Result<()> {
 #[tokio::test]
 async fn unsupported_clauses_error_instead_of_silently_dropping() {
     let client = connect(spawn_server().await).await;
-    // GROUP BY / HAVING are supported now (see aggregate tests); the rest still
-    // error rather than being silently dropped.
-    for sql in ["SELECT 1 FETCH FIRST 1 ROW ONLY", "SELECT DISTINCT 1"] {
+    // GROUP BY / HAVING and DISTINCT are supported now (see the aggregate and
+    // distinct tests); the rest still error rather than being silently dropped.
+    for sql in [
+        "SELECT 1 FETCH FIRST 1 ROW ONLY",
+        "SELECT 1 GROUP BY ROLLUP (1)",
+        "SELECT 1 GROUP BY GROUPING SETS ((1))",
+    ] {
         let err = client.simple_query(sql).await.unwrap_err();
         let db_err = err
             .as_db_error()
@@ -644,6 +648,38 @@ async fn unsupported_clauses_error_instead_of_silently_dropping() {
             "{sql}"
         );
     }
+}
+
+#[tokio::test]
+async fn select_distinct_deduplicates_rows() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE d (a integer, b integer)")
+        .await?;
+    client
+        .simple_query("INSERT INTO d VALUES (1, 10), (1, 10), (2, 20), (2, 30)")
+        .await?;
+
+    // Plain DISTINCT collapses the duplicate (1, 10) row.
+    let messages = client
+        .simple_query("SELECT DISTINCT a, b FROM d ORDER BY a, b")
+        .await?;
+    let deduped = rows(&messages);
+    assert_eq!(deduped.len(), 3);
+    assert_eq!((deduped[0].get(0), deduped[0].get(1)), (Some("1"), Some("10")));
+    assert_eq!((deduped[1].get(0), deduped[1].get(1)), (Some("2"), Some("20")));
+    assert_eq!((deduped[2].get(0), deduped[2].get(1)), (Some("2"), Some("30")));
+
+    // DISTINCT ON (a) keeps the first row per group in ORDER BY order.
+    let messages = client
+        .simple_query("SELECT DISTINCT ON (a) a, b FROM d ORDER BY a, b DESC")
+        .await?;
+    let on = rows(&messages);
+    assert_eq!(on.len(), 2);
+    assert_eq!((on[0].get(0), on[0].get(1)), (Some("1"), Some("10")));
+    assert_eq!((on[1].get(0), on[1].get(1)), (Some("2"), Some("30")));
+
+    Ok(())
 }
 
 #[tokio::test]

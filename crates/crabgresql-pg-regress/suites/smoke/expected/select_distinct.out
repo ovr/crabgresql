@@ -1,0 +1,77 @@
+--
+-- SELECT DISTINCT
+-- Row deduplication over the visible output columns, keeping one row per
+-- distinct combination. ORDER BY (whose keys must all be select-list columns)
+-- sorts the deduplicated result; two NULLs collapse into one row.
+--
+CREATE TABLE dist (id integer, a integer, b integer, name text);
+INSERT INTO dist VALUES
+  (1, 1, 10, 'ferris'),
+  (2, 1, 10, 'ferris'),
+  (3, 2, 20, 'hermit'),
+  (4, 2, 30, 'hermit'),
+  (5, 3, 30, NULL),
+  (6, 3, 30, NULL);
+-- distinct on a single column
+SELECT DISTINCT a FROM dist ORDER BY a;
+ a 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+-- distinct over multiple columns
+SELECT DISTINCT a, b FROM dist ORDER BY a, b;
+ a | b  
+---+----
+ 1 | 10
+ 2 | 20
+ 2 | 30
+ 3 | 30
+(4 rows)
+
+-- NULLs collapse to a single distinct row
+SELECT DISTINCT name FROM dist ORDER BY name;
+  name  
+--------
+ ferris
+ hermit
+ 
+(3 rows)
+
+-- distinct over an expression in the select list
+SELECT DISTINCT a + b AS total FROM dist ORDER BY total;
+ total 
+-------
+    11
+    22
+    32
+    33
+(4 rows)
+
+-- SELECT ALL keeps duplicates (the default)
+SELECT ALL a FROM dist ORDER BY a;
+ a 
+---
+ 1
+ 1
+ 2
+ 2
+ 3
+ 3
+(6 rows)
+
+-- distinct with no ORDER BY still deduplicates
+SELECT DISTINCT a, name FROM dist ORDER BY a, name;
+ a |  name  
+---+--------
+ 1 | ferris
+ 2 | hermit
+ 3 | 
+(3 rows)
+
+-- error: an ORDER BY key that is not in the select list
+SELECT DISTINCT a FROM dist ORDER BY b;
+ERROR:  for SELECT DISTINCT, ORDER BY expressions must appear in select list
+DROP TABLE dist;

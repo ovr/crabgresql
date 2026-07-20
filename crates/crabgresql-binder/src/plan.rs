@@ -36,6 +36,18 @@ pub struct SortKey {
     pub nulls_first: bool,
 }
 
+/// One key column of a `SELECT DISTINCT` / `DISTINCT ON`. Both forms reduce to
+/// deduplicating on a set of columns of the projected tuple: plain `DISTINCT`
+/// keys on every visible output column, `DISTINCT ON (…)` on the resolved ON
+/// expressions (which, like ORDER BY, may live in a hidden column past the
+/// visible width). `column` indexes the projected tuple; `ty` drives the
+/// hash/equality (via the same `hash_key`/`keys_equal` the executor uses).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DistinctKey {
+    pub column: usize,
+    pub ty: PgType,
+}
+
 #[derive(Clone)]
 pub enum LogicalPlan {
     /// FROM-less SELECT (`SELECT 1`) or a standalone `VALUES` list: one or more
@@ -46,6 +58,7 @@ pub enum LogicalPlan {
         rows: Vec<Vec<BoundExpr>>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// Single-table SELECT with optional predicate.
     Query {
@@ -54,6 +67,7 @@ pub enum LogicalPlan {
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// SELECT over a subquery source in FROM: a derived table (`(SELECT ...) s`)
     /// or a CTE reference. `source` produces the input rows; the same
@@ -64,6 +78,7 @@ pub enum LogicalPlan {
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// SELECT over a set-returning function in FROM position. The source rows
     /// come from evaluating `func` with `args`; the same projection/predicate/
@@ -75,6 +90,7 @@ pub enum LogicalPlan {
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// SELECT over a recursive join tree. Leaf rows are laid out left-to-right
     /// in the combined row; the same projection/predicate/sort pipeline as
@@ -85,6 +101,7 @@ pub enum LogicalPlan {
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// LIMIT/OFFSET applied above a SELECT body — after its ORDER BY, since PG
     /// evaluates the count clauses on the ordered result. `source` produces the
@@ -117,6 +134,7 @@ pub enum LogicalPlan {
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// INSERT ... VALUES: rows are full-width in schema order, each cell
     /// already coerced to its column type.
@@ -705,6 +723,7 @@ fn bind_select(
             columns: body.columns,
             projections: body.projections,
             sort: body.sort,
+            distinct: body.distinct,
         });
     }
     Ok(match source {
@@ -715,6 +734,7 @@ fn bind_select(
             projections: body.projections,
             predicate: body.predicate,
             sort: body.sort,
+            distinct: body.distinct,
         },
     })
 }
@@ -729,6 +749,7 @@ fn finish_single_select(input: JoinInput, body: SelectBody) -> LogicalPlan {
             projections: body.projections,
             predicate: body.predicate,
             sort: body.sort,
+            distinct: body.distinct,
         },
         JoinInput::Subplan(source) => LogicalPlan::Subquery {
             source,
@@ -736,6 +757,7 @@ fn finish_single_select(input: JoinInput, body: SelectBody) -> LogicalPlan {
             projections: body.projections,
             predicate: body.predicate,
             sort: body.sort,
+            distinct: body.distinct,
         },
         JoinInput::TableFunction { func, args } => LogicalPlan::TableFunction {
             func,
@@ -744,6 +766,7 @@ fn finish_single_select(input: JoinInput, body: SelectBody) -> LogicalPlan {
             projections: body.projections,
             predicate: body.predicate,
             sort: body.sort,
+            distinct: body.distinct,
         },
     }
 }
@@ -1466,6 +1489,7 @@ fn bind_values_query(
         rows,
         predicate: None,
         sort,
+        distinct: None,
     })
 }
 
@@ -1691,6 +1715,80 @@ fn order_by_target(
     Ok((index, ty))
 }
 
+/// Resolve a `SELECT DISTINCT` / `DISTINCT ON (…)` clause into the set of key
+/// columns to deduplicate on, or `None` when the query keeps duplicates
+/// (`SELECT` / `SELECT ALL`). Runs after [`bind_order_by`], so `sort` and the
+/// hidden columns it appended to `projections` are available for validation and
+/// ON-expression reuse.
+fn bind_distinct(
+    distinct: &Option<ast::Distinct>,
+    columns: &[OutputColumn],
+    scope: &Scope,
+    projections: &mut Vec<BoundExpr>,
+    sort: &[SortKey],
+) -> Result<Option<Vec<DistinctKey>>, BindError> {
+    let keys = match distinct {
+        // No DISTINCT, or the explicit `ALL` default: keep every row.
+        None | Some(ast::Distinct::All) => return Ok(None),
+        // Plain `SELECT DISTINCT`: deduplicate on all visible output columns.
+        Some(ast::Distinct::Distinct) => {
+            // PG requires every ORDER BY key to be a select-list column; a key
+            // that resolved to a hidden column past the visible width is an
+            // expression not in the target list.
+            if sort.iter().any(|key| key.column >= columns.len()) {
+                return Err(BindError::new(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                ));
+            }
+            columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| DistinctKey {
+                    column: i,
+                    ty: col.ty,
+                })
+                .collect()
+        }
+        // `SELECT DISTINCT ON (exprs)`: deduplicate on the ON expressions.
+        Some(ast::Distinct::On(exprs)) => {
+            let mut keys = Vec::with_capacity(exprs.len());
+            for expr in exprs {
+                let (column, ty) = order_by_target(expr, columns, scope, projections, true)?;
+                keys.push(DistinctKey { column, ty });
+            }
+            // When ORDER BY is present the ON expressions must be a prefix of it,
+            // so "first row per DISTINCT ON group" is well-defined by the sort.
+            if !sort.is_empty() {
+                let prefix_matches = keys.len() <= sort.len()
+                    && keys
+                        .iter()
+                        .zip(sort)
+                        .all(|(key, sort_key)| key.column == sort_key.column);
+                if !prefix_matches {
+                    return Err(BindError::new(
+                        sqlstate::INVALID_COLUMN_REFERENCE,
+                        "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                    ));
+                }
+            }
+            keys
+        }
+    };
+    // The executor deduplicates via `keys_equal`, which compares with
+    // `compare_values` and panics on a type it cannot order. Reject such a key
+    // at bind time, mirroring `bind_order_by`.
+    for key in &keys {
+        if !crate::expr::is_orderable(key.ty, scope.catalog().as_ref()) {
+            return Err(BindError::feature_not_supported(format!(
+                "DISTINCT on type {} is not supported yet",
+                crate::expr::type_label(key.ty, scope.catalog().as_ref())
+            )));
+        }
+    }
+    Ok(Some(keys))
+}
+
 fn reject_unsupported_query_clauses(query: &ast::Query) -> Result<(), BindError> {
     // WITH is handled by the caller (bind_ctes) and LIMIT/OFFSET by the caller
     // (bind_limit_offset); neither is rejected here.
@@ -1717,9 +1815,8 @@ fn reject_unsupported_select_clauses(select: &ast::Select) -> Result<(), BindErr
         ast::GroupByExpr::Expressions(_, modifiers) => !modifiers.is_empty(),
         ast::GroupByExpr::All(_) => true,
     };
-    let unsupported: Option<&str> = if select.distinct.is_some() {
-        Some("DISTINCT")
-    } else if grouping_sets_unsupported {
+    // DISTINCT / DISTINCT ON are handled by `bind_distinct` in the select body.
+    let unsupported: Option<&str> = if grouping_sets_unsupported {
         Some("GROUP BY ROLLUP/CUBE/GROUPING SETS")
     } else if !select.named_window.is_empty() {
         Some("WINDOW")
@@ -1768,6 +1865,7 @@ fn bind_values_select(
     // Values node's empty-row evaluation. Hidden columns are never SRFs, so the
     // SRF check below is unaffected.
     let sort = bind_order_by(order_by, &columns, &scope, &mut row, true)?;
+    let distinct = bind_distinct(&select.distinct, &columns, &scope, &mut row, &sort)?;
     // A FROM-less aggregate (`SELECT count(*)`, or a HAVING/GROUP BY) runs over
     // the single virtual row. `count(*)` returns 1, `WHERE false` makes it 0.
     if let Some(agg) = bind_aggregation(select, &scope, &columns, &mut row, &predicate)? {
@@ -1780,6 +1878,7 @@ fn bind_values_select(
             columns,
             projections: row,
             sort,
+            distinct,
         });
     }
     // A FROM-less SELECT with a set-returning function in the target list
@@ -1792,6 +1891,7 @@ fn bind_values_select(
             rows: vec![vec![]],
             predicate: None,
             sort: Vec::new(),
+            distinct: None,
         };
         return Ok(LogicalPlan::Subquery {
             source: Box::new(source),
@@ -1799,6 +1899,7 @@ fn bind_values_select(
             projections: row,
             predicate,
             sort,
+            distinct,
         });
     }
     Ok(LogicalPlan::Values {
@@ -1806,6 +1907,7 @@ fn bind_values_select(
         rows: vec![row],
         predicate,
         sort,
+        distinct,
     })
 }
 
@@ -1815,6 +1917,9 @@ struct SelectBody {
     projections: Vec<BoundExpr>,
     predicate: Option<BoundExpr>,
     sort: Vec<SortKey>,
+    /// `Some` for `SELECT DISTINCT` / `DISTINCT ON` — the key columns to
+    /// deduplicate on. `None` when the query keeps duplicates.
+    distinct: Option<Vec<DistinctKey>>,
     /// Present when the SELECT aggregates (`GROUP BY`/`HAVING`, or an aggregate
     /// in the target list / ORDER BY). `projections` and `sort` have then been
     /// rewritten to reference the aggregate output row.
@@ -1868,6 +1973,10 @@ fn bind_select_body(
 
     let predicate = bind_where(&select.selection, scope)?;
     let sort = bind_order_by(order_by, &columns, scope, &mut projections, true)?;
+    // DISTINCT is resolved before aggregation so any hidden `DISTINCT ON` column
+    // appended to `projections` is aggregate-rewritten alongside the ORDER BY
+    // ones below.
+    let distinct = bind_distinct(&select.distinct, &columns, scope, &mut projections, &sort)?;
     // ORDER BY expressions were appended to `projections` as hidden columns, so
     // aggregate detection/rewrite below covers `ORDER BY count(*)` too.
     let aggregation = bind_aggregation(select, scope, &columns, &mut projections, &predicate)?;
@@ -1876,6 +1985,7 @@ fn bind_select_body(
         projections,
         predicate,
         sort,
+        distinct,
         aggregation,
     })
 }
@@ -4511,6 +4621,99 @@ mod tests {
             } => (projections, sort),
             _ => panic!("expected Query for {sql}, got another plan variant"),
         }
+    }
+
+    fn distinct_of(sql: &str) -> (Vec<BoundExpr>, Option<Vec<DistinctKey>>) {
+        match bound(sql) {
+            LogicalPlan::Query {
+                projections,
+                distinct,
+                ..
+            } => (projections, distinct),
+            _ => panic!("expected Query for {sql}, got another plan variant"),
+        }
+    }
+
+    #[test]
+    fn select_distinct_keys_every_visible_column() {
+        // Plain DISTINCT deduplicates on all visible output columns, in order.
+        let (projections, distinct) = distinct_of("SELECT id, name FROM t");
+        assert!(distinct.is_none(), "no DISTINCT keyword → no distinct keys");
+        let _ = projections;
+        let (_, distinct) = distinct_of("SELECT DISTINCT id, name FROM t");
+        assert_eq!(
+            distinct,
+            Some(vec![
+                DistinctKey {
+                    column: 0,
+                    ty: PgType::Int4,
+                },
+                DistinctKey {
+                    column: 1,
+                    ty: PgType::Text,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn select_all_keeps_duplicates() {
+        // The explicit ALL default is not DISTINCT.
+        let (_, distinct) = distinct_of("SELECT ALL id FROM t");
+        assert!(distinct.is_none());
+    }
+
+    #[test]
+    fn distinct_on_resolves_expressions_to_columns() {
+        // DISTINCT ON (id): id is a select-list column, so the key reuses it.
+        let (projections, distinct) =
+            distinct_of("SELECT DISTINCT ON (id) id, name FROM t ORDER BY id, name");
+        assert_eq!(projections.len(), 2, "ON key reuses the visible column");
+        assert_eq!(
+            distinct,
+            Some(vec![DistinctKey {
+                column: 0,
+                ty: PgType::Int4,
+            }])
+        );
+    }
+
+    #[test]
+    fn distinct_on_hidden_expression_appends_column() {
+        // DISTINCT ON (big) where big is not selected: it becomes a hidden
+        // column, and ORDER BY big reuses that same hidden column (prefix match).
+        let (projections, distinct) =
+            distinct_of("SELECT DISTINCT ON (big) id FROM t ORDER BY big, id");
+        assert_eq!(projections.len(), 2, "one hidden column for the ON expr");
+        assert_eq!(
+            distinct,
+            Some(vec![DistinctKey {
+                column: 1,
+                ty: PgType::Int8,
+            }])
+        );
+    }
+
+    #[test]
+    fn select_distinct_order_by_not_in_select_list_is_42p10() {
+        // PG requires DISTINCT's ORDER BY keys to be select-list columns.
+        let e = bind_err("SELECT DISTINCT id FROM t ORDER BY big");
+        assert_eq!(e.code, "42P10");
+        assert_eq!(
+            e.message,
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+        );
+    }
+
+    #[test]
+    fn distinct_on_not_matching_order_by_is_42p10() {
+        // DISTINCT ON expressions must be a prefix of ORDER BY.
+        let e = bind_err("SELECT DISTINCT ON (id) id FROM t ORDER BY name");
+        assert_eq!(e.code, "42P10");
+        assert_eq!(
+            e.message,
+            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        );
     }
 
     #[test]
