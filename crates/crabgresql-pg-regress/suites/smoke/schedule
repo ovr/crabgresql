@@ -1,5 +1,7 @@
 test: basic
 test: order_by
+test: select_distinct
+test: select_distinct_on
 test: aggregate
 test: errors
 test: cast

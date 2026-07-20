@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use crabgresql_binder::OutputColumn;
-use crabgresql_binder::{BoundAggregate, BoundExpr, JoinKind, SortKey, TableFn};
+use crabgresql_binder::{BoundAggregate, BoundExpr, DistinctKey, JoinKind, SortKey, TableFn};
 use crabgresql_planner::{
     HashKey, PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan,
 };
@@ -108,12 +108,18 @@ pub fn execute(
             rows,
             predicate,
             sort,
+            distinct,
         } => {
+            // The emitted tuple width, including any hidden ORDER BY / DISTINCT ON
+            // columns a FROM-less `SELECT DISTINCT ON (expr)` appended past the
+            // visible output — captured before `rows` is moved so a Distinct can
+            // keep those columns through the sort.
+            let full_width = rows.first().map_or(columns.len(), Vec::len);
             let mut node: Box<dyn ExecNode> = Box::new(Values::new(rows, ctx));
             if let Some(predicate) = predicate {
                 node = Box::new(Filter::new(node, predicate, ctx));
             }
-            node = maybe_sort(node, sort, &columns)?;
+            node = finish_sort_distinct(node, sort, distinct, full_width, &columns)?;
             Ok(Execution::Rows { columns, node })
         }
         PhysicalPlan::Select {
@@ -122,11 +128,13 @@ pub fn execute(
             projections,
             predicate,
             sort,
+            distinct,
         } => project_pipeline(
             Box::new(SeqScan::new(&table, txn)),
             projections,
             predicate,
             sort,
+            distinct,
             columns,
             ctx,
         ),
@@ -138,9 +146,18 @@ pub fn execute(
             projections,
             predicate,
             sort,
+            distinct,
         } => {
             let source = IndexScan::new(&table, &index_name, key, ctx, txn)?;
-            project_pipeline(Box::new(source), projections, predicate, sort, columns, ctx)
+            project_pipeline(
+                Box::new(source),
+                projections,
+                predicate,
+                sort,
+                distinct,
+                columns,
+                ctx,
+            )
         }
         PhysicalPlan::Subquery {
             source,
@@ -148,6 +165,7 @@ pub fn execute(
             projections,
             predicate,
             sort,
+            distinct,
         } => {
             // Stream the source's rows straight into this level's pipeline. A
             // single FROM reference needs no materialization; buffering waits
@@ -158,7 +176,7 @@ pub fn execute(
                     "subquery source did not produce a row set",
                 ));
             };
-            project_pipeline(node, projections, predicate, sort, columns, ctx)
+            project_pipeline(node, projections, predicate, sort, distinct, columns, ctx)
         }
         PhysicalPlan::TableFunction {
             func,
@@ -167,11 +185,13 @@ pub fn execute(
             projections,
             predicate,
             sort,
+            distinct,
         } => project_pipeline(
             Box::new(TableFunctionSource::new(func, args, ctx)),
             projections,
             predicate,
             sort,
+            distinct,
             columns,
             ctx,
         ),
@@ -181,9 +201,10 @@ pub fn execute(
             projections,
             predicate,
             sort,
+            distinct,
         } => {
             let joined = build_join_expr(source, ctx, txn)?;
-            project_pipeline(joined, projections, predicate, sort, columns, ctx)
+            project_pipeline(joined, projections, predicate, sort, distinct, columns, ctx)
         }
         PhysicalPlan::Limit {
             source,
@@ -210,6 +231,7 @@ pub fn execute(
             columns,
             projections,
             sort,
+            distinct,
         } => {
             // Source rows: a base table scan or the single virtual row of a
             // FROM-less aggregate.
@@ -230,7 +252,7 @@ pub fn execute(
             }
             // The projection list and ORDER BY were rewritten to reference the
             // aggregate output row, so the standard tail finishes the job.
-            project_pipeline(node, projections, None, sort, columns, ctx)
+            project_pipeline(node, projections, None, sort, distinct, columns, ctx)
         }
         PhysicalPlan::Insert { table, rows } => execute_insert(&table, &rows, ctx, txn),
         PhysicalPlan::Update {
@@ -246,11 +268,13 @@ pub fn execute(
 /// package it as a streamable result set. Shared by table scans, subquery
 /// sources, and set-returning functions (every SELECT-shaped plan with a
 /// projection list).
+#[allow(clippy::too_many_arguments)]
 fn project_pipeline(
     source: Box<dyn ExecNode>,
     projections: Vec<BoundExpr>,
     predicate: Option<BoundExpr>,
     sort: Vec<SortKey>,
+    distinct: Option<Vec<DistinctKey>>,
     columns: Vec<OutputColumn>,
     ctx: ExecContext,
 ) -> Result<Execution, ExecError> {
@@ -258,6 +282,10 @@ fn project_pipeline(
     if let Some(predicate) = predicate {
         node = Box::new(Filter::new(node, predicate, ctx));
     }
+    // The projected tuple width, including any hidden ORDER BY / DISTINCT ON
+    // columns appended past the visible output — captured before `projections`
+    // is consumed so a Distinct can keep those columns through the sort.
+    let full_width = projections.len();
     // A set-returning function in the target list turns one input row into many,
     // so it needs `ProjectSet` rather than the one-in/one-out `Projection`.
     node = if projections.iter().any(BoundExpr::is_srf) {
@@ -265,8 +293,29 @@ fn project_pipeline(
     } else {
         Box::new(Projection::new(node, projections, ctx))
     };
-    node = maybe_sort(node, sort, &columns)?;
+    node = finish_sort_distinct(node, sort, distinct, full_width, &columns)?;
     Ok(Execution::Rows { columns, node })
+}
+
+/// Apply the ORDER BY and DISTINCT tail. Without DISTINCT this is just the sort
+/// (which trims hidden columns). With DISTINCT the sort must run first but keep
+/// its hidden columns, so it is built with a no-op width and the `Distinct` node
+/// performs the final trim to the visible output width.
+fn finish_sort_distinct(
+    node: Box<dyn ExecNode>,
+    sort: Vec<SortKey>,
+    distinct: Option<Vec<DistinctKey>>,
+    full_width: usize,
+    columns: &[OutputColumn],
+) -> Result<Box<dyn ExecNode>, ExecError> {
+    let Some(keys) = distinct else {
+        return maybe_sort(node, sort, columns);
+    };
+    let mut node = node;
+    if !sort.is_empty() {
+        node = Box::new(Sort::new(node, sort, full_width)?);
+    }
+    Ok(Box::new(Distinct::new(node, keys, columns.len())?))
 }
 
 /// Statement atomicity: evaluate everything first, mutate only after nothing
@@ -1148,6 +1197,60 @@ impl Sort {
 }
 
 impl ExecNode for Sort {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        Ok(self.rows.next())
+    }
+}
+
+/// Materializing de-duplication for `SELECT DISTINCT` / `DISTINCT ON`. On the
+/// first pull it buffers every child row and keeps the first row seen per
+/// distinct-key group (NULL-aware, so two NULL keys collapse — PG's DISTINCT
+/// semantics), preserving input order. When the input is already sorted (as
+/// `DISTINCT ON` requires), "first per group" is the sort-order winner. Keys may
+/// reference hidden columns the child kept past `visible_width`; those are
+/// dropped from each surviving row here (the sort below no longer truncates when
+/// a Distinct follows).
+pub struct Distinct {
+    rows: std::vec::IntoIter<Tuple>,
+}
+
+impl Distinct {
+    pub fn new(
+        mut child: Box<dyn ExecNode>,
+        keys: Vec<DistinctKey>,
+        visible_width: usize,
+    ) -> Result<Self, ExecError> {
+        let key_tys: Vec<PgType> = keys.iter().map(|k| k.ty).collect();
+        let mut out: Vec<Tuple> = Vec::new();
+        // Hash of a row's distinct key → indices into `out` of surviving rows
+        // sharing that hash; `keys_equal` resolves collisions. Mirrors the
+        // grouping in `Aggregate::build`.
+        let mut lookup: HashMap<u64, Vec<usize>> = HashMap::new();
+        while let Some(row) = child.next()? {
+            let key: Vec<Value> = keys.iter().map(|k| row[k.column].clone()).collect();
+            let bucket = lookup.entry(agg::hash_key(&key_tys, &key)).or_default();
+            let seen = bucket.iter().copied().any(|i| {
+                let existing: Vec<Value> =
+                    keys.iter().map(|k| out[i][k.column].clone()).collect();
+                agg::keys_equal(&key_tys, &existing, &key)
+            });
+            if !seen {
+                bucket.push(out.len());
+                out.push(row);
+            }
+        }
+        // Drop hidden distinct/sort-only columns so downstream sees exactly the
+        // visible output width, as `Sort` does when no Distinct follows.
+        for row in &mut out {
+            row.truncate(visible_width);
+        }
+        Ok(Self {
+            rows: out.into_iter(),
+        })
+    }
+}
+
+impl ExecNode for Distinct {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
         Ok(self.rows.next())
     }
@@ -2134,6 +2237,80 @@ mod tests {
         assert_eq!(ids(&mut node), Vec::<i32>::new());
     }
 
+    /// A source node that streams pre-built tuples, for exercising nodes that
+    /// consume arbitrary rows (Sort, Distinct) without going through storage.
+    struct VecSource {
+        rows: std::vec::IntoIter<Tuple>,
+    }
+
+    impl VecSource {
+        fn boxed(rows: Vec<Tuple>) -> Box<dyn ExecNode> {
+            Box::new(Self {
+                rows: rows.into_iter(),
+            })
+        }
+    }
+
+    impl ExecNode for VecSource {
+        fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+            Ok(self.rows.next())
+        }
+    }
+
+    #[test]
+    fn distinct_dedups_keeping_first_seen_order() -> anyhow::Result<()> {
+        // Plain SELECT DISTINCT over a single column: keep the first occurrence
+        // of each value in input order, collapsing NULLs together.
+        let rows = vec![
+            vec![Value::Int4(2)],
+            vec![Value::Int4(1)],
+            vec![Value::Int4(2)],
+            vec![Value::Null],
+            vec![Value::Int4(1)],
+            vec![Value::Null],
+        ];
+        let keys = vec![DistinctKey {
+            column: 0,
+            ty: PgType::Int4,
+        }];
+        let mut node = Distinct::new(VecSource::boxed(rows), keys, 1)?;
+        assert_eq!(
+            collect(&mut node),
+            vec![
+                vec![Value::Int4(2)],
+                vec![Value::Int4(1)],
+                vec![Value::Null],
+            ],
+            "duplicates removed, first-seen order preserved, NULLs collapsed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_on_keys_hidden_column_and_trims() -> anyhow::Result<()> {
+        // DISTINCT ON (b) a — b is a hidden trailing column (index 1) the client
+        // never sees. Rows arrive already sorted by b (as DISTINCT ON requires);
+        // the first row of each b-group survives and the hidden column is
+        // trimmed, leaving only the visible `a`.
+        let rows = vec![
+            vec![Value::Int4(10), Value::Int4(1)],
+            vec![Value::Int4(11), Value::Int4(1)],
+            vec![Value::Int4(20), Value::Int4(2)],
+            vec![Value::Int4(21), Value::Int4(2)],
+        ];
+        let keys = vec![DistinctKey {
+            column: 1,
+            ty: PgType::Int4,
+        }];
+        let mut node = Distinct::new(VecSource::boxed(rows), keys, 1)?;
+        assert_eq!(
+            collect(&mut node),
+            vec![vec![Value::Int4(10)], vec![Value::Int4(20)]],
+            "one row per DISTINCT ON group, hidden key column trimmed"
+        );
+        Ok(())
+    }
+
     #[test]
     fn limit_applies_after_sort() -> anyhow::Result<()> {
         // ORDER BY id DESC LIMIT 1 must return the max, not the first-scanned row.
@@ -2313,6 +2490,17 @@ mod tests {
                 Value::Int8(42), // sum(b): int4 widens to bigint
             ]
         );
+    }
+
+    #[test]
+    fn fromless_distinct_on_hidden_expression() {
+        // A FROM-less `SELECT DISTINCT ON (expr)` where the ON expression is not
+        // in the select list appends a hidden column; the Values pipeline must
+        // keep that column through the sort (not trim to the visible width) so
+        // Distinct can read it. Regression: previously truncated → out-of-bounds.
+        let (columns, rows) = run_rows("SELECT DISTINCT ON (1 + 1) 5 ORDER BY 1 + 1");
+        assert_eq!(columns.len(), 1, "the hidden ON column never reaches output");
+        assert_eq!(rows, vec![vec![Value::Int4(5)]]);
     }
 
     #[test]
