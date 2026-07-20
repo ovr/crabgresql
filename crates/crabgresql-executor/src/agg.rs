@@ -278,6 +278,28 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     u.hash(&mut h);
                 }
             }
+            // money/oid/macaddr compare by their raw i64/u32/byte representation,
+            // so hashing that representation agrees with `keys_equal`.
+            PgType::Money => {
+                if let Value::Money(m) = v {
+                    m.hash(&mut h);
+                }
+            }
+            PgType::Oid => {
+                if let Value::Oid(o) = v {
+                    o.hash(&mut h);
+                }
+            }
+            PgType::Macaddr => {
+                if let Value::Macaddr(b) = v {
+                    b.hash(&mut h);
+                }
+            }
+            PgType::Macaddr8 => {
+                if let Value::Macaddr8(b) = v {
+                    b.hash(&mut h);
+                }
+            }
             PgType::User(type_oid) => {
                 if let Value::Enum { type_oid: value_oid, ordinal, .. } = v
                     && value_oid == type_oid
@@ -286,8 +308,10 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     ordinal.hash(&mut h);
                 }
             }
-            // timetz/interval/inet/cidr (and anything else): equality is not a
-            // raw-field compare, so contribute nothing and rely on `keys_equal`.
+            // timetz/interval/inet/cidr/bit/varbit (and anything else): equality
+            // is not a raw-field compare, so contribute nothing and rely on
+            // `keys_equal`. See `PgType::hashes_distinctly`, which the join
+            // planner uses to avoid a hash join on these one-bucket types.
             _ => {}
         }
     }
