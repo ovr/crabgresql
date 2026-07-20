@@ -57,12 +57,17 @@ impl TableLock {
     /// until the exclusive holder finishes. The returned guard releases the hold
     /// on drop.
     pub fn acquire_shared(self: &Arc<Self>, xid: Xid) -> SharedGuard {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         loop {
             match inner.exclusive {
                 None => break,
                 Some(holder) if holder == xid => break,
-                Some(_) => inner = self.cond.wait(inner).unwrap(),
+                Some(_) => {
+                    inner = self
+                        .cond
+                        .wait(inner)
+                        .unwrap_or_else(|_| panic!("mutex poisoned"))
+                }
             }
         }
         inner.shared += 1;
@@ -77,7 +82,7 @@ impl TableLock {
     /// or abort hook). Re-entrant: a second TRUNCATE by the same transaction
     /// re-acquires trivially.
     pub fn acquire_exclusive(&self, xid: Xid) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         loop {
             if inner.exclusive == Some(xid) {
                 return;
@@ -86,13 +91,16 @@ impl TableLock {
                 inner.exclusive = Some(xid);
                 return;
             }
-            inner = self.cond.wait(inner).unwrap();
+            inner = self
+                .cond
+                .wait(inner)
+                .unwrap_or_else(|_| panic!("mutex poisoned"));
         }
     }
 
     /// Release `xid`'s exclusive hold, if it holds one. Wakes any waiters.
     pub fn release_exclusive(&self, xid: Xid) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         if inner.exclusive == Some(xid) {
             inner.exclusive = None;
             self.cond.notify_all();
@@ -108,7 +116,11 @@ pub struct SharedGuard {
 
 impl Drop for SharedGuard {
     fn drop(&mut self) {
-        let mut inner = self.lock.inner.lock().unwrap();
+        let mut inner = self
+            .lock
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         inner.shared -= 1;
         // Waking on the last shared release lets a waiting exclusive acquirer
         // (which needs shared == 0) proceed.

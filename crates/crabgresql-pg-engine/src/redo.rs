@@ -91,7 +91,7 @@ impl RmgrRedo for HeapRedo {
                 self.engine
                     .recovered_truncates
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|_| panic!("mutex poisoned"))
                     .push(crate::RecoveredTruncate {
                         xid: ctx.xid,
                         table,

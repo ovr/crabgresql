@@ -166,7 +166,10 @@ impl RelCatalog {
     /// repaired at recovery, which calls [`RelCatalog::observe_relfilenode`] for
     /// every relfilenode seen in the WAL before any new id is issued.
     pub fn alloc_relfilenode(&self) -> RelFileNode {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         let rel = state.next;
         state.next += 1;
         RelFileNode(rel)
@@ -181,7 +184,10 @@ impl RelCatalog {
         table: &str,
         new: RelFileNode,
     ) -> std::io::Result<Option<RelFileNode>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         let Some(rel) = state.rels.iter_mut().find(|r| r.name == table) else {
             return Ok(None);
         };
@@ -202,13 +208,19 @@ impl RelCatalog {
     /// new relfilenode named in a WAL truncate record. No persist: the following
     /// checkpoint (or the next DDL) carries the updated counter durably.
     pub fn observe_relfilenode(&self, n: RelFileNode) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         state.next = state.next.max(n.0 + 1);
     }
 
     /// The relfilenode `table` currently points at, or `None` if it is absent.
     pub fn current_relfilenode(&self, table: &str) -> Option<RelFileNode> {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         state
             .rels
             .iter()
@@ -220,7 +232,7 @@ impl RelCatalog {
     pub fn live_relfilenodes(&self) -> Vec<u32> {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
             .rels
             .iter()
             .map(|r| r.rel)

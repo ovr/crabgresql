@@ -87,7 +87,11 @@ impl HeapTable {
     /// `xid` is the truncating transaction, else the committed file.
     fn effective_rel(&self, xid: Xid) -> RelFileNode {
         if self.has_pending.load(Ordering::Acquire)
-            && let Some(p) = self.pending.read().unwrap().as_ref()
+            && let Some(p) = self
+                .pending
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .as_ref()
             && p.xid == xid
         {
             return RelFileNode(p.new_rel);
@@ -98,7 +102,10 @@ impl HeapTable {
     /// Commit a staged TRUNCATE: the new file becomes the committed one. Returns
     /// the old relfilenode to unlink, or `None` if nothing was pending for `xid`.
     pub(crate) fn commit_truncate(&self, xid: Xid) -> Option<RelFileNode> {
-        let mut pending = self.pending.write().unwrap();
+        let mut pending = self
+            .pending
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let p = pending.take_if(|p| p.xid == xid)?;
         let old = self.live_rel.swap(p.new_rel, Ordering::Relaxed);
         self.has_pending.store(false, Ordering::Release);
@@ -109,7 +116,10 @@ impl HeapTable {
     /// Discard a staged TRUNCATE on abort: the new file is dropped, the committed
     /// one stays. Returns the new relfilenode to unlink, or `None`.
     pub(crate) fn abort_truncate(&self, xid: Xid) -> Option<RelFileNode> {
-        let mut pending = self.pending.write().unwrap();
+        let mut pending = self
+            .pending
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let p = pending.take_if(|p| p.xid == xid)?;
         self.has_pending.store(false, Ordering::Release);
         Some(RelFileNode(p.new_rel))
@@ -123,7 +133,10 @@ impl HeapTable {
     /// Point the table at `new` after recovery applied a committed TRUNCATE swap
     /// (the on-disk catalog lagged the WAL). Clears any stale pending state.
     pub(crate) fn rebind(&self, new: RelFileNode) {
-        *self.pending.write().unwrap() = None;
+        *self
+            .pending
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned")) = None;
         self.has_pending.store(false, Ordering::Release);
         self.live_rel.store(new.0, Ordering::Relaxed);
         self.insert_hint.store(0, Ordering::Relaxed);
@@ -350,16 +363,21 @@ impl TableAm for HeapTable {
         Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
         // Double TRUNCATE in one transaction: the previously staged file is now
         // superseded and, being used only by this uncommitted txn, is discarded.
-        let prev = self.pending.write().unwrap().replace(PendingTruncate {
-            xid: txn.xid,
-            new_rel: new.0,
-        });
+        let prev = self
+            .pending
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .replace(PendingTruncate {
+                xid: txn.xid,
+                new_rel: new.0,
+            });
         self.has_pending.store(true, Ordering::Release);
         self.insert_hint.store(0, Ordering::Relaxed);
         match prev {
             Some(prev) => {
-                self.engine.bufpool.forget_relation(RelFileNode(prev.new_rel));
-                Self::io(self.engine.bufpool.smgr().unlink(RelFileNode(prev.new_rel)));
+                // The superseded staged file was used only by this uncommitted
+                // transaction; reclaim it now.
+                self.engine.discard_relfile(RelFileNode(prev.new_rel));
                 // Already registered with the engine on the first TRUNCATE.
             }
             None => {
@@ -368,7 +386,7 @@ impl TableAm for HeapTable {
                 self.engine
                     .pending_truncates
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|_| panic!("mutex poisoned"))
                     .entry(txn.xid)
                     .or_default()
                     .push(self.schema.name.clone());

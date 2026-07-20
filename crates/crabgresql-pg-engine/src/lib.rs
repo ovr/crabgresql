@@ -73,6 +73,16 @@ pub(crate) struct EngineInner {
     pub recovered_truncates: Mutex<Vec<RecoveredTruncate>>,
 }
 
+impl EngineInner {
+    /// Reclaim a relation's on-disk file: evict its buffered pages (without
+    /// writing them back) then unlink the file. A missing file is not an error —
+    /// recovery and the finalize hook call this on files that may already be gone.
+    fn discard_relfile(&self, rel: RelFileNode) {
+        self.bufpool.forget_relation(rel);
+        let _ = self.bufpool.smgr().unlink(rel);
+    }
+}
+
 /// The durable heap engine: a [`TableEngine`] over a data directory.
 pub struct PgEngine {
     inner: Arc<EngineInner>,
@@ -155,7 +165,13 @@ impl PgEngine {
     /// already pointing at the new file and only re-cleans the (already gone) old
     /// file, which tolerates a missing file.
     pub fn apply_recovered_truncates(&self, clog: &Clog) {
-        let recovered = std::mem::take(&mut *self.inner.recovered_truncates.lock().unwrap());
+        let recovered = std::mem::take(
+            &mut *self
+                .inner
+                .recovered_truncates
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned")),
+        );
         if recovered.is_empty() {
             return;
         }
@@ -172,34 +188,39 @@ impl PgEngine {
         }
 
         for table in order {
+            // Resolve each swap by ITS OWN transaction's fate, in WAL order,
+            // threading the table's live relfilenode. A chain can span several
+            // transactions with independent fates (each TRUNCATE holds the table
+            // lock only to its own commit), so the chain must NOT be judged by a
+            // single verdict: a committed swap earlier in the chain leaves its new
+            // file live even if a later (uncommitted) swap is discarded.
             let chain = &by_table[&table];
-            let last = chain.last().unwrap();
-            let committed = clog.is_committed(last.xid);
-            if committed {
-                // Apply the swap. Persist the catalog only if it lagged the WAL.
-                if self.catalog.current_relfilenode(&table) != Some(last.new) {
+            let mut live = self.catalog.current_relfilenode(&table);
+            for rt in chain {
+                if clog.is_committed(rt.xid) {
+                    // Swap took effect: the old file is dead, the new one is live.
+                    self.inner.discard_relfile(rt.old);
+                    live = Some(rt.new);
+                } else {
+                    // Swap never committed: the staged new file is an orphan.
+                    self.inner.discard_relfile(rt.new);
+                }
+            }
+            if let Some(live) = live {
+                // Persist the catalog only if it lagged the WAL, and repoint the
+                // in-memory table handle at the final live file.
+                if self.catalog.current_relfilenode(&table) != Some(live) {
                     self.catalog
-                        .swap_relfilenode(&table, last.new)
-                        .expect("relation catalog write failed");
+                        .swap_relfilenode(&table, live)
+                        .unwrap_or_else(|e| panic!("relation catalog write failed: {e}"));
                 }
-                if let Some(t) = self.tables.read().unwrap().get(&table) {
-                    t.rebind(last.new);
-                }
-                // Unlink every file but the surviving one: each entry's old plus
-                // every superseded intermediate new.
-                for rt in chain {
-                    for victim in [rt.old, rt.new] {
-                        if victim != last.new {
-                            self.inner.bufpool.forget_relation(victim);
-                            let _ = self.inner.bufpool.smgr().unlink(victim);
-                        }
-                    }
-                }
-            } else {
-                // Not committed: discard every staged new file; keep the original.
-                for rt in chain {
-                    self.inner.bufpool.forget_relation(rt.new);
-                    let _ = self.inner.bufpool.smgr().unlink(rt.new);
+                if let Some(t) = self
+                    .tables
+                    .read()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                    .get(&table)
+                {
+                    t.rebind(live);
                 }
             }
         }
@@ -227,8 +248,7 @@ impl PgEngine {
                 .and_then(|s| s.parse::<u32>().ok())
                 && !live.contains(&n)
             {
-                self.inner.bufpool.forget_relation(RelFileNode(n));
-                let _ = self.inner.bufpool.smgr().unlink(RelFileNode(n));
+                self.inner.discard_relfile(RelFileNode(n));
             }
         }
         Ok(())
@@ -241,18 +261,37 @@ impl TxnFinalize for PgEngine {
     /// commit's WAL record is already fsynced, so a crash before or during this
     /// is repaired by `apply_recovered_truncates` at the next boot.
     fn on_commit(&self, xid: Xid) {
-        let Some(tables) = self.inner.pending_truncates.lock().unwrap().remove(&xid) else {
+        let Some(tables) = self
+            .inner
+            .pending_truncates
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .remove(&xid)
+        else {
             return; // hot path: nothing to finalize for this transaction
         };
-        let handles = self.tables.read().unwrap();
+        let handles = self.tables.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
         for name in tables {
             if let Some(t) = handles.get(&name) {
+                // Apply the in-memory swap, then persist + reclaim, then release the
+                // lock — all without panicking, so the exclusive lock is ALWAYS
+                // released even if the catalog persist fails (which would otherwise
+                // strand the lock and wedge the table for the process lifetime).
+                // The lock is held across the persist so a concurrent TRUNCATE that
+                // commits can't have its catalog write clobbered by a stale one.
                 if let Some(old) = t.commit_truncate(xid) {
-                    self.catalog
-                        .swap_relfilenode(&name, t.relfilenode())
-                        .expect("relation catalog write failed");
-                    self.inner.bufpool.forget_relation(old);
-                    let _ = self.inner.bufpool.smgr().unlink(old);
+                    // The commit is already durable in the WAL, so a catalog persist
+                    // failure is not fatal — recovery re-applies the swap from the
+                    // WAL at the next boot; log and continue rather than panic.
+                    if let Err(e) = self.catalog.swap_relfilenode(&name, t.relfilenode()) {
+                        tracing::error!(
+                            table = %name,
+                            error = %e,
+                            "TRUNCATE commit: catalog persist failed; \
+                             will be reconciled from the WAL at next recovery"
+                        );
+                    }
+                    self.inner.discard_relfile(old);
                 }
                 t.release_truncate_lock(xid);
             }
@@ -262,17 +301,23 @@ impl TxnFinalize for PgEngine {
     /// Discard the transaction's staged TRUNCATE files (the table keeps its
     /// original file) and release the exclusive table lock.
     fn on_abort(&self, xid: Xid) {
-        let Some(tables) = self.inner.pending_truncates.lock().unwrap().remove(&xid) else {
+        let Some(tables) = self
+            .inner
+            .pending_truncates
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .remove(&xid)
+        else {
             return;
         };
-        let handles = self.tables.read().unwrap();
+        let handles = self.tables.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
         for name in tables {
             if let Some(t) = handles.get(&name) {
-                if let Some(new) = t.abort_truncate(xid) {
-                    self.inner.bufpool.forget_relation(new);
-                    let _ = self.inner.bufpool.smgr().unlink(new);
-                }
+                let new = t.abort_truncate(xid);
                 t.release_truncate_lock(xid);
+                if let Some(new) = new {
+                    self.inner.discard_relfile(new);
+                }
             }
         }
     }

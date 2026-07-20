@@ -392,3 +392,31 @@ fn interleaved_committed_and_in_flight_txns_recover_committed_only() {
     // xa's insert (2) and update (1->10) survive; xb's insert (3) vanishes; 99 too.
     assert_eq!(visible_ids(&tm, &*table), vec![2, 10, 99]);
 }
+
+#[test]
+fn committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows() {
+    // Regression: a committed TRUNCATE followed by an uncommitted one must NOT be
+    // judged by the last record's fate. The committed truncate's file is live and
+    // must survive; only the uncommitted truncate is discarded.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, tm) = open(dir.path()).unwrap();
+        let table = seed_three(&engine, &tm);
+        // Txn A: truncate away the seed rows and insert 10, 11, then COMMIT.
+        let a = tm.allocate_xid();
+        let ca = tm.context(a, CommandId::FIRST);
+        table.truncate(&ca);
+        insert(&*table, &ca, 10, "x");
+        insert(&*table, &ca, 11, "y");
+        tm.commit(a).unwrap();
+        assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
+        // Txn B: truncate again but never commit; crash with the swap pending.
+        let b = tm.allocate_xid();
+        table.truncate(&tm.context(b, CommandId::FIRST));
+    }
+    // Recovery must keep A's committed rows (10, 11), not delete A's live file
+    // because B's later truncate was uncommitted.
+    let (engine, tm) = open(dir.path()).unwrap();
+    let table = engine.open_table("t").unwrap();
+    assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
+}
