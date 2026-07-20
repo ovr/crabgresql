@@ -5,8 +5,8 @@
 
 use crate::numeric::ParseError;
 use crate::{
-    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, json, money, parse_bool, time,
-    timestamp, timestamptz, timetz,
+    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, json, jsonpath, money,
+    parse_bool, time, timestamp, timestamptz, timetz,
 };
 
 /// SQLSTATE + message for a failed cast.
@@ -452,6 +452,11 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // any-to-text arm above (it re-uses `encode_text_with`).
         (Value::Text(s), PgType::Json) => json::json_in(s).map(Value::Json).map_err(json_err),
         (Value::Text(s), PgType::Jsonb) => json::jsonb_in(s).map(Value::Jsonb).map_err(json_err),
+        // `text` → `jsonpath`: parse the SQL/JSON path language. jsonpath → text
+        // is handled by the generic any-to-text arm (via `encode_text_with`).
+        (Value::Text(s), PgType::Jsonpath) => {
+            jsonpath::jsonpath_in(s).map(Value::Jsonpath).map_err(json_err)
+        }
         // `json` → `jsonb`: re-parse the raw text into the canonical tree.
         (Value::Json(s), PgType::Jsonb) => json::jsonb_in(s).map(Value::Jsonb).map_err(json_err),
         // `jsonb` → `json`: the canonical serialization is always valid JSON.

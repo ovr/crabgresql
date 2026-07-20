@@ -38,6 +38,7 @@ const T_LSEG: u8 = 25;
 const T_ENUM: u8 = 26;
 const T_JSON: u8 = 27;
 const T_JSONB: u8 = 28;
+const T_JSONPATH: u8 = 29;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -172,6 +173,11 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.push(T_JSONB);
             put_var(out, json::format(j).as_bytes());
         }
+        // `jsonpath` stores its canonical text (`jsonpath_out`), re-parsed on decode.
+        Value::Jsonpath(p) => {
+            out.push(T_JSONPATH);
+            put_var(out, crabgresql_types::jsonpath::format(p).as_bytes());
+        }
     }
 }
 
@@ -304,6 +310,12 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             let s = std::str::from_utf8(r.var()).expect("jsonb text is valid utf-8");
             Value::Jsonb(json::jsonb_in(s).expect("stored jsonb re-parses"))
         }
+        T_JSONPATH => {
+            let s = std::str::from_utf8(r.var()).expect("jsonpath text is valid utf-8");
+            Value::Jsonpath(
+                crabgresql_types::jsonpath::jsonpath_in(s).expect("stored jsonpath re-parses"),
+            )
+        }
         other => panic!("corrupt datum tag {other}"),
     };
     *pos = r.pos;
@@ -379,6 +391,12 @@ mod tests {
         roundtrip(json::jsonb_in("{\"b\":1,\"a\":[1,2,3],\"k\":\"v\"}").map(Value::Jsonb).expect("valid jsonb"));
         roundtrip(json::jsonb_in("[]").map(Value::Jsonb).expect("valid jsonb"));
         roundtrip(json::jsonb_in("1.50").map(Value::Jsonb).expect("valid jsonb"));
+        // `jsonpath` stores its canonical text form.
+        roundtrip(
+            crabgresql_types::jsonpath::jsonpath_in("$.a[*] ? (@ > 3)")
+                .map(Value::Jsonpath)
+                .expect("valid jsonpath"),
+        );
     }
 
     #[test]

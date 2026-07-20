@@ -651,6 +651,7 @@ mod tests {
             ("lseg", PgType::Lseg),
             ("json", PgType::Json),
             ("jsonb", PgType::Jsonb),
+            ("jsonpath", PgType::Jsonpath),
         ];
         for (typname, ty) in modeled {
             let row = PG_TYPE_ROWS

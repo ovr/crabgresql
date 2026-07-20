@@ -909,6 +909,7 @@ fn pgtype_from_oid(o: u32) -> PgType {
         oid::LSEG => PgType::Lseg,
         oid::JSON => PgType::Json,
         oid::JSONB => PgType::Jsonb,
+        oid::JSONPATH => PgType::Jsonpath,
         other => PgType::User(other),
     }
 }

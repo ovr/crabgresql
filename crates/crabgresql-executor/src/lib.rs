@@ -1269,6 +1269,9 @@ impl TableFunctionSource {
                 TableFn::GenerateSeries(elem) => {
                     TableFnState::Series(Series::from_args(elem, &values)?)
                 }
+                TableFn::JsonbPathQuery => {
+                    TableFnState::Series(jsonb_path_query_series(&values)?)
+                }
             });
         }
         match self.state.as_mut() {
@@ -2325,16 +2328,40 @@ impl ExecNode for ProjectSet {
     }
 }
 
-/// Build the range iterator for a target-list SRF. Only `generate_series` is a
-/// set-returning projection today.
+/// Build the range iterator for a target-list SRF (`generate_series` or
+/// `jsonb_path_query`).
 fn build_series(func: TableFn, values: &[Value]) -> Result<Series, ExecError> {
     match func {
         TableFn::GenerateSeries(elem) => Series::from_args(elem, values),
+        TableFn::JsonbPathQuery => jsonb_path_query_series(values),
         TableFn::PgInputErrorInfo => Err(ExecError::new(
             crabgresql_pg_wire::sqlstate::FEATURE_NOT_SUPPORTED,
             "set-returning function is not supported in this context",
         )),
     }
+}
+
+/// Evaluate a `jsonb_path_query(target, path [, vars, silent])` call to a
+/// materialized [`Series`] of its result items. `jsonb_path_query` is STRICT, so
+/// a NULL in any argument yields no rows; `silent` suppresses structural errors
+/// (also no rows). A missing-variable error always raises.
+fn jsonb_path_query_series(values: &[Value]) -> Result<Series, ExecError> {
+    // STRICT: any NULL argument (target, path, vars, or silent) → no rows.
+    if values.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Series::Empty);
+    }
+    let (Value::Jsonb(target), Value::Jsonpath(path)) = (&values[0], &values[1]) else {
+        return Ok(Series::Empty);
+    };
+    let vars = match values.get(2) {
+        Some(Value::Jsonb(v)) => Some(v),
+        _ => None,
+    };
+    let silent = matches!(values.get(3), Some(Value::Bool(true)));
+    let items = crabgresql_types::jsonpath::query(path, target, vars, silent)
+        .map_err(|e| ExecError::new(e.sqlstate, e.message))?;
+    let rows: Vec<Value> = items.into_iter().map(Value::Jsonb).collect();
+    Ok(Series::Materialized(rows.into_iter()))
 }
 
 #[cfg(test)]

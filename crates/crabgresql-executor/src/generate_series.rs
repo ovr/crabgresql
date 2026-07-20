@@ -55,6 +55,10 @@ pub enum Series {
     /// A NULL bound/step produces no rows. Carries the element type only so the
     /// (empty) column shape is irrelevant — nothing is yielded.
     Empty,
+    /// A pre-computed sequence of values (e.g. `jsonb_path_query`'s matches),
+    /// yielded one per row. Lets a set-returning function that isn't a lazy range
+    /// reuse the same [`Series`] plumbing.
+    Materialized(std::vec::IntoIter<Value>),
 }
 
 impl Series {
@@ -80,6 +84,7 @@ impl Series {
     pub fn next_value(&mut self) -> Result<Option<Value>, ExecError> {
         match self {
             Series::Empty => Ok(None),
+            Series::Materialized(it) => Ok(it.next()),
             Series::Int {
                 cur,
                 stop,
