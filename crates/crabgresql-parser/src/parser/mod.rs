@@ -3604,6 +3604,7 @@ impl<'a> Parser<'a> {
                     left: Box::new(expr),
                     op,
                     right: Box::new(self.parse_subexpr(precedence)?),
+                    op_span: crate::ast::OpSpan(span),
                 })
             }
         } else if let Token::Word(w) = &tok.token {
@@ -15795,6 +15796,7 @@ impl<'a> Parser<'a> {
                 left,
                 op: BinaryOperator::Eq,
                 right,
+                ..
             } if self.dialect.supports_eq_alias_assignment()
                 && matches!(left.as_ref(), Expr::Identifier(_)) =>
             {

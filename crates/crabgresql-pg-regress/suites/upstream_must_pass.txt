@@ -3,7 +3,10 @@
 # Promote tests here as SQL coverage grows; one name per line.
 comments
 float4
+float8
+lseg
 macaddr
 macaddr8
 md5
 money
+time

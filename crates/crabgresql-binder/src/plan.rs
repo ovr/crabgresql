@@ -1270,6 +1270,7 @@ fn build_merged_join(
             BinOp::Eq,
             Binding::Typed(left_expr.clone()),
             Binding::Typed(right_expr.clone()),
+            crabgresql_parser::Span::empty(),
             catalog.as_ref(),
         )?;
         let Binding::Typed(eq_expr) = eq else {
@@ -3134,9 +3135,70 @@ mod tests {
 
     #[test]
     fn unknown_arithmetic_is_ambiguous_42725() {
+        // Like PG, every 42725 "operator is not unique" carries the same
+        // DETAIL/HINT and a cursor on the operator.
         let e = bind_err("SELECT '1' + '2'");
         assert_eq!(e.code, "42725");
         assert_eq!(e.message, "operator is not unique: unknown + unknown");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Could not choose a best candidate operator.")
+        );
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("You might need to add explicit type casts.")
+        );
+        // Cursor at the `+` (1-based column 12).
+        assert_eq!(e.location, Some((1, 12)));
+    }
+
+    #[test]
+    fn unary_on_untyped_literal_is_ambiguous_42725() {
+        // `- unknown` / `~ unknown` are ambiguous in PG with the same DETAIL/HINT.
+        let e = bind_err("SELECT - NULL");
+        assert_eq!(e.code, "42725");
+        assert_eq!(e.message, "operator is not unique: - unknown");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Could not choose a best candidate operator.")
+        );
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("You might need to add explicit type casts.")
+        );
+    }
+
+    #[test]
+    fn time_plus_time_is_ambiguous_42725() {
+        // PG cannot pick a best `+` candidate for `time + time`, so it reports
+        // ambiguity (with DETAIL/HINT) and points the cursor at the operator —
+        // unlike `timetz + timetz` / `time * time`, which are 42883.
+        let e = bind_err("SELECT time '00:01' + time '00:02'");
+        assert_eq!(e.code, "42725");
+        assert_eq!(
+            e.message,
+            "operator is not unique: time without time zone + time without time zone"
+        );
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Could not choose a best candidate operator.")
+        );
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("You might need to add explicit type casts.")
+        );
+        // Cursor at the `+` (1-based column 21).
+        assert_eq!(e.location, Some((1, 21)));
+    }
+
+    #[test]
+    fn timetz_plus_timetz_stays_undefined_42883() {
+        let e = bind_err("SELECT '00:01+00'::timetz + '00:02+00'::timetz");
+        assert_eq!(e.code, "42883");
+        assert_eq!(
+            e.message,
+            "operator does not exist: time with time zone + time with time zone"
+        );
     }
 
     #[test]

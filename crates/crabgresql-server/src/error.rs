@@ -77,7 +77,7 @@ impl From<crabgresql_binder::BindError> for PgError {
             code: e.code,
             message: e.message,
             detail: e.detail,
-            hint: None,
+            hint: e.hint,
             location: e.location,
         }
     }

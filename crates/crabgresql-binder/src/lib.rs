@@ -40,9 +40,11 @@ pub struct BindError {
     pub message: String,
     /// Optional DETAIL line (e.g. numeric field overflow explains the p/s).
     pub detail: Option<String>,
+    /// Optional HINT line (e.g. "You might need to add explicit type casts.").
+    pub hint: Option<String>,
     /// 1-based (line, column) of the offending token, when PG reports a
     /// cursor position (`LINE n: ... ^`). Only set for literal input-function
-    /// failures, mirroring PG.
+    /// failures and ambiguous operators, mirroring PG.
     pub location: Option<(u64, u64)>,
 }
 
@@ -60,6 +62,7 @@ impl BindError {
             code,
             message: message.into(),
             detail: None,
+            hint: None,
             location: None,
         }
     }
@@ -67,6 +70,12 @@ impl BindError {
     /// Attach a DETAIL line.
     pub fn with_detail(mut self, detail: Option<String>) -> Self {
         self.detail = detail;
+        self
+    }
+
+    /// Attach a HINT line.
+    pub fn with_hint(mut self, hint: Option<String>) -> Self {
+        self.hint = hint;
         self
     }
 

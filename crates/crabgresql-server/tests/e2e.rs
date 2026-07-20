@@ -2512,3 +2512,26 @@ async fn explain_resolves_bind_parameters_in_extended_protocol() -> anyhow::Resu
 
     Ok(())
 }
+
+#[tokio::test]
+async fn time_plus_time_reports_ambiguous_operator_over_the_wire() -> anyhow::Result<()> {
+    use tokio_postgres::error::{ErrorPosition, SqlState};
+
+    let client = connect(spawn_server().await).await;
+    let err = client
+        .simple_query("SELECT time '00:01' + time '00:02'")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::AMBIGUOUS_FUNCTION);
+    assert_eq!(
+        db.message(),
+        "operator is not unique: time without time zone + time without time zone"
+    );
+    assert_eq!(db.detail(), Some("Could not choose a best candidate operator."));
+    assert_eq!(db.hint(), Some("You might need to add explicit type casts."));
+    // Cursor points at the `+` (1-based character 21).
+    assert!(matches!(db.position(), Some(ErrorPosition::Original(21))));
+
+    Ok(())
+}

@@ -819,6 +819,42 @@ impl fmt::Display for CaseWhen {
     }
 }
 
+/// A [`Span`] stored inline in the AST that is deliberately excluded from
+/// equality, ordering, and hashing — mirroring how span-bearing nodes such as
+/// [`Ident`] hand-write their `PartialEq`/`Ord`/`Hash` to ignore the span, so
+/// semantically-equal [`Expr`]s compare equal regardless of source position
+/// (see the `Expr` "Equality and Hashing" note below). Used to remember an
+/// operator token's location for error cursors without letting it perturb
+/// `Expr` equality.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct OpSpan(pub Span);
+
+impl PartialEq for OpSpan {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for OpSpan {}
+
+impl PartialOrd for OpSpan {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OpSpan {
+    fn cmp(&self, _: &Self) -> Ordering {
+        Ordering::Equal
+    }
+}
+
+impl hash::Hash for OpSpan {
+    fn hash<H: hash::Hasher>(&self, _: &mut H) {}
+}
+
 /// An SQL expression of any type.
 ///
 /// # Semantics / Type Checking
@@ -958,6 +994,11 @@ pub enum Expr {
         op: BinaryOperator,
         /// Right operand.
         right: Box<Expr>,
+        /// Span of the operator token, used to point an error's cursor at the
+        /// operator (e.g. `operator is not unique`). Wrapped in [`OpSpan`] so it
+        /// is excluded from `Expr` equality/ordering/hashing. `Span::empty()`
+        /// when the node is synthesized rather than parsed.
+        op_span: OpSpan,
     },
     /// `[NOT] LIKE <pattern> [ESCAPE <escape_character>]`
     Like {
@@ -1758,7 +1799,9 @@ impl fmt::Display for Expr {
                 low,
                 high
             ),
-            Expr::BinaryOp { left, op, right } => write!(f, "{left} {op} {right}"),
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => write!(f, "{left} {op} {right}"),
             Expr::Like {
                 negated,
                 expr,
@@ -10989,6 +11032,33 @@ mod tests {
     fn test_window_frame_default() {
         let window_frame = WindowFrame::default();
         assert_eq!(WindowFrameBound::Preceding(None), window_frame.start_bound);
+    }
+
+    #[test]
+    fn binary_op_span_excluded_from_equality_and_hash() {
+        use crate::tokenizer::Span;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // `op_span` must not perturb `Expr` equality/ordering/hashing — otherwise
+        // the same `a + b` parsed at different source columns would compare
+        // unequal (see the `OpSpan` and `Expr` "Equality and Hashing" docs).
+        let at = |col: u64| Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("a"))),
+            op: BinaryOperator::Plus,
+            right: Box::new(Expr::Identifier(Ident::new("b"))),
+            op_span: OpSpan(Span::new(Location::new(1, col), Location::new(1, col + 1))),
+        };
+        let (early, late) = (at(5), at(99));
+        assert_eq!(early, late);
+        assert_eq!(early.cmp(&late), Ordering::Equal);
+
+        let hash = |e: &Expr| {
+            let mut h = DefaultHasher::new();
+            e.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&early), hash(&late));
     }
 
     #[test]

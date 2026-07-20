@@ -1361,7 +1361,12 @@ impl Spanned for Expr {
                 high,
             } => expr.span().union(&low.span()).union(&high.span()),
 
-            Expr::BinaryOp { left, op: _, right } => left.span().union(&right.span()),
+            Expr::BinaryOp {
+                left,
+                op: _,
+                right,
+                op_span: _,
+            } => left.span().union(&right.span()),
             Expr::Like {
                 negated: _,
                 expr,
