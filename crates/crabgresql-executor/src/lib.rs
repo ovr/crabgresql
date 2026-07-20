@@ -2342,10 +2342,14 @@ fn build_series(func: TableFn, values: &[Value]) -> Result<Series, ExecError> {
 }
 
 /// Evaluate a `jsonb_path_query(target, path [, vars, silent])` call to a
-/// materialized [`Series`] of its result items. A NULL target or path yields no
-/// rows (PG's STRICT behavior); `silent` suppresses structural errors (also no
-/// rows). A missing-variable error always raises.
+/// materialized [`Series`] of its result items. `jsonb_path_query` is STRICT, so
+/// a NULL in any argument yields no rows; `silent` suppresses structural errors
+/// (also no rows). A missing-variable error always raises.
 fn jsonb_path_query_series(values: &[Value]) -> Result<Series, ExecError> {
+    // STRICT: any NULL argument (target, path, vars, or silent) → no rows.
+    if values.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Series::Empty);
+    }
     let (Value::Jsonb(target), Value::Jsonpath(path)) = (&values[0], &values[1]) else {
         return Ok(Series::Empty);
     };

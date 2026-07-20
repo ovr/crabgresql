@@ -417,16 +417,26 @@ pub enum ScalarFn {
 
 /// A SQL/JSON path query entry point. All take a `jsonb` target and a `jsonpath`;
 /// see [`ScalarFn::JsonPath`] for the argument convention.
+///
+/// The SQL functions (`Exists`/`Match`/`QueryArray`/`QueryFirst`) are STRICT and
+/// read an optional `vars`/`silent`; the `@?`/`@@` operator variants
+/// (`ExistsOp`/`MatchOp`) take exactly `[jsonb, jsonpath]` and always run in
+/// silent mode — kept distinct so the STRICT functions don't have to encode
+/// silence as a synthetic NULL argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JsonPathFn {
-    /// `jsonb_path_exists` / `jsonb @? jsonpath` (`-> boolean`).
+    /// `jsonb_path_exists(...)` (`-> boolean`, STRICT).
     Exists,
-    /// `jsonb_path_match` / `jsonb @@ jsonpath` (`-> boolean`, three-valued).
+    /// `jsonb_path_match(...)` (`-> boolean`, three-valued, STRICT).
     Match,
-    /// `jsonb_path_query_array` (`-> jsonb`, the matches wrapped in an array).
+    /// `jsonb_path_query_array(...)` (`-> jsonb`, the matches wrapped in an array).
     QueryArray,
-    /// `jsonb_path_query_first` (`-> jsonb`, the first match or NULL).
+    /// `jsonb_path_query_first(...)` (`-> jsonb`, the first match or NULL).
     QueryFirst,
+    /// `jsonb @? jsonpath` (`-> boolean`; silent form of `Exists`).
+    ExistsOp,
+    /// `jsonb @@ jsonpath` (`-> boolean`; silent form of `Match`).
+    MatchOp,
 }
 
 /// A geometric (`point` / `lseg`) operation. Operators lower to these via

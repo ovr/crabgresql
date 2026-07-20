@@ -70,6 +70,28 @@ SELECT * FROM jsonb_path_query('[1,2]', 'lax $[5]') AS t(v);
 -- jsonb_path_query in FROM position, with a column alias
 SELECT * FROM jsonb_path_query('{"a":[10,20,30]}', '$.a[*] ? (@ >= 20)') AS t(v);
 
+-- the jsonb_path_* functions are STRICT: a NULL vars/silent argument makes the
+-- whole result NULL (and the set-returning form yields no rows)
+SELECT jsonb_path_exists('{"a":1}', '$.a', NULL) AS ex_null,
+       jsonb_path_match('{"a":1}', '$.a == 1', '{}', NULL) AS m_null;
+SELECT * FROM jsonb_path_query('1', '$', NULL) AS t(v);
+
+-- lax mode unwraps a bare array (one level) for the numeric / keyvalue methods
+SELECT jsonb_path_query('[1,-2,3]', '$.abs()') AS abs,
+       jsonb_path_query('[1.5,2.5]', '$.floor()') AS floor;
+-- but only one level: an array element that is itself an array errors
+SELECT jsonb_path_query('[[1],[-2]]', '$.abs()');
+-- .size()/.type() describe the container and never unwrap
+SELECT jsonb_path_query('[1,2,3]', '$.size()') AS size,
+       jsonb_path_query('[1,2]', '$.type()') AS type;
+-- strict .size() on a non-array is an error
+SELECT jsonb_path_query('5', 'strict $.size()');
+
+-- an arithmetic "single numeric value" error names the actual operator, and
+-- unary minus has its own wording
+SELECT jsonb_path_query('[1,2]', '$[*] * 1');
+SELECT jsonb_path_query('{"a":"x"}', '- $.a');
+
 -- errors: a member method on the wrong kind, and a bad path literal
 SELECT jsonb_path_query('"x"', '$.abs()');
 SELECT '$ ? (@ >)'::jsonpath;

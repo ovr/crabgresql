@@ -3374,11 +3374,12 @@ fn resolve_macaddr_op(
 
 /// Materialize an operand at `target`: an untyped literal is parsed as `target`,
 /// a typed operand is coerced (used for the numeric `* /` factor → float8).
-/// Lower `jsonb @? jsonpath` / `jsonb @@ jsonpath` to the jsonpath query
-/// functions. The operators run in silent mode (a structural error yields SQL
-/// NULL rather than raising), encoded as the 4-arg call form
-/// `[target, path, vars = NULL, silent = true]`. Returns `Ok(None)` when the
-/// operator isn't one of these or the left operand isn't `jsonb`.
+/// Lower `jsonb @? jsonpath` / `jsonb @@ jsonpath` to the silent jsonpath query
+/// functions. Uses the dedicated `ExistsOp`/`MatchOp` variants (a 2-arg,
+/// always-silent form) rather than the STRICT `jsonb_path_exists`/`_match`
+/// functions, so the operator never nullifies on a NULL `vars`/`silent`.
+/// Returns `Ok(None)` when the operator isn't one of these or the left operand
+/// isn't `jsonb`.
 fn resolve_jsonb_op(
     op: &ast::BinaryOperator,
     lb: &Binding,
@@ -3386,8 +3387,8 @@ fn resolve_jsonb_op(
 ) -> Result<Option<Binding>, BindError> {
     use crate::functions::JsonPathFn;
     let jf = match op {
-        ast::BinaryOperator::AtQuestion => JsonPathFn::Exists,
-        ast::BinaryOperator::AtAt => JsonPathFn::Match,
+        ast::BinaryOperator::AtQuestion => JsonPathFn::ExistsOp,
+        ast::BinaryOperator::AtAt => JsonPathFn::MatchOp,
         _ => return Ok(None),
     };
     // Only defined for a `jsonb` left operand (an untyped literal is coerced).
@@ -3396,16 +3397,10 @@ fn resolve_jsonb_op(
     }
     let left = resolve_operand(lb, PgType::Jsonb)?;
     let right = resolve_operand(rb, PgType::Jsonpath)?;
-    let args = vec![
-        left,
-        right,
-        BoundExpr::Const { value: Value::Null, ty: PgType::Jsonb },
-        BoundExpr::Const { value: Value::Bool(true), ty: PgType::Bool },
-    ];
     Ok(Some(Binding::Typed(BoundExpr::FuncCall {
         func: ScalarFn::JsonPath(jf),
         ret: PgType::Bool,
-        args,
+        args: vec![left, right],
     })))
 }
 

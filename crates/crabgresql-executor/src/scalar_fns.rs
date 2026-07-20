@@ -89,10 +89,6 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 args[0].encode_text().as_deref(),
             )));
         }
-        // The jsonpath functions are non-strict here so the `@?`/`@@` operators
-        // can pass a NULL `vars` argument; `eval_jsonpath` handles NULL target/
-        // path itself (matching PG's STRICT behavior on those two).
-        ScalarFn::JsonPath(f) => return eval_jsonpath(f, args),
         _ => {}
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -110,6 +106,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 "sequence function reached the pure scalar evaluator",
             ));
         }
+        // --- jsonpath (STRICT: any NULL arg already short-circuited to NULL) ---
+        ScalarFn::JsonPath(f) => return eval_jsonpath(f, args),
         // --- string functions ---
         ScalarFn::TextConcat => {
             return Ok(Value::Text(format!("{}{}", text(&args[0]), text(&args[1]))));
@@ -1326,31 +1324,38 @@ fn lseg_of(v: &Value) -> [f64; 4] {
 
 /// Evaluate a `jsonb_path_*` function (or the `@?`/`@@` operators). Args are
 /// `[target jsonb, path jsonpath]` optionally followed by `[vars jsonb, silent
-/// bool]`. A NULL target or path yields NULL (PG's STRICT behavior); a NULL
-/// `vars` means "no variables". Structural errors surface with their SQLSTATE
-/// unless `silent` suppresses them (a missing-variable error always raises).
+/// bool]`. The SQL functions are STRICT — any NULL argument already
+/// short-circuited to NULL upstream, so on entry every argument is non-NULL. The
+/// `ExistsOp`/`MatchOp` operator variants are always silent and take no vars.
+/// Structural errors surface with their SQLSTATE unless `silent` suppresses them
+/// (a missing-variable error always raises).
 fn eval_jsonpath(f: JsonPathFn, args: &[Value]) -> Result<Value, ExecError> {
+    // The operators run silently with no variables; the functions read the
+    // optional (guaranteed non-NULL) `vars`/`silent` arguments.
+    let (silent, vars) = match f {
+        JsonPathFn::ExistsOp | JsonPathFn::MatchOp => (true, None),
+        _ => {
+            let vars = match args.get(2) {
+                Some(Value::Jsonb(v)) => Some(v),
+                _ => None,
+            };
+            (matches!(args.get(3), Some(Value::Bool(true))), vars)
+        }
+    };
     let target = match &args[0] {
         Value::Jsonb(j) => j,
-        Value::Null => return Ok(Value::Null),
         other => unreachable!("expected jsonb target, got {other:?}"),
     };
     let path = match &args[1] {
         Value::Jsonpath(p) => p,
-        Value::Null => return Ok(Value::Null),
         other => unreachable!("expected jsonpath arg, got {other:?}"),
     };
-    let vars = match args.get(2) {
-        Some(Value::Jsonb(v)) => Some(v),
-        _ => None,
-    };
-    let silent = matches!(args.get(3), Some(Value::Bool(true)));
     let opt_bool = |o: Option<bool>| o.map(Value::Bool).unwrap_or(Value::Null);
     match f {
-        JsonPathFn::Exists => {
+        JsonPathFn::Exists | JsonPathFn::ExistsOp => {
             jsonpath::exists(path, target, vars, silent).map(opt_bool).map_err(json_err)
         }
-        JsonPathFn::Match => {
+        JsonPathFn::Match | JsonPathFn::MatchOp => {
             jsonpath::match_predicate(path, target, vars, silent).map(opt_bool).map_err(json_err)
         }
         JsonPathFn::QueryArray => jsonpath::query(path, target, vars, silent)

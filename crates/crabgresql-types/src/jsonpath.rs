@@ -28,6 +28,7 @@ const SYNTAX_ERROR: &str = "42601";
 const UNDEFINED_OBJECT: &str = "42704";
 const DIVISION_BY_ZERO: &str = "22012";
 const SQL_JSON_MEMBER_NOT_FOUND: &str = "2203A";
+const SQL_JSON_NUMBER_NOT_FOUND: &str = "2203B";
 const SQL_JSON_ARRAY_NOT_FOUND: &str = "22039";
 const SQL_JSON_ITEM_METHOD: &str = "22036";
 const SINGLETON_JSON_ITEM_REQUIRED: &str = "22038";
@@ -147,6 +148,18 @@ enum ArithOp {
     Mul,
     Div,
     Mod,
+}
+
+impl ArithOp {
+    fn symbol(self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+            ArithOp::Mod => "%",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Hash)]
@@ -1261,17 +1274,24 @@ impl Eval<'_> {
                 Ok(out)
             }
             Node::Unary { neg, operand } => {
+                let sym = if *neg { "-" } else { "+" };
                 let items = self.seq(operand, current, last)?;
                 let mut out = Vec::with_capacity(items.len());
                 for it in items {
-                    let n = self.as_number(&it, "unary")?;
-                    out.push(Jsonb::Number(if *neg { n.neg() } else { n }));
+                    let Jsonb::Number(n) = &it else {
+                        return Err(err(
+                            SQL_JSON_NUMBER_NOT_FOUND,
+                            format!("operand of unary jsonpath operator {sym} is not a numeric value"),
+                        ));
+                    };
+                    out.push(Jsonb::Number(if *neg { n.neg() } else { n.clone() }));
                 }
                 Ok(out)
             }
             Node::Arith { op, left, right } => {
-                let l = self.single_number(left, current, "left")?;
-                let r = self.single_number(right, current, "right")?;
+                let sym = op.symbol();
+                let l = self.single_number(left, current, "left", sym)?;
+                let r = self.single_number(right, current, "right", sym)?;
                 Ok(vec![Jsonb::Number(arith(*op, &l, &r)?)])
             }
             // A predicate used in value position (top-level query of a predicate)
@@ -1300,17 +1320,23 @@ impl Eval<'_> {
         ))
     }
 
-    /// Evaluate `node` to exactly one numeric value (with lax array unwrap),
-    /// raising PG's "not a single numeric value" error otherwise. `side` is
-    /// "left"/"right"/"unary" for the message.
-    fn single_number(&self, node: &Node, current: &Jsonb, side: &str) -> Result<Numeric, JsonError> {
+    /// Evaluate a binary-arithmetic `node` to exactly one numeric value (with lax
+    /// array unwrap), raising PG's "not a single numeric value" error otherwise.
+    /// `side` is "left"/"right" and `op` the operator symbol, for the message.
+    fn single_number(
+        &self,
+        node: &Node,
+        current: &Jsonb,
+        side: &str,
+        op: &str,
+    ) -> Result<Numeric, JsonError> {
         let items = self.seq(node, current, None)?;
         let unwrapped = self.unwrap_for_arith(items);
         match unwrapped.as_slice() {
             [Jsonb::Number(n)] => Ok(n.clone()),
             _ => Err(err(
-                SQL_JSON_ITEM_METHOD,
-                format!("{side} operand of jsonpath operator + is not a single numeric value"),
+                SINGLETON_JSON_ITEM_REQUIRED,
+                format!("{side} operand of jsonpath operator {op} is not a single numeric value"),
             )),
         }
     }
@@ -1325,16 +1351,6 @@ impl Eval<'_> {
             return a.clone();
         }
         items
-    }
-
-    fn as_number(&self, v: &Jsonb, side: &str) -> Result<Numeric, JsonError> {
-        match v {
-            Jsonb::Number(n) => Ok(n.clone()),
-            _ => Err(err(
-                SQL_JSON_ITEM_METHOD,
-                format!("{side} operand of jsonpath operator + is not a single numeric value"),
-            )),
-        }
     }
 
     /// Apply one accessor `step` to a single `item`, pushing results onto `out`.
@@ -1504,11 +1520,38 @@ impl Eval<'_> {
     }
 
     fn apply_method(&self, m: Method, item: &Jsonb, out: &mut Vec<Jsonb>) -> Result<(), JsonError> {
+        // In lax mode these methods unwrap an array operand ONE level, applying
+        // per element (`$.abs()` on `[1,-2]` → 1,2). `.size()`/`.type()` operate
+        // on the container itself and never unwrap.
+        if !self.strict
+            && matches!(
+                m,
+                Method::Abs | Method::Floor | Method::Ceiling | Method::Double | Method::KeyValue
+            )
+            && let Jsonb::Array(a) = item
+        {
+            for elem in a {
+                self.apply_method_scalar(m, elem, out)?;
+            }
+            return Ok(());
+        }
+        self.apply_method_scalar(m, item, out)
+    }
+
+    /// Apply an item method to a single (already-unwrapped) item.
+    fn apply_method_scalar(&self, m: Method, item: &Jsonb, out: &mut Vec<Jsonb>) -> Result<(), JsonError> {
         match m {
             Method::Size => {
                 let n = match item {
                     Jsonb::Array(a) => a.len() as i128,
-                    // lax: any non-array has "size" 1.
+                    // strict: `.size()` only applies to an array; lax: any
+                    // non-array has "size" 1.
+                    _ if self.strict => {
+                        return Err(err(
+                            SQL_JSON_ARRAY_NOT_FOUND,
+                            "jsonpath item method .size() can only be applied to an array",
+                        ));
+                    }
                     _ => 1,
                 };
                 out.push(Jsonb::Number(Numeric::from_i128(n)));
@@ -1547,6 +1590,14 @@ impl Eval<'_> {
                     for (k, v) in pairs {
                         // jsonb canonical key order sorts shorter keys first, so
                         // `id` (2) < `key` (3) < `value` (5); build in that order.
+                        //
+                        // `id` is PG's byte offset of the containing object within
+                        // the jsonb datum — reproducing it would need PG's on-disk
+                        // binary layout, which this engine doesn't model (jsonb is
+                        // a canonical tree). PG documents `id` as implementation-
+                        // specific and not meaningful, so we always emit 0; this is
+                        // correct for a top-level object and a known deviation for
+                        // nested ones.
                         out.push(Jsonb::Object(vec![
                             ("id".to_string(), Jsonb::Number(Numeric::from_i128(0))),
                             ("key".to_string(), Jsonb::String(k.clone())),
@@ -1941,6 +1992,52 @@ mod tests {
         assert_eq!(q("{}", "(1.50 + 2.5)")?, vec!["4.00"]);
         assert_eq!(q("{}", "(7 % 3)")?, vec!["1"]);
         Ok(())
+    }
+
+    /// The error text/message returned by evaluating `path` against `target`.
+    fn qerr(target: &str, path: &str) -> JsonError {
+        query(&parse(path).expect("parse"), &jb(target), None, false).unwrap_err()
+    }
+
+    #[test]
+    fn lax_methods_unwrap_arrays_one_level() -> Result<()> {
+        // lax auto-unwraps a bare array for the numeric / keyvalue methods.
+        assert_eq!(q("[1,-2,3]", "$.abs()")?, vec!["1", "2", "3"]);
+        assert_eq!(q("[1.5,2.5]", "$.floor()")?, vec!["1", "2"]);
+        assert_eq!(q("[\"1.5\",2]", "$.double()")?, vec!["1.5", "2"]);
+        // ...one level only: an element that is itself an array errors.
+        assert_eq!(
+            qerr("[[1],[-2]]", "$.abs()").message,
+            "jsonpath item method .abs() can only be applied to a numeric value"
+        );
+        // `.size()`/`.type()` never unwrap (they describe the container).
+        assert_eq!(q("[1,2,3]", "$.size()")?, vec!["3"]);
+        assert_eq!(q("[1,2]", "$.type()")?, vec!["\"array\""]);
+        Ok(())
+    }
+
+    #[test]
+    fn strict_size_requires_array() {
+        // strict `.size()` on a non-array errors; lax returns 1.
+        let e = qerr("5", "strict $.size()");
+        assert_eq!(e.sqlstate, SQL_JSON_ARRAY_NOT_FOUND);
+        assert_eq!(e.message, "jsonpath item method .size() can only be applied to an array");
+    }
+
+    #[test]
+    fn arith_errors_name_the_operator() {
+        // The "single numeric value" error names the actual operator (22038).
+        let e = qerr("[1,2]", "$[*] * 1");
+        assert_eq!(e.sqlstate, SINGLETON_JSON_ITEM_REQUIRED);
+        assert_eq!(e.message, "left operand of jsonpath operator * is not a single numeric value");
+        assert_eq!(
+            qerr("[1,2]", "1 - $[*]").message,
+            "right operand of jsonpath operator - is not a single numeric value"
+        );
+        // Unary has its own message/SQLSTATE (2203B).
+        let u = qerr("{\"a\":\"x\"}", "- $.a");
+        assert_eq!(u.sqlstate, SQL_JSON_NUMBER_NOT_FOUND);
+        assert_eq!(u.message, "operand of unary jsonpath operator - is not a numeric value");
     }
 
     #[test]
