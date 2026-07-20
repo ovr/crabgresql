@@ -11,7 +11,7 @@ use crabgresql_memory_storage::MemoryEngine;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{Format, TransactionStatus};
 use crabgresql_storage_api::TableEngine;
-use crabgresql_txn::{CommandId, IsolationLevel, Snapshot, TransactionManager, Xid};
+use crabgresql_txn::{CommandId, IsolationLevel, LockOwner, Snapshot, TransactionManager, Xid};
 use crabgresql_types::{PgType, Value};
 
 /// A prepared statement (extended protocol `Parse`). Parse-analysis runs once,
@@ -125,6 +125,11 @@ pub struct Session {
     /// The shared transaction manager, held so an abandoned block can be aborted
     /// when the session is dropped (see the [`Drop`] impl).
     pub txnmgr: Arc<TransactionManager>,
+    /// This connection's session-stable table-lock owner, stamped into every
+    /// statement's `TxnContext` so a transaction can upgrade its own `AccessShare`
+    /// hold to `AccessExclusive` (TRUNCATE a table it has an open cursor on)
+    /// without self-deadlocking, while still blocking on other sessions' holds.
+    pub lock_owner: LockOwner,
     /// Session-local temp-table catalog (PG's `pg_temp`). Searched before the
     /// shared global engine, so a `CREATE TEMP TABLE` shadows a same-named
     /// permanent table. Dropped with the session on disconnect — that is the
@@ -145,6 +150,7 @@ impl Session {
         temp_schema: impl Into<String>,
     ) -> Self {
         // PG's default since v12.
+        let lock_owner = txnmgr.new_lock_owner();
         Self {
             database: database.into(),
             user: user.into(),
@@ -155,6 +161,7 @@ impl Session {
             tx_status: TransactionStatus::Idle,
             xact: None,
             txnmgr,
+            lock_owner,
             temp: Arc::new(MemoryEngine::new()),
             prepared: HashMap::new(),
             portals: HashMap::new(),
@@ -176,7 +183,17 @@ impl Drop for Session {
     /// at the statement boundary, so only an open block needs this.
     fn drop(&mut self) {
         if let Some(active) = self.xact.take() {
-            self.txnmgr.abort(active.xid.unwrap_or(Xid::INVALID));
+            let xid = active.xid.unwrap_or(Xid::INVALID);
+            if std::thread::panicking() {
+                // We're unwinding from a panic. The engine finalize hook takes
+                // engine locks that the same panic may have poisoned; re-entering
+                // them here would be a fatal double-panic. Retire the XID without
+                // the hook — any file a pending TRUNCATE staged is reclaimed by the
+                // engine's orphan GC at the next startup.
+                self.txnmgr.abort_without_finalize(xid);
+            } else {
+                self.txnmgr.abort(xid);
+            }
         }
     }
 }

@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use crabgresql_storage_api::{
     DeleteResult, IndexMetadata, TableAm, TableSchema, Tid, Tuple, UpdateResult,
 };
-use crabgresql_txn::{Clog, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
+use crabgresql_txn::{Clog, LockOwner, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
 use crabgresql_wal::RmgrId;
 
 use crate::EngineInner;
@@ -32,6 +32,9 @@ const MAX_TUPLE: usize = crate::page::BLCKSZ - PAGE_HEADER_LEN - 4;
 struct PendingTruncate {
     xid: Xid,
     new_rel: u32,
+    /// The lock owner that holds the table's exclusive lock — needed to release
+    /// it from the commit/abort hook, which only receives the XID.
+    owner: LockOwner,
 }
 
 pub struct HeapTable {
@@ -40,10 +43,13 @@ pub struct HeapTable {
     /// The committed relfilenode — what every transaction sees, except the one
     /// with a pending TRUNCATE (which sees `pending.new_rel`).
     live_rel: AtomicU32,
-    /// A staged, not-yet-committed TRUNCATE, if any.
+    /// A staged, not-yet-committed TRUNCATE, if any. `pending` and `has_pending`
+    /// are the single source of truth for an in-flight swap and are mutated ONLY
+    /// together, through this type's methods (`truncate`/`commit_truncate`/
+    /// `abort_truncate`/`rebind`), so they never drift (review finding #10).
     pending: RwLock<Option<PendingTruncate>>,
-    /// Cheap gate so the read/write hot path skips the `pending` lock entirely
-    /// while no TRUNCATE is in flight.
+    /// Cheap gate that lets the read/write hot path skip the `pending` RwLock read
+    /// entirely while no TRUNCATE is in flight — kept in sync with `pending`.
     has_pending: AtomicBool,
     /// Serializes TRUNCATE (exclusive) against readers/writers (shared).
     lock: Arc<TableLock>,
@@ -100,8 +106,9 @@ impl HeapTable {
     }
 
     /// Commit a staged TRUNCATE: the new file becomes the committed one. Returns
-    /// the old relfilenode to unlink, or `None` if nothing was pending for `xid`.
-    pub(crate) fn commit_truncate(&self, xid: Xid) -> Option<RelFileNode> {
+    /// the old relfilenode to unlink and the lock owner to release, or `None` if
+    /// nothing was pending for `xid`.
+    pub(crate) fn commit_truncate(&self, xid: Xid) -> Option<(RelFileNode, LockOwner)> {
         let mut pending = self
             .pending
             .write()
@@ -110,24 +117,35 @@ impl HeapTable {
         let old = self.live_rel.swap(p.new_rel, Ordering::Relaxed);
         self.has_pending.store(false, Ordering::Release);
         self.insert_hint.store(0, Ordering::Relaxed);
-        Some(RelFileNode(old))
+        Some((RelFileNode(old), p.owner))
     }
 
     /// Discard a staged TRUNCATE on abort: the new file is dropped, the committed
-    /// one stays. Returns the new relfilenode to unlink, or `None`.
-    pub(crate) fn abort_truncate(&self, xid: Xid) -> Option<RelFileNode> {
+    /// one stays. Returns the new relfilenode to unlink and the lock owner to
+    /// release, or `None`.
+    pub(crate) fn abort_truncate(&self, xid: Xid) -> Option<(RelFileNode, LockOwner)> {
         let mut pending = self
             .pending
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let p = pending.take_if(|p| p.xid == xid)?;
         self.has_pending.store(false, Ordering::Release);
-        Some(RelFileNode(p.new_rel))
+        Some((RelFileNode(p.new_rel), p.owner))
     }
 
-    /// Release the exclusive lock a TRUNCATE by `xid` held to transaction end.
-    pub(crate) fn release_truncate_lock(&self, xid: Xid) {
-        self.lock.release_exclusive(xid);
+    /// The relfilenode staged by an uncommitted TRUNCATE, if any. `drop_table`
+    /// reads this so it can reclaim a staged file the catalog doesn't know about.
+    pub(crate) fn staged_relfilenode(&self) -> Option<RelFileNode> {
+        self.pending
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .as_ref()
+            .map(|p| RelFileNode(p.new_rel))
+    }
+
+    /// Release the exclusive lock a TRUNCATE held (keyed by its lock owner).
+    pub(crate) fn release_truncate_lock(&self, owner: LockOwner) {
+        self.lock.release_exclusive(owner);
     }
 
     /// Point the table at `new` after recovery applied a committed TRUNCATE swap
@@ -250,7 +268,7 @@ impl TableAm for HeapTable {
     fn scan(&self, txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
         // Hold a shared lock for the whole iterator life so a concurrent TRUNCATE
         // cannot unlink the file this scan is reading.
-        let guard = self.lock.acquire_shared(txn.xid);
+        let guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         let nblocks = Self::io(self.engine.bufpool.smgr().nblocks(rel));
         Box::new(HeapScan {
@@ -266,7 +284,7 @@ impl TableAm for HeapTable {
     }
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Option<Tuple> {
-        let _guard = self.lock.acquire_shared(txn.xid);
+        let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         let smgr = self.engine.bufpool.smgr();
         if tid.block >= Self::io(smgr.nblocks(rel)) {
@@ -285,7 +303,7 @@ impl TableAm for HeapTable {
     }
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Tid {
-        let _guard = self.lock.acquire_shared(txn.xid);
+        let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
         let bytes = tuple::encode_tuple(
@@ -300,7 +318,7 @@ impl TableAm for HeapTable {
     }
 
     fn update(&self, tid: Tid, tuple: Tuple, txn: &TxnContext) -> UpdateResult {
-        let _guard = self.lock.acquire_shared(txn.xid);
+        let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         // Stamp the old version deleted-by-us FIRST, atomically under its page
         // lock (`stamp_deleted` is the serialization point). Two concurrent
@@ -328,7 +346,7 @@ impl TableAm for HeapTable {
     }
 
     fn delete(&self, tid: Tid, txn: &TxnContext) -> DeleteResult {
-        let _guard = self.lock.acquire_shared(txn.xid);
+        let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         if self.stamp_deleted(rel, tid, txn) {
             DeleteResult::Deleted
@@ -347,7 +365,7 @@ impl TableAm for HeapTable {
         // AccessExclusiveLock: block concurrent readers/writers of this table
         // until we commit, so no one reads the old file we are about to unlink or
         // writes rows that the swap would drop. Held until txn end.
-        self.lock.acquire_exclusive(txn.xid);
+        self.lock.acquire_exclusive(txn.lock_owner);
         let old = self.effective_rel(txn.xid);
         // A fresh, never-reused relfilenode for the empty post-truncate file.
         let new = self.engine.catalog.alloc_relfilenode();
@@ -370,6 +388,7 @@ impl TableAm for HeapTable {
             .replace(PendingTruncate {
                 xid: txn.xid,
                 new_rel: new.0,
+                owner: txn.lock_owner,
             });
         self.has_pending.store(true, Ordering::Release);
         self.insert_hint.store(0, Ordering::Relaxed);
@@ -396,7 +415,7 @@ impl TableAm for HeapTable {
 
     fn vacuum(&self, oldest: Xid, clog: &Clog) {
         // Vacuum reclaims committed-dead versions from the committed file.
-        let _guard = self.lock.acquire_shared(Xid::INVALID);
+        let _guard = self.lock.acquire_shared(LockOwner::INTERNAL);
         let rel = RelFileNode(self.live_rel.load(Ordering::Relaxed));
         let smgr = self.engine.bufpool.smgr();
         let nblocks = Self::io(smgr.nblocks(rel));

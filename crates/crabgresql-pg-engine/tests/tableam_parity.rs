@@ -9,7 +9,9 @@ use crabgresql_storage_api::{
     Column, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableAm,
     TableEngine, TableSchema, Tid, Tuple, UpdateResult,
 };
-use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, TxnContext, TxnFinalize, Xid};
+use crabgresql_txn::{
+    Clog, CommandId, CommitSink, LockOwner, TransactionManager, TxnContext, TxnFinalize, Xid,
+};
 use crabgresql_types::{PgType, Value};
 use crabgresql_wal::{RmgrRegistry, Wal};
 
@@ -557,4 +559,63 @@ fn heap_index_lookup_falls_back_to_scan() -> anyhow::Result<()> {
         .collect();
     assert_eq!(rows, vec![vec![Value::Int4(2), Value::Text("b".into())]]);
     Ok(())
+}
+
+#[test]
+fn truncate_upgrades_over_the_same_owners_open_scan() {
+    // Review finding #3: a session that holds an open cursor (a live scan guard)
+    // and then TRUNCATEs the same table must not self-deadlock. Run it on a worker
+    // thread and fail fast via a timeout if the lock upgrade regresses to a hang.
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let h = setup();
+        let table = h.engine.create_table(schema("t")).unwrap();
+        insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
+
+        // Open a scan under owner 42 and keep it paused mid-stream (a suspended
+        // cursor holds the scan's shared guard exactly like this).
+        let mut scan_ctx = h.tm.context(Xid::INVALID, CommandId::FIRST);
+        scan_ctx.lock_owner = LockOwner(42);
+        let mut scan = table.scan(&scan_ctx);
+        let _first = scan.next();
+
+        // TRUNCATE under the SAME owner: must upgrade over its own shared hold.
+        let tx = h.tm.allocate_xid();
+        let mut trunc_ctx = h.tm.context(tx, CommandId::FIRST);
+        trunc_ctx.lock_owner = LockOwner(42);
+        table.truncate(&trunc_ctx);
+        h.tm.commit(tx).unwrap();
+        drop(scan);
+        done_tx.send(()).unwrap();
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("TRUNCATE deadlocked against the same session's open scan");
+    worker.join().unwrap();
+}
+
+#[test]
+fn drop_table_reclaims_a_pending_truncate_file() {
+    // Review finding #4: a staged (uncommitted) TRUNCATE's new file lives on the
+    // handle, not the catalog; dropping the table must reclaim it, not leak it.
+    let h = setup();
+    let table = h.engine.create_table(schema("t")).unwrap();
+    insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
+
+    // Stage an uncommitted TRUNCATE: the first table is relfilenode 1, so the
+    // staged empty file is relfilenode 2.
+    let tx = h.tm.allocate_xid();
+    table.truncate(&h.tm.context(tx, CommandId::FIRST));
+    let staged = h._dir.path().join("base").join("2");
+    assert!(staged.exists(), "staged TRUNCATE file should exist before the drop");
+
+    h.engine.drop_table("t").unwrap();
+    assert!(
+        !staged.exists(),
+        "drop_table must unlink the staged TRUNCATE file (no leak)"
+    );
 }

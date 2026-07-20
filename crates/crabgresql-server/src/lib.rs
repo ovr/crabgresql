@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::TableEngine;
-use crabgresql_txn::{Clog, CommitSink, TransactionManager, TxnFinalize};
-use crabgresql_wal::{RmgrRegistry, Wal, recover};
+use crabgresql_txn::{CommitSink, TransactionManager, TxnFinalize};
+use crabgresql_wal::Wal;
 use tokio::net::TcpListener;
 
 use crate::global_catalog::GlobalCatalog;
@@ -29,26 +29,11 @@ pub fn open_pg_engine(
     data_dir: &Path,
 ) -> std::io::Result<(Arc<dyn TableEngine>, Arc<TransactionManager>)> {
     let wal = Arc::new(Wal::open(data_dir).map_err(std::io::Error::other)?);
-    let mut registry = RmgrRegistry::new();
-    let engine = Arc::new(PgEngine::new(data_dir, Arc::clone(&wal), &mut registry)?);
-    let clog = Arc::new(Clog::new());
-    let res = recover(data_dir, &registry, &clog).map_err(std::io::Error::other)?;
-    // Clamp the WAL to the last valid record before any new append, discarding a
-    // torn tail left by a crash — otherwise new records land past the garbage and
-    // a later recovery would stop at the torn record and lose them.
-    wal.reset_to(res.end_of_wal)
-        .map_err(std::io::Error::other)?;
-    // Resolve relfilenode-swap TRUNCATEs replayed from the WAL now that the CLOG
-    // is rebuilt (apply committed swaps, discard the rest), then reclaim any
-    // orphaned staging files — both before the checkpoint makes the catalog and
-    // pages durable.
-    engine.apply_recovered_truncates(&clog);
-    engine.gc_orphan_relfiles()?;
-    // Make the pages recovery reconstructed durable so restarts start from a
-    // clean base (recovery is still correct without this, just longer).
-    engine.checkpoint(res.next_xid)?;
+    // The full open + crash-recovery sequence lives in the engine so the server
+    // and the recovery tests share exactly one code path.
+    let (engine, clog, next_xid) = PgEngine::open_recovered(data_dir, Arc::clone(&wal))?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
-    let mut txnmgr = TransactionManager::new_recovered(sink, clog, res.next_xid);
+    let mut txnmgr = TransactionManager::new_recovered(sink, clog, next_xid);
     // Wire the engine's finalize hook so commit/abort apply or discard the swaps
     // and release the TRUNCATE table lock, on every finalize path.
     txnmgr.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);

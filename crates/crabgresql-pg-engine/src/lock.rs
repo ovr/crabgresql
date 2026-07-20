@@ -12,9 +12,14 @@
 //! * TRUNCATE takes an **exclusive** hold, kept until its transaction ends and
 //!   released by the [`crabgresql_txn::TxnFinalize`] hook.
 //!
-//! Shared and exclusive conflict; shared with shared do not. A transaction that
-//! holds the exclusive lock is granted its own shared requests immediately
-//! (read-your-own-truncate), so it never self-blocks.
+//! Shared and exclusive conflict; shared with shared do not. Holds are keyed by a
+//! **[`LockOwner`]** (a session, not a transaction), so — exactly like
+//! PostgreSQL's lock manager, where a backend never self-conflicts — the *same*
+//! owner can upgrade its own shared holds to exclusive: `TRUNCATE`-ing a table the
+//! same session has an open cursor on does not self-deadlock, while another
+//! session's cursor still blocks the TRUNCATE. A read-only-so-far transaction
+//! scans with [`Xid::INVALID`], so the owner (not the XID) is the stable key that
+//! makes this work.
 //!
 //! The `TableAm` methods are infallible, so a conflicting acquisition **blocks**
 //! (faithful to `AccessShare` waiting for `AccessExclusive`) rather than erroring.
@@ -22,18 +27,36 @@
 //! widening the `TableAm` trait to return `Result`; that is a deliberate
 //! follow-up (see the plan and `query.rs`'s `TODO(perf)` about moving statement
 //! execution off the reactor).
+//!
+//! Performance note (review finding #9): the shared acquire takes this per-table
+//! `Mutex` on every DML operation, but it is required for cross-session
+//! correctness, is uncontended in the common (no-TRUNCATE) case, and is taken
+//! once per scan (not per row) — one more short critical section among the
+//! per-page `bufpool` locks each operation already takes. A lock-free fast path
+//! is incompatible with the per-owner upgrade bookkeeping this fix needs, so the
+//! mutex stays.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 
-use crabgresql_txn::Xid;
+use crabgresql_txn::LockOwner;
 
 #[derive(Default)]
 struct LockInner {
-    /// The transaction holding the table exclusively (a pending TRUNCATE), or
-    /// `None`. Held until that transaction commits or aborts.
-    exclusive: Option<Xid>,
-    /// Count of in-flight shared holders (readers and writers).
-    shared: usize,
+    /// The owner holding the table exclusively (a pending TRUNCATE), or `None`.
+    /// Held until that transaction commits or aborts.
+    exclusive: Option<LockOwner>,
+    /// Per-owner count of in-flight shared holders (readers and writers). Keyed
+    /// by owner so an exclusive acquire can tell its own holds apart from others'.
+    shared: HashMap<LockOwner, u32>,
+}
+
+impl LockInner {
+    /// Whether any owner *other than* `owner` currently holds a shared hold — the
+    /// only thing (besides another exclusive) that blocks `owner`'s exclusive.
+    fn foreign_shared(&self, owner: LockOwner) -> bool {
+        self.shared.keys().any(|k| *k != owner)
+    }
 }
 
 /// A per-`HeapTable` lock. Held behind an `Arc` so a scan's [`SharedGuard`] can
@@ -51,17 +74,16 @@ impl TableLock {
         }
     }
 
-    /// Acquire a shared hold for `xid`. Grants immediately when no other
-    /// transaction holds the table exclusively (an exclusive hold by `xid` itself
-    /// is fine — that is the truncater reading its own new file); otherwise waits
-    /// until the exclusive holder finishes. The returned guard releases the hold
-    /// on drop.
-    pub fn acquire_shared(self: &Arc<Self>, xid: Xid) -> SharedGuard {
+    /// Acquire a shared hold for `owner`. Grants immediately when no *other* owner
+    /// holds the table exclusively (an exclusive hold by `owner` itself is fine —
+    /// that is the truncater reading its own new file); otherwise waits until the
+    /// exclusive holder finishes. The returned guard releases the hold on drop.
+    pub fn acquire_shared(self: &Arc<Self>, owner: LockOwner) -> SharedGuard {
         let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         loop {
             match inner.exclusive {
                 None => break,
-                Some(holder) if holder == xid => break,
+                Some(holder) if holder == owner => break,
                 Some(_) => {
                     inner = self
                         .cond
@@ -70,25 +92,28 @@ impl TableLock {
                 }
             }
         }
-        inner.shared += 1;
+        *inner.shared.entry(owner).or_default() += 1;
         SharedGuard {
             lock: Arc::clone(self),
+            owner,
         }
     }
 
-    /// Acquire the exclusive hold for `xid`, waiting until no other transaction
-    /// holds the table exclusively and no shared operations are in flight. The
-    /// hold is kept until [`TableLock::release_exclusive`] (called by the commit
-    /// or abort hook). Re-entrant: a second TRUNCATE by the same transaction
-    /// re-acquires trivially.
-    pub fn acquire_exclusive(&self, xid: Xid) {
+    /// Acquire the exclusive hold for `owner`, waiting until no *other* owner holds
+    /// the table exclusively and no *other* owner holds a shared hold. `owner`'s
+    /// own shared holds do not block it (lock upgrade), so a session can TRUNCATE a
+    /// table it has an open cursor on. The hold is kept until
+    /// [`TableLock::release_exclusive`] (called by the commit or abort hook).
+    /// Re-entrant: a second TRUNCATE by the same owner re-acquires trivially.
+    pub fn acquire_exclusive(&self, owner: LockOwner) {
         let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         loop {
-            if inner.exclusive == Some(xid) {
-                return;
-            }
-            if inner.exclusive.is_none() && inner.shared == 0 {
-                inner.exclusive = Some(xid);
+            let exclusive_ok = match inner.exclusive {
+                None => true,
+                Some(holder) => holder == owner,
+            };
+            if exclusive_ok && !inner.foreign_shared(owner) {
+                inner.exclusive = Some(owner);
                 return;
             }
             inner = self
@@ -98,10 +123,10 @@ impl TableLock {
         }
     }
 
-    /// Release `xid`'s exclusive hold, if it holds one. Wakes any waiters.
-    pub fn release_exclusive(&self, xid: Xid) {
+    /// Release `owner`'s exclusive hold, if it holds one. Wakes any waiters.
+    pub fn release_exclusive(&self, owner: LockOwner) {
         let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
-        if inner.exclusive == Some(xid) {
+        if inner.exclusive == Some(owner) {
             inner.exclusive = None;
             self.cond.notify_all();
         }
@@ -112,6 +137,7 @@ impl TableLock {
 /// table's file cannot be unlinked out from under an in-progress scan.
 pub struct SharedGuard {
     lock: Arc<TableLock>,
+    owner: LockOwner,
 }
 
 impl Drop for SharedGuard {
@@ -121,12 +147,15 @@ impl Drop for SharedGuard {
             .inner
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        inner.shared -= 1;
-        // Waking on the last shared release lets a waiting exclusive acquirer
-        // (which needs shared == 0) proceed.
-        if inner.shared == 0 {
-            self.lock.cond.notify_all();
+        if let Some(count) = inner.shared.get_mut(&self.owner) {
+            *count -= 1;
+            if *count == 0 {
+                inner.shared.remove(&self.owner);
+            }
         }
+        // A waiting exclusive acquirer may now be unblocked (its last conflicting
+        // shared holder just left).
+        self.lock.cond.notify_all();
     }
 }
 
@@ -134,57 +163,76 @@ impl Drop for SharedGuard {
 mod tests {
     use super::*;
 
+    fn owner(n: u64) -> LockOwner {
+        LockOwner(n)
+    }
+
     #[test]
     fn shared_holds_coexist() {
         let lock = Arc::new(TableLock::new());
-        let a = lock.acquire_shared(Xid(3));
-        let b = lock.acquire_shared(Xid(4));
-        assert_eq!(lock.inner.lock().unwrap().shared, 2);
+        let a = lock.acquire_shared(owner(3));
+        let b = lock.acquire_shared(owner(4));
+        assert_eq!(lock.inner.lock().unwrap().shared.values().sum::<u32>(), 2);
         drop(a);
         drop(b);
-        assert_eq!(lock.inner.lock().unwrap().shared, 0);
+        assert!(lock.inner.lock().unwrap().shared.is_empty());
     }
 
     #[test]
     fn exclusive_excludes_and_releases() {
         let lock = Arc::new(TableLock::new());
-        lock.acquire_exclusive(Xid(3));
-        assert_eq!(lock.inner.lock().unwrap().exclusive, Some(Xid(3)));
+        lock.acquire_exclusive(owner(3));
+        assert_eq!(lock.inner.lock().unwrap().exclusive, Some(owner(3)));
         // The holder may still take shared holds (read-your-own-truncate).
-        let g = lock.acquire_shared(Xid(3));
+        let g = lock.acquire_shared(owner(3));
         drop(g);
-        lock.release_exclusive(Xid(3));
+        lock.release_exclusive(owner(3));
         assert_eq!(lock.inner.lock().unwrap().exclusive, None);
     }
 
     #[test]
-    fn exclusive_is_reentrant_for_same_xid() {
+    fn exclusive_is_reentrant_for_same_owner() {
         let lock = Arc::new(TableLock::new());
-        lock.acquire_exclusive(Xid(3));
-        lock.acquire_exclusive(Xid(3)); // must not block
-        lock.release_exclusive(Xid(3));
+        lock.acquire_exclusive(owner(3));
+        lock.acquire_exclusive(owner(3)); // must not block
+        lock.release_exclusive(owner(3));
     }
 
     #[test]
-    fn exclusive_waits_for_shared_to_drain() {
+    fn exclusive_upgrades_over_own_shared_hold() {
+        // The realistic #3 case: a session holds a shared hold (an open cursor)
+        // and then TRUNCATEs the same table. It must not self-deadlock.
+        let lock = Arc::new(TableLock::new());
+        let _cursor = lock.acquire_shared(owner(7));
+        lock.acquire_exclusive(owner(7)); // same owner: granted despite the shared hold
+        assert_eq!(lock.inner.lock().unwrap().exclusive, Some(owner(7)));
+        lock.release_exclusive(owner(7));
+    }
+
+    #[test]
+    fn exclusive_waits_for_a_foreign_shared_hold() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
         use std::time::Duration;
 
         let lock = Arc::new(TableLock::new());
-        let held = lock.acquire_shared(Xid(3));
+        // A DIFFERENT owner's shared hold must block the exclusive.
+        let held = lock.acquire_shared(owner(3));
         let got_exclusive = Arc::new(AtomicBool::new(false));
 
         let l2 = Arc::clone(&lock);
         let flag = Arc::clone(&got_exclusive);
         let t = thread::spawn(move || {
-            l2.acquire_exclusive(Xid(4));
+            l2.acquire_exclusive(owner(4));
             flag.store(true, Ordering::SeqCst);
-            l2.release_exclusive(Xid(4));
+            l2.release_exclusive(owner(4));
         });
 
         thread::sleep(Duration::from_millis(50));
-        assert!(!got_exclusive.load(Ordering::SeqCst), "exclusive must wait for the shared hold");
+        assert!(
+            !got_exclusive.load(Ordering::SeqCst),
+            "exclusive must wait for another owner's shared hold"
+        );
         drop(held);
         t.join().unwrap();
         assert!(got_exclusive.load(Ordering::SeqCst));

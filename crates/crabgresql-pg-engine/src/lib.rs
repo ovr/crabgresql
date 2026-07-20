@@ -33,7 +33,7 @@ use crabgresql_storage_api::{
     IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
 };
 use crabgresql_txn::{Clog, TxnFinalize, Xid};
-use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, write_control};
+use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, recover, write_control};
 
 use crate::bufpool::BufferPool;
 use crate::catalog::RelCatalog;
@@ -65,8 +65,10 @@ pub(crate) struct EngineInner {
     /// allocate a fresh relfilenode.
     pub catalog: Arc<RelCatalog>,
     /// Uncommitted relfilenode-swap TRUNCATEs, keyed by the truncating XID:
-    /// which tables it truncated. The commit/abort hook drains an XID's entry to
-    /// apply or discard its swaps and release the table locks.
+    /// which tables it truncated. This is an O(1) commit-time index (review
+    /// finding #10) — the alternative, scanning every table for a matching
+    /// pending XID on every commit, is O(tables). The commit/abort hook drains an
+    /// XID's entry to apply or discard its swaps and release the table locks.
     pub pending_truncates: Mutex<HashMap<Xid, Vec<String>>>,
     /// TRUNCATE swaps replayed from the WAL during recovery, applied after the
     /// CLOG is rebuilt (see [`PgEngine::apply_recovered_truncates`]).
@@ -131,6 +133,34 @@ impl PgEngine {
             catalog,
             tables: RwLock::new(tables),
         })
+    }
+
+    /// The full engine-side open + crash-recovery sequence over `data_dir`,
+    /// returning the engine, the rebuilt commit log, and the next XID to hand out.
+    /// The single source of truth shared by the server's `open_pg_engine` and the
+    /// recovery tests, so both exercise the same steps (recover → clamp a torn WAL
+    /// tail → reconcile relfilenode-swap TRUNCATEs → reclaim orphans → checkpoint).
+    /// The caller builds the [`crabgresql_txn::TransactionManager`] from the
+    /// returned `clog`/`next_xid` and wires the [`crabgresql_txn::TxnFinalize`]
+    /// hook (this engine as `Arc<dyn TxnFinalize>`).
+    pub fn open_recovered(
+        data_dir: &Path,
+        wal: Arc<Wal>,
+    ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
+        let mut registry = RmgrRegistry::new();
+        let engine = Arc::new(PgEngine::new(data_dir, Arc::clone(&wal), &mut registry)?);
+        let clog = Arc::new(Clog::new());
+        let res = recover(data_dir, &registry, &clog).map_err(std::io::Error::other)?;
+        // Clamp the WAL to the last valid record before any new append, discarding
+        // a torn tail left by a crash.
+        wal.reset_to(res.end_of_wal).map_err(std::io::Error::other)?;
+        // Reconcile swap TRUNCATEs replayed from the WAL (apply committed, discard
+        // the rest), reclaim orphaned staging files, then make the recovered
+        // catalog and pages durable.
+        engine.apply_recovered_truncates(&clog);
+        engine.gc_orphan_relfiles()?;
+        engine.checkpoint(res.next_xid)?;
+        Ok((engine, clog, res.next_xid))
     }
 
     /// Flush all dirty pages to their relation files (obeying the write-ahead
@@ -279,7 +309,7 @@ impl TxnFinalize for PgEngine {
                 // strand the lock and wedge the table for the process lifetime).
                 // The lock is held across the persist so a concurrent TRUNCATE that
                 // commits can't have its catalog write clobbered by a stale one.
-                if let Some(old) = t.commit_truncate(xid) {
+                if let Some((old, owner)) = t.commit_truncate(xid) {
                     // The commit is already durable in the WAL, so a catalog persist
                     // failure is not fatal — recovery re-applies the swap from the
                     // WAL at the next boot; log and continue rather than panic.
@@ -292,8 +322,8 @@ impl TxnFinalize for PgEngine {
                         );
                     }
                     self.inner.discard_relfile(old);
+                    t.release_truncate_lock(owner);
                 }
-                t.release_truncate_lock(xid);
             }
         }
     }
@@ -313,10 +343,9 @@ impl TxnFinalize for PgEngine {
         let handles = self.tables.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
         for name in tables {
             if let Some(t) = handles.get(&name) {
-                let new = t.abort_truncate(xid);
-                t.release_truncate_lock(xid);
-                if let Some(new) = new {
+                if let Some((new, owner)) = t.abort_truncate(xid) {
                     self.inner.discard_relfile(new);
+                    t.release_truncate_lock(owner);
                 }
             }
         }
@@ -366,7 +395,7 @@ impl TableEngine for PgEngine {
         // under the tables lock, so `open_table` never observes a half-dropped
         // relation. The persistent catalog is the source of truth for existence:
         // a missing entry there is the 42P01 case.
-        let rel = {
+        let (rel, staged) = {
             let mut tables = self
                 .tables
                 .write()
@@ -378,8 +407,15 @@ impl TableEngine for PgEngine {
             let Some(rel) = rel else {
                 return Err(StorageError::TableNotFound(name.to_string()));
             };
+            // Also reclaim any file staged by an in-flight TRUNCATE on this table
+            // (its new relfilenode lives on the handle, not the catalog), so
+            // dropping the table doesn't leak it. Concurrent DROP vs another
+            // session's uncommitted TRUNCATE is not otherwise synchronized — full
+            // serialization needs transactional DDL, which is deferred; the losing
+            // side's staged file is caught here or by `gc_orphan_relfiles`.
+            let staged = tables.get(name).and_then(|t| t.staged_relfilenode());
             tables.remove(name);
-            rel
+            (rel, staged)
         };
         // Physical cleanup runs after the tables lock is released, so an IO error
         // unlinking the file panics only this statement rather than poisoning the
@@ -392,6 +428,9 @@ impl TableEngine for PgEngine {
             .smgr()
             .unlink(rel)
             .expect("relation file unlink failed");
+        if let Some(staged) = staged {
+            self.inner.discard_relfile(staged);
+        }
         Ok(())
     }
 

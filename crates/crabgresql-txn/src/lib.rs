@@ -275,6 +275,23 @@ pub enum IsolationLevel {
     Serializable,
 }
 
+/// Identifies who holds a table-level lock. Stable across a session's statements
+/// (both reads, which may carry [`Xid::INVALID`], and writes), so a table AM can
+/// let a transaction upgrade its own `AccessShare` hold to `AccessExclusive`
+/// (e.g. `TRUNCATE` a table the same session has an open cursor on) without
+/// self-deadlocking, exactly as PostgreSQL's lock manager does — while still
+/// blocking on *other* owners' holds. The server assigns one per connection via
+/// [`TransactionManager::new_lock_owner`]; contexts built without a session
+/// default to the transaction's XID, and [`LockOwner::INTERNAL`] is reserved for
+/// engine-internal callers such as VACUUM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LockOwner(pub u64);
+
+impl LockOwner {
+    /// Reserved owner for engine-internal work (VACUUM) with no session.
+    pub const INTERNAL: LockOwner = LockOwner(0);
+}
+
 /// What flows into an engine on every scan and write: who is asking (`xid`,
 /// `cid`), the snapshot their visibility is judged against, and a handle to the
 /// commit log so the engine can resolve other transactions' fates without a
@@ -287,6 +304,10 @@ pub struct TxnContext {
     pub snapshot: Snapshot,
     pub iso: IsolationLevel,
     pub clog: Arc<Clog>,
+    /// The session-stable table-lock owner (see [`LockOwner`]). Defaults to the
+    /// transaction's XID for contexts built without a session; the server stamps
+    /// the connection's owner over it in `build_txn`.
+    pub lock_owner: LockOwner,
 }
 
 /// The one MVCC visibility rule. A version described by `hdr` is visible to a
@@ -388,11 +409,17 @@ pub struct TransactionManager {
     /// Engine finalize hook (relfilenode-swap TRUNCATE apply/discard + lock
     /// release); `None` for the memory engine and unit tests.
     finalize: Option<Arc<dyn TxnFinalize>>,
+    /// Vends session-stable [`LockOwner`]s. Starts at 1 so no session ever gets
+    /// [`LockOwner::INTERNAL`] (0).
+    next_lock_owner: AtomicU64,
 }
 
 impl TransactionManager {
     pub fn new() -> Self {
-        Self::default()
+        TransactionManager {
+            next_lock_owner: AtomicU64::new(1),
+            ..Default::default()
+        }
     }
 
     /// Build a durable manager after crash recovery: attach the WAL-backed
@@ -404,7 +431,16 @@ impl TransactionManager {
             clog,
             sink: Some(sink),
             finalize: None,
+            next_lock_owner: AtomicU64::new(1),
         }
+    }
+
+    /// Assign a fresh, unique [`LockOwner`] for a connection. The server calls
+    /// this once per session; every statement of that session then shares the
+    /// owner, so a transaction can upgrade its own `AccessShare` hold on a table
+    /// to `AccessExclusive` without self-deadlocking.
+    pub fn new_lock_owner(&self) -> LockOwner {
+        LockOwner(self.next_lock_owner.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Attach the engine's [`TxnFinalize`] hook. Called once at startup, after
@@ -477,6 +513,22 @@ impl TransactionManager {
         }
     }
 
+    /// Abort `xid` WITHOUT running the engine [`TxnFinalize`] hook. Used only by
+    /// `Session::drop` when the thread is already unwinding from a panic: the
+    /// hook takes engine locks that a prior panic may have poisoned, and
+    /// re-entering them mid-unwind would be a fatal double-panic. Any physical
+    /// work the aborted transaction staged (a pending TRUNCATE's new file) is
+    /// reclaimed by the engine's orphan GC at the next startup.
+    pub fn abort_without_finalize(&self, xid: Xid) {
+        if xid.is_valid() {
+            if let Some(sink) = &self.sink {
+                sink.log_abort(xid);
+            }
+            self.clog.set_aborted(xid);
+            self.xids.complete(xid);
+        }
+    }
+
     /// Build a context taking a fresh snapshot now (READ COMMITTED default).
     pub fn context(&self, xid: Xid, cid: CommandId) -> TxnContext {
         self.context_with(xid, cid, self.snapshot(), IsolationLevel::ReadCommitted)
@@ -497,6 +549,11 @@ impl TransactionManager {
             snapshot,
             iso,
             clog: Arc::clone(&self.clog),
+            // Default the lock owner to the transaction's XID; the server
+            // overrides it with the connection's session-stable owner in
+            // `build_txn`. This default keeps engine-level tests (which build
+            // contexts directly) correctly keyed per transaction.
+            lock_owner: LockOwner(xid.0),
         }
     }
 }

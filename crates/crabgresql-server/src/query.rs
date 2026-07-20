@@ -547,7 +547,11 @@ pub fn execute_statement(
 /// level (fresh per statement for READ COMMITTED, frozen once for REPEATABLE
 /// READ and above).
 fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool) -> TxnContext {
-    match &mut session.xact {
+    // The connection's session-stable table-lock owner, stamped onto every
+    // context so a transaction can upgrade its own AccessShare hold (an open
+    // cursor) to AccessExclusive (TRUNCATE) without self-deadlocking.
+    let lock_owner = session.lock_owner;
+    let mut ctx = match &mut session.xact {
         Some(active) => {
             let xid = if is_write {
                 *active.xid.get_or_insert_with(|| txnmgr.allocate_xid())
@@ -571,7 +575,9 @@ fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool)
             };
             txnmgr.context(xid, CommandId::FIRST)
         }
-    }
+    };
+    ctx.lock_owner = lock_owner;
+    ctx
 }
 
 /// Close out a statement's transaction bookkeeping. Under autocommit a write

@@ -550,14 +550,32 @@ impl TableAm for MemoryTable {
         applied
     }
 
-    // TRUNCATE uses the default `TableAm::truncate` (scan the visible rows and
-    // `delete_many` them), which stamps each version's `xmax` with the truncating
-    // XID — so it is fully MVCC-transactional: a rollback leaves the versions live
-    // and VACUUM reclaims them once the delete commits. The durable heap engine
-    // instead swaps the relfilenode (PG's mechanism); both agree observably.
-    // The physical index (`phys`) is intentionally NOT cleared: its probe already
-    // MVCC-filters dead versions, and keeping the entries lets a rolled-back
-    // TRUNCATE restore visibility without rebuilding the index.
+    /// TRUNCATE: stamp `xmax` on **every** physically-live version, not just the
+    /// ones visible to the caller's snapshot. Like `delete_many` this is MVCC —
+    /// transactional (a rollback aborts `xmax`, so the rows become live again) —
+    /// but it removes rows a concurrent transaction inserted and hasn't committed
+    /// too, so a committed TRUNCATE really empties the table (the default
+    /// snapshot-scoped `scan + delete_many` would leave those survivors). This
+    /// reproduces PostgreSQL's "TRUNCATE removes everything" observable outcome on
+    /// this lock-free reference engine; the durable heap engine gets the same
+    /// guarantee from its `AccessExclusiveLock`.
+    ///
+    /// The physical index (`phys`) is intentionally NOT cleared: its probe already
+    /// MVCC-filters dead versions, and keeping the entries lets a rolled-back
+    /// TRUNCATE restore visibility without rebuilding the index.
+    fn truncate(&self, txn: &TxnContext) {
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let rows = Arc::make_mut(&mut *rows);
+        for v in rows.iter_mut() {
+            if is_live(&v.header, &txn.clog) {
+                v.header.xmax = txn.xid;
+                v.header.cmax = txn.cid;
+            }
+        }
+    }
 
     /// Reclaim versions that are dead to everyone: deleted by a **committed**
     /// transaction at or before `oldest`. A single retain pass under the lock. A
@@ -970,6 +988,45 @@ mod tests {
         let c = insert_committed(&tm, &*table, vec![Value::Int4(3), Value::Null]);
         assert!(c > b);
         assert_eq!(ids(&tm, &*table), vec![Value::Int4(3)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn truncate_removes_a_concurrent_uncommitted_insert() -> anyhow::Result<()> {
+        // A committed TRUNCATE must empty the table entirely, even of a row a
+        // concurrent transaction inserted but hasn't committed — the row is not
+        // visible to the truncater's snapshot, but TRUNCATE removes everything.
+        let tm = TransactionManager::new();
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t"))?;
+        insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
+        // T1 inserts a row but does not commit.
+        let a = tm.allocate_xid();
+        table.insert(vec![Value::Int4(2), Value::Null], &tm.context(a, CommandId::FIRST));
+        // T2 truncates and commits.
+        let b = tm.allocate_xid();
+        table.truncate(&tm.context(b, CommandId::FIRST));
+        tm.commit(b)?;
+        // T1 commits its insert afterwards — it was still removed by the truncate.
+        tm.commit(a)?;
+        assert!(ids(&tm, &*table).is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rolled_back_truncate_restores_rows() -> anyhow::Result<()> {
+        let tm = TransactionManager::new();
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t"))?;
+        insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
+        insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Null]);
+        let x = tm.allocate_xid();
+        table.truncate(&tm.context(x, CommandId::FIRST));
+        tm.abort(x);
+        // Aborting the TRUNCATE leaves every stamped version live again.
+        assert_eq!(ids(&tm, &*table).len(), 2);
 
         Ok(())
     }

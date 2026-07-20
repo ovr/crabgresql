@@ -6,32 +6,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crabgresql_pg_engine::{PgEngine, RelFileNode};
-use crabgresql_txn::{Clog, CommitSink, TransactionManager, TxnFinalize};
-use crabgresql_wal::{RmgrRegistry, Wal, recover};
+use crabgresql_txn::{CommitSink, TransactionManager, TxnFinalize};
+use crabgresql_wal::Wal;
 
 /// Open the engine over `dir`, replaying any existing WAL, applying recovered
 /// TRUNCATE swaps, and wiring the finalize hook so commits/aborts drive the
-/// relfilenode swap and lock release — the same sequence as the production
-/// `open_pg_engine`. An alias of [`try_open`]; corruption tests that must
-/// inspect the failure can call either.
+/// relfilenode swap and lock release — the exact production startup sequence.
+/// An alias of [`try_open`]; corruption tests that must inspect the failure can
+/// call either.
 pub fn open(dir: &Path) -> std::io::Result<(Arc<PgEngine>, TransactionManager)> {
     try_open(dir)
 }
 
 /// Open the engine, surfacing any recovery error (for corruption tests that must
-/// assert recovery fails loudly).
+/// assert recovery fails loudly). Drives the SAME `PgEngine::open_recovered`
+/// sequence the server's `open_pg_engine` uses (recover → clamp tail → reconcile
+/// truncates → GC → checkpoint), then attaches the finalize hook.
 pub fn try_open(dir: &Path) -> std::io::Result<(Arc<PgEngine>, TransactionManager)> {
     let wal = Arc::new(Wal::open(dir).map_err(std::io::Error::other)?);
-    let mut reg = RmgrRegistry::new();
-    let engine = Arc::new(PgEngine::new(dir, Arc::clone(&wal), &mut reg)?);
-    let clog = Arc::new(Clog::new());
-    let res = recover(dir, &reg, &clog).map_err(std::io::Error::other)?;
-    // Mirror the production startup (open_pg_engine): clamp a torn tail, resolve
-    // recovered truncate swaps, then make the manager finalize-aware.
-    wal.reset_to(res.end_of_wal).map_err(std::io::Error::other)?;
-    engine.apply_recovered_truncates(&clog);
+    let (engine, clog, next_xid) = PgEngine::open_recovered(dir, Arc::clone(&wal))?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
-    let mut tm = TransactionManager::new_recovered(sink, clog, res.next_xid);
+    let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
     tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
     Ok((engine, tm))
 }
