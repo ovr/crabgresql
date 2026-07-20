@@ -3219,11 +3219,11 @@ mod tests {
 
     #[test]
     fn insert_type_mismatch_is_42804_with_column_context() {
-        let e = bind_err("INSERT INTO t (name) VALUES (1)");
+        let e = bind_err("INSERT INTO t (flag) VALUES (1)");
         assert_eq!(e.code, "42804");
         assert_eq!(
             e.message,
-            "column \"name\" is of type text but expression is of type integer"
+            "column \"flag\" is of type boolean but expression is of type integer"
         );
     }
 
