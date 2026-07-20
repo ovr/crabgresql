@@ -1757,15 +1757,27 @@ fn bind_distinct(
                 let (column, ty) = order_by_target(expr, columns, scope, projections, true)?;
                 keys.push(DistinctKey { column, ty });
             }
-            // When ORDER BY is present the ON expressions must be a prefix of it,
-            // so "first row per DISTINCT ON group" is well-defined by the sort.
+            // When ORDER BY is present the ON expressions must be exactly the
+            // *set* of leading ORDER BY expressions (order among them does not
+            // matter — PG accepts `DISTINCT ON (a, b) … ORDER BY b, a`), so
+            // "first row per DISTINCT ON group" is well-defined by the sort.
             if !sort.is_empty() {
-                let prefix_matches = keys.len() <= sort.len()
-                    && keys
-                        .iter()
-                        .zip(sort)
-                        .all(|(key, sort_key)| key.column == sort_key.column);
-                if !prefix_matches {
+                let on_cols: HashSet<usize> = keys.iter().map(|key| key.column).collect();
+                // Walk the leading ORDER BY keys: each must be an ON column until
+                // every ON column is covered. A leading key that is not an ON
+                // column before then — or running out of ORDER BY keys first —
+                // means the ON expressions are not the initial ORDER BY ones.
+                let mut covered: HashSet<usize> = HashSet::new();
+                for sort_key in sort {
+                    if covered.len() == on_cols.len() {
+                        break;
+                    }
+                    if !on_cols.contains(&sort_key.column) {
+                        break;
+                    }
+                    covered.insert(sort_key.column);
+                }
+                if covered != on_cols {
                     return Err(BindError::new(
                         sqlstate::INVALID_COLUMN_REFERENCE,
                         "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
@@ -4709,6 +4721,48 @@ mod tests {
     fn distinct_on_not_matching_order_by_is_42p10() {
         // DISTINCT ON expressions must be a prefix of ORDER BY.
         let e = bind_err("SELECT DISTINCT ON (id) id FROM t ORDER BY name");
+        assert_eq!(e.code, "42P10");
+        assert_eq!(
+            e.message,
+            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        );
+    }
+
+    #[test]
+    fn distinct_on_matches_reordered_order_by_prefix() {
+        // The ON expressions are the *set* of leading ORDER BY expressions;
+        // their order relative to each other does not matter (PG accepts this).
+        let (_, distinct) =
+            distinct_of("SELECT DISTINCT ON (id, big) id, big FROM t ORDER BY big, id");
+        assert_eq!(
+            distinct,
+            Some(vec![
+                DistinctKey {
+                    column: 0,
+                    ty: PgType::Int4,
+                },
+                DistinctKey {
+                    column: 1,
+                    ty: PgType::Int8,
+                },
+            ])
+        );
+        // Extra trailing ORDER BY keys (per-group tiebreak) are still allowed.
+        let (_, distinct) =
+            distinct_of("SELECT DISTINCT ON (id) id, name FROM t ORDER BY id, name");
+        assert_eq!(
+            distinct,
+            Some(vec![DistinctKey {
+                column: 0,
+                ty: PgType::Int4,
+            }])
+        );
+    }
+
+    #[test]
+    fn distinct_on_more_expressions_than_order_by_is_42p10() {
+        // ON has two expressions but ORDER BY only covers one — not a match.
+        let e = bind_err("SELECT DISTINCT ON (id, big) id, big FROM t ORDER BY id");
         assert_eq!(e.code, "42P10");
         assert_eq!(
             e.message,

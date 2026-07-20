@@ -110,13 +110,16 @@ pub fn execute(
             sort,
             distinct,
         } => {
+            // The emitted tuple width, including any hidden ORDER BY / DISTINCT ON
+            // columns a FROM-less `SELECT DISTINCT ON (expr)` appended past the
+            // visible output — captured before `rows` is moved so a Distinct can
+            // keep those columns through the sort.
+            let full_width = rows.first().map_or(columns.len(), Vec::len);
             let mut node: Box<dyn ExecNode> = Box::new(Values::new(rows, ctx));
             if let Some(predicate) = predicate {
                 node = Box::new(Filter::new(node, predicate, ctx));
             }
-            // A FROM-less SELECT has no hidden columns, so the projected width is
-            // the visible width.
-            node = finish_sort_distinct(node, sort, distinct, columns.len(), &columns)?;
+            node = finish_sort_distinct(node, sort, distinct, full_width, &columns)?;
             Ok(Execution::Rows { columns, node })
         }
         PhysicalPlan::Select {
@@ -2487,6 +2490,17 @@ mod tests {
                 Value::Int8(42), // sum(b): int4 widens to bigint
             ]
         );
+    }
+
+    #[test]
+    fn fromless_distinct_on_hidden_expression() {
+        // A FROM-less `SELECT DISTINCT ON (expr)` where the ON expression is not
+        // in the select list appends a hidden column; the Values pipeline must
+        // keep that column through the sort (not trim to the visible width) so
+        // Distinct can read it. Regression: previously truncated → out-of-bounds.
+        let (columns, rows) = run_rows("SELECT DISTINCT ON (1 + 1) 5 ORDER BY 1 + 1");
+        assert_eq!(columns.len(), 1, "the hidden ON column never reaches output");
+        assert_eq!(rows, vec![vec![Value::Int4(5)]]);
     }
 
     #[test]
