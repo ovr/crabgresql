@@ -8,11 +8,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crabgresql_binder::{
-    LogicalPlan, bind_delete_with_params, bind_insert_with_params, bind_query_with_params,
-    bind_update_with_params, output_columns_of, param_ctx_extended, param_ctx_none, param_types,
-    require_all_resolved, substitute_params,
+    BoundExpr, LogicalPlan, bind_delete_with_params, bind_insert_with_params,
+    bind_query_with_params, bind_update_with_params, output_columns_of, param_ctx_extended,
+    param_ctx_none, param_types, require_all_resolved, substitute_params,
 };
-use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
+use crabgresql_executor::{ExecNode, Execution, OutputColumn, Values, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
@@ -409,6 +409,45 @@ pub fn execute_statement(
             }
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
+            }
+            ast::Statement::Explain {
+                analyze, statement, ..
+            } => {
+                // Plain `EXPLAIN <stmt>` only: ANALYZE would run the statement,
+                // which this reduced EXPLAIN does not do. VERBOSE/FORMAT are
+                // ignored.
+                if *analyze {
+                    return Err(PgError::feature_not_supported(
+                        "EXPLAIN ANALYZE is not supported yet",
+                    ));
+                }
+                let Some(inner) =
+                    bind_dml_with_params(&catalog, &type_catalog, statement, params)?
+                else {
+                    return Err(PgError::feature_not_supported(format!(
+                        "EXPLAIN of {} is not supported yet",
+                        statement_kind(statement)
+                    )));
+                };
+                let plan = crabgresql_planner::plan(inner);
+                let rows: Vec<Vec<BoundExpr>> = crabgresql_planner::explain(&plan)
+                    .into_iter()
+                    .map(|line| {
+                        vec![BoundExpr::Const {
+                            value: Value::Text(line),
+                            ty: PgType::Text,
+                        }]
+                    })
+                    .collect();
+                let node: Box<dyn ExecNode> =
+                    Box::new(Values::new(rows, session.exec_context()));
+                return Ok(QueryResult::Rows {
+                    columns: vec![OutputColumn {
+                        name: "QUERY PLAN".to_string(),
+                        ty: PgType::Text,
+                    }],
+                    node,
+                });
             }
             other => {
                 return Err(PgError::feature_not_supported(format!(

@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::{
-    Column, DeleteResult, TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
+    Column, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableAm,
+    TableEngine, TableSchema, Tid, Tuple, UpdateResult,
 };
 use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -509,5 +510,47 @@ fn drop_table_unlinks_file_and_frees_name() -> anyhow::Result<()> {
     let rows: Vec<Value> = t2.scan(&read(&h.tm)).map(|(_, t)| t[0].clone()).collect();
     assert_eq!(rows, vec![Value::Int4(2)]);
 
+    Ok(())
+}
+
+/// A PRIMARY KEY index on `id` (column 0) named `t_pkey`.
+fn pk_on_id() -> IndexMetadata {
+    IndexMetadata {
+        name: "t_pkey".into(),
+        method: IndexMethod::BTree,
+        keys: vec![IndexKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }],
+        unique: true,
+        nulls_distinct: true,
+        constraint: Some(IndexConstraint::PrimaryKey),
+    }
+}
+
+#[test]
+fn heap_index_lookup_falls_back_to_scan() -> anyhow::Result<()> {
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Text("a".into())]);
+    insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Text("b".into())]);
+    h.engine.create_index("t", pk_on_id())?;
+
+    // The durable heap engine builds no physical index yet, so `index_lookup`
+    // reports "unservable" (None) and the executor falls back to a scan.
+    assert!(
+        table
+            .index_lookup("t_pkey", &[Value::Int4(2)], &read(&h.tm))
+            .is_none()
+    );
+
+    // The fallback scan + key filter finds exactly the row an index probe would.
+    let rows: Vec<Tuple> = table
+        .scan(&read(&h.tm))
+        .filter(|(_, t)| t[0] == Value::Int4(2))
+        .map(|(_, t)| t)
+        .collect();
+    assert_eq!(rows, vec![vec![Value::Int4(2), Value::Text("b".into())]]);
     Ok(())
 }
