@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 
 use crate::client::{Client, Field, QueryEvent};
 use crate::format;
-use crate::script::{ScriptItem, lex};
+use crate::script::{ScriptItem, is_copy_from_stdin, lex};
 
 pub struct SuiteConfig {
     /// Directory containing `sql/` and `expected/`.
@@ -151,6 +151,9 @@ fn expected_candidates(regress_dir: &Path, name: &str) -> Vec<PathBuf> {
 async fn run_test(port: u16, sql: &str, statement_timeout: Duration) -> io::Result<String> {
     let mut client = Client::connect(port).await?;
     let mut out = String::new();
+    // A `COPY … FROM STDIN` statement is held here until its `CopyData` payload
+    // arrives (the data lines are lexed after the statement), then run together.
+    let mut pending_copy: Option<String> = None;
     for item in lex(sql) {
         match item {
             ScriptItem::Line(line) => {
@@ -161,7 +164,30 @@ async fn run_test(port: u16, sql: &str, statement_timeout: Duration) -> io::Resu
                 out.push_str(&format::metacommand_stub(&command));
             }
             ScriptItem::Statement(statement) => {
+                // Defer a COPY FROM STDIN: it runs once its data is collected.
+                if is_copy_from_stdin(&statement) {
+                    pending_copy = Some(statement);
+                    continue;
+                }
                 match tokio::time::timeout(statement_timeout, client.simple_query(&statement)).await
+                {
+                    Ok(Ok(events)) => render_events(&mut out, &events, &statement),
+                    Ok(Err(_)) => {
+                        out.push_str("connection to server was lost\n");
+                        break;
+                    }
+                    Err(_) => {
+                        out.push_str("FATAL:  statement timeout in crabgresql regress runner\n");
+                        break;
+                    }
+                }
+            }
+            ScriptItem::CopyData(data) => {
+                let Some(statement) = pending_copy.take() else {
+                    continue;
+                };
+                match tokio::time::timeout(statement_timeout, client.copy_in(&statement, &data))
+                    .await
                 {
                     Ok(Ok(events)) => render_events(&mut out, &events, &statement),
                     Ok(Err(_)) => {

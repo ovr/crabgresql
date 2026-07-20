@@ -361,6 +361,7 @@ name = "crabgresql-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "crabgresql-binder",
  "crabgresql-catalog",
@@ -374,6 +375,7 @@ dependencies = [
  "crabgresql-txn",
  "crabgresql-types",
  "crabgresql-wal",
+ "futures-util",
  "tempfile",
  "tokio",
  "tokio-postgres",

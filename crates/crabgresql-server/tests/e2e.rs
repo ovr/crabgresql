@@ -3248,3 +3248,117 @@ async fn sequence_write_rejected_read_only() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// --------------------------------------------------------------------------
+// COPY ... FROM STDIN
+// --------------------------------------------------------------------------
+
+/// The extended-protocol COPY path (tokio-postgres `copy_in` prepares the
+/// statement, then streams CopyData / CopyDone): rows land with the right types,
+/// NULL (`\N`) and defaults are honored, and the sink reports the row count.
+#[tokio::test]
+async fn copy_in_extended_loads_rows() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int4, b text, c int4 DEFAULT 7)")
+        .await?;
+
+    // Column list omits `c`, which takes its default; `\N` is a SQL NULL.
+    let sink = client
+        .copy_in("COPY t (a, b) FROM STDIN")
+        .await
+        .context("copy_in should enter copy mode")?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"1\thello\n2\t\\N\n")).await?;
+    let count = sink.finish().await?;
+    assert_eq!(count, 2);
+
+    let messages = client
+        .simple_query("SELECT a, b, c FROM t ORDER BY a")
+        .await?;
+    let rows = rows(&messages);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("a"), Some("1"));
+    assert_eq!(rows[0].get("b"), Some("hello"));
+    assert_eq!(rows[0].get("c"), Some("7"));
+    assert_eq!(rows[1].get("a"), Some("2"));
+    assert_eq!(rows[1].get("b"), None); // NULL
+    assert_eq!(rows[1].get("c"), Some("7"));
+    Ok(())
+}
+
+/// CSV format over the extended protocol: quoted fields with `""` doubling and
+/// embedded delimiters, an unquoted empty field as NULL, and HEADER skipping.
+#[tokio::test]
+async fn copy_in_csv_with_header_and_quotes() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE c (a int4, b text)").await?;
+
+    let sink = client
+        .copy_in("COPY c FROM STDIN WITH (FORMAT csv, HEADER)")
+        .await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(
+        b"col_a,col_b\n1,\"a,b\"\n2,\"she \"\"said\"\"\"\n",
+    ))
+    .await?;
+    let count = sink.finish().await?;
+    assert_eq!(count, 2);
+
+    let messages = client.simple_query("SELECT a, b FROM c ORDER BY a").await?;
+    let rows = rows(&messages);
+    assert_eq!(rows[0].get("b"), Some("a,b"));
+    assert_eq!(rows[1].get("b"), Some("she \"said\""));
+    Ok(())
+}
+
+/// A data-type error mid-COPY aborts the whole load (autocommit rollback): the
+/// error surfaces with SQLSTATE 22P02 and no rows are left behind.
+#[tokio::test]
+async fn copy_in_bad_value_aborts_load() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    let sink = client.copy_in("COPY t FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"1\nnot_an_int\n3\n")).await?;
+    let err = sink.finish().await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::INVALID_TEXT_REPRESENTATION
+    );
+
+    // Nothing was committed.
+    let messages = client.simple_query("SELECT count(*) AS n FROM t").await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// COPY into a missing relation errors before entering copy mode (no
+/// CopyInResponse), so the driver surfaces `undefined_table` from `copy_in`.
+#[tokio::test]
+async fn copy_in_missing_table_errors_before_copy_mode() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    let result: Result<tokio_postgres::CopyInSink<bytes::Bytes>, _> =
+        client.copy_in("COPY nope FROM STDIN").await;
+    let err = result
+        .err()
+        .expect("copy_in into a missing table should error");
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::UNDEFINED_TABLE
+    );
+    Ok(())
+}

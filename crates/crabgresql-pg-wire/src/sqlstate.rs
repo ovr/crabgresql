@@ -62,5 +62,10 @@ pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
 pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
 /// `2200H` — a sequence hit its `MINVALUE`/`MAXVALUE` bound with `NO CYCLE`.
 pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
+/// Class 22 — data exception: a COPY data stream that does not match the
+/// expected format (extra/missing columns, unterminated CSV quoting).
+pub const BAD_COPY_FILE_FORMAT: &str = "22P04";
+/// Class 57 — operator intervention: a client-issued CopyFail during COPY FROM.
+pub const QUERY_CANCELED: &str = "57014";
 /// Class 58 — system error: a WAL/data-file I/O failure (e.g. commit fsync).
 pub const IO_ERROR: &str = "58030";

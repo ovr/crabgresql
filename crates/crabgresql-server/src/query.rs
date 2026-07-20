@@ -8,9 +8,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crabgresql_binder::{
-    BoundExpr, LogicalPlan, bind_delete_with_params, bind_insert_with_params,
-    bind_query_with_params, bind_update_with_params, output_columns_of, param_ctx_extended,
-    param_ctx_none, param_types, require_all_resolved, substitute_params,
+    BoundExpr, CopyFromPlan, LogicalPlan, bind_copy_from, bind_delete_with_params,
+    bind_insert_with_params, bind_query_with_params, bind_update_with_params, output_columns_of,
+    param_ctx_extended, param_ctx_none, param_types, require_all_resolved, substitute_params,
 };
 use crabgresql_executor::{DmlVerb, ExecNode, Execution, OutputColumn, Values, execute};
 use crabgresql_parser::ast;
@@ -729,6 +729,91 @@ fn finalize_statement(
         }
     }
     Ok(())
+}
+
+/// Resolve `COPY <table> [(cols)] FROM STDIN` up to the point the connection
+/// can send `CopyInResponse`: bind the target relation, column list, and
+/// text/CSV format, and reject the write in a read-only transaction (25006).
+/// No row data is read here — that streams in over the wire afterwards. Kept
+/// separate from [`execute_statement`] because COPY needs socket access the
+/// pure execute path does not have.
+pub fn prepare_copy_from(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    stmt: &ast::Statement,
+    session: &Session,
+) -> Result<CopyFromPlan, PgError> {
+    let ast::Statement::Copy {
+        source,
+        to,
+        target,
+        options,
+        legacy_options,
+        ..
+    } = stmt
+    else {
+        return Err(PgError::new(
+            sqlstate::INTERNAL_ERROR,
+            "prepare_copy_from called with a non-COPY statement",
+        ));
+    };
+    let (catalog, type_catalog) = bind_catalogs(engine, global_catalog, session);
+    let plan = bind_copy_from(
+        &catalog,
+        &type_catalog,
+        source,
+        *to,
+        target,
+        options,
+        legacy_options,
+    )?;
+    // A COPY FROM is a write: rejected in a READ ONLY transaction, before it
+    // stamps any version. (The table is resolved first, matching DML's 25006
+    // ordering.)
+    if read_only_active(session) {
+        return Err(PgError::new(
+            sqlstate::READ_ONLY_SQL_TRANSACTION,
+            "cannot execute COPY in a read-only transaction",
+        ));
+    }
+    Ok(plan)
+}
+
+/// Execute a bound COPY as an INSERT of the decoded field rows, under a write
+/// transaction, returning the number of rows loaded (the `COPY n` count). Reuses
+/// the same XID/commit lifecycle and constraint checks as an ordinary INSERT.
+pub fn run_copy_insert(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    session: &mut Session,
+    plan: &CopyFromPlan,
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<u64, PgError> {
+    // Turn the decoded rows into an INSERT ... VALUES plan (each field parses via
+    // its column's input function against the resolved type catalog).
+    let (_, type_catalog) = bind_catalogs(engine, global_catalog, session);
+    let logical = plan.build_insert(&type_catalog, rows)?;
+    let txn = build_txn(txnmgr, session, true);
+    let exec = match execute(
+        crabgresql_planner::plan(logical),
+        session.exec_context(),
+        &txn,
+    ) {
+        Ok(exec) => exec,
+        Err(e) => {
+            let _ = finalize_statement(txnmgr, session, &txn, true, false);
+            return Err(e.into());
+        }
+    };
+    finalize_statement(txnmgr, session, &txn, true, true)?;
+    match exec {
+        Execution::Inserted(n) => Ok(n),
+        _ => Err(PgError::new(
+            sqlstate::INTERNAL_ERROR,
+            "COPY produced an unexpected execution result",
+        )),
+    }
 }
 
 /// Map a WAL/commit I/O failure to a SQLSTATE 58030 system error.
