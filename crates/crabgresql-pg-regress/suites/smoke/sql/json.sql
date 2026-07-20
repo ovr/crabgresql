@@ -24,3 +24,7 @@ DROP TABLE jtest;
 SELECT pg_input_is_valid('{"a": 1}', 'json') AS ok,
        pg_input_is_valid('{bad', 'json') AS bad,
        pg_input_is_valid('[1, 2', 'json') AS truncated;
+-- json has no default btree operator class, so it cannot key a unique/primary
+-- index (rejected at DDL rather than crashing at enforcement time)
+CREATE TABLE jbad (j json UNIQUE);
+CREATE TABLE jbad (j json PRIMARY KEY);

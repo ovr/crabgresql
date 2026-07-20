@@ -24,6 +24,10 @@ SELECT 'true'::jsonb::bool AS b,
 -- extracting a scalar of the wrong kind is an error (22023)
 SELECT '"x"'::jsonb::numeric;
 SELECT '[1]'::jsonb::bool;
+-- malformed input: after a comma a key is required (its DETAIL says
+-- "Expected string", not "or }"); a too-large number is a 22003 error
+SELECT '{"a":1,}'::jsonb;
+SELECT '1e1000000'::jsonb;
 -- equality is value-based: 1.0 and 1.00 are equal, and whitespace is irrelevant
 SELECT '[1, 2]'::jsonb = '[1,2]'::jsonb AS eq_ws,
        '1.0'::jsonb = '1.00'::jsonb AS eq_num,

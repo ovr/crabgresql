@@ -384,6 +384,16 @@ impl PgType {
                 | PgType::Numeric
         )
     }
+
+    /// Whether this type has a default B-tree operator class — i.e. it can be
+    /// ordered, so it may key a B-tree / UNIQUE index or a PRIMARY KEY. `json`,
+    /// `point`, and `lseg` have no default ordering in PostgreSQL (and the
+    /// executor's `compare_values` has no arm for them); everything else,
+    /// including user types (enums order by ordinal), does. Must stay in sync
+    /// with `crabgresql_executor::compare_values`.
+    pub fn has_default_btree_opclass(self) -> bool {
+        !matches!(self, PgType::Json | PgType::Point | PgType::Lseg)
+    }
 }
 
 pub use numeric::Numeric;

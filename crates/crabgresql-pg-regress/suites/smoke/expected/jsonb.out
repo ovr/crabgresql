@@ -56,6 +56,17 @@ SELECT '"x"'::jsonb::numeric;
 ERROR:  cannot cast jsonb string to type numeric
 SELECT '[1]'::jsonb::bool;
 ERROR:  cannot cast jsonb array to type boolean
+-- malformed input: after a comma a key is required (its DETAIL says
+-- "Expected string", not "or }"); a too-large number is a 22003 error
+SELECT '{"a":1,}'::jsonb;
+ERROR:  invalid input syntax for type jsonb
+LINE 1: SELECT '{"a":1,}'::jsonb;
+               ^
+DETAIL:  Expected string, but found "}".
+SELECT '1e1000000'::jsonb;
+ERROR:  value overflows numeric format
+LINE 1: SELECT '1e1000000'::jsonb;
+               ^
 -- equality is value-based: 1.0 and 1.00 are equal, and whitespace is irrelevant
 SELECT '[1, 2]'::jsonb = '[1,2]'::jsonb AS eq_ws,
        '1.0'::jsonb = '1.00'::jsonb AS eq_num,

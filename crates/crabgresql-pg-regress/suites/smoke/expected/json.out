@@ -61,3 +61,11 @@ SELECT pg_input_is_valid('{"a": 1}', 'json') AS ok,
  t  | f   | f
 (1 row)
 
+-- json has no default btree operator class, so it cannot key a unique/primary
+-- index (rejected at DDL rather than crashing at enforcement time)
+CREATE TABLE jbad (j json UNIQUE);
+ERROR:  data type json has no default operator class for access method "btree"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+CREATE TABLE jbad (j json PRIMARY KEY);
+ERROR:  data type json has no default operator class for access method "btree"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.

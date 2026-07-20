@@ -28,6 +28,17 @@ use std::cmp::Ordering;
 // crate). Mirrors `crabgresql_pg_wire::sqlstate`.
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 const INVALID_PARAMETER_VALUE: &str = "22023";
+const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
+const UNTRANSLATABLE_CHARACTER: &str = "22P05";
+const PROGRAM_LIMIT_EXCEEDED: &str = "54001";
+
+/// Maximum JSON nesting depth. Bounds every recursion over a [`Jsonb`] value —
+/// parsing, `Drop`, [`format`], and [`cmp`] — so a pathologically nested literal
+/// returns a controlled error instead of overflowing the ~2 MB worker-thread
+/// stack (measured ~2 KB/level while parsing, so this keeps the deepest
+/// recursion under ~1/4 of the stack). Far exceeds any real document; PG relies
+/// on the configurable `check_stack_depth()` for the same protection.
+const MAX_DEPTH: usize = 200;
 
 /// A parsed, canonical `jsonb` value. Object keys are sorted (shorter first,
 /// then byte order) with duplicates removed keeping the last value; numbers are
@@ -90,6 +101,8 @@ fn parse_tree(s: &str, type_name: &str) -> Result<Jsonb, JsonError> {
         bytes: s.as_bytes(),
         pos: 0,
         type_name,
+        is_jsonb: type_name == "jsonb",
+        depth: 0,
     };
     p.skip_ws();
     if p.pos >= p.bytes.len() {
@@ -111,11 +124,25 @@ struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
     type_name: &'a str,
+    /// Whether the target is `jsonb` (which rejects ``) vs `json`.
+    is_jsonb: bool,
+    /// Current container nesting depth, bounded by [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl Parser<'_> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
+    }
+
+    /// `stack depth limit exceeded` (54001), returned instead of overflowing the
+    /// stack on deeply nested input (PG's `check_stack_depth` equivalent).
+    fn too_deep(&self) -> JsonError {
+        JsonError {
+            sqlstate: PROGRAM_LIMIT_EXCEEDED,
+            message: "stack depth limit exceeded".to_string(),
+            detail: None,
+        }
     }
 
     fn skip_ws(&mut self) {
@@ -135,26 +162,57 @@ impl Parser<'_> {
         )
     }
 
-    /// The "token" starting at the cursor, for error messages: a run up to the
-    /// next whitespace or structural character. Used to fill PG's `"%s"` slots.
+    /// The "token" at the cursor, for error messages (PG's `"%s"` slots): a
+    /// structural character is a one-char token; otherwise it is the run up to
+    /// the next whitespace or structural character.
     fn token_at(&self) -> String {
-        let start = self.pos;
-        let mut end = start;
-        while let Some(b) = self.bytes.get(end) {
-            if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b':' | b'{' | b'}' | b'[' | b']') {
-                break;
+        self.token_from(self.pos)
+    }
+
+    /// [`token_at`](Self::token_at), but from an explicit start offset (used when
+    /// a number token has already advanced the cursor past its start).
+    fn token_from(&self, start: usize) -> String {
+        match self.bytes.get(start).copied() {
+            None => String::new(),
+            Some(b) if is_structural(b) => (b as char).to_string(),
+            Some(_) => {
+                let mut end = start;
+                while let Some(&b) = self.bytes.get(end) {
+                    if b.is_ascii_whitespace() || is_structural(b) {
+                        break;
+                    }
+                    end += 1;
+                }
+                String::from_utf8_lossy(&self.bytes[start..end]).into_owned()
             }
-            end += 1;
         }
-        String::from_utf8_lossy(&self.bytes[start..end]).into_owned()
     }
 
     fn parse_value(&mut self) -> Result<Jsonb, JsonError> {
         self.skip_ws();
         match self.peek() {
             None => Err(self.ended()),
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
+            // Containers recurse: bound the depth so nesting cannot overflow the
+            // stack. Decrement on the way back up (the whole parse aborts on the
+            // error path, so no cleanup is needed there).
+            Some(b'{') => {
+                self.depth += 1;
+                if self.depth > MAX_DEPTH {
+                    return Err(self.too_deep());
+                }
+                let r = self.parse_object();
+                self.depth -= 1;
+                r
+            }
+            Some(b'[') => {
+                self.depth += 1;
+                if self.depth > MAX_DEPTH {
+                    return Err(self.too_deep());
+                }
+                let r = self.parse_array();
+                self.depth -= 1;
+                r
+            }
             Some(b'"') => Ok(Jsonb::String(self.parse_string()?)),
             Some(b'-' | b'0'..=b'9') => Ok(Jsonb::Number(self.parse_number()?)),
             Some(b't') => self.parse_keyword("true", Jsonb::Bool(true)),
@@ -211,13 +269,19 @@ impl Parser<'_> {
             self.pos += 1;
             return Ok(Jsonb::Object(pairs));
         }
+        // `first` is only true for the key right after `{`; there a bare `}`
+        // would have been consumed above, so the "expected key" error offers
+        // `}` as an alternative. After a comma PG expects a key only.
+        let mut first = true;
         loop {
             self.skip_ws();
             if self.peek() != Some(b'"') {
                 let detail = if self.peek().is_none() {
                     "The input string ended unexpectedly.".to_string()
-                } else {
+                } else if first {
                     format!("Expected string or \"}}\", but found \"{}\".", self.token_at())
+                } else {
+                    format!("Expected string, but found \"{}\".", self.token_at())
                 };
                 return Err(JsonError::syntax(self.type_name, detail));
             }
@@ -233,11 +297,12 @@ impl Parser<'_> {
             }
             self.pos += 1; // consume ':'
             let value = self.parse_value()?;
-            insert_last_wins(&mut pairs, key, value);
+            pairs.push((key, value));
             self.skip_ws();
             match self.peek() {
                 Some(b',') => {
                     self.pos += 1;
+                    first = false;
                 }
                 Some(b'}') => {
                     self.pos += 1;
@@ -252,8 +317,7 @@ impl Parser<'_> {
                 }
             }
         }
-        pairs.sort_by(|a, b| key_cmp(&a.0, &b.0));
-        Ok(Jsonb::Object(pairs))
+        Ok(Jsonb::Object(canonicalize_object(pairs)))
     }
 
     /// Parse a JSON string literal (cursor at the opening `"`), decoding escapes.
@@ -279,12 +343,17 @@ impl Parser<'_> {
                     ));
                 }
                 Some(_) => {
-                    // Copy one UTF-8 scalar. Find its byte length from the lead
-                    // byte; the input is valid UTF-8 (it came from a &str).
-                    let len = utf8_len(self.bytes[self.pos]);
-                    let end = (self.pos + len).min(self.bytes.len());
-                    out.push_str(&String::from_utf8_lossy(&self.bytes[self.pos..end]));
-                    self.pos = end;
+                    // Copy the whole run of ordinary bytes (no quote, backslash,
+                    // or control char) in one shot. The bytes came from a valid
+                    // `&str`, so the run is on char boundaries and is valid UTF-8.
+                    let start = self.pos;
+                    while let Some(c) = self.peek() {
+                        if c == b'"' || c == b'\\' || c < 0x20 {
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                    out.push_str(std::str::from_utf8(&self.bytes[start..self.pos]).unwrap_or(""));
                 }
             }
         }
@@ -305,23 +374,34 @@ impl Parser<'_> {
             b'u' => {
                 let cp = self.parse_hex4()?;
                 if (0xD800..=0xDBFF).contains(&cp) {
-                    // High surrogate: must be followed by \uDC00..DFFF.
+                    // High surrogate: must be followed by a \uDC00..DFFF low
+                    // surrogate to form a pair.
                     if self.peek() == Some(b'\\') && self.bytes.get(self.pos + 1) == Some(&b'u') {
                         self.pos += 2;
                         let lo = self.parse_hex4()?;
                         if (0xDC00..=0xDFFF).contains(&lo) {
                             let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                             out.push(char::from_u32(c).unwrap_or('\u{fffd}'));
+                        } else if (0xD800..=0xDBFF).contains(&lo) {
+                            return Err(self.bad_escape(
+                                "Unicode high surrogate must not follow a high surrogate.",
+                            ));
                         } else {
-                            return Err(self.bad_escape("Unicode low surrogate must follow a high surrogate."));
+                            return Err(self.bad_escape(
+                                "Unicode low surrogate must follow a high surrogate.",
+                            ));
                         }
                     } else {
-                        return Err(self.bad_escape("Unicode low surrogate must follow a high surrogate."));
+                        return Err(
+                            self.bad_escape("Unicode low surrogate must follow a high surrogate.")
+                        );
                     }
                 } else if (0xDC00..=0xDFFF).contains(&cp) {
-                    return Err(self.bad_escape("Unicode low surrogate must follow a high surrogate."));
+                    return Err(
+                        self.bad_escape("Unicode low surrogate must follow a high surrogate.")
+                    );
                 } else {
-                    out.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+                    self.emit_codepoint(out, cp)?;
                 }
             }
             other => {
@@ -336,6 +416,22 @@ impl Parser<'_> {
 
     fn bad_escape(&self, detail: impl Into<String>) -> JsonError {
         JsonError::syntax(self.type_name, detail)
+    }
+
+    /// Push a decoded Unicode scalar. `jsonb` cannot store a NUL (it is a text
+    /// datum), so a `\u0000` escape is rejected there with PG's wording. `json`
+    /// validates through the same parser but keeps the raw input text, so it
+    /// accepts the escape (`is_jsonb` is false).
+    fn emit_codepoint(&self, out: &mut String, cp: u32) -> Result<(), JsonError> {
+        if cp == 0 && self.is_jsonb {
+            return Err(JsonError {
+                sqlstate: UNTRANSLATABLE_CHARACTER,
+                message: "unsupported Unicode escape sequence".to_string(),
+                detail: Some("\\u0000 cannot be converted to text.".to_string()),
+            });
+        }
+        out.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+        Ok(())
     }
 
     fn parse_hex4(&mut self) -> Result<u32, JsonError> {
@@ -404,46 +500,44 @@ impl Parser<'_> {
         let text = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap_or("");
         Numeric::parse(text).map_err(|e| match e {
             ParseError::Syntax => self.invalid_token_from(start),
-            ParseError::Overflow => JsonError::syntax(self.type_name, "value overflows numeric format"),
+            // A magnitude too large for `numeric` is PG's `numeric_in` error,
+            // surfaced verbatim (22003), not a JSON syntax error.
+            ParseError::Overflow => JsonError {
+                sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
+                message: "value overflows numeric format".to_string(),
+                detail: None,
+            },
         })
     }
 
     fn invalid_token_from(&self, start: usize) -> JsonError {
-        let end = self.bytes[start..]
-            .iter()
-            .position(|b| {
-                matches!(
-                    b,
-                    b' ' | b'\t' | b'\n' | b'\r' | b',' | b':' | b'{' | b'}' | b'[' | b']'
-                )
-            })
-            .map(|i| start + i)
-            .unwrap_or(self.bytes.len());
-        let tok = String::from_utf8_lossy(&self.bytes[start..end.max(self.pos)]);
-        JsonError::syntax(self.type_name, format!("Token \"{tok}\" is invalid."))
+        JsonError::syntax(
+            self.type_name,
+            format!("Token \"{}\" is invalid.", self.token_from(start)),
+        )
     }
 }
 
-fn utf8_len(lead: u8) -> usize {
-    if lead < 0x80 {
-        1
-    } else if lead >> 5 == 0b110 {
-        2
-    } else if lead >> 4 == 0b1110 {
-        3
-    } else {
-        4
-    }
+/// The JSON structural characters, which are one-character tokens.
+fn is_structural(b: u8) -> bool {
+    matches!(b, b',' | b':' | b'{' | b'}' | b'[' | b']')
 }
 
-/// Insert `(key, value)` keeping the **last** occurrence of a duplicate key,
-/// matching jsonb object semantics.
-fn insert_last_wins(pairs: &mut Vec<(String, Jsonb)>, key: String, value: Jsonb) {
-    if let Some(slot) = pairs.iter_mut().find(|(k, _)| *k == key) {
-        slot.1 = value;
-    } else {
-        pairs.push((key, value));
+/// Canonicalize an object's pairs (in input order): drop duplicate keys keeping
+/// the **last** occurrence (jsonb semantics), then sort by [`key_cmp`]. Runs in
+/// O(n log n) — a duplicate-key scan per insertion would be O(n²).
+fn canonicalize_object(mut pairs: Vec<(String, Jsonb)>) -> Vec<(String, Jsonb)> {
+    if pairs.len() > 1 {
+        // Reverse so the last occurrence of each key comes first, then keep the
+        // first-seen (i.e. last-in-input) via a set of retained keys.
+        pairs.reverse();
+        let mut seen = std::collections::HashSet::with_capacity(pairs.len());
+        pairs.retain(|(k, _)| seen.insert(k.clone()));
     }
+    // key_cmp is a total order over distinct keys, so the sort is deterministic
+    // regardless of the retained (reversed) order above.
+    pairs.sort_by(|a, b| key_cmp(&a.0, &b.0));
+    pairs
 }
 
 /// jsonb object-key order: shorter keys sort first, then plain byte order. This
@@ -694,6 +788,56 @@ mod tests {
         assert!(jsonb_in("").is_err());
         assert!(jsonb_in("{\"a\" 1}").is_err());
         assert!(jsonb_in("truefoo").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn deep_nesting_errors_instead_of_overflowing() {
+        // Just past the limit returns a controlled 54001 error, not a crash.
+        let deep = "[".repeat(MAX_DEPTH + 5) + &"]".repeat(MAX_DEPTH + 5);
+        let err = jsonb_in(&deep).unwrap_err();
+        assert_eq!(err.sqlstate, PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(err.message, "stack depth limit exceeded");
+        // A document nested right up to the limit still parses.
+        let ok = "[".repeat(MAX_DEPTH) + &"]".repeat(MAX_DEPTH);
+        assert!(jsonb_in(&ok).is_ok());
+    }
+
+    #[test]
+    fn jsonb_rejects_nul_escape_but_json_keeps_it() {
+        let err = jsonb_in("\"\\u0000\"").unwrap_err();
+        assert_eq!(err.sqlstate, UNTRANSLATABLE_CHARACTER);
+        assert_eq!(err.message, "unsupported Unicode escape sequence");
+        assert_eq!(err.detail.as_deref(), Some("\\u0000 cannot be converted to text."));
+        // `json` preserves the raw text verbatim.
+        assert_eq!(json_in("\"\\u0000\"").unwrap(), "\"\\u0000\"");
+    }
+
+    #[test]
+    fn numeric_overflow_is_out_of_range() {
+        let err = jsonb_in("1e1000000").unwrap_err();
+        assert_eq!(err.sqlstate, NUMERIC_VALUE_OUT_OF_RANGE);
+        assert_eq!(err.message, "value overflows numeric format");
+    }
+
+    #[test]
+    fn object_error_detail_matches_pg_position() {
+        // After a comma only a key is valid (no "or }").
+        let err = jsonb_in("{\"a\":1,}").unwrap_err();
+        assert_eq!(err.detail.as_deref(), Some("Expected string, but found \"}\"."));
+        // At the first key, "}" is offered as an alternative.
+        let err = jsonb_in("{,}").unwrap_err();
+        assert_eq!(err.detail.as_deref(), Some("Expected string or \"}\", but found \",\"."));
+        // Two high surrogates in a row is a distinct message.
+        let err = jsonb_in("\"\\ud800\\ud800\"").unwrap_err();
+        assert_eq!(err.detail.as_deref(), Some("Unicode high surrogate must not follow a high surrogate."));
+    }
+
+    #[test]
+    fn canonicalize_dedups_last_wins_at_scale() -> Result<()> {
+        // Exercises the O(n log n) canonicalizer with duplicate keys.
+        let obj = "{\"a\":1,\"b\":2,\"a\":3,\"c\":4,\"b\":5}";
+        assert_eq!(out(obj)?, "{\"a\": 3, \"b\": 5, \"c\": 4}");
         Ok(())
     }
 }

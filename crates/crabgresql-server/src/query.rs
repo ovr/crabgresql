@@ -1633,6 +1633,24 @@ fn simple_index_keys(
                 format!("column \"{ident}\" named in key does not exist"),
             )
         })?;
+        // A B-tree / UNIQUE index (and PRIMARY KEY) needs an ordering. Types with
+        // no default B-tree operator class (`json`, `point`, `lseg`) are rejected
+        // here, matching PostgreSQL — otherwise unique enforcement would later
+        // call `compare_values` on an unorderable type and panic the backend.
+        let ty = schema.columns[column].ty;
+        if !ty.has_default_btree_opclass() {
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!(
+                    "data type {} has no default operator class for access method \"btree\"",
+                    ty.name()
+                ),
+            )
+            .with_hint(
+                "You must specify an operator class for the index or define a \
+                 default operator class for the data type.",
+            ));
+        }
         keys.push(IndexKey {
             column,
             descending: col.column.options.asc == Some(false),
