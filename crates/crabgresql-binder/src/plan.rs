@@ -141,17 +141,34 @@ pub enum LogicalPlan {
     Insert {
         table: Arc<dyn TableAm>,
         rows: Vec<Vec<BoundExpr>>,
+        /// `RETURNING`: a projection over each inserted row, bound against the
+        /// table schema. `None` when the clause is absent.
+        returning: Option<Returning>,
     },
     Update {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         /// (column index, value expression bound against the OLD row).
         assignments: Vec<(usize, BoundExpr)>,
+        /// `RETURNING`: a projection over each updated (NEW) row.
+        returning: Option<Returning>,
     },
     Delete {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
+        /// `RETURNING`: a projection over each deleted (OLD) row.
+        returning: Option<Returning>,
     },
+}
+
+/// A bound `RETURNING` target list: the output column shape plus one expression
+/// per output column, evaluated against each affected row (the NEW row for
+/// INSERT/UPDATE, the deleted row for DELETE). Same shape as a SELECT
+/// projection.
+#[derive(Clone)]
+pub struct Returning {
+    pub columns: Vec<OutputColumn>,
+    pub projections: Vec<BoundExpr>,
 }
 
 /// One row source feeding a [`LogicalPlan::Join`]: a base table scan, a
@@ -404,22 +421,40 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
             subst_opt(having, params);
             subst_exprs(projections, params);
         }
-        LogicalPlan::Insert { rows, .. } => {
+        LogicalPlan::Insert {
+            rows, returning, ..
+        } => {
             for row in rows {
                 subst_exprs(row, params);
             }
+            subst_returning(returning, params);
         }
         LogicalPlan::Update {
             predicate,
             assignments,
+            returning,
             ..
         } => {
             subst_opt(predicate, params);
             for (_, expr) in assignments {
                 subst_expr(expr, params);
             }
+            subst_returning(returning, params);
         }
-        LogicalPlan::Delete { predicate, .. } => subst_opt(predicate, params),
+        LogicalPlan::Delete {
+            predicate,
+            returning,
+            ..
+        } => {
+            subst_opt(predicate, params);
+            subst_returning(returning, params);
+        }
+    }
+}
+
+fn subst_returning(returning: &mut Option<Returning>, params: &[Value]) {
+    if let Some(returning) = returning {
+        subst_exprs(&mut returning.projections, params);
     }
 }
 
@@ -1509,11 +1544,14 @@ pub fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindEr
         | LogicalPlan::Join { columns, .. } => Ok(columns.clone()),
         // LIMIT/OFFSET is a transparent wrapper: it exposes its source's columns.
         LogicalPlan::Limit { source, .. } => output_columns_of(source),
-        LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => {
-            Err(BindError::feature_not_supported(
+        LogicalPlan::Insert { returning, .. }
+        | LogicalPlan::Update { returning, .. }
+        | LogicalPlan::Delete { returning, .. } => match returning {
+            Some(returning) => Ok(returning.columns.clone()),
+            None => Err(BindError::feature_not_supported(
                 "data-modifying statements in WITH are not supported yet",
-            ))
-        }
+            )),
+        },
     }
 }
 
@@ -1951,14 +1989,16 @@ struct Aggregation {
 /// relation(s). One relation for a single-table SELECT / subquery / SRF, more
 /// for a cross join — `scope` handles wildcard expansion and column resolution
 /// uniformly across however many relations it holds.
-fn bind_select_body(
-    select: &ast::Select,
-    order_by: &Option<ast::OrderBy>,
+/// Bind a target list (a SELECT projection or a `RETURNING` list) against
+/// `scope`, expanding `*`/`t.*` and naming each output column by its alias or
+/// derived name. Shared by SELECT and RETURNING, which have identical shape.
+fn bind_target_list(
+    items: &[ast::SelectItem],
     scope: &Scope,
-) -> Result<SelectBody, BindError> {
+) -> Result<Returning, BindError> {
     let mut columns = Vec::new();
     let mut projections = Vec::new();
-    for item in &select.projection {
+    for item in items {
         match classify_select_item(item)? {
             SelectField::Wildcard => {
                 for (col, expr) in scope.expand_wildcard() {
@@ -1983,6 +2023,52 @@ fn bind_select_body(
             }
         }
     }
+    Ok(Returning {
+        columns,
+        projections,
+    })
+}
+
+/// Bind an optional `RETURNING` clause against the target table's `scope`.
+///
+/// Unlike a SELECT target list, RETURNING is not an aggregation/SRF context:
+/// PostgreSQL rejects aggregate and set-returning functions here at bind time
+/// (there is no aggregate/ProjectSet plan node above a data-modifying
+/// statement to consume them), so reject them with PG's SQLSTATE and wording.
+fn bind_returning(
+    returning: &Option<Vec<ast::SelectItem>>,
+    scope: &Scope,
+) -> Result<Option<Returning>, BindError> {
+    let Some(items) = returning else {
+        return Ok(None);
+    };
+    let bound = bind_target_list(items, scope)?;
+    for projection in &bound.projections {
+        if projection.contains_aggregate() {
+            return Err(BindError::new(
+                sqlstate::GROUPING_ERROR,
+                "aggregate functions are not allowed in RETURNING",
+            ));
+        }
+        if projection.contains_srf() {
+            return Err(BindError::new(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "set-returning functions are not allowed in RETURNING",
+            ));
+        }
+    }
+    Ok(Some(bound))
+}
+
+fn bind_select_body(
+    select: &ast::Select,
+    order_by: &Option<ast::OrderBy>,
+    scope: &Scope,
+) -> Result<SelectBody, BindError> {
+    let Returning {
+        columns,
+        mut projections,
+    } = bind_target_list(&select.projection, scope)?;
 
     let predicate = bind_where(&select.selection, scope)?;
     let sort = bind_order_by(order_by, &columns, scope, &mut projections, true)?;
@@ -2401,11 +2487,6 @@ pub fn bind_insert_with_params(
             )));
         }
     };
-    if insert.returning.is_some() {
-        return Err(BindError::feature_not_supported(
-            "RETURNING is not supported yet",
-        ));
-    }
     if insert.on.is_some() {
         return Err(BindError::feature_not_supported(
             "ON CONFLICT is not supported yet",
@@ -2529,7 +2610,19 @@ pub fn bind_insert_with_params(
         rows.push(row);
     }
 
-    Ok(LogicalPlan::Insert { table, rows })
+    // RETURNING references the inserted row's columns, addressed by the table
+    // name (INSERT takes no alias). Its VALUES bound in the empty scope, so this
+    // needs a fresh table scope.
+    let returning = bind_returning(
+        &insert.returning,
+        &Scope::table(&schema, name, catalog, params),
+    )?;
+
+    Ok(LogicalPlan::Insert {
+        table,
+        rows,
+        returning,
+    })
 }
 
 pub fn bind_update(
@@ -2550,8 +2643,6 @@ pub fn bind_update_with_params(
 ) -> Result<LogicalPlan, BindError> {
     let unsupported: Option<&str> = if update.from.is_some() {
         Some("UPDATE ... FROM")
-    } else if update.returning.is_some() {
-        Some("RETURNING")
     } else if update.or.is_some()
         || update.output.is_some()
         || !update.order_by.is_empty()
@@ -2608,10 +2699,14 @@ pub fn bind_update_with_params(
     }
 
     let predicate = bind_where(&update.selection, &scope)?;
+    // RETURNING references the NEW row (post-update), which the executor feeds
+    // in schema order — the same scope the SET/WHERE clauses bound against.
+    let returning = bind_returning(&update.returning, &scope)?;
     Ok(LogicalPlan::Update {
         table,
         predicate,
         assignments,
+        returning,
     })
 }
 
@@ -2635,8 +2730,6 @@ pub fn bind_delete_with_params(
         Some("multi-table DELETE")
     } else if delete.using.is_some() {
         Some("DELETE ... USING")
-    } else if delete.returning.is_some() {
-        Some("RETURNING")
     } else if delete.output.is_some() || !delete.order_by.is_empty() || delete.limit.is_some() {
         Some("this DELETE form")
     } else {
@@ -2665,7 +2758,13 @@ pub fn bind_delete_with_params(
     let schema = table.schema().clone();
     let scope = Scope::table(&schema, qualifier, catalog, params);
     let predicate = bind_where(&delete.selection, &scope)?;
-    Ok(LogicalPlan::Delete { table, predicate })
+    // RETURNING references the deleted (OLD) row, which the executor feeds.
+    let returning = bind_returning(&delete.returning, &scope)?;
+    Ok(LogicalPlan::Delete {
+        table,
+        predicate,
+        returning,
+    })
 }
 
 #[cfg(test)]
@@ -3489,10 +3588,7 @@ mod tests {
     fn unsupported_forms_stay_0a000() {
         for sql in [
             "UPDATE t SET (id, name) = (1, 'x')",
-            "UPDATE t SET id = 1 RETURNING id",
             "DELETE FROM t USING t AS u",
-            "DELETE FROM t RETURNING id",
-            "INSERT INTO t (id) VALUES (1) RETURNING id",
             // The INSERT source is a full query in PG: silently dropping its
             // clauses would insert the wrong rows.
             "INSERT INTO t (id) VALUES (1), (2) LIMIT 1",
@@ -3519,6 +3615,69 @@ mod tests {
         assert!(bind_one("UPDATE t SET id = DEFAULT").is_ok());
 
         Ok(())
+    }
+
+    #[test]
+    fn returning_binds_output_columns_for_each_dml() -> anyhow::Result<()> {
+        // INSERT: `*` expands the whole table, a computed column carries an alias.
+        let insert = bound("INSERT INTO t (id) VALUES (1) RETURNING *, id + 1 AS next");
+        let LogicalPlan::Insert {
+            returning: Some(_), ..
+        } = &insert
+        else {
+            panic!("expected Insert with RETURNING");
+        };
+        let cols = output_columns_of(&insert)?;
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "big", "name", "flag", "next"]);
+        assert_eq!(cols.last().unwrap().ty, PgType::Int4);
+
+        // UPDATE and DELETE report their RETURNING columns too (used by Describe).
+        let update = bound("UPDATE t SET id = 1 RETURNING id, name");
+        assert!(matches!(
+            update,
+            LogicalPlan::Update {
+                returning: Some(_),
+                ..
+            }
+        ));
+        let names: Vec<String> = output_columns_of(&update)?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["id", "name"]);
+
+        let delete = bound("DELETE FROM t RETURNING name, id");
+        let names: Vec<String> = output_columns_of(&delete)?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["name", "id"]);
+
+        // A RETURNING expression over an unknown column still errors.
+        assert_eq!(bind_err("DELETE FROM t RETURNING nope").code, "42703");
+
+        Ok(())
+    }
+
+    #[test]
+    fn returning_rejects_aggregates_and_set_returning_functions() {
+        // PostgreSQL rejects both at bind time (no aggregate/ProjectSet node
+        // exists above a data-modifying statement to consume them).
+        let agg = bind_err("UPDATE t SET id = 1 RETURNING count(*)");
+        assert_eq!(agg.code, "42803");
+        assert_eq!(
+            agg.message,
+            "aggregate functions are not allowed in RETURNING"
+        );
+        assert_eq!(bind_err("DELETE FROM t RETURNING max(id)").code, "42803");
+
+        let srf = bind_err("INSERT INTO t (id) VALUES (1) RETURNING generate_series(1, id)");
+        assert_eq!(srf.code, "0A000");
+        assert_eq!(
+            srf.message,
+            "set-returning functions are not allowed in RETURNING"
+        );
     }
 
     #[test]

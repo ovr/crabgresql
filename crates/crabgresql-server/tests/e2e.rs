@@ -222,6 +222,123 @@ async fn information_schema_reflects_live_relations_and_session_identity() -> an
     Ok(())
 }
 
+#[tokio::test]
+async fn dml_returning_streams_affected_rows() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE crabs (id integer, name text)")
+        .await?;
+
+    // INSERT ... RETURNING streams the inserted rows (with a computed column)
+    // and still reports the INSERT row count.
+    let messages = client
+        .simple_query(
+            "INSERT INTO crabs VALUES (1, 'ferris'), (2, 'hermit') RETURNING id, name, id + 10 AS bumped",
+        )
+        .await?;
+    let inserted = rows(&messages);
+    assert_eq!(inserted.len(), 2);
+    assert_eq!(inserted[0].get(0), Some("1"));
+    assert_eq!(inserted[0].get(1), Some("ferris"));
+    assert_eq!(inserted[0].get(2), Some("11"));
+    assert_eq!(inserted[1].get(2), Some("12"));
+    let count = messages.iter().find_map(|m| match m {
+        SimpleQueryMessage::CommandComplete(n) => Some(*n),
+        _ => None,
+    });
+    assert_eq!(count, Some(2));
+
+    // UPDATE ... RETURNING returns the NEW rows.
+    let messages = client
+        .simple_query("UPDATE crabs SET name = 'crab' WHERE id = 1 RETURNING id, name")
+        .await?;
+    let updated = rows(&messages);
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].get(0), Some("1"));
+    assert_eq!(updated[0].get(1), Some("crab"));
+
+    // DELETE ... RETURNING returns the deleted (OLD) rows, columns reordered
+    // (name, id). Storage scan order is unspecified, so compare as a set.
+    let messages = client
+        .simple_query("DELETE FROM crabs RETURNING name, id")
+        .await?;
+    let mut deleted: Vec<(Option<&str>, Option<&str>)> =
+        rows(&messages).iter().map(|r| (r.get(0), r.get(1))).collect();
+    deleted.sort();
+    assert_eq!(
+        deleted,
+        vec![(Some("crab"), Some("1")), (Some("hermit"), Some("2"))]
+    );
+    let count = messages.iter().find_map(|m| match m {
+        SimpleQueryMessage::CommandComplete(n) => Some(*n),
+        _ => None,
+    });
+    assert_eq!(count, Some(2));
+
+    // The table is now empty.
+    assert!(rows(&client.simple_query("SELECT id FROM crabs").await?).is_empty());
+
+    Ok(())
+}
+
+/// A RETURNING expression that faults at runtime must abort the whole statement,
+/// leaving the mutation rolled back — the projection runs before the commit.
+#[tokio::test]
+async fn dml_returning_faulting_expression_rolls_back_the_mutation() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id integer)").await?;
+    client.simple_query("INSERT INTO t VALUES (5)").await?;
+
+    // INSERT: division by zero in RETURNING must insert nothing.
+    let err = client
+        .simple_query("INSERT INTO t (id) VALUES (0) RETURNING 100/id")
+        .await
+        .expect_err("expected a division-by-zero error");
+    assert_eq!(err.code(), Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO));
+    let after_insert = client.simple_query("SELECT id FROM t").await?;
+    assert_eq!(
+        rows(&after_insert).len(),
+        1,
+        "the failed INSERT must not persist a row"
+    );
+
+    // DELETE: same faulting RETURNING must delete nothing.
+    client
+        .simple_query("DELETE FROM t RETURNING 100/(id-5)")
+        .await
+        .expect_err("expected a division-by-zero error");
+    let after_delete = client.simple_query("SELECT id FROM t").await?;
+    assert_eq!(
+        rows(&after_delete).len(),
+        1,
+        "the failed DELETE must not remove the row"
+    );
+
+    Ok(())
+}
+
+/// The extended protocol: a prepared `INSERT ... RETURNING` reports its result
+/// column shape at Describe and streams rows at Execute via `query`.
+#[tokio::test]
+async fn dml_returning_extended_protocol() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id integer, label text)")
+        .await?;
+
+    let returned = client
+        .query(
+            "INSERT INTO t VALUES ($1, $2) RETURNING id, label",
+            &[&7i32, &"seven"],
+        )
+        .await?;
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].get::<_, i32>("id"), 7);
+    assert_eq!(returned[0].get::<_, &str>("label"), "seven");
+
+    Ok(())
+}
+
 fn rows(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> {
     messages
         .iter()

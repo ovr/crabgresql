@@ -12,7 +12,7 @@ use crabgresql_binder::{
     bind_query_with_params, bind_update_with_params, output_columns_of, param_ctx_extended,
     param_ctx_none, param_types, require_all_resolved, substitute_params,
 };
-use crabgresql_executor::{ExecNode, Execution, OutputColumn, Values, execute};
+use crabgresql_executor::{DmlVerb, ExecNode, Execution, OutputColumn, Values, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
@@ -76,17 +76,53 @@ impl Notice {
 }
 
 pub enum QueryResult {
-    /// A result set, streamed: the caller pulls tuples from the node and
-    /// derives the `SELECT n` tag from the row count.
+    /// A result set, streamed: the caller pulls tuples from the node and derives
+    /// the CommandComplete tag from `tag` and the row count.
     Rows {
         columns: Vec<OutputColumn>,
         node: Box<dyn ExecNode>,
+        /// Which command tag to report once the rows are drained. A plain SELECT
+        /// (and EXPLAIN) uses `SELECT n`; a `RETURNING` DML keeps its mutation
+        /// tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`).
+        tag: RowTag,
     },
     Command {
         tag: String,
         /// Warnings to emit before the CommandComplete, in order.
         notices: Vec<Notice>,
     },
+}
+
+/// The CommandComplete tag family for a streamed result set. The row count is
+/// filled in once the rows are drained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowTag {
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl RowTag {
+    /// The CommandComplete tag for `count` streamed rows.
+    pub fn complete(self, count: usize) -> String {
+        match self {
+            RowTag::Select => format!("SELECT {count}"),
+            RowTag::Insert => format!("INSERT 0 {count}"),
+            RowTag::Update => format!("UPDATE {count}"),
+            RowTag::Delete => format!("DELETE {count}"),
+        }
+    }
+}
+
+impl From<DmlVerb> for RowTag {
+    fn from(verb: DmlVerb) -> Self {
+        match verb {
+            DmlVerb::Insert => RowTag::Insert,
+            DmlVerb::Update => RowTag::Update,
+            DmlVerb::Delete => RowTag::Delete,
+        }
+    }
 }
 
 impl QueryResult {
@@ -317,8 +353,10 @@ pub fn analyze_statement(
     // to that count during binding, and `require_all_resolved` proved each is
     // `Some`.
     let param_types = param_types(&ctx).into_iter().flatten().collect();
-    // A DQL plan has a row shape; a data-modifying plan does not (no RETURNING),
-    // which `output_columns_of` reports as an error we fold to `None` (NoData).
+    // A plan with a row shape (a DQL query, or a data-modifying statement with a
+    // RETURNING clause) reports its columns; a data-modifying plan without
+    // RETURNING makes `output_columns_of` return an error we fold to `None`
+    // (NoData).
     let result_columns = output_columns_of(&logical).ok();
     Ok(Analyzed {
         param_types,
@@ -485,6 +523,7 @@ pub fn execute_statement(
                         ty: PgType::Text,
                     }],
                     node,
+                    tag: RowTag::Select,
                 });
             }
             other => {
@@ -532,7 +571,20 @@ pub fn execute_statement(
     };
     finalize_statement(txnmgr, session, &txn, is_write, true)?;
     let result = match exec {
-        Execution::Rows { columns, node } => QueryResult::Rows { columns, node },
+        Execution::Rows { columns, node } => QueryResult::Rows {
+            columns,
+            node,
+            tag: RowTag::Select,
+        },
+        Execution::ReturningRows {
+            columns,
+            node,
+            verb,
+        } => QueryResult::Rows {
+            columns,
+            node,
+            tag: verb.into(),
+        },
         Execution::Inserted(n) => QueryResult::command(format!("INSERT 0 {n}")),
         Execution::Updated(n) => QueryResult::command(format!("UPDATE {n}")),
         Execution::Deleted(n) => QueryResult::command(format!("DELETE {n}")),

@@ -361,13 +361,17 @@ async fn write_result(
             emit_notices(writer, &notices, Some(sql));
             writer.command_complete(&tag);
         }
-        QueryResult::Rows { columns, mut node } => {
+        QueryResult::Rows {
+            columns,
+            mut node,
+            tag,
+        } => {
             let fields: Vec<FieldDescription> = columns
                 .iter()
                 .map(|c| FieldDescription::new(c.name.clone(), c.ty.oid(), c.ty.typlen()))
                 .collect();
             writer.row_description(&fields);
-            let mut count = 0u64;
+            let mut count = 0usize;
             loop {
                 match node.next() {
                     Ok(Some(row)) => {
@@ -386,7 +390,7 @@ async fn write_result(
                     }
                 }
             }
-            writer.command_complete(&format!("SELECT {count}"));
+            writer.command_complete(&tag.complete(count));
         }
     }
     Ok(WriteOutcome::Completed)
@@ -751,6 +755,7 @@ fn stream_execute(
         QueryResult::Rows {
             columns: _,
             mut node,
+            tag,
         } => {
             let limit = (max_rows > 0).then_some(max_rows as usize);
             let mut count = 0usize;
@@ -769,6 +774,7 @@ fn stream_execute(
                                 portal.suspended = Some(SuspendedRows {
                                     node,
                                     delivered: count,
+                                    tag,
                                 });
                             }
                             writer.write(&BackendMessage::PortalSuspended);
@@ -776,7 +782,7 @@ fn stream_execute(
                         }
                     }
                     Ok(None) => {
-                        writer.command_complete(&format!("SELECT {count}"));
+                        writer.command_complete(&tag.complete(count));
                         return Ok(());
                     }
                     Err(e) => return Err(e.into()),
@@ -830,9 +836,10 @@ fn resume_portal(
         }
     };
     let delivered = sus.delivered;
+    let tag = sus.tag;
     if exhausted {
         portal.suspended = None;
-        writer.command_complete(&format!("SELECT {delivered}"));
+        writer.command_complete(&tag.complete(delivered));
     } else {
         writer.write(&BackendMessage::PortalSuspended);
     }
