@@ -174,6 +174,28 @@ impl CatalogInner {
         self.casts.iter().find(|c| c.oid == oid)
     }
 
+    /// Rewrite every stored `TypeRef::User(from)` to `TypeRef::User(to)` in the
+    /// function and cast signatures. These reference user types by name (not
+    /// OID), so a `ALTER TYPE ... RENAME TO` must carry the rename into them.
+    fn rename_type_refs(&mut self, from: &str, to: &str) {
+        fn rewrite(r: &mut TypeRef, from: &str, to: &str) {
+            if let TypeRef::User(name) = r
+                && name == from
+            {
+                *name = to.to_string();
+            }
+        }
+        for func in &mut self.funcs {
+            for arg in &mut func.args {
+                rewrite(arg, from, to);
+            }
+        }
+        for cast in &mut self.casts {
+            rewrite(&mut cast.source, from, to);
+            rewrite(&mut cast.target, from, to);
+        }
+    }
+
     /// The name of a user type by OID (reverse of the `types` map).
     fn type_name_by_oid(&self, oid: u32) -> Option<&str> {
         self.types
@@ -191,6 +213,25 @@ impl CatalogInner {
                 .map(|name| TypeRef::User(name.to_string())),
             other => Some(TypeRef::Builtin(other)),
         }
+    }
+}
+
+/// The mutable label list of the enum type `ty`, or the error `ALTER TYPE ...
+/// {ADD|RENAME} VALUE` raises when the type is missing (`42704`) or is not an
+/// enum (`42809`).
+fn enum_labels_mut<'a>(
+    cat: &'a mut CatalogInner,
+    ty: &str,
+) -> Result<&'a mut Vec<String>, PgError> {
+    match cat.types.get_mut(ty) {
+        None => Err(PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("type \"{ty}\" does not exist"),
+        )),
+        // PG's `%s is not an enum` renders the type name unquoted (format_type_be).
+        Some(entry) => entry.enum_labels.as_mut().ok_or_else(|| {
+            PgError::new(sqlstate::WRONG_OBJECT_TYPE, format!("{ty} is not an enum"))
+        }),
     }
 }
 
@@ -358,6 +399,120 @@ impl GlobalCatalog {
                 dependents: Vec::new(),
             },
         );
+        Ok(Vec::new())
+    }
+
+    /// `ALTER TYPE old RENAME TO new`. Works for any user type (enum or base):
+    /// only the `types` map key changes and the OID is preserved, so existing
+    /// `pg_type`/`pg_enum` rows and stored `Value::Enum { type_oid }` stay valid.
+    /// The existence of `old` is checked before the target-name collision, so a
+    /// missing source reports "does not exist" (not the target's "already
+    /// exists"), matching PG. A `new` that collides with a builtin name or an
+    /// existing user type (including `old` itself) is a duplicate-object error.
+    pub fn rename_type(&self, old: &str, new: &str) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        if !cat.types.contains_key(old) {
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("type \"{old}\" does not exist"),
+            ));
+        }
+        if crabgresql_catalog::is_builtin_type_name(new) || cat.types.contains_key(new) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("type \"{new}\" already exists"),
+            ));
+        }
+        // Function and cast signatures store their argument/source/target types
+        // by name (`TypeRef::User`), not by OID, so the rename must follow the
+        // name into them or those objects stop resolving against this type.
+        cat.rename_type_refs(old, new);
+        let entry = cat.types.remove(old).expect("type present after check");
+        cat.types.insert(new.to_string(), entry);
+        Ok(Vec::new())
+    }
+
+    /// `ALTER TYPE ty ADD VALUE [IF NOT EXISTS] 'value' [{BEFORE|AFTER} 'neighbor']`.
+    /// `position` is `Some((before, neighbor))` where `before` selects BEFORE vs
+    /// AFTER; `None` appends. Labels are stored verbatim (case-sensitive), like
+    /// [`Self::create_enum_type`].
+    ///
+    /// Known limitation: an enum value's ordinal is baked into every stored
+    /// `Value::Enum` at bind time, so inserting BEFORE/AFTER an existing label
+    /// renumbers later labels for *new* values only — rows already materialized
+    /// keep their old ordinal until re-read. PG avoids this with a fractional
+    /// `enumsortorder`; matching that is out of scope. Appending (no position) is
+    /// always safe.
+    pub fn add_enum_value(
+        &self,
+        ty: &str,
+        value: &str,
+        if_not_exists: bool,
+        position: Option<(bool, String)>,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let labels = enum_labels_mut(&mut cat, ty)?;
+        if labels.iter().any(|l| l == value) {
+            if if_not_exists {
+                return Ok(vec![CatalogNotice::new(format!(
+                    "enum label \"{value}\" already exists, skipping"
+                ))]);
+            }
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("enum label \"{value}\" already exists"),
+            ));
+        }
+        let index = match &position {
+            None => labels.len(),
+            Some((before, neighbor)) => {
+                let pos = labels.iter().position(|l| l == neighbor).ok_or_else(|| {
+                    PgError::new(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        format!("\"{neighbor}\" is not an existing enum label"),
+                    )
+                })?;
+                if *before { pos } else { pos + 1 }
+            }
+        };
+        labels.insert(index, value.to_string());
+        Ok(Vec::new())
+    }
+
+    /// `ALTER TYPE ty RENAME VALUE 'from' TO 'to'`. Replaces the label in place,
+    /// so its ordinal is unchanged. Rows already holding the old label string
+    /// keep it until re-read (see [`Self::add_enum_value`] for the staleness note).
+    pub fn rename_enum_value(
+        &self,
+        ty: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let labels = enum_labels_mut(&mut cat, ty)?;
+        // PG reports a missing source label before a colliding target one.
+        let from_pos = labels.iter().position(|l| l == from).ok_or_else(|| {
+            PgError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("\"{from}\" is not an existing enum label"),
+            )
+        })?;
+        if labels.iter().any(|l| l == to) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("enum label \"{to}\" already exists"),
+            ));
+        }
+        labels[from_pos] = to.to_string();
         Ok(Vec::new())
     }
 
@@ -1113,6 +1268,146 @@ mod tests {
         // IF EXISTS turns the miss into a skip NOTICE.
         let notices = cat.drop_types(&["nope"], false, true)?;
         assert_eq!(notices[0].message, "type \"nope\" does not exist, skipping");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_type_preserves_oid_and_moves_key() -> anyhow::Result<()> {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("rainbow", vec!["red".into(), "green".into()])?;
+        let oid = cat.resolve_type("rainbow").expect("resolves").oid;
+        cat.rename_type("rainbow", "colors")?;
+        assert!(!cat.is_user_type("rainbow"));
+        assert!(cat.is_user_type("colors"));
+        // Same OID under the new name, so pg_enum/Value::Enum stay valid.
+        assert_eq!(cat.resolve_type("colors").expect("resolves").oid, oid);
+        let info = cat.enum_info(oid).expect("enum info follows the rename");
+        assert_eq!(info.name, "colors");
+        assert_eq!(info.labels, vec!["red", "green"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_type_errors_on_missing_and_collision() -> anyhow::Result<()> {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("a", vec!["x".into()])?;
+        cat.create_enum_type("b", vec!["y".into()])?;
+        let missing = cat.rename_type("nope", "z").unwrap_err();
+        assert_eq!(missing.code, sqlstate::UNDEFINED_OBJECT);
+        assert_eq!(missing.message, "type \"nope\" does not exist");
+        let collide = cat.rename_type("a", "b").unwrap_err();
+        assert_eq!(collide.code, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(collide.message, "type \"b\" already exists");
+        // A target that collides with a builtin name is a duplicate-object error.
+        let builtin = cat.rename_type("a", "int4").unwrap_err();
+        assert_eq!(builtin.code, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(builtin.message, "type \"int4\" already exists");
+        // Source existence is checked before the target collision: a missing
+        // source with a builtin target still reports the source, not the target.
+        let order = cat.rename_type("nope", "int4").unwrap_err();
+        assert_eq!(order.code, sqlstate::UNDEFINED_OBJECT);
+        assert_eq!(order.message, "type \"nope\" does not exist");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_type_follows_the_name_into_cast_signatures() -> anyhow::Result<()> {
+        // Casts store their source/target by name (TypeRef::User), so a rename
+        // must carry into them or find_cast (keyed on the current OID->name) stops
+        // matching a cast created under the old name.
+        let cat = GlobalCatalog::new();
+        cat.define_type("t", 4, Some(PgType::Int4))?;
+        let oid = cat.resolve_type("t").expect("resolves").oid;
+        cat.create_cast(
+            TypeRef::User("t".into()),
+            TypeRef::Builtin(PgType::Int4),
+            true,
+        )?;
+        assert!(cat.find_cast(PgType::User(oid), PgType::Int4).is_some());
+        cat.rename_type("t", "u")?;
+        // Same OID, and the cast still resolves after the rename.
+        assert_eq!(cat.resolve_type("u").expect("resolves").oid, oid);
+        assert!(cat.find_cast(PgType::User(oid), PgType::Int4).is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_enum_value_append_before_after() -> anyhow::Result<()> {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("e", vec!["b".into(), "d".into()])?;
+        let oid = cat.resolve_type("e").expect("resolves").oid;
+        cat.add_enum_value("e", "e", false, None)?; // append
+        cat.add_enum_value("e", "a", false, Some((true, "b".into())))?; // before b
+        cat.add_enum_value("e", "c", false, Some((false, "b".into())))?; // after b
+        let info = cat.enum_info(oid).expect("enum info");
+        assert_eq!(info.labels, vec!["a", "b", "c", "d", "e"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_enum_value_duplicate_and_if_not_exists() -> anyhow::Result<()> {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("e", vec!["a".into()])?;
+        let err = cat.add_enum_value("e", "a", false, None).unwrap_err();
+        assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(err.message, "enum label \"a\" already exists");
+        // IF NOT EXISTS turns the duplicate into a skip NOTICE, no mutation.
+        let notices = cat.add_enum_value("e", "a", true, None)?;
+        assert_eq!(
+            notices[0].message,
+            "enum label \"a\" already exists, skipping"
+        );
+        let oid = cat.resolve_type("e").expect("resolves").oid;
+        assert_eq!(cat.enum_info(oid).expect("info").labels, vec!["a"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_enum_value_errors_on_missing_neighbor_and_non_enum() -> anyhow::Result<()> {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("e", vec!["a".into()])?;
+        let neighbor = cat
+            .add_enum_value("e", "b", false, Some((false, "zzz".into())))
+            .unwrap_err();
+        assert_eq!(neighbor.code, sqlstate::INVALID_PARAMETER_VALUE);
+        assert_eq!(neighbor.message, "\"zzz\" is not an existing enum label");
+        // A base (non-enum) user type rejects ADD VALUE, unquoted name.
+        cat.define_type("base", 4, None)?;
+        let non_enum = cat.add_enum_value("base", "x", false, None).unwrap_err();
+        assert_eq!(non_enum.code, sqlstate::WRONG_OBJECT_TYPE);
+        assert_eq!(non_enum.message, "base is not an enum");
+        // A missing type reports undefined-object with the quoted name.
+        let missing = cat.add_enum_value("nope", "x", false, None).unwrap_err();
+        assert_eq!(missing.code, sqlstate::UNDEFINED_OBJECT);
+        assert_eq!(missing.message, "type \"nope\" does not exist");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_enum_value_in_place_and_errors() -> anyhow::Result<()> {
+        let cat = GlobalCatalog::new();
+        cat.create_enum_type("e", vec!["red".into(), "green".into(), "blue".into()])?;
+        let oid = cat.resolve_type("e").expect("resolves").oid;
+        cat.rename_enum_value("e", "red", "crimson")?;
+        // Renamed in place: ordinal/position unchanged.
+        assert_eq!(
+            cat.enum_info(oid).expect("info").labels,
+            vec!["crimson", "green", "blue"]
+        );
+        // Missing source label is reported before a colliding target.
+        let missing = cat.rename_enum_value("e", "red", "green").unwrap_err();
+        assert_eq!(missing.code, sqlstate::INVALID_PARAMETER_VALUE);
+        assert_eq!(missing.message, "\"red\" is not an existing enum label");
+        let collide = cat.rename_enum_value("e", "blue", "green").unwrap_err();
+        assert_eq!(collide.code, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(collide.message, "enum label \"green\" already exists");
 
         Ok(())
     }

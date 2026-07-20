@@ -349,6 +349,9 @@ pub fn execute_statement(
                 name,
                 representation,
             } => return execute_create_type(global_catalog, name, representation),
+            ast::Statement::AlterType(alter) => {
+                return execute_alter_type(global_catalog, alter);
+            }
             ast::Statement::CreateFunction(create) => {
                 return execute_create_function(global_catalog, create);
             }
@@ -621,6 +624,7 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
         ast::Statement::CreateTable(_) => "CREATE TABLE",
         ast::Statement::CreateIndex(_) => "CREATE INDEX",
         ast::Statement::CreateType { .. } => "CREATE TYPE",
+        ast::Statement::AlterType(_) => "ALTER TYPE",
         ast::Statement::CreateFunction(_) => "CREATE FUNCTION",
         ast::Statement::CreateCast { .. } => "CREATE CAST",
         ast::Statement::Truncate(_) => "TRUNCATE TABLE",
@@ -1813,6 +1817,57 @@ fn execute_create_type(
     };
     Ok(QueryResult::Command {
         tag: "CREATE TYPE".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// Reject an enum-only `ALTER TYPE` operation targeting a builtin type. Builtins
+/// exist but are never enums, so PG reports `<type> is not an enum`
+/// (WRONG_OBJECT_TYPE) rather than the catalog's "type does not exist" (builtins
+/// are absent from the user-type map). The name is rendered as PG's `format_type_be`
+/// spelling (e.g. `integer`, not `int4`) when known.
+fn reject_non_enum_builtin(name: &str) -> Result<(), PgError> {
+    if crabgresql_catalog::is_builtin_type_name(name) {
+        let display = builtin_type_by_name(name).map_or_else(|| name.to_string(), |t| t.name().to_string());
+        return Err(PgError::new(
+            sqlstate::WRONG_OBJECT_TYPE,
+            format!("{display} is not an enum"),
+        ));
+    }
+    Ok(())
+}
+
+/// `ALTER TYPE`. Supports `RENAME TO` (any user type) and, for enums,
+/// `ADD VALUE` and `RENAME VALUE`. The mutation and its PG error text/SQLSTATE
+/// live on [`GlobalCatalog`]; here we only normalize the AST names.
+fn execute_alter_type(
+    catalog: &GlobalCatalog,
+    alter: &ast::AlterType,
+) -> Result<QueryResult, PgError> {
+    let tname = single_object_name(&alter.name, "type")?;
+    let notices = match &alter.operation {
+        ast::AlterTypeOperation::Rename(rename) => {
+            // The builtin-name collision of the target is enforced inside
+            // rename_type, after it confirms the source type exists.
+            catalog.rename_type(&tname, &normalize_ident(&rename.new_name))?
+        }
+        ast::AlterTypeOperation::AddValue(add) => {
+            reject_non_enum_builtin(&tname)?;
+            // Enum labels are string constants, not identifiers — stored verbatim.
+            let position = match &add.position {
+                Some(ast::AlterTypeAddValuePosition::Before(n)) => Some((true, n.value.clone())),
+                Some(ast::AlterTypeAddValuePosition::After(n)) => Some((false, n.value.clone())),
+                None => None,
+            };
+            catalog.add_enum_value(&tname, &add.value.value, add.if_not_exists, position)?
+        }
+        ast::AlterTypeOperation::RenameValue(rename) => {
+            reject_non_enum_builtin(&tname)?;
+            catalog.rename_enum_value(&tname, &rename.from.value, &rename.to.value)?
+        }
+    };
+    Ok(QueryResult::Command {
+        tag: "ALTER TYPE".into(),
         notices: to_notices(notices),
     })
 }
