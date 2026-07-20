@@ -401,6 +401,54 @@ impl BoundExpr {
             }
         }
     }
+
+    /// The inclusive `(min, max)` range of column indices this expression
+    /// references, or `None` if it references no column (a constant/param
+    /// expression). Callers that lay out rows as a concatenation — e.g. a join's
+    /// `left || right` row — use this to decide which side an expression belongs
+    /// to: a range wholly below the boundary is left-only, wholly at/above is
+    /// right-only, and one that straddles it spans both.
+    pub fn column_ref_bounds(&self) -> Option<(usize, usize)> {
+        fn fold(expr: &BoundExpr, acc: &mut Option<(usize, usize)>) {
+            match expr {
+                BoundExpr::ColumnRef { index, .. } => {
+                    *acc = Some(match *acc {
+                        None => (*index, *index),
+                        Some((lo, hi)) => (lo.min(*index), hi.max(*index)),
+                    });
+                }
+                BoundExpr::Const { .. } | BoundExpr::Param { .. } => {}
+                BoundExpr::Unary { expr, .. }
+                | BoundExpr::IsNull { expr, .. }
+                | BoundExpr::Coerce { expr, .. }
+                | BoundExpr::Reinterpret { expr, .. } => fold(expr, acc),
+                BoundExpr::Binary { left, right, .. } => {
+                    fold(left, acc);
+                    fold(right, acc);
+                }
+                BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+                    args.iter().for_each(|a| fold(a, acc));
+                }
+                BoundExpr::Case { whens, else_, .. } => {
+                    for (c, r) in whens {
+                        fold(c, acc);
+                        fold(r, acc);
+                    }
+                    if let Some(e) = else_ {
+                        fold(e, acc);
+                    }
+                }
+                BoundExpr::Aggregate { arg, .. } => {
+                    if let Some(a) = arg {
+                        fold(a, acc);
+                    }
+                }
+            }
+        }
+        let mut acc = None;
+        fold(self, &mut acc);
+        acc
+    }
 }
 
 /// A binding result: typed, or an untyped literal awaiting context (PG's

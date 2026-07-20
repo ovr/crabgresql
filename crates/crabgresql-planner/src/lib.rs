@@ -248,35 +248,47 @@ fn rebuild_and(mut conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
 /// `left` addresses the left input); otherwise hand the expression back as a
 /// residual conjunct.
 fn as_equi_key(conjunct: BoundExpr, left_width: usize) -> Result<HashKey, BoundExpr> {
+    // Classify on a borrow so the non-key paths can return `conjunct` untouched
+    // (no field-by-field rebuild). Only a cross-side equality on a type that
+    // hashes distinctly qualifies; a poorly-hashed type (interval/inet/…) would
+    // collapse the whole build side into one bucket, so keep it as a residual and
+    // let the executor use a nested loop instead.
     let BoundExpr::Binary {
         op: BinOp::Eq,
         arg_ty,
         left,
         right,
-    } = conjunct
+    } = &conjunct
     else {
         return Err(conjunct);
     };
-    let left_side = ref_side(&left, left_width);
-    let right_side = ref_side(&right, left_width);
-    match (left_side, right_side) {
-        (Some(Side::Left), Some(Side::Right)) => Ok(HashKey {
-            left: *left,
-            right: *right,
-            ty: arg_ty,
-        }),
-        (Some(Side::Right), Some(Side::Left)) => Ok(HashKey {
+    if !arg_ty.hashes_distinctly() {
+        return Err(conjunct);
+    }
+    let swap = match (ref_side(left, left_width), ref_side(right, left_width)) {
+        (Some(Side::Left), Some(Side::Right)) => false,
+        (Some(Side::Right), Some(Side::Left)) => true,
+        _ => return Err(conjunct),
+    };
+    let ty = *arg_ty;
+    // Confirmed a cross-side hashable equality — now consume and orient so
+    // `left` addresses the left input.
+    let BoundExpr::Binary { left, right, .. } = conjunct else {
+        unreachable!("matched as an Eq binary above");
+    };
+    Ok(if swap {
+        HashKey {
             left: *right,
             right: *left,
-            ty: arg_ty,
-        }),
-        _ => Err(BoundExpr::Binary {
-            op: BinOp::Eq,
-            arg_ty,
-            left,
-            right,
-        }),
-    }
+            ty,
+        }
+    } else {
+        HashKey {
+            left: *left,
+            right: *right,
+            ty,
+        }
+    })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -286,55 +298,17 @@ enum Side {
 }
 
 /// Which input a key operand references, or `None` if it spans both inputs or
-/// references no column at all (a constant/param — not a join key). All column
-/// references below `left_width` are on the left, the rest on the right.
+/// references no column at all (a constant/param — not a join key). Column
+/// indices below `left_width` are on the left, the rest on the right; the
+/// operand's whole [`BoundExpr::column_ref_bounds`] range must fall on one side.
 fn ref_side(expr: &BoundExpr, left_width: usize) -> Option<Side> {
-    let mut side = None;
-    if !collect_side(expr, left_width, &mut side) {
-        return None;
-    }
-    side
-}
-
-/// Fold every `ColumnRef` in `expr` into `side`. Returns `false` as soon as the
-/// expression is found to span both inputs (a mixed operand can't be a hash
-/// key). `side` stays `None` for a column-free operand.
-fn collect_side(expr: &BoundExpr, left_width: usize, side: &mut Option<Side>) -> bool {
-    match expr {
-        BoundExpr::ColumnRef { index, .. } => {
-            let this = if *index < left_width {
-                Side::Left
-            } else {
-                Side::Right
-            };
-            match side {
-                None => *side = Some(this),
-                Some(existing) if *existing == this => {}
-                Some(_) => return false,
-            }
-            true
-        }
-        BoundExpr::Const { .. } | BoundExpr::Param { .. } => true,
-        BoundExpr::Unary { expr, .. }
-        | BoundExpr::IsNull { expr, .. }
-        | BoundExpr::Coerce { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => collect_side(expr, left_width, side),
-        BoundExpr::Binary { left, right, .. } => {
-            collect_side(left, left_width, side) && collect_side(right, left_width, side)
-        }
-        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
-            args.iter().all(|a| collect_side(a, left_width, side))
-        }
-        BoundExpr::Case { whens, else_, .. } => {
-            whens.iter().all(|(cond, result)| {
-                collect_side(cond, left_width, side) && collect_side(result, left_width, side)
-            }) && else_
-                .as_ref()
-                .is_none_or(|e| collect_side(e, left_width, side))
-        }
-        // Aggregates never appear in a join predicate (the binder rejects them),
-        // so treat one defensively as spanning nothing decidable.
-        BoundExpr::Aggregate { .. } => false,
+    let (lo, hi) = expr.column_ref_bounds()?;
+    if hi < left_width {
+        Some(Side::Left)
+    } else if lo >= left_width {
+        Some(Side::Right)
+    } else {
+        None
     }
 }
 
@@ -714,6 +688,46 @@ mod tests {
         };
         assert!(hash_keys.is_empty());
         assert!(predicate.is_some());
+    }
+
+    #[test]
+    fn equi_join_on_poorly_hashed_type_stays_nested_loop() {
+        // `interval` equality is orderable (so the join binds) but agg::hash_key
+        // can't distinguish interval values — they'd all share one bucket — so the
+        // planner must keep it as a nested-loop predicate, not a hash key.
+        let PhysicalPlan::Join { source, .. } = plan_sql(
+            "SELECT * FROM (VALUES ('1 day'::interval)) a(x) \
+             JOIN (VALUES ('1 day'::interval)) b(y) ON a.x = b.y",
+        ) else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Join {
+            predicate,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert!(hash_keys.is_empty(), "interval key must not be hashed");
+        assert!(predicate.is_some());
+    }
+
+    #[test]
+    fn equi_join_on_hashable_nonint_type_extracts_key() {
+        // `money` compares by its raw i64 and is now hashed distinctly, so an
+        // equality on it is a hash key.
+        let PhysicalPlan::Join { source, .. } = plan_sql(
+            "SELECT * FROM (VALUES ('$1'::money)) a(x) \
+             JOIN (VALUES ('$1'::money)) b(y) ON a.x = b.y",
+        ) else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Join { hash_keys, .. } = source else {
+            panic!("expected Join node");
+        };
+        assert_eq!(hash_keys.len(), 1);
+        assert_eq!(hash_keys[0].ty, PgType::Money);
     }
 
     #[test]

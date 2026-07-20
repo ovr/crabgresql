@@ -166,6 +166,40 @@ impl PgType {
         }
     }
 
+    /// Whether the executor's `agg::hash_key` gives distinct values of this type
+    /// distinct-enough hashes — i.e. equality is a raw-representation compare, so
+    /// hashing that representation agrees with `keys_equal`. Types that fail this
+    /// (`interval`, `timetz`, `inet`, `cidr`, `bit`, `varbit`, `point`, `lseg`,
+    /// and user types) all hash into one shared bucket, so a hash join keyed on
+    /// them would collapse to a full scan; the join planner keeps such equalities
+    /// as nested-loop predicates instead. Must stay in sync with `hash_key`.
+    pub fn hashes_distinctly(self) -> bool {
+        matches!(
+            self,
+            PgType::Bool
+                | PgType::Int2
+                | PgType::Int4
+                | PgType::Int8
+                | PgType::Float4
+                | PgType::Float8
+                | PgType::Numeric
+                | PgType::Money
+                | PgType::Text
+                | PgType::Varchar
+                | PgType::Bpchar
+                | PgType::Name
+                | PgType::Oid
+                | PgType::Bytea
+                | PgType::Date
+                | PgType::Time
+                | PgType::Timestamp
+                | PgType::TimestampTz
+                | PgType::Uuid
+                | PgType::Macaddr
+                | PgType::Macaddr8
+        )
+    }
+
     /// Resolve a built-in type OID back to its [`PgType`], the reverse of
     /// [`PgType::oid`]. Used to map the parameter type OIDs a `Parse` message
     /// declares. Returns `None` for `0` ("unspecified", to be inferred) and any

@@ -812,19 +812,17 @@ pub struct HashJoin {
     left: Box<dyn ExecNode>,
     right_rows: Vec<Tuple>,
     right_matched: Vec<bool>,
-    /// Per right row: its key values, or `None` when the key was NULL (and so
-    /// the row was not inserted into `buckets`). Indexed by right-row position.
-    right_key_vals: Vec<Option<Vec<Value>>>,
-    /// Key hash → the indices of the right rows carrying that hash. Only rows
-    /// with fully non-NULL keys appear here.
-    buckets: HashMap<u64, Vec<usize>>,
+    /// Key hash → the `(right-row index, key values)` of every inner row carrying
+    /// that hash. Only rows with fully non-NULL keys appear here; the stored key
+    /// values are the collision guard checked by `keys_equal` at probe time.
+    buckets: HashMap<u64, Vec<(usize, Vec<Value>)>>,
     left_width: usize,
     right_width: usize,
     kind: JoinKind,
     /// The left-side operand of each equi-key and its comparison type.
     /// `left_keys[i]` indexes the left (probe) input; `key_tys[i]` drives hashing
-    /// and equality. The right-side operands are consumed at build time to
-    /// precompute `right_key_vals`, so they aren't retained.
+    /// and equality. The right-side operands are consumed at build time to fill
+    /// `buckets`, so they aren't retained.
     left_keys: Vec<BoundExpr>,
     key_tys: Vec<PgType>,
     /// Non-equi conjuncts of the ON clause, checked per candidate pair.
@@ -835,10 +833,10 @@ pub struct HashJoin {
     current_left_matched: bool,
     /// Key values of the current left row (valid while its matches are emitted).
     current_left_keys: Vec<Value>,
-    /// Candidate right-row indices for the current left row, and the cursor into
-    /// them. Candidates come from the matching hash bucket; each is confirmed
-    /// with `keys_equal` (collision guard) and the residual predicate.
-    probe_matches: Vec<usize>,
+    /// The bucket the current left row probes (its key hash), or `None` when the
+    /// left key was NULL or unmatched. The bucket is re-borrowed per candidate via
+    /// this hash — never cloned — and `probe_pos` cursors into it.
+    current_probe_hash: Option<u64>,
     probe_pos: usize,
     right_index: usize,
 }
@@ -869,21 +867,21 @@ impl HashJoin {
         }
 
         // Build the hash table over the inner side. A right key expression
-        // indexes the concatenated row, so evaluate it against a row whose left
-        // half is NULL padding and whose right half is the inner row.
-        let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
-        let mut right_key_vals = Vec::with_capacity(right_rows.len());
+        // indexes the concatenated row, so evaluate it against a full-width row
+        // whose left half is NULL padding and whose right half is the inner row.
+        // One scratch buffer is reused across rows: its left half stays NULL and
+        // only the right half is overwritten per row.
+        let mut buckets: HashMap<u64, Vec<(usize, Vec<Value>)>> = HashMap::new();
+        let mut scratch = vec![Value::Null; left_width + right_width];
         for (index, row) in right_rows.iter().enumerate() {
-            let mut padded = vec![Value::Null; left_width];
-            padded.extend_from_slice(row);
-            let vals = eval_join_keys(&right_keys, &padded, ctx)?;
-            if let Some(vals) = &vals {
+            scratch.truncate(left_width);
+            scratch.extend_from_slice(row);
+            if let Some(vals) = eval_join_keys(&right_keys, &scratch, ctx)? {
                 buckets
-                    .entry(agg::hash_key(&key_tys, vals))
+                    .entry(agg::hash_key(&key_tys, &vals))
                     .or_default()
-                    .push(index);
+                    .push((index, vals));
             }
-            right_key_vals.push(vals);
         }
 
         let right_matched = vec![false; right_rows.len()];
@@ -891,7 +889,6 @@ impl HashJoin {
             left,
             right_rows,
             right_matched,
-            right_key_vals,
             buckets,
             left_width,
             right_width,
@@ -904,7 +901,7 @@ impl HashJoin {
             current_left: None,
             current_left_matched: false,
             current_left_keys: Vec::new(),
-            probe_matches: Vec::new(),
+            current_probe_hash: None,
             probe_pos: 0,
             right_index: 0,
         })
@@ -931,18 +928,19 @@ impl HashJoin {
         self.probe_pos = 0;
         let Some(left) = self.current_left.as_ref() else {
             self.current_left_keys.clear();
-            self.probe_matches = Vec::new();
+            self.current_probe_hash = None;
             return Ok(());
         };
         match eval_join_keys(&self.left_keys, left, self.ctx)? {
             Some(vals) => {
-                let hash = agg::hash_key(&self.key_tys, &vals);
+                // Record only the bucket's hash; the bucket itself is re-borrowed
+                // per candidate during probing, never copied.
+                self.current_probe_hash = Some(agg::hash_key(&self.key_tys, &vals));
                 self.current_left_keys = vals;
-                self.probe_matches = self.buckets.get(&hash).cloned().unwrap_or_default();
             }
             None => {
                 self.current_left_keys.clear();
-                self.probe_matches = Vec::new();
+                self.current_probe_hash = None;
             }
         }
         Ok(())
@@ -969,17 +967,37 @@ impl ExecNode for HashJoin {
                         self.load_probe()?;
                     }
 
-                    while self.probe_pos < self.probe_matches.len() {
-                        let right_index = self.probe_matches[self.probe_pos];
-                        self.probe_pos += 1;
-                        // A bucket hit can still be a hash collision, so confirm
-                        // key equality, then the residual (non-equi) conjuncts.
-                        let Some(right_vals) = self.right_key_vals[right_index].as_ref() else {
-                            continue;
+                    loop {
+                        // Pull the next candidate whose key actually matches (a
+                        // bucket hit can be a hash collision), scoping the bucket
+                        // borrow so it ends before we build the row and mutate
+                        // match state below.
+                        let right_index = {
+                            let Some(hash) = self.current_probe_hash else {
+                                break;
+                            };
+                            let Some(bucket) = self.buckets.get(&hash) else {
+                                break;
+                            };
+                            let mut found = None;
+                            while self.probe_pos < bucket.len() {
+                                let (index, right_vals) = &bucket[self.probe_pos];
+                                self.probe_pos += 1;
+                                if agg::keys_equal(
+                                    &self.key_tys,
+                                    &self.current_left_keys,
+                                    right_vals,
+                                ) {
+                                    found = Some(*index);
+                                    break;
+                                }
+                            }
+                            match found {
+                                Some(index) => index,
+                                None => break,
+                            }
                         };
-                        if !agg::keys_equal(&self.key_tys, &self.current_left_keys, right_vals) {
-                            continue;
-                        }
+                        // Then the residual (non-equi) conjuncts of the ON clause.
                         let Some(left) = self.current_left.as_ref() else {
                             continue;
                         };
@@ -2953,6 +2971,33 @@ mod tests {
                 vec![Value::Int4(2), Value::Null],
             ]
         );
+    }
+
+    #[test]
+    fn equi_join_on_money_matches_correctly() {
+        // money hashes distinctly now, so this runs as a hash join.
+        let (_columns, rows) = run_rows(
+            "SELECT a.x, b.y \
+             FROM (VALUES ('$1.00'::money), ('$2.00'::money)) a(x) \
+             JOIN (VALUES ('$2.00'::money), ('$3.00'::money)) b(y) ON a.x = b.y",
+        );
+        assert_eq!(rows, vec![vec![Value::Money(200), Value::Money(200)]]);
+    }
+
+    #[test]
+    fn equi_join_on_interval_matches_via_nested_loop_fallback() {
+        // interval is not hash-distinct, so the planner keeps this as a nested
+        // loop; the result must still be correct (and NULL keys still excluded).
+        let (_columns, rows) = run_rows(
+            "SELECT a.x, b.y \
+             FROM (VALUES ('1 day'::interval), ('24 hours'::interval), (NULL)) a(x) \
+             JOIN (VALUES ('1 day'::interval), ('2 days'::interval)) b(y) ON a.x = b.y \
+             ORDER BY a.x",
+        );
+        // '1 day' and '24 hours' are equal intervals, so both non-null left rows
+        // match the single '1 day' right row; the NULL left key matches nothing.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| !matches!(r[1], Value::Null)));
     }
 
     #[test]
