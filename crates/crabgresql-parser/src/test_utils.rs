@@ -113,7 +113,10 @@ impl TestedDialects {
         F: Fn(&mut Parser) -> T,
     {
         self.one_of_identical_results(|dialect| {
-            let mut parser = self.new_parser(dialect).try_with_sql(sql).unwrap();
+            let mut parser = self
+                .new_parser(dialect)
+                .try_with_sql(sql)
+                .unwrap_or_else(|error| panic!("failed to parse {sql:?}: {error}"));
             f(&mut parser)
         })
     }
@@ -132,7 +135,9 @@ impl TestedDialects {
                 .parse_statements()
         })
         // To fail the `ensure_multiple_dialects_are_tested` test:
-        // Parser::parse_sql(&**self.dialects.first().unwrap(), sql)
+        // if let Some(dialect) = self.dialects.first() {
+        //     Parser::parse_sql(&***dialect, sql)
+        // }
     }
 
     /// Ensures that `sql` parses as a single [Statement] for all tested
@@ -157,10 +162,16 @@ impl TestedDialects {
         let mut statements = self.parse_sql_statements(sql).expect(sql);
         assert_eq!(statements.len(), 1);
         if !canonical.is_empty() && sql != canonical {
-            assert_eq!(self.parse_sql_statements(canonical).unwrap(), statements);
+            assert_eq!(
+                self.parse_sql_statements(canonical)
+                    .unwrap_or_else(|error| panic!("failed to parse {canonical:?}: {error}")),
+                statements
+            );
         }
 
-        let only_statement = statements.pop().unwrap();
+        let only_statement = statements
+            .pop()
+            .unwrap_or_else(|| panic!("single parsed statement is missing"));
 
         if !canonical.is_empty() {
             assert_eq!(canonical, only_statement.to_string())
@@ -172,7 +183,11 @@ impl TestedDialects {
     pub fn statements_parse_to(&self, sql: &str, canonical: &str) -> Vec<Statement> {
         let statements = self.parse_sql_statements(sql).expect(sql);
         if !canonical.is_empty() && sql != canonical {
-            assert_eq!(self.parse_sql_statements(canonical).unwrap(), statements);
+            assert_eq!(
+                self.parse_sql_statements(canonical)
+                    .unwrap_or_else(|error| panic!("failed to parse {canonical:?}: {error}")),
+                statements
+            );
         } else {
             assert_eq!(
                 sql,
@@ -191,7 +206,7 @@ impl TestedDialects {
     pub fn expr_parses_to(&self, sql: &str, canonical: &str) -> Expr {
         let ast = self
             .run_parser_method(sql, |parser| parser.parse_expr())
-            .unwrap();
+            .unwrap_or_else(|error| panic!("failed to parse expression {sql:?}: {error}"));
         assert_eq!(canonical, &ast.to_string());
         ast
     }
@@ -269,7 +284,9 @@ impl TestedDialects {
             if let Some(options) = &self.options {
                 tokenizer = tokenizer.with_unescape(options.unescape);
             }
-            let tokens = tokenizer.tokenize().unwrap();
+            let tokens = tokenizer
+                .tokenize()
+                .unwrap_or_else(|error| panic!("failed to tokenize input: {error}"));
             assert_eq!(expected, tokens, "Tokenized differently for {dialect:?}");
         });
     }
@@ -349,7 +366,18 @@ pub fn alter_table_op(stmt: Statement) -> AlterTableOperation {
 
 /// Creates a `Value::Number`, panic'ing if n is not a number
 pub fn number(n: &str) -> Value {
-    Value::Number(n.parse().unwrap(), false)
+    Value::Number(
+        n.parse()
+            .unwrap_or_else(|_| panic!("invalid numeric literal {n:?}")),
+        false,
+    )
+}
+
+fn first_or_panic<'a, T>(values: &'a [T], message: &str) -> &'a T {
+    match values.first() {
+        Some(value) => value,
+        None => panic!("{message}"),
+    }
 }
 
 /// Creates a [Value::SingleQuotedString]
@@ -448,45 +476,71 @@ pub fn call(function: &str, args: impl IntoIterator<Item = Expr>) -> Expr {
 pub fn index_column(stmt: Statement) -> Expr {
     match stmt {
         Statement::CreateIndex(CreateIndex { columns, .. }) => {
-            columns.first().unwrap().column.expr.clone()
+            first_or_panic(&columns, "CREATE INDEX has no columns")
+                .column
+                .expr
+                .clone()
         }
         Statement::CreateTable(CreateTable { constraints, .. }) => {
-            match constraints.first().unwrap() {
+            match first_or_panic(&constraints, "CREATE TABLE has no constraints") {
                 TableConstraint::Index(constraint) => {
-                    constraint.columns.first().unwrap().column.expr.clone()
+                    first_or_panic(&constraint.columns, "index has no columns").column.expr.clone()
                 }
                 TableConstraint::Unique(constraint) => {
-                    constraint.columns.first().unwrap().column.expr.clone()
+                    first_or_panic(&constraint.columns, "unique constraint has no columns")
+                        .column
+                        .expr
+                        .clone()
                 }
                 TableConstraint::PrimaryKey(constraint) => {
-                    constraint.columns.first().unwrap().column.expr.clone()
+                    first_or_panic(&constraint.columns, "primary key has no columns")
+                        .column
+                        .expr
+                        .clone()
                 }
                 TableConstraint::FulltextOrSpatial(constraint) => {
-                    constraint.columns.first().unwrap().column.expr.clone()
+                    first_or_panic(&constraint.columns, "fulltext constraint has no columns")
+                        .column
+                        .expr
+                        .clone()
                 }
                 _ => panic!("Expected an index, unique, primary, full text, or spatial constraint (foreign key does not support general key part expressions)"),
             }
         }
-        Statement::AlterTable(alter_table) => match alter_table.operations.first().unwrap() {
+        Statement::AlterTable(alter_table) => {
+            match first_or_panic(&alter_table.operations, "ALTER TABLE has no operations") {
             AlterTableOperation::AddConstraint { constraint, .. } => {
                 match constraint {
                     TableConstraint::Index(constraint) => {
-                        constraint.columns.first().unwrap().column.expr.clone()
+                        first_or_panic(&constraint.columns, "index has no columns")
+                            .column
+                            .expr
+                            .clone()
                     }
                     TableConstraint::Unique(constraint) => {
-                        constraint.columns.first().unwrap().column.expr.clone()
+                        first_or_panic(&constraint.columns, "unique constraint has no columns")
+                            .column
+                            .expr
+                            .clone()
                     }
                     TableConstraint::PrimaryKey(constraint) => {
-                        constraint.columns.first().unwrap().column.expr.clone()
+                        first_or_panic(&constraint.columns, "primary key has no columns")
+                            .column
+                            .expr
+                            .clone()
                     }
                     TableConstraint::FulltextOrSpatial(constraint) => {
-                        constraint.columns.first().unwrap().column.expr.clone()
+                        first_or_panic(&constraint.columns, "fulltext constraint has no columns")
+                            .column
+                            .expr
+                            .clone()
                     }
                     _ => panic!("Expected an index, unique, primary, full text, or spatial constraint (foreign key does not support general key part expressions)"),
                 }
             }
             _ => panic!("Expected a constraint"),
-        },
+            }
+        }
         _ => panic!("Expected CREATE INDEX, ALTER TABLE, or CREATE TABLE, got: {stmt:?}"),
     }
 }

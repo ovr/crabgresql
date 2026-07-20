@@ -53,9 +53,7 @@ fn underflow() -> FloatError {
 
 /// Does the trimmed text spell an infinity (`inf` / `infinity`, optional sign)?
 fn spells_infinity(trimmed: &str) -> bool {
-    let core = trimmed
-        .strip_prefix(['+', '-'])
-        .unwrap_or(trimmed);
+    let core = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
     core.eq_ignore_ascii_case("inf") || core.eq_ignore_ascii_case("infinity")
 }
 
@@ -100,9 +98,7 @@ pub fn float8in(orig: &str) -> Result<f64, FloatParseError> {
 /// directly so correctly-rounded results match strtof (the Paxson cases).
 pub fn float4in(orig: &str) -> Result<f32, FloatParseError> {
     let trimmed = orig.trim_matches(|c: char| c.is_ascii_whitespace());
-    let v: f32 = trimmed
-        .parse()
-        .map_err(|_| invalid_input(orig, "real"))?;
+    let v: f32 = trimmed.parse().map_err(|_| invalid_input(orig, "real"))?;
     if v.is_infinite() && !spells_infinity(trimmed) {
         return Err(out_of_range(orig, "real"));
     }
@@ -134,7 +130,11 @@ pub fn fmt_f64(v: f64, efd: i32) -> String {
         let digits = d.mantissa.to_string();
         let lead_exp = d.exponent + digits.len() as i32 - 1;
         let body = render(&digits, lead_exp, 15);
-        if v.is_sign_negative() { format!("-{body}") } else { body }
+        if v.is_sign_negative() {
+            format!("-{body}")
+        } else {
+            body
+        }
     } else {
         let prec = (15 + efd).max(1) as usize;
         fmt_g(v, prec)
@@ -157,7 +157,11 @@ pub fn fmt_f32(v: f32, efd: i32) -> String {
         let digits = d.mantissa.to_string();
         let lead_exp = d.exponent + digits.len() as i32 - 1;
         let body = render(&digits, lead_exp, 6);
-        if v.is_sign_negative() { format!("-{body}") } else { body }
+        if v.is_sign_negative() {
+            format!("-{body}")
+        } else {
+            body
+        }
     } else {
         let prec = (6 + efd).max(1) as usize;
         fmt_g(v as f64, prec)
@@ -283,11 +287,18 @@ macro_rules! float_ops {
         }
         pub fn $cmp(a: $t, b: $t) -> Ordering {
             if a.is_nan() {
-                if b.is_nan() { Ordering::Equal } else { Ordering::Greater }
+                if b.is_nan() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
             } else if b.is_nan() {
                 Ordering::Less
             } else {
-                a.partial_cmp(&b).unwrap()
+                match a.partial_cmp(&b) {
+                    Some(ordering) => ordering,
+                    None => unreachable!("NaN values are handled before comparison"),
+                }
             }
         }
     };
@@ -340,25 +351,29 @@ pub fn f8_cbrt(a: f64) -> f64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_rejects_malformed() {
-        for bad in ["", "   ", "xyz", "5.0.0", "5 . 0", "5.   0", "- 3.0", "N A N", "NaN x", "1 5"]
-        {
+        for bad in [
+            "", "   ", "xyz", "5.0.0", "5 . 0", "5.   0", "- 3.0", "N A N", "NaN x", "1 5",
+        ] {
             let e = float8in(bad).unwrap_err();
             assert_eq!(e.sqlstate, "22P02", "for {bad:?}");
         }
     }
 
     #[test]
-    fn parse_accepts_specials_and_whitespace() {
-        assert!(float8in("  NaN ").unwrap().is_nan());
-        assert_eq!(float8in("infinity").unwrap(), f64::INFINITY);
-        assert_eq!(float8in("          -INFINiTY   ").unwrap(), f64::NEG_INFINITY);
-        assert_eq!(float8in("    0.0   ").unwrap(), 0.0);
-        assert_eq!(float8in("1004.30  ").unwrap(), 1004.3);
+    fn parse_accepts_specials_and_whitespace() -> anyhow::Result<()> {
+        assert!(float8in("  NaN ")?.is_nan());
+        assert_eq!(float8in("infinity")?, f64::INFINITY);
+        assert_eq!(float8in("          -INFINiTY   ")?, f64::NEG_INFINITY);
+        assert_eq!(float8in("    0.0   ")?, 0.0);
+        assert_eq!(float8in("1004.30  ")?, 1004.3);
+
+        Ok(())
     }
 
     #[test]
@@ -373,13 +388,15 @@ mod tests {
     }
 
     #[test]
-    fn zero_mantissa_with_exponent_is_not_underflow() {
+    fn zero_mantissa_with_exponent_is_not_underflow() -> anyhow::Result<()> {
         // A zero mantissa is exactly zero regardless of the exponent; only a
         // nonzero value rounding to zero is an underflow error.
-        assert_eq!(float8in("0e5").unwrap(), 0.0);
-        assert_eq!(float8in("0e-400").unwrap(), 0.0);
-        assert_eq!(float8in("0.0e12").unwrap(), 0.0);
+        assert_eq!(float8in("0e5")?, 0.0);
+        assert_eq!(float8in("0e-400")?, 0.0);
+        assert_eq!(float8in("0.0e12")?, 0.0);
         assert_eq!(float8in("10e-400").unwrap_err().sqlstate, "22003");
+
+        Ok(())
     }
 
     #[test]
@@ -406,22 +423,29 @@ mod tests {
     }
 
     #[test]
-    fn div_by_zero_and_nan() {
+    fn div_by_zero_and_nan() -> anyhow::Result<()> {
         assert_eq!(f8_div(1.0, 0.0).unwrap_err().sqlstate, "22012");
-        assert!(f8_div(f64::NAN, 0.0).unwrap().is_nan());
-        assert_eq!(f8_div(42.0, f64::INFINITY).unwrap(), 0.0);
+        assert!(f8_div(f64::NAN, 0.0)?.is_nan());
+        assert_eq!(f8_div(42.0, f64::INFINITY)?, 0.0);
+
+        Ok(())
     }
 
     #[test]
-    fn pow_edge_cases() {
-        assert_eq!(f8_pow(f64::NAN, 0.0).unwrap(), 1.0);
-        assert_eq!(f8_pow(1.0, f64::NAN).unwrap(), 1.0);
-        assert!(f8_pow(f64::NAN, f64::NAN).unwrap().is_nan());
+    fn pow_edge_cases() -> anyhow::Result<()> {
+        assert_eq!(f8_pow(f64::NAN, 0.0)?, 1.0);
+        assert_eq!(f8_pow(1.0, f64::NAN)?, 1.0);
+        assert!(f8_pow(f64::NAN, f64::NAN)?.is_nan());
         assert_eq!(f8_pow(0.0, -1.0).unwrap_err().sqlstate, "2201F");
         assert_eq!(f8_pow(-1.0, 0.5).unwrap_err().sqlstate, "2201F");
-        assert!(f8_pow(f64::NEG_INFINITY, -3.0).unwrap().is_sign_negative());
-        assert_eq!(f8_pow(f64::NEG_INFINITY, -3.0).unwrap(), 0.0);
-        assert_eq!(f8_pow(1004.3, 1e200).unwrap_err().message, "value out of range: overflow");
+        assert!(f8_pow(f64::NEG_INFINITY, -3.0)?.is_sign_negative());
+        assert_eq!(f8_pow(f64::NEG_INFINITY, -3.0)?, 0.0);
+        assert_eq!(
+            f8_pow(1004.3, 1e200).unwrap_err().message,
+            "value out of range: overflow"
+        );
+
+        Ok(())
     }
 
     #[test]

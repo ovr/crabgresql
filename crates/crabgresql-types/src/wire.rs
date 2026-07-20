@@ -31,6 +31,10 @@ fn no_binary(ty: PgType) -> CastError {
     }
 }
 
+fn fixed<const N: usize>(b: &[u8], ty: PgType) -> Result<[u8; N], CastError> {
+    b.try_into().map_err(|_| invalid_binary(ty))
+}
+
 /// Decode a Bind parameter delivered in **text** format into a `Value` of `ty`.
 /// Reuses the type's SQL input function, so a text parameter and the equivalent
 /// literal fail and succeed identically.
@@ -49,26 +53,15 @@ pub fn decode_text(ty: PgType, s: &str) -> Result<Value, CastError> {
 /// Decode a Bind parameter delivered in **binary** format into a `Value` of
 /// `ty`. Implemented for the scalar/string/`bytea` set; other types → `0A000`.
 pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
-    let fixed = |n: usize| -> Result<&[u8], CastError> {
-        if b.len() == n {
-            Ok(b)
-        } else {
-            Err(invalid_binary(ty))
-        }
-    };
     Ok(match ty {
         // PG's `boolrecv` treats any nonzero byte as true, not only 1.
-        PgType::Bool => Value::Bool(fixed(1)?[0] != 0),
-        PgType::Int2 => Value::Int2(i16::from_be_bytes(fixed(2)?.try_into().unwrap())),
-        PgType::Int4 => Value::Int4(i32::from_be_bytes(fixed(4)?.try_into().unwrap())),
-        PgType::Int8 => Value::Int8(i64::from_be_bytes(fixed(8)?.try_into().unwrap())),
-        PgType::Oid => Value::Oid(u32::from_be_bytes(fixed(4)?.try_into().unwrap())),
-        PgType::Float4 => {
-            Value::Float4(f32::from_bits(u32::from_be_bytes(fixed(4)?.try_into().unwrap())))
-        }
-        PgType::Float8 => {
-            Value::Float8(f64::from_bits(u64::from_be_bytes(fixed(8)?.try_into().unwrap())))
-        }
+        PgType::Bool => Value::Bool(fixed::<1>(b, ty)?[0] != 0),
+        PgType::Int2 => Value::Int2(i16::from_be_bytes(fixed(b, ty)?)),
+        PgType::Int4 => Value::Int4(i32::from_be_bytes(fixed(b, ty)?)),
+        PgType::Int8 => Value::Int8(i64::from_be_bytes(fixed(b, ty)?)),
+        PgType::Oid => Value::Oid(u32::from_be_bytes(fixed(b, ty)?)),
+        PgType::Float4 => Value::Float4(f32::from_bits(u32::from_be_bytes(fixed(b, ty)?))),
+        PgType::Float8 => Value::Float8(f64::from_bits(u64::from_be_bytes(fixed(b, ty)?))),
         PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
             let s = String::from_utf8(b.to_vec()).map_err(|_| invalid_binary(ty))?;
             // `name` truncates to 63 characters (`namerecv`); the rest keep their
@@ -109,49 +102,61 @@ impl Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
-    fn int4_binary_round_trips() {
-        let bytes = Value::Int4(-12345).encode_binary().unwrap().unwrap();
+    fn int4_binary_round_trips() -> anyhow::Result<()> {
+        let bytes = Value::Int4(-12345)
+            .encode_binary()?
+            .ok_or_else(|| anyhow::anyhow!("int4 encoded as NULL"))?;
         assert_eq!(bytes, (-12345i32).to_be_bytes());
-        assert_eq!(decode_binary(PgType::Int4, &bytes).unwrap(), Value::Int4(-12345));
+        assert_eq!(decode_binary(PgType::Int4, &bytes)?, Value::Int4(-12345));
+
+        Ok(())
     }
 
     #[test]
-    fn float8_binary_round_trips() {
+    fn float8_binary_round_trips() -> anyhow::Result<()> {
         let v = Value::Float8(3.5);
-        let bytes = v.encode_binary().unwrap().unwrap();
-        assert_eq!(decode_binary(PgType::Float8, &bytes).unwrap(), v);
+        let bytes = v
+            .encode_binary()?
+            .ok_or_else(|| anyhow::anyhow!("float8 encoded as NULL"))?;
+        assert_eq!(decode_binary(PgType::Float8, &bytes)?, v);
+
+        Ok(())
     }
 
     #[test]
-    fn bool_binary_accepts_any_nonzero_and_rejects_short() {
+    fn bool_binary_accepts_any_nonzero_and_rejects_short() -> anyhow::Result<()> {
         // PG's boolrecv: any nonzero byte is true.
-        assert_eq!(decode_binary(PgType::Bool, &[0]).unwrap(), Value::Bool(false));
-        assert_eq!(decode_binary(PgType::Bool, &[1]).unwrap(), Value::Bool(true));
-        assert_eq!(decode_binary(PgType::Bool, &[2]).unwrap(), Value::Bool(true));
+        assert_eq!(decode_binary(PgType::Bool, &[0])?, Value::Bool(false));
+        assert_eq!(decode_binary(PgType::Bool, &[1])?, Value::Bool(true));
+        assert_eq!(decode_binary(PgType::Bool, &[2])?, Value::Bool(true));
         assert!(decode_binary(PgType::Int4, &[0, 0, 0]).is_err()); // short
+
+        Ok(())
     }
 
     #[test]
-    fn name_param_truncates_to_63_chars() {
+    fn name_param_truncates_to_63_chars() -> anyhow::Result<()> {
         let long = "x".repeat(100);
-        let Value::Text(t) = decode_text(PgType::Name, &long).unwrap() else {
+        let Value::Text(t) = decode_text(PgType::Name, &long)? else {
             panic!("name decodes to text");
         };
         assert_eq!(t.chars().count(), 63);
+
+        Ok(())
     }
 
     #[test]
-    fn text_param_matches_literal_input() {
-        assert_eq!(decode_text(PgType::Int4, " 42 ").unwrap(), Value::Int4(42));
-        assert_eq!(decode_text(PgType::Bool, "t").unwrap(), Value::Bool(true));
-        assert_eq!(
-            decode_text(PgType::Text, "hi").unwrap(),
-            Value::Text("hi".into())
-        );
+    fn text_param_matches_literal_input() -> anyhow::Result<()> {
+        assert_eq!(decode_text(PgType::Int4, " 42 ")?, Value::Int4(42));
+        assert_eq!(decode_text(PgType::Bool, "t")?, Value::Bool(true));
+        assert_eq!(decode_text(PgType::Text, "hi")?, Value::Text("hi".into()));
+
+        Ok(())
     }
 
     #[test]

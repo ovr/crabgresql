@@ -713,6 +713,7 @@ pub(crate) struct CreateTableConfiguration {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use crate::ast::helpers::stmt_create_table::CreateTableBuilder;
     use crate::ast::{Ident, ObjectName, Statement};
@@ -725,7 +726,10 @@ mod tests {
         let create_table = builder.clone().build();
         let stmt: Statement = create_table.into();
 
-        assert_eq!(builder, CreateTableBuilder::try_from(stmt).unwrap());
+        match CreateTableBuilder::try_from(stmt) {
+            Ok(actual) => assert_eq!(builder, actual),
+            Err(error) => panic!("valid create-table fixture was rejected: {error}"),
+        }
     }
 
     #[test]

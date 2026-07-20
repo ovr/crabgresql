@@ -19,8 +19,8 @@ mod d2s_intrinsics;
 pub mod f2s;
 mod f2s_intrinsics;
 
-pub use d2s::{DOUBLE_BIAS, DOUBLE_EXPONENT_BITS, DOUBLE_MANTISSA_BITS, FloatingDecimal64, d2d};
-pub use f2s::{FLOAT_EXPONENT_BITS, FLOAT_MANTISSA_BITS, FloatingDecimal32, f2d};
+pub use d2s::{d2d, FloatingDecimal64, DOUBLE_BIAS, DOUBLE_EXPONENT_BITS, DOUBLE_MANTISSA_BITS};
+pub use f2s::{f2d, FloatingDecimal32, FLOAT_EXPONENT_BITS, FLOAT_MANTISSA_BITS};
 
 /// Shortest-round-trip decimal (mantissa, base-10 exponent) of a finite,
 /// nonzero `f64`, using PG's strict-bounds rule. Callers must handle

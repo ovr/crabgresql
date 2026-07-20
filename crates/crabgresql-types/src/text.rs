@@ -28,7 +28,10 @@ pub struct TextError {
 
 impl TextError {
     fn new(sqlstate: &'static str, message: impl Into<String>) -> Self {
-        TextError { sqlstate, message: message.into() }
+        TextError {
+            sqlstate,
+            message: message.into(),
+        }
     }
 }
 
@@ -40,7 +43,10 @@ type Result<T> = std::result::Result<T, TextError>;
 const MAX_ALLOC: i64 = 0x3FFF_FFFF;
 
 fn too_large() -> TextError {
-    TextError::new(sqlstate::PROGRAM_LIMIT_EXCEEDED, "requested length too large")
+    TextError::new(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "requested length too large",
+    )
 }
 
 // --- length ----------------------------------------------------------------
@@ -119,7 +125,9 @@ pub fn substr(s: &str, start: i32, len: Option<i32>) -> Result<String> {
     if lo > hi {
         return Ok(String::new());
     }
-    Ok(chars[(lo - 1) as usize..=(hi - 1) as usize].iter().collect())
+    Ok(chars[(lo - 1) as usize..=(hi - 1) as usize]
+        .iter()
+        .collect())
 }
 
 /// `strpos(string, substring)` / `position(substring IN string)`: the 1-based
@@ -165,7 +173,10 @@ pub fn trim(s: &str, chars: &str, side: TrimSide) -> String {
     match side {
         TrimSide::Leading => s.trim_start_matches(in_set).to_string(),
         TrimSide::Trailing => s.trim_end_matches(in_set).to_string(),
-        TrimSide::Both => s.trim_start_matches(in_set).trim_end_matches(in_set).to_string(),
+        TrimSide::Both => s
+            .trim_start_matches(in_set)
+            .trim_end_matches(in_set)
+            .to_string(),
     }
 }
 
@@ -255,7 +266,11 @@ pub fn reverse(s: &str) -> String {
 pub fn left(s: &str, n: i32) -> String {
     let chars: Vec<char> = s.chars().collect();
     let total = chars.len() as i64;
-    let take = if n >= 0 { (n as i64).min(total) } else { (total + n as i64).max(0) };
+    let take = if n >= 0 {
+        (n as i64).min(total)
+    } else {
+        (total + n as i64).max(0)
+    };
     chars[..take as usize].iter().collect()
 }
 
@@ -264,7 +279,11 @@ pub fn left(s: &str, n: i32) -> String {
 pub fn right(s: &str, n: i32) -> String {
     let chars: Vec<char> = s.chars().collect();
     let total = chars.len() as i64;
-    let skip = if n >= 0 { (total - n as i64).max(0) } else { (-(n as i64)).min(total) };
+    let skip = if n >= 0 {
+        (total - n as i64).max(0)
+    } else {
+        (-(n as i64)).min(total)
+    };
     chars[skip as usize..].iter().collect()
 }
 
@@ -279,7 +298,10 @@ pub fn ascii(s: &str) -> i32 {
 /// out-of-range values raise PG's errors.
 pub fn chr(n: i32) -> Result<String> {
     if n == 0 {
-        return Err(TextError::new(sqlstate::PROGRAM_LIMIT_EXCEEDED, "null character not permitted"));
+        return Err(TextError::new(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "null character not permitted",
+        ));
     }
     if n < 0 {
         return Err(TextError::new(
@@ -315,14 +337,21 @@ pub fn split_part(s: &str, delim: &str, n: i32) -> Result<String> {
             "field position must not be zero",
         ));
     }
-    let parts: Vec<&str> = if delim.is_empty() { vec![s] } else { s.split(delim).collect() };
+    let parts: Vec<&str> = if delim.is_empty() {
+        vec![s]
+    } else {
+        s.split(delim).collect()
+    };
     let idx: Option<usize> = if n > 0 {
         Some((n - 1) as usize)
     } else {
         let from_end = (-n) as usize;
         parts.len().checked_sub(from_end)
     };
-    Ok(idx.and_then(|i| parts.get(i)).map(|x| x.to_string()).unwrap_or_default())
+    Ok(idx
+        .and_then(|i| parts.get(i))
+        .map(|x| x.to_string())
+        .unwrap_or_default())
 }
 
 /// `starts_with(string, prefix)`.
@@ -496,7 +525,9 @@ fn copy_bracket(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut Stri
                 // A POSIX class/collating/equivalence sub-expression: copy it
                 // through its matching `:]` / `.]` / `=]` so the inner `]` does
                 // not prematurely close the outer class.
-                let kind = *chars.peek().unwrap();
+                let Some(&kind) = chars.peek() else {
+                    break;
+                };
                 out.push('[');
                 out.push(kind);
                 chars.next();
@@ -633,12 +664,20 @@ fn encode_base64(bytes: &[u8]) -> String {
         push(
             &mut out,
             &mut col,
-            if chunk.len() > 1 { BASE64[(n >> 6) as usize & 63] as char } else { '=' },
+            if chunk.len() > 1 {
+                BASE64[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            },
         );
         push(
             &mut out,
             &mut col,
-            if chunk.len() > 2 { BASE64[n as usize & 63] as char } else { '=' },
+            if chunk.len() > 2 {
+                BASE64[n as usize & 63] as char
+            } else {
+                '='
+            },
         );
     }
     out
@@ -710,8 +749,12 @@ fn base64_val(c: u8) -> Option<u8> {
 }
 
 fn decode_base64(s: &str) -> Result<Vec<u8>> {
-    let end_seq =
-        || TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "invalid base64 end sequence");
+    let end_seq = || {
+        TextError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid base64 end sequence",
+        )
+    };
     let mut out = Vec::new();
     let mut buf = 0u32;
     let mut bits = 0u32;
@@ -732,7 +775,10 @@ fn decode_base64(s: &str) -> Result<Vec<u8>> {
         let v = base64_val(c).ok_or_else(|| {
             TextError::new(
                 sqlstate::INVALID_PARAMETER_VALUE,
-                format!("invalid symbol \"{}\" found while decoding base64 sequence", c as char),
+                format!(
+                    "invalid symbol \"{}\" found while decoding base64 sequence",
+                    c as char
+                ),
             )
         })?;
         buf = (buf << 6) | v as u32;
@@ -788,11 +834,9 @@ fn decode_escape(s: &str) -> Vec<u8> {
 /// identifier.
 pub fn quote_ident(s: &str) -> String {
     let bare = !s.is_empty()
-        && s.chars().enumerate().all(|(i, c)| {
-            c == '_'
-                || c.is_ascii_lowercase()
-                || (i > 0 && c.is_ascii_digit())
-        });
+        && s.chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit()));
     if bare {
         s.to_string()
     } else {
@@ -840,7 +884,10 @@ pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
             ));
         }
         args.get(n - 1).ok_or_else(|| {
-            TextError::new(sqlstate::INVALID_PARAMETER_VALUE, "too few arguments for format()")
+            TextError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "too few arguments for format()",
+            )
         })
     };
     let mut out = String::new();
@@ -855,7 +902,11 @@ pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
             *i += 1;
         }
         if *i > start && *i < chars.len() && chars[*i] == '$' {
-            let n: usize = chars[start..*i].iter().collect::<String>().parse().unwrap_or(0);
+            let n: usize = chars[start..*i]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
             *i += 1;
             Some(n)
         } else {
@@ -896,7 +947,10 @@ pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
                 a
             });
             // A null width is treated as no width, matching PG.
-            let w: i64 = arg_at(pos)?.as_deref().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            let w: i64 = arg_at(pos)?
+                .as_deref()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
             width = Some(w);
         } else if i < chars.len() && chars[i].is_ascii_digit() {
             let start = i;
@@ -943,7 +997,10 @@ pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
             }
         };
         // Pad the formatted piece to the requested field width with spaces.
-        let pad = width.map(|w| w as usize).unwrap_or(0).saturating_sub(char_length(&piece) as usize);
+        let pad = width
+            .map(|w| w as usize)
+            .unwrap_or(0)
+            .saturating_sub(char_length(&piece) as usize);
         if pad > 0 && !left_justify {
             out.extend(std::iter::repeat(' ').take(pad));
         }
@@ -1024,6 +1081,7 @@ pub fn name_input(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1041,51 +1099,64 @@ mod tests {
     }
 
     #[test]
-    fn substr_semantics() {
-        assert_eq!(substr("abcdef", 2, Some(3)).unwrap(), "bcd");
-        assert_eq!(substr("café", 2, None).unwrap(), "afé");
-        assert_eq!(substr("abcdef", 0, Some(2)).unwrap(), "a");
+    fn substr_semantics() -> anyhow::Result<()> {
+        assert_eq!(substr("abcdef", 2, Some(3))?, "bcd");
+        assert_eq!(substr("café", 2, None)?, "afé");
+        assert_eq!(substr("abcdef", 0, Some(2))?, "a");
         assert_eq!(substr("abc", 2, Some(-1)).unwrap_err().sqlstate, "22011");
+
+        Ok(())
     }
 
     #[test]
-    fn strpos_and_overlay() {
+    fn strpos_and_overlay() -> anyhow::Result<()> {
         assert_eq!(strpos("abcabc", "bc"), 2);
         assert_eq!(strpos("abc", ""), 1);
         assert_eq!(strpos("abc", "z"), 0);
-        assert_eq!(overlay("Txxxxas", "hom", 2, Some(4)).unwrap(), "Thomas");
+        assert_eq!(overlay("Txxxxas", "hom", 2, Some(4))?, "Thomas");
         // A start of 0 (or below) is a negative-substring error, as in PG.
         assert_eq!(overlay("abc", "X", 0, None).unwrap_err().sqlstate, "22011");
+
+        Ok(())
     }
 
     #[test]
-    fn pad_and_trim() {
-        assert_eq!(pad("abcdef", 3, " ", true).unwrap(), "abc");
-        assert_eq!(pad("ab", 5, "xy", false).unwrap(), "abxyx");
-        assert_eq!(pad("ab", 5, "", true).unwrap(), "ab");
-        assert_eq!(pad("abc", -1, " ", true).unwrap(), "");
+    fn pad_and_trim() -> anyhow::Result<()> {
+        assert_eq!(pad("abcdef", 3, " ", true)?, "abc");
+        assert_eq!(pad("ab", 5, "xy", false)?, "abxyx");
+        assert_eq!(pad("ab", 5, "", true)?, "ab");
+        assert_eq!(pad("abc", -1, " ", true)?, "");
         // A length past MaxAllocSize is rejected instead of allocating.
-        assert_eq!(pad("a", 2_000_000_000, "x", true).unwrap_err().sqlstate, "54000");
+        assert_eq!(
+            pad("a", 2_000_000_000, "x", true).unwrap_err().sqlstate,
+            "54000"
+        );
         assert_eq!(trim("xxabcxx", "x", TrimSide::Both), "abc");
+
+        Ok(())
     }
 
     #[test]
-    fn translate_replace_repeat() {
+    fn translate_replace_repeat() -> anyhow::Result<()> {
         assert_eq!(translate("12345", "143", "ax"), "a2x5");
         assert_eq!(replace("abcabc", "", "X"), "abcabc");
-        assert_eq!(repeat("x", -2).unwrap(), "");
-        assert_eq!(repeat("x", 3).unwrap(), "xxx");
+        assert_eq!(repeat("x", -2)?, "");
+        assert_eq!(repeat("x", 3)?, "xxx");
         assert_eq!(repeat("ab", 2_000_000_000).unwrap_err().sqlstate, "54000");
         assert_eq!(reverse("café"), "éfac");
+
+        Ok(())
     }
 
     #[test]
-    fn left_right_split() {
+    fn left_right_split() -> anyhow::Result<()> {
         assert_eq!(left("abc", -1), "ab");
         assert_eq!(right("abc", -1), "bc");
-        assert_eq!(split_part("a,b,c", ",", -1).unwrap(), "c");
-        assert_eq!(split_part("abc", "", 1).unwrap(), "abc");
+        assert_eq!(split_part("a,b,c", ",", -1)?, "c");
+        assert_eq!(split_part("abc", "", 1)?, "abc");
         assert_eq!(split_part("a", ",", 0).unwrap_err().sqlstate, "22023");
+
+        Ok(())
     }
 
     #[test]
@@ -1095,98 +1166,124 @@ mod tests {
         assert_eq!(chr(-1).unwrap_err().sqlstate, "22023");
         assert_eq!(chr(1114112).unwrap_err().sqlstate, "54000");
         // A surrogate code point is "not valid", distinct from "too large".
-        assert_eq!(chr(55296).unwrap_err().message, "requested character not valid for encoding: 55296");
+        assert_eq!(
+            chr(55296).unwrap_err().message,
+            "requested character not valid for encoding: 55296"
+        );
         assert_eq!(to_hex_i32(-1), "ffffffff");
     }
 
     #[test]
-    fn like_matching() {
-        assert!(like("abc", "a%", None, false).unwrap());
-        assert!(like("abc", "a_c", None, false).unwrap());
-        assert!(!like("abc", "a_", None, false).unwrap());
-        assert!(like("ABC", "abc", None, true).unwrap());
-        assert!(like("a%b", "a\\%b", Some('\\'), false).unwrap());
-        assert!(!like("axb", "a\\%b", Some('\\'), false).unwrap());
+    fn like_matching() -> anyhow::Result<()> {
+        assert!(like("abc", "a%", None, false)?);
+        assert!(like("abc", "a_c", None, false)?);
+        assert!(!like("abc", "a_", None, false)?);
+        assert!(like("ABC", "abc", None, true)?);
+        assert!(like("a%b", "a\\%b", Some('\\'), false)?);
+        assert!(!like("axb", "a\\%b", Some('\\'), false)?);
+
+        Ok(())
     }
 
     #[test]
-    fn regex_matching() {
+    fn regex_matching() -> anyhow::Result<()> {
         // `~` is an unanchored (substring) match.
-        assert!(regex_match("abc", "b", false).unwrap());
-        assert!(regex_match("abc", "^a", false).unwrap());
-        assert!(!regex_match("abc", "^b", false).unwrap());
-        assert!(!regex_match("abc", "z", false).unwrap());
+        assert!(regex_match("abc", "b", false)?);
+        assert!(regex_match("abc", "^a", false)?);
+        assert!(!regex_match("abc", "^b", false)?);
+        assert!(!regex_match("abc", "z", false)?);
         // `~*` is case-insensitive.
-        assert!(regex_match("ABC", "abc", true).unwrap());
-        assert!(!regex_match("ABC", "abc", false).unwrap());
+        assert!(regex_match("ABC", "abc", true)?);
+        assert!(!regex_match("ABC", "abc", false)?);
         // A malformed pattern raises `invalid regular expression` (2201B).
         let e = regex_match("abc", "a(", false).unwrap_err();
         assert_eq!(e.sqlstate, "2201B");
         assert!(e.message.starts_with("invalid regular expression:"));
+
+        Ok(())
     }
 
     #[test]
-    fn similar_to_matching() {
+    fn similar_to_matching() -> anyhow::Result<()> {
         // SIMILAR TO matches the whole string (anchored).
-        assert!(similar_to_match("abc", "a%", Some('\\')).unwrap());
-        assert!(!similar_to_match("abc", "a", Some('\\')).unwrap());
-        assert!(similar_to_match("abc", "a_c", Some('\\')).unwrap());
+        assert!(similar_to_match("abc", "a%", Some('\\'))?);
+        assert!(!similar_to_match("abc", "a", Some('\\'))?);
+        assert!(similar_to_match("abc", "a_c", Some('\\'))?);
         // Alternation and grouping are SQL-regex metacharacters.
-        assert!(similar_to_match("abc", "(a|z)%", Some('\\')).unwrap());
+        assert!(similar_to_match("abc", "(a|z)%", Some('\\'))?);
         // A literal `.` must not act as a wildcard.
-        assert!(!similar_to_match("axc", "a.c", Some('\\')).unwrap());
-        assert!(similar_to_match("a.c", "a.c", Some('\\')).unwrap());
+        assert!(!similar_to_match("axc", "a.c", Some('\\'))?);
+        assert!(similar_to_match("a.c", "a.c", Some('\\'))?);
         // The escape character makes the next character a literal.
-        assert!(similar_to_match("a%c", "a\\%c", Some('\\')).unwrap());
-        assert!(!similar_to_match("axc", "a\\%c", Some('\\')).unwrap());
+        assert!(similar_to_match("a%c", "a\\%c", Some('\\'))?);
+        assert!(!similar_to_match("axc", "a\\%c", Some('\\'))?);
         // Escaping a metacharacter shared with regex keeps it literal (not raw).
-        assert!(similar_to_match("a|b", "a\\|b", Some('\\')).unwrap());
-        assert!(!similar_to_match("a", "a\\|b", Some('\\')).unwrap());
-        assert!(similar_to_match("(", "\\(", Some('\\')).unwrap());
+        assert!(similar_to_match("a|b", "a\\|b", Some('\\'))?);
+        assert!(!similar_to_match("a", "a\\|b", Some('\\'))?);
+        assert!(similar_to_match("(", "\\(", Some('\\'))?);
         // A trailing bare escape is an error.
-        assert_eq!(similar_to_match("abc", "abc\\", Some('\\')).unwrap_err().sqlstate, "22025");
+        assert_eq!(
+            similar_to_match("abc", "abc\\", Some('\\'))
+                .unwrap_err()
+                .sqlstate,
+            "22025"
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn similar_to_bracket_expressions() {
+    fn similar_to_bracket_expressions() -> anyhow::Result<()> {
         // Inside `[...]`, `%` and `_` are literal members, not wildcards.
-        assert!(similar_to_match("%", "[%_]", Some('\\')).unwrap());
-        assert!(similar_to_match("_", "[%_]", Some('\\')).unwrap());
-        assert!(!similar_to_match("x", "[%_]", Some('\\')).unwrap());
-        assert!(similar_to_match("_", "[_]", Some('\\')).unwrap());
-        assert!(!similar_to_match(".", "[_]", Some('\\')).unwrap());
+        assert!(similar_to_match("%", "[%_]", Some('\\'))?);
+        assert!(similar_to_match("_", "[%_]", Some('\\'))?);
+        assert!(!similar_to_match("x", "[%_]", Some('\\'))?);
+        assert!(similar_to_match("_", "[_]", Some('\\'))?);
+        assert!(!similar_to_match(".", "[_]", Some('\\'))?);
         // Negated classes work (a leading `^` is class negation, not a literal).
-        assert!(similar_to_match("b", "[^a]", Some('\\')).unwrap());
-        assert!(!similar_to_match("a", "[^a]", Some('\\')).unwrap());
+        assert!(similar_to_match("b", "[^a]", Some('\\'))?);
+        assert!(!similar_to_match("a", "[^a]", Some('\\'))?);
         // Ranges and POSIX classes pass through.
-        assert!(similar_to_match("-", "[a-]", Some('\\')).unwrap());
-        assert!(similar_to_match("a", "[[:alpha:]]", Some('\\')).unwrap());
-        assert!(!similar_to_match("1", "[[:alpha:]]", Some('\\')).unwrap());
+        assert!(similar_to_match("-", "[a-]", Some('\\'))?);
+        assert!(similar_to_match("a", "[[:alpha:]]", Some('\\'))?);
+        assert!(!similar_to_match("1", "[[:alpha:]]", Some('\\'))?);
         // An unbalanced bracket is rejected, as in PG.
-        assert_eq!(similar_to_match("a", "a[", Some('\\')).unwrap_err().sqlstate, "2201B");
+        assert_eq!(
+            similar_to_match("a", "a[", Some('\\'))
+                .unwrap_err()
+                .sqlstate,
+            "2201B"
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn similar_to_newline_and_braces() {
+    fn similar_to_newline_and_braces() -> anyhow::Result<()> {
         // `%` and `_` match any character, including a newline.
-        assert!(similar_to_match("a\nb", "a%b", Some('\\')).unwrap());
-        assert!(similar_to_match("a\nb", "a_b", Some('\\')).unwrap());
+        assert!(similar_to_match("a\nb", "a%b", Some('\\'))?);
+        assert!(similar_to_match("a\nb", "a_b", Some('\\'))?);
         // A valid bound is a quantifier; an invalid `{` is a literal.
-        assert!(similar_to_match("aa", "a{2}", Some('\\')).unwrap());
-        assert!(!similar_to_match("a", "a{2}", Some('\\')).unwrap());
-        assert!(similar_to_match("a{c", "a{c", Some('\\')).unwrap());
-        assert!(!similar_to_match("ac", "a{c", Some('\\')).unwrap());
+        assert!(similar_to_match("aa", "a{2}", Some('\\'))?);
+        assert!(!similar_to_match("a", "a{2}", Some('\\'))?);
+        assert!(similar_to_match("a{c", "a{c", Some('\\'))?);
+        assert!(!similar_to_match("ac", "a{c", Some('\\'))?);
+
+        Ok(())
     }
 
     #[test]
-    fn encode_decode_roundtrip() {
-        assert_eq!(encode(&[0x00, 0x10, 0x00], "hex").unwrap(), "001000");
-        assert_eq!(encode(b"abc", "base64").unwrap(), "YWJj");
-        assert_eq!(encode(b"a\x00b", "escape").unwrap(), "a\\000b");
-        assert_eq!(decode("YWJj", "base64").unwrap(), b"abc");
-        assert_eq!(decode("001000", "hex").unwrap(), vec![0x00, 0x10, 0x00]);
+    fn encode_decode_roundtrip() -> anyhow::Result<()> {
+        assert_eq!(encode(&[0x00, 0x10, 0x00], "hex")?, "001000");
+        assert_eq!(encode(b"abc", "base64")?, "YWJj");
+        assert_eq!(encode(b"a\x00b", "escape")?, "a\\000b");
+        assert_eq!(decode("YWJj", "base64")?, b"abc");
+        assert_eq!(decode("001000", "hex")?, vec![0x00, 0x10, 0x00]);
         // Malformed base64 (missing padding / lone trailing symbol) is rejected.
-        assert_eq!(decode("abc", "base64").unwrap_err().message, "invalid base64 end sequence");
+        assert_eq!(
+            decode("abc", "base64").unwrap_err().message,
+            "invalid base64 end sequence"
+        );
         assert_eq!(
             decode("a@b", "base64").unwrap_err().message,
             "invalid symbol \"@\" found while decoding base64 sequence"
@@ -1195,37 +1292,52 @@ mod tests {
             decode("xy", "hex").unwrap_err().message,
             "invalid hexadecimal digit: \"x\""
         );
+
+        Ok(())
     }
 
     #[test]
-    fn quoting_and_format() {
+    fn quoting_and_format() -> anyhow::Result<()> {
         assert_eq!(quote_ident("foo bar"), "\"foo bar\"");
         assert_eq!(quote_ident("foo"), "foo");
         assert_eq!(quote_literal("a\\b'c"), "E'a\\\\b''c'");
         assert_eq!(quote_nullable(None), "NULL");
         assert_eq!(
-            format("%s-%I-%L", &[Some("a".into()), Some("b c".into()), Some("d'e".into())]).unwrap(),
+            format(
+                "%s-%I-%L",
+                &[Some("a".into()), Some("b c".into()), Some("d'e".into())]
+            )?,
             "a-\"b c\"-'d''e'"
         );
-        assert_eq!(format("%1$s %1$s", &[Some("x".into())]).unwrap(), "x x");
+        assert_eq!(format("%1$s %1$s", &[Some("x".into())])?, "x x");
         // Field width: right- and left-justified, and `*` reading a width arg.
-        assert_eq!(format("%5s|", &[Some("x".into())]).unwrap(), "    x|");
-        assert_eq!(format("%-5s|", &[Some("x".into())]).unwrap(), "x    |");
-        assert_eq!(format("%*s", &[Some("3".into()), Some("x".into())]).unwrap(), "  x");
-        assert_eq!(format("%%", &[]).unwrap(), "%");
-        assert_eq!(format("%", &[]).unwrap_err().message, "unterminated format() type specifier");
+        assert_eq!(format("%5s|", &[Some("x".into())])?, "    x|");
+        assert_eq!(format("%-5s|", &[Some("x".into())])?, "x    |");
+        assert_eq!(format("%*s", &[Some("3".into()), Some("x".into())])?, "  x");
+        assert_eq!(format("%%", &[])?, "%");
+        assert_eq!(
+            format("%", &[]).unwrap_err().message,
+            "unterminated format() type specifier"
+        );
         assert_eq!(
             format("%0$s", &[Some("x".into())]).unwrap_err().message,
             "format specifies argument 0, but arguments are numbered from 1"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn char_length_coercion() {
-        assert_eq!(bpchar_input("ab", 5, false).unwrap(), "ab   ");
-        assert_eq!(varchar_input("abcdef", 3, true).unwrap(), "abc");
-        assert_eq!(varchar_input("ab   ", 2, false).unwrap(), "ab");
-        assert_eq!(varchar_input("abcdef", 3, false).unwrap_err().sqlstate, "22001");
+    fn char_length_coercion() -> anyhow::Result<()> {
+        assert_eq!(bpchar_input("ab", 5, false)?, "ab   ");
+        assert_eq!(varchar_input("abcdef", 3, true)?, "abc");
+        assert_eq!(varchar_input("ab   ", 2, false)?, "ab");
+        assert_eq!(
+            varchar_input("abcdef", 3, false).unwrap_err().sqlstate,
+            "22001"
+        );
         assert_eq!(bpchar_rtrim("ab   "), "ab");
+
+        Ok(())
     }
 }

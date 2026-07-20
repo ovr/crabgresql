@@ -35,12 +35,18 @@ async fn main() -> std::io::Result<()> {
 
     let (engine, txnmgr): (Arc<dyn TableEngine>, Arc<TransactionManager>) = match &cli.data_dir {
         Some(dir) => {
-            tracing::info!("opening durable heap engine at {} (running recovery)", dir.display());
+            tracing::info!(
+                "opening durable heap engine at {} (running recovery)",
+                dir.display()
+            );
             crabgresql_server::open_pg_engine(dir)?
         }
         None => {
             tracing::info!("no --data-dir: using the in-memory engine (data is not persisted)");
-            (Arc::new(MemoryEngine::new()), Arc::new(TransactionManager::new()))
+            (
+                Arc::new(MemoryEngine::new()),
+                Arc::new(TransactionManager::new()),
+            )
         }
     };
 

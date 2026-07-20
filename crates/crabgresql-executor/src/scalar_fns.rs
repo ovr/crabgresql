@@ -9,9 +9,9 @@
 
 use std::hint::black_box;
 
+use crabgresql_binder::GeoFn;
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_binder::GeoFn;
 use crabgresql_types::{
     Inet, Interval, Numeric, TimeTz, Value, bit, date, float, geo, interval, macaddr, money, net,
     text, time, timestamp, timestamptz, timetz, to_char,
@@ -26,15 +26,24 @@ fn err(sqlstate: &'static str, message: impl Into<String>) -> ExecError {
 }
 
 fn overflow() -> ExecError {
-    err(sqlstate::NUMERIC_VALUE_OUT_OF_RANGE, "value out of range: overflow")
+    err(
+        sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+        "value out of range: overflow",
+    )
 }
 
 fn underflow() -> ExecError {
-    err(sqlstate::NUMERIC_VALUE_OUT_OF_RANGE, "value out of range: underflow")
+    err(
+        sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+        "value out of range: underflow",
+    )
 }
 
 fn out_of_range_input() -> ExecError {
-    err(sqlstate::NUMERIC_VALUE_OUT_OF_RANGE, "input is out of range")
+    err(
+        sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+        "input is out of range",
+    )
 }
 
 /// Evaluate a scalar function. All functions are STRICT: a NULL argument yields
@@ -57,8 +66,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             let Some(sep) = args.first().and_then(|a| a.encode_text()) else {
                 return Ok(Value::Null);
             };
-            let parts: Vec<String> =
-                args[1..].iter().filter_map(|a| a.encode_text()).collect();
+            let parts: Vec<String> = args[1..].iter().filter_map(|a| a.encode_text()).collect();
             return Ok(Value::Text(parts.join(&sep)));
         }
         ScalarFn::Format => {
@@ -68,11 +76,15 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             };
             let fmt_args: Vec<text::FormatArg> =
                 args[1..].iter().map(|a| a.encode_text()).collect();
-            return text::format(&fmt, &fmt_args).map(Value::Text).map_err(text_err);
+            return text::format(&fmt, &fmt_args)
+                .map(Value::Text)
+                .map_err(text_err);
         }
         // quote_nullable is non-strict: a NULL argument becomes the text `NULL`.
         ScalarFn::QuoteNullable => {
-            return Ok(Value::Text(text::quote_nullable(args[0].encode_text().as_deref())));
+            return Ok(Value::Text(text::quote_nullable(
+                args[0].encode_text().as_deref(),
+            )));
         }
         _ => {}
     }
@@ -124,13 +136,23 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 .map_err(text_err);
         }
         ScalarFn::Replace => {
-            return Ok(Value::Text(text::replace(text(&args[0]), text(&args[1]), text(&args[2]))));
+            return Ok(Value::Text(text::replace(
+                text(&args[0]),
+                text(&args[1]),
+                text(&args[2]),
+            )));
         }
         ScalarFn::Translate => {
-            return Ok(Value::Text(text::translate(text(&args[0]), text(&args[1]), text(&args[2]))));
+            return Ok(Value::Text(text::translate(
+                text(&args[0]),
+                text(&args[1]),
+                text(&args[2]),
+            )));
         }
         ScalarFn::Repeat => {
-            return text::repeat(text(&args[0]), i4(&args[1])).map(Value::Text).map_err(text_err);
+            return text::repeat(text(&args[0]), i4(&args[1]))
+                .map(Value::Text)
+                .map_err(text_err);
         }
         ScalarFn::Reverse => return Ok(Value::Text(text::reverse(text(&args[0])))),
         ScalarFn::Left => return Ok(Value::Text(text::left(text(&args[0]), i4(&args[1])))),
@@ -143,7 +165,10 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 .map_err(text_err);
         }
         ScalarFn::StartsWith => {
-            return Ok(Value::Bool(text::starts_with(text(&args[0]), text(&args[1]))));
+            return Ok(Value::Bool(text::starts_with(
+                text(&args[0]),
+                text(&args[1]),
+            )));
         }
         ScalarFn::ToHex => return Ok(Value::Text(text::to_hex_i32(i4(&args[0])))),
         ScalarFn::ToHexInt8 => return Ok(Value::Text(text::to_hex_i64(i8(&args[0])))),
@@ -240,7 +265,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 ScalarFn::BitOr => bit::or(la, da, lb, db),
                 _ => bit::xor(la, da, lb, db),
             };
-            return r.map(|(len, data)| Value::Bit { len, data }).map_err(bit_err);
+            return r
+                .map(|(len, data)| Value::Bit { len, data })
+                .map_err(bit_err);
         }
         ScalarFn::BitConcat => {
             let (la, da) = bits(&args[0]);
@@ -265,7 +292,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         ScalarFn::GetBit => {
             let (len, data) = bits(&args[0]);
-            return bit::get_bit(len, data, i4(&args[1])).map(Value::Int4).map_err(bit_err);
+            return bit::get_bit(len, data, i4(&args[1]))
+                .map(Value::Int4)
+                .map_err(bit_err);
         }
         ScalarFn::SetBit => {
             let (len, data) = bits(&args[0]);
@@ -323,16 +352,20 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         ScalarFn::DatePart => {
             // `None` is SQL NULL (an oscillating field on ±infinity).
-            return Ok(match timestamp::date_part(text(&args[0]), ts(&args[1])).map_err(ts_err)? {
-                Some(v) => Value::Float8(v),
-                None => Value::Null,
-            });
+            return Ok(
+                match timestamp::date_part(text(&args[0]), ts(&args[1])).map_err(ts_err)? {
+                    Some(v) => Value::Float8(v),
+                    None => Value::Null,
+                },
+            );
         }
         ScalarFn::Extract => {
-            return Ok(match timestamp::extract(text(&args[0]), ts(&args[1])).map_err(ts_err)? {
-                Some(n) => Value::Numeric(n),
-                None => Value::Null,
-            });
+            return Ok(
+                match timestamp::extract(text(&args[0]), ts(&args[1])).map_err(ts_err)? {
+                    Some(n) => Value::Numeric(n),
+                    None => Value::Null,
+                },
+            );
         }
         ScalarFn::DateTrunc => {
             return timestamp::date_trunc(text(&args[0]), ts(&args[1]))
@@ -419,7 +452,10 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::NumAbs => return Ok(Value::Numeric(num(&args[0]).abs())),
         ScalarFn::NumSign => return Ok(Value::Numeric(num(&args[0]).signum())),
         ScalarFn::NumMod => {
-            return num(&args[0]).modulo(num(&args[1])).map(Value::Numeric).map_err(num_err);
+            return num(&args[0])
+                .modulo(num(&args[1]))
+                .map(Value::Numeric)
+                .map_err(num_err);
         }
         // `mod(intN, intN)`: remainder truncated toward zero (`MIN % -1 = 0`),
         // division by zero is 22012 — same semantics as the `%` operator.
@@ -427,13 +463,25 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             let zero = || err(sqlstate::DIVISION_BY_ZERO, "division by zero");
             return match (&args[0], &args[1]) {
                 (Value::Int2(a), Value::Int2(b)) => {
-                    if *b == 0 { Err(zero()) } else { Ok(Value::Int2(a.checked_rem(*b).unwrap_or(0))) }
+                    if *b == 0 {
+                        Err(zero())
+                    } else {
+                        Ok(Value::Int2(a.checked_rem(*b).unwrap_or(0)))
+                    }
                 }
                 (Value::Int4(a), Value::Int4(b)) => {
-                    if *b == 0 { Err(zero()) } else { Ok(Value::Int4(a.checked_rem(*b).unwrap_or(0))) }
+                    if *b == 0 {
+                        Err(zero())
+                    } else {
+                        Ok(Value::Int4(a.checked_rem(*b).unwrap_or(0)))
+                    }
                 }
                 (Value::Int8(a), Value::Int8(b)) => {
-                    if *b == 0 { Err(zero()) } else { Ok(Value::Int8(a.checked_rem(*b).unwrap_or(0))) }
+                    if *b == 0 {
+                        Err(zero())
+                    } else {
+                        Ok(Value::Int8(a.checked_rem(*b).unwrap_or(0)))
+                    }
                 }
                 (a, b) => unreachable!("mod(int) on {a:?}, {b:?}"),
             };
@@ -444,11 +492,17 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::NumLn => return num(&args[0]).ln().map(Value::Numeric).map_err(num_err),
         ScalarFn::NumLog10 => return num(&args[0]).log10().map(Value::Numeric).map_err(num_err),
         ScalarFn::NumLog => {
-            return num(&args[0]).log_base(num(&args[1])).map(Value::Numeric).map_err(num_err);
+            return num(&args[0])
+                .log_base(num(&args[1]))
+                .map(Value::Numeric)
+                .map_err(num_err);
         }
         ScalarFn::NumExp => return num(&args[0]).exp().map(Value::Numeric).map_err(num_err),
         ScalarFn::NumPower => {
-            return num(&args[0]).power(num(&args[1])).map(Value::Numeric).map_err(num_err);
+            return num(&args[0])
+                .power(num(&args[1]))
+                .map(Value::Numeric)
+                .map_err(num_err);
         }
         ScalarFn::NumApplyTypmod => {
             return num(&args[0])
@@ -469,33 +523,52 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
 
         // --- interval operators ---
         ScalarFn::IntervalNeg => {
-            return interval::negate(iv(&args[0])).map(Value::Interval).map_err(iv_err);
+            return interval::negate(iv(&args[0]))
+                .map(Value::Interval)
+                .map_err(iv_err);
         }
         ScalarFn::IntervalPl => {
-            return interval::add(iv(&args[0]), iv(&args[1])).map(Value::Interval).map_err(iv_err);
+            return interval::add(iv(&args[0]), iv(&args[1]))
+                .map(Value::Interval)
+                .map_err(iv_err);
         }
         ScalarFn::IntervalMi => {
-            return interval::sub(iv(&args[0]), iv(&args[1])).map(Value::Interval).map_err(iv_err);
+            return interval::sub(iv(&args[0]), iv(&args[1]))
+                .map(Value::Interval)
+                .map_err(iv_err);
         }
         ScalarFn::IntervalMul => {
-            return interval::mul(iv(&args[0]), f8(&args[1])).map(Value::Interval).map_err(iv_err);
+            return interval::mul(iv(&args[0]), f8(&args[1]))
+                .map(Value::Interval)
+                .map_err(iv_err);
         }
         ScalarFn::IntervalDiv => {
-            return interval::div(iv(&args[0]), f8(&args[1])).map(Value::Interval).map_err(iv_err);
+            return interval::div(iv(&args[0]), f8(&args[1]))
+                .map(Value::Interval)
+                .map_err(iv_err);
         }
         ScalarFn::TimestampPlInterval => {
-            return timestamp::pl_interval(ts(&args[0]), iv(&args[1])).map(Value::Timestamp).map_err(ts_err);
+            return timestamp::pl_interval(ts(&args[0]), iv(&args[1]))
+                .map(Value::Timestamp)
+                .map_err(ts_err);
         }
         ScalarFn::TimestampMiInterval => {
-            return timestamp::mi_interval(ts(&args[0]), iv(&args[1])).map(Value::Timestamp).map_err(ts_err);
+            return timestamp::mi_interval(ts(&args[0]), iv(&args[1]))
+                .map(Value::Timestamp)
+                .map_err(ts_err);
         }
         ScalarFn::TimestampMi => {
-            return timestamp::mi(ts(&args[0]), ts(&args[1])).map(Value::Interval).map_err(ts_err);
+            return timestamp::mi(ts(&args[0]), ts(&args[1]))
+                .map(Value::Interval)
+                .map_err(ts_err);
         }
 
         // --- inet/cidr operators ---
         ScalarFn::NetworkContainedBy => {
-            return Ok(Value::Bool(net::contained_by(inet(&args[0]), inet(&args[1]))));
+            return Ok(Value::Bool(net::contained_by(
+                inet(&args[0]),
+                inet(&args[1]),
+            )));
         }
         ScalarFn::NetworkContains => {
             return Ok(Value::Bool(net::contains(inet(&args[0]), inet(&args[1]))));
@@ -504,20 +577,30 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             return Ok(Value::Bool(net::overlaps(inet(&args[0]), inet(&args[1]))));
         }
         ScalarFn::InetAnd => {
-            return net::bit_and(inet(&args[0]), inet(&args[1])).map(Value::Inet).map_err(net_err);
+            return net::bit_and(inet(&args[0]), inet(&args[1]))
+                .map(Value::Inet)
+                .map_err(net_err);
         }
         ScalarFn::InetOr => {
-            return net::bit_or(inet(&args[0]), inet(&args[1])).map(Value::Inet).map_err(net_err);
+            return net::bit_or(inet(&args[0]), inet(&args[1]))
+                .map(Value::Inet)
+                .map_err(net_err);
         }
         ScalarFn::InetNot => return Ok(Value::Inet(net::bit_not(inet(&args[0])))),
         ScalarFn::InetPlInt8 => {
-            return net::add_offset(inet(&args[0]), i8(&args[1])).map(Value::Inet).map_err(net_err);
+            return net::add_offset(inet(&args[0]), i8(&args[1]))
+                .map(Value::Inet)
+                .map_err(net_err);
         }
         ScalarFn::InetMiInt8 => {
-            return net::sub_offset(inet(&args[0]), i8(&args[1])).map(Value::Inet).map_err(net_err);
+            return net::sub_offset(inet(&args[0]), i8(&args[1]))
+                .map(Value::Inet)
+                .map_err(net_err);
         }
         ScalarFn::InetMi => {
-            return net::diff(inet(&args[0]), inet(&args[1])).map(Value::Int8).map_err(net_err);
+            return net::diff(inet(&args[0]), inet(&args[1]))
+                .map(Value::Int8)
+                .map_err(net_err);
         }
 
         // --- inet/cidr functions ---
@@ -566,19 +649,25 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
 
         // --- interval functions ---
         ScalarFn::DatePartInterval => {
-            return Ok(match interval::date_part(text(&args[0]), iv(&args[1])).map_err(iv_err)? {
-                Some(v) => Value::Float8(v),
-                None => Value::Null,
-            });
+            return Ok(
+                match interval::date_part(text(&args[0]), iv(&args[1])).map_err(iv_err)? {
+                    Some(v) => Value::Float8(v),
+                    None => Value::Null,
+                },
+            );
         }
         ScalarFn::ExtractInterval => {
-            return Ok(match interval::extract(text(&args[0]), iv(&args[1])).map_err(iv_err)? {
-                Some(n) => Value::Numeric(n),
-                None => Value::Null,
-            });
+            return Ok(
+                match interval::extract(text(&args[0]), iv(&args[1])).map_err(iv_err)? {
+                    Some(n) => Value::Numeric(n),
+                    None => Value::Null,
+                },
+            );
         }
         ScalarFn::DateTruncInterval => {
-            return interval::date_trunc(text(&args[0]), iv(&args[1])).map(Value::Interval).map_err(iv_err);
+            return interval::date_trunc(text(&args[0]), iv(&args[1]))
+                .map(Value::Interval)
+                .map_err(iv_err);
         }
         ScalarFn::IsfiniteInterval => {
             return Ok(Value::Bool(iv(&args[0]).is_finite()));
@@ -597,16 +686,24 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             .map_err(iv_err);
         }
         ScalarFn::JustifyDays => {
-            return interval::justify_days(iv(&args[0])).map(Value::Interval).map_err(iv_err);
+            return interval::justify_days(iv(&args[0]))
+                .map(Value::Interval)
+                .map_err(iv_err);
         }
         ScalarFn::JustifyHours => {
-            return interval::justify_hours(iv(&args[0])).map(Value::Interval).map_err(iv_err);
+            return interval::justify_hours(iv(&args[0]))
+                .map(Value::Interval)
+                .map_err(iv_err);
         }
         ScalarFn::JustifyInterval => {
-            return interval::justify_interval(iv(&args[0])).map(Value::Interval).map_err(iv_err);
+            return interval::justify_interval(iv(&args[0]))
+                .map(Value::Interval)
+                .map_err(iv_err);
         }
         ScalarFn::Age => {
-            return timestamp::age(ts(&args[0]), ts(&args[1])).map(Value::Interval).map_err(ts_err);
+            return timestamp::age(ts(&args[0]), ts(&args[1]))
+                .map(Value::Interval)
+                .map_err(ts_err);
         }
         ScalarFn::ToCharInterval => {
             // A non-finite interval yields NULL, matching PG.
@@ -618,45 +715,67 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
 
         // --- date operators/functions ---
         ScalarFn::DatePlDays => {
-            return date::add_days(dt(&args[0]), i4(&args[1])).map(Value::Date).map_err(date_err);
+            return date::add_days(dt(&args[0]), i4(&args[1]))
+                .map(Value::Date)
+                .map_err(date_err);
         }
         ScalarFn::DateMiDays => {
-            return date::sub_days(dt(&args[0]), i4(&args[1])).map(Value::Date).map_err(date_err);
+            return date::sub_days(dt(&args[0]), i4(&args[1]))
+                .map(Value::Date)
+                .map_err(date_err);
         }
         ScalarFn::DateMi => {
-            return date::sub_date(dt(&args[0]), dt(&args[1])).map(Value::Int4).map_err(date_err);
+            return date::sub_date(dt(&args[0]), dt(&args[1]))
+                .map(Value::Int4)
+                .map_err(date_err);
         }
         ScalarFn::DatePlInterval => {
-            return date::pl_interval(dt(&args[0]), iv(&args[1])).map(Value::Timestamp).map_err(date_err);
+            return date::pl_interval(dt(&args[0]), iv(&args[1]))
+                .map(Value::Timestamp)
+                .map_err(date_err);
         }
         ScalarFn::DateMiInterval => {
-            return date::mi_interval(dt(&args[0]), iv(&args[1])).map(Value::Timestamp).map_err(date_err);
+            return date::mi_interval(dt(&args[0]), iv(&args[1]))
+                .map(Value::Timestamp)
+                .map_err(date_err);
         }
         ScalarFn::DatePlTime => {
-            return date::pl_time(dt(&args[0]), tm(&args[1])).map(Value::Timestamp).map_err(date_err);
+            return date::pl_time(dt(&args[0]), tm(&args[1]))
+                .map(Value::Timestamp)
+                .map_err(date_err);
         }
         ScalarFn::DatePlTimeTz => {
-            return date::pl_timetz(dt(&args[0]), ttz(&args[1])).map(Value::TimestampTz).map_err(date_err);
+            return date::pl_timetz(dt(&args[0]), ttz(&args[1]))
+                .map(Value::TimestampTz)
+                .map_err(date_err);
         }
         ScalarFn::DatePartDate => {
-            return Ok(match date::date_part(text(&args[0]), dt(&args[1])).map_err(date_err)? {
-                Some(v) => Value::Float8(v),
-                None => Value::Null,
-            });
+            return Ok(
+                match date::date_part(text(&args[0]), dt(&args[1])).map_err(date_err)? {
+                    Some(v) => Value::Float8(v),
+                    None => Value::Null,
+                },
+            );
         }
         ScalarFn::ExtractDate => {
-            return Ok(match date::extract(text(&args[0]), dt(&args[1])).map_err(date_err)? {
-                Some(n) => Value::Numeric(n),
-                None => Value::Null,
-            });
+            return Ok(
+                match date::extract(text(&args[0]), dt(&args[1])).map_err(date_err)? {
+                    Some(n) => Value::Numeric(n),
+                    None => Value::Null,
+                },
+            );
         }
         ScalarFn::IsfiniteDate => {
             return Ok(Value::Bool(date::is_finite(dt(&args[0]))));
         }
         ScalarFn::MakeDate => {
-            return date::make_date(i4(&args[0]) as i64, i4(&args[1]) as i64, i4(&args[2]) as i64)
-                .map(Value::Date)
-                .map_err(date_err);
+            return date::make_date(
+                i4(&args[0]) as i64,
+                i4(&args[1]) as i64,
+                i4(&args[2]) as i64,
+            )
+            .map(Value::Date)
+            .map_err(date_err);
         }
 
         // --- time operators/functions ---
@@ -670,10 +789,14 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             return Ok(Value::Interval(time::mi(tm(&args[0]), tm(&args[1]))));
         }
         ScalarFn::DatePartTime => {
-            return time::date_part(text(&args[0]), tm(&args[1])).map(Value::Float8).map_err(time_err);
+            return time::date_part(text(&args[0]), tm(&args[1]))
+                .map(Value::Float8)
+                .map_err(time_err);
         }
         ScalarFn::ExtractTime => {
-            return time::extract(text(&args[0]), tm(&args[1])).map(Value::Numeric).map_err(time_err);
+            return time::extract(text(&args[0]), tm(&args[1]))
+                .map(Value::Numeric)
+                .map_err(time_err);
         }
         ScalarFn::MakeTime => {
             return time::make_time(i4(&args[0]) as i64, i4(&args[1]) as i64, f8(&args[2]))
@@ -683,51 +806,83 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
 
         // --- timetz operators/functions ---
         ScalarFn::TimeTzPlInterval => {
-            return Ok(Value::TimeTz(timetz::pl_interval(ttz(&args[0]), iv(&args[1]))));
+            return Ok(Value::TimeTz(timetz::pl_interval(
+                ttz(&args[0]),
+                iv(&args[1]),
+            )));
         }
         ScalarFn::TimeTzMiInterval => {
-            return Ok(Value::TimeTz(timetz::mi_interval(ttz(&args[0]), iv(&args[1]))));
+            return Ok(Value::TimeTz(timetz::mi_interval(
+                ttz(&args[0]),
+                iv(&args[1]),
+            )));
         }
         ScalarFn::DatePartTimeTz => {
-            return timetz::date_part(text(&args[0]), ttz(&args[1])).map(Value::Float8).map_err(timetz_err);
+            return timetz::date_part(text(&args[0]), ttz(&args[1]))
+                .map(Value::Float8)
+                .map_err(timetz_err);
         }
         ScalarFn::ExtractTimeTz => {
-            return timetz::extract(text(&args[0]), ttz(&args[1])).map(Value::Numeric).map_err(timetz_err);
+            return timetz::extract(text(&args[0]), ttz(&args[1]))
+                .map(Value::Numeric)
+                .map_err(timetz_err);
         }
 
         // --- money operators/functions ---
         ScalarFn::CashUm => {
-            return money::neg(money_of(&args[0])).map(Value::Money).map_err(cash_err);
+            return money::neg(money_of(&args[0]))
+                .map(Value::Money)
+                .map_err(cash_err);
         }
         ScalarFn::CashPl => {
-            return money::add(money_of(&args[0]), money_of(&args[1])).map(Value::Money).map_err(cash_err);
+            return money::add(money_of(&args[0]), money_of(&args[1]))
+                .map(Value::Money)
+                .map_err(cash_err);
         }
         ScalarFn::CashMi => {
-            return money::sub(money_of(&args[0]), money_of(&args[1])).map(Value::Money).map_err(cash_err);
+            return money::sub(money_of(&args[0]), money_of(&args[1]))
+                .map(Value::Money)
+                .map_err(cash_err);
         }
         ScalarFn::CashMulInt => {
-            return money::mul_int(money_of(&args[0]), i8(&args[1])).map(Value::Money).map_err(cash_err);
+            return money::mul_int(money_of(&args[0]), i8(&args[1]))
+                .map(Value::Money)
+                .map_err(cash_err);
         }
         ScalarFn::CashMulFlt => {
-            return money::mul_float(money_of(&args[0]), f8(&args[1])).map(Value::Money).map_err(cash_err);
+            return money::mul_float(money_of(&args[0]), f8(&args[1]))
+                .map(Value::Money)
+                .map_err(cash_err);
         }
         ScalarFn::CashDivInt => {
-            return money::div_int(money_of(&args[0]), i8(&args[1])).map(Value::Money).map_err(cash_err);
+            return money::div_int(money_of(&args[0]), i8(&args[1]))
+                .map(Value::Money)
+                .map_err(cash_err);
         }
         ScalarFn::CashDivFlt => {
-            return money::div_float(money_of(&args[0]), f8(&args[1])).map(Value::Money).map_err(cash_err);
+            return money::div_float(money_of(&args[0]), f8(&args[1]))
+                .map(Value::Money)
+                .map_err(cash_err);
         }
         ScalarFn::CashDivCash => {
-            return money::div_cash(money_of(&args[0]), money_of(&args[1])).map(Value::Float8).map_err(cash_err);
+            return money::div_cash(money_of(&args[0]), money_of(&args[1]))
+                .map(Value::Float8)
+                .map_err(cash_err);
         }
         ScalarFn::CashWords => {
             return Ok(Value::Text(money::words(money_of(&args[0]))));
         }
         ScalarFn::CashLarger => {
-            return Ok(Value::Money(money::larger(money_of(&args[0]), money_of(&args[1]))));
+            return Ok(Value::Money(money::larger(
+                money_of(&args[0]),
+                money_of(&args[1]),
+            )));
         }
         ScalarFn::CashSmaller => {
-            return Ok(Value::Money(money::smaller(money_of(&args[0]), money_of(&args[1]))));
+            return Ok(Value::Money(money::smaller(
+                money_of(&args[0]),
+                money_of(&args[1]),
+            )));
         }
         _ => {}
     }
@@ -830,10 +985,16 @@ fn dln(x: f64) -> Result<f64, ExecError> {
         return Ok(f64::NAN);
     }
     if x == 0.0 {
-        return Err(err(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of zero"));
+        return Err(err(
+            sqlstate::INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of zero",
+        ));
     }
     if x < 0.0 {
-        return Err(err(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of a negative number"));
+        return Err(err(
+            sqlstate::INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of a negative number",
+        ));
     }
     Ok(x.ln())
 }
@@ -844,10 +1005,16 @@ fn dlog10(x: f64) -> Result<f64, ExecError> {
         return Ok(f64::NAN);
     }
     if x == 0.0 {
-        return Err(err(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of zero"));
+        return Err(err(
+            sqlstate::INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of zero",
+        ));
     }
     if x < 0.0 {
-        return Err(err(sqlstate::INVALID_ARGUMENT_FOR_LOG, "cannot take logarithm of a negative number"));
+        return Err(err(
+            sqlstate::INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of a negative number",
+        ));
     }
     Ok(x.log10())
 }
@@ -857,7 +1024,11 @@ fn dgamma(x: f64) -> Result<f64, ExecError> {
         return Ok(f64::NAN);
     }
     if x.is_infinite() {
-        return if x > 0.0 { Ok(f64::INFINITY) } else { Err(overflow()) };
+        return if x > 0.0 {
+            Ok(f64::INFINITY)
+        } else {
+            Err(overflow())
+        };
     }
     let r = crate::special_fns::tgamma(x);
     if r.is_infinite() || r.is_nan() {
@@ -1026,11 +1197,7 @@ fn dasind(x: f64) -> Result<f64, ExecError> {
     if !(-1.0..=1.0).contains(&x) {
         return Err(out_of_range_input());
     }
-    Ok(if x >= 0.0 {
-        asind_q1(x)
-    } else {
-        -asind_q1(-x)
-    })
+    Ok(if x >= 0.0 { asind_q1(x) } else { -asind_q1(-x) })
 }
 
 fn dacosd(x: f64) -> Result<f64, ExecError> {
@@ -1075,22 +1242,30 @@ pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, Str
         "timestamptz" | "timestamp with time zone" => timestamptz::parse(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
-        "date" => date::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message)),
-        "time" | "time without time zone" => {
-            time::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message))
-        }
-        "timetz" | "time with time zone" => {
-            timetz::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message))
-        }
-        "money" => money::parse(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message)),
+        "date" => date::parse(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
+        "time" | "time without time zone" => time::parse(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
+        "timetz" | "time with time zone" => timetz::parse(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
+        "money" => money::parse(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
         "macaddr" => macaddr::parse_macaddr(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
         "macaddr8" => macaddr::parse_macaddr8(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
-        "point" => geo::parse_point(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message)),
-        "lseg" => geo::parse_lseg(value).map(|_| ()).map_err(|e| (e.sqlstate, e.message)),
+        "point" => geo::parse_point(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
+        "lseg" => geo::parse_lseg(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
         // Other types: not exercised; treat as valid.
         _ => Ok(()),
     }
@@ -1131,20 +1306,29 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
     let geo_err = |e: geo::GeoError| err(e.sqlstate, e.message);
     Ok(match g {
         GeoFn::PointConstruct => Value::Point([f8(&args[0]), f8(&args[1])]),
-        GeoFn::PointDist => {
-            Value::Float8(geo::point_distance(&point_of(&args[0]), &point_of(&args[1])))
-        }
+        GeoFn::PointDist => Value::Float8(geo::point_distance(
+            &point_of(&args[0]),
+            &point_of(&args[1]),
+        )),
         GeoFn::PointLeft => Value::Bool(geo::point_left(&point_of(&args[0]), &point_of(&args[1]))),
-        GeoFn::PointRight => Value::Bool(geo::point_right(&point_of(&args[0]), &point_of(&args[1]))),
-        GeoFn::PointAbove => Value::Bool(geo::point_above(&point_of(&args[0]), &point_of(&args[1]))),
-        GeoFn::PointBelow => Value::Bool(geo::point_below(&point_of(&args[0]), &point_of(&args[1]))),
+        GeoFn::PointRight => {
+            Value::Bool(geo::point_right(&point_of(&args[0]), &point_of(&args[1])))
+        }
+        GeoFn::PointAbove => {
+            Value::Bool(geo::point_above(&point_of(&args[0]), &point_of(&args[1])))
+        }
+        GeoFn::PointBelow => {
+            Value::Bool(geo::point_below(&point_of(&args[0]), &point_of(&args[1])))
+        }
         GeoFn::PointEq => Value::Bool(geo::point_eq(&point_of(&args[0]), &point_of(&args[1]))),
-        GeoFn::PointHoriz => {
-            Value::Bool(geo::point_horizontal(&point_of(&args[0]), &point_of(&args[1])))
-        }
-        GeoFn::PointVert => {
-            Value::Bool(geo::point_vertical(&point_of(&args[0]), &point_of(&args[1])))
-        }
+        GeoFn::PointHoriz => Value::Bool(geo::point_horizontal(
+            &point_of(&args[0]),
+            &point_of(&args[1]),
+        )),
+        GeoFn::PointVert => Value::Bool(geo::point_vertical(
+            &point_of(&args[0]),
+            &point_of(&args[1]),
+        )),
         GeoFn::PointAdd => {
             Value::Point(geo::point_add(&point_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
         }
@@ -1166,12 +1350,14 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::PointOnSeg => {
             Value::Bool(geo::point_on_seg(&point_of(&args[0]), &lseg_of(&args[1])))
         }
-        GeoFn::ClosePointSeg => {
-            Value::Point(geo::close_point_seg(&point_of(&args[0]), &lseg_of(&args[1])))
-        }
-        GeoFn::LsegConstruct => {
-            Value::Lseg(geo::lseg_from_points(&point_of(&args[0]), &point_of(&args[1])))
-        }
+        GeoFn::ClosePointSeg => Value::Point(geo::close_point_seg(
+            &point_of(&args[0]),
+            &lseg_of(&args[1]),
+        )),
+        GeoFn::LsegConstruct => Value::Lseg(geo::lseg_from_points(
+            &point_of(&args[0]),
+            &point_of(&args[1]),
+        )),
         GeoFn::LsegLength => Value::Float8(geo::lseg_length(&lseg_of(&args[0]))),
         GeoFn::LsegCenter => Value::Point(geo::lseg_center(&lseg_of(&args[0]))),
         GeoFn::LsegVert => Value::Bool(geo::lseg_vertical(&lseg_of(&args[0]))),
@@ -1185,9 +1371,10 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::LsegParallel => {
             Value::Bool(geo::lseg_parallel(&lseg_of(&args[0]), &lseg_of(&args[1])))
         }
-        GeoFn::LsegPerpendicular => {
-            Value::Bool(geo::lseg_perpendicular(&lseg_of(&args[0]), &lseg_of(&args[1])))
-        }
+        GeoFn::LsegPerpendicular => Value::Bool(geo::lseg_perpendicular(
+            &lseg_of(&args[0]),
+            &lseg_of(&args[1]),
+        )),
         GeoFn::LsegInterpt => match geo::lseg_interpt(&lseg_of(&args[0]), &lseg_of(&args[1])) {
             Some(p) => Value::Point(p),
             None => Value::Null,
@@ -1267,7 +1454,6 @@ fn timetz_err(e: crabgresql_types::timetz::TimeTzError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
 }
 
-
 fn i4(v: &Value) -> i32 {
     match v {
         Value::Int4(n) => *n,
@@ -1327,11 +1513,16 @@ fn num_err(e: crabgresql_types::numeric::NumErr) -> ExecError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn call(f: ScalarFn, x: f64) -> f64 {
-        match eval_scalar(f, &[Value::Float8(x)]).unwrap() {
+        let result = match eval_scalar(f, &[Value::Float8(x)]) {
+            Ok(value) => value,
+            Err(error) => panic!("scalar-function test fixture failed: {error}"),
+        };
+        match result {
             Value::Float8(v) => v,
             other => panic!("expected float8, got {other:?}"),
         }

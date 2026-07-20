@@ -92,22 +92,28 @@ mod wrapper_tests {
     use super::*;
 
     #[test]
-    fn parses_select_one() {
-        let stmts = parse("SELECT 1").unwrap();
+    fn parses_select_one() -> anyhow::Result<()> {
+        let stmts = parse("SELECT 1")?;
         assert_eq!(stmts.len(), 1);
         assert!(matches!(stmts[0], ast::Statement::Query(_)));
+
+        Ok(())
     }
 
     #[test]
-    fn parses_multiple_statements() {
-        let stmts = parse("SELECT 1; SELECT 2;").unwrap();
+    fn parses_multiple_statements() -> anyhow::Result<()> {
+        let stmts = parse("SELECT 1; SELECT 2;")?;
         assert_eq!(stmts.len(), 2);
+
+        Ok(())
     }
 
     #[test]
-    fn empty_input_yields_no_statements() {
-        assert!(parse("").unwrap().is_empty());
-        assert!(parse("  -- just a comment").unwrap().is_empty());
+    fn empty_input_yields_no_statements() -> anyhow::Result<()> {
+        assert!(parse("")?.is_empty());
+        assert!(parse("  -- just a comment")?.is_empty());
+
+        Ok(())
     }
 
     #[test]

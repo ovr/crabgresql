@@ -70,7 +70,11 @@ pub struct NumErr {
 
 impl NumErr {
     fn new(sqlstate: &'static str, message: impl Into<String>) -> NumErr {
-        NumErr { sqlstate, message: message.into(), detail: None }
+        NumErr {
+            sqlstate,
+            message: message.into(),
+            detail: None,
+        }
     }
 }
 
@@ -82,17 +86,37 @@ impl Numeric {
     // ---- constructors -----------------------------------------------------
 
     pub fn nan() -> Numeric {
-        Numeric { sign: Sign::NaN, weight: 0, dscale: 0, digits: Vec::new() }
+        Numeric {
+            sign: Sign::NaN,
+            weight: 0,
+            dscale: 0,
+            digits: Vec::new(),
+        }
     }
     pub fn pos_inf() -> Numeric {
-        Numeric { sign: Sign::PInf, weight: 0, dscale: 0, digits: Vec::new() }
+        Numeric {
+            sign: Sign::PInf,
+            weight: 0,
+            dscale: 0,
+            digits: Vec::new(),
+        }
     }
     pub fn neg_inf() -> Numeric {
-        Numeric { sign: Sign::NInf, weight: 0, dscale: 0, digits: Vec::new() }
+        Numeric {
+            sign: Sign::NInf,
+            weight: 0,
+            dscale: 0,
+            digits: Vec::new(),
+        }
     }
     /// Zero with the given display scale.
     fn zero(dscale: i32) -> Numeric {
-        Numeric { sign: Sign::Pos, weight: 0, dscale: dscale.max(0), digits: Vec::new() }
+        Numeric {
+            sign: Sign::Pos,
+            weight: 0,
+            dscale: dscale.max(0),
+            digits: Vec::new(),
+        }
     }
 
     pub fn is_nan(&self) -> bool {
@@ -150,7 +174,11 @@ impl Numeric {
             return Numeric::nan();
         }
         if v.is_infinite() {
-            return if v < 0.0 { Numeric::neg_inf() } else { Numeric::pos_inf() };
+            return if v < 0.0 {
+                Numeric::neg_inf()
+            } else {
+                Numeric::pos_inf()
+            };
         }
         if v == 0.0 {
             return Numeric::zero(0);
@@ -181,7 +209,11 @@ impl Numeric {
             return Ok(Numeric::nan());
         }
         if rest.eq_ignore_ascii_case("inf") || rest.eq_ignore_ascii_case("infinity") {
-            return Ok(if neg { Numeric::neg_inf() } else { Numeric::pos_inf() });
+            return Ok(if neg {
+                Numeric::neg_inf()
+            } else {
+                Numeric::pos_inf()
+            });
         }
 
         // Split off an exponent (`e`/`E`).
@@ -194,8 +226,11 @@ impl Numeric {
                     // a positive one overflows the weight, a negative one the
                     // scale. Only reject as syntax if it is not all digits.
                     Err(_) => {
-                        let digits_only =
-                            e.strip_prefix('-').unwrap_or(e).bytes().all(|b| b.is_ascii_digit());
+                        let digits_only = e
+                            .strip_prefix('-')
+                            .unwrap_or(e)
+                            .bytes()
+                            .all(|b| b.is_ascii_digit());
                         if digits_only && !e.is_empty() && e != "-" {
                             return Err(ParseError::Overflow);
                         }
@@ -230,8 +265,11 @@ impl Numeric {
             return Err(ParseError::Overflow);
         }
 
-        let digits: Vec<u8> =
-            int_str.bytes().chain(frac_str.bytes()).map(|b| b - b'0').collect();
+        let digits: Vec<u8> = int_str
+            .bytes()
+            .chain(frac_str.bytes())
+            .map(|b| b - b'0')
+            .collect();
         let low = (point - digits.len() as i64) as i32;
         Ok(Numeric::from_coeff(neg, digits, low, dscale as i32))
     }
@@ -466,7 +504,11 @@ impl Numeric {
         if (self.is_infinite() && other.is_zero()) || (other.is_infinite() && self.is_zero()) {
             return Some(Numeric::nan());
         }
-        Some(if neg { Numeric::neg_inf() } else { Numeric::pos_inf() })
+        Some(if neg {
+            Numeric::neg_inf()
+        } else {
+            Numeric::pos_inf()
+        })
     }
 
     // ---- division / modulo ------------------------------------------------
@@ -491,10 +533,19 @@ impl Numeric {
     /// digits, but never fewer than either operand's scale (PG's
     /// `select_div_scale`, reproduced from its documented rule).
     fn select_div_scale(&self, other: &Numeric) -> i32 {
-        let qweight = self.nbase_weight() - other.nbase_weight()
-            - if self.first_nbase() <= other.first_nbase() { 1 } else { 0 };
+        let qweight = self.nbase_weight()
+            - other.nbase_weight()
+            - if self.first_nbase() <= other.first_nbase() {
+                1
+            } else {
+                0
+            };
         let rscale = MIN_SIG_DIGITS as i64 - qweight * 4;
-        rscale.max(self.dscale as i64).max(other.dscale as i64).max(0).min(MAX_DSCALE) as i32
+        rscale
+            .max(self.dscale as i64)
+            .max(other.dscale as i64)
+            .max(0)
+            .min(MAX_DSCALE) as i32
     }
 
     /// Divide to exactly `rscale` fractional digits; `round` selects
@@ -533,7 +584,11 @@ impl Numeric {
         match (self.is_infinite(), other.is_infinite()) {
             (true, true) => Numeric::nan(),
             (true, false) => {
-                if neg { Numeric::neg_inf() } else { Numeric::pos_inf() }
+                if neg {
+                    Numeric::neg_inf()
+                } else {
+                    Numeric::pos_inf()
+                }
             }
             (false, true) => Numeric::zero(0),
             (false, false) => unreachable!("special_div requires an infinite operand"),
@@ -650,7 +705,11 @@ impl Numeric {
         let rounded = self.round(scale);
         let max_int_digits = precision - scale;
         // Integer digits of `rounded`: weight + 1 when weight >= 0, else 0.
-        let int_digits = if rounded.is_zero() { 0 } else { (rounded.weight + 1).max(0) };
+        let int_digits = if rounded.is_zero() {
+            0
+        } else {
+            (rounded.weight + 1).max(0)
+        };
         if int_digits > max_int_digits {
             return Err(field_overflow(precision, scale, false));
         }
@@ -679,7 +738,11 @@ impl Numeric {
         for _ in 0..r.low() {
             acc = acc.checked_mul(10)?;
         }
-        if r.is_neg() { acc.checked_neg() } else { Some(acc) }
+        if r.is_neg() {
+            acc.checked_neg()
+        } else {
+            Some(acc)
+        }
     }
 
     /// `numeric_float8`/`_float4`: nearest double. Uses a bounded significant-
@@ -696,7 +759,12 @@ impl Numeric {
         }
         let digitstr: String = self.digits.iter().map(|d| (b'0' + d) as char).collect();
         let low = self.low();
-        let s = format!("{}{}e{}", if self.is_neg() { "-" } else { "" }, digitstr, low);
+        let s = format!(
+            "{}{}e{}",
+            if self.is_neg() { "-" } else { "" },
+            digitstr,
+            low
+        );
         s.parse().unwrap_or(f64::NAN)
     }
 
@@ -708,12 +776,18 @@ impl Numeric {
             Sign::NaN => return Ok(Numeric::nan()),
             Sign::PInf => return Ok(Numeric::pos_inf()),
             Sign::NInf => {
-                return Err(NumErr::new("2201F", "cannot take square root of a negative number"));
+                return Err(NumErr::new(
+                    "2201F",
+                    "cannot take square root of a negative number",
+                ));
             }
             _ => {}
         }
         if self.is_neg() {
-            return Err(NumErr::new("2201F", "cannot take square root of a negative number"));
+            return Err(NumErr::new(
+                "2201F",
+                "cannot take square root of a negative number",
+            ));
         }
         if self.is_zero() {
             let rscale = self.sqrt_scale();
@@ -778,7 +852,10 @@ impl Numeric {
             return Err(NumErr::new("2201E", "cannot take logarithm of zero"));
         }
         if self.is_neg() {
-            return Err(NumErr::new("2201E", "cannot take logarithm of a negative number"));
+            return Err(NumErr::new(
+                "2201E",
+                "cannot take logarithm of a negative number",
+            ));
         }
         let guard = 30;
         let val = self.ln_internal(guard);
@@ -795,7 +872,10 @@ impl Numeric {
             return Err(NumErr::new("2201E", "cannot take logarithm of zero"));
         }
         if self.is_neg() {
-            return Err(NumErr::new("2201E", "cannot take logarithm of a negative number"));
+            return Err(NumErr::new(
+                "2201E",
+                "cannot take logarithm of a negative number",
+            ));
         }
         if self.is_infinite() {
             return Ok(Numeric::pos_inf());
@@ -816,11 +896,16 @@ impl Numeric {
                 return Err(NumErr::new("2201E", "cannot take logarithm of zero"));
             }
             if arg.is_neg() {
-                return Err(NumErr::new("2201E", "cannot take logarithm of a negative number"));
+                return Err(NumErr::new(
+                    "2201E",
+                    "cannot take logarithm of a negative number",
+                ));
             }
         }
         let guard = 30;
-        let val = x.ln_internal(guard).div_guard(&self.ln_internal(guard), guard);
+        let val = x
+            .ln_internal(guard)
+            .div_guard(&self.ln_internal(guard), guard);
         let rscale = log_scale(&val);
         Ok(val.round(rscale))
     }
@@ -831,7 +916,11 @@ impl Numeric {
             return Ok(Numeric::nan());
         }
         if self.is_infinite() {
-            return Ok(if self.is_neg() { Numeric::zero(0) } else { Numeric::pos_inf() });
+            return Ok(if self.is_neg() {
+                Numeric::zero(0)
+            } else {
+                Numeric::pos_inf()
+            });
         }
         let rscale = exp_scale(self.to_f64());
         let guard = rscale + 24;
@@ -857,7 +946,10 @@ impl Numeric {
             return if y.is_zero() {
                 Ok(Numeric::from_i128(1))
             } else if y.is_neg() {
-                Err(NumErr::new("2201F", "zero raised to a negative power is undefined"))
+                Err(NumErr::new(
+                    "2201F",
+                    "zero raised to a negative power is undefined",
+                ))
             } else {
                 Ok(Numeric::zero(0))
             };
@@ -948,12 +1040,20 @@ impl Numeric {
             return Ok(one); // 1^y = 1 for any y, including ±Infinity
         }
         if self.is_infinite() {
-            return Ok(if y.is_neg() { Numeric::zero(0) } else { Numeric::pos_inf() });
+            return Ok(if y.is_neg() {
+                Numeric::zero(0)
+            } else {
+                Numeric::pos_inf()
+            });
         }
         // Finite base, infinite exponent.
         let abs_gt_one = self.abs().cmp(&one) == std::cmp::Ordering::Greater;
         let to_infinity = abs_gt_one != y.is_neg();
-        Ok(if to_infinity { Numeric::pos_inf() } else { Numeric::zero(0) })
+        Ok(if to_infinity {
+            Numeric::pos_inf()
+        } else {
+            Numeric::zero(0)
+        })
     }
 
     /// Divide to `guard` fractional digits (rounded) — an internal helper for
@@ -969,8 +1069,14 @@ impl Numeric {
         // Reduce t toward 1 by repeated sqrt; ln(self) = 2^s * ln(t).
         let mut t = self.clone();
         let mut s: u32 = 0;
-        let lo = Numeric::parse("0.9").unwrap();
-        let hi = Numeric::parse("1.1").unwrap();
+        let lo = match Numeric::parse("0.9") {
+            Ok(value) => value,
+            Err(_) => panic!("internal numeric literal 0.9 is invalid"),
+        };
+        let hi = match Numeric::parse("1.1") {
+            Ok(value) => value,
+            Err(_) => panic!("internal numeric literal 1.1 is invalid"),
+        };
         // The reduction needs only ~20 square roots for any representable
         // numeric; cap well below 127 so the `1i128 << s` below can't overflow.
         while t.cmp(&lo) == std::cmp::Ordering::Less || t.cmp(&hi) == std::cmp::Ordering::Greater {
@@ -1010,7 +1116,9 @@ impl Numeric {
         let ln10 = ln10(work);
         // m = round(x / ln10); r = x - m*ln10, |r| <= ln10/2.
         let m_num = self.div_guard(&ln10, 0).round(0);
-        let m = m_num.to_i128().ok_or_else(|| NumErr::new("22003", "value overflows numeric format"))?;
+        let m = m_num
+            .to_i128()
+            .ok_or_else(|| NumErr::new("22003", "value overflows numeric format"))?;
         if m.unsigned_abs() > MAX_NBASE_WEIGHT as u128 {
             return Err(NumErr::new("22003", "value overflows numeric format"));
         }
@@ -1018,7 +1126,10 @@ impl Numeric {
         // Halve r until small, then Taylor, then square back.
         let mut p: u32 = 0;
         let mut rr = r.clone();
-        let small = Numeric::parse("0.01").unwrap();
+        let small = match Numeric::parse("0.01") {
+            Ok(value) => value,
+            Err(_) => panic!("internal numeric literal 0.01 is invalid"),
+        };
         while rr.abs().cmp(&small) == std::cmp::Ordering::Greater {
             rr = rr.div_guard(&Numeric::from_i128(2), work);
             p += 1;
@@ -1032,7 +1143,9 @@ impl Numeric {
         let mut sum = one.clone();
         let mut n: i64 = 1;
         loop {
-            term = term.mul(&rr).div_guard(&Numeric::from_i128(n as i128), work);
+            term = term
+                .mul(&rr)
+                .div_guard(&Numeric::from_i128(n as i128), work);
             if term.is_zero_to_scale(guard) {
                 break;
             }
@@ -1046,7 +1159,12 @@ impl Numeric {
         for _ in 0..p {
             sum = sum.mul(&sum).round(work);
         }
-        let scale10 = Numeric { sign: Sign::Pos, weight: m as i32, dscale: 0, digits: vec![1] };
+        let scale10 = Numeric {
+            sign: Sign::Pos,
+            weight: m as i32,
+            dscale: 0,
+            digits: vec![1],
+        };
         Ok(sum.mul(&scale10).round(guard))
     }
 
@@ -1065,7 +1183,9 @@ fn ln10(guard: i32) -> Numeric {
     const CACHED_SCALE: i32 = 120;
     if guard <= CACHED_SCALE {
         static LN10: std::sync::OnceLock<Numeric> = std::sync::OnceLock::new();
-        return LN10.get_or_init(|| Numeric::from_i128(10).ln_internal(CACHED_SCALE)).clone();
+        return LN10
+            .get_or_init(|| Numeric::from_i128(10).ln_internal(CACHED_SCALE))
+            .clone();
     }
     Numeric::from_i128(10).ln_internal(guard)
 }
@@ -1220,8 +1340,18 @@ fn add_be(a: &[u8], b: &[u8]) -> Vec<u8> {
     let mut carry = 0u8;
     let (mut ia, mut ib) = (a.len(), b.len());
     while ia > 0 || ib > 0 || carry > 0 {
-        let da = if ia > 0 { ia -= 1; a[ia] } else { 0 };
-        let db = if ib > 0 { ib -= 1; b[ib] } else { 0 };
+        let da = if ia > 0 {
+            ia -= 1;
+            a[ia]
+        } else {
+            0
+        };
+        let db = if ib > 0 {
+            ib -= 1;
+            b[ib]
+        } else {
+            0
+        };
         let v = da + db + carry;
         out.push(v % 10);
         carry = v / 10;
@@ -1238,7 +1368,12 @@ fn sub_be(a: &[u8], b: &[u8]) -> Vec<u8> {
     while ia > 0 {
         ia -= 1;
         let da = a[ia] as i8;
-        let db = if ib > 0 { ib -= 1; b[ib] as i8 } else { 0 };
+        let db = if ib > 0 {
+            ib -= 1;
+            b[ib] as i8
+        } else {
+            0
+        };
         let mut v = da - db - borrow;
         if v < 0 {
             v += 10;
@@ -1296,7 +1431,10 @@ fn long_divide(num: &[u8], den: &[u8]) -> (Vec<u8>, Vec<u8>) {
     }
     let qt = trim_leading(&quotient).to_vec();
     let rt = trim_leading(&rem).to_vec();
-    (if qt.is_empty() { vec![0] } else { qt }, if rt.is_empty() { vec![0] } else { rt })
+    (
+        if qt.is_empty() { vec![0] } else { qt },
+        if rt.is_empty() { vec![0] } else { rt },
+    )
 }
 
 /// Integer square root of a big-endian base-10 integer: returns
@@ -1371,17 +1509,23 @@ fn sci_to_plain(sci: &str) -> String {
 /// `numeric(p,s)` constraint.
 fn field_overflow(precision: i32, scale: i32, infinite: bool) -> NumErr {
     let detail = if infinite {
-        format!(
-            "A field with precision {precision}, scale {scale} cannot hold an infinite value."
-        )
+        format!("A field with precision {precision}, scale {scale} cannot hold an infinite value.")
     } else {
         let max_int = precision - scale;
-        let bound = if max_int == 0 { "1".to_string() } else { format!("10^{max_int}") };
+        let bound = if max_int == 0 {
+            "1".to_string()
+        } else {
+            format!("10^{max_int}")
+        };
         format!(
             "A field with precision {precision}, scale {scale} must round to an absolute value less than {bound}."
         )
     };
-    NumErr { sqlstate: "22003", message: "numeric field overflow".to_string(), detail: Some(detail) }
+    NumErr {
+        sqlstate: "22003",
+        message: "numeric field overflow".to_string(),
+        detail: Some(detail),
+    }
 }
 
 impl PartialEq for Numeric {
@@ -1393,11 +1537,15 @@ impl PartialEq for Numeric {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn n(s: &str) -> Numeric {
-        Numeric::parse(s).unwrap()
+        match Numeric::parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid numeric test fixture `{s}`: {error:?}"),
+        }
     }
     fn disp(s: &str) -> String {
         n(s).to_display()
@@ -1405,7 +1553,17 @@ mod tests {
 
     #[test]
     fn parse_and_display_roundtrip() {
-        for s in ["0", "1", "-1", "1.5", "100", "0.05", "40.500000", "-0.0", "12345.6789"] {
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "1.5",
+            "100",
+            "0.05",
+            "40.500000",
+            "-0.0",
+            "12345.6789",
+        ] {
             let d = disp(s);
             let expect = if s == "-0.0" { "0.0" } else { s };
             assert_eq!(d, expect, "input {s}");
@@ -1430,7 +1588,10 @@ mod tests {
         assert!(Numeric::parse("9e131071").is_ok());
         assert_eq!(Numeric::parse("1e-16384"), Err(ParseError::Overflow));
         assert!(Numeric::parse("1e-16383").is_ok());
-        assert_eq!(Numeric::parse("1e99999999999999999999"), Err(ParseError::Overflow));
+        assert_eq!(
+            Numeric::parse("1e99999999999999999999"),
+            Err(ParseError::Overflow)
+        );
         assert_eq!(Numeric::parse("0e2000000000"), Err(ParseError::Overflow));
     }
 
@@ -1440,8 +1601,14 @@ mod tests {
             '+' => x.add(&y),
             '-' => x.sub(&y),
             '*' => x.mul(&y),
-            '/' => x.div(&y).unwrap(),
-            '%' => x.modulo(&y).unwrap(),
+            '/' => match x.div(&y) {
+                Ok(value) => value,
+                Err(error) => panic!("numeric division fixture failed: {error:?}"),
+            },
+            '%' => match x.modulo(&y) {
+                Ok(value) => value,
+                Err(error) => panic!("numeric modulo fixture failed: {error:?}"),
+            },
             _ => unreachable!(),
         }
         .to_display()
@@ -1491,29 +1658,33 @@ mod tests {
     }
 
     #[test]
-    fn special_value_div_and_mod() {
+    fn special_value_div_and_mod() -> anyhow::Result<()> {
         // inf/inf = NaN; nan/0 = NaN; inf/0 and inf%0 = division by zero.
-        assert_eq!(n("Infinity").div(&n("Infinity")).unwrap().to_display(), "NaN");
-        assert_eq!(n("NaN").div(&n("0")).unwrap().to_display(), "NaN");
+        assert_eq!(n("Infinity").div(&n("Infinity"))?.to_display(), "NaN");
+        assert_eq!(n("NaN").div(&n("0"))?.to_display(), "NaN");
         assert_eq!(n("Infinity").div(&n("0")).unwrap_err().sqlstate, "22012");
         assert_eq!(n("Infinity").modulo(&n("0")).unwrap_err().sqlstate, "22012");
-        assert_eq!(n("Infinity").div(&n("2")).unwrap().to_display(), "Infinity");
-        assert_eq!(n("-Infinity").div(&n("2")).unwrap().to_display(), "-Infinity");
-        assert_eq!(n("2").div(&n("Infinity")).unwrap().to_display(), "0");
-        assert_eq!(n("Infinity").modulo(&n("2")).unwrap().to_display(), "NaN");
+        assert_eq!(n("Infinity").div(&n("2"))?.to_display(), "Infinity");
+        assert_eq!(n("-Infinity").div(&n("2"))?.to_display(), "-Infinity");
+        assert_eq!(n("2").div(&n("Infinity"))?.to_display(), "0");
+        assert_eq!(n("Infinity").modulo(&n("2"))?.to_display(), "NaN");
+
+        Ok(())
     }
 
     #[test]
-    fn power_special_values() {
-        assert_eq!(n("0.5").power(&n("-Infinity")).unwrap().to_display(), "Infinity");
-        assert_eq!(n("1").power(&n("Infinity")).unwrap().to_display(), "1");
-        assert_eq!(n("Infinity").power(&n("2")).unwrap().to_display(), "Infinity");
-        assert_eq!(n("2").power(&n("Infinity")).unwrap().to_display(), "Infinity");
-        assert_eq!(n("2").power(&n("-Infinity")).unwrap().to_display(), "0");
+    fn power_special_values() -> anyhow::Result<()> {
+        assert_eq!(n("0.5").power(&n("-Infinity"))?.to_display(), "Infinity");
+        assert_eq!(n("1").power(&n("Infinity"))?.to_display(), "1");
+        assert_eq!(n("Infinity").power(&n("2"))?.to_display(), "Infinity");
+        assert_eq!(n("2").power(&n("Infinity"))?.to_display(), "Infinity");
+        assert_eq!(n("2").power(&n("-Infinity"))?.to_display(), "0");
+
+        Ok(())
     }
 
     #[test]
-    fn arithmetic_and_rounding_edge_cases() {
+    fn arithmetic_and_rounding_edge_cases() -> anyhow::Result<()> {
         // Rounding that carries into a new leading digit.
         assert_eq!(n("9.99").round(1).to_display(), "10.0");
         assert_eq!(n("0.0099").round(2).to_display(), "0.01");
@@ -1524,19 +1695,27 @@ mod tests {
         // Long division with a multi-digit / internal-zero divisor.
         assert_eq!(arith("100070", '/', "1007"), "99.3743793445878848");
         // Perfect-square sqrt is exact (scale from the input's magnitude).
-        assert_eq!(n("152399025").sqrt().unwrap().to_display(), "12345.00000000000");
+        assert_eq!(n("152399025").sqrt()?.to_display(), "12345.00000000000");
         // Big multiplication stays exact.
         assert_eq!(
             arith("12345678901234567890", '*', "98765432109876543210"),
             "1219326311370217952237463801111263526900"
         );
+
+        Ok(())
     }
 
     #[test]
     fn parse_extreme_exponent_does_not_panic() {
         // Exponents at the i64 boundary must classify as overflow, not panic.
-        assert_eq!(Numeric::parse("1e9223372036854775807"), Err(ParseError::Overflow));
-        assert_eq!(Numeric::parse("1e-9223372036854775808"), Err(ParseError::Overflow));
+        assert_eq!(
+            Numeric::parse("1e9223372036854775807"),
+            Err(ParseError::Overflow)
+        );
+        assert_eq!(
+            Numeric::parse("1e-9223372036854775808"),
+            Err(ParseError::Overflow)
+        );
     }
 
     #[test]
@@ -1568,26 +1747,31 @@ mod tests {
     }
 
     #[test]
-    fn typmod_overflow_and_ok() {
-        assert_eq!(n("0.99994").apply_typmod(4, 4).unwrap().to_display(), "0.9999");
+    fn typmod_overflow_and_ok() -> anyhow::Result<()> {
+        assert_eq!(n("0.99994").apply_typmod(4, 4)?.to_display(), "0.9999");
         let e = n("0.99995").apply_typmod(4, 4).unwrap_err();
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(
-            e.detail.unwrap(),
+            e.detail
+                .ok_or_else(|| anyhow::anyhow!("typmod detail is missing"))?,
             "A field with precision 4, scale 4 must round to an absolute value less than 1."
         );
         let e = n("12345.6").apply_typmod(5, 2).unwrap_err();
         assert_eq!(
-            e.detail.unwrap(),
+            e.detail
+                .ok_or_else(|| anyhow::anyhow!("typmod detail is missing"))?,
             "A field with precision 5, scale 2 must round to an absolute value less than 10^3."
         );
-        assert_eq!(n("1.005").apply_typmod(5, 2).unwrap().to_display(), "1.01");
+        assert_eq!(n("1.005").apply_typmod(5, 2)?.to_display(), "1.01");
         let e = Numeric::pos_inf().apply_typmod(4, 4).unwrap_err();
         assert_eq!(
-            e.detail.unwrap(),
+            e.detail
+                .ok_or_else(|| anyhow::anyhow!("typmod detail is missing"))?,
             "A field with precision 4, scale 4 cannot hold an infinite value."
         );
-        assert!(Numeric::nan().apply_typmod(4, 4).unwrap().is_nan());
+        assert!(Numeric::nan().apply_typmod(4, 4)?.is_nan());
+
+        Ok(())
     }
 
     #[test]
@@ -1602,71 +1786,93 @@ mod tests {
         assert_eq!(n("Infinity").to_f64(), f64::INFINITY);
         assert_eq!(Numeric::from_f64_sig(1.5, 15).to_display(), "1.5");
         assert_eq!(Numeric::from_f64_sig(100.0, 15).to_display(), "100");
-        assert_eq!(Numeric::from_f64_sig(2.0 / 3.0, 15).to_display(), "0.666666666666667");
+        assert_eq!(
+            Numeric::from_f64_sig(2.0 / 3.0, 15).to_display(),
+            "0.666666666666667"
+        );
     }
 
     #[test]
-    fn ln_matches_pg() {
-        assert_eq!(n("2").ln().unwrap().to_display(), "0.6931471805599453");
-        assert_eq!(n("20").ln().unwrap().to_display(), "2.9957322735539910");
-        assert_eq!(n("200").ln().unwrap().to_display(), "5.2983173665480367");
-        assert_eq!(n("0.5").ln().unwrap().to_display(), "-0.6931471805599453");
-        assert_eq!(n("0.02").ln().unwrap().to_display(), "-3.9120230054281461");
-        assert_eq!(n("1.5").ln().unwrap().to_display(), "0.4054651081081644");
-        assert_eq!(n("100").ln().unwrap().to_display(), "4.6051701859880914");
-        assert_eq!(n("1e50").ln().unwrap().to_display(), "115.12925464970228");
-        assert_eq!(n("1e100").ln().unwrap().to_display(), "230.25850929940457");
+    fn ln_matches_pg() -> anyhow::Result<()> {
+        assert_eq!(n("2").ln()?.to_display(), "0.6931471805599453");
+        assert_eq!(n("20").ln()?.to_display(), "2.9957322735539910");
+        assert_eq!(n("200").ln()?.to_display(), "5.2983173665480367");
+        assert_eq!(n("0.5").ln()?.to_display(), "-0.6931471805599453");
+        assert_eq!(n("0.02").ln()?.to_display(), "-3.9120230054281461");
+        assert_eq!(n("1.5").ln()?.to_display(), "0.4054651081081644");
+        assert_eq!(n("100").ln()?.to_display(), "4.6051701859880914");
+        assert_eq!(n("1e50").ln()?.to_display(), "115.12925464970228");
+        assert_eq!(n("1e100").ln()?.to_display(), "230.25850929940457");
         assert_eq!(n("0").ln().unwrap_err().sqlstate, "2201E");
         assert_eq!(n("-1").ln().unwrap_err().sqlstate, "2201E");
+
+        Ok(())
     }
 
     #[test]
-    fn exp_matches_pg() {
-        assert_eq!(n("1").exp().unwrap().to_display(), "2.7182818284590452");
-        assert_eq!(n("2").exp().unwrap().to_display(), "7.3890560989306502");
-        assert_eq!(n("0.5").exp().unwrap().to_display(), "1.6487212707001281");
-        assert_eq!(n("10").exp().unwrap().to_display(), "22026.465794806717");
-        assert_eq!(n("0.001").exp().unwrap().to_display(), "1.0010005001667083");
-        assert_eq!(n("-1").exp().unwrap().to_display(), "0.3678794411714423");
-        assert_eq!(n("-10").exp().unwrap().to_display(), "0.00004539992976248485");
+    fn exp_matches_pg() -> anyhow::Result<()> {
+        assert_eq!(n("1").exp()?.to_display(), "2.7182818284590452");
+        assert_eq!(n("2").exp()?.to_display(), "7.3890560989306502");
+        assert_eq!(n("0.5").exp()?.to_display(), "1.6487212707001281");
+        assert_eq!(n("10").exp()?.to_display(), "22026.465794806717");
+        assert_eq!(n("0.001").exp()?.to_display(), "1.0010005001667083");
+        assert_eq!(n("-1").exp()?.to_display(), "0.3678794411714423");
+        assert_eq!(n("-10").exp()?.to_display(), "0.00004539992976248485");
+
+        Ok(())
     }
 
     #[test]
-    fn log_matches_pg() {
-        assert_eq!(n("100").log10().unwrap().to_display(), "2.0000000000000000");
-        assert_eq!(n("2").log10().unwrap().to_display(), "0.3010299956639812");
-        assert_eq!(n("1000").log10().unwrap().to_display(), "3.0000000000000000");
-        assert_eq!(n("0.5").log10().unwrap().to_display(), "-0.3010299956639812");
-        assert_eq!(n("1e20").log10().unwrap().to_display(), "20.000000000000000");
-        assert_eq!(n("2").log_base(&n("8")).unwrap().to_display(), "3.0000000000000000");
+    fn log_matches_pg() -> anyhow::Result<()> {
+        assert_eq!(n("100").log10()?.to_display(), "2.0000000000000000");
+        assert_eq!(n("2").log10()?.to_display(), "0.3010299956639812");
+        assert_eq!(n("1000").log10()?.to_display(), "3.0000000000000000");
+        assert_eq!(n("0.5").log10()?.to_display(), "-0.3010299956639812");
+        assert_eq!(n("1e20").log10()?.to_display(), "20.000000000000000");
+        assert_eq!(n("2").log_base(&n("8"))?.to_display(), "3.0000000000000000");
+
+        Ok(())
     }
 
     #[test]
-    fn power_matches_pg() {
-        assert_eq!(n("2").power(&n("10")).unwrap().to_display(), "1024.0000000000000");
-        assert_eq!(n("2.0").power(&n("0.5")).unwrap().to_display(), "1.4142135623730950");
-        assert_eq!(n("10").power(&n("3")).unwrap().to_display(), "1000.0000000000000");
-        assert_eq!(n("2").power(&n("0.5")).unwrap().to_display(), "1.4142135623730950");
-        assert_eq!(n("3").power(&n("3")).unwrap().to_display(), "27.000000000000000");
-        assert_eq!(n("1.5").power(&n("2")).unwrap().to_display(), "2.2500000000000000");
-        assert_eq!(n("2").power(&n("100")).unwrap().to_display(), "1267650600228229401496703205376");
-        assert_eq!(n("2").power(&n("-10")).unwrap().to_display(), "0.0009765625000000000");
-        assert_eq!(n("-2").power(&n("3")).unwrap().to_display(), "-8.0000000000000000");
+    fn power_matches_pg() -> anyhow::Result<()> {
+        assert_eq!(n("2").power(&n("10"))?.to_display(), "1024.0000000000000");
+        assert_eq!(
+            n("2.0").power(&n("0.5"))?.to_display(),
+            "1.4142135623730950"
+        );
+        assert_eq!(n("10").power(&n("3"))?.to_display(), "1000.0000000000000");
+        assert_eq!(n("2").power(&n("0.5"))?.to_display(), "1.4142135623730950");
+        assert_eq!(n("3").power(&n("3"))?.to_display(), "27.000000000000000");
+        assert_eq!(n("1.5").power(&n("2"))?.to_display(), "2.2500000000000000");
+        assert_eq!(
+            n("2").power(&n("100"))?.to_display(),
+            "1267650600228229401496703205376"
+        );
+        assert_eq!(
+            n("2").power(&n("-10"))?.to_display(),
+            "0.0009765625000000000"
+        );
+        assert_eq!(n("-2").power(&n("3"))?.to_display(), "-8.0000000000000000");
         // Special-case errors.
         assert_eq!(n("0").power(&n("-1")).unwrap_err().sqlstate, "2201F");
         assert_eq!(n("-2").power(&n("0.5")).unwrap_err().sqlstate, "2201F");
-        assert_eq!(n("0").power(&n("0")).unwrap().to_display(), "1");
+        assert_eq!(n("0").power(&n("0"))?.to_display(), "1");
+
+        Ok(())
     }
 
     #[test]
-    fn sqrt_matches_pg() {
-        assert_eq!(n("2").sqrt().unwrap().to_display(), "1.414213562373095");
-        assert_eq!(n("9").sqrt().unwrap().to_display(), "3.000000000000000");
-        assert_eq!(n("100").sqrt().unwrap().to_display(), "10.000000000000000");
-        assert_eq!(n("0.04").sqrt().unwrap().to_display(), "0.20000000000000000");
-        assert_eq!(n("2000000").sqrt().unwrap().to_display(), "1414.2135623730950");
-        assert_eq!(n("2.0").sqrt().unwrap().to_display(), "1.414213562373095");
-        assert_eq!(n("0").sqrt().unwrap().to_display(), "0.000000000000000");
+    fn sqrt_matches_pg() -> anyhow::Result<()> {
+        assert_eq!(n("2").sqrt()?.to_display(), "1.414213562373095");
+        assert_eq!(n("9").sqrt()?.to_display(), "3.000000000000000");
+        assert_eq!(n("100").sqrt()?.to_display(), "10.000000000000000");
+        assert_eq!(n("0.04").sqrt()?.to_display(), "0.20000000000000000");
+        assert_eq!(n("2000000").sqrt()?.to_display(), "1414.2135623730950");
+        assert_eq!(n("2.0").sqrt()?.to_display(), "1.414213562373095");
+        assert_eq!(n("0").sqrt()?.to_display(), "0.000000000000000");
         assert_eq!(n("-1").sqrt().unwrap_err().sqlstate, "2201F");
+
+        Ok(())
     }
 }

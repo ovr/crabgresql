@@ -387,6 +387,10 @@ impl TableEngine for SystemCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn required<T>(value: Option<T>, message: &str) -> anyhow::Result<T> {
+        value.ok_or_else(|| anyhow::anyhow!(message.to_string()))
+    }
     use crabgresql_types::Value;
 
     /// One column of a `pg_type` row, located by column name.
@@ -430,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn pg_class_and_pg_attribute_agree_on_relation_oids() {
+    fn pg_class_and_pg_attribute_agree_on_relation_oids() -> anyhow::Result<()> {
         use crabgresql_storage_api::{Column, TableSchema};
         use crabgresql_types::PgType;
 
@@ -450,27 +454,48 @@ mod tests {
         let cat = SystemCatalog::with_relations(rels);
 
         let class_schema = schema::pg_class_schema();
-        let class = cat.build_pg_catalog("pg_class").unwrap().1;
-        let oid_of = |relname: &str| {
-            let i = class_schema.column_index("relname").unwrap();
-            let o = class_schema.column_index("oid").unwrap();
-            class
-                .iter()
-                .find(|r| r[i] == Value::Text(relname.to_string()))
-                .map(|r| r[o].clone())
-                .unwrap()
+        let class = required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?.1;
+        let oid_of = |relname: &str| -> anyhow::Result<Value> {
+            let i = required(
+                class_schema.column_index("relname"),
+                "relname column is missing",
+            )?;
+            let o = required(class_schema.column_index("oid"), "oid column is missing")?;
+            required(
+                class
+                    .iter()
+                    .find(|r| r[i] == Value::Text(relname.to_string()))
+                    .map(|r| r[o].clone()),
+                "relation row is missing",
+            )
         };
         // Sorted by name → alpha gets the first OID, beta the next.
-        assert_eq!(oid_of("alpha"), Value::Oid(FIRST_REL_OID));
-        assert_eq!(oid_of("beta"), Value::Oid(FIRST_REL_OID + 1));
+        assert_eq!(oid_of("alpha")?, Value::Oid(FIRST_REL_OID));
+        assert_eq!(oid_of("beta")?, Value::Oid(FIRST_REL_OID + 1));
 
         // pg_attribute's attrelid must match pg_class.oid for the same relation.
         let attr_schema = schema::pg_attribute_schema();
-        let attr = cat.build_pg_catalog("pg_attribute").unwrap().1;
-        let arel = attr_schema.column_index("attrelid").unwrap();
-        let aname = attr_schema.column_index("attname").unwrap();
-        let anum = attr_schema.column_index("attnum").unwrap();
-        let atypid = attr_schema.column_index("atttypid").unwrap();
+        let attr = required(
+            cat.build_pg_catalog("pg_attribute"),
+            "pg_attribute is missing",
+        )?
+        .1;
+        let arel = required(
+            attr_schema.column_index("attrelid"),
+            "attrelid column is missing",
+        )?;
+        let aname = required(
+            attr_schema.column_index("attname"),
+            "attname column is missing",
+        )?;
+        let anum = required(
+            attr_schema.column_index("attnum"),
+            "attnum column is missing",
+        )?;
+        let atypid = required(
+            attr_schema.column_index("atttypid"),
+            "atttypid column is missing",
+        )?;
         // alpha has two columns, in declared order, tied to alpha's OID.
         let alpha_attrs: Vec<_> = attr
             .iter()
@@ -481,6 +506,8 @@ mod tests {
         assert_eq!(alpha_attrs[0][anum], Value::Int2(1));
         assert_eq!(alpha_attrs[0][atypid], Value::Oid(23)); // int4
         assert_eq!(alpha_attrs[1][atypid], Value::Oid(25)); // text
+
+        Ok(())
     }
 
     #[test]
@@ -530,12 +557,21 @@ mod tests {
     }
 
     #[test]
-    fn pg_cast_resolves_type_names_to_oids() {
+    fn pg_cast_resolves_type_names_to_oids() -> anyhow::Result<()> {
         let schema = schema::pg_cast_schema();
         let rows = schema::pg_cast_rows();
-        let src = schema.column_index("castsource").unwrap();
-        let tgt = schema.column_index("casttarget").unwrap();
-        let ctx = schema.column_index("castcontext").unwrap();
+        let src = required(
+            schema.column_index("castsource"),
+            "castsource column is missing",
+        )?;
+        let tgt = required(
+            schema.column_index("casttarget"),
+            "casttarget column is missing",
+        )?;
+        let ctx = required(
+            schema.column_index("castcontext"),
+            "castcontext column is missing",
+        )?;
         // int4 (23) -> int8 (20) is an implicit cast in PG.
         let int4_to_int8 = rows
             .iter()
@@ -547,6 +583,8 @@ mod tests {
             rows.iter()
                 .all(|r| r[src] != Value::Oid(0) && r[tgt] != Value::Oid(0))
         );
+
+        Ok(())
     }
 
     #[test]
@@ -562,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn information_schema_reflects_relation_metadata() {
+    fn information_schema_reflects_relation_metadata() -> anyhow::Result<()> {
         use crabgresql_storage_api::{Column, TableSchema};
         use crabgresql_types::PgType;
 
@@ -585,12 +623,27 @@ mod tests {
             ]
         });
 
-        let (tables_schema, tables) = cat.build_information_schema("tables").unwrap();
+        let (tables_schema, tables) = required(
+            cat.build_information_schema("tables"),
+            "information_schema.tables is missing",
+        )?;
         assert_eq!(tables_schema.columns.len(), 12);
-        let catalog = tables_schema.column_index("table_catalog").unwrap();
-        let namespace = tables_schema.column_index("table_schema").unwrap();
-        let name = tables_schema.column_index("table_name").unwrap();
-        let kind = tables_schema.column_index("table_type").unwrap();
+        let catalog = required(
+            tables_schema.column_index("table_catalog"),
+            "table_catalog column is missing",
+        )?;
+        let namespace = required(
+            tables_schema.column_index("table_schema"),
+            "table_schema column is missing",
+        )?;
+        let name = required(
+            tables_schema.column_index("table_name"),
+            "table_name column is missing",
+        )?;
+        let kind = required(
+            tables_schema.column_index("table_type"),
+            "table_type column is missing",
+        )?;
         assert!(tables.iter().any(|row| {
             row[catalog] == Value::Text("appdb".to_string())
                 && row[namespace] == Value::Text("public".to_string())
@@ -603,29 +656,51 @@ mod tests {
                 && row[kind] == Value::Text("LOCAL TEMPORARY".to_string())
         }));
 
-        let (columns_schema, columns) = cat.build_information_schema("columns").unwrap();
+        let (columns_schema, columns) = required(
+            cat.build_information_schema("columns"),
+            "information_schema.columns is missing",
+        )?;
         assert_eq!(columns_schema.columns.len(), 44);
         assert!(
             columns
                 .iter()
                 .all(|row| row.len() == columns_schema.columns.len())
         );
-        let table_name = columns_schema.column_index("table_name").unwrap();
-        let column_name = columns_schema.column_index("column_name").unwrap();
-        let ordinal = columns_schema.column_index("ordinal_position").unwrap();
-        let data_type = columns_schema.column_index("data_type").unwrap();
-        let char_length = columns_schema
-            .column_index("character_maximum_length")
-            .unwrap();
-        let udt_schema = columns_schema.column_index("udt_schema").unwrap();
-        let is_generated = columns_schema.column_index("is_generated").unwrap();
-        let label = columns
-            .iter()
-            .find(|row| {
+        let table_name = required(
+            columns_schema.column_index("table_name"),
+            "table_name column is missing",
+        )?;
+        let column_name = required(
+            columns_schema.column_index("column_name"),
+            "column_name column is missing",
+        )?;
+        let ordinal = required(
+            columns_schema.column_index("ordinal_position"),
+            "ordinal column is missing",
+        )?;
+        let data_type = required(
+            columns_schema.column_index("data_type"),
+            "data_type column is missing",
+        )?;
+        let char_length = required(
+            columns_schema.column_index("character_maximum_length"),
+            "character_maximum_length column is missing",
+        )?;
+        let udt_schema = required(
+            columns_schema.column_index("udt_schema"),
+            "udt_schema column is missing",
+        )?;
+        let is_generated = required(
+            columns_schema.column_index("is_generated"),
+            "is_generated column is missing",
+        )?;
+        let label = required(
+            columns.iter().find(|row| {
                 row[table_name] == Value::Text("widgets".to_string())
                     && row[column_name] == Value::Text("label".to_string())
-            })
-            .unwrap();
+            }),
+            "label column row is missing",
+        )?;
         assert_eq!(label[ordinal], Value::Int4(2));
         assert_eq!(
             label[data_type],
@@ -635,10 +710,15 @@ mod tests {
         assert_eq!(label[udt_schema], Value::Text("pg_catalog".to_string()));
         assert_eq!(label[is_generated], Value::Text("NEVER".to_string()));
 
-        let (_, schemata) = cat.build_information_schema("schemata").unwrap();
+        let (_, schemata) = required(
+            cat.build_information_schema("schemata"),
+            "information_schema.schemata is missing",
+        )?;
         assert!(schemata.iter().any(|row| {
             row[1] == Value::Text("pg_temp_42".to_string())
                 && row[2] == Value::Text("appuser".to_string())
         }));
+
+        Ok(())
     }
 }

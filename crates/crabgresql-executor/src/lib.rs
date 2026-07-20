@@ -16,8 +16,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crabgresql_binder::{BoundAggregate, BoundExpr, JoinKind, SortKey, TableFn};
 pub use crabgresql_binder::OutputColumn;
+use crabgresql_binder::{BoundAggregate, BoundExpr, JoinKind, SortKey, TableFn};
 use crabgresql_planner::{PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan};
 use crabgresql_storage_api::{IndexMetadata, TableAm, Tid, Tuple};
 use crabgresql_txn::TxnContext;
@@ -54,6 +54,14 @@ pub struct ExecError {
     /// Optional DETAIL line (e.g. numeric field overflow explains the p/s).
     pub detail: Option<String>,
 }
+
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExecError {}
 
 impl ExecError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
@@ -194,9 +202,7 @@ pub fn execute(
             let source: Box<dyn ExecNode> = match input {
                 PhysicalAggInput::Scan(table) => Box::new(SeqScan::new(&table, txn)),
                 PhysicalAggInput::Join(source) => build_join_expr(source, ctx, txn)?,
-                PhysicalAggInput::SingleRow => {
-                    Box::new(Values::new(vec![vec![]], ctx))
-                }
+                PhysicalAggInput::SingleRow => Box::new(Values::new(vec![vec![]], ctx)),
             };
             // WHERE filters rows before aggregation.
             let mut node: Box<dyn ExecNode> = match predicate {
@@ -546,7 +552,10 @@ impl TableFunctionSource {
                 }
             });
         }
-        Ok(self.state.as_mut().unwrap())
+        match self.state.as_mut() {
+            Some(state) => Ok(state),
+            None => panic!("table-function state was not initialized"),
+        }
     }
 }
 
@@ -732,10 +741,10 @@ impl ExecNode for NestedLoopJoin {
                     while self.right_index < self.right_rows.len() {
                         let right_index = self.right_index;
                         self.right_index += 1;
-                        let row = self.combined_row(
-                            self.current_left.as_ref().unwrap(),
-                            &self.right_rows[right_index],
-                        );
+                        let Some(left) = self.current_left.as_ref() else {
+                            continue;
+                        };
+                        let row = self.combined_row(left, &self.right_rows[right_index]);
                         let matched = self.kind == JoinKind::Cross
                             || predicate_holds(&self.predicate, &row, self.ctx)?;
                         if matched {
@@ -746,7 +755,9 @@ impl ExecNode for NestedLoopJoin {
                     }
 
                     if !self.current_left_matched && self.preserves_left() {
-                        let mut row = self.current_left.take().unwrap();
+                        let Some(mut row) = self.current_left.take() else {
+                            continue;
+                        };
                         row.extend(std::iter::repeat_n(Value::Null, self.right_width));
                         return Ok(Some(row));
                     }
@@ -944,7 +955,9 @@ impl Aggregate {
                             distinct_values: self
                                 .aggregates
                                 .iter()
-                                .map(|agg| agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty)))
+                                .map(|agg| {
+                                    agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty))
+                                })
                                 .collect(),
                         });
                         bucket.push(i);
@@ -991,7 +1004,10 @@ impl ExecNode for Aggregate {
         if self.output.is_none() {
             self.output = Some(self.build()?);
         }
-        Ok(self.output.as_mut().unwrap().next())
+        match self.output.as_mut() {
+            Some(output) => Ok(output.next()),
+            None => panic!("aggregate output was not initialized"),
+        }
     }
 }
 
@@ -1173,7 +1189,9 @@ impl ExecNode for ProjectSet {
                 };
                 self.current = Some(self.expand(input)?);
             }
-            let exp = self.current.as_mut().unwrap();
+            let Some(exp) = self.current.as_mut() else {
+                continue;
+            };
 
             // Advance every SRF once; the input row is exhausted when they all are.
             let mut srf_vals: Vec<Option<Value>> = Vec::with_capacity(exp.series.len());
@@ -1218,6 +1236,7 @@ fn build_series(func: TableFn, values: &[Value]) -> Result<Series, ExecError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crabgresql_binder::{BinOp, UnaryOp};
@@ -1226,6 +1245,14 @@ mod tests {
     use crabgresql_txn::{CommandId, TransactionManager, TxnContext, Xid};
     use crabgresql_types::PgType;
     use eval::coerce_value;
+
+    #[track_caller]
+    fn test_ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("test fixture operation failed: {error:?}"),
+        }
+    }
 
     thread_local! {
         /// One transaction manager per test thread (libtest runs each test on its
@@ -1241,7 +1268,7 @@ mod tests {
     fn wtxn() -> TxnContext {
         TM.with(|tm| {
             let xid = tm.allocate_xid();
-            tm.commit(xid).unwrap();
+            test_ok(tm.commit(xid));
             tm.context(xid, CommandId::FIRST)
         })
     }
@@ -1283,7 +1310,7 @@ mod tests {
     type TruthTableRow = (BinOp, Option<bool>, Option<bool>, Option<bool>);
 
     #[test]
-    fn and_or_follow_kleene_tables() {
+    fn and_or_follow_kleene_tables() -> anyhow::Result<()> {
         let cases: &[TruthTableRow] = &[
             (BinOp::And, Some(true), Some(true), Some(true)),
             (BinOp::And, Some(true), Some(false), Some(false)),
@@ -1301,12 +1328,14 @@ mod tests {
         for (op, l, r, expected) in cases {
             let expr = binary(*op, PgType::Bool, boolean(*l), boolean(*r));
             let expected = expected.map(Value::Bool).unwrap_or(Value::Null);
-            assert_eq!(eval_const(&expr).unwrap(), expected, "{l:?} {op:?} {r:?}");
+            assert_eq!(eval_const(&expr)?, expected, "{l:?} {op:?} {r:?}");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn null_operand_nulls_comparison() {
+    fn null_operand_nulls_comparison() -> anyhow::Result<()> {
         let expr = binary(
             BinOp::Eq,
             PgType::Int4,
@@ -1316,21 +1345,25 @@ mod tests {
                 ty: PgType::Int4,
             },
         );
-        assert_eq!(eval_const(&expr).unwrap(), Value::Null);
+        assert_eq!(eval_const(&expr)?, Value::Null);
+
+        Ok(())
     }
 
     #[test]
-    fn not_follows_three_valued_logic() {
+    fn not_follows_three_valued_logic() -> anyhow::Result<()> {
         let not = |v| BoundExpr::Unary {
             op: UnaryOp::Not,
             expr: Box::new(boolean(v)),
         };
-        assert_eq!(eval_const(&not(Some(true))).unwrap(), Value::Bool(false));
-        assert_eq!(eval_const(&not(None)).unwrap(), Value::Null);
+        assert_eq!(eval_const(&not(Some(true)))?, Value::Bool(false));
+        assert_eq!(eval_const(&not(None))?, Value::Null);
+
+        Ok(())
     }
 
     #[test]
-    fn is_null_is_never_null() {
+    fn is_null_is_never_null() -> anyhow::Result<()> {
         let is_null = |v: Value, negated| BoundExpr::IsNull {
             expr: Box::new(BoundExpr::Const {
                 value: v,
@@ -1338,22 +1371,18 @@ mod tests {
             }),
             negated,
         };
+        assert_eq!(eval_const(&is_null(Value::Null, false))?, Value::Bool(true));
         assert_eq!(
-            eval_const(&is_null(Value::Null, false)).unwrap(),
-            Value::Bool(true)
-        );
-        assert_eq!(
-            eval_const(&is_null(Value::Int4(1), false)).unwrap(),
+            eval_const(&is_null(Value::Int4(1), false))?,
             Value::Bool(false)
         );
-        assert_eq!(
-            eval_const(&is_null(Value::Null, true)).unwrap(),
-            Value::Bool(false)
-        );
+        assert_eq!(eval_const(&is_null(Value::Null, true))?, Value::Bool(false));
+
+        Ok(())
     }
 
     #[test]
-    fn case_selects_first_true_branch_lazily() {
+    fn case_selects_first_true_branch_lazily() -> anyhow::Result<()> {
         // CASE WHEN <cond1> THEN 10 WHEN <cond2> THEN 20 ELSE 30 END, over
         // constant conditions; false/NULL skip, only the winner is returned.
         let case = |c1: Option<bool>, c2: Option<bool>, else_: Option<BoundExpr>| BoundExpr::Case {
@@ -1363,27 +1392,26 @@ mod tests {
         };
         let e30 = || Some(int4(30));
         assert_eq!(
-            eval_const(&case(Some(true), Some(true), e30())).unwrap(),
+            eval_const(&case(Some(true), Some(true), e30()))?,
             Value::Int4(10)
         );
         assert_eq!(
-            eval_const(&case(Some(false), Some(true), e30())).unwrap(),
+            eval_const(&case(Some(false), Some(true), e30()))?,
             Value::Int4(20)
         );
         // NULL condition behaves like false: falls through to ELSE.
         assert_eq!(
-            eval_const(&case(None, Some(false), e30())).unwrap(),
+            eval_const(&case(None, Some(false), e30()))?,
             Value::Int4(30)
         );
         // No branch matches and no ELSE: NULL.
-        assert_eq!(
-            eval_const(&case(Some(false), None, None)).unwrap(),
-            Value::Null
-        );
+        assert_eq!(eval_const(&case(Some(false), None, None))?, Value::Null);
+
+        Ok(())
     }
 
     #[test]
-    fn case_does_not_evaluate_unselected_results() {
+    fn case_does_not_evaluate_unselected_results() -> anyhow::Result<()> {
         // The losing branch divides by zero; a lazy CASE must never touch it.
         let bomb = binary(BinOp::Div, PgType::Int4, int4(1), int4(0));
         let expr = BoundExpr::Case {
@@ -1391,7 +1419,9 @@ mod tests {
             else_: None,
             ty: PgType::Int4,
         };
-        assert_eq!(eval_const(&expr).unwrap(), Value::Int4(1));
+        assert_eq!(eval_const(&expr)?, Value::Int4(1));
+
+        Ok(())
     }
 
     #[test]
@@ -1429,16 +1459,18 @@ mod tests {
     }
 
     #[test]
-    fn min_over_minus_one_edge_cases() {
+    fn min_over_minus_one_edge_cases() -> anyhow::Result<()> {
         // MIN / -1 overflows ...
         let e =
             eval_const(&binary(BinOp::Div, PgType::Int4, int4(i32::MIN), int4(-1))).unwrap_err();
         assert_eq!(e.code, "22003");
         // ... but MIN % -1 is 0, as in PG.
         assert_eq!(
-            eval_const(&binary(BinOp::Mod, PgType::Int4, int4(i32::MIN), int4(-1))).unwrap(),
+            eval_const(&binary(BinOp::Mod, PgType::Int4, int4(i32::MIN), int4(-1)))?,
             Value::Int4(0)
         );
+
+        Ok(())
     }
 
     #[test]
@@ -1451,13 +1483,13 @@ mod tests {
     }
 
     #[test]
-    fn text_and_bool_comparisons() {
+    fn text_and_bool_comparisons() -> anyhow::Result<()> {
         let text_const = |s: &str| BoundExpr::Const {
             value: Value::Text(s.into()),
             ty: PgType::Text,
         };
         let expr = binary(BinOp::Lt, PgType::Text, text_const("a"), text_const("b"));
-        assert_eq!(eval_const(&expr).unwrap(), Value::Bool(true));
+        assert_eq!(eval_const(&expr)?, Value::Bool(true));
         // false < true
         let expr = binary(
             BinOp::Lt,
@@ -1465,35 +1497,34 @@ mod tests {
             boolean(Some(false)),
             boolean(Some(true)),
         );
-        assert_eq!(eval_const(&expr).unwrap(), Value::Bool(true));
+        assert_eq!(eval_const(&expr)?, Value::Bool(true));
+
+        Ok(())
     }
 
     #[test]
-    fn coerce_range_checks_int8_to_int4() {
+    fn coerce_range_checks_int8_to_int4() -> anyhow::Result<()> {
         let ctx = ExecContext::default();
         assert_eq!(
-            coerce_value(Value::Int8(7), PgType::Int4, ctx).unwrap(),
+            coerce_value(Value::Int8(7), PgType::Int4, ctx)?,
             Value::Int4(7)
         );
         let e = coerce_value(Value::Int8(i64::MAX), PgType::Int4, ctx).unwrap_err();
         assert_eq!(e.code, "22003");
-        assert_eq!(
-            coerce_value(Value::Null, PgType::Int4, ctx).unwrap(),
-            Value::Null
-        );
+        assert_eq!(coerce_value(Value::Null, PgType::Int4, ctx)?, Value::Null);
+
+        Ok(())
     }
 
     fn test_table() -> Arc<dyn TableAm> {
         let engine = MemoryEngine::new();
-        let table = engine
-            .create_table(TableSchema {
-                name: "t".into(),
-                columns: vec![
-                    Column::new("id", PgType::Int4),
-                    Column::new("label", PgType::Text),
-                ],
-            })
-            .unwrap();
+        let table = test_ok(engine.create_table(TableSchema {
+            name: "t".into(),
+            columns: vec![
+                Column::new("id", PgType::Int4),
+                Column::new("label", PgType::Text),
+            ],
+        }));
         let txn = wtxn();
         table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
         table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
@@ -1503,7 +1534,7 @@ mod tests {
 
     fn collect(node: &mut dyn ExecNode) -> Vec<Tuple> {
         let mut rows = Vec::new();
-        while let Some(row) = node.next().unwrap() {
+        while let Some(row) = test_ok(node.next()) {
             rows.push(row);
         }
         rows
@@ -1522,7 +1553,11 @@ mod tests {
             },
             int4(2),
         );
-        let mut node = Filter::new(Box::new(SeqScan::new(&table, &rtxn())), predicate, ExecContext::default());
+        let mut node = Filter::new(
+            Box::new(SeqScan::new(&table, &rtxn())),
+            predicate,
+            ExecContext::default(),
+        );
         assert_eq!(collect(&mut node).len(), 2);
 
         // WHERE label < 'zzz' — NULL label makes the predicate NULL: dropped.
@@ -1538,7 +1573,11 @@ mod tests {
                 ty: PgType::Text,
             },
         );
-        let mut node = Filter::new(Box::new(SeqScan::new(&table, &rtxn())), predicate, ExecContext::default());
+        let mut node = Filter::new(
+            Box::new(SeqScan::new(&table, &rtxn())),
+            predicate,
+            ExecContext::default(),
+        );
         assert_eq!(collect(&mut node).len(), 2);
     }
 
@@ -1554,7 +1593,11 @@ mod tests {
             },
             int4(10),
         )];
-        let mut node = Projection::new(Box::new(SeqScan::new(&table, &rtxn())), exprs, ExecContext::default());
+        let mut node = Projection::new(
+            Box::new(SeqScan::new(&table, &rtxn())),
+            exprs,
+            ExecContext::default(),
+        );
         assert_eq!(
             collect(&mut node),
             vec![
@@ -1566,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn sort_orders_by_hidden_column_then_trims() {
+    fn sort_orders_by_hidden_column_then_trims() -> anyhow::Result<()> {
         // Project only `id` (visible), but sort on a hidden trailing column
         // holding `label` (a resjunk column that ORDER BY references but the
         // client never sees). The sort must order by the hidden value's type
@@ -1582,8 +1625,11 @@ mod tests {
                 ty: PgType::Text,
             },
         ];
-        let projection =
-            Projection::new(Box::new(SeqScan::new(&table, &rtxn())), exprs, ExecContext::default());
+        let projection = Projection::new(
+            Box::new(SeqScan::new(&table, &rtxn())),
+            exprs,
+            ExecContext::default(),
+        );
         // ORDER BY label ASC: NULL (id 3) sorts last (NULLS LAST default), then
         // 'one' (id 1), 'two' (id 2).
         let key = SortKey {
@@ -1592,7 +1638,7 @@ mod tests {
             asc: true,
             nulls_first: false,
         };
-        let mut node = Sort::new(Box::new(projection), vec![key], 1).unwrap();
+        let mut node = Sort::new(Box::new(projection), vec![key], 1)?;
         assert_eq!(
             collect(&mut node),
             vec![
@@ -1602,6 +1648,8 @@ mod tests {
             ],
             "rows ordered by hidden label, trimmed to the single visible column"
         );
+
+        Ok(())
     }
 
     /// Scan `t` (ids 1,2,3 in insertion order), keeping just the `id` column.
@@ -1663,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn limit_applies_after_sort() {
+    fn limit_applies_after_sort() -> anyhow::Result<()> {
         // ORDER BY id DESC LIMIT 1 must return the max, not the first-scanned row.
         let table = test_table();
         let sort = Sort::new(
@@ -1675,14 +1723,15 @@ mod tests {
                 nulls_first: false,
             }],
             1,
-        )
-        .unwrap();
+        )?;
         let mut node = Limit::new(Box::new(sort), Some(1), None);
         assert_eq!(ids(&mut node), vec![3]);
+
+        Ok(())
     }
 
     #[test]
-    fn update_evaluates_against_old_row_and_buffers() {
+    fn update_evaluates_against_old_row_and_buffers() -> anyhow::Result<()> {
         let table = test_table();
         // SET id = id + 1 for every row.
         let assignments = vec![(
@@ -1697,12 +1746,16 @@ mod tests {
                 int4(1),
             ),
         )];
-        let Execution::Updated(n) = execute_update(&table, &None, &assignments, ExecContext::default(), &wtxn()).unwrap() else {
+        let Execution::Updated(n) =
+            execute_update(&table, &None, &assignments, ExecContext::default(), &wtxn())?
+        else {
             panic!("expected Updated");
         };
         assert_eq!(n, 3);
         let ids: Vec<Value> = table.scan(&rtxn()).map(|(_, t)| t[0].clone()).collect();
         assert_eq!(ids, vec![Value::Int4(2), Value::Int4(3), Value::Int4(4)]);
+
+        Ok(())
     }
 
     #[test]
@@ -1729,7 +1782,8 @@ mod tests {
                 ),
             ),
         )];
-        let Err(e) = execute_update(&table, &None, &assignments, ExecContext::default(), &wtxn()) else {
+        let Err(e) = execute_update(&table, &None, &assignments, ExecContext::default(), &wtxn())
+        else {
             panic!("expected error");
         };
         assert_eq!(e.code, "22012");
@@ -1738,7 +1792,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_with_predicate_removes_matching_rows() {
+    fn delete_with_predicate_removes_matching_rows() -> anyhow::Result<()> {
         let table = test_table();
         let predicate = Some(binary(
             BinOp::Gt,
@@ -1749,36 +1803,43 @@ mod tests {
             },
             int4(1),
         ));
-        let Execution::Deleted(n) = execute_delete(&table, &predicate, ExecContext::default(), &wtxn()).unwrap() else {
+        let Execution::Deleted(n) =
+            execute_delete(&table, &predicate, ExecContext::default(), &wtxn())?
+        else {
             panic!("expected Deleted");
         };
         assert_eq!(n, 2);
         assert_eq!(table.scan(&rtxn()).count(), 1);
+
+        Ok(())
     }
 
     /// Parse → bind → plan → execute a query against a fresh engine.
     fn run_rows(sql: &str) -> (Vec<OutputColumn>, Vec<Tuple>) {
-        run_rows_on(&(Arc::new(MemoryEngine::new()) as Arc<dyn TableEngine>), sql)
+        run_rows_on(
+            &(Arc::new(MemoryEngine::new()) as Arc<dyn TableEngine>),
+            sql,
+        )
     }
 
     /// As [`run_rows`], but against a caller-provided engine (for queries over
     /// real tables).
     fn run_rows_on(engine: &Arc<dyn TableEngine>, sql: &str) -> (Vec<OutputColumn>, Vec<Tuple>) {
-        let stmts = crabgresql_parser::parse(sql).unwrap();
+        let stmts = test_ok(crabgresql_parser::parse(sql));
         let crabgresql_parser::ast::Statement::Query(query) = &stmts[0] else {
             panic!("expected a query");
         };
         let catalog: Arc<dyn crabgresql_storage_api::TypeCatalog> =
             Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
-        let logical = crabgresql_binder::bind_query(engine, &catalog, query).unwrap();
+        let logical = test_ok(crabgresql_binder::bind_query(engine, &catalog, query));
         let physical = crabgresql_planner::plan(logical);
         let Execution::Rows { columns, mut node } =
-            execute(physical, ExecContext::default(), &rtxn()).unwrap()
+            test_ok(execute(physical, ExecContext::default(), &rtxn()))
         else {
             panic!("expected rows");
         };
         let mut rows = Vec::new();
-        while let Some(tuple) = node.next().unwrap() {
+        while let Some(tuple) = test_ok(node.next()) {
             rows.push(tuple);
         }
         (columns, rows)
@@ -1788,15 +1849,21 @@ mod tests {
     /// singleton (a=3), and one NULL `b`.
     fn agg_engine() -> Arc<dyn TableEngine> {
         let engine = MemoryEngine::new();
-        let table = engine
-            .create_table(TableSchema {
-                name: "t".into(),
-                columns: vec![Column::new("a", PgType::Int4), Column::new("b", PgType::Int4)],
-            })
-            .unwrap();
+        let table = test_ok(engine.create_table(TableSchema {
+            name: "t".into(),
+            columns: vec![
+                Column::new("a", PgType::Int4),
+                Column::new("b", PgType::Int4),
+            ],
+        }));
         let txn = wtxn();
-        let seed: [(i32, Option<i32>); 5] =
-            [(1, Some(10)), (1, Some(20)), (2, Some(5)), (2, None), (3, Some(7))];
+        let seed: [(i32, Option<i32>); 5] = [
+            (1, Some(10)),
+            (1, Some(20)),
+            (2, Some(5)),
+            (2, None),
+            (3, Some(7)),
+        ];
         for (a, b) in seed {
             let b = b.map(Value::Int4).unwrap_or(Value::Null);
             table.insert(vec![Value::Int4(a), b], &txn);
@@ -1807,8 +1874,10 @@ mod tests {
     #[test]
     fn whole_table_aggregates_ignore_nulls() {
         let engine = agg_engine();
-        let (_c, rows) =
-            run_rows_on(&engine, "SELECT count(*), count(b), min(b), max(b), sum(b) FROM t");
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT count(*), count(b), min(b), max(b), sum(b) FROM t",
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0],
@@ -1823,14 +1892,15 @@ mod tests {
     }
 
     #[test]
-    fn distinct_aggregates_deduplicate_per_group_and_per_call() {
+    fn distinct_aggregates_deduplicate_per_group_and_per_call() -> anyhow::Result<()> {
         let engine = MemoryEngine::new();
-        let table = engine
-            .create_table(TableSchema {
-                name: "d".into(),
-                columns: vec![Column::new("g", PgType::Int4), Column::new("v", PgType::Int4)],
-            })
-            .unwrap();
+        let table = engine.create_table(TableSchema {
+            name: "d".into(),
+            columns: vec![
+                Column::new("g", PgType::Int4),
+                Column::new("v", PgType::Int4),
+            ],
+        })?;
         let txn = wtxn();
         for (g, v) in [
             (1, Some(10)),
@@ -1872,17 +1942,19 @@ mod tests {
 
         // The two calls use independent seen-value sets, even when their
         // inputs have the same type and values.
-        let (_c, rows) = run_rows_on(
-            &engine,
-            "SELECT count(DISTINCT g), sum(DISTINCT g) FROM d",
-        );
+        let (_c, rows) = run_rows_on(&engine, "SELECT count(DISTINCT g), sum(DISTINCT g) FROM d");
         assert_eq!(rows, vec![vec![Value::Int8(2), Value::Int8(3)]]);
+
+        Ok(())
     }
 
     #[test]
     fn empty_group_is_zero_count_and_null_sum() {
         let engine = agg_engine();
-        let (_c, rows) = run_rows_on(&engine, "SELECT count(*), sum(b), min(b) FROM t WHERE a > 100");
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT count(*), sum(b), min(b) FROM t WHERE a > 100",
+        );
         // The implicit group still yields one row.
         assert_eq!(rows, vec![vec![Value::Int8(0), Value::Null, Value::Null]]);
     }
@@ -1901,8 +1973,10 @@ mod tests {
     #[test]
     fn group_by_produces_one_row_per_group() {
         let engine = agg_engine();
-        let (_c, rows) =
-            run_rows_on(&engine, "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY a");
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY a",
+        );
         assert_eq!(
             rows,
             vec![
@@ -1937,16 +2011,17 @@ mod tests {
     }
 
     #[test]
-    fn group_by_null_key_forms_one_group() {
+    fn group_by_null_key_forms_one_group() -> anyhow::Result<()> {
         // Rows with a NULL group key group together (NULL == NULL), distinct from
         // the non-NULL groups. Exercises the hash-grouping NULL path.
         let engine = MemoryEngine::new();
-        let table = engine
-            .create_table(TableSchema {
-                name: "g".into(),
-                columns: vec![Column::new("k", PgType::Int4), Column::new("v", PgType::Int4)],
-            })
-            .unwrap();
+        let table = engine.create_table(TableSchema {
+            name: "g".into(),
+            columns: vec![
+                Column::new("k", PgType::Int4),
+                Column::new("v", PgType::Int4),
+            ],
+        })?;
         let txn = wtxn();
         for (k, v) in [(Some(1), 10), (None, 20), (Some(1), 5), (None, 7)] {
             let k = k.map(Value::Int4).unwrap_or(Value::Null);
@@ -1954,7 +2029,10 @@ mod tests {
         }
         let engine: Arc<dyn TableEngine> = Arc::new(engine);
         // ORDER BY k with NULLS LAST-for-ASC (PG default) so the row order is fixed.
-        let (_c, rows) = run_rows_on(&engine, "SELECT k, count(*), sum(v) FROM g GROUP BY k ORDER BY k");
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT k, count(*), sum(v) FROM g GROUP BY k ORDER BY k",
+        );
         assert_eq!(
             rows,
             vec![
@@ -1962,19 +2040,19 @@ mod tests {
                 vec![Value::Null, Value::Int8(2), Value::Int8(27)],
             ]
         );
+
+        Ok(())
     }
 
     #[test]
-    fn group_by_float_treats_neg_zero_and_nan_like_pg() {
+    fn group_by_float_treats_neg_zero_and_nan_like_pg() -> anyhow::Result<()> {
         // -0.0 groups with 0.0, and NaN groups with NaN — the hash and keys_equal
         // must agree on both. Two 0.0-family rows, two NaN rows.
         let engine = MemoryEngine::new();
-        let table = engine
-            .create_table(TableSchema {
-                name: "f".into(),
-                columns: vec![Column::new("x", PgType::Float8)],
-            })
-            .unwrap();
+        let table = engine.create_table(TableSchema {
+            name: "f".into(),
+            columns: vec![Column::new("x", PgType::Float8)],
+        })?;
         let txn = wtxn();
         for x in [0.0_f64, -0.0, f64::NAN, f64::NAN] {
             table.insert(vec![Value::Float8(x)], &txn);
@@ -1991,12 +2069,13 @@ mod tests {
 
         let (_c, rows) = run_rows_on(&engine, "SELECT count(DISTINCT x) FROM f");
         assert_eq!(rows, vec![vec![Value::Int8(2)]]);
+
+        Ok(())
     }
 
     #[test]
     fn pg_input_error_info_reports_range_error() {
-        let (columns, rows) =
-            run_rows("SELECT * FROM pg_input_error_info('1e400', 'float4')");
+        let (columns, rows) = run_rows("SELECT * FROM pg_input_error_info('1e400', 'float4')");
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
         assert_eq!(rows.len(), 1);
@@ -2013,8 +2092,7 @@ mod tests {
 
     #[test]
     fn pg_input_error_info_is_all_null_for_valid_input() {
-        let (_columns, rows) =
-            run_rows("SELECT * FROM pg_input_error_info('34.5', 'float4')");
+        let (_columns, rows) = run_rows("SELECT * FROM pg_input_error_info('34.5', 'float4')");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], vec![Value::Null; 4]);
     }
@@ -2023,16 +2101,16 @@ mod tests {
     /// the first `next()`, not at plan time).
     fn run_err(sql: &str) -> ExecError {
         let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
-        let stmts = crabgresql_parser::parse(sql).unwrap();
+        let stmts = test_ok(crabgresql_parser::parse(sql));
         let crabgresql_parser::ast::Statement::Query(query) = &stmts[0] else {
             panic!("expected a query");
         };
         let catalog: Arc<dyn crabgresql_storage_api::TypeCatalog> =
             Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
-        let logical = crabgresql_binder::bind_query(&engine, &catalog, query).unwrap();
+        let logical = test_ok(crabgresql_binder::bind_query(&engine, &catalog, query));
         let physical = crabgresql_planner::plan(logical);
         let Execution::Rows { mut node, .. } =
-            execute(physical, ExecContext::default(), &rtxn()).unwrap()
+            test_ok(execute(physical, ExecContext::default(), &rtxn()))
         else {
             panic!("expected rows");
         };
@@ -2149,8 +2227,14 @@ mod tests {
     #[test]
     fn generate_series_numeric_nan_bounds_error_22023() {
         for (sql, msg) in [
-            ("SELECT generate_series('NaN'::numeric, 3)", "start value cannot be NaN"),
-            ("SELECT generate_series(1, 'NaN'::numeric)", "stop value cannot be NaN"),
+            (
+                "SELECT generate_series('NaN'::numeric, 3)",
+                "start value cannot be NaN",
+            ),
+            (
+                "SELECT generate_series(1, 'NaN'::numeric)",
+                "stop value cannot be NaN",
+            ),
             (
                 "SELECT generate_series(1, 3, 'NaN'::numeric)",
                 "step size cannot be NaN",
@@ -2225,7 +2309,11 @@ mod tests {
         );
         assert_eq!(
             series_text(&rows),
-            ["2020-01-03 00:00:00", "2020-01-02 00:00:00", "2020-01-01 00:00:00"]
+            [
+                "2020-01-03 00:00:00",
+                "2020-01-02 00:00:00",
+                "2020-01-01 00:00:00"
+            ]
         );
     }
 
@@ -2287,12 +2375,10 @@ mod tests {
     /// A `nums(n int4)` table seeded with 1, 2, 3.
     fn engine_with_nums() -> Arc<dyn TableEngine> {
         let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
-        let table = engine
-            .create_table(TableSchema {
-                name: "nums".into(),
-                columns: vec![Column::new("n", PgType::Int4)],
-            })
-            .unwrap();
+        let table = test_ok(engine.create_table(TableSchema {
+            name: "nums".into(),
+            columns: vec![Column::new("n", PgType::Int4)],
+        }));
         let txn = wtxn();
         for n in [1, 2, 3] {
             table.insert(vec![Value::Int4(n)], &txn);
@@ -2436,15 +2522,10 @@ mod tests {
 
     #[test]
     fn left_right_and_full_join_null_extend_unmatched_rows() {
-        let values =
-            "(VALUES (1), (2), (NULL)) a(x) JOIN_KIND \
+        let values = "(VALUES (1), (2), (NULL)) a(x) JOIN_KIND \
              (VALUES (2), (2), (3), (NULL)) b(y) ON a.x = b.y";
-        let query = |kind: &str| {
-            format!(
-                "SELECT a.x, b.y FROM {}",
-                values.replace("JOIN_KIND", kind)
-            )
-        };
+        let query =
+            |kind: &str| format!("SELECT a.x, b.y FROM {}", values.replace("JOIN_KIND", kind));
 
         let (_, left) = run_rows(&query("LEFT JOIN"));
         assert_eq!(

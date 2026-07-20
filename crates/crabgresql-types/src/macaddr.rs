@@ -277,11 +277,12 @@ pub fn set7bit(b: &[u8; 8]) -> [u8; 8] {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
-    fn macaddr_roundtrip_and_spellings() {
+    fn macaddr_roundtrip_and_spellings() -> anyhow::Result<()> {
         let canon = [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03];
         for good in [
             "08:00:2b:01:02:03",
@@ -292,9 +293,11 @@ mod tests {
             "0800-2b01-0203",
             "08002b010203",
         ] {
-            assert_eq!(parse_macaddr(good).unwrap(), canon, "{good}");
+            assert_eq!(parse_macaddr(good)?, canon, "{good}");
         }
         assert_eq!(format6(&canon), "08:00:2b:01:02:03");
+
+        Ok(())
     }
 
     #[test]
@@ -302,12 +305,15 @@ mod tests {
         for bad in ["0800:2b01:0203", "not even close", "08:00:2b:01:02", ""] {
             let e = parse_macaddr(bad).unwrap_err();
             assert_eq!(e.sqlstate, "22P02", "{bad}");
-            assert_eq!(e.message, format!("invalid input syntax for type macaddr: \"{bad}\""));
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type macaddr: \"{bad}\"")
+            );
         }
     }
 
     #[test]
-    fn macaddr8_six_byte_expands_eui64() {
+    fn macaddr8_six_byte_expands_eui64() -> anyhow::Result<()> {
         let want = [0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03];
         for good in [
             "08:00:2b:01:02:03",
@@ -321,13 +327,15 @@ mod tests {
             "08:00:2b:01:02:03     ",
             "    08:00:2b:01:02:03",
         ] {
-            assert_eq!(parse_macaddr8(good).unwrap(), want, "{good}");
+            assert_eq!(parse_macaddr8(good)?, want, "{good}");
         }
         assert_eq!(format8(&want), "08:00:2b:ff:fe:01:02:03");
+
+        Ok(())
     }
 
     #[test]
-    fn macaddr8_eight_byte_forms() {
+    fn macaddr8_eight_byte_forms() -> anyhow::Result<()> {
         let want = [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03, 0x04, 0x05];
         for good in [
             "08:00:2b:01:02:03:04:05",
@@ -338,8 +346,10 @@ mod tests {
             "08002b01:02030405",
             "08002b0102030405",
         ] {
-            assert_eq!(parse_macaddr8(good).unwrap(), want, "{good}");
+            assert_eq!(parse_macaddr8(good)?, want, "{good}");
         }
+
+        Ok(())
     }
 
     #[test]
@@ -358,23 +368,34 @@ mod tests {
         ] {
             let e = parse_macaddr8(bad).unwrap_err();
             assert_eq!(e.sqlstate, "22P02", "{bad}");
-            assert_eq!(e.message, format!("invalid input syntax for type macaddr8: \"{bad}\""));
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type macaddr8: \"{bad}\"")
+            );
         }
     }
 
     #[test]
-    fn ops_and_conversions() {
+    fn ops_and_conversions() -> anyhow::Result<()> {
         let m = [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03];
         assert_eq!(not6(&m), [0xf7, 0xff, 0xd4, 0xfe, 0xfd, 0xfc]);
-        assert_eq!(and6(&m, &[0, 0, 0, 0xff, 0xff, 0xff]), [0, 0, 0, 0x01, 0x02, 0x03]);
-        assert_eq!(or6(&m, &[1, 2, 3, 4, 5, 6]), [0x09, 0x02, 0x2b, 0x05, 0x07, 0x07]);
+        assert_eq!(
+            and6(&m, &[0, 0, 0, 0xff, 0xff, 0xff]),
+            [0, 0, 0, 0x01, 0x02, 0x03]
+        );
+        assert_eq!(
+            or6(&m, &[1, 2, 3, 4, 5, 6]),
+            [0x09, 0x02, 0x2b, 0x05, 0x07, 0x07]
+        );
         assert_eq!(trunc6(&m), [0x08, 0x00, 0x2b, 0, 0, 0]);
 
         let m8 = expand6to8(&m);
         assert_eq!(trunc8(&m8), [0x08, 0x00, 0x2b, 0, 0, 0, 0, 0]);
-        assert_eq!(narrow8to6(&m8).unwrap(), m);
+        assert_eq!(narrow8to6(&m8)?, m);
 
         let set = set7bit(&expand6to8(&[0x00, 0x08, 0x2b, 0x01, 0x02, 0x03]));
         assert_eq!(format8(&set), "02:08:2b:ff:fe:01:02:03");
+
+        Ok(())
     }
 }

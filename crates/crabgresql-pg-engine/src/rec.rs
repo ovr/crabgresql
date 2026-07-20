@@ -39,17 +39,17 @@ impl<'a> R<'a> {
         R { b, p: 0 }
     }
     pub fn u16(&mut self) -> u16 {
-        let v = u16::from_le_bytes(self.b[self.p..self.p + 2].try_into().unwrap());
+        let v = u16::from_le_bytes(self.array());
         self.p += 2;
         v
     }
     pub fn u32(&mut self) -> u32 {
-        let v = u32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+        let v = u32::from_le_bytes(self.array());
         self.p += 4;
         v
     }
     pub fn u64(&mut self) -> u64 {
-        let v = u64::from_le_bytes(self.b[self.p..self.p + 8].try_into().unwrap());
+        let v = u64::from_le_bytes(self.array());
         self.p += 8;
         v
     }
@@ -67,6 +67,15 @@ impl<'a> R<'a> {
     }
     pub fn cid(&mut self) -> CommandId {
         CommandId(self.u32())
+    }
+
+    fn array<const N: usize>(&self) -> [u8; N] {
+        let Some(slice) = self.b.get(self.p..self.p + N) else {
+            panic!("heap WAL record is truncated");
+        };
+        let mut out = [0; N];
+        out.copy_from_slice(slice);
+        out
     }
 }
 

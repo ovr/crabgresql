@@ -16,10 +16,10 @@
 //! abbreviation (which needs a date and the zone database) is not — those
 //! inputs are rejected. A missing zone defaults to UTC.
 
+use crate::Numeric;
 use crate::interval::Interval;
 use crate::time;
 use crate::timestamp::fixed_point;
-use crate::Numeric;
 
 const INVALID_DATETIME_FORMAT: &str = "22007";
 const DATETIME_FIELD_OVERFLOW: &str = "22008";
@@ -193,7 +193,10 @@ fn parse_offset(s: &str) -> Option<i32> {
 
 fn is_date_token(tok: &str) -> bool {
     let parts: Vec<&str> = tok.split('-').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 // --- interval arithmetic ---------------------------------------------------
@@ -202,12 +205,18 @@ fn is_date_token(tok: &str) -> bool {
 pub fn pl_interval(v: TimeTz, span: Interval) -> TimeTz {
     // Reduce the interval mod a day before adding to avoid i64 overflow on large
     // intervals; modular reduction commutes with the add (see time::pl_interval).
-    TimeTz { usec: (v.usec + span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY), zone: v.zone }
+    TimeTz {
+        usec: (v.usec + span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY),
+        zone: v.zone,
+    }
 }
 
 /// `timetz - interval`: the negation of the add.
 pub fn mi_interval(v: TimeTz, span: Interval) -> TimeTz {
-    TimeTz { usec: (v.usec - span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY), zone: v.zone }
+    TimeTz {
+        usec: (v.usec - span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY),
+        zone: v.zone,
+    }
 }
 
 // --- field extraction (date_part / extract) --------------------------------
@@ -227,7 +236,11 @@ fn classify(unit: &str) -> Option<bool> {
 }
 
 fn err_unit(unit: &str, supported: bool) -> TimeTzError {
-    let verb = if supported { "not supported" } else { "not recognized" };
+    let verb = if supported {
+        "not supported"
+    } else {
+        "not recognized"
+    };
     TimeTzError {
         sqlstate: INVALID_PARAMETER_VALUE,
         message: format!("unit \"{unit}\" {verb} for type time with time zone"),
@@ -259,7 +272,10 @@ pub fn extract(unit: &str, v: TimeTz) -> Result<Numeric, TimeTzError> {
                 "epoch" => fixed_point(v.usec + v.zone as i64 * USECS_PER_SEC, 6),
                 other => (field_f64(other, v) as i64).to_string(),
             };
-            Ok(Numeric::parse(&s).expect("extract renders a valid numeric literal"))
+            match Numeric::parse(&s) {
+                Ok(value) => Ok(value),
+                Err(_) => panic!("timetz extraction must form a valid numeric literal"),
+            }
         }
     }
 }
@@ -312,7 +328,10 @@ mod tests {
     use super::*;
 
     fn v(s: &str) -> TimeTz {
-        parse(s).unwrap()
+        match parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid timetz test fixture `{s}`: {error:?}"),
+        }
     }
 
     #[test]
@@ -329,19 +348,24 @@ mod tests {
     #[test]
     fn ordering() {
         // 05:06:07-07 == 12:06:07 UTC; 05:06:07+00 == 05:06:07 UTC.
-        assert_eq!(cmp(v("05:06:07-07"), v("05:06:07+00")), std::cmp::Ordering::Greater);
+        assert_eq!(
+            cmp(v("05:06:07-07"), v("05:06:07+00")),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]
-    fn extract_fields() {
+    fn extract_fields() -> anyhow::Result<()> {
         let x = v("13:30:25.575401-04:30");
-        assert_eq!(date_part("hour", x).unwrap(), 13.0);
-        assert_eq!(date_part("timezone", x).unwrap(), -16200.0);
-        assert_eq!(date_part("timezone_hour", x).unwrap(), -4.0);
-        assert_eq!(date_part("timezone_minute", x).unwrap(), -30.0);
-        assert_eq!(extract("microsecond", x).unwrap().to_display(), "25575401");
+        assert_eq!(date_part("hour", x)?, 13.0);
+        assert_eq!(date_part("timezone", x)?, -16200.0);
+        assert_eq!(date_part("timezone_hour", x)?, -4.0);
+        assert_eq!(date_part("timezone_minute", x)?, -30.0);
+        assert_eq!(extract("microsecond", x)?.to_display(), "25575401");
         let y = v("13:30:25.575401-04");
-        assert_eq!(extract("epoch", y).unwrap().to_display(), "63025.575401");
+        assert_eq!(extract("epoch", y)?.to_display(), "63025.575401");
         assert!(date_part("day", x).is_err());
+
+        Ok(())
     }
 }

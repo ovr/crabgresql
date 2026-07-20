@@ -239,7 +239,14 @@ mod tests {
     use super::*;
 
     fn tm(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> TmLite {
-        TmLite { year, month, day, hour, min, sec }
+        TmLite {
+            year,
+            month,
+            day,
+            hour,
+            min,
+            sec,
+        }
     }
 
     fn fixed(z: &Zone) -> i32 {
@@ -250,21 +257,23 @@ mod tests {
     }
 
     #[test]
-    fn fixed_offsets_and_utc_synonyms() {
-        assert_eq!(fixed(&resolve_zone("UTC").unwrap()), 0);
-        assert_eq!(fixed(&resolve_zone("GMT").unwrap()), 0);
-        assert_eq!(fixed(&resolve_zone("Z").unwrap()), 0);
-        assert_eq!(fixed(&resolve_zone("zulu").unwrap()), 0);
-        assert_eq!(fixed(&resolve_zone("+00").unwrap()), 0);
-        assert_eq!(fixed(&resolve_zone("-08").unwrap()), -8 * 3600);
-        assert_eq!(fixed(&resolve_zone("-0800").unwrap()), -8 * 3600);
-        assert_eq!(fixed(&resolve_zone("-08:00").unwrap()), -8 * 3600);
-        assert_eq!(fixed(&resolve_zone("+05:30").unwrap()), 5 * 3600 + 30 * 60);
-        assert_eq!(fixed(&resolve_zone("-04:30").unwrap()), -(4 * 3600 + 30 * 60));
+    fn fixed_offsets_and_utc_synonyms() -> anyhow::Result<()> {
+        assert_eq!(fixed(&resolve_zone("UTC")?), 0);
+        assert_eq!(fixed(&resolve_zone("GMT")?), 0);
+        assert_eq!(fixed(&resolve_zone("Z")?), 0);
+        assert_eq!(fixed(&resolve_zone("zulu")?), 0);
+        assert_eq!(fixed(&resolve_zone("+00")?), 0);
+        assert_eq!(fixed(&resolve_zone("-08")?), -8 * 3600);
+        assert_eq!(fixed(&resolve_zone("-0800")?), -8 * 3600);
+        assert_eq!(fixed(&resolve_zone("-08:00")?), -8 * 3600);
+        assert_eq!(fixed(&resolve_zone("+05:30")?), 5 * 3600 + 30 * 60);
+        assert_eq!(fixed(&resolve_zone("-04:30")?), -(4 * 3600 + 30 * 60));
+
+        Ok(())
     }
 
     #[test]
-    fn displacement_out_of_range() {
+    fn displacement_out_of_range() -> anyhow::Result<()> {
         assert!(matches!(
             resolve_zone("+16"),
             Err(ZoneError::DisplacementOutOfRange(_))
@@ -274,7 +283,7 @@ mod tests {
             Err(ZoneError::DisplacementOutOfRange(_))
         ));
         // ±15:59:59 is the last accepted magnitude.
-        assert_eq!(fixed(&resolve_zone("+15:59:59").unwrap()), 15 * 3600 + 59 * 60 + 59);
+        assert_eq!(fixed(&resolve_zone("+15:59:59")?), 15 * 3600 + 59 * 60 + 59);
         // A huge colon-form hour must be rejected as out-of-range, not overflow
         // `h * 3600` (which panicked in debug before the fix).
         for tok in ["+600000:00", "-600000:00", "+2000000000:00", "+99"] {
@@ -283,6 +292,8 @@ mod tests {
                 "{tok}"
             );
         }
+
+        Ok(())
     }
 
     #[test]
@@ -294,22 +305,24 @@ mod tests {
     }
 
     #[test]
-    fn named_zone_fixed_abbrev() {
+    fn named_zone_fixed_abbrev() -> anyhow::Result<()> {
         // America/New_York in winter is EST (-05:00).
-        let z = resolve_zone("America/New_York").unwrap();
+        let z = resolve_zone("America/New_York")?;
         assert_eq!(offset_for_local(&z, tm(1997, 2, 10, 17, 32, 1)), -5 * 3600);
         // In July it is EDT (-04:00).
         assert_eq!(offset_for_local(&z, tm(2013, 7, 15, 17, 15, 23)), -4 * 3600);
         // The fixed PST abbreviation is always -08:00.
-        assert_eq!(fixed(&resolve_zone("PST").unwrap()), -8 * 3600);
+        assert_eq!(fixed(&resolve_zone("PST")?), -8 * 3600);
+
+        Ok(())
     }
 
     #[test]
-    fn moscow_dst_gap_and_fold() {
+    fn moscow_dst_gap_and_fold() -> anyhow::Result<()> {
         // Europe/Moscow sprang forward +3 -> +4 on 2011-03-27 02:00 (a gap:
         // 02:00..02:59 is nonexistent) and fell back +4 -> +3 on 2014-10-26
         // 01:00 (a fold: 01:00..01:59 is ambiguous).
-        let z = resolve_zone("Europe/Moscow").unwrap();
+        let z = resolve_zone("Europe/Moscow")?;
         // Before the gap: +3.
         assert_eq!(offset_for_local(&z, tm(2011, 3, 27, 1, 0, 0)), 3 * 3600);
         // Inside the gap: PG uses the pre-transition offset, +3.
@@ -319,14 +332,16 @@ mod tests {
         // Inside the fold: PG uses the post-transition offset, +3.
         assert_eq!(offset_for_local(&z, tm(2014, 10, 26, 1, 30, 0)), 3 * 3600);
         // MSK tracks the same history.
-        let msk = resolve_zone("MSK").unwrap();
+        let msk = resolve_zone("MSK")?;
         assert_eq!(offset_for_local(&msk, tm(2011, 3, 27, 1, 0, 0)), 3 * 3600);
         assert_eq!(offset_for_local(&msk, tm(2011, 3, 27, 3, 0, 0)), 4 * 3600);
+
+        Ok(())
     }
 
     #[test]
-    fn offset_for_instant_tracks_dst() {
-        let z = resolve_zone("America/New_York").unwrap();
+    fn offset_for_instant_tracks_dst() -> anyhow::Result<()> {
+        let z = resolve_zone("America/New_York")?;
         // 2001-02-16 20:38:40 UTC: micros since 2000 epoch.
         // (computed via the timestamp module in integration tests; here just
         // assert winter EST vs summer EDT via two instants.)
@@ -336,5 +351,7 @@ mod tests {
         // 2001-07-16T20:38:40Z -> EDT (-4h). Unix secs = 995315920.
         let jul_micros = (995_315_920i64 - 946_684_800) * 1_000_000;
         assert_eq!(offset_for_instant(&z, jul_micros), -4 * 3600);
+
+        Ok(())
     }
 }

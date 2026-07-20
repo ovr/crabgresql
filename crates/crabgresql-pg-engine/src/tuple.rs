@@ -26,6 +26,15 @@ const OFF_CTID_OFF: usize = 32;
 const HAS_NULL: u16 = 0x8000;
 const NATTS_MASK: u16 = 0x07ff;
 
+fn bytes<const N: usize>(buf: &[u8], off: usize) -> [u8; N] {
+    let Some(slice) = buf.get(off..off + N) else {
+        panic!("tuple field is out of bounds");
+    };
+    let mut out = [0; N];
+    out.copy_from_slice(slice);
+    out
+}
+
 /// The header portion decoded from an on-page tuple.
 pub struct OnPageHeader {
     pub hdr: TupleHeader,
@@ -44,13 +53,13 @@ fn wr_u64(buf: &mut [u8], off: usize, v: u64) {
     buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 fn rd_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
+    u16::from_le_bytes(bytes(buf, off))
 }
 fn rd_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+    u32::from_le_bytes(bytes(buf, off))
 }
 fn rd_u64(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+    u64::from_le_bytes(bytes(buf, off))
 }
 
 fn bitmap_len(natts: usize) -> usize {
@@ -104,7 +113,10 @@ pub fn decode_header(buf: &[u8]) -> OnPageHeader {
         infomask: Infomask(rd_u16(buf, OFF_INFOMASK)),
     };
     let infomask2 = rd_u16(buf, OFF_INFOMASK2);
-    let ctid = Tid { block: rd_u32(buf, OFF_CTID_BLOCK), offset: rd_u16(buf, OFF_CTID_OFF) };
+    let ctid = Tid {
+        block: rd_u32(buf, OFF_CTID_BLOCK),
+        offset: rd_u16(buf, OFF_CTID_OFF),
+    };
     OnPageHeader {
         hdr,
         ctid,
@@ -154,7 +166,10 @@ mod tests {
     #[test]
     fn roundtrip_with_and_without_nulls() {
         let hdr = TupleHeader::inserted(Xid(7), CommandId(2));
-        let ctid = Tid { block: 3, offset: 9 };
+        let ctid = Tid {
+            block: 3,
+            offset: 9,
+        };
         for vals in [
             vec![Value::Int4(1), Value::Text("x".into()), Value::Bool(true)],
             vec![Value::Null, Value::Text("y".into()), Value::Null],
@@ -172,13 +187,32 @@ mod tests {
     #[test]
     fn stamp_xmax_and_set_ctid_in_place() {
         let hdr = TupleHeader::inserted(Xid(7), CommandId(0));
-        let mut buf = encode_tuple(&[Value::Int4(1)], &hdr, Tid { block: 0, offset: 1 });
+        let mut buf = encode_tuple(
+            &[Value::Int4(1)],
+            &hdr,
+            Tid {
+                block: 0,
+                offset: 1,
+            },
+        );
         stamp_xmax(&mut buf, Xid(8), CommandId(4));
-        set_ctid(&mut buf, Tid { block: 2, offset: 5 });
+        set_ctid(
+            &mut buf,
+            Tid {
+                block: 2,
+                offset: 5,
+            },
+        );
         let head = decode_header(&buf);
         assert_eq!(head.hdr.xmax, Xid(8));
         assert_eq!(head.hdr.cmax, CommandId(4));
-        assert_eq!(head.ctid, Tid { block: 2, offset: 5 });
+        assert_eq!(
+            head.ctid,
+            Tid {
+                block: 2,
+                offset: 5
+            }
+        );
         // The datum still decodes after the in-place edits.
         let (_, vals) = decode_tuple(&buf);
         assert_eq!(vals, vec![Value::Int4(1)]);

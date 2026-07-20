@@ -16,9 +16,9 @@
 //! accepted and ignored, but a bare IANA zone name without a date is rejected
 //! (as PG does).
 
+use crate::Numeric;
 use crate::interval::Interval;
 use crate::timestamp::{self, fixed_point};
-use crate::Numeric;
 
 const INVALID_DATETIME_FORMAT: &str = "22007";
 const DATETIME_FIELD_OVERFLOW: &str = "22008";
@@ -147,7 +147,10 @@ pub fn parse(input: &str) -> Result<i64, TimeError> {
 /// A bare `YYYY-MM-DD` (dash-separated, digits only) token.
 fn is_date_token(tok: &str) -> bool {
     let parts: Vec<&str> = tok.split('-').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Parse `HH:MM[:SS[.ffffff]]`, returning `(hour, min, sec, usec)`. A 7th+
@@ -189,7 +192,11 @@ pub fn mi_interval(usec: i64, span: Interval) -> i64 {
 /// `time - time` (`time_mi_time`): the microsecond difference, as an interval
 /// whose only nonzero field is `usec`.
 pub fn mi(a: i64, b: i64) -> Interval {
-    Interval { months: 0, days: 0, usec: a - b }
+    Interval {
+        months: 0,
+        days: 0,
+        usec: a - b,
+    }
 }
 
 // --- field extraction (date_part / extract) --------------------------------
@@ -210,7 +217,11 @@ fn classify(unit: &str) -> Option<bool> {
 }
 
 fn err_unit(unit: &str, supported: bool) -> TimeError {
-    let verb = if supported { "not supported" } else { "not recognized" };
+    let verb = if supported {
+        "not supported"
+    } else {
+        "not recognized"
+    };
     TimeError {
         sqlstate: INVALID_PARAMETER_VALUE,
         message: format!("unit \"{unit}\" {verb} for type time without time zone"),
@@ -242,7 +253,10 @@ pub fn extract(unit: &str, usec: i64) -> Result<Numeric, TimeError> {
                 "epoch" => fixed_point(usec, 6),
                 other => (field_f64(other, usec) as i64).to_string(),
             };
-            Ok(Numeric::parse(&s).expect("extract renders a valid numeric literal"))
+            match Numeric::parse(&s) {
+                Ok(value) => Ok(value),
+                Err(_) => panic!("time extraction must form a valid numeric literal"),
+            }
         }
     }
 }
@@ -292,7 +306,10 @@ pub fn make_time(hour: i64, min: i64, sec: f64) -> Result<i64, TimeError> {
     // PG prints the raw arguments (no zero-padding on hour/sec) in the error.
     let err = || TimeError {
         sqlstate: DATETIME_FIELD_OVERFLOW,
-        message: format!("time field value out of range: {hour}:{min:02}:{}", fmt_secs(sec)),
+        message: format!(
+            "time field value out of range: {hour}:{min:02}:{}",
+            fmt_secs(sec)
+        ),
     };
     if !(0..=24).contains(&hour)
         || !(0..=59).contains(&min)
@@ -321,7 +338,10 @@ mod tests {
     use super::*;
 
     fn t(s: &str) -> i64 {
-        parse(s).unwrap()
+        match parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid time test fixture `{s}`: {error:?}"),
+        }
     }
 
     #[test]
@@ -339,15 +359,17 @@ mod tests {
     }
 
     #[test]
-    fn extract_fields() {
+    fn extract_fields() -> anyhow::Result<()> {
         let x = t("13:30:25.575401");
-        assert_eq!(date_part("hour", x).unwrap(), 13.0);
-        assert_eq!(date_part("epoch", x).unwrap(), 48625.575401);
-        assert_eq!(extract("microsecond", x).unwrap().to_display(), "25575401");
-        assert_eq!(extract("second", x).unwrap().to_display(), "25.575401");
-        assert_eq!(extract("epoch", x).unwrap().to_display(), "48625.575401");
+        assert_eq!(date_part("hour", x)?, 13.0);
+        assert_eq!(date_part("epoch", x)?, 48625.575401);
+        assert_eq!(extract("microsecond", x)?.to_display(), "25575401");
+        assert_eq!(extract("second", x)?.to_display(), "25.575401");
+        assert_eq!(extract("epoch", x)?.to_display(), "48625.575401");
         assert!(date_part("day", x).is_err());
         assert!(date_part("fortnight", x).is_err());
+
+        Ok(())
     }
 
     #[test]
@@ -357,20 +379,35 @@ mod tests {
         assert_eq!(mi(t("10:00:00"), t("08:00:00")).usec, 2 * USECS_PER_HOUR);
 
         // A huge interval must fold into the day, not overflow i64.
-        let huge = Interval { months: 0, days: 0, usec: i64::MAX };
+        let huge = Interval {
+            months: 0,
+            days: 0,
+            usec: i64::MAX,
+        };
         let folded = i64::MAX.rem_euclid(USECS_PER_DAY);
-        assert_eq!(pl_interval(base, huge), (base + folded).rem_euclid(USECS_PER_DAY));
-        assert_eq!(mi_interval(base, huge), (base - folded).rem_euclid(USECS_PER_DAY));
+        assert_eq!(
+            pl_interval(base, huge),
+            (base + folded).rem_euclid(USECS_PER_DAY)
+        );
+        assert_eq!(
+            mi_interval(base, huge),
+            (base - folded).rem_euclid(USECS_PER_DAY)
+        );
     }
 
     #[test]
-    fn make_time_ok_and_err() {
-        assert_eq!(format(make_time(8, 20, 0.0).unwrap()), "08:20:00");
+    fn make_time_ok_and_err() -> anyhow::Result<()> {
+        assert_eq!(format(make_time(8, 20, 0.0)?), "08:20:00");
         assert!(make_time(10, 55, 100.1).is_err());
         assert!(make_time(24, 0, 2.1).is_err());
+
+        Ok(())
     }
 
     fn interval(s: &str) -> Interval {
-        crate::interval::parse(s).unwrap()
+        match crate::interval::parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid interval test fixture `{s}`: {error:?}"),
+        }
     }
 }

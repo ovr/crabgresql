@@ -142,6 +142,7 @@ visit_noop!(bigdecimal::BigDecimal);
 ///
 /// # Example
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::parser::Parser;
 /// # use sqlparser::dialect::GenericDialect;
 /// # use sqlparser::ast::{Visit, Visitor, ObjectName, Expr};
@@ -170,7 +171,7 @@ visit_noop!(bigdecimal::BigDecimal);
 ///
 /// let sql = "SELECT a FROM foo where x IN (SELECT y FROM bar)";
 /// let statements = Parser::parse_sql(&GenericDialect{}, sql)
-///    .unwrap();
+///    ?;
 ///
 /// // Drive the visitor through the AST
 /// let mut visitor = V::default();
@@ -188,6 +189,8 @@ visit_noop!(bigdecimal::BigDecimal);
 ///   .into_iter().map(|s| s.to_string()).collect();
 ///
 /// assert_eq!(visitor.visited, expected);
+/// # Ok(())
+/// # }
 /// ```
 pub trait Visitor {
     /// Type returned when the recursion returns early.
@@ -283,6 +286,7 @@ pub trait Visitor {
 ///
 /// # Example
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::parser::Parser;
 /// # use sqlparser::dialect::GenericDialect;
 /// # use sqlparser::ast::{VisitMut, VisitorMut, ObjectName, Expr, Ident};
@@ -304,12 +308,14 @@ pub trait Visitor {
 /// }
 ///
 /// let sql = "SELECT to_replace FROM foo where to_replace IN (SELECT to_replace FROM bar)";
-/// let mut statements = Parser::parse_sql(&GenericDialect{}, sql).unwrap();
+/// let mut statements = Parser::parse_sql(&GenericDialect{}, sql)?;
 ///
 /// // Drive the visitor through the AST
 /// statements.visit(&mut Replacer);
 ///
 /// assert_eq!(statements[0].to_string(), "SELECT replaced FROM foo WHERE replaced IN (SELECT replaced FROM bar)");
+/// # Ok(())
+/// # }
 /// ```
 pub trait VisitorMut {
     /// Type returned when the recursion returns early.
@@ -418,13 +424,14 @@ impl<E, F: FnMut(&mut ObjectName) -> ControlFlow<E>> VisitorMut for RelationVisi
 ///
 /// # Example
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::parser::Parser;
 /// # use sqlparser::dialect::GenericDialect;
 /// # use sqlparser::ast::{visit_relations};
 /// # use core::ops::ControlFlow;
 /// let sql = "SELECT a FROM foo where x IN (SELECT y FROM bar)";
 /// let statements = Parser::parse_sql(&GenericDialect{}, sql)
-///    .unwrap();
+///    ?;
 ///
 /// // visit statements, capturing relations (table names)
 /// let mut visited = vec![];
@@ -440,6 +447,8 @@ impl<E, F: FnMut(&mut ObjectName) -> ControlFlow<E>> VisitorMut for RelationVisi
 ///   .into_iter().map(|s| s.to_string()).collect();
 ///
 /// assert_eq!(visited, expected);
+/// # Ok(())
+/// # }
 /// ```
 pub fn visit_relations<V, E, F>(v: &V, f: F) -> ControlFlow<E>
 where
@@ -458,13 +467,14 @@ where
 ///
 /// # Example
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::parser::Parser;
 /// # use sqlparser::dialect::GenericDialect;
 /// # use sqlparser::ast::{ObjectName, ObjectNamePart, Ident, visit_relations_mut};
 /// # use core::ops::ControlFlow;
 /// let sql = "SELECT a FROM foo";
 /// let mut statements = Parser::parse_sql(&GenericDialect{}, sql)
-///    .unwrap();
+///    ?;
 ///
 /// // visit statements, renaming table foo to bar
 /// visit_relations_mut(&mut statements, |table| {
@@ -473,6 +483,8 @@ where
 /// });
 ///
 /// assert_eq!(statements[0].to_string(), "SELECT a FROM bar");
+/// # Ok(())
+/// # }
 /// ```
 pub fn visit_relations_mut<V, E, F>(v: &mut V, f: F) -> ControlFlow<E>
 where
@@ -506,13 +518,14 @@ impl<E, F: FnMut(&mut Expr) -> ControlFlow<E>> VisitorMut for ExprVisitor<F> {
 ///
 /// # Example
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::parser::Parser;
 /// # use sqlparser::dialect::GenericDialect;
 /// # use sqlparser::ast::{visit_expressions};
 /// # use core::ops::ControlFlow;
 /// let sql = "SELECT a FROM foo where x IN (SELECT y FROM bar)";
 /// let statements = Parser::parse_sql(&GenericDialect{}, sql)
-///    .unwrap();
+///    ?;
 ///
 /// // visit all expressions
 /// let mut visited = vec![];
@@ -530,6 +543,8 @@ impl<E, F: FnMut(&mut Expr) -> ControlFlow<E>> VisitorMut for ExprVisitor<F> {
 ///   .into_iter().map(|s| s.to_string()).collect();
 ///
 /// assert_eq!(visited, expected);
+/// # Ok(())
+/// # }
 /// ```
 pub fn visit_expressions<V, E, F>(v: &V, f: F) -> ControlFlow<E>
 where
@@ -550,12 +565,13 @@ where
 ///
 /// ## Remove all select limits in sub-queries
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::parser::Parser;
 /// # use sqlparser::dialect::GenericDialect;
 /// # use sqlparser::ast::{Expr, visit_expressions_mut, visit_statements_mut};
 /// # use core::ops::ControlFlow;
 /// let sql = "SELECT (SELECT y FROM z LIMIT 9) FROM t LIMIT 3";
-/// let mut statements = Parser::parse_sql(&GenericDialect{}, sql).unwrap();
+/// let mut statements = Parser::parse_sql(&GenericDialect{}, sql)?;
 ///
 /// // Remove all select limits in sub-queries
 /// visit_expressions_mut(&mut statements, |expr| {
@@ -566,6 +582,8 @@ where
 /// });
 ///
 /// assert_eq!(statements[0].to_string(), "SELECT (SELECT y FROM z) FROM t LIMIT 3");
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// ## Wrap column name in function call
@@ -575,12 +593,13 @@ where
 /// [`std::mem`] family of functions.
 ///
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::parser::Parser;
 /// # use sqlparser::dialect::GenericDialect;
 /// # use sqlparser::ast::*;
 /// # use core::ops::ControlFlow;
 /// let sql = "SELECT x, y FROM t";
-/// let mut statements = Parser::parse_sql(&GenericDialect{}, sql).unwrap();
+/// let mut statements = Parser::parse_sql(&GenericDialect{}, sql)?;
 ///
 /// visit_expressions_mut(&mut statements, |expr| {
 ///   if matches!(expr, Expr::Identifier(col_name) if col_name.value == "x") {
@@ -604,6 +623,8 @@ where
 /// });
 ///
 /// assert_eq!(statements[0].to_string(), "SELECT f(x), y FROM t");
+/// # Ok(())
+/// # }
 /// ```
 pub fn visit_expressions_mut<V, E, F>(v: &mut V, f: F) -> ControlFlow<E>
 where
@@ -637,13 +658,14 @@ impl<E, F: FnMut(&mut Statement) -> ControlFlow<E>> VisitorMut for StatementVisi
 ///
 /// # Example
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::parser::Parser;
 /// # use sqlparser::dialect::GenericDialect;
 /// # use sqlparser::ast::{visit_statements};
 /// # use core::ops::ControlFlow;
 /// let sql = "SELECT a FROM foo where x IN (SELECT y FROM bar); CREATE TABLE baz(q int)";
 /// let statements = Parser::parse_sql(&GenericDialect{}, sql)
-///    .unwrap();
+///    ?;
 ///
 /// // visit all statements
 /// let mut visited = vec![];
@@ -659,6 +681,8 @@ impl<E, F: FnMut(&mut Statement) -> ControlFlow<E>> VisitorMut for StatementVisi
 ///   .into_iter().map(|s| s.to_string()).collect();
 ///
 /// assert_eq!(visited, expected);
+/// # Ok(())
+/// # }
 /// ```
 pub fn visit_statements<V, E, F>(v: &V, f: F) -> ControlFlow<E>
 where
@@ -674,12 +698,13 @@ where
 ///
 /// # Example
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::parser::Parser;
 /// # use sqlparser::dialect::GenericDialect;
 /// # use sqlparser::ast::{Statement, visit_statements_mut};
 /// # use core::ops::ControlFlow;
 /// let sql = "SELECT x FROM foo LIMIT 9+$limit; SELECT * FROM t LIMIT f()";
-/// let mut statements = Parser::parse_sql(&GenericDialect{}, sql).unwrap();
+/// let mut statements = Parser::parse_sql(&GenericDialect{}, sql)?;
 ///
 /// // Remove all select limits in outer statements (not in sub-queries)
 /// visit_statements_mut(&mut statements, |stmt| {
@@ -691,6 +716,8 @@ where
 ///
 /// assert_eq!(statements[0].to_string(), "SELECT x FROM foo");
 /// assert_eq!(statements[1].to_string(), "SELECT * FROM t");
+/// # Ok(())
+/// # }
 /// ```
 pub fn visit_statements_mut<V, E, F>(v: &mut V, f: F) -> ControlFlow<E>
 where
@@ -790,11 +817,14 @@ mod tests {
 
     fn do_visit<V: Visitor<Break = ()>>(sql: &str, visitor: &mut V) -> Statement {
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
-        let s = Parser::new(&dialect)
-            .with_tokens(tokens)
-            .parse_statement()
-            .unwrap();
+        let tokens = match Tokenizer::new(&dialect, sql).tokenize() {
+            Ok(tokens) => tokens,
+            Err(error) => panic!("failed to tokenize visitor test fixture: {error}"),
+        };
+        let s = match Parser::new(&dialect).with_tokens(tokens).parse_statement() {
+            Ok(statement) => statement,
+            Err(error) => panic!("failed to parse visitor test fixture: {error}"),
+        };
 
         let flow = s.visit(visitor);
         assert_eq!(flow, ControlFlow::Continue(()));
@@ -993,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn overflow() {
+    fn overflow() -> anyhow::Result<()> {
         let cond = (0..1000)
             .map(|n| format!("X = {n}"))
             .collect::<Vec<_>>()
@@ -1001,15 +1031,16 @@ mod tests {
         let sql = format!("SELECT x where {cond}");
 
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql.as_str()).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, sql.as_str()).tokenize()?;
         let s = Parser::new(&dialect)
             .with_tokens(tokens)
-            .parse_statement()
-            .unwrap();
+            .parse_statement()?;
 
         let mut visitor = QuickVisitor {};
         let flow = s.visit(&mut visitor);
         assert_eq!(flow, ControlFlow::Continue(()));
+
+        Ok(())
     }
 }
 
@@ -1042,11 +1073,14 @@ mod visit_mut_tests {
 
     fn do_visit_mut<V: VisitorMut<Break = ()>>(sql: &str, visitor: &mut V) -> Statement {
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
-        let mut s = Parser::new(&dialect)
-            .with_tokens(tokens)
-            .parse_statement()
-            .unwrap();
+        let tokens = match Tokenizer::new(&dialect, sql).tokenize() {
+            Ok(tokens) => tokens,
+            Err(error) => panic!("failed to tokenize mutable-visitor test fixture: {error}"),
+        };
+        let mut s = match Parser::new(&dialect).with_tokens(tokens).parse_statement() {
+            Ok(statement) => statement,
+            Err(error) => panic!("failed to parse mutable-visitor test fixture: {error}"),
+        };
 
         let flow = s.visit(visitor);
         assert_eq!(flow, ControlFlow::Continue(()));

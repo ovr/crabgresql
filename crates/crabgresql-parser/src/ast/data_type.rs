@@ -405,8 +405,6 @@ fn format_datetime_precision_and_tz(
     Ok(())
 }
 
-
-
 /// Timestamp and Time data types information about TimeZone formatting.
 ///
 /// This is more related to a display information than real differences between each variant. To

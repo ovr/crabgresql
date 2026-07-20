@@ -255,7 +255,9 @@ pub fn analyze_statement(
     let (catalog, type_catalog) = bind_catalogs(engine, global_catalog, session);
     let ctx = param_ctx_extended(declared);
     let logical = match stmt {
-        ast::Statement::Query(query) => bind_query_with_params(&catalog, &type_catalog, query, &ctx)?,
+        ast::Statement::Query(query) => {
+            bind_query_with_params(&catalog, &type_catalog, query, &ctx)?
+        }
         ast::Statement::Insert(insert) => {
             bind_insert_with_params(&catalog, &type_catalog, insert, &ctx)?
         }
@@ -340,80 +342,80 @@ pub fn execute_statement(
         Some(logical) => logical,
         // Not DQL/DML: fall through to the utility-statement handlers below.
         None => match stmt {
-        ast::Statement::CreateTable(create) => {
-            return execute_create_table(engine, &type_catalog, create, session);
-        }
-        ast::Statement::CreateType {
-            name,
-            representation,
-        } => return execute_create_type(global_catalog, name, representation),
-        ast::Statement::CreateFunction(create) => {
-            return execute_create_function(global_catalog, create);
-        }
-        ast::Statement::CreateCast {
-            source,
-            target,
-            method,
-            ..
-        } => return execute_create_cast(global_catalog, source, target, method),
-        ast::Statement::Drop {
-            object_type: ast::ObjectType::Table,
-            names,
-            if_exists,
-            ..
-        } => return execute_drop_table(&catalog, names, *if_exists),
-        ast::Statement::Drop {
-            object_type: ast::ObjectType::Type,
-            names,
-            cascade,
-            if_exists,
-            ..
-        } => return execute_drop_type(global_catalog, names, *cascade, *if_exists),
-        ast::Statement::DropCast {
-            if_exists,
-            source,
-            target,
-            ..
-        } => return execute_drop_cast(global_catalog, source, target, *if_exists),
-        ast::Statement::Set(set) => return apply_set(set, session),
-        ast::Statement::Reset(reset) => return apply_reset(reset, session),
-        ast::Statement::StartTransaction {
-            modes,
-            begin,
-            modifier,
-            statements,
-            exception,
-            has_end_keyword,
-            ..
-        } => {
-            return begin_transaction(
-                session,
+            ast::Statement::CreateTable(create) => {
+                return execute_create_table(engine, &type_catalog, create, session);
+            }
+            ast::Statement::CreateType {
+                name,
+                representation,
+            } => return execute_create_type(global_catalog, name, representation),
+            ast::Statement::CreateFunction(create) => {
+                return execute_create_function(global_catalog, create);
+            }
+            ast::Statement::CreateCast {
+                source,
+                target,
+                method,
+                ..
+            } => return execute_create_cast(global_catalog, source, target, method),
+            ast::Statement::Drop {
+                object_type: ast::ObjectType::Table,
+                names,
+                if_exists,
+                ..
+            } => return execute_drop_table(&catalog, names, *if_exists),
+            ast::Statement::Drop {
+                object_type: ast::ObjectType::Type,
+                names,
+                cascade,
+                if_exists,
+                ..
+            } => return execute_drop_type(global_catalog, names, *cascade, *if_exists),
+            ast::Statement::DropCast {
+                if_exists,
+                source,
+                target,
+                ..
+            } => return execute_drop_cast(global_catalog, source, target, *if_exists),
+            ast::Statement::Set(set) => return apply_set(set, session),
+            ast::Statement::Reset(reset) => return apply_reset(reset, session),
+            ast::Statement::StartTransaction {
                 modes,
-                *begin,
+                begin,
                 modifier,
                 statements,
                 exception,
-                *has_end_keyword,
-            );
-        }
-        ast::Statement::Commit {
-            chain, modifier, ..
-        } => return commit_transaction(txnmgr, session, *chain, modifier),
-        ast::Statement::Rollback { chain, savepoint } => {
-            return rollback_transaction(txnmgr, session, *chain, savepoint);
-        }
-        ast::Statement::Truncate(truncate) => {
-            return execute_truncate(&catalog, txnmgr, session, truncate);
-        }
-        ast::Statement::CreateIndex(create) => {
-            return execute_create_index(&catalog, txnmgr, session, create);
-        }
-        other => {
-            return Err(PgError::feature_not_supported(format!(
-                "statement is not supported yet: {}",
-                statement_kind(other)
-            )));
-        }
+                has_end_keyword,
+                ..
+            } => {
+                return begin_transaction(
+                    session,
+                    modes,
+                    *begin,
+                    modifier,
+                    statements,
+                    exception,
+                    *has_end_keyword,
+                );
+            }
+            ast::Statement::Commit {
+                chain, modifier, ..
+            } => return commit_transaction(txnmgr, session, *chain, modifier),
+            ast::Statement::Rollback { chain, savepoint } => {
+                return rollback_transaction(txnmgr, session, *chain, savepoint);
+            }
+            ast::Statement::Truncate(truncate) => {
+                return execute_truncate(&catalog, txnmgr, session, truncate);
+            }
+            ast::Statement::CreateIndex(create) => {
+                return execute_create_index(&catalog, txnmgr, session, create);
+            }
+            other => {
+                return Err(PgError::feature_not_supported(format!(
+                    "statement is not supported yet: {}",
+                    statement_kind(other)
+                )));
+            }
         },
     };
     // A write statement needs an XID to stamp its versions; a read runs with
@@ -1741,7 +1743,10 @@ fn type_shape_from_options(
                     backing = Some(t);
                 } else if let Some(len) = n.as_deref().and_then(|n| catalog.user_type_typlen(n)) {
                     typlen = len;
-                    backing = catalog.user_type_backing(n.as_deref().unwrap());
+                    let Some(name) = n.as_deref() else {
+                        return Err(PgError::new("XX000", "type name is missing"));
+                    };
+                    backing = catalog.user_type_backing(name);
                 } else {
                     // An unresolvable target is an undefined-object error
                     // (42704), matching PG — reported verbatim (qualifier

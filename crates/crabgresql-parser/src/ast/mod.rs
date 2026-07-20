@@ -64,21 +64,21 @@ pub use self::ddl::{
     AlterTableLock, AlterTableOperation, AlterTableType, AlterType, AlterTypeAddValue,
     AlterTypeAddValuePosition, AlterTypeOperation, AlterTypeRename, AlterTypeRenameValue,
     CastContext, CastMethod, ClusteredBy, ColumnDef, ColumnOption, ColumnOptionDef, ColumnOptions,
-    ColumnPolicy,
-    ColumnPolicyProperty, ConstraintCharacteristics, CreateCollation, CreateCollationDefinition,
-    CreateConnector, CreateDomain, CreateExtension, CreateFunction, CreateIndex, CreateOperator,
-    CreateOperatorClass, CreateOperatorFamily, CreatePolicy, CreatePolicyCommand, CreatePolicyType,
-    CreateTable, CreateTrigger, CreateView, Deduplicate, DeferrableInitial, DistStyle,
-    DropBehavior, DropExtension, DropFunction, DropOperator, DropOperatorClass, DropOperatorFamily,
-    DropOperatorSignature, DropPolicy, DropTrigger, ForValues, FunctionReturnType, GeneratedAs,
-    GeneratedExpressionMode, IdentityParameters, IdentityProperty, IdentityPropertyFormatKind,
-    IdentityPropertyKind, IdentityPropertyOrder, IndexColumn, IndexOption, IndexType,
-    KeyOrIndexDisplay, Msck, NullsDistinctOption, OperatorArgTypes, OperatorClassItem,
-    OperatorFamilyDropItem, OperatorFamilyItem, OperatorOption, OperatorPurpose, Owner, Partition,
-    PartitionBoundValue, ProcedureParam, ReferentialAction, RenameTableNameKind, ReplicaIdentity,
-    TagsColumnOption, TriggerObjectKind, Truncate, UserDefinedTypeCompositeAttributeDef,
-    UserDefinedTypeInternalLength, UserDefinedTypeRangeOption, UserDefinedTypeRepresentation,
-    UserDefinedTypeSqlDefinitionOption, UserDefinedTypeStorage, ViewColumnDef,
+    ColumnPolicy, ColumnPolicyProperty, ConstraintCharacteristics, CreateCollation,
+    CreateCollationDefinition, CreateConnector, CreateDomain, CreateExtension, CreateFunction,
+    CreateIndex, CreateOperator, CreateOperatorClass, CreateOperatorFamily, CreatePolicy,
+    CreatePolicyCommand, CreatePolicyType, CreateTable, CreateTrigger, CreateView, Deduplicate,
+    DeferrableInitial, DistStyle, DropBehavior, DropExtension, DropFunction, DropOperator,
+    DropOperatorClass, DropOperatorFamily, DropOperatorSignature, DropPolicy, DropTrigger,
+    ForValues, FunctionReturnType, GeneratedAs, GeneratedExpressionMode, IdentityParameters,
+    IdentityProperty, IdentityPropertyFormatKind, IdentityPropertyKind, IdentityPropertyOrder,
+    IndexColumn, IndexOption, IndexType, KeyOrIndexDisplay, Msck, NullsDistinctOption,
+    OperatorArgTypes, OperatorClassItem, OperatorFamilyDropItem, OperatorFamilyItem,
+    OperatorOption, OperatorPurpose, Owner, Partition, PartitionBoundValue, ProcedureParam,
+    ReferentialAction, RenameTableNameKind, ReplicaIdentity, TagsColumnOption, TriggerObjectKind,
+    Truncate, UserDefinedTypeCompositeAttributeDef, UserDefinedTypeInternalLength,
+    UserDefinedTypeRangeOption, UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
+    UserDefinedTypeStorage, ViewColumnDef,
 };
 pub use self::dml::{
     Delete, Insert, Merge, MergeAction, MergeClause, MergeClauseKind, MergeInsertExpr,
@@ -90,23 +90,21 @@ pub use self::operator::{BinaryOperator, UnaryOperator};
 pub use self::query::{
     AfterMatchSkip, ConnectByKind, Cte, CteAsMaterialized, Distinct, EmptyMatchesMode,
     ExceptSelectItem, ExcludeSelectItem, ExprWithAlias, ExprWithAliasAndOrderBy, Fetch,
-    FormatClause, GroupByExpr, GroupByWithModifier, IdentWithAlias,
-    IlikeSelectItem, InputFormatClause, Interpolate, InterpolateExpr, Join, JoinConstraint,
-    JoinOperator, JsonTableColumn, JsonTableColumnErrorHandling, JsonTableNamedColumn,
-    JsonTableNestedColumn, LateralView, LimitClause, LockClause, LockType, MatchRecognizePattern,
-    MatchRecognizeSymbol, Measure, NamedWindowDefinition, NamedWindowExpr, NonBlock, Offset,
-    OffsetRows, OpenJsonTableColumn, OrderBy, OrderByExpr, OrderByKind, OrderByOptions,
-    ProjectionSelect, Query, RenameSelectItem,
-    RepetitionQuantifier, ReplaceSelectElement, ReplaceSelectItem, RowsPerMatch, Select,
-    SelectFlavor, SelectInto, SelectItem, SelectItemQualifiedWildcardKind, SelectModifiers,
-    SetExpr, SetOperator, SetQuantifier, Setting, SymbolDefinition, Table, TableAlias,
-    TableAliasColumnDef, TableFactor, TableFunctionArgs, TableIndexHintForClause,
+    FormatClause, GroupByExpr, GroupByWithModifier, IdentWithAlias, IlikeSelectItem,
+    InputFormatClause, Interpolate, InterpolateExpr, Join, JoinConstraint, JoinOperator,
+    JsonTableColumn, JsonTableColumnErrorHandling, JsonTableNamedColumn, JsonTableNestedColumn,
+    LateralView, LimitClause, LockClause, LockType, MatchRecognizePattern, MatchRecognizeSymbol,
+    Measure, NamedWindowDefinition, NamedWindowExpr, NonBlock, Offset, OffsetRows,
+    OpenJsonTableColumn, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, ProjectionSelect,
+    Query, RenameSelectItem, RepetitionQuantifier, ReplaceSelectElement, ReplaceSelectItem,
+    RowsPerMatch, Select, SelectFlavor, SelectInto, SelectItem, SelectItemQualifiedWildcardKind,
+    SelectModifiers, SetExpr, SetOperator, SetQuantifier, Setting, SymbolDefinition, Table,
+    TableAlias, TableAliasColumnDef, TableFactor, TableFunctionArgs, TableIndexHintForClause,
     TableIndexHintType, TableIndexHints, TableIndexType, TableSample, TableSampleBucket,
     TableSampleKind, TableSampleMethod, TableSampleModifier, TableSampleQuantity, TableSampleSeed,
-    TableSampleSeedModifier, TableSampleUnit, TableVersion, TableWithJoins,
-    UpdateTableFromKind, Values, WildcardAdditionalOptions, With, WithFill,
-    XmlNamespaceDefinition, XmlPassingArgument, XmlPassingClause, XmlTableColumn,
-    XmlTableColumnOption,
+    TableSampleSeedModifier, TableSampleUnit, TableVersion, TableWithJoins, UpdateTableFromKind,
+    Values, WildcardAdditionalOptions, With, WithFill, XmlNamespaceDefinition, XmlPassingArgument,
+    XmlPassingClause, XmlTableColumn, XmlTableColumnOption,
 };
 
 pub use self::trigger::{
@@ -580,8 +578,6 @@ impl fmt::Display for StructField {
         }
     }
 }
-
-
 
 /// A dictionary field within a dictionary.
 ///
@@ -1832,16 +1828,10 @@ impl fmt::Display for Expr {
                 negated,
             } => {
                 let not_ = if *negated { "NOT " } else { "" };
-                if form.is_none() {
-                    write!(f, "{expr} IS {not_}NORMALIZED")
+                if let Some(form) = form {
+                    write!(f, "{} IS {}{} NORMALIZED", expr, not_, form)
                 } else {
-                    write!(
-                        f,
-                        "{} IS {}{} NORMALIZED",
-                        expr,
-                        not_,
-                        form.as_ref().unwrap()
-                    )
+                    write!(f, "{expr} IS {not_}NORMALIZED")
                 }
             }
             Expr::SimilarTo {
@@ -4369,10 +4359,11 @@ impl fmt::Display for Statement {
     /// indentation and line breaks. For example:
     ///
     /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # use sqlparser::dialect::GenericDialect;
     /// # use sqlparser::parser::Parser;
     /// let sql = "SELECT a, b FROM table_1";
-    /// let ast = Parser::parse_sql(&GenericDialect, sql).unwrap();
+    /// let ast = Parser::parse_sql(&GenericDialect, sql)?;
     ///
     /// // Regular formatting
     /// assert_eq!(format!("{}", ast[0]), "SELECT a, b FROM table_1");
@@ -4384,6 +4375,8 @@ impl fmt::Display for Statement {
     ///   b
     /// FROM
     ///   table_1"#);
+    /// # Ok(())
+    /// # }
     /// ```
     // Clippy thinks this function is too complicated, but it is painful to
     // split up without extracting structs for each `Statement` variant.

@@ -41,8 +41,10 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, 
             Ok(Value::Bool(is_null != *negated))
         }
         BoundExpr::Coerce { expr, ty } => coerce_value(eval(expr, row, ctx)?, *ty, ctx),
-        BoundExpr::Reinterpret { expr, rep, .. } => cast::reinterpret_value(eval(expr, row, ctx)?, *rep)
-            .map_err(|e| ExecError::new(e.sqlstate, e.message)),
+        BoundExpr::Reinterpret { expr, rep, .. } => {
+            cast::reinterpret_value(eval(expr, row, ctx)?, *rep)
+                .map_err(|e| ExecError::new(e.sqlstate, e.message))
+        }
         BoundExpr::FuncCall { func, args, .. } => {
             let arg_values = args
                 .iter()
@@ -183,9 +185,9 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         // Byte-order comparison: C-collation semantics until collations land.
         // varchar and name compare like text; bpchar ignores trailing blanks.
         PgType::Text | PgType::Varchar | PgType::Name => text(l).cmp(text(r)),
-        PgType::Bpchar => {
-            text(l).trim_end_matches(' ').cmp(text(r).trim_end_matches(' '))
-        }
+        PgType::Bpchar => text(l)
+            .trim_end_matches(' ')
+            .cmp(text(r).trim_end_matches(' ')),
         PgType::Bytea => bytea(l).cmp(bytea(r)),
         // false < true, as in PG.
         PgType::Bool => bool_of(l).cmp(&bool_of(r)),

@@ -68,20 +68,26 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ProtocolError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| ProtocolError::Malformed("truncated message".into()))
+    }
+
     fn u8(&mut self) -> Result<u8, ProtocolError> {
         Ok(self.take(1)?[0])
     }
 
     fn i16(&mut self) -> Result<i16, ProtocolError> {
-        Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(i16::from_be_bytes(self.array()?))
     }
 
     fn i32(&mut self) -> Result<i32, ProtocolError> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(self.array()?))
     }
 
     fn u32(&mut self) -> Result<u32, ProtocolError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(self.array()?))
     }
 
     fn cstr(&mut self) -> Result<String, ProtocolError> {
@@ -146,7 +152,9 @@ impl Format {
         match v {
             0 => Ok(Format::Text),
             1 => Ok(Format::Binary),
-            other => Err(ProtocolError::Malformed(format!("invalid format code {other}"))),
+            other => Err(ProtocolError::Malformed(format!(
+                "invalid format code {other}"
+            ))),
         }
     }
 
@@ -376,7 +384,7 @@ impl AuthRequest {
             2 => AuthRequest::KerberosV5,
             3 => AuthRequest::CleartextPassword,
             5 => {
-                let salt = r.take(4)?.try_into().unwrap();
+                let salt = r.array()?;
                 AuthRequest::Md5Password { salt }
             }
             7 => AuthRequest::Gss,
@@ -451,7 +459,8 @@ impl StartupRequest {
         if body.len() < 4 {
             return Err(ProtocolError::Malformed("short startup packet".into()));
         }
-        let code = i32::from_be_bytes(body[..4].try_into().unwrap());
+        let mut r = Reader::new(body);
+        let code = r.i32()?;
         match code {
             SSL_REQUEST_CODE => Ok(StartupRequest::Ssl),
             GSSENC_REQUEST_CODE => Ok(StartupRequest::GssEnc),
@@ -460,8 +469,8 @@ impl StartupRequest {
                     return Err(ProtocolError::Malformed("short CancelRequest".into()));
                 }
                 Ok(StartupRequest::Cancel {
-                    pid: i32::from_be_bytes(body[4..8].try_into().unwrap()),
-                    secret: i32::from_be_bytes(body[8..12].try_into().unwrap()),
+                    pid: r.i32()?,
+                    secret: r.i32()?,
                 })
             }
             PROTOCOL_VERSION_3 => Ok(StartupRequest::Startup {
@@ -832,15 +841,16 @@ impl BackendMessage {
             BackendMessage::ReadyForQuery(status) => {
                 framed(buf, b'Z', |b| b.put_u8(status.as_byte()))
             }
-            BackendMessage::NegotiateProtocolVersion { minor, unrecognized } => {
-                framed(buf, b'v', |b| {
-                    b.put_i32(*minor);
-                    b.put_i32(unrecognized.len() as i32);
-                    for opt in unrecognized {
-                        put_cstr(b, opt);
-                    }
-                })
-            }
+            BackendMessage::NegotiateProtocolVersion {
+                minor,
+                unrecognized,
+            } => framed(buf, b'v', |b| {
+                b.put_i32(*minor);
+                b.put_i32(unrecognized.len() as i32);
+                for opt in unrecognized {
+                    put_cstr(b, opt);
+                }
+            }),
             BackendMessage::RowDescription(fields) => put_row_description(buf, fields),
             BackendMessage::DataRow(columns) => {
                 put_data_row(buf, columns.iter().map(|c| c.as_deref()))
@@ -901,7 +911,10 @@ impl BackendMessage {
                 for _ in 0..count {
                     unrecognized.push(r.cstr()?);
                 }
-                BackendMessage::NegotiateProtocolVersion { minor, unrecognized }
+                BackendMessage::NegotiateProtocolVersion {
+                    minor,
+                    unrecognized,
+                }
             }
             b'T' => {
                 let count = r.count()?;
@@ -1007,8 +1020,18 @@ mod tests {
     /// Split a fully-framed tagged message into `(tag, body)` and assert the
     /// length prefix covers the length field plus the body (but not the tag).
     fn frame_parts(buf: &[u8]) -> (u8, &[u8]) {
-        let tag = buf[0];
-        let len = i32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+        let Some((&tag, rest)) = buf.split_first() else {
+            panic!("encoded tagged message must contain a tag");
+        };
+        let Some(length_bytes) = rest.get(..4) else {
+            panic!("encoded tagged message must contain a length");
+        };
+        let len = i32::from_be_bytes([
+            length_bytes[0],
+            length_bytes[1],
+            length_bytes[2],
+            length_bytes[3],
+        ]) as usize;
         assert_eq!(len, buf.len() - 1, "tagged length must cover len + body");
         (tag, &buf[5..])
     }
@@ -1018,7 +1041,10 @@ mod tests {
         let mut buf = BytesMut::new();
         msg.encode(&mut buf);
         let (tag, body) = frame_parts(&buf);
-        assert_eq!(FrontendMessage::decode(tag, body).unwrap(), msg);
+        match FrontendMessage::decode(tag, body) {
+            Ok(decoded) => assert_eq!(decoded, msg),
+            Err(error) => panic!("failed to decode frontend round-trip: {error}"),
+        }
     }
 
     #[track_caller]
@@ -1026,16 +1052,30 @@ mod tests {
         let mut buf = BytesMut::new();
         msg.encode(&mut buf);
         let (tag, body) = frame_parts(&buf);
-        assert_eq!(BackendMessage::decode(tag, body).unwrap(), msg);
+        match BackendMessage::decode(tag, body) {
+            Ok(decoded) => assert_eq!(decoded, msg),
+            Err(error) => panic!("failed to decode backend round-trip: {error}"),
+        }
     }
 
     #[track_caller]
     fn rt_startup(req: StartupRequest) {
         let mut buf = BytesMut::new();
         req.encode(&mut buf);
-        let len = i32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let Some(length_bytes) = buf.get(..4) else {
+            panic!("encoded startup message must contain a length");
+        };
+        let len = i32::from_be_bytes([
+            length_bytes[0],
+            length_bytes[1],
+            length_bytes[2],
+            length_bytes[3],
+        ]) as usize;
         assert_eq!(len, buf.len(), "untagged length must cover len + body");
-        assert_eq!(StartupRequest::decode(&buf[4..]).unwrap(), req);
+        match StartupRequest::decode(&buf[4..]) {
+            Ok(decoded) => assert_eq!(decoded, req),
+            Err(error) => panic!("failed to decode startup round-trip: {error}"),
+        }
     }
 
     #[test]
@@ -1119,7 +1159,10 @@ mod tests {
             },
             AuthRequest::Sspi,
             AuthRequest::Sasl {
-                mechanisms: vec!["SCRAM-SHA-256".to_string(), "SCRAM-SHA-256-PLUS".to_string()],
+                mechanisms: vec![
+                    "SCRAM-SHA-256".to_string(),
+                    "SCRAM-SHA-256-PLUS".to_string(),
+                ],
             },
             AuthRequest::Sasl { mechanisms: vec![] },
             AuthRequest::SaslContinue {
@@ -1212,7 +1255,9 @@ mod tests {
             channel: "chan".to_string(),
             payload: "hi".to_string(),
         });
-        rt_backend(BackendMessage::FunctionCallResponse(Some(b"result".to_vec())));
+        rt_backend(BackendMessage::FunctionCallResponse(Some(
+            b"result".to_vec(),
+        )));
         rt_backend(BackendMessage::FunctionCallResponse(None));
     }
 
@@ -1244,13 +1289,15 @@ mod tests {
     }
 
     #[test]
-    fn error_response_carries_sqlstate() {
+    fn error_response_carries_sqlstate() -> anyhow::Result<()> {
         let mut buf = BytesMut::new();
         BackendMessage::ErrorResponse(ErrorFields::error("42601", "syntax error")).encode(&mut buf);
         assert_eq!(buf[0], b'E');
-        let len = i32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+        let len = i32::from_be_bytes(buf[1..5].try_into()?) as usize;
         assert_eq!(buf.len(), 1 + len);
         assert!(buf.windows(6).any(|w| w == b"42601\0"));
+
+        Ok(())
     }
 
     #[test]

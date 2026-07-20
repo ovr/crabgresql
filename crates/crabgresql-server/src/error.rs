@@ -17,6 +17,14 @@ pub struct PgError {
     pub location: Option<(u64, u64)>,
 }
 
+impl std::fmt::Display for PgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PgError {}
+
 impl PgError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {

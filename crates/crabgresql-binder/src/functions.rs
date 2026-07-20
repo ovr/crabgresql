@@ -745,18 +745,46 @@ fn lookup(name: &str) -> &'static [Signature] {
     macro_rules! num_and_f8 {
         ($num:expr, $f8:expr) => {
             &[
-                Signature { func: $f8, args: &[F8], ret: F8 },
-                Signature { func: $num, args: &[NUM], ret: NUM },
+                Signature {
+                    func: $f8,
+                    args: &[F8],
+                    ret: F8,
+                },
+                Signature {
+                    func: $num,
+                    args: &[NUM],
+                    ret: NUM,
+                },
             ]
         };
     }
     match name {
         "trunc" => &[
-            Signature { func: ScalarFn::Trunc, args: &[F8], ret: F8 },
-            Signature { func: ScalarFn::NumTrunc, args: &[NUM], ret: NUM },
-            Signature { func: ScalarFn::NumTrunc, args: &[NUM, I4], ret: NUM },
-            Signature { func: ScalarFn::MacaddrTrunc, args: &[MACADDR], ret: MACADDR },
-            Signature { func: ScalarFn::MacaddrTrunc, args: &[MACADDR8], ret: MACADDR8 },
+            Signature {
+                func: ScalarFn::Trunc,
+                args: &[F8],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::NumTrunc,
+                args: &[NUM],
+                ret: NUM,
+            },
+            Signature {
+                func: ScalarFn::NumTrunc,
+                args: &[NUM, I4],
+                ret: NUM,
+            },
+            Signature {
+                func: ScalarFn::MacaddrTrunc,
+                args: &[MACADDR],
+                ret: MACADDR,
+            },
+            Signature {
+                func: ScalarFn::MacaddrTrunc,
+                args: &[MACADDR8],
+                ret: MACADDR8,
+            },
         ],
         "macaddr8_set7bit" => &[Signature {
             func: ScalarFn::Macaddr8Set7bit,
@@ -764,9 +792,21 @@ fn lookup(name: &str) -> &'static [Signature] {
             ret: MACADDR8,
         }],
         "round" => &[
-            Signature { func: ScalarFn::Round, args: &[F8], ret: F8 },
-            Signature { func: ScalarFn::NumRound, args: &[NUM], ret: NUM },
-            Signature { func: ScalarFn::NumRound, args: &[NUM, I4], ret: NUM },
+            Signature {
+                func: ScalarFn::Round,
+                args: &[F8],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::NumRound,
+                args: &[NUM],
+                ret: NUM,
+            },
+            Signature {
+                func: ScalarFn::NumRound,
+                args: &[NUM, I4],
+                ret: NUM,
+            },
         ],
         "ceil" | "ceiling" => num_and_f8!(ScalarFn::NumCeil, ScalarFn::Ceil),
         "floor" => num_and_f8!(ScalarFn::NumFloor, ScalarFn::Floor),
@@ -776,23 +816,57 @@ fn lookup(name: &str) -> &'static [Signature] {
         // int -> numeric (PG's abs(int) is exact too); a float argument binds
         // the float8 overload.
         "abs" => &[
-            Signature { func: ScalarFn::NumAbs, args: &[NUM], ret: NUM },
-            Signature { func: ScalarFn::AbsF8, args: &[F8], ret: F8 },
+            Signature {
+                func: ScalarFn::NumAbs,
+                args: &[NUM],
+                ret: NUM,
+            },
+            Signature {
+                func: ScalarFn::AbsF8,
+                args: &[F8],
+                ret: F8,
+            },
         ],
         // Integer overloads keep the argument type (like PG); a numeric argument
         // binds the numeric overload exactly.
         "mod" => &[
-            Signature { func: ScalarFn::ModInt, args: &[PgType::Int2, PgType::Int2], ret: PgType::Int2 },
-            Signature { func: ScalarFn::ModInt, args: &[I4, I4], ret: I4 },
-            Signature { func: ScalarFn::ModInt, args: &[PgType::Int8, PgType::Int8], ret: PgType::Int8 },
-            Signature { func: ScalarFn::NumMod, args: &[NUM, NUM], ret: NUM },
+            Signature {
+                func: ScalarFn::ModInt,
+                args: &[PgType::Int2, PgType::Int2],
+                ret: PgType::Int2,
+            },
+            Signature {
+                func: ScalarFn::ModInt,
+                args: &[I4, I4],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::ModInt,
+                args: &[PgType::Int8, PgType::Int8],
+                ret: PgType::Int8,
+            },
+            Signature {
+                func: ScalarFn::NumMod,
+                args: &[NUM, NUM],
+                ret: NUM,
+            },
         ],
         // money helper functions.
-        "cash_words" => &[Signature { func: ScalarFn::CashWords, args: &[MONEY], ret: TEXT }],
-        "cashlarger" => &[Signature { func: ScalarFn::CashLarger, args: &[MONEY, MONEY], ret: MONEY }],
-        "cashsmaller" => {
-            &[Signature { func: ScalarFn::CashSmaller, args: &[MONEY, MONEY], ret: MONEY }]
-        }
+        "cash_words" => &[Signature {
+            func: ScalarFn::CashWords,
+            args: &[MONEY],
+            ret: TEXT,
+        }],
+        "cashlarger" => &[Signature {
+            func: ScalarFn::CashLarger,
+            args: &[MONEY, MONEY],
+            ret: MONEY,
+        }],
+        "cashsmaller" => &[Signature {
+            func: ScalarFn::CashSmaller,
+            args: &[MONEY, MONEY],
+            ret: MONEY,
+        }],
         "cbrt" => unary_f8!(ScalarFn::Cbrt),
         "exp" => num_and_f8!(ScalarFn::NumExp, ScalarFn::Exp),
         "ln" => num_and_f8!(ScalarFn::NumLn, ScalarFn::Ln),
@@ -800,9 +874,21 @@ fn lookup(name: &str) -> &'static [Signature] {
         // a `numeric` argument still binds the numeric overload exactly. The
         // two-arg `log(base, value)` is numeric-only.
         "log" | "log10" => &[
-            Signature { func: ScalarFn::Log10F8, args: &[F8], ret: F8 },
-            Signature { func: ScalarFn::NumLog10, args: &[NUM], ret: NUM },
-            Signature { func: ScalarFn::NumLog, args: &[NUM, NUM], ret: NUM },
+            Signature {
+                func: ScalarFn::Log10F8,
+                args: &[F8],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::NumLog10,
+                args: &[NUM],
+                ret: NUM,
+            },
+            Signature {
+                func: ScalarFn::NumLog,
+                args: &[NUM, NUM],
+                ret: NUM,
+            },
         ],
         "sinh" => unary_f8!(ScalarFn::Sinh),
         "cosh" => unary_f8!(ScalarFn::Cosh),
@@ -822,8 +908,16 @@ fn lookup(name: &str) -> &'static [Signature] {
         "acosd" => unary_f8!(ScalarFn::Acosd),
         "atand" => unary_f8!(ScalarFn::Atand),
         "power" | "pow" => &[
-            Signature { func: ScalarFn::Power, args: &[F8, F8], ret: F8 },
-            Signature { func: ScalarFn::NumPower, args: &[NUM, NUM], ret: NUM },
+            Signature {
+                func: ScalarFn::Power,
+                args: &[F8, F8],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::NumPower,
+                args: &[NUM, NUM],
+                ret: NUM,
+            },
         ],
         "atan2d" => &[Signature {
             func: ScalarFn::Atan2d,
@@ -846,26 +940,86 @@ fn lookup(name: &str) -> &'static [Signature] {
             ret: PgType::Bool,
         }],
         "date_part" => &[
-            Signature { func: ScalarFn::DatePart, args: &[TEXT, TS], ret: F8 },
-            Signature { func: ScalarFn::DatePartInterval, args: &[TEXT, IV], ret: F8 },
-            Signature { func: ScalarFn::DatePartTz, args: &[TEXT, TSTZ], ret: F8 },
-            Signature { func: ScalarFn::DatePartDate, args: &[TEXT, DATE], ret: F8 },
-            Signature { func: ScalarFn::DatePartTime, args: &[TEXT, TIME], ret: F8 },
-            Signature { func: ScalarFn::DatePartTimeTz, args: &[TEXT, TIMETZ], ret: F8 },
+            Signature {
+                func: ScalarFn::DatePart,
+                args: &[TEXT, TS],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::DatePartInterval,
+                args: &[TEXT, IV],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::DatePartTz,
+                args: &[TEXT, TSTZ],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::DatePartDate,
+                args: &[TEXT, DATE],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::DatePartTime,
+                args: &[TEXT, TIME],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::DatePartTimeTz,
+                args: &[TEXT, TIMETZ],
+                ret: F8,
+            },
         ],
         "date_trunc" => &[
-            Signature { func: ScalarFn::DateTrunc, args: &[TEXT, TS], ret: TS },
-            Signature { func: ScalarFn::DateTruncInterval, args: &[TEXT, IV], ret: IV },
-            Signature { func: ScalarFn::DateTruncTz, args: &[TEXT, TSTZ], ret: TSTZ },
+            Signature {
+                func: ScalarFn::DateTrunc,
+                args: &[TEXT, TS],
+                ret: TS,
+            },
+            Signature {
+                func: ScalarFn::DateTruncInterval,
+                args: &[TEXT, IV],
+                ret: IV,
+            },
+            Signature {
+                func: ScalarFn::DateTruncTz,
+                args: &[TEXT, TSTZ],
+                ret: TSTZ,
+            },
         ],
         "isfinite" => &[
-            Signature { func: ScalarFn::Isfinite, args: &[TS], ret: PgType::Bool },
-            Signature { func: ScalarFn::IsfiniteInterval, args: &[IV], ret: PgType::Bool },
-            Signature { func: ScalarFn::IsfiniteTz, args: &[TSTZ], ret: PgType::Bool },
-            Signature { func: ScalarFn::IsfiniteDate, args: &[DATE], ret: PgType::Bool },
+            Signature {
+                func: ScalarFn::Isfinite,
+                args: &[TS],
+                ret: PgType::Bool,
+            },
+            Signature {
+                func: ScalarFn::IsfiniteInterval,
+                args: &[IV],
+                ret: PgType::Bool,
+            },
+            Signature {
+                func: ScalarFn::IsfiniteTz,
+                args: &[TSTZ],
+                ret: PgType::Bool,
+            },
+            Signature {
+                func: ScalarFn::IsfiniteDate,
+                args: &[DATE],
+                ret: PgType::Bool,
+            },
         ],
-        "make_date" => &[Signature { func: ScalarFn::MakeDate, args: &[I4, I4, I4], ret: DATE }],
-        "make_time" => &[Signature { func: ScalarFn::MakeTime, args: &[I4, I4, F8], ret: TIME }],
+        "make_date" => &[Signature {
+            func: ScalarFn::MakeDate,
+            args: &[I4, I4, I4],
+            ret: DATE,
+        }],
+        "make_time" => &[Signature {
+            func: ScalarFn::MakeTime,
+            args: &[I4, I4, F8],
+            ret: TIME,
+        }],
         "make_timestamp" => &[Signature {
             func: ScalarFn::MakeTimestamp,
             args: &[I4, I4, I4, I4, I4, F8],
@@ -876,13 +1030,37 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[I4, I4, I4, I4, I4, I4, F8],
             ret: IV,
         }],
-        "justify_days" => &[Signature { func: ScalarFn::JustifyDays, args: &[IV], ret: IV }],
-        "justify_hours" => &[Signature { func: ScalarFn::JustifyHours, args: &[IV], ret: IV }],
-        "justify_interval" => &[Signature { func: ScalarFn::JustifyInterval, args: &[IV], ret: IV }],
-        "age" => &[Signature { func: ScalarFn::Age, args: &[TS, TS], ret: IV }],
-        "to_char" => &[Signature { func: ScalarFn::ToCharInterval, args: &[IV, TEXT], ret: TEXT }],
+        "justify_days" => &[Signature {
+            func: ScalarFn::JustifyDays,
+            args: &[IV],
+            ret: IV,
+        }],
+        "justify_hours" => &[Signature {
+            func: ScalarFn::JustifyHours,
+            args: &[IV],
+            ret: IV,
+        }],
+        "justify_interval" => &[Signature {
+            func: ScalarFn::JustifyInterval,
+            args: &[IV],
+            ret: IV,
+        }],
+        "age" => &[Signature {
+            func: ScalarFn::Age,
+            args: &[TS, TS],
+            ret: IV,
+        }],
+        "to_char" => &[Signature {
+            func: ScalarFn::ToCharInterval,
+            args: &[IV, TEXT],
+            ret: TEXT,
+        }],
         "make_timestamptz" => &[
-            Signature { func: ScalarFn::MakeTimestampTz, args: &[I4, I4, I4, I4, I4, F8], ret: TSTZ },
+            Signature {
+                func: ScalarFn::MakeTimestampTz,
+                args: &[I4, I4, I4, I4, I4, F8],
+                ret: TSTZ,
+            },
             Signature {
                 func: ScalarFn::MakeTimestampTz,
                 args: &[I4, I4, I4, I4, I4, F8, TEXT],
@@ -891,8 +1069,16 @@ fn lookup(name: &str) -> &'static [Signature] {
         ],
         // The function form of `AT TIME ZONE`: `timezone(zone, value)`.
         "timezone" => &[
-            Signature { func: ScalarFn::TimezoneToTz, args: &[TEXT, TS], ret: TSTZ },
-            Signature { func: ScalarFn::TimezoneToTs, args: &[TEXT, TSTZ], ret: TS },
+            Signature {
+                func: ScalarFn::TimezoneToTz,
+                args: &[TEXT, TS],
+                ret: TSTZ,
+            },
+            Signature {
+                func: ScalarFn::TimezoneToTs,
+                args: &[TEXT, TSTZ],
+                ret: TS,
+            },
         ],
         // Two overloads. Text is listed first so a bare `md5('abc')` unknown
         // literal resolves to text; a typed `bytea` argument never coerces to
@@ -914,124 +1100,394 @@ fn lookup(name: &str) -> &'static [Signature] {
         // `length(bit)` in the bit-string family; `char_length`/`character_length`
         // stay text-only (a bit argument there is `function does not exist`).
         "length" => &[
-            Signature { func: ScalarFn::Length, args: &[TEXT], ret: I4 },
-            Signature { func: ScalarFn::BitLen, args: &[BIT], ret: I4 },
-            Signature { func: ScalarFn::BitLen, args: &[VARBIT], ret: I4 },
+            Signature {
+                func: ScalarFn::Length,
+                args: &[TEXT],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::BitLen,
+                args: &[BIT],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::BitLen,
+                args: &[VARBIT],
+                ret: I4,
+            },
         ],
-        "char_length" | "character_length" => {
-            &[Signature { func: ScalarFn::Length, args: &[TEXT], ret: I4 }]
-        }
+        "char_length" | "character_length" => &[Signature {
+            func: ScalarFn::Length,
+            args: &[TEXT],
+            ret: I4,
+        }],
         // `octet_length` counts the padded bytes of a `bpchar` (via a dedicated
         // overload), while `length`/`bit_length` see the trailing-blank-trimmed
         // text value, matching PG's `bpcharoctetlen` vs `bpcharlen`/text paths.
         "octet_length" => &[
-            Signature { func: ScalarFn::OctetLength, args: &[TEXT], ret: I4 },
-            Signature { func: ScalarFn::OctetLength, args: &[PgType::Bpchar], ret: I4 },
+            Signature {
+                func: ScalarFn::OctetLength,
+                args: &[TEXT],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::OctetLength,
+                args: &[PgType::Bpchar],
+                ret: I4,
+            },
         ],
         // `bit_length(bit)` is the number of bits, like `length(bit)`.
         "bit_length" => &[
-            Signature { func: ScalarFn::BitLength, args: &[TEXT], ret: I4 },
-            Signature { func: ScalarFn::BitLen, args: &[BIT], ret: I4 },
-            Signature { func: ScalarFn::BitLen, args: &[VARBIT], ret: I4 },
+            Signature {
+                func: ScalarFn::BitLength,
+                args: &[TEXT],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::BitLen,
+                args: &[BIT],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::BitLen,
+                args: &[VARBIT],
+                ret: I4,
+            },
         ],
-        "upper" => &[Signature { func: ScalarFn::Upper, args: &[TEXT], ret: TEXT }],
-        "lower" => &[Signature { func: ScalarFn::Lower, args: &[TEXT], ret: TEXT }],
-        "initcap" => &[Signature { func: ScalarFn::Initcap, args: &[TEXT], ret: TEXT }],
+        "upper" => &[Signature {
+            func: ScalarFn::Upper,
+            args: &[TEXT],
+            ret: TEXT,
+        }],
+        "lower" => &[Signature {
+            func: ScalarFn::Lower,
+            args: &[TEXT],
+            ret: TEXT,
+        }],
+        "initcap" => &[Signature {
+            func: ScalarFn::Initcap,
+            args: &[TEXT],
+            ret: TEXT,
+        }],
         "substr" | "substring" => &[
-            Signature { func: ScalarFn::Substr, args: &[TEXT, I4], ret: TEXT },
-            Signature { func: ScalarFn::Substr, args: &[TEXT, I4, I4], ret: TEXT },
-            Signature { func: ScalarFn::SubstrBit, args: &[BIT, I4], ret: BIT },
-            Signature { func: ScalarFn::SubstrBit, args: &[BIT, I4, I4], ret: BIT },
-            Signature { func: ScalarFn::SubstrBit, args: &[VARBIT, I4], ret: VARBIT },
-            Signature { func: ScalarFn::SubstrBit, args: &[VARBIT, I4, I4], ret: VARBIT },
+            Signature {
+                func: ScalarFn::Substr,
+                args: &[TEXT, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::Substr,
+                args: &[TEXT, I4, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::SubstrBit,
+                args: &[BIT, I4],
+                ret: BIT,
+            },
+            Signature {
+                func: ScalarFn::SubstrBit,
+                args: &[BIT, I4, I4],
+                ret: BIT,
+            },
+            Signature {
+                func: ScalarFn::SubstrBit,
+                args: &[VARBIT, I4],
+                ret: VARBIT,
+            },
+            Signature {
+                func: ScalarFn::SubstrBit,
+                args: &[VARBIT, I4, I4],
+                ret: VARBIT,
+            },
         ],
         "strpos" => &[
-            Signature { func: ScalarFn::StrPos, args: &[TEXT, TEXT], ret: I4 },
+            Signature {
+                func: ScalarFn::StrPos,
+                args: &[TEXT, TEXT],
+                ret: I4,
+            },
             // `POSITION(bit IN bit)` desugars to `strpos(str, sub)`.
-            Signature { func: ScalarFn::BitPosition, args: &[BIT, BIT], ret: I4 },
-            Signature { func: ScalarFn::BitPosition, args: &[VARBIT, VARBIT], ret: I4 },
+            Signature {
+                func: ScalarFn::BitPosition,
+                args: &[BIT, BIT],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::BitPosition,
+                args: &[VARBIT, VARBIT],
+                ret: I4,
+            },
         ],
         "overlay" => &[
-            Signature { func: ScalarFn::Overlay, args: &[TEXT, TEXT, I4], ret: TEXT },
-            Signature { func: ScalarFn::Overlay, args: &[TEXT, TEXT, I4, I4], ret: TEXT },
-            Signature { func: ScalarFn::OverlayBit, args: &[BIT, BIT, I4], ret: BIT },
-            Signature { func: ScalarFn::OverlayBit, args: &[BIT, BIT, I4, I4], ret: BIT },
+            Signature {
+                func: ScalarFn::Overlay,
+                args: &[TEXT, TEXT, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::Overlay,
+                args: &[TEXT, TEXT, I4, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::OverlayBit,
+                args: &[BIT, BIT, I4],
+                ret: BIT,
+            },
+            Signature {
+                func: ScalarFn::OverlayBit,
+                args: &[BIT, BIT, I4, I4],
+                ret: BIT,
+            },
         ],
         "get_bit" => &[
-            Signature { func: ScalarFn::GetBit, args: &[BIT, I4], ret: I4 },
-            Signature { func: ScalarFn::GetBit, args: &[VARBIT, I4], ret: I4 },
+            Signature {
+                func: ScalarFn::GetBit,
+                args: &[BIT, I4],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::GetBit,
+                args: &[VARBIT, I4],
+                ret: I4,
+            },
         ],
         "set_bit" => &[
-            Signature { func: ScalarFn::SetBit, args: &[BIT, I4, I4], ret: BIT },
-            Signature { func: ScalarFn::SetBit, args: &[VARBIT, I4, I4], ret: VARBIT },
+            Signature {
+                func: ScalarFn::SetBit,
+                args: &[BIT, I4, I4],
+                ret: BIT,
+            },
+            Signature {
+                func: ScalarFn::SetBit,
+                args: &[VARBIT, I4, I4],
+                ret: VARBIT,
+            },
         ],
         "bit_count" => &[
-            Signature { func: ScalarFn::BitCount, args: &[BIT], ret: I8 },
-            Signature { func: ScalarFn::BitCount, args: &[VARBIT], ret: I8 },
+            Signature {
+                func: ScalarFn::BitCount,
+                args: &[BIT],
+                ret: I8,
+            },
+            Signature {
+                func: ScalarFn::BitCount,
+                args: &[VARBIT],
+                ret: I8,
+            },
         ],
         "ltrim" => &[
-            Signature { func: ScalarFn::Ltrim, args: &[TEXT], ret: TEXT },
-            Signature { func: ScalarFn::Ltrim, args: &[TEXT, TEXT], ret: TEXT },
+            Signature {
+                func: ScalarFn::Ltrim,
+                args: &[TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::Ltrim,
+                args: &[TEXT, TEXT],
+                ret: TEXT,
+            },
         ],
         "rtrim" => &[
-            Signature { func: ScalarFn::Rtrim, args: &[TEXT], ret: TEXT },
-            Signature { func: ScalarFn::Rtrim, args: &[TEXT, TEXT], ret: TEXT },
+            Signature {
+                func: ScalarFn::Rtrim,
+                args: &[TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::Rtrim,
+                args: &[TEXT, TEXT],
+                ret: TEXT,
+            },
         ],
         "btrim" => &[
-            Signature { func: ScalarFn::Btrim, args: &[TEXT], ret: TEXT },
-            Signature { func: ScalarFn::Btrim, args: &[TEXT, TEXT], ret: TEXT },
+            Signature {
+                func: ScalarFn::Btrim,
+                args: &[TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::Btrim,
+                args: &[TEXT, TEXT],
+                ret: TEXT,
+            },
         ],
         "lpad" => &[
-            Signature { func: ScalarFn::Lpad, args: &[TEXT, I4], ret: TEXT },
-            Signature { func: ScalarFn::Lpad, args: &[TEXT, I4, TEXT], ret: TEXT },
+            Signature {
+                func: ScalarFn::Lpad,
+                args: &[TEXT, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::Lpad,
+                args: &[TEXT, I4, TEXT],
+                ret: TEXT,
+            },
         ],
         "rpad" => &[
-            Signature { func: ScalarFn::Rpad, args: &[TEXT, I4], ret: TEXT },
-            Signature { func: ScalarFn::Rpad, args: &[TEXT, I4, TEXT], ret: TEXT },
+            Signature {
+                func: ScalarFn::Rpad,
+                args: &[TEXT, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::Rpad,
+                args: &[TEXT, I4, TEXT],
+                ret: TEXT,
+            },
         ],
-        "replace" => &[Signature { func: ScalarFn::Replace, args: &[TEXT, TEXT, TEXT], ret: TEXT }],
-        "translate" => {
-            &[Signature { func: ScalarFn::Translate, args: &[TEXT, TEXT, TEXT], ret: TEXT }]
-        }
-        "repeat" => &[Signature { func: ScalarFn::Repeat, args: &[TEXT, I4], ret: TEXT }],
-        "reverse" => &[Signature { func: ScalarFn::Reverse, args: &[TEXT], ret: TEXT }],
-        "left" => &[Signature { func: ScalarFn::Left, args: &[TEXT, I4], ret: TEXT }],
-        "right" => &[Signature { func: ScalarFn::Right, args: &[TEXT, I4], ret: TEXT }],
-        "ascii" => &[Signature { func: ScalarFn::Ascii, args: &[TEXT], ret: I4 }],
-        "chr" => &[Signature { func: ScalarFn::Chr, args: &[I4], ret: TEXT }],
-        "split_part" => {
-            &[Signature { func: ScalarFn::SplitPart, args: &[TEXT, TEXT, I4], ret: TEXT }]
-        }
-        "starts_with" => &[Signature { func: ScalarFn::StartsWith, args: &[TEXT, TEXT], ret: BOOL }],
+        "replace" => &[Signature {
+            func: ScalarFn::Replace,
+            args: &[TEXT, TEXT, TEXT],
+            ret: TEXT,
+        }],
+        "translate" => &[Signature {
+            func: ScalarFn::Translate,
+            args: &[TEXT, TEXT, TEXT],
+            ret: TEXT,
+        }],
+        "repeat" => &[Signature {
+            func: ScalarFn::Repeat,
+            args: &[TEXT, I4],
+            ret: TEXT,
+        }],
+        "reverse" => &[Signature {
+            func: ScalarFn::Reverse,
+            args: &[TEXT],
+            ret: TEXT,
+        }],
+        "left" => &[Signature {
+            func: ScalarFn::Left,
+            args: &[TEXT, I4],
+            ret: TEXT,
+        }],
+        "right" => &[Signature {
+            func: ScalarFn::Right,
+            args: &[TEXT, I4],
+            ret: TEXT,
+        }],
+        "ascii" => &[Signature {
+            func: ScalarFn::Ascii,
+            args: &[TEXT],
+            ret: I4,
+        }],
+        "chr" => &[Signature {
+            func: ScalarFn::Chr,
+            args: &[I4],
+            ret: TEXT,
+        }],
+        "split_part" => &[Signature {
+            func: ScalarFn::SplitPart,
+            args: &[TEXT, TEXT, I4],
+            ret: TEXT,
+        }],
+        "starts_with" => &[Signature {
+            func: ScalarFn::StartsWith,
+            args: &[TEXT, TEXT],
+            ret: BOOL,
+        }],
         "to_hex" => &[
-            Signature { func: ScalarFn::ToHex, args: &[I4], ret: TEXT },
-            Signature { func: ScalarFn::ToHexInt8, args: &[I8], ret: TEXT },
+            Signature {
+                func: ScalarFn::ToHex,
+                args: &[I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToHexInt8,
+                args: &[I8],
+                ret: TEXT,
+            },
         ],
-        "encode" => &[Signature { func: ScalarFn::Encode, args: &[BYTEA, TEXT], ret: TEXT }],
-        "decode" => &[Signature { func: ScalarFn::Decode, args: &[TEXT, TEXT], ret: BYTEA }],
-        "quote_ident" => &[Signature { func: ScalarFn::QuoteIdent, args: &[TEXT], ret: TEXT }],
-        "quote_literal" => &[Signature { func: ScalarFn::QuoteLiteral, args: &[TEXT], ret: TEXT }],
-        "quote_nullable" => &[Signature { func: ScalarFn::QuoteNullable, args: &[TEXT], ret: TEXT }],
+        "encode" => &[Signature {
+            func: ScalarFn::Encode,
+            args: &[BYTEA, TEXT],
+            ret: TEXT,
+        }],
+        "decode" => &[Signature {
+            func: ScalarFn::Decode,
+            args: &[TEXT, TEXT],
+            ret: BYTEA,
+        }],
+        "quote_ident" => &[Signature {
+            func: ScalarFn::QuoteIdent,
+            args: &[TEXT],
+            ret: TEXT,
+        }],
+        "quote_literal" => &[Signature {
+            func: ScalarFn::QuoteLiteral,
+            args: &[TEXT],
+            ret: TEXT,
+        }],
+        "quote_nullable" => &[Signature {
+            func: ScalarFn::QuoteNullable,
+            args: &[TEXT],
+            ret: TEXT,
+        }],
         // inet/cidr accessors. A `cidr` argument coerces to the `inet` overload
         // via the implicit cidr->inet cast, matching PG (whose inet functions
         // accept cidr). `abbrev` keeps a distinct cidr overload because its
         // output differs (`10.1/16` vs `10.1.0.0/16`); the inet overload is
         // listed first so an untyped literal resolves to inet (PG's preferred
         // type in the inet/cidr category), while a typed cidr still binds cidr.
-        "host" => &[Signature { func: ScalarFn::Host, args: &[INET], ret: TEXT }],
-        "masklen" => &[Signature { func: ScalarFn::Masklen, args: &[INET], ret: I4 }],
-        "family" => &[Signature { func: ScalarFn::Family, args: &[INET], ret: I4 }],
-        "network" => &[Signature { func: ScalarFn::Network, args: &[INET], ret: CIDR }],
+        "host" => &[Signature {
+            func: ScalarFn::Host,
+            args: &[INET],
+            ret: TEXT,
+        }],
+        "masklen" => &[Signature {
+            func: ScalarFn::Masklen,
+            args: &[INET],
+            ret: I4,
+        }],
+        "family" => &[Signature {
+            func: ScalarFn::Family,
+            args: &[INET],
+            ret: I4,
+        }],
+        "network" => &[Signature {
+            func: ScalarFn::Network,
+            args: &[INET],
+            ret: CIDR,
+        }],
         "abbrev" => &[
-            Signature { func: ScalarFn::AbbrevInet, args: &[INET], ret: TEXT },
-            Signature { func: ScalarFn::AbbrevCidr, args: &[CIDR], ret: TEXT },
+            Signature {
+                func: ScalarFn::AbbrevInet,
+                args: &[INET],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::AbbrevCidr,
+                args: &[CIDR],
+                ret: TEXT,
+            },
         ],
         // --- geometric constructors / accessors ---
-        "point" => &[Signature { func: ScalarFn::Geo(GeoFn::PointConstruct), args: &[F8, F8], ret: POINT }],
-        "lseg" => &[Signature { func: ScalarFn::Geo(GeoFn::LsegConstruct), args: &[POINT, POINT], ret: LSEG }],
-        "slope" => &[Signature { func: ScalarFn::Geo(GeoFn::PointSlope), args: &[POINT, POINT], ret: F8 }],
-        "ishorizontal" => &[Signature { func: ScalarFn::Geo(GeoFn::PointHoriz), args: &[POINT, POINT], ret: BOOL }],
-        "isvertical" => &[Signature { func: ScalarFn::Geo(GeoFn::PointVert), args: &[POINT, POINT], ret: BOOL }],
+        "point" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PointConstruct),
+            args: &[F8, F8],
+            ret: POINT,
+        }],
+        "lseg" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::LsegConstruct),
+            args: &[POINT, POINT],
+            ret: LSEG,
+        }],
+        "slope" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PointSlope),
+            args: &[POINT, POINT],
+            ret: F8,
+        }],
+        "ishorizontal" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PointHoriz),
+            args: &[POINT, POINT],
+            ret: BOOL,
+        }],
+        "isvertical" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PointVert),
+            args: &[POINT, POINT],
+            ret: BOOL,
+        }],
         _ => &[],
     }
 }
@@ -1083,7 +1539,11 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
             .into_iter()
             .map(crate::expr::to_concat_operand)
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok(Binding::Typed(BoundExpr::FuncCall { func, ret: PgType::Text, args }));
+        return Ok(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret: PgType::Text,
+            args,
+        }));
     }
 
     resolve_call(&name, bindings)
@@ -1117,7 +1577,10 @@ fn bind_aggregate(
             ));
         }
     };
-    let distinct = matches!(list.duplicate_treatment, Some(ast::DuplicateTreatment::Distinct));
+    let distinct = matches!(
+        list.duplicate_treatment,
+        Some(ast::DuplicateTreatment::Distinct)
+    );
     if !list.clauses.is_empty() {
         return Err(BindError::feature_not_supported(
             "aggregate ORDER BY / WITHIN GROUP is not supported yet",
@@ -1240,7 +1703,11 @@ pub(crate) fn resolve_call(name: &str, bindings: Vec<Binding>) -> Result<Binding
         if sig.args.len() == bindings.len()
             && let Some(args) = try_coerce_args(&bindings, sig.args, true)
         {
-            return Ok(Binding::Typed(BoundExpr::FuncCall { func: sig.func, ret: sig.ret, args }));
+            return Ok(Binding::Typed(BoundExpr::FuncCall {
+                func: sig.func,
+                ret: sig.ret,
+                args,
+            }));
         }
     }
     let mut best: Option<(usize, &Signature, Vec<BoundExpr>)> = None;
@@ -1260,9 +1727,11 @@ pub(crate) fn resolve_call(name: &str, bindings: Vec<Binding>) -> Result<Binding
         }
     }
     match best {
-        Some((_, sig, args)) => {
-            Ok(Binding::Typed(BoundExpr::FuncCall { func: sig.func, ret: sig.ret, args }))
-        }
+        Some((_, sig, args)) => Ok(Binding::Typed(BoundExpr::FuncCall {
+            func: sig.func,
+            ret: sig.ret,
+            args,
+        })),
         None => Err(undefined_function(name, &bindings)),
     }
 }
@@ -1370,9 +1839,7 @@ fn positional_args(args: &ast::FunctionArguments) -> Result<Vec<ast::Expr>, Bind
 
 /// Extract plain positional argument expressions, rejecting named/wildcard
 /// forms. Shared by scalar calls and table-function (FROM-position) calls.
-pub(crate) fn positional_arg_exprs(
-    args: &[ast::FunctionArg],
-) -> Result<Vec<ast::Expr>, BindError> {
+pub(crate) fn positional_arg_exprs(args: &[ast::FunctionArg]) -> Result<Vec<ast::Expr>, BindError> {
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
         match arg {

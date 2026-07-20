@@ -145,7 +145,15 @@ pub(crate) struct Tm {
 /// Construct a [`Tm`] from calendar fields (astronomical year). Used by
 /// `timestamptz` to encode its range boundaries.
 pub(crate) fn tm(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64, usec: i64) -> Tm {
-    Tm { year, month, day, hour, min, sec, usec }
+    Tm {
+        year,
+        month,
+        day,
+        hour,
+        min,
+        sec,
+        usec,
+    }
 }
 
 /// Split a finite microsecond timestamp into calendar fields.
@@ -163,7 +171,15 @@ pub(crate) fn decode(micros: i64) -> Tm {
     time -= min * USECS_PER_MINUTE;
     let sec = time / USECS_PER_SEC;
     let usec = time - sec * USECS_PER_SEC;
-    Tm { year, month, day, hour, min, sec, usec }
+    Tm {
+        year,
+        month,
+        day,
+        hour,
+        min,
+        sec,
+        usec,
+    }
 }
 
 /// Reassemble calendar fields into a microsecond timestamp.
@@ -408,7 +424,15 @@ pub(crate) fn parse_parts(input: &str) -> Result<Parsed, TimestampError> {
         y = 1 - y;
     }
     Ok(Parsed::Calendar {
-        tm: Tm { year: y, month: m, day: d, hour, min, sec, usec },
+        tm: Tm {
+            year: y,
+            month: m,
+            day: d,
+            hour,
+            min,
+            sec,
+            usec,
+        },
         zone,
     })
 }
@@ -464,7 +488,10 @@ fn month_index(name: &str) -> Option<i64> {
     if let Some(i) = MONTHS.iter().position(|m| *m == name) {
         return Some(i as i64 + 1);
     }
-    MONTH_NAMES.iter().position(|m| *m == name).map(|i| i as i64 + 1)
+    MONTH_NAMES
+        .iter()
+        .position(|m| *m == name)
+        .map(|i| i as i64 + 1)
 }
 
 /// Parse a `HH:MM[:SS[.ffffff]]` time, optionally suffixed with `am`/`pm` and/or
@@ -740,13 +767,21 @@ pub fn extract(unit: &str, micros: i64) -> Result<Option<Numeric>, TimestampErro
         "epoch" => fixed_point(epoch_micros(micros), 6),
         // PG returns a high-precision numeric here; we render the float8 Julian
         // date (fractional, but not byte-identical to PG's exotic numeric scale).
-        "julian" => format!("{}", date_part_canon("julian", micros)?.expect("finite is Some")),
+        "julian" => match date_part_canon("julian", micros)? {
+            Some(value) => format!("{value}"),
+            None => panic!("finite Julian timestamp field must have a value"),
+        },
         // Everything else is an integer field: reuse date_part's value (already
         // canonical, so no re-canonicalization).
-        _ => (date_part_canon(&unit, micros)?.expect("finite integer field is Some") as i64)
-            .to_string(),
+        _ => match date_part_canon(&unit, micros)? {
+            Some(value) => (value as i64).to_string(),
+            None => panic!("finite timestamp field must have a value"),
+        },
     };
-    Ok(Some(Numeric::parse(&s).expect("extract renders a valid numeric literal")))
+    match Numeric::parse(&s) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => panic!("timestamp extraction must form a valid numeric literal"),
+    }
 }
 
 /// Format `scaled` (the field value times `10^scale`) as a fixed-point decimal
@@ -766,7 +801,12 @@ pub(crate) fn fixed_point(scaled: impl Into<i128>, scale: usize) -> String {
     if scale == 0 {
         out.push_str(&int_part.to_string());
     } else {
-        out.push_str(&format!("{}.{:0width$}", int_part, frac_part, width = scale));
+        out.push_str(&format!(
+            "{}.{:0width$}",
+            int_part,
+            frac_part,
+            width = scale
+        ));
     }
     out
 }
@@ -1048,7 +1088,10 @@ fn inf_sign(micros: i64) -> Option<i32> {
 
 /// Rewrap an interval-layer error as a timestamp-layer one (same code/message).
 fn from_interval_err(e: interval::IntervalError) -> TimestampError {
-    TimestampError { sqlstate: e.sqlstate, message: e.message }
+    TimestampError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+    }
 }
 
 /// The symbolic difference `timestamp_mi`/`timestamp_age` produce when either
@@ -1056,7 +1099,13 @@ fn from_interval_err(e: interval::IntervalError) -> TimestampError {
 /// the result is the interval infinity of the dominating (first) operand.
 /// `None` means both operands are finite.
 fn infinite_diff(dt1: i64, dt2: i64) -> Option<Result<Interval, TimestampError>> {
-    let inf = |positive: bool| if positive { interval::POS_INFINITY } else { interval::NEG_INFINITY };
+    let inf = |positive: bool| {
+        if positive {
+            interval::POS_INFINITY
+        } else {
+            interval::NEG_INFINITY
+        }
+    };
     match (inf_sign(dt1), inf_sign(dt2)) {
         (Some(a), Some(b)) if a == b => Some(Err(interval_out_of_range())),
         (Some(a), _) => Some(Ok(inf(a > 0))),
@@ -1122,7 +1171,12 @@ pub fn mi(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
         return result;
     }
     let usec = dt1.checked_sub(dt2).ok_or_else(interval_out_of_range)?;
-    interval::justify_hours(Interval { months: 0, days: 0, usec }).map_err(from_interval_err)
+    interval::justify_hours(Interval {
+        months: 0,
+        days: 0,
+        usec,
+    })
+    .map_err(from_interval_err)
 }
 
 /// `age(dt1, dt2)`: the symbolic (year/month/day) difference PG's `timestamp_age`
@@ -1161,7 +1215,11 @@ pub fn age(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
         mday -= 1;
     }
     while mday < 0 {
-        let (by, bm) = if flip { (tm1.year, tm1.month) } else { (tm2.year, tm2.month) };
+        let (by, bm) = if flip {
+            (tm1.year, tm1.month)
+        } else {
+            (tm2.year, tm2.month)
+        };
         mday += days_in_month(by, bm);
         mon -= 1;
     }
@@ -1177,49 +1235,73 @@ pub fn age(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
     };
     let months = i32::try_from(year * 12 + mon).map_err(|_| interval_out_of_range())?;
     let usec = hour * USECS_PER_HOUR + min * USECS_PER_MINUTE + sec * USECS_PER_SEC + fsec;
-    Ok(Interval { months, days: mday as i32, usec })
+    Ok(Interval {
+        months,
+        days: mday as i32,
+        usec,
+    })
 }
 
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn ts(s: &str) -> i64 {
-        parse(s).unwrap()
+        match parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid timestamp test fixture `{s}`: {error:?}"),
+        }
     }
 
     fn span(s: &str) -> Interval {
-        interval::parse(s).unwrap()
+        match interval::parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid interval test fixture `{s}`: {error:?}"),
+        }
     }
 
     #[test]
-    fn timestamp_interval_arithmetic() {
+    fn timestamp_interval_arithmetic() -> anyhow::Result<()> {
         let fmt_iv = interval::format;
         assert_eq!(
-            format(pl_interval(ts("2001-01-01 12:00:00"), span("1 mon 3 days 4 hours")).unwrap()),
+            format(pl_interval(
+                ts("2001-01-01 12:00:00"),
+                span("1 mon 3 days 4 hours")
+            )?),
             "2001-02-04 16:00:00"
         );
         assert_eq!(
-            format(pl_interval(ts("2001-03-31"), span("1 mon")).unwrap()),
+            format(pl_interval(ts("2001-03-31"), span("1 mon"))?),
             "2001-04-30 00:00:00"
         );
         assert_eq!(
-            format(mi_interval(ts("2001-01-01"), span("1 day")).unwrap()),
+            format(mi_interval(ts("2001-01-01"), span("1 day"))?),
             "2000-12-31 00:00:00"
         );
-        assert_eq!(fmt_iv(mi(ts("2001-01-01"), ts("1997-01-02")).unwrap()), "1460 days");
+        assert_eq!(fmt_iv(mi(ts("2001-01-01"), ts("1997-01-02"))?), "1460 days");
         assert_eq!(
-            fmt_iv(mi(ts("2001-09-22 18:19:20"), ts("2001-09-22 12:00:00")).unwrap()),
+            fmt_iv(mi(ts("2001-09-22 18:19:20"), ts("2001-09-22 12:00:00"))?),
             "06:19:20"
         );
-        assert_eq!(fmt_iv(age(ts("2001-04-10"), ts("1957-06-13")).unwrap()), "43 years 9 mons 27 days");
-        assert_eq!(fmt_iv(age(ts("2010-01-01"), ts("2009-03-15")).unwrap()), "9 mons 17 days");
+        assert_eq!(
+            fmt_iv(age(ts("2001-04-10"), ts("1957-06-13"))?),
+            "43 years 9 mons 27 days"
+        );
+        assert_eq!(
+            fmt_iv(age(ts("2010-01-01"), ts("2009-03-15"))?),
+            "9 mons 17 days"
+        );
         // Infinite operands (PG18 semantics).
-        assert_eq!(pl_interval(POS_INFINITY, span("1 day")).unwrap(), POS_INFINITY);
-        assert_eq!(mi(POS_INFINITY, ts("1995-08-06 12:12:12")).unwrap(), interval::POS_INFINITY);
+        assert_eq!(pl_interval(POS_INFINITY, span("1 day"))?, POS_INFINITY);
+        assert_eq!(
+            mi(POS_INFINITY, ts("1995-08-06 12:12:12"))?,
+            interval::POS_INFINITY
+        );
         assert!(mi(POS_INFINITY, POS_INFINITY).is_err());
-        assert_eq!(age(POS_INFINITY, ts("2020-01-01")).unwrap(), interval::POS_INFINITY);
+        assert_eq!(age(POS_INFINITY, ts("2020-01-01"))?, interval::POS_INFINITY);
+
+        Ok(())
     }
 
     #[test]
@@ -1228,10 +1310,16 @@ mod tests {
         // overflow i64 inside `encode` and panic; it must now return a clean
         // "timestamp out of range" error. Same for an enormous day span.
         assert_eq!(
-            pl_interval(ts("2001-01-01"), span("2000000000 mons")).unwrap_err().message,
+            pl_interval(ts("2001-01-01"), span("2000000000 mons"))
+                .unwrap_err()
+                .message,
             "timestamp out of range"
         );
-        let huge_days = Interval { months: 0, days: i32::MAX, usec: 0 };
+        let huge_days = Interval {
+            months: 0,
+            days: i32::MAX,
+            usec: 0,
+        };
         assert!(pl_interval(ts("2001-01-01"), huge_days).is_err());
     }
 
@@ -1262,7 +1350,10 @@ mod tests {
             format(ts("1997-06-10 17:32:01 -07:00")),
             "1997-06-10 17:32:01"
         );
-        assert_eq!(format(ts("Mon Feb 10 17:32:01 1997 PST")), "1997-02-10 17:32:01");
+        assert_eq!(
+            format(ts("Mon Feb 10 17:32:01 1997 PST")),
+            "1997-02-10 17:32:01"
+        );
     }
 
     #[test]
@@ -1273,7 +1364,10 @@ mod tests {
         assert_eq!(format(ts("2001-02-16Z")), "2001-02-16 00:00:00");
         // But a bogus glued suffix is a syntax error, not a silently-ignored
         // zone (PG rejects `2001-02-16+garbage`).
-        assert_eq!(parse("2001-02-16+garbage").unwrap_err().sqlstate, INVALID_DATETIME_FORMAT);
+        assert_eq!(
+            parse("2001-02-16+garbage").unwrap_err().sqlstate,
+            INVALID_DATETIME_FORMAT
+        );
     }
 
     #[test]
@@ -1308,79 +1402,116 @@ mod tests {
     }
 
     #[test]
-    fn date_part_fields() {
+    fn date_part_fields() -> anyhow::Result<()> {
         let t = ts("2001-02-16 20:38:40.5");
-        let dp = |u: &str| date_part(u, t).unwrap().unwrap();
-        assert_eq!(dp("year"), 2001.0);
-        assert_eq!(dp("month"), 2.0);
-        assert_eq!(dp("day"), 16.0);
-        assert_eq!(dp("hour"), 20.0);
-        assert_eq!(dp("minute"), 38.0);
-        assert_eq!(dp("second"), 40.5);
-        assert_eq!(dp("dow"), 5.0);
-        assert_eq!(dp("isodow"), 5.0);
-        assert_eq!(dp("doy"), 47.0);
-        assert_eq!(dp("quarter"), 1.0);
-        assert_eq!(dp("week"), 7.0);
-        assert_eq!(dp("decade"), 200.0);
-        assert_eq!(dp("century"), 21.0);
-        assert_eq!(dp("millennium"), 3.0);
-        assert_eq!(dp("isoyear"), 2001.0);
-        assert_eq!(dp("microseconds"), 40500000.0);
-        assert_eq!(dp("milliseconds"), 40500.0);
-        assert_eq!(date_part("epoch", ts("2001-02-16 20:38:40")).unwrap().unwrap(), 982355920.0);
+        let dp = |u: &str| -> anyhow::Result<f64> {
+            date_part(u, t)?.ok_or_else(|| anyhow::anyhow!("missing {u} field"))
+        };
+        assert_eq!(dp("year")?, 2001.0);
+        assert_eq!(dp("month")?, 2.0);
+        assert_eq!(dp("day")?, 16.0);
+        assert_eq!(dp("hour")?, 20.0);
+        assert_eq!(dp("minute")?, 38.0);
+        assert_eq!(dp("second")?, 40.5);
+        assert_eq!(dp("dow")?, 5.0);
+        assert_eq!(dp("isodow")?, 5.0);
+        assert_eq!(dp("doy")?, 47.0);
+        assert_eq!(dp("quarter")?, 1.0);
+        assert_eq!(dp("week")?, 7.0);
+        assert_eq!(dp("decade")?, 200.0);
+        assert_eq!(dp("century")?, 21.0);
+        assert_eq!(dp("millennium")?, 3.0);
+        assert_eq!(dp("isoyear")?, 2001.0);
+        assert_eq!(dp("microseconds")?, 40500000.0);
+        assert_eq!(dp("milliseconds")?, 40500.0);
+        assert_eq!(
+            date_part("epoch", ts("2001-02-16 20:38:40"))?
+                .ok_or_else(|| anyhow::anyhow!("missing epoch field"))?,
+            982355920.0
+        );
+
+        Ok(())
     }
 
     #[test]
     fn date_part_unknown_unit() {
-        assert_eq!(date_part("bogus", ts("2001-02-16")).unwrap_err().sqlstate, "22023");
+        assert_eq!(
+            date_part("bogus", ts("2001-02-16")).unwrap_err().sqlstate,
+            "22023"
+        );
     }
 
     #[test]
-    fn extract_scales() {
+    fn extract_scales() -> anyhow::Result<()> {
         let t = ts("2001-02-16 20:38:40.5");
-        let ex = |u: &str| extract(u, t).unwrap().unwrap().to_display();
-        assert_eq!(ex("year"), "2001");
-        assert_eq!(ex("second"), "40.500000");
-        assert_eq!(ex("milliseconds"), "40500.000");
-        assert_eq!(ex("microseconds"), "40500000");
+        let ex = |u: &str| -> anyhow::Result<String> {
+            Ok(extract(u, t)?
+                .ok_or_else(|| anyhow::anyhow!("missing {u} field"))?
+                .to_display())
+        };
+        assert_eq!(ex("year")?, "2001");
+        assert_eq!(ex("second")?, "40.500000");
+        assert_eq!(ex("milliseconds")?, "40500.000");
+        assert_eq!(ex("microseconds")?, "40500000");
         assert_eq!(
-            extract("epoch", ts("2001-02-16 20:38:40")).unwrap().unwrap().to_display(),
+            extract("epoch", ts("2001-02-16 20:38:40"))?
+                .ok_or_else(|| anyhow::anyhow!("missing epoch field"))?
+                .to_display(),
             "982355920.000000"
         );
-        assert_eq!(ex("epoch"), "982355920.500000");
+        assert_eq!(ex("epoch")?, "982355920.500000");
+
+        Ok(())
     }
 
     #[test]
-    fn extract_epoch_near_range_limit_does_not_overflow() {
+    fn extract_epoch_near_range_limit_does_not_overflow() -> anyhow::Result<()> {
         // Regression: near the top of the timestamp range `micros` is close to
         // `i64::MAX`, so shifting to the Unix epoch overflowed `i64` and panicked.
         let t = ts("294276-12-31 23:59:59");
-        assert_eq!(extract("epoch", t).unwrap().unwrap().to_display(), "9224318015999.000000");
-        assert_eq!(date_part("epoch", t).unwrap(), Some(9224318015999.0));
+        assert_eq!(
+            extract("epoch", t)?
+                .ok_or_else(|| anyhow::anyhow!("missing epoch field"))?
+                .to_display(),
+            "9224318015999.000000"
+        );
+        assert_eq!(date_part("epoch", t)?, Some(9224318015999.0));
+
+        Ok(())
     }
 
     #[test]
-    fn non_finite_fields_are_infinity_or_null() {
+    fn non_finite_fields_are_infinity_or_null() -> anyhow::Result<()> {
         // Monotonic fields on ±infinity are ±Infinity; oscillating fields NULL.
-        assert_eq!(date_part("year", POS_INFINITY).unwrap(), Some(f64::INFINITY));
-        assert_eq!(date_part("epoch", NEG_INFINITY).unwrap(), Some(f64::NEG_INFINITY));
-        assert_eq!(date_part("month", POS_INFINITY).unwrap(), None);
-        assert_eq!(date_part("week", NEG_INFINITY).unwrap(), None);
+        assert_eq!(date_part("year", POS_INFINITY)?, Some(f64::INFINITY));
+        assert_eq!(date_part("epoch", NEG_INFINITY)?, Some(f64::NEG_INFINITY));
+        assert_eq!(date_part("month", POS_INFINITY)?, None);
+        assert_eq!(date_part("week", NEG_INFINITY)?, None);
         assert_eq!(
-            extract("year", POS_INFINITY).unwrap().unwrap().to_display(),
+            extract("year", POS_INFINITY)?
+                .ok_or_else(|| anyhow::anyhow!("missing year field"))?
+                .to_display(),
             "Infinity"
         );
-        assert_eq!(extract("day", POS_INFINITY).unwrap(), None);
+        assert_eq!(extract("day", POS_INFINITY)?, None);
         // An unknown unit still errors even on ±infinity.
-        assert_eq!(date_part("bogus", POS_INFINITY).unwrap_err().sqlstate, "22023");
+        assert_eq!(
+            date_part("bogus", POS_INFINITY).unwrap_err().sqlstate,
+            "22023"
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn extract_julian_keeps_the_fraction() {
+    fn extract_julian_keeps_the_fraction() -> anyhow::Result<()> {
         // The fractional day must survive (regression: was truncated to i64).
-        let s = extract("julian", ts("2001-02-16 20:38:40")).unwrap().unwrap().to_display();
+        let s = extract("julian", ts("2001-02-16 20:38:40"))?
+            .ok_or_else(|| anyhow::anyhow!("missing julian field"))?
+            .to_display();
         assert!(s.starts_with("2451957.86"), "got {s}");
+
+        Ok(())
     }
 
     #[test]
@@ -1389,7 +1520,10 @@ mod tests {
         assert_eq!(format(ts("10 Feb 1997")), "1997-02-10 00:00:00");
         // ISO 'T' time with an attached zone (Z / numeric offset) is accepted.
         assert_eq!(format(ts("2001-09-22T18:19:20Z")), "2001-09-22 18:19:20");
-        assert_eq!(format(ts("2001-09-22T18:19:20-07:00")), "2001-09-22 18:19:20");
+        assert_eq!(
+            format(ts("2001-09-22T18:19:20-07:00")),
+            "2001-09-22 18:19:20"
+        );
         // A full English month name works; a word merely prefixed by one does not.
         assert_eq!(format(ts("February 10 1997")), "1997-02-10 00:00:00");
         assert_eq!(parse("marble 5 2001").unwrap_err().sqlstate, "22007");
@@ -1400,50 +1534,59 @@ mod tests {
     }
 
     #[test]
-    fn make_timestamp_boundary_times() {
+    fn make_timestamp_boundary_times() -> anyhow::Result<()> {
         // 24:00:00 rolls into the next day; sec == 60 carries a minute.
         assert_eq!(
-            format(make_timestamp(2013, 7, 15, 24, 0, 0.0).unwrap()),
+            format(make_timestamp(2013, 7, 15, 24, 0, 0.0)?),
             "2013-07-16 00:00:00"
         );
         assert_eq!(
-            format(make_timestamp(2013, 7, 15, 8, 15, 60.0).unwrap()),
+            format(make_timestamp(2013, 7, 15, 8, 15, 60.0)?),
             "2013-07-15 08:16:00"
         );
         // But 24:00 with a nonzero minute, or sec > 60, is still rejected.
         assert!(make_timestamp(2013, 7, 15, 24, 1, 0.0).is_err());
         assert!(make_timestamp(2013, 7, 15, 8, 15, 60.5).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn date_trunc_fields() {
+    fn date_trunc_fields() -> anyhow::Result<()> {
         let t = ts("2001-02-16 20:38:40.5");
-        assert_eq!(format(date_trunc("hour", t).unwrap()), "2001-02-16 20:00:00");
-        assert_eq!(format(date_trunc("day", t).unwrap()), "2001-02-16 00:00:00");
-        assert_eq!(format(date_trunc("month", t).unwrap()), "2001-02-01 00:00:00");
-        assert_eq!(format(date_trunc("year", t).unwrap()), "2001-01-01 00:00:00");
-        assert_eq!(format(date_trunc("week", t).unwrap()), "2001-02-12 00:00:00");
-        assert_eq!(format(date_trunc("quarter", t).unwrap()), "2001-01-01 00:00:00");
-        assert_eq!(format(date_trunc("decade", t).unwrap()), "2000-01-01 00:00:00");
-        assert_eq!(format(date_trunc("century", t).unwrap()), "2001-01-01 00:00:00");
-        assert_eq!(format(date_trunc("millennium", t).unwrap()), "2001-01-01 00:00:00");
+        assert_eq!(format(date_trunc("hour", t)?), "2001-02-16 20:00:00");
+        assert_eq!(format(date_trunc("day", t)?), "2001-02-16 00:00:00");
+        assert_eq!(format(date_trunc("month", t)?), "2001-02-01 00:00:00");
+        assert_eq!(format(date_trunc("year", t)?), "2001-01-01 00:00:00");
+        assert_eq!(format(date_trunc("week", t)?), "2001-02-12 00:00:00");
+        assert_eq!(format(date_trunc("quarter", t)?), "2001-01-01 00:00:00");
+        assert_eq!(format(date_trunc("decade", t)?), "2000-01-01 00:00:00");
+        assert_eq!(format(date_trunc("century", t)?), "2001-01-01 00:00:00");
+        assert_eq!(format(date_trunc("millennium", t)?), "2001-01-01 00:00:00");
         assert_eq!(
-            format(date_trunc("milliseconds", ts("2001-02-16 20:38:40.123456")).unwrap()),
+            format(date_trunc(
+                "milliseconds",
+                ts("2001-02-16 20:38:40.123456")
+            )?),
             "2001-02-16 20:38:40.123"
         );
-        assert_eq!(date_trunc("day", POS_INFINITY).unwrap(), POS_INFINITY);
+        assert_eq!(date_trunc("day", POS_INFINITY)?, POS_INFINITY);
+
+        Ok(())
     }
 
     #[test]
-    fn make_timestamp_ok_and_range() {
+    fn make_timestamp_ok_and_range() -> anyhow::Result<()> {
         assert_eq!(
-            format(make_timestamp(2013, 7, 15, 8, 15, 23.5).unwrap()),
+            format(make_timestamp(2013, 7, 15, 8, 15, 23.5)?),
             "2013-07-15 08:15:23.5"
         );
         assert_eq!(
-            format(make_timestamp(2013, 7, 15, 8, 15, 23.0).unwrap()),
+            format(make_timestamp(2013, 7, 15, 8, 15, 23.0)?),
             "2013-07-15 08:15:23"
         );
         assert!(make_timestamp(2013, 13, 15, 8, 15, 23.0).is_err());
+
+        Ok(())
     }
 }

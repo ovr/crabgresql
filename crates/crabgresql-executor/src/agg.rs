@@ -8,15 +8,15 @@
 //! (or all-NULL) group.
 
 use std::cmp::Ordering;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crabgresql_binder::{AggFn, BoundAggregate};
-use crabgresql_types::{float, Numeric, PgType, Value};
+use crabgresql_types::{Numeric, PgType, Value, float};
 
-use crate::eval::compare_values;
 use crate::ExecError;
+use crate::eval::compare_values;
 
 /// The non-NULL input values already accepted by one `DISTINCT` aggregate in
 /// one group. It uses the same type-aware equality and compatible hash as
@@ -200,9 +200,11 @@ impl Accumulator {
                     Value::Null
                 } else {
                     // count > 0, so the division never divides by zero.
-                    Value::Numeric(sum.div(&Numeric::from_i128(count as i128)).map_err(
-                        |e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail),
-                    )?)
+                    Value::Numeric(
+                        sum.div(&Numeric::from_i128(count as i128)).map_err(|e| {
+                            ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
+                        })?,
+                    )
                 }
             }
             AggState::AvgFloat { sum, count } => {

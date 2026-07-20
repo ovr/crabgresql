@@ -77,8 +77,14 @@ impl Wal {
     /// Truncate the stream back to `lsn`, discarding anything after it. Used
     /// after recovery to drop a torn tail so new records overwrite the garbage.
     pub fn reset_to(&self, lsn: Lsn) -> Result<(), WalError> {
-        let mut inner = self.inner.lock().unwrap();
-        let file = self.file.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let file = self
+            .file
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         file.set_len(lsn.0)?;
         file.sync_data()?;
         inner.unwritten.clear();
@@ -92,9 +98,18 @@ impl Wal {
     /// no fsync — the caller stamps the returned LSN on the page it changed and,
     /// at commit, calls [`Wal::flush`] to make it durable.
     pub fn append(&self, rmgr: RmgrId, info: u8, xid: Xid, payload: &[u8]) -> Lsn {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         let start = Lsn(inner.insert_lsn);
-        let rec = WalRecord { prev_lsn: start, xid, rmgr: rmgr.0, info, payload };
+        let rec = WalRecord {
+            prev_lsn: start,
+            xid,
+            rmgr: rmgr.0,
+            info,
+            payload,
+        };
         let mut scratch = std::mem::take(&mut inner.unwritten);
         let n = rec.encode(start, &mut scratch);
         inner.unwritten = scratch;
@@ -104,7 +119,11 @@ impl Wal {
 
     /// Highest LSN staged (durable or not).
     pub fn current_lsn(&self) -> Lsn {
-        Lsn(self.inner.lock().unwrap().insert_lsn)
+        Lsn(self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .insert_lsn)
     }
 
     /// Highest LSN guaranteed on stable storage.
@@ -119,14 +138,20 @@ impl Wal {
         if self.flushed.load(Ordering::SeqCst) >= up_to.0 {
             return Ok(());
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         loop {
             if self.flushed.load(Ordering::SeqCst) >= up_to.0 {
                 return Ok(());
             }
             if inner.flushing {
                 // Another thread is mid-fsync; wait and recheck.
-                inner = self.cond.wait(inner).unwrap();
+                inner = match self.cond.wait(inner) {
+                    Ok(inner) => inner,
+                    Err(_) => panic!("WAL flush condition-variable mutex poisoned"),
+                };
                 continue;
             }
             // Become the flusher for everything appended so far.
@@ -141,13 +166,19 @@ impl Wal {
             // `written`, and on a partial-write retry the cursor is desynced —
             // both would otherwise corrupt the stream.
             let write_result = (|| -> Result<(), WalError> {
-                let file = self.file.lock().unwrap();
+                let file = self
+                    .file
+                    .lock()
+                    .unwrap_or_else(|_| panic!("mutex poisoned"));
                 file.write_all_at(&bytes, start)?;
                 file.sync_data()?;
                 Ok(())
             })();
 
-            inner = self.inner.lock().unwrap();
+            inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"));
             match write_result {
                 Ok(()) => {
                     inner.written = target;
@@ -195,47 +226,57 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn append_returns_monotonic_end_lsns_and_flush_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let wal = Wal::open(dir.path()).unwrap();
+    fn append_returns_monotonic_end_lsns_and_flush_persists() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
         let a = wal.append(RmgrId::HEAP, 0, Xid(3), &[1, 2, 3]);
         let b = wal.append(RmgrId::HEAP, 0, Xid(3), &[4, 5]);
         assert!(b > a);
         assert_eq!(wal.current_lsn(), b);
         assert_eq!(wal.flushed_lsn(), Lsn::INVALID);
-        wal.flush(b).unwrap();
+        wal.flush(b)?;
         assert_eq!(wal.flushed_lsn(), b);
         // Reopen: the durable position is restored from the file length.
         drop(wal);
-        let wal2 = Wal::open(dir.path()).unwrap();
+        let wal2 = Wal::open(dir.path())?;
         assert_eq!(wal2.current_lsn(), b);
         assert_eq!(wal2.flushed_lsn(), b);
+
+        Ok(())
     }
 
     #[test]
-    fn group_commit_coalesces_concurrent_flushers() {
-        let dir = tempfile::tempdir().unwrap();
-        let wal = Arc::new(Wal::open(dir.path()).unwrap());
-        std::thread::scope(|s| {
+    fn group_commit_coalesces_concurrent_flushers() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        std::thread::scope(|s| -> anyhow::Result<()> {
             let mut handles = Vec::new();
             for i in 0..8u64 {
                 let wal = Arc::clone(&wal);
-                handles.push(s.spawn(move || {
+                handles.push(s.spawn(move || -> Result<Lsn, WalError> {
                     let lsn = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3 + i), &[i as u8; 16]);
-                    wal.flush(lsn).unwrap();
-                    lsn
+                    wal.flush(lsn)?;
+                    Ok(lsn)
                 }));
             }
             for h in handles {
-                let lsn = h.join().unwrap();
+                let lsn = h
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("flush worker panicked"))??;
                 assert!(wal.flushed_lsn() >= lsn, "flush must be durable on return");
             }
-        });
+            Ok(())
+        })?;
+
+        Ok(())
     }
 
     /// Decode every record in the on-disk WAL, returning `(xid, payload)` pairs.
     fn read_all(dir: &Path) -> Vec<(Xid, Vec<u8>)> {
-        let bytes = std::fs::read(wal_path(dir)).unwrap();
+        let bytes = match std::fs::read(wal_path(dir)) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("failed to read WAL test fixture: {error}"),
+        };
         let mut out = Vec::new();
         let mut pos = 0;
         while let Some((rec, len)) = WalRecord::decode(&bytes[pos..]) {
@@ -246,22 +287,22 @@ mod tests {
     }
 
     #[test]
-    fn appending_after_reopen_preserves_earlier_records() {
+    fn appending_after_reopen_preserves_earlier_records() -> anyhow::Result<()> {
         // Regression: flush must write at the logical offset, not the reset OS
         // cursor, or the first append after a reopen clobbers the log head.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir()?;
         {
-            let wal = Wal::open(dir.path()).unwrap();
+            let wal = Wal::open(dir.path())?;
             wal.append(RmgrId::HEAP, 0, Xid(3), b"first");
             let l = wal.append(RmgrId::HEAP, 0, Xid(4), b"second");
-            wal.flush(l).unwrap();
+            wal.flush(l)?;
         }
         {
             // Reopen (cursor at 0, written at end-of-file) and append more.
-            let wal = Wal::open(dir.path()).unwrap();
+            let wal = Wal::open(dir.path())?;
             wal.append(RmgrId::HEAP, 0, Xid(5), b"third");
             let l = wal.append(RmgrId::HEAP, 0, Xid(6), b"fourth");
-            wal.flush(l).unwrap();
+            wal.flush(l)?;
         }
         // All four records from both sessions must decode intact and in order.
         assert_eq!(
@@ -273,34 +314,42 @@ mod tests {
                 (Xid(6), b"fourth".to_vec()),
             ]
         );
+
+        Ok(())
     }
 
     #[test]
-    fn reset_to_discards_a_torn_tail_before_appending() {
+    fn reset_to_discards_a_torn_tail_before_appending() -> anyhow::Result<()> {
         use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir()?;
         let valid_end;
         {
-            let wal = Wal::open(dir.path()).unwrap();
+            let wal = Wal::open(dir.path())?;
             wal.append(RmgrId::HEAP, 0, Xid(3), b"good");
             valid_end = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3), &[]);
-            wal.flush(valid_end).unwrap();
+            wal.flush(valid_end)?;
         }
         // A crash leaves raw garbage on disk past the last valid record.
         {
-            let mut f = OpenOptions::new().append(true).open(wal_path(dir.path())).unwrap();
-            f.write_all(&[0xAB; 37]).unwrap();
+            let mut f = OpenOptions::new().append(true).open(wal_path(dir.path()))?;
+            f.write_all(&[0xAB; 37])?;
         }
         {
-            let wal = Wal::open(dir.path()).unwrap();
+            let wal = Wal::open(dir.path())?;
             // Recovery computes `valid_end`; clamp to it (truncating the garbage),
             // then continue appending cleanly.
-            wal.reset_to(valid_end).unwrap();
+            wal.reset_to(valid_end)?;
             let l = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(10), &[]);
-            wal.flush(l).unwrap();
+            wal.flush(l)?;
         }
         let recs = read_all(dir.path());
         let xids: Vec<Xid> = recs.iter().map(|(x, _)| *x).collect();
-        assert_eq!(xids, vec![Xid(3), Xid(3), Xid(10)], "torn tail dropped, new record appended cleanly");
+        assert_eq!(
+            xids,
+            vec![Xid(3), Xid(3), Xid(10)],
+            "torn tail dropped, new record appended cleanly"
+        );
+
+        Ok(())
     }
 }

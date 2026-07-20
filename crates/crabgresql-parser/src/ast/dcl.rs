@@ -238,10 +238,6 @@ impl fmt::Display for AlterRoleOperation {
     }
 }
 
-
-
-
-
 /// CREATE ROLE statement
 /// See [PostgreSQL](https://www.postgresql.org/docs/current/sql-createrole.html)
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]

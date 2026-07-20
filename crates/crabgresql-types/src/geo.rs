@@ -56,7 +56,10 @@ fn syntax(type_name: &str, orig: &str) -> GeoError {
 
 impl From<crate::float::FloatError> for GeoError {
     fn from(e: crate::float::FloatError) -> GeoError {
-        GeoError { sqlstate: e.sqlstate, message: e.message.to_string() }
+        GeoError {
+            sqlstate: e.sqlstate,
+            message: e.message.to_string(),
+        }
     }
 }
 
@@ -112,7 +115,8 @@ fn scan_float_token(rest: &str) -> usize {
     }
     // `infinity` / `inf` / `nan` (case-insensitive), checked without allocating.
     let word = &b[i..];
-    let starts_with_ci = |w: &[u8], kw: &[u8]| w.len() >= kw.len() && w[..kw.len()].eq_ignore_ascii_case(kw);
+    let starts_with_ci =
+        |w: &[u8], kw: &[u8]| w.len() >= kw.len() && w[..kw.len()].eq_ignore_ascii_case(kw);
     if starts_with_ci(word, b"infinity") {
         return i + 8;
     }
@@ -168,7 +172,10 @@ fn single_decode(cur: &mut Cur, type_name: &str, orig: &str) -> Result<f64, GeoE
         if e.sqlstate == INVALID_TEXT_REPRESENTATION {
             syntax(type_name, orig)
         } else {
-            GeoError { sqlstate: e.sqlstate, message: e.message }
+            GeoError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }
         }
     })?;
     cur.i += n;
@@ -544,16 +551,19 @@ pub fn lseg_from_points(p1: &[f64; 2], p2: &[f64; 2]) -> [f64; 4] {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
-    fn point_roundtrip_and_forms() {
-        assert_eq!(parse_point("(1,2)").unwrap(), [1.0, 2.0]);
-        assert_eq!(parse_point("1,2").unwrap(), [1.0, 2.0]);
-        assert_eq!(parse_point(" ( -3.0 , 4.0 ) ").unwrap(), [-3.0, 4.0]);
+    fn point_roundtrip_and_forms() -> anyhow::Result<()> {
+        assert_eq!(parse_point("(1,2)")?, [1.0, 2.0]);
+        assert_eq!(parse_point("1,2")?, [1.0, 2.0]);
+        assert_eq!(parse_point(" ( -3.0 , 4.0 ) ")?, [-3.0, 4.0]);
         assert_eq!(format_point(&[5.1, 34.5], 0), "(5.1,34.5)");
         assert_eq!(format_point(&[0.0, 0.0], 0), "(0,0)");
+
+        Ok(())
     }
 
     #[test]
@@ -569,40 +579,55 @@ mod tests {
     }
 
     #[test]
-    fn lseg_forms_and_format() {
-        assert_eq!(parse_lseg("[(1,2),(3,4)]").unwrap(), [1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(parse_lseg("(0,0),(6,6)").unwrap(), [0.0, 0.0, 6.0, 6.0]);
-        assert_eq!(parse_lseg("10,-10 ,-3,-4").unwrap(), [10.0, -10.0, -3.0, -4.0]);
+    fn lseg_forms_and_format() -> anyhow::Result<()> {
+        assert_eq!(parse_lseg("[(1,2),(3,4)]")?, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(parse_lseg("(0,0),(6,6)")?, [0.0, 0.0, 6.0, 6.0]);
+        assert_eq!(parse_lseg("10,-10 ,-3,-4")?, [10.0, -10.0, -3.0, -4.0]);
         assert_eq!(
-            parse_lseg("[-1e6,2e2,3e5, -4e1]").unwrap(),
+            parse_lseg("[-1e6,2e2,3e5, -4e1]")?,
             [-1_000_000.0, 200.0, 300_000.0, -40.0]
         );
-        assert_eq!(parse_lseg("((0,0),(1,0))").unwrap(), [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(parse_lseg("((0,0),(1,0))")?, [0.0, 0.0, 1.0, 0.0]);
         assert_eq!(format_lseg(&[1.0, 2.0, 3.0, 4.0], 0), "[(1,2),(3,4)]");
+
+        Ok(())
     }
 
     #[test]
     fn lseg_bad_input() {
-        for bad in ["(3asdf,2 ,3,4r2)", "[1,2,3, 4", "[(,2),(3,4)]", "[(1,2),(3,4)", "(1,2)"] {
+        for bad in [
+            "(3asdf,2 ,3,4r2)",
+            "[1,2,3, 4",
+            "[(,2),(3,4)]",
+            "[(1,2),(3,4)",
+            "(1,2)",
+        ] {
             assert_eq!(parse_lseg(bad).unwrap_err().sqlstate, "22P02", "{bad}");
         }
     }
 
     #[test]
-    fn point_ops() {
+    fn point_ops() -> anyhow::Result<()> {
         assert_eq!(point_distance(&[0.0, 0.0], &[3.0, 4.0]), 5.0);
         assert!(point_left(&[-10.0, 0.0], &[0.0, 0.0]));
         assert!(point_eq(&[5.1, 34.5], &[5.1, 34.5]));
         assert!(point_eq(&[0.0, 0.0], &[0.000_000_9, 0.000_000_9]));
         assert!(!point_eq(&[0.0, 0.0], &[0.000_001_8, 0.000_001_8]));
-        assert_eq!(point_mul(&[5.1, 34.5], &[-10.0, 0.0]).unwrap(), [-51.0, -345.0]);
+        assert_eq!(point_mul(&[5.1, 34.5], &[-10.0, 0.0])?, [-51.0, -345.0]);
         // Underflow: 1e-300 * 1e-300 underflows to 0 from nonzero inputs.
         assert_eq!(
-            point_mul(&[1e-300, -1e-300], &[1e-300, -1e-300]).unwrap_err().sqlstate,
+            point_mul(&[1e-300, -1e-300], &[1e-300, -1e-300])
+                .unwrap_err()
+                .sqlstate,
             "22003"
         );
-        assert_eq!(point_div(&[5.1, 34.5], &[5.1, 34.5]).unwrap(), [1.0, 0.0]);
-        assert_eq!(point_div(&[1.0, 1.0], &[0.0, 0.0]).unwrap_err().sqlstate, "22012");
+        assert_eq!(point_div(&[5.1, 34.5], &[5.1, 34.5])?, [1.0, 0.0]);
+        assert_eq!(
+            point_div(&[1.0, 1.0], &[0.0, 0.0]).unwrap_err().sqlstate,
+            "22012"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -625,15 +650,27 @@ mod tests {
         assert!(lseg_eq(&[0.0, 0.0, 2.0, 0.0], &[0.0, 0.0, 2.0, 0.0]));
         assert!(!lseg_eq(&[0.0, 0.0, 2.0, 0.0], &[0.0, 0.0, 0.0, 2.0]));
         assert_eq!(dist_point_seg(&[0.0, 1.0], &[0.0, 0.0, 1.0, 0.0]), 1.0);
-        assert_eq!(dist_seg_seg(&[0.0, 0.0, 1.0, 0.0], &[0.0, 2.0, 1.0, 2.0]), 2.0);
+        assert_eq!(
+            dist_seg_seg(&[0.0, 0.0, 1.0, 0.0], &[0.0, 2.0, 1.0, 2.0]),
+            2.0
+        );
         assert_eq!(
             lseg_interpt(&[0.0, 0.0, 2.0, 0.0], &[1.0, -1.0, 1.0, 1.0]),
             Some([1.0, 0.0])
         );
-        assert_eq!(lseg_interpt(&[0.0, 0.0, 2.0, 0.0], &[0.0, 1.0, 2.0, 1.0]), None);
-        assert_eq!(close_point_seg(&[0.0, 5.0], &[0.0, 0.0, 10.0, 0.0]), [0.0, 0.0]);
+        assert_eq!(
+            lseg_interpt(&[0.0, 0.0, 2.0, 0.0], &[0.0, 1.0, 2.0, 1.0]),
+            None
+        );
+        assert_eq!(
+            close_point_seg(&[0.0, 5.0], &[0.0, 0.0, 10.0, 0.0]),
+            [0.0, 0.0]
+        );
         // `##` is NULL (None) for parallel segments, a point otherwise.
-        assert_eq!(close_seg_seg(&[0.0, 0.0, 1.0, 0.0], &[0.0, 2.0, 1.0, 2.0]), None);
+        assert_eq!(
+            close_seg_seg(&[0.0, 0.0, 1.0, 0.0], &[0.0, 2.0, 1.0, 2.0]),
+            None
+        );
         assert_eq!(
             close_seg_seg(&[0.0, 0.0, 2.0, 0.0], &[1.0, 1.0, 1.0, 3.0]),
             Some([1.0, 1.0])
@@ -644,10 +681,19 @@ mod tests {
     fn lseg_parallel_perpendicular_are_scale_invariant() {
         // Slope-based comparison stays correct at large coordinate magnitudes,
         // where an absolute cross/dot product would drift past EPSILON.
-        assert!(lseg_parallel(&[0.0, 0.0, 1e6, 1.0], &[0.0, 0.0, 1e6, 1.000_000_1]));
-        assert!(lseg_perpendicular(&[0.0, 0.0, 1000.0, 1.0], &[0.0, 0.0, 1.0, -999.999_5]));
+        assert!(lseg_parallel(
+            &[0.0, 0.0, 1e6, 1.0],
+            &[0.0, 0.0, 1e6, 1.000_000_1]
+        ));
+        assert!(lseg_perpendicular(
+            &[0.0, 0.0, 1000.0, 1.0],
+            &[0.0, 0.0, 1.0, -999.999_5]
+        ));
         // Two vertical segments are parallel; vertical ⟂ horizontal.
         assert!(lseg_parallel(&[0.0, 0.0, 0.0, 5.0], &[3.0, 0.0, 3.0, 10.0]));
-        assert!(lseg_perpendicular(&[0.0, 0.0, 0.0, 5.0], &[0.0, 0.0, 5.0, 0.0]));
+        assert!(lseg_perpendicular(
+            &[0.0, 0.0, 0.0, 5.0],
+            &[0.0, 0.0, 5.0, 0.0]
+        ));
     }
 }

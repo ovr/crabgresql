@@ -229,6 +229,12 @@ impl<'a> Cursor<'a> {
         Ok(head)
     }
 
+    fn array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        self.bytes(N)?
+            .try_into()
+            .map_err(|_| protocol_error("truncated message"))
+    }
+
     fn skip(&mut self, n: usize) -> io::Result<()> {
         self.bytes(n).map(|_| ())
     }
@@ -238,15 +244,15 @@ impl<'a> Cursor<'a> {
     }
 
     fn i16(&mut self) -> io::Result<i16> {
-        Ok(i16::from_be_bytes(self.bytes(2)?.try_into().unwrap()))
+        Ok(i16::from_be_bytes(self.array()?))
     }
 
     fn i32(&mut self) -> io::Result<i32> {
-        Ok(i32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(self.array()?))
     }
 
     fn u32(&mut self) -> io::Result<u32> {
-        Ok(u32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(self.array()?))
     }
 
     fn cstr(&mut self) -> io::Result<String> {

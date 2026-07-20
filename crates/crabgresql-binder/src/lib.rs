@@ -8,9 +8,9 @@ mod functions;
 mod plan;
 
 pub use expr::{
-    BinOp, Binding, BoundAggregate, BoundExpr, Scope, UnaryOp, bind_column_default, bind_expr,
-    bind_scalar, coerce_to_column, length_typmod, map_data_type, param_ctx_extended,
-    param_ctx_none, param_types, require_all_resolved, ParamCtx, ParamState,
+    BinOp, Binding, BoundAggregate, BoundExpr, ParamCtx, ParamState, Scope, UnaryOp,
+    bind_column_default, bind_expr, bind_scalar, coerce_to_column, length_typmod, map_data_type,
+    param_ctx_extended, param_ctx_none, param_types, require_all_resolved,
 };
 pub use functions::{AggFn, GeoFn, ScalarFn, TableFn, lookup_table_fn};
 pub use plan::{
@@ -45,6 +45,14 @@ pub struct BindError {
     /// failures, mirroring PG.
     pub location: Option<(u64, u64)>,
 }
+
+impl std::fmt::Display for BindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BindError {}
 
 impl BindError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {

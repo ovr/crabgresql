@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "core::option::Option::unwrap", reason = "use a typed error, `?`, or an exhaustive match" },
+    { path = "core::result::Result::unwrap", reason = "use a typed error, `?`, or an exhaustive match" },
+]
