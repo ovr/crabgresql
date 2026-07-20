@@ -281,6 +281,42 @@ async fn dml_returning_streams_affected_rows() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A RETURNING expression that faults at runtime must abort the whole statement,
+/// leaving the mutation rolled back — the projection runs before the commit.
+#[tokio::test]
+async fn dml_returning_faulting_expression_rolls_back_the_mutation() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id integer)").await?;
+    client.simple_query("INSERT INTO t VALUES (5)").await?;
+
+    // INSERT: division by zero in RETURNING must insert nothing.
+    let err = client
+        .simple_query("INSERT INTO t (id) VALUES (0) RETURNING 100/id")
+        .await
+        .expect_err("expected a division-by-zero error");
+    assert_eq!(err.code(), Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO));
+    let after_insert = client.simple_query("SELECT id FROM t").await?;
+    assert_eq!(
+        rows(&after_insert).len(),
+        1,
+        "the failed INSERT must not persist a row"
+    );
+
+    // DELETE: same faulting RETURNING must delete nothing.
+    client
+        .simple_query("DELETE FROM t RETURNING 100/(id-5)")
+        .await
+        .expect_err("expected a division-by-zero error");
+    let after_delete = client.simple_query("SELECT id FROM t").await?;
+    assert_eq!(
+        rows(&after_delete).len(),
+        1,
+        "the failed DELETE must not remove the row"
+    );
+
+    Ok(())
+}
+
 /// The extended protocol: a prepared `INSERT ... RETURNING` reports its result
 /// column shape at Describe and streams rows at Execute via `query`.
 #[tokio::test]

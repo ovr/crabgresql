@@ -353,8 +353,10 @@ pub fn analyze_statement(
     // to that count during binding, and `require_all_resolved` proved each is
     // `Some`.
     let param_types = param_types(&ctx).into_iter().flatten().collect();
-    // A DQL plan has a row shape; a data-modifying plan does not (no RETURNING),
-    // which `output_columns_of` reports as an error we fold to `None` (NoData).
+    // A plan with a row shape (a DQL query, or a data-modifying statement with a
+    // RETURNING clause) reports its columns; a data-modifying plan without
+    // RETURNING makes `output_columns_of` return an error we fold to `None`
+    // (NoData).
     let result_columns = output_columns_of(&logical).ok();
     Ok(Analyzed {
         param_types,

@@ -2029,14 +2029,34 @@ fn bind_target_list(
 }
 
 /// Bind an optional `RETURNING` clause against the target table's `scope`.
+///
+/// Unlike a SELECT target list, RETURNING is not an aggregation/SRF context:
+/// PostgreSQL rejects aggregate and set-returning functions here at bind time
+/// (there is no aggregate/ProjectSet plan node above a data-modifying
+/// statement to consume them), so reject them with PG's SQLSTATE and wording.
 fn bind_returning(
     returning: &Option<Vec<ast::SelectItem>>,
     scope: &Scope,
 ) -> Result<Option<Returning>, BindError> {
-    returning
-        .as_ref()
-        .map(|items| bind_target_list(items, scope))
-        .transpose()
+    let Some(items) = returning else {
+        return Ok(None);
+    };
+    let bound = bind_target_list(items, scope)?;
+    for projection in &bound.projections {
+        if projection.contains_aggregate() {
+            return Err(BindError::new(
+                sqlstate::GROUPING_ERROR,
+                "aggregate functions are not allowed in RETURNING",
+            ));
+        }
+        if projection.contains_srf() {
+            return Err(BindError::new(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "set-returning functions are not allowed in RETURNING",
+            ));
+        }
+    }
+    Ok(Some(bound))
 }
 
 fn bind_select_body(
@@ -3576,6 +3596,26 @@ mod tests {
         assert_eq!(bind_err("DELETE FROM t RETURNING nope").code, "42703");
 
         Ok(())
+    }
+
+    #[test]
+    fn returning_rejects_aggregates_and_set_returning_functions() {
+        // PostgreSQL rejects both at bind time (no aggregate/ProjectSet node
+        // exists above a data-modifying statement to consume them).
+        let agg = bind_err("UPDATE t SET id = 1 RETURNING count(*)");
+        assert_eq!(agg.code, "42803");
+        assert_eq!(
+            agg.message,
+            "aggregate functions are not allowed in RETURNING"
+        );
+        assert_eq!(bind_err("DELETE FROM t RETURNING max(id)").code, "42803");
+
+        let srf = bind_err("INSERT INTO t (id) VALUES (1) RETURNING generate_series(1, id)");
+        assert_eq!(srf.code, "0A000");
+        assert_eq!(
+            srf.message,
+            "set-returning functions are not allowed in RETURNING"
+        );
     }
 
     #[test]

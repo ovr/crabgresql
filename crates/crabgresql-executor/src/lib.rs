@@ -100,7 +100,12 @@ pub enum Execution {
     /// A data-modifying statement with a `RETURNING` clause: the affected rows
     /// projected as a result set, plus the DML verb so the server still emits
     /// the mutation command tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`) rather
-    /// than `SELECT n`. The streamed row count equals the mutation count.
+    /// than `SELECT n`. RETURNING is scalar one-in/one-out (the binder rejects
+    /// aggregates and set-returning functions), so the streamed row count is one
+    /// per affected row. It can still exceed the count `update_many`/`delete_many`
+    /// actually applied when a matched row is skipped as non-live at write time;
+    /// that cross-transaction reconciliation arrives with the isolation work
+    /// (see [`execute_update`]).
     ReturningRows {
         columns: Vec<OutputColumn>,
         node: Box<dyn ExecNode>,
@@ -347,9 +352,9 @@ fn finish_sort_distinct(
     Ok(Box::new(Distinct::new(node, keys, columns.len())?))
 }
 
-/// A source node over already-materialized tuples. `RETURNING` projects over
-/// the rows a DML statement has already built (raw `Vec<Value>`), so — unlike
-/// [`Values`], which evaluates `BoundExpr`s — it just replays them.
+/// A source node that replays already-computed output rows. `RETURNING`
+/// projects eagerly and streams the finished rows through this — unlike
+/// [`Values`], which evaluates `BoundExpr`s on each pull.
 struct MaterializedRows {
     rows: std::vec::IntoIter<Tuple>,
 }
@@ -368,28 +373,30 @@ impl ExecNode for MaterializedRows {
     }
 }
 
-/// Build the [`Execution::ReturningRows`] result for a DML statement: project
-/// the bound `RETURNING` list over the `affected` rows. Mirrors the
-/// projection tail of [`project_pipeline`] (SRF-aware) with no filter or sort.
-fn returning_rows(
-    affected: Vec<Tuple>,
-    returning: Returning,
-    verb: DmlVerb,
+/// Project a bound `RETURNING` list over the rows a DML statement affects,
+/// eagerly. The projection must run *before* the caller commits: a faulting
+/// RETURNING expression (division by zero, a failed cast) then propagates out of
+/// `execute` and aborts the statement, rolling the mutation back — matching
+/// PostgreSQL, and unlike a lazy node that would fault mid-stream after the
+/// write already committed. RETURNING is scalar one-in/one-out (the binder
+/// rejects aggregates and set-returning functions), so this is one output row
+/// per affected row.
+fn project_returning<'a>(
+    affected: impl IntoIterator<Item = &'a Tuple>,
+    projections: &[BoundExpr],
     ctx: ExecContext,
-) -> Execution {
-    let Returning {
-        columns,
-        projections,
-    } = returning;
-    let source: Box<dyn ExecNode> = Box::new(MaterializedRows::new(affected));
-    let node: Box<dyn ExecNode> = if projections.iter().any(BoundExpr::is_srf) {
-        Box::new(ProjectSet::new(source, projections, ctx))
-    } else {
-        Box::new(Projection::new(source, projections, ctx))
-    };
+) -> Result<Vec<Tuple>, ExecError> {
+    affected
+        .into_iter()
+        .map(|row| projections.iter().map(|expr| eval(expr, row, ctx)).collect())
+        .collect()
+}
+
+/// Package eagerly-projected `RETURNING` output rows as a streamable result.
+fn returning_rows(output: Vec<Tuple>, columns: Vec<OutputColumn>, verb: DmlVerb) -> Execution {
     Execution::ReturningRows {
         columns,
-        node,
+        node: Box::new(MaterializedRows::new(output)),
         verb,
     }
 }
@@ -426,21 +433,21 @@ fn execute_insert(
         tuples.push(tuple);
     }
     let inserted = tuples.len() as u64;
-    // With RETURNING, keep the inserted rows to project after the writes; the
-    // clause sees the fully-formed row (defaults filled in), in schema order.
-    match returning {
-        Some(returning) => {
-            for tuple in &tuples {
-                table.insert(tuple.clone(), txn);
-            }
-            Ok(returning_rows(tuples, returning, DmlVerb::Insert, ctx))
+    // RETURNING sees the fully-formed row (defaults filled in), in schema order.
+    // Project before inserting so a faulting RETURNING expression aborts the
+    // statement (nothing written); the tuples then move into `insert` uncloned.
+    let output = match &returning {
+        Some(returning) => Some(project_returning(&tuples, &returning.projections, ctx)?),
+        None => None,
+    };
+    for tuple in tuples {
+        table.insert(tuple, txn);
+    }
+    match (returning, output) {
+        (Some(returning), Some(output)) => {
+            Ok(returning_rows(output, returning.columns, DmlVerb::Insert))
         }
-        None => {
-            for tuple in tuples {
-                table.insert(tuple, txn);
-            }
-            Ok(Execution::Inserted(inserted))
-        }
+        _ => Ok(Execution::Inserted(inserted)),
     }
 }
 
@@ -497,13 +504,15 @@ fn execute_update(
         }
         pending.push((tid, new));
     }
-    // With RETURNING, project the NEW rows (in schema order). Snapshot them
-    // before `update_many` consumes `pending`.
+    // With RETURNING, project the NEW rows (in schema order) before
+    // `update_many` consumes `pending`, so a faulting expression aborts the
+    // statement before any row is written.
     match returning {
         Some(returning) => {
-            let new_rows: Vec<Tuple> = pending.iter().map(|(_, new)| new.clone()).collect();
+            let output =
+                project_returning(pending.iter().map(|(_, new)| new), &returning.projections, ctx)?;
             table.update_many(pending, txn);
-            Ok(returning_rows(new_rows, returning, DmlVerb::Update, ctx))
+            Ok(returning_rows(output, returning.columns, DmlVerb::Update))
         }
         None => Ok(Execution::Updated(table.update_many(pending, txn))),
     }
@@ -631,10 +640,13 @@ fn execute_delete(
             }
         }
     }
+    // Project the OLD rows before `delete_many` so a faulting RETURNING
+    // expression aborts the statement before any row is removed.
     match returning {
         Some(returning) => {
+            let output = project_returning(deleted.iter(), &returning.projections, ctx)?;
             table.delete_many(pending, txn);
-            Ok(returning_rows(deleted, returning, DmlVerb::Delete, ctx))
+            Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
         }
         None => Ok(Execution::Deleted(table.delete_many(pending, txn))),
     }
