@@ -1941,14 +1941,34 @@ async fn insert_source_query_clauses_execute_and_ragged_values_are_rejected() ->
     );
     assert_eq!(db_err.message(), "VALUES lists must all be the same length");
 
-    // Two rows from the VALUES insert, one from the SELECT insert; the failed
-    // ragged INSERT left nothing behind.
+    // Two rows from the VALUES insert, one from the SELECT insert.
     let messages = client.simple_query("SELECT a, b FROM t").await?;
-    let rows = rows(&messages);
-    assert_eq!(rows.len(), 3);
+    let t_rows = rows(&messages);
+    assert_eq!(t_rows.len(), 3);
     // Exactly one row carries the computed `b = a + 10` from the SELECT source.
-    let with_b = rows.iter().filter(|r| r.get("b") == Some("11")).count();
+    let with_b = t_rows.iter().filter(|r| r.get("b") == Some("11")).count();
     assert_eq!(with_b, 1);
+
+    // A failed INSERT ... SELECT leaves the target untouched: an integer
+    // overflow while evaluating the source aborts the whole statement, so `u`
+    // stays empty rather than being partially filled.
+    client.simple_query("CREATE TABLE u (a integer)").await?;
+    let err = client
+        .simple_query("INSERT INTO u (a) SELECT a + 2147483647 FROM t")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error()
+            .context("database error details are missing")?
+            .code(),
+        &tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE
+    );
+    let messages = client.simple_query("SELECT a FROM u").await?;
+    assert_eq!(
+        rows(&messages).len(),
+        0,
+        "a failed INSERT ... SELECT must leave no rows"
+    );
 
     Ok(())
 }

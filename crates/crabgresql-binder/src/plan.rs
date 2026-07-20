@@ -847,17 +847,12 @@ fn bind_table_query(
     order_by: &Option<ast::OrderBy>,
     ctes: &CteEnv,
 ) -> Result<LogicalPlan, BindError> {
-    let mut parts = Vec::new();
-    if let Some(schema) = &table.schema_name {
-        parts.push(ast::Ident::new(schema.clone()));
-    }
-    // The parser always fills `table_name` for a well-formed `TABLE t`.
-    let name = table.table_name.clone().ok_or_else(|| {
-        BindError::syntax("TABLE requires a table name")
-    })?;
-    parts.push(ast::Ident::new(name));
+    // `TABLE t` is `SELECT * FROM t`: resolve the name through the same FROM
+    // machinery as a plain relation reference. Reuse the parsed `ObjectName`
+    // verbatim so identifier quoting (`TABLE "MixedCase"`) and schema
+    // qualification are honored exactly as in a FROM clause.
     let relation = ast::TableFactor::Table {
-        name: ast::ObjectName::from(parts),
+        name: table.name.clone(),
         alias: None,
         args: None,
         with_hints: Vec::new(),
@@ -2623,16 +2618,19 @@ pub fn bind_insert_with_params(
     // A non-VALUES body (`SELECT`, `TABLE t`) — or a VALUES list carrying ORDER
     // BY / LIMIT / WITH, which must be executed as a query — feeds rows in from a
     // child plan. A plain VALUES list keeps the direct, fully-materialized path.
-    let is_query_source = matches!(
-        source,
-        Some(q) if q.with.is_some()
-            || q.order_by.is_some()
-            || q.limit_clause.is_some()
-            || !matches!(q.body.as_ref(), ast::SetExpr::Values(_))
-    );
+    let query_source: Option<&ast::Query> = match source {
+        Some(q)
+            if q.with.is_some()
+                || q.order_by.is_some()
+                || q.limit_clause.is_some()
+                || !matches!(q.body.as_ref(), ast::SetExpr::Values(_)) =>
+        {
+            Some(q)
+        }
+        _ => None,
+    };
 
-    let insert_source = if is_query_source {
-        let query = source.expect("is_query_source implies a source query");
+    let insert_source = if let Some(query) = query_source {
         let input = bind_query_with_params(engine, catalog, query, params)?;
         let src_cols = output_columns_of(&input)?;
         // PG matches the query's column count against the target columns: too
@@ -3768,6 +3766,40 @@ mod tests {
         };
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "big", "name", "flag"]);
+        Ok(())
+    }
+
+    #[test]
+    fn table_preserves_quoted_identifier_case() -> anyhow::Result<()> {
+        // A case-sensitive relation reached via `TABLE "MixedCase"` must keep its
+        // quoting, exactly as `SELECT * FROM "MixedCase"` does; an unquoted name
+        // folds to lower case and does not resolve (matching PostgreSQL).
+        let engine = MemoryEngine::new();
+        if let Err(error) = engine.create_table(TableSchema {
+            name: "MixedCase".into(),
+            columns: vec![Column::new("id", PgType::Int4)],
+        }) {
+            panic!("failed to create test table: {error}");
+        }
+        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+        let bind = |sql: &str| -> Result<LogicalPlan, BindError> {
+            let stmts = crabgresql_parser::parse(sql).expect("valid SQL");
+            match &stmts[0] {
+                ast::Statement::Query(q) => bind_query(&engine, &catalog, q),
+                ast::Statement::Insert(i) => bind_insert(&engine, &catalog, i),
+                other => panic!("unexpected statement: {other}"),
+            }
+        };
+
+        // Quoted keeps case → resolves, as a statement and as an INSERT source.
+        assert!(bind("TABLE \"MixedCase\"").is_ok());
+        assert!(bind("INSERT INTO \"MixedCase\" TABLE \"MixedCase\"").is_ok());
+        // Unquoted folds to `mixedcase`, which does not exist.
+        match bind("TABLE MixedCase") {
+            Err(e) => assert_eq!(e.code, sqlstate::UNDEFINED_TABLE),
+            Ok(_) => panic!("unquoted MixedCase must not resolve to \"MixedCase\""),
+        }
         Ok(())
     }
 

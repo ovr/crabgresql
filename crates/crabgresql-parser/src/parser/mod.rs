@@ -13274,53 +13274,12 @@ impl<'a> Parser<'a> {
 
     /// Parse `CREATE TABLE x AS TABLE y`
     pub fn parse_as_table(&mut self) -> Result<Table, ParserError> {
-        let token1 = self.next_token();
-        let token2 = self.next_token();
-        let token3 = self.next_token();
-
-        let table_name;
-        let schema_name;
-        if token2 == Token::Period {
-            match token1.token {
-                Token::Word(w) => {
-                    schema_name = w.value;
-                }
-                _ => {
-                    return self.expected("Schema name", token1);
-                }
-            }
-            match token3.token {
-                Token::Word(w) => {
-                    table_name = w.value;
-                }
-                _ => {
-                    return self.expected("Table name", token3);
-                }
-            }
-            Ok(Table {
-                table_name: Some(table_name),
-                schema_name: Some(schema_name),
-            })
-        } else {
-            match token1.token {
-                Token::Word(w) => {
-                    table_name = w.value;
-                }
-                _ => {
-                    return self.expected("Table name", token1);
-                }
-            }
-            // Only `token1` was the table name; `token2`/`token3` were read ahead
-            // for the `schema.table` case above, so put them back — anything after
-            // an unqualified `TABLE t` (a statement end, ORDER BY, RETURNING, …)
-            // belongs to the caller.
-            self.prev_token();
-            self.prev_token();
-            Ok(Table {
-                table_name: Some(table_name),
-                schema_name: None,
-            })
-        }
+        // A `TABLE t` name is a normal (possibly schema-qualified) object name:
+        // `parse_object_name` consumes exactly the dotted name, preserves
+        // identifier quoting (so `TABLE "MixedCase"` keeps its case), and stops
+        // at whatever follows (a statement end, ORDER BY, UNION, RETURNING, …).
+        let name = self.parse_object_name(false)?;
+        Ok(Table { name })
     }
 
     /// Parse a `SET ROLE` statement. Expects SET to be consumed already.

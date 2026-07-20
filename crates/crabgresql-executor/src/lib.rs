@@ -413,36 +413,6 @@ fn execute_insert(
     ctx: ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    // Materialize every insert tuple before touching the table. For a query
-    // source (`INSERT ... SELECT`) the child is drained fully under `txn`'s
-    // snapshot first, so `INSERT INTO t SELECT ... FROM t` reads only the
-    // pre-insert rows (no Halloween problem).
-    let source_tuples: Vec<Tuple> = match source {
-        PhysicalInsertSource::Values(rows) => rows
-            .iter()
-            .map(|row| row.iter().map(|expr| eval(expr, &[], ctx)).collect())
-            .collect::<Result<_, _>>()?,
-        PhysicalInsertSource::Query { input, projections } => {
-            let Execution::Rows { mut node, .. } = execute(*input, ctx, txn)? else {
-                return Err(ExecError::new(
-                    "XX000",
-                    "insert source did not produce a row set",
-                ));
-            };
-            let mut out = Vec::new();
-            while let Some(row) = node.next()? {
-                out.push(
-                    projections
-                        .iter()
-                        .map(|expr| eval(expr, &row, ctx))
-                        .collect::<Result<_, _>>()?,
-                );
-            }
-            out
-        }
-    };
-
-    let mut tuples: Vec<Tuple> = Vec::with_capacity(source_tuples.len());
     // Existing rows are only consulted to enforce UNIQUE keys; a table with no
     // unique index never needs the scan (NOT NULL checks only the new row).
     let has_unique = table.indexes().iter().any(|index| index.unique);
@@ -451,12 +421,45 @@ fn execute_insert(
     } else {
         Vec::new()
     };
-    for tuple in source_tuples {
+    // Build and constraint-check every insert tuple into `tuples` before any
+    // write. Validation never writes, so doing it while draining a query source
+    // is safe: `table.insert` only runs after the child is fully consumed, so
+    // `INSERT INTO t SELECT ... FROM t` reads only pre-insert rows (no Halloween
+    // problem).
+    let mut tuples: Vec<Tuple> = Vec::new();
+    let mut add = |tuple: Tuple, visible: &mut Vec<Tuple>| -> Result<(), ExecError> {
         validate_constraints(table, &tuple, visible.iter(), ctx)?;
         if has_unique {
             visible.push(tuple.clone());
         }
         tuples.push(tuple);
+        Ok(())
+    };
+    match source {
+        PhysicalInsertSource::Values(rows) => {
+            for row in &rows {
+                let tuple = row
+                    .iter()
+                    .map(|expr| eval(expr, &[], ctx))
+                    .collect::<Result<_, _>>()?;
+                add(tuple, &mut visible)?;
+            }
+        }
+        PhysicalInsertSource::Query { input, projections } => {
+            let Execution::Rows { mut node, .. } = execute(*input, ctx, txn)? else {
+                return Err(ExecError::new(
+                    "XX000",
+                    "insert source did not produce a row set",
+                ));
+            };
+            while let Some(row) = node.next()? {
+                let tuple = projections
+                    .iter()
+                    .map(|expr| eval(expr, &row, ctx))
+                    .collect::<Result<_, _>>()?;
+                add(tuple, &mut visible)?;
+            }
+        }
     }
     let inserted = tuples.len() as u64;
     // RETURNING sees the fully-formed row (defaults filled in), in schema order.

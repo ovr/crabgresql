@@ -725,7 +725,15 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             lines.extend(explain(source).into_iter().map(|l| format!("  {l}")));
             lines
         }
-        PhysicalPlan::Insert { table, .. } => vec![format!("Insert on {}", table.schema().name)],
+        PhysicalPlan::Insert { table, source, .. } => {
+            let mut lines = vec![format!("Insert on {}", table.schema().name)];
+            // A query source (`INSERT ... SELECT` / `TABLE t`) has a child plan;
+            // render it indented under the Insert, as Limit/Subquery do.
+            if let PhysicalInsertSource::Query { input, .. } = source {
+                lines.extend(explain(input).into_iter().map(|l| format!("  {l}")));
+            }
+            lines
+        }
         PhysicalPlan::Update { table, .. } => vec![format!("Update on {}", table.schema().name)],
         PhysicalPlan::Delete { table, .. } => vec![format!("Delete on {}", table.schema().name)],
     }
@@ -1230,5 +1238,18 @@ mod tests {
         let lines = explain(&seq_plan);
         assert_eq!(lines[0], "Seq Scan on t");
         assert_eq!(lines[1], "  Filter: (name = x)");
+    }
+
+    #[test]
+    fn explain_insert_select_shows_source_subtree() {
+        // A query-source INSERT renders its child plan indented under the Insert
+        // node, rather than hiding it behind a bare `Insert on t`.
+        let plan = plan_sql("INSERT INTO t SELECT * FROM t");
+        let lines = explain(&plan);
+        assert_eq!(lines[0], "Insert on t");
+        assert!(
+            lines.iter().skip(1).any(|l| l.contains("Seq Scan on t")),
+            "expected the source scan under Insert, got: {lines:?}"
+        );
     }
 }
