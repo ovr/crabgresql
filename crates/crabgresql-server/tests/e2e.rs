@@ -349,6 +349,71 @@ fn rows(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow>
         .collect()
 }
 
+#[tokio::test]
+async fn subqueries_in_expressions_match_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE sq (id int, val int)")
+        .await?;
+    client
+        .simple_query("INSERT INTO sq VALUES (1, 10), (2, 20), (3, 30)")
+        .await?;
+
+    // Scalar subquery in the target list.
+    let msgs = client
+        .simple_query("SELECT (SELECT max(val) FROM sq) AS m")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("m"), Some("30"));
+
+    // A scalar subquery with no rows is NULL.
+    let msgs = client
+        .simple_query("SELECT (SELECT val FROM sq WHERE id = 99) AS m")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("m"), None);
+
+    // EXISTS / NOT EXISTS.
+    let msgs = client
+        .simple_query(
+            "SELECT id FROM sq WHERE EXISTS (SELECT 1 FROM sq WHERE val = 20) ORDER BY id",
+        )
+        .await?;
+    assert_eq!(rows(&msgs).len(), 3);
+
+    // IN (SELECT ...) as a WHERE predicate.
+    let msgs = client
+        .simple_query(
+            "SELECT id FROM sq WHERE val IN (SELECT val FROM sq WHERE val <> 20) ORDER BY id",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("id")).collect();
+    assert_eq!(got, vec![Some("1"), Some("3")]);
+
+    // NOT IN (SELECT ...).
+    let msgs = client
+        .simple_query(
+            "SELECT id FROM sq WHERE val NOT IN (SELECT val FROM sq WHERE val = 20) ORDER BY id",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("id")).collect();
+    assert_eq!(got, vec![Some("1"), Some("3")]);
+
+    // A scalar subquery returning more than one row is a cardinality violation.
+    let err = client
+        .simple_query("SELECT (SELECT val FROM sq)")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::CARDINALITY_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "more than one row returned by a subquery used as an expression"
+    );
+
+    Ok(())
+}
+
 /// tokio-postgres drives the extended protocol: it sends Parse with no declared
 /// parameter types and relies on the server to infer them and return binary
 /// results. A parameterized arithmetic query must round-trip through
