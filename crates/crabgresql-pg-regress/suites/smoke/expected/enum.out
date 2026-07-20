@@ -133,8 +133,82 @@ SELECT max(col) FROM enumtest WHERE col < 'green';
 (1 row)
 
 --
+-- ALTER TYPE on an enum: ADD VALUE (append, BEFORE, AFTER, IF NOT EXISTS),
+-- RENAME VALUE, and RENAME TO. Changes are reflected immediately in pg_enum.
+--
+CREATE TYPE planets AS ENUM ('venus', 'earth', 'mars');
+ALTER TYPE planets ADD VALUE 'pluto';
+ALTER TYPE planets ADD VALUE 'mercury' BEFORE 'venus';
+ALTER TYPE planets ADD VALUE 'jupiter' AFTER 'mars';
+-- IF NOT EXISTS on an existing label skips with a NOTICE instead of erroring.
+ALTER TYPE planets ADD VALUE IF NOT EXISTS 'earth';
+NOTICE:  enum label "earth" already exists, skipping
+-- A duplicate label without IF NOT EXISTS is an error.
+ALTER TYPE planets ADD VALUE 'earth';
+ERROR:  enum label "earth" already exists
+-- BEFORE/AFTER a label that does not exist is an error.
+ALTER TYPE planets ADD VALUE 'nibiru' AFTER 'zeus';
+ERROR:  "zeus" is not an existing enum label
+-- RENAME VALUE keeps the value's position (sort order).
+ALTER TYPE planets RENAME VALUE 'pluto' TO 'ceres';
+-- The source label must exist and the target must not.
+ALTER TYPE planets RENAME VALUE 'pluto' TO 'x';
+ERROR:  "pluto" is not an existing enum label
+ALTER TYPE planets RENAME VALUE 'earth' TO 'mars';
+ERROR:  enum label "mars" already exists
+-- The full label set, in definition order. (Only the ordering is compared: PG
+-- keeps a fractional enumsortorder after BEFORE/AFTER inserts, while we renumber
+-- 1..N — the label sequence is identical either way.)
+SELECT e.enumlabel
+FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+WHERE t.typname = 'planets'
+ORDER BY e.enumsortorder;
+ enumlabel 
+-----------
+ mercury
+ venus
+ earth
+ mars
+ jupiter
+ ceres
+(6 rows)
+
+-- New values are usable as a column and order by the enum's definition order.
+CREATE TABLE solar (id int, body planets);
+INSERT INTO solar VALUES (1, 'mercury'), (2, 'mars'), (3, 'ceres');
+SELECT * FROM solar ORDER BY body;
+ id |  body   
+----+---------
+  1 | mercury
+  2 | mars
+  3 | ceres
+(3 rows)
+
+-- RENAME TO renames the type itself; the old name stops resolving while the
+-- column keeps working (the type OID is preserved).
+ALTER TYPE planets RENAME TO bodies;
+SELECT typname FROM pg_type WHERE typname IN ('planets', 'bodies');
+ typname 
+---------
+ bodies
+(1 row)
+
+SELECT * FROM solar ORDER BY body;
+ id |  body   
+----+---------
+  1 | mercury
+  2 | mars
+  3 | ceres
+(3 rows)
+
+-- Renaming onto a name that already exists is an error.
+ALTER TYPE bodies RENAME TO bodies;
+ERROR:  type "bodies" already exists
+--
 -- Cleanup.
 --
+DROP TABLE solar;
+DROP TYPE bodies;
 DROP TABLE enumtest;
 DROP TYPE rainbow;
 SELECT COUNT(*) FROM pg_type WHERE typname = 'rainbow';
