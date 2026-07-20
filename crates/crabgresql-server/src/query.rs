@@ -1799,6 +1799,8 @@ fn builtin_type_by_name(name: &str) -> Option<PgType> {
         "interval" => PgType::Interval,
         "macaddr" => PgType::Macaddr,
         "macaddr8" => PgType::Macaddr8,
+        "json" => PgType::Json,
+        "jsonb" => PgType::Jsonb,
         _ => return None,
     })
 }

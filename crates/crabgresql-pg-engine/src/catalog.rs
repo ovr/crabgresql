@@ -508,6 +508,8 @@ fn pgtype_from_oid(o: u32) -> PgType {
         oid::MACADDR8 => PgType::Macaddr8,
         oid::POINT => PgType::Point,
         oid::LSEG => PgType::Lseg,
+        oid::JSON => PgType::Json,
+        oid::JSONB => PgType::Jsonb,
         other => PgType::User(other),
     }
 }

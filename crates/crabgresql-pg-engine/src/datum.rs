@@ -7,7 +7,7 @@
 //! `u32` length prefix followed by the payload. Floats are stored via `to_bits`
 //! so NaN payloads survive a round trip.
 
-use crabgresql_types::{Inet, Interval, Numeric, TimeTz, Value};
+use crabgresql_types::{Inet, Interval, Numeric, TimeTz, Value, json};
 
 // Type tags. Never reordered — they are an on-disk format.
 const T_BOOL: u8 = 1;
@@ -36,6 +36,8 @@ const T_MACADDR8: u8 = 23;
 const T_POINT: u8 = 24;
 const T_LSEG: u8 = 25;
 const T_ENUM: u8 = 26;
+const T_JSON: u8 = 27;
+const T_JSONB: u8 = 28;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -159,6 +161,16 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&type_oid.to_le_bytes());
             out.extend_from_slice(&ordinal.to_le_bytes());
             put_var(out, label.as_bytes());
+        }
+        // `json` stores its raw text; `jsonb` stores its canonical serialization
+        // (already deterministic), re-parsed on decode.
+        Value::Json(s) => {
+            out.push(T_JSON);
+            put_var(out, s.as_bytes());
+        }
+        Value::Jsonb(j) => {
+            out.push(T_JSONB);
+            put_var(out, json::format(j).as_bytes());
         }
     }
 }
@@ -285,6 +297,13 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             let label = String::from_utf8(r.var().to_vec()).expect("enum label is valid utf-8");
             Value::Enum { type_oid, ordinal, label }
         }
+        T_JSON => {
+            Value::Json(String::from_utf8(r.var().to_vec()).expect("json text is valid utf-8"))
+        }
+        T_JSONB => {
+            let s = std::str::from_utf8(r.var()).expect("jsonb text is valid utf-8");
+            Value::Jsonb(json::jsonb_in(s).expect("stored jsonb re-parses"))
+        }
         other => panic!("corrupt datum tag {other}"),
     };
     *pos = r.pos;
@@ -354,6 +373,12 @@ mod tests {
         roundtrip(Value::Lseg([-1e6, 200.0, 3e5, -40.0]));
         roundtrip(Value::Enum { type_oid: 16384, ordinal: 0, label: "red".into() });
         roundtrip(Value::Enum { type_oid: 99999, ordinal: 42, label: String::new() });
+        // `json` keeps its raw text; `jsonb` its canonical tree.
+        roundtrip(Value::Json("{\"b\": 1,  \"a\": 2}".into()));
+        roundtrip(Value::Json("null".into()));
+        roundtrip(json::jsonb_in("{\"b\":1,\"a\":[1,2,3],\"k\":\"v\"}").map(Value::Jsonb).expect("valid jsonb"));
+        roundtrip(json::jsonb_in("[]").map(Value::Jsonb).expect("valid jsonb"));
+        roundtrip(json::jsonb_in("1.50").map(Value::Jsonb).expect("valid jsonb"));
     }
 
     #[test]

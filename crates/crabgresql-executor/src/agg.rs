@@ -300,6 +300,14 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     b.hash(&mut h);
                 }
             }
+            // jsonb equality is structural on its canonical tree, so hashing that
+            // tree agrees with `keys_equal` (which uses `compare_values`). Equal
+            // numbers of different display scale hash equal (numeric `Hash`).
+            PgType::Jsonb => {
+                if let Value::Jsonb(j) = v {
+                    j.hash(&mut h);
+                }
+            }
             PgType::User(type_oid) => {
                 if let Value::Enum { type_oid: value_oid, ordinal, .. } = v
                     && value_oid == type_oid
