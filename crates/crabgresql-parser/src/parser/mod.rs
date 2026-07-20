@@ -612,7 +612,12 @@ impl<'a> Parser<'a> {
                     self.prev_token();
                     self.parse_raise_stmt().map(Into::into)
                 }
-                Keyword::SELECT | Keyword::WITH | Keyword::VALUES | Keyword::FROM => {
+                Keyword::SELECT
+                | Keyword::WITH
+                | Keyword::VALUES
+                | Keyword::FROM
+                // `TABLE t` is PostgreSQL shorthand for `SELECT * FROM t`.
+                | Keyword::TABLE => {
                     self.prev_token();
                     self.parse_query().map(Into::into)
                 }
@@ -13269,47 +13274,12 @@ impl<'a> Parser<'a> {
 
     /// Parse `CREATE TABLE x AS TABLE y`
     pub fn parse_as_table(&mut self) -> Result<Table, ParserError> {
-        let token1 = self.next_token();
-        let token2 = self.next_token();
-        let token3 = self.next_token();
-
-        let table_name;
-        let schema_name;
-        if token2 == Token::Period {
-            match token1.token {
-                Token::Word(w) => {
-                    schema_name = w.value;
-                }
-                _ => {
-                    return self.expected("Schema name", token1);
-                }
-            }
-            match token3.token {
-                Token::Word(w) => {
-                    table_name = w.value;
-                }
-                _ => {
-                    return self.expected("Table name", token3);
-                }
-            }
-            Ok(Table {
-                table_name: Some(table_name),
-                schema_name: Some(schema_name),
-            })
-        } else {
-            match token1.token {
-                Token::Word(w) => {
-                    table_name = w.value;
-                }
-                _ => {
-                    return self.expected("Table name", token1);
-                }
-            }
-            Ok(Table {
-                table_name: Some(table_name),
-                schema_name: None,
-            })
-        }
+        // A `TABLE t` name is a normal (possibly schema-qualified) object name:
+        // `parse_object_name` consumes exactly the dotted name, preserves
+        // identifier quoting (so `TABLE "MixedCase"` keeps its case), and stops
+        // at whatever follows (a statement end, ORDER BY, UNION, RETURNING, …).
+        let name = self.parse_object_name(false)?;
+        Ok(Table { name })
     }
 
     /// Parse a `SET ROLE` statement. Expects SET to be consumed already.
@@ -17270,7 +17240,10 @@ impl<'a> Parser<'a> {
 
     /// Returns true if the next keyword indicates a sub query, i.e. SELECT or WITH
     fn peek_sub_query(&mut self) -> bool {
-        self.peek_one_of_keywords(&[Keyword::SELECT, Keyword::WITH])
+        // `TABLE t` is a query body too (PostgreSQL's `SELECT * FROM t`
+        // shorthand), so an INSERT source starting with it is a subquery, not a
+        // table alias.
+        self.peek_one_of_keywords(&[Keyword::SELECT, Keyword::WITH, Keyword::TABLE])
             .is_some()
     }
 

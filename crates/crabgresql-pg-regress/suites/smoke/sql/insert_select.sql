@@ -1,0 +1,30 @@
+--
+-- INSERT ... SELECT
+-- Smoke test for INSERT with a query source: a SELECT, the `TABLE t`
+-- shorthand, and ORDER BY / LIMIT on the source, plus assignment coercion
+-- of the selected columns into the target columns and RETURNING.
+--
+CREATE TABLE src (id integer, name text);
+INSERT INTO src VALUES (1, 'one'), (2, 'two'), (3, 'three');
+CREATE TABLE dst (id integer, name text, tag text);
+-- INSERT ... SELECT copies the matching rows; the unlisted column defaults to NULL.
+INSERT INTO dst (id, name) SELECT id, name FROM src WHERE id <= 2;
+SELECT * FROM dst ORDER BY id;
+-- ORDER BY / LIMIT on the source are executed: only the largest id is inserted.
+INSERT INTO dst (id, name) SELECT id, name FROM src ORDER BY id DESC LIMIT 1;
+SELECT * FROM dst ORDER BY id;
+-- `TABLE t` is shorthand for `SELECT * FROM t`; the column count must match.
+CREATE TABLE copy (id integer, name text);
+INSERT INTO copy TABLE src;
+SELECT * FROM copy ORDER BY id;
+-- The standalone TABLE command reads a whole table.
+TABLE src;
+-- Assignment coercion: an integer source column assigns into a text column.
+CREATE TABLE isel_labels (label text);
+INSERT INTO isel_labels SELECT id FROM src ORDER BY id;
+SELECT * FROM isel_labels ORDER BY label;
+-- RETURNING works over an INSERT ... SELECT.
+INSERT INTO dst (id, name) SELECT id, name FROM src WHERE id = 3 RETURNING id, name;
+-- A self-insert reads the pre-insert snapshot (no Halloween problem): src doubles.
+INSERT INTO src SELECT * FROM src;
+SELECT id, name FROM src ORDER BY id, name;

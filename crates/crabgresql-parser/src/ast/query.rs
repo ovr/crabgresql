@@ -267,23 +267,15 @@ impl fmt::Display for SetQuantifier {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// A (possibly schema-qualified) table reference used in `FROM` clauses.
 pub struct Table {
-    /// Optional table name (absent for e.g. `TABLE` command without argument).
-    pub table_name: Option<String>,
-    /// Optional schema/catalog name qualifying the table.
-    pub schema_name: Option<String>,
+    /// The relation name, as a (possibly schema-qualified) object name.
+    /// Identifier quoting is preserved so case-sensitive relations resolve
+    /// correctly (`TABLE "MixedCase"`).
+    pub name: ObjectName,
 }
 
 impl fmt::Display for Table {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let Some(table_name) = &self.table_name else {
-            return Err(fmt::Error);
-        };
-        if let Some(ref schema_name) = self.schema_name {
-            write!(f, "TABLE {schema_name}.{table_name}")?;
-        } else {
-            write!(f, "TABLE {table_name}")?;
-        }
-        Ok(())
+        write!(f, "TABLE {}", self.name)
     }
 }
 

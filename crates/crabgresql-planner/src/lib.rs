@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use crabgresql_binder::{
-    AggInput, BinOp, BoundAggregate, BoundExpr, DistinctKey, JoinExpr, JoinInput, JoinKind,
-    LogicalPlan, OutputColumn, Returning, SortKey, TableFn,
+    AggInput, BinOp, BoundAggregate, BoundExpr, DistinctKey, InsertSource, JoinExpr, JoinInput,
+    JoinKind, LogicalPlan, OutputColumn, Returning, SortKey, TableFn,
 };
 use crabgresql_storage_api::{IndexConstraint, IndexMetadata, TableAm, TableSchema};
 use crabgresql_types::PgType;
@@ -101,7 +101,7 @@ pub enum PhysicalPlan {
     },
     Insert {
         table: Arc<dyn TableAm>,
-        rows: Vec<Vec<BoundExpr>>,
+        source: PhysicalInsertSource,
         returning: Option<Returning>,
     },
     Update {
@@ -114,6 +114,20 @@ pub enum PhysicalPlan {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         returning: Option<Returning>,
+    },
+}
+
+/// The rows an INSERT writes, mirroring [`InsertSource`] with the query source's
+/// subplan already lowered to a [`PhysicalPlan`].
+pub enum PhysicalInsertSource {
+    /// Fully-formed rows, full-width in schema order, evaluated against the empty
+    /// row.
+    Values(Vec<Vec<BoundExpr>>),
+    /// Rows pulled from `input`, each mapped through `projections` (full-width,
+    /// schema order) evaluated against the source tuple.
+    Query {
+        input: Box<PhysicalPlan>,
+        projections: Vec<BoundExpr>,
     },
 }
 
@@ -469,11 +483,17 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         },
         LogicalPlan::Insert {
             table,
-            rows,
+            source,
             returning,
         } => PhysicalPlan::Insert {
             table,
-            rows,
+            source: match source {
+                InsertSource::Values(rows) => PhysicalInsertSource::Values(rows),
+                InsertSource::Query { input, projections } => PhysicalInsertSource::Query {
+                    input: Box::new(plan(*input)),
+                    projections,
+                },
+            },
             returning,
         },
         LogicalPlan::Update {
@@ -705,7 +725,15 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             lines.extend(explain(source).into_iter().map(|l| format!("  {l}")));
             lines
         }
-        PhysicalPlan::Insert { table, .. } => vec![format!("Insert on {}", table.schema().name)],
+        PhysicalPlan::Insert { table, source, .. } => {
+            let mut lines = vec![format!("Insert on {}", table.schema().name)];
+            // A query source (`INSERT ... SELECT` / `TABLE t`) has a child plan;
+            // render it indented under the Insert, as Limit/Subquery do.
+            if let PhysicalInsertSource::Query { input, .. } = source {
+                lines.extend(explain(input).into_iter().map(|l| format!("  {l}")));
+            }
+            lines
+        }
         PhysicalPlan::Update { table, .. } => vec![format!("Update on {}", table.schema().name)],
         PhysicalPlan::Delete { table, .. } => vec![format!("Delete on {}", table.schema().name)],
     }
@@ -1095,9 +1123,12 @@ mod tests {
 
     #[test]
     fn insert_rows_are_prebound_constants() {
-        let PhysicalPlan::Insert { rows, .. } = plan_sql("INSERT INTO t (id) VALUES (1), (2)")
+        let PhysicalPlan::Insert { source, .. } = plan_sql("INSERT INTO t (id) VALUES (1), (2)")
         else {
             panic!("expected Insert");
+        };
+        let PhysicalInsertSource::Values(rows) = source else {
+            panic!("expected a VALUES source");
         };
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -1207,5 +1238,18 @@ mod tests {
         let lines = explain(&seq_plan);
         assert_eq!(lines[0], "Seq Scan on t");
         assert_eq!(lines[1], "  Filter: (name = x)");
+    }
+
+    #[test]
+    fn explain_insert_select_shows_source_subtree() {
+        // A query-source INSERT renders its child plan indented under the Insert
+        // node, rather than hiding it behind a bare `Insert on t`.
+        let plan = plan_sql("INSERT INTO t SELECT * FROM t");
+        let lines = explain(&plan);
+        assert_eq!(lines[0], "Insert on t");
+        assert!(
+            lines.iter().skip(1).any(|l| l.contains("Seq Scan on t")),
+            "expected the source scan under Insert, got: {lines:?}"
+        );
     }
 }
