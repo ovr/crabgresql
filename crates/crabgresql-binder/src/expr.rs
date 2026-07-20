@@ -1037,11 +1037,13 @@ fn bind_scalar_subquery(query: &ast::Query, scope: &Scope) -> Result<Binding, Bi
 }
 
 /// `[NOT] EXISTS (SELECT …)` → a bool test on whether the subquery yields rows.
-/// The projected columns are irrelevant (PG likewise ignores them).
+/// The projected columns are irrelevant (PG ignores them), so the target list is
+/// replaced with a constant: the executor then only checks for a first row and
+/// never evaluates the original projection (which could error or be expensive).
 fn bind_exists(query: &ast::Query, negated: bool, scope: &Scope) -> Result<Binding, BindError> {
     let (plan, _columns) = bind_subquery_plan(query, scope)?;
     Ok(Binding::Typed(BoundExpr::Exists {
-        subplan: Subplan(Box::new(plan)),
+        subplan: Subplan(Box::new(crate::plan::strip_to_existence(plan))),
         negated,
     }))
 }
@@ -4260,6 +4262,26 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
             .and_then(|p| p.as_ident())
             .map(normalize_ident)
             .unwrap_or_else(|| "?column?".into()),
+        // `EXISTS (…)` is named "exists" in PG.
+        ast::Expr::Exists { .. } => "exists".into(),
+        // A scalar `(SELECT …)` takes the name of the subquery's single output
+        // column (`(SELECT max(x))` → "max", `(SELECT y)` → "y").
+        ast::Expr::Subquery(query) => subquery_output_name(query),
+        _ => "?column?".into(),
+    }
+}
+
+/// The output-column name of a scalar `(SELECT …)`: the name of the subquery's
+/// first (and only) target-list column — an alias if present, else the item
+/// expression's own [`output_name`]. Anything that isn't a plain `SELECT`
+/// (e.g. `VALUES`) or whose first item is a wildcard falls back to `?column?`.
+fn subquery_output_name(query: &ast::Query) -> String {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return "?column?".into();
+    };
+    match select.projection.first() {
+        Some(ast::SelectItem::UnnamedExpr(expr)) => output_name(expr),
+        Some(ast::SelectItem::ExprWithAlias { alias, .. }) => normalize_ident(alias),
         _ => "?column?".into(),
     }
 }

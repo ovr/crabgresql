@@ -6,11 +6,12 @@
 --
 CREATE TABLE sq (id integer, val integer);
 INSERT INTO sq VALUES (1, 10), (2, 20), (3, 30);
--- scalar subquery in the target list
-SELECT (SELECT max(val) FROM sq) AS max_val;
- max_val 
----------
-      30
+-- scalar subquery in the target list; with no alias PG names the column after
+-- the subquery's single output column
+SELECT (SELECT max(val) FROM sq);
+ max 
+-----
+  30
 (1 row)
 
 -- a scalar subquery returning no rows is NULL
@@ -28,12 +29,20 @@ SELECT id FROM sq WHERE val > (SELECT min(val) FROM sq) ORDER BY id;
   3
 (2 rows)
 
--- EXISTS is true when the subquery yields any row
-SELECT EXISTS (SELECT 1 FROM sq WHERE val = 20) AS has_20,
+-- EXISTS is true when the subquery yields any row; with no alias the column is
+-- named "exists"
+SELECT EXISTS (SELECT 1 FROM sq WHERE val = 20),
        EXISTS (SELECT 1 FROM sq WHERE val = 99) AS has_99;
- has_20 | has_99 
+ exists | has_99 
 --------+--------
  t      | f
+(1 row)
+
+-- EXISTS ignores the subquery's target list, so an error there is never raised
+SELECT EXISTS (SELECT 1 / 0 FROM sq) AS ignores_select_list;
+ ignores_select_list 
+---------------------
+ t
 (1 row)
 
 -- NOT EXISTS negates it
@@ -75,14 +84,34 @@ SELECT 10 IN (SELECT val FROM (VALUES (10), (NULL)) AS v(val)) AS in_null_match;
  t
 (1 row)
 
--- a scalar subquery in the SELECT list, combined with a column
-SELECT id, id + (SELECT count(*) FROM sq) AS plus_count FROM sq ORDER BY id;
- id | plus_count 
-----+------------
-  1 |          4
-  2 |          5
-  3 |          6
-(3 rows)
+-- membership across differing string types: text tested against a char(n)
+-- subquery column still compares equal
+CREATE TABLE txt (t text);
+CREATE TABLE chr (c char(3));
+INSERT INTO txt VALUES ('foo');
+INSERT INTO chr VALUES ('foo');
+SELECT t, t IN (SELECT c FROM chr) AS matched FROM txt;
+  t  | matched 
+-----+---------
+ foo | t
+(1 row)
+
+-- subqueries in DML predicates and assignments
+DELETE FROM sq WHERE val IN (SELECT val FROM sq WHERE val > 25);
+SELECT * FROM sq ORDER BY id;
+ id | val 
+----+-----
+  1 |  10
+  2 |  20
+(2 rows)
+
+UPDATE sq SET val = (SELECT max(val) FROM sq WHERE val < 25) WHERE id = 1;
+SELECT * FROM sq ORDER BY id;
+ id | val 
+----+-----
+  1 |  20
+  2 |  20
+(2 rows)
 
 -- error: a scalar subquery that returns more than one row
 SELECT (SELECT val FROM sq);

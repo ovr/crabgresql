@@ -399,10 +399,18 @@ fn resolve_subqueries(
         }
         PhysicalPlan::Limit { source, .. } => resolve_subqueries(source, ctx, txn)?,
         PhysicalPlan::Insert {
-            rows, returning, ..
+            source, returning, ..
         } => {
-            for row in rows {
-                resolve_exprs(row, ctx, txn)?;
+            match source {
+                PhysicalInsertSource::Values(rows) => {
+                    for row in rows {
+                        resolve_exprs(row, ctx, txn)?;
+                    }
+                }
+                PhysicalInsertSource::Query { input, projections } => {
+                    resolve_subqueries(input, ctx, txn)?;
+                    resolve_exprs(projections, ctx, txn)?;
+                }
             }
             resolve_returning(returning, ctx, txn)?;
         }
@@ -562,7 +570,14 @@ fn fold_subquery(
                         Some(row) => row.into_iter().next().unwrap_or(Value::Null),
                         None => Value::Null,
                     };
-                    Ok(BoundExpr::Const { value, ty })
+                    // Settle the value on the declared output type: the projection
+                    // usually already produces it, but a set-op / promoted column
+                    // could yield a narrower variant, and the outer operator was
+                    // bound against `ty`.
+                    Ok(BoundExpr::Const {
+                        value: coerce_value(value, ty, ctx)?,
+                        ty,
+                    })
                 }
                 _ => Err(ExecError::new(
                     crabgresql_pg_wire::sqlstate::CARDINALITY_VIOLATION,
@@ -571,10 +586,13 @@ fn fold_subquery(
             }
         }
         BoundExpr::Exists { subplan, negated } => {
-            let rows = run_subplan(*subplan.0, ctx, txn)?;
-            // EXISTS is true when the subplan yields a row; NOT EXISTS inverts it.
+            // EXISTS only needs to know whether a row exists, so stop at the first
+            // one rather than draining the whole subplan; the binder already
+            // stripped the target list to a constant so no per-row projection
+            // (or its errors) is evaluated. NOT EXISTS inverts the test.
+            let exists = subplan_has_rows(*subplan.0, ctx, txn)?;
             Ok(BoundExpr::Const {
-                value: Value::Bool(rows.is_empty() == negated),
+                value: Value::Bool(exists != negated),
                 ty: PgType::Bool,
             })
         }
@@ -614,6 +632,22 @@ fn run_subplan(
     }
 }
 
+/// Whether a subplan yields at least one row, stopping at the first — for
+/// `EXISTS`, which needs existence only, not the rows themselves.
+fn subplan_has_rows(
+    logical: LogicalPlan,
+    ctx: ExecContext,
+    txn: &TxnContext,
+) -> Result<bool, ExecError> {
+    match execute(crabgresql_planner::plan(logical), ctx, txn)? {
+        Execution::Rows { mut node, .. } => Ok(node.next()?.is_some()),
+        _ => Err(ExecError::new(
+            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+            "subquery did not produce a result set",
+        )),
+    }
+}
+
 fn drain(mut node: Box<dyn ExecNode>) -> Result<Vec<Tuple>, ExecError> {
     let mut out = Vec::new();
     while let Some(tuple) = node.next()? {
@@ -622,11 +656,13 @@ fn drain(mut node: Box<dyn ExecNode>) -> Result<Vec<Tuple>, ExecError> {
     Ok(out)
 }
 
-/// Fold `x IN (values)` to the OR-chain PG lowers `x IN (list)` to: one
+/// Fold `x IN (values)` to the OR-of-equalities PG lowers `x IN (list)` to: one
 /// `x = value` comparison per candidate, combined with OR. `cmp` is the bound
 /// `x = <hole>` template; each candidate value is substituted into its RHS hole,
-/// preserving the operand coercions the binder resolved. An empty set folds to
-/// `false` (the caller wraps `NOT IN` in `NOT`).
+/// preserving the operand coercions the binder resolved. The comparisons are
+/// combined into a **balanced** OR tree so `eval` (and `Drop`) recurse in
+/// O(log n), not O(n) — a subquery can return far more rows than a hand-written
+/// IN list. An empty set folds to `false` (the caller wraps `NOT IN` in `NOT`).
 fn build_in_chain(
     cmp: &BoundExpr,
     rows: Vec<Tuple>,
@@ -644,55 +680,100 @@ fn build_in_chain(
             "IN (SELECT …) comparison template was not a binary comparison",
         ));
     };
-    let mut acc: Option<BoundExpr> = None;
+    let mut comparisons = Vec::with_capacity(rows.len());
     for mut row in rows {
         let value = if row.is_empty() {
             Value::Null
         } else {
             row.swap_remove(0)
         };
-        let comparison = BoundExpr::Binary {
+        comparisons.push(BoundExpr::Binary {
             op: *op,
             arg_ty: *arg_ty,
             left: left.clone(),
             right: Box::new(substitute_hole(right, value, ctx)?),
-        };
-        acc = Some(match acc {
-            None => comparison,
-            Some(prev) => BoundExpr::Binary {
-                op: BinOp::Or,
-                arg_ty: PgType::Bool,
-                left: Box::new(prev),
-                right: Box::new(comparison),
-            },
         });
     }
-    Ok(acc.unwrap_or(BoundExpr::Const {
-        value: Value::Bool(false),
-        ty: PgType::Bool,
-    }))
+    Ok(balanced_or(comparisons))
 }
 
-/// Replace the innermost `Const` hole of an IN comparison template's RHS with a
-/// candidate value, keeping any `Coerce` wrapper the binder inserted. The value
-/// carries the subquery column's own type, but the binder may have folded a
-/// coercion into the hole `Const`'s declared type (e.g. `numeric` promoted to
-/// `float8` for `float_col IN (SELECT numeric_col)`), so coerce it to match.
+/// Combine boolean expressions into a balanced `OR` tree (depth ⌈log₂ n⌉). An
+/// empty input is `false`. Kept balanced so evaluating / dropping the tree never
+/// recurses linearly in the number of candidates.
+fn balanced_or(mut nodes: Vec<BoundExpr>) -> BoundExpr {
+    if nodes.is_empty() {
+        return BoundExpr::Const {
+            value: Value::Bool(false),
+            ty: PgType::Bool,
+        };
+    }
+    while nodes.len() > 1 {
+        let mut merged = Vec::with_capacity(nodes.len().div_ceil(2));
+        let mut it = nodes.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => merged.push(BoundExpr::Binary {
+                    op: BinOp::Or,
+                    arg_ty: PgType::Bool,
+                    left: Box::new(a),
+                    right: Box::new(b),
+                }),
+                None => merged.push(a),
+            }
+        }
+        nodes = merged;
+    }
+    // Exactly one node remains (input was non-empty).
+    nodes.swap_remove(0)
+}
+
+/// Substitute a candidate value into the IN comparison template's `<hole>` — the
+/// unique NULL `Const` the binder placed on the RHS — and coerce it to that
+/// hole's declared type. The hole may sit under a `Coerce`, a `Reinterpret`, or
+/// a coercion `FuncCall` (e.g. `bpchar → text` lowers to `FuncCall{BpcharToText}`
+/// rather than a `Coerce`), so descend through all of them; only the NULL
+/// placeholder is replaced, leaving any constant function arguments (typmods)
+/// intact.
 fn substitute_hole(
     expr: &BoundExpr,
     value: Value,
     ctx: ExecContext,
 ) -> Result<BoundExpr, ExecError> {
     match expr {
+        // The placeholder: a NULL `Const` carrying the hole's declared type.
+        BoundExpr::Const {
+            value: Value::Null,
+            ty,
+        } => Ok(BoundExpr::Const {
+            value: coerce_value(value, *ty, ctx)?,
+            ty: *ty,
+        }),
+        // Any other constant (e.g. a coercion function's typmod argument) stays.
+        BoundExpr::Const { .. } => Ok(expr.clone()),
         BoundExpr::Coerce { expr, ty } => Ok(BoundExpr::Coerce {
             expr: Box::new(substitute_hole(expr, value, ctx)?),
             ty: *ty,
         }),
-        BoundExpr::Const { ty, .. } => Ok(BoundExpr::Const {
-            value: coerce_value(value, *ty, ctx)?,
-            ty: *ty,
+        BoundExpr::Reinterpret {
+            expr,
+            reported,
+            rep,
+        } => Ok(BoundExpr::Reinterpret {
+            expr: Box::new(substitute_hole(expr, value, ctx)?),
+            reported: *reported,
+            rep: *rep,
         }),
-        // The template's RHS is always a `Const` (possibly `Coerce`-wrapped).
+        BoundExpr::FuncCall { func, ret, args } => {
+            let args = args
+                .iter()
+                .map(|a| substitute_hole(a, value.clone(), ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::FuncCall {
+                func: *func,
+                ret: *ret,
+                args,
+            })
+        }
         other => Ok(other.clone()),
     }
 }

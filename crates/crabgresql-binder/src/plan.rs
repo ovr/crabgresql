@@ -1823,6 +1823,128 @@ pub fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindEr
     }
 }
 
+/// Rewrite an `EXISTS` subquery's target list to a single constant `1`, so the
+/// executor only tests for a first row and never evaluates the original
+/// projection (which PG's semi-join also skips — matching `EXISTS(SELECT 1/0 …)`
+/// returning true rather than erroring). Row count is preserved because a
+/// scalar projection is one-in/one-out; when a projection is set-returning the
+/// output count depends on it, so the plan is left untouched (the executor still
+/// stops at the first produced row). `ORDER BY`/`DISTINCT` are dropped: they
+/// cannot change whether any row exists.
+pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
+    fn one_row() -> Vec<BoundExpr> {
+        vec![BoundExpr::Const {
+            value: Value::Int4(1),
+            ty: PgType::Int4,
+        }]
+    }
+    fn one_col() -> Vec<OutputColumn> {
+        vec![OutputColumn {
+            name: "?column?".into(),
+            ty: PgType::Int4,
+        }]
+    }
+    fn has_srf(projections: &[BoundExpr]) -> bool {
+        projections.iter().any(BoundExpr::contains_srf)
+    }
+    match plan {
+        LogicalPlan::Query {
+            table,
+            projections,
+            predicate,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::Query {
+            table,
+            columns: one_col(),
+            projections: one_row(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Subquery {
+            source,
+            projections,
+            predicate,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::Subquery {
+            source,
+            columns: one_col(),
+            projections: one_row(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Join {
+            source,
+            projections,
+            predicate,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::Join {
+            source,
+            columns: one_col(),
+            projections: one_row(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::TableFunction {
+            func,
+            args,
+            projections,
+            predicate,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::TableFunction {
+            func,
+            args,
+            columns: one_col(),
+            projections: one_row(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            projections,
+            ..
+        } if !has_srf(&projections) => LogicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            columns: one_col(),
+            projections: one_row(),
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Values {
+            rows, predicate, ..
+        } => LogicalPlan::Values {
+            columns: one_col(),
+            rows: rows.into_iter().map(|_| one_row()).collect(),
+            predicate,
+            sort: Vec::new(),
+            distinct: None,
+        },
+        LogicalPlan::Limit {
+            source,
+            limit,
+            offset,
+        } => LogicalPlan::Limit {
+            source: Box::new(strip_to_existence(*source)),
+            limit,
+            offset,
+        },
+        // A set-returning projection (guards above fell through) or a DML body in
+        // WITH: leave as-is; the executor's first-row check is still correct.
+        other => other,
+    }
+}
+
 /// The qualifier a FROM item's columns are addressed by: its alias, else its
 /// name.
 fn relation_qualifier(alias: &Option<ast::TableAlias>, default: &str) -> String {
@@ -2879,8 +3001,9 @@ pub fn bind_insert_with_params(
         }
 
         // VALUES cells bind in the empty scope: a column reference in VALUES is
-        // an undefined column, as in PG.
-        let scope = Scope::empty(catalog, params);
+        // an undefined column, as in PG. A cell may still hold a subquery; INSERT
+        // takes no WITH, so the CTE environment is empty.
+        let scope = Scope::empty(catalog, params).with_subqueries(engine, &CteEnv::new());
         let first_width = value_rows.first().map_or(0, |row| row.len());
         let mut rows = Vec::with_capacity(value_rows.len());
         for value_row in value_rows {
@@ -2922,7 +3045,7 @@ pub fn bind_insert_with_params(
     // needs a fresh table scope.
     let returning = bind_returning(
         &insert.returning,
-        &Scope::table(&schema, name, catalog, params),
+        &Scope::table(&schema, name, catalog, params).with_subqueries(engine, &CteEnv::new()),
     )?;
 
     Ok(LogicalPlan::Insert {
@@ -2970,7 +3093,10 @@ pub fn bind_update_with_params(
     let (table, qualifier) = open_write_relation(engine, &update.table.relation, WriteVerb::Update)?;
     let schema = table.schema().clone();
     let table_name = schema.name.clone();
-    let scope = Scope::table(&schema, qualifier, catalog, params);
+    // SET / WHERE / RETURNING may all contain subqueries; UPDATE takes no WITH,
+    // so the CTE environment is empty.
+    let scope =
+        Scope::table(&schema, qualifier, catalog, params).with_subqueries(engine, &CteEnv::new());
 
     // SET expressions bind against the table schema: they all see the OLD
     // row, so `SET a = b, b = a` swaps.
@@ -3063,7 +3189,9 @@ pub fn bind_delete_with_params(
 
     let (table, qualifier) = open_write_relation(engine, &target.relation, WriteVerb::Delete)?;
     let schema = table.schema().clone();
-    let scope = Scope::table(&schema, qualifier, catalog, params);
+    // WHERE / RETURNING may contain subqueries; DELETE takes no WITH.
+    let scope =
+        Scope::table(&schema, qualifier, catalog, params).with_subqueries(engine, &CteEnv::new());
     let predicate = bind_where(&delete.selection, &scope)?;
     // RETURNING references the deleted (OLD) row, which the executor feeds.
     let returning = bind_returning(&delete.returning, &scope)?;
@@ -4723,13 +4851,7 @@ mod tests {
         };
         assert!(!negated);
         // The comparison template is `id = <hole>`, an equality Binary.
-        assert!(matches!(
-            *cmp,
-            BoundExpr::Binary {
-                op: BinOp::Eq,
-                ..
-            }
-        ));
+        assert!(matches!(*cmp, BoundExpr::Binary { op: BinOp::Eq, .. }));
     }
 
     #[test]
@@ -4753,6 +4875,59 @@ mod tests {
         // (Correlated subqueries are a later stage.)
         let e = bind_err("SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t WHERE id = x.id)");
         assert_eq!(e.code, "42P01");
+    }
+
+    #[test]
+    fn scalar_subquery_column_named_after_inner_column() {
+        let LogicalPlan::Values { columns, .. } = bound("SELECT (SELECT max(id) FROM t)") else {
+            panic!("expected Values");
+        };
+        assert_eq!(columns[0].name, "max");
+    }
+
+    #[test]
+    fn exists_column_named_exists() {
+        let LogicalPlan::Values { columns, .. } = bound("SELECT EXISTS (SELECT 1 FROM t)") else {
+            panic!("expected Values");
+        };
+        assert_eq!(columns[0].name, "exists");
+    }
+
+    #[test]
+    fn exists_strips_target_list_to_a_constant() -> anyhow::Result<()> {
+        // The EXISTS subplan's projection is replaced with a constant so the
+        // original target list (here a division by zero) is never evaluated.
+        let LogicalPlan::Values { rows, .. } = bound("SELECT EXISTS (SELECT id / 0 FROM t)") else {
+            panic!("expected Values");
+        };
+        let BoundExpr::Exists { subplan, .. } = &rows[0][0] else {
+            panic!("expected Exists");
+        };
+        let LogicalPlan::Query { projections, .. } = subplan.0.as_ref() else {
+            panic!("expected Query subplan");
+        };
+        assert!(matches!(projections.as_slice(), [BoundExpr::Const { .. }]));
+        Ok(())
+    }
+
+    #[test]
+    fn update_set_accepts_subquery() {
+        let LogicalPlan::Update { assignments, .. } =
+            bound("UPDATE t SET id = (SELECT max(id) FROM t)")
+        else {
+            panic!("expected Update");
+        };
+        assert!(matches!(assignments[0].1, BoundExpr::ScalarSubquery { .. }));
+    }
+
+    #[test]
+    fn delete_where_accepts_in_subquery() {
+        let LogicalPlan::Delete { predicate, .. } =
+            bound("DELETE FROM t WHERE id IN (SELECT id FROM t)")
+        else {
+            panic!("expected Delete");
+        };
+        assert!(matches!(predicate, Some(BoundExpr::InSubquery { .. })));
     }
 
     fn case_column(sql: &str) -> (OutputColumn, BoundExpr) {
