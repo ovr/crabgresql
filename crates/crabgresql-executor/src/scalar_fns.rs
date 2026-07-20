@@ -10,7 +10,10 @@
 use std::hint::black_box;
 
 use crabgresql_binder::GeoFn;
+use crabgresql_binder::JsonPathFn;
 use crabgresql_binder::ScalarFn;
+use crabgresql_types::json::Jsonb;
+use crabgresql_types::jsonpath;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
     Inet, Interval, Numeric, TimeTz, Value, bit, date, float, geo, interval, json, macaddr, money,
@@ -86,6 +89,10 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 args[0].encode_text().as_deref(),
             )));
         }
+        // The jsonpath functions are non-strict here so the `@?`/`@@` operators
+        // can pass a NULL `vars` argument; `eval_jsonpath` handles NULL target/
+        // path itself (matching PG's STRICT behavior on those two).
+        ScalarFn::JsonPath(f) => return eval_jsonpath(f, args),
         _ => {}
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -1281,6 +1288,9 @@ pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, Str
         "jsonb" => json::jsonb_in(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
+        "jsonpath" => crabgresql_types::jsonpath::jsonpath_in(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
         // Other types: not exercised; treat as valid.
         _ => Ok(()),
     }
@@ -1312,6 +1322,48 @@ fn lseg_of(v: &Value) -> [f64; 4] {
         Value::Lseg(l) => *l,
         other => unreachable!("expected lseg arg, got {other:?}"),
     }
+}
+
+/// Evaluate a `jsonb_path_*` function (or the `@?`/`@@` operators). Args are
+/// `[target jsonb, path jsonpath]` optionally followed by `[vars jsonb, silent
+/// bool]`. A NULL target or path yields NULL (PG's STRICT behavior); a NULL
+/// `vars` means "no variables". Structural errors surface with their SQLSTATE
+/// unless `silent` suppresses them (a missing-variable error always raises).
+fn eval_jsonpath(f: JsonPathFn, args: &[Value]) -> Result<Value, ExecError> {
+    let target = match &args[0] {
+        Value::Jsonb(j) => j,
+        Value::Null => return Ok(Value::Null),
+        other => unreachable!("expected jsonb target, got {other:?}"),
+    };
+    let path = match &args[1] {
+        Value::Jsonpath(p) => p,
+        Value::Null => return Ok(Value::Null),
+        other => unreachable!("expected jsonpath arg, got {other:?}"),
+    };
+    let vars = match args.get(2) {
+        Some(Value::Jsonb(v)) => Some(v),
+        _ => None,
+    };
+    let silent = matches!(args.get(3), Some(Value::Bool(true)));
+    let opt_bool = |o: Option<bool>| o.map(Value::Bool).unwrap_or(Value::Null);
+    match f {
+        JsonPathFn::Exists => {
+            jsonpath::exists(path, target, vars, silent).map(opt_bool).map_err(json_err)
+        }
+        JsonPathFn::Match => {
+            jsonpath::match_predicate(path, target, vars, silent).map(opt_bool).map_err(json_err)
+        }
+        JsonPathFn::QueryArray => jsonpath::query(path, target, vars, silent)
+            .map(|items| Value::Jsonb(Jsonb::Array(items)))
+            .map_err(json_err),
+        JsonPathFn::QueryFirst => jsonpath::query(path, target, vars, silent)
+            .map(|items| items.into_iter().next().map(Value::Jsonb).unwrap_or(Value::Null))
+            .map_err(json_err),
+    }
+}
+
+fn json_err(e: crabgresql_types::json::JsonError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
 }
 
 /// Evaluate a geometric (`point`/`lseg`) operator or function. Arguments arrive

@@ -408,6 +408,25 @@ pub enum ScalarFn {
     Setval,
     /// `lastval() -> int8`: this session's last `nextval`, for any sequence.
     Lastval,
+    // --- jsonpath (jsonb @ jsonpath) ---
+    /// A `jsonb_path_*` function / `@?` / `@@` operator. Args are
+    /// `[jsonb, jsonpath]` optionally followed by `[vars jsonb, silent bool]`;
+    /// the `@?`/`@@` operators pass a `silent = true` 4th arg.
+    JsonPath(JsonPathFn),
+}
+
+/// A SQL/JSON path query entry point. All take a `jsonb` target and a `jsonpath`;
+/// see [`ScalarFn::JsonPath`] for the argument convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonPathFn {
+    /// `jsonb_path_exists` / `jsonb @? jsonpath` (`-> boolean`).
+    Exists,
+    /// `jsonb_path_match` / `jsonb @@ jsonpath` (`-> boolean`, three-valued).
+    Match,
+    /// `jsonb_path_query_array` (`-> jsonb`, the matches wrapped in an array).
+    QueryArray,
+    /// `jsonb_path_query_first` (`-> jsonb`, the first match or NULL).
+    QueryFirst,
 }
 
 /// A geometric (`point` / `lseg`) operation. Operators lower to these via
@@ -500,6 +519,9 @@ pub enum TableFn {
     /// `generate_series(start, stop [, step])` over an integer element type
     /// (`int4` or `int8`, carried here). Yields one row per value in the range.
     GenerateSeries(PgType),
+    /// `jsonb_path_query(target jsonb, path jsonpath [, vars jsonb, silent bool])`
+    /// — one `jsonb` row per item the path returns.
+    JsonbPathQuery,
 }
 
 impl TableFn {
@@ -509,7 +531,9 @@ impl TableFn {
     fn arg_types(self) -> &'static [PgType] {
         match self {
             TableFn::PgInputErrorInfo => &[PgType::Text, PgType::Text],
-            TableFn::GenerateSeries(_) => &[],
+            // `GenerateSeries`/`JsonbPathQuery` are variadic and resolve their
+            // own arguments in `bind_table_fn_call`.
+            TableFn::GenerateSeries(_) | TableFn::JsonbPathQuery => &[],
         }
     }
 
@@ -530,6 +554,10 @@ impl TableFn {
             TableFn::GenerateSeries(elem) => vec![OutputColumn {
                 name: "generate_series".to_string(),
                 ty: elem,
+            }],
+            TableFn::JsonbPathQuery => vec![OutputColumn {
+                name: "jsonb_path_query".to_string(),
+                ty: PgType::Jsonb,
             }],
         }
     }
@@ -653,6 +681,9 @@ pub(crate) fn bind_table_fn_call(
         let (elem, args) = resolve_generate_series(&bindings)?;
         return Ok((TableFn::GenerateSeries(elem), args));
     }
+    if name == "jsonb_path_query" {
+        return Ok((TableFn::JsonbPathQuery, resolve_jsonb_path_query(&bindings)?));
+    }
     let Some(func) = lookup_table_fn(name) else {
         return Err(undefined_function(name, &bindings));
     };
@@ -735,6 +766,8 @@ const MACADDR: PgType = PgType::Macaddr;
 const MACADDR8: PgType = PgType::Macaddr8;
 const POINT: PgType = PgType::Point;
 const LSEG: PgType = PgType::Lseg;
+const JSONB: PgType = PgType::Jsonb;
+const JSONPATH: PgType = PgType::Jsonpath;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -764,6 +797,21 @@ fn lookup(name: &str) -> &'static [Signature] {
                     func: $num,
                     args: &[NUM],
                     ret: NUM,
+                },
+            ]
+        };
+    }
+    // A `jsonb_path_*` scalar's three overloads: `(jsonb, jsonpath)` plus the
+    // optional `vars jsonb` and `silent bool` arguments PG's DEFAULTs expand to.
+    macro_rules! json_path_sigs {
+        ($f:expr, $ret:expr) => {
+            &[
+                Signature { func: ScalarFn::JsonPath($f), args: &[JSONB, JSONPATH], ret: $ret },
+                Signature { func: ScalarFn::JsonPath($f), args: &[JSONB, JSONPATH, JSONB], ret: $ret },
+                Signature {
+                    func: ScalarFn::JsonPath($f),
+                    args: &[JSONB, JSONPATH, JSONB, BOOL],
+                    ret: $ret,
                 },
             ]
         };
@@ -1529,6 +1577,12 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[POINT, POINT],
             ret: BOOL,
         }],
+        // --- jsonpath query functions: each has the 2-arg form plus the
+        // optional `vars jsonb` / `silent bool` arguments PG's DEFAULTs add ---
+        "jsonb_path_exists" => json_path_sigs!(JsonPathFn::Exists, BOOL),
+        "jsonb_path_match" => json_path_sigs!(JsonPathFn::Match, BOOL),
+        "jsonb_path_query_array" => json_path_sigs!(JsonPathFn::QueryArray, JSONB),
+        "jsonb_path_query_first" => json_path_sigs!(JsonPathFn::QueryFirst, JSONB),
         _ => &[],
     }
 }
@@ -1818,7 +1872,7 @@ pub(crate) fn bind_srf_projection(
     let Some(name) = function_name(&func.name) else {
         return Ok(None);
     };
-    if name != "generate_series" {
+    if name != "generate_series" && name != "jsonb_path_query" {
         return Ok(None);
     }
     let arg_exprs = positional_args(&func.args)?;
@@ -1826,12 +1880,38 @@ pub(crate) fn bind_srf_projection(
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
+    if name == "jsonb_path_query" {
+        let args = resolve_jsonb_path_query(&bindings)?;
+        return Ok(Some(BoundExpr::Srf {
+            func: TableFn::JsonbPathQuery,
+            ret: PgType::Jsonb,
+            args,
+        }));
+    }
     let (elem, args) = resolve_generate_series(&bindings)?;
     Ok(Some(BoundExpr::Srf {
         func: TableFn::GenerateSeries(elem),
         ret: elem,
         args,
     }))
+}
+
+/// Resolve a `jsonb_path_query(target, path [, vars, silent])` call to its
+/// coerced argument list (`jsonb`, `jsonpath`, and the optional `vars jsonb` /
+/// `silent bool`). Shared by FROM-position and target-list binding.
+pub(crate) fn resolve_jsonb_path_query(bindings: &[Binding]) -> Result<Vec<BoundExpr>, BindError> {
+    let params: &[PgType] = match bindings.len() {
+        2 => &[JSONB, JSONPATH],
+        3 => &[JSONB, JSONPATH, JSONB],
+        4 => &[JSONB, JSONPATH, JSONB, BOOL],
+        _ => return Err(undefined_function("jsonb_path_query", bindings)),
+    };
+    for exact_only in [true, false] {
+        if let Some(args) = try_coerce_args(bindings, params, exact_only) {
+            return Ok(args);
+        }
+    }
+    Err(undefined_function("jsonb_path_query", bindings))
 }
 
 /// Try to coerce every binding to the signature's parameter types. When

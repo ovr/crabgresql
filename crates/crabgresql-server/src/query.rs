@@ -1997,6 +1997,7 @@ fn builtin_type_by_name(name: &str) -> Option<PgType> {
         "macaddr8" => PgType::Macaddr8,
         "json" => PgType::Json,
         "jsonb" => PgType::Jsonb,
+        "jsonpath" => PgType::Jsonpath,
         _ => return None,
     })
 }

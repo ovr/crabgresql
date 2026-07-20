@@ -12,6 +12,7 @@ pub mod float;
 pub mod geo;
 pub mod interval;
 pub mod json;
+pub mod jsonpath;
 pub mod macaddr;
 pub mod money;
 pub mod net;
@@ -70,6 +71,8 @@ pub mod oid {
     pub const JSON: u32 = 114;
     /// `jsonb`: JSON stored as a canonical binary tree. See [`crate::json`].
     pub const JSONB: u32 = 3802;
+    /// `jsonpath`: an SQL/JSON path expression. See [`crate::jsonpath`].
+    pub const JSONPATH: u32 = 4072;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +139,9 @@ pub enum PgType {
     /// `jsonb`: JSON stored as a canonical tree ([`Value::Jsonb`]). Varlena;
     /// fully ordered/hashable. See [`crate::json`].
     Jsonb,
+    /// `jsonpath`: a compiled SQL/JSON path program ([`Value::Jsonpath`]).
+    /// Varlena; no default equality/ordering. See [`crate::jsonpath`].
+    Jsonpath,
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -175,6 +181,7 @@ impl PgType {
             PgType::Lseg => oid::LSEG,
             PgType::Json => oid::JSON,
             PgType::Jsonb => oid::JSONB,
+            PgType::Jsonpath => oid::JSONPATH,
             PgType::User(oid) => oid,
         }
     }
@@ -253,6 +260,7 @@ impl PgType {
             oid::MACADDR8 => PgType::Macaddr8,
             oid::JSON => PgType::Json,
             oid::JSONB => PgType::Jsonb,
+            oid::JSONPATH => PgType::Jsonpath,
             _ => return None,
         })
     }
@@ -291,7 +299,8 @@ impl PgType {
             | PgType::Inet
             | PgType::Cidr
             | PgType::Json
-            | PgType::Jsonb => -1,
+            | PgType::Jsonb
+            | PgType::Jsonpath => -1,
             PgType::User(_) => -1,
         }
     }
@@ -330,6 +339,7 @@ impl PgType {
             PgType::Lseg => "lseg",
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
+            PgType::Jsonpath => "jsonpath",
             PgType::User(_) => "user-defined",
         }
     }
@@ -369,6 +379,7 @@ impl PgType {
             PgType::Lseg => "lseg",
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
+            PgType::Jsonpath => "jsonpath",
             PgType::User(_) => "user-defined",
         }
     }
@@ -392,7 +403,7 @@ impl PgType {
     /// including user types (enums order by ordinal), does. Must stay in sync
     /// with `crabgresql_executor::compare_values`.
     pub fn has_default_btree_opclass(self) -> bool {
-        !matches!(self, PgType::Json | PgType::Point | PgType::Lseg)
+        !matches!(self, PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg)
     }
 }
 
@@ -473,6 +484,8 @@ pub enum Value {
     Json(String),
     /// `jsonb`: a canonical parsed JSON tree. See [`crate::json`].
     Jsonb(json::Jsonb),
+    /// `jsonpath`: a compiled SQL/JSON path program. See [`crate::jsonpath`].
+    Jsonpath(jsonpath::JsonPath),
     /// A `CREATE TYPE ... AS ENUM` value. `type_oid` is the enum's type OID (so
     /// [`Value::pg_type`] reports `PgType::User(type_oid)`); `ordinal` is the
     /// 0-based position of the label in the enum's definition, which is also its
@@ -517,6 +530,7 @@ impl Value {
             Value::Lseg(_) => Some(PgType::Lseg),
             Value::Json(_) => Some(PgType::Json),
             Value::Jsonb(_) => Some(PgType::Jsonb),
+            Value::Jsonpath(_) => Some(PgType::Jsonpath),
             Value::Enum { type_oid, .. } => Some(PgType::User(*type_oid)),
         }
     }
@@ -567,6 +581,8 @@ impl Value {
             // canonical tree (`jsonb_out`).
             Value::Json(s) => Some(s.clone()),
             Value::Jsonb(j) => Some(json::format(j)),
+            // `jsonpath` prints its canonical form (`jsonpath_out`).
+            Value::Jsonpath(p) => Some(jsonpath::format(p)),
             // An enum prints as its label (PG's `enum_out`).
             Value::Enum { label, .. } => Some(label.clone()),
         }

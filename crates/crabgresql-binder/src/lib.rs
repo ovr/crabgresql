@@ -12,7 +12,7 @@ pub use expr::{
     bind_column_default, bind_expr, bind_scalar, coerce_to_column, length_typmod, map_data_type,
     param_ctx_extended, param_ctx_none, param_types, require_all_resolved,
 };
-pub use functions::{AggFn, GeoFn, ScalarFn, TableFn, lookup_table_fn};
+pub use functions::{AggFn, GeoFn, JsonPathFn, ScalarFn, TableFn, lookup_table_fn};
 pub use plan::{
     AggInput, DistinctKey, InsertSource, JoinExpr, JoinInput, JoinKind, LogicalPlan, Returning,
     SortKey,

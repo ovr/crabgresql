@@ -1475,6 +1475,7 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                 // Full regclass→oid semantics (name normalization, `::oid`) are a
                 // deliberate v1 gap.
                 Some("regclass") => PgType::Text,
+                Some("jsonpath") => PgType::Jsonpath,
                 _ => {
                     return Err(BindError::feature_not_supported(format!(
                         "type \"{dt}\" is not supported yet"
@@ -2453,6 +2454,13 @@ fn bind_binary(
         return Ok(binding);
     }
 
+    // `jsonb @? jsonpath` / `jsonb @@ jsonpath` lower to the jsonpath query
+    // functions (in silent mode). Tried before the generic mapping, which has no
+    // arm for `@?`/`@@`.
+    if let Some(binding) = resolve_jsonb_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
     let op = match op {
         ast::BinaryOperator::Eq => BinOp::Eq,
         ast::BinaryOperator::NotEq => BinOp::NotEq,
@@ -3366,6 +3374,41 @@ fn resolve_macaddr_op(
 
 /// Materialize an operand at `target`: an untyped literal is parsed as `target`,
 /// a typed operand is coerced (used for the numeric `* /` factor → float8).
+/// Lower `jsonb @? jsonpath` / `jsonb @@ jsonpath` to the jsonpath query
+/// functions. The operators run in silent mode (a structural error yields SQL
+/// NULL rather than raising), encoded as the 4-arg call form
+/// `[target, path, vars = NULL, silent = true]`. Returns `Ok(None)` when the
+/// operator isn't one of these or the left operand isn't `jsonb`.
+fn resolve_jsonb_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+) -> Result<Option<Binding>, BindError> {
+    use crate::functions::JsonPathFn;
+    let jf = match op {
+        ast::BinaryOperator::AtQuestion => JsonPathFn::Exists,
+        ast::BinaryOperator::AtAt => JsonPathFn::Match,
+        _ => return Ok(None),
+    };
+    // Only defined for a `jsonb` left operand (an untyped literal is coerced).
+    if matches!(binding_typed_ty(lb), Some(t) if t != PgType::Jsonb) {
+        return Ok(None);
+    }
+    let left = resolve_operand(lb, PgType::Jsonb)?;
+    let right = resolve_operand(rb, PgType::Jsonpath)?;
+    let args = vec![
+        left,
+        right,
+        BoundExpr::Const { value: Value::Null, ty: PgType::Jsonb },
+        BoundExpr::Const { value: Value::Bool(true), ty: PgType::Bool },
+    ];
+    Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+        func: ScalarFn::JsonPath(jf),
+        ret: PgType::Bool,
+        args,
+    })))
+}
+
 fn resolve_operand(b: &Binding, target: PgType) -> Result<BoundExpr, BindError> {
     match b {
         Binding::Typed(e) if e.ty() == target => Ok(e.clone()),
@@ -4018,6 +4061,10 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail)),
         PgType::Jsonb => crabgresql_types::json::jsonb_in(s)
             .map(Value::Jsonb)
+            .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail)),
+        // `jsonpath` parses the SQL/JSON path language into a compiled program.
+        PgType::Jsonpath => crabgresql_types::jsonpath::jsonpath_in(s)
+            .map(Value::Jsonpath)
             .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail)),
         PgType::User(_) => Err(invalid()),
     }
