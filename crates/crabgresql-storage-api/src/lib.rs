@@ -164,6 +164,68 @@ impl TableSchema {
     }
 }
 
+/// A stored sequence: the immutable definition (parameters set at `CREATE
+/// SEQUENCE`) used for reflection and `DROP`. The mutable counter
+/// (`last_value`/`is_called`) lives inside the engine and is advanced
+/// **non-transactionally** — `nextval` is never rolled back — so it is not
+/// carried here. `owned_by` names the table a `serial` column created this
+/// sequence for, so `DROP TABLE` can auto-drop it (PG's `OWNED BY`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceDefinition {
+    pub name: String,
+    /// Backing integer type: `Int2`, `Int4`, or `Int8`.
+    pub data_type: PgType,
+    pub start: i64,
+    pub increment: i64,
+    pub min: i64,
+    pub max: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    pub owned_by: Option<String>,
+}
+
+impl SequenceDefinition {
+    /// Compute `nextval` from the current counter state (`last_value`,
+    /// `is_called`). Both engines keep that pair and call this so the min/max/
+    /// cycle arithmetic stays identical. On success the caller stores the
+    /// returned value as the new `last_value` with `is_called = true`.
+    pub fn next_value(&self, last_value: i64, is_called: bool) -> SequenceAdvance {
+        // When the sequence has not been "called" yet, `nextval` returns the
+        // current value unadvanced: `last_value` is seeded to `start` at
+        // creation and set directly by `setval(x, false)`.
+        if !is_called {
+            return SequenceAdvance::Value(last_value);
+        }
+        let ascending = self.increment > 0;
+        match last_value.checked_add(self.increment) {
+            Some(next) if ascending && next <= self.max => SequenceAdvance::Value(next),
+            Some(next) if !ascending && next >= self.min => SequenceAdvance::Value(next),
+            // Out of range (or i64 wrap): cycle wraps to the far bound, otherwise
+            // it is a hard overflow/underflow.
+            _ if self.cycle => {
+                SequenceAdvance::Value(if ascending { self.min } else { self.max })
+            }
+            _ if ascending => SequenceAdvance::Overflow,
+            _ => SequenceAdvance::Underflow,
+        }
+    }
+}
+
+/// Outcome of [`TableEngine::sequence_nextval`] / [`TableEngine::sequence_setval`].
+/// The server maps the failure variants to SQLSTATEs, keeping this crate free of
+/// the wire-protocol dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SequenceAdvance {
+    /// The new current value.
+    Value(i64),
+    /// No sequence by that name exists.
+    NotFound,
+    /// An ascending sequence hit `max` with `NO CYCLE`.
+    Overflow,
+    /// A descending sequence hit `min` with `NO CYCLE`.
+    Underflow,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("relation \"{0}\" already exists")]
@@ -385,6 +447,45 @@ pub trait TableEngine: Send + Sync {
     /// (CASCADE/RESTRICT) checks. The default is empty.
     fn views(&self) -> Vec<ViewDefinition> {
         Vec::new()
+    }
+
+    /// Register a sequence. `TableAlreadyExists` on a name collision (the caller
+    /// handles `IF NOT EXISTS`). The default rejects it — only an engine that
+    /// keeps a sequence registry (memory, heap) overrides this.
+    fn create_sequence(&self, def: SequenceDefinition) -> Result<(), StorageError> {
+        Err(StorageError::TableNotFound(def.name))
+    }
+
+    /// Remove a sequence. `TableNotFound` if absent. The default knows none.
+    fn drop_sequence(&self, name: &str) -> Result<(), StorageError> {
+        Err(StorageError::TableNotFound(name.to_string()))
+    }
+
+    /// The immutable definition of a sequence, or `None` if there is none by
+    /// that name. The default knows no sequences.
+    fn sequence(&self, _name: &str) -> Option<SequenceDefinition> {
+        None
+    }
+
+    /// Enumerate the engine's sequences for catalog reflection and owned-drop.
+    /// The default is empty.
+    fn sequences(&self) -> Vec<SequenceDefinition> {
+        Vec::new()
+    }
+
+    /// Advance a sequence and return its new value (`nextval`). This mutates
+    /// **non-transactional** counter state and, on the durable engine, persists
+    /// immediately — it is not tied to the caller's transaction and survives
+    /// `ROLLBACK`. The default knows no sequences.
+    fn sequence_nextval(&self, _name: &str) -> SequenceAdvance {
+        SequenceAdvance::NotFound
+    }
+
+    /// Set a sequence's current value (`setval`). With `is_called = true` the
+    /// next `nextval` returns `value + increment`; with `false` it returns
+    /// `value`. Non-transactional, like [`TableEngine::sequence_nextval`].
+    fn sequence_setval(&self, _name: &str, _value: i64, _is_called: bool) -> SequenceAdvance {
+        SequenceAdvance::NotFound
     }
 }
 

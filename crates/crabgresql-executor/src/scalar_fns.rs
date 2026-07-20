@@ -94,6 +94,15 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
     match func {
         // --- geometric (point / lseg) ---
         ScalarFn::Geo(g) => return eval_geo(g, args),
+        // Sequence functions are side-effecting and are dispatched by `eval`
+        // (which has the session's SequenceOps handle) before it ever reaches
+        // this pure evaluator; seeing one here is an internal wiring error.
+        ScalarFn::Nextval | ScalarFn::Currval | ScalarFn::Setval | ScalarFn::Lastval => {
+            return Err(ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                "sequence function reached the pure scalar evaluator",
+            ));
+        }
         // --- string functions ---
         ScalarFn::TextConcat => {
             return Ok(Value::Text(format!("{}{}", text(&args[0]), text(&args[1]))));

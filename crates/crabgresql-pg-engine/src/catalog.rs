@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableSchema, ViewDefinition,
+    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, SequenceAdvance,
+    SequenceDefinition, TableSchema, ViewDefinition,
 };
 use crabgresql_types::{PgType, oid};
 
@@ -24,6 +25,9 @@ const META_MAGIC: &[u8; 4] = b"CRM1";
 /// block it is a backward-compatible tail: a reader that predates views stops
 /// after the metadata and ignores it.
 const VIEW_MAGIC: &[u8; 4] = b"CVW1";
+/// Marks the sequence section, appended after the [`VIEW_MAGIC`] block — a third
+/// backward-compatible tail. A pre-sequence reader stops above and never sees it.
+const SEQ_MAGIC: &[u8; 4] = b"CSQ1";
 
 struct PersistCol {
     name: String,
@@ -52,10 +56,29 @@ struct PersistView {
     depends_on: Vec<String>,
 }
 
+/// A persisted sequence: its immutable definition plus its live, **non-
+/// transactional** counter (`last_value`/`is_called`), which is rewritten to disk
+/// on every `nextval`/`setval` — independent of transaction commit, so it
+/// survives `ROLLBACK`. Sequences hold no relfilenode and no heap storage.
+struct PersistSequence {
+    name: String,
+    type_oid: u32,
+    start: i64,
+    increment: i64,
+    min: i64,
+    max: i64,
+    cache: i64,
+    cycle: bool,
+    owned_by: Option<String>,
+    last_value: i64,
+    is_called: bool,
+}
+
 struct State {
     next: u32,
     rels: Vec<PersistRel>,
     views: Vec<PersistView>,
+    sequences: Vec<PersistSequence>,
 }
 
 pub struct RelCatalog {
@@ -74,6 +97,7 @@ impl RelCatalog {
                 next: FIRST_RELFILENODE,
                 rels: Vec::new(),
                 views: Vec::new(),
+                sequences: Vec::new(),
             },
             Err(e) => return Err(e),
         };
@@ -349,6 +373,129 @@ impl RelCatalog {
             .map(persist_view_to_definition)
     }
 
+    /// Whether a sequence named `name` exists.
+    pub fn contains_sequence(&self, name: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .sequences
+            .iter()
+            .any(|s| s.name == name)
+    }
+
+    /// Register a sequence and persist. Returns `false` (without persisting) if a
+    /// sequence of that name already exists. The counter starts uncalled, so the
+    /// first `nextval` returns `start`.
+    pub fn create_sequence(&self, def: &SequenceDefinition) -> std::io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        if state.sequences.iter().any(|s| s.name == def.name) {
+            return Ok(false);
+        }
+        state.sequences.push(PersistSequence {
+            name: def.name.clone(),
+            type_oid: def.data_type.oid(),
+            start: def.start,
+            increment: def.increment,
+            min: def.min,
+            max: def.max,
+            cache: def.cache,
+            cycle: def.cycle,
+            owned_by: def.owned_by.clone(),
+            // Seed the counter at `start`; the first `nextval` returns it.
+            last_value: def.start,
+            is_called: false,
+        });
+        self.persist(&state)?;
+        Ok(true)
+    }
+
+    /// Remove a sequence and persist. Returns `false` if it was not present.
+    pub fn remove_sequence(&self, name: &str) -> std::io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(pos) = state.sequences.iter().position(|s| s.name == name) else {
+            return Ok(false);
+        };
+        state.sequences.remove(pos);
+        self.persist(&state)?;
+        Ok(true)
+    }
+
+    /// Every stored sequence definition, for catalog reflection and owned-drop.
+    pub fn sequences(&self) -> Vec<SequenceDefinition> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
+            .sequences
+            .iter()
+            .map(persist_sequence_to_definition)
+            .collect()
+    }
+
+    /// A single sequence's definition, or `None` if absent.
+    pub fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
+            .sequences
+            .iter()
+            .find(|s| s.name == name)
+            .map(persist_sequence_to_definition)
+    }
+
+    /// Advance a sequence (`nextval`) and persist the new counter immediately —
+    /// outside any transaction, so the advance survives `ROLLBACK`. Returns the
+    /// new value, or `NotFound`/`Overflow`/`Underflow` without mutating.
+    pub fn advance_sequence(&self, name: &str) -> std::io::Result<SequenceAdvance> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(seq) = state.sequences.iter().position(|s| s.name == name) else {
+            return Ok(SequenceAdvance::NotFound);
+        };
+        let advance = {
+            let def = persist_sequence_to_definition(&state.sequences[seq]);
+            def.next_value(state.sequences[seq].last_value, state.sequences[seq].is_called)
+        };
+        if let SequenceAdvance::Value(v) = advance {
+            state.sequences[seq].last_value = v;
+            state.sequences[seq].is_called = true;
+            self.persist(&state)?;
+        }
+        Ok(advance)
+    }
+
+    /// Set a sequence's counter (`setval`) and persist immediately. Returns the
+    /// new value, or `NotFound` without mutating.
+    pub fn set_sequence(
+        &self,
+        name: &str,
+        value: i64,
+        is_called: bool,
+    ) -> std::io::Result<SequenceAdvance> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(seq) = state.sequences.iter_mut().find(|s| s.name == name) else {
+            return Ok(SequenceAdvance::NotFound);
+        };
+        seq.last_value = value;
+        seq.is_called = is_called;
+        self.persist(&state)?;
+        Ok(SequenceAdvance::Value(value))
+    }
+
     fn persist(&self, state: &State) -> std::io::Result<()> {
         let bytes = encode(state);
         let tmp = self.path.with_extension("tmp");
@@ -384,6 +531,10 @@ fn put_opt_str(out: &mut Vec<u8>, value: &Option<String>) {
         }
         None => out.push(0),
     }
+}
+
+fn put_i64(out: &mut Vec<u8>, v: i64) {
+    out.extend_from_slice(&v.to_le_bytes());
 }
 
 fn encode(state: &State) -> Vec<u8> {
@@ -456,6 +607,22 @@ fn encode(state: &State) -> Vec<u8> {
             put_opt_str(&mut out, &c.default);
         }
     }
+    // Sequences: a third backward-compatible tail after the view block.
+    out.extend_from_slice(SEQ_MAGIC);
+    out.extend_from_slice(&(state.sequences.len() as u32).to_le_bytes());
+    for s in &state.sequences {
+        put_str(&mut out, &s.name);
+        out.extend_from_slice(&s.type_oid.to_le_bytes());
+        put_i64(&mut out, s.start);
+        put_i64(&mut out, s.increment);
+        put_i64(&mut out, s.min);
+        put_i64(&mut out, s.max);
+        put_i64(&mut out, s.cache);
+        out.push(u8::from(s.cycle));
+        put_opt_str(&mut out, &s.owned_by);
+        put_i64(&mut out, s.last_value);
+        out.push(u8::from(s.is_called));
+    }
     out
 }
 
@@ -472,6 +639,11 @@ impl<'a> Dec<'a> {
     fn i32(&mut self) -> i32 {
         let v = i32::from_le_bytes(self.array());
         self.p += 4;
+        v
+    }
+    fn i64(&mut self) -> i64 {
+        let v = i64::from_le_bytes(self.array());
+        self.p += 8;
         v
     }
     fn s(&mut self) -> String {
@@ -627,7 +799,58 @@ fn decode(bytes: &[u8]) -> State {
             });
         }
     }
-    State { next, rels, views }
+    let mut sequences = Vec::new();
+    if d.remaining().starts_with(SEQ_MAGIC) {
+        d.p += SEQ_MAGIC.len();
+        let nseqs = d.u32();
+        for _ in 0..nseqs {
+            let name = d.s();
+            let type_oid = d.u32();
+            let start = d.i64();
+            let increment = d.i64();
+            let min = d.i64();
+            let max = d.i64();
+            let cache = d.i64();
+            let cycle = d.byte() != 0;
+            let owned_by = d.opt_s();
+            let last_value = d.i64();
+            let is_called = d.byte() != 0;
+            sequences.push(PersistSequence {
+                name,
+                type_oid,
+                start,
+                increment,
+                min,
+                max,
+                cache,
+                cycle,
+                owned_by,
+                last_value,
+                is_called,
+            });
+        }
+    }
+    State {
+        next,
+        rels,
+        views,
+        sequences,
+    }
+}
+
+/// Reconstruct a [`SequenceDefinition`] from its persisted form.
+fn persist_sequence_to_definition(s: &PersistSequence) -> SequenceDefinition {
+    SequenceDefinition {
+        name: s.name.clone(),
+        data_type: pgtype_from_oid(s.type_oid),
+        start: s.start,
+        increment: s.increment,
+        min: s.min,
+        max: s.max,
+        cache: s.cache,
+        cycle: s.cycle,
+        owned_by: s.owned_by.clone(),
+    }
 }
 
 /// Reconstruct a [`ViewDefinition`] from its persisted form.
@@ -811,6 +1034,73 @@ mod tests {
         std::fs::write(&path, &bytes[..tail])?;
         let legacy = RelCatalog::load(dir.path())?;
         assert!(legacy.views().is_empty());
+        assert_eq!(legacy.schemas().len(), 1);
+
+        Ok(())
+    }
+
+    fn seq(name: &str) -> SequenceDefinition {
+        SequenceDefinition {
+            name: name.to_string(),
+            data_type: PgType::Int8,
+            start: 1,
+            increment: 1,
+            min: 1,
+            max: i64::MAX,
+            cache: 1,
+            cycle: false,
+            owned_by: None,
+        }
+    }
+
+    #[test]
+    fn sequences_round_trip_and_counter_survives_reload() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        assert!(catalog.create_sequence(&seq("s"))?);
+        // A duplicate is rejected without persisting.
+        assert!(!catalog.create_sequence(&seq("s"))?);
+        // Advance a few times: first nextval yields start (1), then +increment.
+        assert_eq!(catalog.advance_sequence("s")?, SequenceAdvance::Value(1));
+        assert_eq!(catalog.advance_sequence("s")?, SequenceAdvance::Value(2));
+        assert_eq!(catalog.advance_sequence("missing")?, SequenceAdvance::NotFound);
+        drop(catalog);
+
+        // Reload: the definition and the advanced counter both survive.
+        let loaded = RelCatalog::load(dir.path())?;
+        let seqs = loaded.sequences();
+        assert_eq!(seqs.len(), 1);
+        assert_eq!(seqs[0].name, "s");
+        assert_eq!(seqs[0].data_type, PgType::Int8);
+        // nextval continues past the persisted counter, not from start again.
+        assert_eq!(loaded.advance_sequence("s")?, SequenceAdvance::Value(3));
+        // setval resets it; the following nextval reflects is_called.
+        assert_eq!(loaded.set_sequence("s", 10, true)?, SequenceAdvance::Value(10));
+        assert_eq!(loaded.advance_sequence("s")?, SequenceAdvance::Value(11));
+        assert!(loaded.remove_sequence("s")?);
+        assert!(!loaded.remove_sequence("s")?);
+        drop(loaded);
+        let reloaded = RelCatalog::load(dir.path())?;
+        assert!(reloaded.sequences().is_empty());
+
+        // A pre-sequence catalog file (truncated at the sequence marker) still
+        // loads, with no sequences.
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema {
+            name: "t".to_string(),
+            columns: vec![Column::new("id", PgType::Int4)],
+        })?;
+        catalog.create_sequence(&seq("s2"))?;
+        drop(catalog);
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(SEQ_MAGIC.len())
+            .position(|w| w == SEQ_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("sequence marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        assert!(legacy.sequences().is_empty());
         assert_eq!(legacy.schemas().len(), 1);
 
         Ok(())

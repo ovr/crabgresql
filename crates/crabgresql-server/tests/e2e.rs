@@ -3103,3 +3103,45 @@ async fn temp_table_shadows_same_named_view() -> anyhow::Result<()> {
     assert_eq!(rows(&messages)[0].get("b"), Some("5"));
     Ok(())
 }
+
+/// A serial column auto-assigns from an owned sequence, and the sequence reflects
+/// into the catalogs as relkind 'S' / pg_sequence and is auto-dropped with the
+/// table. Covers the headline `serial PRIMARY KEY` case end to end.
+#[tokio::test]
+async fn serial_column_and_sequence_reflection() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query("CREATE TABLE t (id serial PRIMARY KEY, name text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t (name) VALUES ('a'), ('b')")
+        .await?;
+    client.simple_query("INSERT INTO t (name) VALUES ('c')").await?;
+    let id_msgs = client.simple_query("SELECT id FROM t ORDER BY id").await?;
+    let ids: Vec<Option<&str>> = rows(&id_msgs).iter().map(|r| r.get("id")).collect();
+    assert_eq!(ids, vec![Some("1"), Some("2"), Some("3")]);
+
+    // The owned sequence reflects as relkind 'S'.
+    let msgs = client
+        .simple_query("SELECT relkind FROM pg_class WHERE relname = 't_id_seq'")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("relkind"), Some("S"));
+
+    // DROP TABLE auto-drops the owned sequence.
+    client.simple_query("DROP TABLE t").await?;
+    let msgs = client
+        .simple_query("SELECT count(*) AS c FROM pg_class WHERE relname = 't_id_seq'")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("c"), Some("0"));
+
+    // currval before nextval in a session is 55000.
+    client.simple_query("CREATE SEQUENCE s").await?;
+    let err = client.simple_query("SELECT currval('s')").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+    );
+    Ok(())
+}

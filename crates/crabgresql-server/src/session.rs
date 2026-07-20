@@ -4,15 +4,15 @@
 //! snapshot MVCC runs against) are tracked side by side.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crabgresql_executor::{ExecContext, ExecNode, OutputColumn};
+use crabgresql_executor::{ExecContext, ExecError, ExecNode, OutputColumn, SequenceOps};
 
 use crate::query::RowTag;
 use crabgresql_memory_storage::MemoryEngine;
 use crabgresql_parser::ast;
-use crabgresql_pg_wire::{Format, TransactionStatus};
-use crabgresql_storage_api::TableEngine;
+use crabgresql_pg_wire::{Format, TransactionStatus, sqlstate};
+use crabgresql_storage_api::{SequenceAdvance, TableEngine};
 use crabgresql_txn::{CommandId, IsolationLevel, LockOwner, Snapshot, TransactionManager, Xid};
 use crabgresql_types::{PgType, Value};
 
@@ -145,6 +145,122 @@ pub struct Session {
     pub prepared: HashMap<String, PreparedStatement>,
     /// Extended-protocol portals, keyed by name (`""` = the unnamed portal).
     pub portals: HashMap<String, Portal>,
+    /// Per-session `currval`/`lastval` state, updated by `nextval`/`setval`.
+    /// Shared behind an `Arc<Mutex<_>>` so a [`SessionSequences`] handle (which
+    /// the executor holds through [`ExecContext`], possibly in a suspended
+    /// portal) can reach it without borrowing the session.
+    pub seq_state: Arc<Mutex<SessionSeqState>>,
+}
+
+/// A session's `currval`/`lastval` state. `nextval`/`setval` write it; `currval`/
+/// `lastval` read it. Keyed by the (short) sequence name.
+#[derive(Default)]
+pub struct SessionSeqState {
+    currval: HashMap<String, i64>,
+    lastval: Option<i64>,
+}
+
+/// The executor-facing sequence handle: routes `nextval`/`setval` to the engine's
+/// non-transactional counters and maintains this session's `currval`/`lastval`.
+/// Owns its `Arc`s so it can live in a suspended portal's [`ExecContext`].
+pub struct SessionSequences {
+    engine: Arc<dyn TableEngine>,
+    state: Arc<Mutex<SessionSeqState>>,
+}
+
+impl SessionSequences {
+    pub fn new(engine: Arc<dyn TableEngine>, state: Arc<Mutex<SessionSeqState>>) -> Self {
+        Self { engine, state }
+    }
+
+    /// Map the engine's `NotFound` to PG's 42P01 for a sequence name.
+    fn not_found(name: &str) -> ExecError {
+        ExecError::new(
+            sqlstate::UNDEFINED_TABLE,
+            format!("relation \"{name}\" does not exist"),
+        )
+    }
+
+    /// Build the 2200H message for a `NO CYCLE` bound, quoting the bound value as
+    /// PostgreSQL does.
+    fn limit_error(&self, name: &str, ascending: bool) -> ExecError {
+        let bound = self.engine.sequence(name).map(|def| {
+            if ascending {
+                def.max
+            } else {
+                def.min
+            }
+        });
+        let (edge, value) = if ascending {
+            ("maximum", bound.unwrap_or(i64::MAX))
+        } else {
+            ("minimum", bound.unwrap_or(i64::MIN))
+        };
+        ExecError::new(
+            sqlstate::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
+            format!("nextval: reached {edge} value of sequence \"{name}\" ({value})"),
+        )
+    }
+}
+
+impl SequenceOps for SessionSequences {
+    fn nextval(&self, name: &str) -> Result<i64, ExecError> {
+        match self.engine.sequence_nextval(name) {
+            SequenceAdvance::Value(v) => {
+                let mut state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+                state.currval.insert(name.to_string(), v);
+                state.lastval = Some(v);
+                Ok(v)
+            }
+            SequenceAdvance::NotFound => Err(Self::not_found(name)),
+            SequenceAdvance::Overflow => Err(self.limit_error(name, true)),
+            SequenceAdvance::Underflow => Err(self.limit_error(name, false)),
+        }
+    }
+
+    fn currval(&self, name: &str) -> Result<i64, ExecError> {
+        let state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+        if let Some(v) = state.currval.get(name) {
+            return Ok(*v);
+        }
+        // Not yet advanced in this session: a non-existent sequence is 42P01,
+        // an existing-but-unused one is 55000.
+        if self.engine.sequence(name).is_none() {
+            Err(Self::not_found(name))
+        } else {
+            Err(ExecError::new(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                format!("currval of sequence \"{name}\" is not yet defined in this session"),
+            ))
+        }
+    }
+
+    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, ExecError> {
+        match self.engine.sequence_setval(name, value, is_called) {
+            SequenceAdvance::Value(v) => {
+                let mut state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+                state.currval.insert(name.to_string(), v);
+                state.lastval = Some(v);
+                Ok(v)
+            }
+            SequenceAdvance::NotFound => Err(Self::not_found(name)),
+            // setval does not advance, so it cannot overflow.
+            _ => Err(Self::not_found(name)),
+        }
+    }
+
+    fn lastval(&self) -> Result<i64, ExecError> {
+        self.state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .lastval
+            .ok_or_else(|| {
+                ExecError::new(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "lastval is not yet defined in this session",
+                )
+            })
+    }
 }
 
 impl Session {
@@ -170,12 +286,29 @@ impl Session {
             temp: Arc::new(MemoryEngine::new()),
             prepared: HashMap::new(),
             portals: HashMap::new(),
+            seq_state: Arc::new(Mutex::new(SessionSeqState::default())),
         }
     }
 
+    /// The execution context with no sequence handle — for utility paths (e.g.
+    /// `EXPLAIN`'s `Values` node) that never call a sequence function.
     pub fn exec_context(&self) -> ExecContext {
         ExecContext {
             extra_float_digits: self.extra_float_digits,
+            sequences: None,
+        }
+    }
+
+    /// The execution context wired to advance sequences through `engine`, used
+    /// for the statement-execution path (so a `nextval` default or an explicit
+    /// `nextval()` can run and update this session's `currval`/`lastval`).
+    pub fn exec_context_with_sequences(&self, engine: &Arc<dyn TableEngine>) -> ExecContext {
+        ExecContext {
+            extra_float_digits: self.extra_float_digits,
+            sequences: Some(Arc::new(SessionSequences::new(
+                Arc::clone(engine),
+                Arc::clone(&self.seq_state),
+            ))),
         }
     }
 }

@@ -145,6 +145,50 @@ async fn committed_data_survives_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A sequence's counter is non-transactional (a ROLLBACK does not rewind it) and
+/// durable (its advanced position survives a full server restart).
+#[tokio::test]
+async fn sequence_counter_is_nontransactional_and_survives_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Boot 1: create, advance, and prove ROLLBACK does not rewind the counter.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client.simple_query("CREATE SEQUENCE s").await?;
+        let one = rows(&client.simple_query("SELECT nextval('s')").await?)[0]
+            .get(0)
+            .map(str::to_string);
+        assert_eq!(one.as_deref(), Some("1"));
+        client.simple_query("BEGIN").await?;
+        let two = rows(&client.simple_query("SELECT nextval('s')").await?)[0]
+            .get(0)
+            .map(str::to_string);
+        assert_eq!(two.as_deref(), Some("2"));
+        client.simple_query("ROLLBACK").await?;
+        // The rolled-back advance is NOT undone: the next value is 3, not 2.
+        let three = rows(&client.simple_query("SELECT nextval('s')").await?)[0]
+            .get(0)
+            .map(str::to_string);
+        assert_eq!(three.as_deref(), Some("3"));
+        shutdown(client, handle).await;
+    }
+
+    // Boot 2 over the same directory: the counter resumes past its persisted
+    // value (4), not from the start again.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let four = rows(&client.simple_query("SELECT nextval('s')").await?)[0]
+            .get(0)
+            .map(str::to_string);
+        assert_eq!(four.as_deref(), Some("4"));
+        shutdown(client, handle).await;
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn writes_after_a_restart_survive_the_next_restart() -> anyhow::Result<()> {
     // Regression for the WAL-append-after-reopen corruption: the second boot must
