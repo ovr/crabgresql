@@ -771,7 +771,12 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         ast::Expr::CompoundIdentifier(parts) => bind_compound(parts, scope).map(Binding::Typed),
         ast::Expr::Nested(inner) => bind_expr(inner, scope),
         ast::Expr::UnaryOp { op, expr } => bind_unary(*op, expr, scope),
-        ast::Expr::BinaryOp { left, op, right } => bind_binary(left, op, right, scope),
+        ast::Expr::BinaryOp {
+            left,
+            op,
+            right,
+            op_span,
+        } => bind_binary(left, op, right, op_span.0, scope),
         ast::Expr::IsNull(inner) => bind_is_null(inner, scope, false),
         ast::Expr::IsNotNull(inner) => bind_is_null(inner, scope, true),
         ast::Expr::Cast {
@@ -1802,10 +1807,7 @@ fn no_op_unary(sym: &str, ty: &str) -> BindError {
 }
 
 fn ambiguous_unary(sym: &str) -> BindError {
-    BindError::new(
-        sqlstate::AMBIGUOUS_FUNCTION,
-        format!("operator is not unique: {sym} unknown"),
-    )
+    ambiguous_operator_msg(format!("operator is not unique: {sym} unknown"))
 }
 
 fn bind_unary(
@@ -2022,7 +2024,7 @@ fn bind_case(
             None => to_bool_operand(bind_expr(&when.condition, scope)?, "CASE/WHEN")?,
             Some(op) => {
                 let value = bind_expr(&when.condition, scope)?;
-                match bind_binary_op(BinOp::Eq, op.clone(), value, scope.catalog().as_ref())? {
+                match bind_binary_op(BinOp::Eq, op.clone(), value, Span::empty(), scope.catalog().as_ref())? {
                     Binding::Typed(e) => e,
                     // `=` always resolves to a typed boolean expression.
                     Binding::Unknown { .. } => unreachable!("= yields a typed bool"),
@@ -2112,11 +2114,12 @@ fn bind_in_list(
             Some(ty) => Binding::Typed(resolve_operand(item, ty)?),
             None => item.clone(),
         };
-        let comparison = bind_binary_op(cmp, left.clone(), right, scope.catalog().as_ref())?;
+        let comparison =
+            bind_binary_op(cmp, left.clone(), right, Span::empty(), scope.catalog().as_ref())?;
         acc = Some(match acc {
             None => comparison,
             Some(prev) => {
-                bind_binary_op(chain, prev, comparison, scope.catalog().as_ref())?
+                bind_binary_op(chain, prev, comparison, Span::empty(), scope.catalog().as_ref())?
             }
         });
     }
@@ -2162,6 +2165,7 @@ fn bind_binary(
     left: &ast::Expr,
     op: &ast::BinaryOperator,
     right: &ast::Expr,
+    op_span: Span,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     // `||` is not a `BinOp`; PG's `textcat`/`anytextcat` lower to a text concat,
@@ -2261,17 +2265,20 @@ fn bind_binary(
             )));
         }
     };
-    bind_binary_op(op, lb, rb, scope.catalog().as_ref())
+    bind_binary_op(op, lb, rb, op_span, scope.catalog().as_ref())
 }
 
 /// Resolve a binary operator over two already-bound operands. Split out from
 /// `bind_binary` so a simple `CASE operand WHEN v` can reuse the exact `=`
 /// resolution (unknown-literal handling, numeric promotion, "operator does not
-/// exist" errors) that a written `operand = v` gets.
+/// exist" errors) that a written `operand = v` gets. `op_span` locates the
+/// operator token for an error cursor (`Span::empty()` when the caller has no
+/// written operator, e.g. `CASE`/chained comparisons).
 pub(crate) fn bind_binary_op(
     op: BinOp,
     lb: Binding,
     rb: Binding,
+    op_span: Span,
     catalog: &dyn TypeCatalog,
 ) -> Result<Binding, BindError> {
     if op.is_logic() {
@@ -2294,7 +2301,7 @@ pub(crate) fn bind_binary_op(
     // interval`, `interval * / number`) doesn't fit the single-`arg_ty` `Binary`
     // node, so it lowers to a function call. Comparisons and same-type cases fall
     // through to the generic path below.
-    if let Some(binding) = resolve_temporal(op, &lb, &rb)? {
+    if let Some(binding) = resolve_temporal(op, &lb, &rb, op_span)? {
         return Ok(binding);
     }
 
@@ -2342,13 +2349,9 @@ pub(crate) fn bind_binary_op(
             if op.is_arithmetic() {
                 // Every numeric type offers the operator; unknown operands
                 // cannot pick one — PG reports ambiguity.
-                return Err(BindError::new(
-                    sqlstate::AMBIGUOUS_FUNCTION,
-                    format!(
-                        "operator is not unique: unknown {} unknown",
-                        op.sql_symbol()
-                    ),
-                ));
+                return Err(
+                    ambiguous_operator("unknown", op.sql_symbol(), "unknown").at(op_span)
+                );
             }
             // Comparing two untyped literals: PG falls back to text.
             (
@@ -2399,8 +2402,14 @@ pub(crate) fn bind_binary_op(
 /// let the generic (same-type / comparison) path handle it — including the
 /// `operator does not exist` error for combinations with no operator (e.g.
 /// `interval * interval`). An untyped literal opposite a temporal operand takes
-/// the partner type: interval for `±`, float8 for the `* /` factor.
-fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Binding>, BindError> {
+/// the partner type: interval for `±`, float8 for the `* /` factor. `op_span`
+/// locates the operator for the one ambiguity this owns (`time + time`).
+fn resolve_temporal(
+    op: BinOp,
+    lb: &Binding,
+    rb: &Binding,
+    op_span: Span,
+) -> Result<Option<Binding>, BindError> {
     if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
         return Ok(None);
     }
@@ -2490,6 +2499,15 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             (Some(I), Some(TI)) => call(ScalarFn::TimePlInterval, TI, typed(rb), typed(lb)),
             (Some(TZ), Some(I)) => call(ScalarFn::TimeTzPlInterval, TZ, typed(lb), typed(rb)),
             (Some(I), Some(TZ)) => call(ScalarFn::TimeTzPlInterval, TZ, typed(rb), typed(lb)),
+            // `time + time`: PG reaches several candidate `+` operators via
+            // implicit casts and can't pick a best one — ambiguous (42725), not
+            // "does not exist". Unique to `time`: `timetz + timetz`, `date +
+            // date`, `timestamp[tz] + timestamp[tz]` all stay 42883 (verified
+            // against PG), so no other same-type add gets this treatment.
+            (Some(TI), Some(TI)) => {
+                let name = PgType::Time.name();
+                Err(ambiguous_operator(name, "+", name).at(op_span))
+            }
             _ => Ok(None),
         },
         BinOp::Sub => match (lt, rt) {
@@ -3478,6 +3496,21 @@ fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
             op.sql_symbol()
         ),
     )
+}
+
+/// PG reports 42725 (with DETAIL/HINT) when more than one candidate operator
+/// matches and none is clearly best — as opposed to `no_operator`'s 42883 when
+/// no candidate exists at all. Every 42725 site shares the same DETAIL/HINT.
+fn ambiguous_operator_msg(message: String) -> BindError {
+    BindError::new(sqlstate::AMBIGUOUS_FUNCTION, message)
+        .with_detail(Some("Could not choose a best candidate operator.".to_string()))
+        .with_hint(Some(
+            "You might need to add explicit type casts.".to_string(),
+        ))
+}
+
+fn ambiguous_operator(left: &str, sym: &str, right: &str) -> BindError {
+    ambiguous_operator_msg(format!("operator is not unique: {left} {sym} {right}"))
 }
 
 /// Settle two typed operands on a common type: exact match, or numeric
