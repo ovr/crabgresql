@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crabgresql_executor::OutputColumn;
+use crabgresql_parser::ast;
 use crabgresql_pg_wire::{
-    BackendMessage, BackendWriter, FieldDescription, Format, FrontendMessage, FrontendReader,
-    ProtocolError, StartupRequest, Target, TransactionStatus, sqlstate,
+    BackendMessage, BackendWriter, CopyResponse, FieldDescription, Format, FrontendMessage,
+    FrontendReader, ProtocolError, StartupRequest, Target, TransactionStatus, sqlstate,
 };
 use crabgresql_storage_api::TableEngine;
 use crabgresql_txn::TransactionManager;
@@ -18,7 +19,7 @@ use crate::error::PgError;
 use crate::global_catalog::GlobalCatalog;
 use crate::query::{
     Analyzed, BoundParams, Notice, NoticeSeverity, QueryResult, analyze_statement,
-    execute_statement,
+    execute_statement, prepare_copy_from, run_copy_insert,
 };
 use crate::session::{Portal, PreparedStatement, Session, SuspendedRows};
 
@@ -119,8 +120,16 @@ pub async fn handle_connection(
             // Between an error and the next Sync, every message is dropped.
             Some(_) if skip_until_sync => {}
             Some(FrontendMessage::Query(sql)) => {
-                run_simple_query(&sql, &engine, &catalog, &txnmgr, &mut session, &mut writer)
-                    .await?;
+                run_simple_query(
+                    &sql,
+                    &engine,
+                    &catalog,
+                    &txnmgr,
+                    &mut session,
+                    &mut writer,
+                    &mut reader,
+                )
+                .await?;
                 writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
@@ -181,22 +190,50 @@ pub async fn handle_connection(
                 );
             }
             Some(FrontendMessage::Execute { portal, max_rows }) => {
-                let outcome = handle_execute(
-                    &engine,
-                    &catalog,
-                    &txnmgr,
-                    &mut session,
-                    &mut writer,
-                    &portal,
-                    max_rows,
-                );
-                report(
-                    &mut writer,
-                    &mut session,
-                    &mut skip_until_sync,
-                    outcome,
-                    None,
-                );
+                // COPY FROM STDIN needs the socket (to read CopyData frames),
+                // which the pure execute path lacks — drive it here, where the
+                // reader is in scope and errors are ProtocolError. Any other
+                // statement goes through the normal buffered-reply path.
+                if let Some(copy_stmt) = copy_portal_statement(&session, &portal) {
+                    match copy_in_stream(
+                        &engine,
+                        &catalog,
+                        &txnmgr,
+                        &mut session,
+                        &mut writer,
+                        &mut reader,
+                        &copy_stmt,
+                    )
+                    .await?
+                    {
+                        CopyOutcome::Loaded(n) => writer.command_complete(&format!("COPY {n}")),
+                        CopyOutcome::ConnectionClosed => return Ok(()),
+                        CopyOutcome::Failed(e) => report(
+                            &mut writer,
+                            &mut session,
+                            &mut skip_until_sync,
+                            Err(e),
+                            None,
+                        ),
+                    }
+                } else {
+                    let outcome = handle_execute(
+                        &engine,
+                        &catalog,
+                        &txnmgr,
+                        &mut session,
+                        &mut writer,
+                        &portal,
+                        max_rows,
+                    );
+                    report(
+                        &mut writer,
+                        &mut session,
+                        &mut skip_until_sync,
+                        outcome,
+                        None,
+                    );
+                }
             }
             Some(FrontendMessage::Close { target, name }) => {
                 // Close never fails: an unknown name is not an error (PG).
@@ -276,6 +313,7 @@ async fn run_simple_query(
     txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    reader: &mut FrontendReader<impl tokio::io::AsyncRead + Unpin>,
 ) -> Result<(), ProtocolError> {
     let statements = match crabgresql_parser::parse(sql) {
         Ok(statements) => statements,
@@ -292,6 +330,27 @@ async fn run_simple_query(
     }
     for stmt in &statements {
         let efd = session.extra_float_digits;
+        // COPY FROM STDIN drives the copy sub-protocol on the socket rather than
+        // returning a QueryResult, so it is handled inline here.
+        if is_copy_from_stdin(stmt) {
+            match copy_in_stream(engine, catalog, txnmgr, session, writer, reader, stmt).await? {
+                CopyOutcome::Loaded(n) => writer.command_complete(&format!("COPY {n}")),
+                CopyOutcome::ConnectionClosed => return Ok(()),
+                CopyOutcome::Failed(e) => {
+                    let position = e.location.map(|(line, col)| char_position(sql, line, col));
+                    writer.error_response_detailed(
+                        e.code,
+                        &e.message,
+                        e.detail.as_deref(),
+                        e.hint.as_deref(),
+                        position,
+                    );
+                    mark_transaction_failed(session);
+                    return Ok(());
+                }
+            }
+            continue;
+        }
         match execute_statement(engine, catalog, txnmgr, stmt, session, &BoundParams::none()) {
             Ok(result) => {
                 if write_result(writer, result, efd, sql).await? == WriteOutcome::Errored {
@@ -314,6 +373,112 @@ async fn run_simple_query(
         }
     }
     Ok(())
+}
+
+/// Whether a statement is `COPY <table> [(cols)] FROM STDIN` — the only COPY
+/// form the server drives (COPY TO / file / program are rejected at bind time).
+fn is_copy_from_stdin(stmt: &ast::Statement) -> bool {
+    matches!(
+        stmt,
+        ast::Statement::Copy {
+            to: false,
+            target: ast::CopyTarget::Stdin,
+            ..
+        }
+    )
+}
+
+/// If an Execute targets a portal bound to a `COPY … FROM STDIN`, return a clone
+/// of that statement so the caller can drive the copy sub-protocol. A suspended
+/// portal (never a COPY) or any other statement returns `None`, falling through
+/// to the ordinary execute path.
+fn copy_portal_statement(session: &Session, portal_name: &str) -> Option<ast::Statement> {
+    let portal = session.portals.get(portal_name)?;
+    if portal.suspended.is_some() {
+        return None;
+    }
+    let prepared = session.prepared.get(&portal.statement)?;
+    let stmt = prepared.stmt.as_ref()?;
+    is_copy_from_stdin(stmt).then(|| stmt.clone())
+}
+
+/// The outcome of driving a COPY FROM STDIN sub-protocol exchange.
+enum CopyOutcome {
+    /// The stream completed: `n` rows were loaded (`COPY n`).
+    Loaded(u64),
+    /// A resolve/decode/insert error, or a client `CopyFail`, to report to the
+    /// client (and, in an open block, mark the transaction failed).
+    Failed(PgError),
+    /// The client disconnected mid-copy; end the connection.
+    ConnectionClosed,
+}
+
+/// Drive one `COPY <table> FROM STDIN`: resolve the target (before entering copy
+/// mode, so a bad table errors without a CopyInResponse), send CopyInResponse,
+/// accumulate the `CopyData` frames until `CopyDone`, then decode and load the
+/// rows as an INSERT. `Flush`/`Sync` arriving mid-copy are ignored, as PG does
+/// (the extended protocol sends a Sync right after Execute); the trailing Sync
+/// after CopyDone is left for the main loop to turn into ReadyForQuery.
+async fn copy_in_stream(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    session: &mut Session,
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    reader: &mut FrontendReader<impl tokio::io::AsyncRead + Unpin>,
+    stmt: &ast::Statement,
+) -> Result<CopyOutcome, ProtocolError> {
+    let prepared = match prepare_copy_from(engine, catalog, stmt, session) {
+        Ok(prepared) => prepared,
+        // Resolve error (missing table, unsupported option, aborted/read-only
+        // txn): report it without ever entering copy mode.
+        Err(e) => return Ok(CopyOutcome::Failed(e)),
+    };
+
+    // Text-based copy-in (text or CSV): overall format text, every column text.
+    let column_formats = vec![Format::Text; prepared.plan.column_count()];
+    writer.write(&BackendMessage::CopyInResponse(CopyResponse {
+        format: Format::Text,
+        column_formats,
+    }));
+    writer.flush().await?;
+
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        match reader.read_message().await? {
+            None | Some(FrontendMessage::Terminate) => return Ok(CopyOutcome::ConnectionClosed),
+            Some(FrontendMessage::CopyData(bytes)) => buffer.extend_from_slice(&bytes),
+            Some(FrontendMessage::CopyDone) => break,
+            Some(FrontendMessage::CopyFail(msg)) => {
+                return Ok(CopyOutcome::Failed(PgError::new(
+                    sqlstate::QUERY_CANCELED,
+                    format!("COPY from stdin failed: {msg}"),
+                )));
+            }
+            // Client libraries send a Sync right after Execute and may Flush
+            // mid-stream; PG ignores both during COPY IN.
+            Some(FrontendMessage::Flush) => writer.flush().await?,
+            Some(FrontendMessage::Sync) => {}
+            Some(other) => {
+                return Ok(CopyOutcome::Failed(PgError::new(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    format!(
+                        "unexpected message type 0x{:02X} during COPY from stdin",
+                        other.tag()
+                    ),
+                )));
+            }
+        }
+    }
+
+    let rows = match crate::copy::decode(&prepared.plan.format, &buffer) {
+        Ok(rows) => rows,
+        Err(e) => return Ok(CopyOutcome::Failed(e)),
+    };
+    match run_copy_insert(engine, txnmgr, session, &prepared, rows) {
+        Ok(n) => Ok(CopyOutcome::Loaded(n)),
+        Err(e) => Ok(CopyOutcome::Failed(e)),
+    }
 }
 
 /// After a reported error, an open transaction block enters the failed state

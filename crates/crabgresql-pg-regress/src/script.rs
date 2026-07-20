@@ -18,6 +18,33 @@ pub enum ScriptItem {
     /// Any pending statement buffer is discarded (psql's `\g`-family would
     /// execute it; the runner supports no metacommands at all).
     Metacommand(String),
+    /// The inline data body of a preceding `COPY … FROM STDIN` statement: every
+    /// physical line up to (but not including) the terminating `\.`, joined with
+    /// newlines. The data lines are still echoed individually as `Line`s, as
+    /// psql does under `-a`; this carries the payload to feed over the wire.
+    CopyData(String),
+}
+
+/// Whether a completed statement is `COPY … FROM STDIN` (the only COPY form the
+/// runner streams inline data for). Whitespace is collapsed so a multi-line
+/// statement and `FROM  STDIN` both match. `FROM STDIN` must be a trailing token
+/// sequence (optionally followed by `WITH`-options), not merely a substring, so
+/// `COPY (… FROM stdin) TO …` and a `STDIN`-prefixed identifier are not
+/// misclassified.
+pub fn is_copy_from_stdin(sql: &str) -> bool {
+    let upper = sql.trim().trim_end_matches(';').to_ascii_uppercase();
+    let normalized = upper.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !normalized.starts_with("COPY ") {
+        return false;
+    }
+    const MARK: &str = " FROM STDIN";
+    match normalized.find(MARK) {
+        Some(idx) => {
+            let after = &normalized[idx + MARK.len()..];
+            after.is_empty() || after.starts_with(' ')
+        }
+        None => false,
+    }
 }
 
 /// Quoting/comment state that survives across lines. The dollar-quote tag is
@@ -39,8 +66,24 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
     let mut has_content = false;
     let mut state = State::Normal;
     let mut dollar_tag = String::new();
+    // `Some` while collecting the inline data of a `COPY … FROM STDIN`: each
+    // line is echoed and accumulated until a lone `\.` closes the payload.
+    let mut copy_data: Option<String> = None;
 
     for line in input.lines() {
+        // Inside a COPY FROM STDIN payload, every line is data, not SQL, until
+        // the `\.` terminator. psql does not echo copy-in data under -a, so these
+        // lines produce no `Line` item — only the accumulated `CopyData`.
+        if let Some(data) = copy_data.as_mut() {
+            if line == "\\." {
+                items.push(ScriptItem::CopyData(std::mem::take(data)));
+                copy_data = None;
+            } else {
+                data.push_str(line);
+                data.push('\n');
+            }
+            continue;
+        }
         // psql drops empty lines entirely — no echo, nothing added to the
         // statement buffer — unless it is inside a quoted string.
         let in_quote = matches!(
@@ -67,8 +110,17 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
                 State::Normal => {
                     if c == ';' {
                         stmt.push(';');
-                        items.push(ScriptItem::Statement(std::mem::take(&mut stmt)));
+                        let statement = std::mem::take(&mut stmt);
+                        let is_copy = is_copy_from_stdin(&statement);
+                        items.push(ScriptItem::Statement(statement));
                         has_content = false;
+                        // A COPY … FROM STDIN switches subsequent lines to data
+                        // collection; anything after the `;` on this line is not
+                        // part of the payload (psql reads data from the next line).
+                        if is_copy {
+                            copy_data = Some(String::new());
+                            break;
+                        }
                     } else if c == '-' && chars.get(i + 1) == Some(&'-') {
                         in_line_comment = true;
                         if has_content {
@@ -187,8 +239,11 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
         }
     }
 
-    // psql executes whatever is left in the buffer at EOF, `;` or not.
-    if !stmt.trim().is_empty() {
+    // A COPY payload with no closing `\.` at EOF still delivers what it collected.
+    if let Some(data) = copy_data.take() {
+        items.push(ScriptItem::CopyData(data));
+    } else if !stmt.trim().is_empty() {
+        // psql executes whatever is left in the buffer at EOF, `;` or not.
         items.push(ScriptItem::Statement(stmt.trim_end().to_string()));
     }
     items
@@ -363,5 +418,53 @@ mod tests {
                 ScriptItem::Statement("SELECT 'a\n\nb';".into()),
             ]
         );
+    }
+
+    #[test]
+    fn copy_from_stdin_collects_data_without_echoing_it() {
+        // The COPY statement echoes; the data lines and `\.` do not (psql -a
+        // does not echo copy-in data). The payload arrives as one CopyData.
+        let items = lex("COPY t FROM stdin;\n1\ta\n2\tb\n\\.\nSELECT 1;\n");
+        assert_eq!(
+            items,
+            [
+                ScriptItem::Line("COPY t FROM stdin;".into()),
+                ScriptItem::Statement("COPY t FROM stdin;".into()),
+                ScriptItem::CopyData("1\ta\n2\tb\n".into()),
+                ScriptItem::Line("SELECT 1;".into()),
+                ScriptItem::Statement("SELECT 1;".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_data_is_never_parsed_as_sql() {
+        // A `;` inside copy data does not split a statement, and blank data lines
+        // are preserved verbatim in the payload.
+        let items = lex("COPY t FROM stdin;\na;b\n\nc\n\\.\n");
+        assert_eq!(
+            items,
+            [
+                ScriptItem::Line("COPY t FROM stdin;".into()),
+                ScriptItem::Statement("COPY t FROM stdin;".into()),
+                ScriptItem::CopyData("a;b\n\nc\n".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn is_copy_from_stdin_recognizes_forms() {
+        assert!(is_copy_from_stdin("COPY t FROM stdin;"));
+        assert!(is_copy_from_stdin("COPY t (a, b) FROM STDIN"));
+        assert!(is_copy_from_stdin(
+            "COPY t FROM stdin WITH (FORMAT csv)"
+        ));
+        assert!(!is_copy_from_stdin("COPY t TO stdout;"));
+        assert!(!is_copy_from_stdin("COPY t FROM '/tmp/f';"));
+        assert!(!is_copy_from_stdin("SELECT 1;"));
+        // "FROM STDIN" as a substring inside a COPY TO (query) must not match.
+        assert!(!is_copy_from_stdin("COPY (SELECT a FROM stdin) TO stdout;"));
+        // A STDIN-prefixed identifier is not the STDIN keyword.
+        assert!(!is_copy_from_stdin("COPY t FROM stdin_table;"));
     }
 }

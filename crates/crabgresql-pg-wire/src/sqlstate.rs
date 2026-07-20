@@ -9,6 +9,9 @@ pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
 pub const INVALID_TIME_ZONE_DISPLACEMENT_VALUE: &str = "22009";
 pub const DIVISION_BY_ZERO: &str = "22012";
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+/// Class 22 — a byte sequence that is not valid in the server encoding (UTF-8),
+/// e.g. an invalid byte or embedded NUL in COPY data.
+pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 pub const INVALID_PARAMETER_VALUE: &str = "22023";
 pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
 pub const INVALID_ARGUMENT_FOR_LOG: &str = "2201E";
@@ -62,5 +65,10 @@ pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
 pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
 /// `2200H` — a sequence hit its `MINVALUE`/`MAXVALUE` bound with `NO CYCLE`.
 pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
+/// Class 22 — data exception: a COPY data stream that does not match the
+/// expected format (extra/missing columns, unterminated CSV quoting).
+pub const BAD_COPY_FILE_FORMAT: &str = "22P04";
+/// Class 57 — operator intervention: a client-issued CopyFail during COPY FROM.
+pub const QUERY_CANCELED: &str = "57014";
 /// Class 58 — system error: a WAL/data-file I/O failure (e.g. commit fsync).
 pub const IO_ERROR: &str = "58030";

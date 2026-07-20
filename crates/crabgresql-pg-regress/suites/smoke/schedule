@@ -37,3 +37,4 @@ test: returning
 test: insert_select
 test: subquery
 test: sequence
+test: copy

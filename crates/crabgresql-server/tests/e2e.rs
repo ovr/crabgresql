@@ -3248,3 +3248,250 @@ async fn sequence_write_rejected_read_only() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// --------------------------------------------------------------------------
+// COPY ... FROM STDIN
+// --------------------------------------------------------------------------
+
+/// The extended-protocol COPY path (tokio-postgres `copy_in` prepares the
+/// statement, then streams CopyData / CopyDone): rows land with the right types,
+/// NULL (`\N`) and defaults are honored, and the sink reports the row count.
+#[tokio::test]
+async fn copy_in_extended_loads_rows() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int4, b text, c int4 DEFAULT 7)")
+        .await?;
+
+    // Column list omits `c`, which takes its default; `\N` is a SQL NULL.
+    let sink = client
+        .copy_in("COPY t (a, b) FROM STDIN")
+        .await
+        .context("copy_in should enter copy mode")?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"1\thello\n2\t\\N\n")).await?;
+    let count = sink.finish().await?;
+    assert_eq!(count, 2);
+
+    let messages = client
+        .simple_query("SELECT a, b, c FROM t ORDER BY a")
+        .await?;
+    let rows = rows(&messages);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("a"), Some("1"));
+    assert_eq!(rows[0].get("b"), Some("hello"));
+    assert_eq!(rows[0].get("c"), Some("7"));
+    assert_eq!(rows[1].get("a"), Some("2"));
+    assert_eq!(rows[1].get("b"), None); // NULL
+    assert_eq!(rows[1].get("c"), Some("7"));
+    Ok(())
+}
+
+/// CSV format over the extended protocol: quoted fields with `""` doubling and
+/// embedded delimiters, an unquoted empty field as NULL, and HEADER skipping.
+#[tokio::test]
+async fn copy_in_csv_with_header_and_quotes() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE c (a int4, b text)").await?;
+
+    let sink = client
+        .copy_in("COPY c FROM STDIN WITH (FORMAT csv, HEADER)")
+        .await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(
+        b"col_a,col_b\n1,\"a,b\"\n2,\"she \"\"said\"\"\"\n",
+    ))
+    .await?;
+    let count = sink.finish().await?;
+    assert_eq!(count, 2);
+
+    let messages = client.simple_query("SELECT a, b FROM c ORDER BY a").await?;
+    let rows = rows(&messages);
+    assert_eq!(rows[0].get("b"), Some("a,b"));
+    assert_eq!(rows[1].get("b"), Some("she \"said\""));
+    Ok(())
+}
+
+/// A data-type error mid-COPY aborts the whole load (autocommit rollback): the
+/// error surfaces with SQLSTATE 22P02 and no rows are left behind.
+#[tokio::test]
+async fn copy_in_bad_value_aborts_load() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    let sink = client.copy_in("COPY t FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"1\nnot_an_int\n3\n")).await?;
+    let err = sink.finish().await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::INVALID_TEXT_REPRESENTATION
+    );
+
+    // Nothing was committed.
+    let messages = client.simple_query("SELECT count(*) AS n FROM t").await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// COPY into a missing relation errors before entering copy mode (no
+/// CopyInResponse), so the driver surfaces `undefined_table` from `copy_in`.
+#[tokio::test]
+async fn copy_in_missing_table_errors_before_copy_mode() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    let result: Result<tokio_postgres::CopyInSink<bytes::Bytes>, _> =
+        client.copy_in("COPY nope FROM STDIN").await;
+    let err = result
+        .err()
+        .expect("copy_in into a missing table should error");
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::UNDEFINED_TABLE
+    );
+    Ok(())
+}
+
+/// Regression tests for the code-review fixes: byte-oriented escape decoding,
+/// CSV quote concatenation, single-byte options, and the aborted-transaction
+/// guard — all matching PostgreSQL's observable behavior.
+#[tokio::test]
+async fn copy_in_octal_escapes_form_multibyte_utf8() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE m (v text)").await?;
+    let sink = client.copy_in("COPY m FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    // The three UTF-8 bytes of 日 as octal escapes must round-trip to one char.
+    sink.send(Bytes::from_static(b"\\346\\227\\245\n")).await?;
+    sink.finish().await?;
+
+    let messages = client
+        .simple_query("SELECT v, octet_length(v) AS len FROM m")
+        .await?;
+    let rows = rows(&messages);
+    assert_eq!(rows[0].get("v"), Some("日"));
+    assert_eq!(rows[0].get("len"), Some("3"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_in_invalid_utf8_byte_errors() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE m (v text)").await?;
+    let sink = client.copy_in("COPY m FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"\\351\n")).await?; // 0xe9 alone: invalid UTF-8
+    let err = sink.finish().await.unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::CHARACTER_NOT_IN_REPERTOIRE);
+    assert!(db.message().contains("0xe9"), "{}", db.message());
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_in_csv_concatenates_quote_after_content() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE c (a int4, b text)").await?;
+    let sink = client.copy_in("COPY c FROM STDIN WITH (FORMAT csv)").await?;
+    futures_util::pin_mut!(sink);
+    // `1, "two"` -> b = ' two' (space + quoted run), as PG concatenates.
+    sink.send(Bytes::from_static(b"1, \"two\"\n")).await?;
+    assert_eq!(sink.finish().await?, 1);
+
+    let messages = client.simple_query("SELECT '['||b||']' AS b FROM c").await?;
+    assert_eq!(rows(&messages)[0].get("b"), Some("[ two]"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_multibyte_delimiter_rejected() -> anyhow::Result<()> {
+    // A multi-byte DELIMITER is rejected (the parser guards the single-char slot,
+    // and the binder's single-byte check backs it up) rather than silently
+    // splitting on a multi-byte character, matching PG.
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE c (a int4, b text)").await?;
+    let result: Result<tokio_postgres::CopyInSink<bytes::Bytes>, _> = client
+        .copy_in("COPY c FROM STDIN WITH (FORMAT csv, DELIMITER 'é')")
+        .await;
+    assert!(
+        result.is_err(),
+        "a multi-byte COPY delimiter must be rejected"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_in_rejected_in_aborted_transaction() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE z (a int4)").await?;
+    client.batch_execute("BEGIN").await?;
+    // Force the block into the failed state.
+    let _ = client.simple_query("SELECT 1/0").await;
+    // COPY must be refused before entering copy mode (no CopyInResponse), like any
+    // other statement — so a plain simple query surfaces the error without hanging.
+    let err = client
+        .simple_query("COPY z FROM STDIN")
+        .await
+        .err()
+        .expect("COPY in an aborted txn should error");
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::IN_FAILED_SQL_TRANSACTION
+    );
+    client.batch_execute("ROLLBACK").await?;
+    // Connection is still usable after rollback, and no row was loaded.
+    let messages = client.simple_query("SELECT count(*) AS n FROM z").await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// COPY into a table with a `serial` column advances the owned sequence for the
+/// omitted column (its `nextval()` default runs in the copy's exec context),
+/// matching how INSERT fills a serial default.
+#[tokio::test]
+async fn copy_in_fills_serial_default_from_sequence() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE s (id serial PRIMARY KEY, name text)")
+        .await?;
+    let sink = client.copy_in("COPY s (name) FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"alice\nbob\n")).await?;
+    assert_eq!(sink.finish().await?, 2);
+
+    let messages = client
+        .simple_query("SELECT id, name FROM s ORDER BY id")
+        .await?;
+    let rows = rows(&messages);
+    assert_eq!(rows[0].get("id"), Some("1"));
+    assert_eq!(rows[0].get("name"), Some("alice"));
+    assert_eq!(rows[1].get("id"), Some("2"));
+    assert_eq!(rows[1].get("name"), Some("bob"));
+    Ok(())
+}

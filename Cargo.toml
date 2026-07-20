@@ -38,6 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # dev
 anyhow = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tempfile = "3"
 tokio-postgres = "0.7"
 

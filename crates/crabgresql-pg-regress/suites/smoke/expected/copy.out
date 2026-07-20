@@ -1,0 +1,75 @@
+--
+-- COPY ... FROM STDIN
+-- Smoke test for the text and CSV copy-in sub-protocol: tab-delimited and CSV
+-- rows, the \N NULL marker and backslash escapes, an omitted column taking its
+-- default, and char(n) blank-padding on load.
+--
+CREATE TABLE cp (a integer, b text, c integer DEFAULT 7);
+-- Basic text format: TAB-delimited, one row per line.
+COPY cp FROM stdin;
+SELECT * FROM cp ORDER BY a;
+ a |  b  | c  
+---+-----+----
+ 1 | one | 10
+ 2 | two | 20
+(2 rows)
+
+-- Column list: the unlisted column (c) takes its default; \N is a SQL NULL.
+COPY cp (a, b) FROM stdin;
+SELECT * FROM cp ORDER BY a;
+ a |   b   | c  
+---+-------+----
+ 1 | one   | 10
+ 2 | two   | 20
+ 3 | three |  7
+ 4 |       |  7
+(4 rows)
+
+-- Backslash escapes: \\ is a literal backslash and \061 is octal for '1'.
+CREATE TABLE esc (v text);
+COPY esc FROM stdin;
+SELECT v, octet_length(v) FROM esc ORDER BY v;
+  v  | octet_length 
+-----+--------------
+ c\d |            3
+ x1y |            3
+(2 rows)
+
+-- A \t escape decodes to a single tab byte (octet_length 3, not 4 literal chars).
+CREATE TABLE esctab (v text);
+COPY esctab FROM stdin;
+SELECT octet_length(v) AS n FROM esctab;
+ n 
+---
+ 3
+(1 row)
+
+-- CSV with a header line and quoted fields ("" is one literal quote).
+CREATE TABLE cs (a integer, b text);
+COPY cs FROM stdin WITH (FORMAT csv, HEADER);
+SELECT * FROM cs ORDER BY a;
+ a |     b      
+---+------------
+ 1 | a,b
+ 2 | she "said"
+(2 rows)
+
+-- CSV honoring a custom delimiter and NULL string.
+CREATE TABLE cd (a integer, b text);
+COPY cd FROM stdin WITH (FORMAT csv, DELIMITER '|', NULL 'NULL');
+SELECT a, b FROM cd ORDER BY a;
+ a |   b   
+---+-------
+ 1 | hello
+ 2 | 
+(2 rows)
+
+-- char(n) blank-pads on load; octet_length counts the padding.
+CREATE TABLE ch (a char(5));
+COPY ch FROM stdin;
+SELECT octet_length(a) AS len FROM ch;
+ len 
+-----
+   5
+(1 row)
+

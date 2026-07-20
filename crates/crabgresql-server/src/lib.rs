@@ -4,6 +4,7 @@
 
 mod catalog;
 mod connection;
+mod copy;
 mod error;
 mod global_catalog;
 mod query;

@@ -7,10 +7,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crabgresql_parser::ast;
+use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
-    Column, StorageError, TableAm, TableEngine, TypeCatalog, ViewDefinition,
+    Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_types::{PgType, Value};
 
@@ -3053,6 +3053,411 @@ pub fn bind_insert_with_params(
         source: insert_source,
         returning,
     })
+}
+
+/// The COPY text/CSV format, resolved from the statement's `WITH (…)` (and
+/// legacy) options. Consumed by the server's row decoder, which splits the raw
+/// stdin bytes into fields per these rules before [`CopyFromPlan::build_insert`]
+/// turns them into typed rows.
+///
+/// The delimiter, quote, and escape are single bytes — PostgreSQL requires each
+/// to be "a single one-byte character" — so the decoder can operate on the raw
+/// byte stream (COPY is byte-oriented; multi-byte data flows through untouched).
+#[derive(Clone, Debug)]
+pub struct CopyFormat {
+    /// `true` for `FORMAT csv`, `false` for the default text format.
+    pub csv: bool,
+    /// Field separator (TAB for text, `,` for CSV, unless overridden).
+    pub delimiter: u8,
+    /// The unquoted token that means SQL NULL (`\N` for text, empty for CSV).
+    pub null: String,
+    /// Skip the first data line (`HEADER`).
+    pub header: bool,
+    /// CSV quote byte (default `"`); unused in text format.
+    pub quote: u8,
+    /// CSV escape byte (default = the quote byte); unused in text.
+    pub escape: u8,
+    /// Field positions (into the target column list) that CSV must read as a
+    /// non-NULL empty string rather than NULL (`FORCE_NOT_NULL`).
+    pub force_not_null: Vec<usize>,
+}
+
+impl CopyFormat {
+    /// Text-format defaults. Public so the server-side decoder and its tests
+    /// share one source of truth instead of reconstructing the fields.
+    pub fn text() -> Self {
+        CopyFormat {
+            csv: false,
+            delimiter: b'\t',
+            null: "\\N".to_string(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+            force_not_null: Vec::new(),
+        }
+    }
+
+    /// CSV-format defaults.
+    pub fn csv() -> Self {
+        CopyFormat {
+            csv: true,
+            delimiter: b',',
+            null: String::new(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+            force_not_null: Vec::new(),
+        }
+    }
+}
+
+/// A bound `COPY <table> [(cols)] FROM STDIN`: the resolved write target, the
+/// data-column → schema-column mapping, per-column defaults for columns absent
+/// from the column list, and the text/CSV format. The row bytes arrive later
+/// over the wire, so binding is split: this resolves everything the server needs
+/// before sending `CopyInResponse`, and [`build_insert`](Self::build_insert)
+/// turns the decoded field rows into an ordinary [`LogicalPlan::Insert`].
+pub struct CopyFromPlan {
+    table: Arc<dyn TableAm>,
+    table_name: String,
+    schema: TableSchema,
+    /// One schema-column index per data column, in wire order.
+    target_indices: Vec<usize>,
+    /// Default expression per schema column (used for columns not in the list).
+    defaults: Vec<BoundExpr>,
+    pub format: CopyFormat,
+}
+
+impl CopyFromPlan {
+    /// Number of columns each data row must supply.
+    pub fn column_count(&self) -> usize {
+        self.target_indices.len()
+    }
+
+    /// The relation's bare name, for the `COPY` command tag / error context.
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// Turn decoded field rows (`None` = the NULL marker matched) into a
+    /// fully-formed `INSERT ... VALUES` plan: each field parses through its
+    /// column's input function with the column typmod (so `char(n)` blank-pads,
+    /// an over-long `varchar(n)` errors), exactly as a SQL literal would; columns
+    /// absent from the COPY column list take their default. Arity mismatches
+    /// surface as PG's `extra data` / `missing data` errors.
+    pub fn build_insert(
+        &self,
+        catalog: &Arc<dyn TypeCatalog>,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<LogicalPlan, BindError> {
+        let params = param_ctx_none();
+        let scope = Scope::empty(catalog, &params);
+        let ncols = self.target_indices.len();
+        let mut value_rows = Vec::with_capacity(rows.len());
+        for fields in rows {
+            if fields.len() > ncols {
+                return Err(BindError::new(
+                    sqlstate::BAD_COPY_FILE_FORMAT,
+                    "extra data after last expected column",
+                ));
+            }
+            if fields.len() < ncols {
+                let missing = self.target_indices[fields.len()];
+                return Err(BindError::new(
+                    sqlstate::BAD_COPY_FILE_FORMAT,
+                    format!(
+                        "missing data for column \"{}\"",
+                        self.schema.columns[missing].name
+                    ),
+                ));
+            }
+            let mut row = self.defaults.clone();
+            for (field, &idx) in fields.into_iter().zip(&self.target_indices) {
+                let column = &self.schema.columns[idx];
+                row[idx] = match field {
+                    // The NULL marker: a genuine SQL NULL, not the column default.
+                    None => BoundExpr::Const {
+                        value: Value::Null,
+                        ty: column.ty,
+                    },
+                    // A data field parses like the equivalent unknown-typed SQL
+                    // literal against the column type, then takes its length typmod.
+                    Some(text) => coerce_to_column(
+                        Binding::Unknown {
+                            lit: Some(text),
+                            span: Span::empty(),
+                            param: None,
+                        },
+                        column,
+                        &scope,
+                    )?,
+                };
+            }
+            value_rows.push(row);
+        }
+        Ok(LogicalPlan::Insert {
+            table: self.table.clone(),
+            source: InsertSource::Values(value_rows),
+            returning: None,
+        })
+    }
+}
+
+/// Bind `COPY <table> [(cols)] FROM STDIN [WITH (…)]`. Rejects the forms not yet
+/// supported (`COPY TO`, a query source, file/program targets, binary format)
+/// with the matching error, resolves the write target and column list the same
+/// way INSERT does, and resolves the text/CSV options into a [`CopyFormat`].
+pub fn bind_copy_from(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    source: &ast::CopySource,
+    to: bool,
+    target: &ast::CopyTarget,
+    options: &[ast::CopyOption],
+    legacy_options: &[ast::CopyLegacyOption],
+) -> Result<CopyFromPlan, BindError> {
+    if to {
+        return Err(BindError::feature_not_supported(
+            "COPY TO is not supported yet",
+        ));
+    }
+    let (table_name, columns) = match source {
+        ast::CopySource::Table {
+            table_name,
+            columns,
+        } => (table_name, columns),
+        ast::CopySource::Query(_) => {
+            return Err(BindError::feature_not_supported(
+                "COPY (query) is not supported yet",
+            ));
+        }
+    };
+    if !matches!(target, ast::CopyTarget::Stdin) {
+        return Err(BindError::feature_not_supported(
+            "COPY from a file or program is not supported yet; use COPY ... FROM STDIN",
+        ));
+    }
+
+    let (table, name) = resolve_write_table(engine, table_name, WriteVerb::Insert)?;
+    let schema = table.schema().clone();
+    let defaults = schema
+        .columns
+        .iter()
+        .map(|column| default_for_column(column, catalog))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Map the optional column list (empty = every column, in schema order).
+    let target_indices: Vec<usize> = if columns.is_empty() {
+        (0..schema.columns.len()).collect()
+    } else {
+        let mut indices = Vec::with_capacity(columns.len());
+        for ident in columns {
+            let col = normalize_ident(ident);
+            let idx = schema.column_index(&col).ok_or_else(|| {
+                BindError::new(
+                    sqlstate::UNDEFINED_COLUMN,
+                    format!("column \"{col}\" of relation \"{name}\" does not exist"),
+                )
+            })?;
+            if indices.contains(&idx) {
+                return Err(BindError::new(
+                    sqlstate::DUPLICATE_COLUMN,
+                    format!("column \"{col}\" specified more than once"),
+                ));
+            }
+            indices.push(idx);
+        }
+        indices
+    };
+
+    let format = resolve_copy_format(options, legacy_options, &schema, &target_indices, &name)?;
+
+    Ok(CopyFromPlan {
+        table,
+        table_name: name,
+        schema,
+        target_indices,
+        defaults,
+        format,
+    })
+}
+
+/// Resolve the modern `WITH (…)` options plus the pre-9.0 legacy option list
+/// into a [`CopyFormat`]. The format keyword is decided first (so `csv`
+/// defaults apply before per-option overrides), then delimiter/NULL/header and
+/// the CSV-only quote/escape/`FORCE_NOT_NULL` settings.
+fn resolve_copy_format(
+    options: &[ast::CopyOption],
+    legacy_options: &[ast::CopyLegacyOption],
+    schema: &TableSchema,
+    target_indices: &[usize],
+    relname: &str,
+) -> Result<CopyFormat, BindError> {
+    // Pass 1: the format keyword.
+    let mut csv = false;
+    for opt in options {
+        if let ast::CopyOption::Format(name) = opt {
+            match normalize_ident(name).as_str() {
+                "text" => csv = false,
+                "csv" => csv = true,
+                "binary" => {
+                    return Err(BindError::feature_not_supported(
+                        "COPY with binary format is not supported yet",
+                    ));
+                }
+                other => {
+                    return Err(BindError::new(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        format!("COPY format \"{other}\" not recognized"),
+                    ));
+                }
+            }
+        }
+    }
+    for opt in legacy_options {
+        match opt {
+            ast::CopyLegacyOption::Csv(_) => csv = true,
+            ast::CopyLegacyOption::Binary => {
+                return Err(BindError::feature_not_supported(
+                    "COPY with binary format is not supported yet",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mut fmt = if csv {
+        CopyFormat::csv()
+    } else {
+        CopyFormat::text()
+    };
+
+    // Resolve a FORCE_NOT_NULL column name to its position in the data-column
+    // list (the decoder indexes fields by that position).
+    let force_not_null = |cols: &[ast::Ident]| -> Result<Vec<usize>, BindError> {
+        let mut out = Vec::with_capacity(cols.len());
+        for ident in cols {
+            let col = normalize_ident(ident);
+            let sidx = schema.column_index(&col).ok_or_else(|| {
+                BindError::new(
+                    sqlstate::UNDEFINED_COLUMN,
+                    format!("column \"{col}\" of relation \"{relname}\" does not exist"),
+                )
+            })?;
+            let pos = target_indices.iter().position(|&i| i == sidx).ok_or_else(|| {
+                BindError::new(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    format!("FORCE_NOT_NULL column \"{col}\" not referenced by COPY"),
+                )
+            })?;
+            out.push(pos);
+        }
+        Ok(out)
+    };
+
+    // Pass 2: modern per-option overrides.
+    let require_csv = |what: &str| -> Result<(), BindError> {
+        if csv {
+            Ok(())
+        } else {
+            Err(BindError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("COPY {what} available only in CSV mode"),
+            ))
+        }
+    };
+    for opt in options {
+        match opt {
+            ast::CopyOption::Format(_) | ast::CopyOption::Freeze(_) => {}
+            ast::CopyOption::Delimiter(c) => fmt.delimiter = single_byte(*c, "delimiter")?,
+            ast::CopyOption::Null(s) => fmt.null = s.clone(),
+            ast::CopyOption::Header(b) => fmt.header = *b,
+            ast::CopyOption::Quote(c) => {
+                require_csv("QUOTE")?;
+                fmt.quote = single_byte(*c, "quote")?;
+            }
+            ast::CopyOption::Escape(c) => {
+                require_csv("ESCAPE")?;
+                fmt.escape = single_byte(*c, "escape")?;
+            }
+            ast::CopyOption::ForceNotNull(cols) => {
+                require_csv("FORCE_NOT_NULL")?;
+                fmt.force_not_null = force_not_null(cols)?;
+            }
+            ast::CopyOption::ForceNull(_) | ast::CopyOption::ForceQuote(_) => {
+                return Err(BindError::feature_not_supported(
+                    "COPY FORCE_NULL/FORCE_QUOTE is not supported yet",
+                ));
+            }
+            ast::CopyOption::Encoding(enc) => require_utf8(enc)?,
+        }
+    }
+
+    // Pass 2b: legacy per-option overrides (`COPY … CSV HEADER DELIMITER ','`).
+    for opt in legacy_options {
+        match opt {
+            ast::CopyLegacyOption::Delimiter(c) => fmt.delimiter = single_byte(*c, "delimiter")?,
+            ast::CopyLegacyOption::Null(s) => fmt.null = s.clone(),
+            ast::CopyLegacyOption::Header => fmt.header = true,
+            ast::CopyLegacyOption::Binary | ast::CopyLegacyOption::Csv(_) => {}
+            other => {
+                return Err(BindError::feature_not_supported(format!(
+                    "COPY option {other} is not supported yet"
+                )));
+            }
+        }
+        if let ast::CopyLegacyOption::Csv(sub) = opt {
+            for s in sub {
+                match s {
+                    ast::CopyLegacyCsvOption::Header => fmt.header = true,
+                    ast::CopyLegacyCsvOption::Quote(c) => fmt.quote = single_byte(*c, "quote")?,
+                    ast::CopyLegacyCsvOption::Escape(c) => fmt.escape = single_byte(*c, "escape")?,
+                    ast::CopyLegacyCsvOption::ForceNotNull(cols) => {
+                        fmt.force_not_null = force_not_null(cols)?;
+                    }
+                    ast::CopyLegacyCsvOption::ForceQuote(_) => {
+                        return Err(BindError::feature_not_supported(
+                            "COPY FORCE_QUOTE is not supported yet",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // PG rejects a delimiter that collides with the CSV quote.
+    if fmt.csv && fmt.delimiter == fmt.quote {
+        return Err(BindError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "COPY delimiter and quote must be different",
+        ));
+    }
+
+    Ok(fmt)
+}
+
+/// A COPY delimiter/quote/escape must be a single one-byte character (PG rejects
+/// a multi-byte one with `0A000`). Returns the byte for the byte-oriented decoder.
+fn single_byte(c: char, what: &str) -> Result<u8, BindError> {
+    if c.is_ascii() {
+        Ok(c as u8)
+    } else {
+        Err(BindError::feature_not_supported(format!(
+            "COPY {what} must be a single one-byte character"
+        )))
+    }
+}
+
+/// COPY only speaks UTF-8; any other `ENCODING` is an honest not-supported.
+fn require_utf8(enc: &str) -> Result<(), BindError> {
+    let e = enc.to_ascii_uppercase().replace(['-', '_'], "");
+    if e == "UTF8" {
+        Ok(())
+    } else {
+        Err(BindError::feature_not_supported(format!(
+            "COPY ENCODING \"{enc}\" is not supported yet; only UTF8"
+        )))
+    }
 }
 
 pub fn bind_update(

@@ -149,6 +149,72 @@ impl Client {
         }
     }
 
+    /// Drive one `COPY … FROM STDIN` like psql: send the COPY as a `Q` message,
+    /// wait for `CopyInResponse` (`G`), stream `data` as one `CopyData` (`d`)
+    /// frame plus `CopyDone` (`c`), then collect the completion events up to
+    /// ReadyForQuery. If the server errors before entering copy mode (`E` before
+    /// `G` — e.g. a missing table), no data is sent.
+    pub async fn copy_in(&mut self, sql: &str, data: &str) -> io::Result<Vec<QueryEvent>> {
+        let mut packet = vec![b'Q'];
+        packet.extend_from_slice(&((4 + sql.len() + 1) as i32).to_be_bytes());
+        packet.extend_from_slice(sql.as_bytes());
+        packet.push(0);
+        self.writer.write_all(&packet).await?;
+        self.writer.flush().await?;
+
+        let mut events = Vec::new();
+        // Wait for CopyInResponse, surfacing a pre-copy error/notice.
+        loop {
+            let (tag, body) = self.read_message().await?;
+            match tag {
+                b'G' => break, // CopyInResponse: the server is ready for data.
+                b'E' => {
+                    events.push(QueryEvent::Error(parse_error_fields(&body)));
+                    // The command failed before copy mode; drain to ReadyForQuery.
+                    return self.drain_to_ready(events).await;
+                }
+                b'N' => events.push(QueryEvent::Notice(parse_error_fields(&body))),
+                b'S' => {}
+                other => {
+                    return Err(protocol_error(format!(
+                        "unexpected message '{}' before CopyInResponse",
+                        other as char
+                    )));
+                }
+            }
+        }
+
+        // One CopyData frame carrying the whole payload, then CopyDone.
+        let mut copy_data = vec![b'd'];
+        copy_data.extend_from_slice(&((4 + data.len()) as i32).to_be_bytes());
+        copy_data.extend_from_slice(data.as_bytes());
+        self.writer.write_all(&copy_data).await?;
+        self.writer.write_all(&[b'c', 0, 0, 0, 4]).await?; // CopyDone (len 4)
+        self.writer.flush().await?;
+
+        self.drain_to_ready(events).await
+    }
+
+    /// Collect events (CommandComplete / Error / Notice) up to ReadyForQuery.
+    async fn drain_to_ready(&mut self, mut events: Vec<QueryEvent>) -> io::Result<Vec<QueryEvent>> {
+        loop {
+            let (tag, body) = self.read_message().await?;
+            match tag {
+                b'C' => events.push(QueryEvent::CommandComplete(Cursor::new(&body).cstr()?)),
+                b'E' => events.push(QueryEvent::Error(parse_error_fields(&body))),
+                b'N' => events.push(QueryEvent::Notice(parse_error_fields(&body))),
+                b'S' => {}
+                b'Z' => return Ok(events),
+                other => {
+                    return Err(protocol_error(format!(
+                        "unexpected message '{}' in copy response",
+                        other as char
+                    )));
+                }
+            }
+        }
+    }
+
     async fn read_message(&mut self) -> io::Result<(u8, Vec<u8>)> {
         let tag = self.reader.read_u8().await?;
         let len = self.reader.read_i32().await?;
