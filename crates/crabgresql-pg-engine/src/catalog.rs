@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableSchema,
+    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableSchema, ViewDefinition,
 };
 use crabgresql_types::{PgType, oid};
 
@@ -20,6 +20,10 @@ const CATALOG_SUBDIR: &str = "global";
 const CATALOG_FILE: &str = "relcatalog";
 const FIRST_RELFILENODE: u32 = 1;
 const META_MAGIC: &[u8; 4] = b"CRM1";
+/// Marks the view section, appended after the [`META_MAGIC`] block. Like that
+/// block it is a backward-compatible tail: a reader that predates views stops
+/// after the metadata and ignores it.
+const VIEW_MAGIC: &[u8; 4] = b"CVW1";
 
 struct PersistCol {
     name: String,
@@ -37,9 +41,21 @@ struct PersistRel {
     indexes: Vec<IndexMetadata>,
 }
 
+/// A persisted view: its SELECT text, derived column list, and the relations it
+/// references (for `DROP ... CASCADE`). Views hold no relfilenode and no heap
+/// storage — only catalog metadata — so they are persisted separately from
+/// [`PersistRel`].
+struct PersistView {
+    name: String,
+    sql: String,
+    cols: Vec<PersistCol>,
+    depends_on: Vec<String>,
+}
+
 struct State {
     next: u32,
     rels: Vec<PersistRel>,
+    views: Vec<PersistView>,
 }
 
 pub struct RelCatalog {
@@ -57,6 +73,7 @@ impl RelCatalog {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State {
                 next: FIRST_RELFILENODE,
                 rels: Vec::new(),
+                views: Vec::new(),
             },
             Err(e) => return Err(e),
         };
@@ -253,6 +270,85 @@ impl RelCatalog {
         self.persist(&state)
     }
 
+    /// Whether a view named `name` exists.
+    pub fn contains_view(&self, name: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .views
+            .iter()
+            .any(|v| v.name == name)
+    }
+
+    /// Register a view and persist the catalog. Returns `false` (without
+    /// persisting) if a view of that name already exists.
+    pub fn create_view(&self, def: &ViewDefinition) -> std::io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        if state.views.iter().any(|v| v.name == def.name) {
+            return Ok(false);
+        }
+        state.views.push(PersistView {
+            name: def.name.clone(),
+            sql: def.sql.clone(),
+            cols: def
+                .columns
+                .iter()
+                .map(|c| PersistCol {
+                    name: c.name.clone(),
+                    oid: c.ty.oid(),
+                    typmod: c.typmod,
+                    nullable: c.nullable,
+                    not_null_constraint: c.not_null_constraint.clone(),
+                    default: c.default.clone(),
+                })
+                .collect(),
+            depends_on: def.depends_on.clone(),
+        });
+        self.persist(&state)?;
+        Ok(true)
+    }
+
+    /// Remove a view and persist. Returns `false` if it was not present.
+    pub fn remove_view(&self, name: &str) -> std::io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(pos) = state.views.iter().position(|v| v.name == name) else {
+            return Ok(false);
+        };
+        state.views.remove(pos);
+        self.persist(&state)?;
+        Ok(true)
+    }
+
+    /// Every stored view, for catalog reflection, binder resolution, and drop
+    /// dependency checks.
+    pub fn views(&self) -> Vec<ViewDefinition> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state.views.iter().map(persist_view_to_definition).collect()
+    }
+
+    /// Look up a single view by name, cloning only the match — the binder calls
+    /// this per view reference, so it avoids materializing the whole view set.
+    pub fn view(&self, name: &str) -> Option<ViewDefinition> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
+            .views
+            .iter()
+            .find(|v| v.name == name)
+            .map(persist_view_to_definition)
+    }
+
     fn persist(&self, state: &State) -> std::io::Result<()> {
         let bytes = encode(state);
         let tmp = self.path.with_extension("tmp");
@@ -337,6 +433,27 @@ fn encode(state: &State) -> Vec<u8> {
                 out.push(u8::from(key.descending));
                 out.push(u8::from(key.nulls_first));
             }
+        }
+    }
+    // Views: a second backward-compatible tail after the metadata block. A reader
+    // that predates views stops above and never sees this.
+    out.extend_from_slice(VIEW_MAGIC);
+    out.extend_from_slice(&(state.views.len() as u32).to_le_bytes());
+    for v in &state.views {
+        put_str(&mut out, &v.name);
+        put_str(&mut out, &v.sql);
+        out.extend_from_slice(&(v.depends_on.len() as u32).to_le_bytes());
+        for dep in &v.depends_on {
+            put_str(&mut out, dep);
+        }
+        out.extend_from_slice(&(v.cols.len() as u32).to_le_bytes());
+        for c in &v.cols {
+            put_str(&mut out, &c.name);
+            out.extend_from_slice(&c.oid.to_le_bytes());
+            out.extend_from_slice(&c.typmod.to_le_bytes());
+            out.push(u8::from(c.nullable));
+            put_opt_str(&mut out, &c.not_null_constraint);
+            put_opt_str(&mut out, &c.default);
         }
     }
     out
@@ -472,7 +589,66 @@ fn decode(bytes: &[u8]) -> State {
             }
         }
     }
-    State { next, rels }
+    let mut views = Vec::new();
+    if d.remaining().starts_with(VIEW_MAGIC) {
+        d.p += VIEW_MAGIC.len();
+        let nviews = d.u32();
+        for _ in 0..nviews {
+            let name = d.s();
+            let sql = d.s();
+            let ndeps = d.u32();
+            let mut depends_on = Vec::with_capacity(ndeps as usize);
+            for _ in 0..ndeps {
+                depends_on.push(d.s());
+            }
+            let ncols = d.u32();
+            let mut cols = Vec::with_capacity(ncols as usize);
+            for _ in 0..ncols {
+                let cname = d.s();
+                let oid = d.u32();
+                let typmod = d.i32();
+                let nullable = d.byte() != 0;
+                let not_null_constraint = d.opt_s();
+                let default = d.opt_s();
+                cols.push(PersistCol {
+                    name: cname,
+                    oid,
+                    typmod,
+                    nullable,
+                    not_null_constraint,
+                    default,
+                });
+            }
+            views.push(PersistView {
+                name,
+                sql,
+                cols,
+                depends_on,
+            });
+        }
+    }
+    State { next, rels, views }
+}
+
+/// Reconstruct a [`ViewDefinition`] from its persisted form.
+fn persist_view_to_definition(v: &PersistView) -> ViewDefinition {
+    ViewDefinition {
+        name: v.name.clone(),
+        sql: v.sql.clone(),
+        columns: v
+            .cols
+            .iter()
+            .map(|c| {
+                let mut col =
+                    Column::with_typmod(c.name.clone(), pgtype_from_oid(c.oid), c.typmod);
+                col.nullable = c.nullable;
+                col.not_null_constraint = c.not_null_constraint.clone();
+                col.default = c.default.clone();
+                col
+            })
+            .collect(),
+        depends_on: v.depends_on.clone(),
+    }
 }
 
 /// Map a stored `pg_type` OID back to a [`PgType`]. Unknown OIDs become
@@ -570,6 +746,72 @@ mod tests {
         assert!(schema.columns[0].nullable);
         assert!(schema.columns[0].default.is_none());
         assert!(indexes.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn views_round_trip_and_legacy_catalog_ignores_them() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        // A table plus two views, one depending on the other.
+        catalog.create(&TableSchema {
+            name: "t".to_string(),
+            columns: vec![Column::new("id", PgType::Int4)],
+        })?;
+        assert!(catalog.create_view(&ViewDefinition {
+            name: "v".to_string(),
+            sql: "SELECT id FROM t".to_string(),
+            columns: vec![Column::new("id", PgType::Int4)],
+            depends_on: vec!["t".to_string()],
+        })?);
+        assert!(catalog.create_view(&ViewDefinition {
+            name: "w".to_string(),
+            sql: "SELECT id FROM v".to_string(),
+            columns: vec![Column::with_typmod("id", PgType::Int4, -1)],
+            depends_on: vec!["v".to_string()],
+        })?);
+        // A duplicate is rejected without persisting.
+        assert!(!catalog.create_view(&ViewDefinition {
+            name: "v".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![Column::new("x", PgType::Int4)],
+            depends_on: Vec::new(),
+        })?);
+        drop(catalog);
+
+        // Reload: both views survive with their SQL, columns, and dependencies.
+        let loaded = RelCatalog::load(dir.path())?;
+        let mut views = loaded.views();
+        views.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].name, "v");
+        assert_eq!(views[0].sql, "SELECT id FROM t");
+        assert_eq!(views[0].columns[0].name, "id");
+        assert_eq!(views[0].columns[0].ty, PgType::Int4);
+        assert_eq!(views[0].depends_on, vec!["t".to_string()]);
+        assert_eq!(views[1].name, "w");
+        assert_eq!(views[1].depends_on, vec!["v".to_string()]);
+
+        // Removing a view persists.
+        assert!(loaded.remove_view("v")?);
+        assert!(!loaded.remove_view("v")?);
+        drop(loaded);
+        let reloaded = RelCatalog::load(dir.path())?;
+        assert_eq!(reloaded.views().len(), 1);
+
+        // A pre-view catalog file (truncated at the view marker) still loads, with
+        // no views — the table is unaffected.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(VIEW_MAGIC.len())
+            .position(|w| w == VIEW_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("view marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        assert!(legacy.views().is_empty());
+        assert_eq!(legacy.schemas().len(), 1);
 
         Ok(())
     }

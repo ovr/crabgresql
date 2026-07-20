@@ -1,0 +1,42 @@
+--
+-- DROP VIEW
+-- DROP VIEW removes a view, IF EXISTS downgrades a miss to a NOTICE, the wrong
+-- object type is reported (a table is "not a view" and a view "not a table"),
+-- and a view that other views/tables depend on blocks a RESTRICT drop but
+-- cascades under CASCADE. Output hand-checked against PostgreSQL (psql -a -q).
+--
+CREATE TABLE t (id integer);
+INSERT INTO t VALUES (1), (2);
+CREATE VIEW v AS SELECT id FROM t;
+CREATE VIEW w AS SELECT id FROM v;
+-- DROP TABLE on a view (and DROP VIEW on a table) is a wrong-object-type error.
+DROP TABLE v;
+ERROR:  "v" is not a table
+HINT:  Use DROP VIEW to remove a view.
+DROP VIEW t;
+ERROR:  "t" is not a view
+HINT:  Use DROP TABLE to remove a table.
+-- RESTRICT (the default): the view blocks dropping the table it reads.
+DROP TABLE t;
+ERROR:  cannot drop table t because other objects depend on it
+DETAIL:  view v depends on table t
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+-- ... and w blocks dropping the view v it reads.
+DROP VIEW v;
+ERROR:  cannot drop view v because other objects depend on it
+DETAIL:  view w depends on view v
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+-- DROP VIEW removes a leaf view; afterwards it no longer resolves.
+DROP VIEW w;
+SELECT id FROM w;
+ERROR:  relation "w" does not exist
+-- A missing view without IF EXISTS errors; with IF EXISTS it is a skip NOTICE.
+DROP VIEW w;
+ERROR:  view "w" does not exist
+DROP VIEW IF EXISTS w;
+NOTICE:  view "w" does not exist, skipping
+-- CASCADE drops the table and every view that still depends on it.
+DROP TABLE t CASCADE;
+NOTICE:  drop cascades to view v
+SELECT id FROM v;
+ERROR:  relation "v" does not exist

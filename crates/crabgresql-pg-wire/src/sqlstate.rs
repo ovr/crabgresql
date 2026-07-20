@@ -31,6 +31,9 @@ pub const DATATYPE_MISMATCH: &str = "42804";
 pub const GROUPING_ERROR: &str = "42803";
 pub const UNDEFINED_TABLE: &str = "42P01";
 pub const DUPLICATE_TABLE: &str = "42P07";
+/// `42P16` — a relation definition is invalid (e.g. a `CREATE OR REPLACE VIEW`
+/// that renames, drops, or retypes an existing view column).
+pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
 pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
 pub const PROTOCOL_VIOLATION: &str = "08P01";

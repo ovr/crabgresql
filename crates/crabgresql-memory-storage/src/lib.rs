@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
     DeleteResult, IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
-    Tid, Tuple, UpdateResult,
+    Tid, Tuple, UpdateResult, ViewDefinition,
 };
 use crabgresql_txn::{Clog, TupleHeader, TxnContext, XactStatus, satisfies_mvcc};
 use crabgresql_types::{PgType, Value};
@@ -23,6 +23,7 @@ use crabgresql_types::{PgType, Value};
 #[derive(Default)]
 pub struct MemoryEngine {
     tables: RwLock<HashMap<String, Arc<MemoryTable>>>,
+    views: RwLock<HashMap<String, ViewDefinition>>,
 }
 
 impl MemoryEngine {
@@ -38,6 +39,11 @@ impl TableEngine for MemoryEngine {
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&schema.name)
+            || self
+                .views
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(&schema.name)
             || tables.values().any(|t| {
                 t.indexes
                     .read()
@@ -80,6 +86,65 @@ impl TableEngine for MemoryEngine {
             .remove(name)
             .map(|_| ())
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
+    }
+
+    fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {
+        // A view shares PostgreSQL's relation namespace with tables and indexes,
+        // so a collision with any of them is `relation "x" already exists`.
+        let tables = self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        if tables.contains_key(&def.name)
+            || tables.values().any(|t| {
+                t.indexes
+                    .read()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                    .iter()
+                    .any(|i| i.name == def.name)
+            })
+        {
+            return Err(StorageError::TableAlreadyExists(def.name));
+        }
+        drop(tables);
+        let mut views = self
+            .views
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        // A plain insert would silently replace; `CREATE OR REPLACE` is handled by
+        // the server dropping first, so an existing name here is a real conflict.
+        if views.contains_key(&def.name) {
+            return Err(StorageError::TableAlreadyExists(def.name));
+        }
+        views.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    fn resolve_view(&self, _schema: Option<&str>, name: &str) -> Option<ViewDefinition> {
+        // The session overlay has already resolved the namespace; look up by name.
+        self.views
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .get(name)
+            .cloned()
+    }
+
+    fn drop_view(&self, name: &str) -> Result<(), StorageError> {
+        self.views
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
+    }
+
+    fn views(&self) -> Vec<ViewDefinition> {
+        self.views
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .values()
+            .cloned()
+            .collect()
     }
 
     fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
