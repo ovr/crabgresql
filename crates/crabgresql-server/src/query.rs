@@ -883,7 +883,8 @@ fn execute_truncate(
             "TRUNCATE ... ON CLUSTER is not supported yet",
         ));
     }
-    let mut tables: Vec<Arc<dyn TableAm>> = Vec::with_capacity(truncate.table_names.len());
+    let mut named: Vec<(String, Arc<dyn TableAm>)> =
+        Vec::with_capacity(truncate.table_names.len());
     for target in &truncate.table_names {
         if target.only || target.has_asterisk {
             return Err(PgError::feature_not_supported(
@@ -891,13 +892,19 @@ fn execute_truncate(
             ));
         }
         let name = object_name_to_table_name(&target.name)?;
-        tables.push(engine.open_table(&name)?);
+        let table = engine.open_table(&name)?;
+        named.push((name, table));
     }
+    // Acquire the tables' exclusive locks in a deterministic order (by name), so
+    // two concurrent multi-table TRUNCATEs can never deadlock, and drop duplicates
+    // named twice in one statement.
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    named.dedup_by(|a, b| a.0 == b.0);
     // TRUNCATE is a write: run it under a real transaction so autocommit commits
-    // it. (The in-memory engine clears eagerly and ignores the context; truncate
-    // becomes fully transactional with the heap engine.)
+    // it. On the durable heap engine this is fully transactional — the swap is
+    // applied on commit and discarded on rollback (or a crash before commit).
     let txn = build_txn(txnmgr, session, true);
-    for table in &tables {
+    for (_, table) in &named {
         table.truncate(&txn);
     }
     finalize_statement(txnmgr, session, &txn, true, true)?;

@@ -9,13 +9,13 @@ use crabgresql_storage_api::{
     Column, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableAm,
     TableEngine, TableSchema, Tid, Tuple, UpdateResult,
 };
-use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, TxnContext, Xid};
+use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, TxnContext, TxnFinalize, Xid};
 use crabgresql_types::{PgType, Value};
 use crabgresql_wal::{RmgrRegistry, Wal};
 
 struct H {
     _dir: tempfile::TempDir,
-    engine: PgEngine,
+    engine: Arc<PgEngine>,
     tm: TransactionManager,
 }
 
@@ -30,12 +30,14 @@ fn setup() -> H {
     });
     let mut reg = RmgrRegistry::new();
     let engine = match PgEngine::new(dir.path(), Arc::clone(&wal), &mut reg) {
-        Ok(engine) => engine,
+        Ok(engine) => Arc::new(engine),
         Err(error) => panic!("failed to open test engine: {error}"),
     };
     let clog = Arc::new(Clog::new());
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
-    let tm = TransactionManager::new_recovered(sink, clog, Xid::FIRST_NORMAL);
+    let mut tm = TransactionManager::new_recovered(sink, clog, Xid::FIRST_NORMAL);
+    // Wire the finalize hook so a committed TRUNCATE applies its relfilenode swap.
+    tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
     H {
         _dir: dir,
         engine,

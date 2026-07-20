@@ -18,6 +18,7 @@ mod bufpool;
 mod catalog;
 mod datum;
 mod heap;
+mod lock;
 mod page;
 mod rec;
 mod redo;
@@ -26,11 +27,12 @@ mod tuple;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_storage_api::{
     IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
 };
+use crabgresql_txn::{Clog, TxnFinalize, Xid};
 use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, write_control};
 
 use crate::bufpool::BufferPool;
@@ -41,6 +43,16 @@ use crate::smgr::StorageManager;
 
 pub use crate::smgr::RelFileNode;
 
+/// A TRUNCATE swap replayed from the WAL during recovery, awaiting a verdict:
+/// its swap is applied to the catalog only if `xid` committed. Collected by the
+/// redo handler and drained by [`PgEngine::apply_recovered_truncates`].
+pub(crate) struct RecoveredTruncate {
+    pub xid: Xid,
+    pub table: String,
+    pub old: RelFileNode,
+    pub new: RelFileNode,
+}
+
 /// Number of buffer-pool frames (8 MB). Must comfortably exceed the number of
 /// pages pinned concurrently; see `bufpool` docs.
 const DEFAULT_FRAMES: usize = 1024;
@@ -49,13 +61,23 @@ const DEFAULT_FRAMES: usize = 1024;
 pub(crate) struct EngineInner {
     pub bufpool: BufferPool,
     pub wal: Arc<Wal>,
+    /// The durable relation catalog, shared so a heap table's TRUNCATE can
+    /// allocate a fresh relfilenode.
+    pub catalog: Arc<RelCatalog>,
+    /// Uncommitted relfilenode-swap TRUNCATEs, keyed by the truncating XID:
+    /// which tables it truncated. The commit/abort hook drains an XID's entry to
+    /// apply or discard its swaps and release the table locks.
+    pub pending_truncates: Mutex<HashMap<Xid, Vec<String>>>,
+    /// TRUNCATE swaps replayed from the WAL during recovery, applied after the
+    /// CLOG is rebuilt (see [`PgEngine::apply_recovered_truncates`]).
+    pub recovered_truncates: Mutex<Vec<RecoveredTruncate>>,
 }
 
 /// The durable heap engine: a [`TableEngine`] over a data directory.
 pub struct PgEngine {
     inner: Arc<EngineInner>,
     data_dir: PathBuf,
-    catalog: RelCatalog,
+    catalog: Arc<RelCatalog>,
     tables: RwLock<HashMap<String, Arc<HeapTable>>>,
 }
 
@@ -71,7 +93,14 @@ impl PgEngine {
     ) -> std::io::Result<PgEngine> {
         let smgr = Arc::new(StorageManager::open(data_dir)?);
         let bufpool = BufferPool::new(DEFAULT_FRAMES, smgr, Arc::clone(&wal));
-        let inner = Arc::new(EngineInner { bufpool, wal });
+        let catalog = Arc::new(RelCatalog::load(data_dir)?);
+        let inner = Arc::new(EngineInner {
+            bufpool,
+            wal,
+            catalog: Arc::clone(&catalog),
+            pending_truncates: Mutex::new(HashMap::new()),
+            recovered_truncates: Mutex::new(Vec::new()),
+        });
         registry.register(
             RmgrId::HEAP,
             Arc::new(HeapRedo {
@@ -79,7 +108,6 @@ impl PgEngine {
             }),
         );
 
-        let catalog = RelCatalog::load(data_dir)?;
         let mut tables = HashMap::new();
         for (name, rel, schema, indexes) in catalog.schemas() {
             tables.insert(
@@ -109,6 +137,144 @@ impl PgEngine {
         )
         .map_err(std::io::Error::other)?;
         Ok(())
+    }
+
+    /// Resolve relfilenode-swap TRUNCATEs replayed from the WAL, now that the
+    /// CLOG has been rebuilt. Called once by `open_pg_engine` after `recover` and
+    /// before `checkpoint`. For each truncated table, in WAL order:
+    ///
+    /// * every old/new relfilenode is fed to the catalog so a freshly issued id
+    ///   can never alias a file already on disk;
+    /// * if the truncating transaction **committed**, the table is rebound to its
+    ///   final new file (persisting the catalog if it lagged) and every superseded
+    ///   file is unlinked;
+    /// * otherwise the truncate never happened: the staged new file(s) are
+    ///   discarded and the table keeps its original file (rows intact).
+    ///
+    /// Idempotent across repeated recoveries: a re-applied swap sees the catalog
+    /// already pointing at the new file and only re-cleans the (already gone) old
+    /// file, which tolerates a missing file.
+    pub fn apply_recovered_truncates(&self, clog: &Clog) {
+        let recovered = std::mem::take(&mut *self.inner.recovered_truncates.lock().unwrap());
+        if recovered.is_empty() {
+            return;
+        }
+        // Group by table, preserving WAL order within each group.
+        let mut order: Vec<String> = Vec::new();
+        let mut by_table: HashMap<String, Vec<RecoveredTruncate>> = HashMap::new();
+        for rt in recovered {
+            self.catalog.observe_relfilenode(rt.old);
+            self.catalog.observe_relfilenode(rt.new);
+            if !by_table.contains_key(&rt.table) {
+                order.push(rt.table.clone());
+            }
+            by_table.entry(rt.table.clone()).or_default().push(rt);
+        }
+
+        for table in order {
+            let chain = &by_table[&table];
+            let last = chain.last().unwrap();
+            let committed = clog.is_committed(last.xid);
+            if committed {
+                // Apply the swap. Persist the catalog only if it lagged the WAL.
+                if self.catalog.current_relfilenode(&table) != Some(last.new) {
+                    self.catalog
+                        .swap_relfilenode(&table, last.new)
+                        .expect("relation catalog write failed");
+                }
+                if let Some(t) = self.tables.read().unwrap().get(&table) {
+                    t.rebind(last.new);
+                }
+                // Unlink every file but the surviving one: each entry's old plus
+                // every superseded intermediate new.
+                for rt in chain {
+                    for victim in [rt.old, rt.new] {
+                        if victim != last.new {
+                            self.inner.bufpool.forget_relation(victim);
+                            let _ = self.inner.bufpool.smgr().unlink(victim);
+                        }
+                    }
+                }
+            } else {
+                // Not committed: discard every staged new file; keep the original.
+                for rt in chain {
+                    self.inner.bufpool.forget_relation(rt.new);
+                    let _ = self.inner.bufpool.smgr().unlink(rt.new);
+                }
+            }
+        }
+    }
+
+    /// Delete `base/<n>` files not referenced by any live catalog relation.
+    /// Reclaims staged TRUNCATE files whose transaction neither committed nor was
+    /// otherwise resolved (e.g. a crash before the transaction ended). Safe only
+    /// after [`PgEngine::apply_recovered_truncates`] has run — relfilenodes are
+    /// never reused, so a file with no catalog entry is genuinely orphaned.
+    pub fn gc_orphan_relfiles(&self) -> std::io::Result<()> {
+        let live: std::collections::HashSet<u32> =
+            self.catalog.live_relfilenodes().into_iter().collect();
+        let base = self.data_dir.join("base");
+        let entries = match std::fs::read_dir(&base) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if let Some(n) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                && !live.contains(&n)
+            {
+                self.inner.bufpool.forget_relation(RelFileNode(n));
+                let _ = self.inner.bufpool.smgr().unlink(RelFileNode(n));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TxnFinalize for PgEngine {
+    /// Apply the transaction's committed TRUNCATE swaps: rebind each table to its
+    /// new file, unlink the old file, and release the exclusive table lock. The
+    /// commit's WAL record is already fsynced, so a crash before or during this
+    /// is repaired by `apply_recovered_truncates` at the next boot.
+    fn on_commit(&self, xid: Xid) {
+        let Some(tables) = self.inner.pending_truncates.lock().unwrap().remove(&xid) else {
+            return; // hot path: nothing to finalize for this transaction
+        };
+        let handles = self.tables.read().unwrap();
+        for name in tables {
+            if let Some(t) = handles.get(&name) {
+                if let Some(old) = t.commit_truncate(xid) {
+                    self.catalog
+                        .swap_relfilenode(&name, t.relfilenode())
+                        .expect("relation catalog write failed");
+                    self.inner.bufpool.forget_relation(old);
+                    let _ = self.inner.bufpool.smgr().unlink(old);
+                }
+                t.release_truncate_lock(xid);
+            }
+        }
+    }
+
+    /// Discard the transaction's staged TRUNCATE files (the table keeps its
+    /// original file) and release the exclusive table lock.
+    fn on_abort(&self, xid: Xid) {
+        let Some(tables) = self.inner.pending_truncates.lock().unwrap().remove(&xid) else {
+            return;
+        };
+        let handles = self.tables.read().unwrap();
+        for name in tables {
+            if let Some(t) = handles.get(&name) {
+                if let Some(new) = t.abort_truncate(xid) {
+                    self.inner.bufpool.forget_relation(new);
+                    let _ = self.inner.bufpool.smgr().unlink(new);
+                }
+                t.release_truncate_lock(xid);
+            }
+        }
     }
 }
 

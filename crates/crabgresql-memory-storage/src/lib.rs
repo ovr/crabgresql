@@ -550,28 +550,14 @@ impl TableAm for MemoryTable {
         applied
     }
 
-    /// Drop every version in one step. `next_tid` keeps advancing so tids stay
-    /// monotonic and never-reused. (Truncate is not yet transactional — a
-    /// rollback will not bring the rows back; that fidelity waits for the heap
-    /// engine.)
-    fn truncate(&self, _txn: &TxnContext) {
-        let mut rows = self
-            .rows
-            .write()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        *rows = Arc::new(Vec::new());
-        // Drop the now-dangling index entries (rows → phys lock order).
-        for index in self
-            .phys
-            .write()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .iter_mut()
-        {
-            if let Some(map) = index.map.as_mut() {
-                map.clear();
-            }
-        }
-    }
+    // TRUNCATE uses the default `TableAm::truncate` (scan the visible rows and
+    // `delete_many` them), which stamps each version's `xmax` with the truncating
+    // XID — so it is fully MVCC-transactional: a rollback leaves the versions live
+    // and VACUUM reclaims them once the delete commits. The durable heap engine
+    // instead swaps the relfilenode (PG's mechanism); both agree observably.
+    // The physical index (`phys`) is intentionally NOT cleared: its probe already
+    // MVCC-filters dead versions, and keeping the entries lets a rolled-back
+    // TRUNCATE restore visibility without rebuilding the index.
 
     /// Reclaim versions that are dead to everyone: deleted by a **committed**
     /// transaction at or before `oldest`. A single retain pass under the lock. A

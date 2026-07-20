@@ -355,6 +355,25 @@ pub trait CommitSink: Send + Sync {
     fn log_abort(&self, xid: Xid);
 }
 
+/// A callback the engine registers so it can apply deferred physical work when a
+/// transaction's fate is decided — after the [`Clog`] records it. The durable
+/// heap engine uses it to commit or discard a relfilenode-swap TRUNCATE (swap in
+/// the new file and unlink the old on commit; unlink the new file on abort) and
+/// to release the table lock the TRUNCATE held to transaction end.
+///
+/// This is invoked from [`TransactionManager::commit`]/[`TransactionManager::abort`]
+/// *after* the CLOG update, so every finalize path — autocommit statements, an
+/// explicit `COMMIT`/`ROLLBACK`, and a dropped session with an open block — fires
+/// it uniformly, with no engine handle threaded through the query layer. The
+/// commit's WAL fsync (in [`CommitSink::log_commit`]) has already completed by the
+/// time `on_commit` runs, so a crash between the two is repaired at recovery. When
+/// no hook is attached (the in-memory engine, unit tests) commit/abort behave
+/// exactly as before.
+pub trait TxnFinalize: Send + Sync {
+    fn on_commit(&self, xid: Xid);
+    fn on_abort(&self, xid: Xid);
+}
+
 /// The core's transaction service, shared by the whole server: it hands out
 /// XIDs, records commit/abort in the [`Clog`], and mints [`TxnContext`]s with a
 /// fresh snapshot. One instance is shared across all connections (XIDs and the
@@ -366,6 +385,9 @@ pub struct TransactionManager {
     /// Durable commit log, when running on a durable engine; `None` keeps the
     /// pre-durability in-memory behavior for the memory engine and unit tests.
     sink: Option<Arc<dyn CommitSink>>,
+    /// Engine finalize hook (relfilenode-swap TRUNCATE apply/discard + lock
+    /// release); `None` for the memory engine and unit tests.
+    finalize: Option<Arc<dyn TxnFinalize>>,
 }
 
 impl TransactionManager {
@@ -381,7 +403,14 @@ impl TransactionManager {
             xids: XidManager::with_next(next_xid),
             clog,
             sink: Some(sink),
+            finalize: None,
         }
+    }
+
+    /// Attach the engine's [`TxnFinalize`] hook. Called once at startup, after
+    /// the engine and manager are built, before any connection is served.
+    pub fn set_finalize(&mut self, finalize: Arc<dyn TxnFinalize>) {
+        self.finalize = Some(finalize);
     }
 
     /// The shared commit log (engines consult it through [`TxnContext::clog`]).
@@ -419,6 +448,12 @@ impl TransactionManager {
             }
             self.clog.set_committed(xid);
             self.xids.complete(xid);
+            // Fire the engine hook only after the fate is durable (the WAL commit
+            // fsynced above) and recorded in the CLOG, so it can apply the
+            // relfilenode swap and unlink the old file safely.
+            if let Some(finalize) = &self.finalize {
+                finalize.on_commit(xid);
+            }
         }
         Ok(())
     }
@@ -434,6 +469,11 @@ impl TransactionManager {
             }
             self.clog.set_aborted(xid);
             self.xids.complete(xid);
+            // Discard the transaction's uncommitted physical work (a pending
+            // TRUNCATE's new file) and release any table lock it held.
+            if let Some(finalize) = &self.finalize {
+                finalize.on_abort(xid);
+            }
         }
     }
 
