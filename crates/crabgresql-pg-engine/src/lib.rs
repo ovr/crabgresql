@@ -505,7 +505,7 @@ impl TableEngine for PgEngine {
     }
 
     fn resolve_view(&self, _schema: Option<&str>, name: &str) -> Option<ViewDefinition> {
-        self.catalog.views().into_iter().find(|v| v.name == name)
+        self.catalog.view(name)
     }
 
     fn drop_view(&self, name: &str) -> Result<(), StorageError> {

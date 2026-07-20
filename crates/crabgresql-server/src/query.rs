@@ -2141,16 +2141,12 @@ fn execute_create_view(
                 ));
             }
         }
+        // PG rejects only *too many* names; a shorter list renames the leading
+        // columns and leaves the trailing ones with their query-derived names.
         if create.columns.len() > columns.len() {
             return Err(PgError::new(
                 sqlstate::SYNTAX_ERROR,
                 "CREATE VIEW specifies more column names than columns",
-            ));
-        }
-        if create.columns.len() < columns.len() {
-            return Err(PgError::new(
-                sqlstate::SYNTAX_ERROR,
-                "CREATE VIEW specifies less column names than columns",
             ));
         }
         for (out, def) in columns.iter_mut().zip(&create.columns) {
@@ -2258,44 +2254,45 @@ fn check_view_replace_compatible(old: &ViewDefinition, new: &[Column]) -> Result
 /// list) are not traced yet.
 fn referenced_relations(query: &ast::Query) -> Vec<String> {
     let mut names = Vec::new();
-    let mut cte_names = Vec::new();
-    collect_query_relations(query, &mut names, &mut cte_names);
+    // The CTE names currently in scope, as a stack: a query's `WITH` names shadow
+    // like-named base tables only within that query (and its nested scopes), so
+    // they are pushed on entry and popped on exit rather than filtered globally.
+    let mut scope: Vec<String> = Vec::new();
+    collect_query_relations(query, &mut names, &mut scope);
     let mut seen = HashSet::new();
-    names
-        .into_iter()
-        .filter(|n| !cte_names.contains(n))
-        .filter(|n| seen.insert(n.clone()))
-        .collect()
+    names.into_iter().filter(|n| seen.insert(n.clone())).collect()
 }
 
-fn collect_query_relations(query: &ast::Query, names: &mut Vec<String>, cte_names: &mut Vec<String>) {
+fn collect_query_relations(query: &ast::Query, names: &mut Vec<String>, scope: &mut Vec<String>) {
+    let pushed = query.with.as_ref().map_or(0, |with| {
+        for cte in &with.cte_tables {
+            scope.push(normalize_ident(&cte.alias.name));
+        }
+        with.cte_tables.len()
+    });
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            cte_names.push(normalize_ident(&cte.alias.name));
-            collect_query_relations(&cte.query, names, cte_names);
+            collect_query_relations(&cte.query, names, scope);
         }
     }
-    collect_setexpr_relations(&query.body, names, cte_names);
+    collect_setexpr_relations(&query.body, names, scope);
+    scope.truncate(scope.len() - pushed);
 }
 
-fn collect_setexpr_relations(
-    body: &ast::SetExpr,
-    names: &mut Vec<String>,
-    cte_names: &mut Vec<String>,
-) {
+fn collect_setexpr_relations(body: &ast::SetExpr, names: &mut Vec<String>, scope: &mut Vec<String>) {
     match body {
         ast::SetExpr::Select(select) => {
             for twj in &select.from {
-                collect_factor_relations(&twj.relation, names, cte_names);
+                collect_factor_relations(&twj.relation, names, scope);
                 for join in &twj.joins {
-                    collect_factor_relations(&join.relation, names, cte_names);
+                    collect_factor_relations(&join.relation, names, scope);
                 }
             }
         }
-        ast::SetExpr::Query(query) => collect_query_relations(query, names, cte_names),
+        ast::SetExpr::Query(query) => collect_query_relations(query, names, scope),
         ast::SetExpr::SetOperation { left, right, .. } => {
-            collect_setexpr_relations(left, names, cte_names);
-            collect_setexpr_relations(right, names, cte_names);
+            collect_setexpr_relations(left, names, scope);
+            collect_setexpr_relations(right, names, scope);
         }
         _ => {}
     }
@@ -2304,26 +2301,30 @@ fn collect_setexpr_relations(
 fn collect_factor_relations(
     factor: &ast::TableFactor,
     names: &mut Vec<String>,
-    cte_names: &mut Vec<String>,
+    scope: &mut Vec<String>,
 ) {
     match factor {
-        // A plain relation reference (a table function carries `args`).
+        // A plain relation reference (a table function carries `args`); skip it
+        // when an in-scope CTE of the same name shadows the base relation.
         ast::TableFactor::Table {
             name, args: None, ..
         } => {
             if let Some(part) = name.0.last().and_then(|part| part.as_ident()) {
-                names.push(normalize_ident(part));
+                let name = normalize_ident(part);
+                if !scope.contains(&name) {
+                    names.push(name);
+                }
             }
         }
         ast::TableFactor::Derived { subquery, .. } => {
-            collect_query_relations(subquery, names, cte_names)
+            collect_query_relations(subquery, names, scope)
         }
         ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            collect_factor_relations(&table_with_joins.relation, names, cte_names);
+            collect_factor_relations(&table_with_joins.relation, names, scope);
             for join in &table_with_joins.joins {
-                collect_factor_relations(&join.relation, names, cte_names);
+                collect_factor_relations(&join.relation, names, scope);
             }
         }
         _ => {}
@@ -2582,6 +2583,32 @@ fn execute_drop_cast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The referenced relations of the query in a `SELECT` statement.
+    fn deps(sql: &str) -> Vec<String> {
+        let stmts = crabgresql_parser::parse(sql).expect("parse");
+        match &stmts[0] {
+            ast::Statement::Query(query) => referenced_relations(query),
+            other => panic!("expected a query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn referenced_relations_excludes_cte_names_but_keeps_their_bodies() {
+        // A CTE name is not a dependency; the base table inside its body is.
+        assert_eq!(deps("WITH c AS (SELECT 1) SELECT * FROM c"), Vec::<String>::new());
+        assert_eq!(deps("WITH c AS (SELECT * FROM t) SELECT * FROM c"), vec!["t"]);
+    }
+
+    #[test]
+    fn referenced_relations_scopes_cte_shadowing_to_its_own_query() {
+        // The CTE `c` shadows a base table only inside the derived subquery; the
+        // outer `c` is the real relation and must remain a dependency.
+        assert_eq!(
+            deps("SELECT * FROM (WITH c AS (SELECT 1) SELECT * FROM c) d, c"),
+            vec!["c"]
+        );
+    }
 
     /// Extract the base-type option list from a parsed `CREATE TYPE name (...)`.
     fn create_type_options(sql: &str) -> Vec<ast::UserDefinedTypeSqlDefinitionOption> {

@@ -2798,3 +2798,46 @@ async fn recursive_view_definition_errors_on_use_not_creation() -> anyhow::Resul
     );
     Ok(())
 }
+
+/// PG accepts a CREATE VIEW column list shorter than the query's output (the
+/// trailing columns keep their derived names); only a longer list is an error.
+#[tokio::test]
+async fn create_view_accepts_fewer_column_names() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4, b int4)").await?;
+    client.simple_query("INSERT INTO t VALUES (1, 2)").await?;
+    // One name for a two-column query: `a` is renamed to `x`, `b` keeps its name.
+    client
+        .simple_query("CREATE VIEW v (x) AS SELECT a, b FROM t")
+        .await?;
+    let messages = client.simple_query("SELECT x, b FROM v").await?;
+    let result = rows(&messages);
+    assert_eq!(result[0].get("x"), Some("1"));
+    assert_eq!(result[0].get("b"), Some("2"));
+
+    // More names than columns is still an error.
+    let err = client
+        .simple_query("CREATE VIEW w (p, q, r) AS SELECT a, b FROM t")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::SYNTAX_ERROR);
+    assert_eq!(db.message(), "CREATE VIEW specifies more column names than columns");
+    Ok(())
+}
+
+/// A relation resolved through the search path (a temp table) shadows a
+/// same-named permanent view, matching PG's `pg_temp`-before-`public` precedence.
+#[tokio::test]
+async fn temp_table_shadows_same_named_view() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE VIEW x AS SELECT 1 AS a").await?;
+    client.simple_query("CREATE TEMP TABLE x (b int4)").await?;
+    client.simple_query("INSERT INTO x VALUES (5)").await?;
+    // The temp table wins; the row (and column name `b`) come from it, not the view.
+    let messages = client.simple_query("SELECT b FROM x").await?;
+    assert_eq!(rows(&messages)[0].get("b"), Some("5"));
+    Ok(())
+}

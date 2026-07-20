@@ -91,14 +91,22 @@ impl TableEngine for MemoryEngine {
     fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {
         // A view shares PostgreSQL's relation namespace with tables and indexes,
         // so a collision with any of them is `relation "x" already exists`.
-        if self
+        let tables = self
             .tables
             .read()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .contains_key(&def.name)
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        if tables.contains_key(&def.name)
+            || tables.values().any(|t| {
+                t.indexes
+                    .read()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                    .iter()
+                    .any(|i| i.name == def.name)
+            })
         {
             return Err(StorageError::TableAlreadyExists(def.name));
         }
+        drop(tables);
         let mut views = self
             .views
             .write()

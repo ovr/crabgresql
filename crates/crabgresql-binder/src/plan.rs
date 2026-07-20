@@ -990,55 +990,69 @@ fn bind_from_item(
                     input: JoinInput::Subplan(Box::new(cte.plan.clone())),
                 });
             }
-            // A view shares PostgreSQL's relation namespace with tables, so it is
-            // resolved before table resolution: its stored query is re-parsed and
-            // re-bound as a subplan (the same mechanism as a CTE / derived table).
-            if let Some(view) = engine.resolve_view(cte_schema.as_deref(), &tname) {
-                // A view whose definition (transitively) reads itself would
-                // recurse forever when expanded. PG allows creating such a view
-                // but errors when it is used; detect the cycle from the stored
-                // dependency graph before expanding, matching that behavior.
-                if view_is_recursive(engine, &view.name) {
-                    return Err(BindError::new(
-                        sqlstate::INVALID_OBJECT_DEFINITION,
-                        format!(
-                            "infinite recursion detected in rules for relation \"{}\"",
-                            view.name
-                        ),
-                    ));
+            // Read resolution honors the search path: temp → pg_catalog →
+            // global, so an unqualified `pg_type` reaches `pg_catalog` and a temp
+            // table shadows a permanent one (a qualified miss keeps its schema in
+            // the error text). A view shares this relation namespace, but PG's
+            // precedence puts a real relation (temp table, system catalog) ahead
+            // of a like-named view — so a view is tried only when no table on the
+            // path claims the name.
+            match engine.resolve(cte_schema.as_deref(), &tname) {
+                Ok(table) => {
+                    let qualifier = relation_qualifier(alias, &tname);
+                    let mut columns: Vec<OutputColumn> = table
+                        .schema()
+                        .columns
+                        .iter()
+                        .map(|c| OutputColumn {
+                            name: c.name.clone(),
+                            ty: c.ty,
+                        })
+                        .collect();
+                    apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
+                    Ok(BoundFromItem {
+                        qualifier,
+                        columns,
+                        input: JoinInput::Scan(table),
+                    })
                 }
-                let inner = bind_view_query(engine, catalog, &view)?;
-                let qualifier = relation_qualifier(alias, &tname);
-                let mut columns = view_output_columns(&inner, &view)?;
-                apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
-                return Ok(BoundFromItem {
-                    qualifier,
-                    columns,
-                    input: JoinInput::Subplan(Box::new(inner)),
-                });
+                Err(e) => {
+                    // No table on the path: a public view may claim the name. Its
+                    // stored query is re-parsed and re-bound as a subplan (the same
+                    // mechanism as a CTE / derived table).
+                    if matches!(e, StorageError::TableNotFound(_))
+                        && let Some(view) = engine.resolve_view(cte_schema.as_deref(), &tname)
+                    {
+                        // A view whose definition (transitively) reads itself would
+                        // recurse forever when expanded. PG allows creating such a
+                        // view but errors when it is used; detect the cycle from the
+                        // stored dependency graph before expanding.
+                        if view_is_recursive(engine, &view.name) {
+                            return Err(BindError::new(
+                                sqlstate::INVALID_OBJECT_DEFINITION,
+                                format!(
+                                    "infinite recursion detected in rules for relation \"{}\"",
+                                    view.name
+                                ),
+                            ));
+                        }
+                        let inner = bind_view_query(engine, catalog, &view)?;
+                        let qualifier = relation_qualifier(alias, &tname);
+                        let mut columns = view_output_columns(&inner, &view)?;
+                        apply_relation_alias_columns(
+                            &mut columns,
+                            alias,
+                            &table_subject(&qualifier),
+                        )?;
+                        return Ok(BoundFromItem {
+                            qualifier,
+                            columns,
+                            input: JoinInput::Subplan(Box::new(inner)),
+                        });
+                    }
+                    Err(not_found_as_written(e, cte_schema.as_deref(), &tname))
+                }
             }
-            // Read resolution honors the search path: an unqualified `pg_type`
-            // reaches `pg_catalog`, and `pg_catalog.pg_type` routes there
-            // directly (a qualified miss keeps its schema in the error text).
-            let table = engine
-                .resolve(cte_schema.as_deref(), &tname)
-                .map_err(|e| not_found_as_written(e, cte_schema.as_deref(), &tname))?;
-            let qualifier = relation_qualifier(alias, &tname);
-            let mut columns: Vec<OutputColumn> = table
-                .schema()
-                .columns
-                .iter()
-                .map(|c| OutputColumn {
-                    name: c.name.clone(),
-                    ty: c.ty,
-                })
-                .collect();
-            apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
-            Ok(BoundFromItem {
-                qualifier,
-                columns,
-                input: JoinInput::Scan(table),
-            })
         }
         ast::TableFactor::Derived {
             subquery, alias, ..

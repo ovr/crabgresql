@@ -332,30 +332,21 @@ impl RelCatalog {
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state.views.iter().map(persist_view_to_definition).collect()
+    }
+
+    /// Look up a single view by name, cloning only the match — the binder calls
+    /// this per view reference, so it avoids materializing the whole view set.
+    pub fn view(&self, name: &str) -> Option<ViewDefinition> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         state
             .views
             .iter()
-            .map(|v| ViewDefinition {
-                name: v.name.clone(),
-                sql: v.sql.clone(),
-                columns: v
-                    .cols
-                    .iter()
-                    .map(|c| {
-                        let mut col = Column::with_typmod(
-                            c.name.clone(),
-                            pgtype_from_oid(c.oid),
-                            c.typmod,
-                        );
-                        col.nullable = c.nullable;
-                        col.not_null_constraint = c.not_null_constraint.clone();
-                        col.default = c.default.clone();
-                        col
-                    })
-                    .collect(),
-                depends_on: v.depends_on.clone(),
-            })
-            .collect()
+            .find(|v| v.name == name)
+            .map(persist_view_to_definition)
     }
 
     fn persist(&self, state: &State) -> std::io::Result<()> {
@@ -637,6 +628,27 @@ fn decode(bytes: &[u8]) -> State {
         }
     }
     State { next, rels, views }
+}
+
+/// Reconstruct a [`ViewDefinition`] from its persisted form.
+fn persist_view_to_definition(v: &PersistView) -> ViewDefinition {
+    ViewDefinition {
+        name: v.name.clone(),
+        sql: v.sql.clone(),
+        columns: v
+            .cols
+            .iter()
+            .map(|c| {
+                let mut col =
+                    Column::with_typmod(c.name.clone(), pgtype_from_oid(c.oid), c.typmod);
+                col.nullable = c.nullable;
+                col.not_null_constraint = c.not_null_constraint.clone();
+                col.default = c.default.clone();
+                col
+            })
+            .collect(),
+        depends_on: v.depends_on.clone(),
+    }
 }
 
 /// Map a stored `pg_type` OID back to a [`PgType`]. Unknown OIDs become
