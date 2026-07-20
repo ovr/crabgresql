@@ -8,9 +8,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crabgresql_binder::{
-    BoundExpr, CopyFromPlan, LogicalPlan, bind_copy_from, bind_delete_with_params,
-    bind_insert_with_params, bind_query_with_params, bind_update_with_params, output_columns_of,
-    param_ctx_extended, param_ctx_none, param_types, require_all_resolved, substitute_params,
+    BoundExpr, CopyFromPlan, InsertSource, LogicalPlan, bind_copy_from, bind_delete_with_params,
+    bind_insert_with_params, bind_query, bind_query_with_params, bind_update_with_params,
+    output_columns_of, param_ctx_extended, param_ctx_none, param_types, require_all_resolved,
+    substitute_params,
 };
 use crabgresql_executor::{DmlVerb, ExecNode, Execution, OutputColumn, Values, execute};
 use crabgresql_parser::ast;
@@ -439,6 +440,16 @@ pub fn execute_statement(
         Some(logical) => logical,
         // Not DQL/DML: fall through to the utility-statement handlers below.
         None => match stmt {
+            ast::Statement::CreateTable(create) if create.query.is_some() => {
+                return execute_create_table_as(
+                    engine,
+                    &catalog,
+                    &type_catalog,
+                    txnmgr,
+                    create,
+                    session,
+                );
+            }
             ast::Statement::CreateTable(create) => {
                 return execute_create_table(engine, &type_catalog, create, session);
             }
@@ -1577,15 +1588,11 @@ fn execute_create_table(
     } else {
         engine
     };
-    // Clauses we can't honor must be rejected, not silently dropped: CREATE
-    // TABLE AS would otherwise create an empty table (the SELECT is discarded),
-    // and ON COMMIT DROP/DELETE ROWS needs the M2 transaction engine — accepting
-    // it would leave a plain session-lifetime table that diverges from PG.
-    if create.query.is_some() {
-        return Err(PgError::feature_not_supported(
-            "CREATE TABLE ... AS is not supported yet",
-        ));
-    }
+    // CTAS (`create.query.is_some()`) is dispatched to `execute_create_table_as`
+    // before reaching here, so this path only builds an empty table. Clauses we
+    // can't honor must be rejected, not silently dropped: ON COMMIT DROP/DELETE
+    // ROWS needs the M2 transaction engine — accepting it would leave a plain
+    // session-lifetime table that diverges from PG.
     if create.on_commit.is_some() {
         return Err(PgError::feature_not_supported(
             "CREATE TABLE ... ON COMMIT is not supported yet",
@@ -1850,6 +1857,152 @@ fn execute_create_table(
         }
     }
     Ok(QueryResult::command("CREATE TABLE"))
+}
+
+/// `CREATE TABLE <name> [ (cols) ] AS <query>`: derive the new table's column
+/// shape from the query (à la `CREATE VIEW`), create it, then stream the query's
+/// rows into it (à la `INSERT ... SELECT`). The completion tag is `SELECT <n>`,
+/// matching PG's CTAS / `SELECT INTO`.
+fn execute_create_table_as(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    create: &ast::CreateTable,
+    session: &mut Session,
+) -> Result<QueryResult, PgError> {
+    let name = object_name_to_table_name(&create.name)?;
+    // Reject CTAS forms we don't implement rather than silently dropping them.
+    // A table cannot be `OR REPLACE`d; ON COMMIT needs the M2 txn engine; table
+    // constraints / LIKE / CLONE / storage options are not derived from a query.
+    if create.or_replace
+        || create.on_commit.is_some()
+        || !create.constraints.is_empty()
+        || create.like.is_some()
+        || create.clone.is_some()
+        || !matches!(create.table_options, ast::CreateTableOptions::None)
+    {
+        return Err(PgError::feature_not_supported(
+            "this CREATE TABLE ... AS form is not supported yet",
+        ));
+    }
+    // TEMP tables go in the session-local catalog; everything else in the durable
+    // engine. The new table is later opened through the overlay `catalog`, which
+    // resolves the temp target too. Clone the handle (rather than borrow
+    // `session.temp`) so the later `&mut session` write path is unencumbered.
+    let target: Arc<dyn TableEngine> = if create.temporary {
+        session.temp.clone()
+    } else {
+        engine.clone()
+    };
+
+    // Bind the defining query and take its output column shape.
+    let query = create.query.as_ref().expect("CTAS dispatch guards query");
+    let plan = bind_query(catalog, type_catalog, query)?;
+    let mut cols = output_columns_of(&plan)?;
+
+    // An explicit column list renames the leading outputs; names only (no types
+    // or constraints), and it may not exceed the query's column count.
+    if !create.columns.is_empty() {
+        for col in &create.columns {
+            if col.data_type != ast::DataType::Unspecified || !col.options.is_empty() {
+                return Err(PgError::feature_not_supported(
+                    "column types or constraints in CREATE TABLE ... AS are not supported yet",
+                ));
+            }
+        }
+        if create.columns.len() > cols.len() {
+            return Err(PgError::new(
+                sqlstate::SYNTAX_ERROR,
+                "CREATE TABLE AS specifies too many column names",
+            ));
+        }
+        for (out, def) in cols.iter_mut().zip(&create.columns) {
+            out.name = normalize_ident(&def.name);
+        }
+    }
+
+    // Duplicate output column names are rejected, as for a plain table.
+    let mut seen = HashSet::new();
+    for col in &cols {
+        if !seen.insert(col.name.clone()) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_COLUMN,
+                format!("column \"{}\" specified more than once", col.name),
+            ));
+        }
+    }
+
+    let schema = TableSchema {
+        name: name.clone(),
+        columns: cols
+            .iter()
+            .map(|c| Column::new(c.name.clone(), c.ty))
+            .collect(),
+    };
+
+    // Create the table first so a name collision short-circuits before the query
+    // runs. IF NOT EXISTS on an existing relation runs nothing (PG NOTICE).
+    match target.create_table(schema) {
+        Ok(_) => {}
+        Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {
+            return Ok(QueryResult::Command {
+                tag: "CREATE TABLE AS".into(),
+                notices: vec![Notice::notice(
+                    format!("relation \"{name}\" already exists, skipping"),
+                    None,
+                )],
+            });
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Populate: build an INSERT ... SELECT over the new table. Columns are derived
+    // straight from the query's output types, so each target column is an identity
+    // ColumnRef into the source row — no coercion needed.
+    let table = match catalog.open_table(&name) {
+        Ok(table) => table,
+        Err(e) => {
+            let _ = target.drop_table(&name);
+            return Err(e.into());
+        }
+    };
+    let projections = cols
+        .iter()
+        .enumerate()
+        .map(|(index, c)| BoundExpr::ColumnRef { index, ty: c.ty })
+        .collect();
+    let logical = LogicalPlan::Insert {
+        table,
+        source: InsertSource::Query {
+            input: Box::new(plan),
+            projections,
+        },
+        returning: None,
+    };
+
+    // Run the populate INSERT through the standard write tail. The DDL catalog
+    // write above is not MVCC-transactional (as with every DDL path here), so on
+    // a populate failure we best-effort drop the half-created table.
+    let read_only = read_only_active(session);
+    let txn = build_txn(txnmgr, session, true);
+    let exec_ctx = session.exec_context_with_sequences(engine, read_only);
+    let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
+        Ok(exec) => exec,
+        Err(e) => {
+            let _ = finalize_statement(txnmgr, session, &txn, true, false);
+            let _ = target.drop_table(&name);
+            return Err(e.into());
+        }
+    };
+    finalize_statement(txnmgr, session, &txn, true, true)?;
+    let n = match exec {
+        Execution::Inserted(n) => n,
+        // The populate plan is a RETURNING-less INSERT, so execution yields an
+        // insert count and nothing else.
+        _ => unreachable!("CTAS populate is a RETURNING-less INSERT"),
+    };
+    Ok(QueryResult::command(format!("SELECT {n}")))
 }
 
 fn reject_deferred_characteristics(

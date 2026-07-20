@@ -1193,10 +1193,8 @@ async fn temp_table_shadows_permanent_within_the_session_only() -> anyhow::Resul
 async fn unenforceable_ddl_is_rejected() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     for sql in [
-        // Clauses we can't honor must be rejected, not silently dropped: CTAS
-        // would discard the SELECT, and ON COMMIT needs the M2 txn engine.
-        "CREATE TABLE c AS SELECT 1 AS x",
-        "CREATE TEMP TABLE c AS SELECT 1 AS x",
+        // Clauses we can't honor must be rejected, not silently dropped:
+        // ON COMMIT DROP/DELETE ROWS needs the M2 txn engine.
         "CREATE TEMP TABLE c (x int) ON COMMIT DROP",
         "CREATE TEMP TABLE c (x int) ON COMMIT DELETE ROWS",
     ] {
@@ -1209,6 +1207,78 @@ async fn unenforceable_ddl_is_rejected() -> anyhow::Result<()> {
             "{sql}"
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_table_as_select() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // Basic CTAS: column shape derives from the query, rows are populated, and the
+    // completion tag is `SELECT <n>` (tokio-postgres surfaces the trailing count).
+    let messages = client
+        .simple_query("CREATE TABLE t AS SELECT 1 AS a, 'x'::text AS b")
+        .await?;
+    let count = messages.iter().find_map(|m| match m {
+        SimpleQueryMessage::CommandComplete(n) => Some(*n),
+        _ => None,
+    });
+    assert_eq!(count, Some(1));
+    let msgs = client.simple_query("SELECT a, b FROM t").await?;
+    let out = rows(&msgs);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].get(0), Some("1"));
+    assert_eq!(out[0].get(1), Some("x"));
+
+    // A new relation reflects as an ordinary table (relkind 'r').
+    let msgs = client
+        .simple_query("SELECT relkind FROM pg_class WHERE relname = 't'")
+        .await?;
+    let out = rows(&msgs);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].get(0), Some("r"));
+
+    // An empty source populates nothing and reports `SELECT 0`.
+    let messages = client
+        .simple_query("CREATE TABLE empty AS SELECT a FROM t WHERE false")
+        .await?;
+    let count = messages.iter().find_map(|m| match m {
+        SimpleQueryMessage::CommandComplete(n) => Some(*n),
+        _ => None,
+    });
+    assert_eq!(count, Some(0));
+    let msgs = client.simple_query("SELECT a FROM empty").await?;
+    assert!(rows(&msgs).is_empty());
+
+    // Re-creating an existing relation errors 42P07; IF NOT EXISTS skips instead.
+    let err = client
+        .simple_query("CREATE TABLE t AS SELECT 9 AS a")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error()
+            .context("database error details are missing")?
+            .code(),
+        &tokio_postgres::error::SqlState::DUPLICATE_TABLE,
+    );
+    client
+        .simple_query("CREATE TABLE IF NOT EXISTS t AS SELECT 9 AS a")
+        .await?;
+    // The original single row is untouched by the skipped CTAS.
+    let msgs = client.simple_query("SELECT a FROM t").await?;
+    let out = rows(&msgs);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].get(0), Some("1"));
+
+    // TEMP CTAS is session-local and queryable.
+    client
+        .simple_query("CREATE TEMP TABLE tmp AS SELECT * FROM t")
+        .await?;
+    let msgs = client.simple_query("SELECT a, b FROM tmp").await?;
+    let out = rows(&msgs);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].get(0), Some("1"));
 
     Ok(())
 }
