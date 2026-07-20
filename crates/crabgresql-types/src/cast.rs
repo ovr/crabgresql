@@ -5,7 +5,7 @@
 
 use crate::numeric::ParseError;
 use crate::{
-    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, money, parse_bool, time,
+    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, json, money, parse_bool, time,
     timestamp, timestamptz, timetz,
 };
 
@@ -25,6 +25,16 @@ fn out_of_range(ty: PgType) -> CastError {
     CastError {
         sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
         message: format!("{} out of range", ty.name()),
+    }
+}
+
+/// Adapt a [`json::JsonError`] to a [`CastError`]. The optional DETAIL is
+/// dropped here; the binder's literal-input path (`parse_unknown`) preserves it
+/// for `'...'::json` const folding, where the caret position also matters.
+fn json_err(e: json::JsonError) -> CastError {
+    CastError {
+        sqlstate: e.sqlstate,
+        message: e.message,
     }
 }
 
@@ -436,6 +446,34 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
 
         // ---- lseg → point (lseg_center): the segment's midpoint ----
         (Value::Lseg(l), PgType::Point) => Ok(Value::Point(crate::geo::lseg_center(l))),
+
+        // ---- json / jsonb I/O and conversions ----
+        // `json`/`jsonb` → text/varchar/... is handled by the generic
+        // any-to-text arm above (it re-uses `encode_text_with`).
+        (Value::Text(s), PgType::Json) => json::json_in(s).map(Value::Json).map_err(json_err),
+        (Value::Text(s), PgType::Jsonb) => json::jsonb_in(s).map(Value::Jsonb).map_err(json_err),
+        // `json` → `jsonb`: re-parse the raw text into the canonical tree.
+        (Value::Json(s), PgType::Jsonb) => json::jsonb_in(s).map(Value::Jsonb).map_err(json_err),
+        // `jsonb` → `json`: the canonical serialization is always valid JSON.
+        (Value::Jsonb(j), PgType::Json) => Ok(Value::Json(json::format(j))),
+        // `jsonb` scalar → SQL scalar (the casts PG's `pg_cast` defines). A
+        // wrong-kind jsonb is PG's `cannot cast jsonb <kind> to type <t>`.
+        (Value::Jsonb(j), PgType::Bool) => match j {
+            json::Jsonb::Bool(b) => Ok(Value::Bool(*b)),
+            _ => Err(json_err(json::cannot_cast(j, to.name()))),
+        },
+        (
+            Value::Jsonb(j),
+            PgType::Numeric
+            | PgType::Int2
+            | PgType::Int4
+            | PgType::Int8
+            | PgType::Float4
+            | PgType::Float8,
+        ) => match j {
+            json::Jsonb::Number(n) => cast_value(Value::Numeric(n.clone()), to, efd),
+            _ => Err(json_err(json::cannot_cast(j, to.name()))),
+        },
 
         _ => Err(cannot_coerce(from, to)),
     }

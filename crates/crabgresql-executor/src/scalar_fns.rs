@@ -13,8 +13,8 @@ use crabgresql_binder::GeoFn;
 use crabgresql_binder::ScalarFn;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, TimeTz, Value, bit, date, float, geo, interval, macaddr, money, net,
-    text, time, timestamp, timestamptz, timetz, to_char,
+    Inet, Interval, Numeric, TimeTz, Value, bit, date, float, geo, interval, json, macaddr, money,
+    net, text, time, timestamp, timestamptz, timetz, to_char,
 };
 
 use crate::ExecError;
@@ -1264,6 +1264,12 @@ pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, Str
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
         "lseg" => geo::parse_lseg(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
+        "json" => json::json_in(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
+        "jsonb" => json::jsonb_in(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
         // Other types: not exercised; treat as valid.

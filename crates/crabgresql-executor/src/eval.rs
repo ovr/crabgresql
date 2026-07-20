@@ -11,8 +11,8 @@ use std::cmp::Ordering;
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, cast, date, float, interval, money, net,
-    time, timetz,
+    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, cast, date, float, interval, json, money,
+    net, time, timetz,
 };
 
 use crate::{ExecContext, ExecError};
@@ -219,6 +219,9 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         }
         // macaddr/macaddr8: raw byte order (PG's `macaddr_cmp`).
         PgType::Macaddr | PgType::Macaddr8 => macaddr_bytes(l).cmp(macaddr_bytes(r)),
+        // jsonb: PG's `compareJsonbContainers` total order. (`json` has no
+        // default ordering and never reaches here.)
+        PgType::Jsonb => json::cmp(jsonb_of(l), jsonb_of(r)),
         // Query-time user-type ordering is currently defined only for enums.
         // Keep this total for defensive callers: malformed/mixed values use
         // their actual non-user representation or type OID, never an unchecked
@@ -372,6 +375,13 @@ fn macaddr_bytes(v: &Value) -> &[u8] {
         Value::Macaddr(b) => b,
         Value::Macaddr8(b) => b,
         other => unreachable!("expected macaddr/macaddr8, got {other:?}"),
+    }
+}
+
+fn jsonb_of(v: &Value) -> &json::Jsonb {
+    match v {
+        Value::Jsonb(j) => j,
+        other => unreachable!("expected jsonb, got {other:?}"),
     }
 }
 

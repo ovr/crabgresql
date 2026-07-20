@@ -1536,6 +1536,28 @@ impl PartialEq for Numeric {
     }
 }
 
+impl std::hash::Hash for Numeric {
+    /// Value-canonical hashing, consistent with [`Numeric::cmp`] / `PartialEq`:
+    /// two equal numerics of different display scale (`1.0` and `1.00`) hash
+    /// equal, since `digits`/`weight` are stripped of trailing zeros and
+    /// `dscale` is display-only. Used to hash `jsonb` numbers for grouping.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self.sign {
+            Sign::NaN => 0u8.hash(state),
+            Sign::PInf => 1u8.hash(state),
+            Sign::NInf => 2u8.hash(state),
+            Sign::Pos | Sign::Neg => {
+                // Zero normalizes to `Pos` with empty `digits` and `weight` 0, so
+                // its hash is fixed regardless of how it was written.
+                3u8.hash(state);
+                self.is_neg().hash(state);
+                self.weight.hash(state);
+                self.digits.hash(state);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

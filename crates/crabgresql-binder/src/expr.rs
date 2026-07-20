@@ -1065,6 +1065,9 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             | PgType::Money
             | PgType::Macaddr
             | PgType::Macaddr8
+            // `jsonb` has a total order (`compareJsonbContainers`); plain `json`
+            // has no default equality/ordering, so it is intentionally omitted.
+            | PgType::Jsonb
     ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
 }
 
@@ -1223,6 +1226,8 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         // is enforced separately as a typmod coercion.
         DataType::Bit(_) => PgType::Bit,
         DataType::BitVarying(_) | DataType::VarBit(_) => PgType::Varbit,
+        DataType::JSON => PgType::Json,
+        DataType::JSONB => PgType::Jsonb,
         // Geometric types. `point`/`lseg` are modeled; the rest are not yet.
         DataType::GeometricType(kind) => match kind {
             ast::GeometricTypeKind::Point => PgType::Point,
@@ -1254,6 +1259,8 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                 // `f1 point`); the `point '...'`/`GeometricType` path is separate.
                 Some("point") => PgType::Point,
                 Some("lseg") => PgType::Lseg,
+                Some("json") => PgType::Json,
+                Some("jsonb") => PgType::Jsonb,
                 _ => {
                     return Err(BindError::feature_not_supported(format!(
                         "type \"{dt}\" is not supported yet"
@@ -3762,6 +3769,14 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Lseg => crabgresql_types::geo::parse_lseg(s)
             .map(Value::Lseg)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        // `json` keeps the raw text; `jsonb` parses/canonicalizes. Both carry the
+        // JSON DETAIL through so `'{bad'::json` reproduces PG's error report.
+        PgType::Json => crabgresql_types::json::json_in(s)
+            .map(Value::Json)
+            .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail)),
+        PgType::Jsonb => crabgresql_types::json::jsonb_in(s)
+            .map(Value::Jsonb)
+            .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail)),
         PgType::User(_) => Err(invalid()),
     }
 }

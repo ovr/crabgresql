@@ -541,6 +541,8 @@ mod tests {
             ("cidr", PgType::Cidr),
             ("point", PgType::Point),
             ("lseg", PgType::Lseg),
+            ("json", PgType::Json),
+            ("jsonb", PgType::Jsonb),
         ];
         for (typname, ty) in modeled {
             let row = PG_TYPE_ROWS

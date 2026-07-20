@@ -23,6 +23,8 @@ test: generate_series
 test: string
 test: uuid
 test: geo
+test: json
+test: jsonb
 test: inet
 test: cidr
 test: pg_catalog

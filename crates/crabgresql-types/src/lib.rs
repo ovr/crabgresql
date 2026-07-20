@@ -11,6 +11,7 @@ pub mod date;
 pub mod float;
 pub mod geo;
 pub mod interval;
+pub mod json;
 pub mod macaddr;
 pub mod money;
 pub mod net;
@@ -65,6 +66,10 @@ pub mod oid {
     pub const POINT: u32 = 600;
     /// `lseg`: a geometric line segment (two points). See [`crate::geo`].
     pub const LSEG: u32 = 601;
+    /// `json`: JSON stored as validated text. See [`crate::json`].
+    pub const JSON: u32 = 114;
+    /// `jsonb`: JSON stored as a canonical binary tree. See [`crate::json`].
+    pub const JSONB: u32 = 3802;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +130,12 @@ pub enum PgType {
     /// `lseg`: a geometric line segment (two points). Fixed 32-byte type.
     /// See [`crate::geo`].
     Lseg,
+    /// `json`: JSON kept as validated text (whitespace/key order/duplicate keys
+    /// preserved). Varlena; no default equality. See [`crate::json`].
+    Json,
+    /// `jsonb`: JSON stored as a canonical tree ([`Value::Jsonb`]). Varlena;
+    /// fully ordered/hashable. See [`crate::json`].
+    Jsonb,
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -162,6 +173,8 @@ impl PgType {
             PgType::Macaddr8 => oid::MACADDR8,
             PgType::Point => oid::POINT,
             PgType::Lseg => oid::LSEG,
+            PgType::Json => oid::JSON,
+            PgType::Jsonb => oid::JSONB,
             PgType::User(oid) => oid,
         }
     }
@@ -197,6 +210,10 @@ impl PgType {
                 | PgType::Uuid
                 | PgType::Macaddr
                 | PgType::Macaddr8
+                // jsonb equality is structural on its canonical tree, so hashing
+                // that tree agrees with `keys_equal`. `json` has no equality and
+                // never reaches `hash_key`.
+                | PgType::Jsonb
         )
     }
 
@@ -234,6 +251,8 @@ impl PgType {
             oid::CIDR => PgType::Cidr,
             oid::MACADDR => PgType::Macaddr,
             oid::MACADDR8 => PgType::Macaddr8,
+            oid::JSON => PgType::Json,
+            oid::JSONB => PgType::Jsonb,
             _ => return None,
         })
     }
@@ -270,7 +289,9 @@ impl PgType {
             | PgType::Bit
             | PgType::Varbit
             | PgType::Inet
-            | PgType::Cidr => -1,
+            | PgType::Cidr
+            | PgType::Json
+            | PgType::Jsonb => -1,
             PgType::User(_) => -1,
         }
     }
@@ -307,6 +328,8 @@ impl PgType {
             PgType::Macaddr8 => "macaddr8",
             PgType::Point => "point",
             PgType::Lseg => "lseg",
+            PgType::Json => "json",
+            PgType::Jsonb => "jsonb",
             PgType::User(_) => "user-defined",
         }
     }
@@ -344,6 +367,8 @@ impl PgType {
             PgType::Macaddr8 => "macaddr8",
             PgType::Point => "point",
             PgType::Lseg => "lseg",
+            PgType::Json => "json",
+            PgType::Jsonb => "jsonb",
             PgType::User(_) => "user-defined",
         }
     }
@@ -358,6 +383,16 @@ impl PgType {
                 | PgType::Float8
                 | PgType::Numeric
         )
+    }
+
+    /// Whether this type has a default B-tree operator class — i.e. it can be
+    /// ordered, so it may key a B-tree / UNIQUE index or a PRIMARY KEY. `json`,
+    /// `point`, and `lseg` have no default ordering in PostgreSQL (and the
+    /// executor's `compare_values` has no arm for them); everything else,
+    /// including user types (enums order by ordinal), does. Must stay in sync
+    /// with `crabgresql_executor::compare_values`.
+    pub fn has_default_btree_opclass(self) -> bool {
+        !matches!(self, PgType::Json | PgType::Point | PgType::Lseg)
     }
 }
 
@@ -434,6 +469,10 @@ pub enum Value {
     Point([f64; 2]),
     /// `lseg`: a line segment `[(x1,y1),(x2,y2)]` of float8. See [`crate::geo`].
     Lseg([f64; 4]),
+    /// `json`: validated JSON text, kept verbatim. See [`crate::json`].
+    Json(String),
+    /// `jsonb`: a canonical parsed JSON tree. See [`crate::json`].
+    Jsonb(json::Jsonb),
     /// A `CREATE TYPE ... AS ENUM` value. `type_oid` is the enum's type OID (so
     /// [`Value::pg_type`] reports `PgType::User(type_oid)`); `ordinal` is the
     /// 0-based position of the label in the enum's definition, which is also its
@@ -476,6 +515,8 @@ impl Value {
             Value::Macaddr8(_) => Some(PgType::Macaddr8),
             Value::Point(_) => Some(PgType::Point),
             Value::Lseg(_) => Some(PgType::Lseg),
+            Value::Json(_) => Some(PgType::Json),
+            Value::Jsonb(_) => Some(PgType::Jsonb),
             Value::Enum { type_oid, .. } => Some(PgType::User(*type_oid)),
         }
     }
@@ -522,6 +563,10 @@ impl Value {
             Value::Macaddr8(b) => Some(macaddr::format8(b)),
             Value::Point(p) => Some(geo::format_point(p, efd)),
             Value::Lseg(l) => Some(geo::format_lseg(l, efd)),
+            // `json` prints its stored text verbatim; `jsonb` re-serializes its
+            // canonical tree (`jsonb_out`).
+            Value::Json(s) => Some(s.clone()),
+            Value::Jsonb(j) => Some(json::format(j)),
             // An enum prints as its label (PG's `enum_out`).
             Value::Enum { label, .. } => Some(label.clone()),
         }
@@ -550,6 +595,7 @@ impl_message_error!(
     float::FloatError,
     geo::GeoError,
     interval::IntervalError,
+    json::JsonError,
     macaddr::MacaddrError,
     money::MoneyError,
     net::NetError,
