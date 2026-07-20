@@ -10,7 +10,7 @@ use crabgresql_binder::{
     AggInput, BinOp, BoundAggregate, BoundExpr, JoinExpr, JoinInput, JoinKind, LogicalPlan,
     OutputColumn, SortKey, TableFn,
 };
-use crabgresql_storage_api::TableAm;
+use crabgresql_storage_api::{IndexConstraint, IndexMetadata, TableAm, TableSchema};
 use crabgresql_types::PgType;
 
 /// An executable plan. `Select` describes the SeqScan → Filter → Projection →
@@ -24,6 +24,24 @@ pub enum PhysicalPlan {
     },
     Select {
         table: Arc<dyn TableAm>,
+        columns: Vec<OutputColumn>,
+        projections: Vec<BoundExpr>,
+        predicate: Option<BoundExpr>,
+        sort: Vec<SortKey>,
+    },
+    /// A single-table read served by an equality probe on `index_name`: the
+    /// executor evaluates each `key` value once and asks the engine for the
+    /// matching rows. The planner only emits this when the engine reports
+    /// [`TableAm::supports_index_scan`], but the executor still scan-fallbacks
+    /// defensively. `predicate` is the residual WHERE the index did not consume,
+    /// applied as a `Filter`; the standard Projection → Sort tail follows,
+    /// exactly as for [`Self::Select`].
+    IndexScan {
+        table: Arc<dyn TableAm>,
+        index_name: String,
+        /// One `(key column, equality value)` pair per index key column, in key
+        /// order. The value expressions are row-constant and evaluated once.
+        key: Vec<(usize, BoundExpr)>,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -331,12 +349,27 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             projections,
             predicate,
             sort,
-        } => PhysicalPlan::Select {
-            table,
-            columns,
-            projections,
-            predicate,
-            sort,
+        } => match choose_access(&table, predicate) {
+            AccessPath::Index {
+                index_name,
+                key,
+                residual,
+            } => PhysicalPlan::IndexScan {
+                table,
+                index_name,
+                key,
+                columns,
+                projections,
+                predicate: residual,
+                sort,
+            },
+            AccessPath::Scan { predicate } => PhysicalPlan::Select {
+                table,
+                columns,
+                projections,
+                predicate,
+                sort,
+            },
         },
         LogicalPlan::Subquery {
             source,
@@ -425,6 +458,246 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
     }
 }
 
+/// The access path chosen for a single-table read.
+enum AccessPath {
+    /// An equality index probe (see [`PhysicalPlan::IndexScan`]).
+    Index {
+        index_name: String,
+        /// One `(key column, equality value)` pair per index key column, in key
+        /// order.
+        key: Vec<(usize, BoundExpr)>,
+        residual: Option<BoundExpr>,
+    },
+    /// A full scan carrying the whole (unconsumed) predicate.
+    Scan { predicate: Option<BoundExpr> },
+}
+
+/// Choose an access path for a `WHERE` predicate: an equality index probe when
+/// some index's every key column is pinned by an `col = <constant>` conjunct,
+/// else a full scan. PostgreSQL makes this choice by cost; with one real access
+/// path here the rule is structural — an equality-covered PK/UNIQUE (or plain)
+/// index always beats a sequential scan for a point lookup.
+fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> AccessPath {
+    let Some(predicate) = predicate else {
+        return AccessPath::Scan { predicate: None };
+    };
+    let indexes = table.indexes();
+    if indexes.is_empty() {
+        return AccessPath::Scan {
+            predicate: Some(predicate),
+        };
+    }
+
+    // Flatten the AND-tree and classify each conjunct once.
+    let mut conjuncts = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+    let eqs: Vec<Option<(usize, BoundExpr)>> = conjuncts.iter().map(as_eq_key).collect();
+
+    // Prefer a PRIMARY KEY, then a UNIQUE index, then any other index.
+    for pref in [
+        Some(IndexConstraint::PrimaryKey),
+        Some(IndexConstraint::Unique),
+        None,
+    ] {
+        for index in indexes.iter().filter(|i| i.constraint == pref) {
+            let Some(chosen) = cover_index(index, &eqs) else {
+                continue;
+            };
+            // Only route to an index scan the engine can physically serve;
+            // otherwise `EXPLAIN` would advertise an index scan that silently
+            // degrades to a sequential scan at execution time.
+            if !table.supports_index_scan(&index.name) {
+                continue;
+            }
+            let mut key = Vec::with_capacity(chosen.len());
+            let mut consumed = vec![false; conjuncts.len()];
+            for (column, conjunct) in chosen {
+                // `cover_index` only ever returns conjuncts classified as an
+                // equality key, so `eqs[conjunct]` is always `Some`.
+                if let Some((_, value)) = &eqs[conjunct] {
+                    key.push((column, value.clone()));
+                    consumed[conjunct] = true;
+                }
+            }
+            let residual = conjuncts
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !consumed[*i])
+                .map(|(_, conjunct)| conjunct)
+                .collect();
+            return AccessPath::Index {
+                index_name: index.name.clone(),
+                key,
+                residual: rebuild_and(residual),
+            };
+        }
+    }
+
+    AccessPath::Scan {
+        predicate: rebuild_and(conjuncts),
+    }
+}
+
+/// Match each of `index`'s key columns to a distinct equality conjunct, or
+/// `None` if any key column has no `= <constant>` conjunct. Returns the
+/// `(key column, conjunct index)` pairs in key order.
+fn cover_index(
+    index: &IndexMetadata,
+    eqs: &[Option<(usize, BoundExpr)>],
+) -> Option<Vec<(usize, usize)>> {
+    let mut used = vec![false; eqs.len()];
+    let mut chosen = Vec::with_capacity(index.keys.len());
+    for key in &index.keys {
+        let conjunct = eqs.iter().enumerate().position(|(i, eq)| {
+            !used[i] && matches!(eq, Some((column, _)) if *column == key.column)
+        })?;
+        used[conjunct] = true;
+        chosen.push((key.column, conjunct));
+    }
+    Some(chosen)
+}
+
+/// A conjunct of the form `col = <constant>` (either operand order), returning
+/// the column index and the constant value expression. The column side must be
+/// a bare [`BoundExpr::ColumnRef`] — a `Coerce` around it means the comparison
+/// runs at a different type than the index key, so it is not an index match.
+fn as_eq_key(conjunct: &BoundExpr) -> Option<(usize, BoundExpr)> {
+    let BoundExpr::Binary {
+        op: BinOp::Eq,
+        left,
+        right,
+        ..
+    } = conjunct
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (BoundExpr::ColumnRef { index, .. }, value) if is_row_constant(value) => {
+            Some((*index, value.clone()))
+        }
+        (value, BoundExpr::ColumnRef { index, .. }) if is_row_constant(value) => {
+            Some((*index, value.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether an expression can be hoisted to a **single** evaluation for the whole
+/// scan to form the index key. That requires it to reference no column and no
+/// bind parameter *and* to be stable — the same value on every row. Function
+/// calls are rejected conservatively: the executor evaluates the key exactly
+/// once, so hoisting a volatile function (`random()`, `nextval()`) would diverge
+/// from the per-row evaluation a `Filter` performs, and we have no purity
+/// classification here to tell pure from volatile. A rejected key simply falls
+/// back to a sequential scan + filter — correct, just not indexed.
+fn is_row_constant(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Const { .. } => true,
+        BoundExpr::Unary { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::Coerce { expr, .. }
+        | BoundExpr::Reinterpret { expr, .. } => is_row_constant(expr),
+        BoundExpr::Binary { left, right, .. } => is_row_constant(left) && is_row_constant(right),
+        BoundExpr::Case { whens, else_, .. } => {
+            whens
+                .iter()
+                .all(|(when, then)| is_row_constant(when) && is_row_constant(then))
+                && else_.as_ref().map_or(true, |e| is_row_constant(e))
+        }
+        // ColumnRef/Param reference per-row/per-execution state; FuncCall/Srf may
+        // be volatile; Aggregate never appears in a bindable WHERE key.
+        BoundExpr::ColumnRef { .. }
+        | BoundExpr::Param { .. }
+        | BoundExpr::FuncCall { .. }
+        | BoundExpr::Srf { .. }
+        | BoundExpr::Aggregate { .. } => false,
+    }
+}
+
+/// Render a physical plan as PostgreSQL-style `EXPLAIN` text — one string per
+/// output line. This is a **reduced** form: it reproduces PG's node headers
+/// (`Seq Scan on t`, `Index Scan using t_pkey on t`, `Index Cond`, `Filter`) so
+/// the chosen access path is observable, but omits the cost/row/width estimates
+/// PG prints (crabgresql has no cost model). Only the scan paths are rendered in
+/// detail; other plan shapes get a single summary line.
+pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
+    match plan {
+        PhysicalPlan::Select {
+            table, predicate, ..
+        } => {
+            let schema = table.schema();
+            let mut lines = vec![format!("Seq Scan on {}", schema.name)];
+            if let Some(predicate) = predicate {
+                lines.push(format!("  Filter: ({})", explain_expr(predicate, schema)));
+            }
+            lines
+        }
+        PhysicalPlan::IndexScan {
+            table,
+            index_name,
+            key,
+            predicate,
+            ..
+        } => {
+            let schema = table.schema();
+            let mut lines = vec![format!("Index Scan using {index_name} on {}", schema.name)];
+            let cond = key
+                .iter()
+                .map(|(column, value)| {
+                    format!("{} = {}", schema.columns[*column].name, explain_expr(value, schema))
+                })
+                .collect::<Vec<_>>()
+                .join(") AND (");
+            lines.push(format!("  Index Cond: ({cond})"));
+            if let Some(predicate) = predicate {
+                lines.push(format!("  Filter: ({})", explain_expr(predicate, schema)));
+            }
+            lines
+        }
+        PhysicalPlan::Values { .. } => vec!["Values Scan".to_string()],
+        PhysicalPlan::Subquery { source, .. } => explain(source),
+        PhysicalPlan::TableFunction { .. } => vec!["Function Scan".to_string()],
+        PhysicalPlan::Join { .. } => vec!["Nested Loop".to_string()],
+        PhysicalPlan::Aggregate { .. } => vec!["Aggregate".to_string()],
+        PhysicalPlan::Limit { source, .. } => {
+            let mut lines = vec!["Limit".to_string()];
+            lines.extend(explain(source).into_iter().map(|l| format!("  {l}")));
+            lines
+        }
+        PhysicalPlan::Insert { table, .. } => vec![format!("Insert on {}", table.schema().name)],
+        PhysicalPlan::Update { table, .. } => vec![format!("Update on {}", table.schema().name)],
+        PhysicalPlan::Delete { table, .. } => vec![format!("Delete on {}", table.schema().name)],
+    }
+}
+
+/// Minimal expression rendering for `EXPLAIN` conditions: enough to show a
+/// constant key or a residual comparison, not a faithful SQL deparser. Column
+/// references render by name against `schema`.
+fn explain_expr(expr: &BoundExpr, schema: &TableSchema) -> String {
+    match expr {
+        BoundExpr::Const { value, .. } => value
+            .encode_text_with(1)
+            .unwrap_or_else(|| "NULL".to_string()),
+        BoundExpr::ColumnRef { index, .. } => schema
+            .columns
+            .get(*index)
+            .map_or_else(|| format!("${index}"), |c| c.name.clone()),
+        BoundExpr::Param { index, .. } => format!("${}", index + 1),
+        BoundExpr::Coerce { expr, .. } | BoundExpr::Reinterpret { expr, .. } => {
+            explain_expr(expr, schema)
+        }
+        BoundExpr::Binary {
+            op, left, right, ..
+        } => format!(
+            "{} {} {}",
+            explain_expr(left, schema),
+            op.sql_symbol(),
+            explain_expr(right, schema)
+        ),
+        _ => "…".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! SQL in, physical plan out: parse → bind (against a memory table) →
@@ -434,10 +707,18 @@ mod tests {
     use crabgresql_binder::{BinOp, bind_delete, bind_insert, bind_query, bind_update};
     use crabgresql_memory_storage::MemoryEngine;
     use crabgresql_parser::ast;
-    use crabgresql_storage_api::{Column, EmptyTypeCatalog, TableEngine, TableSchema, TypeCatalog};
+    use crabgresql_storage_api::{
+        Column, EmptyTypeCatalog, IndexKey, IndexMethod, TableEngine, TableSchema, TypeCatalog,
+    };
     use crabgresql_types::{PgType, Value};
 
     fn plan_sql(sql: &str) -> PhysicalPlan {
+        plan_sql_indexed(sql, None)
+    }
+
+    /// Plan `sql` against table `t(id int4, big int8, name text)`, optionally
+    /// registering an index (name + `IndexMetadata`) first.
+    fn plan_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> PhysicalPlan {
         let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
         let catalog: Arc<dyn TypeCatalog> = Arc::new(EmptyTypeCatalog);
         if let Err(error) = engine.create_table(TableSchema {
@@ -449,6 +730,11 @@ mod tests {
             ],
         }) {
             panic!("failed to create planner test table: {error}");
+        }
+        if let Some(index) = index
+            && let Err(error) = engine.create_index("t", index)
+        {
+            panic!("failed to create planner test index: {error}");
         }
         let stmts = match crabgresql_parser::parse(sql) {
             Ok(stmts) => stmts,
@@ -780,5 +1066,105 @@ mod tests {
                 ty: PgType::Int4
             }
         );
+    }
+
+    /// A PRIMARY KEY index on `t.id` (column 0).
+    fn pk_on_id() -> IndexMetadata {
+        IndexMetadata {
+            name: "t_pkey".into(),
+            method: IndexMethod::BTree,
+            keys: vec![IndexKey {
+                column: 0,
+                descending: false,
+                nulls_first: false,
+            }],
+            unique: true,
+            nulls_distinct: true,
+            constraint: Some(IndexConstraint::PrimaryKey),
+        }
+    }
+
+    #[test]
+    fn equality_on_pk_becomes_index_scan() {
+        let plan = plan_sql_indexed("SELECT * FROM t WHERE id = 1", Some(pk_on_id()));
+        let PhysicalPlan::IndexScan {
+            index_name,
+            key,
+            predicate,
+            ..
+        } = plan
+        else {
+            panic!("expected IndexScan");
+        };
+        assert_eq!(index_name, "t_pkey");
+        assert_eq!(
+            key,
+            vec![(
+                0,
+                BoundExpr::Const {
+                    value: Value::Int4(1),
+                    ty: PgType::Int4
+                }
+            )]
+        );
+        // The equality conjunct is fully consumed by the index.
+        assert!(predicate.is_none());
+    }
+
+    #[test]
+    fn extra_conjunct_stays_as_residual_filter() {
+        let plan = plan_sql_indexed(
+            "SELECT * FROM t WHERE id = 1 AND name = 'x'",
+            Some(pk_on_id()),
+        );
+        let PhysicalPlan::IndexScan { key, predicate, .. } = plan else {
+            panic!("expected IndexScan");
+        };
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[0].0, 0);
+        // `name = 'x'` is not on the index key, so it remains a runtime filter.
+        let Some(BoundExpr::Binary {
+            op: BinOp::Eq,
+            arg_ty: PgType::Text,
+            ..
+        }) = predicate
+        else {
+            panic!("expected a residual text-equality filter");
+        };
+    }
+
+    #[test]
+    fn equality_on_unindexed_column_stays_seq_scan() {
+        let plan = plan_sql_indexed("SELECT * FROM t WHERE name = 'x'", Some(pk_on_id()));
+        assert!(
+            matches!(plan, PhysicalPlan::Select { .. }),
+            "unindexed column must not use an index scan"
+        );
+    }
+
+    #[test]
+    fn range_on_pk_stays_seq_scan() {
+        // Equality only: a range predicate cannot be served by the hash index.
+        let plan = plan_sql_indexed("SELECT * FROM t WHERE id > 1", Some(pk_on_id()));
+        assert!(matches!(plan, PhysicalPlan::Select { .. }));
+    }
+
+    #[test]
+    fn equality_without_index_stays_seq_scan() {
+        let plan = plan_sql_indexed("SELECT * FROM t WHERE id = 1", None);
+        assert!(matches!(plan, PhysicalPlan::Select { .. }));
+    }
+
+    #[test]
+    fn explain_renders_index_scan_and_seq_scan() {
+        let index_plan = plan_sql_indexed("SELECT * FROM t WHERE id = 1", Some(pk_on_id()));
+        let lines = explain(&index_plan);
+        assert_eq!(lines[0], "Index Scan using t_pkey on t");
+        assert_eq!(lines[1], "  Index Cond: (id = 1)");
+
+        let seq_plan = plan_sql_indexed("SELECT * FROM t WHERE name = 'x'", Some(pk_on_id()));
+        let lines = explain(&seq_plan);
+        assert_eq!(lines[0], "Seq Scan on t");
+        assert_eq!(lines[1], "  Filter: (name = x)");
     }
 }

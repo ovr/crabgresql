@@ -130,6 +130,18 @@ pub fn execute(
             columns,
             ctx,
         ),
+        PhysicalPlan::IndexScan {
+            table,
+            index_name,
+            key,
+            columns,
+            projections,
+            predicate,
+            sort,
+        } => {
+            let source = IndexScan::new(&table, &index_name, key, ctx, txn)?;
+            project_pipeline(Box::new(source), projections, predicate, sort, columns, ctx)
+        }
         PhysicalPlan::Subquery {
             source,
             columns,
@@ -1350,6 +1362,62 @@ impl ExecNode for SeqScan {
     }
 }
 
+/// Equality index scan: probes the engine's physical index for the key. When
+/// the engine cannot serve it (durable heap engine, an index whose key type it
+/// cannot physically index, a system catalog) it falls back to a full scan and
+/// re-checks key equality per row, which is what makes that fallback correct.
+/// The physical-index path is already exact (the engine returns only rows whose
+/// key equals the probe), so it needs no re-check. NULL never matches under `=`.
+pub struct IndexScan {
+    iter: Box<dyn Iterator<Item = Tuple> + Send>,
+}
+
+impl IndexScan {
+    pub fn new(
+        table: &Arc<dyn TableAm>,
+        index_name: &str,
+        key: Vec<(usize, BoundExpr)>,
+        ctx: ExecContext,
+        txn: &TxnContext,
+    ) -> Result<Self, ExecError> {
+        // The key value expressions are row-constant (the planner guarantees
+        // it), so they evaluate once against an empty row.
+        let key_values: Vec<Value> = key
+            .iter()
+            .map(|(_, expr)| eval(expr, &[], ctx))
+            .collect::<Result<_, _>>()?;
+        let iter: Box<dyn Iterator<Item = Tuple> + Send> =
+            match table.index_lookup(index_name, &key_values, txn) {
+                // Exact path: the engine already returned only key-matching,
+                // MVCC-visible rows.
+                Some(rows) => Box::new(rows.map(|(_, tuple)| tuple)),
+                // Fallback path: a full scan, so re-check the key per row.
+                None => {
+                    let cols: Vec<(usize, PgType)> = key
+                        .iter()
+                        .map(|(column, _)| (*column, table.schema().columns[*column].ty))
+                        .collect();
+                    Box::new(table.scan(txn).filter_map(move |(_, tuple)| {
+                        cols.iter().zip(&key_values).all(|(&(column, ty), want)| {
+                            let cell = &tuple[column];
+                            !matches!(cell, Value::Null)
+                                && !matches!(want, Value::Null)
+                                && compare_values(ty, cell, want) == Ordering::Equal
+                        })
+                        .then_some(tuple)
+                    }))
+                }
+            };
+        Ok(Self { iter })
+    }
+}
+
+impl ExecNode for IndexScan {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        Ok(self.iter.next())
+    }
+}
+
 /// Filters child rows by a boolean predicate (WHERE).
 pub struct Filter {
     child: Box<dyn ExecNode>,
@@ -1516,7 +1584,9 @@ mod tests {
     use super::*;
     use crabgresql_binder::{BinOp, UnaryOp};
     use crabgresql_memory_storage::MemoryEngine;
-    use crabgresql_storage_api::{Column, TableEngine, TableSchema};
+    use crabgresql_storage_api::{
+        Column, IndexConstraint, IndexKey, IndexMethod, TableEngine, TableSchema,
+    };
     use crabgresql_txn::{CommandId, TransactionManager, TxnContext, Xid};
     use crabgresql_types::PgType;
     use eval::coerce_value;
@@ -1813,6 +1883,85 @@ mod tests {
             rows.push(row);
         }
         rows
+    }
+
+    /// `test_table`'s rows plus a physical unique index on `id`.
+    fn indexed_table() -> Arc<dyn TableAm> {
+        let engine = MemoryEngine::new();
+        let table = test_ok(engine.create_table(TableSchema {
+            name: "t".into(),
+            columns: vec![
+                Column::new("id", PgType::Int4),
+                Column::new("label", PgType::Text),
+            ],
+        }));
+        test_ok(engine.create_index(
+            "t",
+            IndexMetadata {
+                name: "t_id_key".into(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: true,
+                nulls_distinct: true,
+                constraint: Some(IndexConstraint::Unique),
+            },
+        ));
+        let txn = wtxn();
+        table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
+        table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
+        table.insert(vec![Value::Int4(3), Value::Null], &txn);
+        table
+    }
+
+    #[test]
+    fn index_scan_probes_physical_index() {
+        let table = indexed_table();
+        let mut node = test_ok(IndexScan::new(
+            &table,
+            "t_id_key",
+            vec![(0, int4(2))],
+            ExecContext::default(),
+            &rtxn(),
+        ));
+        assert_eq!(
+            collect(&mut node),
+            vec![vec![Value::Int4(2), Value::Text("two".into())]]
+        );
+    }
+
+    #[test]
+    fn index_scan_falls_back_to_scan_without_physical_index() {
+        // `test_table` has no physical index: `index_lookup` returns None and the
+        // node scans, re-checking the key so the result is still exact.
+        let table = test_table();
+        let mut node = test_ok(IndexScan::new(
+            &table,
+            "missing_index",
+            vec![(0, int4(2))],
+            ExecContext::default(),
+            &rtxn(),
+        ));
+        assert_eq!(
+            collect(&mut node),
+            vec![vec![Value::Int4(2), Value::Text("two".into())]]
+        );
+    }
+
+    #[test]
+    fn index_scan_empty_for_missing_key() {
+        let table = indexed_table();
+        let mut node = test_ok(IndexScan::new(
+            &table,
+            "t_id_key",
+            vec![(0, int4(99))],
+            ExecContext::default(),
+            &rtxn(),
+        ));
+        assert!(collect(&mut node).is_empty());
     }
 
     #[test]

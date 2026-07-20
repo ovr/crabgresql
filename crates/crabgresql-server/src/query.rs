@@ -8,11 +8,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crabgresql_binder::{
-    LogicalPlan, bind_delete_with_params, bind_insert_with_params, bind_query_with_params,
-    bind_update_with_params, output_columns_of, param_ctx_extended, param_ctx_none, param_types,
-    require_all_resolved, substitute_params,
+    BoundExpr, LogicalPlan, bind_delete_with_params, bind_insert_with_params,
+    bind_query_with_params, bind_update_with_params, output_columns_of, param_ctx_extended,
+    param_ctx_none, param_types, require_all_resolved, substitute_params,
 };
-use crabgresql_executor::{ExecNode, Execution, OutputColumn, execute};
+use crabgresql_executor::{ExecNode, Execution, OutputColumn, Values, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
@@ -267,6 +267,41 @@ pub fn analyze_statement(
         ast::Statement::Delete(delete) => {
             bind_delete_with_params(&catalog, &type_catalog, delete, &ctx)?
         }
+        // EXPLAIN resolves its parameters against the inner statement and always
+        // returns a single "QUERY PLAN" text column. Binding the inner here lets
+        // a prepared `EXPLAIN … $1` report its parameter types at Describe rather
+        // than erroring at Execute.
+        ast::Statement::Explain { statement, .. } => {
+            match statement.as_ref() {
+                ast::Statement::Query(q) => {
+                    bind_query_with_params(&catalog, &type_catalog, q, &ctx)?
+                }
+                ast::Statement::Insert(i) => {
+                    bind_insert_with_params(&catalog, &type_catalog, i, &ctx)?
+                }
+                ast::Statement::Update(u) => {
+                    bind_update_with_params(&catalog, &type_catalog, u, &ctx)?
+                }
+                ast::Statement::Delete(d) => {
+                    bind_delete_with_params(&catalog, &type_catalog, d, &ctx)?
+                }
+                // EXPLAIN of a non-DML statement: no parameters, error at Execute.
+                _ => {
+                    return Ok(Analyzed {
+                        param_types: Vec::new(),
+                        result_columns: None,
+                    });
+                }
+            };
+            require_all_resolved(&ctx)?;
+            return Ok(Analyzed {
+                param_types: param_types(&ctx).into_iter().flatten().collect(),
+                result_columns: Some(vec![OutputColumn {
+                    name: "QUERY PLAN".to_string(),
+                    ty: PgType::Text,
+                }]),
+            });
+        }
         // Utility statements (DDL/SET/transaction control) take no parameters and
         // return no rows; their errors surface at Execute, as in PG.
         _ => {
@@ -412,6 +447,45 @@ pub fn execute_statement(
             }
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
+            }
+            ast::Statement::Explain {
+                analyze, statement, ..
+            } => {
+                // Plain `EXPLAIN <stmt>` only: ANALYZE would run the statement,
+                // which this reduced EXPLAIN does not do. VERBOSE/FORMAT are
+                // ignored.
+                if *analyze {
+                    return Err(PgError::feature_not_supported(
+                        "EXPLAIN ANALYZE is not supported yet",
+                    ));
+                }
+                let Some(inner) =
+                    bind_dml_with_params(&catalog, &type_catalog, statement, params)?
+                else {
+                    return Err(PgError::feature_not_supported(format!(
+                        "EXPLAIN of {} is not supported yet",
+                        statement_kind(statement)
+                    )));
+                };
+                let plan = crabgresql_planner::plan(inner);
+                let rows: Vec<Vec<BoundExpr>> = crabgresql_planner::explain(&plan)
+                    .into_iter()
+                    .map(|line| {
+                        vec![BoundExpr::Const {
+                            value: Value::Text(line),
+                            ty: PgType::Text,
+                        }]
+                    })
+                    .collect();
+                let node: Box<dyn ExecNode> =
+                    Box::new(Values::new(rows, session.exec_context()));
+                return Ok(QueryResult::Rows {
+                    columns: vec![OutputColumn {
+                        name: "QUERY PLAN".to_string(),
+                        ty: PgType::Text,
+                    }],
+                    node,
+                });
             }
             other => {
                 return Err(PgError::feature_not_supported(format!(

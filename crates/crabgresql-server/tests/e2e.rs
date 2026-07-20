@@ -2442,3 +2442,73 @@ async fn unsupported_transaction_forms_are_rejected() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .await?;
+
+    // An equality on the PRIMARY KEY chooses an index scan.
+    let plan = client
+        .simple_query("EXPLAIN SELECT * FROM t WHERE id = 2")
+        .await?;
+    let lines: Vec<&str> = rows(&plan).iter().filter_map(|r| r.get(0)).collect();
+    assert_eq!(lines[0], "Index Scan using t_pkey on t");
+    assert!(
+        lines.iter().any(|l| l.contains("Index Cond: (id = 2)")),
+        "plan was {lines:?}"
+    );
+
+    // ...and it still returns the right row.
+    let result = client
+        .simple_query("SELECT label FROM t WHERE id = 2")
+        .await?;
+    assert_eq!(rows(&result)[0].get(0), Some("two"));
+
+    // A filter on a non-indexed column stays a sequential scan.
+    let plan = client
+        .simple_query("EXPLAIN SELECT * FROM t WHERE label = 'two'")
+        .await?;
+    let lines: Vec<&str> = rows(&plan).iter().filter_map(|r| r.get(0)).collect();
+    assert_eq!(lines[0], "Seq Scan on t");
+
+    // EXPLAIN ANALYZE is rejected (it would execute the statement).
+    let err = client
+        .simple_query("EXPLAIN ANALYZE SELECT * FROM t WHERE id = 2")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error()
+            .context("database error details are missing")?
+            .code(),
+        &tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_resolves_bind_parameters_in_extended_protocol() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two')")
+        .await?;
+
+    // The extended-protocol path (a query with $1) must resolve the inner
+    // statement's parameter at Describe and not error at Execute.
+    let rows = client
+        .query("EXPLAIN SELECT * FROM t WHERE id = $1", &[&2i32])
+        .await?;
+    let plan: String = rows[0].get(0);
+    assert_eq!(plan, "Index Scan using t_pkey on t");
+
+    Ok(())
+}

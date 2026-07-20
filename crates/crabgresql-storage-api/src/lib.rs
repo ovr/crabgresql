@@ -204,6 +204,34 @@ pub trait TableAm: Send + Sync {
     /// EvalPlanQual needs after a conflict, and a point lookup for indexes.
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Option<Tuple>;
 
+    /// Whether the engine can physically serve an equality index scan on
+    /// `index_name` — i.e. whether [`TableAm::index_lookup`] would return `Some`
+    /// rather than fall back to a scan. The planner consults this so it only
+    /// chooses an index scan the executor can actually perform, keeping `EXPLAIN`
+    /// honest. The default is `false` (no physical index): the durable heap
+    /// engine and system catalogs report no index-scan support, so their queries
+    /// plan (and display) as sequential scans.
+    fn supports_index_scan(&self, _index_name: &str) -> bool {
+        false
+    }
+
+    /// Probe the physical index `index_name` for versions whose key equals
+    /// `key` (one [`Value`] per index key column, in key order), yielding those
+    /// visible to `txn`. Returns `None` when the engine has no physical index
+    /// able to serve this probe (no such index, or a key type it cannot index) —
+    /// the caller then falls back to a full [`TableAm::scan`], so an index scan
+    /// stays correct on every engine. The default is `None`: only the in-memory
+    /// reference engine builds a physical index today; the durable heap engine
+    /// and read-only system catalogs inherit the fallback.
+    fn index_lookup(
+        &self,
+        _index_name: &str,
+        _key: &[Value],
+        _txn: &TxnContext,
+    ) -> Option<Box<dyn Iterator<Item = (Tid, Tuple)> + Send>> {
+        None
+    }
+
     /// Insert a new version stamped with `txn`'s XID. The tuple must have
     /// exactly `schema().columns.len()` values in schema order — executors index
     /// tuples by schema position and rely on this.
