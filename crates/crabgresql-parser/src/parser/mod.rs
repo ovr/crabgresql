@@ -612,7 +612,12 @@ impl<'a> Parser<'a> {
                     self.prev_token();
                     self.parse_raise_stmt().map(Into::into)
                 }
-                Keyword::SELECT | Keyword::WITH | Keyword::VALUES | Keyword::FROM => {
+                Keyword::SELECT
+                | Keyword::WITH
+                | Keyword::VALUES
+                | Keyword::FROM
+                // `TABLE t` is PostgreSQL shorthand for `SELECT * FROM t`.
+                | Keyword::TABLE => {
                     self.prev_token();
                     self.parse_query().map(Into::into)
                 }
@@ -13305,6 +13310,12 @@ impl<'a> Parser<'a> {
                     return self.expected("Table name", token1);
                 }
             }
+            // Only `token1` was the table name; `token2`/`token3` were read ahead
+            // for the `schema.table` case above, so put them back — anything after
+            // an unqualified `TABLE t` (a statement end, ORDER BY, RETURNING, …)
+            // belongs to the caller.
+            self.prev_token();
+            self.prev_token();
             Ok(Table {
                 table_name: Some(table_name),
                 schema_name: None,
@@ -17270,7 +17281,10 @@ impl<'a> Parser<'a> {
 
     /// Returns true if the next keyword indicates a sub query, i.e. SELECT or WITH
     fn peek_sub_query(&mut self) -> bool {
-        self.peek_one_of_keywords(&[Keyword::SELECT, Keyword::WITH])
+        // `TABLE t` is a query body too (PostgreSQL's `SELECT * FROM t`
+        // shorthand), so an INSERT source starting with it is a subquery, not a
+        // table alias.
+        self.peek_one_of_keywords(&[Keyword::SELECT, Keyword::WITH, Keyword::TABLE])
             .is_some()
     }
 

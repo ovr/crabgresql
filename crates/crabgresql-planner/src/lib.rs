@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use crabgresql_binder::{
-    AggInput, BinOp, BoundAggregate, BoundExpr, DistinctKey, JoinExpr, JoinInput, JoinKind,
-    LogicalPlan, OutputColumn, Returning, SortKey, TableFn,
+    AggInput, BinOp, BoundAggregate, BoundExpr, DistinctKey, InsertSource, JoinExpr, JoinInput,
+    JoinKind, LogicalPlan, OutputColumn, Returning, SortKey, TableFn,
 };
 use crabgresql_storage_api::{IndexConstraint, IndexMetadata, TableAm, TableSchema};
 use crabgresql_types::PgType;
@@ -101,7 +101,7 @@ pub enum PhysicalPlan {
     },
     Insert {
         table: Arc<dyn TableAm>,
-        rows: Vec<Vec<BoundExpr>>,
+        source: PhysicalInsertSource,
         returning: Option<Returning>,
     },
     Update {
@@ -114,6 +114,20 @@ pub enum PhysicalPlan {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         returning: Option<Returning>,
+    },
+}
+
+/// The rows an INSERT writes, mirroring [`InsertSource`] with the query source's
+/// subplan already lowered to a [`PhysicalPlan`].
+pub enum PhysicalInsertSource {
+    /// Fully-formed rows, full-width in schema order, evaluated against the empty
+    /// row.
+    Values(Vec<Vec<BoundExpr>>),
+    /// Rows pulled from `input`, each mapped through `projections` (full-width,
+    /// schema order) evaluated against the source tuple.
+    Query {
+        input: Box<PhysicalPlan>,
+        projections: Vec<BoundExpr>,
     },
 }
 
@@ -469,11 +483,17 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         },
         LogicalPlan::Insert {
             table,
-            rows,
+            source,
             returning,
         } => PhysicalPlan::Insert {
             table,
-            rows,
+            source: match source {
+                InsertSource::Values(rows) => PhysicalInsertSource::Values(rows),
+                InsertSource::Query { input, projections } => PhysicalInsertSource::Query {
+                    input: Box::new(plan(*input)),
+                    projections,
+                },
+            },
             returning,
         },
         LogicalPlan::Update {
@@ -1095,9 +1115,12 @@ mod tests {
 
     #[test]
     fn insert_rows_are_prebound_constants() {
-        let PhysicalPlan::Insert { rows, .. } = plan_sql("INSERT INTO t (id) VALUES (1), (2)")
+        let PhysicalPlan::Insert { source, .. } = plan_sql("INSERT INTO t (id) VALUES (1), (2)")
         else {
             panic!("expected Insert");
+        };
+        let PhysicalInsertSource::Values(rows) = source else {
+            panic!("expected a VALUES source");
         };
         assert_eq!(rows.len(), 2);
         assert_eq!(

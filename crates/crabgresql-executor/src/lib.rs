@@ -21,7 +21,8 @@ use crabgresql_binder::{
     BoundAggregate, BoundExpr, DistinctKey, JoinKind, Returning, SortKey, TableFn,
 };
 use crabgresql_planner::{
-    HashKey, PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan,
+    HashKey, PhysicalAggInput, PhysicalInsertSource, PhysicalJoinExpr, PhysicalJoinInput,
+    PhysicalPlan,
 };
 use crabgresql_storage_api::{IndexMetadata, TableAm, Tid, Tuple};
 use crabgresql_txn::TxnContext;
@@ -281,9 +282,9 @@ pub fn execute(
         }
         PhysicalPlan::Insert {
             table,
-            rows,
+            source,
             returning,
-        } => execute_insert(&table, &rows, returning, ctx, txn),
+        } => execute_insert(&table, source, returning, ctx, txn),
         PhysicalPlan::Update {
             table,
             predicate,
@@ -407,12 +408,41 @@ fn returning_rows(output: Vec<Tuple>, columns: Vec<OutputColumn>, verb: DmlVerb)
 /// transaction commits.
 fn execute_insert(
     table: &Arc<dyn TableAm>,
-    rows: &[Vec<BoundExpr>],
+    source: PhysicalInsertSource,
     returning: Option<Returning>,
     ctx: ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    let mut tuples: Vec<Tuple> = Vec::with_capacity(rows.len());
+    // Materialize every insert tuple before touching the table. For a query
+    // source (`INSERT ... SELECT`) the child is drained fully under `txn`'s
+    // snapshot first, so `INSERT INTO t SELECT ... FROM t` reads only the
+    // pre-insert rows (no Halloween problem).
+    let source_tuples: Vec<Tuple> = match source {
+        PhysicalInsertSource::Values(rows) => rows
+            .iter()
+            .map(|row| row.iter().map(|expr| eval(expr, &[], ctx)).collect())
+            .collect::<Result<_, _>>()?,
+        PhysicalInsertSource::Query { input, projections } => {
+            let Execution::Rows { mut node, .. } = execute(*input, ctx, txn)? else {
+                return Err(ExecError::new(
+                    "XX000",
+                    "insert source did not produce a row set",
+                ));
+            };
+            let mut out = Vec::new();
+            while let Some(row) = node.next()? {
+                out.push(
+                    projections
+                        .iter()
+                        .map(|expr| eval(expr, &row, ctx))
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+            out
+        }
+    };
+
+    let mut tuples: Vec<Tuple> = Vec::with_capacity(source_tuples.len());
     // Existing rows are only consulted to enforce UNIQUE keys; a table with no
     // unique index never needs the scan (NOT NULL checks only the new row).
     let has_unique = table.indexes().iter().any(|index| index.unique);
@@ -421,11 +451,7 @@ fn execute_insert(
     } else {
         Vec::new()
     };
-    for row in rows {
-        let tuple = row
-            .iter()
-            .map(|expr| eval(expr, &[], ctx))
-            .collect::<Result<_, _>>()?;
+    for tuple in source_tuples {
         validate_constraints(table, &tuple, visible.iter(), ctx)?;
         if has_unique {
             visible.push(tuple.clone());
@@ -2630,6 +2656,69 @@ mod tests {
                 Value::Int4(11),
             ]]
         );
+    }
+
+    /// Parse → bind → plan → execute a non-RETURNING INSERT, returning the
+    /// inserted row count. Panics unless the plan produced [`Execution::Inserted`].
+    fn run_insert(engine: &Arc<dyn TableEngine>, sql: &str) -> u64 {
+        use crabgresql_parser::ast;
+        let stmts = test_ok(crabgresql_parser::parse(sql));
+        let catalog: Arc<dyn crabgresql_storage_api::TypeCatalog> =
+            Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+        let ast::Statement::Insert(insert) = &stmts[0] else {
+            panic!("expected an INSERT statement");
+        };
+        let logical = test_ok(crabgresql_binder::bind_insert(engine, &catalog, insert));
+        let physical = crabgresql_planner::plan(logical);
+        match test_ok(execute(physical, ExecContext::default(), &wtxn())) {
+            Execution::Inserted(n) => n,
+            _ => panic!("expected Inserted"),
+        }
+    }
+
+    #[test]
+    fn insert_select_copies_rows() {
+        let engine = returning_engine();
+        // `INSERT ... SELECT` from the same table doubles it (the source is drained
+        // under the snapshot before any write, so it never sees its own inserts).
+        let inserted = run_insert(&engine, "INSERT INTO t (id, label) SELECT id, label FROM t");
+        assert_eq!(inserted, 3);
+        let table = test_ok(engine.open_table("t"));
+        assert_eq!(table.scan(&rtxn()).count(), 6);
+    }
+
+    #[test]
+    fn insert_select_honors_order_by_and_limit() {
+        let engine = returning_engine();
+        let inserted = run_insert(
+            &engine,
+            "INSERT INTO t (id, label) SELECT id, label FROM t ORDER BY id DESC LIMIT 1",
+        );
+        assert_eq!(inserted, 1);
+        let table = test_ok(engine.open_table("t"));
+        assert_eq!(table.scan(&rtxn()).count(), 4);
+    }
+
+    #[test]
+    fn insert_table_source_copies_rows() {
+        let engine = returning_engine();
+        let inserted = run_insert(&engine, "INSERT INTO t (id, label) TABLE t");
+        assert_eq!(inserted, 3);
+        let table = test_ok(engine.open_table("t"));
+        assert_eq!(table.scan(&rtxn()).count(), 6);
+    }
+
+    #[test]
+    fn insert_select_projects_returning() {
+        let engine = returning_engine();
+        let (columns, rows, verb) = run_returning(
+            &engine,
+            "INSERT INTO t (id, label) SELECT id, label FROM t WHERE id = 1 RETURNING id, label",
+        );
+        assert_eq!(verb, DmlVerb::Insert);
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "label"]);
+        assert_eq!(rows, vec![vec![Value::Int4(1), Value::Text("one".into())]]);
     }
 
     #[test]

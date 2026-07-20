@@ -1910,28 +1910,24 @@ async fn expression_type_errors_report_pg_sqlstates() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn insert_source_clauses_and_ragged_values_are_rejected() -> anyhow::Result<()> {
+async fn insert_source_query_clauses_execute_and_ragged_values_are_rejected() -> anyhow::Result<()>
+{
     let client = connect(spawn_server().await).await;
     client
         .simple_query("CREATE TABLE t (a integer, b integer)")
         .await?;
 
-    // The INSERT source is a full query in PG (`VALUES ... LIMIT 1` inserts
-    // one row); until that executes, it must be rejected, not ignored.
-    for sql in [
-        "INSERT INTO t (a) VALUES (1), (2) LIMIT 1",
-        "INSERT INTO t (a) VALUES (1), (2) ORDER BY 1",
-    ] {
-        let err = client.simple_query(sql).await.unwrap_err();
-        assert_eq!(
-            err.as_db_error()
-                .context("database error details are missing")?
-                .code(),
-            &tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED,
-            "{sql}"
-        );
-    }
+    // The INSERT source is a full query in PG: ORDER BY / LIMIT execute, and a
+    // SELECT / TABLE source is inserted row by row. `VALUES (1),(2) ORDER BY 1`
+    // inserts both rows; the SELECT below then copies the smallest one.
+    client
+        .simple_query("INSERT INTO t (a) VALUES (1), (2) ORDER BY 1")
+        .await?;
+    client
+        .simple_query("INSERT INTO t (a, b) SELECT a, a + 10 FROM t ORDER BY a LIMIT 1")
+        .await?;
 
+    // A ragged VALUES list is still a bind-time error.
     let err = client
         .simple_query("INSERT INTO t VALUES (1, 2), (3)")
         .await
@@ -1945,12 +1941,14 @@ async fn insert_source_clauses_and_ragged_values_are_rejected() -> anyhow::Resul
     );
     assert_eq!(db_err.message(), "VALUES lists must all be the same length");
 
-    let messages = client.simple_query("SELECT * FROM t").await?;
-    assert_eq!(
-        rows(&messages).len(),
-        0,
-        "no rejected INSERT may leave rows"
-    );
+    // Two rows from the VALUES insert, one from the SELECT insert; the failed
+    // ragged INSERT left nothing behind.
+    let messages = client.simple_query("SELECT a, b FROM t").await?;
+    let rows = rows(&messages);
+    assert_eq!(rows.len(), 3);
+    // Exactly one row carries the computed `b = a + 10` from the SELECT source.
+    let with_b = rows.iter().filter(|r| r.get("b") == Some("11")).count();
+    assert_eq!(with_b, 1);
 
     Ok(())
 }

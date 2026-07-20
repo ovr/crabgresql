@@ -136,11 +136,12 @@ pub enum LogicalPlan {
         sort: Vec<SortKey>,
         distinct: Option<Vec<DistinctKey>>,
     },
-    /// INSERT ... VALUES: rows are full-width in schema order, each cell
-    /// already coerced to its column type.
+    /// INSERT: rows come either from a `VALUES` list (full-width, schema order,
+    /// each cell already coerced) or from a query source (`INSERT ... SELECT` /
+    /// `INSERT ... TABLE t`). See [`InsertSource`].
     Insert {
         table: Arc<dyn TableAm>,
-        rows: Vec<Vec<BoundExpr>>,
+        source: InsertSource,
         /// `RETURNING`: a projection over each inserted row, bound against the
         /// table schema. `None` when the clause is absent.
         returning: Option<Returning>,
@@ -169,6 +170,23 @@ pub enum LogicalPlan {
 pub struct Returning {
     pub columns: Vec<OutputColumn>,
     pub projections: Vec<BoundExpr>,
+}
+
+/// The rows an INSERT writes.
+#[derive(Clone)]
+pub enum InsertSource {
+    /// `INSERT ... VALUES`: fully-formed rows, full-width in schema order, each
+    /// cell already coerced to its column type. Evaluated against the empty row.
+    Values(Vec<Vec<BoundExpr>>),
+    /// `INSERT ... SELECT` / `INSERT ... TABLE t`: rows are pulled from `input`
+    /// at execution time. `projections` is full-width in schema order — non-target
+    /// columns hold their column default, each target column a `ColumnRef` into
+    /// the source row coerced to the column type — evaluated against each source
+    /// tuple.
+    Query {
+        input: Box<LogicalPlan>,
+        projections: Vec<BoundExpr>,
+    },
 }
 
 /// One row source feeding a [`LogicalPlan::Join`]: a base table scan, a
@@ -422,10 +440,18 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
             subst_exprs(projections, params);
         }
         LogicalPlan::Insert {
-            rows, returning, ..
+            source, returning, ..
         } => {
-            for row in rows {
-                subst_exprs(row, params);
+            match source {
+                InsertSource::Values(rows) => {
+                    for row in rows {
+                        subst_exprs(row, params);
+                    }
+                }
+                InsertSource::Query { input, projections } => {
+                    substitute_params(input, params);
+                    subst_exprs(projections, params);
+                }
             }
             subst_returning(returning, params);
         }
@@ -586,6 +612,9 @@ fn bind_query_body(
             bind_select(engine, catalog, params, select, &query.order_by, ctes)
         }
         ast::SetExpr::Values(values) => bind_values_query(catalog, params, values, &query.order_by),
+        ast::SetExpr::Table(table) => {
+            bind_table_query(engine, catalog, params, table, &query.order_by, ctes)
+        }
         other => Err(BindError::feature_not_supported(format!(
             "query form is not supported yet: {other}"
         ))),
@@ -803,6 +832,67 @@ fn finish_single_select(input: JoinInput, body: SelectBody) -> LogicalPlan {
             sort: body.sort,
             distinct: body.distinct,
         },
+    }
+}
+
+/// Bind a `TABLE t` query body (`SetExpr::Table`), which is exactly
+/// `SELECT * FROM t` with an optional ORDER BY. The table resolves through the
+/// same FROM machinery as a plain relation reference (search-path resolution and
+/// CTE shadowing included), then `*` expands over its columns.
+fn bind_table_query(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+    table: &ast::Table,
+    order_by: &Option<ast::OrderBy>,
+    ctes: &CteEnv,
+) -> Result<LogicalPlan, BindError> {
+    let mut parts = Vec::new();
+    if let Some(schema) = &table.schema_name {
+        parts.push(ast::Ident::new(schema.clone()));
+    }
+    // The parser always fills `table_name` for a well-formed `TABLE t`.
+    let name = table.table_name.clone().ok_or_else(|| {
+        BindError::syntax("TABLE requires a table name")
+    })?;
+    parts.push(ast::Ident::new(name));
+    let relation = ast::TableFactor::Table {
+        name: ast::ObjectName::from(parts),
+        alias: None,
+        args: None,
+        with_hints: Vec::new(),
+        version: None,
+        with_ordinality: false,
+        partitions: Vec::new(),
+        json_path: None,
+        sample: None,
+        index_hints: Vec::new(),
+    };
+    let BoundFrom {
+        source,
+        relations,
+        visible,
+    } = bind_from_item(engine, catalog, params, &relation, ctes)?.into_bound_from();
+    let scope = Scope::relations_with_visible(relations, visible, catalog, params);
+    let mut columns = Vec::new();
+    let mut projections = Vec::new();
+    for (col, expr) in scope.expand_wildcard() {
+        columns.push(col);
+        projections.push(expr);
+    }
+    let sort = bind_order_by(order_by, &columns, &scope, &mut projections, true)?;
+    let body = SelectBody {
+        columns,
+        projections,
+        predicate: None,
+        sort,
+        distinct: None,
+        aggregation: None,
+    };
+    match source {
+        JoinExpr::Input { input, .. } => Ok(finish_single_select(input, body)),
+        // A single relation reference never produces a join tree.
+        JoinExpr::Join { .. } => unreachable!("TABLE t binds a single relation"),
     }
 }
 
@@ -2529,86 +2619,107 @@ pub fn bind_insert_with_params(
     };
 
     let default_values_form = insert.source.is_none();
-    let mut value_rows: Vec<&[ast::Expr]> = Vec::new();
-    let empty: &[ast::Expr] = &[];
-    if default_values_form {
-        value_rows.push(empty);
-    }
     let source = insert.source.as_deref();
-    // The INSERT source is a full query in PG: `VALUES (1),(2) LIMIT 1` is
-    // legal and inserts one row. Ignoring these clauses would silently insert
-    // the wrong rows, so reject them like any other unexecuted clause. ORDER BY
-    // on an INSERT source is not executed here either.
-    if let Some(source) = source {
-        reject_unsupported_query_clauses(source)?;
-        // A WITH on the INSERT source (`INSERT ... WITH c AS (...) VALUES ...`) is not
-        // executed here; reject it rather than silently dropping the CTE. (Top-level
-        // WITH is handled by bind_ctes, but the INSERT path never reaches it.)
-        if source.with.is_some() {
-            return Err(BindError::feature_not_supported(
-                "WITH on INSERT is not supported yet",
-            ));
-        }
-        if source.order_by.is_some() {
-            return Err(BindError::feature_not_supported(
-                "ORDER BY on an INSERT source is not supported yet",
-            ));
-        }
-        // `VALUES (1),(2) LIMIT 1` is a legal INSERT source in PG that inserts one
-        // row; this path does not execute the limit, so reject it rather than
-        // silently insert the wrong rows.
-        if source.limit_clause.is_some() {
-            return Err(BindError::feature_not_supported(
-                "LIMIT/OFFSET on an INSERT source is not supported yet",
-            ));
-        }
-        let values = match source.body.as_ref() {
-            ast::SetExpr::Values(values) => &values.rows,
-            other => {
-                return Err(BindError::feature_not_supported(format!(
-                    "INSERT source is not supported yet: {other}"
-                )));
-            }
-        };
-        value_rows.extend(values.iter().map(|row| row.content.as_slice()));
-    }
+    // A non-VALUES body (`SELECT`, `TABLE t`) — or a VALUES list carrying ORDER
+    // BY / LIMIT / WITH, which must be executed as a query — feeds rows in from a
+    // child plan. A plain VALUES list keeps the direct, fully-materialized path.
+    let is_query_source = matches!(
+        source,
+        Some(q) if q.with.is_some()
+            || q.order_by.is_some()
+            || q.limit_clause.is_some()
+            || !matches!(q.body.as_ref(), ast::SetExpr::Values(_))
+    );
 
-    // VALUES cells bind in the empty scope: a column reference in VALUES is
-    // an undefined column, as in PG.
-    let scope = Scope::empty(catalog, params);
-    let first_width = value_rows.first().map_or(0, |row| row.len());
-    let mut rows = Vec::with_capacity(value_rows.len());
-    for value_row in value_rows {
-        // PG validates the VALUES clause shape before matching it against the
-        // target columns.
-        if value_row.len() != first_width {
-            return Err(BindError::syntax(
-                "VALUES lists must all be the same length",
-            ));
-        }
-        if value_row.len() > target_indices.len() {
+    let insert_source = if is_query_source {
+        let query = source.expect("is_query_source implies a source query");
+        let input = bind_query_with_params(engine, catalog, query, params)?;
+        let src_cols = output_columns_of(&input)?;
+        // PG matches the query's column count against the target columns: too
+        // many is always an error; too few is an error only with an explicit
+        // column list (otherwise trailing columns take their defaults).
+        if src_cols.len() > target_indices.len() {
             return Err(BindError::syntax(
                 "INSERT has more expressions than target columns",
             ));
         }
-        // With an explicit column list PG requires an exact match; without
-        // one, missing trailing columns default to NULL.
-        if !default_values_form && explicit_columns && value_row.len() < target_indices.len() {
+        if explicit_columns && src_cols.len() < target_indices.len() {
             return Err(BindError::syntax(
                 "INSERT has more target columns than expressions",
             ));
         }
-        let mut row = defaults.clone();
-        for (expr, &idx) in value_row.iter().zip(&target_indices) {
-            row[idx] = if is_default_keyword(expr) {
-                defaults[idx].clone()
-            } else {
-                let binding = bind_expr(expr, &scope)?;
-                coerce_to_column(binding, &schema.columns[idx], &scope)?
+        // Build one full-width, schema-order projection per table column: each
+        // target column is a `ColumnRef` into the source row coerced to the
+        // column type (assignment context, so length typmods apply); the rest
+        // keep their column default.
+        let scope = Scope::empty(catalog, params);
+        let mut projections = defaults.clone();
+        for (i, &idx) in target_indices.iter().enumerate().take(src_cols.len()) {
+            let src_ref = BoundExpr::ColumnRef {
+                index: i,
+                ty: src_cols[i].ty,
             };
+            projections[idx] =
+                coerce_to_column(Binding::Typed(src_ref), &schema.columns[idx], &scope)?;
         }
-        rows.push(row);
-    }
+        InsertSource::Query {
+            input: Box::new(input),
+            projections,
+        }
+    } else {
+        // Plain VALUES (or the DEFAULT VALUES form): materialize fully-formed
+        // rows now. FETCH / FOR UPDATE on the source are still rejected.
+        let mut value_rows: Vec<&[ast::Expr]> = Vec::new();
+        let empty: &[ast::Expr] = &[];
+        if default_values_form {
+            value_rows.push(empty);
+        }
+        if let Some(source) = source {
+            reject_unsupported_query_clauses(source)?;
+            let ast::SetExpr::Values(values) = source.body.as_ref() else {
+                unreachable!("non-VALUES bodies take the query-source path");
+            };
+            value_rows.extend(values.rows.iter().map(|row| row.content.as_slice()));
+        }
+
+        // VALUES cells bind in the empty scope: a column reference in VALUES is
+        // an undefined column, as in PG.
+        let scope = Scope::empty(catalog, params);
+        let first_width = value_rows.first().map_or(0, |row| row.len());
+        let mut rows = Vec::with_capacity(value_rows.len());
+        for value_row in value_rows {
+            // PG validates the VALUES clause shape before matching it against the
+            // target columns.
+            if value_row.len() != first_width {
+                return Err(BindError::syntax(
+                    "VALUES lists must all be the same length",
+                ));
+            }
+            if value_row.len() > target_indices.len() {
+                return Err(BindError::syntax(
+                    "INSERT has more expressions than target columns",
+                ));
+            }
+            // With an explicit column list PG requires an exact match; without
+            // one, missing trailing columns default to NULL.
+            if !default_values_form && explicit_columns && value_row.len() < target_indices.len() {
+                return Err(BindError::syntax(
+                    "INSERT has more target columns than expressions",
+                ));
+            }
+            let mut row = defaults.clone();
+            for (expr, &idx) in value_row.iter().zip(&target_indices) {
+                row[idx] = if is_default_keyword(expr) {
+                    defaults[idx].clone()
+                } else {
+                    let binding = bind_expr(expr, &scope)?;
+                    coerce_to_column(binding, &schema.columns[idx], &scope)?
+                };
+            }
+            rows.push(row);
+        }
+        InsertSource::Values(rows)
+    };
 
     // RETURNING references the inserted row's columns, addressed by the table
     // name (INSERT takes no alias). Its VALUES bound in the empty scope, so this
@@ -2620,7 +2731,7 @@ pub fn bind_insert_with_params(
 
     Ok(LogicalPlan::Insert {
         table,
-        rows,
+        source: insert_source,
         returning,
     })
 }
@@ -3475,10 +3586,12 @@ mod tests {
 
     #[test]
     fn insert_coerces_cells_to_column_types() -> anyhow::Result<()> {
-        let LogicalPlan::Insert { rows, .. } =
-            bind_one("INSERT INTO t (id, name) VALUES ('7', 'x')")?
+        let LogicalPlan::Insert {
+            source: InsertSource::Values(rows),
+            ..
+        } = bind_one("INSERT INTO t (id, name) VALUES ('7', 'x')")?
         else {
-            panic!("expected Insert");
+            panic!("expected Insert with a VALUES source");
         };
         // Full-width row in schema order, missing columns padded with NULL.
         assert_eq!(rows[0].len(), 4);
@@ -3589,10 +3702,6 @@ mod tests {
         for sql in [
             "UPDATE t SET (id, name) = (1, 'x')",
             "DELETE FROM t USING t AS u",
-            // The INSERT source is a full query in PG: silently dropping its
-            // clauses would insert the wrong rows.
-            "INSERT INTO t (id) VALUES (1), (2) LIMIT 1",
-            "INSERT INTO t (id) VALUES (1), (2) ORDER BY 1",
         ] {
             let e = bind_err(sql);
             assert_eq!(e.code, "0A000", "for: {sql}");
@@ -3600,10 +3709,95 @@ mod tests {
     }
 
     #[test]
-    fn default_keyword_binds_as_typed_null_without_a_declared_default() -> anyhow::Result<()> {
-        let LogicalPlan::Insert { rows, .. } = bind_one("INSERT INTO t (id) VALUES (DEFAULT)")?
+    fn insert_select_binds_as_query_source() -> anyhow::Result<()> {
+        // A SELECT source produces a query-source Insert whose projection list is
+        // full-width in schema order (unlisted columns take their defaults).
+        let LogicalPlan::Insert {
+            source: InsertSource::Query { projections, .. },
+            ..
+        } = bind_one("INSERT INTO t (id, name) SELECT id, name FROM t")?
         else {
-            panic!("expected Insert");
+            panic!("expected a query-source Insert");
+        };
+        assert_eq!(projections.len(), 4);
+        // The two listed columns reference the source row by position.
+        assert!(matches!(
+            projections[0],
+            BoundExpr::ColumnRef { index: 0, .. }
+        ));
+        assert!(matches!(
+            projections[2],
+            BoundExpr::ColumnRef { index: 1, .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn insert_select_arity_mismatches_match_pg() {
+        let too_many = bind_err("INSERT INTO t (id) SELECT id, name FROM t");
+        assert_eq!(too_many.message, "INSERT has more expressions than target columns");
+        let too_few = bind_err("INSERT INTO t (id, name) SELECT id FROM t");
+        assert_eq!(too_few.message, "INSERT has more target columns than expressions");
+    }
+
+    #[test]
+    fn insert_select_type_mismatch_reports_datatype_mismatch() {
+        // int4 (id) does not assign to a bool column.
+        let e = bind_err("INSERT INTO t (flag) SELECT id FROM t");
+        assert_eq!(e.code, sqlstate::DATATYPE_MISMATCH);
+    }
+
+    #[test]
+    fn insert_table_source_binds_as_query() -> anyhow::Result<()> {
+        // `INSERT ... TABLE t` is `INSERT ... SELECT * FROM t`.
+        let LogicalPlan::Insert {
+            source: InsertSource::Query { projections, .. },
+            ..
+        } = bind_one("INSERT INTO t TABLE t")?
+        else {
+            panic!("expected a query-source Insert");
+        };
+        assert_eq!(projections.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn table_statement_binds_select_star() -> anyhow::Result<()> {
+        let LogicalPlan::Query { columns, .. } = bind_one("TABLE t")? else {
+            panic!("expected a Query plan");
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "big", "name", "flag"]);
+        Ok(())
+    }
+
+    #[test]
+    fn insert_source_query_clauses_are_executed_not_rejected() -> anyhow::Result<()> {
+        // A VALUES source carrying ORDER BY / LIMIT is a full query in PG: it must
+        // be executed as one (a query source), not silently dropped or rejected.
+        for sql in [
+            "INSERT INTO t (id) VALUES (1), (2) LIMIT 1",
+            "INSERT INTO t (id) VALUES (1), (2) ORDER BY 1",
+        ] {
+            let LogicalPlan::Insert {
+                source: InsertSource::Query { .. },
+                ..
+            } = bind_one(sql)?
+            else {
+                panic!("expected a query-source Insert for: {sql}");
+            };
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn default_keyword_binds_as_typed_null_without_a_declared_default() -> anyhow::Result<()> {
+        let LogicalPlan::Insert {
+            source: InsertSource::Values(rows),
+            ..
+        } = bind_one("INSERT INTO t (id) VALUES (DEFAULT)")?
+        else {
+            panic!("expected Insert with a VALUES source");
         };
         assert_eq!(
             rows[0][0],
@@ -4211,11 +4405,17 @@ mod tests {
     }
 
     #[test]
-    fn with_on_insert_source_is_rejected() {
-        // The WITH must not be silently dropped: reject rather than insert (10).
-        let e = bind_err("INSERT INTO t (id) WITH c AS (SELECT 1) VALUES (10)");
-        assert_eq!(e.code, "0A000");
-        assert_eq!(e.message, "WITH on INSERT is not supported yet");
+    fn with_on_insert_source_binds_as_a_query() -> anyhow::Result<()> {
+        // The WITH belongs to the source query and is honored via the query
+        // binder (the CTE here is unused; the VALUES still supplies the row).
+        let LogicalPlan::Insert {
+            source: InsertSource::Query { .. },
+            ..
+        } = bind_one("INSERT INTO t (id) WITH c AS (SELECT 1) VALUES (10)")?
+        else {
+            panic!("expected a query-source Insert");
+        };
+        Ok(())
     }
 
     #[test]

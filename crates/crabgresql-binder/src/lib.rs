@@ -14,7 +14,8 @@ pub use expr::{
 };
 pub use functions::{AggFn, GeoFn, ScalarFn, TableFn, lookup_table_fn};
 pub use plan::{
-    AggInput, DistinctKey, JoinExpr, JoinInput, JoinKind, LogicalPlan, Returning, SortKey,
+    AggInput, DistinctKey, InsertSource, JoinExpr, JoinInput, JoinKind, LogicalPlan, Returning,
+    SortKey,
     bind_delete,
     bind_delete_with_params, bind_insert, bind_insert_with_params, bind_query,
     bind_query_with_params, bind_update, bind_update_with_params, output_columns_of,
