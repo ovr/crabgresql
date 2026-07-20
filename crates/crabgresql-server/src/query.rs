@@ -547,7 +547,11 @@ pub fn execute_statement(
 /// level (fresh per statement for READ COMMITTED, frozen once for REPEATABLE
 /// READ and above).
 fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool) -> TxnContext {
-    match &mut session.xact {
+    // The connection's session-stable table-lock owner, stamped onto every
+    // context so a transaction can upgrade its own AccessShare hold (an open
+    // cursor) to AccessExclusive (TRUNCATE) without self-deadlocking.
+    let lock_owner = session.lock_owner;
+    let mut ctx = match &mut session.xact {
         Some(active) => {
             let xid = if is_write {
                 *active.xid.get_or_insert_with(|| txnmgr.allocate_xid())
@@ -571,7 +575,9 @@ fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool)
             };
             txnmgr.context(xid, CommandId::FIRST)
         }
-    }
+    };
+    ctx.lock_owner = lock_owner;
+    ctx
 }
 
 /// Close out a statement's transaction bookkeeping. Under autocommit a write
@@ -883,7 +889,8 @@ fn execute_truncate(
             "TRUNCATE ... ON CLUSTER is not supported yet",
         ));
     }
-    let mut tables: Vec<Arc<dyn TableAm>> = Vec::with_capacity(truncate.table_names.len());
+    let mut named: Vec<(String, Arc<dyn TableAm>)> =
+        Vec::with_capacity(truncate.table_names.len());
     for target in &truncate.table_names {
         if target.only || target.has_asterisk {
             return Err(PgError::feature_not_supported(
@@ -891,13 +898,19 @@ fn execute_truncate(
             ));
         }
         let name = object_name_to_table_name(&target.name)?;
-        tables.push(engine.open_table(&name)?);
+        let table = engine.open_table(&name)?;
+        named.push((name, table));
     }
+    // Acquire the tables' exclusive locks in a deterministic order (by name), so
+    // two concurrent multi-table TRUNCATEs can never deadlock, and drop duplicates
+    // named twice in one statement.
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    named.dedup_by(|a, b| a.0 == b.0);
     // TRUNCATE is a write: run it under a real transaction so autocommit commits
-    // it. (The in-memory engine clears eagerly and ignores the context; truncate
-    // becomes fully transactional with the heap engine.)
+    // it. On the durable heap engine this is fully transactional — the swap is
+    // applied on commit and discarded on rollback (or a crash before commit).
     let txn = build_txn(txnmgr, session, true);
-    for table in &tables {
+    for (_, table) in &named {
         table.truncate(&txn);
     }
     finalize_statement(txnmgr, session, &txn, true, true)?;

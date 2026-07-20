@@ -320,6 +320,7 @@ dependencies = [
  "crc32c",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

@@ -109,8 +109,14 @@ pub fn vacuum(rel: RelFileNode, block: u32, offs: &[u16]) -> Vec<u8> {
     w.0
 }
 
-pub fn truncate(rel: RelFileNode) -> Vec<u8> {
+/// A relfilenode-swap TRUNCATE: the relation's old (still-live) file and the new
+/// empty file staged for it, plus the relation name so recovery can rebind the
+/// catalog once it knows the transaction's fate. Layout:
+/// `[old:u32][new:u32][name_len:u32][name]`.
+pub fn truncate(table: &str, old: RelFileNode, new: RelFileNode) -> Vec<u8> {
     let mut w = W(Vec::new());
-    w.u32(rel.0);
+    w.u32(old.0);
+    w.u32(new.0);
+    w.bytes(table.as_bytes());
     w.0
 }

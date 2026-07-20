@@ -75,9 +75,29 @@ impl RmgrRedo for HeapRedo {
                 })?;
             }
             rec::HEAP_TRUNCATE => {
-                let rel = r.rel();
-                self.engine.bufpool.forget_relation(rel);
-                self.engine.bufpool.smgr().truncate(rel)?;
+                // A relfilenode-swap TRUNCATE. Materialize the new (empty) file so
+                // the same transaction's later inserts can redo into it, and
+                // record the pending swap keyed by XID — but do NOT touch the
+                // catalog or the old file here: the swap is applied after recovery
+                // only if the transaction committed (see
+                // `PgEngine::apply_recovered_truncates`). Never `set_len(0)` the
+                // new file: it is a fresh, never-reused relfilenode whose only
+                // contents are LSN-gated inserts that must survive replay.
+                let old = r.rel();
+                let new = r.rel();
+                let table = String::from_utf8(r.bytes().to_vec())
+                    .map_err(|e| WalError::Redo(format!("truncate record: bad table name: {e}")))?;
+                self.engine.bufpool.smgr().create_if_missing(new)?;
+                self.engine
+                    .recovered_truncates
+                    .lock()
+                    .unwrap_or_else(|_| panic!("mutex poisoned"))
+                    .push(crate::RecoveredTruncate {
+                        xid: ctx.xid,
+                        table,
+                        old,
+                        new,
+                    });
             }
             other => return Err(WalError::Redo(format!("unknown heap info byte {other:#x}"))),
         }

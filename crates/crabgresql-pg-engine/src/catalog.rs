@@ -158,6 +158,87 @@ impl RelCatalog {
         Ok(Some(RelFileNode(rel)))
     }
 
+    /// Allocate a fresh relfilenode WITHOUT persisting the catalog. Used by a
+    /// relfilenode-swap TRUNCATE, which stages a new empty file before its
+    /// transaction commits: the catalog entry is only rewritten (via
+    /// [`RelCatalog::swap_relfilenode`]) once the swap commits. `next` is bumped
+    /// so the id is never reused; a crash that loses this in-memory bump is
+    /// repaired at recovery, which calls [`RelCatalog::observe_relfilenode`] for
+    /// every relfilenode seen in the WAL before any new id is issued.
+    pub fn alloc_relfilenode(&self) -> RelFileNode {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let rel = state.next;
+        state.next += 1;
+        RelFileNode(rel)
+    }
+
+    /// Point `table` at `new`'s file and persist the catalog. Returns the
+    /// previous relfilenode, or `None` if the table is absent. Idempotent: if the
+    /// table already points at `new` (a re-applied recovery swap) it returns
+    /// `Some(new)` without rewriting the file.
+    pub fn swap_relfilenode(
+        &self,
+        table: &str,
+        new: RelFileNode,
+    ) -> std::io::Result<Option<RelFileNode>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(rel) = state.rels.iter_mut().find(|r| r.name == table) else {
+            return Ok(None);
+        };
+        let old = rel.rel;
+        if old == new.0 {
+            return Ok(Some(new));
+        }
+        rel.rel = new.0;
+        // Keep `next` above the swapped-in id even if it was allocated on a
+        // previous boot and the counter was rebuilt from an older catalog file.
+        state.next = state.next.max(new.0 + 1);
+        self.persist(&state)?;
+        Ok(Some(RelFileNode(old)))
+    }
+
+    /// Raise `next` above `n` so a freshly allocated relfilenode can never alias a
+    /// file that already exists on disk. Called during recovery for every old and
+    /// new relfilenode named in a WAL truncate record. No persist: the following
+    /// checkpoint (or the next DDL) carries the updated counter durably.
+    pub fn observe_relfilenode(&self, n: RelFileNode) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state.next = state.next.max(n.0 + 1);
+    }
+
+    /// The relfilenode `table` currently points at, or `None` if it is absent.
+    pub fn current_relfilenode(&self, table: &str) -> Option<RelFileNode> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
+            .rels
+            .iter()
+            .find(|r| r.name == table)
+            .map(|r| RelFileNode(r.rel))
+    }
+
+    /// Every live relfilenode in the catalog, for the startup orphan-file GC.
+    pub fn live_relfilenodes(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .rels
+            .iter()
+            .map(|r| r.rel)
+            .collect()
+    }
+
     pub fn add_index(&self, table: &str, index: IndexMetadata) -> std::io::Result<()> {
         let mut state = self
             .state

@@ -109,7 +109,17 @@ impl StorageManager {
         Ok(block)
     }
 
-    /// Truncate a relation to zero blocks (TRUNCATE and its redo).
+    /// Ensure a relation's (possibly empty) file exists on disk. Opening through
+    /// [`StorageManager::file`] creates it with `create(true)` and caches the
+    /// handle. Used to stage a relfilenode-swap TRUNCATE's fresh file and to
+    /// materialize it during redo (idempotent: a no-op when the file exists).
+    pub fn create_if_missing(&self, rel: RelFileNode) -> std::io::Result<()> {
+        self.file(rel).map(|_| ())
+    }
+
+    /// Truncate a relation to zero blocks. No longer on the TRUNCATE path (which
+    /// now swaps to a fresh relfilenode) but kept as part of the smgr API.
+    #[allow(dead_code)]
     pub fn truncate(&self, rel: RelFileNode) -> std::io::Result<()> {
         let f = self.file(rel)?;
         let g = f.lock().unwrap_or_else(|_| panic!("mutex poisoned"));

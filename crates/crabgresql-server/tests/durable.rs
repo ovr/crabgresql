@@ -179,3 +179,92 @@ async fn writes_after_a_restart_survive_the_next_restart() -> anyhow::Result<()>
 
     Ok(())
 }
+
+#[tokio::test]
+async fn truncate_rolled_back_across_a_restart_keeps_rows() {
+    // Transactional TRUNCATE end-to-end: a rolled-back (and an abandoned) TRUNCATE
+    // must not survive; the rows come back and persist across a restart.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client.simple_query("CREATE TABLE t (id int)").await.unwrap();
+        client
+            .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+            .await
+            .unwrap();
+        // Explicit block that truncates then rolls back.
+        client.simple_query("BEGIN").await.unwrap();
+        client.simple_query("TRUNCATE t").await.unwrap();
+        // Inside the block the truncater sees its own empty table.
+        let msgs = client.simple_query("SELECT id FROM t").await.unwrap();
+        assert_eq!(rows(&msgs).len(), 0);
+        client.simple_query("ROLLBACK").await.unwrap();
+        // After rollback the rows are back.
+        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await.unwrap();
+        assert_eq!(rows(&msgs).len(), 3);
+        shutdown(client, handle).await;
+    }
+    // Restart: the rolled-back TRUNCATE left nothing behind.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await.unwrap();
+        let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+        assert_eq!(got, vec![Some("1"), Some("2"), Some("3")]);
+        shutdown(client, handle).await;
+    }
+}
+
+#[tokio::test]
+async fn truncate_committed_across_a_restart_stays_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client.simple_query("CREATE TABLE t (id int)").await.unwrap();
+        client.simple_query("INSERT INTO t VALUES (1), (2)").await.unwrap();
+        client.simple_query("BEGIN").await.unwrap();
+        client.simple_query("TRUNCATE t").await.unwrap();
+        client.simple_query("COMMIT").await.unwrap();
+        client.simple_query("INSERT INTO t VALUES (9)").await.unwrap();
+        shutdown(client, handle).await;
+    }
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await.unwrap();
+        let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+        assert_eq!(got, vec![Some("9")]);
+        shutdown(client, handle).await;
+    }
+}
+
+#[tokio::test]
+async fn dropped_table_stays_dropped_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client.simple_query("CREATE TABLE t (id int)").await.unwrap();
+        client.simple_query("INSERT INTO t VALUES (1), (2)").await.unwrap();
+        client.simple_query("DROP TABLE t").await.unwrap();
+        shutdown(client, handle).await;
+    }
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        // The table is gone (42P01 undefined_table)...
+        let err = client.simple_query("SELECT id FROM t").await.unwrap_err();
+        let db = err.as_db_error().expect("expected a database error");
+        assert_eq!(db.code(), &tokio_postgres::error::SqlState::UNDEFINED_TABLE);
+        assert!(db.message().contains("does not exist"), "got: {}", db.message());
+        // ...and a new table gets a fresh relfilenode with no data-file collision.
+        client.simple_query("CREATE TABLE t2 (id int)").await.unwrap();
+        client.simple_query("INSERT INTO t2 VALUES (7)").await.unwrap();
+        let msgs = client.simple_query("SELECT id FROM t2").await.unwrap();
+        let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+        assert_eq!(got, vec![Some("7")]);
+        shutdown(client, handle).await;
+    }
+}
