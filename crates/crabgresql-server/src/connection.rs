@@ -428,15 +428,15 @@ async fn copy_in_stream(
     reader: &mut FrontendReader<impl tokio::io::AsyncRead + Unpin>,
     stmt: &ast::Statement,
 ) -> Result<CopyOutcome, ProtocolError> {
-    let plan = match prepare_copy_from(engine, catalog, stmt, session) {
-        Ok(plan) => plan,
-        // Resolve error (missing table, unsupported option, read-only txn):
-        // report it without ever entering copy mode.
+    let prepared = match prepare_copy_from(engine, catalog, stmt, session) {
+        Ok(prepared) => prepared,
+        // Resolve error (missing table, unsupported option, aborted/read-only
+        // txn): report it without ever entering copy mode.
         Err(e) => return Ok(CopyOutcome::Failed(e)),
     };
 
     // Text-based copy-in (text or CSV): overall format text, every column text.
-    let column_formats = vec![Format::Text; plan.column_count()];
+    let column_formats = vec![Format::Text; prepared.plan.column_count()];
     writer.write(&BackendMessage::CopyInResponse(CopyResponse {
         format: Format::Text,
         column_formats,
@@ -471,11 +471,11 @@ async fn copy_in_stream(
         }
     }
 
-    let rows = match crate::copy::decode(&plan.format, &buffer) {
+    let rows = match crate::copy::decode(&prepared.plan.format, &buffer) {
         Ok(rows) => rows,
         Err(e) => return Ok(CopyOutcome::Failed(e)),
     };
-    match run_copy_insert(engine, catalog, txnmgr, session, &plan, rows) {
+    match run_copy_insert(engine, txnmgr, session, &prepared, rows) {
         Ok(n) => Ok(CopyOutcome::Loaded(n)),
         Err(e) => Ok(CopyOutcome::Failed(e)),
     }

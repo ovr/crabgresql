@@ -3,10 +3,13 @@
 //! The wire layer hands us the raw bytes streamed in `CopyData` frames; this
 //! module splits them into logical rows of field strings per a resolved
 //! [`CopyFormat`] — text-format backslash escapes and the `\N` NULL marker, or
-//! CSV quoting with `""` doubling. It never parses values into a type: that is
-//! [`crabgresql_binder::CopyFromPlan::build_insert`]'s job, which runs each
-//! field through the column's input function. `None` marks a field that matched
-//! the NULL representation.
+//! CSV quoting with `""` doubling. Decoding is **byte-oriented** (as PostgreSQL's
+//! COPY is): escapes produce raw bytes, multi-byte UTF-8 flows through untouched,
+//! and each completed field is validated as UTF-8 only at the end — so an escaped
+//! multi-byte character round-trips and an invalid byte (or NUL) errors exactly
+//! as PG does. It never parses values into a type: that is
+//! [`crabgresql_binder::CopyFromPlan::build_insert`]'s job. `None` marks a field
+//! that matched the NULL representation.
 //!
 //! Reproduces PostgreSQL's observable text/CSV COPY behavior (see the COPY docs)
 //! rather than porting its C reader.
@@ -24,131 +27,145 @@ fn bad_copy(message: impl Into<String>) -> PgError {
     PgError::new(sqlstate::BAD_COPY_FILE_FORMAT, message)
 }
 
+/// PG's error for a byte the server encoding (UTF-8) cannot accept.
+fn invalid_utf8(byte: u8) -> PgError {
+    PgError::new(
+        sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+        format!("invalid byte sequence for encoding \"UTF8\": 0x{byte:02x}"),
+    )
+}
+
+/// Turn a completed field's raw bytes into a `String`, erroring exactly as PG
+/// does on a byte sequence that is not valid UTF-8 or on an embedded NUL.
+fn field_string(bytes: Vec<u8>) -> Result<String, PgError> {
+    let s = String::from_utf8(bytes).map_err(|e| {
+        // The first byte the decoder rejected.
+        let byte = e.as_bytes()[e.utf8_error().valid_up_to()];
+        invalid_utf8(byte)
+    })?;
+    if s.as_bytes().contains(&0) {
+        return Err(invalid_utf8(0));
+    }
+    Ok(s)
+}
+
 /// Decode the full stdin byte stream into rows of fields.
 ///
-/// The bytes must be valid UTF-8 (COPY here only speaks UTF-8). A trailing `\.`
-/// line (text format's end-of-data marker) and the empty segment after a final
-/// newline are dropped. `HEADER` skips the first data line.
+/// A trailing `\.` line (text format's end-of-data marker) and the empty segment
+/// after a final newline are dropped. `HEADER` skips the first data line.
 pub fn decode(format: &CopyFormat, bytes: &[u8]) -> Result<Vec<Vec<Field>>, PgError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        PgError::new(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "invalid byte sequence for encoding \"UTF8\"",
-        )
-    })?;
     if format.csv {
-        decode_csv(format, text)
+        decode_csv(format, bytes)
     } else {
-        decode_text(format, text)
+        decode_text(format, bytes)
     }
 }
 
 /// Split a stream into logical lines on `\n`, stripping a single trailing `\r`
-/// from each (CRLF), and dropping the empty trailing segment left by a final
-/// newline. Used for text format, where a newline always ends a row.
-fn logical_lines(text: &str) -> Vec<&str> {
-    if text.is_empty() {
+/// (CRLF), and dropping the empty trailing segment left by a final newline.
+fn text_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    if bytes.is_empty() {
         return Vec::new();
     }
-    let mut lines: Vec<&str> = text.split('\n').collect();
+    let mut lines: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
     // A terminating '\n' yields a trailing "" that is not its own row.
-    if lines.last() == Some(&"") {
+    if matches!(lines.last(), Some(l) if l.is_empty()) {
         lines.pop();
     }
     lines
         .into_iter()
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .map(|l| match l.last() {
+            Some(&b'\r') => &l[..l.len() - 1],
+            _ => l,
+        })
         .collect()
 }
 
-fn decode_text(format: &CopyFormat, text: &str) -> Result<Vec<Vec<Field>>, PgError> {
+fn decode_text(format: &CopyFormat, bytes: &[u8]) -> Result<Vec<Vec<Field>>, PgError> {
     let delimiter = format.delimiter;
+    let null = format.null.as_bytes();
     let mut rows = Vec::new();
     let mut skip_header = format.header;
-    for line in logical_lines(text) {
+    for line in text_lines(bytes) {
         // The text end-of-data marker `\.` terminates the stream.
-        if line == "\\." {
+        if line == b"\\." {
             break;
         }
         if skip_header {
             skip_header = false;
             continue;
         }
-        rows.push(decode_text_line(line, delimiter, &format.null)?);
+        rows.push(decode_text_line(line, delimiter, null)?);
     }
     Ok(rows)
 }
 
 /// Split one text line into fields on unescaped delimiters, then map the NULL
-/// marker and translate backslash escapes.
-fn decode_text_line(line: &str, delimiter: char, null: &str) -> Result<Vec<Field>, PgError> {
-    let mut fields = Vec::new();
-    let mut raw = String::new();
-    let mut chars = line.chars().peekable();
-    // Split on unescaped delimiters, carrying the raw (still-escaped) field so
-    // the NULL comparison sees `\N` as written.
-    loop {
-        match chars.next() {
-            None => {
-                fields.push(finish_text_field(&raw, null)?);
-                break;
+/// marker (compared against the raw, still-escaped field) and de-escape.
+fn decode_text_line(line: &[u8], delimiter: u8, null: &[u8]) -> Result<Vec<Field>, PgError> {
+    // Split into raw field slices on unescaped delimiters: a backslash always
+    // consumes the next byte, so a `\<delim>` never splits.
+    let mut raw_fields: Vec<&[u8]> = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < line.len() {
+        match line[i] {
+            b'\\' => i += 2,
+            b if b == delimiter => {
+                raw_fields.push(&line[start..i]);
+                i += 1;
+                start = i;
             }
-            Some('\\') => {
-                raw.push('\\');
-                // Keep the escaped char attached so a `\<delim>` never splits.
-                if let Some(c) = chars.next() {
-                    raw.push(c);
-                }
-            }
-            Some(c) if c == delimiter => {
-                fields.push(finish_text_field(&raw, null)?);
-                raw.clear();
-            }
-            Some(c) => raw.push(c),
+            _ => i += 1,
+        }
+    }
+    raw_fields.push(&line[start..]);
+
+    let mut fields = Vec::with_capacity(raw_fields.len());
+    for raw in raw_fields {
+        if raw == null {
+            fields.push(None);
+        } else {
+            fields.push(Some(field_string(unescape_text(raw))?));
         }
     }
     Ok(fields)
 }
 
-/// Resolve one raw text field: the NULL marker (compared before de-escaping) or
-/// the de-escaped contents.
-fn finish_text_field(raw: &str, null: &str) -> Result<Field, PgError> {
-    if raw == null {
-        return Ok(None);
-    }
-    Ok(Some(unescape_text(raw)?))
-}
-
-/// Translate PostgreSQL text-format backslash escapes.
-fn unescape_text(raw: &str) -> Result<String, PgError> {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+/// Translate PostgreSQL text-format backslash escapes into raw bytes.
+fn unescape_text(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
             continue;
         }
-        let Some(esc) = chars.next() else {
+        i += 1;
+        let Some(&esc) = raw.get(i) else {
             // A trailing backslash is a literal backslash.
-            out.push('\\');
+            out.push(b'\\');
             break;
         };
+        i += 1;
         match esc {
-            'b' => out.push('\u{08}'),
-            'f' => out.push('\u{0C}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            'v' => out.push('\u{0B}'),
-            'x' => {
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0C),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0B),
+            b'x' => {
                 // `\xHH`: one or two hex digits.
-                let mut val: u32 = 0;
+                let mut val: u8 = 0;
                 let mut seen = 0;
                 while seen < 2 {
-                    match chars.peek().and_then(|d| d.to_digit(16)) {
+                    match raw.get(i).and_then(|d| (*d as char).to_digit(16)) {
                         Some(d) => {
-                            val = val * 16 + d;
-                            chars.next();
+                            val = val.wrapping_mul(16).wrapping_add(d as u8);
+                            i += 1;
                             seen += 1;
                         }
                         None => break,
@@ -156,143 +173,130 @@ fn unescape_text(raw: &str) -> Result<String, PgError> {
                 }
                 if seen == 0 {
                     // `\x` with no hex digit is a literal `x`, as in PG.
-                    out.push('x');
+                    out.push(b'x');
                 } else {
-                    out.push(byte_to_char(val as u8));
+                    out.push(val);
                 }
             }
-            '0'..='7' => {
-                // `\NNN`: up to three octal digits, including the first (which
-                // the `'0'..='7'` arm guarantees is a valid octal digit).
-                let mut val: u32 = esc.to_digit(8).unwrap_or(0);
+            b'0'..=b'7' => {
+                // `\NNN`: up to three octal digits, including the first.
+                let mut val: u32 = (esc - b'0') as u32;
                 let mut seen = 1;
                 while seen < 3 {
-                    match chars.peek().and_then(|d| d.to_digit(8)) {
-                        Some(d) => {
-                            val = val * 8 + d;
-                            chars.next();
+                    match raw.get(i) {
+                        Some(&d @ b'0'..=b'7') => {
+                            val = val * 8 + (d - b'0') as u32;
+                            i += 1;
                             seen += 1;
                         }
-                        None => break,
+                        _ => break,
                     }
                 }
-                out.push(byte_to_char((val & 0xFF) as u8));
+                out.push((val & 0xFF) as u8);
             }
-            // Any other escaped character is itself (`\\` → `\`, `\d` → `d`).
+            // Any other escaped byte is itself (`\\` → `\`, `\d` → `d`).
             other => out.push(other),
         }
     }
-    Ok(out)
+    out
 }
 
-/// Map a decoded byte value back to a `char`. Values ≥ 0x80 stand for a raw
-/// byte; we surface them as the corresponding Latin-1 code point so the string
-/// round-trips through UTF-8 without loss for the common ASCII escapes.
-fn byte_to_char(b: u8) -> char {
-    b as char
-}
-
-fn decode_csv(format: &CopyFormat, text: &str) -> Result<Vec<Vec<Field>>, PgError> {
+fn decode_csv(format: &CopyFormat, bytes: &[u8]) -> Result<Vec<Vec<Field>>, PgError> {
     let delimiter = format.delimiter;
     let quote = format.quote;
     let escape = format.escape;
+    let null = format.null.as_bytes();
     let mut rows: Vec<Vec<Field>> = Vec::new();
     let mut row: Vec<Field> = Vec::new();
-    let mut field = String::new();
-    let mut quoted = false; // currently inside a quoted field
+    let mut field: Vec<u8> = Vec::new();
+    let mut in_quote = false; // currently inside a quoted section
     let mut was_quoted = false; // this field had a quoted section (never NULL)
-    let mut field_started = false; // any char seen for the current field
-    let mut chars = text.chars().peekable();
+    let mut i = 0;
 
-    // Finish the current field, applying the NULL rule (unquoted match only).
-    let finish_field =
-        |field: &mut String, was_quoted: &mut bool, row: &mut Vec<Field>, force_not_null: bool| {
-            let is_null = !*was_quoted && !force_not_null && field.as_str() == format.null;
-            row.push(if is_null {
-                None
-            } else {
-                Some(std::mem::take(field))
-            });
-            field.clear();
-            *was_quoted = false;
-        };
+    while i < bytes.len() {
+        // `\.` on its own line (outside quotes, at the start of a row) is
+        // end-of-data, matching the text format.
+        if !in_quote && row.is_empty() && field.is_empty() && is_eod_line(bytes, i) {
+            break;
+        }
+        let b = bytes[i];
 
-    while let Some(c) = chars.next() {
-        if quoted {
-            if c == escape {
-                // An escape before a quote/escape emits that literal char. When
-                // escape == quote (the default), a doubled quote is one quote and
-                // a lone quote ends the field — handled below.
+        if in_quote {
+            if b == escape {
+                let next = bytes.get(i + 1).copied();
                 if escape != quote {
-                    if let Some(&n) = chars.peek()
-                        && (n == quote || n == escape)
-                    {
-                        field.push(n);
-                        chars.next();
-                        continue;
+                    // A custom escape before a quote/escape emits that literal.
+                    if next == Some(quote) || next == Some(escape) {
+                        field.push(next.unwrap_or(b));
+                        i += 2;
+                    } else {
+                        field.push(b);
+                        i += 1;
                     }
-                    field.push(c);
                     continue;
                 }
-                // escape == quote: peek to distinguish `""` (literal) from close.
-                if chars.peek() == Some(&quote) {
+                // escape == quote (the default): `""` is one quote, a lone quote
+                // closes the section.
+                if next == Some(quote) {
                     field.push(quote);
-                    chars.next();
+                    i += 2;
                 } else {
-                    quoted = false;
+                    in_quote = false;
+                    i += 1;
                 }
                 continue;
             }
-            if c == quote {
+            if b == quote {
                 // Reachable only when escape != quote: a bare closing quote.
-                quoted = false;
+                in_quote = false;
+                i += 1;
                 continue;
             }
-            field.push(c);
+            field.push(b);
+            i += 1;
             continue;
         }
 
-        // Not inside quotes.
-        if c == quote {
-            if field_started && !field.is_empty() {
-                // A quote in the middle of an unquoted field is a data error in
-                // PG's CSV reader.
-                return Err(bad_copy("unquoted quote character in CSV field"));
-            }
-            quoted = true;
+        // Not inside quotes. A quote (anywhere in the field) opens a quoted
+        // section; PG concatenates unquoted and quoted runs within one field, so
+        // `1, "x"` and `ab"cd"` are accepted (they are not errors).
+        if b == quote {
+            in_quote = true;
             was_quoted = true;
-            field_started = true;
+            i += 1;
             continue;
         }
-        if c == delimiter {
+        if b == delimiter {
             let force = force_not_null_at(format, row.len());
-            finish_field(&mut field, &mut was_quoted, &mut row, force);
-            field_started = false;
+            finish_csv_field(&mut field, &mut was_quoted, &mut row, null, force)?;
+            i += 1;
             continue;
         }
-        if c == '\n' || c == '\r' {
+        if b == b'\n' || b == b'\r' {
             // Consume a CRLF pair as one row terminator.
-            if c == '\r' && chars.peek() == Some(&'\n') {
-                chars.next();
-            }
+            let advance = if b == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
             let force = force_not_null_at(format, row.len());
-            finish_field(&mut field, &mut was_quoted, &mut row, force);
+            finish_csv_field(&mut field, &mut was_quoted, &mut row, null, force)?;
             rows.push(std::mem::take(&mut row));
-            field_started = false;
+            i += advance;
             continue;
         }
-        field.push(c);
-        field_started = true;
+        field.push(b);
+        i += 1;
     }
 
-    if quoted {
+    if in_quote {
         return Err(bad_copy("unterminated CSV quoted field"));
     }
     // A final row without a trailing newline still counts (unless the whole
-    // stream was empty / ended exactly on a newline).
-    if field_started || !field.is_empty() || !row.is_empty() {
+    // stream was empty / ended exactly on a newline / at a `\.` marker).
+    if was_quoted || !field.is_empty() || !row.is_empty() {
         let force = force_not_null_at(format, row.len());
-        finish_field(&mut field, &mut was_quoted, &mut row, force);
+        finish_csv_field(&mut field, &mut was_quoted, &mut row, null, force)?;
         rows.push(row);
     }
 
@@ -300,6 +304,33 @@ fn decode_csv(format: &CopyFormat, text: &str) -> Result<Vec<Vec<Field>>, PgErro
         rows.remove(0);
     }
     Ok(rows)
+}
+
+/// Finish the current CSV field, applying the NULL rule (an unquoted match only)
+/// and validating the bytes as UTF-8.
+fn finish_csv_field(
+    field: &mut Vec<u8>,
+    was_quoted: &mut bool,
+    row: &mut Vec<Field>,
+    null: &[u8],
+    force_not_null: bool,
+) -> Result<(), PgError> {
+    let is_null = !*was_quoted && !force_not_null && field.as_slice() == null;
+    let taken = std::mem::take(field);
+    row.push(if is_null {
+        None
+    } else {
+        Some(field_string(taken)?)
+    });
+    *was_quoted = false;
+    Ok(())
+}
+
+/// Whether `bytes[i..]` begins a lone `\.` end-of-data line.
+fn is_eod_line(bytes: &[u8], i: usize) -> bool {
+    let rest = &bytes[i..];
+    rest.starts_with(b"\\.")
+        && matches!(rest.get(2), None | Some(b'\n') | Some(b'\r'))
 }
 
 fn force_not_null_at(format: &CopyFormat, field_index: usize) -> bool {
@@ -311,29 +342,11 @@ mod tests {
     use super::*;
 
     fn text_format() -> CopyFormat {
-        // Mirrors CopyFormat::text() defaults (that constructor is private to
-        // the binder, so build the equivalent here via the public fields).
-        CopyFormat {
-            csv: false,
-            delimiter: '\t',
-            null: "\\N".to_string(),
-            header: false,
-            quote: '"',
-            escape: '"',
-            force_not_null: Vec::new(),
-        }
+        CopyFormat::text()
     }
 
     fn csv_format() -> CopyFormat {
-        CopyFormat {
-            csv: true,
-            delimiter: ',',
-            null: String::new(),
-            header: false,
-            quote: '"',
-            escape: '"',
-            force_not_null: Vec::new(),
-        }
+        CopyFormat::csv()
     }
 
     #[test]
@@ -375,6 +388,31 @@ mod tests {
     }
 
     #[test]
+    fn text_octal_and_hex_escapes_form_multibyte_utf8() {
+        // The three UTF-8 bytes of 日 written as octal, and é as hex — each must
+        // round-trip to the single character (byte-oriented decode), not mojibake.
+        let rows = decode(&text_format(), b"\\346\\227\\245\t\\xc3\\xa9\n").unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Some("日".into()), Some("é".into())]]
+        );
+    }
+
+    #[test]
+    fn text_invalid_utf8_byte_errors() {
+        let err = decode(&text_format(), b"\\351\n").unwrap_err();
+        assert_eq!(err.code, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
+        assert!(err.message.contains("0xe9"), "{}", err.message);
+    }
+
+    #[test]
+    fn text_nul_byte_errors() {
+        let err = decode(&text_format(), b"a\\000b\n").unwrap_err();
+        assert_eq!(err.code, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
+        assert!(err.message.contains("0x00"), "{}", err.message);
+    }
+
+    #[test]
     fn text_escaped_delimiter_does_not_split() {
         let rows = decode(&text_format(), b"a\\\tb\n").unwrap();
         assert_eq!(rows, vec![vec![Some("a\tb".into())]]);
@@ -406,6 +444,20 @@ mod tests {
                 Some("a,b".into()),
                 Some("she \"said\"".into()),
             ]]
+        );
+    }
+
+    #[test]
+    fn csv_concatenates_unquoted_and_quoted_runs() {
+        // PG accepts a quote adjacent to unquoted content, concatenating the
+        // runs: `1, "two"` -> ` two`, `ab"cd"` -> `abcd`, `"a"b"c"` -> `abc`.
+        let rows = decode(&csv_format(), b"1, \"two\"\nab\"cd\",\"a\"b\"c\"\n").unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".into()), Some(" two".into())],
+                vec![Some("abcd".into()), Some("abc".into())],
+            ]
         );
     }
 
@@ -447,5 +499,14 @@ mod tests {
         fmt.header = true;
         let rows = decode(&fmt, b"a,b\n1,x\n").unwrap();
         assert_eq!(rows, vec![vec![Some("1".into()), Some("x".into())]]);
+    }
+
+    #[test]
+    fn csv_end_of_data_marker() {
+        let rows = decode(&csv_format(), b"1,a\n\\.\n2,b\n").unwrap();
+        assert_eq!(rows, vec![vec![Some("1".into()), Some("a".into())]]);
+        // A quoted `\.` is data, not a terminator.
+        let rows = decode(&csv_format(), b"\"\\.\",x\n").unwrap();
+        assert_eq!(rows, vec![vec![Some("\\.".into()), Some("x".into())]]);
     }
 }

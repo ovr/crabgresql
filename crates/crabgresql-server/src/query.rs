@@ -731,18 +731,35 @@ fn finalize_statement(
     Ok(())
 }
 
+/// A bound COPY plus the type catalog its data fields will parse against —
+/// returned by [`prepare_copy_from`] and threaded into [`run_copy_insert`] so
+/// the catalog is built once per COPY, not twice.
+pub struct PreparedCopy {
+    pub plan: CopyFromPlan,
+    catalog: Arc<dyn TypeCatalog>,
+}
+
 /// Resolve `COPY <table> [(cols)] FROM STDIN` up to the point the connection
 /// can send `CopyInResponse`: bind the target relation, column list, and
-/// text/CSV format, and reject the write in a read-only transaction (25006).
-/// No row data is read here — that streams in over the wire afterwards. Kept
-/// separate from [`execute_statement`] because COPY needs socket access the
-/// pure execute path does not have.
+/// text/CSV format, and reject the write in an aborted (25P02) or read-only
+/// (25006) transaction. No row data is read here — that streams in over the wire
+/// afterwards. Kept separate from [`execute_statement`] because COPY needs socket
+/// access the pure execute path does not have.
 pub fn prepare_copy_from(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     stmt: &ast::Statement,
     session: &Session,
-) -> Result<CopyFromPlan, PgError> {
+) -> Result<PreparedCopy, PgError> {
+    // In an aborted transaction block PG rejects everything but COMMIT/ROLLBACK,
+    // before entering copy mode. COPY bypasses execute_statement's guard, so
+    // re-establish it here.
+    if session.tx_status == TransactionStatus::Failed {
+        return Err(PgError::new(
+            sqlstate::IN_FAILED_SQL_TRANSACTION,
+            "current transaction is aborted, commands ignored until end of transaction block",
+        ));
+    }
     let ast::Statement::Copy {
         source,
         to,
@@ -776,7 +793,10 @@ pub fn prepare_copy_from(
             "cannot execute COPY in a read-only transaction",
         ));
     }
-    Ok(plan)
+    Ok(PreparedCopy {
+        plan,
+        catalog: type_catalog,
+    })
 }
 
 /// Execute a bound COPY as an INSERT of the decoded field rows, under a write
@@ -784,22 +804,21 @@ pub fn prepare_copy_from(
 /// the same XID/commit lifecycle and constraint checks as an ordinary INSERT.
 pub fn run_copy_insert(
     engine: &Arc<dyn TableEngine>,
-    global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
-    plan: &CopyFromPlan,
+    prepared: &PreparedCopy,
     rows: Vec<Vec<Option<String>>>,
 ) -> Result<u64, PgError> {
     // Turn the decoded rows into an INSERT ... VALUES plan (each field parses via
-    // its column's input function against the resolved type catalog).
-    let (_, type_catalog) = bind_catalogs(engine, global_catalog, session);
-    let logical = plan.build_insert(&type_catalog, rows)?;
+    // its column's input function against the type catalog bound at prepare time).
+    let logical = prepared.plan.build_insert(&prepared.catalog, rows)?;
+    // A COPY is a write (read-only was rejected at prepare time); its context
+    // carries a sequence handle so a `serial`/`nextval()` column default advances
+    // the sequence and updates this session's currval/lastval, as INSERT does.
+    let read_only = read_only_active(session);
     let txn = build_txn(txnmgr, session, true);
-    let exec = match execute(
-        crabgresql_planner::plan(logical),
-        session.exec_context(),
-        &txn,
-    ) {
+    let exec_ctx = session.exec_context_with_sequences(engine, read_only);
+    let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
             let _ = finalize_statement(txnmgr, session, &txn, true, false);

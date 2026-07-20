@@ -9,6 +9,9 @@ pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
 pub const INVALID_TIME_ZONE_DISPLACEMENT_VALUE: &str = "22009";
 pub const DIVISION_BY_ZERO: &str = "22012";
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+/// Class 22 — a byte sequence that is not valid in the server encoding (UTF-8),
+/// e.g. an invalid byte or embedded NUL in COPY data.
+pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 pub const INVALID_PARAMETER_VALUE: &str = "22023";
 pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
 pub const INVALID_ARGUMENT_FOR_LOG: &str = "2201E";

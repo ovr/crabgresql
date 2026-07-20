@@ -3059,46 +3059,53 @@ pub fn bind_insert_with_params(
 /// legacy) options. Consumed by the server's row decoder, which splits the raw
 /// stdin bytes into fields per these rules before [`CopyFromPlan::build_insert`]
 /// turns them into typed rows.
+///
+/// The delimiter, quote, and escape are single bytes — PostgreSQL requires each
+/// to be "a single one-byte character" — so the decoder can operate on the raw
+/// byte stream (COPY is byte-oriented; multi-byte data flows through untouched).
 #[derive(Clone, Debug)]
 pub struct CopyFormat {
     /// `true` for `FORMAT csv`, `false` for the default text format.
     pub csv: bool,
     /// Field separator (TAB for text, `,` for CSV, unless overridden).
-    pub delimiter: char,
+    pub delimiter: u8,
     /// The unquoted token that means SQL NULL (`\N` for text, empty for CSV).
     pub null: String,
     /// Skip the first data line (`HEADER`).
     pub header: bool,
-    /// CSV quote character (default `"`); unused in text format.
-    pub quote: char,
-    /// CSV escape character (default = the quote character); unused in text.
-    pub escape: char,
+    /// CSV quote byte (default `"`); unused in text format.
+    pub quote: u8,
+    /// CSV escape byte (default = the quote byte); unused in text.
+    pub escape: u8,
     /// Field positions (into the target column list) that CSV must read as a
     /// non-NULL empty string rather than NULL (`FORCE_NOT_NULL`).
     pub force_not_null: Vec<usize>,
 }
 
 impl CopyFormat {
-    fn text() -> Self {
+    /// Text-format defaults. Public so the server-side decoder and its tests
+    /// share one source of truth instead of reconstructing the fields.
+    pub fn text() -> Self {
         CopyFormat {
             csv: false,
-            delimiter: '\t',
+            delimiter: b'\t',
             null: "\\N".to_string(),
             header: false,
-            quote: '"',
-            escape: '"',
+            quote: b'"',
+            escape: b'"',
             force_not_null: Vec::new(),
         }
     }
 
-    fn csv() -> Self {
+    /// CSV-format defaults.
+    pub fn csv() -> Self {
         CopyFormat {
             csv: true,
-            delimiter: ',',
+            delimiter: b',',
             null: String::new(),
             header: false,
-            quote: '"',
-            escape: '"',
+            quote: b'"',
+            escape: b'"',
             force_not_null: Vec::new(),
         }
     }
@@ -3362,16 +3369,16 @@ fn resolve_copy_format(
     for opt in options {
         match opt {
             ast::CopyOption::Format(_) | ast::CopyOption::Freeze(_) => {}
-            ast::CopyOption::Delimiter(c) => fmt.delimiter = *c,
+            ast::CopyOption::Delimiter(c) => fmt.delimiter = single_byte(*c, "delimiter")?,
             ast::CopyOption::Null(s) => fmt.null = s.clone(),
             ast::CopyOption::Header(b) => fmt.header = *b,
             ast::CopyOption::Quote(c) => {
                 require_csv("QUOTE")?;
-                fmt.quote = *c;
+                fmt.quote = single_byte(*c, "quote")?;
             }
             ast::CopyOption::Escape(c) => {
                 require_csv("ESCAPE")?;
-                fmt.escape = *c;
+                fmt.escape = single_byte(*c, "escape")?;
             }
             ast::CopyOption::ForceNotNull(cols) => {
                 require_csv("FORCE_NOT_NULL")?;
@@ -3389,7 +3396,7 @@ fn resolve_copy_format(
     // Pass 2b: legacy per-option overrides (`COPY … CSV HEADER DELIMITER ','`).
     for opt in legacy_options {
         match opt {
-            ast::CopyLegacyOption::Delimiter(c) => fmt.delimiter = *c,
+            ast::CopyLegacyOption::Delimiter(c) => fmt.delimiter = single_byte(*c, "delimiter")?,
             ast::CopyLegacyOption::Null(s) => fmt.null = s.clone(),
             ast::CopyLegacyOption::Header => fmt.header = true,
             ast::CopyLegacyOption::Binary | ast::CopyLegacyOption::Csv(_) => {}
@@ -3403,8 +3410,8 @@ fn resolve_copy_format(
             for s in sub {
                 match s {
                     ast::CopyLegacyCsvOption::Header => fmt.header = true,
-                    ast::CopyLegacyCsvOption::Quote(c) => fmt.quote = *c,
-                    ast::CopyLegacyCsvOption::Escape(c) => fmt.escape = *c,
+                    ast::CopyLegacyCsvOption::Quote(c) => fmt.quote = single_byte(*c, "quote")?,
+                    ast::CopyLegacyCsvOption::Escape(c) => fmt.escape = single_byte(*c, "escape")?,
                     ast::CopyLegacyCsvOption::ForceNotNull(cols) => {
                         fmt.force_not_null = force_not_null(cols)?;
                     }
@@ -3427,6 +3434,18 @@ fn resolve_copy_format(
     }
 
     Ok(fmt)
+}
+
+/// A COPY delimiter/quote/escape must be a single one-byte character (PG rejects
+/// a multi-byte one with `0A000`). Returns the byte for the byte-oriented decoder.
+fn single_byte(c: char, what: &str) -> Result<u8, BindError> {
+    if c.is_ascii() {
+        Ok(c as u8)
+    } else {
+        Err(BindError::feature_not_supported(format!(
+            "COPY {what} must be a single one-byte character"
+        )))
+    }
 }
 
 /// COPY only speaks UTF-8; any other `ENCODING` is an honest not-supported.

@@ -27,11 +27,24 @@ pub enum ScriptItem {
 
 /// Whether a completed statement is `COPY … FROM STDIN` (the only COPY form the
 /// runner streams inline data for). Whitespace is collapsed so a multi-line
-/// statement and `FROM  STDIN` both match.
+/// statement and `FROM  STDIN` both match. `FROM STDIN` must be a trailing token
+/// sequence (optionally followed by `WITH`-options), not merely a substring, so
+/// `COPY (… FROM stdin) TO …` and a `STDIN`-prefixed identifier are not
+/// misclassified.
 pub fn is_copy_from_stdin(sql: &str) -> bool {
     let upper = sql.trim().trim_end_matches(';').to_ascii_uppercase();
     let normalized = upper.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.starts_with("COPY ") && normalized.contains(" FROM STDIN")
+    if !normalized.starts_with("COPY ") {
+        return false;
+    }
+    const MARK: &str = " FROM STDIN";
+    match normalized.find(MARK) {
+        Some(idx) => {
+            let after = &normalized[idx + MARK.len()..];
+            after.is_empty() || after.starts_with(' ')
+        }
+        None => false,
+    }
 }
 
 /// Quoting/comment state that survives across lines. The dollar-quote tag is
@@ -449,5 +462,9 @@ mod tests {
         assert!(!is_copy_from_stdin("COPY t TO stdout;"));
         assert!(!is_copy_from_stdin("COPY t FROM '/tmp/f';"));
         assert!(!is_copy_from_stdin("SELECT 1;"));
+        // "FROM STDIN" as a substring inside a COPY TO (query) must not match.
+        assert!(!is_copy_from_stdin("COPY (SELECT a FROM stdin) TO stdout;"));
+        // A STDIN-prefixed identifier is not the STDIN keyword.
+        assert!(!is_copy_from_stdin("COPY t FROM stdin_table;"));
     }
 }
