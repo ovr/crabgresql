@@ -28,9 +28,9 @@ mod static_table;
 use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::{
-    IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
+    Column, IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
 };
-use crabgresql_types::Value;
+use crabgresql_types::{PgType, Value};
 
 pub use static_table::StaticTable;
 
@@ -104,6 +104,23 @@ pub enum RelKind {
     Table,
     /// A view (`relkind = 'v'`, table_type `VIEW`).
     View,
+    /// A sequence (`relkind = 'S'`). Not a table, so it is omitted from
+    /// `information_schema.tables`/`.columns`.
+    Sequence,
+}
+
+/// A sequence's parameters, reflected into `pg_sequence`. Carried on the
+/// [`CatalogRelation`] whose [`RelKind::Sequence`] entry it belongs to, so the
+/// sequence's `pg_class` OID (assigned positionally) can be reused as `seqrelid`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogSequence {
+    pub type_oid: u32,
+    pub start: i64,
+    pub increment: i64,
+    pub min: i64,
+    pub max: i64,
+    pub cache: i64,
+    pub cycle: bool,
 }
 
 /// A live relation exposed through the system catalogs.
@@ -114,6 +131,8 @@ pub struct CatalogRelation {
     pub namespace: String,
     pub temporary: bool,
     pub kind: RelKind,
+    /// Sequence parameters, `Some` only when `kind` is [`RelKind::Sequence`].
+    pub sequence: Option<CatalogSequence>,
 }
 
 impl CatalogRelation {
@@ -124,6 +143,7 @@ impl CatalogRelation {
             namespace: "public".to_string(),
             temporary: false,
             kind: RelKind::Table,
+            sequence: None,
         }
     }
 
@@ -134,6 +154,7 @@ impl CatalogRelation {
             namespace: "public".to_string(),
             temporary: false,
             kind: RelKind::Table,
+            sequence: None,
         }
     }
 
@@ -144,6 +165,7 @@ impl CatalogRelation {
             namespace: namespace.into(),
             temporary: true,
             kind: RelKind::Table,
+            sequence: None,
         }
     }
 
@@ -155,6 +177,28 @@ impl CatalogRelation {
             namespace: "public".to_string(),
             temporary: false,
             kind: RelKind::View,
+            sequence: None,
+        }
+    }
+
+    /// A permanent sequence. Its `pg_class` shape is PG's three sequence columns
+    /// (`last_value`, `log_cnt`, `is_called`); `params` feeds `pg_sequence`.
+    pub fn sequence(name: impl Into<String>, params: CatalogSequence) -> Self {
+        let schema = TableSchema {
+            name: name.into(),
+            columns: vec![
+                Column::new("last_value", PgType::Int8),
+                Column::new("log_cnt", PgType::Int8),
+                Column::new("is_called", PgType::Bool),
+            ],
+        };
+        Self {
+            schema,
+            indexes: Vec::new(),
+            namespace: "public".to_string(),
+            temporary: false,
+            kind: RelKind::Sequence,
+            sequence: Some(params),
         }
     }
 }
@@ -292,6 +336,22 @@ impl SystemCatalog {
         })
     }
 
+    /// The `(pg_class OID, params)` of each sequence, for `pg_sequence`. The OID
+    /// matches the one [`SystemCatalog::relation_oids`] assigns (same sort), so
+    /// `pg_sequence.seqrelid` joins `pg_class.oid`.
+    fn sequence_entries(&self) -> Vec<(u32, CatalogSequence)> {
+        let mut rels = self.live_relations().to_vec();
+        rels.sort_by(|a, b| {
+            a.namespace
+                .cmp(&b.namespace)
+                .then_with(|| a.schema.name.cmp(&b.schema.name))
+        });
+        rels.into_iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.sequence.map(|s| (FIRST_REL_OID + i as u32, s)))
+            .collect()
+    }
+
     fn index_oids(&self) -> &[CatalogIndex] {
         self.index_oids.get_or_init(|| {
             let mut relations = self.live_relations().to_vec();
@@ -362,6 +422,10 @@ impl SystemCatalog {
                 schema::pg_index_rows(self.index_oids()),
             )),
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
+            "pg_sequence" => Some((
+                schema::pg_sequence_schema(),
+                schema::pg_sequence_rows(&self.sequence_entries()),
+            )),
             _ => None,
         }
     }

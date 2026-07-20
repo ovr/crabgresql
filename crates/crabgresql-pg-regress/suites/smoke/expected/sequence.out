@@ -1,0 +1,158 @@
+--
+-- SEQUENCES
+-- A sequence is a named counter: nextval advances and returns it, currval and
+-- lastval read this session's last value, setval repositions it. The counter is
+-- NON-transactional (a ROLLBACK does not undo an advance). `serial` desugars to
+-- an integer column plus an owned sequence and a nextval(...) default, and a
+-- sequence reflects into the catalogs as relkind 'S' / pg_sequence. Output
+-- hand-checked against PostgreSQL (psql -a -q).
+--
+CREATE SEQUENCE sq_a INCREMENT 2 MINVALUE 10 MAXVALUE 20 START 10;
+-- The first nextval returns the start value, then advances by the increment.
+SELECT nextval('sq_a');
+ nextval 
+---------
+      10
+(1 row)
+
+SELECT nextval('sq_a');
+ nextval 
+---------
+      12
+(1 row)
+
+-- currval and lastval report this session's most recent value.
+SELECT currval('sq_a');
+ currval 
+---------
+      12
+(1 row)
+
+SELECT lastval();
+ lastval 
+---------
+      12
+(1 row)
+
+-- The regclass form of the argument is accepted too.
+SELECT nextval('sq_a'::regclass);
+ nextval 
+---------
+      14
+(1 row)
+
+-- setval repositions the counter; the next nextval reflects is_called.
+SELECT setval('sq_a', 10);
+ setval 
+--------
+     10
+(1 row)
+
+SELECT nextval('sq_a');
+ nextval 
+---------
+      12
+(1 row)
+
+SELECT setval('sq_a', 18, false);
+ setval 
+--------
+     18
+(1 row)
+
+SELECT nextval('sq_a');
+ nextval 
+---------
+      18
+(1 row)
+
+-- Reaching the maximum (20) with NO CYCLE is an error on the next advance.
+SELECT nextval('sq_a');
+ nextval 
+---------
+      20
+(1 row)
+
+SELECT nextval('sq_a');
+ERROR:  nextval: reached maximum value of sequence "sq_a" (20)
+-- currval before nextval in a fresh sequence is an error.
+CREATE SEQUENCE sq_b;
+SELECT currval('sq_b');
+ERROR:  currval of sequence "sq_b" is not yet defined in this session
+-- The advance is non-transactional: a ROLLBACK does not rewind it.
+SELECT nextval('sq_b');
+ nextval 
+---------
+       1
+(1 row)
+
+BEGIN;
+SELECT nextval('sq_b');
+ nextval 
+---------
+       2
+(1 row)
+
+ROLLBACK;
+SELECT nextval('sq_b');
+ nextval 
+---------
+       3
+(1 row)
+
+-- serial columns auto-assign from an owned sequence.
+CREATE TABLE sq_t (id serial PRIMARY KEY, name text);
+INSERT INTO sq_t (name) VALUES ('a'), ('b');
+INSERT INTO sq_t (name) VALUES ('c');
+SELECT id, name FROM sq_t ORDER BY id;
+ id | name 
+----+------
+  1 | a
+  2 | b
+  3 | c
+(3 rows)
+
+-- A sequence reflects into pg_class as relkind 'S'...
+SELECT relname, relkind FROM pg_class WHERE relname IN ('sq_a', 'sq_t_id_seq') ORDER BY relname;
+   relname   | relkind 
+-------------+---------
+ sq_a        | S
+ sq_t_id_seq | S
+(2 rows)
+
+-- ... and its parameters into pg_sequence.
+SELECT seqstart, seqincrement, seqmin, seqmax, seqcycle
+  FROM pg_sequence JOIN pg_class ON pg_class.oid = pg_sequence.seqrelid
+  WHERE relname = 'sq_a';
+ seqstart | seqincrement | seqmin | seqmax | seqcycle 
+----------+--------------+--------+--------+----------
+       10 |            2 |     10 |     20 | f
+(1 row)
+
+-- A sequence is not a table, so it is absent from information_schema.tables.
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'sq_a';
+ count 
+-------
+     0
+(1 row)
+
+-- DROP SEQUENCE on a table is a wrong-object-type error.
+DROP SEQUENCE sq_t;
+ERROR:  "sq_t" is not a sequence
+HINT:  Use DROP TABLE to remove a table.
+-- DROP TABLE auto-drops the owned serial sequence.
+DROP TABLE sq_t;
+SELECT count(*) FROM pg_class WHERE relname = 'sq_t_id_seq';
+ count 
+-------
+     0
+(1 row)
+
+-- Missing-object diagnostics, with and without IF EXISTS.
+DROP SEQUENCE sq_missing;
+ERROR:  sequence "sq_missing" does not exist
+DROP SEQUENCE IF EXISTS sq_missing;
+NOTICE:  sequence "sq_missing" does not exist, skipping
+-- Clean up (this suite shares one database across tests).
+DROP SEQUENCE sq_a;
+DROP SEQUENCE sq_b;

@@ -11,7 +11,10 @@
 use crabgresql_storage_api::{Column, IndexConstraint, IndexMethod, TableSchema};
 use crabgresql_types::{PgType, Value};
 
-use crate::{CatalogIndex, CatalogRelation, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS, RelKind};
+use crate::{
+    CatalogIndex, CatalogRelation, CatalogSequence, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS,
+    RelKind,
+};
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
 /// built-in ranges so a per-label OID never collides with a type/relation OID.
@@ -199,6 +202,42 @@ pub fn pg_cast_rows() -> Vec<Vec<Value>> {
         .collect()
 }
 
+/// `pg_catalog.pg_sequence` — the definition of each user sequence, one row per
+/// [`RelKind::Sequence`] relation, keyed by its `pg_class` OID (`seqrelid`).
+pub fn pg_sequence_schema() -> TableSchema {
+    TableSchema {
+        name: "pg_sequence".to_string(),
+        columns: vec![
+            col("seqrelid", PgType::Oid),
+            col("seqtypid", PgType::Oid),
+            col("seqstart", PgType::Int8),
+            col("seqincrement", PgType::Int8),
+            col("seqmax", PgType::Int8),
+            col("seqmin", PgType::Int8),
+            col("seqcache", PgType::Int8),
+            col("seqcycle", PgType::Bool),
+        ],
+    }
+}
+
+pub fn pg_sequence_rows(sequences: &[(u32, CatalogSequence)]) -> Vec<Vec<Value>> {
+    sequences
+        .iter()
+        .map(|(oid, s)| {
+            vec![
+                Value::Oid(*oid),
+                Value::Oid(s.type_oid),
+                Value::Int8(s.start),
+                Value::Int8(s.increment),
+                Value::Int8(s.max),
+                Value::Int8(s.min),
+                Value::Int8(s.cache),
+                Value::Bool(s.cycle),
+            ]
+        })
+        .collect()
+}
+
 /// `pg_catalog.pg_namespace` — the schemas visible on a fresh cluster.
 pub fn pg_namespace_schema() -> TableSchema {
     TableSchema {
@@ -255,6 +294,7 @@ pub fn pg_class_rows(
             let (relam, relkind) = match kind {
                 RelKind::Table => (HEAP_AM_OID, "r"),
                 RelKind::View => (0, "v"),
+                RelKind::Sequence => (0, "S"),
             };
             vec![
                 Value::Oid(*oid),
@@ -638,6 +678,8 @@ pub fn information_schema_tables_rows(
 ) -> Vec<Vec<Value>> {
     relations
         .iter()
+        // Sequences are not tables: PG omits them from information_schema.tables.
+        .filter(|relation| relation.kind != RelKind::Sequence)
         .map(|relation| {
             vec![
                 Value::Text(database.to_string()),
@@ -648,6 +690,7 @@ pub fn information_schema_tables_rows(
                         (RelKind::View, _) => "VIEW",
                         (RelKind::Table, true) => "LOCAL TEMPORARY",
                         (RelKind::Table, false) => "BASE TABLE",
+                        (RelKind::Sequence, _) => unreachable!("filtered out above"),
                     }
                     .to_string(),
                 ),
@@ -725,6 +768,8 @@ pub fn information_schema_columns_rows(
 ) -> Vec<Vec<Value>> {
     relations
         .iter()
+        // Sequences are not tables; omit their columns from information_schema.
+        .filter(|relation| relation.kind != RelKind::Sequence)
         .flat_map(|relation| {
             relation
                 .schema

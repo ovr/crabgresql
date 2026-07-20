@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use crabgresql_storage_api::{
-    IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
-    ViewDefinition,
+    IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition, StorageError, TableAm,
+    TableEngine, TableSchema, ViewDefinition,
 };
 
 /// Resolves relations against a session-local temp store first, then the shared
@@ -139,5 +139,31 @@ impl TableEngine for SessionCatalog {
 
     fn views(&self) -> Vec<ViewDefinition> {
         self.global.views()
+    }
+
+    /// Sequences live only in the permanent catalog (temp sequences unsupported),
+    /// so every sequence operation routes to `global`, like views.
+    fn create_sequence(&self, def: SequenceDefinition) -> Result<(), StorageError> {
+        self.global.create_sequence(def)
+    }
+
+    fn drop_sequence(&self, name: &str) -> Result<(), StorageError> {
+        self.global.drop_sequence(name)
+    }
+
+    fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
+        self.global.sequence(name)
+    }
+
+    fn sequences(&self) -> Vec<SequenceDefinition> {
+        self.global.sequences()
+    }
+
+    fn sequence_nextval(&self, name: &str) -> SequenceAdvance {
+        self.global.sequence_nextval(name)
+    }
+
+    fn sequence_setval(&self, name: &str, value: i64, is_called: bool) -> SequenceAdvance {
+        self.global.sequence_setval(name, value, is_called)
     }
 }

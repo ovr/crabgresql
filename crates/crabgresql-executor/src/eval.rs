@@ -8,7 +8,7 @@
 
 use std::cmp::Ordering;
 
-use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
+use crabgresql_binder::{BinOp, BoundExpr, ScalarFn, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
     Inet, Interval, Numeric, PgType, TimeTz, Value, bit, cast, date, float, interval, json, money,
@@ -17,7 +17,7 @@ use crabgresql_types::{
 
 use crate::{ExecContext, ExecError};
 
-pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, ExecError> {
+pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     match expr {
         BoundExpr::Const { value, .. } => Ok(value.clone()),
         BoundExpr::ColumnRef { index, .. } => Ok(row[*index].clone()),
@@ -50,7 +50,13 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, 
                 .iter()
                 .map(|a| eval(a, row, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            crate::scalar_fns::eval_scalar(*func, &arg_values)
+            // The sequence functions are side-effecting and need the session's
+            // sequence handle, so they are dispatched here rather than through the
+            // pure `eval_scalar`.
+            match eval_sequence_fn(*func, &arg_values, ctx) {
+                Some(result) => result,
+                None => crate::scalar_fns::eval_scalar(*func, &arg_values),
+            }
         }
         // CASE tests conditions top-to-bottom and evaluates only the winning
         // branch's result (false and NULL conditions both skip); a missing ELSE
@@ -94,9 +100,70 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: ExecContext) -> Result<Value, 
 
 /// Runtime side of a bind-time `Coerce` node, via the shared cast machinery.
 /// NULL passes through any cast.
-pub fn coerce_value(value: Value, ty: PgType, ctx: ExecContext) -> Result<Value, ExecError> {
+pub fn coerce_value(value: Value, ty: PgType, ctx: &ExecContext) -> Result<Value, ExecError> {
     cast::cast_value(value, ty, ctx.extra_float_digits)
         .map_err(|e| ExecError::new(e.sqlstate, e.message))
+}
+
+/// Dispatch the side-effecting sequence functions. Returns `None` for any other
+/// function (the caller falls back to the pure `eval_scalar`), `Some(result)`
+/// for a sequence function — including a wiring error if the context supplied no
+/// [`SequenceOps`] handle. A NULL sequence-name or value argument yields NULL.
+fn eval_sequence_fn(
+    func: ScalarFn,
+    args: &[Value],
+    ctx: &ExecContext,
+) -> Option<Result<Value, ExecError>> {
+    if !matches!(
+        func,
+        ScalarFn::Nextval | ScalarFn::Currval | ScalarFn::Setval | ScalarFn::Lastval
+    ) {
+        return None;
+    }
+    let Some(ops) = ctx.sequences.as_deref() else {
+        return Some(Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "sequence function evaluated without a sequence context",
+        )));
+    };
+    let result = match func {
+        ScalarFn::Nextval => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            name => ops.nextval(seq_name(name)).map(Value::Int8),
+        },
+        ScalarFn::Currval => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            name => ops.currval(seq_name(name)).map(Value::Int8),
+        },
+        ScalarFn::Setval => {
+            // setval is STRICT: a NULL in any argument (including the optional
+            // `is_called`) yields NULL with no side effect.
+            let is_called = match args.get(2) {
+                None => true,
+                Some(Value::Bool(b)) => *b,
+                _ => return Some(Ok(Value::Null)),
+            };
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                Ok(Value::Null)
+            } else {
+                ops.setval(seq_name(&args[0]), int8(&args[1]), is_called)
+                    .map(Value::Int8)
+            }
+        }
+        ScalarFn::Lastval => ops.lastval().map(Value::Int8),
+        _ => unreachable!("guarded by the matches! above"),
+    };
+    Some(result)
+}
+
+/// Extract a sequence name from a `nextval`/`currval`/`setval` text argument,
+/// taking the last dotted component so a schema-qualified `public.s` resolves to
+/// `s` (full `regclass` name normalization is a v1 gap).
+fn seq_name(v: &Value) -> &str {
+    match v {
+        Value::Text(s) => s.rsplit('.').next().unwrap_or(s),
+        other => unreachable!("sequence name argument was {other:?}"),
+    }
 }
 
 fn eval_unary(op: UnaryOp, operand: Value) -> Result<Value, ExecError> {
@@ -147,7 +214,7 @@ fn eval_binary(
     left: &BoundExpr,
     right: &BoundExpr,
     row: &[Value],
-    ctx: ExecContext,
+    ctx: &ExecContext,
 ) -> Result<Value, ExecError> {
     // AND/OR evaluate lazily left-to-right, as PG does at runtime.
     if let BinOp::And | BinOp::Or = op {
@@ -262,7 +329,7 @@ fn eval_logic(
     left: &BoundExpr,
     right: &BoundExpr,
     row: &[Value],
-    ctx: ExecContext,
+    ctx: &ExecContext,
 ) -> Result<Value, ExecError> {
     // The operand value that decides the result on its own: false for AND,
     // true for OR.

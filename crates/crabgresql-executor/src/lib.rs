@@ -33,11 +33,35 @@ use eval::eval;
 pub use eval::{coerce_value, compare_values};
 use generate_series::Series;
 
-/// Session state that runtime evaluation depends on. Currently just
-/// `extra_float_digits`, which controls float→text output precision.
-#[derive(Clone, Copy, Debug)]
+/// Side-effecting sequence operations (`nextval`/`currval`/`setval`/`lastval`),
+/// which the otherwise-pure expression evaluator cannot express: they mutate
+/// non-transactional engine counters and per-session `currval`/`lastval` state.
+/// The server supplies an implementation through [`ExecContext::sequences`]; the
+/// executor calls it when it evaluates the corresponding functions.
+pub trait SequenceOps: Send + Sync {
+    /// Advance the sequence and return its new value. Errors: 42P01 (no such
+    /// sequence), 2200H (reached min/max with `NO CYCLE`).
+    fn nextval(&self, name: &str) -> Result<i64, ExecError>;
+    /// The value `nextval` most recently returned for this sequence in this
+    /// session. Errors 55000 if `nextval` has not run for it yet.
+    fn currval(&self, name: &str) -> Result<i64, ExecError>;
+    /// Set the sequence's counter; returns `value`.
+    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, ExecError>;
+    /// The value the last `nextval` in this session returned, for any sequence.
+    /// Errors 55000 if no `nextval` has run in the session yet.
+    fn lastval(&self) -> Result<i64, ExecError>;
+}
+
+/// Session state that runtime evaluation depends on: `extra_float_digits`
+/// (float→text output precision) and, when present, the handle the
+/// side-effecting sequence functions dispatch through.
+#[derive(Clone)]
 pub struct ExecContext {
     pub extra_float_digits: i32,
+    /// `None` in contexts that never call a sequence function (e.g. `EXPLAIN`'s
+    /// `Values` node); a sequence function reaching a `None` context is an
+    /// internal wiring error, reported as 5-char `XX000`.
+    pub sequences: Option<Arc<dyn SequenceOps>>,
 }
 
 impl Default for ExecContext {
@@ -45,6 +69,7 @@ impl Default for ExecContext {
         // PG's default since v12.
         Self {
             extra_float_digits: 1,
+            sequences: None,
         }
     }
 }
@@ -126,7 +151,7 @@ pub enum DmlVerb {
 
 pub fn execute(
     mut plan: PhysicalPlan,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     // Fold every non-correlated subquery to a constant/comparison before any node
@@ -145,9 +170,9 @@ pub fn execute(
             // visible output — captured before `rows` is moved so a Distinct can
             // keep those columns through the sort.
             let full_width = rows.first().map_or(columns.len(), Vec::len);
-            let mut node: Box<dyn ExecNode> = Box::new(Values::new(rows, ctx));
+            let mut node: Box<dyn ExecNode> = Box::new(Values::new(rows, ctx.clone()));
             if let Some(predicate) = predicate {
-                node = Box::new(Filter::new(node, predicate, ctx));
+                node = Box::new(Filter::new(node, predicate, ctx.clone()));
             }
             node = finish_sort_distinct(node, sort, distinct, full_width, &columns)?;
             Ok(Execution::Rows { columns, node })
@@ -217,7 +242,7 @@ pub fn execute(
             sort,
             distinct,
         } => project_pipeline(
-            Box::new(TableFunctionSource::new(func, args, ctx)),
+            Box::new(TableFunctionSource::new(func, args, ctx.clone())),
             projections,
             predicate,
             sort,
@@ -268,17 +293,17 @@ pub fn execute(
             let source: Box<dyn ExecNode> = match input {
                 PhysicalAggInput::Scan(table) => Box::new(SeqScan::new(&table, txn)),
                 PhysicalAggInput::Join(source) => build_join_expr(source, ctx, txn)?,
-                PhysicalAggInput::SingleRow => Box::new(Values::new(vec![vec![]], ctx)),
+                PhysicalAggInput::SingleRow => Box::new(Values::new(vec![vec![]], ctx.clone())),
             };
             // WHERE filters rows before aggregation.
             let mut node: Box<dyn ExecNode> = match predicate {
-                Some(predicate) => Box::new(Filter::new(source, predicate, ctx)),
+                Some(predicate) => Box::new(Filter::new(source, predicate, ctx.clone())),
                 None => source,
             };
-            node = Box::new(Aggregate::new(node, group_exprs, aggregates, ctx));
+            node = Box::new(Aggregate::new(node, group_exprs, aggregates, ctx.clone()));
             // HAVING filters the per-group rows.
             if let Some(having) = having {
-                node = Box::new(Filter::new(node, having, ctx));
+                node = Box::new(Filter::new(node, having, ctx.clone()));
             }
             // The projection list and ORDER BY were rewritten to reference the
             // aggregate output row, so the standard tail finishes the job.
@@ -313,7 +338,7 @@ pub fn execute(
 /// a subquery marker.
 fn resolve_subqueries(
     plan: &mut PhysicalPlan,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<(), ExecError> {
     match plan {
@@ -440,7 +465,7 @@ fn resolve_subqueries(
 
 fn resolve_exprs(
     exprs: &mut [BoundExpr],
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<(), ExecError> {
     for e in exprs {
@@ -451,7 +476,7 @@ fn resolve_exprs(
 
 fn resolve_opt(
     expr: &mut Option<BoundExpr>,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<(), ExecError> {
     if let Some(e) = expr {
@@ -462,7 +487,7 @@ fn resolve_opt(
 
 fn resolve_returning(
     returning: &mut Option<Returning>,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<(), ExecError> {
     if let Some(r) = returning {
@@ -473,7 +498,7 @@ fn resolve_returning(
 
 fn resolve_join(
     join: &mut PhysicalJoinExpr,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<(), ExecError> {
     match join {
@@ -503,7 +528,7 @@ fn resolve_join(
 
 /// Recurse an expression tree, resolving nested subqueries bottom-up, then fold
 /// this node if it is itself a subquery marker.
-fn resolve_expr(expr: &mut BoundExpr, ctx: ExecContext, txn: &TxnContext) -> Result<(), ExecError> {
+fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Result<(), ExecError> {
     match expr {
         BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => {}
         BoundExpr::Unary { expr, .. }
@@ -554,7 +579,7 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: ExecContext, txn: &TxnContext) -> Res
 /// Run a subquery marker's subplan once and fold it to a plain expression.
 fn fold_subquery(
     expr: BoundExpr,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<BoundExpr, ExecError> {
     match expr {
@@ -620,7 +645,7 @@ fn fold_subquery(
 /// Plan and execute a subplan, draining its result set into materialized rows.
 fn run_subplan(
     logical: LogicalPlan,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Vec<Tuple>, ExecError> {
     match execute(crabgresql_planner::plan(logical), ctx, txn)? {
@@ -636,7 +661,7 @@ fn run_subplan(
 /// `EXISTS`, which needs existence only, not the rows themselves.
 fn subplan_has_rows(
     logical: LogicalPlan,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<bool, ExecError> {
     match execute(crabgresql_planner::plan(logical), ctx, txn)? {
@@ -666,7 +691,7 @@ fn drain(mut node: Box<dyn ExecNode>) -> Result<Vec<Tuple>, ExecError> {
 fn build_in_chain(
     cmp: &BoundExpr,
     rows: Vec<Tuple>,
-    ctx: ExecContext,
+    ctx: &ExecContext,
 ) -> Result<BoundExpr, ExecError> {
     let BoundExpr::Binary {
         op,
@@ -737,7 +762,7 @@ fn balanced_or(mut nodes: Vec<BoundExpr>) -> BoundExpr {
 fn substitute_hole(
     expr: &BoundExpr,
     value: Value,
-    ctx: ExecContext,
+    ctx: &ExecContext,
 ) -> Result<BoundExpr, ExecError> {
     match expr {
         // The placeholder: a NULL `Const` carrying the hole's declared type.
@@ -790,11 +815,11 @@ fn project_pipeline(
     sort: Vec<SortKey>,
     distinct: Option<Vec<DistinctKey>>,
     columns: Vec<OutputColumn>,
-    ctx: ExecContext,
+    ctx: &ExecContext,
 ) -> Result<Execution, ExecError> {
     let mut node = source;
     if let Some(predicate) = predicate {
-        node = Box::new(Filter::new(node, predicate, ctx));
+        node = Box::new(Filter::new(node, predicate, ctx.clone()));
     }
     // The projected tuple width, including any hidden ORDER BY / DISTINCT ON
     // columns appended past the visible output — captured before `projections`
@@ -803,9 +828,9 @@ fn project_pipeline(
     // A set-returning function in the target list turns one input row into many,
     // so it needs `ProjectSet` rather than the one-in/one-out `Projection`.
     node = if projections.iter().any(BoundExpr::is_srf) {
-        Box::new(ProjectSet::new(node, projections, ctx))
+        Box::new(ProjectSet::new(node, projections, ctx.clone()))
     } else {
-        Box::new(Projection::new(node, projections, ctx))
+        Box::new(Projection::new(node, projections, ctx.clone()))
     };
     node = finish_sort_distinct(node, sort, distinct, full_width, &columns)?;
     Ok(Execution::Rows { columns, node })
@@ -864,7 +889,7 @@ impl ExecNode for MaterializedRows {
 fn project_returning<'a>(
     affected: impl IntoIterator<Item = &'a Tuple>,
     projections: &[BoundExpr],
-    ctx: ExecContext,
+    ctx: &ExecContext,
 ) -> Result<Vec<Tuple>, ExecError> {
     affected
         .into_iter()
@@ -889,7 +914,7 @@ fn execute_insert(
     table: &Arc<dyn TableAm>,
     source: PhysicalInsertSource,
     returning: Option<Returning>,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     // Existing rows are only consulted to enforce UNIQUE keys; a table with no
@@ -970,7 +995,7 @@ fn execute_update(
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
     returning: Option<Returning>,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let original: Vec<(Tid, Tuple)> = table.scan(txn).collect();
@@ -1030,7 +1055,7 @@ fn validate_constraints<'a>(
     table: &Arc<dyn TableAm>,
     tuple: &Tuple,
     existing: impl Iterator<Item = &'a Tuple>,
-    ctx: ExecContext,
+    ctx: &ExecContext,
 ) -> Result<(), ExecError> {
     let schema = table.schema();
     for (column, value) in schema.columns.iter().zip(tuple) {
@@ -1115,13 +1140,13 @@ fn unique_keys_equal(
     agg::keys_equal(&tys, &left, &right)
 }
 
-fn display_value(value: &Value, ctx: ExecContext) -> String {
+fn display_value(value: &Value, ctx: &ExecContext) -> String {
     value
         .encode_text_with(ctx.extra_float_digits)
         .unwrap_or_else(|| "null".to_string())
 }
 
-fn display_tuple(tuple: &Tuple, ctx: ExecContext) -> String {
+fn display_tuple(tuple: &Tuple, ctx: &ExecContext) -> String {
     tuple
         .iter()
         .map(|value| display_value(value, ctx))
@@ -1134,7 +1159,7 @@ fn execute_delete(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let mut pending: Vec<Tid> = Vec::new();
@@ -1165,7 +1190,7 @@ fn execute_delete(
 fn predicate_holds(
     predicate: &Option<BoundExpr>,
     row: &[Value],
-    ctx: ExecContext,
+    ctx: &ExecContext,
 ) -> Result<bool, ExecError> {
     match predicate {
         None => Ok(true),
@@ -1195,7 +1220,7 @@ impl ExecNode for Values {
         };
         let tuple = row
             .iter()
-            .map(|expr| eval(expr, &[], self.ctx))
+            .map(|expr| eval(expr, &[], &self.ctx))
             .collect::<Result<_, _>>()?;
         Ok(Some(tuple))
     }
@@ -1235,7 +1260,7 @@ impl TableFunctionSource {
             let values = self
                 .args
                 .iter()
-                .map(|expr| eval(expr, &[], self.ctx))
+                .map(|expr| eval(expr, &[], &self.ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             self.state = Some(match self.func {
                 TableFn::PgInputErrorInfo => {
@@ -1286,13 +1311,13 @@ fn pg_input_error_info_row(args: &[Value]) -> Tuple {
 /// function, or a recursively-executed subplan (derived table / CTE / VALUES).
 fn build_join_source(
     input: PhysicalJoinInput,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Box<dyn ExecNode>, ExecError> {
     Ok(match input {
         PhysicalJoinInput::Scan(table) => Box::new(SeqScan::new(&table, txn)),
         PhysicalJoinInput::TableFunction { func, args } => {
-            Box::new(TableFunctionSource::new(func, args, ctx))
+            Box::new(TableFunctionSource::new(func, args, ctx.clone()))
         }
         PhysicalJoinInput::Subplan(source) => {
             let Execution::Rows { node, .. } = execute(*source, ctx, txn)? else {
@@ -1311,7 +1336,7 @@ fn build_join_source(
 /// left side and materializes its right side.
 fn build_join_expr(
     source: PhysicalJoinExpr,
-    ctx: ExecContext,
+    ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Box<dyn ExecNode>, ExecError> {
     match source {
@@ -1335,7 +1360,7 @@ fn build_join_expr(
                     right_width,
                     kind,
                     predicate,
-                    ctx,
+                    ctx.clone(),
                 )?))
             } else {
                 Ok(Box::new(HashJoin::new(
@@ -1346,7 +1371,7 @@ fn build_join_expr(
                     kind,
                     hash_keys,
                     predicate,
-                    ctx,
+                    ctx.clone(),
                 )?))
             }
         }
@@ -1454,7 +1479,7 @@ impl ExecNode for NestedLoopJoin {
                         };
                         let row = self.combined_row(left, &self.right_rows[right_index]);
                         let matched = self.kind == JoinKind::Cross
-                            || predicate_holds(&self.predicate, &row, self.ctx)?;
+                            || predicate_holds(&self.predicate, &row, &self.ctx)?;
                         if matched {
                             self.current_left_matched = true;
                             self.right_matched[right_index] = true;
@@ -1568,7 +1593,7 @@ impl HashJoin {
         for (index, row) in right_rows.iter().enumerate() {
             scratch.truncate(left_width);
             scratch.extend_from_slice(row);
-            if let Some(vals) = eval_join_keys(&right_keys, &scratch, ctx)? {
+            if let Some(vals) = eval_join_keys(&right_keys, &scratch, &ctx)? {
                 buckets
                     .entry(agg::hash_key(&key_tys, &vals))
                     .or_default()
@@ -1623,7 +1648,7 @@ impl HashJoin {
             self.current_probe_hash = None;
             return Ok(());
         };
-        match eval_join_keys(&self.left_keys, left, self.ctx)? {
+        match eval_join_keys(&self.left_keys, left, &self.ctx)? {
             Some(vals) => {
                 // Record only the bucket's hash; the bucket itself is re-borrowed
                 // per candidate during probing, never copied.
@@ -1694,7 +1719,7 @@ impl ExecNode for HashJoin {
                             continue;
                         };
                         let row = self.combined_row(left, &self.right_rows[right_index]);
-                        if !predicate_holds(&self.residual, &row, self.ctx)? {
+                        if !predicate_holds(&self.residual, &row, &self.ctx)? {
                             continue;
                         }
                         self.current_left_matched = true;
@@ -1735,7 +1760,7 @@ impl ExecNode for HashJoin {
 fn eval_join_keys(
     keys: &[BoundExpr],
     row: &[Value],
-    ctx: ExecContext,
+    ctx: &ExecContext,
 ) -> Result<Option<Vec<Value>>, ExecError> {
     let mut vals = Vec::with_capacity(keys.len());
     for key in keys {
@@ -1955,7 +1980,7 @@ impl Aggregate {
                 let key = self
                     .group_exprs
                     .iter()
-                    .map(|e| eval(e, &row, self.ctx))
+                    .map(|e| eval(e, &row, &self.ctx))
                     .collect::<Result<Vec<_>, _>>()?;
                 let bucket = lookup.entry(agg::hash_key(&key_tys, &key)).or_default();
                 match bucket
@@ -1997,7 +2022,7 @@ impl Aggregate {
                     // COUNT(*) counts every row, skipping no NULLs.
                     None => acc.count_row(),
                     Some(arg) => {
-                        let v = eval(arg, &row, self.ctx)?;
+                        let v = eval(arg, &row, &self.ctx)?;
                         // Every aggregate but COUNT(*) ignores NULL inputs.
                         if !matches!(v, Value::Null) {
                             if distinct_values.as_mut().is_none_or(|seen| seen.insert(&v)) {
@@ -2111,7 +2136,7 @@ impl IndexScan {
         table: &Arc<dyn TableAm>,
         index_name: &str,
         key: Vec<(usize, BoundExpr)>,
-        ctx: ExecContext,
+        ctx: &ExecContext,
         txn: &TxnContext,
     ) -> Result<Self, ExecError> {
         // The key value expressions are row-constant (the planner guarantees
@@ -2172,7 +2197,7 @@ impl Filter {
 impl ExecNode for Filter {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
         while let Some(row) = self.child.next()? {
-            if predicate_holds(&self.predicate, &row, self.ctx)? {
+            if predicate_holds(&self.predicate, &row, &self.ctx)? {
                 return Ok(Some(row));
             }
         }
@@ -2201,7 +2226,7 @@ impl ExecNode for Projection {
         let projected = self
             .exprs
             .iter()
-            .map(|expr| eval(expr, &row, self.ctx))
+            .map(|expr| eval(expr, &row, &self.ctx))
             .collect::<Result<_, _>>()?;
         Ok(Some(projected))
     }
@@ -2246,7 +2271,7 @@ impl ProjectSet {
                 BoundExpr::Srf { func, args, .. } => {
                     let values = args
                         .iter()
-                        .map(|a| eval(a, &input, self.ctx))
+                        .map(|a| eval(a, &input, &self.ctx))
                         .collect::<Result<Vec<_>, _>>()?;
                     series.push(Some(build_series(*func, &values)?));
                 }
@@ -2292,7 +2317,7 @@ impl ExecNode for ProjectSet {
                 match expr {
                     // Exhausted SRFs pad with NULL to match the longest.
                     BoundExpr::Srf { .. } => out.push(srf_val.unwrap_or(Value::Null)),
-                    _ => out.push(eval(expr, &input, self.ctx)?),
+                    _ => out.push(eval(expr, &input, &self.ctx)?),
                 }
             }
             return Ok(Some(out));
@@ -2382,7 +2407,7 @@ mod tests {
     }
 
     fn eval_const(expr: &BoundExpr) -> Result<Value, ExecError> {
-        eval(expr, &[], ExecContext::default())
+        eval(expr, &[], &ExecContext::default())
     }
 
     /// (op, left, right, expected), with `None` as SQL NULL.
@@ -2583,14 +2608,14 @@ mod tests {
 
     #[test]
     fn coerce_range_checks_int8_to_int4() -> anyhow::Result<()> {
-        let ctx = ExecContext::default();
+        let ctx = &ExecContext::default();
         assert_eq!(
-            coerce_value(Value::Int8(7), PgType::Int4, ctx)?,
+            coerce_value(Value::Int8(7), PgType::Int4, &ctx)?,
             Value::Int4(7)
         );
-        let e = coerce_value(Value::Int8(i64::MAX), PgType::Int4, ctx).unwrap_err();
+        let e = coerce_value(Value::Int8(i64::MAX), PgType::Int4, &ctx).unwrap_err();
         assert_eq!(e.code, "22003");
-        assert_eq!(coerce_value(Value::Null, PgType::Int4, ctx)?, Value::Null);
+        assert_eq!(coerce_value(Value::Null, PgType::Int4, &ctx)?, Value::Null);
 
         Ok(())
     }
@@ -2658,7 +2683,7 @@ mod tests {
             &table,
             "t_id_key",
             vec![(0, int4(2))],
-            ExecContext::default(),
+            &ExecContext::default(),
             &rtxn(),
         ));
         assert_eq!(
@@ -2676,7 +2701,7 @@ mod tests {
             &table,
             "missing_index",
             vec![(0, int4(2))],
-            ExecContext::default(),
+            &ExecContext::default(),
             &rtxn(),
         ));
         assert_eq!(
@@ -2692,7 +2717,7 @@ mod tests {
             &table,
             "t_id_key",
             vec![(0, int4(99))],
-            ExecContext::default(),
+            &ExecContext::default(),
             &rtxn(),
         ));
         assert!(collect(&mut node).is_empty());
@@ -2979,7 +3004,7 @@ mod tests {
             ),
         )];
         let Execution::Updated(n) =
-            execute_update(&table, &None, &assignments, None, ExecContext::default(), &wtxn())?
+            execute_update(&table, &None, &assignments, None, &ExecContext::default(), &wtxn())?
         else {
             panic!("expected Updated");
         };
@@ -3015,7 +3040,7 @@ mod tests {
             ),
         )];
         let Err(e) =
-            execute_update(&table, &None, &assignments, None, ExecContext::default(), &wtxn())
+            execute_update(&table, &None, &assignments, None, &ExecContext::default(), &wtxn())
         else {
             panic!("expected error");
         };
@@ -3037,7 +3062,7 @@ mod tests {
             int4(1),
         ));
         let Execution::Deleted(n) =
-            execute_delete(&table, &predicate, None, ExecContext::default(), &wtxn())?
+            execute_delete(&table, &predicate, None, &ExecContext::default(), &wtxn())?
         else {
             panic!("expected Deleted");
         };
@@ -3092,7 +3117,7 @@ mod tests {
             columns,
             mut node,
             verb,
-        } = test_ok(execute(physical, ExecContext::default(), &wtxn()))
+        } = test_ok(execute(physical, &ExecContext::default(), &wtxn()))
         else {
             panic!("expected ReturningRows");
         };
@@ -3152,7 +3177,7 @@ mod tests {
         };
         let logical = test_ok(crabgresql_binder::bind_insert(engine, &catalog, insert));
         let physical = crabgresql_planner::plan(logical);
-        match test_ok(execute(physical, ExecContext::default(), &wtxn())) {
+        match test_ok(execute(physical, &ExecContext::default(), &wtxn())) {
             Execution::Inserted(n) => n,
             _ => panic!("expected Inserted"),
         }
@@ -3263,7 +3288,7 @@ mod tests {
         let logical = test_ok(crabgresql_binder::bind_query(engine, &catalog, query));
         let physical = crabgresql_planner::plan(logical);
         let Execution::Rows { columns, mut node } =
-            test_ok(execute(physical, ExecContext::default(), &rtxn()))
+            test_ok(execute(physical, &ExecContext::default(), &rtxn()))
         else {
             panic!("expected rows");
         };
@@ -3550,7 +3575,7 @@ mod tests {
         let logical = test_ok(crabgresql_binder::bind_query(&engine, &catalog, query));
         let physical = crabgresql_planner::plan(logical);
         let Execution::Rows { mut node, .. } =
-            test_ok(execute(physical, ExecContext::default(), &rtxn()))
+            test_ok(execute(physical, &ExecContext::default(), &rtxn()))
         else {
             panic!("expected rows");
         };

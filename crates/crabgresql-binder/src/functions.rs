@@ -398,6 +398,16 @@ pub enum ScalarFn {
     // --- geometric (point / lseg) ---
     /// A geometric operator/function; the specific operation is the payload.
     Geo(GeoFn),
+    // --- sequences (side-effecting; dispatched via the executor's SequenceOps,
+    // not the pure `eval_scalar`) ---
+    /// `nextval(regclass) -> int8`: advance a sequence and return its new value.
+    Nextval,
+    /// `currval(regclass) -> int8`: this session's last `nextval` for a sequence.
+    Currval,
+    /// `setval(regclass, int8[, bool]) -> int8`: set a sequence's counter.
+    Setval,
+    /// `lastval() -> int8`: this session's last `nextval`, for any sequence.
+    Lastval,
 }
 
 /// A geometric (`point` / `lseg`) operation. Operators lower to these via
@@ -1154,6 +1164,37 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: I4,
             },
         ],
+        // Sequence functions. The `regclass` argument is accepted as `text` (a
+        // sequence name); `'seq'::regclass` binds through the regclass→text shim
+        // in `map_data_type`. These are side-effecting and are dispatched by the
+        // executor's `eval` (not `eval_scalar`).
+        "nextval" => &[Signature {
+            func: ScalarFn::Nextval,
+            args: &[TEXT],
+            ret: I8,
+        }],
+        "currval" => &[Signature {
+            func: ScalarFn::Currval,
+            args: &[TEXT],
+            ret: I8,
+        }],
+        "setval" => &[
+            Signature {
+                func: ScalarFn::Setval,
+                args: &[TEXT, I8],
+                ret: I8,
+            },
+            Signature {
+                func: ScalarFn::Setval,
+                args: &[TEXT, I8, BOOL],
+                ret: I8,
+            },
+        ],
+        "lastval" => &[Signature {
+            func: ScalarFn::Lastval,
+            args: &[],
+            ret: I8,
+        }],
         "upper" => &[Signature {
             func: ScalarFn::Upper,
             args: &[TEXT],

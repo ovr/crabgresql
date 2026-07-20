@@ -1434,6 +1434,9 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         DataType::BitVarying(_) | DataType::VarBit(_) => PgType::Varbit,
         DataType::JSON => PgType::Json,
         DataType::JSONB => PgType::Jsonb,
+        // `regclass` — modeled as `text` (a relation name); see the `"regclass"`
+        // custom-name arm below for the rationale and the v1 gap.
+        DataType::Regclass => PgType::Text,
         // Geometric types. `point`/`lseg` are modeled; the rest are not yet.
         DataType::GeometricType(kind) => match kind {
             ast::GeometricTypeKind::Point => PgType::Point,
@@ -1467,6 +1470,11 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                 Some("lseg") => PgType::Lseg,
                 Some("json") => PgType::Json,
                 Some("jsonb") => PgType::Jsonb,
+                // `regclass` is modeled as `text` (a relation name) for now: it
+                // lets `nextval('seq'::regclass)` bind against `nextval(text)`.
+                // Full regclass→oid semantics (name normalization, `::oid`) are a
+                // deliberate v1 gap.
+                Some("regclass") => PgType::Text,
                 _ => {
                     return Err(BindError::feature_not_supported(format!(
                         "type \"{dt}\" is not supported yet"

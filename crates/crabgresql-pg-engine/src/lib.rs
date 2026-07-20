@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_storage_api::{
-    IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema, ViewDefinition,
+    IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition, StorageError, TableAm,
+    TableEngine, TableSchema, ViewDefinition,
 };
 use crabgresql_txn::{Clog, TxnFinalize, Xid};
 use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, recover, write_control};
@@ -361,6 +362,7 @@ impl TableEngine for PgEngine {
         if tables.contains_key(&schema.name)
             || self.catalog.contains(&schema.name)
             || self.catalog.contains_view(&schema.name)
+            || self.catalog.contains_sequence(&schema.name)
             || tables
                 .values()
                 .any(|t| t.indexes().iter().any(|i| i.name == schema.name))
@@ -441,6 +443,8 @@ impl TableEngine for PgEngine {
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&index.name)
+            || self.catalog.contains_view(&index.name)
+            || self.catalog.contains_sequence(&index.name)
             || tables
                 .values()
                 .any(|t| t.indexes().iter().any(|i| i.name == index.name))
@@ -488,6 +492,7 @@ impl TableEngine for PgEngine {
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&def.name)
             || self.catalog.contains(&def.name)
+            || self.catalog.contains_sequence(&def.name)
             || tables
                 .values()
                 .any(|t| t.indexes().iter().any(|i| i.name == def.name))
@@ -522,5 +527,63 @@ impl TableEngine for PgEngine {
 
     fn views(&self) -> Vec<ViewDefinition> {
         self.catalog.views()
+    }
+
+    fn create_sequence(&self, def: SequenceDefinition) -> Result<(), StorageError> {
+        // Sequences share the relation namespace. Hold the tables lock across the
+        // collision check and the durable write, matching `create_view`.
+        let tables = self
+            .tables
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        if tables.contains_key(&def.name)
+            || self.catalog.contains(&def.name)
+            || self.catalog.contains_view(&def.name)
+            || tables
+                .values()
+                .any(|t| t.indexes().iter().any(|i| i.name == def.name))
+        {
+            return Err(StorageError::TableAlreadyExists(def.name));
+        }
+        let created = self
+            .catalog
+            .create_sequence(&def)
+            .expect("relation catalog write failed");
+        if !created {
+            return Err(StorageError::TableAlreadyExists(def.name));
+        }
+        Ok(())
+    }
+
+    fn drop_sequence(&self, name: &str) -> Result<(), StorageError> {
+        let removed = self
+            .catalog
+            .remove_sequence(name)
+            .expect("relation catalog write failed");
+        if removed {
+            Ok(())
+        } else {
+            Err(StorageError::TableNotFound(name.to_string()))
+        }
+    }
+
+    fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
+        self.catalog.sequence(name)
+    }
+
+    fn sequences(&self) -> Vec<SequenceDefinition> {
+        self.catalog.sequences()
+    }
+
+    fn sequence_nextval(&self, name: &str) -> SequenceAdvance {
+        self.catalog
+            .advance_sequence(name)
+            .expect("relation catalog write failed")
+    }
+
+    fn sequence_setval(&self, name: &str, value: i64, is_called: bool) -> SequenceAdvance {
+        self.catalog
+            .set_sequence(name, value, is_called)
+            .expect("relation catalog write failed")
     }
 }

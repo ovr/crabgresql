@@ -16,8 +16,8 @@ use crabgresql_executor::{DmlVerb, ExecNode, Execution, OutputColumn, Values, ex
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, StorageError, TableAm,
-    TableEngine, TableSchema, TypeCatalog, ViewDefinition,
+    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, SequenceDefinition, StorageError,
+    TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -216,6 +216,22 @@ fn bind_catalogs(
                             name: view.name,
                             columns: view.columns,
                         })
+                    }));
+                    // Sequences reflect into pg_class as relkind='S' and feed
+                    // pg_catalog.pg_sequence.
+                    rels.extend(global.sequences().into_iter().map(|seq| {
+                        crabgresql_catalog::CatalogRelation::sequence(
+                            seq.name,
+                            crabgresql_catalog::CatalogSequence {
+                                type_oid: seq.data_type.oid(),
+                                start: seq.start,
+                                increment: seq.increment,
+                                min: seq.min,
+                                max: seq.max,
+                                cache: seq.cache,
+                                cycle: seq.cycle,
+                            },
+                        )
                     }));
                     rels
                 },
@@ -429,6 +445,24 @@ pub fn execute_statement(
             ast::Statement::CreateView(create) => {
                 return execute_create_view(&catalog, &type_catalog, create);
             }
+            ast::Statement::CreateSequence {
+                temporary,
+                if_not_exists,
+                name,
+                data_type,
+                sequence_options,
+                owned_by,
+            } => {
+                return execute_create_sequence(
+                    &catalog,
+                    *temporary,
+                    *if_not_exists,
+                    name,
+                    data_type,
+                    sequence_options,
+                    owned_by,
+                );
+            }
             ast::Statement::CreateType {
                 name,
                 representation,
@@ -459,6 +493,13 @@ pub fn execute_statement(
                 if_exists,
                 ..
             } => return execute_drop_view(&catalog, names, *cascade, *if_exists),
+            ast::Statement::Drop {
+                object_type: ast::ObjectType::Sequence,
+                names,
+                cascade,
+                if_exists,
+                ..
+            } => return execute_drop_sequence(&catalog, names, *cascade, *if_exists),
             ast::Statement::Drop {
                 object_type: ast::ObjectType::Type,
                 names,
@@ -575,12 +616,16 @@ pub fn execute_statement(
             format!("cannot execute {verb} in a read-only transaction"),
         ));
     }
+    let read_only = read_only_active(session);
     let txn = build_txn(txnmgr, session, is_write);
-    let exec = match execute(
-        crabgresql_planner::plan(logical),
-        session.exec_context(),
-        &txn,
-    ) {
+    // Sequence functions (`nextval` in a `serial` default or written explicitly)
+    // advance non-transactional counters in the shared engine and update this
+    // session's `currval`/`lastval`, so the execution context carries a handle to
+    // both. Sequences resolve against the global engine (temp sequences are
+    // unsupported), matching temp-view handling. The read-only flag lets a bare
+    // `SELECT nextval(...)` be rejected (25006) even though it is not a DML write.
+    let exec_ctx = session.exec_context_with_sequences(engine, read_only);
+    let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
             // Abort path: infallible, so the result is safe to drop.
@@ -774,6 +819,7 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
     Some(match stmt {
         ast::Statement::CreateTable(_) => "CREATE TABLE",
         ast::Statement::CreateView(_) => "CREATE VIEW",
+        ast::Statement::CreateSequence { .. } => "CREATE SEQUENCE",
         ast::Statement::CreateIndex(_) => "CREATE INDEX",
         ast::Statement::CreateType { .. } => "CREATE TYPE",
         ast::Statement::AlterType(_) => "ALTER TYPE",
@@ -788,6 +834,10 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
             object_type: ast::ObjectType::View,
             ..
         } => "DROP VIEW",
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Sequence,
+            ..
+        } => "DROP SEQUENCE",
         ast::Statement::Drop {
             object_type: ast::ObjectType::Type,
             ..
@@ -1450,11 +1500,43 @@ fn execute_create_table(
     let mut columns = Vec::new();
     let mut pending = Vec::<PendingIndex>::new();
     let mut constraint_names = HashSet::new();
+    // `serial`/`bigserial`/`smallserial` desugar to an int column plus an owned
+    // sequence and a `nextval(...)` default. The sequences are created together
+    // just before the table, so a failed table create can roll them back.
+    let mut serial_defs: Vec<SequenceDefinition> = Vec::new();
     for col in &create.columns {
-        let ty = resolve_column_type(type_catalog, &col.data_type)?;
-        let typmod = crabgresql_binder::length_typmod(&col.data_type).unwrap_or(-1);
         let column_name = normalize_ident(&col.name);
+        let serial_base = serial_base_type(&col.data_type);
+        if serial_base.is_some() && create.temporary {
+            return Err(PgError::feature_not_supported(
+                "serial in a temporary table is not supported yet",
+            ));
+        }
+        let ty = match serial_base {
+            Some(base) => base,
+            None => resolve_column_type(type_catalog, &col.data_type)?,
+        };
+        let typmod = crabgresql_binder::length_typmod(&col.data_type).unwrap_or(-1);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
+        if let Some(base) = serial_base {
+            // Name the sequence `t_col_seq`, dodging existing relations and any
+            // other serial sequences created earlier in this same statement.
+            let taken: Vec<String> = serial_defs.iter().map(|d| d.name.clone()).collect();
+            let seq_name =
+                unique_relation_name(target, &taken, &format!("{name}_{column_name}_seq"));
+            column.default = Some(format!("nextval('{seq_name}')"));
+            serial_defs.push(SequenceDefinition {
+                name: seq_name,
+                data_type: base,
+                start: 1,
+                increment: 1,
+                min: 1,
+                max: serial_type_max(base),
+                cache: 1,
+                cycle: false,
+                owned_by: Some(name.clone()),
+            });
+        }
         for option in &col.options {
             match &option.option {
                 ast::ColumnOption::Null => {}
@@ -1529,6 +1611,11 @@ fn execute_create_table(
                     )));
                 }
             }
+        }
+        // A serial column is NOT NULL; apply it after the option loop so an
+        // explicit (redundant) NOT NULL is tolerated rather than double-counted.
+        if serial_base.is_some() {
+            column.nullable = false;
         }
         columns.push(column);
     }
@@ -1630,18 +1717,33 @@ fn execute_create_table(
             }
         }
     }
+    // Create the serial columns' owned sequences before the table. Names were
+    // chosen unique above, so a failure here is unexpected; clean up on it.
+    for def in &serial_defs {
+        if let Err(e) = target.create_sequence(def.clone()) {
+            drop_created_sequences(target, &serial_defs);
+            return Err(e.into());
+        }
+    }
     match target.create_table(schema) {
         Ok(_) => {
             for index in indexes {
                 if let Err(e) = target.create_index(&name, index) {
                     let _ = target.drop_table(&name);
+                    drop_created_sequences(target, &serial_defs);
                     return Err(e.into());
                 }
             }
         }
-        // PG succeeds with a notice; NoticeResponse itself is still todo.
-        Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {}
-        Err(e) => return Err(e.into()),
+        // PG succeeds with a notice; NoticeResponse itself is still todo. The
+        // serial sequences we just created would be orphaned, so drop them.
+        Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {
+            drop_created_sequences(target, &serial_defs);
+        }
+        Err(e) => {
+            drop_created_sequences(target, &serial_defs);
+            return Err(e.into());
+        }
     }
     Ok(QueryResult::command("CREATE TABLE"))
 }
@@ -2448,6 +2550,17 @@ fn execute_drop_table(
     for view in &dependent_views {
         catalog.drop_view(view)?;
     }
+    // Auto-drop sequences a dropped table owns (a `serial` column's sequence, via
+    // PG's OWNED BY). PG removes these silently, without a cascade notice.
+    for seq in catalog.sequences() {
+        if seq
+            .owned_by
+            .as_deref()
+            .is_some_and(|owner| to_drop.iter().any(|t| t == owner))
+        {
+            let _ = catalog.drop_sequence(&seq.name);
+        }
+    }
     Ok(QueryResult::Command {
         tag: "DROP TABLE".into(),
         notices,
@@ -2509,6 +2622,360 @@ fn execute_drop_view(
     }
     Ok(QueryResult::Command {
         tag: "DROP VIEW".into(),
+        notices,
+    })
+}
+
+/// The base integer type a `serial` pseudotype expands to, or `None` if the type
+/// is not a serial family name. `serial`/`serial4` → int4, `bigserial`/`serial8`
+/// → int8, `smallserial`/`serial2` → int2.
+fn serial_base_type(dt: &ast::DataType) -> Option<PgType> {
+    let ast::DataType::Custom(obj, mods) = dt else {
+        return None;
+    };
+    if !mods.is_empty() {
+        return None;
+    }
+    match obj
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(normalize_ident)
+        .as_deref()
+    {
+        Some("serial" | "serial4") => Some(PgType::Int4),
+        Some("bigserial" | "serial8") => Some(PgType::Int8),
+        Some("smallserial" | "serial2") => Some(PgType::Int2),
+        _ => None,
+    }
+}
+
+/// The upper bound of a serial sequence: the backing integer type's maximum.
+fn serial_type_max(base: PgType) -> i64 {
+    match base {
+        PgType::Int2 => i16::MAX as i64,
+        PgType::Int4 => i32::MAX as i64,
+        _ => i64::MAX,
+    }
+}
+
+/// The inclusive `(min, max)` a sequence data type can hold.
+fn seq_type_bounds(ty: PgType) -> (i64, i64) {
+    match ty {
+        PgType::Int2 => (i16::MIN as i64, i16::MAX as i64),
+        PgType::Int4 => (i32::MIN as i64, i32::MAX as i64),
+        _ => (i64::MIN, i64::MAX),
+    }
+}
+
+/// PostgreSQL's spelling of a sequence data type, for out-of-range diagnostics.
+fn seq_type_name(ty: PgType) -> &'static str {
+    match ty {
+        PgType::Int2 => "smallint",
+        PgType::Int4 => "integer",
+        _ => "bigint",
+    }
+}
+
+/// Pick a relation name not already used by a table, view, index, or sequence
+/// (nor by `extra`, names reserved earlier in the same statement), appending a
+/// numeric suffix as PostgreSQL does for auto-named serial sequences.
+fn unique_relation_name(engine: &Arc<dyn TableEngine>, extra: &[String], base: &str) -> String {
+    let taken = |n: &str| {
+        extra.iter().any(|x| x == n)
+            || engine.sequence(n).is_some()
+            || engine.open_table(n).is_ok()
+            || engine.resolve_view(None, n).is_some()
+            || engine
+                .relation_metadata()
+                .iter()
+                .any(|r| r.indexes.iter().any(|i| i.name == n))
+    };
+    if !taken(base) {
+        return base.to_string();
+    }
+    for i in 1.. {
+        let candidate = format!("{base}{i}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("an unbounded suffix search always finds a free name")
+}
+
+/// Best-effort removal of sequences created earlier in a `CREATE TABLE` that then
+/// failed — DDL is not transactional, so this avoids leaking orphan sequences.
+fn drop_created_sequences(engine: &Arc<dyn TableEngine>, defs: &[SequenceDefinition]) {
+    for def in defs {
+        let _ = engine.drop_sequence(&def.name);
+    }
+}
+
+/// Read an integer sequence option (`INCREMENT 2`, `START -1`, ...). Only integer
+/// literals (optionally signed) are accepted.
+fn parse_i64_expr(expr: &ast::Expr) -> Option<i64> {
+    match expr {
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::Number(n, _) => n.parse().ok(),
+            ast::Value::SingleQuotedString(s) => s.trim().parse().ok(),
+            _ => None,
+        },
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => parse_i64_expr(expr).and_then(|v| v.checked_neg()),
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Plus,
+            expr,
+        } => parse_i64_expr(expr),
+        _ => None,
+    }
+}
+
+fn eval_seq_int(expr: &ast::Expr, option: &str) -> Result<i64, PgError> {
+    parse_i64_expr(expr).ok_or_else(|| {
+        PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("{option} value must be an integer"),
+        )
+    })
+}
+
+/// Fold the parsed `CREATE SEQUENCE` options over PostgreSQL's defaults into a
+/// [`SequenceDefinition`], validating the min/max/start/increment/cache relations.
+fn build_sequence_definition(
+    name: String,
+    data_type: PgType,
+    options: &[ast::SequenceOptions],
+    owned_by: Option<String>,
+) -> Result<SequenceDefinition, PgError> {
+    let (type_min, type_max) = seq_type_bounds(data_type);
+    let mut increment = 1i64;
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    let mut start: Option<i64> = None;
+    let mut cache = 1i64;
+    let mut cycle = false;
+    for opt in options {
+        match opt {
+            ast::SequenceOptions::IncrementBy(e, _) => increment = eval_seq_int(e, "INCREMENT")?,
+            ast::SequenceOptions::MinValue(Some(e)) => min = Some(eval_seq_int(e, "MINVALUE")?),
+            ast::SequenceOptions::MinValue(None) => min = None,
+            ast::SequenceOptions::MaxValue(Some(e)) => max = Some(eval_seq_int(e, "MAXVALUE")?),
+            ast::SequenceOptions::MaxValue(None) => max = None,
+            ast::SequenceOptions::StartWith(e, _) => start = Some(eval_seq_int(e, "START")?),
+            ast::SequenceOptions::Cache(e) => cache = eval_seq_int(e, "CACHE")?,
+            // `Cycle(true)` renders as `NO CYCLE`, so cycling is its negation.
+            ast::SequenceOptions::Cycle(no) => cycle = !no,
+        }
+    }
+    if increment == 0 {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "INCREMENT must not be zero",
+        ));
+    }
+    let ascending = increment > 0;
+    let min = min.unwrap_or(if ascending { 1 } else { type_min });
+    let max = max.unwrap_or(if ascending { type_max } else { -1 });
+    // An explicit MIN/MAX outside the backing integer type's range is rejected
+    // (PG checks this before the MIN<MAX relation). MINVALUE is reported first.
+    if min < type_min || min > type_max {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!(
+                "MINVALUE ({min}) is out of range for sequence data type {}",
+                seq_type_name(data_type)
+            ),
+        ));
+    }
+    if max < type_min || max > type_max {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!(
+                "MAXVALUE ({max}) is out of range for sequence data type {}",
+                seq_type_name(data_type)
+            ),
+        ));
+    }
+    if min >= max {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("MINVALUE ({min}) must be less than MAXVALUE ({max})"),
+        ));
+    }
+    let start = start.unwrap_or(if ascending { min } else { max });
+    if start < min {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("START value ({start}) cannot be less than MINVALUE ({min})"),
+        ));
+    }
+    if start > max {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("START value ({start}) cannot be greater than MAXVALUE ({max})"),
+        ));
+    }
+    if cache < 1 {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("CACHE ({cache}) must be greater than zero"),
+        ));
+    }
+    Ok(SequenceDefinition {
+        name,
+        data_type,
+        start,
+        increment,
+        min,
+        max,
+        cache,
+        cycle,
+        owned_by,
+    })
+}
+
+/// `CREATE SEQUENCE [IF NOT EXISTS] name [AS type] [options]`. `OWNED BY` is
+/// accepted and ignored (dependency tracking beyond serial's own sequences is a
+/// v1 gap); temporary sequences are not supported.
+#[allow(clippy::too_many_arguments)]
+fn execute_create_sequence(
+    catalog: &Arc<dyn TableEngine>,
+    temporary: bool,
+    if_not_exists: bool,
+    name: &ast::ObjectName,
+    data_type: &Option<ast::DataType>,
+    options: &[ast::SequenceOptions],
+    _owned_by: &Option<ast::ObjectName>,
+) -> Result<QueryResult, PgError> {
+    if temporary {
+        return Err(PgError::feature_not_supported(
+            "temporary sequences are not supported yet",
+        ));
+    }
+    let seq_name = object_name_to_table_name(name)?;
+    let data_type = match data_type {
+        None => PgType::Int8,
+        Some(dt) => match crabgresql_binder::map_data_type(dt)? {
+            ty @ (PgType::Int2 | PgType::Int4 | PgType::Int8) => ty,
+            _ => {
+                return Err(PgError::new(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "sequence type must be smallint, integer, or bigint",
+                ));
+            }
+        },
+    };
+    let def = build_sequence_definition(seq_name.clone(), data_type, options, None)?;
+    match catalog.create_sequence(def) {
+        Ok(()) => Ok(QueryResult::command("CREATE SEQUENCE")),
+        Err(StorageError::TableAlreadyExists(_)) if if_not_exists => Ok(QueryResult::Command {
+            tag: "CREATE SEQUENCE".into(),
+            notices: vec![Notice::notice(
+                format!("relation \"{seq_name}\" already exists, skipping"),
+                None,
+            )],
+        }),
+        Err(StorageError::TableAlreadyExists(_)) => Err(PgError::new(
+            sqlstate::DUPLICATE_TABLE,
+            format!("relation \"{seq_name}\" already exists"),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `DROP SEQUENCE name [, ...] [CASCADE|RESTRICT]`. Mirrors [`execute_drop_view`]'s
+/// two-phase validate/drop and wrong-object-type detection. Under RESTRICT a
+/// sequence still owned by a live table's `serial` column is blocked (2BP01);
+/// CASCADE drops it anyway. (Reverse dependencies on *manually* written
+/// `nextval(...)` defaults, which have no OWNED BY link, remain untracked.)
+fn execute_drop_sequence(
+    catalog: &Arc<dyn TableEngine>,
+    names: &[ast::ObjectName],
+    cascade: bool,
+    if_exists: bool,
+) -> Result<QueryResult, PgError> {
+    let snames = names
+        .iter()
+        .map(object_name_to_table_name)
+        .collect::<Result<Vec<_>, _>>()?;
+    for (i, name) in snames.iter().enumerate() {
+        if snames[..i].contains(name) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("sequence \"{name}\" specified more than once"),
+            ));
+        }
+    }
+    let mut notices = Vec::new();
+    let mut to_drop: Vec<String> = Vec::new();
+    for name in &snames {
+        if catalog.sequence(name).is_some() {
+            to_drop.push(name.clone());
+        } else if catalog.resolve_view(None, name).is_some() {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not a sequence"),
+            )
+            .with_hint("Use DROP VIEW to remove a view."));
+        } else if catalog.open_table(name).is_ok() {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not a sequence"),
+            )
+            .with_hint("Use DROP TABLE to remove a table."));
+        } else if if_exists {
+            notices.push(Notice::notice(
+                format!("sequence \"{name}\" does not exist, skipping"),
+                None,
+            ));
+        } else {
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_TABLE,
+                format!("sequence \"{name}\" does not exist"),
+            ));
+        }
+    }
+    // RESTRICT: a sequence owned by a still-existing table (a `serial` column's
+    // sequence) has a dependent default and cannot be dropped directly.
+    if !cascade {
+        for name in &to_drop {
+            let Some(def) = catalog.sequence(name) else {
+                continue;
+            };
+            let Some(owner) = def.owned_by.as_deref() else {
+                continue;
+            };
+            let Ok(table) = catalog.open_table(owner) else {
+                continue;
+            };
+            let column = table
+                .schema()
+                .columns
+                .iter()
+                .find(|c| {
+                    c.default
+                        .as_deref()
+                        .is_some_and(|d| d.contains(&format!("nextval('{name}')")))
+                })
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            return Err(PgError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop sequence {name} because other objects depend on it"),
+            )
+            .with_detail(format!(
+                "default value for column {column} of table {owner} depends on sequence {name}"
+            ))
+            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+        }
+    }
+    for name in &to_drop {
+        catalog.drop_sequence(name)?;
+    }
+    Ok(QueryResult::Command {
+        tag: "DROP SEQUENCE".into(),
         notices,
     })
 }

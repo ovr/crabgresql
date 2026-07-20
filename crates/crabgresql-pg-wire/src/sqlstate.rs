@@ -57,5 +57,10 @@ pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
 pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
 pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
 pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
+/// `55000` — the object is not in a state the operation requires, e.g. `currval`
+/// / `lastval` before any `nextval` has run in the session.
+pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
+/// `2200H` — a sequence hit its `MINVALUE`/`MAXVALUE` bound with `NO CYCLE`.
+pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
 /// Class 58 — system error: a WAL/data-file I/O failure (e.g. commit fsync).
 pub const IO_ERROR: &str = "58030";

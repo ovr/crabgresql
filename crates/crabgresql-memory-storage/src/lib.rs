@@ -14,21 +14,56 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
-    Tid, Tuple, UpdateResult, ViewDefinition,
+    DeleteResult, IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition,
+    StorageError, TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult, ViewDefinition,
 };
 use crabgresql_txn::{Clog, TupleHeader, TxnContext, XactStatus, satisfies_mvcc};
 use crabgresql_types::{PgType, Value};
+
+/// A sequence's immutable definition plus its live, non-transactional counter.
+struct MemorySequence {
+    def: SequenceDefinition,
+    last_value: i64,
+    is_called: bool,
+}
 
 #[derive(Default)]
 pub struct MemoryEngine {
     tables: RwLock<HashMap<String, Arc<MemoryTable>>>,
     views: RwLock<HashMap<String, ViewDefinition>>,
+    sequences: RwLock<HashMap<String, RwLock<MemorySequence>>>,
 }
 
 impl MemoryEngine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether `name` already names a table, index, view or sequence — the shared
+    /// PostgreSQL relation namespace.
+    fn relation_name_taken(&self, name: &str) -> bool {
+        let tables = self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        tables.contains_key(name)
+            || tables.values().any(|t| {
+                t.indexes
+                    .read()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                    .iter()
+                    .any(|i| i.name == name)
+            })
+            || self
+                .views
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(name)
+            || self
+                .sequences
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(name)
     }
 }
 
@@ -41,6 +76,11 @@ impl TableEngine for MemoryEngine {
         if tables.contains_key(&schema.name)
             || self
                 .views
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(&schema.name)
+            || self
+                .sequences
                 .read()
                 .unwrap_or_else(|_| panic!("rwlock poisoned"))
                 .contains_key(&schema.name)
@@ -96,6 +136,11 @@ impl TableEngine for MemoryEngine {
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&def.name)
+            || self
+                .sequences
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(&def.name)
             || tables.values().any(|t| {
                 t.indexes
                     .read()
@@ -147,12 +192,115 @@ impl TableEngine for MemoryEngine {
             .collect()
     }
 
+    fn create_sequence(&self, def: SequenceDefinition) -> Result<(), StorageError> {
+        // Sequences share the relation namespace with tables, views and indexes.
+        if self.relation_name_taken(&def.name) {
+            return Err(StorageError::TableAlreadyExists(def.name));
+        }
+        let mut sequences = self
+            .sequences
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        if sequences.contains_key(&def.name) {
+            return Err(StorageError::TableAlreadyExists(def.name));
+        }
+        sequences.insert(
+            def.name.clone(),
+            RwLock::new(MemorySequence {
+                // Seed the counter at `start`; the first `nextval` returns it.
+                last_value: def.start,
+                def,
+                is_called: false,
+            }),
+        );
+        Ok(())
+    }
+
+    fn drop_sequence(&self, name: &str) -> Result<(), StorageError> {
+        self.sequences
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
+    }
+
+    fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
+        self.sequences
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .get(name)
+            .map(|s| {
+                s.read()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                    .def
+                    .clone()
+            })
+    }
+
+    fn sequences(&self) -> Vec<SequenceDefinition> {
+        self.sequences
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .values()
+            .map(|s| {
+                s.read()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                    .def
+                    .clone()
+            })
+            .collect()
+    }
+
+    fn sequence_nextval(&self, name: &str) -> SequenceAdvance {
+        let sequences = self
+            .sequences
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let Some(seq) = sequences.get(name) else {
+            return SequenceAdvance::NotFound;
+        };
+        let mut seq = seq.write().unwrap_or_else(|_| panic!("rwlock poisoned"));
+        match seq.def.next_value(seq.last_value, seq.is_called) {
+            SequenceAdvance::Value(v) => {
+                seq.last_value = v;
+                seq.is_called = true;
+                SequenceAdvance::Value(v)
+            }
+            other => other,
+        }
+    }
+
+    fn sequence_setval(&self, name: &str, value: i64, is_called: bool) -> SequenceAdvance {
+        let sequences = self
+            .sequences
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let Some(seq) = sequences.get(name) else {
+            return SequenceAdvance::NotFound;
+        };
+        let mut seq = seq.write().unwrap_or_else(|_| panic!("rwlock poisoned"));
+        seq.last_value = value;
+        seq.is_called = is_called;
+        SequenceAdvance::Value(value)
+    }
+
     fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
         let tables = self
             .tables
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&index.name)
+            || self
+                .views
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(&index.name)
+            || self
+                .sequences
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(&index.name)
             || tables.values().any(|t| {
                 t.indexes
                     .read()
