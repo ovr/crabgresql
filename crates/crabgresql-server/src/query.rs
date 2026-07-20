@@ -267,6 +267,41 @@ pub fn analyze_statement(
         ast::Statement::Delete(delete) => {
             bind_delete_with_params(&catalog, &type_catalog, delete, &ctx)?
         }
+        // EXPLAIN resolves its parameters against the inner statement and always
+        // returns a single "QUERY PLAN" text column. Binding the inner here lets
+        // a prepared `EXPLAIN … $1` report its parameter types at Describe rather
+        // than erroring at Execute.
+        ast::Statement::Explain { statement, .. } => {
+            match statement.as_ref() {
+                ast::Statement::Query(q) => {
+                    bind_query_with_params(&catalog, &type_catalog, q, &ctx)?
+                }
+                ast::Statement::Insert(i) => {
+                    bind_insert_with_params(&catalog, &type_catalog, i, &ctx)?
+                }
+                ast::Statement::Update(u) => {
+                    bind_update_with_params(&catalog, &type_catalog, u, &ctx)?
+                }
+                ast::Statement::Delete(d) => {
+                    bind_delete_with_params(&catalog, &type_catalog, d, &ctx)?
+                }
+                // EXPLAIN of a non-DML statement: no parameters, error at Execute.
+                _ => {
+                    return Ok(Analyzed {
+                        param_types: Vec::new(),
+                        result_columns: None,
+                    });
+                }
+            };
+            require_all_resolved(&ctx)?;
+            return Ok(Analyzed {
+                param_types: param_types(&ctx).into_iter().flatten().collect(),
+                result_columns: Some(vec![OutputColumn {
+                    name: "QUERY PLAN".to_string(),
+                    ty: PgType::Text,
+                }]),
+            });
+        }
         // Utility statements (DDL/SET/transaction control) take no parameters and
         // return no rows; their errors surface at Execute, as in PG.
         _ => {

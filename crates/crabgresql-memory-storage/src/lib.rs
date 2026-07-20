@@ -106,18 +106,25 @@ impl TableEngine for MemoryEngine {
         // (dead ones included — the probe MVCC-filters them, just like `rows`).
         // The index is servable only when all its key columns have an
         // equality-canonical encoding; otherwise it stays metadata-only.
+        //
+        // Hold the `rows` read lock across BOTH the build scan and the `phys`
+        // publish (lock order rows → phys): an `insert`/`update` takes the `rows`
+        // write lock before recording into `phys`, so keeping the read lock here
+        // blocks it until the new index is published. Otherwise a row inserted
+        // between "snapshot rows" and "push index" would be missing from the
+        // build snapshot yet also skip `record_in_indexes` (the index isn't in
+        // `phys` yet), leaving it permanently absent from the index.
         let key_columns: Vec<usize> = index.keys.iter().map(|k| k.column).collect();
         let servable = key_columns
             .iter()
             .all(|&c| key_type_indexable(target.schema.columns[c].ty));
+        let rows = target
+            .rows
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let map = servable.then(|| {
             let mut map: HashMap<Vec<Vec<u8>>, Vec<Tid>> = HashMap::new();
-            for v in target
-                .rows
-                .read()
-                .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .iter()
-            {
+            for v in rows.iter() {
                 if let Some(key) = PhysicalIndex::encode_row(&key_columns, &v.tuple) {
                     map.entry(key).or_default().push(v.tid);
                 }
@@ -133,6 +140,7 @@ impl TableEngine for MemoryEngine {
                 key_columns,
                 map,
             });
+        drop(rows);
 
         target
             .indexes
@@ -366,6 +374,14 @@ impl TableAm for MemoryTable {
             .then(|| v.tuple.clone())
     }
 
+    fn supports_index_scan(&self, index_name: &str) -> bool {
+        self.phys
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .iter()
+            .any(|p| p.name == index_name && p.map.is_some())
+    }
+
     fn index_lookup(
         &self,
         index_name: &str,
@@ -473,15 +489,22 @@ impl TableAm for MemoryTable {
         DeleteResult::Deleted
     }
 
-    /// One lock acquisition and at most one copy-on-write clone for the whole
-    /// batch. New versions are appended after all old ones are stamped, keeping
-    /// the tid order intact for the searches inside the loop.
+    /// One `rows` lock acquisition, one `phys` lock acquisition, and at most one
+    /// copy-on-write clone for the whole batch. New versions are appended after
+    /// all old ones are stamped, keeping the tid order intact for the searches
+    /// inside the loop.
     fn update_many(&self, updates: Vec<(Tid, Tuple)>, txn: &TxnContext) -> u64 {
         let mut rows = self
             .rows
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let rows = Arc::make_mut(&mut *rows);
+        // Hold the `phys` lock once for the batch rather than re-locking per row
+        // (lock order rows → phys).
+        let mut phys = self
+            .phys
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let mut new_versions = Vec::new();
         let mut applied = 0;
         for (tid, tuple) in updates {
@@ -491,7 +514,9 @@ impl TableAm for MemoryTable {
                 rows[pos].header.xmax = txn.xid;
                 rows[pos].header.cmax = txn.cid;
                 let new_tid = self.alloc_tid();
-                self.record_in_indexes(&tuple, new_tid);
+                for index in phys.iter_mut() {
+                    index.record(&tuple, new_tid);
+                }
                 new_versions.push(Version {
                     tid: new_tid,
                     header: TupleHeader::inserted(txn.xid, txn.cid),
@@ -563,6 +588,25 @@ impl TableAm for MemoryTable {
                 && v.header.xmax < oldest
                 && clog.is_committed(v.header.xmax))
         });
+        // Rebuild the physical indexes over the survivors so the tids of
+        // reclaimed versions are pruned. Unlike `rows`, the index map is
+        // append-only during normal operation, so vacuum is the point where its
+        // dead entries are collected (lock order rows → phys).
+        for index in self
+            .phys
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .iter_mut()
+        {
+            if let Some(map) = index.map.as_mut() {
+                map.clear();
+                for v in rows.iter() {
+                    if let Some(key) = PhysicalIndex::encode_row(&index.key_columns, &v.tuple) {
+                        map.entry(key).or_default().push(v.tid);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1053,21 +1097,60 @@ mod tests {
     fn index_lookup_none_for_unknown_index_or_ineligible_key_type() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        engine.create_table(schema("t"))?;
+        let table = engine.create_table(schema("t"))?;
         engine.create_index("t", unique_index("t_id_key", 0))?;
         // Unknown index name → unservable, caller falls back to a scan.
         assert!(probe_ids(&engine, &tm, "no_such_index", Value::Int4(1)).is_none());
+        assert!(!table.supports_index_scan("no_such_index"));
+        // An int4 index is servable.
+        assert!(table.supports_index_scan("t_id_key"));
 
         // A float8 key type is not equality-canonical, so its index stays
-        // metadata-only and `index_lookup` returns None (scan fallback).
+        // metadata-only: index_lookup returns None and supports_index_scan is
+        // false, so the planner won't route an index scan to it.
         let ft = engine.create_table(TableSchema {
             name: "f".into(),
             columns: vec![Column::new("x", PgType::Float8)],
         })?;
         engine.create_index("f", unique_index("f_x_key", 0))?;
+        assert!(!ft.supports_index_scan("f_x_key"));
         assert!(
             ft.index_lookup("f_x_key", &[Value::Float8(1.0)], &read(&tm))
                 .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_prunes_dead_tids_from_the_index() -> anyhow::Result<()> {
+        let tm = TransactionManager::new();
+        let engine = MemoryEngine::new();
+        let table = engine.create_table(schema("t"))?;
+        engine.create_index("t", unique_index("t_id_key", 0))?;
+        let mut tid = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("v0".into())]);
+        // Update the same key several times; each update appends a new tid under
+        // the key and leaves the old (now dead) version behind.
+        for i in 1..=5 {
+            let xid = tm.allocate_xid();
+            table.update(
+                tid,
+                vec![Value::Int4(1), Value::Text(format!("v{i}"))],
+                &tm.context(xid, CommandId::FIRST),
+            );
+            tm.commit(xid)?;
+            tid = table
+                .scan(&read(&tm))
+                .find(|(_, t)| t[0] == Value::Int4(1))
+                .ok_or_else(|| anyhow::anyhow!("live row vanished"))?
+                .0;
+        }
+        // Vacuum past all the dead versions, then confirm the probe still returns
+        // exactly the one live row (the pruned tids must not resurrect or drop it).
+        let horizon = tm.allocate_xid();
+        table.vacuum(horizon, tm.clog());
+        assert_eq!(
+            probe_ids(&engine, &tm, "t_id_key", Value::Int4(1)),
+            Some(vec![Value::Int4(1)])
         );
         Ok(())
     }

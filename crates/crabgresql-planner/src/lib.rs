@@ -30,16 +30,18 @@ pub enum PhysicalPlan {
         sort: Vec<SortKey>,
     },
     /// A single-table read served by an equality probe on `index_name`: the
-    /// executor evaluates `key_values` (one per `key_columns` entry, in key
-    /// order) once and asks the engine for the matching rows, falling back to a
-    /// full scan when the engine has no physical index. `predicate` is the
-    /// residual WHERE the index did not consume, applied as a `Filter`; the
-    /// standard Projection → Sort tail follows, exactly as for [`Self::Select`].
+    /// executor evaluates each `key` value once and asks the engine for the
+    /// matching rows. The planner only emits this when the engine reports
+    /// [`TableAm::supports_index_scan`], but the executor still scan-fallbacks
+    /// defensively. `predicate` is the residual WHERE the index did not consume,
+    /// applied as a `Filter`; the standard Projection → Sort tail follows,
+    /// exactly as for [`Self::Select`].
     IndexScan {
         table: Arc<dyn TableAm>,
         index_name: String,
-        key_columns: Vec<usize>,
-        key_values: Vec<BoundExpr>,
+        /// One `(key column, equality value)` pair per index key column, in key
+        /// order. The value expressions are row-constant and evaluated once.
+        key: Vec<(usize, BoundExpr)>,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -350,14 +352,12 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         } => match choose_access(&table, predicate) {
             AccessPath::Index {
                 index_name,
-                key_columns,
-                key_values,
+                key,
                 residual,
             } => PhysicalPlan::IndexScan {
                 table,
                 index_name,
-                key_columns,
-                key_values,
+                key,
                 columns,
                 projections,
                 predicate: residual,
@@ -463,8 +463,9 @@ enum AccessPath {
     /// An equality index probe (see [`PhysicalPlan::IndexScan`]).
     Index {
         index_name: String,
-        key_columns: Vec<usize>,
-        key_values: Vec<BoundExpr>,
+        /// One `(key column, equality value)` pair per index key column, in key
+        /// order.
+        key: Vec<(usize, BoundExpr)>,
         residual: Option<BoundExpr>,
     },
     /// A full scan carrying the whole (unconsumed) predicate.
@@ -489,7 +490,7 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
 
     // Flatten the AND-tree and classify each conjunct once.
     let mut conjuncts = Vec::new();
-    collect_conjuncts(predicate, &mut conjuncts);
+    flatten_and(predicate, &mut conjuncts);
     let eqs: Vec<Option<(usize, BoundExpr)>> = conjuncts.iter().map(as_eq_key).collect();
 
     // Prefer a PRIMARY KEY, then a UNIQUE index, then any other index.
@@ -502,15 +503,19 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
             let Some(chosen) = cover_index(index, &eqs) else {
                 continue;
             };
-            let mut key_columns = Vec::with_capacity(chosen.len());
-            let mut key_values = Vec::with_capacity(chosen.len());
+            // Only route to an index scan the engine can physically serve;
+            // otherwise `EXPLAIN` would advertise an index scan that silently
+            // degrades to a sequential scan at execution time.
+            if !table.supports_index_scan(&index.name) {
+                continue;
+            }
+            let mut key = Vec::with_capacity(chosen.len());
             let mut consumed = vec![false; conjuncts.len()];
             for (column, conjunct) in chosen {
                 // `cover_index` only ever returns conjuncts classified as an
                 // equality key, so `eqs[conjunct]` is always `Some`.
                 if let Some((_, value)) = &eqs[conjunct] {
-                    key_columns.push(column);
-                    key_values.push(value.clone());
+                    key.push((column, value.clone()));
                     consumed[conjunct] = true;
                 }
             }
@@ -522,15 +527,14 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
                 .collect();
             return AccessPath::Index {
                 index_name: index.name.clone(),
-                key_columns,
-                key_values,
-                residual: conjoin(residual),
+                key,
+                residual: rebuild_and(residual),
             };
         }
     }
 
     AccessPath::Scan {
-        predicate: conjoin(conjuncts),
+        predicate: rebuild_and(conjuncts),
     }
 }
 
@@ -551,34 +555,6 @@ fn cover_index(
         chosen.push((key.column, conjunct));
     }
     Some(chosen)
-}
-
-/// Flatten an `AND`-tree into its conjuncts, preserving order.
-fn collect_conjuncts(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
-    match expr {
-        BoundExpr::Binary {
-            op: BinOp::And,
-            left,
-            right,
-            ..
-        } => {
-            collect_conjuncts(*left, out);
-            collect_conjuncts(*right, out);
-        }
-        other => out.push(other),
-    }
-}
-
-/// Rebuild a left-deep `AND`-tree from conjuncts, or `None` when empty.
-fn conjoin(conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
-    let mut iter = conjuncts.into_iter();
-    let first = iter.next()?;
-    Some(iter.fold(first, |acc, next| BoundExpr::Binary {
-        op: BinOp::And,
-        arg_ty: PgType::Bool,
-        left: Box::new(acc),
-        right: Box::new(next),
-    }))
 }
 
 /// A conjunct of the form `col = <constant>` (either operand order), returning
@@ -606,28 +582,35 @@ fn as_eq_key(conjunct: &BoundExpr) -> Option<(usize, BoundExpr)> {
     }
 }
 
-/// Whether an expression is constant with respect to the scanned row: it
-/// references no column and no bind parameter, so the executor can evaluate it
-/// once against an empty row to form the index key.
+/// Whether an expression can be hoisted to a **single** evaluation for the whole
+/// scan to form the index key. That requires it to reference no column and no
+/// bind parameter *and* to be stable — the same value on every row. Function
+/// calls are rejected conservatively: the executor evaluates the key exactly
+/// once, so hoisting a volatile function (`random()`, `nextval()`) would diverge
+/// from the per-row evaluation a `Filter` performs, and we have no purity
+/// classification here to tell pure from volatile. A rejected key simply falls
+/// back to a sequential scan + filter — correct, just not indexed.
 fn is_row_constant(expr: &BoundExpr) -> bool {
     match expr {
-        BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => false,
         BoundExpr::Const { .. } => true,
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Reinterpret { expr, .. } => is_row_constant(expr),
         BoundExpr::Binary { left, right, .. } => is_row_constant(left) && is_row_constant(right),
-        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
-            args.iter().all(is_row_constant)
-        }
         BoundExpr::Case { whens, else_, .. } => {
             whens
                 .iter()
                 .all(|(when, then)| is_row_constant(when) && is_row_constant(then))
                 && else_.as_ref().map_or(true, |e| is_row_constant(e))
         }
-        BoundExpr::Aggregate { arg, .. } => arg.as_ref().map_or(true, |a| is_row_constant(a)),
+        // ColumnRef/Param reference per-row/per-execution state; FuncCall/Srf may
+        // be volatile; Aggregate never appears in a bindable WHERE key.
+        BoundExpr::ColumnRef { .. }
+        | BoundExpr::Param { .. }
+        | BoundExpr::FuncCall { .. }
+        | BoundExpr::Srf { .. }
+        | BoundExpr::Aggregate { .. } => false,
     }
 }
 
@@ -652,18 +635,16 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::IndexScan {
             table,
             index_name,
-            key_columns,
-            key_values,
+            key,
             predicate,
             ..
         } => {
             let schema = table.schema();
             let mut lines = vec![format!("Index Scan using {index_name} on {}", schema.name)];
-            let cond = key_columns
+            let cond = key
                 .iter()
-                .zip(key_values)
-                .map(|(&column, value)| {
-                    format!("{} = {}", schema.columns[column].name, explain_expr(value, schema))
+                .map(|(column, value)| {
+                    format!("{} = {}", schema.columns[*column].name, explain_expr(value, schema))
                 })
                 .collect::<Vec<_>>()
                 .join(") AND (");
@@ -1108,8 +1089,7 @@ mod tests {
         let plan = plan_sql_indexed("SELECT * FROM t WHERE id = 1", Some(pk_on_id()));
         let PhysicalPlan::IndexScan {
             index_name,
-            key_columns,
-            key_values,
+            key,
             predicate,
             ..
         } = plan
@@ -1117,13 +1097,15 @@ mod tests {
             panic!("expected IndexScan");
         };
         assert_eq!(index_name, "t_pkey");
-        assert_eq!(key_columns, vec![0]);
         assert_eq!(
-            key_values,
-            vec![BoundExpr::Const {
-                value: Value::Int4(1),
-                ty: PgType::Int4
-            }]
+            key,
+            vec![(
+                0,
+                BoundExpr::Const {
+                    value: Value::Int4(1),
+                    ty: PgType::Int4
+                }
+            )]
         );
         // The equality conjunct is fully consumed by the index.
         assert!(predicate.is_none());
@@ -1135,15 +1117,11 @@ mod tests {
             "SELECT * FROM t WHERE id = 1 AND name = 'x'",
             Some(pk_on_id()),
         );
-        let PhysicalPlan::IndexScan {
-            key_columns,
-            predicate,
-            ..
-        } = plan
-        else {
+        let PhysicalPlan::IndexScan { key, predicate, .. } = plan else {
             panic!("expected IndexScan");
         };
-        assert_eq!(key_columns, vec![0]);
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[0].0, 0);
         // `name = 'x'` is not on the index key, so it remains a runtime filter.
         let Some(BoundExpr::Binary {
             op: BinOp::Eq,

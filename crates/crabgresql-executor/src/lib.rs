@@ -133,14 +133,13 @@ pub fn execute(
         PhysicalPlan::IndexScan {
             table,
             index_name,
-            key_columns,
-            key_values,
+            key,
             columns,
             projections,
             predicate,
             sort,
         } => {
-            let source = IndexScan::new(&table, &index_name, &key_columns, key_values, ctx, txn)?;
+            let source = IndexScan::new(&table, &index_name, key, ctx, txn)?;
             project_pipeline(Box::new(source), projections, predicate, sort, columns, ctx)
         }
         PhysicalPlan::Subquery {
@@ -1363,11 +1362,12 @@ impl ExecNode for SeqScan {
     }
 }
 
-/// Equality index scan: probes the engine's physical index for the key, or —
-/// when the engine has none (durable heap engine, an index whose key type it
-/// cannot physically index, a system catalog) — falls back to a full scan. In
-/// either case it re-checks key equality per row, which is exact for the index
-/// path and what makes the fallback scan correct. NULL never matches under `=`.
+/// Equality index scan: probes the engine's physical index for the key. When
+/// the engine cannot serve it (durable heap engine, an index whose key type it
+/// cannot physically index, a system catalog) it falls back to a full scan and
+/// re-checks key equality per row, which is what makes that fallback correct.
+/// The physical-index path is already exact (the engine returns only rows whose
+/// key equals the probe), so it needs no re-check. NULL never matches under `=`.
 pub struct IndexScan {
     iter: Box<dyn Iterator<Item = Tuple> + Send>,
 }
@@ -1376,43 +1376,39 @@ impl IndexScan {
     pub fn new(
         table: &Arc<dyn TableAm>,
         index_name: &str,
-        key_columns: &[usize],
-        key_values: Vec<BoundExpr>,
+        key: Vec<(usize, BoundExpr)>,
         ctx: ExecContext,
         txn: &TxnContext,
     ) -> Result<Self, ExecError> {
-        // The key expressions are row-constant (the planner guarantees it), so
-        // they evaluate once against an empty row.
-        let key: Vec<Value> = key_values
+        // The key value expressions are row-constant (the planner guarantees
+        // it), so they evaluate once against an empty row.
+        let key_values: Vec<Value> = key
             .iter()
-            .map(|expr| eval(expr, &[], ctx))
+            .map(|(_, expr)| eval(expr, &[], ctx))
             .collect::<Result<_, _>>()?;
-        let key_types: Vec<PgType> = key_columns
-            .iter()
-            .map(|&column| table.schema().columns[column].ty)
-            .collect();
-        let key_columns = key_columns.to_vec();
-        let source: Box<dyn Iterator<Item = (Tid, Tuple)> + Send> =
-            match table.index_lookup(index_name, &key, txn) {
-                Some(iter) => iter,
-                None => table.scan(txn),
+        let iter: Box<dyn Iterator<Item = Tuple> + Send> =
+            match table.index_lookup(index_name, &key_values, txn) {
+                // Exact path: the engine already returned only key-matching,
+                // MVCC-visible rows.
+                Some(rows) => Box::new(rows.map(|(_, tuple)| tuple)),
+                // Fallback path: a full scan, so re-check the key per row.
+                None => {
+                    let cols: Vec<(usize, PgType)> = key
+                        .iter()
+                        .map(|(column, _)| (*column, table.schema().columns[*column].ty))
+                        .collect();
+                    Box::new(table.scan(txn).filter_map(move |(_, tuple)| {
+                        cols.iter().zip(&key_values).all(|(&(column, ty), want)| {
+                            let cell = &tuple[column];
+                            !matches!(cell, Value::Null)
+                                && !matches!(want, Value::Null)
+                                && compare_values(ty, cell, want) == Ordering::Equal
+                        })
+                        .then_some(tuple)
+                    }))
+                }
             };
-        let iter = source.filter_map(move |(_, tuple)| {
-            key_columns
-                .iter()
-                .zip(&key)
-                .zip(&key_types)
-                .all(|((&column, want), &ty)| {
-                    let cell = &tuple[column];
-                    !matches!(cell, Value::Null)
-                        && !matches!(want, Value::Null)
-                        && compare_values(ty, cell, want) == Ordering::Equal
-                })
-                .then_some(tuple)
-        });
-        Ok(Self {
-            iter: Box::new(iter),
-        })
+        Ok(Self { iter })
     }
 }
 
@@ -1927,8 +1923,7 @@ mod tests {
         let mut node = test_ok(IndexScan::new(
             &table,
             "t_id_key",
-            &[0],
-            vec![int4(2)],
+            vec![(0, int4(2))],
             ExecContext::default(),
             &rtxn(),
         ));
@@ -1946,8 +1941,7 @@ mod tests {
         let mut node = test_ok(IndexScan::new(
             &table,
             "missing_index",
-            &[0],
-            vec![int4(2)],
+            vec![(0, int4(2))],
             ExecContext::default(),
             &rtxn(),
         ));
@@ -1963,8 +1957,7 @@ mod tests {
         let mut node = test_ok(IndexScan::new(
             &table,
             "t_id_key",
-            &[0],
-            vec![int4(99)],
+            vec![(0, int4(99))],
             ExecContext::default(),
             &rtxn(),
         ));

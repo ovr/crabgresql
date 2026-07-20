@@ -537,8 +537,10 @@ fn heap_index_lookup_falls_back_to_scan() -> anyhow::Result<()> {
     insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Text("b".into())]);
     h.engine.create_index("t", pk_on_id())?;
 
-    // The durable heap engine builds no physical index yet, so `index_lookup`
-    // reports "unservable" (None) and the executor falls back to a scan.
+    // The durable heap engine builds no physical index yet, so it reports no
+    // index-scan support (the planner plans a Seq Scan) and `index_lookup`
+    // returns None (the executor falls back to a scan).
+    assert!(!table.supports_index_scan("t_pkey"));
     assert!(
         table
             .index_lookup("t_pkey", &[Value::Int4(2)], &read(&h.tm))
