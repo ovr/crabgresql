@@ -18,10 +18,12 @@ use std::sync::Arc;
 
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{BoundAggregate, BoundExpr, JoinKind, SortKey, TableFn};
-use crabgresql_planner::{PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan};
+use crabgresql_planner::{
+    HashKey, PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan,
+};
 use crabgresql_storage_api::{IndexMetadata, TableAm, Tid, Tuple};
 use crabgresql_txn::TxnContext;
-use crabgresql_types::Value;
+use crabgresql_types::{PgType, Value};
 
 use eval::eval;
 pub use eval::{coerce_value, compare_values};
@@ -627,20 +629,34 @@ fn build_join_expr(
             right,
             kind,
             predicate,
+            hash_keys,
         } => {
             let left_width = left.width();
             let right_width = right.width();
             let left = build_join_expr(*left, ctx, txn)?;
             let right = build_join_expr(*right, ctx, txn)?;
-            Ok(Box::new(NestedLoopJoin::new(
-                left,
-                right,
-                left_width,
-                right_width,
-                kind,
-                predicate,
-                ctx,
-            )?))
+            if hash_keys.is_empty() {
+                Ok(Box::new(NestedLoopJoin::new(
+                    left,
+                    right,
+                    left_width,
+                    right_width,
+                    kind,
+                    predicate,
+                    ctx,
+                )?))
+            } else {
+                Ok(Box::new(HashJoin::new(
+                    left,
+                    right,
+                    left_width,
+                    right_width,
+                    kind,
+                    hash_keys,
+                    predicate,
+                    ctx,
+                )?))
+            }
         }
     }
 }
@@ -779,6 +795,247 @@ impl ExecNode for NestedLoopJoin {
             }
         }
     }
+}
+
+/// Binary hash join over one or more equi-keys, with the hash table built on the
+/// materialized right (inner) side and the left side streamed as the probe. It
+/// emits rows in the same order a [`NestedLoopJoin`] would — left-driven, right
+/// rows in materialization order within each match — so results are identical
+/// whether or not the query sorts.
+///
+/// Outer-join bookkeeping matches `NestedLoopJoin`: `right_matched` tracks which
+/// inner rows participated in a match (for RIGHT/FULL), and unmatched left rows
+/// are null-extended for LEFT/FULL. NULL keys never match (SQL join equality),
+/// so rows with a NULL key are excluded from the hash table and the probe but
+/// still surface as null-extended rows on a preserved side.
+pub struct HashJoin {
+    left: Box<dyn ExecNode>,
+    right_rows: Vec<Tuple>,
+    right_matched: Vec<bool>,
+    /// Per right row: its key values, or `None` when the key was NULL (and so
+    /// the row was not inserted into `buckets`). Indexed by right-row position.
+    right_key_vals: Vec<Option<Vec<Value>>>,
+    /// Key hash → the indices of the right rows carrying that hash. Only rows
+    /// with fully non-NULL keys appear here.
+    buckets: HashMap<u64, Vec<usize>>,
+    left_width: usize,
+    right_width: usize,
+    kind: JoinKind,
+    /// The left-side operand of each equi-key and its comparison type.
+    /// `left_keys[i]` indexes the left (probe) input; `key_tys[i]` drives hashing
+    /// and equality. The right-side operands are consumed at build time to
+    /// precompute `right_key_vals`, so they aren't retained.
+    left_keys: Vec<BoundExpr>,
+    key_tys: Vec<PgType>,
+    /// Non-equi conjuncts of the ON clause, checked per candidate pair.
+    residual: Option<BoundExpr>,
+    ctx: ExecContext,
+    phase: JoinPhase,
+    current_left: Option<Tuple>,
+    current_left_matched: bool,
+    /// Key values of the current left row (valid while its matches are emitted).
+    current_left_keys: Vec<Value>,
+    /// Candidate right-row indices for the current left row, and the cursor into
+    /// them. Candidates come from the matching hash bucket; each is confirmed
+    /// with `keys_equal` (collision guard) and the residual predicate.
+    probe_matches: Vec<usize>,
+    probe_pos: usize,
+    right_index: usize,
+}
+
+impl HashJoin {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        left: Box<dyn ExecNode>,
+        mut right: Box<dyn ExecNode>,
+        left_width: usize,
+        right_width: usize,
+        kind: JoinKind,
+        hash_keys: Vec<HashKey>,
+        residual: Option<BoundExpr>,
+        ctx: ExecContext,
+    ) -> Result<Self, ExecError> {
+        let key_tys: Vec<PgType> = hash_keys.iter().map(|k| k.ty).collect();
+        let mut left_keys = Vec::with_capacity(hash_keys.len());
+        let mut right_keys = Vec::with_capacity(hash_keys.len());
+        for key in hash_keys {
+            left_keys.push(key.left);
+            right_keys.push(key.right);
+        }
+
+        let mut right_rows = Vec::new();
+        while let Some(row) = right.next()? {
+            right_rows.push(row);
+        }
+
+        // Build the hash table over the inner side. A right key expression
+        // indexes the concatenated row, so evaluate it against a row whose left
+        // half is NULL padding and whose right half is the inner row.
+        let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut right_key_vals = Vec::with_capacity(right_rows.len());
+        for (index, row) in right_rows.iter().enumerate() {
+            let mut padded = vec![Value::Null; left_width];
+            padded.extend_from_slice(row);
+            let vals = eval_join_keys(&right_keys, &padded, ctx)?;
+            if let Some(vals) = &vals {
+                buckets
+                    .entry(agg::hash_key(&key_tys, vals))
+                    .or_default()
+                    .push(index);
+            }
+            right_key_vals.push(vals);
+        }
+
+        let right_matched = vec![false; right_rows.len()];
+        Ok(Self {
+            left,
+            right_rows,
+            right_matched,
+            right_key_vals,
+            buckets,
+            left_width,
+            right_width,
+            kind,
+            left_keys,
+            key_tys,
+            residual,
+            ctx,
+            phase: JoinPhase::LeftRows,
+            current_left: None,
+            current_left_matched: false,
+            current_left_keys: Vec::new(),
+            probe_matches: Vec::new(),
+            probe_pos: 0,
+            right_index: 0,
+        })
+    }
+
+    fn preserves_left(&self) -> bool {
+        matches!(self.kind, JoinKind::Left | JoinKind::Full)
+    }
+
+    fn preserves_right(&self) -> bool {
+        matches!(self.kind, JoinKind::Right | JoinKind::Full)
+    }
+
+    fn combined_row(&self, left: &[Value], right: &[Value]) -> Tuple {
+        let mut row = Vec::with_capacity(self.left_width + self.right_width);
+        row.extend_from_slice(left);
+        row.extend_from_slice(right);
+        row
+    }
+
+    /// Look up the candidate right rows for a freshly pulled left row: evaluate
+    /// its keys (a NULL key yields no candidates) and pull the matching bucket.
+    fn load_probe(&mut self) -> Result<(), ExecError> {
+        self.probe_pos = 0;
+        let Some(left) = self.current_left.as_ref() else {
+            self.current_left_keys.clear();
+            self.probe_matches = Vec::new();
+            return Ok(());
+        };
+        match eval_join_keys(&self.left_keys, left, self.ctx)? {
+            Some(vals) => {
+                let hash = agg::hash_key(&self.key_tys, &vals);
+                self.current_left_keys = vals;
+                self.probe_matches = self.buckets.get(&hash).cloned().unwrap_or_default();
+            }
+            None => {
+                self.current_left_keys.clear();
+                self.probe_matches = Vec::new();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ExecNode for HashJoin {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        loop {
+            match self.phase {
+                JoinPhase::LeftRows => {
+                    if self.current_left.is_none() {
+                        self.current_left = self.left.next()?;
+                        let Some(_) = self.current_left else {
+                            self.phase = if self.preserves_right() {
+                                JoinPhase::UnmatchedRight
+                            } else {
+                                JoinPhase::Done
+                            };
+                            self.right_index = 0;
+                            continue;
+                        };
+                        self.current_left_matched = false;
+                        self.load_probe()?;
+                    }
+
+                    while self.probe_pos < self.probe_matches.len() {
+                        let right_index = self.probe_matches[self.probe_pos];
+                        self.probe_pos += 1;
+                        // A bucket hit can still be a hash collision, so confirm
+                        // key equality, then the residual (non-equi) conjuncts.
+                        let Some(right_vals) = self.right_key_vals[right_index].as_ref() else {
+                            continue;
+                        };
+                        if !agg::keys_equal(&self.key_tys, &self.current_left_keys, right_vals) {
+                            continue;
+                        }
+                        let Some(left) = self.current_left.as_ref() else {
+                            continue;
+                        };
+                        let row = self.combined_row(left, &self.right_rows[right_index]);
+                        if !predicate_holds(&self.residual, &row, self.ctx)? {
+                            continue;
+                        }
+                        self.current_left_matched = true;
+                        self.right_matched[right_index] = true;
+                        return Ok(Some(row));
+                    }
+
+                    if !self.current_left_matched && self.preserves_left() {
+                        let Some(mut row) = self.current_left.take() else {
+                            continue;
+                        };
+                        row.extend(std::iter::repeat_n(Value::Null, self.right_width));
+                        return Ok(Some(row));
+                    }
+                    self.current_left = None;
+                }
+                JoinPhase::UnmatchedRight => {
+                    while self.right_index < self.right_rows.len() {
+                        let right_index = self.right_index;
+                        self.right_index += 1;
+                        if !self.right_matched[right_index] {
+                            let mut row = vec![Value::Null; self.left_width];
+                            row.extend_from_slice(&self.right_rows[right_index]);
+                            return Ok(Some(row));
+                        }
+                    }
+                    self.phase = JoinPhase::Done;
+                }
+                JoinPhase::Done => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Evaluate each equi-key expression over `row`, returning `None` as soon as one
+/// is NULL (a NULL key can never match in a join, mirroring PG). `row` must be a
+/// full-width concatenated row so key column indices stay valid.
+fn eval_join_keys(
+    keys: &[BoundExpr],
+    row: &[Value],
+    ctx: ExecContext,
+) -> Result<Option<Vec<Value>>, ExecError> {
+    let mut vals = Vec::with_capacity(keys.len());
+    for key in keys {
+        let v = eval(key, row, ctx)?;
+        if matches!(v, Value::Null) {
+            return Ok(None);
+        }
+        vals.push(v);
+    }
+    Ok(Some(vals))
 }
 
 /// Wrap `node` in a `Sort` when there are ORDER BY keys. `columns` is the
@@ -2623,6 +2880,96 @@ mod tests {
                 vec![Value::Int4(1), Value::Int8(0)],
                 vec![Value::Int4(2), Value::Int8(2)],
                 vec![Value::Null, Value::Int8(0)],
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_join_matches_duplicate_keys_on_both_sides() {
+        // Two left rows and two right rows share key 2, so the equi-join emits
+        // their 2×2 cross product — left-driven, right rows in input order.
+        let (_columns, rows) = run_rows(
+            "SELECT a.x, b.y \
+             FROM (VALUES (1), (2), (2)) a(x) \
+             JOIN (VALUES (2), (2), (3)) b(y) ON a.x = b.y",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_join_on_composite_key() {
+        // Both key columns must match; (1,20) matches only the right (1,20) row.
+        let (_columns, rows) = run_rows(
+            "SELECT a.x, a.y, b.z \
+             FROM (VALUES (1, 10), (1, 20)) a(x, y) \
+             JOIN (VALUES (1, 20, 100), (1, 10, 200), (2, 20, 300)) b(x, y, z) \
+             ON a.x = b.x AND a.y = b.y \
+             ORDER BY a.y",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(10), Value::Int4(200)],
+                vec![Value::Int4(1), Value::Int4(20), Value::Int4(100)],
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_join_applies_residual_predicate() {
+        // `a.x = b.x` is the hash key; `a.v < b.v` is a residual conjunct checked
+        // per candidate pair. Only the pair (x=1, 5 < 9) survives.
+        let (_columns, rows) = run_rows(
+            "SELECT a.v, b.v \
+             FROM (VALUES (1, 5), (2, 9)) a(x, v) \
+             JOIN (VALUES (1, 9), (1, 3), (2, 1)) b(x, v) ON a.x = b.x AND a.v < b.v",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(5), Value::Int4(9)]]);
+    }
+
+    #[test]
+    fn hash_join_left_outer_with_residual_null_extends() {
+        // A LEFT join whose ON has a residual: a left row is null-extended when no
+        // right row satisfies the *whole* ON (key equality AND the residual).
+        let (_columns, rows) = run_rows(
+            "SELECT a.x, b.v \
+             FROM (VALUES (1, 5), (2, 9)) a(x, v) \
+             LEFT JOIN (VALUES (1, 9), (2, 1)) b(x, v) ON a.x = b.x AND a.v < b.v \
+             ORDER BY a.x",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(9)],
+                // x=2 has a key match (b.x=2) but 9 < 1 is false, so null-extended.
+                vec![Value::Int4(2), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_join_coerces_mixed_width_keys() {
+        // int4 = int8 promotes the int4 side to int8; both sides must hash under
+        // the same promoted type for the match to be found.
+        let engine = engine_with_nums();
+        let (_columns, rows) = run_rows_on(
+            &engine,
+            "SELECT a.n, b.big FROM nums a \
+             JOIN (VALUES (1::int8), (3::int8)) b(big) ON a.n = b.big ORDER BY a.n",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int8(1)],
+                vec![Value::Int4(3), Value::Int8(3)],
             ]
         );
     }

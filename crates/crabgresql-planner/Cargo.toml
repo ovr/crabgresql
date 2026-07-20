@@ -10,8 +10,8 @@ workspace = true
 [dependencies]
 crabgresql-binder.workspace = true
 crabgresql-storage-api.workspace = true
+crabgresql-types.workspace = true
 
 [dev-dependencies]
 crabgresql-memory-storage.workspace = true
 crabgresql-parser.workspace = true
-crabgresql-types.workspace = true

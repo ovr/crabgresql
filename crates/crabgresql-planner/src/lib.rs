@@ -7,10 +7,11 @@
 use std::sync::Arc;
 
 use crabgresql_binder::{
-    AggInput, BoundAggregate, BoundExpr, JoinExpr, JoinInput, JoinKind, LogicalPlan, OutputColumn,
-    SortKey, TableFn,
+    AggInput, BinOp, BoundAggregate, BoundExpr, JoinExpr, JoinInput, JoinKind, LogicalPlan,
+    OutputColumn, SortKey, TableFn,
 };
 use crabgresql_storage_api::TableAm;
+use crabgresql_types::PgType;
 
 /// An executable plan. `Select` describes the SeqScan → Filter → Projection →
 /// Sort pipeline the executor builds.
@@ -96,17 +97,39 @@ pub enum PhysicalJoinInput {
     TableFunction { func: TableFn, args: Vec<BoundExpr> },
 }
 
+/// One equi-join key of a hash join: a pair of expressions, one addressing the
+/// left input and one the right, that must compare equal. Both evaluate to `ty`
+/// (the operands' promoted comparison type), so the hash/equality of the two
+/// sides is computed under a single type. Extracted from `col = col` conjuncts
+/// of the ON predicate (see [`extract_hash_keys`]).
+///
+/// The operand expressions still index into the *concatenated* `left || right`
+/// row (the form the binder produced): `left` references `[0, left_width)` and
+/// `right` references `[left_width, ..)`. The executor evaluates each against a
+/// padded row so the indices stay valid.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HashKey {
+    pub left: BoundExpr,
+    pub right: BoundExpr,
+    pub ty: PgType,
+}
+
 /// A [`JoinExpr`] whose leaf subplans have already been physically planned.
 pub enum PhysicalJoinExpr {
     Input {
         input: PhysicalJoinInput,
         width: usize,
     },
+    /// A binary join. When `hash_keys` is non-empty the executor runs a hash
+    /// join keyed on them and `predicate` holds only the residual (non-equi)
+    /// conjuncts of the ON clause; when empty it runs a nested-loop join and
+    /// `predicate` is the whole ON condition (`None` for CROSS/comma joins).
     Join {
         left: Box<PhysicalJoinExpr>,
         right: Box<PhysicalJoinExpr>,
         kind: JoinKind,
         predicate: Option<BoundExpr>,
+        hash_keys: Vec<HashKey>,
     },
 }
 
@@ -145,12 +168,173 @@ fn plan_join_expr(source: JoinExpr) -> PhysicalJoinExpr {
             right,
             kind,
             predicate,
-        } => PhysicalJoinExpr::Join {
-            left: Box::new(plan_join_expr(*left)),
-            right: Box::new(plan_join_expr(*right)),
-            kind,
-            predicate,
-        },
+        } => {
+            let left_width = left.width();
+            let (hash_keys, predicate) = extract_hash_keys(predicate, left_width);
+            PhysicalJoinExpr::Join {
+                left: Box::new(plan_join_expr(*left)),
+                right: Box::new(plan_join_expr(*right)),
+                kind,
+                predicate,
+                hash_keys,
+            }
+        }
+    }
+}
+
+/// Split an ON predicate into hash-join keys plus a residual filter.
+///
+/// The predicate is a boolean over the concatenated `left || right` row, where
+/// the left input occupies column indices `[0, left_width)`. Any top-level
+/// (AND-connected) conjunct of the form `<left-only expr> = <right-only expr>`
+/// (in either operand order) becomes a [`HashKey`]; every other conjunct — a
+/// non-equality, a same-side equality (`a.x = a.z`), or one comparing against a
+/// constant (`a.x = 5`) — stays in the residual predicate, re-AND-ed together.
+///
+/// With no extractable key the residual equals the original predicate, so the
+/// executor falls back to a nested-loop join with identical semantics.
+fn extract_hash_keys(
+    predicate: Option<BoundExpr>,
+    left_width: usize,
+) -> (Vec<HashKey>, Option<BoundExpr>) {
+    let Some(predicate) = predicate else {
+        return (Vec::new(), None);
+    };
+    let mut conjuncts = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+
+    let mut hash_keys = Vec::new();
+    let mut residual = Vec::new();
+    for conjunct in conjuncts {
+        match as_equi_key(conjunct, left_width) {
+            Ok(key) => hash_keys.push(key),
+            Err(other) => residual.push(other),
+        }
+    }
+    (hash_keys, rebuild_and(residual))
+}
+
+/// Recursively split a top-level `AND` tree into its conjuncts, preserving order.
+fn flatten_and(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
+    match expr {
+        BoundExpr::Binary {
+            op: BinOp::And,
+            left,
+            right,
+            ..
+        } => {
+            flatten_and(*left, out);
+            flatten_and(*right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Re-combine conjuncts with `AND`, yielding `None` for an empty list.
+fn rebuild_and(mut conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
+    let mut acc = conjuncts.pop()?;
+    while let Some(next) = conjuncts.pop() {
+        acc = BoundExpr::Binary {
+            op: BinOp::And,
+            arg_ty: PgType::Bool,
+            left: Box::new(next),
+            right: Box::new(acc),
+        };
+    }
+    Some(acc)
+}
+
+/// If `conjunct` is a cross-side equality, return its [`HashKey`] (oriented so
+/// `left` addresses the left input); otherwise hand the expression back as a
+/// residual conjunct.
+fn as_equi_key(conjunct: BoundExpr, left_width: usize) -> Result<HashKey, BoundExpr> {
+    let BoundExpr::Binary {
+        op: BinOp::Eq,
+        arg_ty,
+        left,
+        right,
+    } = conjunct
+    else {
+        return Err(conjunct);
+    };
+    let left_side = ref_side(&left, left_width);
+    let right_side = ref_side(&right, left_width);
+    match (left_side, right_side) {
+        (Some(Side::Left), Some(Side::Right)) => Ok(HashKey {
+            left: *left,
+            right: *right,
+            ty: arg_ty,
+        }),
+        (Some(Side::Right), Some(Side::Left)) => Ok(HashKey {
+            left: *right,
+            right: *left,
+            ty: arg_ty,
+        }),
+        _ => Err(BoundExpr::Binary {
+            op: BinOp::Eq,
+            arg_ty,
+            left,
+            right,
+        }),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    Left,
+    Right,
+}
+
+/// Which input a key operand references, or `None` if it spans both inputs or
+/// references no column at all (a constant/param — not a join key). All column
+/// references below `left_width` are on the left, the rest on the right.
+fn ref_side(expr: &BoundExpr, left_width: usize) -> Option<Side> {
+    let mut side = None;
+    if !collect_side(expr, left_width, &mut side) {
+        return None;
+    }
+    side
+}
+
+/// Fold every `ColumnRef` in `expr` into `side`. Returns `false` as soon as the
+/// expression is found to span both inputs (a mixed operand can't be a hash
+/// key). `side` stays `None` for a column-free operand.
+fn collect_side(expr: &BoundExpr, left_width: usize, side: &mut Option<Side>) -> bool {
+    match expr {
+        BoundExpr::ColumnRef { index, .. } => {
+            let this = if *index < left_width {
+                Side::Left
+            } else {
+                Side::Right
+            };
+            match side {
+                None => *side = Some(this),
+                Some(existing) if *existing == this => {}
+                Some(_) => return false,
+            }
+            true
+        }
+        BoundExpr::Const { .. } | BoundExpr::Param { .. } => true,
+        BoundExpr::Unary { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::Coerce { expr, .. }
+        | BoundExpr::Reinterpret { expr, .. } => collect_side(expr, left_width, side),
+        BoundExpr::Binary { left, right, .. } => {
+            collect_side(left, left_width, side) && collect_side(right, left_width, side)
+        }
+        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+            args.iter().all(|a| collect_side(a, left_width, side))
+        }
+        BoundExpr::Case { whens, else_, .. } => {
+            whens.iter().all(|(cond, result)| {
+                collect_side(cond, left_width, side) && collect_side(result, left_width, side)
+            }) && else_
+                .as_ref()
+                .is_none_or(|e| collect_side(e, left_width, side))
+        }
+        // Aggregates never appear in a join predicate (the binder rejects them),
+        // so treat one defensively as spanning nothing decidable.
+        BoundExpr::Aggregate { .. } => false,
     }
 }
 
@@ -468,14 +652,68 @@ mod tests {
         else {
             panic!("expected Aggregate over Join");
         };
+        // `a.id = b.id` is a cross-side equality, so it lowers to a hash join
+        // with one key and no residual predicate.
+        let PhysicalJoinExpr::Join {
+            kind,
+            predicate,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(kind, JoinKind::Full);
+        assert!(predicate.is_none());
+        assert_eq!(hash_keys.len(), 1);
+    }
+
+    #[test]
+    fn equi_join_extracts_hash_key_and_leaves_residual() {
+        // `a.id = b.id` is the sole key; `a.big > b.big` is a non-equi residual.
+        let PhysicalPlan::Join { source, .. } =
+            plan_sql("SELECT * FROM t a INNER JOIN t b ON a.id = b.id AND a.big > b.big")
+        else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Join {
+            kind,
+            predicate,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert_eq!(kind, JoinKind::Inner);
+        assert_eq!(hash_keys.len(), 1);
+        assert_eq!(hash_keys[0].ty, PgType::Int4);
+        // The residual keeps the `>` comparison as a single conjunct.
         assert!(matches!(
-            source,
-            PhysicalJoinExpr::Join {
-                kind: JoinKind::Full,
-                predicate: Some(_),
-                ..
-            }
+            predicate,
+            Some(BoundExpr::Binary { op: BinOp::Gt, .. })
         ));
+    }
+
+    #[test]
+    fn non_equi_and_constant_equalities_stay_nested_loop() {
+        // `a.id = 1` compares a column to a constant (a filter, not a join key),
+        // and `a.big < b.big` is non-equi: neither yields a hash key.
+        let PhysicalPlan::Join { source, .. } =
+            plan_sql("SELECT * FROM t a INNER JOIN t b ON a.id = 1 AND a.big < b.big")
+        else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Join {
+            predicate,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert!(hash_keys.is_empty());
+        assert!(predicate.is_some());
     }
 
     #[test]
