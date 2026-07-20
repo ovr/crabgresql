@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crabgresql_storage_api::{
     IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
+    ViewDefinition,
 };
 
 /// Resolves relations against a session-local temp store first, then the shared
@@ -113,5 +114,30 @@ impl TableEngine for SessionCatalog {
 
     fn relation_metadata(&self) -> Vec<RelationMetadata> {
         self.global.relation_metadata()
+    }
+
+    /// A view is created in the permanent (global) catalog; temp views are not
+    /// supported yet, so like the CTAS default this routes to `global`.
+    fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {
+        self.global.create_view(def)
+    }
+
+    /// Search-path-aware view resolution, mirroring [`SessionCatalog::resolve`].
+    /// Views live only in the permanent catalog for now, so an unqualified or
+    /// `public.`-qualified name reaches `global`; other namespaces (temp,
+    /// `pg_catalog`) hold no user views.
+    fn resolve_view(&self, schema: Option<&str>, name: &str) -> Option<ViewDefinition> {
+        match schema {
+            None | Some("public") => self.global.resolve_view(None, name),
+            _ => None,
+        }
+    }
+
+    fn drop_view(&self, name: &str) -> Result<(), StorageError> {
+        self.global.drop_view(name)
+    }
+
+    fn views(&self) -> Vec<ViewDefinition> {
+        self.global.views()
     }
 }

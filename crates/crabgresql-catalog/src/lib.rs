@@ -97,6 +97,15 @@ pub fn is_builtin_type_name(name: &str) -> bool {
     PG_TYPE_ROWS.iter().any(|row| row.typname == name)
 }
 
+/// The relation kind reflected into `pg_class.relkind` / `information_schema`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelKind {
+    /// An ordinary table (`relkind = 'r'`, table_type `BASE TABLE`).
+    Table,
+    /// A view (`relkind = 'v'`, table_type `VIEW`).
+    View,
+}
+
 /// A live relation exposed through the system catalogs.
 #[derive(Clone, Debug)]
 pub struct CatalogRelation {
@@ -104,6 +113,7 @@ pub struct CatalogRelation {
     pub indexes: Vec<IndexMetadata>,
     pub namespace: String,
     pub temporary: bool,
+    pub kind: RelKind,
 }
 
 impl CatalogRelation {
@@ -113,6 +123,7 @@ impl CatalogRelation {
             indexes: Vec::new(),
             namespace: "public".to_string(),
             temporary: false,
+            kind: RelKind::Table,
         }
     }
 
@@ -122,6 +133,7 @@ impl CatalogRelation {
             indexes: metadata.indexes,
             namespace: "public".to_string(),
             temporary: false,
+            kind: RelKind::Table,
         }
     }
 
@@ -131,6 +143,18 @@ impl CatalogRelation {
             indexes: Vec::new(),
             namespace: namespace.into(),
             temporary: true,
+            kind: RelKind::Table,
+        }
+    }
+
+    /// A permanent view. Views have no indexes and live in `public`.
+    pub fn view(schema: TableSchema) -> Self {
+        Self {
+            schema,
+            indexes: Vec::new(),
+            namespace: "public".to_string(),
+            temporary: false,
+            kind: RelKind::View,
         }
     }
 }
@@ -166,6 +190,7 @@ pub struct SystemCatalog {
     owner: String,
     live_relations: OnceLock<Vec<CatalogRelation>>,
     oids: OnceLock<Vec<(u32, TableSchema)>>,
+    kinds: OnceLock<Vec<RelKind>>,
     index_oids: OnceLock<Vec<CatalogIndex>>,
     user_types: OnceLock<Vec<CatalogUserType>>,
 }
@@ -210,6 +235,7 @@ impl SystemCatalog {
             owner: owner.into(),
             live_relations: OnceLock::new(),
             oids: OnceLock::new(),
+            kinds: OnceLock::new(),
             index_oids: OnceLock::new(),
             user_types: OnceLock::new(),
         }
@@ -249,6 +275,20 @@ impl SystemCatalog {
                 .enumerate()
                 .map(|(i, r)| (FIRST_REL_OID + i as u32, r.schema))
                 .collect()
+        })
+    }
+
+    /// The relation kind for each entry of [`SystemCatalog::relation_oids`], in
+    /// the same sorted order, so `pg_class` can emit the right `relkind`.
+    fn relation_kinds(&self) -> &[RelKind] {
+        self.kinds.get_or_init(|| {
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            rels.into_iter().map(|r| r.kind).collect()
         })
     }
 
@@ -299,7 +339,11 @@ impl SystemCatalog {
             "pg_namespace" => Some((schema::pg_namespace_schema(), schema::pg_namespace_rows())),
             "pg_class" => Some((
                 schema::pg_class_schema(),
-                schema::pg_class_rows(self.relation_oids(), self.index_oids()),
+                schema::pg_class_rows(
+                    self.relation_oids(),
+                    self.relation_kinds(),
+                    self.index_oids(),
+                ),
             )),
             "pg_attribute" => Some((
                 schema::pg_attribute_schema(),

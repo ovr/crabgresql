@@ -268,3 +268,40 @@ async fn dropped_table_stays_dropped_across_a_restart() {
         shutdown(client, handle).await;
     }
 }
+
+/// A view — a catalog-only object with no heap — survives a full restart: the
+/// relation catalog persists its definition, so `SELECT` through it still works.
+#[tokio::test]
+async fn view_survives_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (port, handle) = spawn_pg(dir.path()).await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id int4, name text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .await?;
+    client
+        .simple_query("CREATE VIEW v (label) AS SELECT name FROM t WHERE id = 2")
+        .await?;
+    shutdown(client, handle).await;
+
+    // Restart: the view definition and its column alias come back.
+    let (port, handle) = spawn_pg(dir.path()).await;
+    let client = connect(port).await;
+    let messages = client.simple_query("SELECT label FROM v").await?;
+    let result = rows(&messages);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].get("label"), Some("b"));
+
+    // It still reflects as a view after recovery.
+    let messages = client
+        .simple_query("SELECT relkind FROM pg_class WHERE relname = 'v'")
+        .await?;
+    assert_eq!(rows(&messages)[0].get("relkind"), Some("v"));
+    shutdown(client, handle).await;
+
+    Ok(())
+}

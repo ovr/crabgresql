@@ -143,6 +143,21 @@ pub struct TableSchema {
     pub columns: Vec<Column>,
 }
 
+/// A stored view: a named query plus the metadata needed to resolve, reflect,
+/// and drop it. The query is carried as **SQL text** (re-parsed by the binder on
+/// each reference) so this crate stays free of a parser dependency. `columns` is
+/// the view's output shape, derived by binding the query at `CREATE VIEW` time;
+/// `depends_on` lists the relation names the query references at the surface
+/// (a view over another view names the *view*, not its base tables) so
+/// `DROP ... CASCADE`/`RESTRICT` can walk the dependency graph.
+#[derive(Clone, Debug)]
+pub struct ViewDefinition {
+    pub name: String,
+    pub sql: String,
+    pub columns: Vec<Column>,
+    pub depends_on: Vec<String>,
+}
+
 impl TableSchema {
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == name)
@@ -345,6 +360,31 @@ pub trait TableEngine: Send + Sync {
                 indexes: Vec::new(),
             })
             .collect()
+    }
+
+    /// Register a view. The caller (server) has already bound the query, derived
+    /// its columns, and computed `depends_on`. The default rejects it — only an
+    /// engine that keeps a view registry (memory, heap) overrides this.
+    fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {
+        Err(StorageError::TableNotFound(def.name))
+    }
+
+    /// Resolve a possibly schema-qualified view name to its stored definition,
+    /// for the binder to expand as a subplan. `None` means "not a view here" —
+    /// the caller falls back to table resolution. The default knows no views.
+    fn resolve_view(&self, _schema: Option<&str>, _name: &str) -> Option<ViewDefinition> {
+        None
+    }
+
+    /// Remove a view. `TableNotFound` if absent. The default knows no views.
+    fn drop_view(&self, name: &str) -> Result<(), StorageError> {
+        Err(StorageError::TableNotFound(name.to_string()))
+    }
+
+    /// Enumerate the engine's views for catalog reflection and dependency
+    /// (CASCADE/RESTRICT) checks. The default is empty.
+    fn views(&self) -> Vec<ViewDefinition> {
+        Vec::new()
     }
 }
 

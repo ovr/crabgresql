@@ -2571,3 +2571,230 @@ async fn time_plus_time_reports_ambiguous_operator_over_the_wire() -> anyhow::Re
 
     Ok(())
 }
+
+/// A view is a stored query: `SELECT` expands it, an explicit column list renames
+/// its output, and it reflects into `pg_class` (`relkind='v'`) and
+/// `information_schema.tables` (`VIEW`).
+#[tokio::test]
+async fn views_expand_and_reflect_into_catalog() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int4, name text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .await?;
+    client
+        .simple_query("CREATE VIEW v AS SELECT id, name FROM t WHERE id = 1")
+        .await?;
+
+    let messages = client.simple_query("SELECT id, name FROM v").await?;
+    let result = rows(&messages);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].get("id"), Some("1"));
+    assert_eq!(result[0].get("name"), Some("a"));
+
+    // Explicit column list renames the outputs.
+    client
+        .simple_query("CREATE VIEW v2 (label) AS SELECT name FROM t")
+        .await?;
+    let messages = client
+        .simple_query("SELECT label FROM v2 ORDER BY label")
+        .await?;
+    let result = rows(&messages);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].get("label"), Some("a"));
+
+    // A view over a view expands transitively.
+    client
+        .simple_query("CREATE VIEW v3 AS SELECT id FROM v")
+        .await?;
+    let messages = client.simple_query("SELECT id FROM v3").await?;
+    assert_eq!(rows(&messages).len(), 1);
+
+    // Catalog reflection: relkind='v' and information_schema table_type='VIEW'.
+    let messages = client
+        .simple_query("SELECT relkind FROM pg_class WHERE relname = 'v'")
+        .await?;
+    assert_eq!(rows(&messages)[0].get("relkind"), Some("v"));
+    let messages = client
+        .simple_query(
+            "SELECT table_type FROM information_schema.tables WHERE table_name = 'v'",
+        )
+        .await?;
+    assert_eq!(rows(&messages)[0].get("table_type"), Some("VIEW"));
+
+    Ok(())
+}
+
+/// `CREATE OR REPLACE VIEW` swaps the definition (and may only add trailing
+/// columns); `IF NOT EXISTS` and a plain re-create resolve name collisions.
+#[tokio::test]
+async fn create_view_replace_and_collisions() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int4)").await?;
+    client.simple_query("INSERT INTO t VALUES (1), (2)").await?;
+    client
+        .simple_query("CREATE VIEW v AS SELECT id FROM t WHERE id = 1")
+        .await?;
+
+    // OR REPLACE swaps the body; the row set changes.
+    client
+        .simple_query("CREATE OR REPLACE VIEW v AS SELECT id FROM t")
+        .await?;
+    let messages = client.simple_query("SELECT id FROM v").await?;
+    assert_eq!(rows(&messages).len(), 2);
+
+    // A plain re-create collides.
+    let err = client
+        .simple_query("CREATE VIEW v AS SELECT 1")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::DUPLICATE_TABLE);
+    assert_eq!(db.message(), "relation \"v\" already exists");
+
+    // IF NOT EXISTS is a no-op (skips) when the view exists.
+    client
+        .simple_query("CREATE VIEW IF NOT EXISTS v AS SELECT 1")
+        .await?;
+
+    // A table cannot collide with a view name either.
+    let err = client
+        .simple_query("CREATE TABLE v (x int4)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::DUPLICATE_TABLE
+    );
+
+    // OR REPLACE that drops a column is rejected.
+    client
+        .simple_query("CREATE VIEW two AS SELECT id, id AS id2 FROM t")
+        .await?;
+    let err = client
+        .simple_query("CREATE OR REPLACE VIEW two AS SELECT id FROM t")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.message(), "cannot drop columns from view");
+
+    Ok(())
+}
+
+/// DROP VIEW honors object type, IF EXISTS, and dependency tracking; a table with
+/// a dependent view refuses RESTRICT and cascades under CASCADE.
+#[tokio::test]
+async fn drop_view_object_type_and_dependencies() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int4)").await?;
+    client
+        .simple_query("CREATE VIEW v AS SELECT id FROM t")
+        .await?;
+
+    // Wrong object type both ways.
+    let err = client.simple_query("DROP TABLE v").await.unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(db.message(), "\"v\" is not a table");
+    assert_eq!(db.hint(), Some("Use DROP VIEW to remove a view."));
+
+    let err = client.simple_query("DROP VIEW t").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("db error").message(),
+        "\"t\" is not a view"
+    );
+
+    // RESTRICT: the table refuses to drop while the view depends on it.
+    let err = client.simple_query("DROP TABLE t").await.unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::DEPENDENT_OBJECTS_STILL_EXIST);
+    assert_eq!(
+        db.message(),
+        "cannot drop table t because other objects depend on it"
+    );
+    assert_eq!(db.detail(), Some("view v depends on table t"));
+
+    // CASCADE drops the table and its dependent view.
+    client.simple_query("DROP TABLE t CASCADE").await?;
+    let err = client.simple_query("SELECT id FROM v").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::UNDEFINED_TABLE
+    );
+
+    // DROP VIEW IF EXISTS on a missing view succeeds (skips).
+    client.simple_query("DROP VIEW IF EXISTS v").await?;
+    Ok(())
+}
+
+/// A view is not automatically updatable: writes through it are rejected.
+#[tokio::test]
+async fn views_are_not_updatable() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int4)").await?;
+    client
+        .simple_query("CREATE VIEW v AS SELECT id FROM t")
+        .await?;
+
+    let err = client
+        .simple_query("INSERT INTO v VALUES (1)")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(db.message(), "cannot insert into view \"v\"");
+
+    let err = client
+        .simple_query("UPDATE v SET id = 2")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("db error").message(),
+        "cannot update view \"v\""
+    );
+
+    let err = client.simple_query("DELETE FROM v").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("db error").message(),
+        "cannot delete from view \"v\""
+    );
+
+    Ok(())
+}
+
+/// A view may (transitively) reference itself: PG permits creating it and errors
+/// only when it is used. Expansion detects the cycle instead of recursing.
+#[tokio::test]
+async fn recursive_view_definition_errors_on_use_not_creation() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+    client
+        .simple_query("CREATE VIEW v2 AS SELECT a FROM t")
+        .await?;
+    client
+        .simple_query("CREATE VIEW v3 AS SELECT a FROM v2")
+        .await?;
+    // Close the loop: v2 -> v3 -> v2. Creating it succeeds (as in PG).
+    client
+        .simple_query("CREATE OR REPLACE VIEW v2 AS SELECT a FROM v3")
+        .await?;
+    // Using it detects the cycle rather than overflowing the stack.
+    let err = client.simple_query("SELECT a FROM v2").await.unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::INVALID_OBJECT_DEFINITION);
+    assert_eq!(
+        db.message(),
+        "infinite recursion detected in rules for relation \"v2\""
+    );
+    Ok(())
+}

@@ -11,7 +11,7 @@
 use crabgresql_storage_api::{Column, IndexConstraint, IndexMethod, TableSchema};
 use crabgresql_types::{PgType, Value};
 
-use crate::{CatalogIndex, CatalogRelation, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS};
+use crate::{CatalogIndex, CatalogRelation, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS, RelKind};
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
 /// built-in ranges so a per-label OID never collides with a type/relation OID.
@@ -237,28 +237,36 @@ pub fn pg_class_schema() -> TableSchema {
     }
 }
 
-/// Build `pg_class` rows from `(oid, schema)` pairs. All user relations live in
-/// `public` (namespace 2200), are ordinary heaps (`relkind = 'r'`, `relam = 2`)
-/// and permanent (`relpersistence = 'p'`); the synthetic OIDs are stable within
-/// one catalog snapshot so a join to `pg_attribute.attrelid` lines up.
+/// Build `pg_class` rows from `(oid, schema)` pairs paired with their kinds. User
+/// relations live in `public` (namespace 2200) and are permanent
+/// (`relpersistence = 'p'`); a table is an ordinary heap (`relkind = 'r'`,
+/// `relam = 2`) while a view has no storage access method (`relkind = 'v'`,
+/// `relam = 0`). The synthetic OIDs are stable within one catalog snapshot so a
+/// join to `pg_attribute.attrelid` lines up.
 pub fn pg_class_rows(
     relations: &[(u32, TableSchema)],
+    kinds: &[RelKind],
     indexes: &[CatalogIndex],
 ) -> Vec<Vec<Value>> {
     let mut rows: Vec<Vec<Value>> = relations
         .iter()
-        .map(|(oid, schema)| {
+        .zip(kinds)
+        .map(|((oid, schema), kind)| {
+            let (relam, relkind) = match kind {
+                RelKind::Table => (HEAP_AM_OID, "r"),
+                RelKind::View => (0, "v"),
+            };
             vec![
                 Value::Oid(*oid),
                 Value::Text(schema.name.clone()),
                 Value::Oid(2200),
                 Value::Oid(0),
                 Value::Oid(10),
-                Value::Oid(HEAP_AM_OID),
+                Value::Oid(relam),
                 Value::Int2(schema.columns.len() as i16),
                 Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
                 Value::Text("p".to_string()),
-                Value::Text("r".to_string()),
+                Value::Text(relkind.to_string()),
             ]
         })
         .collect();
@@ -636,10 +644,10 @@ pub fn information_schema_tables_rows(
                 Value::Text(relation.namespace.clone()),
                 Value::Text(relation.schema.name.clone()),
                 Value::Text(
-                    if relation.temporary {
-                        "LOCAL TEMPORARY"
-                    } else {
-                        "BASE TABLE"
+                    match (relation.kind, relation.temporary) {
+                        (RelKind::View, _) => "VIEW",
+                        (RelKind::Table, true) => "LOCAL TEMPORARY",
+                        (RelKind::Table, false) => "BASE TABLE",
                     }
                     .to_string(),
                 ),

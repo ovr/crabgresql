@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_storage_api::{
-    IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
+    IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema, ViewDefinition,
 };
 use crabgresql_txn::{Clog, TxnFinalize, Xid};
 use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, recover, write_control};
@@ -360,6 +360,7 @@ impl TableEngine for PgEngine {
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&schema.name)
             || self.catalog.contains(&schema.name)
+            || self.catalog.contains_view(&schema.name)
             || tables
                 .values()
                 .any(|t| t.indexes().iter().any(|i| i.name == schema.name))
@@ -475,5 +476,51 @@ impl TableEngine for PgEngine {
                 indexes: t.indexes(),
             })
             .collect()
+    }
+
+    fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {
+        // A view shares the relation namespace with tables and indexes. Hold the
+        // tables lock across the collision check and the durable write so a
+        // concurrent CREATE TABLE of the same name can't slip between them.
+        let tables = self
+            .tables
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        if tables.contains_key(&def.name)
+            || self.catalog.contains(&def.name)
+            || tables
+                .values()
+                .any(|t| t.indexes().iter().any(|i| i.name == def.name))
+        {
+            return Err(StorageError::TableAlreadyExists(def.name));
+        }
+        let created = self
+            .catalog
+            .create_view(&def)
+            .expect("relation catalog write failed");
+        if !created {
+            return Err(StorageError::TableAlreadyExists(def.name));
+        }
+        Ok(())
+    }
+
+    fn resolve_view(&self, _schema: Option<&str>, name: &str) -> Option<ViewDefinition> {
+        self.catalog.views().into_iter().find(|v| v.name == name)
+    }
+
+    fn drop_view(&self, name: &str) -> Result<(), StorageError> {
+        let removed = self
+            .catalog
+            .remove_view(name)
+            .expect("relation catalog write failed");
+        if removed {
+            Ok(())
+        } else {
+            Err(StorageError::TableNotFound(name.to_string()))
+        }
+    }
+
+    fn views(&self) -> Vec<ViewDefinition> {
+        self.catalog.views()
     }
 }

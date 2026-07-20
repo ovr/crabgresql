@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{Column, StorageError, TableAm, TableEngine, TypeCatalog};
+use crabgresql_storage_api::{
+    Column, StorageError, TableAm, TableEngine, TypeCatalog, ViewDefinition,
+};
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
@@ -268,6 +270,7 @@ fn not_found_as_written(e: StorageError, schema: Option<&str>, name: &str) -> Bi
 fn resolve_write_table(
     engine: &Arc<dyn TableEngine>,
     name: &ast::ObjectName,
+    verb: WriteVerb,
 ) -> Result<(Arc<dyn TableAm>, String), BindError> {
     let (schema, table_name) = split_relation_name(name)?;
     let table = match schema.as_deref() {
@@ -285,21 +288,60 @@ fn resolve_write_table(
         // `public.` -> global only, `pg_temp.` -> temp only, other -> not found.
         Some(_) => engine.resolve(schema.as_deref(), &table_name),
     };
-    let table = table.map_err(|e| not_found_as_written(e, schema.as_deref(), &table_name))?;
+    let table = table.map_err(|e| {
+        // A write whose target is a view is rejected as non-updatable rather than
+        // "relation does not exist": crabgresql has no auto-updatable-view or
+        // INSTEAD OF trigger support yet.
+        if matches!(e, StorageError::TableNotFound(_))
+            && engine.resolve_view(schema.as_deref(), &table_name).is_some()
+        {
+            return non_updatable_view(verb, &table_name);
+        }
+        not_found_as_written(e, schema.as_deref(), &table_name)
+    })?;
     Ok((table, table_name))
+}
+
+/// Which DML verb is writing, for the non-updatable-view error text.
+#[derive(Clone, Copy)]
+enum WriteVerb {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// PG's rejection of a write to a view with no updatability support.
+fn non_updatable_view(verb: WriteVerb, name: &str) -> BindError {
+    let (action, trigger) = match verb {
+        WriteVerb::Insert => ("insert into", "INSERT"),
+        WriteVerb::Update => ("update", "UPDATE"),
+        WriteVerb::Delete => ("delete from", "DELETE"),
+    };
+    BindError::new(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        format!("cannot {action} view \"{name}\""),
+    )
+    .with_detail(Some(
+        "Views that do not select from a single table or view are not automatically updatable."
+            .to_string(),
+    ))
+    .with_hint(Some(format!(
+        "To enable {action} the view, provide an INSTEAD OF {trigger} trigger or an unconditional ON {trigger} DO INSTEAD rule."
+    )))
 }
 
 /// Resolve an `UPDATE`/`DELETE` target plus the qualifier for its columns.
 fn open_write_relation(
     engine: &Arc<dyn TableEngine>,
     relation: &ast::TableFactor,
+    verb: WriteVerb,
 ) -> Result<(Arc<dyn TableAm>, String), BindError> {
     let ast::TableFactor::Table { name, alias, .. } = relation else {
         return Err(BindError::feature_not_supported(format!(
             "target is not supported yet: {relation}"
         )));
     };
-    let (table, table_name) = resolve_write_table(engine, name)?;
+    let (table, table_name) = resolve_write_table(engine, name, verb)?;
     let qualifier = aliased_qualifier(alias, table_name)?;
     Ok((table, qualifier))
 }
@@ -815,6 +857,75 @@ impl BoundFromItem {
     }
 }
 
+/// Whether `start` can reach itself through view→view dependency edges — i.e.
+/// expanding it would recurse forever. Follows only names that are themselves
+/// views (a dependency on a table is a leaf); a `visited` set bounds the walk.
+fn view_is_recursive(engine: &Arc<dyn TableEngine>, start: &str) -> bool {
+    let views = engine.views();
+    let deps: HashMap<&str, &[String]> = views
+        .iter()
+        .map(|v| (v.name.as_str(), v.depends_on.as_slice()))
+        .collect();
+    let Some(first) = deps.get(start) else {
+        return false;
+    };
+    let mut stack: Vec<&str> = first.iter().map(String::as_str).collect();
+    let mut visited = HashSet::new();
+    while let Some(name) = stack.pop() {
+        if name == start {
+            return true;
+        }
+        if !visited.insert(name) {
+            continue;
+        }
+        if let Some(next) = deps.get(name) {
+            stack.extend(next.iter().map(String::as_str));
+        }
+    }
+    false
+}
+
+/// Bind a stored view's query into a logical plan. The SQL text is re-parsed and
+/// bound in a fresh scope (no outer CTEs, no outer `$n` parameters — a view body
+/// references neither). A parse/shape failure is an internal invariant violation
+/// (the text was validated at `CREATE VIEW`), reported as `XX000`.
+fn bind_view_query(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    view: &ViewDefinition,
+) -> Result<LogicalPlan, BindError> {
+    let stmts = crabgresql_parser::parse(&view.sql).map_err(|e| {
+        BindError::new(
+            sqlstate::INTERNAL_ERROR,
+            format!("could not parse stored definition of view \"{}\": {e}", view.name),
+        )
+    })?;
+    let query = match stmts.as_slice() {
+        [ast::Statement::Query(query)] => query,
+        _ => {
+            return Err(BindError::new(
+                sqlstate::INTERNAL_ERROR,
+                format!("stored definition of view \"{}\" is not a single query", view.name),
+            ));
+        }
+    };
+    bind_query_scoped(engine, catalog, &param_ctx_none(), query, &CteEnv::new())
+}
+
+/// The output columns a view reference exposes: the stored column names (which
+/// captured any explicit `CREATE VIEW v(...)` list at creation) carrying the
+/// types the re-bound query currently produces.
+fn view_output_columns(
+    inner: &LogicalPlan,
+    view: &ViewDefinition,
+) -> Result<Vec<OutputColumn>, BindError> {
+    let mut columns = output_columns_of(inner)?;
+    for (col, stored) in columns.iter_mut().zip(&view.columns) {
+        col.name = stored.name.clone();
+    }
+    Ok(columns)
+}
+
 /// Resolve one FROM item to a [`BoundFromItem`], producing a bare row source
 /// (no projection pipeline) so several can be combined into a join tree.
 fn bind_from_item(
@@ -877,6 +988,33 @@ fn bind_from_item(
                     qualifier,
                     columns,
                     input: JoinInput::Subplan(Box::new(cte.plan.clone())),
+                });
+            }
+            // A view shares PostgreSQL's relation namespace with tables, so it is
+            // resolved before table resolution: its stored query is re-parsed and
+            // re-bound as a subplan (the same mechanism as a CTE / derived table).
+            if let Some(view) = engine.resolve_view(cte_schema.as_deref(), &tname) {
+                // A view whose definition (transitively) reads itself would
+                // recurse forever when expanded. PG allows creating such a view
+                // but errors when it is used; detect the cycle from the stored
+                // dependency graph before expanding, matching that behavior.
+                if view_is_recursive(engine, &view.name) {
+                    return Err(BindError::new(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        format!(
+                            "infinite recursion detected in rules for relation \"{}\"",
+                            view.name
+                        ),
+                    ));
+                }
+                let inner = bind_view_query(engine, catalog, &view)?;
+                let qualifier = relation_qualifier(alias, &tname);
+                let mut columns = view_output_columns(&inner, &view)?;
+                apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
+                return Ok(BoundFromItem {
+                    qualifier,
+                    columns,
+                    input: JoinInput::Subplan(Box::new(inner)),
                 });
             }
             // Read resolution honors the search path: an unqualified `pg_type`
@@ -2414,7 +2552,7 @@ pub fn bind_insert_with_params(
     // Same write-target routing as UPDATE/DELETE: `public.t` reaches the
     // permanent relation, a write to `pg_catalog` is refused, and the system
     // catalog is never a write target.
-    let (table, name) = resolve_write_table(engine, target)?;
+    let (table, name) = resolve_write_table(engine, target, WriteVerb::Insert)?;
     let schema = table.schema().clone();
     let defaults = schema
         .columns
@@ -2569,7 +2707,7 @@ pub fn bind_update_with_params(
         )));
     }
 
-    let (table, qualifier) = open_write_relation(engine, &update.table.relation)?;
+    let (table, qualifier) = open_write_relation(engine, &update.table.relation, WriteVerb::Update)?;
     let schema = table.schema().clone();
     let table_name = schema.name.clone();
     let scope = Scope::table(&schema, qualifier, catalog, params);
@@ -2661,7 +2799,7 @@ pub fn bind_delete_with_params(
         ));
     }
 
-    let (table, qualifier) = open_write_relation(engine, &target.relation)?;
+    let (table, qualifier) = open_write_relation(engine, &target.relation, WriteVerb::Delete)?;
     let schema = table.schema().clone();
     let scope = Scope::table(&schema, qualifier, catalog, params);
     let predicate = bind_where(&delete.selection, &scope)?;

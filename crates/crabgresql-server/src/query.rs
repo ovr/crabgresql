@@ -17,7 +17,7 @@ use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, StorageError, TableAm,
-    TableEngine, TableSchema, TypeCatalog,
+    TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -172,6 +172,14 @@ fn bind_catalogs(
                         );
                         relation.indexes = metadata.indexes;
                         relation
+                    }));
+                    // Views reflect into pg_class as relkind='v' / pg_attribute
+                    // columns / information_schema.tables as VIEW.
+                    rels.extend(global.views().into_iter().map(|view| {
+                        crabgresql_catalog::CatalogRelation::view(TableSchema {
+                            name: view.name,
+                            columns: view.columns,
+                        })
                     }));
                     rels
                 },
@@ -380,6 +388,9 @@ pub fn execute_statement(
             ast::Statement::CreateTable(create) => {
                 return execute_create_table(engine, &type_catalog, create, session);
             }
+            ast::Statement::CreateView(create) => {
+                return execute_create_view(&catalog, &type_catalog, create);
+            }
             ast::Statement::CreateType {
                 name,
                 representation,
@@ -399,9 +410,17 @@ pub fn execute_statement(
             ast::Statement::Drop {
                 object_type: ast::ObjectType::Table,
                 names,
+                cascade,
                 if_exists,
                 ..
-            } => return execute_drop_table(&catalog, names, *if_exists),
+            } => return execute_drop_table(&catalog, names, *cascade, *if_exists),
+            ast::Statement::Drop {
+                object_type: ast::ObjectType::View,
+                names,
+                cascade,
+                if_exists,
+                ..
+            } => return execute_drop_view(&catalog, names, *cascade, *if_exists),
             ast::Statement::Drop {
                 object_type: ast::ObjectType::Type,
                 names,
@@ -702,6 +721,7 @@ fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
 fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
     Some(match stmt {
         ast::Statement::CreateTable(_) => "CREATE TABLE",
+        ast::Statement::CreateView(_) => "CREATE VIEW",
         ast::Statement::CreateIndex(_) => "CREATE INDEX",
         ast::Statement::CreateType { .. } => "CREATE TYPE",
         ast::Statement::AlterType(_) => "ALTER TYPE",
@@ -712,6 +732,10 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
             object_type: ast::ObjectType::Table,
             ..
         } => "DROP TABLE",
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::View,
+            ..
+        } => "DROP VIEW",
         ast::Statement::Drop {
             object_type: ast::ObjectType::Type,
             ..
@@ -2072,9 +2096,244 @@ fn execute_create_cast(
 /// permanent one. All targets are validated before any is dropped, so a multi-name
 /// DROP is atomic like PG. `CASCADE`/`RESTRICT` are accepted and ignored: no object
 /// depends on a table in this engine, so both simply drop the named tables.
+/// `CREATE [OR REPLACE] VIEW name [(cols)] AS <query>`. Binds the defining query
+/// to validate it and derive the output columns, stores the view (as its SELECT
+/// text plus derived columns and surface dependencies), and handles name
+/// collisions, `IF NOT EXISTS`, and `OR REPLACE`.
+fn execute_create_view(
+    catalog: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    create: &ast::CreateView,
+) -> Result<QueryResult, PgError> {
+    let name = object_name_to_table_name(&create.name)?;
+    // Reject forms we do not implement rather than silently ignoring them.
+    if create.materialized {
+        return Err(PgError::feature_not_supported(
+            "materialized views are not supported yet",
+        ));
+    }
+    if create.temporary {
+        return Err(PgError::feature_not_supported(
+            "temporary views are not supported yet",
+        ));
+    }
+    if create.or_alter
+        || create.to.is_some()
+        || create.with_no_schema_binding
+        || !create.cluster_by.is_empty()
+        || !matches!(create.options, ast::CreateTableOptions::None)
+    {
+        return Err(PgError::feature_not_supported(
+            "this CREATE VIEW form is not supported yet",
+        ));
+    }
+
+    // Bind the defining query: validates it and yields the output column shape.
+    let plan = crabgresql_binder::bind_query(catalog, type_catalog, &create.query)?;
+    let mut columns = output_columns_of(&plan)?;
+
+    // An explicit column list renames the outputs; its length must match exactly.
+    if !create.columns.is_empty() {
+        for col in &create.columns {
+            if col.data_type.is_some() || col.options.is_some() {
+                return Err(PgError::feature_not_supported(
+                    "column options in CREATE VIEW are not supported yet",
+                ));
+            }
+        }
+        if create.columns.len() > columns.len() {
+            return Err(PgError::new(
+                sqlstate::SYNTAX_ERROR,
+                "CREATE VIEW specifies more column names than columns",
+            ));
+        }
+        if create.columns.len() < columns.len() {
+            return Err(PgError::new(
+                sqlstate::SYNTAX_ERROR,
+                "CREATE VIEW specifies less column names than columns",
+            ));
+        }
+        for (out, def) in columns.iter_mut().zip(&create.columns) {
+            out.name = normalize_ident(&def.name);
+        }
+    }
+
+    // Duplicate output column names are rejected, as for a table.
+    let mut seen = HashSet::new();
+    for col in &columns {
+        if !seen.insert(col.name.clone()) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_COLUMN,
+                format!("column \"{}\" specified more than once", col.name),
+            ));
+        }
+    }
+
+    let view_columns: Vec<Column> = columns
+        .iter()
+        .map(|c| Column::new(c.name.clone(), c.ty))
+        .collect();
+    let depends_on = referenced_relations(&create.query);
+    let sql = create.query.to_string();
+
+    let existing_table = catalog.open_table(&name).is_ok();
+    if create.or_replace {
+        if existing_table {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not a view"),
+            ));
+        }
+        if let Some(old) = catalog.resolve_view(None, &name) {
+            check_view_replace_compatible(&old, &view_columns)?;
+            // A replaced view may (transitively) reference itself; PG permits
+            // creating such a view and only errors when it is used, so the
+            // binder detects the cycle at expansion time rather than here.
+            catalog.drop_view(&name)?;
+        }
+    } else if existing_table || catalog.resolve_view(None, &name).is_some() {
+        if create.if_not_exists {
+            return Ok(QueryResult::Command {
+                tag: "CREATE VIEW".into(),
+                notices: vec![Notice::notice(
+                    format!("relation \"{name}\" already exists, skipping"),
+                    None,
+                )],
+            });
+        }
+        return Err(PgError::new(
+            sqlstate::DUPLICATE_TABLE,
+            format!("relation \"{name}\" already exists"),
+        ));
+    }
+
+    catalog.create_view(ViewDefinition {
+        name,
+        sql,
+        columns: view_columns,
+        depends_on,
+    })?;
+    Ok(QueryResult::command("CREATE VIEW"))
+}
+
+/// Enforce PG's `CREATE OR REPLACE VIEW` rule: the new column list may only add
+/// trailing columns; existing columns must keep their name and type.
+fn check_view_replace_compatible(old: &ViewDefinition, new: &[Column]) -> Result<(), PgError> {
+    if new.len() < old.columns.len() {
+        return Err(PgError::new(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            "cannot drop columns from view",
+        ));
+    }
+    for (o, n) in old.columns.iter().zip(new) {
+        if o.name != n.name {
+            return Err(PgError::new(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                format!(
+                    "cannot change name of view column \"{}\" to \"{}\"",
+                    o.name, n.name
+                ),
+            ));
+        }
+        if o.ty != n.ty {
+            return Err(PgError::new(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                format!(
+                    "cannot change data type of view column \"{}\" from {} to {}",
+                    o.name,
+                    o.ty.name(),
+                    n.ty.name()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The surface relation names a query references in FROM position (including
+/// joins, derived tables, nested joins, set operations, and CTE bodies), minus
+/// the names bound by the query's own `WITH` clauses. A view over another view
+/// records the *view* name — the dependency edge `DROP ... CASCADE` walks. NB:
+/// subqueries embedded in expressions (e.g. a scalar subquery in the SELECT
+/// list) are not traced yet.
+fn referenced_relations(query: &ast::Query) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cte_names = Vec::new();
+    collect_query_relations(query, &mut names, &mut cte_names);
+    let mut seen = HashSet::new();
+    names
+        .into_iter()
+        .filter(|n| !cte_names.contains(n))
+        .filter(|n| seen.insert(n.clone()))
+        .collect()
+}
+
+fn collect_query_relations(query: &ast::Query, names: &mut Vec<String>, cte_names: &mut Vec<String>) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            cte_names.push(normalize_ident(&cte.alias.name));
+            collect_query_relations(&cte.query, names, cte_names);
+        }
+    }
+    collect_setexpr_relations(&query.body, names, cte_names);
+}
+
+fn collect_setexpr_relations(
+    body: &ast::SetExpr,
+    names: &mut Vec<String>,
+    cte_names: &mut Vec<String>,
+) {
+    match body {
+        ast::SetExpr::Select(select) => {
+            for twj in &select.from {
+                collect_factor_relations(&twj.relation, names, cte_names);
+                for join in &twj.joins {
+                    collect_factor_relations(&join.relation, names, cte_names);
+                }
+            }
+        }
+        ast::SetExpr::Query(query) => collect_query_relations(query, names, cte_names),
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            collect_setexpr_relations(left, names, cte_names);
+            collect_setexpr_relations(right, names, cte_names);
+        }
+        _ => {}
+    }
+}
+
+fn collect_factor_relations(
+    factor: &ast::TableFactor,
+    names: &mut Vec<String>,
+    cte_names: &mut Vec<String>,
+) {
+    match factor {
+        // A plain relation reference (a table function carries `args`).
+        ast::TableFactor::Table {
+            name, args: None, ..
+        } => {
+            if let Some(part) = name.0.last().and_then(|part| part.as_ident()) {
+                names.push(normalize_ident(part));
+            }
+        }
+        ast::TableFactor::Derived { subquery, .. } => {
+            collect_query_relations(subquery, names, cte_names)
+        }
+        ast::TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_factor_relations(&table_with_joins.relation, names, cte_names);
+            for join in &table_with_joins.joins {
+                collect_factor_relations(&join.relation, names, cte_names);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn execute_drop_table(
     catalog: &Arc<dyn TableEngine>,
     names: &[ast::ObjectName],
+    cascade: bool,
     if_exists: bool,
 ) -> Result<QueryResult, PgError> {
     let tnames = names
@@ -2096,33 +2355,191 @@ fn execute_drop_table(
     // statement before anything is dropped; with IF EXISTS it becomes a skip
     // NOTICE. PG spells the missing-object noun "table" here, not "relation".
     let mut notices = Vec::new();
-    let mut to_drop = Vec::new();
+    let mut to_drop: Vec<String> = Vec::new();
     for name in &tnames {
         match catalog.open_table(name) {
-            Ok(_) => to_drop.push(name),
-            Err(StorageError::TableNotFound(_)) if if_exists => {
-                notices.push(Notice::notice(
-                    format!("table \"{name}\" does not exist, skipping"),
-                    None,
-                ));
-            }
+            Ok(_) => to_drop.push(name.clone()),
             Err(StorageError::TableNotFound(_)) => {
-                return Err(PgError::new(
-                    sqlstate::UNDEFINED_TABLE,
-                    format!("table \"{name}\" does not exist"),
-                ));
+                // A view shares the relation namespace: PG rejects DROP TABLE on
+                // one as a wrong-object-type error rather than "does not exist".
+                if catalog.resolve_view(None, name).is_some() {
+                    return Err(PgError::new(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        format!("\"{name}\" is not a table"),
+                    )
+                    .with_hint("Use DROP VIEW to remove a view."));
+                }
+                if if_exists {
+                    notices.push(Notice::notice(
+                        format!("table \"{name}\" does not exist, skipping"),
+                        None,
+                    ));
+                } else {
+                    return Err(PgError::new(
+                        sqlstate::UNDEFINED_TABLE,
+                        format!("table \"{name}\" does not exist"),
+                    ));
+                }
             }
             Err(e) => return Err(e.into()),
         }
     }
-    // Phase 2: drop the validated survivors.
-    for name in to_drop {
+    // Phase 2: resolve dependent views (RESTRICT errors, CASCADE drops them),
+    // then drop the tables followed by their cascaded views.
+    let (dependent_views, mut cascade_notices) =
+        plan_view_cascade(catalog, "table", &to_drop, cascade)?;
+    notices.append(&mut cascade_notices);
+    for name in &to_drop {
         catalog.drop_table(name)?;
+    }
+    for view in &dependent_views {
+        catalog.drop_view(view)?;
     }
     Ok(QueryResult::Command {
         tag: "DROP TABLE".into(),
         notices,
     })
+}
+
+/// `DROP VIEW name [, ...] [CASCADE|RESTRICT]`. Mirrors [`execute_drop_table`]:
+/// two-phase validate/drop, IF EXISTS skip-notices, wrong-object-type detection
+/// (a table named here is `"x" is not a view`), and dependent-view cascade.
+fn execute_drop_view(
+    catalog: &Arc<dyn TableEngine>,
+    names: &[ast::ObjectName],
+    cascade: bool,
+    if_exists: bool,
+) -> Result<QueryResult, PgError> {
+    let vnames = names
+        .iter()
+        .map(object_name_to_table_name)
+        .collect::<Result<Vec<_>, _>>()?;
+    for (i, name) in vnames.iter().enumerate() {
+        if vnames[..i].contains(name) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("view \"{name}\" specified more than once"),
+            ));
+        }
+    }
+    let mut notices = Vec::new();
+    let mut to_drop: Vec<String> = Vec::new();
+    for name in &vnames {
+        if catalog.resolve_view(None, name).is_some() {
+            to_drop.push(name.clone());
+        } else if catalog.open_table(name).is_ok() {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not a view"),
+            )
+            .with_hint("Use DROP TABLE to remove a table."));
+        } else if if_exists {
+            notices.push(Notice::notice(
+                format!("view \"{name}\" does not exist, skipping"),
+                None,
+            ));
+        } else {
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_TABLE,
+                format!("view \"{name}\" does not exist"),
+            ));
+        }
+    }
+    let (dependent_views, mut cascade_notices) =
+        plan_view_cascade(catalog, "view", &to_drop, cascade)?;
+    notices.append(&mut cascade_notices);
+    for name in &to_drop {
+        catalog.drop_view(name)?;
+    }
+    for view in &dependent_views {
+        catalog.drop_view(view)?;
+    }
+    Ok(QueryResult::Command {
+        tag: "DROP VIEW".into(),
+        notices,
+    })
+}
+
+/// Resolve the views that depend on a set of relations being dropped. `targets`
+/// are the relation names being removed, all of object class `target_noun`
+/// (`"table"` or `"view"`). Under RESTRICT (`!cascade`) any dependent is an
+/// error (2BP01, with a DETAIL line per dependency edge). Under CASCADE it
+/// returns the transitive set of dependent view names to drop, in
+/// discovery order, plus the `drop cascades to ...` NOTICE(s) — matching the
+/// wording of `DROP TYPE ... CASCADE`.
+fn plan_view_cascade(
+    catalog: &Arc<dyn TableEngine>,
+    target_noun: &str,
+    targets: &[String],
+    cascade: bool,
+) -> Result<(Vec<String>, Vec<Notice>), PgError> {
+    let all_views = catalog.views();
+    let is_target = |name: &str| targets.iter().any(|t| t == name);
+
+    if !cascade {
+        // RESTRICT: report every (dependent view, target) edge as a DETAIL line,
+        // in target order then view order, as PG does.
+        let mut detail = Vec::new();
+        let mut first_blocked: Option<&str> = None;
+        for target in targets {
+            for view in &all_views {
+                if is_target(&view.name) {
+                    continue;
+                }
+                if view.depends_on.iter().any(|d| d == target) {
+                    detail.push(format!("view {} depends on {target_noun} {target}", view.name));
+                    first_blocked.get_or_insert(target.as_str());
+                }
+            }
+        }
+        if let Some(blocked) = first_blocked {
+            return Err(PgError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop {target_noun} {blocked} because other objects depend on it"),
+            )
+            .with_detail(detail.join("\n"))
+            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+        }
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    // CASCADE: breadth-first transitive closure of dependent views. A view is
+    // pulled in when its `depends_on` names anything already being dropped.
+    let mut removed: Vec<String> = targets.to_vec();
+    let mut dependents: Vec<String> = Vec::new();
+    loop {
+        let mut added = false;
+        for view in &all_views {
+            if removed.iter().any(|r| r == &view.name) {
+                continue;
+            }
+            if view.depends_on.iter().any(|d| removed.iter().any(|r| r == d)) {
+                removed.push(view.name.clone());
+                dependents.push(view.name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    let notices = match dependents.as_slice() {
+        [] => Vec::new(),
+        [one] => vec![Notice::notice(format!("drop cascades to view {one}"), None)],
+        many => {
+            let detail = many
+                .iter()
+                .map(|v| format!("drop cascades to view {v}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            vec![Notice::notice(
+                format!("drop cascades to {} other objects", many.len()),
+                Some(detail),
+            )]
+        }
+    };
+    Ok((dependents, notices))
 }
 
 /// `DROP TYPE name [, ...] [CASCADE|RESTRICT]`. All names are resolved and
