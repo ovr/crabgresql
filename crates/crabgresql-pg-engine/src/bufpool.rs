@@ -56,7 +56,13 @@ impl BufferPool {
                 })
             })
             .collect();
-        BufferPool { frames, map: Mutex::new(HashMap::new()), hand: AtomicUsize::new(0), smgr, wal }
+        BufferPool {
+            frames,
+            map: Mutex::new(HashMap::new()),
+            hand: AtomicUsize::new(0),
+            smgr,
+            wal,
+        }
     }
 
     pub fn smgr(&self) -> &Arc<StorageManager> {
@@ -68,9 +74,11 @@ impl BufferPool {
     /// dropped.
     pub fn pin(&self, rel: RelFileNode, block: u32) -> std::io::Result<PinnedPage<'_>> {
         let tag = BufferTag { rel, block };
-        let mut map = self.map.lock().unwrap();
+        let mut map = self.map.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         if let Some(&idx) = map.get(&tag) {
-            let mut fr = self.frames[idx].lock().unwrap();
+            let mut fr = self.frames[idx]
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"));
             fr.pins += 1;
             fr.ref_bit = true;
             drop(fr);
@@ -79,7 +87,9 @@ impl BufferPool {
         // Miss: find an unpinned victim via clock sweep.
         let idx = loop {
             let i = self.hand.fetch_add(1, Ordering::Relaxed) % self.frames.len();
-            let mut fr = self.frames[i].lock().unwrap();
+            let mut fr = self.frames[i]
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"));
             if fr.pins > 0 {
                 continue;
             }
@@ -125,10 +135,14 @@ impl BufferPool {
     pub fn flush_all(&self) -> std::io::Result<()> {
         let mut synced: Vec<RelFileNode> = Vec::new();
         for frame in &self.frames {
-            let mut fr = frame.lock().unwrap();
-            if fr.dirty && let Some(tag) = fr.tag {
+            let mut fr = frame.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+            if fr.dirty
+                && let Some(tag) = fr.tag
+            {
                 let lsn = page::get_lsn(&fr.data);
-                self.wal.flush(Lsn(lsn)).map_err(|e| std::io::Error::other(e.to_string()))?;
+                self.wal
+                    .flush(Lsn(lsn))
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 self.smgr.write(tag.rel, tag.block, &fr.data)?;
                 fr.dirty = false;
                 if !synced.contains(&tag.rel) {
@@ -150,9 +164,9 @@ impl BufferPool {
     /// clean and unmapped, hence reusable. (TRUNCATE remains non-transactional,
     /// as documented — this only removes the crash/aliasing.)
     pub fn forget_relation(&self, rel: RelFileNode) {
-        let mut map = self.map.lock().unwrap();
+        let mut map = self.map.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         for frame in &self.frames {
-            let mut fr = frame.lock().unwrap();
+            let mut fr = frame.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
             if fr.tag.map(|t| t.rel == rel).unwrap_or(false) {
                 if let Some(tag) = fr.tag.take() {
                     map.remove(&tag);
@@ -173,7 +187,9 @@ pub struct PinnedPage<'a> {
 
 impl<'a> PinnedPage<'a> {
     fn frame(&self) -> MutexGuard<'a, Frame> {
-        self.pool.frames[self.idx].lock().unwrap()
+        self.pool.frames[self.idx]
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
     }
 
     /// Read the page under the frame lock.
@@ -196,7 +212,9 @@ impl<'a> PinnedPage<'a> {
 
 impl Drop for PinnedPage<'_> {
     fn drop(&mut self) {
-        let mut fr = self.pool.frames[self.idx].lock().unwrap();
+        let mut fr = self.pool.frames[self.idx]
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         // saturating: a concurrent forget_relation must never drive this to
         // underflow even though it no longer resets pins.
         fr.pins = fr.pins.saturating_sub(1);
@@ -208,67 +226,79 @@ impl Drop for PinnedPage<'_> {
 mod tests {
     use super::*;
 
-    fn pool(nframes: usize) -> (tempfile::TempDir, BufferPool) {
-        let dir = tempfile::tempdir().unwrap();
-        let smgr = Arc::new(StorageManager::open(dir.path()).unwrap());
-        let wal = Arc::new(Wal::open(dir.path()).unwrap());
-        (dir, BufferPool::new(nframes, smgr, wal))
+    fn pool(nframes: usize) -> anyhow::Result<(tempfile::TempDir, BufferPool)> {
+        let dir = tempfile::tempdir()?;
+        let smgr = Arc::new(StorageManager::open(dir.path())?);
+        let wal = Arc::new(Wal::open(dir.path())?);
+        Ok((dir, BufferPool::new(nframes, smgr, wal)))
     }
 
     #[test]
-    fn fresh_pages_are_initialized_and_persist_across_eviction() {
-        let (_d, bp) = pool(2);
+    fn fresh_pages_are_initialized_and_persist_across_eviction() -> anyhow::Result<()> {
+        let (_d, bp) = pool(2)?;
         let rel = RelFileNode(1);
         // Write a marker into block 0.
         {
-            let p = bp.pin(rel, 0).unwrap();
-            p.modify(|page| page::add_item(page, b"row0").unwrap());
+            let p = bp.pin(rel, 0)?;
+            p.modify(|page| page::add_item(page, b"row0"))
+                .ok_or_else(|| anyhow::anyhow!("row0 did not fit"))?;
         }
         // Touch two more blocks to force block 0 out of the 2-frame pool.
         for b in 1..=2 {
-            let p = bp.pin(rel, b).unwrap();
-            p.modify(|page| page::add_item(page, format!("row{b}").as_bytes()).unwrap());
+            let p = bp.pin(rel, b)?;
+            p.modify(|page| page::add_item(page, format!("row{b}").as_bytes()))
+                .ok_or_else(|| anyhow::anyhow!("row did not fit"))?;
         }
-        bp.flush_all().unwrap();
+        bp.flush_all()?;
         // Re-pin block 0: it must read back its marker from disk.
-        let p = bp.pin(rel, 0).unwrap();
-        p.read(|page| assert_eq!(page::get_item(page, 1).unwrap(), b"row0"));
+        let p = bp.pin(rel, 0)?;
+        p.read(|page| assert_eq!(page::get_item(page, 1), Some(&b"row0"[..])));
+
+        Ok(())
     }
 
     #[test]
-    fn pinned_pages_are_never_evicted() {
-        let (_d, bp) = pool(2);
+    fn pinned_pages_are_never_evicted() -> anyhow::Result<()> {
+        let (_d, bp) = pool(2)?;
         let rel = RelFileNode(1);
-        let held = bp.pin(rel, 0).unwrap();
-        held.modify(|page| page::add_item(page, b"keep").unwrap());
+        let held = bp.pin(rel, 0)?;
+        held.modify(|page| page::add_item(page, b"keep"))
+            .ok_or_else(|| anyhow::anyhow!("keep row did not fit"))?;
         // Churn other blocks through the remaining frame; the pinned one survives.
         for b in 1..10 {
-            let p = bp.pin(rel, b).unwrap();
-            p.modify(|page| page::add_item(page, b"x").unwrap());
+            let p = bp.pin(rel, b)?;
+            p.modify(|page| page::add_item(page, b"x"))
+                .ok_or_else(|| anyhow::anyhow!("row did not fit"))?;
         }
-        held.read(|page| assert_eq!(page::get_item(page, 1).unwrap(), b"keep"));
+        held.read(|page| assert_eq!(page::get_item(page, 1), Some(&b"keep"[..])));
+
+        Ok(())
     }
 
     #[test]
-    fn forget_relation_while_pinned_is_safe() {
-        let (_d, bp) = pool(4);
+    fn forget_relation_while_pinned_is_safe() -> anyhow::Result<()> {
+        let (_d, bp) = pool(4)?;
         let rel = RelFileNode(1);
         // Hold a pin on block 0 while the relation is forgotten (TRUNCATE).
-        let held = bp.pin(rel, 0).unwrap();
-        held.modify(|page| page::add_item(page, b"stale").unwrap());
+        let held = bp.pin(rel, 0)?;
+        held.modify(|page| page::add_item(page, b"stale"))
+            .ok_or_else(|| anyhow::anyhow!("stale row did not fit"))?;
         bp.forget_relation(rel);
         // Churn other pins: the still-pinned frame must not be reused underneath
         // the live PinnedPage (no aliasing).
         for b in 1..8 {
-            let p = bp.pin(RelFileNode(2), b).unwrap();
-            p.modify(|page| page::add_item(page, b"other").unwrap());
+            let p = bp.pin(RelFileNode(2), b)?;
+            p.modify(|page| page::add_item(page, b"other"))
+                .ok_or_else(|| anyhow::anyhow!("row did not fit"))?;
         }
-        held.read(|page| assert_eq!(page::get_item(page, 1).unwrap(), b"stale"));
+        held.read(|page| assert_eq!(page::get_item(page, 1), Some(&b"stale"[..])));
         // Dropping the pin after forget must not underflow the pin count.
         drop(held);
         // A fresh pin of the forgotten block reads an initialized (empty) page,
         // not the stale contents.
-        let fresh = bp.pin(rel, 0).unwrap();
+        let fresh = bp.pin(rel, 0)?;
         fresh.read(|page| assert!(page::get_item(page, 1).is_none()));
+
+        Ok(())
     }
 }

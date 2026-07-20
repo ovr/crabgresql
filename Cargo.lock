@@ -62,6 +62,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "ar_archive_writer"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -244,6 +250,7 @@ dependencies = [
 name = "crabgresql-binder"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crabgresql-memory-storage",
  "crabgresql-parser",
  "crabgresql-pg-wire",
@@ -255,6 +262,7 @@ dependencies = [
 name = "crabgresql-catalog"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crabgresql-storage-api",
  "crabgresql-txn",
  "crabgresql-types",
@@ -264,6 +272,7 @@ dependencies = [
 name = "crabgresql-executor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crabgresql-binder",
  "crabgresql-memory-storage",
  "crabgresql-parser",
@@ -278,6 +287,7 @@ dependencies = [
 name = "crabgresql-memory-storage"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crabgresql-storage-api",
  "crabgresql-txn",
  "crabgresql-types",
@@ -287,6 +297,7 @@ dependencies = [
 name = "crabgresql-parser"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bigdecimal",
  "log",
  "pretty_assertions",
@@ -301,6 +312,7 @@ dependencies = [
 name = "crabgresql-pg-engine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crabgresql-storage-api",
  "crabgresql-txn",
  "crabgresql-types",
@@ -314,6 +326,7 @@ dependencies = [
 name = "crabgresql-pg-regress"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "crabgresql-memory-storage",
  "crabgresql-server",
@@ -325,6 +338,7 @@ dependencies = [
 name = "crabgresql-pg-wire"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "thiserror",
  "tokio",
@@ -345,6 +359,7 @@ dependencies = [
 name = "crabgresql-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "crabgresql-binder",
  "crabgresql-catalog",
@@ -377,11 +392,15 @@ dependencies = [
 [[package]]
 name = "crabgresql-txn"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
 
 [[package]]
 name = "crabgresql-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "jiff",
  "pg-ryu",
  "regex",
@@ -391,6 +410,7 @@ dependencies = [
 name = "crabgresql-wal"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crabgresql-txn",
  "crc32c",
  "tempfile",

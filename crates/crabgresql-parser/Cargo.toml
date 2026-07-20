@@ -6,6 +6,9 @@ version.workspace = true
 edition = "2021"
 license.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 # Upstream doc examples import `sqlparser::...`, which is no longer an external
 # crate name in this fork; skip doctests rather than rewrite every example.
@@ -23,6 +26,7 @@ sqlparser_derive = { version = "0.5.0", optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 pretty_assertions = "1"
 
 [features]

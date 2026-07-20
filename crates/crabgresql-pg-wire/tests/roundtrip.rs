@@ -13,7 +13,7 @@ use crabgresql_pg_wire::{
 use tokio::io::duplex;
 
 #[tokio::test]
-async fn frontend_messages_survive_the_wire() {
+async fn frontend_messages_survive_the_wire() -> anyhow::Result<()> {
     let (client, server) = duplex(64 * 1024);
     let mut writer = FrontendWriter::new(client);
     let mut reader = FrontendReader::new(server);
@@ -62,18 +62,20 @@ async fn frontend_messages_survive_the_wire() {
     for m in &messages {
         writer.write_message(m);
     }
-    writer.flush().await.unwrap();
+    writer.flush().await?;
     drop(writer); // close the write half so the final read hits EOF
 
-    assert_eq!(reader.read_startup().await.unwrap(), Some(startup));
+    assert_eq!(reader.read_startup().await?, Some(startup));
     for expected in &messages {
-        assert_eq!(reader.read_message().await.unwrap().as_ref(), Some(expected));
+        assert_eq!(reader.read_message().await?.as_ref(), Some(expected));
     }
-    assert!(reader.read_message().await.unwrap().is_none());
+    assert!(reader.read_message().await?.is_none());
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn backend_messages_survive_the_wire() {
+async fn backend_messages_survive_the_wire() -> anyhow::Result<()> {
     let (server, client) = duplex(64 * 1024);
     let mut writer = BackendWriter::new(server);
     let mut reader = BackendReader::new(client);
@@ -102,7 +104,7 @@ async fn backend_messages_survive_the_wire() {
         channel: "chan".to_string(),
         payload: "ping".to_string(),
     });
-    writer.flush().await.unwrap();
+    writer.flush().await?;
     drop(writer);
 
     let expected = vec![
@@ -141,7 +143,9 @@ async fn backend_messages_survive_the_wire() {
     ];
 
     for want in &expected {
-        assert_eq!(reader.read_message().await.unwrap().as_ref(), Some(want));
+        assert_eq!(reader.read_message().await?.as_ref(), Some(want));
     }
-    assert!(reader.read_message().await.unwrap().is_none());
+    assert!(reader.read_message().await?.is_none());
+
+    Ok(())
 }

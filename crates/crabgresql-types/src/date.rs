@@ -19,12 +19,12 @@
 //! (`now`/`today`/`yesterday`/`tomorrow`) need a transaction clock and are not
 //! supported — matching how `timestamp` parses today.
 
+use crate::Numeric;
 use crate::interval::Interval;
 use crate::timestamp::{
     self, POSTGRES_EPOCH_JDATE, century, date2j, days_in_month, decade, iso_week_year, j2date,
     j2day, millennium,
 };
-use crate::Numeric;
 
 // SQLSTATEs (kept as literals; the types crate does not depend on the protocol
 // crate — the binder/executor map these to `sqlstate::*`).
@@ -92,7 +92,11 @@ pub fn format(d: i32) -> String {
     }
     let (year, month, day) = j2date(d as i64 + POSTGRES_EPOCH_JDATE);
     // Years <= 0 are BC: astronomical year 0 is 1 BC, -1 is 2 BC, ...
-    let (year, bc) = if year <= 0 { (1 - year, true) } else { (year, false) };
+    let (year, bc) = if year <= 0 {
+        (1 - year, true)
+    } else {
+        (year, false)
+    };
     let body = format!("{year:04}-{month:02}-{day:02}");
     if bc { format!("{body} BC") } else { body }
 }
@@ -261,7 +265,10 @@ pub fn pl_timetz(d: i32, t: crate::TimeTz) -> Result<i64, DateError> {
 }
 
 fn from_ts_err(e: timestamp::TimestampError) -> DateError {
-    DateError { sqlstate: e.sqlstate, message: e.message }
+    DateError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+    }
 }
 
 // --- field extraction (date_part / extract) --------------------------------
@@ -322,7 +329,11 @@ pub fn date_part(unit: &str, d: i32) -> Result<Option<f64>, DateError> {
         Field::Ok(monotonic) => {
             if !is_finite(d) {
                 return Ok(if monotonic {
-                    Some(if d == POS_INFINITY { f64::INFINITY } else { f64::NEG_INFINITY })
+                    Some(if d == POS_INFINITY {
+                        f64::INFINITY
+                    } else {
+                        f64::NEG_INFINITY
+                    })
                 } else {
                     None
                 });
@@ -342,13 +353,20 @@ pub fn extract(unit: &str, d: i32) -> Result<Option<Numeric>, DateError> {
         Field::Ok(monotonic) => {
             if !is_finite(d) {
                 return Ok(if monotonic {
-                    Some(if d == POS_INFINITY { Numeric::pos_inf() } else { Numeric::neg_inf() })
+                    Some(if d == POS_INFINITY {
+                        Numeric::pos_inf()
+                    } else {
+                        Numeric::neg_inf()
+                    })
                 } else {
                     None
                 });
             }
             let v = field_value(&canon(&lu), d);
-            Ok(Some(Numeric::parse(&v.to_string()).expect("integer literal is valid numeric")))
+            match Numeric::parse(&v.to_string()) {
+                Ok(value) => Ok(Some(value)),
+                Err(_) => panic!("integer date field must form a valid numeric literal"),
+            }
         }
     }
 }
@@ -431,7 +449,10 @@ mod tests {
     use super::*;
 
     fn d(s: &str) -> i32 {
-        parse(s).unwrap()
+        match parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid date test fixture `{s}`: {error:?}"),
+        }
     }
 
     #[test]
@@ -452,29 +473,35 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic() {
-        assert_eq!(sub_date(d("2020-01-02"), d("2020-01-01")).unwrap(), 1);
-        assert_eq!(format(add_days(d("2020-01-01"), 31).unwrap()), "2020-02-01");
-        assert_eq!(format(add_days(POS_INFINITY, 5).unwrap()), "infinity");
+    fn arithmetic() -> anyhow::Result<()> {
+        assert_eq!(sub_date(d("2020-01-02"), d("2020-01-01"))?, 1);
+        assert_eq!(format(add_days(d("2020-01-01"), 31)?), "2020-02-01");
+        assert_eq!(format(add_days(POS_INFINITY, 5)?), "infinity");
+
+        Ok(())
     }
 
     #[test]
-    fn extract_fields() {
-        assert_eq!(date_part("year", d("2020-08-11")).unwrap(), Some(2020.0));
-        assert_eq!(date_part("doy", d("2020-08-11")).unwrap(), Some(224.0));
-        assert_eq!(date_part("epoch", d("2020-08-11")).unwrap(), Some(1_597_104_000.0));
-        assert_eq!(date_part("julian", d("2020-08-11")).unwrap(), Some(2_459_073.0));
+    fn extract_fields() -> anyhow::Result<()> {
+        assert_eq!(date_part("year", d("2020-08-11"))?, Some(2020.0));
+        assert_eq!(date_part("doy", d("2020-08-11"))?, Some(224.0));
+        assert_eq!(date_part("epoch", d("2020-08-11"))?, Some(1_597_104_000.0));
+        assert_eq!(date_part("julian", d("2020-08-11"))?, Some(2_459_073.0));
         assert!(date_part("hour", d("2020-08-11")).is_err());
         assert!(date_part("bogus", d("2020-08-11")).is_err());
-        assert_eq!(date_part("day", POS_INFINITY).unwrap(), None);
-        assert_eq!(date_part("year", POS_INFINITY).unwrap(), Some(f64::INFINITY));
+        assert_eq!(date_part("day", POS_INFINITY)?, None);
+        assert_eq!(date_part("year", POS_INFINITY)?, Some(f64::INFINITY));
+
+        Ok(())
     }
 
     #[test]
-    fn make_date_ok_and_err() {
-        assert_eq!(format(make_date(2013, 7, 15).unwrap()), "2013-07-15");
-        assert_eq!(format(make_date(-44, 3, 15).unwrap()), "0044-03-15 BC");
+    fn make_date_ok_and_err() -> anyhow::Result<()> {
+        assert_eq!(format(make_date(2013, 7, 15)?), "2013-07-15");
+        assert_eq!(format(make_date(-44, 3, 15)?), "0044-03-15 BC");
         assert!(make_date(0, 7, 15).is_err());
         assert!(make_date(2013, 2, 30).is_err());
+
+        Ok(())
     }
 }

@@ -20,6 +20,18 @@ const CONTROL_FILE: &str = "pg_control";
 const MAGIC: u32 = 0xCA6D_0001;
 const VERSION: u32 = 1;
 
+fn read_u32(bytes: &[u8], start: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(start..start + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_u64(bytes: &[u8], start: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(start..start + 8)?.try_into().ok()?,
+    ))
+}
+
 pub fn control_path(dir: &Path) -> PathBuf {
     dir.join(CONTROL_SUBDIR).join(CONTROL_FILE)
 }
@@ -43,18 +55,29 @@ pub fn read_control(dir: &Path) -> Result<Option<ControlFile>, WalError> {
     if bytes.len() < 24 {
         return Ok(None);
     }
-    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let Some(magic) = read_u32(&bytes, 0) else {
+        return Ok(None);
+    };
+    let Some(version) = read_u32(&bytes, 4) else {
+        return Ok(None);
+    };
     if magic != MAGIC || version != VERSION {
         return Ok(None);
     }
-    let crc_stored = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+    let Some(crc_stored) = read_u32(&bytes, 20) else {
+        return Ok(None);
+    };
     if crc32c::crc32c(&bytes[0..20]) != crc_stored {
         return Ok(None);
     }
-    let next_xid = Xid(u64::from_le_bytes(bytes[8..16].try_into().unwrap()));
+    let Some(next_xid) = read_u64(&bytes, 8).map(Xid) else {
+        return Ok(None);
+    };
     let clean_shutdown = bytes[16] != 0;
-    Ok(Some(ControlFile { next_xid, clean_shutdown }))
+    Ok(Some(ControlFile {
+        next_xid,
+        clean_shutdown,
+    }))
 }
 
 /// Atomically replace `pg_control`: write a temp file, fsync it, rename over the
@@ -91,11 +114,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_and_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_control(dir.path()).unwrap(), None);
-        let ctl = ControlFile { next_xid: Xid(1234), clean_shutdown: true };
-        write_control(dir.path(), &ctl).unwrap();
-        assert_eq!(read_control(dir.path()).unwrap(), Some(ctl));
+    fn roundtrip_and_absent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(read_control(dir.path())?, None);
+        let ctl = ControlFile {
+            next_xid: Xid(1234),
+            clean_shutdown: true,
+        };
+        write_control(dir.path(), &ctl)?;
+        assert_eq!(read_control(dir.path())?, Some(ctl));
+
+        Ok(())
     }
 }

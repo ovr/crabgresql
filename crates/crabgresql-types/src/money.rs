@@ -51,7 +51,10 @@ fn out_of_range() -> MoneyError {
 }
 
 fn division_by_zero() -> MoneyError {
-    MoneyError { sqlstate: DIVISION_BY_ZERO, message: "division by zero".to_string() }
+    MoneyError {
+        sqlstate: DIVISION_BY_ZERO,
+        message: "division by zero".to_string(),
+    }
 }
 
 /// `cash_in`: parse money input text into a count of hundredths.
@@ -109,7 +112,9 @@ pub fn parse(input: &str) -> Result<i64, MoneyError> {
                 if in_frac {
                     match frac_digits {
                         0 | 1 => {
-                            mag = mag.checked_mul(10).and_then(|m| m.checked_add(d))
+                            mag = mag
+                                .checked_mul(10)
+                                .and_then(|m| m.checked_add(d))
                                 .ok_or_else(|| value_out_of_range(input))?;
                             frac_digits += 1;
                         }
@@ -124,7 +129,9 @@ pub fn parse(input: &str) -> Result<i64, MoneyError> {
                         _ => {}
                     }
                 } else {
-                    mag = mag.checked_mul(10).and_then(|m| m.checked_add(d))
+                    mag = mag
+                        .checked_mul(10)
+                        .and_then(|m| m.checked_add(d))
                         .ok_or_else(|| value_out_of_range(input))?;
                 }
             }
@@ -159,7 +166,9 @@ pub fn parse(input: &str) -> Result<i64, MoneyError> {
 
     // Scale up to exactly two fractional places, then apply the rounding.
     while frac_digits < 2 {
-        mag = mag.checked_mul(10).ok_or_else(|| value_out_of_range(input))?;
+        mag = mag
+            .checked_mul(10)
+            .ok_or_else(|| value_out_of_range(input))?;
         frac_digits += 1;
     }
     if round_up {
@@ -283,18 +292,39 @@ fn float_to_cents(v: f64) -> Result<i64, MoneyError> {
 // ---- cash_words -----------------------------------------------------------
 
 const ONES: [&str; 20] = [
-    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
-    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
-    "sixteen", "seventeen", "eighteen", "nineteen",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
 ];
 const TENS: [&str; 10] = [
-    "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty",
-    "ninety",
+    "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
 ];
 // Scale names for successive groups of three digits. `i64` dollars reach ~9.2e16
 // (ten-quadrillions), so quadrillion suffices; quintillion is kept for headroom.
 const SCALES: [&str; 7] = [
-    "", " thousand", " million", " billion", " trillion", " quadrillion",
+    "",
+    " thousand",
+    " million",
+    " billion",
+    " trillion",
+    " quadrillion",
     " quintillion",
 ];
 
@@ -312,7 +342,11 @@ pub fn words(cents: i64) -> String {
         s.push_str("minus ");
     }
     s.push_str(&spell(dollars));
-    s.push_str(if dollars == 1 { " dollar and " } else { " dollars and " });
+    s.push_str(if dollars == 1 {
+        " dollar and "
+    } else {
+        " dollars and "
+    });
     s.push_str(&spell(cents_part));
     s.push_str(if cents_part == 1 { " cent" } else { " cents" });
 
@@ -371,6 +405,7 @@ fn spell_three(n: u16) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -416,10 +451,19 @@ mod tests {
         assert_eq!(parse("92233720368547758.07"), Ok(i64::MAX));
         assert_eq!(parse("-92233720368547758.08"), Ok(i64::MIN));
         assert_eq!(parse("92233720368547758.08").unwrap_err().sqlstate, "22003");
-        assert_eq!(parse("-92233720368547758.09").unwrap_err().sqlstate, "22003");
+        assert_eq!(
+            parse("-92233720368547758.09").unwrap_err().sqlstate,
+            "22003"
+        );
         // Rounding into overflow.
-        assert_eq!(parse("92233720368547758.075").unwrap_err().sqlstate, "22003");
-        assert_eq!(parse("-92233720368547758.085").unwrap_err().sqlstate, "22003");
+        assert_eq!(
+            parse("92233720368547758.075").unwrap_err().sqlstate,
+            "22003"
+        );
+        assert_eq!(
+            parse("-92233720368547758.085").unwrap_err().sqlstate,
+            "22003"
+        );
     }
 
     #[test]
@@ -440,7 +484,10 @@ mod tests {
 
     #[test]
     fn words_match_spec() {
-        assert_eq!(words(12300), "One hundred twenty three dollars and zero cents");
+        assert_eq!(
+            words(12300),
+            "One hundred twenty three dollars and zero cents"
+        );
         assert_eq!(
             words(12423),
             "One hundred twenty four dollars and twenty three cents"
@@ -470,7 +517,13 @@ mod tests {
     #[test]
     fn overflow_arithmetic() {
         assert_eq!(add(i64::MAX, 1).unwrap_err().message, "money out of range");
-        assert_eq!(mul_float(4200, f64::NAN).unwrap_err().message, "money out of range");
-        assert_eq!(mul_float(4200, f64::INFINITY).unwrap_err().message, "money out of range");
+        assert_eq!(
+            mul_float(4200, f64::NAN).unwrap_err().message,
+            "money out of range"
+        );
+        assert_eq!(
+            mul_float(4200, f64::INFINITY).unwrap_err().message,
+            "money out of range"
+        );
     }
 }

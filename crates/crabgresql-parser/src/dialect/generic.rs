@@ -73,7 +73,6 @@ impl Dialect for GenericDialect {
         true
     }
 
-
     fn supports_start_transaction_modifier(&self) -> bool {
         true
     }
@@ -246,9 +245,6 @@ impl Dialect for GenericDialect {
         true
     }
 
-
-
-
     fn supports_prewhere(&self) -> bool {
         true
     }
@@ -268,7 +264,6 @@ impl Dialect for GenericDialect {
     fn supports_settings(&self) -> bool {
         true
     }
-
 
     fn supports_comment_optimizer_hint(&self) -> bool {
         true

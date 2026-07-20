@@ -165,15 +165,25 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         }
 
         // ---- text → scalar (input functions) ----
-        (Value::Text(s), PgType::Float4) => float::float4in(s)
-            .map(Value::Float4)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
-        (Value::Text(s), PgType::Float8) => float::float8in(s)
-            .map(Value::Float8)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
-        (Value::Text(s), PgType::Numeric) => {
-            Numeric::parse(s).map(Value::Numeric).map_err(|e| numeric_parse_error(e, s))
+        (Value::Text(s), PgType::Float4) => {
+            float::float4in(s)
+                .map(Value::Float4)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
         }
+        (Value::Text(s), PgType::Float8) => {
+            float::float8in(s)
+                .map(Value::Float8)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        (Value::Text(s), PgType::Numeric) => Numeric::parse(s)
+            .map(Value::Numeric)
+            .map_err(|e| numeric_parse_error(e, s)),
 
         // ---- numeric → float ----
         (Value::Numeric(n), PgType::Float4) => Ok(Value::Float4(n.to_f64() as f32)),
@@ -188,19 +198,32 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             .ok_or_else(|| invalid_input(PgType::Bool, s)),
 
         // ---- text → timestamp (timestamp_in) ----
-        (Value::Text(s), PgType::Timestamp) => timestamp::parse(s)
-            .map(Value::Timestamp)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Timestamp) => {
+            timestamp::parse(s)
+                .map(Value::Timestamp)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
 
         // ---- text → interval (interval_in) ----
-        (Value::Text(s), PgType::Interval) => interval::parse(s)
-            .map(Value::Interval)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Interval) => {
+            interval::parse(s)
+                .map(Value::Interval)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
 
         // ---- text → timestamptz (timestamptz_in) ----
         (Value::Text(s), PgType::TimestampTz) => timestamptz::parse(s)
             .map(Value::TimestampTz)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
 
         // ---- timestamp ↔ timestamptz ----
         // With the session zone fixed to UTC these are an identity on the raw
@@ -213,41 +236,55 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::TimestampTz(m), PgType::Timestamp) => Ok(Value::Timestamp(*m)),
 
         // ---- text → date / time / timetz (input functions) ----
-        (Value::Text(s), PgType::Date) => date::parse(s)
-            .map(Value::Date)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
-        (Value::Text(s), PgType::Time) => time::parse(s)
-            .map(Value::Time)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
-        (Value::Text(s), PgType::TimeTz) => timetz::parse(s)
-            .map(Value::TimeTz)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Date) => date::parse(s).map(Value::Date).map_err(|e| CastError {
+            sqlstate: e.sqlstate,
+            message: e.message,
+        }),
+        (Value::Text(s), PgType::Time) => time::parse(s).map(Value::Time).map_err(|e| CastError {
+            sqlstate: e.sqlstate,
+            message: e.message,
+        }),
+        (Value::Text(s), PgType::TimeTz) => {
+            timetz::parse(s).map(Value::TimeTz).map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            })
+        }
 
         // ---- date ↔ timestamp / timestamptz ----
         // A date widens to midnight; the UTC identity (session zone is UTC)
         // carries it to timestamptz too. The reverse takes the calendar date.
         (Value::Date(d), PgType::Timestamp) => date::to_timestamp_micros(*d)
             .map(Value::Timestamp)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
         (Value::Date(d), PgType::TimestampTz) => date::to_timestamp_micros(*d)
             .map(Value::TimestampTz)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
         (Value::Timestamp(m), PgType::Date) => Ok(Value::Date(date::from_timestamp_micros(*m))),
         (Value::TimestampTz(m), PgType::Date) => Ok(Value::Date(date::from_timestamp_micros(*m))),
 
         // ---- time ↔ interval ----
         // time → interval keeps the microseconds as the time-of-day span;
         // interval → time takes the time-of-day part (mod one day).
-        (Value::Time(usec), PgType::Interval) => {
-            Ok(Value::Interval(Interval { months: 0, days: 0, usec: *usec }))
-        }
-        (Value::Interval(iv), PgType::Time) => {
-            Ok(Value::Time(iv.usec.rem_euclid(86_400_000_000)))
-        }
+        (Value::Time(usec), PgType::Interval) => Ok(Value::Interval(Interval {
+            months: 0,
+            days: 0,
+            usec: *usec,
+        })),
+        (Value::Interval(iv), PgType::Time) => Ok(Value::Time(iv.usec.rem_euclid(86_400_000_000))),
 
         // ---- time ↔ timetz ----
         // time → timetz attaches the session zone (UTC); timetz → time drops it.
-        (Value::Time(usec), PgType::TimeTz) => Ok(Value::TimeTz(TimeTz { usec: *usec, zone: 0 })),
+        (Value::Time(usec), PgType::TimeTz) => Ok(Value::TimeTz(TimeTz {
+            usec: *usec,
+            zone: 0,
+        })),
         (Value::TimeTz(v), PgType::Time) => Ok(Value::Time(v.usec)),
 
         // ---- integer → numeric (exact) ----
@@ -258,7 +295,9 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- float → numeric ----
         // PG's float→numeric keeps DBL_DIG (15) / FLT_DIG (6) significant digits
         // and always prints numeric in plain decimal.
-        (Value::Float4(f), PgType::Numeric) => Ok(Value::Numeric(Numeric::from_f64_sig(*f as f64, 6))),
+        (Value::Float4(f), PgType::Numeric) => {
+            Ok(Value::Numeric(Numeric::from_f64_sig(*f as f64, 6)))
+        }
         (Value::Float8(f), PgType::Numeric) => Ok(Value::Numeric(Numeric::from_f64_sig(*f, 15))),
 
         // ---- numeric → integer (round half away from zero + range check) ----
@@ -272,7 +311,10 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- text → bit / varbit (bit_in / varbit_in) ----
         (Value::Text(s), PgType::Bit | PgType::Varbit) => crate::bit::input(s)
             .map(|(len, data)| Value::Bit { len, data })
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
 
         // ---- bit ↔ varbit: identity on the value (they share the storage);
         // any length rule is applied separately as a typmod coercion. ----
@@ -282,25 +324,43 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Text(s), PgType::Bytea) => byteain(s).map(Value::Bytea),
 
         // ---- text → uuid (uuid_in) ----
-        (Value::Text(s), PgType::Uuid) => crate::uuid::parse(s)
-            .map(Value::Uuid)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Uuid) => {
+            crate::uuid::parse(s)
+                .map(Value::Uuid)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
 
         // ---- text → inet / cidr (inet_in / cidr_in) ----
-        (Value::Text(s), PgType::Inet) => crate::net::inet_in(s)
-            .map(Value::Inet)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
-        (Value::Text(s), PgType::Cidr) => crate::net::cidr_in(s)
-            .map(Value::Cidr)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Inet) => {
+            crate::net::inet_in(s)
+                .map(Value::Inet)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        (Value::Text(s), PgType::Cidr) => {
+            crate::net::cidr_in(s)
+                .map(Value::Cidr)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
 
         // ---- cidr → inet (implicit in PG; the network keeps its masklen) ----
         (Value::Cidr(v), PgType::Inet) => Ok(Value::Inet(*v)),
 
         // ---- text → money (cash_in): $, thousands, parentheses-as-negative ----
-        (Value::Text(s), PgType::Money) => money::parse(s)
-            .map(Value::Money)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Money) => {
+            money::parse(s).map(Value::Money).map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            })
+        }
 
         // ---- int4/int8/numeric → money (whole units scaled to hundredths) ----
         // PG has no int2 → money cast; int2 literals reach money after widening
@@ -336,24 +396,43 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // ---- text → macaddr / macaddr8 (macaddr_in / macaddr8_in) ----
         (Value::Text(s), PgType::Macaddr) => crate::macaddr::parse_macaddr(s)
             .map(Value::Macaddr)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
         (Value::Text(s), PgType::Macaddr8) => crate::macaddr::parse_macaddr8(s)
             .map(Value::Macaddr8)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
 
         // ---- macaddr <-> macaddr8 ----
         (Value::Macaddr(b), PgType::Macaddr8) => Ok(Value::Macaddr8(crate::macaddr::expand6to8(b))),
         (Value::Macaddr8(b), PgType::Macaddr) => crate::macaddr::narrow8to6(b)
             .map(Value::Macaddr)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
 
         // ---- text → point / lseg (point_in / lseg_in) ----
-        (Value::Text(s), PgType::Point) => crate::geo::parse_point(s)
-            .map(Value::Point)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
-        (Value::Text(s), PgType::Lseg) => crate::geo::parse_lseg(s)
-            .map(Value::Lseg)
-            .map_err(|e| CastError { sqlstate: e.sqlstate, message: e.message }),
+        (Value::Text(s), PgType::Point) => {
+            crate::geo::parse_point(s)
+                .map(Value::Point)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        (Value::Text(s), PgType::Lseg) => {
+            crate::geo::parse_lseg(s)
+                .map(Value::Lseg)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
 
         // ---- lseg → point (lseg_center): the segment's midpoint ----
         (Value::Lseg(l), PgType::Point) => Ok(Value::Point(crate::geo::lseg_center(l))),
@@ -378,14 +457,21 @@ fn numeric_to_money(n: &Numeric) -> Result<Value, CastError> {
         .round(0)
         .to_i128()
         .ok_or_else(|| out_of_range(PgType::Money))?;
-    i64::try_from(cents).map(Value::Money).map_err(|_| out_of_range(PgType::Money))
+    i64::try_from(cents)
+        .map(Value::Money)
+        .map_err(|_| out_of_range(PgType::Money))
 }
 
 /// `cash_numeric`: exact value `cents / 100` rendered with display scale 2
 /// (built from text so the scale is always two, e.g. `123.00`).
 fn money_to_numeric(cents: i64) -> Numeric {
     let mag = (cents as i128).unsigned_abs();
-    let s = format!("{}{}.{:02}", if cents < 0 { "-" } else { "" }, mag / 100, mag % 100);
+    let s = format!(
+        "{}{}.{:02}",
+        if cents < 0 { "-" } else { "" },
+        mag / 100,
+        mag % 100
+    );
     Numeric::parse(&s).expect("money renders to a valid numeric")
 }
 
@@ -440,8 +526,7 @@ pub fn byteain(s: &str) -> Result<Vec<u8>, CastError> {
                 let (Some(&d1), Some(&d2)) = (bytes.get(i + 2), bytes.get(i + 3)) else {
                     return Err(invalid_input(PgType::Bytea, s));
                 };
-                let (Some(o0), Some(o1), Some(o2)) =
-                    (octal_val(c), octal_val(d1), octal_val(d2))
+                let (Some(o0), Some(o1), Some(o2)) = (octal_val(c), octal_val(d1), octal_val(d2))
                 else {
                     return Err(invalid_input(PgType::Bytea, s));
                 };
@@ -517,7 +602,12 @@ pub fn text_to_oid(s: &str) -> Result<Value, CastError> {
         Ok(n) if oid_in_range(n) => Ok(Value::Oid(n as u32)),
         // Parsed as a number but too large/small to be a 32-bit oid.
         Ok(_) => Err(value_out_of_range(PgType::Oid, s)),
-        Err(e) if matches!(e.kind(), IntErrorKind::PosOverflow | IntErrorKind::NegOverflow) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                IntErrorKind::PosOverflow | IntErrorKind::NegOverflow
+            ) =>
+        {
             Err(value_out_of_range(PgType::Oid, s))
         }
         Err(_) => Err(invalid_input(PgType::Oid, s)),
@@ -553,9 +643,15 @@ fn numeric_to_int(n: &Numeric, ty: PgType) -> Result<Value, CastError> {
     }
     let v = n.to_i128().ok_or_else(|| out_of_range(ty))?;
     match ty {
-        PgType::Int2 => i16::try_from(v).map(Value::Int2).map_err(|_| out_of_range(ty)),
-        PgType::Int4 => i32::try_from(v).map(Value::Int4).map_err(|_| out_of_range(ty)),
-        PgType::Int8 => i64::try_from(v).map(Value::Int8).map_err(|_| out_of_range(ty)),
+        PgType::Int2 => i16::try_from(v)
+            .map(Value::Int2)
+            .map_err(|_| out_of_range(ty)),
+        PgType::Int4 => i32::try_from(v)
+            .map(Value::Int4)
+            .map_err(|_| out_of_range(ty)),
+        PgType::Int8 => i64::try_from(v)
+            .map(Value::Int8)
+            .map_err(|_| out_of_range(ty)),
         _ => unreachable!("numeric_to_int called with {ty:?}"),
     }
 }
@@ -595,67 +691,82 @@ pub fn reinterpret_value(v: Value, rep: PgType) -> Result<Value, CastError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
-    fn byteain_escape_and_hex() {
+    fn byteain_escape_and_hex() -> anyhow::Result<()> {
         // Plain ASCII (escape format, no backslashes) passes through.
-        assert_eq!(byteain("abc").unwrap(), b"abc");
-        assert_eq!(byteain("").unwrap(), b"");
+        assert_eq!(byteain("abc")?, b"abc");
+        assert_eq!(byteain("")?, b"");
         // Escape sequences.
-        assert_eq!(byteain("\\\\").unwrap(), b"\\");
-        assert_eq!(byteain("a\\001b").unwrap(), vec![b'a', 1, b'b']);
+        assert_eq!(byteain("\\\\")?, b"\\");
+        assert_eq!(byteain("a\\001b")?, vec![b'a', 1, b'b']);
         // Hex format, with whitespace between pairs ignored (matches PG).
-        assert_eq!(byteain("\\xdead").unwrap(), vec![0xde, 0xad]);
-        assert_eq!(byteain("\\xDE AD").unwrap(), vec![0xde, 0xad]);
-        assert_eq!(byteain("\\x").unwrap(), b"");
+        assert_eq!(byteain("\\xdead")?, vec![0xde, 0xad]);
+        assert_eq!(byteain("\\xDE AD")?, vec![0xde, 0xad]);
+        assert_eq!(byteain("\\x")?, b"");
         // Malformed input is 22P02.
         assert_eq!(byteain("\\xabc").unwrap_err().sqlstate, "22P02"); // odd nibbles
         assert_eq!(byteain("\\xzz").unwrap_err().sqlstate, "22P02"); // non-hex
         assert_eq!(byteain("\\x a b").unwrap_err().sqlstate, "22P02"); // mid-byte space
         assert_eq!(byteain("\\9").unwrap_err().sqlstate, "22P02"); // bad escape
         assert_eq!(byteain("\\").unwrap_err().sqlstate, "22P02"); // dangling backslash
+
+        Ok(())
     }
 
     #[test]
-    fn float_to_int_edges() {
+    fn float_to_int_edges() -> anyhow::Result<()> {
         assert_eq!(
-            cast_value(Value::Float4(32767.4), PgType::Int2, 1).unwrap(),
+            cast_value(Value::Float4(32767.4), PgType::Int2, 1)?,
             Value::Int2(32767)
         );
         assert_eq!(
-            cast_value(Value::Float4(32767.6), PgType::Int2, 1).unwrap_err().message,
+            cast_value(Value::Float4(32767.6), PgType::Int2, 1)
+                .unwrap_err()
+                .message,
             "smallint out of range"
         );
         // f32 of 2147483647 rounds up to 2^31, out of int4 range.
         assert_eq!(
-            cast_value(Value::Float4(2147483647.0), PgType::Int4, 1).unwrap_err().sqlstate,
+            cast_value(Value::Float4(2147483647.0), PgType::Int4, 1)
+                .unwrap_err()
+                .sqlstate,
             "22003"
         );
         assert_eq!(
-            cast_value(Value::Float8(-9223372036854775808.5), PgType::Int8, 1).unwrap(),
+            cast_value(Value::Float8(-9223372036854775808.5), PgType::Int8, 1)?,
             Value::Int8(i64::MIN)
         );
+
+        Ok(())
     }
 
     #[test]
     fn float8_to_float4_range() {
         assert_eq!(
-            cast_value(Value::Float8(1e70), PgType::Float4, 1).unwrap_err().message,
+            cast_value(Value::Float8(1e70), PgType::Float4, 1)
+                .unwrap_err()
+                .message,
             "value out of range: overflow"
         );
         assert_eq!(
-            cast_value(Value::Float8(1e-70), PgType::Float4, 1).unwrap_err().message,
+            cast_value(Value::Float8(1e-70), PgType::Float4, 1)
+                .unwrap_err()
+                .message,
             "value out of range: underflow"
         );
     }
 
     #[test]
-    fn numeric_nan_to_float() {
-        let n = cast_value(Value::Text("nan".into()), PgType::Numeric, 1).unwrap();
-        let f = cast_value(n, PgType::Float4, 1).unwrap();
+    fn numeric_nan_to_float() -> anyhow::Result<()> {
+        let n = cast_value(Value::Text("nan".into()), PgType::Numeric, 1)?;
+        let f = cast_value(n, PgType::Float4, 1)?;
         assert_eq!(f.encode_text_with(1).as_deref(), Some("NaN"));
+
+        Ok(())
     }
 
     #[test]
@@ -671,13 +782,13 @@ mod tests {
     }
 
     #[test]
-    fn text_to_int_ok_and_errors() {
+    fn text_to_int_ok_and_errors() -> anyhow::Result<()> {
         assert_eq!(
-            cast(Value::Text("  123 ".into()), PgType::Int4).unwrap(),
+            cast(Value::Text("  123 ".into()), PgType::Int4)?,
             Value::Int4(123)
         );
         assert_eq!(
-            cast(Value::Text("-9".into()), PgType::Int8).unwrap(),
+            cast(Value::Text("-9".into()), PgType::Int8)?,
             Value::Int8(-9)
         );
         // Malformed (including a decimal) is 22P02, echoing the original text.
@@ -688,35 +799,63 @@ mod tests {
         // with the target type's name.
         let e = cast(Value::Text("99999999999".into()), PgType::Int4).unwrap_err();
         assert_eq!(e.sqlstate, "22003");
-        assert_eq!(e.message, "value \"99999999999\" is out of range for type integer");
+        assert_eq!(
+            e.message,
+            "value \"99999999999\" is out of range for type integer"
+        );
         let e = cast(Value::Text("99999".into()), PgType::Int2).unwrap_err();
-        assert_eq!(e.message, "value \"99999\" is out of range for type smallint");
+        assert_eq!(
+            e.message,
+            "value \"99999\" is out of range for type smallint"
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn text_to_bool_ok_and_error() {
-        assert_eq!(cast(Value::Text("t".into()), PgType::Bool).unwrap(), Value::Bool(true));
-        assert_eq!(cast(Value::Text("no".into()), PgType::Bool).unwrap(), Value::Bool(false));
-        assert_eq!(cast(Value::Text("on".into()), PgType::Bool).unwrap(), Value::Bool(true));
+    fn text_to_bool_ok_and_error() -> anyhow::Result<()> {
+        assert_eq!(
+            cast(Value::Text("t".into()), PgType::Bool)?,
+            Value::Bool(true)
+        );
+        assert_eq!(
+            cast(Value::Text("no".into()), PgType::Bool)?,
+            Value::Bool(false)
+        );
+        assert_eq!(
+            cast(Value::Text("on".into()), PgType::Bool)?,
+            Value::Bool(true)
+        );
         let e = cast(Value::Text("x".into()), PgType::Bool).unwrap_err();
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(e.message, "invalid input syntax for type boolean: \"x\"");
+
+        Ok(())
     }
 
     #[test]
-    fn int_to_numeric_is_exact() {
+    fn int_to_numeric_is_exact() -> anyhow::Result<()> {
         assert_eq!(
-            cast(Value::Int4(5), PgType::Numeric).unwrap(),
+            cast(Value::Int4(5), PgType::Numeric)?,
             Value::Numeric(Numeric::from_i128(5))
         );
         assert_eq!(
-            cast(Value::Int8(-9), PgType::Numeric).unwrap(),
+            cast(Value::Int8(-9), PgType::Numeric)?,
             Value::Numeric(Numeric::from_i128(-9))
         );
+
+        Ok(())
     }
 
     fn num_text(v: Value, to: PgType) -> String {
-        cast(v, to).unwrap().encode_text_with(1).unwrap()
+        let value = match cast(v, to) {
+            Ok(value) => value,
+            Err(error) => panic!("numeric test cast failed: {error:?}"),
+        };
+        match value.encode_text_with(1) {
+            Some(text) => text,
+            None => panic!("numeric test value has no text encoding"),
+        }
     }
 
     #[test]
@@ -724,38 +863,55 @@ mod tests {
         // 15 significant digits for float8, plain decimal, no exponent.
         assert_eq!(num_text(Value::Float8(1.5), PgType::Numeric), "1.5");
         assert_eq!(num_text(Value::Float8(1.1), PgType::Numeric), "1.1");
-        assert_eq!(num_text(Value::Float8(2.0 / 3.0), PgType::Numeric), "0.666666666666667");
+        assert_eq!(
+            num_text(Value::Float8(2.0 / 3.0), PgType::Numeric),
+            "0.666666666666667"
+        );
         assert_eq!(num_text(Value::Float8(100.0), PgType::Numeric), "100");
-        assert_eq!(num_text(Value::Float8(1e20), PgType::Numeric), "100000000000000000000");
+        assert_eq!(
+            num_text(Value::Float8(1e20), PgType::Numeric),
+            "100000000000000000000"
+        );
         assert_eq!(num_text(Value::Float8(0.0015), PgType::Numeric), "0.0015");
         assert_eq!(num_text(Value::Float8(-0.0), PgType::Numeric), "0");
         // 6 significant digits for float4.
         assert_eq!(num_text(Value::Float4(123.456), PgType::Numeric), "123.456");
         assert_eq!(num_text(Value::Float4(0.1), PgType::Numeric), "0.1");
         // Non-finite carry through as numeric's own spellings.
-        assert_eq!(num_text(Value::Float8(f64::INFINITY), PgType::Numeric), "Infinity");
-        assert_eq!(num_text(Value::Float8(f64::NEG_INFINITY), PgType::Numeric), "-Infinity");
+        assert_eq!(
+            num_text(Value::Float8(f64::INFINITY), PgType::Numeric),
+            "Infinity"
+        );
+        assert_eq!(
+            num_text(Value::Float8(f64::NEG_INFINITY), PgType::Numeric),
+            "-Infinity"
+        );
         assert_eq!(num_text(Value::Float8(f64::NAN), PgType::Numeric), "NaN");
     }
 
     fn numeric(s: &str) -> Value {
-        Value::Numeric(Numeric::parse(s).unwrap())
+        match Numeric::parse(s) {
+            Ok(value) => Value::Numeric(value),
+            Err(error) => panic!("invalid numeric test fixture `{s}`: {error:?}"),
+        }
     }
 
     #[test]
-    fn numeric_to_int_rounds_half_away_from_zero() {
-        assert_eq!(cast(numeric("0.5"), PgType::Int4).unwrap(), Value::Int4(1));
-        assert_eq!(cast(numeric("1.5"), PgType::Int4).unwrap(), Value::Int4(2));
-        assert_eq!(cast(numeric("2.5"), PgType::Int4).unwrap(), Value::Int4(3));
-        assert_eq!(cast(numeric("-2.5"), PgType::Int4).unwrap(), Value::Int4(-3));
-        assert_eq!(cast(numeric("2.4"), PgType::Int4).unwrap(), Value::Int4(2));
-        assert_eq!(cast(numeric("2.6"), PgType::Int4).unwrap(), Value::Int4(3));
-        assert_eq!(cast(numeric("1e3"), PgType::Int4).unwrap(), Value::Int4(1000));
+    fn numeric_to_int_rounds_half_away_from_zero() -> anyhow::Result<()> {
+        assert_eq!(cast(numeric("0.5"), PgType::Int4)?, Value::Int4(1));
+        assert_eq!(cast(numeric("1.5"), PgType::Int4)?, Value::Int4(2));
+        assert_eq!(cast(numeric("2.5"), PgType::Int4)?, Value::Int4(3));
+        assert_eq!(cast(numeric("-2.5"), PgType::Int4)?, Value::Int4(-3));
+        assert_eq!(cast(numeric("2.4"), PgType::Int4)?, Value::Int4(2));
+        assert_eq!(cast(numeric("2.6"), PgType::Int4)?, Value::Int4(3));
+        assert_eq!(cast(numeric("1e3"), PgType::Int4)?, Value::Int4(1000));
         // Exact large int8 survives the i128 accumulator without precision loss.
         assert_eq!(
-            cast(numeric("9223372036854775807"), PgType::Int8).unwrap(),
+            cast(numeric("9223372036854775807"), PgType::Int8)?,
             Value::Int8(i64::MAX)
         );
+
+        Ok(())
     }
 
     #[test]
@@ -763,7 +919,10 @@ mod tests {
         let e = cast(numeric("99999999999"), PgType::Int4).unwrap_err();
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(e.message, "integer out of range");
-        assert_eq!(cast(numeric("1e30"), PgType::Int8).unwrap_err().message, "bigint out of range");
+        assert_eq!(
+            cast(numeric("1e30"), PgType::Int8).unwrap_err().message,
+            "bigint out of range"
+        );
         let e = cast(Value::Numeric(Numeric::nan()), PgType::Int4).unwrap_err();
         assert_eq!(e.sqlstate, "0A000");
         assert_eq!(e.message, "cannot convert NaN to integer");
@@ -792,24 +951,32 @@ mod tests {
     }
 
     fn bits(s: &str) -> Value {
-        let (len, data) = crate::bit::from_binary(s).unwrap();
+        let (len, data) = match crate::bit::from_binary(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid bit-string test fixture `{s}`: {error:?}"),
+        };
         Value::Bit { len, data }
     }
 
     #[test]
-    fn bit_to_int_reinterprets_width() {
-        assert_eq!(cast(bits("101"), PgType::Int4).unwrap(), Value::Int4(5));
-        assert_eq!(cast(bits("1111"), PgType::Int4).unwrap(), Value::Int4(15));
+    fn bit_to_int_reinterprets_width() -> anyhow::Result<()> {
+        assert_eq!(cast(bits("101"), PgType::Int4)?, Value::Int4(5));
+        assert_eq!(cast(bits("1111"), PgType::Int4)?, Value::Int4(15));
         // 32 set bits fill int4's width → two's-complement -1.
-        assert_eq!(cast(bits(&"1".repeat(32)), PgType::Int4).unwrap(), Value::Int4(-1));
+        assert_eq!(cast(bits(&"1".repeat(32)), PgType::Int4)?, Value::Int4(-1));
         // A 16-bit value is zero-extended (positive) into the wider int4.
-        assert_eq!(cast(bits("1000000000000000"), PgType::Int4).unwrap(), Value::Int4(32768));
+        assert_eq!(
+            cast(bits("1000000000000000"), PgType::Int4)?,
+            Value::Int4(32768)
+        );
         // int8 keeps the same reinterpret semantics.
-        assert_eq!(cast(bits(&"1".repeat(64)), PgType::Int8).unwrap(), Value::Int8(-1));
+        assert_eq!(cast(bits(&"1".repeat(64)), PgType::Int8)?, Value::Int8(-1));
         // Wider than the target → out of range.
         let e = cast(bits(&"1".repeat(40)), PgType::Int4).unwrap_err();
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(e.message, "integer out of range");
+
+        Ok(())
     }
 
     #[test]
@@ -821,33 +988,35 @@ mod tests {
     }
 
     #[test]
-    fn reinterpret_swaps_int_float_bits() {
+    fn reinterpret_swaps_int_float_bits() -> anyhow::Result<()> {
         // int4 → float4: the bit pattern of 1 is the smallest subnormal float.
         assert_eq!(
-            reinterpret_value(Value::Int4(1), PgType::Float4).unwrap(),
+            reinterpret_value(Value::Int4(1), PgType::Float4)?,
             Value::Float4(f32::from_bits(1))
         );
         // float4 → int4 is the inverse.
         assert_eq!(
-            reinterpret_value(Value::Float4(f32::from_bits(1)), PgType::Int4).unwrap(),
+            reinterpret_value(Value::Float4(f32::from_bits(1)), PgType::Int4)?,
             Value::Int4(1)
         );
         // int8 ↔ float8 over 64 bits.
         assert_eq!(
-            reinterpret_value(Value::Int8(4607182418800017408), PgType::Float8).unwrap(),
+            reinterpret_value(Value::Int8(4607182418800017408), PgType::Float8)?,
             Value::Float8(1.0)
         );
         assert_eq!(
-            reinterpret_value(Value::Float8(1.0), PgType::Int8).unwrap(),
+            reinterpret_value(Value::Float8(1.0), PgType::Int8)?,
             Value::Int8(4607182418800017408)
         );
         // Same representation (e.g. xfloat4→float4): identity relabel.
         assert_eq!(
-            reinterpret_value(Value::Float4(1.5), PgType::Float4).unwrap(),
+            reinterpret_value(Value::Float4(1.5), PgType::Float4)?,
             Value::Float4(1.5)
         );
         // NULL passes through.
-        assert_eq!(reinterpret_value(Value::Null, PgType::Float4).unwrap(), Value::Null);
+        assert_eq!(reinterpret_value(Value::Null, PgType::Float4)?, Value::Null);
+
+        Ok(())
     }
 
     #[test]
@@ -858,26 +1027,33 @@ mod tests {
     }
 
     #[test]
-    fn int8_to_oid_wraps_negatives_but_rejects_out_of_range() {
+    fn int8_to_oid_wraps_negatives_but_rejects_out_of_range() -> anyhow::Result<()> {
         // In range: exact.
-        assert_eq!(cast(Value::Int8(2200), PgType::Oid).unwrap(), Value::Oid(2200));
+        assert_eq!(cast(Value::Int8(2200), PgType::Oid)?, Value::Oid(2200));
         // Negative wraps like PG's `(-1)::oid` = 4294967295.
-        assert_eq!(cast(Value::Int8(-1), PgType::Oid).unwrap(), Value::Oid(u32::MAX));
-        assert_eq!(cast(Value::Int8(u32::MAX as i64), PgType::Oid).unwrap(), Value::Oid(u32::MAX));
+        assert_eq!(cast(Value::Int8(-1), PgType::Oid)?, Value::Oid(u32::MAX));
+        assert_eq!(
+            cast(Value::Int8(u32::MAX as i64), PgType::Oid)?,
+            Value::Oid(u32::MAX)
+        );
         // Past the 32-bit range errors (22003) instead of silently truncating.
         let e = cast(Value::Int8(u32::MAX as i64 + 1), PgType::Oid).unwrap_err();
         assert_eq!(e.sqlstate, "22003");
+
+        Ok(())
     }
 
     #[test]
-    fn text_to_oid_accepts_negatives_and_bounds() {
-        assert_eq!(text_to_oid("42").unwrap(), Value::Oid(42));
-        assert_eq!(text_to_oid("  2200 ").unwrap(), Value::Oid(2200));
+    fn text_to_oid_accepts_negatives_and_bounds() -> anyhow::Result<()> {
+        assert_eq!(text_to_oid("42")?, Value::Oid(42));
+        assert_eq!(text_to_oid("  2200 ")?, Value::Oid(2200));
         // oidin accepts a leading minus and wraps (PG: '-1'::oid = 4294967295).
-        assert_eq!(text_to_oid("-1").unwrap(), Value::Oid(u32::MAX));
+        assert_eq!(text_to_oid("-1")?, Value::Oid(u32::MAX));
         // Magnitude past 32 bits is out of range, not a truncated success.
         assert_eq!(text_to_oid("4294967296").unwrap_err().sqlstate, "22003");
         // Non-numeric is 22P02.
         assert_eq!(text_to_oid("abc").unwrap_err().sqlstate, "22P02");
+
+        Ok(())
     }
 }

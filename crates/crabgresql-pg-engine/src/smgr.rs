@@ -23,11 +23,17 @@ impl StorageManager {
     pub fn open(data_dir: &std::path::Path) -> std::io::Result<StorageManager> {
         let base = data_dir.join("base");
         std::fs::create_dir_all(&base)?;
-        Ok(StorageManager { base, files: Mutex::new(HashMap::new()) })
+        Ok(StorageManager {
+            base,
+            files: Mutex::new(HashMap::new()),
+        })
     }
 
     fn file(&self, rel: RelFileNode) -> std::io::Result<Arc<Mutex<File>>> {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self
+            .files
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         if let Some(f) = files.get(&rel.0) {
             return Ok(Arc::clone(f));
         }
@@ -47,7 +53,11 @@ impl StorageManager {
     /// Number of 8 KB blocks currently in the relation file.
     pub fn nblocks(&self, rel: RelFileNode) -> std::io::Result<u32> {
         let f = self.file(rel)?;
-        let len = f.lock().unwrap().metadata()?.len();
+        let len = f
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .metadata()?
+            .len();
         Ok((len / BLCKSZ as u64) as u32)
     }
 
@@ -56,7 +66,7 @@ impl StorageManager {
     /// page must pass its checksum for `block`.
     pub fn read(&self, rel: RelFileNode, block: u32, buf: &mut Page) -> std::io::Result<()> {
         let f = self.file(rel)?;
-        let mut f = f.lock().unwrap();
+        let mut f = f.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         f.seek(SeekFrom::Start(block as u64 * BLCKSZ as u64))?;
         f.read_exact(buf)?;
         if buf.iter().all(|&b| b == 0) {
@@ -77,7 +87,7 @@ impl StorageManager {
         let mut out = *buf;
         page::stamp_checksum(&mut out, block);
         let f = self.file(rel)?;
-        let mut f = f.lock().unwrap();
+        let mut f = f.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         f.seek(SeekFrom::Start(block as u64 * BLCKSZ as u64))?;
         f.write_all(&out)?;
         Ok(())
@@ -88,7 +98,7 @@ impl StorageManager {
     /// collide on the same block number.
     pub fn extend(&self, rel: RelFileNode) -> std::io::Result<u32> {
         let f = self.file(rel)?;
-        let mut g = f.lock().unwrap();
+        let mut g = f.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         let len = g.metadata()?.len();
         let block = (len / BLCKSZ as u64) as u32;
         let mut fresh = [0u8; BLCKSZ];
@@ -102,7 +112,7 @@ impl StorageManager {
     /// Truncate a relation to zero blocks (TRUNCATE and its redo).
     pub fn truncate(&self, rel: RelFileNode) -> std::io::Result<()> {
         let f = self.file(rel)?;
-        let g = f.lock().unwrap();
+        let g = f.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         g.set_len(0)?;
         g.sync_data()
     }
@@ -112,7 +122,10 @@ impl StorageManager {
     /// never extended to disk) is not an error. The caller must evict the
     /// relation's buffered pages before calling this so nothing writes it back.
     pub fn unlink(&self, rel: RelFileNode) -> std::io::Result<()> {
-        self.files.lock().unwrap().remove(&rel.0);
+        self.files
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .remove(&rel.0);
         let path = self.base.join(rel.0.to_string());
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -125,7 +138,7 @@ impl StorageManager {
     /// written, so the data is durable before the checkpoint record).
     pub fn sync(&self, rel: RelFileNode) -> std::io::Result<()> {
         let f = self.file(rel)?;
-        let g = f.lock().unwrap();
+        let g = f.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         g.sync_data()
     }
 }

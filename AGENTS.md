@@ -45,3 +45,10 @@ for the entire codebase:
   individual tests that pass, not the count of `.sql` files: a partially-passing
   file contributes only the tests that actually pass, and is never rounded up to
   a whole file or dropped to zero. Report the honest per-test total.
+
+## Rust error handling
+
+- Never use `unwrap()`.
+- `unwrap_err()` is allowed only in tests that assert an operation fails.
+- In tests, return `Result<(), _>` and propagate errors with `?` instead of
+  calling `unwrap()` for successful fallible operations.

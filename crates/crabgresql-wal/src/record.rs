@@ -93,21 +93,30 @@ impl<'a> WalRecord<'a> {
         if bytes.len() < Self::HEADER_LEN + Self::CRC_LEN {
             return None;
         }
-        let total_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let total_len = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
         if total_len < Self::HEADER_LEN + Self::CRC_LEN || total_len > bytes.len() {
             return None;
         }
-        let stored_crc = u32::from_le_bytes(bytes[total_len - 4..total_len].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(bytes.get(total_len - 4..total_len)?.try_into().ok()?);
         let actual_crc = crc32c::crc32c(&bytes[0..total_len - 4]);
         if stored_crc != actual_crc {
             return None;
         }
-        let prev_lsn = Lsn(u64::from_le_bytes(bytes[4..12].try_into().unwrap()));
-        let xid = Xid(u64::from_le_bytes(bytes[12..20].try_into().unwrap()));
+        let prev_lsn = Lsn(u64::from_le_bytes(bytes.get(4..12)?.try_into().ok()?));
+        let xid = Xid(u64::from_le_bytes(bytes.get(12..20)?.try_into().ok()?));
         let rmgr = bytes[20];
         let info = bytes[21];
         let payload = &bytes[Self::HEADER_LEN..total_len - 4];
-        Some((WalRecord { prev_lsn, xid, rmgr, info, payload }, total_len))
+        Some((
+            WalRecord {
+                prev_lsn,
+                xid,
+                rmgr,
+                info,
+                payload,
+            },
+            total_len,
+        ))
     }
 }
 
@@ -159,18 +168,34 @@ mod tests {
     }
 
     #[test]
-    fn two_records_back_to_back() {
+    fn two_records_back_to_back() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        let a = WalRecord { prev_lsn: Lsn(0), xid: Xid(3), rmgr: 1, info: 0, payload: &[9] };
-        let b = WalRecord { prev_lsn: Lsn(0), xid: Xid(4), rmgr: 2, info: 5, payload: &[8, 8] };
+        let a = WalRecord {
+            prev_lsn: Lsn(0),
+            xid: Xid(3),
+            rmgr: 1,
+            info: 0,
+            payload: &[9],
+        };
+        let b = WalRecord {
+            prev_lsn: Lsn(0),
+            xid: Xid(4),
+            rmgr: 2,
+            info: 5,
+            payload: &[8, 8],
+        };
         let la = a.encode(Lsn(0), &mut buf);
         let lb = b.encode(Lsn(la as u64), &mut buf);
-        let (ra, na) = WalRecord::decode(&buf).unwrap();
+        let (ra, na) = WalRecord::decode(&buf)
+            .ok_or_else(|| anyhow::anyhow!("first WAL record did not decode"))?;
         assert_eq!(na, la);
         assert_eq!(ra.xid, Xid(3));
-        let (rb, nb) = WalRecord::decode(&buf[na..]).unwrap();
+        let (rb, nb) = WalRecord::decode(&buf[na..])
+            .ok_or_else(|| anyhow::anyhow!("second WAL record did not decode"))?;
         assert_eq!(nb, lb);
         assert_eq!(rb.xid, Xid(4));
         assert_eq!(rb.info, 5);
+
+        Ok(())
     }
 }

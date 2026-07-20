@@ -106,7 +106,14 @@ fn zone_error(e: ZoneError) -> TimestampError {
 
 fn tmlite(micros: i64) -> TmLite {
     let tm = decode(micros);
-    TmLite { year: tm.year, month: tm.month, day: tm.day, hour: tm.hour, min: tm.min, sec: tm.sec }
+    TmLite {
+        year: tm.year,
+        month: tm.month,
+        day: tm.day,
+        hour: tm.hour,
+        min: tm.min,
+        sec: tm.sec,
+    }
 }
 
 /// `timestamptz_in`. Interprets any trailing zone token to convert the wall
@@ -139,14 +146,17 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
         None => 0,
         Some(tok) => {
             let zone = tz::resolve_zone(&tok).map_err(zone_error)?;
-            tz::offset_for_local(&zone, TmLite {
-                year: tm.year,
-                month: tm.month,
-                day: tm.day,
-                hour: tm.hour,
-                min: tm.min,
-                sec: tm.sec,
-            })
+            tz::offset_for_local(
+                &zone,
+                TmLite {
+                    year: tm.year,
+                    month: tm.month,
+                    day: tm.day,
+                    hour: tm.hour,
+                    min: tm.min,
+                    sec: tm.sec,
+                },
+            )
         }
     };
     let utc = civil - off_secs as i64 * USECS_PER_SEC;
@@ -176,7 +186,11 @@ pub fn format(micros: i64) -> String {
         return "-infinity".to_string();
     }
     let (body, bc) = format_parts(micros);
-    if bc { format!("{body}+00 BC") } else { format!("{body}+00") }
+    if bc {
+        format!("{body}+00 BC")
+    } else {
+        format!("{body}+00")
+    }
 }
 
 // --- field functions -------------------------------------------------------
@@ -287,22 +301,38 @@ pub fn timestamp_at_zone(zone: &str, micros: i64) -> Result<i64, TimestampError>
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn p(s: &str) -> i64 {
-        parse(s).unwrap()
+        match parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid timestamptz test fixture `{s}`: {error:?}"),
+        }
     }
 
     #[test]
     fn offset_normalizes_to_utc() {
         // -08:00 shifts the wall clock forward 8h to UTC.
-        assert_eq!(format(p("1997-02-10 17:32:01-08")), "1997-02-11 01:32:01+00");
-        assert_eq!(format(p("1997-02-10 17:32:01-0800")), "1997-02-11 01:32:01+00");
-        assert_eq!(format(p("1997-02-10 17:32:01 -08:00")), "1997-02-11 01:32:01+00");
+        assert_eq!(
+            format(p("1997-02-10 17:32:01-08")),
+            "1997-02-11 01:32:01+00"
+        );
+        assert_eq!(
+            format(p("1997-02-10 17:32:01-0800")),
+            "1997-02-11 01:32:01+00"
+        );
+        assert_eq!(
+            format(p("1997-02-10 17:32:01 -08:00")),
+            "1997-02-11 01:32:01+00"
+        );
         // No zone token -> already UTC.
         assert_eq!(format(p("2001-02-16 20:38:40")), "2001-02-16 20:38:40+00");
-        assert_eq!(format(p("2001-02-16 20:38:40+00")), "2001-02-16 20:38:40+00");
+        assert_eq!(
+            format(p("2001-02-16 20:38:40+00")),
+            "2001-02-16 20:38:40+00"
+        );
     }
 
     #[test]
@@ -313,9 +343,15 @@ mod tests {
             "1997-02-10 22:32:01+00"
         );
         // PST is a fixed -08:00.
-        assert_eq!(format(p("1997-02-10 17:32:01 PST")), "1997-02-11 01:32:01+00");
+        assert_eq!(
+            format(p("1997-02-10 17:32:01 PST")),
+            "1997-02-11 01:32:01+00"
+        );
         // UTC / Z synonyms.
-        assert_eq!(format(p("1997-02-10 17:32:01 UTC")), "1997-02-10 17:32:01+00");
+        assert_eq!(
+            format(p("1997-02-10 17:32:01 UTC")),
+            "1997-02-10 17:32:01+00"
+        );
         assert_eq!(format(p("2001-09-22T18:19:20Z")), "2001-09-22 18:19:20+00");
     }
 
@@ -324,12 +360,18 @@ mod tests {
         assert_eq!(format(p("infinity")), "infinity");
         assert_eq!(format(p("-infinity")), "-infinity");
         assert_eq!(format(p("epoch")), "1970-01-01 00:00:00+00");
-        assert_eq!(format(p("2001-02-16 20:38:40.5+00")), "2001-02-16 20:38:40.5+00");
+        assert_eq!(
+            format(p("2001-02-16 20:38:40.5+00")),
+            "2001-02-16 20:38:40.5+00"
+        );
     }
 
     #[test]
     fn bc_and_boundaries() {
-        assert_eq!(format(p("0097-02-16 20:00:00+00 BC")), "0097-02-16 20:00:00+00 BC");
+        assert_eq!(
+            format(p("0097-02-16 20:00:00+00 BC")),
+            "0097-02-16 20:00:00+00 BC"
+        );
         // Lower boundary: 4714-11-24 00:00:00 UTC BC is valid.
         assert!(parse("4714-11-24 00:00:00+00 BC").is_ok());
         assert!(parse("4714-11-23 16:00:00-08 BC").is_ok()); // == the same instant
@@ -353,39 +395,53 @@ mod tests {
             "invalid input syntax for type timestamp with time zone: \"garbage\""
         );
         assert_eq!(
-            parse("2001-01-01 00:00 Nowhere/Nozone").unwrap_err().sqlstate,
+            parse("2001-01-01 00:00 Nowhere/Nozone")
+                .unwrap_err()
+                .sqlstate,
             INVALID_PARAMETER_VALUE
         );
     }
 
     #[test]
-    fn at_time_zone_round_trip() {
+    fn at_time_zone_round_trip() -> anyhow::Result<()> {
         // A UTC instant shown in New York (EST -5h) reads 5h earlier.
         let utc = p("2001-02-16 20:38:40+00");
-        let wall = at_zone_to_timestamp("America/New_York", utc).unwrap();
+        let wall = at_zone_to_timestamp("America/New_York", utc)?;
         assert_eq!(timestamp::format(wall), "2001-02-16 15:38:40");
         // Interpreting that wall clock back in New York returns the UTC instant.
-        let back = timestamp_at_zone("America/New_York", wall).unwrap();
+        let back = timestamp_at_zone("America/New_York", wall)?;
         assert_eq!(back, utc);
+
+        Ok(())
     }
 
     #[test]
-    fn make_and_fields() {
+    fn make_and_fields() -> anyhow::Result<()> {
         // 6-arg is UTC.
         assert_eq!(
-            format(make_timestamptz(2013, 7, 15, 8, 15, 23.5, None).unwrap()),
+            format(make_timestamptz(2013, 7, 15, 8, 15, 23.5, None)?),
             "2013-07-15 08:15:23.5+00"
         );
         // 7-arg with a summer EDT zone (-04:00) shifts +4h to UTC.
         assert_eq!(
-            format(make_timestamptz(2013, 7, 15, 17, 15, 23.0, Some("America/New_York")).unwrap()),
+            format(make_timestamptz(
+                2013,
+                7,
+                15,
+                17,
+                15,
+                23.0,
+                Some("America/New_York")
+            )?),
             "2013-07-15 21:15:23+00"
         );
         // timezone* fields are 0 under the UTC session zone.
         let v = p("2001-02-16 20:38:40+00");
-        assert_eq!(date_part("timezone", v).unwrap(), Some(0.0));
-        assert_eq!(date_part("timezone_hour", v).unwrap(), Some(0.0));
-        assert_eq!(date_part("hour", v).unwrap(), Some(20.0));
+        assert_eq!(date_part("timezone", v)?, Some(0.0));
+        assert_eq!(date_part("timezone_hour", v)?, Some(0.0));
+        assert_eq!(date_part("hour", v)?, Some(20.0));
+
+        Ok(())
     }
 
     // A wildly out-of-range year must be rejected with 22008 *before* `encode`,
@@ -397,7 +453,11 @@ mod tests {
         for input in ["999999-01-01", "300000-01-01 00:00:00+00"] {
             let e = parse(input).expect_err(input);
             assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW, "{input}");
-            assert_eq!(e.message, format!("timestamp out of range: \"{input}\""), "{input}");
+            assert_eq!(
+                e.message,
+                format!("timestamp out of range: \"{input}\""),
+                "{input}"
+            );
         }
         // Beyond the i32 field range: "date/time field value out of range"
         // (must not overflow i64 in `encode`). Both signs.
@@ -434,7 +494,7 @@ mod tests {
     // Applying an offset can push an in-range civil value past the boundary;
     // that must error rather than return a silent out-of-band value.
     #[test]
-    fn offset_overflow_is_rejected() {
+    fn offset_overflow_is_rejected() -> anyhow::Result<()> {
         // make_timestamptz: civil is in range, but the -10h zone pushes it past
         // the upper boundary.
         assert_eq!(
@@ -444,13 +504,15 @@ mod tests {
             DATETIME_FIELD_OVERFLOW
         );
         // AT TIME ZONE past the upper boundary (timestamp -> timestamptz).
-        let near_max = timestamp::parse("294276-12-31 23:59:59").unwrap();
+        let near_max = timestamp::parse("294276-12-31 23:59:59")?;
         assert_eq!(
             timestamp_at_zone("America/New_York", near_max)
                 .unwrap_err()
                 .sqlstate,
             DATETIME_FIELD_OVERFLOW
         );
+
+        Ok(())
     }
 
     // A date with a glued `+` zone is only accepted when the remainder is a

@@ -51,7 +51,10 @@ impl HeapTable {
     }
 
     pub fn add_index(&self, index: IndexMetadata) {
-        self.indexes.write().unwrap().push(index);
+        self.indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .push(index);
     }
 
     #[allow(dead_code)] // used by tooling/tests and future index AM wiring
@@ -88,8 +91,14 @@ impl HeapTable {
                     block: target,
                     offset: off,
                 };
-                tuple::set_ctid(page::get_item_mut(pg, off).unwrap(), tid);
-                let final_bytes = page::get_item(pg, off).unwrap().to_vec();
+                let Some(item) = page::get_item_mut(pg, off) else {
+                    panic!("newly inserted tuple is missing from its page");
+                };
+                tuple::set_ctid(item, tid);
+                let Some(item) = page::get_item(pg, off) else {
+                    panic!("newly inserted tuple is missing from its page");
+                };
+                let final_bytes = item.to_vec();
                 let lsn = self.engine.wal.append(
                     RmgrId::HEAP,
                     rec::HEAP_INSERT,
@@ -152,7 +161,10 @@ impl TableAm for HeapTable {
     }
 
     fn indexes(&self) -> Vec<IndexMetadata> {
-        self.indexes.read().unwrap().clone()
+        self.indexes
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .clone()
     }
 
     fn scan(&self, txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {

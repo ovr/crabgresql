@@ -40,10 +40,10 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "visitor")]
 use sqlparser_derive::{Visit, VisitMut};
 
+use crate::ast::{DollarQuotedString, QuoteDelimitedString};
 use crate::dialect::Dialect;
 use crate::dialect::{GenericDialect, PostgreSqlDialect};
 use crate::keywords::{Keyword, ALL_KEYWORDS, ALL_KEYWORDS_INDEX};
-use crate::ast::{DollarQuotedString, QuoteDelimitedString};
 
 /// SQL Token enumeration
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -869,19 +869,23 @@ impl<'a> Tokenizer<'a> {
     /// Create a new SQL tokenizer for the specified SQL statement
     ///
     /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # use sqlparser::tokenizer::{Token, Whitespace, Tokenizer};
     /// # use sqlparser::dialect::GenericDialect;
     /// # let dialect = GenericDialect{};
     /// let query = r#"SELECT 'foo'"#;
     ///
     /// // Parsing the query
-    /// let tokens = Tokenizer::new(&dialect, &query).tokenize().unwrap();
+    /// let tokens = Tokenizer::new(&dialect, &query).tokenize()?;
     ///
     /// assert_eq!(tokens, vec![
     ///   Token::make_word("SELECT", None),
     ///   Token::Whitespace(Whitespace::Space),
     ///   Token::SingleQuotedString("foo".to_string()),
     /// ]);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(dialect: &'a dyn Dialect, query: &'a str) -> Self {
         Self {
             dialect,
@@ -903,6 +907,7 @@ impl<'a> Tokenizer<'a> {
     /// # Example
     ///
     /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # use sqlparser::tokenizer::{Token, Tokenizer};
     /// # use sqlparser::dialect::GenericDialect;
     /// # let dialect = GenericDialect{};
@@ -911,14 +916,16 @@ impl<'a> Tokenizer<'a> {
     /// let original  = Token::make_word(r#"Foo "" Bar"#, Some('"'));
     ///
     /// // Parsing with unescaping (default)
-    /// let tokens = Tokenizer::new(&dialect, &query).tokenize().unwrap();
+    /// let tokens = Tokenizer::new(&dialect, &query).tokenize()?;
     /// assert_eq!(tokens, vec![unescaped]);
     ///
     /// // Parsing with unescape = false
     /// let tokens = Tokenizer::new(&dialect, &query)
     ///    .with_unescape(false)
-    ///    .tokenize().unwrap();
+    ///    .tokenize()?;
     /// assert_eq!(tokens, vec![original]);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_unescape(mut self, unescape: bool) -> Self {
         self.unescape = unescape;
@@ -1073,8 +1080,7 @@ impl<'a> Tokenizer<'a> {
                     Ok(Some(Token::Whitespace(Whitespace::Newline)))
                 }
                 // BigQuery and MySQL use b or B for byte string literal, Postgres for bit strings
-                b @ 'B' | b @ 'b' if dialect_of!(self is PostgreSqlDialect | GenericDialect) =>
-                {
+                b @ 'B' | b @ 'b' if dialect_of!(self is PostgreSqlDialect | GenericDialect) => {
                     chars.next(); // consume
                     match chars.peek() {
                         Some('\'') => {
@@ -1403,7 +1409,9 @@ impl<'a> Tokenizer<'a> {
                     let mut exponent_part = String::new();
                     if chars.peek() == Some(&'e') || chars.peek() == Some(&'E') {
                         let mut char_clone = chars.peekable.clone();
-                        exponent_part.push(char_clone.next().unwrap());
+                        if let Some(sign) = char_clone.next() {
+                            exponent_part.push(sign);
+                        }
 
                         // Optional sign
                         match char_clone.peek() {
@@ -2634,10 +2642,10 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_select_1() {
+    fn tokenize_select_1() -> anyhow::Result<()> {
         let sql = String::from("SELECT 1");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2646,13 +2654,15 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_select_float() {
+    fn tokenize_select_float() -> anyhow::Result<()> {
         let sql = String::from("SELECT .1");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2661,17 +2671,20 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_with_mapper() {
+    fn tokenize_with_mapper() -> anyhow::Result<()> {
         let sql = String::from("SELECT ?");
         let dialect = GenericDialect {};
         let mut param_num = 1;
 
         let mut tokens = vec![];
-        Tokenizer::new(&dialect, &sql)
-            .tokenize_with_location_into_buf_with_mapper(&mut tokens, |mut token_span| {
+        Tokenizer::new(&dialect, &sql).tokenize_with_location_into_buf_with_mapper(
+            &mut tokens,
+            |mut token_span| {
                 token_span.token = match token_span.token {
                     Token::Placeholder(n) => Token::Placeholder(if n == "?" {
                         let ret = format!("${}", param_num);
@@ -2683,8 +2696,8 @@ mod tests {
                     token => token,
                 };
                 token_span
-            })
-            .unwrap();
+            },
+        )?;
         let actual = tokens.into_iter().map(|t| t.token).collect();
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2693,14 +2706,16 @@ mod tests {
         ];
 
         compare(expected, actual);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_numeric_literal_underscore() {
+    fn tokenize_numeric_literal_underscore() -> anyhow::Result<()> {
         let dialect = GenericDialect {};
         let sql = String::from("SELECT 10_000");
         let mut tokenizer = Tokenizer::new(&dialect, &sql);
-        let tokens = tokenizer.tokenize().unwrap();
+        let tokens = tokenizer.tokenize()?;
         let expected = vec![
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
@@ -2728,13 +2743,15 @@ mod tests {
                 Token::make_word("___0", None), // multiple underscores tokenizes as a word (syntax error in some dialects)
             ],
         );
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_select_exponent() {
+    fn tokenize_select_exponent() -> anyhow::Result<()> {
         let sql = String::from("SELECT 1e10, 1e-10, 1e+10, 1ea, 1e-10a, 1e-10-10");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2762,13 +2779,15 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_scalar_function() {
+    fn tokenize_scalar_function() -> anyhow::Result<()> {
         let sql = String::from("SELECT sqrt(1)");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2780,13 +2799,15 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_string_string_concat() {
+    fn tokenize_string_string_concat() -> anyhow::Result<()> {
         let sql = String::from("SELECT 'a' || 'b'");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2799,12 +2820,14 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
     #[test]
-    fn tokenize_bitwise_op() {
+    fn tokenize_bitwise_op() -> anyhow::Result<()> {
         let sql = String::from("SELECT one | two ^ three");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2820,14 +2843,16 @@ mod tests {
             Token::make_word("three", None),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_logical_xor() {
+    fn tokenize_logical_xor() -> anyhow::Result<()> {
         let sql =
             String::from("SELECT true XOR true, false XOR false, true XOR false, false XOR true");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2860,13 +2885,15 @@ mod tests {
             Token::make_keyword("true"),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_simple_select() {
+    fn tokenize_simple_select() -> anyhow::Result<()> {
         let sql = String::from("SELECT * FROM customer WHERE id = 1 LIMIT 5");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2891,13 +2918,15 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_explain_select() {
+    fn tokenize_explain_select() -> anyhow::Result<()> {
         let sql = String::from("EXPLAIN SELECT * FROM customer WHERE id = 1");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("EXPLAIN"),
@@ -2920,13 +2949,15 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_explain_analyze_select() {
+    fn tokenize_explain_analyze_select() -> anyhow::Result<()> {
         let sql = String::from("EXPLAIN ANALYZE SELECT * FROM customer WHERE id = 1");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("EXPLAIN"),
@@ -2951,13 +2982,15 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_string_predicate() {
+    fn tokenize_string_predicate() -> anyhow::Result<()> {
         let sql = String::from("SELECT * FROM customer WHERE salary != 'Not Provided'");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -2978,14 +3011,16 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_invalid_string() {
+    fn tokenize_invalid_string() -> anyhow::Result<()> {
         let sql = String::from("\n💝مصطفىh");
 
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         // println!("tokens: {:#?}", tokens);
         let expected = vec![
             Token::Whitespace(Whitespace::Newline),
@@ -2993,16 +3028,20 @@ mod tests {
             Token::make_word("مصطفىh", None),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_newline_in_string_literal() {
+    fn tokenize_newline_in_string_literal() -> anyhow::Result<()> {
         let sql = String::from("'foo\r\nbar\nbaz'");
 
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![Token::SingleQuotedString("foo\r\nbar\nbaz".to_string())];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
@@ -3039,11 +3078,11 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_invalid_string_cols() {
+    fn tokenize_invalid_string_cols() -> anyhow::Result<()> {
         let sql = String::from("\n\nSELECT * FROM table\t💝مصطفىh");
 
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         // println!("tokens: {:#?}", tokens);
         let expected = vec![
             Token::Whitespace(Whitespace::Newline),
@@ -3060,10 +3099,12 @@ mod tests {
             Token::make_word("مصطفىh", None),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_dollar_quoted_string_tagged() {
+    fn tokenize_dollar_quoted_string_tagged() -> anyhow::Result<()> {
         let test_cases = vec![
             (
                 String::from("SELECT $tag$dollar '$' quoted strings have $tags like this$ or like this $$$tag$"),
@@ -3122,9 +3163,11 @@ mod tests {
 
         let dialect = GenericDialect {};
         for (sql, expected) in test_cases {
-            let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+            let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
             compare(expected, tokens);
         }
+
+        Ok(())
     }
 
     #[test]
@@ -3160,10 +3203,10 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_nested_dollar_quoted_strings() {
+    fn tokenize_nested_dollar_quoted_strings() -> anyhow::Result<()> {
         let sql = String::from("SELECT $tag$dollar $nested$ string$tag$");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
@@ -3173,13 +3216,15 @@ mod tests {
             }),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_dollar_quoted_string_untagged_empty() {
+    fn tokenize_dollar_quoted_string_untagged_empty() -> anyhow::Result<()> {
         let sql = String::from("SELECT $$$$");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
@@ -3189,14 +3234,16 @@ mod tests {
             }),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_dollar_quoted_string_untagged() {
+    fn tokenize_dollar_quoted_string_untagged() -> anyhow::Result<()> {
         let sql =
             String::from("SELECT $$within dollar '$' quoted strings have $tags like this$ $$");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
@@ -3206,6 +3253,8 @@ mod tests {
             }),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
@@ -3227,10 +3276,10 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_right_arrow() {
+    fn tokenize_right_arrow() -> anyhow::Result<()> {
         let sql = String::from("FUNCTION(key=>value)");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![
             Token::make_word("FUNCTION", None),
             Token::LParen,
@@ -3240,13 +3289,15 @@ mod tests {
             Token::RParen,
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_is_null() {
+    fn tokenize_is_null() -> anyhow::Result<()> {
         let sql = String::from("a IS NULL");
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_word("a", None),
@@ -3257,10 +3308,12 @@ mod tests {
         ];
 
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_comment() {
+    fn tokenize_comment() -> anyhow::Result<()> {
         let test_cases = vec![
             (
                 String::from("0--this is a comment\n1"),
@@ -3299,17 +3352,19 @@ mod tests {
         let dialect = GenericDialect {};
 
         for (sql, expected) in test_cases {
-            let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+            let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
             compare(expected, tokens);
         }
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_comment_postgres() {
+    fn tokenize_comment_postgres() -> anyhow::Result<()> {
         let sql = String::from("1--\r0");
 
         let dialect = PostgreSqlDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![
             Token::Number("1".to_string(), false),
             Token::Whitespace(Whitespace::SingleLineComment {
@@ -3319,27 +3374,31 @@ mod tests {
             Token::Number("0".to_string(), false),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_comment_at_eof() {
+    fn tokenize_comment_at_eof() -> anyhow::Result<()> {
         let sql = String::from("--this is a comment");
 
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![Token::Whitespace(Whitespace::SingleLineComment {
             prefix: "--".to_string(),
             comment: "this is a comment".to_string(),
         })];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_multiline_comment() {
+    fn tokenize_multiline_comment() -> anyhow::Result<()> {
         let sql = String::from("0/*multi-line\n* /comment*/1");
 
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![
             Token::Number("0".to_string(), false),
             Token::Whitespace(Whitespace::MultiLineComment(
@@ -3348,6 +3407,8 @@ mod tests {
             Token::Number("1".to_string(), false),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
@@ -3410,31 +3471,35 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_multiline_comment_with_even_asterisks() {
+    fn tokenize_multiline_comment_with_even_asterisks() -> anyhow::Result<()> {
         let sql = String::from("\n/** Comment **/\n");
 
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![
             Token::Whitespace(Whitespace::Newline),
             Token::Whitespace(Whitespace::MultiLineComment("* Comment *".to_string())),
             Token::Whitespace(Whitespace::Newline),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_unicode_whitespace() {
+    fn tokenize_unicode_whitespace() -> anyhow::Result<()> {
         let sql = String::from(" \u{2003}\n");
 
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![
             Token::Whitespace(Whitespace::Space),
             Token::Whitespace(Whitespace::Space),
             Token::Whitespace(Whitespace::Newline),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
@@ -3453,11 +3518,11 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_newlines() {
+    fn tokenize_newlines() -> anyhow::Result<()> {
         let sql = String::from("line1\nline2\rline3\r\nline4\r");
 
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
         let expected = vec![
             Token::make_word("line1", None),
             Token::Whitespace(Whitespace::Newline),
@@ -3469,13 +3534,15 @@ mod tests {
             Token::Whitespace(Whitespace::Newline),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_pg_regex_match() {
+    fn tokenize_pg_regex_match() -> anyhow::Result<()> {
         let sql = "SELECT col ~ '^a', col ~* '^a', col !~ '^a', col !~* '^a'";
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, sql).tokenize()?;
         let expected = vec![
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
@@ -3507,13 +3574,15 @@ mod tests {
             Token::SingleQuotedString("^a".into()),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_pg_like_match() {
+    fn tokenize_pg_like_match() -> anyhow::Result<()> {
         let sql = "SELECT col ~~ '_a%', col ~~* '_a%', col !~~ '_a%', col !~~* '_a%'";
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, sql).tokenize()?;
         let expected = vec![
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
@@ -3545,13 +3614,15 @@ mod tests {
             Token::SingleQuotedString("_a%".into()),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_quoted_identifier() {
+    fn tokenize_quoted_identifier() -> anyhow::Result<()> {
         let sql = r#" "a "" b" "a """ "c """"" "#;
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, sql).tokenize()?;
         let expected = vec![
             Token::Whitespace(Whitespace::Space),
             Token::make_word(r#"a " b"#, Some('"')),
@@ -3562,29 +3633,32 @@ mod tests {
             Token::Whitespace(Whitespace::Space),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_single_slash_division() {
+    fn tokenize_single_slash_division() -> anyhow::Result<()> {
         let sql = r#"field/1000"#;
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, sql).tokenize()?;
         let expected = vec![
             Token::make_word(r#"field"#, None),
             Token::Div,
             Token::Number("1000".to_string(), false),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_quoted_identifier_with_no_escape() {
+    fn tokenize_quoted_identifier_with_no_escape() -> anyhow::Result<()> {
         let sql = r#" "a "" b" "a """ "c """"" "#;
         let dialect = GenericDialect {};
         let tokens = Tokenizer::new(&dialect, sql)
             .with_unescape(false)
-            .tokenize()
-            .unwrap();
+            .tokenize()?;
         let expected = vec![
             Token::Whitespace(Whitespace::Space),
             Token::make_word(r#"a "" b"#, Some('"')),
@@ -3595,15 +3669,15 @@ mod tests {
             Token::Whitespace(Whitespace::Space),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_with_location() {
+    fn tokenize_with_location() -> anyhow::Result<()> {
         let sql = "SELECT a,\n b";
         let dialect = GenericDialect {};
-        let tokens = Tokenizer::new(&dialect, sql)
-            .tokenize_with_location()
-            .unwrap();
+        let tokens = Tokenizer::new(&dialect, sql).tokenize_with_location()?;
         let expected = vec![
             TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
             TokenWithSpan::at(
@@ -3626,6 +3700,8 @@ mod tests {
             TokenWithSpan::at(Token::make_word("b", None), (2, 2).into(), (2, 3).into()),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     fn compare<T: PartialEq + fmt::Debug>(expected: Vec<T>, actual: Vec<T>) {
@@ -3739,7 +3815,10 @@ mod tests {
 
     fn tokenize_numeric_prefix_inner(dialect: &dyn Dialect) {
         let sql = r#"SELECT * FROM 1"#;
-        let tokens = Tokenizer::new(dialect, sql).tokenize().unwrap();
+        let tokens = match Tokenizer::new(dialect, sql).tokenize() {
+            Ok(tokens) => tokens,
+            Err(error) => panic!("failed to tokenize numeric-prefix test fixture: {error}"),
+        };
         let expected = vec![
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
@@ -3753,11 +3832,11 @@ mod tests {
     }
 
     #[test]
-    fn test_postgres_abs_without_space_and_string_literal() {
+    fn test_postgres_abs_without_space_and_string_literal() -> anyhow::Result<()> {
         let dialect = PostgreSqlDialect {};
 
         let sql = "SELECT @'1'";
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, sql).tokenize()?;
         let expected = vec![
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
@@ -3765,14 +3844,16 @@ mod tests {
             Token::SingleQuotedString("1".to_string()),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
-    fn test_postgres_abs_without_space_and_quoted_column() {
+    fn test_postgres_abs_without_space_and_quoted_column() -> anyhow::Result<()> {
         let dialect = PostgreSqlDialect {};
 
         let sql = r#"SELECT @"bar" FROM foo"#;
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, sql).tokenize()?;
         let expected = vec![
             Token::make_keyword("SELECT"),
             Token::Whitespace(Whitespace::Space),
@@ -3784,6 +3865,8 @@ mod tests {
             Token::make_word("foo", None),
         ];
         compare(expected, tokens);
+
+        Ok(())
     }
 
     #[test]
@@ -3863,11 +3946,11 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_period_underscore() {
+    fn tokenize_period_underscore() -> anyhow::Result<()> {
         let sql = String::from("SELECT table._col");
         // a dialect that supports underscores in numeric literals
         let dialect = PostgreSqlDialect {};
-        let tokens = Tokenizer::new(&dialect, &sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, &sql).tokenize()?;
 
         let expected = vec![
             Token::make_keyword("SELECT"),
@@ -3896,13 +3979,15 @@ mod tests {
         if let Ok(tokens) = Tokenizer::new(&dialect, &sql).tokenize() {
             panic!("Tokenizer should have failed on {sql}, but it succeeded with {tokens:?}");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn tokenize_question_mark() {
+    fn tokenize_question_mark() -> anyhow::Result<()> {
         let dialect = PostgreSqlDialect {};
         let sql = "SELECT x ? y";
-        let tokens = Tokenizer::new(&dialect, sql).tokenize().unwrap();
+        let tokens = Tokenizer::new(&dialect, sql).tokenize()?;
         compare(
             tokens,
             vec![
@@ -3915,6 +4000,8 @@ mod tests {
                 Token::make_word("y", None),
             ],
         );
+
+        Ok(())
     }
 
     #[test]

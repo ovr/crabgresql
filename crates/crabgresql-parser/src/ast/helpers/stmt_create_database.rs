@@ -365,6 +365,7 @@ impl TryFrom<Statement> for CreateDatabaseBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use crate::ast::helpers::stmt_create_database::CreateDatabaseBuilder;
     use crate::ast::{Ident, ObjectName, Statement};
@@ -376,7 +377,10 @@ mod tests {
 
         let stmt = builder.clone().build();
 
-        assert_eq!(builder, CreateDatabaseBuilder::try_from(stmt).unwrap());
+        match CreateDatabaseBuilder::try_from(stmt) {
+            Ok(actual) => assert_eq!(builder, actual),
+            Err(error) => panic!("valid create-database fixture was rejected: {error}"),
+        }
     }
 
     #[test]

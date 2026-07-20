@@ -3,11 +3,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use crabgresql_executor::OutputColumn;
 use crabgresql_pg_wire::{
     BackendMessage, BackendWriter, FieldDescription, Format, FrontendMessage, FrontendReader,
     ProtocolError, StartupRequest, Target, TransactionStatus, sqlstate,
 };
-use crabgresql_executor::OutputColumn;
 use crabgresql_storage_api::TableEngine;
 use crabgresql_txn::TransactionManager;
 use crabgresql_types::cast::CastError;
@@ -129,9 +129,22 @@ pub async fn handle_connection(
                 query,
                 param_types,
             }) => {
-                let outcome =
-                    handle_parse(&engine, &catalog, &mut session, &mut writer, &name, &query, &param_types);
-                report(&mut writer, &mut session, &mut skip_until_sync, outcome, Some(&query));
+                let outcome = handle_parse(
+                    &engine,
+                    &catalog,
+                    &mut session,
+                    &mut writer,
+                    &name,
+                    &query,
+                    &param_types,
+                );
+                report(
+                    &mut writer,
+                    &mut session,
+                    &mut skip_until_sync,
+                    outcome,
+                    Some(&query),
+                );
             }
             Some(FrontendMessage::Bind {
                 portal,
@@ -149,11 +162,23 @@ pub async fn handle_connection(
                     &params,
                     result_formats,
                 );
-                report(&mut writer, &mut session, &mut skip_until_sync, outcome, None);
+                report(
+                    &mut writer,
+                    &mut session,
+                    &mut skip_until_sync,
+                    outcome,
+                    None,
+                );
             }
             Some(FrontendMessage::Describe { target, name }) => {
                 let outcome = handle_describe(&mut session, &mut writer, target, &name);
-                report(&mut writer, &mut session, &mut skip_until_sync, outcome, None);
+                report(
+                    &mut writer,
+                    &mut session,
+                    &mut skip_until_sync,
+                    outcome,
+                    None,
+                );
             }
             Some(FrontendMessage::Execute { portal, max_rows }) => {
                 let outcome = handle_execute(
@@ -165,7 +190,13 @@ pub async fn handle_connection(
                     &portal,
                     max_rows,
                 );
-                report(&mut writer, &mut session, &mut skip_until_sync, outcome, None);
+                report(
+                    &mut writer,
+                    &mut session,
+                    &mut skip_until_sync,
+                    outcome,
+                    None,
+                );
             }
             Some(FrontendMessage::Close { target, name }) => {
                 // Close never fails: an unknown name is not an error (PG).
@@ -688,7 +719,15 @@ fn handle_execute(
         extended: true,
     };
     let result = execute_statement(engine, global_catalog, txnmgr, &stmt, session, &params)?;
-    stream_execute(session, writer, portal_name, result, &result_formats, efd, max_rows)
+    stream_execute(
+        session,
+        writer,
+        portal_name,
+        result,
+        &result_formats,
+        efd,
+        max_rows,
+    )
 }
 
 /// Stream a freshly executed portal's result. Rows are encoded per the portal's
@@ -709,7 +748,10 @@ fn stream_execute(
             writer.command_complete(&tag);
             Ok(())
         }
-        QueryResult::Rows { columns: _, mut node } => {
+        QueryResult::Rows {
+            columns: _,
+            mut node,
+        } => {
             let limit = (max_rows > 0).then_some(max_rows as usize);
             let mut count = 0usize;
             loop {
@@ -755,14 +797,21 @@ fn resume_portal(
 ) -> Result<(), PgError> {
     let efd = session.extra_float_digits;
     let formats = session.portals[portal_name].result_formats.clone();
-    let limit = if max_rows > 0 { max_rows as usize } else { usize::MAX };
-    let sus = session
-        .portals
-        .get_mut(portal_name)
-        .unwrap()
+    let limit = if max_rows > 0 {
+        max_rows as usize
+    } else {
+        usize::MAX
+    };
+    let portal = session.portals.get_mut(portal_name).ok_or_else(|| {
+        PgError::new(
+            sqlstate::INVALID_CURSOR_NAME,
+            format!("portal \"{portal_name}\" does not exist"),
+        )
+    })?;
+    let sus = portal
         .suspended
         .as_mut()
-        .unwrap();
+        .ok_or_else(|| PgError::new("XX000", "portal is not suspended"))?;
     let mut served = 0usize;
     // `writer` is independent of `session`, so writing while the portal is
     // mutably borrowed is fine.
@@ -782,7 +831,7 @@ fn resume_portal(
     };
     let delivered = sus.delivered;
     if exhausted {
-        session.portals.get_mut(portal_name).unwrap().suspended = None;
+        portal.suspended = None;
         writer.command_complete(&format!("SELECT {delivered}"));
     } else {
         writer.write(&BackendMessage::PortalSuspended);

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "regress"
 path = "src/bin/regress.rs"
@@ -14,3 +17,6 @@ crabgresql-memory-storage.workspace = true
 crabgresql-server.workspace = true
 similar.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

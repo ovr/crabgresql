@@ -119,8 +119,16 @@ fn field_value_out_of_range(input: &str) -> IntervalError {
 
 /// Datetime units PG knows but that carry no meaning for an interval; these get
 /// "not supported" rather than "not recognized".
-const NOT_SUPPORTED_UNITS: &[&str] =
-    &["dow", "isodow", "doy", "isoyear", "julian", "timezone", "timezone_hour", "timezone_minute"];
+const NOT_SUPPORTED_UNITS: &[&str] = &[
+    "dow",
+    "isodow",
+    "doy",
+    "isoyear",
+    "julian",
+    "timezone",
+    "timezone_hour",
+    "timezone_minute",
+];
 
 fn division_by_zero() -> IntervalError {
     IntervalError {
@@ -146,7 +154,13 @@ pub fn format(iv: Interval) -> String {
     let mon = (iv.months % 12) as i64;
     add_postgres_part(&mut out, year, "year", &mut is_zero, &mut is_before);
     add_postgres_part(&mut out, mon, "mon", &mut is_zero, &mut is_before);
-    add_postgres_part(&mut out, iv.days as i64, "day", &mut is_zero, &mut is_before);
+    add_postgres_part(
+        &mut out,
+        iv.days as i64,
+        "day",
+        &mut is_zero,
+        &mut is_before,
+    );
 
     let (hour, min, sec, fsec) = split_time(iv.usec);
     if is_zero || hour != 0 || min != 0 || sec != 0 || fsec != 0 {
@@ -169,7 +183,13 @@ pub fn format(iv: Interval) -> String {
 /// output: a separating space once a field has been emitted, an explicit `+` when a
 /// prior field was negative but this one is positive, and a plural `s` unless
 /// the value is exactly `1`.
-fn add_postgres_part(out: &mut String, value: i64, unit: &str, is_zero: &mut bool, is_before: &mut bool) {
+fn add_postgres_part(
+    out: &mut String,
+    value: i64,
+    unit: &str,
+    is_zero: &mut bool,
+    is_before: &mut bool,
+) {
     if value == 0 {
         return;
     }
@@ -179,7 +199,10 @@ fn add_postgres_part(out: &mut String, value: i64, unit: &str, is_zero: &mut boo
     if *is_before && value > 0 {
         out.push('+');
     }
-    out.push_str(&format!("{value} {unit}{}", if value != 1 { "s" } else { "" }));
+    out.push_str(&format!(
+        "{value} {unit}{}",
+        if value != 1 { "s" } else { "" }
+    ));
     *is_before = value < 0;
     *is_zero = false;
 }
@@ -311,9 +334,7 @@ fn scale(iv: Interval, op: impl Fn(f64) -> f64) -> Result<Interval, IntervalErro
     // Spilled more than a whole day of seconds: carry it back into days.
     if sec_remainder.abs() >= SECS_PER_DAY as f64 {
         let whole = (sec_remainder / SECS_PER_DAY as f64).trunc();
-        days = days
-            .checked_add(to_i32(whole)?)
-            .ok_or_else(out_of_range)?;
+        days = days.checked_add(to_i32(whole)?).ok_or_else(out_of_range)?;
         sec_remainder -= whole * SECS_PER_DAY as f64;
     }
     days = days
@@ -325,7 +346,11 @@ fn scale(iv: Interval, op: impl Fn(f64) -> f64) -> Result<Interval, IntervalErro
     if !time.is_finite() || time >= -(i64::MIN as f64) || time < i64::MIN as f64 {
         return Err(out_of_range());
     }
-    Ok(Interval { months, days, usec: time as i64 })
+    Ok(Interval {
+        months,
+        days,
+        usec: time as i64,
+    })
 }
 
 fn to_i32(x: f64) -> Result<i32, IntervalError> {
@@ -455,8 +480,15 @@ pub fn make_interval(
 /// Fields that grow monotonically with the interval (the highest-order field of
 /// each stored component, plus epoch); on `±infinity` PG returns `±Infinity` for
 /// these and NULL for every other (oscillating) known field.
-const MONOTONIC_UNITS: &[&str] =
-    &["hour", "day", "year", "decade", "century", "millennium", "epoch"];
+const MONOTONIC_UNITS: &[&str] = &[
+    "hour",
+    "day",
+    "year",
+    "decade",
+    "century",
+    "millennium",
+    "epoch",
+];
 
 const KNOWN_UNITS: &[&str] = &[
     "microseconds",
@@ -520,9 +552,15 @@ pub fn extract(unit: &str, iv: Interval) -> Result<Option<Numeric>, IntervalErro
         "milliseconds" => crate::timestamp::fixed_point(sub_usec, 3),
         "microseconds" => sub_usec.to_string(),
         "epoch" => format!("{:.6}", epoch_seconds(iv)),
-        _ => (date_part(&unit, iv)?.expect("finite integer field is Some") as i64).to_string(),
+        _ => match date_part(&unit, iv)? {
+            Some(value) => (value as i64).to_string(),
+            None => panic!("finite interval field must have a value"),
+        },
     };
-    Ok(Some(Numeric::parse(&s).expect("extract renders a valid numeric literal")))
+    match Numeric::parse(&s) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => panic!("interval extraction must form a valid numeric literal"),
+    }
 }
 
 /// The value of a known field on a `±infinity` interval.
@@ -547,7 +585,6 @@ fn epoch_seconds(iv: Interval) -> f64 {
         + iv.days as f64 * SECS_PER_DAY as f64
         + iv.usec as f64 / 1e6
 }
-
 
 // --- date_trunc ------------------------------------------------------------
 
@@ -920,7 +957,9 @@ fn parse_number(s: &str, input: &str) -> Result<(i128, f64), IntervalError> {
         if !frac_str.bytes().all(|b| b.is_ascii_digit()) {
             return Err(invalid_syntax(input));
         }
-        format!("0.{frac_str}").parse().map_err(|_| invalid_syntax(input))?
+        format!("0.{frac_str}")
+            .parse()
+            .map_err(|_| invalid_syntax(input))?
     };
     let sign = if neg { -1.0 } else { 1.0 };
     Ok((if neg { -int_part } else { int_part }, frac * sign))
@@ -934,8 +973,16 @@ fn parse_time_token(tok: &str, input: &str) -> Result<i64, IntervalError> {
     let neg = tok.starts_with('-');
     let body = tok.trim_start_matches(['+', '-']);
     let mut parts = body.split(':');
-    let hour: i64 = parts.next().ok_or_else(syntax)?.parse().map_err(|_| syntax())?;
-    let min: i64 = parts.next().ok_or_else(syntax)?.parse().map_err(|_| syntax())?;
+    let hour: i64 = parts
+        .next()
+        .ok_or_else(syntax)?
+        .parse()
+        .map_err(|_| syntax())?;
+    let min: i64 = parts
+        .next()
+        .ok_or_else(syntax)?
+        .parse()
+        .map_err(|_| syntax())?;
     let (sec, fsec) = match parts.next() {
         None => (0, 0),
         Some(secpart) => {
@@ -1037,11 +1084,15 @@ fn parse_iso8601(s: &str, input: &str, acc: &mut Acc) -> Result<(), IntervalErro
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn iv(s: &str) -> Interval {
-        parse(s).unwrap()
+        match parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid interval test fixture `{s}`: {error:?}"),
+        }
     }
     fn out(s: &str) -> String {
         format(iv(s))
@@ -1049,7 +1100,10 @@ mod tests {
 
     #[test]
     fn output_formatting() {
-        assert_eq!(out("1 year 2 mons 3 days 04:05:06"), "1 year 2 mons 3 days 04:05:06");
+        assert_eq!(
+            out("1 year 2 mons 3 days 04:05:06"),
+            "1 year 2 mons 3 days 04:05:06"
+        );
         assert_eq!(out("1.5 days"), "1 day 12:00:00");
         assert_eq!(out("-1 day 2 hours"), "-1 days +02:00:00");
         assert_eq!(out("2 days ago"), "-2 days");
@@ -1069,31 +1123,38 @@ mod tests {
     }
 
     #[test]
-    fn sql_standard_and_iso_forms() {
-        assert_eq!(format(parse_with_default("1", Unit::Day).unwrap()), "1 day");
-        assert_eq!(format(parse_with_default("1-2", Unit::Year).unwrap()), "1 year 2 mons");
+    fn sql_standard_and_iso_forms() -> anyhow::Result<()> {
+        assert_eq!(format(parse_with_default("1", Unit::Day)?), "1 day");
         assert_eq!(
-            format(parse_with_default("3 4:05:06", Unit::Day).unwrap()),
+            format(parse_with_default("1-2", Unit::Year)?),
+            "1 year 2 mons"
+        );
+        assert_eq!(
+            format(parse_with_default("3 4:05:06", Unit::Day)?),
             "3 days 04:05:06"
         );
         assert_eq!(out("P1Y2M3DT4H5M6S"), "1 year 2 mons 3 days 04:05:06");
         assert_eq!(out("1"), "00:00:01");
+
+        Ok(())
     }
 
     #[test]
-    fn infinities() {
+    fn infinities() -> anyhow::Result<()> {
         assert_eq!(iv("infinity"), POS_INFINITY);
         assert_eq!(iv("+infinity"), POS_INFINITY);
         assert_eq!(iv("-infinity"), NEG_INFINITY);
         assert_eq!(format(POS_INFINITY), "infinity");
         assert_eq!(format(NEG_INFINITY), "-infinity");
         assert!(!POS_INFINITY.is_finite());
-        assert_eq!(negate(POS_INFINITY).unwrap(), NEG_INFINITY);
-        assert_eq!(add(POS_INFINITY, iv("1 day")).unwrap(), POS_INFINITY);
+        assert_eq!(negate(POS_INFINITY)?, NEG_INFINITY);
+        assert_eq!(add(POS_INFINITY, iv("1 day"))?, POS_INFINITY);
         assert!(add(POS_INFINITY, NEG_INFINITY).is_err());
-        assert_eq!(mul(POS_INFINITY, 2.0).unwrap(), POS_INFINITY);
+        assert_eq!(mul(POS_INFINITY, 2.0)?, POS_INFINITY);
         assert!(mul(POS_INFINITY, 0.0).is_err());
-        assert_eq!(justify_interval(POS_INFINITY).unwrap(), POS_INFINITY);
+        assert_eq!(justify_interval(POS_INFINITY)?, POS_INFINITY);
+
+        Ok(())
     }
 
     #[test]
@@ -1105,60 +1166,86 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic() {
-        assert_eq!(format(mul(iv("1 day 3 hours"), 2.5).unwrap()), "2 days 19:30:00");
-        assert_eq!(format(div(iv("1 day 3 hours"), 2.0).unwrap()), "13:30:00");
-        assert_eq!(format(mul(iv("2 mons"), 3.0).unwrap()), "6 mons");
-        assert_eq!(format(mul(iv("1 day"), 3.7).unwrap()), "3 days 16:48:00");
-        assert_eq!(format(negate(iv("1 day 2 hours")).unwrap()), "-1 days -02:00:00");
-        assert_eq!(format(add(iv("1 day"), iv("2 hours")).unwrap()), "1 day 02:00:00");
-        assert_eq!(format(sub(iv("5 mons"), iv("2 mons 10 days")).unwrap()), "3 mons -10 days");
+    fn arithmetic() -> anyhow::Result<()> {
+        assert_eq!(format(mul(iv("1 day 3 hours"), 2.5)?), "2 days 19:30:00");
+        assert_eq!(format(div(iv("1 day 3 hours"), 2.0)?), "13:30:00");
+        assert_eq!(format(mul(iv("2 mons"), 3.0)?), "6 mons");
+        assert_eq!(format(mul(iv("1 day"), 3.7)?), "3 days 16:48:00");
+        assert_eq!(format(negate(iv("1 day 2 hours"))?), "-1 days -02:00:00");
+        assert_eq!(format(add(iv("1 day"), iv("2 hours"))?), "1 day 02:00:00");
+        assert_eq!(
+            format(sub(iv("5 mons"), iv("2 mons 10 days"))?),
+            "3 mons -10 days"
+        );
         assert!(div(iv("1 day"), 0.0).is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn justify() {
-        assert_eq!(format(justify_days(iv("35 days")).unwrap()), "1 mon 5 days");
-        assert_eq!(format(justify_hours(iv("27 hours")).unwrap()), "1 day 03:00:00");
+    fn justify() -> anyhow::Result<()> {
+        assert_eq!(format(justify_days(iv("35 days"))?), "1 mon 5 days");
+        assert_eq!(format(justify_hours(iv("27 hours"))?), "1 day 03:00:00");
         assert_eq!(
-            format(justify_interval(iv("1 mon 33 days 27 hours")).unwrap()),
+            format(justify_interval(iv("1 mon 33 days 27 hours"))?),
             "2 mons 4 days 03:00:00"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn fields() {
-        let dp = |u: &str, s: &str| date_part(u, iv(s)).unwrap().unwrap();
-        assert_eq!(dp("hour", "1 day 02:03:04"), 2.0);
-        assert_eq!(dp("day", "1 day 02:03:04"), 1.0);
-        assert_eq!(dp("month", "14 months"), 2.0);
-        assert_eq!(dp("year", "14 months"), 1.0);
-        assert_eq!(dp("quarter", "14 months"), 1.0);
-        assert_eq!(dp("epoch", "1 year 2 mons 3 days 04:05:06"), 37015506.0);
-        assert_eq!(dp("epoch", "1 day 02:03:04"), 93784.0);
-        assert_eq!(dp("minute", "-1 day -02:03:04"), -3.0);
-        let ex = |u: &str, s: &str| extract(u, iv(s)).unwrap().unwrap().to_display();
-        assert_eq!(ex("second", "00:00:04.5"), "4.500000");
-        assert_eq!(ex("milliseconds", "00:00:04.5"), "4500.000");
-        assert_eq!(ex("microseconds", "00:00:04.5"), "4500000");
-        assert_eq!(ex("epoch", "1 day 02:03:04"), "93784.000000");
+    fn fields() -> anyhow::Result<()> {
+        let dp = |u: &str, s: &str| -> anyhow::Result<f64> {
+            date_part(u, iv(s))?.ok_or_else(|| anyhow::anyhow!("missing {u} field"))
+        };
+        assert_eq!(dp("hour", "1 day 02:03:04")?, 2.0);
+        assert_eq!(dp("day", "1 day 02:03:04")?, 1.0);
+        assert_eq!(dp("month", "14 months")?, 2.0);
+        assert_eq!(dp("year", "14 months")?, 1.0);
+        assert_eq!(dp("quarter", "14 months")?, 1.0);
+        assert_eq!(dp("epoch", "1 year 2 mons 3 days 04:05:06")?, 37015506.0);
+        assert_eq!(dp("epoch", "1 day 02:03:04")?, 93784.0);
+        assert_eq!(dp("minute", "-1 day -02:03:04")?, -3.0);
+        let ex = |u: &str, s: &str| -> anyhow::Result<String> {
+            Ok(extract(u, iv(s))?
+                .ok_or_else(|| anyhow::anyhow!("missing {u} field"))?
+                .to_display())
+        };
+        assert_eq!(ex("second", "00:00:04.5")?, "4.500000");
+        assert_eq!(ex("milliseconds", "00:00:04.5")?, "4500.000");
+        assert_eq!(ex("microseconds", "00:00:04.5")?, "4500000");
+        assert_eq!(ex("epoch", "1 day 02:03:04")?, "93784.000000");
         // Infinite intervals: monotonic fields are ±Infinity, others NULL.
-        assert_eq!(date_part("year", POS_INFINITY).unwrap(), Some(f64::INFINITY));
-        assert_eq!(date_part("epoch", NEG_INFINITY).unwrap(), Some(f64::NEG_INFINITY));
-        assert_eq!(date_part("month", POS_INFINITY).unwrap(), None);
-        assert_eq!(date_part("bogus", iv("1 day")).unwrap_err().sqlstate, "22023");
+        assert_eq!(date_part("year", POS_INFINITY)?, Some(f64::INFINITY));
+        assert_eq!(date_part("epoch", NEG_INFINITY)?, Some(f64::NEG_INFINITY));
+        assert_eq!(date_part("month", POS_INFINITY)?, None);
+        assert_eq!(
+            date_part("bogus", iv("1 day")).unwrap_err().sqlstate,
+            "22023"
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn trunc_and_make() {
-        assert_eq!(format(date_trunc("hour", iv("1 day 02:03:04.55")).unwrap()), "1 day 02:00:00");
-        assert_eq!(format(date_trunc("day", iv("1 mon 2 days 3 hours")).unwrap()), "1 mon 2 days");
-        assert_eq!(date_trunc("day", POS_INFINITY).unwrap(), POS_INFINITY);
+    fn trunc_and_make() -> anyhow::Result<()> {
         assert_eq!(
-            format(make_interval(1, 2, 3, 4, 5, 6, 7.5).unwrap()),
+            format(date_trunc("hour", iv("1 day 02:03:04.55"))?),
+            "1 day 02:00:00"
+        );
+        assert_eq!(
+            format(date_trunc("day", iv("1 mon 2 days 3 hours"))?),
+            "1 mon 2 days"
+        );
+        assert_eq!(date_trunc("day", POS_INFINITY)?, POS_INFINITY);
+        assert_eq!(
+            format(make_interval(1, 2, 3, 4, 5, 6, 7.5)?),
             "1 year 2 mons 25 days 05:06:07.5"
         );
-        assert_eq!(format(make_interval(0, 0, 0, 0, 0, 0, 0.0).unwrap()), "00:00:00");
+        assert_eq!(format(make_interval(0, 0, 0, 0, 0, 0, 0.0)?), "00:00:00");
+
+        Ok(())
     }
 
     #[test]
@@ -1176,14 +1263,25 @@ mod tests {
         // A huge hours field in the colon form (was: i64 overflow panic).
         assert_eq!(parse("3000000000:00:00").unwrap_err().sqlstate, "22015");
         // A bare integer beyond i64 (was: reported as 22007 syntax error).
-        assert_eq!(parse("99999999999999999999 days").unwrap_err().sqlstate, "22015");
+        assert_eq!(
+            parse("99999999999999999999 days").unwrap_err().sqlstate,
+            "22015"
+        );
         // A field beyond i32 (was: silently narrowed).
         assert_eq!(parse("3000000000 days").unwrap_err().sqlstate, "22015");
         assert_eq!(parse("3000000000 mons").unwrap_err().sqlstate, "22015");
         // justify carrying past i32 (was: wrapping_add → silent wrong value).
-        let big = Interval { months: 0, days: i32::MAX, usec: USECS_PER_DAY };
+        let big = Interval {
+            months: 0,
+            days: i32::MAX,
+            usec: USECS_PER_DAY,
+        };
         assert!(justify_hours(big).is_err());
-        let big_days = Interval { months: i32::MAX, days: 40, usec: 0 };
+        let big_days = Interval {
+            months: i32::MAX,
+            days: 40,
+            usec: 0,
+        };
         assert!(justify_days(big_days).is_err());
     }
 
@@ -1198,16 +1296,23 @@ mod tests {
     }
 
     #[test]
-    fn infinite_field_split_and_week() {
+    fn infinite_field_split_and_week() -> anyhow::Result<()> {
         // Monotonic fields (incl. hour and day) are ±Infinity; oscillating NULL.
-        let dp = |u: &str, i: Interval| date_part(u, i).unwrap();
-        assert_eq!(dp("hour", POS_INFINITY), Some(f64::INFINITY));
-        assert_eq!(dp("day", POS_INFINITY), Some(f64::INFINITY));
-        assert_eq!(dp("minute", POS_INFINITY), None);
-        assert_eq!(dp("month", NEG_INFINITY), None);
-        assert_eq!(dp("week", POS_INFINITY), None);
-        assert_eq!(date_part("week", iv("20 days")).unwrap(), Some(2.0));
+        let dp = |u: &str, i: Interval| date_part(u, i);
+        assert_eq!(dp("hour", POS_INFINITY)?, Some(f64::INFINITY));
+        assert_eq!(dp("day", POS_INFINITY)?, Some(f64::INFINITY));
+        assert_eq!(dp("minute", POS_INFINITY)?, None);
+        assert_eq!(dp("month", NEG_INFINITY)?, None);
+        assert_eq!(dp("week", POS_INFINITY)?, None);
+        assert_eq!(date_part("week", iv("20 days"))?, Some(2.0));
         // A known-but-unsupported unit says "not supported", not "not recognized".
-        assert!(date_part("dow", iv("1 day")).unwrap_err().message.contains("not supported"));
+        assert!(
+            date_part("dow", iv("1 day"))
+                .unwrap_err()
+                .message
+                .contains("not supported")
+        );
+
+        Ok(())
     }
 }

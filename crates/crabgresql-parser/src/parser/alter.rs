@@ -98,9 +98,6 @@ impl Parser<'_> {
         }
     }
 
-
-
-
     fn parse_pg_alter_role(&mut self) -> Result<Statement, ParserError> {
         let role_name = self.parse_identifier()?;
 

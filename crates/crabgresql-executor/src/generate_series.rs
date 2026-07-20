@@ -91,7 +91,11 @@ impl Series {
                 if *done {
                     return Ok(None);
                 }
-                let in_range = if *forward { *cur <= *stop } else { *cur >= *stop };
+                let in_range = if *forward {
+                    *cur <= *stop
+                } else {
+                    *cur >= *stop
+                };
                 if !in_range {
                     *done = true;
                     return Ok(None);
@@ -148,7 +152,11 @@ impl Series {
                 }
                 // Infinity sentinels are i64 extremes, so a raw compare orders
                 // -inf < finite < +inf correctly.
-                let in_range = if *forward { *cur <= *stop } else { *cur >= *stop };
+                let in_range = if *forward {
+                    *cur <= *stop
+                } else {
+                    *cur >= *stop
+                };
                 if !in_range {
                     *done = true;
                     return Ok(None);

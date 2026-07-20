@@ -95,6 +95,7 @@ pub fn format(b: &[u8; 16]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -105,32 +106,39 @@ mod tests {
     ];
 
     #[test]
-    fn roundtrip_canonical() {
-        assert_eq!(parse(CANON).unwrap(), BYTES);
+    fn roundtrip_canonical() -> anyhow::Result<()> {
+        assert_eq!(parse(CANON)?, BYTES);
         assert_eq!(format(&BYTES), CANON);
+
+        Ok(())
     }
 
     #[test]
-    fn accepts_input_variants() {
+    fn accepts_input_variants() -> anyhow::Result<()> {
         // No hyphens, braces, uppercase — all normalize to the canonical form.
-        assert_eq!(parse("a0eebc999c0b4ef8bb6d6bb9bd380a11").unwrap(), BYTES);
-        assert_eq!(parse("{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}").unwrap(), BYTES);
-        assert_eq!(parse("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11").unwrap(), BYTES);
+        assert_eq!(parse("a0eebc999c0b4ef8bb6d6bb9bd380a11")?, BYTES);
+        assert_eq!(parse("{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}")?, BYTES);
+        assert_eq!(parse("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11")?, BYTES);
+
+        Ok(())
     }
 
     #[test]
     fn rejects_malformed() {
         for bad in [
             "",
-            "a0eebc99",                                // too short
-            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-",   // trailing junk
-            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1z",    // non-hex
-            "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",   // unmatched brace
-            "a0-eebc999c0b4ef8bb6d6bb9bd380a11",        // hyphen after even byte index
+            "a0eebc99",                              // too short
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-", // trailing junk
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1z",  // non-hex
+            "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", // unmatched brace
+            "a0-eebc999c0b4ef8bb6d6bb9bd380a11",     // hyphen after even byte index
         ] {
             let e = parse(bad).unwrap_err();
             assert_eq!(e.sqlstate, "22P02", "{bad}");
-            assert_eq!(e.message, format!("invalid input syntax for type uuid: \"{bad}\""));
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type uuid: \"{bad}\"")
+            );
         }
     }
 }

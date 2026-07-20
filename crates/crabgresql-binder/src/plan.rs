@@ -459,9 +459,7 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         BoundExpr::IsNull { expr, .. } => subst_expr(expr, params),
         BoundExpr::Coerce { expr, .. } => subst_expr(expr, params),
         BoundExpr::Reinterpret { expr, .. } => subst_expr(expr, params),
-        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
-            subst_exprs(args, params)
-        }
+        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => subst_exprs(args, params),
         BoundExpr::Case { whens, else_, .. } => {
             for (cond, result) in whens {
                 subst_expr(cond, params);
@@ -1055,7 +1053,9 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
                 .iter()
                 .map(|(w, r)| (shift_column_refs(w, delta), shift_column_refs(r, delta)))
                 .collect(),
-            else_: else_.as_ref().map(|e| Box::new(shift_column_refs(e, delta))),
+            else_: else_
+                .as_ref()
+                .map(|e| Box::new(shift_column_refs(e, delta))),
             ty: *ty,
         },
         BoundExpr::Srf { func, ret, args } => BoundExpr::Srf {
@@ -1330,10 +1330,7 @@ fn build_merged_join(
     Ok((predicate, new_visible))
 }
 
-fn ensure_unique_qualifier(
-    seen: &mut HashSet<String>,
-    qualifier: &str,
-) -> Result<(), BindError> {
+fn ensure_unique_qualifier(seen: &mut HashSet<String>, qualifier: &str) -> Result<(), BindError> {
     if seen.insert(qualifier.to_string()) {
         Ok(())
     } else {
@@ -1362,9 +1359,7 @@ fn using_column_name(name: &ast::ObjectName) -> Result<String, BindError> {
 }
 
 /// Map an AST join operator to the kind and match strategy the binder builds.
-fn join_kind_and_constraint(
-    operator: &ast::JoinOperator,
-) -> Result<JoinBinding<'_>, BindError> {
+fn join_kind_and_constraint(operator: &ast::JoinOperator) -> Result<JoinBinding<'_>, BindError> {
     use ast::{JoinConstraint, JoinOperator};
 
     fn constrained(
@@ -1383,7 +1378,9 @@ fn join_kind_and_constraint(
                     if cols[..i].contains(name) {
                         return Err(BindError::new(
                             sqlstate::DUPLICATE_COLUMN,
-                            format!("column name \"{name}\" appears more than once in USING clause"),
+                            format!(
+                                "column name \"{name}\" appears more than once in USING clause"
+                            ),
                         ));
                     }
                 }
@@ -2558,30 +2555,40 @@ mod tests {
 
     fn engine_with_table() -> Arc<dyn TableEngine> {
         let engine = MemoryEngine::new();
-        engine
-            .create_table(TableSchema {
-                name: "t".into(),
-                columns: vec![
-                    Column::new("id", PgType::Int4),
-                    Column::new("big", PgType::Int8),
-                    Column::new("name", PgType::Text),
-                    Column::new("flag", PgType::Bool),
-                ],
-            })
-            .unwrap();
+        if let Err(error) = engine.create_table(TableSchema {
+            name: "t".into(),
+            columns: vec![
+                Column::new("id", PgType::Int4),
+                Column::new("big", PgType::Int8),
+                Column::new("name", PgType::Text),
+                Column::new("flag", PgType::Bool),
+            ],
+        }) {
+            panic!("failed to create binder test table: {error}");
+        }
         Arc::new(engine)
     }
 
     fn bind_one(sql: &str) -> Result<LogicalPlan, BindError> {
         let engine = engine_with_table();
         let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
-        let stmts = crabgresql_parser::parse(sql).unwrap();
+        let stmts = match crabgresql_parser::parse(sql) {
+            Ok(stmts) => stmts,
+            Err(error) => panic!("invalid SQL test fixture `{sql}`: {error}"),
+        };
         match &stmts[0] {
             ast::Statement::Query(q) => bind_query(&engine, &catalog, q),
             ast::Statement::Insert(i) => bind_insert(&engine, &catalog, i),
             ast::Statement::Update(u) => bind_update(&engine, &catalog, u),
             ast::Statement::Delete(d) => bind_delete(&engine, &catalog, d),
             other => panic!("unexpected statement: {other}"),
+        }
+    }
+
+    fn bound(sql: &str) -> LogicalPlan {
+        match bind_one(sql) {
+            Ok(plan) => plan,
+            Err(error) => panic!("failed to bind SQL test fixture `{sql}`: {error}"),
         }
     }
 
@@ -2601,7 +2608,7 @@ mod tests {
         Vec<BoundExpr>,
         Option<BoundExpr>,
     ) {
-        match bind_one(sql).unwrap() {
+        match bound(sql) {
             LogicalPlan::Aggregate {
                 group_exprs,
                 aggregates,
@@ -2685,7 +2692,10 @@ mod tests {
 
     #[test]
     fn duplicate_treatment_with_wildcard_is_a_syntax_error() {
-        for sql in ["SELECT count(DISTINCT *) FROM t", "SELECT count(ALL *) FROM t"] {
+        for sql in [
+            "SELECT count(DISTINCT *) FROM t",
+            "SELECT count(ALL *) FROM t",
+        ] {
             let err = bind_err(sql);
             assert_eq!(err.code, sqlstate::SYNTAX_ERROR);
             assert_eq!(err.message, "syntax error at or near \"*\"");
@@ -2926,9 +2936,8 @@ mod tests {
     }
 
     #[test]
-    fn resolves_columns_to_indices() {
-        let LogicalPlan::Query { projections, .. } = bind_one("SELECT name, id FROM t").unwrap()
-        else {
+    fn resolves_columns_to_indices() -> anyhow::Result<()> {
+        let LogicalPlan::Query { projections, .. } = bind_one("SELECT name, id FROM t")? else {
             panic!("expected Query");
         };
         assert_eq!(
@@ -2944,6 +2953,8 @@ mod tests {
                 },
             ]
         );
+
+        Ok(())
     }
 
     #[test]
@@ -2955,7 +2966,7 @@ mod tests {
 
     /// The first projected expression of a bound FROM-less `SELECT`.
     fn one_projection(sql: &str) -> BoundExpr {
-        let LogicalPlan::Values { mut rows, .. } = bind_one(sql).unwrap() else {
+        let LogicalPlan::Values { mut rows, .. } = bound(sql) else {
             panic!("expected Values");
         };
         rows.remove(0).remove(0)
@@ -3051,9 +3062,8 @@ mod tests {
     }
 
     #[test]
-    fn int4_int8_comparison_promotes_via_coerce() {
-        let LogicalPlan::Query { predicate, .. } =
-            bind_one("SELECT id FROM t WHERE id = big").unwrap()
+    fn int4_int8_comparison_promotes_via_coerce() -> anyhow::Result<()> {
+        let LogicalPlan::Query { predicate, .. } = bind_one("SELECT id FROM t WHERE id = big")?
         else {
             panic!("expected Query");
         };
@@ -3076,12 +3086,13 @@ mod tests {
                 ty: PgType::Int8,
             }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn unknown_literal_takes_type_from_other_side() {
-        let LogicalPlan::Query { predicate, .. } =
-            bind_one("SELECT id FROM t WHERE big = '5'").unwrap()
+    fn unknown_literal_takes_type_from_other_side() -> anyhow::Result<()> {
+        let LogicalPlan::Query { predicate, .. } = bind_one("SELECT id FROM t WHERE big = '5'")?
         else {
             panic!("expected Query");
         };
@@ -3096,6 +3107,8 @@ mod tests {
                 ty: PgType::Int8
             }
         );
+
+        Ok(())
     }
 
     #[test]
@@ -3106,8 +3119,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_vs_unknown_comparison_falls_back_to_text() {
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 'a' = 'b'").unwrap() else {
+    fn unknown_vs_unknown_comparison_falls_back_to_text() -> anyhow::Result<()> {
+        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 'a' = 'b'")? else {
             panic!("expected Values");
         };
         assert_eq!(rows.len(), 1);
@@ -3115,6 +3128,8 @@ mod tests {
             panic!("expected comparison");
         };
         assert_eq!(*arg_ty, PgType::Text);
+
+        Ok(())
     }
 
     #[test]
@@ -3146,9 +3161,8 @@ mod tests {
     }
 
     #[test]
-    fn min_int4_literal_binds_as_int4() {
-        let LogicalPlan::Values { rows, columns, .. } = bind_one("SELECT -2147483648").unwrap()
-        else {
+    fn min_int4_literal_binds_as_int4() -> anyhow::Result<()> {
+        let LogicalPlan::Values { rows, columns, .. } = bind_one("SELECT -2147483648")? else {
             panic!("expected Values");
         };
         assert_eq!(
@@ -3159,23 +3173,27 @@ mod tests {
             }
         );
         assert_eq!(columns[0].ty, PgType::Int4);
+
+        Ok(())
     }
 
     #[test]
-    fn output_column_names_follow_pg() {
+    fn output_column_names_follow_pg() -> anyhow::Result<()> {
         let LogicalPlan::Query { columns, .. } =
-            bind_one("SELECT id, (name), id + 1 AS next, id + 1, true FROM t").unwrap()
+            bind_one("SELECT id, (name), id + 1 AS next, id + 1, true FROM t")?
         else {
             panic!("expected Query");
         };
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "name", "next", "?column?", "bool"]);
+
+        Ok(())
     }
 
     #[test]
-    fn insert_coerces_cells_to_column_types() {
+    fn insert_coerces_cells_to_column_types() -> anyhow::Result<()> {
         let LogicalPlan::Insert { rows, .. } =
-            bind_one("INSERT INTO t (id, name) VALUES ('7', 'x')").unwrap()
+            bind_one("INSERT INTO t (id, name) VALUES ('7', 'x')")?
         else {
             panic!("expected Insert");
         };
@@ -3195,6 +3213,8 @@ mod tests {
                 ty: PgType::Int8
             }
         );
+
+        Ok(())
     }
 
     #[test]
@@ -3214,12 +3234,12 @@ mod tests {
     }
 
     #[test]
-    fn update_binds_assignments_by_index() {
+    fn update_binds_assignments_by_index() -> anyhow::Result<()> {
         let LogicalPlan::Update {
             assignments,
             predicate,
             ..
-        } = bind_one("UPDATE t SET name = 'x', id = id + 1 WHERE flag").unwrap()
+        } = bind_one("UPDATE t SET name = 'x', id = id + 1 WHERE flag")?
         else {
             panic!("expected Update");
         };
@@ -3227,6 +3247,8 @@ mod tests {
         assert_eq!(assignments[0].0, 2);
         assert_eq!(assignments[1].0, 0);
         assert!(predicate.is_some());
+
+        Ok(())
     }
 
     #[test]
@@ -3247,9 +3269,8 @@ mod tests {
     }
 
     #[test]
-    fn update_assignment_coerces_to_column_type() {
-        let LogicalPlan::Update { assignments, .. } = bind_one("UPDATE t SET id = big").unwrap()
-        else {
+    fn update_assignment_coerces_to_column_type() -> anyhow::Result<()> {
+        let LogicalPlan::Update { assignments, .. } = bind_one("UPDATE t SET id = big")? else {
             panic!("expected Update");
         };
         assert_eq!(
@@ -3262,19 +3283,22 @@ mod tests {
                 ty: PgType::Int4,
             }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn delete_binds_predicate() {
-        let LogicalPlan::Delete { predicate, .. } = bind_one("DELETE FROM t WHERE id = 1").unwrap()
-        else {
+    fn delete_binds_predicate() -> anyhow::Result<()> {
+        let LogicalPlan::Delete { predicate, .. } = bind_one("DELETE FROM t WHERE id = 1")? else {
             panic!("expected Delete");
         };
         assert!(predicate.is_some());
-        let LogicalPlan::Delete { predicate, .. } = bind_one("DELETE FROM t").unwrap() else {
+        let LogicalPlan::Delete { predicate, .. } = bind_one("DELETE FROM t")? else {
             panic!("expected Delete");
         };
         assert!(predicate.is_none());
+
+        Ok(())
     }
 
     #[test]
@@ -3296,9 +3320,8 @@ mod tests {
     }
 
     #[test]
-    fn default_keyword_binds_as_typed_null_without_a_declared_default() {
-        let LogicalPlan::Insert { rows, .. } =
-            bind_one("INSERT INTO t (id) VALUES (DEFAULT)").unwrap()
+    fn default_keyword_binds_as_typed_null_without_a_declared_default() -> anyhow::Result<()> {
+        let LogicalPlan::Insert { rows, .. } = bind_one("INSERT INTO t (id) VALUES (DEFAULT)")?
         else {
             panic!("expected Insert");
         };
@@ -3310,6 +3333,8 @@ mod tests {
             }
         );
         assert!(bind_one("UPDATE t SET id = DEFAULT").is_ok());
+
+        Ok(())
     }
 
     #[test]
@@ -3342,14 +3367,14 @@ mod tests {
     }
 
     #[test]
-    fn bool_literals_accept_pg_prefixes() {
+    fn bool_literals_accept_pg_prefixes() -> anyhow::Result<()> {
         for (sql, expected) in [
             ("UPDATE t SET flag = 'tru'", Value::Bool(true)),
             ("UPDATE t SET flag = 'of'", Value::Bool(false)),
             ("UPDATE t SET flag = 'ye'", Value::Bool(true)),
             ("UPDATE t SET flag = 'N'", Value::Bool(false)),
         ] {
-            let LogicalPlan::Update { assignments, .. } = bind_one(sql).unwrap() else {
+            let LogicalPlan::Update { assignments, .. } = bind_one(sql)? else {
                 panic!("expected Update for: {sql}");
             };
             assert_eq!(
@@ -3364,6 +3389,8 @@ mod tests {
         // A bare "o" is ambiguous between on and off.
         let e = bind_err("UPDATE t SET flag = 'o'");
         assert_eq!(e.code, "22P02");
+
+        Ok(())
     }
 
     #[test]
@@ -3377,8 +3404,8 @@ mod tests {
     }
 
     #[test]
-    fn decimal_literal_binds_as_numeric() {
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5").unwrap() else {
+    fn decimal_literal_binds_as_numeric() -> anyhow::Result<()> {
+        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5")? else {
             panic!("expected Values");
         };
         let BoundExpr::Const {
@@ -3389,6 +3416,8 @@ mod tests {
             panic!("expected numeric const, got {:?}", rows[0][0]);
         };
         assert_eq!(n.to_display(), "1.5");
+
+        Ok(())
     }
 
     #[test]
@@ -3470,8 +3499,8 @@ mod tests {
     }
 
     #[test]
-    fn float_literal_cast_binds() {
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 'NaN'::float4").unwrap() else {
+    fn float_literal_cast_binds() -> anyhow::Result<()> {
+        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 'NaN'::float4")? else {
             panic!("expected Values");
         };
         let BoundExpr::Const {
@@ -3482,6 +3511,8 @@ mod tests {
             panic!("expected float4 const, got {:?}", rows[0][0]);
         };
         assert!(v.is_nan());
+
+        Ok(())
     }
 
     #[test]
@@ -3520,23 +3551,26 @@ mod tests {
     }
 
     #[test]
-    fn numeric_operators_bind() {
+    fn numeric_operators_bind() -> anyhow::Result<()> {
         // Comparison, arithmetic, and modulo all resolve for numeric now.
         assert!(bind_one("SELECT '1'::numeric < '2'::numeric").is_ok());
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5 + 2.25").unwrap() else {
+        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5 + 2.25")? else {
             panic!("expected Values");
         };
         assert_eq!(rows[0][0].ty(), PgType::Numeric);
         assert!(bind_one("SELECT 5.5 % 2.0").is_ok());
+
+        Ok(())
     }
 
     #[test]
-    fn int2_arithmetic_binds() {
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT '1'::int2 + '2'::int2").unwrap()
-        else {
+    fn int2_arithmetic_binds() -> anyhow::Result<()> {
+        let LogicalPlan::Values { rows, .. } = bind_one("SELECT '1'::int2 + '2'::int2")? else {
             panic!("expected Values");
         };
         assert_eq!(rows[0][0].ty(), PgType::Int2);
+
+        Ok(())
     }
 
     #[test]
@@ -3546,36 +3580,38 @@ mod tests {
     }
 
     #[test]
-    fn cast_keeps_bare_column_name() {
-        let LogicalPlan::Query { columns, .. } = bind_one("SELECT id::int8 FROM t").unwrap() else {
+    fn cast_keeps_bare_column_name() -> anyhow::Result<()> {
+        let LogicalPlan::Query { columns, .. } = bind_one("SELECT id::int8 FROM t")? else {
             panic!("expected Query");
         };
         assert_eq!(columns[0].name, "id");
         // A constant/nested cast falls back to the target type name.
-        let LogicalPlan::Values { columns, .. } =
-            bind_one("SELECT 'nan'::numeric::float4").unwrap()
-        else {
+        let LogicalPlan::Values { columns, .. } = bind_one("SELECT 'nan'::numeric::float4")? else {
             panic!("expected Values");
         };
         assert_eq!(columns[0].name, "float4");
+
+        Ok(())
     }
 
     #[test]
-    fn select_where_without_table_binds_predicate() {
+    fn select_where_without_table_binds_predicate() -> anyhow::Result<()> {
         let LogicalPlan::Values {
             rows, predicate, ..
-        } = bind_one("SELECT 1 WHERE 1 = 2").unwrap()
+        } = bind_one("SELECT 1 WHERE 1 = 2")?
         else {
             panic!("expected Values");
         };
         assert_eq!(rows.len(), 1);
         assert!(predicate.is_some());
+
+        Ok(())
     }
 
     #[test]
-    fn set_returning_function_in_from_binds_columns() {
+    fn set_returning_function_in_from_binds_columns() -> anyhow::Result<()> {
         let LogicalPlan::TableFunction { func, columns, .. } =
-            bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4')").unwrap()
+            bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4')")?
         else {
             panic!("expected TableFunction");
         };
@@ -3583,24 +3619,27 @@ mod tests {
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
         assert!(columns.iter().all(|c| c.ty == PgType::Text));
+
+        Ok(())
     }
 
     #[test]
-    fn set_returning_function_projects_and_filters() {
+    fn set_returning_function_projects_and_filters() -> anyhow::Result<()> {
         // A subset projection over the SRF's columns resolves like a table.
         let LogicalPlan::TableFunction {
             columns, predicate, ..
         } = bind_one(
             "SELECT sql_error_code FROM pg_input_error_info('1e400', 'float4') \
              WHERE message IS NOT NULL",
-        )
-        .unwrap()
+        )?
         else {
             panic!("expected TableFunction");
         };
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "sql_error_code");
         assert!(predicate.is_some());
+
+        Ok(())
     }
 
     #[test]
@@ -3611,9 +3650,9 @@ mod tests {
     }
 
     #[test]
-    fn generate_series_in_from_binds_int4_column() {
+    fn generate_series_in_from_binds_int4_column() -> anyhow::Result<()> {
         let LogicalPlan::TableFunction { func, columns, .. } =
-            bind_one("SELECT * FROM generate_series(1, 5)").unwrap()
+            bind_one("SELECT * FROM generate_series(1, 5)")?
         else {
             panic!("expected TableFunction");
         };
@@ -3621,29 +3660,35 @@ mod tests {
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "generate_series");
         assert_eq!(columns[0].ty, PgType::Int4);
+
+        Ok(())
     }
 
     #[test]
-    fn generate_series_widens_to_int8() {
+    fn generate_series_widens_to_int8() -> anyhow::Result<()> {
         // A bigint bound widens the whole series to int8.
         let LogicalPlan::TableFunction { func, columns, .. } =
-            bind_one("SELECT * FROM generate_series(1, 5000000000)").unwrap()
+            bind_one("SELECT * FROM generate_series(1, 5000000000)")?
         else {
             panic!("expected TableFunction");
         };
         assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int8));
         assert_eq!(columns[0].ty, PgType::Int8);
+
+        Ok(())
     }
 
     #[test]
-    fn generate_series_three_arg_step_binds() {
+    fn generate_series_three_arg_step_binds() -> anyhow::Result<()> {
         let LogicalPlan::TableFunction { func, args, .. } =
-            bind_one("SELECT * FROM generate_series(1, 10, 3)").unwrap()
+            bind_one("SELECT * FROM generate_series(1, 10, 3)")?
         else {
             panic!("expected TableFunction");
         };
         assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int4));
         assert_eq!(args.len(), 3);
+
+        Ok(())
     }
 
     #[test]
@@ -3653,14 +3698,14 @@ mod tests {
     }
 
     #[test]
-    fn generate_series_in_target_list_is_srf_projection() {
+    fn generate_series_in_target_list_is_srf_projection() -> anyhow::Result<()> {
         // A FROM-less SRF in the target list expands over a single dummy row.
         let LogicalPlan::Subquery {
             columns,
             projections,
             source,
             ..
-        } = bind_one("SELECT generate_series(1, 5)").unwrap()
+        } = bind_one("SELECT generate_series(1, 5)")?
         else {
             panic!("expected Subquery over a single-row source");
         };
@@ -3669,22 +3714,26 @@ mod tests {
         assert_eq!(columns[0].ty, PgType::Int4);
         assert!(matches!(projections[0], BoundExpr::Srf { .. }));
         assert!(matches!(*source, LogicalPlan::Values { .. }));
+
+        Ok(())
     }
 
     #[test]
-    fn generate_series_in_target_list_over_table() {
+    fn generate_series_in_target_list_over_table() -> anyhow::Result<()> {
         // Mixed scalar + SRF projection over a base table stays a Query.
         let LogicalPlan::Query { projections, .. } =
-            bind_one("SELECT id, generate_series(1, 2) FROM t").unwrap()
+            bind_one("SELECT id, generate_series(1, 2) FROM t")?
         else {
             panic!("expected Query");
         };
         assert!(matches!(projections[0], BoundExpr::ColumnRef { .. }));
         assert!(matches!(projections[1], BoundExpr::Srf { .. }));
+
+        Ok(())
     }
 
     fn table_fn(sql: &str) -> (crate::TableFn, Vec<OutputColumn>) {
-        let LogicalPlan::TableFunction { func, columns, .. } = bind_one(sql).unwrap() else {
+        let LogicalPlan::TableFunction { func, columns, .. } = bound(sql) else {
             panic!("expected TableFunction");
         };
         (func, columns)
@@ -3728,9 +3777,8 @@ mod tests {
     }
 
     #[test]
-    fn standalone_values_binds_to_values_plan() {
-        let LogicalPlan::Values { columns, rows, .. } =
-            bind_one("VALUES (1, 'a'), (2, 'b')").unwrap()
+    fn standalone_values_binds_to_values_plan() -> anyhow::Result<()> {
+        let LogicalPlan::Values { columns, rows, .. } = bind_one("VALUES (1, 'a'), (2, 'b')")?
         else {
             panic!("expected Values");
         };
@@ -3738,6 +3786,8 @@ mod tests {
         assert_eq!(columns[0].name, "column1");
         assert_eq!(columns[1].name, "column2");
         assert_eq!(rows.len(), 2);
+
+        Ok(())
     }
 
     #[test]
@@ -3747,25 +3797,28 @@ mod tests {
     }
 
     #[test]
-    fn values_common_type_keeps_real_over_int() {
+    fn values_common_type_keeps_real_over_int() -> anyhow::Result<()> {
         // PG's select_common_type resolves (real, int4) to real, not float8
         // (int4 implicitly casts to real). Contrast with operator resolution.
-        let LogicalPlan::Values { columns, .. } =
-            bind_one("VALUES (CAST(1.5 AS real)), (2)").unwrap()
+        let LogicalPlan::Values { columns, .. } = bind_one("VALUES (CAST(1.5 AS real)), (2)")?
         else {
             panic!("expected Values");
         };
         assert_eq!(columns[0].ty, PgType::Float4);
+
+        Ok(())
     }
 
     #[test]
-    fn derived_table_binds_to_subquery_plan() {
+    fn derived_table_binds_to_subquery_plan() -> anyhow::Result<()> {
         let LogicalPlan::Subquery { columns, .. } =
-            bind_one("SELECT x FROM (VALUES (1), (2)) v(x)").unwrap()
+            bind_one("SELECT x FROM (VALUES (1), (2)) v(x)")?
         else {
             panic!("expected Subquery");
         };
         assert_eq!(columns[0].name, "x");
+
+        Ok(())
     }
 
     #[test]
@@ -3776,13 +3829,15 @@ mod tests {
     }
 
     #[test]
-    fn cte_reference_resolves_to_subquery() {
+    fn cte_reference_resolves_to_subquery() -> anyhow::Result<()> {
         let LogicalPlan::Subquery { columns, .. } =
-            bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t").unwrap()
+            bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?
         else {
             panic!("expected Subquery");
         };
         assert_eq!(columns[0].name, "x");
+
+        Ok(())
     }
 
     #[test]
@@ -3828,15 +3883,17 @@ mod tests {
     }
 
     #[test]
-    fn cte_shadows_a_real_table() {
+    fn cte_shadows_a_real_table() -> anyhow::Result<()> {
         // `t` here is the CTE, not the base table `t`; its column is `x`.
         let LogicalPlan::Subquery { columns, .. } =
-            bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t").unwrap()
+            bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?
         else {
             panic!("expected Subquery");
         };
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "x");
+
+        Ok(())
     }
 
     fn case_column(sql: &str) -> (OutputColumn, BoundExpr) {
@@ -3844,7 +3901,7 @@ mod tests {
             columns,
             projections,
             ..
-        } = bind_one(sql).unwrap()
+        } = bound(sql)
         else {
             panic!("expected Query");
         };
@@ -3946,14 +4003,14 @@ mod tests {
     }
 
     #[test]
-    fn cross_join_builds_join_plan_with_offsets() {
+    fn cross_join_builds_join_plan_with_offsets() -> anyhow::Result<()> {
         // Two derived tables: a(x) at offset 0, b(y) at offset 1.
         let LogicalPlan::Join {
             source,
             columns,
             projections,
             ..
-        } = bind_one("SELECT a.x, b.y FROM (VALUES (1)) a(x), (VALUES (2)) b(y)").unwrap()
+        } = bind_one("SELECT a.x, b.y FROM (VALUES (1)) a(x), (VALUES (2)) b(y)")?
         else {
             panic!("expected Join");
         };
@@ -3981,15 +4038,17 @@ mod tests {
         );
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["x", "y"]);
+
+        Ok(())
     }
 
     #[test]
-    fn cross_join_wildcard_expands_every_relation_in_order() {
+    fn cross_join_wildcard_expands_every_relation_in_order() -> anyhow::Result<()> {
         let LogicalPlan::Join {
             columns,
             projections,
             ..
-        } = bind_one("SELECT * FROM (VALUES (1, 2)) a(x, y), (VALUES (3)) b(z)").unwrap()
+        } = bind_one("SELECT * FROM (VALUES (1, 2)) a(x, y), (VALUES (3)) b(z)")?
         else {
             panic!("expected Join");
         };
@@ -4003,13 +4062,15 @@ mod tests {
                 ty: PgType::Int4
             }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn cross_join_qualified_refs_use_combined_row_index() {
+    fn cross_join_qualified_refs_use_combined_row_index() -> anyhow::Result<()> {
         // `t` occupies indices 0..4 (id, big, name, flag); b.y follows at 4.
         let LogicalPlan::Join { projections, .. } =
-            bind_one("SELECT t.id, b.y FROM t, (VALUES (2)) b(y)").unwrap()
+            bind_one("SELECT t.id, b.y FROM t, (VALUES (2)) b(y)")?
         else {
             panic!("expected Join");
         };
@@ -4027,6 +4088,8 @@ mod tests {
                 ty: PgType::Int4
             }
         );
+
+        Ok(())
     }
 
     #[test]
@@ -4044,9 +4107,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cross_join_flattens_like_a_comma() {
+    fn explicit_cross_join_flattens_like_a_comma() -> anyhow::Result<()> {
         let LogicalPlan::Join { source, .. } =
-            bind_one("SELECT * FROM (VALUES (1)) a(x) CROSS JOIN (VALUES (2)) b(y)").unwrap()
+            bind_one("SELECT * FROM (VALUES (1)) a(x) CROSS JOIN (VALUES (2)) b(y)")?
         else {
             panic!("expected Join");
         };
@@ -4058,17 +4121,28 @@ mod tests {
                 ..
             }
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn on_join_kinds_bind_boolean_predicates() {
+    fn on_join_kinds_bind_boolean_predicates() -> anyhow::Result<()> {
         for (sql, expected) in [
             ("SELECT * FROM t a JOIN t b ON a.id = b.id", JoinKind::Inner),
-            ("SELECT * FROM t a LEFT JOIN t b ON a.id = b.id", JoinKind::Left),
-            ("SELECT * FROM t a RIGHT OUTER JOIN t b ON a.id = b.id", JoinKind::Right),
-            ("SELECT * FROM t a FULL JOIN t b ON a.id = b.id", JoinKind::Full),
+            (
+                "SELECT * FROM t a LEFT JOIN t b ON a.id = b.id",
+                JoinKind::Left,
+            ),
+            (
+                "SELECT * FROM t a RIGHT OUTER JOIN t b ON a.id = b.id",
+                JoinKind::Right,
+            ),
+            (
+                "SELECT * FROM t a FULL JOIN t b ON a.id = b.id",
+                JoinKind::Full,
+            ),
         ] {
-            let LogicalPlan::Join { source, .. } = bind_one(sql).unwrap() else {
+            let LogicalPlan::Join { source, .. } = bind_one(sql)? else {
                 panic!("expected Join for {sql}");
             };
             let JoinExpr::Join {
@@ -4087,10 +4161,12 @@ mod tests {
                 })
             ));
         }
+
+        Ok(())
     }
 
     #[test]
-    fn chained_join_is_left_associative_and_offsets_keep_growing() {
+    fn chained_join_is_left_associative_and_offsets_keep_growing() -> anyhow::Result<()> {
         let LogicalPlan::Join {
             source,
             projections,
@@ -4099,8 +4175,7 @@ mod tests {
             "SELECT c.z FROM (VALUES (1)) a(x) \
              LEFT JOIN (VALUES (1)) b(y) ON a.x = b.y \
              JOIN (VALUES (1)) c(z) ON b.y = c.z",
-        )
-        .unwrap()
+        )?
         else {
             panic!("expected Join");
         };
@@ -4126,6 +4201,8 @@ mod tests {
                 ty: PgType::Int4
             }
         );
+
+        Ok(())
     }
 
     #[test]
@@ -4159,7 +4236,7 @@ mod tests {
     }
 
     #[test]
-    fn using_join_merges_column_and_builds_equality() {
+    fn using_join_merges_column_and_builds_equality() -> anyhow::Result<()> {
         // `id` is merged (once, first); the other three columns of each side
         // follow — 1 + 3 + 3 = 7 output columns.
         let LogicalPlan::Join {
@@ -4167,7 +4244,7 @@ mod tests {
             columns,
             projections,
             ..
-        } = bind_one("SELECT * FROM t a JOIN t b USING (id)").unwrap()
+        } = bind_one("SELECT * FROM t a JOIN t b USING (id)")?
         else {
             panic!("expected Join");
         };
@@ -4193,12 +4270,14 @@ mod tests {
                 ty: PgType::Int4
             }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn using_merged_column_is_unqualified_while_sides_stay_addressable() {
+    fn using_merged_column_is_unqualified_while_sides_stay_addressable() -> anyhow::Result<()> {
         let LogicalPlan::Join { projections, .. } =
-            bind_one("SELECT id, a.id, b.id FROM t a JOIN t b USING (id)").unwrap()
+            bind_one("SELECT id, a.id, b.id FROM t a JOIN t b USING (id)")?
         else {
             panic!("expected Join");
         };
@@ -4213,12 +4292,14 @@ mod tests {
             ty: PgType::Int4,
         };
         assert_eq!(projections, vec![left.clone(), left, right]);
+
+        Ok(())
     }
 
     #[test]
-    fn using_full_join_merges_with_coalesce() {
+    fn using_full_join_merges_with_coalesce() -> anyhow::Result<()> {
         let LogicalPlan::Join { projections, .. } =
-            bind_one("SELECT id FROM t a FULL JOIN t b USING (id)").unwrap()
+            bind_one("SELECT id FROM t a FULL JOIN t b USING (id)")?
         else {
             panic!("expected Join");
         };
@@ -4230,13 +4311,15 @@ mod tests {
                 ..
             }
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn natural_join_equates_every_common_column() {
+    fn natural_join_equates_every_common_column() -> anyhow::Result<()> {
         let LogicalPlan::Join {
             source, columns, ..
-        } = bind_one("SELECT * FROM t a NATURAL JOIN t b").unwrap()
+        } = bind_one("SELECT * FROM t a NATURAL JOIN t b")?
         else {
             panic!("expected Join");
         };
@@ -4253,13 +4336,15 @@ mod tests {
                 ..
             }
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn natural_join_without_common_columns_is_a_cross_product() {
+    fn natural_join_without_common_columns_is_a_cross_product() -> anyhow::Result<()> {
         let LogicalPlan::Join {
             source, columns, ..
-        } = bind_one("SELECT * FROM (VALUES (1)) a(x) NATURAL JOIN (VALUES (2)) b(y)").unwrap()
+        } = bind_one("SELECT * FROM (VALUES (1)) a(x) NATURAL JOIN (VALUES (2)) b(y)")?
         else {
             panic!("expected Join");
         };
@@ -4272,6 +4357,8 @@ mod tests {
                 ..
             }
         ));
+
+        Ok(())
     }
 
     #[test]
@@ -4291,7 +4378,7 @@ mod tests {
     }
 
     #[test]
-    fn using_join_in_a_later_comma_group_shifts_merged_indices() {
+    fn using_join_in_a_later_comma_group_shifts_merged_indices() -> anyhow::Result<()> {
         // `t` (4 columns) is the first comma group, so the merged `id` and the
         // rest of the USING group live at combined-row offsets 4 and up.
         let LogicalPlan::Join {
@@ -4301,8 +4388,7 @@ mod tests {
         } = bind_one(
             "SELECT * FROM t, \
              (VALUES (5, 50)) a(id, x) JOIN (VALUES (5, 500)) b(id, y) USING (id)",
-        )
-        .unwrap()
+        )?
         else {
             panic!("expected Join");
         };
@@ -4324,6 +4410,8 @@ mod tests {
                 ty: PgType::Int4
             }
         );
+
+        Ok(())
     }
 
     #[test]
@@ -4337,16 +4425,17 @@ mod tests {
     }
 
     #[test]
-    fn using_merged_column_uses_common_type_not_comparison_type() {
+    fn using_merged_column_uses_common_type_not_comparison_type() -> anyhow::Result<()> {
         // real + int4: PG's select_common_type resolves the merged column to
         // real, even though the equality comparison promotes to float8.
         let LogicalPlan::Join { projections, .. } =
-            bind_one("SELECT x FROM (VALUES (1.0::real)) a(x) JOIN (VALUES (1)) b(x) USING (x)")
-                .unwrap()
+            bind_one("SELECT x FROM (VALUES (1.0::real)) a(x) JOIN (VALUES (1)) b(x) USING (x)")?
         else {
             panic!("expected Join");
         };
         assert_eq!(projections[0].ty(), PgType::Float4);
+
+        Ok(())
     }
 
     #[test]
@@ -4360,12 +4449,12 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_accepts_join_input() {
+    fn aggregate_accepts_join_input() -> anyhow::Result<()> {
         let LogicalPlan::Aggregate {
             input: AggInput::Join(source),
             aggregates,
             ..
-        } = bind_one("SELECT count(*) FROM t a LEFT JOIN t b ON a.id = b.id").unwrap()
+        } = bind_one("SELECT count(*) FROM t a LEFT JOIN t b ON a.id = b.id")?
         else {
             panic!("expected Aggregate over Join");
         };
@@ -4377,17 +4466,20 @@ mod tests {
                 ..
             }
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn where_referencing_both_relations_binds() {
+    fn where_referencing_both_relations_binds() -> anyhow::Result<()> {
         let LogicalPlan::Join { predicate, .. } =
-            bind_one("SELECT a.x FROM (VALUES (1)) a(x), (VALUES (1)) b(y) WHERE a.x = b.y")
-                .unwrap()
+            bind_one("SELECT a.x FROM (VALUES (1)) a(x), (VALUES (1)) b(y) WHERE a.x = b.y")?
         else {
             panic!("expected Join");
         };
         assert!(predicate.is_some());
+
+        Ok(())
     }
 
     #[test]
@@ -4413,7 +4505,7 @@ mod tests {
 
     /// A single-table SELECT's projections and sort keys.
     fn query_parts(sql: &str) -> (Vec<BoundExpr>, Vec<SortKey>) {
-        match bind_one(sql).unwrap() {
+        match bound(sql) {
             LogicalPlan::Query {
                 projections, sort, ..
             } => (projections, sort),
@@ -4522,14 +4614,14 @@ mod tests {
     }
 
     #[test]
-    fn values_order_by_column_name_resolves() {
-        let LogicalPlan::Values { sort, .. } =
-            bind_one("VALUES (3), (1) ORDER BY column1").unwrap()
-        else {
+    fn values_order_by_column_name_resolves() -> anyhow::Result<()> {
+        let LogicalPlan::Values { sort, .. } = bind_one("VALUES (3), (1) ORDER BY column1")? else {
             panic!("expected Values");
         };
         assert_eq!(sort[0].column, 0);
         assert_eq!(sort[0].ty, PgType::Int4);
+
+        Ok(())
     }
 
     #[test]
@@ -4541,53 +4633,60 @@ mod tests {
     }
 
     #[test]
-    fn limit_offset_wraps_body() {
+    fn limit_offset_wraps_body() -> anyhow::Result<()> {
         let LogicalPlan::Limit {
             source,
             limit,
             offset,
-        } = bind_one("SELECT id FROM t LIMIT 5 OFFSET 2").unwrap()
+        } = bind_one("SELECT id FROM t LIMIT 5 OFFSET 2")?
         else {
             panic!("expected Limit");
         };
         assert_eq!(limit, Some(5));
         assert_eq!(offset, Some(2));
         assert!(matches!(*source, LogicalPlan::Query { .. }));
+
+        Ok(())
     }
 
     #[test]
-    fn offset_zero_is_a_bare_offset() {
+    fn offset_zero_is_a_bare_offset() -> anyhow::Result<()> {
         // The float4/float8 optimization-fence shape: `OFFSET 0`, no LIMIT.
-        let LogicalPlan::Limit { limit, offset, .. } =
-            bind_one("SELECT id FROM t OFFSET 0").unwrap()
+        let LogicalPlan::Limit { limit, offset, .. } = bind_one("SELECT id FROM t OFFSET 0")?
         else {
             panic!("expected Limit");
         };
         assert_eq!(limit, None);
         assert_eq!(offset, Some(0));
+
+        Ok(())
     }
 
     #[test]
-    fn limit_all_is_no_bound() {
+    fn limit_all_is_no_bound() -> anyhow::Result<()> {
         // `LIMIT ALL OFFSET 3` carries only the offset; the limit is unbounded.
         let LogicalPlan::Limit { limit, offset, .. } =
-            bind_one("SELECT id FROM t LIMIT ALL OFFSET 3").unwrap()
+            bind_one("SELECT id FROM t LIMIT ALL OFFSET 3")?
         else {
             panic!("expected Limit");
         };
         assert_eq!(limit, None);
         assert_eq!(offset, Some(3));
+
+        Ok(())
     }
 
     #[test]
-    fn offset_in_derived_table_wraps_subplan() {
+    fn offset_in_derived_table_wraps_subplan() -> anyhow::Result<()> {
         // `OFFSET 0` inside a FROM subquery binds as a Limit at that level.
         let LogicalPlan::Subquery { source, .. } =
-            bind_one("SELECT * FROM (SELECT id FROM t OFFSET 0) s").unwrap()
+            bind_one("SELECT * FROM (SELECT id FROM t OFFSET 0) s")?
         else {
             panic!("expected Subquery");
         };
         assert!(matches!(*source, LogicalPlan::Limit { .. }));
+
+        Ok(())
     }
 
     #[test]
@@ -4609,11 +4708,17 @@ mod tests {
     /// Bind `sql` for the extended protocol with the given declared parameter
     /// types, returning both the plan result and the shared context (so tests
     /// can read back the inferred types).
-    fn bind_params(sql: &str, declared: Vec<Option<PgType>>) -> (Result<LogicalPlan, BindError>, ParamCtx) {
+    fn bind_params(
+        sql: &str,
+        declared: Vec<Option<PgType>>,
+    ) -> (Result<LogicalPlan, BindError>, ParamCtx) {
         let engine = engine_with_table();
         let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         let ctx = param_ctx_extended(declared);
-        let stmts = crabgresql_parser::parse(sql).unwrap();
+        let stmts = match crabgresql_parser::parse(sql) {
+            Ok(stmts) => stmts,
+            Err(error) => panic!("invalid SQL test fixture `{sql}`: {error}"),
+        };
         let plan = match &stmts[0] {
             ast::Statement::Query(q) => bind_query_with_params(&engine, &catalog, q, &ctx),
             other => panic!("unexpected statement: {other}"),
@@ -4632,7 +4737,10 @@ mod tests {
         };
         assert_eq!(
             rows[0][0],
-            BoundExpr::Param { index: 0, ty: PgType::Int4 }
+            BoundExpr::Param {
+                index: 0,
+                ty: PgType::Int4
+            }
         );
     }
 
@@ -4673,10 +4781,7 @@ mod tests {
         // A bare `$1` with no context and no declaration cannot be typed.
         let err = param_err("SELECT $1", vec![]);
         assert_eq!(err.code, "42P18");
-        assert_eq!(
-            err.message,
-            "could not determine data type of parameter $1"
-        );
+        assert_eq!(err.message, "could not determine data type of parameter $1");
     }
 
     #[test]
@@ -4686,10 +4791,7 @@ mod tests {
         // an inconsistency PG reports as 42P18.
         let err = param_err("SELECT $1 IN (big, name) FROM t", vec![]);
         assert_eq!(err.code, "42P18");
-        assert_eq!(
-            err.message,
-            "inconsistent types deduced for parameter $1"
-        );
+        assert_eq!(err.message, "inconsistent types deduced for parameter $1");
     }
 
     #[test]

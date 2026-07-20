@@ -20,7 +20,9 @@ fn corpus(out: &str, hex_len: usize) -> Vec<(String, String)> {
         if cols.len() < 2 {
             continue;
         }
-        let hex = &rest[..rest.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(rest.len())];
+        let hex = &rest[..rest
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len())];
         if hex.len() != hex_len {
             continue;
         }
@@ -30,23 +32,35 @@ fn corpus(out: &str, hex_len: usize) -> Vec<(String, String)> {
 }
 
 #[test]
-fn float4_corpus_matches() {
+fn float4_corpus_matches() -> anyhow::Result<()> {
     let pairs = corpus(FLOAT4_OUT, 8);
-    assert!(pairs.len() > 200, "expected a large corpus, got {}", pairs.len());
+    assert!(
+        pairs.len() > 200,
+        "expected a large corpus, got {}",
+        pairs.len()
+    );
     for (hex, expected) in pairs {
-        let bits = u32::from_str_radix(&hex, 16).unwrap();
+        let bits = u32::from_str_radix(&hex, 16)?;
         let got = fmt_f32(f32::from_bits(bits), 1);
         assert_eq!(got, expected, "f32 from bits 0x{hex}");
     }
+
+    Ok(())
 }
 
 #[test]
-fn float8_corpus_matches() {
+fn float8_corpus_matches() -> anyhow::Result<()> {
     let pairs = corpus(FLOAT8_OUT, 16);
-    assert!(pairs.len() > 200, "expected a large corpus, got {}", pairs.len());
+    assert!(
+        pairs.len() > 200,
+        "expected a large corpus, got {}",
+        pairs.len()
+    );
     for (hex, expected) in pairs {
-        let bits = u64::from_str_radix(&hex, 16).unwrap();
+        let bits = u64::from_str_radix(&hex, 16)?;
         let got = fmt_f64(f64::from_bits(bits), 1);
         assert_eq!(got, expected, "f64 from bits 0x{hex}");
     }
+
+    Ok(())
 }

@@ -130,9 +130,7 @@ fn plan_join_input(input: JoinInput) -> PhysicalJoinInput {
     match input {
         JoinInput::Scan(table) => PhysicalJoinInput::Scan(table),
         JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(plan(*source))),
-        JoinInput::TableFunction { func, args } => {
-            PhysicalJoinInput::TableFunction { func, args }
-        }
+        JoinInput::TableFunction { func, args } => PhysicalJoinInput::TableFunction { func, args },
     }
 }
 
@@ -284,25 +282,30 @@ mod tests {
     fn plan_sql(sql: &str) -> PhysicalPlan {
         let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
         let catalog: Arc<dyn TypeCatalog> = Arc::new(EmptyTypeCatalog);
-        engine
-            .create_table(TableSchema {
-                name: "t".into(),
-                columns: vec![
-                    Column::new("id", PgType::Int4),
-                    Column::new("big", PgType::Int8),
-                    Column::new("name", PgType::Text),
-                ],
-            })
-            .unwrap();
-        let stmts = crabgresql_parser::parse(sql).unwrap();
-        let logical = match &stmts[0] {
+        if let Err(error) = engine.create_table(TableSchema {
+            name: "t".into(),
+            columns: vec![
+                Column::new("id", PgType::Int4),
+                Column::new("big", PgType::Int8),
+                Column::new("name", PgType::Text),
+            ],
+        }) {
+            panic!("failed to create planner test table: {error}");
+        }
+        let stmts = match crabgresql_parser::parse(sql) {
+            Ok(stmts) => stmts,
+            Err(error) => panic!("invalid SQL test fixture `{sql}`: {error}"),
+        };
+        let logical = match match &stmts[0] {
             ast::Statement::Query(q) => bind_query(&engine, &catalog, q),
             ast::Statement::Insert(i) => bind_insert(&engine, &catalog, i),
             ast::Statement::Update(u) => bind_update(&engine, &catalog, u),
             ast::Statement::Delete(d) => bind_delete(&engine, &catalog, d),
             other => panic!("unexpected statement: {other}"),
-        }
-        .unwrap();
+        } {
+            Ok(plan) => plan,
+            Err(error) => panic!("failed to bind planner test SQL `{sql}`: {error}"),
+        };
         plan(logical)
     }
 
@@ -438,8 +441,9 @@ mod tests {
 
     #[test]
     fn cross_join_maps_to_physical_join() {
-        let PhysicalPlan::Join { source, columns, .. } =
-            plan_sql("SELECT * FROM t, (VALUES (1)) v(x)")
+        let PhysicalPlan::Join {
+            source, columns, ..
+        } = plan_sql("SELECT * FROM t, (VALUES (1)) v(x)")
         else {
             panic!("expected Join");
         };

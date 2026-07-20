@@ -162,11 +162,14 @@ macro_rules! dialect_is {
 /// name. For example:
 ///
 /// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use sqlparser::dialect::{PostgreSqlDialect, dialect_from_str};
-/// let dialect = dialect_from_str("postgresql").unwrap();
+/// let dialect = dialect_from_str("postgresql").ok_or_else(|| std::io::Error::other("unsupported dialect"))?;
 ///
 /// // Parsed dialect is an instance of `PostgreSqlDialect`:
 /// assert!(dialect.is::<PostgreSqlDialect>());
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// [module level documentation]: crate
@@ -663,7 +666,6 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-
     /// Does the dialect support MySQL-style `'user'@'host'` grantee syntax?
     fn supports_user_host_grantee(&self) -> bool {
         false
@@ -1142,12 +1144,10 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-
     /// Returns true if the dialect supports the `LOAD extension` statement
     fn supports_load_extension(&self) -> bool {
         false
     }
-
 
     /// Returns true if the dialect supports boolean literals (`true` and `false`).
     /// For example, in MSSQL these are treated as identifiers rather than boolean literals.
@@ -1546,9 +1546,6 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-
-
-
     /// Returns true if this dialect supports the `PREWHERE` clause
     /// in `SELECT` statements.
     ///
@@ -1611,7 +1608,6 @@ pub trait Dialect: Debug + Any {
     fn supports_settings(&self) -> bool {
         false
     }
-
 
     /// Returns true if the dialect supports the two-argument comma-separated
     /// form of the `TRIM` function: `TRIM(expr, characters)`.
@@ -1795,7 +1791,10 @@ mod tests {
     }
 
     fn parse_dialect(v: &str) -> Box<dyn Dialect> {
-        dialect_from_str(v).unwrap()
+        match dialect_from_str(v) {
+            Some(dialect) => dialect,
+            None => panic!("unsupported dialect test fixture `{v}`"),
+        }
     }
 
     #[test]

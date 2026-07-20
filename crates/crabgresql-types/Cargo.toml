@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 pg-ryu = { workspace = true }
 jiff = { workspace = true }
 regex = { workspace = true }
+
+[dev-dependencies]
+anyhow.workspace = true

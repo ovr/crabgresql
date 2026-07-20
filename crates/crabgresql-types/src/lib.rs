@@ -365,7 +365,10 @@ pub enum Value {
     Bytea(Vec<u8>),
     /// A `bit`/`bit varying` value: `len` bits packed most-significant-bit-first
     /// in `data` (`ceil(len/8)` bytes, trailing pad bits zero). See [`crate::bit`].
-    Bit { len: u32, data: Vec<u8> },
+    Bit {
+        len: u32,
+        data: Vec<u8>,
+    },
     /// `date`: signed days since 2000-01-01, with `i32::MIN`/`i32::MAX` as the
     /// `-infinity`/`infinity` sentinels. See [`crate::date`].
     Date(i32),
@@ -491,6 +494,63 @@ impl Value {
     }
 }
 
+macro_rules! impl_message_error {
+    ($($ty:path),+ $(,)?) => {
+        $(
+            impl std::fmt::Display for $ty {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str(&self.message)
+                }
+            }
+
+            impl std::error::Error for $ty {}
+        )+
+    };
+}
+
+impl_message_error!(
+    bit::BitError,
+    cast::CastError,
+    date::DateError,
+    float::FloatParseError,
+    float::FloatError,
+    geo::GeoError,
+    interval::IntervalError,
+    macaddr::MacaddrError,
+    money::MoneyError,
+    net::NetError,
+    numeric::NumErr,
+    text::TextError,
+    time::TimeError,
+    timestamp::TimestampError,
+    timetz::TimeTzError,
+    uuid::UuidError,
+);
+
+impl std::fmt::Display for numeric::ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            numeric::ParseError::Syntax => "invalid numeric syntax",
+            numeric::ParseError::Overflow => "numeric value out of range",
+        })
+    }
+}
+
+impl std::error::Error for numeric::ParseError {}
+
+impl std::fmt::Display for tz::ZoneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            tz::ZoneError::NotRecognized(name) => write!(f, "time zone {name:?} not recognized"),
+            tz::ZoneError::DisplacementOutOfRange(name) => {
+                write!(f, "time zone displacement out of range: {name:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for tz::ZoneError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,7 +594,9 @@ mod tests {
     #[test]
     fn bytea_hex_encoding() {
         assert_eq!(
-            Value::Bytea(vec![0x00, 0x10, 0x00]).encode_text().as_deref(),
+            Value::Bytea(vec![0x00, 0x10, 0x00])
+                .encode_text()
+                .as_deref(),
             Some("\\x001000")
         );
     }

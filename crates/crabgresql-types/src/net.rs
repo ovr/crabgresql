@@ -139,7 +139,7 @@ fn parse_ipv4(s: &str) -> Option<([u8; 4], usize)> {
 /// not modeled here.)
 fn cidr_default_bits(first: u8, octets: usize) -> u8 {
     let classful: u8 = match first {
-        0..=127 => 8,   // class A
+        0..=127 => 8,    // class A
         128..=191 => 16, // class B
         192..=223 => 24, // class C
         224..=239 => 4,  // class D (multicast)
@@ -151,7 +151,13 @@ fn cidr_default_bits(first: u8, octets: usize) -> u8 {
 /// Shared body of `inet_in`/`cidr_in`. `cidr` selects the stricter host-bits
 /// check and default masking.
 fn parse_common(input: &str, cidr: bool) -> Result<Inet, NetError> {
-    let invalid = |s: &str| if cidr { invalid_cidr(s) } else { invalid_inet(s) };
+    let invalid = |s: &str| {
+        if cidr {
+            invalid_cidr(s)
+        } else {
+            invalid_inet(s)
+        }
+    };
     let (addr_str, mask_str) = match input.split_once('/') {
         Some((a, m)) => (a, Some(m)),
         None => (input, None),
@@ -198,7 +204,11 @@ fn parse_common(input: &str, cidr: bool) -> Result<Inet, NetError> {
         return Err(cidr_bits_set(input));
     }
 
-    let mut v = Inet { is_ipv6, addr, bits };
+    let mut v = Inet {
+        is_ipv6,
+        addr,
+        bits,
+    };
     if cidr {
         v = v.masked();
     }
@@ -271,7 +281,9 @@ pub fn network_cmp(a: &Inet, b: &Inet) -> Ordering {
 
 /// `a >> b` — `a` strictly contains `b` (`network_sup`).
 pub fn contains(a: &Inet, b: &Inet) -> bool {
-    a.is_ipv6 == b.is_ipv6 && a.bits < b.bits && bitncmp(&a.addr, &b.addr, a.bits) == Ordering::Equal
+    a.is_ipv6 == b.is_ipv6
+        && a.bits < b.bits
+        && bitncmp(&a.addr, &b.addr, a.bits) == Ordering::Equal
 }
 
 /// `a << b` — `a` is strictly contained by `b`.
@@ -281,8 +293,7 @@ pub fn contained_by(a: &Inet, b: &Inet) -> bool {
 
 /// `a && b` — the two networks overlap (either contains the other).
 pub fn overlaps(a: &Inet, b: &Inet) -> bool {
-    a.is_ipv6 == b.is_ipv6
-        && bitncmp(&a.addr, &b.addr, a.bits.min(b.bits)) == Ordering::Equal
+    a.is_ipv6 == b.is_ipv6 && bitncmp(&a.addr, &b.addr, a.bits.min(b.bits)) == Ordering::Equal
 }
 
 // ---- bitwise operators ----
@@ -446,7 +457,11 @@ pub fn abbrev_cidr(v: &Inet) -> String {
     } else {
         // Keep only the octets covered by the mask (rounded up), min one.
         let octets = (net.bits as usize).div_ceil(8).max(1);
-        net.addr[..octets].iter().map(|b| b.to_string()).collect::<Vec<_>>().join(".")
+        net.addr[..octets]
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(".")
     };
     format!("{}/{}", addr, net.bits)
 }
@@ -481,23 +496,39 @@ fn abbrev_ipv6(addr: &[u8; 16], bits: u8) -> String {
             i += 1;
         }
     }
-    let hex = |ws: &[u16]| ws.iter().map(|w| format!("{w:x}")).collect::<Vec<_>>().join(":");
+    let hex = |ws: &[u16]| {
+        ws.iter()
+            .map(|w| format!("{w:x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
     if best_len == 0 {
         hex(&words)
     } else {
-        format!("{}::{}", hex(&words[..best_start]), hex(&words[best_start + best_len..]))
+        format!(
+            "{}::{}",
+            hex(&words[..best_start]),
+            hex(&words[best_start + best_len..])
+        )
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn inet(s: &str) -> Inet {
-        inet_in(s).unwrap()
+        match inet_in(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid inet test fixture `{s}`: {error:?}"),
+        }
     }
     fn cidr(s: &str) -> Inet {
-        cidr_in(s).unwrap()
+        match cidr_in(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid cidr test fixture `{s}`: {error:?}"),
+        }
     }
 
     #[test]
@@ -559,28 +590,42 @@ mod tests {
         assert_eq!(abbrev_cidr(&cidr("2001:db8::/32")), "2001:db8/32");
         assert_eq!(abbrev_cidr(&cidr("2001:db8:0:1::/64")), "2001:db8::1/64");
         assert_eq!(abbrev_cidr(&cidr("ffff::/16")), "ffff::/16");
-        assert_eq!(abbrev_cidr(&cidr("2001:db8:1:2:3::/80")), "2001:db8:1:2:3/80");
+        assert_eq!(
+            abbrev_cidr(&cidr("2001:db8:1:2:3::/80")),
+            "2001:db8:1:2:3/80"
+        );
         assert_eq!(abbrev_cidr(&cidr("::/0")), "::/0");
         assert_eq!(abbrev_cidr(&cidr("0:1::/32")), "::1/32");
     }
 
     #[test]
-    fn diff_reaches_i64_min() {
+    fn diff_reaches_i64_min() -> anyhow::Result<()> {
         // A negative difference of exactly 2^63 is the valid result i64::MIN.
         let a = inet("::");
         let b = inet("::8000:0:0:0"); // 2^63
-        assert_eq!(diff(&a, &b).unwrap(), i64::MIN);
+        assert_eq!(diff(&a, &b)?, i64::MIN);
         // One past that overflows.
         let c = inet("::8000:0:0:1");
         assert_eq!(diff(&a, &c).unwrap_err().sqlstate, "22003");
+
+        Ok(())
     }
 
     #[test]
     fn ordering_family_then_prefix() {
         // IPv4 sorts before IPv6; shorter masklen sorts first at equal prefix.
-        assert_eq!(network_cmp(&inet("10.0.0.0/8"), &inet("::1")), Ordering::Less);
-        assert_eq!(network_cmp(&inet("10.0.0.0/8"), &inet("10.0.0.0/16")), Ordering::Less);
-        assert_eq!(network_cmp(&inet("10.0.0.1"), &inet("10.0.0.2")), Ordering::Less);
+        assert_eq!(
+            network_cmp(&inet("10.0.0.0/8"), &inet("::1")),
+            Ordering::Less
+        );
+        assert_eq!(
+            network_cmp(&inet("10.0.0.0/8"), &inet("10.0.0.0/16")),
+            Ordering::Less
+        );
+        assert_eq!(
+            network_cmp(&inet("10.0.0.1"), &inet("10.0.0.2")),
+            Ordering::Less
+        );
     }
 
     #[test]
@@ -592,15 +637,22 @@ mod tests {
     }
 
     #[test]
-    fn bitwise_and_arith() {
+    fn bitwise_and_arith() -> anyhow::Result<()> {
         assert_eq!(inet_out(&bit_not(&inet("192.168.1.6"))), "63.87.254.249");
         assert_eq!(
-            inet_out(&bit_and(&inet("192.168.1.6"), &inet("255.255.255.0")).unwrap()),
+            inet_out(&bit_and(&inet("192.168.1.6"), &inet("255.255.255.0"))?),
             "192.168.1.0"
         );
-        assert_eq!(inet_out(&add_offset(&inet("10.0.0.1"), 5).unwrap()), "10.0.0.6");
-        assert_eq!(diff(&inet("10.0.0.10"), &inet("10.0.0.1")).unwrap(), 9);
-        assert_eq!(add_offset(&inet("255.255.255.255"), 1).unwrap_err().sqlstate, "22003");
+        assert_eq!(inet_out(&add_offset(&inet("10.0.0.1"), 5)?), "10.0.0.6");
+        assert_eq!(diff(&inet("10.0.0.10"), &inet("10.0.0.1"))?, 9);
+        assert_eq!(
+            add_offset(&inet("255.255.255.255"), 1)
+                .unwrap_err()
+                .sqlstate,
+            "22003"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -609,7 +661,10 @@ mod tests {
         assert_eq!(masklen(&inet("10.0.0.1/8")), 8);
         assert_eq!(family(&inet("10.0.0.1")), 4);
         assert_eq!(family(&inet("::1")), 6);
-        assert_eq!(cidr_out(&network(&inet("192.168.1.5/24"))), "192.168.1.0/24");
+        assert_eq!(
+            cidr_out(&network(&inet("192.168.1.5/24"))),
+            "192.168.1.0/24"
+        );
         assert_eq!(abbrev_cidr(&cidr("10.1.0.0/16")), "10.1/16");
     }
 }

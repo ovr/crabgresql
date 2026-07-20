@@ -114,7 +114,10 @@ impl PgEngine {
 
 impl TableEngine for PgEngine {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
-        let mut tables = self.tables.write().unwrap();
+        let mut tables = self
+            .tables
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&schema.name)
             || self.catalog.contains(&schema.name)
             || tables
@@ -140,7 +143,7 @@ impl TableEngine for PgEngine {
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
         self.tables
             .read()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .get(name)
             .cloned()
             .map(|t| t as Arc<dyn TableAm>)
@@ -153,7 +156,10 @@ impl TableEngine for PgEngine {
         // relation. The persistent catalog is the source of truth for existence:
         // a missing entry there is the 42P01 case.
         let rel = {
-            let mut tables = self.tables.write().unwrap();
+            let mut tables = self
+                .tables
+                .write()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
             let rel = self
                 .catalog
                 .remove(name)
@@ -179,7 +185,10 @@ impl TableEngine for PgEngine {
     }
 
     fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
-        let tables = self.tables.read().unwrap();
+        let tables = self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&index.name)
             || tables
                 .values()
@@ -200,7 +209,7 @@ impl TableEngine for PgEngine {
     fn relations(&self) -> Vec<TableSchema> {
         self.tables
             .read()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .values()
             .map(|t| t.schema().clone())
             .collect()
@@ -209,7 +218,7 @@ impl TableEngine for PgEngine {
     fn relation_metadata(&self) -> Vec<RelationMetadata> {
         self.tables
             .read()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .values()
             .map(|t| RelationMetadata {
                 schema: t.schema().clone(),

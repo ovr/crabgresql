@@ -58,7 +58,9 @@ pub fn recover(
             },
             RmgrId::CHECKPOINT => { /* metadata only; nothing to redo into a page */ }
             other => {
-                let handler = registry.get(other.0).ok_or(WalError::UnknownRmgr(other.0))?;
+                let handler = registry
+                    .get(other.0)
+                    .ok_or(WalError::UnknownRmgr(other.0))?;
                 handler.redo(&RedoContext {
                     lsn: end_lsn,
                     xid: rec.xid,
@@ -70,7 +72,10 @@ pub fn recover(
         pos += len;
     }
 
-    Ok(RecoveryResult { end_of_wal: Lsn(pos as u64), next_xid: Xid(next_xid) })
+    Ok(RecoveryResult {
+        end_of_wal: Lsn(pos as u64),
+        next_xid: Xid(next_xid),
+    })
 }
 
 #[cfg(test)]
@@ -85,55 +90,75 @@ mod tests {
     struct Collector(Arc<Mutex<Vec<Vec<u8>>>>);
     impl RmgrRedo for Collector {
         fn redo(&self, ctx: &RedoContext) -> Result<(), WalError> {
-            self.0.lock().unwrap().push(ctx.payload.to_vec());
+            self.0
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .push(ctx.payload.to_vec());
             Ok(())
         }
     }
 
     #[test]
-    fn replays_committed_records_and_recovers_next_xid() {
-        let dir = tempfile::tempdir().unwrap();
+    fn replays_committed_records_and_recovers_next_xid() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         {
-            let wal = Wal::open(dir.path()).unwrap();
+            let wal = Wal::open(dir.path())?;
             wal.append(RmgrId::HEAP, 7, Xid(3), b"insert-a");
             let c = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3), &[]);
             wal.append(RmgrId::HEAP, 7, Xid(4), b"insert-b"); // never committed
-            wal.flush(c).unwrap();
+            wal.flush(c)?;
         }
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut reg = RmgrRegistry::new();
         reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::clone(&seen))));
         let clog = Clog::new();
-        let res = recover(dir.path(), &reg, &clog).unwrap();
+        let res = recover(dir.path(), &reg, &clog)?;
 
         assert!(clog.is_committed(Xid(3)));
         assert!(!clog.is_committed(Xid(4)));
         assert_eq!(res.next_xid, Xid(5)); // above the highest XID seen (4)
         // Both heap records are redone (redo is oblivious to commit; MVCC hides
         // the uncommitted one at read time).
-        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .len(),
+            2
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn stops_at_a_torn_tail() {
-        let dir = tempfile::tempdir().unwrap();
+    fn stops_at_a_torn_tail() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let good_end;
         {
-            let wal = Wal::open(dir.path()).unwrap();
+            let wal = Wal::open(dir.path())?;
             wal.append(RmgrId::HEAP, 0, Xid(3), b"ok");
             good_end = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3), &[]);
-            wal.flush(good_end).unwrap();
+            wal.flush(good_end)?;
         }
         // Append raw garbage past the valid records (a torn write).
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(wal_path(dir.path())).unwrap();
-            f.write_all(&[0xAB; 40]).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(wal_path(dir.path()))?;
+            f.write_all(&[0xAB; 40])?;
         }
         let mut reg = RmgrRegistry::new();
-        reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::new(Mutex::new(Vec::new())))));
+        reg.register(
+            RmgrId::HEAP,
+            Arc::new(Collector(Arc::new(Mutex::new(Vec::new())))),
+        );
         let clog = Clog::new();
-        let res = recover(dir.path(), &reg, &clog).unwrap();
-        assert_eq!(res.end_of_wal, good_end, "recovery ends at the last valid record");
+        let res = recover(dir.path(), &reg, &clog)?;
+        assert_eq!(
+            res.end_of_wal, good_end,
+            "recovery ends at the last valid record"
+        );
+
+        Ok(())
     }
 }

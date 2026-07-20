@@ -315,7 +315,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn frontend_reader_reads_startup_then_query() {
+    async fn frontend_reader_reads_startup_then_query() -> anyhow::Result<()> {
         // Encode a startup packet + a Query the way a client would, then read
         // them back through the server-side reader.
         let mut out = BytesMut::new();
@@ -327,29 +327,41 @@ mod tests {
         let bytes = out.to_vec();
 
         let mut reader = FrontendReader::new(bytes.as_slice());
-        match reader.read_startup().await.unwrap().unwrap() {
+        match reader
+            .read_startup()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("startup message is missing"))?
+        {
             StartupRequest::Startup { params } => assert_eq!(params["user"], "alice"),
             other => panic!("unexpected: {other:?}"),
         }
-        match reader.read_message().await.unwrap().unwrap() {
+        match reader
+            .read_message()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("query message is missing"))?
+        {
             FrontendMessage::Query(q) => assert_eq!(q, "SELECT 1"),
             other => panic!("unexpected: {other:?}"),
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn clean_eof_is_none_both_directions() {
+    async fn clean_eof_is_none_both_directions() -> anyhow::Result<()> {
         // A client that connects and closes without sending is a clean
         // disconnect at every read entry point, not an error.
         let mut fr = FrontendReader::new(&[][..]);
-        assert!(fr.read_startup().await.unwrap().is_none());
-        assert!(fr.read_message().await.unwrap().is_none());
+        assert!(fr.read_startup().await?.is_none());
+        assert!(fr.read_message().await?.is_none());
         let mut br = BackendReader::new(&[][..]);
-        assert!(br.read_message().await.unwrap().is_none());
+        assert!(br.read_message().await?.is_none());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn malformed_extended_body_becomes_unknown_not_error() {
+    async fn malformed_extended_body_becomes_unknown_not_error() -> anyhow::Result<()> {
         // A Bind ('B') whose body is truncated must not fail the read (which
         // would drop the connection); the frame is consumed and the message is
         // surfaced as Unknown so the server can answer it and stay alive.
@@ -359,29 +371,39 @@ mod tests {
         out.put_slice(b"xyz"); // not a valid Bind body
         let bytes = out.to_vec();
         let mut reader = FrontendReader::new(bytes.as_slice());
-        match reader.read_message().await.unwrap().unwrap() {
+        match reader
+            .read_message()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Bind message is missing"))?
+        {
             FrontendMessage::Unknown { tag, .. } => assert_eq!(tag, b'B'),
             other => panic!("unexpected: {other:?}"),
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn refuse_encryption_writes_single_byte() {
+    async fn refuse_encryption_writes_single_byte() -> anyhow::Result<()> {
         let mut writer = BackendWriter::new(Vec::new());
-        writer.refuse_encryption().await.unwrap();
+        writer.refuse_encryption().await?;
         assert_eq!(writer.inner, b"N");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn backend_writer_convenience_matches_enum_encode() {
+    async fn backend_writer_convenience_matches_enum_encode() -> anyhow::Result<()> {
         // The `data_row` convenience method must produce the same bytes as
         // `BackendMessage::DataRow` so there is one wire layout, not two.
         let mut writer = BackendWriter::new(Vec::new());
         writer.data_row(&[Some("x".to_string()), None]);
-        writer.flush().await.unwrap();
+        writer.flush().await?;
 
         let mut expected = BytesMut::new();
         BackendMessage::DataRow(vec![Some(b"x".to_vec()), None]).encode(&mut expected);
         assert_eq!(writer.inner, expected.to_vec());
+
+        Ok(())
     }
 }

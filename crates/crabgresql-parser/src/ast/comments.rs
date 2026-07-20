@@ -50,6 +50,7 @@ impl Comments {
     ///
     /// # Example
     /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::Location};
     ///
     /// let sql = r#"/*
@@ -66,7 +67,7 @@ impl Comments {
     ///  -- trailing comment
     /// "#;
     ///
-    /// let (ast, comments) = Parser::parse_sql_with_comments(&GenericDialect, sql).unwrap();
+    /// let (ast, comments) = Parser::parse_sql_with_comments(&GenericDialect, sql)?;
     ///
     /// // all comments appearing before line seven, i.e. before the first statement itself
     /// assert_eq!(
@@ -82,6 +83,8 @@ impl Comments {
     /// assert_eq!(
     ///    &comments.find(Location::new(7, 1)..).map(|c| c.as_str()).collect::<Vec<_>>(),
     ///    &[" world ", " second statement\n", " trailing comment\n"]);
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// The [Spanned](crate::ast::Spanned) trait allows you to access location

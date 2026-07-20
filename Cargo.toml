@@ -37,5 +37,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # dev
+anyhow = "1"
 tempfile = "3"
 tokio-postgres = "0.7"
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+unwrap_used = "deny"

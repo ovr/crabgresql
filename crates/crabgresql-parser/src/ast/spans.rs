@@ -28,11 +28,11 @@ use core::iter;
 use crate::tokenizer::Span;
 
 use super::{
-    comments, value::ValueWithSpan, AccessExpr, AlterColumnOperation,
-    AlterIndexOperation, AlterTableOperation, Analyze, Array, Assignment, AssignmentTarget,
-    AttachedToken, BeginEndStatements, CaseStatement, CloseCursor, ClusteredIndex, ColumnDef,
-    ColumnOption, ColumnOptionDef, ConditionalStatementBlock, ConditionalStatements,
-    ConflictTarget, ConnectByKind, ConstraintCharacteristics, CopySource, CreateIndex, CreateTable,
+    comments, value::ValueWithSpan, AccessExpr, AlterColumnOperation, AlterIndexOperation,
+    AlterTableOperation, Analyze, Array, Assignment, AssignmentTarget, AttachedToken,
+    BeginEndStatements, CaseStatement, CloseCursor, ClusteredIndex, ColumnDef, ColumnOption,
+    ColumnOptionDef, ConditionalStatementBlock, ConditionalStatements, ConflictTarget,
+    ConnectByKind, ConstraintCharacteristics, CopySource, CreateIndex, CreateTable,
     CreateTableOptions, Cte, Delete, DoUpdate, ExceptSelectItem, ExcludeSelectItem, Expr,
     ExprWithAlias, Fetch, ForValues, FromTable, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, HavingBound,
@@ -42,12 +42,12 @@ use super::{
     MergeInsertKind, MergeUpdateExpr, NamedParenthesizedList, NamedWindowDefinition, ObjectName,
     ObjectNamePart, Offset, OnConflict, OnConflictAction, OnInsert, OpenStatement, OrderBy,
     OrderByExpr, OrderByKind, OutputClause, Parens, Partition, PartitionBoundValue,
-    ProjectionSelect, Query, RaiseStatement, RaiseStatementValue,
-    ReferentialAction, RenameSelectItem, ReplaceSelectElement, ReplaceSelectItem, Select,
-    SelectInto, SelectItem, SetExpr, SqlOption, Statement, Subscript, SymbolDefinition, TableAlias,
-    TableAliasColumnDef, TableConstraint, TableFactor, TableObject, TableOptionsClustered,
-    TableWithJoins, Update, UpdateTableFromKind, Values, ViewColumnDef, WhileStatement,
-    WildcardAdditionalOptions, With, WithFill,
+    ProjectionSelect, Query, RaiseStatement, RaiseStatementValue, ReferentialAction,
+    RenameSelectItem, ReplaceSelectElement, ReplaceSelectItem, Select, SelectInto, SelectItem,
+    SetExpr, SqlOption, Statement, Subscript, SymbolDefinition, TableAlias, TableAliasColumnDef,
+    TableConstraint, TableFactor, TableObject, TableOptionsClustered, TableWithJoins, Update,
+    UpdateTableFromKind, Values, ViewColumnDef, WhileStatement, WildcardAdditionalOptions, With,
+    WithFill,
 };
 
 /// Given an iterator of spans, return the [Span::union] of all spans.
@@ -400,7 +400,6 @@ impl Spanned for Statement {
         }
     }
 }
-
 
 impl Spanned for CreateTable {
     fn span(&self) -> Span {
@@ -1870,7 +1869,6 @@ impl Spanned for TableFactor {
     }
 }
 
-
 impl Spanned for ExprWithAlias {
     fn span(&self) -> Span {
         let ExprWithAlias { expr, alias } = self;
@@ -2377,7 +2375,10 @@ pub mod tests {
 
     impl<'a> SpanTest<'a> {
         fn new(dialect: &'a dyn Dialect, sql: &'a str) -> Self {
-            Self(Parser::new(dialect).try_with_sql(sql).unwrap(), sql)
+            match Parser::new(dialect).try_with_sql(sql) {
+                Ok(parser) => Self(parser, sql),
+                Err(error) => panic!("failed to parse span test fixture: {error}"),
+            }
         }
 
         // get the subsection of the source string that corresponds to the span
@@ -2389,14 +2390,14 @@ pub mod tests {
     }
 
     #[test]
-    fn test_join() {
+    fn test_join() -> anyhow::Result<()> {
         let dialect = &GenericDialect;
         let mut test = SpanTest::new(
             dialect,
             "SELECT id, name FROM users LEFT JOIN companies ON users.company_id = companies.id",
         );
 
-        let query = test.0.parse_select().unwrap();
+        let query = test.0.parse_select()?;
         let select_span = query.span();
 
         assert_eq!(
@@ -2411,6 +2412,8 @@ pub mod tests {
             test.get_source(join_span),
             "companies ON users.company_id = companies.id"
         );
+
+        Ok(())
     }
 
     #[test]
@@ -2421,7 +2424,10 @@ pub mod tests {
             "SELECT a FROM postgres.public.source UNION SELECT a FROM postgres.public.source",
         );
 
-        let query = test.0.parse_query().unwrap();
+        let query = match test.0.parse_query() {
+            Ok(query) => query,
+            Err(error) => panic!("failed to parse union span fixture: {error}"),
+        };
         let select_span = query.span();
 
         assert_eq!(
@@ -2438,7 +2444,10 @@ pub mod tests {
             "SELECT a FROM (SELECT a FROM postgres.public.source) AS b",
         );
 
-        let query = test.0.parse_select().unwrap();
+        let query = match test.0.parse_select() {
+            Ok(query) => query,
+            Err(error) => panic!("failed to parse subquery span fixture: {error}"),
+        };
         let select_span = query.span();
 
         assert_eq!(
@@ -2460,7 +2469,10 @@ pub mod tests {
         let dialect = &GenericDialect;
         let mut test = SpanTest::new(dialect, "WITH cte_outer AS (SELECT a FROM postgres.public.source), cte_ignored AS (SELECT a FROM cte_outer), cte_inner AS (SELECT a FROM cte_outer) SELECT a FROM cte_inner");
 
-        let query = test.0.parse_query().unwrap();
+        let query = match test.0.parse_query() {
+            Ok(query) => query,
+            Err(error) => panic!("failed to parse CTE span fixture: {error}"),
+        };
 
         let select_span = query.span();
 
@@ -2475,9 +2487,15 @@ pub mod tests {
             "WITH cte AS (SELECT a FROM postgres.public.source) SELECT cte.* FROM cte",
         );
 
-        let query = test.0.parse_query().unwrap();
-        let cte_span = query.clone().with.unwrap().cte_tables[0].span();
-        let cte_query_span = query.clone().with.unwrap().cte_tables[0].query.span();
+        let query = match test.0.parse_query() {
+            Ok(query) => query,
+            Err(error) => panic!("failed to parse wildcard CTE span fixture: {error}"),
+        };
+        let Some(with) = query.with.as_ref() else {
+            panic!("wildcard CTE span fixture must contain a WITH clause");
+        };
+        let cte_span = with.cte_tables[0].span();
+        let cte_query_span = with.cte_tables[0].query.span();
         let body_span = query.body.span();
 
         // the WITH keyboard is part of the query
@@ -2494,25 +2512,31 @@ pub mod tests {
     }
 
     #[test]
-    fn test_case_expr_span() {
+    fn test_case_expr_span() -> anyhow::Result<()> {
         let dialect = &GenericDialect;
         let mut test = SpanTest::new(dialect, "CASE 1 WHEN 2 THEN 3 ELSE 4 END");
-        let expr = test.0.parse_expr().unwrap();
+        let expr = test.0.parse_expr()?;
         let expr_span = expr.span();
         assert_eq!(
             test.get_source(expr_span),
             "CASE 1 WHEN 2 THEN 3 ELSE 4 END"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_placeholder_span() {
+    fn test_placeholder_span() -> anyhow::Result<()> {
         let sql = "\nSELECT\n  :fooBar";
-        let r = Parser::parse_sql(&GenericDialect, sql).unwrap();
+        let r = Parser::parse_sql(&GenericDialect, sql)?;
         assert_eq!(1, r.len());
         match &r[0] {
             Statement::Query(q) => {
-                let col = &q.body.as_select().unwrap().projection[0];
+                let select = q
+                    .body
+                    .as_select()
+                    .ok_or_else(|| anyhow::anyhow!("query body is not SELECT"))?;
+                let col = &select.projection[0];
                 match col {
                     SelectItem::UnnamedExpr(Expr::Value(ValueWithSpan {
                         value: Value::Placeholder(s),
@@ -2526,26 +2550,30 @@ pub mod tests {
             }
             stmt => panic!("expected query; got {stmt:?}"),
         }
+
+        Ok(())
     }
 
     #[test]
-    fn test_alter_table_multiline_span() {
+    fn test_alter_table_multiline_span() -> anyhow::Result<()> {
         let sql = r#"-- foo
 ALTER TABLE users
   ADD COLUMN foo
   varchar; -- hi there"#;
 
-        let r = Parser::parse_sql(&crate::dialect::PostgreSqlDialect {}, sql).unwrap();
+        let r = Parser::parse_sql(&crate::dialect::PostgreSqlDialect {}, sql)?;
         assert_eq!(1, r.len());
 
         let stmt_span = r[0].span();
 
         assert_eq!(stmt_span.start, (2, 13).into());
         assert_eq!(stmt_span.end, (4, 11).into());
+
+        Ok(())
     }
 
     #[test]
-    fn test_update_statement_span() {
+    fn test_update_statement_span() -> anyhow::Result<()> {
         let sql = r#"-- foo
       UPDATE foo
    /* bar */
@@ -2553,51 +2581,57 @@ ALTER TABLE users
  WHERE quux > 42 ;
 "#;
 
-        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql).unwrap();
+        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql)?;
         assert_eq!(1, r.len());
 
         let stmt_span = r[0].span();
 
         assert_eq!(stmt_span.start, (2, 7).into());
         assert_eq!(stmt_span.end, (5, 17).into());
+
+        Ok(())
     }
 
     #[test]
-    fn test_insert_statement_span() {
+    fn test_insert_statement_span() -> anyhow::Result<()> {
         let sql = r#"
 /* foo */ INSERT  INTO  FOO  (X, Y, Z)
   SELECT 1, 2, 3
   FROM DUAL
 ;"#;
 
-        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql).unwrap();
+        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql)?;
         assert_eq!(1, r.len());
 
         let stmt_span = r[0].span();
 
         assert_eq!(stmt_span.start, (2, 11).into());
         assert_eq!(stmt_span.end, (4, 12).into());
+
+        Ok(())
     }
 
     #[test]
-    fn test_delete_statement_span() {
+    fn test_delete_statement_span() -> anyhow::Result<()> {
         let sql = r#"-- foo
       DELETE /* quux */
         FROM foo
        WHERE foo.x = 42
 ;"#;
 
-        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql).unwrap();
+        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql)?;
         assert_eq!(1, r.len());
 
         let stmt_span = r[0].span();
 
         assert_eq!(stmt_span.start, (2, 7).into());
         assert_eq!(stmt_span.end, (4, 24).into());
+
+        Ok(())
     }
 
     #[test]
-    fn test_merge_statement_spans() {
+    fn test_merge_statement_spans() -> anyhow::Result<()> {
         let sql = r#"
         -- plain merge statement; no RETURNING, no OUTPUT
 
@@ -2616,7 +2650,7 @@ ALTER TABLE users
         WHEN NOT MATCHED AND 1 THEN INSERT (product, quantity) ROW
         "#;
 
-        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql).unwrap();
+        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql)?;
         assert_eq!(1, r.len());
 
         // ~ assert the span of the whole statement
@@ -2725,10 +2759,12 @@ ALTER TABLE users
         }
 
         assert!(output.is_none());
+
+        Ok(())
     }
 
     #[test]
-    fn test_merge_statement_spans_with_returning() {
+    fn test_merge_statement_spans_with_returning() -> anyhow::Result<()> {
         let sql = r#"
     MERGE INTO wines AS w
     USING wine_stock_changes AS s
@@ -2739,7 +2775,7 @@ ALTER TABLE users
     RETURNING merge_action(), w.*
         "#;
 
-        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql).unwrap();
+        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql)?;
         assert_eq!(1, r.len());
 
         // ~ assert the span of the whole statement
@@ -2765,15 +2801,17 @@ ALTER TABLE users
         } else {
             panic!("not a MERGE statement");
         };
+
+        Ok(())
     }
 
     #[test]
-    fn test_merge_statement_spans_with_output() {
+    fn test_merge_statement_spans_with_output() -> anyhow::Result<()> {
         let sql = r#"MERGE INTO a USING b ON a.id = b.id
         WHEN MATCHED THEN DELETE
               OUTPUT inserted.*"#;
 
-        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql).unwrap();
+        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql)?;
         assert_eq!(1, r.len());
 
         // ~ assert the span of the whole statement
@@ -2796,10 +2834,12 @@ ALTER TABLE users
         } else {
             panic!("not a MERGE statement");
         };
+
+        Ok(())
     }
 
     #[test]
-    fn test_merge_statement_spans_with_update_predicates() {
+    fn test_merge_statement_spans_with_update_predicates() -> anyhow::Result<()> {
         let sql = r#"
        MERGE INTO a USING b ON a.id = b.id
         WHEN MATCHED THEN
@@ -2807,7 +2847,7 @@ ALTER TABLE users
                WHERE b.x != 2
               DELETE WHERE a.x <> 3"#;
 
-        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql).unwrap();
+        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql)?;
         assert_eq!(1, r.len());
 
         // ~ assert the span of the whole statement
@@ -2816,10 +2856,12 @@ ALTER TABLE users
             stmt_span,
             Span::new(Location::new(2, 8), Location::new(6, 36))
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_merge_statement_spans_with_insert_predicate() {
+    fn test_merge_statement_spans_with_insert_predicate() -> anyhow::Result<()> {
         let sql = r#"
        MERGE INTO a USING b ON a.id = b.id
         WHEN NOT MATCHED THEN
@@ -2827,7 +2869,7 @@ ALTER TABLE users
 -- qed
 "#;
 
-        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql).unwrap();
+        let r = Parser::parse_sql(&crate::dialect::GenericDialect, sql)?;
         assert_eq!(1, r.len());
 
         // ~ assert the span of the whole statement
@@ -2836,5 +2878,7 @@ ALTER TABLE users
             stmt_span,
             Span::new(Location::new(2, 8), Location::new(4, 52))
         );
+
+        Ok(())
     }
 }

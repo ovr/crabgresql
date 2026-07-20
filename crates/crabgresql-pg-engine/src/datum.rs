@@ -181,16 +181,16 @@ impl<'a> Reader<'a> {
         s
     }
     fn u32(&mut self) -> u32 {
-        u32::from_le_bytes(self.take(4).try_into().unwrap())
+        u32::from_le_bytes(self.array())
     }
     fn i32(&mut self) -> i32 {
-        i32::from_le_bytes(self.take(4).try_into().unwrap())
+        i32::from_le_bytes(self.array())
     }
     fn i64(&mut self) -> i64 {
-        i64::from_le_bytes(self.take(8).try_into().unwrap())
+        i64::from_le_bytes(self.array())
     }
     fn u64(&mut self) -> u64 {
-        u64::from_le_bytes(self.take(8).try_into().unwrap())
+        u64::from_le_bytes(self.array())
     }
     fn var(&mut self) -> &'a [u8] {
         let n = self.u32() as usize;
@@ -201,8 +201,18 @@ impl<'a> Reader<'a> {
         let bits = self.take(1)[0];
         let mut addr = [0u8; 16];
         addr.copy_from_slice(self.take(16));
-        let a = Inet { is_ipv6, addr, bits };
+        let a = Inet {
+            is_ipv6,
+            addr,
+            bits,
+        };
         if cidr { Value::Cidr(a) } else { Value::Inet(a) }
+    }
+    fn array<const N: usize>(&mut self) -> [u8; N] {
+        let slice = self.take(N);
+        let mut out = [0; N];
+        out.copy_from_slice(slice);
+        out
     }
 }
 
@@ -212,7 +222,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
     let tag = r.take(1)[0];
     let v = match tag {
         T_BOOL => Value::Bool(r.take(1)[0] != 0),
-        T_INT2 => Value::Int2(i16::from_le_bytes(r.take(2).try_into().unwrap())),
+        T_INT2 => Value::Int2(i16::from_le_bytes(r.array())),
         T_INT4 => Value::Int4(r.i32()),
         T_OID => Value::Oid(r.u32()),
         T_INT8 => Value::Int8(r.i64()),
@@ -306,20 +316,38 @@ mod tests {
         roundtrip(Value::Text(String::new()));
         roundtrip(Value::Text("héllo world".into()));
         roundtrip(Value::Bytea(vec![0, 1, 2, 255]));
-        roundtrip(Value::Bit { len: 8, data: vec![0b1010_1010] });
-        roundtrip(Value::Bit { len: 0, data: vec![] });
-        roundtrip(Value::Bit { len: 1000, data: vec![0xA5; 125] });
+        roundtrip(Value::Bit {
+            len: 8,
+            data: vec![0b1010_1010],
+        });
+        roundtrip(Value::Bit {
+            len: 0,
+            data: vec![],
+        });
+        roundtrip(Value::Bit {
+            len: 1000,
+            data: vec![0xA5; 125],
+        });
         roundtrip(Value::Date(-5));
         roundtrip(Value::Time(86_399_000_000));
-        roundtrip(Value::TimeTz(TimeTz { usec: 1, zone: -3600 }));
+        roundtrip(Value::TimeTz(TimeTz {
+            usec: 1,
+            zone: -3600,
+        }));
         roundtrip(Value::Timestamp(0));
         roundtrip(Value::TimestampTz(i64::MAX));
-        roundtrip(Value::Interval(Interval { months: -13, days: 2, usec: -999 }));
+        roundtrip(Value::Interval(Interval {
+            months: -13,
+            days: 2,
+            usec: -999,
+        }));
         roundtrip(Value::Uuid([9u8; 16]));
         roundtrip(Value::Money(i64::MIN));
         roundtrip(Value::Money(12345));
         roundtrip(Value::Macaddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]));
-        roundtrip(Value::Macaddr8([0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03]));
+        roundtrip(Value::Macaddr8([
+            0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03,
+        ]));
         roundtrip(Value::Point([5.1, 34.5]));
         roundtrip(Value::Point([f64::INFINITY, -1e300]));
         roundtrip(Value::Lseg([1.0, 2.0, 3.0, 4.0]));
@@ -340,16 +368,39 @@ mod tests {
     }
 
     #[test]
-    fn numeric_edge_cases_roundtrip() {
-        for s in ["0", "-0.00", "123.4500", "NaN", "Infinity", "-Infinity", "1e-40"] {
-            roundtrip(Value::Numeric(Numeric::parse(s).unwrap()));
+    fn numeric_edge_cases_roundtrip() -> anyhow::Result<()> {
+        for s in [
+            "0",
+            "-0.00",
+            "123.4500",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "1e-40",
+        ] {
+            roundtrip(Value::Numeric(Numeric::parse(s)?));
         }
+
+        Ok(())
     }
 
     #[test]
     fn inet_and_cidr_v4_v6() {
-        let v4 = Inet { is_ipv6: false, addr: { let mut a = [0u8; 16]; a[0] = 192; a[1] = 168; a }, bits: 24 };
-        let v6 = Inet { is_ipv6: true, addr: [0xab; 16], bits: 64 };
+        let v4 = Inet {
+            is_ipv6: false,
+            addr: {
+                let mut a = [0u8; 16];
+                a[0] = 192;
+                a[1] = 168;
+                a
+            },
+            bits: 24,
+        };
+        let v6 = Inet {
+            is_ipv6: true,
+            addr: [0xab; 16],
+            bits: 64,
+        };
         roundtrip(Value::Inet(v4.clone()));
         roundtrip(Value::Cidr(v6.clone()));
     }

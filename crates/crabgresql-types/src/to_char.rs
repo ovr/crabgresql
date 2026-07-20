@@ -163,18 +163,34 @@ mod tests {
     use crate::interval::parse;
 
     fn tc(s: &str, fmt: &str) -> String {
-        interval(parse(s).unwrap(), fmt).unwrap()
+        let value = match parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid interval test fixture `{s}`: {error:?}"),
+        };
+        match interval(value, fmt) {
+            Some(output) => output,
+            None => panic!("invalid to_char test fixture `{fmt}`"),
+        }
     }
 
     #[test]
     fn codes() {
-        assert_eq!(tc("1 year 2 mons 3 days 04:05:06", "YYYY-MM-DD HH24:MI:SS"), "0001-02-03 04:05:06");
-        assert_eq!(tc("1 day 02:03:04.567", "HH24:MI:SS.MS.US"), "02:03:04.567.567000");
+        assert_eq!(
+            tc("1 year 2 mons 3 days 04:05:06", "YYYY-MM-DD HH24:MI:SS"),
+            "0001-02-03 04:05:06"
+        );
+        assert_eq!(
+            tc("1 day 02:03:04.567", "HH24:MI:SS.MS.US"),
+            "02:03:04.567.567000"
+        );
         assert_eq!(tc("5 days", "DD"), "05");
         assert_eq!(tc("-1 day -02:00:00", "HH24:MI:SS"), "-02:00:00");
         assert_eq!(tc("25 hours", "HH24"), "25");
         assert_eq!(tc("25 hours", "HH12"), "01");
-        assert_eq!(tc("1 day 02:03:04", "\"time is\" HH24:MI:SS"), "time is 02:03:04");
+        assert_eq!(
+            tc("1 day 02:03:04", "\"time is\" HH24:MI:SS"),
+            "time is 02:03:04"
+        );
         assert_eq!(tc("1 day 02:03:04", "FMHH24:FMMI:FMSS"), "2:3:4");
         assert_eq!(tc("90 minutes", "MI"), "30");
     }

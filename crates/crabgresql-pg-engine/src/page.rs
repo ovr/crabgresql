@@ -32,15 +32,24 @@ pub const LP_DEAD: u8 = 3;
 
 pub type Page = [u8; BLCKSZ];
 
+fn bytes<const N: usize>(p: &Page, off: usize) -> [u8; N] {
+    let Some(slice) = p.get(off..off + N) else {
+        panic!("page field is out of bounds");
+    };
+    let mut out = [0; N];
+    out.copy_from_slice(slice);
+    out
+}
+
 fn rd_u16(p: &Page, off: usize) -> u16 {
-    u16::from_le_bytes(p[off..off + 2].try_into().unwrap())
+    u16::from_le_bytes(bytes(p, off))
 }
 fn wr_u16(p: &mut Page, off: usize, v: u16) {
     p[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
 
 pub fn get_lsn(p: &Page) -> u64 {
-    u64::from_le_bytes(p[OFF_LSN..OFF_LSN + 8].try_into().unwrap())
+    u64::from_le_bytes(bytes(p, OFF_LSN))
 }
 pub fn set_lsn(p: &mut Page, lsn: u64) {
     p[OFF_LSN..OFF_LSN + 8].copy_from_slice(&lsn.to_le_bytes());
@@ -104,7 +113,7 @@ fn lp_pos(off: u16) -> usize {
 
 pub fn item_id(p: &Page, off: u16) -> ItemId {
     let at = lp_pos(off);
-    ItemId(u32::from_le_bytes(p[at..at + 4].try_into().unwrap()))
+    ItemId(u32::from_le_bytes(bytes(p, at)))
 }
 
 fn set_item_id(p: &mut Page, off: u16, id: ItemId) {
@@ -213,7 +222,11 @@ pub fn compact(p: &mut Page) {
     for (off, bytes) in &live {
         cur_upper -= bytes.len();
         p[cur_upper..cur_upper + bytes.len()].copy_from_slice(bytes);
-        set_item_id(p, *off, ItemId::new(cur_upper as u16, LP_NORMAL, bytes.len() as u16));
+        set_item_id(
+            p,
+            *off,
+            ItemId::new(cur_upper as u16, LP_NORMAL, bytes.len() as u16),
+        );
     }
     wr_u16(p, OFF_UPPER, cur_upper as u16);
 }
@@ -250,6 +263,10 @@ pub fn verify_checksum(p: &Page, blockno: u32) -> bool {
 mod tests {
     use super::*;
 
+    fn required<T>(value: Option<T>, message: &str) -> anyhow::Result<T> {
+        value.ok_or_else(|| anyhow::anyhow!(message.to_string()))
+    }
+
     fn new_page() -> Box<Page> {
         let mut p = Box::new([0u8; BLCKSZ]);
         init(&mut p);
@@ -257,21 +274,23 @@ mod tests {
     }
 
     #[test]
-    fn init_then_add_and_read() {
+    fn init_then_add_and_read() -> anyhow::Result<()> {
         let mut p = new_page();
         assert!(is_initialized(&p));
         assert_eq!(free_space(&p), BLCKSZ - PAGE_HEADER_LEN);
-        let a = add_item(&mut p, b"hello").unwrap();
-        let b = add_item(&mut p, b"world!!").unwrap();
+        let a = required(add_item(&mut p, b"hello"), "hello did not fit")?;
+        let b = required(add_item(&mut p, b"world!!"), "world did not fit")?;
         assert_eq!(a, 1);
         assert_eq!(b, 2);
-        assert_eq!(get_item(&p, a).unwrap(), b"hello");
-        assert_eq!(get_item(&p, b).unwrap(), b"world!!");
+        assert_eq!(required(get_item(&p, a), "hello is missing")?, b"hello");
+        assert_eq!(required(get_item(&p, b), "world is missing")?, b"world!!");
         assert_eq!(max_offset(&p), 2);
+
+        Ok(())
     }
 
     #[test]
-    fn fill_until_no_room() {
+    fn fill_until_no_room() -> anyhow::Result<()> {
         let mut p = new_page();
         let mut n = 0;
         while add_item(&mut p, &[7u8; 100]).is_some() {
@@ -280,24 +299,34 @@ mod tests {
         assert!(n > 0);
         // Every stored item still reads back.
         for off in 1..=n {
-            assert_eq!(get_item(&p, off as u16).unwrap(), &[7u8; 100]);
+            assert_eq!(
+                required(get_item(&p, off as u16), "item is missing")?,
+                &[7u8; 100]
+            );
         }
+
+        Ok(())
     }
 
     #[test]
-    fn compact_reclaims_dead_space_and_reuses_slot() {
+    fn compact_reclaims_dead_space_and_reuses_slot() -> anyhow::Result<()> {
         let mut p = new_page();
-        let a = add_item(&mut p, b"aaaa").unwrap();
-        let b = add_item(&mut p, b"bbbb").unwrap();
-        let _c = add_item(&mut p, b"cccc").unwrap();
+        let a = required(add_item(&mut p, b"aaaa"), "aaaa did not fit")?;
+        let b = required(add_item(&mut p, b"bbbb"), "bbbb did not fit")?;
+        let _c = required(add_item(&mut p, b"cccc"), "cccc did not fit")?;
         set_flags(&mut p, b, LP_UNUSED);
         let before = free_space(&p);
         compact(&mut p);
-        assert!(free_space(&p) > before, "compaction frees the dead tuple's bytes");
-        assert_eq!(get_item(&p, a).unwrap(), b"aaaa");
+        assert!(
+            free_space(&p) > before,
+            "compaction frees the dead tuple's bytes"
+        );
+        assert_eq!(required(get_item(&p, a), "aaaa is missing")?, b"aaaa");
         // The UNUSED slot is reused by the next insert.
-        let reused = add_item(&mut p, b"dddd").unwrap();
+        let reused = required(add_item(&mut p, b"dddd"), "dddd did not fit")?;
         assert_eq!(reused, b);
+
+        Ok(())
     }
 
     #[test]
@@ -313,23 +342,27 @@ mod tests {
     }
 
     #[test]
-    fn checksum_detects_corruption_and_wrong_block() {
+    fn checksum_detects_corruption_and_wrong_block() -> anyhow::Result<()> {
         let mut p = new_page();
-        add_item(&mut p, b"payload").unwrap();
+        required(add_item(&mut p, b"payload"), "payload did not fit")?;
         stamp_checksum(&mut p, 5);
         assert!(verify_checksum(&p, 5));
         assert!(!verify_checksum(&p, 6), "wrong block number fails");
         let mut torn = p.clone();
         torn[BLCKSZ - 1] ^= 0xff;
         assert!(!verify_checksum(&torn, 5), "flipped byte fails");
+
+        Ok(())
     }
 
     #[test]
-    fn put_item_at_reproduces_offset() {
+    fn put_item_at_reproduces_offset() -> anyhow::Result<()> {
         let mut p = new_page();
         put_item_at(&mut p, 3, b"redo");
-        assert_eq!(get_item(&p, 3).unwrap(), b"redo");
+        assert_eq!(required(get_item(&p, 3), "redo item is missing")?, b"redo");
         assert_eq!(item_id(&p, 1).flags(), LP_UNUSED);
         assert_eq!(item_id(&p, 2).flags(), LP_UNUSED);
+
+        Ok(())
     }
 }

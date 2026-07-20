@@ -16,13 +16,13 @@ use std::env;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-fn main() {
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let catalog_dir = manifest.join("../../vendor/postgres/catalog");
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
 
-    let type_entries = read_dat(&catalog_dir, "pg_type.dat");
-    let cast_entries = read_dat(&catalog_dir, "pg_cast.dat");
+    let type_entries = read_dat(&catalog_dir, "pg_type.dat")?;
+    let cast_entries = read_dat(&catalog_dir, "pg_cast.dat")?;
 
     // Base type name -> OID, used to resolve name references in pg_type
     // (`typelem`) and pg_cast (`castsource`/`casttarget`).
@@ -31,18 +31,22 @@ fn main() {
         .filter_map(|e| Some((get(e, "typname")?, oid_field(e, "oid"))))
         .collect();
 
-    std::fs::write(out_dir.join("pg_type_rows.rs"), gen_pg_type(&type_entries, &name_to_oid))
-        .unwrap();
-    std::fs::write(out_dir.join("pg_cast_rows.rs"), gen_pg_cast(&cast_entries, &name_to_oid))
-        .unwrap();
+    std::fs::write(
+        out_dir.join("pg_type_rows.rs"),
+        gen_pg_type(&type_entries, &name_to_oid),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_cast_rows.rs"),
+        gen_pg_cast(&cast_entries, &name_to_oid),
+    )?;
+    Ok(())
 }
 
-fn read_dat(dir: &std::path::Path, file: &str) -> Vec<Entry> {
+fn read_dat(dir: &std::path::Path, file: &str) -> std::io::Result<Vec<Entry>> {
     let path = dir.join(file);
     println!("cargo:rerun-if-changed={}", path.display());
-    let src =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    parse_dat(&src)
+    let src = std::fs::read_to_string(&path)?;
+    Ok(parse_dat(&src))
 }
 
 /// One `.dat` entry: its `key => value` pairs with quotes stripped.
@@ -93,7 +97,7 @@ fn parse_entry(bytes: &[u8], start: usize) -> (Entry, usize) {
         while i < n && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
             i += 1;
         }
-        let key = std::str::from_utf8(&bytes[key_start..i]).unwrap().to_string();
+        let key = String::from_utf8_lossy(&bytes[key_start..i]).into_owned();
         // '=>'
         i = skip_ws_and_commas(bytes, i);
         if i + 1 < n && bytes[i] == b'=' && bytes[i + 1] == b'>' {
@@ -107,14 +111,10 @@ fn parse_entry(bytes: &[u8], start: usize) -> (Entry, usize) {
             v
         } else {
             let vs = i;
-            while i < n
-                && bytes[i] != b','
-                && bytes[i] != b'}'
-                && !bytes[i].is_ascii_whitespace()
-            {
+            while i < n && bytes[i] != b',' && bytes[i] != b'}' && !bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
-            std::str::from_utf8(&bytes[vs..i]).unwrap().to_string()
+            String::from_utf8_lossy(&bytes[vs..i]).into_owned()
         };
         entry.insert(key, value);
     }
@@ -166,7 +166,12 @@ fn get<'a>(e: &'a Entry, key: &str) -> Option<&'a str> {
 }
 
 fn oid_field(e: &Entry, key: &str) -> u32 {
-    get(e, key).map(|v| v.parse().unwrap()).unwrap_or(0)
+    match get(e, key) {
+        Some(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("bad oid {key}={value:?}")),
+        None => 0,
+    }
 }
 
 fn bool_field(e: &Entry, key: &str, default: bool) -> bool {
@@ -193,7 +198,10 @@ fn gen_pg_type(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
     for e in entries {
         let oid = oid_field(e, "oid");
         let typname = str_field(e, "typname", "");
-        assert!(oid != 0 && !typname.is_empty(), "pg_type entry missing oid/typname");
+        assert!(
+            oid != 0 && !typname.is_empty(),
+            "pg_type entry missing oid/typname"
+        );
         let typlen = resolve_typlen(str_field(e, "typlen", "0"));
         // typelem: element type by name (0 when the type is not an array/vector).
         let typelem = get(e, "typelem")

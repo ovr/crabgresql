@@ -36,7 +36,8 @@ pub fn open_pg_engine(
     // Clamp the WAL to the last valid record before any new append, discarding a
     // torn tail left by a crash — otherwise new records land past the garbage and
     // a later recovery would stop at the torn record and lose them.
-    wal.reset_to(res.end_of_wal).map_err(std::io::Error::other)?;
+    wal.reset_to(res.end_of_wal)
+        .map_err(std::io::Error::other)?;
     // Make the pages recovery reconstructed durable so restarts start from a
     // clean base (recovery is still correct without this, just longer).
     engine.checkpoint(res.next_xid)?;

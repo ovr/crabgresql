@@ -32,12 +32,15 @@ impl MemoryEngine {
 
 impl TableEngine for MemoryEngine {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
-        let mut tables = self.tables.write().unwrap();
+        let mut tables = self
+            .tables
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&schema.name)
             || tables.values().any(|t| {
                 t.indexes
                     .read()
-                    .unwrap()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
                     .iter()
                     .any(|i| i.name == schema.name)
             })
@@ -55,7 +58,10 @@ impl TableEngine for MemoryEngine {
     }
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
-        let tables = self.tables.read().unwrap();
+        let tables = self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         tables
             .get(name)
             .cloned()
@@ -64,7 +70,10 @@ impl TableEngine for MemoryEngine {
     }
 
     fn drop_table(&self, name: &str) -> Result<(), StorageError> {
-        let mut tables = self.tables.write().unwrap();
+        let mut tables = self
+            .tables
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         tables
             .remove(name)
             .map(|_| ())
@@ -72,12 +81,15 @@ impl TableEngine for MemoryEngine {
     }
 
     fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
-        let tables = self.tables.read().unwrap();
+        let tables = self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if tables.contains_key(&index.name)
             || tables.values().any(|t| {
                 t.indexes
                     .read()
-                    .unwrap()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
                     .iter()
                     .any(|i| i.name == index.name)
             })
@@ -87,14 +99,18 @@ impl TableEngine for MemoryEngine {
         let target = tables
             .get(table)
             .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
-        target.indexes.write().unwrap().push(index);
+        target
+            .indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .push(index);
         Ok(())
     }
 
     fn relations(&self) -> Vec<TableSchema> {
         self.tables
             .read()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .values()
             .map(|t| t.schema.clone())
             .collect()
@@ -103,11 +119,15 @@ impl TableEngine for MemoryEngine {
     fn relation_metadata(&self) -> Vec<RelationMetadata> {
         self.tables
             .read()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .values()
             .map(|t| RelationMetadata {
                 schema: t.schema.clone(),
-                indexes: t.indexes.read().unwrap().clone(),
+                indexes: t
+                    .indexes
+                    .read()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                    .clone(),
             })
             .collect()
     }
@@ -185,11 +205,19 @@ impl TableAm for MemoryTable {
     }
 
     fn indexes(&self) -> Vec<IndexMetadata> {
-        self.indexes.read().unwrap().clone()
+        self.indexes
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .clone()
     }
 
     fn scan(&self, txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
-        let rows = Arc::clone(&self.rows.read().unwrap());
+        let rows = Arc::clone(
+            &self
+                .rows
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned")),
+        );
         Box::new(MvccScan {
             rows,
             pos: 0,
@@ -198,7 +226,10 @@ impl TableAm for MemoryTable {
     }
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Option<Tuple> {
-        let rows = self.rows.read().unwrap();
+        let rows = self
+            .rows
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let pos = find(&rows, tid)?;
         let v = &rows[pos];
         satisfies_mvcc(&v.header, &txn.snapshot, &txn.clog, txn.xid, txn.cid)
@@ -208,7 +239,10 @@ impl TableAm for MemoryTable {
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Tid {
         // Copy-on-write: cheap append normally, clones the Vec only while a
         // concurrent scan still holds the previous snapshot.
-        let mut rows = self.rows.write().unwrap();
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let tid = self.alloc_tid();
         Arc::make_mut(&mut *rows).push(Version {
             tid,
@@ -219,7 +253,10 @@ impl TableAm for MemoryTable {
     }
 
     fn update(&self, tid: Tid, tuple: Tuple, txn: &TxnContext) -> UpdateResult {
-        let mut rows = self.rows.write().unwrap();
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let rows = Arc::make_mut(&mut *rows);
         let Some(pos) = find(rows, tid) else {
             return UpdateResult::NotFound;
@@ -242,7 +279,10 @@ impl TableAm for MemoryTable {
     }
 
     fn delete(&self, tid: Tid, txn: &TxnContext) -> DeleteResult {
-        let mut rows = self.rows.write().unwrap();
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let rows = Arc::make_mut(&mut *rows);
         let Some(pos) = find(rows, tid) else {
             return DeleteResult::NotFound;
@@ -259,7 +299,10 @@ impl TableAm for MemoryTable {
     /// batch. New versions are appended after all old ones are stamped, keeping
     /// the tid order intact for the searches inside the loop.
     fn update_many(&self, updates: Vec<(Tid, Tuple)>, txn: &TxnContext) -> u64 {
-        let mut rows = self.rows.write().unwrap();
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let rows = Arc::make_mut(&mut *rows);
         let mut new_versions = Vec::new();
         let mut applied = 0;
@@ -284,7 +327,10 @@ impl TableAm for MemoryTable {
     /// Batch counterpart of [`TableAm::delete`]: stamp every found live version
     /// under one lock.
     fn delete_many(&self, tids: Vec<Tid>, txn: &TxnContext) -> u64 {
-        let mut rows = self.rows.write().unwrap();
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let rows = Arc::make_mut(&mut *rows);
         let mut applied = 0;
         for tid in tids {
@@ -304,7 +350,10 @@ impl TableAm for MemoryTable {
     /// rollback will not bring the rows back; that fidelity waits for the heap
     /// engine.)
     fn truncate(&self, _txn: &TxnContext) {
-        let mut rows = self.rows.write().unwrap();
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         *rows = Arc::new(Vec::new());
     }
 
@@ -313,7 +362,10 @@ impl TableAm for MemoryTable {
     /// version whose deleter aborted (or is still in flight) is live and must be
     /// kept — hence the CLOG check, not just `xmax < oldest`.
     fn vacuum(&self, oldest: crabgresql_txn::Xid, clog: &Clog) {
-        let mut rows = self.rows.write().unwrap();
+        let mut rows = self
+            .rows
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let rows = Arc::make_mut(&mut *rows);
         rows.retain(|v| {
             !(v.header.xmax.is_valid()
@@ -346,7 +398,9 @@ mod tests {
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         let tid = table.insert(tuple, &txn);
-        tm.commit(xid).unwrap();
+        if let Err(error) = tm.commit(xid) {
+            panic!("failed to commit memory-storage test transaction: {error}");
+        }
         tid
     }
 
@@ -361,10 +415,10 @@ mod tests {
     }
 
     #[test]
-    fn insert_then_scan() {
+    fn insert_then_scan() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         insert_committed(
             &tm,
             &*table,
@@ -376,25 +430,29 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].1, vec![Value::Int4(1), Value::Text("one".into())]);
         assert_eq!(rows[1].1, vec![Value::Int4(2), Value::Null]);
+
+        Ok(())
     }
 
     #[test]
-    fn insert_returns_monotonic_tids() {
+    fn insert_returns_monotonic_tids() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let a = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
         let b = insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Null]);
         assert!(b > a);
         let tids: Vec<Tid> = table.scan(&read(&tm)).map(|(tid, _)| tid).collect();
         assert_eq!(tids, vec![a, b]);
+
+        Ok(())
     }
 
     #[test]
-    fn uncommitted_insert_is_invisible_until_commit() {
+    fn uncommitted_insert_is_invisible_until_commit() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         table.insert(vec![Value::Int4(1), Value::Null], &txn);
@@ -403,27 +461,31 @@ mod tests {
         // ...but the inserting transaction's own later command can.
         let self_read = tm.context(xid, CommandId(1));
         assert_eq!(table.scan(&self_read).count(), 1);
-        tm.commit(xid).unwrap();
+        tm.commit(xid)?;
         assert_eq!(table.scan(&read(&tm)).count(), 1);
+
+        Ok(())
     }
 
     #[test]
-    fn aborted_insert_is_never_visible() {
+    fn aborted_insert_is_never_visible() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         table.insert(vec![Value::Int4(1), Value::Null], &txn);
         tm.abort(xid);
         assert_eq!(table.scan(&read(&tm)).count(), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn update_makes_new_version_visible_old_dead() {
+    fn update_makes_new_version_visible_old_dead() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let tid = insert_committed(
             &tm,
             &*table,
@@ -435,16 +497,18 @@ mod tests {
             table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())], &txn),
             UpdateResult::Updated
         );
-        tm.commit(xid).unwrap();
+        tm.commit(xid)?;
         let rows: Vec<_> = table.scan(&read(&tm)).map(|(_, t)| t).collect();
         assert_eq!(rows, vec![vec![Value::Int4(1), Value::Text("uno".into())]]);
+
+        Ok(())
     }
 
     #[test]
-    fn rolled_back_update_restores_old_version() {
+    fn rolled_back_update_restores_old_version() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let tid = insert_committed(
             &tm,
             &*table,
@@ -457,41 +521,47 @@ mod tests {
         // The old version's delete is void and the new version never committed.
         let rows: Vec<_> = table.scan(&read(&tm)).map(|(_, t)| t).collect();
         assert_eq!(rows, vec![vec![Value::Int4(1), Value::Text("one".into())]]);
+
+        Ok(())
     }
 
     #[test]
-    fn delete_leaves_other_tids_untouched() {
+    fn delete_leaves_other_tids_untouched() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
         let b = insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Null]);
         insert_committed(&tm, &*table, vec![Value::Int4(3), Value::Null]);
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         assert_eq!(table.delete(b, &txn), DeleteResult::Deleted);
-        tm.commit(xid).unwrap();
+        tm.commit(xid)?;
         assert_eq!(ids(&tm, &*table), vec![Value::Int4(1), Value::Int4(3)]);
+
+        Ok(())
     }
 
     #[test]
-    fn rolled_back_delete_keeps_the_row() {
+    fn rolled_back_delete_keeps_the_row() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let a = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         table.delete(a, &txn);
         tm.abort(xid);
         assert_eq!(ids(&tm, &*table), vec![Value::Int4(1)]);
+
+        Ok(())
     }
 
     #[test]
-    fn vacuum_keeps_live_row_whose_deleter_aborted() {
+    fn vacuum_keeps_live_row_whose_deleter_aborted() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let a = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
         // Delete the row, then abort the deleter: the row is live again.
         let x = tm.allocate_xid();
@@ -502,19 +572,21 @@ mod tests {
         let horizon = tm.allocate_xid();
         table.vacuum(horizon, tm.clog());
         assert_eq!(ids(&tm, &*table), vec![Value::Int4(1)]);
+
+        Ok(())
     }
 
     #[test]
-    fn update_and_delete_of_missing_tid_report_not_found() {
+    fn update_and_delete_of_missing_tid_report_not_found() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let tid = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         assert_eq!(table.delete(tid, &txn), DeleteResult::Deleted);
         // Already deleted by this (committed-once-we-commit) txn: gone.
-        tm.commit(xid).unwrap();
+        tm.commit(xid)?;
         let x2 = tm.allocate_xid();
         let t2 = tm.context(x2, CommandId::FIRST);
         assert_eq!(table.delete(tid, &t2), DeleteResult::NotFound);
@@ -527,16 +599,20 @@ mod tests {
             table.delete(Tid::from_packed(999), &t2),
             DeleteResult::NotFound
         );
+
+        Ok(())
     }
 
     #[test]
-    fn duplicate_create_fails() {
+    fn duplicate_create_fails() -> anyhow::Result<()> {
         let engine = MemoryEngine::new();
-        engine.create_table(schema("t")).unwrap();
+        engine.create_table(schema("t"))?;
         assert!(matches!(
             engine.create_table(schema("t")),
             Err(StorageError::TableAlreadyExists(_))
         ));
+
+        Ok(())
     }
 
     #[test]
@@ -549,18 +625,20 @@ mod tests {
     }
 
     #[test]
-    fn drop_table_removes_it_and_allows_recreate() {
+    fn drop_table_removes_it_and_allows_recreate() -> anyhow::Result<()> {
         let engine = MemoryEngine::new();
-        engine.create_table(schema("t")).unwrap();
-        engine.drop_table("t").unwrap();
+        engine.create_table(schema("t"))?;
+        engine.drop_table("t")?;
         // Gone after drop.
         assert!(matches!(
             engine.open_table("t"),
             Err(StorageError::TableNotFound(_))
         ));
         // The name is free to reuse.
-        engine.create_table(schema("t")).unwrap();
+        engine.create_table(schema("t"))?;
         assert!(engine.open_table("t").is_ok());
+
+        Ok(())
     }
 
     #[test]
@@ -573,16 +651,16 @@ mod tests {
     }
 
     #[test]
-    fn update_many_applies_batch_and_skips_missing() {
+    fn update_many_applies_batch_and_skips_missing() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let a = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
         let b = insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Null]);
         // Delete b in its own committed txn first.
         let dx = tm.allocate_xid();
         table.delete(b, &tm.context(dx, CommandId::FIRST));
-        tm.commit(dx).unwrap();
+        tm.commit(dx)?;
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         let applied = table.update_many(
@@ -592,75 +670,91 @@ mod tests {
             ],
             &txn,
         );
-        tm.commit(xid).unwrap();
+        tm.commit(xid)?;
         assert_eq!(applied, 1);
         assert_eq!(ids(&tm, &*table), vec![Value::Int4(10)]);
+
+        Ok(())
     }
 
     #[test]
-    fn delete_many_removes_batch_in_one_pass() {
+    fn delete_many_removes_batch_in_one_pass() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let a = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
         let b = insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Null]);
         let c = insert_committed(&tm, &*table, vec![Value::Int4(3), Value::Null]);
         let dx = tm.allocate_xid();
         table.delete(b, &tm.context(dx, CommandId::FIRST));
-        tm.commit(dx).unwrap();
+        tm.commit(dx)?;
         let xid = tm.allocate_xid();
         let txn = tm.context(xid, CommandId::FIRST);
         assert_eq!(table.delete_many(vec![a, b, c], &txn), 2);
-        tm.commit(xid).unwrap();
+        tm.commit(xid)?;
         assert_eq!(table.scan(&read(&tm)).count(), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn truncate_empties_table_and_keeps_tids_monotonic() {
+    fn truncate_empties_table_and_keeps_tids_monotonic() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
         let b = insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Null]);
         let tx = tm.allocate_xid();
         table.truncate(&tm.context(tx, CommandId::FIRST));
-        tm.commit(tx).unwrap();
+        tm.commit(tx)?;
         assert_eq!(table.scan(&read(&tm)).count(), 0);
         let c = insert_committed(&tm, &*table, vec![Value::Int4(3), Value::Null]);
         assert!(c > b);
         assert_eq!(ids(&tm, &*table), vec![Value::Int4(3)]);
+
+        Ok(())
     }
 
     #[test]
-    fn concurrent_inserts_keep_rows_sorted_by_tid() {
+    fn concurrent_inserts_keep_rows_sorted_by_tid() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
-        std::thread::scope(|s| {
+        let table = engine.create_table(schema("t"))?;
+        std::thread::scope(|s| -> anyhow::Result<()> {
+            let mut handles = Vec::new();
             for _ in 0..4 {
-                s.spawn(|| {
+                handles.push(s.spawn(|| -> anyhow::Result<()> {
                     for i in 0..250 {
                         let xid = tm.allocate_xid();
                         let txn = tm.context(xid, CommandId::FIRST);
                         table.insert(vec![Value::Int4(i), Value::Null], &txn);
-                        tm.commit(xid).unwrap();
+                        tm.commit(xid)?;
                     }
-                });
+                    Ok(())
+                }));
             }
-        });
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("insert worker panicked"))??;
+            }
+            Ok(())
+        })?;
         let tids: Vec<Tid> = table.scan(&read(&tm)).map(|(tid, _)| tid).collect();
         assert_eq!(tids.len(), 1000);
         assert!(
             tids.windows(2).all(|w| w[0] < w[1]),
             "rows must stay tid-sorted"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn scan_is_stable_against_concurrent_writes() {
+    fn scan_is_stable_against_concurrent_writes() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
-        let table = engine.create_table(schema("t")).unwrap();
+        let table = engine.create_table(schema("t"))?;
         let a = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Null]);
         // Capture the scan (and its snapshot) before any further writes.
         let scan = table.scan(&read(&tm));
@@ -670,8 +764,10 @@ mod tests {
         let txn = tm.context(xid, CommandId::FIRST);
         table.update(a, vec![Value::Int4(99), Value::Null], &txn);
         table.delete(a, &txn);
-        tm.commit(xid).unwrap();
+        tm.commit(xid)?;
         let rows: Vec<_> = scan.collect();
         assert_eq!(rows, vec![(a, vec![Value::Int4(1), Value::Null])]);
+
+        Ok(())
     }
 }

@@ -218,23 +218,40 @@ impl GlobalCatalog {
     /// Whether `name` (lowercased) resolves to a user-defined type — used to
     /// resolve a SQL type name to a [`TypeRef`].
     pub fn is_user_type(&self, name: &str) -> bool {
-        self.inner.read().unwrap().types.contains_key(name)
+        self.inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .types
+            .contains_key(name)
     }
 
     /// Physical width of a user type, for a `LIKE` clause referencing it.
     pub fn user_type_typlen(&self, name: &str) -> Option<i32> {
-        self.inner.read().unwrap().types.get(name).map(|e| e.typlen)
+        self.inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .types
+            .get(name)
+            .map(|e| e.typlen)
     }
 
     /// Backing builtin of a user type, propagated when another type is `LIKE` it.
     pub fn user_type_backing(&self, name: &str) -> Option<PgType> {
-        self.inner.read().unwrap().types.get(name).and_then(|e| e.backing)
+        self.inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .types
+            .get(name)
+            .and_then(|e| e.backing)
     }
 
     /// `CREATE TYPE name;` — register a shell type. Re-declaring any existing
     /// type (shell or fully defined) is a duplicate-object error, as in PG.
     pub fn create_shell_type(&self, name: &str) -> Result<Vec<CatalogNotice>, PgError> {
-        let mut cat = self.inner.write().unwrap();
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if cat.types.contains_key(name) {
             return Err(PgError::new(
                 sqlstate::DUPLICATE_OBJECT,
@@ -266,7 +283,10 @@ impl GlobalCatalog {
         typlen: i32,
         backing: Option<PgType>,
     ) -> Result<Vec<CatalogNotice>, PgError> {
-        let mut cat = self.inner.write().unwrap();
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         match cat.types.get_mut(name) {
             Some(entry) if entry.defined => Err(PgError::new(
                 sqlstate::DUPLICATE_OBJECT,
@@ -305,7 +325,10 @@ impl GlobalCatalog {
         name: &str,
         labels: Vec<String>,
     ) -> Result<Vec<CatalogNotice>, PgError> {
-        let mut cat = self.inner.write().unwrap();
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         if cat.types.contains_key(name) {
             return Err(PgError::new(
                 sqlstate::DUPLICATE_OBJECT,
@@ -359,10 +382,17 @@ impl GlobalCatalog {
 
         let arg_types: Vec<TypeRef> = args.iter().map(|(ty, _)| ty.clone()).collect();
 
-        let mut cat = self.inner.write().unwrap();
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
 
         // A function may not be redefined with the same name and argument types.
-        if cat.funcs.iter().any(|f| f.name == name && f.args == arg_types) {
+        if cat
+            .funcs
+            .iter()
+            .any(|f| f.name == name && f.args == arg_types)
+        {
             let arglist: Vec<String> = arg_types.iter().map(TypeRef::display_name).collect();
             return Err(PgError::new(
                 sqlstate::DUPLICATE_FUNCTION,
@@ -432,10 +462,17 @@ impl GlobalCatalog {
                 "source data type and target data type are the same",
             ));
         }
-        let mut cat = self.inner.write().unwrap();
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
 
         // A cast for this type pair may only be defined once.
-        if cat.casts.iter().any(|c| c.source == source && c.target == target) {
+        if cat
+            .casts
+            .iter()
+            .any(|c| c.source == source && c.target == target)
+        {
             return Err(PgError::new(
                 sqlstate::DUPLICATE_OBJECT,
                 format!(
@@ -483,7 +520,10 @@ impl GlobalCatalog {
         cascade: bool,
         if_exists: bool,
     ) -> Result<Vec<CatalogNotice>, PgError> {
-        let mut cat = self.inner.write().unwrap();
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         for name in names {
             cat.validate_drop_type(name, cascade, if_exists)?;
         }
@@ -501,7 +541,10 @@ impl GlobalCatalog {
         target: TypeRef,
         if_exists: bool,
     ) -> Result<Vec<CatalogNotice>, PgError> {
-        let mut cat = self.inner.write().unwrap();
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let found = cat
             .casts
             .iter()
@@ -534,7 +577,10 @@ impl GlobalCatalog {
 /// a read lock); binding never holds a write lock, so there is no re-entrancy.
 impl TypeCatalog for GlobalCatalog {
     fn resolve_type(&self, name: &str) -> Option<UserType> {
-        let cat = self.inner.read().unwrap();
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         cat.types.get(name).filter(|e| e.defined).map(|e| UserType {
             oid: e.oid,
             backing: e.backing,
@@ -544,7 +590,7 @@ impl TypeCatalog for GlobalCatalog {
     fn is_shell_type(&self, name: &str) -> bool {
         self.inner
             .read()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .types
             .get(name)
             .is_some_and(|e| !e.defined)
@@ -553,13 +599,16 @@ impl TypeCatalog for GlobalCatalog {
     fn user_type_name(&self, oid: u32) -> Option<String> {
         self.inner
             .read()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .type_name_by_oid(oid)
             .map(str::to_string)
     }
 
     fn find_cast(&self, source: PgType, target: PgType) -> Option<UserCast> {
-        let cat = self.inner.read().unwrap();
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let source = cat.type_ref_of(source)?;
         let target = cat.type_ref_of(target)?;
         cat.casts
@@ -573,7 +622,10 @@ impl TypeCatalog for GlobalCatalog {
     fn backing_rep(&self, ty: PgType) -> PgType {
         match ty {
             PgType::User(oid) => {
-                let cat = self.inner.read().unwrap();
+                let cat = self
+                    .inner
+                    .read()
+                    .unwrap_or_else(|_| panic!("rwlock poisoned"));
                 cat.types
                     .values()
                     .find(|e| e.oid == oid)
@@ -585,7 +637,10 @@ impl TypeCatalog for GlobalCatalog {
     }
 
     fn enum_info(&self, oid: u32) -> Option<EnumInfo> {
-        let cat = self.inner.read().unwrap();
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let (name, entry) = cat.types.iter().find(|(_, e)| e.oid == oid)?;
         entry.enum_labels.as_ref().map(|labels| EnumInfo {
             name: name.clone(),
@@ -608,7 +663,10 @@ impl GlobalCatalog {
     /// Every registered user type, for `pg_type`/`pg_enum` reflection. Shell
     /// types (not yet defined) are excluded, matching PG's `typisdefined`.
     pub fn user_types(&self) -> Vec<UserTypeInfo> {
-        let cat = self.inner.read().unwrap();
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let mut types: Vec<_> = cat.types
             .iter()
             .filter(|(_, e)| e.defined)
@@ -758,6 +816,7 @@ fn is_known_internal(name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -765,24 +824,28 @@ mod tests {
     /// `DROP TYPE ... CASCADE` NOTICE/DETAIL matches PostgreSQL.
     fn bootstrap_xfloat8() -> GlobalCatalog {
         let cat = GlobalCatalog::new();
-        cat.create_shell_type("xfloat8").unwrap();
-        let in_notices = cat
-            .create_function(
-                "xfloat8in",
-                vec![(TypeRef::Cstring, None)],
-                TypeRef::User("xfloat8".into()),
-                "int8in",
-            )
-            .unwrap();
+        if let Err(error) = cat.create_shell_type("xfloat8") {
+            panic!("failed to create shell type test fixture: {error}");
+        }
+        let in_notices = match cat.create_function(
+            "xfloat8in",
+            vec![(TypeRef::Cstring, None)],
+            TypeRef::User("xfloat8".into()),
+            "int8in",
+        ) {
+            Ok(notices) => notices,
+            Err(error) => panic!("failed to create input function test fixture: {error}"),
+        };
         assert_eq!(in_notices[0].message, "return type xfloat8 is only a shell");
-        let out_notices = cat
-            .create_function(
-                "xfloat8out",
-                vec![(TypeRef::User("xfloat8".into()), Some((1, 28)))],
-                TypeRef::Cstring,
-                "int8out",
-            )
-            .unwrap();
+        let out_notices = match cat.create_function(
+            "xfloat8out",
+            vec![(TypeRef::User("xfloat8".into()), Some((1, 28)))],
+            TypeRef::Cstring,
+            "int8out",
+        ) {
+            Ok(notices) => notices,
+            Err(error) => panic!("failed to create output function test fixture: {error}"),
+        };
         assert_eq!(
             out_notices[0].message,
             "argument type xfloat8 is only a shell"
@@ -790,55 +853,64 @@ mod tests {
         // The argument NOTICE carries the type token's (line, column) for the
         // client's `LINE n:` caret; the return-type NOTICE (above) does not.
         assert_eq!(out_notices[0].position, Some((1, 28)));
-        cat.define_type("xfloat8", 8, Some(PgType::Int8)).unwrap();
-        cat.create_cast(
+        if let Err(error) = cat.define_type("xfloat8", 8, Some(PgType::Int8)) {
+            panic!("failed to define type test fixture: {error}");
+        }
+        if let Err(error) = cat.create_cast(
             TypeRef::User("xfloat8".into()),
             TypeRef::Builtin(PgType::Int8),
             true,
-        )
-        .unwrap();
+        ) {
+            panic!("failed to create cast test fixture: {error}");
+        }
         cat
     }
 
     #[test]
-    fn drop_cascade_lists_dependents_in_creation_order() {
+    fn drop_cascade_lists_dependents_in_creation_order() -> anyhow::Result<()> {
         let cat = bootstrap_xfloat8();
-        let notices = cat.drop_types(&["xfloat8"], true, false).unwrap();
+        let notices = cat.drop_types(&["xfloat8"], true, false)?;
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].message, "drop cascades to 3 other objects");
         assert_eq!(
-            notices[0].detail.as_deref().unwrap(),
+            notices[0]
+                .detail
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("cascade notice detail is missing"))?,
             "drop cascades to function xfloat8in(cstring)\n\
              drop cascades to function xfloat8out(xfloat8)\n\
              drop cascades to cast from xfloat8 to bigint"
         );
         // The type and its dependents are gone.
         assert!(!cat.is_user_type("xfloat8"));
+
+        Ok(())
     }
 
     #[test]
-    fn drop_cascade_single_dependent_has_no_count_or_detail() {
+    fn drop_cascade_single_dependent_has_no_count_or_detail() -> anyhow::Result<()> {
         // Exactly one dependent: PG names it inline with no count and no DETAIL.
         let cat = GlobalCatalog::new();
-        cat.create_shell_type("solo").unwrap();
+        cat.create_shell_type("solo")?;
         cat.create_function(
             "solo_in",
             vec![(TypeRef::Cstring, None)],
             TypeRef::User("solo".into()),
             "int8in",
-        )
-        .unwrap();
-        let notices = cat.drop_types(&["solo"], true, false).unwrap();
+        )?;
+        let notices = cat.drop_types(&["solo"], true, false)?;
         assert_eq!(notices.len(), 1);
         assert_eq!(
             notices[0].message,
             "drop cascades to function solo_in(cstring)"
         );
         assert!(notices[0].detail.is_none());
+
+        Ok(())
     }
 
     #[test]
-    fn drop_restrict_refuses_with_hint() {
+    fn drop_restrict_refuses_with_hint() -> anyhow::Result<()> {
         let cat = bootstrap_xfloat8();
         let err = cat.drop_types(&["xfloat8"], false, false).unwrap_err();
         assert_eq!(err.code, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST);
@@ -847,7 +919,9 @@ mod tests {
             "cannot drop type xfloat8 because other objects depend on it"
         );
         assert_eq!(
-            err.detail.as_deref().unwrap(),
+            err.detail
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("dependency detail is missing"))?,
             "function xfloat8in(cstring) depends on type xfloat8\n\
              function xfloat8out(xfloat8) depends on type xfloat8\n\
              cast from xfloat8 to bigint depends on type xfloat8"
@@ -855,6 +929,8 @@ mod tests {
         assert!(err.hint.is_some());
         // Nothing was dropped.
         assert!(cat.is_user_type("xfloat8"));
+
+        Ok(())
     }
 
     #[test]
@@ -862,38 +938,46 @@ mod tests {
         // `DROP TYPE xfloat8, nope;` must leave xfloat8 intact when a later name
         // does not exist — PG evaluates the whole statement atomically.
         let cat = bootstrap_xfloat8();
-        let err = cat.drop_types(&["xfloat8", "nope"], true, false).unwrap_err();
+        let err = cat
+            .drop_types(&["xfloat8", "nope"], true, false)
+            .unwrap_err();
         assert_eq!(err.code, sqlstate::UNDEFINED_OBJECT);
         assert!(cat.is_user_type("xfloat8"));
     }
 
     #[test]
-    fn redeclaring_a_type_is_a_duplicate_error() {
+    fn redeclaring_a_type_is_a_duplicate_error() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
-        cat.create_shell_type("foo").unwrap();
+        cat.create_shell_type("foo")?;
         let err = cat.create_shell_type("foo").unwrap_err();
         assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(err.message, "type \"foo\" already exists");
+
+        Ok(())
     }
 
     #[test]
-    fn shell_types_do_not_resolve_for_queries() {
+    fn shell_types_do_not_resolve_for_queries() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
-        cat.create_shell_type("foo").unwrap();
+        cat.create_shell_type("foo")?;
         assert!(cat.is_shell_type("foo"));
         assert!(cat.resolve_type("foo").is_none());
-        cat.define_type("foo", 8, Some(PgType::Int8)).unwrap();
+        cat.define_type("foo", 8, Some(PgType::Int8))?;
         assert!(!cat.is_shell_type("foo"));
         assert!(cat.resolve_type("foo").is_some());
+
+        Ok(())
     }
 
     #[test]
-    fn user_type_enumeration_follows_oid_order() {
+    fn user_type_enumeration_follows_oid_order() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
-        cat.create_enum_type("zeta", vec!["z".into()]).unwrap();
-        cat.create_enum_type("alpha", vec!["a".into()]).unwrap();
+        cat.create_enum_type("zeta", vec!["z".into()])?;
+        cat.create_enum_type("alpha", vec!["a".into()])?;
         let names: Vec<_> = cat.user_types().into_iter().map(|t| t.name).collect();
         assert_eq!(names, ["zeta", "alpha"]);
+
+        Ok(())
     }
 
     #[test]
@@ -934,17 +1018,22 @@ mod tests {
     fn unknown_internal_function_is_rejected() {
         let cat = GlobalCatalog::new();
         let err = cat
-            .create_function("f", vec![(TypeRef::Cstring, None)], TypeRef::Builtin(PgType::Int8), "nope")
+            .create_function(
+                "f",
+                vec![(TypeRef::Cstring, None)],
+                TypeRef::Builtin(PgType::Int8),
+                "nope",
+            )
             .unwrap_err();
         assert_eq!(err.code, sqlstate::UNDEFINED_FUNCTION);
         assert_eq!(err.message, "there is no built-in function named \"nope\"");
     }
 
     #[test]
-    fn date_io_internals_are_accepted() {
+    fn date_io_internals_are_accepted() -> anyhow::Result<()> {
         // A type can be bootstrapped over any supported type's I/O internals.
         let cat = GlobalCatalog::new();
-        cat.create_shell_type("xd").unwrap();
+        cat.create_shell_type("xd")?;
         assert!(
             cat.create_function(
                 "xd_in",
@@ -954,6 +1043,8 @@ mod tests {
             )
             .is_ok()
         );
+
+        Ok(())
     }
 
     #[test]
@@ -970,13 +1061,12 @@ mod tests {
     }
 
     #[test]
-    fn create_enum_type_and_enum_info_roundtrip() {
+    fn create_enum_type_and_enum_info_roundtrip() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
-        cat.create_enum_type("rainbow", vec!["red".into(), "green".into(), "blue".into()])
-            .unwrap();
+        cat.create_enum_type("rainbow", vec!["red".into(), "green".into(), "blue".into()])?;
         assert!(cat.is_user_type("rainbow"));
-        let oid = cat.resolve_type("rainbow").unwrap().oid;
-        let info = cat.enum_info(oid).unwrap();
+        let oid = cat.resolve_type("rainbow").expect("rainbow resolves").oid;
+        let info = cat.enum_info(oid).expect("rainbow has enum info");
         assert_eq!(info.name, "rainbow");
         assert_eq!(info.labels, vec!["red", "green", "blue"]);
         // A non-enum OID (or a base user type) has no enum_info.
@@ -989,6 +1079,8 @@ mod tests {
             rows[0].enum_labels.as_deref(),
             Some(&["red".to_string(), "green".to_string(), "blue".to_string()][..])
         );
+
+        Ok(())
     }
 
     #[test]
@@ -1004,20 +1096,24 @@ mod tests {
     }
 
     #[test]
-    fn create_enum_duplicate_name_rejected() {
+    fn create_enum_duplicate_name_rejected() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
-        cat.create_enum_type("e", vec!["a".into()]).unwrap();
+        cat.create_enum_type("e", vec!["a".into()])?;
         let err = cat.create_enum_type("e", vec!["b".into()]).unwrap_err();
         assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(err.message, "type \"e\" already exists");
+
+        Ok(())
     }
 
     #[test]
-    fn missing_type_drop_reports_error_or_skips() {
+    fn missing_type_drop_reports_error_or_skips() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
         assert!(cat.drop_types(&["nope"], false, false).is_err());
         // IF EXISTS turns the miss into a skip NOTICE.
-        let notices = cat.drop_types(&["nope"], false, true).unwrap();
+        let notices = cat.drop_types(&["nope"], false, true)?;
         assert_eq!(notices[0].message, "type \"nope\" does not exist, skipping");
+
+        Ok(())
     }
 }

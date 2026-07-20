@@ -69,7 +69,10 @@ impl RelCatalog {
     /// Every relation's `(name, relfilenode, schema)` for rebuilding the table
     /// map at startup.
     pub fn schemas(&self) -> Vec<(String, RelFileNode, TableSchema, Vec<IndexMetadata>)> {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         state
             .rels
             .iter()
@@ -102,7 +105,7 @@ impl RelCatalog {
     pub fn contains(&self, name: &str) -> bool {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
             .rels
             .iter()
             .any(|r| r.name == name)
@@ -111,7 +114,10 @@ impl RelCatalog {
     /// Allocate a fresh relfilenode for `schema`, persist the catalog, and return
     /// the new node.
     pub fn create(&self, schema: &TableSchema) -> std::io::Result<RelFileNode> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         let rel = state.next;
         state.next += 1;
         state.rels.push(PersistRel {
@@ -140,7 +146,10 @@ impl RelCatalog {
     /// stays monotonic so a freed relfilenode is never reused, which keeps the
     /// durability invariant (see `persist`) intact even after a DROP.
     pub fn remove(&self, name: &str) -> std::io::Result<Option<RelFileNode>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         let Some(pos) = state.rels.iter().position(|r| r.name == name) else {
             return Ok(None);
         };
@@ -150,7 +159,10 @@ impl RelCatalog {
     }
 
     pub fn add_index(&self, table: &str, index: IndexMetadata) -> std::io::Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         let rel = state
             .rels
             .iter_mut()
@@ -255,18 +267,22 @@ struct Dec<'a> {
 }
 impl<'a> Dec<'a> {
     fn u32(&mut self) -> u32 {
-        let v = u32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+        let v = u32::from_le_bytes(self.array());
         self.p += 4;
         v
     }
     fn i32(&mut self) -> i32 {
-        let v = i32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+        let v = i32::from_le_bytes(self.array());
         self.p += 4;
         v
     }
     fn s(&mut self) -> String {
         let n = self.u32() as usize;
-        let s = String::from_utf8(self.b[self.p..self.p + n].to_vec()).unwrap();
+        let bytes = self.b[self.p..self.p + n].to_vec();
+        let s = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => panic!("relation catalog contains invalid UTF-8"),
+        };
         self.p += n;
         s
     }
@@ -280,6 +296,14 @@ impl<'a> Dec<'a> {
     }
     fn remaining(&self) -> &[u8] {
         &self.b[self.p..]
+    }
+    fn array<const N: usize>(&self) -> [u8; N] {
+        let Some(slice) = self.b.get(self.p..self.p + N) else {
+            panic!("relation catalog is truncated");
+        };
+        let mut out = [0; N];
+        out.copy_from_slice(slice);
+        out
     }
 }
 
@@ -412,54 +436,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_round_trips_and_legacy_prefix_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let catalog = RelCatalog::load(dir.path()).unwrap();
+    fn metadata_round_trips_and_legacy_prefix_defaults() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
         let mut id = Column::new("id", PgType::Int4);
         id.nullable = false;
         id.default = Some("1 + 2".to_string());
-        catalog
-            .create(&TableSchema {
-                name: "t".to_string(),
-                columns: vec![id],
-            })
-            .unwrap();
-        catalog
-            .add_index(
-                "t",
-                IndexMetadata {
-                    name: "t_pkey".to_string(),
-                    method: IndexMethod::BTree,
-                    keys: vec![IndexKey {
-                        column: 0,
-                        descending: false,
-                        nulls_first: false,
-                    }],
-                    unique: true,
-                    nulls_distinct: true,
-                    constraint: Some(IndexConstraint::PrimaryKey),
-                },
-            )
-            .unwrap();
+        catalog.create(&TableSchema {
+            name: "t".to_string(),
+            columns: vec![id],
+        })?;
+        catalog.add_index(
+            "t",
+            IndexMetadata {
+                name: "t_pkey".to_string(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: true,
+                nulls_distinct: true,
+                constraint: Some(IndexConstraint::PrimaryKey),
+            },
+        )?;
         drop(catalog);
 
-        let loaded = RelCatalog::load(dir.path()).unwrap();
-        let (_, _, schema, indexes) = loaded.schemas().pop().unwrap();
+        let loaded = RelCatalog::load(dir.path())?;
+        let (_, _, schema, indexes) = loaded
+            .schemas()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
         assert!(!schema.columns[0].nullable);
         assert_eq!(schema.columns[0].default.as_deref(), Some("1 + 2"));
         assert_eq!(indexes[0].name, "t_pkey");
 
         let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
-        let bytes = std::fs::read(&path).unwrap();
+        let bytes = std::fs::read(&path)?;
         let tail = bytes
             .windows(META_MAGIC.len())
             .position(|w| w == META_MAGIC)
-            .unwrap();
-        std::fs::write(&path, &bytes[..tail]).unwrap();
-        let legacy = RelCatalog::load(dir.path()).unwrap();
-        let (_, _, schema, indexes) = legacy.schemas().pop().unwrap();
+            .ok_or_else(|| anyhow::anyhow!("metadata marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        let (_, _, schema, indexes) = legacy
+            .schemas()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("legacy catalog is empty"))?;
         assert!(schema.columns[0].nullable);
         assert!(schema.columns[0].default.is_none());
         assert!(indexes.is_empty());
+
+        Ok(())
     }
 }

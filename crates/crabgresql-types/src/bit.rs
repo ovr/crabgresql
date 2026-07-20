@@ -32,7 +32,10 @@ pub struct BitError {
 
 impl BitError {
     fn new(sqlstate: &'static str, message: impl Into<String>) -> BitError {
-        BitError { sqlstate, message: message.into() }
+        BitError {
+            sqlstate,
+            message: message.into(),
+        }
     }
 }
 
@@ -111,7 +114,10 @@ pub fn input(s: &str) -> Result<(u32, Vec<u8>), BitError> {
 /// `bit_out` / `varbit_out`: the `0`/`1` text form, MSB-first. A zero-length
 /// string prints empty.
 pub fn format(len: u32, data: &[u8]) -> String {
-    to_bits(len, data).into_iter().map(|b| if b { '1' } else { '0' }).collect()
+    to_bits(len, data)
+        .into_iter()
+        .map(|b| if b { '1' } else { '0' })
+        .collect()
 }
 
 // --- length coercion -------------------------------------------------------
@@ -267,7 +273,10 @@ pub fn set_bit(len: u32, data: &[u8], n: i32, value: i32) -> Result<(u32, Vec<u8
         return Err(index_out_of_range(n, len));
     }
     if value != 0 && value != 1 {
-        return Err(BitError::new(INVALID_PARAMETER_VALUE, "new bit must be 0 or 1"));
+        return Err(BitError::new(
+            INVALID_PARAMETER_VALUE,
+            "new bit must be 0 or 1",
+        ));
     }
     let mut bits = to_bits(len, data);
     bits[n as usize] = value == 1;
@@ -353,7 +362,10 @@ pub fn overlay(
     // A non-positive start would reduce to a negative head length; PG rejects it
     // up front (this also avoids the `sp - 1` underflow for very negative `sp`).
     if sp <= 0 {
-        return Err(BitError::new(SUBSTRING_ERROR, "negative substring length not allowed"));
+        return Err(BitError::new(
+            SUBSTRING_ERROR,
+            "negative substring length not allowed",
+        ));
     }
     // `sp + sl` can overflow i32; PG guards it with an explicit range error.
     let sp_pl_sl = sp
@@ -377,6 +389,7 @@ pub fn to_u64(len: u32, data: &[u8]) -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -385,23 +398,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_and_format_roundtrip() {
-        let (l, d) = from_binary("11011000000").unwrap();
+    fn parse_and_format_roundtrip() -> anyhow::Result<()> {
+        let (l, d) = from_binary("11011000000")?;
         assert_eq!(l, 11);
         assert_eq!(s(l, &d), "11011000000");
-        let (l, d) = from_binary("").unwrap();
+        let (l, d) = from_binary("")?;
         assert_eq!(s(l, &d), "");
-        let (l, d) = from_hex("0F").unwrap();
+        let (l, d) = from_hex("0F")?;
         assert_eq!(s(l, &d), "00001111");
-        let (l, d) = from_hex("2468").unwrap();
+        let (l, d) = from_hex("2468")?;
         assert_eq!(s(l, &d), "0010010001101000");
+
+        Ok(())
     }
 
     #[test]
     fn parse_rejects_bad_digits() {
-        assert_eq!(from_binary(" 0").unwrap_err().message, "\" \" is not a valid binary digit");
-        assert_eq!(from_hex("Z").unwrap_err().message, "\"Z\" is not a valid hexadecimal digit");
-        assert_eq!(input("01010Z01").unwrap_err().message, "\"Z\" is not a valid binary digit");
+        assert_eq!(
+            from_binary(" 0").unwrap_err().message,
+            "\" \" is not a valid binary digit"
+        );
+        assert_eq!(
+            from_hex("Z").unwrap_err().message,
+            "\"Z\" is not a valid hexadecimal digit"
+        );
+        assert_eq!(
+            input("01010Z01").unwrap_err().message,
+            "\"Z\" is not a valid binary digit"
+        );
         assert_eq!(
             input("x01010Z01").unwrap_err().message,
             "\"Z\" is not a valid hexadecimal digit"
@@ -409,96 +433,168 @@ mod tests {
     }
 
     #[test]
-    fn coerce_fixed_and_varying() {
-        let (l, d) = from_binary("10").unwrap();
+    fn coerce_fixed_and_varying() -> anyhow::Result<()> {
+        let (l, d) = from_binary("10")?;
         // fixed, assignment, wrong length
         assert_eq!(
             coerce(l, &d, 11, false, false).unwrap_err().message,
             "bit string length 2 does not match type bit(11)"
         );
         // varying, assignment, too long
-        let (l2, d2) = from_binary("101011111010").unwrap();
+        let (l2, d2) = from_binary("101011111010")?;
         assert_eq!(
             coerce(l2, &d2, 11, true, false).unwrap_err().message,
             "bit string too long for type bit varying(11)"
         );
         // explicit fixed truncation
-        let (l3, d3) = coerce(l2, &d2, 8, false, true).unwrap();
+        let (l3, d3) = coerce(l2, &d2, 8, false, true)?;
         assert_eq!(s(l3, &d3), "10101111");
+
+        Ok(())
     }
 
     #[test]
-    fn ops_match_pg() {
-        let (la, da) = from_hex("0F").unwrap(); // 00001111
-        let (lb, db) = from_hex("10").unwrap(); // 00010000
-        assert_eq!({ let (l, d) = not(la, &da); s(l, &d) }, "11110000");
-        assert_eq!({ let (l, d) = and(la, &da, lb, &db).unwrap(); s(l, &d) }, "00000000");
-        assert_eq!({ let (l, d) = or(la, &da, lb, &db).unwrap(); s(l, &d) }, "00011111");
-        assert_eq!({ let (l, d) = xor(la, &da, lb, &db).unwrap(); s(l, &d) }, "00011111");
-        assert_eq!({ let (l, d) = shift_left(la, &da, 4); s(l, &d) }, "11110000");
-        assert_eq!({ let (l, d) = shift_right(lb, &db, 2); s(l, &d) }, "00000100");
+    fn ops_match_pg() -> anyhow::Result<()> {
+        let (la, da) = from_hex("0F")?; // 00001111
+        let (lb, db) = from_hex("10")?; // 00010000
         assert_eq!(
-            and(la, &da, 3, &from_binary("101").unwrap().1).unwrap_err().message,
+            {
+                let (l, d) = not(la, &da);
+                s(l, &d)
+            },
+            "11110000"
+        );
+        assert_eq!(
+            {
+                let (l, d) = and(la, &da, lb, &db)?;
+                s(l, &d)
+            },
+            "00000000"
+        );
+        assert_eq!(
+            {
+                let (l, d) = or(la, &da, lb, &db)?;
+                s(l, &d)
+            },
+            "00011111"
+        );
+        assert_eq!(
+            {
+                let (l, d) = xor(la, &da, lb, &db)?;
+                s(l, &d)
+            },
+            "00011111"
+        );
+        assert_eq!(
+            {
+                let (l, d) = shift_left(la, &da, 4);
+                s(l, &d)
+            },
+            "11110000"
+        );
+        assert_eq!(
+            {
+                let (l, d) = shift_right(lb, &db, 2);
+                s(l, &d)
+            },
+            "00000100"
+        );
+        assert_eq!(
+            and(la, &da, 3, &from_binary("101")?.1).unwrap_err().message,
             "cannot AND bit strings of different sizes"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn substring_and_overflow() {
-        let (l, d) = from_binary("01010101").unwrap();
-        assert_eq!({ let (l, d) = substring(l, &d, 2, Some(2147483646)).unwrap(); s(l, &d) }, "1010101");
-        assert_eq!({ let (l, d) = substring(l, &d, -10, Some(2147483646)).unwrap(); s(l, &d) }, "01010101");
+    fn substring_and_overflow() -> anyhow::Result<()> {
+        let (l, d) = from_binary("01010101")?;
         assert_eq!(
-            substring(l, &d, -10, Some(-2147483646)).unwrap_err().message,
+            {
+                let (l, d) = substring(l, &d, 2, Some(2147483646))?;
+                s(l, &d)
+            },
+            "1010101"
+        );
+        assert_eq!(
+            {
+                let (l, d) = substring(l, &d, -10, Some(2147483646))?;
+                s(l, &d)
+            },
+            "01010101"
+        );
+        assert_eq!(
+            substring(l, &d, -10, Some(-2147483646))
+                .unwrap_err()
+                .message,
             "negative substring length not allowed"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn position_boundaries() {
-        let p = |sub: &str, str_: &str| {
-            let (sl, sd) = from_binary(sub).unwrap();
-            let (tl, td) = from_binary(str_).unwrap();
-            position(tl, &td, sl, &sd)
+    fn position_boundaries() -> anyhow::Result<()> {
+        let p = |sub: &str, str_: &str| -> Result<i32, BitError> {
+            let (sl, sd) = from_binary(sub)?;
+            let (tl, td) = from_binary(str_)?;
+            Ok(position(tl, &td, sl, &sd))
         };
-        assert_eq!(p("1010", "0000101"), 0);
-        assert_eq!(p("1010", "00001010"), 5);
-        assert_eq!(p("", "00001010"), 1);
-        assert_eq!(p("0", ""), 0);
-        assert_eq!(p("", ""), 0);
+        assert_eq!(p("1010", "0000101")?, 0);
+        assert_eq!(p("1010", "00001010")?, 5);
+        assert_eq!(p("", "00001010")?, 1);
+        assert_eq!(p("0", "")?, 0);
+        assert_eq!(p("", "")?, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn get_set_bit() {
-        let (l, d) = from_binary("0101011000100").unwrap();
-        assert_eq!(get_bit(l, &d, 10).unwrap(), 1);
-        let (l, d) = from_binary("0101011000100100").unwrap();
-        let (l2, d2) = set_bit(l, &d, 15, 1).unwrap();
+    fn get_set_bit() -> anyhow::Result<()> {
+        let (l, d) = from_binary("0101011000100")?;
+        assert_eq!(get_bit(l, &d, 10)?, 1);
+        let (l, d) = from_binary("0101011000100100")?;
+        let (l2, d2) = set_bit(l, &d, 15, 1)?;
         assert_eq!(s(l2, &d2), "0101011000100101");
         assert_eq!(
             set_bit(l, &d, 16, 1).unwrap_err().message,
             "bit index 16 out of valid range (0..15)"
         );
         // A newvalue other than 0 or 1 is rejected (PG's bitsetbit).
-        assert_eq!(set_bit(l, &d, 3, 5).unwrap_err().message, "new bit must be 0 or 1");
+        assert_eq!(
+            set_bit(l, &d, 3, 5).unwrap_err().message,
+            "new bit must be 0 or 1"
+        );
         assert_eq!(set_bit(l, &d, 3, 5).unwrap_err().sqlstate, "22023");
+
+        Ok(())
     }
 
     #[test]
-    fn overlay_and_count() {
-        let (l, d) = from_binary("0101011100").unwrap();
-        let (rl, rd) = from_binary("001").unwrap();
-        let (ol, od) = overlay(l, &d, rl, &rd, 2, Some(3)).unwrap();
+    fn overlay_and_count() -> anyhow::Result<()> {
+        let (l, d) = from_binary("0101011100")?;
+        let (rl, rd) = from_binary("001")?;
+        let (ol, od) = overlay(l, &d, rl, &rd, 2, Some(3))?;
         assert_eq!(s(ol, &od), "0001011100");
-        let (ol, od) = overlay(l, &d, from_binary("101").unwrap().0, &from_binary("101").unwrap().1, 6, None).unwrap();
+        let (ol, od) = overlay(
+            l,
+            &d,
+            from_binary("101")?.0,
+            &from_binary("101")?.1,
+            6,
+            None,
+        )?;
         assert_eq!(s(ol, &od), "0101010100");
         assert_eq!(bit_count(l, &d), 5);
+
+        Ok(())
     }
 
     #[test]
-    fn overlay_overflow_and_bad_start() {
-        let (l, d) = from_binary("10101").unwrap();
-        let (rl, rd) = from_binary("1").unwrap();
+    fn overlay_overflow_and_bad_start() -> anyhow::Result<()> {
+        let (l, d) = from_binary("10101")?;
+        let (rl, rd) = from_binary("1")?;
         // `sp + sl` must not overflow i32 (would panic in debug); PG raises 22003.
         let e = overlay(l, &d, rl, &rd, 2, Some(i32::MAX)).unwrap_err();
         assert_eq!(e.sqlstate, "22003");
@@ -509,5 +605,7 @@ mod tests {
             "negative substring length not allowed"
         );
         overlay(l, &d, rl, &rd, i32::MIN, None).unwrap_err();
+
+        Ok(())
     }
 }

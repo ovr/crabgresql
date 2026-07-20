@@ -275,15 +275,13 @@ pub struct Table {
 
 impl fmt::Display for Table {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let Some(table_name) = &self.table_name else {
+            return Err(fmt::Error);
+        };
         if let Some(ref schema_name) = self.schema_name {
-            write!(
-                f,
-                "TABLE {}.{}",
-                schema_name,
-                self.table_name.as_ref().unwrap(),
-            )?;
+            write!(f, "TABLE {schema_name}.{table_name}")?;
         } else {
-            write!(f, "TABLE {}", self.table_name.as_ref().unwrap(),)?;
+            write!(f, "TABLE {table_name}")?;
         }
         Ok(())
     }
@@ -1748,8 +1746,6 @@ impl fmt::Display for TableSample {
     }
 }
 
-
-
 /// An item in the `MEASURES` subclause of a `MATCH_RECOGNIZE` operation.
 ///
 /// See <https://docs.snowflake.com/en/sql-reference/constructs/match_recognize#measures-specifying-additional-output-columns>.
@@ -2756,9 +2752,6 @@ impl fmt::Display for OffsetRows {
     }
 }
 
-
-
-
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -2882,9 +2875,6 @@ impl fmt::Display for Distinct {
         }
     }
 }
-
-
-
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -3068,12 +3058,6 @@ impl fmt::Display for InputFormatClause {
     }
 }
 
-
-
-
-
-
-
 /// A single column definition in MySQL's `JSON_TABLE` table valued function.
 ///
 /// See
@@ -3250,8 +3234,6 @@ impl fmt::Display for OpenJsonTableColumn {
         Ok(())
     }
 }
-
-
 
 /// The `FROM` clause of an `UPDATE TABLE` statement
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]

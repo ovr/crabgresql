@@ -133,7 +133,7 @@ impl Clog {
         }
         self.status
             .lock()
-            .unwrap()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
             .get(&xid)
             .copied()
             .unwrap_or(XactStatus::InProgress)
@@ -144,11 +144,17 @@ impl Clog {
     }
 
     pub fn set_committed(&self, xid: Xid) {
-        self.status.lock().unwrap().insert(xid, XactStatus::Committed);
+        self.status
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .insert(xid, XactStatus::Committed);
     }
 
     pub fn set_aborted(&self, xid: Xid) {
-        self.status.lock().unwrap().insert(xid, XactStatus::Aborted);
+        self.status
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .insert(xid, XactStatus::Aborted);
     }
 }
 
@@ -182,7 +188,10 @@ impl XidManager {
     /// already advanced past an XID that is not yet published in `active` and
     /// wrongly treat that still-running transaction as finished.
     pub fn allocate(&self) -> Xid {
-        let mut active = self.active.lock().unwrap();
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         let xid = Xid(self.next.fetch_add(1, Ordering::SeqCst));
         active.insert(xid);
         xid
@@ -191,7 +200,10 @@ impl XidManager {
     /// Mark an XID no longer running (after its CLOG status is set). Snapshots
     /// taken afterwards no longer list it as in-flight.
     pub fn complete(&self, xid: Xid) {
-        self.active.lock().unwrap().remove(&xid);
+        self.active
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .remove(&xid);
     }
 
     /// Build an allocator whose next XID is `next`, used after crash recovery so
@@ -209,7 +221,10 @@ impl XidManager {
     /// Capture the set of transactions in flight right now. Everything `>= xmax`
     /// had not started; everything `< xmin` had already finished.
     pub fn take_snapshot(&self) -> Snapshot {
-        let active = self.active.lock().unwrap();
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         let xmax = Xid(self.next.load(Ordering::SeqCst));
         let xmin = active.iter().next().copied().unwrap_or(xmax);
         Snapshot {
@@ -478,7 +493,11 @@ mod tests {
         let inserter = Xid(3);
         clog.set_committed(inserter);
         // Snapshot taken now: inserter already complete.
-        let snap = Snapshot { xmin: Xid(4), xmax: Xid(4), xip: vec![] };
+        let snap = Snapshot {
+            xmin: Xid(4),
+            xmax: Xid(4),
+            xip: vec![],
+        };
 
         let live = TupleHeader::inserted(inserter, CommandId(0));
         assert!(visible(&live, &snap, &clog, Xid::INVALID, 0));
@@ -486,7 +505,11 @@ mod tests {
         // Delete it with a committed transaction that is also complete.
         let deleter = Xid(4);
         clog.set_committed(deleter);
-        let snap2 = Snapshot { xmin: Xid(5), xmax: Xid(5), xip: vec![] };
+        let snap2 = Snapshot {
+            xmin: Xid(5),
+            xmax: Xid(5),
+            xip: vec![],
+        };
         let mut dead = live;
         dead.xmax = deleter;
         assert!(!visible(&dead, &snap2, &clog, Xid::INVALID, 0));
@@ -496,7 +519,11 @@ mod tests {
     fn in_progress_insert_is_invisible_to_others() {
         let clog = Clog::new();
         let other = Xid(3); // never committed -> InProgress
-        let snap = Snapshot { xmin: Xid(3), xmax: Xid(4), xip: vec![Xid(3)] };
+        let snap = Snapshot {
+            xmin: Xid(3),
+            xmax: Xid(4),
+            xip: vec![Xid(3)],
+        };
         let hdr = TupleHeader::inserted(other, CommandId(0));
         assert!(!visible(&hdr, &snap, &clog, Xid(7), 0));
     }
@@ -506,7 +533,11 @@ mod tests {
         let clog = Clog::new();
         let other = Xid(3);
         clog.set_aborted(other);
-        let snap = Snapshot { xmin: Xid(4), xmax: Xid(4), xip: vec![] };
+        let snap = Snapshot {
+            xmin: Xid(4),
+            xmax: Xid(4),
+            xip: vec![],
+        };
         let hdr = TupleHeader::inserted(other, CommandId(0));
         assert!(!visible(&hdr, &snap, &clog, Xid::INVALID, 0));
     }
@@ -515,7 +546,11 @@ mod tests {
     fn own_insert_visible_only_from_a_later_command() {
         let clog = Clog::new();
         let me = Xid(3);
-        let snap = Snapshot { xmin: Xid(3), xmax: Xid(4), xip: vec![Xid(3)] };
+        let snap = Snapshot {
+            xmin: Xid(3),
+            xmax: Xid(4),
+            xip: vec![Xid(3)],
+        };
         // Inserted by command 0.
         let hdr = TupleHeader::inserted(me, CommandId(0));
         // The inserting command itself does not see the row...
@@ -528,7 +563,11 @@ mod tests {
     fn own_delete_hides_row_only_from_later_commands() {
         let clog = Clog::new();
         let me = Xid(3);
-        let snap = Snapshot { xmin: Xid(3), xmax: Xid(4), xip: vec![Xid(3)] };
+        let snap = Snapshot {
+            xmin: Xid(3),
+            xmax: Xid(4),
+            xip: vec![Xid(3)],
+        };
         // Inserted by command 0, deleted by command 1, same transaction.
         let mut hdr = TupleHeader::inserted(me, CommandId(0));
         hdr.xmax = me;
@@ -546,7 +585,11 @@ mod tests {
         let inserter = Xid(3);
         clog.set_committed(inserter);
         let deleter = Xid(4); // in progress
-        let snap = Snapshot { xmin: Xid(4), xmax: Xid(5), xip: vec![Xid(4)] };
+        let snap = Snapshot {
+            xmin: Xid(4),
+            xmax: Xid(5),
+            xip: vec![Xid(4)],
+        };
         let mut hdr = TupleHeader::inserted(inserter, CommandId(0));
         hdr.xmax = deleter;
         // Deleter not committed -> row still visible.
@@ -558,7 +601,11 @@ mod tests {
         let clog = Clog::new();
         let inserter = Xid(5);
         // Snapshot taken while inserter still in flight.
-        let snap = Snapshot { xmin: Xid(5), xmax: Xid(6), xip: vec![Xid(5)] };
+        let snap = Snapshot {
+            xmin: Xid(5),
+            xmax: Xid(6),
+            xip: vec![Xid(5)],
+        };
         let hdr = TupleHeader::inserted(inserter, CommandId(0));
         // Even though it commits now, the snapshot still hides it.
         clog.set_committed(inserter);
@@ -566,17 +613,31 @@ mod tests {
     }
 
     #[test]
-    fn transaction_manager_commit_makes_writes_visible() {
+    fn transaction_manager_commit_makes_writes_visible() -> anyhow::Result<()> {
         let tm = TransactionManager::new();
         let xid = tm.allocate_xid();
         let hdr = TupleHeader::inserted(xid, CommandId(0));
         // Before commit, another reader's fresh snapshot cannot see it.
         let before = tm.context(Xid::INVALID, CommandId::FIRST);
-        assert!(!satisfies_mvcc(&hdr, &before.snapshot, &before.clog, before.xid, before.cid));
+        assert!(!satisfies_mvcc(
+            &hdr,
+            &before.snapshot,
+            &before.clog,
+            before.xid,
+            before.cid
+        ));
         // After commit, a newly taken snapshot can.
-        tm.commit(xid).unwrap();
+        tm.commit(xid)?;
         let after = tm.context(Xid::INVALID, CommandId::FIRST);
-        assert!(satisfies_mvcc(&hdr, &after.snapshot, &after.clog, after.xid, after.cid));
+        assert!(satisfies_mvcc(
+            &hdr,
+            &after.snapshot,
+            &after.clog,
+            after.xid,
+            after.cid
+        ));
+
+        Ok(())
     }
 
     struct FailingSink;
@@ -596,7 +657,10 @@ mod tests {
         let xid = tm.allocate_xid();
         assert!(tm.commit(xid).is_err());
         assert_eq!(tm.clog().status(xid), XactStatus::Aborted);
-        assert!(!tm.snapshot().in_progress(xid), "XID must be retired from the in-flight set");
+        assert!(
+            !tm.snapshot().in_progress(xid),
+            "XID must be retired from the in-flight set"
+        );
     }
 
     #[test]
@@ -606,6 +670,12 @@ mod tests {
         let hdr = TupleHeader::inserted(xid, CommandId(0));
         tm.abort(xid);
         let after = tm.context(Xid::INVALID, CommandId::FIRST);
-        assert!(!satisfies_mvcc(&hdr, &after.snapshot, &after.clog, after.xid, after.cid));
+        assert!(!satisfies_mvcc(
+            &hdr,
+            &after.snapshot,
+            &after.clog,
+            after.xid,
+            after.cid
+        ));
     }
 }

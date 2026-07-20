@@ -380,7 +380,9 @@ impl BoundExpr {
     pub fn contains_aggregate(&self) -> bool {
         match self {
             BoundExpr::Aggregate { .. } => true,
-            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => false,
+            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => {
+                false
+            }
             BoundExpr::Unary { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_aggregate() || right.contains_aggregate()
@@ -737,9 +739,10 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         }
         ast::Expr::Extract { field, expr, .. } => bind_extract(field, expr, scope),
         ast::Expr::Interval(iv) => bind_interval(iv),
-        ast::Expr::AtTimeZone { timestamp, time_zone } => {
-            bind_at_time_zone(timestamp, time_zone, scope)
-        }
+        ast::Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => bind_at_time_zone(timestamp, time_zone, scope),
         ast::Expr::Case {
             operand,
             conditions,
@@ -752,31 +755,88 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
             scope,
         ),
         // String special-syntax expressions desugar to the equivalent function.
-        ast::Expr::Substring { expr, substring_from, substring_for, .. } => {
-            bind_substring(expr, substring_from.as_deref(), substring_for.as_deref(), scope)
-        }
-        ast::Expr::Trim { expr, trim_where, trim_what, trim_characters } => {
-            bind_trim(expr, *trim_where, trim_what.as_deref(), trim_characters.as_deref(), scope)
-        }
+        ast::Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => bind_substring(
+            expr,
+            substring_from.as_deref(),
+            substring_for.as_deref(),
+            scope,
+        ),
+        ast::Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => bind_trim(
+            expr,
+            *trim_where,
+            trim_what.as_deref(),
+            trim_characters.as_deref(),
+            scope,
+        ),
         ast::Expr::Position { expr, r#in } => {
             // POSITION(sub IN str) == strpos(str, sub).
             let sub = bind_expr(expr, scope)?;
             let str_ = bind_expr(r#in, scope)?;
             crate::functions::resolve_call("strpos", vec![str_, sub])
         }
-        ast::Expr::Overlay { expr, overlay_what, overlay_from, overlay_for } => {
-            bind_overlay(expr, overlay_what, overlay_from, overlay_for.as_deref(), scope)
-        }
-        ast::Expr::Like { negated, any, expr, pattern, escape_char } => {
-            bind_like_node(expr, pattern, escape_char.as_ref(), *any, false, *negated, scope)
-        }
-        ast::Expr::ILike { negated, any, expr, pattern, escape_char } => {
-            bind_like_node(expr, pattern, escape_char.as_ref(), *any, true, *negated, scope)
-        }
-        ast::Expr::SimilarTo { negated, expr, pattern, escape_char } => {
-            bind_similar_to(expr, pattern, escape_char.as_ref(), *negated, scope)
-        }
-        ast::Expr::InList { expr, list, negated } => bind_in_list(expr, list, *negated, scope),
+        ast::Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => bind_overlay(
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for.as_deref(),
+            scope,
+        ),
+        ast::Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => bind_like_node(
+            expr,
+            pattern,
+            escape_char.as_ref(),
+            *any,
+            false,
+            *negated,
+            scope,
+        ),
+        ast::Expr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => bind_like_node(
+            expr,
+            pattern,
+            escape_char.as_ref(),
+            *any,
+            true,
+            *negated,
+            scope,
+        ),
+        ast::Expr::SimilarTo {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => bind_similar_to(expr, pattern, escape_char.as_ref(), *negated, scope),
+        ast::Expr::InList {
+            expr,
+            list,
+            negated,
+        } => bind_in_list(expr, list, *negated, scope),
         other => Err(unsupported_expr(other)),
     }
 }
@@ -792,7 +852,10 @@ fn bind_substring(
     let subject = bind_expr(expr, scope)?;
     let start = match from {
         Some(e) => bind_expr(e, scope)?,
-        None => Binding::Typed(BoundExpr::Const { value: Value::Int4(1), ty: PgType::Int4 }),
+        None => Binding::Typed(BoundExpr::Const {
+            value: Value::Int4(1),
+            ty: PgType::Int4,
+        }),
     };
     let mut args = vec![subject, start];
     if let Some(e) = for_ {
@@ -838,8 +901,11 @@ fn bind_overlay(
     for_: Option<&ast::Expr>,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
-    let mut args =
-        vec![bind_expr(expr, scope)?, bind_expr(what, scope)?, bind_expr(from, scope)?];
+    let mut args = vec![
+        bind_expr(expr, scope)?,
+        bind_expr(what, scope)?,
+        bind_expr(from, scope)?,
+    ];
     if let Some(e) = for_ {
         args.push(bind_expr(e, scope)?);
     }
@@ -857,20 +923,22 @@ fn bind_like_node(
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     if any {
-        return Err(BindError::feature_not_supported("LIKE ANY is not supported yet"));
+        return Err(BindError::feature_not_supported(
+            "LIKE ANY is not supported yet",
+        ));
     }
     let lb = bind_expr(expr, scope)?;
     let rb = bind_expr(pattern, scope)?;
     let escape = match escape_char {
         Some(v) => match &v.value {
-            ast::Value::SingleQuotedString(s) => {
-                Some(Binding::Typed(BoundExpr::Const {
-                    value: Value::Text(s.clone()),
-                    ty: PgType::Text,
-                }))
-            }
+            ast::Value::SingleQuotedString(s) => Some(Binding::Typed(BoundExpr::Const {
+                value: Value::Text(s.clone()),
+                ty: PgType::Text,
+            })),
             other => {
-                return Err(BindError::syntax(format!("invalid ESCAPE literal: {other}")));
+                return Err(BindError::syntax(format!(
+                    "invalid ESCAPE literal: {other}"
+                )));
             }
         },
         None => None,
@@ -886,7 +954,10 @@ pub fn bind_scalar(expr: &ast::Expr, scope: &Scope) -> Result<BoundExpr, BindErr
         // A bare untyped literal defaults to text; but a bind parameter with no
         // surrounding context has no type to take, so PG errors 42P18 rather
         // than silently choosing text.
-        Binding::Unknown { param: Some((index, _)), .. } => {
+        Binding::Unknown {
+            param: Some((index, _)),
+            ..
+        } => {
             return Err(BindError::new(
                 "42P18",
                 format!("could not determine data type of parameter ${}", index + 1),
@@ -973,10 +1044,9 @@ fn bind_value(value: &ast::ValueWithSpan, scope: &Scope) -> Result<Binding, Bind
         // `B'...'` is a `bit(n)` literal (n binary digits); `X'...'` a `bit(4n)`
         // literal (4 bits per hex digit). PG's `bit_in` rejects a bad digit with
         // a data exception (22P02) naming the offender, at the literal's cursor.
-        ast::Value::SingleQuotedByteStringLiteral(s) => bind_bit_literal(
-            crabgresql_types::bit::from_binary(s),
-            value.span,
-        ),
+        ast::Value::SingleQuotedByteStringLiteral(s) => {
+            bind_bit_literal(crabgresql_types::bit::from_binary(s), value.span)
+        }
         ast::Value::HexStringLiteral(s) => {
             bind_bit_literal(crabgresql_types::bit::from_hex(s), value.span)
         }
@@ -1118,7 +1188,13 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         // `bpchar` (no length = unlimited, like text) and `name` arrive as
         // custom type names.
         DataType::Custom(obj, mods) if mods.is_empty() => {
-            match obj.0.last().and_then(|p| p.as_ident()).map(normalize_ident).as_deref() {
+            match obj
+                .0
+                .last()
+                .and_then(|p| p.as_ident())
+                .map(normalize_ident)
+                .as_deref()
+            {
                 Some("bpchar") => PgType::Bpchar,
                 Some("varchar") => PgType::Varchar,
                 Some("name") => PgType::Name,
@@ -1162,10 +1238,12 @@ fn bind_cast(
         Ok(t) => t,
         // Not a builtin type name — it may be a `CREATE TYPE` name; resolve it
         // against the catalog, else surface the original "not supported" error.
-        Err(e) => match custom_type_name(data_type).and_then(|n| scope.catalog().resolve_type(&n)) {
-            Some(ut) => PgType::User(ut.oid),
-            None => return Err(e),
-        },
+        Err(e) => {
+            match custom_type_name(data_type).and_then(|n| scope.catalog().resolve_type(&n)) {
+                Some(ut) => PgType::User(ut.oid),
+                None => return Err(e),
+            }
+        }
     };
     let expr = match bind_expr(inner, scope)? {
         Binding::Unknown { lit, span, param } => {
@@ -1174,7 +1252,9 @@ fn bind_cast(
         Binding::Typed(e) => coerce_cast(e, target, scope)?,
     };
     let expr = apply_numeric_typmod_if_any(expr, target, data_type)?;
-    Ok(Binding::Typed(apply_length_typmod_if_any(expr, target, data_type)?))
+    Ok(Binding::Typed(apply_length_typmod_if_any(
+        expr, target, data_type,
+    )?))
 }
 
 /// The (normalized) name of a bare `DataType::Custom` type reference — e.g. the
@@ -1251,7 +1331,9 @@ fn coerce_user_cast(
             rep: scope.catalog().backing_rep(target),
         }),
         // WITH FUNCTION / WITH INOUT are rejected at `CREATE CAST`; guard anyway.
-        Some(UserCast { without_function: false }) => Err(BindError::feature_not_supported(
+        Some(UserCast {
+            without_function: false,
+        }) => Err(BindError::feature_not_supported(
             "cast with a conversion function is not supported yet",
         )),
         None => Err(BindError::new(
@@ -1270,14 +1352,16 @@ fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
     let (lit, span) = match &ts.value.value {
         ast::Value::SingleQuotedString(s) => (Some(s.clone()), ts.value.span),
         other => {
-            return Err(BindError::syntax(format!(
-                "invalid typed literal: {other}"
-            )));
+            return Err(BindError::syntax(format!("invalid typed literal: {other}")));
         }
     };
     let expr = resolve_unknown(lit, span, None, target)?;
     let expr = apply_numeric_typmod_if_any(expr, target, &ts.data_type)?;
-    Ok(Binding::Typed(apply_length_typmod_if_any(expr, target, &ts.data_type)?))
+    Ok(Binding::Typed(apply_length_typmod_if_any(
+        expr,
+        target,
+        &ts.data_type,
+    )?))
 }
 
 /// The `(precision, scale)` of a `numeric(p[,s])` / `decimal(...)` type name,
@@ -1309,19 +1393,32 @@ fn apply_numeric_typmod_if_any(
     let Some((precision, scale)) = numeric_typmod(data_type) else {
         return Ok(expr);
     };
-    if let BoundExpr::Const { value: Value::Numeric(n), .. } = &expr {
+    if let BoundExpr::Const {
+        value: Value::Numeric(n),
+        ..
+    } = &expr
+    {
         let applied = n
             .apply_typmod(precision, scale)
             .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail))?;
-        return Ok(BoundExpr::Const { value: Value::Numeric(applied), ty: PgType::Numeric });
+        return Ok(BoundExpr::Const {
+            value: Value::Numeric(applied),
+            ty: PgType::Numeric,
+        });
     }
     Ok(BoundExpr::FuncCall {
         func: ScalarFn::NumApplyTypmod,
         ret: PgType::Numeric,
         args: vec![
             expr,
-            BoundExpr::Const { value: Value::Int4(precision), ty: PgType::Int4 },
-            BoundExpr::Const { value: Value::Int4(scale), ty: PgType::Int4 },
+            BoundExpr::Const {
+                value: Value::Int4(precision),
+                ty: PgType::Int4,
+            },
+            BoundExpr::Const {
+                value: Value::Int4(scale),
+                ty: PgType::Int4,
+            },
         ],
     })
 }
@@ -1375,27 +1472,61 @@ pub(crate) fn apply_length_typmod_if_any(
         _ => return Ok(expr),
     };
     // Fold a constant value now (explicit-cast semantics: truncate/pad).
-    if let BoundExpr::Const { value: Value::Text(s), .. } = &expr {
+    if let BoundExpr::Const {
+        value: Value::Text(s),
+        ..
+    } = &expr
+    {
         let folded = match func {
-            ScalarFn::VarcharTypmod => crabgresql_types::text::truncate_chars(s, typmod.unwrap()),
-            ScalarFn::BpcharTypmod => crabgresql_types::text::bpchar_input(s, typmod.unwrap(), true)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))?,
+            ScalarFn::VarcharTypmod => {
+                let Some(typmod) = typmod else {
+                    return Err(BindError::new("XX000", "varchar typmod is missing"));
+                };
+                crabgresql_types::text::truncate_chars(s, typmod)
+            }
+            ScalarFn::BpcharTypmod => {
+                let Some(typmod) = typmod else {
+                    return Err(BindError::new("XX000", "bpchar typmod is missing"));
+                };
+                crabgresql_types::text::bpchar_input(s, typmod, true)
+                    .map_err(|e| BindError::new(e.sqlstate, e.message))?
+            }
             ScalarFn::NameInput => crabgresql_types::text::name_input(s),
             _ => unreachable!(),
         };
-        return Ok(BoundExpr::Const { value: Value::Text(folded), ty: target });
+        return Ok(BoundExpr::Const {
+            value: Value::Text(folded),
+            ty: target,
+        });
     }
-    if let BoundExpr::Const { value: Value::Bit { len, data }, .. } = &expr {
+    if let BoundExpr::Const {
+        value: Value::Bit { len, data },
+        ..
+    } = &expr
+    {
+        let Some(typmod) = typmod else {
+            return Err(BindError::new("XX000", "bit typmod is missing"));
+        };
         let (len, data) =
-            crabgresql_types::bit::coerce(*len, data, typmod.unwrap(), target == PgType::Varbit, true)
+            crabgresql_types::bit::coerce(*len, data, typmod, target == PgType::Varbit, true)
                 .map_err(|e| BindError::new(e.sqlstate, e.message))?;
-        return Ok(BoundExpr::Const { value: Value::Bit { len, data }, ty: target });
+        return Ok(BoundExpr::Const {
+            value: Value::Bit { len, data },
+            ty: target,
+        });
     }
     let mut args = vec![expr];
     if let Some(n) = typmod {
-        args.push(BoundExpr::Const { value: Value::Int4(n), ty: PgType::Int4 });
+        args.push(BoundExpr::Const {
+            value: Value::Int4(n),
+            ty: PgType::Int4,
+        });
     }
-    Ok(BoundExpr::FuncCall { func, ret: target, args })
+    Ok(BoundExpr::FuncCall {
+        func,
+        ret: target,
+        args,
+    })
 }
 
 /// `interval '...'` (with an optional SQL-standard field qualifier). The
@@ -1406,7 +1537,9 @@ fn bind_interval(node: &ast::Interval) -> Result<Binding, BindError> {
         ast::Expr::Value(v) => match &v.value {
             ast::Value::SingleQuotedString(s) => (s.clone(), v.span),
             other => {
-                return Err(BindError::syntax(format!("invalid interval literal: {other}")));
+                return Err(BindError::syntax(format!(
+                    "invalid interval literal: {other}"
+                )));
             }
         },
         other => return Err(unsupported_expr(other)),
@@ -1468,9 +1601,10 @@ fn bind_extract(
                 ),
             ));
         }
-        Binding::Unknown { lit, span, param } => {
-            (ScalarFn::Extract, resolve_unknown(lit, span, param, PgType::Timestamp)?)
-        }
+        Binding::Unknown { lit, span, param } => (
+            ScalarFn::Extract,
+            resolve_unknown(lit, span, param, PgType::Timestamp)?,
+        ),
     };
     Ok(Binding::Typed(BoundExpr::FuncCall {
         func,
@@ -1664,9 +1798,7 @@ fn bind_unary(
                 }
                 // `- money` (`cash_um`); PG has no unary `+ money`, so that falls
                 // through to the error arm below.
-                Binding::Typed(e)
-                    if e.ty() == PgType::Money && op == ast::UnaryOperator::Minus =>
-                {
+                Binding::Typed(e) if e.ty() == PgType::Money && op == ast::UnaryOperator::Minus => {
                     Ok(Binding::Typed(BoundExpr::FuncCall {
                         func: ScalarFn::CashUm,
                         ret: PgType::Money,
@@ -2187,7 +2319,10 @@ pub(crate) fn bind_binary_op(
                 | PgType::Numeric
         );
         let mod_ok = op != BinOp::Mod
-            || matches!(arg_ty, PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Numeric);
+            || matches!(
+                arg_ty,
+                PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Numeric
+            );
         numeric_arith && mod_ok
     } else {
         is_orderable(arg_ty, catalog)
@@ -2220,11 +2355,7 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
         matches!(
             t,
             Some(
-                PgType::Interval
-                    | PgType::Timestamp
-                    | PgType::Date
-                    | PgType::Time
-                    | PgType::TimeTz
+                PgType::Interval | PgType::Timestamp | PgType::Date | PgType::Time | PgType::TimeTz
             )
         )
     };
@@ -2257,26 +2388,48 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             (Some(I), Some(T)) => call(ScalarFn::TimestampPlInterval, T, typed(rb), typed(lb)),
             (Some(I), None) => call(ScalarFn::IntervalPl, I, typed(lb), resolve_operand(rb, I)?),
             (None, Some(I)) => call(ScalarFn::IntervalPl, I, resolve_operand(lb, I)?, typed(rb)),
-            (Some(T), None) => call(ScalarFn::TimestampPlInterval, T, typed(lb), resolve_operand(rb, I)?),
-            (None, Some(T)) => call(ScalarFn::TimestampPlInterval, T, typed(rb), resolve_operand(lb, I)?),
+            (Some(T), None) => call(
+                ScalarFn::TimestampPlInterval,
+                T,
+                typed(lb),
+                resolve_operand(rb, I)?,
+            ),
+            (None, Some(T)) => call(
+                ScalarFn::TimestampPlInterval,
+                T,
+                typed(rb),
+                resolve_operand(lb, I)?,
+            ),
             // date + int -> date; date + interval -> timestamp; date + time -> timestamp.
-            (Some(D), _) if is_int(rt) => {
-                call(ScalarFn::DatePlDays, D, typed(lb), resolve_operand(rb, PgType::Int4)?)
-            }
-            (_, Some(D)) if is_int(lt) => {
-                call(ScalarFn::DatePlDays, D, typed(rb), resolve_operand(lb, PgType::Int4)?)
-            }
+            (Some(D), _) if is_int(rt) => call(
+                ScalarFn::DatePlDays,
+                D,
+                typed(lb),
+                resolve_operand(rb, PgType::Int4)?,
+            ),
+            (_, Some(D)) if is_int(lt) => call(
+                ScalarFn::DatePlDays,
+                D,
+                typed(rb),
+                resolve_operand(lb, PgType::Int4)?,
+            ),
             (Some(D), Some(I)) => call(ScalarFn::DatePlInterval, T, typed(lb), typed(rb)),
             (Some(I), Some(D)) => call(ScalarFn::DatePlInterval, T, typed(rb), typed(lb)),
             (Some(D), Some(TI)) => call(ScalarFn::DatePlTime, T, typed(lb), typed(rb)),
             (Some(TI), Some(D)) => call(ScalarFn::DatePlTime, T, typed(rb), typed(lb)),
             // date + timetz -> timestamptz.
-            (Some(D), Some(TZ)) => {
-                call(ScalarFn::DatePlTimeTz, PgType::TimestampTz, typed(lb), typed(rb))
-            }
-            (Some(TZ), Some(D)) => {
-                call(ScalarFn::DatePlTimeTz, PgType::TimestampTz, typed(rb), typed(lb))
-            }
+            (Some(D), Some(TZ)) => call(
+                ScalarFn::DatePlTimeTz,
+                PgType::TimestampTz,
+                typed(lb),
+                typed(rb),
+            ),
+            (Some(TZ), Some(D)) => call(
+                ScalarFn::DatePlTimeTz,
+                PgType::TimestampTz,
+                typed(rb),
+                typed(lb),
+            ),
             // time + interval -> time; timetz + interval -> timetz.
             (Some(TI), Some(I)) => call(ScalarFn::TimePlInterval, TI, typed(lb), typed(rb)),
             (Some(I), Some(TI)) => call(ScalarFn::TimePlInterval, TI, typed(rb), typed(lb)),
@@ -2298,9 +2451,12 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             (None, Some(T)) => call(ScalarFn::TimestampMi, I, resolve_operand(lb, T)?, typed(rb)),
             // date - date -> int4; date - int -> date; date - interval -> timestamp.
             (Some(D), Some(D)) => call(ScalarFn::DateMi, PgType::Int4, typed(lb), typed(rb)),
-            (Some(D), _) if is_int(rt) => {
-                call(ScalarFn::DateMiDays, D, typed(lb), resolve_operand(rb, PgType::Int4)?)
-            }
+            (Some(D), _) if is_int(rt) => call(
+                ScalarFn::DateMiDays,
+                D,
+                typed(lb),
+                resolve_operand(rb, PgType::Int4)?,
+            ),
             (Some(D), Some(I)) => call(ScalarFn::DateMiInterval, T, typed(lb), typed(rb)),
             // date - timestamp / timestamp - date -> interval: widen the date to
             // a timestamp (midnight) and take the timestamp difference, as PG's
@@ -2311,8 +2467,18 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             (Some(T), Some(D)) => {
                 call(ScalarFn::TimestampMi, I, typed(lb), resolve_operand(rb, T)?)
             }
-            (Some(D), None) => call(ScalarFn::DateMi, PgType::Int4, typed(lb), resolve_operand(rb, D)?),
-            (None, Some(D)) => call(ScalarFn::DateMi, PgType::Int4, resolve_operand(lb, D)?, typed(rb)),
+            (Some(D), None) => call(
+                ScalarFn::DateMi,
+                PgType::Int4,
+                typed(lb),
+                resolve_operand(rb, D)?,
+            ),
+            (None, Some(D)) => call(
+                ScalarFn::DateMi,
+                PgType::Int4,
+                resolve_operand(lb, D)?,
+                typed(rb),
+            ),
             // time - time -> interval; time - interval -> time; timetz - interval -> timetz.
             (Some(TI), Some(TI)) => call(ScalarFn::TimeMi, I, typed(lb), typed(rb)),
             (Some(TI), Some(I)) => call(ScalarFn::TimeMiInterval, TI, typed(lb), typed(rb)),
@@ -2320,18 +2486,27 @@ fn resolve_temporal(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             _ => Ok(None),
         },
         BinOp::Mul => match (lt, rt) {
-            (Some(I), _) if factor_ok(rt) => {
-                call(ScalarFn::IntervalMul, I, typed(lb), resolve_operand(rb, PgType::Float8)?)
-            }
-            (_, Some(I)) if factor_ok(lt) => {
-                call(ScalarFn::IntervalMul, I, typed(rb), resolve_operand(lb, PgType::Float8)?)
-            }
+            (Some(I), _) if factor_ok(rt) => call(
+                ScalarFn::IntervalMul,
+                I,
+                typed(lb),
+                resolve_operand(rb, PgType::Float8)?,
+            ),
+            (_, Some(I)) if factor_ok(lt) => call(
+                ScalarFn::IntervalMul,
+                I,
+                typed(rb),
+                resolve_operand(lb, PgType::Float8)?,
+            ),
             _ => Ok(None),
         },
         BinOp::Div => match (lt, rt) {
-            (Some(I), _) if factor_ok(rt) => {
-                call(ScalarFn::IntervalDiv, I, typed(lb), resolve_operand(rb, PgType::Float8)?)
-            }
+            (Some(I), _) if factor_ok(rt) => call(
+                ScalarFn::IntervalDiv,
+                I,
+                typed(lb),
+                resolve_operand(rb, PgType::Float8)?,
+            ),
             _ => Ok(None),
         },
         _ => Ok(None),
@@ -2368,13 +2543,21 @@ fn resolve_money_op(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
         Binding::Unknown { .. } => unreachable!("typed side is Typed"),
     };
     let call = |func, ret, a: BoundExpr, b: BoundExpr| {
-        Ok(Some(Binding::Typed(BoundExpr::FuncCall { func, ret, args: vec![a, b] })))
+        Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret,
+            args: vec![a, b],
+        })))
     };
     match op {
         // money ± money; an untyped literal opposite money is parsed as money.
         // money ± int/float has no operator in PG — fall through to the error.
         BinOp::Add | BinOp::Sub => {
-            let func = if op == BinOp::Add { ScalarFn::CashPl } else { ScalarFn::CashMi };
+            let func = if op == BinOp::Add {
+                ScalarFn::CashPl
+            } else {
+                ScalarFn::CashMi
+            };
             match (lt, rt) {
                 (Some(M), Some(M)) => call(func, M, typed(lb), typed(rb)),
                 (Some(M), None) => call(func, M, typed(lb), resolve_operand(rb, M)?),
@@ -2383,28 +2566,46 @@ fn resolve_money_op(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Bind
             }
         }
         BinOp::Mul => match (lt, rt) {
-            (Some(M), _) if is_int(rt) => {
-                call(ScalarFn::CashMulInt, M, typed(lb), resolve_operand(rb, PgType::Int8)?)
-            }
-            (_, Some(M)) if is_int(lt) => {
-                call(ScalarFn::CashMulInt, M, typed(rb), resolve_operand(lb, PgType::Int8)?)
-            }
-            (Some(M), _) if is_flt(rt) => {
-                call(ScalarFn::CashMulFlt, M, typed(lb), resolve_operand(rb, PgType::Float8)?)
-            }
-            (_, Some(M)) if is_flt(lt) => {
-                call(ScalarFn::CashMulFlt, M, typed(rb), resolve_operand(lb, PgType::Float8)?)
-            }
+            (Some(M), _) if is_int(rt) => call(
+                ScalarFn::CashMulInt,
+                M,
+                typed(lb),
+                resolve_operand(rb, PgType::Int8)?,
+            ),
+            (_, Some(M)) if is_int(lt) => call(
+                ScalarFn::CashMulInt,
+                M,
+                typed(rb),
+                resolve_operand(lb, PgType::Int8)?,
+            ),
+            (Some(M), _) if is_flt(rt) => call(
+                ScalarFn::CashMulFlt,
+                M,
+                typed(lb),
+                resolve_operand(rb, PgType::Float8)?,
+            ),
+            (_, Some(M)) if is_flt(lt) => call(
+                ScalarFn::CashMulFlt,
+                M,
+                typed(rb),
+                resolve_operand(lb, PgType::Float8)?,
+            ),
             _ => Ok(None),
         },
         BinOp::Div => match (lt, rt) {
             (Some(M), Some(M)) => call(ScalarFn::CashDivCash, PgType::Float8, typed(lb), typed(rb)),
-            (Some(M), _) if is_int(rt) => {
-                call(ScalarFn::CashDivInt, M, typed(lb), resolve_operand(rb, PgType::Int8)?)
-            }
-            (Some(M), _) if is_flt(rt) => {
-                call(ScalarFn::CashDivFlt, M, typed(lb), resolve_operand(rb, PgType::Float8)?)
-            }
+            (Some(M), _) if is_int(rt) => call(
+                ScalarFn::CashDivInt,
+                M,
+                typed(lb),
+                resolve_operand(rb, PgType::Int8)?,
+            ),
+            (Some(M), _) if is_flt(rt) => call(
+                ScalarFn::CashDivFlt,
+                M,
+                typed(lb),
+                resolve_operand(rb, PgType::Float8)?,
+            ),
             _ => Ok(None),
         },
         _ => Ok(None),
@@ -2426,7 +2627,11 @@ fn operand_name(b: &Binding) -> &'static str {
 fn net_no_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> BindError {
     BindError::new(
         sqlstate::UNDEFINED_FUNCTION,
-        format!("operator does not exist: {} {op} {}", operand_name(lb), operand_name(rb)),
+        format!(
+            "operator does not exist: {} {op} {}",
+            operand_name(lb),
+            operand_name(rb)
+        ),
     )
 }
 
@@ -2436,9 +2641,12 @@ fn net_no_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> Bind
 fn net_operand(b: &Binding) -> Option<Result<BoundExpr, BindError>> {
     match b {
         Binding::Typed(e) if is_net_ty(Some(e.ty())) => Some(Ok(e.clone())),
-        Binding::Unknown { lit, span, param } => {
-            Some(resolve_unknown(lit.clone(), *span, param.clone(), PgType::Inet))
-        }
+        Binding::Unknown { lit, span, param } => Some(resolve_unknown(
+            lit.clone(),
+            *span,
+            param.clone(),
+            PgType::Inet,
+        )),
         Binding::Typed(_) => None,
     }
 }
@@ -2544,8 +2752,8 @@ fn resolve_geometric_op(
     lb: &Binding,
     rb: &Binding,
 ) -> Result<Option<Binding>, BindError> {
-    use ast::BinaryOperator as B;
     use crate::functions::GeoFn;
+    use ast::BinaryOperator as B;
     let lt = binding_typed_ty(lb);
     let rt = binding_typed_ty(rb);
     if !is_geo_ty(lt) && !is_geo_ty(rt) {
@@ -2561,83 +2769,138 @@ fn resolve_geometric_op(
     let l = |t: PgType| resolve_operand(lb, t);
     let r = |t: PgType| resolve_operand(rb, t);
     let call = |func, ret, args: Vec<BoundExpr>| {
-        Ok(Some(Binding::Typed(BoundExpr::FuncCall { func, ret, args })))
+        Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret,
+            args,
+        })))
     };
     let geo = |f: GeoFn| ScalarFn::Geo(f);
 
     use PgType::{Lseg, Point};
-    let combo = (left_ty.unwrap(), right_ty.unwrap());
+    let (Some(left_ty), Some(right_ty)) = (left_ty, right_ty) else {
+        return Ok(None);
+    };
+    let combo = (left_ty, right_ty);
     match op {
         // Distance — point↔point, point↔lseg, lseg↔lseg.
         B::LtDashGt => match combo {
-            (Point, Point) => call(geo(GeoFn::PointDist), PgType::Float8, vec![l(Point)?, r(Point)?]),
-            (Point, Lseg) => {
-                call(geo(GeoFn::DistPointSeg), PgType::Float8, vec![l(Point)?, r(Lseg)?])
-            }
-            (Lseg, Point) => {
-                call(geo(GeoFn::DistPointSeg), PgType::Float8, vec![r(Point)?, l(Lseg)?])
-            }
-            (Lseg, Lseg) => call(geo(GeoFn::DistSegSeg), PgType::Float8, vec![l(Lseg)?, r(Lseg)?]),
+            (Point, Point) => call(
+                geo(GeoFn::PointDist),
+                PgType::Float8,
+                vec![l(Point)?, r(Point)?],
+            ),
+            (Point, Lseg) => call(
+                geo(GeoFn::DistPointSeg),
+                PgType::Float8,
+                vec![l(Point)?, r(Lseg)?],
+            ),
+            (Lseg, Point) => call(
+                geo(GeoFn::DistPointSeg),
+                PgType::Float8,
+                vec![r(Point)?, l(Lseg)?],
+            ),
+            (Lseg, Lseg) => call(
+                geo(GeoFn::DistSegSeg),
+                PgType::Float8,
+                vec![l(Lseg)?, r(Lseg)?],
+            ),
             _ => Ok(None),
         },
         // Point positional / same-as / horizontal / vertical predicates.
-        B::PGBitwiseShiftLeft if combo == (Point, Point) => {
-            call(geo(GeoFn::PointLeft), PgType::Bool, vec![l(Point)?, r(Point)?])
-        }
-        B::PGBitwiseShiftRight if combo == (Point, Point) => {
-            call(geo(GeoFn::PointRight), PgType::Bool, vec![l(Point)?, r(Point)?])
-        }
-        B::PipeGtGt if combo == (Point, Point) => {
-            call(geo(GeoFn::PointAbove), PgType::Bool, vec![l(Point)?, r(Point)?])
-        }
-        B::LtLtPipe if combo == (Point, Point) => {
-            call(geo(GeoFn::PointBelow), PgType::Bool, vec![l(Point)?, r(Point)?])
-        }
-        B::TildeEq if combo == (Point, Point) => {
-            call(geo(GeoFn::PointEq), PgType::Bool, vec![l(Point)?, r(Point)?])
-        }
-        B::QuestionDash if combo == (Point, Point) => {
-            call(geo(GeoFn::PointHoriz), PgType::Bool, vec![l(Point)?, r(Point)?])
-        }
-        B::QuestionPipe if combo == (Point, Point) => {
-            call(geo(GeoFn::PointVert), PgType::Bool, vec![l(Point)?, r(Point)?])
-        }
+        B::PGBitwiseShiftLeft if combo == (Point, Point) => call(
+            geo(GeoFn::PointLeft),
+            PgType::Bool,
+            vec![l(Point)?, r(Point)?],
+        ),
+        B::PGBitwiseShiftRight if combo == (Point, Point) => call(
+            geo(GeoFn::PointRight),
+            PgType::Bool,
+            vec![l(Point)?, r(Point)?],
+        ),
+        B::PipeGtGt if combo == (Point, Point) => call(
+            geo(GeoFn::PointAbove),
+            PgType::Bool,
+            vec![l(Point)?, r(Point)?],
+        ),
+        B::LtLtPipe if combo == (Point, Point) => call(
+            geo(GeoFn::PointBelow),
+            PgType::Bool,
+            vec![l(Point)?, r(Point)?],
+        ),
+        B::TildeEq if combo == (Point, Point) => call(
+            geo(GeoFn::PointEq),
+            PgType::Bool,
+            vec![l(Point)?, r(Point)?],
+        ),
+        B::QuestionDash if combo == (Point, Point) => call(
+            geo(GeoFn::PointHoriz),
+            PgType::Bool,
+            vec![l(Point)?, r(Point)?],
+        ),
+        B::QuestionPipe if combo == (Point, Point) => call(
+            geo(GeoFn::PointVert),
+            PgType::Bool,
+            vec![l(Point)?, r(Point)?],
+        ),
         // Point arithmetic (`-> point`).
-        B::Plus if combo == (Point, Point) => {
-            call(geo(GeoFn::PointAdd), PgType::Point, vec![l(Point)?, r(Point)?])
-        }
-        B::Minus if combo == (Point, Point) => {
-            call(geo(GeoFn::PointSub), PgType::Point, vec![l(Point)?, r(Point)?])
-        }
-        B::Multiply if combo == (Point, Point) => {
-            call(geo(GeoFn::PointMul), PgType::Point, vec![l(Point)?, r(Point)?])
-        }
-        B::Divide if combo == (Point, Point) => {
-            call(geo(GeoFn::PointDiv), PgType::Point, vec![l(Point)?, r(Point)?])
-        }
+        B::Plus if combo == (Point, Point) => call(
+            geo(GeoFn::PointAdd),
+            PgType::Point,
+            vec![l(Point)?, r(Point)?],
+        ),
+        B::Minus if combo == (Point, Point) => call(
+            geo(GeoFn::PointSub),
+            PgType::Point,
+            vec![l(Point)?, r(Point)?],
+        ),
+        B::Multiply if combo == (Point, Point) => call(
+            geo(GeoFn::PointMul),
+            PgType::Point,
+            vec![l(Point)?, r(Point)?],
+        ),
+        B::Divide if combo == (Point, Point) => call(
+            geo(GeoFn::PointDiv),
+            PgType::Point,
+            vec![l(Point)?, r(Point)?],
+        ),
         // `point <@ lseg` (point lies on the segment).
-        B::ArrowAt if combo == (Point, Lseg) => {
-            call(geo(GeoFn::PointOnSeg), PgType::Bool, vec![l(Point)?, r(Lseg)?])
-        }
+        B::ArrowAt if combo == (Point, Lseg) => call(
+            geo(GeoFn::PointOnSeg),
+            PgType::Bool,
+            vec![l(Point)?, r(Lseg)?],
+        ),
         // `##` closest point: point→lseg or lseg→lseg (result on the 2nd operand).
         B::DoubleHash => match combo {
-            (Point, Lseg) => {
-                call(geo(GeoFn::ClosePointSeg), PgType::Point, vec![l(Point)?, r(Lseg)?])
-            }
-            (Lseg, Lseg) => call(geo(GeoFn::CloseSegSeg), PgType::Point, vec![l(Lseg)?, r(Lseg)?]),
+            (Point, Lseg) => call(
+                geo(GeoFn::ClosePointSeg),
+                PgType::Point,
+                vec![l(Point)?, r(Lseg)?],
+            ),
+            (Lseg, Lseg) => call(
+                geo(GeoFn::CloseSegSeg),
+                PgType::Point,
+                vec![l(Lseg)?, r(Lseg)?],
+            ),
             _ => Ok(None),
         },
         // `#` intersection point of two segments (NULL if none).
-        B::PGBitwiseXor if combo == (Lseg, Lseg) => {
-            call(geo(GeoFn::LsegInterpt), PgType::Point, vec![l(Lseg)?, r(Lseg)?])
-        }
+        B::PGBitwiseXor if combo == (Lseg, Lseg) => call(
+            geo(GeoFn::LsegInterpt),
+            PgType::Point,
+            vec![l(Lseg)?, r(Lseg)?],
+        ),
         // lseg parallel / perpendicular.
-        B::QuestionDoublePipe if combo == (Lseg, Lseg) => {
-            call(geo(GeoFn::LsegParallel), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
-        }
-        B::QuestionDashPipe if combo == (Lseg, Lseg) => {
-            call(geo(GeoFn::LsegPerpendicular), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
-        }
+        B::QuestionDoublePipe if combo == (Lseg, Lseg) => call(
+            geo(GeoFn::LsegParallel),
+            PgType::Bool,
+            vec![l(Lseg)?, r(Lseg)?],
+        ),
+        B::QuestionDashPipe if combo == (Lseg, Lseg) => call(
+            geo(GeoFn::LsegPerpendicular),
+            PgType::Bool,
+            vec![l(Lseg)?, r(Lseg)?],
+        ),
         // lseg b-tree comparisons (`=`/`<>` by endpoints, the rest by length).
         B::Eq if combo == (Lseg, Lseg) => {
             call(geo(GeoFn::LsegEq), PgType::Bool, vec![l(Lseg)?, r(Lseg)?])
@@ -2673,9 +2936,12 @@ fn bit_operand(b: &Binding) -> Option<Result<BoundExpr, BindError>> {
     match b {
         Binding::Typed(e) if is_bit_family(Some(e.ty())) => Some(Ok(e.clone())),
         Binding::Typed(_) => None,
-        Binding::Unknown { lit, span, param } => {
-            Some(resolve_unknown(lit.clone(), *span, param.clone(), PgType::Bit))
-        }
+        Binding::Unknown { lit, span, param } => Some(resolve_unknown(
+            lit.clone(),
+            *span,
+            param.clone(),
+            PgType::Bit,
+        )),
     }
 }
 
@@ -2834,14 +3100,16 @@ fn bind_pow(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
             || matches!(b, Binding::Unknown { .. })
     };
     if !numeric(&lb) || !numeric(&rb) {
-        return Err(no_operator(&binding_type_label(&lb), BinOp::Pow, &binding_type_label(&rb)));
+        return Err(no_operator(
+            &binding_type_label(&lb),
+            BinOp::Pow,
+            &binding_type_label(&rb),
+        ));
     }
     // PG's `^` exists for `float8` and `numeric`. A float operand selects the
     // float8 operator; otherwise a numeric operand selects numeric (returning
     // numeric); with only ints/unknowns it falls back to float8 (as PG does).
-    let is_float = |b: &Binding| {
-        matches!(b, Binding::Typed(e) if matches!(e.ty(), PgType::Float4 | PgType::Float8))
-    };
+    let is_float = |b: &Binding| matches!(b, Binding::Typed(e) if matches!(e.ty(), PgType::Float4 | PgType::Float8));
     let is_num = |b: &Binding| matches!(b, Binding::Typed(e) if e.ty() == PgType::Numeric);
     if !is_float(&lb) && !is_float(&rb) && (is_num(&lb) || is_num(&rb)) {
         // numeric ^ numeric -> numeric, via the power() function.
@@ -2991,7 +3259,10 @@ pub(crate) fn to_text_operand(binding: Binding) -> Result<BoundExpr, BindError> 
 
 /// True for the text-family types that share `text`'s value representation.
 pub(crate) fn is_text_family(ty: PgType) -> bool {
-    matches!(ty, PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name)
+    matches!(
+        ty,
+        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name
+    )
 }
 
 /// Coerce an argument for `concat`/`concat_ws`/`format`, which use each value's
@@ -3020,7 +3291,11 @@ fn bind_string_concat(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
         };
         return Err(BindError::new(
             sqlstate::UNDEFINED_FUNCTION,
-            format!("operator does not exist: {} || {}", l.ty().name(), r.ty().name()),
+            format!(
+                "operator does not exist: {} || {}",
+                l.ty().name(),
+                r.ty().name()
+            ),
         ));
     }
     let left = to_text_operand(lb)?;
@@ -3047,12 +3322,19 @@ fn bind_like(
         args.push(to_text_operand(escape)?);
     }
     let call = BoundExpr::FuncCall {
-        func: if case_insensitive { ScalarFn::ILike } else { ScalarFn::Like },
+        func: if case_insensitive {
+            ScalarFn::ILike
+        } else {
+            ScalarFn::Like
+        },
         ret: PgType::Bool,
         args,
     };
     let expr = if negated {
-        BoundExpr::Unary { op: UnaryOp::Not, expr: Box::new(call) }
+        BoundExpr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(call),
+        }
     } else {
         call
     };
@@ -3069,12 +3351,19 @@ fn bind_regex(
 ) -> Result<Binding, BindError> {
     let args = vec![to_text_operand(lb)?, to_text_operand(rb)?];
     let call = BoundExpr::FuncCall {
-        func: if case_insensitive { ScalarFn::RegexIMatch } else { ScalarFn::RegexMatch },
+        func: if case_insensitive {
+            ScalarFn::RegexIMatch
+        } else {
+            ScalarFn::RegexMatch
+        },
         ret: PgType::Bool,
         args,
     };
     let expr = if negated {
-        BoundExpr::Unary { op: UnaryOp::Not, expr: Box::new(call) }
+        BoundExpr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(call),
+        }
     } else {
         call
     };
@@ -3098,16 +3387,28 @@ fn bind_similar_to(
     if let Some(v) = escape_char {
         match &v.value {
             ast::Value::SingleQuotedString(s) => {
-                args.push(BoundExpr::Const { value: Value::Text(s.clone()), ty: PgType::Text });
+                args.push(BoundExpr::Const {
+                    value: Value::Text(s.clone()),
+                    ty: PgType::Text,
+                });
             }
             other => {
-                return Err(BindError::syntax(format!("invalid ESCAPE literal: {other}")));
+                return Err(BindError::syntax(format!(
+                    "invalid ESCAPE literal: {other}"
+                )));
             }
         }
     }
-    let call = BoundExpr::FuncCall { func: ScalarFn::SimilarTo, ret: PgType::Bool, args };
+    let call = BoundExpr::FuncCall {
+        func: ScalarFn::SimilarTo,
+        ret: PgType::Bool,
+        args,
+    };
     let expr = if negated {
-        BoundExpr::Unary { op: UnaryOp::Not, expr: Box::new(call) }
+        BoundExpr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(call),
+        }
     } else {
         call
     };
@@ -3232,23 +3533,21 @@ fn common_numeric(a: PgType, b: PgType) -> Option<PgType> {
     if !a.is_numeric() || !b.is_numeric() {
         return None;
     }
-    Some(
-        if a == PgType::Float8 || b == PgType::Float8 {
-            PgType::Float8
-        } else if a == PgType::Float4 || b == PgType::Float4 {
-            // A float mixed with any other numeric type resolves to float8.
-            PgType::Float8
-        } else if a == PgType::Numeric || b == PgType::Numeric {
-            // `numeric` dominates the integer types (int → numeric is exact).
-            PgType::Numeric
-        } else if a == PgType::Int8 || b == PgType::Int8 {
-            PgType::Int8
-        } else if a == PgType::Int4 || b == PgType::Int4 {
-            PgType::Int4
-        } else {
-            PgType::Int2
-        },
-    )
+    Some(if a == PgType::Float8 || b == PgType::Float8 {
+        PgType::Float8
+    } else if a == PgType::Float4 || b == PgType::Float4 {
+        // A float mixed with any other numeric type resolves to float8.
+        PgType::Float8
+    } else if a == PgType::Numeric || b == PgType::Numeric {
+        // `numeric` dominates the integer types (int → numeric is exact).
+        PgType::Numeric
+    } else if a == PgType::Int8 || b == PgType::Int8 {
+        PgType::Int8
+    } else if a == PgType::Int4 || b == PgType::Int4 {
+        PgType::Int4
+    } else {
+        PgType::Int2
+    })
 }
 
 /// Coerce an expression to `ty`. Constant operands fold (and range-check) at
@@ -3263,7 +3562,11 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
     // most text functions. It cannot be done in `cast_value` because a padded
     // `bpchar` value is indistinguishable from `text` there.
     if expr.ty() == PgType::Bpchar && ty == PgType::Text {
-        if let BoundExpr::Const { value: Value::Text(s), .. } = &expr {
+        if let BoundExpr::Const {
+            value: Value::Text(s),
+            ..
+        } = &expr
+        {
             return Ok(BoundExpr::Const {
                 value: Value::Text(s.trim_end_matches(' ').to_string()),
                 ty: PgType::Text,
@@ -3553,18 +3856,31 @@ fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr,
         _ => return Ok(expr),
     };
     // Fold a constant now (assignment semantics: error on non-blank overflow).
-    if let BoundExpr::Const { value: Value::Text(s), .. } = &expr {
+    if let BoundExpr::Const {
+        value: Value::Text(s),
+        ..
+    } = &expr
+    {
         let folded = match func {
-            ScalarFn::VarcharTypmod => crabgresql_types::text::varchar_input(s, column.typmod, false)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))?,
+            ScalarFn::VarcharTypmod => {
+                crabgresql_types::text::varchar_input(s, column.typmod, false)
+                    .map_err(|e| BindError::new(e.sqlstate, e.message))?
+            }
             ScalarFn::BpcharTypmod => crabgresql_types::text::bpchar_input(s, column.typmod, false)
                 .map_err(|e| BindError::new(e.sqlstate, e.message))?,
             ScalarFn::NameInput => crabgresql_types::text::name_input(s),
             _ => unreachable!(),
         };
-        return Ok(BoundExpr::Const { value: Value::Text(folded), ty: column.ty });
+        return Ok(BoundExpr::Const {
+            value: Value::Text(folded),
+            ty: column.ty,
+        });
     }
-    if let BoundExpr::Const { value: Value::Bit { len, data }, .. } = &expr {
+    if let BoundExpr::Const {
+        value: Value::Bit { len, data },
+        ..
+    } = &expr
+    {
         let (len, data) = crabgresql_types::bit::coerce(
             *len,
             data,
@@ -3573,15 +3889,28 @@ fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr,
             false,
         )
         .map_err(|e| BindError::new(e.sqlstate, e.message))?;
-        return Ok(BoundExpr::Const { value: Value::Bit { len, data }, ty: column.ty });
+        return Ok(BoundExpr::Const {
+            value: Value::Bit { len, data },
+            ty: column.ty,
+        });
     }
     let mut args = vec![expr];
     if func != ScalarFn::NameInput {
-        args.push(BoundExpr::Const { value: Value::Int4(column.typmod), ty: PgType::Int4 });
+        args.push(BoundExpr::Const {
+            value: Value::Int4(column.typmod),
+            ty: PgType::Int4,
+        });
         // Third arg 0 = assignment (error on overflow), not a truncating cast.
-        args.push(BoundExpr::Const { value: Value::Int4(0), ty: PgType::Int4 });
+        args.push(BoundExpr::Const {
+            value: Value::Int4(0),
+            ty: PgType::Int4,
+        });
     }
-    Ok(BoundExpr::FuncCall { func, ret: column.ty, args })
+    Ok(BoundExpr::FuncCall {
+        func,
+        ret: column.ty,
+        args,
+    })
 }
 
 /// The result-column name PG derives from an expression's syntax: column
