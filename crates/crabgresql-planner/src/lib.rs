@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crabgresql_binder::{
     AggInput, BinOp, BoundAggregate, BoundExpr, DistinctKey, JoinExpr, JoinInput, JoinKind,
-    LogicalPlan, OutputColumn, SortKey, TableFn,
+    LogicalPlan, OutputColumn, Returning, SortKey, TableFn,
 };
 use crabgresql_storage_api::{IndexConstraint, IndexMetadata, TableAm, TableSchema};
 use crabgresql_types::PgType;
@@ -102,15 +102,18 @@ pub enum PhysicalPlan {
     Insert {
         table: Arc<dyn TableAm>,
         rows: Vec<Vec<BoundExpr>>,
+        returning: Option<Returning>,
     },
     Update {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         assignments: Vec<(usize, BoundExpr)>,
+        returning: Option<Returning>,
     },
     Delete {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
+        returning: Option<Returning>,
     },
 }
 
@@ -464,17 +467,35 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             limit,
             offset,
         },
-        LogicalPlan::Insert { table, rows } => PhysicalPlan::Insert { table, rows },
+        LogicalPlan::Insert {
+            table,
+            rows,
+            returning,
+        } => PhysicalPlan::Insert {
+            table,
+            rows,
+            returning,
+        },
         LogicalPlan::Update {
             table,
             predicate,
             assignments,
+            returning,
         } => PhysicalPlan::Update {
             table,
             predicate,
             assignments,
+            returning,
         },
-        LogicalPlan::Delete { table, predicate } => PhysicalPlan::Delete { table, predicate },
+        LogicalPlan::Delete {
+            table,
+            predicate,
+            returning,
+        } => PhysicalPlan::Delete {
+            table,
+            predicate,
+            returning,
+        },
     }
 }
 

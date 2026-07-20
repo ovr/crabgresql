@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crabgresql_executor::{ExecContext, ExecNode, OutputColumn};
+
+use crate::query::RowTag;
 use crabgresql_memory_storage::MemoryEngine;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{Format, TransactionStatus};
@@ -54,8 +56,11 @@ pub struct SuspendedRows {
     /// later sees the same rows.
     pub node: Box<dyn ExecNode>,
     /// Total rows already delivered across every `Execute` of this portal, so the
-    /// final `CommandComplete` reports the whole portal's `SELECT n`.
+    /// final `CommandComplete` reports the whole portal's count.
     pub delivered: usize,
+    /// The command-tag family to report when the portal exhausts (`SELECT n`, or
+    /// a `RETURNING` DML's mutation tag).
+    pub tag: RowTag,
 }
 
 /// The data-level state of an explicit `BEGIN … COMMIT/ROLLBACK` block. Separate

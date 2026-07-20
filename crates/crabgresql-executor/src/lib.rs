@@ -2,8 +2,8 @@
 //!
 //! Nodes: `Values`, `SeqScan`, `Filter`, `Projection`; expression evaluation
 //! lives in [`eval`]. DML (INSERT/UPDATE/DELETE) runs as plain functions
-//! rather than plan nodes: it yields a row count, not a row stream, and the
-//! pull model only becomes the right shape for it once RETURNING exists.
+//! rather than plan nodes: it yields a row count, and — with `RETURNING` — a
+//! row stream projected over the affected tuples the function already owns.
 
 mod agg;
 pub mod eval;
@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use crabgresql_binder::OutputColumn;
-use crabgresql_binder::{BoundAggregate, BoundExpr, DistinctKey, JoinKind, SortKey, TableFn};
+use crabgresql_binder::{
+    BoundAggregate, BoundExpr, DistinctKey, JoinKind, Returning, SortKey, TableFn,
+};
 use crabgresql_planner::{
     HashKey, PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan,
 };
@@ -95,6 +97,24 @@ pub enum Execution {
     Inserted(u64),
     Updated(u64),
     Deleted(u64),
+    /// A data-modifying statement with a `RETURNING` clause: the affected rows
+    /// projected as a result set, plus the DML verb so the server still emits
+    /// the mutation command tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`) rather
+    /// than `SELECT n`. The streamed row count equals the mutation count.
+    ReturningRows {
+        columns: Vec<OutputColumn>,
+        node: Box<dyn ExecNode>,
+        verb: DmlVerb,
+    },
+}
+
+/// Which data-modifying statement produced a [`Execution::ReturningRows`],
+/// selecting the command tag the server reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmlVerb {
+    Insert,
+    Update,
+    Delete,
 }
 
 pub fn execute(
@@ -254,13 +274,22 @@ pub fn execute(
             // aggregate output row, so the standard tail finishes the job.
             project_pipeline(node, projections, None, sort, distinct, columns, ctx)
         }
-        PhysicalPlan::Insert { table, rows } => execute_insert(&table, &rows, ctx, txn),
+        PhysicalPlan::Insert {
+            table,
+            rows,
+            returning,
+        } => execute_insert(&table, &rows, returning, ctx, txn),
         PhysicalPlan::Update {
             table,
             predicate,
             assignments,
-        } => execute_update(&table, &predicate, &assignments, ctx, txn),
-        PhysicalPlan::Delete { table, predicate } => execute_delete(&table, &predicate, ctx, txn),
+            returning,
+        } => execute_update(&table, &predicate, &assignments, returning, ctx, txn),
+        PhysicalPlan::Delete {
+            table,
+            predicate,
+            returning,
+        } => execute_delete(&table, &predicate, returning, ctx, txn),
     }
 }
 
@@ -318,6 +347,53 @@ fn finish_sort_distinct(
     Ok(Box::new(Distinct::new(node, keys, columns.len())?))
 }
 
+/// A source node over already-materialized tuples. `RETURNING` projects over
+/// the rows a DML statement has already built (raw `Vec<Value>`), so — unlike
+/// [`Values`], which evaluates `BoundExpr`s — it just replays them.
+struct MaterializedRows {
+    rows: std::vec::IntoIter<Tuple>,
+}
+
+impl MaterializedRows {
+    fn new(rows: Vec<Tuple>) -> Self {
+        Self {
+            rows: rows.into_iter(),
+        }
+    }
+}
+
+impl ExecNode for MaterializedRows {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        Ok(self.rows.next())
+    }
+}
+
+/// Build the [`Execution::ReturningRows`] result for a DML statement: project
+/// the bound `RETURNING` list over the `affected` rows. Mirrors the
+/// projection tail of [`project_pipeline`] (SRF-aware) with no filter or sort.
+fn returning_rows(
+    affected: Vec<Tuple>,
+    returning: Returning,
+    verb: DmlVerb,
+    ctx: ExecContext,
+) -> Execution {
+    let Returning {
+        columns,
+        projections,
+    } = returning;
+    let source: Box<dyn ExecNode> = Box::new(MaterializedRows::new(affected));
+    let node: Box<dyn ExecNode> = if projections.iter().any(BoundExpr::is_srf) {
+        Box::new(ProjectSet::new(source, projections, ctx))
+    } else {
+        Box::new(Projection::new(source, projections, ctx))
+    };
+    Execution::ReturningRows {
+        columns,
+        node,
+        verb,
+    }
+}
+
 /// Statement atomicity: evaluate everything first, mutate only after nothing
 /// can fail, so a failure in a later row leaves no earlier rows behind. The
 /// writes are stamped with `txn`'s XID and become durable/visible only when the
@@ -325,6 +401,7 @@ fn finish_sort_distinct(
 fn execute_insert(
     table: &Arc<dyn TableAm>,
     rows: &[Vec<BoundExpr>],
+    returning: Option<Returning>,
     ctx: ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -349,10 +426,22 @@ fn execute_insert(
         tuples.push(tuple);
     }
     let inserted = tuples.len() as u64;
-    for tuple in tuples {
-        table.insert(tuple, txn);
+    // With RETURNING, keep the inserted rows to project after the writes; the
+    // clause sees the fully-formed row (defaults filled in), in schema order.
+    match returning {
+        Some(returning) => {
+            for tuple in &tuples {
+                table.insert(tuple.clone(), txn);
+            }
+            Ok(returning_rows(tuples, returning, DmlVerb::Insert, ctx))
+        }
+        None => {
+            for tuple in tuples {
+                table.insert(tuple, txn);
+            }
+            Ok(Execution::Inserted(inserted))
+        }
     }
-    Ok(Execution::Inserted(inserted))
 }
 
 /// The scan sees `txn`'s snapshot, and the new versions it writes carry `txn`'s
@@ -365,6 +454,7 @@ fn execute_update(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
+    returning: Option<Returning>,
     ctx: ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -407,7 +497,16 @@ fn execute_update(
         }
         pending.push((tid, new));
     }
-    Ok(Execution::Updated(table.update_many(pending, txn)))
+    // With RETURNING, project the NEW rows (in schema order). Snapshot them
+    // before `update_many` consumes `pending`.
+    match returning {
+        Some(returning) => {
+            let new_rows: Vec<Tuple> = pending.iter().map(|(_, new)| new.clone()).collect();
+            table.update_many(pending, txn);
+            Ok(returning_rows(new_rows, returning, DmlVerb::Update, ctx))
+        }
+        None => Ok(Execution::Updated(table.update_many(pending, txn))),
+    }
 }
 
 fn validate_constraints<'a>(
@@ -517,16 +616,28 @@ fn display_tuple(tuple: &Tuple, ctx: ExecContext) -> String {
 fn execute_delete(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
+    returning: Option<Returning>,
     ctx: ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let mut pending: Vec<Tid> = Vec::new();
+    // RETURNING sees the deleted (OLD) rows; capture them alongside the tids.
+    let mut deleted: Vec<Tuple> = Vec::new();
     for (tid, tuple) in table.scan(txn) {
         if predicate_holds(predicate, &tuple, ctx)? {
             pending.push(tid);
+            if returning.is_some() {
+                deleted.push(tuple);
+            }
         }
     }
-    Ok(Execution::Deleted(table.delete_many(pending, txn)))
+    match returning {
+        Some(returning) => {
+            table.delete_many(pending, txn);
+            Ok(returning_rows(deleted, returning, DmlVerb::Delete, ctx))
+        }
+        None => Ok(Execution::Deleted(table.delete_many(pending, txn))),
+    }
 }
 
 /// WHERE keeps a row only when the predicate is exactly true: false and NULL
@@ -2348,7 +2459,7 @@ mod tests {
             ),
         )];
         let Execution::Updated(n) =
-            execute_update(&table, &None, &assignments, ExecContext::default(), &wtxn())?
+            execute_update(&table, &None, &assignments, None, ExecContext::default(), &wtxn())?
         else {
             panic!("expected Updated");
         };
@@ -2383,7 +2494,8 @@ mod tests {
                 ),
             ),
         )];
-        let Err(e) = execute_update(&table, &None, &assignments, ExecContext::default(), &wtxn())
+        let Err(e) =
+            execute_update(&table, &None, &assignments, None, ExecContext::default(), &wtxn())
         else {
             panic!("expected error");
         };
@@ -2405,7 +2517,7 @@ mod tests {
             int4(1),
         ));
         let Execution::Deleted(n) =
-            execute_delete(&table, &predicate, ExecContext::default(), &wtxn())?
+            execute_delete(&table, &predicate, None, ExecContext::default(), &wtxn())?
         else {
             panic!("expected Deleted");
         };
@@ -2413,6 +2525,139 @@ mod tests {
         assert_eq!(table.scan(&rtxn()).count(), 1);
 
         Ok(())
+    }
+
+    /// A fresh engine with `t(id int4, label text)` seeded with three rows, for
+    /// the `RETURNING` tests.
+    fn returning_engine() -> Arc<dyn TableEngine> {
+        let engine = MemoryEngine::new();
+        let table = test_ok(engine.create_table(TableSchema {
+            name: "t".into(),
+            columns: vec![
+                Column::new("id", PgType::Int4),
+                Column::new("label", PgType::Text),
+            ],
+        }));
+        let txn = wtxn();
+        table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
+        table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
+        table.insert(vec![Value::Int4(3), Value::Text("three".into())], &txn);
+        Arc::new(engine)
+    }
+
+    /// Parse → bind → plan → execute a DML `RETURNING` statement, draining the
+    /// projected rows. Panics unless the plan produced [`Execution::ReturningRows`].
+    fn run_returning(
+        engine: &Arc<dyn TableEngine>,
+        sql: &str,
+    ) -> (Vec<OutputColumn>, Vec<Tuple>, DmlVerb) {
+        use crabgresql_parser::ast;
+        let stmts = test_ok(crabgresql_parser::parse(sql));
+        let catalog: Arc<dyn crabgresql_storage_api::TypeCatalog> =
+            Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+        let logical = match &stmts[0] {
+            ast::Statement::Insert(insert) => {
+                test_ok(crabgresql_binder::bind_insert(engine, &catalog, insert))
+            }
+            ast::Statement::Update(update) => {
+                test_ok(crabgresql_binder::bind_update(engine, &catalog, update))
+            }
+            ast::Statement::Delete(delete) => {
+                test_ok(crabgresql_binder::bind_delete(engine, &catalog, delete))
+            }
+            other => panic!("expected a DML statement, got {other:?}"),
+        };
+        let physical = crabgresql_planner::plan(logical);
+        let Execution::ReturningRows {
+            columns,
+            mut node,
+            verb,
+        } = test_ok(execute(physical, ExecContext::default(), &wtxn()))
+        else {
+            panic!("expected ReturningRows");
+        };
+        (columns, collect(node.as_mut()), verb)
+    }
+
+    #[test]
+    fn insert_returning_projects_inserted_rows() {
+        let engine = returning_engine();
+        let (columns, rows, verb) = run_returning(
+            &engine,
+            "INSERT INTO t (id, label) VALUES (10, 'ten'), (11, 'eleven') RETURNING id, label",
+        );
+        assert_eq!(verb, DmlVerb::Insert);
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "label"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(10), Value::Text("ten".into())],
+                vec![Value::Int4(11), Value::Text("eleven".into())],
+            ]
+        );
+        // The rows were actually persisted, not just projected.
+        let table = test_ok(engine.open_table("t"));
+        assert_eq!(table.scan(&rtxn()).count(), 5);
+    }
+
+    #[test]
+    fn insert_returning_star_and_computed_alias() {
+        let engine = returning_engine();
+        let (columns, rows, _) = run_returning(
+            &engine,
+            "INSERT INTO t (id, label) VALUES (10, 'ten') RETURNING *, id + 1 AS next",
+        );
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "label", "next"]);
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Int4(10),
+                Value::Text("ten".into()),
+                Value::Int4(11),
+            ]]
+        );
+    }
+
+    #[test]
+    fn update_returning_projects_new_rows() {
+        let engine = returning_engine();
+        let (columns, rows, verb) = run_returning(
+            &engine,
+            "UPDATE t SET id = id + 100 WHERE id > 1 RETURNING id, label",
+        );
+        assert_eq!(verb, DmlVerb::Update);
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "label"]);
+        // The NEW (post-update) id values.
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(102), Value::Text("two".into())],
+                vec![Value::Int4(103), Value::Text("three".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_returning_projects_deleted_rows_reordered() {
+        let engine = returning_engine();
+        let (columns, rows, verb) =
+            run_returning(&engine, "DELETE FROM t WHERE id > 1 RETURNING label, id");
+        assert_eq!(verb, DmlVerb::Delete);
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["label", "id"]);
+        // The deleted (OLD) rows, columns reordered as requested.
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("two".into()), Value::Int4(2)],
+                vec![Value::Text("three".into()), Value::Int4(3)],
+            ]
+        );
+        let table = test_ok(engine.open_table("t"));
+        assert_eq!(table.scan(&rtxn()).count(), 1);
     }
 
     /// Parse → bind → plan → execute a query against a fresh engine.
