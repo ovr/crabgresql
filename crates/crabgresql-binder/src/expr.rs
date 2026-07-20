@@ -3837,8 +3837,10 @@ pub fn coerce_to_column(
                 e
             } else if ty.is_numeric() && column.ty.is_numeric() {
                 coerce_expr(e, column.ty)?
-            // Any text-family type assigns to any other (text/varchar/char/name).
-            } else if is_text_family(ty) && is_text_family(column.ty) {
+            // PG assignment context permits coercion via I/O to a string-category
+            // target (the source's output function), so any type assigns to
+            // text/varchar/char/name (e.g. INSERT ... VALUES (2) into varchar).
+            } else if is_text_family(column.ty) {
                 coerce_expr(e, column.ty)?
             // `bit` and `bit varying` assign to each other (shared value); the
             // length rule is applied by `apply_length_to_column`.
