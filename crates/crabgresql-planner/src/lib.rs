@@ -798,15 +798,15 @@ mod tests {
     fn plan_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> PhysicalPlan {
         let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
         let catalog: Arc<dyn TypeCatalog> = Arc::new(EmptyTypeCatalog);
-        if let Err(error) = engine.create_table(TableSchema {
-            name: "t".into(),
-            namespace: "public".into(),
-            columns: vec![
+        if let Err(error) = engine.create_table(TableSchema::in_namespace(
+            "t",
+            "public",
+            vec![
                 Column::new("id", PgType::Int4),
                 Column::new("big", PgType::Int8),
                 Column::new("name", PgType::Text),
             ],
-        }) {
+        )) {
             panic!("failed to create planner test table: {error}");
         }
         if let Some(index) = index

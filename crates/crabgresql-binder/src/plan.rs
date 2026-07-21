@@ -336,7 +336,19 @@ fn resolve_write_table(
         }
         not_found_as_written(e, schema.as_deref(), &table_name)
     })?;
+    if table.schema().partition_scheme.is_some() {
+        return Err(partitioned_parent_unsupported(&table_name));
+    }
     Ok((table, table_name))
+}
+
+/// Reject a query or write against a partitioned parent: tuple routing on INSERT
+/// and union scans on read are not implemented yet, so only the individual leaf
+/// partitions can be accessed directly.
+fn partitioned_parent_unsupported(name: &str) -> BindError {
+    BindError::feature_not_supported(format!(
+        "access to partitioned table \"{name}\" is not supported yet"
+    ))
 }
 
 /// Which DML verb is writing, for the non-updatable-view error text.
@@ -1591,6 +1603,9 @@ fn bind_from_item(
             // path claims the name.
             match engine.resolve(cte_schema.as_deref(), &tname) {
                 Ok(table) => {
+                    if table.schema().partition_scheme.is_some() {
+                        return Err(partitioned_parent_unsupported(&tname));
+                    }
                     let qualifier = relation_qualifier(alias, &tname);
                     let mut columns: Vec<OutputColumn> = table
                         .schema()
@@ -4133,16 +4148,15 @@ mod tests {
 
     fn engine_with_table() -> Arc<dyn TableEngine> {
         let engine = MemoryEngine::new();
-        if let Err(error) = engine.create_table(TableSchema {
-            name: "t".into(),
-            namespace: "public".into(),
-            columns: vec![
+        if let Err(error) = engine.create_table(TableSchema::new(
+            "t",
+            vec![
                 Column::new("id", PgType::Int4),
                 Column::new("big", PgType::Int8),
                 Column::new("name", PgType::Text),
                 Column::new("flag", PgType::Bool),
             ],
-        }) {
+        )) {
             panic!("failed to create binder test table: {error}");
         }
         Arc::new(engine)
@@ -5098,11 +5112,9 @@ mod tests {
         // quoting, exactly as `SELECT * FROM "MixedCase"` does; an unquoted name
         // folds to lower case and does not resolve (matching PostgreSQL).
         let engine = MemoryEngine::new();
-        if let Err(error) = engine.create_table(TableSchema {
-            name: "MixedCase".into(),
-            namespace: "public".into(),
-            columns: vec![Column::new("id", PgType::Int4)],
-        }) {
+        if let Err(error) =
+            engine.create_table(TableSchema::new("MixedCase", vec![Column::new("id", PgType::Int4)]))
+        {
             panic!("failed to create test table: {error}");
         }
         let engine: Arc<dyn TableEngine> = Arc::new(engine);

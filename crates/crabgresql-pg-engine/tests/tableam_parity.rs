@@ -48,14 +48,13 @@ fn setup() -> H {
 }
 
 fn schema(name: &str) -> TableSchema {
-    TableSchema {
-        name: name.to_string(),
-        namespace: "public".to_string(),
-        columns: vec![
+    TableSchema::new(
+        name,
+        vec![
             Column::new("id", PgType::Int4),
             Column::new("name", PgType::Text),
         ],
-    }
+    )
 }
 
 fn insert_committed(tm: &TransactionManager, table: &dyn TableAm, tuple: Tuple) -> Tid {

@@ -2761,14 +2761,14 @@ mod tests {
 
     fn test_table() -> Arc<dyn TableAm> {
         let engine = MemoryEngine::new();
-        let table = test_ok(engine.create_table(TableSchema {
-            name: "t".into(),
-            namespace: "public".into(),
-            columns: vec![
+        let table = test_ok(engine.create_table(TableSchema::in_namespace(
+            "t",
+            "public",
+            vec![
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
             ],
-        }));
+        )));
         let txn = wtxn();
         table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
         table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
@@ -2787,14 +2787,14 @@ mod tests {
     /// `test_table`'s rows plus a physical unique index on `id`.
     fn indexed_table() -> Arc<dyn TableAm> {
         let engine = MemoryEngine::new();
-        let table = test_ok(engine.create_table(TableSchema {
-            name: "t".into(),
-            namespace: "public".into(),
-            columns: vec![
+        let table = test_ok(engine.create_table(TableSchema::in_namespace(
+            "t",
+            "public",
+            vec![
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
             ],
-        }));
+        )));
         test_ok(engine.create_index(
             "public",
             "t",
@@ -3218,14 +3218,14 @@ mod tests {
     /// the `RETURNING` tests.
     fn returning_engine() -> Arc<dyn TableEngine> {
         let engine = MemoryEngine::new();
-        let table = test_ok(engine.create_table(TableSchema {
-            name: "t".into(),
-            namespace: "public".into(),
-            columns: vec![
+        let table = test_ok(engine.create_table(TableSchema::in_namespace(
+            "t",
+            "public",
+            vec![
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
             ],
-        }));
+        )));
         let txn = wtxn();
         table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
         table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
@@ -3446,14 +3446,14 @@ mod tests {
     /// singleton (a=3), and one NULL `b`.
     fn agg_engine() -> Arc<dyn TableEngine> {
         let engine = MemoryEngine::new();
-        let table = test_ok(engine.create_table(TableSchema {
-            name: "t".into(),
-            namespace: "public".into(),
-            columns: vec![
+        let table = test_ok(engine.create_table(TableSchema::in_namespace(
+            "t",
+            "public",
+            vec![
                 Column::new("a", PgType::Int4),
                 Column::new("b", PgType::Int4),
             ],
-        }));
+        )));
         let txn = wtxn();
         let seed: [(i32, Option<i32>); 5] = [
             (1, Some(10)),
@@ -3503,14 +3503,14 @@ mod tests {
     #[test]
     fn distinct_aggregates_deduplicate_per_group_and_per_call() -> anyhow::Result<()> {
         let engine = MemoryEngine::new();
-        let table = engine.create_table(TableSchema {
-            name: "d".into(),
-            namespace: "public".into(),
-            columns: vec![
+        let table = engine.create_table(TableSchema::in_namespace(
+            "d",
+            "public",
+            vec![
                 Column::new("g", PgType::Int4),
                 Column::new("v", PgType::Int4),
             ],
-        })?;
+        ))?;
         let txn = wtxn();
         for (g, v) in [
             (1, Some(10)),
@@ -3625,14 +3625,14 @@ mod tests {
         // Rows with a NULL group key group together (NULL == NULL), distinct from
         // the non-NULL groups. Exercises the hash-grouping NULL path.
         let engine = MemoryEngine::new();
-        let table = engine.create_table(TableSchema {
-            name: "g".into(),
-            namespace: "public".into(),
-            columns: vec![
+        let table = engine.create_table(TableSchema::in_namespace(
+            "g",
+            "public",
+            vec![
                 Column::new("k", PgType::Int4),
                 Column::new("v", PgType::Int4),
             ],
-        })?;
+        ))?;
         let txn = wtxn();
         for (k, v) in [(Some(1), 10), (None, 20), (Some(1), 5), (None, 7)] {
             let k = k.map(Value::Int4).unwrap_or(Value::Null);
@@ -3660,11 +3660,11 @@ mod tests {
         // -0.0 groups with 0.0, and NaN groups with NaN — the hash and keys_equal
         // must agree on both. Two 0.0-family rows, two NaN rows.
         let engine = MemoryEngine::new();
-        let table = engine.create_table(TableSchema {
-            name: "f".into(),
-            namespace: "public".into(),
-            columns: vec![Column::new("x", PgType::Float8)],
-        })?;
+        let table = engine.create_table(TableSchema::in_namespace(
+            "f",
+            "public",
+            vec![Column::new("x", PgType::Float8)],
+        ))?;
         let txn = wtxn();
         for x in [0.0_f64, -0.0, f64::NAN, f64::NAN] {
             table.insert(vec![Value::Float8(x)], &txn);
@@ -3987,11 +3987,11 @@ mod tests {
     /// A `nums(n int4)` table seeded with 1, 2, 3.
     fn engine_with_nums() -> Arc<dyn TableEngine> {
         let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
-        let table = test_ok(engine.create_table(TableSchema {
-            name: "nums".into(),
-            namespace: "public".into(),
-            columns: vec![Column::new("n", PgType::Int4)],
-        }));
+        let table = test_ok(engine.create_table(TableSchema::in_namespace(
+            "nums",
+            "public",
+            vec![Column::new("n", PgType::Int4)],
+        )));
         let txn = wtxn();
         for n in [1, 2, 3] {
             table.insert(vec![Value::Int4(n)], &txn);

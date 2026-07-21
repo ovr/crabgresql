@@ -13,12 +13,15 @@ use crabgresql_binder::{
     output_columns_of, param_ctx_extended, param_ctx_none, param_types, require_all_resolved,
     substitute_params,
 };
-use crabgresql_executor::{DmlVerb, ExecNode, Execution, OutputColumn, Values, execute};
+use crabgresql_executor::{
+    DmlVerb, ExecContext, ExecNode, Execution, OutputColumn, Values, execute,
+};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, SequenceDefinition, StorageError,
-    TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
+    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
+    PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, SequenceDefinition,
+    StorageError, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -201,7 +204,15 @@ fn bind_catalogs(
                     let mut rels: Vec<_> = global
                         .relation_metadata()
                         .into_iter()
-                        .map(crabgresql_catalog::CatalogRelation::permanent_metadata)
+                        .map(|metadata| {
+                            let mut relation =
+                                crabgresql_catalog::CatalogRelation::permanent_metadata(metadata);
+                            // A partitioned parent reflects as relkind='p'.
+                            if relation.schema.partition_scheme.is_some() {
+                                relation.kind = crabgresql_catalog::RelKind::PartitionedTable;
+                            }
+                            relation
+                        })
                         .collect();
                     rels.extend(temp.relation_metadata().into_iter().map(|metadata| {
                         let mut relation = crabgresql_catalog::CatalogRelation::temporary(
@@ -1698,6 +1709,25 @@ fn execute_create_table(
             "CREATE TABLE ... ON COMMIT is not supported yet",
         ));
     }
+    // Table inheritance (`INHERITS (...)`) is a distinct feature from declarative
+    // partitioning and is not implemented; reject rather than silently ignore.
+    if create.inherits.is_some() {
+        return Err(PgError::feature_not_supported(
+            "CREATE TABLE ... INHERITS is not supported yet",
+        ));
+    }
+    // Declarative partitioning (initial slice: RANGE, DDL + catalog reflection).
+    // A partitioned parent or a leaf partition may not be TEMP in this slice.
+    if (create.partition_by.is_some() || create.partition_of.is_some()) && create.temporary {
+        return Err(PgError::feature_not_supported(
+            "temporary partitioned tables are not supported yet",
+        ));
+    }
+    // A leaf partition (`PARTITION OF parent`) inherits the parent's columns and
+    // is created as an ordinary heap table carrying its bound; handle it whole.
+    if let Some(parent) = &create.partition_of {
+        return execute_create_partition(engine, type_catalog, create, &namespace, &name, parent);
+    }
     #[derive(Clone)]
     struct PendingIndex {
         explicit_name: Option<String>,
@@ -1890,10 +1920,31 @@ fn execute_create_table(
         ));
     }
 
+    // A partitioned parent (`PARTITION BY ...`) carries a partition key and holds
+    // no rows of its own. This slice supports RANGE only, without keys/serial.
+    let partition_scheme = match create.partition_by.as_deref() {
+        Some(expr) => {
+            if !pending.is_empty() {
+                return Err(PgError::feature_not_supported(
+                    "primary key and unique constraints on partitioned tables are not supported yet",
+                ));
+            }
+            if !serial_defs.is_empty() {
+                return Err(PgError::feature_not_supported(
+                    "serial columns in partitioned tables are not supported yet",
+                ));
+            }
+            Some(build_partition_scheme(expr, &columns)?)
+        }
+        None => None,
+    };
+
     let schema = TableSchema {
         name: name.clone(),
         namespace: namespace.clone(),
         columns,
+        partition_scheme,
+        partition_of: None,
     };
     let mut indexes = Vec::new();
     for p in pending {
@@ -1970,6 +2021,294 @@ fn execute_create_table(
         }
     }
     Ok(QueryResult::command("CREATE TABLE"))
+}
+
+/// Decode a `PARTITION BY <strategy> (<cols>)` clause into a [`PartitionScheme`].
+/// The parser stores the clause as a function-call expression (`RANGE(d)`); this
+/// slice supports RANGE with a single simple-column key.
+fn build_partition_scheme(
+    expr: &ast::Expr,
+    columns: &[Column],
+) -> Result<PartitionScheme, PgError> {
+    let ast::Expr::Function(func) = expr else {
+        return Err(PgError::feature_not_supported(
+            "only PARTITION BY RANGE (column) is supported yet",
+        ));
+    };
+    let strategy = func
+        .name
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|i| i.value.to_uppercase());
+    match strategy.as_deref() {
+        Some("RANGE") => {}
+        Some("LIST") => {
+            return Err(PgError::feature_not_supported(
+                "LIST partitioning is not supported yet",
+            ));
+        }
+        Some("HASH") => {
+            return Err(PgError::feature_not_supported(
+                "HASH partitioning is not supported yet",
+            ));
+        }
+        _ => {
+            return Err(PgError::feature_not_supported(
+                "only PARTITION BY RANGE (column) is supported yet",
+            ));
+        }
+    }
+    let ast::FunctionArguments::List(list) = &func.args else {
+        return Err(PgError::syntax("PARTITION BY requires a column list"));
+    };
+    if list.args.len() != 1 {
+        return Err(PgError::feature_not_supported(
+            "multi-column partition keys are not supported yet",
+        ));
+    }
+    let key = match &list.args[0] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Identifier(ident))) => {
+            normalize_ident(ident)
+        }
+        _ => {
+            return Err(PgError::feature_not_supported(
+                "only simple-column partition keys are supported yet",
+            ));
+        }
+    };
+    let Some(idx) = columns.iter().position(|c| c.name == key) else {
+        return Err(PgError::new(
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column \"{key}\" named in partition key does not exist"),
+        ));
+    };
+    Ok(PartitionScheme {
+        strategy: PartitionStrategy::Range,
+        key_columns: vec![idx],
+    })
+}
+
+/// A single-dimension RANGE endpoint, ordered `NegInf < Finite(v) < PosInf`.
+enum Endpoint {
+    NegInf,
+    Finite(Value),
+    PosInf,
+}
+
+fn endpoint_cmp(a: &Endpoint, b: &Endpoint, ty: PgType) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Endpoint::NegInf, Endpoint::NegInf) | (Endpoint::PosInf, Endpoint::PosInf) => {
+            Ordering::Equal
+        }
+        (Endpoint::NegInf, _) | (_, Endpoint::PosInf) => Ordering::Less,
+        (Endpoint::PosInf, _) | (_, Endpoint::NegInf) => Ordering::Greater,
+        (Endpoint::Finite(x), Endpoint::Finite(y)) => {
+            crabgresql_executor::compare_values(ty, x, y)
+        }
+    }
+}
+
+/// Bind and const-fold a partition-bound expression against the key column's
+/// type, yielding the concrete [`Value`] used for ordering/overlap checks.
+/// Partition bounds must be constants, so binding happens in an empty scope
+/// (column references fail) and evaluation runs with no row.
+fn fold_bound_value(
+    expr: &ast::Expr,
+    key_col: &Column,
+    type_catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Value, PgError> {
+    let bound = crabgresql_binder::bind_column_default(expr, key_col, type_catalog)?;
+    Ok(crabgresql_executor::eval::eval(
+        &bound,
+        &[],
+        &ExecContext::default(),
+    )?)
+}
+
+/// Re-parse a stored bound literal (`expr.to_string()` text) back into an AST
+/// expression, for re-folding a sibling partition's persisted bound.
+fn parse_bound_expr(text: &str) -> Result<ast::Expr, PgError> {
+    let stmts = crabgresql_parser::parse(&format!("SELECT {text}"))
+        .map_err(|e| PgError::new("XX000", format!("stored partition bound is invalid: {e}")))?;
+    match stmts.as_slice() {
+        [ast::Statement::Query(query)] => match query.body.as_ref() {
+            ast::SetExpr::Select(select) => match select.projection.as_slice() {
+                [ast::SelectItem::UnnamedExpr(expr)] => Ok(expr.clone()),
+                _ => Err(PgError::new("XX000", "stored partition bound is invalid")),
+            },
+            _ => Err(PgError::new("XX000", "stored partition bound is invalid")),
+        },
+        _ => Err(PgError::new("XX000", "stored partition bound is invalid")),
+    }
+}
+
+/// Convert one incoming `FOR VALUES` datum into its storage form plus its
+/// ordered [`Endpoint`].
+fn incoming_endpoint(
+    value: &ast::PartitionBoundValue,
+    key_col: &Column,
+    type_catalog: &Arc<dyn TypeCatalog>,
+) -> Result<(PartitionBoundDatum, Endpoint), PgError> {
+    match value {
+        ast::PartitionBoundValue::MinValue => Ok((PartitionBoundDatum::MinValue, Endpoint::NegInf)),
+        ast::PartitionBoundValue::MaxValue => Ok((PartitionBoundDatum::MaxValue, Endpoint::PosInf)),
+        ast::PartitionBoundValue::Expr(expr) => {
+            let value = fold_bound_value(expr, key_col, type_catalog)?;
+            Ok((
+                PartitionBoundDatum::Value(expr.to_string()),
+                Endpoint::Finite(value),
+            ))
+        }
+    }
+}
+
+/// Recompute a persisted sibling datum's ordered [`Endpoint`] for overlap checks.
+fn stored_endpoint(
+    datum: &PartitionBoundDatum,
+    key_col: &Column,
+    type_catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Endpoint, PgError> {
+    match datum {
+        PartitionBoundDatum::MinValue => Ok(Endpoint::NegInf),
+        PartitionBoundDatum::MaxValue => Ok(Endpoint::PosInf),
+        PartitionBoundDatum::Value(text) => {
+            let expr = parse_bound_expr(text)?;
+            Ok(Endpoint::Finite(fold_bound_value(&expr, key_col, type_catalog)?))
+        }
+    }
+}
+
+/// `CREATE TABLE <child> PARTITION OF <parent> FOR VALUES FROM (...) TO (...)`:
+/// create a leaf partition as an ordinary heap table that inherits the parent's
+/// columns and records its bound. RANGE only; the bound is validated non-empty
+/// and non-overlapping with existing siblings.
+fn execute_create_partition(
+    engine: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    create: &ast::CreateTable,
+    namespace: &str,
+    name: &str,
+    parent_ref: &ast::ObjectName,
+) -> Result<QueryResult, PgError> {
+    // A partition inherits its shape from the parent: no redeclared columns,
+    // constraints, or sub-partitioning in this slice.
+    if !create.columns.is_empty() || !create.constraints.is_empty() {
+        return Err(PgError::feature_not_supported(
+            "column and constraint definitions on a partition are not supported yet",
+        ));
+    }
+    if create.partition_by.is_some() {
+        return Err(PgError::feature_not_supported(
+            "sub-partitioning is not supported yet",
+        ));
+    }
+    let (parent_qual, parent_name) = split_object_name(parent_ref, "relation")?;
+    let parent = engine
+        .resolve(parent_qual.as_deref(), &parent_name)
+        .map_err(|_| {
+            PgError::new(
+                sqlstate::UNDEFINED_TABLE,
+                format!("relation \"{parent_name}\" does not exist"),
+            )
+        })?;
+    let parent_schema = parent.schema();
+    let Some(scheme) = &parent_schema.partition_scheme else {
+        return Err(PgError::new(
+            sqlstate::WRONG_OBJECT_TYPE,
+            format!("\"{parent_name}\" is not partitioned"),
+        ));
+    };
+    // Only single-column RANGE keys exist so far.
+    if scheme.key_columns.len() != 1 {
+        return Err(PgError::feature_not_supported(
+            "multi-column partition keys are not supported yet",
+        ));
+    }
+    let key_col = &parent_schema.columns[scheme.key_columns[0]];
+    let Some(for_values) = &create.for_values else {
+        return Err(PgError::syntax("missing FOR VALUES for partition"));
+    };
+    let (from_spec, to_spec) = match for_values {
+        ast::ForValues::From { from, to } => (from, to),
+        ast::ForValues::In(_) => {
+            return Err(PgError::feature_not_supported(
+                "LIST partition bounds (FOR VALUES IN) are not supported yet",
+            ));
+        }
+        ast::ForValues::With { .. } => {
+            return Err(PgError::feature_not_supported(
+                "HASH partition bounds (FOR VALUES WITH) are not supported yet",
+            ));
+        }
+        ast::ForValues::Default => {
+            return Err(PgError::feature_not_supported(
+                "default partitions are not supported yet",
+            ));
+        }
+    };
+    if from_spec.len() != 1 || to_spec.len() != 1 {
+        return Err(PgError::new(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "FROM/TO must specify exactly one value per partition key column",
+        ));
+    }
+    let (from_datum, lower) = incoming_endpoint(&from_spec[0], key_col, type_catalog)?;
+    let (to_datum, upper) = incoming_endpoint(&to_spec[0], key_col, type_catalog)?;
+    // The bound must be non-empty: lower strictly below upper.
+    if endpoint_cmp(&lower, &upper, key_col.ty) != std::cmp::Ordering::Less {
+        return Err(PgError::new(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            format!("empty range bound specified for partition \"{name}\""),
+        ));
+    }
+    // Reject overlap with any existing sibling of the same parent. Two half-open
+    // ranges [lo, hi) overlap iff lo_a < hi_b && lo_b < hi_a.
+    for sibling in engine.relation_metadata() {
+        let Some(part) = &sibling.schema.partition_of else {
+            continue;
+        };
+        if part.parent_namespace != parent_schema.namespace
+            || part.parent_name != parent_schema.name
+        {
+            continue;
+        }
+        let sib_lo = stored_endpoint(&part.bound.from[0], key_col, type_catalog)?;
+        let sib_hi = stored_endpoint(&part.bound.to[0], key_col, type_catalog)?;
+        if endpoint_cmp(&lower, &sib_hi, key_col.ty) == std::cmp::Ordering::Less
+            && endpoint_cmp(&sib_lo, &upper, key_col.ty) == std::cmp::Ordering::Less
+        {
+            return Err(PgError::new(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                format!(
+                    "partition \"{name}\" would overlap partition \"{}\"",
+                    sibling.schema.name
+                ),
+            ));
+        }
+    }
+    let schema = TableSchema {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        columns: parent_schema.columns.clone(),
+        partition_scheme: None,
+        partition_of: Some(PartitionOf {
+            parent_namespace: parent_schema.namespace.clone(),
+            parent_name: parent_schema.name.clone(),
+            bound: PartitionBound {
+                from: vec![from_datum],
+                to: vec![to_datum],
+            },
+        }),
+    };
+    match engine.create_table(schema) {
+        Ok(_) => Ok(QueryResult::command("CREATE TABLE")),
+        Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {
+            Ok(QueryResult::command("CREATE TABLE"))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// `CREATE TABLE <name> [ (cols) ] AS <query>`: derive the new table's column
@@ -2070,6 +2409,8 @@ fn execute_create_table_as(
             .iter()
             .map(|c| Column::new(c.name.clone(), c.ty))
             .collect(),
+        partition_scheme: None,
+        partition_of: None,
     };
 
     // Create the table first so a name collision short-circuits before the query

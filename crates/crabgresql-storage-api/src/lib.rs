@@ -130,6 +130,50 @@ pub struct IndexMetadata {
     pub constraint: Option<IndexConstraint>,
 }
 
+/// The partitioning strategy of a partitioned (parent) table. Only `Range` is
+/// supported so far; `List`/`Hash` are rejected at DDL time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartitionStrategy {
+    Range,
+}
+
+/// The partition key of a partitioned (parent) table. A relation carrying a
+/// `PartitionScheme` is `relkind = 'p'` — metadata only, with no rows of its
+/// own (rows live in its leaf partitions).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionScheme {
+    pub strategy: PartitionStrategy,
+    /// Column positions (into [`TableSchema::columns`]) forming the key.
+    pub key_columns: Vec<usize>,
+}
+
+/// One datum of a RANGE partition bound. `MinValue`/`MaxValue` are the
+/// unbounded ends (`MINVALUE`/`MAXVALUE`); `Value` holds the canonical SQL text
+/// of a bound literal (rebound against the key column's type when compared).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PartitionBoundDatum {
+    Value(String),
+    MinValue,
+    MaxValue,
+}
+
+/// A RANGE partition bound: `FOR VALUES FROM (from...) TO (to...)`. `from` is
+/// inclusive, `to` is exclusive, each a tuple over the parent's key columns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionBound {
+    pub from: Vec<PartitionBoundDatum>,
+    pub to: Vec<PartitionBoundDatum>,
+}
+
+/// Set on a leaf partition (`relispartition = true`): which parent it belongs
+/// to and the bound that admits a row into it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionOf {
+    pub parent_namespace: String,
+    pub parent_name: String,
+    pub bound: PartitionBound,
+}
+
 /// A user relation together with its mutable index metadata.
 #[derive(Clone, Debug)]
 pub struct RelationMetadata {
@@ -146,6 +190,11 @@ pub struct TableSchema {
     /// error text and `pg_class.relname`).
     pub namespace: String,
     pub columns: Vec<Column>,
+    /// `Some` on a partitioned (parent) table: its partition key. Such a table
+    /// is `relkind = 'p'` and holds no rows of its own.
+    pub partition_scheme: Option<PartitionScheme>,
+    /// `Some` on a leaf partition: the parent it attaches to and its bound.
+    pub partition_of: Option<PartitionOf>,
 }
 
 impl TableSchema {
@@ -155,6 +204,8 @@ impl TableSchema {
             name: name.into(),
             namespace: "public".to_string(),
             columns,
+            partition_scheme: None,
+            partition_of: None,
         }
     }
 
@@ -168,6 +219,8 @@ impl TableSchema {
             name: name.into(),
             namespace: namespace.into(),
             columns,
+            partition_scheme: None,
+            partition_of: None,
         }
     }
 }

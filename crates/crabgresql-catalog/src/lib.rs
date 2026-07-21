@@ -102,6 +102,9 @@ pub fn is_builtin_type_name(name: &str) -> bool {
 pub enum RelKind {
     /// An ordinary table (`relkind = 'r'`, table_type `BASE TABLE`).
     Table,
+    /// A partitioned (parent) table (`relkind = 'p'`). Holds no rows of its own;
+    /// still `BASE TABLE` in `information_schema.tables`, as in PG.
+    PartitionedTable,
     /// A view (`relkind = 'v'`, table_type `VIEW`).
     View,
     /// A sequence (`relkind = 'S'`). Not a table, so it is omitted from
@@ -478,6 +481,14 @@ impl SystemCatalog {
                 schema::pg_index_rows(self.index_oids()),
             )),
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
+            "pg_inherits" => Some((
+                schema::pg_inherits_schema(),
+                schema::pg_inherits_rows(self.relation_oids()),
+            )),
+            "pg_partitioned_table" => Some((
+                schema::pg_partitioned_table_schema(),
+                schema::pg_partitioned_table_rows(self.relation_oids()),
+            )),
             "pg_sequence" => Some((
                 schema::pg_sequence_schema(),
                 schema::pg_sequence_rows(&self.sequence_entries()),
