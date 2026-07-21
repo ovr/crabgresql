@@ -40,6 +40,10 @@ pub struct ParamState {
     /// Whether `$n` placeholders are permitted at all. A simple-query bind sets
     /// this false, so any `$n` is PG's `42P02` "there is no parameter $n".
     allow: bool,
+    /// The highest valid parameter number, when the caller knows it up front
+    /// (a SQL function body has exactly `$1..$max` for its declared arguments).
+    /// `None` leaves the wire-protocol bound (`MAX_PARAMS`) as the only cap.
+    max: Option<usize>,
 }
 
 /// Upper bound on a parameter number `$n`. The Bind message carries the values
@@ -52,6 +56,15 @@ impl ParamState {
     /// simple query), this is PG's `42P02` "there is no parameter $n".
     fn reference(&mut self, n1: usize) -> Result<usize, BindError> {
         if !self.allow {
+            return Err(BindError::new(
+                "42P02",
+                format!("there is no parameter ${n1}"),
+            ));
+        }
+        // A caller that declared its parameters (a SQL function body) rejects any
+        // `$n` past the last argument here, at the reference site, so the error
+        // names the actual `n` — matching PG's "there is no parameter $n".
+        if self.max.is_some_and(|max| n1 > max) {
             return Err(BindError::new(
                 "42P02",
                 format!("there is no parameter ${n1}"),
@@ -102,6 +115,19 @@ pub fn param_ctx_extended(declared: Vec<Option<PgType>>) -> ParamCtx {
     std::rc::Rc::new(std::cell::RefCell::new(ParamState {
         types: declared,
         allow: true,
+        max: None,
+    }))
+}
+
+/// A parameter context for a SQL function body: `$1..$declared.len()` are the
+/// declared argument types, and any larger `$n` is PG's `42P02` "there is no
+/// parameter $n" reported at the reference site with the real `n`.
+pub fn param_ctx_capped(declared: Vec<Option<PgType>>) -> ParamCtx {
+    let max = Some(declared.len());
+    std::rc::Rc::new(std::cell::RefCell::new(ParamState {
+        types: declared,
+        allow: true,
+        max,
     }))
 }
 
@@ -111,6 +137,7 @@ pub fn param_ctx_none() -> ParamCtx {
     std::rc::Rc::new(std::cell::RefCell::new(ParamState {
         types: Vec::new(),
         allow: false,
+        max: None,
     }))
 }
 
@@ -459,6 +486,82 @@ impl BoundExpr {
             // propagates; a subquery's own body is a separate query and doesn't.
             BoundExpr::InSubquery { cmp, .. } => cmp.contains_aggregate(),
             BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => false,
+        }
+    }
+
+    /// Whether this expression contains a volatile function call. Today the only
+    /// volatile [`ScalarFn`]s are the sequence functions (`nextval`/`setval` have
+    /// side effects, `currval`/`lastval` read mutable session state) — all marked
+    /// `VOLATILE` by PostgreSQL. Any future volatile scalar function (e.g.
+    /// `random()`) must be added to the match here. Used to refuse duplicating a
+    /// volatile argument when inlining a SQL function body.
+    pub fn contains_volatile_fn(&self) -> bool {
+        match self {
+            BoundExpr::FuncCall { func, args, .. } => {
+                matches!(
+                    func,
+                    ScalarFn::Nextval | ScalarFn::Currval | ScalarFn::Setval | ScalarFn::Lastval
+                ) || args.iter().any(BoundExpr::contains_volatile_fn)
+            }
+            BoundExpr::Srf { args, .. } => args.iter().any(BoundExpr::contains_volatile_fn),
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.contains_volatile_fn(),
+            BoundExpr::Binary { left, right, .. } => {
+                left.contains_volatile_fn() || right.contains_volatile_fn()
+            }
+            BoundExpr::Case { whens, else_, .. } => {
+                whens
+                    .iter()
+                    .any(|(c, r)| c.contains_volatile_fn() || r.contains_volatile_fn())
+                    || else_.as_ref().is_some_and(|e| e.contains_volatile_fn())
+            }
+            BoundExpr::Aggregate { arg, .. } => {
+                arg.as_ref().is_some_and(|a| a.contains_volatile_fn())
+            }
+            // A subquery's own body runs as a separate plan; only the outer needle
+            // of an IN-subquery propagates to the enclosing expression.
+            BoundExpr::InSubquery { cmp, .. } => cmp.contains_volatile_fn(),
+            BoundExpr::Const { .. }
+            | BoundExpr::ColumnRef { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::Exists { .. } => false,
+        }
+    }
+
+    /// How many times a given `$n` ([`BoundExpr::Param`] with this 0-based
+    /// `index`) occurs in this expression tree. Used to decide whether inlining a
+    /// SQL function body would duplicate the evaluation of its `index`-th argument.
+    pub fn count_param_refs(&self, index: usize) -> usize {
+        match self {
+            BoundExpr::Param { index: i, .. } => usize::from(*i == index),
+            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } => 0,
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.count_param_refs(index),
+            BoundExpr::Binary { left, right, .. } => {
+                left.count_param_refs(index) + right.count_param_refs(index)
+            }
+            BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+                args.iter().map(|a| a.count_param_refs(index)).sum()
+            }
+            BoundExpr::Case { whens, else_, .. } => {
+                whens
+                    .iter()
+                    .map(|(c, r)| c.count_param_refs(index) + r.count_param_refs(index))
+                    .sum::<usize>()
+                    + else_.as_ref().map_or(0, |e| e.count_param_refs(index))
+            }
+            BoundExpr::Aggregate { arg, .. } => {
+                arg.as_ref().map_or(0, |a| a.count_param_refs(index))
+            }
+            BoundExpr::InSubquery { cmp, .. } => cmp.count_param_refs(index),
+            // A validated scalar body carries no subquery; its params (if any)
+            // live in a separate plan and are not this body's arguments.
+            BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => 0,
         }
     }
 
@@ -4324,28 +4427,23 @@ pub fn bind_sql_function_body(
         }
     };
 
-    let params = param_ctx_extended(arg_types.iter().copied().map(Some).collect());
+    // Seed `$1..$argcount` to the declared argument types; the capped context
+    // rejects any larger `$n` at its reference site, naming the actual `n`.
+    let params = param_ctx_capped(arg_types.iter().copied().map(Some).collect());
     let scope = Scope::empty(catalog, &params);
     let bound = bind_expr(expr, &scope)?;
-    // A `$n` past the declared argument list has no value to inline. The seeded
-    // slots stay at `arg_types.len()`; a longer vector means a larger `$n` was
-    // referenced (PG's "there is no parameter $n").
-    if param_types(&params).len() > arg_types.len() {
-        return Err(BindError::new(
-            "42P02",
-            format!("there is no parameter ${}", arg_types.len() + 1),
-        ));
-    }
     let bound = coerce_function_return(bound, return_type, catalog)?;
     if bound.contains_srf() {
         return Err(BindError::feature_not_supported(
             "set-returning functions are not supported in a SQL function body yet",
         ));
     }
+    // PG accepts a FROM-less aggregate (e.g. `SELECT sum(1)`) as a function body;
+    // this engine cannot yet inline one as a scalar, so it is a limitation, not
+    // an illegal construct — report it as unsupported rather than a grouping error.
     if bound.contains_aggregate() {
-        return Err(BindError::new(
-            sqlstate::GROUPING_ERROR,
-            "aggregate functions are not allowed in a scalar SQL function body",
+        return Err(BindError::feature_not_supported(
+            "aggregate functions in a SQL function body are not supported yet",
         ));
     }
     Ok(bound)

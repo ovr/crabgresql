@@ -3944,15 +3944,15 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
 
     let client = connect(spawn_server().await).await;
 
-    // A `$n` past the declared argument list has no value to bind.
+    // A `$n` past the declared argument list has no value to bind, and the error
+    // names the parameter actually referenced (not argcount+1).
     let err = client
-        .simple_query("CREATE FUNCTION bad(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + $2 $$")
+        .simple_query("CREATE FUNCTION bad(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + $9 $$")
         .await
         .unwrap_err();
-    assert_eq!(
-        err.as_db_error().expect("database error").code(),
-        &SqlState::UNDEFINED_PARAMETER
-    );
+    let dberr = err.as_db_error().expect("database error");
+    assert_eq!(dberr.code(), &SqlState::UNDEFINED_PARAMETER);
+    assert_eq!(dberr.message(), "there is no parameter $9");
 
     // A body whose type is not assignable to the declared return type.
     let err = client
@@ -4006,6 +4006,74 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_FUNCTION
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_function_language_sql_resolution_and_volatility_match_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE SEQUENCE s").await?;
+
+    // A volatile argument (nextval) referenced more than once in the body would be
+    // evaluated once per occurrence if inlined; refuse it rather than diverge from
+    // PostgreSQL (which evaluates each argument once).
+    client
+        .simple_query(
+            "CREATE FUNCTION twice(bigint) RETURNS bigint LANGUAGE SQL AS $$ SELECT $1 + $1 $$",
+        )
+        .await?;
+    let err = client
+        .simple_query("SELECT twice(nextval('s'))")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+    // A non-volatile argument used twice is fine (double work, same result), and a
+    // volatile argument referenced once is fine (evaluated once).
+    let out = client.simple_query("SELECT twice(21)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("42"));
+    client
+        .simple_query(
+            "CREATE FUNCTION once(bigint) RETURNS bigint LANGUAGE SQL AS $$ SELECT $1 + 1 $$",
+        )
+        .await?;
+    let out = client.simple_query("SELECT once(nextval('s'))").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("2")); // nextval->1, +1 = 2 (advanced once)
+
+    // Overloading: an exact match resolves; two equally-coercible overloads are
+    // ambiguous (42725), as in PostgreSQL.
+    client
+        .simple_query("CREATE FUNCTION g(bigint) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$")
+        .await?;
+    client
+        .simple_query("CREATE FUNCTION g(numeric) RETURNS int LANGUAGE SQL AS $$ SELECT 2 $$")
+        .await?;
+    let out = client.simple_query("SELECT g(1::bigint)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("1")); // exact bigint overload
+    let err = client.simple_query("SELECT g(1::int)").await.unwrap_err();
+    let dberr = err.as_db_error().expect("database error");
+    assert_eq!(dberr.code(), &SqlState::AMBIGUOUS_FUNCTION);
+    assert_eq!(dberr.message(), "function g(integer) is not unique");
+    assert_eq!(
+        dberr.hint(),
+        Some("You might need to add explicit type casts.")
+    );
+
+    // An aggregate body is a scalar-inlining limitation, reported as unsupported
+    // (PostgreSQL accepts `SELECT sum(1)`), not a grouping error.
+    let err = client
+        .simple_query("CREATE FUNCTION agg() RETURNS bigint LANGUAGE SQL AS $$ SELECT sum(1) $$")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
     );
 
     Ok(())
