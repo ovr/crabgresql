@@ -153,7 +153,9 @@ pub struct Session {
 }
 
 /// A session's `currval`/`lastval` state. `nextval`/`setval` write it; `currval`/
-/// `lastval` read it. Keyed by the (short) sequence name.
+/// `lastval` read it. Keyed by the canonical qualified name `"namespace.name"`
+/// (namespace resolved to `public` when the reference was unqualified) so
+/// `currval('s')` and `currval('app.s')` never collide.
 #[derive(Default)]
 pub struct SessionSeqState {
     currval: HashMap<String, i64>,
@@ -184,19 +186,44 @@ impl SessionSequences {
         }
     }
 
+    /// Resolve the reference's schema: the written qualifier, or `public` when
+    /// unqualified (a real search_path is a follow-up).
+    fn resolve_ns(namespace: Option<&str>) -> &str {
+        namespace.unwrap_or("public")
+    }
+
+    /// The name as the caller wrote it (`app.s` when qualified, else `s`), for
+    /// error text that quotes the reference.
+    fn display(namespace: Option<&str>, name: &str) -> String {
+        match namespace {
+            Some(ns) => format!("{ns}.{name}"),
+            None => name.to_string(),
+        }
+    }
+
+    /// Canonical `currval`/`lastval` state key: the namespace resolved to `public`
+    /// when unqualified, so `s` and `public.s` share one entry.
+    fn state_key(namespace: Option<&str>, name: &str) -> String {
+        format!("{}.{}", Self::resolve_ns(namespace), name)
+    }
+
     /// The engine's `NotFound` maps to PG's 42P01 for a truly absent name, but to
     /// 42809 `"x" is not a sequence` when the name is a live table or view — PG
     /// opens the relation and rejects the wrong relkind.
-    fn not_found(&self, name: &str) -> ExecError {
-        if self.engine.open_table(name).is_ok() || self.engine.resolve_view(None, name).is_some() {
+    fn not_found(&self, namespace: Option<&str>, name: &str) -> ExecError {
+        let ns = Self::resolve_ns(namespace);
+        let display = Self::display(namespace, name);
+        if self.engine.resolve(Some(ns), name).is_ok()
+            || self.engine.resolve_view(Some(ns), name).is_some()
+        {
             ExecError::new(
                 sqlstate::WRONG_OBJECT_TYPE,
-                format!("\"{name}\" is not a sequence"),
+                format!("\"{display}\" is not a sequence"),
             )
         } else {
             ExecError::new(
                 sqlstate::UNDEFINED_TABLE,
-                format!("relation \"{name}\" does not exist"),
+                format!("relation \"{display}\" does not exist"),
             )
         }
     }
@@ -211,8 +238,10 @@ impl SessionSequences {
 
     /// Build the 2200H message for a `NO CYCLE` bound, quoting the bound value as
     /// PostgreSQL does.
-    fn limit_error(&self, name: &str, ascending: bool) -> ExecError {
-        let bound = self.engine.sequence(name).map(|def| {
+    fn limit_error(&self, namespace: Option<&str>, name: &str, ascending: bool) -> ExecError {
+        let ns = Self::resolve_ns(namespace);
+        let display = Self::display(namespace, name);
+        let bound = self.engine.sequence(ns, name).map(|def| {
             if ascending {
                 def.max
             } else {
@@ -226,72 +255,86 @@ impl SessionSequences {
         };
         ExecError::new(
             sqlstate::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
-            format!("nextval: reached {edge} value of sequence \"{name}\" ({value})"),
+            format!("nextval: reached {edge} value of sequence \"{display}\" ({value})"),
         )
     }
 }
 
 impl SequenceOps for SessionSequences {
-    fn nextval(&self, name: &str) -> Result<i64, ExecError> {
+    fn nextval(&self, namespace: Option<&str>, name: &str) -> Result<i64, ExecError> {
         if self.read_only {
             return Err(Self::read_only_error("nextval"));
         }
-        match self.engine.sequence_nextval(name) {
+        let ns = Self::resolve_ns(namespace);
+        match self.engine.sequence_nextval(ns, name) {
             SequenceAdvance::Value(v) => {
                 let mut state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
-                state.currval.insert(name.to_string(), v);
+                state.currval.insert(Self::state_key(namespace, name), v);
                 state.lastval = Some(v);
                 Ok(v)
             }
-            SequenceAdvance::NotFound => Err(self.not_found(name)),
-            SequenceAdvance::Overflow => Err(self.limit_error(name, true)),
-            SequenceAdvance::Underflow => Err(self.limit_error(name, false)),
+            SequenceAdvance::NotFound => Err(self.not_found(namespace, name)),
+            SequenceAdvance::Overflow => Err(self.limit_error(namespace, name, true)),
+            SequenceAdvance::Underflow => Err(self.limit_error(namespace, name, false)),
         }
     }
 
-    fn currval(&self, name: &str) -> Result<i64, ExecError> {
+    fn currval(&self, namespace: Option<&str>, name: &str) -> Result<i64, ExecError> {
         // The sequence must still exist — PG opens the relation — so a dropped
         // one is 42P01 (or 42809 for a wrong relkind) even if this session
         // advanced it earlier; only then is the session's cached value consulted.
-        if self.engine.sequence(name).is_none() {
-            return Err(self.not_found(name));
+        let ns = Self::resolve_ns(namespace);
+        if self.engine.sequence(ns, name).is_none() {
+            return Err(self.not_found(namespace, name));
         }
         let state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
-        match state.currval.get(name) {
+        match state.currval.get(&Self::state_key(namespace, name)) {
             Some(v) => Ok(*v),
             None => Err(ExecError::new(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                format!("currval of sequence \"{name}\" is not yet defined in this session"),
+                format!(
+                    "currval of sequence \"{}\" is not yet defined in this session",
+                    Self::display(namespace, name)
+                ),
             )),
         }
     }
 
-    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, ExecError> {
+    fn setval(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, ExecError> {
         if self.read_only {
             return Err(Self::read_only_error("setval"));
         }
-        let Some(def) = self.engine.sequence(name) else {
-            return Err(self.not_found(name));
+        let ns = Self::resolve_ns(namespace);
+        let Some(def) = self.engine.sequence(ns, name) else {
+            return Err(self.not_found(namespace, name));
         };
         if value < def.min || value > def.max {
             return Err(ExecError::new(
                 sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
                 format!(
-                    "setval: value {value} is out of bounds for sequence \"{name}\" ({}..{})",
-                    def.min, def.max
+                    "setval: value {value} is out of bounds for sequence \"{}\" ({}..{})",
+                    Self::display(namespace, name),
+                    def.min,
+                    def.max
                 ),
             ));
         }
-        match self.engine.sequence_setval(name, value, is_called) {
+        match self.engine.sequence_setval(ns, name, value, is_called) {
             SequenceAdvance::Value(v) => {
                 let mut state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
-                state.currval.insert(name.to_string(), v);
+                state.currval.insert(Self::state_key(namespace, name), v);
                 // setval does NOT define lastval: PG's lastval reflects only the
                 // most recent nextval in the session.
                 Ok(v)
             }
             // Concurrently dropped between the existence check and the write.
-            _ => Err(self.not_found(name)),
+            _ => Err(self.not_found(namespace, name)),
         }
     }
 

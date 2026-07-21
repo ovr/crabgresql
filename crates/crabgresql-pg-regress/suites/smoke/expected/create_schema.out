@@ -1,0 +1,31 @@
+--
+-- CREATE SCHEMA
+-- CREATE SCHEMA registers a namespace visible in pg_namespace and
+-- information_schema.schemata. A duplicate without IF NOT EXISTS errors (42P06);
+-- with IF NOT EXISTS it is a skip NOTICE. A pg_-prefixed name is reserved
+-- (42939). Output hand-checked against PostgreSQL (psql -a -q).
+--
+CREATE SCHEMA app;
+-- It shows up as a namespace, owned like any user object.
+SELECT nspname FROM pg_namespace WHERE nspname = 'app';
+ nspname 
+---------
+ app
+(1 row)
+
+SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'app';
+ schema_name 
+-------------
+ app
+(1 row)
+
+-- A duplicate errors; IF NOT EXISTS downgrades it to a skip NOTICE.
+CREATE SCHEMA app;
+ERROR:  schema "app" already exists
+CREATE SCHEMA IF NOT EXISTS app;
+NOTICE:  schema "app" already exists, skipping
+-- The pg_ prefix is reserved for system schemas.
+CREATE SCHEMA pg_stuff;
+ERROR:  unacceptable schema name "pg_stuff"
+DETAIL:  The prefix "pg_" is reserved for system schemas.
+DROP SCHEMA app;

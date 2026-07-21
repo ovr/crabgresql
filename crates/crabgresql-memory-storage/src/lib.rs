@@ -9,8 +9,8 @@
 //! Versions sit behind an `Arc` snapshot cell: a scan grabs the `Arc` in O(1)
 //! and iterates a stable view while writers copy-on-write.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
@@ -27,11 +27,35 @@ struct MemorySequence {
     is_called: bool,
 }
 
-#[derive(Default)]
+/// PostgreSQL's `FIRST_NORMAL_OBJECT_ID`: the first OID handed out for
+/// user-created objects (here, `CREATE SCHEMA` namespaces).
+const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+
+/// A relation's key: `(namespace, name)`. Unqualified relations live in
+/// `public`; a schema-qualified `CREATE` places them in a user namespace.
+type RelKey = (String, String);
+
 pub struct MemoryEngine {
-    tables: RwLock<HashMap<String, Arc<MemoryTable>>>,
-    views: RwLock<HashMap<String, ViewDefinition>>,
-    sequences: RwLock<HashMap<String, RwLock<MemorySequence>>>,
+    tables: RwLock<HashMap<RelKey, Arc<MemoryTable>>>,
+    views: RwLock<HashMap<RelKey, ViewDefinition>>,
+    sequences: RwLock<HashMap<RelKey, RwLock<MemorySequence>>>,
+    /// User-created schemas (`CREATE SCHEMA`), name → OID. Built-in namespaces
+    /// (`public`, `pg_catalog`, `information_schema`, …) are not tracked here.
+    schemas: RwLock<BTreeMap<String, u32>>,
+    /// Next OID for a `CREATE SCHEMA`. Monotonic — never reused after a drop.
+    next_nsp_oid: AtomicU32,
+}
+
+impl Default for MemoryEngine {
+    fn default() -> Self {
+        MemoryEngine {
+            tables: RwLock::new(HashMap::new()),
+            views: RwLock::new(HashMap::new()),
+            sequences: RwLock::new(HashMap::new()),
+            schemas: RwLock::new(BTreeMap::new()),
+            next_nsp_oid: AtomicU32::new(FIRST_NORMAL_OBJECT_ID),
+        }
+    }
 }
 
 impl MemoryEngine {
@@ -39,59 +63,73 @@ impl MemoryEngine {
         Self::default()
     }
 
-    /// Whether `name` already names a table, index, view or sequence — the shared
-    /// PostgreSQL relation namespace.
-    fn relation_name_taken(&self, name: &str) -> bool {
+    /// Whether `name` already names a table, index, view or sequence in
+    /// `namespace` — the shared PostgreSQL relation namespace, scoped per schema.
+    fn relation_name_taken(&self, namespace: &str, name: &str) -> bool {
+        let key = (namespace.to_string(), name.to_string());
         let tables = self
             .tables
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        tables.contains_key(name)
-            || tables.values().any(|t| {
-                t.indexes
-                    .read()
-                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                    .iter()
-                    .any(|i| i.name == name)
-            })
+        tables.contains_key(&key)
+            || tables
+                .iter()
+                .filter(|((ns, _), _)| ns == namespace)
+                .any(|(_, t)| {
+                    t.indexes
+                        .read()
+                        .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                        .iter()
+                        .any(|i| i.name == name)
+                })
             || self
                 .views
                 .read()
                 .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .contains_key(name)
+                .contains_key(&key)
             || self
                 .sequences
                 .read()
                 .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .contains_key(name)
+                .contains_key(&key)
     }
 }
 
 impl TableEngine for MemoryEngine {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
+        let namespace = schema.namespace.clone();
+        let key = (namespace.clone(), schema.name.clone());
+        // Hold the `tables` write lock across the collision check AND the insert,
+        // so two concurrent CREATE TABLE of the same (namespace, name) can't both
+        // pass the check and race to insert. The check is inlined here (rather
+        // than via `relation_name_taken`, which takes its own `tables` read lock
+        // and would deadlock under this write lock).
         let mut tables = self
             .tables
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        if tables.contains_key(&schema.name)
+        let taken = tables.contains_key(&key)
+            || tables
+                .iter()
+                .filter(|((ns, _), _)| *ns == namespace)
+                .any(|(_, t)| {
+                    t.indexes
+                        .read()
+                        .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                        .iter()
+                        .any(|i| i.name == schema.name)
+                })
             || self
                 .views
                 .read()
                 .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .contains_key(&schema.name)
+                .contains_key(&key)
             || self
                 .sequences
                 .read()
                 .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .contains_key(&schema.name)
-            || tables.values().any(|t| {
-                t.indexes
-                    .read()
-                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                    .iter()
-                    .any(|i| i.name == schema.name)
-            })
-        {
+                .contains_key(&key);
+        if taken {
             return Err(StorageError::TableAlreadyExists(schema.name));
         }
         let table = Arc::new(MemoryTable {
@@ -101,84 +139,102 @@ impl TableEngine for MemoryEngine {
             indexes: RwLock::new(Vec::new()),
             phys: RwLock::new(Vec::new()),
         });
-        tables.insert(schema.name, table.clone());
+        tables.insert(key, table.clone());
         Ok(table)
     }
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
-        let tables = self
-            .tables
+        self.resolve(Some("public"), name)
+    }
+
+    fn resolve(&self, schema: Option<&str>, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
+        let namespace = schema.unwrap_or("public");
+        let key = (namespace.to_string(), name.to_string());
+        self.tables
             .read()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        tables
-            .get(name)
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .get(&key)
             .cloned()
             .map(|t| t as Arc<dyn TableAm>)
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
 
-    fn drop_table(&self, name: &str) -> Result<(), StorageError> {
-        let mut tables = self
-            .tables
+    fn drop_table(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+        let key = (namespace.to_string(), name.to_string());
+        self.tables
             .write()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        tables
-            .remove(name)
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .remove(&key)
             .map(|_| ())
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
 
-    fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {
-        // A view shares PostgreSQL's relation namespace with tables and indexes,
-        // so a collision with any of them is `relation "x" already exists`.
-        let tables = self
-            .tables
-            .read()
+    fn create_schema(&self, name: &str) -> Result<u32, StorageError> {
+        let mut schemas = self
+            .schemas
+            .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        if tables.contains_key(&def.name)
-            || self
-                .sequences
-                .read()
-                .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .contains_key(&def.name)
-            || tables.values().any(|t| {
-                t.indexes
-                    .read()
-                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                    .iter()
-                    .any(|i| i.name == def.name)
-            })
-        {
+        if schemas.contains_key(name) {
+            return Err(StorageError::SchemaAlreadyExists(name.to_string()));
+        }
+        let oid = self.next_nsp_oid.fetch_add(1, Ordering::Relaxed);
+        schemas.insert(name.to_string(), oid);
+        Ok(oid)
+    }
+
+    fn drop_schema(&self, name: &str) -> Result<(), StorageError> {
+        self.schemas
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| StorageError::SchemaNotFound(name.to_string()))
+    }
+
+    fn schemas(&self) -> Vec<(String, u32)> {
+        self.schemas
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .iter()
+            .map(|(name, oid)| (name.clone(), *oid))
+            .collect()
+    }
+
+    fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {
+        // A view shares PostgreSQL's relation namespace with tables, indexes and
+        // sequences (per schema), so a collision with any is `relation "x"
+        // already exists`.
+        if self.relation_name_taken(&def.namespace, &def.name) {
             return Err(StorageError::TableAlreadyExists(def.name));
         }
-        drop(tables);
+        let key = (def.namespace.clone(), def.name.clone());
         let mut views = self
             .views
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         // A plain insert would silently replace; `CREATE OR REPLACE` is handled by
         // the server dropping first, so an existing name here is a real conflict.
-        if views.contains_key(&def.name) {
+        if views.contains_key(&key) {
             return Err(StorageError::TableAlreadyExists(def.name));
         }
-        views.insert(def.name.clone(), def);
+        views.insert(key, def);
         Ok(())
     }
 
-    fn resolve_view(&self, _schema: Option<&str>, name: &str) -> Option<ViewDefinition> {
-        // The session overlay has already resolved the namespace; look up by name.
+    fn resolve_view(&self, schema: Option<&str>, name: &str) -> Option<ViewDefinition> {
+        let namespace = schema.unwrap_or("public");
         self.views
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .get(name)
+            .get(&(namespace.to_string(), name.to_string()))
             .cloned()
     }
 
-    fn drop_view(&self, name: &str) -> Result<(), StorageError> {
+    fn drop_view(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
         self.views
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .remove(name)
+            .remove(&(namespace.to_string(), name.to_string()))
             .map(|_| ())
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
@@ -194,18 +250,19 @@ impl TableEngine for MemoryEngine {
 
     fn create_sequence(&self, def: SequenceDefinition) -> Result<(), StorageError> {
         // Sequences share the relation namespace with tables, views and indexes.
-        if self.relation_name_taken(&def.name) {
+        if self.relation_name_taken(&def.namespace, &def.name) {
             return Err(StorageError::TableAlreadyExists(def.name));
         }
+        let key = (def.namespace.clone(), def.name.clone());
         let mut sequences = self
             .sequences
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        if sequences.contains_key(&def.name) {
+        if sequences.contains_key(&key) {
             return Err(StorageError::TableAlreadyExists(def.name));
         }
         sequences.insert(
-            def.name.clone(),
+            key,
             RwLock::new(MemorySequence {
                 // Seed the counter at `start`; the first `nextval` returns it.
                 last_value: def.start,
@@ -216,20 +273,20 @@ impl TableEngine for MemoryEngine {
         Ok(())
     }
 
-    fn drop_sequence(&self, name: &str) -> Result<(), StorageError> {
+    fn drop_sequence(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
         self.sequences
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .remove(name)
+            .remove(&(namespace.to_string(), name.to_string()))
             .map(|_| ())
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
 
-    fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
+    fn sequence(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
         self.sequences
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .get(name)
+            .get(&(namespace.to_string(), name.to_string()))
             .map(|s| {
                 s.read()
                     .unwrap_or_else(|_| panic!("rwlock poisoned"))
@@ -252,12 +309,12 @@ impl TableEngine for MemoryEngine {
             .collect()
     }
 
-    fn sequence_nextval(&self, name: &str) -> SequenceAdvance {
+    fn sequence_nextval(&self, namespace: &str, name: &str) -> SequenceAdvance {
         let sequences = self
             .sequences
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let Some(seq) = sequences.get(name) else {
+        let Some(seq) = sequences.get(&(namespace.to_string(), name.to_string())) else {
             return SequenceAdvance::NotFound;
         };
         let mut seq = seq.write().unwrap_or_else(|_| panic!("rwlock poisoned"));
@@ -271,12 +328,18 @@ impl TableEngine for MemoryEngine {
         }
     }
 
-    fn sequence_setval(&self, name: &str, value: i64, is_called: bool) -> SequenceAdvance {
+    fn sequence_setval(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: i64,
+        is_called: bool,
+    ) -> SequenceAdvance {
         let sequences = self
             .sequences
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let Some(seq) = sequences.get(name) else {
+        let Some(seq) = sequences.get(&(namespace.to_string(), name.to_string())) else {
             return SequenceAdvance::NotFound;
         };
         let mut seq = seq.write().unwrap_or_else(|_| panic!("rwlock poisoned"));
@@ -285,34 +348,21 @@ impl TableEngine for MemoryEngine {
         SequenceAdvance::Value(value)
     }
 
-    fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
+    fn create_index(
+        &self,
+        namespace: &str,
+        table: &str,
+        index: IndexMetadata,
+    ) -> Result<(), StorageError> {
+        if self.relation_name_taken(namespace, &index.name) {
+            return Err(StorageError::RelationAlreadyExists(index.name));
+        }
         let tables = self
             .tables
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        if tables.contains_key(&index.name)
-            || self
-                .views
-                .read()
-                .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .contains_key(&index.name)
-            || self
-                .sequences
-                .read()
-                .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .contains_key(&index.name)
-            || tables.values().any(|t| {
-                t.indexes
-                    .read()
-                    .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                    .iter()
-                    .any(|i| i.name == index.name)
-            })
-        {
-            return Err(StorageError::RelationAlreadyExists(index.name));
-        }
         let target = tables
-            .get(table)
+            .get(&(namespace.to_string(), table.to_string()))
             .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
 
         // Build the physical equality index up front by scanning every version
@@ -837,6 +887,7 @@ mod tests {
     fn schema(name: &str) -> TableSchema {
         TableSchema {
             name: name.to_string(),
+            namespace: "public".to_string(),
             columns: vec![
                 Column::new("id", PgType::Int4),
                 Column::new("name", PgType::Text),
@@ -1118,7 +1169,7 @@ mod tests {
     fn drop_table_removes_it_and_allows_recreate() -> anyhow::Result<()> {
         let engine = MemoryEngine::new();
         engine.create_table(schema("t"))?;
-        engine.drop_table("t")?;
+        engine.drop_table("public", "t")?;
         // Gone after drop.
         assert!(matches!(
             engine.open_table("t"),
@@ -1135,7 +1186,7 @@ mod tests {
     fn drop_missing_table_fails() {
         let engine = MemoryEngine::new();
         assert!(matches!(
-            engine.drop_table("nope"),
+            engine.drop_table("public", "nope"),
             Err(StorageError::TableNotFound(_))
         ));
     }
@@ -1286,7 +1337,7 @@ mod tests {
         let table = engine.create_table(schema("t"))?;
         // A row inserted before CREATE INDEX must be indexed by the build scan.
         insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("a".into())]);
-        engine.create_index("t", unique_index("t_id_key", 0))?;
+        engine.create_index("public", "t", unique_index("t_id_key", 0))?;
         // ...and a row inserted after must be indexed by insert maintenance.
         insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Text("b".into())]);
 
@@ -1311,7 +1362,7 @@ mod tests {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t"))?;
-        engine.create_index("t", unique_index("t_id_key", 0))?;
+        engine.create_index("public", "t", unique_index("t_id_key", 0))?;
         let tid = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("a".into())]);
 
         // Move the key from 1 to 5.
@@ -1354,7 +1405,7 @@ mod tests {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t"))?;
-        engine.create_index("t", unique_index("t_id_key", 0))?;
+        engine.create_index("public", "t", unique_index("t_id_key", 0))?;
         // Unknown index name → unservable, caller falls back to a scan.
         assert!(probe_ids(&engine, &tm, "no_such_index", Value::Int4(1)).is_none());
         assert!(!table.supports_index_scan("no_such_index"));
@@ -1366,9 +1417,10 @@ mod tests {
         // false, so the planner won't route an index scan to it.
         let ft = engine.create_table(TableSchema {
             name: "f".into(),
+            namespace: "public".into(),
             columns: vec![Column::new("x", PgType::Float8)],
         })?;
-        engine.create_index("f", unique_index("f_x_key", 0))?;
+        engine.create_index("public", "f", unique_index("f_x_key", 0))?;
         assert!(!ft.supports_index_scan("f_x_key"));
         assert!(
             ft.index_lookup("f_x_key", &[Value::Float8(1.0)], &read(&tm))
@@ -1382,7 +1434,7 @@ mod tests {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t"))?;
-        engine.create_index("t", unique_index("t_id_key", 0))?;
+        engine.create_index("public", "t", unique_index("t_id_key", 0))?;
         let mut tid = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("v0".into())]);
         // Update the same key several times; each update appends a new tid under
         // the key and leaves the old (now dead) version behind.

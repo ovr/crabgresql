@@ -137,10 +137,11 @@ pub struct CatalogRelation {
 
 impl CatalogRelation {
     pub fn permanent(schema: TableSchema) -> Self {
+        let namespace = schema.namespace.clone();
         Self {
             schema,
             indexes: Vec::new(),
-            namespace: "public".to_string(),
+            namespace,
             temporary: false,
             kind: RelKind::Table,
             sequence: None,
@@ -148,10 +149,11 @@ impl CatalogRelation {
     }
 
     pub fn permanent_metadata(metadata: RelationMetadata) -> Self {
+        let namespace = metadata.schema.namespace.clone();
         Self {
             schema: metadata.schema,
             indexes: metadata.indexes,
-            namespace: "public".to_string(),
+            namespace,
             temporary: false,
             kind: RelKind::Table,
             sequence: None,
@@ -169,33 +171,41 @@ impl CatalogRelation {
         }
     }
 
-    /// A permanent view. Views have no indexes and live in `public`.
+    /// A permanent view. Views have no indexes; its namespace rides on `schema`.
     pub fn view(schema: TableSchema) -> Self {
+        let namespace = schema.namespace.clone();
         Self {
             schema,
             indexes: Vec::new(),
-            namespace: "public".to_string(),
+            namespace,
             temporary: false,
             kind: RelKind::View,
             sequence: None,
         }
     }
 
-    /// A permanent sequence. Its `pg_class` shape is PG's three sequence columns
-    /// (`last_value`, `log_cnt`, `is_called`); `params` feeds `pg_sequence`.
-    pub fn sequence(name: impl Into<String>, params: CatalogSequence) -> Self {
-        let schema = TableSchema {
-            name: name.into(),
-            columns: vec![
+    /// A permanent sequence in `namespace`. Its `pg_class` shape is PG's three
+    /// sequence columns (`last_value`, `log_cnt`, `is_called`); `params` feeds
+    /// `pg_sequence`.
+    pub fn sequence(
+        name: impl Into<String>,
+        namespace: impl Into<String>,
+        params: CatalogSequence,
+    ) -> Self {
+        let namespace = namespace.into();
+        let schema = TableSchema::in_namespace(
+            name,
+            namespace.clone(),
+            vec![
                 Column::new("last_value", PgType::Int8),
                 Column::new("log_cnt", PgType::Int8),
                 Column::new("is_called", PgType::Bool),
             ],
-        };
+        );
         Self {
             schema,
             indexes: Vec::new(),
-            namespace: "public".to_string(),
+            namespace,
             temporary: false,
             kind: RelKind::Sequence,
             sequence: Some(params),
@@ -223,6 +233,11 @@ type RelationsFn = Box<dyn Fn() -> Vec<CatalogRelation> + Send + Sync>;
 /// lazy like [`RelationsFn`] — only a query that opens `pg_type`/`pg_enum` pays.
 type UserTypesFn = Box<dyn Fn() -> Vec<CatalogUserType> + Send + Sync>;
 
+/// Produces the user-created schemas (`CREATE SCHEMA`) as `(name, oid)`, to
+/// reflect into `pg_namespace` and `information_schema.schemata`. Boxed and lazy
+/// like [`RelationsFn`].
+type SchemasFn = Box<dyn Fn() -> Vec<(String, u32)> + Send + Sync>;
+
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so
 /// its rows reflect current server state; live user relations are supplied by a
 /// closure that is invoked at most once (and only when `pg_class`/`pg_attribute`
@@ -230,6 +245,7 @@ type UserTypesFn = Box<dyn Fn() -> Vec<CatalogUserType> + Send + Sync>;
 pub struct SystemCatalog {
     relations: RelationsFn,
     user_types_fn: UserTypesFn,
+    schemas_fn: SchemasFn,
     database: String,
     owner: String,
     live_relations: OnceLock<Vec<CatalogRelation>>,
@@ -237,6 +253,7 @@ pub struct SystemCatalog {
     kinds: OnceLock<Vec<RelKind>>,
     index_oids: OnceLock<Vec<CatalogIndex>>,
     user_types: OnceLock<Vec<CatalogUserType>>,
+    user_schemas: OnceLock<Vec<(String, u32)>>,
 }
 
 impl Default for SystemCatalog {
@@ -275,6 +292,7 @@ impl SystemCatalog {
         Self {
             relations: Box::new(f),
             user_types_fn: Box::new(Vec::new),
+            schemas_fn: Box::new(Vec::new),
             database: database.into(),
             owner: owner.into(),
             live_relations: OnceLock::new(),
@@ -282,6 +300,7 @@ impl SystemCatalog {
             kinds: OnceLock::new(),
             index_oids: OnceLock::new(),
             user_types: OnceLock::new(),
+            user_schemas: OnceLock::new(),
         }
     }
 
@@ -295,12 +314,41 @@ impl SystemCatalog {
         self
     }
 
+    /// Attach a provider of user-created schemas to reflect into `pg_namespace`
+    /// and `information_schema.schemata` (invoked at most once, only if one of
+    /// those relations is opened).
+    pub fn with_schemas_fn(
+        mut self,
+        f: impl Fn() -> Vec<(String, u32)> + Send + Sync + 'static,
+    ) -> Self {
+        self.schemas_fn = Box::new(f);
+        self
+    }
+
     fn live_relations(&self) -> &[CatalogRelation] {
         self.live_relations.get_or_init(|| (self.relations)())
     }
 
     fn user_types(&self) -> &[CatalogUserType] {
         self.user_types.get_or_init(|| (self.user_types_fn)())
+    }
+
+    fn user_schemas(&self) -> &[(String, u32)] {
+        self.user_schemas.get_or_init(|| (self.schemas_fn)())
+    }
+
+    /// Map every namespace name to its OID: the built-in namespaces plus each
+    /// user-created schema. Feeds `pg_class.relnamespace` /
+    /// `pg_constraint.connamespace`.
+    fn namespace_oids(&self) -> std::collections::HashMap<String, u32> {
+        let mut map = std::collections::HashMap::new();
+        map.insert("pg_catalog".to_string(), 11);
+        map.insert("pg_toast".to_string(), 99);
+        map.insert("public".to_string(), 2200);
+        for (name, oid) in self.user_schemas() {
+            map.insert(name.clone(), *oid);
+        }
+        map
     }
 
     /// Assign a stable synthetic OID to each user relation, computed once and
@@ -396,13 +444,17 @@ impl SystemCatalog {
                 schema::pg_enum_schema(),
                 schema::pg_enum_rows(self.user_types()),
             )),
-            "pg_namespace" => Some((schema::pg_namespace_schema(), schema::pg_namespace_rows())),
+            "pg_namespace" => Some((
+                schema::pg_namespace_schema(),
+                schema::pg_namespace_rows(self.user_schemas()),
+            )),
             "pg_class" => Some((
                 schema::pg_class_schema(),
                 schema::pg_class_rows(
                     self.relation_oids(),
                     self.relation_kinds(),
                     self.index_oids(),
+                    &self.namespace_oids(),
                 ),
             )),
             "pg_attribute" => Some((
@@ -415,7 +467,11 @@ impl SystemCatalog {
             )),
             "pg_constraint" => Some((
                 schema::pg_constraint_schema(),
-                schema::pg_constraint_rows(self.relation_oids(), self.index_oids()),
+                schema::pg_constraint_rows(
+                    self.relation_oids(),
+                    self.index_oids(),
+                    &self.namespace_oids(),
+                ),
             )),
             "pg_index" => Some((
                 schema::pg_index_schema(),
@@ -438,6 +494,7 @@ impl SystemCatalog {
                     &self.database,
                     &self.owner,
                     self.live_relations(),
+                    self.user_schemas(),
                 ),
             )),
             "tables" => Some((
@@ -485,7 +542,7 @@ impl TableEngine for SystemCatalog {
         }
     }
 
-    fn drop_table(&self, name: &str) -> Result<(), StorageError> {
+    fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
         // The session catalog routes DROP through temp/global, never here; a
         // system catalog relation is not droppable.
         unreachable!("cannot drop relation \"{name}\" from the system catalog")
@@ -547,17 +604,14 @@ mod tests {
         use crabgresql_types::PgType;
 
         let rels = vec![
-            TableSchema {
-                name: "beta".to_string(),
-                columns: vec![Column::new("x", PgType::Int4)],
-            },
-            TableSchema {
-                name: "alpha".to_string(),
-                columns: vec![
+            TableSchema::new("beta", vec![Column::new("x", PgType::Int4)]),
+            TableSchema::new(
+                "alpha",
+                vec![
                     Column::new("id", PgType::Int4),
                     Column::new("label", PgType::Text),
                 ],
-            },
+            ),
         ];
         let cat = SystemCatalog::with_relations(rels);
 
@@ -717,18 +771,19 @@ mod tests {
 
         let cat = SystemCatalog::with_catalog_relations_fn("appdb", "appuser", || {
             vec![
-                CatalogRelation::permanent(TableSchema {
-                    name: "widgets".to_string(),
-                    columns: vec![
+                CatalogRelation::permanent(TableSchema::new(
+                    "widgets",
+                    vec![
                         Column::new("id", PgType::Int4),
                         Column::with_typmod("label", PgType::Varchar, 12),
                     ],
-                }),
+                )),
                 CatalogRelation::temporary(
-                    TableSchema {
-                        name: "scratch".to_string(),
-                        columns: vec![Column::new("created_at", PgType::TimestampTz)],
-                    },
+                    TableSchema::in_namespace(
+                        "scratch",
+                        "pg_temp_42",
+                        vec![Column::new("created_at", PgType::TimestampTz)],
+                    ),
                     "pg_temp_42",
                 ),
             ]

@@ -796,6 +796,7 @@ mod tests {
         let catalog: Arc<dyn TypeCatalog> = Arc::new(EmptyTypeCatalog);
         if let Err(error) = engine.create_table(TableSchema {
             name: "t".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("id", PgType::Int4),
                 Column::new("big", PgType::Int8),
@@ -805,7 +806,7 @@ mod tests {
             panic!("failed to create planner test table: {error}");
         }
         if let Some(index) = index
-            && let Err(error) = engine.create_index("t", index)
+            && let Err(error) = engine.create_index("public", "t", index)
         {
             panic!("failed to create planner test index: {error}");
         }

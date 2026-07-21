@@ -38,15 +38,25 @@ use generate_series::Series;
 /// non-transactional engine counters and per-session `currval`/`lastval` state.
 /// The server supplies an implementation through [`ExecContext::sequences`]; the
 /// executor calls it when it evaluates the corresponding functions.
+/// The sequence functions take a possibly schema-qualified name. `namespace` is
+/// the schema written by the caller (e.g. `nextval('app.s')`), or `None` when the
+/// reference was unqualified — the implementation resolves `None` to its default
+/// schema (`public` until a real search_path lands).
 pub trait SequenceOps: Send + Sync {
     /// Advance the sequence and return its new value. Errors: 42P01 (no such
     /// sequence), 2200H (reached min/max with `NO CYCLE`).
-    fn nextval(&self, name: &str) -> Result<i64, ExecError>;
+    fn nextval(&self, namespace: Option<&str>, name: &str) -> Result<i64, ExecError>;
     /// The value `nextval` most recently returned for this sequence in this
     /// session. Errors 55000 if `nextval` has not run for it yet.
-    fn currval(&self, name: &str) -> Result<i64, ExecError>;
+    fn currval(&self, namespace: Option<&str>, name: &str) -> Result<i64, ExecError>;
     /// Set the sequence's counter; returns `value`.
-    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, ExecError>;
+    fn setval(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, ExecError>;
     /// The value the last `nextval` in this session returned, for any sequence.
     /// Errors 55000 if no `nextval` has run in the session yet.
     fn lastval(&self) -> Result<i64, ExecError>;
@@ -2651,6 +2661,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = test_ok(engine.create_table(TableSchema {
             name: "t".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
@@ -2676,12 +2687,14 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = test_ok(engine.create_table(TableSchema {
             name: "t".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
             ],
         }));
         test_ok(engine.create_index(
+            "public",
             "t",
             IndexMetadata {
                 name: "t_id_key".into(),
@@ -3105,6 +3118,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = test_ok(engine.create_table(TableSchema {
             name: "t".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
@@ -3332,6 +3346,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = test_ok(engine.create_table(TableSchema {
             name: "t".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("a", PgType::Int4),
                 Column::new("b", PgType::Int4),
@@ -3388,6 +3403,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = engine.create_table(TableSchema {
             name: "d".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("g", PgType::Int4),
                 Column::new("v", PgType::Int4),
@@ -3509,6 +3525,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = engine.create_table(TableSchema {
             name: "g".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("k", PgType::Int4),
                 Column::new("v", PgType::Int4),
@@ -3543,6 +3560,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = engine.create_table(TableSchema {
             name: "f".into(),
+            namespace: "public".into(),
             columns: vec![Column::new("x", PgType::Float8)],
         })?;
         let txn = wtxn();
@@ -3869,6 +3887,7 @@ mod tests {
         let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
         let table = test_ok(engine.create_table(TableSchema {
             name: "nums".into(),
+            namespace: "public".into(),
             columns: vec![Column::new("n", PgType::Int4)],
         }));
         let txn = wtxn();

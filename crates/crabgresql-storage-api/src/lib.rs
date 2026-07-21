@@ -140,7 +140,36 @@ pub struct RelationMetadata {
 #[derive(Clone, Debug)]
 pub struct TableSchema {
     pub name: String,
+    /// The schema (PostgreSQL namespace) this relation lives in. Unqualified
+    /// user relations default to `public`; a schema-qualified `CREATE` sets it
+    /// explicitly. `name` stays the bare `relname` (it appears verbatim in
+    /// error text and `pg_class.relname`).
+    pub namespace: String,
     pub columns: Vec<Column>,
+}
+
+impl TableSchema {
+    /// A table schema in the `public` namespace — the common case.
+    pub fn new(name: impl Into<String>, columns: Vec<Column>) -> Self {
+        TableSchema {
+            name: name.into(),
+            namespace: "public".to_string(),
+            columns,
+        }
+    }
+
+    /// A table schema in an explicit namespace.
+    pub fn in_namespace(
+        name: impl Into<String>,
+        namespace: impl Into<String>,
+        columns: Vec<Column>,
+    ) -> Self {
+        TableSchema {
+            name: name.into(),
+            namespace: namespace.into(),
+            columns,
+        }
+    }
 }
 
 /// A stored view: a named query plus the metadata needed to resolve, reflect,
@@ -153,6 +182,8 @@ pub struct TableSchema {
 #[derive(Clone, Debug)]
 pub struct ViewDefinition {
     pub name: String,
+    /// The schema (namespace) the view lives in; `public` for unqualified views.
+    pub namespace: String,
     pub sql: String,
     pub columns: Vec<Column>,
     pub depends_on: Vec<String>,
@@ -173,6 +204,8 @@ impl TableSchema {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SequenceDefinition {
     pub name: String,
+    /// The schema (namespace) the sequence lives in; `public` when unqualified.
+    pub namespace: String,
     /// Backing integer type: `Int2`, `Int4`, or `Int8`.
     pub data_type: PgType,
     pub start: i64,
@@ -236,6 +269,10 @@ pub enum StorageError {
     RelationAlreadyExists(String),
     #[error("index target relation \"{0}\" does not exist")]
     IndexTableNotFound(String),
+    #[error("schema \"{0}\" already exists")]
+    SchemaAlreadyExists(String),
+    #[error("schema \"{0}\" does not exist")]
+    SchemaNotFound(String),
 }
 
 /// Outcome of `TableAm::update`.
@@ -365,31 +402,77 @@ pub trait TableAm: Send + Sync {
 }
 
 /// Engine factory: `CREATE TABLE ... USING <engine>`.
+///
+/// ## Namespaces
+///
+/// Relation methods take an explicit `namespace: &str` (the schema); unqualified
+/// callers pass `"public"`. `create_table`/`create_view`/`create_sequence` need
+/// no separate argument because the target namespace rides on the definition
+/// struct (`TableSchema::namespace`, `ViewDefinition::namespace`,
+/// `SequenceDefinition::namespace`, defaulting to `public`).
+///
+/// [`TableEngine::open_table`] and [`TableEngine::resolve`] are deliberately
+/// distinct, not a public/namespaced pair: `open_table` is the **unqualified
+/// write-safe** lookup (a session overlay searches temp then the global engine,
+/// never the read-only system catalogs), while `resolve` is the
+/// **search-path-aware read** that also reaches `pg_catalog`/`information_schema`
+/// and honors a `Some(schema)` qualifier.
 pub trait TableEngine: Send + Sync {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError>;
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError>;
 
-    /// Remove a table and all its data. `TableNotFound` if it doesn't exist.
-    fn drop_table(&self, name: &str) -> Result<(), StorageError>;
+    /// Remove a table and all its data from `namespace`. `TableNotFound` if it
+    /// doesn't exist.
+    fn drop_table(&self, namespace: &str, name: &str) -> Result<(), StorageError>;
 
-    /// Register a semantic index after the caller has validated its keys and,
-    /// for UNIQUE, the table's existing contents.
-    fn create_index(&self, _table: &str, index: IndexMetadata) -> Result<(), StorageError> {
+    /// Register a user schema (`CREATE SCHEMA`), returning the OID the engine
+    /// allocated for it. The engine owns OID allocation so the durable engine
+    /// can persist the counter. `SchemaAlreadyExists` on a name collision (the
+    /// caller handles `IF NOT EXISTS`). The default rejects it — only an engine
+    /// that keeps a schema registry overrides this.
+    fn create_schema(&self, name: &str) -> Result<u32, StorageError> {
+        Err(StorageError::SchemaNotFound(name.to_string()))
+    }
+
+    /// Remove a user schema. The caller has already verified it is empty (or is
+    /// dropping its contents first, for CASCADE). `SchemaNotFound` if absent.
+    fn drop_schema(&self, name: &str) -> Result<(), StorageError> {
+        Err(StorageError::SchemaNotFound(name.to_string()))
+    }
+
+    /// Enumerate user-created schemas as `(name, oid)`. Built-in namespaces
+    /// (`public`, `pg_catalog`, …) are not included. The default is empty.
+    fn schemas(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
+
+    /// Whether a user schema by this name exists.
+    fn schema_exists(&self, name: &str) -> bool {
+        self.schemas().iter().any(|(n, _)| n == name)
+    }
+
+    /// Register a semantic index on a table in `namespace` after the caller has
+    /// validated its keys and, for UNIQUE, the table's existing contents.
+    fn create_index(
+        &self,
+        _namespace: &str,
+        _table: &str,
+        index: IndexMetadata,
+    ) -> Result<(), StorageError> {
         Err(StorageError::RelationAlreadyExists(index.name))
     }
 
-    /// Whether `index_name` is occupied in the namespace of `table`. The table
-    /// parameter matters for session overlays where temp and public may use the
-    /// same relation name.
-    fn index_name_exists(&self, _table: &str, index_name: &str) -> bool {
-        self.open_table(index_name).is_ok()
-            || self.relation_metadata().iter().any(|relation| {
-                relation
-                    .indexes
-                    .iter()
-                    .any(|index| index.name == index_name)
-            })
+    /// Whether `index_name` is occupied in `namespace` (an index shares the
+    /// relation namespace with tables/views/sequences). The `table` parameter
+    /// matters for session overlays where temp and public may use the same name.
+    fn index_name_exists(&self, namespace: &str, _table: &str, index_name: &str) -> bool {
+        self.resolve(Some(namespace), index_name).is_ok()
+            || self
+                .relation_metadata()
+                .iter()
+                .filter(|relation| relation.schema.namespace == namespace)
+                .any(|relation| relation.indexes.iter().any(|i| i.name == index_name))
     }
 
     /// Resolve a possibly schema-qualified relation. The default ignores any
@@ -438,8 +521,9 @@ pub trait TableEngine: Send + Sync {
         None
     }
 
-    /// Remove a view. `TableNotFound` if absent. The default knows no views.
-    fn drop_view(&self, name: &str) -> Result<(), StorageError> {
+    /// Remove a view from `namespace`. `TableNotFound` if absent. The default
+    /// knows no views.
+    fn drop_view(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
         Err(StorageError::TableNotFound(name.to_string()))
     }
 
@@ -456,14 +540,15 @@ pub trait TableEngine: Send + Sync {
         Err(StorageError::TableNotFound(def.name))
     }
 
-    /// Remove a sequence. `TableNotFound` if absent. The default knows none.
-    fn drop_sequence(&self, name: &str) -> Result<(), StorageError> {
+    /// Remove a sequence from `namespace`. `TableNotFound` if absent. The default
+    /// knows none.
+    fn drop_sequence(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
         Err(StorageError::TableNotFound(name.to_string()))
     }
 
-    /// The immutable definition of a sequence, or `None` if there is none by
-    /// that name. The default knows no sequences.
-    fn sequence(&self, _name: &str) -> Option<SequenceDefinition> {
+    /// The immutable definition of a sequence in `namespace`, or `None` if there
+    /// is none by that name. The default knows no sequences.
+    fn sequence(&self, _namespace: &str, _name: &str) -> Option<SequenceDefinition> {
         None
     }
 
@@ -477,14 +562,20 @@ pub trait TableEngine: Send + Sync {
     /// **non-transactional** counter state and, on the durable engine, persists
     /// immediately — it is not tied to the caller's transaction and survives
     /// `ROLLBACK`. The default knows no sequences.
-    fn sequence_nextval(&self, _name: &str) -> SequenceAdvance {
+    fn sequence_nextval(&self, _namespace: &str, _name: &str) -> SequenceAdvance {
         SequenceAdvance::NotFound
     }
 
     /// Set a sequence's current value (`setval`). With `is_called = true` the
     /// next `nextval` returns `value + increment`; with `false` it returns
     /// `value`. Non-transactional, like [`TableEngine::sequence_nextval`].
-    fn sequence_setval(&self, _name: &str, _value: i64, _is_called: bool) -> SequenceAdvance {
+    fn sequence_setval(
+        &self,
+        _namespace: &str,
+        _name: &str,
+        _value: i64,
+        _is_called: bool,
+    ) -> SequenceAdvance {
         SequenceAdvance::NotFound
     }
 }

@@ -66,6 +66,8 @@ impl From<StorageError> for PgError {
             StorageError::TableAlreadyExists(_) | StorageError::RelationAlreadyExists(_) => {
                 sqlstate::DUPLICATE_TABLE
             }
+            StorageError::SchemaAlreadyExists(_) => sqlstate::DUPLICATE_SCHEMA,
+            StorageError::SchemaNotFound(_) => sqlstate::INVALID_SCHEMA_NAME,
         };
         Self::new(code, e.to_string())
     }

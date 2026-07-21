@@ -36,6 +36,14 @@ pub const DATATYPE_MISMATCH: &str = "42804";
 pub const GROUPING_ERROR: &str = "42803";
 pub const UNDEFINED_TABLE: &str = "42P01";
 pub const DUPLICATE_TABLE: &str = "42P07";
+/// `42P06` — `CREATE SCHEMA` names a schema that already exists (without
+/// `IF NOT EXISTS`).
+pub const DUPLICATE_SCHEMA: &str = "42P06";
+/// `3F000` — a reference to (or `DROP` of) a schema that does not exist.
+pub const INVALID_SCHEMA_NAME: &str = "3F000";
+/// `42939` — a name reserved for the system was used, e.g. a `pg_`-prefixed
+/// schema name in `CREATE SCHEMA`.
+pub const RESERVED_NAME: &str = "42939";
 /// `42P16` — a relation definition is invalid (e.g. a `CREATE OR REPLACE VIEW`
 /// that renames, drops, or retypes an existing view column).
 pub const INVALID_TABLE_DEFINITION: &str = "42P16";

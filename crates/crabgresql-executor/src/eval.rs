@@ -129,11 +129,17 @@ fn eval_sequence_fn(
     let result = match func {
         ScalarFn::Nextval => match &args[0] {
             Value::Null => Ok(Value::Null),
-            name => ops.nextval(seq_name(name)).map(Value::Int8),
+            name => {
+                let (ns, seq) = seq_ref(name);
+                ops.nextval(ns, seq).map(Value::Int8)
+            }
         },
         ScalarFn::Currval => match &args[0] {
             Value::Null => Ok(Value::Null),
-            name => ops.currval(seq_name(name)).map(Value::Int8),
+            name => {
+                let (ns, seq) = seq_ref(name);
+                ops.currval(ns, seq).map(Value::Int8)
+            }
         },
         ScalarFn::Setval => {
             // setval is STRICT: a NULL in any argument (including the optional
@@ -146,8 +152,8 @@ fn eval_sequence_fn(
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 Ok(Value::Null)
             } else {
-                ops.setval(seq_name(&args[0]), int8(&args[1]), is_called)
-                    .map(Value::Int8)
+                let (ns, seq) = seq_ref(&args[0]);
+                ops.setval(ns, seq, int8(&args[1]), is_called).map(Value::Int8)
             }
         }
         ScalarFn::Lastval => ops.lastval().map(Value::Int8),
@@ -156,12 +162,16 @@ fn eval_sequence_fn(
     Some(result)
 }
 
-/// Extract a sequence name from a `nextval`/`currval`/`setval` text argument,
-/// taking the last dotted component so a schema-qualified `public.s` resolves to
-/// `s` (full `regclass` name normalization is a v1 gap).
-fn seq_name(v: &Value) -> &str {
+/// Split a `nextval`/`currval`/`setval` text argument into `(namespace, name)`:
+/// the last `.` separates an optional schema qualifier from the sequence name
+/// (`app.s` → `(Some("app"), "s")`, `s` → `(None, "s")`). Full `regclass` name
+/// normalization (quoting, case-folding, search_path) is a v1 gap.
+fn seq_ref(v: &Value) -> (Option<&str>, &str) {
     match v {
-        Value::Text(s) => s.rsplit('.').next().unwrap_or(s),
+        Value::Text(s) => match s.rsplit_once('.') {
+            Some((schema, name)) => (Some(schema), name),
+            None => (None, s),
+        },
         other => unreachable!("sequence name argument was {other:?}"),
     }
 }

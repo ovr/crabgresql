@@ -8,6 +8,8 @@
 //! `regproc` I/O columns as the referenced function's `text` name (which is what
 //! PostgreSQL's `regprocout` prints anyway).
 
+use std::collections::HashMap;
+
 use crabgresql_storage_api::{Column, IndexConstraint, IndexMethod, TableSchema};
 use crabgresql_types::{PgType, Value};
 
@@ -34,6 +36,7 @@ fn col(name: &str, ty: PgType) -> Column {
 pub fn pg_type_schema() -> TableSchema {
     TableSchema {
         name: "pg_type".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("oid", PgType::Oid),
             col("typname", PgType::Name),
@@ -134,6 +137,7 @@ pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
 pub fn pg_enum_schema() -> TableSchema {
     TableSchema {
         name: "pg_enum".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("oid", PgType::Oid),
             col("enumtypid", PgType::Oid),
@@ -172,6 +176,7 @@ pub fn pg_enum_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
 pub fn pg_cast_schema() -> TableSchema {
     TableSchema {
         name: "pg_cast".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("oid", PgType::Oid),
             col("castsource", PgType::Oid),
@@ -207,6 +212,7 @@ pub fn pg_cast_rows() -> Vec<Vec<Value>> {
 pub fn pg_sequence_schema() -> TableSchema {
     TableSchema {
         name: "pg_sequence".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("seqrelid", PgType::Oid),
             col("seqtypid", PgType::Oid),
@@ -242,6 +248,7 @@ pub fn pg_sequence_rows(sequences: &[(u32, CatalogSequence)]) -> Vec<Vec<Value>>
 pub fn pg_namespace_schema() -> TableSchema {
     TableSchema {
         name: "pg_namespace".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("oid", PgType::Oid),
             col("nspname", PgType::Name),
@@ -261,6 +268,7 @@ const HEAP_AM_OID: u32 = 2;
 pub fn pg_class_schema() -> TableSchema {
     TableSchema {
         name: "pg_class".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("oid", PgType::Oid),
             col("relname", PgType::Name),
@@ -286,7 +294,11 @@ pub fn pg_class_rows(
     relations: &[(u32, TableSchema)],
     kinds: &[RelKind],
     indexes: &[CatalogIndex],
+    namespace_oids: &HashMap<String, u32>,
 ) -> Vec<Vec<Value>> {
+    // Resolve a relation's namespace OID, defaulting to `public` (2200) for any
+    // namespace not in the map (should not happen for a live relation).
+    let nsp_oid = |namespace: &str| namespace_oids.get(namespace).copied().unwrap_or(2200);
     let mut rows: Vec<Vec<Value>> = relations
         .iter()
         .zip(kinds)
@@ -299,7 +311,7 @@ pub fn pg_class_rows(
             vec![
                 Value::Oid(*oid),
                 Value::Text(schema.name.clone()),
-                Value::Oid(2200),
+                Value::Oid(nsp_oid(&schema.namespace)),
                 Value::Oid(0),
                 Value::Oid(10),
                 Value::Oid(relam),
@@ -314,7 +326,8 @@ pub fn pg_class_rows(
         vec![
             Value::Oid(index.oid),
             Value::Text(index.metadata.name.clone()),
-            Value::Oid(2200),
+            // An index lives in its table's namespace.
+            Value::Oid(nsp_oid(&index.table_schema.namespace)),
             Value::Oid(0),
             Value::Oid(10),
             Value::Oid(match index.metadata.method {
@@ -335,6 +348,7 @@ pub fn pg_class_rows(
 pub fn pg_attribute_schema() -> TableSchema {
     TableSchema {
         name: "pg_attribute".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("attrelid", PgType::Oid),
             col("attname", PgType::Name),
@@ -393,6 +407,7 @@ pub fn pg_attribute_rows(
 pub fn pg_attrdef_schema() -> TableSchema {
     TableSchema {
         name: "pg_attrdef".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("oid", PgType::Oid),
             col("adrelid", PgType::Oid),
@@ -424,6 +439,7 @@ pub fn pg_attrdef_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
 pub fn pg_constraint_schema() -> TableSchema {
     TableSchema {
         name: "pg_constraint".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("oid", PgType::Oid),
             col("conname", PgType::Name),
@@ -443,7 +459,9 @@ pub fn pg_constraint_schema() -> TableSchema {
 pub fn pg_constraint_rows(
     relations: &[(u32, TableSchema)],
     indexes: &[CatalogIndex],
+    namespace_oids: &HashMap<String, u32>,
 ) -> Vec<Vec<Value>> {
+    let nsp_oid = |namespace: &str| namespace_oids.get(namespace).copied().unwrap_or(2200);
     let mut next_oid = 31000_u32;
     let mut rows = Vec::new();
     for (table_oid, schema) in relations {
@@ -452,6 +470,7 @@ pub fn pg_constraint_rows(
                 rows.push(constraint_row(
                     next_oid,
                     name,
+                    nsp_oid(&schema.namespace),
                     "n",
                     *table_oid,
                     0,
@@ -466,6 +485,7 @@ pub fn pg_constraint_rows(
             rows.push(constraint_row(
                 next_oid,
                 &index.metadata.name,
+                nsp_oid(&index.table_schema.namespace),
                 match constraint {
                     IndexConstraint::PrimaryKey => "p",
                     IndexConstraint::Unique => "u",
@@ -488,6 +508,7 @@ pub fn pg_constraint_rows(
 fn constraint_row(
     oid: u32,
     name: &str,
+    connamespace: u32,
     kind: &str,
     table_oid: u32,
     index_oid: u32,
@@ -496,7 +517,7 @@ fn constraint_row(
     vec![
         Value::Oid(oid),
         Value::Text(name.to_string()),
-        Value::Oid(2200),
+        Value::Oid(connamespace),
         Value::Text(kind.to_string()),
         Value::Bool(false),
         Value::Bool(false),
@@ -517,6 +538,7 @@ fn constraint_row(
 pub fn pg_index_schema() -> TableSchema {
     TableSchema {
         name: "pg_index".to_string(),
+        namespace: "pg_catalog".to_string(),
         columns: vec![
             col("indexrelid", PgType::Oid),
             col("indrelid", PgType::Oid),
@@ -583,7 +605,7 @@ pub fn pg_index_rows(indexes: &[CatalogIndex]) -> Vec<Vec<Value>> {
 /// it remains absent here; its named discovery surface lives in
 /// `information_schema.schemata`. Owners are reported as the bootstrap
 /// superuser (10) for now.
-pub fn pg_namespace_rows() -> Vec<Vec<Value>> {
+pub fn pg_namespace_rows(user_schemas: &[(String, u32)]) -> Vec<Vec<Value>> {
     let row = |oid: u32, name: &str| {
         vec![
             Value::Oid(oid),
@@ -592,11 +614,15 @@ pub fn pg_namespace_rows() -> Vec<Vec<Value>> {
             Value::Null,
         ]
     };
-    vec![
+    let mut rows = vec![
         row(11, "pg_catalog"),
         row(99, "pg_toast"),
         row(2200, "public"),
-    ]
+    ];
+    for (name, oid) in user_schemas {
+        rows.push(row(*oid, name));
+    }
+    rows
 }
 
 /// `information_schema.schemata`. Information-schema domains are represented
@@ -604,6 +630,7 @@ pub fn pg_namespace_rows() -> Vec<Vec<Value>> {
 pub fn information_schema_schemata_schema() -> TableSchema {
     TableSchema {
         name: "schemata".to_string(),
+        namespace: "information_schema".to_string(),
         columns: vec![
             col("catalog_name", PgType::Text),
             col("schema_name", PgType::Text),
@@ -620,6 +647,7 @@ pub fn information_schema_schemata_rows(
     database: &str,
     owner: &str,
     relations: &[CatalogRelation],
+    user_schemas: &[(String, u32)],
 ) -> Vec<Vec<Value>> {
     let mut namespaces = vec![
         "information_schema".to_string(),
@@ -630,6 +658,12 @@ pub fn information_schema_schemata_rows(
     for relation in relations {
         if !namespaces.contains(&relation.namespace) {
             namespaces.push(relation.namespace.clone());
+        }
+    }
+    // Include freshly-created, still-empty user schemas (no relations yet).
+    for (name, _) in user_schemas {
+        if !namespaces.contains(name) {
+            namespaces.push(name.clone());
         }
     }
     namespaces.sort();
@@ -655,6 +689,7 @@ pub fn information_schema_schemata_rows(
 pub fn information_schema_tables_schema() -> TableSchema {
     TableSchema {
         name: "tables".to_string(),
+        namespace: "information_schema".to_string(),
         columns: vec![
             col("table_catalog", PgType::Text),
             col("table_schema", PgType::Text),
@@ -713,6 +748,7 @@ pub fn information_schema_columns_schema() -> TableSchema {
     let cardinal = PgType::Int4;
     TableSchema {
         name: "columns".to_string(),
+        namespace: "information_schema".to_string(),
         columns: vec![
             col("table_catalog", text),
             col("table_schema", text),

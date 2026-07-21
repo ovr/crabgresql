@@ -10,6 +10,9 @@ test: enum
 test: drop_table
 test: create_view
 test: drop_view
+test: create_schema
+test: schema_qualified_ddl
+test: drop_schema
 test: date
 test: time
 test: timetz

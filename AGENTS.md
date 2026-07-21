@@ -34,6 +34,20 @@ for the entire codebase:
   behavior it reproduces (e.g. "matches `float8out` at `extra_float_digits = 0`",
   with a regression-test citation), not to PG's implementation.
 
+## Internal interfaces
+
+- The project is pre-1.0 with a single in-tree consumer of every internal API,
+  so **breaking changes to internal interfaces are fine** — Rust traits,
+  function signatures, module boundaries, and crate-internal types. Change the
+  shape that fits the new code best and update all call sites.
+- **Do not** add compatibility shims, deprecated aliases, or parallel "old + new"
+  method pairs just to avoid touching callers. Prefer one clean interface over a
+  backward-compatible one; churn across the workspace is expected and cheap.
+- This freedom stops at two boundaries that are *not* internal: **persisted /
+  on-disk formats** (e.g. the relation catalog — old files must still load, via
+  explicit versioned/back-compatible decoding) and **PG-facing observable
+  behavior** (wire protocol, SQL surface, error text/SQLSTATE, EXPLAIN output).
+
 ## Regression test scoreboard
 
 - When you land work that changes how many regression tests pass — promoting a

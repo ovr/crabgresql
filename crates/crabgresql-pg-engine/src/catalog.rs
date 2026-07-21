@@ -20,6 +20,9 @@ use crate::smgr::RelFileNode;
 const CATALOG_SUBDIR: &str = "global";
 const CATALOG_FILE: &str = "relcatalog";
 const FIRST_RELFILENODE: u32 = 1;
+/// PostgreSQL's `FIRST_NORMAL_OBJECT_ID`: the first OID handed out for
+/// user-created schemas (`CREATE SCHEMA`).
+const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
 const META_MAGIC: &[u8; 4] = b"CRM1";
 /// Marks the view section, appended after the [`META_MAGIC`] block. Like that
 /// block it is a backward-compatible tail: a reader that predates views stops
@@ -28,6 +31,11 @@ const VIEW_MAGIC: &[u8; 4] = b"CVW1";
 /// Marks the sequence section, appended after the [`VIEW_MAGIC`] block — a third
 /// backward-compatible tail. A pre-sequence reader stops above and never sees it.
 const SEQ_MAGIC: &[u8; 4] = b"CSQ1";
+/// Marks the namespace section, appended after the [`SEQ_MAGIC`] block — a
+/// fourth backward-compatible tail carrying the user schema registry and each
+/// object's namespace. A reader that predates schemas stops above and never sees
+/// it, so every object decodes as `public` (the sole namespace before schemas).
+const NSP_MAGIC: &[u8; 4] = b"NSP1";
 
 struct PersistCol {
     name: String,
@@ -40,6 +48,7 @@ struct PersistCol {
 
 struct PersistRel {
     name: String,
+    namespace: String,
     rel: u32,
     cols: Vec<PersistCol>,
     indexes: Vec<IndexMetadata>,
@@ -51,6 +60,7 @@ struct PersistRel {
 /// [`PersistRel`].
 struct PersistView {
     name: String,
+    namespace: String,
     sql: String,
     cols: Vec<PersistCol>,
     depends_on: Vec<String>,
@@ -62,6 +72,7 @@ struct PersistView {
 /// survives `ROLLBACK`. Sequences hold no relfilenode and no heap storage.
 struct PersistSequence {
     name: String,
+    namespace: String,
     type_oid: u32,
     start: i64,
     increment: i64,
@@ -79,6 +90,11 @@ struct State {
     rels: Vec<PersistRel>,
     views: Vec<PersistView>,
     sequences: Vec<PersistSequence>,
+    /// User-created schemas (`CREATE SCHEMA`), name → OID. Built-in namespaces
+    /// are not tracked here.
+    schemas: Vec<(String, u32)>,
+    /// Next OID for a `CREATE SCHEMA`. Monotonic — never reused after a drop.
+    next_nsp: u32,
 }
 
 pub struct RelCatalog {
@@ -98,6 +114,8 @@ impl RelCatalog {
                 rels: Vec::new(),
                 views: Vec::new(),
                 sequences: Vec::new(),
+                schemas: Vec::new(),
+                next_nsp: FIRST_NORMAL_OBJECT_ID,
             },
             Err(e) => return Err(e),
         };
@@ -135,6 +153,7 @@ impl RelCatalog {
                     RelFileNode(r.rel),
                     TableSchema {
                         name: r.name.clone(),
+                        namespace: r.namespace.clone(),
                         columns,
                     },
                     r.indexes.clone(),
@@ -143,17 +162,18 @@ impl RelCatalog {
             .collect()
     }
 
-    pub fn contains(&self, name: &str) -> bool {
+    /// Whether a table named `name` exists in `namespace`.
+    pub fn contains_in(&self, namespace: &str, name: &str) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"))
             .rels
             .iter()
-            .any(|r| r.name == name)
+            .any(|r| r.namespace == namespace && r.name == name)
     }
 
     /// Allocate a fresh relfilenode for `schema`, persist the catalog, and return
-    /// the new node.
+    /// the new node. The table's namespace rides on `schema.namespace`.
     pub fn create(&self, schema: &TableSchema) -> std::io::Result<RelFileNode> {
         let mut state = self
             .state
@@ -163,6 +183,7 @@ impl RelCatalog {
         state.next += 1;
         state.rels.push(PersistRel {
             name: schema.name.clone(),
+            namespace: schema.namespace.clone(),
             rel,
             cols: schema
                 .columns
@@ -186,17 +207,62 @@ impl RelCatalog {
     /// `None` if it was not present). `next` is deliberately left untouched: it
     /// stays monotonic so a freed relfilenode is never reused, which keeps the
     /// durability invariant (see `persist`) intact even after a DROP.
-    pub fn remove(&self, name: &str) -> std::io::Result<Option<RelFileNode>> {
+    pub fn remove_in(&self, namespace: &str, name: &str) -> std::io::Result<Option<RelFileNode>> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let Some(pos) = state.rels.iter().position(|r| r.name == name) else {
+        let Some(pos) = state
+            .rels
+            .iter()
+            .position(|r| r.namespace == namespace && r.name == name)
+        else {
             return Ok(None);
         };
         let rel = state.rels.remove(pos).rel;
         self.persist(&state)?;
         Ok(Some(RelFileNode(rel)))
+    }
+
+    /// Register a user schema, returning the OID allocated for it, or
+    /// `SchemaAlreadyExists`-shaped `None` when it already exists (caller maps
+    /// the error). Persisted immediately.
+    pub fn create_schema(&self, name: &str) -> std::io::Result<Option<u32>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        if state.schemas.iter().any(|(n, _)| n == name) {
+            return Ok(None);
+        }
+        let oid = state.next_nsp;
+        state.next_nsp += 1;
+        state.schemas.push((name.to_string(), oid));
+        self.persist(&state)?;
+        Ok(Some(oid))
+    }
+
+    /// Remove a user schema and persist. Returns `false` if it was not present.
+    pub fn remove_schema(&self, name: &str) -> std::io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(pos) = state.schemas.iter().position(|(n, _)| n == name) else {
+            return Ok(false);
+        };
+        state.schemas.remove(pos);
+        self.persist(&state)?;
+        Ok(true)
+    }
+
+    /// Every user schema as `(name, oid)`.
+    pub fn schema_list(&self) -> Vec<(String, u32)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .schemas
+            .clone()
     }
 
     /// Allocate a fresh relfilenode WITHOUT persisting the catalog. Used by a
@@ -229,7 +295,11 @@ impl RelCatalog {
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let Some(rel) = state.rels.iter_mut().find(|r| r.name == table) else {
+        let Some(rel) = state
+            .rels
+            .iter_mut()
+            .find(|r| r.namespace == "public" && r.name == table)
+        else {
             return Ok(None);
         };
         let old = rel.rel;
@@ -265,7 +335,7 @@ impl RelCatalog {
         state
             .rels
             .iter()
-            .find(|r| r.name == table)
+            .find(|r| r.namespace == "public" && r.name == table)
             .map(|r| RelFileNode(r.rel))
     }
 
@@ -280,7 +350,12 @@ impl RelCatalog {
             .collect()
     }
 
-    pub fn add_index(&self, table: &str, index: IndexMetadata) -> std::io::Result<()> {
+    pub fn add_index_in(
+        &self,
+        namespace: &str,
+        table: &str,
+        index: IndexMetadata,
+    ) -> std::io::Result<()> {
         let mut state = self
             .state
             .lock()
@@ -288,34 +363,40 @@ impl RelCatalog {
         let rel = state
             .rels
             .iter_mut()
-            .find(|r| r.name == table)
+            .find(|r| r.namespace == namespace && r.name == table)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, table))?;
         rel.indexes.push(index);
         self.persist(&state)
     }
 
-    /// Whether a view named `name` exists.
-    pub fn contains_view(&self, name: &str) -> bool {
+    /// Whether a view named `name` exists in `namespace`.
+    pub fn contains_view_in(&self, namespace: &str, name: &str) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"))
             .views
             .iter()
-            .any(|v| v.name == name)
+            .any(|v| v.namespace == namespace && v.name == name)
     }
 
     /// Register a view and persist the catalog. Returns `false` (without
-    /// persisting) if a view of that name already exists.
+    /// persisting) if a view of that name already exists in the view's
+    /// namespace.
     pub fn create_view(&self, def: &ViewDefinition) -> std::io::Result<bool> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        if state.views.iter().any(|v| v.name == def.name) {
+        if state
+            .views
+            .iter()
+            .any(|v| v.namespace == def.namespace && v.name == def.name)
+        {
             return Ok(false);
         }
         state.views.push(PersistView {
             name: def.name.clone(),
+            namespace: def.namespace.clone(),
             sql: def.sql.clone(),
             cols: def
                 .columns
@@ -335,13 +416,18 @@ impl RelCatalog {
         Ok(true)
     }
 
-    /// Remove a view and persist. Returns `false` if it was not present.
-    pub fn remove_view(&self, name: &str) -> std::io::Result<bool> {
+    /// Remove a view in `namespace` and persist. Returns `false` if it was not
+    /// present.
+    pub fn remove_view_in(&self, namespace: &str, name: &str) -> std::io::Result<bool> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let Some(pos) = state.views.iter().position(|v| v.name == name) else {
+        let Some(pos) = state
+            .views
+            .iter()
+            .position(|v| v.namespace == namespace && v.name == name)
+        else {
             return Ok(false);
         };
         state.views.remove(pos);
@@ -359,9 +445,10 @@ impl RelCatalog {
         state.views.iter().map(persist_view_to_definition).collect()
     }
 
-    /// Look up a single view by name, cloning only the match — the binder calls
-    /// this per view reference, so it avoids materializing the whole view set.
-    pub fn view(&self, name: &str) -> Option<ViewDefinition> {
+    /// Look up a single view by name in `namespace`, cloning only the match —
+    /// the binder calls this per view reference, so it avoids materializing the
+    /// whole view set.
+    pub fn view_in(&self, namespace: &str, name: &str) -> Option<ViewDefinition> {
         let state = self
             .state
             .lock()
@@ -369,33 +456,38 @@ impl RelCatalog {
         state
             .views
             .iter()
-            .find(|v| v.name == name)
+            .find(|v| v.namespace == namespace && v.name == name)
             .map(persist_view_to_definition)
     }
 
-    /// Whether a sequence named `name` exists.
-    pub fn contains_sequence(&self, name: &str) -> bool {
+    /// Whether a sequence named `name` exists in `namespace`.
+    pub fn contains_sequence_in(&self, namespace: &str, name: &str) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"))
             .sequences
             .iter()
-            .any(|s| s.name == name)
+            .any(|s| s.namespace == namespace && s.name == name)
     }
 
     /// Register a sequence and persist. Returns `false` (without persisting) if a
-    /// sequence of that name already exists. The counter starts uncalled, so the
-    /// first `nextval` returns `start`.
+    /// sequence of that name already exists in its namespace. The counter starts
+    /// uncalled, so the first `nextval` returns `start`.
     pub fn create_sequence(&self, def: &SequenceDefinition) -> std::io::Result<bool> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        if state.sequences.iter().any(|s| s.name == def.name) {
+        if state
+            .sequences
+            .iter()
+            .any(|s| s.namespace == def.namespace && s.name == def.name)
+        {
             return Ok(false);
         }
         state.sequences.push(PersistSequence {
             name: def.name.clone(),
+            namespace: def.namespace.clone(),
             type_oid: def.data_type.oid(),
             start: def.start,
             increment: def.increment,
@@ -412,13 +504,18 @@ impl RelCatalog {
         Ok(true)
     }
 
-    /// Remove a sequence and persist. Returns `false` if it was not present.
-    pub fn remove_sequence(&self, name: &str) -> std::io::Result<bool> {
+    /// Remove a sequence in `namespace` and persist. Returns `false` if it was
+    /// not present.
+    pub fn remove_sequence_in(&self, namespace: &str, name: &str) -> std::io::Result<bool> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let Some(pos) = state.sequences.iter().position(|s| s.name == name) else {
+        let Some(pos) = state
+            .sequences
+            .iter()
+            .position(|s| s.namespace == namespace && s.name == name)
+        else {
             return Ok(false);
         };
         state.sequences.remove(pos);
@@ -439,8 +536,8 @@ impl RelCatalog {
             .collect()
     }
 
-    /// A single sequence's definition, or `None` if absent.
-    pub fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
+    /// A single sequence's definition in `namespace`, or `None` if absent.
+    pub fn sequence_in(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
         let state = self
             .state
             .lock()
@@ -448,19 +545,27 @@ impl RelCatalog {
         state
             .sequences
             .iter()
-            .find(|s| s.name == name)
+            .find(|s| s.namespace == namespace && s.name == name)
             .map(persist_sequence_to_definition)
     }
 
-    /// Advance a sequence (`nextval`) and persist the new counter immediately —
-    /// outside any transaction, so the advance survives `ROLLBACK`. Returns the
-    /// new value, or `NotFound`/`Overflow`/`Underflow` without mutating.
-    pub fn advance_sequence(&self, name: &str) -> std::io::Result<SequenceAdvance> {
+    /// Advance a sequence (`nextval`) in `namespace` and persist the new counter
+    /// immediately — outside any transaction, so the advance survives `ROLLBACK`.
+    /// Returns the new value, or `NotFound`/`Overflow`/`Underflow` without mutating.
+    pub fn advance_sequence_in(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> std::io::Result<SequenceAdvance> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let Some(seq) = state.sequences.iter().position(|s| s.name == name) else {
+        let Some(seq) = state
+            .sequences
+            .iter()
+            .position(|s| s.namespace == namespace && s.name == name)
+        else {
             return Ok(SequenceAdvance::NotFound);
         };
         let advance = {
@@ -475,10 +580,11 @@ impl RelCatalog {
         Ok(advance)
     }
 
-    /// Set a sequence's counter (`setval`) and persist immediately. Returns the
-    /// new value, or `NotFound` without mutating.
-    pub fn set_sequence(
+    /// Set a sequence's counter (`setval`) in `namespace` and persist
+    /// immediately. Returns the new value, or `NotFound` without mutating.
+    pub fn set_sequence_in(
         &self,
+        namespace: &str,
         name: &str,
         value: i64,
         is_called: bool,
@@ -487,7 +593,11 @@ impl RelCatalog {
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let Some(seq) = state.sequences.iter_mut().find(|s| s.name == name) else {
+        let Some(seq) = state
+            .sequences
+            .iter_mut()
+            .find(|s| s.namespace == namespace && s.name == name)
+        else {
             return Ok(SequenceAdvance::NotFound);
         };
         seq.last_value = value;
@@ -623,6 +733,30 @@ fn encode(state: &State) -> Vec<u8> {
         put_i64(&mut out, s.last_value);
         out.push(u8::from(s.is_called));
     }
+    // Namespaces: a fourth backward-compatible tail after the sequence block. It
+    // carries the user schema registry plus each object's namespace, written in
+    // the same order as the sections above so a reader can zip them back on. A
+    // reader that predates schemas stops above and treats every object as
+    // `public`.
+    out.extend_from_slice(NSP_MAGIC);
+    out.extend_from_slice(&state.next_nsp.to_le_bytes());
+    out.extend_from_slice(&(state.schemas.len() as u32).to_le_bytes());
+    for (name, oid) in &state.schemas {
+        put_str(&mut out, name);
+        out.extend_from_slice(&oid.to_le_bytes());
+    }
+    out.extend_from_slice(&(state.rels.len() as u32).to_le_bytes());
+    for r in &state.rels {
+        put_str(&mut out, &r.namespace);
+    }
+    out.extend_from_slice(&(state.views.len() as u32).to_le_bytes());
+    for v in &state.views {
+        put_str(&mut out, &v.namespace);
+    }
+    out.extend_from_slice(&(state.sequences.len() as u32).to_le_bytes());
+    for s in &state.sequences {
+        put_str(&mut out, &s.namespace);
+    }
     out
 }
 
@@ -702,6 +836,8 @@ fn decode(bytes: &[u8]) -> State {
         }
         rels.push(PersistRel {
             name,
+            // Default to `public`; overridden below from the NSP1 tail when present.
+            namespace: "public".to_string(),
             rel,
             cols,
             indexes: Vec::new(),
@@ -793,6 +929,7 @@ fn decode(bytes: &[u8]) -> State {
             }
             views.push(PersistView {
                 name,
+                namespace: "public".to_string(),
                 sql,
                 cols,
                 depends_on,
@@ -817,6 +954,7 @@ fn decode(bytes: &[u8]) -> State {
             let is_called = d.byte() != 0;
             sequences.push(PersistSequence {
                 name,
+                namespace: "public".to_string(),
                 type_oid,
                 start,
                 increment,
@@ -830,11 +968,39 @@ fn decode(bytes: &[u8]) -> State {
             });
         }
     }
+    // Namespace tail: the user schema registry and each object's namespace,
+    // overriding the `public` defaults set above. Absent in a pre-schema file.
+    let mut schemas = Vec::new();
+    let mut next_nsp = FIRST_NORMAL_OBJECT_ID;
+    if d.remaining().starts_with(NSP_MAGIC) {
+        d.p += NSP_MAGIC.len();
+        next_nsp = d.u32();
+        let nschemas = d.u32();
+        for _ in 0..nschemas {
+            let name = d.s();
+            let oid = d.u32();
+            schemas.push((name, oid));
+        }
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            r.namespace = d.s();
+        }
+        let nviews = d.u32();
+        for v in views.iter_mut().take(nviews as usize) {
+            v.namespace = d.s();
+        }
+        let nseqs = d.u32();
+        for s in sequences.iter_mut().take(nseqs as usize) {
+            s.namespace = d.s();
+        }
+    }
     State {
         next,
         rels,
         views,
         sequences,
+        schemas,
+        next_nsp,
     }
 }
 
@@ -842,6 +1008,7 @@ fn decode(bytes: &[u8]) -> State {
 fn persist_sequence_to_definition(s: &PersistSequence) -> SequenceDefinition {
     SequenceDefinition {
         name: s.name.clone(),
+        namespace: s.namespace.clone(),
         data_type: pgtype_from_oid(s.type_oid),
         start: s.start,
         increment: s.increment,
@@ -857,6 +1024,7 @@ fn persist_sequence_to_definition(s: &PersistSequence) -> SequenceDefinition {
 fn persist_view_to_definition(v: &PersistView) -> ViewDefinition {
     ViewDefinition {
         name: v.name.clone(),
+        namespace: v.namespace.clone(),
         sql: v.sql.clone(),
         columns: v
             .cols
@@ -925,11 +1093,9 @@ mod tests {
         let mut id = Column::new("id", PgType::Int4);
         id.nullable = false;
         id.default = Some("1 + 2".to_string());
-        catalog.create(&TableSchema {
-            name: "t".to_string(),
-            columns: vec![id],
-        })?;
-        catalog.add_index(
+        catalog.create(&TableSchema::new("t", vec![id]))?;
+        catalog.add_index_in(
+            "public",
             "t",
             IndexMetadata {
                 name: "t_pkey".to_string(),
@@ -979,18 +1145,17 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
         // A table plus two views, one depending on the other.
-        catalog.create(&TableSchema {
-            name: "t".to_string(),
-            columns: vec![Column::new("id", PgType::Int4)],
-        })?;
+        catalog.create(&TableSchema::new("t", vec![Column::new("id", PgType::Int4)]))?;
         assert!(catalog.create_view(&ViewDefinition {
             name: "v".to_string(),
+            namespace: "public".to_string(),
             sql: "SELECT id FROM t".to_string(),
             columns: vec![Column::new("id", PgType::Int4)],
             depends_on: vec!["t".to_string()],
         })?);
         assert!(catalog.create_view(&ViewDefinition {
             name: "w".to_string(),
+            namespace: "public".to_string(),
             sql: "SELECT id FROM v".to_string(),
             columns: vec![Column::with_typmod("id", PgType::Int4, -1)],
             depends_on: vec!["v".to_string()],
@@ -998,6 +1163,7 @@ mod tests {
         // A duplicate is rejected without persisting.
         assert!(!catalog.create_view(&ViewDefinition {
             name: "v".to_string(),
+            namespace: "public".to_string(),
             sql: "SELECT 1".to_string(),
             columns: vec![Column::new("x", PgType::Int4)],
             depends_on: Vec::new(),
@@ -1018,8 +1184,8 @@ mod tests {
         assert_eq!(views[1].depends_on, vec!["v".to_string()]);
 
         // Removing a view persists.
-        assert!(loaded.remove_view("v")?);
-        assert!(!loaded.remove_view("v")?);
+        assert!(loaded.remove_view_in("public", "v")?);
+        assert!(!loaded.remove_view_in("public", "v")?);
         drop(loaded);
         let reloaded = RelCatalog::load(dir.path())?;
         assert_eq!(reloaded.views().len(), 1);
@@ -1043,6 +1209,7 @@ mod tests {
     fn seq(name: &str) -> SequenceDefinition {
         SequenceDefinition {
             name: name.to_string(),
+            namespace: "public".to_string(),
             data_type: PgType::Int8,
             start: 1,
             increment: 1,
@@ -1062,9 +1229,12 @@ mod tests {
         // A duplicate is rejected without persisting.
         assert!(!catalog.create_sequence(&seq("s"))?);
         // Advance a few times: first nextval yields start (1), then +increment.
-        assert_eq!(catalog.advance_sequence("s")?, SequenceAdvance::Value(1));
-        assert_eq!(catalog.advance_sequence("s")?, SequenceAdvance::Value(2));
-        assert_eq!(catalog.advance_sequence("missing")?, SequenceAdvance::NotFound);
+        assert_eq!(catalog.advance_sequence_in("public", "s")?, SequenceAdvance::Value(1));
+        assert_eq!(catalog.advance_sequence_in("public", "s")?, SequenceAdvance::Value(2));
+        assert_eq!(
+            catalog.advance_sequence_in("public", "missing")?,
+            SequenceAdvance::NotFound
+        );
         drop(catalog);
 
         // Reload: the definition and the advanced counter both survive.
@@ -1074,12 +1244,15 @@ mod tests {
         assert_eq!(seqs[0].name, "s");
         assert_eq!(seqs[0].data_type, PgType::Int8);
         // nextval continues past the persisted counter, not from start again.
-        assert_eq!(loaded.advance_sequence("s")?, SequenceAdvance::Value(3));
+        assert_eq!(loaded.advance_sequence_in("public", "s")?, SequenceAdvance::Value(3));
         // setval resets it; the following nextval reflects is_called.
-        assert_eq!(loaded.set_sequence("s", 10, true)?, SequenceAdvance::Value(10));
-        assert_eq!(loaded.advance_sequence("s")?, SequenceAdvance::Value(11));
-        assert!(loaded.remove_sequence("s")?);
-        assert!(!loaded.remove_sequence("s")?);
+        assert_eq!(
+            loaded.set_sequence_in("public", "s", 10, true)?,
+            SequenceAdvance::Value(10)
+        );
+        assert_eq!(loaded.advance_sequence_in("public", "s")?, SequenceAdvance::Value(11));
+        assert!(loaded.remove_sequence_in("public", "s")?);
+        assert!(!loaded.remove_sequence_in("public", "s")?);
         drop(loaded);
         let reloaded = RelCatalog::load(dir.path())?;
         assert!(reloaded.sequences().is_empty());
@@ -1087,10 +1260,7 @@ mod tests {
         // A pre-sequence catalog file (truncated at the sequence marker) still
         // loads, with no sequences.
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema {
-            name: "t".to_string(),
-            columns: vec![Column::new("id", PgType::Int4)],
-        })?;
+        catalog.create(&TableSchema::new("t", vec![Column::new("id", PgType::Int4)]))?;
         catalog.create_sequence(&seq("s2"))?;
         drop(catalog);
         let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
@@ -1103,6 +1273,73 @@ mod tests {
         let legacy = RelCatalog::load(dir.path())?;
         assert!(legacy.sequences().is_empty());
         assert_eq!(legacy.schemas().len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn schemas_and_namespaces_round_trip_and_legacy_catalog_defaults_public() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        // A user schema plus a table in it and one in `public`.
+        let app_oid = catalog
+            .create_schema("app")?
+            .ok_or_else(|| anyhow::anyhow!("create_schema returned None"))?;
+        // A duplicate schema is rejected without persisting.
+        assert!(catalog.create_schema("app")?.is_none());
+        catalog.create(&TableSchema::in_namespace(
+            "item",
+            "app",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        catalog.create(&TableSchema::new("item", vec![Column::new("id", PgType::Int4)]))?;
+        drop(catalog);
+
+        // Reload: the schema, its OID, and each table's namespace all survive.
+        let loaded = RelCatalog::load(dir.path())?;
+        assert_eq!(loaded.schema_list(), vec![("app".to_string(), app_oid)]);
+        let mut namespaces: Vec<(String, String)> = loaded
+            .schemas()
+            .into_iter()
+            .map(|(name, _, schema, _)| (schema.namespace, name))
+            .collect();
+        namespaces.sort();
+        assert_eq!(
+            namespaces,
+            vec![
+                ("app".to_string(), "item".to_string()),
+                ("public".to_string(), "item".to_string()),
+            ]
+        );
+
+        // Dropping the schema persists; the OID counter stays monotonic so a new
+        // schema never reuses the freed OID.
+        assert!(loaded.remove_schema("app")?);
+        assert!(!loaded.remove_schema("app")?);
+        let next_oid = loaded
+            .create_schema("app2")?
+            .ok_or_else(|| anyhow::anyhow!("create_schema returned None"))?;
+        assert!(next_oid > app_oid);
+        drop(loaded);
+
+        // A pre-schema catalog file (truncated at the namespace marker) still
+        // loads: no user schemas, and every relation decodes as `public`.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(NSP_MAGIC.len())
+            .position(|w| w == NSP_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("namespace marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        assert!(legacy.schema_list().is_empty());
+        assert!(
+            legacy
+                .schemas()
+                .iter()
+                .all(|(_, _, schema, _)| schema.namespace == "public")
+        );
 
         Ok(())
     }

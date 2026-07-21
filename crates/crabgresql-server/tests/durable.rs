@@ -313,6 +313,57 @@ async fn dropped_table_stays_dropped_across_a_restart() {
     }
 }
 
+/// A user schema and its schema-qualified table survive a full restart: the
+/// relation catalog persists the namespace registry (NSP1) and each relation's
+/// namespace, so the schema, its OID, and the table's rows all come back.
+#[tokio::test]
+async fn schema_and_qualified_table_survive_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let oid = {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client.simple_query("CREATE SCHEMA app").await?;
+        client
+            .simple_query("CREATE TABLE app.item (id int, label text)")
+            .await?;
+        client
+            .simple_query("INSERT INTO app.item VALUES (1, 'a'), (2, 'b')")
+            .await?;
+        let oid = rows(&client.simple_query("SELECT oid FROM pg_namespace WHERE nspname = 'app'").await?)
+            [0]
+        .get(0)
+        .map(str::to_string);
+        shutdown(client, handle).await;
+        oid
+    };
+
+    // Restart: the schema (with the same OID), its table, and its rows persist.
+    let (port, handle) = spawn_pg(dir.path()).await;
+    let client = connect(port).await;
+    let ns = client
+        .simple_query("SELECT oid FROM pg_namespace WHERE nspname = 'app'")
+        .await?;
+    assert_eq!(rows(&ns)[0].get(0).map(str::to_string), oid);
+    let msgs = client
+        .simple_query("SELECT id, label FROM app.item ORDER BY id")
+        .await?;
+    let got: Vec<(Option<&str>, Option<&str>)> =
+        rows(&msgs).iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(got, vec![(Some("1"), Some("a")), (Some("2"), Some("b"))]);
+    // `pg_class.relnamespace` still points at the persisted schema OID.
+    let joined = client
+        .simple_query(
+            "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'item'",
+        )
+        .await?;
+    assert_eq!(rows(&joined)[0].get(0), Some("app"));
+    shutdown(client, handle).await;
+
+    Ok(())
+}
+
 /// A view — a catalog-only object with no heap — survives a full restart: the
 /// relation catalog persists its definition, so `SELECT` through it still works.
 #[tokio::test]
