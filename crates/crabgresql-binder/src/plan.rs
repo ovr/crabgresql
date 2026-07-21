@@ -4239,6 +4239,17 @@ mod tests {
     }
 
     #[test]
+    fn between_reports_low_side_error_first() {
+        // PG analyzes `(id >= low) AND (id <= high)` left-to-right and fully
+        // resolves the low comparison — coercing the bad literal — before it
+        // ever looks at the high bound. The low-side 22P02 must win over the
+        // undefined-column 42703 the high bound would otherwise raise.
+        let e = bind_err("SELECT id FROM t WHERE id BETWEEN 'notint' AND missingcol");
+        assert_eq!(e.code, "22P02");
+        assert_eq!(e.message, "invalid input syntax for type integer: \"notint\"");
+    }
+
+    #[test]
     fn unparsable_unknown_literal_is_22p02() {
         let e = bind_err("SELECT id FROM t WHERE id = 'abc'");
         assert_eq!(e.code, "22P02");
