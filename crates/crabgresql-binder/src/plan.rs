@@ -239,8 +239,10 @@ impl JoinExpr {
 }
 
 /// The row source feeding a [`LogicalPlan::Aggregate`]. `Scan` is a single base
-/// table; `Join` is a recursively joined FROM source; `SingleRow` is the one
-/// virtual row of a FROM-less aggregate (`SELECT count(*)`).
+/// table; `Join` is any other FROM source — a recursively joined tree or a
+/// single-input node (derived table, CTE reference, `VALUES`, or set-returning
+/// function); `SingleRow` is the one virtual row of a FROM-less aggregate
+/// (`SELECT count(*)`).
 #[derive(Clone)]
 pub enum AggInput {
     Scan(Arc<dyn TableAm>),
@@ -823,12 +825,10 @@ fn bind_select(
                 input: JoinInput::Scan(table),
                 ..
             } => AggInput::Scan(table),
-            source @ JoinExpr::Join { .. } => AggInput::Join(source),
-            JoinExpr::Input { .. } => {
-                return Err(BindError::feature_not_supported(
-                    "aggregates over this FROM form are not supported yet",
-                ));
-            }
+            // A derived table, CTE reference, `VALUES` in FROM, or set-returning
+            // function feeds the aggregate through the same join machinery as a
+            // multi-relation FROM — an `Input` node is just a single-source tree.
+            source => AggInput::Join(source),
         };
         return Ok(LogicalPlan::Aggregate {
             input,
