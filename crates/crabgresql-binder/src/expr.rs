@@ -206,6 +206,20 @@ pub enum BoundExpr {
         index: usize,
         ty: PgType,
     },
+    /// A reference to a column of an enclosing query, from within a correlated
+    /// subquery — modelled on PostgreSQL's `Var` with `varlevelsup`. `level` is
+    /// how many query levels up the referenced relation lives (1 = the immediate
+    /// parent), `index` is that ancestor row's combined-row index, and `ty` the
+    /// column's type. Like a `ColumnRef` this is a per-execution runtime value:
+    /// the executor substitutes it with the outer row's value (via
+    /// `crate::plan::substitute_outer`) each time the correlated subplan runs, so
+    /// evaluating one directly is an internal invariant break (see
+    /// `executor::eval`).
+    OuterColumnRef {
+        level: usize,
+        index: usize,
+        ty: PgType,
+    },
     Unary {
         op: UnaryOp,
         expr: Box<BoundExpr>,
@@ -396,6 +410,7 @@ impl BoundExpr {
             BoundExpr::Const { ty, .. } => *ty,
             BoundExpr::ColumnRef { ty, .. } => *ty,
             BoundExpr::Param { ty, .. } => *ty,
+            BoundExpr::OuterColumnRef { ty, .. } => *ty,
             BoundExpr::Unary {
                 op: UnaryOp::Not, ..
             } => PgType::Bool,
@@ -448,6 +463,7 @@ impl BoundExpr {
             BoundExpr::Const { .. }
             | BoundExpr::ColumnRef { .. }
             | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. }
             | BoundExpr::Aggregate { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. } => false,
@@ -463,9 +479,10 @@ impl BoundExpr {
     pub fn contains_aggregate(&self) -> bool {
         match self {
             BoundExpr::Aggregate { .. } => true,
-            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => {
-                false
-            }
+            BoundExpr::Const { .. }
+            | BoundExpr::ColumnRef { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. } => false,
             BoundExpr::Unary { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_aggregate() || right.contains_aggregate()
@@ -526,6 +543,7 @@ impl BoundExpr {
             BoundExpr::Const { .. }
             | BoundExpr::ColumnRef { .. }
             | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. } => false,
         }
@@ -537,7 +555,9 @@ impl BoundExpr {
     pub fn count_param_refs(&self, index: usize) -> usize {
         match self {
             BoundExpr::Param { index: i, .. } => usize::from(*i == index),
-            BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } => 0,
+            BoundExpr::Const { .. }
+            | BoundExpr::ColumnRef { .. }
+            | BoundExpr::OuterColumnRef { .. } => 0,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
             | BoundExpr::Coerce { expr, .. }
@@ -580,7 +600,11 @@ impl BoundExpr {
                         Some((lo, hi)) => (lo.min(*index), hi.max(*index)),
                     });
                 }
-                BoundExpr::Const { .. } | BoundExpr::Param { .. } => {}
+                // An outer reference addresses an enclosing row, not this
+                // (join) row's index space, so it contributes no bound here.
+                BoundExpr::Const { .. }
+                | BoundExpr::Param { .. }
+                | BoundExpr::OuterColumnRef { .. } => {}
                 BoundExpr::Unary { expr, .. }
                 | BoundExpr::IsNull { expr, .. }
                 | BoundExpr::Coerce { expr, .. }
@@ -639,10 +663,23 @@ pub enum Binding {
 /// name), its columns, and the base index its columns occupy in the combined
 /// row (0 for a single relation; the running total across FROM items in a
 /// cross join).
+#[derive(Clone)]
 pub struct ScopeRel {
     qualifier: String,
     columns: Vec<Column>,
     offset: usize,
+}
+
+/// A snapshot of one enclosing query's name-resolution view, kept so a
+/// correlated subquery can resolve an outer column: its relations (for qualified
+/// `q.c` and the plain unqualified case) plus the merged-join `visible` view, so
+/// an unqualified reference to a `USING`/`NATURAL` join column of an outer query
+/// resolves to the single merged column (as in PG) rather than being reported
+/// ambiguous. Level 1 is the immediate parent; deeper ancestors follow.
+#[derive(Clone)]
+pub(crate) struct OuterLevel {
+    rels: Vec<ScopeRel>,
+    visible: Option<Vec<VisibleColumn>>,
 }
 
 /// One column of a merged join namespace (`JOIN … USING` / `NATURAL JOIN`): the
@@ -683,6 +720,133 @@ pub(crate) fn lookup_visible<'a>(cols: &'a [VisibleColumn], name: &str) -> Visib
     }
 }
 
+/// The outcome of resolving a name against one query level's relations.
+enum NameLookup {
+    Found(BoundExpr),
+    Ambiguous,
+    Missing,
+}
+
+/// Find `name` among `rels`' columns, returning its combined-row index and type
+/// (`Ok`) — or `Err(())` for more than one match (ambiguous), or `None` for no
+/// match. Shared by local and outer (correlated) unqualified resolution.
+fn lookup_in_rels(rels: &[ScopeRel], name: &str) -> Option<Result<(usize, PgType), ()>> {
+    let mut found: Option<(usize, PgType)> = None;
+    for rel in rels {
+        for (local, col) in rel.columns.iter().enumerate() {
+            if col.name == name {
+                if found.is_some() {
+                    return Some(Err(()));
+                }
+                found = Some((rel.offset + local, col.ty));
+            }
+        }
+    }
+    found.map(Ok)
+}
+
+/// Resolve `column` within a single relation `rel` for a qualified
+/// `qualifier.column` reference: its local index and type, or `42702` if the
+/// relation exposes the name more than once (e.g. an alias list `v(x, x)`), or
+/// `42703` — spelled with the qualifier, as PG does — if it is absent.
+fn column_in_rel(
+    rel: &ScopeRel,
+    qualifier: &str,
+    column: &str,
+) -> Result<(usize, PgType), BindError> {
+    let mut local: Option<usize> = None;
+    for (i, col) in rel.columns.iter().enumerate() {
+        if col.name == column {
+            if local.is_some() {
+                return Err(BindError::new(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    format!("column reference \"{column}\" is ambiguous"),
+                ));
+            }
+            local = Some(i);
+        }
+    }
+    let local = local.ok_or_else(|| {
+        BindError::new(
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column {qualifier}.{column} does not exist"),
+        )
+    })?;
+    Ok((local, rel.columns[local].ty))
+}
+
+/// Rewrite every `ColumnRef` in `expr` into an `OuterColumnRef` at correlation
+/// `level`, cloning everything else. Used to turn a merged-join `visible`
+/// column's expression — a `ColumnRef` (inner/left/right join) or a full join's
+/// `COALESCE`-as-`CASE` over both sides — into a correlated reference when it is
+/// resolved from an enclosing query by an inner subquery.
+fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::ColumnRef { index, ty } => BoundExpr::OuterColumnRef {
+            level,
+            index: *index,
+            ty: *ty,
+        },
+        BoundExpr::Const { .. } | BoundExpr::Param { .. } | BoundExpr::OuterColumnRef { .. } => {
+            expr.clone()
+        }
+        BoundExpr::Unary { op, expr } => BoundExpr::Unary {
+            op: *op,
+            expr: Box::new(outerize_columns(expr, level)),
+        },
+        BoundExpr::Binary {
+            op,
+            arg_ty,
+            left,
+            right,
+        } => BoundExpr::Binary {
+            op: *op,
+            arg_ty: *arg_ty,
+            left: Box::new(outerize_columns(left, level)),
+            right: Box::new(outerize_columns(right, level)),
+        },
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(outerize_columns(expr, level)),
+            negated: *negated,
+        },
+        BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {
+            expr: Box::new(outerize_columns(expr, level)),
+            ty: *ty,
+        },
+        BoundExpr::Reinterpret {
+            expr,
+            reported,
+            rep,
+        } => BoundExpr::Reinterpret {
+            expr: Box::new(outerize_columns(expr, level)),
+            reported: *reported,
+            rep: *rep,
+        },
+        BoundExpr::FuncCall { func, ret, args } => BoundExpr::FuncCall {
+            func: *func,
+            ret: *ret,
+            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
+        },
+        BoundExpr::Case { whens, else_, ty } => BoundExpr::Case {
+            whens: whens
+                .iter()
+                .map(|(c, r)| (outerize_columns(c, level), outerize_columns(r, level)))
+                .collect(),
+            else_: else_
+                .as_ref()
+                .map(|e| Box::new(outerize_columns(e, level))),
+            ty: *ty,
+        },
+        // A merged-join visible column expression is only ever a ColumnRef or a
+        // COALESCE/CASE over ColumnRefs; these never appear, so clone defensively.
+        BoundExpr::Srf { .. }
+        | BoundExpr::Aggregate { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::InSubquery { .. } => expr.clone(),
+    }
+}
+
 /// Name-resolution scope: an ordered list of relations (empty for a FROM-less
 /// SELECT / INSERT VALUES, one for a single-table SELECT, more for a cross
 /// join). A qualified reference addresses one relation by its name or alias;
@@ -707,6 +871,12 @@ pub struct Scope {
     /// visible at this query level. `None` in contexts where a subquery cannot
     /// appear (column defaults, INSERT VALUES rows), which then reject one.
     subquery: Option<std::rc::Rc<SubqueryContext>>,
+    /// The enclosing queries' resolution views, nearest first (index 0 = the
+    /// immediate parent = correlation level 1). Empty for a top-level query;
+    /// populated by [`Scope::with_outer`] when binding a subquery body so an
+    /// unresolved name can fall through to the outer scope as an
+    /// [`BoundExpr::OuterColumnRef`].
+    outer: Vec<OuterLevel>,
 }
 
 /// The handle a [`Scope`] carries so `bind_expr` can bind a nested query. Shared
@@ -725,6 +895,7 @@ impl Scope {
             catalog: catalog.clone(),
             params: params.clone(),
             subquery: None,
+            outer: Vec::new(),
         }
     }
 
@@ -744,6 +915,7 @@ impl Scope {
             catalog: catalog.clone(),
             params: params.clone(),
             subquery: None,
+            outer: Vec::new(),
         }
     }
 
@@ -785,6 +957,7 @@ impl Scope {
             catalog: catalog.clone(),
             params: params.clone(),
             subquery: None,
+            outer: Vec::new(),
         }
     }
 
@@ -804,6 +977,28 @@ impl Scope {
         self
     }
 
+    /// Attach the enclosing queries' resolution views so a correlated reference
+    /// inside this (subquery) scope can fall through to an outer column. Set by
+    /// the clause binders when binding a subquery body, from
+    /// [`Scope::as_outer_levels`] on the enclosing scope.
+    pub(crate) fn with_outer(mut self, outer: Vec<OuterLevel>) -> Scope {
+        self.outer = outer;
+        self
+    }
+
+    /// The outer-level views a subquery bound against this scope should see:
+    /// this scope's own relations as level 1, then this scope's own outer levels
+    /// (the ancestors) shifted one deeper.
+    pub(crate) fn as_outer_levels(&self) -> Vec<OuterLevel> {
+        let mut levels = Vec::with_capacity(self.outer.len() + 1);
+        levels.push(OuterLevel {
+            rels: self.rels.clone(),
+            visible: self.visible.clone(),
+        });
+        levels.extend(self.outer.iter().cloned());
+        levels
+    }
+
     /// The user-defined type/cast view carried through binding.
     pub fn catalog(&self) -> &Arc<dyn TypeCatalog> {
         &self.catalog
@@ -817,45 +1012,112 @@ impl Scope {
     /// Resolve an unqualified column name. A name that matches exactly one
     /// column binds to its combined-row index; more than one match — whether
     /// across relations or duplicated within one (e.g. an alias list `v(x, x)`)
-    /// — is `42702` (ambiguous); no match is `42703`.
+    /// — is `42702` (ambiguous); no match here nor in any enclosing query is
+    /// `42703`. A name that matches no local column but one in an enclosing
+    /// query (a correlated reference) resolves to that column via an
+    /// [`BoundExpr::OuterColumnRef`], preferring the nearest scope — as in PG.
     fn resolve(&self, name: &str) -> Result<BoundExpr, BindError> {
+        match self.resolve_local(name) {
+            NameLookup::Found(expr) => Ok(expr),
+            NameLookup::Ambiguous => Err(BindError::new(
+                sqlstate::AMBIGUOUS_COLUMN,
+                format!("column reference \"{name}\" is ambiguous"),
+            )),
+            NameLookup::Missing => self.resolve_outer(name),
+        }
+    }
+
+    /// Look a name up in this scope's own relations (or its merged-join `visible`
+    /// view), without consulting enclosing queries.
+    fn resolve_local(&self, name: &str) -> NameLookup {
         // A merged join namespace resolves unqualified names against its visible
         // columns: the join column appears once (never ambiguous), the merged
         // expression carrying its combined-row value.
         if let Some(visible) = &self.visible {
             return match lookup_visible(visible, name) {
-                VisibleLookup::Found(expr) => Ok(expr.clone()),
-                VisibleLookup::Ambiguous => Err(BindError::new(
-                    sqlstate::AMBIGUOUS_COLUMN,
-                    format!("column reference \"{name}\" is ambiguous"),
-                )),
-                VisibleLookup::Missing => Err(BindError::new(
-                    sqlstate::UNDEFINED_COLUMN,
-                    format!("column \"{name}\" does not exist"),
-                )),
+                VisibleLookup::Found(expr) => NameLookup::Found(expr.clone()),
+                VisibleLookup::Ambiguous => NameLookup::Ambiguous,
+                VisibleLookup::Missing => NameLookup::Missing,
             };
         }
-        let mut found: Option<(usize, PgType)> = None;
-        for rel in &self.rels {
-            for (local, col) in rel.columns.iter().enumerate() {
-                if col.name == name {
-                    if found.is_some() {
-                        return Err(BindError::new(
-                            sqlstate::AMBIGUOUS_COLUMN,
-                            format!("column reference \"{name}\" is ambiguous"),
-                        ));
-                    }
-                    found = Some((rel.offset + local, col.ty));
+        match lookup_in_rels(&self.rels, name) {
+            Some(Ok((index, ty))) => NameLookup::Found(BoundExpr::ColumnRef { index, ty }),
+            Some(Err(())) => NameLookup::Ambiguous,
+            None => NameLookup::Missing,
+        }
+    }
+
+    /// Walk the enclosing queries (nearest first) for a name unresolved locally,
+    /// producing a correlated [`BoundExpr::OuterColumnRef`] at the first level
+    /// that has it. Outer levels resolve against their relations (a merged-join
+    /// `visible` view is not consulted across a correlation boundary); `42703` if
+    /// no enclosing query defines the name.
+    fn resolve_outer(&self, name: &str) -> Result<BoundExpr, BindError> {
+        let ambiguous = || {
+            BindError::new(
+                sqlstate::AMBIGUOUS_COLUMN,
+                format!("column reference \"{name}\" is ambiguous"),
+            )
+        };
+        for (depth, level) in self.outer.iter().enumerate() {
+            let level_no = depth + 1;
+            // A `USING`/`NATURAL` join in the outer query merges its join column
+            // into one `visible` entry; resolve against it first so a correlated
+            // unqualified reference to that column is not seen as ambiguous across
+            // the two physical sides still present in `rels`.
+            if let Some(visible) = &level.visible {
+                match lookup_visible(visible, name) {
+                    VisibleLookup::Found(expr) => return Ok(outerize_columns(expr, level_no)),
+                    VisibleLookup::Ambiguous => return Err(ambiguous()),
+                    VisibleLookup::Missing => continue,
                 }
             }
+            match lookup_in_rels(&level.rels, name) {
+                Some(Ok((index, ty))) => {
+                    return Ok(BoundExpr::OuterColumnRef {
+                        level: level_no,
+                        index,
+                        ty,
+                    });
+                }
+                Some(Err(())) => return Err(ambiguous()),
+                None => continue,
+            }
         }
-        let (index, ty) = found.ok_or_else(|| {
-            BindError::new(
-                sqlstate::UNDEFINED_COLUMN,
-                format!("column \"{name}\" does not exist"),
-            )
-        })?;
-        Ok(BoundExpr::ColumnRef { index, ty })
+        Err(BindError::new(
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column \"{name}\" does not exist"),
+        ))
+    }
+
+    /// Resolve a qualified `qualifier.column` reference. A relation matching
+    /// `qualifier` in this scope binds to a plain [`BoundExpr::ColumnRef`]; one
+    /// found only in an enclosing query (nearest first) is a correlated
+    /// [`BoundExpr::OuterColumnRef`]. `42P01` if no relation named `qualifier` is
+    /// in scope at any level; `42703` if the relation is found but lacks the
+    /// column.
+    fn resolve_qualified(&self, qualifier: &str, column: &str) -> Result<BoundExpr, BindError> {
+        if let Some(rel) = self.rels.iter().find(|r| r.qualifier == qualifier) {
+            let (local, ty) = column_in_rel(rel, qualifier, column)?;
+            return Ok(BoundExpr::ColumnRef {
+                index: rel.offset + local,
+                ty,
+            });
+        }
+        for (depth, level) in self.outer.iter().enumerate() {
+            if let Some(rel) = level.rels.iter().find(|r| r.qualifier == qualifier) {
+                let (local, ty) = column_in_rel(rel, qualifier, column)?;
+                return Ok(BoundExpr::OuterColumnRef {
+                    level: depth + 1,
+                    index: rel.offset + local,
+                    ty,
+                });
+            }
+        }
+        Err(BindError::new(
+            sqlstate::UNDEFINED_TABLE,
+            format!("missing FROM-clause entry for table \"{qualifier}\""),
+        ))
     }
 
     /// Find the relation addressed by `qualifier` (alias or table name), or the
@@ -1106,10 +1368,11 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
 }
 
 /// Bind a nested query into a [`LogicalPlan`] against the enclosing scope's
-/// subquery context (table engine + visible CTEs). The subquery is bound in an
-/// independent name scope: it sees no outer columns, so a correlated reference
-/// resolves to nothing and errors `42703` — correlated subqueries are a later
-/// stage.
+/// subquery context (table engine + visible CTEs). The subquery body is bound
+/// in its own name scope, but with the enclosing scope's relations attached as
+/// outer levels ([`Scope::as_outer_levels`]) so a correlated reference resolves
+/// outward to a [`BoundExpr::OuterColumnRef`]; a name in neither still errors
+/// `42703`.
 fn bind_subquery_plan(
     query: &ast::Query,
     scope: &Scope,
@@ -1123,6 +1386,7 @@ fn bind_subquery_plan(
         &scope.params,
         query,
         &ctx.ctes,
+        &scope.as_outer_levels(),
     )?;
     let columns = crate::plan::output_columns_of(&plan)?;
     Ok((plan, columns))
@@ -2088,34 +2352,13 @@ fn bind_compound(parts: &[ast::Ident], scope: &Scope) -> Result<BoundExpr, BindE
         ));
     };
     let qualifier = normalize_ident(qualifier);
-    let rel = scope.relation(&qualifier)?;
     let column = normalize_ident(column);
-    // A qualified reference is still ambiguous if the relation exposes the name
-    // more than once (e.g. an alias list `v(x, x)`), matching PG's 42702.
-    let mut local: Option<usize> = None;
-    for (i, col) in rel.columns.iter().enumerate() {
-        if col.name == column {
-            if local.is_some() {
-                return Err(BindError::new(
-                    sqlstate::AMBIGUOUS_COLUMN,
-                    format!("column reference \"{column}\" is ambiguous"),
-                ));
-            }
-            local = Some(i);
-        }
-    }
-    // PG names the missing column with its qualifier, unquoted: `column q.c does
-    // not exist` (contrast the unqualified form `column "c" does not exist`).
-    let local = local.ok_or_else(|| {
-        BindError::new(
-            sqlstate::UNDEFINED_COLUMN,
-            format!("column {qualifier}.{column} does not exist"),
-        )
-    })?;
-    Ok(BoundExpr::ColumnRef {
-        index: rel.offset + local,
-        ty: rel.columns[local].ty,
-    })
+    // Resolves against this scope's relations first, then enclosing queries — a
+    // qualified reference to an outer relation yields a correlated
+    // `OuterColumnRef`. PG names a missing column with its qualifier, unquoted:
+    // `column q.c does not exist` (contrast the unqualified form `column "c"
+    // does not exist`).
+    scope.resolve_qualified(&qualifier, &column)
 }
 
 fn no_op_unary(sym: &str, ty: &str) -> BindError {
@@ -4503,7 +4746,9 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             value: Value::Null,
             ty,
         }),
-        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } => expr,
+        BoundExpr::Const { .. }
+        | BoundExpr::ColumnRef { .. }
+        | BoundExpr::OuterColumnRef { .. } => expr,
         BoundExpr::Unary { op, expr } => BoundExpr::Unary {
             op,
             expr: Box::new(inline_params(*expr, args)),

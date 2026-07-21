@@ -15,10 +15,10 @@ use crabgresql_storage_api::{
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
-    BinOp, Binding, BoundExpr, ParamCtx, Scope, VisibleColumn, VisibleLookup, bind_binary_op,
-    bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column,
-    lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none, to_bool_operand,
-    unify_value_column,
+    BinOp, Binding, BoundExpr, OuterLevel, ParamCtx, Scope, VisibleColumn, VisibleLookup,
+    bind_binary_op, bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr,
+    coerce_to_column, lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none,
+    to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -573,7 +573,10 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
                 };
             }
         }
-        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } => {}
+        // Outer references belong to an enclosing query, not this statement's
+        // `$n` list; `substitute_outer` fills them per outer row at execution.
+        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::OuterColumnRef { .. } => {
+        }
         BoundExpr::Unary { expr, .. } => subst_expr(expr, params),
         BoundExpr::Binary { left, right, .. } => {
             subst_expr(left, params);
@@ -609,6 +612,456 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
     }
 }
 
+/// Fill a correlated subplan's outer references with the enclosing row's values,
+/// in place, before it executes for that row. `outer` is the immediate parent
+/// row (the one this subplan is correlated to). An [`BoundExpr::OuterColumnRef`]
+/// is resolved by comparing its `level` to its nesting `depth` within this
+/// subplan (1 at the top, +1 per nested expression-subquery): `level == depth`
+/// names a column of `outer` and folds to a `Const`; `level > depth` belongs to
+/// a still-outer query and is decremented (to be filled at that boundary);
+/// `level < depth` names an intervening inner query and is left for it. The
+/// classic nested-loop correlated substitution — run per outer row by the
+/// executor (see `crabgresql_executor`).
+pub fn substitute_outer(plan: &mut LogicalPlan, outer: &[Value]) {
+    subst_outer_plan(plan, outer, 1);
+}
+
+fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
+    match plan {
+        LogicalPlan::Values {
+            rows, predicate, ..
+        } => {
+            for row in rows {
+                for e in row.iter_mut() {
+                    subst_outer_expr(e, outer, depth);
+                }
+            }
+            if let Some(p) = predicate {
+                subst_outer_expr(p, outer, depth);
+            }
+        }
+        LogicalPlan::Query {
+            projections,
+            predicate,
+            ..
+        } => {
+            for e in projections.iter_mut() {
+                subst_outer_expr(e, outer, depth);
+            }
+            if let Some(p) = predicate {
+                subst_outer_expr(p, outer, depth);
+            }
+        }
+        LogicalPlan::Subquery {
+            source,
+            projections,
+            predicate,
+            ..
+        } => {
+            // A derived table is its own query nesting level.
+            subst_outer_plan(source, outer, depth + 1);
+            for e in projections.iter_mut() {
+                subst_outer_expr(e, outer, depth);
+            }
+            if let Some(p) = predicate {
+                subst_outer_expr(p, outer, depth);
+            }
+        }
+        LogicalPlan::TableFunction {
+            args,
+            projections,
+            predicate,
+            ..
+        } => {
+            for e in args.iter_mut().chain(projections.iter_mut()) {
+                subst_outer_expr(e, outer, depth);
+            }
+            if let Some(p) = predicate {
+                subst_outer_expr(p, outer, depth);
+            }
+        }
+        LogicalPlan::Join {
+            source,
+            projections,
+            predicate,
+            ..
+        } => {
+            subst_outer_join(source, outer, depth);
+            for e in projections.iter_mut() {
+                subst_outer_expr(e, outer, depth);
+            }
+            if let Some(p) = predicate {
+                subst_outer_expr(p, outer, depth);
+            }
+        }
+        LogicalPlan::Limit { source, .. } => subst_outer_plan(source, outer, depth),
+        LogicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            projections,
+            ..
+        } => {
+            if let AggInput::Join(join) = input {
+                subst_outer_join(join, outer, depth);
+            }
+            if let Some(p) = predicate {
+                subst_outer_expr(p, outer, depth);
+            }
+            for e in group_exprs.iter_mut() {
+                subst_outer_expr(e, outer, depth);
+            }
+            for agg in aggregates {
+                if let Some(arg) = &mut agg.arg {
+                    subst_outer_expr(arg, outer, depth);
+                }
+            }
+            if let Some(h) = having {
+                subst_outer_expr(h, outer, depth);
+            }
+            for e in projections.iter_mut() {
+                subst_outer_expr(e, outer, depth);
+            }
+        }
+        LogicalPlan::Insert {
+            source, returning, ..
+        } => {
+            match source {
+                InsertSource::Values(rows) => {
+                    for row in rows {
+                        for e in row.iter_mut() {
+                            subst_outer_expr(e, outer, depth);
+                        }
+                    }
+                }
+                InsertSource::Query { input, projections } => {
+                    subst_outer_plan(input, outer, depth + 1);
+                    for e in projections.iter_mut() {
+                        subst_outer_expr(e, outer, depth);
+                    }
+                }
+            }
+            if let Some(r) = returning {
+                for e in r.projections.iter_mut() {
+                    subst_outer_expr(e, outer, depth);
+                }
+            }
+        }
+        LogicalPlan::Update {
+            predicate,
+            assignments,
+            returning,
+            ..
+        } => {
+            if let Some(p) = predicate {
+                subst_outer_expr(p, outer, depth);
+            }
+            for (_, e) in assignments {
+                subst_outer_expr(e, outer, depth);
+            }
+            if let Some(r) = returning {
+                for e in r.projections.iter_mut() {
+                    subst_outer_expr(e, outer, depth);
+                }
+            }
+        }
+        LogicalPlan::Delete {
+            predicate,
+            returning,
+            ..
+        } => {
+            if let Some(p) = predicate {
+                subst_outer_expr(p, outer, depth);
+            }
+            if let Some(r) = returning {
+                for e in r.projections.iter_mut() {
+                    subst_outer_expr(e, outer, depth);
+                }
+            }
+        }
+    }
+}
+
+fn subst_outer_join(join: &mut JoinExpr, outer: &[Value], depth: usize) {
+    match join {
+        JoinExpr::Input { input, .. } => match input {
+            JoinInput::Scan(_) => {}
+            JoinInput::Subplan(plan) => subst_outer_plan(plan, outer, depth + 1),
+            JoinInput::TableFunction { args, .. } => {
+                for e in args.iter_mut() {
+                    subst_outer_expr(e, outer, depth);
+                }
+            }
+        },
+        JoinExpr::Join {
+            left,
+            right,
+            predicate,
+            ..
+        } => {
+            subst_outer_join(left, outer, depth);
+            subst_outer_join(right, outer, depth);
+            if let Some(p) = predicate {
+                subst_outer_expr(p, outer, depth);
+            }
+        }
+    }
+}
+
+fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
+    match expr {
+        BoundExpr::OuterColumnRef { level, index, ty } => {
+            if *level == depth {
+                if let Some(value) = outer.get(*index) {
+                    *expr = BoundExpr::Const {
+                        value: value.clone(),
+                        ty: *ty,
+                    };
+                }
+            } else if *level > depth {
+                *level -= 1;
+            }
+            // `level < depth`: an intervening inner query fills it — leave it.
+        }
+        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => {}
+        BoundExpr::Unary { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::Coerce { expr, .. }
+        | BoundExpr::Reinterpret { expr, .. } => subst_outer_expr(expr, outer, depth),
+        BoundExpr::Binary { left, right, .. } => {
+            subst_outer_expr(left, outer, depth);
+            subst_outer_expr(right, outer, depth);
+        }
+        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+            for a in args.iter_mut() {
+                subst_outer_expr(a, outer, depth);
+            }
+        }
+        BoundExpr::Case { whens, else_, .. } => {
+            for (cond, result) in whens {
+                subst_outer_expr(cond, outer, depth);
+                subst_outer_expr(result, outer, depth);
+            }
+            if let Some(e) = else_ {
+                subst_outer_expr(e, outer, depth);
+            }
+        }
+        BoundExpr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                subst_outer_expr(a, outer, depth);
+            }
+        }
+        // A nested expression-subquery is one query level deeper.
+        BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
+            subst_outer_plan(&mut subplan.0, outer, depth + 1);
+        }
+        BoundExpr::InSubquery { subplan, cmp, .. } => {
+            subst_outer_plan(&mut subplan.0, outer, depth + 1);
+            subst_outer_expr(cmp, outer, depth);
+        }
+    }
+}
+
+/// Whether a bound plan contains any correlated outer reference
+/// ([`BoundExpr::OuterColumnRef`]) — a subplan that cannot be folded once before
+/// execution because its value depends on an enclosing row. The executor uses
+/// this to leave such subqueries for per-outer-row evaluation.
+pub fn plan_has_outer_refs(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    for_each_plan_expr(plan, &mut |e| {
+        if expr_has_outer_ref(e) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Visit every top-level expression of `plan`, recursing through structural
+/// sub-plans (derived tables, join inputs, DML sources). Does not descend into
+/// expression-subquery markers — `expr_has_outer_ref` handles those.
+fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
+    match plan {
+        LogicalPlan::Values {
+            rows, predicate, ..
+        } => {
+            rows.iter().flatten().for_each(&mut *f);
+            if let Some(p) = predicate {
+                f(p);
+            }
+        }
+        LogicalPlan::Query {
+            projections,
+            predicate,
+            ..
+        } => {
+            projections.iter().for_each(&mut *f);
+            if let Some(p) = predicate {
+                f(p);
+            }
+        }
+        LogicalPlan::Subquery {
+            source,
+            projections,
+            predicate,
+            ..
+        } => {
+            for_each_plan_expr(source, &mut *f);
+            projections.iter().for_each(&mut *f);
+            if let Some(p) = predicate {
+                f(p);
+            }
+        }
+        LogicalPlan::TableFunction {
+            args,
+            projections,
+            predicate,
+            ..
+        } => {
+            args.iter().chain(projections.iter()).for_each(&mut *f);
+            if let Some(p) = predicate {
+                f(p);
+            }
+        }
+        LogicalPlan::Join {
+            source,
+            projections,
+            predicate,
+            ..
+        } => {
+            for_each_join_expr(source, &mut *f);
+            projections.iter().for_each(&mut *f);
+            if let Some(p) = predicate {
+                f(p);
+            }
+        }
+        LogicalPlan::Limit { source, .. } => for_each_plan_expr(source, &mut *f),
+        LogicalPlan::Aggregate {
+            input,
+            predicate,
+            group_exprs,
+            aggregates,
+            having,
+            projections,
+            ..
+        } => {
+            if let AggInput::Join(join) = input {
+                for_each_join_expr(join, &mut *f);
+            }
+            if let Some(p) = predicate {
+                f(p);
+            }
+            group_exprs.iter().for_each(&mut *f);
+            for agg in aggregates {
+                if let Some(arg) = &agg.arg {
+                    f(arg);
+                }
+            }
+            if let Some(h) = having {
+                f(h);
+            }
+            projections.iter().for_each(&mut *f);
+        }
+        LogicalPlan::Insert {
+            source, returning, ..
+        } => {
+            match source {
+                InsertSource::Values(rows) => rows.iter().flatten().for_each(&mut *f),
+                InsertSource::Query { input, projections } => {
+                    for_each_plan_expr(input, &mut *f);
+                    projections.iter().for_each(&mut *f);
+                }
+            }
+            if let Some(r) = returning {
+                r.projections.iter().for_each(&mut *f);
+            }
+        }
+        LogicalPlan::Update {
+            predicate,
+            assignments,
+            returning,
+            ..
+        } => {
+            if let Some(p) = predicate {
+                f(p);
+            }
+            for (_, e) in assignments {
+                f(e);
+            }
+            if let Some(r) = returning {
+                r.projections.iter().for_each(&mut *f);
+            }
+        }
+        LogicalPlan::Delete {
+            predicate,
+            returning,
+            ..
+        } => {
+            if let Some(p) = predicate {
+                f(p);
+            }
+            if let Some(r) = returning {
+                r.projections.iter().for_each(&mut *f);
+            }
+        }
+    }
+}
+
+fn for_each_join_expr(join: &JoinExpr, f: &mut impl FnMut(&BoundExpr)) {
+    match join {
+        JoinExpr::Input { input, .. } => match input {
+            JoinInput::Scan(_) => {}
+            JoinInput::Subplan(plan) => for_each_plan_expr(plan, &mut *f),
+            JoinInput::TableFunction { args, .. } => args.iter().for_each(&mut *f),
+        },
+        JoinExpr::Join {
+            left,
+            right,
+            predicate,
+            ..
+        } => {
+            for_each_join_expr(left, &mut *f);
+            for_each_join_expr(right, &mut *f);
+            if let Some(p) = predicate {
+                f(p);
+            }
+        }
+    }
+}
+
+/// Whether an expression tree contains an [`BoundExpr::OuterColumnRef`],
+/// including inside nested expression-subquery subplans.
+fn expr_has_outer_ref(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::OuterColumnRef { .. } => true,
+        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => false,
+        BoundExpr::Unary { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::Coerce { expr, .. }
+        | BoundExpr::Reinterpret { expr, .. } => expr_has_outer_ref(expr),
+        BoundExpr::Binary { left, right, .. } => {
+            expr_has_outer_ref(left) || expr_has_outer_ref(right)
+        }
+        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+            args.iter().any(expr_has_outer_ref)
+        }
+        BoundExpr::Case { whens, else_, .. } => {
+            whens
+                .iter()
+                .any(|(c, r)| expr_has_outer_ref(c) || expr_has_outer_ref(r))
+                || else_.as_deref().is_some_and(expr_has_outer_ref)
+        }
+        BoundExpr::Aggregate { arg, .. } => arg.as_deref().is_some_and(expr_has_outer_ref),
+        BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
+            plan_has_outer_refs(&subplan.0)
+        }
+        BoundExpr::InSubquery { subplan, cmp, .. } => {
+            plan_has_outer_refs(&subplan.0) || expr_has_outer_ref(cmp)
+        }
+    }
+}
+
 pub fn bind_query(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -627,7 +1080,7 @@ pub fn bind_query_with_params(
     query: &ast::Query,
     params: &ParamCtx,
 ) -> Result<LogicalPlan, BindError> {
-    bind_query_scoped(engine, catalog, params, query, &CteEnv::new())
+    bind_query_scoped(engine, catalog, params, query, &CteEnv::new(), &[])
 }
 
 /// Bind a query with a set of visible CTEs. Recurses for CTE bodies and derived
@@ -638,33 +1091,39 @@ pub(crate) fn bind_query_scoped(
     params: &ParamCtx,
     query: &ast::Query,
     outer: &CteEnv,
+    outer_scope: &[OuterLevel],
 ) -> Result<LogicalPlan, BindError> {
     // Only build (clone) an extended environment when this query has a WITH; the
     // common no-CTE case binds against `outer` directly.
     match &query.with {
         Some(with) => {
             let ctes = bind_ctes(engine, catalog, params, with, outer)?;
-            bind_query_body(engine, catalog, params, query, &ctes)
+            bind_query_body(engine, catalog, params, query, &ctes, outer_scope)
         }
-        None => bind_query_body(engine, catalog, params, query, outer),
+        None => bind_query_body(engine, catalog, params, query, outer, outer_scope),
     }
 }
 
 /// Bind a query's body (SELECT or VALUES) against a resolved CTE environment.
+/// `outer_scope` carries the enclosing queries' relations when this body is a
+/// correlated subquery, so its columns can resolve outward (empty otherwise).
 fn bind_query_body(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
     params: &ParamCtx,
     query: &ast::Query,
     ctes: &CteEnv,
+    outer_scope: &[OuterLevel],
 ) -> Result<LogicalPlan, BindError> {
     reject_unsupported_query_clauses(query)?;
     let inner = match query.body.as_ref() {
         ast::SetExpr::Select(select) => {
             reject_unsupported_select_clauses(select)?;
-            bind_select(engine, catalog, params, select, &query.order_by, ctes)
+            bind_select(engine, catalog, params, select, &query.order_by, ctes, outer_scope)
         }
-        ast::SetExpr::Values(values) => bind_values_query(catalog, params, values, &query.order_by),
+        ast::SetExpr::Values(values) => {
+            bind_values_query(catalog, params, values, &query.order_by, outer_scope)
+        }
         ast::SetExpr::Table(table) => {
             bind_table_query(engine, catalog, params, table, &query.order_by, ctes)
         }
@@ -791,7 +1250,8 @@ fn bind_ctes(
                 format!("WITH query name \"{name}\" specified more than once"),
             ));
         }
-        let plan = bind_query_scoped(engine, catalog, params, &cte.query, &ctes)?;
+        // A CTE body is not correlated to the query that references it.
+        let plan = bind_query_scoped(engine, catalog, params, &cte.query, &ctes, &[])?;
         let mut columns = output_columns_of(&plan)?;
         apply_alias_columns(&mut columns, &cte.alias.columns, &with_query_subject(&name))?;
         ctes.insert(name, CteRelation { columns, plan });
@@ -807,17 +1267,19 @@ fn bind_select(
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
     ctes: &CteEnv,
+    outer_scope: &[OuterLevel],
 ) -> Result<LogicalPlan, BindError> {
     if select.from.is_empty() {
-        return bind_values_select(engine, catalog, params, select, order_by, ctes);
+        return bind_values_select(engine, catalog, params, select, order_by, ctes, outer_scope);
     }
     let BoundFrom {
         source,
         relations,
         visible,
-    } = bind_from_clause(engine, catalog, params, &select.from, ctes)?;
+    } = bind_from_clause(engine, catalog, params, &select.from, ctes, outer_scope)?;
     let scope = Scope::relations_with_visible(relations, visible, catalog, params)
-        .with_subqueries(engine, ctes);
+        .with_subqueries(engine, ctes)
+        .with_outer(outer_scope.to_vec());
     let body = bind_select_body(select, order_by, &scope)?;
     if let Some(agg) = body.aggregation {
         let input = match source {
@@ -1039,7 +1501,7 @@ fn bind_view_query(
             ));
         }
     };
-    bind_query_scoped(engine, catalog, &param_ctx_none(), query, &CteEnv::new())
+    bind_query_scoped(engine, catalog, &param_ctx_none(), query, &CteEnv::new(), &[])
 }
 
 /// The output columns a view reference exposes: the stored column names (which
@@ -1194,7 +1656,9 @@ fn bind_from_item(
                 ));
             };
             let qualifier = normalize_ident(&alias.name);
-            let inner = bind_query_scoped(engine, catalog, params, subquery, ctes)?;
+            // A (non-LATERAL) subquery in FROM cannot see the enclosing query's
+            // columns, so it binds with no outer scope.
+            let inner = bind_query_scoped(engine, catalog, params, subquery, ctes, &[])?;
             let mut columns = output_columns_of(&inner)?;
             apply_alias_columns(&mut columns, &alias.columns, &table_subject(&qualifier))?;
             Ok(BoundFromItem {
@@ -1239,6 +1703,7 @@ fn bind_from_clause(
     params: &ParamCtx,
     from: &[ast::TableWithJoins],
     ctes: &CteEnv,
+    outer_scope: &[OuterLevel],
 ) -> Result<BoundFrom, BindError> {
     let mut combined: Option<JoinExpr> = None;
     let mut relations: Vec<(String, Vec<Column>)> = Vec::new();
@@ -1253,7 +1718,7 @@ fn bind_from_clause(
             source: group_source,
             relations: group_relations,
             visible: group_visible,
-        } = bind_table_with_joins(engine, catalog, params, table, ctes)?;
+        } = bind_table_with_joins(engine, catalog, params, table, ctes, outer_scope)?;
         for (qualifier, _) in &group_relations {
             ensure_unique_qualifier(&mut seen, qualifier)?;
         }
@@ -1313,6 +1778,13 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
             ty: *ty,
         },
         BoundExpr::Param { index, ty } => BoundExpr::Param {
+            index: *index,
+            ty: *ty,
+        },
+        // An outer reference addresses an enclosing row, not this query's
+        // column layout, so the local shift leaves it untouched.
+        BoundExpr::OuterColumnRef { level, index, ty } => BoundExpr::OuterColumnRef {
+            level: *level,
             index: *index,
             ty: *ty,
         },
@@ -1415,6 +1887,7 @@ fn bind_table_with_joins(
     params: &ParamCtx,
     table: &ast::TableWithJoins,
     ctes: &CteEnv,
+    outer_scope: &[OuterLevel],
 ) -> Result<BoundFrom, BindError> {
     let mut bound =
         bind_from_item(engine, catalog, params, &table.relation, ctes)?.into_bound_from();
@@ -1462,7 +1935,8 @@ fn bind_table_with_joins(
                 });
                 let scope =
                     Scope::relations_with_visible(on_relations, on_visible, catalog, params)
-                        .with_subqueries(engine, ctes);
+                        .with_subqueries(engine, ctes)
+                        .with_outer(outer_scope.to_vec());
                 let binding = bind_expr(on, &scope)?;
                 if matches!(&binding, Binding::Typed(expr) if expr.contains_aggregate()) {
                     return Err(BindError::new(
@@ -1742,12 +2216,15 @@ fn bind_values_query(
     params: &ParamCtx,
     values: &ast::Values,
     order_by: &Option<ast::OrderBy>,
+    outer_scope: &[OuterLevel],
 ) -> Result<LogicalPlan, BindError> {
     if values.rows.is_empty() {
         return Err(BindError::syntax("VALUES lists must not be empty"));
     }
     let width = values.rows[0].content.len();
-    let scope = Scope::empty(catalog, params);
+    // A `VALUES (...)` used as a correlated subquery (`x IN (VALUES (outer.c))`)
+    // resolves its cell expressions outward via `outer_scope`; empty at top level.
+    let scope = Scope::empty(catalog, params).with_outer(outer_scope.to_vec());
     // Bind every cell, grouping bindings by column for type unification.
     let mut columns_of_bindings: Vec<Vec<crate::Binding>> = vec![Vec::new(); width];
     for row in &values.rows {
@@ -2285,8 +2762,11 @@ fn bind_values_select(
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
     ctes: &CteEnv,
+    outer_scope: &[OuterLevel],
 ) -> Result<LogicalPlan, BindError> {
-    let scope = Scope::empty(catalog, params).with_subqueries(engine, ctes);
+    let scope = Scope::empty(catalog, params)
+        .with_subqueries(engine, ctes)
+        .with_outer(outer_scope.to_vec());
     let mut columns = Vec::new();
     let mut row = Vec::new();
     for item in &select.projection {
@@ -2696,8 +3176,11 @@ fn rewrite_over_aggregate(
             ),
         )),
         // A bind parameter is a per-execution constant (like `Const`): it is the
-        // same value for every group, so it passes through unchanged.
-        c @ (BoundExpr::Const { .. } | BoundExpr::Param { .. }) => Ok(c),
+        // same value for every group, so it passes through unchanged. An outer
+        // (correlated) reference is likewise fixed across this query's groups.
+        c @ (BoundExpr::Const { .. }
+        | BoundExpr::Param { .. }
+        | BoundExpr::OuterColumnRef { .. }) => Ok(c),
         BoundExpr::Unary { op, expr } => Ok(BoundExpr::Unary {
             op,
             expr: Box::new(rewrite_over_aggregate(
@@ -2788,19 +3271,52 @@ fn rewrite_over_aggregate(
             "set-returning functions with aggregation are not supported yet",
         )),
         // A non-correlated subquery is a per-group constant, so scalar/EXISTS pass
-        // through unchanged. For IN, the needle carried by `cmp` is an outer
-        // expression that may hold an aggregate or grouped column, so rewrite it.
-        c @ (BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. }) => Ok(c),
+        // through unchanged. A *correlated* one is rejected here: its
+        // `OuterColumnRef` indices address the outer query's pre-aggregation row,
+        // but a target-list/HAVING expression is evaluated against the aggregate
+        // node's output row (`[group keys, aggregates]`), so the indices would not
+        // line up. (A correlated subquery in WHERE is unaffected — that predicate
+        // runs before aggregation, over the base row, and never reaches here.)
+        c @ (BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. }) => {
+            reject_correlated_over_aggregate(&c)?;
+            Ok(c)
+        }
         BoundExpr::InSubquery {
             subplan,
             negated,
             cmp,
-        } => Ok(BoundExpr::InSubquery {
-            subplan,
-            negated,
-            cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
-        }),
+        } => {
+            if plan_has_outer_refs(&subplan.0) {
+                return Err(correlated_over_aggregate_error());
+            }
+            Ok(BoundExpr::InSubquery {
+                subplan,
+                negated,
+                cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
+            })
+        }
     }
+}
+
+/// Reject a scalar/EXISTS subquery marker that is correlated to the enclosing
+/// (aggregating) query when it appears in a target-list/HAVING expression — see
+/// [`rewrite_over_aggregate`]. Non-correlated markers are left alone.
+fn reject_correlated_over_aggregate(marker: &BoundExpr) -> Result<(), BindError> {
+    let subplan = match marker {
+        BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => &subplan.0,
+        _ => return Ok(()),
+    };
+    if plan_has_outer_refs(subplan) {
+        return Err(correlated_over_aggregate_error());
+    }
+    Ok(())
+}
+
+fn correlated_over_aggregate_error() -> BindError {
+    BindError::feature_not_supported(
+        "correlated subquery in the target list or HAVING of a grouped/aggregated query \
+         is not supported yet",
+    )
 }
 
 /// A projection list item after classification.
@@ -5351,12 +5867,87 @@ mod tests {
     }
 
     #[test]
-    fn correlated_reference_is_rejected() {
-        // Stage 1 binds each subquery in an isolated scope, so an outer relation
-        // is not visible — a qualified outer reference is a missing-FROM error.
-        // (Correlated subqueries are a later stage.)
-        let e = bind_err("SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t WHERE id = x.id)");
-        assert_eq!(e.code, "42P01");
+    fn correlated_qualified_reference_binds_to_outer_column() {
+        // A qualified reference to an enclosing relation resolves outward rather
+        // than erroring: `x.id` becomes an OuterColumnRef at level 1, index 0
+        // (the outer row's `id`).
+        let LogicalPlan::Query {
+            predicate: Some(pred),
+            ..
+        } = bound("SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t WHERE id = x.id)")
+        else {
+            panic!("expected Query with a WHERE predicate");
+        };
+        let BoundExpr::Exists { subplan, negated } = pred else {
+            panic!("expected EXISTS marker, got {pred:?}");
+        };
+        assert!(!negated);
+        let LogicalPlan::Query {
+            predicate: Some(inner),
+            ..
+        } = &*subplan.0
+        else {
+            panic!("expected inner Query with a predicate");
+        };
+        let BoundExpr::Binary { right, .. } = inner else {
+            panic!("expected `id = x.id` comparison, got {inner:?}");
+        };
+        assert!(
+            matches!(
+                **right,
+                BoundExpr::OuterColumnRef {
+                    level: 1,
+                    index: 0,
+                    ..
+                }
+            ),
+            "expected outer reference to x.id, got {right:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_unqualified_reference_binds_to_outer_column() {
+        // An unqualified name absent from the subquery's own relation falls
+        // through to the enclosing query. Here `flag` is not selected from in the
+        // subquery's FROM-less body, so it resolves to the outer row.
+        let LogicalPlan::Query {
+            predicate: Some(pred),
+            ..
+        } = bound("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE flag)")
+        else {
+            panic!("expected Query with a WHERE predicate");
+        };
+        let BoundExpr::Exists { subplan, .. } = pred else {
+            panic!("expected EXISTS marker, got {pred:?}");
+        };
+        // The FROM-less inner body binds as a single-row Values plan; its WHERE
+        // is the bare `flag` outer reference (level 1, the outer row's `flag`).
+        let LogicalPlan::Values {
+            predicate: Some(inner),
+            ..
+        } = &*subplan.0
+        else {
+            panic!("expected inner Values with a predicate");
+        };
+        assert!(
+            matches!(
+                inner,
+                BoundExpr::OuterColumnRef {
+                    level: 1,
+                    index: 3,
+                    ..
+                }
+            ),
+            "expected outer reference to flag (index 3), got {inner:?}"
+        );
+    }
+
+    #[test]
+    fn uncorrelated_missing_column_still_errors_42703() {
+        // A name in neither the subquery nor any enclosing query is still the
+        // ordinary undefined-column error.
+        let e = bind_err("SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t WHERE nope = 1)");
+        assert_eq!(e.code, "42703");
     }
 
     #[test]

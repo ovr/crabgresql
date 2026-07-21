@@ -29,6 +29,16 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             sqlstate::INTERNAL_ERROR,
             format!("parameter ${} was not bound before execution", index + 1),
         )),
+        // A correlated outer reference is replaced with the enclosing row's value
+        // by `crabgresql_binder::substitute_outer` before its subplan runs (see
+        // `crate::eval_correlated_subquery`). Reaching evaluation means that step
+        // was skipped — an internal invariant break, like an unbound `Param`.
+        BoundExpr::OuterColumnRef { level, index, .. } => Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            format!(
+                "outer reference (level {level}, column {index}) was not substituted before execution"
+            ),
+        )),
         BoundExpr::Unary { op, expr } => eval_unary(*op, eval(expr, row, ctx)?),
         BoundExpr::Binary {
             op,
@@ -86,15 +96,13 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             sqlstate::FEATURE_NOT_SUPPORTED,
             "aggregate function called in a context that cannot accept one",
         )),
-        // Subquery markers are folded to constants/comparisons by
-        // `resolve_subqueries` before any node evaluates an expression; one
-        // reaching here means that pass was skipped — an internal invariant break.
+        // A *non-correlated* subquery marker is folded to a constant/comparison by
+        // `resolve_subqueries` before any node evaluates an expression, so it never
+        // reaches here. A *correlated* one is left in place — its value depends on
+        // the outer row — and folded now, against this row.
         BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
-        | BoundExpr::InSubquery { .. } => Err(ExecError::new(
-            sqlstate::INTERNAL_ERROR,
-            "subquery was not resolved before execution",
-        )),
+        | BoundExpr::InSubquery { .. } => crate::eval_correlated_subquery(expr, row, ctx),
     }
 }
 

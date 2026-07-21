@@ -385,6 +385,7 @@ impl Session {
         ExecContext {
             extra_float_digits: self.extra_float_digits,
             sequences: None,
+            txn: None,
         }
     }
 
@@ -403,6 +404,7 @@ impl Session {
                 Arc::clone(&self.seq_state),
                 read_only,
             ))),
+            txn: None,
         }
     }
 }
