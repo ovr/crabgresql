@@ -25,7 +25,7 @@ use crabgresql_types::{PgType, Value};
 
 use crate::catalog::SessionCatalog;
 use crate::error::PgError;
-use crate::global_catalog::{CatalogNotice, GlobalCatalog, TypeRef};
+use crate::global_catalog::{CatalogNotice, FuncDropSpec, GlobalCatalog, TypeRef};
 use crate::session::{ActiveTxn, Session};
 
 /// Severity of a non-error message sent before a command's CommandComplete.
@@ -530,6 +530,13 @@ pub fn execute_statement(
                 ..
             } => return execute_drop_sequence(&catalog, names, *cascade, *if_exists),
             ast::Statement::Drop {
+                object_type: ast::ObjectType::Index,
+                names,
+                cascade,
+                if_exists,
+                ..
+            } => return execute_drop_index(engine, &catalog, session, names, *cascade, *if_exists),
+            ast::Statement::Drop {
                 object_type: ast::ObjectType::Type,
                 names,
                 cascade,
@@ -542,6 +549,9 @@ pub fn execute_statement(
                 target,
                 ..
             } => return execute_drop_cast(global_catalog, source, target, *if_exists),
+            ast::Statement::DropFunction(drop) => {
+                return execute_drop_function(global_catalog, drop);
+            }
             ast::Statement::Set(set) => return apply_set(set, session),
             ast::Statement::Reset(reset) => return apply_reset(reset, session),
             ast::Statement::StartTransaction {
@@ -2594,6 +2604,13 @@ fn execute_create_function(
     };
     let mut args = Vec::new();
     for arg in create.args.iter().flatten() {
+        // OUT parameters are not part of a function's identity in PG, so they are
+        // excluded from the stored signature — matching how DROP FUNCTION resolves
+        // a target (execute_drop_function), so a created function is droppable by
+        // its input-argument signature.
+        if matches!(arg.mode, Some(ast::ArgMode::Out)) {
+            continue;
+        }
         // An empty span (line 0) means the arg was built without source
         // location; only parsed, bare arguments carry a caret position.
         let start = arg.data_type_span.start;
@@ -3425,6 +3442,144 @@ fn execute_drop_sequence(
     })
 }
 
+/// `DROP INDEX name [, ...] [IF EXISTS] [CASCADE|RESTRICT]`. A DROP INDEX names
+/// the index, not its table, so each target is resolved by scanning the session's
+/// relations (temp store first, then the permanent engine, mirroring PG's
+/// `pg_temp`-first search) for the index and dropping it from its owning table.
+/// All targets are validated before any is dropped, so a multi-name DROP is
+/// atomic like PG. An index backing a PRIMARY KEY / UNIQUE constraint cannot be
+/// dropped directly (PG requires dropping the constraint). `CASCADE`/`RESTRICT`
+/// are accepted and ignored: nothing depends on a plain index in this engine.
+fn execute_drop_index(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TableEngine>,
+    session: &Session,
+    names: &[ast::ObjectName],
+    _cascade: bool,
+    if_exists: bool,
+) -> Result<QueryResult, PgError> {
+    let targets = names
+        .iter()
+        .map(|name| split_object_name(name, "index"))
+        .collect::<Result<Vec<_>, _>>()?;
+    // A target named twice is rejected up front; the schema qualifier is part of
+    // the identity, so `s1.i, s2.i` are distinct and allowed.
+    for (i, target) in targets.iter().enumerate() {
+        if targets[..i].contains(target) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("index \"{}\" specified more than once", target.1),
+            ));
+        }
+    }
+    // Snapshot each store once (each call deep-clones its relation metadata).
+    let temp_meta = session.temp.relation_metadata();
+    let global_meta = engine.relation_metadata();
+    let mut notices = Vec::new();
+    // (is_temp, namespace, owning table, index name) to remove in phase 2.
+    let mut to_drop: Vec<(bool, String, String, String)> = Vec::new();
+    for (schema_qual, name) in &targets {
+        let ns = schema_qual.as_deref().unwrap_or("public");
+        // A temp index lives in the session temp keyspace (`pg_temp`); only an
+        // unqualified or temp-qualified name can name one, and it shadows a
+        // permanent index of the same name.
+        let temp_qualified = matches!(schema_qual.as_deref(), None | Some("pg_temp"))
+            || schema_qual.as_deref() == Some(session.temp_schema.as_str());
+        let owner = temp_qualified
+            .then(|| {
+                temp_meta
+                    .iter()
+                    .find(|r| r.indexes.iter().any(|i| i.name == *name))
+                    .map(|rel| (true, rel))
+            })
+            .flatten()
+            .or_else(|| {
+                global_meta
+                    .iter()
+                    .find(|r| r.schema.namespace == ns && r.indexes.iter().any(|i| i.name == *name))
+                    .map(|rel| (false, rel))
+            });
+        if let Some((is_temp, rel)) = owner {
+            // An index backing a constraint requires the constraint be dropped
+            // first — the same error PG raises (2BP01).
+            let backs_constraint = rel
+                .indexes
+                .iter()
+                .find(|i| i.name == *name)
+                .is_some_and(|i| i.constraint.is_some());
+            if backs_constraint {
+                return Err(PgError::new(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop index {name} because constraint {name} on table {} requires it",
+                        rel.schema.name
+                    ),
+                )
+                .with_hint(format!(
+                    "You can drop constraint {name} on table {} instead.",
+                    rel.schema.name
+                )));
+            }
+            // Temp relations are keyed under `public` in the temp engine.
+            let drop_ns = if is_temp {
+                "public"
+            } else {
+                rel.schema.namespace.as_str()
+            };
+            to_drop.push((
+                is_temp,
+                drop_ns.to_string(),
+                rel.schema.name.clone(),
+                name.clone(),
+            ));
+        } else if catalog.resolve(schema_qual.as_deref(), name).is_ok() {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not an index"),
+            )
+            .with_hint("Use DROP TABLE to remove a table."));
+        } else if catalog.resolve_view(schema_qual.as_deref(), name).is_some() {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not an index"),
+            )
+            .with_hint("Use DROP VIEW to remove a view."));
+        } else if catalog.sequence(ns, name).is_some() {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not an index"),
+            )
+            .with_hint("Use DROP SEQUENCE to remove a sequence."));
+        } else if if_exists {
+            notices.push(Notice::notice(
+                format!("index \"{name}\" does not exist, skipping"),
+                None,
+            ));
+        } else {
+            // PG reports a missing index as UNDEFINED_OBJECT (42704), not the
+            // UNDEFINED_TABLE (42P01) it uses for tables/views/sequences.
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("index \"{name}\" does not exist"),
+            ));
+        }
+    }
+    // Route each drop to the concrete store that owns the index, rather than the
+    // session overlay's table-name shadowing (which would misroute a permanent
+    // index when a temp table shares its table's name).
+    for (is_temp, ns, table, index_name) in &to_drop {
+        if *is_temp {
+            session.temp.drop_index("public", table, index_name)?;
+        } else {
+            engine.drop_index(ns, table, index_name)?;
+        }
+    }
+    Ok(QueryResult::Command {
+        tag: "DROP INDEX".into(),
+        notices,
+    })
+}
+
 /// `CREATE SCHEMA [IF NOT EXISTS] name`. Registers a user namespace with an
 /// engine-allocated OID. Rejects a `pg_`-prefixed name (reserved for system
 /// schemas, 42939), reports a collision as 42P06 (or a skip NOTICE under
@@ -3723,6 +3878,45 @@ fn execute_drop_type(
     let notices = catalog.drop_types(&refs, cascade, if_exists)?;
     Ok(QueryResult::Command {
         tag: "DROP TYPE".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// `DROP FUNCTION name [ ( argtypes ) ] [, ...] [IF EXISTS] [CASCADE|RESTRICT]`.
+/// Only `LANGUAGE internal` functions exist in this catalog, but the drop path
+/// is general: each target is resolved by (name, argument types), with the
+/// argument list optional when the name is unambiguous, as in PG. `OUT`
+/// parameters do not contribute to a function's identity, so they are left out
+/// of the lookup signature.
+fn execute_drop_function(
+    catalog: &GlobalCatalog,
+    drop: &ast::DropFunction,
+) -> Result<QueryResult, PgError> {
+    let mut specs: Vec<FuncDropSpec> = Vec::with_capacity(drop.func_desc.len());
+    for desc in &drop.func_desc {
+        let name = single_object_name(&desc.name, "function")?;
+        let args = match &desc.args {
+            Some(args) => {
+                let mut resolved = Vec::new();
+                for arg in args {
+                    if matches!(arg.mode, Some(ast::ArgMode::Out)) {
+                        continue;
+                    }
+                    resolved.push(resolve_type_ref(catalog, &arg.data_type)?);
+                }
+                Some(resolved)
+            }
+            None => None,
+        };
+        specs.push(FuncDropSpec { name, args });
+    }
+    // Naming the same function twice — via two identical signatures, or a bare
+    // name and its signature — is rejected in drop_functions once each target is
+    // resolved to a concrete function.
+    let cascade = matches!(drop.drop_behavior, Some(ast::DropBehavior::Cascade));
+    let notices = catalog.drop_functions(&specs, cascade, drop.if_exists)?;
+    Ok(QueryResult::Command {
+        tag: "DROP FUNCTION".into(),
         notices: to_notices(notices),
     })
 }

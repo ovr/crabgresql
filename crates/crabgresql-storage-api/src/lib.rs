@@ -463,6 +463,19 @@ pub trait TableEngine: Send + Sync {
         Err(StorageError::RelationAlreadyExists(index.name))
     }
 
+    /// Remove the index named `index_name` from `table` in `namespace`. The
+    /// caller has already located the owning table (indexes name the index, not
+    /// the table) and validated the drop. The default rejects it — only an
+    /// engine that stores indexes overrides this.
+    fn drop_index(
+        &self,
+        _namespace: &str,
+        _table: &str,
+        index_name: &str,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::TableNotFound(index_name.to_string()))
+    }
+
     /// Whether `index_name` is occupied in `namespace` (an index shares the
     /// relation namespace with tables/views/sequences). The `table` parameter
     /// matters for session overlays where temp and public may use the same name.

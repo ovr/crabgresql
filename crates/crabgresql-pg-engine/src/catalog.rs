@@ -369,6 +369,25 @@ impl RelCatalog {
         self.persist(&state)
     }
 
+    pub fn remove_index_in(
+        &self,
+        namespace: &str,
+        table: &str,
+        index_name: &str,
+    ) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let rel = state
+            .rels
+            .iter_mut()
+            .find(|r| r.namespace == namespace && r.name == table)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, table))?;
+        rel.indexes.retain(|i| i.name != index_name);
+        self.persist(&state)
+    }
+
     /// Whether a view named `name` exists in `namespace`.
     pub fn contains_view_in(&self, namespace: &str, name: &str) -> bool {
         self.state
