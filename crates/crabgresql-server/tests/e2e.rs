@@ -3421,6 +3421,109 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// DROP INDEX: reflection round-trip, IF EXISTS skip, wrong-object-type, the
+/// constraint-backing-index block, and multi-name atomic dedup. SQLSTATEs are
+/// asserted so the test is stable across PostgreSQL versions.
+#[tokio::test]
+async fn drop_index_semantics() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    client
+        .batch_execute("CREATE TABLE t (id int PRIMARY KEY, a int); CREATE INDEX t_a_idx ON t(a)")
+        .await?;
+
+    // The PK and the explicit index are both reflected as relkind='i'.
+    let count = |msgs: &[tokio_postgres::SimpleQueryMessage]| -> String {
+        rows(msgs)[0].get(0).unwrap_or_default().to_string()
+    };
+    let msgs = client
+        .simple_query("SELECT count(*) FROM pg_class WHERE relkind = 'i'")
+        .await?;
+    assert_eq!(count(&msgs), "2");
+
+    // A table name is not an index (42809).
+    let e = client.batch_execute("DROP INDEX t").await.unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::WRONG_OBJECT_TYPE);
+
+    // A constraint-backing index cannot be dropped directly (2BP01).
+    let e = client.batch_execute("DROP INDEX t_pkey").await.unwrap_err();
+    assert_eq!(
+        e.as_db_error().unwrap().code(),
+        &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
+    );
+
+    // A missing index is 42P01; IF EXISTS turns it into a skip NOTICE.
+    let e = client.batch_execute("DROP INDEX nope").await.unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::UNDEFINED_TABLE);
+    client.batch_execute("DROP INDEX IF EXISTS nope").await?;
+
+    // The real drop removes it from the catalog and frees the name for reuse.
+    client.batch_execute("DROP INDEX t_a_idx").await?;
+    let msgs = client
+        .simple_query("SELECT count(*) FROM pg_class WHERE relkind = 'i'")
+        .await?;
+    assert_eq!(count(&msgs), "1");
+    client.batch_execute("CREATE INDEX t_a_idx ON t(a)").await?;
+
+    // A name listed twice in one statement is rejected up front (42710).
+    let e = client
+        .batch_execute("DROP INDEX t_a_idx, t_a_idx")
+        .await
+        .unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::DUPLICATE_OBJECT);
+    Ok(())
+}
+
+/// DROP FUNCTION: resolves an overload by signature, the bare-name unambiguous
+/// and ambiguous (42725) forms, missing (42883) with IF EXISTS skip, and that a
+/// dropped signature frees its catalog slot for re-creation.
+#[tokio::test]
+async fn drop_function_semantics() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    // Two overloads of the same name (LANGUAGE internal is the only supported
+    // form; the declared signature need not match the builtin it wraps).
+    client
+        .batch_execute(
+            "CREATE FUNCTION f_in(cstring) RETURNS int8 AS 'int8in' LANGUAGE internal; \
+             CREATE FUNCTION f_in(int8) RETURNS cstring AS 'int8out' LANGUAGE internal",
+        )
+        .await?;
+
+    // A bare name with two overloads is ambiguous (42725).
+    let e = client.batch_execute("DROP FUNCTION f_in").await.unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::AMBIGUOUS_FUNCTION);
+
+    // Dropping one overload by its argument list leaves the other; the bare name
+    // is then unambiguous and drops it.
+    client.batch_execute("DROP FUNCTION f_in(int8)").await?;
+    client.batch_execute("DROP FUNCTION f_in").await?;
+
+    // Both are gone now: dropping a missing signature is 42883.
+    let e = client
+        .batch_execute("DROP FUNCTION f_in(cstring)")
+        .await
+        .unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::UNDEFINED_FUNCTION);
+    // IF EXISTS turns the miss into a skip NOTICE.
+    client
+        .batch_execute("DROP FUNCTION IF EXISTS f_in(cstring)")
+        .await?;
+    let e = client
+        .batch_execute("DROP FUNCTION nosuch(int4)")
+        .await
+        .unwrap_err();
+    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::UNDEFINED_FUNCTION);
+
+    // The dropped signature's catalog slot is free: re-creating it succeeds.
+    client
+        .batch_execute("CREATE FUNCTION f_in(cstring) RETURNS int8 AS 'int8in' LANGUAGE internal")
+        .await?;
+    Ok(())
+}
+
 /// nextval() / setval() are rejected in a read-only transaction (25006), even
 /// though a bare SELECT is not a DML write.
 #[tokio::test]

@@ -400,3 +400,40 @@ async fn view_survives_restart() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// DROP INDEX removes the index from the durable relation catalog, and the
+/// removal persists across a restart (the index does not reappear on recovery).
+#[tokio::test]
+async fn dropped_index_stays_dropped_across_a_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (port, handle) = spawn_pg(dir.path()).await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id int4, a int4)")
+        .await?;
+    client.simple_query("CREATE INDEX t_a_idx ON t(a)").await?;
+    // The index reflects as relkind='i' before the drop.
+    let messages = client
+        .simple_query("SELECT count(*) FROM pg_class WHERE relkind = 'i'")
+        .await?;
+    assert_eq!(rows(&messages)[0].get(0), Some("1"));
+    client.simple_query("DROP INDEX t_a_idx").await?;
+    let messages = client
+        .simple_query("SELECT count(*) FROM pg_class WHERE relkind = 'i'")
+        .await?;
+    assert_eq!(rows(&messages)[0].get(0), Some("0"));
+    shutdown(client, handle).await;
+
+    // Restart: the dropped index does not come back, and its name is free again.
+    let (port, handle) = spawn_pg(dir.path()).await;
+    let client = connect(port).await;
+    let messages = client
+        .simple_query("SELECT count(*) FROM pg_class WHERE relkind = 'i'")
+        .await?;
+    assert_eq!(rows(&messages)[0].get(0), Some("0"));
+    client.simple_query("CREATE INDEX t_a_idx ON t(a)").await?;
+    shutdown(client, handle).await;
+
+    Ok(())
+}

@@ -84,6 +84,13 @@ impl HeapTable {
             .push(index);
     }
 
+    pub fn remove_index(&self, index_name: &str) {
+        self.indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .retain(|i| i.name != index_name);
+    }
+
     #[allow(dead_code)] // used by tooling/tests and future index AM wiring
     pub fn relfilenode(&self) -> RelFileNode {
         RelFileNode(self.live_rel.load(Ordering::Relaxed))

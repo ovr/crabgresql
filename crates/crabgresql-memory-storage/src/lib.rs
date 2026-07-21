@@ -413,6 +413,33 @@ impl TableEngine for MemoryEngine {
         Ok(())
     }
 
+    fn drop_index(
+        &self,
+        namespace: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<(), StorageError> {
+        let tables = self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let target = tables
+            .get(&(namespace.to_string(), table.to_string()))
+            .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
+        // Remove both the semantic metadata and the physical equality index.
+        target
+            .indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .retain(|i| i.name != index_name);
+        target
+            .phys
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .retain(|p| p.name != index_name);
+        Ok(())
+    }
+
     fn relations(&self) -> Vec<TableSchema> {
         self.tables
             .read()

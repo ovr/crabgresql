@@ -51,6 +51,29 @@ impl TypeRef {
     }
 }
 
+/// A single target of `DROP FUNCTION`: the function name and, when the
+/// parenthesised argument list was given, its resolved argument types. `args:
+/// None` is the bare `DROP FUNCTION name` form — PG resolves it only when the
+/// name is unambiguous, else it raises `42725`.
+pub struct FuncDropSpec {
+    pub name: String,
+    pub args: Option<Vec<TypeRef>>,
+}
+
+impl FuncDropSpec {
+    /// PG's object description for error/NOTICE text: `function name(argtypes)`
+    /// when an argument list was given, else just `function name`.
+    fn describe(&self) -> String {
+        match &self.args {
+            Some(args) => {
+                let args: Vec<String> = args.iter().map(TypeRef::display_name).collect();
+                format!("function {}({})", self.name, args.join(", "))
+            }
+            None => format!("function {}", self.name),
+        }
+    }
+}
+
 /// A NOTICE the catalog asks the server to emit after a DDL command.
 #[derive(Debug)]
 pub struct CatalogNotice {
@@ -725,6 +748,43 @@ impl GlobalCatalog {
             )),
         }
     }
+
+    /// `DROP FUNCTION spec [, ...] [CASCADE|RESTRICT]`. Every target is resolved
+    /// before any is removed, so a failure on one leaves the whole statement's
+    /// targets intact (PG evaluates a multi-target DROP atomically). Nothing in
+    /// this catalog depends on a function — functions are only ever dependents of
+    /// user types — so `CASCADE`/`RESTRICT` have no dependents to walk and are
+    /// accepted without producing cascade notices.
+    pub fn drop_functions(
+        &self,
+        specs: &[FuncDropSpec],
+        _cascade: bool,
+        if_exists: bool,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        // Phase 1: resolve each target to the OID to remove. `None` marks an
+        // absent target that `if_exists` allows skipping (its NOTICE is emitted
+        // in phase 2). Any hard error here aborts before removing anything.
+        let mut resolved: Vec<Option<u32>> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            resolved.push(cat.resolve_drop_func(spec, if_exists)?);
+        }
+        // Phase 2: remove the resolved functions and collect skip NOTICEs.
+        let mut notices = Vec::new();
+        for (spec, oid) in specs.iter().zip(resolved) {
+            match oid {
+                Some(oid) => cat.remove_func(oid),
+                None => notices.push(CatalogNotice::new(format!(
+                    "{} does not exist, skipping",
+                    spec.describe()
+                ))),
+            }
+        }
+        Ok(notices)
+    }
 }
 
 /// Query-time view: lets the binder resolve a user type name in a cast target
@@ -919,6 +979,49 @@ impl CatalogInner {
                 .cast(oid)
                 .map(CastEntry::describe)
                 .unwrap_or_else(|| "cast ?".to_string()),
+        }
+    }
+
+    /// Resolve a `DROP FUNCTION` target to the OID to remove. `Ok(None)` means
+    /// the function is absent but `if_exists` permits skipping it. Errors on a
+    /// missing function (`42883`) or, for the bare-name form, an ambiguous match
+    /// (`42725`).
+    fn resolve_drop_func(
+        &self,
+        spec: &FuncDropSpec,
+        if_exists: bool,
+    ) -> Result<Option<u32>, PgError> {
+        // With an argument list the (name, args) key is unique (CREATE enforces
+        // it), so there is at most one match; a bare name may match several
+        // overloads.
+        let matches: Vec<&FuncEntry> = match &spec.args {
+            Some(args) => self
+                .funcs
+                .iter()
+                .filter(|f| f.name == spec.name && &f.args == args)
+                .collect(),
+            None => self.funcs.iter().filter(|f| f.name == spec.name).collect(),
+        };
+        match matches.as_slice() {
+            [entry] => Ok(Some(entry.oid)),
+            [] if if_exists => Ok(None),
+            [] => match &spec.args {
+                Some(_) => Err(PgError::new(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    format!("{} does not exist", spec.describe()),
+                )),
+                // PG spells the no-argument-list miss differently.
+                None => Err(PgError::new(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    format!("could not find a function named \"{}\"", spec.name),
+                )),
+            },
+            // Several overloads and no argument list to choose between them.
+            _ => Err(PgError::new(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                format!("function name \"{}\" is not unique", spec.name),
+            )
+            .with_hint("Specify the argument list to select the function unambiguously.")),
         }
     }
 
