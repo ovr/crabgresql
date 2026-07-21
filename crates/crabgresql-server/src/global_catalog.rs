@@ -772,6 +772,23 @@ impl GlobalCatalog {
         for spec in specs {
             resolved.push(cat.resolve_drop_func(spec, if_exists)?);
         }
+        // Two targets that resolve to the same function (identical signatures, or
+        // a bare name and its signature) name one object twice — PG rejects that
+        // with 42710, rendering the function's real signature.
+        for i in 0..resolved.len() {
+            if let Some(oid) = resolved[i]
+                && resolved[..i].contains(&Some(oid))
+            {
+                let desc = cat
+                    .func(oid)
+                    .map(FuncEntry::describe)
+                    .unwrap_or_else(|| "function ?".to_string());
+                return Err(PgError::new(
+                    sqlstate::DUPLICATE_OBJECT,
+                    format!("{desc} specified more than once"),
+                ));
+            }
+        }
         // Phase 2: remove the resolved functions and collect skip NOTICEs.
         let mut notices = Vec::new();
         for (spec, oid) in specs.iter().zip(resolved) {

@@ -535,7 +535,7 @@ pub fn execute_statement(
                 cascade,
                 if_exists,
                 ..
-            } => return execute_drop_index(&catalog, names, *cascade, *if_exists),
+            } => return execute_drop_index(engine, &catalog, session, names, *cascade, *if_exists),
             ast::Statement::Drop {
                 object_type: ast::ObjectType::Type,
                 names,
@@ -2604,6 +2604,13 @@ fn execute_create_function(
     };
     let mut args = Vec::new();
     for arg in create.args.iter().flatten() {
+        // OUT parameters are not part of a function's identity in PG, so they are
+        // excluded from the stored signature — matching how DROP FUNCTION resolves
+        // a target (execute_drop_function), so a created function is droppable by
+        // its input-argument signature.
+        if matches!(arg.mode, Some(ast::ArgMode::Out)) {
+            continue;
+        }
         // An empty span (line 0) means the arg was built without source
         // location; only parsed, bare arguments carry a caret position.
         let start = arg.data_type_span.start;
@@ -3436,14 +3443,17 @@ fn execute_drop_sequence(
 }
 
 /// `DROP INDEX name [, ...] [IF EXISTS] [CASCADE|RESTRICT]`. A DROP INDEX names
-/// the index, not its table, so each target is resolved by scanning the engine's
-/// relations for the index and dropping it from its owning table. All targets
-/// are validated before any is dropped, so a multi-name DROP is atomic like PG.
-/// An index backing a PRIMARY KEY / UNIQUE constraint cannot be dropped directly
-/// (PG requires dropping the constraint). `CASCADE`/`RESTRICT` are accepted and
-/// ignored: nothing depends on a plain index in this engine.
+/// the index, not its table, so each target is resolved by scanning the session's
+/// relations (temp store first, then the permanent engine, mirroring PG's
+/// `pg_temp`-first search) for the index and dropping it from its owning table.
+/// All targets are validated before any is dropped, so a multi-name DROP is
+/// atomic like PG. An index backing a PRIMARY KEY / UNIQUE constraint cannot be
+/// dropped directly (PG requires dropping the constraint). `CASCADE`/`RESTRICT`
+/// are accepted and ignored: nothing depends on a plain index in this engine.
 fn execute_drop_index(
+    engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TableEngine>,
+    session: &Session,
     names: &[ast::ObjectName],
     _cascade: bool,
     if_exists: bool,
@@ -3452,24 +3462,44 @@ fn execute_drop_index(
         .iter()
         .map(|name| split_object_name(name, "index"))
         .collect::<Result<Vec<_>, _>>()?;
-    for (i, (_, name)) in targets.iter().enumerate() {
-        if targets[..i].iter().any(|(_, n)| n == name) {
+    // A target named twice is rejected up front; the schema qualifier is part of
+    // the identity, so `s1.i, s2.i` are distinct and allowed.
+    for (i, target) in targets.iter().enumerate() {
+        if targets[..i].contains(target) {
             return Err(PgError::new(
                 sqlstate::DUPLICATE_OBJECT,
-                format!("index \"{name}\" specified more than once"),
+                format!("index \"{}\" specified more than once", target.1),
             ));
         }
     }
+    // Snapshot each store once (each call deep-clones its relation metadata).
+    let temp_meta = session.temp.relation_metadata();
+    let global_meta = engine.relation_metadata();
     let mut notices = Vec::new();
-    // (namespace, owning table, index name) to remove in phase 2.
-    let mut to_drop: Vec<(String, String, String)> = Vec::new();
+    // (is_temp, namespace, owning table, index name) to remove in phase 2.
+    let mut to_drop: Vec<(bool, String, String, String)> = Vec::new();
     for (schema_qual, name) in &targets {
         let ns = schema_qual.as_deref().unwrap_or("public");
-        let owner = catalog
-            .relation_metadata()
-            .into_iter()
-            .find(|r| r.schema.namespace == ns && r.indexes.iter().any(|i| i.name == *name));
-        if let Some(rel) = owner {
+        // A temp index lives in the session temp keyspace (`pg_temp`); only an
+        // unqualified or temp-qualified name can name one, and it shadows a
+        // permanent index of the same name.
+        let temp_qualified = matches!(schema_qual.as_deref(), None | Some("pg_temp"))
+            || schema_qual.as_deref() == Some(session.temp_schema.as_str());
+        let owner = temp_qualified
+            .then(|| {
+                temp_meta
+                    .iter()
+                    .find(|r| r.indexes.iter().any(|i| i.name == *name))
+                    .map(|rel| (true, rel))
+            })
+            .flatten()
+            .or_else(|| {
+                global_meta
+                    .iter()
+                    .find(|r| r.schema.namespace == ns && r.indexes.iter().any(|i| i.name == *name))
+                    .map(|rel| (false, rel))
+            });
+        if let Some((is_temp, rel)) = owner {
             // An index backing a constraint requires the constraint be dropped
             // first — the same error PG raises (2BP01).
             let backs_constraint = rel
@@ -3490,8 +3520,19 @@ fn execute_drop_index(
                     rel.schema.name
                 )));
             }
-            to_drop.push((rel.schema.namespace.clone(), rel.schema.name.clone(), name.clone()));
-        } else if catalog.resolve(Some(ns), name).is_ok() {
+            // Temp relations are keyed under `public` in the temp engine.
+            let drop_ns = if is_temp {
+                "public"
+            } else {
+                rel.schema.namespace.as_str()
+            };
+            to_drop.push((
+                is_temp,
+                drop_ns.to_string(),
+                rel.schema.name.clone(),
+                name.clone(),
+            ));
+        } else if catalog.resolve(schema_qual.as_deref(), name).is_ok() {
             return Err(PgError::new(
                 sqlstate::WRONG_OBJECT_TYPE,
                 format!("\"{name}\" is not an index"),
@@ -3515,14 +3556,23 @@ fn execute_drop_index(
                 None,
             ));
         } else {
+            // PG reports a missing index as UNDEFINED_OBJECT (42704), not the
+            // UNDEFINED_TABLE (42P01) it uses for tables/views/sequences.
             return Err(PgError::new(
-                sqlstate::UNDEFINED_TABLE,
+                sqlstate::UNDEFINED_OBJECT,
                 format!("index \"{name}\" does not exist"),
             ));
         }
     }
-    for (ns, table, index_name) in &to_drop {
-        catalog.drop_index(ns, table, index_name)?;
+    // Route each drop to the concrete store that owns the index, rather than the
+    // session overlay's table-name shadowing (which would misroute a permanent
+    // index when a temp table shares its table's name).
+    for (is_temp, ns, table, index_name) in &to_drop {
+        if *is_temp {
+            session.temp.drop_index("public", table, index_name)?;
+        } else {
+            engine.drop_index(ns, table, index_name)?;
+        }
     }
     Ok(QueryResult::Command {
         tag: "DROP INDEX".into(),
@@ -3860,18 +3910,9 @@ fn execute_drop_function(
         };
         specs.push(FuncDropSpec { name, args });
     }
-    // Reject a target named twice up front, as PG does (42710).
-    for (i, spec) in specs.iter().enumerate() {
-        if specs[..i]
-            .iter()
-            .any(|s| s.name == spec.name && s.args == spec.args)
-        {
-            return Err(PgError::new(
-                sqlstate::DUPLICATE_OBJECT,
-                format!("function \"{}\" specified more than once", spec.name),
-            ));
-        }
-    }
+    // Naming the same function twice — via two identical signatures, or a bare
+    // name and its signature — is rejected in drop_functions once each target is
+    // resolved to a concrete function.
     let cascade = matches!(drop.drop_behavior, Some(ast::DropBehavior::Cascade));
     let notices = catalog.drop_functions(&specs, cascade, drop.if_exists)?;
     Ok(QueryResult::Command {

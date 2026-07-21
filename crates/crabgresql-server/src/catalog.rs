@@ -130,20 +130,6 @@ impl TableEngine for SessionCatalog {
         }
     }
 
-    fn drop_index(
-        &self,
-        namespace: &str,
-        table: &str,
-        index_name: &str,
-    ) -> Result<(), StorageError> {
-        // A temp table (in the `public`-keyed temp store) shadows a permanent one.
-        if namespace == "public" && self.temp.open_table(table).is_ok() {
-            self.temp.drop_index("public", table, index_name)
-        } else {
-            self.global.drop_index(namespace, table, index_name)
-        }
-    }
-
     fn index_name_exists(&self, namespace: &str, table: &str, index_name: &str) -> bool {
         if namespace == "public" && self.temp.open_table(table).is_ok() {
             self.temp.index_name_exists("public", table, index_name)
