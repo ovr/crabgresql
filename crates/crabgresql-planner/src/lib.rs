@@ -668,8 +668,12 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
         // ColumnRef/Param reference per-row/per-execution state; FuncCall/Srf may
         // be volatile; Aggregate never appears in a bindable WHERE key. A subquery
         // is still an unresolved subplan at plan time, so never hoist it as a key.
+        // An outer (correlated) reference is only a `Const` after `substitute_outer`
+        // rewrites it per outer row; unresolved here it must not be hoisted as a
+        // once-evaluated index key.
         BoundExpr::ColumnRef { .. }
         | BoundExpr::Param { .. }
+        | BoundExpr::OuterColumnRef { .. }
         | BoundExpr::FuncCall { .. }
         | BoundExpr::Srf { .. }
         | BoundExpr::Aggregate { .. }

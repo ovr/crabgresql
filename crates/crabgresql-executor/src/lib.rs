@@ -72,6 +72,12 @@ pub struct ExecContext {
     /// `Values` node); a sequence function reaching a `None` context is an
     /// internal wiring error, reported as 5-char `XX000`.
     pub sequences: Option<Arc<dyn SequenceOps>>,
+    /// The transaction a correlated subquery re-executes against, per outer row.
+    /// Injected by [`execute`] once, at the top of the statement, and cloned into
+    /// every node so `eval` can run a correlated subplan when it reaches one.
+    /// `None` outside a real `execute` (a subquery marker never survives to a
+    /// context without it).
+    pub txn: Option<TxnContext>,
 }
 
 impl Default for ExecContext {
@@ -80,6 +86,7 @@ impl Default for ExecContext {
         Self {
             extra_float_digits: 1,
             sequences: None,
+            txn: None,
         }
     }
 }
@@ -164,9 +171,16 @@ pub fn execute(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    // Fold every non-correlated subquery to a constant/comparison before any node
-    // evaluates an expression, so `eval` never sees a subquery marker.
+    // Fold every *non-correlated* subquery to a constant/comparison before any
+    // node evaluates an expression. Correlated subqueries are left in place and
+    // folded per outer row by `eval`, which needs the transaction to re-run their
+    // subplans — so thread it through the context every node is built with (and
+    // nested `run_subplan` → `execute` re-injects it, so deeper levels see it too).
     resolve_subqueries(&mut plan, ctx, txn)?;
+    let ctx = &ExecContext {
+        txn: Some(txn.clone()),
+        ..ctx.clone()
+    };
     match plan {
         PhysicalPlan::Values {
             columns,
@@ -540,7 +554,10 @@ fn resolve_join(
 /// this node if it is itself a subquery marker.
 fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Result<(), ExecError> {
     match expr {
-        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => {}
+        BoundExpr::Const { .. }
+        | BoundExpr::ColumnRef { .. }
+        | BoundExpr::Param { .. }
+        | BoundExpr::OuterColumnRef { .. } => {}
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::Coerce { expr, .. }
@@ -570,10 +587,10 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
         BoundExpr::InSubquery { cmp, .. } => resolve_expr(cmp, ctx, txn)?,
         BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
     }
-    if matches!(
-        expr,
-        BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } | BoundExpr::InSubquery { .. }
-    ) {
+    // A correlated subquery cannot fold to a constant here — its value depends on
+    // the outer row — so leave the marker for `eval` to fold per row. Only
+    // non-correlated markers fold once, up front.
+    if is_foldable_subquery(expr) {
         let taken = std::mem::replace(
             expr,
             BoundExpr::Const {
@@ -586,6 +603,20 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
     Ok(())
 }
 
+/// Whether `expr` is a subquery marker that can be folded before execution: one
+/// whose subplan has no correlated outer reference. A correlated marker is left
+/// in place for per-outer-row folding in `eval`.
+fn is_foldable_subquery(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::ScalarSubquery { subplan, .. }
+        | BoundExpr::Exists { subplan, .. }
+        | BoundExpr::InSubquery { subplan, .. } => {
+            !crabgresql_binder::plan_has_outer_refs(&subplan.0)
+        }
+        _ => false,
+    }
+}
+
 /// Run a subquery marker's subplan once and fold it to a plain expression.
 fn fold_subquery(
     expr: BoundExpr,
@@ -595,30 +626,10 @@ fn fold_subquery(
     match expr {
         BoundExpr::ScalarSubquery { subplan, ty } => {
             let rows = run_subplan(*subplan.0, ctx, txn)?;
-            match rows.len() {
-                0 => Ok(BoundExpr::Const {
-                    value: Value::Null,
-                    ty,
-                }),
-                1 => {
-                    let value = match rows.into_iter().next() {
-                        Some(row) => row.into_iter().next().unwrap_or(Value::Null),
-                        None => Value::Null,
-                    };
-                    // Settle the value on the declared output type: the projection
-                    // usually already produces it, but a set-op / promoted column
-                    // could yield a narrower variant, and the outer operator was
-                    // bound against `ty`.
-                    Ok(BoundExpr::Const {
-                        value: coerce_value(value, ty, ctx)?,
-                        ty,
-                    })
-                }
-                _ => Err(ExecError::new(
-                    crabgresql_pg_wire::sqlstate::CARDINALITY_VIOLATION,
-                    "more than one row returned by a subquery used as an expression",
-                )),
-            }
+            Ok(BoundExpr::Const {
+                value: scalar_subquery_value(rows, ty, ctx)?,
+                ty,
+            })
         }
         BoundExpr::Exists { subplan, negated } => {
             // EXISTS only needs to know whether a row exists, so stop at the first
@@ -649,6 +660,90 @@ fn fold_subquery(
         }
         // Not a subquery marker (unreachable — the caller matched one).
         other => Ok(other),
+    }
+}
+
+/// The value a scalar subquery folds to from its materialized `rows`: no row →
+/// NULL, one row → its single column coerced to `ty` (the type the outer
+/// operator was bound against — a set-op / promoted column can be narrower), and
+/// more than one row → the `21000` cardinality violation.
+fn scalar_subquery_value(
+    rows: Vec<Tuple>,
+    ty: PgType,
+    ctx: &ExecContext,
+) -> Result<Value, ExecError> {
+    match rows.len() {
+        0 => Ok(Value::Null),
+        1 => {
+            let value = rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next())
+                .unwrap_or(Value::Null);
+            coerce_value(value, ty, ctx)
+        }
+        _ => Err(ExecError::new(
+            crabgresql_pg_wire::sqlstate::CARDINALITY_VIOLATION,
+            "more than one row returned by a subquery used as an expression",
+        )),
+    }
+}
+
+/// Evaluate a *correlated* subquery marker for one outer `row`: the per-row
+/// counterpart of `fold_subquery`. The subplan is cloned, its outer references
+/// filled from `row` (via `crabgresql_binder::substitute_outer`), then run and
+/// folded to a value — a scalar to its single value, `EXISTS` to a bool, and
+/// `IN (…)` to the outer needle's membership (evaluated against `row`). Called
+/// from `eval` when it reaches a marker `resolve_subqueries` left in place, which
+/// only happens under a real `execute`, so `ctx.txn` is present.
+pub(crate) fn eval_correlated_subquery(
+    marker: &BoundExpr,
+    row: &[Value],
+    ctx: &ExecContext,
+) -> Result<Value, ExecError> {
+    let txn = ctx.txn.as_ref().ok_or_else(|| {
+        ExecError::new(
+            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+            "correlated subquery evaluated without a transaction context",
+        )
+    })?;
+    match marker {
+        BoundExpr::ScalarSubquery { subplan, ty } => {
+            let mut logical = (*subplan.0).clone();
+            crabgresql_binder::substitute_outer(&mut logical, row);
+            let rows = run_subplan(logical, ctx, txn)?;
+            scalar_subquery_value(rows, *ty, ctx)
+        }
+        BoundExpr::Exists { subplan, negated } => {
+            let mut logical = (*subplan.0).clone();
+            crabgresql_binder::substitute_outer(&mut logical, row);
+            let exists = subplan_has_rows(logical, ctx, txn)?;
+            Ok(Value::Bool(exists != *negated))
+        }
+        BoundExpr::InSubquery {
+            subplan,
+            negated,
+            cmp,
+        } => {
+            let mut logical = (*subplan.0).clone();
+            crabgresql_binder::substitute_outer(&mut logical, row);
+            let rows = run_subplan(logical, ctx, txn)?;
+            // The OR-chain reuses the bound `x = <hole>` template, whose needle
+            // reads the current row — so evaluate the folded chain against `row`.
+            let in_expr = build_in_chain(cmp, rows, ctx)?;
+            let membership = eval::eval(&in_expr, row, ctx)?;
+            match (negated, membership) {
+                (false, m) => Ok(m),
+                // NOT IN is `NOT (x IN …)`, but Kleene: NULL stays NULL.
+                (true, Value::Bool(b)) => Ok(Value::Bool(!b)),
+                (true, other) => Ok(other),
+            }
+        }
+        // `eval` only calls this for a subquery marker.
+        _ => Err(ExecError::new(
+            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+            "eval_correlated_subquery called on a non-subquery expression",
+        )),
     }
 }
 

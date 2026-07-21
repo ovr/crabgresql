@@ -600,6 +600,106 @@ async fn subquery_review_fixes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Correlated subqueries: a subquery that references a column of the enclosing
+/// query is re-evaluated per outer row (the outer references filled from that
+/// row) — the shapes TPC-H Q2/Q4/Q17/Q20/Q21/Q22 rely on. Covers correlated
+/// `EXISTS`/`NOT EXISTS`, a correlated scalar (with empty → NULL), a correlated
+/// scalar-aggregate comparison in WHERE, a correlated `IN`, and two-level
+/// correlation.
+#[tokio::test]
+async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t1 (a int, b int)").await?;
+    client
+        .simple_query("INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30)")
+        .await?;
+    client.simple_query("CREATE TABLE t2 (a int, c int)").await?;
+    client
+        .simple_query("INSERT INTO t2 VALUES (1, 100), (1, 200), (2, 20), (2, 50), (4, 400)")
+        .await?;
+
+    // Correlated EXISTS (Q4-shape): keep outer rows with a matching t2 row.
+    let msgs = client
+        .simple_query("SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) ORDER BY a")
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("a")).collect();
+    assert_eq!(got, vec![Some("1"), Some("2")]);
+
+    // Correlated NOT EXISTS (Q22-shape): the anti-join complement.
+    let msgs = client
+        .simple_query(
+            "SELECT a FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) ORDER BY a",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("a")).collect();
+    assert_eq!(got, vec![Some("3")]);
+
+    // Correlated scalar subquery in the target list; no matching row → NULL.
+    let msgs = client
+        .simple_query(
+            "SELECT a, (SELECT max(c) FROM t2 WHERE t2.a = t1.a) AS mc FROM t1 ORDER BY a",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs)
+        .iter()
+        .map(|r| (r.get("a"), r.get("mc")))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Some("1"), Some("200")),
+            (Some("2"), Some("50")),
+            (Some("3"), None),
+        ]
+    );
+
+    // Correlated scalar-aggregate comparison in WHERE (Q17-shape). For a=3 the
+    // subquery is empty → NULL → the row is dropped (three-valued logic).
+    let msgs = client
+        .simple_query(
+            "SELECT a FROM t1 WHERE b < (SELECT max(c) FROM t2 WHERE t2.a = t1.a) ORDER BY a",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("a")).collect();
+    assert_eq!(got, vec![Some("1"), Some("2")]);
+
+    // Correlated IN: the candidate set depends on the outer row. Only a=2 has a
+    // t2.c (20) equal to its b (20).
+    let msgs = client
+        .simple_query(
+            "SELECT a FROM t1 WHERE b IN (SELECT c FROM t2 WHERE t2.a = t1.a) ORDER BY a",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("a")).collect();
+    assert_eq!(got, vec![Some("2")]);
+
+    // Two-level correlation: the innermost EXISTS references both the middle
+    // (y.c, level 1) and the outermost (x.a, level 2) query. Only a=2 qualifies
+    // (t2 row (2,20) and t1 row (2,20) with z.a = x.a and z.b = y.c).
+    let msgs = client
+        .simple_query(
+            "SELECT a FROM t1 x WHERE EXISTS (\
+               SELECT 1 FROM t2 y WHERE y.a = x.a AND EXISTS (\
+                 SELECT 1 FROM t1 z WHERE z.a = x.a AND z.b = y.c)) ORDER BY a",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("a")).collect();
+    assert_eq!(got, vec![Some("2")]);
+
+    // Correlation from a join outer (Q17-shape): the outer reference indexes into
+    // the joined (t1 || t2) row, so it must line up with that combined layout.
+    let msgs = client
+        .simple_query(
+            "SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a \
+             WHERE t1.b < (SELECT max(c) FROM t2 z WHERE z.a = t1.a) ORDER BY t1.a",
+        )
+        .await?;
+    let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("a")).collect();
+    assert_eq!(got, vec![Some("1"), Some("1"), Some("2"), Some("2")]);
+
+    Ok(())
+}
+
 /// tokio-postgres drives the extended protocol: it sends Parse with no declared
 /// parameter types and relies on the server to infer them and return binary
 /// results. A parameterized arithmetic query must round-trip through
