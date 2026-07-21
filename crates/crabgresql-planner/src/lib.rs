@@ -802,6 +802,7 @@ mod tests {
                 Column::new("big", PgType::Int8),
                 Column::new("name", PgType::Text),
             ],
+            access_method: None,
         }) {
             panic!("failed to create planner test table: {error}");
         }

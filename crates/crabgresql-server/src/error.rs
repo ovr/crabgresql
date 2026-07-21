@@ -68,6 +68,9 @@ impl From<StorageError> for PgError {
             }
             StorageError::SchemaAlreadyExists(_) => sqlstate::DUPLICATE_SCHEMA,
             StorageError::SchemaNotFound(_) => sqlstate::INVALID_SCHEMA_NAME,
+            // PG's ERRCODE_IO_ERROR (class 58, system error).
+            StorageError::Io(_) => "58030",
+            StorageError::Unsupported(_) => sqlstate::FEATURE_NOT_SUPPORTED,
         };
         Self::new(code, e.to_string())
     }

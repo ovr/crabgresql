@@ -1,0 +1,20 @@
+[package]
+name = "crabgresql-parquet-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crabgresql-storage-api.workspace = true
+crabgresql-txn.workspace = true
+crabgresql-types.workspace = true
+
+arrow.workspace = true
+parquet.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
