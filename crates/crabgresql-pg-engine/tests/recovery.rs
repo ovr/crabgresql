@@ -22,6 +22,7 @@ fn schema() -> TableSchema {
             Column::new("id", PgType::Int4),
             Column::new("name", PgType::Text),
         ],
+        access_method: None,
     }
 }
 

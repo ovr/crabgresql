@@ -146,6 +146,11 @@ pub struct TableSchema {
     /// error text and `pg_class.relname`).
     pub namespace: String,
     pub columns: Vec<Column>,
+    /// The table access method requested at `CREATE TABLE ... USING <method>`.
+    /// `None` means the default heap access method; `Some("parquet")` routes
+    /// the relation to the Parquet-backed engine. Used by the server's routing
+    /// engine to pick a backend at create time and reported as `pg_class.relam`.
+    pub access_method: Option<String>,
 }
 
 impl TableSchema {
@@ -155,6 +160,7 @@ impl TableSchema {
             name: name.into(),
             namespace: "public".to_string(),
             columns,
+            access_method: None,
         }
     }
 
@@ -168,7 +174,14 @@ impl TableSchema {
             name: name.into(),
             namespace: namespace.into(),
             columns,
+            access_method: None,
         }
+    }
+
+    /// Set the table access method (builder-style), leaving all else unchanged.
+    pub fn with_access_method(mut self, access_method: Option<String>) -> Self {
+        self.access_method = access_method;
+        self
     }
 }
 
@@ -273,6 +286,15 @@ pub enum StorageError {
     SchemaAlreadyExists(String),
     #[error("schema \"{0}\" does not exist")]
     SchemaNotFound(String),
+    /// A storage backend failed an underlying I/O or serialization operation
+    /// (e.g. the Parquet engine could not read or write a table's file).
+    #[error("{0}")]
+    Io(String),
+    /// The backend cannot represent something the DDL asked for (e.g. a column
+    /// type the Parquet access method does not support). Maps to a
+    /// feature-not-supported error.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Outcome of `TableAm::update`.
@@ -302,6 +324,14 @@ pub enum DeleteResult {
 /// caller's [`TxnContext`].
 pub trait TableAm: Send + Sync {
     fn schema(&self) -> &TableSchema;
+
+    /// The table access method backing this relation. Defaults to `"heap"`; the
+    /// Parquet engine returns `"parquet"`. The server consults this to reject
+    /// operations an access method cannot serve (e.g. `UPDATE`/`DELETE` on an
+    /// append-only Parquet table) before it reaches the storage layer.
+    fn access_method(&self) -> &str {
+        "heap"
+    }
 
     /// Semantic indexes currently attached to this table.
     fn indexes(&self) -> Vec<IndexMetadata> {

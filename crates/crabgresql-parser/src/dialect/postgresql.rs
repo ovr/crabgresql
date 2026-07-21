@@ -326,4 +326,14 @@ impl Dialect for PostgreSqlDialect {
     fn supports_comment_optimizer_hint(&self) -> bool {
         true
     }
+
+    /// Postgres accepts a table access method after the column list:
+    /// `CREATE TABLE t (...) USING <method>` (e.g. `heap`, or a
+    /// table-access-method extension). The parsed identifier lands in
+    /// `HiveIOFormat::Using`; the server validates and routes on it.
+    ///
+    /// See <https://www.postgresql.org/docs/current/sql-createtable.html>
+    fn supports_create_table_using(&self) -> bool {
+        true
+    }
 }

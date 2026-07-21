@@ -919,6 +919,7 @@ mod tests {
                 Column::new("id", PgType::Int4),
                 Column::new("name", PgType::Text),
             ],
+            access_method: None,
         }
     }
 
@@ -1446,6 +1447,7 @@ mod tests {
             name: "f".into(),
             namespace: "public".into(),
             columns: vec![Column::new("x", PgType::Float8)],
+            access_method: None,
         })?;
         engine.create_index("public", "f", unique_index("f_x_key", 0))?;
         assert!(!ft.supports_index_scan("f_x_key"));

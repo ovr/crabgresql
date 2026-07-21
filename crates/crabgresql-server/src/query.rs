@@ -1173,6 +1173,13 @@ fn execute_truncate(
         }
         let name = object_name_to_table_name(&target.name)?;
         let table = engine.open_table(&name)?;
+        // The Parquet access method is append-only: reject the whole statement
+        // before emptying any table (PG feature-not-supported, SQLSTATE 0A000).
+        if table.access_method() == "parquet" {
+            return Err(PgError::feature_not_supported(
+                "TRUNCATE is not supported on a parquet table",
+            ));
+        }
         named.push((name, table));
     }
     // Acquire the tables' exclusive locks in a deterministic order (by name), so
@@ -1590,6 +1597,29 @@ fn normalize_ident(ident: &ast::Ident) -> String {
     }
 }
 
+/// Resolve the table access method from a `CREATE TABLE ... USING <method>`
+/// clause. The parser records the identifier as a hive-style storage format.
+/// `heap` (and an absent clause) map to `None` — the default heap engine —
+/// while `parquet` maps to `Some("parquet")`. Any other method reproduces
+/// PostgreSQL's `42704 access method "<name>" does not exist`.
+fn resolve_access_method(create: &ast::CreateTable) -> Result<Option<String>, PgError> {
+    let format = match create.hive_formats.as_ref().and_then(|f| f.storage.as_ref()) {
+        Some(ast::HiveIOFormat::Using { format }) => format,
+        // No `USING`, or a hive storage form (STORED AS / ROW FORMAT) we do not
+        // model — the latter cannot appear under the Postgres dialect.
+        _ => return Ok(None),
+    };
+    let method = normalize_ident(format);
+    match method.as_str() {
+        "heap" => Ok(None),
+        "parquet" => Ok(Some("parquet".to_string())),
+        other => Err(PgError::new(
+            "42704",
+            format!("access method \"{other}\" does not exist"),
+        )),
+    }
+}
+
 /// A single-part object name, lowercased. `noun` names the object class for the
 /// error text ("relation", "type", "function"). Qualified names are not yet
 /// supported.
@@ -1696,6 +1726,15 @@ fn execute_create_table(
     if create.on_commit.is_some() {
         return Err(PgError::feature_not_supported(
             "CREATE TABLE ... ON COMMIT is not supported yet",
+        ));
+    }
+    // `USING <method>` selects the table access method. The parser records the
+    // identifier as a hive-style storage format; we recognize `heap` (the
+    // default) and `parquet`, and reproduce PG's error for anything else.
+    let access_method = resolve_access_method(create)?;
+    if access_method.as_deref() == Some("parquet") && create.temporary {
+        return Err(PgError::feature_not_supported(
+            "a temporary table cannot use the parquet access method",
         ));
     }
     #[derive(Clone)]
@@ -1894,6 +1933,7 @@ fn execute_create_table(
         name: name.clone(),
         namespace: namespace.clone(),
         columns,
+        access_method: access_method.clone(),
     };
     let mut indexes = Vec::new();
     for p in pending {
@@ -1939,6 +1979,21 @@ fn execute_create_table(
             for key in &index.keys {
                 schema.columns[key.column].nullable = false;
             }
+        }
+    }
+    // The Parquet access method is append-only and has no index or sequence
+    // support, so reject the DDL that would need them before anything is
+    // created (nothing to roll back on this early return).
+    if access_method.as_deref() == Some("parquet") {
+        if !serial_defs.is_empty() {
+            return Err(PgError::feature_not_supported(
+                "serial columns on a parquet table are not supported",
+            ));
+        }
+        if !indexes.is_empty() {
+            return Err(PgError::feature_not_supported(
+                "PRIMARY KEY / UNIQUE constraints on a parquet table are not supported",
+            ));
         }
     }
     // Create the serial columns' owned sequences before the table. Names were
@@ -2016,6 +2071,13 @@ fn execute_create_table_as(
             "this CREATE TABLE ... AS form is not supported yet",
         ));
     }
+    // Validate any `USING <method>` (rejecting unknown methods with 42704), but
+    // CTAS into a parquet table is not wired up yet — only plain CREATE TABLE.
+    if resolve_access_method(create)?.is_some() {
+        return Err(PgError::feature_not_supported(
+            "CREATE TABLE ... AS ... USING parquet is not supported yet",
+        ));
+    }
     // TEMP tables go in the session-local catalog; everything else in the durable
     // engine. The new table is later opened through the overlay `catalog`, which
     // resolves the temp target too. Clone the handle (rather than borrow
@@ -2070,6 +2132,7 @@ fn execute_create_table_as(
             .iter()
             .map(|c| Column::new(c.name.clone(), c.ty))
             .collect(),
+        access_method: None,
     };
 
     // Create the table first so a name collision short-circuits before the query

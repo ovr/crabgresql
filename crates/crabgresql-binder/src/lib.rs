@@ -112,6 +112,8 @@ impl From<StorageError> for BindError {
             }
             StorageError::SchemaAlreadyExists(_) => sqlstate::DUPLICATE_SCHEMA,
             StorageError::SchemaNotFound(_) => sqlstate::INVALID_SCHEMA_NAME,
+            StorageError::Io(_) => "58030",
+            StorageError::Unsupported(_) => sqlstate::FEATURE_NOT_SUPPORTED,
         };
         Self::new(code, e.to_string())
     }

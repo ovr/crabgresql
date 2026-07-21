@@ -1110,6 +1110,14 @@ fn execute_update(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    // The Parquet access method is append-only; reject in-place updates before
+    // touching the table (PG's feature-not-supported, SQLSTATE 0A000).
+    if table.access_method() == "parquet" {
+        return Err(ExecError::new(
+            "0A000",
+            "UPDATE is not supported on a parquet table",
+        ));
+    }
     let original: Vec<(Tid, Tuple)> = table.scan(txn).collect();
     // `simulated` mirrors the post-update table so a UNIQUE check sees other
     // rows' new values; it is only needed when a unique index exists.
@@ -1274,6 +1282,14 @@ fn execute_delete(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    // The Parquet access method is append-only; reject deletes before scanning
+    // (PG's feature-not-supported, SQLSTATE 0A000).
+    if table.access_method() == "parquet" {
+        return Err(ExecError::new(
+            "0A000",
+            "DELETE is not supported on a parquet table",
+        ));
+    }
     let mut pending: Vec<Tid> = Vec::new();
     // RETURNING sees the deleted (OLD) rows; capture them alongside the tids.
     let mut deleted: Vec<Tuple> = Vec::new();
@@ -2768,6 +2784,7 @@ mod tests {
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
             ],
+            access_method: None,
         }));
         let txn = wtxn();
         table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
@@ -2794,6 +2811,7 @@ mod tests {
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
             ],
+            access_method: None,
         }));
         test_ok(engine.create_index(
             "public",
@@ -3225,6 +3243,7 @@ mod tests {
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
             ],
+            access_method: None,
         }));
         let txn = wtxn();
         table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
@@ -3453,6 +3472,7 @@ mod tests {
                 Column::new("a", PgType::Int4),
                 Column::new("b", PgType::Int4),
             ],
+            access_method: None,
         }));
         let txn = wtxn();
         let seed: [(i32, Option<i32>); 5] = [
@@ -3510,6 +3530,7 @@ mod tests {
                 Column::new("g", PgType::Int4),
                 Column::new("v", PgType::Int4),
             ],
+            access_method: None,
         })?;
         let txn = wtxn();
         for (g, v) in [
@@ -3632,6 +3653,7 @@ mod tests {
                 Column::new("k", PgType::Int4),
                 Column::new("v", PgType::Int4),
             ],
+            access_method: None,
         })?;
         let txn = wtxn();
         for (k, v) in [(Some(1), 10), (None, 20), (Some(1), 5), (None, 7)] {
@@ -3664,6 +3686,7 @@ mod tests {
             name: "f".into(),
             namespace: "public".into(),
             columns: vec![Column::new("x", PgType::Float8)],
+            access_method: None,
         })?;
         let txn = wtxn();
         for x in [0.0_f64, -0.0, f64::NAN, f64::NAN] {
@@ -3991,6 +4014,7 @@ mod tests {
             name: "nums".into(),
             namespace: "public".into(),
             columns: vec![Column::new("n", PgType::Int4)],
+            access_method: None,
         }));
         let txn = wtxn();
         for n in [1, 2, 3] {

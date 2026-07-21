@@ -8,11 +8,13 @@ mod copy;
 mod error;
 mod global_catalog;
 mod query;
+mod routing;
 mod session;
 
 use std::path::Path;
 use std::sync::Arc;
 
+use crabgresql_parquet_storage::ParquetEngine;
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::TableEngine;
 use crabgresql_txn::{CommitSink, TransactionManager, TxnFinalize};
@@ -20,6 +22,19 @@ use crabgresql_wal::Wal;
 use tokio::net::TcpListener;
 
 use crate::global_catalog::GlobalCatalog;
+use crate::routing::RoutingEngine;
+
+/// Compose `default` (the boot heap/memory engine) with a Parquet engine rooted
+/// at `parquet_dir`, so `CREATE TABLE ... USING parquet` tables persist as
+/// Parquet files while every other relation stays in `default`. Any tables
+/// already present under `parquet_dir` are recovered.
+pub fn with_parquet_engine(
+    default: Arc<dyn TableEngine>,
+    parquet_dir: &Path,
+) -> std::io::Result<Arc<dyn TableEngine>> {
+    let parquet = ParquetEngine::open(parquet_dir).map_err(std::io::Error::other)?;
+    Ok(Arc::new(RoutingEngine::new(default, Arc::new(parquet))))
+}
 
 /// Open the durable heap engine over a data directory and run crash recovery:
 /// replay the WAL, rebuild the commit log, seed the XID allocator above every

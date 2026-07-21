@@ -59,6 +59,7 @@ pub fn pg_type_schema() -> TableSchema {
             col("typalign", CHARLIKE),
             col("typstorage", CHARLIKE),
         ],
+        access_method: None,
     }
 }
 
@@ -144,6 +145,7 @@ pub fn pg_enum_schema() -> TableSchema {
             col("enumsortorder", PgType::Float4),
             col("enumlabel", PgType::Name),
         ],
+        access_method: None,
     }
 }
 
@@ -186,6 +188,7 @@ pub fn pg_cast_schema() -> TableSchema {
             col("castcontext", CHARLIKE),
             col("castmethod", CHARLIKE),
         ],
+        access_method: None,
     }
 }
 
@@ -223,6 +226,7 @@ pub fn pg_sequence_schema() -> TableSchema {
             col("seqcache", PgType::Int8),
             col("seqcycle", PgType::Bool),
         ],
+        access_method: None,
     }
 }
 
@@ -256,6 +260,7 @@ pub fn pg_namespace_schema() -> TableSchema {
             // aclitem[]; represented as text and always NULL (default ACL) here.
             col("nspacl", PgType::Text),
         ],
+        access_method: None,
     }
 }
 
@@ -281,6 +286,7 @@ pub fn pg_class_schema() -> TableSchema {
             col("relpersistence", CHARLIKE),
             col("relkind", CHARLIKE),
         ],
+        access_method: None,
     }
 }
 
@@ -360,6 +366,7 @@ pub fn pg_attribute_schema() -> TableSchema {
             col("atthasdef", PgType::Bool),
             col("attisdropped", PgType::Bool),
         ],
+        access_method: None,
     }
 }
 
@@ -414,6 +421,7 @@ pub fn pg_attrdef_schema() -> TableSchema {
             col("adnum", PgType::Int2),
             col("adbin", PgType::Text),
         ],
+        access_method: None,
     }
 }
 
@@ -453,6 +461,7 @@ pub fn pg_constraint_schema() -> TableSchema {
             // int2[] is represented as PG array text until catalog arrays land.
             col("conkey", PgType::Text),
         ],
+        access_method: None,
     }
 }
 
@@ -552,6 +561,7 @@ pub fn pg_index_schema() -> TableSchema {
             col("indkey", PgType::Text),
             col("indoption", PgType::Text),
         ],
+        access_method: None,
     }
 }
 
@@ -640,6 +650,7 @@ pub fn information_schema_schemata_schema() -> TableSchema {
             col("default_character_set_name", PgType::Text),
             col("sql_path", PgType::Text),
         ],
+        access_method: None,
     }
 }
 
@@ -704,6 +715,7 @@ pub fn information_schema_tables_schema() -> TableSchema {
             col("is_typed", PgType::Text),
             col("commit_action", PgType::Text),
         ],
+        access_method: None,
     }
 }
 
@@ -795,6 +807,7 @@ pub fn information_schema_columns_schema() -> TableSchema {
             col("generation_expression", text),
             col("is_updatable", text),
         ],
+        access_method: None,
     }
 }
 

@@ -4142,6 +4142,7 @@ mod tests {
                 Column::new("name", PgType::Text),
                 Column::new("flag", PgType::Bool),
             ],
+            access_method: None,
         }) {
             panic!("failed to create binder test table: {error}");
         }
@@ -5102,6 +5103,7 @@ mod tests {
             name: "MixedCase".into(),
             namespace: "public".into(),
             columns: vec![Column::new("id", PgType::Int4)],
+            access_method: None,
         }) {
             panic!("failed to create test table: {error}");
         }

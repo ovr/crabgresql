@@ -155,6 +155,9 @@ impl RelCatalog {
                         name: r.name.clone(),
                         namespace: r.namespace.clone(),
                         columns,
+                        // The heap engine only ever stores heap tables; Parquet
+                        // relations live in the Parquet engine, not this catalog.
+                        access_method: None,
                     },
                     r.indexes.clone(),
                 )
