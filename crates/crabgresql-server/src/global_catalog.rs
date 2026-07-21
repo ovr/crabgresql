@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{EnumInfo, TypeCatalog, UserCast, UserType};
+use crabgresql_storage_api::{EnumInfo, SqlFunctionSig, TypeCatalog, UserCast, UserType};
 use crabgresql_types::PgType;
 
 use crate::error::PgError;
@@ -130,10 +130,20 @@ struct TypeEntry {
     dependents: Vec<DepId>,
 }
 
+/// How a registered function is implemented: a `LANGUAGE internal` builtin named
+/// by its C symbol (used only for the type-bootstrap I/O functions), or a
+/// `LANGUAGE SQL` function carrying its normalized `SELECT <expr>` body text.
+pub enum FuncBody {
+    Internal(String),
+    Sql(String),
+}
+
 struct FuncEntry {
     oid: u32,
     name: String,
     args: Vec<TypeRef>,
+    ret: TypeRef,
+    body: FuncBody,
 }
 
 impl FuncEntry {
@@ -212,6 +222,7 @@ impl CatalogInner {
             for arg in &mut func.args {
                 rewrite(arg, from, to);
             }
+            rewrite(&mut func.ret, from, to);
         }
         for cast in &mut self.casts {
             rewrite(&mut cast.source, from, to);
@@ -235,6 +246,22 @@ impl CatalogInner {
                 .type_name_by_oid(oid)
                 .map(|name| TypeRef::User(name.to_string())),
             other => Some(TypeRef::Builtin(other)),
+        }
+    }
+
+    /// The query-time `PgType` a stored [`TypeRef`] denotes: a builtin as-is, a
+    /// defined user type by its OID. `None` for a shell (not yet defined) user
+    /// type or the `cstring` I/O pseudo-type, neither of which a SQL function's
+    /// signature can use at query time.
+    fn pg_type_of(&self, r: &TypeRef) -> Option<PgType> {
+        match r {
+            TypeRef::Builtin(t) => Some(*t),
+            TypeRef::User(name) => self
+                .types
+                .get(name)
+                .filter(|e| e.defined)
+                .map(|e| PgType::User(e.oid)),
+            TypeRef::Cstring => None,
         }
     }
 }
@@ -539,19 +566,24 @@ impl GlobalCatalog {
         Ok(Vec::new())
     }
 
-    /// `CREATE FUNCTION ... LANGUAGE internal AS '<internal_name>'`. Validates the
-    /// internal name, registers the function, records its type dependencies, and
-    /// returns any "argument/return type is only a shell" NOTICEs.
-    /// `args` pairs each argument type with the 1-based (line, column) of its
-    /// type token, when known — used to point the argument-shell NOTICE's caret.
+    /// `CREATE FUNCTION`, for both `LANGUAGE internal AS '<internal_name>'` and
+    /// `LANGUAGE SQL` (whose `body` carries the normalized `SELECT <expr>` text).
+    /// Validates an internal name, registers the function, records its type
+    /// dependencies, and returns any "argument/return type is only a shell"
+    /// NOTICEs. `args` pairs each argument type with the 1-based (line, column) of
+    /// its type token, when known — used to point the argument-shell NOTICE's caret.
     pub fn create_function(
         &self,
         name: &str,
         args: Vec<(TypeRef, Option<(u64, u64)>)>,
         ret: TypeRef,
-        internal_name: &str,
+        body: FuncBody,
     ) -> Result<Vec<CatalogNotice>, PgError> {
-        if !is_known_internal(internal_name) {
+        // A `LANGUAGE internal` function must name a supported builtin I/O symbol;
+        // a `LANGUAGE SQL` body was already parsed and validated by the binder.
+        if let FuncBody::Internal(internal_name) = &body
+            && !is_known_internal(internal_name)
+        {
             return Err(PgError::new(
                 sqlstate::UNDEFINED_FUNCTION,
                 format!("there is no built-in function named \"{internal_name}\""),
@@ -617,6 +649,8 @@ impl GlobalCatalog {
             oid,
             name: name.to_string(),
             args: arg_types,
+            ret,
+            body,
         });
         Ok(notices)
     }
@@ -879,6 +913,36 @@ impl TypeCatalog for GlobalCatalog {
             labels: labels.clone(),
         })
     }
+
+    fn sql_functions(&self, name: &str) -> Vec<SqlFunctionSig> {
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        cat.funcs
+            .iter()
+            .filter(|f| f.name == name)
+            .filter_map(|f| {
+                let FuncBody::Sql(body) = &f.body else {
+                    return None;
+                };
+                // A SQL function whose signature mentions `cstring` or an
+                // undefined shell type cannot be called; skip it rather than
+                // surface an unusable overload to the binder.
+                let arg_types = f
+                    .args
+                    .iter()
+                    .map(|a| cat.pg_type_of(a))
+                    .collect::<Option<Vec<_>>>()?;
+                let return_type = cat.pg_type_of(&f.ret)?;
+                Some(SqlFunctionSig {
+                    arg_types,
+                    return_type,
+                    body: body.clone(),
+                })
+            })
+            .collect()
+    }
 }
 
 /// A user-defined type as surfaced to the system-catalog (`pg_type`/`pg_enum`)
@@ -1106,7 +1170,7 @@ mod tests {
             "xfloat8in",
             vec![(TypeRef::Cstring, None)],
             TypeRef::User("xfloat8".into()),
-            "int8in",
+            FuncBody::Internal("int8in".into()),
         ) {
             Ok(notices) => notices,
             Err(error) => panic!("failed to create input function test fixture: {error}"),
@@ -1116,7 +1180,7 @@ mod tests {
             "xfloat8out",
             vec![(TypeRef::User("xfloat8".into()), Some((1, 28)))],
             TypeRef::Cstring,
-            "int8out",
+            FuncBody::Internal("int8out".into()),
         ) {
             Ok(notices) => notices,
             Err(error) => panic!("failed to create output function test fixture: {error}"),
@@ -1171,7 +1235,7 @@ mod tests {
             "solo_in",
             vec![(TypeRef::Cstring, None)],
             TypeRef::User("solo".into()),
-            "int8in",
+            FuncBody::Internal("int8in".into()),
         )?;
         let notices = cat.drop_types(&["solo"], true, false)?;
         assert_eq!(notices.len(), 1);
@@ -1297,11 +1361,66 @@ mod tests {
                 "f",
                 vec![(TypeRef::Cstring, None)],
                 TypeRef::Builtin(PgType::Int8),
-                "nope",
+                FuncBody::Internal("nope".into()),
             )
             .unwrap_err();
         assert_eq!(err.code, sqlstate::UNDEFINED_FUNCTION);
         assert_eq!(err.message, "there is no built-in function named \"nope\"");
+    }
+
+    #[test]
+    fn sql_function_stores_body_and_is_looked_up_by_name() -> anyhow::Result<()> {
+        let cat = GlobalCatalog::new();
+        cat.create_function(
+            "add",
+            vec![
+                (TypeRef::Builtin(PgType::Int4), None),
+                (TypeRef::Builtin(PgType::Int4), None),
+            ],
+            TypeRef::Builtin(PgType::Int8),
+            FuncBody::Sql("SELECT $1 + $2".into()),
+        )?;
+
+        let sigs = cat.sql_functions("add");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].arg_types, vec![PgType::Int4, PgType::Int4]);
+        assert_eq!(sigs[0].return_type, PgType::Int8);
+        assert_eq!(sigs[0].body, "SELECT $1 + $2");
+
+        // A `LANGUAGE internal` function of the same arity is not a SQL function
+        // and must not surface through `sql_functions`.
+        cat.create_function(
+            "add",
+            vec![(TypeRef::Cstring, None)],
+            TypeRef::Builtin(PgType::Int8),
+            FuncBody::Internal("int8in".into()),
+        )?;
+        assert_eq!(cat.sql_functions("add").len(), 1);
+
+        // Overloading by argument type registers a second SQL entry.
+        cat.create_function(
+            "add",
+            vec![(TypeRef::Builtin(PgType::Int4), None)],
+            TypeRef::Builtin(PgType::Int4),
+            FuncBody::Sql("SELECT $1".into()),
+        )?;
+        assert_eq!(cat.sql_functions("add").len(), 2);
+
+        // Same name + same argument types is rejected.
+        let err = cat
+            .create_function(
+                "add",
+                vec![
+                    (TypeRef::Builtin(PgType::Int4), None),
+                    (TypeRef::Builtin(PgType::Int4), None),
+                ],
+                TypeRef::Builtin(PgType::Int4),
+                FuncBody::Sql("SELECT 0".into()),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, sqlstate::DUPLICATE_FUNCTION);
+
+        Ok(())
     }
 
     #[test]
@@ -1314,7 +1433,7 @@ mod tests {
                 "xd_in",
                 vec![(TypeRef::Cstring, None)],
                 TypeRef::User("xd".into()),
-                "date_in",
+                FuncBody::Internal("date_in".into()),
             )
             .is_ok()
         );

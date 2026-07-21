@@ -612,6 +612,18 @@ pub struct EnumInfo {
     pub labels: Vec<String>,
 }
 
+/// A registered `CREATE FUNCTION ... LANGUAGE SQL`, as the binder needs it to
+/// resolve and inline a call: the declared argument types, the declared return
+/// type, and the body as SQL **text** (a `SELECT <expr>` the binder re-parses on
+/// each call, keeping this crate free of a parser/binder dependency, exactly as
+/// [`ViewDefinition`] carries a view's query text).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlFunctionSig {
+    pub arg_types: Vec<PgType>,
+    pub return_type: PgType,
+    pub body: String,
+}
+
 /// A registered `CREATE CAST (source AS target)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserCast {
@@ -654,6 +666,14 @@ pub trait TypeCatalog: Send + Sync {
     /// test for a `PgType::User(oid)`.
     fn enum_info(&self, _oid: u32) -> Option<EnumInfo> {
         None
+    }
+
+    /// Every `LANGUAGE SQL` function registered under `name` (case-insensitive),
+    /// one [`SqlFunctionSig`] per overload. The binder consults this when no
+    /// built-in matches a call, then re-parses and inlines the chosen body.
+    /// Callers with no user functions (binder unit tests) get the empty default.
+    fn sql_functions(&self, _name: &str) -> Vec<SqlFunctionSig> {
+        Vec::new()
     }
 }
 

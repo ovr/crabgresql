@@ -3873,3 +3873,208 @@ async fn copy_in_fills_serial_default_from_sequence() -> anyhow::Result<()> {
     assert_eq!(rows[1].get("name"), Some("bob"));
     Ok(())
 }
+
+#[tokio::test]
+async fn create_function_language_sql_evaluates_and_composes() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // The `AS $$ SELECT ... $$` body form and a direct call.
+    client
+        .simple_query("CREATE FUNCTION add(int, int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + $2 $$")
+        .await?;
+    let out = client.simple_query("SELECT add(1, 2)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("3"));
+
+    // The extended protocol: the outer statement's `$1`/`$2` are the call
+    // arguments, distinct from the body's own (now inlined) parameters.
+    let row = client.query_one("SELECT add($1, $2)", &[&5i32, &7i32]).await?;
+    assert_eq!(row.get::<_, i32>(0), 12);
+
+    // The `RETURN <expr>` body form.
+    client
+        .simple_query("CREATE FUNCTION inc(int) RETURNS int LANGUAGE SQL RETURN $1 + 1")
+        .await?;
+    let out = client.simple_query("SELECT inc(41)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("42"));
+
+    // Functions compose: a body may call another SQL function, and arguments are
+    // arbitrary expressions evaluated in the caller.
+    client
+        .simple_query("CREATE FUNCTION double_inc(int) RETURNS int LANGUAGE SQL AS $$ SELECT inc(inc($1)) $$")
+        .await?;
+    let out = client.simple_query("SELECT double_inc(40), add(inc(1), 5)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("42"));
+    assert_eq!(rows(&out)[0].get(1), Some("7"));
+
+    // Return-type coercion: an int body widens to the declared bigint return.
+    client
+        .simple_query("CREATE FUNCTION widen(int) RETURNS bigint LANGUAGE SQL AS $$ SELECT $1 $$")
+        .await?;
+    let out = client.simple_query("SELECT widen(5)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("5"));
+
+    // Overloading by argument type: same name, different signature.
+    client
+        .simple_query("CREATE FUNCTION same(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 * 10 $$")
+        .await?;
+    client
+        .simple_query("CREATE FUNCTION same(text) RETURNS text LANGUAGE SQL AS $$ SELECT $1 || '!' $$")
+        .await?;
+    let out = client.simple_query("SELECT same(4), same('hi')").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("40"));
+    assert_eq!(rows(&out)[0].get(1), Some("hi!"));
+
+    // A function used per row over a table.
+    client.simple_query("CREATE TABLE t (a int, b int)").await?;
+    client.simple_query("INSERT INTO t VALUES (1, 2), (3, 4), (10, 20)").await?;
+    let out = client
+        .simple_query("SELECT add(a, b) AS s FROM t ORDER BY a")
+        .await?;
+    let out = rows(&out);
+    assert_eq!(out[0].get("s"), Some("3"));
+    assert_eq!(out[1].get("s"), Some("7"));
+    assert_eq!(out[2].get("s"), Some("30"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    // A `$n` past the declared argument list has no value to bind, and the error
+    // names the parameter actually referenced (not argcount+1).
+    let err = client
+        .simple_query("CREATE FUNCTION bad(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + $9 $$")
+        .await
+        .unwrap_err();
+    let dberr = err.as_db_error().expect("database error");
+    assert_eq!(dberr.code(), &SqlState::UNDEFINED_PARAMETER);
+    assert_eq!(dberr.message(), "there is no parameter $9");
+
+    // A body whose type is not assignable to the declared return type.
+    let err = client
+        .simple_query("CREATE FUNCTION badret(int) RETURNS bool LANGUAGE SQL AS $$ SELECT $1 $$")
+        .await
+        .unwrap_err();
+    let dberr = err.as_db_error().expect("database error");
+    assert_eq!(dberr.code(), &SqlState::INVALID_FUNCTION_DEFINITION);
+    assert_eq!(
+        dberr.message(),
+        "return type mismatch in function declared to return boolean"
+    );
+    assert_eq!(dberr.detail(), Some("Actual return type is integer."));
+
+    // An unknown function referenced in a body is rejected at CREATE time.
+    let err = client
+        .simple_query("CREATE FUNCTION nested(int) RETURNS int LANGUAGE SQL AS $$ SELECT nope($1) $$")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_FUNCTION
+    );
+
+    // Only scalar, FROM-less bodies are supported for now.
+    client.simple_query("CREATE TABLE t (a int)").await?;
+    let err = client
+        .simple_query("CREATE FUNCTION scan() RETURNS int LANGUAGE SQL AS $$ SELECT a FROM t $$")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // A duplicate name+signature is rejected.
+    client
+        .simple_query("CREATE FUNCTION dup(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 $$")
+        .await?;
+    let err = client
+        .simple_query("CREATE FUNCTION dup(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + 1 $$")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::DUPLICATE_FUNCTION
+    );
+
+    // Calling with a wrong argument count finds no matching overload.
+    let err = client.simple_query("SELECT dup(1, 2)").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_FUNCTION
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_function_language_sql_resolution_and_volatility_match_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE SEQUENCE s").await?;
+
+    // A volatile argument (nextval) referenced more than once in the body would be
+    // evaluated once per occurrence if inlined; refuse it rather than diverge from
+    // PostgreSQL (which evaluates each argument once).
+    client
+        .simple_query(
+            "CREATE FUNCTION twice(bigint) RETURNS bigint LANGUAGE SQL AS $$ SELECT $1 + $1 $$",
+        )
+        .await?;
+    let err = client
+        .simple_query("SELECT twice(nextval('s'))")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+    // A non-volatile argument used twice is fine (double work, same result), and a
+    // volatile argument referenced once is fine (evaluated once).
+    let out = client.simple_query("SELECT twice(21)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("42"));
+    client
+        .simple_query(
+            "CREATE FUNCTION once(bigint) RETURNS bigint LANGUAGE SQL AS $$ SELECT $1 + 1 $$",
+        )
+        .await?;
+    let out = client.simple_query("SELECT once(nextval('s'))").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("2")); // nextval->1, +1 = 2 (advanced once)
+
+    // Overloading: an exact match resolves; two equally-coercible overloads are
+    // ambiguous (42725), as in PostgreSQL.
+    client
+        .simple_query("CREATE FUNCTION g(bigint) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$")
+        .await?;
+    client
+        .simple_query("CREATE FUNCTION g(numeric) RETURNS int LANGUAGE SQL AS $$ SELECT 2 $$")
+        .await?;
+    let out = client.simple_query("SELECT g(1::bigint)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("1")); // exact bigint overload
+    let err = client.simple_query("SELECT g(1::int)").await.unwrap_err();
+    let dberr = err.as_db_error().expect("database error");
+    assert_eq!(dberr.code(), &SqlState::AMBIGUOUS_FUNCTION);
+    assert_eq!(dberr.message(), "function g(integer) is not unique");
+    assert_eq!(
+        dberr.hint(),
+        Some("You might need to add explicit type casts.")
+    );
+
+    // An aggregate body is a scalar-inlining limitation, reported as unsupported
+    // (PostgreSQL accepts `SELECT sum(1)`), not a grouping error.
+    let err = client
+        .simple_query("CREATE FUNCTION agg() RETURNS bigint LANGUAGE SQL AS $$ SELECT sum(1) $$")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    Ok(())
+}

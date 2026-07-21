@@ -7,11 +7,16 @@
 //! tests, where arguments are floats, unknown literals, or ints promoted to
 //! float8.
 
+use std::sync::Arc;
+
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_storage_api::{SqlFunctionSig, TypeCatalog};
 use crabgresql_types::PgType;
 
-use crate::expr::{Binding, BoundExpr, Scope, bind_expr, coerce_for_arg};
+use crate::expr::{
+    Binding, BoundExpr, Scope, bind_expr, bind_sql_function_body, coerce_for_arg, inline_params,
+};
 use crate::{BindError, OutputColumn};
 
 /// A scalar function the executor can evaluate.
@@ -1651,7 +1656,7 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         }));
     }
 
-    resolve_call(&name, bindings)
+    resolve_call(&name, bindings, scope.catalog())
 }
 
 /// Bind an aggregate call (`count(*)`, `min(x)`, `sum(a + b)`, …) to a transient
@@ -1794,10 +1799,16 @@ fn bind_aggregate(
 /// Resolve an overload for `name` given already-bound arguments, then build the
 /// `FuncCall` node. Shared by ordinary function calls and the `CEIL`/`FLOOR`
 /// special-syntax expressions.
-pub(crate) fn resolve_call(name: &str, bindings: Vec<Binding>) -> Result<Binding, BindError> {
+pub(crate) fn resolve_call(
+    name: &str,
+    bindings: Vec<Binding>,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Binding, BindError> {
     let sigs = lookup(name);
     if sigs.is_empty() {
-        return Err(undefined_function(name, &bindings));
+        // No built-in of this name: a user-defined `LANGUAGE SQL` function may
+        // still match. Only when that also fails is the call undefined.
+        return resolve_sql_function_call(name, bindings, catalog);
     }
     // First try an all-exact-type match. Then, among the signatures whose args
     // all coerce, pick the one keeping the most arguments at their exact type —
@@ -1837,8 +1848,132 @@ pub(crate) fn resolve_call(name: &str, bindings: Vec<Binding>) -> Result<Binding
             ret: sig.ret,
             args,
         })),
-        None => Err(undefined_function(name, &bindings)),
+        // No built-in overload fit the argument types; a user `LANGUAGE SQL`
+        // function of the same name but different signature may still match.
+        None => resolve_sql_function_call(name, bindings, catalog),
     }
+}
+
+/// Maximum depth of nested `LANGUAGE SQL` inlining. A validated function cannot
+/// reference itself (it is registered only after its body binds), so this only
+/// guards against a pathological chain and never trips for legitimate calls.
+const MAX_INLINE_DEPTH: u32 = 100;
+
+thread_local! {
+    /// Current SQL-function inlining depth on this (single-threaded) bind. A RAII
+    /// guard keeps it balanced across the `?` early-returns inside inlining.
+    static INLINE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct InlineGuard;
+
+impl InlineGuard {
+    /// Enter one inlining level, or error if the nesting limit is reached.
+    fn enter() -> Result<InlineGuard, BindError> {
+        let depth = INLINE_DEPTH.with(|d| {
+            let next = d.get() + 1;
+            d.set(next);
+            next
+        });
+        if depth > MAX_INLINE_DEPTH {
+            INLINE_DEPTH.with(|d| d.set(d.get() - 1));
+            // PG's ERRCODE_STATEMENT_TOO_COMPLEX ("stack depth limit exceeded").
+            return Err(BindError::new(
+                "54001",
+                "SQL function inlining nested too deeply",
+            ));
+        }
+        Ok(InlineGuard)
+    }
+}
+
+impl Drop for InlineGuard {
+    fn drop(&mut self) {
+        INLINE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Resolve a call that matched no built-in against the user-defined
+/// `LANGUAGE SQL` functions of that name, then expand the chosen body inline —
+/// its `$n` leaves replaced by the (coerced) call arguments. Returns PG's
+/// `42883` "function name(types) does not exist" when nothing matches, or `42725`
+/// "function name(types) is not unique" when two overloads coerce equally well.
+fn resolve_sql_function_call(
+    name: &str,
+    bindings: Vec<Binding>,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Binding, BindError> {
+    let sigs = catalog.sql_functions(name);
+    let Some((sig, args)) = choose_sql_overload(name, &bindings, &sigs)? else {
+        return Err(undefined_function(name, &bindings));
+    };
+
+    let _guard = InlineGuard::enter()?;
+    let body = bind_sql_function_body(catalog, &sig.arg_types, sig.return_type, &sig.body)?;
+    // Inlining substitutes each argument into every `$n` occurrence, so a volatile
+    // argument (e.g. `nextval`) referenced more than once would run its side
+    // effect / re-roll its value once per occurrence — diverging from PG, which
+    // evaluates each argument once. Refuse that inline rather than mis-evaluate.
+    for (i, arg) in args.iter().enumerate() {
+        if arg.contains_volatile_fn() && body.count_param_refs(i) >= 2 {
+            return Err(BindError::feature_not_supported(
+                "a volatile function argument referenced more than once in a \
+                 SQL function body is not supported yet",
+            ));
+        }
+    }
+    Ok(Binding::Typed(inline_params(body, &args)))
+}
+
+/// Pick the winning `LANGUAGE SQL` overload for a call, mirroring the built-in
+/// resolver's preference: an all-exact-type match wins outright; otherwise the
+/// argument-coercible candidate keeping the most arguments at their exact type
+/// wins, and a tie at that best score is PG's `42725` ambiguity. Returns
+/// `Ok(None)` when no overload's arity/types fit (an undefined function).
+fn choose_sql_overload<'a>(
+    name: &str,
+    bindings: &[Binding],
+    sigs: &'a [SqlFunctionSig],
+) -> Result<Option<(&'a SqlFunctionSig, Vec<BoundExpr>)>, BindError> {
+    // Two overloads can never share the same argument types (`create_function`
+    // rejects that), so at most one all-exact match exists.
+    for sig in sigs {
+        if sig.arg_types.len() == bindings.len()
+            && let Some(args) = try_coerce_args(bindings, &sig.arg_types, true)
+        {
+            return Ok(Some((sig, args)));
+        }
+    }
+    // No exact match: rank the coercible candidates by how many arguments are
+    // already at their exact type, as the built-in resolver does.
+    let mut best: Option<(usize, &SqlFunctionSig, Vec<BoundExpr>)> = None;
+    let mut tied = false;
+    for sig in sigs {
+        if sig.arg_types.len() != bindings.len() {
+            continue;
+        }
+        let Some(args) = try_coerce_args(bindings, &sig.arg_types, false) else {
+            continue;
+        };
+        let score = bindings
+            .iter()
+            .zip(&sig.arg_types)
+            .filter(|(b, target)| matches!(b, Binding::Typed(e) if e.ty() == **target))
+            .count();
+        match &best {
+            None => best = Some((score, sig, args)),
+            Some((b, _, _)) if score > *b => {
+                best = Some((score, sig, args));
+                tied = false;
+            }
+            Some((b, _, _)) if score == *b => tied = true,
+            _ => {}
+        }
+    }
+    if tied {
+        return Err(ambiguous_function(name, bindings));
+    }
+    Ok(best.map(|(_, sig, args)| (sig, args)))
 }
 
 /// Bind a `CEIL(x)` / `FLOOR(x)` expression (sqlparser parses these as dedicated
@@ -1859,7 +1994,7 @@ pub(crate) fn bind_ceil_floor(
         )));
     }
     let arg = bind_expr(expr, scope)?;
-    resolve_call(name, vec![arg])
+    resolve_call(name, vec![arg], scope.catalog())
 }
 
 /// If `func` is a top-level call to a set-returning function usable in the
@@ -1939,15 +2074,41 @@ fn try_coerce_args(
 }
 
 fn undefined_function(name: &str, bindings: &[Binding]) -> BindError {
-    let types = bindings
+    BindError::new(
+        sqlstate::UNDEFINED_FUNCTION,
+        format!(
+            "function {name}({}) does not exist",
+            call_type_list(bindings)
+        ),
+    )
+}
+
+/// PG's `42725` for a call that matches two overloads equally well, with the same
+/// DETAIL/HINT PostgreSQL prints (see [`crate::expr`]'s operator-ambiguity error).
+fn ambiguous_function(name: &str, bindings: &[Binding]) -> BindError {
+    BindError::new(
+        sqlstate::AMBIGUOUS_FUNCTION,
+        format!(
+            "function {name}({}) is not unique",
+            call_type_list(bindings)
+        ),
+    )
+    .with_detail(Some(
+        "Could not choose a best candidate function.".to_string(),
+    ))
+    .with_hint(Some(
+        "You might need to add explicit type casts.".to_string(),
+    ))
+}
+
+/// The comma-separated argument type list rendered for a function-resolution
+/// error message (`integer, text`), matching PG's `func(types)` spelling.
+fn call_type_list(bindings: &[Binding]) -> String {
+    bindings
         .iter()
         .map(crate::expr::binding_type_label)
         .collect::<Vec<_>>()
-        .join(", ");
-    BindError::new(
-        sqlstate::UNDEFINED_FUNCTION,
-        format!("function {name}({types}) does not exist"),
-    )
+        .join(", ")
 }
 
 fn positional_args(args: &ast::FunctionArguments) -> Result<Vec<ast::Expr>, BindError> {

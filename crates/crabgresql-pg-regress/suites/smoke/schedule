@@ -6,6 +6,7 @@ test: aggregate
 test: errors
 test: cast
 test: create_type
+test: create_function
 test: enum
 test: drop_table
 test: create_view
