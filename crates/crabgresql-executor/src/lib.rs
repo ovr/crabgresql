@@ -3960,6 +3960,55 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_over_derived_table() {
+        let engine = engine_with_nums();
+        // sum() over a derived table (subquery in FROM): the FROM form that used
+        // to error with "aggregates over this FROM form are not supported yet".
+        let (columns, rows) = run_rows_on(
+            &engine,
+            "SELECT sum(n) FROM (SELECT n FROM nums WHERE n <> 2) s",
+        );
+        assert_eq!(columns.len(), 1);
+        assert_eq!(rows, vec![vec![Value::Int8(4)]]);
+    }
+
+    #[test]
+    fn grouped_aggregate_over_derived_table() {
+        let engine = agg_engine();
+        let (columns, rows) = run_rows_on(
+            &engine,
+            "SELECT a, sum(b) FROM (SELECT a, b FROM t) s GROUP BY a ORDER BY a",
+        );
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "sum"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int8(30)],
+                vec![Value::Int4(2), Value::Int8(5)],
+                vec![Value::Int4(3), Value::Int8(7)],
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_over_values_in_from() {
+        // count/sum over an inline VALUES relation in FROM.
+        let (_c, rows) = run_rows("SELECT count(*), sum(x) FROM (VALUES (1), (2), (3)) v(x)");
+        assert_eq!(rows, vec![vec![Value::Int8(3), Value::Int8(6)]]);
+    }
+
+    #[test]
+    fn aggregate_over_cte_reference() {
+        let engine = engine_with_nums();
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "WITH big AS (SELECT n FROM nums WHERE n >= 2) SELECT sum(n) FROM big",
+        );
+        assert_eq!(rows, vec![vec![Value::Int8(5)]]);
+    }
+
+    #[test]
     fn cross_join_of_values_is_cartesian_in_pg_order() {
         // First relation outermost (slowest), last relation innermost (fastest).
         let (columns, rows) =
