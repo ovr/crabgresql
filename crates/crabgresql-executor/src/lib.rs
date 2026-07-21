@@ -4009,6 +4009,13 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_over_set_returning_function() {
+        // count/sum over generate_series() as a FROM set-returning function.
+        let (_c, rows) = run_rows("SELECT count(*), sum(generate_series) FROM generate_series(1, 3)");
+        assert_eq!(rows, vec![vec![Value::Int8(3), Value::Int8(6)]]);
+    }
+
+    #[test]
     fn cross_join_of_values_is_cartesian_in_pg_order() {
         // First relation outermost (slowest), last relation innermost (fastest).
         let (columns, rows) =
