@@ -50,6 +50,7 @@ fn setup() -> H {
 fn schema(name: &str) -> TableSchema {
     TableSchema {
         name: name.to_string(),
+        namespace: "public".to_string(),
         columns: vec![
             Column::new("id", PgType::Int4),
             Column::new("name", PgType::Text),

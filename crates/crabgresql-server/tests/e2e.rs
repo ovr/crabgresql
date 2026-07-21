@@ -350,6 +350,113 @@ fn rows(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow>
 }
 
 #[tokio::test]
+async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    // CREATE SCHEMA registers a namespace visible in pg_namespace and
+    // information_schema.schemata.
+    client.simple_query("CREATE SCHEMA app").await?;
+    let ns = client
+        .simple_query("SELECT nspname FROM pg_namespace WHERE nspname = 'app'")
+        .await?;
+    assert_eq!(rows(&ns)[0].get(0), Some("app"));
+    let schemata = client
+        .simple_query("SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'app'")
+        .await?;
+    assert_eq!(rows(&schemata)[0].get(0), Some("app"));
+
+    // Duplicate without IF NOT EXISTS → 42P06; with it → success (a NOTICE).
+    let err = client.simple_query("CREATE SCHEMA app").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::from_code("42P06")
+    );
+    client.simple_query("CREATE SCHEMA IF NOT EXISTS app").await?;
+
+    // A `pg_`-prefixed name is reserved (42939).
+    let err = client.simple_query("CREATE SCHEMA pg_evil").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::from_code("42939")
+    );
+
+    // A schema-qualified table coexists with a same-named public table, and its
+    // pg_class.relnamespace resolves to the schema's pg_namespace.oid.
+    client.simple_query("CREATE TABLE app.item (id int, label text)").await?;
+    client.simple_query("CREATE TABLE item (id int)").await?;
+    client
+        .simple_query("INSERT INTO app.item VALUES (1, 'a'), (2, 'b')")
+        .await?;
+    let selected = client
+        .simple_query("SELECT label FROM app.item ORDER BY id")
+        .await?;
+    let selected = rows(&selected);
+    assert_eq!(selected[0].get(0), Some("a"));
+    assert_eq!(selected[1].get(0), Some("b"));
+
+    let joined = client
+        .simple_query(
+            "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'item' ORDER BY n.nspname",
+        )
+        .await?;
+    let joined = rows(&joined);
+    // One `item` in `app`, one in `public`.
+    assert_eq!(joined[0].get(0), Some("app"));
+    assert_eq!(joined[1].get(0), Some("public"));
+
+    // CREATE TABLE in a missing schema → 3F000.
+    let err = client
+        .simple_query("CREATE TABLE nope.t (id int)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::from_code("3F000")
+    );
+
+    // DROP SCHEMA RESTRICT on a non-empty schema → 2BP01.
+    let err = client.simple_query("DROP SCHEMA app").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
+    );
+
+    // DROP SCHEMA CASCADE removes the schema and its contents; the public `item`
+    // is untouched.
+    client.simple_query("DROP SCHEMA app CASCADE").await?;
+    let gone = client
+        .simple_query("SELECT nspname FROM pg_namespace WHERE nspname = 'app'")
+        .await?;
+    assert!(rows(&gone).is_empty());
+    // Reading a relation in the now-dropped schema fails (resolution finds no
+    // such relation — 42P01, as the read path does not distinguish a missing
+    // schema from a missing table).
+    let err = client
+        .simple_query("SELECT * FROM app.item")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_TABLE
+    );
+    // The like-named public table survives.
+    client.simple_query("SELECT id FROM item").await?;
+
+    // DROP SCHEMA of a missing schema → 3F000; IF EXISTS → success.
+    let err = client.simple_query("DROP SCHEMA nope").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::from_code("3F000")
+    );
+    client.simple_query("DROP SCHEMA IF EXISTS nope").await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn subqueries_in_expressions_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
 

@@ -185,6 +185,7 @@ fn bind_catalogs(
     // search path.
     let system: Arc<dyn TableEngine> = {
         let global = engine.clone();
+        let schemas_engine = engine.clone();
         let temp = session.temp.clone();
         let database = session.database.clone();
         let owner = session.user.clone();
@@ -212,16 +213,18 @@ fn bind_catalogs(
                     // Views reflect into pg_class as relkind='v' / pg_attribute
                     // columns / information_schema.tables as VIEW.
                     rels.extend(global.views().into_iter().map(|view| {
-                        crabgresql_catalog::CatalogRelation::view(TableSchema {
-                            name: view.name,
-                            columns: view.columns,
-                        })
+                        crabgresql_catalog::CatalogRelation::view(TableSchema::in_namespace(
+                            view.name,
+                            view.namespace,
+                            view.columns,
+                        ))
                     }));
                     // Sequences reflect into pg_class as relkind='S' and feed
                     // pg_catalog.pg_sequence.
                     rels.extend(global.sequences().into_iter().map(|seq| {
                         crabgresql_catalog::CatalogRelation::sequence(
                             seq.name,
+                            seq.namespace,
                             crabgresql_catalog::CatalogSequence {
                                 type_oid: seq.data_type.oid(),
                                 start: seq.start,
@@ -246,7 +249,8 @@ fn bind_catalogs(
                         enum_labels: t.enum_labels,
                     })
                     .collect()
-            }),
+            })
+            .with_schemas_fn(move || schemas_engine.schemas()),
         )
     };
     let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
@@ -479,6 +483,20 @@ pub fn execute_statement(
                 method,
                 ..
             } => return execute_create_cast(global_catalog, source, target, method),
+            ast::Statement::CreateSchema {
+                schema_name,
+                if_not_exists,
+                ..
+            } => {
+                return execute_create_schema(engine, schema_name, *if_not_exists);
+            }
+            ast::Statement::Drop {
+                object_type: ast::ObjectType::Schema,
+                names,
+                cascade,
+                if_exists,
+                ..
+            } => return execute_drop_schema(engine, names, *cascade, *if_exists),
             ast::Statement::Drop {
                 object_type: ast::ObjectType::Table,
                 names,
@@ -929,7 +947,12 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
         ast::Statement::AlterType(_) => "ALTER TYPE",
         ast::Statement::CreateFunction(_) => "CREATE FUNCTION",
         ast::Statement::CreateCast { .. } => "CREATE CAST",
+        ast::Statement::CreateSchema { .. } => "CREATE SCHEMA",
         ast::Statement::Truncate(_) => "TRUNCATE TABLE",
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Schema,
+            ..
+        } => "DROP SCHEMA",
         ast::Statement::Drop {
             object_type: ast::ObjectType::Table,
             ..
@@ -1565,13 +1588,80 @@ fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, PgError> 
     single_object_name(name, "relation")
 }
 
+/// Split a possibly schema-qualified object name into `(schema, name)`. One part
+/// is unqualified (`None`); two parts are `schema.name`; three or more (a
+/// database qualifier) are rejected, matching the binder's `split_relation_name`.
+fn split_object_name(
+    name: &ast::ObjectName,
+    noun: &str,
+) -> Result<(Option<String>, String), PgError> {
+    let ident_at = |part: &ast::ObjectNamePart| -> Result<String, PgError> {
+        part.as_ident()
+            .map(normalize_ident)
+            .ok_or_else(|| PgError::syntax(format!("invalid {noun} name: {name}")))
+    };
+    match name.0.as_slice() {
+        [one] => Ok((None, ident_at(one)?)),
+        [schema, one] => Ok((Some(ident_at(schema)?), ident_at(one)?)),
+        _ => Err(PgError::feature_not_supported(format!(
+            "cross-database {noun} names are not supported yet: {name}"
+        ))),
+    }
+}
+
+/// Resolve the namespace a schema-qualified (or unqualified) `CREATE` targets,
+/// validating it. Unqualified and `public` go to `public`; `pg_catalog`/
+/// `information_schema` are permission-denied; any other name must be an existing
+/// user schema (else `3F000`). `display` is the bare object name, for error text.
+fn resolve_create_namespace(
+    engine: &Arc<dyn TableEngine>,
+    schema: Option<&str>,
+    display: &str,
+) -> Result<String, PgError> {
+    match schema {
+        None | Some("public") => Ok("public".to_string()),
+        Some(ns @ ("pg_catalog" | "information_schema")) => Err(PgError::new(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            format!("permission denied to create \"{ns}.{display}\""),
+        )),
+        Some(ns) => {
+            if engine.schema_exists(ns) {
+                Ok(ns.to_string())
+            } else {
+                Err(PgError::new(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    format!("schema \"{ns}\" does not exist"),
+                ))
+            }
+        }
+    }
+}
+
 fn execute_create_table(
     engine: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
     create: &ast::CreateTable,
     session: &Session,
 ) -> Result<QueryResult, PgError> {
-    let name = object_name_to_table_name(&create.name)?;
+    let (schema_qual, name) = split_object_name(&create.name, "relation")?;
+    // A TEMP table lives in the session temp keyspace; a schema qualifier on it
+    // is only meaningful as `pg_temp` (which we already route), so reject any
+    // other qualifier as PG does. Non-temp tables resolve their target schema.
+    let namespace = if create.temporary {
+        match schema_qual.as_deref() {
+            None | Some("pg_temp") => {}
+            Some(other) if other == session.temp_schema => {}
+            Some(_) => {
+                return Err(PgError::feature_not_supported(
+                    "cannot create a temporary relation in a non-temporary schema",
+                ));
+            }
+        }
+        // Temp relations share one keyspace in the session temp engine.
+        "public".to_string()
+    } else {
+        resolve_create_namespace(engine, schema_qual.as_deref(), &name)?
+    };
     let target = if create.temporary {
         &session.temp
     } else {
@@ -1628,9 +1718,17 @@ fn execute_create_table(
             let taken: Vec<String> = serial_defs.iter().map(|d| d.name.clone()).collect();
             let seq_name =
                 unique_relation_name(target, &taken, &format!("{name}_{column_name}_seq"));
-            column.default = Some(format!("nextval('{seq_name}')"));
+            // A qualified table's serial default must reference the sequence by
+            // its schema too, so `nextval` resolves it in the same namespace.
+            let seq_ref = if namespace == "public" {
+                seq_name.clone()
+            } else {
+                format!("{namespace}.{seq_name}")
+            };
+            column.default = Some(format!("nextval('{seq_ref}')"));
             serial_defs.push(SequenceDefinition {
                 name: seq_name,
+                namespace: namespace.clone(),
                 data_type: base,
                 start: 1,
                 increment: 1,
@@ -1773,6 +1871,7 @@ fn execute_create_table(
 
     let schema = TableSchema {
         name: name.clone(),
+        namespace: namespace.clone(),
         columns,
     };
     let mut indexes = Vec::new();
@@ -1832,8 +1931,8 @@ fn execute_create_table(
     match target.create_table(schema) {
         Ok(_) => {
             for index in indexes {
-                if let Err(e) = target.create_index(&name, index) {
-                    let _ = target.drop_table(&name);
+                if let Err(e) = target.create_index_in(&namespace, &name, index) {
+                    let _ = target.drop_table_in(&namespace, &name);
                     drop_created_sequences(target, &serial_defs);
                     return Err(e.into());
                 }
@@ -2364,7 +2463,8 @@ fn execute_create_view(
     type_catalog: &Arc<dyn TypeCatalog>,
     create: &ast::CreateView,
 ) -> Result<QueryResult, PgError> {
-    let name = object_name_to_table_name(&create.name)?;
+    let (schema_qual, name) = split_object_name(&create.name, "relation")?;
+    let namespace = resolve_create_namespace(catalog, schema_qual.as_deref(), &name)?;
     // Reject forms we do not implement rather than silently ignoring them.
     if create.materialized {
         return Err(PgError::feature_not_supported(
@@ -2431,7 +2531,7 @@ fn execute_create_view(
     let depends_on = referenced_relations(&create.query);
     let sql = create.query.to_string();
 
-    let existing_table = catalog.open_table(&name).is_ok();
+    let existing_table = catalog.resolve(Some(&namespace), &name).is_ok();
     if create.or_replace {
         if existing_table {
             return Err(PgError::new(
@@ -2439,14 +2539,14 @@ fn execute_create_view(
                 format!("\"{name}\" is not a view"),
             ));
         }
-        if let Some(old) = catalog.resolve_view(None, &name) {
+        if let Some(old) = catalog.resolve_view(Some(&namespace), &name) {
             check_view_replace_compatible(&old, &view_columns)?;
             // A replaced view may (transitively) reference itself; PG permits
             // creating such a view and only errors when it is used, so the
             // binder detects the cycle at expansion time rather than here.
-            catalog.drop_view(&name)?;
+            catalog.drop_view_in(&namespace, &name)?;
         }
-    } else if existing_table || catalog.resolve_view(None, &name).is_some() {
+    } else if existing_table || catalog.resolve_view(Some(&namespace), &name).is_some() {
         if create.if_not_exists {
             return Ok(QueryResult::Command {
                 tag: "CREATE VIEW".into(),
@@ -2464,6 +2564,7 @@ fn execute_create_view(
 
     catalog.create_view(ViewDefinition {
         name,
+        namespace,
         sql,
         columns: view_columns,
         depends_on,
@@ -2596,18 +2697,31 @@ fn execute_drop_table(
     cascade: bool,
     if_exists: bool,
 ) -> Result<QueryResult, PgError> {
-    let tnames = names
-        .iter()
-        .map(object_name_to_table_name)
-        .collect::<Result<Vec<_>, _>>()?;
+    // Each target splits into `(namespace, bare)`. `None` means "unqualified"
+    // (or `public.`-qualified) — the temp-first, view-cascade path below, exactly
+    // as before schemas. `Some(ns)` is a user schema, dropped directly in that
+    // namespace (its display form keeps the qualifier for error text).
+    let mut targets: Vec<(Option<String>, String, String)> = Vec::new();
+    for name in names {
+        let (schema, bare) = split_object_name(name, "table")?;
+        let display = match &schema {
+            Some(ns) => format!("{ns}.{bare}"),
+            None => bare.clone(),
+        };
+        let namespace = match schema.as_deref() {
+            None | Some("public") => None,
+            Some(ns) => Some(ns.to_string()),
+        };
+        targets.push((namespace, bare, display));
+    }
     // A target named twice is rejected up front, before anything is dropped, as
     // in PG — otherwise the second pass would re-drop (and, if a temp table
     // shadows a permanent one, silently drop the permanent table too).
-    for (i, name) in tnames.iter().enumerate() {
-        if tnames[..i].contains(name) {
+    for (i, (_, _, display)) in targets.iter().enumerate() {
+        if targets[..i].iter().any(|(_, _, d)| d == display) {
             return Err(PgError::new(
                 sqlstate::DUPLICATE_OBJECT,
-                format!("table \"{name}\" specified more than once"),
+                format!("table \"{display}\" specified more than once"),
             ));
         }
     }
@@ -2615,42 +2729,57 @@ fn execute_drop_table(
     // statement before anything is dropped; with IF EXISTS it becomes a skip
     // NOTICE. PG spells the missing-object noun "table" here, not "relation".
     let mut notices = Vec::new();
-    let mut to_drop: Vec<String> = Vec::new();
-    for name in &tnames {
-        match catalog.open_table(name) {
-            Ok(_) => to_drop.push(name.clone()),
-            Err(StorageError::TableNotFound(_)) => {
-                // A view shares the relation namespace: PG rejects DROP TABLE on
-                // one as a wrong-object-type error rather than "does not exist".
-                if catalog.resolve_view(None, name).is_some() {
-                    return Err(PgError::new(
-                        sqlstate::WRONG_OBJECT_TYPE,
-                        format!("\"{name}\" is not a table"),
-                    )
-                    .with_hint("Use DROP VIEW to remove a view."));
-                }
-                if if_exists {
-                    notices.push(Notice::notice(
-                        format!("table \"{name}\" does not exist, skipping"),
-                        None,
-                    ));
-                } else {
-                    return Err(PgError::new(
-                        sqlstate::UNDEFINED_TABLE,
-                        format!("table \"{name}\" does not exist"),
-                    ));
-                }
+    // Unqualified/public targets go through the temp-first + view-cascade path;
+    // user-schema targets are dropped directly.
+    let mut plain: Vec<String> = Vec::new();
+    let mut qualified: Vec<(String, String)> = Vec::new();
+    for (namespace, bare, display) in &targets {
+        let (exists, is_view) = match namespace {
+            None => (
+                catalog.open_table(bare).is_ok(),
+                catalog.resolve_view(None, bare).is_some(),
+            ),
+            Some(ns) => (
+                catalog.resolve(Some(ns), bare).is_ok(),
+                catalog.resolve_view(Some(ns), bare).is_some(),
+            ),
+        };
+        if exists {
+            match namespace {
+                None => plain.push(bare.clone()),
+                Some(ns) => qualified.push((ns.clone(), bare.clone())),
             }
-            Err(e) => return Err(e.into()),
+        } else if is_view {
+            // A view shares the relation namespace: PG rejects DROP TABLE on one
+            // as a wrong-object-type error rather than "does not exist".
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{display}\" is not a table"),
+            )
+            .with_hint("Use DROP VIEW to remove a view."));
+        } else if if_exists {
+            notices.push(Notice::notice(
+                format!("table \"{display}\" does not exist, skipping"),
+                None,
+            ));
+        } else {
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_TABLE,
+                format!("table \"{display}\" does not exist"),
+            ));
         }
     }
-    // Phase 2: resolve dependent views (RESTRICT errors, CASCADE drops them),
-    // then drop the tables followed by their cascaded views.
+    // Phase 2: resolve dependent views for the plain targets (RESTRICT errors,
+    // CASCADE drops them), then drop the tables followed by their cascaded views.
+    // Cross-schema view dependencies on qualified targets are not tracked yet.
     let (dependent_views, mut cascade_notices) =
-        plan_view_cascade(catalog, "table", &to_drop, cascade)?;
+        plan_view_cascade(catalog, "table", &plain, cascade)?;
     notices.append(&mut cascade_notices);
-    for name in &to_drop {
+    for name in &plain {
         catalog.drop_table(name)?;
+    }
+    for (ns, name) in &qualified {
+        catalog.drop_table_in(ns, name)?;
     }
     for view in &dependent_views {
         catalog.drop_view(view)?;
@@ -2658,12 +2787,14 @@ fn execute_drop_table(
     // Auto-drop sequences a dropped table owns (a `serial` column's sequence, via
     // PG's OWNED BY). PG removes these silently, without a cascade notice.
     for seq in catalog.sequences() {
-        if seq
-            .owned_by
-            .as_deref()
-            .is_some_and(|owner| to_drop.iter().any(|t| t == owner))
-        {
-            let _ = catalog.drop_sequence(&seq.name);
+        let owned_by_dropped = seq.owned_by.as_deref().is_some_and(|owner| {
+            (seq.namespace == "public" && plain.iter().any(|t| t == owner))
+                || qualified
+                    .iter()
+                    .any(|(ns, t)| *ns == seq.namespace && t == owner)
+        });
+        if owned_by_dropped {
+            let _ = catalog.drop_sequence_in(&seq.namespace, &seq.name);
         }
     }
     Ok(QueryResult::Command {
@@ -2812,7 +2943,7 @@ fn unique_relation_name(engine: &Arc<dyn TableEngine>, extra: &[String], base: &
 /// failed — DDL is not transactional, so this avoids leaking orphan sequences.
 fn drop_created_sequences(engine: &Arc<dyn TableEngine>, defs: &[SequenceDefinition]) {
     for def in defs {
-        let _ = engine.drop_sequence(&def.name);
+        let _ = engine.drop_sequence_in(&def.namespace, &def.name);
     }
 }
 
@@ -2850,6 +2981,7 @@ fn eval_seq_int(expr: &ast::Expr, option: &str) -> Result<i64, PgError> {
 /// [`SequenceDefinition`], validating the min/max/start/increment/cache relations.
 fn build_sequence_definition(
     name: String,
+    namespace: String,
     data_type: PgType,
     options: &[ast::SequenceOptions],
     owned_by: Option<String>,
@@ -2930,6 +3062,7 @@ fn build_sequence_definition(
     }
     Ok(SequenceDefinition {
         name,
+        namespace,
         data_type,
         start,
         increment,
@@ -2959,7 +3092,8 @@ fn execute_create_sequence(
             "temporary sequences are not supported yet",
         ));
     }
-    let seq_name = object_name_to_table_name(name)?;
+    let (schema_qual, seq_name) = split_object_name(name, "relation")?;
+    let namespace = resolve_create_namespace(catalog, schema_qual.as_deref(), &seq_name)?;
     let data_type = match data_type {
         None => PgType::Int8,
         Some(dt) => match crabgresql_binder::map_data_type(dt)? {
@@ -2972,7 +3106,7 @@ fn execute_create_sequence(
             }
         },
     };
-    let def = build_sequence_definition(seq_name.clone(), data_type, options, None)?;
+    let def = build_sequence_definition(seq_name.clone(), namespace, data_type, options, None)?;
     match catalog.create_sequence(def) {
         Ok(()) => Ok(QueryResult::command("CREATE SEQUENCE")),
         Err(StorageError::TableAlreadyExists(_)) if if_not_exists => Ok(QueryResult::Command {
@@ -3081,6 +3215,163 @@ fn execute_drop_sequence(
     }
     Ok(QueryResult::Command {
         tag: "DROP SEQUENCE".into(),
+        notices,
+    })
+}
+
+/// `CREATE SCHEMA [IF NOT EXISTS] name`. Registers a user namespace with an
+/// engine-allocated OID. Rejects a `pg_`-prefixed name (reserved for system
+/// schemas, 42939), reports a collision as 42P06 (or a skip NOTICE under
+/// `IF NOT EXISTS`), and does not yet support `AUTHORIZATION` or schema-element
+/// forms.
+fn execute_create_schema(
+    engine: &Arc<dyn TableEngine>,
+    schema_name: &ast::SchemaName,
+    if_not_exists: bool,
+) -> Result<QueryResult, PgError> {
+    let name = match schema_name {
+        ast::SchemaName::Simple(obj) => single_object_name(obj, "schema")?,
+        ast::SchemaName::UnnamedAuthorization(_) | ast::SchemaName::NamedAuthorization(_, _) => {
+            return Err(PgError::feature_not_supported(
+                "CREATE SCHEMA AUTHORIZATION is not supported yet",
+            ));
+        }
+    };
+    // `pg_*` is reserved for system schemas, as in PG.
+    if name.starts_with("pg_") {
+        return Err(PgError::new(
+            sqlstate::RESERVED_NAME,
+            format!("unacceptable schema name \"{name}\""),
+        )
+        .with_detail("The prefix \"pg_\" is reserved for system schemas."));
+    }
+    // A name collides with an existing user schema or a reserved built-in.
+    let exists =
+        engine.schema_exists(&name) || matches!(name.as_str(), "public" | "information_schema");
+    if exists {
+        if if_not_exists {
+            return Ok(QueryResult::Command {
+                tag: "CREATE SCHEMA".into(),
+                notices: vec![Notice::notice(
+                    format!("schema \"{name}\" already exists, skipping"),
+                    None,
+                )],
+            });
+        }
+        return Err(PgError::new(
+            sqlstate::DUPLICATE_SCHEMA,
+            format!("schema \"{name}\" already exists"),
+        ));
+    }
+    engine.create_schema(&name)?;
+    Ok(QueryResult::command("CREATE SCHEMA"))
+}
+
+/// `DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE|RESTRICT]`. Two-phase like
+/// [`execute_drop_sequence`]: every target is validated (missing → 3F000, or a
+/// skip NOTICE under `IF EXISTS`) before anything is dropped. Under RESTRICT
+/// (the default) a non-empty schema is an error (2BP01); CASCADE first drops the
+/// schema's contained tables, views, and sequences (emitting a `drop cascades
+/// to ...` NOTICE), then the schema.
+fn execute_drop_schema(
+    engine: &Arc<dyn TableEngine>,
+    names: &[ast::ObjectName],
+    cascade: bool,
+    if_exists: bool,
+) -> Result<QueryResult, PgError> {
+    let snames = names
+        .iter()
+        .map(|n| single_object_name(n, "schema"))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (i, name) in snames.iter().enumerate() {
+        if snames[..i].contains(name) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("schema \"{name}\" specified more than once"),
+            ));
+        }
+    }
+    // Phase 1: validate every target before dropping any.
+    let mut notices = Vec::new();
+    let mut to_drop: Vec<String> = Vec::new();
+    for name in &snames {
+        if engine.schema_exists(name) {
+            to_drop.push(name.clone());
+        } else if if_exists {
+            notices.push(Notice::notice(
+                format!("schema \"{name}\" does not exist, skipping"),
+                None,
+            ));
+        } else {
+            return Err(PgError::new(
+                sqlstate::INVALID_SCHEMA_NAME,
+                format!("schema \"{name}\" does not exist"),
+            ));
+        }
+    }
+    // Phase 2: for each surviving target, enumerate its contents (a `(kind,
+    // name)` list, sorted for deterministic output), then apply RESTRICT/CASCADE.
+    for name in &to_drop {
+        let mut contents: Vec<(&str, String)> = Vec::new();
+        for r in engine.relation_metadata() {
+            if r.schema.namespace == *name {
+                contents.push(("table", r.schema.name));
+            }
+        }
+        for v in engine.views() {
+            if v.namespace == *name {
+                contents.push(("view", v.name));
+            }
+        }
+        for s in engine.sequences() {
+            if s.namespace == *name {
+                contents.push(("sequence", s.name));
+            }
+        }
+        contents.sort();
+
+        if !contents.is_empty() && !cascade {
+            // RESTRICT (the default): refuse to drop a non-empty schema.
+            let detail = contents
+                .iter()
+                .map(|(kind, obj)| format!("{kind} {name}.{obj} depends on schema {name}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(PgError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop schema {name} because other objects depend on it"),
+            )
+            .with_detail(detail)
+            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+        }
+        if !contents.is_empty() {
+            // CASCADE: mirror PG's `drop cascades to ...` NOTICE, then drop each
+            // contained object in the target namespace.
+            let lines: Vec<String> = contents
+                .iter()
+                .map(|(kind, obj)| format!("drop cascades to {kind} {name}.{obj}"))
+                .collect();
+            let notice = if contents.len() == 1 {
+                Notice::notice(lines[0].clone(), None)
+            } else {
+                Notice::notice(
+                    format!("drop cascades to {} other objects", contents.len()),
+                    Some(lines.join("\n")),
+                )
+            };
+            notices.push(notice);
+            for (kind, obj) in &contents {
+                let _ = match *kind {
+                    "table" => engine.drop_table_in(name, obj),
+                    "view" => engine.drop_view_in(name, obj),
+                    _ => engine.drop_sequence_in(name, obj),
+                };
+            }
+        }
+        engine.drop_schema(name)?;
+    }
+    Ok(QueryResult::Command {
+        tag: "DROP SCHEMA".into(),
         notices,
     })
 }

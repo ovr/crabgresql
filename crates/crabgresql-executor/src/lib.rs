@@ -2651,6 +2651,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = test_ok(engine.create_table(TableSchema {
             name: "t".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
@@ -2676,6 +2677,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = test_ok(engine.create_table(TableSchema {
             name: "t".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
@@ -3105,6 +3107,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = test_ok(engine.create_table(TableSchema {
             name: "t".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("id", PgType::Int4),
                 Column::new("label", PgType::Text),
@@ -3332,6 +3335,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = test_ok(engine.create_table(TableSchema {
             name: "t".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("a", PgType::Int4),
                 Column::new("b", PgType::Int4),
@@ -3388,6 +3392,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = engine.create_table(TableSchema {
             name: "d".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("g", PgType::Int4),
                 Column::new("v", PgType::Int4),
@@ -3509,6 +3514,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = engine.create_table(TableSchema {
             name: "g".into(),
+            namespace: "public".into(),
             columns: vec![
                 Column::new("k", PgType::Int4),
                 Column::new("v", PgType::Int4),
@@ -3543,6 +3549,7 @@ mod tests {
         let engine = MemoryEngine::new();
         let table = engine.create_table(TableSchema {
             name: "f".into(),
+            namespace: "public".into(),
             columns: vec![Column::new("x", PgType::Float8)],
         })?;
         let txn = wtxn();
@@ -3869,6 +3876,7 @@ mod tests {
         let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
         let table = test_ok(engine.create_table(TableSchema {
             name: "nums".into(),
+            namespace: "public".into(),
             columns: vec![Column::new("n", PgType::Int4)],
         }));
         let txn = wtxn();

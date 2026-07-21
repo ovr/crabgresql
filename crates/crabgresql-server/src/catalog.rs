@@ -72,7 +72,9 @@ impl TableEngine for SessionCatalog {
             Some("public") => self.global.open_table(name),
             Some("pg_temp") => self.temp.open_table(name),
             Some(namespace) if namespace == self.temp_schema => self.temp.open_table(name),
-            Some(_) => Err(StorageError::TableNotFound(name.to_string())),
+            // Any other qualifier names a user schema; route it to the global
+            // engine, which holds every user namespace.
+            Some(namespace) => self.global.resolve(Some(namespace), name),
         }
     }
 
@@ -90,6 +92,28 @@ impl TableEngine for SessionCatalog {
             Err(StorageError::TableNotFound(_)) => self.global.drop_table(name),
             other => other,
         }
+    }
+
+    fn drop_table_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+        // A schema-qualified table lives in the global engine's namespace.
+        self.global.drop_table_in(namespace, name)
+    }
+
+    // User schemas live in the shared global engine.
+    fn create_schema(&self, name: &str) -> Result<u32, StorageError> {
+        self.global.create_schema(name)
+    }
+
+    fn drop_schema(&self, name: &str) -> Result<(), StorageError> {
+        self.global.drop_schema(name)
+    }
+
+    fn schemas(&self) -> Vec<(String, u32)> {
+        self.global.schemas()
+    }
+
+    fn schema_exists(&self, name: &str) -> bool {
+        self.global.schema_exists(name)
     }
 
     fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
@@ -129,12 +153,20 @@ impl TableEngine for SessionCatalog {
     fn resolve_view(&self, schema: Option<&str>, name: &str) -> Option<ViewDefinition> {
         match schema {
             None | Some("public") => self.global.resolve_view(None, name),
-            _ => None,
+            // Temp and system namespaces hold no user views; any other qualifier
+            // is a user schema, resolved against the global engine.
+            Some("pg_temp") | Some("pg_catalog") | Some("information_schema") => None,
+            Some(namespace) if namespace == self.temp_schema => None,
+            Some(namespace) => self.global.resolve_view(Some(namespace), name),
         }
     }
 
     fn drop_view(&self, name: &str) -> Result<(), StorageError> {
         self.global.drop_view(name)
+    }
+
+    fn drop_view_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+        self.global.drop_view_in(namespace, name)
     }
 
     fn views(&self) -> Vec<ViewDefinition> {
@@ -151,8 +183,16 @@ impl TableEngine for SessionCatalog {
         self.global.drop_sequence(name)
     }
 
+    fn drop_sequence_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+        self.global.drop_sequence_in(namespace, name)
+    }
+
     fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
         self.global.sequence(name)
+    }
+
+    fn sequence_in(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
+        self.global.sequence_in(namespace, name)
     }
 
     fn sequences(&self) -> Vec<SequenceDefinition> {
@@ -163,7 +203,22 @@ impl TableEngine for SessionCatalog {
         self.global.sequence_nextval(name)
     }
 
+    fn sequence_nextval_in(&self, namespace: &str, name: &str) -> SequenceAdvance {
+        self.global.sequence_nextval_in(namespace, name)
+    }
+
     fn sequence_setval(&self, name: &str, value: i64, is_called: bool) -> SequenceAdvance {
         self.global.sequence_setval(name, value, is_called)
+    }
+
+    fn sequence_setval_in(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: i64,
+        is_called: bool,
+    ) -> SequenceAdvance {
+        self.global
+            .sequence_setval_in(namespace, name, value, is_called)
     }
 }
