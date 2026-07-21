@@ -930,7 +930,7 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
             // POSITION(sub IN str) == strpos(str, sub).
             let sub = bind_expr(expr, scope)?;
             let str_ = bind_expr(r#in, scope)?;
-            crate::functions::resolve_call("strpos", vec![str_, sub])
+            crate::functions::resolve_call("strpos", vec![str_, sub], scope.catalog())
         }
         ast::Expr::Overlay {
             expr,
@@ -1121,7 +1121,7 @@ fn bind_substring(
     if let Some(e) = for_ {
         args.push(bind_expr(e, scope)?);
     }
-    crate::functions::resolve_call("substr", args)
+    crate::functions::resolve_call("substr", args, scope.catalog())
 }
 
 /// `TRIM([LEADING|TRAILING|BOTH] [chars FROM] x)` → `ltrim`/`rtrim`/`btrim`.
@@ -1150,7 +1150,7 @@ fn bind_trim(
             "TRIM with multiple characters is not supported yet",
         ));
     }
-    crate::functions::resolve_call(func, args)
+    crate::functions::resolve_call(func, args, scope.catalog())
 }
 
 /// `OVERLAY(x PLACING r FROM a [FOR b])` → `overlay(x, r, a[, b])`.
@@ -1169,7 +1169,7 @@ fn bind_overlay(
     if let Some(e) = for_ {
         args.push(bind_expr(e, scope)?);
     }
-    crate::functions::resolve_call("overlay", args)
+    crate::functions::resolve_call("overlay", args, scope.catalog())
 }
 
 /// Bind a `LIKE`/`ILIKE` expression node (as opposed to the operator form).
@@ -4235,6 +4235,259 @@ pub fn bind_column_default(
         ));
     }
     Ok(bound)
+}
+
+/// Bind the body of a `CREATE FUNCTION ... LANGUAGE SQL` to a typed expression,
+/// with `$1..$n` seeded to the declared argument types and the result coerced to
+/// the declared return type. `body_sql` is the normalized `SELECT <expr>` the
+/// catalog stores; it must be a single FROM-less, single-column `SELECT` — any
+/// other shape (FROM, WHERE, GROUP BY, set-op, multiple columns, …) is rejected,
+/// since a scalar function is expanded inline and the engine has no per-row query
+/// execution for function bodies.
+///
+/// Used both to validate the body at `CREATE FUNCTION` and to produce the
+/// expression a call site inlines: the returned tree still carries `Param` leaves
+/// for `$n`, which [`inline_params`] replaces with the argument expressions.
+pub fn bind_sql_function_body(
+    catalog: &Arc<dyn TypeCatalog>,
+    arg_types: &[PgType],
+    return_type: PgType,
+    body_sql: &str,
+) -> Result<BoundExpr, BindError> {
+    let statements = crabgresql_parser::parse(body_sql).map_err(|e| {
+        BindError::feature_not_supported(format!(
+            "SQL function body must be a single SELECT statement: {e}"
+        ))
+    })?;
+    let query = match statements.as_slice() {
+        [ast::Statement::Query(query)] => query,
+        _ => {
+            return Err(BindError::feature_not_supported(
+                "SQL function body must be a single SELECT statement",
+            ));
+        }
+    };
+    let unsupported: Option<&str> = if query.with.is_some() {
+        Some("WITH")
+    } else if query.order_by.is_some() {
+        Some("ORDER BY")
+    } else if query.limit_clause.is_some() {
+        Some("LIMIT/OFFSET")
+    } else if query.fetch.is_some() || !query.locks.is_empty() {
+        Some("this clause")
+    } else {
+        None
+    };
+    if let Some(clause) = unsupported {
+        return Err(BindError::feature_not_supported(format!(
+            "{clause} is not supported in a SQL function body yet"
+        )));
+    }
+    let select = match query.body.as_ref() {
+        ast::SetExpr::Select(select) => select,
+        _ => {
+            return Err(BindError::feature_not_supported(
+                "only a simple SELECT is supported in a SQL function body",
+            ));
+        }
+    };
+    let group_by_empty = matches!(
+        &select.group_by,
+        ast::GroupByExpr::Expressions(exprs, mods) if exprs.is_empty() && mods.is_empty()
+    );
+    let unsupported: Option<&str> = if !select.from.is_empty() {
+        Some("FROM")
+    } else if select.selection.is_some() {
+        Some("WHERE")
+    } else if !group_by_empty {
+        Some("GROUP BY")
+    } else if select.having.is_some() {
+        Some("HAVING")
+    } else if select.distinct.is_some() {
+        Some("DISTINCT")
+    } else {
+        None
+    };
+    if let Some(clause) = unsupported {
+        return Err(BindError::feature_not_supported(format!(
+            "{clause} is not supported in a SQL function body yet"
+        )));
+    }
+    let expr = match select.projection.as_slice() {
+        [ast::SelectItem::UnnamedExpr(expr)] | [ast::SelectItem::ExprWithAlias { expr, .. }] => {
+            expr
+        }
+        _ => {
+            return Err(BindError::feature_not_supported(
+                "a SQL function body must return a single column",
+            ));
+        }
+    };
+
+    let params = param_ctx_extended(arg_types.iter().copied().map(Some).collect());
+    let scope = Scope::empty(catalog, &params);
+    let bound = bind_expr(expr, &scope)?;
+    // A `$n` past the declared argument list has no value to inline. The seeded
+    // slots stay at `arg_types.len()`; a longer vector means a larger `$n` was
+    // referenced (PG's "there is no parameter $n").
+    if param_types(&params).len() > arg_types.len() {
+        return Err(BindError::new(
+            "42P02",
+            format!("there is no parameter ${}", arg_types.len() + 1),
+        ));
+    }
+    let bound = coerce_function_return(bound, return_type, catalog)?;
+    if bound.contains_srf() {
+        return Err(BindError::feature_not_supported(
+            "set-returning functions are not supported in a SQL function body yet",
+        ));
+    }
+    if bound.contains_aggregate() {
+        return Err(BindError::new(
+            sqlstate::GROUPING_ERROR,
+            "aggregate functions are not allowed in a scalar SQL function body",
+        ));
+    }
+    Ok(bound)
+}
+
+/// Coerce a SQL function body's result to the declared return type, in PG's
+/// assignment context. A bare literal/`NULL` body takes the return type
+/// directly; otherwise the same numeric-widening / text-assignment / implicit
+/// casts as [`coerce_to_column`] apply, and an incompatible pair is PG's `42P13`
+/// "return type mismatch in function declared to return …".
+fn coerce_function_return(
+    binding: Binding,
+    return_type: PgType,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<BoundExpr, BindError> {
+    let expr = match binding {
+        Binding::Unknown { lit, span, param } => {
+            return resolve_unknown_ctx(catalog.as_ref(), lit, span, param, return_type);
+        }
+        Binding::Typed(e) => e,
+    };
+    let ty = expr.ty();
+    if ty == return_type {
+        Ok(expr)
+    } else if (ty.is_numeric() && return_type.is_numeric())
+        || is_text_family(return_type)
+        || implicit_castable(ty, return_type)
+        || matches!((ty, return_type), (PgType::TimestampTz, PgType::Timestamp))
+    {
+        coerce_expr(expr, return_type)
+    } else {
+        Err(BindError::new(
+            "42P13",
+            format!(
+                "return type mismatch in function declared to return {}",
+                type_label(return_type, catalog.as_ref())
+            ),
+        )
+        .with_detail(Some(format!(
+            "Actual return type is {}.",
+            type_label(ty, catalog.as_ref())
+        ))))
+    }
+}
+
+/// Replace each `$n` ([`BoundExpr::Param`]) in a bound SQL-function body with the
+/// call's `n`-th argument expression. Mirrors [`crate::plan::subst_expr`], but
+/// substitutes a whole expression (not a constant value), since a call argument
+/// is an arbitrary expression over the outer row. A validated scalar body never
+/// contains a subquery (the body scope forbids one), so those leaves carry no
+/// params to replace and are left untouched.
+pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
+    match expr {
+        // A validated body never references a `$n` past the argument list, so the
+        // index is always in range; a null const is an inert fallback, not panic.
+        BoundExpr::Param { index, ty } => args.get(index).cloned().unwrap_or(BoundExpr::Const {
+            value: Value::Null,
+            ty,
+        }),
+        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } => expr,
+        BoundExpr::Unary { op, expr } => BoundExpr::Unary {
+            op,
+            expr: Box::new(inline_params(*expr, args)),
+        },
+        BoundExpr::Binary {
+            op,
+            arg_ty,
+            left,
+            right,
+        } => BoundExpr::Binary {
+            op,
+            arg_ty,
+            left: Box::new(inline_params(*left, args)),
+            right: Box::new(inline_params(*right, args)),
+        },
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(inline_params(*expr, args)),
+            negated,
+        },
+        BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {
+            expr: Box::new(inline_params(*expr, args)),
+            ty,
+        },
+        BoundExpr::Reinterpret {
+            expr,
+            reported,
+            rep,
+        } => BoundExpr::Reinterpret {
+            expr: Box::new(inline_params(*expr, args)),
+            reported,
+            rep,
+        },
+        BoundExpr::FuncCall {
+            func,
+            ret,
+            args: call_args,
+        } => BoundExpr::FuncCall {
+            func,
+            ret,
+            args: call_args
+                .into_iter()
+                .map(|a| inline_params(a, args))
+                .collect(),
+        },
+        BoundExpr::Srf {
+            func,
+            ret,
+            args: call_args,
+        } => BoundExpr::Srf {
+            func,
+            ret,
+            args: call_args
+                .into_iter()
+                .map(|a| inline_params(a, args))
+                .collect(),
+        },
+        BoundExpr::Case { whens, else_, ty } => BoundExpr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(cond, result)| (inline_params(cond, args), inline_params(result, args)))
+                .collect(),
+            else_: else_.map(|e| Box::new(inline_params(*e, args))),
+            ty,
+        },
+        BoundExpr::Aggregate {
+            func,
+            distinct,
+            arg,
+            input_ty,
+            ret,
+        } => BoundExpr::Aggregate {
+            func,
+            distinct,
+            arg: arg.map(|a| Box::new(inline_params(*a, args))),
+            input_ty,
+            ret,
+        },
+        // Subqueries cannot appear in a validated scalar body; leave untouched.
+        BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::InSubquery { .. } => expr,
+    }
 }
 
 /// Apply a column's `varchar(n)`/`char(n)`/`name` length coercion in assignment

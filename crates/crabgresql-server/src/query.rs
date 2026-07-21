@@ -25,7 +25,7 @@ use crabgresql_types::{PgType, Value};
 
 use crate::catalog::SessionCatalog;
 use crate::error::PgError;
-use crate::global_catalog::{CatalogNotice, FuncDropSpec, GlobalCatalog, TypeRef};
+use crate::global_catalog::{CatalogNotice, FuncBody, FuncDropSpec, GlobalCatalog, TypeRef};
 use crate::session::{ActiveTxn, Session};
 
 /// Severity of a non-error message sent before a command's CommandComplete.
@@ -486,7 +486,7 @@ pub fn execute_statement(
                 return execute_alter_type(global_catalog, alter);
             }
             ast::Statement::CreateFunction(create) => {
-                return execute_create_function(global_catalog, create);
+                return execute_create_function(global_catalog, &type_catalog, create);
             }
             ast::Statement::CreateCast {
                 source,
@@ -2557,6 +2557,47 @@ fn function_internal_name(create: &ast::CreateFunction) -> Result<String, PgErro
     }
 }
 
+/// The normalized `SELECT <expr>` body text of a `LANGUAGE SQL` function. A
+/// `RETURN expr` / `AS RETURN expr` form becomes `SELECT expr`; an `AS '<body>'`
+/// string is taken verbatim (it is already a `SELECT`); an `AS RETURN (select)`
+/// is rendered from its query. Multi-statement `BEGIN ATOMIC` bodies are not
+/// supported yet. The binder re-parses this text to validate and inline the body.
+fn sql_function_body_text(create: &ast::CreateFunction) -> Result<String, PgError> {
+    match &create.function_body {
+        Some(ast::CreateFunctionBody::Return(expr))
+        | Some(ast::CreateFunctionBody::AsReturnExpr(expr)) => Ok(format!("SELECT {expr}")),
+        Some(ast::CreateFunctionBody::AsReturnSelect(select)) => Ok(select.to_string()),
+        Some(ast::CreateFunctionBody::AsBeforeOptions { body, .. })
+        | Some(ast::CreateFunctionBody::AsAfterOptions(body)) => string_literal(body),
+        _ => Err(PgError::feature_not_supported(
+            "CREATE FUNCTION LANGUAGE SQL requires a RETURN expression or AS '<body>'",
+        )),
+    }
+}
+
+/// The query-time [`PgType`] a resolved [`TypeRef`] denotes, for handing a SQL
+/// function's declared argument/return types to the binder. A `cstring` or shell
+/// user type — neither usable in a SQL function's signature — is refused.
+fn pg_type_of_ref(
+    type_catalog: &Arc<dyn TypeCatalog>,
+    r: &TypeRef,
+) -> Result<crabgresql_types::PgType, PgError> {
+    match r {
+        TypeRef::Builtin(t) => Ok(*t),
+        TypeRef::User(name) => type_catalog
+            .resolve_type(name)
+            .map(|u| crabgresql_types::PgType::User(u.oid))
+            .ok_or_else(|| {
+                PgError::feature_not_supported(format!(
+                    "SQL functions over type \"{name}\" are not supported yet"
+                ))
+            }),
+        TypeRef::Cstring => Err(PgError::feature_not_supported(
+            "SQL functions with a cstring argument or return type are not supported",
+        )),
+    }
+}
+
 /// Extract a single-quoted (or dollar-quoted) string literal expression.
 fn string_literal(expr: &ast::Expr) -> Result<String, PgError> {
     match expr {
@@ -2573,21 +2614,18 @@ fn string_literal(expr: &ast::Expr) -> Result<String, PgError> {
     }
 }
 
-/// `CREATE FUNCTION ... LANGUAGE internal AS '<builtin>'`.
+/// `CREATE FUNCTION`: `LANGUAGE internal AS '<builtin>'` (the type-bootstrap I/O
+/// functions) and `LANGUAGE SQL` scalar functions, whose body is validated and
+/// stored for inline expansion at call time.
 fn execute_create_function(
     catalog: &GlobalCatalog,
+    type_catalog: &Arc<dyn TypeCatalog>,
     create: &ast::CreateFunction,
 ) -> Result<QueryResult, PgError> {
     let lang = create
         .language
         .as_ref()
         .map(|i| i.value.to_ascii_lowercase());
-    if lang.as_deref() != Some("internal") {
-        return Err(PgError::feature_not_supported(
-            "CREATE FUNCTION is only supported for LANGUAGE internal",
-        ));
-    }
-    let internal_name = function_internal_name(create)?;
     let name = single_object_name(&create.name, "function")?;
     let ret = match &create.return_type {
         Some(ast::FunctionReturnType::DataType(dt)) => resolve_type_ref(catalog, dt)?,
@@ -2617,7 +2655,36 @@ fn execute_create_function(
         let position = (start.line != 0).then_some((start.line, start.column));
         args.push((resolve_type_ref(catalog, &arg.data_type)?, position));
     }
-    let notices = catalog.create_function(&name, args, ret, &internal_name)?;
+
+    let body = match lang.as_deref() {
+        Some("internal") => FuncBody::Internal(function_internal_name(create)?),
+        Some("sql") => {
+            let body_sql = sql_function_body_text(create)?;
+            // PG binds a `LANGUAGE SQL` body at CREATE time, reporting parse/type
+            // errors then rather than on first call. Binding here also fixes the
+            // register-after-validate ordering that makes a self-referential body
+            // fail with `undefined_function` instead of recursing forever.
+            let arg_types = args
+                .iter()
+                .map(|(r, _)| pg_type_of_ref(type_catalog, r))
+                .collect::<Result<Vec<_>, _>>()?;
+            let return_type = pg_type_of_ref(type_catalog, &ret)?;
+            crabgresql_binder::bind_sql_function_body(
+                type_catalog,
+                &arg_types,
+                return_type,
+                &body_sql,
+            )
+            .map_err(PgError::from)?;
+            FuncBody::Sql(body_sql)
+        }
+        _ => {
+            return Err(PgError::feature_not_supported(
+                "CREATE FUNCTION is only supported for LANGUAGE internal and LANGUAGE SQL",
+            ));
+        }
+    };
+    let notices = catalog.create_function(&name, args, ret, body)?;
     Ok(QueryResult::Command {
         tag: "CREATE FUNCTION".into(),
         notices: to_notices(notices),
