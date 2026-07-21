@@ -608,6 +608,8 @@ async fn subquery_review_fixes() -> anyhow::Result<()> {
 /// correlation.
 #[tokio::test]
 async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
     let client = connect(spawn_server().await).await;
     client.simple_query("CREATE TABLE t1 (a int, b int)").await?;
     client
@@ -696,6 +698,21 @@ async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
         .await?;
     let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("a")).collect();
     assert_eq!(got, vec![Some("1"), Some("1"), Some("2"), Some("2")]);
+
+    // A correlated subquery in the target list of a GROUP BY (aggregating) query
+    // is rejected cleanly: its OuterColumnRef indices address the pre-aggregation
+    // row, which would not line up with the aggregate node's output row. We
+    // return 0A000 rather than silently returning a wrong value (PG evaluates it;
+    // this is a documented not-yet-supported position). WHERE-clause correlation
+    // over an aggregating query (the join-outer case above) is unaffected.
+    let err = client
+        .simple_query("SELECT a, (SELECT max(c) FROM t2 WHERE t2.a = t1.a) FROM t1 GROUP BY a")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().map(|e| e.code()),
+        Some(&SqlState::FEATURE_NOT_SUPPORTED)
+    );
 
     Ok(())
 }

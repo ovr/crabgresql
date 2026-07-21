@@ -29,3 +29,16 @@ SELECT cq1.a FROM cq1 JOIN cq2 ON cq1.a = cq2.a
 SELECT a FROM cq1 x WHERE EXISTS (
   SELECT 1 FROM cq2 y WHERE y.a = x.a AND EXISTS (
     SELECT 1 FROM cq1 z WHERE z.a = x.a AND z.b = y.c)) ORDER BY a;
+-- correlated reference in a JOIN ... ON clause of a subquery body
+SELECT a FROM cq1 WHERE EXISTS (
+  SELECT 1 FROM cq2 x JOIN cq2 y ON x.a = y.a AND x.c = cq1.b) ORDER BY a;
+-- correlated (VALUES ...) subquery body
+SELECT a FROM cq1 WHERE b IN (VALUES (cq1.a * 10)) ORDER BY a;
+-- unqualified correlated reference to a USING/NATURAL-join column of the outer
+-- query: `k` resolves to the single merged column, not an ambiguity error
+CREATE TABLE cqu1 (k integer, p integer);
+CREATE TABLE cqu2 (k integer, q integer);
+INSERT INTO cqu1 VALUES (1, 10), (2, 20), (5, 50);
+INSERT INTO cqu2 VALUES (1, 100), (2, 200), (5, 500);
+SELECT k FROM cqu1 JOIN cqu2 USING (k)
+  WHERE EXISTS (SELECT 1 FROM cq2 WHERE cq2.a = k) ORDER BY k;

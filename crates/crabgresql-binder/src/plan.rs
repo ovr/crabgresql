@@ -1119,7 +1119,9 @@ fn bind_query_body(
             reject_unsupported_select_clauses(select)?;
             bind_select(engine, catalog, params, select, &query.order_by, ctes, outer_scope)
         }
-        ast::SetExpr::Values(values) => bind_values_query(catalog, params, values, &query.order_by),
+        ast::SetExpr::Values(values) => {
+            bind_values_query(catalog, params, values, &query.order_by, outer_scope)
+        }
         ast::SetExpr::Table(table) => {
             bind_table_query(engine, catalog, params, table, &query.order_by, ctes)
         }
@@ -1272,7 +1274,7 @@ fn bind_select(
         source,
         relations,
         visible,
-    } = bind_from_clause(engine, catalog, params, &select.from, ctes)?;
+    } = bind_from_clause(engine, catalog, params, &select.from, ctes, outer_scope)?;
     let scope = Scope::relations_with_visible(relations, visible, catalog, params)
         .with_subqueries(engine, ctes)
         .with_outer(outer_scope.to_vec());
@@ -1701,6 +1703,7 @@ fn bind_from_clause(
     params: &ParamCtx,
     from: &[ast::TableWithJoins],
     ctes: &CteEnv,
+    outer_scope: &[OuterLevel],
 ) -> Result<BoundFrom, BindError> {
     let mut combined: Option<JoinExpr> = None;
     let mut relations: Vec<(String, Vec<Column>)> = Vec::new();
@@ -1715,7 +1718,7 @@ fn bind_from_clause(
             source: group_source,
             relations: group_relations,
             visible: group_visible,
-        } = bind_table_with_joins(engine, catalog, params, table, ctes)?;
+        } = bind_table_with_joins(engine, catalog, params, table, ctes, outer_scope)?;
         for (qualifier, _) in &group_relations {
             ensure_unique_qualifier(&mut seen, qualifier)?;
         }
@@ -1884,6 +1887,7 @@ fn bind_table_with_joins(
     params: &ParamCtx,
     table: &ast::TableWithJoins,
     ctes: &CteEnv,
+    outer_scope: &[OuterLevel],
 ) -> Result<BoundFrom, BindError> {
     let mut bound =
         bind_from_item(engine, catalog, params, &table.relation, ctes)?.into_bound_from();
@@ -1931,7 +1935,8 @@ fn bind_table_with_joins(
                 });
                 let scope =
                     Scope::relations_with_visible(on_relations, on_visible, catalog, params)
-                        .with_subqueries(engine, ctes);
+                        .with_subqueries(engine, ctes)
+                        .with_outer(outer_scope.to_vec());
                 let binding = bind_expr(on, &scope)?;
                 if matches!(&binding, Binding::Typed(expr) if expr.contains_aggregate()) {
                     return Err(BindError::new(
@@ -2211,12 +2216,15 @@ fn bind_values_query(
     params: &ParamCtx,
     values: &ast::Values,
     order_by: &Option<ast::OrderBy>,
+    outer_scope: &[OuterLevel],
 ) -> Result<LogicalPlan, BindError> {
     if values.rows.is_empty() {
         return Err(BindError::syntax("VALUES lists must not be empty"));
     }
     let width = values.rows[0].content.len();
-    let scope = Scope::empty(catalog, params);
+    // A `VALUES (...)` used as a correlated subquery (`x IN (VALUES (outer.c))`)
+    // resolves its cell expressions outward via `outer_scope`; empty at top level.
+    let scope = Scope::empty(catalog, params).with_outer(outer_scope.to_vec());
     // Bind every cell, grouping bindings by column for type unification.
     let mut columns_of_bindings: Vec<Vec<crate::Binding>> = vec![Vec::new(); width];
     for row in &values.rows {
@@ -3263,19 +3271,52 @@ fn rewrite_over_aggregate(
             "set-returning functions with aggregation are not supported yet",
         )),
         // A non-correlated subquery is a per-group constant, so scalar/EXISTS pass
-        // through unchanged. For IN, the needle carried by `cmp` is an outer
-        // expression that may hold an aggregate or grouped column, so rewrite it.
-        c @ (BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. }) => Ok(c),
+        // through unchanged. A *correlated* one is rejected here: its
+        // `OuterColumnRef` indices address the outer query's pre-aggregation row,
+        // but a target-list/HAVING expression is evaluated against the aggregate
+        // node's output row (`[group keys, aggregates]`), so the indices would not
+        // line up. (A correlated subquery in WHERE is unaffected — that predicate
+        // runs before aggregation, over the base row, and never reaches here.)
+        c @ (BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. }) => {
+            reject_correlated_over_aggregate(&c)?;
+            Ok(c)
+        }
         BoundExpr::InSubquery {
             subplan,
             negated,
             cmp,
-        } => Ok(BoundExpr::InSubquery {
-            subplan,
-            negated,
-            cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
-        }),
+        } => {
+            if plan_has_outer_refs(&subplan.0) {
+                return Err(correlated_over_aggregate_error());
+            }
+            Ok(BoundExpr::InSubquery {
+                subplan,
+                negated,
+                cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
+            })
+        }
     }
+}
+
+/// Reject a scalar/EXISTS subquery marker that is correlated to the enclosing
+/// (aggregating) query when it appears in a target-list/HAVING expression — see
+/// [`rewrite_over_aggregate`]. Non-correlated markers are left alone.
+fn reject_correlated_over_aggregate(marker: &BoundExpr) -> Result<(), BindError> {
+    let subplan = match marker {
+        BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => &subplan.0,
+        _ => return Ok(()),
+    };
+    if plan_has_outer_refs(subplan) {
+        return Err(correlated_over_aggregate_error());
+    }
+    Ok(())
+}
+
+fn correlated_over_aggregate_error() -> BindError {
+    BindError::feature_not_supported(
+        "correlated subquery in the target list or HAVING of a grouped/aggregated query \
+         is not supported yet",
+    )
 }
 
 /// A projection list item after classification.

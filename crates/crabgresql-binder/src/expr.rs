@@ -670,14 +670,16 @@ pub struct ScopeRel {
     offset: usize,
 }
 
-/// A snapshot of one enclosing query's relations, kept so a correlated subquery
-/// can resolve an outer column. A merged-join `visible` view is intentionally
-/// not carried across a correlation boundary — each side's own column stays
-/// addressable through `rels`. Level 1 is the immediate parent; deeper ancestors
-/// follow.
+/// A snapshot of one enclosing query's name-resolution view, kept so a
+/// correlated subquery can resolve an outer column: its relations (for qualified
+/// `q.c` and the plain unqualified case) plus the merged-join `visible` view, so
+/// an unqualified reference to a `USING`/`NATURAL` join column of an outer query
+/// resolves to the single merged column (as in PG) rather than being reported
+/// ambiguous. Level 1 is the immediate parent; deeper ancestors follow.
 #[derive(Clone)]
 pub(crate) struct OuterLevel {
     rels: Vec<ScopeRel>,
+    visible: Option<Vec<VisibleColumn>>,
 }
 
 /// One column of a merged join namespace (`JOIN … USING` / `NATURAL JOIN`): the
@@ -771,6 +773,78 @@ fn column_in_rel(
         )
     })?;
     Ok((local, rel.columns[local].ty))
+}
+
+/// Rewrite every `ColumnRef` in `expr` into an `OuterColumnRef` at correlation
+/// `level`, cloning everything else. Used to turn a merged-join `visible`
+/// column's expression — a `ColumnRef` (inner/left/right join) or a full join's
+/// `COALESCE`-as-`CASE` over both sides — into a correlated reference when it is
+/// resolved from an enclosing query by an inner subquery.
+fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::ColumnRef { index, ty } => BoundExpr::OuterColumnRef {
+            level,
+            index: *index,
+            ty: *ty,
+        },
+        BoundExpr::Const { .. } | BoundExpr::Param { .. } | BoundExpr::OuterColumnRef { .. } => {
+            expr.clone()
+        }
+        BoundExpr::Unary { op, expr } => BoundExpr::Unary {
+            op: *op,
+            expr: Box::new(outerize_columns(expr, level)),
+        },
+        BoundExpr::Binary {
+            op,
+            arg_ty,
+            left,
+            right,
+        } => BoundExpr::Binary {
+            op: *op,
+            arg_ty: *arg_ty,
+            left: Box::new(outerize_columns(left, level)),
+            right: Box::new(outerize_columns(right, level)),
+        },
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(outerize_columns(expr, level)),
+            negated: *negated,
+        },
+        BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {
+            expr: Box::new(outerize_columns(expr, level)),
+            ty: *ty,
+        },
+        BoundExpr::Reinterpret {
+            expr,
+            reported,
+            rep,
+        } => BoundExpr::Reinterpret {
+            expr: Box::new(outerize_columns(expr, level)),
+            reported: *reported,
+            rep: *rep,
+        },
+        BoundExpr::FuncCall { func, ret, args } => BoundExpr::FuncCall {
+            func: *func,
+            ret: *ret,
+            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
+        },
+        BoundExpr::Case { whens, else_, ty } => BoundExpr::Case {
+            whens: whens
+                .iter()
+                .map(|(c, r)| (outerize_columns(c, level), outerize_columns(r, level)))
+                .collect(),
+            else_: else_
+                .as_ref()
+                .map(|e| Box::new(outerize_columns(e, level))),
+            ty: *ty,
+        },
+        // A merged-join visible column expression is only ever a ColumnRef or a
+        // COALESCE/CASE over ColumnRefs; these never appear, so clone defensively.
+        BoundExpr::Srf { .. }
+        | BoundExpr::Aggregate { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::InSubquery { .. } => expr.clone(),
+    }
 }
 
 /// Name-resolution scope: an ordered list of relations (empty for a FROM-less
@@ -919,6 +993,7 @@ impl Scope {
         let mut levels = Vec::with_capacity(self.outer.len() + 1);
         levels.push(OuterLevel {
             rels: self.rels.clone(),
+            visible: self.visible.clone(),
         });
         levels.extend(self.outer.iter().cloned());
         levels
@@ -978,21 +1053,34 @@ impl Scope {
     /// `visible` view is not consulted across a correlation boundary); `42703` if
     /// no enclosing query defines the name.
     fn resolve_outer(&self, name: &str) -> Result<BoundExpr, BindError> {
+        let ambiguous = || {
+            BindError::new(
+                sqlstate::AMBIGUOUS_COLUMN,
+                format!("column reference \"{name}\" is ambiguous"),
+            )
+        };
         for (depth, level) in self.outer.iter().enumerate() {
+            let level_no = depth + 1;
+            // A `USING`/`NATURAL` join in the outer query merges its join column
+            // into one `visible` entry; resolve against it first so a correlated
+            // unqualified reference to that column is not seen as ambiguous across
+            // the two physical sides still present in `rels`.
+            if let Some(visible) = &level.visible {
+                match lookup_visible(visible, name) {
+                    VisibleLookup::Found(expr) => return Ok(outerize_columns(expr, level_no)),
+                    VisibleLookup::Ambiguous => return Err(ambiguous()),
+                    VisibleLookup::Missing => continue,
+                }
+            }
             match lookup_in_rels(&level.rels, name) {
                 Some(Ok((index, ty))) => {
                     return Ok(BoundExpr::OuterColumnRef {
-                        level: depth + 1,
+                        level: level_no,
                         index,
                         ty,
                     });
                 }
-                Some(Err(())) => {
-                    return Err(BindError::new(
-                        sqlstate::AMBIGUOUS_COLUMN,
-                        format!("column reference \"{name}\" is ambiguous"),
-                    ));
-                }
+                Some(Err(())) => return Err(ambiguous()),
                 None => continue,
             }
         }

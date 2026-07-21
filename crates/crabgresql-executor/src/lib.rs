@@ -177,9 +177,13 @@ pub fn execute(
     // subplans — so thread it through the context every node is built with (and
     // nested `run_subplan` → `execute` re-injects it, so deeper levels see it too).
     resolve_subqueries(&mut plan, ctx, txn)?;
+    // Build the enriched context by copying only the fields we keep — not
+    // `..ctx.clone()`, which would clone the old `txn` Snapshot (a `Vec<Xid>`)
+    // only to overwrite it. One `txn.clone()` per execute, none wasted.
     let ctx = &ExecContext {
+        extra_float_digits: ctx.extra_float_digits,
+        sequences: ctx.sequences.clone(),
         txn: Some(txn.clone()),
-        ..ctx.clone()
     };
     match plan {
         PhysicalPlan::Values {
@@ -707,26 +711,32 @@ pub(crate) fn eval_correlated_subquery(
             "correlated subquery evaluated without a transaction context",
         )
     })?;
+    // Every correlated marker carries a subplan; clone it and fill its outer
+    // references from the current `row` once, then interpret per marker kind.
+    let subplan = match marker {
+        BoundExpr::ScalarSubquery { subplan, .. }
+        | BoundExpr::Exists { subplan, .. }
+        | BoundExpr::InSubquery { subplan, .. } => subplan,
+        // `eval` only calls this for a subquery marker.
+        _ => {
+            return Err(ExecError::new(
+                crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+                "eval_correlated_subquery called on a non-subquery expression",
+            ));
+        }
+    };
+    let mut logical = (*subplan.0).clone();
+    crabgresql_binder::substitute_outer(&mut logical, row);
     match marker {
-        BoundExpr::ScalarSubquery { subplan, ty } => {
-            let mut logical = (*subplan.0).clone();
-            crabgresql_binder::substitute_outer(&mut logical, row);
+        BoundExpr::ScalarSubquery { ty, .. } => {
             let rows = run_subplan(logical, ctx, txn)?;
             scalar_subquery_value(rows, *ty, ctx)
         }
-        BoundExpr::Exists { subplan, negated } => {
-            let mut logical = (*subplan.0).clone();
-            crabgresql_binder::substitute_outer(&mut logical, row);
+        BoundExpr::Exists { negated, .. } => {
             let exists = subplan_has_rows(logical, ctx, txn)?;
             Ok(Value::Bool(exists != *negated))
         }
-        BoundExpr::InSubquery {
-            subplan,
-            negated,
-            cmp,
-        } => {
-            let mut logical = (*subplan.0).clone();
-            crabgresql_binder::substitute_outer(&mut logical, row);
+        BoundExpr::InSubquery { negated, cmp, .. } => {
             let rows = run_subplan(logical, ctx, txn)?;
             // The OR-chain reuses the bound `x = <hole>` template, whose needle
             // reads the current row — so evaluate the folded chain against `row`.
@@ -739,11 +749,8 @@ pub(crate) fn eval_correlated_subquery(
                 (true, other) => Ok(other),
             }
         }
-        // `eval` only calls this for a subquery marker.
-        _ => Err(ExecError::new(
-            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
-            "eval_correlated_subquery called on a non-subquery expression",
-        )),
+        // Unreachable: `subplan` above already matched these three variants.
+        _ => Ok(Value::Null),
     }
 }
 
