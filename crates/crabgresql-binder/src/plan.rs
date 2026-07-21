@@ -4175,6 +4175,70 @@ mod tests {
     }
 
     #[test]
+    fn between_desugars_to_gte_and_lte() -> anyhow::Result<()> {
+        let LogicalPlan::Query { predicate, .. } =
+            bind_one("SELECT id FROM t WHERE id BETWEEN 1 AND 3")?
+        else {
+            panic!("expected Query");
+        };
+        // `x BETWEEN low AND high` -> `(x >= low) AND (x <= high)`.
+        let Some(BoundExpr::Binary {
+            op: BinOp::And,
+            left,
+            right,
+            ..
+        }) = predicate
+        else {
+            panic!("expected AND of two comparisons");
+        };
+        assert!(matches!(
+            *left,
+            BoundExpr::Binary {
+                op: BinOp::GtEq,
+                ..
+            }
+        ));
+        assert!(matches!(
+            *right,
+            BoundExpr::Binary {
+                op: BinOp::LtEq,
+                ..
+            }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn not_between_desugars_to_lt_or_gt() -> anyhow::Result<()> {
+        let LogicalPlan::Query { predicate, .. } =
+            bind_one("SELECT id FROM t WHERE id NOT BETWEEN 1 AND 3")?
+        else {
+            panic!("expected Query");
+        };
+        // `x NOT BETWEEN low AND high` -> `(x < low) OR (x > high)`.
+        let Some(BoundExpr::Binary {
+            op: BinOp::Or,
+            left,
+            right,
+            ..
+        }) = predicate
+        else {
+            panic!("expected OR of two comparisons");
+        };
+        assert!(matches!(
+            *left,
+            BoundExpr::Binary { op: BinOp::Lt, .. }
+        ));
+        assert!(matches!(
+            *right,
+            BoundExpr::Binary { op: BinOp::Gt, .. }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn unparsable_unknown_literal_is_22p02() {
         let e = bind_err("SELECT id FROM t WHERE id = 'abc'");
         assert_eq!(e.code, "22P02");

@@ -21,6 +21,7 @@ test: timestamptz
 test: interval
 test: case
 test: in
+test: between
 test: transactions
 test: numeric
 test: join

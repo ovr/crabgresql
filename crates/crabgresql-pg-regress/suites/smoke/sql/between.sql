@@ -1,0 +1,35 @@
+--
+-- BETWEEN / NOT BETWEEN
+-- Range membership `x BETWEEN low AND high`, its negation, three-valued logic
+-- with NULL bounds, implicit type coercion, and use as a WHERE predicate,
+-- checked against psql's aligned format.
+--
+-- literal range membership; NOT BETWEEN is the negation
+SELECT 2 BETWEEN 1 AND 3 AS in3, 5 NOT BETWEEN 1 AND 3 AS notin3;
+-- inclusive on both bounds
+SELECT 1 BETWEEN 1 AND 3 AS low_incl, 3 BETWEEN 1 AND 3 AS high_incl;
+-- the tested expression and the bounds may be arbitrary expressions
+SELECT 3 BETWEEN 1 + 1 AND 2 * 3 AS expr_bounds;
+-- an out-of-range value is false, and NOT BETWEEN its true negation
+SELECT 5 BETWEEN 1 AND 3 AS out_of_range, 5 NOT BETWEEN 1 AND 3 AS out_notin;
+-- three-valued logic: a NULL on the tested side makes the whole test NULL
+SELECT NULL BETWEEN 1 AND 3 AS null_left, NULL NOT BETWEEN 1 AND 3 AS null_left_notin;
+-- a NULL bound is NULL only when the other comparison does not already decide it:
+-- below the low bound is false regardless of the NULL high bound
+SELECT 0 BETWEEN 1 AND NULL AS below_low, 2 BETWEEN 1 AND NULL AS within_low_null_high;
+-- likewise a NULL low bound: above the high bound is false, in range is NULL
+SELECT 5 BETWEEN NULL AND 3 AS above_high, 2 BETWEEN NULL AND 3 AS within_high_null_low;
+-- implicit coercion: an integer tested against numeric bounds resolves the common type
+SELECT 2 BETWEEN 1.5 AND 2.5 AS int_numeric;
+-- an untyped literal on the left adopts the bounds' type
+SELECT '2' BETWEEN 1 AND 3 AS text_lit_left;
+-- text ranges order lexicographically
+SELECT 'b' BETWEEN 'a' AND 'c' AS text_range, 'd' BETWEEN 'a' AND 'c' AS text_out;
+-- range membership over a table column, evaluated once per row (NULL id -> NULL)
+CREATE TABLE brange (id integer, label text);
+INSERT INTO brange VALUES (1, 'a'), (2, 'b'), (3, 'c'), (5, 'e'), (NULL, 'd');
+SELECT label, id BETWEEN 2 AND 4 AS in24 FROM brange ORDER BY label;
+-- BETWEEN in a WHERE predicate keeps only rows testing true (NULL id dropped)
+SELECT label FROM brange WHERE id BETWEEN 2 AND 4 ORDER BY label;
+-- NOT BETWEEN likewise drops the NULL-id row
+SELECT label FROM brange WHERE id NOT BETWEEN 2 AND 4 ORDER BY label;

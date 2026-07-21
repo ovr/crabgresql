@@ -992,6 +992,12 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
             subquery,
             negated,
         } => bind_in_subquery(expr, subquery, *negated, scope),
+        ast::Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => bind_between(expr, low, high, *negated, scope),
         other => Err(unsupported_expr(other)),
     }
 }
@@ -2334,6 +2340,39 @@ fn bind_in_list(
         });
     }
     Ok(acc.expect("non-empty list yields at least one comparison"))
+}
+
+/// Bind `x BETWEEN low AND high` by desugaring into the pair of comparisons PG
+/// itself emits, reusing `bind_binary_op` so each pair resolves with the same
+/// type promotion, unknown-literal typing, "operator does not exist" errors, and
+/// three-valued NULL handling as a written comparison:
+///
+/// - `x BETWEEN low AND high`     -> `(x >= low) AND (x <= high)`
+/// - `x NOT BETWEEN low AND high` -> `(x < low) OR (x > high)`
+///
+/// The `NOT` form is the De Morgan dual of the positive one (`<`/`>` chained
+/// with `OR`), which keeps it Kleene-correct for NULL bounds — mirroring how
+/// `bind_in_list` picks `(NotEq, And)` vs `(Eq, Or)`. The tested expression is
+/// bound twice, as `IN (list)` re-binds its left operand per element.
+fn bind_between(
+    expr: &ast::Expr,
+    low: &ast::Expr,
+    high: &ast::Expr,
+    negated: bool,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let left = bind_expr(expr, scope)?;
+    let low = bind_expr(low, scope)?;
+    let high = bind_expr(high, scope)?;
+    let (cmp_lo, cmp_hi, chain) = if negated {
+        (BinOp::Lt, BinOp::Gt, BinOp::Or)
+    } else {
+        (BinOp::GtEq, BinOp::LtEq, BinOp::And)
+    };
+    let catalog = scope.catalog();
+    let lo = bind_binary_op(cmp_lo, left.clone(), low, Span::empty(), catalog.as_ref())?;
+    let hi = bind_binary_op(cmp_hi, left, high, Span::empty(), catalog.as_ref())?;
+    bind_binary_op(chain, lo, hi, Span::empty(), catalog.as_ref())
 }
 
 /// How an `IN` list resolves to the element type of PG's `= ANY(ARRAY[...])`.
