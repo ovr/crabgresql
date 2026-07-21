@@ -1974,7 +1974,24 @@ fn execute_create_table_as(
     create: &ast::CreateTable,
     session: &mut Session,
 ) -> Result<QueryResult, PgError> {
-    let name = object_name_to_table_name(&create.name)?;
+    let (schema_qual, name) = split_object_name(&create.name, "relation")?;
+    // Resolve the target namespace the same way a plain CREATE TABLE does: a
+    // TEMP table lives in the session temp keyspace (only `pg_temp` qualifiers
+    // allowed), everything else resolves/validates its schema qualifier.
+    let namespace = if create.temporary {
+        match schema_qual.as_deref() {
+            None | Some("pg_temp") => {}
+            Some(other) if other == session.temp_schema => {}
+            Some(_) => {
+                return Err(PgError::feature_not_supported(
+                    "cannot create a temporary relation in a non-temporary schema",
+                ));
+            }
+        }
+        "public".to_string()
+    } else {
+        resolve_create_namespace(engine, schema_qual.as_deref(), &name)?
+    };
     // Reject CTAS forms we don't implement rather than silently dropping them.
     // A table cannot be `OR REPLACE`d; ON COMMIT needs the M2 txn engine; table
     // constraints / LIKE / CLONE / storage options are not derived from a query.
@@ -2038,6 +2055,7 @@ fn execute_create_table_as(
 
     let schema = TableSchema {
         name: name.clone(),
+        namespace: namespace.clone(),
         columns: cols
             .iter()
             .map(|c| Column::new(c.name.clone(), c.ty))
@@ -2066,7 +2084,7 @@ fn execute_create_table_as(
     let table = match catalog.open_table(&name) {
         Ok(table) => table,
         Err(e) => {
-            let _ = target.drop_table(&name);
+            let _ = target.drop_table(&namespace, &name);
             return Err(e.into());
         }
     };
@@ -2094,7 +2112,7 @@ fn execute_create_table_as(
         Ok(exec) => exec,
         Err(e) => {
             let _ = finalize_statement(txnmgr, session, &txn, true, false);
-            let _ = target.drop_table(&name);
+            let _ = target.drop_table(&namespace, &name);
             return Err(e.into());
         }
     };
