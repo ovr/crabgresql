@@ -542,7 +542,7 @@ impl TableEngine for SystemCatalog {
         }
     }
 
-    fn drop_table(&self, name: &str) -> Result<(), StorageError> {
+    fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
         // The session catalog routes DROP through temp/global, never here; a
         // system catalog relation is not droppable.
         unreachable!("cannot drop relation \"{name}\" from the system catalog")

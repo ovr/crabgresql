@@ -38,6 +38,55 @@ ORDER BY n.nspname;
 -- Creating in a schema that does not exist errors.
 CREATE TABLE nope.t (id integer);
 ERROR:  schema "nope" does not exist
+-- A serial column and a standalone sequence both live in the schema; their
+-- defaults and explicit sequence functions resolve within it.
+CREATE TABLE app.counter (id serial, note text);
+INSERT INTO app.counter (note) VALUES ('a'), ('b');
+SELECT id, note FROM app.counter ORDER BY id;
+ id | note 
+----+------
+  1 | a
+  2 | b
+(2 rows)
+
+CREATE SEQUENCE app.seq;
+SELECT nextval('app.seq');
+ nextval 
+---------
+       1
+(1 row)
+
+SELECT nextval('app.seq');
+ nextval 
+---------
+       2
+(1 row)
+
+SELECT currval('app.seq');
+ currval 
+---------
+       2
+(1 row)
+
+SELECT setval('app.seq', 10);
+ setval 
+--------
+     10
+(1 row)
+
+SELECT nextval('app.seq');
+ nextval 
+---------
+      11
+(1 row)
+
+-- A qualified PRIMARY KEY builds its index in the schema.
+CREATE TABLE app.keyed (id integer PRIMARY KEY);
+INSERT INTO app.keyed VALUES (1);
 DROP SCHEMA app CASCADE;
-NOTICE:  drop cascades to table app.item
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to sequence app.seq
+drop cascades to table app.counter
+drop cascades to table app.item
+drop cascades to table app.keyed
 DROP TABLE item;

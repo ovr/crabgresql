@@ -407,6 +407,23 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
     assert_eq!(joined[0].get(0), Some("app"));
     assert_eq!(joined[1].get(0), Some("public"));
 
+    // A serial column and an explicit sequence both resolve within the schema
+    // (regression: qualified sequences used to resolve only in public).
+    client
+        .simple_query("CREATE TABLE app.counter (id serial, note text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO app.counter (note) VALUES ('x'), ('y')")
+        .await?;
+    let ids = client
+        .simple_query("SELECT id FROM app.counter ORDER BY id")
+        .await?;
+    let ids = rows(&ids);
+    assert_eq!(ids[0].get(0), Some("1"));
+    assert_eq!(ids[1].get(0), Some("2"));
+    let nv = client.simple_query("SELECT nextval('app.counter_id_seq')").await?;
+    assert_eq!(rows(&nv)[0].get(0), Some("3"));
+
     // CREATE TABLE in a missing schema → 3F000.
     let err = client
         .simple_query("CREATE TABLE nope.t (id int)")

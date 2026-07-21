@@ -20,5 +20,19 @@ WHERE c.relname = 'item'
 ORDER BY n.nspname;
 -- Creating in a schema that does not exist errors.
 CREATE TABLE nope.t (id integer);
+-- A serial column and a standalone sequence both live in the schema; their
+-- defaults and explicit sequence functions resolve within it.
+CREATE TABLE app.counter (id serial, note text);
+INSERT INTO app.counter (note) VALUES ('a'), ('b');
+SELECT id, note FROM app.counter ORDER BY id;
+CREATE SEQUENCE app.seq;
+SELECT nextval('app.seq');
+SELECT nextval('app.seq');
+SELECT currval('app.seq');
+SELECT setval('app.seq', 10);
+SELECT nextval('app.seq');
+-- A qualified PRIMARY KEY builds its index in the schema.
+CREATE TABLE app.keyed (id integer PRIMARY KEY);
+INSERT INTO app.keyed VALUES (1);
 DROP SCHEMA app CASCADE;
 DROP TABLE item;

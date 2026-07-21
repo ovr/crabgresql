@@ -98,10 +98,40 @@ impl MemoryEngine {
 impl TableEngine for MemoryEngine {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
         let namespace = schema.namespace.clone();
-        if self.relation_name_taken(&namespace, &schema.name) {
+        let key = (namespace.clone(), schema.name.clone());
+        // Hold the `tables` write lock across the collision check AND the insert,
+        // so two concurrent CREATE TABLE of the same (namespace, name) can't both
+        // pass the check and race to insert. The check is inlined here (rather
+        // than via `relation_name_taken`, which takes its own `tables` read lock
+        // and would deadlock under this write lock).
+        let mut tables = self
+            .tables
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let taken = tables.contains_key(&key)
+            || tables
+                .iter()
+                .filter(|((ns, _), _)| *ns == namespace)
+                .any(|(_, t)| {
+                    t.indexes
+                        .read()
+                        .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                        .iter()
+                        .any(|i| i.name == schema.name)
+                })
+            || self
+                .views
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(&key)
+            || self
+                .sequences
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .contains_key(&key);
+        if taken {
             return Err(StorageError::TableAlreadyExists(schema.name));
         }
-        let key = (namespace, schema.name.clone());
         let table = Arc::new(MemoryTable {
             schema: schema.clone(),
             rows: RwLock::new(Arc::new(Vec::new())),
@@ -109,10 +139,7 @@ impl TableEngine for MemoryEngine {
             indexes: RwLock::new(Vec::new()),
             phys: RwLock::new(Vec::new()),
         });
-        self.tables
-            .write()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .insert(key, table.clone());
+        tables.insert(key, table.clone());
         Ok(table)
     }
 
@@ -132,11 +159,7 @@ impl TableEngine for MemoryEngine {
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
 
-    fn drop_table(&self, name: &str) -> Result<(), StorageError> {
-        self.drop_table_in("public", name)
-    }
-
-    fn drop_table_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+    fn drop_table(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
         let key = (namespace.to_string(), name.to_string());
         self.tables
             .write()
@@ -207,11 +230,7 @@ impl TableEngine for MemoryEngine {
             .cloned()
     }
 
-    fn drop_view(&self, name: &str) -> Result<(), StorageError> {
-        self.drop_view_in("public", name)
-    }
-
-    fn drop_view_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+    fn drop_view(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
         self.views
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
@@ -254,11 +273,7 @@ impl TableEngine for MemoryEngine {
         Ok(())
     }
 
-    fn drop_sequence(&self, name: &str) -> Result<(), StorageError> {
-        self.drop_sequence_in("public", name)
-    }
-
-    fn drop_sequence_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+    fn drop_sequence(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
         self.sequences
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
@@ -267,11 +282,7 @@ impl TableEngine for MemoryEngine {
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
 
-    fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
-        self.sequence_in("public", name)
-    }
-
-    fn sequence_in(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
+    fn sequence(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
         self.sequences
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
@@ -298,11 +309,7 @@ impl TableEngine for MemoryEngine {
             .collect()
     }
 
-    fn sequence_nextval(&self, name: &str) -> SequenceAdvance {
-        self.sequence_nextval_in("public", name)
-    }
-
-    fn sequence_nextval_in(&self, namespace: &str, name: &str) -> SequenceAdvance {
+    fn sequence_nextval(&self, namespace: &str, name: &str) -> SequenceAdvance {
         let sequences = self
             .sequences
             .read()
@@ -321,11 +328,7 @@ impl TableEngine for MemoryEngine {
         }
     }
 
-    fn sequence_setval(&self, name: &str, value: i64, is_called: bool) -> SequenceAdvance {
-        self.sequence_setval_in("public", name, value, is_called)
-    }
-
-    fn sequence_setval_in(
+    fn sequence_setval(
         &self,
         namespace: &str,
         name: &str,
@@ -345,11 +348,7 @@ impl TableEngine for MemoryEngine {
         SequenceAdvance::Value(value)
     }
 
-    fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
-        self.create_index_in("public", table, index)
-    }
-
-    fn create_index_in(
+    fn create_index(
         &self,
         namespace: &str,
         table: &str,
@@ -1170,7 +1169,7 @@ mod tests {
     fn drop_table_removes_it_and_allows_recreate() -> anyhow::Result<()> {
         let engine = MemoryEngine::new();
         engine.create_table(schema("t"))?;
-        engine.drop_table("t")?;
+        engine.drop_table("public", "t")?;
         // Gone after drop.
         assert!(matches!(
             engine.open_table("t"),
@@ -1187,7 +1186,7 @@ mod tests {
     fn drop_missing_table_fails() {
         let engine = MemoryEngine::new();
         assert!(matches!(
-            engine.drop_table("nope"),
+            engine.drop_table("public", "nope"),
             Err(StorageError::TableNotFound(_))
         ));
     }
@@ -1338,7 +1337,7 @@ mod tests {
         let table = engine.create_table(schema("t"))?;
         // A row inserted before CREATE INDEX must be indexed by the build scan.
         insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("a".into())]);
-        engine.create_index("t", unique_index("t_id_key", 0))?;
+        engine.create_index("public", "t", unique_index("t_id_key", 0))?;
         // ...and a row inserted after must be indexed by insert maintenance.
         insert_committed(&tm, &*table, vec![Value::Int4(2), Value::Text("b".into())]);
 
@@ -1363,7 +1362,7 @@ mod tests {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t"))?;
-        engine.create_index("t", unique_index("t_id_key", 0))?;
+        engine.create_index("public", "t", unique_index("t_id_key", 0))?;
         let tid = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("a".into())]);
 
         // Move the key from 1 to 5.
@@ -1406,7 +1405,7 @@ mod tests {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t"))?;
-        engine.create_index("t", unique_index("t_id_key", 0))?;
+        engine.create_index("public", "t", unique_index("t_id_key", 0))?;
         // Unknown index name → unservable, caller falls back to a scan.
         assert!(probe_ids(&engine, &tm, "no_such_index", Value::Int4(1)).is_none());
         assert!(!table.supports_index_scan("no_such_index"));
@@ -1421,7 +1420,7 @@ mod tests {
             namespace: "public".into(),
             columns: vec![Column::new("x", PgType::Float8)],
         })?;
-        engine.create_index("f", unique_index("f_x_key", 0))?;
+        engine.create_index("public", "f", unique_index("f_x_key", 0))?;
         assert!(!ft.supports_index_scan("f_x_key"));
         assert!(
             ft.index_lookup("f_x_key", &[Value::Float8(1.0)], &read(&tm))
@@ -1435,7 +1434,7 @@ mod tests {
         let tm = TransactionManager::new();
         let engine = MemoryEngine::new();
         let table = engine.create_table(schema("t"))?;
-        engine.create_index("t", unique_index("t_id_key", 0))?;
+        engine.create_index("public", "t", unique_index("t_id_key", 0))?;
         let mut tid = insert_committed(&tm, &*table, vec![Value::Int4(1), Value::Text("v0".into())]);
         // Update the same key several times; each update appends a new tid under
         // the key and leaves the old (now dead) version behind.

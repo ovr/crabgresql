@@ -504,13 +504,8 @@ impl RelCatalog {
         Ok(true)
     }
 
-    /// Remove a sequence from `public` and persist. Returns `false` if it was not
-    /// present.
-    pub fn remove_sequence(&self, name: &str) -> std::io::Result<bool> {
-        self.remove_sequence_in("public", name)
-    }
-
-    /// Schema-qualified counterpart of [`RelCatalog::remove_sequence`].
+    /// Remove a sequence in `namespace` and persist. Returns `false` if it was
+    /// not present.
     pub fn remove_sequence_in(&self, namespace: &str, name: &str) -> std::io::Result<bool> {
         let mut state = self
             .state
@@ -541,12 +536,7 @@ impl RelCatalog {
             .collect()
     }
 
-    /// A single `public` sequence's definition, or `None` if absent.
-    pub fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
-        self.sequence_in("public", name)
-    }
-
-    /// Schema-qualified counterpart of [`RelCatalog::sequence`].
+    /// A single sequence's definition in `namespace`, or `None` if absent.
     pub fn sequence_in(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
         let state = self
             .state
@@ -559,14 +549,9 @@ impl RelCatalog {
             .map(persist_sequence_to_definition)
     }
 
-    /// Advance a sequence (`nextval`) and persist the new counter immediately —
-    /// outside any transaction, so the advance survives `ROLLBACK`. Returns the
-    /// new value, or `NotFound`/`Overflow`/`Underflow` without mutating.
-    pub fn advance_sequence(&self, name: &str) -> std::io::Result<SequenceAdvance> {
-        self.advance_sequence_in("public", name)
-    }
-
-    /// Schema-qualified counterpart of [`RelCatalog::advance_sequence`].
+    /// Advance a sequence (`nextval`) in `namespace` and persist the new counter
+    /// immediately — outside any transaction, so the advance survives `ROLLBACK`.
+    /// Returns the new value, or `NotFound`/`Overflow`/`Underflow` without mutating.
     pub fn advance_sequence_in(
         &self,
         namespace: &str,
@@ -595,18 +580,8 @@ impl RelCatalog {
         Ok(advance)
     }
 
-    /// Set a sequence's counter (`setval`) and persist immediately. Returns the
-    /// new value, or `NotFound` without mutating.
-    pub fn set_sequence(
-        &self,
-        name: &str,
-        value: i64,
-        is_called: bool,
-    ) -> std::io::Result<SequenceAdvance> {
-        self.set_sequence_in("public", name, value, is_called)
-    }
-
-    /// Schema-qualified counterpart of [`RelCatalog::set_sequence`].
+    /// Set a sequence's counter (`setval`) in `namespace` and persist
+    /// immediately. Returns the new value, or `NotFound` without mutating.
     pub fn set_sequence_in(
         &self,
         namespace: &str,
@@ -1254,9 +1229,12 @@ mod tests {
         // A duplicate is rejected without persisting.
         assert!(!catalog.create_sequence(&seq("s"))?);
         // Advance a few times: first nextval yields start (1), then +increment.
-        assert_eq!(catalog.advance_sequence("s")?, SequenceAdvance::Value(1));
-        assert_eq!(catalog.advance_sequence("s")?, SequenceAdvance::Value(2));
-        assert_eq!(catalog.advance_sequence("missing")?, SequenceAdvance::NotFound);
+        assert_eq!(catalog.advance_sequence_in("public", "s")?, SequenceAdvance::Value(1));
+        assert_eq!(catalog.advance_sequence_in("public", "s")?, SequenceAdvance::Value(2));
+        assert_eq!(
+            catalog.advance_sequence_in("public", "missing")?,
+            SequenceAdvance::NotFound
+        );
         drop(catalog);
 
         // Reload: the definition and the advanced counter both survive.
@@ -1266,12 +1244,15 @@ mod tests {
         assert_eq!(seqs[0].name, "s");
         assert_eq!(seqs[0].data_type, PgType::Int8);
         // nextval continues past the persisted counter, not from start again.
-        assert_eq!(loaded.advance_sequence("s")?, SequenceAdvance::Value(3));
+        assert_eq!(loaded.advance_sequence_in("public", "s")?, SequenceAdvance::Value(3));
         // setval resets it; the following nextval reflects is_called.
-        assert_eq!(loaded.set_sequence("s", 10, true)?, SequenceAdvance::Value(10));
-        assert_eq!(loaded.advance_sequence("s")?, SequenceAdvance::Value(11));
-        assert!(loaded.remove_sequence("s")?);
-        assert!(!loaded.remove_sequence("s")?);
+        assert_eq!(
+            loaded.set_sequence_in("public", "s", 10, true)?,
+            SequenceAdvance::Value(10)
+        );
+        assert_eq!(loaded.advance_sequence_in("public", "s")?, SequenceAdvance::Value(11));
+        assert!(loaded.remove_sequence_in("public", "s")?);
+        assert!(!loaded.remove_sequence_in("public", "s")?);
         drop(loaded);
         let reloaded = RelCatalog::load(dir.path())?;
         assert!(reloaded.sequences().is_empty());

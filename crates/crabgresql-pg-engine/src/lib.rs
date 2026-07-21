@@ -357,6 +357,29 @@ impl TxnFinalize for PgEngine {
     }
 }
 
+impl PgEngine {
+    /// Whether `name` already names a table, index, view or sequence in
+    /// `namespace` — the shared PostgreSQL relation namespace, scoped per schema.
+    /// Mirrors `MemoryEngine::relation_name_taken`. The caller passes the already
+    /// locked `tables` map (the create paths hold that lock across check+write),
+    /// so this must not take the `tables` lock itself.
+    fn relation_name_taken(
+        &self,
+        tables: &HashMap<(String, String), Arc<HeapTable>>,
+        namespace: &str,
+        name: &str,
+    ) -> bool {
+        tables.contains_key(&(namespace.to_string(), name.to_string()))
+            || self.catalog.contains_in(namespace, name)
+            || self.catalog.contains_view_in(namespace, name)
+            || self.catalog.contains_sequence_in(namespace, name)
+            || tables
+                .iter()
+                .filter(|((ns, _), _)| ns == namespace)
+                .any(|(_, t)| t.indexes().iter().any(|i| i.name == name))
+    }
+}
+
 impl TableEngine for PgEngine {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
         let namespace = schema.namespace.clone();
@@ -364,15 +387,7 @@ impl TableEngine for PgEngine {
             .tables
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        if tables.contains_key(&(namespace.clone(), schema.name.clone()))
-            || self.catalog.contains_in(&namespace, &schema.name)
-            || self.catalog.contains_view_in(&namespace, &schema.name)
-            || self.catalog.contains_sequence_in(&namespace, &schema.name)
-            || tables
-                .iter()
-                .filter(|((ns, _), _)| *ns == namespace)
-                .any(|(_, t)| t.indexes().iter().any(|i| i.name == schema.name))
-        {
+        if self.relation_name_taken(&tables, &namespace, &schema.name) {
             return Err(StorageError::TableAlreadyExists(schema.name));
         }
         let rel = self
@@ -404,11 +419,7 @@ impl TableEngine for PgEngine {
             .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
 
-    fn drop_table(&self, name: &str) -> Result<(), StorageError> {
-        self.drop_table_in("public", name)
-    }
-
-    fn drop_table_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+    fn drop_table(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
         // Remove the durable catalog entry and the in-memory handle together
         // under the tables lock, so `open_table` never observes a half-dropped
         // relation. The persistent catalog is the source of truth for existence:
@@ -453,11 +464,7 @@ impl TableEngine for PgEngine {
         Ok(())
     }
 
-    fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
-        self.create_index_in("public", table, index)
-    }
-
-    fn create_index_in(
+    fn create_index(
         &self,
         namespace: &str,
         table: &str,
@@ -467,14 +474,7 @@ impl TableEngine for PgEngine {
             .tables
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        if tables.contains_key(&(namespace.to_string(), index.name.clone()))
-            || self.catalog.contains_view_in(namespace, &index.name)
-            || self.catalog.contains_sequence_in(namespace, &index.name)
-            || tables
-                .iter()
-                .filter(|((ns, _), _)| ns == namespace)
-                .any(|(_, t)| t.indexes().iter().any(|i| i.name == index.name))
-        {
+        if self.relation_name_taken(&tables, namespace, &index.name) {
             return Err(StorageError::RelationAlreadyExists(index.name));
         }
         let target = tables
@@ -541,14 +541,7 @@ impl TableEngine for PgEngine {
             .tables
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        if tables.contains_key(&(namespace.clone(), def.name.clone()))
-            || self.catalog.contains_in(&namespace, &def.name)
-            || self.catalog.contains_sequence_in(&namespace, &def.name)
-            || tables
-                .iter()
-                .filter(|((ns, _), _)| *ns == namespace)
-                .any(|(_, t)| t.indexes().iter().any(|i| i.name == def.name))
-        {
+        if self.relation_name_taken(&tables, &namespace, &def.name) {
             return Err(StorageError::TableAlreadyExists(def.name));
         }
         let created = self
@@ -565,11 +558,7 @@ impl TableEngine for PgEngine {
         self.catalog.view_in(schema.unwrap_or("public"), name)
     }
 
-    fn drop_view(&self, name: &str) -> Result<(), StorageError> {
-        self.drop_view_in("public", name)
-    }
-
-    fn drop_view_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+    fn drop_view(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
         let removed = self
             .catalog
             .remove_view_in(namespace, name)
@@ -593,14 +582,7 @@ impl TableEngine for PgEngine {
             .tables
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        if tables.contains_key(&(namespace.clone(), def.name.clone()))
-            || self.catalog.contains_in(&namespace, &def.name)
-            || self.catalog.contains_view_in(&namespace, &def.name)
-            || tables
-                .iter()
-                .filter(|((ns, _), _)| *ns == namespace)
-                .any(|(_, t)| t.indexes().iter().any(|i| i.name == def.name))
-        {
+        if self.relation_name_taken(&tables, &namespace, &def.name) {
             return Err(StorageError::TableAlreadyExists(def.name));
         }
         let created = self
@@ -613,19 +595,7 @@ impl TableEngine for PgEngine {
         Ok(())
     }
 
-    fn drop_sequence(&self, name: &str) -> Result<(), StorageError> {
-        let removed = self
-            .catalog
-            .remove_sequence(name)
-            .expect("relation catalog write failed");
-        if removed {
-            Ok(())
-        } else {
-            Err(StorageError::TableNotFound(name.to_string()))
-        }
-    }
-
-    fn drop_sequence_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+    fn drop_sequence(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
         let removed = self
             .catalog
             .remove_sequence_in(namespace, name)
@@ -637,11 +607,7 @@ impl TableEngine for PgEngine {
         }
     }
 
-    fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
-        self.catalog.sequence(name)
-    }
-
-    fn sequence_in(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
+    fn sequence(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
         self.catalog.sequence_in(namespace, name)
     }
 
@@ -649,25 +615,13 @@ impl TableEngine for PgEngine {
         self.catalog.sequences()
     }
 
-    fn sequence_nextval(&self, name: &str) -> SequenceAdvance {
-        self.catalog
-            .advance_sequence(name)
-            .expect("relation catalog write failed")
-    }
-
-    fn sequence_nextval_in(&self, namespace: &str, name: &str) -> SequenceAdvance {
+    fn sequence_nextval(&self, namespace: &str, name: &str) -> SequenceAdvance {
         self.catalog
             .advance_sequence_in(namespace, name)
             .expect("relation catalog write failed")
     }
 
-    fn sequence_setval(&self, name: &str, value: i64, is_called: bool) -> SequenceAdvance {
-        self.catalog
-            .set_sequence(name, value, is_called)
-            .expect("relation catalog write failed")
-    }
-
-    fn sequence_setval_in(
+    fn sequence_setval(
         &self,
         namespace: &str,
         name: &str,

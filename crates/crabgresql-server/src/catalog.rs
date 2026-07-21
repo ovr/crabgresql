@@ -85,18 +85,18 @@ impl TableEngine for SessionCatalog {
         self.global.create_table(schema)
     }
 
-    fn drop_table(&self, name: &str) -> Result<(), StorageError> {
-        // Temp-first, mirroring `open_table`: a `DROP TABLE t` drops the session's
-        // temp `t` if one shadows a permanent one, else the permanent table.
-        match self.temp.drop_table(name) {
-            Err(StorageError::TableNotFound(_)) => self.global.drop_table(name),
-            other => other,
+    fn drop_table(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+        // For an unqualified/`public` drop, mirror `open_table`: drop the session's
+        // temp `t` if one shadows a permanent one, else the permanent table. A
+        // schema-qualified table lives only in the global engine's namespace.
+        if namespace == "public" {
+            match self.temp.drop_table("public", name) {
+                Err(StorageError::TableNotFound(_)) => self.global.drop_table("public", name),
+                other => other,
+            }
+        } else {
+            self.global.drop_table(namespace, name)
         }
-    }
-
-    fn drop_table_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
-        // A schema-qualified table lives in the global engine's namespace.
-        self.global.drop_table_in(namespace, name)
     }
 
     // User schemas live in the shared global engine.
@@ -116,19 +116,25 @@ impl TableEngine for SessionCatalog {
         self.global.schema_exists(name)
     }
 
-    fn create_index(&self, table: &str, index: IndexMetadata) -> Result<(), StorageError> {
-        if self.temp.open_table(table).is_ok() {
-            self.temp.create_index(table, index)
+    fn create_index(
+        &self,
+        namespace: &str,
+        table: &str,
+        index: IndexMetadata,
+    ) -> Result<(), StorageError> {
+        // A temp table (in the `public`-keyed temp store) shadows a permanent one.
+        if namespace == "public" && self.temp.open_table(table).is_ok() {
+            self.temp.create_index("public", table, index)
         } else {
-            self.global.create_index(table, index)
+            self.global.create_index(namespace, table, index)
         }
     }
 
-    fn index_name_exists(&self, table: &str, index_name: &str) -> bool {
-        if self.temp.open_table(table).is_ok() {
-            self.temp.index_name_exists(table, index_name)
+    fn index_name_exists(&self, namespace: &str, table: &str, index_name: &str) -> bool {
+        if namespace == "public" && self.temp.open_table(table).is_ok() {
+            self.temp.index_name_exists("public", table, index_name)
         } else {
-            self.global.index_name_exists(table, index_name)
+            self.global.index_name_exists(namespace, table, index_name)
         }
     }
 
@@ -161,12 +167,8 @@ impl TableEngine for SessionCatalog {
         }
     }
 
-    fn drop_view(&self, name: &str) -> Result<(), StorageError> {
-        self.global.drop_view(name)
-    }
-
-    fn drop_view_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
-        self.global.drop_view_in(namespace, name)
+    fn drop_view(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+        self.global.drop_view(namespace, name)
     }
 
     fn views(&self) -> Vec<ViewDefinition> {
@@ -179,46 +181,29 @@ impl TableEngine for SessionCatalog {
         self.global.create_sequence(def)
     }
 
-    fn drop_sequence(&self, name: &str) -> Result<(), StorageError> {
-        self.global.drop_sequence(name)
+    fn drop_sequence(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+        self.global.drop_sequence(namespace, name)
     }
 
-    fn drop_sequence_in(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
-        self.global.drop_sequence_in(namespace, name)
-    }
-
-    fn sequence(&self, name: &str) -> Option<SequenceDefinition> {
-        self.global.sequence(name)
-    }
-
-    fn sequence_in(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
-        self.global.sequence_in(namespace, name)
+    fn sequence(&self, namespace: &str, name: &str) -> Option<SequenceDefinition> {
+        self.global.sequence(namespace, name)
     }
 
     fn sequences(&self) -> Vec<SequenceDefinition> {
         self.global.sequences()
     }
 
-    fn sequence_nextval(&self, name: &str) -> SequenceAdvance {
-        self.global.sequence_nextval(name)
+    fn sequence_nextval(&self, namespace: &str, name: &str) -> SequenceAdvance {
+        self.global.sequence_nextval(namespace, name)
     }
 
-    fn sequence_nextval_in(&self, namespace: &str, name: &str) -> SequenceAdvance {
-        self.global.sequence_nextval_in(namespace, name)
-    }
-
-    fn sequence_setval(&self, name: &str, value: i64, is_called: bool) -> SequenceAdvance {
-        self.global.sequence_setval(name, value, is_called)
-    }
-
-    fn sequence_setval_in(
+    fn sequence_setval(
         &self,
         namespace: &str,
         name: &str,
         value: i64,
         is_called: bool,
     ) -> SequenceAdvance {
-        self.global
-            .sequence_setval_in(namespace, name, value, is_called)
+        self.global.sequence_setval(namespace, name, value, is_called)
     }
 }

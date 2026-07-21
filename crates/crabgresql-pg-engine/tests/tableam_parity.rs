@@ -493,7 +493,7 @@ fn drop_table_unlinks_file_and_frees_name() -> anyhow::Result<()> {
     assert!(base.join("1").exists());
     drop(table);
 
-    h.engine.drop_table("t")?;
+    h.engine.drop_table("public", "t")?;
     // The heap file is unlinked and the name is gone.
     assert!(!base.join("1").exists());
     assert!(matches!(
@@ -502,7 +502,7 @@ fn drop_table_unlinks_file_and_frees_name() -> anyhow::Result<()> {
     ));
     // Dropping again reports the missing table.
     assert!(matches!(
-        h.engine.drop_table("t"),
+        h.engine.drop_table("public", "t"),
         Err(crabgresql_storage_api::StorageError::TableNotFound(_))
     ));
 
@@ -540,7 +540,7 @@ fn heap_index_lookup_falls_back_to_scan() -> anyhow::Result<()> {
     let table = h.engine.create_table(schema("t"))?;
     insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Text("a".into())]);
     insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Text("b".into())]);
-    h.engine.create_index("t", pk_on_id())?;
+    h.engine.create_index("public", "t", pk_on_id())?;
 
     // The durable heap engine builds no physical index yet, so it reports no
     // index-scan support (the planner plans a Seq Scan) and `index_lookup`
@@ -614,7 +614,7 @@ fn drop_table_reclaims_a_pending_truncate_file() {
     let staged = h._dir.path().join("base").join("2");
     assert!(staged.exists(), "staged TRUNCATE file should exist before the drop");
 
-    h.engine.drop_table("t").unwrap();
+    h.engine.drop_table("public", "t").unwrap();
     assert!(
         !staged.exists(),
         "drop_table must unlink the staged TRUNCATE file (no leak)"

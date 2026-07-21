@@ -806,7 +806,7 @@ mod tests {
             panic!("failed to create planner test table: {error}");
         }
         if let Some(index) = index
-            && let Err(error) = engine.create_index("t", index)
+            && let Err(error) = engine.create_index("public", "t", index)
         {
             panic!("failed to create planner test index: {error}");
         }

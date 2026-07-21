@@ -1215,7 +1215,7 @@ fn execute_create_index(
         .ok_or_else(|| PgError::syntax("CREATE INDEX requires an index name"))
         .and_then(object_name_to_table_name)?;
     let table_name = object_name_to_table_name(&create.table_name)?;
-    if engine.index_name_exists(&table_name, &index_name) {
+    if engine.index_name_exists("public", &table_name, &index_name) {
         if create.if_not_exists {
             let mut result = QueryResult::command("CREATE INDEX");
             if let QueryResult::Command { notices, .. } = &mut result {
@@ -1245,7 +1245,7 @@ fn execute_create_index(
         let txn = build_txn(txnmgr, session, false);
         validate_unique_index_build(&table, &index, &txn)?;
     }
-    engine.create_index(&table_name, index)?;
+    engine.create_index("public", &table_name, index)?;
     Ok(QueryResult::command("CREATE INDEX"))
 }
 
@@ -1716,8 +1716,12 @@ fn execute_create_table(
             // Name the sequence `t_col_seq`, dodging existing relations and any
             // other serial sequences created earlier in this same statement.
             let taken: Vec<String> = serial_defs.iter().map(|d| d.name.clone()).collect();
-            let seq_name =
-                unique_relation_name(target, &taken, &format!("{name}_{column_name}_seq"));
+            let seq_name = unique_relation_name(
+                target,
+                &namespace,
+                &taken,
+                &format!("{name}_{column_name}_seq"),
+            );
             // A qualified table's serial default must reference the sequence by
             // its schema too, so `nextval` resolves it in the same namespace.
             let seq_ref = if namespace == "public" {
@@ -1931,8 +1935,8 @@ fn execute_create_table(
     match target.create_table(schema) {
         Ok(_) => {
             for index in indexes {
-                if let Err(e) = target.create_index_in(&namespace, &name, index) {
-                    let _ = target.drop_table_in(&namespace, &name);
+                if let Err(e) = target.create_index(&namespace, &name, index) {
+                    let _ = target.drop_table(&namespace, &name);
                     drop_created_sequences(target, &serial_defs);
                     return Err(e.into());
                 }
@@ -2544,7 +2548,7 @@ fn execute_create_view(
             // A replaced view may (transitively) reference itself; PG permits
             // creating such a view and only errors when it is used, so the
             // binder detects the cycle at expansion time rather than here.
-            catalog.drop_view_in(&namespace, &name)?;
+            catalog.drop_view(&namespace, &name)?;
         }
     } else if existing_table || catalog.resolve_view(Some(&namespace), &name).is_some() {
         if create.if_not_exists {
@@ -2665,15 +2669,25 @@ fn collect_factor_relations(
 ) {
     match factor {
         // A plain relation reference (a table function carries `args`); skip it
-        // when an in-scope CTE of the same name shadows the base relation.
+        // when an in-scope CTE of the same name shadows the base relation. The
+        // reference is recorded as a qualified `"namespace.name"` key (unqualified
+        // → `public`) so a view's dependency set can distinguish same-named
+        // relations in different schemas.
         ast::TableFactor::Table {
             name, args: None, ..
         } => {
-            if let Some(part) = name.0.last().and_then(|part| part.as_ident()) {
-                let name = normalize_ident(part);
-                if !scope.contains(&name) {
-                    names.push(name);
+            let parts = &name.0;
+            if let Some(rel) = parts.last().and_then(|part| part.as_ident()).map(normalize_ident) {
+                // A CTE name is always unqualified, so it shadows only a bare
+                // reference of the same name.
+                let schema = (parts.len() >= 2)
+                    .then(|| parts[parts.len() - 2].as_ident().map(normalize_ident))
+                    .flatten();
+                if schema.is_none() && scope.contains(&rel) {
+                    return;
                 }
+                let namespace = schema.unwrap_or_else(|| "public".to_string());
+                names.push(format!("{namespace}.{rel}"));
             }
         }
         ast::TableFactor::Derived { subquery, .. } => {
@@ -2717,8 +2731,14 @@ fn execute_drop_table(
     // A target named twice is rejected up front, before anything is dropped, as
     // in PG — otherwise the second pass would re-drop (and, if a temp table
     // shadows a permanent one, silently drop the permanent table too).
-    for (i, (_, _, display)) in targets.iter().enumerate() {
-        if targets[..i].iter().any(|(_, _, d)| d == display) {
+    // Dedup by the resolved (namespace, bare) key, not the written display form,
+    // so `DROP TABLE public.t, t` (both resolve to public.t) is caught as PG's
+    // 42710 rather than double-dropping.
+    for (i, (ns, bare, display)) in targets.iter().enumerate() {
+        if targets[..i]
+            .iter()
+            .any(|(ns2, bare2, _)| ns2 == ns && bare2 == bare)
+        {
             return Err(PgError::new(
                 sqlstate::DUPLICATE_OBJECT,
                 format!("table \"{display}\" specified more than once"),
@@ -2769,20 +2789,25 @@ fn execute_drop_table(
             ));
         }
     }
-    // Phase 2: resolve dependent views for the plain targets (RESTRICT errors,
-    // CASCADE drops them), then drop the tables followed by their cascaded views.
-    // Cross-schema view dependencies on qualified targets are not tracked yet.
+    // Phase 2: resolve dependent views across every target namespace (RESTRICT
+    // errors, CASCADE drops them), then drop the tables followed by their
+    // cascaded views.
+    let mut all_targets: Vec<(String, String)> = plain
+        .iter()
+        .map(|n| ("public".to_string(), n.clone()))
+        .collect();
+    all_targets.extend(qualified.iter().cloned());
     let (dependent_views, mut cascade_notices) =
-        plan_view_cascade(catalog, "table", &plain, cascade)?;
+        plan_view_cascade(catalog, "table", &all_targets, cascade)?;
     notices.append(&mut cascade_notices);
     for name in &plain {
-        catalog.drop_table(name)?;
+        catalog.drop_table("public", name)?;
     }
     for (ns, name) in &qualified {
-        catalog.drop_table_in(ns, name)?;
+        catalog.drop_table(ns, name)?;
     }
-    for view in &dependent_views {
-        catalog.drop_view(view)?;
+    for (ns, view) in &dependent_views {
+        catalog.drop_view(ns, view)?;
     }
     // Auto-drop sequences a dropped table owns (a `serial` column's sequence, via
     // PG's OWNED BY). PG removes these silently, without a cascade notice.
@@ -2794,7 +2819,7 @@ fn execute_drop_table(
                     .any(|(ns, t)| *ns == seq.namespace && t == owner)
         });
         if owned_by_dropped {
-            let _ = catalog.drop_sequence_in(&seq.namespace, &seq.name);
+            let _ = catalog.drop_sequence(&seq.namespace, &seq.name);
         }
     }
     Ok(QueryResult::Command {
@@ -2847,14 +2872,18 @@ fn execute_drop_view(
             ));
         }
     }
+    let targets: Vec<(String, String)> = to_drop
+        .iter()
+        .map(|n| ("public".to_string(), n.clone()))
+        .collect();
     let (dependent_views, mut cascade_notices) =
-        plan_view_cascade(catalog, "view", &to_drop, cascade)?;
+        plan_view_cascade(catalog, "view", &targets, cascade)?;
     notices.append(&mut cascade_notices);
     for name in &to_drop {
-        catalog.drop_view(name)?;
+        catalog.drop_view("public", name)?;
     }
-    for view in &dependent_views {
-        catalog.drop_view(view)?;
+    for (ns, view) in &dependent_views {
+        catalog.drop_view(ns, view)?;
     }
     Ok(QueryResult::Command {
         tag: "DROP VIEW".into(),
@@ -2916,15 +2945,21 @@ fn seq_type_name(ty: PgType) -> &'static str {
 /// Pick a relation name not already used by a table, view, index, or sequence
 /// (nor by `extra`, names reserved earlier in the same statement), appending a
 /// numeric suffix as PostgreSQL does for auto-named serial sequences.
-fn unique_relation_name(engine: &Arc<dyn TableEngine>, extra: &[String], base: &str) -> String {
+fn unique_relation_name(
+    engine: &Arc<dyn TableEngine>,
+    namespace: &str,
+    extra: &[String],
+    base: &str,
+) -> String {
     let taken = |n: &str| {
         extra.iter().any(|x| x == n)
-            || engine.sequence(n).is_some()
-            || engine.open_table(n).is_ok()
-            || engine.resolve_view(None, n).is_some()
+            || engine.sequence(namespace, n).is_some()
+            || engine.resolve(Some(namespace), n).is_ok()
+            || engine.resolve_view(Some(namespace), n).is_some()
             || engine
                 .relation_metadata()
                 .iter()
+                .filter(|r| r.schema.namespace == namespace)
                 .any(|r| r.indexes.iter().any(|i| i.name == n))
     };
     if !taken(base) {
@@ -2943,7 +2978,7 @@ fn unique_relation_name(engine: &Arc<dyn TableEngine>, extra: &[String], base: &
 /// failed — DDL is not transactional, so this avoids leaking orphan sequences.
 fn drop_created_sequences(engine: &Arc<dyn TableEngine>, defs: &[SequenceDefinition]) {
     for def in defs {
-        let _ = engine.drop_sequence_in(&def.namespace, &def.name);
+        let _ = engine.drop_sequence(&def.namespace, &def.name);
     }
 }
 
@@ -3150,7 +3185,7 @@ fn execute_drop_sequence(
     let mut notices = Vec::new();
     let mut to_drop: Vec<String> = Vec::new();
     for name in &snames {
-        if catalog.sequence(name).is_some() {
+        if catalog.sequence("public", name).is_some() {
             to_drop.push(name.clone());
         } else if catalog.resolve_view(None, name).is_some() {
             return Err(PgError::new(
@@ -3180,7 +3215,7 @@ fn execute_drop_sequence(
     // sequence) has a dependent default and cannot be dropped directly.
     if !cascade {
         for name in &to_drop {
-            let Some(def) = catalog.sequence(name) else {
+            let Some(def) = catalog.sequence("public", name) else {
                 continue;
             };
             let Some(owner) = def.owned_by.as_deref() else {
@@ -3211,7 +3246,7 @@ fn execute_drop_sequence(
         }
     }
     for name in &to_drop {
-        catalog.drop_sequence(name)?;
+        catalog.drop_sequence("public", name)?;
     }
     Ok(QueryResult::Command {
         tag: "DROP SEQUENCE".into(),
@@ -3312,11 +3347,19 @@ fn execute_drop_schema(
     // Phase 2: for each surviving target, enumerate its contents (a `(kind,
     // name)` list, sorted for deterministic output), then apply RESTRICT/CASCADE.
     for name in &to_drop {
+        let tables: Vec<String> = engine
+            .relation_metadata()
+            .into_iter()
+            .filter(|r| r.schema.namespace == *name)
+            .map(|r| r.schema.name)
+            .collect();
+        // A serial column's OWNED BY sequence is an internal dependency of its
+        // table, dropped silently with it (as in `DROP TABLE`), so it is neither
+        // listed nor RESTRICT-blocking; only standalone sequences are dependents.
+        let mut owned_seqs: Vec<String> = Vec::new();
         let mut contents: Vec<(&str, String)> = Vec::new();
-        for r in engine.relation_metadata() {
-            if r.schema.namespace == *name {
-                contents.push(("table", r.schema.name));
-            }
+        for t in &tables {
+            contents.push(("table", t.clone()));
         }
         for v in engine.views() {
             if v.namespace == *name {
@@ -3324,8 +3367,12 @@ fn execute_drop_schema(
             }
         }
         for s in engine.sequences() {
-            if s.namespace == *name {
-                contents.push(("sequence", s.name));
+            if s.namespace != *name {
+                continue;
+            }
+            match s.owned_by.as_deref() {
+                Some(owner) if tables.iter().any(|t| t == owner) => owned_seqs.push(s.name),
+                _ => contents.push(("sequence", s.name)),
             }
         }
         contents.sort();
@@ -3362,11 +3409,16 @@ fn execute_drop_schema(
             notices.push(notice);
             for (kind, obj) in &contents {
                 let _ = match *kind {
-                    "table" => engine.drop_table_in(name, obj),
-                    "view" => engine.drop_view_in(name, obj),
-                    _ => engine.drop_sequence_in(name, obj),
+                    "table" => engine.drop_table(name, obj),
+                    "view" => engine.drop_view(name, obj),
+                    _ => engine.drop_sequence(name, obj),
                 };
             }
+        }
+        // Drop the serial-owned sequences silently, with their tables (they were
+        // excluded from the cascade listing as internal dependencies).
+        for seq in &owned_seqs {
+            let _ = engine.drop_sequence(name, seq);
         }
         engine.drop_schema(name)?;
     }
@@ -3377,34 +3429,55 @@ fn execute_drop_schema(
 }
 
 /// Resolve the views that depend on a set of relations being dropped. `targets`
-/// are the relation names being removed, all of object class `target_noun`
-/// (`"table"` or `"view"`). Under RESTRICT (`!cascade`) any dependent is an
-/// error (2BP01, with a DETAIL line per dependency edge). Under CASCADE it
-/// returns the transitive set of dependent view names to drop, in
-/// discovery order, plus the `drop cascades to ...` NOTICE(s) — matching the
-/// wording of `DROP TYPE ... CASCADE`.
+/// are the `(namespace, name)` relations being removed, all of object class
+/// `target_noun` (`"table"` or `"view"`). Dependencies are matched on the
+/// qualified `"namespace.name"` key, so a view in any schema that reads a dropped
+/// relation is found (cross-schema included). Under RESTRICT (`!cascade`) any
+/// dependent is an error (2BP01, with a DETAIL line per dependency edge). Under
+/// CASCADE it returns the transitive set of dependent views to drop (each as
+/// `(namespace, name)`), in discovery order, plus the `drop cascades to ...`
+/// NOTICE(s) — matching the wording of `DROP TYPE ... CASCADE`.
+/// A relation as `(namespace, name)` — the key `plan_view_cascade` matches drop
+/// targets and dependent views by.
+type QualifiedRelation = (String, String);
+
 fn plan_view_cascade(
     catalog: &Arc<dyn TableEngine>,
     target_noun: &str,
-    targets: &[String],
+    targets: &[QualifiedRelation],
     cascade: bool,
-) -> Result<(Vec<String>, Vec<Notice>), PgError> {
+) -> Result<(Vec<QualifiedRelation>, Vec<Notice>), PgError> {
     let all_views = catalog.views();
-    let is_target = |name: &str| targets.iter().any(|t| t == name);
+    let key = |ns: &str, name: &str| format!("{ns}.{name}");
+    // PG omits the `public.` prefix in dependency messages; keep a bare display
+    // for public objects and qualify the rest.
+    let disp = |ns: &str, name: &str| {
+        if ns == "public" {
+            name.to_string()
+        } else {
+            format!("{ns}.{name}")
+        }
+    };
+    let target_keys: Vec<String> = targets.iter().map(|(ns, n)| key(ns, n)).collect();
 
     if !cascade {
         // RESTRICT: report every (dependent view, target) edge as a DETAIL line,
         // in target order then view order, as PG does.
         let mut detail = Vec::new();
-        let mut first_blocked: Option<&str> = None;
-        for target in targets {
+        let mut first_blocked: Option<String> = None;
+        for (tns, tn) in targets {
+            let tkey = key(tns, tn);
             for view in &all_views {
-                if is_target(&view.name) {
+                if target_keys.contains(&key(&view.namespace, &view.name)) {
                     continue;
                 }
-                if view.depends_on.iter().any(|d| d == target) {
-                    detail.push(format!("view {} depends on {target_noun} {target}", view.name));
-                    first_blocked.get_or_insert(target.as_str());
+                if view.depends_on.iter().any(|d| d == &tkey) {
+                    detail.push(format!(
+                        "view {} depends on {target_noun} {}",
+                        disp(&view.namespace, &view.name),
+                        disp(tns, tn)
+                    ));
+                    first_blocked.get_or_insert_with(|| disp(tns, tn));
                 }
             }
         }
@@ -3421,17 +3494,18 @@ fn plan_view_cascade(
 
     // CASCADE: breadth-first transitive closure of dependent views. A view is
     // pulled in when its `depends_on` names anything already being dropped.
-    let mut removed: Vec<String> = targets.to_vec();
-    let mut dependents: Vec<String> = Vec::new();
+    let mut removed: Vec<String> = target_keys;
+    let mut dependents: Vec<(String, String)> = Vec::new();
     loop {
         let mut added = false;
         for view in &all_views {
-            if removed.iter().any(|r| r == &view.name) {
+            let vkey = key(&view.namespace, &view.name);
+            if removed.contains(&vkey) {
                 continue;
             }
-            if view.depends_on.iter().any(|d| removed.iter().any(|r| r == d)) {
-                removed.push(view.name.clone());
-                dependents.push(view.name.clone());
+            if view.depends_on.iter().any(|d| removed.contains(d)) {
+                removed.push(vkey);
+                dependents.push((view.namespace.clone(), view.name.clone()));
                 added = true;
             }
         }
@@ -3442,11 +3516,14 @@ fn plan_view_cascade(
 
     let notices = match dependents.as_slice() {
         [] => Vec::new(),
-        [one] => vec![Notice::notice(format!("drop cascades to view {one}"), None)],
+        [(ns, name)] => vec![Notice::notice(
+            format!("drop cascades to view {}", disp(ns, name)),
+            None,
+        )],
         many => {
             let detail = many
                 .iter()
-                .map(|v| format!("drop cascades to view {v}"))
+                .map(|(ns, name)| format!("drop cascades to view {}", disp(ns, name)))
                 .collect::<Vec<_>>()
                 .join("\n");
             vec![Notice::notice(
@@ -3511,8 +3588,14 @@ mod tests {
     #[test]
     fn referenced_relations_excludes_cte_names_but_keeps_their_bodies() {
         // A CTE name is not a dependency; the base table inside its body is.
+        // Dependencies are recorded as qualified `namespace.name` keys.
         assert_eq!(deps("WITH c AS (SELECT 1) SELECT * FROM c"), Vec::<String>::new());
-        assert_eq!(deps("WITH c AS (SELECT * FROM t) SELECT * FROM c"), vec!["t"]);
+        assert_eq!(
+            deps("WITH c AS (SELECT * FROM t) SELECT * FROM c"),
+            vec!["public.t"]
+        );
+        // A schema-qualified reference keeps its schema.
+        assert_eq!(deps("SELECT * FROM app.t"), vec!["app.t"]);
     }
 
     #[test]
@@ -3521,7 +3604,7 @@ mod tests {
         // outer `c` is the real relation and must remain a dependency.
         assert_eq!(
             deps("SELECT * FROM (WITH c AS (SELECT 1) SELECT * FROM c) d, c"),
-            vec!["c"]
+            vec!["public.c"]
         );
     }
 
