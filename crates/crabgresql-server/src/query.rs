@@ -204,15 +204,7 @@ fn bind_catalogs(
                     let mut rels: Vec<_> = global
                         .relation_metadata()
                         .into_iter()
-                        .map(|metadata| {
-                            let mut relation =
-                                crabgresql_catalog::CatalogRelation::permanent_metadata(metadata);
-                            // A partitioned parent reflects as relkind='p'.
-                            if relation.schema.partition_scheme.is_some() {
-                                relation.kind = crabgresql_catalog::RelKind::PartitionedTable;
-                            }
-                            relation
-                        })
+                        .map(crabgresql_catalog::CatalogRelation::permanent_metadata)
                         .collect();
                     rels.extend(temp.relation_metadata().into_iter().map(|metadata| {
                         let mut relation = crabgresql_catalog::CatalogRelation::temporary(
@@ -1184,6 +1176,7 @@ fn execute_truncate(
         }
         let name = object_name_to_table_name(&target.name)?;
         let table = engine.open_table(&name)?;
+        reject_partitioned_parent(&table, &name)?;
         named.push((name, table));
     }
     // Acquire the tables' exclusive locks in a deterministic order (by name), so
@@ -1264,6 +1257,7 @@ fn execute_create_index(
         ));
     }
     let table = engine.open_table(&table_name)?;
+    reject_partitioned_parent(&table, &table_name)?;
     let keys = simple_index_keys(table.schema(), &create.columns)?;
     let index = IndexMetadata {
         name: index_name.clone(),
@@ -2023,6 +2017,20 @@ fn execute_create_table(
     Ok(QueryResult::command("CREATE TABLE"))
 }
 
+/// Reject a direct physical DDL operation (TRUNCATE, CREATE INDEX) on a
+/// partitioned parent. The parent owns no storage of its own — the operation
+/// would have to fan out to its partitions, which is not implemented yet — so it
+/// is rejected rather than silently applied to the empty parent relation,
+/// mirroring the binder's rejection of DML/queries against the parent.
+fn reject_partitioned_parent(table: &Arc<dyn TableAm>, name: &str) -> Result<(), PgError> {
+    if table.schema().partition_scheme.is_some() {
+        return Err(PgError::feature_not_supported(format!(
+            "\"{name}\" is a partitioned table; operating on it directly is not supported yet"
+        )));
+    }
+    Ok(())
+}
+
 /// Decode a `PARTITION BY <strategy> (<cols>)` clause into a [`PartitionScheme`].
 /// The parser stores the clause as a function-call expression (`RANGE(d)`); this
 /// slice supports RANGE with a single simple-column key.
@@ -2083,6 +2091,17 @@ fn build_partition_scheme(
             format!("column \"{key}\" named in partition key does not exist"),
         ));
     };
+    // A RANGE key must be a btree-orderable type; otherwise bound comparison
+    // would later panic in `compare_values`. PG rejects the same at parent create.
+    if !crabgresql_executor::is_orderable(columns[idx].ty) {
+        return Err(PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!(
+                "data type {} has no default operator class for access method \"btree\"",
+                columns[idx].ty.name()
+            ),
+        ));
+    }
     Ok(PartitionScheme {
         strategy: PartitionStrategy::Range,
         key_columns: vec![idx],
@@ -2156,6 +2175,14 @@ fn incoming_endpoint(
         ast::PartitionBoundValue::MaxValue => Ok((PartitionBoundDatum::MaxValue, Endpoint::PosInf)),
         ast::PartitionBoundValue::Expr(expr) => {
             let value = fold_bound_value(expr, key_col, type_catalog)?;
+            // A NULL bound has no place in the RANGE order (and would panic the
+            // downstream `compare_values`); reject it as PG does.
+            if value == Value::Null {
+                return Err(PgError::new(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "cannot specify NULL in range bound",
+                ));
+            }
             Ok((
                 PartitionBoundDatum::Value(expr.to_string()),
                 Endpoint::Finite(value),
@@ -2208,10 +2235,27 @@ fn execute_create_partition(
     let parent = engine
         .resolve(parent_qual.as_deref(), &parent_name)
         .map_err(|_| {
-            PgError::new(
-                sqlstate::UNDEFINED_TABLE,
-                format!("relation \"{parent_name}\" does not exist"),
-            )
+            // A view or sequence of that name exists but is not a table: PG reports
+            // wrong-object-type, not "does not exist".
+            let is_non_table_relation = engine
+                .resolve_view(parent_qual.as_deref(), &parent_name)
+                .is_some()
+                || engine
+                    .sequence(parent_qual.as_deref().unwrap_or("public"), &parent_name)
+                    .is_some();
+            if is_non_table_relation {
+                PgError::new(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    format!(
+                        "inherited relation \"{parent_name}\" is not a table or foreign table"
+                    ),
+                )
+            } else {
+                PgError::new(
+                    sqlstate::UNDEFINED_TABLE,
+                    format!("relation \"{parent_name}\" does not exist"),
+                )
+            }
         })?;
     let parent_schema = parent.schema();
     let Some(scheme) = &parent_schema.partition_scheme else {
@@ -2272,6 +2316,13 @@ fn execute_create_partition(
         if part.parent_namespace != parent_schema.namespace
             || part.parent_name != parent_schema.name
         {
+            continue;
+        }
+        // A relation of this exact name already existing is a name collision, not
+        // a range overlap: skip it here and let `create_table` below report it
+        // (42P07, or a no-op under IF NOT EXISTS) — otherwise the partition would
+        // be reported as overlapping itself.
+        if sibling.schema.namespace == namespace && sibling.schema.name == name {
             continue;
         }
         let sib_lo = stored_endpoint(&part.bound.from[0], key_col, type_catalog)?;
@@ -3383,6 +3434,28 @@ fn execute_drop_table(
                 sqlstate::UNDEFINED_TABLE,
                 format!("table \"{display}\" does not exist"),
             ));
+        }
+    }
+    // A partitioned parent's partitions are dependent objects that PG drops
+    // together with the parent (no CASCADE needed). Expand the target set with
+    // every partition of a parent being dropped that was not itself named, so the
+    // parent is never left with orphaned children (dangling `relispartition`).
+    let mut targeted: std::collections::HashSet<(String, String)> = plain
+        .iter()
+        .map(|n| ("public".to_string(), n.clone()))
+        .chain(qualified.iter().cloned())
+        .collect();
+    let parents = targeted.clone();
+    for meta in catalog.relation_metadata() {
+        let Some(part) = &meta.schema.partition_of else {
+            continue;
+        };
+        if !parents.contains(&(part.parent_namespace.clone(), part.parent_name.clone())) {
+            continue;
+        }
+        let child = (meta.schema.namespace.clone(), meta.schema.name.clone());
+        if targeted.insert(child.clone()) {
+            qualified.push(child);
         }
     }
     // Phase 2: resolve dependent views across every target namespace (RESTRICT

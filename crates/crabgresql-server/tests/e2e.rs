@@ -4284,3 +4284,88 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE m (id int, d date) PARTITION BY RANGE (d)")
+        .await?;
+
+    // A NULL bound is rejected (42P17), not a crash. The connection stays usable.
+    let err = client
+        .simple_query("CREATE TABLE mn PARTITION OF m FOR VALUES FROM (NULL) TO ('2024-01-01')")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::from_code("42P17")
+    );
+    assert_eq!(rows(&client.simple_query("SELECT 1").await?)[0].get(0), Some("1"));
+
+    // A non-orderable RANGE key (json) is rejected at parent create (42704), not a crash.
+    let err = client
+        .simple_query("CREATE TABLE jm (j json) PARTITION BY RANGE (j)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_OBJECT
+    );
+    assert_eq!(rows(&client.simple_query("SELECT 2").await?)[0].get(0), Some("2"));
+
+    // A duplicate partition name is 'relation already exists' (42P07), not a self-overlap;
+    // IF NOT EXISTS is a no-op.
+    client
+        .simple_query("CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')")
+        .await?;
+    let err = client
+        .simple_query("CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::DUPLICATE_TABLE
+    );
+    client
+        .simple_query("CREATE TABLE IF NOT EXISTS m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')")
+        .await?;
+
+    // TRUNCATE / CREATE INDEX on the parent are rejected (0A000), not applied to
+    // the empty parent relation.
+    let err = client.simple_query("TRUNCATE m").await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+    let err = client
+        .simple_query("CREATE INDEX m_idx ON m (d)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // PARTITION OF a view reports wrong-object-type (42809), not 'does not exist'.
+    client.simple_query("CREATE VIEW vv AS SELECT 1 AS x").await?;
+    let err = client
+        .simple_query("CREATE TABLE cv PARTITION OF vv FOR VALUES FROM (1) TO (2)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::WRONG_OBJECT_TYPE
+    );
+
+    // DROP TABLE on the parent cascades to its partitions (no CASCADE needed).
+    client.simple_query("DROP TABLE m").await?;
+    let msgs = client
+        .simple_query("SELECT count(*) FROM pg_class WHERE relname IN ('m', 'm_2024')")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("0"));
+
+    Ok(())
+}

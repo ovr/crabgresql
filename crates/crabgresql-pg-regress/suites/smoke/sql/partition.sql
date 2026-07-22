@@ -40,14 +40,24 @@ CREATE TABLE sales_early PARTITION OF sales FOR VALUES FROM (MINVALUE) TO ('2023
 CREATE TABLE sales_dup PARTITION OF sales FOR VALUES FROM ('2024-06-01') TO ('2024-07-01');
 -- An empty range (lower >= upper) is rejected (42P17).
 CREATE TABLE sales_empty PARTITION OF sales FOR VALUES FROM ('2025-01-01') TO ('2024-01-01');
+-- A NULL bound has no place in the range order; rejected (42P17).
+CREATE TABLE sales_null PARTITION OF sales FOR VALUES FROM (NULL) TO ('2027-01-01');
+-- A duplicate partition name is a name collision (42P07), not a self-overlap.
+CREATE TABLE sales_2024 PARTITION OF sales FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+-- IF NOT EXISTS on an existing partition is a no-op.
+CREATE TABLE IF NOT EXISTS sales_2024 PARTITION OF sales FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+-- A partitioned parent has no storage of its own: TRUNCATE and CREATE INDEX on
+-- it are not supported yet (0A000); they are not silently no-ops.
+TRUNCATE sales;
+CREATE INDEX sales_idx ON sales (sold);
 -- LIST/HASH strategies are not supported yet (0A000).
 CREATE TABLE by_list (id integer) PARTITION BY LIST (id);
+-- A non-orderable RANGE key type (json) is rejected at parent create (42704).
+CREATE TABLE by_json (j json) PARTITION BY RANGE (j);
 -- PARTITION OF a table that is not partitioned is rejected (42809).
 CREATE TABLE plain (id integer);
 CREATE TABLE plain_part PARTITION OF plain FOR VALUES FROM (1) TO (2);
--- Clean up. A partition is dropped like any table; the parent is dropped last.
-DROP TABLE sales_2023;
-DROP TABLE sales_2024;
-DROP TABLE sales_early;
+-- DROP on a partitioned parent cascades to its partitions (no CASCADE needed).
 DROP TABLE sales;
+SELECT relname FROM pg_class WHERE relname LIKE 'sales%' ORDER BY relname;
 DROP TABLE plain;

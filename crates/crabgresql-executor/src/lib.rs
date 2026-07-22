@@ -30,7 +30,7 @@ use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
 
 use eval::eval;
-pub use eval::{coerce_value, compare_values};
+pub use eval::{coerce_value, compare_values, is_orderable};
 use generate_series::Series;
 
 /// Side-effecting sequence operations (`nextval`/`currval`/`setval`/`lastval`),

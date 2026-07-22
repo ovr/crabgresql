@@ -138,38 +138,53 @@ pub struct CatalogRelation {
     pub sequence: Option<CatalogSequence>,
 }
 
+/// The relkind of a stored user relation: a partitioned parent (carrying a
+/// partition key) is `'p'`, everything else an ordinary table `'r'`. A leaf
+/// partition is still an ordinary table (its `partition_of` only sets
+/// `relispartition`).
+fn table_kind(schema: &TableSchema) -> RelKind {
+    if schema.partition_scheme.is_some() {
+        RelKind::PartitionedTable
+    } else {
+        RelKind::Table
+    }
+}
+
 impl CatalogRelation {
     pub fn permanent(schema: TableSchema) -> Self {
         let namespace = schema.namespace.clone();
+        let kind = table_kind(&schema);
         Self {
             schema,
             indexes: Vec::new(),
             namespace,
             temporary: false,
-            kind: RelKind::Table,
+            kind,
             sequence: None,
         }
     }
 
     pub fn permanent_metadata(metadata: RelationMetadata) -> Self {
         let namespace = metadata.schema.namespace.clone();
+        let kind = table_kind(&metadata.schema);
         Self {
             schema: metadata.schema,
             indexes: metadata.indexes,
             namespace,
             temporary: false,
-            kind: RelKind::Table,
+            kind,
             sequence: None,
         }
     }
 
     pub fn temporary(schema: TableSchema, namespace: impl Into<String>) -> Self {
+        let kind = table_kind(&schema);
         Self {
             schema,
             indexes: Vec::new(),
             namespace: namespace.into(),
             temporary: true,
-            kind: RelKind::Table,
+            kind,
             sequence: None,
         }
     }
