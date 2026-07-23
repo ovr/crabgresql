@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use crabgresql_executor::{ExecContext, ExecError, ExecNode, OutputColumn, SequenceOps};
 
 use crate::query::RowTag;
-use crabgresql_memory_storage::MemoryEngine;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{Format, TransactionStatus, sqlstate};
 use crabgresql_storage_api::{SequenceAdvance, TableEngine};
@@ -135,11 +134,10 @@ pub struct Session {
     /// hold to `AccessExclusive` (TRUNCATE a table it has an open cursor on)
     /// without self-deadlocking, while still blocking on other sessions' holds.
     pub lock_owner: LockOwner,
-    /// Session-local temp-table catalog (PG's `pg_temp`). Searched before the
-    /// shared global engine, so a `CREATE TEMP TABLE` shadows a same-named
-    /// permanent table. Dropped with the session on disconnect — that is the
-    /// temp tables' teardown.
-    pub temp: Arc<dyn TableEngine>,
+    /// The shared engine, held so the session can drop this connection's temp
+    /// tables (memory tables in its `pg_temp_N` namespace) at disconnect — the
+    /// temp tables' teardown (see the [`Drop`] impl).
+    pub engine: Arc<dyn TableEngine>,
     /// Extended-protocol prepared statements, keyed by name (`""` = the unnamed
     /// statement, which `Parse` overwrites each time).
     pub prepared: HashMap<String, PreparedStatement>,
@@ -355,6 +353,7 @@ impl SequenceOps for SessionSequences {
 impl Session {
     pub fn with_identity(
         txnmgr: Arc<TransactionManager>,
+        engine: Arc<dyn TableEngine>,
         database: impl Into<String>,
         user: impl Into<String>,
         temp_schema: impl Into<String>,
@@ -372,7 +371,7 @@ impl Session {
             xact: None,
             txnmgr,
             lock_owner,
-            temp: Arc::new(MemoryEngine::new()),
+            engine,
             prepared: HashMap::new(),
             portals: HashMap::new(),
             seq_state: Arc::new(Mutex::new(SessionSeqState::default())),
@@ -427,6 +426,22 @@ impl Drop for Session {
                 self.txnmgr.abort_without_finalize(xid);
             } else {
                 self.txnmgr.abort(xid);
+            }
+        }
+        // Drop this connection's temp tables (memory tables in its `pg_temp_N`
+        // namespace). Skip while panicking — the engine locks may be poisoned and
+        // re-entering them would double-panic; the tables are RAM-only and vanish
+        // at server exit regardless.
+        if !std::thread::panicking() {
+            let temp: Vec<String> = self
+                .engine
+                .relations()
+                .into_iter()
+                .filter(|s| s.namespace == self.temp_schema)
+                .map(|s| s.name)
+                .collect();
+            for name in temp {
+                let _ = self.engine.drop_table(&self.temp_schema, &name);
             }
         }
     }

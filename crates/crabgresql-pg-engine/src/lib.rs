@@ -5,8 +5,11 @@
 //! genuine `ctid = (block, offset)` (`tuple`), and physiological WAL logging via
 //! the core [`crabgresql_wal`] service — with redo-only crash recovery. MVCC is
 //! the shared [`satisfies_mvcc`](crabgresql_txn::satisfies_mvcc) rule applied to
-//! the on-page header, exactly as in the memory engine; only the storage of the
-//! versions differs.
+//! the on-page header.
+//!
+//! An UNLOGGED or TEMP table is a **memory table**: the same heap access method
+//! over pages that live in RAM in the storage manager, with the WAL skipped, so
+//! it is fast and lost on restart. Only where the versions live differs.
 //!
 //! Deliberately deferred to keep this first cut tractable (all documented in
 //! `docs/ARCHITECTURE.md §3`): TOAST (a tuple must fit one page), a durable SLRU
@@ -72,11 +75,13 @@ pub(crate) struct EngineInner {
     /// allocate a fresh relfilenode.
     pub catalog: Arc<RelCatalog>,
     /// Uncommitted relfilenode-swap TRUNCATEs, keyed by the truncating XID:
-    /// which tables it truncated. This is an O(1) commit-time index (review
-    /// finding #10) — the alternative, scanning every table for a matching
-    /// pending XID on every commit, is O(tables). The commit/abort hook drains an
-    /// XID's entry to apply or discard its swaps and release the table locks.
-    pub pending_truncates: Mutex<HashMap<Xid, Vec<String>>>,
+    /// which tables it truncated, as `(namespace, name)` so temp tables (in a
+    /// `pg_temp_N` namespace) resolve correctly, not just `public` ones. This is an
+    /// O(1) commit-time index (review finding #10) — the alternative, scanning
+    /// every table for a matching pending XID on every commit, is O(tables). The
+    /// commit/abort hook drains an XID's entry to apply or discard its swaps and
+    /// release the table locks.
+    pub pending_truncates: Mutex<HashMap<Xid, Vec<(String, String)>>>,
     /// TRUNCATE swaps replayed from the WAL during recovery, applied after the
     /// CLOG is rebuilt (see [`PgEngine::apply_recovered_truncates`]).
     pub recovered_truncates: Mutex<Vec<RecoveredTruncate>>,
@@ -257,8 +262,10 @@ impl PgEngine {
                 // Persist the catalog only if it lagged the WAL, and repoint the
                 // in-memory table handle at the final live file.
                 if self.catalog.current_relfilenode(&table) != Some(live) {
+                    // Recovery only reconciles permanent, WAL-logged (public) tables;
+                    // memory tables never reach the WAL.
                     self.catalog
-                        .swap_relfilenode(&table, live)
+                        .swap_relfilenode("public", &table, live)
                         .unwrap_or_else(|e| panic!("relation catalog write failed: {e}"));
                 }
                 if let Some(t) = self
@@ -318,8 +325,8 @@ impl TxnFinalize for PgEngine {
             return; // hot path: nothing to finalize for this transaction
         };
         let handles = self.tables.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
-        for name in tables {
-            if let Some(t) = handles.get(&("public".to_string(), name.clone())) {
+        for (namespace, name) in tables {
+            if let Some(t) = handles.get(&(namespace.clone(), name.clone())) {
                 // Apply the in-memory swap, then persist + reclaim, then release the
                 // lock — all without panicking, so the exclusive lock is ALWAYS
                 // released even if the catalog persist fails (which would otherwise
@@ -329,8 +336,13 @@ impl TxnFinalize for PgEngine {
                 if let Some((old, owner)) = t.commit_truncate(xid) {
                     // The commit is already durable in the WAL, so a catalog persist
                     // failure is not fatal — recovery re-applies the swap from the
-                    // WAL at the next boot; log and continue rather than panic.
-                    if let Err(e) = self.catalog.swap_relfilenode(&name, t.relfilenode()) {
+                    // WAL at the next boot; log and continue rather than panic. (A
+                    // memory/temp table writes no WAL and its catalog row is not
+                    // persisted, so the swap only updates in-memory state.)
+                    if let Err(e) = self
+                        .catalog
+                        .swap_relfilenode(&namespace, &name, t.relfilenode())
+                    {
                         tracing::error!(
                             table = %name,
                             error = %e,
@@ -358,8 +370,8 @@ impl TxnFinalize for PgEngine {
             return;
         };
         let handles = self.tables.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
-        for name in tables {
-            if let Some(t) = handles.get(&("public".to_string(), name.clone())) {
+        for (namespace, name) in tables {
+            if let Some(t) = handles.get(&(namespace.clone(), name.clone())) {
                 if let Some((new, owner)) = t.abort_truncate(xid) {
                     self.inner.discard_relfile(new);
                     t.release_truncate_lock(owner);
@@ -372,9 +384,9 @@ impl TxnFinalize for PgEngine {
 impl PgEngine {
     /// Whether `name` already names a table, index, view or sequence in
     /// `namespace` — the shared PostgreSQL relation namespace, scoped per schema.
-    /// Mirrors `MemoryEngine::relation_name_taken`. The caller passes the already
-    /// locked `tables` map (the create paths hold that lock across check+write),
-    /// so this must not take the `tables` lock itself.
+    /// The caller passes the already locked `tables` map (the create paths hold
+    /// that lock across check+write), so this must not take the `tables` lock
+    /// itself.
     fn relation_name_taken(
         &self,
         tables: &HashMap<(String, String), Arc<HeapTable>>,
@@ -406,6 +418,11 @@ impl TableEngine for PgEngine {
             .catalog
             .create(&schema)
             .expect("relation catalog write failed");
+        // A memory table (UNLOGGED/TEMP) is RAM-backed: register its relfilenode
+        // with the storage manager so every page op routes to memory, never a file.
+        if schema.persistence.is_memory() {
+            self.inner.bufpool.smgr().register_memory(rel);
+        }
         let table = Arc::new(HeapTable::new(
             Arc::clone(&self.inner),
             rel,
@@ -693,3 +710,79 @@ impl TableEngine for PgEngine {
             .expect("relation catalog write failed")
     }
 }
+
+#[cfg(feature = "test-support")]
+mod test_support {
+    use std::sync::Arc;
+
+    use crabgresql_storage_api::TableEngine;
+    use crabgresql_txn::{CommitSink, TransactionManager, TxnFinalize};
+    use crabgresql_wal::Wal;
+    use tempfile::TempDir;
+
+    use crate::PgEngine;
+
+    /// A fully-wired durable [`PgEngine`] over a throwaway temp directory, plus its
+    /// WAL-backed [`TransactionManager`]. The directory is deleted when this is
+    /// dropped, so each test that builds one is isolated. Replaces the old
+    /// in-memory reference engine in downstream tests.
+    pub struct Ephemeral {
+        engine: Arc<PgEngine>,
+        txnmgr: Arc<TransactionManager>,
+        _dir: TempDir,
+    }
+
+    impl Ephemeral {
+        /// The engine as a trait object, for tests that only need a `TableEngine`.
+        pub fn engine(&self) -> Arc<dyn TableEngine> {
+            Arc::clone(&self.engine) as Arc<dyn TableEngine>
+        }
+
+        /// The concrete engine handle (for engine-specific calls like `checkpoint`).
+        pub fn pg_engine(&self) -> Arc<PgEngine> {
+            Arc::clone(&self.engine)
+        }
+
+        /// The WAL-backed transaction manager wired to this engine's finalize hook.
+        pub fn txnmgr(&self) -> Arc<TransactionManager> {
+            Arc::clone(&self.txnmgr)
+        }
+    }
+
+    /// A fresh engine over a new temp directory, returned as a bare handle. The
+    /// directory is **leaked** (never cleaned) so the engine keeps working for the
+    /// whole test process without a guard to hold — convenient for the many
+    /// metadata/execution tests in downstream crates that build their own
+    /// transaction manager. Each call gets its own directory, so runs stay
+    /// isolated. Use [`ephemeral`] instead when you want the directory reclaimed.
+    pub fn ephemeral_engine() -> Arc<PgEngine> {
+        let dir = TempDir::new().expect("create temp data dir");
+        let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
+        let (engine, _clog, _next_xid) =
+            PgEngine::open_recovered(dir.path(), wal).expect("open engine");
+        // Keep the data directory alive for the process lifetime; the OS reclaims
+        // it when the (short-lived) test process exits.
+        std::mem::forget(dir);
+        engine
+    }
+
+    /// Open a fresh durable engine over a new temp directory, mirroring the
+    /// server's `open_pg_engine` wiring (WAL + recovery + finalize hook).
+    pub fn ephemeral() -> Ephemeral {
+        let dir = TempDir::new().expect("create temp data dir");
+        let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
+        let (engine, clog, next_xid) =
+            PgEngine::open_recovered(dir.path(), Arc::clone(&wal)).expect("open engine");
+        let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+        let mut txnmgr = TransactionManager::new_recovered(sink, clog, next_xid);
+        txnmgr.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
+        Ephemeral {
+            engine,
+            txnmgr: Arc::new(txnmgr),
+            _dir: dir,
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub use test_support::{Ephemeral, ephemeral, ephemeral_engine};

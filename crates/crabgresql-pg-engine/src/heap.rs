@@ -1,7 +1,7 @@
 //! The durable heap access method: `TableAm` over slotted pages + buffer pool +
 //! WAL. Visibility is the shared [`satisfies_mvcc`] rule applied to the on-page
-//! [`TupleHeader`], so this engine and the in-memory engine agree bit-for-bit on
-//! what a snapshot sees; only where the versions live differs.
+//! [`TupleHeader`]. A memory table (UNLOGGED/TEMP) uses this same access method
+//! over RAM-backed pages with the WAL skipped; only where the versions live differs.
 //!
 //! Every mutator follows the same write-ahead sequence inside the page's write
 //! lock: change the page, append the WAL record, stamp `pd_lsn` with the record
@@ -15,7 +15,7 @@ use crabgresql_storage_api::{
 };
 use crabgresql_txn::{Clog, LockOwner, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
 use crabgresql_types::Value;
-use crabgresql_wal::RmgrId;
+use crabgresql_wal::{Lsn, RmgrId};
 
 use crate::EngineInner;
 use crate::btkey;
@@ -59,6 +59,10 @@ pub struct HeapTable {
     /// Last block we inserted into — where the next insert tries first.
     insert_hint: AtomicU32,
     indexes: RwLock<Vec<IndexEntry>>,
+    /// A memory table (`relpersistence` `'u'`/`'t'`): its pages live in RAM in the
+    /// storage manager and every mutation skips the WAL. Set from
+    /// `schema.persistence` at construction.
+    is_memory: bool,
 }
 
 /// One index attached to a heap table: its semantic metadata, its physical
@@ -76,7 +80,6 @@ impl IndexEntry {
     fn is_physical(&self, schema: &TableSchema) -> bool {
         self.rel.0 != 0 && btkey::keys_indexable(schema, &self.meta.keys)
     }
-}
 
 impl HeapTable {
     pub fn new(
@@ -93,6 +96,7 @@ impl HeapTable {
                 latch: Arc::new(RwLock::new(())),
             })
             .collect();
+        let is_memory = schema.persistence.is_memory();
         HeapTable {
             schema,
             engine,
@@ -102,6 +106,19 @@ impl HeapTable {
             lock: Arc::new(TableLock::new()),
             insert_hint: AtomicU32::new(0),
             indexes: RwLock::new(indexes),
+            is_memory,
+        }
+    }
+
+    /// Log a heap change, or skip the WAL entirely for a memory table (returning
+    /// LSN 0, which the page carries as its `pd_lsn`). LSN 0 makes the buffer
+    /// pool's write-ahead flush a no-op, so a memory table's dirty pages evict
+    /// straight to their RAM backing.
+    fn log(&self, info: u8, xid: Xid, payload: &[u8]) -> Lsn {
+        if self.is_memory {
+            Lsn(0)
+        } else {
+            self.engine.wal.append(RmgrId::HEAP, info, xid, payload)
         }
     }
 
@@ -329,8 +346,7 @@ impl HeapTable {
                     panic!("newly inserted tuple is missing from its page");
                 };
                 let final_bytes = item.to_vec();
-                let lsn = self.engine.wal.append(
-                    RmgrId::HEAP,
+                let lsn = self.log(
                     rec::HEAP_INSERT,
                     xid,
                     &rec::insert(rel, target, off, &final_bytes),
@@ -366,8 +382,7 @@ impl HeapTable {
                 return false;
             }
             tuple::stamp_xmax(item, txn.xid, txn.cid);
-            let lsn = self.engine.wal.append(
-                RmgrId::HEAP,
+            let lsn = self.log(
                 rec::HEAP_DELETE,
                 txn.xid,
                 &rec::delete(rel, tid.block, tid.offset, txn.xid, txn.cid),
@@ -379,8 +394,7 @@ impl HeapTable {
 }
 
 /// A version is still updatable/deletable unless a committed transaction deleted
-/// it (an aborted or in-flight deleter leaves it live) — the same rule the
-/// memory engine uses.
+/// it (an aborted or in-flight deleter leaves it live).
 fn is_live(hdr: &TupleHeader, clog: &Clog) -> bool {
     !hdr.xmax.is_valid() || clog.status(hdr.xmax) == XactStatus::Aborted
 }
@@ -554,18 +568,26 @@ impl TableAm for HeapTable {
         // writes rows that the swap would drop. Held until txn end.
         self.lock.acquire_exclusive(txn.lock_owner);
         let old = self.effective_rel(txn.xid);
-        // A fresh, never-reused relfilenode for the empty post-truncate file.
+        // A fresh, never-reused relfilenode for the empty post-truncate file. A
+        // memory table's replacement must also be RAM-backed.
         let new = self.engine.catalog.alloc_relfilenode();
+        if self.is_memory {
+            self.engine.bufpool.smgr().register_memory(new);
+        }
         Self::io(self.engine.bufpool.smgr().create_if_missing(new));
         // WAL-log the swap intent {old, new, table} and flush it. Recovery applies
-        // the swap only for a committed XID, so the record is safe to write now.
-        let lsn = self.engine.wal.append(
-            RmgrId::HEAP,
-            rec::HEAP_TRUNCATE,
-            txn.xid,
-            &rec::truncate(&self.schema.name, old, new),
-        );
-        Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
+        // the swap only for a committed XID, so the record is safe to write now. A
+        // memory table skips the WAL (it never recovers), but the swap still runs
+        // through the same commit/abort finalize path in RAM.
+        if !self.is_memory {
+            let lsn = self.engine.wal.append(
+                RmgrId::HEAP,
+                rec::HEAP_TRUNCATE,
+                txn.xid,
+                &rec::truncate(&self.schema.name, old, new),
+            );
+            Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
+        }
         // Double TRUNCATE in one transaction: the previously staged file is now
         // superseded and, being used only by this uncommitted txn, is discarded.
         let prev = self
@@ -595,7 +617,7 @@ impl TableAm for HeapTable {
                     .unwrap_or_else(|_| panic!("mutex poisoned"))
                     .entry(txn.xid)
                     .or_default()
-                    .push(self.schema.name.clone());
+                    .push((self.schema.namespace.clone(), self.schema.name.clone()));
             }
         }
     }
@@ -664,12 +686,7 @@ impl TableAm for HeapTable {
                     page::set_flags(pg, off, page::LP_UNUSED);
                 }
                 page::compact(pg);
-                let lsn = self.engine.wal.append(
-                    RmgrId::HEAP,
-                    rec::HEAP_VACUUM,
-                    Xid::INVALID,
-                    &rec::vacuum(rel, block, &freed),
-                );
+                let lsn = self.log(rec::HEAP_VACUUM, Xid::INVALID, &rec::vacuum(rel, block, &freed));
                 page::set_lsn(pg, lsn.0);
             });
         }

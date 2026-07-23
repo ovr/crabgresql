@@ -3,10 +3,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::sync::Arc;
-
 use anyhow::Context as _;
-use crabgresql_memory_storage::MemoryEngine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
@@ -20,10 +17,14 @@ async fn spawn_server() -> u16 {
         Ok(address) => address.port(),
         Err(error) => panic!("failed to read test server address: {error}"),
     };
-    tokio::spawn(crabgresql_server::serve(
-        listener,
-        Arc::new(MemoryEngine::new()),
-    ));
+    // Each test server gets its own throwaway data directory, so runs are
+    // isolated. The dir is leaked to keep it alive for the spawned server's whole
+    // lifetime (the OS reclaims it after the test process exits).
+    let dir = tempfile::tempdir().expect("create temp data dir");
+    let (engine, txnmgr) =
+        crabgresql_server::open_pg_engine(dir.path()).expect("open test engine");
+    std::mem::forget(dir);
+    tokio::spawn(crabgresql_server::serve_with(listener, engine, txnmgr));
     port
 }
 
@@ -3053,7 +3054,7 @@ async fn unsupported_transaction_forms_are_rejected() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
+async fn explain_shows_seq_scan_for_pk_equality() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
         .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
@@ -3062,16 +3063,14 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
         .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
         .await?;
 
-    // An equality on the PRIMARY KEY chooses an index scan.
+    // The durable heap engine builds no physical index yet, so even an equality on
+    // the PRIMARY KEY plans a sequential scan (the planner only chooses an Index
+    // Scan when the engine reports `supports_index_scan`).
     let plan = client
         .simple_query("EXPLAIN SELECT * FROM t WHERE id = 2")
         .await?;
     let lines: Vec<&str> = rows(&plan).iter().filter_map(|r| r.get(0)).collect();
-    assert_eq!(lines[0], "Index Scan using t_pkey on t");
-    assert!(
-        lines.iter().any(|l| l.contains("Index Cond: (id = 2)")),
-        "plan was {lines:?}"
-    );
+    assert_eq!(lines[0], "Seq Scan on t");
 
     // ...and it still returns the right row.
     let result = client
@@ -3079,7 +3078,7 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
         .await?;
     assert_eq!(rows(&result)[0].get(0), Some("two"));
 
-    // A filter on a non-indexed column stays a sequential scan.
+    // A filter on a non-indexed column is likewise a sequential scan.
     let plan = client
         .simple_query("EXPLAIN SELECT * FROM t WHERE label = 'two'")
         .await?;
@@ -3101,6 +3100,40 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `CREATE UNLOGGED TABLE` makes a RAM-backed memory table: it reads and writes
+/// like any table, reflects `relpersistence = 'u'` in `pg_class`, and (like PG's
+/// UNLOGGED) its rows do not survive a crash — here, the run just proves the CRUD
+/// path and the catalog reflection.
+#[tokio::test]
+async fn unlogged_table_is_a_memory_table() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE UNLOGGED TABLE u (id int4, label text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO u VALUES (1, 'one'), (2, 'two')")
+        .await?;
+    let selected = client
+        .simple_query("SELECT label FROM u ORDER BY id")
+        .await?;
+    let labels = rows(&selected);
+    assert_eq!(labels[0].get("label"), Some("one"));
+    assert_eq!(labels[1].get("label"), Some("two"));
+
+    // Reflected as an unlogged relation, distinct from a permanent one.
+    client.simple_query("CREATE TABLE p (id int4)").await?;
+    let unlogged = client
+        .simple_query("SELECT relpersistence FROM pg_class WHERE relname = 'u'")
+        .await?;
+    assert_eq!(rows(&unlogged)[0].get("relpersistence"), Some("u"));
+    let permanent = client
+        .simple_query("SELECT relpersistence FROM pg_class WHERE relname = 'p'")
+        .await?;
+    assert_eq!(rows(&permanent)[0].get("relpersistence"), Some("p"));
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn explain_resolves_bind_parameters_in_extended_protocol() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -3117,7 +3150,9 @@ async fn explain_resolves_bind_parameters_in_extended_protocol() -> anyhow::Resu
         .query("EXPLAIN SELECT * FROM t WHERE id = $1", &[&2i32])
         .await?;
     let plan: String = rows[0].get(0);
-    assert_eq!(plan, "Index Scan using t_pkey on t");
+    // The durable engine defers physical indexes, so this plans a Seq Scan; the
+    // point of this test is that the inner statement's `$1` resolves at Describe.
+    assert_eq!(plan, "Seq Scan on t");
 
     Ok(())
 }

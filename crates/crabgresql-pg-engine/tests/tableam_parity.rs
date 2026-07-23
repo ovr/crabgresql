@@ -1,6 +1,7 @@
-//! Drives the durable heap engine through the same `TableAm` scenarios the
-//! in-memory reference engine covers, proving the two agree on visibility,
-//! rollback, batch DML, truncate, vacuum, and concurrent inserts.
+//! Drives the durable heap engine through the full `TableAm` surface — visibility,
+//! rollback, batch DML, truncate, vacuum, and concurrent inserts — over permanent
+//! (on-disk, WAL-logged) tables. The RAM-backed memory-table variant of the same
+//! contract lives in `memory_table.rs`.
 
 use std::sync::Arc;
 

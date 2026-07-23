@@ -10,13 +10,15 @@ use crabgresql_storage_api::{
     TableEngine, TableSchema, ViewDefinition,
 };
 
-/// Resolves relations against a session-local temp store first, then the shared
-/// global engine, then the read-only system catalog — so a `CREATE TEMP TABLE t`
-/// hides a permanent `t`, and `pg_catalog` relations (`pg_type`, …) resolve when
-/// nothing user-defined shadows them. `information_schema` is available only
-/// when schema-qualified. Holds three cheap `Arc` clones; build one per statement.
+/// Resolves relations against this session's temp namespace first, then the
+/// shared global engine, then the read-only system catalog — so a
+/// `CREATE TEMP TABLE t` hides a permanent `t`, and `pg_catalog` relations
+/// (`pg_type`, …) resolve when nothing user-defined shadows them.
+/// `information_schema` is available only when schema-qualified. Temp tables live
+/// in the one shared engine under this session's `pg_temp_N` namespace (PG-style),
+/// so temp resolution is just a namespace-scoped lookup in `global`. Holds two
+/// cheap `Arc` clones; build one per statement.
 pub struct SessionCatalog {
-    temp: Arc<dyn TableEngine>,
     global: Arc<dyn TableEngine>,
     system: Arc<dyn TableEngine>,
     temp_schema: String,
@@ -24,17 +26,25 @@ pub struct SessionCatalog {
 
 impl SessionCatalog {
     pub fn new(
-        temp: Arc<dyn TableEngine>,
         global: Arc<dyn TableEngine>,
         system: Arc<dyn TableEngine>,
         temp_schema: impl Into<String>,
     ) -> Self {
         Self {
-            temp,
             global,
             system,
             temp_schema: temp_schema.into(),
         }
+    }
+
+    /// Resolve `name` in this session's temp namespace, if present there.
+    fn open_temp(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
+        self.global.resolve(Some(&self.temp_schema), name)
+    }
+
+    /// Whether `name` names a table in this session's temp namespace.
+    fn temp_has(&self, name: &str) -> bool {
+        self.open_temp(name).is_ok()
     }
 
     /// Fall through `TableNotFound` to `next`, but surface any other error.
@@ -53,7 +63,7 @@ impl TableEngine for SessionCatalog {
     /// Unqualified, write-safe lookup: temp then global only. Writes resolve
     /// through this, so a mutation never reaches the read-only system catalog.
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
-        Self::or_else_not_found(self.temp.open_table(name), || self.global.open_table(name))
+        Self::or_else_not_found(self.open_temp(name), || self.global.open_table(name))
     }
 
     /// Search-path-aware read resolution. An unqualified name searches temp →
@@ -63,15 +73,15 @@ impl TableEngine for SessionCatalog {
     /// namespace.
     fn resolve(&self, schema: Option<&str>, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
         match schema {
-            None => Self::or_else_not_found(self.temp.open_table(name), || {
+            None => Self::or_else_not_found(self.open_temp(name), || {
                 Self::or_else_not_found(self.system.open_table(name), || {
                     self.global.open_table(name)
                 })
             }),
             Some("pg_catalog") | Some("information_schema") => self.system.resolve(schema, name),
             Some("public") => self.global.open_table(name),
-            Some("pg_temp") => self.temp.open_table(name),
-            Some(namespace) if namespace == self.temp_schema => self.temp.open_table(name),
+            Some("pg_temp") => self.open_temp(name),
+            Some(namespace) if namespace == self.temp_schema => self.open_temp(name),
             // Any other qualifier names a user schema; route it to the global
             // engine, which holds every user namespace.
             Some(namespace) => self.global.resolve(Some(namespace), name),
@@ -90,7 +100,7 @@ impl TableEngine for SessionCatalog {
         // temp `t` if one shadows a permanent one, else the permanent table. A
         // schema-qualified table lives only in the global engine's namespace.
         if namespace == "public" {
-            match self.temp.drop_table("public", name) {
+            match self.global.drop_table(&self.temp_schema, name) {
                 Err(StorageError::TableNotFound(_)) => self.global.drop_table("public", name),
                 other => other,
             }
@@ -122,17 +132,19 @@ impl TableEngine for SessionCatalog {
         table: &str,
         index: IndexMetadata,
     ) -> Result<(), StorageError> {
-        // A temp table (in the `public`-keyed temp store) shadows a permanent one.
-        if namespace == "public" && self.temp.open_table(table).is_ok() {
-            self.temp.create_index("public", table, index)
+        // A temp table (in this session's `pg_temp_N` namespace) shadows a
+        // permanent one of the same unqualified name.
+        if namespace == "public" && self.temp_has(table) {
+            self.global.create_index(&self.temp_schema, table, index)
         } else {
             self.global.create_index(namespace, table, index)
         }
     }
 
     fn index_name_exists(&self, namespace: &str, table: &str, index_name: &str) -> bool {
-        if namespace == "public" && self.temp.open_table(table).is_ok() {
-            self.temp.index_name_exists("public", table, index_name)
+        if namespace == "public" && self.temp_has(table) {
+            self.global
+                .index_name_exists(&self.temp_schema, table, index_name)
         } else {
             self.global.index_name_exists(namespace, table, index_name)
         }

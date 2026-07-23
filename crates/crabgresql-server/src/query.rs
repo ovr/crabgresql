@@ -20,8 +20,9 @@ use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
-    PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, SequenceDefinition,
-    StorageError, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
+    PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
+    SequenceDefinition, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog,
+    ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -190,7 +191,6 @@ fn bind_catalogs(
     let system: Arc<dyn TableEngine> = {
         let global = engine.clone();
         let schemas_engine = engine.clone();
-        let temp = session.temp.clone();
         let database = session.database.clone();
         let owner = session.user.clone();
         let temp_schema = session.temp_schema.clone();
@@ -201,19 +201,31 @@ fn bind_catalogs(
                 database,
                 owner,
                 move || {
-                    let mut rels: Vec<_> = global
-                        .relation_metadata()
-                        .into_iter()
+                    // Temp tables from every session live in the one shared engine
+                    // now (each under its own `pg_temp_N` namespace, persistence
+                    // Temporary). Reflect the permanent tables, plus only THIS
+                    // session's temp tables — so a session never sees another's
+                    // temp relations, exactly as before.
+                    let all = global.relation_metadata();
+                    let mut rels: Vec<_> = all
+                        .iter()
+                        .filter(|m| m.schema.persistence != RelPersistence::Temporary)
+                        .cloned()
                         .map(crabgresql_catalog::CatalogRelation::permanent_metadata)
                         .collect();
-                    rels.extend(temp.relation_metadata().into_iter().map(|metadata| {
-                        let mut relation = crabgresql_catalog::CatalogRelation::temporary(
-                            metadata.schema,
-                            temp_schema.clone(),
-                        );
-                        relation.indexes = metadata.indexes;
-                        relation
-                    }));
+                    rels.extend(
+                        all.into_iter()
+                            .filter(|m| m.schema.namespace == temp_schema)
+                            .map(|metadata| {
+                                let mut relation =
+                                    crabgresql_catalog::CatalogRelation::temporary(
+                                        metadata.schema,
+                                        temp_schema.clone(),
+                                    );
+                                relation.indexes = metadata.indexes;
+                                relation
+                            }),
+                    );
                     // Views reflect into pg_class as relkind='v' / pg_attribute
                     // columns / information_schema.tables as VIEW.
                     rels.extend(global.views().into_iter().map(|view| {
@@ -258,7 +270,6 @@ fn bind_catalogs(
         )
     };
     let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
-        session.temp.clone(),
         engine.clone(),
         system,
         session.temp_schema.clone(),
@@ -1683,16 +1694,22 @@ fn execute_create_table(
                 ));
             }
         }
-        // Temp relations share one keyspace in the session temp engine.
-        "public".to_string()
+        // Temp relations live in this session's `pg_temp_N` namespace in the shared
+        // engine (PG-style), backed by memory tables.
+        session.temp_schema.clone()
     } else {
         resolve_create_namespace(engine, schema_qual.as_deref(), &name)?
     };
-    let target = if create.temporary {
-        &session.temp
+    // Temp and UNLOGGED tables are memory tables (RAM-backed, WAL-skipping); a
+    // plain table is a durable heap. All of them live in the one shared engine now.
+    let persistence = if create.temporary {
+        RelPersistence::Temporary
+    } else if create.unlogged {
+        RelPersistence::Unlogged
     } else {
-        engine
+        RelPersistence::Permanent
     };
+    let target = engine;
     // CTAS (`create.query.is_some()`) is dispatched to `execute_create_table_as`
     // before reaching here, so this path only builds an empty table. Clauses we
     // can't honor must be rejected, not silently dropped: ON COMMIT DROP/DELETE
@@ -1937,6 +1954,7 @@ fn execute_create_table(
         name: name.clone(),
         namespace: namespace.clone(),
         columns,
+        persistence,
         partition_scheme,
         partition_of: None,
     };
@@ -2323,6 +2341,7 @@ fn execute_create_partition(
         name: name.to_string(),
         namespace: namespace.to_string(),
         columns: parent_schema.columns.clone(),
+        persistence: RelPersistence::Permanent,
         partition_scheme: None,
         partition_of: Some(PartitionOf {
             parent_namespace: parent_schema.namespace.clone(),
@@ -2369,7 +2388,7 @@ fn execute_create_table_as(
                 ));
             }
         }
-        "public".to_string()
+        session.temp_schema.clone()
     } else {
         resolve_create_namespace(engine, schema_qual.as_deref(), &name)?
     };
@@ -2387,14 +2406,15 @@ fn execute_create_table_as(
             "this CREATE TABLE ... AS form is not supported yet",
         ));
     }
-    // TEMP tables go in the session-local catalog; everything else in the durable
-    // engine. The new table is later opened through the overlay `catalog`, which
-    // resolves the temp target too. Clone the handle (rather than borrow
-    // `session.temp`) so the later `&mut session` write path is unencumbered.
-    let target: Arc<dyn TableEngine> = if create.temporary {
-        session.temp.clone()
+    // Every table — temp or permanent — lives in the one shared engine now; a
+    // temp table is a memory table in this session's `pg_temp_N` namespace. The
+    // new table is later opened through the overlay `catalog`, which resolves the
+    // temp namespace too.
+    let target: Arc<dyn TableEngine> = engine.clone();
+    let persistence = if create.temporary {
+        RelPersistence::Temporary
     } else {
-        engine.clone()
+        RelPersistence::Permanent
     };
 
     // Bind the defining query and take its output column shape.
@@ -2441,6 +2461,7 @@ fn execute_create_table_as(
             .iter()
             .map(|c| Column::new(c.name.clone(), c.ty))
             .collect(),
+        persistence,
         partition_scheme: None,
         partition_of: None,
     };
@@ -3934,9 +3955,14 @@ fn execute_drop_index(
             ));
         }
     }
-    // Snapshot each store once (each call deep-clones its relation metadata).
-    let temp_meta = session.temp.relation_metadata();
+    // Snapshot the engine's relations once. Temp tables live in this session's
+    // `pg_temp_N` namespace in the same engine, so split the snapshot by namespace.
     let global_meta = engine.relation_metadata();
+    let temp_meta: Vec<_> = global_meta
+        .iter()
+        .filter(|r| r.schema.namespace == session.temp_schema)
+        .cloned()
+        .collect();
     let mut notices = Vec::new();
     // (is_temp, namespace, owning table, index name) to remove in phase 2.
     let mut to_drop: Vec<(bool, String, String, String)> = Vec::new();
@@ -3982,9 +4008,9 @@ fn execute_drop_index(
                     rel.schema.name
                 )));
             }
-            // Temp relations are keyed under `public` in the temp engine.
+            // A temp index lives in this session's `pg_temp_N` namespace.
             let drop_ns = if is_temp {
-                "public"
+                session.temp_schema.as_str()
             } else {
                 rel.schema.namespace.as_str()
             };
@@ -4029,12 +4055,8 @@ fn execute_drop_index(
     // Route each drop to the concrete store that owns the index, rather than the
     // session overlay's table-name shadowing (which would misroute a permanent
     // index when a temp table shares its table's name).
-    for (is_temp, ns, table, index_name) in &to_drop {
-        if *is_temp {
-            session.temp.drop_index("public", table, index_name)?;
-        } else {
-            engine.drop_index(ns, table, index_name)?;
-        }
+    for (_is_temp, ns, table, index_name) in &to_drop {
+        engine.drop_index(ns, table, index_name)?;
     }
     Ok(QueryResult::Command {
         tag: "DROP INDEX".into(),

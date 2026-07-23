@@ -406,6 +406,7 @@ impl Spanned for CreateTable {
         let CreateTable {
             or_replace: _,    // bool
             temporary: _,     // bool
+            unlogged: _,      // bool
             external: _,      // bool
             global: _,        // bool
             dynamic: _,       // bool

@@ -3,10 +3,10 @@
 //! Every data method carries a [`TxnContext`]: the engine judges visibility
 //! against the caller's snapshot and stamps writes with the caller's XID, so
 //! **MVCC lives in the engine while snapshots and XIDs stay the core's job**
-//! (docs/ARCHITECTURE.md §1.3). `crabgresql-memory-storage` is the reference
-//! implementation of this contract; `crabgresql-pg-engine` (the durable heap
-//! engine) is the canonical consumer the shapes here are designed for — hence a
-//! real `(block, offset)` [`Tid`] rather than an opaque scalar.
+//! (docs/ARCHITECTURE.md §1.3). `crabgresql-pg-engine` (the durable heap engine,
+//! with RAM-backed memory tables for the UNLOGGED/TEMP cases) is the
+//! implementation of this contract — hence a real `(block, offset)` [`Tid`]
+//! rather than an opaque scalar.
 
 use std::sync::Arc;
 
@@ -187,6 +187,37 @@ pub struct RelationMetadata {
     pub indexes: Vec<IndexMetadata>,
 }
 
+/// How a relation is stored, mirroring PostgreSQL's `pg_class.relpersistence`.
+/// `Permanent` (`'p'`) tables live on disk and are WAL-logged. `Unlogged` (`'u'`)
+/// and `Temporary` (`'t'`) tables are "memory tables": their pages live in RAM in
+/// the storage manager and their mutations skip the WAL, so they are lost on
+/// restart. Temporary tables additionally live in a per-session `pg_temp_N`
+/// namespace and are dropped at disconnect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RelPersistence {
+    #[default]
+    Permanent,
+    Unlogged,
+    Temporary,
+}
+
+impl RelPersistence {
+    /// Whether this relation is backed by RAM and skips the WAL (an `Unlogged` or
+    /// `Temporary` "memory table"), as opposed to a durable, WAL-logged heap.
+    pub fn is_memory(self) -> bool {
+        matches!(self, RelPersistence::Unlogged | RelPersistence::Temporary)
+    }
+
+    /// The `pg_class.relpersistence` character for this relation.
+    pub fn as_char(self) -> char {
+        match self {
+            RelPersistence::Permanent => 'p',
+            RelPersistence::Unlogged => 'u',
+            RelPersistence::Temporary => 't',
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TableSchema {
     pub name: String,
@@ -196,6 +227,9 @@ pub struct TableSchema {
     /// error text and `pg_class.relname`).
     pub namespace: String,
     pub columns: Vec<Column>,
+    /// How the relation is stored: durable heap (`Permanent`) or a RAM-backed,
+    /// WAL-skipping memory table (`Unlogged`/`Temporary`).
+    pub persistence: RelPersistence,
     /// `Some` on a partitioned (parent) table: its partition key. Such a table
     /// is `relkind = 'p'` and holds no rows of its own.
     pub partition_scheme: Option<PartitionScheme>,
@@ -210,6 +244,7 @@ impl TableSchema {
             name: name.into(),
             namespace: "public".to_string(),
             columns,
+            persistence: RelPersistence::Permanent,
             partition_scheme: None,
             partition_of: None,
         }
@@ -225,6 +260,7 @@ impl TableSchema {
             name: name.into(),
             namespace: namespace.into(),
             columns,
+            persistence: RelPersistence::Permanent,
             partition_scheme: None,
             partition_of: None,
         }

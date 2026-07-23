@@ -6,8 +6,8 @@
 //! versions and answering visibility is the engine's job.** An engine keeps a
 //! [`TupleHeader`] per version and asks [`satisfies_mvcc`] whether a version is
 //! visible to a given [`Snapshot`] — so the visibility semantics live in exactly
-//! one place and both `crabgresql-memory-storage` and the future
-//! `crabgresql-pg-engine` reuse them.
+//! one place and `crabgresql-pg-engine` reuses them for both durable heap tables
+//! and RAM-backed memory tables.
 //!
 //! The rule reproduces PostgreSQL's observable `HeapTupleSatisfiesMVCC`
 //! behaviour (a version is visible when its inserter is committed-and-in-snapshot

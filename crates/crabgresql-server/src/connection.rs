@@ -95,6 +95,7 @@ pub async fn handle_connection(
         .unwrap_or_else(|| user.clone());
     let mut session = Session::with_identity(
         txnmgr.clone(),
+        engine.clone(),
         database,
         user,
         format!("pg_temp_{backend_id}"),

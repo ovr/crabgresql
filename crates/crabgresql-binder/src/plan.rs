@@ -4142,12 +4142,11 @@ pub fn bind_delete_with_params(
 mod tests {
     use super::*;
     use crate::BinOp;
-    use crabgresql_memory_storage::MemoryEngine;
     use crabgresql_storage_api::{Column, TableEngine, TableSchema};
     use crabgresql_types::PgType;
 
     fn engine_with_table() -> Arc<dyn TableEngine> {
-        let engine = MemoryEngine::new();
+        let engine = crabgresql_pg_engine::ephemeral_engine();
         if let Err(error) = engine.create_table(TableSchema::new(
             "t",
             vec![
@@ -4159,7 +4158,7 @@ mod tests {
         )) {
             panic!("failed to create binder test table: {error}");
         }
-        Arc::new(engine)
+        engine
     }
 
     fn bind_one(sql: &str) -> Result<LogicalPlan, BindError> {
@@ -5111,13 +5110,13 @@ mod tests {
         // A case-sensitive relation reached via `TABLE "MixedCase"` must keep its
         // quoting, exactly as `SELECT * FROM "MixedCase"` does; an unquoted name
         // folds to lower case and does not resolve (matching PostgreSQL).
-        let engine = MemoryEngine::new();
+        let engine = crabgresql_pg_engine::ephemeral_engine();
         if let Err(error) =
             engine.create_table(TableSchema::new("MixedCase", vec![Column::new("id", PgType::Int4)]))
         {
             panic!("failed to create test table: {error}");
         }
-        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        let engine: Arc<dyn TableEngine> = engine;
         let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         let bind = |sql: &str| -> Result<LogicalPlan, BindError> {
             let stmts = crabgresql_parser::parse(sql).expect("valid SQL");
