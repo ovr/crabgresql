@@ -1728,11 +1728,17 @@ fn execute_create_table(
         ));
     }
     // Declarative partitioning (initial slice: RANGE, DDL + catalog reflection).
-    // A partitioned parent or a leaf partition may not be TEMP in this slice.
-    if (create.partition_by.is_some() || create.partition_of.is_some()) && create.temporary {
-        return Err(PgError::feature_not_supported(
-            "temporary partitioned tables are not supported yet",
-        ));
+    // A partitioned parent or a leaf partition may not be a memory table (TEMP or
+    // UNLOGGED) in this slice: leaf partitions are always created Permanent, so a
+    // memory-table parent would leave durable partitions dangling off a parent
+    // that vanishes on restart.
+    if (create.partition_by.is_some() || create.partition_of.is_some())
+        && (create.temporary || create.unlogged)
+    {
+        let kind = if create.temporary { "temporary" } else { "unlogged" };
+        return Err(PgError::feature_not_supported(format!(
+            "{kind} partitioned tables are not supported yet"
+        )));
     }
     // A leaf partition (`PARTITION OF parent`) inherits the parent's columns and
     // is created as an ordinary heap table carrying its bound; handle it whole.
@@ -1978,7 +1984,7 @@ fn execute_create_table(
         };
         let index_name = p
             .explicit_name
-            .unwrap_or_else(|| fresh_relation_name(target, &constraint_names, &base));
+            .unwrap_or_else(|| fresh_relation_name(target, &namespace, &constraint_names, &base));
         if !constraint_names.insert(index_name.clone()) {
             return Err(PgError::new(
                 "42710",
@@ -2413,6 +2419,8 @@ fn execute_create_table_as(
     let target: Arc<dyn TableEngine> = engine.clone();
     let persistence = if create.temporary {
         RelPersistence::Temporary
+    } else if create.unlogged {
+        RelPersistence::Unlogged
     } else {
         RelPersistence::Permanent
     };
@@ -2629,15 +2637,20 @@ fn simple_index_keys(
 
 fn fresh_relation_name(
     engine: &Arc<dyn TableEngine>,
+    namespace: &str,
     local: &HashSet<String>,
     base: &str,
 ) -> String {
+    // Relation and index names are unique per schema, so a generated name only has
+    // to dodge collisions in `namespace` — scoping the scan here also keeps it from
+    // depending on other sessions' `pg_temp_N` relations in the shared engine.
     let exists = |candidate: &str| {
         local.contains(candidate)
-            || engine.open_table(candidate).is_ok()
+            || engine.resolve(Some(namespace), candidate).is_ok()
             || engine
                 .relation_metadata()
                 .iter()
+                .filter(|relation| relation.schema.namespace == namespace)
                 .any(|relation| relation.indexes.iter().any(|index| index.name == candidate))
     };
     if !exists(base) {

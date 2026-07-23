@@ -80,6 +80,7 @@ impl IndexEntry {
     fn is_physical(&self, schema: &TableSchema) -> bool {
         self.rel.0 != 0 && btkey::keys_indexable(schema, &self.meta.keys)
     }
+}
 
 impl HeapTable {
     pub fn new(

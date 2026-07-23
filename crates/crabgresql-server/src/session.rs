@@ -429,20 +429,23 @@ impl Drop for Session {
             }
         }
         // Drop this connection's temp tables (memory tables in its `pg_temp_N`
-        // namespace). Skip while panicking — the engine locks may be poisoned and
-        // re-entering them would double-panic; the tables are RAM-only and vanish
-        // at server exit regardless.
-        if !std::thread::panicking() {
-            let temp: Vec<String> = self
-                .engine
+        // namespace). They now live in the shared, process-lifetime engine, so this
+        // is what reclaims them — run it even while panicking, otherwise a panicking
+        // connection leaks its temp tables and their RAM until process exit. Isolate
+        // it in `catch_unwind` so an engine lock the same panic poisoned turns into a
+        // skipped cleanup, not a fatal double-panic abort.
+        let engine = Arc::clone(&self.engine);
+        let temp_schema = self.temp_schema.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let temp: Vec<String> = engine
                 .relations()
                 .into_iter()
-                .filter(|s| s.namespace == self.temp_schema)
+                .filter(|s| s.namespace == temp_schema)
                 .map(|s| s.name)
                 .collect();
             for name in temp {
-                let _ = self.engine.drop_table(&self.temp_schema, &name);
+                let _ = engine.drop_table(&temp_schema, &name);
             }
-        }
+        }));
     }
 }

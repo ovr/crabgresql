@@ -3054,7 +3054,7 @@ async fn unsupported_transaction_forms_are_rejected() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn explain_shows_seq_scan_for_pk_equality() -> anyhow::Result<()> {
+async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
         .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
@@ -3063,14 +3063,17 @@ async fn explain_shows_seq_scan_for_pk_equality() -> anyhow::Result<()> {
         .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
         .await?;
 
-    // The durable heap engine builds no physical index yet, so even an equality on
-    // the PRIMARY KEY plans a sequential scan (the planner only chooses an Index
-    // Scan when the engine reports `supports_index_scan`).
+    // An equality on the PRIMARY KEY chooses an index scan (the durable heap engine
+    // builds a physical B-tree for the PK).
     let plan = client
         .simple_query("EXPLAIN SELECT * FROM t WHERE id = 2")
         .await?;
     let lines: Vec<&str> = rows(&plan).iter().filter_map(|r| r.get(0)).collect();
-    assert_eq!(lines[0], "Seq Scan on t");
+    assert_eq!(lines[0], "Index Scan using t_pkey on t");
+    assert!(
+        lines.iter().any(|l| l.contains("Index Cond: (id = 2)")),
+        "plan was {lines:?}"
+    );
 
     // ...and it still returns the right row.
     let result = client
@@ -3078,7 +3081,7 @@ async fn explain_shows_seq_scan_for_pk_equality() -> anyhow::Result<()> {
         .await?;
     assert_eq!(rows(&result)[0].get(0), Some("two"));
 
-    // A filter on a non-indexed column is likewise a sequential scan.
+    // A filter on a non-indexed column stays a sequential scan.
     let plan = client
         .simple_query("EXPLAIN SELECT * FROM t WHERE label = 'two'")
         .await?;
@@ -3097,6 +3100,61 @@ async fn explain_shows_seq_scan_for_pk_equality() -> anyhow::Result<()> {
         &tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED
     );
 
+    Ok(())
+}
+
+/// A session cannot reach another session's temp tables by qualifying with the
+/// other backend's `pg_temp_N` namespace — temp tables all live in the one shared
+/// engine now, so this guards the isolation the old per-session engine gave for
+/// free.
+#[tokio::test]
+async fn temp_tables_are_not_reachable_across_sessions() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let a = connect(port).await;
+    a.simple_query("CREATE TEMP TABLE secret (x int)").await?;
+    a.simple_query("INSERT INTO secret VALUES (42)").await?;
+    // Learn A's temp namespace (pg_temp_N) from information_schema.
+    let ns = a
+        .simple_query("SELECT table_schema FROM information_schema.tables WHERE table_name = 'secret'")
+        .await?;
+    let a_temp_schema = rows(&ns)[0].get("table_schema").unwrap().to_string();
+    assert!(a_temp_schema.starts_with("pg_temp_"));
+
+    // A second session must not read, write, or drop A's temp table by qualifier.
+    let b = connect(port).await;
+    for stmt in [
+        format!("SELECT * FROM {a_temp_schema}.secret"),
+        format!("INSERT INTO {a_temp_schema}.secret VALUES (99)"),
+        format!("DROP TABLE {a_temp_schema}.secret"),
+    ] {
+        let err = b.simple_query(&stmt).await.unwrap_err();
+        assert_eq!(
+            err.as_db_error().expect("db error").code(),
+            &tokio_postgres::error::SqlState::UNDEFINED_TABLE,
+            "cross-session access should be rejected: {stmt}"
+        );
+    }
+    // A's data is intact.
+    let still = a.simple_query("SELECT x FROM secret").await?;
+    assert_eq!(rows(&still)[0].get("x"), Some("42"));
+
+    Ok(())
+}
+
+/// `CREATE UNLOGGED TABLE ... AS SELECT` must also produce a memory table
+/// (`relpersistence = 'u'`), not silently fall back to a durable Permanent heap.
+#[tokio::test]
+async fn unlogged_create_table_as_is_a_memory_table() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE src (id int4)").await?;
+    client.simple_query("INSERT INTO src VALUES (1), (2)").await?;
+    client
+        .simple_query("CREATE UNLOGGED TABLE u AS SELECT * FROM src")
+        .await?;
+    let reflected = client
+        .simple_query("SELECT relpersistence FROM pg_class WHERE relname = 'u'")
+        .await?;
+    assert_eq!(rows(&reflected)[0].get("relpersistence"), Some("u"));
     Ok(())
 }
 
@@ -3150,9 +3208,7 @@ async fn explain_resolves_bind_parameters_in_extended_protocol() -> anyhow::Resu
         .query("EXPLAIN SELECT * FROM t WHERE id = $1", &[&2i32])
         .await?;
     let plan: String = rows[0].get(0);
-    // The durable engine defers physical indexes, so this plans a Seq Scan; the
-    // point of this test is that the inner statement's `$1` resolves at Describe.
-    assert_eq!(plan, "Seq Scan on t");
+    assert_eq!(plan, "Index Scan using t_pkey on t");
 
     Ok(())
 }

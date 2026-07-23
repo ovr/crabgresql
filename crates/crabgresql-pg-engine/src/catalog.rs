@@ -351,10 +351,17 @@ impl RelCatalog {
             return Ok(Some(new));
         }
         rel.rel = new.0;
+        // A memory table (UNLOGGED/TEMP) is excluded from `encode`, so persisting
+        // here would rewrite + fsync the whole catalog to produce identical bytes.
+        // Update the in-memory relfilenode (so a later DROP unlinks the right RAM
+        // rel) but skip the disk write entirely.
+        let is_memory = rel.persistence.is_memory();
         // Keep `next` above the swapped-in id even if it was allocated on a
         // previous boot and the counter was rebuilt from an older catalog file.
         state.next = state.next.max(new.0 + 1);
-        self.persist(&state)?;
+        if !is_memory {
+            self.persist(&state)?;
+        }
         Ok(Some(RelFileNode(old)))
     }
 

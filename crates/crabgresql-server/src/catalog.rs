@@ -47,6 +47,17 @@ impl SessionCatalog {
         self.open_temp(name).is_ok()
     }
 
+    /// A `pg_temp_N` namespace belonging to ANOTHER session. Temp tables all live
+    /// in the one shared engine now, so without this guard a session could reach
+    /// another backend's temp relations by qualifying with its namespace (e.g.
+    /// `SELECT * FROM pg_temp_3.t`). PostgreSQL forbids cross-session temp access;
+    /// we make a foreign temp namespace simply not resolve, as the old per-session
+    /// temp engine did (`TableNotFound` → 42P01). The `pg_temp` alias and this
+    /// session's own `temp_schema` are handled before this and never reach it.
+    fn is_foreign_temp(&self, namespace: &str) -> bool {
+        namespace.starts_with("pg_temp_") && namespace != self.temp_schema
+    }
+
     /// Fall through `TableNotFound` to `next`, but surface any other error.
     fn or_else_not_found(
         first: Result<Arc<dyn TableAm>, StorageError>,
@@ -82,6 +93,10 @@ impl TableEngine for SessionCatalog {
             Some("public") => self.global.open_table(name),
             Some("pg_temp") => self.open_temp(name),
             Some(namespace) if namespace == self.temp_schema => self.open_temp(name),
+            // Another session's temp namespace is off-limits (see `is_foreign_temp`).
+            Some(namespace) if self.is_foreign_temp(namespace) => {
+                Err(StorageError::TableNotFound(name.to_string()))
+            }
             // Any other qualifier names a user schema; route it to the global
             // engine, which holds every user namespace.
             Some(namespace) => self.global.resolve(Some(namespace), name),
@@ -104,6 +119,9 @@ impl TableEngine for SessionCatalog {
                 Err(StorageError::TableNotFound(_)) => self.global.drop_table("public", name),
                 other => other,
             }
+        } else if self.is_foreign_temp(namespace) {
+            // Never drop another session's temp table.
+            Err(StorageError::TableNotFound(name.to_string()))
         } else {
             self.global.drop_table(namespace, name)
         }
@@ -136,6 +154,9 @@ impl TableEngine for SessionCatalog {
         // permanent one of the same unqualified name.
         if namespace == "public" && self.temp_has(table) {
             self.global.create_index(&self.temp_schema, table, index)
+        } else if self.is_foreign_temp(namespace) {
+            // Never index another session's temp table.
+            Err(StorageError::IndexTableNotFound(table.to_string()))
         } else {
             self.global.create_index(namespace, table, index)
         }
@@ -145,6 +166,8 @@ impl TableEngine for SessionCatalog {
         if namespace == "public" && self.temp_has(table) {
             self.global
                 .index_name_exists(&self.temp_schema, table, index_name)
+        } else if self.is_foreign_temp(namespace) {
+            false
         } else {
             self.global.index_name_exists(namespace, table, index_name)
         }
@@ -175,6 +198,8 @@ impl TableEngine for SessionCatalog {
             // is a user schema, resolved against the global engine.
             Some("pg_temp") | Some("pg_catalog") | Some("information_schema") => None,
             Some(namespace) if namespace == self.temp_schema => None,
+            // A foreign session's temp namespace holds no views we may see.
+            Some(namespace) if self.is_foreign_temp(namespace) => None,
             Some(namespace) => self.global.resolve_view(Some(namespace), name),
         }
     }
