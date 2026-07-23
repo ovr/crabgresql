@@ -313,6 +313,7 @@ name = "crabgresql-pg-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crabgresql-executor",
  "crabgresql-storage-api",
  "crabgresql-txn",
  "crabgresql-types",

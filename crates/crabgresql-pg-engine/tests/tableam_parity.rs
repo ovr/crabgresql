@@ -534,30 +534,46 @@ fn pk_on_id() -> IndexMetadata {
 }
 
 #[test]
-fn heap_index_lookup_falls_back_to_scan() -> anyhow::Result<()> {
+fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
     let h = setup();
     let table = h.engine.create_table(schema("t"))?;
     insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Text("a".into())]);
     insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Text("b".into())]);
     h.engine.create_index("public", "t", pk_on_id())?;
 
-    // The durable heap engine builds no physical index yet, so it reports no
-    // index-scan support (the planner plans a Seq Scan) and `index_lookup`
-    // returns None (the executor falls back to a scan).
-    assert!(!table.supports_index_scan("t_pkey"));
-    assert!(
-        table
-            .index_lookup("t_pkey", &[Value::Int4(2)], &read(&h.tm))
-            .is_none()
-    );
+    // The durable heap engine now builds a physical B-tree: it reports index-scan
+    // support (the planner plans an Index Scan) and `index_lookup` serves the
+    // probe directly.
+    assert!(table.supports_index_scan("t_pkey"));
+    let hits: Vec<Tuple> = table
+        .index_lookup("t_pkey", &[Value::Int4(2)], &read(&h.tm))
+        .expect("the index serves the probe")
+        .map(|(_, t)| t)
+        .collect();
+    assert_eq!(hits, vec![vec![Value::Int4(2), Value::Text("b".into())]]);
 
-    // The fallback scan + key filter finds exactly the row an index probe would.
-    let rows: Vec<Tuple> = table
+    // The index probe agrees bit-for-bit with a seq scan + key filter.
+    let scan: Vec<Tuple> = table
         .scan(&read(&h.tm))
         .filter(|(_, t)| t[0] == Value::Int4(2))
         .map(|(_, t)| t)
         .collect();
-    assert_eq!(rows, vec![vec![Value::Int4(2), Value::Text("b".into())]]);
+    assert_eq!(hits, scan);
+
+    // A key with no matching row is served as an empty result, not a fallback.
+    let miss: Vec<Tuple> = table
+        .index_lookup("t_pkey", &[Value::Int4(999)], &read(&h.tm))
+        .expect("the index serves an absent key too")
+        .map(|(_, t)| t)
+        .collect();
+    assert!(miss.is_empty());
+
+    // An unknown index name falls back (None), keeping the scan path correct.
+    assert!(
+        table
+            .index_lookup("nope", &[Value::Int4(2)], &read(&h.tm))
+            .is_none()
+    );
     Ok(())
 }
 

@@ -77,6 +77,36 @@ pub fn init(p: &mut Page) {
     wr_u16(p, OFF_PAGESIZE, PAGESIZE_VERSION);
 }
 
+/// Initialize a page that reserves `special_len` bytes of special space at its
+/// end (the B-tree keeps its per-page metadata — level, sibling links, flags —
+/// there). The line-pointer array and tuple area live between the header and the
+/// special region, so every item primitive below works unchanged over the
+/// reduced range: [`add_item`]/[`insert_item_at`] grow the tuple area down only
+/// to `special`, never into it. Sets the page-version word, so a reloaded
+/// special page reads back as initialized (the buffer pool won't re-`init` it).
+pub fn init_special(p: &mut Page, special_len: usize) {
+    p.fill(0);
+    let special = BLCKSZ - special_len;
+    wr_u16(p, OFF_LOWER, PAGE_HEADER_LEN as u16);
+    wr_u16(p, OFF_UPPER, special as u16);
+    wr_u16(p, OFF_SPECIAL, special as u16);
+    wr_u16(p, OFF_PAGESIZE, PAGESIZE_VERSION);
+}
+
+/// The special region (a heap page's is empty, since its special offset is
+/// `BLCKSZ`). Callers that reserved it via [`init_special`] read their metadata
+/// here.
+pub fn special(p: &Page) -> &[u8] {
+    let s = rd_u16(p, OFF_SPECIAL) as usize;
+    &p[s..]
+}
+
+/// Mutable view of the special region (see [`special`]).
+pub fn special_mut(p: &mut Page) -> &mut [u8] {
+    let s = rd_u16(p, OFF_SPECIAL) as usize;
+    &mut p[s..]
+}
+
 /// Free bytes available between the line-pointer array and the tuple area.
 pub fn free_space(p: &Page) -> usize {
     upper(p).saturating_sub(lower(p))
@@ -176,6 +206,47 @@ pub fn put_item_at(p: &mut Page, off: u16, bytes: &[u8]) {
     set_item_id(p, off, ItemId::new(new_upper as u16, LP_NORMAL, len as u16));
 }
 
+/// Insert `bytes` at 1-based line-pointer number `off`, shifting the existing
+/// line pointers `[off..=max_offset]` up by one so the array stays in logical
+/// order (the B-tree keeps its item array sorted, unlike the heap, which only
+/// ever appends). `off` may be `max_offset + 1` to append. Returns `false`
+/// without modifying the page when there is no room (the caller then splits).
+/// The freed/overwritten tuple bytes of a later [`remove_item_at`] are not
+/// reclaimed here — B-tree pages never call [`compact`] (it would clobber the
+/// special region), so they tolerate that minor fragmentation.
+pub fn insert_item_at(p: &mut Page, off: u16, bytes: &[u8]) -> bool {
+    let len = bytes.len();
+    if len + 4 > free_space(p) {
+        return false;
+    }
+    let maxoff = max_offset(p);
+    // Place the tuple in the tuple area (its bytes can live anywhere; only the
+    // line-pointer order is the logical order).
+    let new_upper = upper(p) - len;
+    p[new_upper..new_upper + len].copy_from_slice(bytes);
+    wr_u16(p, OFF_UPPER, new_upper as u16);
+    // Open a hole at `off` by shifting line pointers up, high to low.
+    for cur in (off..=maxoff).rev() {
+        let id = item_id(p, cur);
+        set_item_id(p, cur + 1, id);
+    }
+    wr_u16(p, OFF_LOWER, (lower(p) + 4) as u16);
+    set_item_id(p, off, ItemId::new(new_upper as u16, LP_NORMAL, len as u16));
+    true
+}
+
+/// Remove the line pointer at `off`, shifting `[off+1..=max_offset]` down by one
+/// so the array stays contiguous and sorted. The tuple's bytes are left in place
+/// (not reclaimed — see [`insert_item_at`]).
+pub fn remove_item_at(p: &mut Page, off: u16) {
+    let maxoff = max_offset(p);
+    for cur in off..maxoff {
+        let id = item_id(p, cur + 1);
+        set_item_id(p, cur, id);
+    }
+    wr_u16(p, OFF_LOWER, (lower(p) - 4) as u16);
+}
+
 /// Borrow a NORMAL tuple's bytes, or `None` if the slot is not NORMAL.
 pub fn get_item(p: &Page, off: u16) -> Option<&[u8]> {
     if off == 0 || off > max_offset(p) {
@@ -217,8 +288,10 @@ pub fn compact(p: &mut Page) {
             live.push((off, p[start..start + id.len() as usize].to_vec()));
         }
     }
-    // Rewrite the tuple area from the end.
-    let mut cur_upper = BLCKSZ;
+    // Rewrite the tuple area from the end of the tuple region — the start of the
+    // special space, not BLCKSZ — so a page that reserves special space (a B-tree
+    // page) is never corrupted by repacking over its sibling/level metadata.
+    let mut cur_upper = rd_u16(p, OFF_SPECIAL) as usize;
     for (off, bytes) in &live {
         cur_upper -= bytes.len();
         p[cur_upper..cur_upper + bytes.len()].copy_from_slice(bytes);

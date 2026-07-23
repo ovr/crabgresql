@@ -123,6 +123,20 @@ impl TableLock {
         }
     }
 
+    /// Acquire the exclusive hold for `owner` and return an RAII guard that
+    /// releases it on drop — so an unwinding panic can never leak the hold (unlike
+    /// the manual [`TableLock::acquire_exclusive`]/[`TableLock::release_exclusive`]
+    /// pair, which TRUNCATE uses because it holds the lock across a transaction
+    /// boundary). Used by engine-internal DDL (index build/drop), which acquires
+    /// and releases within one call.
+    pub fn acquire_exclusive_guard(self: &Arc<Self>, owner: LockOwner) -> ExclusiveGuard {
+        self.acquire_exclusive(owner);
+        ExclusiveGuard {
+            lock: Arc::clone(self),
+            owner,
+        }
+    }
+
     /// Release `owner`'s exclusive hold, if it holds one. Wakes any waiters.
     pub fn release_exclusive(&self, owner: LockOwner) {
         let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
@@ -130,6 +144,19 @@ impl TableLock {
             inner.exclusive = None;
             self.cond.notify_all();
         }
+    }
+}
+
+/// Releases an exclusive hold on drop (including on an unwinding panic). Returned
+/// by [`TableLock::acquire_exclusive_guard`].
+pub struct ExclusiveGuard {
+    lock: Arc<TableLock>,
+    owner: LockOwner,
+}
+
+impl Drop for ExclusiveGuard {
+    fn drop(&mut self) {
+        self.lock.release_exclusive(self.owner);
     }
 }
 

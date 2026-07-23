@@ -290,6 +290,12 @@ pub struct LockOwner(pub u64);
 impl LockOwner {
     /// Reserved owner for engine-internal work (VACUUM) with no session.
     pub const INTERNAL: LockOwner = LockOwner(0);
+    /// Reserved owner for engine-internal DDL (CREATE/DROP INDEX) with no session.
+    /// Distinct from [`LockOwner::INTERNAL`] so a DDL's exclusive hold also excludes
+    /// a concurrent VACUUM (which runs as `INTERNAL`), and from any session owner
+    /// (allocated from a counter seeded at 1 or from an XID `>= 3`), which this
+    /// top-of-range sentinel never collides with.
+    pub const DDL: LockOwner = LockOwner(u64::MAX);
 }
 
 /// What flows into an engine on every scan and write: who is asking (`xid`,
