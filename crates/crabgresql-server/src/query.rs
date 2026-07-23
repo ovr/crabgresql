@@ -2146,25 +2146,9 @@ fn fold_bound_value(
     )?)
 }
 
-/// Re-parse a stored bound literal (`expr.to_string()` text) back into an AST
-/// expression, for re-folding a sibling partition's persisted bound.
-fn parse_bound_expr(text: &str) -> Result<ast::Expr, PgError> {
-    let stmts = crabgresql_parser::parse(&format!("SELECT {text}"))
-        .map_err(|e| PgError::new("XX000", format!("stored partition bound is invalid: {e}")))?;
-    match stmts.as_slice() {
-        [ast::Statement::Query(query)] => match query.body.as_ref() {
-            ast::SetExpr::Select(select) => match select.projection.as_slice() {
-                [ast::SelectItem::UnnamedExpr(expr)] => Ok(expr.clone()),
-                _ => Err(PgError::new("XX000", "stored partition bound is invalid")),
-            },
-            _ => Err(PgError::new("XX000", "stored partition bound is invalid")),
-        },
-        _ => Err(PgError::new("XX000", "stored partition bound is invalid")),
-    }
-}
-
 /// Convert one incoming `FOR VALUES` datum into its storage form plus its
-/// ordered [`Endpoint`].
+/// ordered [`Endpoint`]. A finite bound is folded to a typed [`Value`] once,
+/// here, and stored as-is — no text round-trip.
 fn incoming_endpoint(
     value: &ast::PartitionBoundValue,
     key_col: &Column,
@@ -2184,26 +2168,20 @@ fn incoming_endpoint(
                 ));
             }
             Ok((
-                PartitionBoundDatum::Value(expr.to_string()),
+                PartitionBoundDatum::Value(value.clone()),
                 Endpoint::Finite(value),
             ))
         }
     }
 }
 
-/// Recompute a persisted sibling datum's ordered [`Endpoint`] for overlap checks.
-fn stored_endpoint(
-    datum: &PartitionBoundDatum,
-    key_col: &Column,
-    type_catalog: &Arc<dyn TypeCatalog>,
-) -> Result<Endpoint, PgError> {
+/// Recompute a persisted sibling datum's ordered [`Endpoint`] for overlap
+/// checks. A stored finite bound is already the folded [`Value`].
+fn stored_endpoint(datum: &PartitionBoundDatum) -> Endpoint {
     match datum {
-        PartitionBoundDatum::MinValue => Ok(Endpoint::NegInf),
-        PartitionBoundDatum::MaxValue => Ok(Endpoint::PosInf),
-        PartitionBoundDatum::Value(text) => {
-            let expr = parse_bound_expr(text)?;
-            Ok(Endpoint::Finite(fold_bound_value(&expr, key_col, type_catalog)?))
-        }
+        PartitionBoundDatum::MinValue => Endpoint::NegInf,
+        PartitionBoundDatum::MaxValue => Endpoint::PosInf,
+        PartitionBoundDatum::Value(v) => Endpoint::Finite(v.clone()),
     }
 }
 
@@ -2325,8 +2303,8 @@ fn execute_create_partition(
         if sibling.schema.namespace == namespace && sibling.schema.name == name {
             continue;
         }
-        let sib_lo = stored_endpoint(&part.bound.from[0], key_col, type_catalog)?;
-        let sib_hi = stored_endpoint(&part.bound.to[0], key_col, type_catalog)?;
+        let sib_lo = stored_endpoint(&part.bound.from[0]);
+        let sib_hi = stored_endpoint(&part.bound.to[0]);
         if endpoint_cmp(&lower, &sib_hi, key_col.ty) == std::cmp::Ordering::Less
             && endpoint_cmp(&sib_lo, &upper, key_col.ty) == std::cmp::Ordering::Less
         {
@@ -2347,6 +2325,7 @@ fn execute_create_partition(
         partition_of: Some(PartitionOf {
             parent_namespace: parent_schema.namespace.clone(),
             parent_name: parent_schema.name.clone(),
+            key_columns: scheme.key_columns.clone(),
             bound: PartitionBound {
                 from: vec![from_datum],
                 to: vec![to_datum],

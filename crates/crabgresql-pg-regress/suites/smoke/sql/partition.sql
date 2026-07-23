@@ -30,6 +30,16 @@ SELECT table_name, table_type FROM information_schema.tables
 -- A partition is an ordinary table: rows insert into and select from it directly.
 INSERT INTO sales_2024 VALUES (1, '2024-06-01', 100);
 SELECT * FROM sales_2024;
+-- A leaf enforces its own bound on a direct INSERT. A key below its range is
+-- rejected (23514); the DETAIL shows the failing row, and nothing is written.
+INSERT INTO sales_2024 VALUES (3, '2023-03-01', 50);
+-- FROM is inclusive but TO is exclusive: the upper bound value belongs to the
+-- next partition, not this one (23514).
+INSERT INTO sales_2024 VALUES (4, '2025-01-01', 50);
+-- A NULL partition key has no place in any range partition (23514).
+INSERT INTO sales_2024 VALUES (5, NULL, 50);
+-- The rejected rows wrote nothing: only the first row remains.
+SELECT count(*) FROM sales_2024;
 -- Routing an INSERT through the parent is not supported yet (0A000).
 INSERT INTO sales VALUES (2, '2023-03-01', 50);
 -- Scanning the parent (union over partitions) is not supported yet (0A000).

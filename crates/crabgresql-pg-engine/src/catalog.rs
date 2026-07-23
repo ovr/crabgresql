@@ -816,6 +816,10 @@ fn encode(state: &State) -> Vec<u8> {
                 out.push(1);
                 put_str(&mut out, &part.parent_namespace);
                 put_str(&mut out, &part.parent_name);
+                out.extend_from_slice(&(part.key_columns.len() as u32).to_le_bytes());
+                for col in &part.key_columns {
+                    out.extend_from_slice(&(*col as u32).to_le_bytes());
+                }
                 put_bound_datums(&mut out, &part.bound.from);
                 put_bound_datums(&mut out, &part.bound.to);
             }
@@ -829,9 +833,11 @@ fn put_bound_datums(out: &mut Vec<u8>, datums: &[PartitionBoundDatum]) {
     out.extend_from_slice(&(datums.len() as u32).to_le_bytes());
     for datum in datums {
         match datum {
+            // A finite bound is a typed value, encoded with the same
+            // self-describing on-page format the heap uses for a datum.
             PartitionBoundDatum::Value(v) => {
                 out.push(0);
-                put_str(out, v);
+                crate::datum::encode_datum(v, out);
             }
             PartitionBoundDatum::MinValue => out.push(1),
             PartitionBoundDatum::MaxValue => out.push(2),
@@ -895,7 +901,7 @@ fn get_bound_datums(d: &mut Dec) -> Vec<PartitionBoundDatum> {
     let mut out = Vec::with_capacity(n as usize);
     for _ in 0..n {
         out.push(match d.byte() {
-            0 => PartitionBoundDatum::Value(d.s()),
+            0 => PartitionBoundDatum::Value(crate::datum::decode_datum(d.b, &mut d.p)),
             1 => PartitionBoundDatum::MinValue,
             _ => PartitionBoundDatum::MaxValue,
         });
@@ -1112,11 +1118,17 @@ fn decode(bytes: &[u8]) -> State {
             if d.byte() != 0 {
                 let parent_namespace = d.s();
                 let parent_name = d.s();
+                let nkeys = d.u32();
+                let mut key_columns = Vec::with_capacity(nkeys as usize);
+                for _ in 0..nkeys {
+                    key_columns.push(d.u32() as usize);
+                }
                 let from = get_bound_datums(&mut d);
                 let to = get_bound_datums(&mut d);
                 r.partition_of = Some(PartitionOf {
                     parent_namespace,
                     parent_name,
+                    key_columns,
                     bound: PartitionBound { from, to },
                 });
             }
@@ -1213,6 +1225,7 @@ fn pgtype_from_oid(o: u32) -> PgType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crabgresql_types::Value;
 
     #[test]
     fn metadata_round_trips_and_legacy_prefix_defaults() -> anyhow::Result<()> {
@@ -1432,8 +1445,10 @@ mod tests {
         child.partition_of = Some(PartitionOf {
             parent_namespace: "public".to_string(),
             parent_name: "m".to_string(),
+            key_columns: vec![1],
+            // 2024-01-01 as a Date value (days since 2000-01-01).
             bound: PartitionBound {
-                from: vec![PartitionBoundDatum::Value("'2024-01-01'".to_string())],
+                from: vec![PartitionBoundDatum::Value(Value::Date(8766))],
                 to: vec![PartitionBoundDatum::MaxValue],
             },
         });
@@ -1459,9 +1474,10 @@ mod tests {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("child lost its partition_of"))?;
         assert_eq!(part.parent_name, "m");
+        assert_eq!(part.key_columns, vec![1]);
         assert_eq!(
             part.bound.from,
-            vec![PartitionBoundDatum::Value("'2024-01-01'".to_string())]
+            vec![PartitionBoundDatum::Value(Value::Date(8766))]
         );
         assert_eq!(part.bound.to, vec![PartitionBoundDatum::MaxValue]);
         drop(loaded);

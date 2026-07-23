@@ -148,18 +148,20 @@ pub struct PartitionScheme {
 }
 
 /// One datum of a RANGE partition bound. `MinValue`/`MaxValue` are the
-/// unbounded ends (`MINVALUE`/`MAXVALUE`); `Value` holds the canonical SQL text
-/// of a bound literal (rebound against the key column's type when compared).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// unbounded ends (`MINVALUE`/`MAXVALUE`); `Value` holds the bound literal
+/// already folded to the key column's type, so it compares directly against a
+/// row's key value with no re-parse. (`Value` has no `Eq`, so neither do the
+/// partition types below — `PartialEq` is all the callers need.)
+#[derive(Clone, Debug, PartialEq)]
 pub enum PartitionBoundDatum {
-    Value(String),
+    Value(Value),
     MinValue,
     MaxValue,
 }
 
 /// A RANGE partition bound: `FOR VALUES FROM (from...) TO (to...)`. `from` is
 /// inclusive, `to` is exclusive, each a tuple over the parent's key columns.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PartitionBound {
     pub from: Vec<PartitionBoundDatum>,
     pub to: Vec<PartitionBoundDatum>,
@@ -167,10 +169,14 @@ pub struct PartitionBound {
 
 /// Set on a leaf partition (`relispartition = true`): which parent it belongs
 /// to and the bound that admits a row into it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PartitionOf {
     pub parent_namespace: String,
     pub parent_name: String,
+    /// Column positions (into [`TableSchema::columns`]) forming the partition
+    /// key — a copy of the parent's [`PartitionScheme::key_columns`]. Carried
+    /// on the leaf so it can enforce its own bound without resolving the parent.
+    pub key_columns: Vec<usize>,
     pub bound: PartitionBound,
 }
 

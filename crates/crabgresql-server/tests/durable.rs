@@ -505,6 +505,17 @@ async fn partition_metadata_survives_restart() -> anyhow::Result<()> {
         let msgs = client.simple_query("SELECT id FROM m_2024").await?;
         assert_eq!(rows(&msgs)[0].get(0), Some("1"));
 
+        // The reloaded (typed) bound still enforces: an out-of-range direct
+        // INSERT into the leaf is rejected (23514), same as before the restart.
+        let err = client
+            .simple_query("INSERT INTO m_2024 VALUES (2, '2023-03-01')")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_db_error().expect("database error").code(),
+            &tokio_postgres::error::SqlState::CHECK_VIOLATION
+        );
+
         shutdown(client, handle).await;
     }
 
