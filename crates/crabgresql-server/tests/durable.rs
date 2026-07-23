@@ -437,3 +437,76 @@ async fn dropped_index_stays_dropped_across_a_restart() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn partition_metadata_survives_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // First boot: a RANGE-partitioned parent with one leaf partition, plus a row
+    // inserted directly into the partition.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE TABLE m (id int, d date) PARTITION BY RANGE (d)")
+            .await?;
+        client
+            .simple_query(
+                "CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+            )
+            .await?;
+        client
+            .simple_query("INSERT INTO m_2024 VALUES (1, '2024-06-01')")
+            .await?;
+        shutdown(client, handle).await;
+    }
+
+    // Second boot: the parent is still relkind='p', the partition still
+    // relispartition='t', the pg_inherits link and the partition's row survive.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+
+        let msgs = client
+            .simple_query(
+                "SELECT relname, relkind, relispartition FROM pg_class \
+                 WHERE relname IN ('m', 'm_2024') ORDER BY relname",
+            )
+            .await?;
+        let r = rows(&msgs);
+        assert_eq!(
+            (r[0].get(0), r[0].get(1), r[0].get(2)),
+            (Some("m"), Some("p"), Some("f"))
+        );
+        assert_eq!(
+            (r[1].get(0), r[1].get(1), r[1].get(2)),
+            (Some("m_2024"), Some("r"), Some("t"))
+        );
+
+        let msgs = client
+            .simple_query(
+                "SELECT c.relname, p.relname FROM pg_inherits i \
+                 JOIN pg_class c ON c.oid = i.inhrelid \
+                 JOIN pg_class p ON p.oid = i.inhparent",
+            )
+            .await?;
+        let r = rows(&msgs);
+        assert_eq!((r[0].get(0), r[0].get(1)), (Some("m_2024"), Some("m")));
+
+        let msgs = client
+            .simple_query("SELECT partstrat, partnatts, partattrs FROM pg_partitioned_table")
+            .await?;
+        let r = rows(&msgs);
+        assert_eq!(
+            (r[0].get(0), r[0].get(1), r[0].get(2)),
+            (Some("r"), Some("1"), Some("2"))
+        );
+
+        let msgs = client.simple_query("SELECT id FROM m_2024").await?;
+        assert_eq!(rows(&msgs)[0].get(0), Some("1"));
+
+        shutdown(client, handle).await;
+    }
+
+    Ok(())
+}

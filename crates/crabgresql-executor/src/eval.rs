@@ -267,6 +267,18 @@ fn eval_binary(
     Ok(Value::Bool(result))
 }
 
+/// Whether [`compare_values`] defines an ordering for `ty` — i.e. the type has a
+/// default btree operator class. The non-orderable types are exactly those that
+/// fall through to the `unreachable!` arm of [`compare_values`]; keep the two in
+/// sync. Callers that would otherwise reach `compare_values` on user input (e.g.
+/// a RANGE partition key) must gate on this to avoid a panic.
+pub fn is_orderable(ty: PgType) -> bool {
+    !matches!(
+        ty,
+        PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg
+    )
+}
+
 /// Total-order comparison of two non-null values of type `ty`. Floats use PG's
 /// total order (NaN sorts greatest, `NaN = NaN`), so this also drives ORDER BY.
 pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {

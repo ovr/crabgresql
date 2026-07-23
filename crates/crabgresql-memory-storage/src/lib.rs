@@ -912,14 +912,13 @@ mod tests {
     use crabgresql_types::{PgType, Value};
 
     fn schema(name: &str) -> TableSchema {
-        TableSchema {
-            name: name.to_string(),
-            namespace: "public".to_string(),
-            columns: vec![
+        TableSchema::new(
+            name,
+            vec![
                 Column::new("id", PgType::Int4),
                 Column::new("name", PgType::Text),
             ],
-        }
+        )
     }
 
     /// A unique index on one column, PostgreSQL's default `nulls_distinct`.
@@ -1442,11 +1441,7 @@ mod tests {
         // A float8 key type is not equality-canonical, so its index stays
         // metadata-only: index_lookup returns None and supports_index_scan is
         // false, so the planner won't route an index scan to it.
-        let ft = engine.create_table(TableSchema {
-            name: "f".into(),
-            namespace: "public".into(),
-            columns: vec![Column::new("x", PgType::Float8)],
-        })?;
+        let ft = engine.create_table(TableSchema::new("f", vec![Column::new("x", PgType::Float8)]))?;
         engine.create_index("public", "f", unique_index("f_x_key", 0))?;
         assert!(!ft.supports_index_scan("f_x_key"));
         assert!(

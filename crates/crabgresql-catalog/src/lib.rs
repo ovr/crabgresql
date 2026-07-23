@@ -102,6 +102,9 @@ pub fn is_builtin_type_name(name: &str) -> bool {
 pub enum RelKind {
     /// An ordinary table (`relkind = 'r'`, table_type `BASE TABLE`).
     Table,
+    /// A partitioned (parent) table (`relkind = 'p'`). Holds no rows of its own;
+    /// still `BASE TABLE` in `information_schema.tables`, as in PG.
+    PartitionedTable,
     /// A view (`relkind = 'v'`, table_type `VIEW`).
     View,
     /// A sequence (`relkind = 'S'`). Not a table, so it is omitted from
@@ -135,38 +138,53 @@ pub struct CatalogRelation {
     pub sequence: Option<CatalogSequence>,
 }
 
+/// The relkind of a stored user relation: a partitioned parent (carrying a
+/// partition key) is `'p'`, everything else an ordinary table `'r'`. A leaf
+/// partition is still an ordinary table (its `partition_of` only sets
+/// `relispartition`).
+fn table_kind(schema: &TableSchema) -> RelKind {
+    if schema.partition_scheme.is_some() {
+        RelKind::PartitionedTable
+    } else {
+        RelKind::Table
+    }
+}
+
 impl CatalogRelation {
     pub fn permanent(schema: TableSchema) -> Self {
         let namespace = schema.namespace.clone();
+        let kind = table_kind(&schema);
         Self {
             schema,
             indexes: Vec::new(),
             namespace,
             temporary: false,
-            kind: RelKind::Table,
+            kind,
             sequence: None,
         }
     }
 
     pub fn permanent_metadata(metadata: RelationMetadata) -> Self {
         let namespace = metadata.schema.namespace.clone();
+        let kind = table_kind(&metadata.schema);
         Self {
             schema: metadata.schema,
             indexes: metadata.indexes,
             namespace,
             temporary: false,
-            kind: RelKind::Table,
+            kind,
             sequence: None,
         }
     }
 
     pub fn temporary(schema: TableSchema, namespace: impl Into<String>) -> Self {
+        let kind = table_kind(&schema);
         Self {
             schema,
             indexes: Vec::new(),
             namespace: namespace.into(),
             temporary: true,
-            kind: RelKind::Table,
+            kind,
             sequence: None,
         }
     }
@@ -478,6 +496,14 @@ impl SystemCatalog {
                 schema::pg_index_rows(self.index_oids()),
             )),
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
+            "pg_inherits" => Some((
+                schema::pg_inherits_schema(),
+                schema::pg_inherits_rows(self.relation_oids()),
+            )),
+            "pg_partitioned_table" => Some((
+                schema::pg_partitioned_table_schema(),
+                schema::pg_partitioned_table_rows(self.relation_oids()),
+            )),
             "pg_sequence" => Some((
                 schema::pg_sequence_schema(),
                 schema::pg_sequence_rows(&self.sequence_entries()),

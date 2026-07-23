@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, SequenceAdvance,
+    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
+    PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, SequenceAdvance,
     SequenceDefinition, TableSchema, ViewDefinition,
 };
 use crabgresql_types::{PgType, oid};
@@ -36,6 +37,12 @@ const SEQ_MAGIC: &[u8; 4] = b"CSQ1";
 /// object's namespace. A reader that predates schemas stops above and never sees
 /// it, so every object decodes as `public` (the sole namespace before schemas).
 const NSP_MAGIC: &[u8; 4] = b"NSP1";
+/// Marks the partition section, appended after the [`NSP_MAGIC`] block — a fifth
+/// backward-compatible tail carrying each relation's declarative-partitioning
+/// metadata (partition key for a parent, parent link + bound for a leaf). A
+/// reader that predates partitioning stops above and treats every relation as
+/// unpartitioned.
+const PART_MAGIC: &[u8; 4] = b"PART";
 
 struct PersistCol {
     name: String,
@@ -52,6 +59,10 @@ struct PersistRel {
     rel: u32,
     cols: Vec<PersistCol>,
     indexes: Vec<IndexMetadata>,
+    /// `Some` on a partitioned (parent) table: its partition key.
+    partition_scheme: Option<PartitionScheme>,
+    /// `Some` on a leaf partition: its parent and bound.
+    partition_of: Option<PartitionOf>,
 }
 
 /// A persisted view: its SELECT text, derived column list, and the relations it
@@ -155,6 +166,8 @@ impl RelCatalog {
                         name: r.name.clone(),
                         namespace: r.namespace.clone(),
                         columns,
+                        partition_scheme: r.partition_scheme.clone(),
+                        partition_of: r.partition_of.clone(),
                     },
                     r.indexes.clone(),
                 )
@@ -198,6 +211,8 @@ impl RelCatalog {
                 })
                 .collect(),
             indexes: Vec::new(),
+            partition_scheme: schema.partition_scheme.clone(),
+            partition_of: schema.partition_of.clone(),
         });
         self.persist(&state)?;
         Ok(RelFileNode(rel))
@@ -776,7 +791,52 @@ fn encode(state: &State) -> Vec<u8> {
     for s in &state.sequences {
         put_str(&mut out, &s.namespace);
     }
+    // Partitioning: a fifth backward-compatible tail after the namespace block,
+    // one record per relation in `rels` order (zipped back on by position). A
+    // reader that predates partitioning stops above and treats every relation as
+    // unpartitioned.
+    out.extend_from_slice(PART_MAGIC);
+    out.extend_from_slice(&(state.rels.len() as u32).to_le_bytes());
+    for r in &state.rels {
+        match &r.partition_scheme {
+            Some(scheme) => {
+                out.push(1);
+                out.push(match scheme.strategy {
+                    PartitionStrategy::Range => 0,
+                });
+                out.extend_from_slice(&(scheme.key_columns.len() as u32).to_le_bytes());
+                for col in &scheme.key_columns {
+                    out.extend_from_slice(&(*col as u32).to_le_bytes());
+                }
+            }
+            None => out.push(0),
+        }
+        match &r.partition_of {
+            Some(part) => {
+                out.push(1);
+                put_str(&mut out, &part.parent_namespace);
+                put_str(&mut out, &part.parent_name);
+                put_bound_datums(&mut out, &part.bound.from);
+                put_bound_datums(&mut out, &part.bound.to);
+            }
+            None => out.push(0),
+        }
+    }
     out
+}
+
+fn put_bound_datums(out: &mut Vec<u8>, datums: &[PartitionBoundDatum]) {
+    out.extend_from_slice(&(datums.len() as u32).to_le_bytes());
+    for datum in datums {
+        match datum {
+            PartitionBoundDatum::Value(v) => {
+                out.push(0);
+                put_str(out, v);
+            }
+            PartitionBoundDatum::MinValue => out.push(1),
+            PartitionBoundDatum::MaxValue => out.push(2),
+        }
+    }
 }
 
 struct Dec<'a> {
@@ -830,6 +890,19 @@ impl<'a> Dec<'a> {
     }
 }
 
+fn get_bound_datums(d: &mut Dec) -> Vec<PartitionBoundDatum> {
+    let n = d.u32();
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        out.push(match d.byte() {
+            0 => PartitionBoundDatum::Value(d.s()),
+            1 => PartitionBoundDatum::MinValue,
+            _ => PartitionBoundDatum::MaxValue,
+        });
+    }
+    out
+}
+
 fn decode(bytes: &[u8]) -> State {
     let mut d = Dec { b: bytes, p: 0 };
     let next = d.u32();
@@ -860,6 +933,9 @@ fn decode(bytes: &[u8]) -> State {
             rel,
             cols,
             indexes: Vec::new(),
+            // Default to unpartitioned; overridden below from the PART1 tail.
+            partition_scheme: None,
+            partition_of: None,
         });
     }
     if d.remaining().starts_with(META_MAGIC) {
@@ -1011,6 +1087,39 @@ fn decode(bytes: &[u8]) -> State {
         let nseqs = d.u32();
         for s in sequences.iter_mut().take(nseqs as usize) {
             s.namespace = d.s();
+        }
+    }
+    // Partition tail: each relation's declarative-partitioning metadata, zipped
+    // back on by position. Absent in a pre-partitioning file (all unpartitioned).
+    if d.remaining().starts_with(PART_MAGIC) {
+        d.p += PART_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            if d.byte() != 0 {
+                // Only RANGE exists so far; the tag is reserved for LIST/HASH.
+                let _strategy_tag = d.byte();
+                let strategy = PartitionStrategy::Range;
+                let nkeys = d.u32();
+                let mut key_columns = Vec::with_capacity(nkeys as usize);
+                for _ in 0..nkeys {
+                    key_columns.push(d.u32() as usize);
+                }
+                r.partition_scheme = Some(PartitionScheme {
+                    strategy,
+                    key_columns,
+                });
+            }
+            if d.byte() != 0 {
+                let parent_namespace = d.s();
+                let parent_name = d.s();
+                let from = get_bound_datums(&mut d);
+                let to = get_bound_datums(&mut d);
+                r.partition_of = Some(PartitionOf {
+                    parent_namespace,
+                    parent_name,
+                    bound: PartitionBound { from, to },
+                });
+            }
         }
     }
     State {
@@ -1292,6 +1401,88 @@ mod tests {
         let legacy = RelCatalog::load(dir.path())?;
         assert!(legacy.sequences().is_empty());
         assert_eq!(legacy.schemas().len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn partitioning_round_trips_and_legacy_catalog_ignores_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        // A partitioned parent plus one leaf partition with a RANGE bound.
+        let mut parent = TableSchema::new(
+            "m",
+            vec![
+                Column::new("id", PgType::Int4),
+                Column::new("d", PgType::Date),
+            ],
+        );
+        parent.partition_scheme = Some(PartitionScheme {
+            strategy: PartitionStrategy::Range,
+            key_columns: vec![1],
+        });
+        catalog.create(&parent)?;
+        let mut child = TableSchema::new(
+            "m_2024",
+            vec![
+                Column::new("id", PgType::Int4),
+                Column::new("d", PgType::Date),
+            ],
+        );
+        child.partition_of = Some(PartitionOf {
+            parent_namespace: "public".to_string(),
+            parent_name: "m".to_string(),
+            bound: PartitionBound {
+                from: vec![PartitionBoundDatum::Value("'2024-01-01'".to_string())],
+                to: vec![PartitionBoundDatum::MaxValue],
+            },
+        });
+        catalog.create(&child)?;
+        drop(catalog);
+
+        // Reload: both the parent's key and the child's parent link + bound survive.
+        let loaded = RelCatalog::load(dir.path())?;
+        let mut schemas = loaded.schemas();
+        schemas.sort_by(|a, b| a.0.cmp(&b.0));
+        let (_, _, parent_schema, _) = &schemas[0];
+        assert_eq!(parent_schema.name, "m");
+        assert_eq!(
+            parent_schema.partition_scheme.as_ref().map(|s| &s.key_columns),
+            Some(&vec![1])
+        );
+        assert!(parent_schema.partition_of.is_none());
+        let (_, _, child_schema, _) = &schemas[1];
+        assert_eq!(child_schema.name, "m_2024");
+        assert!(child_schema.partition_scheme.is_none());
+        let part = child_schema
+            .partition_of
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("child lost its partition_of"))?;
+        assert_eq!(part.parent_name, "m");
+        assert_eq!(
+            part.bound.from,
+            vec![PartitionBoundDatum::Value("'2024-01-01'".to_string())]
+        );
+        assert_eq!(part.bound.to, vec![PartitionBoundDatum::MaxValue]);
+        drop(loaded);
+
+        // A pre-partitioning catalog file (truncated at the partition marker) still
+        // loads: every relation decodes as unpartitioned.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(PART_MAGIC.len())
+            .position(|w| w == PART_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("partition marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        assert!(
+            legacy
+                .schemas()
+                .iter()
+                .all(|(_, _, schema, _)| schema.partition_scheme.is_none()
+                    && schema.partition_of.is_none())
+        );
 
         Ok(())
     }

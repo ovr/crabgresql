@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 
-use crabgresql_storage_api::{Column, IndexConstraint, IndexMethod, TableSchema};
+use crabgresql_storage_api::{
+    Column, IndexConstraint, IndexMethod, PartitionStrategy, TableSchema,
+};
 use crabgresql_types::{PgType, Value};
 
 use crate::{
@@ -34,10 +36,10 @@ fn col(name: &str, ty: PgType) -> Column {
 /// query. Trailing rarely-read columns (`typmodin`, `typnotnull`, `typbasetype`,
 /// `typdefault`, `typacl`, …) are omitted for now.
 pub fn pg_type_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_type".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_type",
+        "pg_catalog",
+        vec![
             col("oid", PgType::Oid),
             col("typname", PgType::Name),
             col("typnamespace", PgType::Oid),
@@ -59,7 +61,7 @@ pub fn pg_type_schema() -> TableSchema {
             col("typalign", CHARLIKE),
             col("typstorage", CHARLIKE),
         ],
-    }
+    )
 }
 
 /// The built-in `pg_type` rows generated from `pg_type.dat`. Callers append any
@@ -135,16 +137,16 @@ pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
 /// 1-based definition position (PG stores a float4 so labels can be inserted
 /// between existing ones; a freshly created enum uses 1, 2, 3, …).
 pub fn pg_enum_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_enum".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_enum",
+        "pg_catalog",
+        vec![
             col("oid", PgType::Oid),
             col("enumtypid", PgType::Oid),
             col("enumsortorder", PgType::Float4),
             col("enumlabel", PgType::Name),
         ],
-    }
+    )
 }
 
 /// The `pg_enum` rows for every user-defined enum type, in a stable order (by
@@ -174,10 +176,10 @@ pub fn pg_enum_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
 
 /// `pg_catalog.pg_cast` — the built-in casts between types crabgresql exposes.
 pub fn pg_cast_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_cast".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_cast",
+        "pg_catalog",
+        vec![
             col("oid", PgType::Oid),
             col("castsource", PgType::Oid),
             col("casttarget", PgType::Oid),
@@ -186,7 +188,7 @@ pub fn pg_cast_schema() -> TableSchema {
             col("castcontext", CHARLIKE),
             col("castmethod", CHARLIKE),
         ],
-    }
+    )
 }
 
 /// The built-in `pg_cast` rows generated from `pg_cast.dat` (restricted to casts
@@ -210,10 +212,10 @@ pub fn pg_cast_rows() -> Vec<Vec<Value>> {
 /// `pg_catalog.pg_sequence` — the definition of each user sequence, one row per
 /// [`RelKind::Sequence`] relation, keyed by its `pg_class` OID (`seqrelid`).
 pub fn pg_sequence_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_sequence".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_sequence",
+        "pg_catalog",
+        vec![
             col("seqrelid", PgType::Oid),
             col("seqtypid", PgType::Oid),
             col("seqstart", PgType::Int8),
@@ -223,7 +225,7 @@ pub fn pg_sequence_schema() -> TableSchema {
             col("seqcache", PgType::Int8),
             col("seqcycle", PgType::Bool),
         ],
-    }
+    )
 }
 
 pub fn pg_sequence_rows(sequences: &[(u32, CatalogSequence)]) -> Vec<Vec<Value>> {
@@ -246,17 +248,17 @@ pub fn pg_sequence_rows(sequences: &[(u32, CatalogSequence)]) -> Vec<Vec<Value>>
 
 /// `pg_catalog.pg_namespace` — the schemas visible on a fresh cluster.
 pub fn pg_namespace_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_namespace".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_namespace",
+        "pg_catalog",
+        vec![
             col("oid", PgType::Oid),
             col("nspname", PgType::Name),
             col("nspowner", PgType::Oid),
             // aclitem[]; represented as text and always NULL (default ACL) here.
             col("nspacl", PgType::Text),
         ],
-    }
+    )
 }
 
 /// OID assigned to the heap access method (`pg_am` row `heap` = 2). Reported for
@@ -266,10 +268,10 @@ const HEAP_AM_OID: u32 = 2;
 /// `pg_catalog.pg_class` — a curated subset of columns for user relations.
 /// Index/partition/stats columns beyond this set are omitted for now.
 pub fn pg_class_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_class".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_class",
+        "pg_catalog",
+        vec![
             col("oid", PgType::Oid),
             col("relname", PgType::Name),
             col("relnamespace", PgType::Oid),
@@ -280,8 +282,9 @@ pub fn pg_class_schema() -> TableSchema {
             col("relhasindex", PgType::Bool),
             col("relpersistence", CHARLIKE),
             col("relkind", CHARLIKE),
+            col("relispartition", PgType::Bool),
         ],
-    }
+    )
 }
 
 /// Build `pg_class` rows from `(oid, schema)` pairs paired with their kinds. User
@@ -303,8 +306,11 @@ pub fn pg_class_rows(
         .iter()
         .zip(kinds)
         .map(|((oid, schema), kind)| {
+            // A partitioned parent has no access method (`relam = 0`) and holds no
+            // storage of its own; a leaf partition is an ordinary heap.
             let (relam, relkind) = match kind {
                 RelKind::Table => (HEAP_AM_OID, "r"),
+                RelKind::PartitionedTable => (0, "p"),
                 RelKind::View => (0, "v"),
                 RelKind::Sequence => (0, "S"),
             };
@@ -319,6 +325,7 @@ pub fn pg_class_rows(
                 Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
                 Value::Text("p".to_string()),
                 Value::Text(relkind.to_string()),
+                Value::Bool(schema.partition_of.is_some()),
             ]
         })
         .collect();
@@ -338,18 +345,105 @@ pub fn pg_class_rows(
             Value::Bool(false),
             Value::Text("p".to_string()),
             Value::Text("i".to_string()),
+            Value::Bool(false),
         ]
     }));
+    rows
+}
+
+/// `pg_catalog.pg_inherits` — the parent/child links of declarative partitions
+/// (and, in PG, table inheritance). One row per leaf partition.
+pub fn pg_inherits_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_inherits",
+        "pg_catalog",
+        vec![
+            col("inhrelid", PgType::Oid),
+            col("inhparent", PgType::Oid),
+            col("inhseqno", PgType::Int4),
+            col("inhdetachpending", PgType::Bool),
+        ],
+    )
+}
+
+/// One `pg_inherits` row per leaf partition, linking its OID to its parent's.
+/// Both OIDs come from the same positional assignment as `pg_class`, so the
+/// `inhrelid`/`inhparent` → `pg_class.oid` joins line up.
+pub fn pg_inherits_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
+    let parent_oid = |namespace: &str, name: &str| -> Option<u32> {
+        relations
+            .iter()
+            .find(|(_, s)| s.namespace == namespace && s.name == name)
+            .map(|(oid, _)| *oid)
+    };
+    let mut rows = Vec::new();
+    for (oid, schema) in relations {
+        if let Some(part) = &schema.partition_of
+            && let Some(parent) = parent_oid(&part.parent_namespace, &part.parent_name)
+        {
+            rows.push(vec![
+                Value::Oid(*oid),
+                Value::Oid(parent),
+                Value::Int4(1),
+                Value::Bool(false),
+            ]);
+        }
+    }
+    rows
+}
+
+/// `pg_catalog.pg_partitioned_table` — one row per partitioned (parent) table,
+/// describing its partition key. A curated subset: `partdefid` (the default
+/// partition) is always 0 and the class/collation/expression vectors are omitted.
+pub fn pg_partitioned_table_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_partitioned_table",
+        "pg_catalog",
+        vec![
+            col("partrelid", PgType::Oid),
+            col("partstrat", CHARLIKE),
+            col("partnatts", PgType::Int2),
+            col("partdefid", PgType::Oid),
+            // PG types this `int2vector`; we render the 1-based key attnums as the
+            // same space-separated text `int2vectorout` produces.
+            col("partattrs", PgType::Text),
+        ],
+    )
+}
+
+/// One `pg_partitioned_table` row per partitioned parent.
+pub fn pg_partitioned_table_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    for (oid, schema) in relations {
+        if let Some(scheme) = &schema.partition_scheme {
+            let strat = match scheme.strategy {
+                PartitionStrategy::Range => "r",
+            };
+            let attrs = scheme
+                .key_columns
+                .iter()
+                .map(|i| (i + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            rows.push(vec![
+                Value::Oid(*oid),
+                Value::Text(strat.to_string()),
+                Value::Int2(scheme.key_columns.len() as i16),
+                Value::Oid(0),
+                Value::Text(attrs),
+            ]);
+        }
+    }
     rows
 }
 
 /// `pg_catalog.pg_attribute` — a curated subset of columns for user relations'
 /// columns. System (negative `attnum`) columns are not emitted yet.
 pub fn pg_attribute_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_attribute".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_attribute",
+        "pg_catalog",
+        vec![
             col("attrelid", PgType::Oid),
             col("attname", PgType::Name),
             col("atttypid", PgType::Oid),
@@ -360,7 +454,7 @@ pub fn pg_attribute_schema() -> TableSchema {
             col("atthasdef", PgType::Bool),
             col("attisdropped", PgType::Bool),
         ],
-    }
+    )
 }
 
 /// Build `pg_attribute` rows: one per column of each relation, `attnum` 1-based
@@ -405,16 +499,16 @@ pub fn pg_attribute_rows(
 }
 
 pub fn pg_attrdef_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_attrdef".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_attrdef",
+        "pg_catalog",
+        vec![
             col("oid", PgType::Oid),
             col("adrelid", PgType::Oid),
             col("adnum", PgType::Int2),
             col("adbin", PgType::Text),
         ],
-    }
+    )
 }
 
 pub fn pg_attrdef_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
@@ -437,10 +531,10 @@ pub fn pg_attrdef_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
 }
 
 pub fn pg_constraint_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_constraint".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_constraint",
+        "pg_catalog",
+        vec![
             col("oid", PgType::Oid),
             col("conname", PgType::Name),
             col("connamespace", PgType::Oid),
@@ -453,7 +547,7 @@ pub fn pg_constraint_schema() -> TableSchema {
             // int2[] is represented as PG array text until catalog arrays land.
             col("conkey", PgType::Text),
         ],
-    }
+    )
 }
 
 pub fn pg_constraint_rows(
@@ -536,10 +630,10 @@ fn constraint_row(
 }
 
 pub fn pg_index_schema() -> TableSchema {
-    TableSchema {
-        name: "pg_index".to_string(),
-        namespace: "pg_catalog".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "pg_index",
+        "pg_catalog",
+        vec![
             col("indexrelid", PgType::Oid),
             col("indrelid", PgType::Oid),
             col("indnatts", PgType::Int2),
@@ -552,7 +646,7 @@ pub fn pg_index_schema() -> TableSchema {
             col("indkey", PgType::Text),
             col("indoption", PgType::Text),
         ],
-    }
+    )
 }
 
 pub fn pg_index_rows(indexes: &[CatalogIndex]) -> Vec<Vec<Value>> {
@@ -628,10 +722,10 @@ pub fn pg_namespace_rows(user_schemas: &[(String, u32)]) -> Vec<Vec<Value>> {
 /// `information_schema.schemata`. Information-schema domains are represented
 /// as text until the engine supports domains over the built-in types.
 pub fn information_schema_schemata_schema() -> TableSchema {
-    TableSchema {
-        name: "schemata".to_string(),
-        namespace: "information_schema".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "schemata",
+        "information_schema",
+        vec![
             col("catalog_name", PgType::Text),
             col("schema_name", PgType::Text),
             col("schema_owner", PgType::Text),
@@ -640,7 +734,7 @@ pub fn information_schema_schemata_schema() -> TableSchema {
             col("default_character_set_name", PgType::Text),
             col("sql_path", PgType::Text),
         ],
-    }
+    )
 }
 
 pub fn information_schema_schemata_rows(
@@ -687,10 +781,10 @@ pub fn information_schema_schemata_rows(
 /// information-schema implementation relations are deliberately not invented:
 /// their complete PostgreSQL metadata is not modeled yet.
 pub fn information_schema_tables_schema() -> TableSchema {
-    TableSchema {
-        name: "tables".to_string(),
-        namespace: "information_schema".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "tables",
+        "information_schema",
+        vec![
             col("table_catalog", PgType::Text),
             col("table_schema", PgType::Text),
             col("table_name", PgType::Text),
@@ -704,7 +798,7 @@ pub fn information_schema_tables_schema() -> TableSchema {
             col("is_typed", PgType::Text),
             col("commit_action", PgType::Text),
         ],
-    }
+    )
 }
 
 pub fn information_schema_tables_rows(
@@ -725,6 +819,8 @@ pub fn information_schema_tables_rows(
                         (RelKind::View, _) => "VIEW",
                         (RelKind::Table, true) => "LOCAL TEMPORARY",
                         (RelKind::Table, false) => "BASE TABLE",
+                        // A partitioned parent reflects as BASE TABLE, as in PG.
+                        (RelKind::PartitionedTable, _) => "BASE TABLE",
                         (RelKind::Sequence, _) => unreachable!("filtered out above"),
                     }
                     .to_string(),
@@ -746,10 +842,10 @@ pub fn information_schema_tables_rows(
 pub fn information_schema_columns_schema() -> TableSchema {
     let text = PgType::Text;
     let cardinal = PgType::Int4;
-    TableSchema {
-        name: "columns".to_string(),
-        namespace: "information_schema".to_string(),
-        columns: vec![
+    TableSchema::in_namespace(
+        "columns",
+        "information_schema",
+        vec![
             col("table_catalog", text),
             col("table_schema", text),
             col("table_name", text),
@@ -795,7 +891,7 @@ pub fn information_schema_columns_schema() -> TableSchema {
             col("generation_expression", text),
             col("is_updatable", text),
         ],
-    }
+    )
 }
 
 pub fn information_schema_columns_rows(

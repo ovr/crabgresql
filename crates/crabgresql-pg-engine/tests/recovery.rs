@@ -15,14 +15,13 @@ mod common;
 use common::{corrupt_page_byte, open, try_open};
 
 fn schema() -> TableSchema {
-    TableSchema {
-        name: "t".to_string(),
-        namespace: "public".to_string(),
-        columns: vec![
+    TableSchema::new(
+        "t",
+        vec![
             Column::new("id", PgType::Int4),
             Column::new("name", PgType::Text),
         ],
-    }
+    )
 }
 
 fn read(tm: &TransactionManager) -> TxnContext {
