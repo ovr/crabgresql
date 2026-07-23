@@ -18,6 +18,10 @@ use crabgresql_types::{PgType, oid};
 
 use crate::smgr::RelFileNode;
 
+/// One relation as reflected at startup: its name, heap relfilenode, schema, and
+/// each index paired with the relfilenode of its physical B-tree.
+type ReflectedRelation = (String, RelFileNode, TableSchema, Vec<(IndexMetadata, RelFileNode)>);
+
 const CATALOG_SUBDIR: &str = "global";
 const CATALOG_FILE: &str = "relcatalog";
 const FIRST_RELFILENODE: u32 = 1;
@@ -43,6 +47,12 @@ const NSP_MAGIC: &[u8; 4] = b"NSP1";
 /// reader that predates partitioning stops above and treats every relation as
 /// unpartitioned.
 const PART_MAGIC: &[u8; 4] = b"PART";
+/// Marks the index-relfilenode section, appended after the [`PART_MAGIC`] block —
+/// a sixth backward-compatible tail carrying the physical B-tree relfilenode of
+/// each index (zipped by position onto the metadata decoded from the `CRM1`
+/// block). A reader that predates physical indexes stops above, so every index
+/// decodes with `rel = 0` (metadata-only) — exactly today's behavior.
+const IDXR_MAGIC: &[u8; 4] = b"IXR1";
 
 struct PersistCol {
     name: String,
@@ -53,12 +63,20 @@ struct PersistCol {
     default: Option<String>,
 }
 
+/// A persisted index: its semantic metadata plus the relfilenode of its physical
+/// B-tree file. `rel == 0` means "no physical index" (a pre-B-tree catalog, or a
+/// metadata-only index) — the sentinel is safe because `FIRST_RELFILENODE` is 1.
+struct PersistIndex {
+    meta: IndexMetadata,
+    rel: u32,
+}
+
 struct PersistRel {
     name: String,
     namespace: String,
     rel: u32,
     cols: Vec<PersistCol>,
-    indexes: Vec<IndexMetadata>,
+    indexes: Vec<PersistIndex>,
     /// `Some` on a partitioned (parent) table: its partition key.
     partition_scheme: Option<PartitionScheme>,
     /// `Some` on a leaf partition: its parent and bound.
@@ -136,9 +154,10 @@ impl RelCatalog {
         })
     }
 
-    /// Every relation's `(name, relfilenode, schema)` for rebuilding the table
-    /// map at startup.
-    pub fn schemas(&self) -> Vec<(String, RelFileNode, TableSchema, Vec<IndexMetadata>)> {
+    /// Every relation's `(name, relfilenode, schema, indexes)` for rebuilding the
+    /// table map at startup. Each index carries its physical B-tree relfilenode
+    /// (`RelFileNode(0)` when metadata-only).
+    pub fn schemas(&self) -> Vec<ReflectedRelation> {
         let state = self
             .state
             .lock()
@@ -169,7 +188,10 @@ impl RelCatalog {
                         partition_scheme: r.partition_scheme.clone(),
                         partition_of: r.partition_of.clone(),
                     },
-                    r.indexes.clone(),
+                    r.indexes
+                        .iter()
+                        .map(|i| (i.meta.clone(), RelFileNode(i.rel)))
+                        .collect(),
                 )
             })
             .collect()
@@ -354,42 +376,63 @@ impl RelCatalog {
             .map(|r| RelFileNode(r.rel))
     }
 
-    /// Every live relfilenode in the catalog, for the startup orphan-file GC.
+    /// Every live relfilenode in the catalog — each table's heap file **and**
+    /// each index's physical B-tree file — for the startup orphan-file GC. Index
+    /// files must be included or `gc_orphan_relfiles` would delete them on the
+    /// next restart.
     pub fn live_relfilenodes(&self) -> Vec<u32> {
-        self.state
+        let state = self
+            .state
             .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
             .rels
             .iter()
-            .map(|r| r.rel)
+            .flat_map(|r| {
+                std::iter::once(r.rel)
+                    .chain(r.indexes.iter().map(|i| i.rel).filter(|&rel| rel != 0))
+            })
             .collect()
     }
 
+    /// Register an index on `table`, allocating and persisting a fresh relfilenode
+    /// for its physical B-tree. The counter bump and the index record are made
+    /// durable in the same locked section, so the relfilenode is never reused even
+    /// across a crash. Returns the allocated relfilenode.
     pub fn add_index_in(
         &self,
         namespace: &str,
         table: &str,
         index: IndexMetadata,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<RelFileNode> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let index_rel = state.next;
         let rel = state
             .rels
             .iter_mut()
             .find(|r| r.namespace == namespace && r.name == table)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, table))?;
-        rel.indexes.push(index);
-        self.persist(&state)
+        rel.indexes.push(PersistIndex {
+            meta: index,
+            rel: index_rel,
+        });
+        state.next += 1;
+        self.persist(&state)?;
+        Ok(RelFileNode(index_rel))
     }
 
+    /// Remove an index from `table` and persist, returning its physical B-tree
+    /// relfilenode (`None` if the index was absent, `Some(RelFileNode(0))` if it
+    /// was metadata-only) so the caller can unlink the file.
     pub fn remove_index_in(
         &self,
         namespace: &str,
         table: &str,
         index_name: &str,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Option<RelFileNode>> {
         let mut state = self
             .state
             .lock()
@@ -399,8 +442,12 @@ impl RelCatalog {
             .iter_mut()
             .find(|r| r.namespace == namespace && r.name == table)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, table))?;
-        rel.indexes.retain(|i| i.name != index_name);
-        self.persist(&state)
+        let Some(pos) = rel.indexes.iter().position(|i| i.meta.name == index_name) else {
+            return Ok(None);
+        };
+        let removed = rel.indexes.remove(pos);
+        self.persist(&state)?;
+        Ok(Some(RelFileNode(removed.rel)))
     }
 
     /// Whether a view named `name` exists in `namespace`.
@@ -709,7 +756,8 @@ fn encode(state: &State) -> Vec<u8> {
             put_opt_str(&mut out, &c.default);
         }
         out.extend_from_slice(&(r.indexes.len() as u32).to_le_bytes());
-        for index in &r.indexes {
+        for pi in &r.indexes {
+            let index = &pi.meta;
             put_str(&mut out, &index.name);
             out.push(match index.method {
                 IndexMethod::BTree => 0,
@@ -820,6 +868,18 @@ fn encode(state: &State) -> Vec<u8> {
                 put_bound_datums(&mut out, &part.bound.to);
             }
             None => out.push(0),
+        }
+    }
+    // Index relfilenodes: a sixth backward-compatible tail after the partition
+    // block. For each relation (in `rels` order) the count of its indexes then
+    // each index's physical B-tree relfilenode, zipped back onto the metadata
+    // decoded from the CRM1 block. Absent in a pre-B-tree file (all `rel = 0`).
+    out.extend_from_slice(IDXR_MAGIC);
+    out.extend_from_slice(&(state.rels.len() as u32).to_le_bytes());
+    for r in &state.rels {
+        out.extend_from_slice(&(r.indexes.len() as u32).to_le_bytes());
+        for pi in &r.indexes {
+            out.extend_from_slice(&pi.rel.to_le_bytes());
         }
     }
     out
@@ -981,13 +1041,18 @@ fn decode(bytes: &[u8]) -> State {
                         nulls_first: d.byte() != 0,
                     });
                 }
-                rels[relpos].indexes.push(IndexMetadata {
-                    name,
-                    method,
-                    keys,
-                    unique,
-                    nulls_distinct,
-                    constraint,
+                rels[relpos].indexes.push(PersistIndex {
+                    meta: IndexMetadata {
+                        name,
+                        method,
+                        keys,
+                        unique,
+                        nulls_distinct,
+                        constraint,
+                    },
+                    // Physical relfilenode is filled from the IXR1 tail below;
+                    // 0 (metadata-only) if that tail is absent (legacy file).
+                    rel: 0,
                 });
             }
         }
@@ -1122,6 +1187,22 @@ fn decode(bytes: &[u8]) -> State {
             }
         }
     }
+    // Index-relfilenode tail: each index's physical B-tree relfilenode, zipped
+    // back onto the metadata already decoded from CRM1 (by position within each
+    // relation). Absent in a pre-B-tree file — every index keeps `rel = 0`.
+    if d.remaining().starts_with(IDXR_MAGIC) {
+        d.p += IDXR_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            let nindexes = d.u32();
+            for i in 0..nindexes as usize {
+                let rel = d.u32();
+                if let Some(pi) = r.indexes.get_mut(i) {
+                    pi.rel = rel;
+                }
+            }
+        }
+    }
     State {
         next,
         rels,
@@ -1247,7 +1328,10 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
         assert!(!schema.columns[0].nullable);
         assert_eq!(schema.columns[0].default.as_deref(), Some("1 + 2"));
-        assert_eq!(indexes[0].name, "t_pkey");
+        assert_eq!(indexes[0].0.name, "t_pkey");
+        // The index was allocated a physical B-tree relfilenode, distinct from
+        // the table's, and it survives the reload.
+        assert_ne!(indexes[0].1.0, 0);
 
         let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
         let bytes = std::fs::read(&path)?;
@@ -1264,6 +1348,87 @@ mod tests {
         assert!(schema.columns[0].nullable);
         assert!(schema.columns[0].default.is_none());
         assert!(indexes.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_relfilenode_survives_and_pre_btree_catalog_defaults_to_metadata_only()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new("t", vec![Column::new("id", PgType::Int4)]))?;
+        let index_rel = catalog.add_index_in(
+            "public",
+            "t",
+            IndexMetadata {
+                name: "t_id_idx".to_string(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: false,
+                nulls_distinct: true,
+                constraint: None,
+            },
+        )?;
+        assert_ne!(index_rel.0, 0);
+        assert!(catalog.live_relfilenodes().contains(&index_rel.0));
+        drop(catalog);
+
+        // Reload: the relfilenode round-trips through the IXR1 tail.
+        let loaded = RelCatalog::load(dir.path())?;
+        let (_, _, _, indexes) = loaded
+            .schemas()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
+        assert_eq!(indexes[0].1, index_rel);
+
+        // remove_index_in returns the relfilenode to unlink, then None.
+        assert_eq!(
+            loaded.remove_index_in("public", "t", "t_id_idx")?,
+            Some(index_rel)
+        );
+        assert_eq!(loaded.remove_index_in("public", "t", "t_id_idx")?, None);
+
+        // A pre-B-tree catalog (truncated at the IXR1 marker) keeps the index
+        // metadata but decodes it as metadata-only (rel == 0).
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new("u", vec![Column::new("id", PgType::Int4)]))?;
+        catalog.add_index_in(
+            "public",
+            "u",
+            IndexMetadata {
+                name: "u_id_idx".to_string(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: false,
+                nulls_distinct: true,
+                constraint: None,
+            },
+        )?;
+        drop(catalog);
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(IDXR_MAGIC.len())
+            .position(|w| w == IDXR_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("index-relfilenode marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        let (_, _, _, indexes) = legacy
+            .schemas()
+            .into_iter()
+            .find(|(name, ..)| name == "u")
+            .ok_or_else(|| anyhow::anyhow!("relation u missing"))?;
+        assert_eq!(indexes[0].0.name, "u_id_idx");
+        assert_eq!(indexes[0].1.0, 0, "legacy index decodes as metadata-only");
 
         Ok(())
     }

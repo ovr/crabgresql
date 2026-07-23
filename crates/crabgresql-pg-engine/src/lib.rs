@@ -14,11 +14,16 @@
 //! full-page writes / torn-page protection beyond page checksums, WAL segment
 //! recycling, and a transactional relation catalog.
 
+mod btkey;
+mod btpage;
+mod btrec;
+mod btredo;
 mod bufpool;
 mod catalog;
 mod datum;
 mod heap;
 mod lock;
+mod nbtree;
 mod page;
 mod rec;
 mod redo;
@@ -36,6 +41,7 @@ use crabgresql_storage_api::{
 use crabgresql_txn::{Clog, TxnFinalize, Xid};
 use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, recover, write_control};
 
+use crate::btredo::BtreeRedo;
 use crate::bufpool::BufferPool;
 use crate::catalog::RelCatalog;
 use crate::heap::HeapTable;
@@ -120,6 +126,12 @@ impl PgEngine {
         registry.register(
             RmgrId::HEAP,
             Arc::new(HeapRedo {
+                engine: Arc::clone(&inner),
+            }),
+        );
+        registry.register(
+            crate::btrec::RMGR_BTREE,
+            Arc::new(BtreeRedo {
                 engine: Arc::clone(&inner),
             }),
         );
@@ -480,10 +492,15 @@ impl TableEngine for PgEngine {
         let target = tables
             .get(&(namespace.to_string(), table.to_string()))
             .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
-        self.catalog
+        // Allocate + persist the index's own relfilenode, then build its physical
+        // B-tree from the heap (under the table's exclusive lock) and publish it.
+        // The catalog write is the durability anchor; a crash after it but before
+        // the WAL-logged build finishes leaves an orphan file reclaimed by GC.
+        let index_rel = self
+            .catalog
             .add_index_in(namespace, table, index.clone())
             .expect("relation catalog write failed");
-        target.add_index(index);
+        target.build_index(index, index_rel);
         Ok(())
     }
 
@@ -493,17 +510,29 @@ impl TableEngine for PgEngine {
         table: &str,
         index_name: &str,
     ) -> Result<(), StorageError> {
-        let tables = self
-            .tables
-            .read()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let target = tables
-            .get(&(namespace.to_string(), table.to_string()))
-            .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
-        self.catalog
-            .remove_index_in(namespace, table, index_name)
-            .expect("relation catalog write failed");
-        target.remove_index(index_name);
+        // Remove the catalog entry and unpublish the in-memory index together
+        // under the tables lock; do the physical file cleanup after releasing it
+        // (an IO error then panics only this statement, not the lock).
+        let rel = {
+            let tables = self
+                .tables
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            let target = tables
+                .get(&(namespace.to_string(), table.to_string()))
+                .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
+            let rel = self
+                .catalog
+                .remove_index_in(namespace, table, index_name)
+                .expect("relation catalog write failed");
+            target.remove_index(index_name);
+            rel
+        };
+        if let Some(rel) = rel
+            && rel.0 != 0
+        {
+            self.inner.discard_relfile(rel);
+        }
         Ok(())
     }
 

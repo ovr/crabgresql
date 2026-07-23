@@ -91,6 +91,71 @@ async fn crud_over_the_wire() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The durable engine's physical B-tree serves equality index scans end to end:
+/// `EXPLAIN` plans an Index Scan, the query returns the right row, and both the
+/// index and its correctness survive a restart (rebuilt from replayed WAL).
+#[tokio::test]
+async fn index_scan_over_the_wire_and_survives_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE TABLE t (id int, label text)")
+            .await?;
+        // Enough rows to exercise a multi-page tree after CREATE INDEX.
+        let values: String = (1..=500).map(|i| format!("({i},'r{i}')")).collect::<Vec<_>>().join(",");
+        client
+            .simple_query(&format!("INSERT INTO t VALUES {values}"))
+            .await?;
+        client.simple_query("CREATE INDEX t_id_idx ON t(id)").await?;
+
+        // EXPLAIN now plans an Index Scan on the durable engine (it did a Seq Scan
+        // before physical B-trees).
+        let msgs = client
+            .simple_query("EXPLAIN SELECT * FROM t WHERE id = 250")
+            .await?;
+        let lines: Vec<String> = rows(&msgs)
+            .iter()
+            .filter_map(|r| r.get(0).map(str::to_string))
+            .collect();
+        assert_eq!(lines[0], "Index Scan using t_id_idx on t");
+        assert!(lines.iter().any(|l| l.contains("Index Cond: (id = 250)")), "plan: {lines:?}");
+
+        // The index scan returns the correct row.
+        let msgs = client
+            .simple_query("SELECT label FROM t WHERE id = 250")
+            .await?;
+        assert_eq!(rows(&msgs)[0].get(0), Some("r250"));
+        shutdown(client, handle).await;
+    }
+
+    // Restart: the index is rebuilt from the WAL and still serves probes.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let msgs = client
+            .simple_query("EXPLAIN SELECT * FROM t WHERE id = 250")
+            .await?;
+        let lines: Vec<String> = rows(&msgs)
+            .iter()
+            .filter_map(|r| r.get(0).map(str::to_string))
+            .collect();
+        assert_eq!(lines[0], "Index Scan using t_id_idx on t");
+        let msgs = client
+            .simple_query("SELECT label FROM t WHERE id = 250")
+            .await?;
+        assert_eq!(rows(&msgs)[0].get(0), Some("r250"));
+        // A never-inserted key is empty.
+        let msgs = client
+            .simple_query("SELECT label FROM t WHERE id = 9999")
+            .await?;
+        assert!(rows(&msgs).is_empty());
+        shutdown(client, handle).await;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn committed_data_survives_restart() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

@@ -14,10 +14,13 @@ use crabgresql_storage_api::{
     DeleteResult, IndexMetadata, TableAm, TableSchema, Tid, Tuple, UpdateResult,
 };
 use crabgresql_txn::{Clog, LockOwner, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
+use crabgresql_types::Value;
 use crabgresql_wal::RmgrId;
 
 use crate::EngineInner;
+use crate::btkey;
 use crate::lock::{SharedGuard, TableLock};
+use crate::nbtree::BTree;
 use crate::page::{self, PAGE_HEADER_LEN};
 use crate::rec;
 use crate::smgr::RelFileNode;
@@ -55,7 +58,24 @@ pub struct HeapTable {
     lock: Arc<TableLock>,
     /// Last block we inserted into — where the next insert tries first.
     insert_hint: AtomicU32,
-    indexes: RwLock<Vec<IndexMetadata>>,
+    indexes: RwLock<Vec<IndexEntry>>,
+}
+
+/// One index attached to a heap table: its semantic metadata, its physical
+/// B-tree relfilenode (`RelFileNode(0)` = metadata-only, no physical scan), and
+/// the coarse latch shared by every [`BTree`] handle for that index so its
+/// operations serialize.
+struct IndexEntry {
+    meta: IndexMetadata,
+    rel: RelFileNode,
+    latch: Arc<RwLock<()>>,
+}
+
+impl IndexEntry {
+    /// Whether this index has a physical B-tree the engine can scan.
+    fn is_physical(&self, schema: &TableSchema) -> bool {
+        self.rel.0 != 0 && btkey::keys_indexable(schema, &self.meta.keys)
+    }
 }
 
 impl HeapTable {
@@ -63,8 +83,16 @@ impl HeapTable {
         engine: Arc<EngineInner>,
         rel: RelFileNode,
         schema: TableSchema,
-        indexes: Vec<IndexMetadata>,
+        indexes: Vec<(IndexMetadata, RelFileNode)>,
     ) -> HeapTable {
+        let indexes = indexes
+            .into_iter()
+            .map(|(meta, rel)| IndexEntry {
+                meta,
+                rel,
+                latch: Arc::new(RwLock::new(())),
+            })
+            .collect();
         HeapTable {
             schema,
             engine,
@@ -77,18 +105,94 @@ impl HeapTable {
         }
     }
 
-    pub fn add_index(&self, index: IndexMetadata) {
+    pub fn add_index(&self, index: IndexMetadata, rel: RelFileNode) {
         self.indexes
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .push(index);
+            .push(IndexEntry {
+                meta: index,
+                rel,
+                latch: Arc::new(RwLock::new(())),
+            });
     }
 
     pub fn remove_index(&self, index_name: &str) {
         self.indexes
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .retain(|i| i.name != index_name);
+            .retain(|i| i.meta.name != index_name);
+    }
+
+    /// Open the [`BTree`] for an index entry (shares the entry's latch).
+    fn btree(&self, entry: &IndexEntry) -> BTree {
+        BTree::open(Arc::clone(&self.engine), entry.rel, Arc::clone(&entry.latch))
+    }
+
+    /// Build the physical B-tree for a new index and publish it. Runs under the
+    /// table's exclusive lock so no concurrent writer slips between the build scan
+    /// and publication; the index becomes probe-visible only once fully built.
+    /// Every physical version is indexed (dead ones included) — probes re-check
+    /// visibility, exactly as the memory engine's build does. An index whose key
+    /// columns are not physically indexable is published metadata-only (no file,
+    /// no build), so `supports_index_scan` stays false and probes fall back.
+    pub fn build_index(&self, meta: IndexMetadata, rel: RelFileNode) {
+        if !btkey::keys_indexable(&self.schema, &meta.keys) {
+            self.add_index(meta, rel);
+            return;
+        }
+        self.lock.acquire_exclusive(LockOwner::INTERNAL);
+        let latch = Arc::new(RwLock::new(()));
+        let btree = BTree::open(Arc::clone(&self.engine), rel, Arc::clone(&latch));
+        Self::io(self.engine.bufpool.smgr().create_if_missing(rel));
+        btree.create();
+        let cols = btkey::key_columns(&meta.keys);
+        let heap_rel = RelFileNode(self.live_rel.load(Ordering::Relaxed));
+        let smgr = self.engine.bufpool.smgr();
+        let nblocks = Self::io(smgr.nblocks(heap_rel));
+        for block in 0..nblocks {
+            let page = Self::io(self.engine.bufpool.pin(heap_rel, block));
+            let rows: Vec<(Tid, Tuple)> = page.read(|pg| {
+                let mut out = Vec::new();
+                for off in 1..=page::max_offset(pg) {
+                    if let Some(bytes) = page::get_item(pg, off) {
+                        out.push((Tid { block, offset: off }, tuple::decode_tuple(bytes).1));
+                    }
+                }
+                out
+            });
+            for (tid, tuple) in rows {
+                if let Some(key) = btkey::encode_row(&self.schema, &cols, &tuple) {
+                    btree.insert(&key, tid);
+                }
+            }
+        }
+        // Make the build durable now, so the index survives a crash even with no
+        // subsequent commit — CREATE INDEX is a durable DDL, as in PostgreSQL.
+        let lsn = self.engine.wal.current_lsn();
+        Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
+        // Publish with the same latch the build used, so no maintenance window
+        // opens between the last build insert and the entry becoming visible.
+        self.indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .push(IndexEntry { meta, rel, latch });
+        self.lock.release_exclusive(LockOwner::INTERNAL);
+    }
+
+    /// Add a `key -> tid` entry to every physical index for a newly placed
+    /// version. A row whose key column is NULL or an un-indexable value is simply
+    /// not indexed (its key never satisfies equality), matching the memory engine.
+    fn maintain_insert(&self, tuple: &Tuple, tid: Tid) {
+        let indexes = self.indexes.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
+        for entry in indexes.iter() {
+            if !entry.is_physical(&self.schema) {
+                continue;
+            }
+            let cols = btkey::key_columns(&entry.meta.keys);
+            if let Some(key) = btkey::encode_row(&self.schema, &cols, tuple) {
+                self.btree(entry).insert(&key, tid);
+            }
+        }
     }
 
     #[allow(dead_code)] // used by tooling/tests and future index AM wiring
@@ -269,7 +373,56 @@ impl TableAm for HeapTable {
         self.indexes
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .clone()
+            .iter()
+            .map(|e| e.meta.clone())
+            .collect()
+    }
+
+    fn supports_index_scan(&self, index_name: &str) -> bool {
+        self.indexes
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .iter()
+            .any(|e| e.meta.name == index_name && e.is_physical(&self.schema))
+    }
+
+    /// Probe the physical B-tree `index_name` for versions whose key equals
+    /// `key`, returning those visible to `txn`. `None` (caller falls back to a
+    /// scan) when the index is absent or has no physical B-tree; `Some(empty)`
+    /// when it is served but nothing matches (including a NULL probe key, which
+    /// never satisfies equality). Visibility is decided by re-fetching each heap
+    /// tuple through [`TableAm::fetch`] — the index entry is never trusted for
+    /// visibility, exactly like a PostgreSQL secondary index.
+    fn index_lookup(
+        &self,
+        index_name: &str,
+        key: &[Value],
+        txn: &TxnContext,
+    ) -> Option<Box<dyn Iterator<Item = (Tid, Tuple)> + Send>> {
+        let (rel, latch, cols) = {
+            let indexes = self.indexes.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
+            let entry = indexes.iter().find(|e| e.meta.name == index_name)?;
+            if !entry.is_physical(&self.schema) {
+                return None;
+            }
+            (
+                entry.rel,
+                Arc::clone(&entry.latch),
+                btkey::key_columns(&entry.meta.keys),
+            )
+        };
+        let Some(kb) = btkey::encode_values(&self.schema, &cols, key) else {
+            // A NULL (or otherwise un-encodable) probe key: served, no match.
+            return Some(Box::new(std::iter::empty()));
+        };
+        let tids = BTree::open(Arc::clone(&self.engine), rel, latch).search_equal(&kb);
+        let mut out = Vec::new();
+        for tid in tids {
+            if let Some(tuple) = self.fetch(tid, txn) {
+                out.push((tid, tuple));
+            }
+        }
+        Some(Box::new(out.into_iter()))
     }
 
     fn scan(&self, txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
@@ -321,7 +474,9 @@ impl TableAm for HeapTable {
                 offset: 0,
             },
         );
-        self.place(rel, txn.xid, &bytes)
+        let tid = self.place(rel, txn.xid, &bytes);
+        self.maintain_insert(&tuple, tid);
+        tid
     }
 
     fn update(&self, tid: Tid, tuple: Tuple, txn: &TxnContext) -> UpdateResult {
@@ -348,7 +503,11 @@ impl TableAm for HeapTable {
                 offset: 0,
             },
         );
-        self.place(rel, txn.xid, &new_bytes);
+        // Index only the new version's key; the old version's entry stays and is
+        // filtered by MVCC at probe time (reclaimed by vacuum), matching the
+        // memory engine's append-only maintenance.
+        let new_tid = self.place(rel, txn.xid, &new_bytes);
+        self.maintain_insert(&tuple, new_tid);
         UpdateResult::Updated
     }
 
@@ -424,21 +583,44 @@ impl TableAm for HeapTable {
         // Vacuum reclaims committed-dead versions from the committed file.
         let _guard = self.lock.acquire_shared(LockOwner::INTERNAL);
         let rel = RelFileNode(self.live_rel.load(Ordering::Relaxed));
+        // Snapshot the physical indexes so each reclaimed version's index entry
+        // can be removed too — otherwise a stale `key -> tid` would point at a
+        // heap slot that a later insert reuses, yielding wrong rows.
+        let phys: Vec<(RelFileNode, Arc<RwLock<()>>, Vec<usize>)> = self
+            .indexes
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .iter()
+            .filter(|e| e.is_physical(&self.schema))
+            .map(|e| {
+                (
+                    e.rel,
+                    Arc::clone(&e.latch),
+                    btkey::key_columns(&e.meta.keys),
+                )
+            })
+            .collect();
         let smgr = self.engine.bufpool.smgr();
         let nblocks = Self::io(smgr.nblocks(rel));
         for block in 0..nblocks {
             let page = Self::io(self.engine.bufpool.pin(rel, block));
-            let freed: Vec<u16> = page.read(|pg| {
+            // Collect the offsets to free and, when indexes exist, the version's
+            // values so its index entries can be deleted.
+            let (freed, victims): (Vec<u16>, Vec<(Tid, Tuple)>) = page.read(|pg| {
                 let mut offs = Vec::new();
+                let mut victims = Vec::new();
                 for off in 1..=page::max_offset(pg) {
                     if let Some(bytes) = page::get_item(pg, off) {
                         let xmax = tuple::decode_header(bytes).hdr.xmax;
                         if xmax.is_valid() && xmax < oldest && clog.is_committed(xmax) {
                             offs.push(off);
+                            if !phys.is_empty() {
+                                victims.push((Tid { block, offset: off }, tuple::decode_tuple(bytes).1));
+                            }
                         }
                     }
                 }
-                offs
+                (offs, victims)
             });
             if freed.is_empty() {
                 continue;
@@ -456,6 +638,16 @@ impl TableAm for HeapTable {
                 );
                 page::set_lsn(pg, lsn.0);
             });
+            // Remove each reclaimed version's index entries (after the heap slot
+            // is freed; the B-tree keys on the index relfilenode, not this heap).
+            for (tid, tuple) in &victims {
+                for (irel, latch, cols) in &phys {
+                    if let Some(key) = btkey::encode_row(&self.schema, cols, tuple) {
+                        BTree::open(Arc::clone(&self.engine), *irel, Arc::clone(latch))
+                            .delete(&key, *tid);
+                    }
+                }
+            }
         }
     }
 }
