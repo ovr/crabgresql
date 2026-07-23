@@ -25,7 +25,7 @@ use crabgresql_planner::{
     HashKey, PhysicalAggInput, PhysicalInsertSource, PhysicalJoinExpr, PhysicalJoinInput,
     PhysicalPlan,
 };
-use crabgresql_storage_api::{IndexMetadata, TableAm, Tid, Tuple};
+use crabgresql_storage_api::{IndexMetadata, PartitionBoundDatum, TableAm, TableSchema, Tid, Tuple};
 use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
 
@@ -1186,6 +1186,11 @@ fn validate_constraints<'a>(
         }
     }
 
+    // Order matches PostgreSQL's observable behavior: a not-null violation (above)
+    // is reported before a partition-constraint violation, which is reported
+    // before a unique-key violation (checked below).
+    check_partition_bound(schema, tuple, ctx)?;
+
     let existing: Vec<&Tuple> = existing.collect();
     for index in table.indexes().iter().filter(|index| index.unique) {
         if unique_key_skipped(index, tuple) {
@@ -1218,6 +1223,64 @@ fn validate_constraints<'a>(
         }
     }
     Ok(())
+}
+
+/// Enforce a leaf partition's RANGE bound against a fully-formed row. A key
+/// value outside `[from, to)` — or a NULL key, which no range partition admits —
+/// is rejected with 23514, matching PostgreSQL's observable behavior (error text
+/// and SQLSTATE) for a direct INSERT/UPDATE into a partition. A non-partition
+/// relation (`None`) passes; the partitioned parent, which would route the row,
+/// is rejected in the binder before it ever reaches here.
+fn check_partition_bound(
+    schema: &TableSchema,
+    tuple: &Tuple,
+    ctx: &ExecContext,
+) -> Result<(), ExecError> {
+    let Some(part) = &schema.partition_of else {
+        return Ok(());
+    };
+    // Only single-column RANGE partitions exist (enforced at DDL time), and the
+    // key column type is DDL-guaranteed orderable, so `compare_values` is safe.
+    let col = part.key_columns[0];
+    let ty = schema.columns[col].ty;
+    let key = &tuple[col];
+    let admitted = !matches!(key, Value::Null)
+        && lower_admits(&part.bound.from[0], ty, key)
+        && upper_admits(&part.bound.to[0], ty, key);
+    if !admitted {
+        return Err(ExecError::new(
+            "23514",
+            format!(
+                "new row for relation \"{}\" violates partition constraint",
+                schema.name
+            ),
+        )
+        .with_detail(Some(format!(
+            "Failing row contains ({}).",
+            display_tuple(tuple, ctx)
+        ))));
+    }
+    Ok(())
+}
+
+/// The inclusive lower bound admits `key` when `key >= from` (or the bound is
+/// `MINVALUE`). `MAXVALUE` as a lower bound admits nothing.
+fn lower_admits(from: &PartitionBoundDatum, ty: PgType, key: &Value) -> bool {
+    match from {
+        PartitionBoundDatum::MinValue => true,
+        PartitionBoundDatum::MaxValue => false,
+        PartitionBoundDatum::Value(v) => compare_values(ty, key, v) != Ordering::Less,
+    }
+}
+
+/// The exclusive upper bound admits `key` when `key < to` (or the bound is
+/// `MAXVALUE`). `MINVALUE` as an upper bound admits nothing.
+fn upper_admits(to: &PartitionBoundDatum, ty: PgType, key: &Value) -> bool {
+    match to {
+        PartitionBoundDatum::MaxValue => true,
+        PartitionBoundDatum::MinValue => false,
+        PartitionBoundDatum::Value(v) => compare_values(ty, key, v) == Ordering::Less,
+    }
 }
 
 fn unique_key_skipped(index: &IndexMetadata, tuple: &Tuple) -> bool {
@@ -1258,10 +1321,28 @@ fn display_value(value: &Value, ctx: &ExecContext) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+/// PostgreSQL renders each column of a "Failing row contains (...)" DETAIL with a
+/// 64-byte field limit: a longer value is clipped on a character boundary and
+/// `...` appended. Match that so the DETAIL stays byte-identical to PG's.
+const FAILING_ROW_FIELD_MAXLEN: usize = 64;
+
+fn clip_failing_row_field(mut s: String) -> String {
+    if s.len() <= FAILING_ROW_FIELD_MAXLEN {
+        return s;
+    }
+    let mut end = FAILING_ROW_FIELD_MAXLEN;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str("...");
+    s
+}
+
 fn display_tuple(tuple: &Tuple, ctx: &ExecContext) -> String {
     tuple
         .iter()
-        .map(|value| display_value(value, ctx))
+        .map(|value| clip_failing_row_field(display_value(value, ctx)))
         .collect::<Vec<_>>()
         .join(", ")
 }

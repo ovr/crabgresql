@@ -4369,3 +4369,125 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn range_partitioning_enforces_leaf_bounds() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE m (id int, d date) PARTITION BY RANGE (d)")
+        .await?;
+    client
+        .simple_query(
+            "CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+        )
+        .await?;
+
+    // A key inside [from, to) inserts directly into the leaf; the lower bound is
+    // inclusive, so exactly '2024-01-01' is admitted.
+    client
+        .simple_query("INSERT INTO m_2024 VALUES (1, '2024-06-01')")
+        .await?;
+    client
+        .simple_query("INSERT INTO m_2024 VALUES (2, '2024-01-01')")
+        .await?;
+
+    // A key below the leaf's range is rejected (23514), with PG's message and
+    // the failing row (all columns, in schema order) in the DETAIL line.
+    let err = client
+        .simple_query("INSERT INTO m_2024 VALUES (3, '2023-03-01')")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "new row for relation \"m_2024\" violates partition constraint"
+    );
+    assert_eq!(db.detail(), Some("Failing row contains (3, 2023-03-01)."));
+
+    // The upper bound is exclusive: exactly '2025-01-01' is rejected.
+    let err = client
+        .simple_query("INSERT INTO m_2024 VALUES (4, '2025-01-01')")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::CHECK_VIOLATION
+    );
+
+    // A NULL partition key has no place in any range partition (23514).
+    let err = client
+        .simple_query("INSERT INTO m_2024 VALUES (5, NULL)")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
+    assert_eq!(db.detail(), Some("Failing row contains (5, null)."));
+
+    // Only the two admitted rows landed; the rejected inserts wrote nothing.
+    let msgs = client.simple_query("SELECT count(*) FROM m_2024").await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("2"));
+
+    // An UPDATE that moves a row's key out of the leaf's range is rejected too
+    // (the check is shared with INSERT).
+    let err = client
+        .simple_query("UPDATE m_2024 SET d = '2030-01-01' WHERE id = 1")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::CHECK_VIOLATION
+    );
+
+    // An unbounded (MINVALUE) leaf admits its open end but still rejects the
+    // other side of its bound.
+    client
+        .simple_query(
+            "CREATE TABLE m_early PARTITION OF m FOR VALUES FROM (MINVALUE) TO ('2024-01-01')",
+        )
+        .await?;
+    client
+        .simple_query("INSERT INTO m_early VALUES (6, '1900-01-01')")
+        .await?;
+    let err = client
+        .simple_query("INSERT INTO m_early VALUES (7, '2024-06-01')")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::CHECK_VIOLATION
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_partitioning_detail_clips_long_field() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE tp (k text) PARTITION BY RANGE (k)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE tp_ab PARTITION OF tp FOR VALUES FROM ('a') TO ('b')")
+        .await?;
+
+    // A failing-row field longer than 64 bytes is clipped to 64 characters with
+    // `...` appended in the DETAIL, matching PostgreSQL's per-column field limit.
+    let long = "z".repeat(70);
+    let err = client
+        .simple_query(&format!("INSERT INTO tp_ab VALUES ('{long}')"))
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
+    assert_eq!(
+        db.detail(),
+        Some(format!("Failing row contains ({}...).", "z".repeat(64)).as_str())
+    );
+
+    Ok(())
+}
