@@ -2093,6 +2093,8 @@ fn build_partition_scheme(
     };
     // A RANGE key must be a btree-orderable type; otherwise bound comparison
     // would later panic in `compare_values`. PG rejects the same at parent create.
+    // (A user type can only reach here as an enum — non-enum user types are
+    // rejected as column types upstream — and enums are orderable.)
     if !crabgresql_executor::is_orderable(columns[idx].ty) {
         return Err(PgError::new(
             sqlstate::UNDEFINED_OBJECT,

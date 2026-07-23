@@ -1186,8 +1186,9 @@ fn validate_constraints<'a>(
         }
     }
 
-    // Matches PG's order: ExecConstraints (NOT NULL above) → ExecPartitionCheck
-    // → index/UNIQUE (below).
+    // Order matches PostgreSQL's observable behavior: a not-null violation (above)
+    // is reported before a partition-constraint violation, which is reported
+    // before a unique-key violation (checked below).
     check_partition_bound(schema, tuple, ctx)?;
 
     let existing: Vec<&Tuple> = existing.collect();
@@ -1226,10 +1227,10 @@ fn validate_constraints<'a>(
 
 /// Enforce a leaf partition's RANGE bound against a fully-formed row. A key
 /// value outside `[from, to)` — or a NULL key, which no range partition admits —
-/// is rejected with 23514, mirroring PostgreSQL's `ExecPartitionCheck` for a
-/// direct INSERT/UPDATE into a partition. A non-partition relation (`None`)
-/// passes; the partitioned parent, which would route the row, is rejected in the
-/// binder before it ever reaches here.
+/// is rejected with 23514, matching PostgreSQL's observable behavior (error text
+/// and SQLSTATE) for a direct INSERT/UPDATE into a partition. A non-partition
+/// relation (`None`) passes; the partitioned parent, which would route the row,
+/// is rejected in the binder before it ever reaches here.
 fn check_partition_bound(
     schema: &TableSchema,
     tuple: &Tuple,
@@ -1320,10 +1321,28 @@ fn display_value(value: &Value, ctx: &ExecContext) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+/// PostgreSQL renders each column of a "Failing row contains (...)" DETAIL with a
+/// 64-byte field limit: a longer value is clipped on a character boundary and
+/// `...` appended. Match that so the DETAIL stays byte-identical to PG's.
+const FAILING_ROW_FIELD_MAXLEN: usize = 64;
+
+fn clip_failing_row_field(mut s: String) -> String {
+    if s.len() <= FAILING_ROW_FIELD_MAXLEN {
+        return s;
+    }
+    let mut end = FAILING_ROW_FIELD_MAXLEN;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str("...");
+    s
+}
+
 fn display_tuple(tuple: &Tuple, ctx: &ExecContext) -> String {
     tuple
         .iter()
-        .map(|value| display_value(value, ctx))
+        .map(|value| clip_failing_row_field(display_value(value, ctx)))
         .collect::<Vec<_>>()
         .join(", ")
 }

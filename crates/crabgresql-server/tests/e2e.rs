@@ -4462,3 +4462,32 @@ async fn range_partitioning_enforces_leaf_bounds() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn range_partitioning_detail_clips_long_field() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE tp (k text) PARTITION BY RANGE (k)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE tp_ab PARTITION OF tp FOR VALUES FROM ('a') TO ('b')")
+        .await?;
+
+    // A failing-row field longer than 64 bytes is clipped to 64 characters with
+    // `...` appended in the DETAIL, matching PostgreSQL's per-column field limit.
+    let long = "z".repeat(70);
+    let err = client
+        .simple_query(&format!("INSERT INTO tp_ab VALUES ('{long}')"))
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
+    assert_eq!(
+        db.detail(),
+        Some(format!("Failing row contains ({}...).", "z".repeat(64)).as_str())
+    );
+
+    Ok(())
+}
