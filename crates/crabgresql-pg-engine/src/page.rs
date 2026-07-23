@@ -288,8 +288,10 @@ pub fn compact(p: &mut Page) {
             live.push((off, p[start..start + id.len() as usize].to_vec()));
         }
     }
-    // Rewrite the tuple area from the end.
-    let mut cur_upper = BLCKSZ;
+    // Rewrite the tuple area from the end of the tuple region — the start of the
+    // special space, not BLCKSZ — so a page that reserves special space (a B-tree
+    // page) is never corrupted by repacking over its sibling/level metadata.
+    let mut cur_upper = rd_u16(p, OFF_SPECIAL) as usize;
     for (off, bytes) in &live {
         cur_upper -= bytes.len();
         p[cur_upper..cur_upper + bytes.len()].copy_from_slice(bytes);

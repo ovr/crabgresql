@@ -492,15 +492,24 @@ impl TableEngine for PgEngine {
         let target = tables
             .get(&(namespace.to_string(), table.to_string()))
             .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
-        // Allocate + persist the index's own relfilenode, then build its physical
-        // B-tree from the heap (under the table's exclusive lock) and publish it.
-        // The catalog write is the durability anchor; a crash after it but before
-        // the WAL-logged build finishes leaves an orphan file reclaimed by GC.
-        let index_rel = self
-            .catalog
-            .add_index_in(namespace, table, index.clone())
+        // Allocate a relfilenode only for a physical index; metadata-only indexes
+        // stay at relfilenode 0 (no file, no burned id).
+        let index_rel = if target.can_index(&index) {
+            self.catalog.alloc_relfilenode()
+        } else {
+            RelFileNode(0)
+        };
+        // Build the B-tree and make its WAL durable FIRST, then commit the catalog
+        // record. Ordering matters for crash safety: if we persisted the catalog
+        // first, a crash before the build's WAL flush would leave a durable index
+        // record pointing at a B-tree that was never made durable, and the first
+        // probe would fault on its missing meta page. With this order, a crash
+        // before the catalog write leaves only an orphan file, which the startup
+        // GC reclaims (it is not yet in the catalog's live set).
+        target.build_index(index.clone(), index_rel);
+        self.catalog
+            .add_index_in(namespace, table, index, index_rel)
             .expect("relation catalog write failed");
-        target.build_index(index, index_rel);
         Ok(())
     }
 
@@ -510,24 +519,26 @@ impl TableEngine for PgEngine {
         table: &str,
         index_name: &str,
     ) -> Result<(), StorageError> {
-        // Remove the catalog entry and unpublish the in-memory index together
-        // under the tables lock; do the physical file cleanup after releasing it
-        // (an IO error then panics only this statement, not the lock).
-        let rel = {
+        // Resolve the table handle, then unpublish + unlink under the table's
+        // exclusive lock (via begin_index_ddl) so a concurrent VACUUM or
+        // in-flight maintenance cannot still be writing the index's relfilenode
+        // while we forget/unlink it. The exclusive hold is dropped at end of scope.
+        let target = {
             let tables = self
                 .tables
                 .read()
                 .unwrap_or_else(|_| panic!("rwlock poisoned"));
-            let target = tables
+            tables
                 .get(&(namespace.to_string(), table.to_string()))
-                .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
-            let rel = self
-                .catalog
-                .remove_index_in(namespace, table, index_name)
-                .expect("relation catalog write failed");
-            target.remove_index(index_name);
-            rel
-        };
+                .cloned()
+        }
+        .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
+        let _guard = target.begin_index_ddl();
+        let rel = self
+            .catalog
+            .remove_index_in(namespace, table, index_name)
+            .expect("relation catalog write failed");
+        target.remove_index(index_name);
         if let Some(rel) = rel
             && rel.0 != 0
         {

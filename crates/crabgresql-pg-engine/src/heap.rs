@@ -123,6 +123,15 @@ impl HeapTable {
             .retain(|i| i.meta.name != index_name);
     }
 
+    /// Take the table's exclusive lock for an index DDL operation (DROP INDEX),
+    /// returning an RAII guard. Excludes concurrent readers/writers and VACUUM
+    /// (which runs as `INTERNAL`) while the index is unpublished and its file
+    /// unlinked, so no maintenance/vacuum still holding a handle writes to the
+    /// doomed relfilenode.
+    pub fn begin_index_ddl(&self) -> crate::lock::ExclusiveGuard {
+        self.lock.acquire_exclusive_guard(LockOwner::DDL)
+    }
+
     /// Open the [`BTree`] for an index entry (shares the entry's latch).
     fn btree(&self, entry: &IndexEntry) -> BTree {
         BTree::open(Arc::clone(&self.engine), entry.rel, Arc::clone(&entry.latch))
@@ -135,12 +144,24 @@ impl HeapTable {
     /// visibility, exactly as the memory engine's build does. An index whose key
     /// columns are not physically indexable is published metadata-only (no file,
     /// no build), so `supports_index_scan` stays false and probes fall back.
+    /// Whether an index over `index`'s key columns can be served by a physical
+    /// B-tree on this table (all key types order-preserving-encodable). When
+    /// false, the index is registered metadata-only (relfilenode 0).
+    pub fn can_index(&self, index: &IndexMetadata) -> bool {
+        btkey::keys_indexable(&self.schema, &index.keys)
+    }
+
     pub fn build_index(&self, meta: IndexMetadata, rel: RelFileNode) {
-        if !btkey::keys_indexable(&self.schema, &meta.keys) {
+        // A metadata-only index (relfilenode 0) has no physical B-tree to build;
+        // just publish it. `rel == 0` is the single canonical encoding of
+        // metadata-only (create_index allocates a relfilenode only when physical).
+        if rel.0 == 0 {
             self.add_index(meta, rel);
             return;
         }
-        self.lock.acquire_exclusive(LockOwner::INTERNAL);
+        // Exclude sessions AND vacuum (which runs as INTERNAL) during the build,
+        // via an RAII guard so a panic mid-build cannot leak the exclusive hold.
+        let _guard = self.lock.acquire_exclusive_guard(LockOwner::DDL);
         let latch = Arc::new(RwLock::new(()));
         let btree = BTree::open(Arc::clone(&self.engine), rel, Arc::clone(&latch));
         Self::io(self.engine.bufpool.smgr().create_if_missing(rel));
@@ -176,7 +197,7 @@ impl HeapTable {
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .push(IndexEntry { meta, rel, latch });
-        self.lock.release_exclusive(LockOwner::INTERNAL);
+        // `_guard` releases the exclusive hold here (or on an unwinding panic).
     }
 
     /// Add a `key -> tid` entry to every physical index for a newly placed
@@ -625,6 +646,19 @@ impl TableAm for HeapTable {
             if freed.is_empty() {
                 continue;
             }
+            // Remove each reclaimed version's index entries BEFORE freeing the heap
+            // slots (PostgreSQL's two-pass order). If the slot were freed first, a
+            // concurrent insert could reuse the offset before its stale `key -> tid`
+            // entry is gone, and a probe would then return the reused row for the
+            // old key. Deleting entries first closes that window.
+            for (tid, tuple) in &victims {
+                for (irel, latch, cols) in &phys {
+                    if let Some(key) = btkey::encode_row(&self.schema, cols, tuple) {
+                        BTree::open(Arc::clone(&self.engine), *irel, Arc::clone(latch))
+                            .delete(&key, *tid);
+                    }
+                }
+            }
             page.modify(|pg| {
                 for &off in &freed {
                     page::set_flags(pg, off, page::LP_UNUSED);
@@ -638,16 +672,6 @@ impl TableAm for HeapTable {
                 );
                 page::set_lsn(pg, lsn.0);
             });
-            // Remove each reclaimed version's index entries (after the heap slot
-            // is freed; the B-tree keys on the index relfilenode, not this heap).
-            for (tid, tuple) in &victims {
-                for (irel, latch, cols) in &phys {
-                    if let Some(key) = btkey::encode_row(&self.schema, cols, tuple) {
-                        BTree::open(Arc::clone(&self.engine), *irel, Arc::clone(latch))
-                            .delete(&key, *tid);
-                    }
-                }
-            }
         }
     }
 }

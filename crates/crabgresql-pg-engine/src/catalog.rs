@@ -395,33 +395,36 @@ impl RelCatalog {
             .collect()
     }
 
-    /// Register an index on `table`, allocating and persisting a fresh relfilenode
-    /// for its physical B-tree. The counter bump and the index record are made
-    /// durable in the same locked section, so the relfilenode is never reused even
-    /// across a crash. Returns the allocated relfilenode.
+    /// Record an index on `table` with the (already allocated) relfilenode `rel`
+    /// of its physical B-tree (`RelFileNode(0)` for a metadata-only index), then
+    /// persist. Persisting the catalog record is the durability commit point for
+    /// CREATE INDEX, so the caller must build and WAL-flush the B-tree *before*
+    /// calling this — otherwise a crash could leave a durable index record whose
+    /// B-tree was never made durable. Keeps `next` above `rel` so the relfilenode
+    /// is never reused.
     pub fn add_index_in(
         &self,
         namespace: &str,
         table: &str,
         index: IndexMetadata,
-    ) -> std::io::Result<RelFileNode> {
+        rel: RelFileNode,
+    ) -> std::io::Result<()> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let index_rel = state.next;
-        let rel = state
+        state.next = state.next.max(rel.0.saturating_add(1));
+        let target = state
             .rels
             .iter_mut()
             .find(|r| r.namespace == namespace && r.name == table)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, table))?;
-        rel.indexes.push(PersistIndex {
+        target.indexes.push(PersistIndex {
             meta: index,
-            rel: index_rel,
+            rel: rel.0,
         });
-        state.next += 1;
         self.persist(&state)?;
-        Ok(RelFileNode(index_rel))
+        Ok(())
     }
 
     /// Remove an index from `table` and persist, returning its physical B-tree
@@ -1303,6 +1306,7 @@ mod tests {
         id.nullable = false;
         id.default = Some("1 + 2".to_string());
         catalog.create(&TableSchema::new("t", vec![id]))?;
+        let index_rel = catalog.alloc_relfilenode();
         catalog.add_index_in(
             "public",
             "t",
@@ -1318,6 +1322,7 @@ mod tests {
                 nulls_distinct: true,
                 constraint: Some(IndexConstraint::PrimaryKey),
             },
+            index_rel,
         )?;
         drop(catalog);
 
@@ -1358,7 +1363,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
         catalog.create(&TableSchema::new("t", vec![Column::new("id", PgType::Int4)]))?;
-        let index_rel = catalog.add_index_in(
+        let index_rel = catalog.alloc_relfilenode();
+        catalog.add_index_in(
             "public",
             "t",
             IndexMetadata {
@@ -1373,6 +1379,7 @@ mod tests {
                 nulls_distinct: true,
                 constraint: None,
             },
+            index_rel,
         )?;
         assert_ne!(index_rel.0, 0);
         assert!(catalog.live_relfilenodes().contains(&index_rel.0));
@@ -1397,6 +1404,7 @@ mod tests {
         // metadata but decodes it as metadata-only (rel == 0).
         let catalog = RelCatalog::load(dir.path())?;
         catalog.create(&TableSchema::new("u", vec![Column::new("id", PgType::Int4)]))?;
+        let u_index_rel = catalog.alloc_relfilenode();
         catalog.add_index_in(
             "public",
             "u",
@@ -1412,6 +1420,7 @@ mod tests {
                 nulls_distinct: true,
                 constraint: None,
             },
+            u_index_rel,
         )?;
         drop(catalog);
         let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);

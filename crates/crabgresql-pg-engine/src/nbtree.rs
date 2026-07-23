@@ -31,10 +31,16 @@ use crate::smgr::RelFileNode;
 
 /// Usable bytes on a B-tree page (between the header and the special region).
 const USABLE: usize = BLCKSZ - PAGE_HEADER_LEN - btpage::BT_SPECIAL_LEN;
+/// Per-item line-pointer overhead (an `ItemId` in the slot array).
+const LP_OVERHEAD: usize = 4;
 /// Largest index item (pointer + key) accepted, matching PostgreSQL's "index row
-/// size exceeds btree maximum" cap. Chosen so a split always has a feasible point
-/// that leaves room for each half's high key.
-const BT_MAX_ITEM: usize = 2048;
+/// size exceeds btree maximum" cap. Kept at `<= (USABLE - 16) / 4` so that after
+/// folding one max-size item into a full page, [`choose_split`] always finds a
+/// split point whose feasibility window (width `>= USABLE - 3*maxsize`) is wider
+/// than a single item — guaranteeing a balanced split exists and neither half
+/// (data + its high key) can exceed [`USABLE`]. See the sizing proof in
+/// `choose_split`.
+const BT_MAX_ITEM: usize = 2000;
 
 /// A durable B-tree rooted in one index relfilenode. Cheap to construct per
 /// operation; all persistent state lives in the buffer pool / WAL keyed by `rel`.
@@ -383,6 +389,12 @@ impl BTree {
         }
         right_items.extend_from_slice(&right_data);
 
+        // Both halves (data + high key) must fit the page; the choose_split sizing
+        // proof guarantees this, so a failure here is a sizing-invariant regression
+        // (which would otherwise silently overflow the page in `put_item_at`).
+        debug_assert!(page_bytes(&left_items) <= USABLE, "btree split: left half overflows");
+        debug_assert!(page_bytes(&right_items) <= USABLE, "btree split: right half overflows");
+
         let leaf_bit = if leaf { BTP_LEAF } else { 0 };
         let left_opaque = BtOpaque {
             prev: opaque.prev,
@@ -523,6 +535,12 @@ use DeleteScan::{Continue, Done, Found};
 /// and its data items (excluding the high key).
 type PageItems = (BtOpaque, Option<Vec<u8>>, Vec<Vec<u8>>);
 
+/// Total on-page bytes a set of items occupies: each item's bytes plus its line
+/// pointer. Used only by the split fit-check debug assertions.
+fn page_bytes(items: &[Vec<u8>]) -> usize {
+    items.iter().map(|it| it.len() + LP_OVERHEAD).sum()
+}
+
 /// Read a page's opaque, its high key (if non-rightmost), and its data items
 /// (excluding the high key), each cloned out so the caller can rebuild the page.
 fn read_page_items(pg: &page::Page) -> PageItems {
@@ -541,12 +559,20 @@ fn read_page_items(pg: &page::Page) -> PageItems {
 }
 
 /// Choose a split index `p` in `[1, n-1]` that most evenly balances bytes while
-/// leaving each side room for its high key. Feasible because single items are
-/// capped at [`BT_MAX_ITEM`].
+/// leaving each side room for its high key.
+///
+/// Sizing proof (why this never fails): each `sizes[i] <= BT_MAX_ITEM + LP_OVERHEAD`.
+/// `side_cap` reserves a whole max-size item (key + its line pointer) for the high
+/// key each side carries, so any `p` with both prefix sums `<= side_cap` yields
+/// halves that fit `USABLE`. Such a `p` exists because the feasible window
+/// `[total - side_cap, side_cap]` has width `2*side_cap - total >= USABLE - 3*(BT_MAX_ITEM+LP_OVERHEAD)`,
+/// which — with `BT_MAX_ITEM <= (USABLE-16)/4` — exceeds one item's size, so a
+/// prefix boundary (steps of `<= one item`) always lands inside it.
 fn choose_split(sizes: &[usize]) -> usize {
     let n = sizes.len();
     debug_assert!(n >= 2, "cannot split a page with fewer than two items");
-    let side_cap = USABLE - BT_MAX_ITEM; // reserve room for the high key
+    // Reserve room for the high key (an item plus its line pointer) each side carries.
+    let side_cap = USABLE - (BT_MAX_ITEM + LP_OVERHEAD);
     let prefix: Vec<usize> = std::iter::once(0)
         .chain(sizes.iter().scan(0usize, |acc, &s| {
             *acc += s;

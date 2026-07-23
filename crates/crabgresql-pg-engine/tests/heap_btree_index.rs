@@ -370,6 +370,127 @@ fn drop_index_unlinks_its_file_and_relfilenodes_stay_monotonic() -> anyhow::Resu
     Ok(())
 }
 
+/// A B-tree index named `t_s_idx` on a single text column (column 0).
+fn idx_on_text() -> IndexMetadata {
+    IndexMetadata {
+        name: "t_s_idx".into(),
+        method: IndexMethod::BTree,
+        keys: vec![IndexKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }],
+        unique: false,
+        nulls_distinct: true,
+        constraint: None,
+    }
+}
+
+#[test]
+fn large_and_mixed_size_keys_split_without_panic_or_corruption() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(TableSchema::new("t", vec![Column::new("s", PgType::Text)]))?;
+    engine.create_index("public", "t", idx_on_text())?;
+
+    // Keys near the B-tree item cap (~1990 bytes), mixed with tiny keys, inserted
+    // so the byte-based split point repeatedly lands next to the sizing bound.
+    // Before the sizing fix this could panic in choose_split ("no feasible split
+    // point") or overflow a page in put_item_at.
+    let x = tm.allocate_xid();
+    let ctx = tm.context(x, CommandId::FIRST);
+    let mut keys: Vec<String> = Vec::new();
+    for i in 0..300u32 {
+        // Padding sizes chosen so the encoded item stays under the ~2000-byte cap
+        // (item = 16 + padding), while still forcing near-boundary split points.
+        let len = match i % 3 {
+            0 => 3,
+            1 => 1000,
+            _ => 1980,
+        };
+        // Unique, order-varied keys: a 6-char index prefix then padding.
+        let key = format!("{i:06}{}", "x".repeat(len));
+        keys.push(key.clone());
+        table.insert(vec![Value::Text(key)], &ctx);
+    }
+    tm.commit(x)?;
+
+    // Every key resolves to exactly one row.
+    for key in &keys {
+        let hits = table
+            .index_lookup("t_s_idx", &[Value::Text(key.clone())], &read(&tm))
+            .expect("served")
+            .count();
+        assert_eq!(hits, 1, "probe for a {}-byte key", key.len());
+    }
+    // A never-inserted key is empty.
+    assert!(
+        table
+            .index_lookup("t_s_idx", &[Value::Text("nope".into())], &read(&tm))
+            .expect("served")
+            .count()
+            == 0
+    );
+    Ok(())
+}
+
+#[test]
+fn metadata_only_index_allocates_no_file_and_no_relfilenode() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    // float8 is not order-preserving-encodable → metadata-only index.
+    let table = engine.create_table(TableSchema::new("t", vec![Column::new("f", PgType::Float8)]))?;
+    let x = tm.allocate_xid();
+    table.insert(vec![Value::Float8(1.5)], &tm.context(x, CommandId::FIRST));
+    tm.commit(x)?;
+    let before = base_files(dir.path());
+
+    engine.create_index(
+        "public",
+        "t",
+        IndexMetadata {
+            name: "t_f_idx".into(),
+            method: IndexMethod::BTree,
+            keys: vec![IndexKey { column: 0, descending: false, nulls_first: false }],
+            unique: false,
+            nulls_distinct: true,
+            constraint: None,
+        },
+    )?;
+
+    // No physical file was created for a metadata-only index (relfilenode 0).
+    assert_eq!(base_files(dir.path()), before, "metadata-only index creates no file");
+    assert!(!table.supports_index_scan("t_f_idx"));
+    Ok(())
+}
+
+#[test]
+fn oversized_key_create_index_panics_without_freezing_the_table() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(TableSchema::new("t", vec![Column::new("s", PgType::Text)]))?;
+    // A value whose encoded key exceeds the B-tree item cap.
+    let x = tm.allocate_xid();
+    table.insert(vec![Value::Text("z".repeat(4000))], &tm.context(x, CommandId::FIRST));
+    tm.commit(x)?;
+
+    // CREATE INDEX panics building the tree (index row size exceeds btree maximum).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.create_index("public", "t", idx_on_text())
+    }));
+    assert!(result.is_err(), "oversized-key CREATE INDEX should fail");
+
+    // The table's exclusive lock was released by the RAII guard during unwind, so
+    // the table is still usable (this would hang/deadlock if the lock leaked).
+    let x = tm.allocate_xid();
+    table.insert(vec![Value::Text("small".into())], &tm.context(x, CommandId::FIRST));
+    tm.commit(x)?;
+    assert_eq!(table.scan(&read(&tm)).count(), 2);
+    // The failed index was never published.
+    assert!(!table.supports_index_scan("t_s_idx"));
+    Ok(())
+}
+
 /// The relfilenode numbers of the files under `<dir>/base`.
 fn base_files(dir: &std::path::Path) -> Vec<u32> {
     let mut v: Vec<u32> = std::fs::read_dir(dir.join("base"))
