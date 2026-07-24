@@ -36,6 +36,10 @@ async fn main() -> std::io::Result<()> {
         cli.data_dir.display()
     );
     let (engine, txnmgr) = crabgresql_server::open_pg_engine(&cli.data_dir)?;
+    // Keep a handle to flush + mark a clean shutdown on Ctrl-C / SIGTERM, so
+    // unlogged tables' data is kept across the restart (a crash would leave the
+    // control file dirty and reset them).
+    let engine_for_shutdown = engine.clone();
 
     let listener = TcpListener::bind(("127.0.0.1", cli.port)).await?;
     tracing::info!(
@@ -44,5 +48,29 @@ async fn main() -> std::io::Result<()> {
         cli.port
     );
 
-    crabgresql_server::serve_with(listener, engine, txnmgr).await
+    tokio::select! {
+        result = crabgresql_server::serve_with(listener, engine, txnmgr) => result,
+        () = shutdown_signal() => {
+            tracing::info!("received shutdown signal; flushing for a clean shutdown");
+            engine_for_shutdown.shutdown();
+            Ok(())
+        }
+    }
+}
+
+/// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(term) => term,
+        Err(error) => {
+            tracing::warn!(%error, "could not install SIGTERM handler; Ctrl-C only");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
 }

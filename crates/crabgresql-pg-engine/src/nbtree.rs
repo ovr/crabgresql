@@ -50,6 +50,10 @@ pub struct BTree {
     engine: Arc<EngineInner>,
     rel: RelFileNode,
     latch: Arc<RwLock<()>>,
+    /// Whether this index's ops skip the WAL (an `Unlogged` table's index —
+    /// file-backed but WAL-silent, rebuilt on crash). `wal_append` then returns
+    /// `Lsn(0)`, exactly like `HeapTable::log`, so eviction is a no-op flush.
+    wal_skipped: bool,
 }
 
 /// The outcome of splitting one page: the separator to install in the parent and
@@ -84,15 +88,24 @@ fn cmp_route(a: (&[u8], u64), b: (&[u8], u64)) -> Ordering {
 }
 
 impl BTree {
-    pub fn open(engine: Arc<EngineInner>, rel: RelFileNode, latch: Arc<RwLock<()>>) -> BTree {
+    pub fn open(
+        engine: Arc<EngineInner>,
+        rel: RelFileNode,
+        latch: Arc<RwLock<()>>,
+        wal_skipped: bool,
+    ) -> BTree {
         BTree {
             engine,
             rel,
             latch,
+            wal_skipped,
         }
     }
 
     fn wal_append(&self, info: u8, payload: &[u8]) -> crabgresql_wal::Lsn {
+        if self.wal_skipped {
+            return crabgresql_wal::Lsn(0);
+        }
         self.engine
             .wal
             .append(RmgrId(btrec::RMGR_BTREE.0), info, Xid::INVALID, payload)
