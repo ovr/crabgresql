@@ -456,7 +456,7 @@ fn resolve_subqueries(
             resolve_opt(predicate, ctx, txn)?;
             resolve_exprs(group_exprs, ctx, txn)?;
             for agg in aggregates.iter_mut() {
-                if let Some(arg) = &mut agg.arg {
+                for arg in agg.args.iter_mut() {
                     resolve_expr(arg, ctx, txn)?;
                 }
             }
@@ -600,8 +600,8 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
                 resolve_expr(e, ctx, txn)?;
             }
         }
-        BoundExpr::Aggregate { arg, .. } => {
-            if let Some(a) = arg {
+        BoundExpr::Aggregate { args, .. } => {
+            for a in args {
                 resolve_expr(a, ctx, txn)?;
             }
         }
@@ -2608,16 +2608,23 @@ impl Aggregate {
                 .zip(group.accumulators.iter_mut())
                 .zip(group.distinct_values.iter_mut())
             {
-                match &agg.arg {
+                if agg.args.is_empty() {
                     // COUNT(*) counts every row, skipping no NULLs.
-                    None => acc.count_row(),
-                    Some(arg) => {
-                        let v = eval(arg, &row, &self.ctx)?;
-                        // Every aggregate but COUNT(*) ignores NULL inputs.
-                        if !matches!(v, Value::Null) {
-                            if distinct_values.as_mut().is_none_or(|seen| seen.insert(&v)) {
-                                acc.accumulate(v)?;
-                            }
+                    acc.count_row();
+                } else {
+                    let values = agg
+                        .args
+                        .iter()
+                        .map(|arg| eval(arg, &row, &self.ctx))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    // Every aggregate but COUNT(*) ignores rows whose value (the
+                    // first argument) is NULL.
+                    if !matches!(values[0], Value::Null) {
+                        if distinct_values
+                            .as_mut()
+                            .is_none_or(|seen| seen.insert(&values[0]))
+                        {
+                            acc.accumulate(values)?;
                         }
                     }
                 }
@@ -4018,6 +4025,46 @@ mod tests {
                 Value::Int4(20), // max(b)
                 Value::Int8(42), // sum(b): int4 widens to bigint
             ]
+        );
+    }
+
+    #[test]
+    fn string_agg_concatenates_skipping_null_values() {
+        // NULL values are skipped; a per-row NULL delimiter contributes nothing.
+        let (_c, rows) = run_rows(
+            "SELECT string_agg(x, d) FROM (VALUES ('a', ','), (NULL, '/'), ('b', NULL), ('c', '-')) t(x, d)",
+        );
+        assert_eq!(rows, vec![vec![Value::Text("ab-c".to_string())]]);
+    }
+
+    #[test]
+    fn string_agg_over_empty_group_is_null() {
+        let (_c, rows) = run_rows("SELECT string_agg(x, ',') FROM (VALUES ('a')) t(x) WHERE false");
+        assert_eq!(rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
+    fn array_upper_matches_length_on_dimension_one() {
+        let (_c, rows) = run_rows(
+            "SELECT array_upper(ARRAY[10, 20, 30], 1), array_upper('{}'::int[], 1), array_upper(ARRAY[1], 2)",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(3), Value::Null, Value::Null]]);
+    }
+
+    #[test]
+    fn array_to_string_skips_or_replaces_nulls() {
+        // Two-arg form skips NULLs; the optional third argument replaces them; a
+        // NULL delimiter yields NULL.
+        let (_c, rows) = run_rows(
+            "SELECT array_to_string(ARRAY[1, NULL, 3], ','), array_to_string(ARRAY[1, NULL, 3], ',', '*'), array_to_string(ARRAY[1, 2], NULL)",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Text("1,3".to_string()),
+                Value::Text("1,*,3".to_string()),
+                Value::Null,
+            ]]
         );
     }
 

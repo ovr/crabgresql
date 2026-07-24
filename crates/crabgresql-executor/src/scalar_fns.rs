@@ -90,6 +90,31 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 args[0].encode_text().as_deref(),
             )));
         }
+        // array_to_string is strict on the array and delimiter, but not on the
+        // optional null-string: a NULL there means NULL elements are omitted (as
+        // in the two-argument form), so it must run before the STRICT check.
+        ScalarFn::ArrayToString => {
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let delim = text(&args[1]);
+            let null_str = match args.get(2) {
+                Some(Value::Null) | None => None,
+                Some(v) => Some(text(v)),
+            };
+            let mut parts: Vec<String> = Vec::new();
+            for v in array_elems(&args[0]) {
+                match v {
+                    Value::Null => {
+                        if let Some(ns) = null_str {
+                            parts.push(ns.to_string());
+                        }
+                    }
+                    _ => parts.push(v.encode_text().unwrap_or_default()),
+                }
+            }
+            return Ok(Value::Text(parts.join(delim)));
+        }
         _ => {}
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -115,9 +140,10 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             return Ok(Value::Bool(array_contains(&args[1], &args[0])));
         }
         ScalarFn::ArrayOverlap => return Ok(Value::Bool(array_overlap(&args[0], &args[1]))),
-        ScalarFn::ArrayLength => {
-            // `array_length(arr, dim)`: only dimension 1 exists here; an empty
-            // array or any other dimension yields NULL.
+        ScalarFn::ArrayLength | ScalarFn::ArrayUpper => {
+            // `array_length(arr, dim)` / `array_upper(arr, dim)`: only dimension
+            // 1 exists here, where the 1-based upper bound equals the length. An
+            // empty array or any other dimension yields NULL.
             let elems = array_elems(&args[0]);
             return Ok(if i4(&args[1]) == 1 && !elems.is_empty() {
                 Value::Int4(elems.len() as i32)
