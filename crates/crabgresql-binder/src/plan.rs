@@ -82,6 +82,18 @@ pub enum LogicalPlan {
         tables: Vec<Arc<dyn TableAm>>,
         columns: Vec<OutputColumn>,
     },
+    /// Concatenation of two sub-plans with identical column layouts — the body of
+    /// a `UNION ALL`. Like [`Self::Append`] it carries no projection/predicate/
+    /// sort/distinct of its own: `UNION` deduplication and a top-level `ORDER BY`
+    /// are layered on by wrapping this in a [`Self::Subquery`] (all-column
+    /// `distinct` and/or `sort`). Each arm has already been coerced to `columns`
+    /// (the unified per-position types, named from the left arm), so both sides
+    /// emit rows of exactly this layout.
+    SetOp {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        columns: Vec<OutputColumn>,
+    },
     /// SELECT over a subquery source in FROM: a derived table (`(SELECT ...) s`)
     /// or a CTE reference. `source` produces the input rows; the same
     /// projection/predicate/sort pipeline as `Query` runs on top.
@@ -530,6 +542,11 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
         }
         // An Append carries only leaf table handles, no parameterizable exprs.
         LogicalPlan::Append { .. } => {}
+        // A SetOp holds no exprs of its own — recurse into both arms.
+        LogicalPlan::SetOp { left, right, .. } => {
+            substitute_params(left, params);
+            substitute_params(right, params);
+        }
         LogicalPlan::Limit { source, .. } => substitute_params(source, params),
         LogicalPlan::Aggregate {
             input,
@@ -771,6 +788,11 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
         }
         // An Append holds only leaf table handles — no correlated exprs.
         LogicalPlan::Append { .. } => {}
+        // A SetOp holds no exprs of its own — recurse into both arms.
+        LogicalPlan::SetOp { left, right, .. } => {
+            subst_outer_plan(left, outer, depth);
+            subst_outer_plan(right, outer, depth);
+        }
         LogicalPlan::Limit { source, .. } => subst_outer_plan(source, outer, depth),
         LogicalPlan::Aggregate {
             input,
@@ -1024,6 +1046,11 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
         }
         // An Append exposes no expressions of its own.
         LogicalPlan::Append { .. } => {}
+        // A SetOp exposes no expressions of its own — recurse into both arms.
+        LogicalPlan::SetOp { left, right, .. } => {
+            for_each_plan_expr(left, &mut *f);
+            for_each_plan_expr(right, &mut *f);
+        }
         LogicalPlan::Limit { source, .. } => for_each_plan_expr(source, &mut *f),
         LogicalPlan::Aggregate {
             input,
@@ -1219,6 +1246,17 @@ fn bind_query_body(
         ast::SetExpr::Table(table) => {
             bind_table_query(engine, catalog, params, table, &query.order_by, ctes)
         }
+        // UNION / UNION ALL. The whole query's ORDER BY applies above the union
+        // (a query-level clause), so it is bound here, not inside the arms.
+        set_op @ ast::SetExpr::SetOperation { .. } => bind_set_operation(
+            engine,
+            catalog,
+            params,
+            set_op,
+            &query.order_by,
+            ctes,
+            outer_scope,
+        ),
         other => Err(BindError::feature_not_supported(format!(
             "query form is not supported yet: {other}"
         ))),
@@ -1235,6 +1273,227 @@ fn bind_query_body(
         }
         None => Ok(inner),
     }
+}
+
+/// Bind a `UNION` / `UNION ALL` set operation into a [`LogicalPlan`]. The union
+/// body is a bare [`LogicalPlan::SetOp`] concatenation of the two arms (each
+/// coerced to the unified column layout); `UNION` deduplication and the
+/// query-level `ORDER BY` are layered on top by wrapping that concat in a
+/// [`LogicalPlan::Subquery`]. `INTERSECT` / `EXCEPT` are not supported yet.
+fn bind_set_operation(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+    set_expr: &ast::SetExpr,
+    order_by: &Option<ast::OrderBy>,
+    ctes: &CteEnv,
+    outer_scope: &[OuterLevel],
+) -> Result<LogicalPlan, BindError> {
+    let ast::SetExpr::SetOperation {
+        left,
+        op,
+        set_quantifier,
+        right,
+    } = set_expr
+    else {
+        unreachable!("bind_set_operation called on a non-set-operation body");
+    };
+    // Only UNION is supported; INTERSECT/EXCEPT/MINUS stay `0A000`.
+    if *op != ast::SetOperator::Union {
+        return Err(BindError::feature_not_supported(format!(
+            "{op} is not supported yet"
+        )));
+    }
+    let all = match set_quantifier {
+        ast::SetQuantifier::All => true,
+        // Bare `UNION` and explicit `UNION DISTINCT` both deduplicate.
+        ast::SetQuantifier::Distinct | ast::SetQuantifier::None => false,
+        // `UNION BY NAME` and friends are non-standard.
+        other => {
+            return Err(BindError::feature_not_supported(format!(
+                "UNION {other} is not supported yet"
+            )));
+        }
+    };
+
+    // Bind both arms (without ORDER BY — that belongs to the whole query) and
+    // reconcile their column layouts into one concat node.
+    let (left_plan, left_cols) = bind_set_tree(engine, catalog, params, left, ctes, outer_scope)?;
+    let (right_plan, right_cols) =
+        bind_set_tree(engine, catalog, params, right, ctes, outer_scope)?;
+    let (source, columns) =
+        unify_set_arms(left_plan, left_cols, right_plan, right_cols, catalog)?;
+
+    // UNION deduplicates on every output column; UNION ALL keeps duplicates.
+    let distinct = if all {
+        None
+    } else {
+        // The executor's dedup compares each key with `keys_equal`, which panics
+        // on a type it cannot order/hash — reject such a type here (as PG does
+        // with "could not identify an equality operator"), mirroring bind_distinct.
+        for col in &columns {
+            if !crate::expr::is_orderable(col.ty, catalog.as_ref()) {
+                return Err(BindError::feature_not_supported(format!(
+                    "UNION on type {} is not supported yet",
+                    crate::expr::type_label(col.ty, catalog.as_ref())
+                )));
+            }
+        }
+        Some(all_column_distinct_keys(&columns))
+    };
+
+    // A top-level ORDER BY resolves against the union's output columns only
+    // (ordinals and output-column names — `allow_hidden = false`).
+    let scope = Scope::empty(catalog, params);
+    let mut projections = identity_projections(&columns);
+    let sort = bind_order_by(order_by, &columns, &scope, &mut projections, false)?;
+
+    if distinct.is_none() && sort.is_empty() {
+        // Bare UNION ALL, no ORDER BY: the concat node is the whole plan.
+        return Ok(source);
+    }
+    Ok(LogicalPlan::Subquery {
+        source: Box::new(source),
+        columns,
+        projections,
+        predicate: None,
+        sort,
+        distinct,
+    })
+}
+
+/// Bind one arm of a set operation to a plan plus its output columns. An arm has
+/// no ORDER BY / LIMIT of its own (those are query-level), so nested SELECT /
+/// VALUES / TABLE bodies bind without one; a nested set operation recurses (and
+/// applies its own UNION deduplication), and a parenthesized subquery arm binds
+/// through the full query-body path (carrying its own ORDER BY / LIMIT).
+fn bind_set_tree(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+    arm: &ast::SetExpr,
+    ctes: &CteEnv,
+    outer_scope: &[OuterLevel],
+) -> Result<(LogicalPlan, Vec<OutputColumn>), BindError> {
+    let plan = match arm {
+        ast::SetExpr::Select(select) => {
+            reject_unsupported_select_clauses(select)?;
+            bind_select(engine, catalog, params, select, &None, ctes, outer_scope)?
+        }
+        ast::SetExpr::Values(values) => {
+            bind_values_query(catalog, params, values, &None, outer_scope)?
+        }
+        ast::SetExpr::Table(table) => bind_table_query(engine, catalog, params, table, &None, ctes)?,
+        ast::SetExpr::SetOperation { .. } => {
+            bind_set_operation(engine, catalog, params, arm, &None, ctes, outer_scope)?
+        }
+        // A parenthesized subquery arm may carry its own ORDER BY / LIMIT.
+        ast::SetExpr::Query(query) => {
+            bind_query_body(engine, catalog, params, query, ctes, outer_scope)?
+        }
+        other => {
+            return Err(BindError::feature_not_supported(format!(
+                "query form is not supported yet: {other}"
+            )));
+        }
+    };
+    let columns = output_columns_of(&plan)?;
+    Ok((plan, columns))
+}
+
+/// Reconcile two set-operation arms into one [`LogicalPlan::SetOp`]: equal arity,
+/// a per-position common type via [`merge_types`], and output names taken from
+/// the left arm (PG's rule). Each arm is coerced to that unified layout (via a
+/// wrapping Subquery of `Coerce` projections, or left untouched when it already
+/// matches) so both sides feed the concat node identical row shapes.
+fn unify_set_arms(
+    left_plan: LogicalPlan,
+    left_cols: Vec<OutputColumn>,
+    right_plan: LogicalPlan,
+    right_cols: Vec<OutputColumn>,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<(LogicalPlan, Vec<OutputColumn>), BindError> {
+    if left_cols.len() != right_cols.len() {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            "each UNION query must have the same number of columns",
+        ));
+    }
+    let mut columns = Vec::with_capacity(left_cols.len());
+    for (l, r) in left_cols.iter().zip(right_cols.iter()) {
+        let ty = merge_types(l.ty, r.ty).ok_or_else(|| {
+            BindError::new(
+                sqlstate::DATATYPE_MISMATCH,
+                format!(
+                    "UNION types {} and {} cannot be matched",
+                    crate::expr::type_label(l.ty, catalog.as_ref()),
+                    crate::expr::type_label(r.ty, catalog.as_ref()),
+                ),
+            )
+        })?;
+        // A UNION output column takes its name from the first (left) arm.
+        columns.push(OutputColumn {
+            name: l.name.clone(),
+            ty,
+        });
+    }
+    let left = coerce_set_arm(left_plan, &left_cols, &columns)?;
+    let right = coerce_set_arm(right_plan, &right_cols, &columns)?;
+    let source = LogicalPlan::SetOp {
+        left: Box::new(left),
+        right: Box::new(right),
+        columns: columns.clone(),
+    };
+    Ok((source, columns))
+}
+
+/// Coerce a set-operation arm's columns to the unified `target` layout. Returns
+/// the arm unchanged when every column type already matches; otherwise wraps it
+/// in a Subquery whose projections coerce each column (an identity `ColumnRef`
+/// where the type already matches).
+fn coerce_set_arm(
+    plan: LogicalPlan,
+    arm_cols: &[OutputColumn],
+    target: &[OutputColumn],
+) -> Result<LogicalPlan, BindError> {
+    if arm_cols.iter().zip(target).all(|(a, t)| a.ty == t.ty) {
+        return Ok(plan);
+    }
+    let mut projections = Vec::with_capacity(target.len());
+    for (i, (a, t)) in arm_cols.iter().zip(target).enumerate() {
+        let col_ref = BoundExpr::ColumnRef {
+            index: i,
+            ty: a.ty,
+        };
+        projections.push(coerce_expr(col_ref, t.ty)?);
+    }
+    Ok(LogicalPlan::Subquery {
+        source: Box::new(plan),
+        columns: target.to_vec(),
+        projections,
+        predicate: None,
+        sort: Vec::new(),
+        distinct: None,
+    })
+}
+
+/// Identity projections (one `ColumnRef` per output column) for the Subquery that
+/// wraps a concat node to deduplicate and/or sort a UNION.
+fn identity_projections(columns: &[OutputColumn]) -> Vec<BoundExpr> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, col)| BoundExpr::ColumnRef { index, ty: col.ty })
+        .collect()
+}
+
+/// Deduplication keys covering every output column — UNION (distinct) semantics.
+fn all_column_distinct_keys(columns: &[OutputColumn]) -> Vec<DistinctKey> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(column, col)| DistinctKey { column, ty: col.ty })
+        .collect()
 }
 
 /// Fold a `LIMIT`/`OFFSET` clause into constant row counts. PG evaluates these as
@@ -2409,6 +2668,7 @@ pub fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindEr
         LogicalPlan::Values { columns, .. }
         | LogicalPlan::Query { columns, .. }
         | LogicalPlan::Append { columns, .. }
+        | LogicalPlan::SetOp { columns, .. }
         | LogicalPlan::Subquery { columns, .. }
         | LogicalPlan::TableFunction { columns, .. }
         | LogicalPlan::Aggregate { columns, .. }
@@ -4387,6 +4647,7 @@ mod tests {
             LogicalPlan::Values { .. } => "Values",
             LogicalPlan::Query { .. } => "Query",
             LogicalPlan::Append { .. } => "Append",
+            LogicalPlan::SetOp { .. } => "SetOp",
             LogicalPlan::Subquery { .. } => "Subquery",
             LogicalPlan::TableFunction { .. } => "TableFunction",
             LogicalPlan::Join { .. } => "Join",
@@ -7221,5 +7482,143 @@ mod tests {
         let err = bind_err("SELECT $1");
         assert_eq!(err.code, "42P02");
         assert_eq!(err.message, "there is no parameter $1");
+    }
+
+    #[test]
+    fn union_all_binds_to_a_bare_setop() {
+        // Same-typed arms, no ORDER BY: the plan is the bare concat, arms untouched.
+        let plan = bound("SELECT id FROM t UNION ALL SELECT id FROM t");
+        let LogicalPlan::SetOp {
+            left,
+            right,
+            columns,
+        } = plan
+        else {
+            panic!("expected SetOp, got {}", plan_name(&plan));
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].ty, PgType::Int4);
+        assert_eq!(plan_name(&left), "Query");
+        assert_eq!(plan_name(&right), "Query");
+    }
+
+    #[test]
+    fn union_deduplicates_via_a_wrapping_distinct() {
+        // Plain UNION wraps the concat in a Subquery that dedups every column.
+        let plan = bound("SELECT id FROM t UNION SELECT id FROM t");
+        let LogicalPlan::Subquery {
+            source,
+            distinct,
+            sort,
+            columns,
+            ..
+        } = plan
+        else {
+            panic!("expected Subquery, got {}", plan_name(&plan));
+        };
+        assert_eq!(plan_name(&source), "SetOp");
+        assert!(sort.is_empty());
+        let keys = distinct.expect("UNION should deduplicate");
+        assert_eq!(keys, vec![DistinctKey {
+            column: 0,
+            ty: PgType::Int4,
+        }]);
+        assert_eq!(columns[0].ty, PgType::Int4);
+    }
+
+    #[test]
+    fn union_unifies_arm_types_and_coerces() {
+        // int4 + int8 unify to int8; the int4 arm is wrapped to coerce, and the
+        // result column keeps the left arm's name.
+        let plan = bound("SELECT id FROM t UNION ALL SELECT big FROM t");
+        let LogicalPlan::SetOp {
+            left,
+            right,
+            columns,
+        } = plan
+        else {
+            panic!("expected SetOp, got {}", plan_name(&plan));
+        };
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].ty, PgType::Int8);
+        // The int4 arm gets a coercion Subquery; the int8 arm is already correct.
+        assert_eq!(plan_name(&left), "Subquery");
+        assert_eq!(plan_name(&right), "Query");
+    }
+
+    #[test]
+    fn union_column_count_mismatch_is_42601() {
+        let err = bind_err("SELECT id FROM t UNION SELECT id, big FROM t");
+        assert_eq!(err.code, sqlstate::SYNTAX_ERROR);
+        assert_eq!(
+            err.message,
+            "each UNION query must have the same number of columns"
+        );
+    }
+
+    #[test]
+    fn union_incompatible_types_is_42804() {
+        // integer vs boolean have no common type.
+        let err = bind_err("SELECT id FROM t UNION SELECT flag FROM t");
+        assert_eq!(err.code, sqlstate::DATATYPE_MISMATCH);
+        assert_eq!(
+            err.message,
+            "UNION types integer and boolean cannot be matched"
+        );
+    }
+
+    #[test]
+    fn union_all_order_by_ordinal_sorts_without_dedup() {
+        let plan = bound("SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY 1");
+        let LogicalPlan::Subquery {
+            source,
+            distinct,
+            sort,
+            ..
+        } = plan
+        else {
+            panic!("expected Subquery, got {}", plan_name(&plan));
+        };
+        assert_eq!(plan_name(&source), "SetOp");
+        assert!(distinct.is_none(), "UNION ALL keeps duplicates");
+        assert_eq!(sort.len(), 1);
+        assert_eq!(sort[0].column, 0);
+    }
+
+    #[test]
+    fn three_way_union_nests_and_dedups() {
+        // (a UNION b) UNION c with a top-level ORDER BY: the outer node dedups and
+        // sorts, and its left arm is the inner UNION's dedup Subquery.
+        let plan =
+            bound("SELECT id FROM t UNION SELECT id FROM t UNION SELECT id FROM t ORDER BY 1");
+        let LogicalPlan::Subquery {
+            source,
+            distinct,
+            sort,
+            ..
+        } = plan
+        else {
+            panic!("expected Subquery, got {}", plan_name(&plan));
+        };
+        assert!(distinct.is_some());
+        assert_eq!(sort.len(), 1);
+        let LogicalPlan::SetOp { left, .. } = *source else {
+            panic!("expected SetOp source");
+        };
+        // The left arm is the inner `a UNION b`, itself a dedup Subquery.
+        assert_eq!(plan_name(&left), "Subquery");
+    }
+
+    #[test]
+    fn intersect_and_except_are_still_unsupported() {
+        assert_eq!(
+            bind_err("SELECT id FROM t INTERSECT SELECT id FROM t").code,
+            sqlstate::FEATURE_NOT_SUPPORTED
+        );
+        assert_eq!(
+            bind_err("SELECT id FROM t EXCEPT SELECT id FROM t").code,
+            sqlstate::FEATURE_NOT_SUPPORTED
+        );
     }
 }

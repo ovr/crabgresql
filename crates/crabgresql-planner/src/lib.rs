@@ -101,6 +101,15 @@ pub enum PhysicalPlan {
         tables: Vec<Arc<dyn TableAm>>,
         columns: Vec<OutputColumn>,
     },
+    /// Concatenation of two sub-plans (a `UNION ALL` body). Mirrors
+    /// [`LogicalPlan::SetOp`]: the executor drains `left` then `right` into one
+    /// row stream. `UNION` deduplication and top-level ORDER BY are applied by a
+    /// wrapping [`Self::Subquery`], so this node carries no tail of its own.
+    SetOp {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        columns: Vec<OutputColumn>,
+    },
     /// LIMIT/OFFSET above a source plan (after its sort). Mirrors
     /// [`LogicalPlan::Limit`].
     Limit {
@@ -419,6 +428,15 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             },
         },
         LogicalPlan::Append { tables, columns } => PhysicalPlan::Append { tables, columns },
+        LogicalPlan::SetOp {
+            left,
+            right,
+            columns,
+        } => PhysicalPlan::SetOp {
+            left: Box::new(plan(*left)),
+            right: Box::new(plan(*right)),
+            columns,
+        },
         LogicalPlan::Subquery {
             source,
             columns,
@@ -760,6 +778,20 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             let mut lines = vec!["Append".to_string()];
             for table in tables {
                 lines.push(format!("  ->  Seq Scan on {}", table.schema().name));
+            }
+            lines
+        }
+        PhysicalPlan::SetOp { left, right, .. } => {
+            // A UNION [ALL] renders like PG's Append: one child sub-plan per arm,
+            // each indented under a `->` lead (multi-line children align their
+            // continuation lines under the first).
+            let mut lines = vec!["Append".to_string()];
+            for child in [left.as_ref(), right.as_ref()] {
+                let mut child_lines = explain(child).into_iter();
+                if let Some(first) = child_lines.next() {
+                    lines.push(format!("  ->  {first}"));
+                    lines.extend(child_lines.map(|l| format!("      {l}")));
+                }
             }
             lines
         }
@@ -1406,6 +1438,29 @@ mod tests {
                 "  ->  Seq Scan on sales_2023".to_string(),
                 "  ->  Seq Scan on sales_2024".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn explain_setop_renders_as_append_over_both_arms() {
+        // A UNION [ALL] renders like PG's Append, with one child sub-plan per arm.
+        let arm = || {
+            Box::new(plan_sql("SELECT * FROM t")) as Box<PhysicalPlan>
+        };
+        let plan = PhysicalPlan::SetOp {
+            left: arm(),
+            right: arm(),
+            columns: vec![OutputColumn {
+                name: "id".into(),
+                ty: PgType::Int4,
+            }],
+        };
+        let lines = explain(&plan);
+        assert_eq!(lines[0], "Append");
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("  ->  ")).count(),
+            2,
+            "expected one child lead per arm, got: {lines:?}"
         );
     }
 

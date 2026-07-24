@@ -1,5 +1,6 @@
 test: basic
 test: order_by
+test: union
 test: select_distinct
 test: select_distinct_on
 test: aggregate
