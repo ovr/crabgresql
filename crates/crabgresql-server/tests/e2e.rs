@@ -4820,3 +4820,68 @@ async fn range_partitioning_routed_update_delete_copy() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Row movement respects the destination leaf's own UNIQUE index: an UPDATE that
+/// relocates a row into a partition where its key already exists is rejected
+/// (23505), and routing does not bypass the leaf's constraint.
+#[tokio::test]
+async fn range_partitioning_row_movement_respects_leaf_unique() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE m (id int, d date) PARTITION BY RANGE (d)")
+        .await?;
+    client
+        .simple_query(
+            "CREATE TABLE m_2023 PARTITION OF m FOR VALUES FROM ('2023-01-01') TO ('2024-01-01')",
+        )
+        .await?;
+    client
+        .simple_query(
+            "CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+        )
+        .await?;
+    // Only the destination leaf carries a UNIQUE index (leaves are ordinary heaps).
+    client
+        .simple_query("CREATE UNIQUE INDEX m_2024_id_idx ON m_2024 (id)")
+        .await?;
+    // id 1 lives in both leaves — legal, since the unique index is per-leaf.
+    client
+        .simple_query("INSERT INTO m VALUES (1, '2023-06-01'), (1, '2024-06-01')")
+        .await?;
+
+    // Moving the m_2023 row into m_2024 collides with the existing id 1 there, so
+    // the destination leaf's unique index rejects it (23505) — nothing moves.
+    let err = client
+        .simple_query("UPDATE m SET d = '2024-03-01' WHERE id = 1 AND d = '2023-06-01'")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+    // The row stayed in m_2023; m_2024 still holds exactly its original row.
+    assert_eq!(
+        rows(&client.simple_query("SELECT count(*) FROM m_2023").await?)[0].get(0),
+        Some("1")
+    );
+    assert_eq!(
+        rows(&client.simple_query("SELECT count(*) FROM m_2024").await?)[0].get(0),
+        Some("1")
+    );
+
+    // A move into m_2024 with a non-colliding key succeeds.
+    client
+        .simple_query("UPDATE m SET id = 2, d = '2024-03-01' WHERE id = 1 AND d = '2023-06-01'")
+        .await?;
+    let msgs = client.simple_query("SELECT id FROM m_2024 ORDER BY id").await?;
+    let moved: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(moved, vec![Some("1"), Some("2")]);
+    assert!(
+        rows(&client.simple_query("SELECT id FROM m_2023").await?).is_empty(),
+        "m_2023 should be empty after the row moved out"
+    );
+
+    Ok(())
+}

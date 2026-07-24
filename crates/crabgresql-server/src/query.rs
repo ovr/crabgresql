@@ -2077,8 +2077,9 @@ fn execute_create_table(
 /// Reject a direct physical DDL operation (TRUNCATE, CREATE INDEX) on a
 /// partitioned parent. The parent owns no storage of its own — the operation
 /// would have to fan out to its partitions, which is not implemented yet — so it
-/// is rejected rather than silently applied to the empty parent relation,
-/// mirroring the binder's rejection of DML/queries against the parent.
+/// is rejected rather than silently applied to the empty parent relation. (DML
+/// and queries against the parent are supported: they route/union across the
+/// leaves; only these physical DDL operations remain unsupported.)
 fn reject_partitioned_parent(table: &Arc<dyn TableAm>, name: &str) -> Result<(), PgError> {
     if table.schema().partition_scheme.is_some() {
         return Err(PgError::feature_not_supported(format!(

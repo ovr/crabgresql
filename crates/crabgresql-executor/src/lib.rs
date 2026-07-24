@@ -1350,19 +1350,25 @@ fn update_routed(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let parent_schema = parent.schema();
-    // Per-leaf simulation of the leaf's live rows after this statement, used only
-    // for UNIQUE checks. Materialized up front for leaves that carry a unique
-    // index; the (common) unique-free leaves keep an empty, unused vector.
     let leaf_has_unique: Vec<bool> = leaves
         .iter()
         .map(|leaf| leaf.indexes().iter().any(|index| index.unique))
         .collect();
-    let mut simulated: Vec<Vec<(Tid, Tuple)>> = leaves
+    // Scan every leaf once (the parent owns no rows). The collected snapshot
+    // drives the match loop and — for leaves with a unique index — seeds the
+    // post-statement simulation, so a leaf is never scanned twice and the match
+    // set is fixed before any write (Halloween-safe).
+    let scans: Vec<Vec<(Tid, Tuple)>> =
+        leaves.iter().map(|leaf| leaf.scan(txn).collect()).collect();
+    // Per-leaf simulation of the leaf's live rows after this statement, used only
+    // for UNIQUE checks; seeded from `scans` for leaves that carry a unique index,
+    // left empty (and unused) for the common unique-free leaf.
+    let mut simulated: Vec<Vec<(Tid, Tuple)>> = scans
         .iter()
         .enumerate()
-        .map(|(i, leaf)| {
+        .map(|(i, rows)| {
             if leaf_has_unique[i] {
-                leaf.scan(txn).collect()
+                rows.clone()
             } else {
                 Vec::new()
             }
@@ -1377,15 +1383,16 @@ fn update_routed(
     let mut pending_insert: Vec<Vec<Tuple>> = vec![Vec::new(); leaves.len()];
     let mut new_rows: Vec<Tuple> = Vec::new();
 
-    for (src, leaf) in leaves.iter().enumerate() {
-        for (tid, old) in leaf.scan(txn) {
-            if !predicate_holds(predicate, &old, ctx)? {
+    for (src, rows) in scans.iter().enumerate() {
+        for (tid, old) in rows {
+            let tid = *tid;
+            if !predicate_holds(predicate, old, ctx)? {
                 continue;
             }
             // Every SET expression sees the OLD row: `SET a = b, b = a` swaps.
             let mut new = old.clone();
             for (index, expr) in assignments {
-                new[*index] = eval(expr, &old, ctx)?;
+                new[*index] = eval(expr, old, ctx)?;
             }
             let dst = route_tuple(parent_schema, leaves, &new, ctx)?;
 
@@ -1395,10 +1402,14 @@ fn update_routed(
             // and the partition bound apply (the latter passes by construction).
             if leaf_has_unique[dst] {
                 if src == dst {
-                    let pos = simulated[dst]
+                    // Mirror `update_direct`: a tid absent from the simulation is a
+                    // row that vanished under us — skip it rather than update it.
+                    let Some(pos) = simulated[dst]
                         .iter()
                         .position(|(candidate, _)| *candidate == tid)
-                        .expect("updated row present in its leaf's simulation");
+                    else {
+                        continue;
+                    };
                     let removed = simulated[dst].remove(pos);
                     if let Err(error) = validate_constraints(
                         &leaves[dst],
@@ -1535,8 +1546,9 @@ fn validate_constraints<'a>(
 /// value outside `[from, to)` — or a NULL key, which no range partition admits —
 /// is rejected with 23514, matching PostgreSQL's observable behavior (error text
 /// and SQLSTATE) for a direct INSERT/UPDATE into a partition. A non-partition
-/// relation (`None`) passes; the partitioned parent, which would route the row,
-/// is rejected in the binder before it ever reaches here.
+/// relation (`None`) passes. This only ever runs on a leaf handle: a write to the
+/// partitioned parent routes each row to a leaf (see `route_tuple`) and validates
+/// against that leaf, so the parent schema itself never reaches here.
 fn check_partition_bound(
     schema: &TableSchema,
     tuple: &Tuple,
