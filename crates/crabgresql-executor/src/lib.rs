@@ -1133,11 +1133,15 @@ fn insert_direct(
 }
 
 /// Route each tuple to the leaf partition of `parent` that admits its key, then
-/// validate and write. Routing runs for the whole batch first: a row whose key
-/// no leaf admits (or a NULL key) fails the statement before any write, matching
-/// PostgreSQL's tuple-routing error. Validation is against the destination leaf,
-/// so a NOT NULL violation names that partition (as PG does); partitions carry
-/// no unique index, so no per-leaf snapshot is needed.
+/// validate and write. Each row is processed in order — routed, then validated
+/// against its destination leaf — so a routing failure (23514) and a constraint
+/// failure (23502/23505) are reported in the same order PostgreSQL would (it
+/// routes then checks constraints, row by row), and a NOT NULL / unique violation
+/// names the destination partition. A leaf is an ordinary heap and may carry a
+/// UNIQUE index, so uniqueness is enforced against the destination leaf's
+/// pre-existing rows plus earlier same-statement rows routed to it, exactly as
+/// [`insert_direct`] does for a plain table. All checks run before any write, so
+/// the statement stays all-or-nothing.
 fn insert_routed(
     parent: &Arc<dyn TableAm>,
     tuples: Vec<Tuple>,
@@ -1147,12 +1151,25 @@ fn insert_routed(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let parent_schema = parent.schema();
-    let routes: Vec<usize> = tuples
-        .iter()
-        .map(|tuple| route_tuple(parent_schema, leaves, tuple, ctx))
-        .collect::<Result<_, _>>()?;
-    for (tuple, &leaf) in tuples.iter().zip(&routes) {
-        validate_constraints(&leaves[leaf], tuple, std::iter::empty(), ctx)?;
+    // Per-leaf snapshot of the rows a UNIQUE check must see, built lazily the
+    // first time a row routes to a leaf that has a unique index (leaves without
+    // one, the common case, never get scanned). `None` = not yet scanned.
+    let mut visible: Vec<Option<Vec<Tuple>>> = vec![None; leaves.len()];
+    let mut routes: Vec<usize> = Vec::with_capacity(tuples.len());
+    for tuple in &tuples {
+        let leaf = route_tuple(parent_schema, leaves, tuple, ctx)?;
+        let has_unique = leaves[leaf].indexes().iter().any(|index| index.unique);
+        if has_unique && visible[leaf].is_none() {
+            visible[leaf] = Some(leaves[leaf].scan(txn).map(|(_, tuple)| tuple).collect());
+        }
+        match visible[leaf].as_deref() {
+            Some(seen) => validate_constraints(&leaves[leaf], tuple, seen.iter(), ctx)?,
+            None => validate_constraints(&leaves[leaf], tuple, std::iter::empty(), ctx)?,
+        }
+        if let Some(seen) = visible[leaf].as_mut() {
+            seen.push(tuple.clone());
+        }
+        routes.push(leaf);
     }
     let inserted = tuples.len() as u64;
     let output = match &returning {
@@ -1189,28 +1206,21 @@ fn route_tuple(
     tuple: &Tuple,
     ctx: &ExecContext,
 ) -> Result<usize, ExecError> {
-    // Only single-column RANGE partitions exist (enforced at DDL time), and the
-    // key column type is DDL-guaranteed orderable, so `compare_values` is safe.
+    // The RANGE-admits rule lives in `leaf_admits` (shared with the leaf-bound
+    // check), so a routed row lands in exactly the leaf a direct INSERT would.
+    for (idx, leaf) in leaves.iter().enumerate() {
+        if leaf_admits(leaf.schema(), tuple) {
+            return Ok(idx);
+        }
+    }
+    // No leaf admits the key (or it is NULL, which no range partition accepts):
+    // PostgreSQL's tuple-routing failure. The DETAIL clips each field to 64 bytes
+    // exactly as `display_tuple` does, so a long key reads byte-identically to PG.
     let scheme = parent
         .partition_scheme
         .as_ref()
         .expect("routing target is a partitioned parent");
     let col = scheme.key_columns[0];
-    let ty = parent.columns[col].ty;
-    let key = &tuple[col];
-    if !matches!(key, Value::Null) {
-        for (idx, leaf) in leaves.iter().enumerate() {
-            let bound = &leaf
-                .schema()
-                .partition_of
-                .as_ref()
-                .expect("routing candidate is a leaf partition")
-                .bound;
-            if lower_admits(&bound.from[0], ty, key) && upper_admits(&bound.to[0], ty, key) {
-                return Ok(idx);
-            }
-        }
-    }
     Err(ExecError::new(
         "23514",
         format!("no partition of relation \"{}\" found for row", parent.name),
@@ -1218,7 +1228,7 @@ fn route_tuple(
     .with_detail(Some(format!(
         "Partition key of the failing row contains ({}) = ({}).",
         parent.columns[col].name,
-        display_value(key, ctx),
+        clip_failing_row_field(display_value(&tuple[col], ctx)),
     ))))
 }
 
@@ -1362,31 +1372,22 @@ fn check_partition_bound(
     tuple: &Tuple,
     ctx: &ExecContext,
 ) -> Result<(), ExecError> {
-    let Some(part) = &schema.partition_of else {
+    // A non-partition relation has no bound to enforce; a leaf whose bound admits
+    // the row passes. Only the out-of-range case falls through to the error.
+    if schema.partition_of.is_none() || leaf_admits(schema, tuple) {
         return Ok(());
-    };
-    // Only single-column RANGE partitions exist (enforced at DDL time), and the
-    // key column type is DDL-guaranteed orderable, so `compare_values` is safe.
-    let col = part.key_columns[0];
-    let ty = schema.columns[col].ty;
-    let key = &tuple[col];
-    let admitted = !matches!(key, Value::Null)
-        && lower_admits(&part.bound.from[0], ty, key)
-        && upper_admits(&part.bound.to[0], ty, key);
-    if !admitted {
-        return Err(ExecError::new(
-            "23514",
-            format!(
-                "new row for relation \"{}\" violates partition constraint",
-                schema.name
-            ),
-        )
-        .with_detail(Some(format!(
-            "Failing row contains ({}).",
-            display_tuple(tuple, ctx)
-        ))));
     }
-    Ok(())
+    Err(ExecError::new(
+        "23514",
+        format!(
+            "new row for relation \"{}\" violates partition constraint",
+            schema.name
+        ),
+    )
+    .with_detail(Some(format!(
+        "Failing row contains ({}).",
+        display_tuple(tuple, ctx)
+    ))))
 }
 
 /// The inclusive lower bound admits `key` when `key >= from` (or the bound is
@@ -1407,6 +1408,26 @@ fn upper_admits(to: &PartitionBoundDatum, ty: PgType, key: &Value) -> bool {
         PartitionBoundDatum::MinValue => false,
         PartitionBoundDatum::Value(v) => compare_values(ty, key, v) == Ordering::Less,
     }
+}
+
+/// Whether the leaf partition described by `leaf`'s schema admits `tuple`'s RANGE
+/// key: a non-NULL key inside `[from, to)`. Single-column key (DDL-enforced); a
+/// NULL key is admitted by no range partition. This is the one place the RANGE
+/// "does this leaf admit this row" rule is composed — shared by leaf-bound
+/// enforcement ([`check_partition_bound`]) and parent tuple routing
+/// ([`route_tuple`]) so the two never disagree about which leaf a row belongs to.
+/// Panics if `leaf` is not a partition leaf; both callers guarantee it.
+fn leaf_admits(leaf: &TableSchema, tuple: &Tuple) -> bool {
+    let part = leaf
+        .partition_of
+        .as_ref()
+        .expect("leaf_admits called on a partition leaf");
+    let col = part.key_columns[0];
+    let ty = leaf.columns[col].ty;
+    let key = &tuple[col];
+    !matches!(key, Value::Null)
+        && lower_admits(&part.bound.from[0], ty, key)
+        && upper_admits(&part.bound.to[0], ty, key)
 }
 
 fn unique_key_skipped(index: &IndexMetadata, tuple: &Tuple) -> bool {

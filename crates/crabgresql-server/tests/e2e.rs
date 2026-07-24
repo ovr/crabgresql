@@ -4646,3 +4646,67 @@ async fn range_partitioning_detail_clips_long_field() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn range_partitioning_routed_insert_enforces_unique_and_error_order() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE m (id int, sold date, amount int NOT NULL) PARTITION BY RANGE (sold)",
+        )
+        .await?;
+    client
+        .simple_query(
+            "CREATE TABLE m_2023 PARTITION OF m FOR VALUES FROM ('2023-01-01') TO ('2024-01-01')",
+        )
+        .await?;
+    // A leaf is an ordinary heap and may carry its own UNIQUE index.
+    client
+        .simple_query("CREATE UNIQUE INDEX m_2023_id_idx ON m_2023 (id)")
+        .await?;
+
+    // A row inserted through the parent that duplicates an existing leaf row must
+    // be rejected by the leaf's unique index (23505) — routing does not bypass it.
+    client
+        .simple_query("INSERT INTO m VALUES (1, '2023-03-01', 10)")
+        .await?;
+    let err = client
+        .simple_query("INSERT INTO m VALUES (1, '2023-06-01', 20)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+
+    // Two rows in one statement that route to the same leaf with a duplicate key
+    // are caught against each other, not just against pre-existing rows.
+    let err = client
+        .simple_query("INSERT INTO m VALUES (2, '2023-02-01', 1), (2, '2023-05-01', 2)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+    // Nothing from the failed statements was written: only the first row remains.
+    let msgs = client.simple_query("SELECT count(*) FROM m").await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("1"));
+
+    // Rows are processed in order: an earlier row's constraint violation is
+    // reported before a later row's routing failure, matching PostgreSQL's
+    // row-by-row processing. Row 1 routes fine but is NULL in a NOT NULL column
+    // (23502); row 2 would fail routing (23514) — the row-1 error must win.
+    let err = client
+        .simple_query("INSERT INTO m VALUES (3, '2023-04-01', NULL), (4, '1990-01-01', 1)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::NOT_NULL_VIOLATION
+    );
+
+    Ok(())
+}
