@@ -592,7 +592,7 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
             subst_opt(predicate, params);
             subst_exprs(group_exprs, params);
             for agg in aggregates {
-                if let Some(arg) = &mut agg.arg {
+                for arg in agg.args.iter_mut() {
                     subst_expr(arg, params);
                 }
             }
@@ -716,8 +716,8 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
                 subst_expr(e, params);
             }
         }
-        BoundExpr::Aggregate { arg, .. } => {
-            if let Some(arg) = arg {
+        BoundExpr::Aggregate { args, .. } => {
+            for arg in args {
                 subst_expr(arg, params);
             }
         }
@@ -854,7 +854,7 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 subst_outer_expr(e, outer, depth);
             }
             for agg in aggregates {
-                if let Some(arg) = &mut agg.arg {
+                for arg in agg.args.iter_mut() {
                     subst_outer_expr(arg, outer, depth);
                 }
             }
@@ -997,8 +997,8 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
                 subst_outer_expr(e, outer, depth);
             }
         }
-        BoundExpr::Aggregate { arg, .. } => {
-            if let Some(a) = arg {
+        BoundExpr::Aggregate { args, .. } => {
+            for a in args {
                 subst_outer_expr(a, outer, depth);
             }
         }
@@ -1116,7 +1116,7 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
             }
             group_exprs.iter().for_each(&mut *f);
             for agg in aggregates {
-                if let Some(arg) = &agg.arg {
+                for arg in agg.args.iter() {
                     f(arg);
                 }
             }
@@ -1218,7 +1218,7 @@ fn expr_has_outer_ref(expr: &BoundExpr) -> bool {
                 .any(|(c, r)| expr_has_outer_ref(c) || expr_has_outer_ref(r))
                 || else_.as_deref().is_some_and(expr_has_outer_ref)
         }
-        BoundExpr::Aggregate { arg, .. } => arg.as_deref().is_some_and(expr_has_outer_ref),
+        BoundExpr::Aggregate { args, .. } => args.iter().any(expr_has_outer_ref),
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
             plan_has_outer_refs(&subplan.0)
         }
@@ -2542,13 +2542,13 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
         BoundExpr::Aggregate {
             func,
             distinct,
-            arg,
+            args,
             input_ty,
             ret,
         } => BoundExpr::Aggregate {
             func: *func,
             distinct: *distinct,
-            arg: arg.as_ref().map(|a| Box::new(shift_column_refs(a, delta))),
+            args: args.iter().map(|a| shift_column_refs(a, delta)).collect(),
             input_ty: *input_ty,
             ret: *ret,
         },
@@ -3851,11 +3851,11 @@ fn rewrite_over_aggregate(
         BoundExpr::Aggregate {
             func,
             distinct,
-            arg,
+            args,
             input_ty,
             ret,
         } => {
-            if arg.as_ref().is_some_and(|a| a.contains_aggregate()) {
+            if args.iter().any(|a| a.contains_aggregate()) {
                 return Err(BindError::new(
                     sqlstate::GROUPING_ERROR,
                     "aggregate function calls cannot be nested",
@@ -3865,7 +3865,7 @@ fn rewrite_over_aggregate(
             aggregates.push(BoundAggregate {
                 func,
                 distinct,
-                arg: arg.map(|a| *a),
+                args,
                 input_ty,
                 ret,
             });
@@ -4987,7 +4987,7 @@ mod tests {
         assert!(having.is_none());
         assert_eq!(aggregates.len(), 1);
         assert_eq!(aggregates[0].func, crate::AggFn::Count);
-        assert!(aggregates[0].arg.is_none());
+        assert!(aggregates[0].args.is_empty());
         assert_eq!(aggregates[0].ret, PgType::Int8);
         // The projection reads the single aggregate slot.
         assert_eq!(

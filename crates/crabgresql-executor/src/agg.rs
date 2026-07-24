@@ -79,6 +79,9 @@ enum AggState {
     AvgNumeric { sum: Numeric, count: i64 },
     /// `avg(float4|float8)` → `float8`: running sum and count.
     AvgFloat { sum: f64, count: i64 },
+    /// `string_agg(value, delimiter)` → `text`: the running concatenation, or
+    /// `None` until the first non-null value (an empty group finalizes to NULL).
+    StringAgg { cur: Option<String> },
 }
 
 impl Accumulator {
@@ -110,6 +113,7 @@ impl Accumulator {
                     count: 0,
                 },
             },
+            AggFn::StringAgg => AggState::StringAgg { cur: None },
         };
         Accumulator { state }
     }
@@ -122,11 +126,14 @@ impl Accumulator {
         }
     }
 
-    /// Fold one non-null argument value into the running state.
-    pub fn accumulate(&mut self, v: Value) -> Result<(), ExecError> {
+    /// Fold one row's argument values into the running state. `values[0]` is the
+    /// value (already known non-null); `string_agg` also reads `values[1]` as the
+    /// per-row delimiter.
+    pub fn accumulate(&mut self, values: &[Value]) -> Result<(), ExecError> {
         match &mut self.state {
             AggState::Count(n) => *n += 1,
             AggState::Extreme { ty, want_max, cur } => {
+                let v = values[0].clone();
                 let replace = match cur {
                     None => true,
                     Some(c) => {
@@ -143,7 +150,7 @@ impl Accumulator {
                 }
             }
             AggState::SumI64(acc) => {
-                let x = as_i64(&v);
+                let x = as_i64(&values[0]);
                 let next = match acc {
                     None => x,
                     Some(a) => a.checked_add(x).ok_or_else(bigint_out_of_range)?,
@@ -151,7 +158,7 @@ impl Accumulator {
                 *acc = Some(next);
             }
             AggState::SumF4(acc) => {
-                let x = as_f32(&v);
+                let x = as_f32(&values[0]);
                 let next = match *acc {
                     None => x,
                     Some(a) => float::f4_add(a, x).map_err(float_error)?,
@@ -159,7 +166,7 @@ impl Accumulator {
                 *acc = Some(next);
             }
             AggState::SumF8(acc) => {
-                let x = as_f64(&v);
+                let x = as_f64(&values[0]);
                 let next = match *acc {
                     None => x,
                     Some(a) => float::f8_add(a, x).map_err(float_error)?,
@@ -167,19 +174,38 @@ impl Accumulator {
                 *acc = Some(next);
             }
             AggState::SumNumeric(acc) => {
-                let x = as_numeric(&v);
+                let x = as_numeric(&values[0]);
                 *acc = Some(match acc {
                     None => x,
                     Some(a) => a.add(&x),
                 });
             }
             AggState::AvgNumeric { sum, count } => {
-                *sum = sum.add(&as_numeric(&v));
+                *sum = sum.add(&as_numeric(&values[0]));
                 *count += 1;
             }
             AggState::AvgFloat { sum, count } => {
-                *sum = float::f8_add(*sum, as_f64(&v)).map_err(float_error)?;
+                *sum = float::f8_add(*sum, as_f64(&values[0])).map_err(float_error)?;
                 *count += 1;
+            }
+            AggState::StringAgg { cur } => {
+                let value = match &values[0] {
+                    Value::Text(s) => s.as_str(),
+                    other => unreachable!("binder rejected string_agg({other:?}, _)"),
+                };
+                // A NULL (or absent) delimiter contributes nothing between values.
+                let delim = match values.get(1) {
+                    None | Some(Value::Null) => "",
+                    Some(Value::Text(s)) => s.as_str(),
+                    other => unreachable!("binder rejected string_agg(_, {other:?})"),
+                };
+                match cur {
+                    None => *cur = Some(value.to_string()),
+                    Some(s) => {
+                        s.push_str(delim);
+                        s.push_str(value);
+                    }
+                }
             }
         }
         Ok(())
@@ -214,6 +240,7 @@ impl Accumulator {
                     Value::Float8(float::f8_div(sum, count as f64).map_err(float_error)?)
                 }
             }
+            AggState::StringAgg { cur } => cur.map(Value::Text).unwrap_or(Value::Null),
         })
     }
 }

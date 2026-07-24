@@ -303,11 +303,12 @@ pub enum BoundExpr {
         /// Whether duplicate non-NULL input values are eliminated before this
         /// aggregate accumulates them.
         distinct: bool,
-        /// `None` for `COUNT(*)` (count every row); the per-row argument
-        /// expression otherwise.
-        arg: Option<Box<BoundExpr>>,
-        /// The argument's (pre-aggregation) type — drives accumulator dispatch.
-        /// Unused for `COUNT(*)`.
+        /// The per-row argument expressions. Empty for `COUNT(*)` (count every
+        /// row); one entry for a unary aggregate; two for `string_agg(value,
+        /// delimiter)`. The first argument is the value whose NULL skips the row.
+        args: Vec<BoundExpr>,
+        /// The (first) argument's pre-aggregation type — drives accumulator
+        /// dispatch. Unused for `COUNT(*)`.
         input_ty: PgType,
         /// The aggregate's result type (see `agg_return_type`).
         ret: PgType,
@@ -365,8 +366,10 @@ pub struct BoundAggregate {
     /// Whether duplicate non-NULL input values are eliminated per group before
     /// accumulation.
     pub distinct: bool,
-    /// Evaluated per source row; `None` = `COUNT(*)`.
-    pub arg: Option<BoundExpr>,
+    /// Evaluated per source row; empty = `COUNT(*)`. The first argument is the
+    /// value (a NULL there skips the row); `string_agg` carries the delimiter
+    /// as a second argument.
+    pub args: Vec<BoundExpr>,
     pub input_ty: PgType,
     pub ret: PgType,
 }
@@ -593,8 +596,8 @@ impl BoundExpr {
                     .any(|(c, r)| c.contains_volatile_fn() || r.contains_volatile_fn())
                     || else_.as_ref().is_some_and(|e| e.contains_volatile_fn())
             }
-            BoundExpr::Aggregate { arg, .. } => {
-                arg.as_ref().is_some_and(|a| a.contains_volatile_fn())
+            BoundExpr::Aggregate { args, .. } => {
+                args.iter().any(|a| a.contains_volatile_fn())
             }
             // A subquery's own body runs as a separate plan; only the outer needle
             // of an IN-subquery propagates to the enclosing expression.
@@ -645,8 +648,8 @@ impl BoundExpr {
                     .sum::<usize>()
                     + else_.as_ref().map_or(0, |e| e.count_param_refs(index))
             }
-            BoundExpr::Aggregate { arg, .. } => {
-                arg.as_ref().map_or(0, |a| a.count_param_refs(index))
+            BoundExpr::Aggregate { args, .. } => {
+                args.iter().map(|a| a.count_param_refs(index)).sum()
             }
             BoundExpr::QuantifiedSubquery { cmp, .. } => {
                 cmp.count_param_refs(index)
@@ -705,10 +708,8 @@ impl BoundExpr {
                         fold(e, acc);
                     }
                 }
-                BoundExpr::Aggregate { arg, .. } => {
-                    if let Some(a) = arg {
-                        fold(a, acc);
-                    }
+                BoundExpr::Aggregate { args, .. } => {
+                    args.iter().for_each(|a| fold(a, acc));
                 }
                 // Non-correlated subplans reference no outer column; only the IN
                 // needle (in `cmp`) can. Scalar/EXISTS contribute nothing.
@@ -4349,9 +4350,10 @@ fn bind_array_concat(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
 }
 
 /// Bind a polymorphic array function whose overload can't live in the
-/// fixed-signature table: `cardinality`, `array_length`, `array_append`,
-/// `array_prepend`, `array_cat`. Returns `Ok(None)` if `name` is not one of
-/// them, so the caller falls through to ordinary resolution.
+/// fixed-signature table: `cardinality`, `array_length`, `array_upper`,
+/// `array_append`, `array_prepend`, `array_cat`, `array_to_string`. Returns
+/// `Ok(None)` if `name` is not one of them, so the caller falls through to
+/// ordinary resolution.
 pub(crate) fn bind_array_function(
     name: &str,
     bindings: &[Binding],
@@ -4384,6 +4386,34 @@ pub(crate) fn bind_array_function(
                 PgType::Int4,
                 vec![resolve_operand(a, arr_ty)?, resolve_operand(dim, PgType::Int4)?],
             )
+        }
+        "array_upper" => {
+            let [a, dim] = bindings else { return Err(undefined()) };
+            let (arr_ty, _) = array_arg_type(a).ok_or_else(undefined)?;
+            call(
+                ScalarFn::ArrayUpper,
+                PgType::Int4,
+                vec![resolve_operand(a, arr_ty)?, resolve_operand(dim, PgType::Int4)?],
+            )
+        }
+        // `array_to_string(anyarray, text [, text])` renders the array's elements
+        // (NULLs skipped, or replaced by the optional third argument) joined by
+        // the delimiter. Always returns text.
+        "array_to_string" => {
+            let (a, delim, null_str) = match bindings {
+                [a, delim] => (a, delim, None),
+                [a, delim, null_str] => (a, delim, Some(null_str)),
+                _ => return Err(undefined()),
+            };
+            let (arr_ty, _) = array_arg_type(a).ok_or_else(undefined)?;
+            let mut args = vec![
+                resolve_operand(a, arr_ty)?,
+                resolve_operand(delim, PgType::Text)?,
+            ];
+            if let Some(null_str) = null_str {
+                args.push(resolve_operand(null_str, PgType::Text)?);
+            }
+            call(ScalarFn::ArrayToString, PgType::Text, args)
         }
         // `array_append(anyarray, elem)` promotes the array/element to their
         // common element type (PG's `anycompatiblearray`/`anycompatible`).
@@ -5566,13 +5596,16 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
         BoundExpr::Aggregate {
             func,
             distinct,
-            arg,
+            args: agg_args,
             input_ty,
             ret,
         } => BoundExpr::Aggregate {
             func,
             distinct,
-            arg: arg.map(|a| Box::new(inline_params(*a, args))),
+            args: agg_args
+                .into_iter()
+                .map(|a| inline_params(a, args))
+                .collect(),
             input_ty,
             ret,
         },

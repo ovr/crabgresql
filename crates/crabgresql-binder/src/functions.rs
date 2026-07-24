@@ -437,8 +437,16 @@ pub enum ScalarFn {
     /// `array_length(array, dim int4) -> int4` (NULL for an empty array or a
     /// dimension other than 1).
     ArrayLength,
+    /// `array_upper(array, dim int4) -> int4` — the upper subscript bound. For
+    /// the 1-based 1-D arrays here this equals the length; NULL for an empty
+    /// array or a dimension other than 1.
+    ArrayUpper,
     /// `cardinality(array) -> int4` — the total number of elements.
     Cardinality,
+    /// `array_to_string(array, delimiter text[, null_string text]) -> text`.
+    /// Non-strict on the optional `null_string`: renders each element (NULLs
+    /// skipped, or replaced by `null_string`) joined by the delimiter.
+    ArrayToString,
 }
 
 /// A SQL/JSON path query entry point. All take a `jsonb` target and a `jsonpath`;
@@ -624,6 +632,9 @@ pub enum AggFn {
     Max,
     Sum,
     Avg,
+    /// `string_agg(value text, delimiter text) -> text`: concatenates the
+    /// non-NULL values of a group, separated by the (per-row) delimiter.
+    StringAgg,
 }
 
 impl AggFn {
@@ -635,6 +646,7 @@ impl AggFn {
             AggFn::Max => "max",
             AggFn::Sum => "sum",
             AggFn::Avg => "avg",
+            AggFn::StringAgg => "string_agg",
         }
     }
 }
@@ -647,6 +659,7 @@ pub fn lookup_agg(name: &str) -> Option<AggFn> {
         "max" => Some(AggFn::Max),
         "sum" => Some(AggFn::Sum),
         "avg" => Some(AggFn::Avg),
+        "string_agg" => Some(AggFn::StringAgg),
         _ => None,
     }
 }
@@ -703,6 +716,9 @@ pub(crate) fn agg_return_type(
             PgType::Float4 | PgType::Float8 => Ok(PgType::Float8),
             _ => Err(unsupported()),
         },
+        // `string_agg(text, text)` always returns text; `bind_aggregate` calls
+        // this directly for the two-argument form's return type.
+        AggFn::StringAgg => Ok(PgType::Text),
     }
 }
 
@@ -1705,7 +1721,13 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
     // table (their argument/result types depend on the array's element type).
     if matches!(
         name.as_str(),
-        "cardinality" | "array_length" | "array_append" | "array_prepend" | "array_cat"
+        "cardinality"
+            | "array_length"
+            | "array_upper"
+            | "array_append"
+            | "array_prepend"
+            | "array_cat"
+            | "array_to_string"
     ) && let Some(binding) = crate::expr::bind_array_function(&name, &bindings)?
     {
         return Ok(binding);
@@ -1778,7 +1800,7 @@ fn bind_aggregate(
         return Ok(Binding::Typed(BoundExpr::Aggregate {
             func: AggFn::Count,
             distinct,
-            arg: None,
+            args: Vec::new(),
             input_ty: PgType::Int8,
             ret: PgType::Int8,
         }));
@@ -1808,24 +1830,52 @@ fn bind_aggregate(
         });
     }
 
-    // Every supported aggregate is unary. Bind each argument (an unknown literal
-    // resolves to text, as in a bare projection) so a wrong-arity error can name
-    // the actual argument types, as PG does.
+    // Bind each argument (an unknown literal resolves to text, as in a bare
+    // projection) so a wrong-arity error can name the actual argument types, as
+    // PG does.
     let arg_exprs = positional_arg_exprs(&list.args)?;
     let mut bound = arg_exprs
         .iter()
         .map(|e| crate::expr::bind_scalar(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
-    if bound.len() != 1 {
+    let undefined_arity = || {
         let types = bound
             .iter()
             .map(|b| b.ty().name())
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(BindError::new(
+        BindError::new(
             sqlstate::UNDEFINED_FUNCTION,
             format!("function {name}({types}) does not exist"),
-        ));
+        )
+    };
+
+    // `string_agg(value text, delimiter text)` is the only two-argument
+    // aggregate. Both arguments must be text (PG defines only the text and bytea
+    // overloads); a non-text-family argument has no overload.
+    if agg == AggFn::StringAgg {
+        if bound.len() != 2 || !bound.iter().all(|b| crate::expr::is_text_family(b.ty())) {
+            return Err(undefined_arity());
+        }
+        if distinct {
+            return Err(BindError::feature_not_supported(
+                "string_agg(DISTINCT ...) is not supported yet",
+            ));
+        }
+        let delim = crate::expr::coerce_expr(bound.pop().expect("delimiter"), PgType::Text)?;
+        let value = crate::expr::coerce_expr(bound.pop().expect("value"), PgType::Text)?;
+        return Ok(Binding::Typed(BoundExpr::Aggregate {
+            func: AggFn::StringAgg,
+            distinct: false,
+            args: vec![value, delim],
+            input_ty: PgType::Text,
+            ret: agg_return_type(agg, PgType::Text, scope)?,
+        }));
+    }
+
+    // Every other supported aggregate is unary.
+    if bound.len() != 1 {
+        return Err(undefined_arity());
     }
     let arg = bound.pop().expect("exactly one argument");
     let input_ty = arg.ty();
@@ -1845,7 +1895,7 @@ fn bind_aggregate(
     Ok(Binding::Typed(BoundExpr::Aggregate {
         func: agg,
         distinct,
-        arg: Some(Box::new(arg)),
+        args: vec![arg],
         input_ty,
         ret,
     }))
