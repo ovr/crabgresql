@@ -340,6 +340,31 @@ pub enum BoundExpr {
         negated: bool,
         cmp: Box<BoundExpr>,
     },
+    /// `left op ANY(SELECT …)` / `left op ALL(SELECT …)`. `cmp` is the bound
+    /// `left op <hole>` comparison template — a `Binary { op, arg_ty, left, right }`
+    /// whose `right` is a NULL `Const` of the subquery column's type (the same
+    /// hole trick as [`BoundExpr::InSubquery`]). At execution each candidate value
+    /// is substituted into the hole and the comparisons are chained: `ANY`/`SOME`
+    /// OR-chains (empty ⇒ false), `ALL` AND-chains (empty ⇒ true), both with
+    /// three-valued NULL logic. Subsumes `InSubquery` (`= ANY` ≡ `IN`, `<> ALL` ≡
+    /// `NOT IN`), which is kept separate and unchanged.
+    QuantifiedSubquery {
+        subplan: Subplan,
+        /// `true` for `ALL` (AND-chain), `false` for `ANY`/`SOME` (OR-chain).
+        all: bool,
+        cmp: Box<BoundExpr>,
+    },
+    /// `left op ANY(array_expr)` / `left op ALL(array_expr)`. `array` evaluates to
+    /// a `Value::Array` per row; `cmp` is the `left op <hole>` template over the
+    /// element type; `all` selects AND (ALL) vs OR (ANY/SOME) chaining. Unlike
+    /// [`BoundExpr::QuantifiedSubquery`] this is an ordinary per-row expression,
+    /// not a subquery marker.
+    QuantifiedArray {
+        array: Box<BoundExpr>,
+        /// `true` for `ALL` (AND-chain), `false` for `ANY`/`SOME` (OR-chain).
+        all: bool,
+        cmp: Box<BoundExpr>,
+    },
 }
 
 /// One aggregate call extracted from a query's expressions, occupying one slot
@@ -451,7 +476,10 @@ impl BoundExpr {
             BoundExpr::Srf { ret, .. } => *ret,
             BoundExpr::Aggregate { ret, .. } => *ret,
             BoundExpr::ScalarSubquery { ty, .. } => *ty,
-            BoundExpr::Exists { .. } | BoundExpr::InSubquery { .. } => PgType::Bool,
+            BoundExpr::Exists { .. }
+            | BoundExpr::InSubquery { .. }
+            | BoundExpr::QuantifiedSubquery { .. }
+            | BoundExpr::QuantifiedArray { .. } => PgType::Bool,
         }
     }
 
@@ -482,7 +510,12 @@ impl BoundExpr {
             }
             // A subquery's own SRFs stay inside its subplan; nothing propagates
             // out to the enclosing projection.
-            BoundExpr::InSubquery { cmp, .. } => cmp.contains_srf(),
+            BoundExpr::InSubquery { cmp, .. } | BoundExpr::QuantifiedSubquery { cmp, .. } => {
+                cmp.contains_srf()
+            }
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.contains_srf() || cmp.contains_srf()
+            }
             BoundExpr::Const { .. }
             | BoundExpr::ColumnRef { .. }
             | BoundExpr::Param { .. }
@@ -528,7 +561,12 @@ impl BoundExpr {
             }
             // The needle (in `cmp`) is an outer expression, so an aggregate there
             // propagates; a subquery's own body is a separate query and doesn't.
-            BoundExpr::InSubquery { cmp, .. } => cmp.contains_aggregate(),
+            BoundExpr::InSubquery { cmp, .. } | BoundExpr::QuantifiedSubquery { cmp, .. } => {
+                cmp.contains_aggregate()
+            }
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.contains_aggregate() || cmp.contains_aggregate()
+            }
             BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => false,
         }
     }
@@ -572,7 +610,12 @@ impl BoundExpr {
             }
             // A subquery's own body runs as a separate plan; only the outer needle
             // of an IN-subquery propagates to the enclosing expression.
-            BoundExpr::InSubquery { cmp, .. } => cmp.contains_volatile_fn(),
+            BoundExpr::InSubquery { cmp, .. } | BoundExpr::QuantifiedSubquery { cmp, .. } => {
+                cmp.contains_volatile_fn()
+            }
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.contains_volatile_fn() || cmp.contains_volatile_fn()
+            }
             BoundExpr::Const { .. }
             | BoundExpr::ColumnRef { .. }
             | BoundExpr::Param { .. }
@@ -617,7 +660,12 @@ impl BoundExpr {
             BoundExpr::Aggregate { arg, .. } => {
                 arg.as_ref().map_or(0, |a| a.count_param_refs(index))
             }
-            BoundExpr::InSubquery { cmp, .. } => cmp.count_param_refs(index),
+            BoundExpr::InSubquery { cmp, .. } | BoundExpr::QuantifiedSubquery { cmp, .. } => {
+                cmp.count_param_refs(index)
+            }
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.count_param_refs(index) + cmp.count_param_refs(index)
+            }
             // A validated scalar body carries no subquery; its params (if any)
             // live in a separate plan and are not this body's arguments.
             BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => 0,
@@ -676,7 +724,13 @@ impl BoundExpr {
                 }
                 // Non-correlated subplans reference no outer column; only the IN
                 // needle (in `cmp`) can. Scalar/EXISTS contribute nothing.
-                BoundExpr::InSubquery { cmp, .. } => fold(cmp, acc),
+                BoundExpr::InSubquery { cmp, .. } | BoundExpr::QuantifiedSubquery { cmp, .. } => {
+                    fold(cmp, acc)
+                }
+                BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                    fold(array, acc);
+                    fold(cmp, acc);
+                }
                 BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
             }
         }
@@ -897,7 +951,9 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
         | BoundExpr::Aggregate { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
-        | BoundExpr::InSubquery { .. } => expr.clone(),
+        | BoundExpr::InSubquery { .. }
+        | BoundExpr::QuantifiedSubquery { .. }
+        | BoundExpr::QuantifiedArray { .. } => expr.clone(),
     }
 }
 
@@ -1411,6 +1467,19 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
             subquery,
             negated,
         } => bind_in_subquery(expr, subquery, *negated, scope),
+        // `left op ANY(…)` / `left op SOME(…)` (SOME ≡ ANY, so `is_some` doesn't
+        // affect binding) and `left op ALL(…)`.
+        ast::Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => bind_quantified(left, compare_op, right, /* all */ false, scope),
+        ast::Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => bind_quantified(left, compare_op, right, /* all */ true, scope),
         ast::Expr::Between {
             expr,
             negated,
@@ -1607,6 +1676,138 @@ fn bind_in_subquery(
     Ok(Binding::Typed(BoundExpr::InSubquery {
         subplan: Subplan(Box::new(plan)),
         negated,
+        cmp: Box::new(cmp),
+    }))
+}
+
+/// `left op ANY(…)` / `left op SOME(…)` / `left op ALL(…)` (`all` selects `ALL`).
+/// The right-hand operand is either a subquery (`ANY(SELECT …)`, →
+/// [`BoundExpr::QuantifiedSubquery`]) or an array-valued expression
+/// (`ANY(ARRAY[…])`, `ANY('{…}')`, `ANY($1)`, → [`BoundExpr::QuantifiedArray`]).
+/// In both cases a NULL `Const` "hole" of the element type stands in for a
+/// candidate and `bind_binary_op` resolves the operator/coercions exactly as a
+/// written `left op v` would (the same trick as [`bind_in_subquery`]).
+fn bind_quantified(
+    left: &ast::Expr,
+    compare_op: &ast::BinaryOperator,
+    right: &ast::Expr,
+    all: bool,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let op = match compare_op {
+        ast::BinaryOperator::Eq => BinOp::Eq,
+        ast::BinaryOperator::NotEq => BinOp::NotEq,
+        ast::BinaryOperator::Lt => BinOp::Lt,
+        ast::BinaryOperator::LtEq => BinOp::LtEq,
+        ast::BinaryOperator::Gt => BinOp::Gt,
+        ast::BinaryOperator::GtEq => BinOp::GtEq,
+        // The parser also accepts the LIKE/regex operator spellings after
+        // ANY/ALL. Those lower to `ScalarFn` calls, not a `Binary` comparison
+        // template, so the quantified path can't build a hole for them yet.
+        other => {
+            return Err(BindError::feature_not_supported(format!(
+                "{other} {} (…) is not supported yet",
+                if all { "ALL" } else { "ANY" }
+            )));
+        }
+    };
+
+    // The parser emits `Expr::Subquery` for the `ANY(SELECT …)` form (possibly
+    // wrapped in redundant parentheses); anything else is an array expression.
+    let mut rhs = right;
+    while let ast::Expr::Nested(inner) = rhs {
+        rhs = inner;
+    }
+    match rhs {
+        ast::Expr::Subquery(query) => bind_quantified_subquery(left, op, query, all, scope),
+        _ => bind_quantified_array(left, op, right, all, scope),
+    }
+}
+
+/// The subquery form of [`bind_quantified`]. Mirrors [`bind_in_subquery`] but
+/// carries the parsed comparison operator (not just `=`) and an `all` flag
+/// instead of `negated`; the executor OR/AND-chains per candidate row.
+fn bind_quantified_subquery(
+    left: &ast::Expr,
+    op: BinOp,
+    query: &ast::Query,
+    all: bool,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let (plan, columns) = bind_subquery_plan(query, scope)?;
+    let [col] = columns.as_slice() else {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            "subquery has too many columns",
+        ));
+    };
+    let elem_ty = col.ty;
+    let needle = bind_expr(left, scope)?;
+    let hole = Binding::Typed(BoundExpr::Const {
+        value: Value::Null,
+        ty: elem_ty,
+    });
+    let cmp = bind_binary_op(op, needle, hole, Span::empty(), scope.catalog().as_ref())?;
+    let Binding::Typed(cmp) = cmp else {
+        return Err(BindError::feature_not_supported(
+            "ANY/ALL (SELECT …) with these operand types is not supported yet",
+        ));
+    };
+    Ok(Binding::Typed(BoundExpr::QuantifiedSubquery {
+        subplan: Subplan(Box::new(plan)),
+        all,
+        cmp: Box::new(cmp),
+    }))
+}
+
+/// The array form of [`bind_quantified`]. The element type comes from the
+/// right-hand array: a typed array contributes its element type; an untyped
+/// literal (`'{1,2,3}'`) or bind parameter takes the needle's type (`text` when
+/// the needle too is untyped) and is coerced to that array type — mirroring
+/// [`bind_in_list`]'s unknown-literal policy. A non-array right side is PG's
+/// `op ANY/ALL (array) requires array on right side` error.
+fn bind_quantified_array(
+    left: &ast::Expr,
+    op: BinOp,
+    right: &ast::Expr,
+    all: bool,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let needle = bind_expr(left, scope)?;
+    let array = bind_expr(right, scope)?;
+    let elem_ty = match binding_typed_ty(&array) {
+        Some(PgType::Array(elem_oid)) => PgType::from_oid(elem_oid).ok_or_else(|| {
+            BindError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "op ANY/ALL (array) requires array on right side",
+            )
+        })?,
+        // A non-array typed right side (e.g. `1 = ANY(2)`).
+        Some(_) => {
+            return Err(BindError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "op ANY/ALL (array) requires array on right side",
+            ));
+        }
+        // Untyped literal / bind parameter: element type follows the needle.
+        None => binding_typed_ty(&needle).unwrap_or(PgType::Text),
+    };
+    // Coerce the right side to `elem_ty[]` (identity for an already-typed array;
+    // parses `'{…}'` / types a `$n` param via `resolve_unknown`'s array arm).
+    let array_expr = resolve_operand(&array, PgType::Array(elem_ty.oid()))?;
+    let hole = Binding::Typed(BoundExpr::Const {
+        value: Value::Null,
+        ty: elem_ty,
+    });
+    let cmp = bind_binary_op(op, needle, hole, Span::empty(), scope.catalog().as_ref())?;
+    let Binding::Typed(cmp) = cmp else {
+        return Err(BindError::feature_not_supported(
+            "ANY/ALL (array) with these operand types is not supported yet",
+        ));
+    };
+    Ok(Binding::Typed(BoundExpr::QuantifiedArray {
+        array: Box::new(array_expr),
+        all,
         cmp: Box::new(cmp),
     }))
 }
@@ -5290,10 +5491,18 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             index: Box::new(inline_params(*index, args)),
             ty,
         },
+        // `x op ANY/ALL(array)` carries no subplan and can appear in a scalar
+        // body, so inline params into both the array and the comparison template.
+        BoundExpr::QuantifiedArray { array, all, cmp } => BoundExpr::QuantifiedArray {
+            array: Box::new(inline_params(*array, args)),
+            all,
+            cmp: Box::new(inline_params(*cmp, args)),
+        },
         // Subqueries cannot appear in a validated scalar body; leave untouched.
         BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
-        | BoundExpr::InSubquery { .. } => expr,
+        | BoundExpr::InSubquery { .. }
+        | BoundExpr::QuantifiedSubquery { .. } => expr,
     }
 }
 

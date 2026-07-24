@@ -680,8 +680,15 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
             substitute_params(&mut subplan.0, params);
         }
-        BoundExpr::InSubquery { subplan, cmp, .. } => {
+        BoundExpr::InSubquery { subplan, cmp, .. }
+        | BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
             substitute_params(&mut subplan.0, params);
+            subst_expr(cmp, params);
+        }
+        // `x op ANY/ALL(array)` carries no subplan; a `$n` may appear in either
+        // the array operand or the needle (in the comparison template).
+        BoundExpr::QuantifiedArray { array, cmp, .. } => {
+            subst_expr(array, params);
             subst_expr(cmp, params);
         }
     }
@@ -943,8 +950,14 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
             subst_outer_plan(&mut subplan.0, outer, depth + 1);
         }
-        BoundExpr::InSubquery { subplan, cmp, .. } => {
+        BoundExpr::InSubquery { subplan, cmp, .. }
+        | BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
             subst_outer_plan(&mut subplan.0, outer, depth + 1);
+            subst_outer_expr(cmp, outer, depth);
+        }
+        // The array operand and the needle live at this query level.
+        BoundExpr::QuantifiedArray { array, cmp, .. } => {
+            subst_outer_expr(array, outer, depth);
             subst_outer_expr(cmp, outer, depth);
         }
     }
@@ -1148,8 +1161,12 @@ fn expr_has_outer_ref(expr: &BoundExpr) -> bool {
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
             plan_has_outer_refs(&subplan.0)
         }
-        BoundExpr::InSubquery { subplan, cmp, .. } => {
+        BoundExpr::InSubquery { subplan, cmp, .. }
+        | BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
             plan_has_outer_refs(&subplan.0) || expr_has_outer_ref(cmp)
+        }
+        BoundExpr::QuantifiedArray { array, cmp, .. } => {
+            expr_has_outer_ref(array) || expr_has_outer_ref(cmp)
         }
     }
 }
@@ -1996,6 +2013,17 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
         } => BoundExpr::InSubquery {
             subplan: subplan.clone(),
             negated: *negated,
+            cmp: Box::new(shift_column_refs(cmp, delta)),
+        },
+        BoundExpr::QuantifiedSubquery { subplan, all, cmp } => BoundExpr::QuantifiedSubquery {
+            subplan: subplan.clone(),
+            all: *all,
+            cmp: Box::new(shift_column_refs(cmp, delta)),
+        },
+        // Both the array operand and the needle index this (outer) row.
+        BoundExpr::QuantifiedArray { array, all, cmp } => BoundExpr::QuantifiedArray {
+            array: Box::new(shift_column_refs(array, delta)),
+            all: *all,
             cmp: Box::new(shift_column_refs(cmp, delta)),
         },
     }
@@ -3438,6 +3466,24 @@ fn rewrite_over_aggregate(
                 cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
             })
         }
+        BoundExpr::QuantifiedSubquery { subplan, all, cmp } => {
+            if plan_has_outer_refs(&subplan.0) {
+                return Err(correlated_over_aggregate_error());
+            }
+            Ok(BoundExpr::QuantifiedSubquery {
+                subplan,
+                all,
+                cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
+            })
+        }
+        // `x op ANY/ALL(array)` has no subplan; rewrite both operands so any
+        // aggregate/group-key reference inside them is redirected to the
+        // aggregate node's output row.
+        BoundExpr::QuantifiedArray { array, all, cmp } => Ok(BoundExpr::QuantifiedArray {
+            array: Box::new(rewrite_over_aggregate(*array, group_exprs, aggregates, scope)?),
+            all,
+            cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
+        }),
     }
 }
 

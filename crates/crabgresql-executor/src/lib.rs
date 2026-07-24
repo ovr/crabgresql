@@ -605,8 +605,17 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
                 resolve_expr(a, ctx, txn)?;
             }
         }
-        // The IN needle (in `cmp`) may itself hold a subquery; fold those first.
-        BoundExpr::InSubquery { cmp, .. } => resolve_expr(cmp, ctx, txn)?,
+        // The IN / ANY / ALL needle (in `cmp`) may itself hold a subquery; fold
+        // those first.
+        BoundExpr::InSubquery { cmp, .. } | BoundExpr::QuantifiedSubquery { cmp, .. } => {
+            resolve_expr(cmp, ctx, txn)?
+        }
+        // `x op ANY/ALL(array)` is an ordinary expression, not a foldable marker;
+        // recurse into both operands so any nested subqueries fold.
+        BoundExpr::QuantifiedArray { array, cmp, .. } => {
+            resolve_expr(array, ctx, txn)?;
+            resolve_expr(cmp, ctx, txn)?;
+        }
         BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
     }
     // A correlated subquery cannot fold to a constant here — its value depends on
@@ -632,7 +641,8 @@ fn is_foldable_subquery(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::ScalarSubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
-        | BoundExpr::InSubquery { subplan, .. } => {
+        | BoundExpr::InSubquery { subplan, .. }
+        | BoundExpr::QuantifiedSubquery { subplan, .. } => {
             !crabgresql_binder::plan_has_outer_refs(&subplan.0)
         }
         _ => false,
@@ -679,6 +689,10 @@ fn fold_subquery(
             } else {
                 in_expr
             })
+        }
+        BoundExpr::QuantifiedSubquery { subplan, all, cmp } => {
+            let rows = run_subplan(*subplan.0, ctx, txn)?;
+            build_quantified_chain(&cmp, subquery_column(rows), all, ctx)
         }
         // Not a subquery marker (unreachable — the caller matched one).
         other => Ok(other),
@@ -734,7 +748,8 @@ pub(crate) fn eval_correlated_subquery(
     let subplan = match marker {
         BoundExpr::ScalarSubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
-        | BoundExpr::InSubquery { subplan, .. } => subplan,
+        | BoundExpr::InSubquery { subplan, .. }
+        | BoundExpr::QuantifiedSubquery { subplan, .. } => subplan,
         // `eval` only calls this for a subquery marker.
         _ => {
             return Err(ExecError::new(
@@ -767,7 +782,14 @@ pub(crate) fn eval_correlated_subquery(
                 (true, other) => Ok(other),
             }
         }
-        // Unreachable: `subplan` above already matched these three variants.
+        BoundExpr::QuantifiedSubquery { all, cmp, .. } => {
+            let rows = run_subplan(logical, ctx, txn)?;
+            // Like the IN chain, the template's needle reads the current row, so
+            // evaluate the OR/AND chain against `row`.
+            let chain = build_quantified_chain(cmp, subquery_column(rows), *all, ctx)?;
+            eval::eval(&chain, row, ctx)
+        }
+        // Unreachable: `subplan` above already matched these four variants.
         _ => Ok(Value::Null),
     }
 }
@@ -869,6 +891,92 @@ fn balanced_or(mut nodes: Vec<BoundExpr>) -> BoundExpr {
             match it.next() {
                 Some(b) => merged.push(BoundExpr::Binary {
                     op: BinOp::Or,
+                    arg_ty: PgType::Bool,
+                    left: Box::new(a),
+                    right: Box::new(b),
+                }),
+                None => merged.push(a),
+            }
+        }
+        nodes = merged;
+    }
+    // Exactly one node remains (input was non-empty).
+    nodes.swap_remove(0)
+}
+
+/// The first column of a subquery's materialized rows — the candidate values a
+/// quantified comparison (`op ANY/ALL (SELECT …)`) chains over. An empty row
+/// contributes a NULL, matching `build_in_chain`.
+fn subquery_column(rows: Vec<Tuple>) -> Vec<Value> {
+    rows.into_iter()
+        .map(|mut row| {
+            if row.is_empty() {
+                Value::Null
+            } else {
+                row.swap_remove(0)
+            }
+        })
+        .collect()
+}
+
+/// Fold `left op ANY/ALL (values)` to the OR/AND chain PG defines it as: one
+/// `left op value` comparison per candidate, substituted into the `cmp`
+/// template's `<hole>` (preserving the binder's coercions), then combined into a
+/// balanced tree. `ANY`/`SOME` OR-chains (empty ⇒ false); `ALL` AND-chains
+/// (empty ⇒ true). Three-valued NULL logic falls out of `eval`'s Kleene AND/OR
+/// and each comparison's NULL short-circuit. Shared by the subquery and array
+/// forms.
+fn build_quantified_chain(
+    cmp: &BoundExpr,
+    values: Vec<Value>,
+    all: bool,
+    ctx: &ExecContext,
+) -> Result<BoundExpr, ExecError> {
+    let BoundExpr::Binary {
+        op,
+        arg_ty,
+        left,
+        right,
+    } = cmp
+    else {
+        return Err(ExecError::new(
+            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+            "ANY/ALL comparison template was not a binary comparison",
+        ));
+    };
+    let mut comparisons = Vec::with_capacity(values.len());
+    for value in values {
+        comparisons.push(BoundExpr::Binary {
+            op: *op,
+            arg_ty: *arg_ty,
+            left: left.clone(),
+            right: Box::new(substitute_hole(right, value, ctx)?),
+        });
+    }
+    Ok(if all {
+        balanced_and(comparisons)
+    } else {
+        balanced_or(comparisons)
+    })
+}
+
+/// Combine boolean expressions into a balanced `AND` tree (depth ⌈log₂ n⌉) — the
+/// `ALL` dual of [`balanced_or`]. An empty input is `true` (`op ALL` over an
+/// empty set holds vacuously).
+fn balanced_and(mut nodes: Vec<BoundExpr>) -> BoundExpr {
+    if nodes.is_empty() {
+        return BoundExpr::Const {
+            value: Value::Bool(true),
+            ty: PgType::Bool,
+        };
+    }
+    while nodes.len() > 1 {
+        let mut merged = Vec::with_capacity(nodes.len().div_ceil(2));
+        let mut it = nodes.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => merged.push(BoundExpr::Binary {
+                    op: BinOp::And,
                     arg_ty: PgType::Bool,
                     left: Box::new(a),
                     right: Box::new(b),

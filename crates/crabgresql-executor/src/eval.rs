@@ -153,7 +153,22 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
         // the outer row — and folded now, against this row.
         BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
-        | BoundExpr::InSubquery { .. } => crate::eval_correlated_subquery(expr, row, ctx),
+        | BoundExpr::InSubquery { .. }
+        | BoundExpr::QuantifiedSubquery { .. } => crate::eval_correlated_subquery(expr, row, ctx),
+        // `left op ANY/ALL(array)` is evaluated per row (both operands may depend
+        // on the row): materialize the array, then chain `left op elem` over its
+        // elements. A NULL array yields NULL.
+        BoundExpr::QuantifiedArray { array, all, cmp } => match eval(array, row, ctx)? {
+            Value::Null => Ok(Value::Null),
+            Value::Array { elems, .. } => {
+                let chain = crate::build_quantified_chain(cmp, elems, *all, ctx)?;
+                eval(&chain, row, ctx)
+            }
+            other => Err(ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                format!("ANY/ALL right operand is not an array: {other:?}"),
+            )),
+        },
     }
 }
 
