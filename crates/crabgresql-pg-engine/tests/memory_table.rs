@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::{
-    Column, RelPersistence, TableAm, TableEngine, TableSchema, Tid, Tuple,
+    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, RelPersistence, TableAm,
+    TableEngine, TableSchema, Tid, Tuple,
 };
 use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnContext, TxnFinalize, Xid};
 use crabgresql_types::{PgType, Value};
@@ -55,6 +56,89 @@ fn insert_committed(tm: &TransactionManager, table: &dyn TableAm, tuple: Tuple) 
 
 fn read(tm: &TransactionManager) -> TxnContext {
     tm.context(Xid::INVALID, CommandId::FIRST)
+}
+
+/// A UNIQUE index named `name` on column 0 (`id`).
+fn idx(name: &str) -> IndexMetadata {
+    IndexMetadata {
+        name: name.into(),
+        method: IndexMethod::BTree,
+        keys: vec![IndexKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }],
+        unique: true,
+        nulls_distinct: true,
+        constraint: Some(IndexConstraint::Unique),
+    }
+}
+
+/// Regression: the catalog's IXR1 (index-relfilenode) tail must skip memory
+/// tables just like every other section, or its positional zip desyncs and a
+/// permanent table's durable index relfilenode is read from the wrong slot — the
+/// physical B-tree is silently downgraded to metadata-only and its file is GC'd.
+#[test]
+fn memory_table_before_indexed_permanent_survives_restart() -> anyhow::Result<()> {
+    let h = setup();
+    // The memory table is created FIRST — that is what shifted the IXR1 tail.
+    let _m = h.engine.create_table(schema("m", RelPersistence::Unlogged))?;
+    let p = h.engine.create_table(schema("p", RelPersistence::Permanent))?;
+    insert_committed(&h.tm, &*p, vec![Value::Int4(1), Value::Text("one".into())]);
+    insert_committed(&h.tm, &*p, vec![Value::Int4(2), Value::Text("two".into())]);
+    h.engine.create_index("public", "p", idx("p_idx"))?;
+    assert!(p.supports_index_scan("p_idx"), "index should be physical when built");
+
+    h.engine.checkpoint(h.tm.allocate_xid())?;
+    drop(p);
+    drop(_m);
+    let dir = h.dir;
+    drop(h.engine);
+    drop(h.tm);
+
+    // Reopen: the permanent index must NOT have been corrupted into metadata-only,
+    // and its B-tree must still probe correctly.
+    let h2 = open(dir);
+    let p2 = h2.engine.open_table("p")?;
+    assert!(
+        p2.supports_index_scan("p_idx"),
+        "permanent index was silently downgraded by the IXR1 desync"
+    );
+    let rows: Vec<Value> = p2
+        .index_lookup("p_idx", &[Value::Int4(2)], &read(&h2.tm))
+        .expect("physical index should serve the probe")
+        .map(|(_, t)| t[1].clone())
+        .collect();
+    assert_eq!(rows, vec![Value::Text("two".into())]);
+
+    Ok(())
+}
+
+/// An index on a memory table (UNLOGGED/TEMP) must stay metadata-only: no physical
+/// B-tree, so no file under `base/` and no WAL — uniqueness is still enforced by
+/// the executor's visible-row scan, and lookups fall back to a heap scan.
+#[test]
+fn memory_table_index_is_metadata_only() -> anyhow::Result<()> {
+    let h = setup();
+    let m = h.engine.create_table(schema("m", RelPersistence::Unlogged))?;
+    insert_committed(&h.tm, &*m, vec![Value::Int4(1), Value::Text("one".into())]);
+    h.engine.create_index("public", "m", idx("m_idx"))?;
+
+    // No physical B-tree: the probe returns None (executor falls back to a scan).
+    assert!(!m.supports_index_scan("m_idx"));
+    assert!(
+        m.index_lookup("m_idx", &[Value::Int4(1)], &read(&h.tm)).is_none()
+    );
+    // Nothing touched disk: neither the heap (rel 1) nor any index file.
+    let base = h.dir.path().join("base");
+    for n in 1..=4 {
+        assert!(
+            !base.join(n.to_string()).exists(),
+            "memory table + its index must not write a file (base/{n} exists)"
+        );
+    }
+
+    Ok(())
 }
 
 #[test]

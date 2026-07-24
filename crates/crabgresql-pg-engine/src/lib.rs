@@ -510,8 +510,13 @@ impl TableEngine for PgEngine {
             .get(&(namespace.to_string(), table.to_string()))
             .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
         // Allocate a relfilenode only for a physical index; metadata-only indexes
-        // stay at relfilenode 0 (no file, no burned id).
-        let index_rel = if target.can_index(&index) {
+        // stay at relfilenode 0 (no file, no burned id). A memory table
+        // (UNLOGGED/TEMP) never gets a physical B-tree — it would write index pages
+        // to a real file under `base/` and WAL-log every mutation, contradicting
+        // the memory-table contract (RAM-only, no WAL). Its indexes stay
+        // metadata-only: uniqueness is still enforced by the executor's
+        // visible-row scan, and equality lookups fall back to a heap scan.
+        let index_rel = if target.can_index(&index) && !target.schema().persistence.is_memory() {
             self.catalog.alloc_relfilenode()
         } else {
             RelFileNode(0)

@@ -262,8 +262,14 @@ impl RelCatalog {
         else {
             return Ok(None);
         };
-        let rel = state.rels.remove(pos).rel;
-        self.persist(&state)?;
+        let removed = state.rels.remove(pos);
+        let rel = removed.rel;
+        // A memory table is excluded from `encode`, so removing it leaves the
+        // on-disk catalog byte-identical — skip the whole rewrite + fsync (this
+        // fires on every temp table at disconnect). Permanent tables still persist.
+        if !removed.persistence.is_memory() {
+            self.persist(&state)?;
+        }
         Ok(Some(RelFileNode(rel)))
     }
 
@@ -906,8 +912,8 @@ fn encode(state: &State) -> Vec<u8> {
     // each index's physical B-tree relfilenode, zipped back onto the metadata
     // decoded from the CRM1 block. Absent in a pre-B-tree file (all `rel = 0`).
     out.extend_from_slice(IDXR_MAGIC);
-    out.extend_from_slice(&(state.rels.len() as u32).to_le_bytes());
-    for r in &state.rels {
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
         out.extend_from_slice(&(r.indexes.len() as u32).to_le_bytes());
         for pi in &r.indexes {
             out.extend_from_slice(&pi.rel.to_le_bytes());
