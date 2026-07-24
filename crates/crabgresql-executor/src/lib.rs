@@ -1449,13 +1449,17 @@ fn update_routed(
                 }
             }
 
+            // `new_rows` is only read (for RETURNING) below; skip cloning into it
+            // when there's no RETURNING clause to project.
+            if returning.is_some() {
+                new_rows.push(new.clone());
+            }
             if src == dst {
-                pending_update[src].push((tid, new.clone()));
+                pending_update[src].push((tid, new));
             } else {
                 pending_delete[src].push(tid);
-                pending_insert[dst].push(new.clone());
+                pending_insert[dst].push(new);
             }
-            new_rows.push(new);
         }
     }
 
@@ -2612,11 +2616,16 @@ impl Aggregate {
                     // COUNT(*) counts every row, skipping no NULLs.
                     acc.count_row();
                 } else {
-                    let values = agg
-                        .args
-                        .iter()
-                        .map(|arg| eval(arg, &row, &self.ctx))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    // Evaluated into a small stack buffer, sized to the largest
+                    // aggregate arity (2, for `string_agg`), so the common
+                    // single-argument aggregates (sum/avg/min/max/count(expr))
+                    // don't pay a per-row Vec allocation.
+                    debug_assert!(agg.args.len() <= 2, "widen ARG_BUF for a >2-arg aggregate");
+                    let mut buf = [Value::Null, Value::Null];
+                    for (slot, arg) in buf.iter_mut().zip(agg.args.iter()) {
+                        *slot = eval(arg, &row, &self.ctx)?;
+                    }
+                    let values = &buf[..agg.args.len()];
                     // Every aggregate but COUNT(*) ignores rows whose value (the
                     // first argument) is NULL.
                     if !matches!(values[0], Value::Null) {

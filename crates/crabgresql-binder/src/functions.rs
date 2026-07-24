@@ -716,8 +716,8 @@ pub(crate) fn agg_return_type(
             PgType::Float4 | PgType::Float8 => Ok(PgType::Float8),
             _ => Err(unsupported()),
         },
-        // `string_agg(text, text)` always returns text; its two-argument form is
-        // bound directly (this arm keeps the match exhaustive).
+        // `string_agg(text, text)` always returns text; `bind_aggregate` calls
+        // this directly for the two-argument form's return type.
         AggFn::StringAgg => Ok(PgType::Text),
     }
 }
@@ -1854,13 +1854,13 @@ fn bind_aggregate(
     // aggregate. Both arguments must be text (PG defines only the text and bytea
     // overloads); a non-text-family argument has no overload.
     if agg == AggFn::StringAgg {
+        if bound.len() != 2 || !bound.iter().all(|b| crate::expr::is_text_family(b.ty())) {
+            return Err(undefined_arity());
+        }
         if distinct {
             return Err(BindError::feature_not_supported(
                 "string_agg(DISTINCT ...) is not supported yet",
             ));
-        }
-        if bound.len() != 2 || !bound.iter().all(|b| crate::expr::is_text_family(b.ty())) {
-            return Err(undefined_arity());
         }
         let delim = crate::expr::coerce_expr(bound.pop().expect("delimiter"), PgType::Text)?;
         let value = crate::expr::coerce_expr(bound.pop().expect("value"), PgType::Text)?;
@@ -1869,7 +1869,7 @@ fn bind_aggregate(
             distinct: false,
             args: vec![value, delim],
             input_ty: PgType::Text,
-            ret: PgType::Text,
+            ret: agg_return_type(agg, PgType::Text, scope)?,
         }));
     }
 

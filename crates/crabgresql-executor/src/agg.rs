@@ -129,11 +129,11 @@ impl Accumulator {
     /// Fold one row's argument values into the running state. `values[0]` is the
     /// value (already known non-null); `string_agg` also reads `values[1]` as the
     /// per-row delimiter.
-    pub fn accumulate(&mut self, mut values: Vec<Value>) -> Result<(), ExecError> {
+    pub fn accumulate(&mut self, values: &[Value]) -> Result<(), ExecError> {
         match &mut self.state {
             AggState::Count(n) => *n += 1,
             AggState::Extreme { ty, want_max, cur } => {
-                let v = values.swap_remove(0);
+                let v = values[0].clone();
                 let replace = match cur {
                     None => true,
                     Some(c) => {
@@ -191,12 +191,13 @@ impl Accumulator {
             AggState::StringAgg { cur } => {
                 let value = match &values[0] {
                     Value::Text(s) => s.as_str(),
-                    _ => "",
+                    other => unreachable!("binder rejected string_agg({other:?}, _)"),
                 };
                 // A NULL (or absent) delimiter contributes nothing between values.
                 let delim = match values.get(1) {
+                    None | Some(Value::Null) => "",
                     Some(Value::Text(s)) => s.as_str(),
-                    _ => "",
+                    other => unreachable!("binder rejected string_agg(_, {other:?})"),
                 };
                 match cur {
                     None => *cur = Some(value.to_string()),
