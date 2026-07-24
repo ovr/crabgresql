@@ -188,11 +188,18 @@ pub struct RelationMetadata {
 }
 
 /// How a relation is stored, mirroring PostgreSQL's `pg_class.relpersistence`.
-/// `Permanent` (`'p'`) tables live on disk and are WAL-logged. `Unlogged` (`'u'`)
-/// and `Temporary` (`'t'`) tables are "memory tables": their pages live in RAM in
-/// the storage manager and their mutations skip the WAL, so they are lost on
-/// restart. Temporary tables additionally live in a per-session `pg_temp_N`
-/// namespace and are dropped at disconnect.
+/// Three classes differing along three independent axes — storage, WAL, and
+/// catalog durability:
+///
+/// | class | storage | WAL | catalog row | on crash |
+/// |---|---|---|---|---|
+/// | `Permanent` (`'p'`) | on-disk | logged | persisted | recovered from WAL |
+/// | `Unlogged` (`'u'`) | on-disk | skipped | persisted | truncated to empty |
+/// | `Temporary` (`'t'`) | RAM | skipped | not persisted | (session-scoped) |
+///
+/// `Unlogged` therefore behaves like `Permanent` except it skips the WAL and its
+/// data (not its definition) is reset after a crash — as in PostgreSQL. Use the
+/// axis-specific helpers below rather than testing the variant directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RelPersistence {
     #[default]
@@ -202,10 +209,29 @@ pub enum RelPersistence {
 }
 
 impl RelPersistence {
-    /// Whether this relation is backed by RAM and skips the WAL (an `Unlogged` or
-    /// `Temporary` "memory table"), as opposed to a durable, WAL-logged heap.
-    pub fn is_memory(self) -> bool {
+    /// Storage axis: whether the relation's pages live in RAM (the storage
+    /// manager's memory store) rather than an on-disk file. Only `Temporary`.
+    pub fn is_ram_backed(self) -> bool {
+        matches!(self, RelPersistence::Temporary)
+    }
+
+    /// WAL axis: whether mutations skip the write-ahead log (`Unlogged` and
+    /// `Temporary`). WAL-skipped pages evict straight to their backing store.
+    pub fn is_wal_skipped(self) -> bool {
         matches!(self, RelPersistence::Unlogged | RelPersistence::Temporary)
+    }
+
+    /// Catalog axis: whether the relation's catalog row is written to the durable
+    /// catalog file, so its definition survives a restart (`Permanent`,
+    /// `Unlogged`). `Temporary` rows are never persisted.
+    pub fn persists_catalog(self) -> bool {
+        matches!(self, RelPersistence::Permanent | RelPersistence::Unlogged)
+    }
+
+    /// Whether this is specifically an `Unlogged` relation — on-disk but
+    /// WAL-silent, and reset to empty after a crash.
+    pub fn is_unlogged(self) -> bool {
+        matches!(self, RelPersistence::Unlogged)
     }
 
     /// The `pg_class.relpersistence` character for this relation.
@@ -517,6 +543,11 @@ pub trait TableEngine: Send + Sync {
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError>;
 
+    /// Flush all data and record a clean shutdown, so a durable engine does NOT
+    /// reset its unlogged relations at the next startup. Called once on graceful
+    /// server exit. The default is a no-op (engines with no durable state).
+    fn shutdown(&self) {}
+
     /// Remove a table and all its data from `namespace`. `TableNotFound` if it
     /// doesn't exist.
     fn drop_table(&self, namespace: &str, name: &str) -> Result<(), StorageError>;
@@ -600,6 +631,18 @@ pub trait TableEngine: Send + Sync {
     /// engines that keep a relation registry override it.
     fn relations(&self) -> Vec<TableSchema> {
         Vec::new()
+    }
+
+    /// Names of relations in `namespace`, without cloning full schemas. The
+    /// default derives from [`relations`](Self::relations); engines keyed by
+    /// namespace override it to read just the names. Used for per-namespace
+    /// teardown (dropping a session's temp tables at disconnect).
+    fn relation_names_in(&self, namespace: &str) -> Vec<String> {
+        self.relations()
+            .into_iter()
+            .filter(|s| s.namespace == namespace)
+            .map(|s| s.name)
+            .collect()
     }
 
     /// Enumerate user relations including live index metadata for catalog

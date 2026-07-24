@@ -21,8 +21,8 @@ use crabgresql_pg_wire::{TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
     PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
-    SequenceDefinition, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog,
-    ViewDefinition,
+    RelationMetadata, SequenceDefinition, StorageError, TableAm, TableEngine, TableSchema,
+    TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -173,6 +173,32 @@ pub struct Analyzed {
     pub result_columns: Option<Vec<OutputColumn>>,
 }
 
+/// The per-session relation-visibility rule, in one place: temp tables from every
+/// session share the one engine (each under its own `pg_temp_N` namespace,
+/// persistence `Temporary`), so a session may see only the **permanent** relations
+/// plus the **temp** relations in ITS OWN `temp_schema` — never another session's.
+/// Splits an engine-wide `relation_metadata()` snapshot into `(permanent, own_temp)`;
+/// foreign temp relations fall out of both. Used by the catalog reflection and by
+/// `execute_drop_index` so the rule is not re-derived per call site.
+fn partition_session_relations(
+    all: Vec<RelationMetadata>,
+    temp_schema: &str,
+) -> (Vec<RelationMetadata>, Vec<RelationMetadata>) {
+    let mut permanent = Vec::new();
+    let mut own_temp = Vec::new();
+    for m in all {
+        if m.schema.persistence == RelPersistence::Temporary {
+            if m.schema.namespace == temp_schema {
+                own_temp.push(m);
+            }
+            // A foreign session's temp relation is invisible here.
+        } else {
+            permanent.push(m);
+        }
+    }
+    (permanent, own_temp)
+}
+
 /// Build the binder's two catalog views for this session: the `pg_temp`-first
 /// relation overlay (temp shadows permanent, both behind the read-only
 /// `pg_catalog`) and the user-type/cast view. Shared by `execute_statement` and
@@ -194,6 +220,8 @@ fn bind_catalogs(
         let database = session.database.clone();
         let owner = session.user.clone();
         let temp_schema = session.temp_schema.clone();
+        let temp_schema_for_nsp = session.temp_schema.clone();
+        let temp_namespace_oid = session.temp_namespace_oid;
         // User-defined types are reflected into pg_type/pg_enum on demand.
         let types = global_catalog.clone();
         Arc::new(
@@ -201,31 +229,22 @@ fn bind_catalogs(
                 database,
                 owner,
                 move || {
-                    // Temp tables from every session live in the one shared engine
-                    // now (each under its own `pg_temp_N` namespace, persistence
-                    // Temporary). Reflect the permanent tables, plus only THIS
-                    // session's temp tables — so a session never sees another's
-                    // temp relations, exactly as before.
-                    let all = global.relation_metadata();
-                    let mut rels: Vec<_> = all
-                        .iter()
-                        .filter(|m| m.schema.persistence != RelPersistence::Temporary)
-                        .cloned()
+                    // Reflect the permanent relations plus only THIS session's temp
+                    // relations (the shared visibility rule).
+                    let (permanent, own_temp) =
+                        partition_session_relations(global.relation_metadata(), &temp_schema);
+                    let mut rels: Vec<_> = permanent
+                        .into_iter()
                         .map(crabgresql_catalog::CatalogRelation::permanent_metadata)
                         .collect();
-                    rels.extend(
-                        all.into_iter()
-                            .filter(|m| m.schema.namespace == temp_schema)
-                            .map(|metadata| {
-                                let mut relation =
-                                    crabgresql_catalog::CatalogRelation::temporary(
-                                        metadata.schema,
-                                        temp_schema.clone(),
-                                    );
-                                relation.indexes = metadata.indexes;
-                                relation
-                            }),
-                    );
+                    rels.extend(own_temp.into_iter().map(|metadata| {
+                        let mut relation = crabgresql_catalog::CatalogRelation::temporary(
+                            metadata.schema,
+                            temp_schema.clone(),
+                        );
+                        relation.indexes = metadata.indexes;
+                        relation
+                    }));
                     // Views reflect into pg_class as relkind='v' / pg_attribute
                     // columns / information_schema.tables as VIEW.
                     rels.extend(global.views().into_iter().map(|view| {
@@ -266,7 +285,21 @@ fn bind_catalogs(
                     })
                     .collect()
             })
-            .with_schemas_fn(move || schemas_engine.schemas()),
+            .with_schemas_fn(move || {
+                let mut schemas = schemas_engine.schemas();
+                // Reflect this session's `pg_temp_N` namespace with a stable
+                // synthetic OID, but only once it holds a temp relation (as PG
+                // instantiates pg_temp_N lazily). Feeding it through the one
+                // `schemas` list keeps `pg_namespace` and `pg_class.relnamespace`
+                // consistent; nothing is persisted. `relation_names_in` is cheap.
+                if !schemas_engine
+                    .relation_names_in(&temp_schema_for_nsp)
+                    .is_empty()
+                {
+                    schemas.push((temp_schema_for_nsp.clone(), temp_namespace_oid));
+                }
+                schemas
+            }),
         )
     };
     let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
@@ -3968,17 +4001,13 @@ fn execute_drop_index(
             ));
         }
     }
-    // Snapshot the engine's relations once. Temp tables live in this session's
-    // `pg_temp_N` namespace in the same engine, so split the snapshot by namespace.
-    let global_meta = engine.relation_metadata();
-    let temp_meta: Vec<_> = global_meta
-        .iter()
-        .filter(|r| r.schema.namespace == session.temp_schema)
-        .cloned()
-        .collect();
+    // Snapshot the engine's relations once, split into the permanent set and this
+    // session's temp set (the shared visibility rule).
+    let (permanent_meta, temp_meta) =
+        partition_session_relations(engine.relation_metadata(), &session.temp_schema);
     let mut notices = Vec::new();
-    // (is_temp, namespace, owning table, index name) to remove in phase 2.
-    let mut to_drop: Vec<(bool, String, String, String)> = Vec::new();
+    // (namespace, owning table, index name) to remove in phase 2.
+    let mut to_drop: Vec<(String, String, String)> = Vec::new();
     for (schema_qual, name) in &targets {
         let ns = schema_qual.as_deref().unwrap_or("public");
         // A temp index lives in the session temp keyspace (`pg_temp`); only an
@@ -3995,7 +4024,7 @@ fn execute_drop_index(
             })
             .flatten()
             .or_else(|| {
-                global_meta
+                permanent_meta
                     .iter()
                     .find(|r| r.schema.namespace == ns && r.indexes.iter().any(|i| i.name == *name))
                     .map(|rel| (false, rel))
@@ -4027,12 +4056,7 @@ fn execute_drop_index(
             } else {
                 rel.schema.namespace.as_str()
             };
-            to_drop.push((
-                is_temp,
-                drop_ns.to_string(),
-                rel.schema.name.clone(),
-                name.clone(),
-            ));
+            to_drop.push((drop_ns.to_string(), rel.schema.name.clone(), name.clone()));
         } else if catalog.resolve(schema_qual.as_deref(), name).is_ok() {
             return Err(PgError::new(
                 sqlstate::WRONG_OBJECT_TYPE,
@@ -4068,7 +4092,7 @@ fn execute_drop_index(
     // Route each drop to the concrete store that owns the index, rather than the
     // session overlay's table-name shadowing (which would misroute a permanent
     // index when a temp table shares its table's name).
-    for (_is_temp, ns, table, index_name) in &to_drop {
+    for (ns, table, index_name) in &to_drop {
         engine.drop_index(ns, table, index_name)?;
     }
     Ok(QueryResult::Command {

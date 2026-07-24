@@ -53,6 +53,12 @@ const PART_MAGIC: &[u8; 4] = b"PART";
 /// block). A reader that predates physical indexes stops above, so every index
 /// decodes with `rel = 0` (metadata-only) — exactly today's behavior.
 const IDXR_MAGIC: &[u8; 4] = b"IXR1";
+/// Marks the persistence section, appended after the [`IDXR_MAGIC`] block — a
+/// seventh backward-compatible tail carrying each relation's `relpersistence`
+/// (one byte per relation in `rels` order: `'p'` permanent, `'u'` unlogged; only
+/// those two persist). A reader that predates this tail stops above and treats
+/// every persisted relation as permanent.
+const RPRS_MAGIC: &[u8; 4] = b"RPR1";
 
 struct PersistCol {
     name: String,
@@ -264,10 +270,10 @@ impl RelCatalog {
         };
         let removed = state.rels.remove(pos);
         let rel = removed.rel;
-        // A memory table is excluded from `encode`, so removing it leaves the
+        // A `Temporary` table is excluded from `encode`, so removing it leaves the
         // on-disk catalog byte-identical — skip the whole rewrite + fsync (this
-        // fires on every temp table at disconnect). Permanent tables still persist.
-        if !removed.persistence.is_memory() {
+        // fires on every temp table at disconnect). Permanent/Unlogged rows persist.
+        if removed.persistence.persists_catalog() {
             self.persist(&state)?;
         }
         Ok(Some(RelFileNode(rel)))
@@ -357,15 +363,15 @@ impl RelCatalog {
             return Ok(Some(new));
         }
         rel.rel = new.0;
-        // A memory table (UNLOGGED/TEMP) is excluded from `encode`, so persisting
-        // here would rewrite + fsync the whole catalog to produce identical bytes.
-        // Update the in-memory relfilenode (so a later DROP unlinks the right RAM
-        // rel) but skip the disk write entirely.
-        let is_memory = rel.persistence.is_memory();
+        // A `Temporary` table is excluded from `encode`, so persisting here would
+        // rewrite + fsync the whole catalog to produce identical bytes. Update the
+        // in-memory relfilenode (so a later DROP unlinks the right rel) but skip the
+        // disk write. Permanent/Unlogged persist the swapped relfilenode.
+        let persists = rel.persistence.persists_catalog();
         // Keep `next` above the swapped-in id even if it was allocated on a
         // previous boot and the counter was rebuilt from an older catalog file.
         state.next = state.next.max(new.0 + 1);
-        if !is_memory {
+        if persists {
             self.persist(&state)?;
         }
         Ok(Some(RelFileNode(old)))
@@ -411,6 +417,31 @@ impl RelCatalog {
             .flat_map(|r| {
                 std::iter::once(r.rel)
                     .chain(r.indexes.iter().map(|i| i.rel).filter(|&rel| rel != 0))
+            })
+            .collect()
+    }
+
+    /// Each `Unlogged` relation's `(heap relfilenode, physical index relfilenodes)`.
+    /// The startup crash-reset (`PgEngine::reset_unlogged_relations`) empties these
+    /// files, since their WAL-skipped pages were never protected against a torn crash.
+    pub fn unlogged_relfilenodes(&self) -> Vec<(RelFileNode, Vec<RelFileNode>)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
+            .rels
+            .iter()
+            .filter(|r| r.persistence.is_unlogged())
+            .map(|r| {
+                let indexes = r
+                    .indexes
+                    .iter()
+                    .map(|i| i.rel)
+                    .filter(|&rel| rel != 0)
+                    .map(RelFileNode)
+                    .collect();
+                (RelFileNode(r.rel), indexes)
             })
             .collect()
     }
@@ -753,15 +784,17 @@ fn put_i64(out: &mut Vec<u8>, v: i64) {
 
 fn encode(state: &State) -> Vec<u8> {
     let mut out = Vec::new();
-    // Memory tables (UNLOGGED/TEMP) never persist: they live only in the in-memory
-    // `State` for this run's name resolution. Every rels section below iterates
-    // this filtered list so the positional tails (namespaces, partitioning) stay
-    // aligned. `next` is still written verbatim, so a memory relfilenode is never
+    // `Temporary` tables never persist: they live only in the in-memory `State`
+    // for this run's name resolution. `Permanent` and `Unlogged` both persist their
+    // definition (an Unlogged table's rows are reset on crash, but its catalog row
+    // survives). Every rels section below iterates this filtered list so the
+    // positional tails (namespaces, partitioning, index relfilenodes, persistence)
+    // stay aligned. `next` is written verbatim, so a temp relfilenode is never
     // reused after restart even though its record is dropped.
     let rels: Vec<&PersistRel> = state
         .rels
         .iter()
-        .filter(|r| !r.persistence.is_memory())
+        .filter(|r| r.persistence.persists_catalog())
         .collect();
     out.extend_from_slice(&state.next.to_le_bytes());
     out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
@@ -918,6 +951,14 @@ fn encode(state: &State) -> Vec<u8> {
         for pi in &r.indexes {
             out.extend_from_slice(&pi.rel.to_le_bytes());
         }
+    }
+    // Persistence: a seventh backward-compatible tail, one `relpersistence` byte per
+    // relation in `rels` order. Only Permanent/Unlogged reach here; `decode`
+    // defaults to Permanent when this tail is absent (a pre-persistence catalog).
+    out.extend_from_slice(RPRS_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        out.push(r.persistence.as_char() as u8);
     }
     out
 }
@@ -1248,6 +1289,18 @@ fn decode(bytes: &[u8]) -> State {
                     pi.rel = rel;
                 }
             }
+        }
+    }
+    // Persistence tail: each relation's relpersistence, zipped by position. Absent
+    // in a pre-persistence file — every relation keeps the Permanent default above.
+    if d.remaining().starts_with(RPRS_MAGIC) {
+        d.p += RPRS_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            r.persistence = match d.byte() {
+                b'u' => RelPersistence::Unlogged,
+                _ => RelPersistence::Permanent,
+            };
         }
     }
     State {

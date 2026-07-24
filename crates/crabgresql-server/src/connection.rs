@@ -99,6 +99,7 @@ pub async fn handle_connection(
         database,
         user,
         format!("pg_temp_{backend_id}"),
+        crate::session::TEMP_NAMESPACE_OID_BASE + backend_id as u32,
     );
 
     // After an error on an extended-protocol message, PG discards everything

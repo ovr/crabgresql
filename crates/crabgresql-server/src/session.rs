@@ -15,6 +15,13 @@ use crabgresql_storage_api::{SequenceAdvance, TableEngine};
 use crabgresql_txn::{CommandId, IsolationLevel, LockOwner, Snapshot, TransactionManager, Xid};
 use crabgresql_types::{PgType, Value};
 
+/// Base for a session's synthetic `pg_temp_N` namespace OID. A high reserved band
+/// disjoint from the built-in namespace OIDs (`pg_catalog`=11, `pg_toast`=99,
+/// `public`=2200) and user `CREATE SCHEMA` OIDs (from `FIRST_NORMAL_OBJECT_ID`
+/// 16384 up), so `pg_class.relnamespace` and `pg_namespace` agree for temp tables
+/// without persisting the temp schema. `backend_id + this` stays well below u32 max.
+pub(crate) const TEMP_NAMESPACE_OID_BASE: u32 = 0x7000_0000;
+
 /// A prepared statement (extended protocol `Parse`). Parse-analysis runs once,
 /// here, so `Describe` can answer without executing and `Bind` knows each
 /// parameter's type. Re-binding at `Execute` uses these resolved types, so the
@@ -109,6 +116,12 @@ pub struct Session {
     pub user: String,
     /// Concrete namespace assigned to this connection's temporary relations.
     pub temp_schema: String,
+    /// Synthetic OID reflected for [`Session::temp_schema`] in `pg_namespace` and
+    /// `pg_class.relnamespace` once the session instantiates a temp relation. A
+    /// high reserved value (see [`TEMP_NAMESPACE_OID_BASE`]) disjoint from built-in
+    /// and user-schema OIDs, so the reflection is consistent without persisting the
+    /// temp schema.
+    pub temp_namespace_oid: u32,
     /// `extra_float_digits` GUC — controls float→text output precision.
     pub extra_float_digits: i32,
     /// `default_transaction_isolation` GUC — the isolation level a new block
@@ -357,6 +370,7 @@ impl Session {
         database: impl Into<String>,
         user: impl Into<String>,
         temp_schema: impl Into<String>,
+        temp_namespace_oid: u32,
     ) -> Self {
         // PG's default since v12.
         let lock_owner = txnmgr.new_lock_owner();
@@ -364,6 +378,7 @@ impl Session {
             database: database.into(),
             user: user.into(),
             temp_schema: temp_schema.into(),
+            temp_namespace_oid,
             extra_float_digits: 1,
             default_iso: IsolationLevel::ReadCommitted,
             default_read_only: false,
@@ -437,13 +452,9 @@ impl Drop for Session {
         let engine = Arc::clone(&self.engine);
         let temp_schema = self.temp_schema.clone();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let temp: Vec<String> = engine
-                .relations()
-                .into_iter()
-                .filter(|s| s.namespace == temp_schema)
-                .map(|s| s.name)
-                .collect();
-            for name in temp {
+            // O(this session's temp tables), reading just their names — not a
+            // deep clone of every schema in the cluster.
+            for name in engine.relation_names_in(&temp_schema) {
                 let _ = engine.drop_table(&temp_schema, &name);
             }
         }));
