@@ -42,7 +42,7 @@ struct Args {
     no_setup: bool,
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
 
