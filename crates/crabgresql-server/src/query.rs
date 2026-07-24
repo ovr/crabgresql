@@ -2545,6 +2545,8 @@ fn execute_create_table_as(
             projections,
         },
         returning: None,
+        // CTAS populates a freshly-created ordinary table — never partitioned.
+        routing: None,
     };
 
     // Run the populate INSERT through the standard write tail. The DDL catalog

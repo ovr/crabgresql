@@ -4360,17 +4360,45 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
     let msgs = client.simple_query("SELECT id FROM m_2024").await?;
     assert_eq!(rows(&msgs)[0].get(0), Some("1"));
 
-    // INSERT and SELECT against the parent are rejected honestly (routing and
-    // union scans are not implemented yet).
-    let err = client
+    // An INSERT through the parent routes each row to the leaf whose range admits
+    // its key: '2024-07-01' lands in m_2024, so the parent now holds two rows.
+    client
         .simple_query("INSERT INTO m VALUES (2, '2024-07-01')")
+        .await?;
+    let msgs = client.simple_query("SELECT id FROM m_2024 ORDER BY id").await?;
+    let leaf_ids: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(leaf_ids, vec![Some("1"), Some("2")]);
+
+    // A SELECT from the parent unions its partitions.
+    let msgs = client.simple_query("SELECT id FROM m ORDER BY id").await?;
+    let parent_ids: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(parent_ids, vec![Some("1"), Some("2")]);
+
+    // EXPLAIN of the parent shows an Append with one Seq Scan per partition.
+    let plan = client.simple_query("EXPLAIN SELECT * FROM m").await?;
+    let lines: Vec<&str> = rows(&plan).iter().filter_map(|r| r.get(0)).collect();
+    assert_eq!(lines[0], "Append");
+    assert!(
+        lines.iter().any(|l| l.contains("Seq Scan on m_2024")),
+        "plan was {lines:?}"
+    );
+
+    // A key admitted by no partition is rejected (23514), and nothing is written.
+    let err = client
+        .simple_query("INSERT INTO m VALUES (3, '2020-01-01')")
         .await
         .unwrap_err();
     assert_eq!(
         err.as_db_error().expect("database error").code(),
-        &SqlState::FEATURE_NOT_SUPPORTED
+        &SqlState::CHECK_VIOLATION
     );
-    let err = client.simple_query("SELECT * FROM m").await.unwrap_err();
+    assert_eq!(rows(&client.simple_query("SELECT count(*) FROM m").await?)[0].get(0), Some("2"));
+
+    // UPDATE/DELETE directly on the parent are still unsupported (0A000).
+    let err = client
+        .simple_query("DELETE FROM m WHERE id = 1")
+        .await
+        .unwrap_err();
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED

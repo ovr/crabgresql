@@ -221,6 +221,14 @@ pub fn execute(
             columns,
             ctx,
         ),
+        PhysicalPlan::Append { tables, columns } => {
+            // A partitioned parent read: concatenate every leaf's scan. The
+            // wrapping Subquery applies this level's projection/predicate/sort.
+            Ok(Execution::Rows {
+                columns,
+                node: Box::new(Append::new(&tables, txn)),
+            })
+        }
         PhysicalPlan::IndexScan {
             table,
             index_name,
@@ -341,7 +349,8 @@ pub fn execute(
             table,
             source,
             returning,
-        } => execute_insert(&table, source, returning, ctx, txn),
+            routing,
+        } => execute_insert(&table, source, returning, routing, ctx, txn),
         PhysicalPlan::Update {
             table,
             predicate,
@@ -386,6 +395,8 @@ fn resolve_subqueries(
             resolve_exprs(projections, ctx, txn)?;
             resolve_opt(predicate, ctx, txn)?;
         }
+        // An Append holds only leaf table handles — no subquery expressions.
+        PhysicalPlan::Append { .. } => {}
         PhysicalPlan::IndexScan {
             key,
             projections,
@@ -1026,6 +1037,70 @@ fn execute_insert(
     table: &Arc<dyn TableAm>,
     source: PhysicalInsertSource,
     returning: Option<Returning>,
+    routing: Option<Vec<Arc<dyn TableAm>>>,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Execution, ExecError> {
+    // Materialize every source tuple before any write. Draining a query source
+    // to completion first is what makes `INSERT INTO t SELECT ... FROM t` read
+    // only pre-insert rows (no Halloween problem), and lets validation/routing
+    // see a stable set so the statement stays all-or-nothing.
+    let tuples = collect_insert_tuples(source, ctx, txn)?;
+    match routing {
+        // Partitioned parent: route each row to the leaf whose RANGE bound admits
+        // its key and write there.
+        Some(leaves) => insert_routed(table, tuples, returning, &leaves, ctx, txn),
+        // Ordinary table: rows go straight to `table`.
+        None => insert_direct(table, tuples, returning, ctx, txn),
+    }
+}
+
+/// Evaluate an INSERT's source into fully-formed, schema-order tuples. No
+/// validation or writing happens here; the caller does both after the whole
+/// source is consumed.
+fn collect_insert_tuples(
+    source: PhysicalInsertSource,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Vec<Tuple>, ExecError> {
+    let mut tuples: Vec<Tuple> = Vec::new();
+    match source {
+        PhysicalInsertSource::Values(rows) => {
+            for row in &rows {
+                tuples.push(
+                    row.iter()
+                        .map(|expr| eval(expr, &[], ctx))
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+        }
+        PhysicalInsertSource::Query { input, projections } => {
+            let Execution::Rows { mut node, .. } = execute(*input, ctx, txn)? else {
+                return Err(ExecError::new(
+                    "XX000",
+                    "insert source did not produce a row set",
+                ));
+            };
+            while let Some(row) = node.next()? {
+                tuples.push(
+                    projections
+                        .iter()
+                        .map(|expr| eval(expr, &row, ctx))
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+        }
+    }
+    Ok(tuples)
+}
+
+/// Constraint-check and write every tuple to a single table (the non-partitioned
+/// path). Each row is validated against the pre-existing rows plus the earlier
+/// rows of this statement, so a duplicate within one INSERT is caught.
+fn insert_direct(
+    table: &Arc<dyn TableAm>,
+    tuples: Vec<Tuple>,
+    returning: Option<Returning>,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -1037,44 +1112,10 @@ fn execute_insert(
     } else {
         Vec::new()
     };
-    // Build and constraint-check every insert tuple into `tuples` before any
-    // write. Validation never writes, so doing it while draining a query source
-    // is safe: `table.insert` only runs after the child is fully consumed, so
-    // `INSERT INTO t SELECT ... FROM t` reads only pre-insert rows (no Halloween
-    // problem).
-    let mut tuples: Vec<Tuple> = Vec::new();
-    let mut add = |tuple: Tuple, visible: &mut Vec<Tuple>| -> Result<(), ExecError> {
-        validate_constraints(table, &tuple, visible.iter(), ctx)?;
+    for tuple in &tuples {
+        validate_constraints(table, tuple, visible.iter(), ctx)?;
         if has_unique {
             visible.push(tuple.clone());
-        }
-        tuples.push(tuple);
-        Ok(())
-    };
-    match source {
-        PhysicalInsertSource::Values(rows) => {
-            for row in &rows {
-                let tuple = row
-                    .iter()
-                    .map(|expr| eval(expr, &[], ctx))
-                    .collect::<Result<_, _>>()?;
-                add(tuple, &mut visible)?;
-            }
-        }
-        PhysicalInsertSource::Query { input, projections } => {
-            let Execution::Rows { mut node, .. } = execute(*input, ctx, txn)? else {
-                return Err(ExecError::new(
-                    "XX000",
-                    "insert source did not produce a row set",
-                ));
-            };
-            while let Some(row) = node.next()? {
-                let tuple = projections
-                    .iter()
-                    .map(|expr| eval(expr, &row, ctx))
-                    .collect::<Result<_, _>>()?;
-                add(tuple, &mut visible)?;
-            }
         }
     }
     let inserted = tuples.len() as u64;
@@ -1088,12 +1129,97 @@ fn execute_insert(
     for tuple in tuples {
         table.insert(tuple, txn);
     }
+    finish_insert(returning, output, inserted)
+}
+
+/// Route each tuple to the leaf partition of `parent` that admits its key, then
+/// validate and write. Routing runs for the whole batch first: a row whose key
+/// no leaf admits (or a NULL key) fails the statement before any write, matching
+/// PostgreSQL's tuple-routing error. Validation is against the destination leaf,
+/// so a NOT NULL violation names that partition (as PG does); partitions carry
+/// no unique index, so no per-leaf snapshot is needed.
+fn insert_routed(
+    parent: &Arc<dyn TableAm>,
+    tuples: Vec<Tuple>,
+    returning: Option<Returning>,
+    leaves: &[Arc<dyn TableAm>],
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Execution, ExecError> {
+    let parent_schema = parent.schema();
+    let routes: Vec<usize> = tuples
+        .iter()
+        .map(|tuple| route_tuple(parent_schema, leaves, tuple, ctx))
+        .collect::<Result<_, _>>()?;
+    for (tuple, &leaf) in tuples.iter().zip(&routes) {
+        validate_constraints(&leaves[leaf], tuple, std::iter::empty(), ctx)?;
+    }
+    let inserted = tuples.len() as u64;
+    let output = match &returning {
+        Some(returning) => Some(project_returning(&tuples, &returning.projections, ctx)?),
+        None => None,
+    };
+    for (tuple, leaf) in tuples.into_iter().zip(routes) {
+        leaves[leaf].insert(tuple, txn);
+    }
+    finish_insert(returning, output, inserted)
+}
+
+/// Shared tail of the INSERT paths: emit RETURNING rows or the inserted count.
+fn finish_insert(
+    returning: Option<Returning>,
+    output: Option<Vec<Tuple>>,
+    inserted: u64,
+) -> Result<Execution, ExecError> {
     match (returning, output) {
         (Some(returning), Some(output)) => {
             Ok(returning_rows(output, returning.columns, DmlVerb::Insert))
         }
         _ => Ok(Execution::Inserted(inserted)),
     }
+}
+
+/// Pick the leaf partition of `parent` whose RANGE bound admits `tuple`'s
+/// partition key, returning its index in `leaves`. A NULL key — which no range
+/// partition accepts — or a key outside every leaf's bound is rejected with
+/// `23514`, matching PostgreSQL's `no partition of relation … found for row`.
+fn route_tuple(
+    parent: &TableSchema,
+    leaves: &[Arc<dyn TableAm>],
+    tuple: &Tuple,
+    ctx: &ExecContext,
+) -> Result<usize, ExecError> {
+    // Only single-column RANGE partitions exist (enforced at DDL time), and the
+    // key column type is DDL-guaranteed orderable, so `compare_values` is safe.
+    let scheme = parent
+        .partition_scheme
+        .as_ref()
+        .expect("routing target is a partitioned parent");
+    let col = scheme.key_columns[0];
+    let ty = parent.columns[col].ty;
+    let key = &tuple[col];
+    if !matches!(key, Value::Null) {
+        for (idx, leaf) in leaves.iter().enumerate() {
+            let bound = &leaf
+                .schema()
+                .partition_of
+                .as_ref()
+                .expect("routing candidate is a leaf partition")
+                .bound;
+            if lower_admits(&bound.from[0], ty, key) && upper_admits(&bound.to[0], ty, key) {
+                return Ok(idx);
+            }
+        }
+    }
+    Err(ExecError::new(
+        "23514",
+        format!("no partition of relation \"{}\" found for row", parent.name),
+    )
+    .with_detail(Some(format!(
+        "Partition key of the failing row contains ({}) = ({}).",
+        parent.columns[col].name,
+        display_value(key, ctx),
+    ))))
 }
 
 /// The scan sees `txn`'s snapshot, and the new versions it writes carry `txn`'s
@@ -2312,6 +2438,35 @@ impl SeqScan {
 }
 
 impl ExecNode for SeqScan {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        Ok(self.iter.next())
+    }
+}
+
+/// Union scan over a partitioned parent's leaf partitions: concatenates each
+/// leaf's snapshot scan into one row stream, in leaf order (see
+/// [`PhysicalPlan::Append`](crabgresql_planner::PhysicalPlan::Append)). Each
+/// leaf captures its own MVCC snapshot up front, exactly as [`SeqScan`] does.
+pub struct Append {
+    iter: Box<dyn Iterator<Item = Tuple> + Send>,
+}
+
+impl Append {
+    pub fn new(tables: &[Arc<dyn TableAm>], txn: &TxnContext) -> Self {
+        let scans: Vec<Box<dyn Iterator<Item = Tuple> + Send>> = tables
+            .iter()
+            .map(|table| {
+                Box::new(table.scan(txn).map(|(_, tuple)| tuple))
+                    as Box<dyn Iterator<Item = Tuple> + Send>
+            })
+            .collect();
+        Self {
+            iter: Box::new(scans.into_iter().flatten()),
+        }
+    }
+}
+
+impl ExecNode for Append {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
         Ok(self.iter.next())
     }

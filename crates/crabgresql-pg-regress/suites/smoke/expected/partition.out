@@ -1,13 +1,12 @@
 --
--- RANGE partitioning (initial slice: DDL + catalog reflection)
--- Declare a RANGE-partitioned parent and attach leaf partitions, then reflect
--- them through pg_class (relkind='p' parent, relispartition partitions),
--- pg_inherits, and pg_partitioned_table. A row goes into a partition directly.
---
--- crabgresql does not route rows or scan partitions through the parent yet, so
--- INSERT/SELECT on the parent are rejected with SQLSTATE 0A000 — a deliberate,
--- honest limitation that diverges from PostgreSQL (which would succeed). Every
--- other statement's output is hand-checked against PostgreSQL (psql -a -q).
+-- RANGE partitioning: DDL + catalog reflection, tuple routing, and union scans.
+-- Declare a RANGE-partitioned parent and attach leaf partitions, reflect them
+-- through pg_class (relkind='p' parent, relispartition partitions), pg_inherits,
+-- and pg_partitioned_table, then INSERT into and SELECT from the parent: rows
+-- route to the leaf whose range admits the key, and a parent scan unions every
+-- partition. Every statement's output is hand-checked against PostgreSQL
+-- (psql -a -q). UPDATE/DELETE and TRUNCATE/CREATE INDEX on the parent are still
+-- unsupported (0A000).
 --
 CREATE TABLE sales (id integer, sold date, amount integer) PARTITION BY RANGE (sold);
 CREATE TABLE sales_2023 PARTITION OF sales FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
@@ -81,12 +80,45 @@ SELECT count(*) FROM sales_2024;
      1
 (1 row)
 
--- Routing an INSERT through the parent is not supported yet (0A000).
+-- Routing an INSERT through the parent sends each row to the leaf whose RANGE
+-- bound admits its key (sold): '2023-03-01' lands in sales_2023.
 INSERT INTO sales VALUES (2, '2023-03-01', 50);
-ERROR:  access to partitioned table "sales" is not supported yet
--- Scanning the parent (union over partitions) is not supported yet (0A000).
-SELECT * FROM sales;
-ERROR:  access to partitioned table "sales" is not supported yet
+-- The routed row is physically in sales_2023, not sales_2024.
+SELECT * FROM sales_2023;
+ id |    sold    | amount 
+----+------------+--------
+  2 | 2023-03-01 |     50
+(1 row)
+
+-- A key admitted by no partition's range is rejected (23514); nothing routes.
+INSERT INTO sales VALUES (6, '2020-01-01', 10);
+ERROR:  no partition of relation "sales" found for row
+DETAIL:  Partition key of the failing row contains (sold) = (2020-01-01).
+-- A NULL partition key belongs to no range partition, so it too is rejected.
+INSERT INTO sales VALUES (7, NULL, 10);
+ERROR:  no partition of relation "sales" found for row
+DETAIL:  Partition key of the failing row contains (sold) = (null).
+-- Scanning the parent unions every partition; ORDER BY sorts across the union.
+SELECT * FROM sales ORDER BY sold;
+ id |    sold    | amount 
+----+------------+--------
+  2 | 2023-03-01 |     50
+  1 | 2024-06-01 |    100
+(2 rows)
+
+-- The union scan feeds WHERE and aggregates like an ordinary table.
+SELECT count(*) FROM sales;
+ count 
+-------
+     2
+(1 row)
+
+SELECT id, amount FROM sales WHERE amount >= 100 ORDER BY id;
+ id | amount 
+----+--------
+  1 |    100
+(1 row)
+
 -- An unbounded (MINVALUE/MAXVALUE) RANGE bound is accepted.
 CREATE TABLE sales_early PARTITION OF sales FOR VALUES FROM (MINVALUE) TO ('2023-01-01');
 -- Overlapping a sibling's range is rejected (42P17).
