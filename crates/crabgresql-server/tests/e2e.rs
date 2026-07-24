@@ -4360,17 +4360,45 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
     let msgs = client.simple_query("SELECT id FROM m_2024").await?;
     assert_eq!(rows(&msgs)[0].get(0), Some("1"));
 
-    // INSERT and SELECT against the parent are rejected honestly (routing and
-    // union scans are not implemented yet).
-    let err = client
+    // An INSERT through the parent routes each row to the leaf whose range admits
+    // its key: '2024-07-01' lands in m_2024, so the parent now holds two rows.
+    client
         .simple_query("INSERT INTO m VALUES (2, '2024-07-01')")
+        .await?;
+    let msgs = client.simple_query("SELECT id FROM m_2024 ORDER BY id").await?;
+    let leaf_ids: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(leaf_ids, vec![Some("1"), Some("2")]);
+
+    // A SELECT from the parent unions its partitions.
+    let msgs = client.simple_query("SELECT id FROM m ORDER BY id").await?;
+    let parent_ids: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(parent_ids, vec![Some("1"), Some("2")]);
+
+    // EXPLAIN of the parent shows an Append with one Seq Scan per partition.
+    let plan = client.simple_query("EXPLAIN SELECT * FROM m").await?;
+    let lines: Vec<&str> = rows(&plan).iter().filter_map(|r| r.get(0)).collect();
+    assert_eq!(lines[0], "Append");
+    assert!(
+        lines.iter().any(|l| l.contains("Seq Scan on m_2024")),
+        "plan was {lines:?}"
+    );
+
+    // A key admitted by no partition is rejected (23514), and nothing is written.
+    let err = client
+        .simple_query("INSERT INTO m VALUES (3, '2020-01-01')")
         .await
         .unwrap_err();
     assert_eq!(
         err.as_db_error().expect("database error").code(),
-        &SqlState::FEATURE_NOT_SUPPORTED
+        &SqlState::CHECK_VIOLATION
     );
-    let err = client.simple_query("SELECT * FROM m").await.unwrap_err();
+    assert_eq!(rows(&client.simple_query("SELECT count(*) FROM m").await?)[0].get(0), Some("2"));
+
+    // UPDATE/DELETE directly on the parent are still unsupported (0A000).
+    let err = client
+        .simple_query("DELETE FROM m WHERE id = 1")
+        .await
+        .unwrap_err();
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -4614,6 +4642,70 @@ async fn range_partitioning_detail_clips_long_field() -> anyhow::Result<()> {
     assert_eq!(
         db.detail(),
         Some(format!("Failing row contains ({}...).", "z".repeat(64)).as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_partitioning_routed_insert_enforces_unique_and_error_order() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE m (id int, sold date, amount int NOT NULL) PARTITION BY RANGE (sold)",
+        )
+        .await?;
+    client
+        .simple_query(
+            "CREATE TABLE m_2023 PARTITION OF m FOR VALUES FROM ('2023-01-01') TO ('2024-01-01')",
+        )
+        .await?;
+    // A leaf is an ordinary heap and may carry its own UNIQUE index.
+    client
+        .simple_query("CREATE UNIQUE INDEX m_2023_id_idx ON m_2023 (id)")
+        .await?;
+
+    // A row inserted through the parent that duplicates an existing leaf row must
+    // be rejected by the leaf's unique index (23505) — routing does not bypass it.
+    client
+        .simple_query("INSERT INTO m VALUES (1, '2023-03-01', 10)")
+        .await?;
+    let err = client
+        .simple_query("INSERT INTO m VALUES (1, '2023-06-01', 20)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+
+    // Two rows in one statement that route to the same leaf with a duplicate key
+    // are caught against each other, not just against pre-existing rows.
+    let err = client
+        .simple_query("INSERT INTO m VALUES (2, '2023-02-01', 1), (2, '2023-05-01', 2)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+    // Nothing from the failed statements was written: only the first row remains.
+    let msgs = client.simple_query("SELECT count(*) FROM m").await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("1"));
+
+    // Rows are processed in order: an earlier row's constraint violation is
+    // reported before a later row's routing failure, matching PostgreSQL's
+    // row-by-row processing. Row 1 routes fine but is NULL in a NOT NULL column
+    // (23502); row 2 would fail routing (23514) — the row-1 error must win.
+    let err = client
+        .simple_query("INSERT INTO m VALUES (3, '2023-04-01', NULL), (4, '1990-01-01', 1)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::NOT_NULL_VIOLATION
     );
 
     Ok(())

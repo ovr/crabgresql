@@ -92,6 +92,15 @@ pub enum PhysicalPlan {
         sort: Vec<SortKey>,
         distinct: Option<Vec<DistinctKey>>,
     },
+    /// Union scan over the leaf partitions of a partitioned parent. Mirrors
+    /// [`LogicalPlan::Append`]: the executor concatenates each leaf's scan into
+    /// one row stream. A partitioned-parent FROM item is planned as a
+    /// [`Self::Subquery`] wrapping this, so the standard projection/predicate/sort
+    /// tail runs on top.
+    Append {
+        tables: Vec<Arc<dyn TableAm>>,
+        columns: Vec<OutputColumn>,
+    },
     /// LIMIT/OFFSET above a source plan (after its sort). Mirrors
     /// [`LogicalPlan::Limit`].
     Limit {
@@ -103,6 +112,9 @@ pub enum PhysicalPlan {
         table: Arc<dyn TableAm>,
         source: PhysicalInsertSource,
         returning: Option<Returning>,
+        /// Leaf partitions for tuple routing when `table` is a partitioned parent
+        /// (see [`LogicalPlan::Insert`]); `None` for an ordinary table.
+        routing: Option<Vec<Arc<dyn TableAm>>>,
     },
     Update {
         table: Arc<dyn TableAm>,
@@ -400,6 +412,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
                 distinct,
             },
         },
+        LogicalPlan::Append { tables, columns } => PhysicalPlan::Append { tables, columns },
         LogicalPlan::Subquery {
             source,
             columns,
@@ -485,6 +498,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             table,
             source,
             returning,
+            routing,
         } => PhysicalPlan::Insert {
             table,
             source: match source {
@@ -495,6 +509,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
                 },
             },
             returning,
+            routing,
         },
         LogicalPlan::Update {
             table,
@@ -724,6 +739,16 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             lines
         }
         PhysicalPlan::Values { .. } => vec!["Values Scan".to_string()],
+        PhysicalPlan::Append { tables, .. } => {
+            // PG's Append over the partitions: one child Seq Scan per leaf, in
+            // scan order. A WHERE predicate lives on the wrapping Subquery in this
+            // pipeline, so it is not re-rendered per child (reduced EXPLAIN).
+            let mut lines = vec!["Append".to_string()];
+            for table in tables {
+                lines.push(format!("  ->  Seq Scan on {}", table.schema().name));
+            }
+            lines
+        }
         PhysicalPlan::Subquery { source, .. } => explain(source),
         PhysicalPlan::TableFunction { .. } => vec!["Function Scan".to_string()],
         PhysicalPlan::Join { .. } => vec!["Nested Loop".to_string()],
@@ -1337,6 +1362,37 @@ mod tests {
         let lines = explain(&seq_plan);
         assert_eq!(lines[0], "Seq Scan on t");
         assert_eq!(lines[1], "  Filter: (name = x)");
+    }
+
+    #[test]
+    fn explain_append_lists_a_seq_scan_per_partition() {
+        // A partitioned-parent union scan renders as an `Append` with one child
+        // `Seq Scan` per leaf, in leaf (scan) order.
+        let engine: Arc<dyn TableEngine> = Arc::new(MetaEngine::default());
+        let leaf = |name: &str| {
+            engine
+                .create_table(TableSchema::in_namespace(
+                    name,
+                    "public",
+                    vec![Column::new("id", PgType::Int4)],
+                ))
+                .expect("create leaf")
+        };
+        let plan = PhysicalPlan::Append {
+            tables: vec![leaf("sales_2023"), leaf("sales_2024")],
+            columns: vec![OutputColumn {
+                name: "id".into(),
+                ty: PgType::Int4,
+            }],
+        };
+        assert_eq!(
+            explain(&plan),
+            vec![
+                "Append".to_string(),
+                "  ->  Seq Scan on sales_2023".to_string(),
+                "  ->  Seq Scan on sales_2024".to_string(),
+            ]
+        );
     }
 
     #[test]

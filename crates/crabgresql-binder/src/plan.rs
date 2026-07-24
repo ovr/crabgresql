@@ -71,6 +71,17 @@ pub enum LogicalPlan {
         sort: Vec<SortKey>,
         distinct: Option<Vec<DistinctKey>>,
     },
+    /// Union scan over the leaf partitions of a partitioned parent. `tables` are
+    /// the leaf relations (each with the parent's column layout); the node emits
+    /// every leaf's rows, full parent-column width, in leaf order. It carries no
+    /// projection/predicate/sort of its own — a partitioned-parent FROM item is
+    /// bound as a [`Self::Subquery`] wrapping this Append, so the surrounding
+    /// SELECT's WHERE/projection/ORDER BY/DISTINCT apply on top (and joins /
+    /// aggregates reuse the same subplan machinery).
+    Append {
+        tables: Vec<Arc<dyn TableAm>>,
+        columns: Vec<OutputColumn>,
+    },
     /// SELECT over a subquery source in FROM: a derived table (`(SELECT ...) s`)
     /// or a CTE reference. `source` produces the input rows; the same
     /// projection/predicate/sort pipeline as `Query` runs on top.
@@ -147,6 +158,12 @@ pub enum LogicalPlan {
         /// `RETURNING`: a projection over each inserted row, bound against the
         /// table schema. `None` when the clause is absent.
         returning: Option<Returning>,
+        /// Tuple routing for a partitioned parent: `Some(leaves)` when `table` is
+        /// a partitioned parent, holding its leaf partitions. The executor routes
+        /// each row to the leaf whose RANGE bound admits its key (reading the
+        /// bound from each leaf's `partition_of`) and writes there instead of to
+        /// `table`. `None` for an ordinary table (rows go straight to `table`).
+        routing: Option<Vec<Arc<dyn TableAm>>>,
     },
     Update {
         table: Arc<dyn TableAm>,
@@ -336,19 +353,54 @@ fn resolve_write_table(
         }
         not_found_as_written(e, schema.as_deref(), &table_name)
     })?;
-    if table.schema().partition_scheme.is_some() {
-        return Err(partitioned_parent_unsupported(&table_name));
-    }
+    // A partitioned parent is a valid INSERT target (rows are routed to leaves by
+    // `bind_insert`); UPDATE/DELETE on the parent are still rejected, in
+    // `open_write_relation`.
     Ok((table, table_name))
 }
 
-/// Reject a query or write against a partitioned parent: tuple routing on INSERT
-/// and union scans on read are not implemented yet, so only the individual leaf
-/// partitions can be accessed directly.
+/// Reject an UPDATE/DELETE against a partitioned parent: cross-partition
+/// UPDATE/DELETE is not implemented yet, so only the individual leaf partitions
+/// can be modified directly. (INSERT routes rows to leaves; a partitioned parent
+/// can also be read via a union scan — see [`LogicalPlan::Append`].)
 fn partitioned_parent_unsupported(name: &str) -> BindError {
     BindError::feature_not_supported(format!(
         "access to partitioned table \"{name}\" is not supported yet"
     ))
+}
+
+/// Enumerate the leaf partitions of the partitioned parent `parent` as storage
+/// handles, in a deterministic order (by leaf name). Both tuple routing on
+/// INSERT and the union scan on read need this set; it is captured at bind time
+/// (like every other `Arc<dyn TableAm>` a plan embeds), so partitions created
+/// after a statement is planned are not observed until it is re-bound.
+fn partition_leaves(
+    engine: &Arc<dyn TableEngine>,
+    parent: &TableSchema,
+) -> Result<Vec<Arc<dyn TableAm>>, BindError> {
+    // Identify the leaves from catalog metadata (each carries a `partition_of`
+    // link back to this parent), then resolve each to a storage handle.
+    let mut leaves: Vec<(String, String)> = engine
+        .relation_metadata()
+        .into_iter()
+        .filter_map(|meta| {
+            let part = meta.schema.partition_of.as_ref()?;
+            (part.parent_namespace == parent.namespace && part.parent_name == parent.name)
+                .then(|| (meta.schema.namespace.clone(), meta.schema.name.clone()))
+        })
+        .collect();
+    leaves.sort();
+    leaves
+        .into_iter()
+        .map(|(namespace, name)| {
+            engine.resolve(Some(&namespace), &name).map_err(|e| {
+                BindError::new(
+                    sqlstate::INTERNAL_ERROR,
+                    format!("partition \"{name}\" of \"{}\" is unreadable: {e}", parent.name),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Which DML verb is writing, for the non-updatable-view error text.
@@ -391,6 +443,9 @@ fn open_write_relation(
         )));
     };
     let (table, table_name) = resolve_write_table(engine, name, verb)?;
+    if table.schema().partition_scheme.is_some() {
+        return Err(partitioned_parent_unsupported(&table_name));
+    }
     let qualifier = aliased_qualifier(alias, table_name)?;
     Ok((table, qualifier))
 }
@@ -472,6 +527,8 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
             subst_exprs(projections, params);
             subst_opt(predicate, params);
         }
+        // An Append carries only leaf table handles, no parameterizable exprs.
+        LogicalPlan::Append { .. } => {}
         LogicalPlan::Limit { source, .. } => substitute_params(source, params),
         LogicalPlan::Aggregate {
             input,
@@ -706,6 +763,8 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 subst_outer_expr(p, outer, depth);
             }
         }
+        // An Append holds only leaf table handles — no correlated exprs.
+        LogicalPlan::Append { .. } => {}
         LogicalPlan::Limit { source, .. } => subst_outer_plan(source, outer, depth),
         LogicalPlan::Aggregate {
             input,
@@ -948,6 +1007,8 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
                 f(p);
             }
         }
+        // An Append exposes no expressions of its own.
+        LogicalPlan::Append { .. } => {}
         LogicalPlan::Limit { source, .. } => for_each_plan_expr(source, &mut *f),
         LogicalPlan::Aggregate {
             input,
@@ -1603,9 +1664,6 @@ fn bind_from_item(
             // path claims the name.
             match engine.resolve(cte_schema.as_deref(), &tname) {
                 Ok(table) => {
-                    if table.schema().partition_scheme.is_some() {
-                        return Err(partitioned_parent_unsupported(&tname));
-                    }
                     let qualifier = relation_qualifier(alias, &tname);
                     let mut columns: Vec<OutputColumn> = table
                         .schema()
@@ -1616,11 +1674,25 @@ fn bind_from_item(
                             ty: c.ty,
                         })
                         .collect();
+                    // A partitioned parent has no rows of its own: read it as a
+                    // union scan over its leaves. Bind it as a subplan wrapping an
+                    // `Append` (raw parent columns), so the surrounding SELECT's
+                    // projection/WHERE/ORDER BY — and any join or aggregate — apply
+                    // through the existing subplan machinery.
+                    let input = if table.schema().partition_scheme.is_some() {
+                        let leaves = partition_leaves(engine, table.schema())?;
+                        JoinInput::Subplan(Box::new(LogicalPlan::Append {
+                            tables: leaves,
+                            columns: columns.clone(),
+                        }))
+                    } else {
+                        JoinInput::Scan(table)
+                    };
                     apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
                     Ok(BoundFromItem {
                         qualifier,
                         columns,
-                        input: JoinInput::Scan(table),
+                        input,
                     })
                 }
                 Err(e) => {
@@ -2298,6 +2370,7 @@ pub fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindEr
     match plan {
         LogicalPlan::Values { columns, .. }
         | LogicalPlan::Query { columns, .. }
+        | LogicalPlan::Append { columns, .. }
         | LogicalPlan::Subquery { columns, .. }
         | LogicalPlan::TableFunction { columns, .. }
         | LogicalPlan::Aggregate { columns, .. }
@@ -3433,6 +3506,13 @@ pub fn bind_insert_with_params(
     // catalog is never a write target.
     let (table, name) = resolve_write_table(engine, target, WriteVerb::Insert)?;
     let schema = table.schema().clone();
+    // A partitioned parent routes each row to a leaf partition at execution time;
+    // capture the leaves now. `None` for an ordinary table.
+    let routing = if schema.partition_scheme.is_some() {
+        Some(partition_leaves(engine, &schema)?)
+    } else {
+        None
+    };
     let defaults = schema
         .columns
         .iter()
@@ -3583,6 +3663,7 @@ pub fn bind_insert_with_params(
         table,
         source: insert_source,
         returning,
+        routing,
     })
 }
 
@@ -3730,6 +3811,9 @@ impl CopyFromPlan {
             table: self.table.clone(),
             source: InsertSource::Values(value_rows),
             returning: None,
+            // COPY into a partitioned parent is rejected in `bind_copy_from`, so
+            // this always targets an ordinary table — no routing.
+            routing: None,
         })
     }
 }
@@ -3770,6 +3854,12 @@ pub fn bind_copy_from(
     }
 
     let (table, name) = resolve_write_table(engine, table_name, WriteVerb::Insert)?;
+    // COPY into a partitioned parent would need tuple routing too; not wired yet
+    // (INSERT is), so keep it rejected rather than writing to the parent's own
+    // (empty) storage.
+    if table.schema().partition_scheme.is_some() {
+        return Err(partitioned_parent_unsupported(&name));
+    }
     let schema = table.schema().clone();
     let defaults = schema
         .columns
@@ -4219,6 +4309,7 @@ mod tests {
         match p {
             LogicalPlan::Values { .. } => "Values",
             LogicalPlan::Query { .. } => "Query",
+            LogicalPlan::Append { .. } => "Append",
             LogicalPlan::Subquery { .. } => "Subquery",
             LogicalPlan::TableFunction { .. } => "TableFunction",
             LogicalPlan::Join { .. } => "Join",
