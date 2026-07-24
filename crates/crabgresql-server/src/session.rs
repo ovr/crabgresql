@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crabgresql_executor::{ExecContext, ExecError, ExecNode, OutputColumn, SequenceOps};
+use crabgresql_executor::{
+    CatalogOps, ExecContext, ExecError, ExecNode, OutputColumn, SequenceOps,
+};
 
 use crate::query::RowTag;
 use crabgresql_parser::ast;
@@ -393,22 +395,26 @@ impl Session {
         }
     }
 
-    /// The execution context with no sequence handle — for utility paths (e.g.
-    /// `EXPLAIN`'s `Values` node) that never call a sequence function.
+    /// The execution context with no sequence or catalog handle — for utility
+    /// paths (e.g. `EXPLAIN`'s `Values` node) that never call either family.
     pub fn exec_context(&self) -> ExecContext {
         ExecContext {
             extra_float_digits: self.extra_float_digits,
             sequences: None,
+            catalog: None,
             txn: None,
         }
     }
 
-    /// The execution context wired to advance sequences through `engine`, used
-    /// for the statement-execution path (so a `nextval` default or an explicit
-    /// `nextval()` can run and update this session's `currval`/`lastval`).
-    pub fn exec_context_with_sequences(
+    /// The execution context for the statement-execution path: wired to advance
+    /// sequences through `engine` (so a `nextval` default or an explicit
+    /// `nextval()` can run and update this session's `currval`/`lastval`) and to
+    /// read `catalog` (so `pg_get_userbyid` / `pg_table_is_visible` resolve
+    /// against this statement's catalog snapshot).
+    pub fn exec_context_for_statement(
         &self,
         engine: &Arc<dyn TableEngine>,
+        catalog: &Arc<dyn CatalogOps>,
         read_only: bool,
     ) -> ExecContext {
         ExecContext {
@@ -418,6 +424,7 @@ impl Session {
                 Arc::clone(&self.seq_state),
                 read_only,
             ))),
+            catalog: Some(Arc::clone(catalog)),
             txn: None,
         }
     }

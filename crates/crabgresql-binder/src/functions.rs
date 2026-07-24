@@ -413,6 +413,13 @@ pub enum ScalarFn {
     Setval,
     /// `lastval() -> int8`: this session's last `nextval`, for any sequence.
     Lastval,
+    // --- catalog lookups (dispatched via the executor's CatalogOps, not the
+    // pure `eval_scalar`, which has no view of the session's pg_catalog) ---
+    /// `pg_get_userbyid(oid) -> name`: the role's name, or `unknown (OID=n)`.
+    PgGetUserById,
+    /// `pg_table_is_visible(oid) -> bool`: whether the relation is reachable by
+    /// an unqualified name. NULL for an OID no relation has.
+    PgTableIsVisible,
     // --- jsonpath (jsonb @ jsonpath) ---
     /// A `jsonb_path_*` function / `@?` / `@@` operator. Args are
     /// `[jsonb, jsonpath]` optionally followed by `[vars jsonb, silent bool]`;
@@ -834,6 +841,8 @@ const POINT: PgType = PgType::Point;
 const LSEG: PgType = PgType::Lseg;
 const JSONB: PgType = PgType::Jsonb;
 const JSONPATH: PgType = PgType::Jsonpath;
+const OID: PgType = PgType::Oid;
+const NAME: PgType = PgType::Name;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
@@ -1308,6 +1317,19 @@ fn lookup(name: &str) -> &'static [Signature] {
             func: ScalarFn::Lastval,
             args: &[],
             ret: I8,
+        }],
+        // Catalog lookups. `int -> oid` is implicit, so an OID written as an
+        // integer literal resolves too. Dispatched by the executor's `eval`
+        // (not `eval_scalar`), which holds the session's catalog snapshot.
+        "pg_get_userbyid" => &[Signature {
+            func: ScalarFn::PgGetUserById,
+            args: &[OID],
+            ret: NAME,
+        }],
+        "pg_table_is_visible" => &[Signature {
+            func: ScalarFn::PgTableIsVisible,
+            args: &[OID],
+            ret: BOOL,
         }],
         "upper" => &[Signature {
             func: ScalarFn::Upper,

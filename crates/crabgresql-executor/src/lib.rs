@@ -61,9 +61,25 @@ pub trait SequenceOps: Send + Sync {
     fn lastval(&self) -> Result<i64, ExecError>;
 }
 
+/// Catalog lookups the pure expression evaluator cannot express: they read the
+/// session's `pg_catalog` snapshot, which `eval_scalar(func, &[Value])` has no
+/// handle to. The server supplies an implementation through
+/// [`ExecContext::catalog`].
+///
+/// Every method returns `Option`, reporting only what it found; how a miss
+/// renders (a placeholder string, NULL) is PostgreSQL-observable behavior and
+/// lives in the executor, so an implementation never learns the SQL surface.
+pub trait CatalogOps: Send + Sync {
+    /// The name of the role `oid` identifies, or `None` if no role has that OID.
+    fn role_name(&self, oid: u32) -> Option<String>;
+    /// Whether the relation `oid` identifies is reachable by an unqualified
+    /// name, or `None` if there is no such relation.
+    fn table_is_visible(&self, oid: u32) -> Option<bool>;
+}
+
 /// Session state that runtime evaluation depends on: `extra_float_digits`
-/// (float→text output precision) and, when present, the handle the
-/// side-effecting sequence functions dispatch through.
+/// (float→text output precision) and, when present, the handles the
+/// side-effecting sequence functions and the catalog functions dispatch through.
 #[derive(Clone)]
 pub struct ExecContext {
     pub extra_float_digits: i32,
@@ -71,6 +87,10 @@ pub struct ExecContext {
     /// `Values` node); a sequence function reaching a `None` context is an
     /// internal wiring error, reported as 5-char `XX000`.
     pub sequences: Option<Arc<dyn SequenceOps>>,
+    /// The `pg_catalog` snapshot the catalog functions (`pg_get_userbyid`,
+    /// `pg_table_is_visible`) resolve against. `None` in the same non-executing
+    /// contexts as `sequences`, and an internal `XX000` if one reaches it.
+    pub catalog: Option<Arc<dyn CatalogOps>>,
     /// The transaction a correlated subquery re-executes against, per outer row.
     /// Injected by [`execute`] once, at the top of the statement, and cloned into
     /// every node so `eval` can run a correlated subplan when it reaches one.
@@ -85,6 +105,7 @@ impl Default for ExecContext {
         Self {
             extra_float_digits: 1,
             sequences: None,
+            catalog: None,
             txn: None,
         }
     }
@@ -182,6 +203,7 @@ pub fn execute(
     let ctx = &ExecContext {
         extra_float_digits: ctx.extra_float_digits,
         sequences: ctx.sequences.clone(),
+        catalog: ctx.catalog.clone(),
         txn: Some(txn.clone()),
     };
     match plan {

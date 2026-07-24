@@ -5,10 +5,55 @@
 
 use std::sync::Arc;
 
+use crabgresql_catalog::SystemCatalog;
+use crabgresql_executor::CatalogOps;
 use crabgresql_storage_api::{
     IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition, StorageError, TableAm,
     TableEngine, TableSchema, ViewDefinition,
 };
+
+/// The executor-facing catalog handle: answers `pg_get_userbyid` and
+/// `pg_table_is_visible` against the same [`SystemCatalog`] snapshot that built
+/// this statement's `pg_class` rows, so the OIDs the client reads back are the
+/// OIDs these functions resolve. Owns its `Arc` so it can live in a suspended
+/// portal's `ExecContext`, like [`crate::session::SessionSequences`].
+pub struct SessionCatalogOps {
+    system: Arc<SystemCatalog>,
+    temp_schema: String,
+}
+
+impl SessionCatalogOps {
+    pub fn new(system: Arc<SystemCatalog>, temp_schema: impl Into<String>) -> Self {
+        Self {
+            system,
+            temp_schema: temp_schema.into(),
+        }
+    }
+}
+
+impl CatalogOps for SessionCatalogOps {
+    fn role_name(&self, oid: u32) -> Option<String> {
+        self.system.role_name(oid).map(str::to_string)
+    }
+
+    /// A relation is visible when an unqualified name reaches it. That set is
+    /// [`SessionCatalog::resolve`]'s: this session's temp namespace, then the
+    /// system catalog, then the global engine — which resolves unqualified names
+    /// in `public` only. `search_path` is still a no-op, so this is crabgresql's
+    /// resolution rule rather than PostgreSQL's; a relation in a `CREATE SCHEMA`
+    /// namespace is correctly invisible because nothing but a qualified name
+    /// finds it.
+    ///
+    /// `pg_catalog` needs no arm: only live user relations are reflected into
+    /// `pg_class`, so no row here ever carries a catalog namespace. That is a
+    /// deviation — PG reports `t` for a catalog relation, we report NULL —
+    /// which becomes reachable if catalog self-reflection ever lands.
+    fn table_is_visible(&self, oid: u32) -> Option<bool> {
+        self.system
+            .relation_namespace(oid)
+            .map(|ns| ns == "public" || ns == self.temp_schema)
+    }
+}
 
 /// Resolves relations against this session's temp namespace first, then the
 /// shared global engine, then the read-only system catalog — so a
