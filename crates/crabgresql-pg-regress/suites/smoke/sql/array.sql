@@ -68,3 +68,36 @@ SELECT unnest(ARRAY[10, 20, 30]);
 SELECT unnest(ARRAY['a', 'b']) AS u;
 
 DROP TABLE arr;
+
+-- containment/overlap treat NULL elements as matching nothing
+SELECT ARRAY[NULL]::int[] @> ARRAY[NULL]::int[] AS null_contains,
+       ARRAY[1, NULL]::int[] @> ARRAY[NULL]::int[] AS null_contains2,
+       ARRAY[1, NULL]::int[] && ARRAY[2, NULL]::int[] AS null_overlap;
+
+-- `||` with an untyped literal or NULL concatenates arrays (not append)
+SELECT ARRAY[1, 2] || '{3,4}' AS lit_concat,
+       ARRAY[1, 2] || NULL AS null_right,
+       NULL || ARRAY[1, 2] AS null_left,
+       ARRAY['a', 'b'] || '{c,d}' AS text_concat;
+
+-- element types are promoted (int + numeric -> numeric[]), like PG
+SELECT ARRAY[1, 2] || 3.5 AS append_promote,
+       array_cat(ARRAY[1, 2], '{3.9}'::numeric[]) AS cat_promote,
+       array_append(ARRAY[1, 2], 3.5) AS fn_append_promote;
+
+-- VALUES / CASE unify differing but compatible array element types
+SELECT a FROM (VALUES (ARRAY[1]), (ARRAY[9000000000])) v(a) ORDER BY 1;
+SELECT CASE WHEN true THEN ARRAY[1] ELSE ARRAY[2.5] END AS case_promote;
+
+-- non-orderable element arrays report PG's equality-operator error, not a crash
+SELECT ARRAY['1'::json] @> ARRAY['1'::json];
+
+-- a bare, uncast empty array cannot determine its type
+SELECT ARRAY[];
+
+-- point[] columns (a non-orderable element type) store and read back
+CREATE TABLE pts (id int, ps point[]);
+INSERT INTO pts VALUES (1, ARRAY[point '(1,2)', point '(3,4)']);
+INSERT INTO pts VALUES (2, '{"(5,6)"}');
+SELECT id, ps, ps[1] FROM pts ORDER BY id;
+DROP TABLE pts;

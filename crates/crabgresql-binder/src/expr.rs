@@ -1432,6 +1432,19 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
 /// `PgType::Array(elem)`. An empty `ARRAY[]` settles on `text[]` and typically
 /// takes its real type from a surrounding cast (`ARRAY[]::int[]`).
 fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindError> {
+    // A bare, uncast `ARRAY[]` has no determinable element type. PG requires an
+    // explicit cast; `ARRAY[]::t[]` is intercepted in `bind_cast` and never
+    // reaches here empty.
+    if elems.is_empty() {
+        return Err(BindError::new(
+            "42P18",
+            "cannot determine type of empty array",
+        )
+        .with_hint(Some(
+            "Explicitly cast to the desired type, for example ARRAY[]::integer[]."
+                .to_string(),
+        )));
+    }
     let bindings = elems
         .iter()
         .map(|e| bind_expr(e, scope))
@@ -2048,6 +2061,19 @@ fn bind_cast(
             }
         }
     };
+    // `ARRAY[]::t[]`: an empty array constructor is otherwise untypable (see
+    // `bind_array_ctor`); the cast target supplies its element type.
+    if let ast::Expr::Array(arr) = inner
+        && arr.elem.is_empty()
+        && let PgType::Array(elem_oid) = target
+        && let Some(elem) = PgType::from_oid(elem_oid)
+    {
+        return Ok(Binding::Typed(BoundExpr::ArrayCtor {
+            elem,
+            ty: target,
+            elems: Vec::new(),
+        }));
+    }
     let expr = match bind_expr(inner, scope)? {
         Binding::Unknown { lit, span, param } => {
             resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, target)?
@@ -3019,7 +3045,7 @@ fn bind_binary(
     }
 
     // Array containment / overlap (`@>` `<@` `&&`) on array operands.
-    if let Some(binding) = resolve_array_op(op, &lb, &rb)? {
+    if let Some(binding) = resolve_array_op(op, &lb, &rb, scope.catalog().as_ref())? {
         return Ok(binding);
     }
 
@@ -3893,14 +3919,18 @@ fn array_arg_type(b: &Binding) -> Option<(PgType, PgType)> {
 }
 
 /// Array containment / overlap operators (`@>`, `<@`, `&&`) → the array
-/// `ScalarFn`s. Only fires when at least one operand is a typed array; two typed
-/// arrays of different element types fall through (PG's `operator does not
-/// exist`). Tried after the network/geometric/jsonb resolvers, which own these
-/// operator spellings for their own operand types.
+/// `ScalarFn`s. Both operands are arrays (an untyped literal adopts the other's
+/// array type); a typed non-array operand yields PG's `operator does not exist`.
+/// The element type must have a default equality operator — a non-orderable
+/// element (`json`, `point`, ...) reports PG's `could not identify an equality
+/// operator` rather than reaching (and panicking in) `compare_values`. Tried
+/// after the network/geometric/jsonb resolvers, which own these spellings for
+/// their own operand types.
 fn resolve_array_op(
     op: &ast::BinaryOperator,
     lb: &Binding,
     rb: &Binding,
+    catalog: &dyn TypeCatalog,
 ) -> Result<Option<Binding>, BindError> {
     use ast::BinaryOperator as B;
     let func = match op {
@@ -3909,21 +3939,41 @@ fn resolve_array_op(
         B::PGOverlap => ScalarFn::ArrayOverlap,
         _ => return Ok(None),
     };
-    let lt = binding_typed_ty(lb);
-    let rt = binding_typed_ty(rb);
-    // The shared array type, taken from a typed array operand. Two typed arrays
-    // of different element types have no operator here.
-    let arr_ty = match (array_arg_type(lb), array_arg_type(rb)) {
-        (Some((a, _)), Some((b, _))) => {
-            if a != b {
-                return Ok(None);
-            }
-            a
+    let la = array_arg_type(lb);
+    let ra = array_arg_type(rb);
+    // The shared array type. Both sides must be arrays: two typed arrays unify on
+    // their element type; an untyped literal opposite a typed array adopts it; a
+    // typed *non-array* opposite an array is `operator does not exist`.
+    let arr_ty = match (la, ra) {
+        (Some((_, le)), Some((_, re))) => {
+            let elem = merge_types(le, re).ok_or_else(|| net_no_operator(lb, op, rb))?;
+            PgType::Array(elem.oid())
         }
-        (Some((a, _)), None) if !rt.is_some_and(PgType::is_array) => a,
-        (None, Some((b, _))) if !lt.is_some_and(PgType::is_array) => b,
-        _ => return Ok(None),
+        (Some((arr, _)), None) => {
+            if binding_typed_ty(rb).is_some() {
+                return Err(net_no_operator(lb, op, rb));
+            }
+            arr
+        }
+        (None, Some((arr, _))) => {
+            if binding_typed_ty(lb).is_some() {
+                return Err(net_no_operator(lb, op, rb));
+            }
+            arr
+        }
+        (None, None) => return Ok(None),
     };
+    // These operators compare elements for equality; a non-orderable element type
+    // has no default equality operator (PG's error), and `compare_values` has no
+    // arm for it — so gate here to keep it off the panic path.
+    let elem = arr_ty.array_element();
+    if !elem.is_some_and(|e| is_orderable(e, catalog)) {
+        let name = elem.map_or_else(|| arr_ty.name().to_string(), |e| type_label(e, catalog));
+        return Err(BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!("could not identify an equality operator for type {name}"),
+        ));
+    }
     let left = resolve_operand(lb, arr_ty)?;
     let right = resolve_operand(rb, arr_ty)?;
     Ok(Some(Binding::Typed(BoundExpr::FuncCall {
@@ -3933,53 +3983,85 @@ fn resolve_array_op(
     })))
 }
 
-/// `||` where at least one operand is an array: array‖array (`array_cat`),
-/// array‖element (`array_append`), or element‖array (`array_prepend`). The
-/// caller (`bind_binary`) routes here before the text/bit concat paths when a
-/// typed array is present.
+/// `||` where at least one operand is an array. An **untyped literal or NULL**
+/// opposite an array is treated as an array (PG resolves `array || unknown` to
+/// `array_cat`), so `ARRAY[1,2] || '{3,4}'` concatenates and `array || NULL`
+/// returns the array; a **typed element** opposite an array is append/prepend.
+/// Element types are unified (PG promotes `int[] || bigint` to `bigint[]`); a
+/// pair with no common type is PG's `operator does not exist: X || Y`.
 fn bind_array_concat(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
-    let la = array_arg_type(&lb);
-    let ra = array_arg_type(&rb);
-    match (la, ra) {
-        // array || array (same element type).
-        (Some((lt, _)), Some((rt, _))) => {
-            if lt != rt {
-                return Err(no_operator(
-                    &binding_type_label(&lb),
-                    BinOp::Add,
-                    &binding_type_label(&rb),
-                ));
-            }
-            let left = resolve_operand(&lb, lt)?;
-            let right = resolve_operand(&rb, lt)?;
+    let mismatch = |lb: &Binding, rb: &Binding| {
+        BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!(
+                "operator does not exist: {} || {}",
+                binding_type_label(lb),
+                binding_type_label(rb)
+            ),
+        )
+    };
+    match (array_arg_type(&lb), array_arg_type(&rb)) {
+        // array || array: unify element types, then concatenate.
+        (Some((_, le)), Some((_, re))) => {
+            let arr = PgType::Array(merge_types(le, re).ok_or_else(|| mismatch(&lb, &rb))?.oid());
+            let left = resolve_operand(&lb, arr)?;
+            let right = resolve_operand(&rb, arr)?;
             Ok(Binding::Typed(BoundExpr::FuncCall {
                 func: ScalarFn::ArrayCat,
-                ret: lt,
+                ret: arr,
                 args: vec![left, right],
             }))
         }
-        // array || element.
-        (Some((arr_ty, elem)), None) => {
-            let left = resolve_operand(&lb, arr_ty)?;
-            let right = resolve_operand(&rb, elem)?;
-            Ok(Binding::Typed(BoundExpr::FuncCall {
-                func: ScalarFn::ArrayAppend,
-                ret: arr_ty,
-                args: vec![left, right],
-            }))
-        }
-        // element || array.
-        (None, Some((arr_ty, elem))) => {
-            let left = resolve_operand(&lb, elem)?;
-            let right = resolve_operand(&rb, arr_ty)?;
-            Ok(Binding::Typed(BoundExpr::FuncCall {
-                func: ScalarFn::ArrayPrepend,
-                ret: arr_ty,
-                args: vec![left, right],
-            }))
-        }
-        // The caller only routes here when a typed array is present.
-        (None, None) => unreachable!("bind_array_concat requires a typed array operand"),
+        // array on the left; right is an untyped literal/NULL (→ concat) or a
+        // typed element (→ append).
+        (Some((arr_ty, elem)), None) => match binding_typed_ty(&rb) {
+            None => {
+                let left = resolve_operand(&lb, arr_ty)?;
+                let right = resolve_operand(&rb, arr_ty)?;
+                Ok(Binding::Typed(BoundExpr::FuncCall {
+                    func: ScalarFn::ArrayCat,
+                    ret: arr_ty,
+                    args: vec![left, right],
+                }))
+            }
+            Some(rty) => {
+                let arr = PgType::Array(merge_types(elem, rty).ok_or_else(|| mismatch(&lb, &rb))?.oid());
+                let elem = arr.array_element().expect("array element resolves");
+                let left = resolve_operand(&lb, arr)?;
+                let right = resolve_operand(&rb, elem)?;
+                Ok(Binding::Typed(BoundExpr::FuncCall {
+                    func: ScalarFn::ArrayAppend,
+                    ret: arr,
+                    args: vec![left, right],
+                }))
+            }
+        },
+        // array on the right; symmetric (untyped literal → concat, element → prepend).
+        (None, Some((arr_ty, elem))) => match binding_typed_ty(&lb) {
+            None => {
+                let left = resolve_operand(&lb, arr_ty)?;
+                let right = resolve_operand(&rb, arr_ty)?;
+                Ok(Binding::Typed(BoundExpr::FuncCall {
+                    func: ScalarFn::ArrayCat,
+                    ret: arr_ty,
+                    args: vec![left, right],
+                }))
+            }
+            Some(lty) => {
+                let arr = PgType::Array(merge_types(elem, lty).ok_or_else(|| mismatch(&lb, &rb))?.oid());
+                let elem = arr.array_element().expect("array element resolves");
+                let left = resolve_operand(&lb, elem)?;
+                let right = resolve_operand(&rb, arr)?;
+                Ok(Binding::Typed(BoundExpr::FuncCall {
+                    func: ScalarFn::ArrayPrepend,
+                    ret: arr,
+                    args: vec![left, right],
+                }))
+            }
+        },
+        // The caller only routes here when a typed array is present; if neither
+        // side classifies as an array, report the operator error rather than panic.
+        (None, None) => Err(mismatch(&lb, &rb)),
     }
 }
 
@@ -4020,34 +4102,45 @@ pub(crate) fn bind_array_function(
                 vec![resolve_operand(a, arr_ty)?, resolve_operand(dim, PgType::Int4)?],
             )
         }
+        // `array_append(anyarray, elem)` promotes the array/element to their
+        // common element type (PG's `anycompatiblearray`/`anycompatible`).
         "array_append" => {
             let [a, e] = bindings else { return Err(undefined()) };
-            let (arr_ty, elem) = array_arg_type(a).ok_or_else(undefined)?;
+            let (_, elem) = array_arg_type(a).ok_or_else(undefined)?;
+            let common = merge_types(elem, binding_typed_ty(e).unwrap_or(elem)).ok_or_else(undefined)?;
+            let arr = PgType::Array(common.oid());
             call(
                 ScalarFn::ArrayAppend,
-                arr_ty,
-                vec![resolve_operand(a, arr_ty)?, resolve_operand(e, elem)?],
+                arr,
+                vec![resolve_operand(a, arr)?, resolve_operand(e, common)?],
             )
         }
         "array_prepend" => {
             let [e, a] = bindings else { return Err(undefined()) };
-            let (arr_ty, elem) = array_arg_type(a).ok_or_else(undefined)?;
+            let (_, elem) = array_arg_type(a).ok_or_else(undefined)?;
+            let common = merge_types(elem, binding_typed_ty(e).unwrap_or(elem)).ok_or_else(undefined)?;
+            let arr = PgType::Array(common.oid());
             call(
                 ScalarFn::ArrayPrepend,
-                arr_ty,
-                vec![resolve_operand(e, elem)?, resolve_operand(a, arr_ty)?],
+                arr,
+                vec![resolve_operand(e, common)?, resolve_operand(a, arr)?],
             )
         }
+        // `array_cat(anyarray, anyarray)` unifies the two element types.
         "array_cat" => {
             let [a, b] = bindings else { return Err(undefined()) };
-            let arr_ty = array_arg_type(a)
-                .or_else(|| array_arg_type(b))
-                .map(|(t, _)| t)
-                .ok_or_else(undefined)?;
+            let ae = array_arg_type(a).map(|(_, e)| e);
+            let be = array_arg_type(b).map(|(_, e)| e);
+            let arr = match (ae, be) {
+                (Some(ae), Some(be)) => PgType::Array(merge_types(ae, be).ok_or_else(undefined)?.oid()),
+                (Some(ae), None) => PgType::Array(ae.oid()),
+                (None, Some(be)) => PgType::Array(be.oid()),
+                (None, None) => return Err(undefined()),
+            };
             call(
                 ScalarFn::ArrayCat,
-                arr_ty,
-                vec![resolve_operand(a, arr_ty)?, resolve_operand(b, arr_ty)?],
+                arr,
+                vec![resolve_operand(a, arr)?, resolve_operand(b, arr)?],
             )
         }
         _ => Ok(None),
@@ -4545,6 +4638,12 @@ pub(crate) fn type_label(ty: PgType, catalog: &dyn TypeCatalog) -> String {
 pub(crate) fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
     if a == b {
         return Some(a);
+    }
+    // Two arrays unify on their element type (PG promotes `int[]` + `bigint[]`
+    // to `bigint[]`); this also drives `array || array` and `array_cat`.
+    if let (PgType::Array(la), PgType::Array(rb)) = (a, b) {
+        let (le, re) = (PgType::from_oid(la)?, PgType::from_oid(rb)?);
+        return merge_types(le, re).map(|e| PgType::Array(e.oid()));
     }
     match (implicit_castable(a, b), implicit_castable(b, a)) {
         (true, false) => Some(b),
@@ -5294,6 +5393,9 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         ast::Expr::AtTimeZone { .. } => "timezone".into(),
         // An `ARRAY[...]` constructor is named "array" in PG.
         ast::Expr::Array(_) => "array".into(),
+        // `a[i]` subscript keeps the base's name, like a bare column through a
+        // cast (`a[1]` → "a"); a non-name base falls through to `?column?`.
+        ast::Expr::CompoundFieldAccess { root, .. } => output_name(root),
         // A bare CASE expression is named "case" in PG.
         ast::Expr::Case { .. } => "case".into(),
         // CEIL/FLOOR special syntax is named after the function.

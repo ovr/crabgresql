@@ -141,3 +141,64 @@ SELECT unnest(ARRAY['a', 'b']) AS u;
 (2 rows)
 
 DROP TABLE arr;
+-- containment/overlap treat NULL elements as matching nothing
+SELECT ARRAY[NULL]::int[] @> ARRAY[NULL]::int[] AS null_contains,
+       ARRAY[1, NULL]::int[] @> ARRAY[NULL]::int[] AS null_contains2,
+       ARRAY[1, NULL]::int[] && ARRAY[2, NULL]::int[] AS null_overlap;
+ null_contains | null_contains2 | null_overlap 
+---------------+----------------+--------------
+ f             | f              | f
+(1 row)
+
+-- `||` with an untyped literal or NULL concatenates arrays (not append)
+SELECT ARRAY[1, 2] || '{3,4}' AS lit_concat,
+       ARRAY[1, 2] || NULL AS null_right,
+       NULL || ARRAY[1, 2] AS null_left,
+       ARRAY['a', 'b'] || '{c,d}' AS text_concat;
+ lit_concat | null_right | null_left | text_concat 
+------------+------------+-----------+-------------
+ {1,2,3,4}  | {1,2}      | {1,2}     | {a,b,c,d}
+(1 row)
+
+-- element types are promoted (int + numeric -> numeric[]), like PG
+SELECT ARRAY[1, 2] || 3.5 AS append_promote,
+       array_cat(ARRAY[1, 2], '{3.9}'::numeric[]) AS cat_promote,
+       array_append(ARRAY[1, 2], 3.5) AS fn_append_promote;
+ append_promote | cat_promote | fn_append_promote 
+----------------+-------------+-------------------
+ {1,2,3.5}      | {1,2,3.9}   | {1,2,3.5}
+(1 row)
+
+-- VALUES / CASE unify differing but compatible array element types
+SELECT a FROM (VALUES (ARRAY[1]), (ARRAY[9000000000])) v(a) ORDER BY 1;
+      a       
+--------------
+ {1}
+ {9000000000}
+(2 rows)
+
+SELECT CASE WHEN true THEN ARRAY[1] ELSE ARRAY[2.5] END AS case_promote;
+ case_promote 
+--------------
+ {1}
+(1 row)
+
+-- non-orderable element arrays report PG's equality-operator error, not a crash
+SELECT ARRAY['1'::json] @> ARRAY['1'::json];
+ERROR:  could not identify an equality operator for type json
+-- a bare, uncast empty array cannot determine its type
+SELECT ARRAY[];
+ERROR:  cannot determine type of empty array
+HINT:  Explicitly cast to the desired type, for example ARRAY[]::integer[].
+-- point[] columns (a non-orderable element type) store and read back
+CREATE TABLE pts (id int, ps point[]);
+INSERT INTO pts VALUES (1, ARRAY[point '(1,2)', point '(3,4)']);
+INSERT INTO pts VALUES (2, '{"(5,6)"}');
+SELECT id, ps, ps[1] FROM pts ORDER BY id;
+ id |        ps         |  ps   
+----+-------------------+-------
+  1 | {"(1,2)","(3,4)"} | (1,2)
+  2 | {"(5,6)"}         | (5,6)
+(2 rows)
+
+DROP TABLE pts;

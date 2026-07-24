@@ -1563,11 +1563,20 @@ fn bind_from_item(
             name,
             alias,
             args: Some(fn_args),
+            with_ordinality,
             ..
         } => {
             if fn_args.settings.is_some() {
                 return Err(BindError::feature_not_supported(
                     "table function SETTINGS are not supported yet",
+                ));
+            }
+            // `WITH ORDINALITY` adds a trailing bigint column; unsupported for now
+            // — reject rather than silently drop it (which would return the wrong
+            // number of columns).
+            if *with_ordinality {
+                return Err(BindError::feature_not_supported(
+                    "WITH ORDINALITY is not supported yet",
                 ));
             }
             let fname = object_name_to_table_name(name)?;

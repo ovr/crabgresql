@@ -337,7 +337,12 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             let elem_oid = r.u32();
             let elem = PgType::from_oid(elem_oid).expect("stored array element type re-resolves");
             let count = r.u32() as usize;
-            let mut elems = Vec::with_capacity(count);
+            // Each element occupies at least one byte (its presence flag), so a
+            // count larger than the bytes remaining is corrupt; cap the up-front
+            // reservation to avoid a huge allocation on a bad page (the loop still
+            // fails loudly via `take` if the data is actually short).
+            let remaining = buf.len().saturating_sub(r.pos);
+            let mut elems = Vec::with_capacity(count.min(remaining));
             for _ in 0..count {
                 if r.take(1)[0] == 0 {
                     elems.push(Value::Null);

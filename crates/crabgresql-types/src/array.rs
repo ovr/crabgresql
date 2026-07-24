@@ -16,7 +16,6 @@ pub struct ArrayError {
 }
 
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
-const FEATURE_NOT_SUPPORTED: &str = "0A000";
 
 fn malformed(s: &str) -> ArrayError {
     ArrayError {
@@ -106,11 +105,18 @@ pub fn format(elems: &[Value], efd: i32) -> String {
     out
 }
 
+/// PG's `array_isspace`: the six ASCII whitespace characters array I/O treats as
+/// whitespace. Deliberately not Rust's Unicode-aware `char::is_whitespace`, which
+/// would over-quote elements containing e.g. a non-breaking space.
+fn is_array_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+}
+
 fn needs_quote(s: &str) -> bool {
     s.is_empty()
         || s.eq_ignore_ascii_case("null")
         || s.chars()
-            .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace())
+            .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || is_array_space(c))
 }
 
 fn push_quoted(out: &mut String, s: &str) {
@@ -147,6 +153,12 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
     }
     loop {
         let (token, quoted) = read_element(&mut chars, input)?;
+        // An empty, unquoted, unescaped token (`{a,,c}`, `{1,}`, `{,1}`) is a
+        // missing element, which PG rejects as malformed. A quoted `""` is a
+        // legitimate empty-string element and keeps `quoted = true`.
+        if !quoted && token.is_empty() {
+            return Err(malformed(input));
+        }
         if !quoted && token.eq_ignore_ascii_case("null") {
             elems.push(Value::Null);
         } else {
@@ -173,14 +185,16 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
 }
 
 fn skip_ws(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+    while matches!(chars.peek(), Some(&c) if is_array_space(c)) {
         chars.next();
     }
 }
 
-/// Read one element token, returning its unescaped text and whether it was
-/// double-quoted. Leaves the iterator positioned on the following delimiter
-/// (`,`/`}`) or trailing whitespace.
+/// Read one element token, returning its unescaped text and whether any part was
+/// double-quoted or backslash-escaped (which forces it to text and disables the
+/// NULL keyword). Leaves the iterator positioned on the following delimiter
+/// (`,`/`}`). Trailing **unquoted, unescaped** whitespace is trimmed, but
+/// whitespace that was quoted or escaped is significant and kept.
 fn read_element(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     input: &str,
@@ -200,10 +214,13 @@ fn read_element(
             }
         }
     }
-    // Unquoted: read until a delimiter, honoring backslash escapes and quotes;
-    // trailing whitespace is trimmed (an interior quote switches to quoted mode).
+    // Unquoted: read until a delimiter, honoring backslash escapes and interior
+    // quotes. `last_sig` tracks the length up to the last significant (non-
+    // whitespace, or quoted/escaped) character, so trailing unquoted whitespace
+    // is dropped while an escaped/quoted trailing space is preserved.
     let mut s = String::new();
-    let mut quoted = false;
+    let mut forced_text = false;
+    let mut last_sig = 0usize;
     loop {
         match chars.peek() {
             Some(',') | Some('}') | None => break,
@@ -211,13 +228,17 @@ fn read_element(
             Some('\\') => {
                 chars.next();
                 match chars.next() {
-                    Some(c) => s.push(c),
+                    Some(c) => {
+                        s.push(c);
+                        forced_text = true;
+                        last_sig = s.len();
+                    }
                     None => return Err(malformed(input)),
                 }
             }
             Some('"') => {
                 chars.next();
-                quoted = true;
+                forced_text = true;
                 loop {
                     match chars.next() {
                         Some('\\') => match chars.next() {
@@ -229,28 +250,19 @@ fn read_element(
                         None => return Err(malformed(input)),
                     }
                 }
+                last_sig = s.len();
             }
             Some(&c) => {
                 chars.next();
                 s.push(c);
+                if !is_array_space(c) {
+                    last_sig = s.len();
+                }
             }
         }
     }
-    if !quoted {
-        while s.ends_with(char::is_whitespace) {
-            s.pop();
-        }
-    }
-    Ok((s, quoted))
-}
-
-/// Feature-not-supported error for an operation this 1-D array slice does not
-/// implement yet (multi-dimensional literals, binary I/O, ...).
-pub fn unsupported(message: impl Into<String>) -> ArrayError {
-    ArrayError {
-        sqlstate: FEATURE_NOT_SUPPORTED,
-        message: message.into(),
-    }
+    s.truncate(last_sig);
+    Ok((s, forced_text))
 }
 
 #[cfg(test)]
@@ -310,6 +322,44 @@ mod tests {
     fn malformed_missing_braces() {
         assert!(array_in("1,2,3", PgType::Int4).is_err());
         assert!(array_in("{1,2", PgType::Int4).is_err());
+    }
+
+    #[test]
+    fn empty_unquoted_element_is_malformed() {
+        // A missing element between/around commas is malformed, but a quoted
+        // empty string is a legitimate element.
+        assert!(array_in("{a,,c}", PgType::Text).is_err());
+        assert!(array_in("{1,}", PgType::Text).is_err());
+        assert!(array_in("{,1}", PgType::Text).is_err());
+        assert_eq!(
+            array_in(r#"{a,"",c}"#, PgType::Text).unwrap(),
+            vec![
+                Value::Text("a".into()),
+                Value::Text(String::new()),
+                Value::Text("c".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn escaped_trailing_whitespace_is_kept() {
+        // A backslash-escaped trailing space is significant and must survive the
+        // unquoted trailing-whitespace trim; an unescaped one is dropped.
+        assert_eq!(
+            array_in("{a\\ }", PgType::Text).unwrap(),
+            vec![Value::Text("a ".into())]
+        );
+        assert_eq!(
+            array_in("{a }", PgType::Text).unwrap(),
+            vec![Value::Text("a".into())]
+        );
+    }
+
+    #[test]
+    fn non_ascii_whitespace_element_is_not_quoted() {
+        // PG's array_out only treats ASCII whitespace as needing quotes; a
+        // non-breaking space (U+00A0) is left bare.
+        assert_eq!(format(&[Value::Text("a\u{00A0}b".into())], 1), "{a\u{00A0}b}");
     }
 
     #[test]

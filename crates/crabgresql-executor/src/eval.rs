@@ -511,7 +511,7 @@ fn int2(v: &Value) -> i16 {
     }
 }
 
-fn array_elems(v: &Value) -> &[Value] {
+pub(crate) fn array_elems(v: &Value) -> &[Value] {
     match v {
         Value::Array { elems, .. } => elems,
         other => unreachable!("expected array, got {other:?}"),

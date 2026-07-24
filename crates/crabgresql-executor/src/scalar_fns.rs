@@ -21,6 +21,7 @@ use crabgresql_types::{
 };
 
 use crate::ExecError;
+use crate::eval::array_elems;
 
 const RADIANS_PER_DEGREE: f64 = 0.017_453_292_519_943_295;
 
@@ -1568,22 +1569,14 @@ fn money_of(v: &Value) -> i64 {
     }
 }
 
-fn array_elems(v: &Value) -> &[Value] {
-    match v {
-        Value::Array { elems, .. } => elems,
-        other => unreachable!("expected array arg, got {other:?}"),
-    }
-}
-
-/// Element equality for array containment/overlap: two NULLs are equal (as PG's
-/// array element comparison treats them), a NULL and a non-NULL are unequal, and
-/// two non-NULLs use the element type's total order.
+/// Element equality for array containment/overlap. PG's `array_contain_compare`
+/// treats a NULL element as matching nothing (a NULL is never "contained", even
+/// by another NULL), so any NULL operand is unequal; two non-NULLs use the
+/// element type's total order.
 fn elem_eq(elem: PgType, x: &Value, y: &Value) -> bool {
-    match (x, y) {
-        (Value::Null, Value::Null) => true,
-        (Value::Null, _) | (_, Value::Null) => false,
-        _ => crate::eval::compare_values(elem, x, y) == std::cmp::Ordering::Equal,
-    }
+    !matches!(x, Value::Null)
+        && !matches!(y, Value::Null)
+        && crate::eval::compare_values(elem, x, y) == std::cmp::Ordering::Equal
 }
 
 /// `a @> b`: every element of `b` is present in `a` (element equality). The
