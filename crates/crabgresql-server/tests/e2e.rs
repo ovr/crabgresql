@@ -3170,10 +3170,10 @@ async fn temp_tables_are_not_reachable_across_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `CREATE UNLOGGED TABLE ... AS SELECT` must also produce a memory table
-/// (`relpersistence = 'u'`), not silently fall back to a durable Permanent heap.
+/// `CREATE UNLOGGED TABLE ... AS SELECT` must also produce an UNLOGGED table
+/// (`relpersistence = 'u'`), not silently fall back to a Permanent heap.
 #[tokio::test]
-async fn unlogged_create_table_as_is_a_memory_table() -> anyhow::Result<()> {
+async fn unlogged_create_table_as_is_unlogged() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client.simple_query("CREATE TABLE src (id int4)").await?;
     client.simple_query("INSERT INTO src VALUES (1), (2)").await?;
@@ -3187,13 +3187,14 @@ async fn unlogged_create_table_as_is_a_memory_table() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `CREATE UNLOGGED TABLE` makes a RAM-backed memory table: it reads and writes
-/// like any table, reflects `relpersistence = 'u'` in `pg_class`, and (like PG's
-/// UNLOGGED) its rows do not survive a crash — here, the run just proves the CRUD
-/// path and the catalog reflection.
+/// `CREATE UNLOGGED TABLE` reads and writes like any table, reflects
+/// `relpersistence = 'u'` in `pg_class`, and — unlike a TEMP table — is a shared
+/// relation visible to other sessions (it is on-disk and WAL-skipped, not
+/// session-local).
 #[tokio::test]
-async fn unlogged_table_is_a_memory_table() -> anyhow::Result<()> {
-    let client = connect(spawn_server().await).await;
+async fn unlogged_table_crud_reflection_and_cross_session() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let client = connect(port).await;
     client
         .simple_query("CREATE UNLOGGED TABLE u (id int4, label text)")
         .await?;
@@ -3217,6 +3218,12 @@ async fn unlogged_table_is_a_memory_table() -> anyhow::Result<()> {
         .simple_query("SELECT relpersistence FROM pg_class WHERE relname = 'p'")
         .await?;
     assert_eq!(rows(&permanent)[0].get("relpersistence"), Some("p"));
+
+    // An UNLOGGED table is shared: a second session sees it and its rows (a TEMP
+    // table would be invisible cross-session).
+    let other = connect(port).await;
+    let seen = other.simple_query("SELECT label FROM u ORDER BY id").await?;
+    assert_eq!(rows(&seen)[0].get("label"), Some("one"));
 
     Ok(())
 }

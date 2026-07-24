@@ -7,9 +7,11 @@
 //! the shared [`satisfies_mvcc`](crabgresql_txn::satisfies_mvcc) rule applied to
 //! the on-page header.
 //!
-//! An UNLOGGED or TEMP table is a **memory table**: the same heap access method
-//! over pages that live in RAM in the storage manager, with the WAL skipped, so
-//! it is fast and lost on restart. Only where the versions live differs.
+//! Three persistence classes share this one heap access method (see
+//! [`crabgresql_storage_api::RelPersistence`]): `Permanent` (on-disk, WAL-logged),
+//! `Unlogged` (on-disk but WAL-skipped, its data reset to empty on crash), and
+//! `Temporary` (RAM-backed, WAL-skipped, gone on restart). Only the WAL and the
+//! backing store differ; visibility is identical.
 //!
 //! Deliberately deferred to keep this first cut tractable (all documented in
 //! `docs/ARCHITECTURE.md §3`): TOAST (a tuple must fit one page), a durable SLRU
@@ -35,6 +37,7 @@ mod tuple;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_storage_api::{
@@ -42,9 +45,10 @@ use crabgresql_storage_api::{
     TableEngine, TableSchema, ViewDefinition,
 };
 use crabgresql_txn::{Clog, TxnFinalize, Xid};
-use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, recover, write_control};
+use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, read_control, recover, write_control};
 
 use crate::btredo::BtreeRedo;
+use crate::nbtree::BTree;
 use crate::bufpool::BufferPool;
 use crate::catalog::RelCatalog;
 use crate::heap::HeapTable;
@@ -106,6 +110,10 @@ pub struct PgEngine {
     /// in `public`; the relfilenode-swap TRUNCATE machinery only ever touches
     /// `public` tables (it threads bare names through the WAL).
     tables: RwLock<HashMap<(String, String), Arc<HeapTable>>>,
+    /// The `next_xid` recorded by the last checkpoint, reused as the control-file
+    /// floor at a clean shutdown (recovery recomputes the exact value from the WAL,
+    /// so this only needs to be a valid lower bound).
+    last_next_xid: AtomicU64,
 }
 
 impl PgEngine {
@@ -154,6 +162,7 @@ impl PgEngine {
             data_dir: data_dir.to_path_buf(),
             catalog,
             tables: RwLock::new(tables),
+            last_next_xid: AtomicU64::new(0),
         })
     }
 
@@ -169,6 +178,13 @@ impl PgEngine {
         data_dir: &Path,
         wal: Arc<Wal>,
     ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
+        // Read the pre-recovery control file: `clean_shutdown == false` (or absent)
+        // means the last run crashed, so unlogged relations must be reset. Read it
+        // BEFORE the startup checkpoint below overwrites it with a running marker.
+        let was_clean = read_control(data_dir)
+            .map_err(std::io::Error::other)?
+            .map(|c| c.clean_shutdown)
+            .unwrap_or(false);
         let mut registry = RmgrRegistry::new();
         let engine = Arc::new(PgEngine::new(data_dir, Arc::clone(&wal), &mut registry)?);
         let clog = Arc::new(Clog::new());
@@ -177,27 +193,59 @@ impl PgEngine {
         // a torn tail left by a crash.
         wal.reset_to(res.end_of_wal).map_err(std::io::Error::other)?;
         // Reconcile swap TRUNCATEs replayed from the WAL (apply committed, discard
-        // the rest), reclaim orphaned staging files, then make the recovered
-        // catalog and pages durable.
+        // the rest), reclaim orphaned staging files.
         engine.apply_recovered_truncates(&clog);
         engine.gc_orphan_relfiles()?;
+        // After a crash, an unlogged relation's WAL-skipped pages may be torn — the
+        // write-ahead rule never guarded them — so empty each unlogged heap and
+        // re-lay its indexes as empty B-trees (PostgreSQL's ResetUnloggedRelations).
+        if !was_clean {
+            engine.reset_unlogged_relations()?;
+        }
+        // Make the recovered catalog and pages durable and mark the DB running.
         engine.checkpoint(res.next_xid)?;
         Ok((engine, clog, res.next_xid))
     }
 
     /// Flush all dirty pages to their relation files (obeying the write-ahead
-    /// rule) and record a clean control file. Called after recovery and at a
-    /// clean shutdown so the data files are current.
+    /// rule) and record a **running** (not-cleanly-shut-down) control file, so a
+    /// crash after this leaves `clean_shutdown = false` and the next startup resets
+    /// unlogged relations. A clean exit calls [`TableEngine::shutdown`], which marks
+    /// it clean instead.
     pub fn checkpoint(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
+        self.write_control_file(next_xid, false)
+    }
+
+    fn write_control_file(&self, next_xid: Xid, clean_shutdown: bool) -> std::io::Result<()> {
         self.inner.bufpool.flush_all()?;
+        self.last_next_xid.store(next_xid.0, Ordering::Relaxed);
         write_control(
             &self.data_dir,
             &ControlFile {
                 next_xid,
-                clean_shutdown: true,
+                clean_shutdown,
             },
         )
         .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    /// Empty every `Unlogged` relation's on-disk files after an unclean shutdown.
+    /// The heap file is truncated to zero blocks; each physical index file is
+    /// truncated and re-initialized to a valid empty B-tree (an empty file would
+    /// fault on the missing meta page). The heap is now empty, so no index rebuild
+    /// inserts are needed. All WAL-silent — this is a startup-time bulk reset.
+    pub fn reset_unlogged_relations(&self) -> std::io::Result<()> {
+        let smgr = self.inner.bufpool.smgr();
+        for (heap_rel, index_rels) in self.catalog.unlogged_relfilenodes() {
+            self.inner.bufpool.forget_relation(heap_rel);
+            smgr.truncate(heap_rel)?;
+            for irel in index_rels {
+                self.inner.bufpool.forget_relation(irel);
+                smgr.truncate(irel)?;
+                BTree::open(Arc::clone(&self.inner), irel, Arc::new(RwLock::new(())), true).create();
+            }
+        }
         Ok(())
     }
 
@@ -418,9 +466,11 @@ impl TableEngine for PgEngine {
             .catalog
             .create(&schema)
             .expect("relation catalog write failed");
-        // A memory table (UNLOGGED/TEMP) is RAM-backed: register its relfilenode
-        // with the storage manager so every page op routes to memory, never a file.
-        if schema.persistence.is_memory() {
+        // A `Temporary` table is RAM-backed: register its relfilenode with the
+        // storage manager so every page op routes to memory, never a file. An
+        // `Unlogged` table is on-disk (WAL-skipped but file-backed), so it is not
+        // registered here — it uses a real `base/<relfilenode>` file.
+        if schema.persistence.is_ram_backed() {
             self.inner.bufpool.smgr().register_memory(rel);
         }
         let table = Arc::new(HeapTable::new(
@@ -435,6 +485,16 @@ impl TableEngine for PgEngine {
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
         self.resolve(Some("public"), name)
+    }
+
+    fn shutdown(&self) {
+        // Flush everything and mark the control file clean, so the next startup
+        // keeps unlogged relations' data. Reuse the last checkpoint's next_xid — a
+        // valid floor; recovery recomputes the exact value from the WAL.
+        let next_xid = Xid(self.last_next_xid.load(Ordering::Relaxed));
+        if let Err(e) = self.write_control_file(next_xid, true) {
+            tracing::error!(error = %e, "clean-shutdown flush failed");
+        }
     }
 
     fn resolve(&self, schema: Option<&str>, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
@@ -509,14 +569,14 @@ impl TableEngine for PgEngine {
         let target = tables
             .get(&(namespace.to_string(), table.to_string()))
             .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
-        // Allocate a relfilenode only for a physical index; metadata-only indexes
-        // stay at relfilenode 0 (no file, no burned id). A memory table
-        // (UNLOGGED/TEMP) never gets a physical B-tree — it would write index pages
-        // to a real file under `base/` and WAL-log every mutation, contradicting
-        // the memory-table contract (RAM-only, no WAL). Its indexes stay
-        // metadata-only: uniqueness is still enforced by the executor's
-        // visible-row scan, and equality lookups fall back to a heap scan.
-        let index_rel = if target.can_index(&index) && !target.schema().persistence.is_memory() {
+        // Index storage follows the table's persistence:
+        // * Permanent / Unlogged → a physical on-disk B-tree (its own relfilenode).
+        //   An Unlogged index is WAL-silent but file-backed (`build_index` derives
+        //   that from the schema) and is reset with its table on crash.
+        // * Temporary → metadata-only (relfilenode 0): a RAM table's index would
+        //   need RAM/WAL handling for little benefit, so uniqueness stays on the
+        //   executor's visible-row scan and equality lookups fall back to a heap scan.
+        let index_rel = if target.can_index(&index) && !target.schema().persistence.is_ram_backed() {
             self.catalog.alloc_relfilenode()
         } else {
             RelFileNode(0)

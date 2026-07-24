@@ -1,7 +1,8 @@
 //! The durable heap access method: `TableAm` over slotted pages + buffer pool +
 //! WAL. Visibility is the shared [`satisfies_mvcc`] rule applied to the on-page
-//! [`TupleHeader`]. A memory table (UNLOGGED/TEMP) uses this same access method
-//! over RAM-backed pages with the WAL skipped; only where the versions live differs.
+//! [`TupleHeader`]. `Unlogged` and `Temporary` tables use this same access method
+//! with the WAL skipped (`Unlogged` still on-disk, `Temporary` in RAM); only the
+//! WAL and the backing store differ.
 //!
 //! Every mutator follows the same write-ahead sequence inside the page's write
 //! lock: change the page, append the WAL record, stamp `pd_lsn` with the record
@@ -59,10 +60,12 @@ pub struct HeapTable {
     /// Last block we inserted into — where the next insert tries first.
     insert_hint: AtomicU32,
     indexes: RwLock<Vec<IndexEntry>>,
-    /// A memory table (`relpersistence` `'u'`/`'t'`): its pages live in RAM in the
-    /// storage manager and every mutation skips the WAL. Set from
-    /// `schema.persistence` at construction.
-    is_memory: bool,
+    /// Whether this relation's mutations skip the WAL (`Unlogged`/`Temporary`).
+    /// Cached from `schema.persistence` at construction. Note this is the WAL axis
+    /// only — RAM-vs-file backing is the storage manager's concern (`is_ram_backed`,
+    /// registered at create time), so an `Unlogged` table is `wal_skipped` but
+    /// on-disk.
+    wal_skipped: bool,
 }
 
 /// One index attached to a heap table: its semantic metadata, its physical
@@ -97,7 +100,7 @@ impl HeapTable {
                 latch: Arc::new(RwLock::new(())),
             })
             .collect();
-        let is_memory = schema.persistence.is_memory();
+        let wal_skipped = schema.persistence.is_wal_skipped();
         HeapTable {
             schema,
             engine,
@@ -107,16 +110,17 @@ impl HeapTable {
             lock: Arc::new(TableLock::new()),
             insert_hint: AtomicU32::new(0),
             indexes: RwLock::new(indexes),
-            is_memory,
+            wal_skipped,
         }
     }
 
-    /// Log a heap change, or skip the WAL entirely for a memory table (returning
-    /// LSN 0, which the page carries as its `pd_lsn`). LSN 0 makes the buffer
-    /// pool's write-ahead flush a no-op, so a memory table's dirty pages evict
-    /// straight to their RAM backing.
+    /// Log a heap change, or skip the WAL entirely for a WAL-skipped table
+    /// (`Unlogged`/`Temporary`), returning LSN 0 which the page carries as its
+    /// `pd_lsn`. LSN 0 makes the buffer pool's write-ahead flush a no-op, so the
+    /// dirty page evicts straight to its backing store (RAM for `Temporary`, a
+    /// file for `Unlogged`).
     fn log(&self, info: u8, xid: Xid, payload: &[u8]) -> Lsn {
-        if self.is_memory {
+        if self.wal_skipped {
             Lsn(0)
         } else {
             self.engine.wal.append(RmgrId::HEAP, info, xid, payload)
@@ -152,7 +156,12 @@ impl HeapTable {
 
     /// Open the [`BTree`] for an index entry (shares the entry's latch).
     fn btree(&self, entry: &IndexEntry) -> BTree {
-        BTree::open(Arc::clone(&self.engine), entry.rel, Arc::clone(&entry.latch))
+        BTree::open(
+            Arc::clone(&self.engine),
+            entry.rel,
+            Arc::clone(&entry.latch),
+            self.schema.persistence.is_unlogged(),
+        )
     }
 
     /// Build the physical B-tree for a new index and publish it. Runs under the
@@ -181,7 +190,12 @@ impl HeapTable {
         // via an RAII guard so a panic mid-build cannot leak the exclusive hold.
         let _guard = self.lock.acquire_exclusive_guard(LockOwner::DDL);
         let latch = Arc::new(RwLock::new(()));
-        let btree = BTree::open(Arc::clone(&self.engine), rel, Arc::clone(&latch));
+        let btree = BTree::open(
+            Arc::clone(&self.engine),
+            rel,
+            Arc::clone(&latch),
+            self.schema.persistence.is_unlogged(),
+        );
         Self::io(self.engine.bufpool.smgr().create_if_missing(rel));
         btree.create();
         let cols = btkey::key_columns(&meta.keys);
@@ -206,9 +220,12 @@ impl HeapTable {
             }
         }
         // Make the build durable now, so the index survives a crash even with no
-        // subsequent commit — CREATE INDEX is a durable DDL, as in PostgreSQL.
-        let lsn = self.engine.wal.current_lsn();
-        Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
+        // subsequent commit — CREATE INDEX is a durable DDL, as in PostgreSQL. An
+        // Unlogged index writes no WAL (it is rebuilt on crash), so nothing to flush.
+        if !self.schema.persistence.is_unlogged() {
+            let lsn = self.engine.wal.current_lsn();
+            Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
+        }
         // Publish with the same latch the build used, so no maintenance window
         // opens between the last build insert and the entry becoming visible.
         self.indexes
@@ -451,7 +468,13 @@ impl TableAm for HeapTable {
             // A NULL (or otherwise un-encodable) probe key: served, no match.
             return Some(Box::new(std::iter::empty()));
         };
-        let tids = BTree::open(Arc::clone(&self.engine), rel, latch).search_equal(&kb);
+        let tids = BTree::open(
+            Arc::clone(&self.engine),
+            rel,
+            latch,
+            self.schema.persistence.is_unlogged(),
+        )
+        .search_equal(&kb);
         let mut out = Vec::new();
         for tid in tids {
             if let Some(tuple) = self.fetch(tid, txn) {
@@ -570,17 +593,18 @@ impl TableAm for HeapTable {
         self.lock.acquire_exclusive(txn.lock_owner);
         let old = self.effective_rel(txn.xid);
         // A fresh, never-reused relfilenode for the empty post-truncate file. A
-        // memory table's replacement must also be RAM-backed.
+        // RAM-backed (`Temporary`) table's replacement must also be RAM-backed.
         let new = self.engine.catalog.alloc_relfilenode();
-        if self.is_memory {
+        if self.schema.persistence.is_ram_backed() {
             self.engine.bufpool.smgr().register_memory(new);
         }
         Self::io(self.engine.bufpool.smgr().create_if_missing(new));
         // WAL-log the swap intent {old, new, table} and flush it. Recovery applies
         // the swap only for a committed XID, so the record is safe to write now. A
-        // memory table skips the WAL (it never recovers), but the swap still runs
-        // through the same commit/abort finalize path in RAM.
-        if !self.is_memory {
+        // WAL-skipped table (`Unlogged`/`Temporary`) writes no such record (an
+        // Unlogged table's data is reset on crash instead), but the swap still runs
+        // through the same commit/abort finalize path.
+        if !self.wal_skipped {
             let lsn = self.engine.wal.append(
                 RmgrId::HEAP,
                 rec::HEAP_TRUNCATE,
@@ -677,8 +701,13 @@ impl TableAm for HeapTable {
             for (tid, tuple) in &victims {
                 for (irel, latch, cols) in &phys {
                     if let Some(key) = btkey::encode_row(&self.schema, cols, tuple) {
-                        BTree::open(Arc::clone(&self.engine), *irel, Arc::clone(latch))
-                            .delete(&key, *tid);
+                        BTree::open(
+                            Arc::clone(&self.engine),
+                            *irel,
+                            Arc::clone(latch),
+                            self.schema.persistence.is_unlogged(),
+                        )
+                        .delete(&key, *tid);
                     }
                 }
             }

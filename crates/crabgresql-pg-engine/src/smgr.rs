@@ -17,7 +17,7 @@ pub struct RelFileNode(pub u32);
 pub struct StorageManager {
     base: PathBuf,
     files: Mutex<HashMap<u32, Arc<Mutex<File>>>>,
-    /// RAM-backed relations (memory tables: `relpersistence` `'u'`/`'t'`). A
+    /// RAM-backed relations (`Temporary` tables only — `Unlogged` is on-disk). A
     /// relfilenode present here holds its blocks in this map instead of a file
     /// under `base/`; every smgr op routes here first. Its pages never touch disk
     /// and are lost on restart. The membership map is an `RwLock` (mutated only at
@@ -196,9 +196,9 @@ impl StorageManager {
         self.file(rel).map(|_| ())
     }
 
-    /// Truncate a relation to zero blocks. No longer on the TRUNCATE path (which
-    /// now swaps to a fresh relfilenode) but kept as part of the smgr API.
-    #[allow(dead_code)]
+    /// Truncate a relation to zero blocks. Not on the transactional TRUNCATE path
+    /// (which swaps to a fresh relfilenode); used by the startup crash-reset of
+    /// unlogged relations ([`crate::PgEngine::reset_unlogged_relations`]).
     pub fn truncate(&self, rel: RelFileNode) -> std::io::Result<()> {
         if self.with_mem(rel, |pages| pages.clear()).is_some() {
             return Ok(());
