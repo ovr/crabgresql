@@ -602,6 +602,18 @@ pub trait TableEngine: Send + Sync {
         Vec::new()
     }
 
+    /// Names of relations in `namespace`, without cloning full schemas. The
+    /// default derives from [`relations`](Self::relations); engines keyed by
+    /// namespace override it to read just the names. Used for per-namespace
+    /// teardown (dropping a session's temp tables at disconnect).
+    fn relation_names_in(&self, namespace: &str) -> Vec<String> {
+        self.relations()
+            .into_iter()
+            .filter(|s| s.namespace == namespace)
+            .map(|s| s.name)
+            .collect()
+    }
+
     /// Enumerate user relations including live index metadata for catalog
     /// reflection. Engines with tables override this; the fallback preserves
     /// compatibility for read-only/system engines.
