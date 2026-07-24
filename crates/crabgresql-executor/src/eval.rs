@@ -400,10 +400,15 @@ pub(crate) fn apply_comparison(
     l: &Value,
     r: &Value,
 ) -> bool {
+    // Every supported collation is deterministic, so equal bytes and equal
+    // values coincide (see `compare_values`'s doc comment) — equality never
+    // needs the collation-aware path, so skip straight past the ICU collator.
+    if matches!(op, BinOp::Eq | BinOp::NotEq) {
+        let eq = compare_values(arg_ty, l, r).is_eq();
+        return if op == BinOp::Eq { eq } else { !eq };
+    }
     let ordering = compare_values_collated(arg_ty, l, r, collation);
     match op {
-        BinOp::Eq => ordering.is_eq(),
-        BinOp::NotEq => ordering.is_ne(),
         BinOp::Lt => ordering.is_lt(),
         BinOp::LtEq => ordering.is_le(),
         BinOp::Gt => ordering.is_gt(),

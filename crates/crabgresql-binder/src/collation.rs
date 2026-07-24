@@ -120,14 +120,23 @@ pub fn expr_collation(expr: &BoundExpr) -> Derived {
 }
 
 impl Derived {
-    /// Keep the stronger of two derivations; on a tie keep `self` unless it
-    /// asserts nothing. Conflicting equal-strength collations are resolved by
-    /// this same rule, which is the documented simplification for implicit
-    /// conflicts (explicit conflicts are caught by [`collation_for_comparison`]
-    /// before they reach here).
-    fn max_with(self, other: Derived) -> Derived {
+    /// Keep the stronger of two derivations. On a tie — both sides carrying
+    /// the same non-`None` strength but disagreeing on the collation — fall
+    /// back to the database default, matching this module's documented
+    /// simplification for a conflict PostgreSQL would flag `42P22` at the
+    /// point of use. A genuine *explicit* conflict is caught earlier by
+    /// [`check_explicit_conflict`] wherever more than one collatable input
+    /// combines, so by the time an explicit/explicit tie reaches here it has
+    /// already been rejected; this fallback only actually fires for implicit
+    /// ties.
+    pub(crate) fn max_with(self, other: Derived) -> Derived {
         if other.strength > self.strength {
             other
+        } else if self.strength == other.strength
+            && self.strength != Strength::None
+            && self.collation != other.collation
+        {
+            Derived::NONE
         } else {
             self
         }
@@ -145,8 +154,44 @@ fn combine_all(exprs: &[BoundExpr]) -> Derived {
 /// ([`crate::OutputColumn::collation`]): `Some` only when it differs from what
 /// the column's type would give anyway, which `None` already means.
 pub fn column_collation(expr: &BoundExpr) -> Option<u32> {
+    output_collation(expr).0
+}
+
+/// [`column_collation`] paired with the strength behind it, for
+/// [`crate::OutputColumn::strength`].
+pub fn output_collation(expr: &BoundExpr) -> (Option<u32>, Strength) {
     let derived = expr_collation(expr);
-    (derived.collation != type_collation(expr.ty())).then_some(derived.collation)
+    let collation = (derived.collation != type_collation(expr.ty())).then_some(derived.collation);
+    (collation, derived.strength)
+}
+
+/// `42P22` when two of `derived` are both explicit and disagree — PostgreSQL's
+/// rule for combining more than one collatable input (function arguments,
+/// `CASE` branches, `ARRAY` elements, a `UNION`'s arms), generalized from the
+/// pairwise check a binary comparison does in [`collation_for_comparison`].
+pub fn check_explicit_conflict(derived: impl IntoIterator<Item = Derived>) -> Result<(), BindError> {
+    let mut explicit: Option<u32> = None;
+    for d in derived {
+        if d.strength != Strength::Explicit {
+            continue;
+        }
+        match explicit {
+            Some(prev) if prev != d.collation => return Err(conflict_error(prev, d.collation)),
+            _ => explicit = Some(d.collation),
+        }
+    }
+    Ok(())
+}
+
+fn conflict_error(a: u32, b: u32) -> BindError {
+    BindError::new(
+        sqlstate::INDETERMINATE_COLLATION,
+        format!(
+            "collation mismatch between explicit collations \"{}\" and \"{}\"",
+            collation_name(a),
+            collation_name(b)
+        ),
+    )
 }
 
 /// The collation a comparison of `left` and `right` should use.
@@ -155,19 +200,7 @@ pub fn column_collation(expr: &BoundExpr) -> Option<u32> {
 /// as PostgreSQL does — that is a query the author wrote two ways at once.
 pub fn collation_for_comparison(left: &BoundExpr, right: &BoundExpr) -> Result<u32, BindError> {
     let (l, r) = (expr_collation(left), expr_collation(right));
-    if l.strength == Strength::Explicit
-        && r.strength == Strength::Explicit
-        && l.collation != r.collation
-    {
-        return Err(BindError::new(
-            sqlstate::INDETERMINATE_COLLATION,
-            format!(
-                "collation mismatch between explicit collations \"{}\" and \"{}\"",
-                collation_name(l.collation),
-                collation_name(r.collation)
-            ),
-        ));
-    }
+    check_explicit_conflict([l, r])?;
     Ok(l.max_with(r).collation)
 }
 

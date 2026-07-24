@@ -9,7 +9,8 @@ mod functions;
 mod plan;
 
 pub use collation::{
-    Derived, Strength, collation_name, column_collation, expr_collation, resolve_collation,
+    Derived, Strength, check_explicit_conflict, collation_name, column_collation, expr_collation,
+    output_collation, resolve_collation,
 };
 pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, ParamCtx, ParamState, Scope, Subplan, UnaryOp,
@@ -44,6 +45,14 @@ pub struct OutputColumn {
     /// `None` means the type default (and is always `None` for a
     /// non-collatable type).
     pub collation: Option<u32>,
+    /// The derivation strength behind `collation` — `Strength::None` when
+    /// `collation` is `None` for want of any collatable input, and otherwise
+    /// `Strength::Implicit`/`Strength::Explicit`. Carried alongside
+    /// `collation` because a rowset boundary (a `UNION` arm, in particular)
+    /// needs to tell an explicit `COLLATE` conflict from an implicit one, and
+    /// `collation` alone can't: an implicit collation can equal the type
+    /// default and still round-trip as `None`.
+    pub strength: Strength,
 }
 
 impl OutputColumn {
@@ -53,6 +62,7 @@ impl OutputColumn {
             name: name.into(),
             ty,
             collation: None,
+            strength: Strength::None,
         }
     }
 }

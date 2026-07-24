@@ -2511,7 +2511,11 @@ fn execute_create_table_as(
         namespace: namespace.clone(),
         columns: cols
             .iter()
-            .map(|c| Column::new(c.name.clone(), c.ty))
+            .map(|c| {
+                let mut col = Column::new(c.name.clone(), c.ty);
+                col.collation = c.collation;
+                col
+            })
             .collect(),
         persistence,
         partition_scheme: None,

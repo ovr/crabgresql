@@ -82,5 +82,46 @@ SELECT a.attname, a.attcollation = (SELECT oid FROM pg_collation WHERE collname 
 SELECT column_name, collation_schema, collation_name FROM information_schema.columns
   WHERE table_name = 'coll_c' ORDER BY column_name;
 
+-- a comparison between two differently, implicitly collated columns is not
+-- order-dependent: swapping operands must not flip which side's collation wins
+CREATE TABLE coll_pair (x text COLLATE "de-x-icu", y text COLLATE "sv-x-icu");
+INSERT INTO coll_pair VALUES ('å', 'z');
+SELECT (x < y) AS de_order, (y > x) AS sv_order FROM coll_pair;
+
+-- conflicting explicit collations are rejected wherever collatable inputs
+-- combine, not just in a direct comparison
+SELECT concat('a' COLLATE "de-x-icu", 'b' COLLATE "sv-x-icu");
+SELECT CASE WHEN true THEN 'a' COLLATE "de-x-icu" ELSE 'b' COLLATE "sv-x-icu" END;
+SELECT ARRAY['a' COLLATE "de-x-icu", 'b' COLLATE "sv-x-icu"];
+SELECT 'a' COLLATE "de-x-icu" UNION SELECT 'b' COLLATE "sv-x-icu";
+-- two implicit collations disagreeing (no explicit COLLATE) still falls back
+-- to the default silently, as documented
+SELECT x FROM coll_pair UNION SELECT y FROM coll_pair ORDER BY 1;
+
+-- MIN/MAX respect the argument's collation, matching ORDER BY
+SELECT min(a) FROM coll_c;
+SELECT max(a) FROM coll_c;
+SELECT a FROM coll_c ORDER BY a LIMIT 1;
+SELECT a FROM coll_c ORDER BY a DESC LIMIT 1;
+
+-- a quantified subquery comparison sees the candidate column's own collation:
+-- 'a' sorts before "Banana" case-insensitively (de-x-icu) but after it in
+-- byte order, so the same literal-vs-subquery comparison disagrees depending
+-- on which table's (differently collated) column supplies the candidate
+SELECT 'a' > ANY (SELECT a FROM coll_c WHERE a = 'Banana') AS gt_de;
+SELECT 'a' > ANY (SELECT a FROM coll_t WHERE a = 'Banana') AS gt_default;
+
+-- CREATE TABLE ... AS SELECT preserves a source column's collation
+CREATE TABLE coll_ctas AS SELECT a FROM coll_c;
+SELECT a FROM coll_ctas ORDER BY a;
+SELECT attcollation = (SELECT oid FROM pg_collation WHERE collname = 'de-x-icu') AS is_de
+  FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'coll_ctas')
+  AND attname = 'a';
+
+-- a bare COLLATE in the select list, with no alias, keeps the operand's name
+SELECT a COLLATE "de-x-icu" FROM coll_c ORDER BY a LIMIT 1;
+
+DROP TABLE coll_ctas;
+DROP TABLE coll_pair;
 DROP TABLE coll_c;
 DROP TABLE coll_t;

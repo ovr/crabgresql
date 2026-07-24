@@ -991,7 +991,9 @@ fn hole_ty(cmp: &BoundExpr) -> Option<PgType> {
                 ty,
             } => Some(*ty),
             BoundExpr::Const { .. } => None,
-            BoundExpr::Coerce { expr, .. } | BoundExpr::Reinterpret { expr, .. } => find(expr),
+            BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::Collate { expr, .. } => find(expr),
             BoundExpr::FuncCall { args, .. } => args.iter().find_map(find),
             _ => None,
         }
@@ -1037,6 +1039,15 @@ fn substitute_hole(
             expr: Box::new(substitute_hole(expr, value, ctx)?),
             reported: *reported,
             rep: *rep,
+        }),
+        BoundExpr::Collate {
+            expr,
+            collation,
+            explicit,
+        } => Ok(BoundExpr::Collate {
+            expr: Box::new(substitute_hole(expr, value, ctx)?),
+            collation: *collation,
+            explicit: *explicit,
         }),
         BoundExpr::FuncCall { func, ret, args } => {
             let args = args

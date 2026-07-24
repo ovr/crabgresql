@@ -1637,6 +1637,15 @@ fn unify_set_columns(
             "each UNION query must have the same number of columns",
         ));
     }
+    // An arm column's `(collation, strength)` re-expressed as a `Derived`, the
+    // same shape every other multi-input collation combination (function
+    // arguments, CASE branches, ARRAY elements) folds over.
+    let to_derived = |c: &OutputColumn| crate::collation::Derived {
+        collation: c
+            .collation
+            .unwrap_or_else(|| crabgresql_types::collation::type_collation(c.ty)),
+        strength: c.strength,
+    };
     let mut columns = Vec::with_capacity(first_cols.len());
     for (i, first) in first_cols.iter().enumerate() {
         // Fold the common type across all arms. A bare NULL contributes no type
@@ -1644,11 +1653,11 @@ fn unify_set_columns(
         // arms), so it never forces the column to `text`.
         let first_typed = !is_null_literal_column(first_plan, i);
         let mut common = first_typed.then_some(first.ty);
-        // Fold the arms' collations the same way: the result column is collated
-        // only while every contributing arm agrees. A NULL arm contributes none,
-        // and a disagreement drops to the type default (`None`), as PG resolves a
-        // set operation's output collation.
-        let mut collation = first_typed.then_some(first.collation);
+        // Fold the arms' collations the same way: two explicit COLLATE clauses
+        // that disagree are `42P22`, exactly as they would be in a direct
+        // comparison; anything weaker that disagrees drops to the type
+        // default, as PG resolves a set operation's output collation.
+        let mut derived = first_typed.then(|| to_derived(first));
         for (plan, cols) in &arms[1..] {
             if is_null_literal_column(plan, i) {
                 continue;
@@ -1667,17 +1676,32 @@ fn unify_set_columns(
                     )
                 })?,
             });
-            collation = match collation {
-                Some(prev) if prev == cols[i].collation => collation,
-                Some(_) => Some(None),
-                None => Some(cols[i].collation),
-            };
+            let next = to_derived(&cols[i]);
+            derived = Some(match derived {
+                None => next,
+                Some(prev) => {
+                    crate::collation::check_explicit_conflict([prev, next])?;
+                    prev.max_with(next)
+                }
+            });
         }
+        // An all-NULL column has no type to take: PG resolves it to `text`.
+        let merged_ty = common.unwrap_or(PgType::Text);
+        let (collation, strength) = match derived.filter(|_| merged_ty.is_collatable()) {
+            Some(d) => {
+                let default = crabgresql_types::collation::type_collation(merged_ty);
+                (
+                    (d.collation != default).then_some(d.collation),
+                    d.strength,
+                )
+            }
+            None => (None, crate::collation::Strength::None),
+        };
         columns.push(OutputColumn {
             name: first.name.clone(),
-            // An all-NULL column has no type to take: PG resolves it to `text`.
-            ty: common.unwrap_or(PgType::Text),
-            collation: collation.flatten(),
+            ty: merged_ty,
+            collation,
+            strength,
         });
     }
     Ok(columns)
@@ -2250,6 +2274,7 @@ fn bind_from_item(
                     name: c.name,
                     ty: c.ty,
                     collation: c.collation,
+                    strength: c.strength,
                 })
                 .collect();
             apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
@@ -2299,6 +2324,10 @@ fn bind_from_item(
                             name: c.name.clone(),
                             ty: c.ty,
                             collation: c.collation,
+                            // A real table column is always implicit strength,
+                            // whether or not its collation equals the type
+                            // default.
+                            strength: crate::collation::Strength::Implicit,
                         })
                         .collect();
                     // A partitioned parent has no rows of its own: read it as a
@@ -3521,10 +3550,12 @@ fn bind_values_select(
             ));
         };
         let bound = bind_projection(expr, &scope)?;
+        let (collation, strength) = crate::collation::output_collation(&bound);
         columns.push(OutputColumn {
             name: alias.unwrap_or_else(|| output_name(expr)),
             ty: bound.ty(),
-            collation: crate::collation::column_collation(&bound),
+            collation,
+            strength,
         });
         row.push(bound);
     }
@@ -3633,10 +3664,12 @@ fn bind_target_list(
             }
             SelectField::Expr(expr, alias) => {
                 let bound = bind_projection(expr, scope)?;
+                let (collation, strength) = crate::collation::output_collation(&bound);
                 columns.push(OutputColumn {
                     name: alias.unwrap_or_else(|| output_name(expr)),
                     ty: bound.ty(),
-                    collation: crate::collation::column_collation(&bound),
+                    collation,
+                    strength,
                 });
                 projections.push(bound);
             }
@@ -3906,12 +3939,16 @@ fn rewrite_over_aggregate(
                 ));
             }
             let index = group_exprs.len() + aggregates.len();
+            let collation = args
+                .first()
+                .map_or(DEFAULT_COLLATION_OID, |a| crate::collation::expr_collation(a).collation);
             aggregates.push(BoundAggregate {
                 func,
                 distinct,
                 args,
                 input_ty,
                 ret,
+                collation,
             });
             Ok(BoundExpr::ColumnRef { index, ty: ret })
         }

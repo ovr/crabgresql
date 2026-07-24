@@ -391,6 +391,10 @@ pub struct BoundAggregate {
     pub args: Vec<BoundExpr>,
     pub input_ty: PgType,
     pub ret: PgType,
+    /// The collation `min`/`max` should compare `args[0]` under — the
+    /// database default for a non-collatable `input_ty` or an argument with
+    /// no collation of its own. Every other aggregate ignores this.
+    pub collation: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1329,11 +1333,13 @@ impl Scope {
             return visible
                 .iter()
                 .map(|col| {
+                    let (collation, strength) = crate::collation::output_collation(&col.expr);
                     (
                         crate::OutputColumn {
                             name: col.name.clone(),
                             ty: col.expr.ty(),
-                            collation: crate::collation::column_collation(&col.expr),
+                            collation,
+                            strength,
                         },
                         col.expr.clone(),
                     )
@@ -1381,6 +1387,11 @@ fn expand_rel(rel: &ScopeRel, out: &mut Vec<(crate::OutputColumn, BoundExpr)>) {
                 name: col.name.clone(),
                 ty: col.ty,
                 collation: col.collation,
+                // A resolved column reference is always implicit strength in
+                // PG's model, whether or not its collation happens to equal
+                // the type default (mirroring `expr_collation`'s `ColumnRef`
+                // arm).
+                strength: crate::collation::Strength::Implicit,
             },
             with_column_collation(
                 BoundExpr::ColumnRef {
@@ -1639,6 +1650,11 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
             elem.name()
         )));
     }
+    if elem.is_collatable() {
+        crate::collation::check_explicit_conflict(
+            exprs.iter().map(crate::collation::expr_collation),
+        )?;
+    }
     Ok(Binding::Typed(BoundExpr::ArrayCtor {
         elem,
         ty: PgType::Array(elem.oid()),
@@ -1839,7 +1855,7 @@ fn bind_quantified_subquery(
     };
     let elem_ty = col.ty;
     let needle = bind_expr(left, scope)?;
-    let cmp = bind_hole_template(op, needle, elem_ty, op_span, scope)?;
+    let cmp = bind_hole_template(op, needle, elem_ty, col.collation, op_span, scope)?;
     Ok(Binding::Typed(BoundExpr::QuantifiedSubquery {
         subplan: Subplan(Box::new(plan)),
         all,
@@ -1878,7 +1894,11 @@ fn bind_quantified_array(
     // Coerce the right side to `elem_ty[]` (identity for an already-typed array;
     // parses `'{…}'` / types a `$n` param via `resolve_unknown`'s array arm).
     let array_expr = resolve_operand(&array, PgType::Array(elem_ty.oid()))?;
-    let cmp = bind_hole_template(op, needle, elem_ty, op_span, scope)?;
+    // `PgType::Array` is never itself collatable (only the element is), and
+    // nothing in this build tracks a per-element collation on an array value
+    // yet, so the hole falls back to the element type's default collation —
+    // unlike the subquery form, which does know its one column's collation.
+    let cmp = bind_hole_template(op, needle, elem_ty, None, op_span, scope)?;
     Ok(Binding::Typed(BoundExpr::QuantifiedArray {
         array: Box::new(array_expr),
         all,
@@ -1896,6 +1916,7 @@ fn bind_hole_template(
     op: BinOp,
     needle: Binding,
     elem_ty: PgType,
+    collation: Option<u32>,
     op_span: Span,
     scope: &Scope,
 ) -> Result<BoundExpr, BindError> {
@@ -1910,9 +1931,20 @@ fn bind_hole_template(
         ))
         .at(op_span));
     }
-    let hole = Binding::Typed(BoundExpr::Const {
+    let placeholder = BoundExpr::Const {
         value: Value::Null,
         ty: elem_ty,
+    };
+    // Wrap the placeholder so `expr_collation` sees the candidate set's real
+    // collation rather than a bare NULL's (which asserts none), the same way
+    // a column reference of `elem_ty` would if we had a real one to bind.
+    let hole = Binding::Typed(match collation {
+        Some(collation) if elem_ty.is_collatable() => BoundExpr::Collate {
+            expr: Box::new(placeholder),
+            collation,
+            explicit: false,
+        },
+        _ => placeholder,
     });
     let cmp = bind_binary_op(op, needle, hole, op_span, scope.catalog().as_ref())?;
     match cmp {
@@ -3118,7 +3150,16 @@ fn bind_case(
     } else {
         None
     };
-    let whens = conds.into_iter().zip(results).collect();
+    let whens: Vec<_> = conds.into_iter().zip(results).collect();
+
+    if ty.is_collatable() {
+        crate::collation::check_explicit_conflict(
+            else_
+                .iter()
+                .map(|e| crate::collation::expr_collation(e))
+                .chain(whens.iter().map(|(_, r)| crate::collation::expr_collation(r))),
+        )?;
+    }
 
     Ok(Binding::Typed(BoundExpr::Case { whens, else_, ty }))
 }
@@ -5855,6 +5896,9 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
             .map(normalize_ident)
             .unwrap_or_else(|| "?column?".into()),
         ast::Expr::Nested(inner) => output_name(inner),
+        // `COLLATE` is value-transparent, like a cast that keeps the type: it
+        // takes the wrapped expression's name, not its own.
+        ast::Expr::Collate { expr, .. } => output_name(expr),
         ast::Expr::Value(v) if matches!(v.value, ast::Value::Boolean(_)) => "bool".into(),
         // PG keeps a bare column's name through a cast (`id::int8` → "id"), but
         // uses the target type name when the argument has no inherent name
