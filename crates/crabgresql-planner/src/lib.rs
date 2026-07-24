@@ -121,11 +121,17 @@ pub enum PhysicalPlan {
         predicate: Option<BoundExpr>,
         assignments: Vec<(usize, BoundExpr)>,
         returning: Option<Returning>,
+        /// Leaf partitions for tuple routing when `table` is a partitioned parent
+        /// (see [`LogicalPlan::Update`]); `None` for an ordinary table.
+        routing: Option<Vec<Arc<dyn TableAm>>>,
     },
     Delete {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         returning: Option<Returning>,
+        /// Leaf partitions for tuple routing when `table` is a partitioned parent
+        /// (see [`LogicalPlan::Delete`]); `None` for an ordinary table.
+        routing: Option<Vec<Arc<dyn TableAm>>>,
     },
 }
 
@@ -516,20 +522,24 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             predicate,
             assignments,
             returning,
+            routing,
         } => PhysicalPlan::Update {
             table,
             predicate,
             assignments,
             returning,
+            routing,
         },
         LogicalPlan::Delete {
             table,
             predicate,
             returning,
+            routing,
         } => PhysicalPlan::Delete {
             table,
             predicate,
             returning,
+            routing,
         },
     }
 }

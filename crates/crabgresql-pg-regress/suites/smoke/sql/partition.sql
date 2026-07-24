@@ -4,9 +4,10 @@
 -- through pg_class (relkind='p' parent, relispartition partitions), pg_inherits,
 -- and pg_partitioned_table, then INSERT into and SELECT from the parent: rows
 -- route to the leaf whose range admits the key, and a parent scan unions every
--- partition. Every statement's output is hand-checked against PostgreSQL
--- (psql -a -q). UPDATE/DELETE and TRUNCATE/CREATE INDEX on the parent are still
--- unsupported (0A000).
+-- partition. UPDATE/DELETE route through the parent too (including cross-leaf
+-- row movement on a key change), while TRUNCATE/CREATE INDEX on the parent are
+-- still unsupported (0A000). Every statement's output is hand-checked against
+-- PostgreSQL (psql -a -q).
 --
 CREATE TABLE sales (id integer, sold date, amount integer) PARTITION BY RANGE (sold);
 CREATE TABLE sales_2023 PARTITION OF sales FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
@@ -53,6 +54,23 @@ SELECT * FROM sales ORDER BY sold;
 -- The union scan feeds WHERE and aggregates like an ordinary table.
 SELECT count(*) FROM sales;
 SELECT id, amount FROM sales WHERE amount >= 100 ORDER BY id;
+-- UPDATE through the parent whose key stays in the same leaf rewrites the row in
+-- place; RETURNING streams the NEW row.
+UPDATE sales SET amount = amount + 1 WHERE id = 1 RETURNING id, amount;
+-- The row is unchanged in location: still in sales_2024.
+SELECT id, amount FROM sales_2024 ORDER BY id;
+-- A key-changing UPDATE moves the row across leaves: id 1's sold moves into 2023,
+-- so the row leaves sales_2024 and lands in sales_2023 (delete + insert).
+UPDATE sales SET sold = '2023-12-31' WHERE id = 1;
+SELECT id FROM sales_2023 ORDER BY id;
+SELECT id FROM sales_2024 ORDER BY id;
+-- A key-changing UPDATE whose new key fits no partition is rejected (23514) and
+-- nothing moves.
+UPDATE sales SET sold = '2020-01-01' WHERE id = 2;
+-- DELETE through the parent removes the row from whichever leaf holds it (id 1 is
+-- now in sales_2023); RETURNING streams the deleted (OLD) row.
+DELETE FROM sales WHERE id = 1 RETURNING id, sold;
+SELECT id FROM sales ORDER BY id;
 -- An unbounded (MINVALUE/MAXVALUE) RANGE bound is accepted.
 CREATE TABLE sales_early PARTITION OF sales FOR VALUES FROM (MINVALUE) TO ('2023-01-01');
 -- Overlapping a sibling's range is rejected (42P17).

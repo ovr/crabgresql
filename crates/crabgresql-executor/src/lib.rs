@@ -356,12 +356,14 @@ pub fn execute(
             predicate,
             assignments,
             returning,
-        } => execute_update(&table, &predicate, &assignments, returning, ctx, txn),
+            routing,
+        } => execute_update(&table, &predicate, &assignments, returning, routing, ctx, txn),
         PhysicalPlan::Delete {
             table,
             predicate,
             returning,
-        } => execute_delete(&table, &predicate, returning, ctx, txn),
+            routing,
+        } => execute_delete(&table, &predicate, returning, routing, ctx, txn),
     }
 }
 
@@ -1237,13 +1239,33 @@ fn route_tuple(
     ))))
 }
 
+/// UPDATE dispatch: an ordinary table updates in place ([`update_direct`]); a
+/// partitioned parent re-routes each NEW row through its leaves, moving a row to
+/// a different leaf when the key change relocates it ([`update_routed`]).
+fn execute_update(
+    table: &Arc<dyn TableAm>,
+    predicate: &Option<BoundExpr>,
+    assignments: &[(usize, BoundExpr)],
+    returning: Option<Returning>,
+    routing: Option<Vec<Arc<dyn TableAm>>>,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Execution, ExecError> {
+    match routing {
+        Some(leaves) => {
+            update_routed(table, &leaves, predicate, assignments, returning, ctx, txn)
+        }
+        None => update_direct(table, predicate, assignments, returning, ctx, txn),
+    }
+}
+
 /// The scan sees `txn`'s snapshot, and the new versions it writes carry `txn`'s
 /// command id, so the statement never re-visits rows it wrote itself (no
 /// Halloween problem). A row that vanished under us (`NotFound`) is skipped, not
 /// counted. Cross-transaction write-write conflicts still resolve last-writer-
 /// wins here — EvalPlanQual (READ COMMITTED) and the 40001 abort (REPEATABLE
 /// READ) that make this correct arrive with the isolation work (P6).
-fn execute_update(
+fn update_direct(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
@@ -1301,6 +1323,165 @@ fn execute_update(
             Ok(returning_rows(output, returning.columns, DmlVerb::Update))
         }
         None => Ok(Execution::Updated(table.update_many(pending, txn))),
+    }
+}
+
+/// UPDATE through a partitioned parent, with cross-partition row movement.
+///
+/// Every leaf is scanned (the parent owns no rows of its own). For each row the
+/// predicate keeps, the NEW tuple is built (every SET sees the OLD row, as in
+/// [`update_direct`]) and re-routed with [`route_tuple`]: a NEW key admitted by no
+/// leaf raises `23514` "no partition of relation … found for row" (PostgreSQL's
+/// tuple-routing failure). A row whose NEW key still belongs to its own leaf is
+/// updated in place; a row that now belongs elsewhere *moves* — deleted from the
+/// old leaf and inserted into the new one (PostgreSQL's DELETE+INSERT semantics).
+///
+/// Constraints are validated against the **destination** leaf, so a NOT NULL /
+/// UNIQUE violation names the partition the row lands in. A leaf is an ordinary
+/// heap and may carry a UNIQUE index (via `CREATE UNIQUE INDEX` on the leaf), so
+/// uniqueness is checked against a per-leaf simulation of the post-statement rows
+/// — mirroring [`update_direct`] within a leaf and treating a moved-in row as an
+/// insert into its destination — but only for leaves that actually have a unique
+/// index (the common case has none, so no simulation is built). All routing and
+/// validation runs before any write, and the whole matched set is taken from the
+/// snapshot first, so the statement stays all-or-nothing and Halloween-safe.
+fn update_routed(
+    parent: &Arc<dyn TableAm>,
+    leaves: &[Arc<dyn TableAm>],
+    predicate: &Option<BoundExpr>,
+    assignments: &[(usize, BoundExpr)],
+    returning: Option<Returning>,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Execution, ExecError> {
+    let parent_schema = parent.schema();
+    let leaf_has_unique: Vec<bool> = leaves
+        .iter()
+        .map(|leaf| leaf.indexes().iter().any(|index| index.unique))
+        .collect();
+    // Scan every leaf once (the parent owns no rows). The collected snapshot
+    // drives the match loop and — for leaves with a unique index — seeds the
+    // post-statement simulation, so a leaf is never scanned twice and the match
+    // set is fixed before any write (Halloween-safe).
+    let scans: Vec<Vec<(Tid, Tuple)>> =
+        leaves.iter().map(|leaf| leaf.scan(txn).collect()).collect();
+    // Per-leaf simulation of the leaf's live rows after this statement, used only
+    // for UNIQUE checks; seeded from `scans` for leaves that carry a unique index,
+    // left empty (and unused) for the common unique-free leaf.
+    let mut simulated: Vec<Vec<(Tid, Tuple)>> = scans
+        .iter()
+        .enumerate()
+        .map(|(i, rows)| {
+            if leaf_has_unique[i] {
+                rows.clone()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+
+    // Writes are grouped per leaf: in-place updates, deletes of moved-out rows,
+    // and inserts of moved-in rows. `new_rows` records every affected NEW row in
+    // scan order for RETURNING.
+    let mut pending_update: Vec<Vec<(Tid, Tuple)>> = vec![Vec::new(); leaves.len()];
+    let mut pending_delete: Vec<Vec<Tid>> = vec![Vec::new(); leaves.len()];
+    let mut pending_insert: Vec<Vec<Tuple>> = vec![Vec::new(); leaves.len()];
+    let mut new_rows: Vec<Tuple> = Vec::new();
+
+    for (src, rows) in scans.iter().enumerate() {
+        for (tid, old) in rows {
+            let tid = *tid;
+            if !predicate_holds(predicate, old, ctx)? {
+                continue;
+            }
+            // Every SET expression sees the OLD row: `SET a = b, b = a` swaps.
+            let mut new = old.clone();
+            for (index, expr) in assignments {
+                new[*index] = eval(expr, old, ctx)?;
+            }
+            let dst = route_tuple(parent_schema, leaves, &new, ctx)?;
+
+            // Validate against the destination leaf. When it has a unique index,
+            // check the NEW row against that leaf's simulated rows (excluding the
+            // row's own OLD slot for an in-place update); otherwise only NOT NULL
+            // and the partition bound apply (the latter passes by construction).
+            if leaf_has_unique[dst] {
+                if src == dst {
+                    // Mirror `update_direct`: a tid absent from the simulation is a
+                    // row that vanished under us — skip it rather than update it.
+                    let Some(pos) = simulated[dst]
+                        .iter()
+                        .position(|(candidate, _)| *candidate == tid)
+                    else {
+                        continue;
+                    };
+                    let removed = simulated[dst].remove(pos);
+                    if let Err(error) = validate_constraints(
+                        &leaves[dst],
+                        &new,
+                        simulated[dst].iter().map(|(_, t)| t),
+                        ctx,
+                    ) {
+                        simulated[dst].insert(pos, removed);
+                        return Err(error);
+                    }
+                    simulated[dst].insert(pos, (tid, new.clone()));
+                } else {
+                    validate_constraints(
+                        &leaves[dst],
+                        &new,
+                        simulated[dst].iter().map(|(_, t)| t),
+                        ctx,
+                    )?;
+                    simulated[dst].push((tid, new.clone()));
+                }
+            } else {
+                validate_constraints(&leaves[dst], &new, std::iter::empty(), ctx)?;
+            }
+            // A moved-out row leaves its source leaf's simulation so a later row
+            // routed back to that leaf does not see the stale OLD value.
+            if src != dst && leaf_has_unique[src] {
+                if let Some(pos) = simulated[src]
+                    .iter()
+                    .position(|(candidate, _)| *candidate == tid)
+                {
+                    simulated[src].remove(pos);
+                }
+            }
+
+            if src == dst {
+                pending_update[src].push((tid, new.clone()));
+            } else {
+                pending_delete[src].push(tid);
+                pending_insert[dst].push(new.clone());
+            }
+            new_rows.push(new);
+        }
+    }
+
+    // Project RETURNING over every NEW row before any write, so a faulting
+    // expression aborts the statement with nothing written.
+    let output = match &returning {
+        Some(returning) => Some(project_returning(new_rows.iter(), &returning.projections, ctx)?),
+        None => None,
+    };
+    // Apply per leaf. A moved row is counted once (via its source-leaf delete);
+    // an in-place update once (via `update_many`); moved-in inserts are not
+    // counted — so the total equals the number of matched rows, as PostgreSQL's
+    // UPDATE tag reports.
+    let mut affected = 0u64;
+    for i in 0..leaves.len() {
+        affected += leaves[i].update_many(std::mem::take(&mut pending_update[i]), txn);
+        affected += leaves[i].delete_many(std::mem::take(&mut pending_delete[i]), txn);
+        for tuple in std::mem::take(&mut pending_insert[i]) {
+            leaves[i].insert(tuple, txn);
+        }
+    }
+    match (returning, output) {
+        (Some(returning), Some(output)) => {
+            Ok(returning_rows(output, returning.columns, DmlVerb::Update))
+        }
+        _ => Ok(Execution::Updated(affected)),
     }
 }
 
@@ -1370,8 +1551,9 @@ fn validate_constraints<'a>(
 /// value outside `[from, to)` — or a NULL key, which no range partition admits —
 /// is rejected with 23514, matching PostgreSQL's observable behavior (error text
 /// and SQLSTATE) for a direct INSERT/UPDATE into a partition. A non-partition
-/// relation (`None`) passes; the partitioned parent, which would route the row,
-/// is rejected in the binder before it ever reaches here.
+/// relation (`None`) passes. This only ever runs on a leaf handle: a write to the
+/// partitioned parent routes each row to a leaf (see `route_tuple`) and validates
+/// against that leaf, so the parent schema itself never reaches here.
 fn check_partition_bound(
     schema: &TableSchema,
     tuple: &Tuple,
@@ -1500,7 +1682,24 @@ fn display_tuple(tuple: &Tuple, ctx: &ExecContext) -> String {
 }
 
 /// See the concurrency note on [`execute_update`].
+/// DELETE dispatch: an ordinary table deletes from its own storage
+/// ([`delete_direct`]); a partitioned parent scans every leaf and deletes matching
+/// rows from whichever leaf holds them ([`delete_routed`]).
 fn execute_delete(
+    table: &Arc<dyn TableAm>,
+    predicate: &Option<BoundExpr>,
+    returning: Option<Returning>,
+    routing: Option<Vec<Arc<dyn TableAm>>>,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Execution, ExecError> {
+    match routing {
+        Some(leaves) => delete_routed(&leaves, predicate, returning, ctx, txn),
+        None => delete_direct(table, predicate, returning, ctx, txn),
+    }
+}
+
+fn delete_direct(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
@@ -1527,6 +1726,48 @@ fn execute_delete(
             Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
         }
         None => Ok(Execution::Deleted(table.delete_many(pending, txn))),
+    }
+}
+
+/// DELETE through a partitioned parent: scan every leaf (the parent owns no rows),
+/// delete each matching row from the leaf that holds it, and — as in
+/// [`delete_direct`] — project any RETURNING over the OLD rows before removing
+/// them. The command count is the sum of the per-leaf deletes.
+fn delete_routed(
+    leaves: &[Arc<dyn TableAm>],
+    predicate: &Option<BoundExpr>,
+    returning: Option<Returning>,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Execution, ExecError> {
+    let mut pending: Vec<Vec<Tid>> = vec![Vec::new(); leaves.len()];
+    // RETURNING sees the deleted (OLD) rows, in scan (leaf) order.
+    let mut deleted: Vec<Tuple> = Vec::new();
+    for (i, leaf) in leaves.iter().enumerate() {
+        for (tid, tuple) in leaf.scan(txn) {
+            if predicate_holds(predicate, &tuple, ctx)? {
+                pending[i].push(tid);
+                if returning.is_some() {
+                    deleted.push(tuple);
+                }
+            }
+        }
+    }
+    match returning {
+        Some(returning) => {
+            let output = project_returning(deleted.iter(), &returning.projections, ctx)?;
+            for (i, leaf) in leaves.iter().enumerate() {
+                leaf.delete_many(std::mem::take(&mut pending[i]), txn);
+            }
+            Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
+        }
+        None => {
+            let mut affected = 0u64;
+            for (i, leaf) in leaves.iter().enumerate() {
+                affected += leaf.delete_many(std::mem::take(&mut pending[i]), txn);
+            }
+            Ok(Execution::Deleted(affected))
+        }
     }
 }
 
@@ -3417,8 +3658,15 @@ mod tests {
                 int4(1),
             ),
         )];
-        let Execution::Updated(n) =
-            execute_update(&table, &None, &assignments, None, &ExecContext::default(), &wtxn())?
+        let Execution::Updated(n) = execute_update(
+            &table,
+            &None,
+            &assignments,
+            None,
+            None,
+            &ExecContext::default(),
+            &wtxn(),
+        )?
         else {
             panic!("expected Updated");
         };
@@ -3453,9 +3701,15 @@ mod tests {
                 ),
             ),
         )];
-        let Err(e) =
-            execute_update(&table, &None, &assignments, None, &ExecContext::default(), &wtxn())
-        else {
+        let Err(e) = execute_update(
+            &table,
+            &None,
+            &assignments,
+            None,
+            None,
+            &ExecContext::default(),
+            &wtxn(),
+        ) else {
             panic!("expected error");
         };
         assert_eq!(e.code, "22012");
@@ -3475,8 +3729,14 @@ mod tests {
             },
             int4(1),
         ));
-        let Execution::Deleted(n) =
-            execute_delete(&table, &predicate, None, &ExecContext::default(), &wtxn())?
+        let Execution::Deleted(n) = execute_delete(
+            &table,
+            &predicate,
+            None,
+            None,
+            &ExecContext::default(),
+            &wtxn(),
+        )?
         else {
             panic!("expected Deleted");
         };
