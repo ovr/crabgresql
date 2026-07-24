@@ -59,6 +59,12 @@ const IDXR_MAGIC: &[u8; 4] = b"IXR1";
 /// those two persist). A reader that predates this tail stops above and treats
 /// every persisted relation as permanent.
 const RPRS_MAGIC: &[u8; 4] = b"RPR1";
+/// Marks the column-collation section, appended after the [`RPRS_MAGIC`] block —
+/// an eighth backward-compatible tail carrying each table column's explicit
+/// `COLLATE` OID (`0` = none, i.e. the type default). A reader that predates
+/// collations stops above and decodes every column with no collation, which is
+/// the pre-collation behavior: byte ordering everywhere.
+const COLL_MAGIC: &[u8; 4] = b"COL1";
 
 struct PersistCol {
     name: String,
@@ -67,6 +73,11 @@ struct PersistCol {
     nullable: bool,
     not_null_constraint: Option<String>,
     default: Option<String>,
+    /// The column's explicit `COLLATE` OID, persisted in the [`COLL_MAGIC`] tail.
+    /// Only relation columns carry one: a view's column collation is re-derived
+    /// each time its stored SELECT text is re-bound, so it is never persisted
+    /// and always decodes as `None` here.
+    collation: Option<u32>,
 }
 
 /// A persisted index: its semantic metadata plus the relfilenode of its physical
@@ -185,6 +196,7 @@ impl RelCatalog {
                         col.nullable = c.nullable;
                         col.not_null_constraint = c.not_null_constraint.clone();
                         col.default = c.default.clone();
+                        col.collation = c.collation;
                         col
                     })
                     .collect();
@@ -241,6 +253,7 @@ impl RelCatalog {
                     nullable: c.nullable,
                     not_null_constraint: c.not_null_constraint.clone(),
                     default: c.default.clone(),
+                    collation: c.collation,
                 })
                 .collect(),
             indexes: Vec::new(),
@@ -543,6 +556,8 @@ impl RelCatalog {
                     nullable: c.nullable,
                     not_null_constraint: c.not_null_constraint.clone(),
                     default: c.default.clone(),
+                    // Never persisted for a view; re-derived from its SELECT.
+                    collation: None,
                 })
                 .collect(),
             depends_on: def.depends_on.clone(),
@@ -960,6 +975,18 @@ fn encode(state: &State) -> Vec<u8> {
     for r in &rels {
         out.push(r.persistence.as_char() as u8);
     }
+    // Column collations: an eighth backward-compatible tail. For each relation
+    // (in `rels` order) its column count then each column's explicit `COLLATE`
+    // OID, `0` meaning none. `decode` leaves every column at `None` when this
+    // tail is absent (a pre-collation catalog).
+    out.extend_from_slice(COLL_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        out.extend_from_slice(&(r.cols.len() as u32).to_le_bytes());
+        for c in &r.cols {
+            out.extend_from_slice(&c.collation.unwrap_or(0).to_le_bytes());
+        }
+    }
     out
 }
 
@@ -1064,6 +1091,8 @@ fn decode(bytes: &[u8]) -> State {
                 nullable: true,
                 not_null_constraint: None,
                 default: None,
+                // Overridden below from the COL1 tail when present.
+                collation: None,
             });
         }
         rels.push(PersistRel {
@@ -1167,6 +1196,7 @@ fn decode(bytes: &[u8]) -> State {
                     nullable,
                     not_null_constraint,
                     default,
+                    collation: None,
                 });
             }
             views.push(PersistView {
@@ -1301,6 +1331,22 @@ fn decode(bytes: &[u8]) -> State {
                 b'u' => RelPersistence::Unlogged,
                 _ => RelPersistence::Permanent,
             };
+        }
+    }
+    // Column-collation tail: each column's explicit COLLATE OID, zipped by
+    // position. Absent in a pre-collation file — every column keeps the `None`
+    // decoded above, i.e. the type's default collation.
+    if d.remaining().starts_with(COLL_MAGIC) {
+        d.p += COLL_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            let ncols = d.u32();
+            for i in 0..ncols as usize {
+                let collation = d.u32();
+                if let Some(c) = r.cols.get_mut(i) {
+                    c.collation = (collation != 0).then_some(collation);
+                }
+            }
         }
     }
     State {

@@ -66,6 +66,11 @@ pub struct Column {
     /// Canonical SQL text of the column default. The binder reparses and binds
     /// it once per DML statement, then the executor evaluates it per row.
     pub default: Option<String>,
+    /// The OID of an explicit `COLLATE` on the column, or `None` for the type's
+    /// default collation. Only ever set on a collatable type
+    /// (`PgType::is_collatable`); it decides how the column's values order in
+    /// comparisons and `ORDER BY` unless a nearer `COLLATE` overrides it.
+    pub collation: Option<u32>,
 }
 
 impl Column {
@@ -78,6 +83,7 @@ impl Column {
             nullable: true,
             not_null_constraint: None,
             default: None,
+            collation: None,
         }
     }
 
@@ -90,6 +96,7 @@ impl Column {
             nullable: true,
             not_null_constraint: None,
             default: None,
+            collation: None,
         }
     }
 }

@@ -12,6 +12,7 @@ use crabgresql_binder::{
 };
 use crabgresql_storage_api::{IndexConstraint, IndexMetadata, TableAm, TableSchema};
 use crabgresql_types::PgType;
+use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 
 /// An executable plan. `Select` describes the SeqScan → Filter → Projection →
 /// Sort pipeline the executor builds.
@@ -314,6 +315,7 @@ fn rebuild_and(mut conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
         acc = BoundExpr::Binary {
             op: BinOp::And,
             arg_ty: PgType::Bool,
+            collation: DEFAULT_COLLATION_OID,
             left: Box::new(next),
             right: Box::new(acc),
         };
@@ -330,11 +332,15 @@ fn as_equi_key(conjunct: BoundExpr, left_width: usize) -> Result<HashKey, BoundE
     // hashes distinctly qualifies; a poorly-hashed type (interval/inet/…) would
     // collapse the whole build side into one bucket, so keep it as a residual and
     // let the executor use a nested loop instead.
+    // The collation is irrelevant here: every supported collation is
+    // deterministic, so equality — and therefore hashing — is bytewise
+    // regardless of which one the comparison carries.
     let BoundExpr::Binary {
         op: BinOp::Eq,
         arg_ty,
         left,
         right,
+        ..
     } = &conjunct
     else {
         return Err(conjunct);
@@ -691,7 +697,7 @@ fn as_eq_key(conjunct: &BoundExpr) -> Option<(usize, BoundExpr)> {
     else {
         return None;
     };
-    match (left.as_ref(), right.as_ref()) {
+    match (strip_collate(left), strip_collate(right)) {
         (BoundExpr::ColumnRef { index, .. }, value) if is_row_constant(value) => {
             Some((*index, value.clone()))
         }
@@ -699,6 +705,19 @@ fn as_eq_key(conjunct: &BoundExpr) -> Option<(usize, BoundExpr)> {
             Some((*index, value.clone()))
         }
         _ => None,
+    }
+}
+
+/// See through a [`BoundExpr::Collate`] to the expression it labels.
+///
+/// Safe for an *equality* index probe specifically: every supported collation is
+/// deterministic, so two values are equal under a collation exactly when their
+/// bytes are equal — which is the order the index is built in. A collation would
+/// matter for a range probe, but those are not index-served.
+fn strip_collate(expr: &BoundExpr) -> &BoundExpr {
+    match expr {
+        BoundExpr::Collate { expr, .. } => strip_collate(expr),
+        other => other,
     }
 }
 
@@ -716,6 +735,7 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::Coerce { expr, .. }
+        | BoundExpr::Collate { expr, .. }
         | BoundExpr::Reinterpret { expr, .. } => is_row_constant(expr),
         BoundExpr::Binary { left, right, .. } => is_row_constant(left) && is_row_constant(right),
         BoundExpr::ArrayCtor { elems, .. } => elems.iter().all(is_row_constant),
@@ -1466,10 +1486,7 @@ mod tests {
         };
         let plan = PhysicalPlan::Append {
             tables: vec![leaf("sales_2023"), leaf("sales_2024")],
-            columns: vec![OutputColumn {
-                name: "id".into(),
-                ty: PgType::Int4,
-            }],
+            columns: vec![OutputColumn::new("id", PgType::Int4)],
         };
         assert_eq!(
             explain(&plan),
@@ -1483,10 +1500,7 @@ mod tests {
 
     /// A three-armed set operation with the given tail, for EXPLAIN tests.
     fn setop_plan(sort: Vec<SortKey>, distinct: Option<Vec<DistinctKey>>) -> PhysicalPlan {
-        let columns = vec![OutputColumn {
-            name: "id".into(),
-            ty: PgType::Int4,
-        }];
+        let columns = vec![OutputColumn::new("id", PgType::Int4)];
         PhysicalPlan::SetOp {
             arms: (0..3)
                 .map(|_| PhysicalSetOpArm {
@@ -1522,6 +1536,7 @@ mod tests {
         let sort = vec![SortKey {
             column: 0,
             ty: PgType::Int4,
+            collation: DEFAULT_COLLATION_OID,
             asc: true,
             nulls_first: false,
         }];

@@ -74,6 +74,18 @@ the CRC-32C / Castagnoli polynomial that PostgreSQL documents for its WAL):
 licensed under Apache-2.0 OR MIT. It is an ordinary Cargo dependency, not
 vendored; no PostgreSQL source is involved.
 
+This product depends on the `icu_collator` and `icu_locale_core` crates from the
+ICU4X project (used only by crates/crabgresql-types/src/collation.rs to order
+strings under the collations exposed as `COLLATE "<locale>-x-icu"`):
+
+  Copyright (c) The ICU4X Project Developers (github.com/unicode-org/icu4x)
+
+licensed under Unicode-3.0. They are ordinary Cargo dependencies, not vendored;
+`icu_collator`'s `compiled_data` feature bundles CLDR collation data (Unicode
+License). No PostgreSQL source is involved: PostgreSQL links the separate C
+library ICU for the same purpose, and only the observable collation names and
+ordering behavior are reproduced.
+
 The time-zone abbreviation table in crates/crabgresql-types/src/tz.rs (e.g.
 `PST` = -08:00, `MSK` -> Europe/Moscow) reproduces values from PostgreSQL's
 `src/timezone/tznames/Default` data file — borrowed as data, not source, under

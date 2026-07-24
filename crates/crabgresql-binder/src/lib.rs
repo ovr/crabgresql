@@ -3,10 +3,14 @@
 //! PG semantics (int4/int8 promotion, untyped-literal coercion), and honest
 //! rejection (`0A000`) of everything parsed but not yet executable.
 
+mod collation;
 mod expr;
 mod functions;
 mod plan;
 
+pub use collation::{
+    Derived, Strength, collation_name, column_collation, expr_collation, resolve_collation,
+};
 pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, ParamCtx, ParamState, Scope, Subplan, UnaryOp,
     bind_column_default, bind_expr, bind_scalar, bind_sql_function_body, coerce_to_column,
@@ -34,6 +38,23 @@ use crabgresql_types::PgType;
 pub struct OutputColumn {
     pub name: String,
     pub ty: PgType,
+    /// The column's collation when it differs from the type default — carried
+    /// so a rowset's collation survives into an enclosing query's scope, the
+    /// way PostgreSQL tracks `varcollid` on every column of every rowset.
+    /// `None` means the type default (and is always `None` for a
+    /// non-collatable type).
+    pub collation: Option<u32>,
+}
+
+impl OutputColumn {
+    /// A column on its type's default collation.
+    pub fn new(name: impl Into<String>, ty: PgType) -> Self {
+        OutputColumn {
+            name: name.into(),
+            ty,
+            collation: None,
+        }
+    }
 }
 
 /// A bind-time error, reported to the client as `ErrorResponse`.

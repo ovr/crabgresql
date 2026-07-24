@@ -29,7 +29,7 @@ use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
 
 use eval::eval;
-pub use eval::{coerce_value, compare_values, is_orderable};
+pub use eval::{coerce_value, compare_values, compare_values_collated, is_orderable};
 use generate_series::Series;
 
 /// Side-effecting sequence operations (`nextval`/`currval`/`setval`/`lastval`),
@@ -614,6 +614,7 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::Coerce { expr, .. }
+        | BoundExpr::Collate { expr, .. }
         | BoundExpr::Reinterpret { expr, .. } => resolve_expr(expr, ctx, txn)?,
         BoundExpr::Binary { left, right, .. } => {
             resolve_expr(left, ctx, txn)?;
@@ -895,6 +896,7 @@ fn eval_quantified(
     let BoundExpr::Binary {
         op,
         arg_ty,
+        collation,
         left,
         right,
     } = cmp
@@ -941,7 +943,7 @@ fn eval_quantified(
             saw_null = true;
             continue;
         }
-        if eval::apply_comparison(*op, *arg_ty, &needle, &candidate) != all {
+        if eval::apply_comparison(*op, *arg_ty, *collation, &needle, &candidate) != all {
             // ANY found a match, or ALL found a counterexample.
             return Ok(Value::Bool(!all));
         }
@@ -2542,7 +2544,7 @@ impl Sort {
                         }
                     }
                     (false, false) => {
-                        let cmp = compare_values(key.ty, va, vb);
+                        let cmp = compare_values_collated(key.ty, va, vb, key.collation);
                         if key.asc { cmp } else { cmp.reverse() }
                     }
                 };
@@ -3166,6 +3168,7 @@ mod tests {
     };
     use crabgresql_txn::{CommandId, TransactionManager, TxnContext, Xid};
     use crabgresql_types::PgType;
+    use crabgresql_types::collation::DEFAULT_COLLATION_OID;
     use eval::coerce_value;
 
     #[track_caller]
@@ -3219,6 +3222,7 @@ mod tests {
         BoundExpr::Binary {
             op,
             arg_ty,
+            collation: DEFAULT_COLLATION_OID,
             left: Box::new(left),
             right: Box::new(right),
         }
@@ -3639,6 +3643,7 @@ mod tests {
         let key = SortKey {
             column: 1,
             ty: PgType::Text,
+            collation: DEFAULT_COLLATION_OID,
             asc: true,
             nulls_first: false,
         };
@@ -3797,6 +3802,7 @@ mod tests {
             vec![SortKey {
                 column: 0,
                 ty: PgType::Int4,
+                collation: DEFAULT_COLLATION_OID,
                 asc: false,
                 nulls_first: false,
             }],

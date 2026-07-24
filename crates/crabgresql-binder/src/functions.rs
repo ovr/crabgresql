@@ -586,10 +586,7 @@ impl TableFn {
 
     /// The output columns of the rowset, in order.
     pub fn columns(self) -> Vec<OutputColumn> {
-        let text = |name: &str| OutputColumn {
-            name: name.to_string(),
-            ty: PgType::Text,
-        };
+        let text = |name: &str| OutputColumn::new(name, PgType::Text);
         match self {
             TableFn::PgInputErrorInfo => vec![
                 text("message"),
@@ -598,18 +595,11 @@ impl TableFn {
                 text("sql_error_code"),
             ],
             // A single column named after the function, of the element type.
-            TableFn::GenerateSeries(elem) => vec![OutputColumn {
-                name: "generate_series".to_string(),
-                ty: elem,
-            }],
-            TableFn::JsonbPathQuery => vec![OutputColumn {
-                name: "jsonb_path_query".to_string(),
-                ty: PgType::Jsonb,
-            }],
-            TableFn::Unnest(elem) => vec![OutputColumn {
-                name: "unnest".to_string(),
-                ty: elem,
-            }],
+            TableFn::GenerateSeries(elem) => vec![OutputColumn::new("generate_series", elem)],
+            TableFn::JsonbPathQuery => {
+                vec![OutputColumn::new("jsonb_path_query", PgType::Jsonb)]
+            }
+            TableFn::Unnest(elem) => vec![OutputColumn::new("unnest", elem)],
         }
     }
 }

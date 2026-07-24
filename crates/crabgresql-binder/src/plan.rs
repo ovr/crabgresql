@@ -12,6 +12,7 @@ use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
     Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
+use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
@@ -34,6 +35,9 @@ use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
 pub struct SortKey {
     pub column: usize,
     pub ty: PgType,
+    /// The collation ordering this key, derived from the ORDER BY expression.
+    /// Only meaningful for a string `ty`; every other type ignores it.
+    pub collation: u32,
     pub asc: bool,
     pub nulls_first: bool,
 }
@@ -700,6 +704,7 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         }
         BoundExpr::IsNull { expr, .. } => subst_expr(expr, params),
         BoundExpr::Coerce { expr, .. } => subst_expr(expr, params),
+        BoundExpr::Collate { expr, .. } => subst_expr(expr, params),
         BoundExpr::Reinterpret { expr, .. } => subst_expr(expr, params),
         BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => subst_exprs(args, params),
         BoundExpr::ArrayCtor { elems, .. } => subst_exprs(elems, params),
@@ -969,6 +974,7 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::Coerce { expr, .. }
+        | BoundExpr::Collate { expr, .. }
         | BoundExpr::Reinterpret { expr, .. } => subst_outer_expr(expr, outer, depth),
         BoundExpr::Binary { left, right, .. } => {
             subst_outer_expr(left, outer, depth);
@@ -1201,6 +1207,7 @@ fn expr_has_outer_ref(expr: &BoundExpr) -> bool {
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::Coerce { expr, .. }
+        | BoundExpr::Collate { expr, .. }
         | BoundExpr::Reinterpret { expr, .. } => expr_has_outer_ref(expr),
         BoundExpr::Binary { left, right, .. } => {
             expr_has_outer_ref(left) || expr_has_outer_ref(right)
@@ -1635,7 +1642,13 @@ fn unify_set_columns(
         // Fold the common type across all arms. A bare NULL contributes no type
         // (PG resolves an unknown-typed set-operation column from the other
         // arms), so it never forces the column to `text`.
-        let mut common = (!is_null_literal_column(first_plan, i)).then_some(first.ty);
+        let first_typed = !is_null_literal_column(first_plan, i);
+        let mut common = first_typed.then_some(first.ty);
+        // Fold the arms' collations the same way: the result column is collated
+        // only while every contributing arm agrees. A NULL arm contributes none,
+        // and a disagreement drops to the type default (`None`), as PG resolves a
+        // set operation's output collation.
+        let mut collation = first_typed.then_some(first.collation);
         for (plan, cols) in &arms[1..] {
             if is_null_literal_column(plan, i) {
                 continue;
@@ -1654,11 +1667,17 @@ fn unify_set_columns(
                     )
                 })?,
             });
+            collation = match collation {
+                Some(prev) if prev == cols[i].collation => collation,
+                Some(_) => Some(None),
+                None => Some(cols[i].collation),
+            };
         }
         columns.push(OutputColumn {
             name: first.name.clone(),
             // An all-NULL column has no type to take: PG resolves it to `text`.
             ty: common.unwrap_or(PgType::Text),
+            collation: collation.flatten(),
         });
     }
     Ok(columns)
@@ -2075,7 +2094,11 @@ fn bind_table_query(
 fn to_columns(columns: &[OutputColumn]) -> Vec<Column> {
     columns
         .iter()
-        .map(|c| Column::new(c.name.clone(), c.ty))
+        .map(|c| {
+            let mut col = Column::new(c.name.clone(), c.ty);
+            col.collation = c.collation;
+            col
+        })
         .collect()
 }
 
@@ -2226,6 +2249,7 @@ fn bind_from_item(
                 .map(|c| OutputColumn {
                     name: c.name,
                     ty: c.ty,
+                    collation: c.collation,
                 })
                 .collect();
             apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
@@ -2274,6 +2298,7 @@ fn bind_from_item(
                         .map(|c| OutputColumn {
                             name: c.name.clone(),
                             ty: c.ty,
+                            collation: c.collation,
                         })
                         .collect();
                     // A partitioned parent has no rows of its own: read it as a
@@ -2481,14 +2506,25 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
             op: *op,
             expr: Box::new(shift_column_refs(expr, delta)),
         },
+        BoundExpr::Collate {
+            expr,
+            collation,
+            explicit,
+        } => BoundExpr::Collate {
+            expr: Box::new(shift_column_refs(expr, delta)),
+            collation: *collation,
+            explicit: *explicit,
+        },
         BoundExpr::Binary {
             op,
             arg_ty,
+            collation,
             left,
             right,
         } => BoundExpr::Binary {
             op: *op,
             arg_ty: *arg_ty,
+            collation: *collation,
             left: Box::new(shift_column_refs(left, delta)),
             right: Box::new(shift_column_refs(right, delta)),
         },
@@ -2693,7 +2729,12 @@ fn default_visible(relations: &[(String, Vec<Column>)], base: usize) -> Vec<Visi
         for col in columns {
             out.push(VisibleColumn {
                 name: col.name.clone(),
-                expr: BoundExpr::ColumnRef { index, ty: col.ty },
+                // Carry the column's declared collation, as unqualified
+                // resolution against `rels` does — this view shadows that path.
+                expr: crate::expr::with_column_collation(
+                    BoundExpr::ColumnRef { index, ty: col.ty },
+                    col.collation,
+                ),
             });
             index += 1;
         }
@@ -2819,6 +2860,7 @@ fn build_merged_join(
             Some(prev) => BoundExpr::Binary {
                 op: BinOp::And,
                 arg_ty: PgType::Bool,
+                collation: DEFAULT_COLLATION_OID,
                 left: Box::new(prev),
                 right: Box::new(eq_expr),
             },
@@ -2944,10 +2986,7 @@ fn bind_values_query(
     let mut column_cells: Vec<Vec<BoundExpr>> = Vec::with_capacity(width);
     for (i, bindings) in columns_of_bindings.into_iter().enumerate() {
         let (ty, cells) = unify_value_column(bindings, "VALUES")?;
-        columns.push(OutputColumn {
-            name: format!("column{}", i + 1),
-            ty,
-        });
+        columns.push(OutputColumn::new(format!("column{}", i + 1), ty));
         column_cells.push(cells);
     }
     // Transpose column-major cells back into rows, moving each cell exactly once.
@@ -3019,10 +3058,7 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
         }]
     }
     fn one_col() -> Vec<OutputColumn> {
-        vec![OutputColumn {
-            name: "?column?".into(),
-            ty: PgType::Int4,
-        }]
+        vec![OutputColumn::new("?column?", PgType::Int4)]
     }
     fn has_srf(projections: &[BoundExpr]) -> bool {
         projections.iter().any(BoundExpr::contains_srf)
@@ -3242,9 +3278,15 @@ fn bind_order_by(
         }
         let asc = oe.options.asc.unwrap_or(true);
         let nulls_first = oe.options.nulls_first.unwrap_or(!asc);
+        // The projected expression at `column` is exactly what the sort reads,
+        // so its derived collation is the one that orders this key.
+        let collation = projections.get(column).map_or(DEFAULT_COLLATION_OID, |e| {
+            crate::collation::expr_collation(e).collation
+        });
         keys.push(SortKey {
             column,
             ty,
+            collation,
             asc,
             nulls_first,
         });
@@ -3482,6 +3524,7 @@ fn bind_values_select(
         columns.push(OutputColumn {
             name: alias.unwrap_or_else(|| output_name(expr)),
             ty: bound.ty(),
+            collation: crate::collation::column_collation(&bound),
         });
         row.push(bound);
     }
@@ -3593,6 +3636,7 @@ fn bind_target_list(
                 columns.push(OutputColumn {
                     name: alias.unwrap_or_else(|| output_name(expr)),
                     ty: bound.ty(),
+                    collation: crate::collation::column_collation(&bound),
                 });
                 projections.push(bound);
             }
@@ -3893,14 +3937,30 @@ fn rewrite_over_aggregate(
                 scope,
             )?),
         }),
+        BoundExpr::Collate {
+            expr,
+            collation,
+            explicit,
+        } => Ok(BoundExpr::Collate {
+            expr: Box::new(rewrite_over_aggregate(
+                *expr,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
+            collation,
+            explicit,
+        }),
         BoundExpr::Binary {
             op,
             arg_ty,
+            collation,
             left,
             right,
         } => Ok(BoundExpr::Binary {
             op,
             arg_ty,
+            collation,
             left: Box::new(rewrite_over_aggregate(
                 *left,
                 group_exprs,
@@ -7548,6 +7608,7 @@ mod tests {
             vec![SortKey {
                 column: 1,
                 ty: PgType::Int4,
+                collation: DEFAULT_COLLATION_OID,
                 asc: false,
                 nulls_first: true,
             }]
@@ -7564,6 +7625,7 @@ mod tests {
             vec![SortKey {
                 column: 0,
                 ty: PgType::Text,
+                collation: DEFAULT_COLLATION_OID,
                 asc: true,
                 nulls_first: false,
             }]

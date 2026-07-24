@@ -496,6 +496,7 @@ impl SystemCatalog {
                 schema::pg_index_rows(self.index_oids()),
             )),
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
+            "pg_collation" => Some((schema::pg_collation_schema(), schema::pg_collation_rows())),
             "pg_inherits" => Some((
                 schema::pg_inherits_schema(),
                 schema::pg_inherits_rows(self.relation_oids()),

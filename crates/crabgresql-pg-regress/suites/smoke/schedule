@@ -48,3 +48,4 @@ test: subquery_correlated
 test: sequence
 test: copy
 test: partition
+test: collate

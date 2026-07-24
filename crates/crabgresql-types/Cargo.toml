@@ -9,6 +9,8 @@ workspace = true
 
 [dependencies]
 pg-ryu = { workspace = true }
+icu_collator = { workspace = true }
+icu_locale_core = { workspace = true }
 jiff = { workspace = true }
 regex = { workspace = true }
 
