@@ -16,7 +16,7 @@ use crabgresql_binder::{AggFn, BoundAggregate};
 use crabgresql_types::{Numeric, PgType, Value, float};
 
 use crate::ExecError;
-use crate::eval::compare_values;
+use crate::eval::{compare_values, compare_values_collated};
 
 /// The non-NULL input values already accepted by one `DISTINCT` aggregate in
 /// one group. It uses the same type-aware equality and compatible hash as
@@ -61,9 +61,10 @@ enum AggState {
     /// `count(*)` and `count(expr)`: a running row/non-null count.
     Count(i64),
     /// `min`/`max`: the running extreme (`None` until the first non-null input),
-    /// and the type/direction used to compare candidates.
+    /// and the type/collation/direction used to compare candidates.
     Extreme {
         ty: PgType,
+        collation: u32,
         want_max: bool,
         cur: Option<Value>,
     },
@@ -91,11 +92,13 @@ impl Accumulator {
             AggFn::Count => AggState::Count(0),
             AggFn::Min => AggState::Extreme {
                 ty: agg.input_ty,
+                collation: agg.collation,
                 want_max: false,
                 cur: None,
             },
             AggFn::Max => AggState::Extreme {
                 ty: agg.input_ty,
+                collation: agg.collation,
                 want_max: true,
                 cur: None,
             },
@@ -132,12 +135,17 @@ impl Accumulator {
     pub fn accumulate(&mut self, values: &[Value]) -> Result<(), ExecError> {
         match &mut self.state {
             AggState::Count(n) => *n += 1,
-            AggState::Extreme { ty, want_max, cur } => {
+            AggState::Extreme {
+                ty,
+                collation,
+                want_max,
+                cur,
+            } => {
                 let v = values[0].clone();
                 let replace = match cur {
                     None => true,
                     Some(c) => {
-                        let ord = compare_values(*ty, &v, c);
+                        let ord = compare_values_collated(*ty, &v, c, *collation);
                         if *want_max {
                             ord == Ordering::Greater
                         } else {

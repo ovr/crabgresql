@@ -586,10 +586,7 @@ impl TableFn {
 
     /// The output columns of the rowset, in order.
     pub fn columns(self) -> Vec<OutputColumn> {
-        let text = |name: &str| OutputColumn {
-            name: name.to_string(),
-            ty: PgType::Text,
-        };
+        let text = |name: &str| OutputColumn::new(name, PgType::Text);
         match self {
             TableFn::PgInputErrorInfo => vec![
                 text("message"),
@@ -598,18 +595,11 @@ impl TableFn {
                 text("sql_error_code"),
             ],
             // A single column named after the function, of the element type.
-            TableFn::GenerateSeries(elem) => vec![OutputColumn {
-                name: "generate_series".to_string(),
-                ty: elem,
-            }],
-            TableFn::JsonbPathQuery => vec![OutputColumn {
-                name: "jsonb_path_query".to_string(),
-                ty: PgType::Jsonb,
-            }],
-            TableFn::Unnest(elem) => vec![OutputColumn {
-                name: "unnest".to_string(),
-                ty: elem,
-            }],
+            TableFn::GenerateSeries(elem) => vec![OutputColumn::new("generate_series", elem)],
+            TableFn::JsonbPathQuery => {
+                vec![OutputColumn::new("jsonb_path_query", PgType::Jsonb)]
+            }
+            TableFn::Unnest(elem) => vec![OutputColumn::new("unnest", elem)],
         }
     }
 }
@@ -1710,11 +1700,7 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
             .into_iter()
             .map(crate::expr::to_concat_operand)
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok(Binding::Typed(BoundExpr::FuncCall {
-            func,
-            ret: PgType::Text,
-            args,
-        }));
+        return finish_func_call(func, PgType::Text, args);
     }
 
     // Polymorphic array functions can't live in the fixed-signature overload
@@ -1904,6 +1890,19 @@ fn bind_aggregate(
 /// Resolve an overload for `name` given already-bound arguments, then build the
 /// `FuncCall` node. Shared by ordinary function calls and the `CEIL`/`FLOOR`
 /// special-syntax expressions.
+/// Build a `FuncCall` binding, rejecting conflicting explicit `COLLATE`
+/// clauses among `args` first (`concat('a' COLLATE x, 'b' COLLATE y)` is
+/// `42P22` the same way `a COLLATE x = b COLLATE y` is). Shared by every
+/// `FuncCall` construction site so the check isn't duplicated at each one.
+fn finish_func_call(func: ScalarFn, ret: PgType, args: Vec<BoundExpr>) -> Result<Binding, BindError> {
+    if ret.is_collatable() || args.iter().any(|a| a.ty().is_collatable()) {
+        crate::collation::check_explicit_conflict(
+            args.iter().map(crate::collation::expr_collation),
+        )?;
+    }
+    Ok(Binding::Typed(BoundExpr::FuncCall { func, ret, args }))
+}
+
 pub(crate) fn resolve_call(
     name: &str,
     bindings: Vec<Binding>,
@@ -1924,11 +1923,7 @@ pub(crate) fn resolve_call(
         if sig.args.len() == bindings.len()
             && let Some(args) = try_coerce_args(&bindings, sig.args, true)
         {
-            return Ok(Binding::Typed(BoundExpr::FuncCall {
-                func: sig.func,
-                ret: sig.ret,
-                args,
-            }));
+            return finish_func_call(sig.func, sig.ret, args);
         }
     }
     let mut best: Option<(usize, &Signature, Vec<BoundExpr>)> = None;
@@ -1948,11 +1943,7 @@ pub(crate) fn resolve_call(
         }
     }
     match best {
-        Some((_, sig, args)) => Ok(Binding::Typed(BoundExpr::FuncCall {
-            func: sig.func,
-            ret: sig.ret,
-            args,
-        })),
+        Some((_, sig, args)) => finish_func_call(sig.func, sig.ret, args),
         // No built-in overload fit the argument types; a user `LANGUAGE SQL`
         // function of the same name but different signature may still match.
         None => resolve_sql_function_call(name, bindings, catalog),

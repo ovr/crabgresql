@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, EnumInfo, TableEngine, TableSchema, TypeCatalog, UserCast};
+use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
     Numeric, PgType, Value, cast, date, float, interval, money, parse_bool, time, timestamp,
@@ -220,15 +221,33 @@ pub enum BoundExpr {
         index: usize,
         ty: PgType,
     },
+    /// A collation attached to a string-typed expression: either an explicit
+    /// `expr COLLATE "name"` clause, or the declared collation of a column,
+    /// which the binder wraps around the `ColumnRef` so the collation travels
+    /// with the expression.
+    ///
+    /// Value-transparent — evaluating it evaluates `expr` unchanged. It exists
+    /// only so [`expr_collation`] can derive which collation a comparison or
+    /// sort should use, and `explicit` records the two strengths PostgreSQL
+    /// distinguishes when combining them (a clause overrides a column's own).
+    Collate {
+        expr: Box<BoundExpr>,
+        collation: u32,
+        explicit: bool,
+    },
     Unary {
         op: UnaryOp,
         expr: Box<BoundExpr>,
     },
     /// `arg_ty` is the operand type after promotion; comparisons and logic
-    /// yield bool, arithmetic yields `arg_ty`.
+    /// yield bool, arithmetic yields `arg_ty`. `collation` is the collation
+    /// derived from the operands, used when `arg_ty` is a string type — the
+    /// only case where it affects the result of `<`/`>` (equality is bytewise
+    /// under every supported collation).
     Binary {
         op: BinOp,
         arg_ty: PgType,
+        collation: u32,
         left: Box<BoundExpr>,
         right: Box<BoundExpr>,
     },
@@ -372,6 +391,10 @@ pub struct BoundAggregate {
     pub args: Vec<BoundExpr>,
     pub input_ty: PgType,
     pub ret: PgType,
+    /// The collation `min`/`max` should compare `args[0]` under — the
+    /// database default for a non-collatable `input_ty` or an argument with
+    /// no collation of its own. Every other aggregate ignores this.
+    pub collation: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -445,6 +468,8 @@ impl BoundExpr {
             BoundExpr::ColumnRef { ty, .. } => *ty,
             BoundExpr::Param { ty, .. } => *ty,
             BoundExpr::OuterColumnRef { ty, .. } => *ty,
+            // Value-transparent: a collation never changes the operand's type.
+            BoundExpr::Collate { expr, .. } => expr.ty(),
             BoundExpr::Unary {
                 op: UnaryOp::Not, ..
             } => PgType::Bool,
@@ -486,6 +511,7 @@ impl BoundExpr {
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
             | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_srf(),
             BoundExpr::Binary { left, right, .. } => left.contains_srf() || right.contains_srf(),
             BoundExpr::FuncCall { args, .. } => args.iter().any(BoundExpr::contains_srf),
@@ -536,6 +562,7 @@ impl BoundExpr {
             }
             BoundExpr::IsNull { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Coerce { expr, .. } => expr.contains_aggregate(),
+            BoundExpr::Collate { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Reinterpret { expr, .. } => expr.contains_aggregate(),
             BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
                 args.iter().any(BoundExpr::contains_aggregate)
@@ -586,6 +613,7 @@ impl BoundExpr {
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
             | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_volatile_fn(),
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_volatile_fn() || right.contains_volatile_fn()
@@ -628,6 +656,7 @@ impl BoundExpr {
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
             | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.count_param_refs(index),
             BoundExpr::Binary { left, right, .. } => {
                 left.count_param_refs(index) + right.count_param_refs(index)
@@ -686,6 +715,7 @@ impl BoundExpr {
                 BoundExpr::Unary { expr, .. }
                 | BoundExpr::IsNull { expr, .. }
                 | BoundExpr::Coerce { expr, .. }
+                | BoundExpr::Collate { expr, .. }
                 | BoundExpr::Reinterpret { expr, .. } => fold(expr, acc),
                 BoundExpr::Binary { left, right, .. } => {
                     fold(left, acc);
@@ -814,18 +844,46 @@ enum NameLookup {
     Missing,
 }
 
-/// Find `name` among `rels`' columns, returning its combined-row index and type
-/// (`Ok`) — or `Err(())` for more than one match (ambiguous), or `None` for no
-/// match. Shared by local and outer (correlated) unqualified resolution.
-fn lookup_in_rels(rels: &[ScopeRel], name: &str) -> Option<Result<(usize, PgType), ()>> {
-    let mut found: Option<(usize, PgType)> = None;
+/// A column resolved by name: where it sits in the combined row, its type, and
+/// its declared collation (`None` for the type default).
+#[derive(Clone, Copy)]
+struct ResolvedColumn {
+    index: usize,
+    ty: PgType,
+    collation: Option<u32>,
+}
+
+/// Wrap a column reference in its declared collation, so the collation travels
+/// with the expression the way an explicit `COLLATE` clause does — but at
+/// *implicit* strength, which an explicit clause can still override. A column
+/// on the type's default collation needs no wrapper.
+pub(crate) fn with_column_collation(expr: BoundExpr, collation: Option<u32>) -> BoundExpr {
+    match collation {
+        Some(collation) => BoundExpr::Collate {
+            expr: Box::new(expr),
+            collation,
+            explicit: false,
+        },
+        None => expr,
+    }
+}
+
+/// Find `name` among `rels`' columns, returning it (`Ok`) — or `Err(())` for
+/// more than one match (ambiguous), or `None` for no match. Shared by local and
+/// outer (correlated) unqualified resolution.
+fn lookup_in_rels(rels: &[ScopeRel], name: &str) -> Option<Result<ResolvedColumn, ()>> {
+    let mut found: Option<ResolvedColumn> = None;
     for rel in rels {
         for (local, col) in rel.columns.iter().enumerate() {
             if col.name == name {
                 if found.is_some() {
                     return Some(Err(()));
                 }
-                found = Some((rel.offset + local, col.ty));
+                found = Some(ResolvedColumn {
+                    index: rel.offset + local,
+                    ty: col.ty,
+                    collation: col.collation,
+                });
             }
         }
     }
@@ -833,14 +891,15 @@ fn lookup_in_rels(rels: &[ScopeRel], name: &str) -> Option<Result<(usize, PgType
 }
 
 /// Resolve `column` within a single relation `rel` for a qualified
-/// `qualifier.column` reference: its local index and type, or `42702` if the
-/// relation exposes the name more than once (e.g. an alias list `v(x, x)`), or
-/// `42703` — spelled with the qualifier, as PG does — if it is absent.
+/// `qualifier.column` reference — its *local* index (the caller adds the
+/// relation's offset), type, and collation. `42702` if the relation exposes the
+/// name more than once (e.g. an alias list `v(x, x)`), or `42703` — spelled with
+/// the qualifier, as PG does — if it is absent.
 fn column_in_rel(
     rel: &ScopeRel,
     qualifier: &str,
     column: &str,
-) -> Result<(usize, PgType), BindError> {
+) -> Result<ResolvedColumn, BindError> {
     let mut local: Option<usize> = None;
     for (i, col) in rel.columns.iter().enumerate() {
         if col.name == column {
@@ -859,7 +918,11 @@ fn column_in_rel(
             format!("column {qualifier}.{column} does not exist"),
         )
     })?;
-    Ok((local, rel.columns[local].ty))
+    Ok(ResolvedColumn {
+        index: local,
+        ty: rel.columns[local].ty,
+        collation: rel.columns[local].collation,
+    })
 }
 
 /// Rewrite every `ColumnRef` in `expr` into an `OuterColumnRef` at correlation
@@ -881,14 +944,25 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             op: *op,
             expr: Box::new(outerize_columns(expr, level)),
         },
+        BoundExpr::Collate {
+            expr,
+            collation,
+            explicit,
+        } => BoundExpr::Collate {
+            expr: Box::new(outerize_columns(expr, level)),
+            collation: *collation,
+            explicit: *explicit,
+        },
         BoundExpr::Binary {
             op,
             arg_ty,
+            collation,
             left,
             right,
         } => BoundExpr::Binary {
             op: *op,
             arg_ty: *arg_ty,
+            collation: *collation,
             left: Box::new(outerize_columns(left, level)),
             right: Box::new(outerize_columns(right, level)),
         },
@@ -1139,7 +1213,13 @@ impl Scope {
             };
         }
         match lookup_in_rels(&self.rels, name) {
-            Some(Ok((index, ty))) => NameLookup::Found(BoundExpr::ColumnRef { index, ty }),
+            Some(Ok(col)) => NameLookup::Found(with_column_collation(
+                BoundExpr::ColumnRef {
+                    index: col.index,
+                    ty: col.ty,
+                },
+                col.collation,
+            )),
             Some(Err(())) => NameLookup::Ambiguous,
             None => NameLookup::Missing,
         }
@@ -1171,12 +1251,15 @@ impl Scope {
                 }
             }
             match lookup_in_rels(&level.rels, name) {
-                Some(Ok((index, ty))) => {
-                    return Ok(BoundExpr::OuterColumnRef {
-                        level: level_no,
-                        index,
-                        ty,
-                    });
+                Some(Ok(col)) => {
+                    return Ok(with_column_collation(
+                        BoundExpr::OuterColumnRef {
+                            level: level_no,
+                            index: col.index,
+                            ty: col.ty,
+                        },
+                        col.collation,
+                    ));
                 }
                 Some(Err(())) => return Err(ambiguous()),
                 None => continue,
@@ -1196,20 +1279,26 @@ impl Scope {
     /// column.
     fn resolve_qualified(&self, qualifier: &str, column: &str) -> Result<BoundExpr, BindError> {
         if let Some(rel) = self.rels.iter().find(|r| r.qualifier == qualifier) {
-            let (local, ty) = column_in_rel(rel, qualifier, column)?;
-            return Ok(BoundExpr::ColumnRef {
-                index: rel.offset + local,
-                ty,
-            });
+            let col = column_in_rel(rel, qualifier, column)?;
+            return Ok(with_column_collation(
+                BoundExpr::ColumnRef {
+                    index: rel.offset + col.index,
+                    ty: col.ty,
+                },
+                col.collation,
+            ));
         }
         for (depth, level) in self.outer.iter().enumerate() {
             if let Some(rel) = level.rels.iter().find(|r| r.qualifier == qualifier) {
-                let (local, ty) = column_in_rel(rel, qualifier, column)?;
-                return Ok(BoundExpr::OuterColumnRef {
-                    level: depth + 1,
-                    index: rel.offset + local,
-                    ty,
-                });
+                let col = column_in_rel(rel, qualifier, column)?;
+                return Ok(with_column_collation(
+                    BoundExpr::OuterColumnRef {
+                        level: depth + 1,
+                        index: rel.offset + col.index,
+                        ty: col.ty,
+                    },
+                    col.collation,
+                ));
             }
         }
         Err(BindError::new(
@@ -1244,10 +1333,13 @@ impl Scope {
             return visible
                 .iter()
                 .map(|col| {
+                    let (collation, strength) = crate::collation::output_collation(&col.expr);
                     (
                         crate::OutputColumn {
                             name: col.name.clone(),
                             ty: col.expr.ty(),
+                            collation,
+                            strength,
                         },
                         col.expr.clone(),
                     )
@@ -1294,11 +1386,20 @@ fn expand_rel(rel: &ScopeRel, out: &mut Vec<(crate::OutputColumn, BoundExpr)>) {
             crate::OutputColumn {
                 name: col.name.clone(),
                 ty: col.ty,
+                collation: col.collation,
+                // A resolved column reference is always implicit strength in
+                // PG's model, whether or not its collation happens to equal
+                // the type default (mirroring `expr_collation`'s `ColumnRef`
+                // arm).
+                strength: crate::collation::Strength::Implicit,
             },
-            BoundExpr::ColumnRef {
-                index: rel.offset + i,
-                ty: col.ty,
-            },
+            with_column_collation(
+                BoundExpr::ColumnRef {
+                    index: rel.offset + i,
+                    ty: col.ty,
+                },
+                col.collation,
+            ),
         ));
     }
 }
@@ -1482,8 +1583,40 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         ast::Expr::CompoundFieldAccess { root, access_chain } => {
             bind_subscript(root, access_chain, scope)
         }
+        ast::Expr::Collate { expr, collation } => bind_collate(expr, collation, scope),
         other => Err(unsupported_expr(other)),
     }
+}
+
+/// Bind `expr COLLATE "name"`.
+///
+/// The clause only labels the operand — the value is unchanged — so the result
+/// keeps the operand's type and the collation rides along in a
+/// [`BoundExpr::Collate`] at *explicit* strength, overriding any collation the
+/// operand already carried. An untyped literal (`'x' COLLATE "C"`) settles on
+/// `text`, as PG does, since the clause proves it is a string.
+fn bind_collate(
+    expr: &ast::Expr,
+    collation: &ast::ObjectName,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let oid = crate::collation::resolve_collation(collation)?;
+    let bound = match bind_expr(expr, scope)? {
+        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text)?,
+        Binding::Typed(e) => e,
+    };
+    let ty = bound.ty();
+    if !ty.is_collatable() {
+        return Err(BindError::new(
+            sqlstate::WRONG_OBJECT_TYPE,
+            format!("collations are not supported by type {}", ty.name()),
+        ));
+    }
+    Ok(Binding::Typed(BoundExpr::Collate {
+        expr: Box::new(bound),
+        collation: oid,
+        explicit: true,
+    }))
 }
 
 /// Bind an `ARRAY[...]` constructor. Elements are bound and unified to a common
@@ -1516,6 +1649,11 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
             "could not find array type for data type {}",
             elem.name()
         )));
+    }
+    if elem.is_collatable() {
+        crate::collation::check_explicit_conflict(
+            exprs.iter().map(crate::collation::expr_collation),
+        )?;
     }
     Ok(Binding::Typed(BoundExpr::ArrayCtor {
         elem,
@@ -1717,7 +1855,7 @@ fn bind_quantified_subquery(
     };
     let elem_ty = col.ty;
     let needle = bind_expr(left, scope)?;
-    let cmp = bind_hole_template(op, needle, elem_ty, op_span, scope)?;
+    let cmp = bind_hole_template(op, needle, elem_ty, col.collation, op_span, scope)?;
     Ok(Binding::Typed(BoundExpr::QuantifiedSubquery {
         subplan: Subplan(Box::new(plan)),
         all,
@@ -1756,7 +1894,11 @@ fn bind_quantified_array(
     // Coerce the right side to `elem_ty[]` (identity for an already-typed array;
     // parses `'{…}'` / types a `$n` param via `resolve_unknown`'s array arm).
     let array_expr = resolve_operand(&array, PgType::Array(elem_ty.oid()))?;
-    let cmp = bind_hole_template(op, needle, elem_ty, op_span, scope)?;
+    // `PgType::Array` is never itself collatable (only the element is), and
+    // nothing in this build tracks a per-element collation on an array value
+    // yet, so the hole falls back to the element type's default collation —
+    // unlike the subquery form, which does know its one column's collation.
+    let cmp = bind_hole_template(op, needle, elem_ty, None, op_span, scope)?;
     Ok(Binding::Typed(BoundExpr::QuantifiedArray {
         array: Box::new(array_expr),
         all,
@@ -1774,6 +1916,7 @@ fn bind_hole_template(
     op: BinOp,
     needle: Binding,
     elem_ty: PgType,
+    collation: Option<u32>,
     op_span: Span,
     scope: &Scope,
 ) -> Result<BoundExpr, BindError> {
@@ -1788,9 +1931,20 @@ fn bind_hole_template(
         ))
         .at(op_span));
     }
-    let hole = Binding::Typed(BoundExpr::Const {
+    let placeholder = BoundExpr::Const {
         value: Value::Null,
         ty: elem_ty,
+    };
+    // Wrap the placeholder so `expr_collation` sees the candidate set's real
+    // collation rather than a bare NULL's (which asserts none), the same way
+    // a column reference of `elem_ty` would if we had a real one to bind.
+    let hole = Binding::Typed(match collation {
+        Some(collation) if elem_ty.is_collatable() => BoundExpr::Collate {
+            expr: Box::new(placeholder),
+            collation,
+            explicit: false,
+        },
+        _ => placeholder,
     });
     let cmp = bind_binary_op(op, needle, hole, op_span, scope.catalog().as_ref())?;
     match cmp {
@@ -2996,7 +3150,16 @@ fn bind_case(
     } else {
         None
     };
-    let whens = conds.into_iter().zip(results).collect();
+    let whens: Vec<_> = conds.into_iter().zip(results).collect();
+
+    if ty.is_collatable() {
+        crate::collation::check_explicit_conflict(
+            else_
+                .iter()
+                .map(|e| crate::collation::expr_collation(e))
+                .chain(whens.iter().map(|(_, r)| crate::collation::expr_collation(r))),
+        )?;
+    }
 
     Ok(Binding::Typed(BoundExpr::Case { whens, else_, ty }))
 }
@@ -3336,6 +3499,7 @@ pub(crate) fn bind_binary_op(
         return Ok(Binding::Typed(BoundExpr::Binary {
             op,
             arg_ty: PgType::Bool,
+            collation: DEFAULT_COLLATION_OID,
             left: Box::new(left),
             right: Box::new(right),
         }));
@@ -3439,9 +3603,17 @@ pub(crate) fn bind_binary_op(
         return Err(no_operator(&name, op, &name));
     }
 
+    // A string comparison orders by the collation derived from its operands;
+    // for every other type the collation is inert, so don't spend the walk.
+    let collation = if arg_ty.is_collatable() {
+        crate::collation::collation_for_comparison(&left, &right)?
+    } else {
+        DEFAULT_COLLATION_OID
+    };
     Ok(Binding::Typed(BoundExpr::Binary {
         op,
         arg_ty,
+        collation,
         left: Box::new(left),
         right: Box::new(right),
     }))
@@ -4587,6 +4759,7 @@ fn bind_pow(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
     Ok(Binding::Typed(BoundExpr::Binary {
         op: BinOp::Pow,
         arg_ty: PgType::Float8,
+        collation: DEFAULT_COLLATION_OID,
         left: Box::new(left),
         right: Box::new(right),
     }))
@@ -4718,12 +4891,10 @@ pub(crate) fn to_text_operand(binding: Binding) -> Result<BoundExpr, BindError> 
     }
 }
 
-/// True for the text-family types that share `text`'s value representation.
+/// True for the text-family types that share `text`'s value representation —
+/// exactly the collatable types.
 pub(crate) fn is_text_family(ty: PgType) -> bool {
-    matches!(
-        ty,
-        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name
-    )
+    ty.is_collatable()
 }
 
 /// Coerce an argument for `concat`/`concat_ws`/`format`, which use each value's
@@ -5533,14 +5704,25 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             op,
             expr: Box::new(inline_params(*expr, args)),
         },
+        BoundExpr::Collate {
+            expr,
+            collation,
+            explicit,
+        } => BoundExpr::Collate {
+            expr: Box::new(inline_params(*expr, args)),
+            collation,
+            explicit,
+        },
         BoundExpr::Binary {
             op,
             arg_ty,
+            collation,
             left,
             right,
         } => BoundExpr::Binary {
             op,
             arg_ty,
+            collation,
             left: Box::new(inline_params(*left, args)),
             right: Box::new(inline_params(*right, args)),
         },
@@ -5714,6 +5896,9 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
             .map(normalize_ident)
             .unwrap_or_else(|| "?column?".into()),
         ast::Expr::Nested(inner) => output_name(inner),
+        // `COLLATE` is value-transparent, like a cast that keeps the type: it
+        // takes the wrapped expression's name, not its own.
+        ast::Expr::Collate { expr, .. } => output_name(expr),
         ast::Expr::Value(v) if matches!(v.value, ast::Value::Boolean(_)) => "bool".into(),
         // PG keeps a bare column's name through a cast (`id::int8` → "id"), but
         // uses the target type name when the argument has no inherent name

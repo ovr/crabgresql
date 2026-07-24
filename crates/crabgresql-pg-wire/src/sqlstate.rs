@@ -34,6 +34,10 @@ pub const DUPLICATE_FUNCTION: &str = "42723";
 pub const CANNOT_COERCE: &str = "42846";
 pub const DATATYPE_MISMATCH: &str = "42804";
 pub const GROUPING_ERROR: &str = "42803";
+/// `42P22` — no collation could be derived for an expression, because two
+/// explicit `COLLATE` clauses conflict or two differently-collated inputs meet
+/// with equal precedence.
+pub const INDETERMINATE_COLLATION: &str = "42P22";
 pub const UNDEFINED_TABLE: &str = "42P01";
 pub const DUPLICATE_TABLE: &str = "42P07";
 /// `42P06` — `CREATE SCHEMA` names a schema that already exists (without

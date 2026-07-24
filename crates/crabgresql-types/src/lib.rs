@@ -8,6 +8,7 @@
 pub mod array;
 pub mod bit;
 pub mod cast;
+pub mod collation;
 pub mod date;
 pub mod float;
 pub mod geo;
@@ -479,6 +480,17 @@ impl PgType {
             }
             _ => true,
         }
+    }
+
+    /// Whether values of this type carry a collation — the types PostgreSQL
+    /// marks with a non-zero `pg_type.typcollation`. Only the string types are
+    /// collatable here; `COLLATE` on anything else is a bind-time error, and a
+    /// column of a non-collatable type records no collation.
+    pub fn is_collatable(self) -> bool {
+        matches!(
+            self,
+            PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name
+        )
     }
 }
 

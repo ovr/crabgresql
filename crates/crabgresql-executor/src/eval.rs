@@ -10,9 +10,10 @@ use std::cmp::Ordering;
 
 use crabgresql_binder::{BinOp, BoundExpr, ScalarFn, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{
-    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, cast, date, float, interval, json, money,
-    net, time, timetz,
+    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, cast, collation, date, float, interval,
+    json, money, net, time, timetz,
 };
 
 use crate::{ExecContext, ExecError};
@@ -40,12 +41,15 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             ),
         )),
         BoundExpr::Unary { op, expr } => eval_unary(*op, eval(expr, row, ctx)?),
+        // A collation labels the operand for comparison; the value is unchanged.
+        BoundExpr::Collate { expr, .. } => eval(expr, row, ctx),
         BoundExpr::Binary {
             op,
             arg_ty,
+            collation,
             left,
             right,
-        } => eval_binary(*op, *arg_ty, left, right, row, ctx),
+        } => eval_binary(*op, *arg_ty, *collation, left, right, row, ctx),
         BoundExpr::IsNull { expr, negated } => {
             let is_null = matches!(eval(expr, row, ctx)?, Value::Null);
             Ok(Value::Bool(is_null != *negated))
@@ -356,6 +360,7 @@ fn eval_unary(op: UnaryOp, operand: Value) -> Result<Value, ExecError> {
 fn eval_binary(
     op: BinOp,
     arg_ty: PgType,
+    collation: u32,
     left: &BoundExpr,
     right: &BoundExpr,
     row: &[Value],
@@ -381,18 +386,29 @@ fn eval_binary(
             other => unreachable!("binder let arithmetic through on {other:?}"),
         };
     }
-    Ok(Value::Bool(apply_comparison(op, arg_ty, &l, &r)))
+    Ok(Value::Bool(apply_comparison(op, arg_ty, collation, &l, &r)))
 }
 
 /// Apply a comparison operator to two already-evaluated, non-NULL operands of
-/// `arg_ty`. Split out of [`eval_binary`] so the quantified comparisons
-/// (`op ANY/ALL`) resolve each candidate exactly as a written comparison does,
-/// without rebuilding an expression node per candidate.
-pub(crate) fn apply_comparison(op: BinOp, arg_ty: PgType, l: &Value, r: &Value) -> bool {
-    let ordering = compare_values(arg_ty, l, r);
+/// `arg_ty`, ordering strings under `collation`. Split out of [`eval_binary`] so
+/// the quantified comparisons (`op ANY/ALL`) resolve each candidate exactly as a
+/// written comparison does, without rebuilding an expression node per candidate.
+pub(crate) fn apply_comparison(
+    op: BinOp,
+    arg_ty: PgType,
+    collation: u32,
+    l: &Value,
+    r: &Value,
+) -> bool {
+    // Every supported collation is deterministic, so equal bytes and equal
+    // values coincide (see `compare_values`'s doc comment) — equality never
+    // needs the collation-aware path, so skip straight past the ICU collator.
+    if matches!(op, BinOp::Eq | BinOp::NotEq) {
+        let eq = compare_values(arg_ty, l, r).is_eq();
+        return if op == BinOp::Eq { eq } else { !eq };
+    }
+    let ordering = compare_values_collated(arg_ty, l, r, collation);
     match op {
-        BinOp::Eq => ordering.is_eq(),
-        BinOp::NotEq => ordering.is_ne(),
         BinOp::Lt => ordering.is_lt(),
         BinOp::LtEq => ordering.is_le(),
         BinOp::Gt => ordering.is_gt(),
@@ -416,21 +432,39 @@ pub fn is_orderable(ty: PgType) -> bool {
     }
 }
 
-/// Total-order comparison of two non-null values of type `ty`. Floats use PG's
-/// total order (NaN sorts greatest, `NaN = NaN`), so this also drives ORDER BY.
+/// Total-order comparison of two non-null values of type `ty` under the
+/// database's default collation. Floats use PG's total order (NaN sorts
+/// greatest, `NaN = NaN`), so this also drives ORDER BY.
+///
+/// String comparison here is byte order. Use [`compare_values_collated`] where a
+/// collation has been derived — comparison operators and ORDER BY — and this one
+/// where the collation is provably irrelevant: equality and hashing (every
+/// supported collation is deterministic, so equal bytes and equal values
+/// coincide), and ordering of non-string types.
 pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
+    compare_values_collated(ty, l, r, DEFAULT_COLLATION_OID)
+}
+
+/// Total-order comparison of two non-null values of type `ty`, ordering strings
+/// under `collation`. Identical to [`compare_values`] for every other type.
+pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32) -> Ordering {
     match ty {
         PgType::Int2 => int2(l).cmp(&int2(r)),
         PgType::Int4 => int4(l).cmp(&int4(r)),
         PgType::Int8 => int8(l).cmp(&int8(r)),
         PgType::Float4 => float::f4_cmp(float4(l), float4(r)),
         PgType::Float8 => float::f8_cmp(float8(l), float8(r)),
-        // Byte-order comparison: C-collation semantics until collations land.
-        // varchar and name compare like text; bpchar ignores trailing blanks.
-        PgType::Text | PgType::Varchar | PgType::Name => text(l).cmp(text(r)),
-        PgType::Bpchar => text(l)
-            .trim_end_matches(' ')
-            .cmp(text(r).trim_end_matches(' ')),
+        // Collation-driven comparison — byte order for `C`/`POSIX`/the database
+        // default, the locale's order for an ICU collation. varchar and name
+        // compare like text; bpchar ignores trailing blanks.
+        PgType::Text | PgType::Varchar | PgType::Name => {
+            collation::compare_str(collation, text(l), text(r))
+        }
+        PgType::Bpchar => collation::compare_str(
+            collation,
+            text(l).trim_end_matches(' '),
+            text(r).trim_end_matches(' '),
+        ),
         PgType::Bytea => bytea(l).cmp(bytea(r)),
         // false < true, as in PG.
         PgType::Bool => bool_of(l).cmp(&bool_of(r)),

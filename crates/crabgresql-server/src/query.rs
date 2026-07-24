@@ -408,10 +408,7 @@ pub fn analyze_statement(
             require_all_resolved(&ctx)?;
             return Ok(Analyzed {
                 param_types: param_types(&ctx).into_iter().flatten().collect(),
-                result_columns: Some(vec![OutputColumn {
-                    name: "QUERY PLAN".to_string(),
-                    ty: PgType::Text,
-                }]),
+                result_columns: Some(vec![OutputColumn::new("QUERY PLAN", PgType::Text)]),
             });
         }
         // Utility statements (DDL/SET/transaction control) take no parameters and
@@ -664,10 +661,7 @@ pub fn execute_statement(
                 let node: Box<dyn ExecNode> =
                     Box::new(Values::new(rows, session.exec_context()));
                 return Ok(QueryResult::Rows {
-                    columns: vec![OutputColumn {
-                        name: "QUERY PLAN".to_string(),
-                        ty: PgType::Text,
-                    }],
+                    columns: vec![OutputColumn::new("QUERY PLAN", PgType::Text)],
                     node,
                     tag: RowTag::Select,
                 });
@@ -1908,6 +1902,22 @@ fn execute_create_table(
                         characteristics: unique.characteristics,
                     });
                 }
+                // `col text COLLATE "de-x-icu"`: the column's values order under
+                // this collation wherever no nearer COLLATE overrides it.
+                ast::ColumnOption::Collation(collation) => {
+                    if column.collation.is_some() {
+                        return Err(PgError::syntax(format!(
+                            "multiple COLLATE clauses not allowed for column \"{column_name}\""
+                        )));
+                    }
+                    if !column.ty.is_collatable() {
+                        return Err(PgError::new(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            format!("collations are not supported by type {}", column.ty.name()),
+                        ));
+                    }
+                    column.collation = Some(crabgresql_binder::resolve_collation(collation)?);
+                }
                 other => {
                     return Err(PgError::feature_not_supported(format!(
                         "column constraint is not supported yet: {other}"
@@ -2501,7 +2511,11 @@ fn execute_create_table_as(
         namespace: namespace.clone(),
         columns: cols
             .iter()
-            .map(|c| Column::new(c.name.clone(), c.ty))
+            .map(|c| {
+                let mut col = Column::new(c.name.clone(), c.ty);
+                col.collation = c.collation;
+                col
+            })
             .collect(),
         persistence,
         partition_scheme: None,

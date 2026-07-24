@@ -60,8 +60,64 @@ pub fn pg_type_schema() -> TableSchema {
             col("typsend", CHARLIKE),
             col("typalign", CHARLIKE),
             col("typstorage", CHARLIKE),
+            col("typcollation", PgType::Oid),
         ],
     )
+}
+
+/// `pg_catalog.pg_collation` — the collations this build ships. `collversion`
+/// is omitted: it exists so PostgreSQL can warn when the underlying OS locale
+/// data changes under an index, and the ICU data here is compiled in, so there
+/// is no external version to drift from.
+pub fn pg_collation_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_collation",
+        "pg_catalog",
+        vec![
+            col("oid", PgType::Oid),
+            col("collname", PgType::Name),
+            col("collnamespace", PgType::Oid),
+            col("collowner", PgType::Oid),
+            col("collprovider", CHARLIKE),
+            col("collisdeterministic", PgType::Bool),
+            col("collencoding", PgType::Int4),
+            col("collcollate", PgType::Text),
+            col("collctype", PgType::Text),
+            col("colllocale", PgType::Text),
+        ],
+    )
+}
+
+/// The `pg_collation` rows, one per collation in the shared registry — the same
+/// list [`crabgresql_types::collation::compare_str`] orders strings by, so what
+/// the catalog advertises and what queries actually do cannot drift.
+pub fn pg_collation_rows() -> Vec<Vec<Value>> {
+    crabgresql_types::collation::COLLATIONS
+        .iter()
+        .map(|c| {
+            let opt_text = |s: Option<&str>| s.map_or(Value::Null, |s| Value::Text(s.to_string()));
+            vec![
+                Value::Oid(c.oid),
+                Value::Text(c.name.to_string()),
+                // Every collation lives in pg_catalog (11), owned by the
+                // bootstrap superuser (10).
+                Value::Oid(11),
+                Value::Oid(10),
+                Value::Text(c.provider.as_char().to_string()),
+                Value::Bool(c.deterministic),
+                Value::Int4(c.encoding),
+                opt_text(c.libc_locale),
+                opt_text(c.libc_locale),
+                opt_text(c.locale),
+            ]
+        })
+        .collect()
+}
+
+/// `typcollation`: the collation of values of `oid`'s type, or `0` when the type
+/// is not collatable. An OID this build does not model has no collation.
+fn typcollation_of(oid: u32) -> u32 {
+    PgType::from_oid(oid).map_or(0, crabgresql_types::collation::type_collation)
 }
 
 /// The built-in `pg_type` rows generated from `pg_type.dat`. Callers append any
@@ -91,6 +147,7 @@ pub fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Text(r.typsend.to_string()),
                 Value::Text(r.typalign.to_string()),
                 Value::Text(r.typstorage.to_string()),
+                Value::Oid(typcollation_of(r.oid)),
             ]
         })
         .collect()
@@ -128,6 +185,8 @@ pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
                 Value::Text("enum_send".to_string()),
                 Value::Text("i".to_string()),
                 Value::Text("p".to_string()),
+                // An enum is not collatable.
+                Value::Oid(0),
             ]
         })
         .collect()
@@ -453,8 +512,18 @@ pub fn pg_attribute_schema() -> TableSchema {
             col("attnotnull", PgType::Bool),
             col("atthasdef", PgType::Bool),
             col("attisdropped", PgType::Bool),
+            col("attcollation", PgType::Oid),
         ],
     )
+}
+
+/// `attcollation`: the column's explicit `COLLATE`, else the type's own
+/// collation — and `0` when the type has none, as PostgreSQL records it.
+fn attcollation_of(column: &Column) -> u32 {
+    match column.collation {
+        Some(oid) => oid,
+        None => typcollation_of(column.ty.oid()),
+    }
 }
 
 /// Build `pg_attribute` rows: one per column of each relation, `attnum` 1-based
@@ -476,6 +545,7 @@ pub fn pg_attribute_rows(
                 Value::Bool(!c.nullable),
                 Value::Bool(c.default.is_some()),
                 Value::Bool(false),
+                Value::Oid(attcollation_of(c)),
             ]);
         }
     }
@@ -492,6 +562,7 @@ pub fn pg_attribute_rows(
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(false),
+                Value::Oid(attcollation_of(column)),
             ]);
         }
     }
@@ -934,6 +1005,20 @@ pub fn information_schema_columns_rows(
                         | PgType::Interval => Value::Int4(6),
                         _ => Value::Null,
                     };
+                    // PG's view joins pg_collation but excludes
+                    // `pg_catalog.default`, so a column left on the database
+                    // collation reports NULL here rather than "default".
+                    let collation =
+                        crabgresql_types::collation::lookup_by_oid(attcollation_of(column))
+                            .filter(|c| c.name != "default");
+                    let (collation_catalog, collation_schema, collation_name) = match collation {
+                        Some(c) => (
+                            Value::Text(database.to_string()),
+                            Value::Text("pg_catalog".to_string()),
+                            Value::Text(c.name.to_string()),
+                        ),
+                        None => (Value::Null, Value::Null, Value::Null),
+                    };
                     vec![
                         Value::Text(database.to_string()),
                         Value::Text(relation.namespace.clone()),
@@ -951,16 +1036,20 @@ pub fn information_schema_columns_rows(
                         character_octets,
                         precision,
                         radix,
+                        // numeric_scale
                         Value::Null,
                         datetime_precision,
+                        // interval_type, interval_precision
+                        Value::Null,
+                        Value::Null,
+                        // character_set_{catalog,schema,name}
                         Value::Null,
                         Value::Null,
                         Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
+                        collation_catalog,
+                        collation_schema,
+                        collation_name,
+                        // domain_{catalog,schema,name}
                         Value::Null,
                         Value::Null,
                         Value::Null,
