@@ -177,6 +177,10 @@ impl TableEngine for SessionCatalog {
         self.global.relations()
     }
 
+    fn relation_names_in(&self, namespace: &str) -> Vec<String> {
+        self.global.relation_names_in(namespace)
+    }
+
     fn relation_metadata(&self) -> Vec<RelationMetadata> {
         self.global.relation_metadata()
     }

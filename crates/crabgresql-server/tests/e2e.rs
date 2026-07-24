@@ -3103,6 +3103,35 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A temp table reflects its own `pg_temp_N` namespace: `pg_class.relnamespace`
+/// joins to a `pg_namespace` row named `pg_temp_N` (not `public`/2200), even though
+/// the temp schema is never persisted.
+#[tokio::test]
+async fn temp_table_reflects_its_own_namespace() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TEMP TABLE t (id int)").await?;
+
+    let joined = client
+        .simple_query(
+            "SELECT n.nspname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 't'",
+        )
+        .await?;
+    let nspname = rows(&joined)[0].get("nspname").expect("nspname");
+    assert!(
+        nspname.starts_with("pg_temp_"),
+        "temp table relnamespace should resolve to pg_temp_N, got {nspname:?}"
+    );
+
+    let listed = client
+        .simple_query("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'pg_temp_%'")
+        .await?;
+    assert_eq!(rows(&listed).len(), 1, "pg_namespace should list the temp schema");
+
+    Ok(())
+}
+
 /// A session cannot reach another session's temp tables by qualifying with the
 /// other backend's `pg_temp_N` namespace — temp tables all live in the one shared
 /// engine now, so this guards the isolation the old per-session engine gave for

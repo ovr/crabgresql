@@ -601,6 +601,19 @@ impl TableEngine for PgEngine {
             .collect()
     }
 
+    fn relation_names_in(&self, namespace: &str) -> Vec<String> {
+        // Read the table map's keys under the lock and clone only the names — no
+        // schema deep-clone — so a session's disconnect teardown is O(its temp
+        // tables), not O(all relations).
+        self.tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .keys()
+            .filter(|(ns, _)| ns == namespace)
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
     fn relation_metadata(&self) -> Vec<RelationMetadata> {
         self.tables
             .read()
