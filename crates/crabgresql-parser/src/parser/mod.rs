@@ -4784,11 +4784,15 @@ impl<'a> Parser<'a> {
         let temporary = self
             .parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY])
             .is_some();
+        // PostgreSQL `UNLOGGED`: a table that is not WAL-logged (a memory table in
+        // this engine). Mutually exclusive with TEMP in PG, but the AST carries the
+        // flag and downstream binding decides.
+        let unlogged = self.parse_one_of_keywords(&[Keyword::UNLOGGED]).is_some();
         let create_view_params = self.parse_create_view_params()?;
         if self.peek_keywords(&[Keyword::SNAPSHOT, Keyword::TABLE]) {
             self.parse_create_snapshot_table().map(Into::into)
         } else if self.parse_keyword(Keyword::TABLE) {
-            self.parse_create_table(or_replace, temporary, global, transient)
+            self.parse_create_table(or_replace, temporary, unlogged, global, transient)
                 .map(Into::into)
         } else if self.peek_keyword(Keyword::MATERIALIZED)
             || self.peek_keyword(Keyword::VIEW)
@@ -7604,6 +7608,7 @@ impl<'a> Parser<'a> {
         &mut self,
         or_replace: bool,
         temporary: bool,
+        unlogged: bool,
         global: Option<bool>,
         transient: bool,
     ) -> Result<CreateTable, ParserError> {
@@ -7755,6 +7760,7 @@ impl<'a> Parser<'a> {
 
         Ok(CreateTableBuilder::new(table_name)
             .temporary(temporary)
+            .unlogged(unlogged)
             .columns(columns)
             .constraints(constraints)
             .or_replace(or_replace)

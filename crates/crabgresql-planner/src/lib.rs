@@ -781,13 +781,103 @@ mod tests {
     //! plan, asserting on the plan's structure.
 
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
     use crabgresql_binder::{BinOp, bind_delete, bind_insert, bind_query, bind_update};
-    use crabgresql_memory_storage::MemoryEngine;
     use crabgresql_parser::ast;
     use crabgresql_storage_api::{
-        Column, EmptyTypeCatalog, IndexKey, IndexMethod, TableEngine, TableSchema, TypeCatalog,
+        Column, DeleteResult, EmptyTypeCatalog, IndexKey, IndexMethod, StorageError, TableEngine,
+        TableSchema, Tid, Tuple, TypeCatalog, UpdateResult,
     };
+    use crabgresql_txn::TxnContext;
     use crabgresql_types::{PgType, Value};
+
+    /// A metadata-only engine for planner tests: it holds table schemas and their
+    /// index metadata and reports `supports_index_scan = true`, so the planner's
+    /// index-selection path is exercised without a real storage engine. It never
+    /// stores rows — the planner only reads schema/index metadata, so every
+    /// row-touching method is `unimplemented!()`.
+    #[derive(Default)]
+    struct MetaEngine {
+        tables: Mutex<HashMap<String, Arc<MetaTable>>>,
+    }
+
+    struct MetaTable {
+        schema: TableSchema,
+        indexes: Mutex<Vec<IndexMetadata>>,
+    }
+
+    impl TableAm for MetaTable {
+        fn schema(&self) -> &TableSchema {
+            &self.schema
+        }
+        fn indexes(&self) -> Vec<IndexMetadata> {
+            self.indexes.lock().expect("mutex").clone()
+        }
+        fn supports_index_scan(&self, _index_name: &str) -> bool {
+            true
+        }
+        fn scan(&self, _txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
+            unimplemented!("planner tests never scan")
+        }
+        fn fetch(&self, _tid: Tid, _txn: &TxnContext) -> Option<Tuple> {
+            unimplemented!("planner tests never fetch")
+        }
+        fn insert(&self, _tuple: Tuple, _txn: &TxnContext) -> Tid {
+            unimplemented!("planner tests never insert")
+        }
+        fn update(&self, _tid: Tid, _tuple: Tuple, _txn: &TxnContext) -> UpdateResult {
+            unimplemented!("planner tests never update")
+        }
+        fn delete(&self, _tid: Tid, _txn: &TxnContext) -> DeleteResult {
+            unimplemented!("planner tests never delete")
+        }
+    }
+
+    impl TableEngine for MetaEngine {
+        fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
+            let table = Arc::new(MetaTable {
+                schema: schema.clone(),
+                indexes: Mutex::new(Vec::new()),
+            });
+            self.tables
+                .lock()
+                .expect("mutex")
+                .insert(schema.name.clone(), Arc::clone(&table));
+            Ok(table as Arc<dyn TableAm>)
+        }
+        fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
+            self.tables
+                .lock()
+                .expect("mutex")
+                .get(name)
+                .cloned()
+                .map(|t| t as Arc<dyn TableAm>)
+                .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
+        }
+        fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
+            self.tables
+                .lock()
+                .expect("mutex")
+                .remove(name)
+                .map(|_| ())
+                .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
+        }
+        fn create_index(
+            &self,
+            _namespace: &str,
+            table: &str,
+            index: IndexMetadata,
+        ) -> Result<(), StorageError> {
+            let tables = self.tables.lock().expect("mutex");
+            let t = tables
+                .get(table)
+                .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
+            t.indexes.lock().expect("mutex").push(index);
+            Ok(())
+        }
+    }
 
     fn plan_sql(sql: &str) -> PhysicalPlan {
         plan_sql_indexed(sql, None)
@@ -796,7 +886,7 @@ mod tests {
     /// Plan `sql` against table `t(id int4, big int8, name text)`, optionally
     /// registering an index (name + `IndexMetadata`) first.
     fn plan_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> PhysicalPlan {
-        let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
+        let engine: Arc<dyn TableEngine> = Arc::new(MetaEngine::default());
         let catalog: Arc<dyn TypeCatalog> = Arc::new(EmptyTypeCatalog);
         if let Err(error) = engine.create_table(TableSchema::in_namespace(
             "t",

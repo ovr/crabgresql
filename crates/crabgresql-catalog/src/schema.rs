@@ -287,9 +287,9 @@ pub fn pg_class_schema() -> TableSchema {
     )
 }
 
-/// Build `pg_class` rows from `(oid, schema)` pairs paired with their kinds. User
-/// relations live in `public` (namespace 2200) and are permanent
-/// (`relpersistence = 'p'`); a table is an ordinary heap (`relkind = 'r'`,
+/// Build `pg_class` rows from `(oid, schema)` pairs paired with their kinds.
+/// `relpersistence` comes from each schema (`'p'` permanent, `'u'` unlogged,
+/// `'t'` temporary — the memory tables); a table is an ordinary heap (`relkind = 'r'`,
 /// `relam = 2`) while a view has no storage access method (`relkind = 'v'`,
 /// `relam = 0`). The synthetic OIDs are stable within one catalog snapshot so a
 /// join to `pg_attribute.attrelid` lines up.
@@ -323,7 +323,7 @@ pub fn pg_class_rows(
                 Value::Oid(relam),
                 Value::Int2(schema.columns.len() as i16),
                 Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
-                Value::Text("p".to_string()),
+                Value::Text(schema.persistence.as_char().to_string()),
                 Value::Text(relkind.to_string()),
                 Value::Bool(schema.partition_of.is_some()),
             ]

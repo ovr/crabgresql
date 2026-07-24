@@ -2562,7 +2562,6 @@ fn jsonb_path_query_series(values: &[Value]) -> Result<Series, ExecError> {
 mod tests {
     use super::*;
     use crabgresql_binder::{BinOp, UnaryOp};
-    use crabgresql_memory_storage::MemoryEngine;
     use crabgresql_storage_api::{
         Column, IndexConstraint, IndexKey, IndexMethod, TableEngine, TableSchema,
     };
@@ -2841,7 +2840,7 @@ mod tests {
     }
 
     fn test_table() -> Arc<dyn TableAm> {
-        let engine = MemoryEngine::new();
+        let engine = crabgresql_pg_engine::ephemeral_engine();
         let table = test_ok(engine.create_table(TableSchema::in_namespace(
             "t",
             "public",
@@ -2867,7 +2866,7 @@ mod tests {
 
     /// `test_table`'s rows plus a physical unique index on `id`.
     fn indexed_table() -> Arc<dyn TableAm> {
-        let engine = MemoryEngine::new();
+        let engine = crabgresql_pg_engine::ephemeral_engine();
         let table = test_ok(engine.create_table(TableSchema::in_namespace(
             "t",
             "public",
@@ -3298,7 +3297,7 @@ mod tests {
     /// A fresh engine with `t(id int4, label text)` seeded with three rows, for
     /// the `RETURNING` tests.
     fn returning_engine() -> Arc<dyn TableEngine> {
-        let engine = MemoryEngine::new();
+        let engine = crabgresql_pg_engine::ephemeral_engine();
         let table = test_ok(engine.create_table(TableSchema::in_namespace(
             "t",
             "public",
@@ -3311,7 +3310,7 @@ mod tests {
         table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
         table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
         table.insert(vec![Value::Int4(3), Value::Text("three".into())], &txn);
-        Arc::new(engine)
+        engine
     }
 
     /// Parse → bind → plan → execute a DML `RETURNING` statement, draining the
@@ -3495,7 +3494,7 @@ mod tests {
     /// Parse → bind → plan → execute a query against a fresh engine.
     fn run_rows(sql: &str) -> (Vec<OutputColumn>, Vec<Tuple>) {
         run_rows_on(
-            &(Arc::new(MemoryEngine::new()) as Arc<dyn TableEngine>),
+            &(crabgresql_pg_engine::ephemeral_engine() as Arc<dyn TableEngine>),
             sql,
         )
     }
@@ -3526,7 +3525,7 @@ mod tests {
     /// An engine with `t(a int, b int)` seeded with two groups (a=1,2) plus a
     /// singleton (a=3), and one NULL `b`.
     fn agg_engine() -> Arc<dyn TableEngine> {
-        let engine = MemoryEngine::new();
+        let engine = crabgresql_pg_engine::ephemeral_engine();
         let table = test_ok(engine.create_table(TableSchema::in_namespace(
             "t",
             "public",
@@ -3547,7 +3546,7 @@ mod tests {
             let b = b.map(Value::Int4).unwrap_or(Value::Null);
             table.insert(vec![Value::Int4(a), b], &txn);
         }
-        Arc::new(engine)
+        engine
     }
 
     #[test]
@@ -3583,7 +3582,7 @@ mod tests {
 
     #[test]
     fn distinct_aggregates_deduplicate_per_group_and_per_call() -> anyhow::Result<()> {
-        let engine = MemoryEngine::new();
+        let engine = crabgresql_pg_engine::ephemeral_engine();
         let table = engine.create_table(TableSchema::in_namespace(
             "d",
             "public",
@@ -3606,7 +3605,7 @@ mod tests {
                 &txn,
             );
         }
-        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        let engine: Arc<dyn TableEngine> = engine;
         let (_c, rows) = run_rows_on(
             &engine,
             "SELECT g, count(DISTINCT v), sum(DISTINCT v), avg(DISTINCT v), min(DISTINCT v), max(DISTINCT v) FROM d GROUP BY g ORDER BY g",
@@ -3705,7 +3704,7 @@ mod tests {
     fn group_by_null_key_forms_one_group() -> anyhow::Result<()> {
         // Rows with a NULL group key group together (NULL == NULL), distinct from
         // the non-NULL groups. Exercises the hash-grouping NULL path.
-        let engine = MemoryEngine::new();
+        let engine = crabgresql_pg_engine::ephemeral_engine();
         let table = engine.create_table(TableSchema::in_namespace(
             "g",
             "public",
@@ -3719,7 +3718,7 @@ mod tests {
             let k = k.map(Value::Int4).unwrap_or(Value::Null);
             table.insert(vec![k, Value::Int4(v)], &txn);
         }
-        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        let engine: Arc<dyn TableEngine> = engine;
         // ORDER BY k with NULLS LAST-for-ASC (PG default) so the row order is fixed.
         let (_c, rows) = run_rows_on(
             &engine,
@@ -3740,7 +3739,7 @@ mod tests {
     fn group_by_float_treats_neg_zero_and_nan_like_pg() -> anyhow::Result<()> {
         // -0.0 groups with 0.0, and NaN groups with NaN — the hash and keys_equal
         // must agree on both. Two 0.0-family rows, two NaN rows.
-        let engine = MemoryEngine::new();
+        let engine = crabgresql_pg_engine::ephemeral_engine();
         let table = engine.create_table(TableSchema::in_namespace(
             "f",
             "public",
@@ -3750,7 +3749,7 @@ mod tests {
         for x in [0.0_f64, -0.0, f64::NAN, f64::NAN] {
             table.insert(vec![Value::Float8(x)], &txn);
         }
-        let engine: Arc<dyn TableEngine> = Arc::new(engine);
+        let engine: Arc<dyn TableEngine> = engine;
         let (_c, rows) = run_rows_on(&engine, "SELECT count(*) FROM f GROUP BY x");
         // Exactly two groups (the 0.0 family and the NaN family), each of size 2.
         let mut counts: Vec<Value> = rows.into_iter().map(|r| r[0].clone()).collect();
@@ -3793,7 +3792,7 @@ mod tests {
     /// Drain a query, returning the first runtime error (SRF errors surface on
     /// the first `next()`, not at plan time).
     fn run_err(sql: &str) -> ExecError {
-        let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
+        let engine: Arc<dyn TableEngine> = crabgresql_pg_engine::ephemeral_engine();
         let stmts = test_ok(crabgresql_parser::parse(sql));
         let crabgresql_parser::ast::Statement::Query(query) = &stmts[0] else {
             panic!("expected a query");
@@ -4067,7 +4066,7 @@ mod tests {
 
     /// A `nums(n int4)` table seeded with 1, 2, 3.
     fn engine_with_nums() -> Arc<dyn TableEngine> {
-        let engine: Arc<dyn TableEngine> = Arc::new(MemoryEngine::new());
+        let engine: Arc<dyn TableEngine> = crabgresql_pg_engine::ephemeral_engine();
         let table = test_ok(engine.create_table(TableSchema::in_namespace(
             "nums",
             "public",

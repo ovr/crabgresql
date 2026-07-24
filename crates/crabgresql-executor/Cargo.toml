@@ -17,5 +17,5 @@ crabgresql-types.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-crabgresql-memory-storage.workspace = true
 crabgresql-parser.workspace = true
+crabgresql-pg-engine = { workspace = true, features = ["test-support"] }

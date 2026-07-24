@@ -66,8 +66,7 @@ Index AM API from PG 12+); concrete engines are separate crates. The first two:
 
 | Crate | Role |
 |---|---|
-| `crabgresql-pg-engine` | Default engine: durable, PG semantics 1:1 |
-| `crabgresql-memory-storage` | In-memory engine: reference implementation of the API, tests, ephemeral tables; lets us run M0/M1 before pg-engine is ready |
+| `crabgresql-pg-engine` | The engine: durable heap (PG semantics 1:1), plus RAM-backed **memory tables** (`UNLOGGED`/`TEMP`) that skip the WAL |
 
 API boundaries (`crabgresql-storage-api`):
 
@@ -94,8 +93,8 @@ Contract with the core:
   engine can store versions however it likes (e.g. in-memory version chains)
   while pg-engine keeps them in tuple headers.
 - **WAL is a core service** (like resource managers in PG): an engine registers
-  its record types and redo handlers. `crabgresql-memory-storage` simply does
-  not write WAL (its tables are effectively UNLOGGED). The core contract is the
+  its record types and redo handlers. A **memory table** (`UNLOGGED`/`TEMP`)
+  simply does not write WAL — its pages live in RAM. The core contract is the
   **write-ahead rule**: a dirty data page stamped with LSN `L` may not be written
   back to its file until the WAL is flushed up to `L` (`Wal::flushed_lsn() >= L`);
   the buffer pool enforces it by flushing WAL before evicting a dirty page, and a
@@ -198,12 +197,12 @@ Components:
                     │ SSI, locks  │    │  engines)           │
                     └──────┬──────┘    └──┬───────────┬──────┘
                            │      ┌───────▼─────┐ ┌───▼──────────────┐
-                           │      │ pg-engine:  │ │ memory-storage:  │
-                           │      │ heap 8KB,   │ │ in-memory        │
-                           │      │ buffer pool,│ │ version chains,  │
-                           │      │ B-tree,TOAST│ │ no WAL           │
-                           │      └───────┬─────┘ └──────────────────┘
-                    ┌──────▼──────────────▼──────────────────┐
+                           │      │ pg-engine:  │ │ memory tables:   │
+                           │      │ heap 8KB,   │ │ same heap AM,    │
+                           │      │ buffer pool,│ │ RAM-backed pages,│
+                           │      │ B-tree,TOAST│ │ no WAL (UNLOGGED)│
+                           │      └───────┬─────┘ └────────┬─────────┘
+                    ┌──────▼──────────────▼───────────────▼──┐
                     │  WAL (core service, rmgr model):       │
                     │  append, group commit, fsync;          │
                     │  checkpointer; crash recovery (redo)   │
@@ -256,7 +255,6 @@ crates/
   crabgresql-wal             # WAL append/replay, rmgr registry, checkpointer, recovery
   crabgresql-storage-api     # TableEngine/TableAm/IndexAm traits, Tid, TupleStream
   crabgresql-pg-engine       # default engine: 8KB heap, buffer pool, B-tree, TOAST
-  crabgresql-memory-storage  # in-memory engine: API reference, tests, ephemeral
   crabgresql-plpgsql         # PL/pgSQL parser + interpreter
   crabgresql-server          # session, GUCs, wiring it all together; bin: crabgresql
   crabgresql-pg-regress      # pg_regress-style runner; diff tests against PG
@@ -290,9 +288,9 @@ ourselves anything that is not visible through SQL:
 ## 6. Roadmap
 
 - **M0 — Hello, psql** (protocol): pgwire, auth, `SELECT 1`, simple query
-  execution on `crabgresql-memory-storage`, error messages. Check: psql works,
+  execution on an in-memory table, error messages. Check: psql works,
   pgbench -i fails meaningfully.
-- **M1 — CRUD + catalog**: storage-api + the memory engine in full,
+- **M1 — CRUD + catalog**: storage-api + the heap engine in full,
   CREATE TABLE/INSERT/SELECT/UPDATE/DELETE, pg_catalog, the
   int/text/bool/numeric/timestamptz types, `\d` works in psql. `pg-engine`
   development starts in parallel.
@@ -313,7 +311,7 @@ ourselves anything that is not visible through SQL:
 | Topology | Single-node until M5; distributed as a separate layer later |
 | Parity version | **PostgreSQL 19**: grammar, catalogs, behavior, regression tests |
 | Parser | sqlparser-rs (Apache), PG dialect; gaps closed via upstream PRs |
-| Storage | Pluggable engines via `crabgresql-storage-api`; default `crabgresql-pg-engine`, reference `crabgresql-memory-storage` |
+| Storage | `crabgresql-pg-engine` behind the pluggable `crabgresql-storage-api`; durable heap tables plus RAM-backed memory tables (`UNLOGGED`/`TEMP`) |
 | Isolation | PG semantics ported 1:1 (RC/EvalPlanQual, RR=SI, SSI) |
 | Executor | Volcano first, vectorization as opt-in later |
 | Concurrency | tokio + threads, shared-everything |

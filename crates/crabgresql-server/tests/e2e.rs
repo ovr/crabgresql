@@ -3,10 +3,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::sync::Arc;
-
 use anyhow::Context as _;
-use crabgresql_memory_storage::MemoryEngine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
@@ -20,10 +17,14 @@ async fn spawn_server() -> u16 {
         Ok(address) => address.port(),
         Err(error) => panic!("failed to read test server address: {error}"),
     };
-    tokio::spawn(crabgresql_server::serve(
-        listener,
-        Arc::new(MemoryEngine::new()),
-    ));
+    // Each test server gets its own throwaway data directory, so runs are
+    // isolated. The dir is leaked to keep it alive for the spawned server's whole
+    // lifetime (the OS reclaims it after the test process exits).
+    let dir = tempfile::tempdir().expect("create temp data dir");
+    let (engine, txnmgr) =
+        crabgresql_server::open_pg_engine(dir.path()).expect("open test engine");
+    std::mem::forget(dir);
+    tokio::spawn(crabgresql_server::serve_with(listener, engine, txnmgr));
     port
 }
 
@@ -3062,7 +3063,8 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
         .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
         .await?;
 
-    // An equality on the PRIMARY KEY chooses an index scan.
+    // An equality on the PRIMARY KEY chooses an index scan (the durable heap engine
+    // builds a physical B-tree for the PK).
     let plan = client
         .simple_query("EXPLAIN SELECT * FROM t WHERE id = 2")
         .await?;
@@ -3097,6 +3099,95 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
             .code(),
         &tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED
     );
+
+    Ok(())
+}
+
+/// A session cannot reach another session's temp tables by qualifying with the
+/// other backend's `pg_temp_N` namespace — temp tables all live in the one shared
+/// engine now, so this guards the isolation the old per-session engine gave for
+/// free.
+#[tokio::test]
+async fn temp_tables_are_not_reachable_across_sessions() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let a = connect(port).await;
+    a.simple_query("CREATE TEMP TABLE secret (x int)").await?;
+    a.simple_query("INSERT INTO secret VALUES (42)").await?;
+    // Learn A's temp namespace (pg_temp_N) from information_schema.
+    let ns = a
+        .simple_query("SELECT table_schema FROM information_schema.tables WHERE table_name = 'secret'")
+        .await?;
+    let a_temp_schema = rows(&ns)[0].get("table_schema").unwrap().to_string();
+    assert!(a_temp_schema.starts_with("pg_temp_"));
+
+    // A second session must not read, write, or drop A's temp table by qualifier.
+    let b = connect(port).await;
+    for stmt in [
+        format!("SELECT * FROM {a_temp_schema}.secret"),
+        format!("INSERT INTO {a_temp_schema}.secret VALUES (99)"),
+        format!("DROP TABLE {a_temp_schema}.secret"),
+    ] {
+        let err = b.simple_query(&stmt).await.unwrap_err();
+        assert_eq!(
+            err.as_db_error().expect("db error").code(),
+            &tokio_postgres::error::SqlState::UNDEFINED_TABLE,
+            "cross-session access should be rejected: {stmt}"
+        );
+    }
+    // A's data is intact.
+    let still = a.simple_query("SELECT x FROM secret").await?;
+    assert_eq!(rows(&still)[0].get("x"), Some("42"));
+
+    Ok(())
+}
+
+/// `CREATE UNLOGGED TABLE ... AS SELECT` must also produce a memory table
+/// (`relpersistence = 'u'`), not silently fall back to a durable Permanent heap.
+#[tokio::test]
+async fn unlogged_create_table_as_is_a_memory_table() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE src (id int4)").await?;
+    client.simple_query("INSERT INTO src VALUES (1), (2)").await?;
+    client
+        .simple_query("CREATE UNLOGGED TABLE u AS SELECT * FROM src")
+        .await?;
+    let reflected = client
+        .simple_query("SELECT relpersistence FROM pg_class WHERE relname = 'u'")
+        .await?;
+    assert_eq!(rows(&reflected)[0].get("relpersistence"), Some("u"));
+    Ok(())
+}
+
+/// `CREATE UNLOGGED TABLE` makes a RAM-backed memory table: it reads and writes
+/// like any table, reflects `relpersistence = 'u'` in `pg_class`, and (like PG's
+/// UNLOGGED) its rows do not survive a crash — here, the run just proves the CRUD
+/// path and the catalog reflection.
+#[tokio::test]
+async fn unlogged_table_is_a_memory_table() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE UNLOGGED TABLE u (id int4, label text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO u VALUES (1, 'one'), (2, 'two')")
+        .await?;
+    let selected = client
+        .simple_query("SELECT label FROM u ORDER BY id")
+        .await?;
+    let labels = rows(&selected);
+    assert_eq!(labels[0].get("label"), Some("one"));
+    assert_eq!(labels[1].get("label"), Some("two"));
+
+    // Reflected as an unlogged relation, distinct from a permanent one.
+    client.simple_query("CREATE TABLE p (id int4)").await?;
+    let unlogged = client
+        .simple_query("SELECT relpersistence FROM pg_class WHERE relname = 'u'")
+        .await?;
+    assert_eq!(rows(&unlogged)[0].get("relpersistence"), Some("u"));
+    let permanent = client
+        .simple_query("SELECT relpersistence FROM pg_class WHERE relname = 'p'")
+        .await?;
+    assert_eq!(rows(&permanent)[0].get("relpersistence"), Some("p"));
 
     Ok(())
 }

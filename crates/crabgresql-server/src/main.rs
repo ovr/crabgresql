@@ -1,11 +1,10 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
-use crabgresql_memory_storage::MemoryEngine;
-use crabgresql_storage_api::TableEngine;
-use crabgresql_txn::TransactionManager;
 use tokio::net::TcpListener;
+
+/// Data directory used when neither `--data-dir` nor `PGDATA` is given.
+const DEFAULT_DATA_DIR: &str = "./pgdata";
 
 /// crabgresql — a PostgreSQL-compatible server.
 #[derive(Parser)]
@@ -16,11 +15,10 @@ struct Cli {
     #[arg(long, short = 'p', env = "CRABGRESQL_PORT", default_value_t = 5433)]
     port: u16,
 
-    /// Data directory (PGDATA). When set, the durable heap engine is used and
-    /// crash recovery runs at startup; when omitted, tables live in memory and
-    /// are lost on exit.
-    #[arg(long = "data-dir", short = 'D', env = "PGDATA")]
-    data_dir: Option<PathBuf>,
+    /// Data directory (PGDATA). The durable heap engine is opened here and crash
+    /// recovery runs at startup. Defaults to `./pgdata` when omitted.
+    #[arg(long = "data-dir", short = 'D', env = "PGDATA", default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -33,22 +31,11 @@ async fn main() -> std::io::Result<()> {
 
     let cli = Cli::parse();
 
-    let (engine, txnmgr): (Arc<dyn TableEngine>, Arc<TransactionManager>) = match &cli.data_dir {
-        Some(dir) => {
-            tracing::info!(
-                "opening durable heap engine at {} (running recovery)",
-                dir.display()
-            );
-            crabgresql_server::open_pg_engine(dir)?
-        }
-        None => {
-            tracing::info!("no --data-dir: using the in-memory engine (data is not persisted)");
-            (
-                Arc::new(MemoryEngine::new()),
-                Arc::new(TransactionManager::new()),
-            )
-        }
-    };
+    tracing::info!(
+        "opening durable heap engine at {} (running recovery)",
+        cli.data_dir.display()
+    );
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(&cli.data_dir)?;
 
     let listener = TcpListener::bind(("127.0.0.1", cli.port)).await?;
     tracing::info!(

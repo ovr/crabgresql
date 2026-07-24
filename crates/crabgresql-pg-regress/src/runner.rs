@@ -5,10 +5,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-use crabgresql_memory_storage::MemoryEngine;
 use similar::TextDiff;
 use tokio::net::TcpListener;
 
@@ -54,10 +52,11 @@ impl SuiteReport {
 pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
-    let server = tokio::spawn(crabgresql_server::serve(
-        listener,
-        Arc::new(MemoryEngine::new()),
-    ));
+    // The whole suite runs against one durable pg-engine over a throwaway data
+    // directory (kept alive until this function returns, past `server.abort()`).
+    let data_dir = tempfile::tempdir()?;
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(data_dir.path())?;
+    let server = tokio::spawn(crabgresql_server::serve_with(listener, engine, txnmgr));
 
     let results_dir = config.outdir.join("results");
     std::fs::create_dir_all(&results_dir)?;

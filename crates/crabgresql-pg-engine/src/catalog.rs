@@ -11,8 +11,8 @@ use std::sync::Mutex;
 
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
-    PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, SequenceAdvance,
-    SequenceDefinition, TableSchema, ViewDefinition,
+    PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
+    SequenceAdvance, SequenceDefinition, TableSchema, ViewDefinition,
 };
 use crabgresql_types::{PgType, oid};
 
@@ -77,6 +77,10 @@ struct PersistRel {
     rel: u32,
     cols: Vec<PersistCol>,
     indexes: Vec<PersistIndex>,
+    /// How the relation is stored. A memory table (`Unlogged`/`Temporary`) is held
+    /// in the in-memory `State` for name resolution during this run but is
+    /// **excluded from [`encode`]** — it never persists and so is gone on restart.
+    persistence: RelPersistence,
     /// `Some` on a partitioned (parent) table: its partition key.
     partition_scheme: Option<PartitionScheme>,
     /// `Some` on a leaf partition: its parent and bound.
@@ -185,6 +189,7 @@ impl RelCatalog {
                         name: r.name.clone(),
                         namespace: r.namespace.clone(),
                         columns,
+                        persistence: r.persistence,
                         partition_scheme: r.partition_scheme.clone(),
                         partition_of: r.partition_of.clone(),
                     },
@@ -233,6 +238,7 @@ impl RelCatalog {
                 })
                 .collect(),
             indexes: Vec::new(),
+            persistence: schema.persistence,
             partition_scheme: schema.partition_scheme.clone(),
             partition_of: schema.partition_of.clone(),
         });
@@ -256,8 +262,14 @@ impl RelCatalog {
         else {
             return Ok(None);
         };
-        let rel = state.rels.remove(pos).rel;
-        self.persist(&state)?;
+        let removed = state.rels.remove(pos);
+        let rel = removed.rel;
+        // A memory table is excluded from `encode`, so removing it leaves the
+        // on-disk catalog byte-identical — skip the whole rewrite + fsync (this
+        // fires on every temp table at disconnect). Permanent tables still persist.
+        if !removed.persistence.is_memory() {
+            self.persist(&state)?;
+        }
         Ok(Some(RelFileNode(rel)))
     }
 
@@ -325,6 +337,7 @@ impl RelCatalog {
     /// `Some(new)` without rewriting the file.
     pub fn swap_relfilenode(
         &self,
+        namespace: &str,
         table: &str,
         new: RelFileNode,
     ) -> std::io::Result<Option<RelFileNode>> {
@@ -335,7 +348,7 @@ impl RelCatalog {
         let Some(rel) = state
             .rels
             .iter_mut()
-            .find(|r| r.namespace == "public" && r.name == table)
+            .find(|r| r.namespace == namespace && r.name == table)
         else {
             return Ok(None);
         };
@@ -344,10 +357,17 @@ impl RelCatalog {
             return Ok(Some(new));
         }
         rel.rel = new.0;
+        // A memory table (UNLOGGED/TEMP) is excluded from `encode`, so persisting
+        // here would rewrite + fsync the whole catalog to produce identical bytes.
+        // Update the in-memory relfilenode (so a later DROP unlinks the right RAM
+        // rel) but skip the disk write entirely.
+        let is_memory = rel.persistence.is_memory();
         // Keep `next` above the swapped-in id even if it was allocated on a
         // previous boot and the counter was rebuilt from an older catalog file.
         state.next = state.next.max(new.0 + 1);
-        self.persist(&state)?;
+        if !is_memory {
+            self.persist(&state)?;
+        }
         Ok(Some(RelFileNode(old)))
     }
 
@@ -733,9 +753,19 @@ fn put_i64(out: &mut Vec<u8>, v: i64) {
 
 fn encode(state: &State) -> Vec<u8> {
     let mut out = Vec::new();
+    // Memory tables (UNLOGGED/TEMP) never persist: they live only in the in-memory
+    // `State` for this run's name resolution. Every rels section below iterates
+    // this filtered list so the positional tails (namespaces, partitioning) stay
+    // aligned. `next` is still written verbatim, so a memory relfilenode is never
+    // reused after restart even though its record is dropped.
+    let rels: Vec<&PersistRel> = state
+        .rels
+        .iter()
+        .filter(|r| !r.persistence.is_memory())
+        .collect();
     out.extend_from_slice(&state.next.to_le_bytes());
-    out.extend_from_slice(&(state.rels.len() as u32).to_le_bytes());
-    for r in &state.rels {
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
         out.extend_from_slice(&r.rel.to_le_bytes());
         put_str(&mut out, &r.name);
         out.extend_from_slice(&(r.cols.len() as u32).to_le_bytes());
@@ -749,8 +779,8 @@ fn encode(state: &State) -> Vec<u8> {
     // relation records and ignore this tail; new readers default metadata when
     // the magic is absent.
     out.extend_from_slice(META_MAGIC);
-    out.extend_from_slice(&(state.rels.len() as u32).to_le_bytes());
-    for r in &state.rels {
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
         out.extend_from_slice(&r.rel.to_le_bytes());
         out.extend_from_slice(&(r.cols.len() as u32).to_le_bytes());
         for c in &r.cols {
@@ -830,8 +860,8 @@ fn encode(state: &State) -> Vec<u8> {
         put_str(&mut out, name);
         out.extend_from_slice(&oid.to_le_bytes());
     }
-    out.extend_from_slice(&(state.rels.len() as u32).to_le_bytes());
-    for r in &state.rels {
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
         put_str(&mut out, &r.namespace);
     }
     out.extend_from_slice(&(state.views.len() as u32).to_le_bytes());
@@ -847,8 +877,8 @@ fn encode(state: &State) -> Vec<u8> {
     // reader that predates partitioning stops above and treats every relation as
     // unpartitioned.
     out.extend_from_slice(PART_MAGIC);
-    out.extend_from_slice(&(state.rels.len() as u32).to_le_bytes());
-    for r in &state.rels {
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
         match &r.partition_scheme {
             Some(scheme) => {
                 out.push(1);
@@ -882,8 +912,8 @@ fn encode(state: &State) -> Vec<u8> {
     // each index's physical B-tree relfilenode, zipped back onto the metadata
     // decoded from the CRM1 block. Absent in a pre-B-tree file (all `rel = 0`).
     out.extend_from_slice(IDXR_MAGIC);
-    out.extend_from_slice(&(state.rels.len() as u32).to_le_bytes());
-    for r in &state.rels {
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
         out.extend_from_slice(&(r.indexes.len() as u32).to_le_bytes());
         for pi in &r.indexes {
             out.extend_from_slice(&pi.rel.to_le_bytes());
@@ -1002,6 +1032,8 @@ fn decode(bytes: &[u8]) -> State {
             rel,
             cols,
             indexes: Vec::new(),
+            // Anything on disk is a durable heap: memory tables are never persisted.
+            persistence: RelPersistence::Permanent,
             // Default to unpartitioned; overridden below from the PART1 tail.
             partition_scheme: None,
             partition_of: None,

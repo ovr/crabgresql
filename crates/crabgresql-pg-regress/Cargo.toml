@@ -13,9 +13,9 @@ path = "src/bin/regress.rs"
 
 [dependencies]
 clap.workspace = true
-crabgresql-memory-storage.workspace = true
 crabgresql-server.workspace = true
 similar.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
