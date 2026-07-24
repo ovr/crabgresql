@@ -101,14 +101,14 @@ pub enum PhysicalPlan {
         tables: Vec<Arc<dyn TableAm>>,
         columns: Vec<OutputColumn>,
     },
-    /// Concatenation of two sub-plans (a `UNION ALL` body). Mirrors
-    /// [`LogicalPlan::SetOp`]: the executor drains `left` then `right` into one
-    /// row stream. `UNION` deduplication and top-level ORDER BY are applied by a
-    /// wrapping [`Self::Subquery`], so this node carries no tail of its own.
+    /// A `UNION` / `UNION ALL`. Mirrors [`LogicalPlan::SetOp`]: the executor
+    /// drains each arm into one row stream, coercing arms that need it, then
+    /// applies this node's own deduplication and sort.
     SetOp {
-        left: Box<PhysicalPlan>,
-        right: Box<PhysicalPlan>,
+        arms: Vec<PhysicalSetOpArm>,
         columns: Vec<OutputColumn>,
+        sort: Vec<SortKey>,
+        distinct: Option<Vec<DistinctKey>>,
     },
     /// LIMIT/OFFSET above a source plan (after its sort). Mirrors
     /// [`LogicalPlan::Limit`].
@@ -142,6 +142,14 @@ pub enum PhysicalPlan {
         /// (see [`LogicalPlan::Delete`]); `None` for an ordinary table.
         routing: Option<Vec<Arc<dyn TableAm>>>,
     },
+}
+
+/// One arm of a [`PhysicalPlan::SetOp`], mirroring [`SetOpArm`].
+pub struct PhysicalSetOpArm {
+    pub plan: PhysicalPlan,
+    /// Projections mapping this arm onto the set operation's output layout;
+    /// `None` when it already emits that layout.
+    pub coercion: Option<Vec<BoundExpr>>,
 }
 
 /// The rows an INSERT writes, mirroring [`InsertSource`] with the query source's
@@ -429,13 +437,21 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
         },
         LogicalPlan::Append { tables, columns } => PhysicalPlan::Append { tables, columns },
         LogicalPlan::SetOp {
-            left,
-            right,
+            arms,
             columns,
+            sort,
+            distinct,
         } => PhysicalPlan::SetOp {
-            left: Box::new(plan(*left)),
-            right: Box::new(plan(*right)),
+            arms: arms
+                .into_iter()
+                .map(|arm| PhysicalSetOpArm {
+                    plan: plan(arm.plan),
+                    coercion: arm.coercion,
+                })
+                .collect(),
             columns,
+            sort,
+            distinct,
         },
         LogicalPlan::Subquery {
             source,
@@ -781,17 +797,28 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             }
             lines
         }
-        PhysicalPlan::SetOp { left, right, .. } => {
-            // A UNION [ALL] renders like PG's Append: one child sub-plan per arm,
-            // each indented under a `->` lead (multi-line children align their
-            // continuation lines under the first).
+        PhysicalPlan::SetOp {
+            arms,
+            sort,
+            distinct,
+            ..
+        } => {
+            // As in PG: an Append over the arms, with the deduplication and the
+            // sort shown above it — so a `UNION` is distinguishable from a
+            // `UNION ALL`, and the cost of each step is visible.
             let mut lines = vec!["Append".to_string()];
-            for child in [left.as_ref(), right.as_ref()] {
-                let mut child_lines = explain(child).into_iter();
+            for arm in arms {
+                let mut child_lines = explain(&arm.plan).into_iter();
                 if let Some(first) = child_lines.next() {
                     lines.push(format!("  ->  {first}"));
                     lines.extend(child_lines.map(|l| format!("      {l}")));
                 }
+            }
+            if distinct.is_some() {
+                lines = nest_under("HashAggregate", lines);
+            }
+            if !sort.is_empty() {
+                lines = nest_under("Sort", lines);
             }
             lines
         }
@@ -816,6 +843,18 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::Update { table, .. } => vec![format!("Update on {}", table.schema().name)],
         PhysicalPlan::Delete { table, .. } => vec![format!("Delete on {}", table.schema().name)],
     }
+}
+
+/// Put `child` under a new parent node, indenting it beneath a `->` lead the way
+/// PG renders a single-child plan node.
+fn nest_under(parent: &str, child: Vec<String>) -> Vec<String> {
+    let mut lines = vec![parent.to_string()];
+    let mut child = child.into_iter();
+    if let Some(first) = child.next() {
+        lines.push(format!("  ->  {first}"));
+        lines.extend(child.map(|l| format!("      {l}")));
+    }
+    lines
 }
 
 /// Minimal expression rendering for `EXPLAIN` conditions: enough to show a
@@ -1441,27 +1480,59 @@ mod tests {
         );
     }
 
+    /// A three-armed set operation with the given tail, for EXPLAIN tests.
+    fn setop_plan(sort: Vec<SortKey>, distinct: Option<Vec<DistinctKey>>) -> PhysicalPlan {
+        let columns = vec![OutputColumn {
+            name: "id".into(),
+            ty: PgType::Int4,
+        }];
+        PhysicalPlan::SetOp {
+            arms: (0..3)
+                .map(|_| PhysicalSetOpArm {
+                    plan: plan_sql("SELECT * FROM t"),
+                    coercion: None,
+                })
+                .collect(),
+            columns,
+            sort,
+            distinct,
+        }
+    }
+
     #[test]
-    fn explain_setop_renders_as_append_over_both_arms() {
-        // A UNION [ALL] renders like PG's Append, with one child sub-plan per arm.
-        let arm = || {
-            Box::new(plan_sql("SELECT * FROM t")) as Box<PhysicalPlan>
-        };
-        let plan = PhysicalPlan::SetOp {
-            left: arm(),
-            right: arm(),
-            columns: vec![OutputColumn {
-                name: "id".into(),
-                ty: PgType::Int4,
-            }],
-        };
-        let lines = explain(&plan);
+    fn explain_union_all_renders_as_append_over_every_arm() {
+        let lines = explain(&setop_plan(Vec::new(), None));
         assert_eq!(lines[0], "Append");
         assert_eq!(
             lines.iter().filter(|l| l.starts_with("  ->  ")).count(),
-            2,
+            3,
             "expected one child lead per arm, got: {lines:?}"
         );
+    }
+
+    #[test]
+    fn explain_shows_the_dedup_and_sort_above_the_append() {
+        // A UNION must be distinguishable from a UNION ALL, and the cost of
+        // deduplicating and sorting visible — as in PG's Sort/HashAggregate/Append.
+        let distinct = Some(vec![DistinctKey {
+            column: 0,
+            ty: PgType::Int4,
+        }]);
+        let sort = vec![SortKey {
+            column: 0,
+            ty: PgType::Int4,
+            asc: true,
+            nulls_first: false,
+        }];
+        assert_eq!(explain(&setop_plan(Vec::new(), distinct.clone()))[0..2], [
+            "HashAggregate".to_string(),
+            "  ->  Append".to_string()
+        ]);
+        assert_eq!(explain(&setop_plan(sort, distinct))[0..3], [
+            "Sort".to_string(),
+            "  ->  HashAggregate".to_string(),
+            "        ->  Append".to_string()
+        ]);
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub const RESERVED_NAME: &str = "42939";
 /// that renames, drops, or retypes an existing view column).
 pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
+/// `54001` — a statement nests too deeply to bind or execute safely (PG reports
+/// this as "stack depth limit exceeded").
+pub const STATEMENT_TOO_COMPLEX: &str = "54001";
 pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
 pub const PROTOCOL_VIOLATION: &str = "08P01";
 /// `26000` — a Bind/Describe names a prepared statement that does not exist.

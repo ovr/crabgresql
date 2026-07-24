@@ -230,23 +230,32 @@ pub fn execute(
             })
         }
         PhysicalPlan::SetOp {
-            left,
-            right,
+            arms,
             columns,
+            sort,
+            distinct,
         } => {
-            // A UNION [ALL] body: run each arm and concatenate the two streams.
-            // Deduplication (UNION) and ORDER BY live on the wrapping Subquery,
-            // so this level only concatenates.
-            let Execution::Rows { node: left, .. } = execute(*left, ctx, txn)? else {
-                return Err(ExecError::new("XX000", "UNION arm did not produce a row set"));
-            };
-            let Execution::Rows { node: right, .. } = execute(*right, ctx, txn)? else {
-                return Err(ExecError::new("XX000", "UNION arm did not produce a row set"));
-            };
-            Ok(Execution::Rows {
-                columns,
-                node: Box::new(Concat::new(vec![left, right])),
-            })
+            // A UNION [ALL]: run each arm, coerce the ones whose own column types
+            // differ from the unified output, and concatenate the streams. Then
+            // apply this node's own deduplication (UNION) and ORDER BY.
+            let mut children: Vec<Box<dyn ExecNode>> = Vec::with_capacity(arms.len());
+            for arm in arms {
+                let Execution::Rows { node, .. } = execute(arm.plan, ctx, txn)? else {
+                    return Err(ExecError::new("XX000", "UNION arm did not produce a row set"));
+                };
+                children.push(match arm.coercion {
+                    Some(projections) => Box::new(Projection::new(node, projections, ctx.clone())),
+                    None => node,
+                });
+            }
+            let node = finish_sort_distinct(
+                Box::new(Concat::new(children)),
+                sort,
+                distinct,
+                columns.len(),
+                &columns,
+            )?;
+            Ok(Execution::Rows { columns, node })
         }
         PhysicalPlan::IndexScan {
             table,
@@ -419,9 +428,13 @@ fn resolve_subqueries(
         // An Append holds only leaf table handles — no subquery expressions.
         PhysicalPlan::Append { .. } => {}
         // A SetOp holds no exprs of its own, but each arm's sub-plan may — recurse.
-        PhysicalPlan::SetOp { left, right, .. } => {
-            resolve_subqueries(left, ctx, txn)?;
-            resolve_subqueries(right, ctx, txn)?;
+        PhysicalPlan::SetOp { arms, .. } => {
+            for arm in arms.iter_mut() {
+                resolve_subqueries(&mut arm.plan, ctx, txn)?;
+                if let Some(coercion) = &mut arm.coercion {
+                    resolve_exprs(coercion, ctx, txn)?;
+                }
+            }
         }
         PhysicalPlan::IndexScan {
             key,
