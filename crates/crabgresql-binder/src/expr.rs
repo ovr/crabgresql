@@ -2954,6 +2954,45 @@ fn bind_binary(
     op_span: Span,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
+    // `a OPERATOR(schema.op) b` — PG's explicit-schema operator spelling. Only the
+    // bare `op` or a `pg_catalog`-qualified name refers to a built-in operator; map
+    // the symbol back to its native `BinaryOperator` and recurse so it reaches the
+    // exact same path as the bare spelling (e.g. `~` -> `bind_regex`).
+    if let ast::BinaryOperator::PGCustomBinaryOperator(parts) = op {
+        let symbol = match parts.as_slice() {
+            [sym] => sym.as_str(),
+            [schema, sym] if schema.eq_ignore_ascii_case("pg_catalog") => sym.as_str(),
+            _ => return Err(custom_op_undefined(left, op, right, scope)),
+        };
+        let native = match symbol {
+            "~" => ast::BinaryOperator::PGRegexMatch,
+            "~*" => ast::BinaryOperator::PGRegexIMatch,
+            "!~" => ast::BinaryOperator::PGRegexNotMatch,
+            "!~*" => ast::BinaryOperator::PGRegexNotIMatch,
+            "~~" => ast::BinaryOperator::PGLikeMatch,
+            "~~*" => ast::BinaryOperator::PGILikeMatch,
+            "!~~" => ast::BinaryOperator::PGNotLikeMatch,
+            "!~~*" => ast::BinaryOperator::PGNotILikeMatch,
+            "=" => ast::BinaryOperator::Eq,
+            "<>" => ast::BinaryOperator::NotEq,
+            "<" => ast::BinaryOperator::Lt,
+            "<=" => ast::BinaryOperator::LtEq,
+            ">" => ast::BinaryOperator::Gt,
+            ">=" => ast::BinaryOperator::GtEq,
+            "||" => ast::BinaryOperator::StringConcat,
+            "+" => ast::BinaryOperator::Plus,
+            "-" => ast::BinaryOperator::Minus,
+            "*" => ast::BinaryOperator::Multiply,
+            "/" => ast::BinaryOperator::Divide,
+            "%" => ast::BinaryOperator::Modulo,
+            "^" => ast::BinaryOperator::PGExp,
+            "@>" => ast::BinaryOperator::AtArrow,
+            "<@" => ast::BinaryOperator::ArrowAt,
+            "&&" => ast::BinaryOperator::PGOverlap,
+            _ => return Err(custom_op_undefined(left, op, right, scope)),
+        };
+        return bind_binary(left, &native, right, op_span, scope);
+    }
     // `||` is not a `BinOp`; PG's `textcat`/`anytextcat` lower to a text concat,
     // and `bitcat` to a bit-string concat when either side is a bit string.
     if matches!(op, ast::BinaryOperator::StringConcat) {
@@ -3511,6 +3550,33 @@ fn net_no_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> Bind
             operand_name(rb)
         ),
     )
+}
+
+/// 42883 for an `OPERATOR(schema.op)` spelling that names no built-in operator
+/// (non-`pg_catalog` schema, or an unrecognized symbol). Binds the operands only
+/// on this error path — so the normal path is never double-bound — to name their
+/// types, mirroring PG's message; the original `op` renders as `OPERATOR(...)`.
+fn custom_op_undefined(
+    left: &ast::Expr,
+    op: &ast::BinaryOperator,
+    right: &ast::Expr,
+    scope: &Scope,
+) -> BindError {
+    let names = (|| {
+        let lb = bind_expr(left, scope)?;
+        let rb = bind_expr(right, scope)?;
+        Ok::<_, BindError>((operand_name(&lb), operand_name(&rb)))
+    })();
+    let (l, r) = names.unwrap_or(("?", "?"));
+    BindError::new(
+        sqlstate::UNDEFINED_FUNCTION,
+        format!("operator does not exist: {l} {op} {r}"),
+    )
+    .with_hint(Some(
+        "No operator matches the given name and argument types. \
+         You might need to add explicit type casts."
+            .to_string(),
+    ))
 }
 
 /// Materialize a network operand: a typed inet/cidr as is (both read through
