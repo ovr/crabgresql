@@ -859,6 +859,89 @@ async fn regex_and_similar_to_operators() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    // `OPERATOR(pg_catalog.op)` and the bare `OPERATOR(op)` form resolve to the
+    // same built-in operator as the plain spelling: regex, comparison,
+    // arithmetic, exponent, array containment, and inet containment/shift all
+    // route identically.
+    let messages = client
+        .simple_query(
+            "SELECT 'foo' OPERATOR(pg_catalog.~) 'f.o' AS rx, \
+             'foo' OPERATOR(~) 'f.o' AS rx_bare, \
+             1 OPERATOR(pg_catalog.=) 1 AS eq, \
+             (1 OPERATOR(pg_catalog.+) 2) AS sum, \
+             (2 OPERATOR(pg_catalog.^) 3) AS pow, \
+             '{1,2}'::int[] OPERATOR(pg_catalog.@>) '{1}'::int[] AS contains, \
+             inet '10.0.0.0/8' OPERATOR(pg_catalog.>>) inet '10.1.2.3' AS net_gt, \
+             inet '10.1.2.3' OPERATOR(pg_catalog.<<) inet '10.0.0.0/8' AS net_lt",
+        )
+        .await?;
+    let rows = rows(&messages);
+    let row = rows[0];
+    assert_eq!(row.get(0), Some("t")); // rx
+    assert_eq!(row.get(1), Some("t")); // rx_bare
+    assert_eq!(row.get(2), Some("t")); // eq
+    assert_eq!(row.get(3), Some("3")); // sum
+    assert_eq!(row.get(4), Some("8")); // pow
+    assert_eq!(row.get(5), Some("t")); // contains
+    assert_eq!(row.get(6), Some("t")); // net_gt (>> handled by resolve_network_op)
+    assert_eq!(row.get(7), Some("t")); // net_lt (<< handled by resolve_network_op)
+
+    // An unrecognized operator symbol is 42883, and the message names the
+    // operator schema-qualified (`pg_catalog.###`) like PG — never wrapped in
+    // `OPERATOR(...)` — with the standard "add explicit type casts" hint.
+    let err = client
+        .simple_query("SELECT 1 OPERATOR(pg_catalog.###) 2")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::UNDEFINED_FUNCTION);
+    assert!(
+        db.message().starts_with("operator does not exist:")
+            && db.message().contains("pg_catalog.###")
+            && !db.message().contains("OPERATOR("),
+        "unexpected message: {}",
+        db.message()
+    );
+    assert_eq!(
+        db.hint(),
+        Some(
+            "No operator matches the given name and argument types. \
+             You might need to add explicit type casts."
+        )
+    );
+
+    // An operand error surfaces first, as PG analyzes operands before resolving
+    // the operator — an undefined column is 42703, not masked as 42883.
+    let err = client
+        .simple_query("SELECT missing_col OPERATOR(pg_catalog.###) 1")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_COLUMN
+    );
+
+    // A non-`pg_catalog` schema qualification never names a built-in operator, so
+    // it is reported as 42883. (Real PG additionally reports 3F000 when the schema
+    // itself does not exist; the schema catalog is not reachable at bind time.)
+    let err = client
+        .simple_query("SELECT 1 OPERATOR(myschema.=) 2")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_FUNCTION
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn hex_string_literals_bind_display_and_cast() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     let messages = client
