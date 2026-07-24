@@ -16,11 +16,12 @@ use crabgresql_types::json::Jsonb;
 use crabgresql_types::jsonpath;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, TimeTz, Value, bit, date, float, geo, interval, json, macaddr, money,
-    net, text, time, timestamp, timestamptz, timetz, to_char,
+    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, geo, interval, json, macaddr,
+    money, net, text, time, timestamp, timestamptz, timetz, to_char,
 };
 
 use crate::ExecError;
+use crate::eval::array_elems;
 
 const RADIANS_PER_DEGREE: f64 = 0.017_453_292_519_943_295;
 
@@ -108,6 +109,34 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         // --- jsonpath (STRICT: any NULL arg already short-circuited to NULL) ---
         ScalarFn::JsonPath(f) => return eval_jsonpath(f, args),
+        // --- array containment / size (STRICT) ---
+        ScalarFn::ArrayContains => return Ok(Value::Bool(array_contains(&args[0], &args[1]))),
+        ScalarFn::ArrayContainedBy => {
+            return Ok(Value::Bool(array_contains(&args[1], &args[0])));
+        }
+        ScalarFn::ArrayOverlap => return Ok(Value::Bool(array_overlap(&args[0], &args[1]))),
+        ScalarFn::ArrayLength => {
+            // `array_length(arr, dim)`: only dimension 1 exists here; an empty
+            // array or any other dimension yields NULL.
+            let elems = array_elems(&args[0]);
+            return Ok(if i4(&args[1]) == 1 && !elems.is_empty() {
+                Value::Int4(elems.len() as i32)
+            } else {
+                Value::Null
+            });
+        }
+        ScalarFn::Cardinality => {
+            return Ok(Value::Int4(array_elems(&args[0]).len() as i32));
+        }
+        // array_cat/append/prepend are non-strict and need the result element
+        // type, so `eval` dispatches them before this pure evaluator; reaching
+        // here is an internal wiring error.
+        ScalarFn::ArrayCat | ScalarFn::ArrayAppend | ScalarFn::ArrayPrepend => {
+            return Err(ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                "array constructor function reached the pure scalar evaluator",
+            ));
+        }
         // --- string functions ---
         ScalarFn::TextConcat => {
             return Ok(Value::Text(format!("{}{}", text(&args[0]), text(&args[1]))));
@@ -1538,6 +1567,40 @@ fn money_of(v: &Value) -> i64 {
         Value::Money(c) => *c,
         other => unreachable!("expected money arg, got {other:?}"),
     }
+}
+
+/// Element equality for array containment/overlap. PG's `array_contain_compare`
+/// treats a NULL element as matching nothing (a NULL is never "contained", even
+/// by another NULL), so any NULL operand is unequal; two non-NULLs use the
+/// element type's total order.
+fn elem_eq(elem: PgType, x: &Value, y: &Value) -> bool {
+    !matches!(x, Value::Null)
+        && !matches!(y, Value::Null)
+        && crate::eval::compare_values(elem, x, y) == std::cmp::Ordering::Equal
+}
+
+/// `a @> b`: every element of `b` is present in `a` (element equality). The
+/// element type is read from `a`'s array value.
+fn array_contains(a: &Value, b: &Value) -> bool {
+    let elem = match a {
+        Value::Array { elem, .. } => *elem,
+        _ => unreachable!("array_contains left is not an array"),
+    };
+    let (ae, be) = (array_elems(a), array_elems(b));
+    be.iter()
+        .all(|y| ae.iter().any(|x| elem_eq(elem, x, y)))
+}
+
+/// `a && b`: the arrays share at least one (non-NULL) element.
+fn array_overlap(a: &Value, b: &Value) -> bool {
+    let elem = match a {
+        Value::Array { elem, .. } => *elem,
+        _ => unreachable!("array_overlap left is not an array"),
+    };
+    let (ae, be) = (array_elems(a), array_elems(b));
+    ae.iter().any(|x| {
+        !matches!(x, Value::Null) && be.iter().any(|y| elem_eq(elem, x, y))
+    })
 }
 
 fn cash_err(e: crabgresql_types::money::MoneyError) -> ExecError {

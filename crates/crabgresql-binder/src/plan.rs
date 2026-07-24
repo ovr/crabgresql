@@ -655,6 +655,11 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         BoundExpr::Coerce { expr, .. } => subst_expr(expr, params),
         BoundExpr::Reinterpret { expr, .. } => subst_expr(expr, params),
         BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => subst_exprs(args, params),
+        BoundExpr::ArrayCtor { elems, .. } => subst_exprs(elems, params),
+        BoundExpr::Subscript { base, index, .. } => {
+            subst_expr(base, params);
+            subst_expr(index, params);
+        }
         BoundExpr::Case { whens, else_, .. } => {
             for (cond, result) in whens {
                 subst_expr(cond, params);
@@ -910,6 +915,15 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
                 subst_outer_expr(a, outer, depth);
             }
         }
+        BoundExpr::ArrayCtor { elems, .. } => {
+            for a in elems.iter_mut() {
+                subst_outer_expr(a, outer, depth);
+            }
+        }
+        BoundExpr::Subscript { base, index, .. } => {
+            subst_outer_expr(base, outer, depth);
+            subst_outer_expr(index, outer, depth);
+        }
         BoundExpr::Case { whens, else_, .. } => {
             for (cond, result) in whens {
                 subst_outer_expr(cond, outer, depth);
@@ -1118,6 +1132,10 @@ fn expr_has_outer_ref(expr: &BoundExpr) -> bool {
         }
         BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
             args.iter().any(expr_has_outer_ref)
+        }
+        BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(expr_has_outer_ref),
+        BoundExpr::Subscript { base, index, .. } => {
+            expr_has_outer_ref(base) || expr_has_outer_ref(index)
         }
         BoundExpr::Case { whens, else_, .. } => {
             whens
@@ -1606,11 +1624,20 @@ fn bind_from_item(
             name,
             alias,
             args: Some(fn_args),
+            with_ordinality,
             ..
         } => {
             if fn_args.settings.is_some() {
                 return Err(BindError::feature_not_supported(
                     "table function SETTINGS are not supported yet",
+                ));
+            }
+            // `WITH ORDINALITY` adds a trailing bigint column; unsupported for now
+            // — reject rather than silently drop it (which would return the wrong
+            // number of columns).
+            if *with_ordinality {
+                return Err(BindError::feature_not_supported(
+                    "WITH ORDINALITY is not supported yet",
                 ));
             }
             let fname = object_name_to_table_name(name)?;
@@ -1926,6 +1953,16 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
             func: *func,
             ret: *ret,
             args: args.iter().map(|a| shift_column_refs(a, delta)).collect(),
+        },
+        BoundExpr::ArrayCtor { elem, ty, elems } => BoundExpr::ArrayCtor {
+            elem: *elem,
+            ty: *ty,
+            elems: elems.iter().map(|a| shift_column_refs(a, delta)).collect(),
+        },
+        BoundExpr::Subscript { base, index, ty } => BoundExpr::Subscript {
+            base: Box::new(shift_column_refs(base, delta)),
+            index: Box::new(shift_column_refs(index, delta)),
+            ty: *ty,
         },
         BoundExpr::Aggregate {
             func,
@@ -3338,6 +3375,23 @@ fn rewrite_over_aggregate(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(BoundExpr::FuncCall { func, ret, args })
         }
+        BoundExpr::ArrayCtor { elem, ty, elems } => {
+            let elems = elems
+                .into_iter()
+                .map(|a| rewrite_over_aggregate(a, group_exprs, aggregates, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::ArrayCtor { elem, ty, elems })
+        }
+        BoundExpr::Subscript { base, index, ty } => Ok(BoundExpr::Subscript {
+            base: Box::new(rewrite_over_aggregate(*base, group_exprs, aggregates, scope)?),
+            index: Box::new(rewrite_over_aggregate(
+                *index,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
+            ty,
+        }),
         BoundExpr::Case { whens, else_, ty } => {
             let whens = whens
                 .into_iter()

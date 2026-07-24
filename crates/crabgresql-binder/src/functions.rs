@@ -418,6 +418,27 @@ pub enum ScalarFn {
     /// `[jsonb, jsonpath]` optionally followed by `[vars jsonb, silent bool]`;
     /// the `@?`/`@@` operators pass a `silent = true` 4th arg.
     JsonPath(JsonPathFn),
+
+    // --- array operators / functions (built directly by the binder; the result
+    // type is carried in the `BoundExpr`). All operate on 1-D arrays. ---
+    /// `array || array` / `array || element` (`arrcat`/`array_append`). Args are
+    /// `[array, array]`.
+    ArrayCat,
+    /// `array_append(array, element)` and `array || element`. Args `[array, elem]`.
+    ArrayAppend,
+    /// `array_prepend(element, array)` and `element || array`. Args `[elem, array]`.
+    ArrayPrepend,
+    /// `array @> array` — the left array contains every element of the right.
+    ArrayContains,
+    /// `array <@ array` — the left array's elements are all in the right.
+    ArrayContainedBy,
+    /// `array && array` — the arrays share at least one element.
+    ArrayOverlap,
+    /// `array_length(array, dim int4) -> int4` (NULL for an empty array or a
+    /// dimension other than 1).
+    ArrayLength,
+    /// `cardinality(array) -> int4` — the total number of elements.
+    Cardinality,
 }
 
 /// A SQL/JSON path query entry point. All take a `jsonb` target and a `jsonpath`;
@@ -537,6 +558,9 @@ pub enum TableFn {
     /// `jsonb_path_query(target jsonb, path jsonpath [, vars jsonb, silent bool])`
     /// — one `jsonb` row per item the path returns.
     JsonbPathQuery,
+    /// `unnest(array)` over a 1-D array whose element type is carried here. Yields
+    /// one row per element (NULL elements included).
+    Unnest(PgType),
 }
 
 impl TableFn {
@@ -546,9 +570,9 @@ impl TableFn {
     fn arg_types(self) -> &'static [PgType] {
         match self {
             TableFn::PgInputErrorInfo => &[PgType::Text, PgType::Text],
-            // `GenerateSeries`/`JsonbPathQuery` are variadic and resolve their
-            // own arguments in `bind_table_fn_call`.
-            TableFn::GenerateSeries(_) | TableFn::JsonbPathQuery => &[],
+            // `GenerateSeries`/`JsonbPathQuery`/`Unnest` are polymorphic/variadic
+            // and resolve their own arguments in `bind_table_fn_call`.
+            TableFn::GenerateSeries(_) | TableFn::JsonbPathQuery | TableFn::Unnest(_) => &[],
         }
     }
 
@@ -573,6 +597,10 @@ impl TableFn {
             TableFn::JsonbPathQuery => vec![OutputColumn {
                 name: "jsonb_path_query".to_string(),
                 ty: PgType::Jsonb,
+            }],
+            TableFn::Unnest(elem) => vec![OutputColumn {
+                name: "unnest".to_string(),
+                ty: elem,
             }],
         }
     }
@@ -699,6 +727,10 @@ pub(crate) fn bind_table_fn_call(
     if name == "jsonb_path_query" {
         return Ok((TableFn::JsonbPathQuery, resolve_jsonb_path_query(&bindings)?));
     }
+    if name == "unnest" {
+        let (elem, args) = resolve_unnest(&bindings)?;
+        return Ok((TableFn::Unnest(elem), args));
+    }
     let Some(func) = lookup_table_fn(name) else {
         return Err(undefined_function(name, &bindings));
     };
@@ -713,6 +745,19 @@ pub(crate) fn bind_table_fn_call(
         }
     }
     Err(undefined_function(name, &bindings))
+}
+
+/// Resolve `unnest(array)` to its element type and single (array) argument. Only
+/// the single-array 1-D form is supported; anything else is `42883`. Shared by
+/// FROM-position and target-list binding.
+pub(crate) fn resolve_unnest(bindings: &[Binding]) -> Result<(PgType, Vec<BoundExpr>), BindError> {
+    if let [Binding::Typed(e)] = bindings
+        && let PgType::Array(elem_oid) = e.ty()
+        && let Some(elem) = PgType::from_oid(elem_oid)
+    {
+        return Ok((elem, vec![e.clone()]));
+    }
+    Err(undefined_function("unnest", bindings))
 }
 
 /// Resolve a `generate_series(start, stop [, step])` call to its element type
@@ -1656,6 +1701,16 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         }));
     }
 
+    // Polymorphic array functions can't live in the fixed-signature overload
+    // table (their argument/result types depend on the array's element type).
+    if matches!(
+        name.as_str(),
+        "cardinality" | "array_length" | "array_append" | "array_prepend" | "array_cat"
+    ) && let Some(binding) = crate::expr::bind_array_function(&name, &bindings)?
+    {
+        return Ok(binding);
+    }
+
     resolve_call(&name, bindings, scope.catalog())
 }
 
@@ -2017,7 +2072,7 @@ pub(crate) fn bind_srf_projection(
     let Some(name) = function_name(&func.name) else {
         return Ok(None);
     };
-    if name != "generate_series" && name != "jsonb_path_query" {
+    if name != "generate_series" && name != "jsonb_path_query" && name != "unnest" {
         return Ok(None);
     }
     let arg_exprs = positional_args(&func.args)?;
@@ -2030,6 +2085,14 @@ pub(crate) fn bind_srf_projection(
         return Ok(Some(BoundExpr::Srf {
             func: TableFn::JsonbPathQuery,
             ret: PgType::Jsonb,
+            args,
+        }));
+    }
+    if name == "unnest" {
+        let (elem, args) = resolve_unnest(&bindings)?;
+        return Ok(Some(BoundExpr::Srf {
+            func: TableFn::Unnest(elem),
+            ret: elem,
             args,
         }));
     }

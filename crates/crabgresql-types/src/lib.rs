@@ -5,6 +5,7 @@
 //! the float regression tests need. `float` and `cast` hold the PG-exact I/O
 //! and cast machinery.
 
+pub mod array;
 pub mod bit;
 pub mod cast;
 pub mod date;
@@ -73,6 +74,41 @@ pub mod oid {
     pub const JSONB: u32 = 3802;
     /// `jsonpath`: an SQL/JSON path expression. See [`crate::jsonpath`].
     pub const JSONPATH: u32 = 4072;
+
+    // Array type OIDs (`pg_type.typarray` of the element type). Element↔array
+    // mapping lives in [`crate::array`].
+    pub const BOOL_ARRAY: u32 = 1000;
+    pub const BYTEA_ARRAY: u32 = 1001;
+    pub const NAME_ARRAY: u32 = 1003;
+    pub const INT2_ARRAY: u32 = 1005;
+    pub const INT4_ARRAY: u32 = 1007;
+    pub const TEXT_ARRAY: u32 = 1009;
+    pub const BPCHAR_ARRAY: u32 = 1014;
+    pub const VARCHAR_ARRAY: u32 = 1015;
+    pub const INT8_ARRAY: u32 = 1016;
+    pub const POINT_ARRAY: u32 = 1017;
+    pub const LSEG_ARRAY: u32 = 1018;
+    pub const FLOAT4_ARRAY: u32 = 1021;
+    pub const FLOAT8_ARRAY: u32 = 1022;
+    pub const OID_ARRAY: u32 = 1028;
+    pub const MACADDR_ARRAY: u32 = 1040;
+    pub const MACADDR8_ARRAY: u32 = 775;
+    pub const INET_ARRAY: u32 = 1041;
+    pub const CIDR_ARRAY: u32 = 651;
+    pub const NUMERIC_ARRAY: u32 = 1231;
+    pub const MONEY_ARRAY: u32 = 791;
+    pub const UUID_ARRAY: u32 = 2951;
+    pub const JSON_ARRAY: u32 = 199;
+    pub const JSONB_ARRAY: u32 = 3807;
+    pub const JSONPATH_ARRAY: u32 = 4073;
+    pub const DATE_ARRAY: u32 = 1182;
+    pub const TIME_ARRAY: u32 = 1183;
+    pub const TIMETZ_ARRAY: u32 = 1270;
+    pub const TIMESTAMP_ARRAY: u32 = 1115;
+    pub const TIMESTAMPTZ_ARRAY: u32 = 1185;
+    pub const INTERVAL_ARRAY: u32 = 1187;
+    pub const BIT_ARRAY: u32 = 1561;
+    pub const VARBIT_ARRAY: u32 = 1563;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +181,12 @@ pub enum PgType {
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
+    /// A one-dimensional array (`T[]`). Carries the **element** type's OID
+    /// (e.g. `Array(oid::INT4)` is `integer[]` / `_int4`); dimensionality is a
+    /// property of the value, not the type, matching PG (`int[]` and `int[][]`
+    /// are the same type). Recover the element [`PgType`] with
+    /// [`PgType::from_oid`]; the array's own OID via [`crate::array::array_oid_for_elem`].
+    Array(u32),
 }
 
 impl PgType {
@@ -183,6 +225,15 @@ impl PgType {
             PgType::Jsonb => oid::JSONB,
             PgType::Jsonpath => oid::JSONPATH,
             PgType::User(oid) => oid,
+            PgType::Array(elem) => array::array_oid_for_elem(elem).unwrap_or(0),
+        }
+    }
+
+    /// The element type of an array type, or `None` for a non-array type.
+    pub fn array_element(self) -> Option<PgType> {
+        match self {
+            PgType::Array(elem) => PgType::from_oid(elem),
+            _ => None,
         }
     }
 
@@ -224,6 +275,11 @@ impl PgType {
         )
     }
 
+    /// Whether this is a (one-dimensional) array type.
+    pub fn is_array(self) -> bool {
+        matches!(self, PgType::Array(_))
+    }
+
     /// Resolve a built-in type OID back to its [`PgType`], the reverse of
     /// [`PgType::oid`]. Used to map the parameter type OIDs a `Parse` message
     /// declares. Returns `None` for `0` ("unspecified", to be inferred) and any
@@ -258,10 +314,16 @@ impl PgType {
             oid::CIDR => PgType::Cidr,
             oid::MACADDR => PgType::Macaddr,
             oid::MACADDR8 => PgType::Macaddr8,
+            oid::POINT => PgType::Point,
+            oid::LSEG => PgType::Lseg,
             oid::JSON => PgType::Json,
             oid::JSONB => PgType::Jsonb,
             oid::JSONPATH => PgType::Jsonpath,
-            _ => return None,
+            // Array type OIDs (`_int4`, `_text`, ...) decode to `Array(elem)`.
+            other => match array::elem_oid_for_array(other) {
+                Some(elem) => PgType::Array(elem),
+                None => return None,
+            },
         })
     }
 
@@ -302,6 +364,8 @@ impl PgType {
             | PgType::Jsonb
             | PgType::Jsonpath => -1,
             PgType::User(_) => -1,
+            // Arrays are varlena.
+            PgType::Array(_) => -1,
         }
     }
 
@@ -341,6 +405,7 @@ impl PgType {
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
             PgType::User(_) => "user-defined",
+            PgType::Array(elem) => array_display_name(elem),
         }
     }
 
@@ -381,6 +446,7 @@ impl PgType {
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
             PgType::User(_) => "user-defined",
+            PgType::Array(elem) => array_typname(elem),
         }
     }
 
@@ -403,7 +469,97 @@ impl PgType {
     /// including user types (enums order by ordinal), does. Must stay in sync
     /// with `crabgresql_executor::compare_values`.
     pub fn has_default_btree_opclass(self) -> bool {
-        !matches!(self, PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg)
+        match self {
+            PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg => false,
+            // An array is orderable iff its element type is (element-wise btree
+            // comparison). An unknown element type (no `from_oid`) is treated as
+            // non-orderable.
+            PgType::Array(elem) => {
+                PgType::from_oid(elem).is_some_and(|e| e.has_default_btree_opclass())
+            }
+            _ => true,
+        }
+    }
+}
+
+/// PG's display spelling of an array type (`integer[]`) for error messages,
+/// keyed on the element OID. Falls back to a generic `"array"` for an element
+/// type this build does not special-case.
+fn array_display_name(elem: u32) -> &'static str {
+    match PgType::from_oid(elem) {
+        Some(PgType::Bool) => "boolean[]",
+        Some(PgType::Int2) => "smallint[]",
+        Some(PgType::Int4) => "integer[]",
+        Some(PgType::Int8) => "bigint[]",
+        Some(PgType::Float4) => "real[]",
+        Some(PgType::Float8) => "double precision[]",
+        Some(PgType::Numeric) => "numeric[]",
+        Some(PgType::Money) => "money[]",
+        Some(PgType::Text) => "text[]",
+        Some(PgType::Varchar) => "character varying[]",
+        Some(PgType::Bpchar) => "character[]",
+        Some(PgType::Name) => "name[]",
+        Some(PgType::Oid) => "oid[]",
+        Some(PgType::Bytea) => "bytea[]",
+        Some(PgType::Bit) => "bit[]",
+        Some(PgType::Varbit) => "bit varying[]",
+        Some(PgType::Date) => "date[]",
+        Some(PgType::Time) => "time without time zone[]",
+        Some(PgType::TimeTz) => "time with time zone[]",
+        Some(PgType::Timestamp) => "timestamp without time zone[]",
+        Some(PgType::TimestampTz) => "timestamp with time zone[]",
+        Some(PgType::Interval) => "interval[]",
+        Some(PgType::Uuid) => "uuid[]",
+        Some(PgType::Inet) => "inet[]",
+        Some(PgType::Cidr) => "cidr[]",
+        Some(PgType::Macaddr) => "macaddr[]",
+        Some(PgType::Macaddr8) => "macaddr8[]",
+        Some(PgType::Point) => "point[]",
+        Some(PgType::Lseg) => "lseg[]",
+        Some(PgType::Json) => "json[]",
+        Some(PgType::Jsonb) => "jsonb[]",
+        Some(PgType::Jsonpath) => "jsonpath[]",
+        _ => "array",
+    }
+}
+
+/// PG's catalog `typname` of an array type (`_int4`) — an underscore followed by
+/// the element's `typname`, keyed on the element OID.
+fn array_typname(elem: u32) -> &'static str {
+    match PgType::from_oid(elem) {
+        Some(PgType::Bool) => "_bool",
+        Some(PgType::Int2) => "_int2",
+        Some(PgType::Int4) => "_int4",
+        Some(PgType::Int8) => "_int8",
+        Some(PgType::Float4) => "_float4",
+        Some(PgType::Float8) => "_float8",
+        Some(PgType::Numeric) => "_numeric",
+        Some(PgType::Money) => "_money",
+        Some(PgType::Text) => "_text",
+        Some(PgType::Varchar) => "_varchar",
+        Some(PgType::Bpchar) => "_bpchar",
+        Some(PgType::Name) => "_name",
+        Some(PgType::Oid) => "_oid",
+        Some(PgType::Bytea) => "_bytea",
+        Some(PgType::Bit) => "_bit",
+        Some(PgType::Varbit) => "_varbit",
+        Some(PgType::Date) => "_date",
+        Some(PgType::Time) => "_time",
+        Some(PgType::TimeTz) => "_timetz",
+        Some(PgType::Timestamp) => "_timestamp",
+        Some(PgType::TimestampTz) => "_timestamptz",
+        Some(PgType::Interval) => "_interval",
+        Some(PgType::Uuid) => "_uuid",
+        Some(PgType::Inet) => "_inet",
+        Some(PgType::Cidr) => "_cidr",
+        Some(PgType::Macaddr) => "_macaddr",
+        Some(PgType::Macaddr8) => "_macaddr8",
+        Some(PgType::Point) => "_point",
+        Some(PgType::Lseg) => "_lseg",
+        Some(PgType::Json) => "_json",
+        Some(PgType::Jsonb) => "_jsonb",
+        Some(PgType::Jsonpath) => "_jsonpath",
+        _ => "array",
     }
 }
 
@@ -497,6 +653,14 @@ pub enum Value {
         ordinal: u32,
         label: String,
     },
+    /// A one-dimensional array. `elem` is the element type (so
+    /// [`Value::pg_type`] can report `PgType::Array(elem.oid())` even for an
+    /// empty array); `elems` are the element values, which may be
+    /// [`Value::Null`]. See [`crate::array`].
+    Array {
+        elem: PgType,
+        elems: Vec<Value>,
+    },
 }
 
 impl Value {
@@ -532,6 +696,7 @@ impl Value {
             Value::Jsonb(_) => Some(PgType::Jsonb),
             Value::Jsonpath(_) => Some(PgType::Jsonpath),
             Value::Enum { type_oid, .. } => Some(PgType::User(*type_oid)),
+            Value::Array { elem, .. } => Some(PgType::Array(elem.oid())),
         }
     }
 
@@ -585,6 +750,8 @@ impl Value {
             Value::Jsonpath(p) => Some(jsonpath::format(p)),
             // An enum prints as its label (PG's `enum_out`).
             Value::Enum { label, .. } => Some(label.clone()),
+            // An array prints in PG's `{...}` form (`array_out`).
+            Value::Array { elems, .. } => Some(array::format(elems, efd)),
         }
     }
 }
@@ -604,6 +771,7 @@ macro_rules! impl_message_error {
 }
 
 impl_message_error!(
+    array::ArrayError,
     bit::BitError,
     cast::CastError,
     date::DateError,

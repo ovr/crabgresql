@@ -14,7 +14,7 @@ use crabgresql_storage_api::{
     PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
     SequenceAdvance, SequenceDefinition, TableSchema, ViewDefinition,
 };
-use crabgresql_types::{PgType, oid};
+use crabgresql_types::PgType;
 
 use crate::smgr::RelFileNode;
 
@@ -1351,44 +1351,13 @@ fn persist_view_to_definition(v: &PersistView) -> ViewDefinition {
     }
 }
 
-/// Map a stored `pg_type` OID back to a [`PgType`]. Unknown OIDs become
-/// [`PgType::User`], carrying the OID forward.
+/// Map a stored `pg_type` OID back to a [`PgType`]. Delegates to
+/// [`PgType::from_oid`] (which also resolves array type OIDs like `_int4`); an
+/// OID with no built-in type becomes [`PgType::User`], carrying it forward. Kept
+/// as a thin wrapper so array/scalar OID handling never drifts from the
+/// canonical map.
 fn pgtype_from_oid(o: u32) -> PgType {
-    match o {
-        oid::BOOL => PgType::Bool,
-        oid::INT2 => PgType::Int2,
-        oid::INT4 => PgType::Int4,
-        oid::INT8 => PgType::Int8,
-        oid::FLOAT4 => PgType::Float4,
-        oid::FLOAT8 => PgType::Float8,
-        oid::NUMERIC => PgType::Numeric,
-        oid::TEXT => PgType::Text,
-        oid::VARCHAR => PgType::Varchar,
-        oid::BPCHAR => PgType::Bpchar,
-        oid::NAME => PgType::Name,
-        oid::OID => PgType::Oid,
-        oid::BYTEA => PgType::Bytea,
-        oid::BIT => PgType::Bit,
-        oid::VARBIT => PgType::Varbit,
-        oid::DATE => PgType::Date,
-        oid::TIME => PgType::Time,
-        oid::TIMETZ => PgType::TimeTz,
-        oid::TIMESTAMP => PgType::Timestamp,
-        oid::TIMESTAMPTZ => PgType::TimestampTz,
-        oid::INTERVAL => PgType::Interval,
-        oid::UUID => PgType::Uuid,
-        oid::INET => PgType::Inet,
-        oid::CIDR => PgType::Cidr,
-        oid::MONEY => PgType::Money,
-        oid::MACADDR => PgType::Macaddr,
-        oid::MACADDR8 => PgType::Macaddr8,
-        oid::POINT => PgType::Point,
-        oid::LSEG => PgType::Lseg,
-        oid::JSON => PgType::Json,
-        oid::JSONB => PgType::Jsonb,
-        oid::JSONPATH => PgType::Jsonpath,
-        other => PgType::User(other),
-    }
+    PgType::from_oid(o).unwrap_or(PgType::User(o))
 }
 
 #[cfg(test)]

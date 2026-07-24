@@ -55,17 +55,68 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             cast::reinterpret_value(eval(expr, row, ctx)?, *rep)
                 .map_err(|e| ExecError::new(e.sqlstate, e.message))
         }
-        BoundExpr::FuncCall { func, args, .. } => {
+        BoundExpr::FuncCall { func, ret, args } => {
             let arg_values = args
                 .iter()
                 .map(|a| eval(a, row, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
+            // `array_cat`/`array_append`/`array_prepend` are non-strict (a NULL
+            // element or side is meaningful) and need the result element type, so
+            // they are dispatched here rather than through the pure `eval_scalar`.
+            if let Some(result) = eval_array_ctor_fn(*func, *ret, &arg_values) {
+                return result;
+            }
             // The sequence functions are side-effecting and need the session's
             // sequence handle, so they are dispatched here rather than through the
             // pure `eval_scalar`.
             match eval_sequence_fn(*func, &arg_values, ctx) {
                 Some(result) => result,
                 None => crate::scalar_fns::eval_scalar(*func, &arg_values),
+            }
+        }
+        // An array constructor: evaluate each element and collect into a
+        // `Value::Array` of the declared element type.
+        BoundExpr::ArrayCtor { elem, elems, .. } => {
+            let values = elems
+                .iter()
+                .map(|e| eval(e, row, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Array {
+                elem: *elem,
+                elems: values,
+            })
+        }
+        // `a[i]`: 1-based element access. A NULL array or NULL/out-of-range
+        // subscript yields NULL (PG semantics), never an error.
+        BoundExpr::Subscript { base, index, .. } => {
+            let base = eval(base, row, ctx)?;
+            let idx = eval(index, row, ctx)?;
+            let elems = match &base {
+                Value::Array { elems, .. } => elems,
+                // NULL array → NULL element.
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(ExecError::new(
+                        sqlstate::INTERNAL_ERROR,
+                        format!("subscript base is not an array: {other:?}"),
+                    ));
+                }
+            };
+            let i = match idx {
+                Value::Int4(i) => i,
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(ExecError::new(
+                        sqlstate::INTERNAL_ERROR,
+                        format!("array subscript is not an int4: {other:?}"),
+                    ));
+                }
+            };
+            // PG arrays are 1-based; a subscript outside `[1, len]` is NULL.
+            if i < 1 || (i as usize) > elems.len() {
+                Ok(Value::Null)
+            } else {
+                Ok(elems[(i - 1) as usize].clone())
             }
         }
         // CASE tests conditions top-to-bottom and evaluates only the winning
@@ -111,6 +162,59 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
 pub fn coerce_value(value: Value, ty: PgType, ctx: &ExecContext) -> Result<Value, ExecError> {
     cast::cast_value(value, ty, ctx.extra_float_digits)
         .map_err(|e| ExecError::new(e.sqlstate, e.message))
+}
+
+/// Dispatch the non-strict array constructor functions (`array_cat`,
+/// `array_append`, `array_prepend`), which build a [`Value::Array`] of `ret`'s
+/// element type. Returns `None` for any other function so the caller falls
+/// through to the pure `eval_scalar`.
+fn eval_array_ctor_fn(func: ScalarFn, ret: PgType, args: &[Value]) -> Option<Result<Value, ExecError>> {
+    let elem = match func {
+        ScalarFn::ArrayCat | ScalarFn::ArrayAppend | ScalarFn::ArrayPrepend => match ret {
+            PgType::Array(elem_oid) => PgType::from_oid(elem_oid),
+            _ => None,
+        },
+        _ => return None,
+    };
+    let Some(elem) = elem else {
+        return Some(Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "array constructor result type is not a known array type",
+        )));
+    };
+    // Elements of an array-typed argument, or `None` when that argument is NULL.
+    let elems_of = |v: &Value| -> Option<Vec<Value>> {
+        match v {
+            Value::Array { elems, .. } => Some(elems.clone()),
+            _ => None,
+        }
+    };
+    let result = match func {
+        // `array_cat(a, b)`: a NULL side is treated as empty; both NULL → NULL.
+        ScalarFn::ArrayCat => match (elems_of(&args[0]), elems_of(&args[1])) {
+            (None, None) => return Some(Ok(Value::Null)),
+            (a, b) => {
+                let mut elems = a.unwrap_or_default();
+                elems.extend(b.unwrap_or_default());
+                Value::Array { elem, elems }
+            }
+        },
+        // `array_append(arr, e)`: a NULL array is treated as empty; `e` (possibly
+        // NULL) is appended.
+        ScalarFn::ArrayAppend => {
+            let mut elems = elems_of(&args[0]).unwrap_or_default();
+            elems.push(args[1].clone());
+            Value::Array { elem, elems }
+        }
+        // `array_prepend(e, arr)`: `e` (possibly NULL) is prepended.
+        ScalarFn::ArrayPrepend => {
+            let mut elems = vec![args[0].clone()];
+            elems.extend(elems_of(&args[1]).unwrap_or_default());
+            Value::Array { elem, elems }
+        }
+        _ => unreachable!(),
+    };
+    Some(Ok(result))
 }
 
 /// Dispatch the side-effecting sequence functions. Returns `None` for any other
@@ -273,10 +377,13 @@ fn eval_binary(
 /// sync. Callers that would otherwise reach `compare_values` on user input (e.g.
 /// a RANGE partition key) must gate on this to avoid a panic.
 pub fn is_orderable(ty: PgType) -> bool {
-    !matches!(
-        ty,
-        PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg
-    )
+    match ty {
+        PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg => false,
+        // An array is orderable iff its element type is (element-wise btree
+        // comparison). Keep in sync with `PgType::has_default_btree_opclass`.
+        PgType::Array(elem_oid) => PgType::from_oid(elem_oid).is_some_and(is_orderable),
+        _ => true,
+    }
 }
 
 /// Total-order comparison of two non-null values of type `ty`. Floats use PG's
@@ -328,6 +435,25 @@ pub fn compare_values(ty: PgType, l: &Value, r: &Value) -> Ordering {
         // jsonb: PG's `compareJsonbContainers` total order. (`json` has no
         // default ordering and never reaches here.)
         PgType::Jsonb => json::cmp(jsonb_of(l), jsonb_of(r)),
+        // Arrays: element-wise comparison, then the shorter array is less on a
+        // common prefix (PG's `array_cmp`). A NULL element sorts after any
+        // non-NULL (NULLS-LAST), matching the default btree order.
+        PgType::Array(elem_oid) => {
+            let elem = PgType::from_oid(elem_oid).expect("orderable array element type resolves");
+            let (la, lb) = (array_elems(l), array_elems(r));
+            for (x, y) in la.iter().zip(lb.iter()) {
+                let ord = match (x, y) {
+                    (Value::Null, Value::Null) => Ordering::Equal,
+                    (Value::Null, _) => Ordering::Greater,
+                    (_, Value::Null) => Ordering::Less,
+                    _ => compare_values(elem, x, y),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            la.len().cmp(&lb.len())
+        }
         // Query-time user-type ordering is currently defined only for enums.
         // Keep this total for defensive callers: malformed/mixed values use
         // their actual non-user representation or type OID, never an unchecked
@@ -382,6 +508,13 @@ fn int2(v: &Value) -> i16 {
     match v {
         Value::Int2(v) => *v,
         other => unreachable!("expected int2, got {other:?}"),
+    }
+}
+
+pub(crate) fn array_elems(v: &Value) -> &[Value] {
+    match v {
+        Value::Array { elems, .. } => elems,
+        other => unreachable!("expected array, got {other:?}"),
     }
 }
 

@@ -480,6 +480,30 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             _ => Err(json_err(json::cannot_cast(j, to.name()))),
         },
 
+        // ---- array I/O and conversions ----
+        // `text` → `array` (`array_in`): parse the `{...}` literal, coercing each
+        // element to the array's element type. array → text/varchar/... is
+        // handled by the generic any-to-text arm above (via `encode_text_with`).
+        (Value::Text(s), PgType::Array(elem_oid)) => {
+            let elem = PgType::from_oid(elem_oid).ok_or_else(|| cannot_coerce(from, to))?;
+            crate::array::array_in(s, elem)
+                .map(|elems| Value::Array { elem, elems })
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        // `array` → `array` with a different element type: recast every element
+        // (e.g. an `int4[]` literal assigned to a `numeric[]` column).
+        (Value::Array { elems, .. }, PgType::Array(elem_oid)) => {
+            let elem = PgType::from_oid(elem_oid).ok_or_else(|| cannot_coerce(from, to))?;
+            let recast = elems
+                .iter()
+                .map(|e| cast_value(e.clone(), elem, efd))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Array { elem, elems: recast })
+        }
+
         _ => Err(cannot_coerce(from, to)),
     }
 }
