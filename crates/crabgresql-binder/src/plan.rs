@@ -172,12 +172,23 @@ pub enum LogicalPlan {
         assignments: Vec<(usize, BoundExpr)>,
         /// `RETURNING`: a projection over each updated (NEW) row.
         returning: Option<Returning>,
+        /// Tuple routing for a partitioned parent: `Some(leaves)` when `table` is
+        /// a partitioned parent, holding its leaf partitions. The executor scans
+        /// every leaf, and for each updated row re-routes the NEW tuple to the
+        /// leaf whose RANGE bound admits it — moving the row (delete from the old
+        /// leaf, insert into the new) when the key change lands it elsewhere.
+        /// `None` for an ordinary table.
+        routing: Option<Vec<Arc<dyn TableAm>>>,
     },
     Delete {
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         /// `RETURNING`: a projection over each deleted (OLD) row.
         returning: Option<Returning>,
+        /// Tuple routing for a partitioned parent: `Some(leaves)` when `table` is
+        /// a partitioned parent. The executor scans every leaf and deletes matching
+        /// rows from whichever leaf holds them. `None` for an ordinary table.
+        routing: Option<Vec<Arc<dyn TableAm>>>,
     },
 }
 
@@ -353,20 +364,10 @@ fn resolve_write_table(
         }
         not_found_as_written(e, schema.as_deref(), &table_name)
     })?;
-    // A partitioned parent is a valid INSERT target (rows are routed to leaves by
-    // `bind_insert`); UPDATE/DELETE on the parent are still rejected, in
-    // `open_write_relation`.
+    // A partitioned parent is a valid write target: INSERT/COPY route rows to
+    // leaves and UPDATE/DELETE route through them (each binder captures the leaves
+    // via `partition_leaves`).
     Ok((table, table_name))
-}
-
-/// Reject an UPDATE/DELETE against a partitioned parent: cross-partition
-/// UPDATE/DELETE is not implemented yet, so only the individual leaf partitions
-/// can be modified directly. (INSERT routes rows to leaves; a partitioned parent
-/// can also be read via a union scan — see [`LogicalPlan::Append`].)
-fn partitioned_parent_unsupported(name: &str) -> BindError {
-    BindError::feature_not_supported(format!(
-        "access to partitioned table \"{name}\" is not supported yet"
-    ))
 }
 
 /// Enumerate the leaf partitions of the partitioned parent `parent` as storage
@@ -442,10 +443,10 @@ fn open_write_relation(
             "target is not supported yet: {relation}"
         )));
     };
+    // A partitioned parent is a valid UPDATE/DELETE target: the executor routes
+    // through its leaves (each binder captures them via `partition_leaves`), so —
+    // unlike before — the parent is not rejected here.
     let (table, table_name) = resolve_write_table(engine, name, verb)?;
-    if table.schema().partition_scheme.is_some() {
-        return Err(partitioned_parent_unsupported(&table_name));
-    }
     let qualifier = aliased_qualifier(alias, table_name)?;
     Ok((table, qualifier))
 }
@@ -3738,6 +3739,10 @@ pub struct CopyFromPlan {
     /// Default expression per schema column (used for columns not in the list).
     defaults: Vec<BoundExpr>,
     pub format: CopyFormat,
+    /// Leaf partitions when `table` is a partitioned parent, so each decoded row
+    /// routes to the leaf whose RANGE bound admits it (reusing the executor's
+    /// INSERT routing); `None` for an ordinary table.
+    routing: Option<Vec<Arc<dyn TableAm>>>,
 }
 
 impl CopyFromPlan {
@@ -3811,9 +3816,9 @@ impl CopyFromPlan {
             table: self.table.clone(),
             source: InsertSource::Values(value_rows),
             returning: None,
-            // COPY into a partitioned parent is rejected in `bind_copy_from`, so
-            // this always targets an ordinary table — no routing.
-            routing: None,
+            // A partitioned parent routes each decoded row to a leaf, reusing the
+            // executor's INSERT tuple routing; `None` targets an ordinary table.
+            routing: self.routing.clone(),
         })
     }
 }
@@ -3854,13 +3859,14 @@ pub fn bind_copy_from(
     }
 
     let (table, name) = resolve_write_table(engine, table_name, WriteVerb::Insert)?;
-    // COPY into a partitioned parent would need tuple routing too; not wired yet
-    // (INSERT is), so keep it rejected rather than writing to the parent's own
-    // (empty) storage.
-    if table.schema().partition_scheme.is_some() {
-        return Err(partitioned_parent_unsupported(&name));
-    }
     let schema = table.schema().clone();
+    // A partitioned parent routes each decoded row to a leaf at execution time
+    // (see `CopyFromPlan::routing`); capture the leaves now. `None` for a plain table.
+    let routing = if schema.partition_scheme.is_some() {
+        Some(partition_leaves(engine, &schema)?)
+    } else {
+        None
+    };
     let defaults = schema
         .columns
         .iter()
@@ -3900,6 +3906,7 @@ pub fn bind_copy_from(
         target_indices,
         defaults,
         format,
+        routing,
     })
 }
 
@@ -4119,6 +4126,13 @@ pub fn bind_update_with_params(
     let (table, qualifier) = open_write_relation(engine, &update.table.relation, WriteVerb::Update)?;
     let schema = table.schema().clone();
     let table_name = schema.name.clone();
+    // A partitioned parent routes each updated row to a leaf (moving it across
+    // leaves when the key changes); capture the leaves now. `None` for a plain table.
+    let routing = if schema.partition_scheme.is_some() {
+        Some(partition_leaves(engine, &schema)?)
+    } else {
+        None
+    };
     // SET / WHERE / RETURNING may all contain subqueries; UPDATE takes no WITH,
     // so the CTE environment is empty.
     let scope =
@@ -4166,6 +4180,7 @@ pub fn bind_update_with_params(
         predicate,
         assignments,
         returning,
+        routing,
     })
 }
 
@@ -4215,6 +4230,13 @@ pub fn bind_delete_with_params(
 
     let (table, qualifier) = open_write_relation(engine, &target.relation, WriteVerb::Delete)?;
     let schema = table.schema().clone();
+    // A partitioned parent deletes matching rows from whichever leaf holds them;
+    // capture the leaves now. `None` for a plain table.
+    let routing = if schema.partition_scheme.is_some() {
+        Some(partition_leaves(engine, &schema)?)
+    } else {
+        None
+    };
     // WHERE / RETURNING may contain subqueries; DELETE takes no WITH.
     let scope =
         Scope::table(&schema, qualifier, catalog, params).with_subqueries(engine, &CteEnv::new());
@@ -4225,6 +4247,7 @@ pub fn bind_delete_with_params(
         table,
         predicate,
         returning,
+        routing,
     })
 }
 

@@ -4394,15 +4394,12 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
     );
     assert_eq!(rows(&client.simple_query("SELECT count(*) FROM m").await?)[0].get(0), Some("2"));
 
-    // UPDATE/DELETE directly on the parent are still unsupported (0A000).
-    let err = client
-        .simple_query("DELETE FROM m WHERE id = 1")
-        .await
-        .unwrap_err();
-    assert_eq!(
-        err.as_db_error().expect("database error").code(),
-        &SqlState::FEATURE_NOT_SUPPORTED
-    );
+    // DELETE through the parent removes the matching row from whichever leaf
+    // holds it (id = 1 lived in m_2024), leaving id = 2 behind.
+    client.simple_query("DELETE FROM m WHERE id = 1").await?;
+    let msgs = client.simple_query("SELECT id FROM m ORDER BY id").await?;
+    let remaining: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(remaining, vec![Some("2")]);
 
     // Unsupported strategies and bad bounds report the right SQLSTATEs.
     let err = client
@@ -4707,6 +4704,119 @@ async fn range_partitioning_routed_insert_enforces_unique_and_error_order() -> a
         err.as_db_error().expect("database error").code(),
         &SqlState::NOT_NULL_VIOLATION
     );
+
+    Ok(())
+}
+
+/// UPDATE/DELETE/COPY through a partitioned parent: in-place update, cross-leaf
+/// row movement on a key change, RETURNING over routed writes, COPY routing, and
+/// the "no partition found" (23514) failure when a key change fits no leaf.
+#[tokio::test]
+async fn range_partitioning_routed_update_delete_copy() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE m (id int, d date) PARTITION BY RANGE (d)")
+        .await?;
+    client
+        .simple_query(
+            "CREATE TABLE m_2023 PARTITION OF m FOR VALUES FROM ('2023-01-01') TO ('2024-01-01')",
+        )
+        .await?;
+    client
+        .simple_query(
+            "CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+        )
+        .await?;
+
+    // COPY through the parent routes each decoded row to the leaf whose range
+    // admits its key: id 1 → m_2023, id 2 → m_2024.
+    let sink = client
+        .copy_in("COPY m FROM STDIN")
+        .await
+        .context("copy_in should enter copy mode")?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"1\t2023-06-01\n2\t2024-06-01\n"))
+        .await?;
+    assert_eq!(sink.finish().await?, 2);
+    assert_eq!(
+        rows(&client.simple_query("SELECT id FROM m_2023").await?)[0].get(0),
+        Some("1")
+    );
+    assert_eq!(
+        rows(&client.simple_query("SELECT id FROM m_2024").await?)[0].get(0),
+        Some("2")
+    );
+
+    // A COPY row whose key fits no partition fails routing (23514) and the whole
+    // load is rolled back.
+    let sink = client.copy_in("COPY m FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"9\t2019-01-01\n")).await?;
+    let err = sink.finish().await.unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::CHECK_VIOLATION
+    );
+    assert_eq!(
+        rows(&client.simple_query("SELECT count(*) FROM m").await?)[0].get(0),
+        Some("2")
+    );
+
+    // An in-place UPDATE through the parent (key stays in the same leaf) rewrites
+    // the row and RETURNING streams the NEW value.
+    let msgs = client
+        .simple_query("UPDATE m SET d = '2023-09-01' WHERE id = 1 RETURNING id, d")
+        .await?;
+    assert_eq!(
+        (rows(&msgs)[0].get("id"), rows(&msgs)[0].get("d")),
+        (Some("1"), Some("2023-09-01"))
+    );
+    // The row stayed in m_2023.
+    assert_eq!(
+        rows(&client.simple_query("SELECT d FROM m_2023 WHERE id = 1").await?)[0].get(0),
+        Some("2023-09-01")
+    );
+
+    // A key-changing UPDATE moves the row across leaves: id 1 leaves m_2023 and
+    // lands in m_2024 (delete-from-old + insert-into-new).
+    client
+        .simple_query("UPDATE m SET d = '2024-03-01' WHERE id = 1")
+        .await?;
+    assert!(
+        rows(&client.simple_query("SELECT id FROM m_2023").await?).is_empty(),
+        "m_2023 should be empty after the row moved out"
+    );
+    let msgs = client.simple_query("SELECT id FROM m_2024 ORDER BY id").await?;
+    let moved: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(moved, vec![Some("1"), Some("2")]);
+
+    // A key-changing UPDATE that fits no partition fails (23514) and nothing moves.
+    let err = client
+        .simple_query("UPDATE m SET d = '2019-05-01' WHERE id = 2")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::CHECK_VIOLATION
+    );
+    assert_eq!(
+        rows(&client.simple_query("SELECT count(*) FROM m_2024").await?)[0].get(0),
+        Some("2")
+    );
+
+    // DELETE through the parent with RETURNING removes from whichever leaf holds
+    // the row and streams the deleted (OLD) row.
+    let msgs = client
+        .simple_query("DELETE FROM m WHERE id = 1 RETURNING id")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("id"), Some("1"));
+    let msgs = client.simple_query("SELECT id FROM m ORDER BY id").await?;
+    let remaining: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(remaining, vec![Some("2")]);
 
     Ok(())
 }
