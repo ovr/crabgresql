@@ -718,6 +718,121 @@ async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ANY`/`SOME`/`ALL` quantified comparisons over both an array expression and a
+/// subquery, checked against PostgreSQL: the six comparison operators, empty/NULL
+/// three-valued semantics, `= ANY` ≡ `IN` / `<> ALL` ≡ `NOT IN`, a correlated
+/// subquery form, single evaluation of a side-effecting needle, and the
+/// non-array right-side error. (`= ANY($1)` with an array parameter is not
+/// covered: binary array parameters are still undecodable — see `types::wire`.)
+#[tokio::test]
+async fn any_all_quantified_comparisons_match_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    // --- Array form: the six operators and SOME synonym. ---
+    let msgs = client
+        .simple_query(
+            "SELECT 2 = ANY(ARRAY[1,2,3]) AS a, 2 = ALL(ARRAY[1,2]) AS b, \
+                    3 > ALL(ARRAY[1,2]) AS c, 20 = SOME(ARRAY[10,20]) AS d",
+        )
+        .await?;
+    let r = &rows(&msgs)[0];
+    assert_eq!(r.get("a"), Some("t"));
+    assert_eq!(r.get("b"), Some("f"));
+    assert_eq!(r.get("c"), Some("t"));
+    assert_eq!(r.get("d"), Some("t"));
+
+    // --- Empty / NULL three-valued semantics. ---
+    let msgs = client
+        .simple_query(
+            "SELECT 1 = ANY(ARRAY[2,NULL]) AS null_elem, \
+                    1 = ANY(ARRAY[]::int[]) AS empty_any, \
+                    1 <> ALL(ARRAY[]::int[]) AS empty_all, \
+                    1 = ANY(NULL::int[]) AS null_arr",
+        )
+        .await?;
+    let r = &rows(&msgs)[0];
+    assert_eq!(r.get("null_elem"), None); // no match but a NULL ⇒ NULL
+    assert_eq!(r.get("empty_any"), Some("f"));
+    assert_eq!(r.get("empty_all"), Some("t"));
+    assert_eq!(r.get("null_arr"), None);
+
+    // A text-literal array coerces to the needle's type; column is `?column?`.
+    let msgs = client.simple_query("SELECT 2 = ANY('{1,2,3}')").await?;
+    assert_eq!(rows(&msgs)[0].get("?column?"), Some("t"));
+
+    // --- Subquery form: `= ANY` ≡ IN, `<> ALL` ≡ NOT IN, plus `> ALL`/`> ANY`. ---
+    client
+        .simple_query("CREATE TABLE sq (id int, val int)")
+        .await?;
+    client
+        .simple_query("INSERT INTO sq VALUES (1,10),(2,20),(3,30)")
+        .await?;
+    let ids = |msgs: &[SimpleQueryMessage]| -> Vec<String> {
+        rows(msgs)
+            .iter()
+            .filter_map(|r| r.get("id").map(str::to_string))
+            .collect()
+    };
+
+    let msgs = client
+        .simple_query("SELECT id FROM sq WHERE val = ANY(SELECT val FROM sq WHERE val <> 20) ORDER BY id")
+        .await?;
+    assert_eq!(ids(&msgs), vec!["1", "3"]);
+
+    let msgs = client
+        .simple_query("SELECT id FROM sq WHERE val <> ALL(SELECT val FROM sq WHERE val = 20) ORDER BY id")
+        .await?;
+    assert_eq!(ids(&msgs), vec!["1", "3"]);
+
+    let msgs = client
+        .simple_query("SELECT id FROM sq WHERE val > ALL(SELECT val FROM sq WHERE val < 30) ORDER BY id")
+        .await?;
+    assert_eq!(ids(&msgs), vec!["3"]);
+
+    let msgs = client
+        .simple_query("SELECT id FROM sq WHERE val > ANY(SELECT val FROM sq) ORDER BY id")
+        .await?;
+    assert_eq!(ids(&msgs), vec!["2", "3"]);
+
+    // Correlated subquery: the candidate set depends on the outer row.
+    let msgs = client
+        .simple_query("SELECT id FROM sq x WHERE val = ANY(SELECT val FROM sq y WHERE y.id = x.id) ORDER BY id")
+        .await?;
+    assert_eq!(ids(&msgs), vec!["1", "2", "3"]);
+
+    // --- The needle is evaluated exactly once, as PG's ScalarArrayOpExpr does. ---
+    // A per-candidate needle would advance the sequence once per element (and,
+    // for the subquery form, compare a *different* value against each candidate).
+    client.simple_query("CREATE SEQUENCE sq1").await?;
+    let msgs = client
+        .simple_query("SELECT nextval('sq1') = ANY(ARRAY[99,98,97]) AS r")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("r"), Some("f"));
+    let msgs = client.simple_query("SELECT currval('sq1') AS v").await?;
+    assert_eq!(rows(&msgs)[0].get("v"), Some("1"), "needle evaluated once");
+
+    // Subquery form: with the needle drawn once (3), 3 is in {1,3} → true. A
+    // re-drawn needle would compare 3 vs 1 then 4 vs 3 and wrongly yield false.
+    client.simple_query("CREATE SEQUENCE sq2").await?;
+    client.simple_query("SELECT setval('sq2', 2)").await?;
+    let msgs = client
+        .simple_query("SELECT nextval('sq2') = ANY(SELECT id FROM sq WHERE id <> 2) AS r")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("r"), Some("t"));
+
+    // --- A non-array right side is PG's `op ANY/ALL (array) requires ...` error,
+    // with the cursor on the operator as PG places it. ---
+    let err = client.simple_query("SELECT 1 = ANY(2)").await.unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(db.message(), "op ANY/ALL (array) requires array on right side");
+    assert_eq!(db.position(), Some(&tokio_postgres::error::ErrorPosition::Original(10)));
+
+    Ok(())
+}
+
 /// tokio-postgres drives the extended protocol: it sends Parse with no declared
 /// parameter types and relies on the server to infer them and return binary
 /// results. A parameterized arithmetic query must round-trip through

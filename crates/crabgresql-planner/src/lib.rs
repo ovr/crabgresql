@@ -708,7 +708,8 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
         | BoundExpr::Aggregate { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
-        | BoundExpr::InSubquery { .. } => false,
+        | BoundExpr::QuantifiedSubquery { .. }
+        | BoundExpr::QuantifiedArray { .. } => false,
     }
 }
 

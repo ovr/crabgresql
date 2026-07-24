@@ -680,8 +680,14 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
             substitute_params(&mut subplan.0, params);
         }
-        BoundExpr::InSubquery { subplan, cmp, .. } => {
+        BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
             substitute_params(&mut subplan.0, params);
+            subst_expr(cmp, params);
+        }
+        // `x op ANY/ALL(array)` carries no subplan; a `$n` may appear in either
+        // the array operand or the needle (in the comparison template).
+        BoundExpr::QuantifiedArray { array, cmp, .. } => {
+            subst_expr(array, params);
             subst_expr(cmp, params);
         }
     }
@@ -943,8 +949,13 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
             subst_outer_plan(&mut subplan.0, outer, depth + 1);
         }
-        BoundExpr::InSubquery { subplan, cmp, .. } => {
+        BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
             subst_outer_plan(&mut subplan.0, outer, depth + 1);
+            subst_outer_expr(cmp, outer, depth);
+        }
+        // The array operand and the needle live at this query level.
+        BoundExpr::QuantifiedArray { array, cmp, .. } => {
+            subst_outer_expr(array, outer, depth);
             subst_outer_expr(cmp, outer, depth);
         }
     }
@@ -1148,8 +1159,11 @@ fn expr_has_outer_ref(expr: &BoundExpr) -> bool {
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
             plan_has_outer_refs(&subplan.0)
         }
-        BoundExpr::InSubquery { subplan, cmp, .. } => {
+        BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
             plan_has_outer_refs(&subplan.0) || expr_has_outer_ref(cmp)
+        }
+        BoundExpr::QuantifiedArray { array, cmp, .. } => {
+            expr_has_outer_ref(array) || expr_has_outer_ref(cmp)
         }
     }
 }
@@ -1989,13 +2003,15 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
             subplan: subplan.clone(),
             negated: *negated,
         },
-        BoundExpr::InSubquery {
-            subplan,
-            negated,
-            cmp,
-        } => BoundExpr::InSubquery {
+        BoundExpr::QuantifiedSubquery { subplan, all, cmp } => BoundExpr::QuantifiedSubquery {
             subplan: subplan.clone(),
-            negated: *negated,
+            all: *all,
+            cmp: Box::new(shift_column_refs(cmp, delta)),
+        },
+        // Both the array operand and the needle index this (outer) row.
+        BoundExpr::QuantifiedArray { array, all, cmp } => BoundExpr::QuantifiedArray {
+            array: Box::new(shift_column_refs(array, delta)),
+            all: *all,
             cmp: Box::new(shift_column_refs(cmp, delta)),
         },
     }
@@ -3424,20 +3440,24 @@ fn rewrite_over_aggregate(
             reject_correlated_over_aggregate(&c)?;
             Ok(c)
         }
-        BoundExpr::InSubquery {
-            subplan,
-            negated,
-            cmp,
-        } => {
+        BoundExpr::QuantifiedSubquery { subplan, all, cmp } => {
             if plan_has_outer_refs(&subplan.0) {
                 return Err(correlated_over_aggregate_error());
             }
-            Ok(BoundExpr::InSubquery {
+            Ok(BoundExpr::QuantifiedSubquery {
                 subplan,
-                negated,
+                all,
                 cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
             })
         }
+        // `x op ANY/ALL(array)` has no subplan; rewrite both operands so any
+        // aggregate/group-key reference inside them is redirected to the
+        // aggregate node's output row.
+        BoundExpr::QuantifiedArray { array, all, cmp } => Ok(BoundExpr::QuantifiedArray {
+            array: Box::new(rewrite_over_aggregate(*array, group_exprs, aggregates, scope)?),
+            all,
+            cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
+        }),
     }
 }
 
@@ -6016,6 +6036,8 @@ mod tests {
         ));
     }
 
+    /// `IN (SELECT …)` is PG's `= ANY (…)`, so it binds to the quantified marker
+    /// with an equality template and no `ALL` flag.
     #[test]
     fn in_subquery_binds_to_marker() {
         let LogicalPlan::Query { predicate, .. } =
@@ -6023,12 +6045,28 @@ mod tests {
         else {
             panic!("expected Query");
         };
-        let Some(BoundExpr::InSubquery { negated, cmp, .. }) = predicate else {
-            panic!("expected InSubquery predicate");
+        let Some(BoundExpr::QuantifiedSubquery { all, cmp, .. }) = predicate else {
+            panic!("expected QuantifiedSubquery predicate");
         };
-        assert!(!negated);
+        assert!(!all);
         // The comparison template is `id = <hole>`, an equality Binary.
         assert!(matches!(*cmp, BoundExpr::Binary { op: BinOp::Eq, .. }));
+    }
+
+    /// `NOT IN (SELECT …)` is PG's `<> ALL (…)` — the De Morgan dual, so it binds
+    /// to an inequality template with `all` set rather than a negated equality.
+    #[test]
+    fn not_in_subquery_binds_to_all_of_inequality() {
+        let LogicalPlan::Query { predicate, .. } =
+            bound("SELECT id FROM t WHERE id NOT IN (SELECT id FROM t)")
+        else {
+            panic!("expected Query");
+        };
+        let Some(BoundExpr::QuantifiedSubquery { all, cmp, .. }) = predicate else {
+            panic!("expected QuantifiedSubquery predicate");
+        };
+        assert!(all);
+        assert!(matches!(*cmp, BoundExpr::Binary { op: BinOp::NotEq, .. }));
     }
 
     #[test]
@@ -6179,7 +6217,10 @@ mod tests {
         else {
             panic!("expected Delete");
         };
-        assert!(matches!(predicate, Some(BoundExpr::InSubquery { .. })));
+        assert!(matches!(
+            predicate,
+            Some(BoundExpr::QuantifiedSubquery { .. })
+        ));
     }
 
     fn case_column(sql: &str) -> (OutputColumn, BoundExpr) {
