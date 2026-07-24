@@ -721,7 +721,9 @@ async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
 /// `ANY`/`SOME`/`ALL` quantified comparisons over both an array expression and a
 /// subquery, checked against PostgreSQL: the six comparison operators, empty/NULL
 /// three-valued semantics, `= ANY` ≡ `IN` / `<> ALL` ≡ `NOT IN`, a correlated
-/// subquery form, a bind-parameter array, and the non-array right-side error.
+/// subquery form, single evaluation of a side-effecting needle, and the
+/// non-array right-side error. (`= ANY($1)` with an array parameter is not
+/// covered: binary array parameters are still undecodable — see `types::wire`.)
 #[tokio::test]
 async fn any_all_quantified_comparisons_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -800,11 +802,33 @@ async fn any_all_quantified_comparisons_match_pg() -> anyhow::Result<()> {
         .await?;
     assert_eq!(ids(&msgs), vec!["1", "2", "3"]);
 
-    // --- A non-array right side is PG's `op ANY/ALL (array) requires ...` error. ---
+    // --- The needle is evaluated exactly once, as PG's ScalarArrayOpExpr does. ---
+    // A per-candidate needle would advance the sequence once per element (and,
+    // for the subquery form, compare a *different* value against each candidate).
+    client.simple_query("CREATE SEQUENCE sq1").await?;
+    let msgs = client
+        .simple_query("SELECT nextval('sq1') = ANY(ARRAY[99,98,97]) AS r")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("r"), Some("f"));
+    let msgs = client.simple_query("SELECT currval('sq1') AS v").await?;
+    assert_eq!(rows(&msgs)[0].get("v"), Some("1"), "needle evaluated once");
+
+    // Subquery form: with the needle drawn once (3), 3 is in {1,3} → true. A
+    // re-drawn needle would compare 3 vs 1 then 4 vs 3 and wrongly yield false.
+    client.simple_query("CREATE SEQUENCE sq2").await?;
+    client.simple_query("SELECT setval('sq2', 2)").await?;
+    let msgs = client
+        .simple_query("SELECT nextval('sq2') = ANY(SELECT id FROM sq WHERE id <> 2) AS r")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("r"), Some("t"));
+
+    // --- A non-array right side is PG's `op ANY/ALL (array) requires ...` error,
+    // with the cursor on the operator as PG places it. ---
     let err = client.simple_query("SELECT 1 = ANY(2)").await.unwrap_err();
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
     assert_eq!(db.message(), "op ANY/ALL (array) requires array on right side");
+    assert_eq!(db.position(), Some(&tokio_postgres::error::ErrorPosition::Original(10)));
 
     Ok(())
 }

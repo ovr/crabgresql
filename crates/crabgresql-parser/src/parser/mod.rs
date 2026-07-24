@@ -3593,12 +3593,14 @@ impl<'a> Parser<'a> {
                         left: Box::new(expr),
                         compare_op: op,
                         right: Box::new(right),
+                        op_span: crate::ast::OpSpan(span),
                     },
                     Keyword::ANY | Keyword::SOME => Expr::AnyOp {
                         left: Box::new(expr),
                         compare_op: op,
                         right: Box::new(right),
                         is_some: keyword == Keyword::SOME,
+                        op_span: crate::ast::OpSpan(span),
                     },
                     unexpected_keyword => return Err(ParserError::ParserError(
                         format!("Internal parser error: expected any of {{ALL, ANY, SOME}}, got {unexpected_keyword:?}"),

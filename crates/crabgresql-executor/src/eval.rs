@@ -153,21 +153,29 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
         // the outer row — and folded now, against this row.
         BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
-        | BoundExpr::InSubquery { .. }
         | BoundExpr::QuantifiedSubquery { .. } => crate::eval_correlated_subquery(expr, row, ctx),
-        // `left op ANY/ALL(array)` is evaluated per row (both operands may depend
-        // on the row): materialize the array, then chain `left op elem` over its
-        // elements. A NULL array yields NULL.
-        BoundExpr::QuantifiedArray { array, all, cmp } => match eval(array, row, ctx)? {
-            Value::Null => Ok(Value::Null),
-            Value::Array { elems, .. } => {
-                let chain = crate::build_quantified_chain(cmp, elems, *all, ctx)?;
-                eval(&chain, row, ctx)
-            }
-            other => Err(ExecError::new(
-                sqlstate::INTERNAL_ERROR,
-                format!("ANY/ALL right operand is not an array: {other:?}"),
-            )),
+        // `left op ANY/ALL(array)`: compare the needle (evaluated once) against
+        // each element. A NULL array yields NULL. A constant array — including
+        // the one a folded `op ANY/ALL (SELECT …)` becomes — is borrowed rather
+        // than cloned, so a large candidate set costs nothing per row.
+        BoundExpr::QuantifiedArray { array, all, cmp } => match array.as_ref() {
+            BoundExpr::Const {
+                value: Value::Array { elems, .. },
+                ..
+            } => crate::eval_quantified(cmp, elems, *all, row, ctx),
+            BoundExpr::Const {
+                value: Value::Null, ..
+            } => Ok(Value::Null),
+            _ => match eval(array, row, ctx)? {
+                Value::Null => Ok(Value::Null),
+                Value::Array { elems, .. } => {
+                    crate::eval_quantified(cmp, &elems, *all, row, ctx)
+                }
+                other => Err(ExecError::new(
+                    sqlstate::INTERNAL_ERROR,
+                    format!("ANY/ALL right operand is not an array: {other:?}"),
+                )),
+            },
         },
     }
 }
@@ -373,8 +381,16 @@ fn eval_binary(
             other => unreachable!("binder let arithmetic through on {other:?}"),
         };
     }
-    let ordering = compare_values(arg_ty, &l, &r);
-    let result = match op {
+    Ok(Value::Bool(apply_comparison(op, arg_ty, &l, &r)))
+}
+
+/// Apply a comparison operator to two already-evaluated, non-NULL operands of
+/// `arg_ty`. Split out of [`eval_binary`] so the quantified comparisons
+/// (`op ANY/ALL`) resolve each candidate exactly as a written comparison does,
+/// without rebuilding an expression node per candidate.
+pub(crate) fn apply_comparison(op: BinOp, arg_ty: PgType, l: &Value, r: &Value) -> bool {
+    let ordering = compare_values(arg_ty, l, r);
+    match op {
         BinOp::Eq => ordering.is_eq(),
         BinOp::NotEq => ordering.is_ne(),
         BinOp::Lt => ordering.is_lt(),
@@ -382,8 +398,7 @@ fn eval_binary(
         BinOp::Gt => ordering.is_gt(),
         BinOp::GtEq => ordering.is_ge(),
         _ => unreachable!(),
-    };
-    Ok(Value::Bool(result))
+    }
 }
 
 /// Whether [`compare_values`] defines an ordering for `ty` — i.e. the type has a

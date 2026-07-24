@@ -1061,6 +1061,11 @@ pub enum Expr {
         right: Box<Expr>,
         /// ANY and SOME are synonymous: <https://docs.cloudera.com/cdw-runtime/cloud/using-hiveql/topics/hive_comparison_predicates.html>
         is_some: bool,
+        /// Span of the comparison operator token — where PostgreSQL points an
+        /// error's cursor (e.g. `op ANY/ALL (array) requires array on right
+        /// side`). Wrapped in [`OpSpan`] so it is excluded from `Expr`
+        /// equality/ordering/hashing, as [`Expr::BinaryOp`]'s is.
+        op_span: OpSpan,
     },
     /// `ALL` operation e.g. `foo > ALL(bar)`, comparison operator is one of `[=, >, <, =>, =<, !=]`
     /// <https://docs.snowflake.com/en/sql-reference/operators-subquery#all-any>
@@ -1071,6 +1076,8 @@ pub enum Expr {
         compare_op: BinaryOperator,
         /// Right-hand subquery expression.
         right: Box<Expr>,
+        /// Span of the comparison operator token; see [`Expr::AnyOp`].
+        op_span: OpSpan,
     },
 
     /// Unary operation e.g. `NOT foo`
@@ -1904,6 +1911,7 @@ impl fmt::Display for Expr {
                 compare_op,
                 right,
                 is_some,
+                op_span: _,
             } => {
                 let add_parens = !matches!(right.as_ref(), Expr::Subquery(_));
                 write!(
@@ -1918,6 +1926,7 @@ impl fmt::Display for Expr {
                 left,
                 compare_op,
                 right,
+                op_span: _,
             } => {
                 let add_parens = !matches!(right.as_ref(), Expr::Subquery(_));
                 write!(

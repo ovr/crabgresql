@@ -1428,11 +1428,13 @@ impl Spanned for Expr {
                 compare_op: _,
                 right,
                 is_some: _,
+                op_span: _,
             } => left.span().union(&right.span()),
             Expr::AllOp {
                 left,
                 compare_op: _,
                 right,
+                op_span: _,
             } => left.span().union(&right.span()),
             Expr::UnaryOp { op: _, expr } => expr.span(),
             Expr::Convert {

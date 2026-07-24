@@ -18,8 +18,7 @@ use std::sync::Arc;
 
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{
-    BinOp, BoundAggregate, BoundExpr, DistinctKey, JoinKind, LogicalPlan, Returning, SortKey,
-    TableFn, UnaryOp,
+    BoundAggregate, BoundExpr, DistinctKey, JoinKind, LogicalPlan, Returning, SortKey, TableFn,
 };
 use crabgresql_planner::{
     HashKey, PhysicalAggInput, PhysicalInsertSource, PhysicalJoinExpr, PhysicalJoinInput,
@@ -607,7 +606,7 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
         }
         // The IN / ANY / ALL needle (in `cmp`) may itself hold a subquery; fold
         // those first.
-        BoundExpr::InSubquery { cmp, .. } | BoundExpr::QuantifiedSubquery { cmp, .. } => {
+        BoundExpr::QuantifiedSubquery { cmp, .. } => {
             resolve_expr(cmp, ctx, txn)?
         }
         // `x op ANY/ALL(array)` is an ordinary expression, not a foldable marker;
@@ -615,6 +614,11 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
         BoundExpr::QuantifiedArray { array, cmp, .. } => {
             resolve_expr(array, ctx, txn)?;
             resolve_expr(cmp, ctx, txn)?;
+            // A literal `ARRAY[…]` is row-invariant, so build its `Value::Array`
+            // once here rather than rebuilding it for every row in `eval`.
+            if let Some(folded) = fold_const_array(array) {
+                **array = folded;
+            }
         }
         BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
     }
@@ -641,7 +645,6 @@ fn is_foldable_subquery(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::ScalarSubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
-        | BoundExpr::InSubquery { subplan, .. }
         | BoundExpr::QuantifiedSubquery { subplan, .. } => {
             !crabgresql_binder::plan_has_outer_refs(&subplan.0)
         }
@@ -674,25 +677,23 @@ fn fold_subquery(
                 ty: PgType::Bool,
             })
         }
-        BoundExpr::InSubquery {
-            subplan,
-            negated,
-            cmp,
-        } => {
-            let rows = run_subplan(*subplan.0, ctx, txn)?;
-            let in_expr = build_in_chain(&cmp, rows, ctx)?;
-            Ok(if negated {
-                BoundExpr::Unary {
-                    op: UnaryOp::Not,
-                    expr: Box::new(in_expr),
-                }
-            } else {
-                in_expr
-            })
-        }
+        // The subquery runs once here; its candidate values become a constant
+        // array so the per-row work reuses the single `QuantifiedArray`
+        // evaluation path (which evaluates the needle exactly once per row).
         BoundExpr::QuantifiedSubquery { subplan, all, cmp } => {
             let rows = run_subplan(*subplan.0, ctx, txn)?;
-            build_quantified_chain(&cmp, subquery_column(rows), all, ctx)
+            let elem = hole_ty(&cmp).unwrap_or(PgType::Text);
+            Ok(BoundExpr::QuantifiedArray {
+                array: Box::new(BoundExpr::Const {
+                    value: Value::Array {
+                        elem,
+                        elems: subquery_column(rows),
+                    },
+                    ty: PgType::Array(elem.oid()),
+                }),
+                all,
+                cmp,
+            })
         }
         // Not a subquery marker (unreachable — the caller matched one).
         other => Ok(other),
@@ -748,7 +749,6 @@ pub(crate) fn eval_correlated_subquery(
     let subplan = match marker {
         BoundExpr::ScalarSubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
-        | BoundExpr::InSubquery { subplan, .. }
         | BoundExpr::QuantifiedSubquery { subplan, .. } => subplan,
         // `eval` only calls this for a subquery marker.
         _ => {
@@ -769,27 +769,13 @@ pub(crate) fn eval_correlated_subquery(
             let exists = subplan_has_rows(logical, ctx, txn)?;
             Ok(Value::Bool(exists != *negated))
         }
-        BoundExpr::InSubquery { negated, cmp, .. } => {
-            let rows = run_subplan(logical, ctx, txn)?;
-            // The OR-chain reuses the bound `x = <hole>` template, whose needle
-            // reads the current row — so evaluate the folded chain against `row`.
-            let in_expr = build_in_chain(cmp, rows, ctx)?;
-            let membership = eval::eval(&in_expr, row, ctx)?;
-            match (negated, membership) {
-                (false, m) => Ok(m),
-                // NOT IN is `NOT (x IN …)`, but Kleene: NULL stays NULL.
-                (true, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                (true, other) => Ok(other),
-            }
-        }
         BoundExpr::QuantifiedSubquery { all, cmp, .. } => {
             let rows = run_subplan(logical, ctx, txn)?;
-            // Like the IN chain, the template's needle reads the current row, so
-            // evaluate the OR/AND chain against `row`.
-            let chain = build_quantified_chain(cmp, subquery_column(rows), *all, ctx)?;
-            eval::eval(&chain, row, ctx)
+            // The template's needle reads the current row, so the quantifier is
+            // evaluated against `row` (needle once, then each candidate).
+            eval_quantified(cmp, &subquery_column(rows), *all, row, ctx)
         }
-        // Unreachable: `subplan` above already matched these four variants.
+        // Unreachable: `subplan` above already matched these three variants.
         _ => Ok(Value::Null),
     }
 }
@@ -833,80 +819,9 @@ fn drain(mut node: Box<dyn ExecNode>) -> Result<Vec<Tuple>, ExecError> {
     Ok(out)
 }
 
-/// Fold `x IN (values)` to the OR-of-equalities PG lowers `x IN (list)` to: one
-/// `x = value` comparison per candidate, combined with OR. `cmp` is the bound
-/// `x = <hole>` template; each candidate value is substituted into its RHS hole,
-/// preserving the operand coercions the binder resolved. The comparisons are
-/// combined into a **balanced** OR tree so `eval` (and `Drop`) recurse in
-/// O(log n), not O(n) — a subquery can return far more rows than a hand-written
-/// IN list. An empty set folds to `false` (the caller wraps `NOT IN` in `NOT`).
-fn build_in_chain(
-    cmp: &BoundExpr,
-    rows: Vec<Tuple>,
-    ctx: &ExecContext,
-) -> Result<BoundExpr, ExecError> {
-    let BoundExpr::Binary {
-        op,
-        arg_ty,
-        left,
-        right,
-    } = cmp
-    else {
-        return Err(ExecError::new(
-            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
-            "IN (SELECT …) comparison template was not a binary comparison",
-        ));
-    };
-    let mut comparisons = Vec::with_capacity(rows.len());
-    for mut row in rows {
-        let value = if row.is_empty() {
-            Value::Null
-        } else {
-            row.swap_remove(0)
-        };
-        comparisons.push(BoundExpr::Binary {
-            op: *op,
-            arg_ty: *arg_ty,
-            left: left.clone(),
-            right: Box::new(substitute_hole(right, value, ctx)?),
-        });
-    }
-    Ok(balanced_or(comparisons))
-}
-
-/// Combine boolean expressions into a balanced `OR` tree (depth ⌈log₂ n⌉). An
-/// empty input is `false`. Kept balanced so evaluating / dropping the tree never
-/// recurses linearly in the number of candidates.
-fn balanced_or(mut nodes: Vec<BoundExpr>) -> BoundExpr {
-    if nodes.is_empty() {
-        return BoundExpr::Const {
-            value: Value::Bool(false),
-            ty: PgType::Bool,
-        };
-    }
-    while nodes.len() > 1 {
-        let mut merged = Vec::with_capacity(nodes.len().div_ceil(2));
-        let mut it = nodes.into_iter();
-        while let Some(a) = it.next() {
-            match it.next() {
-                Some(b) => merged.push(BoundExpr::Binary {
-                    op: BinOp::Or,
-                    arg_ty: PgType::Bool,
-                    left: Box::new(a),
-                    right: Box::new(b),
-                }),
-                None => merged.push(a),
-            }
-        }
-        nodes = merged;
-    }
-    // Exactly one node remains (input was non-empty).
-    nodes.swap_remove(0)
-}
-
 /// The first column of a subquery's materialized rows — the candidate values a
-/// quantified comparison (`op ANY/ALL (SELECT …)`) chains over. An empty row
-/// contributes a NULL, matching `build_in_chain`.
+/// quantified comparison (`op ANY/ALL (SELECT …)`) tests against. An empty row
+/// contributes a NULL.
 fn subquery_column(rows: Vec<Tuple>) -> Vec<Value> {
     rows.into_iter()
         .map(|mut row| {
@@ -919,19 +834,27 @@ fn subquery_column(rows: Vec<Tuple>) -> Vec<Value> {
         .collect()
 }
 
-/// Fold `left op ANY/ALL (values)` to the OR/AND chain PG defines it as: one
-/// `left op value` comparison per candidate, substituted into the `cmp`
-/// template's `<hole>` (preserving the binder's coercions), then combined into a
-/// balanced tree. `ANY`/`SOME` OR-chains (empty ⇒ false); `ALL` AND-chains
-/// (empty ⇒ true). Three-valued NULL logic falls out of `eval`'s Kleene AND/OR
-/// and each comparison's NULL short-circuit. Shared by the subquery and array
-/// forms.
-fn build_quantified_chain(
+/// Evaluate `left op ANY/ALL (values)` against one `row`.
+///
+/// The needle is evaluated **exactly once** — PG's `ScalarArrayOpExpr` evaluates
+/// its scalar side once, so a volatile or side-effecting needle
+/// (`nextval('s') = ANY(…)`, `random() > ALL(…)`) must not be re-run per
+/// candidate. Each candidate is then substituted into the `cmp` template's
+/// `<hole>` (preserving the coercions the binder resolved) and compared against
+/// that single needle value.
+///
+/// Three-valued logic, matching the OR/AND chain this replaces: `ANY` yields
+/// true on the first match, `ALL` false on the first mismatch (both
+/// short-circuit); otherwise a NULL anywhere makes the result NULL, and an
+/// exhausted set yields the quantifier's identity (`ANY` ⇒ false, `ALL` ⇒ true,
+/// so an empty set is false / vacuously true).
+fn eval_quantified(
     cmp: &BoundExpr,
-    values: Vec<Value>,
+    values: &[Value],
     all: bool,
+    row: &[Value],
     ctx: &ExecContext,
-) -> Result<BoundExpr, ExecError> {
+) -> Result<Value, ExecError> {
     let BoundExpr::Binary {
         op,
         arg_ty,
@@ -944,53 +867,103 @@ fn build_quantified_chain(
             "ANY/ALL comparison template was not a binary comparison",
         ));
     };
-    let mut comparisons = Vec::with_capacity(values.len());
-    for value in values {
-        comparisons.push(BoundExpr::Binary {
-            op: *op,
-            arg_ty: *arg_ty,
-            left: left.clone(),
-            right: Box::new(substitute_hole(right, value, ctx)?),
-        });
+    // Without the binder's NULL `Const` placeholder there is nothing to
+    // substitute a candidate into, and every comparison would silently be
+    // `needle op NULL` — i.e. a wrong answer with no error. Fail loudly instead.
+    if hole_ty(cmp).is_none() {
+        return Err(ExecError::new(
+            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+            "ANY/ALL comparison template has no candidate placeholder",
+        ));
     }
-    Ok(if all {
-        balanced_and(comparisons)
+    // The one and only evaluation of the needle.
+    let needle = eval::eval(left, row, ctx)?;
+    let needle_null = matches!(needle, Value::Null);
+    let mut saw_null = needle_null;
+    // The common case is a bare hole (`Const { Null, ty }`): the candidate only
+    // needs the hole's coercion, with no node to build and evaluate per element.
+    let bare_hole = match right.as_ref() {
+        BoundExpr::Const {
+            value: Value::Null,
+            ty,
+        } => Some(*ty),
+        _ => None,
+    };
+    for value in values {
+        // Candidates are coerced even once the result can only be NULL, since a
+        // coercion failure is observable — as it was when this was an OR/AND
+        // chain that evaluated every element.
+        let candidate = match bare_hole {
+            Some(ty) => eval::coerce_value(value.clone(), ty, ctx)?,
+            None => eval::eval(&substitute_hole(right, value.clone(), ctx)?, row, ctx)?,
+        };
+        // Only *this* candidate (or the needle) being NULL skips the comparison;
+        // an earlier NULL must not mask a later decisive one, so
+        // `1 = ANY(ARRAY[NULL, 1])` is still true rather than NULL.
+        if needle_null || matches!(candidate, Value::Null) {
+            saw_null = true;
+            continue;
+        }
+        if eval::apply_comparison(*op, *arg_ty, &needle, &candidate) != all {
+            // ANY found a match, or ALL found a counterexample.
+            return Ok(Value::Bool(!all));
+        }
+    }
+    if saw_null {
+        Ok(Value::Null)
     } else {
-        balanced_or(comparisons)
+        Ok(Value::Bool(all))
+    }
+}
+
+/// Fold an all-constant `ARRAY[…]` constructor into the `Value::Array` it always
+/// produces, so a quantified comparison over a literal array borrows one
+/// constant instead of rebuilding the array per row. `None` when any element is
+/// non-constant (a column/param reference), which must stay per-row.
+fn fold_const_array(expr: &BoundExpr) -> Option<BoundExpr> {
+    let BoundExpr::ArrayCtor { elem, ty, elems } = expr else {
+        return None;
+    };
+    let values = elems
+        .iter()
+        .map(|e| match e {
+            BoundExpr::Const { value, .. } => Some(value.clone()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(BoundExpr::Const {
+        value: Value::Array {
+            elem: *elem,
+            elems: values,
+        },
+        ty: *ty,
     })
 }
 
-/// Combine boolean expressions into a balanced `AND` tree (depth ⌈log₂ n⌉) — the
-/// `ALL` dual of [`balanced_or`]. An empty input is `true` (`op ALL` over an
-/// empty set holds vacuously).
-fn balanced_and(mut nodes: Vec<BoundExpr>) -> BoundExpr {
-    if nodes.is_empty() {
-        return BoundExpr::Const {
-            value: Value::Bool(true),
-            ty: PgType::Bool,
-        };
-    }
-    while nodes.len() > 1 {
-        let mut merged = Vec::with_capacity(nodes.len().div_ceil(2));
-        let mut it = nodes.into_iter();
-        while let Some(a) = it.next() {
-            match it.next() {
-                Some(b) => merged.push(BoundExpr::Binary {
-                    op: BinOp::And,
-                    arg_ty: PgType::Bool,
-                    left: Box::new(a),
-                    right: Box::new(b),
-                }),
-                None => merged.push(a),
-            }
+/// The declared type of a comparison template's `<hole>` — the NULL `Const` the
+/// binder planted on the RHS, reached through the same coercion wrappers
+/// [`substitute_hole`] descends. Used to label the constant array a folded
+/// `op ANY/ALL (SELECT …)` becomes; `None` if the template has no hole.
+fn hole_ty(cmp: &BoundExpr) -> Option<PgType> {
+    fn find(expr: &BoundExpr) -> Option<PgType> {
+        match expr {
+            BoundExpr::Const {
+                value: Value::Null,
+                ty,
+            } => Some(*ty),
+            BoundExpr::Const { .. } => None,
+            BoundExpr::Coerce { expr, .. } | BoundExpr::Reinterpret { expr, .. } => find(expr),
+            BoundExpr::FuncCall { args, .. } => args.iter().find_map(find),
+            _ => None,
         }
-        nodes = merged;
     }
-    // Exactly one node remains (input was non-empty).
-    nodes.swap_remove(0)
+    match cmp {
+        BoundExpr::Binary { right, .. } => find(right),
+        _ => None,
+    }
 }
 
-/// Substitute a candidate value into the IN comparison template's `<hole>` — the
+/// Substitute a candidate value into the comparison template's `<hole>` — the
 /// unique NULL `Const` the binder placed on the RHS — and coerce it to that
 /// hole's declared type. The hole may sit under a `Coerce`, a `Reinterpret`, or
 /// a coercion `FuncCall` (e.g. `bpchar → text` lowers to `FuncCall{BpcharToText}`
