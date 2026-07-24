@@ -573,6 +573,11 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
         BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
             resolve_exprs(args, ctx, txn)?;
         }
+        BoundExpr::ArrayCtor { elems, .. } => resolve_exprs(elems, ctx, txn)?,
+        BoundExpr::Subscript { base, index, .. } => {
+            resolve_expr(base, ctx, txn)?;
+            resolve_expr(index, ctx, txn)?;
+        }
         BoundExpr::Case { whens, else_, .. } => {
             for (cond, result) in whens.iter_mut() {
                 resolve_expr(cond, ctx, txn)?;
@@ -1465,6 +1470,7 @@ impl TableFunctionSource {
                 TableFn::JsonbPathQuery => {
                     TableFnState::Series(jsonb_path_query_series(&values)?)
                 }
+                TableFn::Unnest(_) => TableFnState::Series(unnest_series(&values)),
             });
         }
         match self.state.as_mut() {
@@ -2527,10 +2533,20 @@ fn build_series(func: TableFn, values: &[Value]) -> Result<Series, ExecError> {
     match func {
         TableFn::GenerateSeries(elem) => Series::from_args(elem, values),
         TableFn::JsonbPathQuery => jsonb_path_query_series(values),
+        TableFn::Unnest(_) => Ok(unnest_series(values)),
         TableFn::PgInputErrorInfo => Err(ExecError::new(
             crabgresql_pg_wire::sqlstate::FEATURE_NOT_SUPPORTED,
             "set-returning function is not supported in this context",
         )),
+    }
+}
+
+/// Materialize `unnest(array)` into a [`Series`] of its elements (NULL elements
+/// included). A NULL array argument yields no rows, as PG's `unnest` does.
+fn unnest_series(values: &[Value]) -> Series {
+    match values.first() {
+        Some(Value::Array { elems, .. }) => Series::Materialized(elems.clone().into_iter()),
+        _ => Series::Empty,
     }
 }
 

@@ -258,6 +258,23 @@ pub enum BoundExpr {
         ret: PgType,
         args: Vec<BoundExpr>,
     },
+    /// An array constructor (`ARRAY[a, b, c]` or `ARRAY[]::t[]`). Every element
+    /// is already coerced to `elem`, the common element type; `ty` is the
+    /// resulting `PgType::Array(elem.oid())`. Evaluates element-wise to a
+    /// [`Value::Array`].
+    ArrayCtor {
+        elem: PgType,
+        ty: PgType,
+        elems: Vec<BoundExpr>,
+    },
+    /// Array element access (`a[i]`). `base` is an array expression, `index` is
+    /// an int4; the result type `ty` is the element type. A NULL or out-of-range
+    /// subscript yields NULL (PG semantics), never an error.
+    Subscript {
+        base: Box<BoundExpr>,
+        index: Box<BoundExpr>,
+        ty: PgType,
+    },
     /// `CASE`: WHEN conditions are boolean and evaluated top-to-bottom; the
     /// first one that is *true* selects its result. `else_` is present only for
     /// an explicit ELSE (a missing ELSE yields NULL). Every result is already
@@ -428,6 +445,8 @@ impl BoundExpr {
             BoundExpr::Coerce { ty, .. } => *ty,
             BoundExpr::Reinterpret { reported, .. } => *reported,
             BoundExpr::FuncCall { ret, .. } => *ret,
+            BoundExpr::ArrayCtor { ty, .. } => *ty,
+            BoundExpr::Subscript { ty, .. } => *ty,
             BoundExpr::Case { ty, .. } => *ty,
             BoundExpr::Srf { ret, .. } => *ret,
             BoundExpr::Aggregate { ret, .. } => *ret,
@@ -451,6 +470,10 @@ impl BoundExpr {
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_srf(),
             BoundExpr::Binary { left, right, .. } => left.contains_srf() || right.contains_srf(),
             BoundExpr::FuncCall { args, .. } => args.iter().any(BoundExpr::contains_srf),
+            BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_srf),
+            BoundExpr::Subscript { base, index, .. } => {
+                base.contains_srf() || index.contains_srf()
+            }
             BoundExpr::Case { whens, else_, .. } => {
                 whens
                     .iter()
@@ -493,6 +516,10 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
                 args.iter().any(BoundExpr::contains_aggregate)
             }
+            BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_aggregate),
+            BoundExpr::Subscript { base, index, .. } => {
+                base.contains_aggregate() || index.contains_aggregate()
+            }
             BoundExpr::Case { whens, else_, .. } => {
                 whens
                     .iter()
@@ -521,6 +548,12 @@ impl BoundExpr {
                 ) || args.iter().any(BoundExpr::contains_volatile_fn)
             }
             BoundExpr::Srf { args, .. } => args.iter().any(BoundExpr::contains_volatile_fn),
+            BoundExpr::ArrayCtor { elems, .. } => {
+                elems.iter().any(BoundExpr::contains_volatile_fn)
+            }
+            BoundExpr::Subscript { base, index, .. } => {
+                base.contains_volatile_fn() || index.contains_volatile_fn()
+            }
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
             | BoundExpr::Coerce { expr, .. }
@@ -567,6 +600,12 @@ impl BoundExpr {
             }
             BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
                 args.iter().map(|a| a.count_param_refs(index)).sum()
+            }
+            BoundExpr::ArrayCtor { elems, .. } => {
+                elems.iter().map(|a| a.count_param_refs(index)).sum()
+            }
+            BoundExpr::Subscript { base, index: idx, .. } => {
+                base.count_param_refs(index) + idx.count_param_refs(index)
             }
             BoundExpr::Case { whens, else_, .. } => {
                 whens
@@ -615,6 +654,11 @@ impl BoundExpr {
                 }
                 BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
                     args.iter().for_each(|a| fold(a, acc));
+                }
+                BoundExpr::ArrayCtor { elems, .. } => elems.iter().for_each(|a| fold(a, acc)),
+                BoundExpr::Subscript { base, index, .. } => {
+                    fold(base, acc);
+                    fold(index, acc);
                 }
                 BoundExpr::Case { whens, else_, .. } => {
                     for (c, r) in whens {
@@ -826,6 +870,16 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             func: *func,
             ret: *ret,
             args: args.iter().map(|a| outerize_columns(a, level)).collect(),
+        },
+        BoundExpr::ArrayCtor { elem, ty, elems } => BoundExpr::ArrayCtor {
+            elem: *elem,
+            ty: *ty,
+            elems: elems.iter().map(|a| outerize_columns(a, level)).collect(),
+        },
+        BoundExpr::Subscript { base, index, ty } => BoundExpr::Subscript {
+            base: Box::new(outerize_columns(base, level)),
+            index: Box::new(outerize_columns(index, level)),
+            ty: *ty,
         },
         BoundExpr::Case { whens, else_, ty } => BoundExpr::Case {
             whens: whens
@@ -1363,8 +1417,84 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
             low,
             high,
         } => bind_between(expr, low, high, *negated, scope),
+        // `ARRAY[...]` / `[...]` array constructor.
+        ast::Expr::Array(arr) => bind_array_ctor(&arr.elem, scope),
+        // `a[i]` array element access.
+        ast::Expr::CompoundFieldAccess { root, access_chain } => {
+            bind_subscript(root, access_chain, scope)
+        }
         other => Err(unsupported_expr(other)),
     }
+}
+
+/// Bind an `ARRAY[...]` constructor. Elements are bound and unified to a common
+/// element type (untyped literals adapt to it), then coerced; the result type is
+/// `PgType::Array(elem)`. An empty `ARRAY[]` settles on `text[]` and typically
+/// takes its real type from a surrounding cast (`ARRAY[]::int[]`).
+fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindError> {
+    let bindings = elems
+        .iter()
+        .map(|e| bind_expr(e, scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (elem, exprs) = unify_value_column(bindings, "ARRAY")?;
+    // Reject an element type this build has no array type for — this also
+    // rejects a multi-dimensional constructor (an array-typed element).
+    if crabgresql_types::array::array_oid_for_elem(elem.oid()).is_none() {
+        return Err(BindError::feature_not_supported(format!(
+            "could not find array type for data type {}",
+            elem.name()
+        )));
+    }
+    Ok(Binding::Typed(BoundExpr::ArrayCtor {
+        elem,
+        ty: PgType::Array(elem.oid()),
+        elems: exprs,
+    }))
+}
+
+/// Bind an `a[i]` subscript. Only a single integer index on an array is
+/// supported (slices and chained/multi-dim subscripts are `0A000`). The result
+/// type is the array's element type.
+fn bind_subscript(
+    root: &ast::Expr,
+    access_chain: &[ast::AccessExpr],
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let index_expr = match access_chain {
+        [ast::AccessExpr::Subscript(ast::Subscript::Index { index })] => index,
+        [ast::AccessExpr::Subscript(ast::Subscript::Slice { .. })] => {
+            return Err(BindError::feature_not_supported(
+                "array slice access is not supported yet",
+            ));
+        }
+        // Chained/multi-dimensional subscripts and dotted field access.
+        _ => {
+            return Err(BindError::feature_not_supported(
+                "multi-dimensional or field subscripting is not supported yet",
+            ));
+        }
+    };
+    let base = bind_scalar(root, scope)?;
+    let elem = match base.ty() {
+        PgType::Array(elem_oid) => PgType::from_oid(elem_oid).ok_or_else(|| {
+            BindError::feature_not_supported("subscripting this array type is not supported yet")
+        })?,
+        other => {
+            return Err(BindError::new(
+                sqlstate::DATATYPE_MISMATCH,
+                format!(
+                    "cannot subscript type {} because it does not support subscripting",
+                    other.name()
+                ),
+            ));
+        }
+    };
+    let index = coerce_expr(bind_scalar(index_expr, scope)?, PgType::Int4)?;
+    Ok(Binding::Typed(BoundExpr::Subscript {
+        base: Box::new(base),
+        index: Box::new(index),
+        ty: elem,
+    }))
 }
 
 /// Bind a nested query into a [`LogicalPlan`] against the enclosing scope's
@@ -1615,6 +1745,11 @@ fn unsupported_expr(expr: &ast::Expr) -> BindError {
 /// (`=`, `<`, …) and ORDER BY require this — binding a sort or comparison on any
 /// other type would produce a node the evaluator can't handle.
 pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
+    // An array is orderable/comparable iff its element type is (element-wise
+    // comparison). Keep in sync with the executor's `compare_values`.
+    if let PgType::Array(elem_oid) = ty {
+        return PgType::from_oid(elem_oid).is_some_and(|e| is_orderable(e, catalog));
+    }
     matches!(
         ty,
         PgType::Bool
@@ -1820,6 +1955,31 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                 )));
             }
         },
+        // `T[]` / `ARRAY[N]` / `ARRAY<T>`: a one-dimensional array of the element
+        // type. The `int[5]` length is accepted and ignored (PG does not enforce
+        // array length). A bare `ARRAY` (no element type) has no meaning here.
+        DataType::Array(elem_def) => {
+            let inner = match elem_def {
+                ast::ArrayElemTypeDef::SquareBracket(inner, _)
+                | ast::ArrayElemTypeDef::AngleBracket(inner)
+                | ast::ArrayElemTypeDef::Parenthesis(inner) => inner,
+                ast::ArrayElemTypeDef::None => {
+                    return Err(BindError::feature_not_supported(
+                        "array type without an element type is not supported",
+                    ));
+                }
+            };
+            let elem = map_data_type(inner)?;
+            // Only element types this build has an array type for are supported;
+            // this also rejects multi-dimensional arrays (an array element type),
+            // which are not modeled yet.
+            if crabgresql_types::array::array_oid_for_elem(elem.oid()).is_none() {
+                return Err(BindError::feature_not_supported(format!(
+                    "type \"{dt}\" is not supported yet"
+                )));
+            }
+            PgType::Array(elem.oid())
+        }
         // `bpchar` (no length = unlimited, like text) and `name` arrive as
         // custom type names.
         DataType::Custom(obj, mods) if mods.is_empty() => {
@@ -2773,6 +2933,13 @@ fn bind_binary(
     if matches!(op, ast::BinaryOperator::StringConcat) {
         let lb = bind_expr(left, scope)?;
         let rb = bind_expr(right, scope)?;
+        // Array concatenation (`array || array`, `array || element`,
+        // `element || array`) when either side is a typed array.
+        if binding_typed_ty(&lb).is_some_and(PgType::is_array)
+            || binding_typed_ty(&rb).is_some_and(PgType::is_array)
+        {
+            return bind_array_concat(lb, rb);
+        }
         // Route to bit concatenation only when neither side is a concrete
         // non-bit type — i.e. both operands are bit strings or untyped literals,
         // and at least one is a bit string. `bit || text` instead falls to the
@@ -2848,6 +3015,11 @@ fn bind_binary(
     // functions (in silent mode). Tried before the generic mapping, which has no
     // arm for `@?`/`@@`.
     if let Some(binding) = resolve_jsonb_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
+    // Array containment / overlap (`@>` `<@` `&&`) on array operands.
+    if let Some(binding) = resolve_array_op(op, &lb, &rb)? {
         return Ok(binding);
     }
 
@@ -3709,6 +3881,179 @@ fn resolve_bit_op(
     Ok(None)
 }
 
+/// The `(array type, element type)` of a binding that is a typed array, or
+/// `None` for anything else.
+fn array_arg_type(b: &Binding) -> Option<(PgType, PgType)> {
+    match binding_typed_ty(b) {
+        Some(PgType::Array(elem_oid)) => {
+            PgType::from_oid(elem_oid).map(|e| (PgType::Array(elem_oid), e))
+        }
+        _ => None,
+    }
+}
+
+/// Array containment / overlap operators (`@>`, `<@`, `&&`) → the array
+/// `ScalarFn`s. Only fires when at least one operand is a typed array; two typed
+/// arrays of different element types fall through (PG's `operator does not
+/// exist`). Tried after the network/geometric/jsonb resolvers, which own these
+/// operator spellings for their own operand types.
+fn resolve_array_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+) -> Result<Option<Binding>, BindError> {
+    use ast::BinaryOperator as B;
+    let func = match op {
+        B::AtArrow => ScalarFn::ArrayContains,
+        B::ArrowAt => ScalarFn::ArrayContainedBy,
+        B::PGOverlap => ScalarFn::ArrayOverlap,
+        _ => return Ok(None),
+    };
+    let lt = binding_typed_ty(lb);
+    let rt = binding_typed_ty(rb);
+    // The shared array type, taken from a typed array operand. Two typed arrays
+    // of different element types have no operator here.
+    let arr_ty = match (array_arg_type(lb), array_arg_type(rb)) {
+        (Some((a, _)), Some((b, _))) => {
+            if a != b {
+                return Ok(None);
+            }
+            a
+        }
+        (Some((a, _)), None) if !rt.is_some_and(PgType::is_array) => a,
+        (None, Some((b, _))) if !lt.is_some_and(PgType::is_array) => b,
+        _ => return Ok(None),
+    };
+    let left = resolve_operand(lb, arr_ty)?;
+    let right = resolve_operand(rb, arr_ty)?;
+    Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+        func,
+        ret: PgType::Bool,
+        args: vec![left, right],
+    })))
+}
+
+/// `||` where at least one operand is an array: array‖array (`array_cat`),
+/// array‖element (`array_append`), or element‖array (`array_prepend`). The
+/// caller (`bind_binary`) routes here before the text/bit concat paths when a
+/// typed array is present.
+fn bind_array_concat(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
+    let la = array_arg_type(&lb);
+    let ra = array_arg_type(&rb);
+    match (la, ra) {
+        // array || array (same element type).
+        (Some((lt, _)), Some((rt, _))) => {
+            if lt != rt {
+                return Err(no_operator(
+                    &binding_type_label(&lb),
+                    BinOp::Add,
+                    &binding_type_label(&rb),
+                ));
+            }
+            let left = resolve_operand(&lb, lt)?;
+            let right = resolve_operand(&rb, lt)?;
+            Ok(Binding::Typed(BoundExpr::FuncCall {
+                func: ScalarFn::ArrayCat,
+                ret: lt,
+                args: vec![left, right],
+            }))
+        }
+        // array || element.
+        (Some((arr_ty, elem)), None) => {
+            let left = resolve_operand(&lb, arr_ty)?;
+            let right = resolve_operand(&rb, elem)?;
+            Ok(Binding::Typed(BoundExpr::FuncCall {
+                func: ScalarFn::ArrayAppend,
+                ret: arr_ty,
+                args: vec![left, right],
+            }))
+        }
+        // element || array.
+        (None, Some((arr_ty, elem))) => {
+            let left = resolve_operand(&lb, elem)?;
+            let right = resolve_operand(&rb, arr_ty)?;
+            Ok(Binding::Typed(BoundExpr::FuncCall {
+                func: ScalarFn::ArrayPrepend,
+                ret: arr_ty,
+                args: vec![left, right],
+            }))
+        }
+        // The caller only routes here when a typed array is present.
+        (None, None) => unreachable!("bind_array_concat requires a typed array operand"),
+    }
+}
+
+/// Bind a polymorphic array function whose overload can't live in the
+/// fixed-signature table: `cardinality`, `array_length`, `array_append`,
+/// `array_prepend`, `array_cat`. Returns `Ok(None)` if `name` is not one of
+/// them, so the caller falls through to ordinary resolution.
+pub(crate) fn bind_array_function(
+    name: &str,
+    bindings: &[Binding],
+) -> Result<Option<Binding>, BindError> {
+    let undefined = || {
+        BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!(
+                "function {name}({}) does not exist",
+                bindings
+                    .iter()
+                    .map(binding_type_label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    };
+    let call = |func, ret, args| Ok(Some(Binding::Typed(BoundExpr::FuncCall { func, ret, args })));
+    match name {
+        "cardinality" => {
+            let [b] = bindings else { return Err(undefined()) };
+            let (arr_ty, _) = array_arg_type(b).ok_or_else(undefined)?;
+            call(ScalarFn::Cardinality, PgType::Int4, vec![resolve_operand(b, arr_ty)?])
+        }
+        "array_length" => {
+            let [a, dim] = bindings else { return Err(undefined()) };
+            let (arr_ty, _) = array_arg_type(a).ok_or_else(undefined)?;
+            call(
+                ScalarFn::ArrayLength,
+                PgType::Int4,
+                vec![resolve_operand(a, arr_ty)?, resolve_operand(dim, PgType::Int4)?],
+            )
+        }
+        "array_append" => {
+            let [a, e] = bindings else { return Err(undefined()) };
+            let (arr_ty, elem) = array_arg_type(a).ok_or_else(undefined)?;
+            call(
+                ScalarFn::ArrayAppend,
+                arr_ty,
+                vec![resolve_operand(a, arr_ty)?, resolve_operand(e, elem)?],
+            )
+        }
+        "array_prepend" => {
+            let [e, a] = bindings else { return Err(undefined()) };
+            let (arr_ty, elem) = array_arg_type(a).ok_or_else(undefined)?;
+            call(
+                ScalarFn::ArrayPrepend,
+                arr_ty,
+                vec![resolve_operand(e, elem)?, resolve_operand(a, arr_ty)?],
+            )
+        }
+        "array_cat" => {
+            let [a, b] = bindings else { return Err(undefined()) };
+            let arr_ty = array_arg_type(a)
+                .or_else(|| array_arg_type(b))
+                .map(|(t, _)| t)
+                .ok_or_else(undefined)?;
+            call(
+                ScalarFn::ArrayCat,
+                arr_ty,
+                vec![resolve_operand(a, arr_ty)?, resolve_operand(b, arr_ty)?],
+            )
+        }
+        _ => Ok(None),
+    }
+}
+
 /// `macaddr`/`macaddr8` `&`/`|`: lower to the width-dispatched `ScalarFn`. PG has
 /// only `macaddr & macaddr` and `macaddr8 & macaddr8` — no cross-width operator
 /// and no implicit `macaddr`<->`macaddr8` — so both operands must settle on the
@@ -4451,6 +4796,14 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Jsonpath => crabgresql_types::jsonpath::jsonpath_in(s)
             .map(Value::Jsonpath)
             .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail)),
+        // `array_in`: parse a `{...}` literal, coercing each element to the array
+        // element type.
+        PgType::Array(elem_oid) => {
+            let elem = PgType::from_oid(elem_oid).ok_or_else(invalid)?;
+            crabgresql_types::array::array_in(s, elem)
+                .map(|elems| Value::Array { elem, elems })
+                .map_err(|e| BindError::new(e.sqlstate, e.message))
+        }
         PgType::User(_) => Err(invalid()),
     }
 }
@@ -4826,6 +5179,16 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             input_ty,
             ret,
         },
+        BoundExpr::ArrayCtor { elem, ty, elems } => BoundExpr::ArrayCtor {
+            elem,
+            ty,
+            elems: elems.into_iter().map(|a| inline_params(a, args)).collect(),
+        },
+        BoundExpr::Subscript { base, index, ty } => BoundExpr::Subscript {
+            base: Box::new(inline_params(*base, args)),
+            index: Box::new(inline_params(*index, args)),
+            ty,
+        },
         // Subqueries cannot appear in a validated scalar body; leave untouched.
         BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
@@ -4929,6 +5292,8 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         ast::Expr::Extract { .. } => "extract".into(),
         // `x AT TIME ZONE y` lowers to timezone(); PG names the column "timezone".
         ast::Expr::AtTimeZone { .. } => "timezone".into(),
+        // An `ARRAY[...]` constructor is named "array" in PG.
+        ast::Expr::Array(_) => "array".into(),
         // A bare CASE expression is named "case" in PG.
         ast::Expr::Case { .. } => "case".into(),
         // CEIL/FLOOR special syntax is named after the function.
@@ -4989,9 +5354,17 @@ fn column_name(expr: &ast::Expr) -> Option<String> {
 }
 
 fn type_output_name(data_type: &ast::DataType) -> String {
-    map_data_type(data_type).map(|ty| ty.typname().to_string()).unwrap_or_else(|_| {
-        // A user-defined type (e.g. an enum) is named after the type itself, as
-        // PG does (`'red'::rainbow` → column "rainbow").
-        custom_type_name(data_type).unwrap_or_else(|| "?column?".into())
-    })
+    map_data_type(data_type)
+        .map(|ty| match ty {
+            // A cast to an array type is named after the *element* type in PG
+            // (`'{1}'::int[]` → column "int4"), not the `_int4` array typname.
+            PgType::Array(elem) => PgType::from_oid(elem)
+                .map_or_else(|| ty.typname().to_string(), |e| e.typname().to_string()),
+            _ => ty.typname().to_string(),
+        })
+        .unwrap_or_else(|_| {
+            // A user-defined type (e.g. an enum) is named after the type itself, as
+            // PG does (`'red'::rainbow` → column "rainbow").
+            custom_type_name(data_type).unwrap_or_else(|| "?column?".into())
+        })
 }

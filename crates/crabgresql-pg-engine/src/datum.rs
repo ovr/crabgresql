@@ -7,7 +7,7 @@
 //! `u32` length prefix followed by the payload. Floats are stored via `to_bits`
 //! so NaN payloads survive a round trip.
 
-use crabgresql_types::{Inet, Interval, Numeric, TimeTz, Value, json};
+use crabgresql_types::{Inet, Interval, Numeric, PgType, TimeTz, Value, json};
 
 // Type tags. Never reordered — they are an on-disk format.
 const T_BOOL: u8 = 1;
@@ -39,6 +39,7 @@ const T_ENUM: u8 = 26;
 const T_JSON: u8 = 27;
 const T_JSONB: u8 = 28;
 const T_JSONPATH: u8 = 29;
+const T_ARRAY: u8 = 30;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -178,6 +179,22 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.push(T_JSONPATH);
             put_var(out, crabgresql_types::jsonpath::format(p).as_bytes());
         }
+        // A 1-D array: element type OID, element count, then per element a
+        // presence byte (0 = NULL, 1 = a self-describing datum). Elements recurse
+        // through `encode_datum`, so nested value types work automatically.
+        Value::Array { elem, elems } => {
+            out.push(T_ARRAY);
+            out.extend_from_slice(&elem.oid().to_le_bytes());
+            out.extend_from_slice(&(elems.len() as u32).to_le_bytes());
+            for e in elems {
+                if matches!(e, Value::Null) {
+                    out.push(0);
+                } else {
+                    out.push(1);
+                    encode_datum(e, out);
+                }
+            }
+        }
     }
 }
 
@@ -316,6 +333,20 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
                 crabgresql_types::jsonpath::jsonpath_in(s).expect("stored jsonpath re-parses"),
             )
         }
+        T_ARRAY => {
+            let elem_oid = r.u32();
+            let elem = PgType::from_oid(elem_oid).expect("stored array element type re-resolves");
+            let count = r.u32() as usize;
+            let mut elems = Vec::with_capacity(count);
+            for _ in 0..count {
+                if r.take(1)[0] == 0 {
+                    elems.push(Value::Null);
+                } else {
+                    elems.push(decode_datum(buf, &mut r.pos));
+                }
+            }
+            Value::Array { elem, elems }
+        }
         other => panic!("corrupt datum tag {other}"),
     };
     *pos = r.pos;
@@ -397,6 +428,23 @@ mod tests {
                 .map(Value::Jsonpath)
                 .expect("valid jsonpath"),
         );
+        // Arrays: 1-D, empty, NULL elements, and a text element type.
+        roundtrip(Value::Array {
+            elem: PgType::Int4,
+            elems: vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)],
+        });
+        roundtrip(Value::Array {
+            elem: PgType::Int4,
+            elems: vec![],
+        });
+        roundtrip(Value::Array {
+            elem: PgType::Int8,
+            elems: vec![Value::Int8(10), Value::Null, Value::Int8(-30)],
+        });
+        roundtrip(Value::Array {
+            elem: PgType::Text,
+            elems: vec![Value::Text("a".into()), Value::Text("b,c".into())],
+        });
     }
 
     #[test]
