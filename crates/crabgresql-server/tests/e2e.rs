@@ -866,7 +866,8 @@ async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
 
     // `OPERATOR(pg_catalog.op)` and the bare `OPERATOR(op)` form resolve to the
     // same built-in operator as the plain spelling: regex, comparison,
-    // arithmetic, exponent, and array containment all route identically.
+    // arithmetic, exponent, array containment, and inet containment/shift all
+    // route identically.
     let messages = client
         .simple_query(
             "SELECT 'foo' OPERATOR(pg_catalog.~) 'f.o' AS rx, \
@@ -874,7 +875,9 @@ async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
              1 OPERATOR(pg_catalog.=) 1 AS eq, \
              (1 OPERATOR(pg_catalog.+) 2) AS sum, \
              (2 OPERATOR(pg_catalog.^) 3) AS pow, \
-             '{1,2}'::int[] OPERATOR(pg_catalog.@>) '{1}'::int[] AS contains",
+             '{1,2}'::int[] OPERATOR(pg_catalog.@>) '{1}'::int[] AS contains, \
+             inet '10.0.0.0/8' OPERATOR(pg_catalog.>>) inet '10.1.2.3' AS net_gt, \
+             inet '10.1.2.3' OPERATOR(pg_catalog.<<) inet '10.0.0.0/8' AS net_lt",
         )
         .await?;
     let rows = rows(&messages);
@@ -885,18 +888,47 @@ async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
     assert_eq!(row.get(3), Some("3")); // sum
     assert_eq!(row.get(4), Some("8")); // pow
     assert_eq!(row.get(5), Some("t")); // contains
+    assert_eq!(row.get(6), Some("t")); // net_gt (>> handled by resolve_network_op)
+    assert_eq!(row.get(7), Some("t")); // net_lt (<< handled by resolve_network_op)
 
-    // An unrecognized operator symbol is 42883, not "feature not supported".
+    // An unrecognized operator symbol is 42883, and the message names the
+    // operator schema-qualified (`pg_catalog.###`) like PG — never wrapped in
+    // `OPERATOR(...)` — with the standard "add explicit type casts" hint.
     let err = client
         .simple_query("SELECT 1 OPERATOR(pg_catalog.###) 2")
         .await
         .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::UNDEFINED_FUNCTION);
+    assert!(
+        db.message().starts_with("operator does not exist:")
+            && db.message().contains("pg_catalog.###")
+            && !db.message().contains("OPERATOR("),
+        "unexpected message: {}",
+        db.message()
+    );
     assert_eq!(
-        err.as_db_error().expect("database error").code(),
-        &SqlState::UNDEFINED_FUNCTION
+        db.hint(),
+        Some(
+            "No operator matches the given name and argument types. \
+             You might need to add explicit type casts."
+        )
     );
 
-    // A non-`pg_catalog` schema qualification never names a built-in operator.
+    // An operand error surfaces first, as PG analyzes operands before resolving
+    // the operator — an undefined column is 42703, not masked as 42883.
+    let err = client
+        .simple_query("SELECT missing_col OPERATOR(pg_catalog.###) 1")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_COLUMN
+    );
+
+    // A non-`pg_catalog` schema qualification never names a built-in operator, so
+    // it is reported as 42883. (Real PG additionally reports 3F000 when the schema
+    // itself does not exist; the schema catalog is not reachable at bind time.)
     let err = client
         .simple_query("SELECT 1 OPERATOR(myschema.=) 2")
         .await

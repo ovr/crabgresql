@@ -2957,7 +2957,10 @@ fn bind_binary(
     // `a OPERATOR(schema.op) b` — PG's explicit-schema operator spelling. Only the
     // bare `op` or a `pg_catalog`-qualified name refers to a built-in operator; map
     // the symbol back to its native `BinaryOperator` and recurse so it reaches the
-    // exact same path as the bare spelling (e.g. `~` -> `bind_regex`).
+    // exact same path as the bare spelling (e.g. `~` -> `bind_regex`). A non-empty,
+    // non-`pg_catalog` qualifier names no built-in operator, so it is reported as
+    // 42883 (PG additionally reports 3F000 when that schema does not exist, but the
+    // schema catalog is not reachable here, so both collapse to 42883).
     if let ast::BinaryOperator::PGCustomBinaryOperator(parts) = op {
         let symbol = match parts.as_slice() {
             [sym] => sym.as_str(),
@@ -2989,6 +2992,13 @@ fn bind_binary(
             "@>" => ast::BinaryOperator::AtArrow,
             "<@" => ast::BinaryOperator::ArrowAt,
             "&&" => ast::BinaryOperator::PGOverlap,
+            "<<" => ast::BinaryOperator::PGBitwiseShiftLeft,
+            ">>" => ast::BinaryOperator::PGBitwiseShiftRight,
+            "&" => ast::BinaryOperator::BitwiseAnd,
+            "|" => ast::BinaryOperator::BitwiseOr,
+            "#" => ast::BinaryOperator::PGBitwiseXor,
+            "@@" => ast::BinaryOperator::AtAt,
+            "@?" => ast::BinaryOperator::AtQuestion,
             _ => return Err(custom_op_undefined(left, op, right, scope)),
         };
         return bind_binary(left, &native, right, op_span, scope);
@@ -3554,23 +3564,36 @@ fn net_no_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> Bind
 
 /// 42883 for an `OPERATOR(schema.op)` spelling that names no built-in operator
 /// (non-`pg_catalog` schema, or an unrecognized symbol). Binds the operands only
-/// on this error path — so the normal path is never double-bound — to name their
-/// types, mirroring PG's message; the original `op` renders as `OPERATOR(...)`.
+/// on this error path — so the normal path is never double-bound — and surfaces
+/// an operand error (undefined column, bad cast, …) *first*, as PG does by
+/// analyzing the operands before resolving the operator. The operator renders
+/// schema-qualified (`pg_catalog.###`) like PG, not wrapped in `OPERATOR(...)`.
 fn custom_op_undefined(
     left: &ast::Expr,
     op: &ast::BinaryOperator,
     right: &ast::Expr,
     scope: &Scope,
 ) -> BindError {
-    let names = (|| {
-        let lb = bind_expr(left, scope)?;
-        let rb = bind_expr(right, scope)?;
-        Ok::<_, BindError>((operand_name(&lb), operand_name(&rb)))
-    })();
-    let (l, r) = names.unwrap_or(("?", "?"));
+    let lb = match bind_expr(left, scope) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let rb = match bind_expr(right, scope) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    // PG names the operator as `schema.op` (or bare `op`), never `OPERATOR(...)`.
+    let op_name = match op {
+        ast::BinaryOperator::PGCustomBinaryOperator(parts) => parts.join("."),
+        _ => op.to_string(),
+    };
     BindError::new(
         sqlstate::UNDEFINED_FUNCTION,
-        format!("operator does not exist: {l} {op} {r}"),
+        format!(
+            "operator does not exist: {} {op_name} {}",
+            operand_name(&lb),
+            operand_name(&rb)
+        ),
     )
     .with_hint(Some(
         "No operator matches the given name and argument types. \
