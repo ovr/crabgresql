@@ -228,6 +228,34 @@ pub fn execute(
                 node: Box::new(Append::new(&tables, txn)),
             })
         }
+        PhysicalPlan::SetOp {
+            arms,
+            columns,
+            sort,
+            distinct,
+        } => {
+            // A UNION [ALL]: run each arm, coerce the ones whose own column types
+            // differ from the unified output, and concatenate the streams. Then
+            // apply this node's own deduplication (UNION) and ORDER BY.
+            let mut children: Vec<Box<dyn ExecNode>> = Vec::with_capacity(arms.len());
+            for arm in arms {
+                let Execution::Rows { node, .. } = execute(arm.plan, ctx, txn)? else {
+                    return Err(ExecError::new("XX000", "UNION arm did not produce a row set"));
+                };
+                children.push(match arm.coercion {
+                    Some(projections) => Box::new(Projection::new(node, projections, ctx.clone())),
+                    None => node,
+                });
+            }
+            let node = finish_sort_distinct(
+                Box::new(Concat::new(children)),
+                sort,
+                distinct,
+                columns.len(),
+                &columns,
+            )?;
+            Ok(Execution::Rows { columns, node })
+        }
         PhysicalPlan::IndexScan {
             table,
             index_name,
@@ -398,6 +426,15 @@ fn resolve_subqueries(
         }
         // An Append holds only leaf table handles — no subquery expressions.
         PhysicalPlan::Append { .. } => {}
+        // A SetOp holds no exprs of its own, but each arm's sub-plan may — recurse.
+        PhysicalPlan::SetOp { arms, .. } => {
+            for arm in arms.iter_mut() {
+                resolve_subqueries(&mut arm.plan, ctx, txn)?;
+                if let Some(coercion) = &mut arm.coercion {
+                    resolve_exprs(coercion, ctx, txn)?;
+                }
+            }
+        }
         PhysicalPlan::IndexScan {
             key,
             projections,
@@ -2818,6 +2855,38 @@ impl Append {
 impl ExecNode for Append {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
         Ok(self.iter.next())
+    }
+}
+
+/// Concatenation of child pipelines — the executor side of a `UNION ALL` body
+/// (see [`PhysicalPlan::SetOp`](crabgresql_planner::PhysicalPlan::SetOp)). Drains
+/// each child fully, in order, before advancing to the next. Unlike [`Append`],
+/// the children are already-projected `ExecNode` arms, so rows are pulled through
+/// the Volcano `next()` rather than by flattening iterators. `UNION`
+/// deduplication and ORDER BY are applied by the wrapping Subquery pipeline.
+pub struct Concat {
+    children: Vec<Box<dyn ExecNode>>,
+    cursor: usize,
+}
+
+impl Concat {
+    pub fn new(children: Vec<Box<dyn ExecNode>>) -> Self {
+        Self {
+            children,
+            cursor: 0,
+        }
+    }
+}
+
+impl ExecNode for Concat {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        while self.cursor < self.children.len() {
+            if let Some(tuple) = self.children[self.cursor].next()? {
+                return Ok(Some(tuple));
+            }
+            self.cursor += 1;
+        }
+        Ok(None)
     }
 }
 

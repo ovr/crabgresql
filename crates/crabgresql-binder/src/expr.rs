@@ -4935,8 +4935,21 @@ pub(crate) fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
         // type is `bit varying` (the preferred type of the bit-string category),
         // as PG's `select_common_type` resolves it.
         (true, true) => Some(PgType::Varbit),
-        (false, false) => common_numeric(a, b),
+        (false, false) => common_string(a, b).or_else(|| common_numeric(a, b)),
     }
+}
+
+/// The common type of two string types. `char(n)` and `varchar(n)` are not
+/// castable to each other, so they only meet at `text` — the preferred type of
+/// PG's string category, which `select_common_type` picks for them.
+fn common_string(a: PgType, b: PgType) -> Option<PgType> {
+    let is_string = |ty| {
+        matches!(
+            ty,
+            PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name
+        )
+    };
+    (is_string(a) && is_string(b)).then_some(PgType::Text)
 }
 
 /// Resolve a set of expressions (one `VALUES`/`UNION` column, or a `CASE`'s

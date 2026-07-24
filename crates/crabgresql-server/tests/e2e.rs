@@ -5083,3 +5083,56 @@ async fn range_partitioning_row_movement_respects_leaf_unique() -> anyhow::Resul
 
     Ok(())
 }
+
+#[tokio::test]
+async fn long_union_all_chain_survives_the_server() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    // A flat chain binds to one N-ary node, so it costs no recursion. Nesting
+    // one level per arm previously overflowed the stack and aborted the whole
+    // process, taking every other session with it.
+    let mut sql = String::from("SELECT 0");
+    for i in 1..=1000 {
+        sql.push_str(&format!(" UNION ALL SELECT {i}"));
+    }
+    let rows = client
+        .simple_query(&format!("SELECT count(*) AS n FROM ({sql}) x"))
+        .await?;
+    let count = rows
+        .iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.get("n").map(str::to_string),
+            _ => None,
+        })
+        .expect("count row");
+    assert_eq!(count, "1001");
+    // The session — and the server — are still usable afterwards.
+    client.simple_query("SELECT 1").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn correlated_reference_inside_a_union_arm_resolves() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE c (a int4)").await?;
+    client.simple_query("INSERT INTO c VALUES (1), (2)").await?;
+    // The deduplicating form wraps the arms in the set-operation node; when that
+    // wrapper was a derived table it counted as a query nesting level, leaving
+    // `o.a` unsubstituted and surfacing an internal error.
+    let rows = client
+        .simple_query("SELECT a, (SELECT o.a UNION SELECT o.a) AS same FROM c o ORDER BY 1")
+        .await?;
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => {
+                Some((r.get("a")?.to_string(), r.get("same")?.to_string()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pairs, vec![
+        ("1".to_string(), "1".to_string()),
+        ("2".to_string(), "2".to_string())
+    ]);
+    Ok(())
+}
