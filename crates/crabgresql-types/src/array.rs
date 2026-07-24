@@ -8,21 +8,34 @@
 
 use crate::{PgType, Value, cast, oid};
 
-/// SQLSTATE + message for a failed array input (`array_in`).
+/// SQLSTATE + message (+ optional DETAIL) for a failed array input (`array_in`).
+/// The DETAIL mirrors PG's `array_in` (e.g. `Unexpected "," character.`); like
+/// `json`, it is carried through the binder's literal-input path and dropped on
+/// the runtime cast path (which has no DETAIL channel).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrayError {
     pub sqlstate: &'static str,
     pub message: String,
+    pub detail: Option<&'static str>,
 }
 
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 
-fn malformed(s: &str) -> ArrayError {
+fn malformed(s: &str, detail: &'static str) -> ArrayError {
     ArrayError {
         sqlstate: INVALID_TEXT_REPRESENTATION,
         message: format!("malformed array literal: \"{s}\""),
+        detail: Some(detail),
     }
 }
+
+// PG's `array_in` DETAIL strings.
+const DETAIL_START: &str = "Array value must start with \"{\" or dimension information.";
+const DETAIL_EOF: &str = "Unexpected end of input.";
+const DETAIL_JUNK: &str = "Junk after closing right brace.";
+const DETAIL_COMMA: &str = "Unexpected \",\" character.";
+const DETAIL_RBRACE: &str = "Unexpected \"}\" character.";
+const DETAIL_LBRACE: &str = "Unexpected \"{\" character.";
 
 /// The array type OID for an element type OID (`int4` → `_int4` = 1007), or
 /// `None` when this build has no array type for that element.
@@ -138,7 +151,7 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
     let trimmed = input.trim();
     let mut chars = trimmed.chars().peekable();
     if chars.next() != Some('{') {
-        return Err(malformed(input));
+        return Err(malformed(input, DETAIL_START));
     }
     let mut elems = Vec::new();
     skip_ws(&mut chars);
@@ -147,7 +160,7 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
         chars.next();
         skip_ws(&mut chars);
         if chars.next().is_some() {
-            return Err(malformed(input));
+            return Err(malformed(input, DETAIL_JUNK));
         }
         return Ok(elems);
     }
@@ -155,9 +168,15 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
         let (token, quoted) = read_element(&mut chars, input)?;
         // An empty, unquoted, unescaped token (`{a,,c}`, `{1,}`, `{,1}`) is a
         // missing element, which PG rejects as malformed. A quoted `""` is a
-        // legitimate empty-string element and keeps `quoted = true`.
+        // legitimate empty-string element and keeps `quoted = true`. PG's DETAIL
+        // names the character that follows the missing element.
         if !quoted && token.is_empty() {
-            return Err(malformed(input));
+            let detail = match chars.peek() {
+                Some('}') => DETAIL_RBRACE,
+                Some(',') => DETAIL_COMMA,
+                _ => DETAIL_EOF,
+            };
+            return Err(malformed(input, detail));
         }
         if !quoted && token.eq_ignore_ascii_case("null") {
             elems.push(Value::Null);
@@ -165,6 +184,7 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
             let v = cast::cast_value(Value::Text(token), elem, 1).map_err(|e| ArrayError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             })?;
             elems.push(v);
         }
@@ -174,12 +194,14 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
                 skip_ws(&mut chars);
             }
             Some('}') => break,
-            _ => return Err(malformed(input)),
+            // EOF before a closing brace, or any other stray character.
+            None => return Err(malformed(input, DETAIL_EOF)),
+            Some(_) => return Err(malformed(input, DETAIL_COMMA)),
         }
     }
     skip_ws(&mut chars);
     if chars.next().is_some() {
-        return Err(malformed(input));
+        return Err(malformed(input, DETAIL_JUNK));
     }
     Ok(elems)
 }
@@ -206,11 +228,11 @@ fn read_element(
             match chars.next() {
                 Some('\\') => match chars.next() {
                     Some(c) => s.push(c),
-                    None => return Err(malformed(input)),
+                    None => return Err(malformed(input, DETAIL_EOF)),
                 },
                 Some('"') => return Ok((s, true)),
                 Some(c) => s.push(c),
-                None => return Err(malformed(input)),
+                None => return Err(malformed(input, DETAIL_EOF)),
             }
         }
     }
@@ -224,7 +246,7 @@ fn read_element(
     loop {
         match chars.peek() {
             Some(',') | Some('}') | None => break,
-            Some('{') => return Err(malformed(input)),
+            Some('{') => return Err(malformed(input, DETAIL_LBRACE)),
             Some('\\') => {
                 chars.next();
                 match chars.next() {
@@ -233,7 +255,7 @@ fn read_element(
                         forced_text = true;
                         last_sig = s.len();
                     }
-                    None => return Err(malformed(input)),
+                    None => return Err(malformed(input, DETAIL_EOF)),
                 }
             }
             Some('"') => {
@@ -243,11 +265,11 @@ fn read_element(
                     match chars.next() {
                         Some('\\') => match chars.next() {
                             Some(c) => s.push(c),
-                            None => return Err(malformed(input)),
+                            None => return Err(malformed(input, DETAIL_EOF)),
                         },
                         Some('"') => break,
                         Some(c) => s.push(c),
-                        None => return Err(malformed(input)),
+                        None => return Err(malformed(input, DETAIL_EOF)),
                     }
                 }
                 last_sig = s.len();
@@ -322,6 +344,20 @@ mod tests {
     fn malformed_missing_braces() {
         assert!(array_in("1,2,3", PgType::Int4).is_err());
         assert!(array_in("{1,2", PgType::Int4).is_err());
+    }
+
+    #[test]
+    fn malformed_detail_matches_pg() {
+        // DETAIL strings verified against PostgreSQL's array_in.
+        let d = |s: &str| array_in(s, PgType::Text).unwrap_err().detail.unwrap();
+        assert_eq!(d("1,2,3"), DETAIL_START);
+        assert_eq!(d("abc"), DETAIL_START);
+        assert_eq!(d("{1,2"), DETAIL_EOF);
+        assert_eq!(d("{1,2}}"), DETAIL_JUNK);
+        assert_eq!(d("{1,2} junk"), DETAIL_JUNK);
+        assert_eq!(d("{a,,c}"), DETAIL_COMMA);
+        assert_eq!(d("{,1}"), DETAIL_COMMA);
+        assert_eq!(d("{1,}"), DETAIL_RBRACE);
     }
 
     #[test]

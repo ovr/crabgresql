@@ -4896,12 +4896,14 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             .map(Value::Jsonpath)
             .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail)),
         // `array_in`: parse a `{...}` literal, coercing each element to the array
-        // element type.
+        // element type. Carry PG's DETAIL through (`'{a,,c}'::int[]`).
         PgType::Array(elem_oid) => {
             let elem = PgType::from_oid(elem_oid).ok_or_else(invalid)?;
             crabgresql_types::array::array_in(s, elem)
                 .map(|elems| Value::Array { elem, elems })
-                .map_err(|e| BindError::new(e.sqlstate, e.message))
+                .map_err(|e| {
+                    BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))
+                })
         }
         PgType::User(_) => Err(invalid()),
     }
