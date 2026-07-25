@@ -209,7 +209,8 @@ fn gen_pg_type(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
             .unwrap_or(0);
         let row = format!(
             "    PgTypeRow {{ oid: {oid}, typname: {typname:?}, typnamespace: 11, \
-typowner: 10, typlen: {typlen}, typbyval: {typbyval}, typtype: {typtype:?}, \
+typowner: crate::schema::BOOTSTRAP_ROLE_OID, typlen: {typlen}, typbyval: {typbyval}, \
+typtype: {typtype:?}, \
 typcategory: {typcategory:?}, typispreferred: {typispreferred}, typisdefined: true, \
 typdelim: {typdelim:?}, typrelid: {typrelid}, typelem: {typelem}, typarray: {typarray}, \
 typinput: {typinput:?}, typoutput: {typoutput:?}, typreceive: {typreceive:?}, \

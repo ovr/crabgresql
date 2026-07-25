@@ -5,10 +5,73 @@
 
 use std::sync::Arc;
 
+use crabgresql_catalog::SystemCatalog;
+use crabgresql_executor::CatalogOps;
 use crabgresql_storage_api::{
     IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition, StorageError, TableAm,
     TableEngine, TableSchema, ViewDefinition,
 };
+
+/// The executor-facing catalog handle: answers `pg_get_userbyid` and
+/// `pg_table_is_visible` against the same [`SystemCatalog`] snapshot that built
+/// this statement's `pg_class` rows, so the OIDs the client reads back are the
+/// OIDs these functions resolve. Owns its `Arc` so it can live in a suspended
+/// portal's `ExecContext`, like [`crate::session::SessionSequences`].
+pub struct SessionCatalogOps {
+    system: Arc<SystemCatalog>,
+    temp_schema: String,
+}
+
+impl SessionCatalogOps {
+    pub fn new(system: Arc<SystemCatalog>, temp_schema: impl Into<String>) -> Self {
+        Self {
+            system,
+            temp_schema: temp_schema.into(),
+        }
+    }
+}
+
+impl CatalogOps for SessionCatalogOps {
+    fn role_name(&self, oid: u32) -> Option<String> {
+        self.system.role_name(oid).map(str::to_string)
+    }
+
+    /// A relation is visible when *its own unqualified name reaches it* — PG's
+    /// rule, which is about name resolution, not namespace membership: a
+    /// relation another one shadows is invisible even though its schema is on
+    /// the path.
+    ///
+    /// So this walks [`SessionCatalog::resolve`]'s search order for the
+    /// relation's own name (temp → system catalog → global, which resolves
+    /// unqualified names in `public` only) and reports whether the relation
+    /// found is this one. `search_path` is still a no-op, so the order is
+    /// crabgresql's rather than PostgreSQL's; a relation in a `CREATE SCHEMA`
+    /// namespace is correctly invisible because nothing but a qualified name
+    /// reaches it.
+    ///
+    /// Kept in step with `resolve` by `visibility_follows_resolution_order`
+    /// below, which fails if the two disagree about a shadowed name.
+    fn table_is_visible(&self, oid: u32) -> Option<bool> {
+        let (namespace, name) = self.system.relation_ref(oid)?;
+        // 1. This session's temp namespace shadows everything.
+        if self
+            .system
+            .relation_oid_in(&self.temp_schema, name)
+            .is_some()
+        {
+            return Some(namespace == self.temp_schema);
+        }
+        // 2. Then pg_catalog. A user relation sharing a catalog relation's name
+        //    is unreachable unqualified, so it is not visible. (No pg_class row
+        //    carries a catalog namespace today — only live user relations are
+        //    reflected — so this arm only ever hides, never reveals.)
+        if self.system.has_catalog_relation(name) {
+            return Some(namespace == "pg_catalog");
+        }
+        // 3. Otherwise the global engine, which resolves unqualified in public.
+        Some(namespace == "public")
+    }
+}
 
 /// Resolves relations against this session's temp namespace first, then the
 /// shared global engine, then the read-only system catalog — so a
@@ -246,5 +309,140 @@ impl TableEngine for SessionCatalog {
         is_called: bool,
     ) -> SequenceAdvance {
         self.global.sequence_setval(namespace, name, value, is_called)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crabgresql_catalog::CatalogRelation;
+    use crabgresql_storage_api::Column;
+    use crabgresql_types::PgType;
+
+    fn table(namespace: &str, name: &str) -> CatalogRelation {
+        let schema =
+            TableSchema::in_namespace(name, namespace, vec![Column::new("a", PgType::Int4)]);
+        // `temporary` takes the namespace separately and leaves `schema.namespace`
+        // alone, so build every relation through `permanent` (which derives the
+        // namespace from the schema) and keep the two fields equal — the
+        // invariant `SystemCatalog::relation_ref` documents.
+        CatalogRelation::permanent(schema)
+    }
+
+    /// `pg_table_is_visible` must agree with what an unqualified name actually
+    /// resolves to. PG's rule is reachability, not namespace membership, so a
+    /// shadowed relation is invisible even though its schema is on the path.
+    /// This asserts the two against each other rather than restating the rule,
+    /// so a change to `SessionCatalog::resolve`'s search order fails here.
+    /// `shadowed` exists in public AND in this session's temp namespace;
+    /// `only_public` is plainly reachable; `tucked` needs a schema qualifier;
+    /// `pg_am` collides with a catalog relation's name.
+    const RELATIONS: &[(&str, &str)] = &[
+        ("public", "shadowed"),
+        ("pg_temp_1", "shadowed"),
+        ("public", "only_public"),
+        ("app", "tucked"),
+        ("public", "pg_am"),
+    ];
+
+    #[test]
+    fn visibility_follows_resolution_order() -> anyhow::Result<()> {
+        let temp_schema = "pg_temp_1";
+        let system = Arc::new(
+            crabgresql_catalog::SystemCatalog::with_catalog_relations_fn("db", "owner", || {
+                RELATIONS.iter().map(|(ns, n)| table(ns, n)).collect()
+            })
+            .with_schemas_fn(|| {
+                vec![
+                    ("app".to_string(), 16_000),
+                    ("pg_temp_1".to_string(), 16_001),
+                ]
+            }),
+        );
+        let ops = SessionCatalogOps::new(Arc::clone(&system), temp_schema);
+        let catalog = SessionCatalog::new(
+            Arc::new(StubEngine(RELATIONS.to_vec())),
+            Arc::clone(&system) as Arc<dyn TableEngine>,
+            temp_schema,
+        );
+
+        for (namespace, name) in RELATIONS {
+            let oid = system
+                .relation_oid_in(namespace, name)
+                .ok_or_else(|| anyhow::anyhow!("{namespace}.{name} has no OID"))?;
+            let visible = ops
+                .table_is_visible(oid)
+                .ok_or_else(|| anyhow::anyhow!("{namespace}.{name} has no relation"))?;
+            // What does the bare name actually resolve to? Visibility must be
+            // exactly "resolution lands on this relation".
+            let reachable = match catalog.resolve(None, name) {
+                Ok(found) => found.schema().namespace == *namespace,
+                Err(_) => false,
+            };
+            assert_eq!(
+                visible, reachable,
+                "pg_table_is_visible disagrees with unqualified resolution for {namespace}.{name}"
+            );
+        }
+
+        // Spell out the cases the rule exists for, so a regression names itself
+        // rather than only showing up as a disagreement above.
+        let vis = |ns: &str, name: &str| {
+            system
+                .relation_oid_in(ns, name)
+                .and_then(|oid| ops.table_is_visible(oid))
+        };
+        assert_eq!(vis(temp_schema, "shadowed"), Some(true));
+        assert_eq!(
+            vis("public", "shadowed"),
+            Some(false),
+            "temp shadows public"
+        );
+        assert_eq!(
+            vis("public", "pg_am"),
+            Some(false),
+            "pg_catalog shadows public"
+        );
+        assert_eq!(vis("public", "only_public"), Some(true));
+        assert_eq!(vis("app", "tucked"), Some(false), "needs a qualifier");
+        // An OID no relation has is NULL, not false — and answering it must not
+        // depend on the relation list.
+        assert_eq!(ops.table_is_visible(1), None);
+
+        Ok(())
+    }
+
+    /// A stand-in for the global engine: resolves `public` only, as
+    /// `PgEngine::open_table` does, so the temp → system → global ordering under
+    /// test is the real one.
+    struct StubEngine(Vec<(&'static str, &'static str)>);
+
+    impl TableEngine for StubEngine {
+        fn create_table(&self, _schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
+            unreachable!("the visibility test never creates")
+        }
+
+        fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
+            self.resolve(Some("public"), name)
+        }
+
+        fn resolve(
+            &self,
+            namespace: Option<&str>,
+            name: &str,
+        ) -> Result<Arc<dyn TableAm>, StorageError> {
+            let namespace = namespace.unwrap_or("public");
+            match self.0.iter().find(|(ns, n)| *ns == namespace && *n == name) {
+                Some((ns, n)) => Ok(crabgresql_catalog::StaticTable::arc(
+                    table(ns, n).schema,
+                    Vec::new(),
+                )),
+                None => Err(StorageError::TableNotFound(name.to_string())),
+            }
+        }
+
+        fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
+            Err(StorageError::TableNotFound(name.to_string()))
+        }
     }
 }

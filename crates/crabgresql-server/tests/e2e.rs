@@ -350,6 +350,173 @@ fn rows(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow>
         .collect()
 }
 
+/// The five listing queries psql sends for `\d`, `\dt`, `\dv`, `\ds`, and `\di`,
+/// replayed verbatim (captured from psql 18.4, which is the shape we get because
+/// we advertise `server_version = 19.0`). The regress runner cannot execute
+/// backslash metacommands, so this is the gate that the whole query binds and
+/// runs — including the owner column, which the smoke suite cannot assert
+/// because the reference server's role differs.
+#[tokio::test]
+async fn psql_describe_listings_match_pg() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query("CREATE TABLE t1 (id int PRIMARY KEY, label text)")
+        .await?;
+    client
+        .simple_query("CREATE VIEW v1 AS SELECT id FROM t1")
+        .await?;
+    client.simple_query("CREATE SEQUENCE s1").await?;
+    client
+        .simple_query("CREATE TABLE parted (id int, k int) PARTITION BY RANGE (id)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE parted_lo PARTITION OF parted FOR VALUES FROM (1) TO (10)")
+        .await?;
+    // A relation only a qualified name reaches must not appear in any listing.
+    client.simple_query("CREATE SCHEMA app").await?;
+    client
+        .simple_query("CREATE TABLE app.hidden (x int)")
+        .await?;
+
+    // psql builds the four table-ish listings from one query, varying only the
+    // relkind set; `\dv` and `\ds` omit the pg_am join.
+    let listing = |relkinds: &str, with_am: bool| {
+        format!(
+            "SELECT n.nspname as \"Schema\",\n  \
+               c.relname as \"Name\",\n  \
+               CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' \
+               WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' \
+               WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' \
+               WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' \
+               WHEN 'I' THEN 'partitioned index' END as \"Type\",\n  \
+               pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\"\n\
+             FROM pg_catalog.pg_class c\n     \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n{}\
+             WHERE c.relkind IN ({relkinds})\n      \
+             AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname !~ '^pg_toast'\n      \
+             AND n.nspname <> 'information_schema'\n  \
+             AND pg_catalog.pg_table_is_visible(c.oid)\n\
+             ORDER BY 1,2;",
+            if with_am {
+                "     LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam\n"
+            } else {
+                ""
+            }
+        )
+    };
+    let listed = |messages: &[SimpleQueryMessage]| {
+        rows(messages)
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}|{}|{}|{}",
+                    r.get(0).unwrap_or("?"),
+                    r.get(1).unwrap_or("?"),
+                    r.get(2).unwrap_or("?"),
+                    r.get(3).unwrap_or("?"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // `\d` — every relkind a user can see. `app.hidden` is absent (not visible),
+    // and the owner is the connected role, as PG reports it.
+    let d = client
+        .simple_query(&listing("'r','p','v','m','S','f',''", true))
+        .await?;
+    assert_eq!(
+        listed(&d),
+        vec![
+            "public|parted|partitioned table|postgres",
+            "public|parted_lo|table|postgres",
+            "public|s1|sequence|postgres",
+            "public|t1|table|postgres",
+            "public|v1|view|postgres",
+        ]
+    );
+
+    // `\dt` — tables and partitioned parents only.
+    let dt = client.simple_query(&listing("'r','p',''", true)).await?;
+    assert_eq!(
+        listed(&dt),
+        vec![
+            "public|parted|partitioned table|postgres",
+            "public|parted_lo|table|postgres",
+            "public|t1|table|postgres",
+        ]
+    );
+
+    // `\dv` and `\ds` drop the pg_am join entirely.
+    let dv = client.simple_query(&listing("'v',''", false)).await?;
+    assert_eq!(listed(&dv), vec!["public|v1|view|postgres"]);
+    let ds = client.simple_query(&listing("'S',''", false)).await?;
+    assert_eq!(listed(&ds), vec!["public|s1|sequence|postgres"]);
+
+    // `\di` adds pg_index and a second pg_class alias for the indexed table, so
+    // the same catalog relation is scanned twice in one statement — the OIDs
+    // must agree across both scans and across pg_table_is_visible.
+    let di = client
+        .simple_query(
+            "SELECT n.nspname as \"Schema\",\n  \
+               c.relname as \"Name\",\n  \
+               CASE c.relkind WHEN 'i' THEN 'index' WHEN 'I' THEN 'partitioned index' END as \"Type\",\n  \
+               pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\",\n  \
+               c2.relname as \"Table\"\n\
+             FROM pg_catalog.pg_class c\n     \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n     \
+             LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam\n     \
+             LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n     \
+             LEFT JOIN pg_catalog.pg_class c2 ON i.indrelid = c2.oid\n\
+             WHERE c.relkind IN ('i','I','')\n      \
+             AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname !~ '^pg_toast'\n      \
+             AND n.nspname <> 'information_schema'\n  \
+             AND pg_catalog.pg_table_is_visible(c.oid)\n\
+             ORDER BY 1,2;",
+        )
+        .await?;
+    let index_rows = rows(&di);
+    assert_eq!(index_rows.len(), 1);
+    assert_eq!(index_rows[0].get(1), Some("t1_pkey"));
+    assert_eq!(index_rows[0].get(2), Some("index"));
+    assert_eq!(index_rows[0].get(3), Some("postgres"));
+    assert_eq!(index_rows[0].get(4), Some("t1"));
+
+    // A temp relation is this session's, so it joins the listing under its own
+    // namespace — the one visibility rule that is not simply "public".
+    client
+        .simple_query("CREATE TEMP TABLE tmp1 (y int)")
+        .await?;
+    let with_temp = client.simple_query(&listing("'r','p',''", true)).await?;
+    let temp_row = rows(&with_temp)
+        .into_iter()
+        .find(|r| r.get(1) == Some("tmp1"))
+        .context("temp table should be listed")?;
+    assert!(
+        temp_row.get(0).unwrap_or("").starts_with("pg_temp_"),
+        "temp relation should list under its pg_temp_N namespace, got {:?}",
+        temp_row.get(0)
+    );
+
+    // The index's relam resolves through pg_am, and a view's `relam = 0` finds
+    // no row (which is why psql uses a LEFT JOIN).
+    let ams = client
+        .simple_query(
+            "SELECT c.relname, a.amname FROM pg_catalog.pg_class c \
+             LEFT JOIN pg_catalog.pg_am a ON a.oid = c.relam \
+             WHERE c.relname IN ('t1', 't1_pkey', 'v1') ORDER BY 1",
+        )
+        .await?;
+    let am_rows = rows(&ams);
+    assert_eq!(am_rows[0].get(1), Some("heap")); // t1
+    assert_eq!(am_rows[1].get(1), Some("btree")); // t1_pkey
+    assert_eq!(am_rows[2].get(1), None); // v1
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;

@@ -450,6 +450,73 @@ impl SystemCatalog {
         })
     }
 
+    /// The name of the role `oid` identifies, or `None` if no role has that OID.
+    /// Every catalog row reports [`schema::BOOTSTRAP_ROLE_OID`] as its owner
+    /// (crabgresql has no role catalog), so exactly one OID resolves — to this
+    /// snapshot's session user. Backs `pg_get_userbyid`.
+    pub fn role_name(&self, oid: u32) -> Option<&str> {
+        (oid == schema::BOOTSTRAP_ROLE_OID).then_some(self.owner.as_str())
+    }
+
+    /// The `(namespace, name)` of the relation `oid` identifies — a
+    /// table/view/sequence or an index — or `None` if this snapshot has no such
+    /// relation. Backs `pg_table_is_visible`, which needs the name as well as
+    /// the namespace to answer *reachability* rather than mere membership.
+    ///
+    /// Reads exactly the fields [`schema::pg_class_rows`] reports as
+    /// `relnamespace`/`relname`: `schema.namespace` for a relation and
+    /// `table_schema.namespace` for an index. Note that `schema.namespace` is a
+    /// distinct field from [`CatalogRelation::namespace`]; they agree for temp
+    /// relations only because the server selects those on `schema.namespace`.
+    /// Diverging here would make a relation `pg_class` lists invisible.
+    ///
+    /// OIDs are assigned positionally by [`SystemCatalog::relation_oids`] and
+    /// [`SystemCatalog::index_oids`], so this indexes rather than scans — it is
+    /// called once per row when a `\d` listing filters on
+    /// `pg_table_is_visible`, which a linear scan would make quadratic. The
+    /// stored OID is still compared, so a future non-positional assignment
+    /// degrades to "not found" rather than to a wrong answer.
+    pub fn relation_ref(&self, oid: u32) -> Option<(&str, &str)> {
+        // Below the synthetic floor no relation can match, and answering here
+        // avoids forcing the lazy relation enumeration for an unrelated OID
+        // (`SELECT pg_table_is_visible(1)` should not enumerate the database).
+        let offset = oid.checked_sub(FIRST_REL_OID)? as usize;
+        let relations = self.relation_oids();
+        if let Some((stored, schema)) = relations.get(offset) {
+            return (*stored == oid)
+                .then_some((schema.namespace.as_str(), schema.name.as_str()));
+        }
+        let index = self.index_oids().get(offset - relations.len())?;
+        (index.oid == oid).then_some((
+            index.table_schema.namespace.as_str(),
+            index.metadata.name.as_str(),
+        ))
+    }
+
+    /// The OID of `namespace.name` in this snapshot, or `None` if it holds no
+    /// such relation. The inverse of [`SystemCatalog::relation_ref`]; feeds the
+    /// shadowing check in `pg_table_is_visible`.
+    pub fn relation_oid_in(&self, namespace: &str, name: &str) -> Option<u32> {
+        let relation = self
+            .relation_oids()
+            .iter()
+            .find(|(_, schema)| schema.namespace == namespace && schema.name == name);
+        if let Some((oid, _)) = relation {
+            return Some(*oid);
+        }
+        self.index_oids()
+            .iter()
+            .find(|index| index.table_schema.namespace == namespace && index.metadata.name == name)
+            .map(|index| index.oid)
+    }
+
+    /// Whether `name` is a `pg_catalog` relation this catalog serves. Cheap for
+    /// a name that is not one (the builders run only on a match), which is the
+    /// common case — it is consulted per relation when deciding visibility.
+    pub fn has_catalog_relation(&self, name: &str) -> bool {
+        self.build_pg_catalog(name).is_some()
+    }
+
     /// Build the requested relation's rows + schema, or `None` if unknown.
     fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         match name {
@@ -495,6 +562,7 @@ impl SystemCatalog {
                 schema::pg_index_schema(),
                 schema::pg_index_rows(self.index_oids()),
             )),
+            "pg_am" => Some((schema::pg_am_schema(), schema::pg_am_rows())),
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
             "pg_collation" => Some((schema::pg_collation_schema(), schema::pg_collation_rows())),
             "pg_inherits" => Some((
@@ -779,12 +847,138 @@ mod tests {
         Ok(())
     }
 
+    /// `pg_am` reports PostgreSQL's built-in access methods verbatim, and the
+    /// OIDs `pg_class.relam` emits are exactly the ones it can be joined to.
+    #[test]
+    fn pg_am_lists_the_builtin_access_methods() -> anyhow::Result<()> {
+        let schema = schema::pg_am_schema();
+        let rows = schema::pg_am_rows();
+        let oid = required(schema.column_index("oid"), "oid column is missing")?;
+        let amname = required(schema.column_index("amname"), "amname column is missing")?;
+        let amtype = required(schema.column_index("amtype"), "amtype column is missing")?;
+        assert!(rows.iter().all(|r| r.len() == schema.columns.len()));
+
+        let by_oid = |n: u32| rows.iter().find(|r| r[oid] == Value::Oid(n));
+        // heap is the only table access method; the rest are index methods.
+        let heap = required(by_oid(2), "heap row is missing")?;
+        assert_eq!(heap[amname], Value::Text("heap".to_string()));
+        assert_eq!(heap[amtype], Value::Text("t".to_string()));
+        let btree = required(by_oid(403), "btree row is missing")?;
+        assert_eq!(btree[amname], Value::Text("btree".to_string()));
+        assert_eq!(btree[amtype], Value::Text("i".to_string()));
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r[amtype] == Value::Text("i".to_string()))
+                .count(),
+            6
+        );
+
+        // Every `relam` a pg_class row can carry joins to a pg_am row (0 is the
+        // no-access-method sentinel views/sequences/partitioned parents use).
+        let cat = SystemCatalog::with_relations(vec![TableSchema::new(
+            "t",
+            vec![Column::new("a", PgType::Int4)],
+        )]);
+        let (class_schema, class_rows) =
+            required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?;
+        let relam = required(
+            class_schema.column_index("relam"),
+            "relam column is missing",
+        )?;
+        for row in &class_rows {
+            if row[relam] == Value::Oid(0) {
+                continue;
+            }
+            assert!(
+                rows.iter().any(|am| am[oid] == row[relam]),
+                "pg_class.relam {:?} has no pg_am row",
+                row[relam]
+            );
+        }
+
+        Ok(())
+    }
+
+    /// `pg_get_userbyid`'s and `pg_table_is_visible`'s backing lookups agree with
+    /// the `pg_class` rows built from the same snapshot: the `relowner` every row
+    /// reports resolves to a name, and every row's OID resolves to the namespace
+    /// that row reports.
+    #[test]
+    fn catalog_lookups_agree_with_pg_class_rows() -> anyhow::Result<()> {
+        let cat = SystemCatalog::with_catalog_relations_fn("db", "alice", || {
+            vec![CatalogRelation::permanent(TableSchema::in_namespace(
+                "t",
+                "app",
+                vec![Column::new("a", PgType::Int4)],
+            ))]
+        })
+        .with_schemas_fn(|| vec![("app".to_string(), 16_000)]);
+        let (schema, rows) = required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?;
+        let oid = required(schema.column_index("oid"), "oid column is missing")?;
+        let relowner = required(
+            schema.column_index("relowner"),
+            "relowner column is missing",
+        )?;
+        let relnamespace = required(
+            schema.column_index("relnamespace"),
+            "relnamespace column is missing",
+        )?;
+        let row = required(rows.first(), "expected one pg_class row")?;
+
+        // The owner OID pg_class reports is the one `pg_get_userbyid` resolves.
+        // Asserted against the constant, not a literal, so moving the bootstrap
+        // OID cannot leave the row and the lookup disagreeing.
+        assert_eq!(row[relowner], Value::Oid(schema::BOOTSTRAP_ROLE_OID));
+        assert_eq!(cat.role_name(schema::BOOTSTRAP_ROLE_OID), Some("alice"));
+        assert_eq!(cat.role_name(schema::BOOTSTRAP_ROLE_OID + 1), None);
+
+        // Every other owner column reports the same role, so `pg_get_userbyid`
+        // resolves them all rather than printing `unknown (OID=n)` for some.
+        for relation in ["pg_type", "pg_collation", "pg_namespace"] {
+            let (s, r) = required(cat.build_pg_catalog(relation), relation)?;
+            let owner = required(
+                s.columns
+                    .iter()
+                    .position(|c| c.name.ends_with("owner"))
+                    .map(|i| i),
+                "an owner column",
+            )?;
+            for row in &r {
+                let Value::Oid(o) = row[owner] else {
+                    anyhow::bail!("{relation} owner column was not an OID");
+                };
+                assert!(
+                    cat.role_name(o).is_some(),
+                    "{relation} owner OID {o} does not resolve to a role name"
+                );
+            }
+        }
+
+        // ... and the namespace it reports is the one visibility is decided on.
+        let Value::Oid(rel_oid) = row[oid] else {
+            anyhow::bail!("pg_class.oid was not an OID");
+        };
+        assert_eq!(cat.relation_ref(rel_oid), Some(("app", "t")));
+        assert_eq!(cat.relation_oid_in("app", "t"), Some(rel_oid));
+        assert_eq!(
+            cat.namespace_oids().get("app").copied().map(Value::Oid),
+            Some(row[relnamespace].clone())
+        );
+        // An OID no relation has resolves to nothing, so the function is NULL —
+        // both above the assigned range and below the synthetic floor.
+        assert_eq!(cat.relation_ref(rel_oid + 1_000), None);
+        assert_eq!(cat.relation_ref(1), None);
+
+        Ok(())
+    }
+
     #[test]
     fn unknown_relation_is_not_found() {
         let cat = SystemCatalog::new();
         assert!(cat.open_table("pg_type").is_ok());
         assert!(cat.open_table("pg_namespace").is_ok());
         assert!(cat.open_table("pg_cast").is_ok());
+        assert!(cat.open_table("pg_am").is_ok());
         assert!(matches!(
             cat.open_table("pg_nonexistent"),
             Err(StorageError::TableNotFound(_))

@@ -132,6 +132,14 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 "sequence function reached the pure scalar evaluator",
             ));
         }
+        // Likewise the catalog functions, which `eval` dispatches through the
+        // session's CatalogOps handle.
+        ScalarFn::PgGetUserById | ScalarFn::PgTableIsVisible => {
+            return Err(ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                "catalog function reached the pure scalar evaluator",
+            ));
+        }
         // --- jsonpath (STRICT: any NULL arg already short-circuited to NULL) ---
         ScalarFn::JsonPath(f) => return eval_jsonpath(f, args),
         // --- array containment / size (STRICT) ---

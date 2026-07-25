@@ -90,3 +90,10 @@ The time-zone abbreviation table in crates/crabgresql-types/src/tz.rs (e.g.
 `PST` = -08:00, `MSK` -> Europe/Moscow) reproduces values from PostgreSQL's
 `src/timezone/tznames/Default` data file — borrowed as data, not source, under
 the PostgreSQL License (see the clean-room policy in AGENTS.md).
+
+The `pg_am` rows in crates/crabgresql-catalog/src/schema.rs (the access-method
+OIDs, names, handler-function names, and types: `heap` = 2, `btree` = 403, …)
+reproduce values from PostgreSQL's `pg_am` catalog, transcribed from the
+observable output of `SELECT * FROM pg_am` on a stock server rather than from
+`pg_am.dat` — borrowed as data, not source, under the PostgreSQL License, on the
+same footing as the tz.rs table above.

@@ -100,9 +100,9 @@ pub fn pg_collation_rows() -> Vec<Vec<Value>> {
                 Value::Oid(c.oid),
                 Value::Text(c.name.to_string()),
                 // Every collation lives in pg_catalog (11), owned by the
-                // bootstrap superuser (10).
+                // bootstrap superuser.
                 Value::Oid(11),
-                Value::Oid(10),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
                 Value::Text(c.provider.as_char().to_string()),
                 Value::Bool(c.deterministic),
                 Value::Int4(c.encoding),
@@ -167,7 +167,7 @@ pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
                 Value::Text(t.name.clone()),
                 // pg_catalog namespace / bootstrap superuser, as elsewhere.
                 Value::Oid(11),
-                Value::Oid(10),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
                 // Enums are a fixed 4-byte, pass-by-value, OID-backed type.
                 Value::Int2(4),
                 Value::Bool(true),
@@ -323,6 +323,61 @@ pub fn pg_namespace_schema() -> TableSchema {
 /// OID assigned to the heap access method (`pg_am` row `heap` = 2). Reported for
 /// every user relation's `relam`.
 const HEAP_AM_OID: u32 = 2;
+/// OID of the `btree` index access method, shared by `pg_am` and the `relam` of
+/// every B-tree index's `pg_class` row so the join between them holds.
+const BTREE_AM_OID: u32 = 403;
+/// OID of the `hash` index access method; see [`BTREE_AM_OID`].
+const HASH_AM_OID: u32 = 405;
+
+/// OID reported as the owner of every relation, type, and schema. PostgreSQL
+/// assigns 10 to the bootstrap superuser; crabgresql has no role catalog yet, so
+/// one owner stands for the whole cluster. `pg_get_userbyid` resolves it back to
+/// the session user, so the two must agree — hence the shared constant.
+pub(crate) const BOOTSTRAP_ROLE_OID: u32 = 10;
+
+/// `pg_catalog.pg_am` — the access methods. PostgreSQL lists the methods its
+/// build actually registered; crabgresql implements only `heap`, `btree`, and
+/// `hash`, but reports all seven of PostgreSQL's built-ins so a client that
+/// joins `pg_class.relam` or reads `pg_am` sees the shape it expects.
+///
+/// Fidelity note (`AGENTS.md`): these rows are transcribed from the output of
+/// `SELECT oid, amname, amhandler, amtype FROM pg_am ORDER BY oid` on a stock
+/// PostgreSQL 18.4, not from upstream source. No `pg_am.dat` is vendored —
+/// seven rows do not justify codegen.
+pub fn pg_am_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_am",
+        "pg_catalog",
+        vec![
+            col("oid", PgType::Oid),
+            col("amname", PgType::Name),
+            col("amhandler", CHARLIKE),
+            col("amtype", CHARLIKE),
+        ],
+    )
+}
+
+/// The fixed `pg_am` rows. `amtype` is `'t'` for a table access method and
+/// `'i'` for an index one.
+pub fn pg_am_rows() -> Vec<Vec<Value>> {
+    let row = |oid: u32, amname: &str, amhandler: &str, amtype: &str| {
+        vec![
+            Value::Oid(oid),
+            Value::Text(amname.to_string()),
+            Value::Text(amhandler.to_string()),
+            Value::Text(amtype.to_string()),
+        ]
+    };
+    vec![
+        row(HEAP_AM_OID, "heap", "heap_tableam_handler", "t"),
+        row(BTREE_AM_OID, "btree", "bthandler", "i"),
+        row(HASH_AM_OID, "hash", "hashhandler", "i"),
+        row(783, "gist", "gisthandler", "i"),
+        row(2742, "gin", "ginhandler", "i"),
+        row(3580, "brin", "brinhandler", "i"),
+        row(4000, "spgist", "spghandler", "i"),
+    ]
+}
 
 /// `pg_catalog.pg_class` — a curated subset of columns for user relations.
 /// Index/partition/stats columns beyond this set are omitted for now.
@@ -378,7 +433,7 @@ pub fn pg_class_rows(
                 Value::Text(schema.name.clone()),
                 Value::Oid(nsp_oid(&schema.namespace)),
                 Value::Oid(0),
-                Value::Oid(10),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
                 Value::Oid(relam),
                 Value::Int2(schema.columns.len() as i16),
                 Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
@@ -395,10 +450,10 @@ pub fn pg_class_rows(
             // An index lives in its table's namespace.
             Value::Oid(nsp_oid(&index.table_schema.namespace)),
             Value::Oid(0),
-            Value::Oid(10),
+            Value::Oid(BOOTSTRAP_ROLE_OID),
             Value::Oid(match index.metadata.method {
-                IndexMethod::BTree => 403,
-                IndexMethod::Hash => 405,
+                IndexMethod::BTree => BTREE_AM_OID,
+                IndexMethod::Hash => HASH_AM_OID,
             }),
             Value::Int2(index.metadata.keys.len() as i16),
             Value::Bool(false),
@@ -775,7 +830,7 @@ pub fn pg_namespace_rows(user_schemas: &[(String, u32)]) -> Vec<Vec<Value>> {
         vec![
             Value::Oid(oid),
             Value::Text(name.to_string()),
-            Value::Oid(10),
+            Value::Oid(BOOTSTRAP_ROLE_OID),
             Value::Null,
         ]
     };

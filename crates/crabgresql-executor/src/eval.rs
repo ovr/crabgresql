@@ -73,7 +73,12 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             // The sequence functions are side-effecting and need the session's
             // sequence handle, so they are dispatched here rather than through the
             // pure `eval_scalar`.
-            match eval_sequence_fn(*func, &arg_values, ctx) {
+            if let Some(result) = eval_sequence_fn(*func, &arg_values, ctx) {
+                return result;
+            }
+            // The catalog functions read the session's pg_catalog snapshot, which
+            // the pure `eval_scalar` has no handle to.
+            match eval_catalog_fn(*func, &arg_values, ctx) {
                 Some(result) => result,
                 None => crate::scalar_fns::eval_scalar(*func, &arg_values),
             }
@@ -299,6 +304,48 @@ fn eval_sequence_fn(
         _ => unreachable!("guarded by the matches! above"),
     };
     Some(result)
+}
+
+/// Dispatch the catalog-reading functions. Returns `None` for any other function
+/// (the caller falls back to the pure `eval_scalar`), `Some(result)` for a
+/// catalog function — including a wiring error if the context supplied no
+/// [`CatalogOps`] handle.
+///
+/// Both functions are STRICT, but this path runs ahead of `eval_scalar`'s NULL
+/// short-circuit, so a NULL argument is handled here.
+fn eval_catalog_fn(
+    func: ScalarFn,
+    args: &[Value],
+    ctx: &ExecContext,
+) -> Option<Result<Value, ExecError>> {
+    if !matches!(func, ScalarFn::PgGetUserById | ScalarFn::PgTableIsVisible) {
+        return None;
+    }
+    if matches!(args[0], Value::Null) {
+        return Some(Ok(Value::Null));
+    }
+    let Some(ops) = ctx.catalog.as_deref() else {
+        return Some(Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "catalog function evaluated without a catalog context",
+        )));
+    };
+    // The binder declares these arguments as `oid` and inserts the coercion, so
+    // the value has already arrived as one — including the reinterpret-not-clamp
+    // of a negative (PG prints `pg_get_userbyid(-1)` as `unknown (OID=…4295)`),
+    // which `cast` owns.
+    let oid = oid_of(&args[0]);
+    let value = match func {
+        // PG never returns NULL here: an unresolvable OID prints a placeholder.
+        ScalarFn::PgGetUserById => Value::Text(
+            ops.role_name(oid)
+                .unwrap_or_else(|| format!("unknown (OID={oid})")),
+        ),
+        // ... whereas an OID no relation has is NULL, not false.
+        ScalarFn::PgTableIsVisible => ops.table_is_visible(oid).map_or(Value::Null, Value::Bool),
+        _ => unreachable!("guarded by the matches! above"),
+    };
+    Some(Ok(value))
 }
 
 /// Split a `nextval`/`currval`/`setval` text argument into `(namespace, name)`:

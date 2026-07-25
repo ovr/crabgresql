@@ -14,7 +14,7 @@ use crabgresql_binder::{
     substitute_params,
 };
 use crabgresql_executor::{
-    DmlVerb, ExecContext, ExecNode, Execution, OutputColumn, Values, execute,
+    CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, OutputColumn, Values, execute,
 };
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
@@ -27,7 +27,7 @@ use crabgresql_storage_api::{
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
 
-use crate::catalog::SessionCatalog;
+use crate::catalog::{SessionCatalog, SessionCatalogOps};
 use crate::error::PgError;
 use crate::global_catalog::{CatalogNotice, FuncBody, FuncDropSpec, GlobalCatalog, TypeRef};
 use crate::session::{ActiveTxn, Session};
@@ -199,22 +199,31 @@ fn partition_session_relations(
     (permanent, own_temp)
 }
 
-/// Build the binder's two catalog views for this session: the `pg_temp`-first
-/// relation overlay (temp shadows permanent, both behind the read-only
-/// `pg_catalog`) and the user-type/cast view. Shared by `execute_statement` and
-/// `analyze_statement` so binding sees identical name resolution either way.
+/// Build this session's three catalog views: the `pg_temp`-first relation
+/// overlay for the binder (temp shadows permanent, both behind the read-only
+/// `pg_catalog`), the user-type/cast view, and the executor's handle for the
+/// catalog functions. Shared by `execute_statement` and `analyze_statement` so
+/// binding sees identical name resolution either way.
+///
+/// The third view wraps the *same* `SystemCatalog` the first is built from, so
+/// `pg_table_is_visible(c.oid)` resolves the very OIDs the `pg_class` scan in
+/// the same statement emitted.
 fn bind_catalogs(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     session: &Session,
-) -> (Arc<dyn TableEngine>, Arc<dyn TypeCatalog>) {
+) -> (
+    Arc<dyn TableEngine>,
+    Arc<dyn TypeCatalog>,
+    Arc<dyn CatalogOps>,
+) {
     // The read-only system catalog (`pg_catalog`), rebuilt per statement so its
     // rows reflect current server state: live user relations (permanent + this
     // session's temp tables) are reflected into pg_class/pg_attribute. The
     // relation enumeration is lazy — only a query that actually opens
     // pg_class/pg_attribute pays for it. It sits behind temp + global on the
     // search path.
-    let system: Arc<dyn TableEngine> = {
+    let system: Arc<crabgresql_catalog::SystemCatalog> = {
         let global = engine.clone();
         let schemas_engine = engine.clone();
         let database = session.database.clone();
@@ -304,13 +313,15 @@ fn bind_catalogs(
     };
     let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
         engine.clone(),
-        system,
+        system.clone(),
         session.temp_schema.clone(),
     ));
     // The global catalog is the binder's view of user-defined types and casts,
     // so an expression can cast to/from a `CREATE TYPE` name.
     let type_catalog: Arc<dyn TypeCatalog> = global_catalog.clone();
-    (catalog, type_catalog)
+    let catalog_ops: Arc<dyn CatalogOps> =
+        Arc::new(SessionCatalogOps::new(system, session.temp_schema.clone()));
+    (catalog, type_catalog, catalog_ops)
 }
 
 /// Bind a DQL/DML statement against `catalog`, threading `$n` placeholders
@@ -364,7 +375,9 @@ pub fn analyze_statement(
     declared: Vec<Option<PgType>>,
     session: &Session,
 ) -> Result<Analyzed, PgError> {
-    let (catalog, type_catalog) = bind_catalogs(engine, global_catalog, session);
+    // Describe binds but never executes, so the catalog handle is dropped here;
+    // Execute re-enters `execute_statement`, which builds a fresh one.
+    let (catalog, type_catalog, _) = bind_catalogs(engine, global_catalog, session);
     let ctx = param_ctx_extended(declared);
     let logical = match stmt {
         ast::Statement::Query(query) => {
@@ -483,7 +496,7 @@ pub fn execute_statement(
     // Resolution overlay: the session's temp catalog shadows the shared global
     // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
     // so it keeps the raw engine + session below.
-    let (catalog, type_catalog) = bind_catalogs(engine, global_catalog, session);
+    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
     let logical = match bind_dml_with_params(&catalog, &type_catalog, stmt, params)? {
         Some(logical) => logical,
         // Not DQL/DML: fall through to the utility-statement handlers below.
@@ -493,6 +506,7 @@ pub fn execute_statement(
                     engine,
                     &catalog,
                     &type_catalog,
+                    &catalog_ops,
                     txnmgr,
                     create,
                     session,
@@ -704,7 +718,9 @@ pub fn execute_statement(
     // both. Sequences resolve against the global engine (temp sequences are
     // unsupported), matching temp-view handling. The read-only flag lets a bare
     // `SELECT nextval(...)` be rejected (25006) even though it is not a DML write.
-    let exec_ctx = session.exec_context_with_sequences(engine, read_only);
+    // The catalog handle is the same snapshot this statement bound against, so
+    // `pg_table_is_visible(c.oid)` agrees with the `pg_class` rows it filters.
+    let exec_ctx = session.exec_context_for_statement(engine, &catalog_ops, read_only);
     let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
@@ -811,12 +827,15 @@ fn finalize_statement(
     Ok(())
 }
 
-/// A bound COPY plus the type catalog its data fields will parse against —
-/// returned by [`prepare_copy_from`] and threaded into [`run_copy_insert`] so
-/// the catalog is built once per COPY, not twice.
+/// A bound COPY plus the catalogs its rows will be built against — the type
+/// catalog its data fields parse against, and the relation snapshot a column
+/// default's catalog function would resolve through. Returned by
+/// [`prepare_copy_from`] and threaded into [`run_copy_insert`] so both are built
+/// once per COPY, not twice.
 pub struct PreparedCopy {
     pub plan: CopyFromPlan,
     catalog: Arc<dyn TypeCatalog>,
+    catalog_ops: Arc<dyn CatalogOps>,
 }
 
 /// Resolve `COPY <table> [(cols)] FROM STDIN` up to the point the connection
@@ -854,7 +873,7 @@ pub fn prepare_copy_from(
             "prepare_copy_from called with a non-COPY statement",
         ));
     };
-    let (catalog, type_catalog) = bind_catalogs(engine, global_catalog, session);
+    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
     let plan = bind_copy_from(
         &catalog,
         &type_catalog,
@@ -876,6 +895,7 @@ pub fn prepare_copy_from(
     Ok(PreparedCopy {
         plan,
         catalog: type_catalog,
+        catalog_ops,
     })
 }
 
@@ -894,10 +914,11 @@ pub fn run_copy_insert(
     let logical = prepared.plan.build_insert(&prepared.catalog, rows)?;
     // A COPY is a write (read-only was rejected at prepare time); its context
     // carries a sequence handle so a `serial`/`nextval()` column default advances
-    // the sequence and updates this session's currval/lastval, as INSERT does.
+    // the sequence and updates this session's currval/lastval, as INSERT does,
+    // and the catalog snapshot bound at prepare time for the same reason.
     let read_only = read_only_active(session);
     let txn = build_txn(txnmgr, session, true);
-    let exec_ctx = session.exec_context_with_sequences(engine, read_only);
+    let exec_ctx = session.exec_context_for_statement(engine, &prepared.catalog_ops, read_only);
     let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
@@ -2420,6 +2441,7 @@ fn execute_create_table_as(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
+    catalog_ops: &Arc<dyn CatalogOps>,
     txnmgr: &Arc<TransactionManager>,
     create: &ast::CreateTable,
     session: &mut Session,
@@ -2569,7 +2591,7 @@ fn execute_create_table_as(
     // a populate failure we best-effort drop the half-created table.
     let read_only = read_only_active(session);
     let txn = build_txn(txnmgr, session, true);
-    let exec_ctx = session.exec_context_with_sequences(engine, read_only);
+    let exec_ctx = session.exec_context_for_statement(engine, catalog_ops, read_only);
     let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
