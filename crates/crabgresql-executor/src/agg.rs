@@ -325,6 +325,13 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     o.hash(&mut h);
                 }
             }
+            // Only the OID: equality ignores the rendered name, so hashing it
+            // would put two equal values in different buckets.
+            PgType::Reg(_) => {
+                if let Value::Reg(r) = v {
+                    r.oid.hash(&mut h);
+                }
+            }
             PgType::Macaddr => {
                 if let Value::Macaddr(b) = v {
                     b.hash(&mut h);

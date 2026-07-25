@@ -140,6 +140,14 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 "catalog function reached the pure scalar evaluator",
             ));
         }
+        // Likewise the deparse/formatting functions, dispatched by `eval` because
+        // they are not uniformly STRICT.
+        ScalarFn::FormatType | ScalarFn::PgGetExpr => {
+            return Err(ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                "deparse function reached the pure scalar evaluator",
+            ));
+        }
         // --- jsonpath (STRICT: any NULL arg already short-circuited to NULL) ---
         ScalarFn::JsonPath(f) => return eval_jsonpath(f, args),
         // --- array containment / size (STRICT) ---

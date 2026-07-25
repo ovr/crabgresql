@@ -11,7 +11,8 @@
 use std::collections::HashMap;
 
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexMethod, PartitionStrategy, TableSchema,
+    Column, IndexConstraint, IndexMethod, PartitionBoundDatum, PartitionOf, PartitionStrategy,
+    TableSchema,
 };
 use crabgresql_types::{PgType, Value};
 
@@ -379,8 +380,12 @@ pub fn pg_am_rows() -> Vec<Vec<Value>> {
     ]
 }
 
-/// `pg_catalog.pg_class` — a curated subset of columns for user relations.
-/// Index/partition/stats columns beyond this set are omitted for now.
+/// `pg_catalog.pg_class` — a curated subset of columns for user relations, in
+/// PostgreSQL's `attnum` order. Columns crabgresql has no state for are still
+/// emitted with their true constant so a client's `\d` predicates evaluate as on
+/// PG (e.g. `relchecks = 0` gates the CHECK-constraint listing *off*). Storage
+/// bookkeeping columns beyond this set (`relpages`, `relfrozenxid`, …) are
+/// omitted.
 pub fn pg_class_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_class",
@@ -390,14 +395,55 @@ pub fn pg_class_schema() -> TableSchema {
             col("relname", PgType::Name),
             col("relnamespace", PgType::Oid),
             col("reltype", PgType::Oid),
+            col("reloftype", PgType::Oid),
             col("relowner", PgType::Oid),
             col("relam", PgType::Oid),
-            col("relnatts", PgType::Int2),
+            col("reltablespace", PgType::Oid),
+            col("reltoastrelid", PgType::Oid),
             col("relhasindex", PgType::Bool),
             col("relpersistence", CHARLIKE),
             col("relkind", CHARLIKE),
+            col("relnatts", PgType::Int2),
+            col("relchecks", PgType::Int2),
+            col("relhasrules", PgType::Bool),
+            col("relhastriggers", PgType::Bool),
+            col("relrowsecurity", PgType::Bool),
+            col("relforcerowsecurity", PgType::Bool),
+            col("relreplident", CHARLIKE),
             col("relispartition", PgType::Bool),
+            // pg_node_tree in PG; crabgresql stores the already-deparsed
+            // `FOR VALUES …` text (see `pg_get_expr`, which just echoes it).
+            col("relpartbound", PgType::Text),
         ],
+    )
+}
+
+/// Deparse a leaf partition's `relpartbound` to the canonical text PostgreSQL's
+/// `pg_get_expr(relpartbound, oid)` prints — `FOR VALUES FROM (…) TO (…)`. Only
+/// RANGE partitions exist, so only the range form is produced. Numeric bounds
+/// print bare; every other literal is single-quoted (embedded quotes doubled);
+/// `MINVALUE`/`MAXVALUE` print as the bare keywords. Storing the final text (not
+/// a node tree) is a deliberate deviation: `pg_get_expr` then just echoes it.
+fn deparse_partbound(part: &PartitionOf) -> String {
+    let datum = |d: &PartitionBoundDatum| match d {
+        PartitionBoundDatum::MinValue => "MINVALUE".to_string(),
+        PartitionBoundDatum::MaxValue => "MAXVALUE".to_string(),
+        PartitionBoundDatum::Value(v) => {
+            let text = v.encode_text().unwrap_or_default();
+            if v.pg_type().is_some_and(PgType::is_numeric) {
+                text
+            } else {
+                format!("'{}'", text.replace('\'', "''"))
+            }
+        }
+    };
+    let list = |datums: &[PartitionBoundDatum]| {
+        datums.iter().map(datum).collect::<Vec<_>>().join(", ")
+    };
+    format!(
+        "FOR VALUES FROM ({}) TO ({})",
+        list(&part.bound.from),
+        list(&part.bound.to)
     )
 }
 
@@ -407,6 +453,12 @@ pub fn pg_class_schema() -> TableSchema {
 /// `relam = 2`) while a view has no storage access method (`relkind = 'v'`,
 /// `relam = 0`). The synthetic OIDs are stable within one catalog snapshot so a
 /// join to `pg_attribute.attrelid` lines up.
+///
+/// Columns crabgresql does not track are their PostgreSQL constants: no CHECK
+/// constraints (`relchecks = 0`), rules only on views (`relhasrules`), no
+/// triggers or row security, no `OF type` / tablespace / TOAST relation. A
+/// heap-backed relation defaults its replica identity to the primary key
+/// (`relreplident = 'd'`); views, sequences, and indexes have none (`'n'`).
 pub fn pg_class_rows(
     relations: &[(u32, TableSchema)],
     kinds: &[RelKind],
@@ -428,18 +480,43 @@ pub fn pg_class_rows(
                 RelKind::View => (0, "v"),
                 RelKind::Sequence => (0, "S"),
             };
+            // Heap-backed relations (ordinary + partitioned tables) default their
+            // replica identity to the primary key; the rest carry none.
+            let relreplident = match kind {
+                RelKind::Table | RelKind::PartitionedTable => "d",
+                RelKind::View | RelKind::Sequence => "n",
+            };
+            let relpartbound = match &schema.partition_of {
+                Some(part) => Value::Text(deparse_partbound(part)),
+                None => Value::Null,
+            };
             vec![
                 Value::Oid(*oid),
                 Value::Text(schema.name.clone()),
                 Value::Oid(nsp_oid(&schema.namespace)),
                 Value::Oid(0),
+                // reloftype: crabgresql has no typed tables.
+                Value::Oid(0),
                 Value::Oid(BOOTSTRAP_ROLE_OID),
                 Value::Oid(relam),
-                Value::Int2(schema.columns.len() as i16),
+                // reltablespace / reltoastrelid: default tablespace, no TOAST.
+                Value::Oid(0),
+                Value::Oid(0),
                 Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
                 Value::Text(schema.persistence.as_char().to_string()),
                 Value::Text(relkind.to_string()),
+                Value::Int2(schema.columns.len() as i16),
+                // relchecks: no CHECK constraints modeled.
+                Value::Int2(0),
+                // relhasrules: only a view carries the `_RETURN` rule.
+                Value::Bool(matches!(kind, RelKind::View)),
+                // relhastriggers / relrowsecurity / relforcerowsecurity.
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Text(relreplident.to_string()),
                 Value::Bool(schema.partition_of.is_some()),
+                relpartbound,
             ]
         })
         .collect();
@@ -450,16 +527,27 @@ pub fn pg_class_rows(
             // An index lives in its table's namespace.
             Value::Oid(nsp_oid(&index.table_schema.namespace)),
             Value::Oid(0),
+            Value::Oid(0),
             Value::Oid(BOOTSTRAP_ROLE_OID),
             Value::Oid(match index.metadata.method {
                 IndexMethod::BTree => BTREE_AM_OID,
                 IndexMethod::Hash => HASH_AM_OID,
             }),
-            Value::Int2(index.metadata.keys.len() as i16),
+            Value::Oid(0),
+            Value::Oid(0),
             Value::Bool(false),
             Value::Text("p".to_string()),
             Value::Text("i".to_string()),
+            Value::Int2(index.metadata.keys.len() as i16),
+            Value::Int2(0),
             Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            // An index has no replica identity of its own.
+            Value::Text("n".to_string()),
+            Value::Bool(false),
+            Value::Null,
         ]
     }));
     rows
@@ -566,10 +654,29 @@ pub fn pg_attribute_schema() -> TableSchema {
             col("atttypmod", PgType::Int4),
             col("attnotnull", PgType::Bool),
             col("atthasdef", PgType::Bool),
+            col("attidentity", CHARLIKE),
+            col("attgenerated", CHARLIKE),
             col("attisdropped", PgType::Bool),
             col("attcollation", PgType::Oid),
         ],
     )
+}
+
+/// PostgreSQL's `atttypmod` encoding of a column's declared modifier, from the
+/// raw form crabgresql stores in [`Column::typmod`] (a bare length for the
+/// character/bit types, `-1` for none). `character`/`character varying` reserve
+/// four bytes for the varlena header (`n + VARHDRSZ`); `bit`/`bit varying` store
+/// the length directly. Numeric and datetime precisions are not persisted yet,
+/// so those columns carry `-1` — `format_type` then omits the modifier. Keeping
+/// this the true PostgreSQL encoding lets `format_type(atttypid, atttypmod)`
+/// reproduce PG's `\d` type strings.
+fn atttypmod_of(column: &Column) -> i32 {
+    const VARHDRSZ: i32 = 4;
+    match column.ty {
+        _ if column.typmod < 0 => -1,
+        PgType::Varchar | PgType::Bpchar => column.typmod + VARHDRSZ,
+        _ => column.typmod,
+    }
 }
 
 /// `attcollation`: the column's explicit `COLLATE`, else the type's own
@@ -596,9 +703,12 @@ pub fn pg_attribute_rows(
                 Value::Oid(c.ty.oid()),
                 Value::Int2(c.ty.typlen()),
                 Value::Int2((i + 1) as i16),
-                Value::Int4(c.typmod),
+                Value::Int4(atttypmod_of(c)),
                 Value::Bool(!c.nullable),
                 Value::Bool(c.default.is_some()),
+                // attidentity / attgenerated: no identity or generated columns.
+                Value::Text(String::new()),
+                Value::Text(String::new()),
                 Value::Bool(false),
                 Value::Oid(attcollation_of(c)),
             ]);
@@ -613,9 +723,11 @@ pub fn pg_attribute_rows(
                 Value::Oid(column.ty.oid()),
                 Value::Int2(column.ty.typlen()),
                 Value::Int2((position + 1) as i16),
-                Value::Int4(column.typmod),
+                Value::Int4(atttypmod_of(column)),
                 Value::Bool(false),
                 Value::Bool(false),
+                Value::Text(String::new()),
+                Value::Text(String::new()),
                 Value::Bool(false),
                 Value::Oid(attcollation_of(column)),
             ]);

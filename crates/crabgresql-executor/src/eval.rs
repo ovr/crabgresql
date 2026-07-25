@@ -76,6 +76,12 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             if let Some(result) = eval_sequence_fn(*func, &arg_values, ctx) {
                 return result;
             }
+            // `format_type` / `pg_get_expr` are non-strict in a way the pure
+            // `eval_scalar` cannot express (`format_type` returns a name for a
+            // NULL modifier), so they are dispatched here.
+            if let Some(result) = eval_deparse_fn(*func, &arg_values) {
+                return result;
+            }
             // The catalog functions read the session's pg_catalog snapshot, which
             // the pure `eval_scalar` has no handle to.
             match eval_catalog_fn(*func, &arg_values, ctx) {
@@ -273,17 +279,17 @@ fn eval_sequence_fn(
     let result = match func {
         ScalarFn::Nextval => match &args[0] {
             Value::Null => Ok(Value::Null),
-            name => {
-                let (ns, seq) = seq_ref(name);
-                ops.nextval(ns, seq).map(Value::Int8)
-            }
+            name => match seq_ref_owned(name, ctx) {
+                Some((ns, seq)) => ops.nextval(ns.as_deref(), &seq).map(Value::Int8),
+                None => Err(missing_catalog()),
+            },
         },
         ScalarFn::Currval => match &args[0] {
             Value::Null => Ok(Value::Null),
-            name => {
-                let (ns, seq) = seq_ref(name);
-                ops.currval(ns, seq).map(Value::Int8)
-            }
+            name => match seq_ref_owned(name, ctx) {
+                Some((ns, seq)) => ops.currval(ns.as_deref(), &seq).map(Value::Int8),
+                None => Err(missing_catalog()),
+            },
         },
         ScalarFn::Setval => {
             // setval is STRICT: a NULL in any argument (including the optional
@@ -296,8 +302,12 @@ fn eval_sequence_fn(
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 Ok(Value::Null)
             } else {
-                let (ns, seq) = seq_ref(&args[0]);
-                ops.setval(ns, seq, int8(&args[1]), is_called).map(Value::Int8)
+                match seq_ref_owned(&args[0], ctx) {
+                    Some((ns, seq)) => ops
+                        .setval(ns.as_deref(), &seq, int8(&args[1]), is_called)
+                        .map(Value::Int8),
+                    None => Err(missing_catalog()),
+                }
             }
         }
         ScalarFn::Lastval => ops.lastval().map(Value::Int8),
@@ -318,7 +328,13 @@ fn eval_catalog_fn(
     args: &[Value],
     ctx: &ExecContext,
 ) -> Option<Result<Value, ExecError>> {
-    if !matches!(func, ScalarFn::PgGetUserById | ScalarFn::PgTableIsVisible) {
+    if !matches!(
+        func,
+        ScalarFn::PgGetUserById
+            | ScalarFn::PgTableIsVisible
+            | ScalarFn::RegIn(_)
+            | ScalarFn::RegFromOid(_)
+    ) {
         return None;
     }
     if matches!(args[0], Value::Null) {
@@ -330,11 +346,14 @@ fn eval_catalog_fn(
             "catalog function evaluated without a catalog context",
         )));
     };
-    // The binder declares these arguments as `oid` and inserts the coercion, so
-    // the value has already arrived as one — including the reinterpret-not-clamp
-    // of a negative (PG prints `pg_get_userbyid(-1)` as `unknown (OID=…4295)`),
-    // which `cast` owns.
-    let oid = oid_of(&args[0]);
+    // The binder declares the OID-taking arguments as `oid` and inserts the
+    // coercion, so the value has already arrived as one — including the
+    // reinterpret-not-clamp of a negative (PG prints `pg_get_userbyid(-1)` as
+    // `unknown (OID=…4295)`), which `cast` owns. `RegIn` alone takes text.
+    let oid = match args[0] {
+        Value::Text(_) => 0,
+        _ => oid_of(&args[0]),
+    };
     let value = match func {
         // PG never returns NULL here: an unresolvable OID prints a placeholder.
         ScalarFn::PgGetUserById => Value::Text(
@@ -343,9 +362,92 @@ fn eval_catalog_fn(
         ),
         // ... whereas an OID no relation has is NULL, not false.
         ScalarFn::PgTableIsVisible => ops.table_is_visible(oid).map_or(Value::Null, Value::Bool),
+        // `'name'::reg*` must find the object; `oid::reg*` takes the OID as
+        // given and only resolves how it renders, so it cannot fail.
+        ScalarFn::RegIn(kind) => match &args[0] {
+            Value::Text(s) => match crate::reg::from_text(kind, s, ops) {
+                Ok(reg) => Value::Reg(reg),
+                Err(e) => return Some(Err(e)),
+            },
+            other => unreachable!("reg* input was {other:?}"),
+        },
+        ScalarFn::RegFromOid(kind) => Value::Reg(crate::reg::from_oid(kind, oid, ops)),
         _ => unreachable!("guarded by the matches! above"),
     };
     Some(Ok(value))
+}
+
+/// Dispatch the type-formatting / node-tree deparse functions. Returns `None`
+/// for any other function (the caller falls back to the pure `eval_scalar`).
+/// These run ahead of `eval_scalar` because they are not uniformly STRICT:
+/// `format_type` must return a type name when only its modifier is NULL.
+fn eval_deparse_fn(func: ScalarFn, args: &[Value]) -> Option<Result<Value, ExecError>> {
+    match func {
+        ScalarFn::FormatType => Some(Ok(eval_format_type(args))),
+        // `pg_get_expr` echoes the already-deparsed SQL text crabgresql stores
+        // (a column default's `adbin`, a partition's `relpartbound`). A NULL
+        // node yields NULL, as in PG.
+        ScalarFn::PgGetExpr => Some(Ok(args[0].clone())),
+        _ => None,
+    }
+}
+
+/// `format_type(oid, typmod)`. A NULL oid yields NULL; oid `0` is `-`; an oid
+/// this build does not model is `???`. The modifier is decoded in PostgreSQL's
+/// `atttypmod` encoding (see `crabgresql_catalog`'s `atttypmod_of`), so this is
+/// the inverse that reproduces PG's `\d` type strings.
+fn eval_format_type(args: &[Value]) -> Value {
+    let oid = match &args[0] {
+        Value::Null => return Value::Null,
+        v => oid_of(v),
+    };
+    // A NULL (or absent) modifier means "no modifier applied".
+    let typmod = match args.get(1) {
+        Some(Value::Int4(m)) if *m >= 0 => Some(*m),
+        _ => None,
+    };
+    Value::Text(format_type_text(oid, typmod))
+}
+
+/// The body of `format_type`: PostgreSQL's SQL spelling of type `oid` with
+/// `typmod` (its `atttypmod` encoding) applied.
+fn format_type_text(oid: u32, typmod: Option<i32>) -> String {
+    // VARHDRSZ: character types encode `length + 4` (see `atttypmod_of`).
+    const VARHDRSZ: i32 = 4;
+    if oid == 0 {
+        return "-".to_string();
+    }
+    let Some(ty) = PgType::from_oid(oid) else {
+        // A user type would resolve through `CatalogOps::type_name` (a follow-up
+        // once that lookup lands); a genuinely unknown OID is `???`, as in PG.
+        return "???".to_string();
+    };
+    // An array formats its element type (carrying the modifier) with `[]`.
+    if let PgType::Array(elem) = ty {
+        return format!("{}[]", format_type_text(elem, typmod));
+    }
+    let name = ty.name();
+    let Some(m) = typmod else {
+        return name.to_string();
+    };
+    match ty {
+        PgType::Numeric => {
+            let m = m - VARHDRSZ;
+            format!("numeric({},{})", m >> 16, m & 0xffff)
+        }
+        PgType::Varchar => format!("character varying({})", m - VARHDRSZ),
+        PgType::Bpchar => format!("character({})", m - VARHDRSZ),
+        PgType::Bit => format!("bit({m})"),
+        PgType::Varbit => format!("bit varying({m})"),
+        // The precision goes *before* the "with[out] time zone" suffix.
+        PgType::Time => format!("time({m}) without time zone"),
+        PgType::TimeTz => format!("time({m}) with time zone"),
+        PgType::Timestamp => format!("timestamp({m}) without time zone"),
+        PgType::TimestampTz => format!("timestamp({m}) with time zone"),
+        // `interval`'s typmod packs range+precision bits; crabgresql never
+        // persists one, so a modifier here is printed as the bare type name.
+        _ => name.to_string(),
+    }
 }
 
 /// Split a `nextval`/`currval`/`setval` text argument into `(namespace, name)`:
@@ -359,6 +461,33 @@ fn seq_ref(v: &Value) -> (Option<&str>, &str) {
             None => (None, s),
         },
         other => unreachable!("sequence name argument was {other:?}"),
+    }
+}
+
+/// A `regclass` sequence argument reached a context with no catalog handle, or
+/// names a relation that has since gone: the same internal wiring error the
+/// other catalog-less paths report.
+fn missing_catalog() -> ExecError {
+    ExecError::new(
+        sqlstate::INTERNAL_ERROR,
+        "sequence function could not resolve a regclass argument",
+    )
+}
+
+/// The `(namespace, name)` a sequence-function argument denotes. A `regclass`
+/// argument already resolved its OID at cast time, so the pair comes from the
+/// catalog rather than from re-parsing the rendered name — which would be
+/// ambiguous for a quoted name containing a `.`.
+fn seq_ref_owned(v: &Value, ctx: &ExecContext) -> Option<(Option<String>, String)> {
+    match v {
+        Value::Reg(r) => {
+            let (ns, name) = ctx.catalog.as_deref()?.rel_name(r.oid)?;
+            Some((Some(ns), name))
+        }
+        other => {
+            let (ns, name) = seq_ref(other);
+            Some((ns.map(str::to_string), name.to_string()))
+        }
     }
 }
 
@@ -535,6 +664,9 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         PgType::Money => money::cmp(money_of(l), money_of(r)),
         // oid: unsigned 32-bit order (PG's `oidcmp`).
         PgType::Oid => oid_of(l).cmp(&oid_of(r)),
+        // A reg* value orders by OID, never by the name it renders as — the
+        // same rule its `PartialEq` and `hash_key` use.
+        PgType::Reg(_) => reg_oid(l).cmp(&reg_oid(r)),
         // bit/varbit: common-prefix bit order, then shorter first (`bit_cmp`).
         PgType::Bit | PgType::Varbit => {
             let (la, da) = bit_of(l);
@@ -640,6 +772,13 @@ fn oid_of(v: &Value) -> u32 {
     match v {
         Value::Oid(v) => *v,
         other => unreachable!("expected oid, got {other:?}"),
+    }
+}
+
+fn reg_oid(v: &Value) -> u32 {
+    match v {
+        Value::Reg(r) => r.oid,
+        other => unreachable!("expected a reg* value, got {other:?}"),
     }
 }
 

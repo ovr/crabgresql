@@ -517,6 +517,44 @@ impl SystemCatalog {
         self.build_pg_catalog(name).is_some()
     }
 
+    /// The name of the schema `oid` identifies, or `None` if this snapshot has
+    /// no such schema. The inverse of [`SystemCatalog::namespace_oid`]; both back
+    /// `regnamespace`, and both read the same table `pg_namespace` is built from.
+    pub fn namespace_name(&self, oid: u32) -> Option<String> {
+        self.namespace_oids()
+            .into_iter()
+            .find(|(_, o)| *o == oid)
+            .map(|(name, _)| name)
+    }
+
+    pub fn namespace_oid(&self, name: &str) -> Option<u32> {
+        self.namespace_oids().get(name).copied()
+    }
+
+    /// The `(namespace, name)` of the user type `oid` identifies, or `None` for
+    /// an OID no `CREATE TYPE` has. Built-in types are not here — they resolve
+    /// without a catalog. User types carry no namespace of their own yet
+    /// (`CREATE TYPE app.t` is unsupported), so they all report `public`, which
+    /// is where an unqualified name finds them.
+    pub fn user_type_ref(&self, oid: u32) -> Option<(&str, &str)> {
+        self.user_types()
+            .iter()
+            .find(|t| t.oid == oid)
+            .map(|t| ("public", t.name.as_str()))
+    }
+
+    /// The OID of the user type `namespace.name` names. A qualifier other than
+    /// `public` matches nothing, for the reason above.
+    pub fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+        if matches!(namespace, Some(ns) if ns != "public") {
+            return None;
+        }
+        self.user_types()
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.oid)
+    }
+
     /// Build the requested relation's rows + schema, or `None` if unknown.
     fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         match name {

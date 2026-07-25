@@ -71,6 +71,45 @@ impl CatalogOps for SessionCatalogOps {
         // 3. Otherwise the global engine, which resolves unqualified in public.
         Some(namespace == "public")
     }
+
+    fn rel_name(&self, oid: u32) -> Option<(String, String)> {
+        self.system
+            .relation_ref(oid)
+            .map(|(ns, name)| (ns.to_string(), name.to_string()))
+    }
+
+    /// An unqualified name resolves the way `table_is_visible` reports: this
+    /// session's temp schema, then `pg_catalog`, then `public`. Asking the
+    /// catalog for each in turn keeps `'t'::regclass` landing on the same
+    /// relation a bare `SELECT * FROM t` would.
+    fn rel_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+        match namespace {
+            Some(ns) => self.system.relation_oid_in(ns, name),
+            None => self
+                .system
+                .relation_oid_in(&self.temp_schema, name)
+                .or_else(|| self.system.relation_oid_in("pg_catalog", name))
+                .or_else(|| self.system.relation_oid_in("public", name)),
+        }
+    }
+
+    fn namespace_name(&self, oid: u32) -> Option<String> {
+        self.system.namespace_name(oid)
+    }
+
+    fn namespace_oid(&self, name: &str) -> Option<u32> {
+        self.system.namespace_oid(name)
+    }
+
+    fn user_type_name(&self, oid: u32) -> Option<(String, String)> {
+        self.system
+            .user_type_ref(oid)
+            .map(|(ns, name)| (ns.to_string(), name.to_string()))
+    }
+
+    fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+        self.system.user_type_oid(namespace, name)
+    }
 }
 
 /// Resolves relations against this session's temp namespace first, then the

@@ -7,7 +7,7 @@
 //! `u32` length prefix followed by the payload. Floats are stored via `to_bits`
 //! so NaN payloads survive a round trip.
 
-use crabgresql_types::{Inet, Interval, Numeric, PgType, TimeTz, Value, json};
+use crabgresql_types::{Inet, Interval, Numeric, PgType, Reg, TimeTz, Value, json};
 
 // Type tags. Never reordered — they are an on-disk format.
 const T_BOOL: u8 = 1;
@@ -40,6 +40,7 @@ const T_JSON: u8 = 27;
 const T_JSONB: u8 = 28;
 const T_JSONPATH: u8 = 29;
 const T_ARRAY: u8 = 30;
+const T_REG: u8 = 31;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -157,6 +158,17 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             for c in l {
                 out.extend_from_slice(&c.to_bits().to_le_bytes());
             }
+        }
+        // A reg* value stores the OID *and* the name it renders as, because the
+        // name is resolved when the value is built, not at output time (see
+        // `crabgresql_types::Reg`). A row read back therefore shows the name the
+        // object had when it was written, which is a documented divergence from
+        // PG — PG re-resolves the OID on every output.
+        Value::Reg(reg) => {
+            out.push(T_REG);
+            out.extend_from_slice(&reg.kind.oid().to_le_bytes());
+            out.extend_from_slice(&reg.oid.to_le_bytes());
+            put_var(out, reg.name.as_bytes());
         }
         Value::Enum { type_oid, ordinal, label } => {
             out.push(T_ENUM);
@@ -314,6 +326,17 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             f64::from_bits(r.u64()),
             f64::from_bits(r.u64()),
         ]),
+        T_REG => {
+            let kind_oid = r.u32();
+            let PgType::Reg(kind) = PgType::from_oid(kind_oid)
+                .expect("stored reg* type re-resolves")
+            else {
+                panic!("reg datum tagged with a non-reg type oid {kind_oid}")
+            };
+            let oid = r.u32();
+            let name = String::from_utf8(r.var().to_vec()).expect("reg name is valid utf-8");
+            Value::Reg(Reg { kind, oid, name })
+        }
         T_ENUM => {
             let type_oid = r.u32();
             let ordinal = r.u32();
@@ -361,6 +384,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crabgresql_types::RegKind;
 
     fn roundtrip(v: Value) {
         let mut buf = Vec::new();
@@ -371,8 +395,46 @@ mod tests {
         assert_eq!(got, v);
     }
 
+    /// `Reg`'s `PartialEq` compares only `(kind, oid)`, so `roundtrip`'s
+    /// assertion cannot see a lost or corrupted name. Check the rendered text
+    /// explicitly — losing it would make a stored `regclass` column read back as
+    /// bare digits.
+    #[test]
+    fn reg_datum_keeps_its_rendered_name() {
+        let mut buf = Vec::new();
+        encode_datum(
+            &Value::Reg(Reg {
+                kind: RegKind::Class,
+                oid: 1259,
+                name: "rs.\"Mixed Case\"".into(),
+            }),
+            &mut buf,
+        );
+        let mut pos = 0;
+        let Value::Reg(got) = decode_datum(&buf, &mut pos) else {
+            panic!("decoded a non-reg value");
+        };
+        assert_eq!(got.kind, RegKind::Class);
+        assert_eq!(got.oid, 1259);
+        assert_eq!(got.name, "rs.\"Mixed Case\"");
+    }
+
     #[test]
     fn all_variants_roundtrip() {
+        // A reg* value carries its rendered name through the page, including the
+        // `-`/digits renderings an unresolved OID gets.
+        roundtrip(Value::Reg(Reg {
+            kind: RegKind::Class,
+            oid: 1259,
+            name: "pg_class".into(),
+        }));
+        roundtrip(Value::Reg(Reg {
+            kind: RegKind::Type,
+            oid: 23,
+            name: "integer".into(),
+        }));
+        roundtrip(Value::Reg(Reg::unresolved(RegKind::Namespace, 0)));
+        roundtrip(Value::Reg(Reg::unresolved(RegKind::Class, 999_999)));
         roundtrip(Value::Bool(true));
         roundtrip(Value::Bool(false));
         roundtrip(Value::Int2(i16::MIN));

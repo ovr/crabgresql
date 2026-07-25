@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{SqlFunctionSig, TypeCatalog};
-use crabgresql_types::PgType;
+use crabgresql_types::{PgType, RegKind};
 
 use crate::expr::{
     Binding, BoundExpr, Scope, bind_expr, bind_sql_function_body, coerce_for_arg, inline_params,
@@ -420,6 +420,25 @@ pub enum ScalarFn {
     /// `pg_table_is_visible(oid) -> bool`: whether the relation is reachable by
     /// an unqualified name. NULL for an OID no relation has.
     PgTableIsVisible,
+    /// `'name'::reg*`: resolve an object name to the OID it identifies, erroring
+    /// if nothing has that name. Emitted by a cast, not callable by name — PG
+    /// spells these `regclassin` and friends, which are not SQL-visible either.
+    RegIn(RegKind),
+    /// `oid::reg*`: take an OID as-is and resolve the name it renders as. An OID
+    /// that names nothing is not an error (it prints as `-` or its digits), so
+    /// this never fails.
+    RegFromOid(RegKind),
+    // --- catalog deparse / type formatting (dispatched by the executor's `eval`,
+    // not the pure `eval_scalar`: `format_type` is non-strict in its typmod
+    // argument, which `eval_scalar`'s STRICT short-circuit cannot express) ---
+    /// `format_type(oid, int4) -> text`: PostgreSQL's SQL spelling of a type with
+    /// its modifier applied (`character varying(20)`, `numeric(4,2)`). NULL oid
+    /// yields NULL; a NULL modifier means "no modifier" (not NULL).
+    FormatType,
+    /// `pg_get_expr(text, oid[, bool]) -> text`: deparse a stored node tree back
+    /// to SQL. crabgresql already stores canonical SQL text (column defaults,
+    /// `relpartbound`), so this echoes its first argument.
+    PgGetExpr,
     // --- jsonpath (jsonb @ jsonpath) ---
     /// A `jsonb_path_*` function / `@?` / `@@` operator. Args are
     /// `[jsonb, jsonpath]` optionally followed by `[vars jsonb, silent bool]`;
@@ -842,6 +861,7 @@ const LSEG: PgType = PgType::Lseg;
 const JSONB: PgType = PgType::Jsonb;
 const JSONPATH: PgType = PgType::Jsonpath;
 const OID: PgType = PgType::Oid;
+const REGCLASS: PgType = PgType::Reg(RegKind::Class);
 const NAME: PgType = PgType::Name;
 
 /// The overloads for `name` (already lowercased). Most math functions take one
@@ -1287,20 +1307,35 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: I4,
             },
         ],
-        // Sequence functions. The `regclass` argument is accepted as `text` (a
-        // sequence name); `'seq'::regclass` binds through the regclass→text shim
-        // in `map_data_type`. These are side-effecting and are dispatched by the
-        // executor's `eval` (not `eval_scalar`).
-        "nextval" => &[Signature {
-            func: ScalarFn::Nextval,
-            args: &[TEXT],
-            ret: I8,
-        }],
-        "currval" => &[Signature {
-            func: ScalarFn::Currval,
-            args: &[TEXT],
-            ret: I8,
-        }],
+        // Sequence functions. PG declares these over `regclass`; the `text`
+        // overload is kept alongside it so a bare `nextval('seq')` still binds
+        // without the unknown literal having to resolve through the catalog.
+        // These are side-effecting and are dispatched by the executor's `eval`
+        // (not `eval_scalar`).
+        "nextval" => &[
+            Signature {
+                func: ScalarFn::Nextval,
+                args: &[TEXT],
+                ret: I8,
+            },
+            Signature {
+                func: ScalarFn::Nextval,
+                args: &[REGCLASS],
+                ret: I8,
+            },
+        ],
+        "currval" => &[
+            Signature {
+                func: ScalarFn::Currval,
+                args: &[TEXT],
+                ret: I8,
+            },
+            Signature {
+                func: ScalarFn::Currval,
+                args: &[REGCLASS],
+                ret: I8,
+            },
+        ],
         "setval" => &[
             Signature {
                 func: ScalarFn::Setval,
@@ -1309,7 +1344,17 @@ fn lookup(name: &str) -> &'static [Signature] {
             },
             Signature {
                 func: ScalarFn::Setval,
+                args: &[REGCLASS, I8],
+                ret: I8,
+            },
+            Signature {
+                func: ScalarFn::Setval,
                 args: &[TEXT, I8, BOOL],
+                ret: I8,
+            },
+            Signature {
+                func: ScalarFn::Setval,
+                args: &[REGCLASS, I8, BOOL],
                 ret: I8,
             },
         ],
@@ -1331,6 +1376,26 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[OID],
             ret: BOOL,
         }],
+        // Type formatting / node-tree deparse. Dispatched by the executor's
+        // `eval` (not `eval_scalar`): `format_type` must return non-NULL for a
+        // NULL type modifier, which the STRICT `eval_scalar` path cannot do.
+        "format_type" => &[Signature {
+            func: ScalarFn::FormatType,
+            args: &[OID, I4],
+            ret: TEXT,
+        }],
+        "pg_get_expr" => &[
+            Signature {
+                func: ScalarFn::PgGetExpr,
+                args: &[TEXT, OID],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::PgGetExpr,
+                args: &[TEXT, OID, BOOL],
+                ret: TEXT,
+            },
+        ],
         "upper" => &[Signature {
             func: ScalarFn::Upper,
             args: &[TEXT],

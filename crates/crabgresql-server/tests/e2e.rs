@@ -5303,3 +5303,42 @@ async fn correlated_reference_inside_a_union_arm_resolves() -> anyhow::Result<()
     ]);
     Ok(())
 }
+
+/// A `reg*` column must be advertised on the wire as the real PG type OID
+/// (regclass = 2205), not as the `text`/`oid` it is represented by internally —
+/// a client that reads `RowDescription` decodes by that OID. `\d` itself never
+/// looks, but `\gdesc` and every typed driver do.
+#[tokio::test]
+async fn reg_columns_advertise_their_postgresql_type_oids() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client.simple_query("CREATE TABLE regwire (a integer)").await?;
+
+    let typed = client
+        .query(
+            "SELECT 'regwire'::regclass AS c, 23::regtype AS t, 2200::regnamespace AS n",
+            &[],
+        )
+        .await?;
+    let columns = typed[0].columns();
+    assert_eq!(columns[0].type_().oid(), 2205, "regclass");
+    assert_eq!(columns[1].type_().oid(), 2206, "regtype");
+    assert_eq!(columns[2].type_().oid(), 4089, "regnamespace");
+
+    // The value on the wire is the rendered name, and the OID underneath still
+    // round-trips through `::oid`.
+    let rendered = client
+        .simple_query("SELECT 'regwire'::regclass::text AS name, 23::regtype::text AS ty")
+        .await?;
+    let row = rows(&rendered);
+    assert_eq!(row[0].get("name"), Some("regwire"));
+    assert_eq!(row[0].get("ty"), Some("integer"));
+
+    let same = client
+        .simple_query(
+            "SELECT 'regwire'::regclass::oid = 'REGWIRE'::regclass::oid AS eq",
+        )
+        .await?;
+    assert_eq!(rows(&same)[0].get("eq"), Some("t"));
+    Ok(())
+}
