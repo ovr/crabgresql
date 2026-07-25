@@ -517,6 +517,77 @@ async fn psql_describe_listings_match_pg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The per-column query psql sends third for `\d <table>` / `\d <view>`,
+/// replayed verbatim but for the OID psql substitutes from its first query.
+/// This is the gate that the whole statement binds and runs: `format_type` over
+/// the stored `atttypmod`, `pg_get_expr` over a column default in a correlated
+/// subquery, the collation subquery that must self-filter to NULL, and the
+/// `attidentity`/`attgenerated` projections.
+#[tokio::test]
+async fn psql_describe_columns_match_pg() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query(
+            "CREATE TABLE t1 (id int PRIMARY KEY, code varchar(20), \
+             tag char(4), mask bit(5), flag bool DEFAULT true, note text)",
+        )
+        .await?;
+
+    // Verbatim psql, with the relation located by name instead of by OID.
+    let columns = client
+        .simple_query(
+            "SELECT a.attname,\n  \
+               pg_catalog.format_type(a.atttypid, a.atttypmod),\n  \
+               (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)\n   \
+                FROM pg_catalog.pg_attrdef d\n   \
+                WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef),\n  \
+               a.attnotnull,\n  \
+               (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t\n   \
+                WHERE c.oid = a.attcollation AND t.oid = a.atttypid \
+                AND a.attcollation <> t.typcollation) AS attcollation,\n  \
+               a.attidentity,\n  \
+               a.attgenerated\n\
+             FROM pg_catalog.pg_attribute a, pg_catalog.pg_class c\n\
+             WHERE c.relname = 't1' AND a.attrelid = c.oid AND a.attnum > 0 \
+             AND NOT a.attisdropped\n\
+             ORDER BY a.attnum;",
+        )
+        .await?;
+    let described = rows(&columns)
+        .iter()
+        .map(|r| {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                r.get(0).unwrap_or("?"),
+                r.get(1).unwrap_or("?"),
+                // The three columns psql renders as blank when absent.
+                r.get(2).unwrap_or(""),
+                r.get(3).unwrap_or("?"),
+                r.get(4).unwrap_or(""),
+                r.get(5).unwrap_or(""),
+                r.get(6).unwrap_or(""),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Exactly what PostgreSQL 18.4 returns for this table: the declared type
+    // modifiers survive into `format_type`, the default deparses back to its SQL
+    // text, and no column is collated, identity, or generated.
+    assert_eq!(
+        described,
+        vec![
+            "id|integer||t|||".to_string(),
+            "code|character varying(20)||f|||".to_string(),
+            "tag|character(4)||f|||".to_string(),
+            "mask|bit(5)||f|||".to_string(),
+            "flag|boolean|true|f|||".to_string(),
+            "note|text||f|||".to_string(),
+        ]
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -5301,5 +5372,44 @@ async fn correlated_reference_inside_a_union_arm_resolves() -> anyhow::Result<()
         ("1".to_string(), "1".to_string()),
         ("2".to_string(), "2".to_string())
     ]);
+    Ok(())
+}
+
+/// A `reg*` column must be advertised on the wire as the real PG type OID
+/// (regclass = 2205), not as the `text`/`oid` it is represented by internally —
+/// a client that reads `RowDescription` decodes by that OID. `\d` itself never
+/// looks, but `\gdesc` and every typed driver do.
+#[tokio::test]
+async fn reg_columns_advertise_their_postgresql_type_oids() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client.simple_query("CREATE TABLE regwire (a integer)").await?;
+
+    let typed = client
+        .query(
+            "SELECT 'regwire'::regclass AS c, 23::regtype AS t, 2200::regnamespace AS n",
+            &[],
+        )
+        .await?;
+    let columns = typed[0].columns();
+    assert_eq!(columns[0].type_().oid(), 2205, "regclass");
+    assert_eq!(columns[1].type_().oid(), 2206, "regtype");
+    assert_eq!(columns[2].type_().oid(), 4089, "regnamespace");
+
+    // The value on the wire is the rendered name, and the OID underneath still
+    // round-trips through `::oid`.
+    let rendered = client
+        .simple_query("SELECT 'regwire'::regclass::text AS name, 23::regtype::text AS ty")
+        .await?;
+    let row = rows(&rendered);
+    assert_eq!(row[0].get("name"), Some("regwire"));
+    assert_eq!(row[0].get("ty"), Some("integer"));
+
+    let same = client
+        .simple_query(
+            "SELECT 'regwire'::regclass::oid = 'REGWIRE'::regclass::oid AS eq",
+        )
+        .await?;
+    assert_eq!(rows(&same)[0].get("eq"), Some("t"));
     Ok(())
 }

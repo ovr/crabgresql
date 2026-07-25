@@ -60,6 +60,14 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
         PgType::Int4 => Value::Int4(i32::from_be_bytes(fixed(b, ty)?)),
         PgType::Int8 => Value::Int8(i64::from_be_bytes(fixed(b, ty)?)),
         PgType::Oid => Value::Oid(u32::from_be_bytes(fixed(b, ty)?)),
+        // PG's `regclassrecv` and friends send only the OID, so a value arriving
+        // over the binary protocol has no name yet and renders like an
+        // unresolved one. Clients send reg* parameters this way only rarely;
+        // resolution would need a catalog this layer does not have.
+        PgType::Reg(kind) => Value::Reg(crate::Reg::unresolved(
+            kind,
+            u32::from_be_bytes(fixed(b, ty)?),
+        )),
         PgType::Float4 => Value::Float4(f32::from_bits(u32::from_be_bytes(fixed(b, ty)?))),
         PgType::Float8 => Value::Float8(f64::from_bits(u64::from_be_bytes(fixed(b, ty)?))),
         PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
@@ -89,6 +97,9 @@ impl Value {
             Value::Int4(v) => v.to_be_bytes().to_vec(),
             Value::Int8(v) => v.to_be_bytes().to_vec(),
             Value::Oid(v) => v.to_be_bytes().to_vec(),
+            // Like PG's `regclasssend`: the OID alone goes on the wire, never
+            // the name.
+            Value::Reg(r) => r.oid.to_be_bytes().to_vec(),
             Value::Float4(v) => v.to_bits().to_be_bytes().to_vec(),
             Value::Float8(v) => v.to_bits().to_be_bytes().to_vec(),
             Value::Text(s) => s.as_bytes().to_vec(),

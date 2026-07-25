@@ -17,8 +17,8 @@ use crabgresql_storage_api::{Column, EnumInfo, TableEngine, TableSchema, TypeCat
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
-    Numeric, PgType, Value, cast, date, float, interval, money, parse_bool, time, timestamp,
-    timestamptz, timetz,
+    Numeric, PgType, Reg, RegKind, Value, cast, date, float, interval, money, parse_bool, time,
+    timestamp, timestamptz, timetz,
 };
 
 use crate::BindError;
@@ -2129,6 +2129,9 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             | PgType::Bpchar
             | PgType::Name
             | PgType::Oid
+            // A reg* value compares by the OID it holds, never by the name it
+            // renders as — see `compare_values` in the executor.
+            | PgType::Reg(_)
             | PgType::Bytea
             | PgType::Date
             | PgType::Time
@@ -2305,9 +2308,7 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         DataType::BitVarying(_) | DataType::VarBit(_) => PgType::Varbit,
         DataType::JSON => PgType::Json,
         DataType::JSONB => PgType::Jsonb,
-        // `regclass` — modeled as `text` (a relation name); see the `"regclass"`
-        // custom-name arm below for the rationale and the v1 gap.
-        DataType::Regclass => PgType::Text,
+        DataType::Regclass => PgType::Reg(RegKind::Class),
         // Geometric types. `point`/`lseg` are modeled; the rest are not yet.
         DataType::GeometricType(kind) => match kind {
             ast::GeometricTypeKind::Point => PgType::Point,
@@ -2343,48 +2344,46 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
             }
             PgType::Array(elem.oid())
         }
-        // `bpchar` (no length = unlimited, like text) and `name` arrive as
-        // custom type names.
-        DataType::Custom(obj, mods) if mods.is_empty() => {
-            match obj
-                .0
-                .last()
-                .and_then(|p| p.as_ident())
-                .map(normalize_ident)
-                .as_deref()
-            {
-                Some("bpchar") => PgType::Bpchar,
-                Some("varchar") => PgType::Varchar,
-                Some("name") => PgType::Name,
-                Some("money") => PgType::Money,
-                Some("oid") => PgType::Oid,
-                Some("macaddr") => PgType::Macaddr,
-                Some("macaddr8") => PgType::Macaddr8,
-                // `point`/`lseg` reach here as bareword type names (`::point`,
-                // `f1 point`); the `point '...'`/`GeometricType` path is separate.
-                Some("point") => PgType::Point,
-                Some("lseg") => PgType::Lseg,
-                Some("json") => PgType::Json,
-                Some("jsonb") => PgType::Jsonb,
-                // `regclass` is modeled as `text` (a relation name) for now: it
-                // lets `nextval('seq'::regclass)` bind against `nextval(text)`.
-                // Full regclass→oid semantics (name normalization, `::oid`) are a
-                // deliberate v1 gap.
-                Some("regclass") => PgType::Text,
-                Some("jsonpath") => PgType::Jsonpath,
-                _ => {
-                    return Err(BindError::feature_not_supported(format!(
-                        "type \"{dt}\" is not supported yet"
-                    )));
-                }
+        // Type names the parser has no dedicated `DataType` for arrive here:
+        // `bpchar`, `name`, `point`, and every built-in written with a
+        // `pg_catalog.` qualifier.
+        DataType::Custom(obj, mods) if mods.is_empty() => match builtin_custom_type(obj) {
+            Some(t) => t,
+            None => {
+                return Err(BindError::feature_not_supported(format!(
+                    "type \"{dt}\" is not supported yet"
+                )));
             }
-        }
+        },
         other => {
             return Err(BindError::feature_not_supported(format!(
                 "type \"{other}\" is not supported yet"
             )));
         }
     })
+}
+
+/// The built-in a `DataType::Custom` name denotes, or `None` if it names no
+/// built-in — an unknown type, or one qualified with a schema other than
+/// `pg_catalog`. Both fall through to the user-type lookup in [`bind_cast`].
+///
+/// Built-ins live in `pg_catalog`, so a bare `int4` and `pg_catalog.int4` name
+/// the same type while `app.int4` names a user type that merely shares the
+/// spelling. psql leans on the qualified form throughout `\d` (`::pg_catalog.text`,
+/// `pr.prattrs::pg_catalog.int2[]`), which `DataType::Array` picks up by
+/// recursing through here.
+fn builtin_custom_type(obj: &ast::ObjectName) -> Option<PgType> {
+    let parts = obj
+        .0
+        .iter()
+        .map(|p| p.as_ident().map(normalize_ident))
+        .collect::<Option<Vec<_>>>()?;
+    let name = match parts.as_slice() {
+        [name] => name.as_str(),
+        [schema, name] if schema == "pg_catalog" => name.as_str(),
+        _ => return None,
+    };
+    PgType::from_name(name)
 }
 
 fn precision_of(info: &ast::ExactNumberInfo) -> Option<u64> {
@@ -2424,6 +2423,12 @@ fn bind_cast(
             elems: Vec::new(),
         }));
     }
+    // A reg* cast resolves an object name (or an OID's name) against the
+    // catalog, which lives in the executor — so it lowers to a function call
+    // instead of folding here.
+    if let PgType::Reg(kind) = target {
+        return Ok(Binding::Typed(bind_reg_cast(inner, kind, scope)?));
+    }
     let expr = match bind_expr(inner, scope)? {
         Binding::Unknown { lit, span, param } => {
             resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, target)?
@@ -2439,6 +2444,44 @@ fn bind_cast(
 /// The (normalized) name of a bare `DataType::Custom` type reference — e.g. the
 /// `xfloat4` in `x::xfloat4` — used to look a `CREATE TYPE` name up in the
 /// catalog. `None` for anything that is not a plain custom name.
+/// Lower `expr::regclass` (and the other `reg*` targets) to the catalog-backed
+/// function that resolves it at run time.
+///
+/// Which function depends on what is being cast, matching PG: a *name* is looked
+/// up and must exist, whereas an *OID* is taken as-is and only rendered — PG's
+/// oid→reg casts are binary-coercible, so `999999::regclass` prints the digits
+/// rather than erroring. An unknown literal is the name form.
+fn bind_reg_cast(inner: &ast::Expr, kind: RegKind, scope: &Scope) -> Result<BoundExpr, BindError> {
+    let expr = match bind_expr(inner, scope)? {
+        Binding::Unknown { lit, span, param } => {
+            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, PgType::Text)?
+        }
+        Binding::Typed(e) => e,
+    };
+    let ty = expr.ty();
+    let (func, arg_ty) = match ty {
+        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
+            (ScalarFn::RegIn(kind), PgType::Text)
+        }
+        // reg* -> reg* goes through the OID, as it does in PG: the OID is kept
+        // and re-rendered as the new kind of object.
+        PgType::Oid | PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Reg(_) => {
+            (ScalarFn::RegFromOid(kind), PgType::Oid)
+        }
+        other => {
+            return Err(BindError::new(
+                sqlstate::CANNOT_COERCE,
+                format!("cannot cast type {} to {}", other.name(), kind.typname()),
+            ));
+        }
+    };
+    Ok(BoundExpr::FuncCall {
+        func,
+        ret: PgType::Reg(kind),
+        args: vec![coerce_expr(expr, arg_ty)?],
+    })
+}
+
 fn custom_type_name(dt: &ast::DataType) -> Option<String> {
     match dt {
         ast::DataType::Custom(obj, mods) if mods.is_empty() => {
@@ -5402,6 +5445,17 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
                     BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))
                 })
         }
+        // A reg* literal names an object, and only the catalog can turn a name
+        // into an OID. The cast path resolves it at run time (`bind_reg_cast`);
+        // reaching here means a context that folds a literal with no catalog in
+        // hand, so only the numeric spelling can be honored.
+        PgType::Reg(kind) => match s.trim().parse::<u32>() {
+            Ok(oid) => Ok(Value::Reg(Reg::unresolved(kind, oid))),
+            Err(_) => Err(BindError::feature_not_supported(format!(
+                "resolving a {} name is not supported in this context",
+                kind.typname()
+            ))),
+        },
         PgType::User(_) => Err(invalid()),
     }
 }

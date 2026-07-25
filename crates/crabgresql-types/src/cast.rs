@@ -400,6 +400,15 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Oid(n), PgType::Int8) => Ok(Value::Int8(*n as i64)),
         (Value::Oid(n), PgType::Int4) => Ok(Value::Int4(*n as i32)),
 
+        // ---- reg* -> oid/int ----
+        // A reg* value is an OID under a name, so shedding the name is a plain
+        // reinterpret. The reverse (oid -> reg*) is *not* here: it has to look
+        // the name up, so the binder lowers it to a catalog-backed function.
+        // reg* -> text is not here either; the text arm above renders the name.
+        (Value::Reg(r), PgType::Oid) => Ok(Value::Oid(r.oid)),
+        (Value::Reg(r), PgType::Int8) => Ok(Value::Int8(r.oid as i64)),
+        (Value::Reg(r), PgType::Int4) => Ok(Value::Int4(r.oid as i32)),
+
         // ---- text -> oid (oidin: unsigned decimal, wrapping) ----
         (Value::Text(s), PgType::Oid) => text_to_oid(s),
 

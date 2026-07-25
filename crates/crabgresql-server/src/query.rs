@@ -2836,37 +2836,10 @@ fn resolve_type_ref(catalog: &GlobalCatalog, dt: &ast::DataType) -> Result<TypeR
 
 /// The built-in type a catalog type name refers to (for a `LIKE` clause), so its
 /// `pg_type.typlen` can be read from the authoritative `PgType::typlen()` rather
-/// than a second width table.
+/// than a second width table. The name table is `PgType::from_name`, shared with
+/// the binder so a `LIKE` clause and a cast agree on what a spelling means.
 fn builtin_type_by_name(name: &str) -> Option<PgType> {
-    Some(match name {
-        "int8" | "bigint" => PgType::Int8,
-        "int4" | "integer" | "int" => PgType::Int4,
-        "int2" | "smallint" => PgType::Int2,
-        "float8" | "double precision" => PgType::Float8,
-        "float4" | "real" => PgType::Float4,
-        "numeric" | "decimal" => PgType::Numeric,
-        "bool" | "boolean" => PgType::Bool,
-        "bytea" => PgType::Bytea,
-        "text" => PgType::Text,
-        "varchar" | "character varying" => PgType::Varchar,
-        "bpchar" | "char" | "character" => PgType::Bpchar,
-        "name" => PgType::Name,
-        "oid" => PgType::Oid,
-        "bit" => PgType::Bit,
-        "varbit" | "bit varying" => PgType::Varbit,
-        "date" => PgType::Date,
-        "time" => PgType::Time,
-        "timetz" => PgType::TimeTz,
-        "timestamp" => PgType::Timestamp,
-        "timestamptz" => PgType::TimestampTz,
-        "interval" => PgType::Interval,
-        "macaddr" => PgType::Macaddr,
-        "macaddr8" => PgType::Macaddr8,
-        "json" => PgType::Json,
-        "jsonb" => PgType::Jsonb,
-        "jsonpath" => PgType::Jsonpath,
-        _ => return None,
-    })
+    PgType::from_name(name)
 }
 
 /// Derive a base type's physical width (`pg_type.typlen`) and backing builtin

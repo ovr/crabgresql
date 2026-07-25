@@ -9,6 +9,7 @@ mod agg;
 pub mod eval;
 mod generate_series;
 mod md5;
+pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
 
@@ -75,6 +76,23 @@ pub trait CatalogOps: Send + Sync {
     /// Whether the relation `oid` identifies is reachable by an unqualified
     /// name, or `None` if there is no such relation.
     fn table_is_visible(&self, oid: u32) -> Option<bool>;
+    /// The `(namespace, name)` of the relation `oid` identifies, or `None` if
+    /// there is no such relation. Backs `regclass` output and the `regclass`
+    /// spelling of the sequence functions.
+    fn rel_name(&self, oid: u32) -> Option<(String, String)>;
+    /// The OID of the relation `namespace.name` names, or `None` if there is no
+    /// such relation. `None` for `namespace` searches the unqualified path, as
+    /// `pg_table_is_visible` reports it. Backs `regclass` input.
+    fn rel_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
+    /// The name of the schema `oid` identifies, and its inverse. Back
+    /// `regnamespace`.
+    fn namespace_name(&self, oid: u32) -> Option<String>;
+    fn namespace_oid(&self, name: &str) -> Option<u32>;
+    /// The `(namespace, name)` of the *user* type `oid` identifies, and its
+    /// inverse. Built-in types resolve without a catalog (`PgType::from_oid` /
+    /// `PgType::from_name`), so these see only `CREATE TYPE` names.
+    fn user_type_name(&self, oid: u32) -> Option<(String, String)>;
+    fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
 }
 
 /// Session state that runtime evaluation depends on: `extra_float_digits`

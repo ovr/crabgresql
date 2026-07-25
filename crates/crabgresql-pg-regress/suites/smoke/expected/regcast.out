@@ -1,0 +1,125 @@
+--
+-- reg* CASTS
+-- regclass/regtype/regnamespace store an OID and render as the name of what
+-- they identify. psql's \d leans on this (`conrelid::regclass`,
+-- `c.oid::pg_catalog.regclass::pg_catalog.text`, `reloftype::regtype`).
+--
+-- No query here prints a relation OID: crabgresql assigns synthetic ones, so
+-- only the *names* they render as are comparable with PostgreSQL.
+CREATE TABLE rc_t (a integer);
+CREATE SCHEMA rcs;
+CREATE TABLE rcs.rc_u (a integer);
+-- a name resolves to the relation, and renders back as the same name
+SELECT 'rc_t'::regclass AS by_name;
+ by_name 
+---------
+ rc_t
+(1 row)
+
+-- an unquoted name folds to lower case, and surrounding space is ignored
+SELECT 'RC_T'::regclass AS folded, '  rc_t  '::regclass AS trimmed;
+ folded | trimmed 
+--------+---------
+ rc_t   | rc_t
+(1 row)
+
+-- a relation an unqualified name does not reach renders schema-qualified
+SELECT 'rcs.rc_u'::regclass AS qualified;
+ qualified 
+-----------
+ rcs.rc_u
+(1 row)
+
+-- OID 0 renders as a dash, and an OID naming nothing renders as its digits
+SELECT 0::regclass AS zero, 4294967000::regclass AS unknown_oid;
+ zero | unknown_oid 
+------+-------------
+ -    | 4294967000
+(1 row)
+
+-- regtype renders a builtin under its SQL spelling, not its catalog one
+SELECT 25::regtype AS text_t, 23::regtype AS int_t, 1043::regtype AS varchar_t;
+ text_t |  int_t  |     varchar_t     
+--------+---------+-------------------
+ text   | integer | character varying
+(1 row)
+
+-- including array types
+SELECT 1005::regtype AS int2_array;
+ int2_array 
+------------
+ smallint[]
+(1 row)
+
+-- and accepts either spelling on input
+SELECT 'integer'::regtype AS sql_spelling, 'int4'::regtype AS catalog_spelling;
+ sql_spelling | catalog_spelling 
+--------------+------------------
+ integer      | integer
+(1 row)
+
+SELECT 0::regtype AS zero_type;
+ zero_type 
+-----------
+ -
+(1 row)
+
+-- regnamespace names a schema
+SELECT 'rcs'::regnamespace AS by_name, 'public'::regnamespace AS pub;
+ by_name |  pub   
+---------+--------
+ rcs     | public
+(1 row)
+
+-- casting to text goes through the rendered name, not the OID
+SELECT 'rc_t'::regclass::text AS as_text, length('rc_t'::regclass::text) AS len;
+ as_text | len 
+---------+-----
+ rc_t    |   4
+(1 row)
+
+-- the round trip through oid preserves the value
+SELECT 'rc_t'::regclass::oid = 'rc_t'::regclass::oid AS oid_roundtrip;
+ oid_roundtrip 
+---------------
+ t
+(1 row)
+
+-- equality is by OID, so two spellings of one relation are equal
+SELECT 'rc_t'::regclass = 'RC_T'::regclass AS same_relation;
+ same_relation 
+---------------
+ t
+(1 row)
+
+SELECT 'rcs.rc_u'::regclass = 'rc_t'::regclass AS different_relations;
+ different_relations 
+---------------------
+ f
+(1 row)
+
+-- a name that resolves to nothing is an error, per kind of object
+SELECT 'rc_nosuchtable'::regclass;
+ERROR:  relation "rc_nosuchtable" does not exist
+SELECT 'rc_nosuchtype'::regtype;
+ERROR:  type "rc_nosuchtype" does not exist
+SELECT 'rc_nosuchschema'::regnamespace;
+ERROR:  schema "rc_nosuchschema" does not exist
+-- sequences are relations, so nextval takes either spelling
+CREATE SEQUENCE rc_s;
+SELECT nextval('rc_s') AS bare, nextval('rc_s'::regclass) AS via_regclass;
+ bare | via_regclass 
+------+--------------
+    1 |            2
+(1 row)
+
+SELECT setval('rc_s'::regclass, 10) AS after_setval;
+ after_setval 
+--------------
+           10
+(1 row)
+
+DROP SEQUENCE rc_s;
+DROP TABLE rc_t;
+DROP TABLE rcs.rc_u;
+DROP SCHEMA rcs;

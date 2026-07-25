@@ -136,3 +136,126 @@ DROP SCHEMA dtest_schema;
 DROP VIEW dtest_view;
 DROP SEQUENCE dtest_seq;
 DROP TABLE dtest_tbl;
+--
+-- What `\d <table>` and `\d <view>` read past that listing: `format_type`,
+-- `pg_get_expr`, and the `pg_class`/`pg_attribute` columns. Type modifiers are
+-- written as literal (OID, atttypmod) pairs so these cases do not depend on the
+-- `reg*` casts.
+--
+-- format_type spells a type as `\d` shows it. numeric packs (precision, scale)
+-- above the four-byte varlena header the character types also reserve; the bit
+-- types store their length directly.
+SELECT pg_catalog.format_type(1700, 262150) AS "numeric",
+       pg_catalog.format_type(1043, 24) AS "varchar",
+       pg_catalog.format_type(1042, 14) AS "bpchar",
+       pg_catalog.format_type(1560, 5) AS "bit";
+   numeric    |        varchar        |    bpchar     |  bit   
+--------------+-----------------------+---------------+--------
+ numeric(4,2) | character varying(20) | character(10) | bit(5)
+(1 row)
+
+-- a datetime precision prints before the time-zone suffix, not after it; an
+-- array formats its element type and appends `[]`
+SELECT pg_catalog.format_type(1114, 3) AS "timestamp",
+       pg_catalog.format_type(1184, 3) AS "timestamptz",
+       pg_catalog.format_type(1007, NULL) AS "int4_array";
+           timestamp            |         timestamptz         | int4_array 
+--------------------------------+-----------------------------+------------
+ timestamp(3) without time zone | timestamp(3) with time zone | integer[]
+(1 row)
+
+-- format_type is strict in its OID but not in its modifier: a NULL modifier
+-- means "no modifier" (psql's sequence query relies on it). OID 0 prints `-`
+-- and an OID no type has prints `???`, neither of them NULL.
+SELECT pg_catalog.format_type(1043, NULL) AS unmodified,
+       pg_catalog.format_type(NULL, 24) IS NULL AS null_type,
+       pg_catalog.format_type(0, NULL) AS zero,
+       pg_catalog.format_type(999999, NULL) AS unknown;
+    unmodified     | null_type | zero | unknown 
+-------------------+-----------+------+---------
+ character varying | t         | -    | ???
+(1 row)
+
+CREATE TABLE dfmt_t (id int PRIMARY KEY, code varchar(20), tag char(4), mask bit(5), note text);
+-- pg_attribute reports atttypmod in PostgreSQL's encoding, so format_type over
+-- it reproduces `\d`'s Type column. No column is an identity or generated one,
+-- which PostgreSQL spells as the empty string rather than NULL.
+SELECT a.attname, a.atttypid, a.atttypmod,
+       pg_catalog.format_type(a.atttypid, a.atttypmod) AS "Type",
+       a.attidentity, a.attgenerated
+  FROM pg_catalog.pg_attribute a, pg_catalog.pg_class c
+ WHERE c.relname = 'dfmt_t' AND a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+ ORDER BY a.attnum;
+ attname | atttypid | atttypmod |         Type          | attidentity | attgenerated 
+---------+----------+-----------+-----------------------+-------------+--------------
+ id      |       23 |        -1 | integer               |             | 
+ code    |     1043 |        24 | character varying(20) |             | 
+ tag     |     1042 |         8 | character(4)          |             | 
+ mask    |     1560 |         5 | bit(5)                |             | 
+ note    |       25 |        -1 | text                  |             | 
+(5 rows)
+
+CREATE TABLE dfmt_d (id int DEFAULT 42, label text);
+-- the third query psql's `\d` sends, verbatim except that the relation is found
+-- by name instead of by the OID psql substitutes. The default subquery
+-- exercises pg_get_expr; the collation subquery self-filters to NULL because a
+-- column with no explicit COLLATE carries its type's own collation.
+SELECT a.attname,
+  pg_catalog.format_type(a.atttypid, a.atttypmod),
+  (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)
+   FROM pg_catalog.pg_attrdef d
+   WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef),
+  a.attnotnull,
+  (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t
+   WHERE c.oid = a.attcollation AND t.oid = a.atttypid AND a.attcollation <> t.typcollation) AS attcollation,
+  a.attidentity,
+  a.attgenerated
+FROM pg_catalog.pg_attribute a, pg_catalog.pg_class c
+WHERE c.relname = 'dfmt_d' AND a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attnum;
+ attname | format_type | pg_get_expr | attnotnull | attcollation | attidentity | attgenerated 
+---------+-------------+-------------+------------+--------------+-------------+--------------
+ id      | integer     | 42          | f          |              |             | 
+ label   | text        |             | f          |              |             | 
+(2 rows)
+
+CREATE VIEW dfmt_v AS SELECT id FROM dfmt_d;
+-- the pg_class columns psql's second `\d` query projects. Nothing here has a
+-- CHECK constraint, trigger, row security, typed-table parent, or non-default
+-- tablespace; only a view owns a rule; and a heap-backed relation defaults its
+-- replica identity to the primary key while a view has none. (`reltoastrelid`
+-- is deliberately not projected: PostgreSQL gives a text column's table a real
+-- TOAST relation, which crabgresql does not model.)
+SELECT c.relname, c.relkind, c.relchecks, c.relhasrules, c.relhastriggers,
+       c.relrowsecurity, c.relforcerowsecurity, c.relpersistence, c.relreplident,
+       c.reloftype, c.reltablespace, c.relispartition
+  FROM pg_catalog.pg_class c
+ WHERE c.relname IN ('dfmt_d', 'dfmt_v')
+ ORDER BY 1;
+ relname | relkind | relchecks | relhasrules | relhastriggers | relrowsecurity | relforcerowsecurity | relpersistence | relreplident | reloftype | reltablespace | relispartition 
+---------+---------+-----------+-------------+----------------+----------------+---------------------+----------------+--------------+-----------+---------------+----------------
+ dfmt_d  | r       |         0 | f           | f              | f              | f                   | p              | d            |         0 |             0 | f
+ dfmt_v  | v       |         0 | t           | f              | f              | f                   | p              | n            |         0 |             0 | f
+(2 rows)
+
+CREATE TABLE dfmt_p (a int, b text) PARTITION BY RANGE (a);
+CREATE TABLE dfmt_p1 PARTITION OF dfmt_p FOR VALUES FROM (1) TO (10);
+CREATE TABLE dfmt_p2 PARTITION OF dfmt_p FOR VALUES FROM (10) TO (MAXVALUE);
+-- a leaf partition's bound, deparsed back to SQL. The partitioned parent itself
+-- has no bound.
+SELECT c.relname, c.relkind, c.relispartition,
+       pg_catalog.pg_get_expr(c.relpartbound, c.oid) AS bound
+  FROM pg_catalog.pg_class c
+ WHERE c.relname LIKE 'dfmt_p%'
+ ORDER BY 1;
+ relname | relkind | relispartition |               bound                
+---------+---------+----------------+------------------------------------
+ dfmt_p  | p       | f              | 
+ dfmt_p1 | r       | t              | FOR VALUES FROM (1) TO (10)
+ dfmt_p2 | r       | t              | FOR VALUES FROM (10) TO (MAXVALUE)
+(3 rows)
+
+DROP TABLE dfmt_p;
+DROP VIEW dfmt_v;
+DROP TABLE dfmt_d;
+DROP TABLE dfmt_t;

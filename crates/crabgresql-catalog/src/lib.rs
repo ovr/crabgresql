@@ -517,6 +517,44 @@ impl SystemCatalog {
         self.build_pg_catalog(name).is_some()
     }
 
+    /// The name of the schema `oid` identifies, or `None` if this snapshot has
+    /// no such schema. The inverse of [`SystemCatalog::namespace_oid`]; both back
+    /// `regnamespace`, and both read the same table `pg_namespace` is built from.
+    pub fn namespace_name(&self, oid: u32) -> Option<String> {
+        self.namespace_oids()
+            .into_iter()
+            .find(|(_, o)| *o == oid)
+            .map(|(name, _)| name)
+    }
+
+    pub fn namespace_oid(&self, name: &str) -> Option<u32> {
+        self.namespace_oids().get(name).copied()
+    }
+
+    /// The `(namespace, name)` of the user type `oid` identifies, or `None` for
+    /// an OID no `CREATE TYPE` has. Built-in types are not here — they resolve
+    /// without a catalog. User types carry no namespace of their own yet
+    /// (`CREATE TYPE app.t` is unsupported), so they all report `public`, which
+    /// is where an unqualified name finds them.
+    pub fn user_type_ref(&self, oid: u32) -> Option<(&str, &str)> {
+        self.user_types()
+            .iter()
+            .find(|t| t.oid == oid)
+            .map(|t| ("public", t.name.as_str()))
+    }
+
+    /// The OID of the user type `namespace.name` names. A qualifier other than
+    /// `public` matches nothing, for the reason above.
+    pub fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+        if matches!(namespace, Some(ns) if ns != "public") {
+            return None;
+        }
+        self.user_types()
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.oid)
+    }
+
     /// Build the requested relation's rows + schema, or `None` if unknown.
     fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         match name {
@@ -813,6 +851,16 @@ mod tests {
                 ty.typlen(),
                 "{typname} typlen drift (.dat vs PgType)"
             );
+            // The name a bare or `pg_catalog.`-qualified type name binds through
+            // is the same one the catalog reports, in both directions — so a
+            // built-in cannot be spelled one way in `pg_type` and another in a
+            // cast.
+            assert_eq!(
+                PgType::from_name(typname),
+                Some(ty),
+                "{typname} does not resolve back to its PgType"
+            );
+            assert_eq!(ty.typname(), typname, "{typname} typname drift");
         }
     }
 
@@ -895,6 +943,168 @@ mod tests {
                 row[relam]
             );
         }
+
+        Ok(())
+    }
+
+    /// The `pg_class` columns psql's `\d` reads but crabgresql has no state for
+    /// carry their true PostgreSQL constant, not a placeholder — `relchecks = 0`
+    /// is what gates psql's CHECK-constraint query *off*, and `relhasrules`
+    /// distinguishes a view (which owns a `_RETURN` rule) from a table.
+    /// `relpartbound` carries the deparsed bound a leaf partition was created
+    /// with, since `pg_get_expr` only echoes it.
+    #[test]
+    fn pg_class_reports_describe_columns_and_partition_bounds() -> anyhow::Result<()> {
+        use crabgresql_storage_api::{
+            Column, PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme,
+            PartitionStrategy, TableSchema,
+        };
+        use crabgresql_types::PgType;
+
+        fn plain(name: &str) -> TableSchema {
+            TableSchema::new(name, vec![Column::new("a", PgType::Int4)])
+        }
+        // A leaf partition of `part`, bounded by one datum on each side.
+        fn leaf(name: &str, from: PartitionBoundDatum, to: PartitionBoundDatum) -> TableSchema {
+            let mut schema = plain(name);
+            schema.partition_of = Some(PartitionOf {
+                parent_namespace: "public".to_string(),
+                parent_name: "part".to_string(),
+                key_columns: vec![0],
+                bound: PartitionBound {
+                    from: vec![from],
+                    to: vec![to],
+                },
+            });
+            schema
+        }
+        // A range-partitioned parent, one leaf with a numeric bound open at the
+        // top, and one leaf keyed on text (which must quote its literals).
+        let mut parent = plain("part");
+        parent.partition_scheme = Some(PartitionScheme {
+            strategy: PartitionStrategy::Range,
+            key_columns: vec![0],
+        });
+        let cat = SystemCatalog::with_catalog_relations_fn("db", "owner", move || {
+            vec![
+                CatalogRelation::permanent(plain("tbl")),
+                CatalogRelation::view(plain("vw")),
+                CatalogRelation::permanent(parent.clone()),
+                CatalogRelation::permanent(leaf(
+                    "part_hi",
+                    PartitionBoundDatum::Value(Value::Int4(10)),
+                    PartitionBoundDatum::MaxValue,
+                )),
+                CatalogRelation::permanent(leaf(
+                    "part_txt",
+                    PartitionBoundDatum::MinValue,
+                    PartitionBoundDatum::Value(Value::Text("it's".to_string())),
+                )),
+            ]
+        });
+
+        let (schema, rows) = required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?;
+        assert!(rows.iter().all(|r| r.len() == schema.columns.len()));
+        let relname = required(schema.column_index("relname"), "relname is missing")?;
+        let cell = |name: &str, col: &str| -> anyhow::Result<Value> {
+            let i = required(schema.column_index(col), col)?;
+            required(
+                rows.iter()
+                    .find(|r| r[relname] == Value::Text(name.to_string()))
+                    .map(|r| r[i].clone()),
+                name,
+            )
+        };
+
+        // No CHECK constraints, triggers, row security, typed tables, TOAST, or
+        // non-default tablespace exist here — but each column still answers.
+        for col in [
+            "relchecks",
+            "relhastriggers",
+            "relrowsecurity",
+            "relforcerowsecurity",
+            "reloftype",
+            "reltablespace",
+            "reltoastrelid",
+        ] {
+            let zero = match col {
+                "relchecks" => Value::Int2(0),
+                "relhastriggers" | "relrowsecurity" | "relforcerowsecurity" => Value::Bool(false),
+                _ => Value::Oid(0),
+            };
+            assert_eq!(cell("tbl", col)?, zero, "{col}");
+        }
+        // Only a view carries a rule; only heap-backed relations default their
+        // replica identity to the primary key.
+        assert_eq!(cell("tbl", "relhasrules")?, Value::Bool(false));
+        assert_eq!(cell("vw", "relhasrules")?, Value::Bool(true));
+        assert_eq!(cell("tbl", "relreplident")?, Value::Text("d".to_string()));
+        assert_eq!(cell("part", "relreplident")?, Value::Text("d".to_string()));
+        assert_eq!(cell("vw", "relreplident")?, Value::Text("n".to_string()));
+
+        // A non-partition has no bound; a leaf's is the text PostgreSQL's
+        // `pg_get_expr(relpartbound, oid)` prints — numbers bare, other literals
+        // quoted (with embedded quotes doubled), MINVALUE/MAXVALUE as keywords.
+        assert_eq!(cell("tbl", "relpartbound")?, Value::Null);
+        assert_eq!(cell("part", "relpartbound")?, Value::Null);
+        assert_eq!(
+            cell("part_hi", "relpartbound")?,
+            Value::Text("FOR VALUES FROM (10) TO (MAXVALUE)".to_string())
+        );
+        assert_eq!(
+            cell("part_txt", "relpartbound")?,
+            Value::Text("FOR VALUES FROM (MINVALUE) TO ('it''s')".to_string())
+        );
+
+        Ok(())
+    }
+
+    /// `pg_attribute.atttypmod` is emitted in PostgreSQL's encoding, not the raw
+    /// modifier crabgresql stores on the column, so `format_type(atttypid,
+    /// atttypmod)` reproduces PG's `\d` type strings. The character types add
+    /// the four-byte varlena header; the bit types do not; a column with no
+    /// modifier is `-1`.
+    #[test]
+    fn pg_attribute_encodes_postgres_atttypmod() -> anyhow::Result<()> {
+        use crabgresql_storage_api::{Column, TableSchema};
+        use crabgresql_types::PgType;
+
+        let cat = SystemCatalog::with_relations(vec![TableSchema::new(
+            "t",
+            vec![
+                Column::with_typmod("v", PgType::Varchar, 20),
+                Column::with_typmod("c", PgType::Bpchar, 10),
+                Column::with_typmod("b", PgType::Bit, 5),
+                Column::with_typmod("vb", PgType::Varbit, 7),
+                Column::new("i", PgType::Int4),
+            ],
+        )]);
+        let (schema, rows) = required(
+            cat.build_pg_catalog("pg_attribute"),
+            "pg_attribute is missing",
+        )?;
+        assert!(rows.iter().all(|r| r.len() == schema.columns.len()));
+        let attname = required(schema.column_index("attname"), "attname is missing")?;
+        let cell = |name: &str, col: &str| -> anyhow::Result<Value> {
+            let i = required(schema.column_index(col), col)?;
+            required(
+                rows.iter()
+                    .find(|r| r[attname] == Value::Text(name.to_string()))
+                    .map(|r| r[i].clone()),
+                name,
+            )
+        };
+
+        // varchar(20) / character(10) reserve VARHDRSZ; bit(5) / varbit(7) do not.
+        assert_eq!(cell("v", "atttypmod")?, Value::Int4(24));
+        assert_eq!(cell("c", "atttypmod")?, Value::Int4(14));
+        assert_eq!(cell("b", "atttypmod")?, Value::Int4(5));
+        assert_eq!(cell("vb", "atttypmod")?, Value::Int4(7));
+        assert_eq!(cell("i", "atttypmod")?, Value::Int4(-1));
+        // Identity and generated columns do not exist, and PG spells "neither"
+        // as the empty string rather than NULL — psql projects both directly.
+        assert_eq!(cell("i", "attidentity")?, Value::Text(String::new()));
+        assert_eq!(cell("i", "attgenerated")?, Value::Text(String::new()));
 
         Ok(())
     }

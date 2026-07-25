@@ -75,6 +75,12 @@ pub mod oid {
     pub const JSONB: u32 = 3802;
     /// `jsonpath`: an SQL/JSON path expression. See [`crate::jsonpath`].
     pub const JSONPATH: u32 = 4072;
+    /// `regclass`: an OID that renders as a relation name. See [`crate::Reg`].
+    pub const REGCLASS: u32 = 2205;
+    /// `regtype`: an OID that renders as a type name. See [`crate::Reg`].
+    pub const REGTYPE: u32 = 2206;
+    /// `regnamespace`: an OID that renders as a schema name. See [`crate::Reg`].
+    pub const REGNAMESPACE: u32 = 4089;
 
     // Array type OIDs (`pg_type.typarray` of the element type). Element↔array
     // mapping lives in [`crate::array`].
@@ -179,6 +185,11 @@ pub enum PgType {
     /// `jsonpath`: a compiled SQL/JSON path program ([`Value::Jsonpath`]).
     /// Varlena; no default equality/ordering. See [`crate::jsonpath`].
     Jsonpath,
+    /// A `reg*` type: an OID that renders as the name of the object it
+    /// identifies ([`Value::Reg`]). Fixed 4-byte type. The three PG types
+    /// share one variant because they differ only in *what* the OID names —
+    /// see [`RegKind`].
+    Reg(RegKind),
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -188,6 +199,97 @@ pub enum PgType {
     /// are the same type). Recover the element [`PgType`] with
     /// [`PgType::from_oid`]; the array's own OID via [`crate::array::array_oid_for_elem`].
     Array(u32),
+}
+
+/// Which kind of object a `reg*` OID names. Each variant is a distinct
+/// PostgreSQL type that stores an OID and renders as that object's name, so
+/// `'pg_class'::regclass` and `1259::regclass` are the same value.
+///
+/// PG has more of these (`regproc`, `regoper`, `regconfig`, `regrole`, …);
+/// only the three crabgresql can actually resolve are modeled. `regproc` in
+/// particular needs a `pg_proc` this build does not have, so `pg_type.typinput`
+/// and friends stay `text` in the catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegKind {
+    /// `regclass`: names a relation (table, view, sequence, index).
+    Class,
+    /// `regtype`: names a type.
+    Type,
+    /// `regnamespace`: names a schema.
+    Namespace,
+}
+
+impl RegKind {
+    pub fn oid(self) -> u32 {
+        match self {
+            RegKind::Class => oid::REGCLASS,
+            RegKind::Type => oid::REGTYPE,
+            RegKind::Namespace => oid::REGNAMESPACE,
+        }
+    }
+
+    /// Catalog `typname`, which for these is also the SQL spelling.
+    pub fn typname(self) -> &'static str {
+        match self {
+            RegKind::Class => "regclass",
+            RegKind::Type => "regtype",
+            RegKind::Namespace => "regnamespace",
+        }
+    }
+
+    /// What the object is called in the "does not exist" error a failed lookup
+    /// raises — PG reports `relation "x" does not exist` for `regclass` but
+    /// `type "x" does not exist` for `regtype`.
+    pub fn object_noun(self) -> &'static str {
+        match self {
+            RegKind::Class => "relation",
+            RegKind::Type => "type",
+            RegKind::Namespace => "schema",
+        }
+    }
+}
+
+/// A `reg*` value: the OID, plus the text it renders as.
+///
+/// PostgreSQL stores only the OID and resolves the name in the type's output
+/// function, at output time. `encode_text` here is pure — it has no catalog
+/// handle, and giving every type one would be a far larger change — so the name
+/// is resolved when the value is *produced* (the cast) and carried alongside.
+/// The difference is observable only if the object is renamed between the cast
+/// and output, or if a `reg*` value is stored in a table and the object is
+/// renamed afterwards.
+///
+/// Equality is by `(kind, oid)` only, never the name: the same OID reached
+/// through different paths (resolved by a cast, or read back from disk) must
+/// still compare equal. Ordering and hashing agree — see `compare_values` and
+/// `hash_key` in the executor.
+#[derive(Clone, Debug)]
+pub struct Reg {
+    pub kind: RegKind,
+    pub oid: u32,
+    /// The rendered name: `pg_class`, a schema-qualified `rs.t`, a quoted
+    /// `"Mixed Case"`, `-` for OID 0, or the bare digits when the OID resolves
+    /// to nothing (all probed against PG 18.4).
+    pub name: String,
+}
+
+impl Reg {
+    /// The rendering PG gives an OID that names nothing: `-` for `0`
+    /// (`InvalidOid`), the bare digits otherwise.
+    pub fn unresolved(kind: RegKind, oid: u32) -> Self {
+        let name = if oid == 0 {
+            "-".to_string()
+        } else {
+            oid.to_string()
+        };
+        Self { kind, oid, name }
+    }
+}
+
+impl PartialEq for Reg {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.oid == other.oid
+    }
 }
 
 impl PgType {
@@ -225,6 +327,7 @@ impl PgType {
             PgType::Json => oid::JSON,
             PgType::Jsonb => oid::JSONB,
             PgType::Jsonpath => oid::JSONPATH,
+            PgType::Reg(kind) => kind.oid(),
             PgType::User(oid) => oid,
             PgType::Array(elem) => array::array_oid_for_elem(elem).unwrap_or(0),
         }
@@ -273,6 +376,9 @@ impl PgType {
                 // that tree agrees with `keys_equal`. `json` has no equality and
                 // never reaches `hash_key`.
                 | PgType::Jsonb
+                // A reg* value compares by OID alone, and `hash_key` hashes the
+                // OID alone — the carried name is never part of either.
+                | PgType::Reg(_)
         )
     }
 
@@ -320,11 +426,73 @@ impl PgType {
             oid::JSON => PgType::Json,
             oid::JSONB => PgType::Jsonb,
             oid::JSONPATH => PgType::Jsonpath,
+            oid::REGCLASS => PgType::Reg(RegKind::Class),
+            oid::REGTYPE => PgType::Reg(RegKind::Type),
+            oid::REGNAMESPACE => PgType::Reg(RegKind::Namespace),
             // Array type OIDs (`_int4`, `_text`, ...) decode to `Array(elem)`.
             other => match array::elem_oid_for_array(other) {
                 Some(elem) => PgType::Array(elem),
                 None => return None,
             },
+        })
+    }
+
+    /// Resolve a built-in type *name* to its [`PgType`], the reverse of
+    /// [`PgType::typname`] and [`PgType::name`]. Every built-in answers to both
+    /// its catalog spelling (`int4`, `float8`, `timestamptz`) and its SQL
+    /// spelling (`integer`, `double precision`, `timestamp with time zone`),
+    /// plus the aliases SQL allows (`int`, `decimal`, `char`). `None` for a name
+    /// this build has no built-in for — a user type, or an unsupported one.
+    ///
+    /// Built-in type names live in `pg_catalog`, so this is what a bare or
+    /// `pg_catalog.`-qualified name resolves against before the user-type
+    /// catalog is consulted. Multi-word spellings only reach here from a catalog
+    /// name (`CREATE TYPE ... LIKE`); the parser gives those their own
+    /// `DataType` variants.
+    ///
+    /// `pg_type_rows_agree_with_pgtype_for_modeled_types` in `crabgresql-catalog`
+    /// checks every modeled type's vendored `typname` against this, so a new
+    /// type cannot land here spelled differently than the catalog spells it.
+    pub fn from_name(name: &str) -> Option<PgType> {
+        Some(match name {
+            "bool" | "boolean" => PgType::Bool,
+            "int2" | "smallint" => PgType::Int2,
+            "int4" | "integer" | "int" => PgType::Int4,
+            "int8" | "bigint" => PgType::Int8,
+            "float4" | "real" => PgType::Float4,
+            "float8" | "double precision" => PgType::Float8,
+            "numeric" | "decimal" => PgType::Numeric,
+            "money" => PgType::Money,
+            "text" => PgType::Text,
+            "varchar" | "character varying" => PgType::Varchar,
+            // Unlike PG, `"char"` (the quoted 1-byte type) is not modeled
+            // separately; it and `char`/`character` all resolve to `bpchar`.
+            "bpchar" | "char" | "character" => PgType::Bpchar,
+            "name" => PgType::Name,
+            "oid" => PgType::Oid,
+            "bytea" => PgType::Bytea,
+            "bit" => PgType::Bit,
+            "varbit" | "bit varying" => PgType::Varbit,
+            "date" => PgType::Date,
+            "time" | "time without time zone" => PgType::Time,
+            "timetz" | "time with time zone" => PgType::TimeTz,
+            "timestamp" | "timestamp without time zone" => PgType::Timestamp,
+            "timestamptz" | "timestamp with time zone" => PgType::TimestampTz,
+            "interval" => PgType::Interval,
+            "uuid" => PgType::Uuid,
+            "inet" => PgType::Inet,
+            "cidr" => PgType::Cidr,
+            "macaddr" => PgType::Macaddr,
+            "macaddr8" => PgType::Macaddr8,
+            "point" => PgType::Point,
+            "lseg" => PgType::Lseg,
+            "json" => PgType::Json,
+            "jsonb" => PgType::Jsonb,
+            "jsonpath" => PgType::Jsonpath,
+            "regclass" => PgType::Reg(RegKind::Class),
+            "regtype" => PgType::Reg(RegKind::Type),
+            "regnamespace" => PgType::Reg(RegKind::Namespace),
+            _ => return None,
         })
     }
 
@@ -346,6 +514,8 @@ impl PgType {
             PgType::Interval => 16,
             PgType::Uuid => 16,
             PgType::Oid => 4,
+            // Every reg* type is a 4-byte OID under the name it renders as.
+            PgType::Reg(_) => 4,
             PgType::Macaddr => 6,
             PgType::Macaddr8 => 8,
             PgType::Point => 16,
@@ -405,6 +575,7 @@ impl PgType {
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
+            PgType::Reg(kind) => kind.typname(),
             PgType::User(_) => "user-defined",
             PgType::Array(elem) => array_display_name(elem),
         }
@@ -446,6 +617,7 @@ impl PgType {
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
+            PgType::Reg(kind) => kind.typname(),
             PgType::User(_) => "user-defined",
             PgType::Array(elem) => array_typname(elem),
         }
@@ -609,6 +781,9 @@ pub enum Value {
     /// `oid`: an unsigned 32-bit object identifier. Prints as an unsigned
     /// decimal; carries the referenced OID for `reg*`-style catalog columns.
     Oid(u32),
+    /// A `reg*` value: an OID that prints as the name of what it identifies.
+    /// See [`Reg`] for why the name is carried rather than resolved at output.
+    Reg(Reg),
     Text(String),
     Bytea(Vec<u8>),
     /// A `bit`/`bit varying` value: `len` bits packed most-significant-bit-first
@@ -688,6 +863,7 @@ impl Value {
             Value::Numeric(_) => Some(PgType::Numeric),
             Value::Money(_) => Some(PgType::Money),
             Value::Oid(_) => Some(PgType::Oid),
+            Value::Reg(r) => Some(PgType::Reg(r.kind)),
             Value::Text(_) => Some(PgType::Text),
             Value::Bytea(_) => Some(PgType::Bytea),
             Value::Bit { .. } => Some(PgType::Bit),
@@ -731,6 +907,9 @@ impl Value {
             Value::Numeric(n) => Some(n.to_display()),
             Value::Money(c) => Some(money::format(*c)),
             Value::Oid(v) => Some(v.to_string()),
+            // The name was resolved when the value was built; this is the whole
+            // of the reg* output function.
+            Value::Reg(r) => Some(r.name.clone()),
             Value::Text(s) => Some(s.clone()),
             Value::Bytea(bytes) => {
                 let mut out = String::with_capacity(2 + bytes.len() * 2);
