@@ -100,9 +100,9 @@ pub fn pg_collation_rows() -> Vec<Vec<Value>> {
                 Value::Oid(c.oid),
                 Value::Text(c.name.to_string()),
                 // Every collation lives in pg_catalog (11), owned by the
-                // bootstrap superuser (10).
+                // bootstrap superuser.
                 Value::Oid(11),
-                Value::Oid(10),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
                 Value::Text(c.provider.as_char().to_string()),
                 Value::Bool(c.deterministic),
                 Value::Int4(c.encoding),

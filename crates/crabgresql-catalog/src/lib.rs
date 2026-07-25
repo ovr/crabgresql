@@ -458,24 +458,63 @@ impl SystemCatalog {
         (oid == schema::BOOTSTRAP_ROLE_OID).then_some(self.owner.as_str())
     }
 
-    /// The namespace of the relation `oid` identifies — a table/view/sequence or
-    /// an index — or `None` if this snapshot has no such relation. Backs
-    /// `pg_table_is_visible`.
+    /// The `(namespace, name)` of the relation `oid` identifies — a
+    /// table/view/sequence or an index — or `None` if this snapshot has no such
+    /// relation. Backs `pg_table_is_visible`, which needs the name as well as
+    /// the namespace to answer *reachability* rather than mere membership.
     ///
     /// Reads exactly the fields [`schema::pg_class_rows`] reports as
-    /// `relnamespace`: `schema.namespace` for a relation and
+    /// `relnamespace`/`relname`: `schema.namespace` for a relation and
     /// `table_schema.namespace` for an index. Note that `schema.namespace` is a
     /// distinct field from [`CatalogRelation::namespace`]; they agree for temp
     /// relations only because the server selects those on `schema.namespace`.
     /// Diverging here would make a relation `pg_class` lists invisible.
-    pub fn relation_namespace(&self, oid: u32) -> Option<&str> {
-        if let Some((_, schema)) = self.relation_oids().iter().find(|(o, _)| *o == oid) {
-            return Some(&schema.namespace);
+    ///
+    /// OIDs are assigned positionally by [`SystemCatalog::relation_oids`] and
+    /// [`SystemCatalog::index_oids`], so this indexes rather than scans — it is
+    /// called once per row when a `\d` listing filters on
+    /// `pg_table_is_visible`, which a linear scan would make quadratic. The
+    /// stored OID is still compared, so a future non-positional assignment
+    /// degrades to "not found" rather than to a wrong answer.
+    pub fn relation_ref(&self, oid: u32) -> Option<(&str, &str)> {
+        // Below the synthetic floor no relation can match, and answering here
+        // avoids forcing the lazy relation enumeration for an unrelated OID
+        // (`SELECT pg_table_is_visible(1)` should not enumerate the database).
+        let offset = oid.checked_sub(FIRST_REL_OID)? as usize;
+        let relations = self.relation_oids();
+        if let Some((stored, schema)) = relations.get(offset) {
+            return (*stored == oid)
+                .then_some((schema.namespace.as_str(), schema.name.as_str()));
+        }
+        let index = self.index_oids().get(offset - relations.len())?;
+        (index.oid == oid).then_some((
+            index.table_schema.namespace.as_str(),
+            index.metadata.name.as_str(),
+        ))
+    }
+
+    /// The OID of `namespace.name` in this snapshot, or `None` if it holds no
+    /// such relation. The inverse of [`SystemCatalog::relation_ref`]; feeds the
+    /// shadowing check in `pg_table_is_visible`.
+    pub fn relation_oid_in(&self, namespace: &str, name: &str) -> Option<u32> {
+        let relation = self
+            .relation_oids()
+            .iter()
+            .find(|(_, schema)| schema.namespace == namespace && schema.name == name);
+        if let Some((oid, _)) = relation {
+            return Some(*oid);
         }
         self.index_oids()
             .iter()
-            .find(|index| index.oid == oid)
-            .map(|index| index.table_schema.namespace.as_str())
+            .find(|index| index.table_schema.namespace == namespace && index.metadata.name == name)
+            .map(|index| index.oid)
+    }
+
+    /// Whether `name` is a `pg_catalog` relation this catalog serves. Cheap for
+    /// a name that is not one (the builders run only on a match), which is the
+    /// common case — it is consulted per relation when deciding visibility.
+    pub fn has_catalog_relation(&self, name: &str) -> bool {
+        self.build_pg_catalog(name).is_some()
     }
 
     /// Build the requested relation's rows + schema, or `None` if unknown.
@@ -887,21 +926,48 @@ mod tests {
         let row = required(rows.first(), "expected one pg_class row")?;
 
         // The owner OID pg_class reports is the one `pg_get_userbyid` resolves.
-        assert_eq!(row[relowner], Value::Oid(10));
-        assert_eq!(cat.role_name(10), Some("alice"));
-        assert_eq!(cat.role_name(11), None);
+        // Asserted against the constant, not a literal, so moving the bootstrap
+        // OID cannot leave the row and the lookup disagreeing.
+        assert_eq!(row[relowner], Value::Oid(schema::BOOTSTRAP_ROLE_OID));
+        assert_eq!(cat.role_name(schema::BOOTSTRAP_ROLE_OID), Some("alice"));
+        assert_eq!(cat.role_name(schema::BOOTSTRAP_ROLE_OID + 1), None);
+
+        // Every other owner column reports the same role, so `pg_get_userbyid`
+        // resolves them all rather than printing `unknown (OID=n)` for some.
+        for relation in ["pg_type", "pg_collation", "pg_namespace"] {
+            let (s, r) = required(cat.build_pg_catalog(relation), relation)?;
+            let owner = required(
+                s.columns
+                    .iter()
+                    .position(|c| c.name.ends_with("owner"))
+                    .map(|i| i),
+                "an owner column",
+            )?;
+            for row in &r {
+                let Value::Oid(o) = row[owner] else {
+                    anyhow::bail!("{relation} owner column was not an OID");
+                };
+                assert!(
+                    cat.role_name(o).is_some(),
+                    "{relation} owner OID {o} does not resolve to a role name"
+                );
+            }
+        }
 
         // ... and the namespace it reports is the one visibility is decided on.
         let Value::Oid(rel_oid) = row[oid] else {
             anyhow::bail!("pg_class.oid was not an OID");
         };
-        assert_eq!(cat.relation_namespace(rel_oid), Some("app"));
+        assert_eq!(cat.relation_ref(rel_oid), Some(("app", "t")));
+        assert_eq!(cat.relation_oid_in("app", "t"), Some(rel_oid));
         assert_eq!(
             cat.namespace_oids().get("app").copied().map(Value::Oid),
             Some(row[relnamespace].clone())
         );
-        // An OID no relation has resolves to nothing, so the function is NULL.
-        assert_eq!(cat.relation_namespace(rel_oid + 1_000), None);
+        // An OID no relation has resolves to nothing, so the function is NULL —
+        // both above the assigned range and below the synthetic floor.
+        assert_eq!(cat.relation_ref(rel_oid + 1_000), None);
+        assert_eq!(cat.relation_ref(1), None);
 
         Ok(())
     }

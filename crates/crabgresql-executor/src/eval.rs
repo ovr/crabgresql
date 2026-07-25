@@ -330,10 +330,11 @@ fn eval_catalog_fn(
             "catalog function evaluated without a catalog context",
         )));
     };
-    let oid = match catalog_oid(&args[0]) {
-        Ok(oid) => oid,
-        Err(e) => return Some(Err(e)),
-    };
+    // The binder declares these arguments as `oid` and inserts the coercion, so
+    // the value has already arrived as one — including the reinterpret-not-clamp
+    // of a negative (PG prints `pg_get_userbyid(-1)` as `unknown (OID=…4295)`),
+    // which `cast` owns.
+    let oid = oid_of(&args[0]);
     let value = match func {
         // PG never returns NULL here: an unresolvable OID prints a placeholder.
         ScalarFn::PgGetUserById => Value::Text(
@@ -345,24 +346,6 @@ fn eval_catalog_fn(
         _ => unreachable!("guarded by the matches! above"),
     };
     Some(Ok(value))
-}
-
-/// The OID a catalog function's argument denotes. The binder declares these
-/// arguments as `oid`, and the integer types coerce to it implicitly — but that
-/// coercion reinterprets rather than clamps (PG prints `pg_get_userbyid(-1)` as
-/// `unknown (OID=4294967295)`), so the integer cases carry it through the same
-/// way rather than assuming the value already arrived as `Value::Oid`.
-fn catalog_oid(v: &Value) -> Result<u32, ExecError> {
-    match v {
-        Value::Oid(n) => Ok(*n),
-        Value::Int2(n) => Ok(*n as u32),
-        Value::Int4(n) => Ok(*n as u32),
-        Value::Int8(n) => Ok(*n as u32),
-        other => Err(ExecError::new(
-            sqlstate::INTERNAL_ERROR,
-            format!("catalog function received a non-oid argument: {other:?}"),
-        )),
-    }
 }
 
 /// Split a `nextval`/`currval`/`setval` text argument into `(namespace, name)`:
