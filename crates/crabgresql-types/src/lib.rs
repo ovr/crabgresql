@@ -25,6 +25,8 @@ pub mod timestamp;
 pub mod timestamptz;
 pub mod timetz;
 pub mod to_char;
+pub mod tsquery;
+pub mod tsvector;
 pub mod tz;
 pub mod uuid;
 pub mod wire;
@@ -81,6 +83,10 @@ pub mod oid {
     pub const REGTYPE: u32 = 2206;
     /// `regnamespace`: an OID that renders as a schema name. See [`crate::Reg`].
     pub const REGNAMESPACE: u32 = 4089;
+    /// `tsvector`: a sorted list of weighted lexemes. See [`crate::tsvector`].
+    pub const TSVECTOR: u32 = 3614;
+    /// `tsquery`: a text-search query expression. See [`crate::tsquery`].
+    pub const TSQUERY: u32 = 3615;
 
     // Array type OIDs (`pg_type.typarray` of the element type). Element↔array
     // mapping lives in [`crate::array`].
@@ -193,6 +199,13 @@ pub enum PgType {
     /// share one variant because they differ only in *what* the OID names —
     /// see [`RegKind`].
     Reg(RegKind),
+    /// `tsvector`: a sorted list of distinct lexemes with weighted positions
+    /// ([`Value::Tsvector`]). Varlena; ordered and hashable.
+    /// See [`crate::tsvector`].
+    Tsvector,
+    /// `tsquery`: a text-search query tree ([`Value::Tsquery`]). Varlena;
+    /// ordered and hashable. See [`crate::tsquery`].
+    Tsquery,
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -331,6 +344,8 @@ impl PgType {
             PgType::Jsonb => oid::JSONB,
             PgType::Jsonpath => oid::JSONPATH,
             PgType::Reg(kind) => kind.oid(),
+            PgType::Tsvector => oid::TSVECTOR,
+            PgType::Tsquery => oid::TSQUERY,
             PgType::User(oid) => oid,
             PgType::Array(elem) => array::array_oid_for_elem(elem).unwrap_or(0),
         }
@@ -382,6 +397,10 @@ impl PgType {
                 // A reg* value compares by OID alone, and `hash_key` hashes the
                 // OID alone — the carried name is never part of either.
                 | PgType::Reg(_)
+                // Both text-search types are canonicalized on input, so their
+                // structural hash agrees with `keys_equal`.
+                | PgType::Tsvector
+                | PgType::Tsquery
         )
     }
 
@@ -432,6 +451,8 @@ impl PgType {
             oid::REGCLASS => PgType::Reg(RegKind::Class),
             oid::REGTYPE => PgType::Reg(RegKind::Type),
             oid::REGNAMESPACE => PgType::Reg(RegKind::Namespace),
+            oid::TSVECTOR => PgType::Tsvector,
+            oid::TSQUERY => PgType::Tsquery,
             // Array type OIDs (`_int4`, `_text`, ...) decode to `Array(elem)`.
             other => match array::elem_oid_for_array(other) {
                 Some(elem) => PgType::Array(elem),
@@ -492,6 +513,8 @@ impl PgType {
             "json" => PgType::Json,
             "jsonb" => PgType::Jsonb,
             "jsonpath" => PgType::Jsonpath,
+            "tsvector" => PgType::Tsvector,
+            "tsquery" => PgType::Tsquery,
             "regclass" => PgType::Reg(RegKind::Class),
             "regtype" => PgType::Reg(RegKind::Type),
             "regnamespace" => PgType::Reg(RegKind::Namespace),
@@ -536,7 +559,9 @@ impl PgType {
             | PgType::Cidr
             | PgType::Json
             | PgType::Jsonb
-            | PgType::Jsonpath => -1,
+            | PgType::Jsonpath
+            | PgType::Tsvector
+            | PgType::Tsquery => -1,
             PgType::User(_) => -1,
             // Arrays are varlena.
             PgType::Array(_) => -1,
@@ -579,6 +604,8 @@ impl PgType {
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
             PgType::Reg(kind) => kind.typname(),
+            PgType::Tsvector => "tsvector",
+            PgType::Tsquery => "tsquery",
             PgType::User(_) => "user-defined",
             PgType::Array(elem) => array_display_name(elem),
         }
@@ -621,6 +648,8 @@ impl PgType {
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
             PgType::Reg(kind) => kind.typname(),
+            PgType::Tsvector => "tsvector",
+            PgType::Tsquery => "tsquery",
             PgType::User(_) => "user-defined",
             PgType::Array(elem) => array_typname(elem),
         }
@@ -832,6 +861,10 @@ pub enum Value {
     Jsonb(json::Jsonb),
     /// `jsonpath`: a compiled SQL/JSON path program. See [`crate::jsonpath`].
     Jsonpath(jsonpath::JsonPath),
+    /// `tsvector`: sorted lexemes with weighted positions. See [`crate::tsvector`].
+    Tsvector(tsvector::TsVector),
+    /// `tsquery`: a text-search query tree. See [`crate::tsquery`].
+    Tsquery(tsquery::TsQuery),
     /// A `CREATE TYPE ... AS ENUM` value. `type_oid` is the enum's type OID (so
     /// [`Value::pg_type`] reports `PgType::User(type_oid)`); `ordinal` is the
     /// 0-based position of the label in the enum's definition, which is also its
@@ -886,6 +919,8 @@ impl Value {
             Value::Json(_) => Some(PgType::Json),
             Value::Jsonb(_) => Some(PgType::Jsonb),
             Value::Jsonpath(_) => Some(PgType::Jsonpath),
+            Value::Tsvector(_) => Some(PgType::Tsvector),
+            Value::Tsquery(_) => Some(PgType::Tsquery),
             Value::Enum { type_oid, .. } => Some(PgType::User(*type_oid)),
             Value::Array { elem, .. } => Some(PgType::Array(elem.oid())),
         }
@@ -942,6 +977,9 @@ impl Value {
             Value::Jsonb(j) => Some(json::format(j)),
             // `jsonpath` prints its canonical form (`jsonpath_out`).
             Value::Jsonpath(p) => Some(jsonpath::format(p)),
+            // Both text-search types print their canonical form.
+            Value::Tsvector(v) => Some(tsvector::format(v)),
+            Value::Tsquery(q) => Some(tsquery::format(q)),
             // An enum prints as its label (PG's `enum_out`).
             Value::Enum { label, .. } => Some(label.clone()),
             // An array prints in PG's `{...}` form (`array_out`).
@@ -982,6 +1020,7 @@ impl_message_error!(
     time::TimeError,
     timestamp::TimestampError,
     timetz::TimeTzError,
+    tsvector::TsError,
     uuid::UuidError,
 );
 

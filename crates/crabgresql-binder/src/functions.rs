@@ -444,6 +444,9 @@ pub enum ScalarFn {
     /// `[jsonb, jsonpath]` optionally followed by `[vars jsonb, silent bool]`;
     /// the `@?`/`@@` operators pass a `silent = true` 4th arg.
     JsonPath(JsonPathFn),
+    // --- text search (tsvector / tsquery) ---
+    /// A `tsvector`/`tsquery` operation; the specific operation is the payload.
+    Ts(TsFn),
 
     // --- array operators / functions (built directly by the binder; the result
     // type is carried in the `BoundExpr`). All operate on 1-D arrays. ---
@@ -497,6 +500,54 @@ pub enum JsonPathFn {
     ExistsOp,
     /// `jsonb @@ jsonpath` (`-> boolean`; silent form of `Match`).
     MatchOp,
+}
+
+/// A text-search operation over `tsvector`/`tsquery`. Operators lower to these
+/// via `resolve_ts_op` (`@@`, `&&`, `<->`), `resolve_ts_concat` (`||`) and
+/// `resolve_ts_unary` (`!!`); named functions register them in [`lookup`].
+/// Argument order is fixed per variant.
+///
+/// PG spells the weight arguments as `"char"` and `"char"[]`, which this engine
+/// has no type for; they are modeled as `text`/`text[]`, so a literal like
+/// `setweight(v, 'c')` binds identically. Only the first character is read, as
+/// the `"char"` cast would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TsFn {
+    /// `tsvector @@ tsquery` (`-> boolean`). Operand order is normalized, so the
+    /// `tsquery @@ tsvector` spelling lowers here too.
+    Match,
+    /// `tsvector || tsvector` (`-> tsvector`).
+    VectorConcat,
+    /// `strip(tsvector) -> tsvector`.
+    Strip,
+    /// `length(tsvector) -> int4`.
+    VectorLength,
+    /// `setweight(tsvector, text) -> tsvector`.
+    SetWeight,
+    /// `setweight(tsvector, text, text[]) -> tsvector`.
+    SetWeightLexemes,
+    /// `ts_delete(tsvector, text)` / `ts_delete(tsvector, text[])` (`-> tsvector`).
+    Delete,
+    /// `ts_filter(tsvector, text[]) -> tsvector`.
+    Filter,
+    /// `tsvector_to_array(tsvector) -> text[]`.
+    VectorToArray,
+    /// `array_to_tsvector(text[]) -> tsvector`.
+    ArrayToVector,
+    /// `numnode(tsquery) -> int4`.
+    NumNode,
+    /// `querytree(tsquery) -> text`.
+    QueryTree,
+    /// `tsquery && tsquery` (`-> tsquery`).
+    QueryAnd,
+    /// `tsquery || tsquery` (`-> tsquery`).
+    QueryOr,
+    /// `!! tsquery` (`-> tsquery`).
+    QueryNot,
+    /// `tsquery <-> tsquery` and `tsquery_phrase(tsquery, tsquery)` (`-> tsquery`).
+    QueryPhrase,
+    /// `tsquery_phrase(tsquery, tsquery, int4) -> tsquery`.
+    QueryPhraseDist,
 }
 
 /// A geometric (`point` / `lseg`) operation. Operators lower to these via
@@ -704,13 +755,14 @@ pub(crate) fn agg_return_type(
         // COUNT is handled by the caller (arg-less for `*`); COUNT(expr) counts
         // non-null values of any type and returns bigint.
         AggFn::Count => Ok(PgType::Int8),
-        // MIN/MAX return the argument type. PG defines them for every orderable
-        // type *except* boolean (users reach for bool_and/bool_or there), so
-        // `is_orderable` — which includes bool for ORDER BY — is too broad here.
+        // MIN/MAX return the argument type. PG defines them for most orderable
+        // types, so `is_orderable` is the right starting point — but it is too
+        // broad on its own: `boolean` is ordered yet has no min/max aggregate
+        // (users reach for bool_and/bool_or), and neither do the text-search
+        // types, which are ordered only so they can key a btree index.
         AggFn::Min | AggFn::Max => {
-            if input_ty != PgType::Bool
-                && crate::expr::is_orderable(input_ty, scope.catalog().as_ref())
-            {
+            let has_minmax = !matches!(input_ty, PgType::Bool | PgType::Tsvector | PgType::Tsquery);
+            if has_minmax && crate::expr::is_orderable(input_ty, scope.catalog().as_ref()) {
                 Ok(input_ty)
             } else {
                 Err(unsupported())
@@ -860,6 +912,9 @@ const POINT: PgType = PgType::Point;
 const LSEG: PgType = PgType::Lseg;
 const JSONB: PgType = PgType::Jsonb;
 const JSONPATH: PgType = PgType::Jsonpath;
+const TSVECTOR: PgType = PgType::Tsvector;
+const TSQUERY: PgType = PgType::Tsquery;
+const TEXTARR: PgType = PgType::Array(crabgresql_types::oid::TEXT);
 const OID: PgType = PgType::Oid;
 const REGCLASS: PgType = PgType::Reg(RegKind::Class);
 const NAME: PgType = PgType::Name;
@@ -1266,6 +1321,11 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature {
                 func: ScalarFn::BitLen,
                 args: &[VARBIT],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::Ts(TsFn::VectorLength),
+                args: &[TSVECTOR],
                 ret: I4,
             },
         ],
@@ -1732,6 +1792,75 @@ fn lookup(name: &str) -> &'static [Signature] {
         }],
         // --- jsonpath query functions: each has the 2-arg form plus the
         // optional `vars jsonb` / `silent bool` arguments PG's DEFAULTs add ---
+        // --- text search (tsvector / tsquery) ---
+        "strip" => &[Signature {
+            func: ScalarFn::Ts(TsFn::Strip),
+            args: &[TSVECTOR],
+            ret: TSVECTOR,
+        }],
+        "setweight" => &[
+            Signature {
+                func: ScalarFn::Ts(TsFn::SetWeight),
+                args: &[TSVECTOR, TEXT],
+                ret: TSVECTOR,
+            },
+            Signature {
+                func: ScalarFn::Ts(TsFn::SetWeightLexemes),
+                args: &[TSVECTOR, TEXT, TEXTARR],
+                ret: TSVECTOR,
+            },
+        ],
+        // Both `ts_delete` overloads share one variant; the executor branches on
+        // whether the second argument arrived as text or as an array.
+        "ts_delete" => &[
+            Signature {
+                func: ScalarFn::Ts(TsFn::Delete),
+                args: &[TSVECTOR, TEXT],
+                ret: TSVECTOR,
+            },
+            Signature {
+                func: ScalarFn::Ts(TsFn::Delete),
+                args: &[TSVECTOR, TEXTARR],
+                ret: TSVECTOR,
+            },
+        ],
+        "ts_filter" => &[Signature {
+            func: ScalarFn::Ts(TsFn::Filter),
+            args: &[TSVECTOR, TEXTARR],
+            ret: TSVECTOR,
+        }],
+        "tsvector_to_array" => &[Signature {
+            func: ScalarFn::Ts(TsFn::VectorToArray),
+            args: &[TSVECTOR],
+            ret: TEXTARR,
+        }],
+        "array_to_tsvector" => &[Signature {
+            func: ScalarFn::Ts(TsFn::ArrayToVector),
+            args: &[TEXTARR],
+            ret: TSVECTOR,
+        }],
+        "numnode" => &[Signature {
+            func: ScalarFn::Ts(TsFn::NumNode),
+            args: &[TSQUERY],
+            ret: I4,
+        }],
+        "querytree" => &[Signature {
+            func: ScalarFn::Ts(TsFn::QueryTree),
+            args: &[TSQUERY],
+            ret: TEXT,
+        }],
+        "tsquery_phrase" => &[
+            Signature {
+                func: ScalarFn::Ts(TsFn::QueryPhrase),
+                args: &[TSQUERY, TSQUERY],
+                ret: TSQUERY,
+            },
+            Signature {
+                func: ScalarFn::Ts(TsFn::QueryPhraseDist),
+                args: &[TSQUERY, TSQUERY, I4],
+                ret: TSQUERY,
+            },
+        ],
         "jsonb_path_exists" => json_path_sigs!(JsonPathFn::Exists, BOOL),
         "jsonb_path_match" => json_path_sigs!(JsonPathFn::Match, BOOL),
         "jsonb_path_query_array" => json_path_sigs!(JsonPathFn::QueryArray, JSONB),

@@ -350,6 +350,18 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     j.hash(&mut h);
                 }
             }
+            // Both text-search types are canonicalized on input, so hashing the
+            // parsed structure agrees with `keys_equal`.
+            PgType::Tsvector => {
+                if let Value::Tsvector(t) = v {
+                    t.hash(&mut h);
+                }
+            }
+            PgType::Tsquery => {
+                if let Value::Tsquery(q) = v {
+                    q.hash(&mut h);
+                }
+            }
             PgType::User(type_oid) => {
                 if let Value::Enum { type_oid: value_oid, ordinal, .. } = v
                     && value_oid == type_oid

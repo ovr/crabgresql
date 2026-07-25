@@ -78,6 +78,9 @@ pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
 /// `55000` — the object is not in a state the operation requires, e.g. `currval`
 /// / `lastval` before any `nextval` has run in the session.
 pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
+/// `22004` — a NULL where the operation forbids one, e.g. a NULL element in
+/// `ts_filter`'s weight array.
+pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
 /// `2200H` — a sequence hit its `MINVALUE`/`MAXVALUE` bound with `NO CYCLE`.
 pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
 /// Class 22 — data exception: a COPY data stream that does not match the

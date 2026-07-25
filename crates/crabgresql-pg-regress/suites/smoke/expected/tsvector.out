@@ -1,0 +1,380 @@
+--
+-- TSVECTOR
+-- The text-search document type: input parsing, canonical output, the editing
+-- functions, ordering and storage. The query side lives in tsquery.
+-- Output hand-checked against PostgreSQL.
+--
+-- Input is whitespace-separated; every lexeme comes back single-quoted, sorted
+-- by byte order, with duplicates merged.
+SELECT '1'::tsvector;
+ tsvector 
+----------
+ '1'
+(1 row)
+
+SELECT ' 1 '::tsvector;
+ tsvector 
+----------
+ '1'
+(1 row)
+
+SELECT '1 2'::tsvector;
+ tsvector 
+----------
+ '1' '2'
+(1 row)
+
+SELECT 'b a'::tsvector;
+ tsvector 
+----------
+ 'a' 'b'
+(1 row)
+
+SELECT 'a b a'::tsvector;
+ tsvector 
+----------
+ 'a' 'b'
+(1 row)
+
+-- An empty input is a valid empty tsvector.
+SELECT ''::tsvector;
+ tsvector 
+----------
+ 
+(1 row)
+
+-- A lexeme may be single-quoted, which lets it contain spaces; `''` is an
+-- embedded quote and a quoted lexeme is self-delimiting.
+SELECT '''1 2'''::tsvector;
+ tsvector 
+----------
+ '1 2'
+(1 row)
+
+SELECT '''1 ''''2'''::tsvector;
+ tsvector 
+----------
+ '1 ''2'
+(1 row)
+
+SELECT '''1 ''''2''3'::tsvector;
+  tsvector   
+-------------
+ '1 ''2' '3'
+(1 row)
+
+-- Backslash escapes one character in either form; output re-doubles them.
+SELECT $$'\\as' ab\c ab\\c AB\\\c ab\\\\c$$::tsvector;
+                tsvector                
+----------------------------------------
+ 'AB\\c' '\\as' 'ab\\\\c' 'ab\\c' 'abc'
+(1 row)
+
+-- A lexeme may carry positions, which sort and de-duplicate.
+SELECT 'a:2,1'::tsvector;
+ tsvector 
+----------
+ 'a':1,2
+(1 row)
+
+SELECT 'a:1,1'::tsvector;
+ tsvector 
+----------
+ 'a':1
+(1 row)
+
+SELECT 'a:1 a:2'::tsvector;
+ tsvector 
+----------
+ 'a':1,2
+(1 row)
+
+-- A positionless duplicate does not erase the positions.
+SELECT 'a:1 a'::tsvector;
+ tsvector 
+----------
+ 'a':1
+(1 row)
+
+-- Weights rank D < C < B < A; D is the default and is never printed. A repeated
+-- position keeps the strongest weight.
+SELECT '''w'':4A,3B,2C,1D,5 a:8'::tsvector;
+        tsvector        
+------------------------
+ 'a':8 'w':1,2C,3B,4A,5
+(1 row)
+
+SELECT 'a:1B a:1A'::tsvector;
+ tsvector 
+----------
+ 'a':1A
+(1 row)
+
+SELECT 'a:1D a:1C'::tsvector;
+ tsvector 
+----------
+ 'a':1C
+(1 row)
+
+-- `*` is an accepted spelling of weight A. A `D` keeps the default and lets
+-- another weight letter follow, so `1dc` is C -- but `1cd` is a syntax error.
+SELECT 'a:1*'::tsvector;
+ tsvector 
+----------
+ 'a':1A
+(1 row)
+
+SELECT 'a:1dc'::tsvector;
+ tsvector 
+----------
+ 'a':1C
+(1 row)
+
+SELECT 'a:1cd'::tsvector;
+ERROR:  syntax error in tsvector: "a:1cd"
+LINE 1: SELECT 'a:1cd'::tsvector;
+               ^
+-- Positions cap at 16383 silently, but 0 is rejected.
+SELECT 'a:16384'::tsvector;
+ tsvector  
+-----------
+ 'a':16383
+(1 row)
+
+SELECT 'a:0'::tsvector;
+ERROR:  wrong position info in tsvector: "a:0"
+LINE 1: SELECT 'a:0'::tsvector;
+               ^
+-- An empty lexeme can never be stored.
+SELECT $$''$$::tsvector;
+ERROR:  syntax error in tsvector: "''"
+LINE 1: SELECT $$''$$::tsvector;
+               ^
+SELECT 'a:'::tsvector;
+ERROR:  syntax error in tsvector: "a:"
+LINE 1: SELECT 'a:'::tsvector;
+               ^
+SELECT 'a:b'::tsvector;
+ERROR:  syntax error in tsvector: "a:b"
+LINE 1: SELECT 'a:b'::tsvector;
+               ^
+-- pg_input_is_valid reports bad input without raising.
+SELECT pg_input_is_valid('foo', 'tsvector') AS ok, pg_input_is_valid($$''$$, 'tsvector') AS bad;
+ ok | bad 
+----+-----
+ t  | f
+(1 row)
+
+SELECT * FROM pg_input_error_info($$''$$, 'tsvector');
+            message             | detail | hint | sql_error_code 
+--------------------------------+--------+------+----------------
+ syntax error in tsvector: "''" |        |      | 42601
+(1 row)
+
+-- concatenation shifts the right operand past the left's highest position, and
+-- normalizes a lowercase weight letter
+SELECT 'a:3A b:2a'::tsvector || 'ba:1234 a:1B';
+          ?column?          
+----------------------------
+ 'a':3A,4B 'b':2A 'ba':1237
+(1 row)
+
+SELECT 'a b'::tsvector || 'b:1 c'::tsvector;
+   ?column?    
+---------------
+ 'a' 'b':1 'c'
+(1 row)
+
+SELECT 'a:1 b:2'::tsvector || ''::tsvector;
+  ?column?   
+-------------
+ 'a':1 'b':2
+(1 row)
+
+-- editing functions
+SELECT strip('w:12B w:13* w:12,5,6 a:1,3* a:3 w asd:1dc asd'::tsvector);
+     strip     
+---------------
+ 'a' 'asd' 'w'
+(1 row)
+
+SELECT length('a b c'::tsvector) AS three, length(''::tsvector) AS zero;
+ three | zero 
+-------+------
+     3 |    0
+(1 row)
+
+SELECT setweight('a:1,3A asd:1C w:5,6,12B,13A'::tsvector, 'c');
+              setweight               
+--------------------------------------
+ 'a':1C,3C 'asd':1C 'w':5C,6C,12C,13C
+(1 row)
+
+-- the three-argument form stamps only the named lexemes; NULL entries are skipped
+SELECT setweight('a:1,3A asd:1C w:5,6,12B,13A zxc:81,222A,567'::tsvector, 'c', '{a,zxc}');
+                       setweight                        
+--------------------------------------------------------
+ 'a':1C,3C 'asd':1C 'w':5,6,12B,13A 'zxc':81C,222C,567C
+(1 row)
+
+SELECT setweight('a asd w:5,6,12B,13A zxc'::tsvector, 'c', ARRAY['a', 'zxc', '', NULL]);
+            setweight            
+---------------------------------
+ 'a' 'asd' 'w':5,6,12B,13A 'zxc'
+(1 row)
+
+SELECT setweight('a:1'::tsvector, 'x');
+ERROR:  unrecognized weight: 120
+-- ts_delete matches whole lexemes only: neither a prefix nor a plural removes one
+SELECT ts_delete('base:7 hidden:6 rebel:1 spaceship:2,33A,34B,35C,36D strike:3'::tsvector, 'bas');
+                               ts_delete                               
+-----------------------------------------------------------------------
+ 'base':7 'hidden':6 'rebel':1 'spaceship':2,33A,34B,35C,36 'strike':3
+(1 row)
+
+SELECT ts_delete('base:7 hidden:6 rebel:1 spaceship:2,33A,34B,35C,36D strike:3'::tsvector, 'spaceship');
+                ts_delete                 
+------------------------------------------
+ 'base':7 'hidden':6 'rebel':1 'strike':3
+(1 row)
+
+SELECT ts_delete('base hidden rebel spaceship strike'::tsvector, ARRAY['spaceship','leya','rebel', '', NULL]);
+        ts_delete         
+--------------------------
+ 'base' 'hidden' 'strike'
+(1 row)
+
+-- ts_filter keeps the listed weights; a stripped lexeme has none, so it drops
+SELECT ts_filter('base:7A empir:17 evil:15 hidden:6A rebel:1A won:9'::tsvector, '{a}');
+            ts_filter             
+----------------------------------
+ 'base':7A 'hidden':6A 'rebel':1A
+(1 row)
+
+SELECT ts_filter('base hidden rebel'::tsvector, '{a}');
+ ts_filter 
+-----------
+ 
+(1 row)
+
+SELECT ts_filter('base:7A'::tsvector, '{a,x}');
+ERROR:  unrecognized weight: "x"
+-- Unlike setweight/ts_delete, ts_filter rejects a NULL weight. PostgreSQL
+-- spells the argument `"char"[]`, a type this engine does not have, so we model
+-- it as text[] -- which is why PG answers this particular call with
+-- `function ts_filter(tsvector, text[]) does not exist` instead.
+SELECT ts_filter('base:7A'::tsvector, ARRAY['a', NULL]);
+ERROR:  weight array may not contain nulls
+-- array conversions; array_to_tsvector sorts and de-duplicates
+SELECT tsvector_to_array('base:7 hidden:6 rebel:1'::tsvector);
+  tsvector_to_array  
+---------------------
+ {base,hidden,rebel}
+(1 row)
+
+SELECT array_to_tsvector(ARRAY['foo','bar','baz','bar']);
+ array_to_tsvector 
+-------------------
+ 'bar' 'baz' 'foo'
+(1 row)
+
+SELECT array_to_tsvector(ARRAY['base', NULL]);
+ERROR:  lexeme array may not contain nulls
+SELECT array_to_tsvector(ARRAY['base', '']);
+ERROR:  lexeme array may not contain empty strings
+-- a tsvector round-trips through text
+SELECT 'a:1B b'::tsvector::text;
+    text    
+------------
+ 'a':1B 'b'
+(1 row)
+
+SELECT 'a:1B b'::text::tsvector;
+  tsvector  
+------------
+ 'a':1B 'b'
+(1 row)
+
+-- ordering: storage footprint first, then lexeme count, then byte order. The
+-- footprint outranks the count, so one long lexeme sorts after two short ones.
+SELECT v FROM (VALUES ('b'::tsvector),('aa'),('a b'),('zz'),('a:1')) t(v) ORDER BY v;
+    v    
+---------
+ 'b'
+ 'aa'
+ 'zz'
+ 'a':1
+ 'a' 'b'
+(5 rows)
+
+SELECT 'aaaaaaa'::tsvector < 'a b'::tsvector AS f, 'a:1'::tsvector < 'a b'::tsvector AS t;
+ f | t 
+---+---
+ f | t
+(1 row)
+
+SELECT 'aa:1'::tsvector < 'b:1'::tsvector AS t, 'a'::tsvector < 'a b'::tsvector AS t2;
+ t | t2 
+---+----
+ t | t
+(1 row)
+
+-- positions order descending, so 'a':2 precedes 'a':1
+SELECT v FROM (VALUES ('a:1'::tsvector),('a:2'),('a:3,4'),('a:1,2')) t(v) ORDER BY v;
+    v    
+---------
+ 'a':2
+ 'a':1
+ 'a':3,4
+ 'a':1,2
+(4 rows)
+
+-- positions participate in equality
+SELECT 'a:1'::tsvector = 'a:1'::tsvector AS t, 'a:1'::tsvector = 'a:2'::tsvector AS f;
+ t | f 
+---+---
+ t | f
+(1 row)
+
+-- a text operand is not silently reinterpreted as a tsvector: PG's `||` on
+-- text and tsvector is the text concatenation, not a lexeme union
+SELECT 'hello'::text || 'a b'::tsvector;
+   ?column?   
+--------------
+ hello'a' 'b'
+(1 row)
+
+-- storage, grouping and indexing over a real table
+CREATE TABLE tsdoc(id int, v tsvector);
+INSERT INTO tsdoc VALUES (1, 'rat:1 cat:2A'), (2, 'dog:1'), (3, 'rat:1 cat:2A');
+SELECT id, v FROM tsdoc ORDER BY id;
+ id |        v         
+----+------------------
+  1 | 'cat':2A 'rat':1
+  2 | 'dog':1
+  3 | 'cat':2A 'rat':1
+(3 rows)
+
+SELECT v, count(*) FROM tsdoc GROUP BY v ORDER BY v;
+        v         | count 
+------------------+-------
+ 'dog':1          |     1
+ 'cat':2A 'rat':1 |     2
+(2 rows)
+
+SELECT DISTINCT v FROM tsdoc ORDER BY v;
+        v         
+------------------
+ 'dog':1
+ 'cat':2A 'rat':1
+(2 rows)
+
+CREATE INDEX tsdoc_v_idx ON tsdoc(v);
+SELECT id FROM tsdoc WHERE v = 'cat:2A rat:1'::tsvector ORDER BY id;
+ id 
+----
+  1
+  3
+(2 rows)
+
+DROP TABLE tsdoc;

@@ -12,6 +12,7 @@ use std::hint::black_box;
 use crabgresql_binder::GeoFn;
 use crabgresql_binder::JsonPathFn;
 use crabgresql_binder::ScalarFn;
+use crabgresql_binder::TsFn;
 use crabgresql_types::json::Jsonb;
 use crabgresql_types::jsonpath;
 use crabgresql_pg_wire::sqlstate;
@@ -150,6 +151,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         // --- jsonpath (STRICT: any NULL arg already short-circuited to NULL) ---
         ScalarFn::JsonPath(f) => return eval_jsonpath(f, args),
+        ScalarFn::Ts(f) => return eval_ts(f, args),
         // --- array containment / size (STRICT) ---
         ScalarFn::ArrayContains => return Ok(Value::Bool(array_contains(&args[0], &args[1]))),
         ScalarFn::ArrayContainedBy => {
@@ -1351,6 +1353,12 @@ pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, Str
         "lseg" => geo::parse_lseg(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
+        "tsvector" => crabgresql_types::tsvector::tsvector_in(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
+        "tsquery" => crabgresql_types::tsquery::tsquery_in(value)
+            .map(|_| ())
+            .map_err(|e| (e.sqlstate, e.message)),
         "json" => json::json_in(value)
             .map(|_| ())
             .map_err(|e| (e.sqlstate, e.message)),
@@ -1436,6 +1444,119 @@ fn eval_jsonpath(f: JsonPathFn, args: &[Value]) -> Result<Value, ExecError> {
             .map(|items| items.into_iter().next().map(Value::Jsonb).unwrap_or(Value::Null))
             .map_err(json_err),
     }
+}
+
+/// The `tsvector`/`tsquery` family. Every variant is STRICT, so `args` holds no
+/// NULLs — except inside the `text[]` arguments, where a NULL element is
+/// meaningful (`setweight`/`ts_delete` skip them, `array_to_tsvector` rejects
+/// them).
+fn eval_ts(f: TsFn, args: &[Value]) -> Result<Value, ExecError> {
+    use crabgresql_types::{tsquery, tsvector};
+
+    let vector = |v: &Value| match v {
+        Value::Tsvector(t) => t.clone(),
+        other => unreachable!("expected tsvector, got {other:?}"),
+    };
+    let query = |v: &Value| match v {
+        Value::Tsquery(q) => q.clone(),
+        other => unreachable!("expected tsquery, got {other:?}"),
+    };
+    // A `text` or `text[]` argument as a list of optional lexemes, so the two
+    // `ts_delete` overloads share one code path.
+    let words = |v: &Value| -> Vec<Option<String>> {
+        match v {
+            Value::Text(s) => vec![Some(s.clone())],
+            Value::Array { elems, .. } => elems
+                .iter()
+                .map(|e| match e {
+                    Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            other => unreachable!("expected text or text[], got {other:?}"),
+        }
+    };
+    let ts_err = |e: tsvector::TsError| ExecError::new(e.sqlstate, e.message);
+
+    Ok(match f {
+        TsFn::Match => Value::Bool(tsquery::matches(&vector(&args[0]), &query(&args[1]))),
+        TsFn::VectorConcat => {
+            Value::Tsvector(tsvector::concat(&vector(&args[0]), &vector(&args[1])))
+        }
+        TsFn::Strip => Value::Tsvector(tsvector::strip(&vector(&args[0]))),
+        TsFn::VectorLength => Value::Int4(tsvector::length(&vector(&args[0]))),
+        TsFn::SetWeight | TsFn::SetWeightLexemes => {
+            // PG takes a `"char"`, which keeps only the first character.
+            let label = match &args[1] {
+                Value::Text(s) => s.chars().next().unwrap_or('\0'),
+                other => unreachable!("expected text weight, got {other:?}"),
+            };
+            let w = tsvector::weight_from_char(label).map_err(ts_err)?;
+            let tv = vector(&args[0]);
+            Value::Tsvector(match f {
+                TsFn::SetWeight => tsvector::setweight(&tv, w),
+                _ => tsvector::setweight_lexemes(&tv, w, &words(&args[2])),
+            })
+        }
+        TsFn::Delete => Value::Tsvector(tsvector::ts_delete(&vector(&args[0]), &words(&args[1]))),
+        TsFn::Filter => {
+            // Unlike setweight/ts_delete, which skip NULL entries, ts_filter
+            // rejects them outright.
+            let mut weights = Vec::new();
+            for label in words(&args[1]) {
+                let label = label.ok_or_else(|| {
+                    ExecError::new(
+                        sqlstate::NULL_VALUE_NOT_ALLOWED,
+                        "weight array may not contain nulls",
+                    )
+                })?;
+                weights.push(tsvector::weight_from_label(&label).map_err(ts_err)?);
+            }
+            Value::Tsvector(tsvector::ts_filter(&vector(&args[0]), &weights))
+        }
+        TsFn::VectorToArray => Value::Array {
+            elem: PgType::Text,
+            elems: tsvector::to_array(&vector(&args[0]))
+                .into_iter()
+                .map(Value::Text)
+                .collect(),
+        },
+        TsFn::ArrayToVector => {
+            Value::Tsvector(tsvector::from_array(&words(&args[0])).map_err(ts_err)?)
+        }
+        TsFn::NumNode => Value::Int4(tsquery::numnode(&query(&args[0]))),
+        TsFn::QueryTree => Value::Text(tsquery::querytree(&query(&args[0]))),
+        TsFn::QueryAnd => {
+            Value::Tsquery(tsquery::and(&query(&args[0]), &query(&args[1])).map_err(ts_err)?)
+        }
+        TsFn::QueryOr => {
+            Value::Tsquery(tsquery::or(&query(&args[0]), &query(&args[1])).map_err(ts_err)?)
+        }
+        TsFn::QueryNot => Value::Tsquery(tsquery::not(&query(&args[0])).map_err(ts_err)?),
+        TsFn::QueryPhrase => {
+            Value::Tsquery(tsquery::phrase(&query(&args[0]), &query(&args[1]), 1).map_err(ts_err)?)
+        }
+        TsFn::QueryPhraseDist => {
+            let dist = match &args[2] {
+                Value::Int4(n) => *n,
+                other => unreachable!("expected int4 distance, got {other:?}"),
+            };
+            // Same range the `<N>` operator accepts. Without this an out-of-range
+            // distance would build a tsquery whose text form no longer re-parses.
+            let dist = u16::try_from(dist)
+                .ok()
+                .filter(|d| u32::from(*d) <= tsquery::MAX_DISTANCE)
+                .ok_or_else(|| {
+                    ExecError::new(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "distance in phrase operator must be an integer value between zero and 16384 inclusive",
+                    )
+                })?;
+            Value::Tsquery(
+                tsquery::phrase(&query(&args[0]), &query(&args[1]), dist).map_err(ts_err)?,
+            )
+        }
+    })
 }
 
 fn json_err(e: crabgresql_types::json::JsonError) -> ExecError {
