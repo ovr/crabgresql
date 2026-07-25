@@ -11,12 +11,13 @@ use std::cmp::Ordering;
 use crabgresql_binder::{BinOp, BoundExpr, ScalarFn, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
+use crabgresql_types::text::quote_ident;
 use crabgresql_types::{
     Inet, Interval, Numeric, PgType, TimeTz, Value, bit, cast, collation, date, float, interval,
     json, money, net, time, timetz,
 };
 
-use crate::{ExecContext, ExecError};
+use crate::{CatalogOps, ExecContext, ExecError};
 
 pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     match expr {
@@ -79,7 +80,7 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             // `format_type` / `pg_get_expr` are non-strict in a way the pure
             // `eval_scalar` cannot express (`format_type` returns a name for a
             // NULL modifier), so they are dispatched here.
-            if let Some(result) = eval_deparse_fn(*func, &arg_values) {
+            if let Some(result) = eval_deparse_fn(*func, &arg_values, ctx) {
                 return result;
             }
             // The catalog functions read the session's pg_catalog snapshot, which
@@ -381,71 +382,109 @@ fn eval_catalog_fn(
 /// for any other function (the caller falls back to the pure `eval_scalar`).
 /// These run ahead of `eval_scalar` because they are not uniformly STRICT:
 /// `format_type` must return a type name when only its modifier is NULL.
-fn eval_deparse_fn(func: ScalarFn, args: &[Value]) -> Option<Result<Value, ExecError>> {
+fn eval_deparse_fn(
+    func: ScalarFn,
+    args: &[Value],
+    ctx: &ExecContext,
+) -> Option<Result<Value, ExecError>> {
     match func {
-        ScalarFn::FormatType => Some(Ok(eval_format_type(args))),
-        // `pg_get_expr` echoes the already-deparsed SQL text crabgresql stores
-        // (a column default's `adbin`, a partition's `relpartbound`). A NULL
-        // node yields NULL, as in PG.
+        ScalarFn::FormatType => Some(Ok(eval_format_type(args, ctx))),
+        // `pg_get_expr` echoes the SQL text crabgresql stores in place of a
+        // `pg_node_tree`: a partition's `relpartbound` is deparsed when the row
+        // is built (see `crabgresql_catalog`'s `deparse_partbound`). A column
+        // default's `adbin` is the statement's own expression text rather than a
+        // canonical deparse, so it prints as written — `nextval('s')` where
+        // PostgreSQL prints `nextval('s'::regclass)`, and `'x'` where PostgreSQL
+        // prints `'x'::text`. A NULL node yields NULL, as in PG.
         ScalarFn::PgGetExpr => Some(Ok(args[0].clone())),
         _ => None,
     }
 }
 
 /// `format_type(oid, typmod)`. A NULL oid yields NULL; oid `0` is `-`; an oid
-/// this build does not model is `???`. The modifier is decoded in PostgreSQL's
-/// `atttypmod` encoding (see `crabgresql_catalog`'s `atttypmod_of`), so this is
-/// the inverse that reproduces PG's `\d` type strings.
-fn eval_format_type(args: &[Value]) -> Value {
+/// nothing in the catalog claims is `???`. The modifier is decoded in
+/// PostgreSQL's `atttypmod` encoding (see `crabgresql_catalog`'s
+/// `atttypmod_of`), so this is the inverse that reproduces PG's `\d` strings.
+///
+/// A NULL modifier and the `-1` modifier are *not* the same input: PostgreSQL
+/// tracks whether one was given at all, and `bpchar` reports itself differently
+/// for each (see [`format_type_text`]).
+fn eval_format_type(args: &[Value], ctx: &ExecContext) -> Value {
     let oid = match &args[0] {
         Value::Null => return Value::Null,
         v => oid_of(v),
     };
-    // A NULL (or absent) modifier means "no modifier applied".
     let typmod = match args.get(1) {
-        Some(Value::Int4(m)) if *m >= 0 => Some(*m),
+        Some(Value::Int4(m)) => Some(*m),
+        // Absent or SQL NULL: no modifier was given.
         _ => None,
     };
-    Value::Text(format_type_text(oid, typmod))
+    Value::Text(format_type_text(oid, typmod, ctx.catalog.as_deref()))
 }
 
 /// The body of `format_type`: PostgreSQL's SQL spelling of type `oid` with
-/// `typmod` (its `atttypmod` encoding) applied.
-fn format_type_text(oid: u32, typmod: Option<i32>) -> String {
+/// `typmod` applied. `typmod` is `None` when no modifier was given at all and
+/// `Some(m)` for one that was — including `Some(-1)`, the "no modifier" value
+/// `pg_attribute` stores, which PostgreSQL still distinguishes from `None`.
+///
+/// Each type prints its modifier only above its own threshold, matching the
+/// `typmodout` functions (probed against PostgreSQL 18.4): the character types
+/// need more than the four-byte varlena header they reserve, `numeric` needs at
+/// least that header, and the rest need only a non-negative value. Below the
+/// threshold PostgreSQL prints the bare type name rather than a nonsensical
+/// `character varying(-2)`.
+///
+/// Two deliberate gaps, neither reachable from a crabgresql catalog row (both
+/// need a modifier this build never stores): `interval`'s modifier packs range
+/// bits and is printed bare rather than decoded, and PostgreSQL's generic
+/// fallback for a type with no `typmodout` (`format_type(25, 5)` → `text(5)`)
+/// is not reproduced.
+fn format_type_text(oid: u32, typmod: Option<i32>, catalog: Option<&dyn CatalogOps>) -> String {
     // VARHDRSZ: character types encode `length + 4` (see `atttypmod_of`).
     const VARHDRSZ: i32 = 4;
     if oid == 0 {
         return "-".to_string();
     }
     let Some(ty) = PgType::from_oid(oid) else {
-        // A user type would resolve through `CatalogOps::type_name` (a follow-up
-        // once that lookup lands); a genuinely unknown OID is `???`, as in PG.
-        return "???".to_string();
+        // Not a built-in: a `CREATE TYPE` type resolves through the catalog, the
+        // same lookup `regtype` renders through, so the two agree on a name.
+        // Anything else is `???`, as in PG.
+        return catalog
+            .and_then(|ops| ops.user_type_name(oid))
+            .map_or_else(|| "???".to_string(), |(_, name)| quote_ident(&name));
     };
     // An array formats its element type (carrying the modifier) with `[]`.
     if let PgType::Array(elem) = ty {
-        return format!("{}[]", format_type_text(elem, typmod));
+        return format!("{}[]", format_type_text(elem, typmod, catalog));
     }
     let name = ty.name();
     let Some(m) = typmod else {
         return name.to_string();
     };
     match ty {
-        PgType::Numeric => {
+        PgType::Numeric if m >= VARHDRSZ => {
             let m = m - VARHDRSZ;
-            format!("numeric({},{})", m >> 16, m & 0xffff)
+            // The scale is an 11-bit *signed* field, so `numeric(4,-2)` round
+            // trips; the precision is masked to the 16 bits above it.
+            let precision = (m >> 16) & 0xffff;
+            let scale = (((m & 0x7ff) ^ 1024) - 1024) as i16;
+            format!("numeric({precision},{scale})")
         }
-        PgType::Varchar => format!("character varying({})", m - VARHDRSZ),
-        PgType::Bpchar => format!("character({})", m - VARHDRSZ),
-        PgType::Bit => format!("bit({m})"),
-        PgType::Varbit => format!("bit varying({m})"),
+        PgType::Varchar if m > VARHDRSZ => format!("character varying({})", m - VARHDRSZ),
+        PgType::Bpchar if m > VARHDRSZ => format!("character({})", m - VARHDRSZ),
+        // `bpchar` is the one type that reports which spelling it was asked
+        // about: given a modifier it cannot print, it is `bpchar`; given none at
+        // all it is `character`. An unmodified `bpchar` column stores -1, so
+        // this is the arm `\d` takes for one.
+        PgType::Bpchar => "bpchar".to_string(),
+        PgType::Bit if m >= 0 => format!("bit({m})"),
+        PgType::Varbit if m >= 0 => format!("bit varying({m})"),
         // The precision goes *before* the "with[out] time zone" suffix.
-        PgType::Time => format!("time({m}) without time zone"),
-        PgType::TimeTz => format!("time({m}) with time zone"),
-        PgType::Timestamp => format!("timestamp({m}) without time zone"),
-        PgType::TimestampTz => format!("timestamp({m}) with time zone"),
-        // `interval`'s typmod packs range+precision bits; crabgresql never
-        // persists one, so a modifier here is printed as the bare type name.
+        PgType::Time if m >= 0 => format!("time({m}) without time zone"),
+        PgType::TimeTz if m >= 0 => format!("time({m}) with time zone"),
+        PgType::Timestamp if m >= 0 => format!("timestamp({m}) without time zone"),
+        PgType::TimestampTz if m >= 0 => format!("timestamp({m}) with time zone"),
+        // Below its type's threshold a modifier prints nothing at all.
         _ => name.to_string(),
     }
 }
@@ -481,8 +520,14 @@ fn missing_catalog() -> ExecError {
 fn seq_ref_owned(v: &Value, ctx: &ExecContext) -> Option<(Option<String>, String)> {
     match v {
         Value::Reg(r) => {
-            let (ns, name) = ctx.catalog.as_deref()?.rel_name(r.oid)?;
-            Some((Some(ns), name))
+            let ops = ctx.catalog.as_deref()?;
+            let (ns, name) = ops.rel_name(r.oid)?;
+            // Qualify only what an unqualified name would not reach, so an error
+            // about a visible relation names it the way the caller wrote it —
+            // `"s" is not a sequence`, matching both the `text` spelling of
+            // these functions and PG.
+            let ns = (ops.table_is_visible(r.oid) != Some(true)).then_some(ns);
+            Some((ns, name))
         }
         other => {
             let (ns, name) = seq_ref(other);
@@ -1050,7 +1095,14 @@ fn numeric_error(e: crabgresql_types::numeric::NumErr) -> ExecError {
 #[cfg(test)]
 mod format_type_tests {
     use super::{eval_format_type, format_type_text};
+    use crate::{CatalogOps, ExecContext};
     use crabgresql_types::{Value, oid};
+    use std::sync::Arc;
+
+    /// `format_type` with no catalog behind it — the built-in-only path.
+    fn ft(oid: u32, typmod: Option<i32>) -> String {
+        format_type_text(oid, typmod, None)
+    }
 
     /// Every expectation here was probed against PostgreSQL 18.4
     /// (`SELECT format_type(oid, typmod)`). The modifier is in PG's `atttypmod`
@@ -1058,7 +1110,6 @@ mod format_type_tests {
     /// is the decode side of that contract.
     #[test]
     fn format_type_matches_postgres() {
-        let ft = format_type_text;
         // No modifier: the plain SQL spelling, which is not the `typname`
         // (`integer`, not `int4`).
         assert_eq!(ft(oid::INT4, None), "integer");
@@ -1094,28 +1145,111 @@ mod format_type_tests {
         assert_eq!(ft(999_999, None), "???");
     }
 
+    /// A modifier below its type's threshold prints nothing, rather than a
+    /// negative or zero length that is not valid SQL. The thresholds differ per
+    /// type and were probed: the character types need more than the four-byte
+    /// header they reserve, `numeric` needs at least it, the rest need only a
+    /// non-negative value.
+    #[test]
+    fn modifier_below_its_threshold_prints_nothing() {
+        assert_eq!(ft(oid::VARCHAR, Some(2)), "character varying");
+        assert_eq!(ft(oid::VARCHAR, Some(4)), "character varying");
+        assert_eq!(ft(oid::VARCHAR, Some(5)), "character varying(1)");
+        assert_eq!(ft(oid::BPCHAR, Some(4)), "bpchar");
+        assert_eq!(ft(oid::BPCHAR, Some(5)), "character(1)");
+        assert_eq!(ft(oid::NUMERIC, Some(3)), "numeric");
+        assert_eq!(ft(oid::NUMERIC, Some(4)), "numeric(0,0)");
+        assert_eq!(ft(oid::NUMERIC, Some(5)), "numeric(0,1)");
+        assert_eq!(ft(oid::TIMESTAMP, Some(-1)), "timestamp without time zone");
+        assert_eq!(ft(oid::VARBIT, Some(-1)), "bit varying");
+    }
+
+    /// `numeric`'s scale is an 11-bit *signed* field and its precision is masked
+    /// to the 16 bits above it, so a negative-scale numeric round trips.
+    #[test]
+    fn numeric_scale_is_signed() {
+        // PostgreSQL stores numeric(4,-2) as atttypmod 264194.
+        assert_eq!(ft(oid::NUMERIC, Some(264_194)), "numeric(4,-2)");
+        assert_eq!(ft(oid::NUMERIC, Some(i32::MAX)), "numeric(32767,-5)");
+    }
+
+    /// `bpchar` is the one type that distinguishes "a modifier was given, but it
+    /// is the no-modifier value" from "no modifier at all": the former is
+    /// `bpchar`, the latter `character`. An unmodified `bpchar` column stores
+    /// `-1`, so this is what `\d` prints for one.
+    #[test]
+    fn bpchar_reports_which_spelling_it_was_asked_about() {
+        assert_eq!(ft(oid::BPCHAR, None), "character");
+        assert_eq!(ft(oid::BPCHAR, Some(-1)), "bpchar");
+        // Only bpchar does this; varchar reads the same either way.
+        assert_eq!(ft(oid::VARCHAR, None), "character varying");
+        assert_eq!(ft(oid::VARCHAR, Some(-1)), "character varying");
+    }
+
+    /// A `CREATE TYPE` type resolves through the catalog rather than falling to
+    /// `???`, so `format_type` and `regtype` agree on what to call it.
+    #[test]
+    fn user_type_resolves_through_the_catalog() {
+        struct OneEnum;
+        impl CatalogOps for OneEnum {
+            fn role_name(&self, _oid: u32) -> Option<String> {
+                None
+            }
+            fn table_is_visible(&self, _oid: u32) -> Option<bool> {
+                None
+            }
+            fn rel_name(&self, _oid: u32) -> Option<(String, String)> {
+                None
+            }
+            fn rel_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
+                None
+            }
+            fn namespace_name(&self, _oid: u32) -> Option<String> {
+                None
+            }
+            fn namespace_oid(&self, _name: &str) -> Option<u32> {
+                None
+            }
+            fn user_type_name(&self, oid: u32) -> Option<(String, String)> {
+                (oid == 16_384).then(|| ("public".to_string(), "mood".to_string()))
+            }
+            fn user_type_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
+                None
+            }
+        }
+
+        let ctx = ExecContext {
+            catalog: Some(Arc::new(OneEnum)),
+            ..ExecContext::default()
+        };
+        assert_eq!(
+            eval_format_type(&[Value::Oid(16_384), Value::Int4(-1)], &ctx),
+            Value::Text("mood".to_string())
+        );
+        // An OID the catalog does not claim is still `???`.
+        assert_eq!(
+            eval_format_type(&[Value::Oid(999_999), Value::Int4(-1)], &ctx),
+            Value::Text("???".to_string())
+        );
+    }
+
     /// The argument-level contract: `format_type` is strict in its OID but *not*
     /// in its modifier — a NULL modifier means "no modifier", which is why this
     /// function bypasses `eval_scalar`'s STRICT short-circuit. psql's sequence
     /// query relies on it (`format_type(seqtypid, NULL)`).
     #[test]
     fn null_oid_is_null_but_null_typmod_is_no_modifier() {
+        let ctx = ExecContext::default();
         assert_eq!(
-            eval_format_type(&[Value::Null, Value::Int4(24)]),
+            eval_format_type(&[Value::Null, Value::Int4(24)], &ctx),
             Value::Null
         );
         assert_eq!(
-            eval_format_type(&[Value::Oid(oid::VARCHAR), Value::Null]),
-            Value::Text("character varying".to_string())
-        );
-        // -1 is the "no modifier" sentinel `pg_attribute` stores, and reads the
-        // same as NULL.
-        assert_eq!(
-            eval_format_type(&[Value::Oid(oid::VARCHAR), Value::Int4(-1)]),
+            eval_format_type(&[Value::Oid(oid::VARCHAR), Value::Null], &ctx),
             Value::Text("character varying".to_string())
         );
         assert_eq!(
-            eval_format_type(&[Value::Oid(oid::VARCHAR), Value::Int4(24)]),
+            eval_format_type(&[Value::Oid(oid::VARCHAR), Value::Int4(24)], &ctx),
             Value::Text("character varying(20)".to_string())
         );
     }

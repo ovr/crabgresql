@@ -418,19 +418,41 @@ pub fn pg_class_schema() -> TableSchema {
     )
 }
 
-/// Deparse a leaf partition's `relpartbound` to the canonical text PostgreSQL's
+/// Deparse a leaf partition's `relpartbound` to the text PostgreSQL's
 /// `pg_get_expr(relpartbound, oid)` prints — `FOR VALUES FROM (…) TO (…)`. Only
-/// RANGE partitions exist, so only the range form is produced. Numeric bounds
-/// print bare; every other literal is single-quoted (embedded quotes doubled);
-/// `MINVALUE`/`MAXVALUE` print as the bare keywords. Storing the final text (not
-/// a node tree) is a deliberate deviation: `pg_get_expr` then just echoes it.
+/// RANGE partitions exist, so only the range form is produced. `MINVALUE`/
+/// `MAXVALUE` print as bare keywords. Storing the final text (not a node tree)
+/// is a deliberate deviation: `pg_get_expr` then just echoes it.
+///
+/// Quoting follows what PostgreSQL 18.4 was observed to print: `true`/`false`
+/// bare, a non-negative integer bare, and everything else single-quoted with
+/// embedded quotes doubled — including negative numbers (`'-10'`), floats,
+/// dates, and strings.
+///
+/// Fidelity note: PostgreSQL actually decides this from the *parse* of the
+/// bound, printing a literal bare only when it needed no coercion to the key
+/// type — so with an `int8` key even `5` prints as `'5'`, while with an `int4`
+/// key it prints bare. crabgresql stores the bound already coerced to the key
+/// type and does not record whether a coercion happened, so it cannot make that
+/// distinction; the rule above matches PostgreSQL for the `int4`, boolean, and
+/// text keys in practice and quotes (the safe, re-parseable form) otherwise.
 fn deparse_partbound(part: &PartitionOf) -> String {
     let datum = |d: &PartitionBoundDatum| match d {
         PartitionBoundDatum::MinValue => "MINVALUE".to_string(),
         PartitionBoundDatum::MaxValue => "MAXVALUE".to_string(),
         PartitionBoundDatum::Value(v) => {
+            // A boolean bound is an SQL keyword, not a string: PG prints
+            // `false`, never the `'f'` of the wire encoding — which would not
+            // even re-parse as a bool bound.
+            if let Value::Bool(b) = v {
+                return if *b { "true" } else { "false" }.to_string();
+            }
             let text = v.encode_text().unwrap_or_default();
-            if v.pg_type().is_some_and(PgType::is_numeric) {
+            let bare = match v {
+                Value::Int2(_) | Value::Int4(_) | Value::Int8(_) => !text.starts_with('-'),
+                _ => false,
+            };
+            if bare {
                 text
             } else {
                 format!("'{}'", text.replace('\'', "''"))
@@ -677,11 +699,17 @@ pub fn pg_attribute_schema() -> TableSchema {
 /// - a **view**'s columns: a view records its output columns without a modifier
 ///   (`OutputColumn` carries no typmod), so `\d v` prints `character varying`
 ///   where PostgreSQL prints `character varying(20)`.
+///
+/// The addition saturates rather than wrapping: DDL rejects a length beyond
+/// PostgreSQL's limit ([`crabgresql_types::text::MAX_CHAR_LENGTH`]), so a value
+/// that could overflow is unreachable through a `CREATE TABLE` — but this runs
+/// against whatever a data directory already holds, and building a catalog row
+/// must never panic the session that reads `pg_attribute`.
 fn atttypmod_of(column: &Column) -> i32 {
     const VARHDRSZ: i32 = 4;
     match column.ty {
         _ if column.typmod < 0 => -1,
-        PgType::Varchar | PgType::Bpchar => column.typmod + VARHDRSZ,
+        PgType::Varchar | PgType::Bpchar => column.typmod.saturating_add(VARHDRSZ),
         _ => column.typmod,
     }
 }

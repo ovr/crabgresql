@@ -1822,7 +1822,10 @@ fn execute_create_table(
             Some(base) => base,
             None => resolve_column_type(type_catalog, &col.data_type)?,
         };
-        let typmod = crabgresql_binder::length_typmod(&col.data_type).unwrap_or(-1);
+        reject_stored_reg_type(ty, &column_name)?;
+        // Checked, not bare `length_typmod`: an out-of-range length would be
+        // stored on the column and later overflow `pg_attribute.atttypmod`.
+        let typmod = crabgresql_binder::checked_length_typmod(&col.data_type)?.unwrap_or(-1);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
         if let Some(base) = serial_base {
             // Name the sequence `t_col_seq`, dodging existing relations and any
@@ -2528,6 +2531,11 @@ fn execute_create_table_as(
         }
     }
 
+    // A projected `reg*` cannot be stored, for the same reason a declared one
+    // cannot (see `reject_stored_reg_type`).
+    for c in &cols {
+        reject_stored_reg_type(c.ty, &c.name)?;
+    }
     let schema = TableSchema {
         name: name.clone(),
         namespace: namespace.clone(),
@@ -2760,6 +2768,35 @@ fn map_data_type(dt: &ast::DataType) -> Result<PgType, PgError> {
 /// custom identifier — a `CREATE TYPE` name from the catalog (e.g. an enum),
 /// yielding `PgType::User(oid)`. A bare name that is neither is an
 /// undefined-object error (42704), matching PG (and `resolve_type_ref`).
+/// Refuse to give a stored column a `reg*` type.
+///
+/// A `reg*` value is an OID, and its whole contract is that the OID keeps
+/// naming the same object. crabgresql assigns relation OIDs positionally per
+/// catalog snapshot (`SystemCatalog::relation_oids`) rather than durably, so
+/// unrelated DDL renumbers them: a stored `regclass` would silently come to name
+/// a *different* relation, and equality against a freshly cast value would go
+/// false. Rejecting the column is the honest boundary until relation OIDs are
+/// persistent — using `reg*` in expressions (casts, comparisons, the catalog
+/// queries psql sends) is unaffected, since those resolve within one snapshot.
+fn reject_stored_reg_type(ty: PgType, column: &str) -> Result<(), PgError> {
+    let kind = match ty {
+        PgType::Reg(kind) => Some(kind),
+        PgType::Array(elem) => match PgType::from_oid(elem) {
+            Some(PgType::Reg(kind)) => Some(kind),
+            _ => None,
+        },
+        _ => None,
+    };
+    match kind {
+        None => Ok(()),
+        Some(kind) => Err(PgError::feature_not_supported(format!(
+            "column \"{column}\" cannot have type {} because relation OIDs are \
+             not stable across schema changes yet",
+            kind.typname()
+        ))),
+    }
+}
+
 fn resolve_column_type(
     type_catalog: &Arc<dyn TypeCatalog>,
     dt: &ast::DataType,

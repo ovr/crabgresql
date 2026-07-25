@@ -17,7 +17,7 @@ use crabgresql_storage_api::{Column, EnumInfo, TableEngine, TableSchema, TypeCat
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
-    Numeric, PgType, Reg, RegKind, Value, cast, date, float, interval, money, parse_bool, time,
+    Numeric, PgType, RegKind, Value, cast, date, float, interval, money, parse_bool, time,
     timestamp, timestamptz, timetz,
 };
 
@@ -2429,6 +2429,25 @@ fn bind_cast(
     if let PgType::Reg(kind) = target {
         return Ok(Binding::Typed(bind_reg_cast(inner, kind, scope)?));
     }
+    // `ARRAY[…]::reg*[]`: cast each element, for the same reason. A value-level
+    // array cast cannot do this — coercing an element needs a catalog lookup,
+    // not a pure conversion — so casting an existing `text[]` *expression* to
+    // `reg*[]` is still unsupported; only the constructor spelling resolves.
+    if let ast::Expr::Array(arr) = inner
+        && let PgType::Array(elem_oid) = target
+        && let Some(PgType::Reg(kind)) = PgType::from_oid(elem_oid)
+    {
+        let elems = arr
+            .elem
+            .iter()
+            .map(|e| bind_reg_cast(e, kind, scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Binding::Typed(BoundExpr::ArrayCtor {
+            elem: PgType::Reg(kind),
+            ty: target,
+            elems,
+        }));
+    }
     let expr = match bind_expr(inner, scope)? {
         Binding::Unknown { lit, span, param } => {
             resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, target)?
@@ -2665,6 +2684,54 @@ pub fn length_typmod(dt: &ast::DataType) -> Option<i32> {
     }
 }
 
+/// The largest `character`/`character varying` length PostgreSQL accepts, and
+/// the largest `bit`/`bit varying` one. Probed against 18.4, which rejects both
+/// ends of the range (`varchar(0)` and `varchar(10485761)`) with 22023.
+const MAX_CHAR_LENGTH: u64 = 10_485_760;
+const MAX_BIT_LENGTH: u64 = 83_886_080;
+
+/// [`length_typmod`] with PostgreSQL's declared-length bounds enforced.
+///
+/// Worth having separately from `length_typmod`, which cannot report an error:
+/// an unchecked length is not merely accepted-but-odd, it reaches
+/// `pg_attribute` as a stored `atttypmod`, where PostgreSQL's `n + VARHDRSZ`
+/// encoding would overflow `i32` and take down every later reader of the
+/// catalog. Rejecting the DDL is also what PostgreSQL does, and the error names
+/// the type by its `typname` (`char`, not `character`), as PG's does.
+pub fn checked_length_typmod(dt: &ast::DataType) -> Result<Option<i32>, BindError> {
+    use ast::DataType;
+    fn declared(l: &Option<ast::CharacterLength>) -> Option<u64> {
+        match l {
+            Some(ast::CharacterLength::IntegerLength { length, .. }) => Some(*length),
+            _ => None,
+        }
+    }
+    let (length, typname, max) = match dt {
+        DataType::Char(l) | DataType::Character(l) => (declared(l), "char", MAX_CHAR_LENGTH),
+        DataType::Varchar(l) | DataType::CharacterVarying(l) => {
+            (declared(l), "varchar", MAX_CHAR_LENGTH)
+        }
+        DataType::Bit(n) => (*n, "bit", MAX_BIT_LENGTH),
+        DataType::BitVarying(n) | DataType::VarBit(n) => (*n, "varbit", MAX_BIT_LENGTH),
+        // No other type carries a length modifier here.
+        _ => return Ok(None),
+    };
+    if let Some(n) = length {
+        let invalid = |message: String| BindError::new(sqlstate::INVALID_PARAMETER_VALUE, message);
+        if n < 1 {
+            return Err(invalid(format!(
+                "length for type {typname} must be at least 1"
+            )));
+        }
+        if n > max {
+            return Err(invalid(format!(
+                "length for type {typname} cannot exceed {max}"
+            )));
+        }
+    }
+    Ok(length_typmod(dt))
+}
+
 /// Apply a `varchar(n)`/`char(n)` length coercion, or a `name` truncation, when
 /// the target is one of those types. Constant inputs fold at bind time.
 pub(crate) fn apply_length_typmod_if_any(
@@ -2673,19 +2740,19 @@ pub(crate) fn apply_length_typmod_if_any(
     data_type: &ast::DataType,
 ) -> Result<BoundExpr, BindError> {
     let (func, typmod) = match target {
-        PgType::Varchar => match length_typmod(data_type) {
+        PgType::Varchar => match checked_length_typmod(data_type)? {
             Some(n) => (ScalarFn::VarcharTypmod, Some(n)),
             None => return Ok(expr),
         },
-        PgType::Bpchar => match length_typmod(data_type) {
+        PgType::Bpchar => match checked_length_typmod(data_type)? {
             Some(n) => (ScalarFn::BpcharTypmod, Some(n)),
             None => return Ok(expr),
         },
-        PgType::Bit => match length_typmod(data_type) {
+        PgType::Bit => match checked_length_typmod(data_type)? {
             Some(n) => (ScalarFn::BitTypmod, Some(n)),
             None => return Ok(expr),
         },
-        PgType::Varbit => match length_typmod(data_type) {
+        PgType::Varbit => match checked_length_typmod(data_type)? {
             Some(n) => (ScalarFn::VarbitTypmod, Some(n)),
             None => return Ok(expr),
         },
@@ -4921,6 +4988,13 @@ fn implicit_castable(from: PgType, to: PgType) -> bool {
                 // literal resolves a `varbit` overload and vice versa.
                 | (Bit, Varbit)
                 | (Varbit, Bit)
+                // `reg* -> oid` is implicit in PG, which is how `oid =
+                // 't'::regclass` resolves (both sides become oid) — the shape
+                // psql's `\d` uses to match a relation. The reverse direction is
+                // implicit in PG too, but cannot be a pure value cast here: it
+                // has to resolve a name through the catalog, so `oid::regclass`
+                // stays an explicit cast lowering to `RegFromOid`.
+                | (Reg(_), Oid)
         )
 }
 
@@ -5332,6 +5406,36 @@ pub(crate) fn resolve_unknown(
         ctx.borrow_mut().resolve(index, ty)?;
         return Ok(BoundExpr::Param { index, ty });
     }
+    // A `reg*` literal names an object, and only the catalog can turn a name
+    // into an OID — which the binder does not hold. Emit the same runtime
+    // resolution an explicit `'t'::regclass` lowers to, so a literal that takes
+    // its type from a `reg*` context resolves the way PG's `regclassin` does
+    // instead of failing to fold here.
+    //
+    // Divergence: in a comparison PostgreSQL types the literal from the chosen
+    // operator, and `reg* = unknown` picks `oideq`, so PG reads the literal as
+    // an OID and rejects `'pg_class'::regclass = 'pg_class'` with "invalid input
+    // syntax for type oid". This binder types it from the other side and
+    // resolves the name, accepting it. Erring toward resolution keeps the
+    // literal usable wherever a `reg*` is expected; matching PG exactly would
+    // mean typing unknown operands from operator resolution.
+    if let PgType::Reg(kind) = ty {
+        let arg = match lit {
+            None => BoundExpr::Const {
+                value: Value::Null,
+                ty: PgType::Text,
+            },
+            Some(s) => BoundExpr::Const {
+                value: Value::Text(s),
+                ty: PgType::Text,
+            },
+        };
+        return Ok(BoundExpr::FuncCall {
+            func: ScalarFn::RegIn(kind),
+            ret: ty,
+            args: vec![arg],
+        });
+    }
     let value = match lit {
         None => Value::Null,
         Some(s) => parse_unknown(&s, ty).map_err(|e| e.at(span))?,
@@ -5445,17 +5549,13 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
                     BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))
                 })
         }
-        // A reg* literal names an object, and only the catalog can turn a name
-        // into an OID. The cast path resolves it at run time (`bind_reg_cast`);
-        // reaching here means a context that folds a literal with no catalog in
-        // hand, so only the numeric spelling can be honored.
-        PgType::Reg(kind) => match s.trim().parse::<u32>() {
-            Ok(oid) => Ok(Value::Reg(Reg::unresolved(kind, oid))),
-            Err(_) => Err(BindError::feature_not_supported(format!(
-                "resolving a {} name is not supported in this context",
-                kind.typname()
-            ))),
-        },
+        // Never reached: `resolve_unknown` intercepts a reg* literal and lowers
+        // it to the runtime `RegIn` resolution, because only the catalog can
+        // turn an object name into an OID and the binder holds none.
+        PgType::Reg(_) => Err(BindError::new(
+            sqlstate::INTERNAL_ERROR,
+            "reg* literal reached the constant folder",
+        )),
         PgType::User(_) => Err(invalid()),
     }
 }

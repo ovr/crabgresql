@@ -517,6 +517,106 @@ async fn psql_describe_listings_match_pg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A declared length beyond PostgreSQL's limit is rejected at DDL time, with
+/// PG's message and SQLSTATE. It must not be stored: `pg_attribute` encodes a
+/// character length as `n + 4`, so an unchecked one would overflow there and
+/// take down every later reader of the catalog — permanently, since the table
+/// outlives the session.
+#[tokio::test]
+async fn out_of_range_declared_length_is_rejected() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    for ddl in [
+        "CREATE TABLE t (a varchar(2147483647))",
+        "CREATE TABLE t (a varchar(10485761))",
+        "CREATE TABLE t (a char(10485761))",
+        "CREATE TABLE t (a bit(83886081))",
+        "CREATE TABLE t (a varchar(0))",
+    ] {
+        let err = client.simple_query(ddl).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(&SqlState::INVALID_PARAMETER_VALUE),
+            "{ddl} should be rejected as out of range"
+        );
+    }
+
+    // The catalog is still readable, and the session still usable.
+    client
+        .simple_query("CREATE TABLE t (a varchar(20), b char(4))")
+        .await?;
+    let attrs = client
+        .simple_query(
+            "SELECT a.attname, a.atttypmod, pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             FROM pg_catalog.pg_attribute a, pg_catalog.pg_class c \
+             WHERE c.relname = 't' AND a.attrelid = c.oid AND a.attnum > 0 ORDER BY a.attnum",
+        )
+        .await?;
+    let rows = rows(&attrs);
+    assert_eq!(
+        (rows[0].get(1), rows[0].get(2)),
+        (Some("24"), Some("character varying(20)"))
+    );
+    assert_eq!(
+        (rows[1].get(1), rows[1].get(2)),
+        (Some("8"), Some("character(4)"))
+    );
+
+    Ok(())
+}
+
+/// A `reg*` cannot be a stored column type. Its whole contract is that the OID
+/// keeps naming the same object, and crabgresql numbers relations positionally
+/// per catalog snapshot — so a stored value would silently come to name a
+/// different relation after unrelated DDL. Expression use is unaffected.
+#[tokio::test]
+async fn reg_types_are_rejected_as_stored_columns() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE zz (a int)").await?;
+
+    for ddl in [
+        "CREATE TABLE hold (r regclass)",
+        "CREATE TABLE hold (r regtype)",
+        "CREATE TABLE hold (r regclass[])",
+        "CREATE TABLE hold AS SELECT 'zz'::regclass AS r",
+    ] {
+        let err = client.simple_query(ddl).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(&SqlState::FEATURE_NOT_SUPPORTED),
+            "{ddl} should be rejected"
+        );
+    }
+
+    // ... while a reg* in an expression still resolves, in both directions.
+    let q = client
+        .simple_query(
+            "SELECT 'zz'::regclass::text, 'pg_class'::regclass::text, \
+             1259::regclass::text, 'pg_class'::regclass = 1259::regclass",
+        )
+        .await?;
+    let row = &rows(&q)[0];
+    assert_eq!(row.get(0), Some("zz"));
+    // A catalog relation resolves by name and by its fixed OID, and renders
+    // unqualified because `pg_catalog` is always reachable.
+    assert_eq!(row.get(1), Some("pg_class"));
+    assert_eq!(row.get(2), Some("pg_class"));
+    assert_eq!(row.get(3), Some("t"));
+
+    // `oid = regclass` resolves through the implicit reg* -> oid cast, the
+    // comparison shape psql's `\d` uses to find a relation.
+    let cmp = client
+        .simple_query("SELECT relname FROM pg_catalog.pg_class WHERE oid = 'zz'::regclass")
+        .await?;
+    assert_eq!(rows(&cmp)[0].get(0), Some("zz"));
+
+    Ok(())
+}
+
 /// The per-column query psql sends third for `\d <table>` / `\d <view>`,
 /// replayed verbatim but for the OID psql substitutes from its first query.
 /// This is the gate that the whole statement binds and runs: `format_type` over
