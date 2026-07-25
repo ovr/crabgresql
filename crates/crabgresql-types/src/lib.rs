@@ -116,6 +116,9 @@ pub mod oid {
     pub const INTERVAL_ARRAY: u32 = 1187;
     pub const BIT_ARRAY: u32 = 1561;
     pub const VARBIT_ARRAY: u32 = 1563;
+    pub const REGCLASS_ARRAY: u32 = 2210;
+    pub const REGTYPE_ARRAY: u32 = 2211;
+    pub const REGNAMESPACE_ARRAY: u32 = 4090;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

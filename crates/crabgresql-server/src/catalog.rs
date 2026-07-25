@@ -52,6 +52,12 @@ impl CatalogOps for SessionCatalogOps {
     /// Kept in step with `resolve` by `visibility_follows_resolution_order`
     /// below, which fails if the two disagree about a shadowed name.
     fn table_is_visible(&self, oid: u32) -> Option<bool> {
+        // A catalog relation is always reachable unqualified: `pg_catalog`
+        // precedes the rest of the path, so nothing in a user schema shadows
+        // it. (This is why `'pg_class'::regclass` renders bare, not qualified.)
+        if crabgresql_catalog::builtin_relation_name(oid).is_some() {
+            return Some(true);
+        }
         let (namespace, name) = self.system.relation_ref(oid)?;
         // 1. This session's temp namespace shadows everything.
         if self
@@ -62,9 +68,9 @@ impl CatalogOps for SessionCatalogOps {
             return Some(namespace == self.temp_schema);
         }
         // 2. Then pg_catalog. A user relation sharing a catalog relation's name
-        //    is unreachable unqualified, so it is not visible. (No pg_class row
-        //    carries a catalog namespace today — only live user relations are
-        //    reflected — so this arm only ever hides, never reveals.)
+        //    is unreachable unqualified, so it is not visible; the catalog
+        //    relation itself is (nothing shadows it, and `pg_catalog` is always
+        //    on the path).
         if self.system.has_catalog_relation(name) {
             return Some(namespace == "pg_catalog");
         }
@@ -73,6 +79,12 @@ impl CatalogOps for SessionCatalogOps {
     }
 
     fn rel_name(&self, oid: u32) -> Option<(String, String)> {
+        // A catalog relation has no `pg_class` row to look up — it answers from
+        // the fixed OID assignments instead, so `1259::regclass` renders as
+        // `pg_class` the way it does in PostgreSQL.
+        if let Some(name) = crabgresql_catalog::builtin_relation_name(oid) {
+            return Some(("pg_catalog".to_string(), name.to_string()));
+        }
         self.system
             .relation_ref(oid)
             .map(|(ns, name)| (ns.to_string(), name.to_string()))
@@ -82,13 +94,24 @@ impl CatalogOps for SessionCatalogOps {
     /// session's temp schema, then `pg_catalog`, then `public`. Asking the
     /// catalog for each in turn keeps `'t'::regclass` landing on the same
     /// relation a bare `SELECT * FROM t` would.
+    ///
+    /// The `pg_catalog` step goes through the fixed OID table rather than the
+    /// `pg_class` rows: catalog relations are not reflected into `pg_class`, so
+    /// they have no positional OID to find there.
     fn rel_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+        let in_catalog = |name: &str| {
+            self.system
+                .has_catalog_relation(name)
+                .then(|| crabgresql_catalog::builtin_relation_oid(name))
+                .flatten()
+        };
         match namespace {
+            Some("pg_catalog") => in_catalog(name),
             Some(ns) => self.system.relation_oid_in(ns, name),
             None => self
                 .system
                 .relation_oid_in(&self.temp_schema, name)
-                .or_else(|| self.system.relation_oid_in("pg_catalog", name))
+                .or_else(|| in_catalog(name))
                 .or_else(|| self.system.relation_oid_in("public", name)),
         }
     }

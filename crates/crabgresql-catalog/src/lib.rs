@@ -97,6 +97,52 @@ pub fn is_builtin_type_name(name: &str) -> bool {
     PG_TYPE_ROWS.iter().any(|row| row.typname == name)
 }
 
+/// PostgreSQL's fixed OIDs for the `pg_catalog` relations this build serves.
+///
+/// Catalog relations are not reflected into `pg_class` (only live user
+/// relations are), so they have no OID from the positional assignment
+/// [`SystemCatalog::relation_oids`] hands out. They still need one: a client
+/// identifies a relation by casting its name — `'pg_class'::regclass` — and
+/// expects the OID back to render as the name again. These are PostgreSQL's own
+/// assignments (probed from `pg_class` on 18.4) rather than invented values, so
+/// an OID a client hard-codes means the same thing here.
+///
+/// `builtin_relation_oid_is_complete` keeps this in step with what
+/// `build_pg_catalog` actually serves.
+const BUILTIN_RELATION_OIDS: &[(&str, u32)] = &[
+    ("pg_type", 1247),
+    ("pg_attribute", 1249),
+    ("pg_class", 1259),
+    ("pg_sequence", 2224),
+    ("pg_am", 2601),
+    ("pg_attrdef", 2604),
+    ("pg_cast", 2605),
+    ("pg_constraint", 2606),
+    ("pg_index", 2610),
+    ("pg_inherits", 2611),
+    ("pg_namespace", 2615),
+    ("pg_partitioned_table", 3350),
+    ("pg_collation", 3456),
+    ("pg_enum", 3501),
+];
+
+/// The fixed OID of the `pg_catalog` relation `name`, if this build serves one.
+pub fn builtin_relation_oid(name: &str) -> Option<u32> {
+    BUILTIN_RELATION_OIDS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, oid)| *oid)
+}
+
+/// The inverse of [`builtin_relation_oid`]: the `pg_catalog` relation `oid`
+/// names, if it is one of the fixed assignments.
+pub fn builtin_relation_name(oid: u32) -> Option<&'static str> {
+    BUILTIN_RELATION_OIDS
+        .iter()
+        .find(|(_, o)| *o == oid)
+        .map(|(name, _)| *name)
+}
+
 /// The relation kind reflected into `pg_class.relkind` / `information_schema`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelKind {
@@ -1000,6 +1046,16 @@ mod tests {
                     PartitionBoundDatum::MinValue,
                     PartitionBoundDatum::Value(Value::Text("it's".to_string())),
                 )),
+                CatalogRelation::permanent(leaf(
+                    "part_bool",
+                    PartitionBoundDatum::Value(Value::Bool(false)),
+                    PartitionBoundDatum::Value(Value::Bool(true)),
+                )),
+                CatalogRelation::permanent(leaf(
+                    "part_neg",
+                    PartitionBoundDatum::Value(Value::Int4(-10)),
+                    PartitionBoundDatum::Value(Value::Int4(0)),
+                )),
             ]
         });
 
@@ -1055,6 +1111,16 @@ mod tests {
             cell("part_txt", "relpartbound")?,
             Value::Text("FOR VALUES FROM (MINVALUE) TO ('it''s')".to_string())
         );
+        // A boolean bound is a keyword, and a negative number is quoted — both
+        // as PostgreSQL prints them, and `'f'` would not even re-parse.
+        assert_eq!(
+            cell("part_bool", "relpartbound")?,
+            Value::Text("FOR VALUES FROM (false) TO (true)".to_string())
+        );
+        assert_eq!(
+            cell("part_neg", "relpartbound")?,
+            Value::Text("FOR VALUES FROM ('-10') TO (0)".to_string())
+        );
 
         Ok(())
     }
@@ -1105,6 +1171,76 @@ mod tests {
         // as the empty string rather than NULL — psql projects both directly.
         assert_eq!(cell("i", "attidentity")?, Value::Text(String::new()));
         assert_eq!(cell("i", "attgenerated")?, Value::Text(String::new()));
+
+        Ok(())
+    }
+
+    /// Building `pg_attribute` must not panic on a length that would overflow
+    /// PostgreSQL's `n + VARHDRSZ` encoding. DDL rejects such a length, so this
+    /// is only reachable from a data directory that already holds one — where a
+    /// panic would make the catalog permanently unreadable rather than merely
+    /// misreport a column.
+    #[test]
+    fn oversized_typmod_saturates_instead_of_panicking() -> anyhow::Result<()> {
+        use crabgresql_storage_api::{Column, TableSchema};
+        use crabgresql_types::PgType;
+
+        let cat = SystemCatalog::with_relations(vec![TableSchema::new(
+            "t",
+            vec![Column::with_typmod("v", PgType::Varchar, i32::MAX)],
+        )]);
+        let (schema, rows) = required(
+            cat.build_pg_catalog("pg_attribute"),
+            "pg_attribute is missing",
+        )?;
+        let i = required(schema.column_index("atttypmod"), "atttypmod is missing")?;
+        assert_eq!(rows[0][i], Value::Int4(i32::MAX));
+
+        Ok(())
+    }
+
+    /// Every `pg_catalog` relation this build serves has a fixed OID, and the
+    /// mapping round trips. Without this a newly served relation would be
+    /// nameable in a query but not castable to `regclass`, which is the exact
+    /// gap the OID table exists to close.
+    #[test]
+    fn builtin_relation_oids_cover_every_served_relation() -> anyhow::Result<()> {
+        let cat = SystemCatalog::new();
+        for (name, oid) in BUILTIN_RELATION_OIDS {
+            assert!(
+                cat.has_catalog_relation(name),
+                "{name} has a fixed OID but is not served"
+            );
+            assert_eq!(builtin_relation_oid(name), Some(*oid));
+            assert_eq!(builtin_relation_name(*oid), Some(*name));
+        }
+        // The other direction: nothing served is missing from the table. The
+        // served set is only reachable by name, so it is listed here explicitly.
+        for name in [
+            "pg_type",
+            "pg_enum",
+            "pg_namespace",
+            "pg_class",
+            "pg_attribute",
+            "pg_attrdef",
+            "pg_constraint",
+            "pg_index",
+            "pg_am",
+            "pg_cast",
+            "pg_collation",
+            "pg_inherits",
+            "pg_partitioned_table",
+            "pg_sequence",
+        ] {
+            assert!(cat.has_catalog_relation(name), "{name} is not served");
+            assert!(
+                builtin_relation_oid(name).is_some(),
+                "{name} is served but has no fixed OID"
+            );
+        }
+        // A relation that is not a catalog one has no fixed OID.
+        assert_eq!(builtin_relation_oid("no_such_catalog"), None);
+        assert_eq!(builtin_relation_name(0), None);
 
         Ok(())
     }

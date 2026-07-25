@@ -106,6 +106,21 @@ SELECT pg_catalog.format_type(1043, NULL) AS unmodified,
        pg_catalog.format_type(NULL, 24) IS NULL AS null_type,
        pg_catalog.format_type(0, NULL) AS zero,
        pg_catalog.format_type(999999, NULL) AS unknown;
+-- a modifier below its type's threshold prints nothing rather than a negative
+-- length: the character types need more than the four-byte header they
+-- reserve, numeric needs at least it
+SELECT pg_catalog.format_type(1043, 2) AS vc_below,
+       pg_catalog.format_type(1043, 4) AS vc_at,
+       pg_catalog.format_type(1043, 5) AS vc_above,
+       pg_catalog.format_type(1700, 3) AS num_below,
+       pg_catalog.format_type(1700, 4) AS num_at;
+-- numeric's scale is a *signed* 11-bit field, so a negative scale round trips
+SELECT pg_catalog.format_type(1700, 264194) AS neg_scale,
+       pg_catalog.format_type(1700, 2147483647) AS max_modifier;
+-- `bpchar` is the one type that distinguishes "a modifier was given, but it is
+-- the no-modifier value" from "no modifier at all"
+SELECT pg_catalog.format_type(1042, -1) AS given_none,
+       pg_catalog.format_type(1042, NULL) AS not_given;
 CREATE TABLE dfmt_t (id int PRIMARY KEY, code varchar(20), tag char(4), mask bit(5), note text);
 -- pg_attribute reports atttypmod in PostgreSQL's encoding, so format_type over
 -- it reproduces `\d`'s Type column. No column is an identity or generated one,
@@ -150,6 +165,8 @@ SELECT c.relname, c.relkind, c.relchecks, c.relhasrules, c.relhastriggers,
 CREATE TABLE dfmt_p (a int, b text) PARTITION BY RANGE (a);
 CREATE TABLE dfmt_p1 PARTITION OF dfmt_p FOR VALUES FROM (1) TO (10);
 CREATE TABLE dfmt_p2 PARTITION OF dfmt_p FOR VALUES FROM (10) TO (MAXVALUE);
+-- a negative bound is quoted, where a non-negative one is bare
+CREATE TABLE dfmt_p3 PARTITION OF dfmt_p FOR VALUES FROM (MINVALUE) TO (-10);
 -- a leaf partition's bound, deparsed back to SQL. The partitioned parent itself
 -- has no bound.
 SELECT c.relname, c.relkind, c.relispartition,
@@ -157,6 +174,13 @@ SELECT c.relname, c.relkind, c.relispartition,
   FROM pg_catalog.pg_class c
  WHERE c.relname LIKE 'dfmt_p%'
  ORDER BY 1;
+-- a boolean bound is an SQL keyword, not the `t`/`f` of the wire encoding
+CREATE TABLE dfmt_b (a bool, b int) PARTITION BY RANGE (a);
+CREATE TABLE dfmt_b1 PARTITION OF dfmt_b FOR VALUES FROM (false) TO (true);
+SELECT c.relname, pg_catalog.pg_get_expr(c.relpartbound, c.oid) AS bound
+  FROM pg_catalog.pg_class c
+ WHERE c.relname = 'dfmt_b1';
+DROP TABLE dfmt_b;
 DROP TABLE dfmt_p;
 DROP VIEW dfmt_v;
 DROP TABLE dfmt_d;
