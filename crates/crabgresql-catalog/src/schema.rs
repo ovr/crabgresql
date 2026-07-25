@@ -437,9 +437,8 @@ fn deparse_partbound(part: &PartitionOf) -> String {
             }
         }
     };
-    let list = |datums: &[PartitionBoundDatum]| {
-        datums.iter().map(datum).collect::<Vec<_>>().join(", ")
-    };
+    let list =
+        |datums: &[PartitionBoundDatum]| datums.iter().map(datum).collect::<Vec<_>>().join(", ");
     format!(
         "FOR VALUES FROM ({}) TO ({})",
         list(&part.bound.from),
@@ -666,10 +665,18 @@ pub fn pg_attribute_schema() -> TableSchema {
 /// raw form crabgresql stores in [`Column::typmod`] (a bare length for the
 /// character/bit types, `-1` for none). `character`/`character varying` reserve
 /// four bytes for the varlena header (`n + VARHDRSZ`); `bit`/`bit varying` store
-/// the length directly. Numeric and datetime precisions are not persisted yet,
-/// so those columns carry `-1` — `format_type` then omits the modifier. Keeping
-/// this the true PostgreSQL encoding lets `format_type(atttypid, atttypmod)`
-/// reproduce PG's `\d` type strings.
+/// the length directly. Keeping this the true PostgreSQL encoding lets
+/// `format_type(atttypid, atttypmod)` reproduce PG's `\d` type strings.
+///
+/// Two modifiers do not survive to here yet, so `\d` shows the bare type name
+/// where PostgreSQL shows a modifier. Both are upstream of this function:
+/// - `numeric(p,s)` and `timestamp(p)`/`time(p)`: [`Column::typmod`] is only
+///   populated from `length_typmod` (the character and bit types), and it is
+///   also what the INSERT path length-coerces against, so persisting these
+///   needs its own change rather than a catalog-side re-encode.
+/// - a **view**'s columns: a view records its output columns without a modifier
+///   (`OutputColumn` carries no typmod), so `\d v` prints `character varying`
+///   where PostgreSQL prints `character varying(20)`.
 fn atttypmod_of(column: &Column) -> i32 {
     const VARHDRSZ: i32 = 4;
     match column.ty {

@@ -1048,6 +1048,80 @@ fn numeric_error(e: crabgresql_types::numeric::NumErr) -> ExecError {
 }
 
 #[cfg(test)]
+mod format_type_tests {
+    use super::{eval_format_type, format_type_text};
+    use crabgresql_types::{Value, oid};
+
+    /// Every expectation here was probed against PostgreSQL 18.4
+    /// (`SELECT format_type(oid, typmod)`). The modifier is in PG's `atttypmod`
+    /// encoding — the one `crabgresql_catalog`'s `pg_attribute` emits — so this
+    /// is the decode side of that contract.
+    #[test]
+    fn format_type_matches_postgres() {
+        let ft = format_type_text;
+        // No modifier: the plain SQL spelling, which is not the `typname`
+        // (`integer`, not `int4`).
+        assert_eq!(ft(oid::INT4, None), "integer");
+        assert_eq!(ft(oid::NUMERIC, None), "numeric");
+        assert_eq!(ft(oid::BPCHAR, None), "character");
+        assert_eq!(ft(oid::TEXT, None), "text");
+        // numeric packs (precision, scale) into the two halves above the
+        // varlena header: 262150 = ((4 << 16) | 2) + 4.
+        assert_eq!(ft(oid::NUMERIC, Some(262150)), "numeric(4,2)");
+        // The character types reserve four bytes for that header, so the
+        // declared length is the modifier minus 4.
+        assert_eq!(ft(oid::VARCHAR, Some(24)), "character varying(20)");
+        assert_eq!(ft(oid::BPCHAR, Some(14)), "character(10)");
+        // Bit lengths are stored directly, with no header allowance.
+        assert_eq!(ft(oid::BIT, Some(5)), "bit(5)");
+        assert_eq!(ft(oid::VARBIT, Some(5)), "bit varying(5)");
+        // The precision goes *before* the time-zone suffix, not at the end.
+        assert_eq!(
+            ft(oid::TIMESTAMP, Some(3)),
+            "timestamp(3) without time zone"
+        );
+        assert_eq!(ft(oid::TIMESTAMPTZ, Some(3)), "timestamp(3) with time zone");
+        assert_eq!(ft(oid::TIME, Some(3)), "time(3) without time zone");
+        assert_eq!(ft(oid::TIMETZ, Some(3)), "time(3) with time zone");
+        // A `reg*` type spells as its own name.
+        assert_eq!(ft(oid::REGCLASS, None), "regclass");
+        // An array formats its element type, carrying the modifier, plus `[]`.
+        assert_eq!(ft(oid::INT4_ARRAY, None), "integer[]");
+        assert_eq!(ft(oid::VARCHAR_ARRAY, Some(24)), "character varying(20)[]");
+        // The two sentinels: OID 0 is `-`, an OID no type has is `???`.
+        assert_eq!(ft(0, None), "-");
+        assert_eq!(ft(0, Some(5)), "-");
+        assert_eq!(ft(999_999, None), "???");
+    }
+
+    /// The argument-level contract: `format_type` is strict in its OID but *not*
+    /// in its modifier — a NULL modifier means "no modifier", which is why this
+    /// function bypasses `eval_scalar`'s STRICT short-circuit. psql's sequence
+    /// query relies on it (`format_type(seqtypid, NULL)`).
+    #[test]
+    fn null_oid_is_null_but_null_typmod_is_no_modifier() {
+        assert_eq!(
+            eval_format_type(&[Value::Null, Value::Int4(24)]),
+            Value::Null
+        );
+        assert_eq!(
+            eval_format_type(&[Value::Oid(oid::VARCHAR), Value::Null]),
+            Value::Text("character varying".to_string())
+        );
+        // -1 is the "no modifier" sentinel `pg_attribute` stores, and reads the
+        // same as NULL.
+        assert_eq!(
+            eval_format_type(&[Value::Oid(oid::VARCHAR), Value::Int4(-1)]),
+            Value::Text("character varying".to_string())
+        );
+        assert_eq!(
+            eval_format_type(&[Value::Oid(oid::VARCHAR), Value::Int4(24)]),
+            Value::Text("character varying(20)".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
 mod enum_cmp_tests {
     use super::compare_values;
     use crabgresql_types::{PgType, Value};

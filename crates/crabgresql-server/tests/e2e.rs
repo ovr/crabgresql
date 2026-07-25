@@ -517,6 +517,77 @@ async fn psql_describe_listings_match_pg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The per-column query psql sends third for `\d <table>` / `\d <view>`,
+/// replayed verbatim but for the OID psql substitutes from its first query.
+/// This is the gate that the whole statement binds and runs: `format_type` over
+/// the stored `atttypmod`, `pg_get_expr` over a column default in a correlated
+/// subquery, the collation subquery that must self-filter to NULL, and the
+/// `attidentity`/`attgenerated` projections.
+#[tokio::test]
+async fn psql_describe_columns_match_pg() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query(
+            "CREATE TABLE t1 (id int PRIMARY KEY, code varchar(20), \
+             tag char(4), mask bit(5), flag bool DEFAULT true, note text)",
+        )
+        .await?;
+
+    // Verbatim psql, with the relation located by name instead of by OID.
+    let columns = client
+        .simple_query(
+            "SELECT a.attname,\n  \
+               pg_catalog.format_type(a.atttypid, a.atttypmod),\n  \
+               (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)\n   \
+                FROM pg_catalog.pg_attrdef d\n   \
+                WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef),\n  \
+               a.attnotnull,\n  \
+               (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t\n   \
+                WHERE c.oid = a.attcollation AND t.oid = a.atttypid \
+                AND a.attcollation <> t.typcollation) AS attcollation,\n  \
+               a.attidentity,\n  \
+               a.attgenerated\n\
+             FROM pg_catalog.pg_attribute a, pg_catalog.pg_class c\n\
+             WHERE c.relname = 't1' AND a.attrelid = c.oid AND a.attnum > 0 \
+             AND NOT a.attisdropped\n\
+             ORDER BY a.attnum;",
+        )
+        .await?;
+    let described = rows(&columns)
+        .iter()
+        .map(|r| {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                r.get(0).unwrap_or("?"),
+                r.get(1).unwrap_or("?"),
+                // The three columns psql renders as blank when absent.
+                r.get(2).unwrap_or(""),
+                r.get(3).unwrap_or("?"),
+                r.get(4).unwrap_or(""),
+                r.get(5).unwrap_or(""),
+                r.get(6).unwrap_or(""),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Exactly what PostgreSQL 18.4 returns for this table: the declared type
+    // modifiers survive into `format_type`, the default deparses back to its SQL
+    // text, and no column is collated, identity, or generated.
+    assert_eq!(
+        described,
+        vec![
+            "id|integer||t|||".to_string(),
+            "code|character varying(20)||f|||".to_string(),
+            "tag|character(4)||f|||".to_string(),
+            "mask|bit(5)||f|||".to_string(),
+            "flag|boolean|true|f|||".to_string(),
+            "note|text||f|||".to_string(),
+        ]
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
