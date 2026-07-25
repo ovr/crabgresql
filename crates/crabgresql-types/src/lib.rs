@@ -328,6 +328,62 @@ impl PgType {
         })
     }
 
+    /// Resolve a built-in type *name* to its [`PgType`], the reverse of
+    /// [`PgType::typname`] and [`PgType::name`]. Every built-in answers to both
+    /// its catalog spelling (`int4`, `float8`, `timestamptz`) and its SQL
+    /// spelling (`integer`, `double precision`, `timestamp with time zone`),
+    /// plus the aliases SQL allows (`int`, `decimal`, `char`). `None` for a name
+    /// this build has no built-in for — a user type, or an unsupported one.
+    ///
+    /// Built-in type names live in `pg_catalog`, so this is what a bare or
+    /// `pg_catalog.`-qualified name resolves against before the user-type
+    /// catalog is consulted. Multi-word spellings only reach here from a catalog
+    /// name (`CREATE TYPE ... LIKE`); the parser gives those their own
+    /// `DataType` variants.
+    ///
+    /// `pg_type_rows_agree_with_pgtype_for_modeled_types` in `crabgresql-catalog`
+    /// checks every modeled type's vendored `typname` against this, so a new
+    /// type cannot land here spelled differently than the catalog spells it.
+    pub fn from_name(name: &str) -> Option<PgType> {
+        Some(match name {
+            "bool" | "boolean" => PgType::Bool,
+            "int2" | "smallint" => PgType::Int2,
+            "int4" | "integer" | "int" => PgType::Int4,
+            "int8" | "bigint" => PgType::Int8,
+            "float4" | "real" => PgType::Float4,
+            "float8" | "double precision" => PgType::Float8,
+            "numeric" | "decimal" => PgType::Numeric,
+            "money" => PgType::Money,
+            "text" => PgType::Text,
+            "varchar" | "character varying" => PgType::Varchar,
+            // Unlike PG, `"char"` (the quoted 1-byte type) is not modeled
+            // separately; it and `char`/`character` all resolve to `bpchar`.
+            "bpchar" | "char" | "character" => PgType::Bpchar,
+            "name" => PgType::Name,
+            "oid" => PgType::Oid,
+            "bytea" => PgType::Bytea,
+            "bit" => PgType::Bit,
+            "varbit" | "bit varying" => PgType::Varbit,
+            "date" => PgType::Date,
+            "time" | "time without time zone" => PgType::Time,
+            "timetz" | "time with time zone" => PgType::TimeTz,
+            "timestamp" | "timestamp without time zone" => PgType::Timestamp,
+            "timestamptz" | "timestamp with time zone" => PgType::TimestampTz,
+            "interval" => PgType::Interval,
+            "uuid" => PgType::Uuid,
+            "inet" => PgType::Inet,
+            "cidr" => PgType::Cidr,
+            "macaddr" => PgType::Macaddr,
+            "macaddr8" => PgType::Macaddr8,
+            "point" => PgType::Point,
+            "lseg" => PgType::Lseg,
+            "json" => PgType::Json,
+            "jsonb" => PgType::Jsonb,
+            "jsonpath" => PgType::Jsonpath,
+            _ => return None,
+        })
+    }
+
     /// `pg_type.typlen`: byte width for fixed-size types, -1 for varlena.
     pub fn typlen(self) -> i16 {
         match self {

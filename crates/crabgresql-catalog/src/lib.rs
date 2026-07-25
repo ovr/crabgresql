@@ -813,6 +813,16 @@ mod tests {
                 ty.typlen(),
                 "{typname} typlen drift (.dat vs PgType)"
             );
+            // The name a bare or `pg_catalog.`-qualified type name binds through
+            // is the same one the catalog reports, in both directions — so a
+            // built-in cannot be spelled one way in `pg_type` and another in a
+            // cast.
+            assert_eq!(
+                PgType::from_name(typname),
+                Some(ty),
+                "{typname} does not resolve back to its PgType"
+            );
+            assert_eq!(ty.typname(), typname, "{typname} typname drift");
         }
     }
 

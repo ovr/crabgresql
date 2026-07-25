@@ -2343,48 +2343,52 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
             }
             PgType::Array(elem.oid())
         }
-        // `bpchar` (no length = unlimited, like text) and `name` arrive as
-        // custom type names.
-        DataType::Custom(obj, mods) if mods.is_empty() => {
-            match obj
-                .0
-                .last()
-                .and_then(|p| p.as_ident())
-                .map(normalize_ident)
-                .as_deref()
-            {
-                Some("bpchar") => PgType::Bpchar,
-                Some("varchar") => PgType::Varchar,
-                Some("name") => PgType::Name,
-                Some("money") => PgType::Money,
-                Some("oid") => PgType::Oid,
-                Some("macaddr") => PgType::Macaddr,
-                Some("macaddr8") => PgType::Macaddr8,
-                // `point`/`lseg` reach here as bareword type names (`::point`,
-                // `f1 point`); the `point '...'`/`GeometricType` path is separate.
-                Some("point") => PgType::Point,
-                Some("lseg") => PgType::Lseg,
-                Some("json") => PgType::Json,
-                Some("jsonb") => PgType::Jsonb,
-                // `regclass` is modeled as `text` (a relation name) for now: it
-                // lets `nextval('seq'::regclass)` bind against `nextval(text)`.
-                // Full regclass→oid semantics (name normalization, `::oid`) are a
-                // deliberate v1 gap.
-                Some("regclass") => PgType::Text,
-                Some("jsonpath") => PgType::Jsonpath,
-                _ => {
-                    return Err(BindError::feature_not_supported(format!(
-                        "type \"{dt}\" is not supported yet"
-                    )));
-                }
+        // Type names the parser has no dedicated `DataType` for arrive here:
+        // `bpchar`, `name`, `point`, and every built-in written with a
+        // `pg_catalog.` qualifier.
+        DataType::Custom(obj, mods) if mods.is_empty() => match builtin_custom_type(obj) {
+            Some(t) => t,
+            None => {
+                return Err(BindError::feature_not_supported(format!(
+                    "type \"{dt}\" is not supported yet"
+                )));
             }
-        }
+        },
         other => {
             return Err(BindError::feature_not_supported(format!(
                 "type \"{other}\" is not supported yet"
             )));
         }
     })
+}
+
+/// The built-in a `DataType::Custom` name denotes, or `None` if it names no
+/// built-in — an unknown type, or one qualified with a schema other than
+/// `pg_catalog`. Both fall through to the user-type lookup in [`bind_cast`].
+///
+/// Built-ins live in `pg_catalog`, so a bare `int4` and `pg_catalog.int4` name
+/// the same type while `app.int4` names a user type that merely shares the
+/// spelling. psql leans on the qualified form throughout `\d` (`::pg_catalog.text`,
+/// `pr.prattrs::pg_catalog.int2[]`), which `DataType::Array` picks up by
+/// recursing through here.
+fn builtin_custom_type(obj: &ast::ObjectName) -> Option<PgType> {
+    let parts = obj
+        .0
+        .iter()
+        .map(|p| p.as_ident().map(normalize_ident))
+        .collect::<Option<Vec<_>>>()?;
+    let name = match parts.as_slice() {
+        [name] => name.as_str(),
+        [schema, name] if schema == "pg_catalog" => name.as_str(),
+        _ => return None,
+    };
+    // `regclass` is modeled as `text` (a relation name) for now: it lets
+    // `nextval('seq'::regclass)` bind against `nextval(text)`. Full regclass→oid
+    // semantics (name normalization, `::oid`) are a deliberate v1 gap.
+    if name == "regclass" {
+        return Some(PgType::Text);
+    }
+    PgType::from_name(name)
 }
 
 fn precision_of(info: &ast::ExactNumberInfo) -> Option<u64> {
