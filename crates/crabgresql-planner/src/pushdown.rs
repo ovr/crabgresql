@@ -68,7 +68,13 @@ fn place(node: &mut JoinExpr, base: usize, conjunct: BoundExpr) -> Option<BoundE
     else {
         return Some(conjunct);
     };
-    let (lo, hi) = conjunct.column_ref_bounds()?;
+    let Some((lo, hi)) = conjunct.column_ref_bounds() else {
+        // `None` means this expression has no visible dependency in the
+        // current row's index space. It does not mean the conjunct was placed:
+        // correlated subplans, for example, carry their dependency in an
+        // OuterColumnRef that bounds deliberately ignore.
+        return Some(conjunct);
+    };
     let split = base + left.width();
     debug_assert!(
         lo >= base && hi < split + right.width(),
@@ -147,15 +153,13 @@ fn may_descend_right(kind: JoinKind) -> bool {
 /// advance a different number of times and a routine's side effects would
 /// change count. PostgreSQL declines to push volatile quals for the same
 /// reason.
-fn is_relocatable(expr: &BoundExpr) -> bool {
+pub(crate) fn is_relocatable(expr: &BoundExpr) -> bool {
     fn opaque(expr: &BoundExpr) -> bool {
         match expr {
             BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. }
-            | BoundExpr::QuantifiedSubquery { .. }
-            | BoundExpr::Routine { .. }
-            | BoundExpr::Srf { .. } => true,
+            | BoundExpr::QuantifiedSubquery { .. } => true,
             BoundExpr::ColumnRef { .. } | BoundExpr::Const { .. } | BoundExpr::Param { .. } => {
                 false
             }
@@ -165,9 +169,10 @@ fn is_relocatable(expr: &BoundExpr) -> bool {
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => opaque(expr),
             BoundExpr::Binary { left, right, .. } => opaque(left) || opaque(right),
-            BoundExpr::FuncCall { args, .. } | BoundExpr::Aggregate { args, .. } => {
-                args.iter().any(opaque)
-            }
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. }
+            | BoundExpr::Aggregate { args, .. } => args.iter().any(opaque),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(opaque),
             BoundExpr::Subscript { base, index, .. } => opaque(base) || opaque(index),
             BoundExpr::Case { whens, else_, .. } => {
@@ -180,4 +185,41 @@ fn is_relocatable(expr: &BoundExpr) -> bool {
     // A conjunct referencing no column at all (`1 = 1`, `$1 IS NULL`) has no
     // subtree it belongs to more than any other, so leave it at the top.
     expr.column_ref_bounds().is_some() && !opaque(expr) && !expr.contains_volatile_fn()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crabgresql_binder::{JoinInput, TableFn};
+    use crabgresql_types::{PgType, Value};
+
+    fn leaf() -> JoinExpr {
+        JoinExpr::Input {
+            input: JoinInput::TableFunction {
+                func: TableFn::GenerateSeries(PgType::Int4),
+                args: Vec::new(),
+            },
+            width: 1,
+        }
+    }
+
+    #[test]
+    fn place_returns_a_conjunct_with_no_visible_column_bounds() {
+        let mut join = JoinExpr::Join {
+            left: Box::new(leaf()),
+            right: Box::new(leaf()),
+            kind: JoinKind::Inner,
+            predicate: None,
+        };
+        let conjunct = BoundExpr::Const {
+            value: Value::Bool(true),
+            ty: PgType::Bool,
+        };
+
+        assert_eq!(place(&mut join, 0, conjunct.clone()), Some(conjunct));
+        let JoinExpr::Join { predicate, .. } = join else {
+            panic!("expected Join node");
+        };
+        assert!(predicate.is_none(), "the conjunct was not placed or dropped");
+    }
 }

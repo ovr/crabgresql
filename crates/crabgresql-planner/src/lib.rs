@@ -225,6 +225,16 @@ impl PhysicalJoinExpr {
             PhysicalJoinExpr::Join { left, right, .. } => left.width() + right.width(),
         }
     }
+
+    /// The executor and EXPLAIN must use the same physical-algorithm decision.
+    /// Keeping it here prevents the renderer from drifting away if the
+    /// selection rule grows beyond the presence of extracted hash keys.
+    pub fn uses_hash_join(&self) -> bool {
+        matches!(
+            self,
+            PhysicalJoinExpr::Join { hash_keys, .. } if !hash_keys.is_empty()
+        )
+    }
 }
 
 /// The row source of a [`PhysicalPlan::Aggregate`], mirroring [`AggInput`].
@@ -301,6 +311,10 @@ fn sink_leaf_filters(
 
     let mut kept = Vec::new();
     for mut conjunct in conjuncts {
+        if !pushdown::is_relocatable(&conjunct) {
+            kept.push(conjunct);
+            continue;
+        }
         // A deeper join node would already have taken this conjunct during
         // pushdown, so the only home left below is a leaf.
         let (target, base) = match ref_side(&conjunct, left_width) {
@@ -980,8 +994,6 @@ fn ms(d: Duration) -> String {
     format!("{:.3}", d.as_secs_f64() * 1000.0)
 }
 
-/// Put `child` under a new parent node, indenting it beneath a `->` lead the way
-/// PG renders a single-child plan node.
 /// Append a child plan under a `->` lead, indenting its continuation lines to
 /// line up beneath it.
 fn push_child(lines: &mut Vec<String>, child: Vec<String>) {
@@ -992,14 +1004,23 @@ fn push_child(lines: &mut Vec<String>, child: Vec<String>) {
     }
 }
 
+/// Put `child` under a new parent node, indenting it beneath a `->` lead the way
+/// PG renders a single-child plan node.
 fn nest_under(parent: &str, child: Vec<String>) -> Vec<String> {
     let mut lines = vec![parent.to_string()];
-    let mut child = child.into_iter();
-    if let Some(first) = child.next() {
-        lines.push(format!("  ->  {first}"));
-        lines.extend(child.map(|l| format!("      {l}")));
-    }
+    push_child(&mut lines, child);
     lines
+}
+
+/// Add a property to the root node of an already-rendered plan. Root properties
+/// belong before its first child; appending would make a filter executed above
+/// a multi-node subplan look like it belonged to the subplan's final leaf.
+fn push_root_property(lines: &mut Vec<String>, property: String) {
+    let child = lines
+        .iter()
+        .position(|line| line.starts_with("  ->  "))
+        .unwrap_or(lines.len());
+    lines.insert(child, format!("  {property}"));
 }
 
 /// Minimal expression rendering for `EXPLAIN` conditions: enough to show a
@@ -1065,6 +1086,7 @@ fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<&str>> {
 /// recomputed per node rather than threaded down.
 fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<String> {
     let names = join_column_names(join);
+    let hashed = join.uses_hash_join();
     match join {
         PhysicalJoinExpr::Input {
             input, predicate, ..
@@ -1077,7 +1099,10 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
                 PhysicalJoinInput::Subplan(source) => explain(source),
             };
             for predicate in predicate.iter().chain(filter) {
-                lines.push(format!("  Filter: ({})", explain_expr(predicate, &names)));
+                push_root_property(
+                    &mut lines,
+                    format!("Filter: ({})", explain_expr(predicate, &names)),
+                );
             }
             lines
         }
@@ -1088,7 +1113,6 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
             hash_keys,
             ..
         } => {
-            let hashed = !hash_keys.is_empty();
             let mut lines = vec![if hashed { "Hash Join" } else { "Nested Loop" }.to_string()];
             if hashed {
                 let cond = hash_keys
@@ -1749,6 +1773,85 @@ mod tests {
     }
 
     #[test]
+    fn correlated_on_conjunct_is_not_sunk_to_a_leaf() {
+        // Unlike the WHERE case above, this expression starts on the explicit
+        // join node and reaches leaf sinking only after its equality became a
+        // hash key. The scalar subplan still needs the full joined row when its
+        // OuterColumnRef is substituted, so the residual must remain here.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a JOIN t b ON a.id = b.id \
+             AND b.big = (SELECT max(c.big) FROM t c WHERE c.id = a.big)",
+        ));
+        let PhysicalJoinExpr::Join {
+            right,
+            predicate,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert_eq!(hash_keys.len(), 1);
+        assert!(
+            matches!(predicate, Some(BoundExpr::Binary { op: BinOp::Eq, .. })),
+            "the correlated ON residual stays on the join"
+        );
+        assert!(filter.is_none());
+        let PhysicalJoinExpr::Input {
+            predicate: right_leaf,
+            ..
+        } = *right
+        else {
+            panic!("expected a leaf on the right");
+        };
+        assert!(right_leaf.is_none());
+    }
+
+    #[test]
+    fn volatile_on_conjunct_is_not_sunk_to_a_leaf() {
+        // An explicit ON residual bypasses WHERE pushdown, but must receive the
+        // same volatility screen before leaf sinking. Otherwise nextval runs
+        // once per scanned right row instead of once per candidate join row.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a JOIN t b \
+             ON a.id = b.id AND b.big > nextval('s')",
+        ));
+        let PhysicalJoinExpr::Join {
+            right,
+            predicate,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert_eq!(hash_keys.len(), 1);
+        assert!(
+            matches!(predicate, Some(BoundExpr::Binary { op: BinOp::Gt, .. })),
+            "the volatile ON residual stays on the join"
+        );
+        assert!(filter.is_none());
+        let PhysicalJoinExpr::Input {
+            predicate: right_leaf,
+            ..
+        } = *right
+        else {
+            panic!("expected a leaf on the right");
+        };
+        assert!(right_leaf.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "shifted out of range")]
+    fn shifting_a_column_below_zero_panics_in_all_builds() {
+        let mut expr = BoundExpr::ColumnRef {
+            index: 0,
+            ty: PgType::Int4,
+        };
+        expr.shift_column_refs(-1);
+    }
+
+    #[test]
     fn non_equi_comma_join_condition_lands_on_an_inner_node() {
         // A non-equi condition yields no hash key, so it rides the nested loop as
         // the node's predicate. The kind must flip to Inner: `Cross` is the
@@ -2041,6 +2144,30 @@ mod tests {
                 "        ->  Seq Scan on t",
                 "              Filter: (big = 7)",
             ]
+        );
+    }
+
+    #[test]
+    fn explain_attaches_a_subplan_leaf_filter_to_the_subplan_root() {
+        let lines = explain(&plan_sql(
+            "SELECT * FROM t a \
+             JOIN (SELECT x.id, x.big FROM t x, t y WHERE x.id = y.id) b \
+               ON a.id = b.id AND b.big = 7",
+        ));
+        let filter = lines
+            .iter()
+            .position(|line| line.contains("Filter:"))
+            .unwrap_or_else(|| panic!("expected the sunk filter: {lines:?}"));
+        let subplan_child = lines
+            .iter()
+            .enumerate()
+            .skip(filter + 1)
+            .find(|(_, line)| line.contains("->  Seq Scan on t"))
+            .map(|(index, _)| index)
+            .expect("expected a child of the subplan root");
+        assert!(
+            filter < subplan_child,
+            "the filter must be a property of the subplan root, not its final leaf: {lines:?}"
         );
     }
 

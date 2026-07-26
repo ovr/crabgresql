@@ -46,6 +46,27 @@ SELECT a.v, b.w FROM p_a a, p_b b
   ORDER BY 1;
 -- a conjunct referencing no column at all also stays put
 SELECT a.v, b.w FROM p_a a, p_b b WHERE a.id = b.id AND 1 = 1 ORDER BY 1;
+-- Explicit ON residuals go through leaf sinking without going through WHERE
+-- pushdown first. Correlated and volatile expressions must still stay on the
+-- join, where they see the full joined row and run once per candidate pair.
+CREATE TABLE p_ka (id integer, big integer);
+INSERT INTO p_ka VALUES (1, 10), (2, 20);
+CREATE TABLE p_kb (id integer, big integer);
+INSERT INTO p_kb VALUES (1, 100), (2, 200), (3, 300);
+CREATE TABLE p_kc (k integer, v integer);
+INSERT INTO p_kc VALUES (10, 100), (20, 200);
+SELECT a.id, b.big FROM p_ka a JOIN p_kb b
+  ON a.id = b.id AND b.big = (SELECT max(c.v) FROM p_kc c WHERE c.k = a.big)
+  ORDER BY 1;
+CREATE SEQUENCE p_sink_seq;
+SELECT a.id, b.big FROM p_ka a JOIN p_kb b
+  ON a.id = b.id AND b.big > nextval('p_sink_seq')
+  ORDER BY 1;
+SELECT currval('p_sink_seq');
+DROP SEQUENCE p_sink_seq;
+DROP TABLE p_ka;
+DROP TABLE p_kb;
+DROP TABLE p_kc;
 -- NULL join keys never match
 INSERT INTO p_a VALUES (NULL, 99);
 INSERT INTO p_b VALUES (NULL, 999);

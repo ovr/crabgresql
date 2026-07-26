@@ -839,9 +839,10 @@ impl BoundExpr {
     pub fn shift_column_refs(&mut self, delta: isize) {
         match self {
             BoundExpr::ColumnRef { index, .. } => {
-                let shifted = *index as isize + delta;
-                debug_assert!(shifted >= 0, "column index {index} shifted below zero");
-                *index = shifted as usize;
+                let Some(shifted) = index.checked_add_signed(delta) else {
+                    panic!("column index {index} shifted out of range by {delta}");
+                };
+                *index = shifted;
             }
             BoundExpr::Const { .. }
             | BoundExpr::Param { .. }

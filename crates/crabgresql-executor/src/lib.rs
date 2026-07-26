@@ -2251,6 +2251,7 @@ fn build_join_expr(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Box<dyn ExecNode>, ExecError> {
+    let uses_hash_join = source.uses_hash_join();
     match source {
         PhysicalJoinExpr::Input {
             input, predicate, ..
@@ -2272,17 +2273,7 @@ fn build_join_expr(
             let right_width = right.width();
             let left = build_join_expr(*left, ctx, txn)?;
             let right = build_join_expr(*right, ctx, txn)?;
-            if hash_keys.is_empty() {
-                Ok(Box::new(NestedLoopJoin::new(
-                    left,
-                    right,
-                    left_width,
-                    right_width,
-                    kind,
-                    predicate,
-                    ctx.clone(),
-                )?))
-            } else {
+            if uses_hash_join {
                 Ok(Box::new(HashJoin::new(
                     left,
                     right,
@@ -2290,6 +2281,16 @@ fn build_join_expr(
                     right_width,
                     kind,
                     hash_keys,
+                    predicate,
+                    ctx.clone(),
+                )?))
+            } else {
+                Ok(Box::new(NestedLoopJoin::new(
+                    left,
+                    right,
+                    left_width,
+                    right_width,
+                    kind,
                     predicate,
                     ctx.clone(),
                 )?))
@@ -5308,6 +5309,30 @@ mod tests {
              JOIN (VALUES (1, 9), (1, 3), (2, 1)) b(x, v) ON a.x = b.x AND a.v < b.v",
         );
         assert_eq!(rows, vec![vec![Value::Int4(5), Value::Int4(9)]]);
+    }
+
+    #[test]
+    fn explicit_on_correlated_residual_uses_the_join_row() {
+        // The correlated scalar subquery reads `a.big` from the full joined row.
+        // Sinking the residual onto b would substitute its outer reference from
+        // b's two-column row and read `b.big` instead, returning no rows.
+        let (_, rows) = run_rows(
+            "SELECT a.id, b.big \
+             FROM (VALUES (1, 10), (2, 20)) a(id, big) \
+             JOIN (VALUES (1, 100), (2, 200), (3, 300)) b(id, big) \
+               ON a.id = b.id \
+              AND b.big = (SELECT max(c.v) \
+                           FROM (VALUES (10, 100), (20, 200)) c(k, v) \
+                           WHERE c.k = a.big) \
+             ORDER BY a.id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(100)],
+                vec![Value::Int4(2), Value::Int4(200)],
+            ]
+        );
     }
 
     #[test]
