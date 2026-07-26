@@ -67,15 +67,14 @@ pub use self::ddl::{
     ColumnPolicy, ColumnPolicyProperty, ConstraintCharacteristics, CreateCollation,
     CreateCollationDefinition, CreateConnector, CreateDomain, CreateExtension, CreateFunction,
     CreateIndex, CreateOperator, CreateOperatorClass, CreateOperatorFamily, CreatePolicy,
-    CreatePolicyCommand, CreatePolicyType, CreateTable, CreateTrigger, CreateView, Deduplicate,
-    DeferrableInitial, DistStyle, DoStatement, DropBehavior, DropExtension, DropFunction,
-    DropOperator, DropOperatorClass, DropOperatorFamily, DropOperatorSignature, DropPolicy,
-    DropTrigger,
-    ForValues, FunctionReturnType, GeneratedAs, GeneratedExpressionMode, IdentityParameters,
-    IdentityProperty, IdentityPropertyFormatKind, IdentityPropertyKind, IdentityPropertyOrder,
-    IndexColumn, IndexOption, IndexType, KeyOrIndexDisplay, Msck, NullsDistinctOption,
-    OperatorArgTypes, OperatorClassItem, OperatorFamilyDropItem, OperatorFamilyItem,
-    OperatorOption, OperatorPurpose, Owner, Partition, PartitionBoundValue, ProcedureParam,
+    CreatePolicyCommand, CreatePolicyType, CreateProcedure, CreateTable, CreateTrigger, CreateView,
+    Deduplicate, DeferrableInitial, DistStyle, DoStatement, DropBehavior, DropExtension,
+    DropFunction, DropOperator, DropOperatorClass, DropOperatorFamily, DropOperatorSignature,
+    DropPolicy, DropTrigger, ForValues, FunctionReturnType, GeneratedAs, GeneratedExpressionMode,
+    IdentityParameters, IdentityProperty, IdentityPropertyFormatKind, IdentityPropertyKind,
+    IdentityPropertyOrder, IndexColumn, IndexOption, IndexType, KeyOrIndexDisplay, Msck,
+    NullsDistinctOption, OperatorArgTypes, OperatorClassItem, OperatorFamilyDropItem,
+    OperatorFamilyItem, OperatorOption, OperatorPurpose, Owner, Partition, PartitionBoundValue,
     ReferentialAction, RenameTableNameKind, ReplicaIdentity, TagsColumnOption, TriggerObjectKind,
     Truncate, UserDefinedTypeCompositeAttributeDef, UserDefinedTypeInternalLength,
     UserDefinedTypeRangeOption, UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
@@ -4085,21 +4084,8 @@ pub enum Statement {
     CreateTrigger(CreateTrigger),
     /// DROP TRIGGER statement. See struct [DropTrigger] for details.
     DropTrigger(DropTrigger),
-    /// ```sql
-    /// CREATE PROCEDURE
-    /// ```
-    CreateProcedure {
-        /// `OR ALTER` flag.
-        or_alter: bool,
-        /// Procedure name.
-        name: ObjectName,
-        /// Optional procedure parameters.
-        params: Option<Vec<ProcedureParam>>,
-        /// Optional language identifier.
-        language: Option<Ident>,
-        /// Procedure body statements.
-        body: ConditionalStatements,
-    },
+    /// CREATE PROCEDURE statement. See struct [CreateProcedure] for details.
+    CreateProcedure(CreateProcedure),
     /// ```sql
     /// GRANT privileges ON objects TO grantees
     /// ```
@@ -4697,32 +4683,7 @@ impl fmt::Display for Statement {
             Statement::CreateDomain(create_domain) => create_domain.fmt(f),
             Statement::CreateTrigger(create_trigger) => create_trigger.fmt(f),
             Statement::DropTrigger(drop_trigger) => drop_trigger.fmt(f),
-            Statement::CreateProcedure {
-                name,
-                or_alter,
-                params,
-                language,
-                body,
-            } => {
-                write!(
-                    f,
-                    "CREATE {or_alter}PROCEDURE {name}",
-                    or_alter = if *or_alter { "OR ALTER " } else { "" },
-                    name = name
-                )?;
-
-                if let Some(p) = params {
-                    if !p.is_empty() {
-                        write!(f, " ({})", display_comma_separated(p))?;
-                    }
-                }
-
-                if let Some(language) = language {
-                    write!(f, " LANGUAGE {language}")?;
-                }
-
-                write!(f, " AS {body}")
-            }
+            Statement::CreateProcedure(create_procedure) => create_procedure.fmt(f),
             Statement::CreateView(create_view) => create_view.fmt(f),
             Statement::CreateTable(create_table) => create_table.fmt(f),
             Statement::CreateIndex(create_index) => create_index.fmt(f),
@@ -10987,6 +10948,12 @@ impl From<DropDomain> for Statement {
 impl From<CreateFunction> for Statement {
     fn from(c: CreateFunction) -> Self {
         Self::CreateFunction(c)
+    }
+}
+
+impl From<CreateProcedure> for Statement {
+    fn from(c: CreateProcedure) -> Self {
+        Self::CreateProcedure(c)
     }
 }
 

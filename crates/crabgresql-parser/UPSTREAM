@@ -21,3 +21,13 @@ discard):
   * `parse_routine_body_literal` factored out of
     `parse_create_function_body_string`, so CREATE FUNCTION, CREATE PROCEDURE
     and DO share one body-literal path and all keep the literal's span.
+  * `Statement::CreateProcedure` reshaped from upstream's T-SQL grammar
+    (`LANGUAGE x AS <statement list> END`, unreachable from the PG dialect) to
+    PostgreSQL's (`(args) LANGUAGE x AS $$...$$`), as a `CreateProcedure`
+    struct. The attribute-clause loop is shared with CREATE FUNCTION via
+    `parse_pg_routine_options`, mirroring PG's single `createfunc_opt_list`
+    production. `ProcedureParam`, `parse_optional_procedure_parameters` and
+    `parse_procedure_param` were removed as dead — procedures now use
+    `parse_function_arg`/`OperateFunctionArg`.
+  * The `CREATE PROCEDURE` dispatch moved above the `or_replace` bail in
+    `parse_create`, so `CREATE OR REPLACE PROCEDURE` parses.
