@@ -301,6 +301,13 @@ struct FuncEntry {
 }
 
 impl FuncEntry {
+    /// `name(argtype, ...)` — the routine's signature, with no object-class
+    /// prefix.
+    fn signature(&self) -> String {
+        let args: Vec<String> = self.args.iter().map(TypeRef::display_name).collect();
+        format!("{}({})", self.name, args.join(", "))
+    }
+
     /// PG's `function name(argtype, ...)` object description.
     fn describe(&self) -> String {
         let args: Vec<String> = self.args.iter().map(TypeRef::display_name).collect();
@@ -1318,7 +1325,7 @@ impl CatalogInner {
         {
             return Err(PgError::new(
                 sqlstate::WRONG_OBJECT_TYPE,
-                format!("{} is not a {}", entry.describe(), kind.noun()),
+                format!("{} is not a {}", entry.signature(), kind.noun()),
             ));
         }
         match matches.as_slice() {

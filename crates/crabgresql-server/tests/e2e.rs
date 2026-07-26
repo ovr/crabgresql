@@ -6200,13 +6200,33 @@ async fn plpgsql_bodies_are_syntax_checked_at_create_time() -> anyhow::Result<()
 
     let e = client
         .batch_execute(
-            "CREATE FUNCTION bad() RETURNS int LANGUAGE plpgsql AS $$ BEGIN x := 1; END $$",
+            "CREATE FUNCTION bad() RETURNS int LANGUAGE plpgsql AS $$\nBEGIN\n  x := 1;\nEND $$",
         )
         .await
         .unwrap_err();
     let db = e.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::SYNTAX_ERROR);
     assert_eq!(db.message(), "\"x\" is not a known variable");
+    // PostgreSQL also prints a `LINE n:` excerpt with a caret into the body,
+    // which needs a mapping from a body offset back into the statement text;
+    // the CONTEXT line names the line instead.
+    assert_eq!(
+        db.where_(),
+        Some("compilation of PL/pgSQL function \"bad\" near line 3")
+    );
+
+    // A RAISE whose format string and argument list disagree is caught when
+    // the routine is defined, not when the RAISE is reached.
+    let e = client
+        .batch_execute(
+            "CREATE FUNCTION few() RETURNS int LANGUAGE plpgsql AS $$\n\
+             BEGIN RAISE NOTICE 'a % b %', 1; RETURN 1; END $$",
+        )
+        .await
+        .unwrap_err();
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code().code(), "22023");
+    assert_eq!(db.message(), "too few parameters specified for RAISE");
 
     // Forward references are fine: the SQL inside a body is only bound at call
     // time, so this creates and then works once the table exists.

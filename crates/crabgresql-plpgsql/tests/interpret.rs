@@ -329,9 +329,10 @@ fn falling_off_the_end_without_return_is_an_error() {
     let e = err(h.call(oid, vec![Value::Int4(1)]));
     assert_eq!(e.code, "2F005");
     assert_eq!(e.message, "control reached end of function without RETURN");
+    // No line: the function ran out, it did not fail at a particular statement.
     assert_eq!(
         e.context(),
-        Some("PL/pgSQL function f(integer) line 1 at END".to_string())
+        Some("PL/pgSQL function f(integer)".to_string())
     );
 }
 
@@ -351,10 +352,9 @@ fn raise_notice_formats_its_arguments_and_reaches_the_sink() {
     assert_eq!(notices[0].severity, Severity::Notice);
     // `%%` is a literal percent; a NULL argument renders as `<NULL>`.
     assert_eq!(notices[0].message, "n is 7, 100% sure, <NULL> again");
-    assert_eq!(
-        notices[0].context,
-        vec!["PL/pgSQL function f(integer) line 1 at RAISE"]
-    );
+    // No CONTEXT: PostgreSQL prints one only for messages at ERROR and above
+    // under the default `client_min_messages`.
+    assert!(notices[0].context.is_empty());
 }
 
 #[test]
@@ -694,9 +694,20 @@ fn an_inline_block_runs_and_names_itself_in_a_traceback() {
         .expect("run block");
     let notices = h.taken_notices();
     assert_eq!(notices[0].message, "from a DO block");
+    assert!(notices[0].context.is_empty());
+}
+
+/// An anonymous block names itself `inline_code_block` where a routine would
+/// print its signature.
+#[test]
+fn an_inline_block_names_itself_in_an_error_traceback() {
+    let h = Harness::new();
+    let e = h
+        .run_block("BEGIN RAISE EXCEPTION 'from a DO block'; END")
+        .expect_err("expected the block to raise");
     assert_eq!(
-        notices[0].context,
-        vec!["PL/pgSQL function inline_code_block line 1 at RAISE"]
+        e.context(),
+        Some("PL/pgSQL function inline_code_block line 1 at RAISE".to_string())
     );
 }
 

@@ -240,11 +240,9 @@ impl Interpreter {
                 "2F005",
                 "control reached end of function without RETURN",
             )
-            .push_context(frame_line(
-                def,
-                routine.block.stmts.last().map_or(1, Stmt::line),
-                "END",
-            ))),
+            // No statement to name: the function ran out, it did not fail at
+            // a particular line.
+            .push_context(format!("PL/pgSQL function {}", routine_label(def)))),
             _ => Ok(Value::Null),
         }
     }
@@ -589,7 +587,11 @@ impl Interpreter {
                 return Err(ExecError::new("P0002", "query returned no rows"));
             }
             if rows.len() > 1 {
-                return Err(ExecError::new("P0003", "query returned more than one row"));
+                return Err(
+                    ExecError::new("P0003", "query returned more than one row").with_hint(Some(
+                        "Make sure the query returns a single row, or use LIMIT 1.".into(),
+                    )),
+                );
             }
         }
         match rows.first() {
@@ -715,7 +717,9 @@ impl Interpreter {
                 message,
                 detail,
                 hint,
-                context: vec![frame_line(def, raise.line, "RAISE")],
+                // PostgreSQL prints no CONTEXT for a message below ERROR
+                // under the default `client_min_messages`.
+                context: Vec::new(),
             });
         }
         Ok(())
@@ -966,14 +970,20 @@ fn loop_flow(flow: Flow, label: Option<&str>) -> Option<Flow> {
 /// `PL/pgSQL function f(integer) line 3 at RAISE`. An anonymous block renders
 /// as `inline_code_block` with no argument list, as PostgreSQL does.
 fn frame_line(def: &RoutineDef, line: u32, label: &str) -> String {
-    // PostgreSQL names an anonymous block `inline_code_block`, with no argument
-    // list, where it would otherwise print a signature.
-    let what = if def.name == INLINE_BLOCK_NAME {
+    format!(
+        "PL/pgSQL function {} line {line} at {label}",
+        routine_label(def)
+    )
+}
+
+/// How a routine names itself in a traceback: its signature, or the literal
+/// `inline_code_block` (with no argument list) for an anonymous `DO`.
+fn routine_label(def: &RoutineDef) -> String {
+    if def.name == INLINE_BLOCK_NAME {
         INLINE_BLOCK_NAME.to_string()
     } else {
         def.signature()
-    };
-    format!("PL/pgSQL function {what} line {line} at {label}")
+    }
 }
 
 /// How PostgreSQL names a `DO $$ ... $$` block in a traceback.

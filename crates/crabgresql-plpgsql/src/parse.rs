@@ -644,6 +644,27 @@ impl<'a> Compiler<'a> {
         let using = self.raise_using()?;
         self.lex.expect(&Token::SemiColon)?;
 
+        // The placeholder count is fixed by the format string, so a mismatch is
+        // knowable now — and PostgreSQL reports it when the routine is defined
+        // rather than waiting for the RAISE to be reached.
+        if let Some(format) = &format {
+            let placeholders = count_placeholders(format);
+            if placeholders > args.len() {
+                return Err(CompileError::new(
+                    "22023",
+                    "too few parameters specified for RAISE",
+                    line,
+                ));
+            }
+            if placeholders < args.len() {
+                return Err(CompileError::new(
+                    "22023",
+                    "too many parameters specified for RAISE",
+                    line,
+                ));
+            }
+        }
+
         Ok(Stmt::Raise(Box::new(Raise {
             level,
             format,
@@ -993,6 +1014,24 @@ fn name_positions(lex: &Lexer<'_>, text: &str) -> Vec<(usize, usize)> {
         }
     }
     spans
+}
+
+/// How many arguments a `RAISE` format string consumes: every `%` except the
+/// `%%` that stands for a literal percent sign.
+fn count_placeholders(format: &str) -> usize {
+    let mut count = 0usize;
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            continue;
+        }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+        } else {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// An identifier's value, folded to lowercase unless it was quoted.

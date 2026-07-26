@@ -292,6 +292,14 @@ pub struct CompileError {
 }
 
 impl CompileError {
+    pub fn new(code: &'static str, message: impl Into<String>, line: u32) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            line,
+        }
+    }
+
     pub fn syntax(message: impl Into<String>, line: u32) -> Self {
         Self {
             code: crabgresql_pg_wire::sqlstate::SYNTAX_ERROR,

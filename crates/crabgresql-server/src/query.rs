@@ -3588,12 +3588,8 @@ fn execute_create_function(
                 .filter(|a| a.mode.is_input())
                 .map(|a| a.name.clone())
                 .collect();
-            crabgresql_plpgsql::compile(&body_sql, &arg_names).map_err(|e| {
-                PgError::new(e.code, e.message).with_detail(format!(
-                    "compilation of PL/pgSQL function near line {}",
-                    e.line
-                ))
-            })?;
+            crabgresql_plpgsql::compile(&body_sql, &arg_names)
+                .map_err(|e| compile_failure(&name, e))?;
             FuncBody::PlPgSql(body_sql)
         }
         _ => {
@@ -3712,12 +3708,7 @@ fn execute_create_procedure(
         .filter(|a| a.mode.is_input())
         .map(|a| a.name.clone())
         .collect();
-    crabgresql_plpgsql::compile(&body_sql, &arg_names).map_err(|e| {
-        PgError::new(e.code, e.message).with_detail(format!(
-            "compilation of PL/pgSQL function near line {}",
-            e.line
-        ))
-    })?;
+    crabgresql_plpgsql::compile(&body_sql, &arg_names).map_err(|e| compile_failure(&name, e))?;
 
     let notices = catalog.create_function(RoutineDefinition {
         name,
@@ -3736,6 +3727,20 @@ fn execute_create_procedure(
         tag: "CREATE PROCEDURE".into(),
         notices: to_notices(notices),
     })
+}
+
+/// A routine body that would not compile, as PostgreSQL's PL/pgSQL validator
+/// reports it. PostgreSQL adds a `LINE n:` excerpt with a caret into the body;
+/// reproducing that needs a mapping from a body offset back into the statement
+/// text, which the parser does not carry, so the CONTEXT line names the line
+/// instead.
+fn compile_failure(name: &str, e: crabgresql_plpgsql::CompileError) -> PgError {
+    let line = e.line;
+    let mut err = PgError::new(e.code, e.message);
+    err.context.push(format!(
+        "compilation of PL/pgSQL function \"{name}\" near line {line}"
+    ));
+    err
 }
 
 /// A procedure's body, verbatim — see [`routine_body_text`] for why it is not
