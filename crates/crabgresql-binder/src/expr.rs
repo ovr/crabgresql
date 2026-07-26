@@ -2148,6 +2148,9 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             // `jsonb` has a total order (`compareJsonbContainers`); plain `json`
             // has no default equality/ordering, so it is intentionally omitted.
             | PgType::Jsonb
+            // Both text-search types have a default btree opclass in PG.
+            | PgType::Tsvector
+            | PgType::Tsquery
     ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
 }
 
@@ -2308,6 +2311,10 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         DataType::BitVarying(_) | DataType::VarBit(_) => PgType::Varbit,
         DataType::JSON => PgType::Json,
         DataType::JSONB => PgType::Jsonb,
+        // The parser has dedicated keyword variants for these two; the bareword
+        // arm below still catches the schema-qualified spellings.
+        DataType::TsVector => PgType::Tsvector,
+        DataType::TsQuery => PgType::Tsquery,
         DataType::Regclass => PgType::Reg(RegKind::Class),
         // Geometric types. `point`/`lseg` are modeled; the rest are not yet.
         DataType::GeometricType(kind) => match kind {
@@ -3134,6 +3141,8 @@ fn bind_unary(
         | ast::UnaryOperator::QuestionPipe => {
             resolve_geometric_unary(op, bind_expr(operand, scope)?)
         }
+        // `!!` — prefix negation of a `tsquery`.
+        ast::UnaryOperator::PGPrefixFactorial => resolve_ts_unary(bind_expr(operand, scope)?),
         other => Err(BindError::feature_not_supported(format!(
             "operator is not supported yet: {other}"
         ))),
@@ -3484,6 +3493,12 @@ fn bind_binary(
         {
             return bind_array_concat(lb, rb);
         }
+        // `tsvector || tsvector` unions the lexemes; `tsquery || tsquery` is an
+        // OR. Both need a typed text-search operand, so a plain `text || text`
+        // is untouched.
+        if let Some(binding) = resolve_ts_concat(&lb, &rb)? {
+            return Ok(binding);
+        }
         // Route to bit concatenation only when neither side is a concrete
         // non-bit type — i.e. both operands are bit strings or untyped literals,
         // and at least one is a bit string. `bit || text` instead falls to the
@@ -3552,6 +3567,15 @@ fn bind_binary(
     // lower to `ScalarFn::Geo` calls. Tried before the generic mapping so
     // `<<`/`>>`/`=`/`<` etc. reach here when a geometric operand is present.
     if let Some(binding) = resolve_geometric_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
+    // `tsvector @@ tsquery` and the `tsquery` combinators. Placed before the
+    // jsonpath and array resolvers, which claim `@@` and `&&` respectively. The
+    // network and geometric resolvers run earlier and also claim `&&`/`<->`, but
+    // each self-guards on its own operand types, and this one only fires on a
+    // typed text-search operand — so no resolver shadows another.
+    if let Some(binding) = resolve_ts_op(op, &lb, &rb)? {
         return Ok(binding);
     }
 
@@ -4026,9 +4050,15 @@ fn operand_name(b: &Binding) -> &'static str {
     binding_typed_ty(b).map_or("unknown", |t| t.name())
 }
 
-/// `operator does not exist: <lname> <op> <rname>`, with the real operand names
-/// in their actual order.
-fn net_no_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> BindError {
+/// `operator does not exist: <left> <op> <right>` (42883) for the operator
+/// spellings that have no [`BinOp`] — the family resolvers' `@@`, `&&`, `<->`,
+/// `>>`, ... Shared so a mis-typed operand reports a missing operator instead of
+/// a cast failure from inside `coerce_expr`.
+fn undefined_binary_operator(
+    lb: &Binding,
+    op: &ast::BinaryOperator,
+    rb: &Binding,
+) -> BindError {
     BindError::new(
         sqlstate::UNDEFINED_FUNCTION,
         format!(
@@ -4147,7 +4177,7 @@ fn resolve_network_op(
             return Ok(None);
         }
         let (Some(a), Some(b)) = (net_operand(lb), net_operand(rb)) else {
-            return Err(net_no_operator(lb, op, rb));
+            return Err(undefined_binary_operator(lb, op, rb));
         };
         return call(func, ret, a?, b?);
     }
@@ -4156,25 +4186,25 @@ fn resolve_network_op(
     match op {
         B::Plus if is_net_ty(lt) && !is_net_ty(rt) => {
             let (Some(a), Some(n)) = (net_operand(lb), int_operand(rb)) else {
-                return Err(net_no_operator(lb, op, rb));
+                return Err(undefined_binary_operator(lb, op, rb));
             };
             call(ScalarFn::InetPlInt8, PgType::Inet, a?, n?)
         }
         B::Plus if is_net_ty(rt) && !is_net_ty(lt) => {
             let (Some(a), Some(n)) = (net_operand(rb), int_operand(lb)) else {
-                return Err(net_no_operator(lb, op, rb));
+                return Err(undefined_binary_operator(lb, op, rb));
             };
             call(ScalarFn::InetPlInt8, PgType::Inet, a?, n?)
         }
         B::Minus if is_net_ty(lt) && is_net_ty(rt) => {
             let (Some(a), Some(b)) = (net_operand(lb), net_operand(rb)) else {
-                return Err(net_no_operator(lb, op, rb));
+                return Err(undefined_binary_operator(lb, op, rb));
             };
             call(ScalarFn::InetMi, PgType::Int8, a?, b?)
         }
         B::Minus if is_net_ty(lt) => {
             let (Some(a), Some(n)) = (net_operand(lb), int_operand(rb)) else {
-                return Err(net_no_operator(lb, op, rb));
+                return Err(undefined_binary_operator(lb, op, rb));
             };
             call(ScalarFn::InetMiInt8, PgType::Inet, a?, n?)
         }
@@ -4512,18 +4542,18 @@ fn resolve_array_op(
     // typed *non-array* opposite an array is `operator does not exist`.
     let arr_ty = match (la, ra) {
         (Some((_, le)), Some((_, re))) => {
-            let elem = merge_types(le, re).ok_or_else(|| net_no_operator(lb, op, rb))?;
+            let elem = merge_types(le, re).ok_or_else(|| undefined_binary_operator(lb, op, rb))?;
             PgType::Array(elem.oid())
         }
         (Some((arr, _)), None) => {
             if binding_typed_ty(rb).is_some() {
-                return Err(net_no_operator(lb, op, rb));
+                return Err(undefined_binary_operator(lb, op, rb));
             }
             arr
         }
         (None, Some((arr, _))) => {
             if binding_typed_ty(lb).is_some() {
-                return Err(net_no_operator(lb, op, rb));
+                return Err(undefined_binary_operator(lb, op, rb));
             }
             arr
         }
@@ -4772,7 +4802,7 @@ fn resolve_macaddr_op(
     let mac_ty = match (lt, rt) {
         (Some(l), Some(r)) if is_mac(lt) && is_mac(rt) => {
             if l != r {
-                return Err(net_no_operator(lb, op, rb));
+                return Err(undefined_binary_operator(lb, op, rb));
             }
             l
         }
@@ -4784,7 +4814,7 @@ fn resolve_macaddr_op(
     // literal; a typed non-mac partner (e.g. `macaddr & integer`) has no operator.
     let typed_non_mac = |t: Option<PgType>| t.is_some() && !is_mac(t);
     if typed_non_mac(lt) || typed_non_mac(rt) {
-        return Err(net_no_operator(lb, op, rb));
+        return Err(undefined_binary_operator(lb, op, rb));
     }
     let a = resolve_operand(lb, mac_ty)?;
     let b = resolve_operand(rb, mac_ty)?;
@@ -4825,6 +4855,133 @@ fn resolve_jsonb_op(
         ret: PgType::Bool,
         args: vec![left, right],
     })))
+}
+
+/// Text-search operators: `tsvector @@ tsquery` (either operand order), and
+/// `tsquery && | <-> tsquery`.
+///
+/// Both operands must be untyped literals or already the required text-search
+/// type. `Ok(None)` when no text-search operand is present, so `@@` still
+/// reaches the jsonpath resolver; otherwise an error, so `point <-> tsquery`
+/// reports a missing operator rather than a cast failure from inside
+/// `coerce_expr`.
+fn resolve_ts_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+) -> Result<Option<Binding>, BindError> {
+    use crate::functions::TsFn;
+    let (lt, rt) = (binding_typed_ty(lb), binding_typed_ty(rb));
+    // An operand is usable as `want` only if it is untyped or already `want`.
+    let usable = |t: Option<PgType>, want: PgType| t.is_none_or(|t| t == want);
+    match op {
+        ast::BinaryOperator::AtAt => {
+            // Decide the operand order from whichever side is already typed.
+            let swapped = match (lt, rt) {
+                (Some(PgType::Tsvector), _) | (_, Some(PgType::Tsquery)) => false,
+                (Some(PgType::Tsquery), _) | (_, Some(PgType::Tsvector)) => true,
+                _ => return Ok(None),
+            };
+            let (vec_b, query_b) = if swapped { (rb, lb) } else { (lb, rb) };
+            let (vec_t, query_t) = if swapped { (rt, lt) } else { (lt, rt) };
+            // The vector side must already *be* a tsvector. PG resolves an
+            // untyped literal here to `text`, not `tsvector` -- `'Hello World'
+            // @@ 'hello'::tsquery` is `to_tsvector('Hello World') @@ …`, which
+            // is true. Parsing the literal as a tsvector instead would answer
+            // false, and look like a real answer. Both that and an explicit
+            // `text` operand need a text search configuration, a later rung, so
+            // report the honest 0A000 rather than a wrong boolean or a 42883
+            // that would deny an operator PG really has.
+            if vec_t.is_none() || vec_t.is_some_and(is_text_family) {
+                return Err(BindError::feature_not_supported(
+                    "text @@ tsquery is not supported yet: it requires a text search \
+                     configuration (to_tsvector)",
+                ));
+            }
+            if !usable(vec_t, PgType::Tsvector) || !usable(query_t, PgType::Tsquery) {
+                return Err(undefined_binary_operator(lb, op, rb));
+            }
+            Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+                func: ScalarFn::Ts(TsFn::Match),
+                ret: PgType::Bool,
+                args: vec![
+                    resolve_operand(vec_b, PgType::Tsvector)?,
+                    resolve_operand(query_b, PgType::Tsquery)?,
+                ],
+            })))
+        }
+        // `&&` and `<->` combine two queries. Without a typed `tsquery` these
+        // belong to arrays/inet and to the geometric distance operator.
+        ast::BinaryOperator::PGOverlap | ast::BinaryOperator::LtDashGt => {
+            if lt != Some(PgType::Tsquery) && rt != Some(PgType::Tsquery) {
+                return Ok(None);
+            }
+            if !usable(lt, PgType::Tsquery) || !usable(rt, PgType::Tsquery) {
+                return Err(undefined_binary_operator(lb, op, rb));
+            }
+            let f = if matches!(op, ast::BinaryOperator::PGOverlap) {
+                TsFn::QueryAnd
+            } else {
+                TsFn::QueryPhrase
+            };
+            Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+                func: ScalarFn::Ts(f),
+                ret: PgType::Tsquery,
+                args: vec![
+                    resolve_operand(lb, PgType::Tsquery)?,
+                    resolve_operand(rb, PgType::Tsquery)?,
+                ],
+            })))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn resolve_ts_concat(lb: &Binding, rb: &Binding) -> Result<Option<Binding>, BindError> {
+    use crate::functions::TsFn;
+    let (lt, rt) = (binding_typed_ty(lb), binding_typed_ty(rb));
+    let ty = if lt == Some(PgType::Tsvector) || rt == Some(PgType::Tsvector) {
+        PgType::Tsvector
+    } else if lt == Some(PgType::Tsquery) || rt == Some(PgType::Tsquery) {
+        PgType::Tsquery
+    } else {
+        return Ok(None);
+    };
+    // The other side must be untyped or the same text-search type. Anything else
+    // (`text || tsvector`) is PG's `anytextcat`, which renders the tsvector as
+    // text — so leave it to `bind_string_concat`.
+    if !lt.is_none_or(|t| t == ty) || !rt.is_none_or(|t| t == ty) {
+        return Ok(None);
+    }
+    let f = if ty == PgType::Tsvector {
+        TsFn::VectorConcat
+    } else {
+        TsFn::QueryOr
+    };
+    let left = resolve_operand(lb, ty)?;
+    let right = resolve_operand(rb, ty)?;
+    Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+        func: ScalarFn::Ts(f),
+        ret: ty,
+        args: vec![left, right],
+    })))
+}
+
+/// `!! tsquery` — negation. PG spells prefix `!!` as the "factorial" token.
+fn resolve_ts_unary(operand: Binding) -> Result<Binding, BindError> {
+    use crate::functions::TsFn;
+    let e = match operand {
+        Binding::Typed(e) if e.ty() == PgType::Tsquery => e,
+        Binding::Typed(e) => return Err(no_op_unary("!!", e.ty().name())),
+        Binding::Unknown { lit, span, param } => {
+            resolve_unknown(lit, span, param, PgType::Tsquery)?
+        }
+    };
+    Ok(Binding::Typed(BoundExpr::FuncCall {
+        func: ScalarFn::Ts(TsFn::QueryNot),
+        ret: PgType::Tsquery,
+        args: vec![e],
+    }))
 }
 
 fn resolve_operand(b: &Binding, target: PgType) -> Result<BoundExpr, BindError> {
@@ -5539,6 +5696,14 @@ fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Jsonpath => crabgresql_types::jsonpath::jsonpath_in(s)
             .map(Value::Jsonpath)
             .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail)),
+        // The text-search types parse their own input languages. Neither carries
+        // a DETAIL; the message already names the offending input.
+        PgType::Tsvector => crabgresql_types::tsvector::tsvector_in(s)
+            .map(Value::Tsvector)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Tsquery => crabgresql_types::tsquery::tsquery_in(s)
+            .map(Value::Tsquery)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         // `array_in`: parse a `{...}` literal, coercing each element to the array
         // element type. Carry PG's DETAIL through (`'{a,,c}'::int[]`).
         PgType::Array(elem_oid) => {

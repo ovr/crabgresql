@@ -52,3 +52,5 @@ test: copy
 test: partition
 test: collate
 test: psql_describe
+test: tsvector
+test: tsquery

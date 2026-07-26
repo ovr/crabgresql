@@ -885,6 +885,8 @@ mod tests {
             ("json", PgType::Json),
             ("jsonb", PgType::Jsonb),
             ("jsonpath", PgType::Jsonpath),
+            ("tsvector", PgType::Tsvector),
+            ("tsquery", PgType::Tsquery),
         ];
         for (typname, ty) in modeled {
             let row = PG_TYPE_ROWS

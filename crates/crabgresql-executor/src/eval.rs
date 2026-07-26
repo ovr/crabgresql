@@ -14,7 +14,7 @@ use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::text::quote_ident;
 use crabgresql_types::{
     Inet, Interval, Numeric, PgType, TimeTz, Value, bit, cast, collation, date, float, interval,
-    json, money, net, time, timetz,
+    json, money, net, time, timetz, tsquery, tsvector,
 };
 
 use crate::{CatalogOps, ExecContext, ExecError};
@@ -723,6 +723,9 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         // jsonb: PG's `compareJsonbContainers` total order. (`json` has no
         // default ordering and never reaches here.)
         PgType::Jsonb => json::cmp(jsonb_of(l), jsonb_of(r)),
+        // The text-search types carry their own total orders.
+        PgType::Tsvector => tsvector::cmp(tsvector_of(l), tsvector_of(r)),
+        PgType::Tsquery => tsquery::cmp(tsquery_of(l), tsquery_of(r)),
         // Arrays: element-wise comparison, then the shorter array is less on a
         // common prefix (PG's `array_cmp`). A NULL element sorts after any
         // non-NULL (NULLS-LAST), matching the default btree order.
@@ -916,6 +919,20 @@ fn jsonb_of(v: &Value) -> &json::Jsonb {
     match v {
         Value::Jsonb(j) => j,
         other => unreachable!("expected jsonb, got {other:?}"),
+    }
+}
+
+fn tsvector_of(v: &Value) -> &tsvector::TsVector {
+    match v {
+        Value::Tsvector(t) => t,
+        other => unreachable!("expected tsvector, got {other:?}"),
+    }
+}
+
+fn tsquery_of(v: &Value) -> &tsquery::TsQuery {
+    match v {
+        Value::Tsquery(q) => q,
+        other => unreachable!("expected tsquery, got {other:?}"),
     }
 }
 

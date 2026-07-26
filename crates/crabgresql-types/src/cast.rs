@@ -38,6 +38,13 @@ fn json_err(e: json::JsonError) -> CastError {
     }
 }
 
+fn ts_err(e: crate::tsvector::TsError) -> CastError {
+    CastError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+    }
+}
+
 fn cannot_coerce(from: PgType, to: PgType) -> CastError {
     CastError {
         sqlstate: CANNOT_COERCE,
@@ -455,6 +462,18 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
 
         // ---- lseg → point (lseg_center): the segment's midpoint ----
         (Value::Lseg(l), PgType::Point) => Ok(Value::Point(crate::geo::lseg_center(l))),
+
+        // ---- tsvector / tsquery input ----
+        // The reverse direction (→ text/varchar/...) is handled by the generic
+        // any-to-text arm above, which re-uses `encode_text_with`.
+        (Value::Text(s), PgType::Tsvector) => crate::tsvector::tsvector_in(s)
+            .map(Value::Tsvector)
+            .map_err(ts_err),
+        (Value::Text(s), PgType::Tsquery) => crate::tsquery::tsquery_in(s)
+            .map(Value::Tsquery)
+            .map_err(ts_err),
+        // `tsvector` → `tsquery` is not a cast in PG, and vice versa; both fall
+        // through to the generic "cannot cast" error below.
 
         // ---- json / jsonb I/O and conversions ----
         // `json`/`jsonb` → text/varchar/... is handled by the generic
