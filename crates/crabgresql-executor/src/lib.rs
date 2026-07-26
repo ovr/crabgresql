@@ -3679,9 +3679,9 @@ mod tests {
             ],
         )));
         let txn = wtxn();
-        table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
-        table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
-        table.insert(vec![Value::Int4(3), Value::Null], &txn);
+        test_ok(table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn));
+        test_ok(table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn));
+        test_ok(table.insert(vec![Value::Int4(3), Value::Null], &txn));
         table
     }
 
@@ -3721,9 +3721,9 @@ mod tests {
             },
         ));
         let txn = wtxn();
-        table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
-        table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
-        table.insert(vec![Value::Int4(3), Value::Null], &txn);
+        test_ok(table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn));
+        test_ok(table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn));
+        test_ok(table.insert(vec![Value::Int4(3), Value::Null], &txn));
         table
     }
 
@@ -4171,9 +4171,9 @@ mod tests {
             ],
         )));
         let txn = wtxn();
-        table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn);
-        table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn);
-        table.insert(vec![Value::Int4(3), Value::Text("three".into())], &txn);
+        test_ok(table.insert(vec![Value::Int4(1), Value::Text("one".into())], &txn));
+        test_ok(table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn));
+        test_ok(table.insert(vec![Value::Int4(3), Value::Text("three".into())], &txn));
         engine
     }
 
@@ -4408,7 +4408,7 @@ mod tests {
         ];
         for (a, b) in seed {
             let b = b.map(Value::Int4).unwrap_or(Value::Null);
-            table.insert(vec![Value::Int4(a), b], &txn);
+            test_ok(table.insert(vec![Value::Int4(a), b], &txn));
         }
         engine
     }
@@ -4507,7 +4507,7 @@ mod tests {
             table.insert(
                 vec![Value::Int4(g), v.map(Value::Int4).unwrap_or(Value::Null)],
                 &txn,
-            );
+            )?;
         }
         let engine: Arc<dyn TableEngine> = engine;
         let (_c, rows) = run_rows_on(
@@ -4620,7 +4620,7 @@ mod tests {
         let txn = wtxn();
         for (k, v) in [(Some(1), 10), (None, 20), (Some(1), 5), (None, 7)] {
             let k = k.map(Value::Int4).unwrap_or(Value::Null);
-            table.insert(vec![k, Value::Int4(v)], &txn);
+            table.insert(vec![k, Value::Int4(v)], &txn)?;
         }
         let engine: Arc<dyn TableEngine> = engine;
         // ORDER BY k with NULLS LAST-for-ASC (PG default) so the row order is fixed.
@@ -4651,7 +4651,7 @@ mod tests {
         ))?;
         let txn = wtxn();
         for x in [0.0_f64, -0.0, f64::NAN, f64::NAN] {
-            table.insert(vec![Value::Float8(x)], &txn);
+            table.insert(vec![Value::Float8(x)], &txn)?;
         }
         let engine: Arc<dyn TableEngine> = engine;
         let (_c, rows) = run_rows_on(&engine, "SELECT count(*) FROM f GROUP BY x");
@@ -4978,7 +4978,7 @@ mod tests {
         )));
         let txn = wtxn();
         for n in [1, 2, 3] {
-            table.insert(vec![Value::Int4(n)], &txn);
+            test_ok(table.insert(vec![Value::Int4(n)], &txn));
         }
         engine
     }

@@ -121,7 +121,7 @@ fn many_rows_force_splits_and_every_key_is_findable() -> anyhow::Result<()> {
     let ctx = tm.context(x, CommandId::FIRST);
     let mut id = 1i32;
     for _ in 0..N {
-        table.insert(vec![Value::Int4(id), Value::Text("v".into())], &ctx);
+        table.insert(vec![Value::Int4(id), Value::Text("v".into())], &ctx)?;
         // A simple full-period LCG over [0, N) reordered by stepping a coprime.
         id = (id + 1237) % N;
     }
@@ -152,11 +152,11 @@ fn duplicate_keys_return_every_matching_row_across_split_leaves() -> anyhow::Res
     let ctx = tm.context(x, CommandId::FIRST);
     const DUPES: usize = 2000;
     for i in 0..DUPES {
-        table.insert(vec![Value::Int4(7), Value::Text(format!("d{i}"))], &ctx);
+        table.insert(vec![Value::Int4(7), Value::Text(format!("d{i}"))], &ctx)?;
     }
     // A couple of other keys so the duplicate run has neighbors.
-    table.insert(vec![Value::Int4(1), Value::Text("one".into())], &ctx);
-    table.insert(vec![Value::Int4(9), Value::Text("nine".into())], &ctx);
+    table.insert(vec![Value::Int4(1), Value::Text("one".into())], &ctx)?;
+    table.insert(vec![Value::Int4(9), Value::Text("nine".into())], &ctx)?;
     tm.commit(x)?;
 
     let hits = table
@@ -182,7 +182,7 @@ fn update_moves_key_and_old_snapshot_still_sees_old_version() -> anyhow::Result<
 
     // Update the key column 1 -> 2, committed.
     let xu = tm.allocate_xid();
-    table.update(tid, vec![Value::Int4(2), Value::Text("a2".into())], &tm.context(xu, CommandId::FIRST));
+    table.update(tid, vec![Value::Int4(2), Value::Text("a2".into())], &tm.context(xu, CommandId::FIRST))?;
     tm.commit(xu)?;
 
     // Under the pre-update snapshot: key 1 still finds the old version, key 2 is
@@ -207,7 +207,7 @@ fn delete_hides_the_row_from_the_probe() -> anyhow::Result<()> {
     let before = read(&tm);
 
     let xd = tm.allocate_xid();
-    table.delete(tid, &tm.context(xd, CommandId::FIRST));
+    table.delete(tid, &tm.context(xd, CommandId::FIRST))?;
     tm.commit(xd)?;
 
     // The committer's later snapshot sees nothing; the pre-delete snapshot still
@@ -225,8 +225,8 @@ fn null_key_is_not_indexed_and_probing_null_is_empty() -> anyhow::Result<()> {
     engine.create_index("public", "t", idx_on_id())?;
     // Row whose key column is NULL: not indexed (NULL never satisfies equality).
     let x = tm.allocate_xid();
-    table.insert(vec![Value::Null, Value::Text("null-key".into())], &tm.context(x, CommandId::FIRST));
-    table.insert(vec![Value::Int4(1), Value::Text("one".into())], &tm.context(x, CommandId::FIRST));
+    table.insert(vec![Value::Null, Value::Text("null-key".into())], &tm.context(x, CommandId::FIRST))?;
+    table.insert(vec![Value::Int4(1), Value::Text("one".into())], &tm.context(x, CommandId::FIRST))?;
     tm.commit(x)?;
 
     // A NULL probe is served (the index is physical) but matches nothing.
@@ -248,7 +248,7 @@ fn un_indexable_key_type_falls_back_to_scan() -> anyhow::Result<()> {
     let s = TableSchema::new("t", vec![Column::new("f", PgType::Float8)]);
     let table = engine.create_table(s)?;
     let x = tm.allocate_xid();
-    table.insert(vec![Value::Float8(1.5)], &tm.context(x, CommandId::FIRST));
+    table.insert(vec![Value::Float8(1.5)], &tm.context(x, CommandId::FIRST))?;
     tm.commit(x)?;
     engine.create_index(
         "public",
@@ -283,7 +283,7 @@ fn vacuum_removes_the_index_entry_so_a_reused_slot_is_not_found() -> anyhow::Res
     // Delete row id=1 and vacuum past its deleter, reclaiming both the heap slot
     // and its index entry.
     let xd = tm.allocate_xid();
-    table.delete(tid, &tm.context(xd, CommandId::FIRST));
+    table.delete(tid, &tm.context(xd, CommandId::FIRST))?;
     tm.commit(xd)?;
     let horizon = tm.allocate_xid();
     table.vacuum(horizon, tm.clog());
@@ -314,7 +314,7 @@ fn index_survives_a_crash_and_serves_probes_after_recovery() -> anyhow::Result<(
         let x = tm.allocate_xid();
         let ctx = tm.context(x, CommandId::FIRST);
         for id in 3..800 {
-            table.insert(vec![Value::Int4(id), Value::Text("v".into())], &ctx);
+            table.insert(vec![Value::Int4(id), Value::Text("v".into())], &ctx)?;
         }
         tm.commit(x)?;
     }
@@ -412,7 +412,7 @@ fn large_and_mixed_size_keys_split_without_panic_or_corruption() -> anyhow::Resu
         // Unique, order-varied keys: a 6-char index prefix then padding.
         let key = format!("{i:06}{}", "x".repeat(len));
         keys.push(key.clone());
-        table.insert(vec![Value::Text(key)], &ctx);
+        table.insert(vec![Value::Text(key)], &ctx)?;
     }
     tm.commit(x)?;
 
@@ -442,7 +442,7 @@ fn metadata_only_index_allocates_no_file_and_no_relfilenode() -> anyhow::Result<
     // float8 is not order-preserving-encodable → metadata-only index.
     let table = engine.create_table(TableSchema::new("t", vec![Column::new("f", PgType::Float8)]))?;
     let x = tm.allocate_xid();
-    table.insert(vec![Value::Float8(1.5)], &tm.context(x, CommandId::FIRST));
+    table.insert(vec![Value::Float8(1.5)], &tm.context(x, CommandId::FIRST))?;
     tm.commit(x)?;
     let before = base_files(dir.path());
 
@@ -472,7 +472,7 @@ fn oversized_key_create_index_panics_without_freezing_the_table() -> anyhow::Res
     let table = engine.create_table(TableSchema::new("t", vec![Column::new("s", PgType::Text)]))?;
     // A value whose encoded key exceeds the B-tree item cap.
     let x = tm.allocate_xid();
-    table.insert(vec![Value::Text("z".repeat(4000))], &tm.context(x, CommandId::FIRST));
+    table.insert(vec![Value::Text("z".repeat(4000))], &tm.context(x, CommandId::FIRST))?;
     tm.commit(x)?;
 
     // CREATE INDEX panics building the tree (index row size exceeds btree maximum).
@@ -484,7 +484,7 @@ fn oversized_key_create_index_panics_without_freezing_the_table() -> anyhow::Res
     // The table's exclusive lock was released by the RAII guard during unwind, so
     // the table is still usable (this would hang/deadlock if the lock leaked).
     let x = tm.allocate_xid();
-    table.insert(vec![Value::Text("small".into())], &tm.context(x, CommandId::FIRST));
+    table.insert(vec![Value::Text("small".into())], &tm.context(x, CommandId::FIRST))?;
     tm.commit(x)?;
     assert_eq!(table.scan(&read(&tm)).count(), 2);
     // The failed index was never published.

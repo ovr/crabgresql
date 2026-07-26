@@ -79,10 +79,14 @@ This product depends on the Apache Arrow Rust and Apache Parquet Rust crates
 crates/crabgresql-parquet-engine for managed columnar table storage:
 
   Copyright The Apache Software Foundation
+  Copyright (c) 2020-2022 Oliver Margetts
 
-licensed under Apache-2.0. Snappy compression is provided through Parquet's
-`snap` feature and the Apache-2.0 `snap` crate. These are ordinary Cargo
-dependencies, not vendored.
+licensed under Apache-2.0 AND MIT. Snappy compression is provided through
+Parquet's `snap` feature and the BSD-3-Clause `snap` crate:
+
+  Copyright 2011, The Snappy-Rust Authors
+
+These are ordinary Cargo dependencies, not vendored.
 
 This product depends on the `icu_collator` and `icu_locale_core` crates from the
 ICU4X project (used only by crates/crabgresql-types/src/collation.rs to order

@@ -127,7 +127,7 @@ fn uncommitted_insert_is_invisible_until_commit() -> anyhow::Result<()> {
     let table = h.engine.create_table(schema("t"))?;
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    table.insert(vec![Value::Int4(1), Value::Null], &txn);
+    table.insert(vec![Value::Int4(1), Value::Null], &txn)?;
     assert_eq!(table.scan(&read(&h.tm)).count(), 0);
     let self_read = h.tm.context(xid, CommandId(1));
     assert_eq!(table.scan(&self_read).count(), 1);
@@ -143,7 +143,7 @@ fn aborted_insert_is_never_visible() -> anyhow::Result<()> {
     let table = h.engine.create_table(schema("t"))?;
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    table.insert(vec![Value::Int4(1), Value::Null], &txn);
+    table.insert(vec![Value::Int4(1), Value::Null], &txn)?;
     h.tm.abort(xid);
     assert_eq!(table.scan(&read(&h.tm)).count(), 0);
 
@@ -186,7 +186,7 @@ fn rolled_back_update_restores_old_version() -> anyhow::Result<()> {
     );
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())], &txn);
+    table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())], &txn)?;
     h.tm.abort(xid);
     let rows: Vec<_> = scan_rows(&*table, &read(&h.tm))
         .into_iter()
@@ -220,7 +220,7 @@ fn rolled_back_delete_keeps_the_row() -> anyhow::Result<()> {
     let a = insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    table.delete(a, &txn);
+    table.delete(a, &txn)?;
     h.tm.abort(xid);
     assert_eq!(ids(&h.tm, &*table), vec![Value::Int4(1)]);
 
@@ -233,7 +233,7 @@ fn vacuum_keeps_live_row_whose_deleter_aborted() -> anyhow::Result<()> {
     let table = h.engine.create_table(schema("t"))?;
     let a = insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
     let x = h.tm.allocate_xid();
-    table.delete(a, &h.tm.context(x, CommandId::FIRST));
+    table.delete(a, &h.tm.context(x, CommandId::FIRST))?;
     h.tm.abort(x);
     let horizon = h.tm.allocate_xid();
     table.vacuum(horizon, h.tm.clog());
@@ -249,7 +249,7 @@ fn vacuum_reclaims_committed_dead_row() -> anyhow::Result<()> {
     let a = insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
     insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Null]);
     let x = h.tm.allocate_xid();
-    table.delete(a, &h.tm.context(x, CommandId::FIRST));
+    table.delete(a, &h.tm.context(x, CommandId::FIRST))?;
     h.tm.commit(x)?;
     let horizon = h.tm.allocate_xid();
     table.vacuum(horizon, h.tm.clog());
@@ -317,7 +317,7 @@ fn update_many_applies_batch_and_skips_missing() -> anyhow::Result<()> {
     let a = insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
     let b = insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Null]);
     let dx = h.tm.allocate_xid();
-    table.delete(b, &h.tm.context(dx, CommandId::FIRST));
+    table.delete(b, &h.tm.context(dx, CommandId::FIRST))?;
     h.tm.commit(dx)?;
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
@@ -343,7 +343,7 @@ fn delete_many_removes_batch_in_one_pass() -> anyhow::Result<()> {
     let b = insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Null]);
     let c = insert_committed(&h.tm, &*table, vec![Value::Int4(3), Value::Null]);
     let dx = h.tm.allocate_xid();
-    table.delete(b, &h.tm.context(dx, CommandId::FIRST));
+    table.delete(b, &h.tm.context(dx, CommandId::FIRST))?;
     h.tm.commit(dx)?;
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
@@ -424,7 +424,7 @@ fn analyze_counts_visible_rows_exactly() -> anyhow::Result<()> {
     table.insert(
         vec![Value::Int4(9998), Value::Null],
         &h.tm.context(pending, CommandId::FIRST),
-    );
+    )?;
     let gone = table
         .scan(&read(&h.tm))
         .next()
@@ -432,7 +432,7 @@ fn analyze_counts_visible_rows_exactly() -> anyhow::Result<()> {
         .map(|(tid, _)| tid)
         .expect("seeded rows");
     let del = h.tm.allocate_xid();
-    table.delete(gone, &h.tm.context(del, CommandId::FIRST));
+    table.delete(gone, &h.tm.context(del, CommandId::FIRST))?;
     h.tm.commit(del)?;
 
     let xid = h.tm.allocate_xid();
@@ -558,7 +558,7 @@ fn concurrent_inserts_are_all_visible_with_distinct_tids() -> anyhow::Result<()>
                 for i in 0..250 {
                     let xid = h.tm.allocate_xid();
                     let txn = h.tm.context(xid, CommandId::FIRST);
-                    table.insert(vec![Value::Int4(i), Value::Null], &txn);
+                    table.insert(vec![Value::Int4(i), Value::Null], &txn)?;
                     h.tm.commit(xid)?;
                 }
                 Ok(())
@@ -609,7 +609,7 @@ fn concurrent_updates_of_one_row_never_duplicate_it() -> anyhow::Result<()> {
                         tid,
                         vec![Value::Int4(1000 + w), Value::Text("vN".into())],
                         &txn,
-                    );
+                    )?;
                     tm.commit(xid)?;
                     Ok(())
                 }));
@@ -645,7 +645,7 @@ fn scan_is_stable_against_concurrent_writes() -> anyhow::Result<()> {
     insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Null]);
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    table.update(a, vec![Value::Int4(99), Value::Null], &txn);
+    table.update(a, vec![Value::Int4(99), Value::Null], &txn)?;
     h.tm.commit(xid)?;
     let rows: Vec<_> = scan
         .collect::<Result<Vec<_>, StorageError>>()?;
@@ -757,7 +757,7 @@ fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
 }
 
 #[test]
-fn truncate_upgrades_over_the_same_owners_open_scan() {
+fn truncate_upgrades_over_the_same_owners_open_scan() -> anyhow::Result<()> {
     // Review finding #3: a session that holds an open cursor (a live scan guard)
     // and then TRUNCATEs the same table must not self-deadlock. Run it on a worker
     // thread and fail fast via a timeout if the lock upgrade regresses to a hang.
@@ -765,9 +765,9 @@ fn truncate_upgrades_over_the_same_owners_open_scan() {
     use std::time::Duration;
 
     let (done_tx, done_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || -> anyhow::Result<()> {
         let h = setup();
-        let table = h.engine.create_table(schema("t")).unwrap();
+        let table = h.engine.create_table(schema("t"))?;
         insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
 
         // Open a scan under owner 42 and keep it paused mid-stream (a suspended
@@ -781,36 +781,41 @@ fn truncate_upgrades_over_the_same_owners_open_scan() {
         let tx = h.tm.allocate_xid();
         let mut trunc_ctx = h.tm.context(tx, CommandId::FIRST);
         trunc_ctx.lock_owner = LockOwner(42);
-        table.truncate(&trunc_ctx);
-        h.tm.commit(tx).unwrap();
+        table.truncate(&trunc_ctx)?;
+        h.tm.commit(tx)?;
         drop(scan);
-        done_tx.send(()).unwrap();
+        done_tx.send(())?;
+        Ok(())
     });
 
     done_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("TRUNCATE deadlocked against the same session's open scan");
-    worker.join().unwrap();
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("TRUNCATE worker panicked"))??;
+    Ok(())
 }
 
 #[test]
-fn drop_table_reclaims_a_pending_truncate_file() {
+fn drop_table_reclaims_a_pending_truncate_file() -> anyhow::Result<()> {
     // Review finding #4: a staged (uncommitted) TRUNCATE's new file lives on the
     // handle, not the catalog; dropping the table must reclaim it, not leak it.
     let h = setup();
-    let table = h.engine.create_table(schema("t")).unwrap();
+    let table = h.engine.create_table(schema("t"))?;
     insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
 
     // Stage an uncommitted TRUNCATE: the first table is relfilenode 1, so the
     // staged empty file is relfilenode 2.
     let tx = h.tm.allocate_xid();
-    table.truncate(&h.tm.context(tx, CommandId::FIRST));
+    table.truncate(&h.tm.context(tx, CommandId::FIRST))?;
     let staged = h._dir.path().join("base").join("2");
     assert!(staged.exists(), "staged TRUNCATE file should exist before the drop");
 
-    h.engine.drop_table("public", "t").unwrap();
+    h.engine.drop_table("public", "t")?;
     assert!(
         !staged.exists(),
         "drop_table must unlink the staged TRUNCATE file (no leak)"
     );
+    Ok(())
 }

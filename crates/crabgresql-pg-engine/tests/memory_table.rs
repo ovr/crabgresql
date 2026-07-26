@@ -149,7 +149,7 @@ fn temporary_table_truncate_swaps_in_ram() -> anyhow::Result<()> {
     insert_committed(&h.tm, &*t, vec![Value::Int4(1), Value::Null]);
     insert_committed(&h.tm, &*t, vec![Value::Int4(2), Value::Null]);
     let tx = h.tm.allocate_xid();
-    t.truncate(&h.tm.context(tx, CommandId::FIRST));
+    t.truncate(&h.tm.context(tx, CommandId::FIRST))?;
     h.tm.commit(tx)?;
     assert_eq!(t.scan(&read(&h.tm)).count(), 0);
     insert_committed(&h.tm, &*t, vec![Value::Int4(3), Value::Null]);
