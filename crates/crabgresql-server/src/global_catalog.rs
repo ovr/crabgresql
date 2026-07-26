@@ -130,28 +130,199 @@ struct TypeEntry {
     dependents: Vec<DepId>,
 }
 
-/// How a registered function is implemented: a `LANGUAGE internal` builtin named
-/// by its C symbol (used only for the type-bootstrap I/O functions), or a
-/// `LANGUAGE SQL` function carrying its normalized `SELECT <expr>` body text.
+/// How a registered routine is implemented: a `LANGUAGE internal` builtin named
+/// by its C symbol (used only for the type-bootstrap I/O functions), a
+/// `LANGUAGE SQL` function carrying its normalized `SELECT <expr>` body text,
+/// or a `LANGUAGE plpgsql` routine carrying its body verbatim.
 pub enum FuncBody {
     Internal(String),
     Sql(String),
+    PlPgSql(String),
+}
+
+impl FuncBody {
+    /// The `pg_language` OID this body's language has.
+    pub fn lang_oid(&self) -> u32 {
+        match self {
+            FuncBody::Internal(_) => lang::INTERNAL,
+            FuncBody::Sql(_) => lang::SQL,
+            FuncBody::PlPgSql(_) => lang::PLPGSQL,
+        }
+    }
+
+    /// The body text as written — PG's `pg_proc.prosrc`. For a
+    /// `LANGUAGE internal` routine this is the C symbol name, as in PG.
+    pub fn src(&self) -> &str {
+        match self {
+            FuncBody::Internal(s) | FuncBody::Sql(s) | FuncBody::PlPgSql(s) => s,
+        }
+    }
+}
+
+/// `pg_language` OIDs. The first three are PostgreSQL's bootstrap OIDs and are
+/// stable across versions; `plpgsql`'s is assigned by `CREATE EXTENSION` at
+/// initdb time in PG and therefore varies by build, so there is nothing to
+/// reproduce — clients match on `lanname`, not on the OID.
+pub mod lang {
+    pub const INTERNAL: u32 = 12;
+    pub const C: u32 = 13;
+    pub const SQL: u32 = 14;
+    pub const PLPGSQL: u32 = 13540;
+}
+
+/// Whether a routine was created by `CREATE FUNCTION` or `CREATE PROCEDURE` —
+/// PG's `pg_proc.prokind`. The two share one catalog and one name/argument
+/// namespace, so a procedure can win overload resolution in expression context
+/// and must be rejected there rather than silently missed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutineKind {
+    Function,
+    Procedure,
+}
+
+impl RoutineKind {
+    /// The `pg_proc.prokind` character.
+    pub fn prokind(self) -> char {
+        match self {
+            RoutineKind::Function => 'f',
+            RoutineKind::Procedure => 'p',
+        }
+    }
+
+    /// The object class as PG names it in error text ("function"/"procedure").
+    pub fn noun(self) -> &'static str {
+        match self {
+            RoutineKind::Function => "function",
+            RoutineKind::Procedure => "procedure",
+        }
+    }
+}
+
+/// `IMMUTABLE | STABLE | VOLATILE` — PG's `pg_proc.provolatile`. PG defaults to
+/// `VOLATILE`, which is also the safe default here: a volatile routine is
+/// re-evaluated per row and forces a writable transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Volatility {
+    Immutable,
+    Stable,
+    #[default]
+    Volatile,
+}
+
+impl Volatility {
+    /// The `pg_proc.provolatile` character.
+    pub fn provolatile(self) -> char {
+        match self {
+            Volatility::Immutable => 'i',
+            Volatility::Stable => 's',
+            Volatility::Volatile => 'v',
+        }
+    }
+}
+
+/// A routine argument's mode — PG's `pg_proc.proargmodes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ArgMode {
+    #[default]
+    In,
+    Out,
+    InOut,
+}
+
+impl ArgMode {
+    /// The `pg_proc.proargmodes` character.
+    pub fn proargmode(self) -> char {
+        match self {
+            ArgMode::In => 'i',
+            ArgMode::Out => 'o',
+            ArgMode::InOut => 'b',
+        }
+    }
+
+    /// Whether an argument in this mode is passed in by the caller, and so is
+    /// part of the routine's identity for overload resolution and DROP.
+    pub fn is_input(self) -> bool {
+        !matches!(self, ArgMode::Out)
+    }
+}
+
+/// One declared argument of a routine, as written.
+#[derive(Clone, Debug)]
+pub struct RoutineArg {
+    pub ty: TypeRef,
+    pub mode: ArgMode,
+    /// The parameter name, when the declaration gave one. A PL/pgSQL body
+    /// refers to its arguments by these names.
+    pub name: Option<String>,
+    /// 1-based (line, column) of the argument's type token, for the caret on
+    /// the "argument type is only a shell" NOTICE. `None` when unknown.
+    pub position: Option<(u64, u64)>,
+}
+
+/// Everything `CREATE FUNCTION` / `CREATE PROCEDURE` declares about a routine.
+/// Passed as a struct because the attribute set is wide and mostly optional.
+pub struct RoutineDefinition {
+    pub name: String,
+    pub kind: RoutineKind,
+    /// Every declared argument, including `OUT` ones. The routine's *identity*
+    /// (overload resolution, DROP) uses only the input arguments; `OUT`
+    /// parameters are kept for `pg_proc.proallargtypes`/`proargmodes`.
+    pub args: Vec<RoutineArg>,
+    /// `void` for a procedure, which declares no return type.
+    pub ret: TypeRef,
+    pub body: FuncBody,
+    pub volatility: Volatility,
+    /// `STRICT` / `RETURNS NULL ON NULL INPUT`: a NULL argument short-circuits
+    /// the call to NULL without entering the body.
+    pub strict: bool,
+    /// `SECURITY DEFINER`.
+    pub secdef: bool,
 }
 
 struct FuncEntry {
     oid: u32,
     name: String,
+    /// The schema the routine lives in. Always `public` today —
+    /// `CREATE FUNCTION app.f` is still unsupported.
+    namespace: String,
+    kind: RoutineKind,
+    /// Input-argument types: the routine's identity.
     args: Vec<TypeRef>,
+    /// Every declared argument including `OUT` ones, in declaration order.
+    all_args: Vec<RoutineArg>,
     ret: TypeRef,
     body: FuncBody,
+    volatility: Volatility,
+    strict: bool,
+    secdef: bool,
 }
 
 impl FuncEntry {
     /// PG's `function name(argtype, ...)` object description.
     fn describe(&self) -> String {
         let args: Vec<String> = self.args.iter().map(TypeRef::display_name).collect();
-        format!("function {}({})", self.name, args.join(", "))
+        format!("{} {}({})", self.kind.noun(), self.name, args.join(", "))
     }
+}
+
+/// A registered routine as seen from outside the catalog — the shape `pg_proc`
+/// rows and the routine interpreter are built from. Types are reported as
+/// [`TypeRef`]s so the caller decides how an unresolvable one renders.
+#[derive(Clone, Debug)]
+pub struct FuncInfo {
+    pub oid: u32,
+    pub name: String,
+    pub namespace: String,
+    pub kind: RoutineKind,
+    pub lang_oid: u32,
+    pub args: Vec<TypeRef>,
+    pub all_args: Vec<RoutineArg>,
+    pub ret: TypeRef,
+    pub volatility: Volatility,
+    pub strict: bool,
+    pub secdef: bool,
+    /// `pg_proc.prosrc` — the body as written.
+    pub src: String,
 }
 
 struct CastEntry {
@@ -566,22 +737,17 @@ impl GlobalCatalog {
         Ok(Vec::new())
     }
 
-    /// `CREATE FUNCTION`, for both `LANGUAGE internal AS '<internal_name>'` and
-    /// `LANGUAGE SQL` (whose `body` carries the normalized `SELECT <expr>` text).
-    /// Validates an internal name, registers the function, records its type
-    /// dependencies, and returns any "argument/return type is only a shell"
-    /// NOTICEs. `args` pairs each argument type with the 1-based (line, column) of
-    /// its type token, when known — used to point the argument-shell NOTICE's caret.
-    pub fn create_function(
-        &self,
-        name: &str,
-        args: Vec<(TypeRef, Option<(u64, u64)>)>,
-        ret: TypeRef,
-        body: FuncBody,
-    ) -> Result<Vec<CatalogNotice>, PgError> {
+    /// `CREATE FUNCTION` / `CREATE PROCEDURE`, for `LANGUAGE internal AS
+    /// '<internal_name>'`, `LANGUAGE SQL` (whose body carries the normalized
+    /// `SELECT <expr>` text) and `LANGUAGE plpgsql` (whose body is kept
+    /// verbatim). Validates an internal name, registers the routine, records
+    /// its type dependencies, and returns any "argument/return type is only a
+    /// shell" NOTICEs.
+    pub fn create_function(&self, def: RoutineDefinition) -> Result<Vec<CatalogNotice>, PgError> {
         // A `LANGUAGE internal` function must name a supported builtin I/O symbol;
-        // a `LANGUAGE SQL` body was already parsed and validated by the binder.
-        if let FuncBody::Internal(internal_name) = &body
+        // a `LANGUAGE SQL` body was already parsed and validated by the binder,
+        // and a PL/pgSQL body by its own parser.
+        if let FuncBody::Internal(internal_name) = &def.body
             && !is_known_internal(internal_name)
         {
             return Err(PgError::new(
@@ -590,24 +756,32 @@ impl GlobalCatalog {
             ));
         }
 
-        let arg_types: Vec<TypeRef> = args.iter().map(|(ty, _)| ty.clone()).collect();
+        // Identity is the input arguments only: PG excludes OUT parameters from
+        // a routine's signature, so `f(int, OUT int)` and `f(int)` collide.
+        let arg_types: Vec<TypeRef> = def
+            .args
+            .iter()
+            .filter(|a| a.mode.is_input())
+            .map(|a| a.ty.clone())
+            .collect();
 
         let mut cat = self
             .inner
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
 
-        // A function may not be redefined with the same name and argument types.
+        // A routine may not be redefined with the same name and argument types.
         if cat
             .funcs
             .iter()
-            .any(|f| f.name == name && f.args == arg_types)
+            .any(|f| f.name == def.name && f.args == arg_types)
         {
             let arglist: Vec<String> = arg_types.iter().map(TypeRef::display_name).collect();
             return Err(PgError::new(
                 sqlstate::DUPLICATE_FUNCTION,
                 format!(
-                    "function {name}({}) already exists with same argument types",
+                    "function {}({}) already exists with same argument types",
+                    def.name,
                     arglist.join(", ")
                 ),
             ));
@@ -618,41 +792,78 @@ impl GlobalCatalog {
         // PG reports a shell reference for the return type first, then arguments.
         // The return-type NOTICE carries no cursor position (PG prints no caret
         // for it); each argument NOTICE points at its type token.
-        if let TypeRef::User(tname) = &ret
+        if let TypeRef::User(tname) = &def.ret
             && cat.types.get(tname).is_some_and(|e| !e.defined)
         {
             notices.push(CatalogNotice::new(format!(
                 "return type {tname} is only a shell"
             )));
         }
-        for (arg, position) in &args {
-            if let TypeRef::User(tname) = arg
+        for arg in &def.args {
+            if let TypeRef::User(tname) = &arg.ty
                 && cat.types.get(tname).is_some_and(|e| !e.defined)
             {
                 let mut notice =
                     CatalogNotice::new(format!("argument type {tname} is only a shell"));
-                if let Some(pos) = position {
-                    notice = notice.with_position(*pos);
+                if let Some(pos) = arg.position {
+                    notice = notice.with_position(pos);
                 }
                 notices.push(notice);
             }
         }
 
         let oid = cat.alloc_oid();
-        // Every user type mentioned in the signature depends on this function.
-        for tref in std::iter::once(&ret).chain(arg_types.iter()) {
+        // Every user type mentioned in the signature depends on this routine.
+        for tref in std::iter::once(&def.ret).chain(def.args.iter().map(|a| &a.ty)) {
             if let TypeRef::User(tname) = tref {
                 cat.add_dependent(tname, DepId::Func(oid));
             }
         }
         cat.funcs.push(FuncEntry {
             oid,
-            name: name.to_string(),
+            name: def.name,
+            // CREATE FUNCTION does not accept a qualified name yet, so every
+            // routine lands in `public`.
+            namespace: "public".to_string(),
+            kind: def.kind,
             args: arg_types,
-            ret,
-            body,
+            all_args: def.args,
+            ret: def.ret,
+            body: def.body,
+            volatility: def.volatility,
+            strict: def.strict,
+            secdef: def.secdef,
         });
         Ok(notices)
+    }
+
+    /// Every registered routine, ordered by OID. Backs `pg_proc` and the
+    /// routine interpreter's catalog lookups.
+    pub fn functions(&self) -> Vec<FuncInfo> {
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let mut out: Vec<FuncInfo> = cat
+            .funcs
+            .iter()
+            .map(|f| FuncInfo {
+                oid: f.oid,
+                name: f.name.clone(),
+                namespace: f.namespace.clone(),
+                kind: f.kind,
+                lang_oid: f.body.lang_oid(),
+                args: f.args.clone(),
+                all_args: f.all_args.clone(),
+                ret: f.ret.clone(),
+                volatility: f.volatility,
+                strict: f.strict,
+                secdef: f.secdef,
+                src: f.body.src().to_string(),
+            })
+            .collect();
+        out.sort_by_key(|f| f.oid);
+        out
     }
 
     /// `CREATE CAST (source AS target) ...`. Only binary-coercible
@@ -1159,6 +1370,34 @@ fn is_known_internal(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A plain `CREATE FUNCTION` definition: all-`IN` arguments, no attributes.
+    /// `args` pairs each type with the caret position of its type token.
+    fn func(
+        name: &str,
+        args: Vec<(TypeRef, Option<(u64, u64)>)>,
+        ret: TypeRef,
+        body: FuncBody,
+    ) -> RoutineDefinition {
+        RoutineDefinition {
+            name: name.to_string(),
+            kind: RoutineKind::Function,
+            args: args
+                .into_iter()
+                .map(|(ty, position)| RoutineArg {
+                    ty,
+                    mode: ArgMode::In,
+                    name: None,
+                    position,
+                })
+                .collect(),
+            ret,
+            body,
+            volatility: Volatility::Volatile,
+            strict: false,
+            secdef: false,
+        }
+    }
+
     /// Bootstrap the `xfloat8`-over-`int8` sequence and assert the
     /// `DROP TYPE ... CASCADE` NOTICE/DETAIL matches PostgreSQL.
     fn bootstrap_xfloat8() -> GlobalCatalog {
@@ -1166,22 +1405,22 @@ mod tests {
         if let Err(error) = cat.create_shell_type("xfloat8") {
             panic!("failed to create shell type test fixture: {error}");
         }
-        let in_notices = match cat.create_function(
+        let in_notices = match cat.create_function(func(
             "xfloat8in",
             vec![(TypeRef::Cstring, None)],
             TypeRef::User("xfloat8".into()),
             FuncBody::Internal("int8in".into()),
-        ) {
+        )) {
             Ok(notices) => notices,
             Err(error) => panic!("failed to create input function test fixture: {error}"),
         };
         assert_eq!(in_notices[0].message, "return type xfloat8 is only a shell");
-        let out_notices = match cat.create_function(
+        let out_notices = match cat.create_function(func(
             "xfloat8out",
             vec![(TypeRef::User("xfloat8".into()), Some((1, 28)))],
             TypeRef::Cstring,
             FuncBody::Internal("int8out".into()),
-        ) {
+        )) {
             Ok(notices) => notices,
             Err(error) => panic!("failed to create output function test fixture: {error}"),
         };
@@ -1231,12 +1470,12 @@ mod tests {
         // Exactly one dependent: PG names it inline with no count and no DETAIL.
         let cat = GlobalCatalog::new();
         cat.create_shell_type("solo")?;
-        cat.create_function(
+        cat.create_function(func(
             "solo_in",
             vec![(TypeRef::Cstring, None)],
             TypeRef::User("solo".into()),
             FuncBody::Internal("int8in".into()),
-        )?;
+        ))?;
         let notices = cat.drop_types(&["solo"], true, false)?;
         assert_eq!(notices.len(), 1);
         assert_eq!(
@@ -1357,12 +1596,12 @@ mod tests {
     fn unknown_internal_function_is_rejected() {
         let cat = GlobalCatalog::new();
         let err = cat
-            .create_function(
+            .create_function(func(
                 "f",
                 vec![(TypeRef::Cstring, None)],
                 TypeRef::Builtin(PgType::Int8),
                 FuncBody::Internal("nope".into()),
-            )
+            ))
             .unwrap_err();
         assert_eq!(err.code, sqlstate::UNDEFINED_FUNCTION);
         assert_eq!(err.message, "there is no built-in function named \"nope\"");
@@ -1371,7 +1610,7 @@ mod tests {
     #[test]
     fn sql_function_stores_body_and_is_looked_up_by_name() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
-        cat.create_function(
+        cat.create_function(func(
             "add",
             vec![
                 (TypeRef::Builtin(PgType::Int4), None),
@@ -1379,7 +1618,7 @@ mod tests {
             ],
             TypeRef::Builtin(PgType::Int8),
             FuncBody::Sql("SELECT $1 + $2".into()),
-        )?;
+        ))?;
 
         let sigs = cat.sql_functions("add");
         assert_eq!(sigs.len(), 1);
@@ -1389,26 +1628,26 @@ mod tests {
 
         // A `LANGUAGE internal` function of the same arity is not a SQL function
         // and must not surface through `sql_functions`.
-        cat.create_function(
+        cat.create_function(func(
             "add",
             vec![(TypeRef::Cstring, None)],
             TypeRef::Builtin(PgType::Int8),
             FuncBody::Internal("int8in".into()),
-        )?;
+        ))?;
         assert_eq!(cat.sql_functions("add").len(), 1);
 
         // Overloading by argument type registers a second SQL entry.
-        cat.create_function(
+        cat.create_function(func(
             "add",
             vec![(TypeRef::Builtin(PgType::Int4), None)],
             TypeRef::Builtin(PgType::Int4),
             FuncBody::Sql("SELECT $1".into()),
-        )?;
+        ))?;
         assert_eq!(cat.sql_functions("add").len(), 2);
 
         // Same name + same argument types is rejected.
         let err = cat
-            .create_function(
+            .create_function(func(
                 "add",
                 vec![
                     (TypeRef::Builtin(PgType::Int4), None),
@@ -1416,8 +1655,93 @@ mod tests {
                 ],
                 TypeRef::Builtin(PgType::Int4),
                 FuncBody::Sql("SELECT 0".into()),
-            )
+            ))
             .unwrap_err();
+        assert_eq!(err.code, sqlstate::DUPLICATE_FUNCTION);
+
+        Ok(())
+    }
+
+    /// `functions()` reports what the declaration said, so `pg_proc` and the
+    /// routine interpreter both read the same metadata rather than defaults.
+    #[test]
+    fn functions_reports_declared_metadata() -> anyhow::Result<()> {
+        let cat = GlobalCatalog::new();
+        cat.create_function(RoutineDefinition {
+            name: "greet".to_string(),
+            kind: RoutineKind::Procedure,
+            args: vec![
+                RoutineArg {
+                    ty: TypeRef::Builtin(PgType::Int4),
+                    mode: ArgMode::In,
+                    name: Some("n".to_string()),
+                    position: None,
+                },
+                RoutineArg {
+                    ty: TypeRef::Builtin(PgType::Text),
+                    mode: ArgMode::Out,
+                    name: Some("msg".to_string()),
+                    position: None,
+                },
+            ],
+            ret: TypeRef::Builtin(PgType::Text),
+            body: FuncBody::PlPgSql("BEGIN END".to_string()),
+            volatility: Volatility::Immutable,
+            strict: true,
+            secdef: true,
+        })?;
+
+        let funcs = cat.functions();
+        assert_eq!(funcs.len(), 1);
+        let f = &funcs[0];
+        assert_eq!(f.name, "greet");
+        assert_eq!(f.namespace, "public");
+        assert_eq!(f.kind, RoutineKind::Procedure);
+        assert_eq!(f.lang_oid, lang::PLPGSQL);
+        assert_eq!(f.volatility, Volatility::Immutable);
+        assert!(f.strict);
+        assert!(f.secdef);
+        assert_eq!(f.src, "BEGIN END");
+        // Identity is the input arguments only...
+        assert_eq!(f.args, vec![TypeRef::Builtin(PgType::Int4)]);
+        // ...but the OUT parameter survives for proallargtypes/proargmodes,
+        // with its declared name for the body to refer to.
+        assert_eq!(f.all_args.len(), 2);
+        assert_eq!(f.all_args[1].mode, ArgMode::Out);
+        assert_eq!(f.all_args[1].name.as_deref(), Some("msg"));
+
+        // A PL/pgSQL body is not inlinable, so it must not surface as a SQL
+        // function to the binder.
+        assert!(cat.sql_functions("greet").is_empty());
+
+        Ok(())
+    }
+
+    /// PG excludes OUT parameters from a routine's identity, so `f(int)` and
+    /// `f(int, OUT int)` collide.
+    #[test]
+    fn out_parameters_are_excluded_from_identity() -> anyhow::Result<()> {
+        let cat = GlobalCatalog::new();
+        cat.create_function(func(
+            "f",
+            vec![(TypeRef::Builtin(PgType::Int4), None)],
+            TypeRef::Builtin(PgType::Int4),
+            FuncBody::Sql("SELECT $1".into()),
+        ))?;
+
+        let mut with_out = func(
+            "f",
+            vec![(TypeRef::Builtin(PgType::Int4), None)],
+            TypeRef::Builtin(PgType::Int4),
+            FuncBody::Sql("SELECT $1".into()),
+        );
+        with_out.args.push(RoutineArg {
+            ty: TypeRef::Builtin(PgType::Int4),
+            mode: ArgMode::Out,
+            name: None,
+            position: None,
+        });
+        let err = cat.create_function(with_out).unwrap_err();
         assert_eq!(err.code, sqlstate::DUPLICATE_FUNCTION);
 
         Ok(())
@@ -1429,12 +1753,12 @@ mod tests {
         let cat = GlobalCatalog::new();
         cat.create_shell_type("xd")?;
         assert!(
-            cat.create_function(
+            cat.create_function(func(
                 "xd_in",
                 vec![(TypeRef::Cstring, None)],
                 TypeRef::User("xd".into()),
                 FuncBody::Internal("date_in".into()),
-            )
+            ))
             .is_ok()
         );
 

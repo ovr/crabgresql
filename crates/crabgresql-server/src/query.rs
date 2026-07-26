@@ -32,7 +32,10 @@ use crabgresql_types::{PgType, Value};
 use crate::catalog::{SessionCatalog, SessionCatalogOps};
 use crate::error::PgError;
 use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
-use crate::global_catalog::{CatalogNotice, FuncBody, FuncDropSpec, GlobalCatalog, TypeRef};
+use crate::global_catalog::{
+    ArgMode, CatalogNotice, FuncBody, FuncDropSpec, GlobalCatalog, RoutineArg, RoutineDefinition,
+    RoutineKind, TypeRef, Volatility,
+};
 use crate::session::{ActiveTxn, Session};
 
 /// Severity of a non-error message sent before a command's CommandComplete.
@@ -3332,21 +3335,7 @@ fn execute_create_function(
             ));
         }
     };
-    let mut args = Vec::new();
-    for arg in create.args.iter().flatten() {
-        // OUT parameters are not part of a function's identity in PG, so they are
-        // excluded from the stored signature — matching how DROP FUNCTION resolves
-        // a target (execute_drop_function), so a created function is droppable by
-        // its input-argument signature.
-        if matches!(arg.mode, Some(ast::ArgMode::Out)) {
-            continue;
-        }
-        // An empty span (line 0) means the arg was built without source
-        // location; only parsed, bare arguments carry a caret position.
-        let start = arg.data_type_span.start;
-        let position = (start.line != 0).then_some((start.line, start.column));
-        args.push((resolve_type_ref(catalog, &arg.data_type)?, position));
-    }
+    let args = routine_args(catalog, create.args.as_deref().unwrap_or(&[]))?;
 
     let body = match lang.as_deref() {
         Some("internal") => FuncBody::Internal(function_internal_name(create)?),
@@ -3358,7 +3347,8 @@ fn execute_create_function(
             // fail with `undefined_function` instead of recursing forever.
             let arg_types = args
                 .iter()
-                .map(|(r, _)| pg_type_of_ref(type_catalog, r))
+                .filter(|a| a.mode.is_input())
+                .map(|a| pg_type_of_ref(type_catalog, &a.ty))
                 .collect::<Result<Vec<_>, _>>()?;
             let return_type = pg_type_of_ref(type_catalog, &ret)?;
             crabgresql_binder::bind_sql_function_body(
@@ -3376,11 +3366,75 @@ fn execute_create_function(
             ));
         }
     };
-    let notices = catalog.create_function(&name, args, ret, body)?;
+    let notices = catalog.create_function(RoutineDefinition {
+        name,
+        kind: RoutineKind::Function,
+        args,
+        ret,
+        body,
+        volatility: routine_volatility(create.behavior.as_ref()),
+        strict: routine_strict(create.called_on_null.as_ref()),
+        secdef: matches!(create.security, Some(ast::FunctionSecurity::Definer)),
+    })?;
     Ok(QueryResult::Command {
         tag: "CREATE FUNCTION".into(),
         notices: to_notices(notices),
     })
+}
+
+/// Resolve a parsed routine's parameter list. `OUT` parameters are kept — they
+/// are excluded from the routine's *identity* by the catalog, not here, because
+/// `pg_proc.proallargtypes`/`proargmodes` still need to report them.
+fn routine_args(
+    catalog: &GlobalCatalog,
+    args: &[ast::OperateFunctionArg],
+) -> Result<Vec<RoutineArg>, PgError> {
+    args.iter()
+        .map(|arg| {
+            let mode = match arg.mode {
+                None | Some(ast::ArgMode::In) => ArgMode::In,
+                Some(ast::ArgMode::Out) => ArgMode::Out,
+                Some(ast::ArgMode::InOut) => ArgMode::InOut,
+                Some(ast::ArgMode::Variadic) => {
+                    return Err(PgError::feature_not_supported(
+                        "VARIADIC parameters are not supported yet",
+                    ));
+                }
+            };
+            if arg.default_expr.is_some() {
+                return Err(PgError::feature_not_supported(
+                    "parameter defaults are not supported yet",
+                ));
+            }
+            // An empty span (line 0) means the arg was built without source
+            // location; only parsed, bare arguments carry a caret position.
+            let start = arg.data_type_span.start;
+            Ok(RoutineArg {
+                ty: resolve_type_ref(catalog, &arg.data_type)?,
+                mode,
+                name: arg.name.as_ref().map(normalize_ident),
+                position: (start.line != 0).then_some((start.line, start.column)),
+            })
+        })
+        .collect()
+}
+
+/// `IMMUTABLE | STABLE | VOLATILE`, defaulting to PG's `VOLATILE`.
+fn routine_volatility(behavior: Option<&ast::FunctionBehavior>) -> Volatility {
+    match behavior {
+        Some(ast::FunctionBehavior::Immutable) => Volatility::Immutable,
+        Some(ast::FunctionBehavior::Stable) => Volatility::Stable,
+        Some(ast::FunctionBehavior::Volatile) | None => Volatility::Volatile,
+    }
+}
+
+/// `STRICT` and `RETURNS NULL ON NULL INPUT` are spellings of the same thing;
+/// `CALLED ON NULL INPUT` is PG's default.
+fn routine_strict(called_on_null: Option<&ast::FunctionCalledOnNull>) -> bool {
+    matches!(
+        called_on_null,
+        Some(ast::FunctionCalledOnNull::Strict | ast::FunctionCalledOnNull::ReturnsNullOnNullInput)
+    )
 }
 
 /// `CREATE CAST (source AS target) ...`.
