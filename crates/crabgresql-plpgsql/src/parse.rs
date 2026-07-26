@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 
 use crabgresql_parser::tokenizer::{Token, Word};
+use crabgresql_pg_wire::sqlstate;
 
 use crate::ast::{
     Block, CompileError, Decl, LoopDirection, Raise, RaiseLevel, RaiseUsing, Routine, SqlFragment,
@@ -230,6 +231,11 @@ impl<'a> Compiler<'a> {
         let type_end = self.scan_to(&[
             Stop::Token(Token::SemiColon),
             Stop::Token(Token::Assignment),
+            // PostgreSQL accepts `=` as a synonym for `:=` in a declaration, so
+            // it ends the type just as `:=` does. Without it the initializer is
+            // swallowed into the type text and `DECLARE x int = 5` fails at run
+            // time with `type "int = 5" does not exist`.
+            Stop::Token(Token::Eq),
             Stop::Word("default"),
             Stop::Word("not"),
         ])?;
@@ -651,14 +657,14 @@ impl<'a> Compiler<'a> {
             let placeholders = count_placeholders(format);
             if placeholders > args.len() {
                 return Err(CompileError::new(
-                    "22023",
+                    sqlstate::SYNTAX_ERROR,
                     "too few parameters specified for RAISE",
                     line,
                 ));
             }
             if placeholders < args.len() {
                 return Err(CompileError::new(
-                    "22023",
+                    sqlstate::SYNTAX_ERROR,
                     "too many parameters specified for RAISE",
                     line,
                 ));

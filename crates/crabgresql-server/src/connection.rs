@@ -341,14 +341,24 @@ async fn run_simple_query(
             }
             continue;
         }
-        match execute_statement(engine, catalog, txnmgr, stmt, session, &BoundParams::none()) {
-            Ok(result) => {
+        let outcome = execute_statement(engine, catalog, txnmgr, stmt, session, &BoundParams::none());
+        // Diagnostics a routine raised belong to this statement whether it
+        // succeeded or failed. Handlers fold them into their own result, but
+        // draining again here is what makes stranding them impossible: a path
+        // that forgets — or one that returned an error before folding — would
+        // otherwise leave them buffered for whatever statement drains next.
+        let stranded = session.notices.drain();
+        match outcome {
+            Ok(mut result) => {
+                result.prepend_notices(stranded);
                 if write_result(writer, result, efd, sql).await? == WriteOutcome::Errored {
                     mark_transaction_failed(session);
                     return Ok(());
                 }
             }
             Err(e) => {
+                // PG order: notices raised before the failure, then the error.
+                emit_notices(writer, &stranded, Some(sql));
                 let position = e.location.map(|(line, col)| char_position(sql, line, col));
                 writer.error_fields(e.to_fields(position));
                 mark_transaction_failed(session);
@@ -892,7 +902,19 @@ fn handle_execute(
         values: param_values,
         extended: true,
     };
-    let result = execute_statement(engine, global_catalog, txnmgr, &stmt, session, &params)?;
+    let outcome = execute_statement(engine, global_catalog, txnmgr, &stmt, session, &params);
+    // Drained on both arms — see the simple-query path for why this cannot be
+    // left to the statement handlers alone.
+    let stranded = session.notices.drain();
+    let mut result = match outcome {
+        Ok(result) => result,
+        Err(e) => {
+            // PG order: notices raised before the failure, then the error.
+            emit_notices(writer, &stranded, None);
+            return Err(e);
+        }
+    };
+    result.prepend_notices(stranded);
     stream_execute(
         session,
         writer,

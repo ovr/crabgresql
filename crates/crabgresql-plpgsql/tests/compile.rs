@@ -110,6 +110,14 @@ fn declarations_carry_their_type_text_and_modifiers() {
 
     assert_eq!(decls[0].type_text, "numeric(10, 2)");
     assert_eq!(decls[0].init.as_ref().map(|f| f.text.as_str()), Some("1.5"));
+    // PostgreSQL accepts `=` as a synonym for `:=` here; the type must stop at
+    // it rather than swallowing the initializer into the type text.
+    let eq = ok("DECLARE x int = 5; BEGIN NULL; END", &[]);
+    assert_eq!(eq.block.decls[0].type_text, "int");
+    assert_eq!(
+        eq.block.decls[0].init.as_ref().map(|f| f.text.as_str()),
+        Some("5")
+    );
     assert!(decls[1].constant);
     assert_eq!(decls[1].type_text, "text");
     assert!(decls[2].not_null);

@@ -250,3 +250,40 @@ SELECT count(*) FROM pl_later WHERE n = 40;
 -- DROP will not cross the two kinds.
 DROP FUNCTION pl_add_row(int);
 DROP PROCEDURE pl_add_row(int);
+
+-- A NOTICE raised before a failure belongs to the statement that raised it,
+-- and must not resurface attached to a later one.
+DO $$ BEGIN RAISE NOTICE 'before the failure'; RAISE EXCEPTION 'boom'; END $$;
+SELECT 1 AS after_the_failure;
+
+-- One CONTEXT frame per invocation, naming the innermost statement -- not one
+-- frame per enclosing IF/LOOP.
+CREATE FUNCTION pl_nested() RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  FOR i IN 1..3 LOOP
+    IF i = 2 THEN
+      RAISE EXCEPTION 'nested boom';
+    END IF;
+  END LOOP;
+  RETURN 0;
+END $$;
+SELECT pl_nested();
+DROP FUNCTION pl_nested();
+
+-- With no message at all, the SQLSTATE is the message.
+DO $$ BEGIN RAISE EXCEPTION USING DETAIL = 'more'; END $$;
+
+-- `=` is a synonym for `:=` in a declaration.
+DO $$ DECLARE x int = 5; BEGIN RAISE NOTICE 'x=%', x; END $$;
+
+-- A RAISE placeholder/argument mismatch is a syntax error, at definition time.
+DO $$ BEGIN RAISE NOTICE 'a % b %', 1; END $$;
+
+-- A READ ONLY transaction rejects DML whatever its expressions call.
+CREATE FUNCTION pl_pure(n int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN RETURN n; END $$;
+BEGIN READ ONLY;
+INSERT INTO pl_later (n) VALUES (pl_pure(1));
+ROLLBACK;
+SELECT pl_pure(7);
+DROP FUNCTION pl_pure(int);

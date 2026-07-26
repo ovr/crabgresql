@@ -190,6 +190,23 @@ impl QueryResult {
             notices: Vec::new(),
         }
     }
+
+    /// Put `notices` ahead of any this result already carries.
+    ///
+    /// The connection layer folds in whatever was still buffered when the
+    /// statement returned. Prepending rather than appending keeps them in the
+    /// order they were raised: anything left in the buffer was raised during
+    /// execution, before the handler attached its own.
+    pub fn prepend_notices(&mut self, mut notices: Vec<Notice>) {
+        if notices.is_empty() {
+            return;
+        }
+        let own = match self {
+            QueryResult::Rows { notices, .. } | QueryResult::Command { notices, .. } => notices,
+        };
+        notices.append(own);
+        *own = notices;
+    }
 }
 
 /// Parameters supplied to a statement. A simple (`Q`) query passes
@@ -875,27 +892,31 @@ pub fn execute_statement(
     // the body's versions with. Conservative — a pure routine burns an XID — and
     // observably harmless, since PostgreSQL defaults routines to VOLATILE anyway.
     let calls_routine = crabgresql_binder::plan_calls_routine(&logical);
+    let dml_verb = match logical {
+        LogicalPlan::Insert { .. } => Some("INSERT"),
+        LogicalPlan::Update { .. } => Some("UPDATE"),
+        LogicalPlan::Delete { .. } => Some("DELETE"),
+        _ => None,
+    };
     // A plain `EXPLAIN <write>` never executes, so it is not a write: PG accepts
     // `BEGIN READ ONLY; EXPLAIN DELETE FROM t` and raises 25006 only once ANALYZE
     // makes the statement run for real. That covers a routine call too — plain
     // `EXPLAIN SELECT f()` plans without ever entering the body.
-    let is_write = (calls_routine
-        || matches!(
-            logical,
-            LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
-        ))
-        && explain.is_none_or(|opts| opts.analyze);
+    let runs = explain.is_none_or(|opts| opts.analyze);
+    let is_write = (calls_routine || dml_verb.is_some()) && runs;
     // A write in a READ ONLY transaction (or under the read-only session default)
     // is rejected before it stamps any version, matching PG's 25006.
-    // A routine call is only *treated* as a write; whether it actually writes is
-    // decided inside the body, which does its own read-only check.
-    if is_write && !calls_routine && read_only_active(session) {
-        let verb = match logical {
-            LogicalPlan::Insert { .. } => "INSERT",
-            LogicalPlan::Update { .. } => "UPDATE",
-            LogicalPlan::Delete { .. } => "DELETE",
-            _ => unreachable!("is_write implies a DML plan"),
-        };
+    //
+    // This keys off the DML node, not off `is_write`: a routine is only
+    // *treated* as a write so it has an XID to stamp with, and whether it really
+    // writes is decided inside the body, which does its own read-only check. But
+    // that reasoning covers only the routine — an outer `INSERT INTO t VALUES
+    // (f(1))` writes no matter what `f` does, and nothing downstream would catch
+    // it (the executor's DML paths never consult `ExecContext::read_only`).
+    if let Some(verb) = dml_verb
+        && runs
+        && read_only_active(session)
+    {
         return Err(PgError::new(
             sqlstate::READ_ONLY_SQL_TRANSACTION,
             format!("cannot execute {verb} in a read-only transaction"),
@@ -1005,8 +1026,27 @@ pub fn execute_statement(
     // transaction open until the portal closes. Undoing it needs per-portal
     // transaction lifetimes; until then the cost is the result set's memory,
     // paid only by statements that call a routine.
+    //
+    // Draining is where a routine body actually runs, so it is also where a
+    // `RAISE EXCEPTION` surfaces — it needs the same abort path `execute` has
+    // above, or the statement's XID is never marked aborted and stays in the
+    // in-flight set, pinning the snapshot horizon for the life of the process.
     let exec = if calls_routine {
-        materialize(exec)?
+        match materialize(exec) {
+            Ok(exec) => exec,
+            Err(e) => {
+                // Abort path: infallible, so the result is safe to drop.
+                let _ = finalize_statement(
+                    txnmgr,
+                    session,
+                    &txn,
+                    is_write,
+                    false,
+                    Some(&command_counter),
+                );
+                return Err(e);
+            }
+        }
     } else {
         exec
     };
@@ -1294,17 +1334,19 @@ pub fn run_copy_insert(
         engine,
         &prepared.catalog_ops,
         routines,
-        command_counter,
+        Arc::clone(&command_counter),
         read_only,
     );
     let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
-            let _ = finalize_statement(txnmgr, session, &txn, true, false, None);
+            let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
             return Err(e.into());
         }
     };
-    finalize_statement(txnmgr, session, &txn, true, true, None)?;
+    // A column default can call a routine, whose body advances the counter, so
+    // the block's command id has to be read back rather than merely bumped.
+    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter))?;
     match exec {
         Execution::Inserted(n) => Ok(n),
         _ => Err(PgError::new(
@@ -3056,18 +3098,20 @@ fn execute_create_table_as(
         engine,
         catalog_ops,
         routines,
-        command_counter,
+        Arc::clone(&command_counter),
         read_only,
     );
     let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
-            let _ = finalize_statement(txnmgr, session, &txn, true, false, None);
+            let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
             let _ = target.drop_table(&namespace, &name);
             return Err(e.into());
         }
     };
-    finalize_statement(txnmgr, session, &txn, true, true, None)?;
+    // The source query can call a routine, whose body advances the counter, so
+    // the block's command id has to be read back rather than merely bumped.
+    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter))?;
     let n = match exec {
         Execution::Inserted(n) => n,
         // The populate plan is a RETURNING-less INSERT, so execution yields an
@@ -3898,25 +3942,42 @@ fn execute_call(
     }
 
     let sig = resolve_procedure(&type_catalog, &name, &args)?;
-    // Coerce each argument to its declared type, as a function call's would be.
-    let exec_only = session.exec_context();
-    let mut values = Vec::with_capacity(args.len());
-    for (arg, ty) in args.iter().zip(sig.arg_types.iter()) {
-        let value = crabgresql_executor::eval_row_free(arg, &exec_only)?;
-        values.push(crabgresql_executor::coerce_value(value, *ty, &exec_only)?);
-    }
 
     let (routines, command_counter) =
         statement_runtime(&catalog, &type_catalog, global_catalog, session);
     let read_only = read_only_active(session);
     let txn = build_txn(txnmgr, session, true);
-    let exec_ctx = session.exec_context_for_statement(
-        engine,
-        &catalog_ops,
-        Arc::clone(&routines),
-        Arc::clone(&command_counter),
-        read_only,
-    );
+    let exec_ctx = ExecContext {
+        // An argument can itself call a routine (`CALL p(f(1))`), so it is
+        // evaluated under the same runtime the body gets — including the
+        // transaction, which nothing else attaches here because these
+        // expressions never go through `execute`.
+        txn: Some(txn.clone()),
+        ..session.exec_context_for_statement(
+            engine,
+            &catalog_ops,
+            Arc::clone(&routines),
+            Arc::clone(&command_counter),
+            read_only,
+        )
+    };
+    // Coerce each argument to its declared type, as a function call's would be.
+    let mut values = Vec::with_capacity(args.len());
+    for (arg, ty) in args.iter().zip(sig.arg_types.iter()) {
+        let coerced = crabgresql_executor::eval_row_free(arg, &exec_ctx)
+            .and_then(|value| crabgresql_executor::coerce_value(value, *ty, &exec_ctx));
+        match coerced {
+            Ok(value) => values.push(value),
+            Err(e) => {
+                // The transaction is open by now, so a bad argument has to abort
+                // it rather than leaving the XID in flight.
+                let _ =
+                    finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
+                return Err(e.into());
+            }
+        }
+    }
+
     if let Err(e) = routines.call(sig.oid, values, &exec_ctx, &txn) {
         let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
         return Err(e.into());

@@ -165,7 +165,8 @@ impl Interpreter {
         ctx: &ExecContext,
         txn: &TxnContext,
     ) -> Result<(), ExecError> {
-        let routine = crate::compile_inline_block(body).map_err(compile_error)?;
+        let routine =
+            crate::compile_inline_block(body).map_err(|e| compile_error(INLINE_BLOCK_NAME, e))?;
         let def = RoutineDef {
             // PostgreSQL names an anonymous block `inline_code_block` in
             // tracebacks, with no argument list.
@@ -186,7 +187,9 @@ impl Interpreter {
         if let Some(routine) = self.cache.get(oid) {
             return Ok(routine);
         }
-        let routine = Arc::new(crate::compile(&def.src, &def.arg_names).map_err(compile_error)?);
+        let routine = Arc::new(
+            crate::compile(&def.src, &def.arg_names).map_err(|e| compile_error(&def.name, e))?,
+        );
         self.cache.put(oid, Arc::clone(&routine));
         Ok(routine)
     }
@@ -228,7 +231,19 @@ impl Interpreter {
         frame.init_slot(routine.found, Value::Bool(false), Some(PgType::Bool));
         frame.track_found(routine.found);
 
-        let flow = self.block(&routine.block, &mut frame, ctx, txn, def)?;
+        // One `CONTEXT:` frame per invocation, naming the statement this
+        // invocation was executing. A nested call has already pushed its own
+        // frames by the time the error arrives here, so they stack
+        // innermost-first exactly as PostgreSQL renders them.
+        let flow = match self.block(&routine.block, &mut frame, ctx, txn, def) {
+            Ok(flow) => flow,
+            Err(e) => {
+                return Err(match frame.current_statement() {
+                    Some((line, label)) => e.push_context(frame_line(def, line, label)),
+                    None => e,
+                });
+            }
+        };
         match flow {
             Flow::Return(value) => match def.ret {
                 Some(ty) => crabgresql_executor::coerce_value(value, ty, ctx),
@@ -310,12 +325,14 @@ impl Interpreter {
         txn: &TxnContext,
         def: &RoutineDef,
     ) -> Result<Flow, ExecError> {
-        // Every statement is dispatched through here, which makes this the one
-        // place a `CONTEXT:` frame has to be pushed. Doing it while unwinding —
-        // rather than keeping a frame stack — costs nothing on the happy path
-        // and cannot leave a stale frame behind on an early return.
+        // Record the statement rather than pushing a `CONTEXT:` frame here.
+        // PostgreSQL emits one frame per routine *invocation*, naming the
+        // statement that invocation was on; pushing per dispatch would stack a
+        // line for every enclosing IF/LOOP/block as the error unwound, where
+        // PostgreSQL prints one. `run` pushes the single frame at the
+        // invocation boundary, using whatever this leaves behind.
+        frame.enter_statement(stmt.line(), stmt.context_label());
         self.statement_inner(stmt, frame, ctx, txn, def)
-            .map_err(|e| e.push_context(frame_line(def, stmt.line(), stmt.context_label())))
     }
 
     fn statement_inner(
@@ -683,13 +700,12 @@ impl Interpreter {
             Some(frag) => text(frag, frame)?,
             None => None,
         };
-        let message = message.unwrap_or_else(|| {
-            // `RAISE EXCEPTION USING DETAIL = ...` with no message at all.
-            match raise.level {
-                RaiseLevel::Exception => "raise exception".to_string(),
-                _ => String::new(),
-            }
-        });
+        // `RAISE ... USING DETAIL = ...` with no format string, condition name or
+        // `USING MESSAGE`: PostgreSQL uses the SQLSTATE itself as the message
+        // text (`ERROR: P0001`, `NOTICE: 00000`). It is the *resolved* code, so
+        // `RAISE SQLSTATE '22012' USING DETAIL = ...` reports `22012`, not the
+        // level's default.
+        let message = message.unwrap_or_else(|| code.to_string());
 
         if raise.level == RaiseLevel::Exception {
             return Err(ExecError::new(code, message)
@@ -1008,7 +1024,7 @@ fn format_message(format: &str, args: &[Option<String>]) -> Result<String, ExecE
             _ => {
                 let Some(arg) = args.get(next) else {
                     return Err(ExecError::new(
-                        "22023",
+                        sqlstate::SYNTAX_ERROR,
                         "too few parameters specified for RAISE",
                     ));
                 };
@@ -1019,7 +1035,7 @@ fn format_message(format: &str, args: &[Option<String>]) -> Result<String, ExecE
     }
     if next < args.len() {
         return Err(ExecError::new(
-            "22023",
+            sqlstate::SYNTAX_ERROR,
             "too many parameters specified for RAISE",
         ));
     }
@@ -1046,9 +1062,12 @@ fn first_word(s: &str) -> &str {
 
 /// A compile-time failure surfaced at run time, as PostgreSQL does for a body
 /// it only validates when the routine is first called.
-fn compile_error(e: crate::CompileError) -> ExecError {
+///
+/// PostgreSQL names the routine in quotes here, and — unlike a runtime
+/// traceback frame — bare, with no argument list.
+fn compile_error(name: &str, e: crate::CompileError) -> ExecError {
     ExecError::new(e.code, e.message).push_context(format!(
-        "compilation of PL/pgSQL function near line {}",
+        "compilation of PL/pgSQL function \"{name}\" near line {}",
         e.line
     ))
 }

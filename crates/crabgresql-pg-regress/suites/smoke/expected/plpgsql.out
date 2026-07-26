@@ -343,3 +343,56 @@ SELECT count(*) FROM pl_later WHERE n = 40;
 DROP FUNCTION pl_add_row(int);
 ERROR:  pl_add_row(integer) is not a function
 DROP PROCEDURE pl_add_row(int);
+-- A NOTICE raised before a failure belongs to the statement that raised it,
+-- and must not resurface attached to a later one.
+DO $$ BEGIN RAISE NOTICE 'before the failure'; RAISE EXCEPTION 'boom'; END $$;
+NOTICE:  before the failure
+ERROR:  boom
+CONTEXT:  PL/pgSQL function inline_code_block line 1 at RAISE
+SELECT 1 AS after_the_failure;
+ after_the_failure 
+-------------------
+                 1
+(1 row)
+
+-- One CONTEXT frame per invocation, naming the innermost statement -- not one
+-- frame per enclosing IF/LOOP.
+CREATE FUNCTION pl_nested() RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  FOR i IN 1..3 LOOP
+    IF i = 2 THEN
+      RAISE EXCEPTION 'nested boom';
+    END IF;
+  END LOOP;
+  RETURN 0;
+END $$;
+SELECT pl_nested();
+ERROR:  nested boom
+CONTEXT:  PL/pgSQL function pl_nested() line 5 at RAISE
+DROP FUNCTION pl_nested();
+-- With no message at all, the SQLSTATE is the message.
+DO $$ BEGIN RAISE EXCEPTION USING DETAIL = 'more'; END $$;
+ERROR:  P0001
+DETAIL:  more
+CONTEXT:  PL/pgSQL function inline_code_block line 1 at RAISE
+-- `=` is a synonym for `:=` in a declaration.
+DO $$ DECLARE x int = 5; BEGIN RAISE NOTICE 'x=%', x; END $$;
+NOTICE:  x=5
+-- A RAISE placeholder/argument mismatch is a syntax error, at definition time.
+DO $$ BEGIN RAISE NOTICE 'a % b %', 1; END $$;
+ERROR:  too few parameters specified for RAISE
+CONTEXT:  compilation of PL/pgSQL function "inline_code_block" near line 1
+-- A READ ONLY transaction rejects DML whatever its expressions call.
+CREATE FUNCTION pl_pure(n int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN RETURN n; END $$;
+BEGIN READ ONLY;
+INSERT INTO pl_later (n) VALUES (pl_pure(1));
+ERROR:  cannot execute INSERT in a read-only transaction
+ROLLBACK;
+SELECT pl_pure(7);
+ pl_pure 
+---------
+       7
+(1 row)
+
+DROP FUNCTION pl_pure(int);

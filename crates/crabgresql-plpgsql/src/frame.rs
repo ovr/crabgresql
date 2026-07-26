@@ -55,6 +55,16 @@ pub struct Frame {
     slots: Vec<Slot>,
     /// The slot holding `FOUND`, which several statements update.
     found: Option<VarId>,
+    /// The innermost statement this invocation has begun executing, as
+    /// `(line, context label)`.
+    ///
+    /// PostgreSQL reports exactly one `CONTEXT:` frame per routine invocation,
+    /// naming the statement that invocation was on — not one frame per
+    /// enclosing statement. Recording the deepest statement entered (and never
+    /// restoring it while unwinding) leaves precisely that statement here when
+    /// an error escapes, so the interpreter can push one frame at the
+    /// invocation boundary.
+    current: Option<(u32, &'static str)>,
 }
 
 impl Frame {
@@ -62,7 +72,19 @@ impl Frame {
         Self {
             slots: vec![Slot::default(); nvars],
             found: None,
+            current: None,
         }
+    }
+
+    /// Record that this invocation has begun executing a statement. Called on
+    /// the way *in*, so nesting overwrites with the innermost statement.
+    pub fn enter_statement(&mut self, line: u32, label: &'static str) {
+        self.current = Some((line, label));
+    }
+
+    /// The statement to name in this invocation's `CONTEXT:` frame.
+    pub fn current_statement(&self) -> Option<(u32, &'static str)> {
+        self.current
     }
 
     /// Set a slot's value and type outright, bypassing the CONSTANT check —

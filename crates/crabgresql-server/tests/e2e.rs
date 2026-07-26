@@ -6225,7 +6225,8 @@ async fn plpgsql_bodies_are_syntax_checked_at_create_time() -> anyhow::Result<()
         .await
         .unwrap_err();
     let db = e.as_db_error().expect("database error");
-    assert_eq!(db.code().code(), "22023");
+    // PostgreSQL reports this from `check_raise_parameters` as a syntax error.
+    assert_eq!(db.code().code(), "42601");
     assert_eq!(db.message(), "too few parameters specified for RAISE");
 
     // Forward references are fine: the SQL inside a body is only bound at call
@@ -6417,5 +6418,109 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
     let names: Vec<&str> = rows.iter().map(|r| r.get(0)).collect();
     assert_eq!(names, ["internal", "c", "sql", "plpgsql"]);
 
+    Ok(())
+}
+
+/// A READ ONLY transaction rejects DML no matter what its expressions call.
+/// The routine itself is only *treated* as a write so it has an XID to stamp
+/// with — that exemption must not leak onto the outer statement, which writes
+/// whatever the routine does.
+#[tokio::test]
+async fn read_only_rejects_dml_that_calls_a_routine() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (n int)").await?;
+    client
+        .batch_execute(
+            "CREATE FUNCTION pure(n int) RETURNS int LANGUAGE plpgsql AS $$
+             BEGIN RETURN n; END $$",
+        )
+        .await?;
+
+    for sql in [
+        "INSERT INTO t VALUES (pure(1))",
+        "UPDATE t SET n = pure(1)",
+        "DELETE FROM t WHERE n = pure(1)",
+    ] {
+        client.batch_execute("BEGIN READ ONLY").await?;
+        let e = client.batch_execute(sql).await.unwrap_err();
+        assert_eq!(
+            e.as_db_error().expect("database error").code(),
+            &SqlState::READ_ONLY_SQL_TRANSACTION,
+            "{sql}"
+        );
+        client.batch_execute("ROLLBACK").await?;
+    }
+
+    // A bare SELECT of the same routine is still allowed: nothing writes.
+    client.batch_execute("BEGIN READ ONLY").await?;
+    assert_eq!(
+        client.query_one("SELECT pure(7)", &[]).await?.get::<_, i32>(0),
+        7
+    );
+    client.batch_execute("ROLLBACK").await?;
+
+    assert_eq!(
+        client.query_one("SELECT count(*) FROM t", &[]).await?.get::<_, i64>(0),
+        0
+    );
+    Ok(())
+}
+
+/// A routine that raises mid-drain must abort its statement's transaction. If
+/// the XID leaks in-flight it pins the snapshot horizon and the rows it touched
+/// can never be modified again.
+#[tokio::test]
+async fn routine_error_while_draining_rolls_its_writes_back() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (n int)").await?;
+    client
+        .batch_execute(
+            "CREATE FUNCTION boom() RETURNS int LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO t VALUES (1); RAISE EXCEPTION 'boom'; END $$",
+        )
+        .await?;
+
+    let e = client.query_one("SELECT boom()", &[]).await.unwrap_err();
+    assert_eq!(e.as_db_error().expect("database error").message(), "boom");
+
+    // The body's insert is rolled back, and the connection is still usable —
+    // an XID left in flight would also block this row from being written.
+    assert_eq!(
+        client.query_one("SELECT count(*) FROM t", &[]).await?.get::<_, i64>(0),
+        0
+    );
+    client.batch_execute("INSERT INTO t VALUES (2)").await?;
+    assert_eq!(
+        client.query_one("SELECT count(*) FROM t", &[]).await?.get::<_, i64>(0),
+        1
+    );
+    Ok(())
+}
+
+/// `CALL p(f(1))` — a routine call inside a CALL argument needs the same
+/// runtime the body gets, or it fails with an internal error.
+#[tokio::test]
+async fn call_arguments_may_themselves_call_routines() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (n int)").await?;
+    client
+        .batch_execute(
+            "CREATE FUNCTION inc(n int) RETURNS int LANGUAGE plpgsql AS $$
+             BEGIN RETURN n + 1; END $$",
+        )
+        .await?;
+    client
+        .batch_execute(
+            "CREATE PROCEDURE keep(v int) LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO t VALUES (v); END $$",
+        )
+        .await?;
+
+    client.batch_execute("CALL keep(inc(1))").await?;
+    assert_eq!(
+        client.query_one("SELECT n FROM t", &[]).await?.get::<_, i32>(0),
+        2
+    );
     Ok(())
 }

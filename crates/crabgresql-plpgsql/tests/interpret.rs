@@ -366,7 +366,9 @@ fn raise_reports_a_wrong_argument_count() {
     ] {
         let oid = h.define("f", &[], None, body);
         let e = err(h.call(oid, vec![]));
-        assert_eq!(e.code, "22023");
+        // PostgreSQL reports a RAISE placeholder/argument mismatch as a syntax
+        // error (`check_raise_parameters`), not as an invalid parameter value.
+        assert_eq!(e.code, "42601");
         assert!(e.message.contains(want), "{body}: {}", e.message);
     }
 }
@@ -389,6 +391,64 @@ fn raise_exception_carries_its_sqlstate_detail_and_hint() {
     // With no ERRCODE, a bare RAISE EXCEPTION is P0001.
     let oid = h.define("g", &[], None, "BEGIN RAISE EXCEPTION 'plain'; END");
     assert_eq!(err(h.call(oid, vec![])).code, "P0001");
+}
+
+/// With nothing to say, PostgreSQL says the SQLSTATE: `RAISE EXCEPTION USING
+/// DETAIL = 'x'` reports `ERROR: P0001`, and `RAISE SQLSTATE '22012' USING
+/// DETAIL = 'x'` reports `ERROR: 22012` — the *resolved* code, not the level's
+/// default.
+#[test]
+fn raise_without_a_message_reports_the_sqlstate() {
+    let h = Harness::new();
+
+    let oid = h.define(
+        "f",
+        &[],
+        None,
+        "BEGIN RAISE EXCEPTION USING DETAIL = 'more'; END",
+    );
+    let e = err(h.call(oid, vec![]));
+    assert_eq!(e.code, "P0001");
+    assert_eq!(e.message, "P0001");
+    assert_eq!(e.detail.as_deref(), Some("more"));
+
+    let oid = h.define(
+        "g",
+        &[],
+        None,
+        "BEGIN RAISE EXCEPTION USING ERRCODE = '22012', DETAIL = 'more'; END",
+    );
+    let e = err(h.call(oid, vec![]));
+    assert_eq!(e.code, "22012");
+    assert_eq!(e.message, "22012");
+}
+
+/// PostgreSQL prints exactly one `CONTEXT:` frame per routine invocation,
+/// naming the statement that invocation was on — not one per enclosing
+/// statement. A `RAISE` nested inside `IF` inside `FOR` is one line.
+#[test]
+fn context_reports_one_frame_per_invocation() {
+    let h = Harness::new();
+    let oid = h.define(
+        "f",
+        &[],
+        Some(PgType::Int4),
+        "BEGIN\n\
+         FOR i IN 1..3 LOOP\n\
+         IF i = 2 THEN\n\
+         RAISE EXCEPTION 'boom';\n\
+         END IF;\n\
+         END LOOP;\n\
+         RETURN 0;\n\
+         END",
+    );
+    let e = err(h.call(oid, vec![]));
+    assert_eq!(e.message, "boom");
+    assert_eq!(
+        e.context,
+        vec!["PL/pgSQL function f() line 4 at RAISE".to_string()],
+        "expected a single frame naming the innermost statement"
+    );
 }
 
 /// A condition name supplies both SQLSTATE and message, wherever it appears.
