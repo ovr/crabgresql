@@ -54,3 +54,4 @@ test: collate
 test: psql_describe
 test: tsvector
 test: tsquery
+test: analyze

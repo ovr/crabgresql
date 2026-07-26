@@ -420,3 +420,63 @@ fn committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows() {
     let table = engine.open_table("t").unwrap();
     assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
 }
+
+#[test]
+fn size_derived_statistics_survive_a_crash() -> anyhow::Result<()> {
+    // Statistics are not WAL-logged, but the size-derived estimate is read back
+    // from the relation file itself — so it must come back after a crash without
+    // anything having replayed it.
+    let dir = tempfile::tempdir()?;
+    let before;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(schema())?;
+        for i in 0..500 {
+            let xid = tm.allocate_xid();
+            insert(&*table, &tm.context(xid, CommandId::FIRST), i, "padding");
+            tm.commit(xid)?;
+        }
+        before = table.statistics();
+        assert!(before.relpages > 0, "{before:?}");
+        // Drop without a checkpoint: only the fsynced WAL survives.
+    }
+
+    let (engine, _tm) = open(dir.path())?;
+    assert_eq!(engine.open_table("t")?.statistics(), before);
+
+    Ok(())
+}
+
+#[test]
+fn analyze_results_survive_a_crash_without_being_wal_logged() -> anyhow::Result<()> {
+    // Statistics live in the relation catalog, which is fsynced directly rather
+    // than replayed from the WAL. This proves the tail alone carries them across
+    // a crash — nothing redoes an ANALYZE.
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(schema())?;
+        for i in 0..40 {
+            let xid = tm.allocate_xid();
+            insert(&*table, &tm.context(xid, CommandId::FIRST), i, "row");
+            tm.commit(xid)?;
+        }
+        let xid = tm.allocate_xid();
+        engine.analyze("public", "t", &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        let stats = table.statistics();
+        assert!(stats.analyzed);
+        assert_eq!(stats.reltuples, 40.0);
+        // Drop without a checkpoint.
+    }
+
+    let (engine, _tm) = open(dir.path())?;
+    let stats = engine.open_table("t")?.statistics();
+    assert!(
+        stats.analyzed,
+        "the reopened relation must still know it was analyzed: {stats:?}"
+    );
+    assert_eq!(stats.reltuples, 40.0);
+
+    Ok(())
+}

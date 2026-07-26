@@ -15,6 +15,9 @@ use crabgresql_types::{PgType, Value};
 
 pub use crabgresql_txn as txn;
 
+mod stats;
+pub use stats::{ColStats, RelStats};
+
 /// A materialized row. Column order matches the table schema.
 pub type Tuple = Vec<Value>;
 
@@ -187,11 +190,14 @@ pub struct PartitionOf {
     pub bound: PartitionBound,
 }
 
-/// A user relation together with its mutable index metadata.
+/// A user relation together with its mutable index metadata and size estimates.
 #[derive(Clone, Debug)]
 pub struct RelationMetadata {
     pub schema: TableSchema,
     pub indexes: Vec<IndexMetadata>,
+    /// What [`TableAm::statistics`] reported when this snapshot was taken —
+    /// the source of `pg_class.relpages`/`reltuples`.
+    pub stats: RelStats,
 }
 
 /// How a relation is stored, mirroring PostgreSQL's `pg_class.relpersistence`.
@@ -436,6 +442,17 @@ pub trait TableAm: Send + Sync {
         Vec::new()
     }
 
+    /// Size and distribution estimates for the planner, and the source of
+    /// `pg_class.relpages`/`reltuples`. Engines should override this with
+    /// whatever they can report cheaply — the planner may call it once per
+    /// relation per statement, so it must not scan.
+    ///
+    /// The default is [`RelStats::unknown`]: an engine that cannot report a
+    /// physical size reports nothing rather than a fabricated number.
+    fn statistics(&self) -> RelStats {
+        RelStats::unknown(self.schema())
+    }
+
     /// Full scan yielding only the versions visible to `txn`'s snapshot. The
     /// iterator captures the snapshot up front, so a DML statement never
     /// re-visits rows it modified itself (the reader's own new versions carry
@@ -652,6 +669,24 @@ pub trait TableEngine: Send + Sync {
             .collect()
     }
 
+    /// Measure a relation under `txn` and record the result, so later planning
+    /// and `pg_class.relpages`/`reltuples` report it (`ANALYZE`).
+    ///
+    /// Non-transactional by design, matching PostgreSQL: the result stands even
+    /// if `txn` later rolls back. That is safe because statistics never affect a
+    /// query's result, only which correct plan is chosen.
+    ///
+    /// The default reports that the engine cannot analyze; only engines with
+    /// real storage override it.
+    fn analyze(
+        &self,
+        _namespace: &str,
+        name: &str,
+        _txn: &TxnContext,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::TableNotFound(name.to_string()))
+    }
+
     /// Enumerate user relations including live index metadata for catalog
     /// reflection. Engines with tables override this; the fallback preserves
     /// compatibility for read-only/system engines.
@@ -659,6 +694,7 @@ pub trait TableEngine: Send + Sync {
         self.relations()
             .into_iter()
             .map(|schema| RelationMetadata {
+                stats: RelStats::unknown(&schema),
                 schema,
                 indexes: Vec::new(),
             })
