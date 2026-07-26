@@ -47,30 +47,25 @@ impl ExplainOptions {
     pub fn resolve(
         analyze: bool,
         verbose: bool,
-        format: Option<&ast::AnalyzeFormatKind>,
         options: Option<&[ast::UtilityOption]>,
     ) -> Result<Self, PgError> {
-        if verbose {
-            return Err(unsupported_option("VERBOSE"));
-        }
-        if let Some(format) = format {
-            let format = match format {
-                ast::AnalyzeFormatKind::Keyword(f) | ast::AnalyzeFormatKind::Assignment(f) => f,
-            };
-            if !matches!(format, ast::AnalyzeFormat::TEXT) {
-                return Err(unsupported_option(&format!("FORMAT {format}")));
-            }
-        }
         let mut analyze = analyze;
         let mut summary = None;
-        // Options PG accepts only under ANALYZE, recorded rather than rejected in
-        // the loop so the cross-check below runs in PG's order: `EXPLAIN (WAL)` is
-        // "WAL requires ANALYZE", not "WAL is not supported yet".
-        let mut requires_analyze = None;
-        // Recognized, switched on, and shape-changing for us: reported after the
-        // cross-check, so PG's own error wins wherever PG has one.
-        let mut unsupported = None;
+        // Every flag is *last wins*, as in PG: it applies the option list in order,
+        // so `EXPLAIN (MEMORY ON, MEMORY OFF)` is accepted — the final value is off.
+        // Nothing may be rejected while the list is still being read, or a later
+        // `OFF` could not take an earlier `ON` back.
+        let mut verbose = verbose;
+        let mut timing = false;
+        let mut wal = false;
+        let mut serialize = false;
+        let mut settings = false;
+        let mut memory = false;
         let mut generic_plan = false;
+        // `FORMAT <name>`, kept as written: PG compares it exactly, so only the
+        // lexer's folding of an unquoted word makes `FORMAT TEXT` work while
+        // `FORMAT 'TEXT'` does not.
+        let mut format: Option<String> = None;
         for option in options.unwrap_or_default() {
             // The option name is an identifier, so it folds to lowercase unless it
             // was quoted — which is also the spelling PG echoes back in the errors
@@ -84,11 +79,7 @@ impl ExplainOptions {
                 // TIMING needs ANALYZE but asks for nothing we cannot deliver: it
                 // is validated so `EXPLAIN (ANALYZE, TIMING OFF)` is accepted today
                 // and keeps meaning the same thing once per-node times arrive.
-                "timing" => {
-                    if option_flag(option, &name)? {
-                        requires_analyze = requires_analyze.or(Some("TIMING"));
-                    }
-                }
+                "timing" => timing = option_flag(option, &name)?,
                 // Accepted and ignored: neither changes which lines we print.
                 "costs" | "buffers" => {
                     option_flag(option, &name)?;
@@ -96,62 +87,28 @@ impl ExplainOptions {
                 // Recognized by PG, and shape-changing when switched on: VERBOSE
                 // adds `Output:` lines, SETTINGS a `Settings:` line, MEMORY a
                 // `Planning:`/`Memory:` block, WAL a `WAL:` line, and GENERIC_PLAN
-                // plans the statement differently. Tolerated only when off.
-                "verbose" | "settings" | "memory" => {
-                    if option_flag(option, &name)? {
-                        unsupported = unsupported.or(Some(name.to_ascii_uppercase()));
-                    }
-                }
-                "generic_plan" => {
-                    if option_flag(option, &name)? {
-                        generic_plan = true;
-                        unsupported = unsupported.or(Some("GENERIC_PLAN".to_string()));
-                    }
-                }
-                "wal" => {
-                    if option_flag(option, &name)? {
-                        requires_analyze = requires_analyze.or(Some("WAL"));
-                        unsupported = unsupported.or(Some("WAL".to_string()));
-                    }
-                }
-                // SERIALIZE takes a mode (`none` / `text` / `binary`), not a
-                // boolean, and defaults to `text` when bare; only `none` is a no-op.
+                // plans the statement differently.
+                "verbose" => verbose = option_flag(option, &name)?,
+                "settings" => settings = option_flag(option, &name)?,
+                "memory" => memory = option_flag(option, &name)?,
+                "wal" => wal = option_flag(option, &name)?,
+                "generic_plan" => generic_plan = option_flag(option, &name)?,
+                // SERIALIZE takes a mode, not a boolean, and defaults to `text` when
+                // bare. `none` and `off` are the two spellings that ask for nothing.
                 "serialize" => {
-                    let mode = option_value(option).unwrap_or_else(|| "text".to_string());
-                    if !mode.eq_ignore_ascii_case("none") {
-                        requires_analyze = requires_analyze.or(Some("SERIALIZE"));
-                        unsupported = unsupported.or(Some("SERIALIZE".to_string()));
-                    }
+                    let mode = match option.arg {
+                        None => "text".to_string(),
+                        Some(_) => option_text(option, &name)?,
+                    };
+                    serialize = match mode.as_str() {
+                        "none" | "off" => false,
+                        "text" | "binary" => true,
+                        _ => return Err(unrecognized_value(&name, &mode)),
+                    };
                 }
-                "format" => {
-                    if option.arg.is_none() {
-                        // `EXPLAIN (FORMAT) SELECT 1` is
-                        // `ERROR: 42601: format requires a parameter` in PG.
-                        return Err(PgError::new(
-                            sqlstate::SYNTAX_ERROR,
-                            format!("{name} requires a parameter"),
-                        ));
-                    }
-                    // An argument that is not a scalar literal names no format.
-                    let format = option_value(option).unwrap_or_default();
-                    match format.to_ascii_lowercase().as_str() {
-                        "text" => {}
-                        "json" | "xml" | "yaml" => {
-                            return Err(unsupported_option(&format!(
-                                "FORMAT {}",
-                                format.to_ascii_uppercase()
-                            )));
-                        }
-                        _ => {
-                            return Err(PgError::new(
-                                sqlstate::INVALID_PARAMETER_VALUE,
-                                format!(
-                                    "unrecognized value for EXPLAIN option \"format\": \"{format}\""
-                                ),
-                            ));
-                        }
-                    }
-                }
+                // The format is checked after the loop, where PG's ordering puts it
+                // relative to the cross-checks.
+                "format" => format = Some(option_text(option, &name)?),
                 _ => {
                     return Err(PgError::new(
                         sqlstate::SYNTAX_ERROR,
@@ -160,16 +117,28 @@ impl ExplainOptions {
                 }
             }
         }
-        // PG's cross-check runs after the whole option list is read, and before it
-        // decides what to print — so `EXPLAIN (TIMING ON)` reports the dependency,
-        // not a missing feature.
-        if let Some(option) = requires_analyze
-            && !analyze
-        {
-            return Err(PgError::new(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                format!("EXPLAIN option {option} requires ANALYZE"),
-            ));
+        // From here the options are settled, and the checks run in PG's order —
+        // verified against PG 18.4 to be independent of the order they were
+        // written in. An unusable FORMAT value comes first, because PG validates it
+        // as it reads the option rather than in a cross-check. The comparison is
+        // exact: `FORMAT TEXT` works only because the lexer folds an unquoted word,
+        // while `FORMAT 'TEXT'` is an unrecognized value.
+        let format = match format.as_deref() {
+            None | Some("text") => None,
+            Some("json" | "xml" | "yaml") => format,
+            Some(other) => return Err(unrecognized_value("format", other)),
+        };
+        // Then the cross-checks: `EXPLAIN (TIMING ON)` reports the dependency, not
+        // a missing feature. PG picks WAL over TIMING over SERIALIZE.
+        if !analyze {
+            for (requested, option) in [(wal, "WAL"), (timing, "TIMING"), (serialize, "SERIALIZE")] {
+                if requested {
+                    return Err(PgError::new(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        format!("EXPLAIN option {option} requires ANALYZE"),
+                    ));
+                }
+            }
         }
         // GENERIC_PLAN asks for a plan built without the parameter values ANALYZE
         // needs in order to run, so PG rejects the combination outright.
@@ -179,8 +148,24 @@ impl ExplainOptions {
                 "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together",
             ));
         }
-        if let Some(option) = unsupported {
-            return Err(unsupported_option(&option));
+        // Last, the options PG honors and crabgresql cannot yet produce.
+        if let Some(format) = format {
+            return Err(unsupported_option(&format!(
+                "FORMAT {}",
+                format.to_ascii_uppercase()
+            )));
+        }
+        for (requested, option) in [
+            (verbose, "VERBOSE"),
+            (settings, "SETTINGS"),
+            (memory, "MEMORY"),
+            (wal, "WAL"),
+            (serialize, "SERIALIZE"),
+            (generic_plan, "GENERIC_PLAN"),
+        ] {
+            if requested {
+                return Err(unsupported_option(option));
+            }
         }
         Ok(Self {
             analyze,
@@ -195,6 +180,34 @@ impl ExplainOptions {
 /// the gap is ours to report rather than to paper over.
 fn unsupported_option(option: &str) -> PgError {
     PgError::feature_not_supported(format!("EXPLAIN ({option}) is not supported yet"))
+}
+
+/// A value-taking option given a word it does not know, e.g.
+/// `EXPLAIN (FORMAT bogus)`. `value` is echoed exactly as the client wrote it.
+fn unrecognized_value(option: &str, value: &str) -> PgError {
+    PgError::new(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        format!("unrecognized value for EXPLAIN option \"{option}\": \"{value}\""),
+    )
+}
+
+/// The word a value-taking option carries, with PG's identifier folding applied:
+/// an unquoted word lowercases (so `FORMAT TEXT` means `text`), while a quoted or
+/// string literal keeps its case (so `FORMAT 'TEXT'` stays `TEXT`, and is
+/// therefore *not* the `text` format). Errors if the option carries no value, or
+/// one that is not a word or literal — reporting it the way PG does either way.
+fn option_text(option: &ast::UtilityOption, name: &str) -> Result<String, PgError> {
+    if option.arg.is_none() {
+        // `EXPLAIN (FORMAT) SELECT 1` is
+        // `ERROR: 42601: format requires a parameter` in PG.
+        return Err(PgError::syntax(format!("{name} requires a parameter")));
+    }
+    // An argument that is not a word or a scalar literal — `-1`, `NULL`, `1+1` —
+    // names no value, and PG echoes it as the unrecognized value it is.
+    option_value(option).ok_or_else(|| {
+        let written = option.arg.as_ref().map_or(String::new(), ToString::to_string);
+        unrecognized_value(name, &written)
+    })
 }
 
 /// The boolean an option carries: a bare option name is TRUE, and only
@@ -228,12 +241,13 @@ fn option_flag(option: &ast::UtilityOption, name: &str) -> Result<bool, PgError>
 
 /// The bare word, string or number an option carries, e.g. `FORMAT json`,
 /// `FORMAT 'json'`, `FORMAT $$json$$` (all three accepted by PG) or `ANALYZE off`.
-/// `None` when there is no argument *or* the argument is not a scalar literal —
-/// callers must distinguish those two cases themselves via `option.arg`, because
-/// an unreadable value has to be an error, not a default.
+/// A bare word folds like any identifier; a literal is returned verbatim.
+/// `None` when there is no argument *or* the argument is not a word or scalar
+/// literal — callers must distinguish those two cases themselves via `option.arg`,
+/// because an unreadable value has to be an error, not a default.
 fn option_value(option: &ast::UtilityOption) -> Option<String> {
     match option.arg.as_ref()? {
-        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
+        ast::Expr::Identifier(ident) => Some(normalize_ident(ident)),
         ast::Expr::Value(value) => match &value.value {
             ast::Value::Number(n, _) => Some(n.to_string()),
             ast::Value::SingleQuotedString(s) => Some(s.clone()),
@@ -313,7 +327,6 @@ mod tests {
             ast::Statement::Explain {
                 analyze,
                 verbose,
-                format,
                 options,
                 ..
             },
@@ -324,7 +337,6 @@ mod tests {
         Ok(ExplainOptions::resolve(
             *analyze,
             *verbose,
-            format.as_ref(),
             options.as_deref(),
         ))
     }
@@ -430,13 +442,13 @@ mod tests {
 
     #[test]
     fn text_format_is_the_only_supported_format() -> anyhow::Result<()> {
+        // Only the parenthesized spelling reaches here; the bare
+        // `EXPLAIN FORMAT <kind>` form is not PG grammar and is rejected upstream.
         accept("EXPLAIN (FORMAT TEXT) SELECT 1")?;
-        accept("EXPLAIN FORMAT TEXT SELECT 1")?;
         for (sql, option) in [
             ("EXPLAIN (FORMAT JSON) SELECT 1", "FORMAT JSON"),
             ("EXPLAIN (FORMAT xml) SELECT 1", "FORMAT XML"),
             ("EXPLAIN (FORMAT yaml) SELECT 1", "FORMAT YAML"),
-            ("EXPLAIN FORMAT JSON SELECT 1", "FORMAT JSON"),
         ] {
             assert_eq!(
                 reject(sql)?,
@@ -447,6 +459,90 @@ mod tests {
                 "{sql}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_format_value_is_compared_exactly() -> anyhow::Result<()> {
+        // PG compares the format name with `strcmp`, so only the lexer's folding of
+        // an unquoted word makes the upper-case spelling work.
+        accept("EXPLAIN (FORMAT TEXT) SELECT 1")?;
+        accept("EXPLAIN (FORMAT 'text') SELECT 1")?;
+        for sql in [
+            "EXPLAIN (FORMAT 'TEXT') SELECT 1",
+            "EXPLAIN (FORMAT \"TEXT\") SELECT 1",
+        ] {
+            assert_eq!(
+                reject(sql)?,
+                (
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized value for EXPLAIN option \"format\": \"TEXT\"".to_string()
+                ),
+                "{sql}"
+            );
+        }
+        // A quoted JSON is likewise an unrecognized *value*, not a missing feature.
+        assert_eq!(
+            reject("EXPLAIN (FORMAT 'JSON') SELECT 1")?.0,
+            sqlstate::INVALID_PARAMETER_VALUE
+        );
+        // Formats PG has no name for at all.
+        for name in ["graphviz", "tree", "traditional", "bogus"] {
+            assert_eq!(
+                reject(&format!("EXPLAIN (FORMAT {name}) SELECT 1"))?,
+                (
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    format!("unrecognized value for EXPLAIN option \"format\": \"{name}\"")
+                ),
+                "FORMAT {name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_takes_a_mode_and_validates_it() -> anyhow::Result<()> {
+        // `none` and `off` both ask for nothing, so neither needs ANALYZE.
+        accept("EXPLAIN (SERIALIZE none) SELECT 1")?;
+        accept("EXPLAIN (SERIALIZE off) SELECT 1")?;
+        accept("EXPLAIN (SERIALIZE NONE) SELECT 1")?;
+        // An unknown mode is an unrecognized value, reported before the
+        // requires-ANALYZE cross-check and regardless of ANALYZE.
+        for sql in [
+            "EXPLAIN (SERIALIZE bogus) SELECT 1",
+            "EXPLAIN (ANALYZE, SERIALIZE bogus) SELECT 1",
+        ] {
+            assert_eq!(
+                reject(sql)?,
+                (
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized value for EXPLAIN option \"serialize\": \"bogus\"".to_string()
+                ),
+                "{sql}"
+            );
+        }
+        // Quoted, so compared exactly — `'NONE'` is not the `none` mode.
+        assert_eq!(
+            reject("EXPLAIN (SERIALIZE 'NONE') SELECT 1")?,
+            (
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unrecognized value for EXPLAIN option \"serialize\": \"NONE\"".to_string()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_value_is_echoed_as_written() -> anyhow::Result<()> {
+        // PG renders the offending argument rather than dropping it, so the client
+        // is told what was rejected.
+        assert_eq!(
+            reject("EXPLAIN (FORMAT -1) SELECT 1")?,
+            (
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unrecognized value for EXPLAIN option \"format\": \"-1\"".to_string()
+            )
+        );
         Ok(())
     }
 
@@ -704,6 +800,64 @@ mod tests {
         let opts = accept("EXPLAIN (SUMMARY OFF, ANALYZE) SELECT 1")?;
         assert!(opts.analyze);
         assert!(!opts.summary);
+        Ok(())
+    }
+
+    #[test]
+    fn switching_an_unsupported_option_back_off_is_accepted() -> anyhow::Result<()> {
+        // The rejection must not latch while the list is still being read: PG
+        // accepts every one of these because the final value is off.
+        for sql in [
+            "EXPLAIN (MEMORY ON, MEMORY OFF) SELECT 1",
+            "EXPLAIN (VERBOSE ON, VERBOSE OFF) SELECT 1",
+            "EXPLAIN (SETTINGS ON, SETTINGS OFF) SELECT 1",
+            "EXPLAIN (WAL ON, WAL OFF) SELECT 1",
+            "EXPLAIN (TIMING ON, TIMING OFF) SELECT 1",
+            "EXPLAIN (GENERIC_PLAN ON, GENERIC_PLAN OFF) SELECT 1",
+            "EXPLAIN (SERIALIZE text, SERIALIZE none) SELECT 1",
+            "EXPLAIN (FORMAT json, FORMAT text) SELECT 1",
+        ] {
+            accept(sql)?;
+        }
+        // ...and switching one back *on* is still rejected.
+        assert_eq!(
+            reject("EXPLAIN (MEMORY OFF, MEMORY ON) SELECT 1")?.0,
+            sqlstate::FEATURE_NOT_SUPPORTED
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_error_a_bad_option_list_reports_does_not_depend_on_option_order() -> anyhow::Result<()> {
+        // PG's checks run once the list is settled, so each pair reports the same
+        // error whichever way round it is written.
+        for (a, b, expected) in [
+            (
+                "FORMAT bogus, WAL ON",
+                "WAL ON, FORMAT bogus",
+                "unrecognized value for EXPLAIN option \"format\": \"bogus\"",
+            ),
+            (
+                "TIMING ON, WAL ON",
+                "WAL ON, TIMING ON",
+                "EXPLAIN option WAL requires ANALYZE",
+            ),
+            (
+                "SERIALIZE text, TIMING ON",
+                "TIMING ON, SERIALIZE text",
+                "EXPLAIN option TIMING requires ANALYZE",
+            ),
+            (
+                "ANALYZE, GENERIC_PLAN",
+                "GENERIC_PLAN, ANALYZE",
+                "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together",
+            ),
+        ] {
+            let first = reject(&format!("EXPLAIN ({a}) SELECT 1"))?;
+            let second = reject(&format!("EXPLAIN ({b}) SELECT 1"))?;
+            assert_eq!(first.1, expected, "EXPLAIN ({a})");
+            assert_eq!(first, second, "EXPLAIN ({a}) vs EXPLAIN ({b})");
+        }
         Ok(())
     }
 }

@@ -89,8 +89,8 @@ pub enum QueryResult {
         columns: Vec<OutputColumn>,
         node: Box<dyn ExecNode>,
         /// Which command tag to report once the rows are drained. A plain SELECT
-        /// (and EXPLAIN) uses `SELECT n`; a `RETURNING` DML keeps its mutation
-        /// tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`).
+        /// uses `SELECT n`, EXPLAIN the bare `EXPLAIN`, and a `RETURNING` DML keeps
+        /// its mutation tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`).
         tag: RowTag,
     },
     Command {
@@ -405,8 +405,25 @@ pub fn analyze_statement(
         // The options are deliberately *not* validated here: PG inspects them at
         // Describe only to pick the result column type and raises nothing, leaving
         // every option error to Execute. Rejecting at Parse would abort an open
-        // transaction block for a statement that was never executed.
-        ast::Statement::Explain { statement, .. } => {
+        // transaction block for a statement that was never executed. A spelling
+        // PG's *grammar* rejects is different — that is a parse error there, so it
+        // has to fail here too rather than at Execute.
+        ast::Statement::Explain {
+            query_plan,
+            estimate,
+            statement,
+            format,
+            ..
+        } => {
+            if let Some(modifier) = query_plan
+                .then_some("QUERY")
+                .or_else(|| estimate.then_some("ESTIMATE"))
+                .or_else(|| format.is_some().then_some("FORMAT"))
+            {
+                return Err(PgError::syntax(format!(
+                    "syntax error at or near \"{modifier}\""
+                )));
+            }
             match statement.as_ref() {
                 ast::Statement::Query(q) => {
                     bind_query_with_params(&catalog, &type_catalog, q, &ctx)?
@@ -511,7 +528,12 @@ pub fn execute_statement(
     // commit. Unwrapping any earlier would make `BEGIN READ ONLY; EXPLAIN CREATE
     // TABLE t(…)` report 25006 instead of EXPLAIN's own unsupported-statement
     // error.
-    let (stmt, explain) = match stmt {
+    // The modifiers are carried unresolved past the binder on purpose: PG
+    // parse-analyzes the inner statement *before* it reads the option list, so
+    // `EXPLAIN (BOGUS) SELECT * FROM missing` reports the missing relation, not the
+    // bad option. Grammar errors are the exception — those precede name resolution
+    // in PG too, so they are raised here.
+    let (stmt, explain_options) = match stmt {
         ast::Statement::Explain {
             analyze,
             verbose,
@@ -522,16 +544,18 @@ pub fn execute_statement(
             options,
             ..
         } => {
-            // `EXPLAIN QUERY PLAN` (SQLite) and `EXPLAIN ESTIMATE` (ClickHouse) are
-            // other dialects' spellings that the shared parser accepts. PG's
-            // grammar does not, so neither does crabgresql — silently treating them
-            // as a plain EXPLAIN would answer a question that was not asked.
-            // PG echoes the offending token as the client wrote it and adds a
-            // cursor position; the parser keeps neither for these flags, so the
-            // keyword is reported in upper case and without a caret.
+            // `EXPLAIN QUERY PLAN` (SQLite), `EXPLAIN ESTIMATE` (ClickHouse) and the
+            // bare `EXPLAIN FORMAT <kind>` are other dialects' spellings that the
+            // shared parser accepts. PG's grammar has none of them, so neither does
+            // crabgresql — silently treating them as a plain EXPLAIN would answer a
+            // question that was not asked. PG echoes the offending token as the
+            // client wrote it and adds a cursor position; the parser keeps neither
+            // for these flags, so the keyword is reported in upper case without a
+            // caret.
             if let Some(modifier) = query_plan
                 .then_some("QUERY")
                 .or_else(|| estimate.then_some("ESTIMATE"))
+                .or_else(|| format.is_some().then_some("FORMAT"))
             {
                 return Err(PgError::syntax(format!(
                     "syntax error at or near \"{modifier}\""
@@ -539,12 +563,7 @@ pub fn execute_statement(
             }
             (
                 statement.as_ref(),
-                Some(ExplainOptions::resolve(
-                    *analyze,
-                    *verbose,
-                    format.as_ref(),
-                    options.as_deref(),
-                )?),
+                Some((*analyze, *verbose, options.as_deref())),
             )
         }
         other => (other, None),
@@ -557,7 +576,7 @@ pub fn execute_statement(
         Some(logical) => logical,
         // EXPLAIN of a utility statement: report the gap rather than falling
         // through to the handler, which would run the utility for real.
-        None if explain.is_some() => {
+        None if explain_options.is_some() => {
             return Err(PgError::feature_not_supported(format!(
                 "EXPLAIN of {} is not supported yet",
                 statement_kind(stmt)
@@ -715,6 +734,14 @@ pub fn execute_statement(
             }
         },
     };
+    // The inner statement bound, so the modifiers can be read now — after name
+    // resolution, where PG reads them.
+    let explain = match explain_options {
+        Some((analyze, verbose, options)) => {
+            Some(ExplainOptions::resolve(analyze, verbose, options)?)
+        }
+        None => None,
+    };
     // A write statement needs an XID to stamp its versions; a read runs with
     // none. Decide from the bound plan, not the surface AST: the binder already
     // resolved the statement to an Insert/Update/Delete node, so a new writing
@@ -741,6 +768,9 @@ pub fn execute_statement(
         ));
     }
     // Only EXPLAIN reports a planning time, so only EXPLAIN pays for the clock.
+    // The clock brackets planning alone, as PG's does — parse analysis (here, the
+    // binder) is outside it there too. crabgresql's planner does far less than
+    // PG's, so this number is legitimately small; it is not comparable to PG's.
     let planning_started = explain.is_some().then(Instant::now);
     let plan = crabgresql_planner::plan(logical);
     let planning = planning_started.map_or(Duration::ZERO, |started| started.elapsed());

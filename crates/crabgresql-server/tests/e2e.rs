@@ -3863,10 +3863,48 @@ async fn explain_options_report_pgs_sqlstates() -> anyhow::Result<()> {
         client.simple_query(sql).await?;
     }
 
-    // Another dialect's spelling that the shared parser accepts is not PG's.
-    for sql in ["EXPLAIN QUERY PLAN SELECT 1", "EXPLAIN ESTIMATE SELECT 1"] {
+    // Another dialect's spelling that the shared parser accepts is not PG's, and
+    // PG's grammar rejects it before it resolves any name.
+    for sql in [
+        "EXPLAIN QUERY PLAN SELECT 1",
+        "EXPLAIN ESTIMATE SELECT 1",
+        "EXPLAIN FORMAT TEXT SELECT 1",
+        "EXPLAIN FORMAT JSON SELECT 1",
+    ] {
         assert_eq!(sqlstate(&client, sql).await?, "42601", "{sql}");
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_resolves_names_before_reading_its_options() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // PG parse-analyzes the inner statement before it reads the option list, so a
+    // missing relation outranks a bad option — a client fixing errors in the order
+    // reported sees the same sequence it would from PG.
+    for sql in [
+        "EXPLAIN (BOGUS) SELECT * FROM nonexistent",
+        "EXPLAIN (FORMAT JSON) SELECT * FROM nonexistent",
+        "EXPLAIN (TIMING ON) SELECT * FROM nonexistent",
+        "EXPLAIN (ANALYZE -1) SELECT * FROM nonexistent",
+    ] {
+        assert_eq!(sqlstate(&client, sql).await?, "42P01", "{sql}");
+    }
+
+    // A grammar error is the exception: PG raises it before name resolution.
+    assert_eq!(
+        sqlstate(&client, "EXPLAIN QUERY PLAN SELECT * FROM nonexistent").await?,
+        "42601"
+    );
+
+    // With the relation present, the option error is what surfaces.
+    client.simple_query("CREATE TABLE present (id int)").await?;
+    assert_eq!(
+        sqlstate(&client, "EXPLAIN (BOGUS) SELECT * FROM present").await?,
+        "42601"
+    );
 
     Ok(())
 }
