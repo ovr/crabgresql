@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use crabgresql_storage_api::{
-    DeleteResult, TableAm, TableSchema, Tid, Tuple, UpdateResult, txn::TxnContext,
+    DeleteResult, RelStats, TableAm, TableSchema, Tid, Tuple, UpdateResult, txn::TxnContext,
 };
 use crabgresql_txn::Xid;
 
@@ -47,6 +47,13 @@ impl TableAm for StaticTable {
         &self.schema
     }
 
+    /// Exact, not estimated: the rows are already materialized, so counting them
+    /// is free and there is nothing for `ANALYZE` to improve. Reported as
+    /// analyzed for that reason.
+    fn statistics(&self) -> RelStats {
+        RelStats::exact(self.rows.len(), &self.schema)
+    }
+
     fn scan(&self, _txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
         // Synthetic tids from the row index; catalog rows are always visible.
         let rows = self.rows.clone();
@@ -70,4 +77,36 @@ impl TableAm for StaticTable {
     }
 
     fn vacuum(&self, _oldest: Xid, _clog: &crabgresql_txn::Clog) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crabgresql_storage_api::Column;
+    use crabgresql_types::{PgType, Value};
+
+    fn table(rows: usize) -> StaticTable {
+        StaticTable::new(
+            TableSchema::new("t", vec![Column::new("id", PgType::Int4)]),
+            (0..rows).map(|i| vec![Value::Int4(i as i32)]).collect(),
+        )
+    }
+
+    #[test]
+    fn statistics_count_the_rows_exactly() {
+        let stats = table(7).statistics();
+        assert_eq!(stats.reltuples, 7.0);
+        assert!(
+            stats.analyzed,
+            "a materialized row count is exact, not an estimate"
+        );
+        assert!(stats.relpages > 0);
+    }
+
+    #[test]
+    fn an_empty_catalog_relation_reports_no_rows() {
+        let stats = table(0).statistics();
+        assert_eq!(stats.reltuples, 0.0);
+        assert_eq!(stats.relpages, 0);
+    }
 }

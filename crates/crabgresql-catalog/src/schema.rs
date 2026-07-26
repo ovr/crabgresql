@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexMethod, PartitionBoundDatum, PartitionOf, PartitionStrategy,
-    TableSchema,
+    RelStats, TableSchema,
 };
 use crabgresql_types::{PgType, Value};
 
@@ -384,8 +384,18 @@ pub fn pg_am_rows() -> Vec<Vec<Value>> {
 /// PostgreSQL's `attnum` order. Columns crabgresql has no state for are still
 /// emitted with their true constant so a client's `\d` predicates evaluate as on
 /// PG (e.g. `relchecks = 0` gates the CHECK-constraint listing *off*). Storage
-/// bookkeeping columns beyond this set (`relpages`, `relfrozenxid`, …) are
+/// bookkeeping columns beyond this set (`relfrozenxid`, `relminmxid`, …) are
 /// omitted.
+///
+/// `relpages`/`reltuples` hold the **last `ANALYZE` snapshot**, not a live
+/// measurement — matching PostgreSQL, where a relation that has never been
+/// analyzed or vacuumed reports `relpages = 0` and `reltuples = -1` however
+/// large it actually is (observed on PostgreSQL 18.4). The planner's own live
+/// size estimate is a separate thing: see [`crate::RelStats`].
+///
+/// `relallvisible` sits between them in `attnum` order and is emitted as a
+/// constant `0` — crabgresql keeps no visibility map, and `0` is what PostgreSQL
+/// reports for a relation that has never been vacuumed.
 pub fn pg_class_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_class",
@@ -399,6 +409,9 @@ pub fn pg_class_schema() -> TableSchema {
             col("relowner", PgType::Oid),
             col("relam", PgType::Oid),
             col("reltablespace", PgType::Oid),
+            col("relpages", PgType::Int4),
+            col("reltuples", PgType::Float4),
+            col("relallvisible", PgType::Int4),
             col("reltoastrelid", PgType::Oid),
             col("relhasindex", PgType::Bool),
             col("relpersistence", CHARLIKE),
@@ -468,6 +481,25 @@ fn deparse_partbound(part: &PartitionOf) -> String {
     )
 }
 
+/// The `(relpages, reltuples)` pair `pg_class` reports for a relation.
+///
+/// PostgreSQL only writes these during `VACUUM`/`ANALYZE`, so a relation that
+/// has never been analyzed reports `(0, -1)` no matter how large it is — `-1` is
+/// the sentinel meaning "unknown", distinct from a genuine zero-row relation
+/// (verified against PostgreSQL 18.4). Reporting the planner's live estimate
+/// here instead would look more informative and be less correct: a client that
+/// checks `reltuples = -1` to decide whether a table needs analyzing would never
+/// see one that did.
+fn analyzed_size(stats: &RelStats) -> (Value, Value) {
+    if !stats.analyzed {
+        return (Value::Int4(0), Value::Float4(-1.0));
+    }
+    (
+        Value::Int4(stats.relpages.min(i32::MAX as u32) as i32),
+        Value::Float4(stats.reltuples as f32),
+    )
+}
+
 /// Build `pg_class` rows from `(oid, schema)` pairs paired with their kinds.
 /// `relpersistence` comes from each schema (`'p'` permanent, `'u'` unlogged,
 /// `'t'` temporary — the memory tables); a table is an ordinary heap (`relkind = 'r'`,
@@ -480,9 +512,12 @@ fn deparse_partbound(part: &PartitionOf) -> String {
 /// triggers or row security, no `OF type` / tablespace / TOAST relation. A
 /// heap-backed relation defaults its replica identity to the primary key
 /// (`relreplident = 'd'`); views, sequences, and indexes have none (`'n'`).
+///
+/// `stats` is parallel to `relations`; see [`analyzed_size`] for how it renders.
 pub fn pg_class_rows(
     relations: &[(u32, TableSchema)],
     kinds: &[RelKind],
+    stats: &[RelStats],
     indexes: &[CatalogIndex],
     namespace_oids: &HashMap<String, u32>,
 ) -> Vec<Vec<Value>> {
@@ -492,7 +527,8 @@ pub fn pg_class_rows(
     let mut rows: Vec<Vec<Value>> = relations
         .iter()
         .zip(kinds)
-        .map(|((oid, schema), kind)| {
+        .zip(stats)
+        .map(|(((oid, schema), kind), stats)| {
             // A partitioned parent has no access method (`relam = 0`) and holds no
             // storage of its own; a leaf partition is an ordinary heap.
             let (relam, relkind) = match kind {
@@ -511,6 +547,12 @@ pub fn pg_class_rows(
                 Some(part) => Value::Text(deparse_partbound(part)),
                 None => Value::Null,
             };
+            // A sequence is one page holding its single row, and PostgreSQL
+            // reports it that way from creation — there is nothing to analyze.
+            let (relpages, reltuples) = match kind {
+                RelKind::Sequence => (Value::Int4(1), Value::Float4(1.0)),
+                _ => analyzed_size(stats),
+            };
             vec![
                 Value::Oid(*oid),
                 Value::Text(schema.name.clone()),
@@ -520,8 +562,13 @@ pub fn pg_class_rows(
                 Value::Oid(0),
                 Value::Oid(BOOTSTRAP_ROLE_OID),
                 Value::Oid(relam),
-                // reltablespace / reltoastrelid: default tablespace, no TOAST.
+                // reltablespace: default tablespace.
                 Value::Oid(0),
+                relpages,
+                reltuples,
+                // relallvisible: no visibility map is kept.
+                Value::Int4(0),
+                // reltoastrelid: no TOAST relation.
                 Value::Oid(0),
                 Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
                 Value::Text(schema.persistence.as_char().to_string()),
@@ -555,6 +602,11 @@ pub fn pg_class_rows(
                 IndexMethod::Hash => HASH_AM_OID,
             }),
             Value::Oid(0),
+            // relpages / reltuples: per-index size is not tracked, so an index
+            // reports the never-analyzed sentinel. relallvisible: no map.
+            Value::Int4(0),
+            Value::Float4(-1.0),
+            Value::Int4(0),
             Value::Oid(0),
             Value::Bool(false),
             Value::Text("p".to_string()),

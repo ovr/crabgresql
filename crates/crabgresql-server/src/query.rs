@@ -258,6 +258,7 @@ fn bind_catalogs(
                             temp_schema.clone(),
                         );
                         relation.indexes = metadata.indexes;
+                        relation.stats = metadata.stats;
                         relation
                     }));
                     // Views reflect into pg_class as relkind='v' / pg_attribute
@@ -722,6 +723,9 @@ pub fn execute_statement(
             }
             ast::Statement::Truncate(truncate) => {
                 return execute_truncate(&catalog, txnmgr, session, truncate);
+            }
+            ast::Statement::Analyze(analyze) => {
+                return execute_analyze(&catalog, txnmgr, session, analyze);
             }
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
@@ -1348,6 +1352,77 @@ fn execute_truncate(
     }
     finalize_statement(txnmgr, session, &txn, true, true)?;
     Ok(QueryResult::command("TRUNCATE TABLE"))
+}
+
+/// `ANALYZE [table [(column, ...)]]` — measure relations and record what the
+/// planner and `pg_class.relpages`/`reltuples` report.
+///
+/// Runs as a **read**: it only scans rows, and the statistics it writes are
+/// non-transactional, so they stand even if the surrounding transaction rolls
+/// back. That is also why no read-only check applies — PostgreSQL 18.4 accepts
+/// `ANALYZE` inside a `READ ONLY` transaction and still updates `reltuples`.
+///
+/// A bare `ANALYZE` covers every relation this session can reach, skipping ones
+/// with no rows of their own (partitioned parents) and other sessions' temp
+/// tables, which the engine refuses by reporting them as absent.
+fn execute_analyze(
+    engine: &Arc<dyn TableEngine>,
+    txnmgr: &Arc<TransactionManager>,
+    session: &mut Session,
+    analyze: &ast::Analyze,
+) -> Result<QueryResult, PgError> {
+    if analyze.partitions.is_some() {
+        return Err(PgError::feature_not_supported(
+            "ANALYZE of a partition list is not supported yet",
+        ));
+    }
+    if analyze.for_columns || !analyze.columns.is_empty() {
+        return Err(PgError::feature_not_supported(
+            "ANALYZE of a column list is not supported yet",
+        ));
+    }
+    if analyze.cache_metadata || analyze.noscan || analyze.compute_statistics {
+        return Err(PgError::feature_not_supported(
+            "ANALYZE ... CACHE METADATA / NOSCAN / COMPUTE STATISTICS is not supported yet",
+        ));
+    }
+
+    // Resolve every target before measuring any, so a typo in the second name
+    // does not leave the first already analyzed.
+    let targets: Vec<(String, String)> = match &analyze.table_name {
+        Some(name) => {
+            let name = object_name_to_table_name(name)?;
+            let table = engine.open_table(&name)?;
+            reject_partitioned_parent(&table, &name)?;
+            vec![("public".to_string(), name)]
+        }
+        None => engine
+            .relations()
+            .into_iter()
+            // A partitioned parent holds no rows of its own; PostgreSQL derives
+            // its statistics from its children, which is not implemented here.
+            .filter(|schema| schema.partition_scheme.is_none())
+            .map(|schema| (schema.namespace, schema.name))
+            .collect(),
+    };
+
+    let txn = build_txn(txnmgr, session, false);
+    for (namespace, name) in &targets {
+        match engine.analyze(namespace, name, &txn) {
+            Ok(()) => {}
+            // A bare ANALYZE walks every relation the engine lists, which
+            // includes other sessions' temp tables; the engine reports those as
+            // absent and they are simply skipped. A named target was already
+            // resolved above, so it cannot land here.
+            Err(StorageError::TableNotFound(_)) if analyze.table_name.is_none() => {}
+            Err(error) => {
+                finalize_statement(txnmgr, session, &txn, false, false)?;
+                return Err(error.into());
+            }
+        }
+    }
+    finalize_statement(txnmgr, session, &txn, false, true)?;
+    Ok(QueryResult::command("ANALYZE"))
 }
 
 /// Register a semantic index. It is reflected through the catalogs and UNIQUE

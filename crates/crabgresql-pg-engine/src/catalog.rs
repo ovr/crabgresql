@@ -65,6 +65,15 @@ const RPRS_MAGIC: &[u8; 4] = b"RPR1";
 /// collations stops above and decodes every column with no collation, which is
 /// the pre-collation behavior: byte ordering everywhere.
 const COLL_MAGIC: &[u8; 4] = b"COL1";
+/// Marks the statistics section, appended after the [`COLL_MAGIC`] block — a
+/// ninth backward-compatible tail carrying what `ANALYZE` last measured for each
+/// relation. A reader that predates statistics stops above and treats every
+/// relation as never analyzed, which is exactly the pre-`ANALYZE` behavior.
+///
+/// Statistics are the one thing in this file that is legitimately *disposable*:
+/// PostgreSQL treats `pg_class.reltuples`/`pg_statistic` as best-effort, so
+/// losing this tail costs plan quality and nothing else.
+const STAT_MAGIC: &[u8; 4] = b"STA1";
 
 struct PersistCol {
     name: String,
@@ -102,6 +111,18 @@ struct PersistRel {
     partition_scheme: Option<PartitionScheme>,
     /// `Some` on a leaf partition: its parent and bound.
     partition_of: Option<PartitionOf>,
+    /// What `ANALYZE` last measured, persisted in the [`STAT_MAGIC`] tail.
+    /// `None` means never analyzed.
+    stats: Option<PersistStats>,
+}
+
+/// A persisted `ANALYZE` result. Relation-level only for now; `ncols` is written
+/// even when zero so per-column statistics can be added to the same tail without
+/// a format break.
+#[derive(Clone, Debug, PartialEq)]
+struct PersistStats {
+    relpages: u32,
+    reltuples: f64,
 }
 
 /// A persisted view: its SELECT text, derived column list, and the relations it
@@ -260,6 +281,8 @@ impl RelCatalog {
             persistence: schema.persistence,
             partition_scheme: schema.partition_scheme.clone(),
             partition_of: schema.partition_of.clone(),
+            // A brand-new relation has never been analyzed.
+            stats: None,
         });
         self.persist(&state)?;
         Ok(RelFileNode(rel))
@@ -376,6 +399,12 @@ impl RelCatalog {
             return Ok(Some(new));
         }
         rel.rel = new.0;
+        // Statistics describe the file being swapped out, so they do not carry
+        // over to the empty one. Clearing them here (rather than measuring zero)
+        // returns the relation to never-analyzed, which is what PostgreSQL
+        // reports after a TRUNCATE. Without this the stale row count would be
+        // re-persisted and reloaded on the next open.
+        rel.stats = None;
         // A `Temporary` table is excluded from `encode`, so persisting here would
         // rewrite + fsync the whole catalog to produce identical bytes. Update the
         // in-memory relfilenode (so a later DROP unlinks the right rel) but skip the
@@ -388,6 +417,59 @@ impl RelCatalog {
             self.persist(&state)?;
         }
         Ok(Some(RelFileNode(old)))
+    }
+
+    /// Record what `ANALYZE` measured for a relation. Returns `false` if this
+    /// catalog has no such relation.
+    ///
+    /// Deliberately **not** transactional: like PostgreSQL's, an `ANALYZE`
+    /// result survives a `ROLLBACK` of the transaction that produced it. That is
+    /// safe precisely because nothing depends on statistics for correctness —
+    /// the worst a stale or rolled-back number causes is a worse plan.
+    pub fn set_stats(
+        &self,
+        namespace: &str,
+        table: &str,
+        relpages: u32,
+        reltuples: f64,
+    ) -> std::io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(rel) = state
+            .rels
+            .iter_mut()
+            .find(|r| r.namespace == namespace && r.name == table)
+        else {
+            return Ok(false);
+        };
+        rel.stats = Some(PersistStats {
+            relpages,
+            reltuples,
+        });
+        // A `Temporary` relation is excluded from `encode`, so persisting would
+        // rewrite and fsync the whole catalog to produce identical bytes. Keep
+        // the in-memory statistics (this session still plans against them) and
+        // skip the disk write, exactly as `swap_relfilenode` does.
+        if rel.persistence.persists_catalog() {
+            self.persist(&state)?;
+        }
+        Ok(true)
+    }
+
+    /// What `ANALYZE` last measured for a relation as `(relpages, reltuples)`, or
+    /// `None` if it has never been analyzed (or does not exist here).
+    pub fn stats_in(&self, namespace: &str, table: &str) -> Option<(u32, f64)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let rel = state
+            .rels
+            .iter()
+            .find(|r| r.namespace == namespace && r.name == table)?;
+        rel.stats.as_ref().map(|s| (s.relpages, s.reltuples))
     }
 
     /// Raise `next` above `n` so a freshly allocated relfilenode can never alias a
@@ -987,6 +1069,27 @@ fn encode(state: &State) -> Vec<u8> {
             out.extend_from_slice(&c.collation.unwrap_or(0).to_le_bytes());
         }
     }
+    // Statistics: a ninth backward-compatible tail. For each relation (in `rels`
+    // order) a presence byte, and when set, what ANALYZE measured. `decode`
+    // leaves every relation never-analyzed when this tail is absent. The
+    // per-relation column count is written even though it is always zero today,
+    // so per-column statistics can be appended inside this same tail later
+    // without minting a tenth magic.
+    out.extend_from_slice(STAT_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        match &r.stats {
+            Some(stats) => {
+                out.push(1);
+                out.extend_from_slice(&stats.relpages.to_le_bytes());
+                // reltuples is a float; persist its exact bit pattern rather
+                // than a lossy decimal rendering.
+                out.extend_from_slice(&stats.reltuples.to_bits().to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
     out
 }
 
@@ -1025,6 +1128,12 @@ impl<'a> Dec<'a> {
         let v = i64::from_le_bytes(self.array());
         self.p += 8;
         v
+    }
+    /// A float persisted as its exact IEEE-754 bit pattern (see [`STAT_MAGIC`]).
+    fn f64(&mut self) -> f64 {
+        let v = u64::from_le_bytes(self.array());
+        self.p += 8;
+        f64::from_bits(v)
     }
     fn s(&mut self) -> String {
         let n = self.u32() as usize;
@@ -1107,6 +1216,8 @@ fn decode(bytes: &[u8]) -> State {
             // Default to unpartitioned; overridden below from the PART1 tail.
             partition_scheme: None,
             partition_of: None,
+            // Default to never analyzed; overridden below from the STA1 tail.
+            stats: None,
         });
     }
     if d.remaining().starts_with(META_MAGIC) {
@@ -1347,6 +1458,26 @@ fn decode(bytes: &[u8]) -> State {
                     c.collation = (collation != 0).then_some(collation);
                 }
             }
+        }
+    }
+    // Statistics tail: what ANALYZE last measured, zipped by position. Absent in
+    // a pre-statistics file — every relation keeps the never-analyzed `None`
+    // decoded above. The trailing column count is read and skipped; it is always
+    // zero today (see `encode`).
+    if d.remaining().starts_with(STAT_MAGIC) {
+        d.p += STAT_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            if d.byte() == 0 {
+                continue;
+            }
+            let relpages = d.u32();
+            let reltuples = d.f64();
+            let _ncols = d.u32();
+            r.stats = Some(PersistStats {
+                relpages,
+                reltuples,
+            });
         }
     }
     State {
@@ -1840,6 +1971,84 @@ mod tests {
                 .iter()
                 .all(|(_, _, schema, _)| schema.namespace == "public")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn statistics_round_trip_and_a_pre_stats_catalog_reports_never_analyzed()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        catalog.create(&TableSchema::new(
+            "untouched",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        // A fresh relation has never been analyzed.
+        assert_eq!(catalog.stats_in("public", "t"), None);
+        // A fractional row count exercises the float encoding: a sampled
+        // reltuples is not an integer, and must survive verbatim.
+        assert!(catalog.set_stats("public", "t", 17, 1234.5)?);
+        assert!(!catalog.set_stats("public", "nosuch", 1, 1.0)?);
+        drop(catalog);
+
+        let loaded = RelCatalog::load(dir.path())?;
+        assert_eq!(loaded.stats_in("public", "t"), Some((17, 1234.5)));
+        // Statistics are per relation, not global: analyzing one must not make
+        // its neighbour look analyzed.
+        assert_eq!(loaded.stats_in("public", "untouched"), None);
+        drop(loaded);
+
+        // A catalog written before this tail existed stops at the missing magic
+        // and decodes every relation as never analyzed — exactly the behavior
+        // before ANALYZE existed.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(STAT_MAGIC.len())
+            .position(|w| w == STAT_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("statistics marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        assert_eq!(legacy.stats_in("public", "t"), None);
+        // Everything the earlier tails carry still decodes.
+        assert_eq!(legacy.schemas().len(), 2);
+
+        Ok(())
+    }
+
+    /// A committed TRUNCATE swaps the relfilenode; the measurement of the file
+    /// it swapped away must not survive, in memory or on the next open.
+    #[test]
+    fn a_relfilenode_swap_clears_the_persisted_statistics() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        catalog.create(&TableSchema::new(
+            "other",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        assert!(catalog.set_stats("public", "t", 17, 1234.0)?);
+        assert!(catalog.set_stats("public", "other", 3, 9.0)?);
+
+        let swapped = catalog.alloc_relfilenode();
+        catalog.swap_relfilenode("public", "t", swapped)?;
+        assert_eq!(catalog.stats_in("public", "t"), None);
+        // Only the truncated relation is affected.
+        assert_eq!(catalog.stats_in("public", "other"), Some((3, 9.0)));
+        drop(catalog);
+
+        // The clear was persisted, so a restart does not resurrect the old count.
+        let reopened = RelCatalog::load(dir.path())?;
+        assert_eq!(reopened.stats_in("public", "t"), None);
+        assert_eq!(reopened.stats_in("public", "other"), Some((3, 9.0)));
 
         Ok(())
     }

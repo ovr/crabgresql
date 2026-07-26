@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, TableAm, TableSchema, Tid, Tuple, UpdateResult,
+    DeleteResult, IndexMetadata, RelStats, TableAm, TableSchema, Tid, Tuple, UpdateResult,
 };
 use crabgresql_txn::{Clog, LockOwner, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
 use crabgresql_types::Value;
@@ -66,6 +66,10 @@ pub struct HeapTable {
     /// registered at create time), so an `Unlogged` table is `wal_skipped` but
     /// on-disk.
     wal_skipped: bool,
+    /// What `ANALYZE` last measured, or `None` for a never-analyzed relation.
+    /// Loaded from the durable catalog at open and rewritten by `ANALYZE`;
+    /// non-transactional, matching PostgreSQL (see `RelCatalog::set_stats`).
+    analyzed: RwLock<Option<(u32, f64)>>,
 }
 
 /// One index attached to a heap table: its semantic metadata, its physical
@@ -111,7 +115,58 @@ impl HeapTable {
             insert_hint: AtomicU32::new(0),
             indexes: RwLock::new(indexes),
             wal_skipped,
+            analyzed: RwLock::new(None),
         }
+    }
+
+    /// The relation's size in 8 KB pages, straight from the storage manager
+    /// (a file-length division, so O(1)). `Err` only on an I/O failure.
+    ///
+    /// Reports the **committed** relfilenode; a caller that must agree with a
+    /// scan should use [`HeapTable::measure`] instead.
+    pub fn nblocks(&self) -> std::io::Result<u32> {
+        self.engine.bufpool.smgr().nblocks(self.relfilenode())
+    }
+
+    /// Count the rows visible to `txn` and size the relation, as one consistent
+    /// observation: `(relpages, reltuples)`.
+    ///
+    /// Both halves must describe the *same* file, which needs two things a
+    /// naive `scan().count()` then `nblocks()` does not give:
+    ///
+    /// - **One relfilenode.** A scan reads [`HeapTable::effective_rel`] — the
+    ///   staged file when `txn` itself has an uncommitted TRUNCATE — while
+    ///   [`HeapTable::nblocks`] reads the committed one. Inside
+    ///   `BEGIN; TRUNCATE t; ANALYZE t;` those differ, pairing the new file's
+    ///   row count with the old file's size.
+    /// - **One lock hold.** The guard `scan` takes lives only as long as its
+    ///   iterator, so a `scan(..).count()` releases it before any later call;
+    ///   another session's TRUNCATE could commit in the gap and swap the file
+    ///   between the two reads. Holding a shared hold across both closes that
+    ///   window — nested shared holds by the same owner are refcounted, so the
+    ///   one `scan` takes underneath is harmless.
+    pub fn measure(&self, txn: &TxnContext) -> (u32, f64) {
+        let _guard = self.lock.acquire_shared(txn.lock_owner);
+        let rel = self.effective_rel(txn.xid);
+        let relpages = self
+            .engine
+            .bufpool
+            .smgr()
+            .nblocks(rel)
+            // Statistics are advisory: a size that cannot be read pairs a zero
+            // with the real count rather than failing the statement.
+            .unwrap_or(0);
+        let reltuples = self.scan(txn).count() as f64;
+        (relpages, reltuples)
+    }
+
+    /// Install the `ANALYZE` result the durable catalog holds for this relation,
+    /// at open, or the one a fresh `ANALYZE` just produced.
+    pub fn set_analyzed(&self, relpages: u32, reltuples: f64) {
+        *self
+            .analyzed
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned")) = Some((relpages, reltuples));
     }
 
     /// Log a heap change, or skip the WAL entirely for a WAL-skipped table
@@ -251,7 +306,6 @@ impl HeapTable {
         }
     }
 
-    #[allow(dead_code)] // used by tooling/tests and future index AM wiring
     pub fn relfilenode(&self) -> RelFileNode {
         RelFileNode(self.live_rel.load(Ordering::Relaxed))
     }
@@ -284,6 +338,14 @@ impl HeapTable {
         let old = self.live_rel.swap(p.new_rel, Ordering::Relaxed);
         self.has_pending.store(false, Ordering::Release);
         self.insert_hint.store(0, Ordering::Relaxed);
+        // The measurement described the file that just went away, so drop it
+        // rather than let it describe the empty one. Back to never-analyzed —
+        // which is what PostgreSQL reports after a TRUNCATE (`relpages = 0`,
+        // `reltuples = -1`), not a measured zero.
+        *self
+            .analyzed
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned")) = None;
         Some((RelFileNode(old), p.owner))
     }
 
@@ -429,6 +491,35 @@ impl TableAm for HeapTable {
             .iter()
             .map(|e| e.meta.clone())
             .collect()
+    }
+
+    /// Size estimates from the storage manager: `nblocks` is the file length
+    /// divided by the page size, so this stays O(1) and needs no scan.
+    ///
+    /// Reports the **committed** relfilenode, not the one a transaction with a
+    /// staged TRUNCATE would read: statistics are relation-wide metadata, and
+    /// an uncommitted truncation has not changed the relation's size for anyone
+    /// else yet. An I/O error yields "nothing known" rather than a panic —
+    /// statistics are advisory, and no query result depends on them.
+    fn statistics(&self) -> RelStats {
+        // An ANALYZE result supersedes the size-derived guess: it counted the
+        // rows rather than inferring them from an assumed row width.
+        if let Some((relpages, reltuples)) = *self
+            .analyzed
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+        {
+            return RelStats {
+                relpages,
+                reltuples,
+                analyzed: true,
+                columns: Vec::new(),
+            };
+        }
+        match self.nblocks() {
+            Ok(nblocks) => RelStats::from_pages(nblocks, &self.schema),
+            Err(_) => RelStats::unknown(&self.schema),
+        }
     }
 
     fn supports_index_scan(&self, index_name: &str) -> bool {

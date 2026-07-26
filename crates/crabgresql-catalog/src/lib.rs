@@ -28,7 +28,8 @@ mod static_table;
 use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::{
-    Column, IndexMetadata, RelationMetadata, StorageError, TableAm, TableEngine, TableSchema,
+    Column, IndexMetadata, RelStats, RelationMetadata, StorageError, TableAm, TableEngine,
+    TableSchema,
 };
 use crabgresql_types::{PgType, Value};
 
@@ -182,6 +183,11 @@ pub struct CatalogRelation {
     pub kind: RelKind,
     /// Sequence parameters, `Some` only when `kind` is [`RelKind::Sequence`].
     pub sequence: Option<CatalogSequence>,
+    /// Size estimates feeding `pg_class.relpages`/`reltuples`. Relations with no
+    /// storage of their own — views and partitioned parents — leave this at
+    /// [`RelStats::unknown`], which renders as PostgreSQL's never-analyzed
+    /// sentinel; sequences are reported from their fixed shape instead.
+    pub stats: RelStats,
 }
 
 /// The relkind of a stored user relation: a partitioned parent (carrying a
@@ -200,6 +206,7 @@ impl CatalogRelation {
     pub fn permanent(schema: TableSchema) -> Self {
         let namespace = schema.namespace.clone();
         let kind = table_kind(&schema);
+        let stats = RelStats::unknown(&schema);
         Self {
             schema,
             indexes: Vec::new(),
@@ -207,6 +214,7 @@ impl CatalogRelation {
             temporary: false,
             kind,
             sequence: None,
+            stats,
         }
     }
 
@@ -220,11 +228,13 @@ impl CatalogRelation {
             temporary: false,
             kind,
             sequence: None,
+            stats: metadata.stats,
         }
     }
 
     pub fn temporary(schema: TableSchema, namespace: impl Into<String>) -> Self {
         let kind = table_kind(&schema);
+        let stats = RelStats::unknown(&schema);
         Self {
             schema,
             indexes: Vec::new(),
@@ -232,12 +242,14 @@ impl CatalogRelation {
             temporary: true,
             kind,
             sequence: None,
+            stats,
         }
     }
 
     /// A permanent view. Views have no indexes; its namespace rides on `schema`.
     pub fn view(schema: TableSchema) -> Self {
         let namespace = schema.namespace.clone();
+        let stats = RelStats::unknown(&schema);
         Self {
             schema,
             indexes: Vec::new(),
@@ -245,6 +257,7 @@ impl CatalogRelation {
             temporary: false,
             kind: RelKind::View,
             sequence: None,
+            stats,
         }
     }
 
@@ -266,6 +279,7 @@ impl CatalogRelation {
                 Column::new("is_called", PgType::Bool),
             ],
         );
+        let stats = RelStats::unknown(&schema);
         Self {
             schema,
             indexes: Vec::new(),
@@ -273,6 +287,7 @@ impl CatalogRelation {
             temporary: false,
             kind: RelKind::Sequence,
             sequence: Some(params),
+            stats,
         }
     }
 }
@@ -315,6 +330,7 @@ pub struct SystemCatalog {
     live_relations: OnceLock<Vec<CatalogRelation>>,
     oids: OnceLock<Vec<(u32, TableSchema)>>,
     kinds: OnceLock<Vec<RelKind>>,
+    stats: OnceLock<Vec<RelStats>>,
     index_oids: OnceLock<Vec<CatalogIndex>>,
     user_types: OnceLock<Vec<CatalogUserType>>,
     user_schemas: OnceLock<Vec<(String, u32)>>,
@@ -362,6 +378,7 @@ impl SystemCatalog {
             live_relations: OnceLock::new(),
             oids: OnceLock::new(),
             kinds: OnceLock::new(),
+            stats: OnceLock::new(),
             index_oids: OnceLock::new(),
             user_types: OnceLock::new(),
             user_schemas: OnceLock::new(),
@@ -445,6 +462,20 @@ impl SystemCatalog {
                     .then_with(|| a.schema.name.cmp(&b.schema.name))
             });
             rels.into_iter().map(|r| r.kind).collect()
+        })
+    }
+
+    /// The size estimates for each entry of [`SystemCatalog::relation_oids`], in
+    /// the same sorted order, feeding `pg_class.relpages`/`reltuples`.
+    fn relation_stats(&self) -> &[RelStats] {
+        self.stats.get_or_init(|| {
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            rels.into_iter().map(|r| r.stats).collect()
         })
     }
 
@@ -622,6 +653,7 @@ impl SystemCatalog {
                 schema::pg_class_rows(
                     self.relation_oids(),
                     self.relation_kinds(),
+                    self.relation_stats(),
                     self.index_oids(),
                     &self.namespace_oids(),
                 ),
@@ -885,6 +917,8 @@ mod tests {
             ("json", PgType::Json),
             ("jsonb", PgType::Jsonb),
             ("jsonpath", PgType::Jsonpath),
+            ("tsvector", PgType::Tsvector),
+            ("tsquery", PgType::Tsquery),
         ];
         for (typname, ty) in modeled {
             let row = PG_TYPE_ROWS
@@ -1451,6 +1485,98 @@ mod tests {
             row[1] == Value::Text("pg_temp_42".to_string())
                 && row[2] == Value::Text("appuser".to_string())
         }));
+
+        Ok(())
+    }
+
+    /// `relpages`/`reltuples` follow PostgreSQL's rule that they are written only
+    /// by `ANALYZE`, and both of `pg_class_rows`' row-building paths (relations,
+    /// then indexes) stay as wide as the schema.
+    #[test]
+    fn pg_class_size_columns_report_the_never_analyzed_sentinel() -> anyhow::Result<()> {
+        use crabgresql_storage_api::{
+            Column, IndexKey, IndexMethod, RelStats, TableSchema,
+        };
+        use crabgresql_types::PgType;
+
+        let table = TableSchema::new("tbl", vec![Column::new("a", PgType::Int4)]);
+        let index = IndexMetadata {
+            name: "tbl_a_idx".to_string(),
+            method: IndexMethod::BTree,
+            keys: vec![IndexKey {
+                column: 0,
+                descending: false,
+                nulls_first: false,
+            }],
+            unique: false,
+            nulls_distinct: true,
+            constraint: None,
+        };
+        // `analyzed_stats` stands in for a relation ANALYZE has measured; the
+        // others have not been analyzed and must report the sentinel.
+        let analyzed = RelStats::exact(1234, &table);
+        let cat = SystemCatalog::with_catalog_relations_fn("db", "owner", move || {
+            let mut measured = CatalogRelation::permanent(TableSchema::new(
+                "measured",
+                vec![Column::new("a", PgType::Int4)],
+            ));
+            measured.stats = analyzed.clone();
+            let mut indexed = CatalogRelation::permanent(table.clone());
+            indexed.indexes = vec![index.clone()];
+            vec![
+                measured,
+                indexed,
+                CatalogRelation::view(TableSchema::new(
+                    "vw",
+                    vec![Column::new("a", PgType::Int4)],
+                )),
+                CatalogRelation::sequence(
+                    "sq",
+                    "public",
+                    CatalogSequence {
+                        type_oid: PgType::Int8.oid(),
+                        start: 1,
+                        increment: 1,
+                        min: 1,
+                        max: i64::MAX,
+                        cache: 1,
+                        cycle: false,
+                    },
+                ),
+            ]
+        });
+
+        let (schema, rows) = required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?;
+        // The index row is built by a separate path from the relation rows;
+        // both must match the schema width or a client reads shifted columns.
+        assert_eq!(rows.len(), 5, "four relations plus one index");
+        assert!(rows.iter().all(|r| r.len() == schema.columns.len()));
+
+        let relname = required(schema.column_index("relname"), "relname is missing")?;
+        let cell = |name: &str, col: &str| -> anyhow::Result<Value> {
+            let i = required(schema.column_index(col), col)?;
+            required(
+                rows.iter()
+                    .find(|r| r[relname] == Value::Text(name.to_string()))
+                    .map(|r| r[i].clone()),
+                name,
+            )
+        };
+
+        // Never analyzed: no pages and the `-1` unknown sentinel — NOT zero,
+        // which would claim the relation is known to be empty.
+        for name in ["tbl", "vw", "tbl_a_idx"] {
+            assert_eq!(cell(name, "relpages")?, Value::Int4(0), "{name}");
+            assert_eq!(cell(name, "reltuples")?, Value::Float4(-1.0), "{name}");
+        }
+        // Analyzed: the measured count, reported as-is.
+        assert_eq!(cell("measured", "reltuples")?, Value::Float4(1234.0));
+        assert!(matches!(cell("measured", "relpages")?, Value::Int4(p) if p > 0));
+        // A sequence is one page holding one row from the moment it is created.
+        assert_eq!(cell("sq", "relpages")?, Value::Int4(1));
+        assert_eq!(cell("sq", "reltuples")?, Value::Float4(1.0));
+        // No visibility map is kept, so nothing is ever all-visible.
+        assert_eq!(cell("measured", "relallvisible")?, Value::Int4(0));
 
         Ok(())
     }

@@ -81,6 +81,16 @@ SELECT relname, relkind, relnatts, relpersistence
  pgcat_reflect | r       |        2 | p
 (1 row)
 
+-- size bookkeeping is only written by ANALYZE, so a fresh relation reports
+-- PG's never-analyzed sentinel: no pages, reltuples = -1 (unknown, not zero)
+SELECT relname, relpages, reltuples, relallvisible
+  FROM pg_class
+ WHERE relname = 'pgcat_reflect';
+    relname    | relpages | reltuples | relallvisible 
+---------------+----------+-----------+---------------
+ pgcat_reflect |        0 |        -1 |             0
+(1 row)
+
 -- pg_attribute joined to pg_class lists that relation's columns, in order,
 -- with PG's type OIDs (23 = int4, 25 = text) and typlen (-1 = varlena)
 SELECT a.attname, a.atttypid, a.attlen, a.attnum

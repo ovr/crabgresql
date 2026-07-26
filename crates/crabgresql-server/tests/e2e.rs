@@ -5973,3 +5973,65 @@ async fn reg_columns_advertise_their_postgresql_type_oids() -> anyhow::Result<()
     assert_eq!(rows(&same)[0].get("eq"), Some("t"));
     Ok(())
 }
+
+#[tokio::test]
+async fn analyze_measures_relations_and_reports_its_limits() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client.simple_query("CREATE TABLE a1 (id int)").await?;
+    client.simple_query("INSERT INTO a1 VALUES (1), (2)").await?;
+    client.simple_query("CREATE TEMP TABLE a2 (id int)").await?;
+    client.simple_query("INSERT INTO a2 VALUES (1)").await?;
+
+    let reltuples = |messages: &[SimpleQueryMessage], want: &str| {
+        let got = messages
+            .iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+                _ => None,
+            })
+            .expect("one row");
+        assert_eq!(got, want);
+    };
+    let size = |name: &str| format!("SELECT reltuples::int FROM pg_class WHERE relname = '{name}'");
+
+    // A bare ANALYZE covers every reachable relation, permanent and temp alike.
+    client.simple_query("ANALYZE").await?;
+    reltuples(&client.simple_query(&size("a1")).await?, "2");
+    reltuples(&client.simple_query(&size("a2")).await?, "1");
+
+    // A named ANALYZE re-measures just that relation.
+    client.simple_query("INSERT INTO a1 VALUES (3)").await?;
+    client.simple_query("ANALYZE a1").await?;
+    reltuples(&client.simple_query(&size("a1")).await?, "3");
+
+    // PostgreSQL 18.4 accepts ANALYZE inside a READ ONLY transaction and still
+    // updates the statistics, so this must not be rejected as a write.
+    client.simple_query("BEGIN TRANSACTION READ ONLY").await?;
+    client.simple_query("ANALYZE a1").await?;
+    client.simple_query("COMMIT").await?;
+
+    let err = client
+        .simple_query("ANALYZE nosuchtable")
+        .await
+        .expect_err("analyzing a missing relation must fail");
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_TABLE
+    );
+
+    // Column statistics are not collected yet, so a column list is refused
+    // rather than silently ignored.
+    let err = client
+        .simple_query("ANALYZE a1 (id)")
+        .await
+        .expect_err("a column list is not supported yet");
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    Ok(())
+}

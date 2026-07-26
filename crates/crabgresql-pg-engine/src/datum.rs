@@ -41,6 +41,8 @@ const T_JSONB: u8 = 28;
 const T_JSONPATH: u8 = 29;
 const T_ARRAY: u8 = 30;
 const T_REG: u8 = 31;
+const T_TSVECTOR: u8 = 32;
+const T_TSQUERY: u8 = 33;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -190,6 +192,18 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         Value::Jsonpath(p) => {
             out.push(T_JSONPATH);
             put_var(out, crabgresql_types::jsonpath::format(p).as_bytes());
+        }
+        // Both text-search types store their canonical text for the same reason:
+        // the output form round-trips exactly through the input parser.
+        Value::Tsvector(v) => {
+            out.push(T_TSVECTOR);
+            put_var(out, crabgresql_types::tsvector::format(v).as_bytes());
+        }
+        // `tsquery` cannot store its text form: `tsquery_out` is lossy for
+        // `&`/`|` associativity, so `'1|(2|4)'` would come back as `'1|2|4'`.
+        Value::Tsquery(q) => {
+            out.push(T_TSQUERY);
+            put_var(out, &crabgresql_types::tsquery::encode(q));
         }
         // A 1-D array: element type OID, element count, then per element a
         // presence byte (0 = NULL, 1 = a self-describing datum). Elements recurse
@@ -356,6 +370,15 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
                 crabgresql_types::jsonpath::jsonpath_in(s).expect("stored jsonpath re-parses"),
             )
         }
+        T_TSVECTOR => {
+            let s = std::str::from_utf8(r.var()).expect("tsvector text is valid utf-8");
+            Value::Tsvector(
+                crabgresql_types::tsvector::tsvector_in(s).expect("stored tsvector re-parses"),
+            )
+        }
+        T_TSQUERY => Value::Tsquery(
+            crabgresql_types::tsquery::decode(r.var()).expect("stored tsquery decodes"),
+        ),
         T_ARRAY => {
             let elem_oid = r.u32();
             let elem = PgType::from_oid(elem_oid).expect("stored array element type re-resolves");
@@ -495,6 +518,25 @@ mod tests {
                 .map(Value::Jsonpath)
                 .expect("valid jsonpath"),
         );
+        // Both text-search types store their canonical text form. The escaped
+        // lexeme and the phrase query exercise the parts of that form most
+        // likely to lose information on a round trip.
+        for tv in ["'a':1A,3B 'b' 'c':16383", r"'ab\\c' 'x''y'", ""] {
+            roundtrip(
+                crabgresql_types::tsvector::tsvector_in(tv)
+                    .map(Value::Tsvector)
+                    .expect("valid tsvector"),
+            );
+        }
+        // The last two print identically but are distinct values, so they pin
+        // that storage keeps the tree shape rather than the canonical text.
+        for tq in ["'a':*AB <2> ( 'b' | !'c' )", "!!'x'", "", "1|2|4", "1|(2|4)"] {
+            roundtrip(
+                crabgresql_types::tsquery::tsquery_in(tq)
+                    .map(Value::Tsquery)
+                    .expect("valid tsquery"),
+            );
+        }
         // Arrays: 1-D, empty, NULL elements, and a text element type.
         roundtrip(Value::Array {
             elem: PgType::Int4,
