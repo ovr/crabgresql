@@ -26,7 +26,9 @@ use crabgresql_planner::{
     HashKey, PhysicalAggInput, PhysicalInsertSource, PhysicalJoinExpr, PhysicalJoinInput,
     PhysicalPlan,
 };
-use crabgresql_storage_api::{IndexMetadata, PartitionBoundDatum, TableAm, TableSchema, Tid, Tuple};
+use crabgresql_storage_api::{
+    IndexMetadata, PartitionBoundDatum, StorageError, TableAm, TableSchema, Tid, Tuple,
+};
 use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
 
@@ -255,6 +257,21 @@ impl std::fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
+
+impl From<StorageError> for ExecError {
+    fn from(error: StorageError) -> Self {
+        let code = match error {
+            StorageError::UnsupportedOperation(_) | StorageError::UnsupportedType(_) => "0A000",
+            StorageError::Io(_) => "58030",
+            StorageError::CorruptData(_) => "XX001",
+            StorageError::TableNotFound(_) | StorageError::IndexTableNotFound(_) => "42P01",
+            StorageError::TableAlreadyExists(_) | StorageError::RelationAlreadyExists(_) => "42P07",
+            StorageError::SchemaAlreadyExists(_) => "42P06",
+            StorageError::SchemaNotFound(_) => "3F000",
+        };
+        Self::new(code, error.to_string())
+    }
+}
 
 impl ExecError {
     pub fn new(code: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
@@ -1428,7 +1445,10 @@ fn insert_direct(
     // unique index never needs the scan (NOT NULL checks only the new row).
     let has_unique = table.indexes().iter().any(|index| index.unique);
     let mut visible: Vec<Tuple> = if has_unique {
-        table.scan(txn).map(|(_, tuple)| tuple).collect()
+        table
+            .scan(txn)
+            .map(|row| row.map(|(_, tuple)| tuple))
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         Vec::new()
     };
@@ -1446,9 +1466,7 @@ fn insert_direct(
         Some(returning) => Some(project_returning(&tuples, &returning.projections, ctx)?),
         None => None,
     };
-    for tuple in tuples {
-        table.insert(tuple, txn);
-    }
+    table.insert_many(tuples, txn)?;
     finish_insert(returning, output, inserted)
 }
 
@@ -1480,7 +1498,12 @@ fn insert_routed(
         let leaf = route_tuple(parent_schema, leaves, tuple, ctx)?;
         let has_unique = leaves[leaf].indexes().iter().any(|index| index.unique);
         if has_unique && visible[leaf].is_none() {
-            visible[leaf] = Some(leaves[leaf].scan(txn).map(|(_, tuple)| tuple).collect());
+            visible[leaf] = Some(
+                leaves[leaf]
+                    .scan(txn)
+                    .map(|row| row.map(|(_, tuple)| tuple))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
         match visible[leaf].as_deref() {
             Some(seen) => validate_constraints(&leaves[leaf], tuple, seen.iter(), ctx)?,
@@ -1496,8 +1519,12 @@ fn insert_routed(
         Some(returning) => Some(project_returning(&tuples, &returning.projections, ctx)?),
         None => None,
     };
+    let mut batches: Vec<Vec<Tuple>> = vec![Vec::new(); leaves.len()];
     for (tuple, leaf) in tuples.into_iter().zip(routes) {
-        leaves[leaf].insert(tuple, txn);
+        batches[leaf].push(tuple);
+    }
+    for (leaf, tuples) in leaves.iter().zip(batches) {
+        leaf.insert_many(tuples, txn)?;
     }
     finish_insert(returning, output, inserted)
 }
@@ -1586,7 +1613,7 @@ fn update_direct(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    let original: Vec<(Tid, Tuple)> = table.scan(txn).collect();
+    let original: Vec<(Tid, Tuple)> = table.scan(txn).collect::<Result<_, _>>()?;
     // `simulated` mirrors the post-update table so a UNIQUE check sees other
     // rows' new values; it is only needed when a unique index exists.
     let has_unique = table.indexes().iter().any(|index| index.unique);
@@ -1632,10 +1659,10 @@ fn update_direct(
         Some(returning) => {
             let output =
                 project_returning(pending.iter().map(|(_, new)| new), &returning.projections, ctx)?;
-            table.update_many(pending, txn);
+            table.update_many(pending, txn)?;
             Ok(returning_rows(output, returning.columns, DmlVerb::Update))
         }
-        None => Ok(Execution::Updated(table.update_many(pending, txn))),
+        None => Ok(Execution::Updated(table.update_many(pending, txn)?)),
     }
 }
 
@@ -1676,8 +1703,10 @@ fn update_routed(
     // drives the match loop and — for leaves with a unique index — seeds the
     // post-statement simulation, so a leaf is never scanned twice and the match
     // set is fixed before any write (Halloween-safe).
-    let scans: Vec<Vec<(Tid, Tuple)>> =
-        leaves.iter().map(|leaf| leaf.scan(txn).collect()).collect();
+    let scans: Vec<Vec<(Tid, Tuple)>> = leaves
+        .iter()
+        .map(|leaf| leaf.scan(txn).collect::<Result<Vec<_>, _>>())
+        .collect::<Result<_, _>>()?;
     // Per-leaf simulation of the leaf's live rows after this statement, used only
     // for UNIQUE checks; seeded from `scans` for leaves that carry a unique index,
     // left empty (and unused) for the common unique-free leaf.
@@ -1788,11 +1817,9 @@ fn update_routed(
     // UPDATE tag reports.
     let mut affected = 0u64;
     for i in 0..leaves.len() {
-        affected += leaves[i].update_many(std::mem::take(&mut pending_update[i]), txn);
-        affected += leaves[i].delete_many(std::mem::take(&mut pending_delete[i]), txn);
-        for tuple in std::mem::take(&mut pending_insert[i]) {
-            leaves[i].insert(tuple, txn);
-        }
+        affected += leaves[i].update_many(std::mem::take(&mut pending_update[i]), txn)?;
+        affected += leaves[i].delete_many(std::mem::take(&mut pending_delete[i]), txn)?;
+        leaves[i].insert_many(std::mem::take(&mut pending_insert[i]), txn)?;
     }
     match (returning, output) {
         (Some(returning), Some(output)) => {
@@ -2026,7 +2053,8 @@ fn delete_direct(
     let mut pending: Vec<Tid> = Vec::new();
     // RETURNING sees the deleted (OLD) rows; capture them alongside the tids.
     let mut deleted: Vec<Tuple> = Vec::new();
-    for (tid, tuple) in table.scan(txn) {
+    for row in table.scan(txn) {
+        let (tid, tuple) = row?;
         if predicate_holds(predicate, &tuple, ctx)? {
             pending.push(tid);
             if returning.is_some() {
@@ -2039,10 +2067,10 @@ fn delete_direct(
     match returning {
         Some(returning) => {
             let output = project_returning(deleted.iter(), &returning.projections, ctx)?;
-            table.delete_many(pending, txn);
+            table.delete_many(pending, txn)?;
             Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
         }
-        None => Ok(Execution::Deleted(table.delete_many(pending, txn))),
+        None => Ok(Execution::Deleted(table.delete_many(pending, txn)?)),
     }
 }
 
@@ -2061,7 +2089,8 @@ fn delete_routed(
     // RETURNING sees the deleted (OLD) rows, in scan (leaf) order.
     let mut deleted: Vec<Tuple> = Vec::new();
     for (i, leaf) in leaves.iter().enumerate() {
-        for (tid, tuple) in leaf.scan(txn) {
+        for row in leaf.scan(txn) {
+            let (tid, tuple) = row?;
             if predicate_holds(predicate, &tuple, ctx)? {
                 pending[i].push(tid);
                 if returning.is_some() {
@@ -2074,14 +2103,14 @@ fn delete_routed(
         Some(returning) => {
             let output = project_returning(deleted.iter(), &returning.projections, ctx)?;
             for (i, leaf) in leaves.iter().enumerate() {
-                leaf.delete_many(std::mem::take(&mut pending[i]), txn);
+                leaf.delete_many(std::mem::take(&mut pending[i]), txn)?;
             }
             Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
         }
         None => {
             let mut affected = 0u64;
             for (i, leaf) in leaves.iter().enumerate() {
-                affected += leaf.delete_many(std::mem::take(&mut pending[i]), txn);
+                affected += leaf.delete_many(std::mem::take(&mut pending[i]), txn)?;
             }
             Ok(Execution::Deleted(affected))
         }
@@ -3023,20 +3052,20 @@ impl ExecNode for Limit {
 
 /// Full table scan through the storage API.
 pub struct SeqScan {
-    iter: Box<dyn Iterator<Item = Tuple> + Send>,
+    iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
 }
 
 impl SeqScan {
     pub fn new(table: &Arc<dyn TableAm>, txn: &TxnContext) -> Self {
         Self {
-            iter: Box::new(table.scan(txn).map(|(_, tuple)| tuple)),
+            iter: Box::new(table.scan(txn).map(|row| row.map(|(_, tuple)| tuple))),
         }
     }
 }
 
 impl ExecNode for SeqScan {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        Ok(self.iter.next())
+        self.iter.next().transpose().map_err(ExecError::from)
     }
 }
 
@@ -3045,16 +3074,16 @@ impl ExecNode for SeqScan {
 /// [`PhysicalPlan::Append`](crabgresql_planner::PhysicalPlan::Append)). Each
 /// leaf captures its own MVCC snapshot up front, exactly as [`SeqScan`] does.
 pub struct Append {
-    iter: Box<dyn Iterator<Item = Tuple> + Send>,
+    iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
 }
 
 impl Append {
     pub fn new(tables: &[Arc<dyn TableAm>], txn: &TxnContext) -> Self {
-        let scans: Vec<Box<dyn Iterator<Item = Tuple> + Send>> = tables
+        let scans: Vec<Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>> = tables
             .iter()
             .map(|table| {
-                Box::new(table.scan(txn).map(|(_, tuple)| tuple))
-                    as Box<dyn Iterator<Item = Tuple> + Send>
+                Box::new(table.scan(txn).map(|row| row.map(|(_, tuple)| tuple)))
+                    as Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>
             })
             .collect();
         Self {
@@ -3065,7 +3094,7 @@ impl Append {
 
 impl ExecNode for Append {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        Ok(self.iter.next())
+        self.iter.next().transpose().map_err(ExecError::from)
     }
 }
 
@@ -3108,7 +3137,7 @@ impl ExecNode for Concat {
 /// The physical-index path is already exact (the engine returns only rows whose
 /// key equals the probe), so it needs no re-check. NULL never matches under `=`.
 pub struct IndexScan {
-    iter: Box<dyn Iterator<Item = Tuple> + Send>,
+    iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
 }
 
 impl IndexScan {
@@ -3125,25 +3154,29 @@ impl IndexScan {
             .iter()
             .map(|(_, expr)| eval(expr, &[], ctx))
             .collect::<Result<_, _>>()?;
-        let iter: Box<dyn Iterator<Item = Tuple> + Send> =
+        let iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send> =
             match table.index_lookup(index_name, &key_values, txn) {
                 // Exact path: the engine already returned only key-matching,
                 // MVCC-visible rows.
-                Some(rows) => Box::new(rows.map(|(_, tuple)| tuple)),
+                Some(rows) => Box::new(rows.map(|(_, tuple)| Ok(tuple))),
                 // Fallback path: a full scan, so re-check the key per row.
                 None => {
                     let cols: Vec<(usize, PgType)> = key
                         .iter()
                         .map(|(column, _)| (*column, table.schema().columns[*column].ty))
                         .collect();
-                    Box::new(table.scan(txn).filter_map(move |(_, tuple)| {
-                        cols.iter().zip(&key_values).all(|(&(column, ty), want)| {
-                            let cell = &tuple[column];
-                            !matches!(cell, Value::Null)
-                                && !matches!(want, Value::Null)
-                                && compare_values(ty, cell, want) == Ordering::Equal
-                        })
-                        .then_some(tuple)
+                    Box::new(table.scan(txn).filter_map(move |row| match row {
+                        Ok((_, tuple)) => cols
+                            .iter()
+                            .zip(&key_values)
+                            .all(|(&(column, ty), want)| {
+                                let cell = &tuple[column];
+                                !matches!(cell, Value::Null)
+                                    && !matches!(want, Value::Null)
+                                    && compare_values(ty, cell, want) == Ordering::Equal
+                            })
+                            .then_some(Ok(tuple)),
+                        Err(error) => Some(Err(error)),
                     }))
                 }
             };
@@ -3153,7 +3186,7 @@ impl IndexScan {
 
 impl ExecNode for IndexScan {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        Ok(self.iter.next())
+        self.iter.next().transpose().map_err(ExecError::from)
     }
 }
 
@@ -4036,7 +4069,14 @@ mod tests {
             panic!("expected Updated");
         };
         assert_eq!(n, 3);
-        let ids: Vec<Value> = table.scan(&rtxn()).map(|(_, t)| t[0].clone()).collect();
+        let ids: Vec<Value> = table
+            .scan(&rtxn())
+            .map(|row| {
+                row.unwrap_or_else(|error| panic!("scan failed: {error}"))
+                    .1[0]
+                    .clone()
+            })
+            .collect();
         assert_eq!(ids, vec![Value::Int4(2), Value::Int4(3), Value::Int4(4)]);
 
         Ok(())
@@ -4078,7 +4118,14 @@ mod tests {
             panic!("expected error");
         };
         assert_eq!(e.code, "22012");
-        let ids: Vec<Value> = table.scan(&rtxn()).map(|(_, t)| t[0].clone()).collect();
+        let ids: Vec<Value> = table
+            .scan(&rtxn())
+            .map(|row| {
+                row.unwrap_or_else(|error| panic!("scan failed: {error}"))
+                    .1[0]
+                    .clone()
+            })
+            .collect();
         assert_eq!(ids, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
     }
 

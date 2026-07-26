@@ -196,6 +196,12 @@ impl Dialect for PostgreSqlDialect {
         true
     }
 
+    /// CrabgreSQL extends PostgreSQL's table-access-method surface with managed
+    /// engines selected by `CREATE TABLE ... USING <method>`.
+    fn supports_create_table_using(&self) -> bool {
+        true
+    }
+
     /// see <https://www.postgresql.org/docs/current/sql-explain.html>
     fn supports_explain_with_utility_options(&self) -> bool {
         true

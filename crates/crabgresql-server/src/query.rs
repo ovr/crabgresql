@@ -26,7 +26,7 @@ use crabgresql_storage_api::{
     Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
     PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
     RelationMetadata, RoutineKind as ApiRoutineKind, RoutineSig, SequenceDefinition, StorageError,
-    TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
+    TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -1663,12 +1663,20 @@ fn execute_truncate(
     // named twice in one statement.
     named.sort_by(|a, b| a.0.cmp(&b.0));
     named.dedup_by(|a, b| a.0 == b.0);
+    if named
+        .iter()
+        .any(|(_, table)| !table.capabilities().truncate)
+    {
+        return Err(PgError::feature_not_supported(
+            "table access method \"parquet\" does not support TRUNCATE",
+        ));
+    }
     // TRUNCATE is a write: run it under a real transaction so autocommit commits
     // it. On the durable heap engine this is fully transactional — the swap is
     // applied on commit and discarded on rollback (or a crash before commit).
     let txn = build_txn(txnmgr, session, true);
     for (_, table) in &named {
-        table.truncate(&txn);
+        table.truncate(&txn)?;
     }
     finalize_statement(txnmgr, session, &txn, true, true, None)?;
     Ok(QueryResult::command("TRUNCATE TABLE"))
@@ -1832,7 +1840,8 @@ fn validate_unique_index_build(
 ) -> Result<(), PgError> {
     let schema = table.schema();
     let mut seen: Vec<crabgresql_storage_api::Tuple> = Vec::new();
-    for (_, tuple) in table.scan(txn) {
+    for row in table.scan(txn) {
+        let (_, tuple) = row?;
         if index.nulls_distinct
             && index
                 .keys
@@ -2164,6 +2173,41 @@ fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, PgError> 
     single_object_name(name, "relation")
 }
 
+fn create_table_access_method(
+    create: &ast::CreateTable,
+) -> Result<TableAccessMethod, PgError> {
+    if create.external {
+        return Err(PgError::feature_not_supported(
+            "external tables are not supported",
+        ));
+    }
+    let Some(format) = &create.hive_formats else {
+        return Ok(TableAccessMethod::Heap);
+    };
+    if format.row_format.is_some()
+        || format.serde_properties.is_some()
+        || format.location.is_some()
+    {
+        return Err(PgError::feature_not_supported(
+            "external table storage options and LOCATION are not supported",
+        ));
+    }
+    let Some(ast::HiveIOFormat::Using { format }) = &format.storage else {
+        return Err(PgError::feature_not_supported(
+            "only CREATE TABLE ... USING heap or USING parquet is supported",
+        ));
+    };
+    let name = normalize_ident(format);
+    match name.as_str() {
+        "heap" => Ok(TableAccessMethod::Heap),
+        "parquet" => Ok(TableAccessMethod::Parquet),
+        _ => Err(PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("table access method \"{name}\" does not exist"),
+        )),
+    }
+}
+
 /// Split a possibly schema-qualified object name into `(schema, name)`. One part
 /// is unqualified (`None`); two parts are `schema.name`; three or more (a
 /// database qualifier) are rejected, matching the binder's `split_relation_name`.
@@ -2219,6 +2263,7 @@ fn execute_create_table(
     create: &ast::CreateTable,
     session: &Session,
 ) -> Result<QueryResult, PgError> {
+    let access_method = create_table_access_method(create)?;
     let (schema_qual, name) = split_object_name(&create.name, "relation")?;
     // A TEMP table lives in the session temp keyspace; a schema qualifier on it
     // is only meaningful as `pg_temp` (which we already route), so reject any
@@ -2248,6 +2293,20 @@ fn execute_create_table(
     } else {
         RelPersistence::Permanent
     };
+    if access_method == TableAccessMethod::Parquet
+        && persistence != RelPersistence::Permanent
+    {
+        return Err(PgError::feature_not_supported(
+            "table access method \"parquet\" only supports permanent tables",
+        ));
+    }
+    if access_method == TableAccessMethod::Parquet
+        && (create.partition_by.is_some() || create.partition_of.is_some())
+    {
+        return Err(PgError::feature_not_supported(
+            "table access method \"parquet\" does not support partitioning",
+        ));
+    }
     let target = engine;
     // CTAS (`create.query.is_some()`) is dispatched to `execute_create_table_as`
     // before reaching here, so this path only builds an empty table. Clauses we
@@ -2519,6 +2578,7 @@ fn execute_create_table(
         namespace: namespace.clone(),
         columns,
         persistence,
+        access_method,
         partition_scheme,
         partition_of: None,
     };
@@ -2907,6 +2967,7 @@ fn execute_create_partition(
         namespace: namespace.to_string(),
         columns: parent_schema.columns.clone(),
         persistence: RelPersistence::Permanent,
+        access_method: TableAccessMethod::Heap,
         partition_scheme: None,
         partition_of: Some(PartitionOf {
             parent_namespace: parent_schema.namespace.clone(),
@@ -2942,6 +3003,7 @@ fn execute_create_table_as(
     create: &ast::CreateTable,
     session: &mut Session,
 ) -> Result<QueryResult, PgError> {
+    let access_method = create_table_access_method(create)?;
     let (schema_qual, name) = split_object_name(&create.name, "relation")?;
     // Resolve the target namespace the same way a plain CREATE TABLE does: a
     // TEMP table lives in the session temp keyspace (only `pg_temp` qualifiers
@@ -2986,6 +3048,13 @@ fn execute_create_table_as(
     } else {
         RelPersistence::Permanent
     };
+    if access_method == TableAccessMethod::Parquet
+        && persistence != RelPersistence::Permanent
+    {
+        return Err(PgError::feature_not_supported(
+            "table access method \"parquet\" only supports permanent tables",
+        ));
+    }
 
     // Bind the defining query and take its output column shape.
     let query = create.query.as_ref().expect("CTAS dispatch guards query");
@@ -3041,6 +3110,7 @@ fn execute_create_table_as(
             })
             .collect(),
         persistence,
+        access_method,
         partition_scheme: None,
         partition_of: None,
     };

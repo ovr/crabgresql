@@ -210,6 +210,63 @@ async fn committed_data_survives_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn parquet_commit_rollback_and_restart_are_durable() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE TABLE events (id int4, label text) USING parquet")
+            .await?;
+        client
+            .simple_query("INSERT INTO events VALUES (1, 'committed')")
+            .await?;
+        client.simple_query("BEGIN").await?;
+        client
+            .simple_query("INSERT INTO events VALUES (2, 'rolled back')")
+            .await?;
+        client.simple_query("ROLLBACK").await?;
+        shutdown(client, handle).await;
+    }
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let messages = client
+            .simple_query("SELECT id, label FROM events ORDER BY id")
+            .await?;
+        let result = rows(&messages);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            (result[0].get(0), result[0].get(1)),
+            (Some("1"), Some("committed"))
+        );
+        client
+            .simple_query("INSERT INTO events VALUES (3, 'after restart')")
+            .await?;
+        shutdown(client, handle).await;
+    }
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let messages = client
+            .simple_query("SELECT id FROM events ORDER BY id")
+            .await?;
+        let ids: Vec<Option<&str>> = rows(&messages).iter().map(|row| row.get(0)).collect();
+        assert_eq!(ids, vec![Some("1"), Some("3")]);
+        client.simple_query("DROP TABLE events").await?;
+        shutdown(client, handle).await;
+    }
+    assert!(
+        !dir.path().join("parquet").join("1").exists(),
+        "DROP TABLE must remove its managed Parquet directory"
+    );
+    Ok(())
+}
+
 /// A sequence's counter is non-transactional (a ROLLBACK does not rewind it) and
 /// durable (its advanced position survives a full server restart).
 #[tokio::test]

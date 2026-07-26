@@ -257,6 +257,17 @@ impl RelPersistence {
     }
 }
 
+/// Physical table access method selected by `CREATE TABLE ... USING`.
+///
+/// This is persisted as part of [`TableSchema`]. Existing catalogs that predate
+/// access-method persistence decode as [`TableAccessMethod::Heap`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TableAccessMethod {
+    #[default]
+    Heap,
+    Parquet,
+}
+
 #[derive(Clone, Debug)]
 pub struct TableSchema {
     pub name: String,
@@ -269,6 +280,9 @@ pub struct TableSchema {
     /// How the relation is stored: durable heap (`Permanent`) or a RAM-backed,
     /// WAL-skipping memory table (`Unlogged`/`Temporary`).
     pub persistence: RelPersistence,
+    /// The physical access method. Plain `CREATE TABLE` uses `Heap`; an explicit
+    /// `USING parquet` selects the append-only Parquet implementation.
+    pub access_method: TableAccessMethod,
     /// `Some` on a partitioned (parent) table: its partition key. Such a table
     /// is `relkind = 'p'` and holds no rows of its own.
     pub partition_scheme: Option<PartitionScheme>,
@@ -284,6 +298,7 @@ impl TableSchema {
             namespace: "public".to_string(),
             columns,
             persistence: RelPersistence::Permanent,
+            access_method: TableAccessMethod::Heap,
             partition_scheme: None,
             partition_of: None,
         }
@@ -300,6 +315,7 @@ impl TableSchema {
             namespace: namespace.into(),
             columns,
             persistence: RelPersistence::Permanent,
+            access_method: TableAccessMethod::Heap,
             partition_scheme: None,
             partition_of: None,
         }
@@ -407,6 +423,14 @@ pub enum StorageError {
     SchemaAlreadyExists(String),
     #[error("schema \"{0}\" does not exist")]
     SchemaNotFound(String),
+    #[error("{0}")]
+    UnsupportedOperation(String),
+    #[error("{0}")]
+    UnsupportedType(String),
+    #[error("{0}")]
+    Io(String),
+    #[error("{0}")]
+    CorruptData(String),
 }
 
 /// Outcome of `TableAm::update`.
@@ -432,10 +456,46 @@ pub enum DeleteResult {
     Conflict { updater: Xid, latest: Option<Tid> },
 }
 
+/// Mutations a table access method can execute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableCapabilities {
+    pub insert: bool,
+    pub update: bool,
+    pub delete: bool,
+    pub truncate: bool,
+}
+
+impl TableCapabilities {
+    pub const MUTABLE: Self = Self {
+        insert: true,
+        update: true,
+        delete: true,
+        truncate: true,
+    };
+
+    pub const APPEND_ONLY: Self = Self {
+        insert: true,
+        update: false,
+        delete: false,
+        truncate: false,
+    };
+}
+
+/// A fallible tuple stream. Storage failures can occur after a scan has begun
+/// (for example while opening the next Parquet fragment), so errors travel as
+/// iterator items instead of being collapsed into an eager open result.
+pub type TupleStream = Box<
+    dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send,
+>;
+
 /// Table access: scans and modifications on one table, all judged against the
 /// caller's [`TxnContext`].
 pub trait TableAm: Send + Sync {
     fn schema(&self) -> &TableSchema;
+
+    fn capabilities(&self) -> TableCapabilities {
+        TableCapabilities::MUTABLE
+    }
 
     /// Semantic indexes currently attached to this table.
     fn indexes(&self) -> Vec<IndexMetadata> {
@@ -457,11 +517,11 @@ pub trait TableAm: Send + Sync {
     /// iterator captures the snapshot up front, so a DML statement never
     /// re-visits rows it modified itself (the reader's own new versions carry
     /// the reader's command id and stay invisible to the same command).
-    fn scan(&self, txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send>;
+    fn scan(&self, txn: &TxnContext) -> TupleStream;
 
     /// Fetch one version by tid if it is visible to `txn` — the re-read
     /// EvalPlanQual needs after a conflict, and a point lookup for indexes.
-    fn fetch(&self, tid: Tid, txn: &TxnContext) -> Option<Tuple>;
+    fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError>;
 
     /// Whether the engine can physically serve an equality index scan on
     /// `index_name` — i.e. whether [`TableAm::index_lookup`] would return `Some`
@@ -494,48 +554,73 @@ pub trait TableAm: Send + Sync {
     /// Insert a new version stamped with `txn`'s XID. The tuple must have
     /// exactly `schema().columns.len()` values in schema order — executors index
     /// tuples by schema position and rely on this.
-    fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Tid;
+    fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError>;
+
+    /// Insert a statement's complete tuple batch. Engines with a columnar write
+    /// path override this to build one or more fragments rather than one file per
+    /// tuple.
+    fn insert_many(
+        &self,
+        tuples: Vec<Tuple>,
+        txn: &TxnContext,
+    ) -> Result<Vec<Tid>, StorageError> {
+        tuples
+            .into_iter()
+            .map(|tuple| self.insert(tuple, txn))
+            .collect()
+    }
 
     /// Replace the version identified by `tid`: the old version is marked
     /// deleted by `txn` and a new version holding `tuple` is inserted. The tuple
     /// contract matches [`TableAm::insert`].
-    fn update(&self, tid: Tid, tuple: Tuple, txn: &TxnContext) -> UpdateResult;
+    fn update(
+        &self,
+        tid: Tid,
+        tuple: Tuple,
+        txn: &TxnContext,
+    ) -> Result<UpdateResult, StorageError>;
 
     /// Mark the version identified by `tid` deleted by `txn`.
-    fn delete(&self, tid: Tid, txn: &TxnContext) -> DeleteResult;
+    fn delete(&self, tid: Tid, txn: &TxnContext) -> Result<DeleteResult, StorageError>;
 
     /// Apply a batch of replacements, returning how many rows were found and
     /// updated (vanished tids are skipped, not counted). Engines should
     /// override this to apply the whole batch under one lock — per-row calls
     /// make a large UPDATE quadratic.
-    fn update_many(&self, updates: Vec<(Tid, Tuple)>, txn: &TxnContext) -> u64 {
+    fn update_many(
+        &self,
+        updates: Vec<(Tid, Tuple)>,
+        txn: &TxnContext,
+    ) -> Result<u64, StorageError> {
         let mut applied = 0;
         for (tid, tuple) in updates {
-            if self.update(tid, tuple, txn) == UpdateResult::Updated {
+            if self.update(tid, tuple, txn)? == UpdateResult::Updated {
                 applied += 1;
             }
         }
-        applied
+        Ok(applied)
     }
 
     /// Batch counterpart of [`TableAm::delete`], mirroring
     /// [`TableAm::update_many`].
-    fn delete_many(&self, tids: Vec<Tid>, txn: &TxnContext) -> u64 {
+    fn delete_many(&self, tids: Vec<Tid>, txn: &TxnContext) -> Result<u64, StorageError> {
         let mut applied = 0;
         for tid in tids {
-            if self.delete(tid, txn) == DeleteResult::Deleted {
+            if self.delete(tid, txn)? == DeleteResult::Deleted {
                 applied += 1;
             }
         }
-        applied
+        Ok(applied)
     }
 
     /// Remove every row (TRUNCATE). Row identity is not preserved: engines need
     /// not keep tids reusable after a truncate. The default scans and deletes;
     /// engines should override with a whole-table reset.
-    fn truncate(&self, txn: &TxnContext) {
-        let tids: Vec<Tid> = self.scan(txn).map(|(tid, _)| tid).collect();
-        self.delete_many(tids, txn);
+    fn truncate(&self, txn: &TxnContext) -> Result<(), StorageError> {
+        let tids: Result<Vec<Tid>, StorageError> =
+            self.scan(txn).map(|row| row.map(|(tid, _)| tid)).collect();
+        self.delete_many(tids?, txn)?;
+        Ok(())
     }
 
     /// Reclaim versions dead to every transaction at or before `oldest`. A

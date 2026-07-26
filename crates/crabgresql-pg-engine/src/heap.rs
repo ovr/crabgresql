@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, RelStats, TableAm, TableSchema, Tid, Tuple, UpdateResult,
+    DeleteResult, IndexMetadata, RelStats, StorageError, TableAm, TableSchema, Tid, Tuple,
+    TupleStream, UpdateResult,
 };
 use crabgresql_txn::{Clog, LockOwner, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
 use crabgresql_types::Value;
@@ -568,14 +569,14 @@ impl TableAm for HeapTable {
         .search_equal(&kb);
         let mut out = Vec::new();
         for tid in tids {
-            if let Some(tuple) = self.fetch(tid, txn) {
+            if let Ok(Some(tuple)) = self.fetch(tid, txn) {
                 out.push((tid, tuple));
             }
         }
         Some(Box::new(out.into_iter()))
     }
 
-    fn scan(&self, txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
+    fn scan(&self, txn: &TxnContext) -> TupleStream {
         // Hold a shared lock for the whole iterator life so a concurrent TRUNCATE
         // cannot unlink the file this scan is reading.
         let guard = self.lock.acquire_shared(txn.lock_owner);
@@ -593,15 +594,15 @@ impl TableAm for HeapTable {
         })
     }
 
-    fn fetch(&self, tid: Tid, txn: &TxnContext) -> Option<Tuple> {
+    fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         let smgr = self.engine.bufpool.smgr();
         if tid.block >= Self::io(smgr.nblocks(rel)) {
-            return None;
+            return Ok(None);
         }
         let page = Self::io(self.engine.bufpool.pin(rel, tid.block));
-        page.read(|pg| {
+        Ok(page.read(|pg| {
             let bytes = page::get_item(pg, tid.offset)?;
             let head = tuple::decode_header(bytes);
             if satisfies_mvcc(&head.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid) {
@@ -609,10 +610,10 @@ impl TableAm for HeapTable {
             } else {
                 None
             }
-        })
+        }))
     }
 
-    fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Tid {
+    fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
@@ -626,10 +627,15 @@ impl TableAm for HeapTable {
         );
         let tid = self.place(rel, txn.xid, &bytes);
         self.maintain_insert(&tuple, tid);
-        tid
+        Ok(tid)
     }
 
-    fn update(&self, tid: Tid, tuple: Tuple, txn: &TxnContext) -> UpdateResult {
+    fn update(
+        &self,
+        tid: Tid,
+        tuple: Tuple,
+        txn: &TxnContext,
+    ) -> Result<UpdateResult, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         // Stamp the old version deleted-by-us FIRST, atomically under its page
@@ -639,7 +645,7 @@ impl TableAm for HeapTable {
         // never ends up with two live successors. Only after winning that race do
         // we place the new version.
         if !self.stamp_deleted(rel, tid, txn) {
-            return UpdateResult::NotFound;
+            return Ok(UpdateResult::NotFound);
         }
         // The old tuple's forward ctid is left pointing at itself; the
         // update-chain link is only consumed by EvalPlanQual, which is deferred
@@ -658,16 +664,20 @@ impl TableAm for HeapTable {
         // memory engine's append-only maintenance.
         let new_tid = self.place(rel, txn.xid, &new_bytes);
         self.maintain_insert(&tuple, new_tid);
-        UpdateResult::Updated
+        Ok(UpdateResult::Updated)
     }
 
-    fn delete(&self, tid: Tid, txn: &TxnContext) -> DeleteResult {
+    fn delete(
+        &self,
+        tid: Tid,
+        txn: &TxnContext,
+    ) -> Result<DeleteResult, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         if self.stamp_deleted(rel, tid, txn) {
-            DeleteResult::Deleted
+            Ok(DeleteResult::Deleted)
         } else {
-            DeleteResult::NotFound
+            Ok(DeleteResult::NotFound)
         }
     }
 
@@ -677,7 +687,7 @@ impl TableAm for HeapTable {
     /// the [`crabgresql_txn::TxnFinalize`] hook (`PgEngine::on_commit`/`on_abort`).
     /// The old file stays intact until commit, so a rollback or crash-before-commit
     /// restores every row.
-    fn truncate(&self, txn: &TxnContext) {
+    fn truncate(&self, txn: &TxnContext) -> Result<(), StorageError> {
         // AccessExclusiveLock: block concurrent readers/writers of this table
         // until we commit, so no one reads the old file we are about to unlink or
         // writes rows that the swap would drop. Held until txn end.
@@ -736,6 +746,7 @@ impl TableAm for HeapTable {
                     .push((self.schema.namespace.clone(), self.schema.name.clone()));
             }
         }
+        Ok(())
     }
 
     fn vacuum(&self, oldest: Xid, clog: &Clog) {
@@ -831,14 +842,14 @@ struct HeapScan {
 }
 
 impl Iterator for HeapScan {
-    type Item = (Tid, Tuple);
+    type Item = Result<(Tid, Tuple), StorageError>;
 
-    fn next(&mut self) -> Option<(Tid, Tuple)> {
+    fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.buf_idx < self.buffer.len() {
                 let row = self.buffer[self.buf_idx].clone();
                 self.buf_idx += 1;
-                return Some(row);
+                return Some(Ok(row));
             }
             if self.cur_block >= self.nblocks {
                 return None;

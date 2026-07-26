@@ -13,6 +13,7 @@ use crabgresql_storage_api::{
     Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
     PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
     SequenceAdvance, SequenceDefinition, TableSchema, ViewDefinition,
+    TableAccessMethod,
 };
 use crabgresql_types::PgType;
 
@@ -74,6 +75,11 @@ const COLL_MAGIC: &[u8; 4] = b"COL1";
 /// PostgreSQL treats `pg_class.reltuples`/`pg_statistic` as best-effort, so
 /// losing this tail costs plan quality and nothing else.
 const STAT_MAGIC: &[u8; 4] = b"STA1";
+/// Marks the table-access-method section. It is appended after statistics and
+/// stores one byte per relation (`0` heap, `1` parquet). A catalog without this
+/// tail predates pluggable durable table storage and therefore decodes every
+/// relation as heap.
+const TAM_MAGIC: &[u8; 4] = b"TAM1";
 
 struct PersistCol {
     name: String,
@@ -107,6 +113,7 @@ struct PersistRel {
     /// in the in-memory `State` for name resolution during this run but is
     /// **excluded from [`encode`]** — it never persists and so is gone on restart.
     persistence: RelPersistence,
+    access_method: TableAccessMethod,
     /// `Some` on a partitioned (parent) table: its partition key.
     partition_scheme: Option<PartitionScheme>,
     /// `Some` on a leaf partition: its parent and bound.
@@ -229,6 +236,7 @@ impl RelCatalog {
                         namespace: r.namespace.clone(),
                         columns,
                         persistence: r.persistence,
+                        access_method: r.access_method,
                         partition_scheme: r.partition_scheme.clone(),
                         partition_of: r.partition_of.clone(),
                     },
@@ -279,6 +287,7 @@ impl RelCatalog {
                 .collect(),
             indexes: Vec::new(),
             persistence: schema.persistence,
+            access_method: schema.access_method,
             partition_scheme: schema.partition_scheme.clone(),
             partition_of: schema.partition_of.clone(),
             // A brand-new relation has never been analyzed.
@@ -1090,6 +1099,16 @@ fn encode(state: &State) -> Vec<u8> {
             None => out.push(0),
         }
     }
+    // Table access method: a tenth backward-compatible tail. Older catalogs
+    // omitted it because heap was the only durable table access method.
+    out.extend_from_slice(TAM_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        out.push(match r.access_method {
+            TableAccessMethod::Heap => 0,
+            TableAccessMethod::Parquet => 1,
+        });
+    }
     out
 }
 
@@ -1213,6 +1232,7 @@ fn decode(bytes: &[u8]) -> State {
             indexes: Vec::new(),
             // Anything on disk is a durable heap: memory tables are never persisted.
             persistence: RelPersistence::Permanent,
+            access_method: TableAccessMethod::Heap,
             // Default to unpartitioned; overridden below from the PART1 tail.
             partition_scheme: None,
             partition_of: None,
@@ -1480,6 +1500,17 @@ fn decode(bytes: &[u8]) -> State {
             });
         }
     }
+    // Table-access-method tail: absent means the legacy heap default.
+    if d.remaining().starts_with(TAM_MAGIC) {
+        d.p += TAM_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            r.access_method = match d.byte() {
+                1 => TableAccessMethod::Parquet,
+                _ => TableAccessMethod::Heap,
+            };
+        }
+    }
     State {
         next,
         rels,
@@ -1598,6 +1629,39 @@ mod tests {
         assert!(schema.columns[0].default.is_none());
         assert!(indexes.is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn table_access_method_round_trips_and_legacy_defaults_to_heap() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        let mut schema = TableSchema::new("events", vec![Column::new("id", PgType::Int4)]);
+        schema.access_method = TableAccessMethod::Parquet;
+        catalog.create(&schema)?;
+        drop(catalog);
+
+        let loaded = RelCatalog::load(dir.path())?;
+        let (_, _, schema, _) = loaded
+            .schemas()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
+        assert_eq!(schema.access_method, TableAccessMethod::Parquet);
+        drop(loaded);
+
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(TAM_MAGIC.len())
+            .position(|window| window == TAM_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("table access method marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        let (_, _, schema, _) = legacy
+            .schemas()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("legacy catalog is empty"))?;
+        assert_eq!(schema.access_method, TableAccessMethod::Heap);
         Ok(())
     }
 

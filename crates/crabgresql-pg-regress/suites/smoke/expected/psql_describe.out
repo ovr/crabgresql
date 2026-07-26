@@ -14,16 +14,17 @@
 --
 -- pg_am lists PostgreSQL's built-in access methods
 SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid;
- oid  | amname |      amhandler       | amtype 
-------+--------+----------------------+--------
-    2 | heap   | heap_tableam_handler | t
-  403 | btree  | bthandler            | i
-  405 | hash   | hashhandler          | i
-  783 | gist   | gisthandler          | i
- 2742 | gin    | ginhandler           | i
- 3580 | brin   | brinhandler          | i
- 4000 | spgist | spghandler           | i
-(7 rows)
+  oid  | amname  |        amhandler        | amtype 
+-------+---------+-------------------------+--------
+     2 | heap    | heap_tableam_handler    | t
+   403 | btree   | bthandler               | i
+   405 | hash    | hashhandler             | i
+   783 | gist    | gisthandler             | i
+  2742 | gin     | ginhandler              | i
+  3580 | brin    | brinhandler             | i
+  4000 | spgist  | spghandler              | i
+ 16384 | parquet | parquet_tableam_handler | t
+(8 rows)
 
 -- pg_get_userbyid never returns NULL: an unowned OID prints a placeholder, and
 -- a negative argument reinterprets as unsigned rather than clamping

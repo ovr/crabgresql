@@ -10,7 +10,8 @@ use std::sync::Arc;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
-    Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
+    Column, StorageError, TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog,
+    ViewDefinition,
 };
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, Value};
@@ -406,6 +407,26 @@ fn resolve_write_table(
         }
         not_found_as_written(e, schema.as_deref(), &table_name)
     })?;
+    let capabilities = table.capabilities();
+    let supported = match verb {
+        WriteVerb::Insert => capabilities.insert,
+        WriteVerb::Update => capabilities.update,
+        WriteVerb::Delete => capabilities.delete,
+    };
+    if !supported {
+        let verb = match verb {
+            WriteVerb::Insert => "INSERT",
+            WriteVerb::Update => "UPDATE",
+            WriteVerb::Delete => "DELETE",
+        };
+        let method = match table.schema().access_method {
+            TableAccessMethod::Heap => "heap",
+            TableAccessMethod::Parquet => "parquet",
+        };
+        return Err(BindError::feature_not_supported(format!(
+            "table access method \"{method}\" does not support {verb}"
+        )));
+    }
     // A partitioned parent is a valid write target: INSERT/COPY route rows to
     // leaves and UPDATE/DELETE route through them (each binder captures the leaves
     // via `partition_leaves`).

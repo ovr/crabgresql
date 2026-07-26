@@ -74,6 +74,16 @@ the CRC-32C / Castagnoli polynomial that PostgreSQL documents for its WAL):
 licensed under Apache-2.0 OR MIT. It is an ordinary Cargo dependency, not
 vendored; no PostgreSQL source is involved.
 
+This product depends on the Apache Arrow Rust and Apache Parquet Rust crates
+(`arrow-array`, `arrow-schema`, and `parquet`), used by
+crates/crabgresql-parquet-engine for managed columnar table storage:
+
+  Copyright The Apache Software Foundation
+
+licensed under Apache-2.0. Snappy compression is provided through Parquet's
+`snap` feature and the Apache-2.0 `snap` crate. These are ordinary Cargo
+dependencies, not vendored.
+
 This product depends on the `icu_collator` and `icu_locale_core` crates from the
 ICU4X project (used only by crates/crabgresql-types/src/collation.rs to order
 strings under the collations exposed as `COLLATE "<locale>-x-icu"`):

@@ -4908,6 +4908,127 @@ async fn copy_in_extended_loads_rows() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE p (id int4 PRIMARY KEY, label text, payload bytea) USING parquet",
+        )
+        .await?;
+    client
+        .simple_query(
+            "INSERT INTO p VALUES (1, 'one', '\\x0102'), (2, NULL, NULL)",
+        )
+        .await?;
+
+    let messages = client
+        .simple_query("SELECT id, label, encode(payload, 'hex') FROM p ORDER BY id")
+        .await?;
+    let result = rows(&messages);
+    assert_eq!(result.len(), 2);
+    assert_eq!(
+        (result[0].get(0), result[0].get(1), result[0].get(2)),
+        (Some("1"), Some("one"), Some("0102"))
+    );
+    assert_eq!(
+        (result[1].get(0), result[1].get(1), result[1].get(2)),
+        (Some("2"), None, None)
+    );
+
+    let catalog = client
+        .simple_query(
+            "SELECT a.oid, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam \
+             WHERE c.relname = 'p'",
+        )
+        .await?;
+    assert_eq!(
+        (rows(&catalog)[0].get(0), rows(&catalog)[0].get(1)),
+        (Some("16384"), Some("parquet"))
+    );
+
+    let sink = client.copy_in("COPY p (id, label) FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"3\tthree\n4\tfour\n")).await?;
+    assert_eq!(sink.finish().await?, 2);
+
+    client
+        .simple_query("CREATE TABLE p_copy USING parquet AS SELECT id, label FROM p")
+        .await?;
+    let copied = client
+        .simple_query("SELECT count(*) FROM p_copy")
+        .await?;
+    assert_eq!(rows(&copied)[0].get(0), Some("4"));
+
+    let duplicate = client
+        .simple_query("INSERT INTO p (id) VALUES (1)")
+        .await
+        .expect_err("PRIMARY KEY remains semantically enforced");
+    assert_eq!(
+        duplicate
+            .as_db_error()
+            .expect("database error")
+            .code()
+            .code(),
+        "23505"
+    );
+
+    for (sql, verb) in [
+        ("UPDATE p SET label = 'x'", "UPDATE"),
+        ("DELETE FROM p", "DELETE"),
+        ("TRUNCATE p", "TRUNCATE"),
+    ] {
+        let error = client
+            .simple_query(sql)
+            .await
+            .expect_err("append-only mutation must fail");
+        let error = error.as_db_error().expect("database error");
+        assert_eq!(error.code().code(), "0A000");
+        assert_eq!(
+            error.message(),
+            format!("table access method \"parquet\" does not support {verb}")
+        );
+    }
+
+    let unknown = client
+        .simple_query("CREATE TABLE unknown_am (id int) USING imaginary")
+        .await
+        .expect_err("unknown table access method must fail");
+    assert_eq!(
+        unknown
+            .as_db_error()
+            .expect("database error")
+            .code()
+            .code(),
+        "42704"
+    );
+    for sql in [
+        "CREATE TEMP TABLE temp_p (id int) USING parquet",
+        "CREATE UNLOGGED TABLE unlogged_p (id int) USING parquet",
+        "CREATE TABLE partitioned_p (id int) USING parquet PARTITION BY RANGE (id)",
+        "CREATE TABLE unsupported_p (value jsonb) USING parquet",
+        "CREATE TABLE located_p (id int) USING parquet LOCATION '/tmp/data'",
+    ] {
+        let error = client
+            .simple_query(sql)
+            .await
+            .expect_err("unsupported Parquet table form must fail");
+        assert_eq!(
+            error
+                .as_db_error()
+                .expect("database error")
+                .code()
+                .code(),
+            "0A000",
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
 /// CSV format over the extended protocol: quoted fields with `""` doubling and
 /// embedded delimiters, an unquoted empty field as NULL, and HEADER skipping.
 #[tokio::test]

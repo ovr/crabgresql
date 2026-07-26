@@ -65,7 +65,7 @@ fn insert_committed(tm: &TransactionManager, table: &dyn TableAm, tuple: Tuple) 
     if let Err(error) = tm.commit(xid) {
         panic!("failed to commit table-access test transaction: {error}");
     }
-    tid
+    tid.unwrap_or_else(|error| panic!("failed to insert table-access test tuple: {error}"))
 }
 
 fn read(tm: &TransactionManager) -> TxnContext {
@@ -73,7 +73,17 @@ fn read(tm: &TransactionManager) -> TxnContext {
 }
 
 fn ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<Value> {
-    table.scan(&read(tm)).map(|(_, t)| t[0].clone()).collect()
+    scan_rows(table, &read(tm))
+        .into_iter()
+        .map(|(_, t)| t[0].clone())
+        .collect()
+}
+
+fn scan_rows(table: &dyn TableAm, txn: &TxnContext) -> Vec<(Tid, Tuple)> {
+    table
+        .scan(txn)
+        .collect::<Result<Vec<_>, StorageError>>()
+        .unwrap_or_else(|error| panic!("table scan failed: {error}"))
 }
 
 #[test]
@@ -86,7 +96,7 @@ fn insert_then_scan() -> anyhow::Result<()> {
         vec![Value::Int4(1), Value::Text("one".into())],
     );
     insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Null]);
-    let rows: Vec<_> = table.scan(&read(&h.tm)).collect();
+    let rows = scan_rows(&*table, &read(&h.tm));
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].1, vec![Value::Int4(1), Value::Text("one".into())]);
     assert_eq!(rows[1].1, vec![Value::Int4(2), Value::Null]);
@@ -102,7 +112,10 @@ fn insert_returns_distinct_ascending_tids() -> anyhow::Result<()> {
     let b = insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Null]);
     // Sequential inserts fill a block in order, so tids ascend by (block, offset).
     assert!(b > a);
-    let tids: Vec<Tid> = table.scan(&read(&h.tm)).map(|(tid, _)| tid).collect();
+    let tids: Vec<Tid> = scan_rows(&*table, &read(&h.tm))
+        .into_iter()
+        .map(|(tid, _)| tid)
+        .collect();
     assert_eq!(tids, vec![a, b]);
 
     Ok(())
@@ -149,11 +162,14 @@ fn update_makes_new_version_visible_old_dead() -> anyhow::Result<()> {
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
     assert_eq!(
-        table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())], &txn),
+        table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())], &txn)?,
         UpdateResult::Updated
     );
     h.tm.commit(xid)?;
-    let rows: Vec<_> = table.scan(&read(&h.tm)).map(|(_, t)| t).collect();
+    let rows: Vec<_> = scan_rows(&*table, &read(&h.tm))
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect();
     assert_eq!(rows, vec![vec![Value::Int4(1), Value::Text("uno".into())]]);
 
     Ok(())
@@ -172,7 +188,10 @@ fn rolled_back_update_restores_old_version() -> anyhow::Result<()> {
     let txn = h.tm.context(xid, CommandId::FIRST);
     table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())], &txn);
     h.tm.abort(xid);
-    let rows: Vec<_> = table.scan(&read(&h.tm)).map(|(_, t)| t).collect();
+    let rows: Vec<_> = scan_rows(&*table, &read(&h.tm))
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect();
     assert_eq!(rows, vec![vec![Value::Int4(1), Value::Text("one".into())]]);
 
     Ok(())
@@ -187,7 +206,7 @@ fn delete_leaves_other_tids_untouched() -> anyhow::Result<()> {
     insert_committed(&h.tm, &*table, vec![Value::Int4(3), Value::Null]);
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    assert_eq!(table.delete(b, &txn), DeleteResult::Deleted);
+    assert_eq!(table.delete(b, &txn)?, DeleteResult::Deleted);
     h.tm.commit(xid)?;
     assert_eq!(ids(&h.tm, &*table), vec![Value::Int4(1), Value::Int4(3)]);
 
@@ -247,13 +266,13 @@ fn update_and_delete_of_missing_tid_report_not_found() -> anyhow::Result<()> {
     let tid = insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    assert_eq!(table.delete(tid, &txn), DeleteResult::Deleted);
+    assert_eq!(table.delete(tid, &txn)?, DeleteResult::Deleted);
     h.tm.commit(xid)?;
     let x2 = h.tm.allocate_xid();
     let t2 = h.tm.context(x2, CommandId::FIRST);
-    assert_eq!(table.delete(tid, &t2), DeleteResult::NotFound);
+    assert_eq!(table.delete(tid, &t2)?, DeleteResult::NotFound);
     assert_eq!(
-        table.update(tid, vec![Value::Int4(2), Value::Null], &t2),
+        table.update(tid, vec![Value::Int4(2), Value::Null], &t2)?,
         UpdateResult::NotFound
     );
     assert_eq!(
@@ -263,7 +282,7 @@ fn update_and_delete_of_missing_tid_report_not_found() -> anyhow::Result<()> {
                 offset: 999
             },
             &t2
-        ),
+        )?,
         DeleteResult::NotFound
     );
 
@@ -308,7 +327,7 @@ fn update_many_applies_batch_and_skips_missing() -> anyhow::Result<()> {
             (b, vec![Value::Int4(20), Value::Null]),
         ],
         &txn,
-    );
+    )?;
     h.tm.commit(xid)?;
     assert_eq!(applied, 1);
     assert_eq!(ids(&h.tm, &*table), vec![Value::Int4(10)]);
@@ -328,7 +347,7 @@ fn delete_many_removes_batch_in_one_pass() -> anyhow::Result<()> {
     h.tm.commit(dx)?;
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    assert_eq!(table.delete_many(vec![a, b, c], &txn), 2);
+    assert_eq!(table.delete_many(vec![a, b, c], &txn)?, 2);
     h.tm.commit(xid)?;
     assert_eq!(table.scan(&read(&h.tm)).count(), 0);
 
@@ -342,7 +361,7 @@ fn truncate_empties_table() -> anyhow::Result<()> {
     insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
     insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Null]);
     let tx = h.tm.allocate_xid();
-    table.truncate(&h.tm.context(tx, CommandId::FIRST));
+    table.truncate(&h.tm.context(tx, CommandId::FIRST))?;
     h.tm.commit(tx)?;
     assert_eq!(table.scan(&read(&h.tm)).count(), 0);
     insert_committed(&h.tm, &*table, vec![Value::Int4(3), Value::Null]);
@@ -385,7 +404,7 @@ fn statistics_track_the_relations_physical_size() -> anyhow::Result<()> {
     // TRUNCATE swaps in a fresh, empty relfilenode, so the estimate must follow
     // it back down — and only once the swap has committed.
     let tx = h.tm.allocate_xid();
-    table.truncate(&h.tm.context(tx, CommandId::FIRST));
+    table.truncate(&h.tm.context(tx, CommandId::FIRST))?;
     h.tm.commit(tx)?;
     assert_eq!(table.statistics().relpages, 0);
 
@@ -409,6 +428,7 @@ fn analyze_counts_visible_rows_exactly() -> anyhow::Result<()> {
     let gone = table
         .scan(&read(&h.tm))
         .next()
+        .transpose()?
         .map(|(tid, _)| tid)
         .expect("seeded rows");
     let del = h.tm.allocate_xid();
@@ -444,7 +464,7 @@ fn truncate_discards_the_analyze_result() -> anyhow::Result<()> {
     assert_eq!(table.statistics().reltuples, 200.0);
 
     let tx = h.tm.allocate_xid();
-    table.truncate(&h.tm.context(tx, CommandId::FIRST));
+    table.truncate(&h.tm.context(tx, CommandId::FIRST))?;
     h.tm.commit(tx)?;
 
     let stats = table.statistics();
@@ -478,7 +498,7 @@ fn analyze_inside_an_uncommitted_truncate_measures_one_file() -> anyhow::Result<
     // One transaction: stage a TRUNCATE, then analyze inside it.
     let tx = h.tm.allocate_xid();
     let ctx = h.tm.context(tx, CommandId::FIRST);
-    table.truncate(&ctx);
+    table.truncate(&ctx)?;
     h.engine.analyze("public", "t", &ctx)?;
     let staged = table.statistics();
     assert_eq!(
@@ -514,8 +534,8 @@ fn many_inserts_span_multiple_pages() -> anyhow::Result<()> {
             vec![Value::Int4(i), Value::Text("x".repeat(40))],
         );
     }
-    let got: Vec<i32> = table
-        .scan(&read(&h.tm))
+    let got: Vec<i32> = scan_rows(&*table, &read(&h.tm))
+        .into_iter()
         .map(|(_, t)| match t[0] {
             Value::Int4(v) => v,
             _ => unreachable!(),
@@ -551,7 +571,10 @@ fn concurrent_inserts_are_all_visible_with_distinct_tids() -> anyhow::Result<()>
         }
         Ok(())
     })?;
-    let tids: Vec<Tid> = table.scan(&read(&h.tm)).map(|(tid, _)| tid).collect();
+    let tids: Vec<Tid> = scan_rows(&*table, &read(&h.tm))
+        .into_iter()
+        .map(|(tid, _)| tid)
+        .collect();
     assert_eq!(tids.len(), 1000);
     let mut sorted = tids.clone();
     sorted.sort();
@@ -598,8 +621,8 @@ fn concurrent_updates_of_one_row_never_duplicate_it() -> anyhow::Result<()> {
             }
             Ok(())
         })?;
-        let rows: Vec<Value> = table
-            .scan(&read(&h.tm))
+        let rows: Vec<Value> = scan_rows(&*table, &read(&h.tm))
+            .into_iter()
             .map(|(_, t)| t[0].clone())
             .collect();
         assert_eq!(
@@ -624,7 +647,8 @@ fn scan_is_stable_against_concurrent_writes() -> anyhow::Result<()> {
     let txn = h.tm.context(xid, CommandId::FIRST);
     table.update(a, vec![Value::Int4(99), Value::Null], &txn);
     h.tm.commit(xid)?;
-    let rows: Vec<_> = scan.collect();
+    let rows: Vec<_> = scan
+        .collect::<Result<Vec<_>, StorageError>>()?;
     assert_eq!(rows, vec![(a, vec![Value::Int4(1), Value::Null])]);
 
     Ok(())
@@ -663,7 +687,10 @@ fn drop_table_unlinks_file_and_frees_name() -> anyhow::Result<()> {
     insert_committed(&h.tm, &*t2, vec![Value::Int4(2), Value::Null]);
     assert!(base.join("2").exists());
     assert!(!base.join("1").exists());
-    let rows: Vec<Value> = t2.scan(&read(&h.tm)).map(|(_, t)| t[0].clone()).collect();
+    let rows: Vec<Value> = scan_rows(&*t2, &read(&h.tm))
+        .into_iter()
+        .map(|(_, t)| t[0].clone())
+        .collect();
     assert_eq!(rows, vec![Value::Int4(2)]);
 
     Ok(())
@@ -705,8 +732,8 @@ fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
     assert_eq!(hits, vec![vec![Value::Int4(2), Value::Text("b".into())]]);
 
     // The index probe agrees bit-for-bit with a seq scan + key filter.
-    let scan: Vec<Tuple> = table
-        .scan(&read(&h.tm))
+    let scan: Vec<Tuple> = scan_rows(&*table, &read(&h.tm))
+        .into_iter()
         .filter(|(_, t)| t[0] == Value::Int4(2))
         .map(|(_, t)| t)
         .collect();

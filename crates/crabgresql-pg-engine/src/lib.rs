@@ -41,11 +41,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crabgresql_parquet_engine::{ParquetRedo, ParquetTable, RMGR_PARQUET, validate_schema};
 use crabgresql_storage_api::{
-    IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition, StorageError, TableAm,
-    TableEngine, TableSchema, ViewDefinition,
+    DeleteResult, IndexMetadata, RelStats, RelationMetadata, SequenceAdvance, SequenceDefinition,
+    StorageError, TableAccessMethod, TableAm, TableCapabilities, TableEngine, TableSchema, Tid,
+    Tuple, TupleStream, UpdateResult, ViewDefinition,
 };
 use crabgresql_txn::{Clog, TxnContext, TxnFinalize, Xid};
+use crabgresql_types::Value;
 use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, read_control, recover, write_control};
 
 use crate::btredo::BtreeRedo;
@@ -92,6 +95,160 @@ pub(crate) struct EngineInner {
     pub recovered_truncates: Mutex<Vec<RecoveredTruncate>>,
 }
 
+/// One open relation, dispatched by its persisted table access method.
+enum ManagedTable {
+    Heap(Arc<HeapTable>),
+    Parquet(Arc<ParquetTable>),
+}
+
+impl ManagedTable {
+    fn as_heap(&self) -> Option<&HeapTable> {
+        match self {
+            ManagedTable::Heap(table) => Some(table),
+            ManagedTable::Parquet(_) => None,
+        }
+    }
+
+    fn as_parquet(&self) -> Option<&ParquetTable> {
+        match self {
+            ManagedTable::Heap(_) => None,
+            ManagedTable::Parquet(table) => Some(table),
+        }
+    }
+}
+
+impl TableAm for ManagedTable {
+    fn schema(&self) -> &TableSchema {
+        match self {
+            ManagedTable::Heap(table) => table.schema(),
+            ManagedTable::Parquet(table) => table.schema(),
+        }
+    }
+
+    fn capabilities(&self) -> TableCapabilities {
+        match self {
+            ManagedTable::Heap(table) => table.capabilities(),
+            ManagedTable::Parquet(table) => table.capabilities(),
+        }
+    }
+
+    fn indexes(&self) -> Vec<IndexMetadata> {
+        match self {
+            ManagedTable::Heap(table) => table.indexes(),
+            ManagedTable::Parquet(table) => table.indexes(),
+        }
+    }
+
+    fn statistics(&self) -> RelStats {
+        match self {
+            ManagedTable::Heap(table) => table.statistics(),
+            ManagedTable::Parquet(table) => table.statistics(),
+        }
+    }
+
+    fn scan(&self, txn: &TxnContext) -> TupleStream {
+        match self {
+            ManagedTable::Heap(table) => table.scan(txn),
+            ManagedTable::Parquet(table) => table.scan(txn),
+        }
+    }
+
+    fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
+        match self {
+            ManagedTable::Heap(table) => table.fetch(tid, txn),
+            ManagedTable::Parquet(table) => table.fetch(tid, txn),
+        }
+    }
+
+    fn supports_index_scan(&self, index_name: &str) -> bool {
+        match self {
+            ManagedTable::Heap(table) => table.supports_index_scan(index_name),
+            ManagedTable::Parquet(table) => table.supports_index_scan(index_name),
+        }
+    }
+
+    fn index_lookup(
+        &self,
+        index_name: &str,
+        key: &[Value],
+        txn: &TxnContext,
+    ) -> Option<Box<dyn Iterator<Item = (Tid, Tuple)> + Send>> {
+        match self {
+            ManagedTable::Heap(table) => table.index_lookup(index_name, key, txn),
+            ManagedTable::Parquet(table) => table.index_lookup(index_name, key, txn),
+        }
+    }
+
+    fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
+        match self {
+            ManagedTable::Heap(table) => table.insert(tuple, txn),
+            ManagedTable::Parquet(table) => table.insert(tuple, txn),
+        }
+    }
+
+    fn insert_many(
+        &self,
+        tuples: Vec<Tuple>,
+        txn: &TxnContext,
+    ) -> Result<Vec<Tid>, StorageError> {
+        match self {
+            ManagedTable::Heap(table) => table.insert_many(tuples, txn),
+            ManagedTable::Parquet(table) => table.insert_many(tuples, txn),
+        }
+    }
+
+    fn update(
+        &self,
+        tid: Tid,
+        tuple: Tuple,
+        txn: &TxnContext,
+    ) -> Result<UpdateResult, StorageError> {
+        match self {
+            ManagedTable::Heap(table) => table.update(tid, tuple, txn),
+            ManagedTable::Parquet(table) => table.update(tid, tuple, txn),
+        }
+    }
+
+    fn delete(&self, tid: Tid, txn: &TxnContext) -> Result<DeleteResult, StorageError> {
+        match self {
+            ManagedTable::Heap(table) => table.delete(tid, txn),
+            ManagedTable::Parquet(table) => table.delete(tid, txn),
+        }
+    }
+
+    fn update_many(
+        &self,
+        updates: Vec<(Tid, Tuple)>,
+        txn: &TxnContext,
+    ) -> Result<u64, StorageError> {
+        match self {
+            ManagedTable::Heap(table) => table.update_many(updates, txn),
+            ManagedTable::Parquet(table) => table.update_many(updates, txn),
+        }
+    }
+
+    fn delete_many(&self, tids: Vec<Tid>, txn: &TxnContext) -> Result<u64, StorageError> {
+        match self {
+            ManagedTable::Heap(table) => table.delete_many(tids, txn),
+            ManagedTable::Parquet(table) => table.delete_many(tids, txn),
+        }
+    }
+
+    fn truncate(&self, txn: &TxnContext) -> Result<(), StorageError> {
+        match self {
+            ManagedTable::Heap(table) => table.truncate(txn),
+            ManagedTable::Parquet(table) => table.truncate(txn),
+        }
+    }
+
+    fn vacuum(&self, oldest: Xid, clog: &Clog) {
+        match self {
+            ManagedTable::Heap(table) => table.vacuum(oldest, clog),
+            ManagedTable::Parquet(table) => table.vacuum(oldest, clog),
+        }
+    }
+}
+
 impl EngineInner {
     /// Reclaim a relation's on-disk file: evict its buffered pages (without
     /// writing them back) then unlink the file. A missing file is not an error —
@@ -110,7 +267,7 @@ pub struct PgEngine {
     /// Open table handles keyed by `(namespace, name)`. Unqualified tables live
     /// in `public`; the relfilenode-swap TRUNCATE machinery only ever touches
     /// `public` tables (it threads bare names through the WAL).
-    tables: RwLock<HashMap<(String, String), Arc<HeapTable>>>,
+    tables: RwLock<HashMap<(String, String), Arc<ManagedTable>>>,
     /// The `next_xid` recorded by the last checkpoint, reused as the control-file
     /// floor at a clean shutdown (recovery recomputes the exact value from the WAL,
     /// so this only needs to be a valid lower bound).
@@ -132,7 +289,7 @@ impl PgEngine {
         let catalog = Arc::new(RelCatalog::load(data_dir)?);
         let inner = Arc::new(EngineInner {
             bufpool,
-            wal,
+            wal: Arc::clone(&wal),
             catalog: Arc::clone(&catalog),
             pending_truncates: Mutex::new(HashMap::new()),
             recovered_truncates: Mutex::new(Vec::new()),
@@ -149,17 +306,37 @@ impl PgEngine {
                 engine: Arc::clone(&inner),
             }),
         );
+        registry.register(RMGR_PARQUET, Arc::new(ParquetRedo));
 
         let mut tables = HashMap::new();
         for (name, rel, schema, indexes) in catalog.schemas() {
             let namespace = schema.namespace.clone();
-            let table = HeapTable::new(Arc::clone(&inner), rel, schema, indexes);
-            // Restore the last ANALYZE result so the planner does not fall back
-            // to a size-derived guess for a relation that was measured before
-            // the restart.
-            if let Some((relpages, reltuples)) = catalog.stats_in(&namespace, &name) {
-                table.set_analyzed(relpages, reltuples);
-            }
+            let analyzed = catalog.stats_in(&namespace, &name);
+            let table = match schema.access_method {
+                TableAccessMethod::Heap => {
+                    let table = Arc::new(HeapTable::new(
+                        Arc::clone(&inner),
+                        rel,
+                        schema,
+                        indexes,
+                    ));
+                    if let Some((relpages, reltuples)) = analyzed {
+                        table.set_analyzed(relpages, reltuples);
+                    }
+                    ManagedTable::Heap(table)
+                }
+                TableAccessMethod::Parquet => {
+                    let indexes = indexes.into_iter().map(|(index, _)| index).collect();
+                    let table = Arc::new(
+                        ParquetTable::open(data_dir, rel.0, schema, indexes, Arc::clone(&wal))
+                            .map_err(std::io::Error::other)?,
+                    );
+                    if let Some((relpages, reltuples)) = analyzed {
+                        table.set_analyzed(relpages, reltuples);
+                    }
+                    ManagedTable::Parquet(table)
+                }
+            };
             tables.insert((namespace, name), Arc::new(table));
         }
         Ok(PgEngine {
@@ -200,6 +377,9 @@ impl PgEngine {
         // Reconcile swap TRUNCATEs replayed from the WAL (apply committed, discard
         // the rest), reclaim orphaned staging files.
         engine.apply_recovered_truncates(&clog);
+        engine
+            .recover_parquet_fragments(&clog)
+            .map_err(std::io::Error::other)?;
         engine.gc_orphan_relfiles()?;
         // After a crash, an unlogged relation's WAL-skipped pages may be torn — the
         // write-ahead rule never guarded them — so empty each unlogged heap and
@@ -326,11 +506,26 @@ impl PgEngine {
                     .read()
                     .unwrap_or_else(|_| panic!("rwlock poisoned"))
                     .get(&("public".to_string(), table.clone()))
+                    .and_then(|table| table.as_heap())
                 {
                     t.rebind(live);
                 }
             }
         }
+    }
+
+    fn recover_parquet_fragments(&self, clog: &Clog) -> Result<(), StorageError> {
+        for table in self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .values()
+        {
+            if let Some(parquet) = table.as_parquet() {
+                parquet.recover(clog)?;
+            }
+        }
+        Ok(())
     }
 
     /// Delete `base/<n>` files not referenced by any live catalog relation.
@@ -368,18 +563,18 @@ impl TxnFinalize for PgEngine {
     /// commit's WAL record is already fsynced, so a crash before or during this
     /// is repaired by `apply_recovered_truncates` at the next boot.
     fn on_commit(&self, xid: Xid) {
-        let Some(tables) = self
+        let truncate_tables = self
             .inner
             .pending_truncates
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"))
-            .remove(&xid)
-        else {
-            return; // hot path: nothing to finalize for this transaction
-        };
+            .remove(&xid);
         let handles = self.tables.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
-        for (namespace, name) in tables {
-            if let Some(t) = handles.get(&(namespace.clone(), name.clone())) {
+        for (namespace, name) in truncate_tables.into_iter().flatten() {
+            if let Some(t) = handles
+                .get(&(namespace.clone(), name.clone()))
+                .and_then(|table| table.as_heap())
+            {
                 // Apply the in-memory swap, then persist + reclaim, then release the
                 // lock — all without panicking, so the exclusive lock is ALWAYS
                 // released even if the catalog persist fails (which would otherwise
@@ -408,27 +603,48 @@ impl TxnFinalize for PgEngine {
                 }
             }
         }
+        for table in handles.values() {
+            if let Some(parquet) = table.as_parquet()
+                && let Err(error) = parquet.finish_transaction(xid, true)
+            {
+                tracing::error!(
+                    table = %parquet.schema().name,
+                    error = %error,
+                    "Parquet commit finalization failed; recovery will reconcile it"
+                );
+            }
+        }
     }
 
     /// Discard the transaction's staged TRUNCATE files (the table keeps its
     /// original file) and release the exclusive table lock.
     fn on_abort(&self, xid: Xid) {
-        let Some(tables) = self
+        let truncate_tables = self
             .inner
             .pending_truncates
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"))
-            .remove(&xid)
-        else {
-            return;
-        };
+            .remove(&xid);
         let handles = self.tables.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
-        for (namespace, name) in tables {
-            if let Some(t) = handles.get(&(namespace.clone(), name.clone())) {
-                if let Some((new, owner)) = t.abort_truncate(xid) {
-                    self.inner.discard_relfile(new);
-                    t.release_truncate_lock(owner);
-                }
+        for (namespace, name) in truncate_tables.into_iter().flatten() {
+            if let Some(t) = handles
+                .get(&(namespace.clone(), name.clone()))
+                .and_then(|table| table.as_heap())
+                && let Some((new, owner)) = t.abort_truncate(xid)
+            {
+                self.inner.discard_relfile(new);
+                t.release_truncate_lock(owner);
+            }
+        }
+        for table in handles.values() {
+            if let Some(parquet) = table.as_parquet()
+                && let Err(error) = parquet.finish_transaction(xid, false)
+            {
+                tracing::error!(
+                    table = %parquet.schema().name,
+                    error = %error,
+                    "Parquet abort cleanup failed; recovery will reconcile it"
+                );
             }
         }
     }
@@ -442,7 +658,7 @@ impl PgEngine {
     /// itself.
     fn relation_name_taken(
         &self,
-        tables: &HashMap<(String, String), Arc<HeapTable>>,
+        tables: &HashMap<(String, String), Arc<ManagedTable>>,
         namespace: &str,
         name: &str,
     ) -> bool {
@@ -459,13 +675,27 @@ impl PgEngine {
 
 impl TableEngine for PgEngine {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
+        if schema.access_method == TableAccessMethod::Parquet {
+            if schema.persistence != crabgresql_storage_api::RelPersistence::Permanent {
+                return Err(StorageError::UnsupportedOperation(
+                    "table access method \"parquet\" only supports permanent tables".to_string(),
+                ));
+            }
+            if schema.partition_scheme.is_some() || schema.partition_of.is_some() {
+                return Err(StorageError::UnsupportedOperation(
+                    "table access method \"parquet\" does not support partitioning".to_string(),
+                ));
+            }
+            validate_schema(&schema)?;
+        }
         let namespace = schema.namespace.clone();
+        let name = schema.name.clone();
         let mut tables = self
             .tables
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        if self.relation_name_taken(&tables, &namespace, &schema.name) {
-            return Err(StorageError::TableAlreadyExists(schema.name));
+        if self.relation_name_taken(&tables, &namespace, &name) {
+            return Err(StorageError::TableAlreadyExists(name));
         }
         let rel = self
             .catalog
@@ -475,16 +705,34 @@ impl TableEngine for PgEngine {
         // storage manager so every page op routes to memory, never a file. An
         // `Unlogged` table is on-disk (WAL-skipped but file-backed), so it is not
         // registered here — it uses a real `base/<relfilenode>` file.
-        if schema.persistence.is_ram_backed() {
+        if schema.access_method == TableAccessMethod::Heap && schema.persistence.is_ram_backed() {
             self.inner.bufpool.smgr().register_memory(rel);
         }
-        let table = Arc::new(HeapTable::new(
-            Arc::clone(&self.inner),
-            rel,
-            schema.clone(),
-            Vec::new(),
-        ));
-        tables.insert((namespace, schema.name), Arc::clone(&table));
+        let table = match schema.access_method {
+            TableAccessMethod::Heap => ManagedTable::Heap(Arc::new(HeapTable::new(
+                Arc::clone(&self.inner),
+                rel,
+                schema,
+                Vec::new(),
+            ))),
+            TableAccessMethod::Parquet => {
+                match ParquetTable::open(
+                    &self.data_dir,
+                    rel.0,
+                    schema,
+                    Vec::new(),
+                    Arc::clone(&self.inner.wal),
+                ) {
+                    Ok(table) => ManagedTable::Parquet(Arc::new(table)),
+                    Err(error) => {
+                        let _ = self.catalog.remove_in(&namespace, &name);
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        let table = Arc::new(table);
+        tables.insert((namespace, name), Arc::clone(&table));
         Ok(table as Arc<dyn TableAm>)
     }
 
@@ -505,10 +753,29 @@ impl TableEngine for PgEngine {
         };
         // Scan outside the tables lock: measuring a large relation must not block
         // concurrent DDL on unrelated tables.
-        let stats = crate::analyze::analyze_heap(&table, txn, analyze::SampleTarget::default());
-        // Publish to the live handle first, then durably. A crash between the two
-        // loses the result, which is exactly the guarantee statistics carry.
-        table.set_analyzed(stats.relpages, stats.reltuples);
+        let stats = match table.as_ref() {
+            ManagedTable::Heap(heap) => {
+                let stats =
+                    crate::analyze::analyze_heap(heap, txn, analyze::SampleTarget::default());
+                heap.set_analyzed(stats.relpages, stats.reltuples);
+                stats
+            }
+            ManagedTable::Parquet(parquet) => {
+                let mut reltuples = 0.0;
+                for row in parquet.scan(txn) {
+                    row?;
+                    reltuples += 1.0;
+                }
+                let relpages = parquet.statistics().relpages;
+                parquet.set_analyzed(relpages, reltuples);
+                RelStats {
+                    relpages,
+                    reltuples,
+                    analyzed: true,
+                    columns: Vec::new(),
+                }
+            }
+        };
         self.catalog
             .set_stats(namespace, name, stats.relpages, stats.reltuples)
             .expect("relation catalog write failed");
@@ -542,7 +809,7 @@ impl TableEngine for PgEngine {
         // relation. The persistent catalog is the source of truth for existence:
         // a missing entry there is the 42P01 case.
         let key = (namespace.to_string(), name.to_string());
-        let (rel, staged) = {
+        let (rel, dropped, staged) = {
             let mut tables = self
                 .tables
                 .write()
@@ -560,21 +827,30 @@ impl TableEngine for PgEngine {
             // session's uncommitted TRUNCATE is not otherwise synchronized — full
             // serialization needs transactional DDL, which is deferred; the losing
             // side's staged file is caught here or by `gc_orphan_relfiles`.
-            let staged = tables.get(&key).and_then(|t| t.staged_relfilenode());
+            let dropped = tables.get(&key).cloned();
+            let staged = dropped
+                .as_deref()
+                .and_then(ManagedTable::as_heap)
+                .and_then(HeapTable::staged_relfilenode);
             tables.remove(&key);
-            (rel, staged)
+            (rel, dropped, staged)
         };
         // Physical cleanup runs after the tables lock is released, so an IO error
         // unlinking the file panics only this statement rather than poisoning the
         // lock and disabling every other table operation. Evict the relation's
         // buffered pages first so a later checkpoint can't write them back to the
         // file we are about to unlink.
-        self.inner.bufpool.forget_relation(rel);
-        self.inner
-            .bufpool
-            .smgr()
-            .unlink(rel)
-            .expect("relation file unlink failed");
+        match dropped.as_deref() {
+            Some(ManagedTable::Parquet(table)) => table.drop_storage()?,
+            _ => {
+                self.inner.bufpool.forget_relation(rel);
+                self.inner
+                    .bufpool
+                    .smgr()
+                    .unlink(rel)
+                    .expect("relation file unlink failed");
+            }
+        }
         if let Some(staged) = staged {
             self.inner.discard_relfile(staged);
         }
@@ -604,10 +880,13 @@ impl TableEngine for PgEngine {
         // * Temporary → metadata-only (relfilenode 0): a RAM table's index would
         //   need RAM/WAL handling for little benefit, so uniqueness stays on the
         //   executor's visible-row scan and equality lookups fall back to a heap scan.
-        let index_rel = if target.can_index(&index) && !target.schema().persistence.is_ram_backed() {
-            self.catalog.alloc_relfilenode()
-        } else {
-            RelFileNode(0)
+        let index_rel = match target.as_ref() {
+            ManagedTable::Heap(heap)
+                if heap.can_index(&index) && !heap.schema().persistence.is_ram_backed() =>
+            {
+                self.catalog.alloc_relfilenode()
+            }
+            _ => RelFileNode(0),
         };
         // Build the B-tree and make its WAL durable FIRST, then commit the catalog
         // record. Ordering matters for crash safety: if we persisted the catalog
@@ -616,7 +895,10 @@ impl TableEngine for PgEngine {
         // probe would fault on its missing meta page. With this order, a crash
         // before the catalog write leaves only an orphan file, which the startup
         // GC reclaims (it is not yet in the catalog's live set).
-        target.build_index(index.clone(), index_rel);
+        match target.as_ref() {
+            ManagedTable::Heap(heap) => heap.build_index(index.clone(), index_rel),
+            ManagedTable::Parquet(parquet) => parquet.add_index(index.clone()),
+        }
         self.catalog
             .add_index_in(namespace, table, index, index_rel)
             .expect("relation catalog write failed");
@@ -643,16 +925,32 @@ impl TableEngine for PgEngine {
                 .cloned()
         }
         .ok_or_else(|| StorageError::IndexTableNotFound(table.to_string()))?;
-        let _guard = target.begin_index_ddl();
-        let rel = self
-            .catalog
-            .remove_index_in(namespace, table, index_name)
-            .expect("relation catalog write failed");
-        target.remove_index(index_name);
-        if let Some(rel) = rel
-            && rel.0 != 0
-        {
-            self.inner.discard_relfile(rel);
+        match target.as_ref() {
+            ManagedTable::Heap(heap) => {
+                let _guard = heap.begin_index_ddl();
+                let rel = self
+                    .catalog
+                    .remove_index_in(namespace, table, index_name)
+                    .expect("relation catalog write failed");
+                heap.remove_index(index_name);
+                if let Some(rel) = rel
+                    && rel.0 != 0
+                {
+                    self.inner.discard_relfile(rel);
+                }
+            }
+            ManagedTable::Parquet(parquet) => {
+                let rel = self
+                    .catalog
+                    .remove_index_in(namespace, table, index_name)
+                    .expect("relation catalog write failed");
+                parquet.remove_index(index_name);
+                if let Some(rel) = rel
+                    && rel.0 != 0
+                {
+                    self.inner.discard_relfile(rel);
+                }
+            }
         }
         Ok(())
     }

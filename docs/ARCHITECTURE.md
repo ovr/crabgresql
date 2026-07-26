@@ -67,6 +67,7 @@ Index AM API from PG 12+); concrete engines are separate crates. The first two:
 | Crate | Role |
 |---|---|
 | `crabgresql-pg-engine` | The engine: durable heap (PG semantics 1:1), plus RAM-backed **memory tables** (`UNLOGGED`/`TEMP`) that skip the WAL |
+| `crabgresql-parquet-engine` | Managed, permanent, append-only Parquet tables selected explicitly with `USING parquet` |
 
 API boundaries (`crabgresql-storage-api`):
 
@@ -76,10 +77,11 @@ trait TableEngine {           // factory: CREATE TABLE ... USING <engine>
 }
 trait TableAm {               // scans and modifications, snapshot-aware
     fn scan(&self, snapshot: &Snapshot) -> TupleStream;
-    fn fetch(&self, tid: Tid, snapshot: &Snapshot) -> Option<Tuple>;
-    fn insert(&self, tuple, txn) -> Tid;
-    fn update(&self, tid, tuple, txn) -> UpdateResult;  // conflict info for EvalPlanQual
-    fn delete(&self, tid, txn) -> DeleteResult;
+    fn fetch(&self, tid: Tid, snapshot: &Snapshot) -> Result<Option<Tuple>>;
+    fn insert(&self, tuple, txn) -> Result<Tid>;
+    fn insert_many(&self, tuples, txn) -> Result<Vec<Tid>>;
+    fn update(&self, tid, tuple, txn) -> Result<UpdateResult>;  // conflict info for EvalPlanQual
+    fn delete(&self, tid, txn) -> Result<DeleteResult>;
     fn vacuum(&self, horizon: Xid);                     // GC of dead versions
 }
 trait IndexAm { ... }         // insert / scan(range) / bulk build
@@ -106,9 +108,9 @@ Contract with the core:
   CLOG and checkpoint-bounded recovery (recovery currently replays the whole
   WAL), full-page writes for torn-page protection beyond page checksums, and WAL
   segment recycling.
-- Syntactically, extensibility is exposed the standard PG way:
-  `CREATE TABLE ... USING pg_engine | memory` (and
-  `default_table_access_method`).
+- Syntactically, extensibility is exposed the standard PG way. Plain
+  `CREATE TABLE` remains heap; `CREATE TABLE ... USING parquet` explicitly
+  selects the columnar method. `default_table_access_method` is unchanged.
 
 **`crabgresql-pg-engine`** — the reference engine, reproducing PG:
 
@@ -121,8 +123,22 @@ Contract with the core:
 - VACUUM: background collection of dead versions; 64-bit XIDs — see
   "Deliberate deviations" below.
 
-Later, the same API enables: a columnar engine for analytics, an engine on top
-of object storage (serverless), FDW-like adapters.
+**`crabgresql-parquet-engine`** — managed append-only analytics storage:
+
+- one or more immutable Snappy-compressed fragments per INSERT statement,
+  capped at 65,535 rows so `(fragment, row)` maps to a stable `Tid`;
+- only user columns appear in the Arrow/Parquet schema; format, schema, `xmin`,
+  and `cmin` metadata live in the footer;
+- fragments are fsynced as `.pending`, covered by an XID-observation WAL record,
+  and atomically promoted on commit or removed on abort/recovery;
+- sequential row-group scans feed the existing row executor. Physical index
+  scans and predicate/projection pushdown are intentionally deferred;
+- V1 rejects UPDATE, DELETE, TRUNCATE, TEMP/UNLOGGED tables, partitioning,
+  external `LOCATION`, and types without a native or documented compound
+  encoding.
+
+Later, the same API enables object-storage engines (serverless) and FDW-like
+adapters.
 
 ### 1.4 Concurrency: tokio + shared-everything, not process-per-connection
 
@@ -198,9 +214,9 @@ Components:
                     └──────┬──────┘    └──┬───────────┬──────┘
                            │      ┌───────▼─────┐ ┌───▼──────────────┐
                            │      │ pg-engine:  │ │ memory tables:   │
-                           │      │ heap 8KB,   │ │ same heap AM,    │
-                           │      │ buffer pool,│ │ RAM-backed pages,│
-                           │      │ B-tree,TOAST│ │ no WAL (UNLOGGED)│
+                           │      │ heap 8KB,   │ │ Parquet + memory │
+                           │      │ buffer pool,│ │ table methods    │
+                           │      │ B-tree,TOAST│ │ managed storage  │
                            │      └───────┬─────┘ └────────┬─────────┘
                     ┌──────▼──────────────▼───────────────▼──┐
                     │  WAL (core service, rmgr model):       │
@@ -255,6 +271,7 @@ crates/
   crabgresql-wal             # WAL append/replay, rmgr registry, checkpointer, recovery
   crabgresql-storage-api     # TableEngine/TableAm/IndexAm traits, Tid, TupleStream
   crabgresql-pg-engine       # default engine: 8KB heap, buffer pool, B-tree, TOAST
+  crabgresql-parquet-engine  # managed append-only Parquet table access method
   crabgresql-plpgsql         # PL/pgSQL parser + interpreter
   crabgresql-server          # session, GUCs, wiring it all together; bin: crabgresql
   crabgresql-pg-regress      # pg_regress-style runner; diff tests against PG

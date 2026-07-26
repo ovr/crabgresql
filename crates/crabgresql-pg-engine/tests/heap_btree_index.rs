@@ -48,7 +48,7 @@ fn insert_committed(tm: &TransactionManager, table: &dyn TableAm, id: i32, name:
     let x = tm.allocate_xid();
     let tid = table.insert(vec![Value::Int4(id), Value::Text(name.into())], &tm.context(x, CommandId::FIRST));
     tm.commit(x).expect("commit");
-    tid
+    tid.unwrap_or_else(|error| panic!("insert failed: {error}"))
 }
 
 /// Probe `key` and return the visible `id`s, sorted.
@@ -70,6 +70,7 @@ fn probe_ids(table: &dyn TableAm, txn: &TxnContext, key: i32) -> Vec<i32> {
 fn scan_ids(table: &dyn TableAm, txn: &TxnContext, key: i32) -> Vec<i32> {
     let mut v: Vec<i32> = table
         .scan(txn)
+        .map(|row| row.unwrap_or_else(|error| panic!("scan failed: {error}")))
         .filter(|(_, t)| t[0] == Value::Int4(key))
         .map(|(_, t)| match &t[0] {
             Value::Int4(x) => *x,

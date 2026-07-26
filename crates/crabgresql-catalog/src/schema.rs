@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexMethod, PartitionBoundDatum, PartitionOf, PartitionStrategy,
-    RelStats, TableSchema,
+    RelStats, TableAccessMethod, TableSchema,
 };
 use crabgresql_types::{PgType, Value};
 
@@ -324,6 +324,8 @@ pub fn pg_namespace_schema() -> TableSchema {
 /// OID assigned to the heap access method (`pg_am` row `heap` = 2). Reported for
 /// every user relation's `relam`.
 const HEAP_AM_OID: u32 = 2;
+/// Stable extension-range OID assigned to the managed Parquet table method.
+pub const PARQUET_AM_OID: u32 = 16_384;
 /// OID of the `btree` index access method, shared by `pg_am` and the `relam` of
 /// every B-tree index's `pg_class` row so the join between them holds.
 const BTREE_AM_OID: u32 = 403;
@@ -337,8 +339,8 @@ const HASH_AM_OID: u32 = 405;
 pub(crate) const BOOTSTRAP_ROLE_OID: u32 = 10;
 
 /// `pg_catalog.pg_am` — the access methods. PostgreSQL lists the methods its
-/// build actually registered; crabgresql implements only `heap`, `btree`, and
-/// `hash`, but reports all seven of PostgreSQL's built-ins so a client that
+/// build actually registered; crabgresql adds its managed `parquet` table
+/// method alongside PostgreSQL's built-ins so a client that
 /// joins `pg_class.relam` or reads `pg_am` sees the shape it expects.
 ///
 /// Fidelity note (`AGENTS.md`): these rows are transcribed from the output of
@@ -377,6 +379,7 @@ pub fn pg_am_rows() -> Vec<Vec<Value>> {
         row(2742, "gin", "ginhandler", "i"),
         row(3580, "brin", "brinhandler", "i"),
         row(4000, "spgist", "spghandler", "i"),
+        row(PARQUET_AM_OID, "parquet", "parquet_tableam_handler", "t"),
     ]
 }
 
@@ -530,9 +533,15 @@ pub fn pg_class_rows(
         .zip(stats)
         .map(|(((oid, schema), kind), stats)| {
             // A partitioned parent has no access method (`relam = 0`) and holds no
-            // storage of its own; a leaf partition is an ordinary heap.
+            // storage of its own.
             let (relam, relkind) = match kind {
-                RelKind::Table => (HEAP_AM_OID, "r"),
+                RelKind::Table => (
+                    match schema.access_method {
+                        TableAccessMethod::Heap => HEAP_AM_OID,
+                        TableAccessMethod::Parquet => PARQUET_AM_OID,
+                    },
+                    "r",
+                ),
                 RelKind::PartitionedTable => (0, "p"),
                 RelKind::View => (0, "v"),
                 RelKind::Sequence => (0, "S"),

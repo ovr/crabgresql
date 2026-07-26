@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+crabgresql-parquet-engine.workspace = true
 crabgresql-storage-api.workspace = true
 crabgresql-txn.workspace = true
 crabgresql-types.workspace = true

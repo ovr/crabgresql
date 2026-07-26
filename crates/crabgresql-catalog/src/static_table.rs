@@ -11,7 +11,8 @@
 use std::sync::Arc;
 
 use crabgresql_storage_api::{
-    DeleteResult, RelStats, TableAm, TableSchema, Tid, Tuple, UpdateResult, txn::TxnContext,
+    DeleteResult, RelStats, StorageError, TableAm, TableSchema, Tid, Tuple, TupleStream,
+    UpdateResult, txn::TxnContext,
 };
 use crabgresql_txn::Xid;
 
@@ -54,25 +55,37 @@ impl TableAm for StaticTable {
         RelStats::exact(self.rows.len(), &self.schema)
     }
 
-    fn scan(&self, _txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
+    fn scan(&self, _txn: &TxnContext) -> TupleStream {
         // Synthetic tids from the row index; catalog rows are always visible.
         let rows = self.rows.clone();
-        Box::new((0..rows.len()).map(move |i| (Tid::from_packed(i as u64), rows[i].clone())))
+        Box::new(
+            (0..rows.len())
+                .map(move |i| Ok((Tid::from_packed(i as u64), rows[i].clone()))),
+        )
     }
 
-    fn fetch(&self, tid: Tid, _txn: &TxnContext) -> Option<Tuple> {
-        self.rows.get(tid.packed() as usize).cloned()
+    fn fetch(&self, tid: Tid, _txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
+        Ok(self.rows.get(tid.packed() as usize).cloned())
     }
 
-    fn insert(&self, _tuple: Tuple, _txn: &TxnContext) -> Tid {
+    fn insert(&self, _tuple: Tuple, _txn: &TxnContext) -> Result<Tid, StorageError> {
         self.read_only()
     }
 
-    fn update(&self, _tid: Tid, _tuple: Tuple, _txn: &TxnContext) -> UpdateResult {
+    fn update(
+        &self,
+        _tid: Tid,
+        _tuple: Tuple,
+        _txn: &TxnContext,
+    ) -> Result<UpdateResult, StorageError> {
         self.read_only()
     }
 
-    fn delete(&self, _tid: Tid, _txn: &TxnContext) -> DeleteResult {
+    fn delete(
+        &self,
+        _tid: Tid,
+        _txn: &TxnContext,
+    ) -> Result<DeleteResult, StorageError> {
         self.read_only()
     }
 

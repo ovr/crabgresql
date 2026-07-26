@@ -945,7 +945,7 @@ mod tests {
     use crabgresql_parser::ast;
     use crabgresql_storage_api::{
         Column, DeleteResult, EmptyTypeCatalog, IndexKey, IndexMethod, StorageError, TableEngine,
-        TableSchema, Tid, Tuple, TypeCatalog, UpdateResult,
+        TableSchema, Tid, Tuple, TupleStream, TypeCatalog, UpdateResult,
     };
     use crabgresql_txn::TxnContext;
     use crabgresql_types::{PgType, Value};
@@ -975,19 +975,32 @@ mod tests {
         fn supports_index_scan(&self, _index_name: &str) -> bool {
             true
         }
-        fn scan(&self, _txn: &TxnContext) -> Box<dyn Iterator<Item = (Tid, Tuple)> + Send> {
+        fn scan(&self, _txn: &TxnContext) -> TupleStream {
             unimplemented!("planner tests never scan")
         }
-        fn fetch(&self, _tid: Tid, _txn: &TxnContext) -> Option<Tuple> {
+        fn fetch(
+            &self,
+            _tid: Tid,
+            _txn: &TxnContext,
+        ) -> Result<Option<Tuple>, StorageError> {
             unimplemented!("planner tests never fetch")
         }
-        fn insert(&self, _tuple: Tuple, _txn: &TxnContext) -> Tid {
+        fn insert(&self, _tuple: Tuple, _txn: &TxnContext) -> Result<Tid, StorageError> {
             unimplemented!("planner tests never insert")
         }
-        fn update(&self, _tid: Tid, _tuple: Tuple, _txn: &TxnContext) -> UpdateResult {
+        fn update(
+            &self,
+            _tid: Tid,
+            _tuple: Tuple,
+            _txn: &TxnContext,
+        ) -> Result<UpdateResult, StorageError> {
             unimplemented!("planner tests never update")
         }
-        fn delete(&self, _tid: Tid, _txn: &TxnContext) -> DeleteResult {
+        fn delete(
+            &self,
+            _tid: Tid,
+            _txn: &TxnContext,
+        ) -> Result<DeleteResult, StorageError> {
             unimplemented!("planner tests never delete")
         }
     }

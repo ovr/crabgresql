@@ -31,7 +31,7 @@ fn read(tm: &TransactionManager) -> TxnContext {
 fn visible_ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<i32> {
     let mut v: Vec<i32> = table
         .scan(&read(tm))
-        .map(|(_, t)| match t[0] {
+        .map(|row| match row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
             Value::Int4(x) => x,
             _ => unreachable!(),
         })
@@ -43,13 +43,16 @@ fn visible_ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<i32> {
 fn tid_of(tm: &TransactionManager, table: &dyn TableAm, id: i32) -> Tid {
     table
         .scan(&read(tm))
+        .map(|row| row.unwrap_or_else(|error| panic!("scan failed: {error}")))
         .find(|(_, t)| t[0] == Value::Int4(id))
         .map(|(tid, _)| tid)
         .unwrap_or_else(|| panic!("expected visible tuple with id {id}"))
 }
 
 fn insert(table: &dyn TableAm, txn: &TxnContext, id: i32, name: &str) -> Tid {
-    table.insert(vec![Value::Int4(id), Value::Text(name.into())], txn)
+    table
+        .insert(vec![Value::Int4(id), Value::Text(name.into())], txn)
+        .unwrap_or_else(|error| panic!("insert failed: {error}"))
 }
 
 #[test]
@@ -231,7 +234,8 @@ fn truncate_uncommitted_then_crash_restores_rows() {
         // Read-your-own-truncate: the truncater sees its own now-empty table
         // (reading under its OWN xid; a concurrent reader would block on the
         // AccessExclusive lock until this transaction ends).
-        let own: Vec<i32> = table.scan(&ctx).map(|(_, t)| match t[0] {
+        let own: Vec<i32> = table.scan(&ctx).map(|row| match row
+            .unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
             Value::Int4(x) => x,
             _ => unreachable!(),
         }).collect();

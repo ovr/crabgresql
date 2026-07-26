@@ -14,6 +14,7 @@ crabgresql-catalog = { path = "crates/crabgresql-catalog" }
 crabgresql-executor = { path = "crates/crabgresql-executor" }
 crabgresql-planner = { path = "crates/crabgresql-planner" }
 crabgresql-parser = { path = "crates/crabgresql-parser" }
+crabgresql-parquet-engine = { path = "crates/crabgresql-parquet-engine" }
 crabgresql-pg-engine = { path = "crates/crabgresql-pg-engine" }
 crabgresql-pg-wire = { path = "crates/crabgresql-pg-wire" }
 crabgresql-plpgsql = { path = "crates/crabgresql-plpgsql" }
@@ -26,12 +27,15 @@ pg-ryu = { path = "vendor/ryu" }
 
 # external
 bytes = "1"
+arrow-array = "59.1"
+arrow-schema = "59.1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
 icu_collator = "2"
 icu_locale_core = "2"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 regex = "1"
+parquet = { version = "59.1", default-features = false, features = ["arrow", "snap"] }
 similar = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }

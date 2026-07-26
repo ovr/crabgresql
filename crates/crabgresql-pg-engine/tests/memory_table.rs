@@ -66,7 +66,7 @@ fn insert_committed(tm: &TransactionManager, table: &dyn TableAm, tuple: Tuple) 
     let txn = tm.context(xid, CommandId::FIRST);
     let tid = table.insert(tuple, &txn);
     tm.commit(xid).expect("commit insert");
-    tid
+    tid.unwrap_or_else(|error| panic!("insert failed: {error}"))
 }
 
 fn read(tm: &TransactionManager) -> TxnContext {
@@ -76,7 +76,7 @@ fn read(tm: &TransactionManager) -> TxnContext {
 fn ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<i32> {
     table
         .scan(&read(tm))
-        .map(|(_, t)| match t[0] {
+        .map(|row| match row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
             Value::Int4(v) => v,
             _ => unreachable!(),
         })
