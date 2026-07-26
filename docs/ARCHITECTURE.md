@@ -75,14 +75,15 @@ API boundaries (`crabgresql-storage-api`):
 trait TableEngine {           // factory: CREATE TABLE ... USING <engine>
     fn create_table(...) -> Box<dyn TableAm>;
 }
-trait TableAm {               // scans and modifications, snapshot-aware
-    fn scan(&self, snapshot: &Snapshot) -> TupleStream;
-    fn fetch(&self, tid: Tid, snapshot: &Snapshot) -> Result<Option<Tuple>>;
+type TupleStream = Box<dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send>;
+trait TableAm {               // scans and modifications, transaction-context-aware
+    fn scan(&self, txn: &TxnContext) -> TupleStream;
+    fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>>;
     fn insert(&self, tuple, txn) -> Result<Tid>;
     fn insert_many(&self, tuples, txn) -> Result<Vec<Tid>>;
     fn update(&self, tid, tuple, txn) -> Result<UpdateResult>;  // conflict info for EvalPlanQual
     fn delete(&self, tid, txn) -> Result<DeleteResult>;
-    fn vacuum(&self, horizon: Xid);                     // GC of dead versions
+    fn vacuum(&self, oldest: Xid, clog: &Clog);         // GC of dead versions
 }
 trait IndexAm { ... }         // insert / scan(range) / bulk build
 ```
