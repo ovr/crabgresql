@@ -632,6 +632,7 @@ impl<'a> Parser<'a> {
                 Keyword::UPDATE => self.parse_update(next_token),
                 Keyword::ALTER => self.parse_alter(),
                 Keyword::CALL => self.parse_call(),
+                Keyword::DO => self.parse_do(),
                 Keyword::COPY => self.parse_copy(),
                 Keyword::CLOSE => self.parse_close(),
                 Keyword::SET => self.parse_set(),
@@ -11245,32 +11246,61 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a routine body written as a literal — the `$$ ... $$` or `'...'`
+    /// after `CREATE FUNCTION ... AS`, `CREATE PROCEDURE ... AS`, or `DO`.
+    ///
+    /// The span is kept because its `start` is the position of the opening
+    /// delimiter, which is what lets an error raised inside the body be mapped
+    /// back to a line of the statement that declared it.
+    fn parse_routine_body_literal(&mut self) -> Result<ValueWithSpan, ParserError> {
+        let peek_token = self.peek_token();
+        let span = peek_token.span;
+        match peek_token.token {
+            Token::DollarQuotedString(s)
+                if dialect_of!(self is PostgreSqlDialect | GenericDialect) =>
+            {
+                self.next_token();
+                Ok(Value::DollarQuotedString(s).with_span(span))
+            }
+            _ => Ok(Value::SingleQuotedString(self.parse_literal_string()?).with_span(span)),
+        }
+    }
+
     /// Parse the body of a `CREATE FUNCTION` specified as a string.
     /// e.g. `CREATE FUNCTION ... AS $$ body $$`.
     fn parse_create_function_body_string(&mut self) -> Result<CreateFunctionBody, ParserError> {
-        let parse_string_expr = |parser: &mut Parser| -> Result<Expr, ParserError> {
-            let peek_token = parser.peek_token();
-            let span = peek_token.span;
-            match peek_token.token {
-                Token::DollarQuotedString(s) if dialect_of!(parser is PostgreSqlDialect | GenericDialect) =>
-                {
-                    parser.next_token();
-                    Ok(Expr::Value(Value::DollarQuotedString(s).with_span(span)))
-                }
-                _ => Ok(Expr::Value(
-                    Value::SingleQuotedString(parser.parse_literal_string()?).with_span(span),
-                )),
-            }
-        };
-
         Ok(CreateFunctionBody::AsBeforeOptions {
-            body: parse_string_expr(self)?,
+            body: Expr::Value(self.parse_routine_body_literal()?),
             link_symbol: if self.consume_token(&Token::Comma) {
-                Some(parse_string_expr(self)?)
+                Some(Expr::Value(self.parse_routine_body_literal()?))
             } else {
                 None
             },
         })
+    }
+
+    /// Parse `DO [ LANGUAGE lang_name ] code` — an anonymous code block,
+    /// executed as if it were the body of a void-returning procedure.
+    /// PostgreSQL accepts the LANGUAGE clause on either side of the code.
+    ///
+    /// [PostgreSQL](https://www.postgresql.org/docs/current/sql-do.html)
+    fn parse_do(&mut self) -> Result<Statement, ParserError> {
+        let mut language = if self.parse_keyword(Keyword::LANGUAGE) {
+            Some(self.parse_identifier()?)
+        } else {
+            None
+        };
+        let body = self.parse_routine_body_literal()?;
+        if self.parse_keyword(Keyword::LANGUAGE) {
+            if language.is_some() {
+                return parser_err!(
+                    "conflicting or redundant options",
+                    self.peek_token().span.start
+                );
+            }
+            language = Some(self.parse_identifier()?);
+        }
+        Ok(Statement::Do(DoStatement { language, body }))
     }
 
     /// Parse a literal string
@@ -18147,5 +18177,93 @@ mod tests {
             let sql = format!("\nSELECT\n  :{w}fooBar");
             assert!(Parser::parse_sql(&GenericDialect, &sql).is_err());
         }
+    }
+
+    fn parse_pg(sql: &str) -> Result<Vec<Statement>, ParserError> {
+        Parser::parse_sql(&PostgreSqlDialect {}, sql)
+    }
+
+    fn do_stmt(sql: &str) -> DoStatement {
+        match parse_pg(sql).expect("parse").pop() {
+            Some(Statement::Do(stmt)) => stmt,
+            other => panic!("expected DO, got {other:?}"),
+        }
+    }
+
+    /// The body of a `DO` block is captured verbatim, whichever quoting form it
+    /// uses, and the LANGUAGE clause is accepted on either side of it.
+    #[test]
+    fn parse_do_captures_body_verbatim() {
+        let untagged = do_stmt("DO $$ BEGIN RAISE NOTICE 'hi'; END $$");
+        assert!(untagged.language.is_none());
+        assert_eq!(
+            untagged.body.value,
+            Value::DollarQuotedString(DollarQuotedString {
+                value: " BEGIN RAISE NOTICE 'hi'; END ".to_string(),
+                tag: None,
+            })
+        );
+
+        // A tag lets the body contain `$$`, and nested tags stay verbatim.
+        let tagged = do_stmt("DO $outer$ SELECT $$inner$$; $outer$");
+        assert_eq!(
+            tagged.body.value,
+            Value::DollarQuotedString(DollarQuotedString {
+                value: " SELECT $$inner$$; ".to_string(),
+                tag: Some("outer".to_string()),
+            })
+        );
+
+        // `DO 'code'` — the SQL-standard single-quoted spelling.
+        let quoted = do_stmt("DO 'BEGIN END'");
+        assert_eq!(
+            quoted.body.value,
+            Value::SingleQuotedString("BEGIN END".to_string())
+        );
+
+        for sql in ["DO LANGUAGE plpgsql $$ BEGIN END $$", "DO $$ BEGIN END $$ LANGUAGE plpgsql"] {
+            let stmt = do_stmt(sql);
+            assert_eq!(
+                stmt.language.map(|i| i.value),
+                Some("plpgsql".to_string()),
+                "{sql}"
+            );
+        }
+    }
+
+    /// The body literal's span starts at the opening delimiter, which is what
+    /// lets a position inside the body map back to a line of the statement.
+    #[test]
+    fn parse_do_body_span_points_at_the_opening_delimiter() {
+        let stmt = do_stmt("DO $tag$\nBEGIN\nEND\n$tag$");
+        assert_eq!(stmt.body.span.start.line, 1);
+        // 1-based column of the `$` that opens `$tag$`.
+        assert_eq!(stmt.body.span.start.column, 4);
+    }
+
+    /// PostgreSQL rejects a second LANGUAGE clause with "conflicting or
+    /// redundant options" rather than a bare syntax error.
+    #[test]
+    fn parse_do_rejects_a_repeated_language_clause() {
+        let e = parse_pg("DO LANGUAGE plpgsql $$ BEGIN END $$ LANGUAGE sql").unwrap_err();
+        assert!(
+            e.to_string().contains("conflicting or redundant options"),
+            "{e}"
+        );
+    }
+
+    /// `DO` is only a statement in leading position; `ON CONFLICT DO NOTHING`
+    /// and friends consume their own `DO` and must not be disturbed.
+    #[test]
+    fn do_keyword_elsewhere_is_untouched() {
+        parse_pg("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING").expect("parse");
+    }
+
+    /// `DO` round-trips through `Display`, always printing LANGUAGE first.
+    #[test]
+    fn parse_do_round_trips() {
+        let dialects = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
+        dialects.verified_stmt("DO LANGUAGE plpgsql $$ BEGIN END $$");
+        dialects.verified_stmt("DO $$ BEGIN END $$");
     }
 }

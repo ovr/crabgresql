@@ -11,3 +11,13 @@ and examples/ were not vendored; the sqlparser_derive proc-macro is left as an
 unused optional dependency). CrabgreSQL-specific additions live in later commits;
 diffing src/ against this tag shows our divergence. Re-sync by replacing src/
 from a newer tag and updating the commit above.
+
+Deliberate divergences from upstream (things a re-sync must re-apply, not
+discard):
+
+  * OperateFunctionArg gained `data_type_span`, so CREATE FUNCTION can point a
+    caret at an argument type in the "type is only a shell" NOTICE.
+  * New `Statement::Do` / `DoStatement`. Upstream has no DO statement at all.
+  * `parse_routine_body_literal` factored out of
+    `parse_create_function_body_string`, so CREATE FUNCTION, CREATE PROCEDURE
+    and DO share one body-literal path and all keep the literal's span.

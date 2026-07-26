@@ -68,8 +68,9 @@ pub use self::ddl::{
     CreateCollationDefinition, CreateConnector, CreateDomain, CreateExtension, CreateFunction,
     CreateIndex, CreateOperator, CreateOperatorClass, CreateOperatorFamily, CreatePolicy,
     CreatePolicyCommand, CreatePolicyType, CreateTable, CreateTrigger, CreateView, Deduplicate,
-    DeferrableInitial, DistStyle, DropBehavior, DropExtension, DropFunction, DropOperator,
-    DropOperatorClass, DropOperatorFamily, DropOperatorSignature, DropPolicy, DropTrigger,
+    DeferrableInitial, DistStyle, DoStatement, DropBehavior, DropExtension, DropFunction,
+    DropOperator, DropOperatorClass, DropOperatorFamily, DropOperatorSignature, DropPolicy,
+    DropTrigger,
     ForValues, FunctionReturnType, GeneratedAs, GeneratedExpressionMode, IdentityParameters,
     IdentityProperty, IdentityPropertyFormatKind, IdentityPropertyKind, IdentityPropertyOrder,
     IndexColumn, IndexOption, IndexType, KeyOrIndexDisplay, Msck, NullsDistinctOption,
@@ -3599,6 +3600,11 @@ pub enum Statement {
     /// ```
     Call(Function),
     /// ```sql
+    /// DO [ LANGUAGE lang_name ] $$ ... $$
+    /// ```
+    /// An anonymous code block.
+    Do(DoStatement),
+    /// ```sql
     /// COPY [TO | FROM] ...
     /// ```
     Copy {
@@ -4528,6 +4534,7 @@ impl fmt::Display for Statement {
             } => write!(f, "LOAD {name}"),
 
             Statement::Call(function) => write!(f, "CALL {function}"),
+            Statement::Do(stmt) => write!(f, "{stmt}"),
 
             Statement::Copy {
                 source,

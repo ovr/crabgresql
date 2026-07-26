@@ -274,6 +274,7 @@ impl Spanned for Values {
 /// - [Statement::CreateSchema]
 /// - [Statement::CreateDatabase]
 /// - [Statement::CreateFunction]
+/// - [Statement::Do]
 /// - [Statement::CreateTrigger]
 /// - [Statement::DropTrigger]
 /// - [Statement::CreateProcedure]
@@ -369,6 +370,7 @@ impl Spanned for Statement {
             Statement::CreateSchema { .. } => Span::empty(),
             Statement::CreateDatabase { .. } => Span::empty(),
             Statement::CreateFunction { .. } => Span::empty(),
+            Statement::Do { .. } => Span::empty(),
             Statement::CreateDomain { .. } => Span::empty(),
             Statement::CreateTrigger { .. } => Span::empty(),
             Statement::DropTrigger { .. } => Span::empty(),

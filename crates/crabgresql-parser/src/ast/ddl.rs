@@ -3783,6 +3783,35 @@ impl fmt::Display for CreateFunction {
     }
 }
 
+/// `DO [ LANGUAGE lang_name ] code` — an anonymous code block, executed as if
+/// it were the body of a void-returning procedure. The language defaults to
+/// `plpgsql`; PostgreSQL accepts the LANGUAGE clause on either side of the
+/// code, but only ever prints it first.
+///
+/// [PostgreSQL](https://www.postgresql.org/docs/current/sql-do.html)
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct DoStatement {
+    /// The `LANGUAGE` the code is written in. `None` means the server's
+    /// default for `DO`, which is `plpgsql`.
+    pub language: Option<Ident>,
+    /// The block's code, as written: a dollar-quoted or single-quoted literal.
+    /// The span's `start` is the opening delimiter, so a position inside the
+    /// code can be mapped back to a line of the `DO` statement.
+    pub body: ValueWithSpan,
+}
+
+impl fmt::Display for DoStatement {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("DO ")?;
+        if let Some(language) = &self.language {
+            write!(f, "LANGUAGE {language} ")?;
+        }
+        write!(f, "{}", self.body)
+    }
+}
+
 /// ```sql
 /// CREATE CONNECTOR [IF NOT EXISTS] connector_name
 /// [TYPE datasource_type]
