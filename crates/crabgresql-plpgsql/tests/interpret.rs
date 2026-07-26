@@ -554,7 +554,7 @@ fn embedded_dml_runs_and_select_into_reads_it_back() {
 /// documented divergence, so it gets a test that pins it down rather than
 /// leaving it to be discovered.
 #[test]
-fn a_variable_shadows_a_column_of_the_same_name() {
+fn a_variable_shadows_a_column_of_the_same_name() -> anyhow::Result<()> {
     let h = Harness::new();
     let table = h
         .engine
@@ -565,8 +565,8 @@ fn a_variable_shadows_a_column_of_the_same_name() {
         ))
         .expect("create table");
     let txn = h.txn();
-    table.insert(vec![Value::Int4(1)], &txn);
-    table.insert(vec![Value::Int4(2)], &txn);
+    table.insert(vec![Value::Int4(1)], &txn)?;
+    table.insert(vec![Value::Int4(2)], &txn)?;
 
     let oid = h.define(
         "f",
@@ -576,6 +576,7 @@ fn a_variable_shadows_a_column_of_the_same_name() {
     );
     // `sum(n)` sums the *parameter*, once per row — not the column.
     assert_eq!(ok(h.call(oid, vec![Value::Int4(10)])), Value::Int8(20));
+    Ok(())
 }
 
 /// A statement inside a body sees what the statement before it wrote — which
@@ -624,7 +625,7 @@ fn found_reflects_whether_the_last_statement_matched() {
 }
 
 #[test]
-fn select_into_strict_reports_no_rows_and_too_many_rows() {
+fn select_into_strict_reports_no_rows_and_too_many_rows() -> anyhow::Result<()> {
     let h = Harness::new();
     let table = h
         .engine
@@ -635,8 +636,8 @@ fn select_into_strict_reports_no_rows_and_too_many_rows() {
         ))
         .expect("create table");
     let txn = h.txn();
-    table.insert(vec![Value::Int4(1)], &txn);
-    table.insert(vec![Value::Int4(2)], &txn);
+    table.insert(vec![Value::Int4(1)], &txn)?;
+    table.insert(vec![Value::Int4(2)], &txn)?;
 
     let oid = h.define(
         "none",
@@ -657,6 +658,7 @@ fn select_into_strict_reports_no_rows_and_too_many_rows() {
     let e = err(h.call(oid, vec![]));
     assert_eq!(e.code, "P0003");
     assert_eq!(e.message, "query returned more than one row");
+    Ok(())
 }
 
 /// A bare SELECT has nowhere to put its rows; PostgreSQL says so and points at
@@ -687,7 +689,7 @@ fn perform_discards_rows_and_sets_found() {
 }
 
 #[test]
-fn a_scalar_expression_returning_many_rows_is_a_cardinality_violation() {
+fn a_scalar_expression_returning_many_rows_is_a_cardinality_violation() -> anyhow::Result<()> {
     let h = Harness::new();
     let table = h
         .engine
@@ -698,8 +700,8 @@ fn a_scalar_expression_returning_many_rows_is_a_cardinality_violation() {
         ))
         .expect("create table");
     let txn = h.txn();
-    table.insert(vec![Value::Int4(1)], &txn);
-    table.insert(vec![Value::Int4(2)], &txn);
+    table.insert(vec![Value::Int4(1)], &txn)?;
+    table.insert(vec![Value::Int4(2)], &txn)?;
 
     let oid = h.define(
         "f",
@@ -708,6 +710,7 @@ fn a_scalar_expression_returning_many_rows_is_a_cardinality_violation() {
         "DECLARE x int; BEGIN x := (SELECT n FROM t); RETURN x; END",
     );
     assert_eq!(err(h.call(oid, vec![])).code, "21000");
+    Ok(())
 }
 
 #[test]

@@ -139,4 +139,21 @@ mod wrapper_tests {
     fn syntax_error_is_reported() {
         assert!(parse("SELEC 1").is_err());
     }
+
+    #[test]
+    fn parses_postgresql_table_access_method() -> anyhow::Result<()> {
+        let statements = parse("CREATE TABLE events (id int4) USING parquet")?;
+        let [ast::Statement::CreateTable(create)] = statements.as_slice() else {
+            anyhow::bail!("expected CREATE TABLE");
+        };
+        let Some(ast::HiveIOFormat::Using { format }) = create
+            .hive_formats
+            .as_ref()
+            .and_then(|formats| formats.storage.as_ref())
+        else {
+            anyhow::bail!("expected USING table access method");
+        };
+        assert_eq!(format.value, "parquet");
+        Ok(())
+    }
 }

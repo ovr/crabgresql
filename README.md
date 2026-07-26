@@ -44,10 +44,11 @@ What exists today:
   `SeqScan`, `Filter`, `Projection`, nested-loop joins, aggregation, sorting,
   and limits — plus buffered (statement-atomic) INSERT/UPDATE/DELETE with
   NOT NULL and immediate composite-uniqueness validation.
-- **Storage** (`crabgresql-storage-api` + `crabgresql-pg-engine`): the pluggable
-  `TableEngine`/`TableAm` API — tid-addressed scan/insert/update/delete — over a
-  durable 8 KB slotted-page heap with a buffer pool and WAL, plus RAM-backed
-  memory tables (`UNLOGGED`/`TEMP`) that reuse the same heap AM without a WAL.
+- **Storage** (`crabgresql-storage-api`): the pluggable `TableEngine`/`TableAm`
+  API over a durable 8 KB heap (`crabgresql-pg-engine`), RAM-backed temporary
+  and WAL-skipped unlogged tables, plus managed permanent append-only Snappy
+  Parquet tables (`crabgresql-parquet-engine`) selected with
+  `CREATE TABLE ... USING parquet`.
 
 Tests: `cargo test` — unit tests per crate plus end-to-end tests that drive a
 real driver (tokio-postgres) and raw-socket handshake checks.

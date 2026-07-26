@@ -31,7 +31,7 @@ fn read(tm: &TransactionManager) -> TxnContext {
 fn visible_ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<i32> {
     let mut v: Vec<i32> = table
         .scan(&read(tm))
-        .map(|(_, t)| match t[0] {
+        .map(|row| match row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
             Value::Int4(x) => x,
             _ => unreachable!(),
         })
@@ -43,13 +43,16 @@ fn visible_ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<i32> {
 fn tid_of(tm: &TransactionManager, table: &dyn TableAm, id: i32) -> Tid {
     table
         .scan(&read(tm))
+        .map(|row| row.unwrap_or_else(|error| panic!("scan failed: {error}")))
         .find(|(_, t)| t[0] == Value::Int4(id))
         .map(|(tid, _)| tid)
         .unwrap_or_else(|| panic!("expected visible tuple with id {id}"))
 }
 
 fn insert(table: &dyn TableAm, txn: &TxnContext, id: i32, name: &str) -> Tid {
-    table.insert(vec![Value::Int4(id), Value::Text(name.into())], txn)
+    table
+        .insert(vec![Value::Int4(id), Value::Text(name.into())], txn)
+        .unwrap_or_else(|error| panic!("insert failed: {error}"))
 }
 
 #[test]
@@ -86,7 +89,7 @@ fn committed_survives_uncommitted_and_aborted_vanish() -> anyhow::Result<()> {
             tid_two,
             vec![Value::Int4(20), Value::Text("a2u".into())],
             &tm.context(xg, CommandId::FIRST),
-        );
+        )?;
         tm.commit(xg)?;
 
         // F: a final committed insert. Its commit fsync also makes B's and C's
@@ -203,13 +206,13 @@ fn seed_three(engine: &PgEngine, tm: &TransactionManager) -> Arc<dyn TableAm> {
 }
 
 #[test]
-fn truncate_committed_then_crash_recovers_empty() {
+fn truncate_committed_then_crash_recovers_empty() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, tm) = open(dir.path()).unwrap();
         let table = seed_three(&engine, &tm);
         let tx = tm.allocate_xid();
-        table.truncate(&tm.context(tx, CommandId::FIRST));
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
         tm.commit(tx).unwrap();
         assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
         // Crash: drop without checkpoint.
@@ -217,21 +220,23 @@ fn truncate_committed_then_crash_recovers_empty() {
     let (engine, tm) = open(dir.path()).unwrap();
     let table = engine.open_table("t").unwrap();
     assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
+    Ok(())
 }
 
 #[test]
-fn truncate_uncommitted_then_crash_restores_rows() {
+fn truncate_uncommitted_then_crash_restores_rows() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, tm) = open(dir.path()).unwrap();
         let table = seed_three(&engine, &tm);
         let tx = tm.allocate_xid();
         let ctx = tm.context(tx, CommandId::FIRST);
-        table.truncate(&ctx);
+        table.truncate(&ctx)?;
         // Read-your-own-truncate: the truncater sees its own now-empty table
         // (reading under its OWN xid; a concurrent reader would block on the
         // AccessExclusive lock until this transaction ends).
-        let own: Vec<i32> = table.scan(&ctx).map(|(_, t)| match t[0] {
+        let own: Vec<i32> = table.scan(&ctx).map(|row| match row
+            .unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
             Value::Int4(x) => x,
             _ => unreachable!(),
         }).collect();
@@ -242,15 +247,16 @@ fn truncate_uncommitted_then_crash_restores_rows() {
     let (engine, tm) = open(dir.path()).unwrap();
     let table = engine.open_table("t").unwrap();
     assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
+    Ok(())
 }
 
 #[test]
-fn truncate_rolled_back_restores_rows_in_place_and_after_restart() {
+fn truncate_rolled_back_restores_rows_in_place_and_after_restart() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let (engine, tm) = open(dir.path()).unwrap();
     let table = seed_three(&engine, &tm);
     let tx = tm.allocate_xid();
-    table.truncate(&tm.context(tx, CommandId::FIRST));
+    table.truncate(&tm.context(tx, CommandId::FIRST))?;
     tm.abort(tx);
     // Explicit abort restores the rows immediately (the old file was untouched).
     assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
@@ -258,17 +264,18 @@ fn truncate_rolled_back_restores_rows_in_place_and_after_restart() {
     let (engine, tm) = open(dir.path()).unwrap();
     let table = engine.open_table("t").unwrap();
     assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
+    Ok(())
 }
 
 #[test]
-fn truncate_then_insert_then_commit_crash_keeps_only_new_rows() {
+fn truncate_then_insert_then_commit_crash_keeps_only_new_rows() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, tm) = open(dir.path()).unwrap();
         let table = seed_three(&engine, &tm);
         let tx = tm.allocate_xid();
         let ctx = tm.context(tx, CommandId::FIRST);
-        table.truncate(&ctx);
+        table.truncate(&ctx)?;
         // Post-truncate inserts land in the new file (read-your-own-truncate).
         insert(&*table, &ctx, 10, "x");
         insert(&*table, &ctx, 11, "y");
@@ -278,16 +285,17 @@ fn truncate_then_insert_then_commit_crash_keeps_only_new_rows() {
     let (engine, tm) = open(dir.path()).unwrap();
     let table = engine.open_table("t").unwrap();
     assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
+    Ok(())
 }
 
 #[test]
-fn truncate_crash_then_truncate_again_commit_is_consistent() {
+fn truncate_crash_then_truncate_again_commit_is_consistent() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, tm) = open(dir.path()).unwrap();
         let table = seed_three(&engine, &tm);
         let tx = tm.allocate_xid();
-        table.truncate(&tm.context(tx, CommandId::FIRST));
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
         // Crash before commit.
     }
     {
@@ -296,7 +304,7 @@ fn truncate_crash_then_truncate_again_commit_is_consistent() {
         let table = engine.open_table("t").unwrap();
         assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
         let tx = tm.allocate_xid();
-        table.truncate(&tm.context(tx, CommandId::FIRST));
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
         tm.commit(tx).unwrap();
         assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
     }
@@ -308,6 +316,7 @@ fn truncate_crash_then_truncate_again_commit_is_consistent() {
     insert(&*table, &tm.context(x, CommandId::FIRST), 42, "z");
     tm.commit(x).unwrap();
     assert_eq!(visible_ids(&tm, &*table), vec![42]);
+    Ok(())
 }
 
 // --- Corruption & checkpoint interactions ---
@@ -361,7 +370,7 @@ fn checkpoint_then_more_writes_then_crash_recovers_all() {
 }
 
 #[test]
-fn interleaved_committed_and_in_flight_txns_recover_committed_only() {
+fn interleaved_committed_and_in_flight_txns_recover_committed_only() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, tm) = open(dir.path()).unwrap();
@@ -378,7 +387,7 @@ fn interleaved_committed_and_in_flight_txns_recover_committed_only() {
         insert(&*table, &ca, 2, "a-ins");
         insert(&*table, &cb, 3, "b-ins");
         // xa updates the base row (delete old + insert new); xb does not touch it.
-        table.update(base_tid, vec![Value::Int4(10), Value::Text("a-upd".into())], &ca);
+        table.update(base_tid, vec![Value::Int4(10), Value::Text("a-upd".into())], &ca)?;
         // Commit xa; leave xb in flight, then commit an unrelated row to force
         // xb's records durable, so recovery must reason about them explicitly.
         tm.commit(xa).unwrap();
@@ -391,10 +400,11 @@ fn interleaved_committed_and_in_flight_txns_recover_committed_only() {
     let table = engine.open_table("t").unwrap();
     // xa's insert (2) and update (1->10) survive; xb's insert (3) vanishes; 99 too.
     assert_eq!(visible_ids(&tm, &*table), vec![2, 10, 99]);
+    Ok(())
 }
 
 #[test]
-fn committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows() {
+fn committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows() -> anyhow::Result<()> {
     // Regression: a committed TRUNCATE followed by an uncommitted one must NOT be
     // judged by the last record's fate. The committed truncate's file is live and
     // must survive; only the uncommitted truncate is discarded.
@@ -405,20 +415,21 @@ fn committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows() {
         // Txn A: truncate away the seed rows and insert 10, 11, then COMMIT.
         let a = tm.allocate_xid();
         let ca = tm.context(a, CommandId::FIRST);
-        table.truncate(&ca);
+        table.truncate(&ca)?;
         insert(&*table, &ca, 10, "x");
         insert(&*table, &ca, 11, "y");
         tm.commit(a).unwrap();
         assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
         // Txn B: truncate again but never commit; crash with the swap pending.
         let b = tm.allocate_xid();
-        table.truncate(&tm.context(b, CommandId::FIRST));
+        table.truncate(&tm.context(b, CommandId::FIRST))?;
     }
     // Recovery must keep A's committed rows (10, 11), not delete A's live file
     // because B's later truncate was uncommitted.
     let (engine, tm) = open(dir.path()).unwrap();
     let table = engine.open_table("t").unwrap();
     assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
+    Ok(())
 }
 
 #[test]
@@ -478,5 +489,97 @@ fn analyze_results_survive_a_crash_without_being_wal_logged() -> anyhow::Result<
     );
     assert_eq!(stats.reltuples, 40.0);
 
+    Ok(())
+}
+
+fn parquet_schema(name: &str) -> TableSchema {
+    let mut schema = TableSchema::new(name, vec![Column::new("id", PgType::Int4)]);
+    schema.access_method = crabgresql_storage_api::TableAccessMethod::Parquet;
+    schema
+}
+
+/// The single `parquet/<relfilenode>` directory in `dir`.
+fn parquet_table_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(dir.join("parquet"))
+        .expect("parquet root exists")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .next()
+        .expect("the parquet table directory exists")
+}
+
+#[test]
+fn an_unopenable_parquet_relation_does_not_block_startup() -> anyhow::Result<()> {
+    // A Parquet relation whose directory the engine cannot make sense of must
+    // degrade to "this one table is unavailable", not "the cluster will not
+    // boot" — otherwise every heap table in the same data directory becomes
+    // unreachable and the offender could never be dropped.
+    let dir = tempfile::tempdir()?;
+    let table_dir;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let heap = engine.create_table(schema())?;
+        let xid = tm.allocate_xid();
+        insert(&*heap, &tm.context(xid, CommandId::FIRST), 1, "kept");
+        tm.commit(xid)?;
+
+        let events = engine.create_table(parquet_schema("events"))?;
+        let xid = tm.allocate_xid();
+        events.insert(vec![Value::Int4(9)], &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        table_dir = parquet_table_dir(dir.path());
+    }
+    // Leave behind a file the fragment-name parser rejects.
+    std::fs::write(table_dir.join("not-a-fragment.parquet"), b"garbage")?;
+
+    let (engine, tm) = open(dir.path())?;
+    // The heap table is untouched and still readable.
+    let heap = engine.open_table("t")?;
+    assert_eq!(visible_ids(&tm, &*heap), vec![1]);
+    // The broken relation reports as nonexistent rather than taking the engine
+    // down, and can still be dropped so the catalog entry goes away.
+    assert!(engine.open_table("events").is_err());
+    engine.drop_table("public", "events")?;
+    drop(tm);
+    drop(engine);
+
+    // The next boot reclaims its now-orphaned fragment directory.
+    let (_engine, _tm) = open(dir.path())?;
+    assert!(
+        !table_dir.exists(),
+        "orphaned Parquet directory should have been reclaimed: {table_dir:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_orphaned_parquet_directory_is_reclaimed_at_startup() -> anyhow::Result<()> {
+    // `drop_table` removes the catalog entry before the fragment directory, so a
+    // crash or IO error in that window leaves a directory no relation owns. The
+    // startup sweep is the Parquet counterpart of `gc_orphan_relfiles`; without
+    // it the bytes are stranded forever.
+    let dir = tempfile::tempdir()?;
+    let live_dir;
+    let orphan_dir = dir.path().join("parquet").join("999999");
+    {
+        let (engine, tm) = open(dir.path())?;
+        let events = engine.create_table(parquet_schema("events"))?;
+        let xid = tm.allocate_xid();
+        events.insert(vec![Value::Int4(1)], &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        live_dir = parquet_table_dir(dir.path());
+        // A directory whose relation no longer exists in the catalog.
+        std::fs::create_dir_all(&orphan_dir)?;
+        std::fs::write(orphan_dir.join("00000001-3-0.parquet"), b"stale")?;
+    }
+
+    let (engine, tm) = open(dir.path())?;
+    assert!(
+        !orphan_dir.exists(),
+        "startup should reclaim the orphaned Parquet directory"
+    );
+    // The live relation is left alone.
+    assert!(live_dir.exists());
+    assert_eq!(engine.open_table("events")?.scan(&read(&tm)).count(), 1);
     Ok(())
 }
