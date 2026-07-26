@@ -352,7 +352,16 @@ mod tests {
         let err = resolve(sql)?.err().ok_or_else(|| {
             anyhow::anyhow!("{sql}: expected the options to be rejected, they were accepted")
         })?;
-        Ok((err.code, err.message))
+        // Every EXPLAIN option error is built from a `sqlstate` constant, so the
+        // code is always borrowed. Only a code composed at runtime (`RAISE ...
+        // USING ERRCODE`) is owned, and this path never builds one.
+        let code = match err.code {
+            std::borrow::Cow::Borrowed(code) => code,
+            std::borrow::Cow::Owned(code) => {
+                anyhow::bail!("{sql}: expected a static SQLSTATE, got {code}")
+            }
+        };
+        Ok((code, err.message))
     }
 
     #[test]
