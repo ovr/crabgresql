@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crabgresql_binder::{
     BoundExpr, CopyFromPlan, InsertSource, LogicalPlan, bind_copy_from, bind_delete_with_params,
@@ -14,7 +15,7 @@ use crabgresql_binder::{
     substitute_params,
 };
 use crabgresql_executor::{
-    CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, OutputColumn, Values, execute,
+    CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, OutputColumn, execute,
 };
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{TransactionStatus, sqlstate};
@@ -29,6 +30,7 @@ use crabgresql_types::{PgType, Value};
 
 use crate::catalog::{SessionCatalog, SessionCatalogOps};
 use crate::error::PgError;
+use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
 use crate::global_catalog::{CatalogNotice, FuncBody, FuncDropSpec, GlobalCatalog, TypeRef};
 use crate::session::{ActiveTxn, Session};
 
@@ -87,8 +89,8 @@ pub enum QueryResult {
         columns: Vec<OutputColumn>,
         node: Box<dyn ExecNode>,
         /// Which command tag to report once the rows are drained. A plain SELECT
-        /// (and EXPLAIN) uses `SELECT n`; a `RETURNING` DML keeps its mutation
-        /// tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`).
+        /// uses `SELECT n`, EXPLAIN the bare `EXPLAIN`, and a `RETURNING` DML keeps
+        /// its mutation tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`).
         tag: RowTag,
     },
     Command {
@@ -106,6 +108,9 @@ pub enum RowTag {
     Insert,
     Update,
     Delete,
+    /// `EXPLAIN`, whose tag carries no count — the plan's line count is not a row
+    /// count, and a driver that reads the trailing integer would report it as one.
+    Explain,
 }
 
 impl RowTag {
@@ -116,6 +121,7 @@ impl RowTag {
             RowTag::Insert => format!("INSERT 0 {count}"),
             RowTag::Update => format!("UPDATE {count}"),
             RowTag::Delete => format!("DELETE {count}"),
+            RowTag::Explain => "EXPLAIN".to_string(),
         }
     }
 }
@@ -397,7 +403,28 @@ pub fn analyze_statement(
         // returns a single "QUERY PLAN" text column. Binding the inner here lets
         // a prepared `EXPLAIN … $1` report its parameter types at Describe rather
         // than erroring at Execute.
-        ast::Statement::Explain { statement, .. } => {
+        // The options are deliberately *not* validated here: PG inspects them at
+        // Describe only to pick the result column type and raises nothing, leaving
+        // every option error to Execute. Rejecting at Parse would abort an open
+        // transaction block for a statement that was never executed. A spelling
+        // PG's *grammar* rejects is different — that is a parse error there, so it
+        // has to fail here too rather than at Execute.
+        ast::Statement::Explain {
+            query_plan,
+            estimate,
+            statement,
+            format,
+            ..
+        } => {
+            if let Some(modifier) = query_plan
+                .then_some("QUERY")
+                .or_else(|| estimate.then_some("ESTIMATE"))
+                .or_else(|| format.is_some().then_some("FORMAT"))
+            {
+                return Err(PgError::syntax(format!(
+                    "syntax error at or near \"{modifier}\""
+                )));
+            }
             match statement.as_ref() {
                 ast::Statement::Query(q) => {
                     bind_query_with_params(&catalog, &type_catalog, q, &ctx)?
@@ -422,7 +449,7 @@ pub fn analyze_statement(
             require_all_resolved(&ctx)?;
             return Ok(Analyzed {
                 param_types: param_types(&ctx).into_iter().flatten().collect(),
-                result_columns: Some(vec![OutputColumn::new("QUERY PLAN", PgType::Text)]),
+                result_columns: Some(explain_columns()),
             });
         }
         // Utility statements (DDL/SET/transaction control) take no parameters and
@@ -494,12 +521,68 @@ pub fn execute_statement(
             format!("cannot execute {command} in a read-only transaction"),
         ));
     }
+    // `EXPLAIN [ANALYZE] <stmt>`: from here on the inner statement is the one
+    // being processed, and `explain` records how to report it. Unwrapping here —
+    // after the aborted-block and read-only-DDL checks, before binding — is what
+    // lets ANALYZE reach the same transaction machinery as a bare statement: PG
+    // really runs it, so a write must take an XID, honor the read-only check, and
+    // commit. Unwrapping any earlier would make `BEGIN READ ONLY; EXPLAIN CREATE
+    // TABLE t(…)` report 25006 instead of EXPLAIN's own unsupported-statement
+    // error.
+    // The modifiers are carried unresolved past the binder on purpose: PG
+    // parse-analyzes the inner statement *before* it reads the option list, so
+    // `EXPLAIN (BOGUS) SELECT * FROM missing` reports the missing relation, not the
+    // bad option. Grammar errors are the exception — those precede name resolution
+    // in PG too, so they are raised here.
+    let (stmt, explain_options) = match stmt {
+        ast::Statement::Explain {
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+            ..
+        } => {
+            // `EXPLAIN QUERY PLAN` (SQLite), `EXPLAIN ESTIMATE` (ClickHouse) and the
+            // bare `EXPLAIN FORMAT <kind>` are other dialects' spellings that the
+            // shared parser accepts. PG's grammar has none of them, so neither does
+            // crabgresql — silently treating them as a plain EXPLAIN would answer a
+            // question that was not asked. PG echoes the offending token as the
+            // client wrote it and adds a cursor position; the parser keeps neither
+            // for these flags, so the keyword is reported in upper case without a
+            // caret.
+            if let Some(modifier) = query_plan
+                .then_some("QUERY")
+                .or_else(|| estimate.then_some("ESTIMATE"))
+                .or_else(|| format.is_some().then_some("FORMAT"))
+            {
+                return Err(PgError::syntax(format!(
+                    "syntax error at or near \"{modifier}\""
+                )));
+            }
+            (
+                statement.as_ref(),
+                Some((*analyze, *verbose, options.as_deref())),
+            )
+        }
+        other => (other, None),
+    };
     // Resolution overlay: the session's temp catalog shadows the shared global
     // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
     // so it keeps the raw engine + session below.
     let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
     let logical = match bind_dml_with_params(&catalog, &type_catalog, stmt, params)? {
         Some(logical) => logical,
+        // EXPLAIN of a utility statement: report the gap rather than falling
+        // through to the handler, which would run the utility for real.
+        None if explain_options.is_some() => {
+            return Err(PgError::feature_not_supported(format!(
+                "EXPLAIN of {} is not supported yet",
+                statement_kind(stmt)
+            )));
+        }
         // Not DQL/DML: fall through to the utility-statement handlers below.
         None => match stmt {
             ast::Statement::CreateTable(create) if create.query.is_some() => {
@@ -647,43 +730,6 @@ pub fn execute_statement(
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
             }
-            ast::Statement::Explain {
-                analyze, statement, ..
-            } => {
-                // Plain `EXPLAIN <stmt>` only: ANALYZE would run the statement,
-                // which this reduced EXPLAIN does not do. VERBOSE/FORMAT are
-                // ignored.
-                if *analyze {
-                    return Err(PgError::feature_not_supported(
-                        "EXPLAIN ANALYZE is not supported yet",
-                    ));
-                }
-                let Some(inner) =
-                    bind_dml_with_params(&catalog, &type_catalog, statement, params)?
-                else {
-                    return Err(PgError::feature_not_supported(format!(
-                        "EXPLAIN of {} is not supported yet",
-                        statement_kind(statement)
-                    )));
-                };
-                let plan = crabgresql_planner::plan(inner);
-                let rows: Vec<Vec<BoundExpr>> = crabgresql_planner::explain(&plan)
-                    .into_iter()
-                    .map(|line| {
-                        vec![BoundExpr::Const {
-                            value: Value::Text(line),
-                            ty: PgType::Text,
-                        }]
-                    })
-                    .collect();
-                let node: Box<dyn ExecNode> =
-                    Box::new(Values::new(rows, session.exec_context()));
-                return Ok(QueryResult::Rows {
-                    columns: vec![OutputColumn::new("QUERY PLAN", PgType::Text)],
-                    node,
-                    tag: RowTag::Select,
-                });
-            }
             other => {
                 return Err(PgError::feature_not_supported(format!(
                     "statement is not supported yet: {}",
@@ -692,14 +738,25 @@ pub fn execute_statement(
             }
         },
     };
+    // The inner statement bound, so the modifiers can be read now — after name
+    // resolution, where PG reads them.
+    let explain = match explain_options {
+        Some((analyze, verbose, options)) => {
+            Some(ExplainOptions::resolve(analyze, verbose, options)?)
+        }
+        None => None,
+    };
     // A write statement needs an XID to stamp its versions; a read runs with
     // none. Decide from the bound plan, not the surface AST: the binder already
     // resolved the statement to an Insert/Update/Delete node, so a new writing
     // statement kind can't accidentally run XID-less and produce invisible rows.
+    // A plain `EXPLAIN <write>` never executes, so it is not a write: PG accepts
+    // `BEGIN READ ONLY; EXPLAIN DELETE FROM t` and raises 25006 only once ANALYZE
+    // makes the statement run for real.
     let is_write = matches!(
         logical,
         LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
-    );
+    ) && explain.is_none_or(|opts| opts.analyze);
     // A write in a READ ONLY transaction (or under the read-only session default)
     // is rejected before it stamps any version, matching PG's 25006.
     if is_write && read_only_active(session) {
@@ -714,8 +771,47 @@ pub fn execute_statement(
             format!("cannot execute {verb} in a read-only transaction"),
         ));
     }
+    // Only EXPLAIN reports a planning time, so only EXPLAIN pays for the clock.
+    // The clock brackets planning alone, as PG's does — parse analysis (here, the
+    // binder) is outside it there too. crabgresql's planner does far less than
+    // PG's, so this number is legitimately small; it is not comparable to PG's.
+    let planning_started = explain.is_some().then(Instant::now);
+    let plan = crabgresql_planner::plan(logical);
+    let planning = planning_started.map_or(Duration::ZERO, |started| started.elapsed());
+    // Rendered here, while the plan is still borrowable — `execute` consumes it.
+    let explaining = explain.map(|opts| (opts, crabgresql_planner::explain(&plan)));
     let read_only = read_only_active(session);
+    // Every statement that reads takes a snapshot, EXPLAIN included: PG pins the
+    // transaction snapshot for it, so inside a REPEATABLE READ block a plain
+    // EXPLAIN freezes the view the rest of the block sees. That is why this runs
+    // before the EXPLAIN paths return, not after.
     let txn = build_txn(txnmgr, session, is_write);
+    if let Some((opts, mut lines)) = explaining {
+        // A plain EXPLAIN stops at the plan; only ANALYZE runs the statement, and
+        // it shares this statement's transaction bookkeeping — a write has an XID
+        // and commits (or aborts, if the run faults mid-stream) exactly as the
+        // bare statement would.
+        let execution = match opts.analyze {
+            false => None,
+            true => {
+                let exec_ctx =
+                    session.exec_context_for_statement(engine, &catalog_ops, read_only);
+                match run_analyze(plan, &exec_ctx, &txn) {
+                    Ok(execution) => Some(execution),
+                    Err(e) => {
+                        // Abort path: infallible, so the result is safe to drop.
+                        let _ = finalize_statement(txnmgr, session, &txn, is_write, false);
+                        return Err(e.into());
+                    }
+                }
+            }
+        };
+        finalize_statement(txnmgr, session, &txn, is_write, true)?;
+        if opts.summary {
+            lines.extend(crabgresql_planner::explain_summary(planning, execution));
+        }
+        return Ok(explain_result(lines, session));
+    }
     // Sequence functions (`nextval` in a `serial` default or written explicitly)
     // advance non-transactional counters in the shared engine and update this
     // session's `currval`/`lastval`, so the execution context carries a handle to
@@ -725,7 +821,7 @@ pub fn execute_statement(
     // The catalog handle is the same snapshot this statement bound against, so
     // `pg_table_is_visible(c.oid)` agrees with the `pg_class` rows it filters.
     let exec_ctx = session.exec_context_for_statement(engine, &catalog_ops, read_only);
-    let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
+    let exec = match execute(plan, &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
             // Abort path: infallible, so the result is safe to drop.
@@ -1722,7 +1818,7 @@ fn statement_kind(stmt: &ast::Statement) -> String {
 }
 
 /// Unquoted identifiers fold to lowercase, as in PG.
-fn normalize_ident(ident: &ast::Ident) -> String {
+pub(crate) fn normalize_ident(ident: &ast::Ident) -> String {
     match ident.quote_style {
         Some(_) => ident.value.clone(),
         None => ident.value.to_lowercase(),

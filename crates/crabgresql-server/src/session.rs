@@ -50,11 +50,34 @@ pub struct Portal {
     /// Per-column result formats. Length 0 = all text, 1 = applies to every
     /// column, otherwise one entry per column (as the `Bind` message encodes).
     pub result_formats: Vec<Format>,
-    /// A row-limited `Execute` (`max_rows > 0`) that did not exhaust the result
-    /// keeps its live iterator here and resumes it on the next `Execute`, so the
-    /// remaining rows are streamed lazily rather than buffered. `None` until the
-    /// portal first suspends.
-    pub suspended: Option<SuspendedRows>,
+    /// Where this portal is in its life: never run, paused mid-result, or
+    /// finished. A finished portal must never re-run its statement.
+    pub state: PortalState,
+}
+
+/// How far a portal has got. A portal is executed at most once: PG answers a
+/// second `Execute` of a finished portal from the portal's recorded state rather
+/// than running the statement again, which for a data-modifying statement would
+/// apply its writes twice.
+pub enum PortalState {
+    /// Bound but not yet executed.
+    Ready,
+    /// A row-limited `Execute` (`max_rows > 0`) did not exhaust the result, so the
+    /// live iterator waits here and the next `Execute` resumes it — streaming,
+    /// rather than buffering the remainder.
+    Suspended(SuspendedRows),
+    /// Ran to completion. `tag` is the command-tag family of the result set it
+    /// produced, or `None` for a statement that produced no result set at all
+    /// (a plain `INSERT`/`UPDATE`/`DELETE`, DDL, `SET`): PG re-reports an
+    /// exhausted result set as an empty one, but refuses to re-run the latter.
+    Done { tag: Option<RowTag> },
+}
+
+impl PortalState {
+    /// Whether a further `Execute` resumes a paused result.
+    pub fn is_suspended(&self) -> bool {
+        matches!(self, PortalState::Suspended(_))
+    }
 }
 
 /// A portal suspended by a row-limited `Execute`: the still-running result
