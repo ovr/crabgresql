@@ -29,6 +29,7 @@ test: between
 test: transactions
 test: numeric
 test: join
+test: join_pushdown
 test: generate_series
 test: string
 test: uuid

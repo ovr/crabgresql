@@ -824,6 +824,70 @@ impl BoundExpr {
         fold(self, &mut acc);
         acc
     }
+
+    /// Add `delta` to every `ColumnRef` index, relocating this expression from
+    /// one row layout to another. `delta` is signed: combining a comma group's
+    /// merged-column view with the groups laid out before it shifts *up* by the
+    /// group's base, while pushing a predicate from a join's combined row down
+    /// into a subtree shifts *down* by that subtree's base offset.
+    ///
+    /// Mirrors [`Self::column_ref_bounds`] exactly — an expression this moves is
+    /// an expression whose bounds that reports, and vice versa. In particular an
+    /// `OuterColumnRef` addresses an enclosing row and is left untouched, as is a
+    /// subplan's own body: only the `IN` needle and array operand of a
+    /// quantified comparison index this row.
+    pub fn shift_column_refs(&mut self, delta: isize) {
+        match self {
+            BoundExpr::ColumnRef { index, .. } => {
+                let Some(shifted) = index.checked_add_signed(delta) else {
+                    panic!("column index {index} shifted out of range by {delta}");
+                };
+                *index = shifted;
+            }
+            BoundExpr::Const { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. }
+            | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::Exists { .. } => {}
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.shift_column_refs(delta),
+            BoundExpr::Binary { left, right, .. } => {
+                left.shift_column_refs(delta);
+                right.shift_column_refs(delta);
+            }
+            // A routine's body has its own frame; only its arguments index this row.
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. }
+            | BoundExpr::Aggregate { args, .. } => {
+                args.iter_mut().for_each(|a| a.shift_column_refs(delta));
+            }
+            BoundExpr::ArrayCtor { elems, .. } => {
+                elems.iter_mut().for_each(|e| e.shift_column_refs(delta));
+            }
+            BoundExpr::Subscript { base, index, .. } => {
+                base.shift_column_refs(delta);
+                index.shift_column_refs(delta);
+            }
+            BoundExpr::Case { whens, else_, .. } => {
+                for (c, r) in whens {
+                    c.shift_column_refs(delta);
+                    r.shift_column_refs(delta);
+                }
+                if let Some(e) = else_ {
+                    e.shift_column_refs(delta);
+                }
+            }
+            BoundExpr::QuantifiedSubquery { cmp, .. } => cmp.shift_column_refs(delta),
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.shift_column_refs(delta);
+                cmp.shift_column_refs(delta);
+            }
+        }
+    }
 }
 
 /// A binding result: typed, or an untyped literal awaiting context (PG's

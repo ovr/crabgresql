@@ -752,11 +752,16 @@ fn resolve_join(
     txn: &TxnContext,
 ) -> Result<(), ExecError> {
     match join {
-        PhysicalJoinExpr::Input { input, .. } => match input {
-            PhysicalJoinInput::Scan(_) => {}
-            PhysicalJoinInput::Subplan(source) => resolve_subqueries(source, ctx, txn)?,
-            PhysicalJoinInput::TableFunction { args, .. } => resolve_exprs(args, ctx, txn)?,
-        },
+        PhysicalJoinExpr::Input {
+            input, predicate, ..
+        } => {
+            match input {
+                PhysicalJoinInput::Scan(_) => {}
+                PhysicalJoinInput::Subplan(source) => resolve_subqueries(source, ctx, txn)?,
+                PhysicalJoinInput::TableFunction { args, .. } => resolve_exprs(args, ctx, txn)?,
+            }
+            resolve_opt(predicate, ctx, txn)?;
+        }
         PhysicalJoinExpr::Join {
             left,
             right,
@@ -2246,8 +2251,17 @@ fn build_join_expr(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Box<dyn ExecNode>, ExecError> {
+    let uses_hash_join = source.uses_hash_join();
     match source {
-        PhysicalJoinExpr::Input { input, .. } => build_join_source(input, ctx, txn),
+        PhysicalJoinExpr::Input {
+            input, predicate, ..
+        } => {
+            let source = build_join_source(input, ctx, txn)?;
+            Ok(match predicate {
+                Some(predicate) => Box::new(Filter::new(source, predicate, ctx.clone())),
+                None => source,
+            })
+        }
         PhysicalJoinExpr::Join {
             left,
             right,
@@ -2259,17 +2273,7 @@ fn build_join_expr(
             let right_width = right.width();
             let left = build_join_expr(*left, ctx, txn)?;
             let right = build_join_expr(*right, ctx, txn)?;
-            if hash_keys.is_empty() {
-                Ok(Box::new(NestedLoopJoin::new(
-                    left,
-                    right,
-                    left_width,
-                    right_width,
-                    kind,
-                    predicate,
-                    ctx.clone(),
-                )?))
-            } else {
+            if uses_hash_join {
                 Ok(Box::new(HashJoin::new(
                     left,
                     right,
@@ -2277,6 +2281,16 @@ fn build_join_expr(
                     right_width,
                     kind,
                     hash_keys,
+                    predicate,
+                    ctx.clone(),
+                )?))
+            } else {
+                Ok(Box::new(NestedLoopJoin::new(
+                    left,
+                    right,
+                    left_width,
+                    right_width,
+                    kind,
                     predicate,
                     ctx.clone(),
                 )?))
@@ -2321,6 +2335,11 @@ impl NestedLoopJoin {
         predicate: Option<BoundExpr>,
         ctx: ExecContext,
     ) -> Result<Self, ExecError> {
+        debug_assert!(
+            kind != JoinKind::Cross || predicate.is_none(),
+            "a cross join carries no predicate; the planner flips the kind to Inner \
+             when it attaches one"
+        );
         let mut right_rows = Vec::new();
         while let Some(row) = right.next()? {
             right_rows.push(row);
@@ -2385,8 +2404,11 @@ impl ExecNode for NestedLoopJoin {
                             continue;
                         };
                         let row = self.combined_row(left, &self.right_rows[right_index]);
-                        let matched = self.kind == JoinKind::Cross
-                            || predicate_holds(&self.predicate, &row, &self.ctx)?;
+                        // A cross join carries no predicate, and `predicate_holds`
+                        // already answers `true` for `None`, so there is no
+                        // kind-specific short circuit here: an unconditional check
+                        // means a predicate that reaches this node is always applied.
+                        let matched = predicate_holds(&self.predicate, &row, &self.ctx)?;
                         if matched {
                             self.current_left_matched = true;
                             self.right_matched[right_index] = true;
@@ -2477,6 +2499,11 @@ impl HashJoin {
         residual: Option<BoundExpr>,
         ctx: ExecContext,
     ) -> Result<Self, ExecError> {
+        debug_assert!(
+            kind != JoinKind::Cross,
+            "a cross join has no equi-keys; the planner flips the kind to Inner when \
+             it attaches a predicate"
+        );
         let key_tys: Vec<PgType> = hash_keys.iter().map(|k| k.ty).collect();
         let mut left_keys = Vec::with_capacity(hash_keys.len());
         let mut right_keys = Vec::with_capacity(hash_keys.len());
@@ -5285,6 +5312,30 @@ mod tests {
     }
 
     #[test]
+    fn explicit_on_correlated_residual_uses_the_join_row() {
+        // The correlated scalar subquery reads `a.big` from the full joined row.
+        // Sinking the residual onto b would substitute its outer reference from
+        // b's two-column row and read `b.big` instead, returning no rows.
+        let (_, rows) = run_rows(
+            "SELECT a.id, b.big \
+             FROM (VALUES (1, 10), (2, 20)) a(id, big) \
+             JOIN (VALUES (1, 100), (2, 200), (3, 300)) b(id, big) \
+               ON a.id = b.id \
+              AND b.big = (SELECT max(c.v) \
+                           FROM (VALUES (10, 100), (20, 200)) c(k, v) \
+                           WHERE c.k = a.big) \
+             ORDER BY a.id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(100)],
+                vec![Value::Int4(2), Value::Int4(200)],
+            ]
+        );
+    }
+
+    #[test]
     fn hash_join_left_outer_with_residual_null_extends() {
         // A LEFT join whose ON has a residual: a left row is null-extended when no
         // right row satisfies the *whole* ON (key equality AND the residual).
@@ -5301,6 +5352,127 @@ mod tests {
                 // x=2 has a key match (b.x=2) but 9 < 1 is false, so null-extended.
                 vec![Value::Int4(2), Value::Null],
             ]
+        );
+    }
+
+    #[test]
+    fn comma_join_where_equality_matches_the_explicit_on_form() {
+        // The planner now extracts `a.x = b.y` from the WHERE into the join, so
+        // this runs as a hash join. Rows — and their order — must be exactly what
+        // the explicit ON form produces, duplicates included.
+        let comma = "SELECT a.x, b.y \
+                     FROM (VALUES (1), (2), (2)) a(x), (VALUES (2), (2), (3)) b(y) \
+                     WHERE a.x = b.y";
+        let explicit = "SELECT a.x, b.y \
+                        FROM (VALUES (1), (2), (2)) a(x) \
+                        JOIN (VALUES (2), (2), (3)) b(y) ON a.x = b.y";
+        let (_, comma_rows) = run_rows(comma);
+        let (_, explicit_rows) = run_rows(explicit);
+        assert_eq!(comma_rows, explicit_rows);
+        assert_eq!(
+            comma_rows,
+            vec![
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn comma_join_null_keys_never_match() {
+        // NULL = NULL is unknown, so a NULL key joins nothing — the hash join
+        // excludes it at build and probe time, matching the nested loop it replaced.
+        let (_, rows) = run_rows(
+            "SELECT a.x, b.y \
+             FROM (VALUES (1), (NULL)) a(x), (VALUES (1), (NULL)) b(y) \
+             WHERE a.x = b.y",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(1), Value::Int4(1)]]);
+    }
+
+    #[test]
+    fn comma_join_non_equi_condition_still_filters() {
+        // No hash key here, so the condition rides the nested loop as the node's
+        // predicate on a join whose kind flipped from Cross to Inner. A node left
+        // as Cross would return the whole product instead.
+        let (_, rows) = run_rows(
+            "SELECT a.x, b.y \
+             FROM (VALUES (1), (5)) a(x), (VALUES (2), (9)) b(y) \
+             WHERE a.x < b.y",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(2)],
+                vec![Value::Int4(1), Value::Int4(9)],
+                vec![Value::Int4(5), Value::Int4(9)],
+            ]
+        );
+    }
+
+    #[test]
+    fn three_way_comma_join_matches_the_explicit_on_form() {
+        let comma = "SELECT a.x, b.y, c.z \
+                     FROM (VALUES (1), (2)) a(x), (VALUES (1), (2)) b(y), (VALUES (2), (3)) c(z) \
+                     WHERE a.x = b.y AND b.y = c.z";
+        let explicit = "SELECT a.x, b.y, c.z \
+                        FROM (VALUES (1), (2)) a(x) \
+                        JOIN (VALUES (1), (2)) b(y) ON a.x = b.y \
+                        JOIN (VALUES (2), (3)) c(z) ON b.y = c.z";
+        let (_, comma_rows) = run_rows(comma);
+        let (_, explicit_rows) = run_rows(explicit);
+        assert_eq!(comma_rows, explicit_rows);
+        assert_eq!(
+            comma_rows,
+            vec![vec![Value::Int4(2), Value::Int4(2), Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    fn leaf_filters_restrict_both_sides_of_a_comma_join() {
+        // `a.x > 1` and `b.k < 30` sink to their own scans, leaving only the
+        // equality on the join. The surviving rows must be exactly what the
+        // unrestricted join filtered afterwards would have produced.
+        let (_, rows) = run_rows(
+            "SELECT a.x, b.k \
+             FROM (VALUES (1, 10), (2, 20), (3, 30)) a(x, k), \
+                  (VALUES (1, 10), (2, 20), (3, 30)) b(x, k) \
+             WHERE a.x = b.x AND a.x > 1 AND b.k < 30 ORDER BY a.x",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(2), Value::Int4(20)]]);
+    }
+
+    #[test]
+    fn anti_join_idiom_survives_pushdown() {
+        // `b.y IS NULL` reads the null-supplying side of a LEFT join. Pushing it
+        // below the join would drop the b rows an a row matched, null-extend that
+        // a row, and let it pass — so this must keep returning only the genuinely
+        // unmatched left rows.
+        let (_, rows) = run_rows(
+            "SELECT a.x \
+             FROM (VALUES (1), (2), (3)) a(x) \
+             LEFT JOIN (VALUES (2)) b(y) ON a.x = b.y \
+             WHERE b.y IS NULL ORDER BY a.x",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(1)], vec![Value::Int4(3)]]);
+    }
+
+    #[test]
+    fn comma_join_with_an_outer_join_group_keeps_outer_semantics() {
+        // A bushy FROM: the LEFT join's null-extended row must survive into the
+        // cross join, and the WHERE conjunct over the preserved side must not
+        // change which rows the LEFT join emits.
+        let (_, rows) = run_rows(
+            "SELECT a.x, b.y, c.z \
+             FROM (VALUES (1), (2)) a(x) LEFT JOIN (VALUES (2)) b(y) ON a.x = b.y, \
+                  (VALUES (7)) c(z) \
+             WHERE a.x = 1 ORDER BY a.x",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int4(1), Value::Null, Value::Int4(7)]]
         );
     }
 

@@ -4,6 +4,8 @@
 //! to hold the layer boundary where index selection, join ordering and
 //! cost-based choices land later (docs/ARCHITECTURE.md §2).
 
+mod pushdown;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -198,6 +200,10 @@ pub enum PhysicalJoinExpr {
     Input {
         input: PhysicalJoinInput,
         width: usize,
+        /// Single-relation conjuncts the planner sank to this leaf, applied
+        /// above the source before any join sees the row. Indexes the leaf's own
+        /// row, so a right child's conjuncts are rebased on the way down.
+        predicate: Option<BoundExpr>,
     },
     /// A binary join. When `hash_keys` is non-empty the executor runs a hash
     /// join keyed on them and `predicate` holds only the residual (non-equi)
@@ -218,6 +224,16 @@ impl PhysicalJoinExpr {
             PhysicalJoinExpr::Input { width, .. } => *width,
             PhysicalJoinExpr::Join { left, right, .. } => left.width() + right.width(),
         }
+    }
+
+    /// The executor and EXPLAIN must use the same physical-algorithm decision.
+    /// Keeping it here prevents the renderer from drifting away if the
+    /// selection rule grows beyond the presence of extracted hash keys.
+    pub fn uses_hash_join(&self) -> bool {
+        matches!(
+            self,
+            PhysicalJoinExpr::Join { hash_keys, .. } if !hash_keys.is_empty()
+        )
     }
 }
 
@@ -241,6 +257,7 @@ fn plan_join_expr(source: JoinExpr) -> PhysicalJoinExpr {
         JoinExpr::Input { input, width } => PhysicalJoinExpr::Input {
             input: plan_join_input(input),
             width,
+            predicate: None,
         },
         JoinExpr::Join {
             left,
@@ -250,15 +267,75 @@ fn plan_join_expr(source: JoinExpr) -> PhysicalJoinExpr {
         } => {
             let left_width = left.width();
             let (hash_keys, predicate) = extract_hash_keys(predicate, left_width);
+            debug_assert!(
+                kind != JoinKind::Cross || (predicate.is_none() && hash_keys.is_empty()),
+                "a cross join carries no condition; pushdown flips the kind to Inner \
+                 when it attaches one"
+            );
+            let mut left = Box::new(plan_join_expr(*left));
+            let mut right = Box::new(plan_join_expr(*right));
+            let predicate = sink_leaf_filters(predicate, &mut left, &mut right, kind, left_width);
             PhysicalJoinExpr::Join {
-                left: Box::new(plan_join_expr(*left)),
-                right: Box::new(plan_join_expr(*right)),
+                left,
+                right,
                 kind,
                 predicate,
                 hash_keys,
             }
         }
     }
+}
+
+/// Sink single-relation conjuncts of a join's residual into the leaf they
+/// restrict, so a scan is filtered before it is materialized into a hash table
+/// rather than after the join has already paired its rows.
+///
+/// Restricted to inner joins, and deliberately so. For an *outer* join the two
+/// predicate origins that meet in this residual pull in opposite directions: a
+/// conjunct that came from the query's `WHERE` may only sink into the preserved
+/// side, while one that came from the `ON` clause may only sink into the
+/// null-supplying side. Nothing here records which is which, and an inner join
+/// null-extends neither side, so the distinction cannot arise.
+fn sink_leaf_filters(
+    predicate: Option<BoundExpr>,
+    left: &mut PhysicalJoinExpr,
+    right: &mut PhysicalJoinExpr,
+    kind: JoinKind,
+    left_width: usize,
+) -> Option<BoundExpr> {
+    if !matches!(kind, JoinKind::Cross | JoinKind::Inner) {
+        return predicate;
+    }
+    let mut conjuncts = Vec::new();
+    flatten_and(predicate?, &mut conjuncts);
+
+    let mut kept = Vec::new();
+    for mut conjunct in conjuncts {
+        if !pushdown::is_relocatable(&conjunct) {
+            kept.push(conjunct);
+            continue;
+        }
+        // A deeper join node would already have taken this conjunct during
+        // pushdown, so the only home left below is a leaf.
+        let (target, base) = match ref_side(&conjunct, left_width) {
+            Some(Side::Left) => (&mut *left, 0),
+            Some(Side::Right) => (&mut *right, left_width),
+            None => {
+                kept.push(conjunct);
+                continue;
+            }
+        };
+        let PhysicalJoinExpr::Input {
+            predicate: leaf, ..
+        } = target
+        else {
+            kept.push(conjunct);
+            continue;
+        };
+        conjunct.shift_column_refs(-(base as isize));
+        *leaf = rebuild_and(leaf.take().into_iter().chain([conjunct]).collect());
+    }
+    rebuild_and(kept)
 }
 
 /// Split an ON predicate into hash-join keys plus a residual filter.
@@ -294,7 +371,7 @@ fn extract_hash_keys(
 }
 
 /// Recursively split a top-level `AND` tree into its conjuncts, preserving order.
-fn flatten_and(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
+pub(crate) fn flatten_and(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
     match expr {
         BoundExpr::Binary {
             op: BinOp::And,
@@ -310,7 +387,7 @@ fn flatten_and(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
 }
 
 /// Re-combine conjuncts with `AND`, yielding `None` for an empty list.
-fn rebuild_and(mut conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
+pub(crate) fn rebuild_and(mut conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
     let mut acc = conjuncts.pop()?;
     while let Some(next) = conjuncts.pop() {
         acc = BoundExpr::Binary {
@@ -493,20 +570,23 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             distinct,
         },
         LogicalPlan::Join {
-            source,
+            mut source,
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        } => PhysicalPlan::Join {
-            source: plan_join_expr(source),
-            columns,
-            projections,
-            predicate,
-            sort,
-            distinct,
-        },
+        } => {
+            let predicate = pushdown::push_where_into_joins(&mut source, predicate);
+            PhysicalPlan::Join {
+                source: plan_join_expr(source),
+                columns,
+                projections,
+                predicate,
+                sort,
+                distinct,
+            }
+        }
         LogicalPlan::Aggregate {
             input,
             predicate,
@@ -517,21 +597,30 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             projections,
             sort,
             distinct,
-        } => PhysicalPlan::Aggregate {
-            input: match input {
-                AggInput::Scan(table) => PhysicalAggInput::Scan(table),
-                AggInput::Join(source) => PhysicalAggInput::Join(plan_join_expr(source)),
-                AggInput::SingleRow => PhysicalAggInput::SingleRow,
-            },
-            predicate,
-            group_exprs,
-            aggregates,
-            having,
-            columns,
-            projections,
-            sort,
-            distinct,
-        },
+        } => {
+            // A grouped query keeps its `WHERE` here — the same join-row predicate
+            // an ungrouped one carries — so the extraction has to run on this path
+            // too, or every aggregating join (most of TPC-H) misses it.
+            let (input, predicate) = match input {
+                AggInput::Scan(table) => (PhysicalAggInput::Scan(table), predicate),
+                AggInput::Join(mut source) => {
+                    let predicate = pushdown::push_where_into_joins(&mut source, predicate);
+                    (PhysicalAggInput::Join(plan_join_expr(source)), predicate)
+                }
+                AggInput::SingleRow => (PhysicalAggInput::SingleRow, predicate),
+            };
+            PhysicalPlan::Aggregate {
+                input,
+                predicate,
+                group_exprs,
+                aggregates,
+                having,
+                columns,
+                projections,
+                sort,
+                distinct,
+            }
+        }
         LogicalPlan::Limit {
             source,
             limit,
@@ -787,9 +876,10 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             table, predicate, ..
         } => {
             let schema = table.schema();
+            let names = schema_names(schema);
             let mut lines = vec![format!("Seq Scan on {}", schema.name)];
             if let Some(predicate) = predicate {
-                lines.push(format!("  Filter: ({})", explain_expr(predicate, schema)));
+                lines.push(format!("  Filter: ({})", explain_expr(predicate, &names)));
             }
             lines
         }
@@ -801,17 +891,22 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             ..
         } => {
             let schema = table.schema();
+            let names = schema_names(schema);
             let mut lines = vec![format!("Index Scan using {index_name} on {}", schema.name)];
             let cond = key
                 .iter()
                 .map(|(column, value)| {
-                    format!("{} = {}", schema.columns[*column].name, explain_expr(value, schema))
+                    format!(
+                        "{} = {}",
+                        schema.columns[*column].name,
+                        explain_expr(value, &names)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(") AND (");
             lines.push(format!("  Index Cond: ({cond})"));
             if let Some(predicate) = predicate {
-                lines.push(format!("  Filter: ({})", explain_expr(predicate, schema)));
+                lines.push(format!("  Filter: ({})", explain_expr(predicate, &names)));
             }
             lines
         }
@@ -837,11 +932,7 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             // `UNION ALL`, and the cost of each step is visible.
             let mut lines = vec!["Append".to_string()];
             for arm in arms {
-                let mut child_lines = explain(&arm.plan).into_iter();
-                if let Some(first) = child_lines.next() {
-                    lines.push(format!("  ->  {first}"));
-                    lines.extend(child_lines.map(|l| format!("      {l}")));
-                }
+                push_child(&mut lines, explain(&arm.plan));
             }
             if distinct.is_some() {
                 lines = nest_under("HashAggregate", lines);
@@ -853,8 +944,19 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
         }
         PhysicalPlan::Subquery { source, .. } => explain(source),
         PhysicalPlan::TableFunction { .. } => vec!["Function Scan".to_string()],
-        PhysicalPlan::Join { .. } => vec!["Nested Loop".to_string()],
-        PhysicalPlan::Aggregate { .. } => vec!["Aggregate".to_string()],
+        PhysicalPlan::Join {
+            source, predicate, ..
+        } => explain_join(source, predicate.as_ref()),
+        PhysicalPlan::Aggregate {
+            input, predicate, ..
+        } => match input {
+            // Only the join input is rendered in detail: it is the shape whose
+            // access strategy is worth observing, and the one pushdown changes.
+            PhysicalAggInput::Join(source) => {
+                nest_under("Aggregate", explain_join(source, predicate.as_ref()))
+            }
+            _ => vec!["Aggregate".to_string()],
+        },
         PhysicalPlan::Limit { source, .. } => {
             let mut lines = vec!["Limit".to_string()];
             lines.extend(explain(source).into_iter().map(|l| format!("  {l}")));
@@ -892,43 +994,163 @@ fn ms(d: Duration) -> String {
     format!("{:.3}", d.as_secs_f64() * 1000.0)
 }
 
-/// Put `child` under a new parent node, indenting it beneath a `->` lead the way
-/// PG renders a single-child plan node.
-fn nest_under(parent: &str, child: Vec<String>) -> Vec<String> {
-    let mut lines = vec![parent.to_string()];
+/// Append a child plan under a `->` lead, indenting its continuation lines to
+/// line up beneath it.
+fn push_child(lines: &mut Vec<String>, child: Vec<String>) {
     let mut child = child.into_iter();
     if let Some(first) = child.next() {
         lines.push(format!("  ->  {first}"));
         lines.extend(child.map(|l| format!("      {l}")));
     }
+}
+
+/// Put `child` under a new parent node, indenting it beneath a `->` lead the way
+/// PG renders a single-child plan node.
+fn nest_under(parent: &str, child: Vec<String>) -> Vec<String> {
+    let mut lines = vec![parent.to_string()];
+    push_child(&mut lines, child);
     lines
+}
+
+/// Add a property to the root node of an already-rendered plan. Root properties
+/// belong before its first child; appending would make a filter executed above
+/// a multi-node subplan look like it belonged to the subplan's final leaf.
+fn push_root_property(lines: &mut Vec<String>, property: String) {
+    let child = lines
+        .iter()
+        .position(|line| line.starts_with("  ->  "))
+        .unwrap_or(lines.len());
+    lines.insert(child, format!("  {property}"));
 }
 
 /// Minimal expression rendering for `EXPLAIN` conditions: enough to show a
 /// constant key or a residual comparison, not a faithful SQL deparser. Column
 /// references render by name against `schema`.
-fn explain_expr(expr: &BoundExpr, schema: &TableSchema) -> String {
+fn explain_expr(expr: &BoundExpr, names: &[Option<&str>]) -> String {
     match expr {
         BoundExpr::Const { value, .. } => value
             .encode_text_with(1)
             .unwrap_or_else(|| "NULL".to_string()),
-        BoundExpr::ColumnRef { index, .. } => schema
-            .columns
+        BoundExpr::ColumnRef { index, .. } => names
             .get(*index)
-            .map_or_else(|| format!("${index}"), |c| c.name.clone()),
+            .copied()
+            .flatten()
+            .map_or_else(|| format!("${index}"), str::to_string),
         BoundExpr::Param { index, .. } => format!("${}", index + 1),
         BoundExpr::Coerce { expr, .. } | BoundExpr::Reinterpret { expr, .. } => {
-            explain_expr(expr, schema)
+            explain_expr(expr, names)
         }
         BoundExpr::Binary {
             op, left, right, ..
         } => format!(
             "{} {} {}",
-            explain_expr(left, schema),
+            explain_expr(left, names),
             op.sql_symbol(),
-            explain_expr(right, schema)
+            explain_expr(right, names)
         ),
         _ => "…".to_string(),
+    }
+}
+
+/// The column names of a single table's row, for [`explain_expr`].
+fn schema_names(schema: &TableSchema) -> Vec<Option<&str>> {
+    schema
+        .columns
+        .iter()
+        .map(|c| Some(c.name.as_str()))
+        .collect()
+}
+
+/// The column names of a join subtree's row, in layout order. A subplan or
+/// table-function leaf contributes `None` per column — its output columns have
+/// no schema name to show, so an expression over them renders as `$index`.
+fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<&str>> {
+    match join {
+        PhysicalJoinExpr::Input { input, width, .. } => match input {
+            PhysicalJoinInput::Scan(table) => schema_names(table.schema()),
+            _ => vec![None; *width],
+        },
+        PhysicalJoinExpr::Join { left, right, .. } => {
+            let mut names = join_column_names(left);
+            names.extend(join_column_names(right));
+            names
+        }
+    }
+}
+
+/// Render a join tree. `filter` is the plan-level `WHERE` residual that pushdown
+/// could not relocate; it belongs to the root node's row, so only the root call
+/// passes it.
+///
+/// A node's own predicate and hash keys index *its* subtree's row, so names are
+/// recomputed per node rather than threaded down.
+fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<String> {
+    let names = join_column_names(join);
+    let hashed = join.uses_hash_join();
+    match join {
+        PhysicalJoinExpr::Input {
+            input, predicate, ..
+        } => {
+            let mut lines = match input {
+                PhysicalJoinInput::Scan(table) => {
+                    vec![format!("Seq Scan on {}", table.schema().name)]
+                }
+                PhysicalJoinInput::TableFunction { .. } => vec!["Function Scan".to_string()],
+                PhysicalJoinInput::Subplan(source) => explain(source),
+            };
+            for predicate in predicate.iter().chain(filter) {
+                push_root_property(
+                    &mut lines,
+                    format!("Filter: ({})", explain_expr(predicate, &names)),
+                );
+            }
+            lines
+        }
+        PhysicalJoinExpr::Join {
+            left,
+            right,
+            predicate,
+            hash_keys,
+            ..
+        } => {
+            let mut lines = vec![if hashed { "Hash Join" } else { "Nested Loop" }.to_string()];
+            if hashed {
+                let cond = hash_keys
+                    .iter()
+                    .map(|k| {
+                        format!(
+                            "{} = {}",
+                            explain_expr(&k.left, &names),
+                            explain_expr(&k.right, &names)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(") AND (");
+                lines.push(format!("  Hash Cond: ({cond})"));
+            }
+            if let Some(predicate) = predicate {
+                lines.push(format!(
+                    "  Join Filter: ({})",
+                    explain_expr(predicate, &names)
+                ));
+            }
+            if let Some(filter) = filter {
+                lines.push(format!("  Filter: ({})", explain_expr(filter, &names)));
+            }
+            push_child(&mut lines, explain_join(left, None));
+            // The right input is the build side, so a hash join shows it under a
+            // Hash node the way PG does.
+            let right = explain_join(right, None);
+            push_child(
+                &mut lines,
+                if hashed {
+                    nest_under("Hash", right)
+                } else {
+                    right
+                },
+            );
+            lines
+        }
     }
 }
 
@@ -1341,6 +1563,414 @@ mod tests {
         assert_eq!(hash_keys[0].ty, PgType::Money);
     }
 
+    /// The root join node of a `PhysicalPlan::Join`, plus whatever predicate was
+    /// left behind above it.
+    fn join_root(plan: PhysicalPlan) -> (PhysicalJoinExpr, Option<BoundExpr>) {
+        let PhysicalPlan::Join {
+            source, predicate, ..
+        } = plan
+        else {
+            panic!("expected Join");
+        };
+        (source, predicate)
+    }
+
+    fn join_parts(source: PhysicalJoinExpr) -> (JoinKind, Option<BoundExpr>, Vec<HashKey>) {
+        let PhysicalJoinExpr::Join {
+            kind,
+            predicate,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected a Join node, not a leaf");
+        };
+        (kind, predicate, hash_keys)
+    }
+
+    #[test]
+    fn comma_join_where_equality_becomes_a_hash_join() {
+        // The headline property: a comma join whose WHERE carries the join
+        // condition must reach the same physical shape as the explicit ON form.
+        let (comma_source, comma_filter) =
+            join_root(plan_sql("SELECT * FROM t a, t b WHERE a.id = b.id"));
+        let (on_source, on_filter) =
+            join_root(plan_sql("SELECT * FROM t a JOIN t b ON a.id = b.id"));
+
+        let (comma_kind, comma_pred, comma_keys) = join_parts(comma_source);
+        let (on_kind, on_pred, on_keys) = join_parts(on_source);
+
+        assert_eq!(comma_kind, on_kind, "kind must match the explicit-ON form");
+        assert_eq!(
+            comma_kind,
+            JoinKind::Inner,
+            "Cross must flip once conditioned"
+        );
+        assert_eq!(comma_keys, on_keys, "hash keys must match");
+        assert_eq!(comma_keys.len(), 1);
+        assert_eq!(comma_pred, on_pred, "residual must match");
+        // The conjunct moved: nothing is left to re-check above the join.
+        assert!(comma_filter.is_none());
+        assert!(on_filter.is_none());
+    }
+
+    #[test]
+    fn aggregate_over_comma_join_pushes_its_where() {
+        // A grouped query keeps its WHERE on the Aggregate node, so extraction has
+        // to run on that path too — this is the shape most of TPC-H has.
+        let PhysicalPlan::Aggregate {
+            input: PhysicalAggInput::Join(source),
+            predicate,
+            ..
+        } = plan_sql("SELECT a.name, count(*) FROM t a, t b WHERE a.id = b.id GROUP BY a.name")
+        else {
+            panic!("expected Aggregate over Join");
+        };
+        let (kind, residual, hash_keys) = join_parts(source);
+        assert_eq!(kind, JoinKind::Inner);
+        assert_eq!(hash_keys.len(), 1);
+        assert!(residual.is_none());
+        assert!(predicate.is_none());
+    }
+
+    #[test]
+    fn three_way_comma_join_hashes_at_every_level() {
+        // The TPC-H Q3 shape. The binder builds Cross(Cross(a, b), c); `a.id = b.id`
+        // sinks to the inner node and `b.id = c.id` straddles the root, so both
+        // levels get a key and no reordering is needed.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a, t b, t c WHERE a.id = b.id AND b.id = c.id",
+        ));
+        let PhysicalJoinExpr::Join {
+            left,
+            kind,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert_eq!(kind, JoinKind::Inner);
+        assert_eq!(hash_keys.len(), 1, "root joins (a,b) to c");
+
+        let (inner_kind, inner_residual, inner_keys) = join_parts(*left);
+        assert_eq!(inner_kind, JoinKind::Inner);
+        assert_eq!(inner_keys.len(), 1, "inner node joins a to b");
+        assert!(inner_residual.is_none());
+        assert!(filter.is_none());
+    }
+
+    #[test]
+    fn bushy_right_subtree_predicate_is_rebased() {
+        // `t a, t b JOIN t c ON ...` is the one shape that nests a join under a
+        // right child, and a right child's predicate is base-0 relative to its own
+        // subtree while the WHERE is global. `b.big = c.big` is at global indices
+        // 4 and 7 and must land at local 1 and 4 — the subtree starts at 3.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a, t b JOIN t c ON b.id = c.id WHERE b.big = c.big",
+        ));
+        let PhysicalJoinExpr::Join {
+            right,
+            kind,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        // Nothing landed at the root: the conjunct belongs to the right subtree.
+        assert_eq!(kind, JoinKind::Cross);
+        assert!(hash_keys.is_empty());
+        assert!(filter.is_none());
+
+        let (sub_kind, sub_residual, sub_keys) = join_parts(*right);
+        assert_eq!(sub_kind, JoinKind::Inner);
+        assert!(sub_residual.is_none());
+        assert_eq!(sub_keys.len(), 2, "the ON key plus the pushed one");
+        let pushed = &sub_keys[1];
+        assert_eq!(
+            (&pushed.left, &pushed.right),
+            (
+                &BoundExpr::ColumnRef {
+                    index: 1,
+                    ty: PgType::Int8
+                },
+                &BoundExpr::ColumnRef {
+                    index: 4,
+                    ty: PgType::Int8
+                }
+            ),
+            "rebased into the subtree's own index space, not left global"
+        );
+    }
+
+    #[test]
+    fn anti_join_predicate_is_not_pushed_below_a_left_join() {
+        // The classic anti-join idiom. `b.big IS NULL` reads the null-supplying
+        // side, so it must stay above the join: moving it into the ON (or below it)
+        // would resurrect rows the WHERE drops.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a LEFT JOIN t b ON a.id = b.id WHERE b.big IS NULL",
+        ));
+        let (kind, residual, hash_keys) = join_parts(source);
+        assert_eq!(kind, JoinKind::Left);
+        assert_eq!(hash_keys.len(), 1, "the ON equality is still a key");
+        assert!(residual.is_none(), "nothing was attached to the ON");
+        assert!(
+            matches!(filter, Some(BoundExpr::IsNull { .. })),
+            "the IS NULL stays above the join"
+        );
+    }
+
+    #[test]
+    fn full_join_takes_no_pushed_predicate() {
+        // Both sides of a FULL join are null-supplying, so neither attaching nor
+        // descending is sound — even for a conjunct over just one side.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a FULL JOIN t b ON a.id = b.id WHERE a.big = 1",
+        ));
+        let (kind, residual, _) = join_parts(source);
+        assert_eq!(kind, JoinKind::Full);
+        assert!(residual.is_none());
+        assert!(filter.is_some());
+    }
+
+    #[test]
+    fn volatile_conjunct_is_not_pushed() {
+        // Relocating a volatile conjunct changes how many times it runs: sunk to a
+        // leaf it fires once per scanned row, where above the join it fired once
+        // per joined row. `nextval` would advance a different number of times.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a, t b WHERE a.id = b.id AND a.big > nextval('s')",
+        ));
+        let (kind, residual, hash_keys) = join_parts(source);
+        assert_eq!(kind, JoinKind::Inner);
+        assert_eq!(hash_keys.len(), 1, "the plain equality still pushes");
+        assert!(residual.is_none(), "nothing sank to the join or its leaves");
+        assert!(
+            matches!(filter, Some(BoundExpr::Binary { op: BinOp::Gt, .. })),
+            "the volatile comparison stays above the join"
+        );
+    }
+
+    #[test]
+    fn correlated_conjunct_is_not_pushed() {
+        // A correlated EXISTS reports no column bounds — its dependency on this row
+        // lives inside the subplan as an outer reference — so moving it to a
+        // narrower row would silently read a different column. It stays put.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a, t b WHERE a.id = b.id \
+             AND EXISTS (SELECT 1 FROM t c WHERE c.id = a.id)",
+        ));
+        let (kind, residual, hash_keys) = join_parts(source);
+        assert_eq!(kind, JoinKind::Inner);
+        assert_eq!(hash_keys.len(), 1, "the plain equality still pushes");
+        assert!(residual.is_none());
+        assert!(
+            matches!(filter, Some(BoundExpr::Exists { .. })),
+            "the correlated EXISTS stays above the join"
+        );
+    }
+
+    #[test]
+    fn correlated_on_conjunct_is_not_sunk_to_a_leaf() {
+        // Unlike the WHERE case above, this expression starts on the explicit
+        // join node and reaches leaf sinking only after its equality became a
+        // hash key. The scalar subplan still needs the full joined row when its
+        // OuterColumnRef is substituted, so the residual must remain here.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a JOIN t b ON a.id = b.id \
+             AND b.big = (SELECT max(c.big) FROM t c WHERE c.id = a.big)",
+        ));
+        let PhysicalJoinExpr::Join {
+            right,
+            predicate,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert_eq!(hash_keys.len(), 1);
+        assert!(
+            matches!(predicate, Some(BoundExpr::Binary { op: BinOp::Eq, .. })),
+            "the correlated ON residual stays on the join"
+        );
+        assert!(filter.is_none());
+        let PhysicalJoinExpr::Input {
+            predicate: right_leaf,
+            ..
+        } = *right
+        else {
+            panic!("expected a leaf on the right");
+        };
+        assert!(right_leaf.is_none());
+    }
+
+    #[test]
+    fn volatile_on_conjunct_is_not_sunk_to_a_leaf() {
+        // An explicit ON residual bypasses WHERE pushdown, but must receive the
+        // same volatility screen before leaf sinking. Otherwise nextval runs
+        // once per scanned right row instead of once per candidate join row.
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a JOIN t b \
+             ON a.id = b.id AND b.big > nextval('s')",
+        ));
+        let PhysicalJoinExpr::Join {
+            right,
+            predicate,
+            hash_keys,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert_eq!(hash_keys.len(), 1);
+        assert!(
+            matches!(predicate, Some(BoundExpr::Binary { op: BinOp::Gt, .. })),
+            "the volatile ON residual stays on the join"
+        );
+        assert!(filter.is_none());
+        let PhysicalJoinExpr::Input {
+            predicate: right_leaf,
+            ..
+        } = *right
+        else {
+            panic!("expected a leaf on the right");
+        };
+        assert!(right_leaf.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "shifted out of range")]
+    fn shifting_a_column_below_zero_panics_in_all_builds() {
+        let mut expr = BoundExpr::ColumnRef {
+            index: 0,
+            ty: PgType::Int4,
+        };
+        expr.shift_column_refs(-1);
+    }
+
+    #[test]
+    fn non_equi_comma_join_condition_lands_on_an_inner_node() {
+        // A non-equi condition yields no hash key, so it rides the nested loop as
+        // the node's predicate. The kind must flip to Inner: `Cross` is the
+        // planner's marker for "unconditional", and leaving it would misdescribe
+        // a node that now filters.
+        let (source, filter) = join_root(plan_sql("SELECT * FROM t a, t b WHERE a.big < b.big"));
+        let (kind, residual, hash_keys) = join_parts(source);
+        assert_eq!(kind, JoinKind::Inner);
+        assert!(hash_keys.is_empty());
+        assert!(matches!(
+            residual,
+            Some(BoundExpr::Binary { op: BinOp::Lt, .. })
+        ));
+        assert!(filter.is_none());
+    }
+
+    #[test]
+    fn single_relation_conjunct_sinks_to_its_leaf() {
+        // `a.big = 7` restricts one relation, so it is not a join key — it sinks
+        // all the way to a's scan, which is then filtered before the join pairs
+        // anything (and, on the build side, before the hash table is populated).
+        let (source, filter) = join_root(plan_sql(
+            "SELECT * FROM t a, t b WHERE a.id = b.id AND a.big = 7",
+        ));
+        let PhysicalJoinExpr::Join {
+            left,
+            right,
+            kind,
+            predicate,
+            hash_keys,
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert_eq!(kind, JoinKind::Inner);
+        assert_eq!(hash_keys.len(), 1);
+        assert!(predicate.is_none(), "nothing left on the join node");
+        assert!(filter.is_none(), "nothing left above the join");
+
+        let PhysicalJoinExpr::Input {
+            predicate: left_leaf,
+            ..
+        } = *left
+        else {
+            panic!("expected a leaf on the left");
+        };
+        assert!(matches!(
+            left_leaf,
+            Some(BoundExpr::Binary { op: BinOp::Eq, .. })
+        ));
+        let PhysicalJoinExpr::Input {
+            predicate: right_leaf,
+            ..
+        } = *right
+        else {
+            panic!("expected a leaf on the right");
+        };
+        assert!(right_leaf.is_none(), "b is unrestricted");
+    }
+
+    #[test]
+    fn right_leaf_filter_is_rebased_into_the_leaf_row() {
+        // `b.big = 7` is at index 4 of the join's combined row; b's own row starts
+        // at 3, so the sunk filter has to address index 1.
+        let (source, _) = join_root(plan_sql(
+            "SELECT * FROM t a, t b WHERE a.id = b.id AND b.big = 7",
+        ));
+        let PhysicalJoinExpr::Join { right, .. } = source else {
+            panic!("expected Join node");
+        };
+        let PhysicalJoinExpr::Input {
+            predicate: Some(BoundExpr::Binary { left, .. }),
+            ..
+        } = *right
+        else {
+            panic!("expected a filtered leaf on the right");
+        };
+        assert_eq!(
+            *left,
+            BoundExpr::ColumnRef {
+                index: 1,
+                ty: PgType::Int8
+            }
+        );
+    }
+
+    #[test]
+    fn outer_join_residual_is_not_sunk_to_a_leaf() {
+        // The residual of an outer join mixes conjuncts whose safe direction is
+        // opposite (a WHERE conjunct sinks into the preserved side, an ON conjunct
+        // into the null-supplying one) and nothing records which is which, so
+        // nothing sinks at all.
+        let (source, _) = join_root(plan_sql(
+            "SELECT * FROM t a LEFT JOIN t b ON a.id = b.id AND b.big > 5",
+        ));
+        let PhysicalJoinExpr::Join {
+            right,
+            kind,
+            predicate,
+            ..
+        } = source
+        else {
+            panic!("expected Join node");
+        };
+        assert_eq!(kind, JoinKind::Left);
+        assert!(
+            matches!(predicate, Some(BoundExpr::Binary { op: BinOp::Gt, .. })),
+            "the ON residual stays on the join node"
+        );
+        let PhysicalJoinExpr::Input {
+            predicate: right_leaf,
+            ..
+        } = *right
+        else {
+            panic!("expected a leaf on the right");
+        };
+        assert!(right_leaf.is_none());
+    }
+
     #[test]
     fn aggregate_query_maps_to_physical_aggregate() {
         let PhysicalPlan::Aggregate {
@@ -1494,6 +2124,95 @@ mod tests {
         let lines = explain(&seq_plan);
         assert_eq!(lines[0], "Seq Scan on t");
         assert_eq!(lines[1], "  Filter: (name = x)");
+    }
+
+    #[test]
+    fn explain_renders_a_comma_join_as_a_hash_join() {
+        // The whole point of the extraction is observable here: a comma join with
+        // its condition in the WHERE now reports a Hash Join with a Hash Cond, and
+        // the single-relation restriction shows as a Filter on the scan it sank to.
+        let lines = explain(&plan_sql(
+            "SELECT * FROM t a, t b WHERE a.id = b.id AND b.big = 7",
+        ));
+        assert_eq!(
+            lines,
+            vec![
+                "Hash Join",
+                "  Hash Cond: (id = id)",
+                "  ->  Seq Scan on t",
+                "  ->  Hash",
+                "        ->  Seq Scan on t",
+                "              Filter: (big = 7)",
+            ]
+        );
+    }
+
+    #[test]
+    fn explain_attaches_a_subplan_leaf_filter_to_the_subplan_root() {
+        let lines = explain(&plan_sql(
+            "SELECT * FROM t a \
+             JOIN (SELECT x.id, x.big FROM t x, t y WHERE x.id = y.id) b \
+               ON a.id = b.id AND b.big = 7",
+        ));
+        let filter = lines
+            .iter()
+            .position(|line| line.contains("Filter:"))
+            .unwrap_or_else(|| panic!("expected the sunk filter: {lines:?}"));
+        let subplan_child = lines
+            .iter()
+            .enumerate()
+            .skip(filter + 1)
+            .find(|(_, line)| line.contains("->  Seq Scan on t"))
+            .map(|(index, _)| index)
+            .expect("expected a child of the subplan root");
+        assert!(
+            filter < subplan_child,
+            "the filter must be a property of the subplan root, not its final leaf: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn explain_renders_a_non_equi_join_as_a_nested_loop() {
+        let lines = explain(&plan_sql("SELECT * FROM t a, t b WHERE a.big < b.big"));
+        assert_eq!(
+            lines,
+            vec![
+                "Nested Loop",
+                "  Join Filter: (big < big)",
+                "  ->  Seq Scan on t",
+                "  ->  Seq Scan on t",
+            ]
+        );
+    }
+
+    #[test]
+    fn explain_renders_an_unpushable_where_above_the_join() {
+        // The anti-join idiom: `b.big IS NULL` may not move, so it stays a Filter
+        // on the join node itself rather than becoming part of the ON.
+        let lines = explain(&plan_sql(
+            "SELECT * FROM t a LEFT JOIN t b ON a.id = b.id WHERE b.big IS NULL",
+        ));
+        assert_eq!(lines[0], "Hash Join");
+        assert_eq!(lines[1], "  Hash Cond: (id = id)");
+        assert_eq!(lines[2], "  Filter: (…)");
+    }
+
+    #[test]
+    fn explain_nests_a_join_under_an_aggregate() {
+        // Without this the plan shape is invisible for grouped queries — which is
+        // most of TPC-H.
+        let lines = explain(&plan_sql("SELECT count(*) FROM t a, t b WHERE a.id = b.id"));
+        assert_eq!(
+            lines,
+            vec![
+                "Aggregate",
+                "  ->  Hash Join",
+                "        Hash Cond: (id = id)",
+                "        ->  Seq Scan on t",
+                "        ->  Hash",
+                "              ->  Seq Scan on t",
+            ]
+        );
     }
 
     #[test]
