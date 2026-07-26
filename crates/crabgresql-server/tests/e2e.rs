@@ -6035,3 +6035,196 @@ async fn analyze_measures_relations_and_reports_its_limits() -> anyhow::Result<(
 
     Ok(())
 }
+
+/// `CREATE FUNCTION ... LANGUAGE plpgsql` and calling one from SQL: the whole
+/// path from CREATE through overload resolution, the interpreter, and back out
+/// as a value.
+#[tokio::test]
+async fn plpgsql_functions_run_from_sql() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .batch_execute(
+            "CREATE FUNCTION fib(n int) RETURNS bigint LANGUAGE plpgsql AS $$
+             DECLARE a bigint := 0; b bigint := 1; t bigint;
+             BEGIN
+               IF n < 1 THEN RETURN 0; END IF;
+               FOR i IN 2..n LOOP
+                 t := a + b; a := b; b := t;
+               END LOOP;
+               RETURN b;
+             END $$",
+        )
+        .await?;
+
+    let row = client.query_one("SELECT fib(10)", &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 55);
+
+    // Called per row of a real scan, and usable in a WHERE clause.
+    client
+        .batch_execute("CREATE TABLE t (n int); INSERT INTO t VALUES (1), (5), (10)")
+        .await?;
+    let rows = client
+        .query("SELECT n, fib(n) FROM t WHERE fib(n) > 3 ORDER BY n", &[])
+        .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>(0), 5);
+    assert_eq!(rows[0].get::<_, i64>(1), 5);
+    assert_eq!(rows[1].get::<_, i64>(1), 55);
+
+    Ok(())
+}
+
+/// A PL/pgSQL routine writes inside the caller's transaction, and later
+/// statements in the body see what earlier ones wrote.
+#[tokio::test]
+async fn a_plpgsql_function_can_write_and_read_back() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE log (msg text)").await?;
+    client
+        .batch_execute(
+            "CREATE FUNCTION note(m text) RETURNS bigint LANGUAGE plpgsql AS $$
+             DECLARE c bigint;
+             BEGIN
+               INSERT INTO log (msg) VALUES (m);
+               SELECT count(*) INTO c FROM log;
+               RETURN c;
+             END $$",
+        )
+        .await?;
+
+    assert_eq!(
+        client
+            .query_one("SELECT note('a')", &[])
+            .await?
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(
+        client
+            .query_one("SELECT note('b')", &[])
+            .await?
+            .get::<_, i64>(0),
+        2
+    );
+    // The writes are committed and visible to a plain query afterwards.
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM log", &[])
+            .await?
+            .get::<_, i64>(0),
+        2
+    );
+
+    Ok(())
+}
+
+/// `RAISE EXCEPTION` reaches the client with its SQLSTATE and a CONTEXT
+/// traceback naming the routine and the line.
+#[tokio::test]
+async fn plpgsql_raise_reaches_the_client_with_context() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION boom(n int) RETURNS int LANGUAGE plpgsql AS $$\n\
+             BEGIN\n\
+               RAISE EXCEPTION 'bad value %', n USING ERRCODE = '22023', HINT = 'try 1';\n\
+             END $$",
+        )
+        .await?;
+
+    let e = client.query_one("SELECT boom(7)", &[]).await.unwrap_err();
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code().code(), "22023");
+    assert_eq!(db.message(), "bad value 7");
+    assert_eq!(db.hint(), Some("try 1"));
+    assert_eq!(
+        db.where_(),
+        Some("PL/pgSQL function boom(integer) line 3 at RAISE")
+    );
+
+    Ok(())
+}
+
+/// A recursive routine terminates on its own, and an unbounded one reports
+/// PostgreSQL's stack-depth error rather than aborting the process.
+#[tokio::test]
+async fn plpgsql_recursion_works_and_is_bounded() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    // A body may call itself: nothing binds the body at CREATE time, so the
+    // routine is already registered by the time the call is resolved.
+    client
+        .batch_execute(
+            "CREATE FUNCTION fact(n int) RETURNS bigint LANGUAGE plpgsql AS $$
+             BEGIN
+               IF n <= 1 THEN RETURN 1; END IF;
+               RETURN n * fact(n - 1);
+             END $$",
+        )
+        .await?;
+    assert_eq!(
+        client
+            .query_one("SELECT fact(10)", &[])
+            .await?
+            .get::<_, i64>(0),
+        3_628_800
+    );
+
+    client
+        .batch_execute(
+            "CREATE FUNCTION forever(n int) RETURNS int LANGUAGE plpgsql AS $$
+             BEGIN RETURN forever(n + 1); END $$",
+        )
+        .await?;
+    let e = client
+        .query_one("SELECT forever(1)", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().expect("database error").code(),
+        &SqlState::from_code("54001")
+    );
+
+    Ok(())
+}
+
+/// A body that is not valid PL/pgSQL is rejected at CREATE time, as
+/// PostgreSQL's validator does — but only for syntax, so a body referring to a
+/// table that does not exist yet still creates.
+#[tokio::test]
+async fn plpgsql_bodies_are_syntax_checked_at_create_time() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    let e = client
+        .batch_execute(
+            "CREATE FUNCTION bad() RETURNS int LANGUAGE plpgsql AS $$ BEGIN x := 1; END $$",
+        )
+        .await
+        .unwrap_err();
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::SYNTAX_ERROR);
+    assert_eq!(db.message(), "\"x\" is not a known variable");
+
+    // Forward references are fine: the SQL inside a body is only bound at call
+    // time, so this creates and then works once the table exists.
+    client
+        .batch_execute(
+            "CREATE FUNCTION later() RETURNS bigint LANGUAGE plpgsql AS $$
+             DECLARE c bigint;
+             BEGIN SELECT count(*) INTO c FROM not_yet; RETURN c; END $$",
+        )
+        .await?;
+    client.batch_execute("CREATE TABLE not_yet (n int)").await?;
+    assert_eq!(
+        client
+            .query_one("SELECT later()", &[])
+            .await?
+            .get::<_, i64>(0),
+        0
+    );
+
+    Ok(())
+}

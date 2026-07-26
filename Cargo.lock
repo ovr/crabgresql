@@ -377,6 +377,7 @@ dependencies = [
  "crabgresql-pg-engine",
  "crabgresql-pg-wire",
  "crabgresql-planner",
+ "crabgresql-plpgsql",
  "crabgresql-storage-api",
  "crabgresql-txn",
  "crabgresql-types",

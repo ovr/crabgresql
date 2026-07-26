@@ -26,7 +26,7 @@ pub use plan::{
     bind_delete,
     bind_delete_with_params, bind_insert, bind_insert_with_params, bind_query,
     bind_query_with_params, bind_update, bind_update_with_params, output_columns_of,
-    plan_has_outer_refs, substitute_outer, substitute_params,
+    plan_calls_routine, plan_has_outer_refs, substitute_outer, substitute_params,
 };
 
 use crabgresql_parser::Span;

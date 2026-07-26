@@ -277,6 +277,27 @@ pub enum BoundExpr {
         ret: PgType,
         args: Vec<BoundExpr>,
     },
+    /// A call to a user-defined routine the binder cannot inline — a
+    /// `LANGUAGE plpgsql` body, which is an imperative program rather than an
+    /// expression. Unlike [`BoundExpr::FuncCall`] it carries no [`ScalarFn`] to
+    /// dispatch on, so it survives to execution as a marker and `eval` hands it
+    /// to the routine interpreter.
+    ///
+    /// Arguments are already coerced to the declared types and are evaluated
+    /// exactly once per call, so the inline path's volatile-argument hazard
+    /// (see `resolve_user_routine_call`) does not arise here.
+    Routine {
+        /// Catalog OID of the resolved overload — the runtime handle.
+        oid: u32,
+        /// Carried so an error raised before the interpreter is entered (the
+        /// routine was dropped mid-statement) can still name it.
+        name: Arc<str>,
+        arg_types: Arc<[PgType]>,
+        /// `STRICT`: any NULL argument yields NULL without entering the body.
+        strict: bool,
+        args: Vec<BoundExpr>,
+        ret: PgType,
+    },
     /// An array constructor (`ARRAY[a, b, c]` or `ARRAY[]::t[]`). Every element
     /// is already coerced to `elem`, the common element type; `ty` is the
     /// resulting `PgType::Array(elem.oid())`. Evaluates element-wise to a
@@ -486,7 +507,7 @@ impl BoundExpr {
             BoundExpr::IsNull { .. } => PgType::Bool,
             BoundExpr::Coerce { ty, .. } => *ty,
             BoundExpr::Reinterpret { reported, .. } => *reported,
-            BoundExpr::FuncCall { ret, .. } => *ret,
+            BoundExpr::FuncCall { ret, .. } | BoundExpr::Routine { ret, .. } => *ret,
             BoundExpr::ArrayCtor { ty, .. } => *ty,
             BoundExpr::Subscript { ty, .. } => *ty,
             BoundExpr::Case { ty, .. } => *ty,
@@ -514,7 +535,9 @@ impl BoundExpr {
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_srf(),
             BoundExpr::Binary { left, right, .. } => left.contains_srf() || right.contains_srf(),
-            BoundExpr::FuncCall { args, .. } => args.iter().any(BoundExpr::contains_srf),
+            BoundExpr::FuncCall { args, .. } | BoundExpr::Routine { args, .. } => {
+                args.iter().any(BoundExpr::contains_srf)
+            }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_srf),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_srf() || index.contains_srf()
@@ -543,6 +566,49 @@ impl BoundExpr {
         }
     }
 
+    /// Whether this expression tree calls a user-defined routine anywhere,
+    /// including inside a subquery marker — a correlated subplan is executed
+    /// per outer row, so a routine in one still runs under this statement.
+    pub fn contains_routine(&self) -> bool {
+        match self {
+            BoundExpr::Routine { .. } => true,
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.contains_routine(),
+            BoundExpr::Binary { left, right, .. } => {
+                left.contains_routine() || right.contains_routine()
+            }
+            BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+                args.iter().any(BoundExpr::contains_routine)
+            }
+            BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_routine),
+            BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_routine),
+            BoundExpr::Subscript { base, index, .. } => {
+                base.contains_routine() || index.contains_routine()
+            }
+            BoundExpr::Case { whens, else_, .. } => {
+                whens.iter().any(|(condition, result)| {
+                    condition.contains_routine() || result.contains_routine()
+                }) || else_.as_ref().is_some_and(|expr| expr.contains_routine())
+            }
+            BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
+                crate::plan::plan_calls_routine(&subplan.0)
+            }
+            BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
+                cmp.contains_routine() || crate::plan::plan_calls_routine(&subplan.0)
+            }
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.contains_routine() || cmp.contains_routine()
+            }
+            BoundExpr::Const { .. }
+            | BoundExpr::ColumnRef { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. } => false,
+        }
+    }
+
     /// Whether this node itself is an aggregate marker.
     pub fn is_aggregate(&self) -> bool {
         matches!(self, BoundExpr::Aggregate { .. })
@@ -564,9 +630,9 @@ impl BoundExpr {
             BoundExpr::Coerce { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Collate { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Reinterpret { expr, .. } => expr.contains_aggregate(),
-            BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
-                args.iter().any(BoundExpr::contains_aggregate)
-            }
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. } => args.iter().any(BoundExpr::contains_aggregate),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_aggregate),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_aggregate() || index.contains_aggregate()
@@ -579,9 +645,7 @@ impl BoundExpr {
             }
             // The needle (in `cmp`) is an outer expression, so an aggregate there
             // propagates; a subquery's own body is a separate query and doesn't.
-            BoundExpr::QuantifiedSubquery { cmp, .. } => {
-                cmp.contains_aggregate()
-            }
+            BoundExpr::QuantifiedSubquery { cmp, .. } => cmp.contains_aggregate(),
             BoundExpr::QuantifiedArray { array, cmp, .. } => {
                 array.contains_aggregate() || cmp.contains_aggregate()
             }
@@ -603,10 +667,11 @@ impl BoundExpr {
                     ScalarFn::Nextval | ScalarFn::Currval | ScalarFn::Setval | ScalarFn::Lastval
                 ) || args.iter().any(BoundExpr::contains_volatile_fn)
             }
+            // A routine's body is opaque here and PostgreSQL defaults a
+            // routine to VOLATILE, so treat every call as volatile.
+            BoundExpr::Routine { .. } => true,
             BoundExpr::Srf { args, .. } => args.iter().any(BoundExpr::contains_volatile_fn),
-            BoundExpr::ArrayCtor { elems, .. } => {
-                elems.iter().any(BoundExpr::contains_volatile_fn)
-            }
+            BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_volatile_fn),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_volatile_fn() || index.contains_volatile_fn()
             }
@@ -661,15 +726,15 @@ impl BoundExpr {
             BoundExpr::Binary { left, right, .. } => {
                 left.count_param_refs(index) + right.count_param_refs(index)
             }
-            BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
-                args.iter().map(|a| a.count_param_refs(index)).sum()
-            }
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. } => args.iter().map(|a| a.count_param_refs(index)).sum(),
             BoundExpr::ArrayCtor { elems, .. } => {
                 elems.iter().map(|a| a.count_param_refs(index)).sum()
             }
-            BoundExpr::Subscript { base, index: idx, .. } => {
-                base.count_param_refs(index) + idx.count_param_refs(index)
-            }
+            BoundExpr::Subscript {
+                base, index: idx, ..
+            } => base.count_param_refs(index) + idx.count_param_refs(index),
             BoundExpr::Case { whens, else_, .. } => {
                 whens
                     .iter()
@@ -721,7 +786,9 @@ impl BoundExpr {
                     fold(left, acc);
                     fold(right, acc);
                 }
-                BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+                BoundExpr::FuncCall { args, .. }
+                | BoundExpr::Routine { args, .. }
+                | BoundExpr::Srf { args, .. } => {
                     args.iter().for_each(|a| fold(a, acc));
                 }
                 BoundExpr::ArrayCtor { elems, .. } => elems.iter().for_each(|a| fold(a, acc)),
@@ -988,6 +1055,22 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             ret: *ret,
             args: args.iter().map(|a| outerize_columns(a, level)).collect(),
         },
+        BoundExpr::Routine {
+            oid,
+            name,
+            arg_types,
+            strict,
+            args,
+            ret,
+        } => BoundExpr::Routine {
+            oid: *oid,
+            name: Arc::clone(name),
+            arg_types: Arc::clone(arg_types),
+            strict: *strict,
+            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
+            ret: *ret,
+        },
+
         BoundExpr::ArrayCtor { elem, ty, elems } => BoundExpr::ArrayCtor {
             elem: *elem,
             ty: *ty,
@@ -6054,6 +6137,21 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             collation,
             left: Box::new(inline_params(*left, args)),
             right: Box::new(inline_params(*right, args)),
+        },
+        BoundExpr::Routine {
+            oid,
+            name,
+            arg_types,
+            strict,
+            args: call_args,
+            ret,
+        } => BoundExpr::Routine {
+            oid,
+            name,
+            arg_types,
+            strict,
+            args: call_args.into_iter().map(|a| inline_params(a, args)).collect(),
+            ret,
         },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
             expr: Box::new(inline_params(*expr, args)),

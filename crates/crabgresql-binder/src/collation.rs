@@ -98,6 +98,9 @@ pub fn expr_collation(expr: &BoundExpr) -> Derived {
         }
         // A result takes the common collation of its collatable inputs.
         BoundExpr::FuncCall { args, .. } => combine_all(args),
+        // A routine's result carries its declared type's default collation, not
+        // its arguments' — the body is opaque, so nothing is derived through it.
+        BoundExpr::Routine { .. } => Derived::NONE,
         BoundExpr::Binary { left, right, .. } => {
             expr_collation(left).max_with(expr_collation(right))
         }

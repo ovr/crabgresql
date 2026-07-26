@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use crabgresql_binder::{
@@ -16,7 +17,8 @@ use crabgresql_binder::{
     substitute_params,
 };
 use crabgresql_executor::{
-    CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, OutputColumn, execute,
+    CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, MaterializedRows, OutputColumn,
+    RoutineOps, execute,
 };
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{ErrorFields, TransactionStatus, sqlstate};
@@ -36,6 +38,7 @@ use crate::global_catalog::{
     ArgMode, CatalogNotice, FuncBody, FuncDropSpec, GlobalCatalog, RoutineArg, RoutineDefinition,
     RoutineKind, TypeRef, Volatility,
 };
+use crate::routines::RoutineDispatch;
 use crate::session::{ActiveTxn, Session};
 
 /// Severity of a non-error message sent before a command's CommandComplete.
@@ -127,6 +130,14 @@ pub enum QueryResult {
         /// uses `SELECT n`, EXPLAIN the bare `EXPLAIN`, and a `RETURNING` DML keeps
         /// its mutation tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`).
         tag: RowTag,
+        /// Diagnostics raised while producing the rows — a `RAISE NOTICE` from
+        /// a routine body. Emitted before the RowDescription.
+        ///
+        /// They can be collected up front because a plan that calls a routine
+        /// is materialized before this is built (see `materialize`); a truly
+        /// streamed result set would need them interleaved with the rows, which
+        /// is what the session-owned buffer they come from is shaped for.
+        notices: Vec<Notice>,
     },
     Command {
         tag: String,
@@ -626,6 +637,7 @@ pub fn execute_statement(
                     &catalog,
                     &type_catalog,
                     &catalog_ops,
+                    global_catalog,
                     txnmgr,
                     create,
                     session,
@@ -785,16 +797,26 @@ pub fn execute_statement(
     // none. Decide from the bound plan, not the surface AST: the binder already
     // resolved the statement to an Insert/Update/Delete node, so a new writing
     // statement kind can't accidentally run XID-less and produce invisible rows.
+    // A routine body may write, and nothing here can tell before running it, so
+    // a statement that calls one is treated as a write: it needs an XID to stamp
+    // the body's versions with. Conservative — a pure routine burns an XID — and
+    // observably harmless, since PostgreSQL defaults routines to VOLATILE anyway.
+    let calls_routine = crabgresql_binder::plan_calls_routine(&logical);
     // A plain `EXPLAIN <write>` never executes, so it is not a write: PG accepts
     // `BEGIN READ ONLY; EXPLAIN DELETE FROM t` and raises 25006 only once ANALYZE
-    // makes the statement run for real.
-    let is_write = matches!(
-        logical,
-        LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
-    ) && explain.is_none_or(|opts| opts.analyze);
+    // makes the statement run for real. That covers a routine call too — plain
+    // `EXPLAIN SELECT f()` plans without ever entering the body.
+    let is_write = (calls_routine
+        || matches!(
+            logical,
+            LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
+        ))
+        && explain.is_none_or(|opts| opts.analyze);
     // A write in a READ ONLY transaction (or under the read-only session default)
     // is rejected before it stamps any version, matching PG's 25006.
-    if is_write && read_only_active(session) {
+    // A routine call is only *treated* as a write; whether it actually writes is
+    // decided inside the body, which does its own read-only check.
+    if is_write && !calls_routine && read_only_active(session) {
         let verb = match logical {
             LogicalPlan::Insert { .. } => "INSERT",
             LogicalPlan::Update { .. } => "UPDATE",
@@ -816,6 +838,11 @@ pub fn execute_statement(
     // Rendered here, while the plan is still borrowable — `execute` consumes it.
     let explaining = explain.map(|opts| (opts, crabgresql_planner::explain(&plan)));
     let read_only = read_only_active(session);
+    // The routine handle and command counter a called routine's body runs under.
+    // Built before the EXPLAIN branch, not after: `EXPLAIN ANALYZE SELECT f()`
+    // really does enter the body, so it needs the same runtime a bare call gets.
+    let (routines, command_counter) =
+        statement_runtime(&catalog, &type_catalog, global_catalog, session);
     // Every statement that reads takes a snapshot, EXPLAIN included: PG pins the
     // transaction snapshot for it, so inside a REPEATABLE READ block a plain
     // EXPLAIN freezes the view the rest of the block sees. That is why this runs
@@ -829,19 +856,38 @@ pub fn execute_statement(
         let execution = match opts.analyze {
             false => None,
             true => {
-                let exec_ctx =
-                    session.exec_context_for_statement(engine, &catalog_ops, read_only);
+                let exec_ctx = session.exec_context_for_statement(
+                    engine,
+                    &catalog_ops,
+                    Arc::clone(&routines),
+                    Arc::clone(&command_counter),
+                    read_only,
+                );
                 match run_analyze(plan, &exec_ctx, &txn) {
                     Ok(execution) => Some(execution),
                     Err(e) => {
                         // Abort path: infallible, so the result is safe to drop.
-                        let _ = finalize_statement(txnmgr, session, &txn, is_write, false);
+                        let _ = finalize_statement(
+                            txnmgr,
+                            session,
+                            &txn,
+                            is_write,
+                            false,
+                            Some(&command_counter),
+                        );
                         return Err(e.into());
                     }
                 }
             }
         };
-        finalize_statement(txnmgr, session, &txn, is_write, true)?;
+        finalize_statement(
+            txnmgr,
+            session,
+            &txn,
+            is_write,
+            true,
+            Some(&command_counter),
+        )?;
         if opts.summary {
             lines.extend(crabgresql_planner::explain_summary(planning, execution));
         }
@@ -855,21 +901,59 @@ pub fn execute_statement(
     // `SELECT nextval(...)` be rejected (25006) even though it is not a DML write.
     // The catalog handle is the same snapshot this statement bound against, so
     // `pg_table_is_visible(c.oid)` agrees with the `pg_class` rows it filters.
-    let exec_ctx = session.exec_context_for_statement(engine, &catalog_ops, read_only);
+    let exec_ctx = session.exec_context_for_statement(
+        engine,
+        &catalog_ops,
+        routines,
+        Arc::clone(&command_counter),
+        read_only,
+    );
     let exec = match execute(plan, &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
             // Abort path: infallible, so the result is safe to drop.
-            let _ = finalize_statement(txnmgr, session, &txn, is_write, false);
+            let _ = finalize_statement(
+                txnmgr,
+                session,
+                &txn,
+                is_write,
+                false,
+                Some(&command_counter),
+            );
             return Err(e.into());
         }
     };
-    finalize_statement(txnmgr, session, &txn, is_write, true)?;
+    // `finalize_statement` closes the statement's transaction, and a streamed
+    // result set is pulled *after* it returns — so a routine called per row
+    // would run its body after its own transaction had already committed or
+    // aborted. Drain the rows here instead when a routine is in the plan.
+    //
+    // A deliberate, temporary deviation: PostgreSQL streams and holds the
+    // transaction open until the portal closes. Undoing it needs per-portal
+    // transaction lifetimes; until then the cost is the result set's memory,
+    // paid only by statements that call a routine.
+    let exec = if calls_routine {
+        materialize(exec)?
+    } else {
+        exec
+    };
+    finalize_statement(
+        txnmgr,
+        session,
+        &txn,
+        is_write,
+        true,
+        Some(&command_counter),
+    )?;
+    // Anything a routine body raised is buffered on the session; hand it to the
+    // caller alongside the result so it goes out ahead of the rows.
+    let notices = session.notices.drain();
     let result = match exec {
         Execution::Rows { columns, node } => QueryResult::Rows {
             columns,
             node,
             tag: RowTag::Select,
+            notices,
         },
         Execution::ReturningRows {
             columns,
@@ -879,12 +963,73 @@ pub fn execute_statement(
             columns,
             node,
             tag: verb.into(),
+            notices,
         },
-        Execution::Inserted(n) => QueryResult::command(format!("INSERT 0 {n}")),
-        Execution::Updated(n) => QueryResult::command(format!("UPDATE {n}")),
-        Execution::Deleted(n) => QueryResult::command(format!("DELETE {n}")),
+        Execution::Inserted(n) => command_with(format!("INSERT 0 {n}"), notices),
+        Execution::Updated(n) => command_with(format!("UPDATE {n}"), notices),
+        Execution::Deleted(n) => command_with(format!("DELETE {n}"), notices),
     };
     Ok(result)
+}
+
+/// The routine dispatcher and command counter one statement executes with.
+///
+/// Both are per statement. The dispatcher binds a routine body against the same
+/// temp-first overlay and `pg_catalog` snapshot the caller bound against, so a
+/// body resolves names exactly as its caller did. The counter is seeded from the
+/// open block's command id and read back by [`finalize_statement`], so command
+/// ids advanced *inside* a routine body are not lost — without that, the next
+/// top-level statement would reuse an id the body already stamped rows with and
+/// could not see them.
+fn statement_runtime(
+    catalog: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    global_catalog: &Arc<GlobalCatalog>,
+    session: &Session,
+) -> (Arc<dyn RoutineOps>, Arc<AtomicU32>) {
+    let routines: Arc<dyn RoutineOps> = Arc::new(RoutineDispatch::new(
+        Arc::clone(catalog),
+        Arc::clone(type_catalog),
+        Arc::clone(global_catalog),
+        Arc::clone(&session.routine_cache),
+    ));
+    let start = session
+        .xact
+        .as_ref()
+        .map_or(CommandId::FIRST.0, |active| active.cid.0);
+    (routines, Arc::new(AtomicU32::new(start)))
+}
+
+/// A command-tag result carrying diagnostics raised while it ran.
+fn command_with(tag: String, notices: Vec<Notice>) -> QueryResult {
+    QueryResult::Command { tag, notices }
+}
+
+/// Pull a result set into memory, so nothing is left to run after the
+/// statement's transaction closes. Mutation counts pass through untouched.
+fn materialize(exec: Execution) -> Result<Execution, PgError> {
+    let (columns, mut node, verb) = match exec {
+        Execution::Rows { columns, node } => (columns, node, None),
+        Execution::ReturningRows {
+            columns,
+            node,
+            verb,
+        } => (columns, node, Some(verb)),
+        done => return Ok(done),
+    };
+    let mut rows = Vec::new();
+    while let Some(row) = node.next()? {
+        rows.push(row);
+    }
+    let node: Box<dyn ExecNode> = Box::new(MaterializedRows::new(rows));
+    Ok(match verb {
+        Some(verb) => Execution::ReturningRows {
+            columns,
+            node,
+            verb,
+        },
+        None => Execution::Rows { columns, node },
+    })
 }
 
 /// Build the [`TxnContext`] a statement executes under. Under autocommit each
@@ -938,6 +1083,7 @@ fn finalize_statement(
     txn: &TxnContext,
     is_write: bool,
     ok: bool,
+    command_counter: Option<&Arc<AtomicU32>>,
 ) -> Result<(), PgError> {
     match &mut session.xact {
         None => {
@@ -956,7 +1102,13 @@ fn finalize_statement(
             }
         }
         Some(active) => {
-            active.cid = CommandId(active.cid.0 + 1);
+            // Read the counter back rather than adding one: a routine body may
+            // have advanced it several times, and reusing an id it already
+            // stamped rows with would hide those rows from the next statement.
+            let used = command_counter.map_or(active.cid.0, |c| {
+                c.load(std::sync::atomic::Ordering::Acquire)
+            });
+            active.cid = CommandId(used.max(active.cid.0) + 1);
         }
     }
     Ok(())
@@ -971,6 +1123,10 @@ pub struct PreparedCopy {
     pub plan: CopyFromPlan,
     catalog: Arc<dyn TypeCatalog>,
     catalog_ops: Arc<dyn CatalogOps>,
+    /// The temp-first engine overlay this COPY bound against, kept so a column
+    /// default that calls a routine resolves names the same way the COPY did.
+    engine: Arc<dyn TableEngine>,
+    global: Arc<GlobalCatalog>,
 }
 
 /// Resolve `COPY <table> [(cols)] FROM STDIN` up to the point the connection
@@ -1031,6 +1187,8 @@ pub fn prepare_copy_from(
         plan,
         catalog: type_catalog,
         catalog_ops,
+        engine: catalog,
+        global: Arc::clone(global_catalog),
     })
 }
 
@@ -1053,15 +1211,27 @@ pub fn run_copy_insert(
     // and the catalog snapshot bound at prepare time for the same reason.
     let read_only = read_only_active(session);
     let txn = build_txn(txnmgr, session, true);
-    let exec_ctx = session.exec_context_for_statement(engine, &prepared.catalog_ops, read_only);
+    let (routines, command_counter) = statement_runtime(
+        &prepared.engine,
+        &prepared.catalog,
+        &prepared.global,
+        session,
+    );
+    let exec_ctx = session.exec_context_for_statement(
+        engine,
+        &prepared.catalog_ops,
+        routines,
+        command_counter,
+        read_only,
+    );
     let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
-            let _ = finalize_statement(txnmgr, session, &txn, true, false);
+            let _ = finalize_statement(txnmgr, session, &txn, true, false, None);
             return Err(e.into());
         }
     };
-    finalize_statement(txnmgr, session, &txn, true, true)?;
+    finalize_statement(txnmgr, session, &txn, true, true, None)?;
     match exec {
         Execution::Inserted(n) => Ok(n),
         _ => Err(PgError::new(
@@ -1385,7 +1555,7 @@ fn execute_truncate(
     for (_, table) in &named {
         table.truncate(&txn);
     }
-    finalize_statement(txnmgr, session, &txn, true, true)?;
+    finalize_statement(txnmgr, session, &txn, true, true, None)?;
     Ok(QueryResult::command("TRUNCATE TABLE"))
 }
 
@@ -1451,12 +1621,12 @@ fn execute_analyze(
             // resolved above, so it cannot land here.
             Err(StorageError::TableNotFound(_)) if analyze.table_name.is_none() => {}
             Err(error) => {
-                finalize_statement(txnmgr, session, &txn, false, false)?;
+                finalize_statement(txnmgr, session, &txn, false, false, None)?;
                 return Err(error.into());
             }
         }
     }
-    finalize_statement(txnmgr, session, &txn, false, true)?;
+    finalize_statement(txnmgr, session, &txn, false, true, None)?;
     Ok(QueryResult::command("ANALYZE"))
 }
 
@@ -2646,11 +2816,13 @@ fn execute_create_partition(
 /// shape from the query (à la `CREATE VIEW`), create it, then stream the query's
 /// rows into it (à la `INSERT ... SELECT`). The completion tag is `SELECT <n>`,
 /// matching PG's CTAS / `SELECT INTO`.
+#[allow(clippy::too_many_arguments)]
 fn execute_create_table_as(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
     catalog_ops: &Arc<dyn CatalogOps>,
+    global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
     create: &ast::CreateTable,
     session: &mut Session,
@@ -2805,16 +2977,24 @@ fn execute_create_table_as(
     // a populate failure we best-effort drop the half-created table.
     let read_only = read_only_active(session);
     let txn = build_txn(txnmgr, session, true);
-    let exec_ctx = session.exec_context_for_statement(engine, catalog_ops, read_only);
+    let (routines, command_counter) =
+        statement_runtime(catalog, type_catalog, global_catalog, session);
+    let exec_ctx = session.exec_context_for_statement(
+        engine,
+        catalog_ops,
+        routines,
+        command_counter,
+        read_only,
+    );
     let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
-            let _ = finalize_statement(txnmgr, session, &txn, true, false);
+            let _ = finalize_statement(txnmgr, session, &txn, true, false, None);
             let _ = target.drop_table(&namespace, &name);
             return Err(e.into());
         }
     };
-    finalize_statement(txnmgr, session, &txn, true, true)?;
+    finalize_statement(txnmgr, session, &txn, true, true, None)?;
     let n = match exec {
         Execution::Inserted(n) => n,
         // The populate plan is a RETURNING-less INSERT, so execution yields an
@@ -3270,6 +3450,20 @@ fn sql_function_body_text(create: &ast::CreateFunction) -> Result<String, PgErro
     }
 }
 
+/// The body of a `LANGUAGE plpgsql` routine, verbatim. Unlike a SQL body it is
+/// never normalized: a `CONTEXT:` line reports a line number relative to the
+/// text as written, and PostgreSQL counts the remainder of the `$$` line as
+/// line 1 — so not even leading whitespace may be trimmed.
+fn routine_body_text(create: &ast::CreateFunction) -> Result<String, PgError> {
+    match &create.function_body {
+        Some(ast::CreateFunctionBody::AsBeforeOptions { body, .. })
+        | Some(ast::CreateFunctionBody::AsAfterOptions(body)) => string_literal(body),
+        _ => Err(PgError::feature_not_supported(
+            "CREATE FUNCTION LANGUAGE plpgsql requires AS '<body>'",
+        )),
+    }
+}
+
 /// The query-time [`PgType`] a resolved [`TypeRef`] denotes, for handing a SQL
 /// function's declared argument/return types to the binder. A `cstring` or shell
 /// user type — neither usable in a SQL function's signature — is refused.
@@ -3360,9 +3554,30 @@ fn execute_create_function(
             .map_err(PgError::from)?;
             FuncBody::Sql(body_sql)
         }
+        Some("plpgsql") => {
+            let body_sql = routine_body_text(create)?;
+            // Only the syntax is checked, never the SQL inside the body. That is
+            // what PostgreSQL's PL/pgSQL validator does, and it is not a
+            // shortcut: `create_function` registers the routine *after*
+            // validating, so binding the body here would make every recursive
+            // routine fail to create with 42883.
+            let arg_names: Vec<Option<String>> = args
+                .iter()
+                .filter(|a| a.mode.is_input())
+                .map(|a| a.name.clone())
+                .collect();
+            crabgresql_plpgsql::compile(&body_sql, &arg_names).map_err(|e| {
+                PgError::new(e.code, e.message).with_detail(format!(
+                    "compilation of PL/pgSQL function near line {}",
+                    e.line
+                ))
+            })?;
+            FuncBody::PlPgSql(body_sql)
+        }
         _ => {
             return Err(PgError::feature_not_supported(
-                "CREATE FUNCTION is only supported for LANGUAGE internal and LANGUAGE SQL",
+                "CREATE FUNCTION is only supported for LANGUAGE internal, LANGUAGE SQL and \
+                 LANGUAGE plpgsql",
             ));
         }
     };

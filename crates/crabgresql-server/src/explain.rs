@@ -302,6 +302,7 @@ pub fn explain_result(lines: Vec<String>, session: &Session) -> QueryResult {
         columns: explain_columns(),
         node,
         tag: RowTag::Explain,
+        notices: Vec::new(),
     }
 }
 

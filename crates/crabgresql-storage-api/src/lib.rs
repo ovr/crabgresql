@@ -793,16 +793,46 @@ pub struct EnumInfo {
     pub labels: Vec<String>,
 }
 
-/// A registered `CREATE FUNCTION ... LANGUAGE SQL`, as the binder needs it to
-/// resolve and inline a call: the declared argument types, the declared return
-/// type, and the body as SQL **text** (a `SELECT <expr>` the binder re-parses on
-/// each call, keeping this crate free of a parser/binder dependency, exactly as
-/// [`ViewDefinition`] carries a view's query text).
+/// How a registered routine is implemented, from the binder's point of view.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SqlFunctionSig {
+pub enum RoutineImpl {
+    /// A `LANGUAGE SQL` body as SQL **text** — a `SELECT <expr>` the binder
+    /// re-parses and inlines into the calling expression, keeping this crate
+    /// free of a parser/binder dependency exactly as [`ViewDefinition`] carries
+    /// a view's query text.
+    Sql(String),
+    /// A `LANGUAGE plpgsql` body, which is an imperative program and cannot be
+    /// inlined. The binder emits a call the executor dispatches at run time,
+    /// identified by [`RoutineSig::oid`].
+    PlPgSql,
+}
+
+/// Whether a routine was created by `CREATE FUNCTION` or `CREATE PROCEDURE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutineKind {
+    Function,
+    Procedure,
+}
+
+/// A registered routine, as the binder needs it to resolve a call.
+///
+/// Functions and procedures share one signature — PostgreSQL resolves overloads
+/// across all of `pg_proc` regardless of language or kind, so `f(int)` in SQL
+/// and `f(text)` in PL/pgSQL compete in one pool and an equally good match
+/// between them is ambiguous. Splitting them into two lookups would give the
+/// wrong preference and the wrong ambiguity behavior.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutineSig {
+    /// Catalog OID — the handle a runtime call carries.
+    pub oid: u32,
+    pub name: String,
     pub arg_types: Vec<PgType>,
+    /// `void` for a procedure, which declares no return type.
     pub return_type: PgType,
-    pub body: String,
+    pub kind: RoutineKind,
+    /// `STRICT`: a NULL argument yields NULL without entering the body.
+    pub strict: bool,
+    pub imp: RoutineImpl,
 }
 
 /// A registered `CREATE CAST (source AS target)`.
@@ -849,11 +879,12 @@ pub trait TypeCatalog: Send + Sync {
         None
     }
 
-    /// Every `LANGUAGE SQL` function registered under `name` (case-insensitive),
-    /// one [`SqlFunctionSig`] per overload. The binder consults this when no
-    /// built-in matches a call, then re-parses and inlines the chosen body.
-    /// Callers with no user functions (binder unit tests) get the empty default.
-    fn sql_functions(&self, _name: &str) -> Vec<SqlFunctionSig> {
+    /// Every user-defined routine registered under `name` (case-insensitive),
+    /// functions *and* procedures, one [`RoutineSig`] per overload. The binder
+    /// consults this when no built-in matches a call, then either inlines a SQL
+    /// body or emits a runtime call. Callers with no user routines (binder unit
+    /// tests) get the empty default.
+    fn routines(&self, _name: &str) -> Vec<RoutineSig> {
         Vec::new()
     }
 }

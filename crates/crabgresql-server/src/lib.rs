@@ -9,6 +9,7 @@ mod error;
 mod explain;
 mod global_catalog;
 mod query;
+mod routines;
 mod session;
 
 use std::path::Path;

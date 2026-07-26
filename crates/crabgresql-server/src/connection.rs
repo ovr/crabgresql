@@ -514,7 +514,12 @@ async fn write_result(
             columns,
             mut node,
             tag,
+            notices,
         } => {
+            // Diagnostics raised while producing the rows go out first, as PG
+            // does — it emits them at the point they are raised, which for a
+            // materialized result set is before the first row is sent.
+            emit_notices(writer, &notices, Some(sql));
             let fields: Vec<FieldDescription> = columns
                 .iter()
                 .map(|c| FieldDescription::new(c.name.clone(), c.ty.oid(), c.ty.typlen()))
@@ -924,7 +929,9 @@ fn stream_execute(
             columns: _,
             mut node,
             tag,
+            notices,
         } => {
+            emit_notices(writer, &notices, None);
             let limit = (max_rows > 0).then_some(max_rows as usize);
             let mut count = 0usize;
             loop {

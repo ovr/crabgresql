@@ -92,11 +92,20 @@ impl RoutineCache {
     }
 }
 
-/// PostgreSQL's `max_stack_depth` analogue for routine calls. The Rust stack is
-/// the real limit — each level costs a `call` frame plus an `execute`/`eval`
-/// recursion — so this is set well below the point where a deep body could
-/// overflow it, and reports PostgreSQL's error rather than aborting.
-const MAX_CALL_DEPTH: u32 = 200;
+/// How deep routine calls may nest.
+///
+/// PostgreSQL's `max_stack_depth` is a *byte* budget, checked by probing the
+/// actual stack pointer; there is no equivalent here, so this is a frame count
+/// chosen to stay well inside the smallest stack we can rely on. A level costs
+/// an interpreter frame plus a whole bind/plan/execute/eval recursion, which
+/// measured at roughly 40 KB in a debug build — a 2 MB thread stack overflows
+/// somewhere between 40 and 50 levels. This is set at half that, because the
+/// failure mode it guards against is a process abort, not an error.
+///
+/// That makes it far shallower than PostgreSQL's effective depth. Raising it
+/// means either giving the runtime's worker threads a bigger stack or probing
+/// the stack pointer the way PostgreSQL does.
+const MAX_CALL_DEPTH: u32 = 24;
 
 /// A PL/pgSQL interpreter bound to one statement's catalog snapshot.
 ///

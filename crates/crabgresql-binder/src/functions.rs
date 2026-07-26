@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{SqlFunctionSig, TypeCatalog};
+use crabgresql_storage_api::{RoutineImpl, RoutineKind, RoutineSig, TypeCatalog};
 use crabgresql_types::{PgType, RegKind};
 
 use crate::expr::{
@@ -2128,7 +2128,7 @@ pub(crate) fn resolve_call(
     if sigs.is_empty() {
         // No built-in of this name: a user-defined `LANGUAGE SQL` function may
         // still match. Only when that also fails is the call undefined.
-        return resolve_sql_function_call(name, bindings, catalog);
+        return resolve_user_routine_call(name, bindings, catalog);
     }
     // First try an all-exact-type match. Then, among the signatures whose args
     // all coerce, pick the one keeping the most arguments at their exact type —
@@ -2162,7 +2162,7 @@ pub(crate) fn resolve_call(
         Some((_, sig, args)) => finish_func_call(sig.func, sig.ret, args),
         // No built-in overload fit the argument types; a user `LANGUAGE SQL`
         // function of the same name but different signature may still match.
-        None => resolve_sql_function_call(name, bindings, catalog),
+        None => resolve_user_routine_call(name, bindings, catalog),
     }
 }
 
@@ -2205,23 +2205,53 @@ impl Drop for InlineGuard {
     }
 }
 
-/// Resolve a call that matched no built-in against the user-defined
-/// `LANGUAGE SQL` functions of that name, then expand the chosen body inline —
-/// its `$n` leaves replaced by the (coerced) call arguments. Returns PG's
-/// `42883` "function name(types) does not exist" when nothing matches, or `42725`
-/// "function name(types) is not unique" when two overloads coerce equally well.
-fn resolve_sql_function_call(
+/// Resolve a call that matched no built-in against the user-defined routines of
+/// that name.
+///
+/// A `LANGUAGE SQL` body is expanded inline, its `$n` leaves replaced by the
+/// (coerced) call arguments; anything else becomes a [`BoundExpr::Routine`] the
+/// executor dispatches at run time. Returns PG's `42883` "function name(types)
+/// does not exist" when nothing matches, or `42725` "function name(types) is not
+/// unique" when two overloads coerce equally well.
+fn resolve_user_routine_call(
     name: &str,
     bindings: Vec<Binding>,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<Binding, BindError> {
-    let sigs = catalog.sql_functions(name);
-    let Some((sig, args)) = choose_sql_overload(name, &bindings, &sigs)? else {
+    let sigs = catalog.routines(name);
+    let Some((sig, args)) = choose_routine_overload(name, &bindings, &sigs)? else {
         return Err(undefined_function(name, &bindings));
     };
 
+    // A procedure is not callable as a function, even when its signature is the
+    // only match — PG reports 42809 with the CALL hint rather than 42883.
+    if sig.kind == RoutineKind::Procedure {
+        let arglist: Vec<&str> = sig.arg_types.iter().map(|t| t.name()).collect();
+        return Err(BindError::new(
+            sqlstate::WRONG_OBJECT_TYPE,
+            format!("{name}({}) is a procedure", arglist.join(", ")),
+        )
+        .with_hint(Some("To call a procedure, use CALL.".into())));
+    }
+
+    let body = match &sig.imp {
+        RoutineImpl::Sql(body) => body,
+        // Not inlinable: the body is an imperative program, so the call
+        // survives to execution as a marker carrying the routine's OID.
+        RoutineImpl::PlPgSql => {
+            return Ok(Binding::Typed(BoundExpr::Routine {
+                oid: sig.oid,
+                name: Arc::from(sig.name.as_str()),
+                arg_types: Arc::from(sig.arg_types.as_slice()),
+                strict: sig.strict,
+                args,
+                ret: sig.return_type,
+            }));
+        }
+    };
+
     let _guard = InlineGuard::enter()?;
-    let body = bind_sql_function_body(catalog, &sig.arg_types, sig.return_type, &sig.body)?;
+    let body = bind_sql_function_body(catalog, &sig.arg_types, sig.return_type, body)?;
     // Inlining substitutes each argument into every `$n` occurrence, so a volatile
     // argument (e.g. `nextval`) referenced more than once would run its side
     // effect / re-roll its value once per occurrence — diverging from PG, which
@@ -2237,16 +2267,16 @@ fn resolve_sql_function_call(
     Ok(Binding::Typed(inline_params(body, &args)))
 }
 
-/// Pick the winning `LANGUAGE SQL` overload for a call, mirroring the built-in
+/// Pick the winning user-routine overload for a call, mirroring the built-in
 /// resolver's preference: an all-exact-type match wins outright; otherwise the
 /// argument-coercible candidate keeping the most arguments at their exact type
 /// wins, and a tie at that best score is PG's `42725` ambiguity. Returns
 /// `Ok(None)` when no overload's arity/types fit (an undefined function).
-fn choose_sql_overload<'a>(
+fn choose_routine_overload<'a>(
     name: &str,
     bindings: &[Binding],
-    sigs: &'a [SqlFunctionSig],
-) -> Result<Option<(&'a SqlFunctionSig, Vec<BoundExpr>)>, BindError> {
+    sigs: &'a [RoutineSig],
+) -> Result<Option<(&'a RoutineSig, Vec<BoundExpr>)>, BindError> {
     // Two overloads can never share the same argument types (`create_function`
     // rejects that), so at most one all-exact match exists.
     for sig in sigs {
@@ -2258,7 +2288,7 @@ fn choose_sql_overload<'a>(
     }
     // No exact match: rank the coercible candidates by how many arguments are
     // already at their exact type, as the built-in resolver does.
-    let mut best: Option<(usize, &SqlFunctionSig, Vec<BoundExpr>)> = None;
+    let mut best: Option<(usize, &RoutineSig, Vec<BoundExpr>)> = None;
     let mut tied = false;
     for sig in sigs {
         if sig.arg_types.len() != bindings.len() {

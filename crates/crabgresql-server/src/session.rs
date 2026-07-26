@@ -4,13 +4,16 @@
 //! snapshot MVCC runs against) are tracked side by side.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
 use crabgresql_executor::{
-    CatalogOps, ExecContext, ExecError, ExecNode, OutputColumn, SequenceOps,
+    CatalogOps, ExecContext, ExecError, ExecNode, NoticeSink, OutputColumn, RoutineOps, SequenceOps,
 };
+use crabgresql_plpgsql::RoutineCache;
 
 use crate::query::RowTag;
+use crate::routines::SessionNotices;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{Format, TransactionStatus, sqlstate};
 use crabgresql_storage_api::{SequenceAdvance, TableEngine};
@@ -186,6 +189,13 @@ pub struct Session {
     /// the executor holds through [`ExecContext`], possibly in a suspended
     /// portal) can reach it without borrowing the session.
     pub seq_state: Arc<Mutex<SessionSeqState>>,
+    /// Diagnostics raised mid-execution (`RAISE NOTICE` inside a routine body),
+    /// drained by the connection layer as it writes rows.
+    pub notices: Arc<SessionNotices>,
+    /// Compiled PL/pgSQL bodies, shared for the session's lifetime. Keyed by
+    /// catalog OID; needs no invalidation because OIDs are never reused and a
+    /// routine's body is fixed once created.
+    pub routine_cache: Arc<RoutineCache>,
 }
 
 /// A session's `currval`/`lastval` state. `nextval`/`setval` write it; `currval`/
@@ -415,6 +425,8 @@ impl Session {
             prepared: HashMap::new(),
             portals: HashMap::new(),
             seq_state: Arc::new(Mutex::new(SessionSeqState::default())),
+            notices: Arc::new(SessionNotices::default()),
+            routine_cache: Arc::new(RoutineCache::new()),
         }
     }
 
@@ -435,10 +447,13 @@ impl Session {
     /// `nextval()` can run and update this session's `currval`/`lastval`) and to
     /// read `catalog` (so `pg_get_userbyid` / `pg_table_is_visible` resolve
     /// against this statement's catalog snapshot).
+    #[allow(clippy::too_many_arguments)]
     pub fn exec_context_for_statement(
         &self,
         engine: &Arc<dyn TableEngine>,
         catalog: &Arc<dyn CatalogOps>,
+        routines: Arc<dyn RoutineOps>,
+        command_counter: Arc<AtomicU32>,
         read_only: bool,
     ) -> ExecContext {
         ExecContext {
@@ -450,7 +465,11 @@ impl Session {
             ))),
             catalog: Some(Arc::clone(catalog)),
             txn: None,
-            ..ExecContext::default()
+            routines: Some(routines),
+            notices: Some(Arc::clone(&self.notices) as Arc<dyn NoticeSink>),
+            read_only,
+            call_depth: 0,
+            command_counter: Some(command_counter),
         }
     }
 }

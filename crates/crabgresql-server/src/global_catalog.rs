@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::{EnumInfo, SqlFunctionSig, TypeCatalog, UserCast, UserType};
+use crabgresql_storage_api::{
+    EnumInfo, RoutineImpl, RoutineKind as ApiRoutineKind, RoutineSig, TypeCatalog, UserCast,
+    UserType,
+};
 use crabgresql_types::PgType;
 
 use crate::error::PgError;
@@ -1125,7 +1128,7 @@ impl TypeCatalog for GlobalCatalog {
         })
     }
 
-    fn sql_functions(&self, name: &str) -> Vec<SqlFunctionSig> {
+    fn routines(&self, name: &str) -> Vec<RoutineSig> {
         let cat = self
             .inner
             .read()
@@ -1134,22 +1137,33 @@ impl TypeCatalog for GlobalCatalog {
             .iter()
             .filter(|f| f.name == name)
             .filter_map(|f| {
-                let FuncBody::Sql(body) = &f.body else {
-                    return None;
+                // A `LANGUAGE internal` entry is an I/O symbol used to bootstrap
+                // a type, not something a query can call.
+                let imp = match &f.body {
+                    FuncBody::Sql(body) => RoutineImpl::Sql(body.clone()),
+                    FuncBody::PlPgSql(_) => RoutineImpl::PlPgSql,
+                    FuncBody::Internal(_) => return None,
                 };
-                // A SQL function whose signature mentions `cstring` or an
-                // undefined shell type cannot be called; skip it rather than
-                // surface an unusable overload to the binder.
+                // A routine whose signature mentions `cstring` or an undefined
+                // shell type cannot be called; skip it rather than surface an
+                // unusable overload to the binder.
                 let arg_types = f
                     .args
                     .iter()
                     .map(|a| cat.pg_type_of(a))
                     .collect::<Option<Vec<_>>>()?;
                 let return_type = cat.pg_type_of(&f.ret)?;
-                Some(SqlFunctionSig {
+                Some(RoutineSig {
+                    oid: f.oid,
+                    name: f.name.clone(),
                     arg_types,
                     return_type,
-                    body: body.clone(),
+                    kind: match f.kind {
+                        RoutineKind::Function => ApiRoutineKind::Function,
+                        RoutineKind::Procedure => ApiRoutineKind::Procedure,
+                    },
+                    strict: f.strict,
+                    imp,
                 })
             })
             .collect()
@@ -1620,21 +1634,21 @@ mod tests {
             FuncBody::Sql("SELECT $1 + $2".into()),
         ))?;
 
-        let sigs = cat.sql_functions("add");
+        let sigs = cat.routines("add");
         assert_eq!(sigs.len(), 1);
         assert_eq!(sigs[0].arg_types, vec![PgType::Int4, PgType::Int4]);
         assert_eq!(sigs[0].return_type, PgType::Int8);
-        assert_eq!(sigs[0].body, "SELECT $1 + $2");
+        assert_eq!(sigs[0].imp, RoutineImpl::Sql("SELECT $1 + $2".into()));
 
         // A `LANGUAGE internal` function of the same arity is not a SQL function
-        // and must not surface through `sql_functions`.
+        // and must not surface through `routines`.
         cat.create_function(func(
             "add",
             vec![(TypeRef::Cstring, None)],
             TypeRef::Builtin(PgType::Int8),
             FuncBody::Internal("int8in".into()),
         ))?;
-        assert_eq!(cat.sql_functions("add").len(), 1);
+        assert_eq!(cat.routines("add").len(), 1);
 
         // Overloading by argument type registers a second SQL entry.
         cat.create_function(func(
@@ -1643,7 +1657,7 @@ mod tests {
             TypeRef::Builtin(PgType::Int4),
             FuncBody::Sql("SELECT $1".into()),
         ))?;
-        assert_eq!(cat.sql_functions("add").len(), 2);
+        assert_eq!(cat.routines("add").len(), 2);
 
         // Same name + same argument types is rejected.
         let err = cat
@@ -1712,7 +1726,13 @@ mod tests {
 
         // A PL/pgSQL body is not inlinable, so it must not surface as a SQL
         // function to the binder.
-        assert!(cat.sql_functions("greet").is_empty());
+        assert!(matches!(
+            cat.routines("greet").as_slice(),
+            [RoutineSig {
+                imp: RoutineImpl::PlPgSql,
+                ..
+            }]
+        ));
 
         Ok(())
     }

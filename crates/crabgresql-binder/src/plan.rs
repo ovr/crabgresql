@@ -706,7 +706,9 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         BoundExpr::Coerce { expr, .. } => subst_expr(expr, params),
         BoundExpr::Collate { expr, .. } => subst_expr(expr, params),
         BoundExpr::Reinterpret { expr, .. } => subst_expr(expr, params),
-        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => subst_exprs(args, params),
+        BoundExpr::FuncCall { args, .. }
+        | BoundExpr::Routine { args, .. }
+        | BoundExpr::Srf { args, .. } => subst_exprs(args, params),
         BoundExpr::ArrayCtor { elems, .. } => subst_exprs(elems, params),
         BoundExpr::Subscript { base, index, .. } => {
             subst_expr(base, params);
@@ -980,7 +982,9 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
             subst_outer_expr(left, outer, depth);
             subst_outer_expr(right, outer, depth);
         }
-        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+        BoundExpr::FuncCall { args, .. }
+        | BoundExpr::Routine { args, .. }
+        | BoundExpr::Srf { args, .. } => {
             for a in args.iter_mut() {
                 subst_outer_expr(a, outer, depth);
             }
@@ -1032,6 +1036,22 @@ pub fn plan_has_outer_refs(plan: &LogicalPlan) -> bool {
     let mut found = false;
     for_each_plan_expr(plan, &mut |e| {
         if expr_has_outer_ref(e) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether `plan` calls a user-defined routine anywhere.
+///
+/// A routine body may write, and the executor cannot tell before running it —
+/// so a statement that calls one has to be treated as a write: it needs an XID
+/// to stamp the body's versions with, and its result set has to be drained
+/// before the transaction is finalized rather than streamed after it.
+pub fn plan_calls_routine(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    for_each_plan_expr(plan, &mut |e| {
+        if e.contains_routine() {
             found = true;
         }
     });
@@ -1212,9 +1232,9 @@ fn expr_has_outer_ref(expr: &BoundExpr) -> bool {
         BoundExpr::Binary { left, right, .. } => {
             expr_has_outer_ref(left) || expr_has_outer_ref(right)
         }
-        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
-            args.iter().any(expr_has_outer_ref)
-        }
+        BoundExpr::FuncCall { args, .. }
+        | BoundExpr::Routine { args, .. }
+        | BoundExpr::Srf { args, .. } => args.iter().any(expr_has_outer_ref),
         BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(expr_has_outer_ref),
         BoundExpr::Subscript { base, index, .. } => {
             expr_has_outer_ref(base) || expr_has_outer_ref(index)
@@ -2579,6 +2599,22 @@ fn shift_column_refs(expr: &BoundExpr, delta: usize) -> BoundExpr {
             ret: *ret,
             args: args.iter().map(|a| shift_column_refs(a, delta)).collect(),
         },
+        BoundExpr::Routine {
+            oid,
+            name,
+            arg_types,
+            strict,
+            args,
+            ret,
+        } => BoundExpr::Routine {
+            oid: *oid,
+            name: Arc::clone(name),
+            arg_types: Arc::clone(arg_types),
+            strict: *strict,
+            args: args.iter().map(|a| shift_column_refs(a, delta)).collect(),
+            ret: *ret,
+        },
+
         BoundExpr::Case { whens, else_, ty } => BoundExpr::Case {
             whens: whens
                 .iter()
@@ -4049,6 +4085,27 @@ fn rewrite_over_aggregate(
                 .map(|a| rewrite_over_aggregate(a, group_exprs, aggregates, scope))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(BoundExpr::FuncCall { func, ret, args })
+        }
+        BoundExpr::Routine {
+            oid,
+            name,
+            arg_types,
+            strict,
+            args,
+            ret,
+        } => {
+            let args = args
+                .into_iter()
+                .map(|a| rewrite_over_aggregate(a, group_exprs, aggregates, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::Routine {
+                oid,
+                name,
+                arg_types,
+                strict,
+                args,
+                ret,
+            })
         }
         BoundExpr::ArrayCtor { elem, ty, elems } => {
             let elems = elems

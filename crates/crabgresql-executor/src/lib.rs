@@ -793,7 +793,9 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
             resolve_expr(left, ctx, txn)?;
             resolve_expr(right, ctx, txn)?;
         }
-        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+        BoundExpr::FuncCall { args, .. }
+        | BoundExpr::Routine { args, .. }
+        | BoundExpr::Srf { args, .. } => {
             resolve_exprs(args, ctx, txn)?;
         }
         BoundExpr::ArrayCtor { elems, .. } => resolve_exprs(elems, ctx, txn)?,
@@ -1294,12 +1296,12 @@ fn finish_sort_distinct(
 /// A source node that replays already-computed output rows. `RETURNING`
 /// projects eagerly and streams the finished rows through this — unlike
 /// [`Values`], which evaluates `BoundExpr`s on each pull.
-struct MaterializedRows {
+pub struct MaterializedRows {
     rows: std::vec::IntoIter<Tuple>,
 }
 
 impl MaterializedRows {
-    fn new(rows: Vec<Tuple>) -> Self {
+    pub fn new(rows: Vec<Tuple>) -> Self {
         Self {
             rows: rows.into_iter(),
         }
