@@ -6228,3 +6228,108 @@ async fn plpgsql_bodies_are_syntax_checked_at_create_time() -> anyhow::Result<()
 
     Ok(())
 }
+
+/// `DO $$ ... $$` runs an anonymous block, including its NOTICEs and its DML.
+#[tokio::test]
+async fn do_blocks_run_and_emit_notices() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (n int)").await?;
+
+    client
+        .batch_execute(
+            "DO $$ BEGIN FOR i IN 1..3 LOOP INSERT INTO t (n) VALUES (i); END LOOP; END $$",
+        )
+        .await?;
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM t", &[])
+            .await?
+            .get::<_, i64>(0),
+        3
+    );
+
+    // LANGUAGE may be given explicitly, on either side of the code.
+    client
+        .batch_execute("DO LANGUAGE plpgsql $$ BEGIN NULL; END $$")
+        .await?;
+
+    // A language that cannot run inline code, and one that does not exist.
+    let e = client
+        .batch_execute("DO LANGUAGE sql $$ SELECT 1 $$")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+    let e = client
+        .batch_execute("DO LANGUAGE nope $$ BEGIN END $$")
+        .await
+        .unwrap_err();
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::UNDEFINED_OBJECT);
+    assert_eq!(db.message(), "language \"nope\" does not exist");
+
+    Ok(())
+}
+
+/// `CREATE PROCEDURE` and `CALL`, and the two 42809s that keep procedures and
+/// functions from being confused for one another.
+#[tokio::test]
+async fn procedures_are_created_called_and_dropped() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (n int)").await?;
+
+    client
+        .batch_execute(
+            "CREATE PROCEDURE add_n(v int) LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO t (n) VALUES (v); END $$",
+        )
+        .await?;
+    client.batch_execute("CALL add_n(4)").await?;
+    client.batch_execute("CALL add_n(5)").await?;
+    assert_eq!(
+        client
+            .query_one("SELECT sum(n) FROM t", &[])
+            .await?
+            .get::<_, i64>(0),
+        9
+    );
+
+    // A procedure is not callable as a function...
+    let e = client.query_one("SELECT add_n(1)", &[]).await.unwrap_err();
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(db.message(), "add_n(integer) is a procedure");
+    assert_eq!(db.hint(), Some("To call a procedure, use CALL."));
+
+    // ...nor a function callable with CALL.
+    client
+        // A LANGUAGE SQL body refers to its arguments only as `$n`.
+        .batch_execute("CREATE FUNCTION fn_n(v int) RETURNS int LANGUAGE sql AS 'SELECT $1'")
+        .await?;
+    let e = client.batch_execute("CALL fn_n(1)").await.unwrap_err();
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(db.hint(), Some("To call a function, use SELECT."));
+
+    // DROP refuses to cross the two kinds, then drops the right one.
+    let e = client
+        .batch_execute("DROP FUNCTION add_n(int)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().expect("database error").code(),
+        &SqlState::WRONG_OBJECT_TYPE
+    );
+    client.batch_execute("DROP PROCEDURE add_n(int)").await?;
+    let e = client.batch_execute("CALL add_n(1)").await.unwrap_err();
+    assert_eq!(
+        e.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_FUNCTION
+    );
+
+    Ok(())
+}

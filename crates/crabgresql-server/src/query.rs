@@ -25,8 +25,8 @@ use crabgresql_pg_wire::{ErrorFields, TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
     PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
-    RelationMetadata, SequenceDefinition, StorageError, TableAm, TableEngine, TableSchema,
-    TypeCatalog, ViewDefinition,
+    RelationMetadata, RoutineKind as ApiRoutineKind, RoutineSig, SequenceDefinition, StorageError,
+    TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -740,6 +740,28 @@ pub fn execute_statement(
             } => return execute_drop_cast(global_catalog, source, target, *if_exists),
             ast::Statement::DropFunction(drop) => {
                 return execute_drop_function(global_catalog, drop);
+            }
+            ast::Statement::CreateProcedure(create) => {
+                return execute_create_procedure(global_catalog, create);
+            }
+            ast::Statement::DropProcedure {
+                if_exists,
+                proc_desc,
+                drop_behavior,
+            } => {
+                return execute_drop_routine(
+                    global_catalog,
+                    RoutineKind::Procedure,
+                    proc_desc,
+                    *if_exists,
+                    drop_behavior.as_ref(),
+                );
+            }
+            ast::Statement::Do(block) => {
+                return execute_do(engine, global_catalog, txnmgr, block, session);
+            }
+            ast::Statement::Call(call) => {
+                return execute_call(engine, global_catalog, txnmgr, call, session);
             }
             ast::Statement::Set(set) => return apply_set(set, session),
             ast::Statement::Reset(reset) => return apply_reset(reset, session),
@@ -3652,6 +3674,241 @@ fn routine_strict(called_on_null: Option<&ast::FunctionCalledOnNull>) -> bool {
     )
 }
 
+/// `CREATE PROCEDURE name(args) LANGUAGE plpgsql AS $$ ... $$`.
+///
+/// PostgreSQL shares one attribute-clause production between CREATE FUNCTION
+/// and CREATE PROCEDURE and rejects the function-only ones here rather than in
+/// the grammar, so the parser accepts them and this is where they are refused.
+fn execute_create_procedure(
+    catalog: &GlobalCatalog,
+    create: &ast::CreateProcedure,
+) -> Result<QueryResult, PgError> {
+    for (attribute, present) in [
+        ("volatility", create.behavior.is_some()),
+        ("strictness", create.called_on_null.is_some()),
+        ("parallel", create.parallel.is_some()),
+    ] {
+        if present {
+            return Err(PgError::new(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                format!("invalid attribute in procedure definition: {attribute}"),
+            ));
+        }
+    }
+    let name = single_object_name(&create.name, "procedure")?;
+    let args = routine_args(catalog, create.args.as_deref().unwrap_or(&[]))?;
+    let lang = create
+        .language
+        .as_ref()
+        .map(|i| i.value.to_ascii_lowercase());
+    let Some("plpgsql") = lang.as_deref() else {
+        return Err(PgError::feature_not_supported(
+            "CREATE PROCEDURE is only supported for LANGUAGE plpgsql",
+        ));
+    };
+    let body_sql = procedure_body_text(create)?;
+    let arg_names: Vec<Option<String>> = args
+        .iter()
+        .filter(|a| a.mode.is_input())
+        .map(|a| a.name.clone())
+        .collect();
+    crabgresql_plpgsql::compile(&body_sql, &arg_names).map_err(|e| {
+        PgError::new(e.code, e.message).with_detail(format!(
+            "compilation of PL/pgSQL function near line {}",
+            e.line
+        ))
+    })?;
+
+    let notices = catalog.create_function(RoutineDefinition {
+        name,
+        kind: RoutineKind::Procedure,
+        args,
+        // A procedure declares no return type. There is no `void` here yet, so
+        // a placeholder is stored; nothing reads it, because `RoutineKind`
+        // already tells the interpreter a procedure returns nothing.
+        ret: TypeRef::Builtin(PgType::Text),
+        body: FuncBody::PlPgSql(body_sql),
+        volatility: Volatility::Volatile,
+        strict: false,
+        secdef: matches!(create.security, Some(ast::FunctionSecurity::Definer)),
+    })?;
+    Ok(QueryResult::Command {
+        tag: "CREATE PROCEDURE".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// A procedure's body, verbatim — see [`routine_body_text`] for why it is not
+/// normalized.
+fn procedure_body_text(create: &ast::CreateProcedure) -> Result<String, PgError> {
+    match &create.function_body {
+        Some(ast::CreateFunctionBody::AsBeforeOptions { body, .. })
+        | Some(ast::CreateFunctionBody::AsAfterOptions(body)) => string_literal(body),
+        _ => Err(PgError::feature_not_supported(
+            "CREATE PROCEDURE requires AS '<body>'",
+        )),
+    }
+}
+
+/// `DO [LANGUAGE lang] $$ ... $$` — an anonymous block, run as if it were the
+/// body of a void-returning procedure.
+///
+/// Unlike a routine call this has no catalog entry, so the body is compiled
+/// fresh every time; a `DO` block is written to run once.
+fn execute_do(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    block: &ast::DoStatement,
+    session: &mut Session,
+) -> Result<QueryResult, PgError> {
+    let lang = block
+        .language
+        .as_ref()
+        .map(|i| i.value.to_ascii_lowercase())
+        .unwrap_or_else(|| "plpgsql".to_string());
+    match lang.as_str() {
+        "plpgsql" => {}
+        "sql" | "internal" | "c" => {
+            return Err(PgError::feature_not_supported(format!(
+                "language \"{lang}\" does not support inline code execution"
+            )));
+        }
+        other => {
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("language \"{other}\" does not exist"),
+            ));
+        }
+    }
+    let body = string_literal(&ast::Expr::Value(block.body.clone()))?;
+
+    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
+    let (routines, command_counter) =
+        statement_runtime(&catalog, &type_catalog, global_catalog, session);
+    // A DO block is opaque: nothing here can tell whether it writes, so it gets
+    // an XID like any other write. Its own DML does the read-only check.
+    let read_only = read_only_active(session);
+    let txn = build_txn(txnmgr, session, true);
+    let exec_ctx = session.exec_context_for_statement(
+        engine,
+        &catalog_ops,
+        Arc::clone(&routines),
+        Arc::clone(&command_counter),
+        read_only,
+    );
+    let outcome = routines.run_inline_block(&body, &exec_ctx, &txn);
+    if let Err(e) = outcome {
+        let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
+        return Err(e.into());
+    }
+    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter))?;
+    Ok(QueryResult::Command {
+        tag: "DO".into(),
+        notices: session.notices.drain(),
+    })
+}
+
+/// `CALL proc(args)`.
+///
+/// A `CALL` argument is a constant expression — there is no row for a column
+/// reference to come from — so the arguments are bound against an empty scope
+/// and evaluated before the body is entered.
+fn execute_call(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    call: &ast::Function,
+    session: &mut Session,
+) -> Result<QueryResult, PgError> {
+    let name = single_object_name(&call.name, "procedure")?;
+    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
+
+    let ast::FunctionArguments::List(list) = &call.args else {
+        return Err(PgError::feature_not_supported(
+            "CALL with no argument list is not supported yet",
+        ));
+    };
+    let params = param_ctx_none();
+    let scope = crabgresql_binder::Scope::empty(&type_catalog, &params);
+    let mut args = Vec::with_capacity(list.args.len());
+    for arg in &list.args {
+        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg else {
+            return Err(PgError::feature_not_supported(
+                "named and wildcard CALL arguments are not supported yet",
+            ));
+        };
+        args.push(crabgresql_binder::bind_scalar(expr, &scope)?);
+    }
+
+    let sig = resolve_procedure(&type_catalog, &name, &args)?;
+    // Coerce each argument to its declared type, as a function call's would be.
+    let exec_only = session.exec_context();
+    let mut values = Vec::with_capacity(args.len());
+    for (arg, ty) in args.iter().zip(sig.arg_types.iter()) {
+        let value = crabgresql_executor::eval_row_free(arg, &exec_only)?;
+        values.push(crabgresql_executor::coerce_value(value, *ty, &exec_only)?);
+    }
+
+    let (routines, command_counter) =
+        statement_runtime(&catalog, &type_catalog, global_catalog, session);
+    let read_only = read_only_active(session);
+    let txn = build_txn(txnmgr, session, true);
+    let exec_ctx = session.exec_context_for_statement(
+        engine,
+        &catalog_ops,
+        Arc::clone(&routines),
+        Arc::clone(&command_counter),
+        read_only,
+    );
+    if let Err(e) = routines.call(sig.oid, values, &exec_ctx, &txn) {
+        let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
+        return Err(e.into());
+    }
+    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter))?;
+    Ok(QueryResult::Command {
+        tag: "CALL".into(),
+        notices: session.notices.drain(),
+    })
+}
+
+/// Resolve `CALL name(args)` to a procedure. A name that resolves only to a
+/// *function* is `42809` with the SELECT hint, mirroring how calling a
+/// procedure as a function is refused in the other direction.
+fn resolve_procedure(
+    type_catalog: &Arc<dyn TypeCatalog>,
+    name: &str,
+    args: &[crabgresql_binder::BoundExpr],
+) -> Result<RoutineSig, PgError> {
+    let sigs = type_catalog.routines(name);
+    let arg_types: Vec<PgType> = args.iter().map(|a| a.ty()).collect();
+    let matches_arity = |sig: &RoutineSig| sig.arg_types.len() == args.len();
+
+    if let Some(sig) = sigs
+        .iter()
+        .find(|s| s.kind == ApiRoutineKind::Procedure && s.arg_types == arg_types)
+        .or_else(|| {
+            sigs.iter()
+                .find(|s| s.kind == ApiRoutineKind::Procedure && matches_arity(s))
+        })
+    {
+        return Ok(sig.clone());
+    }
+    let rendered: Vec<&str> = arg_types.iter().map(|t| t.name()).collect();
+    let signature = format!("{name}({})", rendered.join(", "));
+    if sigs.iter().any(matches_arity) {
+        return Err(PgError::new(
+            sqlstate::WRONG_OBJECT_TYPE,
+            format!("{signature} is not a procedure"),
+        )
+        .with_hint("To call a function, use SELECT."));
+    }
+    Err(PgError::new(
+        sqlstate::UNDEFINED_FUNCTION,
+        format!("procedure {signature} does not exist"),
+    ))
+}
+
 /// `CREATE CAST (source AS target) ...`.
 fn execute_create_cast(
     catalog: &GlobalCatalog,
@@ -4934,9 +5191,29 @@ fn execute_drop_function(
     catalog: &GlobalCatalog,
     drop: &ast::DropFunction,
 ) -> Result<QueryResult, PgError> {
-    let mut specs: Vec<FuncDropSpec> = Vec::with_capacity(drop.func_desc.len());
-    for desc in &drop.func_desc {
-        let name = single_object_name(&desc.name, "function")?;
+    execute_drop_routine(
+        catalog,
+        RoutineKind::Function,
+        &drop.func_desc,
+        drop.if_exists,
+        drop.drop_behavior.as_ref(),
+    )
+}
+
+/// `DROP FUNCTION`/`DROP PROCEDURE`. The two differ only in which kind of
+/// routine they may name: PostgreSQL reports `42809` rather than "does not
+/// exist" when the name resolves to the other kind, because a confusing
+/// success is worse than a clear refusal.
+fn execute_drop_routine(
+    catalog: &GlobalCatalog,
+    kind: RoutineKind,
+    descs: &[ast::FunctionDesc],
+    if_exists: bool,
+    drop_behavior: Option<&ast::DropBehavior>,
+) -> Result<QueryResult, PgError> {
+    let mut specs: Vec<FuncDropSpec> = Vec::with_capacity(descs.len());
+    for desc in descs {
+        let name = single_object_name(&desc.name, kind.noun())?;
         let args = match &desc.args {
             Some(args) => {
                 let mut resolved = Vec::new();
@@ -4952,13 +5229,16 @@ fn execute_drop_function(
         };
         specs.push(FuncDropSpec { name, args });
     }
-    // Naming the same function twice — via two identical signatures, or a bare
+    // Naming the same routine twice — via two identical signatures, or a bare
     // name and its signature — is rejected in drop_functions once each target is
-    // resolved to a concrete function.
-    let cascade = matches!(drop.drop_behavior, Some(ast::DropBehavior::Cascade));
-    let notices = catalog.drop_functions(&specs, cascade, drop.if_exists)?;
+    // resolved to a concrete routine.
+    let cascade = matches!(drop_behavior, Some(ast::DropBehavior::Cascade));
+    let notices = catalog.drop_functions(&specs, kind, cascade, if_exists)?;
     Ok(QueryResult::Command {
-        tag: "DROP FUNCTION".into(),
+        tag: match kind {
+            RoutineKind::Function => "DROP FUNCTION".into(),
+            RoutineKind::Procedure => "DROP PROCEDURE".into(),
+        },
         notices: to_notices(notices),
     })
 }

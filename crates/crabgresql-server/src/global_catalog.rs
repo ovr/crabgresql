@@ -1006,6 +1006,7 @@ impl GlobalCatalog {
     pub fn drop_functions(
         &self,
         specs: &[FuncDropSpec],
+        kind: RoutineKind,
         _cascade: bool,
         if_exists: bool,
     ) -> Result<Vec<CatalogNotice>, PgError> {
@@ -1018,7 +1019,7 @@ impl GlobalCatalog {
         // in phase 2). Any hard error here aborts before removing anything.
         let mut resolved: Vec<Option<u32>> = Vec::with_capacity(specs.len());
         for spec in specs {
-            resolved.push(cat.resolve_drop_func(spec, if_exists)?);
+            resolved.push(cat.resolve_drop_func(spec, kind, if_exists)?);
         }
         // Two targets that resolve to the same function (identical signatures, or
         // a bare name and its signature) name one object twice — PG rejects that
@@ -1295,6 +1296,7 @@ impl CatalogInner {
     fn resolve_drop_func(
         &self,
         spec: &FuncDropSpec,
+        kind: RoutineKind,
         if_exists: bool,
     ) -> Result<Option<u32>, PgError> {
         // With an argument list the (name, args) key is unique (CREATE enforces
@@ -1308,6 +1310,17 @@ impl CatalogInner {
                 .collect(),
             None => self.funcs.iter().filter(|f| f.name == spec.name).collect(),
         };
+        // `DROP FUNCTION` may not name a procedure, or vice versa. PostgreSQL
+        // reports the mismatch rather than "does not exist", because a wrong
+        // DROP silently succeeding on the wrong object would be worse.
+        if let [entry] = matches.as_slice()
+            && entry.kind != kind
+        {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("{} is not a {}", entry.describe(), kind.noun()),
+            ));
+        }
         match matches.as_slice() {
             [entry] => Ok(Some(entry.oid)),
             [] if if_exists => Ok(None),

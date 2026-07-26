@@ -1293,6 +1293,13 @@ fn finish_sort_distinct(
     Ok(Box::new(Distinct::new(node, keys, columns.len())?))
 }
 
+/// Evaluate an expression that references no row — a `CALL` argument, which
+/// has no row for a column reference to come from. The binder has already
+/// rejected any column reference, so the empty row is never indexed.
+pub fn eval_row_free(expr: &BoundExpr, ctx: &ExecContext) -> Result<Value, ExecError> {
+    eval(expr, &[], ctx)
+}
+
 /// A source node that replays already-computed output rows. `RETURNING`
 /// projects eagerly and streams the finished rows through this — unlike
 /// [`Values`], which evaluates `BoundExpr`s on each pull.
