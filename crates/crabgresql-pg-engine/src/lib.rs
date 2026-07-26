@@ -327,14 +327,32 @@ impl PgEngine {
                 }
                 TableAccessMethod::Parquet => {
                     let indexes = indexes.into_iter().map(|(index, _)| index).collect();
-                    let table = Arc::new(
-                        ParquetTable::open(data_dir, rel.0, schema, indexes, Arc::clone(&wal))
-                            .map_err(std::io::Error::other)?,
-                    );
-                    if let Some((relpages, reltuples)) = analyzed {
-                        table.set_analyzed(relpages, reltuples);
+                    // A relation that cannot be opened must not take the whole
+                    // cluster down with it: one unparseable filename under
+                    // `parquet/<rel>/` would otherwise abort startup, making every
+                    // heap table unreachable and leaving no way to DROP the
+                    // offender. Log it and leave the relation unregistered — it
+                    // then reports 42P01 on access, and DROP TABLE still clears
+                    // the catalog entry (`gc_orphan_parquet_dirs` reclaims the
+                    // directory at the next boot).
+                    match ParquetTable::open(data_dir, rel.0, schema, indexes, Arc::clone(&wal)) {
+                        Ok(table) => {
+                            let table = Arc::new(table);
+                            if let Some((relpages, reltuples)) = analyzed {
+                                table.set_analyzed(relpages, reltuples);
+                            }
+                            ManagedTable::Parquet(table)
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                table = %name,
+                                error = %error,
+                                "Parquet relation could not be opened; \
+                                 it will report as nonexistent until dropped"
+                            );
+                            continue;
+                        }
                     }
-                    ManagedTable::Parquet(table)
                 }
             };
             tables.insert((namespace, name), Arc::new(table));
@@ -377,10 +395,9 @@ impl PgEngine {
         // Reconcile swap TRUNCATEs replayed from the WAL (apply committed, discard
         // the rest), reclaim orphaned staging files.
         engine.apply_recovered_truncates(&clog);
-        engine
-            .recover_parquet_fragments(&clog)
-            .map_err(std::io::Error::other)?;
+        engine.recover_parquet_fragments(&clog);
         engine.gc_orphan_relfiles()?;
+        engine.gc_orphan_parquet_dirs()?;
         // After a crash, an unlogged relation's WAL-skipped pages may be torn — the
         // write-ahead rule never guarded them — so empty each unlogged heap and
         // re-lay its indexes as empty B-trees (PostgreSQL's ResetUnloggedRelations).
@@ -514,15 +531,61 @@ impl PgEngine {
         }
     }
 
-    fn recover_parquet_fragments(&self, clog: &Clog) -> Result<(), StorageError> {
+    fn recover_parquet_fragments(&self, clog: &Clog) {
         for table in self
             .tables
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .values()
         {
-            if let Some(parquet) = table.as_parquet() {
-                parquet.recover(clog)?;
+            // As in `PgEngine::new`: one relation whose fragments cannot be
+            // reconciled must not stop the cluster from starting.
+            if let Some(parquet) = table.as_parquet()
+                && let Err(error) = parquet.recover(clog)
+            {
+                tracing::error!(
+                    table = %parquet.schema().name,
+                    error = %error,
+                    "Parquet fragment recovery failed; pending fragments remain unreconciled"
+                );
+            }
+        }
+    }
+
+    /// Delete `parquet/<n>` directories not referenced by any live catalog
+    /// relation — the Parquet counterpart of [`PgEngine::gc_orphan_relfiles`].
+    ///
+    /// `drop_table` removes the catalog entry before the fragment directory, so a
+    /// crash or IO error in that window would otherwise strand the whole
+    /// directory with nothing to reclaim it. Parquet relations never swap
+    /// relfilenodes (the method has no TRUNCATE), so a directory with no catalog
+    /// entry is genuinely orphaned.
+    pub fn gc_orphan_parquet_dirs(&self) -> std::io::Result<()> {
+        let live: std::collections::HashSet<u32> =
+            self.catalog.live_relfilenodes().into_iter().collect();
+        let root = self.data_dir.join("parquet");
+        let entries = match std::fs::read_dir(&root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if let Some(n) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                && !live.contains(&n)
+            {
+                // Best-effort, like the heap sweep: a directory we fail to remove
+                // is retried at the next boot rather than blocking startup.
+                if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                    tracing::error!(
+                        relfilenode = n,
+                        error = %error,
+                        "orphaned Parquet directory could not be reclaimed"
+                    );
+                }
             }
         }
         Ok(())
@@ -766,7 +829,9 @@ impl TableEngine for PgEngine {
                     row?;
                     reltuples += 1.0;
                 }
-                let relpages = parquet.statistics().relpages;
+                // Re-measure rather than reading `statistics()`, which returns the
+                // previous ANALYZE's cached value and would pin relpages forever.
+                let relpages = parquet.measure_relpages()?;
                 parquet.set_analyzed(relpages, reltuples);
                 RelStats {
                     relpages,

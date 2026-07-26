@@ -1663,13 +1663,16 @@ fn execute_truncate(
     // named twice in one statement.
     named.sort_by(|a, b| a.0.cmp(&b.0));
     named.dedup_by(|a, b| a.0 == b.0);
-    if named
+    if let Some((_, table)) = named
         .iter()
-        .any(|(_, table)| !table.capabilities().truncate)
+        .find(|(_, table)| !table.capabilities().truncate)
     {
-        return Err(PgError::feature_not_supported(
-            "table access method \"parquet\" does not support TRUNCATE",
-        ));
+        // Name the offending table's own method, not a hardcoded one — the guard
+        // is generic over `capabilities()`, so the message must be too.
+        let method = table.schema().access_method.as_str();
+        return Err(PgError::feature_not_supported(format!(
+            "table access method \"{method}\" does not support TRUNCATE"
+        )));
     }
     // TRUNCATE is a write: run it under a real transaction so autocommit commits
     // it. On the durable heap engine this is fully transactional — the swap is
@@ -2198,14 +2201,12 @@ fn create_table_access_method(
         ));
     };
     let name = normalize_ident(format);
-    match name.as_str() {
-        "heap" => Ok(TableAccessMethod::Heap),
-        "parquet" => Ok(TableAccessMethod::Parquet),
-        _ => Err(PgError::new(
+    TableAccessMethod::from_name(&name).ok_or_else(|| {
+        PgError::new(
             sqlstate::UNDEFINED_OBJECT,
-            format!("table access method \"{name}\" does not exist"),
-        )),
-    }
+            format!("access method \"{name}\" does not exist"),
+        )
+    })
 }
 
 /// Split a possibly schema-qualified object name into `(schema, name)`. One part

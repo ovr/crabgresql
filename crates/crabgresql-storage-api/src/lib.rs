@@ -268,6 +268,27 @@ pub enum TableAccessMethod {
     Parquet,
 }
 
+impl TableAccessMethod {
+    /// The `pg_am.amname` this method is known by — the spelling accepted by
+    /// `CREATE TABLE ... USING` and reported back in error text. Single source of
+    /// truth so a message can never name a method other than the table's own.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TableAccessMethod::Heap => "heap",
+            TableAccessMethod::Parquet => "parquet",
+        }
+    }
+
+    /// Resolve an `amname` written by the user. `None` is the 42704 case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "heap" => Some(TableAccessMethod::Heap),
+            "parquet" => Some(TableAccessMethod::Parquet),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TableSchema {
     pub name: String,

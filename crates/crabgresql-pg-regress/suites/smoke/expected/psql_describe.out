@@ -23,7 +23,7 @@ SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid;
   2742 | gin     | ginhandler              | i
   3580 | brin    | brinhandler             | i
   4000 | spgist  | spghandler              | i
- 16384 | parquet | parquet_tableam_handler | t
+ 16000 | parquet | parquet_tableam_handler | t
 (8 rows)
 
 -- pg_get_userbyid never returns NULL: an unowned OID prints a placeholder, and

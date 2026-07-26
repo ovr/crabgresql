@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
-    Column, StorageError, TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog,
+    Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog,
     ViewDefinition,
 };
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
@@ -419,10 +419,7 @@ fn resolve_write_table(
             WriteVerb::Update => "UPDATE",
             WriteVerb::Delete => "DELETE",
         };
-        let method = match table.schema().access_method {
-            TableAccessMethod::Heap => "heap",
-            TableAccessMethod::Parquet => "parquet",
-        };
+        let method = table.schema().access_method.as_str();
         return Err(BindError::feature_not_supported(format!(
             "table access method \"{method}\" does not support {verb}"
         )));

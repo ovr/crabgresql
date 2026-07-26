@@ -4947,7 +4947,7 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
         .await?;
     assert_eq!(
         (rows(&catalog)[0].get(0), rows(&catalog)[0].get(1)),
-        (Some("16384"), Some("parquet"))
+        (Some("16000"), Some("parquet"))
     );
 
     let sink = client.copy_in("COPY p (id, label) FROM STDIN").await?;
@@ -4997,13 +4997,13 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
         .simple_query("CREATE TABLE unknown_am (id int) USING imaginary")
         .await
         .expect_err("unknown table access method must fail");
+    let unknown = unknown.as_db_error().expect("database error");
+    assert_eq!(unknown.code().code(), "42704");
+    // Wording matches PostgreSQL's `get_am_type_oid`, which says "access method",
+    // not "table access method".
     assert_eq!(
-        unknown
-            .as_db_error()
-            .expect("database error")
-            .code()
-            .code(),
-        "42704"
+        unknown.message(),
+        "access method \"imaginary\" does not exist"
     );
     for sql in [
         "CREATE TEMP TABLE temp_p (id int) USING parquet",

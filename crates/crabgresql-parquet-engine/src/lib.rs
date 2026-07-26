@@ -5,7 +5,7 @@
 //! them to `.parquet` or removes them on abort. MVCC identity lives in file
 //! metadata, leaving the physical Parquet schema composed solely of user columns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -537,6 +537,39 @@ struct Fragment {
     pending: bool,
 }
 
+impl Fragment {
+    /// The name this fragment takes once its transaction commits: the same file
+    /// with the `.pending` suffix stripped. `None` for an already-promoted one.
+    fn promoted_path(&self) -> Option<PathBuf> {
+        if !self.pending {
+            return None;
+        }
+        let name = self.path.file_name()?.to_str()?.strip_suffix(".pending")?;
+        Some(self.path.with_file_name(name))
+    }
+}
+
+/// Open a fragment by path, tolerating a concurrent commit's promotion rename.
+///
+/// A reader lists fragments up front but opens them lazily, and a fragment is
+/// visible under MVCC as soon as its transaction is marked committed in the
+/// clog — which happens *before* the finalize hook renames `.pending` away. A
+/// scan can therefore hold a `.pending` path that has since been promoted; the
+/// bytes are unchanged, so retry under the committed name rather than failing
+/// the query with a spurious ENOENT.
+fn open_fragment_file(fragment: &Fragment) -> Result<File, StorageError> {
+    match File::open(&fragment.path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let promoted = fragment
+                .promoted_path()
+                .ok_or_else(|| io_error("open Parquet fragment", error))?;
+            File::open(&promoted).map_err(|error| io_error("open Parquet fragment", error))
+        }
+        Err(error) => Err(io_error("open Parquet fragment", error)),
+    }
+}
+
 fn parse_fragment(path: PathBuf) -> Result<Option<Fragment>, StorageError> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Err(corrupt("Parquet fragment has a non-UTF-8 filename"));
@@ -616,7 +649,7 @@ fn open_reader(
     rel: u32,
     fragment: &Fragment,
 ) -> Result<ParquetRecordBatchReader, StorageError> {
-    let file = File::open(&fragment.path).map_err(|error| io_error("open Parquet fragment", error))?;
+    let file = open_fragment_file(fragment)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|error| corrupt(format!("read Parquet footer: {error}")))?;
     let metadata = metadata_map(builder.metadata().file_metadata().key_value_metadata());
@@ -721,6 +754,13 @@ pub struct ParquetTable {
     indexes: RwLock<Vec<IndexMetadata>>,
     analyzed: RwLock<Option<(u32, f64)>>,
     next_block: Mutex<u32>,
+    /// Transactions that have staged `.pending` fragments in this table and not
+    /// yet been finalized. The engine's commit/abort hook runs over every open
+    /// table, so this lets [`ParquetTable::finish_transaction`] answer "nothing
+    /// of mine" from memory instead of paying a directory scan and an fsync on
+    /// every transaction end. Empty after a restart, which is correct:
+    /// [`ParquetTable::recover`] reconciles leftover pending files directly.
+    staged_xids: Mutex<HashSet<Xid>>,
 }
 
 impl ParquetTable {
@@ -749,7 +789,22 @@ impl ParquetTable {
             indexes: RwLock::new(indexes),
             analyzed: RwLock::new(None),
             next_block: Mutex::new(next_block),
+            staged_xids: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Measure the relation's current on-disk size in 8 KB pages, ignoring any
+    /// cached ANALYZE result. `statistics()` deliberately prefers the cached
+    /// value; ANALYZE itself must re-measure, or `relpages` would freeze at
+    /// whatever the first ANALYZE recorded and never track the table's growth.
+    pub fn measure_relpages(&self) -> Result<u32, StorageError> {
+        let bytes: u64 = fragments(&self.dir)?
+            .iter()
+            .filter(|fragment| !fragment.pending)
+            .filter_map(|fragment| std::fs::metadata(&fragment.path).ok())
+            .map(|metadata| metadata.len())
+            .sum();
+        Ok(bytes.div_ceil(8_192).min(u32::MAX as u64) as u32)
     }
 
     pub fn set_analyzed(&self, relpages: u32, reltuples: f64) {
@@ -773,47 +828,82 @@ impl ParquetTable {
             .retain(|index| index.name != name);
     }
 
-    pub fn finish_transaction(&self, xid: Xid, committed: bool) -> Result<(), StorageError> {
-        for fragment in fragments(&self.dir)?
-            .into_iter()
-            .filter(|fragment| fragment.pending && fragment.xid == xid)
-        {
+    /// Promote (on commit) or unlink (on abort) an already-listed set of pending
+    /// fragments. Does not scan the directory or fsync it — the caller owns both,
+    /// so a batch of transactions costs one listing and one fsync rather than one
+    /// of each per transaction.
+    fn reconcile(&self, pending: &[Fragment], committed: bool) -> Result<(), StorageError> {
+        for fragment in pending {
             if committed {
-                let name = fragment
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
+                let promoted = fragment
+                    .promoted_path()
                     .ok_or_else(|| corrupt("pending Parquet filename is invalid"))?;
-                let final_name = name
-                    .strip_suffix(".pending")
-                    .ok_or_else(|| corrupt("pending Parquet suffix is invalid"))?;
-                std::fs::rename(&fragment.path, self.dir.join(final_name))
+                std::fs::rename(&fragment.path, &promoted)
                     .map_err(|error| io_error("promote Parquet fragment", error))?;
             } else {
                 std::fs::remove_file(&fragment.path)
                     .map_err(|error| io_error("remove aborted Parquet fragment", error))?;
             }
         }
+        Ok(())
+    }
+
+    pub fn finish_transaction(&self, xid: Xid, committed: bool) -> Result<(), StorageError> {
+        // The engine's finalize hook calls this for every open Parquet table on
+        // every transaction end. Tables the transaction never wrote to answer
+        // from memory here, without touching the filesystem at all.
+        let staged = self
+            .staged_xids
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .remove(&xid);
+        if !staged {
+            return Ok(());
+        }
+        let pending: Vec<Fragment> = fragments(&self.dir)?
+            .into_iter()
+            .filter(|fragment| fragment.pending && fragment.xid == xid)
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.reconcile(&pending, committed)?;
         sync_dir(&self.dir)
     }
 
     pub fn recover(&self, clog: &crabgresql_txn::Clog) -> Result<(), StorageError> {
-        let entries =
-            std::fs::read_dir(&self.dir).map_err(|error| io_error("recover Parquet table", error))?;
+        // Collect the whole directory before touching it: the reconciliation
+        // below renames and unlinks entries, and mutating a directory while a
+        // `read_dir` stream over it is still open can silently skip entries,
+        // stranding another transaction's fragments as `.pending` forever.
+        let entries = std::fs::read_dir(&self.dir)
+            .map_err(|error| io_error("recover Parquet table", error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| io_error("recover Parquet entry", error))?;
+        let mut pending: HashMap<Xid, Vec<Fragment>> = HashMap::new();
+        let mut dirty = false;
         for entry in entries {
-            let path = entry
-                .map_err(|error| io_error("recover Parquet entry", error))?
-                .path();
+            let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
                 std::fs::remove_file(path)
                     .map_err(|error| io_error("remove temporary Parquet fragment", error))?;
+                dirty = true;
                 continue;
             }
             if let Some(fragment) = parse_fragment(path)?
                 && fragment.pending
             {
-                self.finish_transaction(fragment.xid, clog.is_committed(fragment.xid))?;
+                pending.entry(fragment.xid).or_default().push(fragment);
             }
+        }
+        // One reconcile pass per distinct transaction, not per file — and a
+        // single directory fsync covering all of them.
+        for (xid, fragments) in &pending {
+            self.reconcile(fragments, clog.is_committed(*xid))?;
+            dirty = true;
+        }
+        if dirty {
+            sync_dir(&self.dir)?;
         }
         Ok(())
     }
@@ -920,16 +1010,10 @@ impl TableAm for ParquetTable {
                 columns: Vec::new(),
             };
         }
-        let Ok(fragments) = fragments(&self.dir) else {
+        let Ok(relpages) = self.measure_relpages() else {
             return RelStats::unknown(&self.schema);
         };
-        let bytes: u64 = fragments
-            .iter()
-            .filter(|fragment| !fragment.pending)
-            .filter_map(|fragment| std::fs::metadata(&fragment.path).ok())
-            .map(|metadata| metadata.len())
-            .sum();
-        RelStats::from_pages(bytes.div_ceil(8_192).min(u32::MAX as u64) as u32, &self.schema)
+        RelStats::from_pages(relpages, &self.schema)
     }
 
     fn scan(&self, txn: &TxnContext) -> TupleStream {
@@ -985,6 +1069,13 @@ impl TableAm for ParquetTable {
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
+        // Record the writer before any file appears on disk, so the finalize
+        // hook is guaranteed to reconcile this transaction's fragments even if
+        // the write fails partway. A stale entry only costs one directory scan.
+        self.staged_xids
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .insert(txn.xid);
         let mut next = self
             .next_block
             .lock()
@@ -1396,6 +1487,137 @@ mod tests {
         interrupted.recover(&clog)?;
         assert_eq!(parquet_files(dir.path(), 1)?.len(), 1);
         assert!(parquet_files(dir.path(), 2)?.is_empty());
+        Ok(())
+    }
+
+    /// A scan lists fragments up front but opens them lazily, and a fragment
+    /// becomes MVCC-visible the moment its transaction is marked committed —
+    /// before the finalize hook renames `.pending` away. The reader must follow
+    /// the promotion rather than failing the query with a spurious ENOENT.
+    #[test]
+    fn scan_follows_a_fragment_promoted_after_it_was_listed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let table = ParquetTable::open(
+            dir.path(),
+            1,
+            schema("promoted", &[PgType::Int4]),
+            Vec::new(),
+            Arc::clone(&wal),
+        )?;
+        let xid = tm.allocate_xid();
+        table.insert(vec![Value::Int4(7)], &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+
+        // Snapshot the fragment list (still `.pending`) before the rename lands,
+        // exactly as a concurrent session's scan would.
+        let scan = table.scan(&tm.context(Xid::INVALID, CommandId::FIRST));
+        table.finish_transaction(xid, true)?;
+        let rows = scan.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, vec![Value::Int4(7)]);
+        Ok(())
+    }
+
+    /// `recover` must reconcile *every* pending transaction it finds, including
+    /// when several interleave in the same directory. Reconciling from a live
+    /// `read_dir` stream while renaming/unlinking entries could skip some.
+    #[test]
+    fn recover_reconciles_every_pending_transaction() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let table = ParquetTable::open(
+            dir.path(),
+            1,
+            schema("interleaved", &[PgType::Int4]),
+            Vec::new(),
+            Arc::clone(&wal),
+        )?;
+        // Interleave several fragments from two transactions, leaving all of
+        // them `.pending` as an interrupted run would.
+        let (first, second) = (tm.allocate_xid(), tm.allocate_xid());
+        for value in 0..8 {
+            let xid = if value % 2 == 0 { first } else { second };
+            table.insert(
+                vec![Value::Int4(value)],
+                &tm.context(xid, CommandId::FIRST),
+            )?;
+        }
+        assert!(parquet_files(dir.path(), 1)?.is_empty());
+
+        let clog = Clog::new();
+        clog.set_committed(first);
+        clog.set_aborted(second);
+        table.recover(&clog)?;
+
+        // The committed transaction's four fragments were promoted; the aborted
+        // transaction's four were unlinked. Neither was left half-reconciled.
+        assert_eq!(parquet_files(dir.path(), 1)?.len(), 4);
+        let table_dir = dir.path().join("parquet").join("1");
+        let pending = std::fs::read_dir(&table_dir)?
+            .filter(|entry| {
+                entry.as_ref().is_ok_and(|entry| {
+                    entry.file_name().to_string_lossy().ends_with(".pending")
+                })
+            })
+            .count();
+        assert_eq!(pending, 0);
+        Ok(())
+    }
+
+    /// The finalize hook runs over every open Parquet table on every transaction
+    /// end, so a table the transaction never wrote to must answer from memory —
+    /// no directory scan, no fsync. Deleting the directory makes any filesystem
+    /// access observable as an error.
+    #[test]
+    fn finish_transaction_skips_tables_the_xid_never_wrote() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let table = ParquetTable::open(
+            dir.path(),
+            1,
+            schema("untouched", &[PgType::Int4]),
+            Vec::new(),
+            Arc::clone(&wal),
+        )?;
+        std::fs::remove_dir_all(dir.path().join("parquet").join("1"))?;
+        let xid = tm.allocate_xid();
+        table.finish_transaction(xid, true)?;
+        table.finish_transaction(xid, false)?;
+        Ok(())
+    }
+
+    /// `statistics()` intentionally returns the last ANALYZE's cached numbers,
+    /// so ANALYZE itself must re-measure — otherwise `relpages` freezes at the
+    /// first value recorded and never tracks the table's growth.
+    #[test]
+    fn measure_relpages_ignores_the_cached_analyze_result() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let table = ParquetTable::open(
+            dir.path(),
+            1,
+            schema("stats", &[PgType::Int4]),
+            Vec::new(),
+            Arc::clone(&wal),
+        )?;
+        let xid = tm.allocate_xid();
+        table.insert(vec![Value::Int4(1)], &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        table.finish_transaction(xid, true)?;
+
+        let measured = table.measure_relpages()?;
+        table.set_analyzed(9_999, 1.0);
+        assert_eq!(table.statistics().relpages, 9_999, "cache serves statistics");
+        assert_eq!(
+            table.measure_relpages()?,
+            measured,
+            "ANALYZE re-measures instead of reading its own cached value back"
+        );
         Ok(())
     }
 

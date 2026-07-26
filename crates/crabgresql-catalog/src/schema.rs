@@ -324,8 +324,14 @@ pub fn pg_namespace_schema() -> TableSchema {
 /// OID assigned to the heap access method (`pg_am` row `heap` = 2). Reported for
 /// every user relation's `relam`.
 const HEAP_AM_OID: u32 = 2;
-/// Stable extension-range OID assigned to the managed Parquet table method.
-pub const PARQUET_AM_OID: u32 = 16_384;
+/// Stable OID assigned to the managed Parquet table method. PostgreSQL has no
+/// such method, so the value is crabgresql's own — but it must stay *below*
+/// `FIRST_USER_OID` (16384), the point where the server's OID allocator starts
+/// handing out OIDs to user objects. A built-in catalog row at 16384 would share
+/// its OID with the first `CREATE TYPE`/`CREATE SCHEMA`, breaking the
+/// cluster-wide uniqueness clients assume. PostgreSQL reserves 1..16383 for
+/// built-ins for exactly this reason.
+pub const PARQUET_AM_OID: u32 = 16_000;
 /// OID of the `btree` index access method, shared by `pg_am` and the `relam` of
 /// every B-tree index's `pg_class` row so the join between them holds.
 const BTREE_AM_OID: u32 = 403;

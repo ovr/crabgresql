@@ -81,7 +81,9 @@ crates/crabgresql-parquet-engine for managed columnar table storage:
   Copyright The Apache Software Foundation
   Copyright (c) 2020-2022 Oliver Margetts
 
-licensed under Apache-2.0 AND MIT. Snappy compression is provided through
+`arrow-schema` and `parquet` are licensed under Apache-2.0; `arrow-array` is
+licensed under Apache-2.0 AND MIT (its arrow2-derived portions carry the
+Margetts copyright above). Snappy compression is provided through
 Parquet's `snap` feature and the BSD-3-Clause `snap` crate:
 
   Copyright 2011, The Snappy-Rust Authors
