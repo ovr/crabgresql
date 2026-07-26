@@ -62,6 +62,15 @@ SELECT reltuples FROM pg_class WHERE relname = 'an_t';
          2
 (1 row)
 
+-- TRUNCATE discards the measurement: it described the file that was swapped
+-- away, so the relation goes back to unknown rather than reporting stale rows.
+TRUNCATE an_t;
+SELECT reltuples FROM pg_class WHERE relname = 'an_t';
+ reltuples 
+-----------
+        -1
+(1 row)
+
 -- ANALYZE is accepted inside a READ ONLY transaction: it writes statistics, not
 -- data, and PostgreSQL does not treat that as a write.
 BEGIN TRANSACTION READ ONLY;

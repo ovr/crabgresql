@@ -399,6 +399,12 @@ impl RelCatalog {
             return Ok(Some(new));
         }
         rel.rel = new.0;
+        // Statistics describe the file being swapped out, so they do not carry
+        // over to the empty one. Clearing them here (rather than measuring zero)
+        // returns the relation to never-analyzed, which is what PostgreSQL
+        // reports after a TRUNCATE. Without this the stale row count would be
+        // re-persisted and reloaded on the next open.
+        rel.stats = None;
         // A `Temporary` table is excluded from `encode`, so persisting here would
         // rewrite + fsync the whole catalog to produce identical bytes. Update the
         // in-memory relfilenode (so a later DROP unlinks the right rel) but skip the
@@ -2011,6 +2017,38 @@ mod tests {
         assert_eq!(legacy.stats_in("public", "t"), None);
         // Everything the earlier tails carry still decodes.
         assert_eq!(legacy.schemas().len(), 2);
+
+        Ok(())
+    }
+
+    /// A committed TRUNCATE swaps the relfilenode; the measurement of the file
+    /// it swapped away must not survive, in memory or on the next open.
+    #[test]
+    fn a_relfilenode_swap_clears_the_persisted_statistics() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        catalog.create(&TableSchema::new(
+            "other",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        assert!(catalog.set_stats("public", "t", 17, 1234.0)?);
+        assert!(catalog.set_stats("public", "other", 3, 9.0)?);
+
+        let swapped = catalog.alloc_relfilenode();
+        catalog.swap_relfilenode("public", "t", swapped)?;
+        assert_eq!(catalog.stats_in("public", "t"), None);
+        // Only the truncated relation is affected.
+        assert_eq!(catalog.stats_in("public", "other"), Some((3, 9.0)));
+        drop(catalog);
+
+        // The clear was persisted, so a restart does not resurrect the old count.
+        let reopened = RelCatalog::load(dir.path())?;
+        assert_eq!(reopened.stats_in("public", "t"), None);
+        assert_eq!(reopened.stats_in("public", "other"), Some((3, 9.0)));
 
         Ok(())
     }

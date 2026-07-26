@@ -54,12 +54,10 @@ pub fn analyze_heap(table: &HeapTable, txn: &TxnContext, target: SampleTarget) -
         target_rows = target.target_rows,
         "ANALYZE: reading every row (sampling not implemented)"
     );
-    let reltuples = table.scan(txn).count() as f64;
-    // Read the page count *after* the scan: the scan pins the relation against a
-    // concurrent TRUNCATE, so this cannot observe a file the rows did not come
-    // from. A page count that fails to read leaves the pair self-consistent at
-    // zero pages rather than pairing a real row count with a bogus size.
-    let relpages = table.nblocks().unwrap_or(0);
+    // One call, so the row count and the page count describe the same file even
+    // when this transaction has a staged TRUNCATE or another commits one
+    // mid-measurement — see [`HeapTable::measure`].
+    let (relpages, reltuples) = table.measure(txn);
     RelStats {
         relpages,
         reltuples,

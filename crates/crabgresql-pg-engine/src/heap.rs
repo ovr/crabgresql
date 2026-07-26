@@ -121,8 +121,43 @@ impl HeapTable {
 
     /// The relation's size in 8 KB pages, straight from the storage manager
     /// (a file-length division, so O(1)). `Err` only on an I/O failure.
+    ///
+    /// Reports the **committed** relfilenode; a caller that must agree with a
+    /// scan should use [`HeapTable::measure`] instead.
     pub fn nblocks(&self) -> std::io::Result<u32> {
         self.engine.bufpool.smgr().nblocks(self.relfilenode())
+    }
+
+    /// Count the rows visible to `txn` and size the relation, as one consistent
+    /// observation: `(relpages, reltuples)`.
+    ///
+    /// Both halves must describe the *same* file, which needs two things a
+    /// naive `scan().count()` then `nblocks()` does not give:
+    ///
+    /// - **One relfilenode.** A scan reads [`HeapTable::effective_rel`] — the
+    ///   staged file when `txn` itself has an uncommitted TRUNCATE — while
+    ///   [`HeapTable::nblocks`] reads the committed one. Inside
+    ///   `BEGIN; TRUNCATE t; ANALYZE t;` those differ, pairing the new file's
+    ///   row count with the old file's size.
+    /// - **One lock hold.** The guard `scan` takes lives only as long as its
+    ///   iterator, so a `scan(..).count()` releases it before any later call;
+    ///   another session's TRUNCATE could commit in the gap and swap the file
+    ///   between the two reads. Holding a shared hold across both closes that
+    ///   window — nested shared holds by the same owner are refcounted, so the
+    ///   one `scan` takes underneath is harmless.
+    pub fn measure(&self, txn: &TxnContext) -> (u32, f64) {
+        let _guard = self.lock.acquire_shared(txn.lock_owner);
+        let rel = self.effective_rel(txn.xid);
+        let relpages = self
+            .engine
+            .bufpool
+            .smgr()
+            .nblocks(rel)
+            // Statistics are advisory: a size that cannot be read pairs a zero
+            // with the real count rather than failing the statement.
+            .unwrap_or(0);
+        let reltuples = self.scan(txn).count() as f64;
+        (relpages, reltuples)
     }
 
     /// Install the `ANALYZE` result the durable catalog holds for this relation,
@@ -303,6 +338,14 @@ impl HeapTable {
         let old = self.live_rel.swap(p.new_rel, Ordering::Relaxed);
         self.has_pending.store(false, Ordering::Release);
         self.insert_hint.store(0, Ordering::Relaxed);
+        // The measurement described the file that just went away, so drop it
+        // rather than let it describe the empty one. Back to never-analyzed —
+        // which is what PostgreSQL reports after a TRUNCATE (`relpages = 0`,
+        // `reltuples = -1`), not a measured zero.
+        *self
+            .analyzed
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned")) = None;
         Some((RelFileNode(old), p.owner))
     }
 

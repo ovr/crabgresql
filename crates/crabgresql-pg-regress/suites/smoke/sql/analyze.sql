@@ -32,6 +32,10 @@ SELECT reltuples FROM pg_class WHERE relname = 'an_t';
 DELETE FROM an_t WHERE id = 3;
 ANALYZE;
 SELECT reltuples FROM pg_class WHERE relname = 'an_t';
+-- TRUNCATE discards the measurement: it described the file that was swapped
+-- away, so the relation goes back to unknown rather than reporting stale rows.
+TRUNCATE an_t;
+SELECT reltuples FROM pg_class WHERE relname = 'an_t';
 -- ANALYZE is accepted inside a READ ONLY transaction: it writes statistics, not
 -- data, and PostgreSQL does not treat that as a write.
 BEGIN TRANSACTION READ ONLY;
