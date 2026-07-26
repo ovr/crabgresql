@@ -99,6 +99,14 @@ async fn backend_messages_survive_the_wire() -> anyhow::Result<()> {
     writer.command_complete("SELECT 1");
     writer.notice_response("00000", "heads up", Some("more detail"), Some(3));
     writer.error_response("42601", "syntax error");
+    writer.error_fields(
+        ErrorFields::error("P0001", "boom")
+            .with_hint("try harder")
+            .with_context(
+                "PL/pgSQL function inner() line 3 at RAISE\n\
+                 PL/pgSQL function outer() line 2 at PERFORM",
+            ),
+    );
     writer.write(&BackendMessage::NotificationResponse {
         pid: 99,
         channel: "chan".to_string(),
@@ -135,6 +143,16 @@ async fn backend_messages_survive_the_wire() -> anyhow::Result<()> {
                 .with_position(3),
         ),
         BackendMessage::ErrorResponse(ErrorFields::error("42601", "syntax error")),
+        // A multi-frame CONTEXT traceback: embedded newlines must survive the
+        // round trip, since that is how nested call frames are stacked.
+        BackendMessage::ErrorResponse(
+            ErrorFields::error("P0001", "boom")
+                .with_hint("try harder")
+                .with_context(
+                    "PL/pgSQL function inner() line 3 at RAISE\n\
+                     PL/pgSQL function outer() line 2 at PERFORM",
+                ),
+        ),
         BackendMessage::NotificationResponse {
             pid: 99,
             channel: "chan".to_string(),

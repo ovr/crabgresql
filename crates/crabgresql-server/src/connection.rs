@@ -18,8 +18,8 @@ use tokio::net::TcpStream;
 use crate::error::PgError;
 use crate::global_catalog::GlobalCatalog;
 use crate::query::{
-    Analyzed, BoundParams, Notice, NoticeSeverity, QueryResult, RowTag, analyze_statement,
-    execute_statement, prepare_copy_from, run_copy_insert,
+    Analyzed, BoundParams, Notice, QueryResult, RowTag, analyze_statement, execute_statement,
+    prepare_copy_from, run_copy_insert,
 };
 use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedRows};
 
@@ -286,13 +286,7 @@ fn report(
         let position = e
             .location
             .and_then(|(line, col)| sql.map(|s| char_position(s, line, col)));
-        writer.error_response_detailed(
-            e.code,
-            &e.message,
-            e.detail.as_deref(),
-            e.hint.as_deref(),
-            position,
-        );
+        writer.error_fields(e.to_fields(position));
         mark_transaction_failed(session);
         *skip_until_sync = true;
     }
@@ -340,13 +334,7 @@ async fn run_simple_query(
                 CopyOutcome::ConnectionClosed => return Ok(()),
                 CopyOutcome::Failed(e) => {
                     let position = e.location.map(|(line, col)| char_position(sql, line, col));
-                    writer.error_response_detailed(
-                        e.code,
-                        &e.message,
-                        e.detail.as_deref(),
-                        e.hint.as_deref(),
-                        position,
-                    );
+                    writer.error_fields(e.to_fields(position));
                     mark_transaction_failed(session);
                     return Ok(());
                 }
@@ -362,13 +350,7 @@ async fn run_simple_query(
             }
             Err(e) => {
                 let position = e.location.map(|(line, col)| char_position(sql, line, col));
-                writer.error_response_detailed(
-                    e.code,
-                    &e.message,
-                    e.detail.as_deref(),
-                    e.hint.as_deref(),
-                    position,
-                );
+                writer.error_fields(e.to_fields(position));
                 mark_transaction_failed(session);
                 return Ok(());
             }
@@ -552,7 +534,11 @@ async fn write_result(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        writer.error_response_full(e.code, &e.message, e.detail.as_deref(), None);
+                        // Mid-stream: rows have already gone out. The error can
+                        // still carry a HINT and a CONTEXT traceback (a routine
+                        // body raising on row N), so route it through the same
+                        // field builder as every other emission site.
+                        writer.error_fields(PgError::from(e).to_fields(None));
                         return Ok(WriteOutcome::Errored);
                     }
                 }
@@ -573,17 +559,10 @@ fn emit_notices(
     sql: Option<&str>,
 ) {
     for notice in notices {
-        match notice.severity {
-            NoticeSeverity::Warning => writer.warning_response(notice.code, &notice.message),
-            NoticeSeverity::Notice => writer.notice_response(
-                notice.code,
-                &notice.message,
-                notice.detail.as_deref(),
-                notice
-                    .location
-                    .and_then(|(line, col)| sql.map(|s| char_position(s, line, col))),
-            ),
-        }
+        let position = notice
+            .location
+            .and_then(|(line, col)| sql.map(|s| char_position(s, line, col)));
+        writer.notice_fields(notice.to_fields(position));
     }
 }
 

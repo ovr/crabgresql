@@ -262,6 +262,19 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
         self.write(&BackendMessage::NoticeResponse(fields));
     }
 
+    /// ErrorResponse from a pre-built field list — the escape hatch for errors
+    /// carrying more than the positional `error_response_*` helpers cover (a
+    /// CONTEXT traceback, a HINT and a position together, a non-ERROR severity).
+    pub fn error_fields(&mut self, fields: ErrorFields) {
+        self.write(&BackendMessage::ErrorResponse(fields));
+    }
+
+    /// NoticeResponse from a pre-built field list. The severity already in
+    /// `fields` selects NOTICE vs WARNING; both travel as a NoticeResponse.
+    pub fn notice_fields(&mut self, fields: ErrorFields) {
+        self.write(&BackendMessage::NoticeResponse(fields));
+    }
+
     /// NoticeResponse with severity WARNING — e.g. "there is no transaction in
     /// progress" on a redundant COMMIT/ROLLBACK.
     pub fn warning_response(&mut self, code: &str, message: &str) {

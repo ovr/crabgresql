@@ -4,6 +4,7 @@
 //! (CREATE TABLE) and session commands (SET) execute directly here until the
 //! catalog and GUC store exist.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use crabgresql_executor::{
     CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, OutputColumn, execute,
 };
 use crabgresql_parser::ast;
-use crabgresql_pg_wire::{TransactionStatus, sqlstate};
+use crabgresql_pg_wire::{ErrorFields, TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
     PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
@@ -46,13 +47,17 @@ pub enum NoticeSeverity {
 /// A non-error message sent before a command's CommandComplete.
 pub struct Notice {
     pub severity: NoticeSeverity,
-    pub code: &'static str,
+    pub code: Cow<'static, str>,
     pub message: String,
     pub detail: Option<String>,
+    pub hint: Option<String>,
     /// 1-based (line, column) of the token this NOTICE points at, when PG
     /// renders a `LINE n:` cursor excerpt. Converted to a wire character offset
     /// when the NOTICE is sent.
     pub location: Option<(u64, u64)>,
+    /// The `CONTEXT:` traceback, innermost frame first — PG attaches one to a
+    /// `RAISE NOTICE` inside a routine body just as it does to an error.
+    pub context: Vec<String>,
 }
 
 impl Notice {
@@ -60,10 +65,12 @@ impl Notice {
     fn warning(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             severity: NoticeSeverity::Warning,
-            code,
+            code: Cow::Borrowed(code),
             message: message.into(),
             detail: None,
+            hint: None,
             location: None,
+            context: Vec::new(),
         }
     }
 
@@ -74,11 +81,36 @@ impl Notice {
             severity: NoticeSeverity::Notice,
             // psql does not print the SQLSTATE of a NOTICE; PG uses
             // successful_completion (00000) for these.
-            code: "00000",
+            code: Cow::Borrowed("00000"),
             message: message.into(),
             detail,
+            hint: None,
             location: None,
+            context: Vec::new(),
         }
+    }
+
+    /// The wire fields for this notice. `position` is the cursor offset the
+    /// caller resolved from [`Notice::location`]; only the caller holds the SQL
+    /// text needed to convert (line, column) into a character offset.
+    pub fn to_fields(&self, position: Option<usize>) -> ErrorFields {
+        let mut fields = match self.severity {
+            NoticeSeverity::Notice => ErrorFields::notice(&self.code, &self.message),
+            NoticeSeverity::Warning => ErrorFields::warning(&self.code, &self.message),
+        };
+        if let Some(detail) = &self.detail {
+            fields = fields.with_detail(detail);
+        }
+        if let Some(hint) = &self.hint {
+            fields = fields.with_hint(hint);
+        }
+        if let Some(position) = position {
+            fields = fields.with_position(position);
+        }
+        if !self.context.is_empty() {
+            fields = fields.with_context(&self.context.join("\n"));
+        }
+        fields
     }
 }
 

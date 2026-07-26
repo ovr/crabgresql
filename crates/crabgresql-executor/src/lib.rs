@@ -13,6 +13,7 @@ pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -134,11 +135,20 @@ impl Default for ExecContext {
 /// result set have already been sent.
 #[derive(Debug)]
 pub struct ExecError {
-    /// 5-character SQLSTATE code.
-    pub code: &'static str,
+    /// 5-character SQLSTATE code. A `Cow` because a routine body can name its
+    /// own SQLSTATE at runtime (`RAISE ... USING ERRCODE`); every built-in
+    /// error still passes a `&'static str` from [`sqlstate`].
+    pub code: Cow<'static, str>,
     pub message: String,
     /// Optional DETAIL line (e.g. numeric field overflow explains the p/s).
     pub detail: Option<String>,
+    /// Optional HINT line.
+    pub hint: Option<String>,
+    /// The `CONTEXT:` traceback: the call frames this error unwound through,
+    /// innermost first. Empty for an error raised at the top level. Accreted
+    /// while unwinding rather than tracked in a frame stack, so the happy path
+    /// costs nothing and there is no pop to forget.
+    pub context: Vec<String>,
 }
 
 impl std::fmt::Display for ExecError {
@@ -150,11 +160,13 @@ impl std::fmt::Display for ExecError {
 impl std::error::Error for ExecError {}
 
 impl ExecError {
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.into(),
             message: message.into(),
             detail: None,
+            hint: None,
+            context: Vec::new(),
         }
     }
 
@@ -162,6 +174,25 @@ impl ExecError {
     pub fn with_detail(mut self, detail: Option<String>) -> Self {
         self.detail = detail;
         self
+    }
+
+    /// Attach a HINT line.
+    pub fn with_hint(mut self, hint: Option<String>) -> Self {
+        self.hint = hint;
+        self
+    }
+
+    /// Record the call frame this error is propagating out of. Called while
+    /// unwinding, so frames land innermost-first without a frame stack.
+    pub fn push_context(mut self, frame: impl Into<String>) -> Self {
+        self.context.push(frame.into());
+        self
+    }
+
+    /// The `CONTEXT` wire field: frames newline-joined, innermost first, or
+    /// `None` when no frame contributed.
+    pub fn context(&self) -> Option<String> {
+        (!self.context.is_empty()).then(|| self.context.join("\n"))
     }
 }
 

@@ -81,6 +81,11 @@ pub struct BindError {
     /// cursor position (`LINE n: ... ^`). Only set for literal input-function
     /// failures and ambiguous operators, mirroring PG.
     pub location: Option<(u64, u64)>,
+    /// The `CONTEXT:` traceback: the call frames this error unwound through,
+    /// innermost first. Non-empty only when binding happened inside a routine
+    /// body (a `LANGUAGE SQL` inline expansion, or a statement in a PL/pgSQL
+    /// body bound at call time).
+    pub context: Vec<String>,
 }
 
 impl std::fmt::Display for BindError {
@@ -99,6 +104,7 @@ impl BindError {
             detail: None,
             hint: None,
             location: None,
+            context: Vec::new(),
         }
     }
 
@@ -106,6 +112,19 @@ impl BindError {
     pub fn with_detail(mut self, detail: Option<String>) -> Self {
         self.detail = detail;
         self
+    }
+
+    /// Record the call frame this error is propagating out of. Called while
+    /// unwinding, so frames land innermost-first without a frame stack.
+    pub fn push_context(mut self, frame: impl Into<String>) -> Self {
+        self.context.push(frame.into());
+        self
+    }
+
+    /// The `CONTEXT` wire field: frames newline-joined, innermost first, or
+    /// `None` when no frame contributed.
+    pub fn context(&self) -> Option<String> {
+        (!self.context.is_empty()).then(|| self.context.join("\n"))
     }
 
     /// Attach a HINT line.
