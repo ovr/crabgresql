@@ -35,6 +35,11 @@ CREATE TABLE pgcat_reflect (id int4, label text);
 SELECT relname, relkind, relnatts, relpersistence
   FROM pg_class
  WHERE relname = 'pgcat_reflect';
+-- size bookkeeping is only written by ANALYZE, so a fresh relation reports
+-- PG's never-analyzed sentinel: no pages, reltuples = -1 (unknown, not zero)
+SELECT relname, relpages, reltuples, relallvisible
+  FROM pg_class
+ WHERE relname = 'pgcat_reflect';
 -- pg_attribute joined to pg_class lists that relation's columns, in order,
 -- with PG's type OIDs (23 = int4, 25 = text) and typlen (-1 = varlena)
 SELECT a.attname, a.atttypid, a.attlen, a.attnum

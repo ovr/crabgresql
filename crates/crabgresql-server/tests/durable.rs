@@ -586,3 +586,69 @@ async fn partition_metadata_survives_restart() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `ANALYZE` is non-transactional and durable: its result survives both a
+/// `ROLLBACK` and a full server restart, matching PostgreSQL.
+#[tokio::test]
+async fn analyze_statistics_are_nontransactional_and_survive_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let reltuples = |messages: &[SimpleQueryMessage]| -> Option<String> {
+        rows(messages).first()?.get(0).map(str::to_string)
+    };
+    const SIZE: &str =
+        "SELECT reltuples::int FROM pg_class WHERE relname = 'meas'";
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client.simple_query("CREATE TABLE meas (id int)").await?;
+        client
+            .simple_query("INSERT INTO meas VALUES (1), (2), (3)")
+            .await?;
+        // Until ANALYZE runs, pg_class reports the never-analyzed sentinel
+        // rather than the real size — as PostgreSQL does.
+        assert_eq!(
+            reltuples(&client.simple_query(SIZE).await?).as_deref(),
+            Some("-1")
+        );
+
+        client.simple_query("ANALYZE meas").await?;
+        assert_eq!(
+            reltuples(&client.simple_query(SIZE).await?).as_deref(),
+            Some("3")
+        );
+
+        // An ANALYZE inside a transaction that then rolls back still stands:
+        // statistics are not transactional.
+        client.simple_query("BEGIN").await?;
+        client.simple_query("INSERT INTO meas VALUES (4)").await?;
+        client.simple_query("ANALYZE meas").await?;
+        client.simple_query("ROLLBACK").await?;
+        assert_eq!(
+            reltuples(&client.simple_query(SIZE).await?).as_deref(),
+            Some("4"),
+            "a rolled-back ANALYZE result must not be rewound"
+        );
+        shutdown(client, handle).await;
+    }
+
+    // Boot 2 over the same directory: the measurement is still there, and the
+    // row the rollback removed is still gone.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        assert_eq!(
+            reltuples(&client.simple_query(SIZE).await?).as_deref(),
+            Some("4")
+        );
+        // Re-measuring after the restart sees the truth again.
+        client.simple_query("ANALYZE meas").await?;
+        assert_eq!(
+            reltuples(&client.simple_query(SIZE).await?).as_deref(),
+            Some("3")
+        );
+        shutdown(client, handle).await;
+    }
+
+    Ok(())
+}

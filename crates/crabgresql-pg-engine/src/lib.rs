@@ -19,6 +19,7 @@
 //! full-page writes / torn-page protection beyond page checksums, WAL segment
 //! recycling, and a transactional relation catalog.
 
+mod analyze;
 mod btkey;
 mod btpage;
 mod btrec;
@@ -44,7 +45,7 @@ use crabgresql_storage_api::{
     IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition, StorageError, TableAm,
     TableEngine, TableSchema, ViewDefinition,
 };
-use crabgresql_txn::{Clog, TxnFinalize, Xid};
+use crabgresql_txn::{Clog, TxnContext, TxnFinalize, Xid};
 use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, read_control, recover, write_control};
 
 use crate::btredo::BtreeRedo;
@@ -152,10 +153,14 @@ impl PgEngine {
         let mut tables = HashMap::new();
         for (name, rel, schema, indexes) in catalog.schemas() {
             let namespace = schema.namespace.clone();
-            tables.insert(
-                (namespace, name),
-                Arc::new(HeapTable::new(Arc::clone(&inner), rel, schema, indexes)),
-            );
+            let table = HeapTable::new(Arc::clone(&inner), rel, schema, indexes);
+            // Restore the last ANALYZE result so the planner does not fall back
+            // to a size-derived guess for a relation that was measured before
+            // the restart.
+            if let Some((relpages, reltuples)) = catalog.stats_in(&namespace, &name) {
+                table.set_analyzed(relpages, reltuples);
+            }
+            tables.insert((namespace, name), Arc::new(table));
         }
         Ok(PgEngine {
             inner,
@@ -487,6 +492,29 @@ impl TableEngine for PgEngine {
         self.resolve(Some("public"), name)
     }
 
+    fn analyze(&self, namespace: &str, name: &str, txn: &TxnContext) -> Result<(), StorageError> {
+        let table = {
+            let tables = self
+                .tables
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            tables
+                .get(&(namespace.to_string(), name.to_string()))
+                .cloned()
+                .ok_or_else(|| StorageError::TableNotFound(name.to_string()))?
+        };
+        // Scan outside the tables lock: measuring a large relation must not block
+        // concurrent DDL on unrelated tables.
+        let stats = crate::analyze::analyze_heap(&table, txn, analyze::SampleTarget::default());
+        // Publish to the live handle first, then durably. A crash between the two
+        // loses the result, which is exactly the guarantee statistics carry.
+        table.set_analyzed(stats.relpages, stats.reltuples);
+        self.catalog
+            .set_stats(namespace, name, stats.relpages, stats.reltuples)
+            .expect("relation catalog write failed");
+        Ok(())
+    }
+
     fn shutdown(&self) {
         // Flush everything and mark the control file clean, so the next startup
         // keeps unlogged relations' data. Reuse the last checkpoint's next_xid — a
@@ -682,6 +710,7 @@ impl TableEngine for PgEngine {
             .map(|t| RelationMetadata {
                 schema: t.schema().clone(),
                 indexes: t.indexes(),
+                stats: t.statistics(),
             })
             .collect()
     }

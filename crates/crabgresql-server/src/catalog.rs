@@ -11,6 +11,7 @@ use crabgresql_storage_api::{
     IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition, StorageError, TableAm,
     TableEngine, TableSchema, ViewDefinition,
 };
+use crabgresql_txn::TxnContext;
 
 /// The executor-facing catalog handle: answers `pg_get_userbyid` and
 /// `pg_table_is_visible` against the same [`SystemCatalog`] snapshot that built
@@ -308,6 +309,19 @@ impl TableEngine for SessionCatalog {
 
     fn relation_metadata(&self) -> Vec<RelationMetadata> {
         self.global.relation_metadata()
+    }
+
+    /// Analyze the same relation `open_table` would resolve: this session's temp
+    /// table shadows a permanent one of the same unqualified name, and another
+    /// session's temp table is never reachable.
+    fn analyze(&self, namespace: &str, name: &str, txn: &TxnContext) -> Result<(), StorageError> {
+        if namespace == "public" && self.temp_has(name) {
+            self.global.analyze(&self.temp_schema, name, txn)
+        } else if self.is_foreign_temp(namespace) {
+            Err(StorageError::TableNotFound(name.to_string()))
+        } else {
+            self.global.analyze(namespace, name, txn)
+        }
     }
 
     /// A view is created in the permanent (global) catalog; temp views are not

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::{
-    Column, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableAm,
-    TableEngine, TableSchema, Tid, Tuple, UpdateResult,
+    Column, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, StorageError,
+    TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, CommandId, CommitSink, LockOwner, TransactionManager, TxnContext, TxnFinalize, Xid,
@@ -349,6 +349,157 @@ fn truncate_empties_table() -> anyhow::Result<()> {
     assert_eq!(ids(&h.tm, &*table), vec![Value::Int4(3)]);
 
     Ok(())
+}
+
+#[test]
+fn statistics_track_the_relations_physical_size() -> anyhow::Result<()> {
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+
+    // A brand-new relation occupies no pages and so estimates no rows.
+    let empty = table.statistics();
+    assert_eq!(empty.relpages, 0);
+    assert_eq!(empty.reltuples, 0.0);
+    assert!(
+        !empty.analyzed,
+        "a size-derived estimate must not claim to be analyzed"
+    );
+
+    // Enough rows to span several 8 KB pages, so the page count is meaningful.
+    for i in 0..1000 {
+        insert_committed(
+            &h.tm,
+            &*table,
+            vec![Value::Int4(i), Value::Text("x".repeat(40))],
+        );
+    }
+    let full = table.statistics();
+    assert!(full.relpages > 1, "expected several pages, got {full:?}");
+    // The estimate divides page space by an assumed row width, so it is only
+    // ever a rough figure — assert the order of magnitude, not the number.
+    assert!(
+        (250.0..=4000.0).contains(&full.reltuples),
+        "1000 rows should estimate within a factor of 4: {full:?}"
+    );
+
+    // TRUNCATE swaps in a fresh, empty relfilenode, so the estimate must follow
+    // it back down — and only once the swap has committed.
+    let tx = h.tm.allocate_xid();
+    table.truncate(&h.tm.context(tx, CommandId::FIRST));
+    h.tm.commit(tx)?;
+    assert_eq!(table.statistics().relpages, 0);
+
+    Ok(())
+}
+
+#[test]
+fn analyze_counts_visible_rows_exactly() -> anyhow::Result<()> {
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    for i in 0..250 {
+        insert_committed(&h.tm, &*table, vec![Value::Int4(i), Value::Null]);
+    }
+    // An uncommitted insert and a committed delete: ANALYZE measures what a
+    // reader can see, so neither should be counted.
+    let pending = h.tm.allocate_xid();
+    table.insert(
+        vec![Value::Int4(9998), Value::Null],
+        &h.tm.context(pending, CommandId::FIRST),
+    );
+    let gone = table
+        .scan(&read(&h.tm))
+        .next()
+        .map(|(tid, _)| tid)
+        .expect("seeded rows");
+    let del = h.tm.allocate_xid();
+    table.delete(gone, &h.tm.context(del, CommandId::FIRST));
+    h.tm.commit(del)?;
+
+    let xid = h.tm.allocate_xid();
+    h.engine.analyze("public", "t", &h.tm.context(xid, CommandId::FIRST))?;
+    h.tm.commit(xid)?;
+
+    let stats = table.statistics();
+    assert!(stats.analyzed);
+    assert_eq!(stats.reltuples, 249.0, "{stats:?}");
+    assert!(stats.relpages > 0, "{stats:?}");
+
+    Ok(())
+}
+
+#[test]
+fn truncate_discards_the_analyze_result() -> anyhow::Result<()> {
+    // Regression: statistics describe the file TRUNCATE swaps away, so keeping
+    // them would report the pre-truncate row count for an empty relation
+    // forever. PostgreSQL returns the relation to never-analyzed.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    for i in 0..200 {
+        insert_committed(&h.tm, &*table, vec![Value::Int4(i), Value::Null]);
+    }
+    let xid = h.tm.allocate_xid();
+    h.engine
+        .analyze("public", "t", &h.tm.context(xid, CommandId::FIRST))?;
+    h.tm.commit(xid)?;
+    assert_eq!(table.statistics().reltuples, 200.0);
+
+    let tx = h.tm.allocate_xid();
+    table.truncate(&h.tm.context(tx, CommandId::FIRST));
+    h.tm.commit(tx)?;
+
+    let stats = table.statistics();
+    assert!(
+        !stats.analyzed,
+        "TRUNCATE must return the relation to never-analyzed, got {stats:?}"
+    );
+    assert_eq!(stats.relpages, 0);
+    assert_eq!(stats.reltuples, 0.0);
+
+    Ok(())
+}
+
+#[test]
+fn analyze_inside_an_uncommitted_truncate_measures_one_file() -> anyhow::Result<()> {
+    // Regression: the scan reads the transaction's staged (empty) file while a
+    // bare nblocks() reads the committed one, which paired a zero row count
+    // with the old file's page count — and survived the rollback, because
+    // statistics are not transactional.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    for i in 0..500 {
+        insert_committed(
+            &h.tm,
+            &*table,
+            vec![Value::Int4(i), Value::Text("x".repeat(40))],
+        );
+    }
+    assert!(table.statistics().relpages > 1);
+
+    // One transaction: stage a TRUNCATE, then analyze inside it.
+    let tx = h.tm.allocate_xid();
+    let ctx = h.tm.context(tx, CommandId::FIRST);
+    table.truncate(&ctx);
+    h.engine.analyze("public", "t", &ctx)?;
+    let staged = table.statistics();
+    assert_eq!(
+        (staged.relpages, staged.reltuples),
+        (0, 0.0),
+        "the staged empty file must be measured as a whole, got {staged:?}"
+    );
+    h.tm.abort(tx);
+
+    Ok(())
+}
+
+#[test]
+fn analyze_of_a_missing_relation_reports_it_as_absent() {
+    let h = setup();
+    let xid = h.tm.allocate_xid();
+    let error = h
+        .engine
+        .analyze("public", "nosuch", &h.tm.context(xid, CommandId::FIRST))
+        .expect_err("analyzing a missing relation must fail");
+    assert!(matches!(error, StorageError::TableNotFound(name) if name == "nosuch"));
 }
 
 #[test]
