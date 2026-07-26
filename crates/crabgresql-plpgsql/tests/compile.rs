@@ -5,6 +5,8 @@
 use crabgresql_plpgsql::ast::{LoopDirection, RaiseLevel, SqlFragment, Stmt, VarId};
 use crabgresql_plpgsql::{CompileError, Routine, compile};
 
+/// Frame slots run: arguments, then `FOUND` (which PostgreSQL makes a real
+/// variable of the routine's outermost scope), then declarations in order.
 fn args(names: &[&str]) -> Vec<Option<String>> {
     names.iter().map(|n| Some((*n).to_string())).collect()
 }
@@ -31,11 +33,7 @@ fn variables_become_placeholders_and_the_rest_is_verbatim() {
     let [Stmt::Assign { target, value, .. }] = &routine.block.stmts[..] else {
         panic!("expected one assignment");
     };
-    assert_eq!(
-        *target,
-        VarId(2),
-        "x is the third slot, after two arguments"
-    );
+    assert_eq!(*target, VarId(3), "x follows two arguments and FOUND");
     assert_eq!(value.text, "$1 + $2 * 2");
     assert_eq!(value.params, vec![VarId(0), VarId(1)]);
 }
@@ -120,7 +118,7 @@ fn declarations_carry_their_type_text_and_modifiers() {
     assert_eq!(decls[3].type_text, "myenum");
     assert!(decls[3].init.is_none());
 
-    assert_eq!(routine.nvars, 4);
+    assert_eq!(routine.nvars, 5, "four declarations plus FOUND");
 }
 
 /// NOT NULL without an initializer is a definition-time error in PostgreSQL,
@@ -169,8 +167,8 @@ fn nested_blocks_shadow_and_then_restore() {
     else {
         panic!("expected one assignment inside");
     };
-    assert_eq!(shadowed.params, vec![VarId(3)], "the inner x");
-    assert_eq!(outer.params, vec![VarId(0)], "the outer x again");
+    assert_eq!(shadowed.params, vec![VarId(4)], "the inner x");
+    assert_eq!(outer.params, vec![VarId(1)], "the outer x again");
 }
 
 #[test]
@@ -269,7 +267,7 @@ fn for_loop_variable_is_scoped_to_the_loop_and_shadows() {
         panic!("expected one assignment in the body");
     };
     assert_eq!(inside.params, vec![*var], "the loop variable");
-    assert_eq!(after.params, vec![VarId(0)], "the declared i again");
+    assert_eq!(after.params, vec![VarId(1)], "the declared i again");
 }
 
 #[test]
@@ -354,7 +352,7 @@ fn select_into_lifts_its_targets_out_of_the_query() {
         panic!("expected one SELECT INTO, got {:?}", routine.block.stmts);
     };
     assert_eq!(query.text, "SELECT count(*), max(id) FROM t WHERE x = $1");
-    assert_eq!(targets, &[VarId(1), VarId(2)]);
+    assert_eq!(targets, &[VarId(2), VarId(3)]);
     assert!(!strict);
     assert_eq!(query.params, vec![VarId(0)]);
 }
@@ -393,7 +391,7 @@ fn insert_into_is_not_a_select_into() {
         panic!("expected an INTO statement");
     };
     assert_eq!(query.text, "INSERT INTO t (x) VALUES (1) RETURNING id");
-    assert_eq!(targets, &[VarId(0)]);
+    assert_eq!(targets, &[VarId(1)]);
 }
 
 #[test]

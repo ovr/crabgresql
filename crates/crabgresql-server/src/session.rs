@@ -426,6 +426,7 @@ impl Session {
             sequences: None,
             catalog: None,
             txn: None,
+            ..ExecContext::default()
         }
     }
 
@@ -449,6 +450,7 @@ impl Session {
             ))),
             catalog: Some(Arc::clone(catalog)),
             txn: None,
+            ..ExecContext::default()
         }
     }
 }

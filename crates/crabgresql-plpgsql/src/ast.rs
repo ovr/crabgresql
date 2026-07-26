@@ -272,6 +272,9 @@ pub struct Routine {
     /// The routine's parameter names, in declaration order. Slots `0..len` of
     /// the frame hold the arguments, reachable by these names and as `$n`.
     pub arg_names: Vec<Option<String>>,
+    /// The slot holding `FOUND`, which PostgreSQL makes a real variable of the
+    /// routine's outermost scope rather than a magic expression.
+    pub found: VarId,
     pub block: Block,
     /// Total frame size — every declaration in every nested block gets its own
     /// slot, so entering a block never reallocates.

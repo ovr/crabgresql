@@ -318,7 +318,7 @@ impl<'a> Lexer<'a> {
     /// Convert a 1-based (line, column) to a byte offset. The tokenizer counts
     /// columns in characters, so the column is walked as a `char` count rather
     /// than added to the line's byte offset.
-    fn offset_of(&self, line: u64, column: u64) -> Option<usize> {
+    pub fn offset_of(&self, line: u64, column: u64) -> Option<usize> {
         let line_start = *self.line_starts.get(line.checked_sub(1)? as usize)?;
         let rest = self.src.get(line_start..)?;
         let col = column.saturating_sub(1) as usize;

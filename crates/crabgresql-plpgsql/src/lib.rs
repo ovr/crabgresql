@@ -26,10 +26,35 @@
 //! routine through [`crabgresql_executor::RoutineOps`], a trait object the
 //! server installs on the execution context — the same escape hatch the
 //! sequence and catalog functions already use.
+//!
+//! # Known divergences from PostgreSQL
+//!
+//! - **Variable/column conflicts resolve in the variable's favour.** When a
+//!   routine variable and a column of a table in the query share a name, the
+//!   variable wins. PostgreSQL makes this configurable through
+//!   `plpgsql.variable_conflict` and defaults to raising an ambiguity error;
+//!   deciding that needs the binder's view of which columns are in scope, which
+//!   compilation deliberately does not have. Variable-wins is PostgreSQL's
+//!   historical behavior and what almost all real code assumes.
+//! - **Assignment uses an explicit cast, not an assignment cast.** The two
+//!   differ only at the edges — an explicit cast to `varchar(5)` truncates
+//!   where an assignment cast would raise.
+//! - **`EXCEPTION` handlers are rejected.** A handler needs a subtransaction
+//!   per block entry, and this engine has no savepoints yet. Without handlers,
+//!   an error in a body aborts the whole transaction — which is exactly what
+//!   PostgreSQL does for a body that has none.
+//! - `SETOF` / `RETURN NEXT` / `RETURN QUERY`, cursors, `EXECUTE`,
+//!   `FOR ... IN <query>`, `FOREACH`, `GET DIAGNOSTICS` and record / `%TYPE`
+//!   variables are not implemented; each is reported as `0A000` by name rather
+//!   than as a syntax error.
 
 pub mod ast;
+mod condition;
+mod exec;
+mod frame;
 mod lexer;
 mod parse;
 
 pub use ast::{CompileError, Routine};
+pub use exec::{Interpreter, RoutineCache, RoutineDef, RoutineSource};
 pub use parse::{compile, compile_inline_block};

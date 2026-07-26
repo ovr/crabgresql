@@ -54,6 +54,8 @@ struct Compiler<'a> {
     /// refers to.
     nargs: usize,
     arg_names: Vec<Option<String>>,
+    /// The slot holding `FOUND`.
+    found: VarId,
     /// Loop labels currently in scope, innermost last, for `EXIT`/`CONTINUE`.
     loop_labels: Vec<Option<String>>,
     /// Block labels currently in scope, for `EXIT <label>` out of a block.
@@ -68,12 +70,21 @@ impl<'a> Compiler<'a> {
                 args.insert(name.clone(), VarId(i));
             }
         }
+        // `FOUND` is a real variable in PostgreSQL, not a magic expression:
+        // it lives in the routine's outermost scope, starts false, and is
+        // updated by every statement that can report whether it matched a row.
+        // Giving it a frame slot means a reference to it lifts into a `$n` like
+        // any other variable, with no special case in the fragment rewriter.
+        let found = VarId(arg_names.len());
+        args.insert("found".to_string(), found);
+
         Ok(Self {
             lex: Lexer::new(body)?,
             scopes: vec![args],
-            nvars: arg_names.len(),
+            nvars: arg_names.len() + 1,
             nargs: arg_names.len(),
             arg_names: arg_names.to_vec(),
+            found,
             loop_labels: Vec::new(),
             block_labels: Vec::new(),
         })
@@ -89,6 +100,7 @@ impl<'a> Compiler<'a> {
         }
         Ok(Routine {
             arg_names: self.arg_names,
+            found: self.found,
             block,
             nvars: self.nvars,
         })
@@ -809,6 +821,7 @@ impl<'a> Compiler<'a> {
             return Err(CompileError::syntax("missing expression", line));
         }
         let inner = Lexer::new(text)?;
+        let name_spans = name_positions(&inner, text);
         let mut params: Vec<VarId> = Vec::new();
         let mut out = String::with_capacity(text.len());
         let mut copied = 0usize;
@@ -818,6 +831,12 @@ impl<'a> Compiler<'a> {
             else {
                 continue;
             };
+            if name_spans
+                .iter()
+                .any(|(s, e)| tok_start >= *s && tok_end <= *e)
+            {
+                continue;
+            }
             if let Some(var) = self.fragment_var(&inner, i) {
                 out.push_str(inner.slice_bytes(copied, tok_start));
                 // A variable referenced twice reuses one placeholder, so the
@@ -922,6 +941,58 @@ fn describe(stop: &[Stop]) -> String {
         })
         .collect();
     names.join(" or ")
+}
+
+/// Byte ranges of identifiers that name a *column* rather than stand for an
+/// expression, and so must never be rewritten to a placeholder.
+///
+/// The two that matter — an `INSERT`'s column list and an `UPDATE`'s `SET`
+/// targets — are indistinguishable from an expression at the token level, and
+/// both routinely share a name with a routine variable: `INSERT INTO t (n)
+/// VALUES (n)` means "insert the variable n into the column n". Substituting
+/// the first `n` would turn the statement into nonsense.
+///
+/// The statement is parsed to find them. Text that does not parse yields no
+/// exclusions, which is the safe direction: the binder reports the syntax error
+/// at call time either way.
+fn name_positions(lex: &Lexer<'_>, text: &str) -> Vec<(usize, usize)> {
+    use crabgresql_parser::ast::{AssignmentTarget, Spanned, Statement};
+
+    let Ok(statements) = crabgresql_parser::parse(text) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    let mut push = |span: crabgresql_parser::Span| {
+        if let (Some(start), Some(end)) = (
+            lex.offset_of(span.start.line, span.start.column),
+            lex.offset_of(span.end.line, span.end.column),
+        ) {
+            spans.push((start, end));
+        }
+    };
+    for statement in &statements {
+        match statement {
+            Statement::Insert(insert) => {
+                for column in &insert.columns {
+                    push(column.span());
+                }
+            }
+            Statement::Update(update) => {
+                for assignment in &update.assignments {
+                    match &assignment.target {
+                        AssignmentTarget::ColumnName(name) => push(name.span()),
+                        AssignmentTarget::Tuple(names) => {
+                            for name in names {
+                                push(name.span());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
 }
 
 /// An identifier's value, folded to lowercase unless it was quoted.
