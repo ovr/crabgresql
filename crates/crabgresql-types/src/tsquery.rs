@@ -1035,13 +1035,36 @@ fn intersect(a: PosSet, b: PosSet) -> PosSet {
         // if the other is unknown -- three-valued `NO & MAYBE` is `NO`.
         (PosSet::Exact(v), _) | (_, PosSet::Exact(v)) if v.is_empty() => PosSet::Exact(v),
         (PosSet::Unknown, _) | (_, PosSet::Unknown) => PosSet::Unknown,
-        (PosSet::Exact(x), PosSet::Exact(y)) => {
-            // Both sides are sorted by end, not start, so walk the shorter one
-            // and probe the other by start.
+        (PosSet::Exact(mut x), PosSet::Exact(mut y)) => {
+            // Re-sort by start and merge, rather than probing one side per
+            // element of the other: both operands can reach the position
+            // ceiling via a `|` chain, and the product of two such sets is
+            // ~268M pair visits *per row*.
+            //
+            // Within a group of equal starts every pair contributes whichever
+            // span reaches further, so the result is each side's members that
+            // reach at least as far as the other side's shortest -- linear in
+            // the group sizes instead of quadratic.
+            x.sort_unstable_by_key(|m| (m.start(), m.end));
+            y.sort_unstable_by_key(|m| (m.start(), m.end));
             let mut out = Vec::new();
-            for sx in &x {
-                for sy in starting_at(&y, sx.start()) {
-                    out.push(longer(*sx, sy));
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < x.len() && j < y.len() {
+                let (sx, sy) = (x[i].start(), y[j].start());
+                match sx.cmp(&sy) {
+                    Ordering::Less => i += x[i..].partition_point(|m| m.start() == sx),
+                    Ordering::Greater => j += y[j..].partition_point(|m| m.start() == sy),
+                    Ordering::Equal => {
+                        let xe = i + x[i..].partition_point(|m| m.start() == sx);
+                        let ye = j + y[j..].partition_point(|m| m.start() == sy);
+                        // Sorted by end within the group, so the first is the
+                        // shortest.
+                        let (shortest_x, shortest_y) = (x[i].end, y[j].end);
+                        out.extend(x[i..xe].iter().copied().filter(|m| m.end >= shortest_y));
+                        out.extend(y[j..ye].iter().copied().filter(|m| m.end >= shortest_x));
+                        i = xe;
+                        j = ye;
+                    }
                 }
             }
             PosSet::Exact(norm_spans(out))
