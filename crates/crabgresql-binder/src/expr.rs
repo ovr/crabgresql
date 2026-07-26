@@ -2401,22 +2401,32 @@ fn precision_of(info: &ast::ExactNumberInfo) -> Option<u64> {
     }
 }
 
+/// Resolve a written type name to a [`PgType`], falling back to the catalog for
+/// `CREATE TYPE` names. This is the resolution a cast target goes through, so a
+/// type name that works in `expr::t` works everywhere this is used — notably a
+/// PL/pgSQL variable declaration, whose type is lifted out of the routine body
+/// as text.
+pub fn resolve_data_type(
+    catalog: &Arc<dyn TypeCatalog>,
+    data_type: &ast::DataType,
+) -> Result<PgType, BindError> {
+    match map_data_type(data_type) {
+        Ok(t) => Ok(t),
+        // Not a builtin type name — it may be a `CREATE TYPE` name; resolve it
+        // against the catalog, else surface the original "not supported" error.
+        Err(e) => match custom_type_name(data_type).and_then(|n| catalog.resolve_type(&n)) {
+            Some(ut) => Ok(PgType::User(ut.oid)),
+            None => Err(e),
+        },
+    }
+}
+
 fn bind_cast(
     inner: &ast::Expr,
     data_type: &ast::DataType,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
-    let target = match map_data_type(data_type) {
-        Ok(t) => t,
-        // Not a builtin type name — it may be a `CREATE TYPE` name; resolve it
-        // against the catalog, else surface the original "not supported" error.
-        Err(e) => {
-            match custom_type_name(data_type).and_then(|n| scope.catalog().resolve_type(&n)) {
-                Some(ut) => PgType::User(ut.oid),
-                None => return Err(e),
-            }
-        }
-    };
+    let target = resolve_data_type(scope.catalog(), data_type)?;
     // `ARRAY[]::t[]`: an empty array constructor is otherwise untypable (see
     // `bind_array_ctor`); the cast target supplies its element type.
     if let ast::Expr::Array(arr) = inner

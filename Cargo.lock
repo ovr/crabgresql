@@ -348,6 +348,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabgresql-plpgsql"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crabgresql-binder",
+ "crabgresql-executor",
+ "crabgresql-parser",
+ "crabgresql-pg-engine",
+ "crabgresql-pg-wire",
+ "crabgresql-planner",
+ "crabgresql-storage-api",
+ "crabgresql-txn",
+ "crabgresql-types",
+]
+
+[[package]]
 name = "crabgresql-server"
 version = "0.1.0"
 dependencies = [
