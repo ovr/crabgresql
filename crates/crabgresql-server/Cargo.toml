@@ -19,6 +19,7 @@ crabgresql-planner.workspace = true
 crabgresql-parser.workspace = true
 crabgresql-pg-engine.workspace = true
 crabgresql-pg-wire.workspace = true
+crabgresql-plpgsql.workspace = true
 crabgresql-storage-api.workspace = true
 crabgresql-txn.workspace = true
 crabgresql-types.workspace = true

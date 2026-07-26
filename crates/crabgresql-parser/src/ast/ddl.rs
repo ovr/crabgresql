@@ -41,9 +41,9 @@ use crate::ast::{
         CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
         UniqueConstraint,
     },
-    ArgMode, AttachedToken, CommentDef, ConditionalStatements, CreateFunctionBody,
-    CreateFunctionUsing, CreateTableLikeKind, CreateTableOptions, CreateViewParams, DataType, Expr,
-    FileFormat, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionDesc,
+    AttachedToken, CommentDef, ConditionalStatements, CreateFunctionBody, CreateFunctionUsing,
+    CreateTableLikeKind, CreateTableOptions, CreateViewParams, DataType, Expr, FileFormat,
+    FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionDesc,
     FunctionDeterminismSpecifier, FunctionParallel, FunctionSecurity, HiveDistributionStyle,
     HiveFormat, HiveIOFormat, HiveRowFormat, HiveSetLocation, Ident, InitializeKind,
     MySQLColumnPosition, ObjectName, OnCommit, OneOrManyWithParens, OperateFunctionArg,
@@ -1491,37 +1491,6 @@ impl fmt::Display for NullsDistinctOption {
             Self::None => Ok(()),
             Self::Distinct => write!(f, " NULLS DISTINCT"),
             Self::NotDistinct => write!(f, " NULLS NOT DISTINCT"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// A parameter of a stored procedure or function declaration.
-pub struct ProcedureParam {
-    /// Parameter name.
-    pub name: Ident,
-    /// Parameter data type.
-    pub data_type: DataType,
-    /// Optional mode (`IN`, `OUT`, `INOUT`, etc.).
-    pub mode: Option<ArgMode>,
-    /// Optional default expression for the parameter.
-    pub default: Option<Expr>,
-}
-
-impl fmt::Display for ProcedureParam {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let Some(mode) = &self.mode {
-            if let Some(default) = &self.default {
-                write!(f, "{mode} {} {} = {}", self.name, self.data_type, default)
-            } else {
-                write!(f, "{mode} {} {}", self.name, self.data_type)
-            }
-        } else if let Some(default) = &self.default {
-            write!(f, "{} {} = {}", self.name, self.data_type, default)
-        } else {
-            write!(f, "{} {}", self.name, self.data_type)
         }
     }
 }
@@ -3780,6 +3749,117 @@ impl fmt::Display for CreateFunction {
             write!(f, " AS {bes}")?;
         }
         Ok(())
+    }
+}
+
+/// ```sql
+/// CREATE [ OR REPLACE ] PROCEDURE name ( [ args ] )
+///   { LANGUAGE lang_name | SECURITY { DEFINER | INVOKER } | SET x = v
+///   | AS 'definition' } ...
+/// ```
+///
+/// PostgreSQL's grammar is `CREATE FUNCTION`'s minus `RETURNS`, sharing one
+/// attribute-clause production with it. The function-only attributes are
+/// therefore accepted by the parser and carried here so the server can report
+/// PostgreSQL's "invalid attribute in procedure definition" — which PostgreSQL
+/// also raises at definition time, not parse time.
+///
+/// [PostgreSQL](https://www.postgresql.org/docs/current/sql-createprocedure.html)
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct CreateProcedure {
+    /// True if this is a `CREATE OR REPLACE PROCEDURE` statement.
+    pub or_replace: bool,
+    /// Name of the procedure to be created.
+    pub name: ObjectName,
+    /// The procedure's parameters. `Some(vec![])` for `p()`.
+    pub args: Option<Vec<OperateFunctionArg>>,
+    /// `LANGUAGE lang_name`.
+    pub language: Option<Ident>,
+    /// The procedure body, e.g. `AS $$ ... $$`.
+    pub function_body: Option<CreateFunctionBody>,
+    /// `SECURITY { DEFINER | INVOKER }`.
+    pub security: Option<FunctionSecurity>,
+    /// `SET configuration_parameter { TO | = } value`.
+    pub set_params: Vec<FunctionDefinitionSetParam>,
+    /// `IMMUTABLE | STABLE | VOLATILE` — grammar-legal here, rejected by the
+    /// server.
+    pub behavior: Option<FunctionBehavior>,
+    /// `CALLED ON NULL INPUT | RETURNS NULL ON NULL INPUT | STRICT` —
+    /// grammar-legal here, rejected by the server.
+    pub called_on_null: Option<FunctionCalledOnNull>,
+    /// `PARALLEL { UNSAFE | RESTRICTED | SAFE }` — grammar-legal here, rejected
+    /// by the server.
+    pub parallel: Option<FunctionParallel>,
+}
+
+impl fmt::Display for CreateProcedure {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "CREATE {or_replace}PROCEDURE {name}",
+            or_replace = if self.or_replace { "OR REPLACE " } else { "" },
+            name = self.name,
+        )?;
+        if let Some(args) = &self.args {
+            write!(f, "({})", display_comma_separated(args))?;
+        }
+        if let Some(language) = &self.language {
+            write!(f, " LANGUAGE {language}")?;
+        }
+        if let Some(behavior) = &self.behavior {
+            write!(f, " {behavior}")?;
+        }
+        if let Some(called_on_null) = &self.called_on_null {
+            write!(f, " {called_on_null}")?;
+        }
+        if let Some(parallel) = &self.parallel {
+            write!(f, " {parallel}")?;
+        }
+        if let Some(security) = &self.security {
+            write!(f, " {security}")?;
+        }
+        for set_param in &self.set_params {
+            write!(f, " {set_param}")?;
+        }
+        if let Some(CreateFunctionBody::AsBeforeOptions { body, link_symbol }) = &self.function_body
+        {
+            write!(f, " AS {body}")?;
+            if let Some(link_symbol) = link_symbol {
+                write!(f, ", {link_symbol}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `DO [ LANGUAGE lang_name ] code` — an anonymous code block, executed as if
+/// it were the body of a void-returning procedure. The language defaults to
+/// `plpgsql`; PostgreSQL accepts the LANGUAGE clause on either side of the
+/// code, but only ever prints it first.
+///
+/// [PostgreSQL](https://www.postgresql.org/docs/current/sql-do.html)
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct DoStatement {
+    /// The `LANGUAGE` the code is written in. `None` means the server's
+    /// default for `DO`, which is `plpgsql`.
+    pub language: Option<Ident>,
+    /// The block's code, as written: a dollar-quoted or single-quoted literal.
+    /// The span's `start` is the opening delimiter, so a position inside the
+    /// code can be mapped back to a line of the `DO` statement.
+    pub body: ValueWithSpan,
+}
+
+impl fmt::Display for DoStatement {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("DO ")?;
+        if let Some(language) = &self.language {
+            write!(f, "LANGUAGE {language} ")?;
+        }
+        write!(f, "{}", self.body)
     }
 }
 

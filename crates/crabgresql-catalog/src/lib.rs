@@ -23,6 +23,8 @@
 //! follow-up.
 
 mod schema;
+
+pub use schema::PLPGSQL_LANG_OID;
 mod static_table;
 
 use std::sync::{Arc, OnceLock};
@@ -113,6 +115,7 @@ pub fn is_builtin_type_name(name: &str) -> bool {
 const BUILTIN_RELATION_OIDS: &[(&str, u32)] = &[
     ("pg_type", 1247),
     ("pg_attribute", 1249),
+    ("pg_proc", 1255),
     ("pg_class", 1259),
     ("pg_sequence", 2224),
     ("pg_am", 2601),
@@ -121,6 +124,7 @@ const BUILTIN_RELATION_OIDS: &[(&str, u32)] = &[
     ("pg_constraint", 2606),
     ("pg_index", 2610),
     ("pg_inherits", 2611),
+    ("pg_language", 2612),
     ("pg_namespace", 2615),
     ("pg_partitioned_table", 3350),
     ("pg_collation", 3456),
@@ -302,6 +306,38 @@ pub struct CatalogUserType {
     pub enum_labels: Option<Vec<String>>,
 }
 
+/// A user-defined routine reflected into `pg_proc`. Built by whoever owns the
+/// function catalog, so this crate stays free of server types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogRoutine {
+    pub oid: u32,
+    pub name: String,
+    pub namespace: String,
+    /// `pg_proc.prokind`: `'f'` function, `'p'` procedure.
+    pub kind: char,
+    /// `pg_proc.prolang` — a `pg_language` OID.
+    pub lang: u32,
+    /// Input-argument type OIDs, in signature order (`proargtypes`). A `0`
+    /// stands for a type that does not resolve, as PostgreSQL reports for one
+    /// it cannot name.
+    pub arg_types: Vec<u32>,
+    /// Every argument including OUT/INOUT, or empty when they are all IN —
+    /// PostgreSQL leaves `proallargtypes` NULL in that case.
+    pub all_arg_types: Vec<u32>,
+    /// One of `i`/`o`/`b` per entry of `all_arg_types`, or empty.
+    pub arg_modes: Vec<char>,
+    /// Argument names, or empty when no argument is named.
+    pub arg_names: Vec<String>,
+    pub ret_type: u32,
+    pub retset: bool,
+    /// `pg_proc.provolatile`: `i`/`s`/`v`.
+    pub volatile: char,
+    pub strict: bool,
+    pub secdef: bool,
+    /// `pg_proc.prosrc` — the body as written.
+    pub src: String,
+}
+
 /// Produces the live user relations to reflect into `pg_class`/`pg_attribute`
 /// and `information_schema`.
 /// Boxed so it can capture the server engines and run lazily — only a query that
@@ -311,6 +347,11 @@ type RelationsFn = Box<dyn Fn() -> Vec<CatalogRelation> + Send + Sync>;
 /// Produces the user-defined types to reflect into `pg_type`/`pg_enum`. Boxed and
 /// lazy like [`RelationsFn`] — only a query that opens `pg_type`/`pg_enum` pays.
 type UserTypesFn = Box<dyn Fn() -> Vec<CatalogUserType> + Send + Sync>;
+
+/// Produces the user-defined routines to reflect into `pg_proc`. Boxed and
+/// lazy for the same reason as the others: only a query that opens `pg_proc`
+/// pays for enumerating them.
+type RoutinesFn = Box<dyn Fn() -> Vec<CatalogRoutine> + Send + Sync>;
 
 /// Produces the user-created schemas (`CREATE SCHEMA`) as `(name, oid)`, to
 /// reflect into `pg_namespace` and `information_schema.schemata`. Boxed and lazy
@@ -324,6 +365,7 @@ type SchemasFn = Box<dyn Fn() -> Vec<(String, u32)> + Send + Sync>;
 pub struct SystemCatalog {
     relations: RelationsFn,
     user_types_fn: UserTypesFn,
+    routines_fn: RoutinesFn,
     schemas_fn: SchemasFn,
     database: String,
     owner: String,
@@ -333,6 +375,7 @@ pub struct SystemCatalog {
     stats: OnceLock<Vec<RelStats>>,
     index_oids: OnceLock<Vec<CatalogIndex>>,
     user_types: OnceLock<Vec<CatalogUserType>>,
+    routines: OnceLock<Vec<CatalogRoutine>>,
     user_schemas: OnceLock<Vec<(String, u32)>>,
 }
 
@@ -372,6 +415,7 @@ impl SystemCatalog {
         Self {
             relations: Box::new(f),
             user_types_fn: Box::new(Vec::new),
+            routines_fn: Box::new(Vec::new),
             schemas_fn: Box::new(Vec::new),
             database: database.into(),
             owner: owner.into(),
@@ -381,6 +425,7 @@ impl SystemCatalog {
             stats: OnceLock::new(),
             index_oids: OnceLock::new(),
             user_types: OnceLock::new(),
+            routines: OnceLock::new(),
             user_schemas: OnceLock::new(),
         }
     }
@@ -392,6 +437,16 @@ impl SystemCatalog {
         f: impl Fn() -> Vec<CatalogUserType> + Send + Sync + 'static,
     ) -> Self {
         self.user_types_fn = Box::new(f);
+        self
+    }
+
+    /// Attach a provider of user-defined routines to reflect into `pg_proc`
+    /// (invoked at most once, only if `pg_proc` is opened).
+    pub fn with_routines_fn(
+        mut self,
+        f: impl Fn() -> Vec<CatalogRoutine> + Send + Sync + 'static,
+    ) -> Self {
+        self.routines_fn = Box::new(f);
         self
     }
 
@@ -412,6 +467,10 @@ impl SystemCatalog {
 
     fn user_types(&self) -> &[CatalogUserType] {
         self.user_types.get_or_init(|| (self.user_types_fn)())
+    }
+
+    fn routines(&self) -> &[CatalogRoutine] {
+        self.routines.get_or_init(|| (self.routines_fn)())
     }
 
     fn user_schemas(&self) -> &[(String, u32)] {
@@ -679,6 +738,11 @@ impl SystemCatalog {
                 schema::pg_index_rows(self.index_oids()),
             )),
             "pg_am" => Some((schema::pg_am_schema(), schema::pg_am_rows())),
+            "pg_language" => Some((schema::pg_language_schema(), schema::pg_language_rows())),
+            "pg_proc" => Some((
+                schema::pg_proc_schema(),
+                schema::pg_proc_rows(self.routines(), &self.namespace_oids()),
+            )),
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
             "pg_collation" => Some((schema::pg_collation_schema(), schema::pg_collation_rows())),
             "pg_inherits" => Some((

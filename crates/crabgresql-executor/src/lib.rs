@@ -13,6 +13,7 @@ pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -95,6 +96,77 @@ pub trait CatalogOps: Send + Sync {
     fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
 }
 
+/// Severity of a diagnostic produced during execution. `Debug` and `Log` reach
+/// the server log rather than the client under PostgreSQL's default
+/// `client_min_messages`; the rest travel as a `NoticeResponse`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Debug,
+    Log,
+    Info,
+    Notice,
+    Warning,
+}
+
+/// A diagnostic raised *during* execution rather than by the statement as a
+/// whole — what `RAISE NOTICE` inside a routine body produces.
+#[derive(Clone, Debug)]
+pub struct RuntimeNotice {
+    pub severity: Severity,
+    pub code: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    /// The `CONTEXT:` traceback, innermost frame first.
+    pub context: Vec<String>,
+}
+
+/// Where mid-execution diagnostics go.
+///
+/// Deliberately a sink on the context rather than a return channel on
+/// [`ExecNode::next`]: a notice can be raised while a result set is streaming,
+/// and threading it through every node's signature would touch every executor
+/// node to serve one caller. The server installs a session-owned buffer and
+/// drains it as it writes rows, so a notice raised on row 3 reaches the client
+/// between row 3 and row 4.
+pub trait NoticeSink: Send + Sync {
+    fn emit(&self, notice: RuntimeNotice);
+}
+
+/// Invocation of a user-defined routine whose body the binder cannot inline.
+///
+/// A `LANGUAGE SQL` body is a single expression and is expanded into the
+/// calling expression at bind time. A PL/pgSQL body is an imperative program
+/// that binds, plans and executes SQL of its own — vocabulary the executor does
+/// not have — so the server supplies an implementation through
+/// [`ExecContext::routines`] and `eval` dispatches to it.
+///
+/// `ctx` is the caller's own context; an implementation clones it (bumping
+/// `call_depth`) for the statements it runs, so the body sees the same sequence
+/// handle, notice sink and catalog snapshot as its caller. It must not *store*
+/// a context: the context holds an `Arc` to the implementation, and putting one
+/// back would leak the cycle.
+pub trait RoutineOps: Send + Sync {
+    /// Call a routine and produce its return value. A procedure yields
+    /// `Value::Null`.
+    fn call(
+        &self,
+        oid: u32,
+        args: Vec<Value>,
+        ctx: &ExecContext,
+        txn: &TxnContext,
+    ) -> Result<Value, ExecError>;
+
+    /// Run a `DO $$ ... $$` block. Its body is passed verbatim — an anonymous
+    /// block has no catalog entry to look up.
+    fn run_inline_block(
+        &self,
+        body: &str,
+        ctx: &ExecContext,
+        txn: &TxnContext,
+    ) -> Result<(), ExecError>;
+}
+
 /// Session state that runtime evaluation depends on: `extra_float_digits`
 /// (float→text output precision) and, when present, the handles the
 /// side-effecting sequence functions and the catalog functions dispatch through.
@@ -115,6 +187,27 @@ pub struct ExecContext {
     /// `None` outside a real `execute` (a subquery marker never survives to a
     /// context without it).
     pub txn: Option<TxnContext>,
+    /// The interpreter a non-inlinable routine call dispatches through.
+    pub routines: Option<Arc<dyn RoutineOps>>,
+    /// Where a `RAISE` inside a routine body deposits its diagnostics.
+    pub notices: Option<Arc<dyn NoticeSink>>,
+    /// Whether the enclosing transaction is read-only. Until now this only
+    /// reached the sequence handle; a routine body's DML needs it too, since
+    /// the statement-level check cannot see inside a body.
+    pub read_only: bool,
+    /// How many routine calls deep execution is, for the stack-depth limit.
+    ///
+    /// A field rather than a thread-local: a suspended portal holds a live
+    /// `ExecNode` and its cloned context across `Execute` round-trips, and
+    /// tokio may resume it on a different worker thread. Cloning the context
+    /// into every node also scopes the depth to the call tree for free.
+    pub call_depth: u32,
+    /// The transaction's command counter, shared with the session so that
+    /// statements run inside a routine body advance the same counter the
+    /// session reads back at statement end. Without it the next top-level
+    /// statement would reuse a command id the body already stamped rows with,
+    /// and those rows would be invisible to it.
+    pub command_counter: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl Default for ExecContext {
@@ -125,6 +218,11 @@ impl Default for ExecContext {
             sequences: None,
             catalog: None,
             txn: None,
+            routines: None,
+            notices: None,
+            read_only: false,
+            call_depth: 0,
+            command_counter: None,
         }
     }
 }
@@ -134,11 +232,20 @@ impl Default for ExecContext {
 /// result set have already been sent.
 #[derive(Debug)]
 pub struct ExecError {
-    /// 5-character SQLSTATE code.
-    pub code: &'static str,
+    /// 5-character SQLSTATE code. A `Cow` because a routine body can name its
+    /// own SQLSTATE at runtime (`RAISE ... USING ERRCODE`); every built-in
+    /// error still passes a `&'static str` from [`sqlstate`].
+    pub code: Cow<'static, str>,
     pub message: String,
     /// Optional DETAIL line (e.g. numeric field overflow explains the p/s).
     pub detail: Option<String>,
+    /// Optional HINT line.
+    pub hint: Option<String>,
+    /// The `CONTEXT:` traceback: the call frames this error unwound through,
+    /// innermost first. Empty for an error raised at the top level. Accreted
+    /// while unwinding rather than tracked in a frame stack, so the happy path
+    /// costs nothing and there is no pop to forget.
+    pub context: Vec<String>,
 }
 
 impl std::fmt::Display for ExecError {
@@ -150,11 +257,13 @@ impl std::fmt::Display for ExecError {
 impl std::error::Error for ExecError {}
 
 impl ExecError {
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.into(),
             message: message.into(),
             detail: None,
+            hint: None,
+            context: Vec::new(),
         }
     }
 
@@ -162,6 +271,25 @@ impl ExecError {
     pub fn with_detail(mut self, detail: Option<String>) -> Self {
         self.detail = detail;
         self
+    }
+
+    /// Attach a HINT line.
+    pub fn with_hint(mut self, hint: Option<String>) -> Self {
+        self.hint = hint;
+        self
+    }
+
+    /// Record the call frame this error is propagating out of. Called while
+    /// unwinding, so frames land innermost-first without a frame stack.
+    pub fn push_context(mut self, frame: impl Into<String>) -> Self {
+        self.context.push(frame.into());
+        self
+    }
+
+    /// The `CONTEXT` wire field: frames newline-joined, innermost first, or
+    /// `None` when no frame contributed.
+    pub fn context(&self) -> Option<String> {
+        (!self.context.is_empty()).then(|| self.context.join("\n"))
     }
 }
 
@@ -223,6 +351,11 @@ pub fn execute(
         sequences: ctx.sequences.clone(),
         catalog: ctx.catalog.clone(),
         txn: Some(txn.clone()),
+        routines: ctx.routines.clone(),
+        notices: ctx.notices.clone(),
+        read_only: ctx.read_only,
+        call_depth: ctx.call_depth,
+        command_counter: ctx.command_counter.clone(),
     };
     match plan {
         PhysicalPlan::Values {
@@ -660,7 +793,9 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
             resolve_expr(left, ctx, txn)?;
             resolve_expr(right, ctx, txn)?;
         }
-        BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
+        BoundExpr::FuncCall { args, .. }
+        | BoundExpr::Routine { args, .. }
+        | BoundExpr::Srf { args, .. } => {
             resolve_exprs(args, ctx, txn)?;
         }
         BoundExpr::ArrayCtor { elems, .. } => resolve_exprs(elems, ctx, txn)?,
@@ -1158,15 +1293,22 @@ fn finish_sort_distinct(
     Ok(Box::new(Distinct::new(node, keys, columns.len())?))
 }
 
+/// Evaluate an expression that references no row — a `CALL` argument, which
+/// has no row for a column reference to come from. The binder has already
+/// rejected any column reference, so the empty row is never indexed.
+pub fn eval_row_free(expr: &BoundExpr, ctx: &ExecContext) -> Result<Value, ExecError> {
+    eval(expr, &[], ctx)
+}
+
 /// A source node that replays already-computed output rows. `RETURNING`
 /// projects eagerly and streams the finished rows through this — unlike
 /// [`Values`], which evaluates `BoundExpr`s on each pull.
-struct MaterializedRows {
+pub struct MaterializedRows {
     rows: std::vec::IntoIter<Tuple>,
 }
 
 impl MaterializedRows {
-    fn new(rows: Vec<Tuple>) -> Self {
+    pub fn new(rows: Vec<Tuple>) -> Self {
         Self {
             rows: rows.into_iter(),
         }

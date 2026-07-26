@@ -87,6 +87,25 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
     Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|e| ParseError(e.to_string()))
 }
 
+/// Parse a bare SQL type name, e.g. `numeric(10, 2)`, `text[]` or a
+/// `CREATE TYPE` name. Trailing input is an error, so a caller cannot silently
+/// accept `int; DROP TABLE t`.
+///
+/// Used for type names that reach us outside a statement — a PL/pgSQL
+/// declaration's type, which is lifted out of a routine body as text.
+pub fn parse_data_type(sql: &str) -> Result<ast::DataType, ParseError> {
+    let mut parser = Parser::new(&PostgreSqlDialect {})
+        .try_with_sql(sql)
+        .map_err(|e| ParseError(e.to_string()))?;
+    let data_type = parser
+        .parse_data_type()
+        .map_err(|e| ParseError(e.to_string()))?;
+    parser
+        .expect_token(&tokenizer::Token::EOF)
+        .map_err(|e| ParseError(e.to_string()))?;
+    Ok(data_type)
+}
+
 #[cfg(test)]
 mod wrapper_tests {
     use super::*;

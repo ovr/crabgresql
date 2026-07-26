@@ -230,7 +230,9 @@ fn put_opt_bytes(buf: &mut BytesMut, value: Option<&[u8]>) {
 /// The body of an ErrorResponse / NoticeResponse: a list of `(field code, value)`
 /// pairs terminated by a zero byte. Common codes: `S`everity (localized),
 /// `V` severity (non-localized), sqlstate `C`ode, `M`essage, `D`etail,
-/// `H`int, `P`osition. Kept as an ordered list so it round-trips exactly.
+/// `H`int, `P`osition, and `W` — the context traceback (spelled `W` because
+/// PostgreSQL calls it "Where"). Kept as an ordered list so it round-trips
+/// exactly.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ErrorFields {
     pub fields: Vec<(u8, String)>,
@@ -279,6 +281,14 @@ impl ErrorFields {
     /// Append a cursor POSITION (`P`) field — a 1-based character offset.
     pub fn with_position(mut self, position: usize) -> Self {
         self.fields.push((b'P', position.to_string()));
+        self
+    }
+
+    /// Append a CONTEXT (`W`) field — the call-stack traceback a client renders
+    /// as `CONTEXT: ...`. Nested call frames are one field value, newline
+    /// separated and innermost first, which is how PostgreSQL stacks them.
+    pub fn with_context(mut self, context: &str) -> Self {
+        self.fields.push((b'W', context.to_string()));
         self
     }
 

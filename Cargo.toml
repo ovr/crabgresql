@@ -16,6 +16,7 @@ crabgresql-planner = { path = "crates/crabgresql-planner" }
 crabgresql-parser = { path = "crates/crabgresql-parser" }
 crabgresql-pg-engine = { path = "crates/crabgresql-pg-engine" }
 crabgresql-pg-wire = { path = "crates/crabgresql-pg-wire" }
+crabgresql-plpgsql = { path = "crates/crabgresql-plpgsql" }
 crabgresql-server = { path = "crates/crabgresql-server" }
 crabgresql-storage-api = { path = "crates/crabgresql-storage-api" }
 crabgresql-txn = { path = "crates/crabgresql-txn" }

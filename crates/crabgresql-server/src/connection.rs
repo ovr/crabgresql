@@ -18,8 +18,8 @@ use tokio::net::TcpStream;
 use crate::error::PgError;
 use crate::global_catalog::GlobalCatalog;
 use crate::query::{
-    Analyzed, BoundParams, Notice, NoticeSeverity, QueryResult, RowTag, analyze_statement,
-    execute_statement, prepare_copy_from, run_copy_insert,
+    Analyzed, BoundParams, Notice, QueryResult, RowTag, analyze_statement, execute_statement,
+    prepare_copy_from, run_copy_insert,
 };
 use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedRows};
 
@@ -286,13 +286,7 @@ fn report(
         let position = e
             .location
             .and_then(|(line, col)| sql.map(|s| char_position(s, line, col)));
-        writer.error_response_detailed(
-            e.code,
-            &e.message,
-            e.detail.as_deref(),
-            e.hint.as_deref(),
-            position,
-        );
+        writer.error_fields(e.to_fields(position));
         mark_transaction_failed(session);
         *skip_until_sync = true;
     }
@@ -340,35 +334,33 @@ async fn run_simple_query(
                 CopyOutcome::ConnectionClosed => return Ok(()),
                 CopyOutcome::Failed(e) => {
                     let position = e.location.map(|(line, col)| char_position(sql, line, col));
-                    writer.error_response_detailed(
-                        e.code,
-                        &e.message,
-                        e.detail.as_deref(),
-                        e.hint.as_deref(),
-                        position,
-                    );
+                    writer.error_fields(e.to_fields(position));
                     mark_transaction_failed(session);
                     return Ok(());
                 }
             }
             continue;
         }
-        match execute_statement(engine, catalog, txnmgr, stmt, session, &BoundParams::none()) {
-            Ok(result) => {
+        let outcome = execute_statement(engine, catalog, txnmgr, stmt, session, &BoundParams::none());
+        // Diagnostics a routine raised belong to this statement whether it
+        // succeeded or failed. Handlers fold them into their own result, but
+        // draining again here is what makes stranding them impossible: a path
+        // that forgets — or one that returned an error before folding — would
+        // otherwise leave them buffered for whatever statement drains next.
+        let stranded = session.notices.drain();
+        match outcome {
+            Ok(mut result) => {
+                result.prepend_notices(stranded);
                 if write_result(writer, result, efd, sql).await? == WriteOutcome::Errored {
                     mark_transaction_failed(session);
                     return Ok(());
                 }
             }
             Err(e) => {
+                // PG order: notices raised before the failure, then the error.
+                emit_notices(writer, &stranded, Some(sql));
                 let position = e.location.map(|(line, col)| char_position(sql, line, col));
-                writer.error_response_detailed(
-                    e.code,
-                    &e.message,
-                    e.detail.as_deref(),
-                    e.hint.as_deref(),
-                    position,
-                );
+                writer.error_fields(e.to_fields(position));
                 mark_transaction_failed(session);
                 return Ok(());
             }
@@ -532,7 +524,12 @@ async fn write_result(
             columns,
             mut node,
             tag,
+            notices,
         } => {
+            // Diagnostics raised while producing the rows go out first, as PG
+            // does — it emits them at the point they are raised, which for a
+            // materialized result set is before the first row is sent.
+            emit_notices(writer, &notices, Some(sql));
             let fields: Vec<FieldDescription> = columns
                 .iter()
                 .map(|c| FieldDescription::new(c.name.clone(), c.ty.oid(), c.ty.typlen()))
@@ -552,7 +549,11 @@ async fn write_result(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        writer.error_response_full(e.code, &e.message, e.detail.as_deref(), None);
+                        // Mid-stream: rows have already gone out. The error can
+                        // still carry a HINT and a CONTEXT traceback (a routine
+                        // body raising on row N), so route it through the same
+                        // field builder as every other emission site.
+                        writer.error_fields(PgError::from(e).to_fields(None));
                         return Ok(WriteOutcome::Errored);
                     }
                 }
@@ -573,17 +574,10 @@ fn emit_notices(
     sql: Option<&str>,
 ) {
     for notice in notices {
-        match notice.severity {
-            NoticeSeverity::Warning => writer.warning_response(notice.code, &notice.message),
-            NoticeSeverity::Notice => writer.notice_response(
-                notice.code,
-                &notice.message,
-                notice.detail.as_deref(),
-                notice
-                    .location
-                    .and_then(|(line, col)| sql.map(|s| char_position(s, line, col))),
-            ),
-        }
+        let position = notice
+            .location
+            .and_then(|(line, col)| sql.map(|s| char_position(s, line, col)));
+        writer.notice_fields(notice.to_fields(position));
     }
 }
 
@@ -908,7 +902,19 @@ fn handle_execute(
         values: param_values,
         extended: true,
     };
-    let result = execute_statement(engine, global_catalog, txnmgr, &stmt, session, &params)?;
+    let outcome = execute_statement(engine, global_catalog, txnmgr, &stmt, session, &params);
+    // Drained on both arms — see the simple-query path for why this cannot be
+    // left to the statement handlers alone.
+    let stranded = session.notices.drain();
+    let mut result = match outcome {
+        Ok(result) => result,
+        Err(e) => {
+            // PG order: notices raised before the failure, then the error.
+            emit_notices(writer, &stranded, None);
+            return Err(e);
+        }
+    };
+    result.prepend_notices(stranded);
     stream_execute(
         session,
         writer,
@@ -945,7 +951,9 @@ fn stream_execute(
             columns: _,
             mut node,
             tag,
+            notices,
         } => {
+            emit_notices(writer, &notices, None);
             let limit = (max_rows > 0).then_some(max_rows as usize);
             let mut count = 0usize;
             loop {

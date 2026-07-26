@@ -99,6 +99,7 @@ pub fn format_notice(notice: &ErrorFields, query: &str) -> String {
     }
     push_field(&mut out, "DETAIL", notice.get(b'D'));
     push_field(&mut out, "HINT", notice.get(b'H'));
+    push_field(&mut out, "CONTEXT", notice.get(b'W'));
     out
 }
 
@@ -339,6 +340,40 @@ mod tests {
         assert_eq!(
             format_error(&fields, "SELECT 1;"),
             "ERROR:  boom\nDETAIL:  the details\nHINT:  try harder\n"
+        );
+    }
+
+    /// A nested call's CONTEXT frames are one `W` field, newline-joined. psql
+    /// labels only the first line, leaving continuation frames unindented.
+    #[test]
+    fn multi_frame_context_leaves_continuation_lines_unindented() {
+        let fields = error_fields(&[
+            (b'V', "ERROR"),
+            (b'M', "illegal backlink beginning with XX"),
+            (
+                b'W',
+                "PL/pgSQL function tg_backlink_set(character,character) line 30 at RAISE\n\
+                 PL/pgSQL function tg_backlink_a() line 17 at assignment",
+            ),
+        ]);
+        assert_eq!(
+            format_error(&fields, "SELECT 1;"),
+            "ERROR:  illegal backlink beginning with XX\n\
+             CONTEXT:  PL/pgSQL function tg_backlink_set(character,character) line 30 at RAISE\n\
+             PL/pgSQL function tg_backlink_a() line 17 at assignment\n"
+        );
+    }
+
+    #[test]
+    fn notice_renders_context() {
+        let fields = error_fields(&[
+            (b'V', "NOTICE"),
+            (b'M', "hello"),
+            (b'W', "PL/pgSQL function f() line 2 at RAISE"),
+        ]);
+        assert_eq!(
+            format_notice(&fields, "SELECT f();"),
+            "NOTICE:  hello\nCONTEXT:  PL/pgSQL function f() line 2 at RAISE\n"
         );
     }
 

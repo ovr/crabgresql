@@ -90,6 +90,40 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                 None => crate::scalar_fns::eval_scalar(*func, &arg_values),
             }
         }
+        // A call to a user-defined routine the binder could not inline. The
+        // interpreter lives above this crate, so the call goes out through the
+        // handle the server installed on the context.
+        BoundExpr::Routine {
+            oid,
+            name,
+            strict,
+            args,
+            ret,
+            ..
+        } => {
+            let arg_values = args
+                .iter()
+                .map(|a| eval(a, row, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            // STRICT short-circuits before the body is entered, as in PG.
+            if *strict && arg_values.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let routines = ctx.routines.as_ref().ok_or_else(|| {
+                ExecError::new(
+                    sqlstate::INTERNAL_ERROR,
+                    format!("routine \"{name}\" called without a routine handle"),
+                )
+            })?;
+            let txn = ctx.txn.as_ref().ok_or_else(|| {
+                ExecError::new(
+                    sqlstate::INTERNAL_ERROR,
+                    format!("routine \"{name}\" called without a transaction context"),
+                )
+            })?;
+            let value = routines.call(*oid, arg_values, ctx, txn)?;
+            coerce_value(value, *ret, ctx)
+        }
         // An array constructor: evaluate each element and collect into a
         // `Value::Array` of the declared element type.
         BoundExpr::ArrayCtor { elem, elems, .. } => {

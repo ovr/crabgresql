@@ -232,6 +232,24 @@ impl From<bool> for MatchedTrailingBracket {
     }
 }
 
+/// The attribute clauses PostgreSQL's `CREATE FUNCTION` and `CREATE PROCEDURE`
+/// share — its grammar runs both through one `createfunc_opt_list` production,
+/// so the parser accepts the full set for either and leaves rejecting the
+/// function-only ones on a procedure to the server, where PostgreSQL rejects
+/// them too.
+///
+/// See [Parser::parse_pg_routine_options].
+#[derive(Default)]
+struct PgRoutineOptions {
+    language: Option<Ident>,
+    behavior: Option<FunctionBehavior>,
+    function_body: Option<CreateFunctionBody>,
+    called_on_null: Option<FunctionCalledOnNull>,
+    parallel: Option<FunctionParallel>,
+    security: Option<FunctionSecurity>,
+    set_params: Vec<FunctionDefinitionSetParam>,
+}
+
 /// Options that control how the [`Parser`] parses SQL text
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParserOptions {
@@ -632,6 +650,7 @@ impl<'a> Parser<'a> {
                 Keyword::UPDATE => self.parse_update(next_token),
                 Keyword::ALTER => self.parse_alter(),
                 Keyword::CALL => self.parse_call(),
+                Keyword::DO => self.parse_do(),
                 Keyword::COPY => self.parse_copy(),
                 Keyword::CLOSE => self.parse_close(),
                 Keyword::SET => self.parse_set(),
@@ -4809,6 +4828,11 @@ impl<'a> Parser<'a> {
             self.parse_create_external_table(or_replace).map(Into::into)
         } else if self.parse_keyword(Keyword::FUNCTION) {
             self.parse_create_function(or_alter, or_replace, temporary)
+        } else if self.parse_keyword(Keyword::PROCEDURE) {
+            // Must sit above the `or_replace` bail below: PostgreSQL accepts
+            // `CREATE OR REPLACE PROCEDURE`.
+            self.parse_postgres_create_procedure(or_replace)
+                .map(Into::into)
         } else if self.parse_keyword(Keyword::DOMAIN) {
             self.parse_create_domain().map(Into::into)
         } else if self.parse_keyword(Keyword::TRIGGER) {
@@ -4819,7 +4843,7 @@ impl<'a> Parser<'a> {
                 .map(Into::into)
         } else if or_replace {
             self.expected_ref(
-                "[EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE",
+                "[EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION or PROCEDURE after CREATE OR REPLACE",
                 self.peek_token_ref(),
             )
         } else if self.parse_keyword(Keyword::EXTENSION) {
@@ -4840,8 +4864,6 @@ impl<'a> Parser<'a> {
             self.parse_create_collation().map(Into::into)
         } else if self.parse_keyword(Keyword::TYPE) {
             self.parse_create_type()
-        } else if self.parse_keyword(Keyword::PROCEDURE) {
-            self.parse_create_procedure(or_alter)
         } else if self.parse_keyword(Keyword::OPERATOR) {
             // Check if this is CREATE OPERATOR FAMILY or CREATE OPERATOR CLASS
             if self.parse_keyword(Keyword::FAMILY) {
@@ -5154,17 +5176,82 @@ impl<'a> Parser<'a> {
             None
         };
 
-        #[derive(Default)]
-        struct Body {
-            language: Option<Ident>,
-            behavior: Option<FunctionBehavior>,
-            function_body: Option<CreateFunctionBody>,
-            called_on_null: Option<FunctionCalledOnNull>,
-            parallel: Option<FunctionParallel>,
-            security: Option<FunctionSecurity>,
+        let body = self.parse_pg_routine_options()?;
+
+        Ok(CreateFunction {
+            or_alter: false,
+            or_replace,
+            temporary,
+            name,
+            args: Some(args),
+            return_type,
+            behavior: body.behavior,
+            called_on_null: body.called_on_null,
+            parallel: body.parallel,
+            security: body.security,
+            set_params: body.set_params,
+            language: body.language,
+            function_body: body.function_body,
+            if_not_exists: false,
+            using: None,
+            determinism_specifier: None,
+            options: None,
+            remote_connection: None,
+        })
+    }
+
+    /// Parse `CREATE PROCEDURE` for [PostgreSQL]. Distinct from the T-SQL form
+    /// this parser used to accept: PostgreSQL has no `RETURNS`, no
+    /// `AS <statement list> END`, and its body is an opaque `LANGUAGE`-specific
+    /// string. The attribute clauses are shared with `CREATE FUNCTION` —
+    /// PostgreSQL's grammar shares one option list between the two and rejects
+    /// the function-only attributes at definition time, not parse time, so they
+    /// are accepted here and carried for the server to report on.
+    ///
+    /// [PostgreSQL]: https://www.postgresql.org/docs/current/sql-createprocedure.html
+    fn parse_postgres_create_procedure(
+        &mut self,
+        or_replace: bool,
+    ) -> Result<CreateProcedure, ParserError> {
+        let name = self.parse_object_name(false)?;
+
+        self.expect_token(&Token::LParen)?;
+        let args = if Token::RParen != self.peek_token_ref().token {
+            self.parse_comma_separated(Parser::parse_function_arg)?
+        } else {
+            vec![]
+        };
+        self.expect_token(&Token::RParen)?;
+
+        // `RETURNS` has nowhere to land on a procedure, and PostgreSQL's grammar
+        // rejects it outright rather than deferring to definition time.
+        if self.peek_keyword(Keyword::RETURNS) {
+            return self.expected_ref("a procedure attribute", self.peek_token_ref());
         }
-        let mut body = Body::default();
-        let mut set_params: Vec<FunctionDefinitionSetParam> = Vec::new();
+
+        let body = self.parse_pg_routine_options()?;
+
+        Ok(CreateProcedure {
+            or_replace,
+            name,
+            args: Some(args),
+            language: body.language,
+            function_body: body.function_body,
+            security: body.security,
+            set_params: body.set_params,
+            behavior: body.behavior,
+            called_on_null: body.called_on_null,
+            parallel: body.parallel,
+        })
+    }
+
+    /// Parse the attribute clauses shared by PostgreSQL's `CREATE FUNCTION` and
+    /// `CREATE PROCEDURE` — its grammar shares one `createfunc_opt_list`
+    /// production between them. Stops at the first token that is not an
+    /// attribute clause.
+    fn parse_pg_routine_options(&mut self) -> Result<PgRoutineOptions, ParserError> {
+        let mut body = PgRoutineOptions::default();
+        let set_params = &mut body.set_params;
         loop {
             fn ensure_not_set<T>(field: &Option<T>, name: &str) -> Result<(), ParserError> {
                 if field.is_some() {
@@ -5262,27 +5349,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-
-        Ok(CreateFunction {
-            or_alter: false,
-            or_replace,
-            temporary,
-            name,
-            args: Some(args),
-            return_type,
-            behavior: body.behavior,
-            called_on_null: body.called_on_null,
-            parallel: body.parallel,
-            security: body.security,
-            set_params,
-            language: body.language,
-            function_body: body.function_body,
-            if_not_exists: false,
-            using: None,
-            determinism_specifier: None,
-            options: None,
-            remote_connection: None,
-        })
+        Ok(body)
     }
 
     fn parse_function_return_type(&mut self) -> Result<FunctionReturnType, ParserError> {
@@ -8210,32 +8277,6 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    /// Parse optional procedure parameters.
-    pub fn parse_optional_procedure_parameters(
-        &mut self,
-    ) -> Result<Option<Vec<ProcedureParam>>, ParserError> {
-        let mut params = vec![];
-        if !self.consume_token(&Token::LParen) || self.consume_token(&Token::RParen) {
-            return Ok(Some(params));
-        }
-        loop {
-            if let Token::Word(_) = &self.peek_token_ref().token {
-                params.push(self.parse_procedure_param()?)
-            }
-            let comma = self.consume_token(&Token::Comma);
-            if self.consume_token(&Token::RParen) {
-                // allow a trailing comma, even though it's not in standard
-                break;
-            } else if !comma {
-                return self.expected_ref(
-                    "',' or ')' after parameter definition",
-                    self.peek_token_ref(),
-                );
-            }
-        }
-        Ok(Some(params))
-    }
-
     /// Parse columns and constraints.
     pub fn parse_columns(&mut self) -> Result<(Vec<ColumnDef>, Vec<TableConstraint>), ParserError> {
         let mut columns = vec![];
@@ -8275,33 +8316,6 @@ impl<'a> Parser<'a> {
         }
 
         Ok((columns, constraints))
-    }
-
-    /// Parse procedure parameter.
-    pub fn parse_procedure_param(&mut self) -> Result<ProcedureParam, ParserError> {
-        let mode = if self.parse_keyword(Keyword::IN) {
-            Some(ArgMode::In)
-        } else if self.parse_keyword(Keyword::OUT) {
-            Some(ArgMode::Out)
-        } else if self.parse_keyword(Keyword::INOUT) {
-            Some(ArgMode::InOut)
-        } else {
-            None
-        };
-        let name = self.parse_identifier()?;
-        let data_type = self.parse_data_type()?;
-        let default = if self.consume_token(&Token::Eq) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        Ok(ProcedureParam {
-            name,
-            data_type,
-            mode,
-            default,
-        })
     }
 
     /// Parse column definition.
@@ -11245,32 +11259,60 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a routine body written as a literal — the `$$ ... $$` or `'...'`
+    /// after `CREATE FUNCTION ... AS`, `CREATE PROCEDURE ... AS`, or `DO`.
+    ///
+    /// The span is kept because its `start` is the position of the opening
+    /// delimiter, which is what lets an error raised inside the body be mapped
+    /// back to a line of the statement that declared it.
+    fn parse_routine_body_literal(&mut self) -> Result<ValueWithSpan, ParserError> {
+        let peek_token = self.peek_token();
+        let span = peek_token.span;
+        match peek_token.token {
+            Token::DollarQuotedString(s) if dialect_of!(self is PostgreSqlDialect | GenericDialect) =>
+            {
+                self.next_token();
+                Ok(Value::DollarQuotedString(s).with_span(span))
+            }
+            _ => Ok(Value::SingleQuotedString(self.parse_literal_string()?).with_span(span)),
+        }
+    }
+
     /// Parse the body of a `CREATE FUNCTION` specified as a string.
     /// e.g. `CREATE FUNCTION ... AS $$ body $$`.
     fn parse_create_function_body_string(&mut self) -> Result<CreateFunctionBody, ParserError> {
-        let parse_string_expr = |parser: &mut Parser| -> Result<Expr, ParserError> {
-            let peek_token = parser.peek_token();
-            let span = peek_token.span;
-            match peek_token.token {
-                Token::DollarQuotedString(s) if dialect_of!(parser is PostgreSqlDialect | GenericDialect) =>
-                {
-                    parser.next_token();
-                    Ok(Expr::Value(Value::DollarQuotedString(s).with_span(span)))
-                }
-                _ => Ok(Expr::Value(
-                    Value::SingleQuotedString(parser.parse_literal_string()?).with_span(span),
-                )),
-            }
-        };
-
         Ok(CreateFunctionBody::AsBeforeOptions {
-            body: parse_string_expr(self)?,
+            body: Expr::Value(self.parse_routine_body_literal()?),
             link_symbol: if self.consume_token(&Token::Comma) {
-                Some(parse_string_expr(self)?)
+                Some(Expr::Value(self.parse_routine_body_literal()?))
             } else {
                 None
             },
         })
+    }
+
+    /// Parse `DO [ LANGUAGE lang_name ] code` — an anonymous code block,
+    /// executed as if it were the body of a void-returning procedure.
+    /// PostgreSQL accepts the LANGUAGE clause on either side of the code.
+    ///
+    /// [PostgreSQL](https://www.postgresql.org/docs/current/sql-do.html)
+    fn parse_do(&mut self) -> Result<Statement, ParserError> {
+        let mut language = if self.parse_keyword(Keyword::LANGUAGE) {
+            Some(self.parse_identifier()?)
+        } else {
+            None
+        };
+        let body = self.parse_routine_body_literal()?;
+        if self.parse_keyword(Keyword::LANGUAGE) {
+            if language.is_some() {
+                return parser_err!(
+                    "conflicting or redundant options",
+                    self.peek_token().span.start
+                );
+            }
+            language = Some(self.parse_identifier()?);
+        }
+        Ok(Statement::Do(DoStatement { language, body }))
     }
 
     /// Parse a literal string
@@ -16782,30 +16824,6 @@ impl<'a> Parser<'a> {
         Ok(NamedWindowDefinition(ident, window_expr))
     }
 
-    /// Parse `CREATE PROCEDURE` statement.
-    pub fn parse_create_procedure(&mut self, or_alter: bool) -> Result<Statement, ParserError> {
-        let name = self.parse_object_name(false)?;
-        let params = self.parse_optional_procedure_parameters()?;
-
-        let language = if self.parse_keyword(Keyword::LANGUAGE) {
-            Some(self.parse_identifier()?)
-        } else {
-            None
-        };
-
-        self.expect_keyword_is(Keyword::AS)?;
-
-        let body = self.parse_conditional_statements(&[Keyword::END])?;
-
-        Ok(Statement::CreateProcedure {
-            name,
-            or_alter,
-            params,
-            language,
-            body,
-        })
-    }
-
     /// Parse a window specification.
     pub fn parse_window_spec(&mut self) -> Result<WindowSpec, ParserError> {
         let window_name = match &self.peek_token_ref().token {
@@ -18147,5 +18165,178 @@ mod tests {
             let sql = format!("\nSELECT\n  :{w}fooBar");
             assert!(Parser::parse_sql(&GenericDialect, &sql).is_err());
         }
+    }
+
+    fn parse_pg(sql: &str) -> Result<Vec<Statement>, ParserError> {
+        Parser::parse_sql(&PostgreSqlDialect {}, sql)
+    }
+
+    fn do_stmt(sql: &str) -> DoStatement {
+        match parse_pg(sql).expect("parse").pop() {
+            Some(Statement::Do(stmt)) => stmt,
+            other => panic!("expected DO, got {other:?}"),
+        }
+    }
+
+    /// The body of a `DO` block is captured verbatim, whichever quoting form it
+    /// uses, and the LANGUAGE clause is accepted on either side of it.
+    #[test]
+    fn parse_do_captures_body_verbatim() {
+        let untagged = do_stmt("DO $$ BEGIN RAISE NOTICE 'hi'; END $$");
+        assert!(untagged.language.is_none());
+        assert_eq!(
+            untagged.body.value,
+            Value::DollarQuotedString(DollarQuotedString {
+                value: " BEGIN RAISE NOTICE 'hi'; END ".to_string(),
+                tag: None,
+            })
+        );
+
+        // A tag lets the body contain `$$`, and nested tags stay verbatim.
+        let tagged = do_stmt("DO $outer$ SELECT $$inner$$; $outer$");
+        assert_eq!(
+            tagged.body.value,
+            Value::DollarQuotedString(DollarQuotedString {
+                value: " SELECT $$inner$$; ".to_string(),
+                tag: Some("outer".to_string()),
+            })
+        );
+
+        // `DO 'code'` — the SQL-standard single-quoted spelling.
+        let quoted = do_stmt("DO 'BEGIN END'");
+        assert_eq!(
+            quoted.body.value,
+            Value::SingleQuotedString("BEGIN END".to_string())
+        );
+
+        for sql in [
+            "DO LANGUAGE plpgsql $$ BEGIN END $$",
+            "DO $$ BEGIN END $$ LANGUAGE plpgsql",
+        ] {
+            let stmt = do_stmt(sql);
+            assert_eq!(
+                stmt.language.map(|i| i.value),
+                Some("plpgsql".to_string()),
+                "{sql}"
+            );
+        }
+    }
+
+    /// The body literal's span starts at the opening delimiter, which is what
+    /// lets a position inside the body map back to a line of the statement.
+    #[test]
+    fn parse_do_body_span_points_at_the_opening_delimiter() {
+        let stmt = do_stmt("DO $tag$\nBEGIN\nEND\n$tag$");
+        assert_eq!(stmt.body.span.start.line, 1);
+        // 1-based column of the `$` that opens `$tag$`.
+        assert_eq!(stmt.body.span.start.column, 4);
+    }
+
+    /// PostgreSQL rejects a second LANGUAGE clause with "conflicting or
+    /// redundant options" rather than a bare syntax error.
+    #[test]
+    fn parse_do_rejects_a_repeated_language_clause() {
+        let e = parse_pg("DO LANGUAGE plpgsql $$ BEGIN END $$ LANGUAGE sql").unwrap_err();
+        assert!(
+            e.to_string().contains("conflicting or redundant options"),
+            "{e}"
+        );
+    }
+
+    /// `DO` is only a statement in leading position; `ON CONFLICT DO NOTHING`
+    /// and friends consume their own `DO` and must not be disturbed.
+    #[test]
+    fn do_keyword_elsewhere_is_untouched() {
+        parse_pg("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING").expect("parse");
+    }
+
+    /// `DO` round-trips through `Display`, always printing LANGUAGE first.
+    #[test]
+    fn parse_do_round_trips() {
+        let dialects = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
+        dialects.verified_stmt("DO LANGUAGE plpgsql $$ BEGIN END $$");
+        dialects.verified_stmt("DO $$ BEGIN END $$");
+    }
+
+    fn create_procedure(sql: &str) -> CreateProcedure {
+        match parse_pg(sql).expect("parse").pop() {
+            Some(Statement::CreateProcedure(stmt)) => stmt,
+            other => panic!("expected CREATE PROCEDURE, got {other:?}"),
+        }
+    }
+
+    /// PostgreSQL's `CREATE PROCEDURE` is `CREATE FUNCTION`'s grammar minus
+    /// `RETURNS`: an opaque `AS $$ ... $$` body, not a T-SQL statement list.
+    #[test]
+    fn parse_create_procedure_takes_a_literal_body() {
+        let stmt = create_procedure(
+            "CREATE PROCEDURE p(a INT, INOUT b TEXT) LANGUAGE plpgsql AS $$ BEGIN END $$",
+        );
+        assert!(!stmt.or_replace);
+        assert_eq!(stmt.name.to_string(), "p");
+        assert_eq!(stmt.language.map(|i| i.value), Some("plpgsql".to_string()));
+
+        let args = stmt.args.expect("args");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].mode, None);
+        assert_eq!(args[1].mode, Some(ArgMode::InOut));
+        assert_eq!(args[1].name.as_ref().map(|i| i.value.as_str()), Some("b"));
+        // Argument type spans come from the shared `parse_function_arg`, so the
+        // shell-type NOTICE caret works for procedures too.
+        assert_ne!(args[0].data_type_span.start.line, 0);
+
+        match stmt.function_body {
+            Some(CreateFunctionBody::AsBeforeOptions { body, .. }) => assert_eq!(
+                body,
+                Expr::Value(
+                    Value::DollarQuotedString(DollarQuotedString {
+                        value: " BEGIN END ".to_string(),
+                        tag: None,
+                    })
+                    .with_empty_span()
+                )
+            ),
+            other => panic!("expected AsBeforeOptions, got {other:?}"),
+        }
+    }
+
+    /// A zero-argument procedure keeps its empty parameter list, and the
+    /// attribute clauses shared with CREATE FUNCTION are accepted.
+    #[test]
+    fn parse_create_procedure_accepts_shared_attributes() {
+        let stmt = create_procedure(
+            "CREATE OR REPLACE PROCEDURE p() SECURITY DEFINER SET search_path = 'x' \
+             LANGUAGE plpgsql AS $$ BEGIN END $$",
+        );
+        assert!(stmt.or_replace);
+        assert_eq!(stmt.args.as_deref(), Some(&[][..]));
+        assert_eq!(stmt.security, Some(FunctionSecurity::Definer));
+        assert_eq!(stmt.set_params.len(), 1);
+    }
+
+    /// A procedure has nothing to return, and PostgreSQL rejects `RETURNS` in
+    /// the grammar rather than deferring it to definition time.
+    #[test]
+    fn parse_create_procedure_rejects_returns() {
+        let e = parse_pg("CREATE PROCEDURE p() RETURNS INT LANGUAGE plpgsql AS $$ $$").unwrap_err();
+        assert!(
+            e.to_string().contains("Expected: a procedure attribute"),
+            "{e}"
+        );
+    }
+
+    /// `CREATE OR REPLACE PROCEDURE` used to fall into the `or_replace` bail
+    /// because the PROCEDURE branch sat below it.
+    #[test]
+    fn create_or_replace_bail_still_names_the_supported_objects() {
+        let e = parse_pg("CREATE OR REPLACE SEQUENCE s").unwrap_err();
+        assert!(e.to_string().contains("or FUNCTION or PROCEDURE"), "{e}");
+    }
+
+    #[test]
+    fn parse_create_procedure_round_trips() {
+        let dialects = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
+        dialects.verified_stmt("CREATE PROCEDURE p(a INT) LANGUAGE plpgsql AS $$ BEGIN END $$");
+        dialects.verified_stmt("CREATE OR REPLACE PROCEDURE p() LANGUAGE sql AS 'SELECT 1'");
     }
 }

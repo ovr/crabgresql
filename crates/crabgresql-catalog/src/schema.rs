@@ -17,8 +17,8 @@ use crabgresql_storage_api::{
 use crabgresql_types::{PgType, Value};
 
 use crate::{
-    CatalogIndex, CatalogRelation, CatalogSequence, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS,
-    RelKind,
+    CatalogIndex, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogUserType, PG_CAST_ROWS,
+    PG_TYPE_ROWS, RelKind,
 };
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
@@ -1328,6 +1328,183 @@ pub fn information_schema_columns_rows(
                         Value::Text("YES".to_string()),
                     ]
                 })
+        })
+        .collect()
+}
+
+/// An `oidvector` column, rendered as the space-separated text `oidvectorout`
+/// prints. `oidvector` does not exist in this build's type system; the *output*
+/// is byte-identical to PostgreSQL's, so the only thing lost is subscripting
+/// (`proargtypes[0]`), which nothing in psql's `\df` uses. Named so the
+/// deviation is greppable, like [`CHARLIKE`].
+const OIDVECTORLIKE: PgType = PgType::Text;
+
+/// `pg_catalog.pg_language`.
+pub fn pg_language_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_language",
+        "pg_catalog",
+        vec![
+            col("oid", PgType::Oid),
+            col("lanname", PgType::Name),
+            col("lanowner", PgType::Oid),
+            col("lanispl", PgType::Bool),
+            col("lanpltrusted", PgType::Bool),
+            col("lanplcallfoid", PgType::Oid),
+            col("laninline", PgType::Oid),
+            col("lanvalidator", PgType::Oid),
+            col("lanacl", PgType::Text),
+        ],
+    )
+}
+
+/// The fixed `pg_language` rows.
+///
+/// 12/13/14 are PostgreSQL's bootstrap OIDs and are stable across versions.
+/// `plpgsql`'s is not: PostgreSQL assigns it through `CREATE EXTENSION` at
+/// initdb time, so it varies by build and there is nothing to reproduce —
+/// clients match on `lanname`. The handler OIDs stay 0 until `pg_proc` carries
+/// built-in rows for them to point at.
+pub fn pg_language_rows() -> Vec<Vec<Value>> {
+    let row = |oid: u32, name: &str, ispl: bool, trusted: bool| {
+        vec![
+            Value::Oid(oid),
+            Value::Text(name.to_string()),
+            Value::Oid(BOOTSTRAP_ROLE_OID),
+            Value::Bool(ispl),
+            Value::Bool(trusted),
+            Value::Oid(0),
+            Value::Oid(0),
+            Value::Oid(0),
+            Value::Null,
+        ]
+    };
+    vec![
+        row(12, "internal", false, false),
+        row(13, "c", false, false),
+        row(14, "sql", false, true),
+        row(PLPGSQL_LANG_OID, "plpgsql", true, true),
+    ]
+}
+
+/// The `pg_language` OID this build gives `plpgsql`. See [`pg_language_rows`]
+/// for why it is ours to choose.
+pub const PLPGSQL_LANG_OID: u32 = 13540;
+
+/// `pg_catalog.pg_proc` — the columns clients read, in PostgreSQL's order.
+pub fn pg_proc_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_proc",
+        "pg_catalog",
+        vec![
+            col("oid", PgType::Oid),
+            col("proname", PgType::Name),
+            col("pronamespace", PgType::Oid),
+            col("proowner", PgType::Oid),
+            col("prolang", PgType::Oid),
+            col("procost", PgType::Float4),
+            col("prorows", PgType::Float4),
+            col("provariadic", PgType::Oid),
+            col("prosupport", CHARLIKE),
+            col("prokind", CHARLIKE),
+            col("prosecdef", PgType::Bool),
+            col("proleakproof", PgType::Bool),
+            col("proisstrict", PgType::Bool),
+            col("proretset", PgType::Bool),
+            col("provolatile", CHARLIKE),
+            col("proparallel", CHARLIKE),
+            col("pronargs", PgType::Int2),
+            col("pronargdefaults", PgType::Int2),
+            col("prorettype", PgType::Oid),
+            col("proargtypes", OIDVECTORLIKE),
+            col("proallargtypes", PgType::Array(crabgresql_types::oid::OID)),
+            col("proargmodes", PgType::Array(crabgresql_types::oid::TEXT)),
+            col("proargnames", PgType::Array(crabgresql_types::oid::TEXT)),
+            col("prosrc", PgType::Text),
+            col("probin", PgType::Text),
+        ],
+    )
+}
+
+/// The `pg_proc` rows for the routines this server holds.
+///
+/// Honest for everything the catalog actually knows. The stubs are the columns
+/// nothing here can have an opinion about yet, each set to PostgreSQL's own
+/// default rather than to zero: `procost`/`prorows` (no planner cost model),
+/// `provariadic`/`pronargdefaults` (VARIADIC and argument defaults are
+/// rejected), `prosupport`/`proleakproof`/`proparallel`. `probin` is NULL
+/// honestly — there are no C functions.
+pub fn pg_proc_rows(
+    routines: &[CatalogRoutine],
+    namespace_oids: &HashMap<String, u32>,
+) -> Vec<Vec<Value>> {
+    routines
+        .iter()
+        .map(|r| {
+            // PostgreSQL leaves these NULL rather than empty when there is
+            // nothing to report, and clients test for NULL.
+            let optional_array = |elem: PgType, values: Vec<Value>| {
+                if values.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Array {
+                        elem,
+                        elems: values,
+                    }
+                }
+            };
+            vec![
+                Value::Oid(r.oid),
+                Value::Text(r.name.clone()),
+                Value::Oid(namespace_oids.get(&r.namespace).copied().unwrap_or(2200)),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
+                Value::Oid(r.lang),
+                // PostgreSQL's defaults: 1 for a built-in, 100 for anything
+                // whose body it has to run.
+                Value::Float4(if r.lang == 12 || r.lang == 13 {
+                    1.0
+                } else {
+                    100.0
+                }),
+                Value::Float4(if r.retset { 1000.0 } else { 0.0 }),
+                Value::Oid(0),
+                Value::Text("-".to_string()),
+                Value::Text(r.kind.to_string()),
+                Value::Bool(r.secdef),
+                Value::Bool(false),
+                Value::Bool(r.strict),
+                Value::Bool(r.retset),
+                Value::Text(r.volatile.to_string()),
+                Value::Text("u".to_string()),
+                Value::Int2(r.arg_types.len() as i16),
+                Value::Int2(0),
+                Value::Oid(r.ret_type),
+                // `oidvectorout` prints the OIDs space-separated.
+                Value::Text(
+                    r.arg_types
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                optional_array(
+                    PgType::Oid,
+                    r.all_arg_types.iter().map(|t| Value::Oid(*t)).collect(),
+                ),
+                optional_array(
+                    PgType::Text,
+                    r.arg_modes
+                        .iter()
+                        .map(|m| Value::Text(m.to_string()))
+                        .collect(),
+                ),
+                optional_array(
+                    PgType::Text,
+                    r.arg_names.iter().map(|n| Value::Text(n.clone())).collect(),
+                ),
+                Value::Text(r.src.clone()),
+                Value::Null,
+            ]
         })
         .collect()
 }

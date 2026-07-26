@@ -15,8 +15,8 @@ pub use collation::{
 pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, ParamCtx, ParamState, Scope, Subplan, UnaryOp,
     bind_column_default, bind_expr, bind_scalar, bind_sql_function_body, checked_length_typmod,
-    coerce_to_column, inline_params, length_typmod, map_data_type, param_ctx_extended,
-    param_ctx_none, param_types, require_all_resolved,
+    coerce_to_column, inline_params, length_typmod, map_data_type, param_ctx_capped,
+    param_ctx_extended, param_ctx_none, param_types, require_all_resolved, resolve_data_type,
 };
 pub use functions::{AggFn, GeoFn, JsonPathFn, ScalarFn, TableFn, TsFn, lookup_table_fn};
 pub use plan::{
@@ -26,7 +26,7 @@ pub use plan::{
     bind_delete,
     bind_delete_with_params, bind_insert, bind_insert_with_params, bind_query,
     bind_query_with_params, bind_update, bind_update_with_params, output_columns_of,
-    plan_has_outer_refs, substitute_outer, substitute_params,
+    plan_calls_routine, plan_has_outer_refs, substitute_outer, substitute_params,
 };
 
 use crabgresql_parser::Span;
@@ -81,6 +81,11 @@ pub struct BindError {
     /// cursor position (`LINE n: ... ^`). Only set for literal input-function
     /// failures and ambiguous operators, mirroring PG.
     pub location: Option<(u64, u64)>,
+    /// The `CONTEXT:` traceback: the call frames this error unwound through,
+    /// innermost first. Non-empty only when binding happened inside a routine
+    /// body (a `LANGUAGE SQL` inline expansion, or a statement in a PL/pgSQL
+    /// body bound at call time).
+    pub context: Vec<String>,
 }
 
 impl std::fmt::Display for BindError {
@@ -99,6 +104,7 @@ impl BindError {
             detail: None,
             hint: None,
             location: None,
+            context: Vec::new(),
         }
     }
 
@@ -106,6 +112,19 @@ impl BindError {
     pub fn with_detail(mut self, detail: Option<String>) -> Self {
         self.detail = detail;
         self
+    }
+
+    /// Record the call frame this error is propagating out of. Called while
+    /// unwinding, so frames land innermost-first without a frame stack.
+    pub fn push_context(mut self, frame: impl Into<String>) -> Self {
+        self.context.push(frame.into());
+        self
+    }
+
+    /// The `CONTEXT` wire field: frames newline-joined, innermost first, or
+    /// `None` when no frame contributed.
+    pub fn context(&self) -> Option<String> {
+        (!self.context.is_empty()).then(|| self.context.join("\n"))
     }
 
     /// Attach a HINT line.
