@@ -6353,3 +6353,69 @@ async fn procedures_are_created_called_and_dropped() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `pg_language` and `pg_proc`: a routine is visible to introspection, with the
+/// metadata its declaration actually gave.
+#[tokio::test]
+async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION shown(a int, b text) RETURNS bigint \
+             LANGUAGE plpgsql IMMUTABLE STRICT AS $$ BEGIN RETURN 1; END $$",
+        )
+        .await?;
+
+    let row = client
+        .query_one(
+            "SELECT p.proname, l.lanname, p.prokind, p.provolatile, p.proisstrict, \
+                    p.pronargs, p.proargtypes, p.prosrc, n.nspname, \
+                    array_to_string(p.proargnames, ',') AS argnames \
+             FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
+             JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE p.proname = 'shown'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>("proname"), "shown");
+    assert_eq!(row.get::<_, &str>("lanname"), "plpgsql");
+    assert_eq!(row.get::<_, &str>("prokind"), "f");
+    // The attributes CREATE FUNCTION used to parse and silently drop.
+    assert_eq!(row.get::<_, &str>("provolatile"), "i");
+    assert!(row.get::<_, bool>("proisstrict"));
+    assert_eq!(row.get::<_, i16>("pronargs"), 2);
+    // `proargtypes` renders as oidvectorout does: the OIDs, space-separated.
+    assert_eq!(row.get::<_, &str>("proargtypes"), "23 25");
+    // Read through array_to_string: arrays have no binary wire format yet.
+    assert_eq!(row.get::<_, &str>("argnames"), "a,b");
+    assert!(row.get::<_, &str>("prosrc").contains("RETURN 1;"));
+    assert_eq!(row.get::<_, &str>("nspname"), "public");
+
+    // A procedure is prokind 'p'.
+    client
+        .batch_execute("CREATE PROCEDURE proc_shown() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$")
+        .await?;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT prokind FROM pg_catalog.pg_proc WHERE proname = 'proc_shown'",
+                &[]
+            )
+            .await?
+            .get::<_, &str>(0),
+        "p"
+    );
+
+    // The four languages this build knows, and only those.
+    let rows = client
+        .query(
+            "SELECT lanname FROM pg_catalog.pg_language ORDER BY oid",
+            &[],
+        )
+        .await?;
+    let names: Vec<&str> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(names, ["internal", "c", "sql", "plpgsql"]);
+
+    Ok(())
+}

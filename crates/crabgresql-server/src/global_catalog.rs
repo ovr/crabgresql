@@ -168,9 +168,9 @@ impl FuncBody {
 /// reproduce — clients match on `lanname`, not on the OID.
 pub mod lang {
     pub const INTERNAL: u32 = 12;
-    pub const C: u32 = 13;
     pub const SQL: u32 = 14;
-    pub const PLPGSQL: u32 = 13540;
+    /// Re-exported so `pg_language` and a routine's `prolang` cannot drift.
+    pub const PLPGSQL: u32 = crabgresql_catalog::PLPGSQL_LANG_OID;
 }
 
 /// Whether a routine was created by `CREATE FUNCTION` or `CREATE PROCEDURE` —

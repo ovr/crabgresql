@@ -35,8 +35,8 @@ use crate::catalog::{SessionCatalog, SessionCatalogOps};
 use crate::error::PgError;
 use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
 use crate::global_catalog::{
-    ArgMode, CatalogNotice, FuncBody, FuncDropSpec, GlobalCatalog, RoutineArg, RoutineDefinition,
-    RoutineKind, TypeRef, Volatility,
+    ArgMode, CatalogNotice, FuncBody, FuncDropSpec, FuncInfo, GlobalCatalog, RoutineArg,
+    RoutineDefinition, RoutineKind, TypeRef, Volatility,
 };
 use crate::routines::RoutineDispatch;
 use crate::session::{ActiveTxn, Session};
@@ -285,6 +285,7 @@ fn bind_catalogs(
         let temp_namespace_oid = session.temp_namespace_oid;
         // User-defined types are reflected into pg_type/pg_enum on demand.
         let types = global_catalog.clone();
+        let routines = global_catalog.clone();
         Arc::new(
             crabgresql_catalog::SystemCatalog::with_catalog_relations_fn(
                 database,
@@ -347,6 +348,7 @@ fn bind_catalogs(
                     })
                     .collect()
             })
+            .with_routines_fn(move || routines.functions().iter().map(catalog_routine).collect())
             .with_schemas_fn(move || {
                 let mut schemas = schemas_engine.schemas();
                 // Reflect this session's `pg_temp_N` namespace with a stable
@@ -375,6 +377,55 @@ fn bind_catalogs(
     let catalog_ops: Arc<dyn CatalogOps> =
         Arc::new(SessionCatalogOps::new(system, session.temp_schema.clone()));
     (catalog, type_catalog, catalog_ops)
+}
+
+/// A catalog routine as `pg_proc` reports it.
+///
+/// A type that does not resolve is reported as OID 0 rather than dropping the
+/// row: `pg_proc` should show every routine that exists, and PostgreSQL also
+/// prints 0 for a type it cannot name.
+fn catalog_routine(info: &FuncInfo) -> crabgresql_catalog::CatalogRoutine {
+    let oid_of = |r: &TypeRef| match r {
+        TypeRef::Builtin(t) => t.oid(),
+        TypeRef::User(_) | TypeRef::Cstring => 0,
+    };
+    // PostgreSQL leaves proallargtypes/proargmodes NULL unless some argument is
+    // OUT or INOUT, and proargnames NULL unless some argument is named.
+    let has_output = info.all_args.iter().any(|a| !a.mode.is_input());
+    let named = info.all_args.iter().any(|a| a.name.is_some());
+    crabgresql_catalog::CatalogRoutine {
+        oid: info.oid,
+        name: info.name.clone(),
+        namespace: info.namespace.clone(),
+        kind: info.kind.prokind(),
+        lang: info.lang_oid,
+        arg_types: info.args.iter().map(oid_of).collect(),
+        all_arg_types: if has_output {
+            info.all_args.iter().map(|a| oid_of(&a.ty)).collect()
+        } else {
+            Vec::new()
+        },
+        arg_modes: if has_output {
+            info.all_args.iter().map(|a| a.mode.proargmode()).collect()
+        } else {
+            Vec::new()
+        },
+        arg_names: if named {
+            info.all_args
+                .iter()
+                .map(|a| a.name.clone().unwrap_or_default())
+                .collect()
+        } else {
+            Vec::new()
+        },
+        ret_type: oid_of(&info.ret),
+        // SETOF is rejected at CREATE, so nothing here returns a set yet.
+        retset: false,
+        volatile: info.volatility.provolatile(),
+        strict: info.strict,
+        secdef: info.secdef,
+        src: info.src.clone(),
+    }
 }
 
 /// Bind a DQL/DML statement against `catalog`, threading `$n` placeholders
