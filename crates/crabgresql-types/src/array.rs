@@ -82,6 +82,8 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::JSON, oid::JSON_ARRAY),
     (oid::JSONB, oid::JSONB_ARRAY),
     (oid::JSONPATH, oid::JSONPATH_ARRAY),
+    (oid::TSVECTOR, oid::TSVECTOR_ARRAY),
+    (oid::TSQUERY, oid::TSQUERY_ARRAY),
     (oid::DATE, oid::DATE_ARRAY),
     (oid::TIME, oid::TIME_ARRAY),
     (oid::TIMETZ, oid::TIMETZ_ARRAY),

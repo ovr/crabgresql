@@ -131,15 +131,16 @@ SELECT strip('x:1 y:2 q:3 y:4'::tsvector) @@ '!(x <-> y)' AS "true";
 -- flat operator chain, which the parser builds with a loop but which every
 -- later walk still recurses over.
 --
--- Our cap is lower than PostgreSQL's: PG parses onto an explicit stack, so it
--- accepts these three and only reports `tsquery stack too small` far later (it
--- does reject the `!` case below). Bounding recursion is what keeps a single
--- literal from aborting the backend, so the cap stays.
+-- Our cap is lower than PostgreSQL's, and is sized against the deepest walk:
+-- reading a stored query back off the heap. That way nothing the parser accepts
+-- can overflow later. PG accepts these three and only reports `tsquery stack
+-- too small` far later (it does reject the `!` case below). Bounding recursion
+-- is what keeps a single literal from aborting the backend, so the cap stays.
 SELECT (repeat('(', 5000) || 'a' || repeat(')', 5000))::tsquery;
 SELECT (repeat('!', 5000) || 'a')::tsquery;
 SELECT numnode((repeat('a&', 5000) || 'a')::tsquery);
 -- a chain well inside the limit still works, and matches PG
-SELECT numnode((repeat('a&', 400) || 'a')::tsquery);
+SELECT numnode((repeat('a&', 200) || 'a')::tsquery);
 -- tsquery_phrase enforces the same distance range as the `<N>` operator
 SELECT tsquery_phrase('a', 'b', 20000);
 

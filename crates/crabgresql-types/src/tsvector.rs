@@ -439,12 +439,6 @@ pub fn max_pos(tv: &TsVector) -> u16 {
         .unwrap_or(0)
 }
 
-/// Whether any lexeme carries position information. A vector without positions
-/// can never satisfy a phrase query, and ignores weight filters entirely.
-pub fn has_positions(tv: &TsVector) -> bool {
-    tv.lexemes.iter().any(|l| !l.positions.is_empty())
-}
-
 /// `tsvector || tsvector`: union the lexemes, shifting the right operand's
 /// positions past the left operand's highest position.
 pub fn concat(a: &TsVector, b: &TsVector) -> TsVector {

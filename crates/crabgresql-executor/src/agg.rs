@@ -350,16 +350,13 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     j.hash(&mut h);
                 }
             }
-            // Both text-search types are canonicalized on input, so hashing the
-            // parsed structure agrees with `keys_equal`.
+            // `tsvector` is canonicalized on input, so hashing the parsed
+            // structure agrees with `keys_equal`. `tsquery` contributes nothing
+            // (see `PgType::hashes_distinctly`): its equality ignores a leaf's
+            // prefix flag and weight mask, which a structural hash cannot.
             PgType::Tsvector => {
                 if let Value::Tsvector(t) = v {
                     t.hash(&mut h);
-                }
-            }
-            PgType::Tsquery => {
-                if let Value::Tsquery(q) = v {
-                    q.hash(&mut h);
                 }
             }
             PgType::User(type_oid) => {

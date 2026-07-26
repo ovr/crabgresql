@@ -1450,15 +1450,17 @@ fn eval_jsonpath(f: JsonPathFn, args: &[Value]) -> Result<Value, ExecError> {
 /// NULLs — except inside the `text[]` arguments, where a NULL element is
 /// meaningful (`setweight`/`ts_delete` skip them, `array_to_tsvector` rejects
 /// them).
-fn eval_ts(f: TsFn, args: &[Value]) -> Result<Value, ExecError> {
+fn eval_ts<'a>(f: TsFn, args: &'a [Value]) -> Result<Value, ExecError> {
     use crabgresql_types::{tsquery, tsvector};
 
-    let vector = |v: &Value| match v {
-        Value::Tsvector(t) => t.clone(),
+    // Borrow rather than clone: this runs once per row per node, and every
+    // callee below takes `&`. Matches `eval_jsonpath` above.
+    let vector = |v: &'a Value| match v {
+        Value::Tsvector(t) => t,
         other => unreachable!("expected tsvector, got {other:?}"),
     };
-    let query = |v: &Value| match v {
-        Value::Tsquery(q) => q.clone(),
+    let query = |v: &'a Value| match v {
+        Value::Tsquery(q) => q,
         other => unreachable!("expected tsquery, got {other:?}"),
     };
     // A `text` or `text[]` argument as a list of optional lexemes, so the two
@@ -1479,12 +1481,12 @@ fn eval_ts(f: TsFn, args: &[Value]) -> Result<Value, ExecError> {
     let ts_err = |e: tsvector::TsError| ExecError::new(e.sqlstate, e.message);
 
     Ok(match f {
-        TsFn::Match => Value::Bool(tsquery::matches(&vector(&args[0]), &query(&args[1]))),
+        TsFn::Match => Value::Bool(tsquery::matches(vector(&args[0]), query(&args[1]))),
         TsFn::VectorConcat => {
-            Value::Tsvector(tsvector::concat(&vector(&args[0]), &vector(&args[1])))
+            Value::Tsvector(tsvector::concat(vector(&args[0]), vector(&args[1])))
         }
-        TsFn::Strip => Value::Tsvector(tsvector::strip(&vector(&args[0]))),
-        TsFn::VectorLength => Value::Int4(tsvector::length(&vector(&args[0]))),
+        TsFn::Strip => Value::Tsvector(tsvector::strip(vector(&args[0]))),
+        TsFn::VectorLength => Value::Int4(tsvector::length(vector(&args[0]))),
         TsFn::SetWeight | TsFn::SetWeightLexemes => {
             // PG takes a `"char"`, which keeps only the first character.
             let label = match &args[1] {
@@ -1494,11 +1496,11 @@ fn eval_ts(f: TsFn, args: &[Value]) -> Result<Value, ExecError> {
             let w = tsvector::weight_from_char(label).map_err(ts_err)?;
             let tv = vector(&args[0]);
             Value::Tsvector(match f {
-                TsFn::SetWeight => tsvector::setweight(&tv, w),
-                _ => tsvector::setweight_lexemes(&tv, w, &words(&args[2])),
+                TsFn::SetWeight => tsvector::setweight(tv, w),
+                _ => tsvector::setweight_lexemes(tv, w, &words(&args[2])),
             })
         }
-        TsFn::Delete => Value::Tsvector(tsvector::ts_delete(&vector(&args[0]), &words(&args[1]))),
+        TsFn::Delete => Value::Tsvector(tsvector::ts_delete(vector(&args[0]), &words(&args[1]))),
         TsFn::Filter => {
             // Unlike setweight/ts_delete, which skip NULL entries, ts_filter
             // rejects them outright.
@@ -1512,11 +1514,11 @@ fn eval_ts(f: TsFn, args: &[Value]) -> Result<Value, ExecError> {
                 })?;
                 weights.push(tsvector::weight_from_label(&label).map_err(ts_err)?);
             }
-            Value::Tsvector(tsvector::ts_filter(&vector(&args[0]), &weights))
+            Value::Tsvector(tsvector::ts_filter(vector(&args[0]), &weights))
         }
         TsFn::VectorToArray => Value::Array {
             elem: PgType::Text,
-            elems: tsvector::to_array(&vector(&args[0]))
+            elems: tsvector::to_array(vector(&args[0]))
                 .into_iter()
                 .map(Value::Text)
                 .collect(),
@@ -1524,17 +1526,17 @@ fn eval_ts(f: TsFn, args: &[Value]) -> Result<Value, ExecError> {
         TsFn::ArrayToVector => {
             Value::Tsvector(tsvector::from_array(&words(&args[0])).map_err(ts_err)?)
         }
-        TsFn::NumNode => Value::Int4(tsquery::numnode(&query(&args[0]))),
-        TsFn::QueryTree => Value::Text(tsquery::querytree(&query(&args[0]))),
+        TsFn::NumNode => Value::Int4(tsquery::numnode(query(&args[0]))),
+        TsFn::QueryTree => Value::Text(tsquery::querytree(query(&args[0]))),
         TsFn::QueryAnd => {
-            Value::Tsquery(tsquery::and(&query(&args[0]), &query(&args[1])).map_err(ts_err)?)
+            Value::Tsquery(tsquery::and(query(&args[0]), query(&args[1])).map_err(ts_err)?)
         }
         TsFn::QueryOr => {
-            Value::Tsquery(tsquery::or(&query(&args[0]), &query(&args[1])).map_err(ts_err)?)
+            Value::Tsquery(tsquery::or(query(&args[0]), query(&args[1])).map_err(ts_err)?)
         }
-        TsFn::QueryNot => Value::Tsquery(tsquery::not(&query(&args[0])).map_err(ts_err)?),
+        TsFn::QueryNot => Value::Tsquery(tsquery::not(query(&args[0])).map_err(ts_err)?),
         TsFn::QueryPhrase => {
-            Value::Tsquery(tsquery::phrase(&query(&args[0]), &query(&args[1]), 1).map_err(ts_err)?)
+            Value::Tsquery(tsquery::phrase(query(&args[0]), query(&args[1]), 1).map_err(ts_err)?)
         }
         TsFn::QueryPhraseDist => {
             let dist = match &args[2] {
@@ -1553,7 +1555,7 @@ fn eval_ts(f: TsFn, args: &[Value]) -> Result<Value, ExecError> {
                     )
                 })?;
             Value::Tsquery(
-                tsquery::phrase(&query(&args[0]), &query(&args[1]), dist).map_err(ts_err)?,
+                tsquery::phrase(query(&args[0]), query(&args[1]), dist).map_err(ts_err)?,
             )
         }
     })

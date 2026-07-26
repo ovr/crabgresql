@@ -114,6 +114,8 @@ pub mod oid {
     pub const JSON_ARRAY: u32 = 199;
     pub const JSONB_ARRAY: u32 = 3807;
     pub const JSONPATH_ARRAY: u32 = 4073;
+    pub const TSVECTOR_ARRAY: u32 = 3643;
+    pub const TSQUERY_ARRAY: u32 = 3645;
     pub const DATE_ARRAY: u32 = 1182;
     pub const TIME_ARRAY: u32 = 1183;
     pub const TIMETZ_ARRAY: u32 = 1270;
@@ -397,10 +399,12 @@ impl PgType {
                 // A reg* value compares by OID alone, and `hash_key` hashes the
                 // OID alone — the carried name is never part of either.
                 | PgType::Reg(_)
-                // Both text-search types are canonicalized on input, so their
-                // structural hash agrees with `keys_equal`.
+                // `tsvector` is canonicalized on input, so its structural hash
+                // agrees with `keys_equal`. `tsquery` is deliberately absent:
+                // its equality ignores a leaf's prefix flag and weight mask (as
+                // PG's does), which the derived `Hash` cannot, so hashing it
+                // would split groups `keys_equal` calls equal.
                 | PgType::Tsvector
-                | PgType::Tsquery
         )
     }
 
@@ -735,6 +739,8 @@ fn array_display_name(elem: u32) -> &'static str {
         Some(PgType::Json) => "json[]",
         Some(PgType::Jsonb) => "jsonb[]",
         Some(PgType::Jsonpath) => "jsonpath[]",
+        Some(PgType::Tsvector) => "tsvector[]",
+        Some(PgType::Tsquery) => "tsquery[]",
         _ => "array",
     }
 }
@@ -775,6 +781,8 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Json) => "_json",
         Some(PgType::Jsonb) => "_jsonb",
         Some(PgType::Jsonpath) => "_jsonpath",
+        Some(PgType::Tsvector) => "_tsvector",
+        Some(PgType::Tsquery) => "_tsquery",
         _ => "array",
     }
 }

@@ -7,8 +7,7 @@
 //! the SQLSTATE/message of each error — derived from the documentation and from
 //! differential probing against a real server, and implemented independently.
 //!
-//! Representation: a tree ([`Node`]) rather than PG's flattened polish-notation
-//! array. The tree shape is significant — `'1|2|4'` and `'1|(2|4)'` are distinct
+//! Representation: a tree ([`Node`]). The tree shape is significant — `'1|2|4'` and `'1|(2|4)'` are distinct
 //! values in PG even though they print identically — so parsing never
 //! re-associates.
 
@@ -34,11 +33,14 @@ const MAX_PARSE_DEPTH: usize = 200;
 /// building it did not recurse: `'a&a&a&…'` is parsed by a loop but produces a
 /// left spine as deep as the term count.
 ///
-/// Measured on a 2 MiB worker-thread stack (debug, the larger-frame case), those
-/// walks survive a depth of 2000 and overflow by 4000, so this leaves ~2x
-/// margin. PG instead parses onto an explicit stack and reports
-/// `tsquery stack too small` once that fills.
-const MAX_NODE_DEPTH: usize = 1000;
+/// Measured on a 2 MiB worker-thread stack (debug, the larger-frame case): the
+/// cheap walks survive a depth of 2000, but [`decode`] — the deepest frame, and
+/// the one reached when a stored query is read back — survives 800 and
+/// overflows by 1000. The cap is set below that worst walk with ~2x margin, so
+/// nothing the parser accepts can crash on its way back off the heap. PG's own
+/// limit is far higher; it reports `tsquery stack too small` when its parser
+/// stack fills.
+const MAX_NODE_DEPTH: usize = 400;
 
 /// Weight-filter bits. A query operand may restrict which weights count as a
 /// match; an empty mask means "any weight".
@@ -72,12 +74,6 @@ pub enum Node {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TsQuery {
     pub root: Option<Node>,
-}
-
-impl TsQuery {
-    pub fn is_empty(&self) -> bool {
-        self.root.is_none()
-    }
 }
 
 /// PG's wording when its parser stack fills; ours reports the same thing when a
@@ -461,13 +457,14 @@ fn op_rank(n: &Node) -> (u8, u16) {
 /// structural walk comparing the operator first and the **right** child before
 /// the left.
 ///
-/// The leaf tier is a documented divergence. PG compares leaf lexemes by an
-/// internal hash of the word, so its single-lexeme queries sort in an order with
-/// no relation to the text (`'d' < 'm' < 'a' < 'e' < …` on 18.4). That order is
-/// an implementation artifact with no documented contract, so we compare the
-/// lexeme bytes instead. Equality is unaffected — only the relative `<`/`>` of
-/// two same-shaped, same-length queries differs, and every comparison the
-/// upstream `tstypes` suite asserts is decided by one of the tiers above.
+/// Like PG, the leaf tier looks only at the lexeme: `'a' = 'a:*'` and
+/// `'a:A' = 'a:B'` are true, so a prefix flag or weight mask never separates two
+/// otherwise equal queries.
+///
+/// The one divergence is the *order* of two distinct lexemes, which comes out in an order with no
+/// relation to the text (`'d' < 'm' < 'a' < 'e' < …` on 18.4). That order has no
+/// documented contract, so we use byte order; every comparison the upstream
+/// `tstypes` suite asserts is decided by one of the tiers above it.
 pub fn cmp(a: &TsQuery, b: &TsQuery) -> Ordering {
     numnode(a)
         .cmp(&numnode(b))
@@ -497,11 +494,15 @@ fn cmp_node(a: &Node, b: &Node) -> Ordering {
                 prefix: p2,
                 weights: g2,
             },
-        ) => w1
-            .as_bytes()
-            .cmp(w2.as_bytes())
-            .then_with(|| p1.cmp(p2))
-            .then_with(|| g1.cmp(g2)),
+        ) => {
+            // PG compares only the lexeme here: `'a' = 'a:*'` and
+            // `'a:A' = 'a:B'` are both true, and `SELECT DISTINCT` collapses
+            // them. Including the prefix flag or the weight mask would make
+            // equality stricter than PG's, since `=`/`DISTINCT`/`GROUP BY` all
+            // route through this comparison.
+            let _ = (p1, p2, g1, g2);
+            w1.as_bytes().cmp(w2.as_bytes())
+        }
         (Node::Not(x), Node::Not(y)) => cmp_node(x, y),
         (Node::And(l1, r1), Node::And(l2, r2))
         | (Node::Or(l1, r1), Node::Or(l2, r2))
@@ -629,7 +630,12 @@ pub fn querytree(q: &TsQuery) -> String {
         }
     }
 
-    match q.root.as_ref().and_then(clean) {
+    // An empty query has nothing to strip, so it prints as nothing; `T` is
+    // reserved for a query whose every branch was negated away.
+    let Some(root) = q.root.as_ref() else {
+        return String::new();
+    };
+    match clean(root) {
         Some(n) => format(&TsQuery { root: Some(n) }),
         None => "T".to_string(),
     }
@@ -755,56 +761,6 @@ pub fn decode(bytes: &[u8]) -> Option<TsQuery> {
 // Matching (`@@`)
 // ---------------------------------------------------------------------------
 
-/// One phrase match, spanning positions `(end - width) ..= end`. A bare lexeme
-/// has `width == 0`; combining `a <N> b` yields a match whose span reaches from
-/// `a`'s start to `b`'s end.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct PMatch {
-    end: u16,
-    width: u16,
-}
-
-/// The positions at which a subexpression matches, inside a phrase node.
-#[derive(Clone, Debug)]
-enum PosSet {
-    /// Matches nowhere.
-    None,
-    /// Matches exactly at these spans (sorted, deduplicated).
-    At(Vec<PMatch>),
-    /// Matches at every position — a negation that no lexeme contradicts.
-    Everywhere,
-}
-
-/// `tsvector @@ tsquery`.
-pub fn matches(tv: &TsVector, q: &TsQuery) -> bool {
-    match &q.root {
-        None => false,
-        Some(root) => eval(tv, root),
-    }
-}
-
-/// Boolean evaluation, used everywhere outside a phrase operand.
-fn eval(tv: &TsVector, node: &Node) -> bool {
-    match node {
-        // A lexeme matches if any of its positions passes the weight filter --
-        // or if it has no positions at all, since a stripped vector carries no
-        // weights to filter on (PG's long-standing behavior, which is why
-        // `strip('wa:1A') @@ 'w:*D'` is true).
-        Node::Val {
-            word,
-            prefix,
-            weights,
-        } => matching_lexemes(tv, word, *prefix).iter().any(|l| {
-            l.positions.is_empty() || l.positions.iter().any(|p| weight_ok(*weights, p.weight))
-        }),
-        Node::Not(inner) => !eval(tv, inner),
-        Node::And(l, r) => eval(tv, l) && eval(tv, r),
-        Node::Or(l, r) => eval(tv, l) || eval(tv, r),
-        // A phrase is satisfied if it matches anywhere.
-        Node::Phrase { .. } => matches!(phrase_eval(tv, node), PosSet::At(v) if !v.is_empty()),
-    }
-}
-
 /// The lexemes a `Val` node's word selects. `TsVector.lexemes` is sorted by byte
 /// order, so both an exact match and a prefix match are a *contiguous* run: seek
 /// the lower bound once instead of scanning the whole document per node.
@@ -853,96 +809,312 @@ fn lexeme_positions(tv: &TsVector, node: &Node) -> Vec<u16> {
     out
 }
 
+/// One phrase match, spanning positions `start ..= end`. A bare lexeme has
+/// `width == 0`; combining `a <N> b` yields a match reaching from `a`'s start to
+/// `b`'s end.
+///
+/// Positions are signed because a negation matches *outside* the document too:
+/// `'a:1' @@ '!c <2> a'` is true, with `!c` sitting at position -1. Clamping at
+/// zero silently loses that whole family of matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PMatch {
+    end: i32,
+    width: i32,
+}
+
+impl PMatch {
+    fn at(end: i32) -> PMatch {
+        PMatch { end, width: 0 }
+    }
+
+    fn start(self) -> i32 {
+        self.end - self.width
+    }
+
+    /// The span reaching from `self`'s start to `to`'s end.
+    fn spanning(self, to: PMatch) -> PMatch {
+        PMatch {
+            end: to.end,
+            width: to.end - self.start(),
+        }
+    }
+}
+
+/// Where a subexpression matches, inside a phrase operand.
+///
+/// Three states, not two.
+///
+/// A negation yields a *cofinite* set — every position except the ones the
+/// negated term occupies — kept symbolically rather than materialized. It also
+/// has to carry explicit spans: `(a <-> b) | !z` matches both
+/// everywhere-except-nothing and the two-word extent of `a <-> b`, and an
+/// enclosing `<->` measures from that wider start. Hence `extra`.
+///
+/// A lexeme that is present but carries no positions has an *unknown* position
+/// rather than no position: `'z:7 x' @@ '!x <2> z'` is false (x is there, so
+/// `!x` holds nowhere) while `'z:7' @@ '!x <2> z'` is true (x is absent).
+#[derive(Clone, Debug)]
+enum PosSet {
+    /// A finite set of spans, sorted and deduplicated. Empty means "nowhere".
+    Exact(Vec<PMatch>),
+    /// A match of width `width` ending at every position *except* `except`,
+    /// together with the explicit spans in `extra`. Both lists are sorted and
+    /// deduplicated. `width` is 0 for a plain negation; joining two negations
+    /// yields a set whose members span the distance between them.
+    Cofinite {
+        except: Vec<i32>,
+        width: i32,
+        extra: Vec<PMatch>,
+    },
+    /// Present, but at an unknown position. Any phrase built on it is
+    /// indeterminate, which `@@` reports as false.
+    Unknown,
+}
+
+impl PosSet {
+    /// Whether the subexpression definitely matches somewhere. A cofinite set is
+    /// never empty.
+    fn matches_anywhere(&self) -> bool {
+        match self {
+            PosSet::Exact(v) => !v.is_empty(),
+            PosSet::Cofinite { .. } => true,
+            PosSet::Unknown => false,
+        }
+    }
+}
+
+fn norm_points(mut v: Vec<i32>) -> Vec<i32> {
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Sort, deduplicate, and drop any span reaching past the highest position a
+/// tsvector can hold -- a negation placed there could never line up with a real
+/// lexeme, and PG does not match it either (`'b:16382 y:16383' @@
+/// 'b <-> (y <-> !x)'` is false, while the same shape one position lower is
+/// true).
+fn norm_spans(mut v: Vec<PMatch>) -> Vec<PMatch> {
+    v.retain(|m| m.end <= i32::from(tsvector::MAX_POS));
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// The spans in `v` that begin at `p`. `v` is ordered by end, not start, so this
+/// is a scan; `extra` only ever holds the spans an explicit `|` contributed.
+fn starting_at(v: &[PMatch], p: i32) -> impl Iterator<Item = PMatch> + '_ {
+    v.iter().copied().filter(move |m| m.start() == p)
+}
+
+/// The cofinite member *starting* at `p`, unless it is excluded.
+fn cofinite_from(except: &[i32], width: i32, p: i32) -> Option<PMatch> {
+    let end = p + width;
+    except
+        .binary_search(&end)
+        .is_err()
+        .then_some(PMatch { end, width })
+}
+
+/// The cofinite member *ending* at `e`, unless it is excluded.
+fn cofinite_to(except: &[i32], width: i32, e: i32) -> Option<PMatch> {
+    except
+        .binary_search(&e)
+        .is_err()
+        .then_some(PMatch { end: e, width })
+}
+
+/// Keep whichever of two same-start spans reaches further, which is what an `&`
+/// between phrase operands does.
+fn longer(a: PMatch, b: PMatch) -> PMatch {
+    if a.end >= b.end { a } else { b }
+}
+
+/// `tsvector @@ tsquery`.
+pub fn matches(tv: &TsVector, q: &TsQuery) -> bool {
+    match &q.root {
+        None => false,
+        Some(root) => eval(tv, root),
+    }
+}
+
+/// Boolean evaluation, used everywhere outside a phrase operand.
+fn eval(tv: &TsVector, node: &Node) -> bool {
+    match node {
+        // A lexeme matches if any of its positions passes the weight filter --
+        // or if it has no positions at all, since a stripped vector carries no
+        // weights to filter on (PG's long-standing behavior, which is why
+        // `strip('wa:1A') @@ 'w:*D'` is true).
+        Node::Val {
+            word,
+            prefix,
+            weights,
+        } => matching_lexemes(tv, word, *prefix).iter().any(|l| {
+            l.positions.is_empty() || l.positions.iter().any(|p| weight_ok(*weights, p.weight))
+        }),
+        Node::Not(inner) => !eval(tv, inner),
+        Node::And(l, r) => eval(tv, l) && eval(tv, r),
+        Node::Or(l, r) => eval(tv, l) || eval(tv, r),
+        Node::Phrase { .. } => phrase_eval(tv, node).matches_anywhere(),
+    }
+}
+
 /// Positional evaluation, used for the operands of a phrase node.
 fn phrase_eval(tv: &TsVector, node: &Node) -> PosSet {
     match node {
-        Node::Val { .. } => {
-            let spans: Vec<PMatch> = lexeme_positions(tv, node)
-                .into_iter()
-                .map(|end| PMatch { end, width: 0 })
-                .collect();
-            if spans.is_empty() {
-                PosSet::None
-            } else {
-                PosSet::At(spans)
+        Node::Val { word, prefix, .. } => {
+            // *Any* positionless match makes the operand indeterminate, even if
+            // another lexeme the prefix selects does carry positions: PG reports
+            // `'b' 'bc':5 @@ 'b:* <0> bc'` as false, not true.
+            if matching_lexemes(tv, word, *prefix)
+                .iter()
+                .any(|l| l.positions.is_empty())
+            {
+                return PosSet::Unknown;
             }
+            // Otherwise: the positions that pass the weight filter, or a
+            // definite "matches nowhere" when the term is absent or every
+            // position was filtered out.
+            PosSet::Exact(
+                lexeme_positions(tv, node)
+                    .into_iter()
+                    .map(|p| PMatch::at(i32::from(p)))
+                    .collect(),
+            )
         }
-        // Inside a phrase, `!x` matches at every position where `x` does not.
-        Node::Not(inner) => complement(tv, phrase_eval(tv, inner)),
+        // `!!x` is `x`. Taking the complement twice would round the spans down
+        // to points, so collapse the pair instead.
+        Node::Not(inner) => match inner.as_ref() {
+            Node::Not(x) => phrase_eval(tv, x),
+            _ => complement(phrase_eval(tv, inner)),
+        },
         Node::And(l, r) => intersect(phrase_eval(tv, l), phrase_eval(tv, r)),
         Node::Or(l, r) => union(phrase_eval(tv, l), phrase_eval(tv, r)),
         Node::Phrase { dist, left, right } => {
-            join(tv, phrase_eval(tv, left), phrase_eval(tv, right), *dist)
+            join(phrase_eval(tv, left), phrase_eval(tv, right), i32::from(*dist))
         }
     }
 }
 
-/// Every position in the vector, used to materialize [`PosSet::Everywhere`].
-fn all_positions(tv: &TsVector) -> Vec<PMatch> {
-    (1..=tsvector::max_pos(tv))
-        .map(|end| PMatch { end, width: 0 })
-        .collect()
-}
-
-fn materialize(tv: &TsVector, set: PosSet) -> Vec<PMatch> {
+/// `!x`: where `x` does not match. The exclusion is keyed on each span's **end**,
+/// which is what makes `'a:1 b:2 c:3' @@ '!(a <-> b) <0> a'` true while
+/// `… <0> b` is false.
+fn complement(set: PosSet) -> PosSet {
     match set {
-        PosSet::None => Vec::new(),
-        PosSet::At(v) => v,
-        PosSet::Everywhere => all_positions(tv),
+        PosSet::Unknown => PosSet::Unknown,
+        PosSet::Exact(spans) => PosSet::Cofinite {
+            except: norm_points(spans.iter().map(|s| s.end).collect()),
+            width: 0,
+            extra: Vec::new(),
+        },
+        // The complement of "matches anywhere but these" is "matches only at
+        // these", minus the positions an explicit span already covers.
+        //
+        // Keyed on the excluded *end*. When the cofinite members span a distance
+        // (a phrase between two negations, e.g. `!(!a <-> !b)`) neither this nor
+        // keying on the start reproduces PG exactly; measured over 4400
+        // differential cases against 18.4, end-keying leaves one divergence and
+        // start-keying two, both only in phrases nesting three or more
+        // negations. See `known_divergence_negated_negation_phrase`.
+        PosSet::Cofinite { except, extra, .. } => PosSet::Exact(norm_spans(
+            except
+                .into_iter()
+                .filter(|p| !extra.iter().any(|m| m.end == *p))
+                .map(PMatch::at)
+                .collect(),
+        )),
     }
 }
 
-fn complement(tv: &TsVector, set: PosSet) -> PosSet {
-    match set {
-        PosSet::None => PosSet::Everywhere,
-        PosSet::Everywhere => PosSet::None,
-        PosSet::At(spans) => {
-            // `spans` is sorted by `end`, so walk it alongside the position
-            // range rather than re-scanning it for every position: the operand
-            // can hold thousands of spans and `max_pos` reaches 16383.
-            let mut rest = Vec::new();
-            let mut next = 0usize;
-            for p in 1..=tsvector::max_pos(tv) {
-                while next < spans.len() && spans[next].end < p {
-                    next += 1;
-                }
-                if spans.get(next).map(|s| s.end) != Some(p) {
-                    rest.push(PMatch { end: p, width: 0 });
-                }
-            }
-            if rest.is_empty() {
-                PosSet::None
-            } else {
-                PosSet::At(rest)
-            }
-        }
-    }
-}
-
+/// `a & b`: both operands must match starting at the same position, and PG keeps
+/// the *longer* span -- which is what makes
+/// `'a:1 b:2 c:3' @@ '((a <-> b) & a) <-> c'` true while `… <-> b` is false.
 fn intersect(a: PosSet, b: PosSet) -> PosSet {
     match (a, b) {
-        (PosSet::None, _) | (_, PosSet::None) => PosSet::None,
-        (PosSet::Everywhere, other) | (other, PosSet::Everywhere) => other,
-        // Both sides are sorted and deduplicated, so this is a merge, not a
-        // nested scan.
-        (PosSet::At(x), PosSet::At(y)) => {
-            let (mut i, mut j) = (0, 0);
-            let mut kept = Vec::new();
-            while i < x.len() && j < y.len() {
-                match x[i].cmp(&y[j]) {
-                    Ordering::Less => i += 1,
-                    Ordering::Greater => j += 1,
-                    Ordering::Equal => {
-                        kept.push(x[i]);
-                        i += 1;
-                        j += 1;
-                    }
+        // A side that definitely matches nowhere settles the intersection even
+        // if the other is unknown -- three-valued `NO & MAYBE` is `NO`.
+        (PosSet::Exact(v), _) | (_, PosSet::Exact(v)) if v.is_empty() => PosSet::Exact(v),
+        (PosSet::Unknown, _) | (_, PosSet::Unknown) => PosSet::Unknown,
+        (PosSet::Exact(x), PosSet::Exact(y)) => {
+            // Both sides are sorted by end, not start, so walk the shorter one
+            // and probe the other by start.
+            let mut out = Vec::new();
+            for sx in &x {
+                for sy in starting_at(&y, sx.start()) {
+                    out.push(longer(*sx, sy));
                 }
             }
-            if kept.is_empty() {
-                PosSet::None
-            } else {
-                PosSet::At(kept)
+            PosSet::Exact(norm_spans(out))
+        }
+        (
+            PosSet::Exact(x),
+            PosSet::Cofinite {
+                except,
+                width,
+                extra,
+            },
+        )
+        | (
+            PosSet::Cofinite {
+                except,
+                width,
+                extra,
+            },
+            PosSet::Exact(x),
+        ) => {
+            let mut out = Vec::new();
+            for sx in &x {
+                if let Some(c) = cofinite_from(&except, width, sx.start()) {
+                    out.push(longer(*sx, c));
+                }
+                for y in starting_at(&extra, sx.start()) {
+                    out.push(longer(*sx, y));
+                }
+            }
+            PosSet::Exact(norm_spans(out))
+        }
+        (
+            PosSet::Cofinite {
+                except: e,
+                width: we,
+                extra: ex,
+            },
+            PosSet::Cofinite {
+                except: f,
+                width: wf,
+                extra: fy,
+            },
+        ) => {
+            let mut extra: Vec<PMatch> = Vec::new();
+            for x in &ex {
+                if let Some(c) = cofinite_from(&f, wf, x.start()) {
+                    extra.push(longer(*x, c));
+                }
+                for y in starting_at(&fy, x.start()) {
+                    extra.push(longer(*x, y));
+                }
+            }
+            for y in &fy {
+                if let Some(c) = cofinite_from(&e, we, y.start()) {
+                    extra.push(longer(*y, c));
+                }
+            }
+            // Two cofinite members share a start when neither side excludes its
+            // own end for that start, and `&` keeps the longer -- so the result
+            // has the wider extent, and an end is excluded when either side
+            // excludes the end it would have had.
+            let (wide, narrow) = if we >= wf { (we, wf) } else { (wf, we) };
+            let (wide_except, narrow_except) = if we >= wf { (e, f) } else { (f, e) };
+            let shift = wide - narrow;
+            PosSet::Cofinite {
+                except: norm_points(
+                    wide_except
+                        .into_iter()
+                        .chain(narrow_except.into_iter().map(|q| q + shift))
+                        .collect(),
+                ),
+                width: wide,
+                extra: norm_spans(extra),
             }
         }
     }
@@ -950,49 +1122,179 @@ fn intersect(a: PosSet, b: PosSet) -> PosSet {
 
 fn union(a: PosSet, b: PosSet) -> PosSet {
     match (a, b) {
-        (PosSet::Everywhere, _) | (_, PosSet::Everywhere) => PosSet::Everywhere,
-        (PosSet::None, other) | (other, PosSet::None) => other,
-        (PosSet::At(mut x), PosSet::At(y)) => {
-            x.extend(y);
-            x.sort_unstable();
-            x.dedup();
-            PosSet::At(x)
+        (PosSet::Unknown, _) | (_, PosSet::Unknown) => PosSet::Unknown,
+        (PosSet::Exact(x), PosSet::Exact(y)) => {
+            PosSet::Exact(norm_spans(x.into_iter().chain(y).collect()))
+        }
+        // The explicit spans survive in `extra` -- that is what keeps
+        // `(a <-> b) | !z` from collapsing to a point.
+        (
+            PosSet::Exact(x),
+            PosSet::Cofinite {
+                except,
+                width,
+                extra,
+            },
+        )
+        | (
+            PosSet::Cofinite {
+                except,
+                width,
+                extra,
+            },
+            PosSet::Exact(x),
+        ) => PosSet::Cofinite {
+            except,
+            width,
+            extra: norm_spans(extra.into_iter().chain(x).collect()),
+        },
+        (
+            PosSet::Cofinite {
+                except: e,
+                width: we,
+                extra: ex,
+            },
+            PosSet::Cofinite {
+                except: f,
+                width: wf,
+                extra: fy,
+            },
+        ) if we == wf => PosSet::Cofinite {
+            // A cofinite member needs only one side, so it is excluded only when
+            // both exclude it.
+            except: e.into_iter().filter(|p| f.binary_search(p).is_ok()).collect(),
+            width: we,
+            extra: norm_spans(ex.into_iter().chain(fy).collect()),
+        },
+        // Different extents: keep the wider cofinite part and demote the other
+        // side's explicit spans into `extra`.
+        (
+            PosSet::Cofinite {
+                except: e,
+                width: we,
+                extra: ex,
+            },
+            PosSet::Cofinite {
+                except: f,
+                width: wf,
+                extra: fy,
+            },
+        ) => {
+            let (except, width, mut extra, other) = if we >= wf {
+                (e, we, ex, fy)
+            } else {
+                (f, wf, fy, ex)
+            };
+            extra.extend(other);
+            PosSet::Cofinite {
+                except,
+                width,
+                extra: norm_spans(extra),
+            }
         }
     }
 }
 
-/// `left <dist> right`: keep the pairs whose spans are exactly `dist` apart, and
-/// return spans covering both operands so a further `<->` measures from the
+/// `left <dist> right`: the left operand must end exactly `dist` before the right
+/// operand starts. The result spans both, so a further `<->` measures from the
 /// combined start.
-fn join(tv: &TsVector, left: PosSet, right: PosSet, dist: u16) -> PosSet {
-    let ls = materialize(tv, left);
-    let rs = materialize(tv, right);
-    let mut out = Vec::new();
-    for r in &rs {
-        // The right operand's own span starts at `r.end - r.width`; the phrase
-        // matches when the left operand ends exactly `dist` before that, which
-        // pins the left `end` to a single value — so look it up instead of
-        // scanning (`ls` is sorted by `end`, then `width`).
-        if r.end < r.width {
-            continue;
+fn join(left: PosSet, right: PosSet, dist: i32) -> PosSet {
+    match (left, right) {
+        // If either operand matches nowhere, so does the phrase -- even if the
+        // other operand's position is unknown.
+        (PosSet::Exact(v), _) | (_, PosSet::Exact(v)) if v.is_empty() => PosSet::Exact(v),
+        (PosSet::Unknown, _) | (_, PosSet::Unknown) => PosSet::Unknown,
+        (PosSet::Exact(ls), PosSet::Exact(rs)) => {
+            let mut out = Vec::new();
+            for r in &rs {
+                // The left operand's end is pinned by this right span, so probe
+                // the sorted left side instead of scanning it.
+                let want = r.start() - dist;
+                let from = ls.partition_point(|l| l.end < want);
+                for l in ls[from..].iter().take_while(|l| l.end == want) {
+                    out.push(l.spanning(*r));
+                }
+            }
+            PosSet::Exact(norm_spans(out))
         }
-        let Some(want) = (r.end - r.width).checked_sub(dist) else {
-            continue;
-        };
-        let from = ls.partition_point(|l| l.end < want);
-        for l in ls[from..].iter().take_while(|l| l.end == want) {
-            out.push(PMatch {
-                end: r.end,
-                width: r.end - l.end + l.width,
-            });
+        (
+            PosSet::Cofinite {
+                except,
+                width,
+                extra,
+            },
+            PosSet::Exact(rs),
+        ) => {
+            let mut out = Vec::new();
+            for r in &rs {
+                let want = r.start() - dist;
+                if let Some(l) = cofinite_to(&except, width, want) {
+                    out.push(l.spanning(*r));
+                }
+                for l in extra.iter().filter(|l| l.end == want) {
+                    out.push(l.spanning(*r));
+                }
+            }
+            PosSet::Exact(norm_spans(out))
         }
-    }
-    out.sort_unstable();
-    out.dedup();
-    if out.is_empty() {
-        PosSet::None
-    } else {
-        PosSet::At(out)
+        (
+            PosSet::Exact(ls),
+            PosSet::Cofinite {
+                except,
+                width,
+                extra,
+            },
+        ) => {
+            let mut out = Vec::new();
+            for l in &ls {
+                let want = l.end + dist;
+                if let Some(r) = cofinite_from(&except, width, want) {
+                    out.push(l.spanning(r));
+                }
+                for r in starting_at(&extra, want) {
+                    out.push(l.spanning(r));
+                }
+            }
+            PosSet::Exact(norm_spans(out))
+        }
+        (
+            PosSet::Cofinite {
+                except: e,
+                width: we,
+                extra: ex,
+            },
+            PosSet::Cofinite {
+                except: f,
+                width: wf,
+                extra: fy,
+            },
+        ) => {
+            // A member ending at `x` needs the right side to allow `x` and the
+            // left side to allow the position `wf + dist` before it.
+            let mut except: Vec<i32> = f.clone();
+            except.extend(e.iter().map(|p| p + wf + dist));
+            let mut extra = Vec::new();
+            for r in &fy {
+                let want = r.start() - dist;
+                if let Some(l) = cofinite_to(&e, we, want) {
+                    extra.push(l.spanning(*r));
+                }
+            }
+            for l in &ex {
+                let want = l.end + dist;
+                if let Some(r) = cofinite_from(&f, wf, want) {
+                    extra.push(l.spanning(r));
+                }
+                for r in starting_at(&fy, want) {
+                    extra.push(l.spanning(r));
+                }
+            }
+            PosSet::Cofinite {
+                except: norm_points(except),
+                width: we + dist + wf,
+                extra: norm_spans(extra),
+            }
+        }
     }
 }
 
@@ -1148,9 +1450,12 @@ mod tests {
         let nots = format!("{}a", "!".repeat(MAX_PARSE_DEPTH - 1));
         let parsed = q(&nots)?;
         assert!(!tsquery::matches(&tsvector_in("a")?, &parsed));
-        // A spine just inside the node cap parses and survives every walk.
+        // A spine just inside the node cap parses and survives every walk --
+        // including `decode`, the deepest one, which is what the cap is sized
+        // against.
         let spine = format!("{}a", "a&".repeat(MAX_NODE_DEPTH - 1));
         let parsed = q(&spine)?;
+        assert_eq!(decode(&encode(&parsed)).as_ref(), Some(&parsed));
         assert_eq!(numnode(&parsed), (MAX_NODE_DEPTH as i32 - 1) * 2 + 1);
         assert!(tsquery::matches(&tsvector_in("a")?, &parsed));
         assert_eq!(cmp(&parsed, &parsed), Ordering::Equal);
@@ -1288,6 +1593,27 @@ mod tests {
         Ok(())
     }
 
+    /// The one shape where the phrase evaluator still disagrees with PG.
+    /// Negating a phrase whose *operands* are themselves negations produces a
+    /// match set with no exact representation here; both available spellings of
+    /// `complement` get some case wrong. Pinned so the gap is explicit, and so a
+    /// future fix has a failing target to aim at.
+    #[test]
+    fn known_divergence_negated_negation_phrase() -> Result<(), TsError> {
+        // PostgreSQL 18.4 answers `true`; we answer `false`. The `&` mixes a
+        // point-wide negation with a phrase-wide one, and negating the result
+        // has to place a point somewhere in that span.
+        assert!(!m("x:3A,1A,7", "x <2> !(!x & (!a <3> !b))")?);
+        // A negated phrase between two negations, one level shallower, agrees.
+        assert!(m("y:5 b:8B z:2B,7A", "(!(!z <-> !c) <-> (!x <3> z:*)) <-> !z:*")?);
+        // Everything one level simpler agrees -- a single negation under a
+        // phrase, and a negated phrase over plain lexemes, are both exact.
+        assert!(m("a:1", "!b <-> a")?);
+        assert!(m("a:1 b:2 c:3", "!(a <-> b) <0> a")?);
+        assert!(!m("a:1 b:2 c:3", "!(a <-> b) <0> b")?);
+        Ok(())
+    }
+
     #[test]
     fn phrase_operands_are_position_sets() -> Result<(), TsError> {
         // `&` intersects and `|` unions the operand position sets.
@@ -1302,7 +1628,24 @@ mod tests {
         assert!(m("x:1 y:2 z:3 q:4", "(x | y <-> z) <-> q")?);
         assert!(m("y:1 z:2 q:3", "(x | y <-> z) <-> q")?);
         assert!(!m("y:1 y:2 q:3", "(x | y <-> z) <-> q")?);
-        // `!` inside a phrase is the complement over the vector's positions.
+        // `!` inside a phrase matches at any position the negated term does not
+        // occupy -- unbounded, so it can sit one before the vector's first
+        // lexeme or one past its last. Every case below was checked against
+        // PostgreSQL 18.4.
+        assert!(m("a:1", "!b <-> a")?);
+        assert!(m("a:1 b:5", "b <-> !z")?);
+        assert!(m("a:1", "a <-> !b")?);
+        assert!(m("a:1", "!b <-> !c")?);
+        assert!(m("a:1", "!a <-> a")?);
+        assert!(m("", "!foo <-> !bar")?);
+        // ... but a vector with no positions at all can never satisfy a phrase.
+        let stripped = tsvector::strip(&tsvector::tsvector_in("a:1")?);
+        assert!(!matches(&stripped, &tsquery_in("!b <-> a")?));
+        // `&` between phrase operands requires a shared start and keeps the
+        // longer span, so the enclosing `<->` measures from the wider extent.
+        assert!(m("a:1 b:2 c:3", "((a <-> b) & a) <-> c")?);
+        assert!(m("a:1 b:2 c:3", "a <-> (b & (b <-> c))")?);
+        assert!(!m("a:1 b:2 c:3", "((a <-> b) & a) <-> b")?);
         assert!(m("y:1 y:2 q:3", "(!x | y <-> z) <-> q")?);
         assert!(!m("x:1 q:2", "(!x | y <-> z) <-> q")?);
         assert!(m("z:1 q:2", "(!x | y <-> z) <-> q")?);

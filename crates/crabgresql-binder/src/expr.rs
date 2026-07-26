@@ -3570,10 +3570,11 @@ fn bind_binary(
         return Ok(binding);
     }
 
-    // `tsvector @@ tsquery` and the `tsquery` combinators. Tried before the
-    // jsonpath resolver (which also claims `@@`) and before the array/network
-    // ones (which claim `&&`); it only fires on a typed text-search operand, so
-    // none of them are shadowed.
+    // `tsvector @@ tsquery` and the `tsquery` combinators. Placed before the
+    // jsonpath and array resolvers, which claim `@@` and `&&` respectively. The
+    // network and geometric resolvers run earlier and also claim `&&`/`<->`, but
+    // each self-guards on its own operand types, and this one only fires on a
+    // typed text-search operand — so no resolver shadows another.
     if let Some(binding) = resolve_ts_op(op, &lb, &rb)? {
         return Ok(binding);
     }
@@ -4049,8 +4050,6 @@ fn operand_name(b: &Binding) -> &'static str {
     binding_typed_ty(b).map_or("unknown", |t| t.name())
 }
 
-/// `operator does not exist: <lname> <op> <rname>`, with the real operand names
-/// in their actual order.
 /// `operator does not exist: <left> <op> <right>` (42883) for the operator
 /// spellings that have no [`BinOp`] — the family resolvers' `@@`, `&&`, `<->`,
 /// `>>`, ... Shared so a mis-typed operand reports a missing operator instead of
@@ -4863,13 +4862,9 @@ fn resolve_jsonb_op(
 ///
 /// Both operands must be untyped literals or already the required text-search
 /// type. `Ok(None)` when no text-search operand is present, so `@@` still
-/// reaches the jsonpath resolver; the "operator does not exist" error when one
-/// side is text-search and the other is some unrelated concrete type, so
-/// `point <-> tsquery` reports 42883 rather than a cast failure from inside
-/// `coerce_expr`. In particular PG's `text @@ tsquery` means
-/// `to_tsvector(text) @@ q`, which needs a text-search configuration — a later
-/// rung — so it must not be silently answered by re-parsing the text as a
-/// tsvector.
+/// reaches the jsonpath resolver; otherwise an error, so `point <-> tsquery`
+/// reports a missing operator rather than a cast failure from inside
+/// `coerce_expr`.
 fn resolve_ts_op(
     op: &ast::BinaryOperator,
     lb: &Binding,
@@ -4889,6 +4884,20 @@ fn resolve_ts_op(
             };
             let (vec_b, query_b) = if swapped { (rb, lb) } else { (lb, rb) };
             let (vec_t, query_t) = if swapped { (rt, lt) } else { (lt, rt) };
+            // The vector side must already *be* a tsvector. PG resolves an
+            // untyped literal here to `text`, not `tsvector` -- `'Hello World'
+            // @@ 'hello'::tsquery` is `to_tsvector('Hello World') @@ …`, which
+            // is true. Parsing the literal as a tsvector instead would answer
+            // false, and look like a real answer. Both that and an explicit
+            // `text` operand need a text search configuration, a later rung, so
+            // report the honest 0A000 rather than a wrong boolean or a 42883
+            // that would deny an operator PG really has.
+            if vec_t.is_none() || vec_t.is_some_and(is_text_family) {
+                return Err(BindError::feature_not_supported(
+                    "text @@ tsquery is not supported yet: it requires a text search \
+                     configuration (to_tsvector)",
+                ));
+            }
             if !usable(vec_t, PgType::Tsvector) || !usable(query_t, PgType::Tsquery) {
                 return Err(undefined_binary_operator(lb, op, rb));
             }
