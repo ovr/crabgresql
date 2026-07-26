@@ -3100,6 +3100,89 @@ async fn extended_protocol_runs_a_full_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `CommandComplete` tag of the last completed command in a batch.
+fn command_tag(msgs: &[(u8, Vec<u8>)]) -> anyhow::Result<String> {
+    let body = &msgs
+        .iter()
+        .rev()
+        .find(|(t, _)| *t == b'C')
+        .context("CommandComplete is missing")?
+        .1;
+    Ok(String::from_utf8_lossy(body.split_last().map_or(&body[..], |(_, s)| s)).into_owned())
+}
+
+/// A portal executes at most once. A second `Execute` of a portal that already ran
+/// to completion must be answered from the portal's recorded state, never by
+/// running the statement again — which for a data-modifying statement would apply
+/// its writes twice. Named portals inside an explicit block survive Sync, so this
+/// is reachable by any client that re-Executes a portal it believes is done.
+#[tokio::test]
+async fn a_completed_portal_is_not_run_again() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client.simple_query("CREATE TABLE p (id int)").await?;
+
+    // Parse/Bind a named portal, Execute it to completion, then Execute again.
+    // `sql` runs inside a block so the portal outlives the first Sync.
+    async fn execute_twice(port: u16, sql: &str) -> anyhow::Result<(String, Vec<(u8, Vec<u8>)>)> {
+        let mut socket = raw_session(port).await;
+        socket
+            .write_all(&frontend_message(b'Q', b"BEGIN\0"))
+            .await?;
+        read_until_ready(&mut socket).await;
+
+        let mut parse = b"st\0".to_vec();
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(b"\0\x00\x00");
+        let mut batch = Vec::new();
+        batch.extend(frontend_message(b'P', &parse));
+        // Bind portal "po" from statement "st": no formats, no params.
+        batch.extend(frontend_message(b'B', b"po\0st\0\x00\x00\x00\x00\x00\x00"));
+        batch.extend(frontend_message(b'E', b"po\0\x00\x00\x00\x00"));
+        batch.extend(frontend_message(b'S', b""));
+        socket.write_all(&batch).await?;
+        let first = command_tag(&read_until_ready(&mut socket).await)?;
+
+        let mut again = Vec::new();
+        again.extend(frontend_message(b'E', b"po\0\x00\x00\x00\x00"));
+        again.extend(frontend_message(b'S', b""));
+        socket.write_all(&again).await?;
+        Ok((first, read_until_ready(&mut socket).await))
+    }
+
+    // A statement with no result set cannot be re-run at all: PG answers 55000.
+    let (first, second) = execute_twice(port, "INSERT INTO p VALUES (1)").await?;
+    assert_eq!(first, "INSERT 0 1");
+    let err = &second
+        .iter()
+        .find(|(t, _)| *t == b'E')
+        .context("expected an ErrorResponse for the second Execute")?
+        .1;
+    assert!(
+        err.windows(6).any(|w| w == b"55000\0"),
+        "expected 55000, got {}",
+        String::from_utf8_lossy(err)
+    );
+
+    // An exhausted result set re-reports as an empty one, with a zero count.
+    let (first, second) = execute_twice(port, "SELECT * FROM p").await?;
+    assert_eq!(first, "SELECT 0");
+    assert_eq!(command_tag(&second)?, "SELECT 0");
+
+    // EXPLAIN ANALYZE is the case that makes this a data bug: it returns a result
+    // set *and* writes, so a re-run would double the write while the client sees
+    // nothing but plan text both times.
+    client.simple_query("CREATE TABLE q (id int)").await?;
+    let (first, second) = execute_twice(port, "EXPLAIN ANALYZE INSERT INTO q VALUES (1)").await?;
+    assert_eq!(first, "EXPLAIN");
+    assert_eq!(command_tag(&second)?, "EXPLAIN");
+    // The block the raw session opened was never committed, so the row is gone —
+    // what matters is that a second connection never sees two of them.
+    assert_eq!(row_count(&client, "q").await, 0);
+
+    Ok(())
+}
+
 /// A Bind whose result-format count is neither 0, 1, nor the column count must
 /// be rejected (08P01) instead of panicking on an out-of-bounds format index.
 #[tokio::test]

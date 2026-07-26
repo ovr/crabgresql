@@ -18,10 +18,10 @@ use tokio::net::TcpStream;
 use crate::error::PgError;
 use crate::global_catalog::GlobalCatalog;
 use crate::query::{
-    Analyzed, BoundParams, Notice, NoticeSeverity, QueryResult, analyze_statement,
+    Analyzed, BoundParams, Notice, NoticeSeverity, QueryResult, RowTag, analyze_statement,
     execute_statement, prepare_copy_from, run_copy_insert,
 };
-use crate::session::{Portal, PreparedStatement, Session, SuspendedRows};
+use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedRows};
 
 /// Fake backend pids for BackendKeyData: every connection needs a distinct
 /// one, but there are no processes to kill yet (cancel lands with M1+).
@@ -396,7 +396,7 @@ fn is_copy_from_stdin(stmt: &ast::Statement) -> bool {
 /// to the ordinary execute path.
 fn copy_portal_statement(session: &Session, portal_name: &str) -> Option<ast::Statement> {
     let portal = session.portals.get(portal_name)?;
-    if portal.suspended.is_some() {
+    if portal.state.is_suspended() {
         return None;
     }
     let prepared = session.prepared.get(&portal.statement)?;
@@ -781,7 +781,7 @@ fn handle_bind(
             statement: statement.to_string(),
             params: values,
             result_formats,
-            suspended: None,
+            state: PortalState::Ready,
         },
     );
     writer.write(&BackendMessage::BindComplete);
@@ -853,16 +853,35 @@ fn handle_execute(
     portal_name: &str,
     max_rows: i32,
 ) -> Result<(), PgError> {
-    if !session.portals.contains_key(portal_name) {
+    let Some(portal) = session.portals.get(portal_name) else {
         return Err(PgError::new(
             sqlstate::INVALID_CURSOR_NAME,
             format!("portal \"{portal_name}\" does not exist"),
         ));
-    }
-    // A portal a previous row-limited Execute left suspended resumes from its
-    // buffered rows, without re-running the query.
-    if session.portals[portal_name].suspended.is_some() {
-        return resume_portal(session, writer, portal_name, max_rows);
+    };
+    match &portal.state {
+        // A portal a previous row-limited Execute left suspended resumes from its
+        // live iterator, without re-running the query.
+        PortalState::Suspended(_) => {
+            return resume_portal(session, writer, portal_name, max_rows);
+        }
+        // A finished portal is answered from what it recorded: an exhausted result
+        // set re-reports as an empty one, and a statement that produced no result
+        // set cannot be run again at all. Either way the statement does not run a
+        // second time — for a data-modifying statement that would write twice.
+        PortalState::Done { tag } => {
+            match tag {
+                Some(tag) => writer.command_complete(&tag.complete(0)),
+                None => {
+                    return Err(PgError::new(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        format!("portal \"{portal_name}\" cannot be run"),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        PortalState::Ready => {}
     }
     // Fresh execution. Copy out what `execute_statement` needs, since it borrows
     // the whole session; cloning the parsed statement keeps the prepared
@@ -917,6 +936,9 @@ fn stream_execute(
         QueryResult::Command { tag, notices } => {
             emit_notices(writer, &notices, None);
             writer.command_complete(&tag);
+            // No result set to re-report, so a further Execute is refused rather
+            // than re-running the statement.
+            finish_portal(session, portal_name, None);
             Ok(())
         }
         QueryResult::Rows {
@@ -938,7 +960,7 @@ fn stream_execute(
                             // exactly `max_rows` rows suspends here and the next
                             // Execute returns `SELECT 0` (a valid PG sequence).
                             if let Some(portal) = session.portals.get_mut(portal_name) {
-                                portal.suspended = Some(SuspendedRows {
+                                portal.state = PortalState::Suspended(SuspendedRows {
                                     node,
                                     delivered: count,
                                     tag,
@@ -950,6 +972,7 @@ fn stream_execute(
                     }
                     Ok(None) => {
                         writer.command_complete(&tag.complete(count));
+                        finish_portal(session, portal_name, Some(tag));
                         return Ok(());
                     }
                     Err(e) => return Err(e.into()),
@@ -981,10 +1004,9 @@ fn resume_portal(
             format!("portal \"{portal_name}\" does not exist"),
         )
     })?;
-    let sus = portal
-        .suspended
-        .as_mut()
-        .ok_or_else(|| PgError::new("XX000", "portal is not suspended"))?;
+    let PortalState::Suspended(sus) = &mut portal.state else {
+        return Err(PgError::new("XX000", "portal is not suspended"));
+    };
     let mut served = 0usize;
     // `writer` is independent of `session`, so writing while the portal is
     // mutably borrowed is fine.
@@ -1005,10 +1027,21 @@ fn resume_portal(
     let delivered = sus.delivered;
     let tag = sus.tag;
     if exhausted {
-        portal.suspended = None;
+        // Finished, not back to Ready: a further Execute re-reports the exhausted
+        // result set as empty rather than running the statement again.
+        portal.state = PortalState::Done { tag: Some(tag) };
         writer.command_complete(&tag.complete(delivered));
     } else {
         writer.write(&BackendMessage::PortalSuspended);
     }
     Ok(())
+}
+
+/// Record that a portal ran to completion, so a further `Execute` is answered
+/// from `tag` instead of re-running the statement. `tag` is the result set's
+/// command-tag family, or `None` when the statement produced no result set.
+fn finish_portal(session: &mut Session, portal_name: &str, tag: Option<RowTag>) {
+    if let Some(portal) = session.portals.get_mut(portal_name) {
+        portal.state = PortalState::Done { tag };
+    }
 }
