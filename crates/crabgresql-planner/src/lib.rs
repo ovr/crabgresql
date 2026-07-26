@@ -5,6 +5,7 @@
 //! cost-based choices land later (docs/ARCHITECTURE.md §2).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crabgresql_binder::{
     AggInput, BinOp, BoundAggregate, BoundExpr, DistinctKey, InsertSource, JoinExpr, JoinInput,
@@ -773,6 +774,12 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
 /// the chosen access path is observable, but omits the cost/row/width estimates
 /// PG prints (crabgresql has no cost model). Only the scan paths are rendered in
 /// detail; other plan shapes get a single summary line.
+///
+/// `EXPLAIN ANALYZE` renders the same lines and appends [`explain_summary`]. It
+/// adds no per-node `(actual time=… rows=… loops=…)` suffix and no `Buffers:`
+/// block, so a node line is a *prefix* of PG's, not a copy of it: a consumer that
+/// parses `actual rows=` out of ANALYZE output will not find it here. Only the two
+/// footers are byte-identical to PG's.
 pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
     match plan {
         PhysicalPlan::Select {
@@ -864,6 +871,24 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::Update { table, .. } => vec![format!("Update on {}", table.schema().name)],
         PhysicalPlan::Delete { table, .. } => vec![format!("Delete on {}", table.schema().name)],
     }
+}
+
+/// The trailing summary `EXPLAIN` prints below the plan when `SUMMARY` is on
+/// (which `ANALYZE` implies): how long planning took, and — only when the
+/// statement actually ran — how long it took to run to completion. A plain
+/// `EXPLAIN (SUMMARY ON)` reports planning alone, as PG does. Times are
+/// milliseconds to three decimals, as PG prints them.
+pub fn explain_summary(planning: Duration, execution: Option<Duration>) -> Vec<String> {
+    let mut lines = vec![format!("Planning Time: {} ms", ms(planning))];
+    if let Some(execution) = execution {
+        lines.push(format!("Execution Time: {} ms", ms(execution)));
+    }
+    lines
+}
+
+/// A duration as PG prints an EXPLAIN time: milliseconds with three decimals.
+fn ms(d: Duration) -> String {
+    format!("{:.3}", d.as_secs_f64() * 1000.0)
 }
 
 /// Put `child` under a new parent node, indenting it beneath a `->` lead the way
@@ -1562,5 +1587,39 @@ mod tests {
             lines.iter().skip(1).any(|l| l.contains("Seq Scan on t")),
             "expected the source scan under Insert, got: {lines:?}"
         );
+    }
+
+    #[test]
+    fn explain_summary_renders_times_in_milliseconds() {
+        // PG's ANALYZE footers: milliseconds to three decimals, planning first.
+        assert_eq!(
+            explain_summary(
+                Duration::from_nanos(87_000),
+                Some(Duration::from_nanos(93_400))
+            ),
+            vec![
+                "Planning Time: 0.087 ms".to_string(),
+                "Execution Time: 0.093 ms".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn explain_summary_omits_execution_time_when_the_statement_did_not_run() {
+        // A plain `EXPLAIN (SUMMARY ON)` reports planning alone — there is no
+        // execution to time.
+        assert_eq!(
+            explain_summary(Duration::from_nanos(59_000), None),
+            vec!["Planning Time: 0.059 ms".to_string()]
+        );
+    }
+
+    #[test]
+    fn explain_summary_rounds_to_three_decimals() {
+        // Just under a millisecond still rounds up to `1.000`, and a sub-nanosecond
+        // measurement prints `0.000` rather than an empty or exponent form.
+        let lines = explain_summary(Duration::from_nanos(999_600), Some(Duration::ZERO));
+        assert_eq!(lines[0], "Planning Time: 1.000 ms");
+        assert_eq!(lines[1], "Execution Time: 0.000 ms");
     }
 }

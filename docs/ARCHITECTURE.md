@@ -300,8 +300,13 @@ ourselves anything that is not visible through SQL:
   Elle finds no anomalies.
 - **M4 — Server-side logic**: PL/pgSQL, triggers, views, COPY, cursors,
   LISTEN/NOTIFY; Flyway/Prisma migrations of real projects pass.
-- **M5 — Ops**: pg_stat_* views, EXPLAIN ANALYZE, automatic VACUUM/ANALYZE,
-  logical replication (publisher) for CDC.
+- **M5 — Ops**: pg_stat_* views, EXPLAIN ANALYZE (partial: the statement runs and
+  is timed, with `Planning Time:` / `Execution Time:` footers; per-node
+  `(actual …)` counters still to come. `VERBOSE`, `FORMAT JSON`/`XML`/`YAML`,
+  `SETTINGS`, `MEMORY`, `WAL` and `GENERIC_PLAN` now report `0A000` rather than
+  being silently ignored — they would change the shape of the output, and a plan
+  that answers a question the client did not ask is worse than a stated gap),
+  automatic VACUUM/ANALYZE, logical replication (publisher) for CDC.
 
 ## 7. Decisions made
 

@@ -3601,10 +3601,7 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
 
     // An equality on the PRIMARY KEY chooses an index scan (the durable heap engine
     // builds a physical B-tree for the PK).
-    let plan = client
-        .simple_query("EXPLAIN SELECT * FROM t WHERE id = 2")
-        .await?;
-    let lines: Vec<&str> = rows(&plan).iter().filter_map(|r| r.get(0)).collect();
+    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM t WHERE id = 2").await?;
     assert_eq!(lines[0], "Index Scan using t_pkey on t");
     assert!(
         lines.iter().any(|l| l.contains("Index Cond: (id = 2)")),
@@ -3618,17 +3615,359 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
     assert_eq!(rows(&result)[0].get(0), Some("two"));
 
     // A filter on a non-indexed column stays a sequential scan.
-    let plan = client
-        .simple_query("EXPLAIN SELECT * FROM t WHERE label = 'two'")
-        .await?;
-    let lines: Vec<&str> = rows(&plan).iter().filter_map(|r| r.get(0)).collect();
+    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM t WHERE label = 'two'").await?;
     assert_eq!(lines[0], "Seq Scan on t");
 
-    // EXPLAIN ANALYZE is rejected (it would execute the statement).
+    Ok(())
+}
+
+/// The `QUERY PLAN` lines of an EXPLAIN, as the client sees them.
+async fn explain_lines(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<Vec<String>> {
+    let plan = client.simple_query(sql).await?;
+    Ok(rows(&plan)
+        .iter()
+        .filter_map(|r| r.get(0).map(str::to_string))
+        .collect())
+}
+
+/// The SQLSTATE a failing statement reports.
+async fn sqlstate(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<String> {
     let err = client
-        .simple_query("EXPLAIN ANALYZE SELECT * FROM t WHERE id = 2")
+        .simple_query(sql)
         .await
-        .unwrap_err();
+        .expect_err("statement should be rejected");
+    Ok(err
+        .as_db_error()
+        .context("database error details are missing")?
+        .code()
+        .code()
+        .to_string())
+}
+
+#[tokio::test]
+async fn explain_analyze_reports_planning_and_execution_time() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .await?;
+
+    // ANALYZE keeps the plan lines a plain EXPLAIN prints and appends PG's two
+    // footers — millisecond times to three decimals.
+    let lines = explain_lines(&client, "EXPLAIN ANALYZE SELECT * FROM t WHERE id = 2").await?;
+    assert_eq!(lines[0], "Index Scan using t_pkey on t");
+    assert_eq!(lines[1], "  Index Cond: (id = 2)");
+    let footers = &lines[2..];
+    assert!(
+        footers[0].starts_with("Planning Time: ") && footers[0].ends_with(" ms"),
+        "plan was {lines:?}"
+    );
+    assert!(
+        footers[1].starts_with("Execution Time: ") && footers[1].ends_with(" ms"),
+        "plan was {lines:?}"
+    );
+    for footer in footers {
+        let time = footer
+            .split(": ")
+            .nth(1)
+            .and_then(|t| t.strip_suffix(" ms"))
+            .context("a footer should carry a time")?;
+        assert_eq!(
+            time.split('.').nth(1).map(str::len),
+            Some(3),
+            "expected three decimals in {footer:?}"
+        );
+        assert!(time.parse::<f64>().is_ok(), "{footer:?} is not a number");
+    }
+
+    // SUMMARY OFF drops the footers, leaving exactly the plain EXPLAIN output.
+    assert_eq!(
+        explain_lines(
+            &client,
+            "EXPLAIN (ANALYZE, SUMMARY OFF) SELECT * FROM t WHERE id = 2"
+        )
+        .await?,
+        explain_lines(&client, "EXPLAIN SELECT * FROM t WHERE id = 2").await?
+    );
+
+    // Without ANALYZE there is no execution to time, so PG reports planning alone.
+    let lines = explain_lines(&client, "EXPLAIN (SUMMARY ON) SELECT * FROM t").await?;
+    assert_eq!(lines[0], "Seq Scan on t");
+    assert!(lines[1].starts_with("Planning Time: "), "plan was {lines:?}");
+    assert_eq!(lines.len(), 2, "plan was {lines:?}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_analyze_runs_dml_and_plain_explain_does_not() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int)").await?;
+
+    // A plain EXPLAIN only plans: the row is not written.
+    let lines = explain_lines(&client, "EXPLAIN INSERT INTO t VALUES (1)").await?;
+    assert_eq!(lines, vec!["Insert on t".to_string()]);
+    assert_eq!(row_count(&client, "t").await, 0);
+
+    // ANALYZE executes it for real — and still answers with the plan, not
+    // `INSERT 0 1`.
+    let lines = explain_lines(&client, "EXPLAIN ANALYZE INSERT INTO t VALUES (1)").await?;
+    assert_eq!(lines[0], "Insert on t");
+    assert!(lines[1].starts_with("Planning Time: "), "plan was {lines:?}");
+    assert_eq!(row_count(&client, "t").await, 1);
+
+    // UPDATE and DELETE apply too.
+    explain_lines(&client, "EXPLAIN ANALYZE UPDATE t SET id = 2").await?;
+    assert_eq!(row_count(&client, "t WHERE id = 2").await, 1);
+    explain_lines(&client, "EXPLAIN ANALYZE DELETE FROM t").await?;
+    assert_eq!(row_count(&client, "t").await, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_analyze_write_is_visible_to_another_session() -> anyhow::Result<()> {
+    // Under autocommit the write must be committed by the time the statement
+    // finishes, not left dangling in an unfinalized transaction.
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client.simple_query("CREATE TABLE t (id int)").await?;
+    client
+        .simple_query("EXPLAIN ANALYZE INSERT INTO t VALUES (7)")
+        .await?;
+
+    let other = connect(port).await;
+    assert_eq!(row_count(&other, "t").await, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_analyze_aborts_the_statement_when_the_run_faults() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int)").await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+
+    // The third source row divides by zero. The fault surfaces as the statement's
+    // error and nothing it had already written survives — proving the run is
+    // drained before the commit, not after.
+    assert_eq!(
+        sqlstate(
+            &client,
+            "EXPLAIN ANALYZE INSERT INTO t SELECT 100 / (id - 3) FROM t"
+        )
+        .await?,
+        "22012"
+    );
+    assert_eq!(row_count(&client, "t").await, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_analyze_rolls_back_with_its_transaction_block() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int)").await?;
+
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("EXPLAIN ANALYZE INSERT INTO t VALUES (1)")
+        .await?;
+    // The write is visible inside the block...
+    assert_eq!(row_count(&client, "t").await, 1);
+    client.simple_query("ROLLBACK").await?;
+    // ...and gone after the rollback: ANALYZE's write belongs to the block, and is
+    // not committed at the statement boundary.
+    assert_eq!(row_count(&client, "t").await, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_analyze_honors_the_read_only_transaction_check() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int)").await?;
+    client.simple_query("INSERT INTO t VALUES (1)").await?;
+
+    client.simple_query("BEGIN TRANSACTION READ ONLY").await?;
+    // A plain EXPLAIN of a write is accepted in a read-only transaction — it never
+    // executes, so there is nothing to reject. ANALYZE does execute, so it is.
+    assert_eq!(
+        explain_lines(&client, "EXPLAIN DELETE FROM t WHERE id = 1").await?,
+        vec!["Delete on t".to_string()]
+    );
+    assert_eq!(
+        sqlstate(&client, "EXPLAIN ANALYZE DELETE FROM t WHERE id = 1").await?,
+        "25006"
+    );
+    client.simple_query("ROLLBACK").await?;
+    assert_eq!(row_count(&client, "t").await, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_of_a_utility_statement_never_runs_it() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // Wrapping a utility in EXPLAIN must report the gap, not fall through to the
+    // handler and create the table for real — with or without ANALYZE.
+    //
+    // The invariant under test is "never runs it". The SQLSTATE is a known
+    // divergence, not a contract: PG's grammar accepts only explainable
+    // statements, so `EXPLAIN CREATE TABLE …` is a 42601 syntax error there, and
+    // `EXPLAIN <other utility>` prints one `Utility Statement` row. Closing that
+    // gap belongs with the statements themselves (`EXPLAIN CREATE TABLE … AS
+    // SELECT` is fully explainable in PG), and may change this assertion.
+    for sql in [
+        "EXPLAIN CREATE TABLE untouched (x int)",
+        "EXPLAIN ANALYZE CREATE TABLE untouched (x int)",
+    ] {
+        assert_eq!(sqlstate(&client, sql).await?, "0A000", "{sql}");
+    }
+    assert_eq!(
+        row_count(&client, "pg_class WHERE relname = 'untouched'").await,
+        0
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_options_report_pgs_sqlstates() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    for (sql, expected) in [
+        // An unknown option name is a syntax error in PG, not an invalid value.
+        ("EXPLAIN (BOGUS) SELECT 1", "42601"),
+        ("EXPLAIN (FORMAT bogus) SELECT 1", "22023"),
+        ("EXPLAIN (TIMING ON) SELECT 1", "22023"),
+        // Options PG supports and crabgresql cannot yet produce.
+        ("EXPLAIN (FORMAT JSON) SELECT 1", "0A000"),
+        ("EXPLAIN VERBOSE SELECT 1", "0A000"),
+        ("EXPLAIN (SETTINGS) SELECT 1", "0A000"),
+    ] {
+        assert_eq!(sqlstate(&client, sql).await?, expected, "{sql}");
+    }
+
+    // ...and the ones we accept and ignore stay accepted.
+    for sql in [
+        "EXPLAIN (COSTS OFF) SELECT 1",
+        "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) SELECT 1",
+        "EXPLAIN (FORMAT TEXT) SELECT 1",
+    ] {
+        client.simple_query(sql).await?;
+    }
+
+    // Another dialect's spelling that the shared parser accepts is not PG's.
+    for sql in ["EXPLAIN QUERY PLAN SELECT 1", "EXPLAIN ESTIMATE SELECT 1"] {
+        assert_eq!(sqlstate(&client, sql).await?, "42601", "{sql}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unreadable_explain_option_value_does_not_run_the_statement() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int)").await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+
+    // A value the option parser cannot read must be an error, never a silent
+    // "TRUE": read as TRUE, ANALYZE would turn on and the DELETE would run.
+    for sql in [
+        "EXPLAIN (ANALYZE -1) DELETE FROM t",
+        "EXPLAIN (ANALYZE NULL) DELETE FROM t",
+        "EXPLAIN (ANALYZE yes) DELETE FROM t",
+    ] {
+        assert_eq!(sqlstate(&client, sql).await?, "42601", "{sql}");
+        assert_eq!(row_count(&client, "t").await, 3, "{sql} deleted rows");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn plain_explain_pins_the_repeatable_read_snapshot() -> anyhow::Result<()> {
+    // EXPLAIN reads the catalog, so it takes a snapshot like any other reading
+    // statement: in a REPEATABLE READ block it must freeze the view the rest of
+    // the block sees, even though it executes nothing.
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client.simple_query("CREATE TABLE t (id int)").await?;
+    client.simple_query("INSERT INTO t VALUES (1)").await?;
+
+    client
+        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    client.simple_query("EXPLAIN SELECT * FROM t").await?;
+
+    let other = connect(port).await;
+    other.simple_query("INSERT INTO t VALUES (99)").await?;
+
+    // The snapshot was taken by the EXPLAIN, so the concurrent insert is invisible.
+    assert_eq!(row_count(&client, "t").await, 1);
+    client.simple_query("ROLLBACK").await?;
+    assert_eq!(row_count(&client, "t").await, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_reports_the_explain_command_tag() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int)").await?;
+
+    // PG's CommandComplete for EXPLAIN is the bare tag `EXPLAIN`, with no count —
+    // the plan's line count is not a row count, and `execute` returns the tag's
+    // trailing integer, so a count here would be reported as affected rows.
+    assert_eq!(client.execute("EXPLAIN SELECT * FROM t", &[]).await?, 0);
+    // Most visibly for a DML ANALYZE, which really does write.
+    assert_eq!(
+        client
+            .execute("EXPLAIN ANALYZE INSERT INTO t VALUES (1)", &[])
+            .await?,
+        0
+    );
+    assert_eq!(row_count(&client, "t").await, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_analyze_resolves_bind_parameters_in_extended_protocol() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int PRIMARY KEY)")
+        .await?;
+    client.simple_query("INSERT INTO t VALUES (1), (2)").await?;
+
+    // A prepared EXPLAIN ANALYZE infers `$1` from the inner statement at Describe,
+    // then runs with the bound value at Execute.
+    let rows = client
+        .query("EXPLAIN ANALYZE SELECT * FROM t WHERE id = $1", &[&2i32])
+        .await?;
+    let lines: Vec<&str> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(lines[0], "Index Scan using t_pkey on t");
+    assert_eq!(lines[1], "  Index Cond: (id = 2)");
+    assert!(
+        lines.iter().any(|l| l.starts_with("Execution Time: ")),
+        "plan was {lines:?}"
+    );
+
+    // An option we cannot honor is rejected when the portal executes, which is
+    // where PG raises its own option errors — Parse and Describe stay clean, so a
+    // driver that only prepares the statement does not abort its transaction block.
+    let err = client
+        .query("EXPLAIN (FORMAT JSON) SELECT * FROM t WHERE id = $1", &[&2i32])
+        .await
+        .expect_err("FORMAT JSON should be rejected");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
