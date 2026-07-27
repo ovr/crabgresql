@@ -17,8 +17,8 @@ fn sizes_and_intervals_come_from_the_documented_variables() {
     // SAFETY: this binary holds exactly one test, so no other thread is
     // reading the environment while these are set.
     unsafe {
-        std::env::set_var(crabgresql_config::BUFFER_TABLE_SOFT_BYTES, "64MB");
-        std::env::set_var(crabgresql_config::BUFFER_GLOBAL_HARD_BYTES, "1gb");
+        std::env::set_var(crabgresql_config::BUFFER_TABLE_SOFT_BYTES.name, "64MB");
+        std::env::set_var(crabgresql_config::BUFFER_GLOBAL_HARD_BYTES.name, "1gb");
         std::env::set_var(crabgresql_config::BUFFER_MAX_AGE_MS, "250");
         std::env::set_var(crabgresql_config::BUFFER_TICK_MS, "50");
     }
@@ -32,10 +32,29 @@ fn sizes_and_intervals_come_from_the_documented_variables() {
     // A size we cannot parse leaves the default in place rather than the
     // server refusing to start.
     unsafe {
-        std::env::set_var(crabgresql_config::BUFFER_TABLE_SOFT_BYTES, "32 quatloos");
+        std::env::set_var(
+            crabgresql_config::BUFFER_TABLE_SOFT_BYTES.name,
+            "32 quatloos",
+        );
     }
     assert_eq!(
         BufferFlushPolicy::from_env().table_soft_bytes,
         defaults.table_soft_bytes
+    );
+
+    // One past the supported range is corrected to the nearest legal size,
+    // again without refusing to start.
+    unsafe {
+        std::env::set_var(crabgresql_config::BUFFER_TABLE_SOFT_BYTES.name, "64GB");
+        std::env::set_var(crabgresql_config::BUFFER_GLOBAL_HARD_BYTES.name, "1B");
+    }
+    let policy = BufferFlushPolicy::from_env();
+    assert_eq!(
+        policy.table_soft_bytes,
+        crabgresql_config::BUFFER_TABLE_SOFT_BYTES.max
+    );
+    assert_eq!(
+        policy.global_hard_bytes,
+        crabgresql_config::BUFFER_GLOBAL_HARD_BYTES.min
     );
 }
