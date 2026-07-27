@@ -124,24 +124,13 @@ Contract with the core:
 - VACUUM: background collection of dead versions; 64-bit XIDs — see
   "Deliberate deviations" below.
 
-**`crabgresql-parquet-engine`** — managed append-only analytics storage:
-
-- one or more immutable Snappy-compressed fragments per INSERT statement,
-  capped at 65,535 rows so `(fragment, row)` maps to a stable `Tid`;
-- only user columns appear in the Arrow/Parquet schema; format, schema, `xmin`,
-  and `cmin` metadata live in the footer;
-- fragments are fsynced as `.pending`, covered by an XID-observation WAL record,
-  and atomically promoted on commit or removed on abort/recovery;
-- sequential row-group scans feed the existing row executor. Physical index
-  scans and predicate/projection pushdown are intentionally deferred;
-- TRUNCATE is transactional, by the same mechanism as the heap's relfilenode
-  swap: a fresh `parquet/<new>/` fragment directory is staged under an
-  `AccessExclusive` hold and WAL-logged, then swapped in on commit (old directory
-  removed) or discarded on abort — so a rollback or a crash before commit
-  restores every row, and a crash after it is repaired from the WAL;
-- V1 rejects UPDATE and DELETE (fragments are immutable), TEMP/UNLOGGED tables,
-  partitioning, external `LOCATION`, and types without a native or documented
-  compound encoding.
+**`crabgresql-parquet-engine`** — managed append-only analytics storage. The
+current V1 writes immutable, Snappy-compressed fragments transactionally:
+statement-sized batches become fsynced `.pending` files and are promoted on
+commit or removed on abort/recovery. It supports transactional TRUNCATE through
+a relfilenode-directory swap, but not UPDATE, DELETE, partitioning, compaction,
+or external `LOCATION`. Section 2 defines the target buffered, sorted,
+chunk-and-partition architecture and explicitly distinguishes it from V1.
 
 Later, the same API enables object-storage engines (serverless) and FDW-like
 adapters.
@@ -183,7 +172,378 @@ Components:
   `deadlock_timeout`).
 - **Subtransactions** (`SAVEPOINT`) — sub-XIDs, rollback to savepoint.
 
-## 2. System layers
+## 2. Parquet table engine
+
+The Parquet table access method is managed database storage, not an exporter
+that happens to write `.parquet` files. It owns transaction visibility, WAL
+recovery, physical layout, file publication, statistics, and garbage
+collection. Clients select it with `CREATE TABLE ... USING parquet`; its
+physical organization is not part of PostgreSQL's observable SQL contract.
+
+This section is the **target design**. The current V1 state and implementation
+sequence are tracked separately in
+[`ROADMAP.md`](../ROADMAP.md#parquet-table-engine), so architectural intent is
+not confused with implemented behavior.
+
+The main components and data flow are:
+
+```text
+                         ParquetTable (TableAm)
+                                  |
+                    INSERT/COPY   |   scan/fetch
+                                  v
+                      +-----------------------+
+                      |      BufferTable      |
+                      | MVCC rows, RAM, WAL   |
+                      | partitioned internally|
+                      +----+-------------+----+
+                           |             |
+                  BUFFER_APPEND WAL      | sealed flush batch
+                           v             v
+                      core WAL      sort + ChunkWriter
+                                          |
+                                          v
+                              immutable Parquet chunks
+                                          |
+                                 atomic publication
+                                          v
+                                 ManifestStore
+                                          |
+                          scans read pinned generation
+
+BackgroundJobScheduler: Flush, Compact, Repartition, Rewrite, GC, Statistics
+```
+
+Every Parquet relation owns one `BufferTable`. `ParquetTable::insert_many`
+delegates to it; only a background `Flush` job may invoke `ChunkWriter`.
+`ParquetTable::scan` builds a read view from the `BufferTable` and a pinned
+manifest generation. This makes the buffer an architectural boundary rather
+than an optional batching optimization.
+
+### 2.1 Storage vocabulary and invariants
+
+- A **SQL partition** is PostgreSQL-visible catalog state with a partition
+  constraint. It remains a separate leaf relation and is the outermost hard
+  routing boundary.
+- A **storage partition** is an engine-internal range or bucket inside one
+  Parquet leaf relation. It is the unit of buffering, pruning, compaction, and
+  parallelism. A storage partition may split or merge online, but may never move
+  a row across an SQL partition constraint. "Partition" below means a storage
+  partition unless explicitly qualified.
+- A **chunk** is exactly one immutable Parquet file. A chunk belongs to one
+  table, one storage partition, one schema version, and one partition-spec
+  version.
+- A **row group** is Parquet's internal encoding and scan unit inside a chunk;
+  it is not a chunk and is never independently published.
+- A **buffer table** (`BufferTable`) is the mandatory engine-internal,
+  RAM-resident table in front of the chunks. It is not a separately addressable
+  SQL relation, but it has a schema, contains MVCC row versions, is recoverable
+  from WAL, and participates in the same snapshots as durable chunks.
+- A **manifest generation** is the immutable list of chunks and storage
+  partitions comprising a table at one instant. Readers pin a generation;
+  writers publish a new generation atomically.
+
+The following invariants are non-negotiable:
+
+1. INSERT and COPY always enter the relation's buffer table; foreground
+   transactions never write directly to a final Parquet file.
+2. Acknowledged permanent-table data is present either in durable chunks or in
+   WAL that can reconstruct the buffer table.
+3. Every chunk is sorted by the table's effective sort key. Equal keys are
+   ordered by a hidden, immutable row ID, making the order total and
+   deterministic.
+4. Chunks never change in place. Flush, compaction, repartitioning, and TRUNCATE
+   publish a manifest delta and retire old files.
+5. Readers see one manifest generation plus snapshot-visible buffer-table rows.
+   Publication can change the physical source of a row, but cannot add, omit,
+   or duplicate it in a snapshot.
+6. Logical row identity is independent of `(file, row number)`. This is required
+   before compaction can be enabled: rewriting a chunk must not invalidate
+   executor references or future physical indexes.
+7. On-disk format changes are versioned. Existing V1 fragment directories and
+   files must remain readable; a background rewrite may migrate them, but an
+   upgrade may not require destructive conversion.
+
+### 2.2 Layout metadata and defaults
+
+Each Parquet relation stores a versioned `ParquetLayout` alongside its schema:
+
+```text
+partition key        columns/expressions and range or hash strategy
+sort key             columns, direction, NULL order, collation version
+chunk target         64 MiB of encoded Parquet bytes
+compression          Snappy initially; versioned per chunk
+partition spec       version plus current bounds/buckets
+schema version       physical-to-logical column mapping
+buffer limits        per-table soft/hard bytes and maximum row age
+```
+
+The default chunk target is **64 MiB compressed**. It is a soft target, not a
+correctness boundary: compression ratio is known only while encoding, and one
+exceptionally large row or row group may cross it. The writer rotates near the
+target and enforces a separate configurable hard limit. Sixty-four MiB is small
+enough for useful compaction and parallel scans on local storage while avoiding
+the tiny-file behavior of the current per-statement layout. Object-storage
+profiles may choose a larger default without changing the file format.
+
+The effective sort key always exists:
+
+1. the partition key is the prefix;
+2. an explicitly configured clustering key follows;
+3. the hidden logical row ID is the final tie-breaker.
+
+With no partition or clustering key, the row ID alone supplies deterministic
+order, although it provides little predicate pruning. Comparisons use
+CrabgreSQL/PostgreSQL semantics, including direction, NULL ordering, NaN
+behavior, and the recorded collation version. A collation-version change makes
+affected chunks candidates for a rewrite rather than silently changing their
+claimed order.
+
+The manifest is the source of truth; directory listing is only a recovery and
+orphan-GC aid. Each chunk entry contains at least:
+
+```text
+chunk ID and path                    state: active or retired
+partition/spec/schema versions       row count and encoded byte size
+sort-key minimum and maximum         per-column pruning statistics
+creation and publication LSNs        MVCC/freeze metadata
+checksum and Parquet format version  optional bloom/filter references
+```
+
+### 2.3 Buffer table
+
+`BufferTable` is a real storage component with a table-like contract, not the
+regular `crabgresql-pg-engine` memory-table implementation. TEMP and UNLOGGED
+memory tables deliberately skip WAL; a permanent Parquet buffer must do the
+opposite. The two implementations may share Arrow batch utilities, but they
+must not share durability semantics.
+
+There is exactly one `BufferTable` per open Parquet relation. Internally it owns
+a map of `PartitionId -> PartitionBuffer`, so flush and backpressure can operate
+independently on hot partitions while the table retains one transaction and
+memory-accounting boundary.
+
+Its logical schema is always derived from the relation schema:
+
+```text
+user columns          values supplied by INSERT/COPY
+logical row ID        stable identity across flush and compaction
+xmin / cmin           MVCC creator and command identity
+partition ID          destination under a partition-spec version
+schema/spec versions  decoding and routing identity
+append WAL LSN        recovery and publication watermark
+```
+
+These fields are engine metadata, not SQL-visible columns. A schema change
+creates a new buffer-batch schema version; already-buffered batches retain the
+version with which they were validated until a flush converts them to the
+current physical mapping.
+
+The component exposes four conceptual operations:
+
+```text
+append(txn, rows)                  WAL-log and add transaction-owned rows
+read(snapshot, manifest_watermark) return visible, not-yet-covered rows
+seal(partition, cutoff)            freeze an immutable flush batch
+release(published_batch)           reclaim RAM after durable publication
+```
+
+A partition buffer moves through explicit states:
+
+```text
+Mutable -> Sealed -> Flushing -> Published -> Reclaimable
+   ^          |
+   +----------+  flush failure returns the batch without losing rows
+```
+
+`Mutable` accepts appends. `Sealed` is immutable, so sorting and encoding do not
+hold the foreground write lock. `Published` remains readable until the manifest
+watermark and all buffer read views prove that the chunk copy is authoritative;
+only then is its memory reclaimable. State transitions are idempotent by batch
+ID, allowing recovery or a retried job to repeat them safely.
+
+Buffer memory is accounted both per relation and globally by a
+`BufferTableManager`. Reaching a table's soft limit seals its largest eligible
+partition; the global hard limit applies backpressure to new Parquet writes
+until jobs release memory. A maximum row age seals low-volume partitions even
+when byte thresholds are not reached.
+
+### 2.4 Write path, MVCC, and WAL
+
+```text
+INSERT / COPY
+      |
+      v
+validate + route + allocate logical row IDs
+      |
+      v
+append versioned BUFFER_APPEND WAL record
+      |
+      v
+transaction-owned rows in BufferTable partition
+      |
+      +---- COMMIT flushes WAL ----> snapshot-visible buffered rows
+                                      |
+                                      v
+                              background sorted flush
+                                      |
+                                      v
+                              chunk + manifest generation
+```
+
+`BUFFER_APPEND` carries the table identity, layout/schema versions, XID/CID,
+logical row IDs, destination partition, and a checksummed, versioned column
+batch. The in-memory representation may use Arrow arrays, but WAL does not
+depend on an unstable Rust or Arrow memory layout. As with the heap, appending a
+record need not fsync immediately; the transaction's COMMIT record establishes
+durability and group commit amortizes the flush.
+
+The buffer table retains transaction metadata. A transaction reads its own
+writes; other transactions see buffered rows only when the usual snapshot and
+CLOG rules allow them. Abort removes the rows lazily or eagerly. A flush selects
+committed rows and leaves in-progress rows buffered. Because one output chunk
+may contain rows from several transactions, the V2 physical format stores
+per-row MVCC and logical-ID streams as hidden engine metadata (internal columns
+or an equivalent sidecar encoding); they are not exposed as user columns. Rows
+old enough to be visible to every possible snapshot may be frozen during
+compaction.
+
+Every partition buffer tracks its minimum and maximum WAL LSN. A checkpoint may
+recycle `BUFFER_APPEND` WAL only after all covered rows are in fsynced chunks
+and the manifest generation containing those chunks is durable. Recovery
+replays records newer than the durable table watermark, reconstructs the buffer
+table, consults CLOG for visibility, and discards aborted rows. Replay is
+idempotent by logical row ID, buffer-batch ID, and publication watermark.
+
+### 2.5 Sorted flush and atomic publication
+
+A flush worker seals eligible committed rows from one `PartitionBuffer`, then:
+
+1. sorts them with the effective PostgreSQL comparator and logical row ID
+   tie-breaker;
+2. writes one or more approximately 64 MiB chunks under unique temporary names;
+3. closes and fsyncs each file and its containing directory;
+4. appends a WAL-backed manifest delta naming the outputs and covered input
+   row IDs/LSNs;
+5. atomically publishes the next manifest generation;
+6. releases the corresponding buffer-table batch only after publication is
+   durable and no pinned buffer read view still references it.
+
+Failure before publication leaves unreferenced temporary files for orphan GC.
+Failure after the manifest WAL record but before the manifest file update is
+completed by recovery. Failure after publication but before buffer release is
+deduplicated by row ID and the manifest's covered-LSN watermark. Therefore a
+row is never lost and readers never need to guess whether a file is live.
+
+Sorting happens at flush, not on the foreground transaction path: INSERT
+latency remains bounded, while every durable chunk still has a declared order.
+The current V1 optimization—one transaction per file with `xmin`/`cmin` in the
+footer—remains readable, but cannot be used for multi-transaction compaction
+without upgrading to the V2 metadata representation.
+
+### 2.6 Read path and row identity
+
+A scan pins a manifest generation and a transaction snapshot, prunes chunks
+using partition bounds and chunk statistics, and reads the remaining row groups
+with projection and predicate pushdown where semantics permit. It also scans
+snapshot-visible rows through the relation's `BufferTable`. Moving rows from
+the buffer table to a chunk while a scan is running cannot create duplicates:
+the scan's pinned generation records a covered-LSN watermark, and its buffer
+read view includes only rows not covered by that watermark. Those two values
+define one read view even if publication and buffer cleanup happen concurrently.
+
+Physical chunk order does not imply SQL result order; a query still needs
+`ORDER BY`. The layout order exists for range pruning, compression,
+merge-friendly compaction, and an executor fast path when the requested SQL
+order is compatible.
+
+V1 encodes `Tid` as `(fragment, row offset)` and caps a fragment at 65,535 rows.
+That locator is incompatible with background rewrites. Before compaction is
+enabled, the storage API must distinguish:
+
+- a stable, engine-owned logical row reference used by fetch and indexes;
+- a generation-scoped physical locator used only to find encoded bytes;
+- PostgreSQL-facing `ctid`, which remains an opaque compatibility value and is
+  not the durable identity of a Parquet row.
+
+Compaction copies the logical row ID unchanged and builds the new generation's
+locator mapping. Future indexes point to logical IDs, never filenames or row
+ordinals.
+
+### 2.7 Compaction policy
+
+Flush chunks enter level 0 and may have overlapping sort-key ranges. Higher
+levels contain non-overlapping ranges within a partition. The initial policy is
+a small leveled compactor:
+
+- schedule compaction when a partition has at least eight L0 chunks, excessive
+  sub-target chunks, or a configured read-amplification score;
+- choose adjacent/overlapping chunks, respecting an I/O budget;
+- perform a k-way merge in effective sort order;
+- split outputs around the 64 MiB target rather than producing one giant file;
+- preserve logical row IDs and required MVCC metadata, freeze rows only when the
+  global visibility horizon permits it;
+- atomically replace all selected inputs with all outputs in one manifest
+  generation.
+
+Chunk count alone is not a reason to rewrite healthy, target-sized,
+non-overlapping data. Selection balances read amplification, reclaimable bytes,
+sort overlap, and write amplification. Statistics are computed while writing
+outputs, so compaction and ANALYZE can share work without making planner
+statistics depend on a directory scan.
+
+The compactor validates its input chunk IDs against the current manifest before
+publication. If another job has already replaced an input, it abandons its
+temporary outputs and retries selection; it never publishes a partial merge.
+
+### 2.8 Background jobs and online repartitioning
+
+The engine provides a shared background-job scheduler with per-table and
+per-partition concurrency limits, memory/I/O budgets, cancellation, and
+observable progress. Initial job kinds are:
+
+- `Flush` — sealed buffer-table batch to sorted L0 chunks;
+- `Compact` — merge/rewrite chunks within a partition;
+- `SplitPartition` / `MergePartitions` — change internal partition bounds;
+- `RewriteSchemaOrCollation` — migrate a versioned physical layout;
+- `GarbageCollect` — delete retired and orphaned files;
+- `RefreshStatistics` — publish planner statistics when no rewrite is useful.
+
+The queue itself need not be durable: desired work is rediscovered from buffer
+table pressure and manifest state after restart. Only a job's publication is
+durable and WAL-backed. Jobs are idempotent, use unique output IDs, and expose
+cooperative cancellation points between row groups and output chunks.
+
+Online repartitioning uses partition-spec generations:
+
+1. publish a new spec for routing new writes;
+2. keep old-spec chunks readable alongside new-spec chunks;
+3. rewrite old chunks into destinations under the new bounds;
+4. atomically retire the old spec after every source chunk is replaced;
+5. garbage-collect old files only when no reader pins their manifest.
+
+This is how chunks may be redistributed between **storage** partitions. Moving a
+row between PostgreSQL-visible SQL partitions is a separate DDL/data-movement
+operation and must recheck the destination partition constraint.
+
+### 2.9 Concurrency, garbage collection, and TRUNCATE
+
+Readers do not block file production. They hold an immutable manifest handle;
+retired files remain until no handle references their generation and the MVCC
+horizon says no active snapshot can need them. Publication takes a short
+partition-scoped manifest lock/CAS rather than a table-wide lock. Flush and
+compaction for different partitions may run concurrently, while budget limits
+prevent them from starving foreground queries.
+
+TRUNCATE publishes an empty table generation transactionally. The existing
+relfilenode-directory swap remains a valid implementation, but old directories
+are reclaimed through the same generation-aware GC rules. DROP and failed DDL
+likewise retire storage first and unlink it only when it is no longer visible.
+
+The implementation sequence for this design lives in
+[`ROADMAP.md`](../ROADMAP.md#parquet-table-engine).
+
+## 3. System layers
 
 ```
                     ┌────────────────────────────────────────┐
@@ -219,10 +579,10 @@ Components:
                     │ SSI, locks  │    │  engines)           │
                     └──────┬──────┘    └──┬───────────┬──────┘
                            │      ┌───────▼─────┐ ┌───▼──────────────┐
-                           │      │ pg-engine:  │ │ memory tables:   │
-                           │      │ heap 8KB,   │ │ Parquet + memory │
-                           │      │ buffer pool,│ │ table methods    │
-                           │      │ B-tree,TOAST│ │ managed storage  │
+                           │      │ pg-engine:  │ │ parquet-engine:  │
+                           │      │ heap 8KB +  │ │ buffer tables,   │
+                           │      │ RAM tables, │ │ manifests, sorted│
+                           │      │ B-tree,TOAST│ │ immutable chunks │
                            │      └───────┬─────┘ └────────┬─────────┘
                     ┌──────▼──────────────▼───────────────▼──┐
                     │  WAL (core service, rmgr model):       │
@@ -231,7 +591,7 @@ Components:
                     └────────────────────────────────────────┘
 ```
 
-### 2.1 Catalog
+### 3.1 Catalog
 
 - `pg_catalog` — real tables (pg_class, pg_attribute, pg_type, pg_proc,
   pg_namespace, pg_index, pg_constraint, …) with **the same OIDs for built-in
@@ -242,7 +602,7 @@ Components:
 - `information_schema` — views over pg_catalog, as in PG.
 - An in-memory catalog cache with DDL-driven invalidation (sinval analog).
 
-### 2.2 Type system
+### 3.2 Type system
 
 The most underestimated part of compatibility. Bit-for-bit behavior required:
 
@@ -255,14 +615,14 @@ The most underestimated part of compatibility. Bit-for-bit behavior required:
 - implicit cast rules and function/operator overload resolution — we reproduce
   the semantics of `func_select_candidate` and PG's cast tables.
 
-### 2.3 Functions and PL/pgSQL
+### 3.3 Functions and PL/pgSQL
 
 - Built-in functions (~3000 in pg_proc): implemented by usage frequency; the
   rest return feature-not-supported with an honest SQLSTATE.
 - PL/pgSQL — our own parser and interpreter (`crabgresql-plpgsql`) on top of
   our executor — a prerequisite for passing real-world migrations.
 
-## 3. Workspace layout (crates)
+## 4. Workspace layout (crates)
 
 ```
 crates/
@@ -277,13 +637,13 @@ crates/
   crabgresql-wal             # WAL append/replay, rmgr registry, checkpointer, recovery
   crabgresql-storage-api     # TableEngine/TableAm/IndexAm traits, Tid, TupleStream
   crabgresql-pg-engine       # default engine: 8KB heap, buffer pool, B-tree, TOAST
-  crabgresql-parquet-engine  # managed append-only Parquet table access method
+  crabgresql-parquet-engine  # buffered immutable Parquet chunks + compaction
   crabgresql-plpgsql         # PL/pgSQL parser + interpreter
   crabgresql-server          # session, GUCs, wiring it all together; bin: crabgresql
   crabgresql-pg-regress      # pg_regress-style runner; diff tests against PG
 ```
 
-## 4. Compatibility verification strategy (this IS the product)
+## 5. Compatibility verification strategy (this IS the product)
 
 1. **Differential testing** — the primary tool. A runner executes the same SQL
    on real PostgreSQL (in a container) and on us, comparing results, column
@@ -296,7 +656,7 @@ crates/
    smoke tests.
 4. **Public compat dashboard**: % of PG regression tests passing, by category.
 
-## 5. Deliberate deviations from PostgreSQL
+## 6. Deliberate deviations from PostgreSQL
 
 Compatibility on the outside, modernity on the inside. Internally we allow
 ourselves anything that is not visible through SQL:
@@ -308,29 +668,6 @@ ourselves anything that is not visible through SQL:
 - no `postgresql.conf` legacy: we also read PG-format config; unknown GUCs are
   accepted and ignored with a warning (drivers love setting them).
 
-## 6. Roadmap
-
-- **M0 — Hello, psql** (protocol): pgwire, auth, `SELECT 1`, simple query
-  execution on an in-memory table, error messages. Check: psql works,
-  pgbench -i fails meaningfully.
-- **M1 — CRUD + catalog**: storage-api + the heap engine in full,
-  CREATE TABLE/INSERT/SELECT/UPDATE/DELETE, pg_catalog, the
-  int/text/bool/numeric/timestamptz types, `\d` works in psql. `pg-engine`
-  development starts in parallel.
-- **M2 — Transactions**: MVCC, snapshots, READ COMMITTED + REPEATABLE READ,
-  row locks, WAL + recovery, B-tree, ORM smoke tests pass.
-- **M3 — SERIALIZABLE**: SSI, deadlock detection, PG isolation tests green,
-  Elle finds no anomalies.
-- **M4 — Server-side logic**: PL/pgSQL, triggers, views, COPY, cursors,
-  LISTEN/NOTIFY; Flyway/Prisma migrations of real projects pass.
-- **M5 — Ops**: pg_stat_* views, EXPLAIN ANALYZE (partial: the statement runs and
-  is timed, with `Planning Time:` / `Execution Time:` footers; per-node
-  `(actual …)` counters still to come. `VERBOSE`, `FORMAT JSON`/`XML`/`YAML`,
-  `SETTINGS`, `MEMORY`, `WAL` and `GENERIC_PLAN` now report `0A000` rather than
-  being silently ignored — they would change the shape of the output, and a plan
-  that answers a question the client did not ask is worse than a stated gap),
-  automatic VACUUM/ANALYZE, logical replication (publisher) for CDC.
-
 ## 7. Decisions made
 
 | Question | Decision |
@@ -340,6 +677,7 @@ ourselves anything that is not visible through SQL:
 | Parity version | **PostgreSQL 19**: grammar, catalogs, behavior, regression tests |
 | Parser | sqlparser-rs (Apache), PG dialect; gaps closed via upstream PRs |
 | Storage | `crabgresql-pg-engine` behind the pluggable `crabgresql-storage-api`; durable heap tables plus RAM-backed memory tables (`UNLOGGED`/`TEMP`) |
+| Parquet layout | WAL-backed buffer tables, sorted immutable ~64 MiB chunks, manifest generations, and background compaction/repartitioning |
 | Isolation | PG semantics ported 1:1 (RC/EvalPlanQual, RR=SI, SSI) |
 | Executor | Volcano first, vectorization as opt-in later |
 | Concurrency | tokio + threads, shared-everything |

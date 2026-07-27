@@ -1,7 +1,8 @@
 # CrabgreSQL
 
 A PostgreSQL-compatible DBMS written in Rust. See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and
+[ROADMAP.md](ROADMAP.md) for the development sequence.
 
 **Status: M1 in progress — CRUD.** The full parse → bind → plan → execute
 pipeline runs simple CRUD end-to-end against the in-memory storage engine:
