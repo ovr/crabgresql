@@ -92,10 +92,25 @@ SELECT regexp_like('abc', 'B', 'i') AS rl1, regexp_like('abc', 'B') AS rl2,
 SELECT regexp_substr('abcdef', 'c.') AS rs1,
        regexp_substr('foobarbaz', 'b(a)(.)', 1, 2, 'i', 2) AS rs2,
        regexp_substr('abc', 'z') AS rs3, regexp_substr('abc', '(x)?b', 1, 1, '', 1) AS rs4;
+-- start re-seeds the scan, so a match that began earlier is clipped not skipped
+SELECT regexp_substr('hello world', '[a-z]+', 3) AS st1,
+       regexp_substr('aaaaa', 'aa', 2, 2) AS st2,
+       regexp_count('aaaaa', 'aa', 2) AS st3,
+       regexp_count('abcabc', '^a', 2) AS st4;
+-- a pattern with no capture groups treats subexpr 1 as the whole match
+SELECT regexp_substr('abc', 'b', 1, 1, '', 1) AS sx1,
+       regexp_substr('abc', 'b', 1, 1, '', 2) AS sx2;
+-- the x flag keeps whitespace significant inside a bracket expression
+SELECT regexp_like('a b', 'a[ ]b', 'x') AS x1, regexp_like('ab', 'a b', 'x') AS x2;
+-- newline-sensitive modes stop a negated class from matching a newline
+SELECT regexp_like(chr(10), '[^x]') AS n1, regexp_like(chr(10), '[^x]', 'n') AS n2,
+       regexp_replace('a'||chr(10)||'b', '[^x]b', 'X', 'n') = 'a'||chr(10)||'b' AS n3;
 -- errors: unknown flag, the global flag where it makes no sense, bad start
 SELECT regexp_replace('abc', 'b', 'x', 'z');
 SELECT regexp_like('abc', 'b', 'g');
 SELECT regexp_count('abc', 'b', 0);
+-- start is validated before the flags string
+SELECT regexp_count('abc', 'b', 0, 'z');
 
 -- encode / decode
 SELECT encode('\x001000'::bytea, 'hex') AS e_hex, encode('abc'::bytea, 'base64') AS e_b64,

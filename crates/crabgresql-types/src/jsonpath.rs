@@ -1747,11 +1747,13 @@ impl Eval<'_> {
 
     fn like_regex(&self, operand: &Node, pattern: &str, flags: &str, current: &Jsonb) -> Result<Ternary, JsonError> {
         let ls = self.pred_operand(operand, current)?;
-        let ci = flags.contains('i');
         let mut unknown = false;
         for l in &ls {
             match l {
-                Jsonb::String(s) => match crate::text::regex_match(s, pattern, ci) {
+                // `like_regex` is XQuery-flavored, not POSIX: its flags differ
+                // from the `~` operator's defaults, so it does not go through
+                // `regex_match`.
+                Jsonb::String(s) => match crate::text::like_regex_match(s, pattern, flags) {
                     Ok(true) => return Ok(Ternary::True),
                     Ok(false) => {}
                     Err(_) => unknown = true,

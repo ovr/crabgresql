@@ -497,17 +497,6 @@ impl Default for ReOpts {
     }
 }
 
-impl ReOpts {
-    /// Pack the options into a bitfield so they can key the pattern cache.
-    fn bits(self) -> u8 {
-        u8::from(self.case_insensitive)
-            | u8::from(self.multi_line) << 1
-            | u8::from(self.dot_all) << 2
-            | u8::from(self.ignore_whitespace) << 3
-            | u8::from(self.literal) << 4
-    }
-}
-
 /// Parse a PG regex flags string into compile options plus the `g` ("global")
 /// flag, which is not a compile option but a per-function behavior switch.
 ///
@@ -563,57 +552,161 @@ fn parse_re_flags(flags: &str) -> Result<(ReOpts, bool)> {
     Ok((opts, global))
 }
 
-/// How many compiled patterns to keep per thread, matching PG's regex cache.
+/// Rewrite `pattern` for the two PG behaviors the `regex` crate cannot express
+/// through builder options. Both need to know where bracket expressions start
+/// and end, so one walk does both:
+///
+///   * expanded mode (`x`): whitespace and `#` comments are ignored, but *not*
+///     inside a bracket expression, where PG keeps them significant. The
+///     crate's `ignore_whitespace` strips them everywhere, so we strip them
+///     ourselves and leave that option off.
+///   * newline-sensitive modes (`n`/`m`/`p`): a negated bracket expression must
+///     not match a newline. The crate's `dot_matches_new_line` covers only `.`,
+///     so each `[^...]` is intersected with `[^\n]` using the crate's character
+///     class intersection. Wrapping the class whole is what makes this safe —
+///     injecting `\n` into it would turn a leading or trailing `-` into a range.
+fn rewrite_pattern(pattern: &str, opts: ReOpts) -> String {
+    let expand = opts.ignore_whitespace;
+    let no_newline = !opts.dot_all;
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // An escape always carries its next character through untouched, so
+            // `\ ` stays a literal space even in expanded mode.
+            '\\' => {
+                out.push('\\');
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '[' => {
+                let class = take_bracket(&mut chars);
+                // `[^` is negated; `[` alone is not.
+                if no_newline && class.starts_with('^') {
+                    // `class` already carries its own leading `^`.
+                    out.push_str("[[");
+                    out.push_str(&class);
+                    out.push_str("]&&[^\\n]]");
+                } else {
+                    out.push('[');
+                    out.push_str(&class);
+                    out.push(']');
+                }
+            }
+            '#' if expand => {
+                // A comment runs to the end of the line.
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            c if expand && c.is_whitespace() => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Consume a bracket expression's body from `chars`, which is positioned just
+/// after the opening `[`, and return it without the enclosing brackets. Handles
+/// the POSIX rules that make `]` a literal member: a leading `^` and a `]` in
+/// first position, plus `[:name:]`/`[.x.]`/`[=x=]` sub-expressions. An
+/// unterminated class is returned as-is so the regex compiler reports it.
+fn take_bracket(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut body = String::new();
+    if chars.peek() == Some(&'^') {
+        body.push('^');
+        chars.next();
+    }
+    if chars.peek() == Some(&']') {
+        body.push(']');
+        chars.next();
+    }
+    while let Some(c) = chars.next() {
+        match c {
+            ']' => return body,
+            // `[:alpha:]` and friends: copy through to the matching delimiter.
+            '[' if matches!(chars.peek(), Some(':' | '.' | '=')) => {
+                let kind = chars.next().unwrap_or(':');
+                body.push('[');
+                body.push(kind);
+                while let Some(c) = chars.next() {
+                    body.push(c);
+                    if c == kind && chars.peek() == Some(&']') {
+                        body.push(']');
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // An escape inside a class still carries its next character.
+            '\\' => {
+                body.push('\\');
+                if let Some(next) = chars.next() {
+                    body.push(next);
+                }
+            }
+            other => body.push(other),
+        }
+    }
+    body
+}
+
+/// How many compiled patterns to keep per thread. The bound exists to cap
+/// per-thread memory for a cache consulted once per row; the exact depth is not
+/// observable, so any small number would do.
 const RE_CACHE_MAX: usize = 32;
 
 thread_local! {
-    /// Most-recently-used first. `Regex` is internally reference-counted, so
-    /// handing out clones is cheap; compiling is not, and these functions are
-    /// called once per row.
-    static RE_CACHE: std::cell::RefCell<Vec<(String, u8, regex::Regex)>> =
+    /// Most-recently-used first. Cloning a `Regex` is *not* free — it allocates
+    /// a fresh, empty match-state pool — so entries are lent out by reference
+    /// (see [`with_cached`]) rather than cloned per row.
+    static RE_CACHE: std::cell::RefCell<Vec<(String, ReOpts, regex::Regex)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Compile `pattern` under `opts`, reusing a cached `Regex` when one is live.
-fn compile_cached(pattern: &str, opts: ReOpts) -> Result<regex::Regex> {
-    let bits = opts.bits();
-    let hit = RE_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let idx = cache
-            .iter()
-            .position(|(p, b, _)| *b == bits && p == pattern)?;
-        // Promote to most-recently-used.
-        let entry = cache.remove(idx);
-        let re = entry.2.clone();
-        cache.insert(0, entry);
-        Some(re)
-    });
-    if let Some(re) = hit {
-        return Ok(re);
-    }
-
-    // The `q` flag makes the whole pattern a literal string.
-    let escaped;
-    let source = if opts.literal {
-        escaped = regex::escape(pattern);
-        escaped.as_str()
-    } else {
-        pattern
-    };
-    let re = regex::RegexBuilder::new(source)
-        .case_insensitive(opts.case_insensitive)
-        .multi_line(opts.multi_line)
-        .dot_matches_new_line(opts.dot_all)
-        .ignore_whitespace(opts.ignore_whitespace)
-        .build()
-        .map_err(invalid_regex)?;
-
+/// Compile `pattern` under `opts` (reusing a cached `Regex` when one is live)
+/// and run `f` against it.
+///
+/// `f` must not itself call back into the cache: the entry is lent out while
+/// the thread-local is borrowed, so re-entering would panic. Every caller in
+/// this module runs a single match and returns an owned result.
+fn with_cached<T>(pattern: &str, opts: ReOpts, f: impl FnOnce(&regex::Regex) -> T) -> Result<T> {
     RE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        cache.insert(0, (pattern.to_string(), bits, re.clone()));
-        cache.truncate(RE_CACHE_MAX);
-    });
-    Ok(re)
+        match cache
+            .iter()
+            .position(|(p, o, _)| *o == opts && p == pattern)
+        {
+            Some(idx) => {
+                // Promote to most-recently-used. Already-hot patterns (the
+                // common case for a per-row scan) need no shuffling at all.
+                if idx != 0 {
+                    cache[..=idx].rotate_right(1);
+                }
+            }
+            None => {
+                // The `q` flag makes the whole pattern a literal string;
+                // otherwise apply the rewrites the crate cannot express.
+                let source = if opts.literal {
+                    regex::escape(pattern)
+                } else {
+                    rewrite_pattern(pattern, opts)
+                };
+                let re = regex::RegexBuilder::new(&source)
+                    .case_insensitive(opts.case_insensitive)
+                    .multi_line(opts.multi_line)
+                    .dot_matches_new_line(opts.dot_all)
+                    .build()
+                    .map_err(invalid_regex)?;
+                cache.insert(0, (pattern.to_string(), opts, re));
+                cache.truncate(RE_CACHE_MAX);
+            }
+        }
+        Ok(f(&cache[0].2))
+    })
 }
 
 /// POSIX regex match, backing the `~` (case-sensitive) and `~*`
@@ -624,7 +717,22 @@ pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<boo
         case_insensitive,
         ..ReOpts::default()
     };
-    Ok(compile_cached(pattern, opts)?.is_match(s))
+    with_cached(pattern, opts, |re| re.is_match(s))
+}
+
+/// jsonpath's `like_regex`, which is XQuery-flavored rather than POSIX: `.`
+/// does *not* match a newline unless the `s` flag asks for it, the opposite of
+/// [`regex_match`]'s default. Only `i s m x q` are meaningful here; PG's
+/// jsonpath parser rejects anything else before we see it.
+pub fn like_regex_match(s: &str, pattern: &str, flags: &str) -> Result<bool> {
+    let opts = ReOpts {
+        case_insensitive: flags.contains('i'),
+        multi_line: flags.contains('m'),
+        dot_all: flags.contains('s'),
+        ignore_whitespace: flags.contains('x'),
+        literal: flags.contains('q'),
+    };
+    with_cached(pattern, opts, |re| re.is_match(s))
 }
 
 /// `SIMILAR TO`: an SQL-standard pattern language distinct from both LIKE and
@@ -632,7 +740,7 @@ pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<boo
 /// `~`). We translate it to a POSIX regex and delegate to the `regex` crate.
 pub fn similar_to_match(s: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
     let translated = similar_to_regex(pattern, escape)?;
-    Ok(compile_cached(&translated, ReOpts::default())?.is_match(s))
+    with_cached(&translated, ReOpts::default(), |re| re.is_match(s))
 }
 
 // --- regexp_* functions ----------------------------------------------------
@@ -716,14 +824,15 @@ fn translate_replacement(replacement: &str) -> String {
 /// flag only the first match is replaced.
 pub fn regexp_replace(s: &str, pattern: &str, replacement: &str, flags: &str) -> Result<String> {
     let (opts, global) = parse_re_flags(flags)?;
-    let re = compile_cached(pattern, opts)?;
     let replacement = translate_replacement(replacement);
-    let out = if global {
-        re.replace_all(s, replacement.as_str())
-    } else {
-        re.replace(s, replacement.as_str())
-    };
-    Ok(out.into_owned())
+    with_cached(pattern, opts, |re| {
+        let out = if global {
+            re.replace_all(s, replacement.as_str())
+        } else {
+            re.replace(s, replacement.as_str())
+        };
+        out.into_owned()
+    })
 }
 
 /// `regexp_like(string, pattern [, flags])` — the functional spelling of `~`.
@@ -732,26 +841,48 @@ pub fn regexp_like(s: &str, pattern: &str, flags: &str) -> Result<bool> {
     if global {
         return Err(reject_global("regexp_like"));
     }
-    Ok(compile_cached(pattern, opts)?.is_match(s))
+    with_cached(pattern, opts, |re| re.is_match(s))
+}
+
+/// Byte offset one match past `from`, advancing over an empty match by a whole
+/// character so the scan cannot stall.
+fn advance(s: &str, m: &regex::Match<'_>, from: usize) -> usize {
+    if m.end() > from {
+        return m.end();
+    }
+    s[from..]
+        .chars()
+        .next()
+        .map_or(from + 1, |c| from + c.len_utf8())
 }
 
 /// `regexp_count(string, pattern [, start [, flags]])` — non-overlapping
 /// matches at or after the 1-based character position `start`.
 pub fn regexp_count(s: &str, pattern: &str, start: i32, flags: &str) -> Result<i32> {
-    let (opts, global) = parse_re_flags(flags)?;
     let offset = start_offset(s, start)?;
+    let (opts, global) = parse_re_flags(flags)?;
     if global {
         return Err(reject_global("regexp_count"));
     }
-    let re = compile_cached(pattern, opts)?;
     let Some(offset) = offset else {
         return Ok(0);
     };
-    // Scanning the whole haystack and skipping early matches (rather than
-    // searching `&s[offset..]`) keeps `^` and look-behind aware of the text
-    // before `start`, as PG's engine is.
-    let count = re.find_iter(s).filter(|m| m.start() >= offset).count();
-    Ok(i32::try_from(count).unwrap_or(i32::MAX))
+    with_cached(pattern, opts, |re| {
+        // PG re-seeds the non-overlapping scan *at* `start`, so a match that
+        // began earlier is re-found clipped rather than skipped. `find_at`
+        // keeps `^` and look-behind aware of the text before `start`, which
+        // slicing the haystack would not.
+        let mut cursor = offset;
+        let mut count: i32 = 0;
+        while let Some(m) = re.find_at(s, cursor) {
+            count = count.saturating_add(1);
+            cursor = advance(s, &m, cursor);
+            if cursor > s.len() {
+                break;
+            }
+        }
+        count
+    })
 }
 
 /// `regexp_substr(string, pattern [, start [, n [, flags [, subexpr]]]])` — the
@@ -766,7 +897,6 @@ pub fn regexp_substr(
     flags: &str,
     subexpr: i32,
 ) -> Result<Option<String>> {
-    let (opts, global) = parse_re_flags(flags)?;
     let offset = start_offset(s, start)?;
     if n < 1 {
         return Err(invalid_parameter("n", n));
@@ -774,19 +904,35 @@ pub fn regexp_substr(
     if subexpr < 0 {
         return Err(invalid_parameter("subexpr", subexpr));
     }
+    let (opts, global) = parse_re_flags(flags)?;
     if global {
         return Err(reject_global("regexp_substr"));
     }
-    let re = compile_cached(pattern, opts)?;
     let Some(offset) = offset else {
         return Ok(None);
     };
-    let found = re
-        .captures_iter(s)
-        .filter(|c| c.get(0).is_some_and(|m| m.start() >= offset))
-        .nth(n as usize - 1);
-    // An out-of-range `subexpr` is NULL rather than an error, as in PG.
-    Ok(found.and_then(|c| c.get(subexpr as usize).map(|m| m.as_str().to_string())))
+    with_cached(pattern, opts, |re| {
+        // Walk to the `n`th match the same way `regexp_count` counts them.
+        let mut cursor = offset;
+        for _ in 1..n {
+            let m = re.find_at(s, cursor)?;
+            cursor = advance(s, &m, cursor);
+            if cursor > s.len() {
+                return None;
+            }
+        }
+        let caps = re.captures_at(s, cursor)?;
+        // A pattern with no subexpressions has no group to ask for, so PG
+        // treats `subexpr` 1 as the whole match. Anything genuinely out of
+        // range, or a group that did not participate, is NULL rather than an
+        // error.
+        let group = if subexpr == 1 && re.captures_len() == 1 {
+            0
+        } else {
+            subexpr as usize
+        };
+        caps.get(group).map(|m| m.as_str().to_string())
+    })
 }
 
 /// Emit `c` as a regex literal, escaping it when it is a regex metacharacter
@@ -1575,12 +1721,17 @@ mod tests {
 
         assert_eq!(regexp_count("abcabc", "a", 1, "")?, 2);
         assert_eq!(regexp_count("abcABC", "a", 1, "i")?, 2);
-        // `start` skips matches beginning before it, but the engine still sees
-        // the earlier text, so `^` stays bound to the start of the string.
         assert_eq!(regexp_count("abcabc", "a", 2, "")?, 1);
+        // The scan re-seeds *at* `start` rather than filtering a scan that
+        // began at 0, so a match overlapping an earlier one is still found.
+        assert_eq!(regexp_count("aaaaa", "aa", 2, "")?, 2);
+        // The engine still sees the text before `start`, so `^` stays bound to
+        // the start of the whole string.
         assert_eq!(regexp_count("abcabc", "^a", 2, "")?, 0);
         // A `start` past the end of the string simply finds nothing.
         assert_eq!(regexp_count("abc", "b", 9, "")?, 0);
+        // An empty match must advance the cursor, not stall it.
+        assert_eq!(regexp_count("abc", "", 1, "")?, 4);
 
         assert_eq!(
             regexp_substr("abcdef", "c.", 1, 1, "", 0)?.as_deref(),
@@ -1595,12 +1746,75 @@ mod tests {
             regexp_substr("foobarbaz", "b(a)(.)", 1, 2, "i", 2)?.as_deref(),
             Some("z")
         );
+        // A match that began before `start` is re-found clipped, not skipped.
+        assert_eq!(
+            regexp_substr("aaaaa", "aa", 2, 1, "", 0)?.as_deref(),
+            Some("aa")
+        );
+        assert_eq!(
+            regexp_substr("aaaaa", "aa", 2, 2, "", 0)?.as_deref(),
+            Some("aa")
+        );
+        assert_eq!(
+            regexp_substr("hello world", "[a-z]+", 3, 1, "", 0)?.as_deref(),
+            Some("llo")
+        );
+        // A pattern with no capture groups has no group to ask for, so PG
+        // treats `subexpr` 1 as the whole match.
+        assert_eq!(
+            regexp_substr("abc", "b", 1, 1, "", 1)?.as_deref(),
+            Some("b")
+        );
         // No match, an out-of-range group and a group that did not participate
         // are all NULL rather than errors.
         assert_eq!(regexp_substr("abc", "z", 1, 1, "", 0)?, None);
         assert_eq!(regexp_substr("abc", "b", 9, 1, "", 0)?, None);
+        assert_eq!(regexp_substr("abc", "b", 1, 1, "", 2)?, None);
         assert_eq!(regexp_substr("abc", "(b)", 1, 1, "", 5)?, None);
         assert_eq!(regexp_substr("abc", "(x)?b", 1, 1, "", 1)?, None);
+
+        Ok(())
+    }
+
+    /// The `regex` crate cannot express these two through builder options, so
+    /// [`rewrite_pattern`] rewrites the pattern instead.
+    #[test]
+    fn regex_pattern_rewrites() -> anyhow::Result<()> {
+        // Expanded mode ignores whitespace and `#` comments, but *not* inside a
+        // bracket expression.
+        assert!(regexp_like("a b", "a[ ]b", "x")?);
+        assert!(regexp_like("ab", "a b", "x")?);
+        assert!(regexp_like("ab", "a#comment\nb", "x")?);
+        // An escaped space stays literal even in expanded mode.
+        assert!(regexp_like("a b", r"a\ b", "x")?);
+        // Under a newline-sensitive mode a negated class must not match a
+        // newline; under the default (and `w`) it must.
+        assert!(!regexp_like("\n", "[^x]", "n")?);
+        assert!(!regexp_like("\n", "[^x]", "p")?);
+        assert!(regexp_like("\n", "[^x]", "")?);
+        assert!(regexp_like("\n", "[^x]", "w")?);
+        assert_eq!(regexp_replace("a\nb", "[^x]b", "X", "n")?, "a\nb");
+        // Wrapping the class (rather than injecting into it) keeps a leading or
+        // trailing `-` literal instead of turning it into a range.
+        assert!(!regexp_like("-", "[^-a]", "n")?);
+        assert!(!regexp_like("-", "[^a-]", "n")?);
+        assert!(regexp_like("b", "[^a-]", "n")?);
+        // A positive class that names a newline still matches one.
+        assert!(regexp_like("\n", "[\\n]", "n")?);
+
+        Ok(())
+    }
+
+    /// jsonpath's `like_regex` is XQuery-flavored: `.` does not span a newline
+    /// unless `s` is given, the opposite of the `~` operator's default.
+    #[test]
+    fn jsonpath_like_regex_flags() -> anyhow::Result<()> {
+        assert!(!like_regex_match("a\nb", "a.b", "")?);
+        assert!(like_regex_match("a\nb", "a.b", "s")?);
+        assert!(like_regex_match("ABC", "abc", "i")?);
+        assert!(!like_regex_match("ABC", "abc", "")?);
+        // `~` keeps the POSIX default, so the two disagree by design.
+        assert!(regex_match("a\nb", "a.b", false)?);
 
         Ok(())
     }
