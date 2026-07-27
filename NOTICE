@@ -20,6 +20,17 @@ original scanner, not a port of PostgreSQL's Catalog.pm. Borrowing catalog data
 (and generating from pg_type.dat/pg_proc.dat) is the clean-room-sanctioned path
 per AGENTS.md; no PostgreSQL source code is included.
 
+This product includes the ClickBench benchmark's schema and queries
+(crates/crabgresql-bench/suites/clickbench/create.sql and queries.sql, the
+upstream `postgresql/` variant used unmodified):
+
+  Copyright ClickHouse, Inc. and the ClickBench contributors
+  (github.com/ClickHouse/ClickBench)
+
+licensed under Apache-2.0 (the same license as this project). They are SQL test
+data for crates/crabgresql-bench only; the dataset itself is not vendored and is
+downloaded by the person running the benchmark.
+
 This product includes a fork of the `ryu` crate under vendor/ryu, used for
 shortest-decimal float formatting:
 

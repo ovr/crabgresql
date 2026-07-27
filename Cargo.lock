@@ -384,6 +384,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabgresql-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "crabgresql-server",
+ "futures-util",
+ "tempfile",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "crabgresql-binder"
 version = "0.1.0"
 dependencies = [
