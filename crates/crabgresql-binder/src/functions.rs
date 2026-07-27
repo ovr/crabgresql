@@ -325,6 +325,14 @@ pub enum ScalarFn {
     RegexIMatch,
     /// `text SIMILAR TO text [ESCAPE text] -> bool`.
     SimilarTo,
+    /// `regexp_replace(source, pattern, replacement [, flags]) -> text`.
+    RegexpReplace,
+    /// `regexp_like(string, pattern [, flags]) -> bool`.
+    RegexpLike,
+    /// `regexp_count(string, pattern [, start [, flags]]) -> int4`.
+    RegexpCount,
+    /// `regexp_substr(string, pattern [, start [, n [, flags [, subexpr]]]]) -> text`.
+    RegexpSubstr,
     /// `encode(bytea, text) -> text`.
     Encode,
     /// `decode(text, text) -> bytea`.
@@ -1644,6 +1652,78 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[TEXT, TEXT, TEXT],
             ret: TEXT,
         }],
+        // The `regexp_*` family. Each function takes its optional trailing
+        // arguments as extra overloads; the executor discriminates on arity.
+        // PG 15's `regexp_replace(source, pattern, repl, start, N [, flags])`
+        // is not offered: its 4-argument form collides with the flags form.
+        "regexp_replace" => &[
+            Signature {
+                func: ScalarFn::RegexpReplace,
+                args: &[TEXT, TEXT, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::RegexpReplace,
+                args: &[TEXT, TEXT, TEXT, TEXT],
+                ret: TEXT,
+            },
+        ],
+        "regexp_like" => &[
+            Signature {
+                func: ScalarFn::RegexpLike,
+                args: &[TEXT, TEXT],
+                ret: BOOL,
+            },
+            Signature {
+                func: ScalarFn::RegexpLike,
+                args: &[TEXT, TEXT, TEXT],
+                ret: BOOL,
+            },
+        ],
+        "regexp_count" => &[
+            Signature {
+                func: ScalarFn::RegexpCount,
+                args: &[TEXT, TEXT],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::RegexpCount,
+                args: &[TEXT, TEXT, I4],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::RegexpCount,
+                args: &[TEXT, TEXT, I4, TEXT],
+                ret: I4,
+            },
+        ],
+        "regexp_substr" => &[
+            Signature {
+                func: ScalarFn::RegexpSubstr,
+                args: &[TEXT, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::RegexpSubstr,
+                args: &[TEXT, TEXT, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::RegexpSubstr,
+                args: &[TEXT, TEXT, I4, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::RegexpSubstr,
+                args: &[TEXT, TEXT, I4, I4, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::RegexpSubstr,
+                args: &[TEXT, TEXT, I4, I4, TEXT, I4],
+                ret: TEXT,
+            },
+        ],
         "translate" => &[Signature {
             func: ScalarFn::Translate,
             args: &[TEXT, TEXT, TEXT],

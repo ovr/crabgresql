@@ -288,6 +288,36 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 .map(Value::Bool)
                 .map_err(text_err);
         }
+        // The `regexp_*` family shares one variant per function across all its
+        // arities, so absent trailing arguments fall back to PG's defaults.
+        ScalarFn::RegexpReplace => {
+            let flags = args.get(3).map_or("", text);
+            return text::regexp_replace(text(&args[0]), text(&args[1]), text(&args[2]), flags)
+                .map(Value::Text)
+                .map_err(text_err);
+        }
+        ScalarFn::RegexpLike => {
+            let flags = args.get(2).map_or("", text);
+            return text::regexp_like(text(&args[0]), text(&args[1]), flags)
+                .map(Value::Bool)
+                .map_err(text_err);
+        }
+        ScalarFn::RegexpCount => {
+            let start = args.get(2).map_or(1, i4);
+            let flags = args.get(3).map_or("", text);
+            return text::regexp_count(text(&args[0]), text(&args[1]), start, flags)
+                .map(Value::Int4)
+                .map_err(text_err);
+        }
+        ScalarFn::RegexpSubstr => {
+            let start = args.get(2).map_or(1, i4);
+            let n = args.get(3).map_or(1, i4);
+            let flags = args.get(4).map_or("", text);
+            let subexpr = args.get(5).map_or(0, i4);
+            return text::regexp_substr(text(&args[0]), text(&args[1]), start, n, flags, subexpr)
+                .map(|found| found.map_or(Value::Null, Value::Text))
+                .map_err(text_err);
+        }
         ScalarFn::SimilarTo => {
             // No ESCAPE clause defaults to `\`; `ESCAPE ''` disables escaping.
             let escape = match args.get(2) {

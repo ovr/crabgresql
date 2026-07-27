@@ -10,6 +10,7 @@
 /// so `crabgresql-types` needs no dependency on the wire-protocol crate; the
 /// executor maps these onto `crabgresql_pg_wire::sqlstate::*`.
 mod sqlstate {
+    pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
     pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
     pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
     pub const SUBSTRING_ERROR: &str = "22011";
@@ -468,15 +469,162 @@ fn invalid_regex(e: regex::Error) -> TextError {
     )
 }
 
+/// The compile-time options a PG regex flags string resolves to.
+///
+/// The defaults are PG's, *not* the `regex` crate's: an unadorned PG regex is
+/// "newline-insensitive", meaning `.` matches a newline and `^`/`$` anchor only
+/// at the ends of the string. The crate defaults to the opposite `.`, so
+/// `dot_all` starts out `true`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReOpts {
+    case_insensitive: bool,
+    multi_line: bool,
+    dot_all: bool,
+    ignore_whitespace: bool,
+    /// The `q` flag: the pattern is a literal string, not a regex.
+    literal: bool,
+}
+
+impl Default for ReOpts {
+    fn default() -> Self {
+        ReOpts {
+            case_insensitive: false,
+            multi_line: false,
+            dot_all: true,
+            ignore_whitespace: false,
+            literal: false,
+        }
+    }
+}
+
+impl ReOpts {
+    /// Pack the options into a bitfield so they can key the pattern cache.
+    fn bits(self) -> u8 {
+        u8::from(self.case_insensitive)
+            | u8::from(self.multi_line) << 1
+            | u8::from(self.dot_all) << 2
+            | u8::from(self.ignore_whitespace) << 3
+            | u8::from(self.literal) << 4
+    }
+}
+
+/// Parse a PG regex flags string into compile options plus the `g` ("global")
+/// flag, which is not a compile option but a per-function behavior switch.
+///
+/// Later flags override earlier ones, so `ig` and `ci` behave as in PG. An
+/// unrecognized flag is `22023`.
+fn parse_re_flags(flags: &str) -> Result<(ReOpts, bool)> {
+    let mut opts = ReOpts::default();
+    let mut global = false;
+    for c in flags.chars() {
+        match c {
+            'g' => global = true,
+            'i' => opts.case_insensitive = true,
+            'c' => opts.case_insensitive = false,
+            'x' => opts.ignore_whitespace = true,
+            // PG's four newline-sensitivity modes. `s` is the default; `n`/`m`
+            // make both `.` and the anchors newline-aware, while `p` and `w`
+            // each flip only one of the two.
+            's' => {
+                opts.multi_line = false;
+                opts.dot_all = true;
+            }
+            'n' | 'm' => {
+                opts.multi_line = true;
+                opts.dot_all = false;
+            }
+            'p' => {
+                opts.multi_line = false;
+                opts.dot_all = false;
+            }
+            'w' => {
+                opts.multi_line = true;
+                opts.dot_all = true;
+            }
+            'q' => opts.literal = true,
+            // `e` selects a POSIX ERE, which is close enough to the `regex`
+            // crate's grammar to accept as-is; `b` selects a BRE, a genuinely
+            // different grammar we do not translate.
+            'e' => opts.literal = false,
+            'b' => {
+                return Err(TextError::new(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "basic regular expressions (flag \"b\") are not supported",
+                ));
+            }
+            other => {
+                return Err(TextError::new(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    format!("invalid regular expression option: \"{other}\""),
+                ));
+            }
+        }
+    }
+    Ok((opts, global))
+}
+
+/// How many compiled patterns to keep per thread, matching PG's regex cache.
+const RE_CACHE_MAX: usize = 32;
+
+thread_local! {
+    /// Most-recently-used first. `Regex` is internally reference-counted, so
+    /// handing out clones is cheap; compiling is not, and these functions are
+    /// called once per row.
+    static RE_CACHE: std::cell::RefCell<Vec<(String, u8, regex::Regex)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Compile `pattern` under `opts`, reusing a cached `Regex` when one is live.
+fn compile_cached(pattern: &str, opts: ReOpts) -> Result<regex::Regex> {
+    let bits = opts.bits();
+    let hit = RE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let idx = cache
+            .iter()
+            .position(|(p, b, _)| *b == bits && p == pattern)?;
+        // Promote to most-recently-used.
+        let entry = cache.remove(idx);
+        let re = entry.2.clone();
+        cache.insert(0, entry);
+        Some(re)
+    });
+    if let Some(re) = hit {
+        return Ok(re);
+    }
+
+    // The `q` flag makes the whole pattern a literal string.
+    let escaped;
+    let source = if opts.literal {
+        escaped = regex::escape(pattern);
+        escaped.as_str()
+    } else {
+        pattern
+    };
+    let re = regex::RegexBuilder::new(source)
+        .case_insensitive(opts.case_insensitive)
+        .multi_line(opts.multi_line)
+        .dot_matches_new_line(opts.dot_all)
+        .ignore_whitespace(opts.ignore_whitespace)
+        .build()
+        .map_err(invalid_regex)?;
+
+    RE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.insert(0, (pattern.to_string(), bits, re.clone()));
+        cache.truncate(RE_CACHE_MAX);
+    });
+    Ok(re)
+}
+
 /// POSIX regex match, backing the `~` (case-sensitive) and `~*`
 /// (case-insensitive) operators. The match is *unanchored*: `~` succeeds when
 /// the pattern matches anywhere in `s`, as in PG.
 pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<bool> {
-    let re = regex::RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()
-        .map_err(invalid_regex)?;
-    Ok(re.is_match(s))
+    let opts = ReOpts {
+        case_insensitive,
+        ..ReOpts::default()
+    };
+    Ok(compile_cached(pattern, opts)?.is_match(s))
 }
 
 /// `SIMILAR TO`: an SQL-standard pattern language distinct from both LIKE and
@@ -484,8 +632,161 @@ pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<boo
 /// `~`). We translate it to a POSIX regex and delegate to the `regex` crate.
 pub fn similar_to_match(s: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
     let translated = similar_to_regex(pattern, escape)?;
-    let re = regex::Regex::new(&translated).map_err(invalid_regex)?;
-    Ok(re.is_match(s))
+    Ok(compile_cached(&translated, ReOpts::default())?.is_match(s))
+}
+
+// --- regexp_* functions ----------------------------------------------------
+
+/// Reject the `g` flag for the functions that match at most once. PG raises
+/// this *before* compiling the pattern, so an invalid pattern combined with `g`
+/// still reports the `g` problem.
+fn reject_global(func: &str) -> TextError {
+    TextError::new(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        format!("{func}() does not support the \"global\" option"),
+    )
+}
+
+fn invalid_parameter(name: &str, value: i32) -> TextError {
+    TextError::new(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        format!("invalid value for parameter \"{name}\": {value}"),
+    )
+}
+
+/// Translate a 1-based *character* `start` into a byte offset. `Ok(None)` means
+/// `start` lies past the end of the string, where PG simply finds no match.
+fn start_offset(s: &str, start: i32) -> Result<Option<usize>> {
+    if start < 1 {
+        return Err(invalid_parameter("start", start));
+    }
+    // `start` may legitimately point one past the last character, so extend the
+    // offsets with the end of the string.
+    let mut offsets = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()));
+    Ok(offsets.nth(start as usize - 1))
+}
+
+/// Rewrite a PG replacement string into the `regex` crate's `$`-based syntax.
+///
+/// PG recognizes `\1`..`\9` (capture group), `\&` (the whole match) and `\\`
+/// (a literal backslash). A backslash before anything else is *not* an error:
+/// PG emits both characters literally, so `\q` stays `\q`. A group reference
+/// with no corresponding group expands to the empty string, which is also what
+/// the `regex` crate does.
+fn translate_replacement(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // `$` is a metacharacter for the crate but a literal for PG.
+            '$' => out.push_str("$$"),
+            '\\' => match chars.peek() {
+                // Braced so that `\1x` stays group 1 rather than group `1x`.
+                // Only one digit is consumed: PG reads `\10` as group 1 then
+                // a literal `0`.
+                Some(&d @ '1'..='9') => {
+                    chars.next();
+                    out.push_str("${");
+                    out.push(d);
+                    out.push('}');
+                }
+                Some('&') => {
+                    chars.next();
+                    out.push_str("${0}");
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                // Any other escape (and a trailing lone backslash) is literal;
+                // leave the following character for the next iteration so it
+                // still gets its own escaping.
+                _ => out.push('\\'),
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// `regexp_replace(source, pattern, replacement [, flags])`. Without the `g`
+/// flag only the first match is replaced.
+pub fn regexp_replace(s: &str, pattern: &str, replacement: &str, flags: &str) -> Result<String> {
+    let (opts, global) = parse_re_flags(flags)?;
+    let re = compile_cached(pattern, opts)?;
+    let replacement = translate_replacement(replacement);
+    let out = if global {
+        re.replace_all(s, replacement.as_str())
+    } else {
+        re.replace(s, replacement.as_str())
+    };
+    Ok(out.into_owned())
+}
+
+/// `regexp_like(string, pattern [, flags])` — the functional spelling of `~`.
+pub fn regexp_like(s: &str, pattern: &str, flags: &str) -> Result<bool> {
+    let (opts, global) = parse_re_flags(flags)?;
+    if global {
+        return Err(reject_global("regexp_like"));
+    }
+    Ok(compile_cached(pattern, opts)?.is_match(s))
+}
+
+/// `regexp_count(string, pattern [, start [, flags]])` — non-overlapping
+/// matches at or after the 1-based character position `start`.
+pub fn regexp_count(s: &str, pattern: &str, start: i32, flags: &str) -> Result<i32> {
+    let (opts, global) = parse_re_flags(flags)?;
+    let offset = start_offset(s, start)?;
+    if global {
+        return Err(reject_global("regexp_count"));
+    }
+    let re = compile_cached(pattern, opts)?;
+    let Some(offset) = offset else {
+        return Ok(0);
+    };
+    // Scanning the whole haystack and skipping early matches (rather than
+    // searching `&s[offset..]`) keeps `^` and look-behind aware of the text
+    // before `start`, as PG's engine is.
+    let count = re.find_iter(s).filter(|m| m.start() >= offset).count();
+    Ok(i32::try_from(count).unwrap_or(i32::MAX))
+}
+
+/// `regexp_substr(string, pattern [, start [, n [, flags [, subexpr]]]])` — the
+/// `n`th match at or after `start`, or its `subexpr`th capture group. Returns
+/// `None` (SQL NULL) when there is no such match or the group did not
+/// participate.
+pub fn regexp_substr(
+    s: &str,
+    pattern: &str,
+    start: i32,
+    n: i32,
+    flags: &str,
+    subexpr: i32,
+) -> Result<Option<String>> {
+    let (opts, global) = parse_re_flags(flags)?;
+    let offset = start_offset(s, start)?;
+    if n < 1 {
+        return Err(invalid_parameter("n", n));
+    }
+    if subexpr < 0 {
+        return Err(invalid_parameter("subexpr", subexpr));
+    }
+    if global {
+        return Err(reject_global("regexp_substr"));
+    }
+    let re = compile_cached(pattern, opts)?;
+    let Some(offset) = offset else {
+        return Ok(None);
+    };
+    let found = re
+        .captures_iter(s)
+        .filter(|c| c.get(0).is_some_and(|m| m.start() >= offset))
+        .nth(n as usize - 1);
+    // An out-of-range `subexpr` is NULL rather than an error, as in PG.
+    Ok(found.and_then(|c| c.get(subexpr as usize).map(|m| m.as_str().to_string())))
 }
 
 /// Emit `c` as a regex literal, escaping it when it is a regex metacharacter
@@ -1201,6 +1502,136 @@ mod tests {
         assert!(e.message.starts_with("invalid regular expression:"));
 
         Ok(())
+    }
+
+    /// PG's regexes are newline-*insensitive* by default: `.` spans newlines
+    /// and the anchors bind to the whole string, the opposite of the `regex`
+    /// crate's defaults.
+    #[test]
+    fn regex_newline_defaults() -> anyhow::Result<()> {
+        assert!(regex_match("a\nb", "a.b", false)?);
+        assert_eq!(regexp_replace("a\nb", "a.b", "X", "")?, "X");
+        // `n`/`m` make both `.` and the anchors newline-aware.
+        assert_eq!(regexp_replace("a\nb", "a.b", "X", "n")?, "a\nb");
+        assert_eq!(regexp_replace("a\nb", "^b", "X", "n")?, "a\nX");
+        // `p` is newline-sensitive for `.` only, `w` for the anchors only.
+        assert_eq!(regexp_replace("a\nb", "^b", "X", "p")?, "a\nb");
+        assert_eq!(regexp_replace("a\nb", "a.b", "X", "w")?, "X");
+
+        Ok(())
+    }
+
+    #[test]
+    fn regex_flags() -> anyhow::Result<()> {
+        assert_eq!(regexp_replace("abc", "B", "X", "i")?, "aXc");
+        // A later flag overrides an earlier one.
+        assert_eq!(regexp_replace("abc", "B", "X", "ic")?, "abc");
+        // `x` ignores whitespace in the pattern; `q` makes it a literal.
+        assert_eq!(regexp_replace("abc", "a b c", "X", "x")?, "X");
+        assert_eq!(regexp_replace("a.c", "a.c", "X", "q")?, "X");
+        assert_eq!(regexp_replace("abc", "a.c", "X", "q")?, "abc");
+        // An unknown flag is 22023; `b` (BRE) is an unimplemented feature.
+        let e = regexp_replace("abc", "b", "X", "z").unwrap_err();
+        assert_eq!(e.sqlstate, "22023");
+        assert_eq!(e.message, "invalid regular expression option: \"z\"");
+        assert_eq!(
+            regexp_replace("abc", "b", "X", "b").unwrap_err().sqlstate,
+            "0A000"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn regexp_replace_substitutions() -> anyhow::Result<()> {
+        // Only the first match without `g`, every match with it.
+        assert_eq!(regexp_replace("a1b2", "[0-9]", "X", "")?, "aXb2");
+        assert_eq!(regexp_replace("a1b2", "[0-9]", "X", "g")?, "aXbX");
+        // `\1`..`\9` are capture groups and `\&` is the whole match.
+        assert_eq!(
+            regexp_replace("1112223333", r"(\d{3})(\d{3})(\d{4})", r"(\1) \2-\3", "")?,
+            "(111) 222-3333"
+        );
+        assert_eq!(regexp_replace("abc", "b", r"[\&]", "")?, "a[b]c");
+        // `\\` is one literal backslash.
+        assert_eq!(regexp_replace("abc", "b", r"\\", "")?, r"a\c");
+        // Only one digit is consumed, so `\10` is group 1 then a literal `0`.
+        assert_eq!(regexp_replace("abc", "(b)", r"[\10]", "")?, "a[b0]c");
+        // A reference to a group that does not exist expands to nothing.
+        assert_eq!(regexp_replace("abc", "(b)", r"[\9]", "")?, "a[]c");
+        // Any other escape keeps both characters, and so does a trailing one.
+        assert_eq!(regexp_replace("abc", "b", r"[\q]", "")?, r"a[\q]c");
+        assert_eq!(regexp_replace("abc", "b", r"x\", "")?, r"ax\c");
+        // `$` is a metacharacter for the `regex` crate but a literal for PG.
+        assert_eq!(regexp_replace("abc", "b", "$1", "")?, "a$1c");
+
+        Ok(())
+    }
+
+    #[test]
+    fn regexp_like_count_substr() -> anyhow::Result<()> {
+        assert!(regexp_like("abc", "B", "i")?);
+        assert!(!regexp_like("abc", "B", "")?);
+
+        assert_eq!(regexp_count("abcabc", "a", 1, "")?, 2);
+        assert_eq!(regexp_count("abcABC", "a", 1, "i")?, 2);
+        // `start` skips matches beginning before it, but the engine still sees
+        // the earlier text, so `^` stays bound to the start of the string.
+        assert_eq!(regexp_count("abcabc", "a", 2, "")?, 1);
+        assert_eq!(regexp_count("abcabc", "^a", 2, "")?, 0);
+        // A `start` past the end of the string simply finds nothing.
+        assert_eq!(regexp_count("abc", "b", 9, "")?, 0);
+
+        assert_eq!(
+            regexp_substr("abcdef", "c.", 1, 1, "", 0)?.as_deref(),
+            Some("cd")
+        );
+        assert_eq!(
+            regexp_substr("abcabc", "b", 2, 1, "", 0)?.as_deref(),
+            Some("b")
+        );
+        // The `n`th match, and a capture group within it.
+        assert_eq!(
+            regexp_substr("foobarbaz", "b(a)(.)", 1, 2, "i", 2)?.as_deref(),
+            Some("z")
+        );
+        // No match, an out-of-range group and a group that did not participate
+        // are all NULL rather than errors.
+        assert_eq!(regexp_substr("abc", "z", 1, 1, "", 0)?, None);
+        assert_eq!(regexp_substr("abc", "b", 9, 1, "", 0)?, None);
+        assert_eq!(regexp_substr("abc", "(b)", 1, 1, "", 5)?, None);
+        assert_eq!(regexp_substr("abc", "(x)?b", 1, 1, "", 1)?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn regexp_parameter_errors() {
+        // These functions match at most once, so `g` is rejected — and PG
+        // rejects it before it even compiles the pattern.
+        for e in [
+            regexp_like("abc", "a(", "g").unwrap_err(),
+            regexp_count("abc", "a(", 1, "g").unwrap_err(),
+            regexp_substr("abc", "a(", 1, 1, "g", 0).unwrap_err(),
+        ] {
+            assert_eq!(e.sqlstate, "22023");
+            assert!(
+                e.message
+                    .ends_with("does not support the \"global\" option")
+            );
+        }
+        assert_eq!(
+            regexp_count("abc", "b", 0, "").unwrap_err().message,
+            "invalid value for parameter \"start\": 0"
+        );
+        assert_eq!(
+            regexp_substr("abc", "b", 1, 0, "", 0).unwrap_err().message,
+            "invalid value for parameter \"n\": 0"
+        );
+        assert_eq!(
+            regexp_substr("abc", "b", 1, 1, "", -1).unwrap_err().message,
+            "invalid value for parameter \"subexpr\": -1"
+        );
     }
 
     #[test]

@@ -76,6 +76,27 @@ SELECT 'b' SIMILAR TO '[^a]' AS b1, '%' SIMILAR TO '[%_]' AS b2,
        'aa' SIMILAR TO 'a{2}' AS b3, 'a{c' SIMILAR TO 'a{c' AS b4,
        'a|b' SIMILAR TO 'a\|b' AS b5;
 
+-- regexp_replace: first match only, then every match with the g flag
+SELECT regexp_replace('a1b2', '[0-9]', 'X') AS rr1,
+       regexp_replace('a1b2', '[0-9]', 'X', 'g') AS rr2,
+       regexp_replace('abc', 'B', 'X', 'i') AS rr3;
+-- the PG replacement escapes: \1..\9 groups, \& whole match, \\ backslash
+SELECT regexp_replace('1112223333', '(\d{3})(\d{3})(\d{4})', '(\1) \2-\3') AS rr4,
+       regexp_replace('abc', 'b', '[\&]') AS rr5,
+       regexp_replace('abc', '(b)', '[\10]') AS rr6,
+       regexp_replace('abc', 'b', '[\q]') AS rr7;
+-- regexp_like / regexp_count / regexp_substr, incl. start, n and subexpr
+SELECT regexp_like('abc', 'B', 'i') AS rl1, regexp_like('abc', 'B') AS rl2,
+       regexp_count('abcabc', 'a') AS rc1, regexp_count('abcabc', 'a', 2) AS rc2,
+       regexp_count('abcABC', 'a', 1, 'i') AS rc3;
+SELECT regexp_substr('abcdef', 'c.') AS rs1,
+       regexp_substr('foobarbaz', 'b(a)(.)', 1, 2, 'i', 2) AS rs2,
+       regexp_substr('abc', 'z') AS rs3, regexp_substr('abc', '(x)?b', 1, 1, '', 1) AS rs4;
+-- errors: unknown flag, the global flag where it makes no sense, bad start
+SELECT regexp_replace('abc', 'b', 'x', 'z');
+SELECT regexp_like('abc', 'b', 'g');
+SELECT regexp_count('abc', 'b', 0);
+
 -- encode / decode
 SELECT encode('\x001000'::bytea, 'hex') AS e_hex, encode('abc'::bytea, 'base64') AS e_b64,
        encode('a\000b'::bytea, 'escape') AS e_esc;
