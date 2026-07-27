@@ -17227,11 +17227,56 @@ impl<'a> Parser<'a> {
 
     fn parse_vacuum(&mut self) -> Result<Statement, ParserError> {
         self.expect_keyword(Keyword::VACUUM)?;
-        let full = self.parse_keyword(Keyword::FULL);
+        let mut full = self.parse_keyword(Keyword::FULL);
         let sort_only = self.parse_keywords(&[Keyword::SORT, Keyword::ONLY]);
         let delete_only = self.parse_keywords(&[Keyword::DELETE, Keyword::ONLY]);
         let reindex = self.parse_keyword(Keyword::REINDEX);
         let recluster = self.parse_keyword(Keyword::RECLUSTER);
+        // PostgreSQL's own options, which must be consumed as options rather than
+        // swallowed by `parse_object_name` below — `parse_identifier` accepts any
+        // word, so `VACUUM ANALYZE` would otherwise bind a table named "analyze".
+        // Both spellings: the legacy bare-keyword list and the parenthesized one.
+        let mut freeze = false;
+        let mut verbose = false;
+        let mut analyze = false;
+        if self.consume_token(&Token::LParen) {
+            loop {
+                match self.parse_one_of_keywords(&[
+                    Keyword::FULL,
+                    Keyword::FREEZE,
+                    Keyword::VERBOSE,
+                    Keyword::ANALYZE,
+                ]) {
+                    Some(Keyword::FULL) => full = true,
+                    Some(Keyword::FREEZE) => freeze = true,
+                    Some(Keyword::VERBOSE) => verbose = true,
+                    Some(Keyword::ANALYZE) => analyze = true,
+                    _ => {
+                        return self.expected("a VACUUM option", self.peek_token());
+                    }
+                }
+                // PG allows a boolean argument per option; consume it so the shape
+                // parses, and let the executor decide what it can honor.
+                let _ = self.parse_one_of_keywords(&[Keyword::TRUE, Keyword::FALSE]);
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect_token(&Token::RParen)?;
+        } else {
+            loop {
+                match self.parse_one_of_keywords(&[
+                    Keyword::FREEZE,
+                    Keyword::VERBOSE,
+                    Keyword::ANALYZE,
+                ]) {
+                    Some(Keyword::FREEZE) => freeze = true,
+                    Some(Keyword::VERBOSE) => verbose = true,
+                    Some(Keyword::ANALYZE) => analyze = true,
+                    _ => break,
+                }
+            }
+        }
         let (table_name, threshold, boost) =
             match self.maybe_parse(|p| p.parse_object_name(false))? {
                 Some(table_name) => {
@@ -17256,6 +17301,9 @@ impl<'a> Parser<'a> {
             table_name,
             threshold,
             boost,
+            freeze,
+            verbose,
+            analyze,
         }))
     }
 

@@ -396,6 +396,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabgresql-buffer-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crabgresql-storage-api",
+ "crabgresql-txn",
+ "crabgresql-types",
+ "crabgresql-wal",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "crabgresql-catalog"
 version = "0.1.0"
 dependencies = [
@@ -427,6 +440,7 @@ dependencies = [
  "anyhow",
  "arrow-array",
  "arrow-schema",
+ "crabgresql-buffer-engine",
  "crabgresql-storage-api",
  "crabgresql-txn",
  "crabgresql-types",
@@ -455,6 +469,7 @@ name = "crabgresql-pg-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crabgresql-buffer-engine",
  "crabgresql-executor",
  "crabgresql-parquet-engine",
  "crabgresql-storage-api",

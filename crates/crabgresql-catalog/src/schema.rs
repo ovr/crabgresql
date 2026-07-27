@@ -332,6 +332,9 @@ const HEAP_AM_OID: u32 = 2;
 /// cluster-wide uniqueness clients assume. PostgreSQL reserves 1..16383 for
 /// built-ins for exactly this reason.
 pub const PARQUET_AM_OID: u32 = 16_000;
+/// Stable OID of the managed buffer table method; see [`PARQUET_AM_OID`] for why
+/// crabgresql's own methods sit below `FIRST_USER_OID`.
+pub const BUFFER_AM_OID: u32 = 16_001;
 /// OID of the `btree` index access method, shared by `pg_am` and the `relam` of
 /// every B-tree index's `pg_class` row so the join between them holds.
 const BTREE_AM_OID: u32 = 403;
@@ -345,8 +348,8 @@ const HASH_AM_OID: u32 = 405;
 pub(crate) const BOOTSTRAP_ROLE_OID: u32 = 10;
 
 /// `pg_catalog.pg_am` — the access methods. PostgreSQL lists the methods its
-/// build actually registered; crabgresql adds its managed `parquet` table
-/// method alongside PostgreSQL's built-ins so a client that
+/// build actually registered; crabgresql adds its managed `parquet` and `buffer`
+/// table methods alongside PostgreSQL's built-ins so a client that
 /// joins `pg_class.relam` or reads `pg_am` sees the shape it expects.
 ///
 /// Fidelity note (`AGENTS.md`): these rows are transcribed from the output of
@@ -386,6 +389,7 @@ pub fn pg_am_rows() -> Vec<Vec<Value>> {
         row(3580, "brin", "brinhandler", "i"),
         row(4000, "spgist", "spghandler", "i"),
         row(PARQUET_AM_OID, "parquet", "parquet_tableam_handler", "t"),
+        row(BUFFER_AM_OID, "buffer", "buffer_tableam_handler", "t"),
     ]
 }
 
@@ -545,6 +549,7 @@ pub fn pg_class_rows(
                     match schema.access_method {
                         TableAccessMethod::Heap => HEAP_AM_OID,
                         TableAccessMethod::Parquet => PARQUET_AM_OID,
+                        TableAccessMethod::Buffer => BUFFER_AM_OID,
                     },
                     "r",
                 ),

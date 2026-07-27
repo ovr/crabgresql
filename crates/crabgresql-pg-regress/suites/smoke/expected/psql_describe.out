@@ -12,7 +12,7 @@
 -- is created after the listings, since PostgreSQL numbers `pg_temp_N` by
 -- backend slot and the name would not reproduce.
 --
--- pg_am lists PostgreSQL's built-in access methods
+-- pg_am lists PostgreSQL's built-in access methods plus crabgresql's own
 SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid;
   oid  | amname  |        amhandler        | amtype 
 -------+---------+-------------------------+--------
@@ -24,7 +24,8 @@ SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid;
   3580 | brin    | brinhandler             | i
   4000 | spgist  | spghandler              | i
  16000 | parquet | parquet_tableam_handler | t
-(8 rows)
+ 16001 | buffer  | buffer_tableam_handler  | t
+(9 rows)
 
 -- pg_get_userbyid never returns NULL: an unowned OID prints a placeholder, and
 -- a negative argument reinterprets as unsigned rather than clamping

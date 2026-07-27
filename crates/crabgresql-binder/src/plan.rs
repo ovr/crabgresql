@@ -430,6 +430,36 @@ fn resolve_write_table(
     Ok((table, table_name))
 }
 
+/// The physical sources a read of `table` must union, or `None` when it is
+/// scanned directly.
+///
+/// Two independent kinds of split compose here. A **SQL partitioned parent**
+/// holds no rows itself and fans out to its catalog leaf partitions. An access
+/// method with **engine-internal storage leaves** fans out to its own physical
+/// sources ([`TableAm::storage_leaves`]) — invisible to the catalog.
+///
+/// A SQL leaf may itself split the second way, so the leaves are expanded and
+/// the result flattened: `Append` stays one flat list and the executor keeps one
+/// loop. Nothing produces that nesting today (a partitioned parent's leaves are
+/// heap relations), but writing the flatten costs three lines and removes the
+/// trap for whoever first makes a columnar relation a partition.
+fn scan_leaves(
+    engine: &Arc<dyn TableEngine>,
+    table: &Arc<dyn TableAm>,
+) -> Result<Option<Vec<Arc<dyn TableAm>>>, BindError> {
+    if table.schema().partition_scheme.is_some() {
+        let mut leaves = Vec::new();
+        for leaf in partition_leaves(engine, table.schema())? {
+            match leaf.storage_leaves() {
+                Some(inner) => leaves.extend(inner),
+                None => leaves.push(leaf),
+            }
+        }
+        return Ok(Some(leaves));
+    }
+    Ok(table.storage_leaves())
+}
+
 /// Enumerate the leaf partitions of the partitioned parent `parent` as storage
 /// handles, in a deterministic order (by leaf name). Both tuple routing on
 /// INSERT and the union scan on read need this set; it is captured at bind time
@@ -2368,19 +2398,17 @@ fn bind_from_item(
                             strength: crate::collation::Strength::Implicit,
                         })
                         .collect();
-                    // A partitioned parent has no rows of its own: read it as a
-                    // union scan over its leaves. Bind it as a subplan wrapping an
-                    // `Append` (raw parent columns), so the surrounding SELECT's
-                    // projection/WHERE/ORDER BY — and any join or aggregate — apply
-                    // through the existing subplan machinery.
-                    let input = if table.schema().partition_scheme.is_some() {
-                        let leaves = partition_leaves(engine, table.schema())?;
-                        JoinInput::Subplan(Box::new(LogicalPlan::Append {
+                    // A relation whose rows live in several places is read as a
+                    // union scan. Bind it as a subplan wrapping an `Append` (raw
+                    // relation columns), so the surrounding SELECT's
+                    // projection/WHERE/ORDER BY — and any join or aggregate —
+                    // apply through the existing subplan machinery.
+                    let input = match scan_leaves(engine, &table)? {
+                        Some(leaves) => JoinInput::Subplan(Box::new(LogicalPlan::Append {
                             tables: leaves,
                             columns: columns.clone(),
-                        }))
-                    } else {
-                        JoinInput::Scan(table)
+                        })),
+                        None => JoinInput::Scan(table),
                     };
                     apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
                     Ok(BoundFromItem {
@@ -8042,6 +8070,126 @@ mod tests {
         assert_eq!(
             bind_err("SELECT id FROM t EXCEPT SELECT id FROM t").code,
             sqlstate::FEATURE_NOT_SUPPORTED
+        );
+    }
+
+    /// A relation whose storage is split into engine-internal leaves. Only
+    /// `schema` and `storage_leaves` are exercised — `scan_leaves` inspects
+    /// metadata and never touches rows.
+    struct SplitTable {
+        schema: TableSchema,
+        leaves: Vec<Arc<dyn TableAm>>,
+    }
+
+    impl SplitTable {
+        fn new(name: &str, leaves: Vec<Arc<dyn TableAm>>) -> Arc<dyn TableAm> {
+            Arc::new(Self {
+                schema: TableSchema::new(name, vec![Column::new("id", PgType::Int4)]),
+                leaves,
+            })
+        }
+    }
+
+    impl TableAm for SplitTable {
+        fn schema(&self) -> &TableSchema {
+            &self.schema
+        }
+        fn storage_leaves(&self) -> Option<Vec<Arc<dyn TableAm>>> {
+            (!self.leaves.is_empty()).then(|| self.leaves.clone())
+        }
+        fn scan(&self, _txn: &crabgresql_storage_api::txn::TxnContext) -> crabgresql_storage_api::TupleStream {
+            Box::new(std::iter::empty())
+        }
+        fn fetch(
+            &self,
+            _tid: crabgresql_storage_api::Tid,
+            _txn: &crabgresql_storage_api::txn::TxnContext,
+        ) -> Result<Option<crabgresql_storage_api::Tuple>, crabgresql_storage_api::StorageError>
+        {
+            Ok(None)
+        }
+        fn insert(
+            &self,
+            _tuple: crabgresql_storage_api::Tuple,
+            _txn: &crabgresql_storage_api::txn::TxnContext,
+        ) -> Result<crabgresql_storage_api::Tid, crabgresql_storage_api::StorageError> {
+            unimplemented!("metadata-only test double")
+        }
+        fn update(
+            &self,
+            _tid: crabgresql_storage_api::Tid,
+            _tuple: crabgresql_storage_api::Tuple,
+            _txn: &crabgresql_storage_api::txn::TxnContext,
+        ) -> Result<crabgresql_storage_api::UpdateResult, crabgresql_storage_api::StorageError>
+        {
+            unimplemented!("metadata-only test double")
+        }
+        fn delete(
+            &self,
+            _tid: crabgresql_storage_api::Tid,
+            _txn: &crabgresql_storage_api::txn::TxnContext,
+        ) -> Result<crabgresql_storage_api::DeleteResult, crabgresql_storage_api::StorageError>
+        {
+            unimplemented!("metadata-only test double")
+        }
+    }
+
+    fn leaf_names(leaves: &[Arc<dyn TableAm>]) -> Vec<String> {
+        leaves.iter().map(|l| l.schema().name.clone()).collect()
+    }
+
+    #[test]
+    fn a_relation_without_storage_leaves_is_scanned_directly() {
+        let engine = engine_with_table();
+        let table = SplitTable::new("solo", Vec::new());
+        assert!(
+            scan_leaves(&engine, &table)
+                .expect("scan_leaves must not fail on a plain relation")
+                .is_none(),
+            "a monolithic relation must bind to a plain Scan, not a one-armed Append"
+        );
+    }
+
+    #[test]
+    fn storage_leaves_become_the_append_arms() {
+        let engine = engine_with_table();
+        let table = SplitTable::new(
+            "split",
+            vec![
+                SplitTable::new("split_chunks", Vec::new()),
+                SplitTable::new("split_buffer", Vec::new()),
+            ],
+        );
+        let leaves = scan_leaves(&engine, &table)
+            .expect("scan_leaves must not fail")
+            .expect("a relation reporting storage leaves must fan out");
+        // Order is the access method's, not sorted: a leaf order carries meaning
+        // (durable storage before the write buffer, say) that must survive.
+        assert_eq!(leaf_names(&leaves), vec!["split_chunks", "split_buffer"]);
+    }
+
+    #[test]
+    fn a_sql_partitions_storage_leaves_flatten_into_one_append() {
+        // A partitioned parent is identified by its schema, so build one whose
+        // single leaf itself splits, and confirm the result is one flat list
+        // rather than an Append of an Append.
+        let inner = SplitTable::new(
+            "part_2024",
+            vec![
+                SplitTable::new("part_2024_chunks", Vec::new()),
+                SplitTable::new("part_2024_buffer", Vec::new()),
+            ],
+        );
+        // `partition_leaves` reads the engine's catalog, so exercise the flatten
+        // directly on the expansion `scan_leaves` performs.
+        let flattened: Vec<Arc<dyn TableAm>> = match inner.storage_leaves() {
+            Some(leaves) => leaves,
+            None => vec![Arc::clone(&inner)],
+        };
+        assert_eq!(
+            leaf_names(&flattened),
+            vec!["part_2024_chunks", "part_2024_buffer"],
+            "a SQL partition that splits its storage must contribute its leaves, not itself"
         );
     }
 }

@@ -10627,6 +10627,12 @@ pub struct VacuumStatement {
     pub threshold: Option<ValueWithSpan>,
     /// Whether `BOOST` was specified.
     pub boost: bool,
+    /// Whether PostgreSQL's `FREEZE` was specified.
+    pub freeze: bool,
+    /// Whether PostgreSQL's `VERBOSE` was specified.
+    pub verbose: bool,
+    /// Whether PostgreSQL's `ANALYZE` was specified.
+    pub analyze: bool,
 }
 
 impl fmt::Display for VacuumStatement {

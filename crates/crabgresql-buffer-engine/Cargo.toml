@@ -1,5 +1,5 @@
 [package]
-name = "crabgresql-parquet-engine"
+name = "crabgresql-buffer-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,14 +8,11 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-arrow-array.workspace = true
-arrow-schema.workspace = true
-crabgresql-buffer-engine.workspace = true
 crabgresql-storage-api.workspace = true
 crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
 crabgresql-wal.workspace = true
-parquet.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

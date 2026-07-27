@@ -41,6 +41,10 @@ pub fn open_pg_engine(
     // and release the TRUNCATE table lock, on every finalize path.
     txnmgr.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
     let txnmgr = Arc::new(txnmgr);
+    // Only after the finalize hook is wired: `VACUUM` flushes a RAM write buffer
+    // by committing its own transaction, and a commit that fired before the hook
+    // existed would never promote the fragment it had just written.
+    engine.attach_txn_manager(Arc::clone(&txnmgr));
     Ok((engine as Arc<dyn TableEngine>, txnmgr))
 }
 

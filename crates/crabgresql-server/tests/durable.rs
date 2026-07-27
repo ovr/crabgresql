@@ -91,6 +91,158 @@ async fn crud_over_the_wire() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A committed `INSERT` into a Parquet relation is durable through the WAL alone:
+/// the row reads back immediately and survives a restart, while no Parquet file
+/// exists for it yet. That is the point of the write buffer — a stream of small
+/// inserts must not become a directory of tiny fragments.
+#[tokio::test]
+async fn a_committed_parquet_insert_is_durable_before_any_file_exists() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let parquet_files = || -> Vec<String> {
+        let mut names = Vec::new();
+        let root = dir.path().join("parquet");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return names;
+        };
+        for entry in entries.flatten() {
+            let Ok(inner) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for file in inner.flatten() {
+                names.push(file.file_name().to_string_lossy().into_owned());
+            }
+        }
+        names
+    };
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE TABLE events (id int4, label text) USING parquet")
+            .await?;
+        for id in 1..=5 {
+            client
+                .simple_query(&format!("INSERT INTO events VALUES ({id}, 'row {id}')"))
+                .await?;
+        }
+        let messages = client.simple_query("SELECT id FROM events").await?;
+        assert_eq!(rows(&messages).len(), 5);
+        assert!(
+            parquet_files().is_empty(),
+            "five separate inserts must not have produced five fragments: {:?}",
+            parquet_files()
+        );
+
+        // VACUUM is the explicit flush: five buffered rows become ONE chunk, and
+        // the rows read back identically across the move.
+        client.simple_query("VACUUM events").await?;
+        assert_eq!(
+            parquet_files().len(),
+            1,
+            "a flush must consolidate the batch into one fragment: {:?}",
+            parquet_files()
+        );
+        let messages = client
+            .simple_query("SELECT id FROM events ORDER BY id")
+            .await?;
+        let result = rows(&messages);
+        assert_eq!(
+            result.iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+            vec![Some("1"), Some("2"), Some("3"), Some("4"), Some("5")],
+            "a flush must not add, drop, or duplicate a row"
+        );
+
+        // Flushing again has nothing left to move.
+        client.simple_query("VACUUM events").await?;
+        assert_eq!(parquet_files().len(), 1, "an empty flush must write no file");
+        shutdown(client, handle).await;
+    }
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let messages = client
+            .simple_query("SELECT id FROM events ORDER BY id")
+            .await?;
+        let result = rows(&messages);
+        assert_eq!(
+            result.iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+            vec![Some("1"), Some("2"), Some("3"), Some("4"), Some("5")],
+            "every acknowledged row must come back from the WAL"
+        );
+        shutdown(client, handle).await;
+    }
+    Ok(())
+}
+
+/// A buffer table holds its rows only in RAM, so the WAL is its *entire*
+/// durability story: a committed row must come back after a restart even though
+/// no file ever held it, a rolled-back one must not, and recovery must resume
+/// row ids above every id the log mentions.
+#[tokio::test]
+async fn buffer_table_rows_survive_a_restart_through_the_wal_alone() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE TABLE staging (id int4, label text) USING buffer")
+            .await?;
+        client
+            .simple_query("INSERT INTO staging VALUES (1, 'committed'), (2, 'also committed')")
+            .await?;
+        // A committed delete must stay deleted across the restart.
+        client.simple_query("DELETE FROM staging WHERE id = 2").await?;
+        client.simple_query("BEGIN").await?;
+        client
+            .simple_query("INSERT INTO staging VALUES (3, 'rolled back')")
+            .await?;
+        client.simple_query("ROLLBACK").await?;
+        shutdown(client, handle).await;
+    }
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let messages = client
+            .simple_query("SELECT id, label FROM staging ORDER BY id")
+            .await?;
+        let result = rows(&messages);
+        assert_eq!(result.len(), 1, "only the committed, undeleted row may return");
+        assert_eq!(
+            (result[0].get(0), result[0].get(1)),
+            (Some("1"), Some("committed"))
+        );
+        // Writing after recovery must not collide with a recovered row id.
+        client
+            .simple_query("INSERT INTO staging VALUES (4, 'after restart')")
+            .await?;
+        let messages = client
+            .simple_query("SELECT id FROM staging ORDER BY id")
+            .await?;
+        assert_eq!(rows(&messages).len(), 2);
+        shutdown(client, handle).await;
+    }
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let messages = client
+            .simple_query("SELECT id FROM staging ORDER BY id")
+            .await?;
+        let result = rows(&messages);
+        assert_eq!(
+            result.iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+            vec![Some("1"), Some("4")],
+            "a second restart must replay to the same state, not accumulate"
+        );
+        shutdown(client, handle).await;
+    }
+    Ok(())
+}
+
 /// The durable engine's physical B-tree serves equality index scans end to end:
 /// `EXPLAIN` plans an Index Scan, the query returns the right row, and both the
 /// index and its correctness survive a restart (rebuilt from replayed WAL).

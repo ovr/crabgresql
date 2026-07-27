@@ -5028,6 +5028,327 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
     Ok(())
 }
 
+/// A Parquet relation is physically two stores — the immutable chunks and its RAM
+/// write buffer — so it plans as an `Append` over both. The leaves are not
+/// catalog relations, so each labels itself and neither appears in `pg_class`.
+#[tokio::test]
+async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves()
+-> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE p (id int4, label text) USING parquet")
+        .await?;
+    client.simple_query("INSERT INTO p VALUES (1, 'one')").await?;
+
+    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Append".to_string(),
+            "  ->  Seq Scan on p".to_string(),
+            "  ->  Buffer Scan on p".to_string(),
+        ],
+        "the two leaves must be distinguishable, not the same line twice"
+    );
+
+    // Splitting the relation across leaves must not cost the plan its predicate
+    // or its column names — both live on nodes above the Append.
+    client.simple_query("CREATE TABLE h (id int4, label text)").await?;
+    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p WHERE id = 1").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Append".to_string(),
+            "  Filter: (id = 1)".to_string(),
+            "  ->  Seq Scan on p".to_string(),
+            "  ->  Buffer Scan on p".to_string(),
+        ],
+        "a WHERE on a split relation must still be rendered, and by column name"
+    );
+    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p JOIN h ON p.id = h.id").await?;
+    assert!(
+        lines.iter().any(|line| line.contains("Hash Cond: (id = id)")),
+        "join keys over a split relation must render by name, not as $n: {lines:?}"
+    );
+
+    // The leaves are engine-internal: nothing new is addressable from SQL.
+    let messages = client
+        .simple_query("SELECT relname FROM pg_catalog.pg_class WHERE relname LIKE 'p%'")
+        .await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("p")],
+        "a storage leaf must not gain a pg_class row"
+    );
+    Ok(())
+}
+
+/// A committed TRUNCATE empties the relation outright, even when the truncating
+/// transaction holds a snapshot that predates rows another session committed —
+/// the durable and buffered halves must not disagree about what "all rows" means.
+#[tokio::test]
+async fn truncate_under_repeatable_read_leaves_no_rows_behind() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let truncater = connect(port).await;
+    let other = connect(port).await;
+    truncater
+        .simple_query("CREATE TABLE p (id int4) USING parquet")
+        .await?;
+    truncater.simple_query("INSERT INTO p VALUES (1)").await?;
+
+    // Pin the truncater's snapshot before the other session's row exists.
+    truncater
+        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    let messages = truncater.simple_query("SELECT id FROM p").await?;
+    assert_eq!(rows(&messages).len(), 1);
+
+    other.simple_query("INSERT INTO p VALUES (999)").await?;
+
+    truncater.simple_query("TRUNCATE p").await?;
+    truncater.simple_query("COMMIT").await?;
+
+    let messages = other.simple_query("SELECT id FROM p ORDER BY id").await?;
+    assert!(
+        rows(&messages).is_empty(),
+        "a committed TRUNCATE must leave no row behind, including one it could not see"
+    );
+    Ok(())
+}
+
+/// `VACUUM` is the explicit flush hook: it moves a Parquet relation's buffered
+/// rows into durable storage without changing what any reader sees, works on a
+/// heap table and bare, and refuses the forms it cannot honor.
+#[tokio::test]
+async fn vacuum_flushes_buffered_rows_without_changing_what_readers_see()
+-> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE p (id int4, label text) USING parquet")
+        .await?;
+    client.simple_query("CREATE TABLE h (id int4)").await?;
+    client
+        .simple_query("INSERT INTO p VALUES (1, 'one'), (2, 'two'), (3, NULL)")
+        .await?;
+    client.simple_query("INSERT INTO h VALUES (1)").await?;
+
+    let messages = client
+        .simple_query("SELECT id, label FROM p ORDER BY id")
+        .await?;
+    let before = rows(&messages)
+        .iter()
+        .map(|r| (r.get(0).map(str::to_string), r.get(1).map(str::to_string)))
+        .collect::<Vec<_>>();
+
+    client.simple_query("VACUUM p").await?;
+
+    let messages = client
+        .simple_query("SELECT id, label FROM p ORDER BY id")
+        .await?;
+    let after = rows(&messages)
+        .iter()
+        .map(|r| (r.get(0).map(str::to_string), r.get(1).map(str::to_string)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        before, after,
+        "moving rows from the buffer into a chunk must be invisible to a reader"
+    );
+
+    // A second flush has nothing to move, and further inserts still land and read
+    // back alongside the already-flushed rows.
+    client.simple_query("VACUUM p").await?;
+    client.simple_query("INSERT INTO p VALUES (4, 'four')").await?;
+    let messages = client.simple_query("SELECT id FROM p ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3"), Some("4")],
+        "a chunk and the buffer must read as one relation"
+    );
+
+    // Heap relations and the bare form are accepted; neither has anything to flush.
+    client.simple_query("VACUUM h").await?;
+    client.simple_query("VACUUM").await?;
+
+    // A flush is its own transaction, so it cannot run inside a block.
+    client.simple_query("BEGIN").await?;
+    let in_block = client
+        .simple_query("VACUUM p")
+        .await
+        .expect_err("VACUUM inside a transaction block must fail");
+    assert_eq!(
+        in_block.as_db_error().expect("database error").code().code(),
+        "25001"
+    );
+    client.simple_query("ROLLBACK").await?;
+
+    // PostgreSQL's own option spellings must be understood as options. Parsed as
+    // a table name instead, `VACUUM ANALYZE` reports 42P01 on a relation the user
+    // never wrote.
+    for sql in [
+        "VACUUM ANALYZE",
+        "VACUUM VERBOSE",
+        "VACUUM ANALYZE p",
+        "VACUUM (ANALYZE) p",
+        "VACUUM (VERBOSE, ANALYZE) p",
+    ] {
+        client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|error| panic!("`{sql}` must be accepted: {error}"));
+    }
+
+    // Inside a block, the transaction-block check must win over the unsupported
+    // -modifier check, as it does in PostgreSQL.
+    client.simple_query("BEGIN").await?;
+    let full_in_block = client
+        .simple_query("VACUUM FULL p")
+        .await
+        .expect_err("VACUUM inside a transaction block must fail");
+    assert_eq!(
+        full_in_block
+            .as_db_error()
+            .expect("database error")
+            .code()
+            .code(),
+        "25001",
+        "a transaction block is rejected before any option is inspected"
+    );
+    client.simple_query("ROLLBACK").await?;
+
+    // Modifiers that would change what VACUUM does must be stated gaps, not
+    // silently downgraded to a plain vacuum.
+    let full = client
+        .simple_query("VACUUM FULL p")
+        .await
+        .expect_err("VACUUM FULL must be reported as unsupported");
+    assert_eq!(
+        full.as_db_error().expect("database error").code().code(),
+        "0A000"
+    );
+
+    // A partitioned parent holds no rows of its own, matching ANALYZE.
+    client
+        .simple_query("CREATE TABLE part (id int4) PARTITION BY RANGE (id)")
+        .await?;
+    let parent = client
+        .simple_query("VACUUM part")
+        .await
+        .expect_err("VACUUM of a partitioned parent must fail");
+    assert_eq!(
+        parent.as_db_error().expect("database error").code().code(),
+        "0A000"
+    );
+    Ok(())
+}
+
+/// `USING buffer` is a first-class access method: a WAL-logged, RAM-resident
+/// table that supports the full mutable surface, reflects itself in `pg_am` and
+/// `pg_class.relam`, and rejects the forms that contradict "permanent, engine
+/// managed".
+#[tokio::test]
+async fn buffer_tables_are_fully_mutable_and_reflect_their_access_method()
+-> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE b (id int4 PRIMARY KEY, label text) USING buffer")
+        .await?;
+    client
+        .simple_query("INSERT INTO b VALUES (1, 'one'), (2, 'two'), (3, NULL)")
+        .await?;
+
+    let messages = client
+        .simple_query("SELECT id, label FROM b ORDER BY id")
+        .await?;
+    let result = rows(&messages);
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0].get("label"), Some("one"));
+    assert_eq!(result[2].get("label"), None);
+
+    // Unlike Parquet, a buffer table is mutable.
+    client
+        .simple_query("UPDATE b SET label = 'ONE' WHERE id = 1")
+        .await?;
+    client.simple_query("DELETE FROM b WHERE id = 3").await?;
+    let messages = client
+        .simple_query("SELECT id, label FROM b ORDER BY id")
+        .await?;
+    let result = rows(&messages);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].get("label"), Some("ONE"));
+
+    // The PRIMARY KEY is enforced by scanning the visible rows, as on Parquet.
+    let duplicate = client
+        .simple_query("INSERT INTO b VALUES (2, 'dup')")
+        .await
+        .expect_err("a duplicate key must be rejected");
+    assert_eq!(
+        duplicate.as_db_error().expect("database error").code().code(),
+        "23505"
+    );
+
+    // A rollback must undo everything, since the rows are MVCC versions and not
+    // an opaque RAM cache.
+    client.simple_query("BEGIN").await?;
+    client.simple_query("DELETE FROM b").await?;
+    assert!(rows(&client.simple_query("SELECT id FROM b").await?).is_empty());
+    client.simple_query("ROLLBACK").await?;
+    let messages = client.simple_query("SELECT id FROM b").await?;
+    assert_eq!(rows(&messages).len(), 2);
+
+    // A rolled-back DELETE leaves `xmax` set on every row; counting those as dead
+    // would report the relation permanently empty in pg_class.
+    client.simple_query("BEGIN").await?;
+    client.simple_query("DELETE FROM b").await?;
+    client.simple_query("ROLLBACK").await?;
+    client.simple_query("ANALYZE b").await?;
+    let messages = client
+        .simple_query(
+            "SELECT count(*)::int8 AS live, \
+             (SELECT reltuples::int8 FROM pg_catalog.pg_class WHERE relname = 'b') AS est FROM b",
+        )
+        .await?;
+    let counted = rows(&messages);
+    assert_eq!(
+        counted[0].get("est"),
+        counted[0].get("live"),
+        "reltuples must match the rows a scan returns after an aborted DELETE"
+    );
+
+    client.simple_query("TRUNCATE b").await?;
+    assert!(rows(&client.simple_query("SELECT id FROM b").await?).is_empty());
+
+    let messages = client
+        .simple_query(
+            "SELECT c.relam, a.amname FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_am a ON a.oid = c.relam WHERE c.relname = 'b'",
+        )
+        .await?;
+    let reflected = rows(&messages);
+    assert_eq!(reflected.len(), 1);
+    assert_eq!(reflected[0].get("relam"), Some("16001"));
+    assert_eq!(reflected[0].get("amname"), Some("buffer"));
+
+    // A buffer table is WAL-logged and permanent by definition, so the forms that
+    // ask for the opposite must be refused rather than quietly downgraded.
+    for sql in [
+        "CREATE TEMP TABLE temp_b (id int) USING buffer",
+        "CREATE UNLOGGED TABLE unlogged_b (id int) USING buffer",
+        "CREATE TABLE partitioned_b (id int) USING buffer PARTITION BY RANGE (id)",
+        "CREATE TABLE unsupported_b (value jsonb) USING buffer",
+    ] {
+        let error = client
+            .simple_query(sql)
+            .await
+            .expect_err("unsupported buffer table form must fail");
+        assert_eq!(
+            error.as_db_error().expect("database error").code().code(),
+            "0A000",
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
 /// TRUNCATE on a Parquet table is a transactional directory swap: it empties the
 /// table, a rollback brings every row back, reloading after it works, and it
 /// composes with heap tables in one multi-table statement.

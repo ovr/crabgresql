@@ -26,7 +26,7 @@ mod btrec;
 mod btredo;
 mod bufpool;
 mod catalog;
-mod datum;
+mod flush;
 mod heap;
 mod nbtree;
 mod page;
@@ -40,13 +40,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crabgresql_parquet_engine::{ParquetRedo, ParquetTable, RMGR_PARQUET, validate_schema};
+use crabgresql_buffer_engine::{BufferRedo, BufferTable, RMGR_BUFFER};
+use crabgresql_parquet_engine::{
+    BufferedParquetTable, ParquetRedo, ParquetTable, RMGR_PARQUET, validate_schema,
+};
 use crabgresql_storage_api::{
     DeleteResult, IndexMetadata, RelStats, RelationMetadata, RelfilenodeAllocator, SequenceAdvance,
     SequenceDefinition, StorageError, TableAccessMethod, TableAm, TableCapabilities, TableEngine,
     TableSchema, Tid, Tuple, TupleStream, UpdateResult, ViewDefinition,
 };
-use crabgresql_txn::{Clog, TxnContext, TxnFinalize, Xid};
+use crabgresql_txn::{Clog, TransactionManager, TxnContext, TxnFinalize, Xid};
 use crabgresql_types::Value;
 use crabgresql_wal::{
     ControlFile, RmgrId, RmgrRedo, RmgrRegistry, Wal, read_control, recover, write_control,
@@ -60,6 +63,7 @@ use crate::heap::HeapTable;
 use crate::redo::HeapRedo;
 use crate::smgr::StorageManager;
 
+pub use crate::flush::{BufferFlushPolicy, BufferedRelation};
 pub use crate::smgr::RelFileNode;
 
 /// A TRUNCATE swap replayed from the WAL during recovery, awaiting a verdict:
@@ -117,73 +121,75 @@ impl RelfilenodeAllocator for CatalogAllocator {
 /// One open relation, dispatched by its persisted table access method.
 enum ManagedTable {
     Heap(Arc<HeapTable>),
-    Parquet(Arc<ParquetTable>),
+    Parquet(Arc<BufferedParquetTable>),
+    Buffer(Arc<BufferTable>),
 }
 
 impl ManagedTable {
-    fn as_heap(&self) -> Option<&HeapTable> {
+    /// The concrete access method behind this relation.
+    ///
+    /// Every `TableAm` method forwards through here rather than matching per
+    /// method: the enum adds dispatch, never behavior, so one match is both the
+    /// whole implementation and the only place a newly added method has to be
+    /// taught about.
+    fn as_am(&self) -> &dyn TableAm {
         match self {
-            ManagedTable::Heap(table) => Some(table),
-            ManagedTable::Parquet(_) => None,
+            ManagedTable::Heap(table) => table.as_ref(),
+            ManagedTable::Parquet(table) => table.as_ref(),
+            ManagedTable::Buffer(table) => table.as_ref(),
         }
     }
 
-    fn as_parquet(&self) -> Option<&ParquetTable> {
+    fn as_heap(&self) -> Option<&HeapTable> {
         match self {
-            ManagedTable::Heap(_) => None,
+            ManagedTable::Heap(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    fn as_parquet(&self) -> Option<&BufferedParquetTable> {
+        match self {
             ManagedTable::Parquet(table) => Some(table),
+            _ => None,
         }
     }
 }
 
 impl TableAm for ManagedTable {
     fn schema(&self) -> &TableSchema {
-        match self {
-            ManagedTable::Heap(table) => table.schema(),
-            ManagedTable::Parquet(table) => table.schema(),
-        }
+        self.as_am().schema()
     }
 
     fn capabilities(&self) -> TableCapabilities {
-        match self {
-            ManagedTable::Heap(table) => table.capabilities(),
-            ManagedTable::Parquet(table) => table.capabilities(),
-        }
+        self.as_am().capabilities()
     }
 
     fn indexes(&self) -> Vec<IndexMetadata> {
-        match self {
-            ManagedTable::Heap(table) => table.indexes(),
-            ManagedTable::Parquet(table) => table.indexes(),
-        }
+        self.as_am().indexes()
     }
 
     fn statistics(&self) -> RelStats {
-        match self {
-            ManagedTable::Heap(table) => table.statistics(),
-            ManagedTable::Parquet(table) => table.statistics(),
-        }
+        self.as_am().statistics()
+    }
+
+    fn storage_leaves(&self) -> Option<Vec<Arc<dyn TableAm>>> {
+        self.as_am().storage_leaves()
+    }
+
+    fn scan_label(&self) -> String {
+        self.as_am().scan_label()
     }
 
     fn scan(&self, txn: &TxnContext) -> TupleStream {
-        match self {
-            ManagedTable::Heap(table) => table.scan(txn),
-            ManagedTable::Parquet(table) => table.scan(txn),
-        }
+        self.as_am().scan(txn)
     }
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
-        match self {
-            ManagedTable::Heap(table) => table.fetch(tid, txn),
-            ManagedTable::Parquet(table) => table.fetch(tid, txn),
-        }
+        self.as_am().fetch(tid, txn)
     }
 
     fn supports_index_scan(&self, index_name: &str) -> bool {
-        match self {
-            ManagedTable::Heap(table) => table.supports_index_scan(index_name),
-            ManagedTable::Parquet(table) => table.supports_index_scan(index_name),
-        }
+        self.as_am().supports_index_scan(index_name)
     }
 
     fn index_lookup(
@@ -192,17 +198,11 @@ impl TableAm for ManagedTable {
         key: &[Value],
         txn: &TxnContext,
     ) -> Option<Box<dyn Iterator<Item = (Tid, Tuple)> + Send>> {
-        match self {
-            ManagedTable::Heap(table) => table.index_lookup(index_name, key, txn),
-            ManagedTable::Parquet(table) => table.index_lookup(index_name, key, txn),
-        }
+        self.as_am().index_lookup(index_name, key, txn)
     }
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
-        match self {
-            ManagedTable::Heap(table) => table.insert(tuple, txn),
-            ManagedTable::Parquet(table) => table.insert(tuple, txn),
-        }
+        self.as_am().insert(tuple, txn)
     }
 
     fn insert_many(
@@ -210,10 +210,7 @@ impl TableAm for ManagedTable {
         tuples: Vec<Tuple>,
         txn: &TxnContext,
     ) -> Result<Vec<Tid>, StorageError> {
-        match self {
-            ManagedTable::Heap(table) => table.insert_many(tuples, txn),
-            ManagedTable::Parquet(table) => table.insert_many(tuples, txn),
-        }
+        self.as_am().insert_many(tuples, txn)
     }
 
     fn update(
@@ -222,17 +219,11 @@ impl TableAm for ManagedTable {
         tuple: Tuple,
         txn: &TxnContext,
     ) -> Result<UpdateResult, StorageError> {
-        match self {
-            ManagedTable::Heap(table) => table.update(tid, tuple, txn),
-            ManagedTable::Parquet(table) => table.update(tid, tuple, txn),
-        }
+        self.as_am().update(tid, tuple, txn)
     }
 
     fn delete(&self, tid: Tid, txn: &TxnContext) -> Result<DeleteResult, StorageError> {
-        match self {
-            ManagedTable::Heap(table) => table.delete(tid, txn),
-            ManagedTable::Parquet(table) => table.delete(tid, txn),
-        }
+        self.as_am().delete(tid, txn)
     }
 
     fn update_many(
@@ -240,31 +231,19 @@ impl TableAm for ManagedTable {
         updates: Vec<(Tid, Tuple)>,
         txn: &TxnContext,
     ) -> Result<u64, StorageError> {
-        match self {
-            ManagedTable::Heap(table) => table.update_many(updates, txn),
-            ManagedTable::Parquet(table) => table.update_many(updates, txn),
-        }
+        self.as_am().update_many(updates, txn)
     }
 
     fn delete_many(&self, tids: Vec<Tid>, txn: &TxnContext) -> Result<u64, StorageError> {
-        match self {
-            ManagedTable::Heap(table) => table.delete_many(tids, txn),
-            ManagedTable::Parquet(table) => table.delete_many(tids, txn),
-        }
+        self.as_am().delete_many(tids, txn)
     }
 
     fn truncate(&self, txn: &TxnContext) -> Result<(), StorageError> {
-        match self {
-            ManagedTable::Heap(table) => table.truncate(txn),
-            ManagedTable::Parquet(table) => table.truncate(txn),
-        }
+        self.as_am().truncate(txn)
     }
 
     fn vacuum(&self, oldest: Xid, clog: &Clog) {
-        match self {
-            ManagedTable::Heap(table) => table.vacuum(oldest, clog),
-            ManagedTable::Parquet(table) => table.vacuum(oldest, clog),
-        }
+        self.as_am().vacuum(oldest, clog)
     }
 }
 
@@ -289,6 +268,9 @@ pub struct PgEngine {
     /// The Parquet redo handler, kept so [`PgEngine::apply_recovered_truncates`]
     /// can drain the directory swaps replay collected.
     parquet_redo: Arc<ParquetRedo>,
+    /// The buffer-table redo handler, kept so [`PgEngine::restore_buffers`] can
+    /// drain the rows replay rebuilt.
+    buffer_redo: Arc<BufferRedo>,
     /// Open table handles keyed by `(namespace, name)`. Unqualified tables live
     /// in `public`; a heap TRUNCATE threads a bare name through the WAL and so is
     /// only ever reconciled for `public` (a Parquet record carries its namespace).
@@ -297,6 +279,23 @@ pub struct PgEngine {
     /// floor at a clean shutdown (recovery recomputes the exact value from the WAL,
     /// so this only needs to be a valid lower bound).
     last_next_xid: AtomicU64,
+    /// The transaction service, attached after construction.
+    ///
+    /// Flushing a RAM write buffer into durable storage is a real transaction —
+    /// it allocates an XID, stamps both halves with it, and commits — so the
+    /// engine needs the manager. But the manager is built *from* this engine's
+    /// recovered CLOG, so it cannot be a constructor argument; see
+    /// [`PgEngine::attach_txn_manager`].
+    ///
+    /// Held **weakly**: the manager already owns this engine through its finalize
+    /// hook, so a strong handle here would close a reference cycle and neither
+    /// would ever be dropped — leaking the data directory's file handles and
+    /// leaving the flush worker running against a directory nobody is using.
+    txnmgr: std::sync::OnceLock<std::sync::Weak<TransactionManager>>,
+    /// The background flush thread, present once a transaction manager is
+    /// attached. Tests that build an engine by hand never attach one, so they get
+    /// no thread and stay deterministic.
+    flush_worker: Mutex<Option<crate::flush::FlushWorker>>,
 }
 
 impl PgEngine {
@@ -333,6 +332,11 @@ impl PgEngine {
         );
         let parquet_redo = Arc::new(ParquetRedo::new(data_dir));
         registry.register(RMGR_PARQUET, Arc::clone(&parquet_redo) as Arc<dyn RmgrRedo>);
+        // Registered before `recover` runs, and kept so `restore_buffers` can
+        // install each relation's replayed rows once the CLOG is rebuilt. A
+        // buffer table holds nothing on disk, so the log is its only source.
+        let buffer_redo = Arc::new(BufferRedo::new());
+        registry.register(RMGR_BUFFER, Arc::clone(&buffer_redo) as Arc<dyn RmgrRedo>);
         let relfilenodes: Arc<dyn RelfilenodeAllocator> =
             Arc::new(CatalogAllocator(Arc::clone(&catalog)));
 
@@ -353,6 +357,17 @@ impl PgEngine {
                     }
                     ManagedTable::Heap(table)
                 }
+                TableAccessMethod::Buffer => {
+                    // Opens empty: every row comes back from the WAL in
+                    // `restore_buffers`, after recovery rebuilds the CLOG.
+                    let indexes = indexes.into_iter().map(|(index, _)| index).collect();
+                    ManagedTable::Buffer(Arc::new(BufferTable::open(
+                        rel.0,
+                        schema,
+                        indexes,
+                        Arc::clone(&wal),
+                    )))
+                }
                 TableAccessMethod::Parquet => {
                     let indexes = indexes.into_iter().map(|(index, _)| index).collect();
                     // A relation that cannot be opened must not take the whole
@@ -366,13 +381,23 @@ impl PgEngine {
                     match ParquetTable::open(
                         data_dir,
                         rel.0,
-                        schema,
-                        indexes,
+                        schema.clone(),
+                        Vec::new(),
                         Arc::clone(&wal),
                         Arc::clone(&relfilenodes),
                     ) {
-                        Ok(table) => {
-                            let table = Arc::new(table);
+                        Ok(chunks) => {
+                            // The buffer opens empty and is filled from the WAL by
+                            // `restore_buffers`, below in the startup sequence.
+                            let buffer = BufferTable::open(
+                                rel.0,
+                                schema.clone(),
+                                Vec::new(),
+                                Arc::clone(&wal),
+                            )
+                            .as_write_buffer_of(&schema.name);
+                            let table =
+                                Arc::new(BufferedParquetTable::open(chunks, buffer, indexes));
                             if let Some((relpages, reltuples)) = analyzed {
                                 table.set_analyzed(relpages, reltuples);
                             }
@@ -398,6 +423,9 @@ impl PgEngine {
             catalog,
             relfilenodes,
             parquet_redo,
+            buffer_redo,
+            txnmgr: std::sync::OnceLock::new(),
+            flush_worker: Mutex::new(None),
             tables: RwLock::new(tables),
             last_next_xid: AtomicU64::new(0),
         })
@@ -433,6 +461,10 @@ impl PgEngine {
         // the rest), reclaim orphaned staging files.
         engine.apply_recovered_truncates(&clog);
         engine.recover_parquet_fragments(&clog);
+        // A buffer table has no file to reconcile: its rows exist only in the WAL
+        // until now. Runs after the truncate resolution so a relation whose
+        // storage was swapped is already on its final generation.
+        engine.restore_buffers(&clog);
         engine.gc_orphan_relfiles()?;
         engine.gc_orphan_parquet_dirs()?;
         // After a crash, an unlogged relation's WAL-skipped pages may be torn — the
@@ -446,11 +478,138 @@ impl PgEngine {
         Ok((engine, clog, res.next_xid))
     }
 
+    /// Install the buffer-table rows replay rebuilt.
+    ///
+    /// The whole WAL is replayed before this runs, so the CLOG is complete and
+    /// each relation can keep exactly the rows a future snapshot could see. A
+    /// relation the log never mentions simply stays empty.
+    fn restore_buffers(&self, clog: &Clog) {
+        for table in self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .values()
+        {
+            // Both a standalone `USING buffer` relation and the write buffer of a
+            // Parquet relation are rebuilt here — they are the same component, and
+            // missing the second would silently drop every committed row that had
+            // not yet been flushed to a chunk.
+            let buffer = match table.as_ref() {
+                ManagedTable::Buffer(buffer) => buffer.as_ref(),
+                ManagedTable::Parquet(parquet) => parquet.buffer().as_ref(),
+                ManagedTable::Heap(_) => continue,
+            };
+            if let Some(restored) = self.buffer_redo.take(buffer.relfilenode()) {
+                buffer.restore(restored, clog);
+            }
+        }
+        // Anything still held belongs to a relfilenode no open relation names — a
+        // superseded TRUNCATE generation or a dropped relation. Freeing it here is
+        // the only chance: `take` is keyed by relfilenode and nothing else ever
+        // visits these entries.
+        self.buffer_redo.discard_unclaimed();
+    }
+
     /// Flush all dirty pages to their relation files (obeying the write-ahead
     /// rule) and record a **running** (not-cleanly-shut-down) control file, so a
     /// crash after this leaves `clean_shutdown = false` and the next startup resets
     /// unlogged relations. A clean exit calls [`TableEngine::shutdown`], which marks
     /// it clean instead.
+    /// Hand the engine the transaction service its storage-maintenance work
+    /// needs, once.
+    ///
+    /// `VACUUM` on a relation with a RAM write buffer flushes it by running an
+    /// independent transaction: allocate an XID, write the chunk and tombstone
+    /// the buffered rows under it, commit. That needs the manager — and the
+    /// manager is built from the CLOG this engine recovered, so the dependency
+    /// only closes after both exist.
+    ///
+    /// Must be called after the manager's finalize hook is wired: a flush that
+    /// committed first would never promote its own `.pending` fragment. Calling
+    /// it twice is a no-op, and an engine that never gets a manager simply
+    /// reports `VACUUM` as unavailable rather than misbehaving.
+    pub fn attach_txn_manager(self: &Arc<Self>, txnmgr: Arc<TransactionManager>) {
+        if self.txnmgr.set(Arc::downgrade(&txnmgr)).is_err() {
+            return;
+        }
+        // Give every buffer the CLOG, so `statistics()` — which gets no
+        // `TxnContext` — can tell a row deleted by a committed transaction from
+        // one whose deleter aborted. `create_table` does the same for relations
+        // created later.
+        for table in self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .values()
+        {
+            Self::attach_clog_to(table, txnmgr.clog());
+        }
+        let worker = crate::flush::FlushWorker::spawn(
+            Arc::downgrade(self),
+            BufferFlushPolicy::from_env(),
+        );
+        *self
+            .flush_worker
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned")) = Some(worker);
+    }
+
+    /// Hand `table`'s RAM buffer the CLOG, if it has one.
+    fn attach_clog_to(table: &ManagedTable, clog: &Arc<Clog>) {
+        match table {
+            ManagedTable::Parquet(parquet) => parquet.buffer().attach_clog(Arc::clone(clog)),
+            ManagedTable::Buffer(buffer) => buffer.attach_clog(Arc::clone(clog)),
+            ManagedTable::Heap(_) => {}
+        }
+    }
+
+    /// Every relation currently holding rows in a RAM write buffer.
+    ///
+    /// The flush worker reads this instead of keeping its own registry: the
+    /// engine's table map already *is* the registry, and a second one would only
+    /// be something to keep in sync.
+    pub fn buffered_relations(&self) -> Vec<BufferedRelation> {
+        self.tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .iter()
+            .filter_map(|((namespace, name), table)| {
+                // Both a Parquet relation's write buffer and a standalone
+                // `USING buffer` relation belong here. The latter has nowhere to
+                // flush to, but `vacuum_table` still reclaims its dead versions —
+                // and without that its memory only ever grows, which is the exact
+                // failure this worker exists to prevent.
+                let (rel, bytes) = match table.as_ref() {
+                    ManagedTable::Parquet(parquet) => {
+                        (parquet.relfilenode(), parquet.buffer().resident_bytes())
+                    }
+                    ManagedTable::Buffer(buffer) => {
+                        (buffer.relfilenode(), buffer.resident_bytes())
+                    }
+                    ManagedTable::Heap(_) => return None,
+                };
+                (bytes > 0).then(|| BufferedRelation {
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    rel,
+                    bytes,
+                })
+            })
+            .collect()
+    }
+
+    /// Flush one relation's buffer, choosing the reclamation horizon itself.
+    /// The worker's entry point; `VACUUM` reaches the same work through
+    /// [`TableEngine::vacuum_table`].
+    pub fn flush_buffer(&self, namespace: &str, name: &str) -> Result<u64, StorageError> {
+        let Some(txnmgr) = self.txnmgr.get().and_then(std::sync::Weak::upgrade) else {
+            return Err(StorageError::UnsupportedOperation(
+                "no transaction service is attached".to_string(),
+            ));
+        };
+        self.vacuum_table(namespace, name, txnmgr.reclaim_horizon())
+    }
+
     pub fn checkpoint(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
         self.write_control_file(next_xid, false)
     }
@@ -605,11 +764,15 @@ impl PgEngine {
                 let stale = match handle.as_ref() {
                     ManagedTable::Heap(t) => t.relfilenode() != live,
                     ManagedTable::Parquet(t) => t.relfilenode() != live.0,
+                    // A buffer table owns no physical relation to swap: TRUNCATE
+                    // is MVCC tombstones, so there is nothing to repoint.
+                    ManagedTable::Buffer(_) => false,
                 };
                 if !stale {
                     continue;
                 }
                 match handle.as_ref() {
+                    ManagedTable::Buffer(_) => unreachable!("a buffer table is never stale"),
                     ManagedTable::Heap(t) => t.rebind(live),
                     ManagedTable::Parquet(t) => {
                         if let Err(error) = t.rebind(live.0) {
@@ -876,16 +1039,19 @@ impl PgEngine {
 
 impl TableEngine for PgEngine {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
-        if schema.access_method == TableAccessMethod::Parquet {
+        // The server rejects these at bind time for the message; re-asserting them
+        // here makes them invariants of the engine rather than of one caller.
+        if schema.access_method.is_engine_managed() {
+            let method = schema.access_method.as_str();
             if schema.persistence != crabgresql_storage_api::RelPersistence::Permanent {
-                return Err(StorageError::UnsupportedOperation(
-                    "table access method \"parquet\" only supports permanent tables".to_string(),
-                ));
+                return Err(StorageError::UnsupportedOperation(format!(
+                    "table access method \"{method}\" only supports permanent tables"
+                )));
             }
             if schema.partition_scheme.is_some() || schema.partition_of.is_some() {
-                return Err(StorageError::UnsupportedOperation(
-                    "table access method \"parquet\" does not support partitioning".to_string(),
-                ));
+                return Err(StorageError::UnsupportedOperation(format!(
+                    "table access method \"{method}\" does not support partitioning"
+                )));
             }
             validate_schema(&schema)?;
         }
@@ -916,16 +1082,35 @@ impl TableEngine for PgEngine {
                 schema,
                 Vec::new(),
             ))),
+            TableAccessMethod::Buffer => ManagedTable::Buffer(Arc::new(BufferTable::open(
+                rel.0,
+                schema,
+                Vec::new(),
+                Arc::clone(&self.inner.wal),
+            ))),
             TableAccessMethod::Parquet => {
                 match ParquetTable::open(
                     &self.data_dir,
                     rel.0,
-                    schema,
+                    schema.clone(),
                     Vec::new(),
                     Arc::clone(&self.inner.wal),
                     Arc::clone(&self.relfilenodes),
                 ) {
-                    Ok(table) => ManagedTable::Parquet(Arc::new(table)),
+                    Ok(chunks) => {
+                        let buffer = BufferTable::open(
+                            rel.0,
+                            schema.clone(),
+                            Vec::new(),
+                            Arc::clone(&self.inner.wal),
+                        )
+                        .as_write_buffer_of(&schema.name);
+                        ManagedTable::Parquet(Arc::new(BufferedParquetTable::open(
+                            chunks,
+                            buffer,
+                            Vec::new(),
+                        )))
+                    }
                     Err(error) => {
                         let _ = self.catalog.remove_in(&namespace, &name);
                         return Err(error);
@@ -934,6 +1119,12 @@ impl TableEngine for PgEngine {
             }
         };
         let table = Arc::new(table);
+        // A relation created after the transaction service was attached must get
+        // the CLOG too, or `statistics()` — which has no `TxnContext` — cannot tell
+        // a committed delete from a rolled-back one and reports the relation empty.
+        if let Some(txnmgr) = self.txnmgr.get().and_then(std::sync::Weak::upgrade) {
+            Self::attach_clog_to(&table, txnmgr.clog());
+        }
         tables.insert((namespace, name), Arc::clone(&table));
         Ok(table as Arc<dyn TableAm>)
     }
@@ -962,12 +1153,23 @@ impl TableEngine for PgEngine {
                 heap.set_analyzed(stats.relpages, stats.reltuples);
                 stats
             }
+            ManagedTable::Buffer(buffer) => {
+                // Rows are in memory, so the "estimate" is an exact count and
+                // there is nothing to measure or cache.
+                buffer.statistics()
+            }
             ManagedTable::Parquet(parquet) => {
                 // Size and rows come from one directory under one shared hold, so an
                 // ANALYZE inside an uncommitted TRUNCATE cannot pair the staged
                 // directory's row count with the old one's page count. Measuring
                 // (rather than reading `statistics()`) is what keeps relpages from
                 // being pinned to the first ANALYZE's value forever.
+                //
+                // Only the durable half is measured, cached, and persisted:
+                // `statistics()` adds the buffer's live row count on top, and
+                // `PgEngine::new` re-seeds this cache from the catalog at every
+                // boot — so a persisted figure that already counted buffered rows
+                // would be added to them a second time after a restart.
                 let (relpages, reltuples) = parquet.measure(txn)?;
                 // Tagged with the measuring transaction: if it rolls back, the
                 // fragments it sized are unlinked and the result goes with them.
@@ -986,7 +1188,59 @@ impl TableEngine for PgEngine {
         Ok(())
     }
 
+    fn vacuum_table(
+        &self,
+        namespace: &str,
+        name: &str,
+        oldest: Xid,
+    ) -> Result<u64, StorageError> {
+        let Some(txnmgr) = self.txnmgr.get().and_then(std::sync::Weak::upgrade) else {
+            return Err(StorageError::UnsupportedOperation(
+                "VACUUM is unavailable: this engine has no transaction service".to_string(),
+            ));
+        };
+        // Resolve and release the map lock before doing any work: a flush commits,
+        // and the commit hook walks every open table, so holding a read guard
+        // across it would nest two locks for no reason.
+        let table = {
+            let tables = self
+                .tables
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            tables
+                .get(&(namespace.to_string(), name.to_string()))
+                .cloned()
+                .ok_or_else(|| StorageError::TableNotFound(name.to_string()))?
+        };
+        match table.as_ref() {
+            // A relation whose rows are buffered in RAM becomes durable-as-a-file
+            // here; this is the only path that turns many small writes into one
+            // chunk on demand.
+            ManagedTable::Parquet(parquet) => parquet.flush(&txnmgr),
+            ManagedTable::Heap(heap) => {
+                heap.vacuum(oldest, txnmgr.clog());
+                Ok(0)
+            }
+            ManagedTable::Buffer(buffer) => {
+                // A standalone buffer table has nowhere to flush to, so vacuuming
+                // it means only reclaiming versions no snapshot can still see.
+                buffer.vacuum(oldest, txnmgr.clog());
+                Ok(0)
+            }
+        }
+    }
+
     fn shutdown(&self) {
+        // Stop the background worker first, so no flush is mid-write while the
+        // control file is being marked clean.
+        if let Some(worker) = self
+            .flush_worker
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .take()
+        {
+            worker.stop_and_join();
+        }
         // Flush everything and mark the control file clean, so the next startup
         // keeps unlogged relations' data. Reuse the last checkpoint's next_xid — a
         // valid floor; recovery recomputes the exact value from the WAL.
@@ -1102,6 +1356,7 @@ impl TableEngine for PgEngine {
         match target.as_ref() {
             ManagedTable::Heap(heap) => heap.build_index(index.clone(), index_rel),
             ManagedTable::Parquet(parquet) => parquet.add_index(index.clone()),
+            ManagedTable::Buffer(buffer) => buffer.add_index(index.clone()),
         }
         self.catalog
             .add_index_in(namespace, table, index, index_rel)
@@ -1142,6 +1397,14 @@ impl TableEngine for PgEngine {
                 {
                     self.inner.discard_relfile(rel);
                 }
+            }
+            ManagedTable::Buffer(buffer) => {
+                self.catalog
+                    .remove_index_in(namespace, table, index_name)
+                    .expect("relation catalog write failed");
+                // No physical index relation to reclaim: a buffer index is
+                // metadata only, so `index_rel` was never allocated.
+                buffer.remove_index(index_name);
             }
             ManagedTable::Parquet(parquet) => {
                 let rel = self

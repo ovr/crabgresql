@@ -21,6 +21,10 @@
 //! open transaction and discard fragments that transaction had already staged. The
 //! fix is transaction-scoped table locks in the engine, not per-AM bookkeeping.
 
+mod buffered;
+
+pub use buffered::BufferedParquetTable;
+
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -39,8 +43,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, RelStats, RelfilenodeAllocator, StorageError, TableAm,
-    TableCapabilities, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
+    DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats, RelfilenodeAllocator, StorageError,
+    TableAm, TableCapabilities, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     CommandId, Infomask, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, Xid,
@@ -118,11 +122,19 @@ pub fn supports_type(ty: PgType) -> bool {
     )
 }
 
+/// Reject a schema this format cannot represent.
+///
+/// The error names `schema.access_method` rather than a hard-coded "parquet"
+/// because the buffer table shares this whitelist: a row a buffer accepts must
+/// always be convertible to a fragment, or a flush would fail long after the
+/// `INSERT` that should have been rejected. One whitelist keeps that true, and
+/// naming the relation's own method keeps the message honest.
 pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
     if let Some(column) = schema.columns.iter().find(|column| !supports_type(column.ty)) {
         return Err(StorageError::UnsupportedType(format!(
-            "data type {} is not supported by table access method \"parquet\"",
-            column.ty.name()
+            "data type {} is not supported by table access method \"{}\"",
+            column.ty.name(),
+            schema.access_method.as_str(),
         )));
     }
     Ok(())
@@ -605,9 +617,14 @@ fn parse_fragment(path: PathBuf) -> Result<Option<Fragment>, StorageError> {
         },
     };
     let mut parts = base.split('-');
+    // A fragment block is a physical tid address, so the logical-row-id flag must
+    // be clear (see `TID_LOGICAL_FLAG`). Rejecting it here, at the one place a
+    // block number is read off disk, keeps a hand-edited or future-format name
+    // from producing tids that `fetch` would route to the wrong storage.
     let block = parts
         .next()
         .and_then(|value| u32::from_str_radix(value, 16).ok())
+        .filter(|block| *block <= MAX_PHYSICAL_BLOCK)
         .ok_or_else(|| corrupt(format!("invalid Parquet fragment filename \"{name}\"")))?;
     let xid = parts
         .next()
@@ -880,7 +897,7 @@ impl ParquetTable {
 
     /// The relfilenode `xid` should read and write: the directory staged by its own
     /// TRUNCATE, else the committed one.
-    fn effective_rel(&self, xid: Xid) -> u32 {
+    pub fn effective_rel(&self, xid: Xid) -> u32 {
         if self.has_pending.load(Ordering::Acquire)
             && let Some(p) = self
                 .pending
@@ -1604,8 +1621,12 @@ impl TableAm for ParquetTable {
         let mut tids = Vec::with_capacity(tuples.len());
         for chunk in tuples.chunks(MAX_FRAGMENT_ROWS) {
             let block = *next;
+            // A fragment block is a physical address, so it must stay below the
+            // logical-tid flag (see `TID_LOGICAL_FLAG`) — past it, a fragment tid
+            // would read as a logical row id and `fetch` would route it wrong.
             *next = next
                 .checked_add(1)
+                .filter(|next| *next <= MAX_PHYSICAL_BLOCK)
                 .ok_or_else(|| io_error("allocate Parquet fragment", "fragment id exhausted"))?;
             let (temp, pending) = match self.write_fragment(rel, &dir, block, chunk, txn) {
                 Ok(paths) => paths,

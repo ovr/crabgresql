@@ -446,11 +446,29 @@ without upgrading to the V2 metadata representation.
 A scan pins a manifest generation and a transaction snapshot, prunes chunks
 using partition bounds and chunk statistics, and reads the remaining row groups
 with projection and predicate pushdown where semantics permit. It also scans
-snapshot-visible rows through the relation's `BufferTable`. Moving rows from
-the buffer table to a chunk while a scan is running cannot create duplicates:
-the scan's pinned generation records a covered-LSN watermark, and its buffer
-read view includes only rows not covered by that watermark. Those two values
-define one read view even if publication and buffer cleanup happen concurrently.
+snapshot-visible rows through the relation's `BufferTable`.
+
+Moving rows from the buffer table to a chunk while a scan is running must not
+create duplicates or omissions. **The implemented mechanism is a flush
+transaction, not a watermark.** A flush allocates its own XID `X_f`, writes the
+chunk stamped `xmin = X_f`, stamps the copied buffer rows `xmax = X_f`, and
+commits — so one CLOG entry decides both halves. `Snapshot::in_progress` reports
+`true` for any XID at or above a snapshot's `xmax`, which fixes a reader's
+verdict on `X_f` at the moment its snapshot is taken and makes it immune to when
+the flush commits. Every reader therefore sees each row either in the buffer or
+in the chunk, never both and never neither, whatever the interleaving. Ordinary
+`satisfies_mvcc` does the whole job: no covered-LSN watermark, no pinned
+generation, and no coordination between the two leaf scans beyond sharing one
+`TxnContext`.
+
+This is what lets the two stores be planned as independent `Append` leaves
+(§2.1's storage partitions, made visible to the planner through
+`TableAm::storage_leaves`) rather than hidden behind one merging scan. Its one
+obligation is retention: the buffer copy must survive until `VACUUM` proves no
+snapshot still needs it, so a flush may not reclaim eagerly. A covered-LSN
+watermark remains the right mechanism for **WAL recycling** — deciding when a
+`BUFFER_APPEND` record is no longer needed for recovery — which is a separate
+question from read visibility.
 
 Physical chunk order does not imply SQL result order; a query still needs
 `ORDER BY`. The layout order exists for range pruning, compression,
