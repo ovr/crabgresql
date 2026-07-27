@@ -55,6 +55,26 @@ What exists today:
 Tests: `cargo test` — unit tests per crate plus end-to-end tests that drive a
 real driver (tokio-postgres) and raw-socket handshake checks.
 
+## Configuration
+
+Every environment variable the server reads is declared in one place,
+[`crabgresql-config`](crates/crabgresql-config/src/lib.rs); a value that does
+not parse falls back to its default rather than failing startup.
+
+| Variable | Default | Controls |
+| --- | --- | --- |
+| `CRABGRESQL_PORT` | `5433` | TCP port to listen on (also `--port`) |
+| `PGDATA` | `./pgdata` | data directory the durable heap engine is opened in (also `--data-dir`) |
+| `RUST_LOG` | `info` | tracing filter directives |
+| `CRABGRESQL_BUFFER_TABLE_SOFT_BYTES` | `33554432` | per-relation buffered bytes that make one write buffer flush-eligible |
+| `CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES` | `268435456` | buffered bytes across all relations that make every buffer eligible |
+| `CRABGRESQL_BUFFER_MAX_AGE_MS` | `60000` | how long a write buffer may hold rows before being flushed anyway |
+| `CRABGRESQL_BUFFER_TICK_MS` | `1000` | how often the background flush worker looks for eligible buffers |
+
+The `CRABGRESQL_BUFFER_*` knobs are environment variables rather than GUCs
+because a `SET` is session-scoped and the flush worker is process-wide; moving
+them to real storage settings is a follow-up.
+
 ## PostgreSQL regression tests
 
 The PostgreSQL regression corpus (`src/test/regress`, pinned to a master

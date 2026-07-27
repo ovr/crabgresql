@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 crabgresql-binder.workspace = true
 crabgresql-catalog.workspace = true
+crabgresql-config.workspace = true
 crabgresql-executor.workspace = true
 crabgresql-planner.workspace = true
 crabgresql-parser.workspace = true

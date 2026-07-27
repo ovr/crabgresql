@@ -12,6 +12,7 @@ license = "Apache-2.0"
 crabgresql-binder = { path = "crates/crabgresql-binder" }
 crabgresql-buffer-engine = { path = "crates/crabgresql-buffer-engine" }
 crabgresql-catalog = { path = "crates/crabgresql-catalog" }
+crabgresql-config = { path = "crates/crabgresql-config" }
 crabgresql-executor = { path = "crates/crabgresql-executor" }
 crabgresql-planner = { path = "crates/crabgresql-planner" }
 crabgresql-parser = { path = "crates/crabgresql-parser" }
