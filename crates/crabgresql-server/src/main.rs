@@ -1,10 +1,8 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use crabgresql_config as config;
 use tokio::net::TcpListener;
-
-/// Data directory used when neither `--data-dir` nor `PGDATA` is given.
-const DEFAULT_DATA_DIR: &str = "./pgdata";
 
 /// crabgresql — a PostgreSQL-compatible server.
 #[derive(Parser)]
@@ -12,12 +10,12 @@ const DEFAULT_DATA_DIR: &str = "./pgdata";
 struct Cli {
     /// Port to listen on. Defaults one above PG's 5432 so a local PostgreSQL can
     /// keep running.
-    #[arg(long, short = 'p', env = "CRABGRESQL_PORT", default_value_t = 5433)]
+    #[arg(long, short = 'p', env = config::PORT, default_value_t = config::DEFAULT_PORT)]
     port: u16,
 
     /// Data directory (PGDATA). The durable heap engine is opened here and crash
     /// recovery runs at startup. Defaults to `./pgdata` when omitted.
-    #[arg(long = "data-dir", short = 'D', env = "PGDATA", default_value = DEFAULT_DATA_DIR)]
+    #[arg(long = "data-dir", short = 'D', env = config::DATA_DIR, default_value = config::DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
 }
 
@@ -25,7 +23,8 @@ struct Cli {
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_env(config::LOG_FILTER)
+                .unwrap_or_else(|_| config::DEFAULT_LOG_FILTER.into()),
         )
         .init();
 

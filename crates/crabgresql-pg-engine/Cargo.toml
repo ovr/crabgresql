@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 crabgresql-buffer-engine.workspace = true
+crabgresql-config.workspace = true
 crabgresql-parquet-engine.workspace = true
 crabgresql-storage-api.workspace = true
 crabgresql-txn.workspace = true

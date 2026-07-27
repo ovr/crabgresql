@@ -15,6 +15,8 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crabgresql_config as config;
+
 use crate::PgEngine;
 
 /// When a relation's buffered rows should become a durable chunk.
@@ -36,10 +38,10 @@ pub struct BufferFlushPolicy {
 impl Default for BufferFlushPolicy {
     fn default() -> Self {
         BufferFlushPolicy {
-            table_soft_bytes: 32 * 1024 * 1024,
-            global_hard_bytes: 256 * 1024 * 1024,
-            max_age: Duration::from_secs(60),
-            tick: Duration::from_secs(1),
+            table_soft_bytes: config::BUFFER_TABLE_SOFT_BYTES.default,
+            global_hard_bytes: config::BUFFER_GLOBAL_HARD_BYTES.default,
+            max_age: config::BUFFER_MAX_AGE.default,
+            tick: config::BUFFER_TICK.default,
         }
     }
 }
@@ -50,33 +52,20 @@ impl BufferFlushPolicy {
     /// Environment variables rather than GUCs because `SET` is session-scoped and
     /// there is no storage-settings plumbing yet; a per-session knob for a
     /// process-wide background thread would be misleading. Moving these to real
-    /// GUCs is a follow-up.
+    /// GUCs is a follow-up. The names, defaults and accepted ranges live in
+    /// `crabgresql-config` with every other environment variable.
+    ///
+    /// A value we cannot use as written is corrected — clamped into range, or
+    /// replaced by the default when it does not parse — and the correction is
+    /// logged, since a knob that silently does something other than what it
+    /// was set to is worse than one that is ignored loudly.
     pub fn from_env() -> Self {
-        let default = BufferFlushPolicy::default();
-        let bytes = |name: &str, fallback: usize| {
-            std::env::var(name)
-                .ok()
-                .and_then(|raw| raw.parse::<usize>().ok())
-                .unwrap_or(fallback)
-        };
-        let millis = |name: &str, fallback: Duration| {
-            std::env::var(name)
-                .ok()
-                .and_then(|raw| raw.parse::<u64>().ok())
-                .map(Duration::from_millis)
-                .unwrap_or(fallback)
-        };
+        let complain = |message: String| tracing::warn!("{message}");
         BufferFlushPolicy {
-            table_soft_bytes: bytes(
-                "CRABGRESQL_BUFFER_TABLE_SOFT_BYTES",
-                default.table_soft_bytes,
-            ),
-            global_hard_bytes: bytes(
-                "CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES",
-                default.global_hard_bytes,
-            ),
-            max_age: millis("CRABGRESQL_BUFFER_MAX_AGE_MS", default.max_age),
-            tick: millis("CRABGRESQL_BUFFER_TICK_MS", default.tick),
+            table_soft_bytes: config::BUFFER_TABLE_SOFT_BYTES.get(complain),
+            global_hard_bytes: config::BUFFER_GLOBAL_HARD_BYTES.get(complain),
+            max_age: config::BUFFER_MAX_AGE.get(complain),
+            tick: config::BUFFER_TICK.get(complain),
         }
     }
 }

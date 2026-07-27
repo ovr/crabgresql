@@ -419,6 +419,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabgresql-config"
+version = "0.1.0"
+
+[[package]]
 name = "crabgresql-executor"
 version = "0.1.0"
 dependencies = [
@@ -470,6 +474,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crabgresql-buffer-engine",
+ "crabgresql-config",
  "crabgresql-executor",
  "crabgresql-parquet-engine",
  "crabgresql-storage-api",
@@ -540,6 +545,7 @@ dependencies = [
  "clap",
  "crabgresql-binder",
  "crabgresql-catalog",
+ "crabgresql-config",
  "crabgresql-executor",
  "crabgresql-parser",
  "crabgresql-pg-engine",
