@@ -121,6 +121,11 @@ SELECT decode('001000', 'hex') AS d_hex, decode('YWJj', 'base64') AS d_b64;
 SELECT quote_ident('foo') AS qi1, quote_ident('foo bar') AS qi2,
        quote_literal('a''b') AS ql, quote_nullable(NULL) AS qn;
 
+-- bool -> text spells the value out, unlike the t/f output function that still
+-- backs display, concat() and the cast to name
+SELECT true::text AS b1, false::varchar AS b2, true::name AS b3,
+       concat(true, 'x') AS b4, true || 'x' AS b5, length(true::text) AS b6;
+
 -- character types: casts, typmod truncation, and the default column names
 SELECT 'abc'::varchar AS v_unbounded, 'abcdef'::varchar(3) AS v_trunc,
        'abcdef'::char(3) AS c_trunc, 'ab'::char AS c_default;

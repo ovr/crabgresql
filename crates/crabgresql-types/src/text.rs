@@ -654,6 +654,17 @@ fn take_bracket(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
     body
 }
 
+/// How the cached pattern text turns into a regex. Caching on the *user's*
+/// pattern rather than on the compiled source keeps `SIMILAR TO`'s translation
+/// out of the per-row path too, not just the compile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternKind {
+    /// A POSIX regex, compiled under these options.
+    Regex(ReOpts),
+    /// A `SIMILAR TO` pattern, translated first (see [`similar_to_regex`]).
+    SimilarTo(Option<char>),
+}
+
 /// How many compiled patterns to keep per thread. The bound exists to cap
 /// per-thread memory for a cache consulted once per row; the exact depth is not
 /// observable, so any small number would do.
@@ -663,22 +674,26 @@ thread_local! {
     /// Most-recently-used first. Cloning a `Regex` is *not* free — it allocates
     /// a fresh, empty match-state pool — so entries are lent out by reference
     /// (see [`with_cached`]) rather than cloned per row.
-    static RE_CACHE: std::cell::RefCell<Vec<(String, ReOpts, regex::Regex)>> =
+    static RE_CACHE: std::cell::RefCell<Vec<(String, PatternKind, regex::Regex)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Compile `pattern` under `opts` (reusing a cached `Regex` when one is live)
-/// and run `f` against it.
+/// Compile `pattern` according to `kind` (reusing a cached `Regex` when one is
+/// live) and run `f` against it.
 ///
 /// `f` must not itself call back into the cache: the entry is lent out while
 /// the thread-local is borrowed, so re-entering would panic. Every caller in
 /// this module runs a single match and returns an owned result.
-fn with_cached<T>(pattern: &str, opts: ReOpts, f: impl FnOnce(&regex::Regex) -> T) -> Result<T> {
+fn with_cached<T>(
+    pattern: &str,
+    kind: PatternKind,
+    f: impl FnOnce(&regex::Regex) -> T,
+) -> Result<T> {
     RE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         match cache
             .iter()
-            .position(|(p, o, _)| *o == opts && p == pattern)
+            .position(|(p, k, _)| *k == kind && p == pattern)
         {
             Some(idx) => {
                 // Promote to most-recently-used. Already-hot patterns (the
@@ -690,10 +705,14 @@ fn with_cached<T>(pattern: &str, opts: ReOpts, f: impl FnOnce(&regex::Regex) -> 
             None => {
                 // The `q` flag makes the whole pattern a literal string;
                 // otherwise apply the rewrites the crate cannot express.
-                let source = if opts.literal {
-                    regex::escape(pattern)
-                } else {
-                    rewrite_pattern(pattern, opts)
+                let opts = match kind {
+                    PatternKind::Regex(opts) => opts,
+                    PatternKind::SimilarTo(_) => ReOpts::default(),
+                };
+                let source = match kind {
+                    PatternKind::SimilarTo(escape) => similar_to_regex(pattern, escape)?,
+                    PatternKind::Regex(opts) if opts.literal => regex::escape(pattern),
+                    PatternKind::Regex(opts) => rewrite_pattern(pattern, opts),
                 };
                 let re = regex::RegexBuilder::new(&source)
                     .case_insensitive(opts.case_insensitive)
@@ -701,7 +720,7 @@ fn with_cached<T>(pattern: &str, opts: ReOpts, f: impl FnOnce(&regex::Regex) -> 
                     .dot_matches_new_line(opts.dot_all)
                     .build()
                     .map_err(invalid_regex)?;
-                cache.insert(0, (pattern.to_string(), opts, re));
+                cache.insert(0, (pattern.to_string(), kind, re));
                 cache.truncate(RE_CACHE_MAX);
             }
         }
@@ -717,7 +736,7 @@ pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<boo
         case_insensitive,
         ..ReOpts::default()
     };
-    with_cached(pattern, opts, |re| re.is_match(s))
+    with_cached(pattern, PatternKind::Regex(opts), |re| re.is_match(s))
 }
 
 /// jsonpath's `like_regex`, which is XQuery-flavored rather than POSIX: `.`
@@ -732,15 +751,16 @@ pub fn like_regex_match(s: &str, pattern: &str, flags: &str) -> Result<bool> {
         ignore_whitespace: flags.contains('x'),
         literal: flags.contains('q'),
     };
-    with_cached(pattern, opts, |re| re.is_match(s))
+    with_cached(pattern, PatternKind::Regex(opts), |re| re.is_match(s))
 }
 
 /// `SIMILAR TO`: an SQL-standard pattern language distinct from both LIKE and
 /// POSIX regex. It is case-sensitive and matches the *whole* string (unlike
 /// `~`). We translate it to a POSIX regex and delegate to the `regex` crate.
 pub fn similar_to_match(s: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
-    let translated = similar_to_regex(pattern, escape)?;
-    with_cached(&translated, ReOpts::default(), |re| re.is_match(s))
+    // The cache is keyed on the SIMILAR TO pattern itself, so a repeated row
+    // skips the translation as well as the compile.
+    with_cached(pattern, PatternKind::SimilarTo(escape), |re| re.is_match(s))
 }
 
 // --- regexp_* functions ----------------------------------------------------
@@ -825,7 +845,7 @@ fn translate_replacement(replacement: &str) -> String {
 pub fn regexp_replace(s: &str, pattern: &str, replacement: &str, flags: &str) -> Result<String> {
     let (opts, global) = parse_re_flags(flags)?;
     let replacement = translate_replacement(replacement);
-    with_cached(pattern, opts, |re| {
+    with_cached(pattern, PatternKind::Regex(opts), |re| {
         let out = if global {
             re.replace_all(s, replacement.as_str())
         } else {
@@ -841,7 +861,7 @@ pub fn regexp_like(s: &str, pattern: &str, flags: &str) -> Result<bool> {
     if global {
         return Err(reject_global("regexp_like"));
     }
-    with_cached(pattern, opts, |re| re.is_match(s))
+    with_cached(pattern, PatternKind::Regex(opts), |re| re.is_match(s))
 }
 
 /// Byte offset one match past `from`, advancing over an empty match by a whole
@@ -867,7 +887,7 @@ pub fn regexp_count(s: &str, pattern: &str, start: i32, flags: &str) -> Result<i
     let Some(offset) = offset else {
         return Ok(0);
     };
-    with_cached(pattern, opts, |re| {
+    with_cached(pattern, PatternKind::Regex(opts), |re| {
         // PG re-seeds the non-overlapping scan *at* `start`, so a match that
         // began earlier is re-found clipped rather than skipped. `find_at`
         // keeps `^` and look-behind aware of the text before `start`, which
@@ -911,7 +931,7 @@ pub fn regexp_substr(
     let Some(offset) = offset else {
         return Ok(None);
     };
-    with_cached(pattern, opts, |re| {
+    with_cached(pattern, PatternKind::Regex(opts), |re| {
         // Walk to the `n`th match the same way `regexp_count` counts them.
         let mut cursor = offset;
         for _ in 1..n {
