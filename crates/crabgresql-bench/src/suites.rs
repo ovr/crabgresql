@@ -27,9 +27,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clickbench_has_43_queries_and_a_105_column_schema() {
+    fn clickbench_has_43_queries_and_a_105_column_schema() -> anyhow::Result<()> {
         assert_eq!(CLICKBENCH.queries().len(), 43);
-        assert_eq!(CLICKBENCH.schema(None).matches("NOT NULL").count(), 105);
+        assert_eq!(CLICKBENCH.schema(None)?.matches("NOT NULL").count(), 105);
+        // The vendored file must stay spliceable, or `--using` cannot work.
+        assert!(
+            CLICKBENCH
+                .schema(Some("parquet"))?
+                .ends_with("USING parquet")
+        );
+        Ok(())
     }
 
     #[test]

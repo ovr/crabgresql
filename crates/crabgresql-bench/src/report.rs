@@ -9,28 +9,46 @@ pub struct SuiteRun {
     pub suite: String,
     /// What was benchmarked, for the report header.
     pub target: String,
-    /// Rows loaded, when this run loaded the dataset.
-    pub loaded_rows: Option<u64>,
+    /// The access method the table was created with, `None` when this run did
+    /// not create it and so cannot know. Recorded because a timing is
+    /// meaningless without the storage it was measured on.
+    pub access_method: Option<String>,
+    /// Rows in the benchmarked table, counted (not assumed) before the run.
+    pub table_rows: u64,
+    /// Time the load took, when this run loaded the dataset.
     pub load_time: Option<Duration>,
     pub queries: Vec<QueryRun>,
 }
 
 pub struct QueryRun {
     pub number: usize,
-    pub sql: String,
     pub runs: Vec<Outcome>,
 }
 
 pub enum Outcome {
-    Ok { elapsed: Duration, rows: usize },
+    Ok {
+        elapsed: Duration,
+        rows: usize,
+    },
     Failed(String),
+    /// The run never completed and the connection was abandoned.
     TimedOut,
+    /// The connection was lost, so this query was never really measured —
+    /// distinct from `Failed`, which is the server rejecting the query.
+    Disconnected(String),
 }
 
 impl Outcome {
     fn seconds(&self) -> Option<f64> {
         match self {
             Outcome::Ok { elapsed, .. } => Some(elapsed.as_secs_f64()),
+            _ => None,
+        }
+    }
+
+    fn rows(&self) -> Option<usize> {
+        match self {
+            Outcome::Ok { rows, .. } => Some(*rows),
             _ => None,
         }
     }
@@ -45,13 +63,42 @@ impl QueryRun {
             .min_by(f64::total_cmp)
     }
 
+    /// Rows the query returned, from its first successful run.
+    pub fn rows(&self) -> Option<usize> {
+        self.runs.iter().find_map(Outcome::rows)
+    }
+
+    /// True if repeated runs of the same query disagreed on how many rows they
+    /// returned — the cheapest available signal that a result is not to be
+    /// trusted, since a query is otherwise scored purely on not erroring.
+    pub fn rows_unstable(&self) -> bool {
+        let mut counts = self.runs.iter().filter_map(Outcome::rows);
+        let Some(first) = counts.next() else {
+            return false;
+        };
+        counts.any(|count| count != first)
+    }
+
     /// The first thing that went wrong, if anything did.
-    pub fn failure(&self) -> Option<String> {
+    pub fn failure(&self) -> Option<&str> {
         self.runs.iter().find_map(|outcome| match outcome {
             Outcome::Ok { .. } => None,
-            Outcome::Failed(message) => Some(message.clone()),
-            Outcome::TimedOut => Some("timed out".to_string()),
+            Outcome::Failed(message) | Outcome::Disconnected(message) => Some(message.as_str()),
+            Outcome::TimedOut => Some("timed out"),
         })
+    }
+
+    /// One-line verdict, shared by the progress log and the results table so
+    /// the two cannot disagree.
+    pub fn status(&self) -> String {
+        match (self.best(), self.failure()) {
+            (Some(_), None) if self.rows_unstable() => {
+                "ok, BUT row count differs between runs".to_string()
+            }
+            (Some(_), None) => "ok".to_string(),
+            (_, Some(failure)) => one_line(failure),
+            (None, None) => "not run".to_string(),
+        }
     }
 }
 
@@ -60,56 +107,58 @@ impl SuiteRun {
         self.queries.iter().filter(|q| q.best().is_some()).count()
     }
 
+    /// How the table under test is described wherever a number is reported.
+    /// A reused table's storage is reported as `unknown`, not guessed at.
+    fn table_description(&self) -> String {
+        format!(
+            "{} rows, {} storage",
+            self.table_rows,
+            self.access_method.as_deref().unwrap_or("unknown"),
+        )
+    }
+
     pub fn table(&self) -> String {
         let runs = self.queries.first().map_or(0, |q| q.runs.len());
         let mut out = String::new();
         let _ = writeln!(out, "\n{} on {}", self.suite, self.target);
-        if let (Some(rows), Some(time)) = (self.loaded_rows, self.load_time) {
-            let _ = writeln!(
-                out,
-                "loaded {rows} rows in {:.1}s ({:.0} rows/s)",
-                time.as_secs_f64(),
-                rows as f64 / time.as_secs_f64().max(f64::EPSILON),
-            );
+        let _ = write!(out, "{}", self.table_description());
+        match self.load_time {
+            Some(time) => {
+                let _ = writeln!(
+                    out,
+                    ", loaded in {:.1}s ({:.0} rows/s)",
+                    time.as_secs_f64(),
+                    self.table_rows as f64 / time.as_secs_f64().max(f64::EPSILON),
+                );
+            }
+            None => {
+                let _ = writeln!(out, " (loaded by an earlier run)");
+            }
         }
 
         let _ = write!(out, "\n{:>3}", "#");
         for i in 1..=runs {
             let _ = write!(out, " {:>9}", format!("run {i}"));
         }
-        let _ = writeln!(out, " {:>9}  status", "best");
+        let _ = writeln!(out, " {:>9} {:>9}  status", "best", "rows");
 
         for query in &self.queries {
             let _ = write!(out, "{:>3}", query.number);
             for outcome in &query.runs {
-                match outcome.seconds() {
-                    Some(secs) => {
-                        let _ = write!(out, " {secs:>9.3}");
-                    }
-                    None => {
-                        let _ = write!(out, " {:>9}", "-");
-                    }
-                }
+                let _ = match outcome.seconds() {
+                    Some(secs) => write!(out, " {secs:>9.3}"),
+                    None => write!(out, " {:>9}", "-"),
+                };
             }
-            match (query.best(), query.failure()) {
-                (Some(best), None) => {
-                    let _ = writeln!(out, " {best:>9.3}  ok");
-                }
-                (best, Some(failure)) => {
-                    match best {
-                        Some(best) => {
-                            let _ = write!(out, " {best:>9.3}");
-                        }
-                        None => {
-                            let _ = write!(out, " {:>9}", "-");
-                        }
-                    }
-                    let _ = writeln!(out, "  {}", one_line(&failure));
-                }
-                (None, None) => {
-                    let _ = writeln!(out, " {:>9}  not run", "-");
-                }
-            }
+            let _ = match query.best() {
+                Some(best) => write!(out, " {best:>9.3}"),
+                None => write!(out, " {:>9}", "-"),
+            };
+            let _ = match query.rows() {
+                Some(rows) => write!(out, " {rows:>9}"),
+                None => write!(out, " {:>9}", "-"),
+            };
+            let _ = writeln!(out, "  {}", query.status());
         }
 
         let total: f64 = self.queries.iter().filter_map(QueryRun::best).sum();
@@ -123,19 +172,40 @@ impl SuiteRun {
     }
 
     /// `{"system": …, "result": [[…], …]}` — the shape ClickBench's own
-    /// `results/*.json` files use, so a run can be pasted straight in.
+    /// `results/*.json` files use, so a run can be pasted straight in. The
+    /// per-query failure text is kept alongside it, so the artifact carries
+    /// the gap list rather than an undifferentiated row of `null`s.
     pub fn json(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "{{");
         let _ = writeln!(out, "  \"system\": \"CrabgreSQL\",");
-        let _ = writeln!(out, "  \"suite\": \"{}\",", self.suite);
+        let _ = writeln!(out, "  \"suite\": \"{}\",", escape(&self.suite));
         let _ = writeln!(out, "  \"target\": \"{}\",", escape(&self.target));
-        if let Some(rows) = self.loaded_rows {
-            let _ = writeln!(out, "  \"rows\": {rows},");
-        }
+        let _ = writeln!(
+            out,
+            "  \"access_method\": \"{}\",",
+            escape(self.access_method.as_deref().unwrap_or("unknown")),
+        );
+        let _ = writeln!(out, "  \"rows\": {},", self.table_rows);
         if let Some(time) = self.load_time {
             let _ = writeln!(out, "  \"load_time\": {:.3},", time.as_secs_f64());
         }
+        let _ = writeln!(out, "  \"failures\": {{");
+        let failures: Vec<&QueryRun> = self
+            .queries
+            .iter()
+            .filter(|q| q.failure().is_some())
+            .collect();
+        for (i, query) in failures.iter().enumerate() {
+            let comma = if i + 1 == failures.len() { "" } else { "," };
+            let _ = writeln!(
+                out,
+                "    \"{}\": \"{}\"{comma}",
+                query.number,
+                escape(&one_line(query.failure().unwrap_or("failed"))),
+            );
+        }
+        let _ = writeln!(out, "  }},");
         let _ = writeln!(out, "  \"result\": [");
         for (i, query) in self.queries.iter().enumerate() {
             let runs: Vec<String> = query
@@ -166,37 +236,37 @@ fn one_line(message: &str) -> String {
 }
 
 fn escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\n', '\r', '\t'], " ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ok(millis: u64, rows: usize) -> Outcome {
+        Outcome::Ok {
+            elapsed: Duration::from_millis(millis),
+            rows,
+        }
+    }
+
     fn run() -> SuiteRun {
         SuiteRun {
             suite: "clickbench".to_string(),
             target: "in-process".to_string(),
-            loaded_rows: Some(10),
+            access_method: Some("parquet".to_string()),
+            table_rows: 10,
             load_time: Some(Duration::from_secs(1)),
             queries: vec![
                 QueryRun {
                     number: 1,
-                    sql: "SELECT 1".to_string(),
-                    runs: vec![
-                        Outcome::Ok {
-                            elapsed: Duration::from_millis(500),
-                            rows: 1,
-                        },
-                        Outcome::Ok {
-                            elapsed: Duration::from_millis(250),
-                            rows: 1,
-                        },
-                    ],
+                    runs: vec![ok(500, 1), ok(250, 1)],
                 },
                 QueryRun {
                     number: 2,
-                    sql: "SELECT nope()".to_string(),
                     runs: vec![Outcome::Failed(
                         "ERROR: no function nope\nline 2".to_string(),
                     )],
@@ -207,8 +277,9 @@ mod tests {
 
     #[test]
     fn best_is_the_fastest_successful_run() {
-        assert_eq!(run().queries[0].best(), Some(0.25));
-        assert_eq!(run().queries[1].best(), None);
+        let run = run();
+        assert_eq!(run.queries[0].best(), Some(0.25));
+        assert_eq!(run.queries[1].best(), None);
     }
 
     #[test]
@@ -220,9 +291,38 @@ mod tests {
     }
 
     #[test]
-    fn json_uses_null_for_failed_runs() {
+    fn table_names_the_storage_and_row_count_it_measured() {
+        let table = run().table();
+        assert!(table.contains("10 rows, parquet storage"), "{table}");
+    }
+
+    #[test]
+    fn a_row_count_that_moves_between_runs_is_called_out() {
+        let stable = QueryRun {
+            number: 1,
+            runs: vec![ok(1, 7), ok(1, 7)],
+        };
+        assert!(!stable.rows_unstable());
+        assert_eq!(stable.status(), "ok");
+
+        let moving = QueryRun {
+            number: 1,
+            runs: vec![ok(1, 7), ok(1, 6)],
+        };
+        assert!(moving.rows_unstable());
+        assert!(moving.status().contains("row count differs"));
+    }
+
+    #[test]
+    fn json_uses_null_for_failed_runs_but_keeps_the_reason() {
         let json = run().json();
         assert!(json.contains("[0.500, 0.250],"), "{json}");
         assert!(json.contains("[null]"), "{json}");
+        assert!(json.contains("\"access_method\": \"parquet\""), "{json}");
+        assert!(json.contains("\"rows\": 10"), "{json}");
+        assert!(
+            json.contains("\"2\": \"ERROR: no function nope\""),
+            "{json}"
+        );
     }
 }

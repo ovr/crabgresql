@@ -46,15 +46,15 @@ enum Command {
         url: Option<String>,
 
         /// Timed repetitions per query
-        #[arg(long, value_name = "N", default_value_t = 3)]
+        #[arg(long, value_name = "N", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
         runs: u32,
 
         /// Run only these query numbers
-        #[arg(long, value_delimiter = ',', value_name = "N,N")]
-        query: Vec<usize>,
+        #[arg(long, value_delimiter = ',', value_name = "N,N", value_parser = clap::value_parser!(u64).range(1..))]
+        query: Vec<u64>,
 
         /// Per-run timeout in seconds
-        #[arg(long, value_name = "SECONDS", default_value_t = 120)]
+        #[arg(long, value_name = "SECONDS", default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
 
         /// Access method for the benchmark table (parquet, buffer, …)
@@ -98,18 +98,13 @@ async fn main() -> ExitCode {
         eprintln!("bench: unknown suite `{suite}`; try `bench list`");
         return ExitCode::from(2);
     };
-    if runs == 0 {
-        eprintln!("bench: --runs must be at least 1");
-        return ExitCode::from(2);
-    }
-
     let config = RunConfig {
         data,
         rows,
         data_dir,
         url,
         runs,
-        only: query,
+        only: query.into_iter().map(|n| n as usize).collect(),
         timeout: Duration::from_secs(timeout),
         access_method: using,
         reload,
