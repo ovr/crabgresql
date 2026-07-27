@@ -91,8 +91,6 @@ async fn crud_over_the_wire() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The durable engine's physical B-tree serves equality index scans end to end:
-/// `EXPLAIN` plans an Index Scan, the query returns the right row, and both the
 /// A committed `INSERT` into a Parquet relation is durable through the WAL alone:
 /// the row reads back immediately and survives a restart, while no Parquet file
 /// exists for it yet. That is the point of the write buffer — a stream of small
@@ -245,6 +243,8 @@ async fn buffer_table_rows_survive_a_restart_through_the_wal_alone() -> anyhow::
     Ok(())
 }
 
+/// The durable engine's physical B-tree serves equality index scans end to end:
+/// `EXPLAIN` plans an Index Scan, the query returns the right row, and both the
 /// index and its correctness survive a restart (rebuilt from replayed WAL).
 #[tokio::test]
 async fn index_scan_over_the_wire_and_survives_restart() -> anyhow::Result<()> {

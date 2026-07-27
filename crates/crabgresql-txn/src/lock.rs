@@ -110,6 +110,27 @@ impl TableLock {
         }
     }
 
+    /// Take a shared hold only if it can be granted without waiting.
+    ///
+    /// For background maintenance, which must never block: a session sitting idle
+    /// inside `BEGIN; TRUNCATE t;` holds the exclusive lock to end of transaction,
+    /// and a worker serving every relation from one thread would starve them all
+    /// waiting for it — and would then refuse to join at shutdown. Returning
+    /// `None` lets the caller skip this relation and retry on its next pass.
+    pub fn try_acquire_shared(self: &Arc<Self>, owner: LockOwner) -> Option<SharedGuard> {
+        let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+        match inner.exclusive {
+            None => {}
+            Some(holder) if holder == owner => {}
+            Some(_) => return None,
+        }
+        *inner.shared.entry(owner).or_default() += 1;
+        Some(SharedGuard {
+            lock: Arc::clone(self),
+            owner,
+        })
+    }
+
     /// Acquire the exclusive hold for `owner`, waiting until no *other* owner holds
     /// the table exclusively and no *other* owner holds a shared hold. `owner`'s
     /// own shared holds do not block it (lock upgrade), so a session can TRUNCATE a

@@ -947,7 +947,23 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             }
             lines
         }
-        PhysicalPlan::Subquery { source, .. } => explain(source),
+        PhysicalPlan::Subquery {
+            source, predicate, ..
+        } => {
+            let mut lines = explain(source);
+            // A subplan's WHERE lives here, not on the child, so rendering only
+            // the child would drop the predicate from the plan entirely. Names
+            // come from the SOURCE row (what the predicate indexes into), not the
+            // subquery's projected output.
+            if let Some(predicate) = predicate {
+                let names = source_column_names(source);
+                push_root_property(
+                    &mut lines,
+                    format!("Filter: ({})", explain_expr(predicate, &names)),
+                );
+            }
+            lines
+        }
         PhysicalPlan::TableFunction { .. } => vec!["Function Scan".to_string()],
         PhysicalPlan::Join {
             source, predicate, ..
@@ -1066,6 +1082,21 @@ fn schema_names(schema: &TableSchema) -> Vec<Option<&str>> {
         .collect()
 }
 
+/// The column names of `plan`'s output row, for rendering an expression that
+/// indexes into it. Empty when the shape has no names to offer, which
+/// [`explain_expr`] renders as `$index`.
+fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<&str>> {
+    match plan {
+        PhysicalPlan::Append { columns, .. } => {
+            columns.iter().map(|c| Some(c.name.as_str())).collect()
+        }
+        PhysicalPlan::Select { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
+            schema_names(table.schema())
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// The column names of a join subtree's row, in layout order. A subplan or
 /// table-function leaf contributes `None` per column — its output columns have
 /// no schema name to show, so an expression over them renders as `$index`.
@@ -1073,6 +1104,16 @@ fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<&str>> {
     match join {
         PhysicalJoinExpr::Input { input, width, .. } => match input {
             PhysicalJoinInput::Scan(table) => schema_names(table.schema()),
+            // An `Append` here is one relation read from several physical
+            // sources, not a genuine subquery: its columns are the relation's, so
+            // an expression over them must still render by name. Without this a
+            // join or filter touching such a relation prints `$0`.
+            PhysicalJoinInput::Subplan(plan) => match plan.as_ref() {
+                PhysicalPlan::Append { columns, .. } if columns.len() == *width => {
+                    columns.iter().map(|c| Some(c.name.as_str())).collect()
+                }
+                _ => vec![None; *width],
+            },
             _ => vec![None; *width],
         },
         PhysicalJoinExpr::Join { left, right, .. } => {

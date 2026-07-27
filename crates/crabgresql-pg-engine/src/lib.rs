@@ -286,7 +286,12 @@ pub struct PgEngine {
     /// engine needs the manager. But the manager is built *from* this engine's
     /// recovered CLOG, so it cannot be a constructor argument; see
     /// [`PgEngine::attach_txn_manager`].
-    txnmgr: std::sync::OnceLock<Arc<TransactionManager>>,
+    ///
+    /// Held **weakly**: the manager already owns this engine through its finalize
+    /// hook, so a strong handle here would close a reference cycle and neither
+    /// would ever be dropped — leaking the data directory's file handles and
+    /// leaving the flush worker running against a directory nobody is using.
+    txnmgr: std::sync::OnceLock<std::sync::Weak<TransactionManager>>,
     /// The background flush thread, present once a transaction manager is
     /// attached. Tests that build an engine by hand never attach one, so they get
     /// no thread and stay deterministic.
@@ -498,6 +503,11 @@ impl PgEngine {
                 buffer.restore(restored, clog);
             }
         }
+        // Anything still held belongs to a relfilenode no open relation names — a
+        // superseded TRUNCATE generation or a dropped relation. Freeing it here is
+        // the only chance: `take` is keyed by relfilenode and nothing else ever
+        // visits these entries.
+        self.buffer_redo.discard_unclaimed();
     }
 
     /// Flush all dirty pages to their relation files (obeying the write-ahead
@@ -519,8 +529,20 @@ impl PgEngine {
     /// it twice is a no-op, and an engine that never gets a manager simply
     /// reports `VACUUM` as unavailable rather than misbehaving.
     pub fn attach_txn_manager(self: &Arc<Self>, txnmgr: Arc<TransactionManager>) {
-        if self.txnmgr.set(txnmgr).is_err() {
+        if self.txnmgr.set(Arc::downgrade(&txnmgr)).is_err() {
             return;
+        }
+        // Give every buffer the CLOG, so `statistics()` — which gets no
+        // `TxnContext` — can tell a row deleted by a committed transaction from
+        // one whose deleter aborted. `create_table` does the same for relations
+        // created later.
+        for table in self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .values()
+        {
+            Self::attach_clog_to(table, txnmgr.clog());
         }
         let worker = crate::flush::FlushWorker::spawn(
             Arc::downgrade(self),
@@ -530,6 +552,15 @@ impl PgEngine {
             .flush_worker
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned")) = Some(worker);
+    }
+
+    /// Hand `table`'s RAM buffer the CLOG, if it has one.
+    fn attach_clog_to(table: &ManagedTable, clog: &Arc<Clog>) {
+        match table {
+            ManagedTable::Parquet(parquet) => parquet.buffer().attach_clog(Arc::clone(clog)),
+            ManagedTable::Buffer(buffer) => buffer.attach_clog(Arc::clone(clog)),
+            ManagedTable::Heap(_) => {}
+        }
     }
 
     /// Every relation currently holding rows in a RAM write buffer.
@@ -543,12 +574,24 @@ impl PgEngine {
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .iter()
             .filter_map(|((namespace, name), table)| {
-                let parquet = table.as_parquet()?;
-                let bytes = parquet.buffer().resident_bytes();
+                // Both a Parquet relation's write buffer and a standalone
+                // `USING buffer` relation belong here. The latter has nowhere to
+                // flush to, but `vacuum_table` still reclaims its dead versions —
+                // and without that its memory only ever grows, which is the exact
+                // failure this worker exists to prevent.
+                let (rel, bytes) = match table.as_ref() {
+                    ManagedTable::Parquet(parquet) => {
+                        (parquet.relfilenode(), parquet.buffer().resident_bytes())
+                    }
+                    ManagedTable::Buffer(buffer) => {
+                        (buffer.relfilenode(), buffer.resident_bytes())
+                    }
+                    ManagedTable::Heap(_) => return None,
+                };
                 (bytes > 0).then(|| BufferedRelation {
                     namespace: namespace.clone(),
                     name: name.clone(),
-                    rel: parquet.relfilenode(),
+                    rel,
                     bytes,
                 })
             })
@@ -559,13 +602,12 @@ impl PgEngine {
     /// The worker's entry point; `VACUUM` reaches the same work through
     /// [`TableEngine::vacuum_table`].
     pub fn flush_buffer(&self, namespace: &str, name: &str) -> Result<u64, StorageError> {
-        let Some(txnmgr) = self.txnmgr.get() else {
+        let Some(txnmgr) = self.txnmgr.get().and_then(std::sync::Weak::upgrade) else {
             return Err(StorageError::UnsupportedOperation(
                 "no transaction service is attached".to_string(),
             ));
         };
-        let oldest = txnmgr.snapshot().xmin;
-        self.vacuum_table(namespace, name, oldest)
+        self.vacuum_table(namespace, name, txnmgr.reclaim_horizon())
     }
 
     pub fn checkpoint(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
@@ -1077,6 +1119,12 @@ impl TableEngine for PgEngine {
             }
         };
         let table = Arc::new(table);
+        // A relation created after the transaction service was attached must get
+        // the CLOG too, or `statistics()` — which has no `TxnContext` — cannot tell
+        // a committed delete from a rolled-back one and reports the relation empty.
+        if let Some(txnmgr) = self.txnmgr.get().and_then(std::sync::Weak::upgrade) {
+            Self::attach_clog_to(&table, txnmgr.clog());
+        }
         tables.insert((namespace, name), Arc::clone(&table));
         Ok(table as Arc<dyn TableAm>)
     }
@@ -1146,7 +1194,7 @@ impl TableEngine for PgEngine {
         name: &str,
         oldest: Xid,
     ) -> Result<u64, StorageError> {
-        let Some(txnmgr) = self.txnmgr.get() else {
+        let Some(txnmgr) = self.txnmgr.get().and_then(std::sync::Weak::upgrade) else {
             return Err(StorageError::UnsupportedOperation(
                 "VACUUM is unavailable: this engine has no transaction service".to_string(),
             ));
@@ -1168,7 +1216,7 @@ impl TableEngine for PgEngine {
             // A relation whose rows are buffered in RAM becomes durable-as-a-file
             // here; this is the only path that turns many small writes into one
             // chunk on demand.
-            ManagedTable::Parquet(parquet) => parquet.flush(txnmgr, oldest),
+            ManagedTable::Parquet(parquet) => parquet.flush(&txnmgr),
             ManagedTable::Heap(heap) => {
                 heap.vacuum(oldest, txnmgr.clog());
                 Ok(0)

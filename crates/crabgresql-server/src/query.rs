@@ -1780,11 +1780,24 @@ fn execute_vacuum(
     session: &mut Session,
     vacuum: &ast::VacuumStatement,
 ) -> Result<QueryResult, PgError> {
+    // PostgreSQL rejects a transaction block before it looks at any option, so
+    // `BEGIN; VACUUM FULL t;` reports 25001 there and must here too — a client
+    // keying retry logic on that SQLSTATE would otherwise see 0A000 for the same
+    // violation.
+    if session.tx_status == TransactionStatus::InTransaction {
+        return Err(PgError::new(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "VACUUM cannot run inside a transaction block",
+        ));
+    }
     // Modifiers the grammar accepts but this implementation does not honor. A
     // `VACUUM FULL` that silently ran a plain vacuum would report success for work
-    // it never did, so each is a stated gap instead.
+    // it never did, so each is a stated gap instead. `ANALYZE` is honored below;
+    // `VERBOSE` only adds progress messages, so accepting it silently is faithful
+    // enough — the work it describes still happens.
     for (present, name) in [
         (vacuum.full, "FULL"),
+        (vacuum.freeze, "FREEZE"),
         (vacuum.sort_only, "SORT ONLY"),
         (vacuum.delete_only, "DELETE ONLY"),
         (vacuum.reindex, "REINDEX"),
@@ -1797,12 +1810,6 @@ fn execute_vacuum(
                 "VACUUM {name} is not supported yet"
             )));
         }
-    }
-    if session.tx_status == TransactionStatus::InTransaction {
-        return Err(PgError::new(
-            sqlstate::ACTIVE_SQL_TRANSACTION,
-            "VACUUM cannot run inside a transaction block",
-        ));
     }
 
     // Resolve every target first, so a typo in the second name does not leave the
@@ -1842,6 +1849,21 @@ fn execute_vacuum(
     }
     if flushed > 0 {
         tracing::debug!(rows = flushed, "VACUUM flushed buffered rows to durable storage");
+    }
+    // `VACUUM ANALYZE` is one statement that does both, as in PostgreSQL.
+    if vacuum.analyze {
+        let txn = build_txn(txnmgr, session, false);
+        for (namespace, name) in &targets {
+            match engine.analyze(namespace, name, &txn) {
+                Ok(()) => {}
+                Err(StorageError::TableNotFound(_)) if vacuum.table_name.is_none() => {}
+                Err(error) => {
+                    finalize_statement(txnmgr, session, &txn, false, false, None)?;
+                    return Err(error.into());
+                }
+            }
+        }
+        finalize_statement(txnmgr, session, &txn, false, true, None)?;
     }
     Ok(QueryResult::command("VACUUM"))
 }

@@ -18,7 +18,7 @@ mod lock;
 
 pub use lock::{ExclusiveGuard, SharedGuard, TableLock};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -313,6 +313,11 @@ pub struct TxnContext {
     pub cid: CommandId,
     pub snapshot: Snapshot,
     pub iso: IsolationLevel,
+    /// Keeps [`TxnContext::snapshot`] counted as in-use for as long as this
+    /// context (or any clone of it) lives, so storage cannot reclaim a version
+    /// this reader can still see. `None` only for contexts built by hand in
+    /// tests, which hold nothing back.
+    pub reservation: Option<Arc<SnapshotGuard>>,
     pub clog: Arc<Clog>,
     /// The session-stable table-lock owner (see [`LockOwner`]). Defaults to the
     /// transaction's XID for contexts built without a session; the server stamps
@@ -422,6 +427,43 @@ pub struct TransactionManager {
     /// Vends session-stable [`LockOwner`]s. Starts at 1 so no session ever gets
     /// [`LockOwner::INTERNAL`] (0).
     next_lock_owner: AtomicU64,
+    /// Snapshots still in use, as a multiset of their `xmax` keyed by count.
+    ///
+    /// A read-only transaction never allocates an XID, so it contributes nothing
+    /// to [`Snapshot::xmin`] — yet it can still be reading rows that a later
+    /// transaction has deleted. Any storage that reclaims deleted versions needs
+    /// to know about those readers, hence this registry.
+    live_snapshots: Arc<Mutex<BTreeMap<Xid, usize>>>,
+}
+
+/// Keeps a snapshot counted in [`TransactionManager::live_snapshots`] until it is
+/// dropped, so reclamation cannot run past a reader that is still using it.
+pub struct SnapshotGuard {
+    live: Arc<Mutex<BTreeMap<Xid, usize>>>,
+    xmax: Xid,
+}
+
+impl std::fmt::Debug for SnapshotGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotGuard")
+            .field("xmax", &self.xmax)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        if let Some(count) = live.get_mut(&self.xmax) {
+            *count -= 1;
+            if *count == 0 {
+                live.remove(&self.xmax);
+            }
+        }
+    }
 }
 
 impl TransactionManager {
@@ -442,6 +484,7 @@ impl TransactionManager {
             sink: Some(sink),
             finalize: None,
             next_lock_owner: AtomicU64::new(1),
+            live_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -471,6 +514,48 @@ impl TransactionManager {
     }
 
     /// Capture the current in-flight set.
+    /// Register `snapshot` as in use until the returned guard drops.
+    ///
+    /// The server holds one per open transaction and one per statement, so a
+    /// read-only `REPEATABLE READ` session — which allocates no XID and so does
+    /// not appear in any snapshot's in-flight set — still holds back
+    /// [`TransactionManager::reclaim_horizon`].
+    pub fn register_snapshot(&self, snapshot: &Snapshot) -> SnapshotGuard {
+        *self
+            .live_snapshots
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .entry(snapshot.xmax)
+            .or_insert(0) += 1;
+        SnapshotGuard {
+            live: Arc::clone(&self.live_snapshots),
+            xmax: snapshot.xmax,
+        }
+    }
+
+    /// The XID below which a deleted row version is dead to every reader that
+    /// exists or can still be created.
+    ///
+    /// This is the floor for reclaiming versions, and it is deliberately NOT just
+    /// `snapshot().xmin`: that only accounts for transactions holding an XID, and
+    /// a read-only transaction holds a snapshot without one. Reclaiming above a
+    /// live snapshot's `xmax` would delete rows out from under a `REPEATABLE READ`
+    /// reader mid-transaction.
+    pub fn reclaim_horizon(&self) -> Xid {
+        let oldest_reader = self
+            .live_snapshots
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .keys()
+            .next()
+            .copied();
+        let running = self.snapshot().xmin;
+        match oldest_reader {
+            Some(reader) => running.min(reader),
+            None => running,
+        }
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.xids.take_snapshot()
     }
@@ -553,11 +638,13 @@ impl TransactionManager {
         snapshot: Snapshot,
         iso: IsolationLevel,
     ) -> TxnContext {
+        let reservation = Arc::new(self.register_snapshot(&snapshot));
         TxnContext {
             xid,
             cid,
             snapshot,
             iso,
+            reservation: Some(reservation),
             clog: Arc::clone(&self.clog),
             // Default the lock owner to the transaction's XID; the server
             // overrides it with the connection's session-stable owner in

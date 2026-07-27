@@ -96,6 +96,11 @@ pub struct RestoredBuffer {
     /// One past the highest row id the log mentions, so restored ids are never
     /// handed out a second time.
     pub next_row_id: u64,
+    /// `row_id -> index into rows`, so replaying a delete is a lookup rather than
+    /// a scan. A flush emits one `BUFFER_DELETE` naming *every* row it moved, so
+    /// deletes are not rare in the log — without this, replay is quadratic in the
+    /// relation's lifetime row count and startup time runs away.
+    index: HashMap<u64, usize>,
 }
 
 /// A WAL-logged, RAM-resident MVCC row store.
@@ -126,6 +131,12 @@ pub struct BufferTable {
     /// PostgreSQL's plain `Seq Scan on <rel>`, because from SQL there is nothing
     /// unusual to report.
     scan_label: Option<String>,
+    /// The commit log, attached once the engine has a transaction service.
+    ///
+    /// [`TableAm::statistics`] takes no [`TxnContext`], but deciding whether a
+    /// stamped row is actually dead needs the deleter's fate. Absent (a bare table
+    /// in a unit test) the count falls back to treating any `xmax` as dead.
+    clog: RwLock<Option<Arc<Clog>>>,
 }
 
 impl BufferTable {
@@ -139,6 +150,7 @@ impl BufferTable {
             wal,
             indexes: RwLock::new(indexes),
             scan_label: None,
+            clog: RwLock::new(None),
         }
     }
 
@@ -180,6 +192,44 @@ impl BufferTable {
         self.append(rel, tuples, txn)
     }
 
+    /// Append rows under ids already minted by [`Self::alloc_row_ids`].
+    ///
+    /// Exists so a test can install two batches in the opposite order to the one
+    /// their ids were minted in — the interleaving that the unlocked encode step
+    /// makes possible and that a plain `extend` would leave unsorted forever.
+    #[cfg(test)]
+    pub(crate) fn append_at(
+        &self,
+        first_row_id: u64,
+        tuples: Vec<Tuple>,
+        txn: &TxnContext,
+    ) -> Result<Vec<Tid>, StorageError> {
+        self.install(self.relfilenode(), first_row_id, tuples, txn)
+    }
+
+    /// Stamp every currently-live row deleted, filing the record under `rel`.
+    ///
+    /// Deliberately not snapshot-scoped: this backs `TRUNCATE`, which empties the
+    /// relation outright. The caller must hold the relation's exclusive lock, so
+    /// no other transaction can be adding rows while this runs.
+    pub fn delete_all_live_in(
+        &self,
+        rel: u32,
+        txn: &TxnContext,
+    ) -> Result<u64, StorageError> {
+        let live: Vec<u64> = {
+            let rows = self.rows_read();
+            rows.iter()
+                .filter(|row| {
+                    !row.hdr.xmax.is_valid()
+                        || txn.clog.status(row.hdr.xmax) == XactStatus::Aborted
+                })
+                .map(|row| row.row_id)
+                .collect()
+        };
+        Ok(self.stamp_deleted(rel, &live, txn).len() as u64)
+    }
+
     /// Stamp rows deleted, filing the record under `rel`. See [`Self::append_in`].
     pub fn delete_many_in(
         &self,
@@ -213,6 +263,36 @@ impl BufferTable {
     /// MVCC already answers the question.
     pub fn snapshot_rows(&self, txn: &TxnContext) -> Vec<(Tid, Tuple)> {
         self.visible(txn)
+    }
+
+    /// Supply the commit log, so [`TableAm::statistics`] can tell a row deleted by
+    /// a committed transaction from one whose deleter aborted.
+    pub fn attach_clog(&self, clog: Arc<Clog>) {
+        *self
+            .clog
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned")) = Some(clog);
+    }
+
+    /// Rows no committed transaction has deleted. An aborted deleter leaves its
+    /// `xmax` behind, so the field's presence is not the test.
+    pub fn live_rows(&self) -> usize {
+        let clog = self
+            .clog
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let rows = self.rows_read();
+        rows.iter()
+            .filter(|row| {
+                if !row.hdr.xmax.is_valid() {
+                    return true;
+                }
+                match clog.as_ref() {
+                    Some(clog) => clog.status(row.hdr.xmax) != XactStatus::Committed,
+                    None => false,
+                }
+            })
+            .count()
     }
 
     /// Live encoded bytes. Cheap enough for a scheduler to poll.
@@ -326,6 +406,22 @@ impl BufferTable {
             return Ok(Vec::new());
         }
         let first_row_id = self.alloc_row_ids(tuples.len() as u64)?;
+        self.install(rel, first_row_id, tuples, txn)
+    }
+
+    /// Encode, WAL-log and install rows under ids already minted. Split from
+    /// [`Self::append`] so a test can drive the install order independently of the
+    /// allocation order.
+    fn install(
+        &self,
+        rel: u32,
+        first_row_id: u64,
+        tuples: Vec<Tuple>,
+        txn: &TxnContext,
+    ) -> Result<Vec<Tid>, StorageError> {
+        if tuples.is_empty() {
+            return Ok(Vec::new());
+        }
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
 
         // Encode outside every lock: this is the expensive step and nothing it
@@ -348,9 +444,29 @@ impl BufferTable {
         }
 
         let tids = staged.iter().map(|row| Tid::logical(row.row_id)).collect();
-        // Row ids were allocated in order and `alloc_row_ids` is the only source,
-        // so appending keeps `rows` sorted without a re-sort.
-        self.rows_write().extend(staged);
+        {
+            let mut rows = self.rows_write();
+            // Ids come from one counter, but they are minted before this lock is
+            // taken and the encoding in between is deliberately unlocked — so two
+            // writers CAN arrive out of order, and a plain `extend` would leave
+            // `rows` unsorted forever. Every lookup here binary-searches, so that
+            // would silently lose rows: a flush would copy them into a chunk and
+            // then fail to tombstone them, duplicating them permanently.
+            //
+            // In-order arrival is the overwhelmingly common case, so check the
+            // boundary and fall back to positional inserts only when it fails.
+            let in_order = rows
+                .last()
+                .is_none_or(|last| last.row_id < staged[0].row_id);
+            if in_order {
+                rows.extend(staged);
+            } else {
+                for row in staged {
+                    let at = rows.partition_point(|existing| existing.row_id < row.row_id);
+                    rows.insert(at, row);
+                }
+            }
+        }
         self.bytes.fetch_add(total, Ordering::Relaxed);
         Ok(tids)
     }
@@ -543,6 +659,20 @@ impl BufferRedo {
             .unwrap_or_else(|_| panic!("mutex poisoned"))
             .remove(&rel)
     }
+
+    /// Drop everything replay collected that nobody claimed.
+    ///
+    /// Rows logged under a relfilenode a committed TRUNCATE superseded, or under a
+    /// relation that was later dropped, have no table to restore them into. They
+    /// are correctly unreachable — but without this they would sit decoded in RAM
+    /// for the life of the process, invisible to every accounting and reclaimable
+    /// by nothing.
+    pub fn discard_unclaimed(&self) {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .clear();
+    }
 }
 
 impl RmgrRedo for BufferRedo {
@@ -569,8 +699,10 @@ impl RmgrRedo for BufferRedo {
                 let hdr = TupleHeader::inserted(ctx.xid, cid);
                 for offset in 0..n_rows as u64 {
                     let values = decode_row(&mut cursor, n_cols)?;
+                    let row_id = first_row_id + offset;
+                    buffer.index.insert(row_id, buffer.rows.len());
                     buffer.rows.push(RestoredRow {
-                        row_id: first_row_id + offset,
+                        row_id,
                         values,
                         hdr,
                     });
@@ -581,10 +713,11 @@ impl RmgrRedo for BufferRedo {
                 let n = cursor.u32()?;
                 for _ in 0..n {
                     let row_id = cursor.u64()?;
-                    // Linear rather than indexed: deletes are rare relative to
-                    // inserts, and a map would have to be rebuilt per relation
-                    // for a pass that runs once at startup.
-                    if let Some(row) = buffer.rows.iter_mut().find(|row| row.row_id == row_id) {
+                    if let Some(row) = buffer
+                        .index
+                        .get(&row_id)
+                        .and_then(|at| buffer.rows.get_mut(*at))
+                    {
                         row.hdr.xmax = ctx.xid;
                         row.hdr.cmax = cid;
                     }
@@ -629,8 +762,6 @@ impl TableAm for BufferTable {
             .clone()
     }
 
-    /// Exact, because the rows are in memory and counting them is a walk of a
-    /// `Vec` — no sampling and no estimate needed.
     fn scan_label(&self) -> String {
         match &self.scan_label {
             Some(label) => label.clone(),
@@ -638,9 +769,14 @@ impl TableAm for BufferTable {
         }
     }
 
+    /// Exact, because the rows are in memory and counting them is a walk of a
+    /// `Vec` — no sampling and no estimate needed.
+    ///
+    /// A set `xmax` alone does not make a row dead: an aborted deleter leaves it
+    /// live, and `vacuum` never clears the field, so counting on `xmax.is_valid()`
+    /// would report a relation as permanently empty after one rolled-back DELETE.
     fn statistics(&self) -> RelStats {
-        let rows = self.rows_read();
-        let live = rows.iter().filter(|row| !row.hdr.xmax.is_valid()).count();
+        let live = self.live_rows();
         RelStats::exact(live, &self.schema)
     }
 
@@ -1017,6 +1153,86 @@ mod tests {
             Ok(())
         }
         fn log_abort(&self, _xid: Xid) {}
+    }
+
+    /// Row ids are minted before the install lock is taken, so two writers can
+    /// arrive out of order. Every lookup binary-searches, so an unsorted `rows`
+    /// silently loses rows — they get copied into a chunk and never tombstoned.
+    #[test]
+    fn out_of_order_appends_stay_searchable() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (wal, table) = open(dir.path())?;
+        let tm = manager(&wal);
+
+        // Mint B's ids first but install A's rows first, which is exactly what an
+        // interleaving of the unlocked encode step produces.
+        let first = table.alloc_row_ids(2)?;
+        let second = table.alloc_row_ids(2)?;
+        assert!(first < second);
+        let xid = tm.allocate_xid();
+        let txn = tm.context(xid, CommandId::FIRST);
+        table.append_at(second, vec![row(3, "c"), row(4, "d")], &txn)?;
+        table.append_at(first, vec![row(1, "a"), row(2, "b")], &txn)?;
+        tm.commit(xid)?;
+
+        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(visible_ids(&table, &reader), vec![1, 2, 3, 4]);
+        // The out-of-order ids must still resolve, or a flush would copy them to a
+        // chunk and fail to tombstone them, duplicating them permanently.
+        for row_id in [first, first + 1, second, second + 1] {
+            assert!(
+                table.fetch(Tid::logical(row_id), &reader)?.is_some(),
+                "row {row_id} must be reachable after an out-of-order install"
+            );
+        }
+        let stamped = table.delete_many_in(
+            table.relfilenode(),
+            (first..first + 2)
+                .chain(second..second + 2)
+                .map(Tid::logical)
+                .collect(),
+            &tm.context(tm.allocate_xid(), CommandId::FIRST),
+        )?;
+        assert_eq!(stamped, 4, "every row must be tombstonable");
+        Ok(())
+    }
+
+    /// A rolled-back DELETE leaves `xmax` set, and nothing ever clears it, so
+    /// counting live rows by "xmax is unset" reports the relation permanently
+    /// empty — which flows straight into `pg_class.reltuples`.
+    #[test]
+    fn an_aborted_delete_does_not_make_rows_look_gone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (wal, table) = open(dir.path())?;
+        let tm = manager(&wal);
+        table.attach_clog(Arc::clone(tm.clog()));
+
+        let writer = tm.allocate_xid();
+        let tids = table.insert_many(
+            vec![row(1, "a"), row(2, "b"), row(3, "c")],
+            &tm.context(writer, CommandId::FIRST),
+        )?;
+        tm.commit(writer)?;
+        assert_eq!(table.live_rows(), 3);
+
+        let deleter = tm.allocate_xid();
+        table.delete_many(tids.clone(), &tm.context(deleter, CommandId::FIRST))?;
+        tm.abort(deleter);
+
+        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(visible_ids(&table, &reader), vec![1, 2, 3]);
+        assert_eq!(
+            table.live_rows(),
+            3,
+            "an aborted deleter leaves the rows live, so they must still be counted"
+        );
+
+        // And a committed delete really does drop the count.
+        let deleter = tm.allocate_xid();
+        table.delete_many(vec![tids[0]], &tm.context(deleter, CommandId::FIRST))?;
+        tm.commit(deleter)?;
+        assert_eq!(table.live_rows(), 2);
+        Ok(())
     }
 
     #[test]

@@ -22,7 +22,7 @@
 //! not yet in a chunk, or in the chunk and gone from the buffer — never both and
 //! never neither, no matter when the two leaf scans open relative to the flush.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_buffer_engine::BufferTable;
 use crabgresql_storage_api::{
@@ -46,6 +46,11 @@ pub struct BufferedParquetTable {
     /// two must describe the same set of rows. Holding them here is what keeps a
     /// `PRIMARY KEY` checked against buffered *and* flushed rows.
     indexes: RwLock<Vec<IndexMetadata>>,
+    /// Held for the duration of a flush, so only one runs per relation. Two
+    /// concurrent flushes each see the other's XID as in-progress, so each would
+    /// copy the same rows into its own fragment and neither's tombstones would
+    /// apply to the other's view.
+    flushing: Mutex<()>,
 }
 
 impl BufferedParquetTable {
@@ -55,6 +60,7 @@ impl BufferedParquetTable {
             chunks: Arc::new(chunks),
             buffer: Arc::new(buffer),
             indexes: RwLock::new(indexes),
+            flushing: Mutex::new(()),
         }
     }
 
@@ -152,33 +158,46 @@ impl BufferedParquetTable {
     /// is fixed when its snapshot is taken — `Snapshot::in_progress` is `true` for
     /// any XID at or above the snapshot's `xmax` — so a snapshot either predates
     /// the flush and reads the rows from the buffer, or postdates it and reads
-    /// them from the chunk. Never both, never neither, however the two leaf scans
-    /// interleave with the flush.
+    /// them from the chunk. Never both, never neither.
     ///
     /// The rows keep their contents but are restamped with the flush's XID rather
-    /// than their original inserters'. That is sound because the buffer copy
-    /// survives until [`TableAm::vacuum`] proves no snapshot still needs it, so a
-    /// reader that predates the flush never loses sight of the row.
-    pub fn flush(
-        &self,
-        txnmgr: &TransactionManager,
-        oldest: Xid,
-    ) -> Result<u64, StorageError> {
-        // Allocate first, then take the shared hold, then the snapshot. The hold
-        // must precede the snapshot (invariant P1 on `ParquetTable::scan_in`): a
-        // concurrent TRUNCATE can otherwise swap the directory out from under a
-        // flush that already decided which rows to move, resurrecting them in a
-        // generation that was supposed to be empty.
+    /// than their original inserters'. That is sound only because the buffer copy
+    /// survives until the reclamation horizon proves no snapshot still needs it —
+    /// see [`TransactionManager::reclaim_horizon`], which accounts for readers
+    /// that hold a snapshot without ever allocating an XID.
+    ///
+    /// Returns `Ok(0)` without doing anything when another flush is already
+    /// running or the relation is exclusively locked; both are transient and the
+    /// caller retries on its next pass.
+    pub fn flush(&self, txnmgr: &TransactionManager) -> Result<u64, StorageError> {
+        // Serialize flushes of this relation against each other. Two concurrent
+        // flushes would each snapshot the same rows (each sees the other's XID as
+        // in-progress, so neither's tombstones apply to the other's view), write
+        // duplicate fragments, and both commit — returning every flushed row twice
+        // for the rest of the relation's life. The chunk store's shared hold
+        // cannot do this job: shared does not exclude shared.
+        let Ok(_flushing) = self.flushing.try_lock() else {
+            return Ok(0);
+        };
+        // Non-blocking, and taken BEFORE the snapshot (invariant P1 on
+        // `ParquetTable::scan_in`): a concurrent TRUNCATE must not swap the
+        // directory out from under a flush that already chose its rows.
+        let Some(_guard) = self.chunks.lock.try_acquire_shared(LockOwner::INTERNAL) else {
+            return Ok(0);
+        };
+
         let xid = txnmgr.allocate_xid();
-        let _guard = self.chunks.lock.acquire_shared(LockOwner(xid.0));
-        let txn = txnmgr.context(xid, crabgresql_txn::CommandId::FIRST);
+        let mut txn = txnmgr.context(xid, crabgresql_txn::CommandId::FIRST);
+        // Engine-internal work with no session, which is exactly what this owner
+        // is reserved for. Deriving an owner from the XID instead would share a
+        // numeric space with session owners, and a collision would let a flush be
+        // mistaken for the session holding a TRUNCATE.
+        txn.lock_owner = LockOwner::INTERNAL;
 
         let rows = self.buffer.snapshot_rows(&txn);
         if rows.is_empty() {
             txnmgr.abort(xid);
-            // Nothing to flush is still a good moment to reclaim rows an earlier
-            // flush superseded, now that no snapshot can need them.
-            self.buffer.vacuum(oldest, &txn.clog);
+            self.buffer.vacuum(txnmgr.reclaim_horizon(), &txn.clog);
             return Ok(0);
         }
         let flushed = rows.len() as u64;
@@ -188,21 +207,38 @@ impl BufferedParquetTable {
         // One `insert_many` for the whole batch, so the flush produces one
         // fragment rather than one per original transaction — which is the entire
         // reason the buffer exists.
-        if let Err(error) = self
+        let staged = self
             .chunks
             .insert_many(values, &txn)
-            .and_then(|_| self.buffer.delete_many_in(rel, tids, &txn))
-        {
-            // Abort undoes both halves at once: the fragment is still `.pending`
-            // and the finalize hook unlinks it, and an `xmax` belonging to an
-            // aborted transaction means "not deleted".
-            txnmgr.abort(xid);
-            return Err(error);
+            .and_then(|_| self.buffer.delete_many_in(rel, tids, &txn));
+        match staged {
+            // Every row this flush copied must also have been tombstoned. A
+            // shortfall means some row is now in the chunk *and* still live in the
+            // buffer, so publishing the fragment would duplicate it; abort instead
+            // and let the next pass retry.
+            Ok(stamped) if stamped == flushed => {}
+            Ok(stamped) => {
+                txnmgr.abort(xid);
+                return Err(StorageError::CorruptData(format!(
+                    "buffer flush copied {flushed} rows but tombstoned {stamped}"
+                )));
+            }
+            Err(error) => {
+                // Abort undoes both halves at once: the fragment is still
+                // `.pending` and the finalize hook unlinks it, and an `xmax`
+                // belonging to an aborted transaction means "not deleted".
+                txnmgr.abort(xid);
+                return Err(error);
+            }
         }
         txnmgr
             .commit(xid)
             .map_err(|error| StorageError::Io(error.to_string()))?;
-        self.buffer.vacuum(oldest, &txn.clog);
+        // Recompute the horizon AFTER the commit. One captured before this
+        // transaction started can never cover the rows it just stamped, so the
+        // flush would free no memory at all and the relation would look
+        // permanently over its threshold.
+        self.buffer.vacuum(txnmgr.reclaim_horizon(), &txn.clog);
         Ok(flushed)
     }
 
@@ -295,11 +331,15 @@ impl TableAm for BufferedParquetTable {
     }
 
     fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+        // The relation's shared hold covers the buffer half too, even though the
+        // buffer owns no files. Without it a writer would not conflict with a
+        // staged TRUNCATE's AccessExclusive hold, and its rows would be logged
+        // under a relfilenode the TRUNCATE is about to supersede — acknowledged
+        // and visible, then silently absent after the next restart.
+        let _guard = self.chunks.lock.acquire_shared(txn.lock_owner);
         // The *effective* generation, not the live one: a transaction that has
         // staged a TRUNCATE reads and writes in the staged directory, so its
-        // buffered rows must be logged there too. Otherwise recovery would look
-        // for them under the committed id and find nothing — losing rows the
-        // transaction had already acknowledged.
+        // buffered rows must be logged there too.
         self.buffer
             .append_in(self.chunks.effective_rel(txn.xid), tuples, txn)
     }
@@ -330,15 +370,17 @@ impl TableAm for BufferedParquetTable {
     /// transaction means "not deleted").
     fn truncate(&self, txn: &TxnContext) -> Result<(), StorageError> {
         self.chunks.truncate(txn)?;
-        let visible: Vec<Tid> = self
-            .buffer
-            .scan(txn)
-            .filter_map(|row| row.ok().map(|(tid, _)| tid))
-            .collect();
-        // Tombstones belong to the generation the rows are in — the one being
-        // superseded — not to the directory this TRUNCATE just staged.
+        // Every live row, not just the ones this transaction can see. The chunk
+        // half discards its whole directory regardless of snapshot, so scoping the
+        // buffer half to the truncater's snapshot would let a row committed by
+        // another session after that snapshot was taken survive a committed
+        // TRUNCATE — and then vanish at the next restart, because the buffer
+        // rebinds to the post-truncate generation.
+        //
+        // Safe because TRUNCATE holds AccessExclusive: no other transaction can be
+        // mid-write here, so "live now" is a stable set.
         self.buffer
-            .delete_many_in(self.chunks.relfilenode(), visible, txn)?;
+            .delete_all_live_in(self.chunks.relfilenode(), txn)?;
         Ok(())
     }
 
@@ -354,7 +396,7 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     use crabgresql_storage_api::{Column, RelfilenodeAllocator, TableAccessMethod};
-    use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager};
+    use crabgresql_txn::{Clog, CommandId, CommitSink, IsolationLevel, TransactionManager};
     use crabgresql_types::{PgType, Value};
     use crabgresql_wal::Wal;
 
@@ -426,6 +468,14 @@ mod tests {
         Ok((table, tm))
     }
 
+    /// A reader built the way the server builds one for a read-only statement:
+    /// with no XID at all. That is the shape that matters — a reader holding an
+    /// XID is counted by `snapshot().xmin` and would hold back reclamation for
+    /// the wrong reason, hiding whether the snapshot registry actually works.
+    fn read_only(tm: &TransactionManager) -> TxnContext {
+        tm.context(Xid::INVALID, CommandId::FIRST)
+    }
+
     fn ids_of(rows: Vec<(Tid, Tuple)>) -> Vec<i32> {
         let mut ids: Vec<i32> = rows
             .into_iter()
@@ -487,10 +537,10 @@ mod tests {
             let (table, tm) = open_wired(dir.path())?;
             seed(&table, &tm, &[1, 2, 3, 4, 5]);
 
-            let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+            let reader = read_only(&tm);
             let ids = append_scan_with(&table, &reader, first_buffer, || {
                 let flushed = table
-                    .flush(&tm, tm.snapshot().xmin)
+                    .flush(&tm)
                     .expect("flush must succeed");
                 assert_eq!(flushed, 5);
             });
@@ -510,16 +560,27 @@ mod tests {
         seed(&table, &tm, &[1, 2, 3]);
 
         // A reader that started before the flush keeps reading the buffer copy,
-        // which is why the flush may not reclaim it eagerly.
-        let older = tm.context(tm.allocate_xid(), CommandId::FIRST);
-        assert_eq!(table.flush(&tm, older.snapshot.xmin)?, 3);
+        // which is why the flush may not reclaim it eagerly. This reader holds NO
+        // XID, so only the snapshot registry holds the horizon back.
+        let older = read_only(&tm);
+        assert_eq!(table.flush(&tm)?, 3);
         assert_eq!(
             ids_of(table.scan(&older).map(|r| r.expect("scan")).collect()),
             vec![1, 2, 3],
             "a snapshot older than the flush must still see every row exactly once"
         );
+        // A second flush runs the reclamation path with a horizon computed after
+        // the first flush committed. Without the registry it would collect the
+        // buffer copies this reader is still using, and its next scan would come
+        // back empty — rows the user never deleted vanishing mid-transaction.
+        assert_eq!(table.flush(&tm)?, 0);
+        assert_eq!(
+            ids_of(table.scan(&older).map(|r| r.expect("scan")).collect()),
+            vec![1, 2, 3],
+            "reclamation must not run past a live snapshot that holds no XID"
+        );
 
-        let newer = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        let newer = read_only(&tm);
         assert_eq!(
             ids_of(table.scan(&newer).map(|r| r.expect("scan")).collect()),
             vec![1, 2, 3],
@@ -540,17 +601,130 @@ mod tests {
         table.insert_many(vec![vec![Value::Int4(9)]], &open_txn)?;
 
         assert_eq!(
-            table.flush(&tm, tm.snapshot().xmin)?,
+            table.flush(&tm)?,
             2,
             "only committed rows may be flushed"
         );
         tm.commit(open_xid)?;
 
-        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        let reader = read_only(&tm);
         assert_eq!(
             ids_of(table.scan(&reader).map(|r| r.expect("scan")).collect()),
             vec![1, 2, 9],
             "the row that was in flight during the flush must still be readable"
+        );
+        Ok(())
+    }
+
+    /// Once every reader that predates the flush is gone, the copies it was
+    /// holding back must actually be freed — otherwise the relation looks
+    /// permanently over its threshold and the worker re-flushes forever.
+    #[test]
+    fn reclamation_frees_the_buffer_once_no_reader_needs_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (table, tm) = open_wired(dir.path())?;
+        seed(&table, &tm, &[1, 2, 3]);
+        let before = table.buffer().resident_bytes();
+        assert!(before > 0);
+
+        {
+            let _reader = read_only(&tm);
+            assert_eq!(table.flush(&tm)?, 3);
+            assert_eq!(
+                table.buffer().resident_bytes(),
+                before,
+                "a live reader must hold the copies back"
+            );
+        }
+        // Reader gone: the next pass reclaims.
+        assert_eq!(table.flush(&tm)?, 0);
+        assert_eq!(
+            table.buffer().resident_bytes(),
+            0,
+            "a flush must free the rows it moved once nothing can still read them"
+        );
+        Ok(())
+    }
+
+    /// A second flush overlapping the first must not copy the same rows into a
+    /// second fragment. Reproduced by holding the flush mutex across the call,
+    /// which is exactly the state a concurrent flush observes.
+    #[test]
+    fn a_second_concurrent_flush_does_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (table, tm) = open_wired(dir.path())?;
+        seed(&table, &tm, &[1, 2, 3]);
+
+        let held = table
+            .flushing
+            .try_lock()
+            .expect("no flush is running in this test");
+        assert_eq!(
+            table.flush(&tm)?,
+            0,
+            "a flush must decline while another holds the relation"
+        );
+        drop(held);
+
+        assert_eq!(table.flush(&tm)?, 3);
+        let reader = read_only(&tm);
+        assert_eq!(
+            ids_of(table.scan(&reader).map(|r| r.expect("scan")).collect()),
+            vec![1, 2, 3],
+            "no row may be duplicated by the declined flush"
+        );
+        Ok(())
+    }
+
+    /// A relation exclusively locked by someone else must be skipped, not waited
+    /// on: the worker serves every relation from one thread, and blocking here
+    /// starves the rest and hangs shutdown.
+    #[test]
+    fn a_flush_declines_rather_than_waiting_for_an_exclusive_lock() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (table, tm) = open_wired(dir.path())?;
+        seed(&table, &tm, &[1, 2, 3]);
+
+        // Stand in for a session sitting inside `BEGIN; TRUNCATE p;`.
+        table.chunks.lock.acquire_exclusive(LockOwner(4_242));
+        let started = std::time::Instant::now();
+        assert_eq!(table.flush(&tm)?, 0, "the flush must decline");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the flush must return immediately, not block on the lock"
+        );
+        table.chunks.lock.release_exclusive(LockOwner(4_242));
+
+        assert_eq!(table.flush(&tm)?, 3, "and succeed once the lock is released");
+        Ok(())
+    }
+
+    /// TRUNCATE empties the relation outright. Scoping the buffer half to the
+    /// truncater's snapshot would leave a row another session committed after
+    /// that snapshot was taken, so a committed TRUNCATE would not truncate.
+    #[test]
+    fn truncate_removes_rows_committed_after_the_truncaters_snapshot()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (table, tm) = open_wired(dir.path())?;
+        seed(&table, &tm, &[1]);
+
+        // The truncater pins its snapshot first (REPEATABLE READ).
+        let snapshot = tm.snapshot();
+        // Another session commits a row the truncater's snapshot cannot see.
+        seed(&table, &tm, &[999]);
+
+        let xid = tm.allocate_xid();
+        let truncater =
+            tm.context_with(xid, CommandId::FIRST, snapshot, IsolationLevel::RepeatableRead);
+        table.truncate(&truncater)?;
+        tm.commit(xid)?;
+
+        let reader = read_only(&tm);
+        assert_eq!(
+            ids_of(table.scan(&reader).map(|r| r.expect("scan")).collect()),
+            Vec::<i32>::new(),
+            "a committed TRUNCATE must leave no row behind, whatever it could see"
         );
         Ok(())
     }
@@ -577,13 +751,13 @@ mod tests {
         };
         assert_eq!(fragments(), 0, "foreground inserts must write no fragment");
 
-        assert_eq!(table.flush(&tm, tm.snapshot().xmin)?, 10);
+        assert_eq!(table.flush(&tm)?, 10);
         assert_eq!(
             fragments(),
             1,
             "ten transactions' rows must consolidate into one fragment"
         );
-        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        let reader = read_only(&tm);
         assert_eq!(
             ids_of(table.scan(&reader).map(|r| r.expect("scan")).collect()),
             (0..10).collect::<Vec<i32>>()

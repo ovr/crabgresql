@@ -260,7 +260,7 @@ mod tests {
         let tm = Arc::new(tm);
         // Set the service directly rather than through `attach_txn_manager`, which
         // would also start a worker on the production policy.
-        let _ = engine.txnmgr.set(Arc::clone(&tm));
+        let _ = engine.txnmgr.set(Arc::downgrade(&tm));
 
         let mut schema = TableSchema::new("p", vec![Column::new("id", PgType::Int4)]);
         schema.access_method = TableAccessMethod::Parquet;

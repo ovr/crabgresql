@@ -5051,6 +5051,26 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves()
         "the two leaves must be distinguishable, not the same line twice"
     );
 
+    // Splitting the relation across leaves must not cost the plan its predicate
+    // or its column names — both live on nodes above the Append.
+    client.simple_query("CREATE TABLE h (id int4, label text)").await?;
+    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p WHERE id = 1").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Append".to_string(),
+            "  Filter: (id = 1)".to_string(),
+            "  ->  Seq Scan on p".to_string(),
+            "  ->  Buffer Scan on p".to_string(),
+        ],
+        "a WHERE on a split relation must still be rendered, and by column name"
+    );
+    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p JOIN h ON p.id = h.id").await?;
+    assert!(
+        lines.iter().any(|line| line.contains("Hash Cond: (id = id)")),
+        "join keys over a split relation must render by name, not as $n: {lines:?}"
+    );
+
     // The leaves are engine-internal: nothing new is addressable from SQL.
     let messages = client
         .simple_query("SELECT relname FROM pg_catalog.pg_class WHERE relname LIKE 'p%'")
@@ -5059,6 +5079,39 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves()
         rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
         vec![Some("p")],
         "a storage leaf must not gain a pg_class row"
+    );
+    Ok(())
+}
+
+/// A committed TRUNCATE empties the relation outright, even when the truncating
+/// transaction holds a snapshot that predates rows another session committed —
+/// the durable and buffered halves must not disagree about what "all rows" means.
+#[tokio::test]
+async fn truncate_under_repeatable_read_leaves_no_rows_behind() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let truncater = connect(port).await;
+    let other = connect(port).await;
+    truncater
+        .simple_query("CREATE TABLE p (id int4) USING parquet")
+        .await?;
+    truncater.simple_query("INSERT INTO p VALUES (1)").await?;
+
+    // Pin the truncater's snapshot before the other session's row exists.
+    truncater
+        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    let messages = truncater.simple_query("SELECT id FROM p").await?;
+    assert_eq!(rows(&messages).len(), 1);
+
+    other.simple_query("INSERT INTO p VALUES (999)").await?;
+
+    truncater.simple_query("TRUNCATE p").await?;
+    truncater.simple_query("COMMIT").await?;
+
+    let messages = other.simple_query("SELECT id FROM p ORDER BY id").await?;
+    assert!(
+        rows(&messages).is_empty(),
+        "a committed TRUNCATE must leave no row behind, including one it could not see"
     );
     Ok(())
 }
@@ -5125,6 +5178,40 @@ async fn vacuum_flushes_buffered_rows_without_changing_what_readers_see()
     assert_eq!(
         in_block.as_db_error().expect("database error").code().code(),
         "25001"
+    );
+    client.simple_query("ROLLBACK").await?;
+
+    // PostgreSQL's own option spellings must be understood as options. Parsed as
+    // a table name instead, `VACUUM ANALYZE` reports 42P01 on a relation the user
+    // never wrote.
+    for sql in [
+        "VACUUM ANALYZE",
+        "VACUUM VERBOSE",
+        "VACUUM ANALYZE p",
+        "VACUUM (ANALYZE) p",
+        "VACUUM (VERBOSE, ANALYZE) p",
+    ] {
+        client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|error| panic!("`{sql}` must be accepted: {error}"));
+    }
+
+    // Inside a block, the transaction-block check must win over the unsupported
+    // -modifier check, as it does in PostgreSQL.
+    client.simple_query("BEGIN").await?;
+    let full_in_block = client
+        .simple_query("VACUUM FULL p")
+        .await
+        .expect_err("VACUUM inside a transaction block must fail");
+    assert_eq!(
+        full_in_block
+            .as_db_error()
+            .expect("database error")
+            .code()
+            .code(),
+        "25001",
+        "a transaction block is rejected before any option is inspected"
     );
     client.simple_query("ROLLBACK").await?;
 
@@ -5207,6 +5294,25 @@ async fn buffer_tables_are_fully_mutable_and_reflect_their_access_method()
     client.simple_query("ROLLBACK").await?;
     let messages = client.simple_query("SELECT id FROM b").await?;
     assert_eq!(rows(&messages).len(), 2);
+
+    // A rolled-back DELETE leaves `xmax` set on every row; counting those as dead
+    // would report the relation permanently empty in pg_class.
+    client.simple_query("BEGIN").await?;
+    client.simple_query("DELETE FROM b").await?;
+    client.simple_query("ROLLBACK").await?;
+    client.simple_query("ANALYZE b").await?;
+    let messages = client
+        .simple_query(
+            "SELECT count(*)::int8 AS live, \
+             (SELECT reltuples::int8 FROM pg_catalog.pg_class WHERE relname = 'b') AS est FROM b",
+        )
+        .await?;
+    let counted = rows(&messages);
+    assert_eq!(
+        counted[0].get("est"),
+        counted[0].get("live"),
+        "reltuples must match the rows a scan returns after an aborted DELETE"
+    );
 
     client.simple_query("TRUNCATE b").await?;
     assert!(rows(&client.simple_query("SELECT id FROM b").await?).is_empty());
