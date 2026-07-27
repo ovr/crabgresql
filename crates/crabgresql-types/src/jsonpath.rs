@@ -25,6 +25,7 @@ use std::cmp::Ordering;
 // SQLSTATE literals (kept local; the types crate must not depend on the wire
 // crate). Mirror `crabgresql_pg_wire::sqlstate`.
 const SYNTAX_ERROR: &str = "42601";
+const FEATURE_NOT_SUPPORTED: &str = "0A000";
 const UNDEFINED_OBJECT: &str = "42704";
 const DIVISION_BY_ZERO: &str = "22012";
 const SQL_JSON_MEMBER_NOT_FOUND: &str = "2203A";
@@ -88,7 +89,7 @@ enum Node {
     LikeRegex {
         operand: Box<Node>,
         pattern: String,
-        flags: String,
+        flags: crate::text::LikeRegexFlags,
     },
     IsUnknown(Box<Node>),
 }
@@ -195,6 +196,16 @@ fn err(sqlstate: &'static str, message: impl Into<String>) -> JsonError {
 
 fn syntax(message: impl Into<String>) -> JsonError {
     err(SYNTAX_ERROR, message)
+}
+
+/// Carry a `crate::text` failure through unchanged: its SQLSTATE and message
+/// are already the ones PG reports for a bad regex.
+fn text_err(e: crate::text::TextError) -> JsonError {
+    JsonError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+        detail: None,
+    }
 }
 
 /// Whether `silent`/lax suppression applies to this error. PG suppresses every
@@ -670,7 +681,7 @@ impl Parser {
                 Some(Tok::Str(s)) => s,
                 _ => return Err(self.err_here()),
             };
-            let flags = if self.eat_ident_ci("flag") {
+            let raw = if self.eat_ident_ci("flag") {
                 match self.next() {
                     Some(Tok::Str(s)) => s,
                     _ => return Err(self.err_here()),
@@ -678,6 +689,25 @@ impl Parser {
             } else {
                 String::new()
             };
+            // PG validates the flags and compiles the pattern while *parsing*
+            // the path, so all three of these are errors on the cast rather
+            // than on any row — a path over an empty array still raises them.
+            let flags = crate::text::LikeRegexFlags::parse(&raw).map_err(|c| JsonError {
+                sqlstate: SYNTAX_ERROR,
+                message: "invalid input syntax for type jsonpath".to_string(),
+                detail: Some(format!(
+                    "Unrecognized flag character \"{c}\" in LIKE_REGEX predicate."
+                )),
+            })?;
+            // `q` escapes the whole pattern, which makes expanded mode moot, so
+            // PG only rejects `x` when `q` is absent.
+            if flags.wspace && !flags.quote {
+                return Err(err(
+                    FEATURE_NOT_SUPPORTED,
+                    "XQuery \"x\" flag (expanded regular expressions) is not implemented",
+                ));
+            }
+            crate::text::like_regex_compile(&pattern, flags).map_err(text_err)?;
             Node::LikeRegex { operand: Box::new(left), pattern, flags }
         } else {
             left
@@ -1125,9 +1155,11 @@ fn write_node(out: &mut String, node: &Node, brackets: bool) {
             write_node(out, operand, prio(operand) <= sp);
             out.push_str(" like_regex ");
             write_json_string(out, pattern);
+            // Re-emitted from the parsed set, so the spelling is canonical
+            // rather than whatever the user wrote.
             if !flags.is_empty() {
                 out.push_str(" flag ");
-                write_json_string(out, flags);
+                write_json_string(out, &flags.canonical());
             }
             if brackets {
                 out.push(')');
@@ -1681,7 +1713,7 @@ impl Eval<'_> {
             }),
             Node::Compare { op, left, right } => self.compare(*op, left, right, current),
             Node::StartsWith { operand, prefix } => self.starts_with(operand, prefix, current),
-            Node::LikeRegex { operand, pattern, flags } => self.like_regex(operand, pattern, flags, current),
+            Node::LikeRegex { operand, pattern, flags } => self.like_regex(operand, pattern, *flags, current),
             Node::Exists(inner) => {
                 // exists() suppresses structural errors → Unknown.
                 match self.seq(inner, current, None) {
@@ -1745,7 +1777,13 @@ impl Eval<'_> {
         Ok(if unknown { Ternary::Unknown } else { Ternary::False })
     }
 
-    fn like_regex(&self, operand: &Node, pattern: &str, flags: &str, current: &Jsonb) -> Result<Ternary, JsonError> {
+    fn like_regex(
+        &self,
+        operand: &Node,
+        pattern: &str,
+        flags: crate::text::LikeRegexFlags,
+        current: &Jsonb,
+    ) -> Result<Ternary, JsonError> {
         let ls = self.pred_operand(operand, current)?;
         let mut unknown = false;
         for l in &ls {
@@ -1756,7 +1794,10 @@ impl Eval<'_> {
                 Jsonb::String(s) => match crate::text::like_regex_match(s, pattern, flags) {
                     Ok(true) => return Ok(Ternary::True),
                     Ok(false) => {}
-                    Err(_) => unknown = true,
+                    // Unreachable: the parser compiled this same pattern under
+                    // these same flags. Propagating rather than degrading to
+                    // Unknown keeps any future drift between the two loud.
+                    Err(e) => return Err(text_err(e)),
                 },
                 _ => unknown = true,
             }
@@ -1947,6 +1988,64 @@ mod tests {
         Ok(items.iter().map(crate::json::format).collect())
     }
 
+    /// PG validates `like_regex` while parsing the path, so these are all
+    /// errors on the cast rather than on any row.
+    #[test]
+    fn like_regex_is_validated_at_parse_time() {
+        // An unrecognized flag character, reported with PG's DETAIL.
+        let e = jsonpath_in("$ like_regex \"a\" flag \"z\"").unwrap_err();
+        assert_eq!(e.sqlstate, "42601");
+        assert_eq!(e.message, "invalid input syntax for type jsonpath");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Unrecognized flag character \"z\" in LIKE_REGEX predicate.")
+        );
+        assert_eq!(
+            jsonpath_in("$ like_regex \"a\" flag \"hello\"")
+                .unwrap_err()
+                .detail
+                .as_deref(),
+            Some("Unrecognized flag character \"h\" in LIKE_REGEX predicate.")
+        );
+
+        // `x` is unimplemented, but only rejected when `q` is absent.
+        let e = jsonpath_in("$ like_regex \"a\" flag \"ismx\"").unwrap_err();
+        assert_eq!(e.sqlstate, "0A000");
+        assert_eq!(
+            e.message,
+            "XQuery \"x\" flag (expanded regular expressions) is not implemented"
+        );
+        assert!(jsonpath_in("$ like_regex \"a\" flag \"qx\"").is_ok());
+        assert!(jsonpath_in("$ like_regex \"a\" flag \"ismxq\"").is_ok());
+
+        // The pattern itself is compiled during the parse. (Only the SQLSTATE
+        // is pinned: our message comes from the `regex` crate and differs from
+        // PG's wording, as it already does for the `~` operator.)
+        assert_eq!(
+            jsonpath_in("$ like_regex \"a(\"").unwrap_err().sqlstate,
+            "2201B"
+        );
+        // Under `q` the pattern is escaped, so a "bad" regex is fine.
+        assert!(jsonpath_in("$ like_regex \"a(\" flag \"q\"").is_ok());
+    }
+
+    #[test]
+    fn like_regex_evaluates_under_flags() -> Result<()> {
+        // `q` matches the literal text, including regex metacharacters.
+        assert_eq!(q("{\"a\":\"a(\"}", "$.a ? (@ like_regex \"a(\" flag \"q\")")?, ["\"a(\""]);
+        // `x` is inert: it survives parsing only with `q`, which already made
+        // the pattern literal, so the spaces still have to match.
+        assert_eq!(q("{\"a\":\"a b\"}", "$.a ? (@ like_regex \"a b\" flag \"xq\")")?, ["\"a b\""]);
+        assert!(q("{\"a\":\"ab\"}", "$.a ? (@ like_regex \"a b\" flag \"xq\")")?.is_empty());
+        // `i` composes with `q`.
+        assert_eq!(q("{\"a\":\"A.C\"}", "$.a ? (@ like_regex \"a.c\" flag \"qi\")")?, ["\"A.C\""]);
+        // `s` lets `.` span a newline; without it, it must not.
+        assert_eq!(q("{\"a\":\"a\\nb\"}", "$.a ? (@ like_regex \"a.b\" flag \"s\")")?.len(), 1);
+        assert!(q("{\"a\":\"a\\nb\"}", "$.a ? (@ like_regex \"a.b\")")?.is_empty());
+
+        Ok(())
+    }
+
     #[test]
     fn output_canonical_form() -> Result<()> {
         assert_eq!(out("$.a.b[*] ? (@ > 3)")?, "$.\"a\".\"b\"[*]?(@ > 3)");
@@ -1954,6 +2053,15 @@ mod tests {
         assert_eq!(out("strict $.a.**{2 to 4}.c")?, "strict $.\"a\".**{2 to 4}.\"c\"");
         assert_eq!(out("$.a + $.b * 2 - (-3)")?, "(($.\"a\" + $.\"b\" * 2) - -3)");
         assert_eq!(out("$ ? (@ like_regex \"ab.*c\" flag \"i\")")?, "$?(@ like_regex \"ab.*c\" flag \"i\")");
+        // Flags are re-emitted from the parsed set: fixed order, deduplicated,
+        // and omitted entirely when empty.
+        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"qmi\")")?, "$?(@ like_regex \"a\" flag \"imq\")");
+        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"ii\")")?, "$?(@ like_regex \"a\" flag \"i\")");
+        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"\")")?, "$?(@ like_regex \"a\")");
+        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"xq\")")?, "$?(@ like_regex \"a\" flag \"xq\")");
+        // Canonical output must re-parse: `x` is emitted before the `q` that
+        // makes it legal.
+        assert_eq!(out(&out("$ ? (@ like_regex \"a\" flag \"qx\")")?)?, "$?(@ like_regex \"a\" flag \"xq\")");
         assert_eq!(out("$ ? (@.name starts with \"Jo\")")?, "$?(@.\"name\" starts with \"Jo\")");
         assert_eq!(out("$ ? (exists (@.x))")?, "$?(exists (@.\"x\"))");
         assert_eq!(out("$ ? ((@ > 1) is unknown)")?, "$?((@ > 1) is unknown)");

@@ -37,6 +37,49 @@ SELECT '$ ? (@ like_regex "ab.*c" flag "i")'::jsonpath AS re;
  $?(@ like_regex "ab.*c" flag "i")
 (1 row)
 
+-- like_regex flags are re-emitted from the parsed set: fixed order, deduped,
+-- and omitted when empty
+SELECT '$ ? (@ like_regex "a" flag "qmi")'::jsonpath AS re_ord,
+       '$ ? (@ like_regex "a" flag "ii")'::jsonpath AS re_dup,
+       '$ ? (@ like_regex "a" flag "")'::jsonpath AS re_none,
+       '$ ? (@ like_regex "a" flag "xq")'::jsonpath AS re_xq;
+             re_ord              |            re_dup             |       re_none        |             re_xq              
+---------------------------------+-------------------------------+----------------------+--------------------------------
+ $?(@ like_regex "a" flag "imq") | $?(@ like_regex "a" flag "i") | $?(@ like_regex "a") | $?(@ like_regex "a" flag "xq")
+(1 row)
+
+-- like_regex flags are validated when the path is parsed, not when it is used
+SELECT '$ like_regex "a" flag "z"'::jsonpath;
+ERROR:  invalid input syntax for type jsonpath
+LINE 1: SELECT '$ like_regex "a" flag "z"'::jsonpath;
+               ^
+DETAIL:  Unrecognized flag character "z" in LIKE_REGEX predicate.
+SELECT '$ like_regex "a" flag "x"'::jsonpath;
+ERROR:  XQuery "x" flag (expanded regular expressions) is not implemented
+LINE 1: SELECT '$ like_regex "a" flag "x"'::jsonpath;
+               ^
+-- ... so an empty array, which iterates nothing, still raises
+SELECT jsonb_path_match('[]'::jsonb, '$[*] ? (@ like_regex "a b" flag "x")'::jsonpath);
+ERROR:  XQuery "x" flag (expanded regular expressions) is not implemented
+LINE 1: SELECT jsonb_path_match('[]'::jsonb, '$[*] ? (@ like_regex "...
+                                             ^
+SELECT pg_input_is_valid('$ like_regex "a" flag "z"', 'jsonpath') AS bad_flag,
+       pg_input_is_valid('$ like_regex "a" flag "qx"', 'jsonpath') AS ok_flag;
+ bad_flag | ok_flag 
+----------+---------
+ f        | t
+(1 row)
+
+-- q matches the pattern literally, and composes with i
+SELECT jsonb_path_match('"A.C"'::jsonb, '$ like_regex "a.c" flag "qi"') AS q_i,
+       jsonb_path_match('"ABC"'::jsonb, '$ like_regex "a.c" flag "q"') AS q_only,
+       jsonb_path_match('"a\nb"'::jsonb, '$ like_regex "^b" flag "m"') AS m_flag,
+       jsonb_path_match('"a\nb"'::jsonb, '$ like_regex "a.b"') AS no_s;
+ q_i | q_only | m_flag | no_s 
+-----+--------+--------+------
+ t   | f      | t      | f
+(1 row)
+
 SELECT '$ ? (@.name starts with "Jo")'::jsonpath AS sw;
               sw               
 -------------------------------

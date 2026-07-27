@@ -739,19 +739,93 @@ pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<boo
     with_cached(pattern, PatternKind::Regex(opts), |re| re.is_match(s))
 }
 
-/// jsonpath's `like_regex`, which is XQuery-flavored rather than POSIX: `.`
-/// does *not* match a newline unless the `s` flag asks for it, the opposite of
-/// [`regex_match`]'s default. Only `i s m x q` are meaningful here; PG's
-/// jsonpath parser rejects anything else before we see it.
-pub fn like_regex_match(s: &str, pattern: &str, flags: &str) -> Result<bool> {
-    let opts = ReOpts {
-        case_insensitive: flags.contains('i'),
-        multi_line: flags.contains('m'),
-        dot_all: flags.contains('s'),
-        ignore_whitespace: flags.contains('x'),
-        literal: flags.contains('q'),
-    };
-    with_cached(pattern, PatternKind::Regex(opts), |re| re.is_match(s))
+/// The flag set jsonpath's `like_regex ... flag "..."` accepts. It is
+/// XQuery-flavored rather than POSIX, so it is both a different set and a
+/// different default from [`parse_re_flags`]: `.` does *not* span a newline
+/// unless `s` asks for it.
+///
+/// Held as a parsed set rather than the literal text because PG re-emits it in
+/// a fixed order with duplicates collapsed, so `flag "qmi"` prints as
+/// `flag "imq"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LikeRegexFlags {
+    /// `i` — case-insensitive.
+    pub icase: bool,
+    /// `s` — `.` matches a newline.
+    pub dotall: bool,
+    /// `m` — `^`/`$` match at line boundaries.
+    pub mline: bool,
+    /// `x` — expanded mode. PG rejects this flag unless `q` is also present,
+    /// and `q` makes the pattern literal, so it never affects a match.
+    pub wspace: bool,
+    /// `q` — the pattern is a literal string.
+    pub quote: bool,
+}
+
+impl LikeRegexFlags {
+    /// Parse a flag string, reporting the first unrecognized character.
+    pub fn parse(flags: &str) -> std::result::Result<Self, char> {
+        let mut out = LikeRegexFlags::default();
+        for c in flags.chars() {
+            match c {
+                'i' => out.icase = true,
+                's' => out.dotall = true,
+                'm' => out.mline = true,
+                'x' => out.wspace = true,
+                'q' => out.quote = true,
+                other => return Err(other),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == LikeRegexFlags::default()
+    }
+
+    /// PG's spelling of the set: the flags it contains, in a fixed order.
+    pub fn canonical(self) -> String {
+        let mut out = String::new();
+        for (on, c) in [
+            (self.icase, 'i'),
+            (self.dotall, 's'),
+            (self.mline, 'm'),
+            (self.wspace, 'x'),
+            (self.quote, 'q'),
+        ] {
+            if on {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn opts(self) -> ReOpts {
+        ReOpts {
+            case_insensitive: self.icase,
+            multi_line: self.mline,
+            dot_all: self.dotall,
+            // Never set: `x` only survives parsing alongside `q`, which escapes
+            // the whole pattern, leaving expanded mode unobservable.
+            ignore_whitespace: false,
+            literal: self.quote,
+        }
+    }
+}
+
+/// jsonpath's `like_regex`.
+pub fn like_regex_match(s: &str, pattern: &str, flags: LikeRegexFlags) -> Result<bool> {
+    with_cached(pattern, PatternKind::Regex(flags.opts()), |re| {
+        re.is_match(s)
+    })
+}
+
+/// Compile-check a `like_regex` pattern without matching anything, as PG does
+/// while *parsing* the path — a bad pattern is an error on the cast, not on the
+/// row. The compile is not wasted work: it seats the pattern at the head of the
+/// per-thread cache, where the first evaluation finds it.
+pub fn like_regex_compile(pattern: &str, flags: LikeRegexFlags) -> Result<()> {
+    with_cached(pattern, PatternKind::Regex(flags.opts()), |_| ())
 }
 
 /// `SIMILAR TO`: an SQL-standard pattern language distinct from both LIKE and
@@ -1829,14 +1903,56 @@ mod tests {
     /// unless `s` is given, the opposite of the `~` operator's default.
     #[test]
     fn jsonpath_like_regex_flags() -> anyhow::Result<()> {
-        assert!(!like_regex_match("a\nb", "a.b", "")?);
-        assert!(like_regex_match("a\nb", "a.b", "s")?);
-        assert!(like_regex_match("ABC", "abc", "i")?);
-        assert!(!like_regex_match("ABC", "abc", "")?);
+        let f = |s: &str| LikeRegexFlags::parse(s).expect("valid flags");
+
+        assert!(!like_regex_match("a\nb", "a.b", f(""))?);
+        assert!(like_regex_match("a\nb", "a.b", f("s"))?);
+        assert!(like_regex_match("ABC", "abc", f("i"))?);
+        assert!(!like_regex_match("ABC", "abc", f(""))?);
+        // `m` anchors at line boundaries without letting `.` span them.
+        assert!(like_regex_match("a\nb", "^b", f("m"))?);
+        assert!(!like_regex_match("a\nb", "^b", f(""))?);
+        assert!(!like_regex_match("a\nb", "a.b", f("m"))?);
+        // `q` makes the pattern literal, and composes with `i`.
+        assert!(like_regex_match("a.c", "a.c", f("q"))?);
+        assert!(!like_regex_match("abc", "a.c", f("q"))?);
+        assert!(like_regex_match("A.C", "a.c", f("qi"))?);
+        // Non-`s` mode also keeps a negated class from matching a newline.
+        assert!(!like_regex_match("\n", "[^x]", f(""))?);
+        assert!(like_regex_match("\n", "[^x]", f("s"))?);
         // `~` keeps the POSIX default, so the two disagree by design.
         assert!(regex_match("a\nb", "a.b", false)?);
 
         Ok(())
+    }
+
+    #[test]
+    fn like_regex_flags_parse_and_canonicalize() {
+        // PG re-emits the parsed set in a fixed order, deduplicated.
+        let canon = |s: &str| LikeRegexFlags::parse(s).expect("valid").canonical();
+        assert_eq!(canon("qmi"), "imq");
+        assert_eq!(canon("xsmiq"), "ismxq");
+        assert_eq!(canon("ii"), "i");
+        assert_eq!(canon(""), "");
+        assert_eq!(canon("xq"), "xq");
+        assert!(LikeRegexFlags::parse("").expect("valid").is_empty());
+        // The first unrecognized character is reported.
+        assert_eq!(LikeRegexFlags::parse("z"), Err('z'));
+        assert_eq!(LikeRegexFlags::parse("ihello"), Err('h'));
+        assert_eq!(LikeRegexFlags::parse("g"), Err('g'));
+    }
+
+    #[test]
+    fn like_regex_compiles_at_parse_time() {
+        let f = |s: &str| LikeRegexFlags::parse(s).expect("valid flags");
+
+        assert_eq!(
+            like_regex_compile("a(", f("")).unwrap_err().sqlstate,
+            "2201B"
+        );
+        // Under `q` the pattern is escaped, so it always compiles.
+        assert!(like_regex_compile("a(", f("q")).is_ok());
+        assert!(like_regex_compile("a.b", f("is")).is_ok());
     }
 
     #[test]
