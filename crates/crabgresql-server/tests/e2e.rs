@@ -4979,7 +4979,6 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
     for (sql, verb) in [
         ("UPDATE p SET label = 'x'", "UPDATE"),
         ("DELETE FROM p", "DELETE"),
-        ("TRUNCATE p", "TRUNCATE"),
     ] {
         let error = client
             .simple_query(sql)
@@ -5022,6 +5021,98 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
                 .expect("database error")
                 .code()
                 .code(),
+            "0A000",
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
+/// TRUNCATE on a Parquet table is a transactional directory swap: it empties the
+/// table, a rollback brings every row back, reloading after it works, and it
+/// composes with heap tables in one multi-table statement.
+#[tokio::test]
+async fn parquet_truncate_is_transactional_and_resets_statistics() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE p (id int4, label text) USING parquet")
+        .await?;
+    client.simple_query("CREATE TABLE h (id int4)").await?;
+    client
+        .simple_query("INSERT INTO p VALUES (1, 'one'), (2, 'two')")
+        .await?;
+    client.simple_query("INSERT INTO h VALUES (1)").await?;
+
+    let count = |messages: &[tokio_postgres::SimpleQueryMessage]| {
+        rows(messages)[0].get(0).map(str::to_string)
+    };
+
+    // ANALYZE first, so the reset back to never-analyzed is observable.
+    client.simple_query("ANALYZE p").await?;
+    let analyzed = client
+        .simple_query("SELECT reltuples FROM pg_class WHERE relname = 'p'")
+        .await?;
+    assert_eq!(count(&analyzed).as_deref(), Some("2"));
+
+    // Rolled back: the rows are back, in place and afterwards.
+    client.simple_query("BEGIN").await?;
+    client.simple_query("TRUNCATE p").await?;
+    let inside = client.simple_query("SELECT count(*) FROM p").await?;
+    assert_eq!(count(&inside).as_deref(), Some("0"));
+    client.simple_query("ROLLBACK").await?;
+    let after_rollback = client.simple_query("SELECT count(*) FROM p").await?;
+    assert_eq!(count(&after_rollback).as_deref(), Some("2"));
+
+    // Committed, in one statement with a heap table (which also exercises the
+    // name-ordered lock acquisition), then reloaded.
+    client.simple_query("TRUNCATE p, h").await?;
+    let emptied = client.simple_query("SELECT count(*) FROM p").await?;
+    assert_eq!(count(&emptied).as_deref(), Some("0"));
+    let heap_emptied = client.simple_query("SELECT count(*) FROM h").await?;
+    assert_eq!(count(&heap_emptied).as_deref(), Some("0"));
+
+    // PostgreSQL reports a truncated relation as never-analyzed, not as a measured
+    // zero: `relpages = 0`, `reltuples = -1`.
+    let reset = client
+        .simple_query("SELECT relpages, reltuples FROM pg_class WHERE relname = 'p'")
+        .await?;
+    assert_eq!(
+        (rows(&reset)[0].get(0), rows(&reset)[0].get(1)),
+        (Some("0"), Some("-1"))
+    );
+
+    client
+        .simple_query("INSERT INTO p VALUES (3, 'three')")
+        .await?;
+    let reloaded = client
+        .simple_query("SELECT id, label FROM p ORDER BY id")
+        .await?;
+    assert_eq!(rows(&reloaded).len(), 1);
+    assert_eq!(
+        (rows(&reloaded)[0].get(0), rows(&reloaded)[0].get(1)),
+        (Some("3"), Some("three"))
+    );
+
+    // TRUNCATE twice in one transaction, then insert: the rows of the second
+    // truncate's directory are the only ones that survive.
+    client.simple_query("BEGIN").await?;
+    client.simple_query("TRUNCATE p").await?;
+    client.simple_query("INSERT INTO p VALUES (4, 'four')").await?;
+    client.simple_query("TRUNCATE p").await?;
+    client.simple_query("INSERT INTO p VALUES (5, 'five')").await?;
+    client.simple_query("COMMIT").await?;
+    let doubled = client.simple_query("SELECT id FROM p ORDER BY id").await?;
+    assert_eq!(rows(&doubled).len(), 1);
+    assert_eq!(rows(&doubled)[0].get(0), Some("5"));
+
+    // The unsupported spellings stay unsupported.
+    for sql in ["TRUNCATE p CASCADE", "TRUNCATE p RESTART IDENTITY"] {
+        let error = client
+            .simple_query(sql)
+            .await
+            .expect_err("unsupported TRUNCATE form must fail");
+        assert_eq!(
+            error.as_db_error().expect("database error").code().code(),
             "0A000",
             "{sql}"
         );

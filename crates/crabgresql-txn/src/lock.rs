@@ -1,16 +1,20 @@
-//! A minimal per-table lock, reproducing PostgreSQL's `AccessShareLock` vs
-//! `AccessExclusiveLock` conflict rule for TRUNCATE.
+//! A minimal per-relation lock, reproducing PostgreSQL's `AccessShareLock` vs
+//! `AccessExclusiveLock` conflict rule for TRUNCATE. It lives here, in the
+//! transaction crate, because both table access methods that swap their physical
+//! relation on TRUNCATE need it: the heap (a new `base/<n>` file) and Parquet (a
+//! new `parquet/<n>/` fragment directory).
 //!
-//! TRUNCATE swaps the table's physical file (a new relfilenode) in on commit and
-//! unlinks the old file. On this engine — which has no other table-level locking
-//! — that swap must be serialized against concurrent readers and writers of the
-//! same table, otherwise a reader could iterate a file that TRUNCATE is about to
-//! unlink, or a writer's committed rows could vanish into a discarded file. So:
+//! TRUNCATE swaps the table's physical relation (a new relfilenode) in on commit
+//! and removes the old one. On this engine — which has no other table-level
+//! locking — that swap must be serialized against concurrent readers and writers
+//! of the same table, otherwise a reader could iterate a file that TRUNCATE is
+//! about to unlink, or a writer's committed rows could vanish into a discarded
+//! relation. So:
 //!
 //! * every scan / fetch / insert / update / delete takes a **shared** guard for
 //!   the duration of the operation (a scan holds it for the whole iterator life);
 //! * TRUNCATE takes an **exclusive** hold, kept until its transaction ends and
-//!   released by the [`crabgresql_txn::TxnFinalize`] hook.
+//!   released by the [`crate::TxnFinalize`] hook.
 //!
 //! Shared and exclusive conflict; shared with shared do not. Holds are keyed by a
 //! **[`LockOwner`]** (a session, not a transaction), so — exactly like
@@ -39,7 +43,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 
-use crabgresql_txn::LockOwner;
+use crate::LockOwner;
 
 #[derive(Default)]
 struct LockInner {
@@ -59,11 +63,18 @@ impl LockInner {
     }
 }
 
-/// A per-`HeapTable` lock. Held behind an `Arc` so a scan's [`SharedGuard`] can
-/// outlive a borrow of the table and keep the file pinned for the iterator.
+/// A per-relation lock, owned by the table access method's open handle. Held
+/// behind an `Arc` so a scan's [`SharedGuard`] can outlive a borrow of the table
+/// and keep the relation pinned for the iterator.
 pub struct TableLock {
     inner: Mutex<LockInner>,
     cond: Condvar,
+}
+
+impl Default for TableLock {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TableLock {
@@ -199,22 +210,22 @@ mod tests {
         let lock = Arc::new(TableLock::new());
         let a = lock.acquire_shared(owner(3));
         let b = lock.acquire_shared(owner(4));
-        assert_eq!(lock.inner.lock().unwrap().shared.values().sum::<u32>(), 2);
+        assert_eq!(lock.inner.lock().expect("mutex poisoned").shared.values().sum::<u32>(), 2);
         drop(a);
         drop(b);
-        assert!(lock.inner.lock().unwrap().shared.is_empty());
+        assert!(lock.inner.lock().expect("mutex poisoned").shared.is_empty());
     }
 
     #[test]
     fn exclusive_excludes_and_releases() {
         let lock = Arc::new(TableLock::new());
         lock.acquire_exclusive(owner(3));
-        assert_eq!(lock.inner.lock().unwrap().exclusive, Some(owner(3)));
+        assert_eq!(lock.inner.lock().expect("mutex poisoned").exclusive, Some(owner(3)));
         // The holder may still take shared holds (read-your-own-truncate).
         let g = lock.acquire_shared(owner(3));
         drop(g);
         lock.release_exclusive(owner(3));
-        assert_eq!(lock.inner.lock().unwrap().exclusive, None);
+        assert_eq!(lock.inner.lock().expect("mutex poisoned").exclusive, None);
     }
 
     #[test]
@@ -232,7 +243,7 @@ mod tests {
         let lock = Arc::new(TableLock::new());
         let _cursor = lock.acquire_shared(owner(7));
         lock.acquire_exclusive(owner(7)); // same owner: granted despite the shared hold
-        assert_eq!(lock.inner.lock().unwrap().exclusive, Some(owner(7)));
+        assert_eq!(lock.inner.lock().expect("mutex poisoned").exclusive, Some(owner(7)));
         lock.release_exclusive(owner(7));
     }
 
@@ -261,7 +272,7 @@ mod tests {
             "exclusive must wait for another owner's shared hold"
         );
         drop(held);
-        t.join().unwrap();
+        t.join().expect("worker panicked");
         assert!(got_exclusive.load(Ordering::SeqCst));
     }
 }

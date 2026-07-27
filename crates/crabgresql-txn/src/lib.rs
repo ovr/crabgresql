@@ -14,6 +14,10 @@
 //! and its deleter is not); it is written independently from PG's C source per
 //! the clean-room policy in `AGENTS.md`.
 
+mod lock;
+
+pub use lock::{ExclusiveGuard, SharedGuard, TableLock};
+
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

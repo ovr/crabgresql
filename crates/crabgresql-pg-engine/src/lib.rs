@@ -28,7 +28,6 @@ mod bufpool;
 mod catalog;
 mod datum;
 mod heap;
-mod lock;
 mod nbtree;
 mod page;
 mod rec;
@@ -43,13 +42,15 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_parquet_engine::{ParquetRedo, ParquetTable, RMGR_PARQUET, validate_schema};
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, RelStats, RelationMetadata, SequenceAdvance, SequenceDefinition,
-    StorageError, TableAccessMethod, TableAm, TableCapabilities, TableEngine, TableSchema, Tid,
-    Tuple, TupleStream, UpdateResult, ViewDefinition,
+    DeleteResult, IndexMetadata, RelStats, RelationMetadata, RelfilenodeAllocator, SequenceAdvance,
+    SequenceDefinition, StorageError, TableAccessMethod, TableAm, TableCapabilities, TableEngine,
+    TableSchema, Tid, Tuple, TupleStream, UpdateResult, ViewDefinition,
 };
 use crabgresql_txn::{Clog, TxnContext, TxnFinalize, Xid};
 use crabgresql_types::Value;
-use crabgresql_wal::{ControlFile, RmgrId, RmgrRegistry, Wal, read_control, recover, write_control};
+use crabgresql_wal::{
+    ControlFile, RmgrId, RmgrRedo, RmgrRegistry, Wal, read_control, recover, write_control,
+};
 
 use crate::btredo::BtreeRedo;
 use crate::nbtree::BTree;
@@ -66,9 +67,16 @@ pub use crate::smgr::RelFileNode;
 /// redo handler and drained by [`PgEngine::apply_recovered_truncates`].
 pub(crate) struct RecoveredTruncate {
     pub xid: Xid,
+    /// The relation's schema. Heap records carry bare names through the WAL and so
+    /// are always `public`; a Parquet record carries the namespace explicitly.
+    pub namespace: String,
     pub table: String,
     pub old: RelFileNode,
     pub new: RelFileNode,
+    /// Whether the swapped relation is a Parquet fragment directory rather than a
+    /// heap file — the physical reclaim differs (`gc_orphan_parquet_dirs` sweeps
+    /// directories; `discard_relfile` only knows about `base/<n>`).
+    pub parquet: bool,
 }
 
 /// Number of buffer-pool frames (8 MB). Must comfortably exceed the number of
@@ -93,6 +101,17 @@ pub(crate) struct EngineInner {
     /// TRUNCATE swaps replayed from the WAL during recovery, applied after the
     /// CLOG is rebuilt (see [`PgEngine::apply_recovered_truncates`]).
     pub recovered_truncates: Mutex<Vec<RecoveredTruncate>>,
+}
+
+/// Exposes the relation catalog's relfilenode counter to an out-of-crate access
+/// method (Parquet), whose TRUNCATE stages a fresh `parquet/<n>/` directory and
+/// must draw its id from the same sequence as every heap file.
+struct CatalogAllocator(Arc<RelCatalog>);
+
+impl RelfilenodeAllocator for CatalogAllocator {
+    fn alloc_relfilenode(&self) -> u32 {
+        self.0.alloc_relfilenode().0
+    }
 }
 
 /// One open relation, dispatched by its persisted table access method.
@@ -264,9 +283,15 @@ pub struct PgEngine {
     inner: Arc<EngineInner>,
     data_dir: PathBuf,
     catalog: Arc<RelCatalog>,
+    /// The catalog's relfilenode counter, handed to every Parquet table so its
+    /// TRUNCATE can stage a fresh directory (see [`CatalogAllocator`]).
+    relfilenodes: Arc<dyn RelfilenodeAllocator>,
+    /// The Parquet redo handler, kept so [`PgEngine::apply_recovered_truncates`]
+    /// can drain the directory swaps replay collected.
+    parquet_redo: Arc<ParquetRedo>,
     /// Open table handles keyed by `(namespace, name)`. Unqualified tables live
-    /// in `public`; the relfilenode-swap TRUNCATE machinery only ever touches
-    /// `public` tables (it threads bare names through the WAL).
+    /// in `public`; a heap TRUNCATE threads a bare name through the WAL and so is
+    /// only ever reconciled for `public` (a Parquet record carries its namespace).
     tables: RwLock<HashMap<(String, String), Arc<ManagedTable>>>,
     /// The `next_xid` recorded by the last checkpoint, reused as the control-file
     /// floor at a clean shutdown (recovery recomputes the exact value from the WAL,
@@ -306,7 +331,10 @@ impl PgEngine {
                 engine: Arc::clone(&inner),
             }),
         );
-        registry.register(RMGR_PARQUET, Arc::new(ParquetRedo));
+        let parquet_redo = Arc::new(ParquetRedo::new(data_dir));
+        registry.register(RMGR_PARQUET, Arc::clone(&parquet_redo) as Arc<dyn RmgrRedo>);
+        let relfilenodes: Arc<dyn RelfilenodeAllocator> =
+            Arc::new(CatalogAllocator(Arc::clone(&catalog)));
 
         let mut tables = HashMap::new();
         for (name, rel, schema, indexes) in catalog.schemas() {
@@ -335,7 +363,14 @@ impl PgEngine {
                     // then reports 42P01 on access, and DROP TABLE still clears
                     // the catalog entry (`gc_orphan_parquet_dirs` reclaims the
                     // directory at the next boot).
-                    match ParquetTable::open(data_dir, rel.0, schema, indexes, Arc::clone(&wal)) {
+                    match ParquetTable::open(
+                        data_dir,
+                        rel.0,
+                        schema,
+                        indexes,
+                        Arc::clone(&wal),
+                        Arc::clone(&relfilenodes),
+                    ) {
                         Ok(table) => {
                             let table = Arc::new(table);
                             if let Some((relpages, reltuples)) = analyzed {
@@ -361,6 +396,8 @@ impl PgEngine {
             inner,
             data_dir: data_dir.to_path_buf(),
             catalog,
+            relfilenodes,
+            parquet_redo,
             tables: RwLock::new(tables),
             last_next_xid: AtomicU64::new(0),
         })
@@ -451,81 +488,154 @@ impl PgEngine {
         Ok(())
     }
 
-    /// Resolve relfilenode-swap TRUNCATEs replayed from the WAL, now that the
-    /// CLOG has been rebuilt. Called once by `open_pg_engine` after `recover` and
-    /// before `checkpoint`. For each truncated table, in WAL order:
+    /// Resolve relfilenode-swap TRUNCATEs replayed from the WAL — heap files and
+    /// Parquet fragment directories alike — now that the CLOG has been rebuilt.
+    /// Called once by `open_pg_engine` after `recover` and before `checkpoint`. For
+    /// each truncated table, in WAL order:
     ///
     /// * every old/new relfilenode is fed to the catalog so a freshly issued id
-    ///   can never alias a file already on disk;
+    ///   can never alias a file or directory already on disk;
     /// * if the truncating transaction **committed**, the table is rebound to its
-    ///   final new file (persisting the catalog if it lagged) and every superseded
-    ///   file is unlinked;
-    /// * otherwise the truncate never happened: the staged new file(s) are
-    ///   discarded and the table keeps its original file (rows intact).
+    ///   final new relation (persisting the catalog if it lagged) and every
+    ///   superseded one is reclaimed;
+    /// * otherwise the truncate never happened: the staged new relation is
+    ///   discarded and the table keeps its original one (rows intact).
     ///
     /// Idempotent across repeated recoveries: a re-applied swap sees the catalog
-    /// already pointing at the new file and only re-cleans the (already gone) old
-    /// file, which tolerates a missing file.
+    /// already pointing at the new relation and only re-cleans the (already gone)
+    /// old one, which tolerates a missing file or directory.
     pub fn apply_recovered_truncates(&self, clog: &Clog) {
-        let recovered = std::mem::take(
+        // Parquet swaps are collected by their own redo handler; fold them in so
+        // both access methods go through this one resolution.
+        let mut recovered = std::mem::take(
             &mut *self
                 .inner
                 .recovered_truncates
                 .lock()
                 .unwrap_or_else(|_| panic!("mutex poisoned")),
         );
+        recovered.extend(self.parquet_redo.take_recovered().into_iter().map(|rt| {
+            RecoveredTruncate {
+                xid: rt.xid,
+                namespace: rt.namespace,
+                table: rt.name,
+                old: RelFileNode(rt.old),
+                new: RelFileNode(rt.new),
+                parquet: true,
+            }
+        }));
         if recovered.is_empty() {
             return;
         }
-        // Group by table, preserving WAL order within each group.
-        let mut order: Vec<String> = Vec::new();
-        let mut by_table: HashMap<String, Vec<RecoveredTruncate>> = HashMap::new();
+        // Group by relation, preserving WAL order within each group.
+        let mut order: Vec<(String, String)> = Vec::new();
+        let mut by_table: HashMap<(String, String), Vec<RecoveredTruncate>> = HashMap::new();
         for rt in recovered {
             self.catalog.observe_relfilenode(rt.old);
             self.catalog.observe_relfilenode(rt.new);
-            if !by_table.contains_key(&rt.table) {
-                order.push(rt.table.clone());
+            let key = (rt.namespace.clone(), rt.table.clone());
+            if !by_table.contains_key(&key) {
+                order.push(key.clone());
             }
-            by_table.entry(rt.table.clone()).or_default().push(rt);
+            by_table.entry(key).or_default().push(rt);
         }
 
-        for table in order {
+        for key in order {
             // Resolve each swap by ITS OWN transaction's fate, in WAL order,
             // threading the table's live relfilenode. A chain can span several
             // transactions with independent fates (each TRUNCATE holds the table
             // lock only to its own commit), so the chain must NOT be judged by a
             // single verdict: a committed swap earlier in the chain leaves its new
-            // file live even if a later (uncommitted) swap is discarded.
-            let chain = &by_table[&table];
-            let mut live = self.catalog.current_relfilenode(&table);
+            // relation live even if a later (uncommitted) swap is discarded.
+            let (namespace, table) = &key;
+            let chain = &by_table[&key];
+            let mut live = self.catalog.current_relfilenode(namespace, table);
             for rt in chain {
+                // A swap only applies to the relation it was recorded against. The
+                // WAL is replayed from the beginning on every boot and DDL is not
+                // logged, so a record can name a relation that was since dropped and
+                // re-created under the same name — applying it would repoint the new
+                // relation at the old one's dead file and let the orphan sweep delete
+                // the live one. Requiring `old` to be what the relation currently
+                // points at also makes re-applying an already-applied swap a no-op.
+                if live != Some(rt.old) {
+                    continue;
+                }
+                // A Parquet relation's storage is a directory, not a `base/<n>`
+                // file: the dead and the staged directories are both reclaimed by
+                // `gc_orphan_parquet_dirs`, which runs right after this and deletes
+                // every directory the catalog no longer names.
                 if clog.is_committed(rt.xid) {
-                    // Swap took effect: the old file is dead, the new one is live.
-                    self.inner.discard_relfile(rt.old);
+                    // Swap took effect: the old relation is dead, the new one live.
+                    if !rt.parquet {
+                        self.inner.discard_relfile(rt.old);
+                    }
                     live = Some(rt.new);
-                } else {
+                } else if !rt.parquet {
                     // Swap never committed: the staged new file is an orphan.
                     self.inner.discard_relfile(rt.new);
                 }
             }
             if let Some(live) = live {
                 // Persist the catalog only if it lagged the WAL, and repoint the
-                // in-memory table handle at the final live file.
-                if self.catalog.current_relfilenode(&table) != Some(live) {
-                    // Recovery only reconciles permanent, WAL-logged (public) tables;
-                    // memory tables never reach the WAL.
+                // in-memory table handle at the final live relation.
+                if self.catalog.current_relfilenode(namespace, table) != Some(live) {
+                    // Recovery only reconciles permanent, WAL-logged tables; memory
+                    // tables never reach the WAL.
                     self.catalog
-                        .swap_relfilenode("public", &table, live)
+                        .swap_relfilenode(namespace, table, live)
                         .unwrap_or_else(|e| panic!("relation catalog write failed: {e}"));
                 }
-                if let Some(t) = self
+                let handle = self
                     .tables
                     .read()
                     .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                    .get(&("public".to_string(), table.clone()))
-                    .and_then(|table| table.as_heap())
-                {
-                    t.rebind(live);
+                    .get(&key)
+                    .cloned();
+                let Some(handle) = handle else {
+                    continue;
+                };
+                // Repoint the open handle only if it is not already on `live`.
+                // The WAL is replayed from the beginning on every boot, so this loop
+                // revisits every TRUNCATE the relation ever ran; rebinding a handle
+                // that needs nothing is not free — it resets per-relation state (a
+                // Parquet table drops the ANALYZE result `PgEngine::new` just seeded
+                // from the catalog), so the relation would silently lose its
+                // statistics at every restart.
+                let stale = match handle.as_ref() {
+                    ManagedTable::Heap(t) => t.relfilenode() != live,
+                    ManagedTable::Parquet(t) => t.relfilenode() != live.0,
+                };
+                if !stale {
+                    continue;
+                }
+                match handle.as_ref() {
+                    ManagedTable::Heap(t) => t.rebind(live),
+                    ManagedTable::Parquet(t) => {
+                        if let Err(error) = t.rebind(live.0) {
+                            // One relation we cannot repoint must not stop the
+                            // cluster from booting — but it must not keep serving
+                            // either: the catalog names `live`, and
+                            // `gc_orphan_parquet_dirs` (next in the startup sequence)
+                            // deletes every directory the catalog does not name,
+                            // including the one this handle is still pointing at.
+                            // Unregister it, exactly as `PgEngine::new` does for a
+                            // relation it cannot open: it then reports 42P01 until
+                            // the next boot rebinds it, and DROP TABLE still clears
+                            // the catalog entry.
+                            tracing::error!(
+                                table = %table,
+                                error = %error,
+                                "Parquet relation could not be rebound after a \
+                                 recovered TRUNCATE; it will report as nonexistent \
+                                 until the next restart"
+                            );
+                            self.tables
+                                .write()
+                                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                                .remove(&key);
+                        }
+                    }
                 }
             }
         }
@@ -554,12 +664,17 @@ impl PgEngine {
 
     /// Delete `parquet/<n>` directories not referenced by any live catalog
     /// relation — the Parquet counterpart of [`PgEngine::gc_orphan_relfiles`].
+    /// Relfilenodes are never reused, so a directory the catalog does not name is
+    /// genuinely orphaned. It reclaims three kinds of leftovers:
     ///
-    /// `drop_table` removes the catalog entry before the fragment directory, so a
-    /// crash or IO error in that window would otherwise strand the whole
-    /// directory with nothing to reclaim it. Parquet relations never swap
-    /// relfilenodes (the method has no TRUNCATE), so a directory with no catalog
-    /// entry is genuinely orphaned.
+    /// * `drop_table` removes the catalog entry before the fragment directory, so a
+    ///   crash or IO error in that window would strand the whole directory;
+    /// * a TRUNCATE's staged directory whose transaction never resolved (a crash
+    ///   before commit, or a failure between staging and the WAL flush);
+    /// * the pre-TRUNCATE directory whose removal at commit time failed.
+    ///
+    /// Must run after [`PgEngine::apply_recovered_truncates`], which is what decides
+    /// which side of a replayed swap the catalog names.
     pub fn gc_orphan_parquet_dirs(&self) -> std::io::Result<()> {
         let live: std::collections::HashSet<u32> =
             self.catalog.live_relfilenodes().into_iter().collect();
@@ -666,15 +781,38 @@ impl TxnFinalize for PgEngine {
                 }
             }
         }
-        for table in handles.values() {
-            if let Some(parquet) = table.as_parquet()
-                && let Err(error) = parquet.finish_transaction(xid, true)
-            {
-                tracing::error!(
-                    table = %parquet.schema().name,
+        for ((namespace, name), table) in handles.iter() {
+            let Some(parquet) = table.as_parquet() else {
+                continue;
+            };
+            match parquet.finish_transaction(xid, true) {
+                // A committed TRUNCATE swapped the fragment directory: persist it,
+                // then release the hold — in that order, exactly as the heap arm
+                // does, so a concurrent TRUNCATE (which cannot stage until the hold
+                // is gone) can never have its catalog write clobbered by this one.
+                // A catalog write failure is logged rather than fatal (the WAL record
+                // repairs it at the next recovery), but the hold is released either
+                // way or the table would be wedged for the process lifetime.
+                Ok(Some(swap)) => {
+                    if let Err(error) =
+                        self.catalog
+                            .swap_relfilenode(namespace, name, RelFileNode(swap.new_rel))
+                    {
+                        tracing::error!(
+                            table = %name,
+                            error = %error,
+                            "Parquet TRUNCATE commit: catalog persist failed; \
+                             will be reconciled from the WAL at next recovery"
+                        );
+                    }
+                    parquet.release_truncate_lock(swap.owner);
+                }
+                Ok(None) => {}
+                Err(error) => tracing::error!(
+                    table = %name,
                     error = %error,
                     "Parquet commit finalization failed; recovery will reconcile it"
-                );
+                ),
             }
         }
     }
@@ -785,6 +923,7 @@ impl TableEngine for PgEngine {
                     schema,
                     Vec::new(),
                     Arc::clone(&self.inner.wal),
+                    Arc::clone(&self.relfilenodes),
                 ) {
                     Ok(table) => ManagedTable::Parquet(Arc::new(table)),
                     Err(error) => {
@@ -824,15 +963,15 @@ impl TableEngine for PgEngine {
                 stats
             }
             ManagedTable::Parquet(parquet) => {
-                let mut reltuples = 0.0;
-                for row in parquet.scan(txn) {
-                    row?;
-                    reltuples += 1.0;
-                }
-                // Re-measure rather than reading `statistics()`, which returns the
-                // previous ANALYZE's cached value and would pin relpages forever.
-                let relpages = parquet.measure_relpages()?;
-                parquet.set_analyzed(relpages, reltuples);
+                // Size and rows come from one directory under one shared hold, so an
+                // ANALYZE inside an uncommitted TRUNCATE cannot pair the staged
+                // directory's row count with the old one's page count. Measuring
+                // (rather than reading `statistics()`) is what keeps relpages from
+                // being pinned to the first ANALYZE's value forever.
+                let (relpages, reltuples) = parquet.measure(txn)?;
+                // Tagged with the measuring transaction: if it rolls back, the
+                // fragments it sized are unlinked and the result goes with them.
+                parquet.set_analyzed_by(txn.xid, relpages, reltuples);
                 RelStats {
                     relpages,
                     reltuples,

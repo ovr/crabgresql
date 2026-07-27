@@ -1679,7 +1679,14 @@ fn execute_truncate(
     // applied on commit and discarded on rollback (or a crash before commit).
     let txn = build_txn(txnmgr, session, true);
     for (_, table) in &named {
-        table.truncate(&txn)?;
+        // A failed TRUNCATE must still end the statement as a failure: an access
+        // method whose `truncate` is fallible (Parquet stages a directory and flushes
+        // WAL) may have left an earlier table in the list holding its exclusive
+        // AccessExclusive hold, and only the abort's finalize hook releases it.
+        if let Err(error) = table.truncate(&txn) {
+            let _ = finalize_statement(txnmgr, session, &txn, true, false, None);
+            return Err(error.into());
+        }
     }
     finalize_statement(txnmgr, session, &txn, true, true, None)?;
     Ok(QueryResult::command("TRUNCATE TABLE"))

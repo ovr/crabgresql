@@ -406,6 +406,82 @@ async fn truncate_committed_across_a_restart_stays_empty() {
     }
 }
 
+/// TRUNCATE on a Parquet table end-to-end across restarts: the committed swap
+/// stays committed, a rolled-back one leaves the rows in place, and exactly one
+/// fragment directory survives each restart (the superseded and staged ones are
+/// reclaimed).
+#[tokio::test]
+async fn parquet_truncate_is_durable_across_a_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let parquet_dirs = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("parquet"))
+            .expect("parquet root exists")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    };
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE TABLE events (id int4) USING parquet")
+            .await?;
+        client
+            .simple_query("INSERT INTO events VALUES (1), (2)")
+            .await?;
+        // Rolled back: nothing changes.
+        client.simple_query("BEGIN").await?;
+        client.simple_query("TRUNCATE events").await?;
+        client.simple_query("ROLLBACK").await?;
+        // Committed, then reloaded in the same boot.
+        client.simple_query("TRUNCATE events").await?;
+        client.simple_query("INSERT INTO events VALUES (9)").await?;
+        shutdown(client, handle).await;
+    }
+    assert_eq!(
+        parquet_dirs().len(),
+        1,
+        "the superseded and rolled-back directories are gone: {:?}",
+        parquet_dirs()
+    );
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let msgs = client
+            .simple_query("SELECT id FROM events ORDER BY id")
+            .await?;
+        let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+        assert_eq!(got, vec![Some("9")]);
+        // A TRUNCATE that never commits before the shutdown leaves the rows alone.
+        client.simple_query("BEGIN").await?;
+        client.simple_query("TRUNCATE events").await?;
+        shutdown(client, handle).await;
+    }
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let msgs = client
+            .simple_query("SELECT id FROM events ORDER BY id")
+            .await?;
+        let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+        assert_eq!(got, vec![Some("9")]);
+        assert_eq!(parquet_dirs().len(), 1, "{:?}", parquet_dirs());
+        client.simple_query("DROP TABLE events").await?;
+        shutdown(client, handle).await;
+    }
+    assert!(
+        parquet_dirs().is_empty(),
+        "DROP TABLE must remove every directory the relation owned: {:?}",
+        parquet_dirs()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn dropped_table_stays_dropped_across_a_restart() {
     let dir = tempfile::tempdir().unwrap();

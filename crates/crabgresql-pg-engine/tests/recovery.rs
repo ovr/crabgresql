@@ -583,3 +583,385 @@ fn an_orphaned_parquet_directory_is_reclaimed_at_startup() -> anyhow::Result<()>
     assert_eq!(engine.open_table("events")?.scan(&read(&tm)).count(), 1);
     Ok(())
 }
+
+// --- Transactional TRUNCATE across crash (Parquet directory swap) ---
+
+/// Every `parquet/<n>` directory on disk, as relfilenodes.
+fn parquet_dirs(dir: &std::path::Path) -> Vec<u32> {
+    let mut dirs: Vec<u32> = std::fs::read_dir(dir.join("parquet"))
+        .expect("parquet root exists")
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().and_then(|n| n.parse().ok()))
+        .collect();
+    dirs.sort_unstable();
+    dirs
+}
+
+/// Seed rows 1,2,3 into a fresh Parquet table in one committed transaction.
+fn seed_parquet(
+    engine: &PgEngine,
+    tm: &TransactionManager,
+) -> anyhow::Result<Arc<dyn TableAm>> {
+    let table = engine.create_table(parquet_schema("events"))?;
+    let xid = tm.allocate_xid();
+    let ctx = tm.context(xid, CommandId::FIRST);
+    for id in 1..=3 {
+        table.insert(vec![Value::Int4(id)], &ctx)?;
+    }
+    tm.commit(xid)?;
+    Ok(table)
+}
+
+#[test]
+fn parquet_truncate_committed_then_crash_recovers_empty() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_parquet(&engine, &tm)?;
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        tm.commit(tx)?;
+        assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
+        // Crash: drop without checkpoint.
+    }
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("events")?;
+    assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
+    assert_eq!(
+        parquet_dirs(dir.path()).len(),
+        1,
+        "the pre-truncate directory is gone and no staging leftovers remain"
+    );
+    Ok(())
+}
+
+#[test]
+fn parquet_truncate_uncommitted_then_crash_restores_rows() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_parquet(&engine, &tm)?;
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        // Never commits: crash with the swap staged.
+    }
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("events")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
+    assert_eq!(
+        parquet_dirs(dir.path()).len(),
+        1,
+        "the staged directory of an unresolved transaction is reclaimed at startup"
+    );
+    Ok(())
+}
+
+#[test]
+fn parquet_truncate_rolled_back_restores_rows_in_place_and_after_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = seed_parquet(&engine, &tm)?;
+    let tx = tm.allocate_xid();
+    table.truncate(&tm.context(tx, CommandId::FIRST))?;
+    tm.abort(tx);
+    // The old directory was untouched, so the rows are back immediately.
+    assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
+    assert_eq!(parquet_dirs(dir.path()).len(), 1);
+    drop((engine, tm));
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("events")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
+    Ok(())
+}
+
+#[test]
+fn parquet_truncate_then_insert_then_commit_crash_keeps_only_new_rows() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_parquet(&engine, &tm)?;
+        let tx = tm.allocate_xid();
+        let ctx = tm.context(tx, CommandId::FIRST);
+        table.truncate(&ctx)?;
+        table.insert(vec![Value::Int4(10)], &tm.context(tx, CommandId(1)))?;
+        table.insert(vec![Value::Int4(11)], &tm.context(tx, CommandId(2)))?;
+        tm.commit(tx)?;
+        assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
+    }
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("events")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
+    Ok(())
+}
+
+#[test]
+fn parquet_truncate_crash_then_truncate_again_commit_is_consistent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_parquet(&engine, &tm)?;
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        // Crash before commit.
+    }
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.open_table("events")?;
+        assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        tm.commit(tx)?;
+        assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
+    }
+    // Final restart: empty, and the recovered relation still accepts writes into
+    // the swapped-in directory.
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("events")?;
+    assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
+    let xid = tm.allocate_xid();
+    table.insert(vec![Value::Int4(42)], &tm.context(xid, CommandId::FIRST))?;
+    tm.commit(xid)?;
+    assert_eq!(visible_ids(&tm, &*table), vec![42]);
+    Ok(())
+}
+
+#[test]
+fn parquet_committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows()
+-> anyhow::Result<()> {
+    // A committed swap followed by an uncommitted one must NOT be judged by the
+    // last record's fate: the committed truncate's directory is live and must
+    // survive, only the uncommitted one is discarded.
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_parquet(&engine, &tm)?;
+        let a = tm.allocate_xid();
+        table.truncate(&tm.context(a, CommandId::FIRST))?;
+        table.insert(vec![Value::Int4(10)], &tm.context(a, CommandId(1)))?;
+        table.insert(vec![Value::Int4(11)], &tm.context(a, CommandId(2)))?;
+        tm.commit(a)?;
+        assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
+        let b = tm.allocate_xid();
+        table.truncate(&tm.context(b, CommandId::FIRST))?;
+    }
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("events")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
+    assert_eq!(parquet_dirs(dir.path()).len(), 1);
+    Ok(())
+}
+
+#[test]
+fn parquet_committed_truncate_with_a_stale_catalog_is_repaired_at_recovery() -> anyhow::Result<()> {
+    // The one window the WAL record exists for: the transaction's commit is
+    // durable, but the catalog persist that follows it never happened (a crash
+    // between the two). Recovery must re-apply the swap from the WAL, or the
+    // truncated rows would come back.
+    let dir = tempfile::tempdir()?;
+    let staged;
+    {
+        // No finalize hook: the commit is durable, but nothing applies the swap or
+        // persists it to the catalog.
+        let (engine, tm) = common::open_without_finalize(dir.path())?;
+        let table = seed_parquet(&engine, &tm)?;
+        let before = parquet_dirs(dir.path());
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        staged = parquet_dirs(dir.path())
+            .into_iter()
+            .find(|rel| !before.contains(rel))
+            .expect("the TRUNCATE staged a directory");
+        tm.commit(tx)?;
+    }
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("events")?;
+    assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
+    assert_eq!(
+        parquet_dirs(dir.path()),
+        vec![staged],
+        "recovery must repoint the relation at the staged directory and reclaim the old one"
+    );
+    // And the repaired relation still writes into the right directory.
+    let xid = tm.allocate_xid();
+    table.insert(vec![Value::Int4(5)], &tm.context(xid, CommandId::FIRST))?;
+    tm.commit(xid)?;
+    assert_eq!(visible_ids(&tm, &*table), vec![5]);
+    Ok(())
+}
+
+#[test]
+fn drop_table_reclaims_a_pending_parquet_truncate_directory() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = seed_parquet(&engine, &tm)?;
+    let tx = tm.allocate_xid();
+    table.truncate(&tm.context(tx, CommandId::FIRST))?;
+    assert_eq!(parquet_dirs(dir.path()).len(), 2, "live plus staged");
+    engine.drop_table("public", "events")?;
+    assert!(
+        parquet_dirs(dir.path()).is_empty(),
+        "DROP TABLE must reclaim the staged directory too — the catalog never named it"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_replayed_truncate_does_not_repoint_a_recreated_relation() -> anyhow::Result<()> {
+    // The WAL is replayed from the beginning on every boot and DDL is not logged,
+    // so a committed TRUNCATE record can name a relation that was since dropped and
+    // re-created under the same name. Applying it would repoint the NEW relation at
+    // the old one's dead storage, and the orphan sweep would then delete the live
+    // storage — silently emptying a table nobody truncated.
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_parquet(&engine, &tm)?;
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        tm.commit(tx)?;
+        engine.drop_table("public", "events")?;
+
+        // Same name, brand-new relation and directory.
+        let recreated = engine.create_table(parquet_schema("events"))?;
+        let xid = tm.allocate_xid();
+        recreated.insert(vec![Value::Int4(42)], &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        assert_eq!(visible_ids(&tm, &*recreated), vec![42]);
+        // Crash without a checkpoint, so recovery replays the stale truncate.
+    }
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("events")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![42]);
+    Ok(())
+}
+
+/// The same hazard for the heap: a committed relfilenode-swap TRUNCATE replayed
+/// against a relation that was dropped and re-created under the same name.
+#[test]
+fn a_replayed_heap_truncate_does_not_repoint_a_recreated_relation() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm);
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        tm.commit(tx)?;
+        engine.drop_table("public", "t")?;
+
+        let recreated = engine.create_table(schema())?;
+        let xid = tm.allocate_xid();
+        insert(&*recreated, &tm.context(xid, CommandId::FIRST), 42, "z");
+        tm.commit(xid)?;
+        assert_eq!(visible_ids(&tm, &*recreated), vec![42]);
+    }
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![42]);
+    Ok(())
+}
+
+#[test]
+fn a_committed_truncate_in_a_non_public_schema_is_repaired_at_recovery() -> anyhow::Result<()> {
+    // The heap's TRUNCATE record carries the relation's schema, so recovery
+    // resolves `app.t` against `app.t`. Assuming `public` would look up a
+    // different relation (or none), and the swap would be silently skipped —
+    // resurrecting rows a committed TRUNCATE removed.
+    let dir = tempfile::tempdir()?;
+    {
+        // No finalize hook: the commit is durable, but nothing applies the swap or
+        // persists it to the catalog — the window the WAL record exists for.
+        let (engine, tm) = common::open_without_finalize(dir.path())?;
+        engine.create_schema("app")?;
+        let mut app_schema = schema();
+        app_schema.namespace = "app".to_string();
+        let table = engine.create_table(app_schema)?;
+        let xid = tm.allocate_xid();
+        insert(&*table, &tm.context(xid, CommandId::FIRST), 1, "a");
+        insert(&*table, &tm.context(xid, CommandId::FIRST), 2, "b");
+        tm.commit(xid)?;
+
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        tm.commit(tx)?;
+    }
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.resolve(Some("app"), "t")?;
+    assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
+    Ok(())
+}
+
+#[test]
+fn recovery_keeps_the_analyze_result_of_a_previously_truncated_relation() -> anyhow::Result<()> {
+    // The WAL is replayed from the beginning on every boot, so a relation's old
+    // TRUNCATE record is seen again at every restart. Rebinding a handle that is
+    // already on the right relation is not free — it drops the ANALYZE result the
+    // engine just seeded from the catalog — so recovery must skip it.
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_parquet(&engine, &tm)?;
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        tm.commit(tx)?;
+        let xid = tm.allocate_xid();
+        for id in 1..=4 {
+            table.insert(vec![Value::Int4(id)], &tm.context(xid, CommandId::FIRST))?;
+        }
+        tm.commit(xid)?;
+        let xid = tm.allocate_xid();
+        engine.analyze("public", "events", &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        assert_eq!(table.statistics().reltuples, 4.0);
+    }
+    for boot in 1..=2 {
+        let (engine, _tm) = open(dir.path())?;
+        let stats = engine.open_table("events")?.statistics();
+        assert!(
+            stats.analyzed,
+            "boot {boot}: the replayed TRUNCATE must not discard the statistics: {stats:?}"
+        );
+        assert_eq!(stats.reltuples, 4.0, "boot {boot}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_parquet_relation_that_cannot_be_rebound_reports_as_absent() -> anyhow::Result<()> {
+    // Recovery repoints the relation at the swapped-in directory. If that fails,
+    // the catalog names the new directory while the handle still holds the old one
+    // — which `gc_orphan_parquet_dirs` deletes moments later. Serving that handle
+    // would fail on every access, so the relation must be unregistered instead.
+    let dir = tempfile::tempdir()?;
+    let staged;
+    {
+        let (engine, tm) = common::open_without_finalize(dir.path())?;
+        let table = seed_parquet(&engine, &tm)?;
+        let before = parquet_dirs(dir.path());
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        staged = parquet_dirs(dir.path())
+            .into_iter()
+            .find(|rel| !before.contains(rel))
+            .expect("the TRUNCATE staged a directory");
+        tm.commit(tx)?;
+    }
+    // A file the fragment-name parser rejects makes the rebind's `next_block_in`
+    // fail for the swapped-in directory.
+    std::fs::write(
+        dir.path()
+            .join("parquet")
+            .join(staged.to_string())
+            .join("not-a-fragment.parquet"),
+        b"garbage",
+    )?;
+
+    let (engine, _tm) = open(dir.path())?;
+    assert!(
+        engine.open_table("events").is_err(),
+        "a relation that could not be rebound must report as nonexistent, \
+         not serve a directory the startup sweep deleted"
+    );
+    // And it is still droppable, so the catalog entry can be cleared.
+    engine.drop_table("public", "events")?;
+    Ok(())
+}
