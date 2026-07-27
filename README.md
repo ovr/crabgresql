@@ -67,7 +67,7 @@ not parse falls back to its default rather than failing startup.
 | `PGDATA` | `./pgdata` | | data directory the durable heap engine is opened in (also `--data-dir`) |
 | `RUST_LOG` | `info` | | tracing filter directives |
 | `CRABGRESQL_BUFFER_TABLE_SOFT_BYTES` | `32MB` | `8kB`–`2GB` | per-relation buffered bytes that make one write buffer flush-eligible |
-| `CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES` | `256MB` | `8kB`–`2GB` | buffered bytes across all relations that make every buffer eligible |
+| `CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES` | `256MB` | `8kB`–`16GB` | buffered bytes across all relations that make every buffer eligible |
 | `CRABGRESQL_BUFFER_MAX_AGE` | `1m` | `10ms`–`24h` | how long a write buffer may hold rows before being flushed anyway |
 | `CRABGRESQL_BUFFER_TICK` | `1s` | `10ms`–`1h` | how often the background flush worker looks for eligible buffers |
 

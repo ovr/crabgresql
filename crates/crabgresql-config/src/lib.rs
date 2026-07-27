@@ -39,10 +39,14 @@ const KB: usize = 1024;
 const MB: usize = KB * KB;
 const GB: usize = KB * KB * KB;
 
-/// Buffered rows live in RAM, so a limit past a couple of gigabytes is a
-/// memory problem rather than a tuning choice. Two, not more, so the constant
-/// still fits a 32-bit `usize`.
-const MAX_BUFFER_BYTES: usize = 2 * GB;
+/// One relation's buffered rows sit in RAM until they become a chunk, so past
+/// a couple of gigabytes for a single table this is a memory problem rather
+/// than a tuning choice.
+const MAX_TABLE_BUFFER_BYTES: usize = 2 * GB;
+/// The global ceiling covers every relation at once, so it is allowed to be
+/// far larger than any one buffer. `saturating_mul` because 16 GB is more than
+/// a 32-bit `usize` can hold, where the ceiling is the address space anyway.
+const MAX_GLOBAL_BUFFER_BYTES: usize = GB.saturating_mul(16);
 /// One heap page. Below that a buffer would flush on essentially every row,
 /// which is the unbuffered behavior plus the bookkeeping.
 const MIN_BUFFER_BYTES: usize = 8 * KB;
@@ -54,7 +58,7 @@ pub const BUFFER_TABLE_SOFT_BYTES: SizeVar = SizeVar {
     name: "CRABGRESQL_BUFFER_TABLE_SOFT_BYTES",
     default: 32 * MB,
     min: MIN_BUFFER_BYTES,
-    max: MAX_BUFFER_BYTES,
+    max: MAX_TABLE_BUFFER_BYTES,
     help: "per-relation buffered bytes that make one write buffer flush-eligible",
 };
 /// Buffered bytes across all relations that make *every* buffer eligible.
@@ -62,7 +66,7 @@ pub const BUFFER_GLOBAL_HARD_BYTES: SizeVar = SizeVar {
     name: "CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES",
     default: 256 * MB,
     min: MIN_BUFFER_BYTES,
-    max: MAX_BUFFER_BYTES,
+    max: MAX_GLOBAL_BUFFER_BYTES,
     help: "buffered bytes across all relations that make every buffer eligible",
 };
 /// How long a write buffer may hold rows before being flushed anyway.
@@ -317,7 +321,7 @@ pub const ALL: &[EnvVar] = &[
         name: BUFFER_GLOBAL_HARD_BYTES.name,
         default: "256MB",
         help: BUFFER_GLOBAL_HARD_BYTES.help,
-        range: Some(("8kB", "2GB")),
+        range: Some(("8kB", "16GB")),
     },
     EnvVar {
         name: BUFFER_MAX_AGE.name,
