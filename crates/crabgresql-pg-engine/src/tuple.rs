@@ -10,7 +10,7 @@
 use crabgresql_storage_api::{Tid, Tuple};
 use crabgresql_txn::{CommandId, Infomask, TupleHeader, Xid};
 
-use crate::datum::{decode_datum, encode_datum};
+use crabgresql_types::datum::{decode_datum, encode_datum};
 
 pub const TUPLE_HEADER_LEN: usize = 36;
 

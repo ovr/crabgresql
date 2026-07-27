@@ -864,6 +864,9 @@ pub fn execute_statement(
             ast::Statement::Analyze(analyze) => {
                 return execute_analyze(&catalog, txnmgr, session, analyze);
             }
+            ast::Statement::Vacuum(vacuum) => {
+                return execute_vacuum(&catalog, txnmgr, session, vacuum);
+            }
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
             }
@@ -1763,6 +1766,86 @@ fn execute_analyze(
     Ok(QueryResult::command("ANALYZE"))
 }
 
+/// `VACUUM [table]` — tidy a relation's storage.
+///
+/// For a relation with a RAM write buffer (a Parquet table) this is the explicit
+/// flush: buffered rows become one durable chunk. For a heap relation it reclaims
+/// versions dead to every snapshot.
+///
+/// Unlike `ANALYZE`, this cannot run inside a transaction block: the flush is its
+/// own transaction, which is also why PostgreSQL raises `25001` here.
+fn execute_vacuum(
+    engine: &Arc<dyn TableEngine>,
+    txnmgr: &Arc<TransactionManager>,
+    session: &mut Session,
+    vacuum: &ast::VacuumStatement,
+) -> Result<QueryResult, PgError> {
+    // Modifiers the grammar accepts but this implementation does not honor. A
+    // `VACUUM FULL` that silently ran a plain vacuum would report success for work
+    // it never did, so each is a stated gap instead.
+    for (present, name) in [
+        (vacuum.full, "FULL"),
+        (vacuum.sort_only, "SORT ONLY"),
+        (vacuum.delete_only, "DELETE ONLY"),
+        (vacuum.reindex, "REINDEX"),
+        (vacuum.recluster, "RECLUSTER"),
+        (vacuum.boost, "BOOST"),
+        (vacuum.threshold.is_some(), "TO ... PERCENT"),
+    ] {
+        if present {
+            return Err(PgError::feature_not_supported(format!(
+                "VACUUM {name} is not supported yet"
+            )));
+        }
+    }
+    if session.tx_status == TransactionStatus::InTransaction {
+        return Err(PgError::new(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "VACUUM cannot run inside a transaction block",
+        ));
+    }
+
+    // Resolve every target first, so a typo in the second name does not leave the
+    // first already vacuumed.
+    let targets: Vec<(String, String)> = match &vacuum.table_name {
+        Some(name) => {
+            let name = object_name_to_table_name(name)?;
+            let table = engine.open_table(&name)?;
+            // A partitioned parent holds no rows of its own. PostgreSQL recurses
+            // into the children; `ANALYZE` here already rejects rather than
+            // recursing, and the two disagreeing about the same object would be
+            // worse than both being conservative.
+            reject_partitioned_parent(&table, &name)?;
+            vec![("public".to_string(), name)]
+        }
+        None => engine
+            .relations()
+            .into_iter()
+            .filter(|schema| schema.partition_scheme.is_none())
+            .map(|schema| (schema.namespace, schema.name))
+            .collect(),
+    };
+
+    // Versions below the oldest running transaction's floor are dead to every
+    // snapshot that can still be taken, so they are safe to reclaim.
+    let oldest = txnmgr.snapshot().xmin;
+    let mut flushed = 0u64;
+    for (namespace, name) in &targets {
+        match engine.vacuum_table(namespace, name, oldest) {
+            Ok(rows) => flushed += rows,
+            // A bare VACUUM walks every relation the engine lists, including other
+            // sessions' temp tables, which it reports as absent. A named target was
+            // resolved above, so it cannot land here.
+            Err(StorageError::TableNotFound(_)) if vacuum.table_name.is_none() => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if flushed > 0 {
+        tracing::debug!(rows = flushed, "VACUUM flushed buffered rows to durable storage");
+    }
+    Ok(QueryResult::command("VACUUM"))
+}
+
 /// Register a semantic index. It is reflected through the catalogs and UNIQUE
 /// indexes validate existing and future rows; physical lookup/IndexScan waits
 /// for the B-tree access-method milestone.
@@ -2204,7 +2287,7 @@ fn create_table_access_method(
     }
     let Some(ast::HiveIOFormat::Using { format }) = &format.storage else {
         return Err(PgError::feature_not_supported(
-            "only CREATE TABLE ... USING heap or USING parquet is supported",
+            "only CREATE TABLE ... USING heap, USING buffer or USING parquet is supported",
         ));
     };
     let name = normalize_ident(format);
@@ -2301,19 +2384,23 @@ fn execute_create_table(
     } else {
         RelPersistence::Permanent
     };
-    if access_method == TableAccessMethod::Parquet
-        && persistence != RelPersistence::Permanent
-    {
-        return Err(PgError::feature_not_supported(
-            "table access method \"parquet\" only supports permanent tables",
-        ));
+    // An engine-managed method defines its own relationship to the WAL, so
+    // UNLOGGED and TEMP have no meaning for it, and it holds no per-partition
+    // storage to route into. Reject both rather than silently ignoring the
+    // clause and handing back a table that is not what was asked for.
+    if access_method.is_engine_managed() && persistence != RelPersistence::Permanent {
+        return Err(PgError::feature_not_supported(format!(
+            "table access method \"{}\" only supports permanent tables",
+            access_method.as_str(),
+        )));
     }
-    if access_method == TableAccessMethod::Parquet
+    if access_method.is_engine_managed()
         && (create.partition_by.is_some() || create.partition_of.is_some())
     {
-        return Err(PgError::feature_not_supported(
-            "table access method \"parquet\" does not support partitioning",
-        ));
+        return Err(PgError::feature_not_supported(format!(
+            "table access method \"{}\" does not support partitioning",
+            access_method.as_str(),
+        )));
     }
     let target = engine;
     // CTAS (`create.query.is_some()`) is dispatched to `execute_create_table_as`
@@ -3056,12 +3143,11 @@ fn execute_create_table_as(
     } else {
         RelPersistence::Permanent
     };
-    if access_method == TableAccessMethod::Parquet
-        && persistence != RelPersistence::Permanent
-    {
-        return Err(PgError::feature_not_supported(
-            "table access method \"parquet\" only supports permanent tables",
-        ));
+    if access_method.is_engine_managed() && persistence != RelPersistence::Permanent {
+        return Err(PgError::feature_not_supported(format!(
+            "table access method \"{}\" only supports permanent tables",
+            access_method.as_str(),
+        )));
     }
 
     // Bind the defining query and take its output column shape.

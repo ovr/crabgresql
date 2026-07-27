@@ -1107,6 +1107,7 @@ fn encode(state: &State) -> Vec<u8> {
         out.push(match r.access_method {
             TableAccessMethod::Heap => 0,
             TableAccessMethod::Parquet => 1,
+            TableAccessMethod::Buffer => 2,
         });
     }
     out
@@ -1120,7 +1121,7 @@ fn put_bound_datums(out: &mut Vec<u8>, datums: &[PartitionBoundDatum]) {
             // self-describing on-page format the heap uses for a datum.
             PartitionBoundDatum::Value(v) => {
                 out.push(0);
-                crate::datum::encode_datum(v, out);
+                crabgresql_types::datum::encode_datum(v, out);
             }
             PartitionBoundDatum::MinValue => out.push(1),
             PartitionBoundDatum::MaxValue => out.push(2),
@@ -1190,7 +1191,7 @@ fn get_bound_datums(d: &mut Dec) -> Vec<PartitionBoundDatum> {
     let mut out = Vec::with_capacity(n as usize);
     for _ in 0..n {
         out.push(match d.byte() {
-            0 => PartitionBoundDatum::Value(crate::datum::decode_datum(d.b, &mut d.p)),
+            0 => PartitionBoundDatum::Value(crabgresql_types::datum::decode_datum(d.b, &mut d.p)),
             1 => PartitionBoundDatum::MinValue,
             _ => PartitionBoundDatum::MaxValue,
         });
@@ -1505,8 +1506,12 @@ fn decode(bytes: &[u8]) -> State {
         d.p += TAM_MAGIC.len();
         let nrels = d.u32();
         for r in rels.iter_mut().take(nrels as usize) {
+            // Adding a method appends a discriminant; an unknown one decodes as
+            // heap, which is also how a catalog written before this tail existed
+            // is read.
             r.access_method = match d.byte() {
                 1 => TableAccessMethod::Parquet,
+                2 => TableAccessMethod::Buffer,
                 _ => TableAccessMethod::Heap,
             };
         }
@@ -1639,14 +1644,24 @@ mod tests {
         let mut schema = TableSchema::new("events", vec![Column::new("id", PgType::Int4)]);
         schema.access_method = TableAccessMethod::Parquet;
         catalog.create(&schema)?;
+        let mut buffered = TableSchema::new("staging", vec![Column::new("id", PgType::Int4)]);
+        buffered.access_method = TableAccessMethod::Buffer;
+        catalog.create(&buffered)?;
         drop(catalog);
 
         let loaded = RelCatalog::load(dir.path())?;
-        let (_, _, schema, _) = loaded
-            .schemas()
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
-        assert_eq!(schema.access_method, TableAccessMethod::Parquet);
+        let method = |name: &str| {
+            loaded
+                .schemas()
+                .into_iter()
+                .find(|(rel_name, _, _, _)| rel_name == name)
+                .map(|(_, _, schema, _)| schema.access_method)
+        };
+        // Every method must survive the round trip, not just the first one added:
+        // the tail is one byte per relation, so a missed discriminant would
+        // silently reopen the relation on the wrong storage.
+        assert_eq!(method("events"), Some(TableAccessMethod::Parquet));
+        assert_eq!(method("staging"), Some(TableAccessMethod::Buffer));
         drop(loaded);
 
         let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
@@ -1657,11 +1672,15 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("table access method marker is missing"))?;
         std::fs::write(&path, &bytes[..tail])?;
         let legacy = RelCatalog::load(dir.path())?;
-        let (_, _, schema, _) = legacy
-            .schemas()
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("legacy catalog is empty"))?;
-        assert_eq!(schema.access_method, TableAccessMethod::Heap);
+        let schemas = legacy.schemas();
+        assert!(!schemas.is_empty(), "legacy catalog is empty");
+        for (name, _, schema, _) in schemas {
+            assert_eq!(
+                schema.access_method,
+                TableAccessMethod::Heap,
+                "a catalog written before the tail existed must decode as heap ({name})"
+            );
+        }
         Ok(())
     }
 

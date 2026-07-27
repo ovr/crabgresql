@@ -1,0 +1,1124 @@
+//! The `buffer` table access method: a WAL-logged, RAM-resident MVCC row store.
+//!
+//! Rows live only in memory; durability comes entirely from the WAL. That is the
+//! deliberate inverse of the heap engine's `TEMP`/`UNLOGGED` memory tables, which
+//! are also RAM-resident but skip the WAL: those trade durability for speed,
+//! while a buffer table trades *space* for speed and keeps every guarantee. A
+//! committed `INSERT` is as durable here as in the heap — the commit record's
+//! fsync covers the row — it simply has no file of its own until something moves
+//! it to one.
+//!
+//! That is what makes it useful in front of an append-only columnar store: writes
+//! are acknowledged at WAL speed and accumulate in RAM, and a later flush turns
+//! many small writes into one large immutable file. Used on its own via
+//! `CREATE TABLE ... USING buffer`, it is a fast, fully transactional table whose
+//! size is bounded by memory.
+//!
+//! MVCC is per row and uses the core [`TupleHeader`]/[`satisfies_mvcc`] rule
+//! unchanged, so visibility here is the same rule the heap obeys — there is no
+//! second definition of "visible" in the tree.
+//!
+//! Rows are addressed by **logical row id** ([`Tid::logical`]), never by a
+//! physical slot. A row keeps its identity when it is flushed to another access
+//! method's storage, which a `(block, offset)` address could not express.
+//!
+//! Recovery replays the whole WAL into [`BufferRedo`], then
+//! [`BufferTable::restore`] installs the rows whose transactions committed. There
+//! is no checkpoint to reconcile against: the buffer starts empty at every boot
+//! and is rebuilt from the log.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+use crabgresql_storage_api::{
+    DeleteResult, IndexMetadata, MAX_ROW_ID, RelStats, StorageError, TableAm, TableSchema, Tid,
+    Tuple, TupleStream, UpdateResult,
+};
+use crabgresql_txn::{
+    Clog, CommandId, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc,
+};
+use crabgresql_types::Value;
+use crabgresql_types::datum::{decode_datum, encode_datum};
+use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, Wal, WalError};
+
+/// Resource manager for buffer-table records. 10 is the heap, 11 the B-tree,
+/// 12 Parquet.
+pub const RMGR_BUFFER: RmgrId = RmgrId(13);
+
+/// Rows appended by a transaction.
+pub const BUFFER_INSERT: u8 = 1;
+/// Rows stamped deleted by a transaction.
+pub const BUFFER_DELETE: u8 = 2;
+
+/// Payload format version. Bumping it is how a layout change stays readable:
+/// redo rejects a version it does not know rather than misparsing it.
+const PAYLOAD_FORMAT: u8 = 1;
+
+/// Rough per-row overhead charged to the memory accounting on top of the encoded
+/// values: the `BufferRow` itself plus its `Vec` headers. Approximate by design —
+/// this feeds a flush threshold, not a correctness decision.
+const ROW_OVERHEAD_BYTES: usize = 64;
+
+fn corrupt(message: impl Into<String>) -> StorageError {
+    StorageError::CorruptData(message.into())
+}
+
+fn unsupported(message: impl Into<String>) -> StorageError {
+    StorageError::UnsupportedOperation(message.into())
+}
+
+/// One MVCC row version resident in RAM.
+#[derive(Clone, Debug)]
+struct BufferRow {
+    /// Stable identity, monotonically assigned and never reused. Survives a
+    /// flush into another access method's storage.
+    row_id: u64,
+    values: Tuple,
+    hdr: TupleHeader,
+    /// Encoded size, charged to the table's byte accounting. Cached because the
+    /// flush thresholds read it far more often than rows change.
+    bytes: usize,
+}
+
+/// A row recovered from the WAL, before its transaction's fate is known.
+#[derive(Clone, Debug)]
+pub struct RestoredRow {
+    pub row_id: u64,
+    pub values: Tuple,
+    pub hdr: TupleHeader,
+}
+
+/// Everything replay learned about one relation's buffer.
+#[derive(Debug, Default)]
+pub struct RestoredBuffer {
+    pub rows: Vec<RestoredRow>,
+    /// One past the highest row id the log mentions, so restored ids are never
+    /// handed out a second time.
+    pub next_row_id: u64,
+}
+
+/// A WAL-logged, RAM-resident MVCC row store.
+pub struct BufferTable {
+    schema: TableSchema,
+    /// The relation identity this table's WAL records carry — the relfilenode
+    /// the catalog currently names.
+    ///
+    /// A buffer table has no file to swap, so it never *initiates* a change here;
+    /// but when it fronts an access method that does (a Parquet relation's
+    /// TRUNCATE stages a fresh directory), it must follow, because recovery looks
+    /// up a relation's replayed rows by the id the catalog names at boot. Rows
+    /// logged under a superseded id are then correctly dropped: the only way that
+    /// id was superseded is a committed TRUNCATE, which those rows do not survive.
+    rel: AtomicU32,
+    /// Rows in ascending `row_id` order, which is also insertion order — so
+    /// lookups binary-search and scans need no sort. `vacuum` uses `retain`,
+    /// which preserves the ordering.
+    rows: RwLock<Vec<BufferRow>>,
+    next_row_id: AtomicU64,
+    /// Live encoded bytes, maintained incrementally so a flush scheduler can read
+    /// it without walking the rows.
+    bytes: AtomicUsize,
+    wal: Arc<Wal>,
+    indexes: RwLock<Vec<IndexMetadata>>,
+    /// The EXPLAIN line this table prints, when it is one leaf of a relation
+    /// whose storage is split. `None` — a standalone `USING buffer` table — keeps
+    /// PostgreSQL's plain `Seq Scan on <rel>`, because from SQL there is nothing
+    /// unusual to report.
+    scan_label: Option<String>,
+}
+
+impl BufferTable {
+    pub fn open(rel: u32, schema: TableSchema, indexes: Vec<IndexMetadata>, wal: Arc<Wal>) -> Self {
+        BufferTable {
+            schema,
+            rel: AtomicU32::new(rel),
+            rows: RwLock::new(Vec::new()),
+            next_row_id: AtomicU64::new(0),
+            bytes: AtomicUsize::new(0),
+            wal,
+            indexes: RwLock::new(indexes),
+            scan_label: None,
+        }
+    }
+
+    /// Label this table as the write buffer of `relation` in EXPLAIN output, so
+    /// an `Append` over one relation's two leaves does not print the same line
+    /// twice.
+    pub fn as_write_buffer_of(mut self, relation: &str) -> Self {
+        self.scan_label = Some(format!("Buffer Scan on {relation}"));
+        self
+    }
+
+    /// The relation identity this table's WAL records carry.
+    pub fn relfilenode(&self) -> u32 {
+        self.rel.load(Ordering::Relaxed)
+    }
+
+    /// Point this table at a new relfilenode, following a committed TRUNCATE on
+    /// the relation it fronts. Rows already in memory are unaffected: the id
+    /// selects where *future* records are filed and where recovery looks, and the
+    /// truncate's own MVCC tombstones decide what stays visible.
+    pub fn rebind(&self, new: u32) {
+        self.rel.store(new, Ordering::Relaxed);
+    }
+
+    /// Append rows, filing their WAL records under `rel` instead of this table's
+    /// current relfilenode.
+    ///
+    /// A relation that stages a TRUNCATE reads and writes in the *staged*
+    /// generation until it commits, so rows written by the truncating transaction
+    /// must be logged there too — otherwise recovery would look for them under
+    /// the committed id and find nothing, losing rows the transaction
+    /// acknowledged. Every other transaction passes the live id and is unaffected.
+    pub fn append_in(
+        &self,
+        rel: u32,
+        tuples: Vec<Tuple>,
+        txn: &TxnContext,
+    ) -> Result<Vec<Tid>, StorageError> {
+        self.append(rel, tuples, txn)
+    }
+
+    /// Stamp rows deleted, filing the record under `rel`. See [`Self::append_in`].
+    pub fn delete_many_in(
+        &self,
+        rel: u32,
+        tids: Vec<Tid>,
+        txn: &TxnContext,
+    ) -> Result<u64, StorageError> {
+        Ok(self.stamp_deleted(rel, &self.row_ids_of(tids)?, txn).len() as u64)
+    }
+
+    /// The logical row ids `tids` name, erroring on a physical one.
+    fn row_ids_of(&self, tids: Vec<Tid>) -> Result<Vec<u64>, StorageError> {
+        tids.into_iter()
+            .map(|tid| {
+                tid.row_id().ok_or_else(|| {
+                    corrupt(format!(
+                        "buffer table \"{}\" was handed a physical tid",
+                        self.schema.name
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// The rows visible to `txn`, as `(tid, values)` — the input to a flush.
+    ///
+    /// "Visible to a fresh snapshot" is exactly the right selection: it admits
+    /// rows whose inserter committed before the flush transaction started, and
+    /// excludes rows still in flight (they stay buffered for a later flush) and
+    /// rows an aborted transaction wrote. No separate seal state is needed —
+    /// MVCC already answers the question.
+    pub fn snapshot_rows(&self, txn: &TxnContext) -> Vec<(Tid, Tuple)> {
+        self.visible(txn)
+    }
+
+    /// Live encoded bytes. Cheap enough for a scheduler to poll.
+    pub fn resident_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Attach a semantic index. There is no physical index structure: rows live
+    /// in one `Vec`, so uniqueness is enforced by the executor's visible-row scan
+    /// and `supports_index_scan` stays false.
+    pub fn add_index(&self, index: IndexMetadata) {
+        self.indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .push(index);
+    }
+
+    pub fn remove_index(&self, name: &str) {
+        self.indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .retain(|index| index.name != name);
+    }
+
+    fn rows_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<BufferRow>> {
+        self.rows
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+    }
+
+    fn rows_write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<BufferRow>> {
+        self.rows
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+    }
+
+    /// Install the rows replay recovered, keeping only those a future snapshot
+    /// could see.
+    ///
+    /// Filtering here rather than at read time is what keeps the steady-state
+    /// scan free of recovery concerns: an aborted or never-committed inserter's
+    /// rows can never become visible (after a crash an XID without a commit
+    /// record will never get one), and a committed deleter's rows are dead to
+    /// every snapshot a restarted server can hand out, since the oldest possible
+    /// snapshot starts after recovery.
+    pub fn restore(&self, restored: RestoredBuffer, clog: &Clog) {
+        let mut rows = self.rows_write();
+        let mut bytes = 0usize;
+        rows.clear();
+        for row in restored.rows {
+            if clog.status(row.hdr.xmin) != XactStatus::Committed {
+                continue;
+            }
+            if row.hdr.xmax.is_valid() && clog.status(row.hdr.xmax) == XactStatus::Committed {
+                continue;
+            }
+            let size = row_bytes(&row.values);
+            bytes += size;
+            rows.push(BufferRow {
+                row_id: row.row_id,
+                values: row.values,
+                // A surviving row is live: its deleter, if any, aborted.
+                hdr: TupleHeader {
+                    xmax: Xid::INVALID,
+                    ..row.hdr
+                },
+                bytes: size,
+            });
+        }
+        rows.sort_by_key(|row| row.row_id);
+        self.bytes.store(bytes, Ordering::Relaxed);
+        // Above every id the log mentions, including those just discarded: a
+        // reused id would make a replayed delete hit the wrong row.
+        self.next_row_id
+            .store(restored.next_row_id, Ordering::Relaxed);
+    }
+
+    /// Snapshot-visible rows, materialized under one read lock.
+    ///
+    /// The rows are copied rather than streamed because the lock cannot be held
+    /// across the iterator's life without blocking every writer for the duration
+    /// of the caller's query.
+    fn visible(&self, txn: &TxnContext) -> Vec<(Tid, Tuple)> {
+        self.rows_read()
+            .iter()
+            .filter(|row| satisfies_mvcc(&row.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid))
+            .map(|row| (Tid::logical(row.row_id), row.values.clone()))
+            .collect()
+    }
+
+    /// Mint `count` consecutive row ids.
+    fn alloc_row_ids(&self, count: u64) -> Result<u64, StorageError> {
+        let first = self.next_row_id.fetch_add(count, Ordering::Relaxed);
+        if first.saturating_add(count) > MAX_ROW_ID {
+            return Err(unsupported(format!(
+                "buffer table \"{}\" has exhausted its row ids",
+                self.schema.name
+            )));
+        }
+        Ok(first)
+    }
+
+    /// Append `tuples`, WAL-logging them first.
+    ///
+    /// The record is appended but **not** flushed: the transaction's commit
+    /// record is the durability boundary, and because the WAL is one ordered
+    /// stream, flushing at commit makes every earlier append durable for free —
+    /// with group commit amortizing the fsync across sessions.
+    fn append(&self, rel: u32, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+        if tuples.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first_row_id = self.alloc_row_ids(tuples.len() as u64)?;
+        let hdr = TupleHeader::inserted(txn.xid, txn.cid);
+
+        // Encode outside every lock: this is the expensive step and nothing it
+        // touches is shared.
+        let mut staged = Vec::with_capacity(tuples.len());
+        let mut total = 0usize;
+        for (offset, values) in tuples.into_iter().enumerate() {
+            let size = row_bytes(&values);
+            total += size;
+            staged.push(BufferRow {
+                row_id: first_row_id + offset as u64,
+                values,
+                hdr,
+                bytes: size,
+            });
+        }
+
+        for chunk in encode_insert(rel, txn.cid, &staged) {
+            self.wal.append(RMGR_BUFFER, BUFFER_INSERT, txn.xid, &chunk);
+        }
+
+        let tids = staged.iter().map(|row| Tid::logical(row.row_id)).collect();
+        // Row ids were allocated in order and `alloc_row_ids` is the only source,
+        // so appending keeps `rows` sorted without a re-sort.
+        self.rows_write().extend(staged);
+        self.bytes.fetch_add(total, Ordering::Relaxed);
+        Ok(tids)
+    }
+
+    /// Stamp the rows named by `row_ids` deleted by `txn`, WAL-logging the ones
+    /// actually stamped.
+    ///
+    /// A row is stampable unless a *committed* transaction already deleted it; an
+    /// aborted or in-flight deleter leaves it live. Doing the check and the stamp
+    /// under one write lock is the serialization point, so two concurrent
+    /// deleters of the same row cannot both succeed.
+    fn stamp_deleted(&self, rel: u32, row_ids: &[u64], txn: &TxnContext) -> Vec<u64> {
+        let mut stamped = Vec::with_capacity(row_ids.len());
+        {
+            let mut rows = self.rows_write();
+            for row_id in row_ids {
+                let Ok(index) = rows.binary_search_by_key(row_id, |row| row.row_id) else {
+                    continue;
+                };
+                let row = &mut rows[index];
+                let live = !row.hdr.xmax.is_valid()
+                    || txn.clog.status(row.hdr.xmax) == XactStatus::Aborted;
+                if !live {
+                    continue;
+                }
+                row.hdr.xmax = txn.xid;
+                row.hdr.cmax = txn.cid;
+                stamped.push(*row_id);
+            }
+        }
+        if !stamped.is_empty() {
+            self.wal.append(
+                RMGR_BUFFER,
+                BUFFER_DELETE,
+                txn.xid,
+                &encode_delete(rel, txn.cid, &stamped),
+            );
+        }
+        stamped
+    }
+}
+
+/// The encoded size of one row's values, plus fixed per-row overhead.
+fn row_bytes(values: &[Value]) -> usize {
+    let mut buf = Vec::new();
+    for value in values {
+        if !matches!(value, Value::Null) {
+            encode_datum(value, &mut buf);
+        }
+    }
+    buf.len() + ROW_OVERHEAD_BYTES
+}
+
+/// The largest `BUFFER_INSERT` payload emitted in one record.
+///
+/// `Wal::append` stages bytes under one mutex, so a single huge record would
+/// hold it for one enormous copy and stall every other session's group commit.
+/// Splitting bounds that hold; the rows are contiguous by id either way.
+const MAX_INSERT_PAYLOAD: usize = 1 << 20;
+
+/// Encode `rows` as one or more `BUFFER_INSERT` payloads.
+///
+/// Layout, little-endian throughout:
+/// `[fmt:u8][rel:u32][cid:u32][first_row_id:u64][n_rows:u32][n_cols:u16]`
+/// then per row a null bitmap of `ceil(n_cols/8)` bytes followed by
+/// [`encode_datum`] for each non-null column in schema order.
+fn encode_insert(rel: u32, cid: CommandId, rows: &[BufferRow]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < rows.len() {
+        let mut payload = Vec::new();
+        let mut end = start;
+        // Reserve the header, then backfill the row count once the split point is
+        // known — the alternative is encoding every row twice.
+        let n_cols = rows[start].values.len() as u16;
+        payload.push(PAYLOAD_FORMAT);
+        payload.extend_from_slice(&rel.to_le_bytes());
+        payload.extend_from_slice(&cid.0.to_le_bytes());
+        payload.extend_from_slice(&rows[start].row_id.to_le_bytes());
+        let count_at = payload.len();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&n_cols.to_le_bytes());
+        while end < rows.len() {
+            if end > start && payload.len() >= MAX_INSERT_PAYLOAD {
+                break;
+            }
+            encode_row(&rows[end].values, &mut payload);
+            end += 1;
+        }
+        let count = (end - start) as u32;
+        payload[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
+        out.push(payload);
+        start = end;
+    }
+    out
+}
+
+fn encode_row(values: &[Value], out: &mut Vec<u8>) {
+    let bitmap_len = values.len().div_ceil(8);
+    let bitmap_at = out.len();
+    out.resize(bitmap_at + bitmap_len, 0);
+    for (index, value) in values.iter().enumerate() {
+        if matches!(value, Value::Null) {
+            out[bitmap_at + index / 8] |= 1 << (index % 8);
+        } else {
+            encode_datum(value, out);
+        }
+    }
+}
+
+/// `[fmt:u8][rel:u32][cid:u32][n:u32]` then `n` row ids.
+fn encode_delete(rel: u32, cid: CommandId, row_ids: &[u64]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(13 + row_ids.len() * 8);
+    payload.push(PAYLOAD_FORMAT);
+    payload.extend_from_slice(&rel.to_le_bytes());
+    payload.extend_from_slice(&cid.0.to_le_bytes());
+    payload.extend_from_slice(&(row_ids.len() as u32).to_le_bytes());
+    for row_id in row_ids {
+        payload.extend_from_slice(&row_id.to_le_bytes());
+    }
+    payload
+}
+
+/// Cursor over a WAL payload. Every read is checked, so a truncated record is a
+/// clean error rather than a panic.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Cursor { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], WalError> {
+        if self.pos + n > self.buf.len() {
+            return Err(WalError::Redo(
+                "truncated buffer-table WAL payload".to_string(),
+            ));
+        }
+        let slice = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8, WalError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, WalError> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, WalError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, WalError> {
+        let bytes = self.take(8)?;
+        let mut wide = [0u8; 8];
+        wide.copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(wide))
+    }
+}
+
+/// Replays buffer-table records, accumulating each relation's rows for
+/// [`BufferTable::restore`] to install once the CLOG is rebuilt.
+///
+/// Replay cannot decide visibility itself: a record's transaction may commit
+/// later in the same log. So it applies every record unconditionally and leaves
+/// the filtering to `restore`, which runs after the whole log is read.
+#[derive(Default)]
+pub struct BufferRedo {
+    buffers: Mutex<HashMap<u32, RestoredBuffer>>,
+}
+
+impl BufferRedo {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take the rows replayed for `rel`, leaving nothing behind — each relation
+    /// is restored exactly once.
+    pub fn take(&self, rel: u32) -> Option<RestoredBuffer> {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .remove(&rel)
+    }
+}
+
+impl RmgrRedo for BufferRedo {
+    fn redo(&self, ctx: &RedoContext) -> Result<(), WalError> {
+        let mut cursor = Cursor::new(ctx.payload);
+        let format = cursor.u8()?;
+        if format != PAYLOAD_FORMAT {
+            return Err(WalError::Redo(format!(
+                "unsupported buffer-table payload format {format}"
+            )));
+        }
+        let rel = cursor.u32()?;
+        let cid = CommandId(cursor.u32()?);
+        let mut buffers = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let buffer = buffers.entry(rel).or_default();
+        match ctx.info {
+            BUFFER_INSERT => {
+                let first_row_id = cursor.u64()?;
+                let n_rows = cursor.u32()?;
+                let n_cols = cursor.u16()? as usize;
+                let hdr = TupleHeader::inserted(ctx.xid, cid);
+                for offset in 0..n_rows as u64 {
+                    let values = decode_row(&mut cursor, n_cols)?;
+                    buffer.rows.push(RestoredRow {
+                        row_id: first_row_id + offset,
+                        values,
+                        hdr,
+                    });
+                }
+                buffer.next_row_id = buffer.next_row_id.max(first_row_id + n_rows as u64);
+            }
+            BUFFER_DELETE => {
+                let n = cursor.u32()?;
+                for _ in 0..n {
+                    let row_id = cursor.u64()?;
+                    // Linear rather than indexed: deletes are rare relative to
+                    // inserts, and a map would have to be rebuilt per relation
+                    // for a pass that runs once at startup.
+                    if let Some(row) = buffer.rows.iter_mut().find(|row| row.row_id == row_id) {
+                        row.hdr.xmax = ctx.xid;
+                        row.hdr.cmax = cid;
+                    }
+                    buffer.next_row_id = buffer.next_row_id.max(row_id + 1);
+                }
+            }
+            other => {
+                return Err(WalError::Redo(format!(
+                    "unknown buffer-table WAL record info byte {other:#x}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn decode_row(cursor: &mut Cursor<'_>, n_cols: usize) -> Result<Tuple, WalError> {
+    let bitmap = cursor.take(n_cols.div_ceil(8))?.to_vec();
+    let mut values = Vec::with_capacity(n_cols);
+    for index in 0..n_cols {
+        if bitmap[index / 8] & (1 << (index % 8)) != 0 {
+            values.push(Value::Null);
+        } else {
+            let mut pos = cursor.pos;
+            let value = decode_datum(cursor.buf, &mut pos);
+            cursor.pos = pos;
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+impl TableAm for BufferTable {
+    fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    fn indexes(&self) -> Vec<IndexMetadata> {
+        self.indexes
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .clone()
+    }
+
+    /// Exact, because the rows are in memory and counting them is a walk of a
+    /// `Vec` — no sampling and no estimate needed.
+    fn scan_label(&self) -> String {
+        match &self.scan_label {
+            Some(label) => label.clone(),
+            None => format!("Seq Scan on {}", self.schema.name),
+        }
+    }
+
+    fn statistics(&self) -> RelStats {
+        let rows = self.rows_read();
+        let live = rows.iter().filter(|row| !row.hdr.xmax.is_valid()).count();
+        RelStats::exact(live, &self.schema)
+    }
+
+    fn scan(&self, txn: &TxnContext) -> TupleStream {
+        Box::new(self.visible(txn).into_iter().map(Ok))
+    }
+
+    fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
+        let Some(row_id) = tid.row_id() else {
+            return Err(corrupt(format!(
+                "buffer table \"{}\" was handed a physical tid",
+                self.schema.name
+            )));
+        };
+        let rows = self.rows_read();
+        let Ok(index) = rows.binary_search_by_key(&row_id, |row| row.row_id) else {
+            return Ok(None);
+        };
+        let row = &rows[index];
+        Ok(satisfies_mvcc(&row.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid)
+            .then(|| row.values.clone()))
+    }
+
+    fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
+        let tids = self.append(self.relfilenode(), vec![tuple], txn)?;
+        tids.into_iter().next().ok_or_else(|| {
+            corrupt("buffer table insert produced no tid".to_string())
+        })
+    }
+
+    fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+        self.append(self.relfilenode(), tuples, txn)
+    }
+
+    /// Update is delete-then-insert, as in the heap: the old version is stamped
+    /// first, so two concurrent updaters serialize and the loser adds no second
+    /// successor.
+    fn update(&self, tid: Tid, tuple: Tuple, txn: &TxnContext) -> Result<UpdateResult, StorageError> {
+        let Some(row_id) = tid.row_id() else {
+            return Err(corrupt(format!(
+                "buffer table \"{}\" was handed a physical tid",
+                self.schema.name
+            )));
+        };
+        let rel = self.relfilenode();
+        if self.stamp_deleted(rel, &[row_id], txn).is_empty() {
+            return Ok(UpdateResult::NotFound);
+        }
+        self.append(rel, vec![tuple], txn)?;
+        Ok(UpdateResult::Updated)
+    }
+
+    fn delete(&self, tid: Tid, txn: &TxnContext) -> Result<DeleteResult, StorageError> {
+        let Some(row_id) = tid.row_id() else {
+            return Err(corrupt(format!(
+                "buffer table \"{}\" was handed a physical tid",
+                self.schema.name
+            )));
+        };
+        if self.stamp_deleted(self.relfilenode(), &[row_id], txn).is_empty() {
+            return Ok(DeleteResult::NotFound);
+        }
+        Ok(DeleteResult::Deleted)
+    }
+
+    /// One pass and one WAL record for the whole batch, rather than the trait
+    /// default's record per row.
+    fn delete_many(&self, tids: Vec<Tid>, txn: &TxnContext) -> Result<u64, StorageError> {
+        let row_ids = self.row_ids_of(tids)?;
+        Ok(self.stamp_deleted(self.relfilenode(), &row_ids, txn).len() as u64)
+    }
+
+    /// Reclaim versions dead to every snapshot at or before `oldest`.
+    ///
+    /// This is where a buffer table's memory actually comes back. Rows are held
+    /// after a committed delete because an older snapshot may still need them —
+    /// dropping them at delete time would break `REPEATABLE READ`, and would
+    /// break a flush, whose whole correctness argument is that the pre-flush copy
+    /// stays readable to snapshots that predate it.
+    fn vacuum(&self, oldest: Xid, clog: &Clog) {
+        let mut rows = self.rows_write();
+        let mut freed = 0usize;
+        rows.retain(|row| {
+            let dead_insert = clog.status(row.hdr.xmin) == XactStatus::Aborted;
+            let dead_delete = row.hdr.xmax.is_valid()
+                && row.hdr.xmax < oldest
+                && clog.status(row.hdr.xmax) == XactStatus::Committed;
+            if dead_insert || dead_delete {
+                freed += row.bytes;
+                return false;
+            }
+            true
+        });
+        self.bytes.fetch_sub(freed, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crabgresql_storage_api::{Column, TableAccessMethod};
+    use crabgresql_txn::{CommitSink, TransactionManager};
+    use crabgresql_types::PgType;
+    use crabgresql_wal::{RmgrRegistry, recover};
+
+    use super::*;
+
+    fn schema(name: &str) -> TableSchema {
+        let mut schema = TableSchema::new(
+            name,
+            vec![
+                Column::new("id", PgType::Int4),
+                Column::new("label", PgType::Text),
+            ],
+        );
+        schema.access_method = TableAccessMethod::Buffer;
+        schema
+    }
+
+    fn manager(wal: &Arc<Wal>) -> TransactionManager {
+        let sink: Arc<dyn CommitSink> = Arc::clone(wal) as Arc<dyn CommitSink>;
+        TransactionManager::new_recovered(sink, Arc::new(Clog::new()), Xid::FIRST_NORMAL)
+    }
+
+    fn row(id: i32, label: &str) -> Tuple {
+        vec![Value::Int4(id), Value::Text(label.to_string())]
+    }
+
+    /// Every id a scan can see, sorted so assertions do not depend on row order.
+    fn visible_ids(table: &BufferTable, txn: &TxnContext) -> Vec<i32> {
+        let mut ids: Vec<i32> = table
+            .scan(txn)
+            .map(|row| match row.expect("scan must not fail").1[0] {
+                Value::Int4(id) => id,
+                ref other => panic!("unexpected id value {other:?}"),
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn open(dir: &Path) -> anyhow::Result<(Arc<Wal>, BufferTable)> {
+        let wal = Arc::new(Wal::open(dir)?);
+        let table = BufferTable::open(7, schema("b"), Vec::new(), Arc::clone(&wal));
+        Ok((wal, table))
+    }
+
+    #[test]
+    fn a_row_is_invisible_to_its_own_command_and_visible_to_the_next()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (wal, table) = open(dir.path())?;
+        let tm = manager(&wal);
+        let xid = tm.allocate_xid();
+
+        let insert = tm.context(xid, CommandId::FIRST);
+        table.insert(row(1, "one"), &insert)?;
+        // The inserting command must not see its own row, or an `INSERT ...
+        // SELECT` from the same table would feed on its own output.
+        assert_eq!(visible_ids(&table, &insert), Vec::<i32>::new());
+
+        let next = tm.context(xid, CommandId(insert.cid.0 + 1));
+        assert_eq!(visible_ids(&table, &next), vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn another_session_sees_a_row_only_after_it_commits() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (wal, table) = open(dir.path())?;
+        let tm = manager(&wal);
+
+        let writer_xid = tm.allocate_xid();
+        let writer = tm.context(writer_xid, CommandId::FIRST);
+        table.insert(row(1, "one"), &writer)?;
+
+        // A snapshot taken while the writer is in flight must never see the row,
+        // even after the writer commits: the verdict is fixed at snapshot time.
+        let early = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(visible_ids(&table, &early), Vec::<i32>::new());
+        tm.commit(writer_xid)?;
+        assert_eq!(
+            visible_ids(&table, &early),
+            Vec::<i32>::new(),
+            "committing must not retroactively change an existing snapshot"
+        );
+
+        let late = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(visible_ids(&table, &late), vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_aborted_inserts_rows_are_invisible_and_vacuum_reclaims_them()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (wal, table) = open(dir.path())?;
+        let tm = manager(&wal);
+
+        let xid = tm.allocate_xid();
+        table.insert_many(vec![row(1, "one"), row(2, "two")], &tm.context(xid, CommandId::FIRST))?;
+        let charged = table.resident_bytes();
+        assert!(charged > 0, "rows must be charged to the byte accounting");
+        tm.abort(xid);
+
+        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(visible_ids(&table, &reader), Vec::<i32>::new());
+
+        table.vacuum(tm.snapshot().xmin, tm.clog());
+        assert_eq!(
+            table.resident_bytes(),
+            0,
+            "vacuum must return an aborted transaction's memory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_committed_delete_is_retained_for_older_snapshots_then_vacuumed()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (wal, table) = open(dir.path())?;
+        let tm = manager(&wal);
+
+        let writer = tm.allocate_xid();
+        let tids =
+            table.insert_many(vec![row(1, "one"), row(2, "two")], &tm.context(writer, CommandId::FIRST))?;
+        tm.commit(writer)?;
+
+        // An open snapshot that predates the delete.
+        let older = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(visible_ids(&table, &older), vec![1, 2]);
+
+        let deleter = tm.allocate_xid();
+        let deleted = table.delete_many(vec![tids[0]], &tm.context(deleter, CommandId::FIRST))?;
+        assert_eq!(deleted, 1);
+        tm.commit(deleter)?;
+
+        // This is the property a flush depends on: the pre-delete copy stays
+        // readable to a snapshot taken before the deleting transaction.
+        assert_eq!(
+            visible_ids(&table, &older),
+            vec![1, 2],
+            "a committed delete must not disturb an older snapshot"
+        );
+        let newer = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(visible_ids(&table, &newer), vec![2]);
+
+        // With the old snapshot's xmin as the floor, the row is not yet
+        // reclaimable; above the deleter it is.
+        table.vacuum(older.snapshot.xmin, tm.clog());
+        assert_eq!(visible_ids(&table, &older), vec![1, 2]);
+        table.vacuum(tm.allocate_xid(), tm.clog());
+        assert_eq!(visible_ids(&table, &newer), vec![2]);
+        Ok(())
+    }
+
+    #[test]
+    fn update_replaces_the_row_and_keeps_one_live_version() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (wal, table) = open(dir.path())?;
+        let tm = manager(&wal);
+
+        let writer = tm.allocate_xid();
+        let tids = table.insert_many(vec![row(1, "one")], &tm.context(writer, CommandId::FIRST))?;
+        tm.commit(writer)?;
+
+        let updater = tm.allocate_xid();
+        let txn = tm.context(updater, CommandId::FIRST);
+        assert_eq!(table.update(tids[0], row(9, "nine"), &txn)?, UpdateResult::Updated);
+        // A second update of the same version finds it already stamped.
+        assert_eq!(table.update(tids[0], row(8, "eight"), &txn)?, UpdateResult::NotFound);
+        tm.commit(updater)?;
+
+        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(visible_ids(&table, &reader), vec![9]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_logical_tid_fetches_and_a_physical_one_is_rejected() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (wal, table) = open(dir.path())?;
+        let tm = manager(&wal);
+
+        let writer = tm.allocate_xid();
+        let tids = table.insert_many(vec![row(1, "one")], &tm.context(writer, CommandId::FIRST))?;
+        tm.commit(writer)?;
+        assert!(tids[0].is_logical(), "a buffer table must mint logical tids");
+
+        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(table.fetch(tids[0], &reader)?, Some(row(1, "one")));
+        assert_eq!(table.fetch(Tid::logical(9_999), &reader)?, None);
+        // A physical tid could only arrive by routing a fetch to the wrong
+        // storage, which must be loud rather than silently reading nothing.
+        assert!(matches!(
+            table.fetch(Tid::new(1, 1), &reader),
+            Err(StorageError::CorruptData(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn committed_rows_are_rebuilt_from_the_wal_and_uncommitted_ones_are_not()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        {
+            let (wal, table) = open(dir.path())?;
+            let tm = manager(&wal);
+
+            let kept = tm.allocate_xid();
+            let tids = table.insert_many(
+                vec![row(1, "one"), row(2, "two"), row(3, "three")],
+                &tm.context(kept, CommandId::FIRST),
+            )?;
+            // Delete one of them in the same committed transaction.
+            table.delete_many(vec![tids[2]], &tm.context(kept, CommandId(1)))?;
+            tm.commit(kept)?;
+
+            let rolled_back = tm.allocate_xid();
+            table.insert_many(vec![row(4, "four")], &tm.context(rolled_back, CommandId::FIRST))?;
+            tm.abort(rolled_back);
+
+            // Never resolved — the crash happens here. Force the record to disk
+            // so replay genuinely sees an insert with no commit or abort after
+            // it; `flushed_lsn` is what is *already* durable, so flushing to it
+            // would be a no-op and the record would simply vanish.
+            let torn = tm.allocate_xid();
+            table.insert_many(vec![row(5, "five")], &tm.context(torn, CommandId::FIRST))?;
+            wal.flush(wal.current_lsn())?;
+        }
+
+        // Restart: replay the whole log, then install what committed.
+        let redo = Arc::new(BufferRedo::new());
+        let mut registry = RmgrRegistry::new();
+        registry.register(RMGR_BUFFER, Arc::clone(&redo) as Arc<dyn RmgrRedo>);
+        let clog = Clog::new();
+        let result = recover(dir.path(), &registry, &clog)?;
+
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let table = BufferTable::open(7, schema("b"), Vec::new(), wal);
+        let restored = redo.take(7).expect("replay must recover the relation");
+        table.restore(restored, &clog);
+
+        let tm = TransactionManager::new_recovered(
+            Arc::new(NullSink),
+            Arc::new(clog),
+            result.next_xid,
+        );
+        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(
+            visible_ids(&table, &reader),
+            vec![1, 2],
+            "only the committed transaction's surviving rows may come back"
+        );
+        // A new insert must not reuse a recovered row id, or a replayed delete
+        // would later hit the wrong row.
+        let writer = tm.allocate_xid();
+        let fresh = table.insert_many(vec![row(6, "six")], &tm.context(writer, CommandId::FIRST))?;
+        assert!(
+            fresh[0].row_id().expect("logical tid") >= 5,
+            "row ids must resume above every id the log mentions"
+        );
+        Ok(())
+    }
+
+    /// A commit sink for the post-recovery manager in tests that have already
+    /// closed their WAL.
+    struct NullSink;
+
+    impl CommitSink for NullSink {
+        fn log_commit(&self, _xid: Xid) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn log_abort(&self, _xid: Xid) {}
+    }
+
+    #[test]
+    fn every_supported_value_survives_a_wal_round_trip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut wide = TableSchema::new(
+            "wide",
+            vec![
+                Column::new("a", PgType::Int4),
+                Column::new("b", PgType::Text),
+                Column::new("c", PgType::Bool),
+                Column::new("d", PgType::Float8),
+            ],
+        );
+        wide.access_method = TableAccessMethod::Buffer;
+        let expected = vec![
+            vec![
+                Value::Int4(42),
+                Value::Text("hello".to_string()),
+                Value::Bool(true),
+                Value::Float8(1.5),
+            ],
+            // A row that is entirely NULL exercises the bitmap with no datums.
+            vec![Value::Null, Value::Null, Value::Null, Value::Null],
+            vec![
+                Value::Null,
+                Value::Text(String::new()),
+                Value::Null,
+                Value::Float8(f64::NAN),
+            ],
+        ];
+        {
+            let wal = Arc::new(Wal::open(dir.path())?);
+            let table = BufferTable::open(3, wide.clone(), Vec::new(), Arc::clone(&wal));
+            let tm = manager(&wal);
+            let xid = tm.allocate_xid();
+            table.insert_many(expected.clone(), &tm.context(xid, CommandId::FIRST))?;
+            tm.commit(xid)?;
+        }
+
+        let redo = Arc::new(BufferRedo::new());
+        let mut registry = RmgrRegistry::new();
+        registry.register(RMGR_BUFFER, Arc::clone(&redo) as Arc<dyn RmgrRedo>);
+        let clog = Clog::new();
+        let result = recover(dir.path(), &registry, &clog)?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let table = BufferTable::open(3, wide, Vec::new(), wal);
+        table.restore(redo.take(3).expect("replay recovers the relation"), &clog);
+
+        let tm =
+            TransactionManager::new_recovered(Arc::new(NullSink), Arc::new(clog), result.next_xid);
+        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        let mut got: Vec<Tuple> = table
+            .scan(&reader)
+            .map(|row| row.expect("scan must not fail").1)
+            .collect();
+        assert_eq!(got.len(), expected.len());
+        // NaN != NaN, so compare it by bit pattern rather than by value.
+        for (index, want) in expected.iter().enumerate() {
+            for (col, value) in want.iter().enumerate() {
+                match (value, &got[index][col]) {
+                    (Value::Float8(a), Value::Float8(b)) if a.is_nan() => {
+                        assert!(b.is_nan(), "NaN must survive the round trip");
+                    }
+                    (a, b) => assert_eq!(a, b, "row {index} column {col}"),
+                }
+            }
+        }
+        got.clear();
+        Ok(())
+    }
+
+    #[test]
+    fn a_large_batch_splits_into_several_wal_records_and_still_round_trips()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Each row carries ~4 KiB of text, so 512 rows comfortably exceed the
+        // 1 MiB record cap and force the split path.
+        let rows: Vec<Tuple> = (0..512)
+            .map(|id| vec![Value::Int4(id), Value::Text("x".repeat(4096))])
+            .collect();
+        {
+            let (wal, table) = open(dir.path())?;
+            let tm = manager(&wal);
+            let xid = tm.allocate_xid();
+            table.insert_many(rows.clone(), &tm.context(xid, CommandId::FIRST))?;
+            tm.commit(xid)?;
+        }
+
+        let redo = Arc::new(BufferRedo::new());
+        let mut registry = RmgrRegistry::new();
+        registry.register(RMGR_BUFFER, Arc::clone(&redo) as Arc<dyn RmgrRedo>);
+        let clog = Clog::new();
+        let result = recover(dir.path(), &registry, &clog)?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let table = BufferTable::open(7, schema("b"), Vec::new(), wal);
+        table.restore(redo.take(7).expect("replay recovers the relation"), &clog);
+
+        let tm =
+            TransactionManager::new_recovered(Arc::new(NullSink), Arc::new(clog), result.next_xid);
+        let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
+        assert_eq!(visible_ids(&table, &reader), (0..512).collect::<Vec<i32>>());
+        Ok(())
+    }
+}

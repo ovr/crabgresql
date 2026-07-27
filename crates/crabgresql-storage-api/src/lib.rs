@@ -27,11 +27,41 @@ pub type Tuple = Vec<Value>;
 /// the in-memory engine synthesizes them from a monotonic counter (`block` the
 /// high bits, `offset` the low), so its tids are just as opaque but share the
 /// type the heap engine needs.
+///
+/// The top bit of `block` is reserved: see [`TID_LOGICAL_FLAG`]. Clear, the tid
+/// is a physical address as above; set, it is a logical row id
+/// ([`Tid::logical`]) for an access method that rewrites storage underneath its
+/// rows. One relation may hand out both kinds, and [`TableAm::fetch`] routes on
+/// [`Tid::is_logical`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Tid {
     pub block: u32,
     pub offset: u16,
 }
+
+/// Set in [`Tid::block`], this marks a tid as a **logical row id** — an
+/// identity that survives the row being physically rewritten — rather than a
+/// physical `(block, offset)` locator.
+///
+/// An access method that rewrites storage underneath a row (a columnar store
+/// compacting files, or a write buffer flushing to one) cannot use a physical
+/// address as identity: the address changes while the row does not. Reserving
+/// the top bit splits the space in two so one relation can hand out both kinds
+/// and route a `fetch` by inspecting the tid alone, with no side table.
+///
+/// The flag means "addressed by identity", not "resident in RAM": a row keeps
+/// its logical tid after it is written to durable storage.
+pub const TID_LOGICAL_FLAG: u32 = 0x8000_0000;
+
+/// The largest physical block number an access method may use, now that
+/// [`TID_LOGICAL_FLAG`] owns the top bit. Engines whose blocks count up from 0
+/// are unaffected in practice; the limit exists so an overflow is an error
+/// rather than a tid that silently reads as logical.
+pub const MAX_PHYSICAL_BLOCK: u32 = TID_LOGICAL_FLAG - 1;
+
+/// The largest logical row id representable in a [`Tid`] — 47 bits, the 31 left
+/// in `block` plus the 16 in `offset`.
+pub const MAX_ROW_ID: u64 = (1 << 47) - 1;
 
 impl Tid {
     pub const fn new(block: u32, offset: u16) -> Self {
@@ -50,6 +80,30 @@ impl Tid {
         Tid {
             block: (n >> 16) as u32,
             offset: (n & 0xffff) as u16,
+        }
+    }
+
+    /// The tid naming logical row `row_id`. Panics in debug on overflow past
+    /// [`MAX_ROW_ID`]; callers mint ids from a counter they also bound.
+    pub const fn logical(row_id: u64) -> Self {
+        debug_assert!(row_id <= MAX_ROW_ID, "logical row id overflows a tid");
+        Tid {
+            block: TID_LOGICAL_FLAG | (row_id >> 16) as u32,
+            offset: (row_id & 0xffff) as u16,
+        }
+    }
+
+    /// Whether this tid names a logical row id rather than a physical address.
+    pub const fn is_logical(self) -> bool {
+        self.block & TID_LOGICAL_FLAG != 0
+    }
+
+    /// The logical row id this tid names, or `None` if it is a physical locator.
+    pub const fn row_id(self) -> Option<u64> {
+        if self.is_logical() {
+            Some((((self.block & !TID_LOGICAL_FLAG) as u64) << 16) | self.offset as u64)
+        } else {
+            None
         }
     }
 }
@@ -280,6 +334,11 @@ pub enum TableAccessMethod {
     #[default]
     Heap,
     Parquet,
+    /// A WAL-logged, RAM-resident row store. Durable like the heap (the commit
+    /// record covers its rows) but with no file of its own, so its size is
+    /// bounded by memory. Distinct from an `UNLOGGED`/`TEMP` heap table, which is
+    /// also RAM-resident but deliberately skips the WAL.
+    Buffer,
 }
 
 impl TableAccessMethod {
@@ -290,6 +349,7 @@ impl TableAccessMethod {
         match self {
             TableAccessMethod::Heap => "heap",
             TableAccessMethod::Parquet => "parquet",
+            TableAccessMethod::Buffer => "buffer",
         }
     }
 
@@ -298,8 +358,23 @@ impl TableAccessMethod {
         match name {
             "heap" => Some(TableAccessMethod::Heap),
             "parquet" => Some(TableAccessMethod::Parquet),
+            "buffer" => Some(TableAccessMethod::Buffer),
             _ => None,
         }
+    }
+
+    /// Whether the engine, rather than the buffer pool, owns this method's
+    /// storage.
+    ///
+    /// These methods have no unlogged or temporary form (they define their own
+    /// relationship to the WAL) and no partition routing. One predicate keeps the
+    /// CREATE TABLE, CTAS, and engine-side guards from drifting apart as methods
+    /// are added.
+    pub fn is_engine_managed(self) -> bool {
+        matches!(
+            self,
+            TableAccessMethod::Parquet | TableAccessMethod::Buffer
+        )
     }
 }
 
@@ -535,6 +610,40 @@ pub trait TableAm: Send + Sync {
     /// Semantic indexes currently attached to this table.
     fn indexes(&self) -> Vec<IndexMetadata> {
         Vec::new()
+    }
+
+    /// The engine-internal storage leaves a read of this relation must union,
+    /// in scan order, or `None` (the default) when the relation *is* its own
+    /// storage and is scanned directly.
+    ///
+    /// These are not catalog relations: they have no `pg_class` row, no OID, and
+    /// no name a user can write. They exist so an access method whose storage is
+    /// physically several sources — say a durable columnar store fronted by a
+    /// RAM write buffer — can be read as an `Append` and gain per-leaf planning,
+    /// without any of that becoming SQL-visible.
+    ///
+    /// A write target is always the relation itself. An access method that
+    /// splits its storage routes writes internally, so [`TableAm::capabilities`]
+    /// and every DML error keep describing the relation and its declared access
+    /// method, never a leaf. Leaves are produced for reads only.
+    ///
+    /// All leaves are scanned under one [`TxnContext`], so they share a snapshot.
+    /// An access method that moves rows between leaves must make that move a
+    /// transaction, so a shared snapshot yields every row exactly once.
+    fn storage_leaves(&self) -> Option<Vec<Arc<dyn TableAm>>> {
+        None
+    }
+
+    /// The whole `EXPLAIN` node line for a sequential scan of this relation.
+    ///
+    /// Returning the entire line, not just a name, is what lets a relation that
+    /// is physically several sources label each one distinctly: an `Append` over
+    /// two leaves of the *same* relation would otherwise print the same line
+    /// twice and read like a planner bug. The default reproduces PostgreSQL's
+    /// `Seq Scan on <rel>` and is what every catalog relation and SQL partition
+    /// uses.
+    fn scan_label(&self) -> String {
+        format!("Seq Scan on {}", self.schema().name)
     }
 
     /// Size and distribution estimates for the planner, and the source of
@@ -807,6 +916,23 @@ pub trait TableEngine: Send + Sync {
         Err(StorageError::TableNotFound(name.to_string()))
     }
 
+    /// Tidy a relation's storage (`VACUUM`): reclaim versions dead to every
+    /// snapshot at or before `oldest`, and make durable whatever an access method
+    /// is holding in memory. Returns the number of rows made durable, which is
+    /// zero for an access method that only reclaims.
+    ///
+    /// Deliberately not a [`TableAm`] method: an access method with a RAM write
+    /// buffer flushes by running its own transaction, and only the engine has the
+    /// transaction service. The default reclaims via [`TableAm::vacuum`].
+    fn vacuum_table(
+        &self,
+        _namespace: &str,
+        name: &str,
+        _oldest: Xid,
+    ) -> Result<u64, StorageError> {
+        Err(StorageError::TableNotFound(name.to_string()))
+    }
+
     /// Enumerate user relations including live index metadata for catalog
     /// reflection. Engines with tables override this; the fallback preserves
     /// compatibility for read-only/system engines.
@@ -1024,5 +1150,64 @@ impl TypeCatalog for EmptyTypeCatalog {
 
     fn backing_rep(&self, ty: PgType) -> PgType {
         ty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_and_physical_tids_never_collide() {
+        // The two spaces must stay disjoint at their boundaries, which is what
+        // lets `fetch` route on the tid alone. Note `offset` 0 is legal for a
+        // logical id but not for a heap line pointer — irrelevant, because the
+        // flag, not the offset, is what separates them.
+        let physical = [
+            Tid::new(0, 0),
+            Tid::new(0, 1),
+            Tid::new(1, u16::MAX),
+            Tid::new(MAX_PHYSICAL_BLOCK, u16::MAX),
+        ];
+        let logical = [0, 1, 0xffff, 0x1_0000, MAX_ROW_ID];
+
+        for tid in physical {
+            assert!(!tid.is_logical(), "{tid:?} must read as physical");
+            assert_eq!(tid.row_id(), None);
+        }
+        for row_id in logical {
+            let tid = Tid::logical(row_id);
+            assert!(tid.is_logical(), "row id {row_id} must read as logical");
+            assert_eq!(tid.row_id(), Some(row_id), "row id must round-trip");
+        }
+
+        // Every logical tid sorts above every physical one, so a scan that
+        // yields durable rows before buffered ones is already tid-ordered.
+        let highest_physical = physical
+            .iter()
+            .map(|t| t.packed())
+            .max()
+            .expect("the physical fixture is non-empty");
+        let lowest_logical = logical
+            .iter()
+            .map(|id| Tid::logical(*id).packed())
+            .min()
+            .expect("the logical fixture is non-empty");
+        assert!(
+            highest_physical < lowest_logical,
+            "physical tids must sort below logical ones"
+        );
+    }
+
+    #[test]
+    fn the_logical_flag_is_the_only_bit_separating_the_spaces() {
+        // Row id 0 and physical (0, 0) differ in exactly the flag: proof the
+        // split costs one bit and nothing else.
+        assert_eq!(Tid::logical(0).block, TID_LOGICAL_FLAG);
+        assert_eq!(Tid::logical(0).offset, 0);
+        assert_eq!(MAX_PHYSICAL_BLOCK, TID_LOGICAL_FLAG - 1);
+        // The largest row id saturates the tid exactly — every bit but the flag
+        // is in use, so 47 is the true capacity and not a rounded-down guess.
+        assert_eq!(Tid::logical(MAX_ROW_ID), Tid::new(u32::MAX, u16::MAX));
     }
 }

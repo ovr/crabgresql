@@ -11,7 +11,7 @@ use crabgresql_storage_api::{
     IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition, StorageError, TableAm,
     TableEngine, TableSchema, ViewDefinition,
 };
-use crabgresql_txn::TxnContext;
+use crabgresql_txn::{TxnContext, Xid};
 
 /// The executor-facing catalog handle: answers `pg_get_userbyid` and
 /// `pg_table_is_visible` against the same [`SystemCatalog`] snapshot that built
@@ -321,6 +321,24 @@ impl TableEngine for SessionCatalog {
             Err(StorageError::TableNotFound(name.to_string()))
         } else {
             self.global.analyze(namespace, name, txn)
+        }
+    }
+
+    /// Same namespace resolution as [`SessionCatalog::analyze`]: an unqualified
+    /// name may be this session's temp table, and another session's temp schema
+    /// is not reachable at all.
+    fn vacuum_table(
+        &self,
+        namespace: &str,
+        name: &str,
+        oldest: Xid,
+    ) -> Result<u64, StorageError> {
+        if namespace == "public" && self.temp_has(name) {
+            self.global.vacuum_table(&self.temp_schema, name, oldest)
+        } else if self.is_foreign_temp(namespace) {
+            Err(StorageError::TableNotFound(name.to_string()))
+        } else {
+            self.global.vacuum_table(namespace, name, oldest)
         }
     }
 

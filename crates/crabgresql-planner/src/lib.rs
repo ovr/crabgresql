@@ -912,12 +912,17 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
         }
         PhysicalPlan::Values { .. } => vec!["Values Scan".to_string()],
         PhysicalPlan::Append { tables, .. } => {
-            // PG's Append over the partitions: one child Seq Scan per leaf, in
-            // scan order. A WHERE predicate lives on the wrapping Subquery in this
+            // PG's Append over the partitions: one child scan per leaf, in scan
+            // order. A WHERE predicate lives on the wrapping Subquery in this
             // pipeline, so it is not re-rendered per child (reduced EXPLAIN).
+            //
+            // Each leaf names its own line: a SQL partition renders as the usual
+            // `Seq Scan on <leaf>`, while an engine-internal storage leaf can
+            // distinguish itself, so an Append over one relation's leaves is not
+            // the same line repeated.
             let mut lines = vec!["Append".to_string()];
             for table in tables {
-                lines.push(format!("  ->  Seq Scan on {}", table.schema().name));
+                lines.push(format!("  ->  {}", table.scan_label()));
             }
             lines
         }

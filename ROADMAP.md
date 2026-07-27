@@ -32,20 +32,39 @@ order and may change as milestones are completed or reprioritized.
 The target design is specified in
 [`docs/ARCHITECTURE.md` §2](docs/ARCHITECTURE.md#2-parquet-table-engine).
 
-The current implementation is V1: one or more immutable fragments per INSERT
-statement, a 65,535-row `Tid` limit, transaction identity in each footer,
-directory listing as the live-file index, `.pending` rename on commit,
-sequential scans, and no background workers or partition support.
+The current implementation is V1 plus the write buffer: fragments carry
+transaction identity in their footer, the directory listing is the live-file
+index, `.pending` is renamed on commit, and scans are sequential. Foreground
+`INSERT`/`COPY` no longer create files — they land in a WAL-logged RAM
+`BufferTable` (the `buffer` access method, also selectable on its own with
+`CREATE TABLE ... USING buffer`), which a background worker or an explicit
+`VACUUM` flushes into one fragment. A relation therefore plans as an `Append`
+over its two engine-internal storage leaves.
+
+Two consequences worth stating plainly:
+
+- **A committed `INSERT` is durable before any file exists.** It is covered by
+  the commit record's fsync and rebuilt from the WAL at startup, but nothing
+  external should expect to see it under `parquet/<rel>/` until a flush.
+- **WAL volume now carries all Parquet data.** With no segment recycling and
+  whole-WAL replay at every boot, a large `COPY` grows both the log and every
+  subsequent startup. Checkpoint-bounded recovery is therefore a hard
+  prerequisite of step 3 below, not a deferred nicety.
 
 The target design should land in compatibility-preserving slices:
 
 1. Add versioned layout and manifest metadata while continuing to read and
    write V1 fragments.
-2. Introduce logical row IDs and the mandatory WAL-backed `BufferTable`,
+2. ~~Introduce logical row IDs and the mandatory WAL-backed `BufferTable`,
    including recovery, snapshot reads, state transitions, memory limits, and
-   backpressure.
+   backpressure.~~ **Done**, except per-partition buffers and write
+   backpressure: there is one buffer per relation, and memory is bounded by the
+   flush policy rather than by blocking writers.
 3. Switch foreground file creation to sorted background flush with the 64 MiB
-   target and V2 per-row engine metadata.
+   target and V2 per-row engine metadata. The flush is background already, but
+   output is unsorted and still capped at 65,535 rows per fragment by the `Tid`
+   offset — the 64 MiB target is unreachable until the V2 footer lands, so the
+   two are one change.
 4. Add manifest-pinned scans, pruning/pushdown, retired-file GC, and leveled
    compaction.
 5. Add internal partition split/merge and online repartitioning.

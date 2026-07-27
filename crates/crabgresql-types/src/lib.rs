@@ -9,6 +9,7 @@ pub mod array;
 pub mod bit;
 pub mod cast;
 pub mod collation;
+pub mod datum;
 pub mod date;
 pub mod float;
 pub mod geo;

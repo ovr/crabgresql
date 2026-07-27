@@ -1,4 +1,4 @@
-//! Self-describing on-page encoding of a single [`Value`].
+//! Self-describing durable encoding of a single [`Value`].
 //!
 //! Each datum begins with a one-byte type tag, so decoding never needs the
 //! column's declared type — the null bitmap in the tuple header handles NULLs,
@@ -6,8 +6,18 @@
 //! kinds write their raw little-endian bytes; variable-width kinds write a
 //! `u32` length prefix followed by the payload. Floats are stored via `to_bits`
 //! so NaN payloads survive a round trip.
+//!
+//! This lives beside [`Value`] rather than in a storage crate because every
+//! durable representation of a value shares it: heap pages, the relation
+//! catalog's partition bounds, and the Parquet buffer table's WAL records. One
+//! codec means one place to get a type's byte layout right, and it means an
+//! access method outside `crabgresql-pg-engine` can persist a `Value` without
+//! reimplementing 33 encodings.
+//!
+//! The tag bytes below are an on-disk format shared by all of those. Adding a
+//! kind appends a tag; renumbering one silently misreads every existing file.
 
-use crabgresql_types::{Inet, Interval, Numeric, PgType, Reg, TimeTz, Value, json};
+use crate::{Inet, Interval, Numeric, PgType, Reg, TimeTz, Value, json};
 
 // Type tags. Never reordered — they are an on-disk format.
 const T_BOOL: u8 = 1;
@@ -191,19 +201,19 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         // `jsonpath` stores its canonical text (`jsonpath_out`), re-parsed on decode.
         Value::Jsonpath(p) => {
             out.push(T_JSONPATH);
-            put_var(out, crabgresql_types::jsonpath::format(p).as_bytes());
+            put_var(out, crate::jsonpath::format(p).as_bytes());
         }
         // Both text-search types store their canonical text for the same reason:
         // the output form round-trips exactly through the input parser.
         Value::Tsvector(v) => {
             out.push(T_TSVECTOR);
-            put_var(out, crabgresql_types::tsvector::format(v).as_bytes());
+            put_var(out, crate::tsvector::format(v).as_bytes());
         }
         // `tsquery` cannot store its text form: `tsquery_out` is lossy for
         // `&`/`|` associativity, so `'1|(2|4)'` would come back as `'1|2|4'`.
         Value::Tsquery(q) => {
             out.push(T_TSQUERY);
-            put_var(out, &crabgresql_types::tsquery::encode(q));
+            put_var(out, &crate::tsquery::encode(q));
         }
         // A 1-D array: element type OID, element count, then per element a
         // presence byte (0 = NULL, 1 = a self-describing datum). Elements recurse
@@ -367,17 +377,17 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         T_JSONPATH => {
             let s = std::str::from_utf8(r.var()).expect("jsonpath text is valid utf-8");
             Value::Jsonpath(
-                crabgresql_types::jsonpath::jsonpath_in(s).expect("stored jsonpath re-parses"),
+                crate::jsonpath::jsonpath_in(s).expect("stored jsonpath re-parses"),
             )
         }
         T_TSVECTOR => {
             let s = std::str::from_utf8(r.var()).expect("tsvector text is valid utf-8");
             Value::Tsvector(
-                crabgresql_types::tsvector::tsvector_in(s).expect("stored tsvector re-parses"),
+                crate::tsvector::tsvector_in(s).expect("stored tsvector re-parses"),
             )
         }
         T_TSQUERY => Value::Tsquery(
-            crabgresql_types::tsquery::decode(r.var()).expect("stored tsquery decodes"),
+            crate::tsquery::decode(r.var()).expect("stored tsquery decodes"),
         ),
         T_ARRAY => {
             let elem_oid = r.u32();
@@ -407,7 +417,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crabgresql_types::RegKind;
+    use crate::RegKind;
 
     fn roundtrip(v: Value) {
         let mut buf = Vec::new();
@@ -514,7 +524,7 @@ mod tests {
         roundtrip(json::jsonb_in("1.50").map(Value::Jsonb).expect("valid jsonb"));
         // `jsonpath` stores its canonical text form.
         roundtrip(
-            crabgresql_types::jsonpath::jsonpath_in("$.a[*] ? (@ > 3)")
+            crate::jsonpath::jsonpath_in("$.a[*] ? (@ > 3)")
                 .map(Value::Jsonpath)
                 .expect("valid jsonpath"),
         );
@@ -523,7 +533,7 @@ mod tests {
         // likely to lose information on a round trip.
         for tv in ["'a':1A,3B 'b' 'c':16383", r"'ab\\c' 'x''y'", ""] {
             roundtrip(
-                crabgresql_types::tsvector::tsvector_in(tv)
+                crate::tsvector::tsvector_in(tv)
                     .map(Value::Tsvector)
                     .expect("valid tsvector"),
             );
@@ -532,7 +542,7 @@ mod tests {
         // that storage keeps the tree shape rather than the canonical text.
         for tq in ["'a':*AB <2> ( 'b' | !'c' )", "!!'x'", "", "1|2|4", "1|(2|4)"] {
             roundtrip(
-                crabgresql_types::tsquery::tsquery_in(tq)
+                crate::tsquery::tsquery_in(tq)
                     .map(Value::Tsquery)
                     .expect("valid tsquery"),
             );
