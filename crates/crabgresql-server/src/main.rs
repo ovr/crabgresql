@@ -23,8 +23,7 @@ struct Cli {
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            // `EnvFilter`'s default env is `RUST_LOG`, i.e. `config::LOG_FILTER`.
-            tracing_subscriber::EnvFilter::try_from_default_env()
+            tracing_subscriber::EnvFilter::try_from_env(config::LOG_FILTER)
                 .unwrap_or_else(|_| config::DEFAULT_LOG_FILTER.into()),
         )
         .init();

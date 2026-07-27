@@ -4,9 +4,14 @@
 //! The names used to live as string literals at the point of use, which made
 //! the set of knobs impossible to enumerate, document, or test: adding one was
 //! a local edit nobody else could see. Here a name, its default and the range
-//! it may take sit in one constant, [`ALL`] lists the whole set, and [`var`] is
-//! the only place in the workspace that calls `std::env::var` for
-//! configuration.
+//! it may take sit in one constant, and the README's Configuration table is
+//! their prose copy.
+//!
+//! Only the knobs this crate reads itself go through [`RangedVar`]. The
+//! server's port and data directory are clap arguments that happen to take an
+//! environment fallback, and `RUST_LOG` belongs to `tracing_subscriber`; those
+//! three are here as names and defaults only, and they keep their own
+//! (stricter, exit-on-bad-input) behavior.
 //!
 //! Cargo's own build-time variables (`OUT_DIR`, `CARGO_MANIFEST_DIR`,
 //! `CARGO_TARGET_TMPDIR`) are deliberately absent — they are an interface with
@@ -86,6 +91,15 @@ pub const BUFFER_TICK: TimeVar = TimeVar {
     help: "how often the background flush worker looks for eligible buffers",
 };
 
+// Bounds that are transposed, or a default outside them, would be a startup
+// panic waiting for the first operator to set that variable: `Ord::clamp`
+// asserts `min <= max`. Checked here rather than in a test, because a test
+// only covers the knobs somebody remembered to list in it.
+const _: () = assert!(BUFFER_TABLE_SOFT_BYTES.is_sane());
+const _: () = assert!(BUFFER_GLOBAL_HARD_BYTES.is_sane());
+const _: () = assert!(BUFFER_MAX_AGE.is_sane());
+const _: () = assert!(BUFFER_TICK.is_sane());
+
 /// A knob whose value is a quantity: its name, its default, and the range it
 /// is allowed to take.
 ///
@@ -107,6 +121,24 @@ pub struct RangedVar<T> {
 pub type SizeVar = RangedVar<usize>;
 /// A knob measured in time, written `60s` or `60000`.
 pub type TimeVar = RangedVar<Duration>;
+
+impl SizeVar {
+    /// Whether the bounds are ordered and hold the default, checkable while
+    /// compiling. `Ord` is not usable in a `const fn`, hence one of these per
+    /// quantity rather than one on [`RangedVar`].
+    const fn is_sane(&self) -> bool {
+        self.min <= self.default && self.default <= self.max
+    }
+}
+
+impl TimeVar {
+    /// See [`SizeVar::is_sane`]; compares milliseconds because `Duration`'s
+    /// comparisons are not `const` either.
+    const fn is_sane(&self) -> bool {
+        self.min.as_millis() <= self.default.as_millis()
+            && self.default.as_millis() <= self.max.as_millis()
+    }
+}
 
 impl<T: Quantity> RangedVar<T> {
     /// The value to use, reading the environment.
@@ -131,7 +163,7 @@ impl<T: Quantity> RangedVar<T> {
     /// value honors that, where falling back to the default would move it the
     /// other way. A value we cannot read at all says nothing, so it gets the
     /// default.
-    pub fn read(&self, raw: Option<&str>) -> (T, Option<String>) {
+    fn read(&self, raw: Option<&str>) -> (T, Option<String>) {
         let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
             return (self.default, None);
         };
@@ -274,150 +306,34 @@ fn match_unit<T: Copy>(unit: &str, table: &[(&str, T)]) -> Option<T> {
 /// An empty value counts as unset: a shell that exports `FOO=` has said
 /// nothing, and treating it as a parse failure would mean the same thing by a
 /// longer route.
-pub fn var(name: &str) -> Option<String> {
+fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|raw| !raw.is_empty())
 }
-
-/// A documented knob, for anything that wants to render the set rather than
-/// read one value out of it (`--help`, the README table, tests).
-#[derive(Clone, Copy, Debug)]
-pub struct EnvVar {
-    pub name: &'static str,
-    /// The default written the way a user would type it.
-    pub default: &'static str,
-    pub help: &'static str,
-    /// The accepted range, written the same way, for the knobs that have one.
-    pub range: Option<(&'static str, &'static str)>,
-}
-
-/// Every environment variable in the list above, in the order a reader meets
-/// them: server first, storage tuning after.
-pub const ALL: &[EnvVar] = &[
-    EnvVar {
-        name: PORT,
-        default: "5433",
-        help: "TCP port to listen on",
-        range: None,
-    },
-    EnvVar {
-        name: DATA_DIR,
-        default: DEFAULT_DATA_DIR,
-        help: "data directory the durable heap engine is opened in",
-        range: None,
-    },
-    EnvVar {
-        name: LOG_FILTER,
-        default: DEFAULT_LOG_FILTER,
-        help: "tracing filter directives",
-        range: None,
-    },
-    EnvVar {
-        name: BUFFER_TABLE_SOFT_BYTES.name,
-        default: "32MB",
-        help: BUFFER_TABLE_SOFT_BYTES.help,
-        range: Some(("8kB", "2GB")),
-    },
-    EnvVar {
-        name: BUFFER_GLOBAL_HARD_BYTES.name,
-        default: "256MB",
-        help: BUFFER_GLOBAL_HARD_BYTES.help,
-        range: Some(("8kB", "16GB")),
-    },
-    EnvVar {
-        name: BUFFER_MAX_AGE.name,
-        default: "1m",
-        help: BUFFER_MAX_AGE.help,
-        range: Some(("10ms", "24h")),
-    },
-    EnvVar {
-        name: BUFFER_TICK.name,
-        default: "1s",
-        help: BUFFER_TICK.help,
-        range: Some(("10ms", "1h")),
-    },
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The size knobs, so a new one is validated by these tests for free.
-    const SIZES: &[SizeVar] = &[BUFFER_TABLE_SOFT_BYTES, BUFFER_GLOBAL_HARD_BYTES];
-    /// The same, for the ones measured in time.
-    const TIMES: &[TimeVar] = &[BUFFER_MAX_AGE, BUFFER_TICK];
-
-    fn entry(name: &str) -> &'static EnvVar {
-        match ALL.iter().find(|entry| entry.name == name) {
-            Some(entry) => entry,
-            None => panic!("{name} is missing from ALL"),
-        }
-    }
-
-    /// What [`RangedVar::read`] says about a knob's documented shape: the
-    /// spelling of its default and range must be what the reader enforces.
-    fn assert_documented<T: Quantity + std::fmt::Debug>(knob: &RangedVar<T>) {
-        let documented = entry(knob.name);
-        assert_eq!(T::parse(documented.default), Some(knob.default));
-        assert_eq!(
-            documented.range,
-            Some((knob.min.render().as_str(), knob.max.render().as_str())),
-            "{}'s documented range is not the one it enforces",
-            knob.name
-        );
-        assert_eq!(documented.help, knob.help);
-        assert!(
-            knob.min <= knob.default && knob.default <= knob.max,
-            "{}'s default is outside its own range",
-            knob.name
-        );
-    }
-
+    /// The spellings the README documents, checked against what the knobs
+    /// actually enforce. The table there is the only place these ranges are
+    /// written for a human, so it is the copy worth pinning.
     #[test]
-    fn all_lists_every_name_once() {
-        let declared = [
-            PORT,
-            DATA_DIR,
-            LOG_FILTER,
-            BUFFER_TABLE_SOFT_BYTES.name,
-            BUFFER_GLOBAL_HARD_BYTES.name,
-            BUFFER_MAX_AGE.name,
-            BUFFER_TICK.name,
-        ];
-        let listed: Vec<&str> = ALL.iter().map(|entry| entry.name).collect();
-        assert_eq!(listed, declared);
-        for (index, entry) in ALL.iter().enumerate() {
-            assert!(
-                !ALL[..index].iter().any(|other| other.name == entry.name),
-                "{} is listed twice",
-                entry.name
-            );
-        }
-    }
+    fn the_readme_table_says_what_the_knobs_enforce() {
+        assert_eq!(BUFFER_TABLE_SOFT_BYTES.default.render(), "32MB");
+        assert_eq!(BUFFER_TABLE_SOFT_BYTES.min.render(), "8kB");
+        assert_eq!(BUFFER_TABLE_SOFT_BYTES.max.render(), "2GB");
 
-    #[test]
-    fn only_the_postgres_compatible_names_go_unprefixed() {
-        for entry in ALL {
-            let ours = entry.name.starts_with("CRABGRESQL_");
-            let borrowed = entry.name == DATA_DIR || entry.name == LOG_FILTER;
-            assert!(
-                ours ^ borrowed,
-                "{} is neither ours nor a name we borrow on purpose",
-                entry.name
-            );
-        }
-    }
+        assert_eq!(BUFFER_GLOBAL_HARD_BYTES.default.render(), "256MB");
+        assert_eq!(BUFFER_GLOBAL_HARD_BYTES.min.render(), "8kB");
+        assert_eq!(BUFFER_GLOBAL_HARD_BYTES.max.render(), "16GB");
 
-    #[test]
-    fn documented_defaults_and_ranges_match_the_constants() {
-        assert_eq!(entry(PORT).default, DEFAULT_PORT.to_string());
-        assert_eq!(entry(DATA_DIR).default, DEFAULT_DATA_DIR);
-        assert_eq!(entry(LOG_FILTER).default, DEFAULT_LOG_FILTER);
-        for knob in SIZES {
-            assert_documented(knob);
-        }
-        for knob in TIMES {
-            assert_documented(knob);
-        }
+        assert_eq!(BUFFER_MAX_AGE.default.render(), "1m");
+        assert_eq!(BUFFER_MAX_AGE.min.render(), "10ms");
+        assert_eq!(BUFFER_MAX_AGE.max.render(), "24h");
+
+        assert_eq!(BUFFER_TICK.default.render(), "1s");
+        assert_eq!(BUFFER_TICK.min.render(), "10ms");
+        assert_eq!(BUFFER_TICK.max.render(), "1h");
     }
 
     #[test]
