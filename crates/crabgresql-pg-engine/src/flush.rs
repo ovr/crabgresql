@@ -57,11 +57,11 @@ impl BufferFlushPolicy {
     pub fn from_env() -> Self {
         let default = BufferFlushPolicy::default();
         BufferFlushPolicy {
-            table_soft_bytes: config::parse_or(
+            table_soft_bytes: config::bytes_or(
                 config::BUFFER_TABLE_SOFT_BYTES,
                 default.table_soft_bytes,
             ),
-            global_hard_bytes: config::parse_or(
+            global_hard_bytes: config::bytes_or(
                 config::BUFFER_GLOBAL_HARD_BYTES,
                 default.global_hard_bytes,
             ),

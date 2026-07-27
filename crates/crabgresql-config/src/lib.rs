@@ -14,7 +14,6 @@
 //! Unparseable values fall back to the default rather than failing startup: a
 //! typo in a tuning knob should not keep a server from coming up.
 
-use std::str::FromStr;
 use std::time::Duration;
 
 /// TCP port the server listens on.
@@ -26,8 +25,10 @@ pub const DATA_DIR: &str = "PGDATA";
 /// rather than by this crate, so the name is here only to be documented.
 pub const LOG_FILTER: &str = "RUST_LOG";
 /// Per-relation buffered bytes that make one write buffer flush-eligible.
+/// Accepts a `kB`/`MB`/`GB`/`TB` suffix — see [`bytes_or`].
 pub const BUFFER_TABLE_SOFT_BYTES: &str = "CRABGRESQL_BUFFER_TABLE_SOFT_BYTES";
 /// Buffered bytes across all relations that make *every* buffer eligible.
+/// Accepts a `kB`/`MB`/`GB`/`TB` suffix — see [`bytes_or`].
 pub const BUFFER_GLOBAL_HARD_BYTES: &str = "CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES";
 /// How long a write buffer may hold rows before being flushed anyway.
 pub const BUFFER_MAX_AGE_MS: &str = "CRABGRESQL_BUFFER_MAX_AGE_MS";
@@ -79,12 +80,12 @@ pub const ALL: &[EnvVar] = &[
     },
     EnvVar {
         name: BUFFER_TABLE_SOFT_BYTES,
-        default: "33554432",
+        default: "32MB",
         help: "per-relation buffered bytes that make one write buffer flush-eligible",
     },
     EnvVar {
         name: BUFFER_GLOBAL_HARD_BYTES,
-        default: "268435456",
+        default: "256MB",
         help: "buffered bytes across all relations that make every buffer eligible",
     },
     EnvVar {
@@ -108,10 +109,17 @@ pub fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|raw| !raw.is_empty())
 }
 
-/// `name` parsed as `T`, falling back to `fallback` when it is unset or does
-/// not parse.
-pub fn parse_or<T: FromStr>(name: &str, fallback: T) -> T {
-    parse_raw(var(name).as_deref(), fallback)
+/// `name` read as a byte count, falling back to `fallback` when it is unset or
+/// unusable.
+///
+/// The grammar is a run of decimal digits followed by an optional unit:
+/// nothing or `B` for bytes, `kB`, `MB`, `GB`, `TB`. Units are binary
+/// (1 kB = 1024 B) and matched case-insensitively, the trailing `B` is
+/// optional, and surrounding space is ignored — `32MB`, `32 mb` and `32m` all
+/// mean the same thing. Anything else, including a size that overflows
+/// `usize`, is a value we cannot honor, so it yields `fallback`.
+pub fn bytes_or(name: &str, fallback: usize) -> usize {
+    bytes_raw(var(name).as_deref(), fallback)
 }
 
 /// `name` read as a count of milliseconds, falling back to `fallback`.
@@ -119,15 +127,47 @@ pub fn duration_ms_or(name: &str, fallback: Duration) -> Duration {
     duration_ms_raw(var(name).as_deref(), fallback)
 }
 
-/// The parsing half of [`parse_or`], split out so it can be tested without
+/// The parsing half of [`bytes_or`], split out so it can be tested without
 /// mutating the process environment.
-fn parse_raw<T: FromStr>(raw: Option<&str>, fallback: T) -> T {
-    raw.and_then(|raw| raw.parse().ok()).unwrap_or(fallback)
+fn bytes_raw(raw: Option<&str>, fallback: usize) -> usize {
+    let Some(raw) = raw else {
+        return fallback;
+    };
+    let raw = raw.trim();
+    let digits_end = raw
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(raw.len());
+    let (digits, unit) = raw.split_at(digits_end);
+    match (digits.parse::<usize>(), byte_unit(unit)) {
+        (Ok(count), Some(multiplier)) => count.checked_mul(multiplier).unwrap_or(fallback),
+        _ => fallback,
+    }
+}
+
+/// How many bytes `unit` stands for, or `None` when it names no unit we know.
+fn byte_unit(unit: &str) -> Option<usize> {
+    const KB: usize = 1024;
+    let unit = unit.trim();
+    [
+        ("", 1),
+        ("b", 1),
+        ("k", KB),
+        ("kb", KB),
+        ("m", KB * KB),
+        ("mb", KB * KB),
+        ("g", KB * KB * KB),
+        ("gb", KB * KB * KB),
+        ("t", KB * KB * KB * KB),
+        ("tb", KB * KB * KB * KB),
+    ]
+    .into_iter()
+    .find(|(name, _)| unit.eq_ignore_ascii_case(name))
+    .map(|(_, multiplier)| multiplier)
 }
 
 /// The parsing half of [`duration_ms_or`].
 fn duration_ms_raw(raw: Option<&str>, fallback: Duration) -> Duration {
-    match raw.and_then(|raw| raw.parse::<u64>().ok()) {
+    match raw.and_then(|raw| raw.trim().parse::<u64>().ok()) {
         Some(millis) => Duration::from_millis(millis),
         None => fallback,
     }
@@ -182,13 +222,15 @@ mod tests {
         assert_eq!(default_of(PORT), Some(DEFAULT_PORT.to_string().as_str()));
         assert_eq!(default_of(DATA_DIR), Some(DEFAULT_DATA_DIR));
         assert_eq!(default_of(LOG_FILTER), Some(DEFAULT_LOG_FILTER));
+        // The size knobs are documented the way a user would type them, so the
+        // check is that the documented spelling *parses back* to the constant.
         assert_eq!(
-            default_of(BUFFER_TABLE_SOFT_BYTES),
-            Some(DEFAULT_BUFFER_TABLE_SOFT_BYTES.to_string().as_str())
+            bytes_raw(default_of(BUFFER_TABLE_SOFT_BYTES), 0),
+            DEFAULT_BUFFER_TABLE_SOFT_BYTES
         );
         assert_eq!(
-            default_of(BUFFER_GLOBAL_HARD_BYTES),
-            Some(DEFAULT_BUFFER_GLOBAL_HARD_BYTES.to_string().as_str())
+            bytes_raw(default_of(BUFFER_GLOBAL_HARD_BYTES), 0),
+            DEFAULT_BUFFER_GLOBAL_HARD_BYTES
         );
         assert_eq!(
             default_of(BUFFER_MAX_AGE_MS),
@@ -202,10 +244,17 @@ mod tests {
 
     #[test]
     fn parsing_falls_back_on_anything_unusable() {
-        assert_eq!(parse_raw::<usize>(None, 7), 7);
-        assert_eq!(parse_raw::<usize>(Some("nope"), 7), 7);
-        assert_eq!(parse_raw::<usize>(Some("-1"), 7), 7);
-        assert_eq!(parse_raw::<usize>(Some("12"), 7), 12);
+        assert_eq!(bytes_raw(None, 7), 7);
+        assert_eq!(bytes_raw(Some("nope"), 7), 7);
+        assert_eq!(bytes_raw(Some("-1"), 7), 7);
+        assert_eq!(bytes_raw(Some("12"), 7), 12);
+        // A unit with no count, and a count with a unit we do not know.
+        assert_eq!(bytes_raw(Some("MB"), 7), 7);
+        assert_eq!(bytes_raw(Some("12 quatloos"), 7), 7);
+        assert_eq!(bytes_raw(Some("1.5MB"), 7), 7);
+        // Overflowing `usize` is a size we cannot honor, not a saturating one.
+        assert_eq!(bytes_raw(Some("99999999999999999999999"), 7), 7);
+        assert_eq!(bytes_raw(Some("16777216TB"), 7), 7);
 
         let fallback = Duration::from_secs(60);
         assert_eq!(duration_ms_raw(None, fallback), fallback);
@@ -217,11 +266,29 @@ mod tests {
     }
 
     #[test]
+    fn sizes_may_be_spelled_with_a_unit() {
+        const KB: usize = 1024;
+        assert_eq!(bytes_raw(Some("0"), 7), 0);
+        assert_eq!(bytes_raw(Some("512B"), 7), 512);
+        assert_eq!(bytes_raw(Some("8kB"), 7), 8 * KB);
+        assert_eq!(bytes_raw(Some("32MB"), 7), 32 * KB * KB);
+        assert_eq!(bytes_raw(Some("2GB"), 7), 2 * KB * KB * KB);
+        assert_eq!(bytes_raw(Some("1TB"), 7), KB * KB * KB * KB);
+        // Case, a bare unit letter and space around either half are all fine.
+        assert_eq!(bytes_raw(Some("32mb"), 7), 32 * KB * KB);
+        assert_eq!(bytes_raw(Some("32Mb"), 7), 32 * KB * KB);
+        assert_eq!(bytes_raw(Some("32m"), 7), 32 * KB * KB);
+        assert_eq!(bytes_raw(Some("  32 MB  "), 7), 32 * KB * KB);
+    }
+
+    #[test]
     fn an_empty_value_reads_as_unset() {
         // Not `var` itself: setting a variable is `unsafe` under the 2024
         // edition and would race the other tests in this binary. The filter it
-        // applies is what matters, and an empty string reaching `parse_raw`
+        // applies is what matters, and an empty string reaching the parsers
         // falls back all the same.
-        assert_eq!(parse_raw::<usize>(Some(""), 7), 7);
+        assert_eq!(bytes_raw(Some(""), 7), 7);
+        let fallback = Duration::from_secs(60);
+        assert_eq!(duration_ms_raw(Some(""), fallback), fallback);
     }
 }
