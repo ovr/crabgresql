@@ -19,15 +19,15 @@ fn sizes_and_intervals_come_from_the_documented_variables() {
     unsafe {
         std::env::set_var(crabgresql_config::BUFFER_TABLE_SOFT_BYTES.name, "64MB");
         std::env::set_var(crabgresql_config::BUFFER_GLOBAL_HARD_BYTES.name, "1gb");
-        std::env::set_var(crabgresql_config::BUFFER_MAX_AGE_MS, "250");
-        std::env::set_var(crabgresql_config::BUFFER_TICK_MS, "50");
+        std::env::set_var(crabgresql_config::BUFFER_MAX_AGE.name, "5m");
+        std::env::set_var(crabgresql_config::BUFFER_TICK.name, "250");
     }
 
     let policy = BufferFlushPolicy::from_env();
     assert_eq!(policy.table_soft_bytes, 64 * 1024 * 1024);
     assert_eq!(policy.global_hard_bytes, 1024 * 1024 * 1024);
-    assert_eq!(policy.max_age, Duration::from_millis(250));
-    assert_eq!(policy.tick, Duration::from_millis(50));
+    assert_eq!(policy.max_age, Duration::from_secs(5 * 60));
+    assert_eq!(policy.tick, Duration::from_millis(250));
 
     // A size we cannot parse leaves the default in place rather than the
     // server refusing to start.
@@ -42,11 +42,12 @@ fn sizes_and_intervals_come_from_the_documented_variables() {
         defaults.table_soft_bytes
     );
 
-    // One past the supported range is corrected to the nearest legal size,
+    // One past the supported range is corrected to the nearest legal value,
     // again without refusing to start.
     unsafe {
         std::env::set_var(crabgresql_config::BUFFER_TABLE_SOFT_BYTES.name, "64GB");
         std::env::set_var(crabgresql_config::BUFFER_GLOBAL_HARD_BYTES.name, "1B");
+        std::env::set_var(crabgresql_config::BUFFER_TICK.name, "0");
     }
     let policy = BufferFlushPolicy::from_env();
     assert_eq!(
@@ -57,4 +58,6 @@ fn sizes_and_intervals_come_from_the_documented_variables() {
         policy.global_hard_bytes,
         crabgresql_config::BUFFER_GLOBAL_HARD_BYTES.min
     );
+    // The tick's minimum is what keeps the worker from spinning on a zero.
+    assert_eq!(policy.tick, crabgresql_config::BUFFER_TICK.min);
 }

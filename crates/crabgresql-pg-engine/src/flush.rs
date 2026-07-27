@@ -40,8 +40,8 @@ impl Default for BufferFlushPolicy {
         BufferFlushPolicy {
             table_soft_bytes: config::BUFFER_TABLE_SOFT_BYTES.default,
             global_hard_bytes: config::BUFFER_GLOBAL_HARD_BYTES.default,
-            max_age: Duration::from_millis(config::DEFAULT_BUFFER_MAX_AGE_MS),
-            tick: Duration::from_millis(config::DEFAULT_BUFFER_TICK_MS),
+            max_age: config::BUFFER_MAX_AGE.default,
+            tick: config::BUFFER_TICK.default,
         }
     }
 }
@@ -55,18 +55,17 @@ impl BufferFlushPolicy {
     /// GUCs is a follow-up. The names, defaults and accepted ranges live in
     /// `crabgresql-config` with every other environment variable.
     ///
-    /// A size we cannot use as written is corrected — clamped into range, or
+    /// A value we cannot use as written is corrected — clamped into range, or
     /// replaced by the default when it does not parse — and the correction is
     /// logged, since a knob that silently does something other than what it
     /// was set to is worse than one that is ignored loudly.
     pub fn from_env() -> Self {
-        let default = BufferFlushPolicy::default();
         let complain = |message: String| tracing::warn!("{message}");
         BufferFlushPolicy {
             table_soft_bytes: config::BUFFER_TABLE_SOFT_BYTES.get(complain),
             global_hard_bytes: config::BUFFER_GLOBAL_HARD_BYTES.get(complain),
-            max_age: config::duration_ms_or(config::BUFFER_MAX_AGE_MS, default.max_age),
-            tick: config::duration_ms_or(config::BUFFER_TICK_MS, default.tick),
+            max_age: config::BUFFER_MAX_AGE.get(complain),
+            tick: config::BUFFER_TICK.get(complain),
         }
     }
 }
