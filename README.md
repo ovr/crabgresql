@@ -107,3 +107,16 @@ expected and honest. Regression protection lives in `cargo test`: the
 crabgresql-authored smoke suite must always pass, plus every upstream test
 promoted to `crates/crabgresql-pg-regress/suites/upstream_must_pass.txt` as
 coverage grows.
+
+## Benchmarks
+
+`crabgresql-bench` runs published analytical benchmarks — ClickBench today —
+against an in-process server, or against stock PostgreSQL for comparison. A
+query that hits an engine gap is reported in place instead of aborting the run,
+so the results table doubles as a gap list. See
+[`crates/crabgresql-bench/README.md`](crates/crabgresql-bench/README.md).
+
+```console
+$ cargo run --release -p crabgresql-bench -- run clickbench --data hits.tsv
+42 of 43 queries succeeded, 12.341s total (best runs)
+```
