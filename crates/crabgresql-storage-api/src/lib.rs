@@ -257,6 +257,20 @@ impl RelPersistence {
     }
 }
 
+/// Source of fresh, never-reused relfilenodes — the engine's catalog counter.
+///
+/// A table access method that swaps its physical relation on TRUNCATE needs an id
+/// that can never alias another relation's file or directory, so it must draw from
+/// the *same* counter as every other relation rather than keep a private one. The
+/// engine owns that counter; an out-of-crate access method (Parquet) reaches it
+/// through this trait.
+pub trait RelfilenodeAllocator: Send + Sync {
+    /// Issue a relfilenode no relation has ever used. Does not persist the
+    /// catalog: the id becomes durable only when the swap that staged it commits,
+    /// and recovery re-observes ids from the WAL before issuing new ones.
+    fn alloc_relfilenode(&self) -> u32;
+}
+
 /// Physical table access method selected by `CREATE TABLE ... USING`.
 ///
 /// This is persisted as part of [`TableSchema`]. Existing catalogs that predate

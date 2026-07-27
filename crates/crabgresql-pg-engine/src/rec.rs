@@ -110,13 +110,18 @@ pub fn vacuum(rel: RelFileNode, block: u32, offs: &[u16]) -> Vec<u8> {
 }
 
 /// A relfilenode-swap TRUNCATE: the relation's old (still-live) file and the new
-/// empty file staged for it, plus the relation name so recovery can rebind the
-/// catalog once it knows the transaction's fate. Layout:
-/// `[old:u32][new:u32][name_len:u32][name]`.
-pub fn truncate(table: &str, old: RelFileNode, new: RelFileNode) -> Vec<u8> {
+/// empty file staged for it, plus the relation's schema-qualified name so recovery
+/// can rebind the catalog once it knows the transaction's fate. Layout:
+/// `[old:u32][new:u32][ns_len:u32][ns][name_len:u32][name]`.
+///
+/// The namespace is on the wire because relations are keyed by `(namespace, name)`:
+/// assuming `public` would make recovery resolve `app.t` against `public.t` — either
+/// a different relation or none at all.
+pub fn truncate(namespace: &str, table: &str, old: RelFileNode, new: RelFileNode) -> Vec<u8> {
     let mut w = W(Vec::new());
     w.u32(old.0);
     w.u32(new.0);
+    w.bytes(namespace.as_bytes());
     w.bytes(table.as_bytes());
     w.0
 }

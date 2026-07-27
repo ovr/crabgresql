@@ -15,13 +15,15 @@ use crabgresql_storage_api::{
     DeleteResult, IndexMetadata, RelStats, StorageError, TableAm, TableSchema, Tid, Tuple,
     TupleStream, UpdateResult,
 };
-use crabgresql_txn::{Clog, LockOwner, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
+use crabgresql_txn::{
+    Clog, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, XactStatus, Xid,
+    satisfies_mvcc,
+};
 use crabgresql_types::Value;
 use crabgresql_wal::{Lsn, RmgrId};
 
 use crate::EngineInner;
 use crate::btkey;
-use crate::lock::{SharedGuard, TableLock};
 use crate::nbtree::BTree;
 use crate::page::{self, PAGE_HEADER_LEN};
 use crate::rec;
@@ -206,7 +208,7 @@ impl HeapTable {
     /// (which runs as `INTERNAL`) while the index is unpublished and its file
     /// unlinked, so no maintenance/vacuum still holding a handle writes to the
     /// doomed relfilenode.
-    pub fn begin_index_ddl(&self) -> crate::lock::ExclusiveGuard {
+    pub fn begin_index_ddl(&self) -> crabgresql_txn::ExclusiveGuard {
         self.lock.acquire_exclusive_guard(LockOwner::DDL)
     }
 
@@ -710,7 +712,7 @@ impl TableAm for HeapTable {
                 RmgrId::HEAP,
                 rec::HEAP_TRUNCATE,
                 txn.xid,
-                &rec::truncate(&self.schema.name, old, new),
+                &rec::truncate(&self.schema.namespace, &self.schema.name, old, new),
             );
             Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
         }

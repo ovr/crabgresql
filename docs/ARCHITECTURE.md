@@ -134,9 +134,14 @@ Contract with the core:
   and atomically promoted on commit or removed on abort/recovery;
 - sequential row-group scans feed the existing row executor. Physical index
   scans and predicate/projection pushdown are intentionally deferred;
-- V1 rejects UPDATE, DELETE, TRUNCATE, TEMP/UNLOGGED tables, partitioning,
-  external `LOCATION`, and types without a native or documented compound
-  encoding.
+- TRUNCATE is transactional, by the same mechanism as the heap's relfilenode
+  swap: a fresh `parquet/<new>/` fragment directory is staged under an
+  `AccessExclusive` hold and WAL-logged, then swapped in on commit (old directory
+  removed) or discarded on abort — so a rollback or a crash before commit
+  restores every row, and a crash after it is repaired from the WAL;
+- V1 rejects UPDATE and DELETE (fragments are immutable), TEMP/UNLOGGED tables,
+  partitioning, external `LOCATION`, and types without a native or documented
+  compound encoding.
 
 Later, the same API enables object-storage engines (serverless) and FDW-like
 adapters.

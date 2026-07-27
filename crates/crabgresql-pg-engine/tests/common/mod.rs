@@ -23,12 +23,21 @@ pub fn open(dir: &Path) -> std::io::Result<(Arc<PgEngine>, TransactionManager)> 
 /// sequence the server's `open_pg_engine` uses (recover → clamp tail → reconcile
 /// truncates → GC → checkpoint), then attaches the finalize hook.
 pub fn try_open(dir: &Path) -> std::io::Result<(Arc<PgEngine>, TransactionManager)> {
+    let (engine, mut tm) = open_without_finalize(dir)?;
+    tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
+    Ok((engine, tm))
+}
+
+/// Open the engine WITHOUT the finalize hook, so a `commit` makes the commit
+/// record durable and marks the CLOG but never applies the transaction's
+/// relfilenode swap in memory or persists it to the catalog. That is exactly the
+/// crash window between the commit fsync and the catalog write, which recovery has
+/// to repair from the WAL.
+pub fn open_without_finalize(dir: &Path) -> std::io::Result<(Arc<PgEngine>, TransactionManager)> {
     let wal = Arc::new(Wal::open(dir).map_err(std::io::Error::other)?);
     let (engine, clog, next_xid) = PgEngine::open_recovered(dir, Arc::clone(&wal))?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
-    let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
-    tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
-    Ok((engine, tm))
+    Ok((engine, TransactionManager::new_recovered(sink, clog, next_xid)))
 }
 
 /// The on-disk path of a relation's data file: `<dir>/base/<relfilenode>`.

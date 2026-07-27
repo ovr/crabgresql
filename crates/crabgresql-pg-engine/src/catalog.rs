@@ -494,7 +494,7 @@ impl RelCatalog {
     }
 
     /// The relfilenode `table` currently points at, or `None` if it is absent.
-    pub fn current_relfilenode(&self, table: &str) -> Option<RelFileNode> {
+    pub fn current_relfilenode(&self, namespace: &str, table: &str) -> Option<RelFileNode> {
         let state = self
             .state
             .lock()
@@ -502,7 +502,7 @@ impl RelCatalog {
         state
             .rels
             .iter()
-            .find(|r| r.namespace == "public" && r.name == table)
+            .find(|r| r.namespace == namespace && r.name == table)
             .map(|r| RelFileNode(r.rel))
     }
 
