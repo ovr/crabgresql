@@ -39,7 +39,7 @@ use crate::global_catalog::{
     RoutineDefinition, RoutineKind, TypeRef, Volatility,
 };
 use crate::routines::RoutineDispatch;
-use crate::session::{ActiveTxn, Session};
+use crate::session::{ActiveTxn, Session, Vectorize};
 
 /// Severity of a non-error message sent before a command's CommandComplete.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2034,6 +2034,15 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
         }
         ast::Set::SingleAssignment {
             variable, values, ..
+        } if qualified_guc_name(variable).as_deref() == Some(VECTORIZE_GUC) => {
+            session.vectorize = if is_set_default(values) {
+                Vectorize::default()
+            } else {
+                parse_vectorize(values)?
+            };
+        }
+        ast::Set::SingleAssignment {
+            variable, values, ..
         } => match single_ident_lower(variable).as_deref() {
             // `SET x = DEFAULT` restores each GUC's boot value (PG accepts it and
             // resets rather than erroring on the "DEFAULT" token).
@@ -2154,6 +2163,21 @@ fn parse_default_isolation(values: &[ast::Expr]) -> Result<IsolationLevel, PgErr
 /// Parse a Boolean GUC value using PG's boolean spellings (any unambiguous
 /// prefix of true/false/yes/no/off, `on`, `1`/`0`). An unrecognized value is an
 /// invalid-parameter error (22023).
+/// The name of crabgresql's own vectorization setting.
+const VECTORIZE_GUC: &str = "crabgresql.vectorize";
+
+fn parse_vectorize(values: &[ast::Expr]) -> Result<Vectorize, PgError> {
+    set_value_to_string(values)
+        .as_deref()
+        .and_then(Vectorize::parse)
+        .ok_or_else(|| {
+            PgError::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("parameter \"{VECTORIZE_GUC}\" requires off, on, or force"),
+            )
+        })
+}
+
 fn parse_set_bool(values: &[ast::Expr], param: &str) -> Result<bool, PgError> {
     set_value_to_string(values)
         .as_deref()
@@ -2199,11 +2223,18 @@ fn set_value_to_string(exprs: &[ast::Expr]) -> Option<String> {
 /// `extra_float_digits`=1, `default_transaction_isolation`=READ COMMITTED,
 /// `default_transaction_read_only`=off.
 fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<QueryResult, PgError> {
-    let (all, name) = match &reset.reset {
-        ast::Reset::ALL => (true, None),
-        ast::Reset::ConfigurationParameter(name) => (false, single_ident_lower(name)),
+    let (all, name, qualified) = match &reset.reset {
+        ast::Reset::ALL => (true, None, None),
+        ast::Reset::ConfigurationParameter(name) => (
+            false,
+            single_ident_lower(name),
+            qualified_guc_name(name),
+        ),
     };
     let hit = |param: &str| all || name.as_deref() == Some(param);
+    if all || qualified.as_deref() == Some(VECTORIZE_GUC) {
+        session.vectorize = Vectorize::default();
+    }
     if hit("extra_float_digits") {
         session.extra_float_digits = 1;
     }
@@ -2222,6 +2253,22 @@ fn single_ident_lower(name: &ast::ObjectName) -> Option<String> {
         return None;
     }
     name.0[0].as_ident().map(normalize_ident)
+}
+
+/// A dotted GUC name, lowercased and rejoined — `crabgresql.vectorize`.
+///
+/// [`single_ident_lower`] answers `None` for these, which is why crabgresql's
+/// own settings need their own reader. The dotted spelling is deliberate:
+/// PostgreSQL treats any `prefix.name` as a custom-GUC placeholder and accepts
+/// `SET` on it rather than erroring, so a script that runs against both servers
+/// is unaffected by one of them not knowing the setting.
+fn qualified_guc_name(name: &ast::ObjectName) -> Option<String> {
+    let parts: Option<Vec<String>> = name
+        .0
+        .iter()
+        .map(|part| part.as_ident().map(normalize_ident))
+        .collect();
+    Some(parts?.join("."))
 }
 
 fn set_value_to_i32(exprs: &[ast::Expr]) -> Result<i32, PgError> {

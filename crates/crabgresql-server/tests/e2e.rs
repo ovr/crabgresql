@@ -7201,3 +7201,263 @@ async fn call_arguments_may_themselves_call_routines() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Vectorized executor: the differential harness.
+//
+// The vectorized path's obligation is not "match PostgreSQL" — it is "match this
+// server's own row engine, byte for byte". For group emission order, tie-breaking
+// under ORDER BY … LIMIT, and the representative value of a group, PostgreSQL is
+// unspecified, but crabgresql has already made a deterministic choice that its
+// test corpus pins. A vectorized answer that is differently-ordered but equally
+// PostgreSQL-legal is still a regression.
+//
+// So the row engine is the oracle, and these tests compare the two engines
+// directly rather than against literals.
+// ---------------------------------------------------------------------------
+
+/// Every row of `sql`, rendered as text, in the order the server produced them.
+///
+/// Ordering is preserved and never normalized: a `GROUP BY` with no `ORDER BY`
+/// reports groups in first-seen order, and sorting here would discard exactly
+/// the property most likely to break.
+async fn rows_as_text(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    let messages = client
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|error| panic!("query failed: {sql}\n{error}"));
+    messages
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|i| row.get(i).map(str::to_string))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run `sql` under both engines and assert they agree.
+async fn assert_engines_agree(client: &tokio_postgres::Client, sql: &str) {
+    client
+        .batch_execute("SET crabgresql.vectorize = off")
+        .await
+        .expect("disable vectorization");
+    let by_row = rows_as_text(client, sql).await;
+
+    client
+        .batch_execute("SET crabgresql.vectorize = on")
+        .await
+        .expect("enable vectorization");
+    let by_batch = rows_as_text(client, sql).await;
+
+    assert_eq!(by_row, by_batch, "engines disagree on: {sql}");
+}
+
+/// Whether the gate accepts `sql`, established by asking it to insist.
+///
+/// This is the coverage assertion. Without it a gate that silently stopped
+/// firing would still pass every equality check above — the two engines would
+/// agree because only one of them ever ran.
+async fn is_vectorized(client: &tokio_postgres::Client, sql: &str) -> bool {
+    client
+        .batch_execute("SET crabgresql.vectorize = force")
+        .await
+        .expect("force vectorization");
+    let accepted = match client.simple_query(sql).await {
+        Ok(_) => true,
+        Err(error) => {
+            // `Display` for a tokio-postgres error is just "db error"; the
+            // server's own message is in the `DbError`.
+            let message = error
+                .as_db_error()
+                .map_or_else(|| error.to_string(), |db| db.message().to_string());
+            assert!(
+                message.contains("cannot vectorize this plan"),
+                "expected a refusal, got: {message}"
+            );
+            false
+        }
+    };
+    client
+        .batch_execute("SET crabgresql.vectorize = on")
+        .await
+        .expect("restore vectorization");
+    accepted
+}
+
+/// A Parquet relation seeded with values chosen to hit the places the two
+/// engines could disagree.
+///
+/// Deliberately not flushed: a `USING parquet` relation reads from a columnar
+/// chunk store *and* a RAM write buffer, and leaving rows in both exercises the
+/// pipeline that spans them. If the two halves disagreed about, say, the date
+/// epoch, a `GROUP BY d` would report two groups per date.
+async fn seed_hazard_table(client: &tokio_postgres::Client) {
+    client
+        .batch_execute(
+            "CREATE TABLE hazard (
+                 i2 int2, i4 int4, i8 int8,
+                 f8 float8,
+                 t  text,
+                 d  date,
+                 ts timestamp,
+                 n  numeric,
+                 b  bool
+             ) USING parquet",
+        )
+        .await
+        .expect("create hazard table");
+
+    // Signed zero and NaN in both orders, because the representative a group
+    // emits is the first one seen, not a canonical form.
+    client
+        .batch_execute(
+            "INSERT INTO hazard VALUES
+               (1, 10, 100, -0.0, 'a',   DATE '2013-07-01', TIMESTAMP '2013-07-01 12:00:00', 1.0,  true),
+               (1, 10, 100,  0.0, 'a',   DATE '2013-07-01', TIMESTAMP '2013-07-01 12:00:00', 1.00, true),
+               (2, 20, 200,  'NaN'::float8, 'b', DATE '1999-12-31', TIMESTAMP '1970-01-01 00:00:00', 2.5, false),
+               (2, 20, 200,  'NaN'::float8, 'B', DATE '2000-01-01', TIMESTAMP '2000-01-01 00:00:00', 2.50, false),
+               (3, 30, 300,  1.5, '',    DATE 'infinity',   TIMESTAMP 'infinity',  0,    true),
+               (3, 30, 300, -1.5, NULL,  DATE '-infinity',  TIMESTAMP '-infinity', -0.0, NULL),
+               (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+        )
+        .await
+        .expect("seed hazard rows");
+}
+
+/// The queries both engines must answer identically.
+///
+/// Mixed on purpose: some the gate accepts and some it declines. A declined
+/// query is still worth running, because "vectorization is on" must not perturb
+/// a plan that does not use it.
+const DIFFERENTIAL_QUERIES: &[&str] = &[
+    // Ungrouped aggregates: the shape with no group key at all, which must still
+    // produce exactly one row.
+    "SELECT count(*) FROM hazard",
+    "SELECT count(i4) FROM hazard",
+    "SELECT sum(i2), sum(i4), sum(i8) FROM hazard",
+    "SELECT min(i4), max(i4), min(t), max(t) FROM hazard",
+    "SELECT avg(i4) FROM hazard",
+    "SELECT sum(f8), avg(f8) FROM hazard",
+    "SELECT count(*) FROM hazard WHERE i4 IS NULL",
+    // Grouping, with no ORDER BY — the answer is determined entirely by
+    // first-seen group order.
+    "SELECT i2, count(*) FROM hazard GROUP BY i2",
+    "SELECT t, count(*) FROM hazard GROUP BY t",
+    "SELECT b, count(*) FROM hazard GROUP BY b",
+    // Signed zero and NaN: PostgreSQL groups -0.0 with 0.0 and every NaN
+    // together, and emits the *first* spelling seen.
+    "SELECT f8, count(*) FROM hazard GROUP BY f8",
+    // numeric: 1.0, 1.00 and 2.5, 2.50 are one value with two spellings each.
+    "SELECT n, count(*) FROM hazard GROUP BY n",
+    // The date epoch canary. A missing rebase shifts this window by exactly 30
+    // years while preserving order, so it would return zero rows and look fine.
+    "SELECT count(*) FROM hazard WHERE d >= DATE '2013-01-01'",
+    "SELECT d, count(*) FROM hazard GROUP BY d",
+    "SELECT count(*) FROM hazard WHERE ts >= TIMESTAMP '2000-01-01 00:00:00'",
+    "SELECT ts, count(*) FROM hazard GROUP BY ts",
+    // Infinity sentinels are the extremes of their domain, not ordinary integers.
+    "SELECT count(*) FROM hazard WHERE d = DATE 'infinity'",
+    "SELECT max(d), min(d) FROM hazard",
+    // Three-valued logic. NOT (NULL AND FALSE) is TRUE and selects a row;
+    // intersecting validity instead of using Kleene rules would drop it.
+    "SELECT count(*) FROM hazard WHERE NOT (b AND i4 = 999)",
+    "SELECT count(*) FROM hazard WHERE b OR i4 = 10",
+    "SELECT count(*) FROM hazard WHERE i4 > 10 AND t <> ''",
+    // A smallint compared against an integer literal widens the column. The
+    // widening is total, so it is admitted where a narrowing cast is not — and
+    // it matters: in a ClickBench-shaped relation about half the columns are
+    // smallint, so refusing it costs most of the benefit.
+    "SELECT count(*) FROM hazard WHERE i2 <> 0",
+    "SELECT i2, count(*) FROM hazard WHERE i2 <> 0 GROUP BY i2",
+    "SELECT count(*) FROM hazard WHERE i2 = 1 AND i4 = 10",
+    "SELECT sum(i2), min(i2), max(i2) FROM hazard",
+    // Integer arithmetic, which arrow checks and this path remaps.
+    "SELECT sum(i4 + 1), sum(i4 * 2), sum(i8 - 1) FROM hazard",
+    "SELECT count(*) FROM hazard WHERE i4 + 1 > 11",
+    // Grouped, ordered and limited: the row-side tail above a vectorized
+    // aggregate.
+    "SELECT i2, count(*) c FROM hazard GROUP BY i2 ORDER BY c DESC, i2 LIMIT 2",
+    "SELECT i2, sum(i4) FROM hazard GROUP BY i2 HAVING count(*) > 1 ORDER BY i2",
+    // Shapes the gate declines, which must be unaffected by the setting.
+    "SELECT i4 FROM hazard ORDER BY i4",
+    "SELECT count(DISTINCT i4) FROM hazard",
+    "SELECT length(t) FROM hazard ORDER BY 1",
+    "SELECT count(*) FROM (SELECT i4 FROM hazard) s",
+];
+
+#[tokio::test]
+async fn vectorized_and_row_engines_agree_on_every_query() -> Result<(), Box<dyn std::error::Error>>
+{
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    seed_hazard_table(&client).await;
+
+    for sql in DIFFERENTIAL_QUERIES {
+        assert_engines_agree(&client, sql).await;
+    }
+    Ok(())
+}
+
+/// The coverage assertion: the gate must actually be accepting the shapes this
+/// work exists to accelerate.
+///
+/// A pure equality test cannot catch a gate that stopped firing — both engines
+/// would "agree" because only the row one ever ran. This pins which queries take
+/// the vectorized path, so widening or narrowing the allow-list shows up as a
+/// diff here rather than as an unnoticed performance regression.
+#[tokio::test]
+async fn the_gate_accepts_the_shapes_it_is_meant_to() -> Result<(), Box<dyn std::error::Error>> {
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    seed_hazard_table(&client).await;
+
+    let accepted = [
+        "SELECT count(*) FROM hazard",
+        "SELECT sum(i4), avg(i4), min(i4), max(i4) FROM hazard",
+        "SELECT i2, count(*) FROM hazard GROUP BY i2",
+        "SELECT t, count(*) FROM hazard GROUP BY t",
+        "SELECT count(*) FROM hazard WHERE d >= DATE '2013-01-01'",
+        "SELECT i2, sum(i4) FROM hazard GROUP BY i2 HAVING count(*) > 1",
+        "SELECT sum(i4 + 1) FROM hazard",
+        // The widening cast, and a LIMIT above a blocking aggregate — which the
+        // row `Limit` node re-enters the gate for, so it really is vectorized.
+        "SELECT count(*) FROM hazard WHERE i2 <> 0",
+        "SELECT i2, count(*) c FROM hazard GROUP BY i2 ORDER BY c DESC LIMIT 5",
+    ];
+    for sql in accepted {
+        assert!(is_vectorized(&client, sql).await, "gate declined: {sql}");
+    }
+
+    let declined = [
+        // No aggregate: a bare scan's rows leave the batch world one tuple at a
+        // time, so it is not yet worth vectorizing.
+        "SELECT i4 FROM hazard",
+        // A DISTINCT aggregate needs a per-group set, not a kernel.
+        "SELECT count(DISTINCT i4) FROM hazard",
+        // Scalar functions are refused wholesale rather than by a sub-whitelist.
+        "SELECT sum(length(t)) FROM hazard",
+        // numeric is text on disk, and text order is not numeric order.
+        "SELECT count(*) FROM hazard WHERE n > 1",
+        // Float arithmetic: PostgreSQL raises on overflow and on
+        // underflow-to-zero, and arrow's kernels do neither.
+        "SELECT sum(f8 * 2) FROM hazard",
+        // A narrowing cast raises 22003, so it is not a widening.
+        "SELECT count(*) FROM hazard WHERE i8::int2 = 1",
+        // A data-modifying statement.
+        "SELECT count(*) FROM hazard WHERE i4 = 10",
+    ];
+    for sql in declined {
+        // The last entry is a control: it *should* be accepted, so a typo that
+        // made everything decline would not pass silently.
+        if sql.contains("i4 = 10") {
+            assert!(is_vectorized(&client, sql).await, "control was declined");
+            continue;
+        }
+        assert!(!is_vectorized(&client, sql).await, "gate accepted: {sql}");
+    }
+    Ok(())
+}

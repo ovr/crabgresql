@@ -280,6 +280,17 @@ impl TableAm for BufferedParquetTable {
         ])
     }
 
+    /// Deliberately row-only, even though half of this relation is columnar.
+    ///
+    /// A caller reaches the two halves through [`Self::storage_leaves`] and
+    /// vectorizes each on its own terms — the chunk store natively, the buffer
+    /// through a row-to-batch adapter. Implementing a columnar scan here would
+    /// mean this method chaining two heterogeneous sources, which is what
+    /// `storage_leaves` exists to avoid.
+    fn supports_batch_scan(&self) -> bool {
+        false
+    }
+
     /// The chunk half is a cached `ANALYZE` result or a size-derived estimate;
     /// the buffer half is always counted live.
     ///

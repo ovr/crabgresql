@@ -58,6 +58,35 @@ termination, per-row triggers. Therefore:
 - **v2**: vectorized fast paths for read-only plans without volatile functions
   (morally like JIT in PG: enabled only when it is safe).
 
+v2 has landed for grouping and aggregation over columnar storage
+(`crabgresql-batch`, `crabgresql-vector-exec`). Its shape follows directly from
+the constraint above: the row engine is untouched and remains authoritative, a
+plan is vectorized only when a gate proves every construct in it reproducible,
+and anything else — including anything the gate has not reached yet — falls back
+to rows. The `crabgresql.vectorize` GUC (`off`/`on`/`force`) selects the path;
+`off` is the oracle the differential tests compare against, and `force` turns a
+declined plan into an error so that gate coverage is assertable rather than
+merely hoped for.
+
+What is vectorized is the scan, the decode and the `WHERE`. Accumulation is
+deliberately *not*: it reuses the row engine's own accumulators and its
+`hash_key`/`keys_equal` pair, so `sum(int8) → numeric`, `avg(int)`'s scale,
+`min`/`max` collation, float summation order, and first-seen group order and
+representative are inherited rather than reimplemented. The performance is in the
+input rows, and those never become tuples.
+
+Two constraints are worth recording because they are easy to get wrong:
+
+- **A kernel may not evaluate a row the row engine would not have.**
+  `SELECT 1/x FROM t WHERE x <> 0` succeeds in PostgreSQL, and so must it here.
+  Expression evaluation therefore carries a selection, and `AND`/`OR`/`CASE`
+  narrow it before evaluating anything that can raise.
+- **A batch carries PostgreSQL-domain values, not Arrow ones.** `date` and
+  `timestamp` are rebased out of the Arrow epoch where a batch is built. Leaving
+  them in Arrow's domain and shifting constants instead is the tempting
+  optimization and silently returns rows for a window 30 years away, since the
+  shift preserves ordering.
+
 ### 1.3 Storage: pluggable engines (storage engine API)
 
 Storage is not a single implementation but an **extension point**. The core
@@ -698,7 +727,7 @@ ourselves anything that is not visible through SQL:
 | Storage | `crabgresql-pg-engine` behind the pluggable `crabgresql-storage-api`; durable heap tables plus RAM-backed memory tables (`UNLOGGED`/`TEMP`) |
 | Parquet layout | WAL-backed buffer tables, sorted immutable ~64 MiB chunks, manifest generations, and background compaction/repartitioning |
 | Isolation | PG semantics ported 1:1 (RC/EvalPlanQual, RR=SI, SSI) |
-| Executor | Volcano first, vectorization as opt-in later |
+| Executor | Volcano, with an opt-in vectorized path for grouped aggregation over columnar storage |
 | Concurrency | tokio + threads, shared-everything |
 | License | **Apache-2.0** — our own codebase; we do not port PostgreSQL directly |
 

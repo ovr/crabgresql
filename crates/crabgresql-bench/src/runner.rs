@@ -37,6 +37,12 @@ pub struct RunConfig {
     pub access_method: Option<String>,
     /// Drop and reload every table, even if the dataset is already loaded.
     pub reload: bool,
+    /// `SET name = value` issued on every connection before timing starts.
+    ///
+    /// Re-applied after a reconnect, so a mid-run timeout cannot silently drop
+    /// the setting and leave the rest of the suite measuring a different engine
+    /// than the one the run claims to be measuring.
+    pub settings: Vec<(String, String)>,
 }
 
 /// The server under test, kept alive for the length of the run.
@@ -90,6 +96,7 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
 
     let target = start_target(config).await?;
     let mut client = client::connect(&target.conninfo).await?;
+    apply_settings(&client, config).await?;
     let loaded = load_if_needed(&client, suite, config).await?;
 
     let mut results = Vec::with_capacity(queries.len());
@@ -119,7 +126,14 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
             runs.push(outcome);
             if broken {
                 match reconnect(&target.conninfo, config.timeout).await {
-                    Ok(fresh) => client = fresh,
+                    Ok(fresh) => {
+                        client = fresh;
+                        // A fresh connection is a fresh session, so `--set` has
+                        // to be re-applied. Without this a mid-run timeout would
+                        // silently drop the setting and leave the rest of the
+                        // suite measuring a different engine than the run claims.
+                        apply_settings(&client, config).await?;
+                    }
                     // Keep what has already been measured rather than throwing
                     // the whole run (and its load) away.
                     Err(e) => {
@@ -462,6 +476,20 @@ async fn start_target(config: &RunConfig) -> Result<Target> {
         _data_dir: temp_dir,
         server: Some(server),
     })
+}
+
+/// Apply `--set` to a freshly opened connection.
+async fn apply_settings(client: &tokio_postgres::Client, config: &RunConfig) -> Result<()> {
+    for (name, value) in &config.settings {
+        // Quoted, so a value like `off` is a string literal rather than an
+        // identifier the parser might read as something else.
+        let sql = format!("SET {name} = '{}'", value.replace('\'', "''"));
+        client
+            .batch_execute(&sql)
+            .await
+            .with_context(|| format!("applying `{sql}`"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

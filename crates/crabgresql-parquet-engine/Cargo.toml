@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 arrow-array.workspace = true
 arrow-schema.workspace = true
+crabgresql-batch.workspace = true
 crabgresql-buffer-engine.workspace = true
 crabgresql-storage-api.workspace = true
 crabgresql-txn.workspace = true

@@ -100,6 +100,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-arith"
+version = "59.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64a13b8d3008c4e9063c597a08f46446fe3fd5789277127672d6c0bdbb43b1ff"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "chrono",
+ "num-traits",
+]
+
+[[package]]
 name = "arrow-array"
 version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -154,6 +168,19 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
+]
+
+[[package]]
+name = "arrow-ord"
+version = "59.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e13dbdc2a9c053c10c7baa6e30faee04a180aa7ce88e471835850ce37abd20b"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "arrow-select",
 ]
 
 [[package]]
@@ -384,6 +411,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabgresql-batch"
+version = "0.1.0"
+dependencies = [
+ "arrow-arith",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-ord",
+ "arrow-schema",
+ "arrow-select",
+ "crabgresql-types",
+]
+
+[[package]]
 name = "crabgresql-bench"
 version = "0.1.0"
 dependencies = [
@@ -458,6 +498,7 @@ dependencies = [
  "anyhow",
  "arrow-array",
  "arrow-schema",
+ "crabgresql-batch",
  "crabgresql-buffer-engine",
  "crabgresql-storage-api",
  "crabgresql-txn",
@@ -569,6 +610,7 @@ dependencies = [
  "crabgresql-storage-api",
  "crabgresql-txn",
  "crabgresql-types",
+ "crabgresql-vector-exec",
  "crabgresql-wal",
  "futures-util",
  "tempfile",
@@ -582,6 +624,7 @@ dependencies = [
 name = "crabgresql-storage-api"
 version = "0.1.0"
 dependencies = [
+ "crabgresql-batch",
  "crabgresql-txn",
  "crabgresql-types",
  "thiserror",
@@ -605,6 +648,19 @@ dependencies = [
  "pg-ryu",
  "regex",
  "regex-syntax",
+]
+
+[[package]]
+name = "crabgresql-vector-exec"
+version = "0.1.0"
+dependencies = [
+ "crabgresql-batch",
+ "crabgresql-binder",
+ "crabgresql-executor",
+ "crabgresql-planner",
+ "crabgresql-storage-api",
+ "crabgresql-txn",
+ "crabgresql-types",
 ]
 
 [[package]]

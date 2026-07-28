@@ -8,11 +8,14 @@
 //! implementation of this contract — hence a real `(block, offset)` [`Tid`]
 //! rather than an opaque scalar.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crabgresql_batch::{Batch, VectorExpr};
 use crabgresql_txn::{Clog, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
 
+pub use crabgresql_batch as batch;
 pub use crabgresql_txn as txn;
 
 mod stats;
@@ -600,6 +603,70 @@ pub type TupleStream = Box<
     dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send,
 >;
 
+/// A fallible stream of columnar batches — the columnar analogue of
+/// [`TupleStream`].
+pub type BatchStream = Box<dyn Iterator<Item = Result<Batch, StorageError>> + Send>;
+
+/// What a columnar scan should read, and what it may prune.
+///
+/// Every field except `columns` is a hint an engine may ignore. `filters`,
+/// `row_ids` and `parallelism` are unused by the first vectorized executor and
+/// present anyway: changing this struct is cheap, but changing
+/// [`TableAm::scan_batches`]'s signature would touch every engine, and these are
+/// exactly the three things predicate pushdown, columnar DML, and parallel scans
+/// will need.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct ScanRequest {
+    /// The columns to read. Fixes the batch shape — see
+    /// [`TableAm::scan_batches`].
+    pub columns: ColumnProjection,
+    /// Conjuncts the caller applies anyway, offered so an engine can skip
+    /// chunks, row groups or pages it can prove cannot match.
+    ///
+    /// A [`VectorExpr::Column`] here indexes *batch column position* — the same
+    /// frame the batches will arrive in — so one compiled expression serves both
+    /// the engine's pushdown and the caller's residual filter, and the two can
+    /// never drift.
+    ///
+    /// [`VectorExpr::Column`]: crabgresql_batch::VectorExpr::Column
+    pub filters: Vec<VectorExpr>,
+    /// Whether the caller needs [`Batch::row_id`]. False on every read path.
+    pub row_ids: bool,
+    /// Preferred rows per batch.
+    pub batch_size: usize,
+    /// How many streams the caller can consume concurrently.
+    pub parallelism: NonZeroUsize,
+}
+
+/// The batch size a scan uses when the caller expresses no preference. Matches
+/// the Parquet reader's own default, so a scan that simply hands its reader's
+/// batches through does no regrouping.
+pub const DEFAULT_BATCH_SIZE: usize = 8_192;
+
+impl ScanRequest {
+    /// A serial, filter-free read of `columns` — what a first-cut vectorized
+    /// scan asks for.
+    pub fn new(columns: ColumnProjection) -> Self {
+        ScanRequest {
+            columns,
+            filters: Vec::new(),
+            row_ids: false,
+            batch_size: DEFAULT_BATCH_SIZE,
+            parallelism: NonZeroUsize::MIN,
+        }
+    }
+
+    /// The schema ordinals this request reads, ascending — the order batch
+    /// columns must arrive in, and the `slots` of the schema they carry.
+    pub fn slots(&self, width: usize) -> Vec<usize> {
+        match &self.columns {
+            ColumnProjection::All => (0..width).collect(),
+            ColumnProjection::Some(columns) => columns.to_vec(),
+        }
+    }
+}
+
 /// Which of a relation's columns a scan actually needs.
 ///
 /// A columnar engine reads only the selected columns off disk; a row store
@@ -760,6 +827,62 @@ pub trait TableAm: Send + Sync {
     /// Pruning columns must never change the number, order, or [`Tid`] of the
     /// rows produced: `fetch` addresses rows by position within a scan.
     fn scan(&self, txn: &TxnContext, projection: &ColumnProjection) -> TupleStream;
+
+    /// Whether [`TableAm::scan_batches`] would return `Some`, answerable without
+    /// touching storage.
+    ///
+    /// The vectorized executor consults this while deciding whether to vectorize
+    /// a plan at all, so it never commits to a path the engine cannot serve —
+    /// the same contract [`TableAm::supports_index_scan`] has, for the same
+    /// reason.
+    fn supports_batch_scan(&self) -> bool {
+        false
+    }
+
+    /// A columnar scan: the same rows [`TableAm::scan`] would yield, in the same
+    /// order, under the same snapshot — delivered as [`Batch`]es.
+    ///
+    /// `None` (the default) means this engine has no columnar representation and
+    /// the caller must fall back to the row scan. **Returning `None` is always
+    /// correct**, which is what lets every existing engine ignore this method.
+    ///
+    /// # Batch shape
+    ///
+    /// Unlike [`TableAm::scan`], batches are *narrow*: exactly the columns
+    /// `req.columns` names, **in ascending schema-ordinal order**, with
+    /// [`BatchSchema::slots`] recording which ordinal each column holds. Callers
+    /// resolve column positions once, before the scan opens, so an engine that
+    /// emitted them in some other order would return wrong answers rather than
+    /// slow ones. (This is a live hazard, not a hypothetical: Parquet's
+    /// `ProjectionMask` does not promise to preserve request order, which is why
+    /// `open_reader` derives its position map by field *name*.)
+    ///
+    /// A batch always carries PostgreSQL-domain values — `date` and `timestamp`
+    /// rebased out of the Arrow epoch — so a caller never has to know which
+    /// engine produced it. See [`crabgresql_batch::epoch`].
+    ///
+    /// Batch boundaries carry no meaning. A caller must produce the same answer
+    /// under any splitting, including one batch per row.
+    ///
+    /// # Parallelism
+    ///
+    /// Returns one or more streams. Their concatenation **in vec order** is
+    /// exactly `scan()`'s row order, so a serial caller chains them and gets a
+    /// deterministic scan. An engine returns at most `req.parallelism` streams
+    /// and may always return one.
+    ///
+    /// The snapshot is captured once, here, and shared by every returned stream:
+    /// two streams of one scan must never see different sets of rows.
+    ///
+    /// # Filters
+    ///
+    /// [`ScanRequest::filters`] are *hints*. The caller re-applies every one of
+    /// them regardless, so applying none, some, or all of them is equally
+    /// correct — which is what lets predicate pushdown land incrementally, one
+    /// predicate shape at a time, without any correctness coupling.
+    fn scan_batches(&self, _txn: &TxnContext, _req: &ScanRequest) -> Option<Vec<BatchStream>> {
+        None
+    }
 
     /// Fetch one version by tid if it is visible to `txn` — the re-read
     /// EvalPlanQual needs after a conflict, and a point lookup for indexes.

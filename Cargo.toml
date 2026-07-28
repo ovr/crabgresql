@@ -9,6 +9,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # internal crates
+crabgresql-batch = { path = "crates/crabgresql-batch" }
 crabgresql-binder = { path = "crates/crabgresql-binder" }
 crabgresql-buffer-engine = { path = "crates/crabgresql-buffer-engine" }
 crabgresql-catalog = { path = "crates/crabgresql-catalog" }
@@ -24,13 +25,23 @@ crabgresql-server = { path = "crates/crabgresql-server" }
 crabgresql-storage-api = { path = "crates/crabgresql-storage-api" }
 crabgresql-txn = { path = "crates/crabgresql-txn" }
 crabgresql-types = { path = "crates/crabgresql-types" }
+crabgresql-vector-exec = { path = "crates/crabgresql-vector-exec" }
 crabgresql-wal = { path = "crates/crabgresql-wal" }
 pg-ryu = { path = "vendor/ryu" }
 
 # external
 bytes = "1"
+# The vectorized executor's kernels, all from the same arrow-rs release as
+# `parquet`. `arrow-buffer` and `arrow-select` were already in the lock file
+# transitively; `arrow-arith` (checked integer arithmetic, Kleene booleans) and
+# `arrow-ord` (comparisons) are new. Both are held to the same version as the
+# rest of the family so an upgrade moves them together.
+arrow-arith = "59.1"
 arrow-array = "59.1"
+arrow-buffer = "59.1"
+arrow-ord = "59.1"
 arrow-schema = "59.1"
+arrow-select = "59.1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
 icu_collator = "2"

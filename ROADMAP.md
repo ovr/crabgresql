@@ -66,7 +66,11 @@ The target design should land in compatibility-preserving slices:
    offset — the 64 MiB target is unreachable until the V2 footer lands, so the
    two are one change.
 4. Add manifest-pinned scans, pruning/pushdown, retired-file GC, and leveled
-   compaction.
+   compaction. The reader half of this now has a consumer: `TableAm::scan_batches`
+   takes a `ScanRequest` carrying the caller's conjuncts, which an engine may use
+   to skip chunks, row groups or pages. The caller re-applies every filter
+   regardless, so pushdown can land one predicate shape at a time without any
+   correctness coupling.
 5. Add internal partition split/merge and online repartitioning.
 6. Only then consider UPDATE/DELETE through delta chunks and tombstones; the
    append-only path must be correct and recoverable first.

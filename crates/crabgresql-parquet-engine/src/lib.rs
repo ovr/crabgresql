@@ -42,10 +42,11 @@ use arrow_array::{
     RecordBatchReader, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+use crabgresql_batch::{Batch, BatchField, BatchSchema, epoch};
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats,
-    RelfilenodeAllocator, StorageError, TableAm, TableCapabilities, TableSchema, Tid, Tuple,
-    TupleStream, UpdateResult,
+    BatchStream, ColumnProjection, DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats,
+    RelfilenodeAllocator, ScanRequest, StorageError, TableAm, TableCapabilities, TableSchema, Tid,
+    Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     CommandId, Infomask, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, Xid,
@@ -867,6 +868,188 @@ impl Iterator for ParquetScan {
     }
 }
 
+/// The batch form of [`ParquetScan`]: the same fragments, the same order, the
+/// same shared hold — handing the reader's `RecordBatch`es up instead of
+/// shredding each one into rows.
+///
+/// Everything that decides *which* rows a scan returns is shared with the row
+/// scan: `visible_fragments` filters whole files by MVCC before either iterator
+/// exists, and `open_reader` applies the same projection mask and re-checks the
+/// same footer identity. This iterator only changes the shape of the handoff.
+struct ParquetBatchScan {
+    schema: TableSchema,
+    /// The batch schema every produced batch carries. Fixed for the scan's life
+    /// — expression compilation resolved column positions against it — so a
+    /// fragment whose reader disagrees is an error rather than a reshaping.
+    batch_schema: BatchSchema,
+    /// The schema ordinals, ascending, that every fragment must decode into.
+    slots: Arc<[usize]>,
+    rel: u32,
+    projection: ColumnProjection,
+    fragments: Vec<Fragment>,
+    fragment_index: usize,
+    reader: Option<ParquetRecordBatchReader>,
+    /// Keeps the shared hold for the whole iterator life, so a concurrent
+    /// TRUNCATE cannot remove the directory this scan is still reading.
+    _guard: SharedGuard,
+}
+
+impl Iterator for ParquetBatchScan {
+    type Item = Result<Batch, StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(reader) = &mut self.reader {
+                match reader.next() {
+                    Some(Ok(batch)) => {
+                        // An empty batch carries no rows and no meaning; skipping
+                        // it here keeps `None` the only end-of-stream signal.
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        return Some(to_batch(&self.schema, &self.batch_schema, &self.slots, &batch));
+                    }
+                    Some(Err(error)) => {
+                        self.reader = None;
+                        return Some(Err(corrupt(format!("decode Parquet row group: {error}"))));
+                    }
+                    None => self.reader = None,
+                }
+            }
+            let fragment = self.fragments.get(self.fragment_index)?.clone();
+            self.fragment_index += 1;
+            match open_reader(&self.schema, self.rel, &fragment, &self.projection) {
+                Ok((reader, positions)) => {
+                    if positions.as_ref() != self.slots.as_ref() {
+                        return Some(Err(corrupt(format!(
+                            "Parquet fragment {} decodes columns {:?} where {:?} was expected",
+                            fragment.path.display(),
+                            positions,
+                            self.slots
+                        ))));
+                    }
+                    self.reader = Some(reader);
+                }
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+}
+
+/// Convert one reader `RecordBatch` into a [`Batch`].
+///
+/// Mostly free: an Arrow array whose storage layout already matches the batch
+/// representation is handed over by `Arc` clone with no copy at all, which is
+/// every type except `date` and `timestamp`. Those two are rebased out of the
+/// Arrow epoch — one pass over one column — because a batch carries
+/// PostgreSQL-domain values (see [`crabgresql_batch::epoch`] for why this is not
+/// pushed into the constants instead).
+fn to_batch(
+    schema: &TableSchema,
+    batch_schema: &BatchSchema,
+    slots: &[usize],
+    batch: &RecordBatch,
+) -> Result<Batch, StorageError> {
+    if batch.num_columns() != slots.len() {
+        return Err(corrupt(format!(
+            "Parquet batch has {} columns where {} were expected",
+            batch.num_columns(),
+            slots.len()
+        )));
+    }
+    let mut columns = Vec::with_capacity(slots.len());
+    for (index, &slot) in slots.iter().enumerate() {
+        let column = schema
+            .columns
+            .get(slot)
+            .ok_or_else(|| corrupt(format!("Parquet batch names missing column {slot}")))?;
+        columns.push(to_batch_array(column, batch.column(index))?);
+    }
+    Batch::new(batch_schema.clone(), columns, batch.num_rows())
+        .map_err(|error| corrupt(format!("build batch: {error}")))
+}
+
+/// One stored Arrow array in the batch representation of `column`'s type.
+fn to_batch_array(
+    column: &crabgresql_storage_api::Column,
+    array: &ArrayRef,
+) -> Result<ArrayRef, StorageError> {
+    let mismatch = || corrupt(format!("Parquet column \"{}\" has an unexpected type", column.name));
+    let converted: ArrayRef = match column.ty {
+        // `Date32Array` and `Int32Array` share a layout, so reinterpreting the
+        // buffers is free; only the epoch shift touches values.
+        PgType::Date => {
+            let stored = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(mismatch)?;
+            let raw = Int32Array::new(stored.values().clone(), stored.nulls().cloned());
+            Arc::new(epoch::rebase_dates(&raw).ok_or_else(|| {
+                corrupt(format!(
+                    "date epoch conversion overflow in column \"{}\"",
+                    column.name
+                ))
+            })?)
+        }
+        PgType::Timestamp | PgType::TimestampTz => {
+            let stored = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(mismatch)?;
+            let raw = Int64Array::new(stored.values().clone(), stored.nulls().cloned());
+            Arc::new(epoch::rebase_timestamps(&raw).ok_or_else(|| {
+                corrupt(format!(
+                    "timestamp epoch conversion overflow in column \"{}\"",
+                    column.name
+                ))
+            })?)
+        }
+        // PostgreSQL's `time` is already microseconds since midnight, so this is
+        // a pure relabelling with no shift.
+        PgType::Time => {
+            let stored = array
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .ok_or_else(mismatch)?;
+            Arc::new(Int64Array::new(
+                stored.values().clone(),
+                stored.nulls().cloned(),
+            ))
+        }
+        // Every other type stores exactly what a batch wants. This is the whole
+        // point of the exercise: 100-odd of ClickBench's 105 columns arrive here
+        // and cost one `Arc` clone.
+        _ => Arc::clone(array),
+    };
+    Ok(converted)
+}
+
+/// The batch schema a scan of `schema` restricted to `slots` produces.
+fn batch_schema_for(schema: &TableSchema, slots: &[usize]) -> Result<BatchSchema, StorageError> {
+    let mut fields = Vec::with_capacity(slots.len());
+    for &slot in slots {
+        let column = schema
+            .columns
+            .get(slot)
+            .ok_or_else(|| corrupt(format!("projection names missing column {slot}")))?;
+        let field = BatchField::new(
+            Some(column.name.clone()),
+            column.ty,
+            column.typmod,
+            column.nullable,
+        )
+        .ok_or_else(|| {
+            StorageError::UnsupportedType(format!(
+                "data type {} has no columnar batch representation",
+                column.ty.name()
+            ))
+        })?;
+        fields.push(field);
+    }
+    BatchSchema::scan(fields, slots.to_vec())
+        .map_err(|error| corrupt(format!("build batch schema: {error}")))
+}
+
 /// An uncommitted directory-swap TRUNCATE staged by one transaction. Because a
 /// TRUNCATE holds the table exclusively until it commits, at most one can exist on
 /// a table at a time — hence a single `Option`, not a map.
@@ -1381,6 +1564,35 @@ impl ParquetTable {
         Ok(self.scan_over(rel, fragments, guard, projection))
     }
 
+    /// The batch twin of [`ParquetTable::scan_in`].
+    ///
+    /// Takes the shared hold and resolves the relfilenode in the same order and
+    /// for the same reason (invariant P1), then lists the same fragments through
+    /// the same `visible_fragments` — so a batch scan and a row scan started
+    /// under one snapshot provably see the same rows.
+    fn batch_scan_in(
+        &self,
+        txn: &TxnContext,
+        req: &ScanRequest,
+    ) -> Result<ParquetBatchScan, StorageError> {
+        let slots: Arc<[usize]> = req.slots(self.schema.columns.len()).into();
+        let batch_schema = batch_schema_for(&self.schema, &slots)?;
+        let guard = self.lock.acquire_shared(txn.lock_owner);
+        let rel = self.effective_rel(txn.xid);
+        let fragments = self.visible_fragments(rel, txn)?;
+        Ok(ParquetBatchScan {
+            schema: self.schema.clone(),
+            batch_schema,
+            slots,
+            rel,
+            projection: req.columns.clone(),
+            fragments,
+            fragment_index: 0,
+            reader: None,
+            _guard: guard,
+        })
+    }
+
     /// Scan an already-listed fragment set, taking over the caller's shared hold.
     /// Lets a caller that has both measured and listed (see [`ParquetTable::measure`])
     /// read exactly what it measured.
@@ -1640,6 +1852,31 @@ impl TableAm for ParquetTable {
             Ok(scan) => Box::new(scan),
             Err(error) => Box::new(std::iter::once(Err(error))),
         }
+    }
+
+    fn supports_batch_scan(&self) -> bool {
+        // Every type this format stores has a batch representation except the
+        // two it stores as Arrow structs, which no kernel reads. Answering from
+        // the schema alone keeps this free of I/O, as the contract requires.
+        self.schema
+            .columns
+            .iter()
+            .all(|column| crabgresql_batch::encoding_of(column.ty).is_some())
+    }
+
+    fn scan_batches(&self, txn: &TxnContext, req: &ScanRequest) -> Option<Vec<BatchStream>> {
+        if !self.supports_batch_scan() {
+            return None;
+        }
+        // A failure to open surfaces as the stream's first item rather than as a
+        // `None`, matching `scan`: `None` means "this engine has no columnar
+        // path", and reporting an I/O error that way would silently downgrade
+        // to a row scan that is about to hit the same error.
+        let stream: BatchStream = match self.batch_scan_in(txn, req) {
+            Ok(scan) => Box::new(scan),
+            Err(error) => Box::new(std::iter::once(Err(error))),
+        };
+        Some(vec![stream])
     }
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
@@ -2153,6 +2390,271 @@ mod tests {
             metadata
                 .iter()
                 .any(|item| item.key == super::META_XMIN && item.value.as_deref() == Some("3"))
+        );
+        Ok(())
+    }
+
+    /// Every row a batch scan produces, rebuilt as a full-width tuple in scan
+    /// order — the shape a row scan returns, so the two can be compared directly.
+    fn batch_scan_rows(
+        table: &ParquetTable,
+        txn: &crabgresql_txn::TxnContext,
+        projection: ColumnProjection,
+    ) -> anyhow::Result<Vec<Tuple>> {
+        let width = table.schema().columns.len();
+        let streams = table
+            .scan_batches(txn, &crabgresql_storage_api::ScanRequest::new(projection))
+            .ok_or_else(|| anyhow::anyhow!("engine declined a batch scan"))?;
+        let mut rows = Vec::new();
+        for stream in streams {
+            for batch in stream {
+                let batch = batch?;
+                for row in 0..batch.len() {
+                    let mut tuple = Vec::new();
+                    batch.row_into(row, width, &mut tuple)?;
+                    rows.push(tuple);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The load-bearing equivalence: a batch scan and a row scan of the same
+    /// relation under the same snapshot must agree value for value.
+    ///
+    /// Every type the format stores is present, including the three whose batch
+    /// representation differs from their stored one. `date` and `timestamp` are
+    /// the reason this test exists — a missing epoch rebase shifts them by
+    /// exactly 30 years while preserving order, so nothing else would notice.
+    #[test]
+    fn a_batch_scan_returns_exactly_what_a_row_scan_returns() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let schema = schema(
+            "types",
+            &[
+                PgType::Bool,
+                PgType::Int2,
+                PgType::Int4,
+                PgType::Int8,
+                PgType::Float4,
+                PgType::Float8,
+                PgType::Numeric,
+                PgType::Text,
+                PgType::Bytea,
+                PgType::Uuid,
+                PgType::Date,
+                PgType::Time,
+                PgType::Timestamp,
+                PgType::TimestampTz,
+            ],
+        );
+        let table = open_table(dir.path(), 1, schema, Arc::clone(&wal))?;
+        let row = |date: i32, timestamp: i64| {
+            vec![
+                Value::Bool(true),
+                Value::Int2(-2),
+                Value::Int4(42),
+                Value::Int8(9_000_000_000),
+                Value::Float4(1.25),
+                // Signed zero and NaN survive the round trip untouched; the
+                // comparison kernels, not the scan, reconcile them.
+                Value::Float8(-0.0),
+                Value::Numeric(Numeric::parse("1.00").expect("numeric")),
+                Value::Text("hello".to_string()),
+                Value::Bytea(vec![0, 1, 255]),
+                Value::Uuid([0x42; 16]),
+                Value::Date(date),
+                Value::Time(12_345_678),
+                Value::Timestamp(timestamp),
+                Value::TimestampTz(-987_654_321),
+            ]
+        };
+        let rows = vec![
+            // An ordinary date, the PostgreSQL epoch itself, and both infinity
+            // sentinels — which must pass through unshifted.
+            row(4_930, 123_456_789),
+            row(0, 0),
+            row(i32::MAX, i64::MAX),
+            row(i32::MIN, i64::MIN),
+            vec![Value::Null; 14],
+        ];
+        let xid = tm.allocate_xid();
+        table.insert_many(rows.clone(), &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        finish(&table, xid, true)?;
+
+        let txn = tm.context(Xid::INVALID, CommandId::FIRST);
+        let by_row: Vec<Tuple> = table
+            .scan(&txn, &ColumnProjection::All)
+            .map(|result| result.map(|(_, tuple)| tuple))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(by_row, rows, "the row scan itself must round-trip");
+
+        let by_batch = batch_scan_rows(&table, &txn, ColumnProjection::All)?;
+        assert_eq!(by_batch, by_row, "batch and row scans must agree");
+        Ok(())
+    }
+
+    /// The same equivalence under a projection, where the batch is narrow and
+    /// the tuple stays full width with unread slots left null.
+    #[test]
+    fn a_projected_batch_scan_agrees_with_a_projected_row_scan() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let schema = schema(
+            "t",
+            &[PgType::Int4, PgType::Text, PgType::Date, PgType::Int8],
+        );
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+        let rows: Vec<Tuple> = (0..3)
+            .map(|i| {
+                vec![
+                    Value::Int4(i),
+                    Value::Text(format!("row{i}")),
+                    Value::Date(4_930 + i),
+                    Value::Int8(i64::from(i) * 100),
+                ]
+            })
+            .collect();
+        let xid = tm.allocate_xid();
+        table.insert_many(rows, &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        finish(&table, xid, true)?;
+
+        let txn = tm.context(Xid::INVALID, CommandId::FIRST);
+        // Deliberately not adjacent and not starting at zero, so a scan that
+        // returned columns in reader order rather than schema order would show.
+        let projection = ColumnProjection::of([2, 0], &schema);
+        let by_row: Vec<Tuple> = table
+            .scan(&txn, &projection)
+            .map(|result| result.map(|(_, tuple)| tuple))
+            .collect::<Result<_, _>>()?;
+        let by_batch = batch_scan_rows(&table, &txn, projection)?;
+        assert_eq!(by_batch, by_row);
+        // And the projection really did narrow: the unread columns are null.
+        assert!(by_batch.iter().all(|row| row[1] == Value::Null && row[3] == Value::Null));
+        Ok(())
+    }
+
+    /// A batch scan must not see rows a row scan cannot, so both go through the
+    /// same `visible_fragments`. Checked at the two boundaries that matter: a
+    /// statement's own uncommitted insert, and another transaction's.
+    #[test]
+    fn a_batch_scan_obeys_the_same_snapshot_as_a_row_scan() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let xid = tm.allocate_xid();
+        table.insert_many(vec![vec![Value::Int4(1)]], &tm.context(xid, CommandId::FIRST))?;
+
+        // Assert against the row scan rather than against a literal, so the
+        // property under test is "the two agree" rather than a restatement of
+        // MVCC that could drift from it.
+        let mut agree = |txn: &crabgresql_txn::TxnContext, expected: usize| -> anyhow::Result<()> {
+            let by_row = table.scan(txn, &ColumnProjection::All).count();
+            let by_batch = batch_scan_rows(&table, txn, ColumnProjection::All)?.len();
+            assert_eq!((by_row, by_batch), (expected, expected));
+            Ok(())
+        };
+
+        // Its own insert, before and after the command counter advances.
+        agree(&tm.context(xid, CommandId::FIRST), 0)?;
+        agree(&tm.context(xid, CommandId(1)), 1)?;
+        // Another transaction, while the insert is still uncommitted.
+        let before_commit = tm.context(Xid::INVALID, CommandId::FIRST);
+        agree(&before_commit, 0)?;
+
+        tm.commit(xid)?;
+        finish(&table, xid, true)?;
+        // A snapshot taken before the commit still cannot see it...
+        agree(&before_commit, 0)?;
+        // ...but one taken after can.
+        agree(&tm.context(Xid::INVALID, CommandId::FIRST), 1)?;
+        Ok(())
+    }
+
+    /// Rows must arrive in the same order across fragments, since a `GROUP BY`
+    /// with no `ORDER BY` reports groups in first-seen order.
+    #[test]
+    fn a_batch_scan_preserves_row_order_across_fragments() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        for value in 0..3 {
+            let xid = tm.allocate_xid();
+            table.insert_many(
+                vec![vec![Value::Int4(value)]],
+                &tm.context(xid, CommandId::FIRST),
+            )?;
+            tm.commit(xid)?;
+            finish(&table, xid, true)?;
+        }
+        let txn = tm.context(Xid::INVALID, CommandId::FIRST);
+        let by_row: Vec<Tuple> = table
+            .scan(&txn, &ColumnProjection::All)
+            .map(|result| result.map(|(_, tuple)| tuple))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(by_row.len(), 3, "expected one fragment per transaction");
+        assert_eq!(batch_scan_rows(&table, &txn, ColumnProjection::All)?, by_row);
+        Ok(())
+    }
+
+    /// Every type this format can store also has a batch representation, so no
+    /// Parquet relation is ever denied the columnar path by its schema.
+    ///
+    /// The two whitelists are maintained separately — `supports_type` here and
+    /// `encoding_of` in `crabgresql-batch` — so this pins the relationship
+    /// between them. If a type is ever added to one and not the other, a scan
+    /// would decline for a reason nobody chose; this fails first.
+    ///
+    /// Note the whitelists agree without being identical: `interval` and
+    /// `timetz` are *representable* in a batch (as Arrow structs) but no kernel
+    /// computes on them. Refusing them is the gate's job, not the scan's.
+    #[test]
+    fn every_storable_type_can_also_be_scanned_as_batches() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let storable = [
+            PgType::Bool,
+            PgType::Int2,
+            PgType::Int4,
+            PgType::Int8,
+            PgType::Float4,
+            PgType::Float8,
+            PgType::Numeric,
+            PgType::Text,
+            PgType::Varchar,
+            PgType::Bpchar,
+            PgType::Name,
+            PgType::Bytea,
+            PgType::Uuid,
+            PgType::Date,
+            PgType::Time,
+            PgType::TimeTz,
+            PgType::Timestamp,
+            PgType::TimestampTz,
+            PgType::Interval,
+        ];
+        assert!(
+            storable.iter().all(|ty| super::supports_type(*ty)),
+            "the storable list has drifted from `supports_type`"
+        );
+        let table = open_table(dir.path(), 1, schema("t", &storable), Arc::clone(&wal))?;
+        assert!(table.supports_batch_scan());
+        let txn = tm.context(Xid::INVALID, CommandId::FIRST);
+        assert!(
+            table
+                .scan_batches(
+                    &txn,
+                    &crabgresql_storage_api::ScanRequest::new(ColumnProjection::All)
+                )
+                .is_some()
         );
         Ok(())
     }

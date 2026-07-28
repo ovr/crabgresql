@@ -67,6 +67,12 @@ enum Command {
         #[arg(long)]
         reload: bool,
 
+        /// `SET name=value` on every connection, repeatable. Use it to A/B one
+        /// engine setting against another within a single binary, so compiler,
+        /// allocator and page-cache differences cannot masquerade as a result.
+        #[arg(long = "set", value_name = "NAME=VALUE", value_parser = parse_setting)]
+        settings: Vec<(String, String)>,
+
         /// Also write the results as JSON to this path
         #[arg(long, value_name = "PATH")]
         json: Option<PathBuf>,
@@ -87,6 +93,7 @@ async fn main() -> ExitCode {
         timeout,
         using,
         reload,
+        settings,
         json,
     } = args.command
     else {
@@ -110,6 +117,7 @@ async fn main() -> ExitCode {
         timeout: Duration::from_secs(timeout),
         access_method: using,
         reload,
+        settings,
     };
     let report = match run(suite, &config).await {
         Ok(report) => report,
@@ -132,4 +140,15 @@ async fn main() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// `NAME=VALUE`, split at the first `=` so a value may contain one.
+fn parse_setting(raw: &str) -> Result<(String, String), String> {
+    let (name, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=VALUE, got `{raw}`"))?;
+    if name.is_empty() {
+        return Err(format!("setting name is empty in `{raw}`"));
+    }
+    Ok((name.to_string(), value.to_string()))
 }

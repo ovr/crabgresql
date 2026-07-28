@@ -5,7 +5,13 @@
 //! rather than plan nodes: it yields a row count, and — with `RETURNING` — a
 //! row stream projected over the affected tuples the function already owns.
 
-mod agg;
+/// Aggregate accumulation, and the hash/equality pair that decides grouping.
+///
+/// Public so the vectorized executor can reuse it **verbatim** rather than
+/// reimplementing it. That is what keeps `sum(int8) → numeric`, `avg(int)`'s
+/// scale, `min`/`max` collation and first-seen group order identical across the
+/// two engines: there is one implementation, not two that must be kept in step.
+pub mod agg;
 pub mod eval;
 mod generate_series;
 mod md5;
@@ -211,6 +217,38 @@ pub struct ExecContext {
     /// statement would reuse a command id the body already stamped rows with,
     /// and those rows would be invisible to it.
     pub command_counter: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// The vectorized executor, when the session has one installed and enabled.
+    ///
+    /// `None` means every plan runs on rows, which is what the row engine did
+    /// before this existed and what it still does for anything the vectorized
+    /// engine declines. Installed by the server alongside `sequences` and
+    /// `catalog` — a handle rather than a direct call, so `crabgresql-executor`
+    /// keeps no dependency on Arrow or on the vectorized crate, and the row
+    /// engine cannot be affected by their code as a matter of structure rather
+    /// than of review.
+    pub batch_engine: Option<Arc<dyn BatchEngine>>,
+}
+
+/// The vectorized executor, seen from the row engine.
+///
+/// One method, consulted once per statement. Everything that decides *whether* a
+/// plan can be vectorized — the shape whitelist, the type whitelist, the
+/// expression compiler — lives behind it in `crabgresql-vector-exec`.
+pub trait BatchEngine: Send + Sync {
+    /// Build a vectorized execution for `plan`, or `None` to run it on rows.
+    ///
+    /// `None` is always a correct answer and carries no diagnostic: a plan is
+    /// declined for reasons a user cannot act on (a type the vector path has not
+    /// reached yet), so reporting them would be noise. `Err` is reserved for a
+    /// genuine runtime failure while building — the plan was accepted and then
+    /// something went wrong, which must not silently fall back to a different
+    /// execution of the same statement.
+    fn try_execute(
+        &self,
+        plan: &PhysicalPlan,
+        ctx: &ExecContext,
+        txn: &TxnContext,
+    ) -> Result<Option<Execution>, ExecError>;
 }
 
 impl Default for ExecContext {
@@ -226,6 +264,7 @@ impl Default for ExecContext {
             read_only: false,
             call_depth: 0,
             command_counter: None,
+            batch_engine: None,
         }
     }
 }
@@ -374,7 +413,21 @@ pub fn execute(
         read_only: ctx.read_only,
         call_depth: ctx.call_depth,
         command_counter: ctx.command_counter.clone(),
+        batch_engine: ctx.batch_engine.clone(),
     };
+    // The vectorized fast path (docs/ARCHITECTURE.md §1.2). Consulted here, once
+    // per statement, and deliberately *after* `resolve_subqueries` — that fold
+    // rewrites non-correlated subqueries to constants, so a decision taken before
+    // it would judge a plan that is not the one about to run.
+    //
+    // Anything the vectorized engine declines — including everything it has
+    // simply not reached yet — falls through to the row pipeline below,
+    // unchanged. `plan` is only borrowed, so the fallback is total.
+    if let Some(engine) = &ctx.batch_engine
+        && let Some(execution) = engine.try_execute(&plan, ctx, txn)?
+    {
+        return Ok(execution);
+    }
     match plan {
         PhysicalPlan::Values {
             columns,
@@ -1275,7 +1328,13 @@ fn substitute_hole(
 /// sources, and set-returning functions (every SELECT-shaped plan with a
 /// projection list).
 #[allow(clippy::too_many_arguments)]
-fn project_pipeline(
+/// Build the tail every row source shares: filter, project, sort, de-duplicate.
+///
+/// Public so the vectorized executor can finish a plan the same way this one
+/// does. The order these are applied in is semantically load-bearing — a
+/// projection must sit above the filter, or it would evaluate rows the filter
+/// removed — so the vectorized path calls this rather than reproducing it.
+pub fn project_pipeline(
     source: Box<dyn ExecNode>,
     projections: Vec<BoundExpr>,
     predicate: Option<BoundExpr>,

@@ -1,5 +1,5 @@
 [package]
-name = "crabgresql-storage-api"
+name = "crabgresql-vector-exec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,9 @@ workspace = true
 
 [dependencies]
 crabgresql-batch.workspace = true
+crabgresql-binder.workspace = true
+crabgresql-executor.workspace = true
+crabgresql-planner.workspace = true
+crabgresql-storage-api.workspace = true
 crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
-thiserror.workspace = true

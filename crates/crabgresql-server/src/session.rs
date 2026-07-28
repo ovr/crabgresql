@@ -8,8 +8,10 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
 use crabgresql_executor::{
-    CatalogOps, ExecContext, ExecError, ExecNode, NoticeSink, OutputColumn, RoutineOps, SequenceOps,
+    BatchEngine, CatalogOps, ExecContext, ExecError, ExecNode, NoticeSink, OutputColumn,
+    RoutineOps, SequenceOps,
 };
+use crabgresql_vector_exec::VectorEngine;
 use crabgresql_plpgsql::RoutineCache;
 
 use crate::query::RowTag;
@@ -136,6 +138,38 @@ impl ActiveTxn {
     }
 }
 
+/// The `crabgresql.vectorize` setting.
+///
+/// Three values, each with a distinct job. `off` is the oracle the differential
+/// harness compares against — without it the harness would need two server
+/// builds. `force` turns a declined plan into an error naming the reason, which
+/// is what makes gate coverage assertable: a fast path nobody can observe is one
+/// that can silently stop firing and still pass every correctness test.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Vectorize {
+    /// Never vectorize.
+    Off,
+    /// Vectorize whatever the gate accepts, and run the rest on rows.
+    #[default]
+    On,
+    /// Vectorize, or raise `0A000` naming the refusal. Test-only.
+    Force,
+}
+
+impl Vectorize {
+    /// Parse a GUC value. Accepts PostgreSQL's boolean spellings for `off`/`on`
+    /// so `SET crabgresql.vectorize = false` behaves as a reader would expect.
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("force") {
+            return Some(Vectorize::Force);
+        }
+        match crabgresql_types::parse_bool(value)? {
+            true => Some(Vectorize::On),
+            false => Some(Vectorize::Off),
+        }
+    }
+}
+
 pub struct Session {
     /// Database and role accepted during startup. The server currently has one
     /// physical database, but these are still the current connection identity
@@ -159,6 +193,9 @@ pub struct Session {
     /// `default_transaction_read_only` GUC — the access mode a new block inherits
     /// when it names none.
     pub default_read_only: bool,
+    /// `crabgresql.vectorize` GUC — whether analytical plans run through the
+    /// vectorized executor.
+    pub vectorize: Vectorize,
     /// Current transaction state, reported in every `ReadyForQuery`. `Idle`
     /// outside a block, `InTransaction` after `BEGIN`, `Failed` once a statement
     /// errors inside a block (only `COMMIT`/`ROLLBACK` clear it).
@@ -422,6 +459,7 @@ impl Session {
             txnmgr,
             lock_owner,
             engine,
+            vectorize: Vectorize::default(),
             prepared: HashMap::new(),
             portals: HashMap::new(),
             seq_state: Arc::new(Mutex::new(SessionSeqState::default())),
@@ -470,6 +508,21 @@ impl Session {
             read_only,
             call_depth: 0,
             command_counter: Some(command_counter),
+            batch_engine: self.batch_engine(),
+        }
+    }
+
+    /// The vectorized executor this session should use, or `None` when
+    /// `crabgresql.vectorize` is `off`.
+    ///
+    /// Built per statement rather than held on the session: it is a
+    /// zero-field handle, and constructing it here keeps the `off` setting a
+    /// genuine absence rather than a flag the engine has to re-check.
+    fn batch_engine(&self) -> Option<Arc<dyn BatchEngine>> {
+        match self.vectorize {
+            Vectorize::Off => None,
+            Vectorize::On => Some(Arc::new(VectorEngine::new()) as Arc<dyn BatchEngine>),
+            Vectorize::Force => Some(Arc::new(VectorEngine::forcing()) as Arc<dyn BatchEngine>),
         }
     }
 }
