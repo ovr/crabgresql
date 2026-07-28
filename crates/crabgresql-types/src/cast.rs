@@ -181,6 +181,16 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             Ok(Value::Text(if *b { "true" } else { "false" }.to_string()))
         }
 
+        // ---- inet → text / varchar / bpchar ----
+        // Like bool below, `inet` has a dedicated cast that does not agree with
+        // its output function: the cast always spells the masklen out, while
+        // `inet_out` (display, `concat()`, `array_out`, `::name`) omits `/32`
+        // and `/128`. `cidr_out` already always prints one, so `cidr` needs no
+        // arm of its own.
+        (Value::Inet(v), PgType::Text | PgType::Varchar | PgType::Bpchar) => {
+            Ok(Value::Text(crate::net::inet_text(v)))
+        }
+
         // ---- anything → text / varchar / bpchar / name (float uses efd) ----
         // These four share the `text` value representation; any length limit for
         // varchar/bpchar is applied separately as a typmod coercion. A

@@ -36,6 +36,9 @@ icu_collator = "2"
 icu_locale_core = "2"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 regex = "1"
+# `regex::Error` is opaque, so classifying a compile failure (an unsupported
+# construct versus a malformed pattern) needs the parser's own error enum.
+regex-syntax = "0.8"
 parquet = { version = "59.1", default-features = false, features = ["arrow", "snap"] }
 similar = "2"
 thiserror = "2"

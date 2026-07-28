@@ -111,6 +111,22 @@ SELECT regexp_like('abc', 'b', 'g');
 SELECT regexp_count('abc', 'b', 0);
 -- start is validated before the flags string
 SELECT regexp_count('abc', 'b', 0, 'z');
+-- a zero-width match is not re-found, and g replaces one next to a real match
+SELECT regexp_count('abc', '$') AS z1, regexp_count('xax', 'a|$') AS z2,
+       regexp_substr('abc', '$', 1, 2) AS z3,
+       regexp_replace('abc', 'b*', 'X', 'g') AS z4,
+       regexp_replace('aaa', 'a|', 'X', 'g') AS z5;
+-- regexp_replace's start / N form, discriminated from flags by argument type
+SELECT regexp_replace('a1b2c3', '[0-9]', 'X', 2) AS s1,
+       regexp_replace('a1b2c3', '[0-9]', 'X', 1, 2) AS s2,
+       regexp_replace('a1b2c3', '[0-9]', 'X', 1, 0) AS s3,
+       regexp_replace('A1b2', '[a-z]', 'X', 1, 0, 'i') AS s4,
+       regexp_replace('a1b2', '[0-9]', 'X', 'g') AS s5;
+-- t is the inverse of x; q cannot combine with expanded or newline modes
+SELECT regexp_replace('abc', 'a b c', 'X', 't') AS t1,
+       regexp_replace('abc', 'a b c', 'X', 'tx') AS t2,
+       regexp_like('a b', 'a b', 'qs') AS t3;
+SELECT regexp_like('a b', 'a b', 'qx');
 
 -- encode / decode
 SELECT encode('\x001000'::bytea, 'hex') AS e_hex, encode('abc'::bytea, 'base64') AS e_b64,
@@ -125,6 +141,11 @@ SELECT quote_ident('foo') AS qi1, quote_ident('foo bar') AS qi2,
 -- backs display, concat() and the cast to name
 SELECT true::text AS b1, false::varchar AS b2, true::name AS b3,
        concat(true, 'x') AS b4, true || 'x' AS b5, length(true::text) AS b6;
+-- inet is the other type whose cast disagrees with its output function: the
+-- cast always spells the masklen out
+SELECT ('192.168.1.5'::inet)::text AS i1, concat('192.168.1.5'::inet) AS i2,
+       ('192.168.1.5'::inet)::name AS i3, ('192.168.1.5'::inet) || '' AS i4,
+       ('192.168.1.0/24'::cidr)::text AS i5;
 
 -- character types: casts, typmod truncation, and the default column names
 SELECT 'abc'::varchar AS v_unbounded, 'abcdef'::varchar(3) AS v_trunc,

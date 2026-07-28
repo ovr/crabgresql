@@ -291,10 +291,29 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         // The `regexp_*` family shares one variant per function across all its
         // arities, so absent trailing arguments fall back to PG's defaults.
         ScalarFn::RegexpReplace => {
-            let flags = args.get(3).map_or("", text);
-            return text::regexp_replace(text(&args[0]), text(&args[1]), text(&args[2]), flags)
-                .map(Value::Text)
-                .map_err(text_err);
+            // Two 4-argument forms overlap here, so the fourth argument is
+            // discriminated by type rather than by arity: `text` is the flags
+            // form, `int4` the `start [, n [, flags]]` one.
+            let (start, n, flags) = match args.get(3) {
+                None | Some(Value::Text(_)) => (1, None, args.get(3).map_or("", text)),
+                // Without an explicit `n` this form replaces just the first
+                // match at or after `start`; `n = 0` is what asks for all.
+                _ => (
+                    i4(&args[3]),
+                    Some(args.get(4).map_or(1, i4)),
+                    args.get(5).map_or("", text),
+                ),
+            };
+            return text::regexp_replace_at(
+                text(&args[0]),
+                text(&args[1]),
+                text(&args[2]),
+                start,
+                n,
+                flags,
+            )
+            .map(Value::Text)
+            .map_err(text_err);
         }
         ScalarFn::RegexpLike => {
             let flags = args.get(2).map_or("", text);

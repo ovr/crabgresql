@@ -1662,14 +1662,18 @@ fn lookup(name: &str) -> &'static [Signature] {
             ret: TEXT,
         }],
         // The `regexp_*` family, whose trailing `start`/`n`/`flags`/`subexpr`
-        // arguments are all optional. PG 15's `regexp_replace(source, pattern,
-        // repl, start, N [, flags])` is not offered: its 4-argument form
-        // collides with the flags form.
+        // arguments are all optional. `regexp_replace` has two 4-argument forms
+        // that differ only in the last argument's type; the flags form is
+        // listed first because that is what an untyped literal resolves to (an
+        // integer literal binds as `int4` and picks the other by exact match).
         "regexp_replace" => arity_sigs!(
             ScalarFn::RegexpReplace,
             TEXT,
             &[TEXT, TEXT, TEXT],
             &[TEXT, TEXT, TEXT, TEXT],
+            &[TEXT, TEXT, TEXT, I4],
+            &[TEXT, TEXT, TEXT, I4, I4],
+            &[TEXT, TEXT, TEXT, I4, I4, TEXT],
         ),
         "regexp_like" => arity_sigs!(
             ScalarFn::RegexpLike,

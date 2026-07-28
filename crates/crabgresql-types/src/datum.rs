@@ -53,6 +53,10 @@ const T_ARRAY: u8 = 30;
 const T_REG: u8 = 31;
 const T_TSVECTOR: u8 = 32;
 const T_TSQUERY: u8 = 33;
+/// `jsonpath` as a serialized tree. Supersedes [`T_JSONPATH`], whose canonical
+/// text had to be re-parsed on read; that tag is still decoded so pages written
+/// before the change keep working.
+const T_JSONPATH_TREE: u8 = 34;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -198,10 +202,13 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.push(T_JSONB);
             put_var(out, json::format(j).as_bytes());
         }
-        // `jsonpath` stores its canonical text (`jsonpath_out`), re-parsed on decode.
+        // `jsonpath` stores its tree, not its canonical text: `jsonpath_out`
+        // parenthesizes equal-priority sub-expressions, so re-parsing could
+        // exceed the depth limit the original passed, and any tightening of the
+        // parser would retroactively make stored values unreadable.
         Value::Jsonpath(p) => {
-            out.push(T_JSONPATH);
-            put_var(out, crate::jsonpath::format(p).as_bytes());
+            out.push(T_JSONPATH_TREE);
+            put_var(out, &crate::jsonpath::encode(p));
         }
         // Both text-search types store their canonical text for the same reason:
         // the output form round-trips exactly through the input parser.
@@ -374,11 +381,13 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             let s = std::str::from_utf8(r.var()).expect("jsonb text is valid utf-8");
             Value::Jsonb(json::jsonb_in(s).expect("stored jsonb re-parses"))
         }
+        T_JSONPATH_TREE => {
+            Value::Jsonpath(crate::jsonpath::decode(r.var()).expect("stored jsonpath decodes"))
+        }
+        // Written by builds before the tree encoding existed.
         T_JSONPATH => {
             let s = std::str::from_utf8(r.var()).expect("jsonpath text is valid utf-8");
-            Value::Jsonpath(
-                crate::jsonpath::jsonpath_in(s).expect("stored jsonpath re-parses"),
-            )
+            Value::Jsonpath(crate::jsonpath::jsonpath_in(s).expect("stored jsonpath re-parses"))
         }
         T_TSVECTOR => {
             let s = std::str::from_utf8(r.var()).expect("tsvector text is valid utf-8");

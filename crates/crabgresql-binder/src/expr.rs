@@ -5337,10 +5337,11 @@ pub(crate) fn to_concat_operand(binding: Binding) -> Result<BoundExpr, BindError
         Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text),
         Binding::Typed(e) if is_text_family(e.ty()) => Ok(e),
         // These functions render each argument with its *output* function, not
-        // its cast to text. The two differ for bool (`t` versus `true`), so
-        // bool is left for the executor to encode; `||`, which really does cast,
-        // goes through `to_text_operand` instead.
-        Binding::Typed(e) if e.ty() == PgType::Bool => Ok(e),
+        // its cast to text. The two differ for bool (`t` versus `true`) and for
+        // inet (`192.168.1.5` versus `192.168.1.5/32`), so those are left for
+        // the executor to encode; `||`, which really does cast, goes through
+        // `to_text_operand` instead.
+        Binding::Typed(e) if matches!(e.ty(), PgType::Bool | PgType::Inet) => Ok(e),
         Binding::Typed(e) => coerce_expr(e, PgType::Text),
     }
 }

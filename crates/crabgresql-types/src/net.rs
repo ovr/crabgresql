@@ -252,6 +252,14 @@ pub fn cidr_out(v: &Inet) -> String {
     format!("{}/{}", addr_str(&v.masked()), v.bits)
 }
 
+/// The `inet -> text` *cast*, which is not [`inet_out`]: PG's dedicated cast
+/// always spells the masklen out, so `192.168.1.5` casts to `192.168.1.5/32`
+/// even though it displays without one. (`cidr` needs no equivalent —
+/// [`cidr_out`] already always prints the masklen.)
+pub fn inet_text(v: &Inet) -> String {
+    format!("{}/{}", addr_str(v), v.bits)
+}
+
 /// Compare the first `nbits` bits of two addresses.
 fn bitncmp(a: &[u8; 16], b: &[u8; 16], nbits: u8) -> Ordering {
     let whole = (nbits / 8) as usize;
