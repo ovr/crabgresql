@@ -1271,7 +1271,7 @@ mod tests {
     /// stores rows — the planner only reads schema/index metadata, so every
     /// row-touching method is `unimplemented!()`.
     #[derive(Default)]
-    struct MetaEngine {
+    pub(super) struct MetaEngine {
         tables: Mutex<HashMap<String, Arc<MetaTable>>>,
     }
 
@@ -2456,8 +2456,9 @@ mod projection_tests {
     //! The column-projection pass: SQL in, the projection stamped on each scan
     //! leaf out. The fixture table is `t(id int4, big int8, name text)`.
 
-    use super::tests::plan_sql;
+    use super::tests::{MetaEngine, plan_sql};
     use super::*;
+    use crabgresql_storage_api::{Column, TableEngine};
 
     /// The stamped projection, as a plain `Vec` (`None` = every column).
     fn cols(projection: &ColumnProjection) -> Option<Vec<usize>> {
@@ -2575,6 +2576,151 @@ mod projection_tests {
         };
         assert_eq!(leaf(*left), Some(vec![0, 1]), "left keeps its own indices");
         assert_eq!(leaf(*right), Some(vec![1, 2]), "right rebases by left width");
+    }
+
+    /// Demand threads down through a derived table: the inner `SELECT *`
+    /// projects every column, but only the one the outer query reads is
+    /// actually needed from the table.
+    ///
+    /// This is the shape a view expands to, and the one an earlier version of
+    /// this pass could not see through — it matched a literal `Append` child and
+    /// so read all three columns here.
+    #[test]
+    fn demand_threads_through_a_derived_table() {
+        let plan = plan_sql("SELECT id FROM (SELECT * FROM t) s");
+        let PhysicalPlan::Subquery { source, .. } = plan else {
+            panic!("expected a Subquery over the derived table");
+        };
+        let PhysicalPlan::Select { projection, .. } = *source else {
+            panic!("expected the derived table to lower to a Select");
+        };
+        assert_eq!(cols(&projection), Some(vec![0]));
+    }
+
+    /// Two levels of nesting, and a predicate at the inner level that reads a
+    /// column the outer query never sees.
+    #[test]
+    fn demand_threads_through_nested_derived_tables() {
+        let plan = plan_sql("SELECT id FROM (SELECT * FROM (SELECT * FROM t WHERE big > 1) a) b");
+        let mut node = &plan;
+        loop {
+            match node {
+                PhysicalPlan::Subquery { source, .. } => node = source,
+                PhysicalPlan::Select { projection, .. } => {
+                    // `id` for the output, `big` for the inner WHERE.
+                    assert_eq!(cols(projection), Some(vec![0, 1]));
+                    return;
+                }
+                other => panic!("unexpected node {}", explain(other)[0]),
+            }
+        }
+    }
+
+    /// `LIMIT` has no projections of its own — its output row is its source
+    /// row — so demand passes straight through it.
+    #[test]
+    fn demand_threads_through_a_limit() {
+        let plan = plan_sql("SELECT id FROM (SELECT * FROM t LIMIT 5) s");
+        let mut node = &plan;
+        loop {
+            match node {
+                PhysicalPlan::Subquery { source, .. } => node = source,
+                PhysicalPlan::Limit { source, .. } => node = source,
+                PhysicalPlan::Select { projection, .. } => {
+                    assert_eq!(cols(projection), Some(vec![0]));
+                    return;
+                }
+                other => panic!("unexpected node {}", explain(other)[0]),
+            }
+        }
+    }
+
+    /// A hidden ORDER BY column lives in the inner node's `projections` past the
+    /// visible width. The outer demand does not name it, so it survives only
+    /// because `through_tail` folds the sort keys into the node's own demand.
+    #[test]
+    fn a_hidden_order_by_column_survives_threading() {
+        let plan = plan_sql("SELECT id FROM (SELECT * FROM t) s ORDER BY name");
+        let PhysicalPlan::Subquery { source, .. } = plan else {
+            panic!("expected a Subquery");
+        };
+        let PhysicalPlan::Select { projection, .. } = *source else {
+            panic!("expected a Select");
+        };
+        assert_eq!(
+            cols(&projection),
+            Some(vec![0, 2]),
+            "`name` is read for the sort even though it is not in the select list"
+        );
+    }
+
+    /// A set-operation arm still prunes from its **own** tail — it just does not
+    /// receive the consumer's demand, because a non-`ALL` `UNION` deduplicates
+    /// on every output column and an arm's coercion may hold a NULL constant
+    /// that references no source column.
+    #[test]
+    fn a_set_operation_arm_prunes_from_its_own_tail_only() {
+        let PhysicalPlan::SetOp { arms, .. } =
+            plan_sql("SELECT id FROM t UNION ALL SELECT big FROM t")
+        else {
+            panic!("expected a SetOp");
+        };
+        let projection = |arm: &PhysicalSetOpArm| match &arm.plan {
+            PhysicalPlan::Select { projection, .. } => cols(projection),
+            other => panic!("expected each arm to be a Select, got {}", explain(other)[0]),
+        };
+        assert_eq!(projection(&arms[0]), Some(vec![0]));
+        assert_eq!(projection(&arms[1]), Some(vec![1]));
+
+        // But an arm that selects everything is not narrowed by what the
+        // consumer of the set operation happens to read.
+        let PhysicalPlan::Subquery { source, .. } =
+            plan_sql("SELECT id FROM (SELECT * FROM t UNION ALL SELECT * FROM t) s")
+        else {
+            panic!("expected a Subquery over the set operation");
+        };
+        let PhysicalPlan::SetOp { arms, .. } = *source else {
+            panic!("expected a SetOp under the subquery");
+        };
+        assert_eq!(projection(&arms[0]), None);
+    }
+
+    /// An `Append` fans one projection out to every leaf, so leaves that do not
+    /// share a width must disable pruning rather than hand a leaf an ordinal
+    /// past its own end — which would panic inside the storage engine.
+    #[test]
+    fn append_leaves_of_differing_width_disable_pruning() {
+        let engine: Arc<dyn TableEngine> = Arc::new(MetaEngine::default());
+        let leaf = |name: &str, types: &[PgType]| {
+            engine
+                .create_table(TableSchema::in_namespace(
+                    name,
+                    "public",
+                    types
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ty)| Column::new(format!("c{i}"), *ty))
+                        .collect(),
+                ))
+                .expect("create leaf")
+        };
+        let wide = leaf("wide", &[PgType::Int4, PgType::Int4, PgType::Int4]);
+        let narrow = leaf("narrow", &[PgType::Int4, PgType::Int4]);
+
+        let mut plan = PhysicalPlan::Append {
+            tables: vec![wide, narrow],
+            projection: ColumnProjection::Some(vec![2].into()),
+            columns: vec![
+                OutputColumn::new("c0", PgType::Int4),
+                OutputColumn::new("c1", PgType::Int4),
+                OutputColumn::new("c2", PgType::Int4),
+            ],
+        };
+        projection::push_column_projections(&mut plan);
+        let PhysicalPlan::Append { projection, .. } = &plan else {
+            unreachable!()
+        };
+        assert_eq!(cols(projection), None);
     }
 
     /// DML reads whole rows: the row is rebuilt by ordinal and RETURNING may

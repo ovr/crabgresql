@@ -15,18 +15,35 @@
 //! Runs last in [`plan`](crate::plan), after `pushdown::push_where_into_joins`,
 //! so a predicate is analyzed at the leaf where it will actually be evaluated.
 //!
+//! # Demand flows down
+//!
+//! The pass threads a *demand set* — the columns a node's consumers read, in
+//! that node's own output-row index space — from the top of the plan to each
+//! scan leaf. A node that projects maps its parent's demand through its own
+//! `projections` ([`through_tail`]), so only the source columns feeding a
+//! demanded output column survive.
+//!
+//! Threading is what makes the pass see through the shapes a relation is
+//! normally read through. `SELECT k FROM v` over a view plans as
+//! `Subquery { source: Subquery { source: Append } }` and
+//! `SELECT count(k) FROM v` as `Aggregate { Join { Subplan(Subquery { Append }) } }`;
+//! an earlier version of this pass matched a literal `Append` child and so
+//! collapsed both to "read everything", turning the optimization off for every
+//! view and derived table.
+//!
 //! Every path is fail-safe: an expression whose dependencies cannot be proven,
 //! or a plan shape this pass does not model, yields [`ColumnProjection::All`] —
 //! which is exactly the behavior before this pass existed.
 
 use std::collections::BTreeSet;
 
-use crabgresql_binder::{BoundAggregate, BoundExpr};
-use crabgresql_storage_api::ColumnProjection;
+use crabgresql_binder::{BoundAggregate, BoundExpr, DistinctKey, SortKey};
+use crabgresql_storage_api::{ColumnProjection, TableAm, TableSchema};
 
 use crate::{
     PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan, PhysicalSetOpArm,
 };
+use std::sync::Arc;
 
 /// The columns a node's consumers read, in that node's own base-0 index space.
 /// `None` means "could not be determined — assume all of them".
@@ -36,24 +53,29 @@ type Demand = Option<BTreeSet<usize>>;
 const ALL: Demand = None;
 
 /// Stamp a projection on every scan leaf of `plan` that this pass can prove one
-/// for.
+/// for. The root's own output is fully consumed by the client, so it starts at
+/// [`ALL`].
 pub(crate) fn push_column_projections(plan: &mut PhysicalPlan) {
+    push(plan, ALL);
+}
+
+/// Push `demand` — the columns of **this node's output row** that its consumer
+/// reads — down to the scan leaves beneath it.
+fn push(plan: &mut PhysicalPlan, demand: Demand) {
     match plan {
         // The tail-bearing single-table nodes: their own `projections` and
         // `predicate` are the only things that read the scanned row.
-        //
-        // `sort` and `distinct` are deliberately absent. Their `column` fields
-        // index the *projected* tuple, not the base row (see the doc comments on
-        // `SortKey` and `DistinctKey` in the binder's `plan.rs`), and a hidden
-        // ORDER BY / DISTINCT ON column is already appended to `projections`.
         PhysicalPlan::Select {
             table,
             projection,
             projections,
             predicate,
+            sort,
+            distinct,
             ..
         } => {
-            *projection = resolve(tail_demand(projections, predicate.as_ref()), table.schema());
+            let demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
+            *projection = resolve(demand, table.schema());
         }
         PhysicalPlan::IndexScan {
             table,
@@ -61,9 +83,11 @@ pub(crate) fn push_column_projections(plan: &mut PhysicalPlan) {
             key,
             projections,
             predicate,
+            sort,
+            distinct,
             ..
         } => {
-            let mut demand = tail_demand(projections, predicate.as_ref());
+            let mut demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
             // The executor's index-scan fallback (`IndexScan::new`) re-checks
             // every key column per row whenever the engine has no physical index
             // to probe — which is every engine but the in-memory one. Pruning a
@@ -80,40 +104,37 @@ pub(crate) fn push_column_projections(plan: &mut PhysicalPlan) {
             source,
             projections,
             predicate,
+            sort,
+            distinct,
             ..
         } => {
-            // An `Append` has no expressions of its own, so its columns are
-            // demanded entirely by this node. Push only into a literal `Append`:
-            // that is the partitioned-parent / buffered-Parquet shape, and the
-            // one child whose output row is provably the base relation's row
-            // (a single FROM item binds at scope offset 0). Any other source
-            // computes its own demand from its own tail.
-            if let PhysicalPlan::Append {
-                projection,
-                columns,
-                tables,
-            } = source.as_mut()
-            {
-                let demand = tail_demand(projections, predicate.as_ref());
-                // Every leaf shares the parent's layout, so one projection
-                // serves them all; take the width from the first leaf's schema.
-                if let Some(table) = tables.first() {
-                    debug_assert_eq!(table.schema().columns.len(), columns.len());
-                    *projection = resolve(demand, table.schema());
-                }
-            } else {
-                push_column_projections(source);
-            }
+            let demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
+            push(source, demand);
+        }
+        // Transparent: output row is the source row, no expressions of its own.
+        PhysicalPlan::Limit { source, .. } => push(source, demand),
+        // Also transparent, and the node that actually reaches storage: every
+        // leaf carries the relation's own column layout, so the demand arrives
+        // already in the leaves' index space.
+        PhysicalPlan::Append {
+            tables,
+            projection,
+            columns,
+        } => {
+            *projection = append_projection(demand, tables, columns.len());
         }
         PhysicalPlan::Join {
             source,
             projections,
             predicate,
+            sort,
+            distinct,
             ..
         } => {
-            // `projections`/`predicate` here index the whole concatenated join
-            // row, which is exactly `source`'s own base-0 space.
-            prune_join(source, tail_demand(projections, predicate.as_ref()));
+            // `projections`/`predicate` index the whole concatenated join row,
+            // which is exactly `source`'s own base-0 space.
+            let demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
+            prune_join(source, demand);
         }
         PhysicalPlan::Aggregate {
             input,
@@ -122,10 +143,12 @@ pub(crate) fn push_column_projections(plan: &mut PhysicalPlan) {
             aggregates,
             ..
         } => {
-            // Only WHERE, the grouping keys and the aggregate arguments read the
-            // *source* row. `projections`, `having`, `sort` and `distinct` all
-            // index the post-grouping row, and `BoundAggregate::args` is the
-            // aggregate's only field over source columns (`count(*)` has none).
+            // The parent's demand is deliberately ignored. Only WHERE, the
+            // grouping keys and the aggregate arguments read the *source* row —
+            // `projections`, `having`, `sort` and `distinct` all index the
+            // post-grouping row — and none of the three may be dropped just
+            // because its output column is unread: a group key determines the
+            // row count, and the executor accumulates every aggregate.
             let demand = add_exprs(Some(BTreeSet::new()), predicate.as_ref());
             let demand = add_exprs(demand, group_exprs.iter());
             let demand = aggregates
@@ -142,27 +165,96 @@ pub(crate) fn push_column_projections(plan: &mut PhysicalPlan) {
             }
         }
 
-        // Shapes this pass does not model: recurse so nested scans still get
-        // their own analysis, but demand nothing across the boundary.
-        PhysicalPlan::Limit { source, .. } => push_column_projections(source),
+        // Arms line up positionally with the set operation's output, but demand
+        // is not threaded through them: a non-ALL `UNION` deduplicates on every
+        // output column anyway, and an arm's `coercion` may hold a NULL constant
+        // that references no source column at all.
         PhysicalPlan::SetOp { arms, .. } => {
             for PhysicalSetOpArm { plan, .. } in arms {
-                push_column_projections(plan);
+                push(plan, ALL);
             }
         }
         PhysicalPlan::Insert { source, .. } => {
             if let crate::PhysicalInsertSource::Query { input, .. } = source {
-                push_column_projections(input);
+                push(input, ALL);
             }
         }
-        // A bare `Append` reached without a wrapping `Subquery`, plus the leaves
-        // that hold no scan and the DML nodes, which always read whole rows.
-        PhysicalPlan::Append { .. }
-        | PhysicalPlan::Values { .. }
+        // Leaves that hold no scan, plus the DML nodes — those rebuild rows by
+        // ordinal and their RETURNING may name any column, so the executor
+        // passes `ColumnProjection::All` on every DML scan explicitly.
+        PhysicalPlan::Values { .. }
         | PhysicalPlan::TableFunction { .. }
         | PhysicalPlan::Update { .. }
         | PhysicalPlan::Delete { .. } => {}
     }
+}
+
+/// Map a parent's demand on a node's **output** row down to a demand on the row
+/// its source produces.
+///
+/// Only the projections the parent actually reads contribute their column
+/// references; the predicate always does, because `project_pipeline` evaluates
+/// it as a `Filter` *below* the `Projection`, against the source row.
+fn through_tail(
+    demand: Demand,
+    projections: &[BoundExpr],
+    predicate: Option<&BoundExpr>,
+    sort: &[SortKey],
+    distinct: &Option<Vec<DistinctKey>>,
+) -> Demand {
+    // `sort` and `distinct` index the *projected* tuple — including hidden
+    // ORDER BY / DISTINCT ON columns the binder appended past the visible output
+    // width — so they are this node's own demand on its own projections. They
+    // contribute nothing directly to the source row, but dropping a projection
+    // they key on would leave the sort reading a NULL.
+    let wanted = demand.map(|mut wanted| {
+        wanted.extend(sort.iter().map(|key| key.column));
+        if let Some(distinct) = distinct {
+            wanted.extend(distinct.iter().map(|key| key.column));
+        }
+        wanted
+    });
+
+    let mut out = Some(BTreeSet::new());
+    match wanted {
+        None => out = add_exprs(out, projections.iter()),
+        Some(wanted) => {
+            for index in wanted {
+                match projections.get(index) {
+                    Some(expr) => out = add_exprs(out, Some(expr)),
+                    // A demand past our own output width: the caller's index
+                    // space is not ours, so nothing here can be proven.
+                    None => return ALL,
+                }
+            }
+        }
+    }
+    add_exprs(out, predicate)
+}
+
+/// Resolve one projection to share across an [`PhysicalPlan::Append`]'s leaves.
+///
+/// The leaves of an `Append` are a partitioned parent's partitions or a
+/// relation's storage leaves, so they all carry the relation's column layout and
+/// one projection serves them all. That invariant spans the binder, the engines
+/// and DDL, so it is checked rather than assumed: an ordinal valid for one leaf
+/// but past the end of another would panic inside `ProjectionMask::roots` or
+/// `BufferTable::visible` rather than merely reading the wrong column.
+fn append_projection(
+    demand: Demand,
+    tables: &[Arc<dyn TableAm>],
+    columns: usize,
+) -> ColumnProjection {
+    let Some(first) = tables.first() else {
+        return ColumnProjection::All;
+    };
+    if tables
+        .iter()
+        .any(|table| table.schema().columns.len() != columns)
+    {
+        return ColumnProjection::All;
+    }
+    resolve(demand, first.schema())
 }
 
 /// Push `demand` — expressed in `node`'s own base-0 index space — down to the
@@ -174,30 +266,23 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
             width,
             predicate,
         } => {
-            // A leaf's own sunk conjuncts are already rebased to the leaf's row
-            // by `pushdown::place`, so they share this space and need no shift.
+            // A leaf's own sunk conjuncts were rebased into the leaf's row by
+            // `sink_leaf_filters` (which applies `shift_column_refs(-base)` on
+            // the way down), so they share this space and need no shift here.
             let demand = add_exprs(demand, predicate.as_ref());
             let width = *width;
-            let demand =
-                demand.map(|demand| demand.into_iter().filter(|index| *index < width).collect());
+            // An index past the leaf's own width means the demand was derived in
+            // the wrong space. Fail safe rather than dropping it: a dropped
+            // column reads back NULL and silently returns wrong rows.
+            let demand = match demand {
+                Some(demand) if demand.iter().any(|index| *index >= width) => ALL,
+                other => other,
+            };
             match input {
                 PhysicalJoinInput::Scan { table, projection } => {
                     *projection = resolve(demand, table.schema());
                 }
-                PhysicalJoinInput::Subplan(source) => {
-                    // Same reasoning as the `Subquery` arm above: an `Append`
-                    // is transparent, anything else owns its own tail.
-                    if let PhysicalPlan::Append {
-                        projection, tables, ..
-                    } = source.as_mut()
-                    {
-                        if let Some(table) = tables.first() {
-                            *projection = resolve(demand, table.schema());
-                        }
-                    } else {
-                        push_column_projections(source);
-                    }
-                }
+                PhysicalJoinInput::Subplan(source) => push(source, demand),
                 PhysicalJoinInput::TableFunction { .. } => {}
             }
         }
@@ -216,7 +301,9 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
             });
 
             // Split at the boundary: left indices pass through unchanged, right
-            // indices rebase into the right subtree's own base-0 space.
+            // indices rebase into the right subtree's own base-0 space. This is
+            // a partition of the concatenated row, not a clamp — every index
+            // lands on exactly one side.
             let split = left.width();
             let (left_demand, right_demand) = match demand {
                 None => (ALL, ALL),
@@ -237,12 +324,6 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
     }
 }
 
-/// The columns a standard projection/predicate tail reads from its source row.
-fn tail_demand(projections: &[BoundExpr], predicate: Option<&BoundExpr>) -> Demand {
-    let demand = add_exprs(Some(BTreeSet::new()), projections.iter());
-    add_exprs(demand, predicate)
-}
-
 /// Fold more expressions into `demand`, collapsing to [`ALL`] as soon as any of
 /// them — or `demand` itself — cannot be pinned down.
 fn add_exprs<'a>(demand: Demand, exprs: impl IntoIterator<Item = &'a BoundExpr>) -> Demand {
@@ -256,7 +337,7 @@ fn add_exprs<'a>(demand: Demand, exprs: impl IntoIterator<Item = &'a BoundExpr>)
 }
 
 /// Turn a computed demand into the projection to stamp on a leaf.
-fn resolve(demand: Demand, schema: &crabgresql_storage_api::TableSchema) -> ColumnProjection {
+fn resolve(demand: Demand, schema: &TableSchema) -> ColumnProjection {
     match demand {
         None => ColumnProjection::All,
         Some(demand) => ColumnProjection::of(demand, schema),
