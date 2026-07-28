@@ -6519,7 +6519,9 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         ast::Expr::Floor { .. } => "floor".into(),
         // String special-syntax expressions are named after the function they
         // desugar to (`TRIM` → its ltrim/rtrim/btrim variant).
-        ast::Expr::Substring { .. } => "substring".into(),
+        ast::Expr::Substring { shorthand, .. } => {
+            if *shorthand { "substr".into() } else { "substring".into() }
+        }
         ast::Expr::Position { .. } => "position".into(),
         ast::Expr::Overlay { .. } => "overlay".into(),
         ast::Expr::Trim { trim_where, .. } => match trim_where {

@@ -2677,8 +2677,12 @@ impl<'a> Parser<'a> {
 
         // `SUBSTRING(x SIMILAR p ESCAPE e)` is the SQL spelling of
         // `SUBSTRING(x FROM p FOR e)`, so it fills the same two slots. `ESCAPE`
-        // is not optional in this form.
-        let similar = self.parse_keyword(Keyword::SIMILAR);
+        // is not optional in this form. PG's grammar gives the spelling to
+        // `SUBSTRING` alone, so under `SUBSTR` we leave `SIMILAR` unconsumed and
+        // let the closing paren report a syntax error: `substr` has no regex
+        // overload, and binding it would silently read the pattern and the
+        // escape as positional offsets.
+        let similar = !shorthand && self.parse_keyword(Keyword::SIMILAR);
         if similar {
             let pattern = self.parse_expr()?;
             self.expect_keyword(Keyword::ESCAPE)?;

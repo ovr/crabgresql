@@ -1218,6 +1218,54 @@ pub fn regexp_substr(
     })
 }
 
+/// Which match preference a `SIMILAR TO` segment must have as a whole.
+///
+/// PG expresses this by wrapping a segment in `{1,1}?` (prefer shortest) or
+/// `{1,1}` (prefer longest), which in its engine flips the preference of the
+/// *entire* wrapped subexpression. That cannot be ported literally: in the
+/// `regex` crate the `?` applies only to the repetition count — already fixed at
+/// one — so `^(?:.*){1,1}?(.*)$` still lets the inner `.*` run greedily and
+/// captures nothing. The preference has to be pushed down onto every quantifier
+/// the segment emits instead, which is what [`push_quantifier`] does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Greed {
+    /// Keep whatever the user wrote: the suffix segment, and a pattern with no
+    /// separators at all.
+    AsIs,
+    /// The segment before the first separator: prefer the shortest match, so
+    /// extraction starts as early as possible.
+    Shortest,
+    /// The extracted segment: prefer the longest match, overriding any lazy
+    /// marker the user wrote inside it.
+    Longest,
+}
+
+/// Emit one quantifier token under `greed`.
+///
+/// The user's own lazy marker is *consumed* before the segment's preference is
+/// applied, so at most one `?` is ever emitted per token. Appending blindly
+/// would build `a*??` from the user's `a*?` and `a*???` from `a*??`, and the
+/// regex crate is not a reliable backstop for that — it rejects `a**` but
+/// accepts both `.*+` and `.*?+`.
+fn push_quantifier(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    out: &mut String,
+    token: &str,
+    greed: Greed,
+) {
+    let lazy = chars.peek() == Some(&'?');
+    if lazy {
+        chars.next();
+    }
+    out.push_str(token);
+    match greed {
+        Greed::Shortest => out.push('?'),
+        Greed::Longest => {}
+        Greed::AsIs if lazy => out.push('?'),
+        Greed::AsIs => {}
+    }
+}
+
 /// Emit `c` as a regex literal, escaping it when it is a regex metacharacter
 /// (`regex::escape` covers the full set: `. + * ? ( ) | [ ] { } ^ $ \`).
 fn push_literal(out: &mut String, c: char) {
@@ -1248,7 +1296,7 @@ fn copy_bracket(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut Stri
 /// `{`, copy it through the closing `}` and return; otherwise emit a literal
 /// `{`, leaving the following characters for the caller. PG treats a `{` that
 /// does not open a bound as an ordinary character.
-fn push_brace(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
+fn push_brace(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String, greed: Greed) {
     let mut look = chars.clone();
     let mut bound = String::new();
     let digits = |it: &mut std::iter::Peekable<std::str::Chars>, buf: &mut String| {
@@ -1275,53 +1323,49 @@ fn push_brace(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String
     }
     if look.peek() == Some(&'}') {
         look.next();
-        out.push('{');
-        out.push_str(&bound);
-        out.push('}');
         *chars = look;
+        push_quantifier(chars, out, &format!("{{{bound}}}"), greed);
     } else {
-        push_literal(out, '{');
+        // Digits followed `{`, so PG is already parsing a bound and reports
+        // `invalid repetition count(s)` when it is never closed. Emitting the
+        // `{` unescaped hands the same verdict to the regex compiler, instead of
+        // quietly demoting a malformed bound to a literal.
+        out.push('{');
     }
 }
 
-/// Translate a `SIMILAR TO` pattern into an anchored POSIX regex string.
+/// Split a `SIMILAR TO` pattern at its *escape-double-quote separators*
+/// (`escape` + `"`), returning one, two or three segments of raw pattern text.
 ///
-/// `%` becomes `.*` and `_` becomes `.` (both match any character, including a
-/// newline, which the caller's `dot_all` option provides); the SQL-regex
-/// metacharacters `| * + ? ( )` and valid `{...}` bounds pass through; bracket
-/// expressions `[...]` are copied verbatim (see [`copy_bracket`]); every other
-/// character is emitted as a regex literal. The escape character (default `\`)
-/// makes the following character a literal. The result is wrapped in `^(?:...)$`
-/// so the match spans the whole string.
-///
-/// The one exception to "escape makes the next character literal" is the
-/// *escape-double-quote separator* `escape` + `"`: it delimits the portion of
-/// the match that `substring(text, text, text)` extracts, and is translated into
-/// the sole capture group of the result. `SIMILAR TO` itself just ignores that
-/// group, which is why `'x' SIMILAR TO 'x\"'` is true. So that the separator is
-/// always group 1, a parenthesised group written by the user becomes the
-/// non-capturing `(?:`.
-fn similar_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
-    let mut out = String::from("^(?:");
-    let mut separators = 0u32;
+/// The separators mark the part of the match that `substring(text, text, text)`
+/// extracts. They are structural: PG splits the pattern here and wraps each
+/// piece on its own, rather than dropping a paren in place, which is why an
+/// alternation never binds across a separator. A separator inside a bracket
+/// expression is an ordinary class member — PG agrees, so classes are skipped
+/// whole using the same [`take_bracket`] the translation uses, keeping the two
+/// scans in step.
+fn split_separators(pattern: &str, escape: Option<char>) -> Result<Vec<String>> {
+    let mut segments = vec![String::new()];
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         if Some(c) == escape {
             match chars.next() {
                 Some('"') => {
-                    separators += 1;
-                    match separators {
-                        1 => out.push('('),
-                        2 => out.push(')'),
-                        _ => {
-                            return Err(TextError::new(
-                                sqlstate::INVALID_USE_OF_ESCAPE_CHARACTER,
-                                "SQL regular expression may not contain more than two escape-double-quote separators",
-                            ));
-                        }
+                    if segments.len() == 3 {
+                        return Err(TextError::new(
+                            sqlstate::INVALID_USE_OF_ESCAPE_CHARACTER,
+                            "SQL regular expression may not contain more than two escape-double-quote separators",
+                        ));
                     }
+                    segments.push(String::new());
                 }
-                Some(next) => push_literal(&mut out, next),
+                // Not a separator: keep the escape sequence intact for the
+                // per-segment translation to interpret.
+                Some(next) => {
+                    let segment = segments.last_mut().expect("at least one segment");
+                    segment.push(c);
+                    segment.push(next);
+                }
                 None => {
                     return Err(TextError::new(
                         sqlstate::INVALID_ESCAPE_SEQUENCE,
@@ -1330,24 +1374,99 @@ fn similar_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
                 }
             }
         } else {
+            let segment = segments.last_mut().expect("at least one segment");
+            segment.push(c);
+            if c == '[' {
+                let (body, closed) = take_bracket(&mut chars);
+                segment.push_str(&body);
+                if closed {
+                    segment.push(']');
+                }
+            }
+        }
+    }
+    Ok(segments)
+}
+
+/// Translate one separator-free segment of a `SIMILAR TO` pattern into regex
+/// source, under the match preference `greed` (see [`Greed`]).
+///
+/// `%` becomes `.*` and `_` becomes `.` (both match any character, including a
+/// newline, which the caller's `dot_all` option provides); the SQL-regex
+/// metacharacters `| * + ? ( )` and valid `{...}` bounds pass through; bracket
+/// expressions `[...]` are copied verbatim (see [`copy_bracket`]); every other
+/// character is emitted as a regex literal. The escape character (default `\`)
+/// makes the following character a literal. A parenthesised group written by the
+/// user becomes the non-capturing `(?:`, so that the separator group added by
+/// [`similar_to_regex`] is always group 1.
+fn translate_segment(segment: &str, escape: Option<char>, greed: Greed) -> Result<String> {
+    let mut out = String::new();
+    let mut chars = segment.chars().peekable();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next) => push_literal(&mut out, next),
+                // `split_separators` has already rejected a trailing escape.
+                None => unreachable!("escape sequences arrive here intact"),
+            }
+        } else {
             match c {
-                '%' => out.push_str(".*"),
+                '%' => push_quantifier(&mut chars, &mut out, ".*", greed),
                 '_' => out.push('.'),
                 '(' => out.push_str("(?:"),
+                '*' | '+' | '?' => {
+                    let mut token = [0u8; 4];
+                    push_quantifier(&mut chars, &mut out, c.encode_utf8(&mut token), greed);
+                }
                 // SQL-regex metacharacters shared with POSIX regex.
-                '|' | '*' | '+' | '?' | ')' => out.push(c),
+                '|' | ')' => out.push(c),
                 '[' => copy_bracket(&mut chars, &mut out),
-                '{' => push_brace(&mut chars, &mut out),
+                '{' => push_brace(&mut chars, &mut out, greed),
                 other => push_literal(&mut out, other),
             }
         }
     }
+    Ok(out)
+}
+
+/// Translate a `SIMILAR TO` pattern into an anchored POSIX regex string.
+///
+/// The pattern is first split at its escape-double-quote separators (see
+/// [`split_separators`]), then each segment is translated separately and the
+/// pieces are assembled as `^(?:PRE)(MID)(?:POST)$`. PG builds the same shape,
+/// spelled `^(?:PRE){1,1}?(MID){1,1}(?:POST)$`; the wrappers there set each
+/// segment's match preference, which we reproduce with [`Greed`] because the
+/// `regex` crate has no equivalent construct.
+///
+/// `SIMILAR TO` itself ignores the capture group — it only asks whether the
+/// whole string matches, which is why `'x' SIMILAR TO 'x\"'` is true — so one
+/// translation serves both it and `substring(text, text, text)`.
+fn similar_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
+    let segments = split_separators(pattern, escape)?;
+    // With no separator at all there is nothing to extract, so the whole pattern
+    // keeps the preferences the user wrote.
+    let head = if segments.len() == 1 {
+        Greed::AsIs
+    } else {
+        Greed::Shortest
+    };
+
+    let mut out = String::from("^(?:");
+    out.push_str(&translate_segment(&segments[0], escape, head)?);
+    out.push(')');
     // A lone opening separator extracts everything from there to the end of the
-    // match, so close its group at the end of the pattern.
-    if separators == 1 {
+    // match, which falls out of translating the (absent) suffix as empty.
+    if let Some(extracted) = segments.get(1) {
+        out.push('(');
+        out.push_str(&translate_segment(extracted, escape, Greed::Longest)?);
         out.push(')');
     }
-    out.push_str(")$");
+    if let Some(suffix) = segments.get(2) {
+        out.push_str("(?:");
+        out.push_str(&translate_segment(suffix, escape, Greed::AsIs)?);
+        out.push(')');
+    }
+    out.push('$');
     Ok(out)
 }
 
@@ -2420,6 +2539,81 @@ mod tests {
         assert!(similar_to_match("x", "x#\"", esc)?);
         assert!(!similar_to_match("x\"", "x#\"", esc)?);
         assert!(similar_to_match("x", "#\"x#\"", esc)?);
+
+        Ok(())
+    }
+
+    /// The separators split the pattern into segments that are wrapped
+    /// independently, and the segment before the first one must prefer the
+    /// *shortest* match so extraction starts as early as possible. Every
+    /// expected value here was taken from PG 18.4.
+    #[test]
+    fn substring_sql_regex_segments() -> anyhow::Result<()> {
+        let esc = Some('#');
+        // A greedy prefix would swallow the capture and return "" or a suffix.
+        assert_eq!(
+            substring_similar("abc", "%#\"%#\"%", esc)?.as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            substring_similar("aaa", "%#\"a%#\"%", esc)?.as_deref(),
+            Some("aaa")
+        );
+        assert_eq!(
+            substring_similar("foobar", "%#\"o+#\"%", esc)?.as_deref(),
+            Some("oo")
+        );
+        assert_eq!(substring_similar("abc", "%#\"_#\"%", esc)?.as_deref(), Some("a"));
+        assert_eq!(substring_similar("abc", "%#\"%", esc)?.as_deref(), Some("abc"));
+        // The preference has to reach a bound and a user-written quantifier too.
+        assert_eq!(
+            substring_similar("aaa", "a{1,2}#\"%#\"%", esc)?.as_deref(),
+            Some("aa")
+        );
+        assert_eq!(
+            substring_similar("aaab", "a*#\"%#\"%", esc)?.as_deref(),
+            Some("aaab")
+        );
+        // Alternation must not bind across a separator boundary: emitting the
+        // separator in place would build `^(?:(a)|b)$`, which cannot match "ab".
+        assert_eq!(substring_similar("ab", "#\"a#\"|b", esc)?.as_deref(), Some("a"));
+        // The extracted segment prefers the longest match, overriding a lazy
+        // marker the user wrote inside it (PG's `{1,1}` wrapper).
+        assert_eq!(
+            substring_similar("aaa", "#\"a*?#\"%", esc)?.as_deref(),
+            Some("aaa")
+        );
+        // ...and a user marker in the prefix is consumed, never doubled into the
+        // `a*???` the regex compiler would choke on.
+        assert_eq!(substring_similar("ab", "%?#\"a#\"%", esc)?.as_deref(), Some("a"));
+        assert_eq!(
+            substring_similar("x\u{65e5}y", "%#\"\u{65e5}#\"%", esc)?.as_deref(),
+            Some("\u{65e5}")
+        );
+
+        // A quantifier straight after the closing separator has no operand, so
+        // the suffix `(?:{3})` is rejected like PG's `quantifier operand invalid`.
+        assert_eq!(
+            substring_similar("aaa", "#\"a#\"{3}", esc).unwrap_err().sqlstate,
+            "2201B"
+        );
+        assert_eq!(
+            similar_to_match("aaa", "#\"a#\"{3}", esc).unwrap_err().sqlstate,
+            "2201B"
+        );
+        // Digits after `{` commit PG to reading a bound, so leaving it unclosed
+        // is an error rather than a literal brace.
+        assert_eq!(
+            similar_to_match("a{1", "a{1", esc).unwrap_err().sqlstate,
+            "2201B"
+        );
+
+        // A separator inside a bracket expression is an ordinary class member.
+        assert!(similar_to_match("a\"b", "a[#\"]b", esc)?);
+        // Empty segments in every position.
+        assert_eq!(substring_similar("X", "X#\"#\"", esc)?.as_deref(), Some(""));
+        assert_eq!(substring_similar("", "#\"#\"", esc)?.as_deref(), Some(""));
+        assert_eq!(substring_similar("ab", "#\"%#\"", esc)?.as_deref(), Some("ab"));
 
         Ok(())
     }

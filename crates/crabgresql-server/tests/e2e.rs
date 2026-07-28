@@ -1374,13 +1374,83 @@ async fn substring_pattern_extraction() -> anyhow::Result<()> {
         "SQL regular expression may not contain more than two escape-double-quote separators"
     );
 
-    let err = client
-        .simple_query("SELECT substring('Thomas' similar 'o' escape '##')")
-        .await
-        .unwrap_err();
-    let db = err.as_db_error().expect("database error");
-    assert_eq!(db.code(), &SqlState::INVALID_ESCAPE_SEQUENCE);
-    assert_eq!(db.message(), "invalid escape string");
+    // The escape-length complaint is a HINT in PG, not a DETAIL, and every
+    // operator that takes an ESCAPE reports it the same way.
+    for query in [
+        "SELECT substring('Thomas' similar 'o' escape '##')",
+        "SELECT 'x' SIMILAR TO 'x' ESCAPE '##'",
+        "SELECT 'x' LIKE 'x' ESCAPE '##'",
+    ] {
+        let err = client.simple_query(query).await.unwrap_err();
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.code(), &SqlState::INVALID_ESCAPE_SEQUENCE, "{query}");
+        assert_eq!(db.message(), "invalid escape string", "{query}");
+        assert_eq!(
+            db.hint(),
+            Some("Escape string must be empty or one character."),
+            "{query}"
+        );
+        assert_eq!(db.detail(), None, "{query}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn substring_similar_is_rejected_under_the_substr_spelling() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    // PG's grammar gives the SIMILAR spelling to SUBSTRING only. Accepting it
+    // under SUBSTR would bind against `substr(text, int4, int4)` and read the
+    // pattern and the escape as offsets, so `substr('abcdef' SIMILAR '2' ESCAPE
+    // '3')` would quietly return 'bcd' instead of being rejected.
+    for query in [
+        "SELECT substr('abcdef' SIMILAR '2' ESCAPE '3')",
+        "SELECT substr('abcdef' SIMILAR '%#\"cd#\"%' ESCAPE '#')",
+    ] {
+        let err = client.simple_query(query).await.unwrap_err();
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.code(), &SqlState::SYNTAX_ERROR, "{query}");
+    }
+
+    // The SUBSTRING spelling still works, and each name labels its own column.
+    let messages = client
+        .simple_query(
+            "SELECT substring('abcdef' SIMILAR '%#\"cd#\"%' ESCAPE '#'), \
+             substr('abcdef', 2, 3)",
+        )
+        .await?;
+    let row = rows(&messages)[0];
+    let names: Vec<_> = row.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["substring", "substr"]);
+    assert_eq!(row.get(0), Some("cd"));
+    assert_eq!(row.get(1), Some("bcd"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn substring_similar_extracts_from_the_earliest_position() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // The segment before the first separator prefers the shortest match, so the
+    // canonical `%#"..."#%` idiom extracts from the earliest position rather
+    // than letting a greedy prefix eat the capture.
+    let messages = client
+        .simple_query(
+            "SELECT substring('abc' similar '%#\"%#\"%' escape '#') AS whole, \
+             substring('aaa' similar '%#\"a%#\"%' escape '#') AS runs, \
+             substring('foobar' similar '%#\"o+#\"%' escape '#') AS quantified, \
+             substring('ab' similar '#\"a#\"|b' escape '#') AS alternation",
+        )
+        .await?;
+    let row = rows(&messages)[0];
+    assert_eq!(row.get(0), Some("abc"));
+    assert_eq!(row.get(1), Some("aaa"));
+    assert_eq!(row.get(2), Some("oo"));
+    assert_eq!(row.get(3), Some("a"));
 
     Ok(())
 }

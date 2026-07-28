@@ -261,23 +261,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         ScalarFn::ToHexInt8 => return Ok(Value::Text(text::to_hex_i64(i8(&args[0])))),
         ScalarFn::Like | ScalarFn::ILike => {
             let ci = matches!(func, ScalarFn::ILike);
-            // No ESCAPE clause defaults to `\`; `ESCAPE ''` disables escaping.
-            let escape = match args.get(2) {
-                None => Some('\\'),
-                Some(v) => {
-                    let s = text(v);
-                    if s.chars().count() > 1 {
-                        return Err(err(
-                            sqlstate::INVALID_ESCAPE_SEQUENCE,
-                            "invalid escape string",
-                        )
-                        .with_detail(Some(
-                            "Escape string must be empty or one character.".to_string(),
-                        )));
-                    }
-                    s.chars().next()
-                }
-            };
+            let escape = escape_char(args.get(2))?;
             return text::like(text(&args[0]), text(&args[1]), escape, ci)
                 .map(Value::Bool)
                 .map_err(text_err);
