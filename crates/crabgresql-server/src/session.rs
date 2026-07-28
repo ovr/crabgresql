@@ -113,15 +113,15 @@ pub struct ActiveTxn {
     /// REPEATABLE READ (and above) freeze one snapshot for the whole block, set
     /// on the first statement; READ COMMITTED leaves this `None` and takes a
     /// fresh snapshot per statement.
-    pub snapshot: Option<Snapshot>,
-    /// Keeps the frozen snapshot counted in the manager's live-snapshot registry
-    /// for the whole block, not just the statement that took it — the statement's
-    /// own guard lives on its `TxnContext` and dies with it. A read-only block
-    /// allocates no XID and so does not move `Snapshot::xmin`, which makes this
-    /// registration the only thing holding reclamation off the versions the block
-    /// is still entitled to read. `None` under READ COMMITTED, which has no
-    /// block-lifetime snapshot to hold.
-    pub reservation: Option<SnapshotGuard>,
+    ///
+    /// The [`SnapshotGuard`] rides along so the block's snapshot stays counted in
+    /// the manager's live-snapshot registry for the block's whole life, not just
+    /// the statement that took it — the statement's own guard lives on its
+    /// `TxnContext` and dies with it. A read-only block allocates no XID and so
+    /// does not move `Snapshot::xmin`, which makes this registration the only
+    /// thing holding reclamation off the versions the block is still entitled to
+    /// read. Pairing the two in one field is what keeps them from drifting apart.
+    pub snapshot: Option<(Snapshot, SnapshotGuard)>,
     /// Command counter: each statement in the block runs at the next `cid`, so a
     /// later statement sees earlier ones' writes.
     pub cid: CommandId,
@@ -140,7 +140,6 @@ impl ActiveTxn {
             iso,
             read_only,
             snapshot: None,
-            reservation: None,
             cid: CommandId::FIRST,
             has_run_query: false,
         }

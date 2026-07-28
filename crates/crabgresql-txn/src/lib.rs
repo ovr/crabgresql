@@ -427,7 +427,8 @@ pub struct TransactionManager {
     /// Vends session-stable [`LockOwner`]s. Starts at 1 so no session ever gets
     /// [`LockOwner::INTERNAL`] (0).
     next_lock_owner: AtomicU64,
-    /// Snapshots still in use, as a multiset of their `xmax` keyed by count.
+    /// Snapshots still in use, as a multiset of their reclamation floor keyed by
+    /// count.
     ///
     /// A read-only transaction never allocates an XID, so it contributes nothing
     /// to [`Snapshot::xmin`] — yet it can still be reading rows that a later
@@ -440,13 +441,20 @@ pub struct TransactionManager {
 /// dropped, so reclamation cannot run past a reader that is still using it.
 pub struct SnapshotGuard {
     live: Arc<Mutex<BTreeMap<Xid, usize>>>,
-    xmax: Xid,
+    /// The snapshot's [`Snapshot::xmin`], which is the floor it pins.
+    ///
+    /// Deliberately not `xmax`: a snapshot can still see rows deleted by any XID
+    /// in its `xip` list, and the smallest of those is `xmin` by definition.
+    /// Pinning `xmax` would leave every `xip` member above the horizon, so a
+    /// concurrent vacuum would reclaim exactly the versions this reader is
+    /// entitled to keep reading.
+    floor: Xid,
 }
 
 impl std::fmt::Debug for SnapshotGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotGuard")
-            .field("xmax", &self.xmax)
+            .field("floor", &self.floor)
             .finish_non_exhaustive()
     }
 }
@@ -457,10 +465,10 @@ impl Drop for SnapshotGuard {
             .live
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        if let Some(count) = live.get_mut(&self.xmax) {
+        if let Some(count) = live.get_mut(&self.floor) {
             *count -= 1;
             if *count == 0 {
-                live.remove(&self.xmax);
+                live.remove(&self.floor);
             }
         }
     }
@@ -513,23 +521,54 @@ impl TransactionManager {
         self.xids.allocate()
     }
 
-    /// Capture the current in-flight set.
-    /// Register `snapshot` as in use until the returned guard drops.
+    /// Register `snapshot` as in use until the returned guard drops, pinning
+    /// [`TransactionManager::reclaim_horizon`] at its [`Snapshot::xmin`].
     ///
     /// The server holds one per open transaction and one per statement, so a
     /// read-only `REPEATABLE READ` session — which allocates no XID and so does
-    /// not appear in any snapshot's in-flight set — still holds back
-    /// [`TransactionManager::reclaim_horizon`].
+    /// not appear in any snapshot's in-flight set — still holds back the horizon.
+    ///
+    /// Prefer [`Self::freeze_snapshot`] when capturing a fresh snapshot: this
+    /// entry point exists for a snapshot that already exists, and leaves the
+    /// caller responsible for the gap between capture and registration.
     pub fn register_snapshot(&self, snapshot: &Snapshot) -> SnapshotGuard {
-        *self
+        let mut live = self
             .live_snapshots
             .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"))
-            .entry(snapshot.xmax)
-            .or_insert(0) += 1;
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        Self::register_locked(&mut live, Arc::clone(&self.live_snapshots), snapshot)
+    }
+
+    /// Take a snapshot and register it in one step.
+    ///
+    /// The two-step form has a window: between `snapshot()` and
+    /// `register_snapshot`, the new reader is in neither the in-flight set (it
+    /// holds no XID) nor the registry, so a concurrent [`Self::reclaim_horizon`]
+    /// can step over it and reclaim versions the snapshot was just handed the
+    /// right to read. Holding the registry lock across the capture closes it.
+    pub fn freeze_snapshot(&self) -> (Snapshot, SnapshotGuard) {
+        let mut live = self
+            .live_snapshots
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        // Lock order is live_snapshots -> the XID set, and nothing takes them the
+        // other way round; `reclaim_horizon` releases the registry before it reads
+        // the in-flight set.
+        let snapshot = self.xids.take_snapshot();
+        let guard = Self::register_locked(&mut live, Arc::clone(&self.live_snapshots), &snapshot);
+        (snapshot, guard)
+    }
+
+    /// Count `snapshot` into an already-locked registry.
+    fn register_locked(
+        live: &mut BTreeMap<Xid, usize>,
+        handle: Arc<Mutex<BTreeMap<Xid, usize>>>,
+        snapshot: &Snapshot,
+    ) -> SnapshotGuard {
+        *live.entry(snapshot.xmin).or_insert(0) += 1;
         SnapshotGuard {
-            live: Arc::clone(&self.live_snapshots),
-            xmax: snapshot.xmax,
+            live: handle,
+            floor: snapshot.xmin,
         }
     }
 
@@ -539,7 +578,7 @@ impl TransactionManager {
     /// This is the floor for reclaiming versions, and it is deliberately NOT just
     /// `snapshot().xmin`: that only accounts for transactions holding an XID, and
     /// a read-only transaction holds a snapshot without one. Reclaiming above a
-    /// live snapshot's `xmax` would delete rows out from under a `REPEATABLE READ`
+    /// live snapshot's floor would delete rows out from under a `REPEATABLE READ`
     /// reader mid-transaction.
     pub fn reclaim_horizon(&self) -> Xid {
         let oldest_reader = self
@@ -626,7 +665,9 @@ impl TransactionManager {
 
     /// Build a context taking a fresh snapshot now (READ COMMITTED default).
     pub fn context(&self, xid: Xid, cid: CommandId) -> TxnContext {
-        self.context_with(xid, cid, self.snapshot(), IsolationLevel::ReadCommitted)
+        // Capture and register together, so no vacuum can slip between the two.
+        let (snapshot, guard) = self.freeze_snapshot();
+        self.context_from(xid, cid, snapshot, guard, IsolationLevel::ReadCommitted)
     }
 
     /// Build a context from an explicit snapshot and isolation level — for
@@ -638,7 +679,19 @@ impl TransactionManager {
         snapshot: Snapshot,
         iso: IsolationLevel,
     ) -> TxnContext {
-        let reservation = Arc::new(self.register_snapshot(&snapshot));
+        let guard = self.register_snapshot(&snapshot);
+        self.context_from(xid, cid, snapshot, guard, iso)
+    }
+
+    fn context_from(
+        &self,
+        xid: Xid,
+        cid: CommandId,
+        snapshot: Snapshot,
+        guard: SnapshotGuard,
+        iso: IsolationLevel,
+    ) -> TxnContext {
+        let reservation = Arc::new(guard);
         TxnContext {
             xid,
             cid,
@@ -687,8 +740,7 @@ mod tests {
     #[test]
     fn a_registered_read_only_snapshot_holds_back_the_reclaim_horizon() {
         let tm = TransactionManager::new();
-        let reader = tm.snapshot();
-        let guard = tm.register_snapshot(&reader);
+        let (reader, guard) = tm.freeze_snapshot();
 
         // Write traffic that starts and finishes entirely after the reader. With
         // nothing left in flight the running xmin is free to run past it.
@@ -702,7 +754,7 @@ mod tests {
 
         assert_eq!(
             tm.reclaim_horizon(),
-            reader.xmax,
+            reader.xmin,
             "the live reader must pin the horizon at its own snapshot"
         );
 
@@ -712,6 +764,35 @@ mod tests {
             tm.reclaim_horizon(),
             tm.snapshot().xmin,
             "a released snapshot must stop holding back reclamation"
+        );
+    }
+
+    /// A reader pins its `xmin`, not its `xmax`. The two coincide only when the
+    /// reader's `xip` list is empty, so a writer already in flight at capture time
+    /// is what separates a correct floor from one that reclaims rows the reader is
+    /// still entitled to see.
+    #[test]
+    fn a_reader_pins_below_a_writer_that_was_in_flight_when_it_captured() {
+        let tm = TransactionManager::new();
+
+        // The deleter is ALREADY running when the reader captures its snapshot, so
+        // it lands in `xip` and its delete does not apply to this reader.
+        let deleter = tm.allocate_xid();
+        let (reader, _guard) = tm.freeze_snapshot();
+        assert!(
+            reader.in_progress(deleter),
+            "the premise: the reader must still see rows this deleter removed"
+        );
+
+        tm.commit(deleter)
+            .expect("a manager with no sink cannot fail to commit");
+
+        // Storage reclaims a version when `xmax < horizon && committed`, so a
+        // horizon above `deleter` would free rows the reader can still read.
+        let horizon = tm.reclaim_horizon();
+        assert!(
+            deleter >= horizon,
+            "horizon {horizon:?} ran past deleter {deleter:?}, which the reader still sees"
         );
     }
 

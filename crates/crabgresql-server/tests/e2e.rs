@@ -5300,19 +5300,63 @@ async fn vacuum_does_not_reclaim_below_a_read_only_repeatable_read_reader()
     );
 
     // Holding the horizon back only delays reclamation: once the reader is done,
-    // the delete is final for everyone.
+    // the delete is final, and a vacuum with nothing to hold it back must still
+    // leave the live rows alone.
     reader.simple_query("COMMIT").await?;
-    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
-    assert_eq!(
-        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
-        vec![Some("1"), Some("3")]
-    );
     vacuumer.simple_query("VACUUM t").await?;
     let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
     assert_eq!(
         rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
         vec![Some("1"), Some("3")],
-        "with no reader holding it back, the version is reclaimed for good"
+        "the delete is final once the reader is gone, and live rows survive"
+    );
+    Ok(())
+}
+
+/// The same guarantee when the deleter was still IN FLIGHT as the reader froze
+/// its snapshot, which is the case that separates a correct reclamation floor
+/// from one that only looks correct.
+///
+/// A reader can still see rows deleted by any XID in its `xip` list, and the
+/// smallest of those is its `xmin`. A floor taken from the snapshot's `xmax`
+/// instead leaves every `xip` member above the horizon, so the vacuum reclaims
+/// precisely the versions the reader is entitled to keep reading. The two agree
+/// whenever `xip` is empty, so only a concurrent writer tells them apart.
+#[tokio::test]
+async fn vacuum_respects_a_reader_that_captured_around_an_in_flight_deleter()
+-> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let reader = connect(port).await;
+    let deleter = connect(port).await;
+    let vacuumer = connect(port).await;
+    deleter.simple_query("CREATE TABLE t (id int4)").await?;
+    deleter
+        .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+
+    // Open the delete but do NOT commit: its XID is in flight, so it lands in the
+    // reader's `xip` and its delete does not apply to the reader.
+    deleter.simple_query("BEGIN").await?;
+    deleter.simple_query("DELETE FROM t WHERE id = 2").await?;
+
+    reader
+        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3")],
+        "an uncommitted delete is invisible to the reader"
+    );
+
+    deleter.simple_query("COMMIT").await?;
+    vacuumer.simple_query("VACUUM t").await?;
+
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3")],
+        "the horizon must stay below a deleter the reader still has in flight"
     );
     Ok(())
 }
