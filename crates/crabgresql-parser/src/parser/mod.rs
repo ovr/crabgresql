@@ -17417,6 +17417,28 @@ mod tests {
 
     use super::*;
 
+    /// `SIMILAR` is only an infix operator when `TO` follows it; a bare one
+    /// belongs to `SUBSTRING(x SIMILAR p ESCAPE e)`. The lookahead guard that
+    /// arranges this sits in the precedence table, where an off-by-one silently
+    /// stops `NOT SIMILAR TO` from parsing at all, so pin both spellings.
+    #[test]
+    fn parse_similar_to_and_substring_similar_round_trip() {
+        let dialects = all_dialects();
+        dialects.verified_stmt("SELECT 'a' SIMILAR TO 'b'");
+        dialects.verified_stmt("SELECT 'a' NOT SIMILAR TO 'b'");
+        dialects.verified_stmt("SELECT 'a' SIMILAR TO 'b' ESCAPE '#'");
+        dialects.verified_stmt("SELECT 'a' NOT SIMILAR TO 'b' ESCAPE '#'");
+        dialects.verified_stmt("SELECT SUBSTRING('a' SIMILAR 'b' ESCAPE '#')");
+        // The FROM/FOR spelling means the same call and keeps its own rendering.
+        dialects.verified_stmt("SELECT SUBSTRING('a' FROM 'b' FOR '#')");
+        // PG's grammar gives the SIMILAR spelling to SUBSTRING alone.
+        assert!(Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "SELECT SUBSTR('a' SIMILAR 'b' ESCAPE '#')"
+        )
+        .is_err());
+    }
+
     #[test]
     fn parse_create_cast_round_trips() {
         let dialects = all_dialects();

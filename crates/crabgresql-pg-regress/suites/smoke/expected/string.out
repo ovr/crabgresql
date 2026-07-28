@@ -214,9 +214,33 @@ SELECT substring('Thomas' similar '%#"o_a#"_' escape '#') AS q1,
  oma | oma | Thomas | Y  | b
 (1 row)
 
--- (the "more than two separators" and "invalid escape string" errors are not
--- exercised here: PG raises them from inside a SQL-language function, so psql
--- prints a CONTEXT line this server has no equivalent for)
+-- the pattern is split at the separators, so the part before the first one
+-- matches as little as possible and an alternation cannot bind across them
+SELECT substring('abc' similar '%#"%#"%' escape '#') AS g1,
+       substring('aaa' similar '%#"a%#"%' escape '#') AS g2,
+       substring('foobar' similar '%#"o+#"%' escape '#') AS g3,
+       substring('ab' similar '#"a#"|b' escape '#') AS g4,
+       substring('aaab' similar 'a*#"%#"%' escape '#') AS g5;
+ g1  | g2  | g3 | g4 |  g5  
+-----+-----+----+----+------
+ abc | aaa | oo | a  | aaab
+(1 row)
+
+-- a trailing escape character has nothing left to escape and is dropped
+SELECT 'abc' SIMILAR TO 'abc#' ESCAPE '#' AS t1, 'ab' SIMILAR TO 'abc#' ESCAPE '#' AS t2;
+ t1 | t2 
+----+----
+ t  | f
+(1 row)
+
+-- at most two separators, and the escape string is at most one character
+-- (spelled through the operator: the substring() spelling reports the same
+-- errors from inside a SQL-language function, which adds a psql CONTEXT line)
+SELECT 'x' SIMILAR TO 'a#"b#"c#"d' ESCAPE '#';
+ERROR:  SQL regular expression may not contain more than two escape-double-quote separators
+SELECT 'x' SIMILAR TO 'y' ESCAPE '##';
+ERROR:  invalid escape string
+HINT:  Escape string must be empty or one character.
 -- regexp_replace: first match only, then every match with the g flag
 SELECT regexp_replace('a1b2', '[0-9]', 'X') AS rr1,
        regexp_replace('a1b2', '[0-9]', 'X', 'g') AS rr2,

@@ -931,6 +931,64 @@ const OID: PgType = PgType::Oid;
 const REGCLASS: PgType = PgType::Reg(RegKind::Class);
 const NAME: PgType = PgType::Name;
 
+/// How many leading entries of [`SUBSTRING_SIGS`] are the regex-extraction
+/// forms. `substr` is the same list without them.
+const SUBSTRING_REGEX_SIGS: usize = 2;
+
+/// `substring`'s overloads, regex forms first. `substr` is the tail of this
+/// list, which is what gives the two names PG's different answers for an untyped
+/// literal: `substring('abcdef', '2')` is NULL (the literal is a pattern) while
+/// `substr('abcdef', '2')` is `bcdef` (it is an offset).
+///
+/// The order is load-bearing, not cosmetic. `coerce_for_arg` resolves a
+/// non-parameter `Binding::Unknown` even under `exact_only`, so an untyped
+/// literal is an exact match for *both* the text and the int4 form and the tie
+/// is broken by position in `resolve_call`'s first pass. Keep the regex forms
+/// leading, and keep the two names sharing one list so a new positional overload
+/// cannot reach one spelling but not the other.
+const SUBSTRING_SIGS: &[Signature] = &[
+    Signature {
+        func: ScalarFn::SubstringRegex,
+        args: &[TEXT, TEXT],
+        ret: TEXT,
+    },
+    Signature {
+        func: ScalarFn::SubstringSimilar,
+        args: &[TEXT, TEXT, TEXT],
+        ret: TEXT,
+    },
+    Signature {
+        func: ScalarFn::Substr,
+        args: &[TEXT, I4],
+        ret: TEXT,
+    },
+    Signature {
+        func: ScalarFn::Substr,
+        args: &[TEXT, I4, I4],
+        ret: TEXT,
+    },
+    Signature {
+        func: ScalarFn::SubstrBit,
+        args: &[BIT, I4],
+        ret: BIT,
+    },
+    Signature {
+        func: ScalarFn::SubstrBit,
+        args: &[BIT, I4, I4],
+        ret: BIT,
+    },
+    Signature {
+        func: ScalarFn::SubstrBit,
+        args: &[VARBIT, I4],
+        ret: VARBIT,
+    },
+    Signature {
+        func: ScalarFn::SubstrBit,
+        args: &[VARBIT, I4, I4],
+        ret: VARBIT,
+    },
+];
+
 /// The overloads for `name` (already lowercased). Most math functions take one
 /// float8 and return float8.
 fn lookup(name: &str) -> &'static [Signature] {
@@ -1492,86 +1550,8 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[TEXT],
             ret: TEXT,
         }],
-        // `substring` additionally has the two regex-extraction forms, which
-        // `substr` does not: `substr('abcdef', '2')` is `bcdef` (the untyped
-        // literal becomes an offset) while `substring('abcdef', '2')` is NULL
-        // (it becomes a pattern). Listing the text forms first is what produces
-        // that split — an untyped argument matches neither exactly, so
-        // `resolve_call`'s second pass breaks the tie by list order.
-        "substring" => &[
-            Signature {
-                func: ScalarFn::SubstringRegex,
-                args: &[TEXT, TEXT],
-                ret: TEXT,
-            },
-            Signature {
-                func: ScalarFn::SubstringSimilar,
-                args: &[TEXT, TEXT, TEXT],
-                ret: TEXT,
-            },
-            Signature {
-                func: ScalarFn::Substr,
-                args: &[TEXT, I4],
-                ret: TEXT,
-            },
-            Signature {
-                func: ScalarFn::Substr,
-                args: &[TEXT, I4, I4],
-                ret: TEXT,
-            },
-            Signature {
-                func: ScalarFn::SubstrBit,
-                args: &[BIT, I4],
-                ret: BIT,
-            },
-            Signature {
-                func: ScalarFn::SubstrBit,
-                args: &[BIT, I4, I4],
-                ret: BIT,
-            },
-            Signature {
-                func: ScalarFn::SubstrBit,
-                args: &[VARBIT, I4],
-                ret: VARBIT,
-            },
-            Signature {
-                func: ScalarFn::SubstrBit,
-                args: &[VARBIT, I4, I4],
-                ret: VARBIT,
-            },
-        ],
-        "substr" => &[
-            Signature {
-                func: ScalarFn::Substr,
-                args: &[TEXT, I4],
-                ret: TEXT,
-            },
-            Signature {
-                func: ScalarFn::Substr,
-                args: &[TEXT, I4, I4],
-                ret: TEXT,
-            },
-            Signature {
-                func: ScalarFn::SubstrBit,
-                args: &[BIT, I4],
-                ret: BIT,
-            },
-            Signature {
-                func: ScalarFn::SubstrBit,
-                args: &[BIT, I4, I4],
-                ret: BIT,
-            },
-            Signature {
-                func: ScalarFn::SubstrBit,
-                args: &[VARBIT, I4],
-                ret: VARBIT,
-            },
-            Signature {
-                func: ScalarFn::SubstrBit,
-                args: &[VARBIT, I4, I4],
-                ret: VARBIT,
-            },
-        ],
+        "substring" => SUBSTRING_SIGS,
+        "substr" => &SUBSTRING_SIGS[SUBSTRING_REGEX_SIGS..],
         "strpos" => &[
             Signature {
                 func: ScalarFn::StrPos,

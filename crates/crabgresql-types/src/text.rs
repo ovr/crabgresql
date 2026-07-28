@@ -932,9 +932,13 @@ pub fn similar_to_match(s: &str, pattern: &str, escape: Option<char>) -> Result<
 /// the first capture group when the pattern has one, otherwise the whole match.
 /// A group that did not participate yields NULL rather than the empty string.
 fn extracted(re: &regex::Regex, s: &str) -> Option<String> {
-    let caps = re.captures(s)?;
-    let group = usize::from(re.captures_len() > 1);
-    caps.get(group).map(|m| m.as_str().to_string())
+    // Asking for captures allocates a slot buffer per call, so a pattern with no
+    // subexpression — the common `substring(col from '...')` — takes `find`
+    // instead, like `regexp_count` and `regexp_like` next door.
+    if re.captures_len() == 1 {
+        return re.find(s).map(|m| m.as_str().to_string());
+    }
+    re.captures(s)?.get(1).map(|m| m.as_str().to_string())
 }
 
 /// `substring(string, pattern)`: POSIX-regex extraction. Returns the pattern's

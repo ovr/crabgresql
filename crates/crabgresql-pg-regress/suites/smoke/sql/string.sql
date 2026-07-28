@@ -92,9 +92,20 @@ SELECT substring('Thomas' similar '%#"o_a#"_' escape '#') AS q1,
        substring('Thomas' similar '%o_a_' escape '#') AS q3,
        substring('XY' similar 'X#"Y' escape '#') AS q4,
        substring('abc' similar '(a)#"b#"c' escape '#') AS q5;
--- (the "more than two separators" and "invalid escape string" errors are not
--- exercised here: PG raises them from inside a SQL-language function, so psql
--- prints a CONTEXT line this server has no equivalent for)
+-- the pattern is split at the separators, so the part before the first one
+-- matches as little as possible and an alternation cannot bind across them
+SELECT substring('abc' similar '%#"%#"%' escape '#') AS g1,
+       substring('aaa' similar '%#"a%#"%' escape '#') AS g2,
+       substring('foobar' similar '%#"o+#"%' escape '#') AS g3,
+       substring('ab' similar '#"a#"|b' escape '#') AS g4,
+       substring('aaab' similar 'a*#"%#"%' escape '#') AS g5;
+-- a trailing escape character has nothing left to escape and is dropped
+SELECT 'abc' SIMILAR TO 'abc#' ESCAPE '#' AS t1, 'ab' SIMILAR TO 'abc#' ESCAPE '#' AS t2;
+-- at most two separators, and the escape string is at most one character
+-- (spelled through the operator: the substring() spelling reports the same
+-- errors from inside a SQL-language function, which adds a psql CONTEXT line)
+SELECT 'x' SIMILAR TO 'a#"b#"c#"d' ESCAPE '#';
+SELECT 'x' SIMILAR TO 'y' ESCAPE '##';
 
 -- regexp_replace: first match only, then every match with the g flag
 SELECT regexp_replace('a1b2', '[0-9]', 'X') AS rr1,
