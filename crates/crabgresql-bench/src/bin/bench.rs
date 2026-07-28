@@ -34,7 +34,8 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         data: Option<PathBuf>,
 
-        /// Load only the first N rows of each table's data
+        /// Load only the first N rows; single-table suites only, since slicing
+        /// each table of a joined schema independently dangles its keys
         #[arg(long, value_name = "N")]
         rows: Option<u64>,
 
@@ -58,11 +59,11 @@ enum Command {
         #[arg(long, value_name = "SECONDS", default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
 
-        /// Access method for the benchmark table (parquet, buffer, …)
+        /// Access method for the benchmark tables (parquet, buffer, …)
         #[arg(long, value_name = "AM")]
         using: Option<String>,
 
-        /// Drop and reload the table even if it is already populated
+        /// Drop and reload every table of the suite, even if already loaded
         #[arg(long)]
         reload: bool,
 

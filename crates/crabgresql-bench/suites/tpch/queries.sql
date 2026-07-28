@@ -103,14 +103,16 @@ select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice*(1-l_dis
 from lineitem, part
 where l_partkey = p_partkey and l_shipdate >= date '1995-09-01'
  and l_shipdate < date '1995-09-01' + interval '1' month;
--- Q15
+-- Q15 setup
 create view revenue0 (supplier_no, total_revenue) as
  select l_suppkey, sum(l_extendedprice * (1 - l_discount)) from lineitem
  where l_shipdate >= date '1996-01-01' and l_shipdate < date '1996-01-01' + interval '3' month
  group by l_suppkey;
+-- Q15
 select s_suppkey, s_name, s_address, s_phone, total_revenue from supplier, revenue0
 where s_suppkey = supplier_no and total_revenue = (select max(total_revenue) from revenue0)
 order by s_suppkey;
+-- Q15 teardown
 drop view revenue0;
 -- Q16
 select p_brand, p_type, p_size, count(distinct ps_suppkey) as supplier_cnt

@@ -121,6 +121,6 @@ table doubles as a gap list. See
 $ cargo run --release -p crabgresql-bench -- run clickbench --data hits.tsv
 43 of 43 queries succeeded, 13.228s total (best runs)
 
-$ cargo run --release -p crabgresql-bench -- run tpch --data tpch/
-21 of 22 queries succeeded, 40.450s total (best runs)
+$ cargo run --release -p crabgresql-bench -- run tpch --data tpch/ --timeout 180
+22 of 22 queries succeeded, 123.329s total (best runs)  # not a TPC-H result
 ```

@@ -47,6 +47,15 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// One line naming what happened, for the progress log.
+    pub fn summary(&self) -> String {
+        match self {
+            Outcome::Ok { .. } => "ok".to_string(),
+            Outcome::Failed(message) | Outcome::Disconnected(message) => one_line(message),
+            Outcome::TimedOut => "timed out".to_string(),
+        }
+    }
+
     fn seconds(&self) -> Option<f64> {
         match self {
             Outcome::Ok { elapsed, .. } => Some(elapsed.as_secs_f64()),
@@ -175,7 +184,9 @@ impl SuiteRun {
             let _ = writeln!(out, "  {}", query.status());
         }
 
-        let total: f64 = self.queries.iter().filter_map(QueryRun::best).sum();
+        // `Sum for f64` starts from -0.0, so a run where nothing succeeded
+        // would otherwise print "-0.000s total".
+        let total: f64 = self.queries.iter().filter_map(QueryRun::best).sum::<f64>() + 0.0;
         let _ = writeln!(
             out,
             "\n{} of {} queries succeeded, {total:.3}s total (best runs)",
@@ -186,9 +197,14 @@ impl SuiteRun {
     }
 
     /// `{"system": …, "result": [[…], …]}` — the shape ClickBench's own
-    /// `results/*.json` files use, so a run can be pasted straight in. The
+    /// `results/*.json` files use, so a full run can be pasted straight in. The
     /// per-query failure text is kept alongside it, so the artifact carries
     /// the gap list rather than an undifferentiated row of `null`s.
+    ///
+    /// `result` is positional, which is only self-describing when every query
+    /// ran and the numbering is dense. `--query` filtering and `Numbered`
+    /// suites break both assumptions, so `query_numbers` names the query each
+    /// slot belongs to — without it, a filtered run reads as Q1..Qn.
     pub fn json(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "{{");
@@ -231,6 +247,15 @@ impl SuiteRun {
             );
         }
         let _ = writeln!(out, "  }},");
+        let _ = writeln!(
+            out,
+            "  \"query_numbers\": [{}],",
+            self.queries
+                .iter()
+                .map(|q| q.number.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         let _ = writeln!(out, "  \"result\": [");
         for (i, query) in self.queries.iter().enumerate() {
             let runs: Vec<String> = query

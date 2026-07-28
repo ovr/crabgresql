@@ -13,7 +13,10 @@ pub const CLICKBENCH: Suite = Suite {
     schema_sql: include_str!("../suites/clickbench/create.sql"),
     queries_sql: include_str!("../suites/clickbench/queries.sql"),
     queries_format: QueryFormat::OnePerLine,
-    dataset_url: "https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz",
+    dataset_hint: "  curl -sS https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz \\\n\
+                   \x20   | gzip -dc | head -n 1000000 > hits.tsv\n\
+                   then re-run with --data hits.tsv (uncompressed — the loader \
+                   does not decompress).",
     format: DataFormat::Tsv,
 };
 
@@ -22,8 +25,8 @@ pub const CLICKBENCH: Suite = Suite {
 ///
 /// The queries are the specification's own text — implicit comma joins, no
 /// hand-rewriting into `JOIN … ON`. Rewriting them would measure the rewrite
-/// rather than the planner, and a query the planner cannot yet handle is
-/// exactly what this harness exists to surface.
+/// rather than the planner, and a query the planner handles badly is exactly
+/// what this harness exists to surface.
 pub const TPCH: Suite = Suite {
     name: "tpch",
     description: "TPC-H: 22 decision-support queries over 8 tables",
@@ -34,10 +37,14 @@ pub const TPCH: Suite = Suite {
     schema_sql: include_str!("../suites/tpch/create.sql"),
     queries_sql: include_str!("../suites/tpch/queries.sql"),
     queries_format: QueryFormat::Numbered,
-    // No public download: the data is generated. See this crate's README for
-    // the DuckDB recipe.
-    dataset_url: "generate it with DuckDB's `tpch` extension — see \
-                  crates/crabgresql-bench/README.md",
+    // No public download: TPC-H data is generated.
+    dataset_hint: "  duckdb tpch.duckdb -c \"INSTALL tpch; LOAD tpch; CALL dbgen(sf=0.01);\"\n\
+                   \x20 mkdir -p tpch\n\
+                   \x20 for t in region nation part supplier partsupp customer orders lineitem; do\n\
+                   \x20     duckdb tpch.duckdb -c \\\n\
+                   \x20       \"COPY $t TO 'tpch/$t.tbl' (FORMAT csv, DELIMITER '|', HEADER false);\"\n\
+                   \x20 done\n\
+                   then re-run with --data tpch/ (the directory, not a file).",
     format: DataFormat::Psv,
 };
 
