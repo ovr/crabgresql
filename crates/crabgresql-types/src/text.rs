@@ -940,6 +940,14 @@ fn extracted(re: &regex::Regex, s: &str) -> Option<String> {
 /// `substring(string, pattern)`: POSIX-regex extraction. Returns the pattern's
 /// first parenthesised subexpression, or the whole match when it has none, and
 /// `None` (SQL NULL) when the pattern does not match at all.
+///
+/// **Documented divergence.** PG's engine is POSIX leftmost-*longest* while the
+/// `regex` crate is Perl leftmost-*first*, so an alternation whose later branch
+/// is longer extracts less than PG does: `substring('foobar' from 'o|oo')` is
+/// `oo` in PG and `o` here. The whole `~`/`regexp_*` family shares the trait,
+/// but this is the first function where it changes a returned *value* rather
+/// than a boolean. Fixing it means replacing the engine, not the translation —
+/// reordering a user's alternation branches is not sound.
 pub fn substring_regex(s: &str, pattern: &str) -> Result<Option<String>> {
     with_cached(pattern, PatternKind::Regex(ReOpts::default()), |re| {
         extracted(re, s)
@@ -1366,12 +1374,9 @@ fn split_separators(pattern: &str, escape: Option<char>) -> Result<Vec<String>> 
                     segment.push(c);
                     segment.push(next);
                 }
-                None => {
-                    return Err(TextError::new(
-                        sqlstate::INVALID_ESCAPE_SEQUENCE,
-                        "invalid SQL regular expression: escape character must not be the last character",
-                    ));
-                }
+                // PG silently drops an escape character with nothing left to
+                // escape: `similar_to_escape('abc\', '\')` is `^(?:abc)$`.
+                None => break,
             }
         } else {
             let segment = segments.last_mut().expect("at least one segment");
@@ -2430,13 +2435,10 @@ mod tests {
         assert!(similar_to_match("a|b", "a\\|b", Some('\\'))?);
         assert!(!similar_to_match("a", "a\\|b", Some('\\'))?);
         assert!(similar_to_match("(", "\\(", Some('\\'))?);
-        // A trailing bare escape is an error.
-        assert_eq!(
-            similar_to_match("abc", "abc\\", Some('\\'))
-                .unwrap_err()
-                .sqlstate,
-            "22025"
-        );
+        // A trailing bare escape has nothing left to escape, and PG drops it
+        // rather than complaining.
+        assert!(similar_to_match("abc", "abc\\", Some('\\'))?);
+        assert!(!similar_to_match("ab", "abc\\", Some('\\'))?);
 
         Ok(())
     }
