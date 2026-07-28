@@ -2660,7 +2660,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse `SUBSTRING`/`SUBSTR` expressions: `SUBSTRING(expr FROM start FOR length)` or `SUBSTR(expr, start, length)`.
+    /// Parse `SUBSTRING`/`SUBSTR` expressions: `SUBSTRING(expr FROM start FOR length)`,
+    /// `SUBSTR(expr, start, length)`, or the SQL-regex form
+    /// `SUBSTRING(expr SIMILAR pattern ESCAPE escape)`.
     pub fn parse_substring(&mut self) -> Result<Expr, ParserError> {
         let shorthand = match self.expect_one_of_keywords(&[Keyword::SUBSTR, Keyword::SUBSTRING])? {
             Keyword::SUBSTR => true,
@@ -2672,6 +2674,30 @@ impl<'a> Parser<'a> {
         };
         self.expect_token(&Token::LParen)?;
         let expr = self.parse_expr()?;
+
+        // `SUBSTRING(x SIMILAR p ESCAPE e)` is the SQL spelling of
+        // `SUBSTRING(x FROM p FOR e)`, so it fills the same two slots. `ESCAPE`
+        // is not optional in this form. PG's grammar gives the spelling to
+        // `SUBSTRING` alone, so under `SUBSTR` we leave `SIMILAR` unconsumed and
+        // let the closing paren report a syntax error: `substr` has no regex
+        // overload, and binding it would silently read the pattern and the
+        // escape as positional offsets.
+        let similar = !shorthand && self.parse_keyword(Keyword::SIMILAR);
+        if similar {
+            let pattern = self.parse_expr()?;
+            self.expect_keyword(Keyword::ESCAPE)?;
+            let escape = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            return Ok(Expr::Substring {
+                expr: Box::new(expr),
+                substring_from: Some(Box::new(pattern)),
+                substring_for: Some(Box::new(escape)),
+                similar: true,
+                special: false,
+                shorthand,
+            });
+        }
+
         let mut from_expr = None;
         let special = self.consume_token(&Token::Comma);
         if special || self.parse_keyword(Keyword::FROM) {
@@ -2688,6 +2714,7 @@ impl<'a> Parser<'a> {
             expr: Box::new(expr),
             substring_from: from_expr.map(Box::new),
             substring_for: to_expr.map(Box::new),
+            similar: false,
             special,
             shorthand,
         })
@@ -4299,6 +4326,13 @@ impl<'a> Parser<'a> {
     /// Returns true if the current token matches the expected keyword.
     pub fn peek_keyword(&self, expected: Keyword) -> bool {
         matches!(&self.peek_token_ref().token, Token::Word(w) if expected == w.keyword)
+    }
+
+    #[must_use]
+    /// Check whether the token `n` ahead of the current one is `expected`,
+    /// without consuming anything. `n == 0` is the current token.
+    pub fn peek_nth_keyword(&self, n: usize, expected: Keyword) -> bool {
+        matches!(&self.peek_nth_token_ref(n).token, Token::Word(w) if expected == w.keyword)
     }
 
     /// If the current token is the `expected` keyword followed by
@@ -17382,6 +17416,28 @@ mod tests {
     use crate::test_utils::{all_dialects, TestedDialects};
 
     use super::*;
+
+    /// `SIMILAR` is only an infix operator when `TO` follows it; a bare one
+    /// belongs to `SUBSTRING(x SIMILAR p ESCAPE e)`. The lookahead guard that
+    /// arranges this sits in the precedence table, where an off-by-one silently
+    /// stops `NOT SIMILAR TO` from parsing at all, so pin both spellings.
+    #[test]
+    fn parse_similar_to_and_substring_similar_round_trip() {
+        let dialects = all_dialects();
+        dialects.verified_stmt("SELECT 'a' SIMILAR TO 'b'");
+        dialects.verified_stmt("SELECT 'a' NOT SIMILAR TO 'b'");
+        dialects.verified_stmt("SELECT 'a' SIMILAR TO 'b' ESCAPE '#'");
+        dialects.verified_stmt("SELECT 'a' NOT SIMILAR TO 'b' ESCAPE '#'");
+        dialects.verified_stmt("SELECT SUBSTRING('a' SIMILAR 'b' ESCAPE '#')");
+        // The FROM/FOR spelling means the same call and keeps its own rendering.
+        dialects.verified_stmt("SELECT SUBSTRING('a' FROM 'b' FOR '#')");
+        // PG's grammar gives the SIMILAR spelling to SUBSTRING alone.
+        assert!(Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "SELECT SUBSTR('a' SIMILAR 'b' ESCAPE '#')"
+        )
+        .is_err());
+    }
 
     #[test]
     fn parse_create_cast_round_trips() {

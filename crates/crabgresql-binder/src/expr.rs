@@ -1705,11 +1705,13 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
             expr,
             substring_from,
             substring_for,
+            shorthand,
             ..
         } => bind_substring(
             expr,
             substring_from.as_deref(),
             substring_for.as_deref(),
+            *shorthand,
             scope,
         ),
         ast::Expr::Trim {
@@ -2195,12 +2197,18 @@ fn bind_hole_template(
     }
 }
 
-/// `SUBSTRING(x [FROM a] [FOR b])` → `substr(x, a[, b])`. With no `FROM`, PG
+/// `SUBSTRING(x [FROM a] [FOR b])` → `substring(x, a[, b])`. With no `FROM`, PG
 /// defaults the start to 1.
+///
+/// The name matters: overload resolution is what separates the positional form
+/// from the two regex forms, and only `substring` has the latter. `SUBSTR` is
+/// therefore resolved under its own name so `substr(x, '2')` keeps treating the
+/// literal as an offset.
 fn bind_substring(
     expr: &ast::Expr,
     from: Option<&ast::Expr>,
     for_: Option<&ast::Expr>,
+    shorthand: bool,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     let subject = bind_expr(expr, scope)?;
@@ -2215,7 +2223,8 @@ fn bind_substring(
     if let Some(e) = for_ {
         args.push(bind_expr(e, scope)?);
     }
-    crate::functions::resolve_call("substr", args, scope.catalog())
+    let name = if shorthand { "substr" } else { "substring" };
+    crate::functions::resolve_call(name, args, scope.catalog())
 }
 
 /// `TRIM([LEADING|TRAILING|BOTH] [chars FROM] x)` → `ltrim`/`rtrim`/`btrim`.
@@ -6510,7 +6519,9 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         ast::Expr::Floor { .. } => "floor".into(),
         // String special-syntax expressions are named after the function they
         // desugar to (`TRIM` → its ltrim/rtrim/btrim variant).
-        ast::Expr::Substring { .. } => "substring".into(),
+        ast::Expr::Substring { shorthand, .. } => {
+            if *shorthand { "substr".into() } else { "substring".into() }
+        }
         ast::Expr::Position { .. } => "position".into(),
         ast::Expr::Overlay { .. } => "overlay".into(),
         ast::Expr::Trim { trim_where, .. } => match trim_where {

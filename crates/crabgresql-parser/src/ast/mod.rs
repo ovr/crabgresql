@@ -1186,13 +1186,24 @@ pub enum Expr {
     /// ```sql
     /// SUBSTRING(<expr>, <expr>, <expr>)
     /// ```
+    /// or
+    /// ```sql
+    /// SUBSTRING(<expr> SIMILAR <expr> ESCAPE <expr>)
+    /// ```
     Substring {
         /// Source expression.
         expr: Box<Expr>,
-        /// Optional `FROM` expression.
+        /// Optional `FROM` expression (the pattern, in the `SIMILAR` form).
         substring_from: Option<Box<Expr>>,
-        /// Optional `FOR` expression.
+        /// Optional `FOR` expression (the escape character, in the `SIMILAR`
+        /// form).
         substring_for: Option<Box<Expr>>,
+
+        /// true if the expression is represented using the
+        /// `SUBSTRING(expr SIMILAR pattern ESCAPE escape)` syntax, which means
+        /// exactly the same thing as `SUBSTRING(expr FROM pattern FOR escape)`.
+        /// This flag is used for formatting.
+        similar: bool,
 
         /// false if the expression is represented using the `SUBSTRING(expr [FROM start] [FOR len])` syntax
         /// true if the expression is represented using the `SUBSTRING(expr, start, len)` syntax
@@ -2118,6 +2129,7 @@ impl fmt::Display for Expr {
                 expr,
                 substring_from,
                 substring_for,
+                similar,
                 special,
                 shorthand,
             } => {
@@ -2127,17 +2139,17 @@ impl fmt::Display for Expr {
                 }
                 write!(f, "({expr}")?;
                 if let Some(from_part) = substring_from {
-                    if *special {
-                        write!(f, ", {from_part}")?;
-                    } else {
-                        write!(f, " FROM {from_part}")?;
+                    match (*similar, *special) {
+                        (true, _) => write!(f, " SIMILAR {from_part}")?,
+                        (false, true) => write!(f, ", {from_part}")?,
+                        (false, false) => write!(f, " FROM {from_part}")?,
                     }
                 }
                 if let Some(for_part) = substring_for {
-                    if *special {
-                        write!(f, ", {for_part}")?;
-                    } else {
-                        write!(f, " FOR {for_part}")?;
+                    match (*similar, *special) {
+                        (true, _) => write!(f, " ESCAPE {for_part}")?,
+                        (false, true) => write!(f, ", {for_part}")?,
+                        (false, false) => write!(f, " FOR {for_part}")?,
                     }
                 }
 
