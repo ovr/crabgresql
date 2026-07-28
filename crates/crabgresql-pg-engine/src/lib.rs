@@ -53,7 +53,7 @@ use crabgresql_storage_api::{
 use crabgresql_txn::{Clog, TransactionManager, TxnContext, TxnFinalize, Xid};
 use crabgresql_types::Value;
 use crabgresql_wal::{
-    ControlFile, RmgrId, RmgrRedo, RmgrRegistry, Wal, read_control, recover, write_control,
+    ControlFile, Lsn, RmgrId, RmgrRedo, RmgrRegistry, Wal, read_control, recover, write_control,
 };
 
 use crate::btredo::BtreeRedo;
@@ -440,9 +440,15 @@ impl PgEngine {
     /// The caller builds the [`crabgresql_txn::TransactionManager`] from the
     /// returned `clog`/`next_xid` and wires the [`crabgresql_txn::TxnFinalize`]
     /// hook (this engine as `Arc<dyn TxnFinalize>`).
+    ///
+    /// `redo` is the LSN replay resumes from. Production passes
+    /// [`Lsn::INVALID`] — the whole stream — because nothing writes a checkpoint
+    /// record to read a real redo point from yet; recovery tests use it to
+    /// exercise a bounded replay.
     pub fn open_recovered(
         data_dir: &Path,
         wal: Arc<Wal>,
+        redo: Lsn,
     ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
         // Read the pre-recovery control file: `clean_shutdown == false` (or absent)
         // means the last run crashed, so unlogged relations must be reset. Read it
@@ -454,7 +460,7 @@ impl PgEngine {
         let mut registry = RmgrRegistry::new();
         let engine = Arc::new(PgEngine::new(data_dir, Arc::clone(&wal), &mut registry)?);
         let clog = Arc::new(Clog::new());
-        let res = recover(data_dir, &registry, &clog).map_err(std::io::Error::other)?;
+        let res = recover(data_dir, &registry, &clog, redo).map_err(std::io::Error::other)?;
         // Clamp the WAL to the last valid record before any new append, discarding
         // a torn tail left by a crash.
         wal.reset_to(res.end_of_wal).map_err(std::io::Error::other)?;
@@ -613,6 +619,12 @@ impl PgEngine {
 
     pub fn checkpoint(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
         self.write_control_file(next_xid, false)
+    }
+
+    /// The buffer pool, for white-box tests that assert checkpoint ordering.
+    #[cfg(test)]
+    pub(crate) fn bufpool(&self) -> &crate::bufpool::BufferPool {
+        &self.inner.bufpool
     }
 
     fn write_control_file(&self, next_xid: Xid, clean_shutdown: bool) -> std::io::Result<()> {
@@ -1632,7 +1644,8 @@ mod test_support {
         let dir = TempDir::new().expect("create temp data dir");
         let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
         let (engine, _clog, _next_xid) =
-            PgEngine::open_recovered(dir.path(), wal).expect("open engine");
+            PgEngine::open_recovered(dir.path(), wal, crabgresql_wal::Lsn::INVALID)
+                .expect("open engine");
         // Keep the data directory alive for the process lifetime; the OS reclaims
         // it when the (short-lived) test process exits.
         std::mem::forget(dir);
@@ -1645,7 +1658,8 @@ mod test_support {
         let dir = TempDir::new().expect("create temp data dir");
         let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
         let (engine, clog, next_xid) =
-            PgEngine::open_recovered(dir.path(), Arc::clone(&wal)).expect("open engine");
+            PgEngine::open_recovered(dir.path(), Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)
+                .expect("open engine");
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut txnmgr = TransactionManager::new_recovered(sink, clog, next_xid);
         txnmgr.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);

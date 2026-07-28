@@ -26,7 +26,8 @@ struct H {
 fn open(dir: tempfile::TempDir) -> H {
     let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
     let (engine, clog, next_xid) =
-        PgEngine::open_recovered(dir.path(), Arc::clone(&wal)).expect("open engine");
+        PgEngine::open_recovered(dir.path(), Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)
+            .expect("open engine");
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
     let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
     tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);

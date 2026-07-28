@@ -299,6 +299,113 @@ fn vacuum_removes_the_index_entry_so_a_reused_slot_is_not_found() -> anyhow::Res
     Ok(())
 }
 
+/// Replay bounded at a checkpoint's redo point keeps a heavily split B-tree
+/// intact — and provably never reads the log below that point.
+///
+/// The prefix below `redo` is scribbled over before reopening. If recovery
+/// touched one byte of it the first `decode` would fail, the log would read as
+/// empty, and every row would vanish — so this cannot pass by accident
+/// (verified: forcing `recover` back to offset 0 fails it).
+///
+/// Everything is inserted by ONE transaction that commits *above* the redo
+/// point, deliberately. The CLOG is still a RAM `HashMap` rebuilt from replay,
+/// so a transaction whose commit record sat below redo would come back
+/// `InProgress` and all its rows would be invisible — nothing to do with
+/// splits. Making commit status survive a bounded replay is the durable-CLOG
+/// work; this test isolates the page-level behaviour from it.
+///
+/// The *timing* hazard in `split_page` is guarded separately, by
+/// `nbtree::tests::no_page_stays_dirty_at_or_below_a_sampled_redo_point` and by
+/// the `CheckpointDelay` tests in `crabgresql-wal`.
+#[test]
+fn a_bounded_replay_after_a_checkpoint_keeps_every_split_reachable() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const ROWS: i32 = 4_000;
+    let dir = tempfile::tempdir()?;
+    let redo = Arc::new(AtomicU64::new(0));
+
+    // --- lifetime 1: split under a concurrently looping checkpointer. ---
+    {
+        let (engine, tm, wal) =
+            common::open_from_with_wal(dir.path(), crabgresql_wal::Lsn::INVALID)?;
+        let table = engine.create_table(schema("t"))?;
+        engine.create_index("public", "t", idx_on_id())?;
+
+        let done = Arc::new(AtomicBool::new(false));
+        let x = tm.allocate_xid();
+        std::thread::scope(|s| -> anyhow::Result<()> {
+            let checkpointer = {
+                let (engine, wal, done, redo) = (
+                    Arc::clone(&engine),
+                    Arc::clone(&wal),
+                    Arc::clone(&done),
+                    Arc::clone(&redo),
+                );
+                let next_xid = Xid(x.0 + 1);
+                s.spawn(move || -> anyhow::Result<()> {
+                    while !done.load(Ordering::SeqCst) {
+                        // The ordering a real checkpointer must use: sample redo
+                        // BEFORE flushing buffers, and make the redo point itself
+                        // durable before anything can name it.
+                        let point = wal.redo_point();
+                        wal.flush(point)?;
+                        engine.checkpoint(next_xid)?;
+                        redo.fetch_max(point.0, Ordering::SeqCst);
+                    }
+                    Ok(())
+                })
+            };
+
+            // Shuffled insert order so descent and splits are exercised, not just
+            // right-edge appends.
+            let ctx = tm.context(x, CommandId::FIRST);
+            let mut id = 1i32;
+            for _ in 0..ROWS {
+                table.insert(vec![Value::Int4(id), Value::Text("v".into())], &ctx)?;
+                id = (id + 1237) % ROWS;
+            }
+            done.store(true, Ordering::SeqCst);
+            checkpointer
+                .join()
+                .map_err(|_| anyhow::anyhow!("checkpointer thread panicked"))?
+        })?;
+
+        // Commit only after the last redo sample, so the commit record is above
+        // redo and the rebuilt CLOG still learns this transaction's fate.
+        tm.commit(x)?;
+        wal.flush(wal.current_lsn())?;
+    }
+
+    // --- lifetime 2: destroy the prefix below redo, then replay from redo. ---
+    let redo = crabgresql_wal::Lsn(redo.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(redo.is_valid(), "the checkpointer never sampled a redo point");
+    common::scribble(&common::wal_file_path(dir.path()), 0, redo.0, 0xAB)?;
+    {
+        let (engine, tm) = common::open_from(dir.path(), redo)?;
+        let table = engine.open_table("t")?;
+        assert!(table.supports_index_scan("t_id_idx"));
+        // Every key must still be index-reachable, and the index must agree with
+        // a sequential scan — a lost split shows up as a missing key or as a
+        // descent into an empty page.
+        for id in (0..ROWS).step_by(89) {
+            let txn = read(&tm);
+            assert_eq!(
+                probe_ids(&*table, &txn, id),
+                scan_ids(&*table, &txn, id),
+                "index and heap disagree on key {id}"
+            );
+            assert_eq!(
+                probe_ids(&*table, &txn, id),
+                vec![id],
+                "key {id} unreachable after replay from {redo}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn index_survives_a_crash_and_serves_probes_after_recovery() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

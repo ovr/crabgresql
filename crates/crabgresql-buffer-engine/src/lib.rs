@@ -1140,7 +1140,7 @@ mod tests {
         let mut registry = RmgrRegistry::new();
         registry.register(RMGR_BUFFER, Arc::clone(&redo) as Arc<dyn RmgrRedo>);
         let clog = Clog::new();
-        let result = recover(dir.path(), &registry, &clog)?;
+        let result = recover(dir.path(), &registry, &clog, crabgresql_wal::Lsn::INVALID)?;
 
         let wal = Arc::new(Wal::open(dir.path())?);
         let table = BufferTable::open(7, schema("b"), Vec::new(), wal);
@@ -1302,7 +1302,7 @@ mod tests {
         let mut registry = RmgrRegistry::new();
         registry.register(RMGR_BUFFER, Arc::clone(&redo) as Arc<dyn RmgrRedo>);
         let clog = Clog::new();
-        let result = recover(dir.path(), &registry, &clog)?;
+        let result = recover(dir.path(), &registry, &clog, crabgresql_wal::Lsn::INVALID)?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let table = BufferTable::open(3, wide, Vec::new(), wal);
         table.restore(redo.take(3).expect("replay recovers the relation"), &clog);
@@ -1351,7 +1351,7 @@ mod tests {
         let mut registry = RmgrRegistry::new();
         registry.register(RMGR_BUFFER, Arc::clone(&redo) as Arc<dyn RmgrRedo>);
         let clog = Clog::new();
-        let result = recover(dir.path(), &registry, &clog)?;
+        let result = recover(dir.path(), &registry, &clog, crabgresql_wal::Lsn::INVALID)?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let table = BufferTable::open(7, schema("b"), Vec::new(), wal);
         table.restore(redo.take(7).expect("replay recovers the relation"), &clog);

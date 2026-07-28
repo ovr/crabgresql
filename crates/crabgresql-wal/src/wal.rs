@@ -8,7 +8,7 @@ use std::sync::{Condvar, Mutex};
 
 use crabgresql_txn::{CommitSink, Xid};
 
-use crate::record::{Lsn, WalError, WalRecord};
+use crate::record::{Lsn, LsnRange, WalError, WalRecord};
 use crate::rmgr::{RmgrId, XACT_ABORT, XACT_COMMIT};
 
 /// The single WAL file lives at `<dir>/pg_wal/wal`. Segment rotation is a
@@ -32,8 +32,20 @@ struct Inner {
     flushing: bool,
 }
 
+/// Checkpoint-delay bookkeeping. Guarded by its own mutex, independent of
+/// [`Inner`]: a writer holding a delay goes on to `append`, so the lock order is
+/// always `delay` → `inner` and never the reverse.
+struct Delay {
+    /// Writers currently inside a "record appended, effect not yet published"
+    /// window.
+    active: u64,
+    /// A checkpointer is waiting to sample the redo point. New delays queue
+    /// behind it, so a steady stream of writers cannot starve it.
+    wanted: bool,
+}
+
 /// The write-ahead log. Cheap [`Wal::append`] stages bytes in memory and returns
-/// the record's end-LSN; [`Wal::flush`] makes everything up to a target LSN
+/// the record's byte range; [`Wal::flush`] makes everything up to a target LSN
 /// durable with a single fsync shared by all concurrent committers (group
 /// commit).
 pub struct Wal {
@@ -43,6 +55,47 @@ pub struct Wal {
     /// Highest LSN known to be on stable storage (fsynced).
     flushed: AtomicU64,
     cond: Condvar,
+    delay: Mutex<Delay>,
+    delay_cond: Condvar,
+}
+
+/// Holds the checkpointer off while its owner finishes publishing the effect of
+/// a record it has already appended. Releases on `Drop`.
+///
+/// The hazard it closes: a writer that appends a record and only afterwards
+/// makes the state deciding whether that record must be replayed visible. A
+/// checkpointer sampling the redo point inside that window would publish a redo
+/// above the record while the effect is neither on disk nor in the replayed
+/// suffix — the change is simply lost.
+///
+/// Most writers need nothing: the heap `INSERT`/`DELETE` path appends the record
+/// and stamps the page inside one buffer-pool `modify` closure, so both become
+/// visible under a single frame lock and no window exists. This guard is for the
+/// writers that genuinely cannot do that — currently only a B-tree split, which
+/// is one record over three separately locked pages. A transaction commit and a
+/// buffer-table install will join it as the durable-CLOG and checkpoint work
+/// lands.
+///
+/// The guard is **non-reentrant**: a thread holding one must not call
+/// [`Wal::redo_point`], which would wait for itself. A checkpointer must also
+/// let `redo_point` return *before* flushing buffers, so it never holds this
+/// barrier while taking buffer-pool frame mutexes.
+pub struct CheckpointDelay<'a> {
+    wal: &'a Wal,
+}
+
+impl Drop for CheckpointDelay<'_> {
+    fn drop(&mut self) {
+        let mut delay = self
+            .wal
+            .delay
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        delay.active -= 1;
+        if delay.active == 0 {
+            self.wal.delay_cond.notify_all();
+        }
+    }
 }
 
 impl Wal {
@@ -71,7 +124,61 @@ impl Wal {
             file: Mutex::new(file),
             flushed: AtomicU64::new(len),
             cond: Condvar::new(),
+            delay: Mutex::new(Delay {
+                active: 0,
+                wanted: false,
+            }),
+            delay_cond: Condvar::new(),
         })
+    }
+
+    /// Take a checkpoint delay, blocking while a checkpointer is already waiting
+    /// to sample. See [`CheckpointDelay`] for when a writer needs one.
+    ///
+    /// Deliberately `Mutex` + `Condvar` rather than an `RwLock`: on macOS
+    /// `std::sync::RwLock` wraps a reader-preferring `pthread_rwlock`, so a
+    /// steady stream of delay holders could starve the checkpointer forever.
+    /// `wanted` is what makes the checkpointer's side win.
+    pub fn delay_checkpoint(&self) -> CheckpointDelay<'_> {
+        let mut delay = self
+            .delay
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        while delay.wanted {
+            delay = match self.delay_cond.wait(delay) {
+                Ok(delay) => delay,
+                Err(_) => panic!("WAL checkpoint-delay condition-variable mutex poisoned"),
+            };
+        }
+        delay.active += 1;
+        CheckpointDelay { wal: self }
+    }
+
+    /// The redo point — a record boundary at or above which replay must resume.
+    /// Blocks until every outstanding [`CheckpointDelay`] is released, so on
+    /// return every record below the result has its effect published.
+    ///
+    /// A checkpoint must sample this **before** flushing buffers, never after:
+    /// sampling afterwards would let a page dirtied during the flush pass carry
+    /// an LSN below the redo point, leaving it neither written back nor
+    /// replayed.
+    pub fn redo_point(&self) -> Lsn {
+        let mut delay = self
+            .delay
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        delay.wanted = true;
+        while delay.active > 0 {
+            delay = match self.delay_cond.wait(delay) {
+                Ok(delay) => delay,
+                Err(_) => panic!("WAL checkpoint-delay condition-variable mutex poisoned"),
+            };
+        }
+        // Lock order delay -> inner; nothing takes them the other way round.
+        let lsn = self.current_lsn();
+        delay.wanted = false;
+        self.delay_cond.notify_all();
+        lsn
     }
 
     /// Truncate the stream back to `lsn`, discarding anything after it. Used
@@ -94,27 +201,32 @@ impl Wal {
         Ok(())
     }
 
-    /// Stage one record for a resource manager, returning its end-LSN. No I/O and
-    /// no fsync — the caller stamps the returned LSN on the page it changed and,
-    /// at commit, calls [`Wal::flush`] to make it durable.
-    pub fn append(&self, rmgr: RmgrId, info: u8, xid: Xid, payload: &[u8]) -> Lsn {
+    /// Stage one record for a resource manager, returning the byte range it
+    /// occupies. No I/O and no fsync — the caller stamps the range's `end` on the
+    /// page it changed and, at commit, calls [`Wal::flush`] to make it durable.
+    /// The `start` is the record's own boundary, which is what a redo point has
+    /// to name.
+    pub fn append(&self, rmgr: RmgrId, info: u8, xid: Xid, payload: &[u8]) -> LsnRange {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
         let start = Lsn(inner.insert_lsn);
         let rec = WalRecord {
-            prev_lsn: start,
+            rec_lsn: start,
             xid,
             rmgr: rmgr.0,
             info,
             payload,
         };
         let mut scratch = std::mem::take(&mut inner.unwritten);
-        let n = rec.encode(start, &mut scratch);
+        let n = rec.encode(&mut scratch);
         inner.unwritten = scratch;
         inner.insert_lsn += n as u64;
-        Lsn(inner.insert_lsn)
+        LsnRange {
+            start,
+            end: Lsn(inner.insert_lsn),
+        }
     }
 
     /// Highest LSN staged (durable or not).
@@ -208,7 +320,7 @@ impl Wal {
 /// abort record but needs no fsync.
 impl CommitSink for Wal {
     fn log_commit(&self, xid: Xid) -> std::io::Result<()> {
-        let lsn = self.append(RmgrId::XACT, XACT_COMMIT, xid, &[]);
+        let lsn = self.append(RmgrId::XACT, XACT_COMMIT, xid, &[]).end;
         self.flush(lsn).map_err(|e| match e {
             WalError::Io(io) => io,
             other => std::io::Error::other(other.to_string()),
@@ -229,8 +341,8 @@ mod tests {
     fn append_returns_monotonic_end_lsns_and_flush_persists() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Wal::open(dir.path())?;
-        let a = wal.append(RmgrId::HEAP, 0, Xid(3), &[1, 2, 3]);
-        let b = wal.append(RmgrId::HEAP, 0, Xid(3), &[4, 5]);
+        let a = wal.append(RmgrId::HEAP, 0, Xid(3), &[1, 2, 3]).end;
+        let b = wal.append(RmgrId::HEAP, 0, Xid(3), &[4, 5]).end;
         assert!(b > a);
         assert_eq!(wal.current_lsn(), b);
         assert_eq!(wal.flushed_lsn(), Lsn::INVALID);
@@ -254,7 +366,7 @@ mod tests {
             for i in 0..8u64 {
                 let wal = Arc::clone(&wal);
                 handles.push(s.spawn(move || -> Result<Lsn, WalError> {
-                    let lsn = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3 + i), &[i as u8; 16]);
+                    let lsn = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3 + i), &[i as u8; 16]).end;
                     wal.flush(lsn)?;
                     Ok(lsn)
                 }));
@@ -294,14 +406,14 @@ mod tests {
         {
             let wal = Wal::open(dir.path())?;
             wal.append(RmgrId::HEAP, 0, Xid(3), b"first");
-            let l = wal.append(RmgrId::HEAP, 0, Xid(4), b"second");
+            let l = wal.append(RmgrId::HEAP, 0, Xid(4), b"second").end;
             wal.flush(l)?;
         }
         {
             // Reopen (cursor at 0, written at end-of-file) and append more.
             let wal = Wal::open(dir.path())?;
             wal.append(RmgrId::HEAP, 0, Xid(5), b"third");
-            let l = wal.append(RmgrId::HEAP, 0, Xid(6), b"fourth");
+            let l = wal.append(RmgrId::HEAP, 0, Xid(6), b"fourth").end;
             wal.flush(l)?;
         }
         // All four records from both sessions must decode intact and in order.
@@ -326,7 +438,7 @@ mod tests {
         {
             let wal = Wal::open(dir.path())?;
             wal.append(RmgrId::HEAP, 0, Xid(3), b"good");
-            valid_end = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3), &[]);
+            valid_end = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3), &[]).end;
             wal.flush(valid_end)?;
         }
         // A crash leaves raw garbage on disk past the last valid record.
@@ -339,7 +451,7 @@ mod tests {
             // Recovery computes `valid_end`; clamp to it (truncating the garbage),
             // then continue appending cleanly.
             wal.reset_to(valid_end)?;
-            let l = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(10), &[]);
+            let l = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(10), &[]).end;
             wal.flush(l)?;
         }
         let recs = read_all(dir.path());
@@ -349,6 +461,158 @@ mod tests {
             vec![Xid(3), Xid(3), Xid(10)],
             "torn tail dropped, new record appended cleanly"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn append_returns_the_records_own_byte_range() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        let mut previous_end = Lsn(0);
+        for i in 0..4usize {
+            let payload = vec![i as u8; i * 11];
+            let range = wal.append(RmgrId::HEAP, 0, Xid(3), &payload);
+            assert_eq!(range.start, previous_end, "ranges must be contiguous");
+            assert_eq!(
+                range.end.0 - range.start.0,
+                (WalRecord::HEADER_LEN + payload.len() + 4) as u64,
+                "range width must be the encoded record length"
+            );
+            previous_end = range.end;
+        }
+        assert_eq!(wal.current_lsn(), previous_end);
+
+        Ok(())
+    }
+
+    #[test]
+    fn redo_point_is_the_insert_lsn_when_nothing_is_delayed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        assert_eq!(wal.redo_point(), Lsn::INVALID);
+        let range = wal.append(RmgrId::HEAP, 0, Xid(3), b"a");
+        assert_eq!(wal.redo_point(), range.end);
+        // Repeatable: sampling does not consume anything.
+        assert_eq!(wal.redo_point(), wal.current_lsn());
+
+        Ok(())
+    }
+
+    /// Poll `f()` for up to `max_ms`, returning whether it ever held. A positive
+    /// assertion wants a generous ceiling (slow CI must not fail); a negative
+    /// one ("this must NOT happen") wants a short window, since it always waits
+    /// the full duration.
+    fn eventually(max_ms: u64, f: impl Fn() -> bool) -> bool {
+        for _ in 0..max_ms {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    }
+
+    #[test]
+    fn redo_point_blocks_until_every_delay_is_released() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let before = wal.append(RmgrId::HEAP, 0, Xid(3), b"below-redo");
+
+        let delay = wal.delay_checkpoint();
+        // Appended while the delay is held: the effect is not published yet, so
+        // a redo point sampled now must not sit above this record.
+        let during = wal.append(RmgrId::HEAP, 0, Xid(3), b"in-window");
+
+        let sampled = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|s| -> anyhow::Result<()> {
+            let handle = {
+                let wal = Arc::clone(&wal);
+                let sampled = Arc::clone(&sampled);
+                s.spawn(move || {
+                    let lsn = wal.redo_point();
+                    sampled.store(true, Ordering::SeqCst);
+                    lsn
+                })
+            };
+
+            // The sampler must still be blocked while the delay is outstanding.
+            assert!(
+                !eventually(300, || sampled.load(Ordering::SeqCst)),
+                "redo_point returned while a CheckpointDelay was held"
+            );
+            assert!(before.end <= during.start);
+
+            drop(delay);
+            let lsn = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("redo_point sampler panicked"))?;
+            assert!(
+                lsn >= during.end,
+                "once the delay is released the sample covers the whole window"
+            );
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_delay_queues_behind_a_waiting_checkpointer() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let held = wal.delay_checkpoint();
+
+        let sampling = Arc::new(AtomicBool::new(false));
+        let took_second = Arc::new(AtomicBool::new(false));
+
+        std::thread::scope(|s| -> anyhow::Result<()> {
+            let sampler = {
+                let wal = Arc::clone(&wal);
+                let sampling = Arc::clone(&sampling);
+                s.spawn(move || {
+                    sampling.store(true, Ordering::SeqCst);
+                    wal.redo_point()
+                })
+            };
+            assert!(
+                eventually(2_000, || sampling.load(Ordering::SeqCst)),
+                "sampler thread never started"
+            );
+
+            // Give the sampler time to set `wanted` while `held` blocks it.
+            let waiter = {
+                let wal = Arc::clone(&wal);
+                let took_second = Arc::clone(&took_second);
+                s.spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let guard = wal.delay_checkpoint();
+                    took_second.store(true, Ordering::SeqCst);
+                    drop(guard);
+                })
+            };
+
+            // The second delay must not be granted while the checkpointer waits:
+            // that is what stops a steady writer stream from starving it.
+            assert!(
+                !eventually(400, || took_second.load(Ordering::SeqCst)),
+                "a new delay was granted ahead of a waiting checkpointer"
+            );
+
+            drop(held);
+            sampler
+                .join()
+                .map_err(|_| anyhow::anyhow!("redo_point sampler panicked"))?;
+            waiter
+                .join()
+                .map_err(|_| anyhow::anyhow!("delay waiter panicked"))?;
+            assert!(took_second.load(Ordering::SeqCst));
+            Ok(())
+        })?;
 
         Ok(())
     }
