@@ -5260,6 +5260,107 @@ async fn truncate_under_repeatable_read_leaves_no_rows_behind() -> anyhow::Resul
     Ok(())
 }
 
+/// `VACUUM` may not reclaim a version a live reader is still entitled to see.
+///
+/// The reader is read-only, so it never allocates an XID and is invisible to the
+/// running-transaction floor; the snapshot it registered for the block is the
+/// only thing standing between it and the vacuumer. Choosing the wrong floor here
+/// deletes the row out from under a `REPEATABLE READ` session mid-transaction.
+#[tokio::test]
+async fn vacuum_does_not_reclaim_below_a_read_only_repeatable_read_reader()
+-> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let reader = connect(port).await;
+    let vacuumer = connect(port).await;
+    vacuumer.simple_query("CREATE TABLE t (id int4)").await?;
+    vacuumer
+        .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+
+    // The first read freezes and registers the block's snapshot. The block writes
+    // nothing, so it holds no XID from here on.
+    reader
+        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3")]
+    );
+
+    // A committed delete, then a vacuum, both while the reader sits idle.
+    vacuumer.simple_query("DELETE FROM t WHERE id = 2").await?;
+    vacuumer.simple_query("VACUUM t").await?;
+
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3")],
+        "VACUUM must not reclaim a version the open snapshot can still see"
+    );
+
+    // Holding the horizon back only delays reclamation: once the reader is done,
+    // the delete is final, and a vacuum with nothing to hold it back must still
+    // leave the live rows alone.
+    reader.simple_query("COMMIT").await?;
+    vacuumer.simple_query("VACUUM t").await?;
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("3")],
+        "the delete is final once the reader is gone, and live rows survive"
+    );
+    Ok(())
+}
+
+/// The same guarantee when the deleter was still IN FLIGHT as the reader froze
+/// its snapshot, which is the case that separates a correct reclamation floor
+/// from one that only looks correct.
+///
+/// A reader can still see rows deleted by any XID in its `xip` list, and the
+/// smallest of those is its `xmin`. A floor taken from the snapshot's `xmax`
+/// instead leaves every `xip` member above the horizon, so the vacuum reclaims
+/// precisely the versions the reader is entitled to keep reading. The two agree
+/// whenever `xip` is empty, so only a concurrent writer tells them apart.
+#[tokio::test]
+async fn vacuum_respects_a_reader_that_captured_around_an_in_flight_deleter()
+-> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let reader = connect(port).await;
+    let deleter = connect(port).await;
+    let vacuumer = connect(port).await;
+    deleter.simple_query("CREATE TABLE t (id int4)").await?;
+    deleter
+        .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+
+    // Open the delete but do NOT commit: its XID is in flight, so it lands in the
+    // reader's `xip` and its delete does not apply to the reader.
+    deleter.simple_query("BEGIN").await?;
+    deleter.simple_query("DELETE FROM t WHERE id = 2").await?;
+
+    reader
+        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3")],
+        "an uncommitted delete is invisible to the reader"
+    );
+
+    deleter.simple_query("COMMIT").await?;
+    vacuumer.simple_query("VACUUM t").await?;
+
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3")],
+        "the horizon must stay below a deleter the reader still has in flight"
+    );
+    Ok(())
+}
+
 /// `VACUUM` is the explicit flush hook: it moves a Parquet relation's buffered
 /// rows into durable storage without changing what any reader sees, works on a
 /// heap table and bare, and refuses the forms it cannot honor.

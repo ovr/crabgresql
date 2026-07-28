@@ -17,7 +17,9 @@ use crate::routines::SessionNotices;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{Format, TransactionStatus, sqlstate};
 use crabgresql_storage_api::{SequenceAdvance, TableEngine};
-use crabgresql_txn::{CommandId, IsolationLevel, LockOwner, Snapshot, TransactionManager, Xid};
+use crabgresql_txn::{
+    CommandId, IsolationLevel, LockOwner, Snapshot, SnapshotGuard, TransactionManager, Xid,
+};
 use crabgresql_types::{PgType, Value};
 
 /// Base for a session's synthetic `pg_temp_N` namespace OID. A high reserved band
@@ -111,7 +113,15 @@ pub struct ActiveTxn {
     /// REPEATABLE READ (and above) freeze one snapshot for the whole block, set
     /// on the first statement; READ COMMITTED leaves this `None` and takes a
     /// fresh snapshot per statement.
-    pub snapshot: Option<Snapshot>,
+    ///
+    /// The [`SnapshotGuard`] rides along so the block's snapshot stays counted in
+    /// the manager's live-snapshot registry for the block's whole life, not just
+    /// the statement that took it — the statement's own guard lives on its
+    /// `TxnContext` and dies with it. A read-only block allocates no XID and so
+    /// does not move `Snapshot::xmin`, which makes this registration the only
+    /// thing holding reclamation off the versions the block is still entitled to
+    /// read. Pairing the two in one field is what keeps them from drifting apart.
+    pub snapshot: Option<(Snapshot, SnapshotGuard)>,
     /// Command counter: each statement in the block runs at the next `cid`, so a
     /// later statement sees earlier ones' writes.
     pub cid: CommandId,
