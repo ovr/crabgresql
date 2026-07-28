@@ -659,7 +659,7 @@ crates/
   crabgresql-plpgsql         # PL/pgSQL parser + interpreter
   crabgresql-server          # session, GUCs, wiring it all together; bin: crabgresql
   crabgresql-pg-regress      # pg_regress-style runner; diff tests against PG
-  crabgresql-bench           # analytical benchmark harness (ClickBench, …)
+  crabgresql-bench           # analytical benchmark harness (ClickBench, TPC-H)
 ```
 
 ## 5. Compatibility verification strategy (this IS the product)

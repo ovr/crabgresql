@@ -36,6 +36,10 @@ pub async fn connect(conninfo: &str) -> Result<Client> {
 /// after `max_rows` data lines when set, and skipping the file's header line
 /// when `skip_header`. Returns the number of rows the server accepted.
 ///
+/// `trailing_delimiter`, when set, is dropped from the end of every line —
+/// TPC-H's `dbgen` terminates each `.tbl` row with one, which `COPY` would
+/// otherwise read as an extra empty column.
+///
 /// The file is read on a blocking thread and handed over one batch at a time,
 /// so neither side ever holds more than a couple of [`COPY_BATCH_BYTES`]. Each
 /// batch is its own transaction: a load that dies half way leaves the table
@@ -47,11 +51,13 @@ pub async fn copy_file_in(
     path: &Path,
     max_rows: Option<u64>,
     skip_header: bool,
+    trailing_delimiter: Option<u8>,
 ) -> Result<u64> {
     let (tx, mut rx) = mpsc::channel::<Bytes>(2);
     let owned = path.to_path_buf();
-    let reader =
-        tokio::task::spawn_blocking(move || read_batches(&owned, max_rows, skip_header, &tx));
+    let reader = tokio::task::spawn_blocking(move || {
+        read_batches(&owned, max_rows, skip_header, trailing_delimiter, &tx)
+    });
 
     let mut accepted = 0u64;
     let mut failure = None;
@@ -101,6 +107,7 @@ fn read_batches(
     path: &Path,
     max_rows: Option<u64>,
     skip_header: bool,
+    trailing_delimiter: Option<u8>,
     tx: &mpsc::Sender<Bytes>,
 ) -> Result<u64> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -128,6 +135,15 @@ fn read_batches(
         // A final line without a newline still has to reach the server as one.
         if !line.ends_with(b"\n") {
             line.push(b'\n');
+        }
+        // `dbgen` writes `a|b|c|\n`; `COPY` counts that last `|` as the start
+        // of a fourth, empty column. Drop it so the benchmark's own generator
+        // works without post-processing.
+        if let Some(delimiter) = trailing_delimiter {
+            let end = line.len() - 1;
+            if end > 0 && line[end - 1] == delimiter {
+                line.remove(end - 1);
+            }
         }
         batch.extend_from_slice(&line);
         rows += 1;

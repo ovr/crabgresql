@@ -25,15 +25,17 @@ enum Command {
     List,
     /// Run a benchmark suite
     Run {
-        /// Suite name, e.g. `clickbench`
+        /// Suite name, e.g. `clickbench` or `tpch`
         suite: String,
 
-        /// Raw data file to load (uncompressed); not needed once loaded into
-        /// a persistent --data-dir
+        /// Raw data to load (uncompressed): the data file for a single-table
+        /// suite, the directory of per-table files for a multi-table one. Not
+        /// needed once loaded into a persistent --data-dir
         #[arg(long, value_name = "PATH")]
         data: Option<PathBuf>,
 
-        /// Load only the first N rows of --data
+        /// Load only the first N rows; single-table suites only, since slicing
+        /// each table of a joined schema independently dangles its keys
         #[arg(long, value_name = "N")]
         rows: Option<u64>,
 
@@ -57,11 +59,11 @@ enum Command {
         #[arg(long, value_name = "SECONDS", default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
 
-        /// Access method for the benchmark table (parquet, buffer, …)
+        /// Access method for the benchmark tables (parquet, buffer, …)
         #[arg(long, value_name = "AM")]
         using: Option<String>,
 
-        /// Drop and reload the table even if it is already populated
+        /// Drop and reload every table of the suite, even if already loaded
         #[arg(long)]
         reload: bool,
 
