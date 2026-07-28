@@ -25,15 +25,16 @@ enum Command {
     List,
     /// Run a benchmark suite
     Run {
-        /// Suite name, e.g. `clickbench`
+        /// Suite name, e.g. `clickbench` or `tpch`
         suite: String,
 
-        /// Raw data file to load (uncompressed); not needed once loaded into
-        /// a persistent --data-dir
+        /// Raw data to load (uncompressed): the data file for a single-table
+        /// suite, the directory of per-table files for a multi-table one. Not
+        /// needed once loaded into a persistent --data-dir
         #[arg(long, value_name = "PATH")]
         data: Option<PathBuf>,
 
-        /// Load only the first N rows of --data
+        /// Load only the first N rows of each table's data
         #[arg(long, value_name = "N")]
         rows: Option<u64>,
 

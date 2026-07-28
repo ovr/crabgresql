@@ -9,15 +9,23 @@ pub struct SuiteRun {
     pub suite: String,
     /// What was benchmarked, for the report header.
     pub target: String,
-    /// The access method the table was created with, `None` when this run did
-    /// not create it and so cannot know. Recorded because a timing is
+    /// The access method the tables were created with, `None` when this run did
+    /// not create them and so cannot know. Recorded because a timing is
     /// meaningless without the storage it was measured on.
     pub access_method: Option<String>,
-    /// Rows in the benchmarked table, counted (not assumed) before the run.
-    pub table_rows: u64,
+    /// The benchmarked tables and their rows, counted (not assumed) before the
+    /// run.
+    pub tables: Vec<TableRows>,
     /// Time the load took, when this run loaded the dataset.
     pub load_time: Option<Duration>,
     pub queries: Vec<QueryRun>,
+}
+
+/// One loaded table and how many rows it holds.
+#[derive(Clone)]
+pub struct TableRows {
+    pub name: String,
+    pub rows: u64,
 }
 
 pub struct QueryRun {
@@ -107,14 +115,20 @@ impl SuiteRun {
         self.queries.iter().filter(|q| q.best().is_some()).count()
     }
 
-    /// How the table under test is described wherever a number is reported.
-    /// A reused table's storage is reported as `unknown`, not guessed at.
+    /// Rows across every table under test.
+    pub fn total_rows(&self) -> u64 {
+        self.tables.iter().map(|table| table.rows).sum()
+    }
+
+    /// How the dataset under test is described wherever a number is reported.
+    /// A reused dataset's storage is reported as `unknown`, not guessed at.
     fn table_description(&self) -> String {
-        format!(
-            "{} rows, {} storage",
-            self.table_rows,
-            self.access_method.as_deref().unwrap_or("unknown"),
-        )
+        let storage = self.access_method.as_deref().unwrap_or("unknown");
+        let rows = self.total_rows();
+        match self.tables.len() {
+            0 | 1 => format!("{rows} rows, {storage} storage"),
+            n => format!("{rows} rows across {n} tables, {storage} storage"),
+        }
     }
 
     pub fn table(&self) -> String {
@@ -128,7 +142,7 @@ impl SuiteRun {
                     out,
                     ", loaded in {:.1}s ({:.0} rows/s)",
                     time.as_secs_f64(),
-                    self.table_rows as f64 / time.as_secs_f64().max(f64::EPSILON),
+                    self.total_rows() as f64 / time.as_secs_f64().max(f64::EPSILON),
                 );
             }
             None => {
@@ -186,7 +200,18 @@ impl SuiteRun {
             "  \"access_method\": \"{}\",",
             escape(self.access_method.as_deref().unwrap_or("unknown")),
         );
-        let _ = writeln!(out, "  \"rows\": {},", self.table_rows);
+        let _ = writeln!(out, "  \"rows\": {},", self.total_rows());
+        let _ = writeln!(out, "  \"tables\": {{");
+        for (i, table) in self.tables.iter().enumerate() {
+            let comma = if i + 1 == self.tables.len() { "" } else { "," };
+            let _ = writeln!(
+                out,
+                "    \"{}\": {}{comma}",
+                escape(&table.name),
+                table.rows
+            );
+        }
+        let _ = writeln!(out, "  }},");
         if let Some(time) = self.load_time {
             let _ = writeln!(out, "  \"load_time\": {:.3},", time.as_secs_f64());
         }
@@ -258,7 +283,10 @@ mod tests {
             suite: "clickbench".to_string(),
             target: "in-process".to_string(),
             access_method: Some("parquet".to_string()),
-            table_rows: 10,
+            tables: vec![TableRows {
+                name: "hits".to_string(),
+                rows: 10,
+            }],
             load_time: Some(Duration::from_secs(1)),
             queries: vec![
                 QueryRun {
@@ -294,6 +322,23 @@ mod tests {
     fn table_names_the_storage_and_row_count_it_measured() {
         let table = run().table();
         assert!(table.contains("10 rows, parquet storage"), "{table}");
+    }
+
+    #[test]
+    fn a_multi_table_dataset_reports_the_total_and_the_table_count() {
+        let mut multi = run();
+        multi.tables.push(TableRows {
+            name: "orders".to_string(),
+            rows: 32,
+        });
+        let table = multi.table();
+        assert!(
+            table.contains("42 rows across 2 tables, parquet storage"),
+            "{table}"
+        );
+        let json = multi.json();
+        assert!(json.contains("\"rows\": 42"), "{json}");
+        assert!(json.contains("\"orders\": 32"), "{json}");
     }
 
     #[test]

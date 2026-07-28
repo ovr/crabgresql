@@ -110,13 +110,17 @@ coverage grows.
 
 ## Benchmarks
 
-`crabgresql-bench` runs published analytical benchmarks — ClickBench today —
-against an in-process server, or against stock PostgreSQL for comparison. A
-query that hits an engine gap is reported in place instead of aborting the run,
-so the results table doubles as a gap list. See
+`crabgresql-bench` runs published analytical benchmarks — ClickBench for scans
+and aggregation over one wide table, TPC-H for joins over eight — against an
+in-process server, or against stock PostgreSQL for comparison. A query that hits
+an engine gap is reported in place instead of aborting the run, so the results
+table doubles as a gap list. See
 [`crates/crabgresql-bench/README.md`](crates/crabgresql-bench/README.md).
 
 ```console
 $ cargo run --release -p crabgresql-bench -- run clickbench --data hits.tsv
-42 of 43 queries succeeded, 12.341s total (best runs)
+43 of 43 queries succeeded, 13.228s total (best runs)
+
+$ cargo run --release -p crabgresql-bench -- run tpch --data tpch/
+21 of 22 queries succeeded, 40.450s total (best runs)
 ```
