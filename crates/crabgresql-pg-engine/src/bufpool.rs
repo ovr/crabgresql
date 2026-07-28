@@ -156,6 +156,23 @@ impl BufferPool {
         Ok(())
     }
 
+    /// `pd_lsn` of every frame that is currently dirty, skipping never-stamped
+    /// pages (`pd_lsn == 0`). White-box hook for the checkpoint-ordering test:
+    /// after `flush_all` returns, a dirty frame whose LSN is at or below a
+    /// previously sampled redo point is a change that is neither on disk nor in
+    /// the replayed suffix.
+    #[cfg(test)]
+    pub(crate) fn dirty_page_lsns(&self) -> Vec<u64> {
+        self.frames
+            .iter()
+            .filter_map(|frame| {
+                let fr = frame.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+                let lsn = page::get_lsn(&fr.data);
+                (fr.dirty && fr.tag.is_some() && lsn != 0).then_some(lsn)
+            })
+            .collect()
+    }
+
     /// Drop every cached page for a relation (used by TRUNCATE). Unmaps and
     /// cleans the frames but never touches `pins`: a frame a concurrent
     /// `PinnedPage` still holds keeps `pins > 0`, so it is not chosen as an

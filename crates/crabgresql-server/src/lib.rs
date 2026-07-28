@@ -34,7 +34,8 @@ pub fn open_pg_engine(
     let wal = Arc::new(Wal::open(data_dir).map_err(std::io::Error::other)?);
     // The full open + crash-recovery sequence lives in the engine so the server
     // and the recovery tests share exactly one code path.
-    let (engine, clog, next_xid) = PgEngine::open_recovered(data_dir, Arc::clone(&wal))?;
+    let (engine, clog, next_xid) =
+        PgEngine::open_recovered(data_dir, Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
     let mut txnmgr = TransactionManager::new_recovered(sink, clog, next_xid);
     // Wire the engine's finalize hook so commit/abort apply or discard the swaps

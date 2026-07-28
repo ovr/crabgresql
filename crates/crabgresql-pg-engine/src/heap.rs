@@ -181,7 +181,7 @@ impl HeapTable {
         if self.wal_skipped {
             Lsn(0)
         } else {
-            self.engine.wal.append(RmgrId::HEAP, info, xid, payload)
+            self.engine.wal.append(RmgrId::HEAP, info, xid, payload).end
         }
     }
 
@@ -716,7 +716,7 @@ impl TableAm for HeapTable {
                 txn.xid,
                 &rec::truncate(&self.schema.namespace, &self.schema.name, old, new),
             );
-            Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
+            Self::io(self.engine.wal.flush(lsn.end).map_err(std::io::Error::other));
         }
         // Double TRUNCATE in one transaction: the previously staged file is now
         // superseded and, being used only by this uncommitted txn, is discarded.

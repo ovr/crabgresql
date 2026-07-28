@@ -1751,7 +1751,8 @@ impl TableAm for ParquetTable {
         }
         let lsn = self
             .wal
-            .append(RMGR_PARQUET, PARQUET_XID_OBSERVED, txn.xid, &[]);
+            .append(RMGR_PARQUET, PARQUET_XID_OBSERVED, txn.xid, &[])
+            .end;
         if let Err(error) = self.wal.flush(lsn) {
             for (temp, pending) in &staged {
                 let _ = std::fs::remove_file(temp);
@@ -1842,7 +1843,7 @@ impl ParquetTable {
             &encode_truncate(&self.schema.namespace, &self.schema.name, old, new),
         );
         self.wal
-            .flush(lsn)
+            .flush(lsn.end)
             .map_err(|error| io_error("flush Parquet TRUNCATE WAL record", error))?;
         self.staged_xids
             .lock()
@@ -2236,7 +2237,7 @@ mod tests {
             Arc::new(super::ParquetRedo::new(dir.path())),
         );
         let clog = Arc::new(Clog::new());
-        let result = recover(dir.path(), &registry, &clog)?;
+        let result = recover(dir.path(), &registry, &clog, crabgresql_wal::Lsn::INVALID)?;
         assert!(result.next_xid > interrupted_xid);
 
         let committed = open_table(dir.path(), 1, schema("committed", &[PgType::Int4]), Arc::clone(&recovered_wal))?;

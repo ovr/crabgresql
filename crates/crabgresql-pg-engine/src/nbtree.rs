@@ -109,6 +109,15 @@ impl BTree {
         self.engine
             .wal
             .append(RmgrId(btrec::RMGR_BTREE.0), info, Xid::INVALID, payload)
+            .end
+    }
+
+    /// Hold the checkpointer off across a multi-page update. `None` for a
+    /// WAL-skipped (`UNLOGGED`/`TEMPORARY`) tree, which writes no record and so
+    /// has nothing a redo point could strand — that keeps bulk unlogged index
+    /// builds off the barrier entirely.
+    fn checkpoint_delay(&self) -> Option<crabgresql_wal::CheckpointDelay<'_>> {
+        (!self.wal_skipped).then(|| self.engine.wal.delay_checkpoint())
     }
 
     /// Build an empty tree: meta page (block 0) pointing at an empty root leaf
@@ -433,20 +442,42 @@ impl BTree {
             &right_items,
             old_right_sibling,
         );
-        let lsn = self.wal_append(btrec::BT_SPLIT, &payload);
-
+        // A split is one record spanning three pages, so it is the one writer
+        // with a window between "record appended" and "every page it describes
+        // is dirty" — `flush_all` takes frame locks one at a time and can
+        // interleave between the `modify` calls below. Hold the checkpointer off
+        // across the whole window: a redo point sampled inside it would sit above
+        // the record while two of the three pages are still clean, leaving the
+        // split neither on disk nor in the replayed suffix, while the parent
+        // downlink (a later `BT_INSERT`) *is* replayed — descent into an empty
+        // page.
+        // Pin all three pages BEFORE taking the barrier. A `pin` that misses runs
+        // clock-sweep eviction, which fsyncs the WAL and writes the victim out —
+        // holding the barrier across that would stall the checkpointer, and with
+        // it (via the barrier's writer queue) every other index writer, for the
+        // length of an fsync chain. Pinning first leaves the barrier spanning
+        // only in-memory work.
         let left_page = io(self.engine.bufpool.pin(self.rel, blk));
-        left_page.modify(|pg| {
-            btpage::rebuild(pg, &left_opaque, &left_items);
-            page::set_lsn(pg, lsn.0);
-        });
         let right_page = io(self.engine.bufpool.pin(self.rel, right_blk));
+        let sibling = (old_right_sibling != INVALID_BLOCK)
+            .then(|| io(self.engine.bufpool.pin(self.rel, old_right_sibling)));
+
+        let _delay = self.checkpoint_delay();
+
+        // Append inside the left page's `modify`, matching every other page
+        // writer here and in the heap: the record and the first dirty page then
+        // become visible under one frame lock.
+        let lsn = left_page.modify(|pg| {
+            btpage::rebuild(pg, &left_opaque, &left_items);
+            let lsn = self.wal_append(btrec::BT_SPLIT, &payload);
+            page::set_lsn(pg, lsn.0);
+            lsn
+        });
         right_page.modify(|pg| {
             btpage::rebuild(pg, &right_opaque, &right_items);
             page::set_lsn(pg, lsn.0);
         });
-        if old_right_sibling != INVALID_BLOCK {
-            let sib = io(self.engine.bufpool.pin(self.rel, old_right_sibling));
+        if let Some(sib) = sibling {
             sib.modify(|pg| {
                 let mut o = btpage::get_opaque(pg);
                 o.prev = right_blk;
@@ -608,4 +639,127 @@ fn choose_split(sizes: &[usize]) -> usize {
     }
     assert!(best != 0, "btree split found no feasible split point");
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    use crabgresql_storage_api::{
+        Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableEngine, TableSchema,
+    };
+    use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnFinalize};
+    use crabgresql_types::{PgType, Value};
+    use crabgresql_wal::{Lsn, Wal};
+
+    use super::*;
+    use crate::PgEngine;
+
+    /// The ordering a checkpoint must establish: **after `flush_all` completes,
+    /// no frame is still dirty at or below the redo point sampled before it.**
+    ///
+    /// A dirty frame with `pd_lsn <= redo` is a change that a bounded replay
+    /// would skip (its record starts below `redo`) and that was never written
+    /// back — silently lost. `pd_lsn > redo` is fine: the record was appended
+    /// after the sample, so replay reapplies it.
+    ///
+    /// Every other page writer gets this for free by appending *inside* the
+    /// `modify` closure, under the frame lock. A B-tree split cannot: it is one
+    /// record over three pages, dirtied in three separate critical sections, and
+    /// `flush_all` takes frame locks one at a time. `CheckpointDelay` is what
+    /// closes that window.
+    ///
+    /// Checking the invariant in-process catches *every* violation under load,
+    /// rather than only one that happens to survive to the final checkpoint of a
+    /// crash-and-replay test.
+    ///
+    /// Honest scope: this is a load test against a real interleaving, not a
+    /// proof. The window it hunts is roughly a microsecond wide against a much
+    /// longer `flush_all` scan, so removing the delay does **not** reliably make
+    /// it red. What actually establishes the fix is that `redo_point` provably
+    /// cannot return while a delay is held (`crabgresql-wal`'s
+    /// `redo_point_blocks_until_every_delay_is_released`) plus this function
+    /// holding one across the whole three-page window. This test is the
+    /// regression guard for a change that widens the window *systematically*.
+    #[test]
+    fn no_page_stays_dirty_at_or_below_a_sampled_redo_point() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let (engine, clog, next_xid) =
+            PgEngine::open_recovered(dir.path(), Arc::clone(&wal), Lsn::INVALID)?;
+        let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+        let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
+        tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
+
+        let table = engine.create_table(TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        engine.create_index(
+            "public",
+            "t",
+            IndexMetadata {
+                name: "t_id_idx".into(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: false,
+                nulls_distinct: true,
+                constraint: Some(IndexConstraint::Unique),
+            },
+        )?;
+
+        const ROWS: i32 = 6_000;
+        let done = Arc::new(AtomicBool::new(false));
+        let x = tm.allocate_xid();
+
+        std::thread::scope(|s| -> anyhow::Result<()> {
+            let checkpointer = {
+                let (engine, wal, done) =
+                    (Arc::clone(&engine), Arc::clone(&wal), Arc::clone(&done));
+                s.spawn(move || -> anyhow::Result<()> {
+                    let mut rounds = 0u64;
+                    while !done.load(AtomicOrdering::SeqCst) {
+                        // Sample redo BEFORE flushing — the only order that makes
+                        // "flush_all visited the frame before the append implies
+                        // LSN > redo" a complete argument.
+                        let redo = wal.redo_point()?;
+                        engine.bufpool().flush_all()?;
+                        let stranded: Vec<u64> = engine
+                            .bufpool()
+                            .dirty_page_lsns()
+                            .into_iter()
+                            .filter(|&lsn| lsn <= redo.0)
+                            .collect();
+                        assert!(
+                            stranded.is_empty(),
+                            "pages {stranded:?} are dirty at or below redo {redo} \
+                             after flush_all: neither on disk nor replayed"
+                        );
+                        rounds += 1;
+                    }
+                    assert!(rounds > 0, "the checkpointer never ran a round");
+                    Ok(())
+                })
+            };
+
+            // Shuffled order so splits happen mid-tree, not only at the right edge.
+            let ctx = tm.context(x, CommandId::FIRST);
+            let mut id = 1i32;
+            for _ in 0..ROWS {
+                table.insert(vec![Value::Int4(id)], &ctx)?;
+                id = (id + 1237) % ROWS;
+            }
+            done.store(true, AtomicOrdering::SeqCst);
+            checkpointer
+                .join()
+                .map_err(|_| anyhow::anyhow!("checkpointer thread panicked"))?
+        })?;
+        tm.commit(x)?;
+
+        Ok(())
+    }
 }
