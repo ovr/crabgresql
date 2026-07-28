@@ -39,9 +39,13 @@ struct Delay {
     /// Writers currently inside a "record appended, effect not yet published"
     /// window.
     active: u64,
-    /// A checkpointer is waiting to sample the redo point. New delays queue
-    /// behind it, so a steady stream of writers cannot starve it.
-    wanted: bool,
+    /// How many checkpointers are waiting to sample the redo point. New delays
+    /// queue behind them, so a steady stream of writers cannot starve one.
+    ///
+    /// A count, not a flag: with a flag, the first sampler to finish would clear
+    /// it while a second was still waiting, admitting writers again and starving
+    /// exactly the caller the mechanism exists to protect.
+    wanted: u64,
 }
 
 /// The write-ahead log. Cheap [`Wal::append`] stages bytes in memory and returns
@@ -126,7 +130,7 @@ impl Wal {
             cond: Condvar::new(),
             delay: Mutex::new(Delay {
                 active: 0,
-                wanted: false,
+                wanted: 0,
             }),
             delay_cond: Condvar::new(),
         })
@@ -144,7 +148,7 @@ impl Wal {
             .delay
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        while delay.wanted {
+        while delay.wanted > 0 {
             delay = match self.delay_cond.wait(delay) {
                 Ok(delay) => delay,
                 Err(_) => panic!("WAL checkpoint-delay condition-variable mutex poisoned"),
@@ -156,29 +160,46 @@ impl Wal {
 
     /// The redo point — a record boundary at or above which replay must resume.
     /// Blocks until every outstanding [`CheckpointDelay`] is released, so on
-    /// return every record below the result has its effect published.
+    /// return every record below the result has its effect published, and the
+    /// result is **durable**: the returned LSN is always backed by bytes on
+    /// disk.
+    ///
+    /// The flush is not a convenience. Recovery hard-errors when asked to resume
+    /// past end-of-file, so publishing a redo point sampled from the staged
+    /// insert position — which [`Wal::current_lsn`] documents as "durable or
+    /// not" — would leave a cluster that refuses to start after a crash.
+    /// Recovery also relies on it in the other direction: because the redo point
+    /// never exceeds the flush boundary, a record torn *at* the redo point is
+    /// impossible, which is what lets a failure to decode there be treated as a
+    /// bad redo point rather than an ordinary torn tail.
     ///
     /// A checkpoint must sample this **before** flushing buffers, never after:
     /// sampling afterwards would let a page dirtied during the flush pass carry
     /// an LSN below the redo point, leaving it neither written back nor
     /// replayed.
-    pub fn redo_point(&self) -> Lsn {
-        let mut delay = self
-            .delay
-            .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"));
-        delay.wanted = true;
-        while delay.active > 0 {
-            delay = match self.delay_cond.wait(delay) {
-                Ok(delay) => delay,
-                Err(_) => panic!("WAL checkpoint-delay condition-variable mutex poisoned"),
-            };
-        }
-        // Lock order delay -> inner; nothing takes them the other way round.
-        let lsn = self.current_lsn();
-        delay.wanted = false;
-        self.delay_cond.notify_all();
-        lsn
+    pub fn redo_point(&self) -> Result<Lsn, WalError> {
+        let lsn = {
+            let mut delay = self
+                .delay
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"));
+            delay.wanted += 1;
+            while delay.active > 0 {
+                delay = match self.delay_cond.wait(delay) {
+                    Ok(delay) => delay,
+                    Err(_) => panic!("WAL checkpoint-delay condition-variable mutex poisoned"),
+                };
+            }
+            // Lock order delay -> inner; nothing takes them the other way round.
+            let lsn = self.current_lsn();
+            delay.wanted -= 1;
+            self.delay_cond.notify_all();
+            lsn
+        };
+        // Outside the barrier: an fsync here would otherwise block every writer
+        // taking a delay, for no benefit — the sample is already fixed.
+        self.flush(lsn)?;
+        Ok(lsn)
     }
 
     /// Truncate the stream back to `lsn`, discarding anything after it. Used
@@ -490,11 +511,37 @@ mod tests {
     fn redo_point_is_the_insert_lsn_when_nothing_is_delayed() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Wal::open(dir.path())?;
-        assert_eq!(wal.redo_point(), Lsn::INVALID);
+        assert_eq!(wal.redo_point()?, Lsn::INVALID);
         let range = wal.append(RmgrId::HEAP, 0, Xid(3), b"a");
-        assert_eq!(wal.redo_point(), range.end);
+        assert_eq!(wal.redo_point()?, range.end);
         // Repeatable: sampling does not consume anything.
-        assert_eq!(wal.redo_point(), wal.current_lsn());
+        assert_eq!(wal.redo_point()?, wal.current_lsn());
+
+        Ok(())
+    }
+
+    /// The redo point must never name a byte past the end of the on-disk log:
+    /// recovery hard-errors on that, so publishing one would leave a cluster
+    /// that refuses to start.
+    #[test]
+    fn redo_point_is_durable_on_return() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        // Staged but never explicitly flushed.
+        let range = wal.append(RmgrId::HEAP, 0, Xid(3), b"staged-only");
+        assert_eq!(wal.flushed_lsn(), Lsn::INVALID, "nothing flushed yet");
+
+        let redo = wal.redo_point()?;
+        assert_eq!(redo, range.end);
+        assert!(
+            wal.flushed_lsn() >= redo,
+            "redo_point must flush through the LSN it returns"
+        );
+        let on_disk = std::fs::metadata(wal_path(dir.path()))?.len();
+        assert!(
+            on_disk >= redo.0,
+            "the file must be at least as long as the redo point ({on_disk} < {redo})"
+        );
 
         Ok(())
     }
@@ -548,7 +595,7 @@ mod tests {
             drop(delay);
             let lsn = handle
                 .join()
-                .map_err(|_| anyhow::anyhow!("redo_point sampler panicked"))?;
+                .map_err(|_| anyhow::anyhow!("redo_point sampler panicked"))??;
             assert!(
                 lsn >= during.end,
                 "once the delay is released the sample covers the whole window"

@@ -33,4 +33,4 @@ pub use control::{ControlFile, read_control, write_control};
 pub use record::{Lsn, LsnRange, WalError, WalRecord};
 pub use recovery::{RecoveryResult, recover};
 pub use rmgr::{RedoContext, RmgrId, RmgrRedo, RmgrRegistry, XACT_ABORT, XACT_COMMIT};
-pub use wal::{CheckpointDelay, Wal};
+pub use wal::{CheckpointDelay, Wal, wal_path};

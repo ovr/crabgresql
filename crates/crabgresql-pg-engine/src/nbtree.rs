@@ -451,25 +451,33 @@ impl BTree {
         // split neither on disk nor in the replayed suffix, while the parent
         // downlink (a later `BT_INSERT`) *is* replayed — descent into an empty
         // page.
+        // Pin all three pages BEFORE taking the barrier. A `pin` that misses runs
+        // clock-sweep eviction, which fsyncs the WAL and writes the victim out —
+        // holding the barrier across that would stall the checkpointer, and with
+        // it (via the barrier's writer queue) every other index writer, for the
+        // length of an fsync chain. Pinning first leaves the barrier spanning
+        // only in-memory work.
+        let left_page = io(self.engine.bufpool.pin(self.rel, blk));
+        let right_page = io(self.engine.bufpool.pin(self.rel, right_blk));
+        let sibling = (old_right_sibling != INVALID_BLOCK)
+            .then(|| io(self.engine.bufpool.pin(self.rel, old_right_sibling)));
+
         let _delay = self.checkpoint_delay();
 
         // Append inside the left page's `modify`, matching every other page
         // writer here and in the heap: the record and the first dirty page then
         // become visible under one frame lock.
-        let left_page = io(self.engine.bufpool.pin(self.rel, blk));
         let lsn = left_page.modify(|pg| {
             btpage::rebuild(pg, &left_opaque, &left_items);
             let lsn = self.wal_append(btrec::BT_SPLIT, &payload);
             page::set_lsn(pg, lsn.0);
             lsn
         });
-        let right_page = io(self.engine.bufpool.pin(self.rel, right_blk));
         right_page.modify(|pg| {
             btpage::rebuild(pg, &right_opaque, &right_items);
             page::set_lsn(pg, lsn.0);
         });
-        if old_right_sibling != INVALID_BLOCK {
-            let sib = io(self.engine.bufpool.pin(self.rel, old_right_sibling));
+        if let Some(sib) = sibling {
             sib.modify(|pg| {
                 let mut o = btpage::get_opaque(pg);
                 o.prev = right_blk;
@@ -718,7 +726,7 @@ mod tests {
                         // Sample redo BEFORE flushing — the only order that makes
                         // "flush_all visited the frame before the append implies
                         // LSN > redo" a complete argument.
-                        let redo = wal.redo_point();
+                        let redo = wal.redo_point()?;
                         engine.bufpool().flush_all()?;
                         let stranded: Vec<u64> = engine
                             .bufpool()

@@ -1,6 +1,10 @@
 //! Shared helpers for the durable-engine integration tests: open/reopen an
 //! engine over a data directory (the "crash = drop without checkpoint, then
 //! reopen" idiom), and mutate on-disk files to simulate torn/corrupt media.
+//!
+//! This module is compiled into each integration-test binary separately, so any
+//! helper a given binary does not call looks unused there.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,9 +76,11 @@ pub fn open_from_with_wal(
     Ok((engine, tm, wal))
 }
 
-/// The WAL stream file, for tests that corrupt or truncate it directly.
+/// The WAL stream file, for tests that corrupt or truncate it directly. Defers
+/// to the WAL crate so the layout is defined in exactly one place — a test that
+/// scribbled a stale path would silently become a no-op and still pass.
 pub fn wal_file_path(dir: &Path) -> PathBuf {
-    dir.join("pg_wal").join("wal")
+    crabgresql_wal::wal_path(dir)
 }
 
 /// The on-disk path of a relation's data file: `<dir>/base/<relfilenode>`.

@@ -347,10 +347,10 @@ fn a_bounded_replay_after_a_checkpoint_keeps_every_split_reachable() -> anyhow::
                 s.spawn(move || -> anyhow::Result<()> {
                     while !done.load(Ordering::SeqCst) {
                         // The ordering a real checkpointer must use: sample redo
-                        // BEFORE flushing buffers, and make the redo point itself
-                        // durable before anything can name it.
-                        let point = wal.redo_point();
-                        wal.flush(point)?;
+                        // BEFORE flushing buffers. `redo_point` makes the point
+                        // itself durable, so nothing here can name a byte past
+                        // the end of the on-disk log.
+                        let point = wal.redo_point()?;
                         engine.checkpoint(next_xid)?;
                         redo.fetch_max(point.0, Ordering::SeqCst);
                     }
