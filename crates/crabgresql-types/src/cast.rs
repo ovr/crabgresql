@@ -172,6 +172,25 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         )
         .map(|r| Value::Int8(r as i64)),
 
+        // ---- bool → text / varchar / bpchar ----
+        // PG spells these out via its dedicated `booltext` cast. Its *output*
+        // function still yields `t`/`f`, which is what display, `concat()` and
+        // the cast to `name` use — so this arm must stay ahead of the generic
+        // any-to-text arm below without replacing it.
+        (Value::Bool(b), PgType::Text | PgType::Varchar | PgType::Bpchar) => {
+            Ok(Value::Text(if *b { "true" } else { "false" }.to_string()))
+        }
+
+        // ---- inet → text / varchar / bpchar ----
+        // Like bool below, `inet` has a dedicated cast that does not agree with
+        // its output function: the cast always spells the masklen out, while
+        // `inet_out` (display, `concat()`, `array_out`, `::name`) omits `/32`
+        // and `/128`. `cidr_out` already always prints one, so `cidr` needs no
+        // arm of its own.
+        (Value::Inet(v), PgType::Text | PgType::Varchar | PgType::Bpchar) => {
+            Ok(Value::Text(crate::net::inet_text(v)))
+        }
+
         // ---- anything → text / varchar / bpchar / name (float uses efd) ----
         // These four share the `text` value representation; any length limit for
         // varchar/bpchar is applied separately as a typmod coercion. A
@@ -874,6 +893,25 @@ mod tests {
 
     fn cast(v: Value, to: PgType) -> Result<Value, CastError> {
         cast_value(v, to, 1)
+    }
+
+    /// PG's `bool -> text` cast spells the value out, even though the type's
+    /// output function (used for display, `concat()` and the cast to `name`)
+    /// stays `t`/`f`.
+    #[test]
+    fn bool_to_text_spells_the_value_out() -> anyhow::Result<()> {
+        for to in [PgType::Text, PgType::Varchar, PgType::Bpchar] {
+            assert_eq!(cast(Value::Bool(true), to)?, Value::Text("true".into()));
+            assert_eq!(cast(Value::Bool(false), to)?, Value::Text("false".into()));
+        }
+        // `name` has no such cast, so it falls back to the output function.
+        assert_eq!(
+            cast(Value::Bool(true), PgType::Name)?,
+            Value::Text("t".into())
+        );
+        assert_eq!(Value::Bool(true).encode_text().as_deref(), Some("t"));
+
+        Ok(())
     }
 
     #[test]

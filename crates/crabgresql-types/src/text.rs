@@ -10,6 +10,7 @@
 /// so `crabgresql-types` needs no dependency on the wire-protocol crate; the
 /// executor maps these onto `crabgresql_pg_wire::sqlstate::*`.
 mod sqlstate {
+    pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
     pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
     pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
     pub const SUBSTRING_ERROR: &str = "22011";
@@ -455,10 +456,40 @@ pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool
 
 // --- regex (`~` / `~*`) and SIMILAR TO -------------------------------------
 
-/// Turn a `regex` crate compile failure into PG's `invalid regular expression`
-/// error (SQLSTATE `2201B`). PG's detail text differs from the `regex` crate's,
-/// but the SQLSTATE and message prefix match observed PG behavior.
-fn invalid_regex(e: regex::Error) -> TextError {
+/// Turn a `regex` crate compile failure into an error.
+///
+/// Two different things can go wrong, and PG distinguishes them by outcome even
+/// though the crate does not: the pattern may be *malformed*, which PG also
+/// rejects (`2201B`, matching its `invalid regular expression: ...`), or it may
+/// be perfectly valid POSIX that this engine cannot execute — a backreference
+/// or a look-around, both of which PG supports. Reporting the second kind as a
+/// syntax error would be a lie, and silently treating it as "no match" would
+/// return wrong rows, so it is `0A000`.
+///
+/// `regex::Error` is opaque (`Syntax(String)`), so the pattern is re-parsed
+/// with `regex_syntax` to classify it. That only happens on the error path.
+fn invalid_regex(e: regex::Error, source: &str, opts: ReOpts) -> TextError {
+    use regex_syntax::ast::ErrorKind;
+
+    let unsupported = matches!(
+        regex_syntax::ParserBuilder::new()
+            .case_insensitive(opts.case_insensitive)
+            .multi_line(opts.multi_line)
+            .dot_matches_new_line(opts.dot_all)
+            .build()
+            .parse(source),
+        Err(regex_syntax::Error::Parse(ref e))
+            if matches!(
+                e.kind(),
+                ErrorKind::UnsupportedBackreference | ErrorKind::UnsupportedLookAround
+            )
+    );
+    if unsupported {
+        return TextError::new(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "regular expression backreferences and look-around are not supported",
+        );
+    }
     // The crate's `Display` is multi-line; collapse to a single line so the
     // message reads like PG's one-line `invalid regular expression: ...`.
     let detail = e.to_string().split('\n').collect::<Vec<_>>().join(" ");
@@ -468,24 +499,693 @@ fn invalid_regex(e: regex::Error) -> TextError {
     )
 }
 
+/// The compile-time options a PG regex flags string resolves to.
+///
+/// The defaults are PG's, *not* the `regex` crate's: an unadorned PG regex is
+/// "newline-insensitive", meaning `.` matches a newline and `^`/`$` anchor only
+/// at the ends of the string. The crate defaults to the opposite `.`, so
+/// `dot_all` starts out `true`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReOpts {
+    case_insensitive: bool,
+    multi_line: bool,
+    dot_all: bool,
+    ignore_whitespace: bool,
+    /// The `q` flag: the pattern is a literal string, not a regex.
+    literal: bool,
+}
+
+impl Default for ReOpts {
+    fn default() -> Self {
+        ReOpts {
+            case_insensitive: false,
+            multi_line: false,
+            dot_all: true,
+            ignore_whitespace: false,
+            literal: false,
+        }
+    }
+}
+
+/// Parse a PG regex flags string into compile options plus the `g` ("global")
+/// flag, which is not a compile option but a per-function behavior switch.
+///
+/// Later flags override earlier ones, so `ig` and `ci` behave as in PG. An
+/// unrecognized flag is `22023`.
+fn parse_re_flags(flags: &str) -> Result<(ReOpts, bool)> {
+    let mut opts = ReOpts::default();
+    let mut global = false;
+    for c in flags.chars() {
+        match c {
+            'g' => global = true,
+            'i' => opts.case_insensitive = true,
+            'c' => opts.case_insensitive = false,
+            'x' => opts.ignore_whitespace = true,
+            // `t` ("tight") is the inverse of `x`, and the default.
+            't' => opts.ignore_whitespace = false,
+            // PG's four newline-sensitivity modes. `s` is the default; `n`/`m`
+            // make both `.` and the anchors newline-aware, while `p` and `w`
+            // each flip only one of the two.
+            's' => {
+                opts.multi_line = false;
+                opts.dot_all = true;
+            }
+            'n' | 'm' => {
+                opts.multi_line = true;
+                opts.dot_all = false;
+            }
+            'p' => {
+                opts.multi_line = false;
+                opts.dot_all = false;
+            }
+            'w' => {
+                opts.multi_line = true;
+                opts.dot_all = true;
+            }
+            'q' => opts.literal = true,
+            // `b` and `e` select a BRE and an ERE, grammars in which `+`, `(`
+            // and the `\d`-style shorthands mean something else than they do in
+            // the ARE this engine speaks. Accepting either as a no-op would
+            // silently return wrong rows, so both are refused outright.
+            'b' => {
+                return Err(TextError::new(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "basic regular expressions (flag \"b\") are not supported",
+                ));
+            }
+            'e' => {
+                return Err(TextError::new(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "extended regular expressions (flag \"e\") are not supported",
+                ));
+            }
+            other => {
+                return Err(TextError::new(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    format!("invalid regular expression option: \"{other}\""),
+                ));
+            }
+        }
+    }
+    // A literal pattern has no syntax to expand or to anchor, so PG refuses `q`
+    // alongside expanded mode or any of the newline modes. `s` is the default
+    // and `i` still applies, so neither of those is a conflict.
+    if opts.literal && (opts.ignore_whitespace || opts.multi_line || !opts.dot_all) {
+        return Err(TextError::new(
+            sqlstate::INVALID_REGULAR_EXPRESSION,
+            "invalid regular expression: invalid argument to regex function",
+        ));
+    }
+    Ok((opts, global))
+}
+
+/// Rewrite `pattern` for the two PG behaviors the `regex` crate cannot express
+/// through builder options. Both need to know where bracket expressions start
+/// and end, so one walk does both:
+///
+///   * expanded mode (`x`): whitespace and `#` comments are ignored, but *not*
+///     inside a bracket expression, where PG keeps them significant. The
+///     crate's `ignore_whitespace` strips them everywhere, so we strip them
+///     ourselves and leave that option off.
+///   * newline-sensitive modes (`n`/`m`/`p`): a negated bracket expression must
+///     not match a newline. The crate's `dot_matches_new_line` covers only `.`,
+///     so each `[^...]` is intersected with `[^\n]` using the crate's character
+///     class intersection. Wrapping the class whole is what makes this safe —
+///     injecting `\n` into it would turn a leading or trailing `-` into a range.
+fn rewrite_pattern(pattern: &str, opts: ReOpts) -> Result<String> {
+    let expand = opts.ignore_whitespace;
+    let no_newline = !opts.dot_all;
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // An escape always carries its next character through untouched, so
+            // `\ ` stays a literal space even in expanded mode.
+            '\\' => {
+                out.push('\\');
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '[' => {
+                let (class, closed) = take_bracket(&mut chars);
+                if !closed {
+                    // Hand the imbalance to the compiler rather than inventing a
+                    // terminator, so a malformed class stays an error.
+                    out.push('[');
+                    out.push_str(&class);
+                } else if no_newline && class.starts_with('^') {
+                    // Negated, and `class` already carries its own leading `^`.
+                    out.push_str("[[");
+                    out.push_str(&class);
+                    out.push_str("]&&[^\\n]]");
+                } else {
+                    out.push('[');
+                    out.push_str(&class);
+                    out.push(']');
+                }
+            }
+            // Expanded mode ignores whitespace, but not *within* a
+            // multi-character symbol: PG rejects `( ?:` rather than reading it
+            // as `(?:`. Only `(?` is checked; other multi-character symbols
+            // cannot be split by whitespace in this dialect.
+            '(' if expand => {
+                out.push('(');
+                let mut ahead = chars.clone();
+                let mut spaced = false;
+                while ahead.peek().is_some_and(|c| c.is_whitespace()) {
+                    ahead.next();
+                    spaced = true;
+                }
+                if ahead.peek() == Some(&'?') {
+                    if spaced {
+                        return Err(TextError::new(
+                            sqlstate::INVALID_REGULAR_EXPRESSION,
+                            "invalid regular expression: quantifier operand invalid",
+                        ));
+                    }
+                    // Copy `(?` and the character that completes the symbol
+                    // without giving whitespace a chance to be stripped.
+                    chars.next();
+                    out.push('?');
+                    match chars.next() {
+                        Some(c) if c.is_whitespace() => {
+                            return Err(TextError::new(
+                                sqlstate::INVALID_REGULAR_EXPRESSION,
+                                "invalid regular expression: quantifier operand invalid",
+                            ));
+                        }
+                        Some(c) => out.push(c),
+                        None => {}
+                    }
+                }
+            }
+            '#' if expand => {
+                // A comment runs to the end of the line.
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            c if expand && c.is_whitespace() => {}
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
+/// Consume a bracket expression's body from `chars`, which is positioned just
+/// after the opening `[`, and return it without the enclosing brackets together
+/// with whether the closing `]` was actually found.
+///
+/// Handles the POSIX rules that make `]` a literal member: a leading `^` and a
+/// `]` in first position, plus `[:name:]`/`[.x.]`/`[=x=]` sub-expressions and a
+/// backslash escape. A caller must **not** supply a closing `]` of its own when
+/// `closed` is false: leaving the class unbalanced is what makes the regex
+/// compiler report PG's `brackets [] not balanced`, instead of silently turning
+/// a malformed pattern into a valid one that matches.
+fn take_bracket(chars: &mut std::iter::Peekable<std::str::Chars>) -> (String, bool) {
+    let mut body = String::new();
+    if chars.peek() == Some(&'^') {
+        body.push('^');
+        chars.next();
+    }
+    if chars.peek() == Some(&']') {
+        body.push(']');
+        chars.next();
+    }
+    while let Some(c) = chars.next() {
+        match c {
+            ']' => return (body, true),
+            // `[:alpha:]` and friends: copy through to the matching delimiter so
+            // the inner `]` does not close the outer class.
+            '[' if matches!(chars.peek(), Some(':' | '.' | '=')) => {
+                let kind = chars.next().unwrap_or(':');
+                body.push('[');
+                body.push(kind);
+                while let Some(c) = chars.next() {
+                    body.push(c);
+                    if c == kind && chars.peek() == Some(&']') {
+                        body.push(']');
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // An escape inside a class still carries its next character.
+            '\\' => {
+                body.push('\\');
+                if let Some(next) = chars.next() {
+                    body.push(next);
+                }
+            }
+            other => body.push(other),
+        }
+    }
+    (body, false)
+}
+
+/// How the cached pattern text turns into a regex. Caching on the *user's*
+/// pattern rather than on the compiled source keeps `SIMILAR TO`'s translation
+/// out of the per-row path too, not just the compile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternKind {
+    /// A POSIX regex, compiled under these options.
+    Regex(ReOpts),
+    /// A `SIMILAR TO` pattern, translated first (see [`similar_to_regex`]).
+    SimilarTo(Option<char>),
+}
+
+/// How many compiled patterns to keep per thread. The bound exists to cap
+/// per-thread memory for a cache consulted once per row; the exact depth is not
+/// observable, so any small number would do.
+const RE_CACHE_MAX: usize = 32;
+
+thread_local! {
+    /// Most-recently-used first. Cloning a `Regex` is *not* free — it allocates
+    /// a fresh, empty match-state pool — so entries are lent out by reference
+    /// (see [`with_cached`]) rather than cloned per row.
+    static RE_CACHE: std::cell::RefCell<Vec<(String, PatternKind, regex::Regex)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Compile `pattern` according to `kind` (reusing a cached `Regex` when one is
+/// live) and run `f` against it.
+///
+/// `f` must not itself call back into the cache: the entry is lent out while
+/// the thread-local is borrowed, so re-entering would panic. Every caller in
+/// this module runs a single match and returns an owned result.
+fn with_cached<T>(
+    pattern: &str,
+    kind: PatternKind,
+    f: impl FnOnce(&regex::Regex) -> T,
+) -> Result<T> {
+    RE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        match cache
+            .iter()
+            .position(|(p, k, _)| *k == kind && p == pattern)
+        {
+            Some(idx) => {
+                // Promote to most-recently-used. Already-hot patterns (the
+                // common case for a per-row scan) need no shuffling at all.
+                if idx != 0 {
+                    cache[..=idx].rotate_right(1);
+                }
+            }
+            None => {
+                // The `q` flag makes the whole pattern a literal string;
+                // otherwise apply the rewrites the crate cannot express.
+                let (opts, source) = match kind {
+                    PatternKind::SimilarTo(escape) => {
+                        (ReOpts::default(), similar_to_regex(pattern, escape)?)
+                    }
+                    PatternKind::Regex(opts) if opts.literal => (opts, regex::escape(pattern)),
+                    PatternKind::Regex(opts) => (opts, rewrite_pattern(pattern, opts)?),
+                };
+                let re = regex::RegexBuilder::new(&source)
+                    .case_insensitive(opts.case_insensitive)
+                    .multi_line(opts.multi_line)
+                    .dot_matches_new_line(opts.dot_all)
+                    .build()
+                    .map_err(|e| invalid_regex(e, &source, opts))?;
+                cache.insert(0, (pattern.to_string(), kind, re));
+                cache.truncate(RE_CACHE_MAX);
+            }
+        }
+        Ok(f(&cache[0].2))
+    })
+}
+
 /// POSIX regex match, backing the `~` (case-sensitive) and `~*`
 /// (case-insensitive) operators. The match is *unanchored*: `~` succeeds when
 /// the pattern matches anywhere in `s`, as in PG.
 pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<bool> {
-    let re = regex::RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()
-        .map_err(invalid_regex)?;
-    Ok(re.is_match(s))
+    let opts = ReOpts {
+        case_insensitive,
+        ..ReOpts::default()
+    };
+    with_cached(pattern, PatternKind::Regex(opts), |re| re.is_match(s))
+}
+
+/// The flag set jsonpath's `like_regex ... flag "..."` accepts. It is
+/// XQuery-flavored rather than POSIX, so it is both a different set and a
+/// different default from [`parse_re_flags`]: `.` does *not* span a newline
+/// unless `s` asks for it.
+///
+/// Held as a parsed set rather than the literal text because PG re-emits it in
+/// a fixed order with duplicates collapsed, so `flag "qmi"` prints as
+/// `flag "imq"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LikeRegexFlags {
+    /// `i` — case-insensitive.
+    pub icase: bool,
+    /// `s` — `.` matches a newline.
+    pub dotall: bool,
+    /// `m` — `^`/`$` match at line boundaries.
+    pub mline: bool,
+    /// `x` — expanded mode. PG rejects this flag unless `q` is also present,
+    /// and `q` makes the pattern literal, so it never affects a match.
+    pub wspace: bool,
+    /// `q` — the pattern is a literal string.
+    pub quote: bool,
+}
+
+impl LikeRegexFlags {
+    /// Parse a flag string, reporting the first unrecognized character.
+    pub fn parse(flags: &str) -> std::result::Result<Self, char> {
+        let mut out = LikeRegexFlags::default();
+        for c in flags.chars() {
+            match c {
+                'i' => out.icase = true,
+                's' => out.dotall = true,
+                'm' => out.mline = true,
+                'x' => out.wspace = true,
+                'q' => out.quote = true,
+                other => return Err(other),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == LikeRegexFlags::default()
+    }
+
+    /// PG's spelling of the set: the flags it contains, in a fixed order.
+    pub fn canonical(self) -> String {
+        let mut out = String::new();
+        for (on, c) in [
+            (self.icase, 'i'),
+            (self.dotall, 's'),
+            (self.mline, 'm'),
+            (self.wspace, 'x'),
+            (self.quote, 'q'),
+        ] {
+            if on {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn opts(self) -> ReOpts {
+        ReOpts {
+            case_insensitive: self.icase,
+            multi_line: self.mline,
+            dot_all: self.dotall,
+            // Never set: `x` only survives parsing alongside `q`, which escapes
+            // the whole pattern, leaving expanded mode unobservable.
+            ignore_whitespace: false,
+            literal: self.quote,
+        }
+    }
+}
+
+/// jsonpath's `like_regex`.
+pub fn like_regex_match(s: &str, pattern: &str, flags: LikeRegexFlags) -> Result<bool> {
+    with_cached(pattern, PatternKind::Regex(flags.opts()), |re| {
+        re.is_match(s)
+    })
+}
+
+/// Compile-check a `like_regex` pattern without matching anything, as PG does
+/// while *parsing* the path — a bad pattern is an error on the cast, not on the
+/// row. The compile is not wasted work: it seats the pattern at the head of the
+/// per-thread cache, where the first evaluation finds it.
+pub fn like_regex_compile(pattern: &str, flags: LikeRegexFlags) -> Result<()> {
+    with_cached(pattern, PatternKind::Regex(flags.opts()), |_| ())
 }
 
 /// `SIMILAR TO`: an SQL-standard pattern language distinct from both LIKE and
 /// POSIX regex. It is case-sensitive and matches the *whole* string (unlike
 /// `~`). We translate it to a POSIX regex and delegate to the `regex` crate.
 pub fn similar_to_match(s: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
-    let translated = similar_to_regex(pattern, escape)?;
-    let re = regex::Regex::new(&translated).map_err(invalid_regex)?;
-    Ok(re.is_match(s))
+    // The cache is keyed on the SIMILAR TO pattern itself, so a repeated row
+    // skips the translation as well as the compile.
+    with_cached(pattern, PatternKind::SimilarTo(escape), |re| re.is_match(s))
+}
+
+// --- regexp_* functions ----------------------------------------------------
+
+/// Reject the `g` flag for the functions that match at most once. PG raises
+/// this *before* compiling the pattern, so an invalid pattern combined with `g`
+/// still reports the `g` problem.
+fn reject_global(func: &str) -> TextError {
+    TextError::new(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        format!("{func}() does not support the \"global\" option"),
+    )
+}
+
+fn invalid_parameter(name: &str, value: i32) -> TextError {
+    TextError::new(
+        sqlstate::INVALID_PARAMETER_VALUE,
+        format!("invalid value for parameter \"{name}\": {value}"),
+    )
+}
+
+/// Translate a 1-based *character* `start` into a byte offset. `Ok(None)` means
+/// `start` lies past the end of the string, where PG simply finds no match.
+fn start_offset(s: &str, start: i32) -> Result<Option<usize>> {
+    if start < 1 {
+        return Err(invalid_parameter("start", start));
+    }
+    // `start` may legitimately point one past the last character, so extend the
+    // offsets with the end of the string.
+    let mut offsets = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()));
+    Ok(offsets.nth(start as usize - 1))
+}
+
+/// Rewrite a PG replacement string into the `regex` crate's `$`-based syntax.
+///
+/// PG recognizes `\1`..`\9` (capture group), `\&` (the whole match) and `\\`
+/// (a literal backslash). A backslash before anything else is *not* an error:
+/// PG emits both characters literally, so `\q` stays `\q`. A group reference
+/// with no corresponding group expands to the empty string, which is also what
+/// the `regex` crate does.
+fn translate_replacement(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // `$` is a metacharacter for the crate but a literal for PG.
+            '$' => out.push_str("$$"),
+            '\\' => match chars.peek() {
+                // Braced so that `\1x` stays group 1 rather than group `1x`.
+                // Only one digit is consumed: PG reads `\10` as group 1 then
+                // a literal `0`.
+                Some(&d @ '1'..='9') => {
+                    chars.next();
+                    out.push_str("${");
+                    out.push(d);
+                    out.push('}');
+                }
+                Some('&') => {
+                    chars.next();
+                    out.push_str("${0}");
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                // Any other escape (and a trailing lone backslash) is literal;
+                // leave the following character for the next iteration so it
+                // still gets its own escaping.
+                _ => out.push('\\'),
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+thread_local! {
+    /// The last replacement string and its translation. The replacement is a
+    /// constant literal in nearly every query, so this keeps the rewrite off
+    /// the per-row path the way [`RE_CACHE`] keeps compilation off it. One slot
+    /// is enough: a query has one replacement.
+    static LAST_REPLACEMENT: std::cell::RefCell<(String, String)> =
+        const { std::cell::RefCell::new((String::new(), String::new())) };
+}
+
+fn translate_replacement_cached(replacement: &str) -> String {
+    LAST_REPLACEMENT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.0 != replacement {
+            *slot = (replacement.to_string(), translate_replacement(replacement));
+        }
+        slot.1.clone()
+    })
+}
+
+/// `regexp_replace(source, pattern, replacement [, flags])`. Without the `g`
+/// flag only the first match is replaced.
+pub fn regexp_replace(s: &str, pattern: &str, replacement: &str, flags: &str) -> Result<String> {
+    regexp_replace_at(s, pattern, replacement, 1, None, flags)
+}
+
+/// `regexp_replace(source, pattern, replacement, start [, n [, flags]])`.
+///
+/// `n` is `None` for the flags-only form, where `g` chooses between the first
+/// match and all of them. When it is given it wins over `g`: `0` means every
+/// match at or after `start`, and `k` means only the `k`th.
+pub fn regexp_replace_at(
+    s: &str,
+    pattern: &str,
+    replacement: &str,
+    start: i32,
+    n: Option<i32>,
+    flags: &str,
+) -> Result<String> {
+    let offset = start_offset(s, start)?;
+    if let Some(n) = n
+        && n < 0
+    {
+        return Err(invalid_parameter("n", n));
+    }
+    let (opts, global) = parse_re_flags(flags)?;
+    let replacement = translate_replacement_cached(replacement);
+    // A `start` past the end of the string leaves it untouched.
+    let Some(offset) = offset else {
+        return Ok(s.to_string());
+    };
+    with_cached(pattern, PatternKind::Regex(opts), |re| {
+        // Walking the matches explicitly rather than calling `replace_all`,
+        // which suppresses a zero-width match sitting where the previous match
+        // ended; PG replaces it.
+        let mut out = String::with_capacity(s.len());
+        let mut copied = 0;
+        let mut cursor = offset;
+        let mut seen = 0;
+        while let Some(caps) = re.captures_at(s, cursor) {
+            let m = caps.get(0).expect("group 0 always participates");
+            seen += 1;
+            if n.is_none_or(|k| k == 0 || k == seen) {
+                out.push_str(&s[copied..m.start()]);
+                caps.expand(&replacement, &mut out);
+                copied = m.end();
+            }
+            let last = match n {
+                Some(0) => false,
+                Some(k) => seen >= k,
+                None => !global,
+            };
+            cursor = advance(s, &m);
+            if last || cursor > s.len() {
+                break;
+            }
+        }
+        out.push_str(&s[copied..]);
+        out
+    })
+}
+
+/// `regexp_like(string, pattern [, flags])` — the functional spelling of `~`.
+pub fn regexp_like(s: &str, pattern: &str, flags: &str) -> Result<bool> {
+    let (opts, global) = parse_re_flags(flags)?;
+    if global {
+        return Err(reject_global("regexp_like"));
+    }
+    with_cached(pattern, PatternKind::Regex(opts), |re| re.is_match(s))
+}
+
+/// Where the scan resumes after `m`. Emptiness is decided by the *match*, not
+/// by where the search started: an empty match found ahead of the cursor would
+/// otherwise leave the cursor sitting on it and be found a second time. A
+/// zero-width match advances by a whole character so the scan cannot stall.
+fn advance(s: &str, m: &regex::Match<'_>) -> usize {
+    if m.end() > m.start() {
+        return m.end();
+    }
+    let end = m.end();
+    s[end..]
+        .chars()
+        .next()
+        .map_or(end + 1, |c| end + c.len_utf8())
+}
+
+/// `regexp_count(string, pattern [, start [, flags]])` — non-overlapping
+/// matches at or after the 1-based character position `start`.
+pub fn regexp_count(s: &str, pattern: &str, start: i32, flags: &str) -> Result<i32> {
+    let offset = start_offset(s, start)?;
+    let (opts, global) = parse_re_flags(flags)?;
+    if global {
+        return Err(reject_global("regexp_count"));
+    }
+    let Some(offset) = offset else {
+        return Ok(0);
+    };
+    with_cached(pattern, PatternKind::Regex(opts), |re| {
+        // PG re-seeds the non-overlapping scan *at* `start`, so a match that
+        // began earlier is re-found clipped rather than skipped. `find_at`
+        // keeps `^` and look-behind aware of the text before `start`, which
+        // slicing the haystack would not.
+        let mut cursor = offset;
+        let mut count: i32 = 0;
+        while let Some(m) = re.find_at(s, cursor) {
+            count = count.saturating_add(1);
+            cursor = advance(s, &m);
+            if cursor > s.len() {
+                break;
+            }
+        }
+        count
+    })
+}
+
+/// `regexp_substr(string, pattern [, start [, n [, flags [, subexpr]]]])` — the
+/// `n`th match at or after `start`, or its `subexpr`th capture group. Returns
+/// `None` (SQL NULL) when there is no such match or the group did not
+/// participate.
+pub fn regexp_substr(
+    s: &str,
+    pattern: &str,
+    start: i32,
+    n: i32,
+    flags: &str,
+    subexpr: i32,
+) -> Result<Option<String>> {
+    let offset = start_offset(s, start)?;
+    if n < 1 {
+        return Err(invalid_parameter("n", n));
+    }
+    if subexpr < 0 {
+        return Err(invalid_parameter("subexpr", subexpr));
+    }
+    let (opts, global) = parse_re_flags(flags)?;
+    if global {
+        return Err(reject_global("regexp_substr"));
+    }
+    let Some(offset) = offset else {
+        return Ok(None);
+    };
+    with_cached(pattern, PatternKind::Regex(opts), |re| {
+        // Walk to the `n`th match the same way `regexp_count` counts them.
+        let mut cursor = offset;
+        for _ in 1..n {
+            let m = re.find_at(s, cursor)?;
+            cursor = advance(s, &m);
+            if cursor > s.len() {
+                return None;
+            }
+        }
+        let caps = re.captures_at(s, cursor)?;
+        // A pattern with no subexpressions has no group to ask for, so PG
+        // treats `subexpr` 1 as the whole match. Anything genuinely out of
+        // range, or a group that did not participate, is NULL rather than an
+        // error.
+        let group = if subexpr == 1 && re.captures_len() == 1 {
+            0
+        } else {
+            subexpr as usize
+        };
+        caps.get(group).map(|m| m.as_str().to_string())
+    })
 }
 
 /// Emit `c` as a regex literal, escaping it when it is a regex metacharacter
@@ -506,42 +1206,11 @@ fn push_literal(out: &mut String, c: char) {
 /// sub-expressions are copied whole. An unterminated class is left unbalanced so
 /// the regex compiler rejects it, matching PG's `brackets [] not balanced`.
 fn copy_bracket(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
+    let (body, closed) = take_bracket(chars);
     out.push('[');
-    if chars.peek() == Some(&'^') {
-        out.push('^');
-        chars.next();
-    }
-    if chars.peek() == Some(&']') {
+    out.push_str(&body);
+    if closed {
         out.push(']');
-        chars.next();
-    }
-    while let Some(c) = chars.next() {
-        match c {
-            ']' => {
-                out.push(']');
-                return;
-            }
-            '[' if matches!(chars.peek(), Some(':' | '.' | '=')) => {
-                // A POSIX class/collating/equivalence sub-expression: copy it
-                // through its matching `:]` / `.]` / `=]` so the inner `]` does
-                // not prematurely close the outer class.
-                let Some(&kind) = chars.peek() else {
-                    break;
-                };
-                out.push('[');
-                out.push(kind);
-                chars.next();
-                while let Some(cc) = chars.next() {
-                    out.push(cc);
-                    if cc == kind && chars.peek() == Some(&']') {
-                        out.push(']');
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            other => out.push(other),
-        }
     }
 }
 
@@ -588,14 +1257,14 @@ fn push_brace(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String
 /// Translate a `SIMILAR TO` pattern into an anchored POSIX regex string.
 ///
 /// `%` becomes `.*` and `_` becomes `.` (both match any character, including a
-/// newline — hence the leading `(?s)`); the SQL-regex metacharacters `| * + ? (
-/// )` and valid `{...}` bounds pass through; bracket expressions `[...]` are
-/// copied verbatim (see [`copy_bracket`]); every other character is emitted as a
-/// regex literal. The escape character (default `\`) makes the following
-/// character a literal. The result is wrapped in `(?s)^(?:...)$` so the match
-/// spans the whole string.
+/// newline, which the caller's `dot_all` option provides); the SQL-regex
+/// metacharacters `| * + ? ( )` and valid `{...}` bounds pass through; bracket
+/// expressions `[...]` are copied verbatim (see [`copy_bracket`]); every other
+/// character is emitted as a regex literal. The escape character (default `\`)
+/// makes the following character a literal. The result is wrapped in `^(?:...)$`
+/// so the match spans the whole string.
 fn similar_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
-    let mut out = String::from("(?s)^(?:");
+    let mut out = String::from("^(?:");
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         if Some(c) == escape {
@@ -1201,6 +1870,369 @@ mod tests {
         assert!(e.message.starts_with("invalid regular expression:"));
 
         Ok(())
+    }
+
+    /// PG's regexes are newline-*insensitive* by default: `.` spans newlines
+    /// and the anchors bind to the whole string, the opposite of the `regex`
+    /// crate's defaults.
+    #[test]
+    fn regex_newline_defaults() -> anyhow::Result<()> {
+        assert!(regex_match("a\nb", "a.b", false)?);
+        assert_eq!(regexp_replace("a\nb", "a.b", "X", "")?, "X");
+        // `n`/`m` make both `.` and the anchors newline-aware.
+        assert_eq!(regexp_replace("a\nb", "a.b", "X", "n")?, "a\nb");
+        assert_eq!(regexp_replace("a\nb", "^b", "X", "n")?, "a\nX");
+        // `p` is newline-sensitive for `.` only, `w` for the anchors only.
+        assert_eq!(regexp_replace("a\nb", "^b", "X", "p")?, "a\nb");
+        assert_eq!(regexp_replace("a\nb", "a.b", "X", "w")?, "X");
+
+        Ok(())
+    }
+
+    #[test]
+    fn regex_flags() -> anyhow::Result<()> {
+        assert_eq!(regexp_replace("abc", "B", "X", "i")?, "aXc");
+        // A later flag overrides an earlier one.
+        assert_eq!(regexp_replace("abc", "B", "X", "ic")?, "abc");
+        // `x` ignores whitespace in the pattern; `q` makes it a literal.
+        assert_eq!(regexp_replace("abc", "a b c", "X", "x")?, "X");
+        assert_eq!(regexp_replace("a.c", "a.c", "X", "q")?, "X");
+        assert_eq!(regexp_replace("abc", "a.c", "X", "q")?, "abc");
+        // An unknown flag is 22023; `b` (BRE) is an unimplemented feature.
+        let e = regexp_replace("abc", "b", "X", "z").unwrap_err();
+        assert_eq!(e.sqlstate, "22023");
+        assert_eq!(e.message, "invalid regular expression option: \"z\"");
+        assert_eq!(
+            regexp_replace("abc", "b", "X", "b").unwrap_err().sqlstate,
+            "0A000"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn regexp_replace_substitutions() -> anyhow::Result<()> {
+        // Only the first match without `g`, every match with it.
+        assert_eq!(regexp_replace("a1b2", "[0-9]", "X", "")?, "aXb2");
+        assert_eq!(regexp_replace("a1b2", "[0-9]", "X", "g")?, "aXbX");
+        // `\1`..`\9` are capture groups and `\&` is the whole match.
+        assert_eq!(
+            regexp_replace("1112223333", r"(\d{3})(\d{3})(\d{4})", r"(\1) \2-\3", "")?,
+            "(111) 222-3333"
+        );
+        assert_eq!(regexp_replace("abc", "b", r"[\&]", "")?, "a[b]c");
+        // `\\` is one literal backslash.
+        assert_eq!(regexp_replace("abc", "b", r"\\", "")?, r"a\c");
+        // Only one digit is consumed, so `\10` is group 1 then a literal `0`.
+        assert_eq!(regexp_replace("abc", "(b)", r"[\10]", "")?, "a[b0]c");
+        // A reference to a group that does not exist expands to nothing.
+        assert_eq!(regexp_replace("abc", "(b)", r"[\9]", "")?, "a[]c");
+        // Any other escape keeps both characters, and so does a trailing one.
+        assert_eq!(regexp_replace("abc", "b", r"[\q]", "")?, r"a[\q]c");
+        assert_eq!(regexp_replace("abc", "b", r"x\", "")?, r"ax\c");
+        // `$` is a metacharacter for the `regex` crate but a literal for PG.
+        assert_eq!(regexp_replace("abc", "b", "$1", "")?, "a$1c");
+
+        Ok(())
+    }
+
+    #[test]
+    fn regexp_like_count_substr() -> anyhow::Result<()> {
+        assert!(regexp_like("abc", "B", "i")?);
+        assert!(!regexp_like("abc", "B", "")?);
+
+        assert_eq!(regexp_count("abcabc", "a", 1, "")?, 2);
+        assert_eq!(regexp_count("abcABC", "a", 1, "i")?, 2);
+        assert_eq!(regexp_count("abcabc", "a", 2, "")?, 1);
+        // The scan re-seeds *at* `start` rather than filtering a scan that
+        // began at 0, so a match overlapping an earlier one is still found.
+        assert_eq!(regexp_count("aaaaa", "aa", 2, "")?, 2);
+        // The engine still sees the text before `start`, so `^` stays bound to
+        // the start of the whole string. `xaaa` discriminates: searching a
+        // *slice* from `start` would anchor `^` at the `a` and find one.
+        assert_eq!(regexp_count("xaaa", "^a", 2, "")?, 0);
+        assert_eq!(regexp_substr("xabc", "^abc", 2, 1, "", 0)?, None);
+        // A `start` past the end of the string simply finds nothing.
+        assert_eq!(regexp_count("abc", "b", 9, "")?, 0);
+        // An empty match must advance the cursor, not stall it — and a
+        // zero-width match found *ahead* of the cursor must not be re-found.
+        assert_eq!(regexp_count("abc", "", 1, "")?, 4);
+        assert_eq!(regexp_count("abc", "$", 1, "")?, 1);
+        assert_eq!(regexp_count("xax", "a|$", 1, "")?, 2);
+        assert_eq!(regexp_substr("abc", "$", 1, 2, "", 0)?, None);
+        // Multi-byte input: `start` counts characters, and the empty-match step
+        // has to move a whole character or it would split a codepoint.
+        assert_eq!(regexp_substr("äöü", ".", 2, 1, "", 0)?.as_deref(), Some("ö"));
+        assert_eq!(regexp_count("äöü", "", 1, "")?, 4);
+        assert_eq!(regexp_count("äöüä", "ä", 2, "")?, 1);
+
+        assert_eq!(
+            regexp_substr("abcdef", "c.", 1, 1, "", 0)?.as_deref(),
+            Some("cd")
+        );
+        assert_eq!(
+            regexp_substr("abcabc", "b", 2, 1, "", 0)?.as_deref(),
+            Some("b")
+        );
+        // The `n`th match, and a capture group within it.
+        assert_eq!(
+            regexp_substr("foobarbaz", "b(a)(.)", 1, 2, "i", 2)?.as_deref(),
+            Some("z")
+        );
+        // A match that began before `start` is re-found clipped, not skipped.
+        assert_eq!(
+            regexp_substr("aaaaa", "aa", 2, 1, "", 0)?.as_deref(),
+            Some("aa")
+        );
+        assert_eq!(
+            regexp_substr("aaaaa", "aa", 2, 2, "", 0)?.as_deref(),
+            Some("aa")
+        );
+        assert_eq!(
+            regexp_substr("hello world", "[a-z]+", 3, 1, "", 0)?.as_deref(),
+            Some("llo")
+        );
+        // A pattern with no capture groups has no group to ask for, so PG
+        // treats `subexpr` 1 as the whole match.
+        assert_eq!(
+            regexp_substr("abc", "b", 1, 1, "", 1)?.as_deref(),
+            Some("b")
+        );
+        // No match, an out-of-range group and a group that did not participate
+        // are all NULL rather than errors.
+        assert_eq!(regexp_substr("abc", "z", 1, 1, "", 0)?, None);
+        assert_eq!(regexp_substr("abc", "b", 9, 1, "", 0)?, None);
+        assert_eq!(regexp_substr("abc", "b", 1, 1, "", 2)?, None);
+        assert_eq!(regexp_substr("abc", "(b)", 1, 1, "", 5)?, None);
+        assert_eq!(regexp_substr("abc", "(x)?b", 1, 1, "", 1)?, None);
+
+        Ok(())
+    }
+
+    /// The `regex` crate cannot express these two through builder options, so
+    /// [`rewrite_pattern`] rewrites the pattern instead.
+    #[test]
+    fn regex_pattern_rewrites() -> anyhow::Result<()> {
+        // Expanded mode ignores whitespace and `#` comments, but *not* inside a
+        // bracket expression.
+        assert!(regexp_like("a b", "a[ ]b", "x")?);
+        assert!(regexp_like("ab", "a b", "x")?);
+        assert!(regexp_like("ab", "a#comment\nb", "x")?);
+        // An escaped space stays literal even in expanded mode.
+        assert!(regexp_like("a b", r"a\ b", "x")?);
+        // Under a newline-sensitive mode a negated class must not match a
+        // newline; under the default (and `w`) it must.
+        assert!(!regexp_like("\n", "[^x]", "n")?);
+        assert!(!regexp_like("\n", "[^x]", "p")?);
+        assert!(regexp_like("\n", "[^x]", "")?);
+        assert!(regexp_like("\n", "[^x]", "w")?);
+        assert_eq!(regexp_replace("a\nb", "[^x]b", "X", "n")?, "a\nb");
+        // Wrapping the class (rather than injecting into it) keeps a leading or
+        // trailing `-` literal instead of turning it into a range.
+        assert!(!regexp_like("-", "[^-a]", "n")?);
+        assert!(!regexp_like("-", "[^a-]", "n")?);
+        assert!(regexp_like("b", "[^a-]", "n")?);
+        // A positive class that names a newline still matches one.
+        assert!(regexp_like("\n", "[\\n]", "n")?);
+
+        Ok(())
+    }
+
+    /// A malformed bracket expression must stay malformed. Rewriting the
+    /// pattern must not invent the `]` the user left out, or an invalid regex
+    /// silently becomes a valid one that matches.
+    #[test]
+    fn unterminated_bracket_is_still_an_error() {
+        for pattern in ["[abc", "a[bc", "[^abc", "[a-", "[[:alpha:]", "x[.", "[]"] {
+            let Err(e) = regex_match("abc", pattern, false) else {
+                panic!("{pattern:?} should not compile");
+            };
+            assert_eq!(e.sqlstate, "2201B", "for {pattern:?}");
+        }
+        // A newline-sensitive flag takes the negated-class path, which must not
+        // wrap an unterminated class either.
+        assert!(regexp_like("abc", "[^abc", "n").is_err());
+        // The balanced forms still work.
+        assert!(regex_match("abc", "[abc]", false).is_ok());
+        assert!(regex_match("a]c", "[]a]", false).is_ok());
+    }
+
+    #[test]
+    fn bracket_walk_branches() -> anyhow::Result<()> {
+        // POSIX class, in-class escape, leading `]`, and a negated class under
+        // a newline-sensitive flag (which goes through the wrap).
+        assert!(regexp_like("abc", "[[:alpha:]]+", "")?);
+        assert!(regexp_like("a]b", "[\\]]", "")?);
+        assert!(regexp_like("]", "[]]", "")?);
+        assert!(!regexp_like("\n", "[^[:alpha:]]", "n")?);
+        assert!(regexp_like("\n", "[^[:alpha:]]", "")?);
+        assert!(regexp_like("1", "[^[:alpha:]]", "n")?);
+        assert!(!regexp_like("x", "[^[:alpha:]]", "n")?);
+        // `#` is only a comment in expanded mode, where `#b` drops off and the
+        // pattern is just `a`; without `x` it has to match literally.
+        assert!(regexp_like("a#b", "a#b", "")?);
+        assert!(regexp_like("axb", "a#b", "x")?);
+        assert!(!regexp_like("axb", "a#b", "")?);
+        // SIMILAR TO shares the same walk, so an in-class escape works there too.
+        assert!(similar_to_match("a]c", "%[a\\]b]%", Some('\\'))?);
+
+        Ok(())
+    }
+
+    /// The cache lends out `cache[0]`, so the promote-on-hit is load-bearing
+    /// for correctness, not just for speed. These would pass trivially if the
+    /// cache were removed, so they exercise it through repeated lookups.
+    #[test]
+    fn pattern_cache_returns_the_right_entry() -> anyhow::Result<()> {
+        // Interleave two patterns so each lookup is a hit on a non-zero index.
+        for _ in 0..4 {
+            assert!(regex_match("abc", "a", false)?);
+            assert!(!regex_match("abc", "z", false)?);
+            assert!(regex_match("abc", "b", false)?);
+        }
+        // Evict past the bound, then come back to the first pattern.
+        for i in 0..RE_CACHE_MAX + 8 {
+            let p = format!("p{i}");
+            assert!(!regex_match("abc", &p, false)?);
+        }
+        assert!(regex_match("abc", "a", false)?);
+        // The same text means different things as a regex and as a SIMILAR TO
+        // pattern, so the two must not share a cache entry.
+        assert!(regex_match("axc", "a.c", false)?);
+        assert!(!similar_to_match("axc", "a.c", Some('\\'))?);
+        assert!(similar_to_match("a.c", "a.c", Some('\\'))?);
+        // Different escape characters are likewise distinct keys.
+        assert!(similar_to_match("a%c", "a$%c", Some('$'))?);
+        assert!(!similar_to_match("a%c", "a$%c", Some('\\'))?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn flag_completeness() -> anyhow::Result<()> {
+        // `t` is the inverse of `x`, and later flags win.
+        assert_eq!(regexp_replace("abc", "a b c", "X", "t")?, "abc");
+        assert_eq!(regexp_replace("abc", "a b c", "X", "tx")?, "X");
+        assert_eq!(regexp_replace("abc", "a b c", "X", "xt")?, "abc");
+        // `q` cannot combine with expanded or newline modes, but `s`/`i` are fine.
+        for flags in ["qx", "qn", "qm", "qp", "qw"] {
+            let e = regexp_like("a b", "a b", flags).unwrap_err();
+            assert_eq!(e.sqlstate, "2201B", "for {flags:?}");
+            assert_eq!(
+                e.message,
+                "invalid regular expression: invalid argument to regex function"
+            );
+        }
+        assert!(regexp_like("a b", "a b", "qs")?);
+        assert!(regexp_like("A B", "a b", "qi")?);
+        // `b` and `e` select grammars this engine does not speak; both refuse
+        // rather than quietly returning the wrong rows.
+        for flags in ["b", "e"] {
+            assert_eq!(
+                regexp_like("abc", "b", flags).unwrap_err().sqlstate,
+                "0A000",
+                "for {flags:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A pattern this engine cannot execute is not the same thing as a pattern
+    /// that is malformed: PG accepts both of these.
+    #[test]
+    fn unsupported_constructs_are_reported_as_such() {
+        for pattern in [r"(a)\1", "a(?=b)", "a(?<=b)"] {
+            let e = regex_match("aa", pattern, false).unwrap_err();
+            assert_eq!(e.sqlstate, "0A000", "for {pattern:?}");
+        }
+        // A genuinely malformed pattern still reports a syntax error.
+        assert_eq!(regex_match("aa", "a(", false).unwrap_err().sqlstate, "2201B");
+    }
+
+    /// jsonpath's `like_regex` is XQuery-flavored: `.` does not span a newline
+    /// unless `s` is given, the opposite of the `~` operator's default.
+    #[test]
+    fn jsonpath_like_regex_flags() -> anyhow::Result<()> {
+        let f = |s: &str| LikeRegexFlags::parse(s).expect("valid flags");
+
+        assert!(!like_regex_match("a\nb", "a.b", f(""))?);
+        assert!(like_regex_match("a\nb", "a.b", f("s"))?);
+        assert!(like_regex_match("ABC", "abc", f("i"))?);
+        assert!(!like_regex_match("ABC", "abc", f(""))?);
+        // `m` anchors at line boundaries without letting `.` span them.
+        assert!(like_regex_match("a\nb", "^b", f("m"))?);
+        assert!(!like_regex_match("a\nb", "^b", f(""))?);
+        assert!(!like_regex_match("a\nb", "a.b", f("m"))?);
+        // `q` makes the pattern literal, and composes with `i`.
+        assert!(like_regex_match("a.c", "a.c", f("q"))?);
+        assert!(!like_regex_match("abc", "a.c", f("q"))?);
+        assert!(like_regex_match("A.C", "a.c", f("qi"))?);
+        // Non-`s` mode also keeps a negated class from matching a newline.
+        assert!(!like_regex_match("\n", "[^x]", f(""))?);
+        assert!(like_regex_match("\n", "[^x]", f("s"))?);
+        // `~` keeps the POSIX default, so the two disagree by design.
+        assert!(regex_match("a\nb", "a.b", false)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn like_regex_flags_parse_and_canonicalize() {
+        // PG re-emits the parsed set in a fixed order, deduplicated.
+        let canon = |s: &str| LikeRegexFlags::parse(s).expect("valid").canonical();
+        assert_eq!(canon("qmi"), "imq");
+        assert_eq!(canon("xsmiq"), "ismxq");
+        assert_eq!(canon("ii"), "i");
+        assert_eq!(canon(""), "");
+        assert_eq!(canon("xq"), "xq");
+        assert!(LikeRegexFlags::parse("").expect("valid").is_empty());
+        // The first unrecognized character is reported.
+        assert_eq!(LikeRegexFlags::parse("z"), Err('z'));
+        assert_eq!(LikeRegexFlags::parse("ihello"), Err('h'));
+        assert_eq!(LikeRegexFlags::parse("g"), Err('g'));
+    }
+
+    #[test]
+    fn like_regex_compiles_at_parse_time() {
+        let f = |s: &str| LikeRegexFlags::parse(s).expect("valid flags");
+
+        assert_eq!(
+            like_regex_compile("a(", f("")).unwrap_err().sqlstate,
+            "2201B"
+        );
+        // Under `q` the pattern is escaped, so it always compiles.
+        assert!(like_regex_compile("a(", f("q")).is_ok());
+        assert!(like_regex_compile("a.b", f("is")).is_ok());
+    }
+
+    #[test]
+    fn regexp_parameter_errors() {
+        // These functions match at most once, so `g` is rejected — and PG
+        // rejects it before it even compiles the pattern.
+        for e in [
+            regexp_like("abc", "a(", "g").unwrap_err(),
+            regexp_count("abc", "a(", 1, "g").unwrap_err(),
+            regexp_substr("abc", "a(", 1, 1, "g", 0).unwrap_err(),
+        ] {
+            assert_eq!(e.sqlstate, "22023");
+            assert!(
+                e.message
+                    .ends_with("does not support the \"global\" option")
+            );
+        }
+        assert_eq!(
+            regexp_count("abc", "b", 0, "").unwrap_err().message,
+            "invalid value for parameter \"start\": 0"
+        );
+        assert_eq!(
+            regexp_substr("abc", "b", 1, 0, "", 0).unwrap_err().message,
+            "invalid value for parameter \"n\": 0"
+        );
+        assert_eq!(
+            regexp_substr("abc", "b", 1, 1, "", -1).unwrap_err().message,
+            "invalid value for parameter \"subexpr\": -1"
+        );
     }
 
     #[test]

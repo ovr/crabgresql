@@ -604,6 +604,7 @@ dependencies = [
  "jiff",
  "pg-ryu",
  "regex",
+ "regex-syntax",
 ]
 
 [[package]]

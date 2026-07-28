@@ -76,6 +76,58 @@ SELECT 'b' SIMILAR TO '[^a]' AS b1, '%' SIMILAR TO '[%_]' AS b2,
        'aa' SIMILAR TO 'a{2}' AS b3, 'a{c' SIMILAR TO 'a{c' AS b4,
        'a|b' SIMILAR TO 'a\|b' AS b5;
 
+-- regexp_replace: first match only, then every match with the g flag
+SELECT regexp_replace('a1b2', '[0-9]', 'X') AS rr1,
+       regexp_replace('a1b2', '[0-9]', 'X', 'g') AS rr2,
+       regexp_replace('abc', 'B', 'X', 'i') AS rr3;
+-- the PG replacement escapes: \1..\9 groups, \& whole match, \\ backslash
+SELECT regexp_replace('1112223333', '(\d{3})(\d{3})(\d{4})', '(\1) \2-\3') AS rr4,
+       regexp_replace('abc', 'b', '[\&]') AS rr5,
+       regexp_replace('abc', '(b)', '[\10]') AS rr6,
+       regexp_replace('abc', 'b', '[\q]') AS rr7;
+-- regexp_like / regexp_count / regexp_substr, incl. start, n and subexpr
+SELECT regexp_like('abc', 'B', 'i') AS rl1, regexp_like('abc', 'B') AS rl2,
+       regexp_count('abcabc', 'a') AS rc1, regexp_count('abcabc', 'a', 2) AS rc2,
+       regexp_count('abcABC', 'a', 1, 'i') AS rc3;
+SELECT regexp_substr('abcdef', 'c.') AS rs1,
+       regexp_substr('foobarbaz', 'b(a)(.)', 1, 2, 'i', 2) AS rs2,
+       regexp_substr('abc', 'z') AS rs3, regexp_substr('abc', '(x)?b', 1, 1, '', 1) AS rs4;
+-- start re-seeds the scan, so a match that began earlier is clipped not skipped
+SELECT regexp_substr('hello world', '[a-z]+', 3) AS st1,
+       regexp_substr('aaaaa', 'aa', 2, 2) AS st2,
+       regexp_count('aaaaa', 'aa', 2) AS st3,
+       regexp_count('abcabc', '^a', 2) AS st4;
+-- a pattern with no capture groups treats subexpr 1 as the whole match
+SELECT regexp_substr('abc', 'b', 1, 1, '', 1) AS sx1,
+       regexp_substr('abc', 'b', 1, 1, '', 2) AS sx2;
+-- the x flag keeps whitespace significant inside a bracket expression
+SELECT regexp_like('a b', 'a[ ]b', 'x') AS x1, regexp_like('ab', 'a b', 'x') AS x2;
+-- newline-sensitive modes stop a negated class from matching a newline
+SELECT regexp_like(chr(10), '[^x]') AS n1, regexp_like(chr(10), '[^x]', 'n') AS n2,
+       regexp_replace('a'||chr(10)||'b', '[^x]b', 'X', 'n') = 'a'||chr(10)||'b' AS n3;
+-- errors: unknown flag, the global flag where it makes no sense, bad start
+SELECT regexp_replace('abc', 'b', 'x', 'z');
+SELECT regexp_like('abc', 'b', 'g');
+SELECT regexp_count('abc', 'b', 0);
+-- start is validated before the flags string
+SELECT regexp_count('abc', 'b', 0, 'z');
+-- a zero-width match is not re-found, and g replaces one next to a real match
+SELECT regexp_count('abc', '$') AS z1, regexp_count('xax', 'a|$') AS z2,
+       regexp_substr('abc', '$', 1, 2) AS z3,
+       regexp_replace('abc', 'b*', 'X', 'g') AS z4,
+       regexp_replace('aaa', 'a|', 'X', 'g') AS z5;
+-- regexp_replace's start / N form, discriminated from flags by argument type
+SELECT regexp_replace('a1b2c3', '[0-9]', 'X', 2) AS s1,
+       regexp_replace('a1b2c3', '[0-9]', 'X', 1, 2) AS s2,
+       regexp_replace('a1b2c3', '[0-9]', 'X', 1, 0) AS s3,
+       regexp_replace('A1b2', '[a-z]', 'X', 1, 0, 'i') AS s4,
+       regexp_replace('a1b2', '[0-9]', 'X', 'g') AS s5;
+-- t is the inverse of x; q cannot combine with expanded or newline modes
+SELECT regexp_replace('abc', 'a b c', 'X', 't') AS t1,
+       regexp_replace('abc', 'a b c', 'X', 'tx') AS t2,
+       regexp_like('a b', 'a b', 'qs') AS t3;
+SELECT regexp_like('a b', 'a b', 'qx');
+
 -- encode / decode
 SELECT encode('\x001000'::bytea, 'hex') AS e_hex, encode('abc'::bytea, 'base64') AS e_b64,
        encode('a\000b'::bytea, 'escape') AS e_esc;
@@ -84,6 +136,16 @@ SELECT decode('001000', 'hex') AS d_hex, decode('YWJj', 'base64') AS d_b64;
 -- quoting
 SELECT quote_ident('foo') AS qi1, quote_ident('foo bar') AS qi2,
        quote_literal('a''b') AS ql, quote_nullable(NULL) AS qn;
+
+-- bool -> text spells the value out, unlike the t/f output function that still
+-- backs display, concat() and the cast to name
+SELECT true::text AS b1, false::varchar AS b2, true::name AS b3,
+       concat(true, 'x') AS b4, true || 'x' AS b5, length(true::text) AS b6;
+-- inet is the other type whose cast disagrees with its output function: the
+-- cast always spells the masklen out
+SELECT ('192.168.1.5'::inet)::text AS i1, concat('192.168.1.5'::inet) AS i2,
+       ('192.168.1.5'::inet)::name AS i3, ('192.168.1.5'::inet) || '' AS i4,
+       ('192.168.1.0/24'::cidr)::text AS i5;
 
 -- character types: casts, typmod truncation, and the default column names
 SELECT 'abc'::varchar AS v_unbounded, 'abcdef'::varchar(3) AS v_trunc,

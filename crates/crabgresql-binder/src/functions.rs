@@ -325,6 +325,14 @@ pub enum ScalarFn {
     RegexIMatch,
     /// `text SIMILAR TO text [ESCAPE text] -> bool`.
     SimilarTo,
+    /// `regexp_replace(source, pattern, replacement [, flags]) -> text`.
+    RegexpReplace,
+    /// `regexp_like(string, pattern [, flags]) -> bool`.
+    RegexpLike,
+    /// `regexp_count(string, pattern [, start [, flags]]) -> int4`.
+    RegexpCount,
+    /// `regexp_substr(string, pattern [, start [, n [, flags [, subexpr]]]]) -> text`.
+    RegexpSubstr,
     /// `encode(bytea, text) -> text`.
     Encode,
     /// `decode(text, text) -> bytea`.
@@ -964,6 +972,15 @@ fn lookup(name: &str) -> &'static [Signature] {
                     ret: $ret,
                 },
             ]
+        };
+    }
+    // A scalar with optional trailing arguments, which PG models as one
+    // overload per arity. Spelling each argument list out (rather than deriving
+    // them as prefixes) keeps the positions visible, because the executor reads
+    // the optional ones positionally via `args.get(N)`.
+    macro_rules! arity_sigs {
+        ($f:expr, $ret:expr, $($args:expr),+ $(,)?) => {
+            &[$(Signature { func: $f, args: $args, ret: $ret }),+]
         };
     }
     match name {
@@ -1644,6 +1661,42 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[TEXT, TEXT, TEXT],
             ret: TEXT,
         }],
+        // The `regexp_*` family, whose trailing `start`/`n`/`flags`/`subexpr`
+        // arguments are all optional. `regexp_replace` has two 4-argument forms
+        // that differ only in the last argument's type; the flags form is
+        // listed first because that is what an untyped literal resolves to (an
+        // integer literal binds as `int4` and picks the other by exact match).
+        "regexp_replace" => arity_sigs!(
+            ScalarFn::RegexpReplace,
+            TEXT,
+            &[TEXT, TEXT, TEXT],
+            &[TEXT, TEXT, TEXT, TEXT],
+            &[TEXT, TEXT, TEXT, I4],
+            &[TEXT, TEXT, TEXT, I4, I4],
+            &[TEXT, TEXT, TEXT, I4, I4, TEXT],
+        ),
+        "regexp_like" => arity_sigs!(
+            ScalarFn::RegexpLike,
+            BOOL,
+            &[TEXT, TEXT],
+            &[TEXT, TEXT, TEXT],
+        ),
+        "regexp_count" => arity_sigs!(
+            ScalarFn::RegexpCount,
+            I4,
+            &[TEXT, TEXT],
+            &[TEXT, TEXT, I4],
+            &[TEXT, TEXT, I4, TEXT],
+        ),
+        "regexp_substr" => arity_sigs!(
+            ScalarFn::RegexpSubstr,
+            TEXT,
+            &[TEXT, TEXT],
+            &[TEXT, TEXT, I4],
+            &[TEXT, TEXT, I4, I4],
+            &[TEXT, TEXT, I4, I4, TEXT],
+            &[TEXT, TEXT, I4, I4, TEXT, I4],
+        ),
         "translate" => &[Signature {
             func: ScalarFn::Translate,
             args: &[TEXT, TEXT, TEXT],

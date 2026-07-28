@@ -25,6 +25,7 @@ use std::cmp::Ordering;
 // SQLSTATE literals (kept local; the types crate must not depend on the wire
 // crate). Mirror `crabgresql_pg_wire::sqlstate`.
 const SYNTAX_ERROR: &str = "42601";
+const FEATURE_NOT_SUPPORTED: &str = "0A000";
 const UNDEFINED_OBJECT: &str = "42704";
 const DIVISION_BY_ZERO: &str = "22012";
 const SQL_JSON_MEMBER_NOT_FOUND: &str = "2203A";
@@ -88,7 +89,7 @@ enum Node {
     LikeRegex {
         operand: Box<Node>,
         pattern: String,
-        flags: String,
+        flags: crate::text::LikeRegexFlags,
     },
     IsUnknown(Box<Node>),
 }
@@ -195,6 +196,16 @@ fn err(sqlstate: &'static str, message: impl Into<String>) -> JsonError {
 
 fn syntax(message: impl Into<String>) -> JsonError {
     err(SYNTAX_ERROR, message)
+}
+
+/// Carry a `crate::text` failure through unchanged: its SQLSTATE and message
+/// are already the ones PG reports for a bad regex.
+fn text_err(e: crate::text::TextError) -> JsonError {
+    JsonError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+        detail: None,
+    }
 }
 
 /// Whether `silent`/lax suppression applies to this error. PG suppresses every
@@ -670,7 +681,7 @@ impl Parser {
                 Some(Tok::Str(s)) => s,
                 _ => return Err(self.err_here()),
             };
-            let flags = if self.eat_ident_ci("flag") {
+            let raw = if self.eat_ident_ci("flag") {
                 match self.next() {
                     Some(Tok::Str(s)) => s,
                     _ => return Err(self.err_here()),
@@ -678,6 +689,25 @@ impl Parser {
             } else {
                 String::new()
             };
+            // PG validates the flags and compiles the pattern while *parsing*
+            // the path, so all three of these are errors on the cast rather
+            // than on any row — a path over an empty array still raises them.
+            let flags = crate::text::LikeRegexFlags::parse(&raw).map_err(|c| JsonError {
+                sqlstate: SYNTAX_ERROR,
+                message: "invalid input syntax for type jsonpath".to_string(),
+                detail: Some(format!(
+                    "Unrecognized flag character \"{c}\" in LIKE_REGEX predicate."
+                )),
+            })?;
+            // `q` escapes the whole pattern, which makes expanded mode moot, so
+            // PG only rejects `x` when `q` is absent.
+            if flags.wspace && !flags.quote {
+                return Err(err(
+                    FEATURE_NOT_SUPPORTED,
+                    "XQuery \"x\" flag (expanded regular expressions) is not implemented",
+                ));
+            }
+            crate::text::like_regex_compile(&pattern, flags).map_err(text_err)?;
             Node::LikeRegex { operand: Box::new(left), pattern, flags }
         } else {
             left
@@ -1032,6 +1062,373 @@ pub fn format(p: &JsonPath) -> String {
     out
 }
 
+// --- storage codec ----------------------------------------------------------
+//
+// A stored jsonpath must decode without re-running the parser. Re-parsing the
+// canonical text looks safe but is not: [`format`] adds parentheses around
+// equal-priority sub-expressions, so a path accepted just under [`MAX_DEPTH`]
+// can come back deeper than it went in, and any tightening of the parser (as
+// happened for `like_regex` flags) retroactively makes older stored values
+// unreadable. `tsquery` avoids the same trap the same way.
+
+const B_ROOT: u8 = 0;
+const B_CURRENT: u8 = 1;
+const B_LAST: u8 = 2;
+const B_VAR: u8 = 3;
+const B_NUM: u8 = 4;
+const B_STR: u8 = 5;
+const B_BOOL: u8 = 6;
+const B_NULL: u8 = 7;
+const B_ACCESSOR: u8 = 8;
+const B_UNARY: u8 = 9;
+const B_ARITH: u8 = 10;
+const B_AND: u8 = 11;
+const B_OR: u8 = 12;
+const B_NOT: u8 = 13;
+const B_COMPARE: u8 = 14;
+const B_EXISTS: u8 = 15;
+const B_STARTS_WITH: u8 = 16;
+const B_LIKE_REGEX: u8 = 17;
+const B_IS_UNKNOWN: u8 = 18;
+
+const A_KEY: u8 = 0;
+const A_WILDCARD_MEMBER: u8 = 1;
+const A_WILDCARD_ARRAY: u8 = 2;
+const A_RECURSIVE: u8 = 3;
+const A_SUBSCRIPT: u8 = 4;
+const A_METHOD: u8 = 5;
+const A_FILTER: u8 = 6;
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn get_str(b: &[u8], i: &mut usize) -> Option<String> {
+    let len = u32::from_le_bytes(b.get(*i..*i + 4)?.try_into().ok()?) as usize;
+    *i += 4;
+    let s = std::str::from_utf8(b.get(*i..*i + len)?).ok()?.to_string();
+    *i += len;
+    Some(s)
+}
+
+fn put_opt_u32(out: &mut Vec<u8>, v: Option<u32>) {
+    match v {
+        None => out.push(0),
+        Some(n) => {
+            out.push(1);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+}
+
+fn get_opt_u32(b: &[u8], i: &mut usize) -> Option<Option<u32>> {
+    let tag = *b.get(*i)?;
+    *i += 1;
+    if tag == 0 {
+        return Some(None);
+    }
+    let n = u32::from_le_bytes(b.get(*i..*i + 4)?.try_into().ok()?);
+    *i += 4;
+    Some(Some(n))
+}
+
+/// Serialize a path for storage, in prefix order. See the note above for why
+/// the canonical text form is not used.
+pub fn encode(p: &JsonPath) -> Vec<u8> {
+    fn put_accessor(a: &Accessor, out: &mut Vec<u8>) {
+        match a {
+            Accessor::Key(k) => {
+                out.push(A_KEY);
+                put_str(out, k);
+            }
+            Accessor::WildcardMember => out.push(A_WILDCARD_MEMBER),
+            Accessor::WildcardArray => out.push(A_WILDCARD_ARRAY),
+            Accessor::Recursive(lo, hi) => {
+                out.push(A_RECURSIVE);
+                put_opt_u32(out, *lo);
+                put_opt_u32(out, *hi);
+            }
+            Accessor::Subscript(subs) => {
+                out.push(A_SUBSCRIPT);
+                out.extend_from_slice(&(subs.len() as u32).to_le_bytes());
+                for s in subs {
+                    match s {
+                        Subscript::Index(n) => {
+                            out.push(0);
+                            put(n, out);
+                        }
+                        Subscript::Range(lo, hi) => {
+                            out.push(1);
+                            put(lo, out);
+                            put(hi, out);
+                        }
+                    }
+                }
+            }
+            Accessor::Method(m) => {
+                out.push(A_METHOD);
+                // Spelled out rather than `as u8` so reordering the enum cannot
+                // silently reinterpret already-stored data.
+                out.push(match m {
+                    Method::Size => 0,
+                    Method::Type => 1,
+                    Method::Double => 2,
+                    Method::Abs => 3,
+                    Method::Floor => 4,
+                    Method::Ceiling => 5,
+                    Method::KeyValue => 6,
+                });
+            }
+            Accessor::Filter(n) => {
+                out.push(A_FILTER);
+                put(n, out);
+            }
+        }
+    }
+    fn put(n: &Node, out: &mut Vec<u8>) {
+        match n {
+            Node::Root => out.push(B_ROOT),
+            Node::Current => out.push(B_CURRENT),
+            Node::Last => out.push(B_LAST),
+            Node::Var(v) => {
+                out.push(B_VAR);
+                put_str(out, v);
+            }
+            // `Numeric`'s text form is exact, and `datum` already relies on that
+            // for a stored `numeric`.
+            Node::LitNum(v) => {
+                out.push(B_NUM);
+                put_str(out, &v.to_display());
+            }
+            Node::LitStr(s) => {
+                out.push(B_STR);
+                put_str(out, s);
+            }
+            Node::LitBool(b) => {
+                out.push(B_BOOL);
+                out.push(u8::from(*b));
+            }
+            Node::LitNull => out.push(B_NULL),
+            Node::Accessor { base, step } => {
+                out.push(B_ACCESSOR);
+                put(base, out);
+                put_accessor(step, out);
+            }
+            Node::Unary { neg, operand } => {
+                out.push(B_UNARY);
+                out.push(u8::from(*neg));
+                put(operand, out);
+            }
+            Node::Arith { op, left, right } => {
+                out.push(B_ARITH);
+                out.push(match op {
+                    ArithOp::Add => 0,
+                    ArithOp::Sub => 1,
+                    ArithOp::Mul => 2,
+                    ArithOp::Div => 3,
+                    ArithOp::Mod => 4,
+                });
+                put(left, out);
+                put(right, out);
+            }
+            Node::And(l, r) => {
+                out.push(B_AND);
+                put(l, out);
+                put(r, out);
+            }
+            Node::Or(l, r) => {
+                out.push(B_OR);
+                put(l, out);
+                put(r, out);
+            }
+            Node::Not(x) => {
+                out.push(B_NOT);
+                put(x, out);
+            }
+            Node::Compare { op, left, right } => {
+                out.push(B_COMPARE);
+                out.push(match op {
+                    CmpOp::Eq => 0,
+                    CmpOp::Ne => 1,
+                    CmpOp::Lt => 2,
+                    CmpOp::Le => 3,
+                    CmpOp::Gt => 4,
+                    CmpOp::Ge => 5,
+                });
+                put(left, out);
+                put(right, out);
+            }
+            Node::Exists(x) => {
+                out.push(B_EXISTS);
+                put(x, out);
+            }
+            Node::StartsWith { operand, prefix } => {
+                out.push(B_STARTS_WITH);
+                put(operand, out);
+                put(prefix, out);
+            }
+            Node::LikeRegex {
+                operand,
+                pattern,
+                flags,
+            } => {
+                out.push(B_LIKE_REGEX);
+                put(operand, out);
+                put_str(out, pattern);
+                put_str(out, &flags.canonical());
+            }
+            Node::IsUnknown(x) => {
+                out.push(B_IS_UNKNOWN);
+                put(x, out);
+            }
+        }
+    }
+    let mut out = vec![u8::from(p.strict)];
+    put(&p.expr, &mut out);
+    out
+}
+
+/// Inverse of [`encode`]. `None` if the bytes are malformed or nest deeper than
+/// [`MAX_DEPTH`] — both impossible for a datum this build wrote, but checked so
+/// a corrupt page cannot overflow the stack.
+pub fn decode(bytes: &[u8]) -> Option<JsonPath> {
+    fn get_accessor(b: &[u8], i: &mut usize, depth: usize) -> Option<Accessor> {
+        let tag = *b.get(*i)?;
+        *i += 1;
+        Some(match tag {
+            A_KEY => Accessor::Key(get_str(b, i)?),
+            A_WILDCARD_MEMBER => Accessor::WildcardMember,
+            A_WILDCARD_ARRAY => Accessor::WildcardArray,
+            A_RECURSIVE => Accessor::Recursive(get_opt_u32(b, i)?, get_opt_u32(b, i)?),
+            A_SUBSCRIPT => {
+                let n = u32::from_le_bytes(b.get(*i..*i + 4)?.try_into().ok()?) as usize;
+                *i += 4;
+                // A length header cannot be trusted from a corrupt page, so the
+                // elements themselves have to run out first.
+                let mut subs = Vec::new();
+                for _ in 0..n {
+                    let kind = *b.get(*i)?;
+                    *i += 1;
+                    subs.push(match kind {
+                        0 => Subscript::Index(get(b, i, depth + 1)?),
+                        1 => Subscript::Range(get(b, i, depth + 1)?, get(b, i, depth + 1)?),
+                        _ => return None,
+                    });
+                }
+                Accessor::Subscript(subs)
+            }
+            A_METHOD => {
+                let m = match *b.get(*i)? {
+                    0 => Method::Size,
+                    1 => Method::Type,
+                    2 => Method::Double,
+                    3 => Method::Abs,
+                    4 => Method::Floor,
+                    5 => Method::Ceiling,
+                    6 => Method::KeyValue,
+                    _ => return None,
+                };
+                *i += 1;
+                Accessor::Method(m)
+            }
+            A_FILTER => Accessor::Filter(Box::new(get(b, i, depth + 1)?)),
+            _ => return None,
+        })
+    }
+    fn get(b: &[u8], i: &mut usize, depth: usize) -> Option<Node> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        let tag = *b.get(*i)?;
+        *i += 1;
+        Some(match tag {
+            B_ROOT => Node::Root,
+            B_CURRENT => Node::Current,
+            B_LAST => Node::Last,
+            B_VAR => Node::Var(get_str(b, i)?),
+            B_NUM => Node::LitNum(Numeric::parse(&get_str(b, i)?).ok()?),
+            B_STR => Node::LitStr(get_str(b, i)?),
+            B_BOOL => {
+                let v = *b.get(*i)? != 0;
+                *i += 1;
+                Node::LitBool(v)
+            }
+            B_NULL => Node::LitNull,
+            B_ACCESSOR => Node::Accessor {
+                base: Box::new(get(b, i, depth + 1)?),
+                step: get_accessor(b, i, depth)?,
+            },
+            B_UNARY => {
+                let neg = *b.get(*i)? != 0;
+                *i += 1;
+                Node::Unary {
+                    neg,
+                    operand: Box::new(get(b, i, depth + 1)?),
+                }
+            }
+            B_ARITH => {
+                let op = match *b.get(*i)? {
+                    0 => ArithOp::Add,
+                    1 => ArithOp::Sub,
+                    2 => ArithOp::Mul,
+                    3 => ArithOp::Div,
+                    4 => ArithOp::Mod,
+                    _ => return None,
+                };
+                *i += 1;
+                Node::Arith {
+                    op,
+                    left: Box::new(get(b, i, depth + 1)?),
+                    right: Box::new(get(b, i, depth + 1)?),
+                }
+            }
+            B_AND => Node::And(
+                Box::new(get(b, i, depth + 1)?),
+                Box::new(get(b, i, depth + 1)?),
+            ),
+            B_OR => Node::Or(
+                Box::new(get(b, i, depth + 1)?),
+                Box::new(get(b, i, depth + 1)?),
+            ),
+            B_NOT => Node::Not(Box::new(get(b, i, depth + 1)?)),
+            B_COMPARE => {
+                let op = match *b.get(*i)? {
+                    0 => CmpOp::Eq,
+                    1 => CmpOp::Ne,
+                    2 => CmpOp::Lt,
+                    3 => CmpOp::Le,
+                    4 => CmpOp::Gt,
+                    5 => CmpOp::Ge,
+                    _ => return None,
+                };
+                *i += 1;
+                Node::Compare {
+                    op,
+                    left: Box::new(get(b, i, depth + 1)?),
+                    right: Box::new(get(b, i, depth + 1)?),
+                }
+            }
+            B_EXISTS => Node::Exists(Box::new(get(b, i, depth + 1)?)),
+            B_STARTS_WITH => Node::StartsWith {
+                operand: Box::new(get(b, i, depth + 1)?),
+                prefix: Box::new(get(b, i, depth + 1)?),
+            },
+            B_LIKE_REGEX => Node::LikeRegex {
+                operand: Box::new(get(b, i, depth + 1)?),
+                pattern: get_str(b, i)?,
+                flags: crate::text::LikeRegexFlags::parse(&get_str(b, i)?).ok()?,
+            },
+            B_IS_UNKNOWN => Node::IsUnknown(Box::new(get(b, i, depth + 1)?)),
+            _ => return None,
+        })
+    }
+    let strict = *bytes.first()? != 0;
+    let mut i = 1;
+    let expr = get(bytes, &mut i, 0)?;
+    (i == bytes.len()).then_some(JsonPath { strict, expr })
+}
+
 /// Operator priority (PG's `operationPriority`): a child is parenthesized when
 /// its priority is `<=` its parent's, so lower-priority (looser-binding) or
 /// equal-priority sub-expressions print with explicit grouping.
@@ -1125,9 +1522,11 @@ fn write_node(out: &mut String, node: &Node, brackets: bool) {
             write_node(out, operand, prio(operand) <= sp);
             out.push_str(" like_regex ");
             write_json_string(out, pattern);
+            // Re-emitted from the parsed set, so the spelling is canonical
+            // rather than whatever the user wrote.
             if !flags.is_empty() {
                 out.push_str(" flag ");
-                write_json_string(out, flags);
+                write_json_string(out, &flags.canonical());
             }
             if brackets {
                 out.push(')');
@@ -1681,7 +2080,7 @@ impl Eval<'_> {
             }),
             Node::Compare { op, left, right } => self.compare(*op, left, right, current),
             Node::StartsWith { operand, prefix } => self.starts_with(operand, prefix, current),
-            Node::LikeRegex { operand, pattern, flags } => self.like_regex(operand, pattern, flags, current),
+            Node::LikeRegex { operand, pattern, flags } => self.like_regex(operand, pattern, *flags, current),
             Node::Exists(inner) => {
                 // exists() suppresses structural errors → Unknown.
                 match self.seq(inner, current, None) {
@@ -1745,16 +2144,27 @@ impl Eval<'_> {
         Ok(if unknown { Ternary::Unknown } else { Ternary::False })
     }
 
-    fn like_regex(&self, operand: &Node, pattern: &str, flags: &str, current: &Jsonb) -> Result<Ternary, JsonError> {
+    fn like_regex(
+        &self,
+        operand: &Node,
+        pattern: &str,
+        flags: crate::text::LikeRegexFlags,
+        current: &Jsonb,
+    ) -> Result<Ternary, JsonError> {
         let ls = self.pred_operand(operand, current)?;
-        let ci = flags.contains('i');
         let mut unknown = false;
         for l in &ls {
             match l {
-                Jsonb::String(s) => match crate::text::regex_match(s, pattern, ci) {
+                // `like_regex` is XQuery-flavored, not POSIX: its flags differ
+                // from the `~` operator's defaults, so it does not go through
+                // `regex_match`.
+                Jsonb::String(s) => match crate::text::like_regex_match(s, pattern, flags) {
                     Ok(true) => return Ok(Ternary::True),
                     Ok(false) => {}
-                    Err(_) => unknown = true,
+                    // Unreachable: the parser compiled this same pattern under
+                    // these same flags. Propagating rather than degrading to
+                    // Unknown keeps any future drift between the two loud.
+                    Err(e) => return Err(text_err(e)),
                 },
                 _ => unknown = true,
             }
@@ -1945,6 +2355,66 @@ mod tests {
         Ok(items.iter().map(crate::json::format).collect())
     }
 
+    /// PG validates `like_regex` while parsing the path, so these are all
+    /// errors on the cast rather than on any row.
+    #[test]
+    fn like_regex_is_validated_at_parse_time() {
+        // An unrecognized flag character, reported with PG's DETAIL.
+        let e = jsonpath_in("$ like_regex \"a\" flag \"z\"").expect_err("bad flag");
+        assert_eq!(e.sqlstate, "42601");
+        assert_eq!(e.message, "invalid input syntax for type jsonpath");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("Unrecognized flag character \"z\" in LIKE_REGEX predicate.")
+        );
+        assert_eq!(
+            jsonpath_in("$ like_regex \"a\" flag \"hello\"")
+                .expect_err("bad flag")
+                .detail
+                .as_deref(),
+            Some("Unrecognized flag character \"h\" in LIKE_REGEX predicate.")
+        );
+
+        // `x` is unimplemented, but only rejected when `q` is absent.
+        let e = jsonpath_in("$ like_regex \"a\" flag \"ismx\"").expect_err("x needs q");
+        assert_eq!(e.sqlstate, "0A000");
+        assert_eq!(
+            e.message,
+            "XQuery \"x\" flag (expanded regular expressions) is not implemented"
+        );
+        assert!(jsonpath_in("$ like_regex \"a\" flag \"qx\"").is_ok());
+        assert!(jsonpath_in("$ like_regex \"a\" flag \"ismxq\"").is_ok());
+
+        // The pattern itself is compiled during the parse. (Only the SQLSTATE
+        // is pinned: our message comes from the `regex` crate and differs from
+        // PG's wording, as it already does for the `~` operator.)
+        assert_eq!(
+            jsonpath_in("$ like_regex \"a(\"")
+                .expect_err("bad pattern")
+                .sqlstate,
+            "2201B"
+        );
+        // Under `q` the pattern is escaped, so a "bad" regex is fine.
+        assert!(jsonpath_in("$ like_regex \"a(\" flag \"q\"").is_ok());
+    }
+
+    #[test]
+    fn like_regex_evaluates_under_flags() -> Result<()> {
+        // `q` matches the literal text, including regex metacharacters.
+        assert_eq!(q("{\"a\":\"a(\"}", "$.a ? (@ like_regex \"a(\" flag \"q\")")?, ["\"a(\""]);
+        // `x` is inert: it survives parsing only with `q`, which already made
+        // the pattern literal, so the spaces still have to match.
+        assert_eq!(q("{\"a\":\"a b\"}", "$.a ? (@ like_regex \"a b\" flag \"xq\")")?, ["\"a b\""]);
+        assert!(q("{\"a\":\"ab\"}", "$.a ? (@ like_regex \"a b\" flag \"xq\")")?.is_empty());
+        // `i` composes with `q`.
+        assert_eq!(q("{\"a\":\"A.C\"}", "$.a ? (@ like_regex \"a.c\" flag \"qi\")")?, ["\"A.C\""]);
+        // `s` lets `.` span a newline; without it, it must not.
+        assert_eq!(q("{\"a\":\"a\\nb\"}", "$.a ? (@ like_regex \"a.b\" flag \"s\")")?.len(), 1);
+        assert!(q("{\"a\":\"a\\nb\"}", "$.a ? (@ like_regex \"a.b\")")?.is_empty());
+
+        Ok(())
+    }
+
     #[test]
     fn output_canonical_form() -> Result<()> {
         assert_eq!(out("$.a.b[*] ? (@ > 3)")?, "$.\"a\".\"b\"[*]?(@ > 3)");
@@ -1952,6 +2422,15 @@ mod tests {
         assert_eq!(out("strict $.a.**{2 to 4}.c")?, "strict $.\"a\".**{2 to 4}.\"c\"");
         assert_eq!(out("$.a + $.b * 2 - (-3)")?, "(($.\"a\" + $.\"b\" * 2) - -3)");
         assert_eq!(out("$ ? (@ like_regex \"ab.*c\" flag \"i\")")?, "$?(@ like_regex \"ab.*c\" flag \"i\")");
+        // Flags are re-emitted from the parsed set: fixed order, deduplicated,
+        // and omitted entirely when empty.
+        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"qmi\")")?, "$?(@ like_regex \"a\" flag \"imq\")");
+        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"ii\")")?, "$?(@ like_regex \"a\" flag \"i\")");
+        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"\")")?, "$?(@ like_regex \"a\")");
+        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"xq\")")?, "$?(@ like_regex \"a\" flag \"xq\")");
+        // Canonical output must re-parse: `x` is emitted before the `q` that
+        // makes it legal.
+        assert_eq!(out(&out("$ ? (@ like_regex \"a\" flag \"qx\")")?)?, "$?(@ like_regex \"a\" flag \"xq\")");
         assert_eq!(out("$ ? (@.name starts with \"Jo\")")?, "$?(@.\"name\" starts with \"Jo\")");
         assert_eq!(out("$ ? (exists (@.x))")?, "$?(exists (@.\"x\"))");
         assert_eq!(out("$ ? ((@ > 1) is unknown)")?, "$?((@ > 1) is unknown)");

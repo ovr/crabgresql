@@ -12,6 +12,24 @@ SELECT 'lax $."a b"[1 to 3, 5].size()'::jsonpath;
 SELECT 'strict $.a.**{2 to 4}.c'::jsonpath;
 SELECT '$.a + $.b * 2 - (-3)'::jsonpath AS arith;
 SELECT '$ ? (@ like_regex "ab.*c" flag "i")'::jsonpath AS re;
+-- like_regex flags are re-emitted from the parsed set: fixed order, deduped,
+-- and omitted when empty
+SELECT '$ ? (@ like_regex "a" flag "qmi")'::jsonpath AS re_ord,
+       '$ ? (@ like_regex "a" flag "ii")'::jsonpath AS re_dup,
+       '$ ? (@ like_regex "a" flag "")'::jsonpath AS re_none,
+       '$ ? (@ like_regex "a" flag "xq")'::jsonpath AS re_xq;
+-- like_regex flags are validated when the path is parsed, not when it is used
+SELECT '$ like_regex "a" flag "z"'::jsonpath;
+SELECT '$ like_regex "a" flag "x"'::jsonpath;
+-- ... so an empty array, which iterates nothing, still raises
+SELECT jsonb_path_match('[]'::jsonb, '$[*] ? (@ like_regex "a b" flag "x")'::jsonpath);
+SELECT pg_input_is_valid('$ like_regex "a" flag "z"', 'jsonpath') AS bad_flag,
+       pg_input_is_valid('$ like_regex "a" flag "qx"', 'jsonpath') AS ok_flag;
+-- q matches the pattern literally, and composes with i
+SELECT jsonb_path_match('"A.C"'::jsonb, '$ like_regex "a.c" flag "qi"') AS q_i,
+       jsonb_path_match('"ABC"'::jsonb, '$ like_regex "a.c" flag "q"') AS q_only,
+       jsonb_path_match('"a\nb"'::jsonb, '$ like_regex "^b" flag "m"') AS m_flag,
+       jsonb_path_match('"a\nb"'::jsonb, '$ like_regex "a.b"') AS no_s;
 SELECT '$ ? (@.name starts with "Jo")'::jsonpath AS sw;
 SELECT '$ ? (exists (@.x))'::jsonpath AS ex;
 SELECT '$[last]'::jsonpath AS last;
