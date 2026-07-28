@@ -681,6 +681,40 @@ mod tests {
         assert!(!snap2.in_progress(b));
     }
 
+    /// The property every reclaiming caller depends on: a read-only reader is
+    /// invisible to `Snapshot::xmin` — it holds no XID — so only the registry
+    /// keeps `reclaim_horizon` from running past it.
+    #[test]
+    fn a_registered_read_only_snapshot_holds_back_the_reclaim_horizon() {
+        let tm = TransactionManager::new();
+        let reader = tm.snapshot();
+        let guard = tm.register_snapshot(&reader);
+
+        // Write traffic that starts and finishes entirely after the reader. With
+        // nothing left in flight the running xmin is free to run past it.
+        let writer = tm.allocate_xid();
+        tm.commit(writer)
+            .expect("a manager with no sink cannot fail to commit");
+        assert!(
+            tm.snapshot().xmin > reader.xmax,
+            "the premise: xmin must have passed the reader, which holds no XID"
+        );
+
+        assert_eq!(
+            tm.reclaim_horizon(),
+            reader.xmax,
+            "the live reader must pin the horizon at its own snapshot"
+        );
+
+        // Once the reader is gone, nothing holds the horizon down.
+        drop(guard);
+        assert_eq!(
+            tm.reclaim_horizon(),
+            tm.snapshot().xmin,
+            "a released snapshot must stop holding back reclamation"
+        );
+    }
+
     #[test]
     fn committed_insert_is_visible_deleted_row_is_not() {
         let clog = Clog::new();

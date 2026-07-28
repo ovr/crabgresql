@@ -1168,10 +1168,24 @@ fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool)
             };
             let snapshot = match active.iso {
                 IsolationLevel::ReadCommitted => txnmgr.snapshot(),
-                IsolationLevel::RepeatableRead | IsolationLevel::Serializable => active
-                    .snapshot
-                    .get_or_insert_with(|| txnmgr.snapshot())
-                    .clone(),
+                IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
+                    match &active.snapshot {
+                        Some(frozen) => frozen.clone(),
+                        None => {
+                            // Freezing the block's snapshot also registers it for
+                            // the block's whole life. The per-statement guard on
+                            // the `TxnContext` below only covers this statement,
+                            // and a read-only block holds no XID, so without this
+                            // the block is invisible to `reclaim_horizon` while it
+                            // sits idle between statements — exactly when a
+                            // concurrent VACUUM would run.
+                            let frozen = txnmgr.snapshot();
+                            active.reservation = Some(txnmgr.register_snapshot(&frozen));
+                            active.snapshot = Some(frozen.clone());
+                            frozen
+                        }
+                    }
+                }
             };
             txnmgr.context_with(xid, active.cid, snapshot, active.iso)
         }
@@ -1833,9 +1847,13 @@ fn execute_vacuum(
             .collect(),
     };
 
-    // Versions below the oldest running transaction's floor are dead to every
-    // snapshot that can still be taken, so they are safe to reclaim.
-    let oldest = txnmgr.snapshot().xmin;
+    // Versions below the reclamation horizon are dead to every reader that exists
+    // or can still be created, so they are safe to reclaim. This is deliberately
+    // not `snapshot().xmin`: a read-only transaction holds a snapshot without an
+    // XID, so it moves the horizon but not the xmin, and reclaiming above it would
+    // delete rows out from under a REPEATABLE READ reader mid-transaction. The
+    // background flush worker chooses the same floor.
+    let oldest = txnmgr.reclaim_horizon();
     let mut flushed = 0u64;
     for (namespace, name) in &targets {
         match engine.vacuum_table(namespace, name, oldest) {

@@ -5260,6 +5260,63 @@ async fn truncate_under_repeatable_read_leaves_no_rows_behind() -> anyhow::Resul
     Ok(())
 }
 
+/// `VACUUM` may not reclaim a version a live reader is still entitled to see.
+///
+/// The reader is read-only, so it never allocates an XID and is invisible to the
+/// running-transaction floor; the snapshot it registered for the block is the
+/// only thing standing between it and the vacuumer. Choosing the wrong floor here
+/// deletes the row out from under a `REPEATABLE READ` session mid-transaction.
+#[tokio::test]
+async fn vacuum_does_not_reclaim_below_a_read_only_repeatable_read_reader()
+-> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let reader = connect(port).await;
+    let vacuumer = connect(port).await;
+    vacuumer.simple_query("CREATE TABLE t (id int4)").await?;
+    vacuumer
+        .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+
+    // The first read freezes and registers the block's snapshot. The block writes
+    // nothing, so it holds no XID from here on.
+    reader
+        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3")]
+    );
+
+    // A committed delete, then a vacuum, both while the reader sits idle.
+    vacuumer.simple_query("DELETE FROM t WHERE id = 2").await?;
+    vacuumer.simple_query("VACUUM t").await?;
+
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3")],
+        "VACUUM must not reclaim a version the open snapshot can still see"
+    );
+
+    // Holding the horizon back only delays reclamation: once the reader is done,
+    // the delete is final for everyone.
+    reader.simple_query("COMMIT").await?;
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("3")]
+    );
+    vacuumer.simple_query("VACUUM t").await?;
+    let messages = reader.simple_query("SELECT id FROM t ORDER BY id").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("1"), Some("3")],
+        "with no reader holding it back, the version is reclaimed for good"
+    );
+    Ok(())
+}
+
 /// `VACUUM` is the explicit flush hook: it moves a Parquet relation's buffered
 /// rows into durable storage without changing what any reader sees, works on a
 /// heap table and bare, and refuses the forms it cannot honor.
