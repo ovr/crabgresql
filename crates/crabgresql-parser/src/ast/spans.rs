@@ -1471,6 +1471,7 @@ impl Spanned for Expr {
                 expr,
                 substring_from,
                 substring_for,
+                similar: _,
                 special: _,
                 shorthand: _,
             } => union_spans(

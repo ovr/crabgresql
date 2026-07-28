@@ -333,6 +333,10 @@ pub enum ScalarFn {
     RegexpCount,
     /// `regexp_substr(string, pattern [, start [, n [, flags [, subexpr]]]]) -> text`.
     RegexpSubstr,
+    /// `substring(text, text) -> text`: POSIX-regex extraction.
+    SubstringRegex,
+    /// `substring(text, text, text) -> text`: SQL-regex (`SIMILAR`) extraction.
+    SubstringSimilar,
     /// `encode(bytea, text) -> text`.
     Encode,
     /// `decode(text, text) -> bytea`.
@@ -1488,7 +1492,55 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[TEXT],
             ret: TEXT,
         }],
-        "substr" | "substring" => &[
+        // `substring` additionally has the two regex-extraction forms, which
+        // `substr` does not: `substr('abcdef', '2')` is `bcdef` (the untyped
+        // literal becomes an offset) while `substring('abcdef', '2')` is NULL
+        // (it becomes a pattern). Listing the text forms first is what produces
+        // that split — an untyped argument matches neither exactly, so
+        // `resolve_call`'s second pass breaks the tie by list order.
+        "substring" => &[
+            Signature {
+                func: ScalarFn::SubstringRegex,
+                args: &[TEXT, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::SubstringSimilar,
+                args: &[TEXT, TEXT, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::Substr,
+                args: &[TEXT, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::Substr,
+                args: &[TEXT, I4, I4],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::SubstrBit,
+                args: &[BIT, I4],
+                ret: BIT,
+            },
+            Signature {
+                func: ScalarFn::SubstrBit,
+                args: &[BIT, I4, I4],
+                ret: BIT,
+            },
+            Signature {
+                func: ScalarFn::SubstrBit,
+                args: &[VARBIT, I4],
+                ret: VARBIT,
+            },
+            Signature {
+                func: ScalarFn::SubstrBit,
+                args: &[VARBIT, I4, I4],
+                ret: VARBIT,
+            },
+        ],
+        "substr" => &[
             Signature {
                 func: ScalarFn::Substr,
                 args: &[TEXT, I4],

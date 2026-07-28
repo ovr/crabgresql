@@ -338,25 +338,20 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 .map_err(text_err);
         }
         ScalarFn::SimilarTo => {
-            // No ESCAPE clause defaults to `\`; `ESCAPE ''` disables escaping.
-            let escape = match args.get(2) {
-                None => Some('\\'),
-                Some(v) => {
-                    let s = text(v);
-                    if s.chars().count() > 1 {
-                        return Err(err(
-                            sqlstate::INVALID_ESCAPE_SEQUENCE,
-                            "invalid escape string",
-                        )
-                        .with_detail(Some(
-                            "Escape string must be empty or one character.".to_string(),
-                        )));
-                    }
-                    s.chars().next()
-                }
-            };
+            let escape = escape_char(args.get(2))?;
             return text::similar_to_match(text(&args[0]), text(&args[1]), escape)
                 .map(Value::Bool)
+                .map_err(text_err);
+        }
+        ScalarFn::SubstringRegex => {
+            return text::substring_regex(text(&args[0]), text(&args[1]))
+                .map(|found| found.map_or(Value::Null, Value::Text))
+                .map_err(text_err);
+        }
+        ScalarFn::SubstringSimilar => {
+            let escape = escape_char(args.get(2))?;
+            return text::substring_similar(text(&args[0]), text(&args[1]), escape)
+                .map(|found| found.map_or(Value::Null, Value::Text))
                 .map_err(text_err);
         }
         ScalarFn::Encode => {
@@ -1084,6 +1079,28 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
 
 fn text_err(e: text::TextError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
+}
+
+/// The `ESCAPE` argument shared by `SIMILAR TO` and the SQL-regex `substring`
+/// form. An absent clause defaults to `\`; `ESCAPE ''` disables escaping
+/// altogether; anything longer than one character is an error.
+fn escape_char(arg: Option<&Value>) -> Result<Option<char>, ExecError> {
+    match arg {
+        None => Ok(Some('\\')),
+        Some(v) => {
+            let s = text(v);
+            if s.chars().count() > 1 {
+                return Err(err(
+                    sqlstate::INVALID_ESCAPE_SEQUENCE,
+                    "invalid escape string",
+                )
+                .with_hint(Some(
+                    "Escape string must be empty or one character.".to_string(),
+                )));
+            }
+            Ok(s.chars().next())
+        }
+    }
 }
 
 fn bit_err(e: bit::BitError) -> ExecError {

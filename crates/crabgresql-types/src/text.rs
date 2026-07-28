@@ -13,6 +13,7 @@ mod sqlstate {
     pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
     pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
     pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
+    pub const INVALID_USE_OF_ESCAPE_CHARACTER: &str = "2200C";
     pub const SUBSTRING_ERROR: &str = "22011";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
     pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
@@ -927,6 +928,35 @@ pub fn similar_to_match(s: &str, pattern: &str, escape: Option<char>) -> Result<
     with_cached(pattern, PatternKind::SimilarTo(escape), |re| re.is_match(s))
 }
 
+/// The value the two-and-three-argument `substring` forms extract from a match:
+/// the first capture group when the pattern has one, otherwise the whole match.
+/// A group that did not participate yields NULL rather than the empty string.
+fn extracted(re: &regex::Regex, s: &str) -> Option<String> {
+    let caps = re.captures(s)?;
+    let group = usize::from(re.captures_len() > 1);
+    caps.get(group).map(|m| m.as_str().to_string())
+}
+
+/// `substring(string, pattern)`: POSIX-regex extraction. Returns the pattern's
+/// first parenthesised subexpression, or the whole match when it has none, and
+/// `None` (SQL NULL) when the pattern does not match at all.
+pub fn substring_regex(s: &str, pattern: &str) -> Result<Option<String>> {
+    with_cached(pattern, PatternKind::Regex(ReOpts::default()), |re| {
+        extracted(re, s)
+    })
+}
+
+/// `substring(string, pattern, escape)`: the SQL-regex form, spelled
+/// `SUBSTRING(s SIMILAR pat ESCAPE e)` or `SUBSTRING(s FROM pat FOR e)`. The
+/// pattern is a `SIMILAR TO` pattern whose escape-double-quote separators mark
+/// the part to extract (see [`similar_to_regex`]); with no separators the whole
+/// match is returned.
+pub fn substring_similar(s: &str, pattern: &str, escape: Option<char>) -> Result<Option<String>> {
+    with_cached(pattern, PatternKind::SimilarTo(escape), |re| {
+        extracted(re, s)
+    })
+}
+
 // --- regexp_* functions ----------------------------------------------------
 
 /// Reject the `g` flag for the functions that match at most once. PG raises
@@ -1263,12 +1293,34 @@ fn push_brace(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String
 /// character is emitted as a regex literal. The escape character (default `\`)
 /// makes the following character a literal. The result is wrapped in `^(?:...)$`
 /// so the match spans the whole string.
+///
+/// The one exception to "escape makes the next character literal" is the
+/// *escape-double-quote separator* `escape` + `"`: it delimits the portion of
+/// the match that `substring(text, text, text)` extracts, and is translated into
+/// the sole capture group of the result. `SIMILAR TO` itself just ignores that
+/// group, which is why `'x' SIMILAR TO 'x\"'` is true. So that the separator is
+/// always group 1, a parenthesised group written by the user becomes the
+/// non-capturing `(?:`.
 fn similar_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
     let mut out = String::from("^(?:");
+    let mut separators = 0u32;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         if Some(c) == escape {
             match chars.next() {
+                Some('"') => {
+                    separators += 1;
+                    match separators {
+                        1 => out.push('('),
+                        2 => out.push(')'),
+                        _ => {
+                            return Err(TextError::new(
+                                sqlstate::INVALID_USE_OF_ESCAPE_CHARACTER,
+                                "SQL regular expression may not contain more than two escape-double-quote separators",
+                            ));
+                        }
+                    }
+                }
                 Some(next) => push_literal(&mut out, next),
                 None => {
                     return Err(TextError::new(
@@ -1281,13 +1333,19 @@ fn similar_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
             match c {
                 '%' => out.push_str(".*"),
                 '_' => out.push('.'),
+                '(' => out.push_str("(?:"),
                 // SQL-regex metacharacters shared with POSIX regex.
-                '|' | '*' | '+' | '?' | '(' | ')' => out.push(c),
+                '|' | '*' | '+' | '?' | ')' => out.push(c),
                 '[' => copy_bracket(&mut chars, &mut out),
                 '{' => push_brace(&mut chars, &mut out),
                 other => push_literal(&mut out, other),
             }
         }
+    }
+    // A lone opening separator extracts everything from there to the end of the
+    // match, so close its group at the end of the pattern.
+    if separators == 1 {
+        out.push(')');
     }
     out.push_str(")$");
     Ok(out)
@@ -2300,6 +2358,68 @@ mod tests {
         assert!(!similar_to_match("a", "a{2}", Some('\\'))?);
         assert!(similar_to_match("a{c", "a{c", Some('\\'))?);
         assert!(!similar_to_match("ac", "a{c", Some('\\'))?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn substring_posix_regex() -> anyhow::Result<()> {
+        // With no subexpression the whole match is returned.
+        assert_eq!(substring_regex("Thomas", "...$")?.as_deref(), Some("mas"));
+        assert_eq!(substring_regex("foobar", "o+")?.as_deref(), Some("oo"));
+        // With one or more, the *first* is what comes back.
+        assert_eq!(substring_regex("foobar", "o(.)b")?.as_deref(), Some("o"));
+        assert_eq!(substring_regex("foobar", "o(.)b(a)")?.as_deref(), Some("o"));
+        // A group that did not participate is NULL, not the empty string.
+        assert_eq!(substring_regex("abc", "(x)?b")?, None);
+        // No match at all is NULL, and matching is case-sensitive.
+        assert_eq!(substring_regex("abc", "x")?, None);
+        assert_eq!(substring_regex("ABC", "b")?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn substring_sql_regex() -> anyhow::Result<()> {
+        let esc = Some('#');
+        // Two separators delimit the extracted part; the pattern as a whole
+        // still has to match the whole string.
+        assert_eq!(
+            substring_similar("Thomas", "%#\"o_a#\"_", esc)?.as_deref(),
+            Some("oma")
+        );
+        // With no separators the whole match comes back...
+        assert_eq!(
+            substring_similar("Thomas", "%o_a_", esc)?.as_deref(),
+            Some("Thomas")
+        );
+        // ...and with a lone opening one, everything from there to the end.
+        assert_eq!(substring_similar("XY", "X#\"Y", esc)?.as_deref(), Some("Y"));
+        // Parentheses written by the user do not shift the separator group.
+        assert_eq!(
+            substring_similar("abc", "(a)#\"b#\"c", esc)?.as_deref(),
+            Some("b")
+        );
+        // An empty capture is the empty string, distinct from no match at all.
+        assert_eq!(
+            substring_similar("Thomas", "Thomas#\"#\"", esc)?.as_deref(),
+            Some("")
+        );
+        assert_eq!(substring_similar("Thomas", "o", esc)?, None);
+        // Without an escape character `#"` is just two literal characters.
+        assert_eq!(substring_similar("Thomas", "%#\"o_a#\"_", None)?, None);
+        // A third separator is an error rather than a silent extra group.
+        assert_eq!(
+            substring_similar("XYZ", "X#\"Y#\"Z#\"", esc)
+                .unwrap_err()
+                .sqlstate,
+            "2200C"
+        );
+
+        // SIMILAR TO shares the translation and simply ignores the separators.
+        assert!(similar_to_match("x", "x#\"", esc)?);
+        assert!(!similar_to_match("x\"", "x#\"", esc)?);
+        assert!(similar_to_match("x", "#\"x#\"", esc)?);
 
         Ok(())
     }

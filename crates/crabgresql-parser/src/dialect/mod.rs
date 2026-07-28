@@ -795,7 +795,14 @@ pub trait Dialect: Debug + Any {
                     Token::Word(w) if w.keyword == Keyword::RLIKE => Ok(p!(Like)),
                     Token::Word(w) if w.keyword == Keyword::REGEXP => Ok(p!(Like)),
                     Token::Word(w) if w.keyword == Keyword::MATCH => Ok(p!(Like)),
-                    Token::Word(w) if w.keyword == Keyword::SIMILAR => Ok(p!(Like)),
+                    // Only `SIMILAR TO` is an operator; a bare `SIMILAR` belongs
+                    // to `SUBSTRING(x SIMILAR p ESCAPE e)`.
+                    Token::Word(w)
+                        if w.keyword == Keyword::SIMILAR
+                            && parser.peek_nth_keyword(2, Keyword::TO) =>
+                    {
+                        Ok(p!(Like))
+                    }
                     Token::Word(w) if w.keyword == Keyword::MEMBER => Ok(p!(Like)),
                     Token::Word(w)
                         if w.keyword == Keyword::NULL && !parser.in_column_definition_state() =>
@@ -817,7 +824,11 @@ pub trait Dialect: Debug + Any {
             Token::Word(w) if w.keyword == Keyword::RLIKE => Ok(p!(Like)),
             Token::Word(w) if w.keyword == Keyword::REGEXP => Ok(p!(Like)),
             Token::Word(w) if w.keyword == Keyword::MATCH => Ok(p!(Like)),
-            Token::Word(w) if w.keyword == Keyword::SIMILAR => Ok(p!(Like)),
+            Token::Word(w)
+                if w.keyword == Keyword::SIMILAR && parser.peek_nth_keyword(1, Keyword::TO) =>
+            {
+                Ok(p!(Like))
+            }
             Token::Word(w) if w.keyword == Keyword::MEMBER => Ok(p!(Like)),
             Token::Word(w) if w.keyword == Keyword::OPERATOR => Ok(p!(Between)),
             Token::Word(w) if w.keyword == Keyword::DIV => Ok(p!(MulDivModOp)),

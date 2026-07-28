@@ -2660,7 +2660,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse `SUBSTRING`/`SUBSTR` expressions: `SUBSTRING(expr FROM start FOR length)` or `SUBSTR(expr, start, length)`.
+    /// Parse `SUBSTRING`/`SUBSTR` expressions: `SUBSTRING(expr FROM start FOR length)`,
+    /// `SUBSTR(expr, start, length)`, or the SQL-regex form
+    /// `SUBSTRING(expr SIMILAR pattern ESCAPE escape)`.
     pub fn parse_substring(&mut self) -> Result<Expr, ParserError> {
         let shorthand = match self.expect_one_of_keywords(&[Keyword::SUBSTR, Keyword::SUBSTRING])? {
             Keyword::SUBSTR => true,
@@ -2672,6 +2674,26 @@ impl<'a> Parser<'a> {
         };
         self.expect_token(&Token::LParen)?;
         let expr = self.parse_expr()?;
+
+        // `SUBSTRING(x SIMILAR p ESCAPE e)` is the SQL spelling of
+        // `SUBSTRING(x FROM p FOR e)`, so it fills the same two slots. `ESCAPE`
+        // is not optional in this form.
+        let similar = self.parse_keyword(Keyword::SIMILAR);
+        if similar {
+            let pattern = self.parse_expr()?;
+            self.expect_keyword(Keyword::ESCAPE)?;
+            let escape = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            return Ok(Expr::Substring {
+                expr: Box::new(expr),
+                substring_from: Some(Box::new(pattern)),
+                substring_for: Some(Box::new(escape)),
+                similar: true,
+                special: false,
+                shorthand,
+            });
+        }
+
         let mut from_expr = None;
         let special = self.consume_token(&Token::Comma);
         if special || self.parse_keyword(Keyword::FROM) {
@@ -2688,6 +2710,7 @@ impl<'a> Parser<'a> {
             expr: Box::new(expr),
             substring_from: from_expr.map(Box::new),
             substring_for: to_expr.map(Box::new),
+            similar: false,
             special,
             shorthand,
         })
@@ -4299,6 +4322,13 @@ impl<'a> Parser<'a> {
     /// Returns true if the current token matches the expected keyword.
     pub fn peek_keyword(&self, expected: Keyword) -> bool {
         matches!(&self.peek_token_ref().token, Token::Word(w) if expected == w.keyword)
+    }
+
+    #[must_use]
+    /// Check whether the token `n` ahead of the current one is `expected`,
+    /// without consuming anything. `n == 0` is the current token.
+    pub fn peek_nth_keyword(&self, n: usize, expected: Keyword) -> bool {
+        matches!(&self.peek_nth_token_ref(n).token, Token::Word(w) if expected == w.keyword)
     }
 
     /// If the current token is the `expected` keyword followed by

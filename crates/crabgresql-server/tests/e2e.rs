@@ -1312,6 +1312,80 @@ async fn regex_and_similar_to_operators() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn substring_pattern_extraction() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    // `substring(text, text)` extracts with a POSIX regex: the first
+    // subexpression when there is one, otherwise the whole match.
+    let messages = client
+        .simple_query(
+            "SELECT substring('Thomas' from '...$') AS tail, \
+             substring('foobar' from 'o(.)b(a)') AS grp, \
+             substring('abc' from '(x)?b') AS unmatched_grp, \
+             substring('ABC' from 'b') AS case_sensitive",
+        )
+        .await?;
+    let row = rows(&messages)[0];
+    assert_eq!(row.get(0), Some("mas"));
+    assert_eq!(row.get(1), Some("o"));
+    assert_eq!(row.get(2), None);
+    assert_eq!(row.get(3), None);
+
+    // The three-argument SQL-regex form, in both of its spellings.
+    let messages = client
+        .simple_query(
+            "SELECT substring('Thomas' similar '%#\"o_a#\"_' escape '#') AS sim, \
+             substring('Thomas' from '%#\"o_a#\"_' for '#') AS from_for, \
+             substring('Thomas' similar '%o_a_' escape '#') AS whole, \
+             substring('XY' similar 'X#\"Y' escape '#') AS open_ended",
+        )
+        .await?;
+    let row = rows(&messages)[0];
+    assert_eq!(row.get(0), Some("oma"));
+    assert_eq!(row.get(1), Some("oma"));
+    assert_eq!(row.get(2), Some("Thomas"));
+    assert_eq!(row.get(3), Some("Y"));
+
+    // Overload resolution splits the two names: an untyped literal is a pattern
+    // for `substring` but an offset for `substr`, which has no regex forms.
+    let messages = client
+        .simple_query(
+            "SELECT substring('abcdef' from '2') AS pattern, \
+             substr('abcdef', '2') AS offset_, \
+             substring('abcdef' from 2 for 3) AS positional",
+        )
+        .await?;
+    let row = rows(&messages)[0];
+    assert_eq!(row.get(0), None);
+    assert_eq!(row.get(1), Some("bcdef"));
+    assert_eq!(row.get(2), Some("bcd"));
+
+    // At most two separators, and the escape must be a single character.
+    let err = client
+        .simple_query("SELECT substring('XYZ' similar 'X#\"Y#\"Z#\"' escape '#')")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code().code(), "2200C");
+    assert_eq!(
+        db.message(),
+        "SQL regular expression may not contain more than two escape-double-quote separators"
+    );
+
+    let err = client
+        .simple_query("SELECT substring('Thomas' similar 'o' escape '##')")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::INVALID_ESCAPE_SEQUENCE);
+    assert_eq!(db.message(), "invalid escape string");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
 

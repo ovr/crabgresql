@@ -75,6 +75,26 @@ SELECT 'abc' SIMILAR TO '(b|a)%' AS s1, 'abc' SIMILAR TO 'a_c' AS s2,
 SELECT 'b' SIMILAR TO '[^a]' AS b1, '%' SIMILAR TO '[%_]' AS b2,
        'aa' SIMILAR TO 'a{2}' AS b3, 'a{c' SIMILAR TO 'a{c' AS b4,
        'a|b' SIMILAR TO 'a\|b' AS b5;
+-- the escape-double-quote separator is a substring marker, not a literal, so
+-- SIMILAR TO ignores it
+SELECT 'x' SIMILAR TO 'x#"' ESCAPE '#' AS d1, 'x"' SIMILAR TO 'x#"' ESCAPE '#' AS d2;
+
+-- substring(string from pattern): POSIX extraction; the first subexpression
+-- wins when there is one, and a non-participating group is NULL
+SELECT substring('Thomas' from '...$') AS p1, substring('foobar' from 'o(.)b(a)') AS p2,
+       substring('abc' from '(x)?b') AS p3, substring('ABC' from 'b') AS p4;
+-- an untyped literal makes it the pattern form, unlike substr()
+SELECT substring('abcdef' from '2') AS p5, substr('abcdef', '2') AS p6;
+-- substring(string similar pattern escape e): #" delimits what is extracted,
+-- and the same call can be spelled FROM ... FOR ...
+SELECT substring('Thomas' similar '%#"o_a#"_' escape '#') AS q1,
+       substring('Thomas' from '%#"o_a#"_' for '#') AS q2,
+       substring('Thomas' similar '%o_a_' escape '#') AS q3,
+       substring('XY' similar 'X#"Y' escape '#') AS q4,
+       substring('abc' similar '(a)#"b#"c' escape '#') AS q5;
+-- (the "more than two separators" and "invalid escape string" errors are not
+-- exercised here: PG raises them from inside a SQL-language function, so psql
+-- prints a CONTEXT line this server has no equivalent for)
 
 -- regexp_replace: first match only, then every match with the g flag
 SELECT regexp_replace('a1b2', '[0-9]', 'X') AS rr1,
