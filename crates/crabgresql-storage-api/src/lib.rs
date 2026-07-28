@@ -614,60 +614,57 @@ pub type TupleStream = Box<
 pub enum ColumnProjection {
     /// Every column. The state of any scan whose needs could not be proven.
     All,
-    /// Sorted, deduplicated schema ordinals. Never empty and never a complete
-    /// cover — [`ColumnProjection::of`] normalizes both cases away.
+    /// Sorted, deduplicated, in-range schema ordinals. Never empty and never a
+    /// complete cover — [`ColumnProjection::of`] normalizes those away, and is
+    /// the only sanctioned way to build this variant.
     Some(Arc<[usize]>),
 }
 
 impl ColumnProjection {
-    pub const fn all() -> Self {
-        ColumnProjection::All
-    }
-
     /// Build a projection from the schema ordinals a plan proved it reads.
     ///
-    /// Normalizes two edge cases so consumers never have to:
+    /// Every branch that cannot produce a *correct narrower* answer returns
+    /// [`Self::All`]. Reading too much is only slow; reading too little returns
+    /// wrong rows, because the pruned slots come back as placeholder values.
     ///
-    /// * A set covering every column becomes [`Self::All`], so engines take
-    ///   their unprojected fast path and equality against `All` is meaningful.
+    /// Three cases are normalized so consumers never have to:
+    ///
+    /// * An **out-of-range** ordinal means the demand was computed in the wrong
+    ///   index space. That is a planner bug, and the safe response is to read
+    ///   everything rather than silently drop the column it names.
     /// * An **empty** set (`SELECT count(*)`, which reads no column at all)
     ///   becomes the single narrowest column rather than a zero-column read.
     ///   Counting rows still only pays for one column — the entire win — while
     ///   avoiding any dependence on how a storage format reports the row count
     ///   of a batch with no columns.
+    /// * A set **covering every column** becomes `All`, so engines take their
+    ///   unprojected fast path and equality against `All` is meaningful. This
+    ///   is checked last, so a one-column relation whose demand was empty
+    ///   normalizes to `All` rather than to the complete cover `Some([0])`.
     pub fn of(columns: impl IntoIterator<Item = usize>, schema: &TableSchema) -> Self {
         let width = schema.columns.len();
-        let mut wanted: Vec<usize> = columns.into_iter().filter(|&i| i < width).collect();
+        let mut wanted: Vec<usize> = Vec::new();
+        for index in columns {
+            if index >= width {
+                return ColumnProjection::All;
+            }
+            wanted.push(index);
+        }
         wanted.sort_unstable();
         wanted.dedup();
 
+        if wanted.is_empty() {
+            // A relation with no columns at all leaves nothing to prune, and
+            // `width == 0` is caught by the cover check just below.
+            if width == 0 {
+                return ColumnProjection::All;
+            }
+            wanted.push(narrowest_column(schema));
+        }
         if wanted.len() >= width {
             return ColumnProjection::All;
         }
-        if wanted.is_empty() {
-            match narrowest_column(schema) {
-                Some(index) => wanted.push(index),
-                // A relation with no columns at all: nothing to prune.
-                None => return ColumnProjection::All,
-            }
-        }
         ColumnProjection::Some(wanted.into())
-    }
-
-    /// Whether the scan needs the value at schema position `index`.
-    pub fn contains(&self, index: usize) -> bool {
-        match self {
-            ColumnProjection::All => true,
-            ColumnProjection::Some(cols) => cols.binary_search(&index).is_ok(),
-        }
-    }
-
-    /// The selected schema ordinals, ascending. `All` yields `0..width`.
-    pub fn indices(&self, width: usize) -> Box<dyn Iterator<Item = usize> + '_> {
-        match self {
-            ColumnProjection::All => Box::new(0..width),
-            ColumnProjection::Some(cols) => Box::new(cols.iter().copied()),
-        }
     }
 }
 
@@ -675,19 +672,16 @@ impl ColumnProjection {
 /// else the first column. `typlen` follows PostgreSQL's convention — a positive
 /// byte width for a fixed-width type, negative for a variable-length one — so
 /// ordering by it puts a `bool` ahead of a `text`.
-fn narrowest_column(schema: &TableSchema) -> Option<usize> {
+///
+/// Only called for a non-empty schema, so column 0 is always a valid fallback.
+fn narrowest_column(schema: &TableSchema) -> usize {
     schema
         .columns
         .iter()
         .enumerate()
         .filter(|(_, column)| column.ty.typlen() > 0)
         .min_by_key(|(_, column)| column.ty.typlen())
-        .map(|(index, _)| index)
-        .or(if schema.columns.is_empty() {
-            None
-        } else {
-            Some(0)
-        })
+        .map_or(0, |(index, _)| index)
 }
 
 /// Table access: scans and modifications on one table, all judged against the
@@ -1315,5 +1309,69 @@ mod tests {
         // The largest row id saturates the tid exactly — every bit but the flag
         // is in use, so 47 is the true capacity and not a rounded-down guess.
         assert_eq!(Tid::logical(MAX_ROW_ID), Tid::new(u32::MAX, u16::MAX));
+    }
+}
+
+#[cfg(test)]
+mod column_projection_tests {
+    use super::*;
+    use crabgresql_types::PgType;
+
+    fn schema(types: &[PgType]) -> TableSchema {
+        TableSchema::new(
+            "t",
+            types
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| Column::new(format!("c{index}"), *ty))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_proven_subset_is_kept_sorted_and_deduplicated() {
+        let schema = schema(&[PgType::Int4, PgType::Int8, PgType::Text, PgType::Bool]);
+        assert_eq!(
+            ColumnProjection::of([2, 0, 2], &schema),
+            ColumnProjection::Some(vec![0, 2].into())
+        );
+    }
+
+    /// A set covering every column takes the unprojected fast path, so an
+    /// engine can branch on `All` and mean it.
+    #[test]
+    fn a_complete_cover_normalizes_to_all() {
+        let schema = schema(&[PgType::Int4, PgType::Text]);
+        assert_eq!(ColumnProjection::of([0, 1], &schema), ColumnProjection::All);
+    }
+
+    /// `count(*)` reads no column, but a one-column relation has no narrower
+    /// answer than "all of it" — the cover check has to run *after* the
+    /// empty-set fill for this to hold.
+    #[test]
+    fn an_empty_demand_narrows_but_never_produces_a_cover() {
+        let wide = schema(&[PgType::Text, PgType::Bool, PgType::Int8]);
+        assert_eq!(
+            ColumnProjection::of([], &wide),
+            ColumnProjection::Some(vec![1].into()),
+            "the 1-byte bool is cheaper than the int8 or the varlena text"
+        );
+
+        let single = schema(&[PgType::Int4]);
+        assert_eq!(ColumnProjection::of([], &single), ColumnProjection::All);
+        assert_eq!(ColumnProjection::of([], &schema(&[])), ColumnProjection::All);
+    }
+
+    /// The load-bearing direction: an ordinal outside the schema means the
+    /// demand was computed in the wrong index space. Reading everything is
+    /// merely slow; dropping the column would return NULL for a real value.
+    #[test]
+    fn an_out_of_range_ordinal_fails_safe_to_all() {
+        let schema = schema(&[PgType::Int4, PgType::Text, PgType::Bool]);
+        assert_eq!(ColumnProjection::of([3], &schema), ColumnProjection::All);
+        assert_eq!(ColumnProjection::of([0, 9], &schema), ColumnProjection::All);
+        // Not: drop the 9, keep {0}. And not: drop it, find the set empty, and
+        // fall through to the narrowest column.
+        assert_eq!(ColumnProjection::of([9], &schema), ColumnProjection::All);
     }
 }

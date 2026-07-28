@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use crabgresql_pg_engine::PgEngine;
-use crabgresql_storage_api::{ColumnProjection, 
-    Column, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, StorageError,
-    TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
+use crabgresql_storage_api::{
+    Column, ColumnProjection, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod,
+    StorageError, TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, CommandId, CommitSink, LockOwner, TransactionManager, TxnContext, TxnFinalize, Xid,

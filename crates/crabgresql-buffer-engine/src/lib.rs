@@ -392,7 +392,13 @@ impl BufferTable {
                     ColumnProjection::Some(cols) => {
                         let mut values = vec![Value::Null; width];
                         for &index in cols.iter() {
-                            values[index] = row.values[index].clone();
+                            // Indexed defensively: the `All` arm above passes a
+                            // stored row through whatever its width, so a row
+                            // narrower than the schema must degrade here too
+                            // rather than panic inside a `TupleStream`.
+                            if let Some(value) = row.values.get(index) {
+                                values[index] = value.clone();
+                            }
                         }
                         values
                     }

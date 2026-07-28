@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crabgresql_pg_engine::{PgEngine, RelFileNode};
-use crabgresql_storage_api::{ColumnProjection, Column, TableAm, TableEngine, TableSchema, Tid};
+use crabgresql_storage_api::{Column, ColumnProjection, TableAm, TableEngine, TableSchema, Tid};
 use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
 use crabgresql_wal::{RmgrRegistry, Wal, recover};

@@ -4,9 +4,9 @@
 //! rows and duplicates, vacuum reclaiming index entries (so a reused heap slot
 //! is never reachable by a stale key), crash recovery, and file lifecycle.
 
-use crabgresql_storage_api::{ColumnProjection, 
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableAm, TableEngine,
-    TableSchema, Tid,
+use crabgresql_storage_api::{
+    Column, ColumnProjection, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableAm,
+    TableEngine, TableSchema, Tid,
 };
 use crabgresql_txn::{CommandId, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};

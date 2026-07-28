@@ -210,8 +210,8 @@ fn sweep(
 
 #[cfg(test)]
 mod tests {
-    use crabgresql_storage_api::{ColumnProjection, 
-        Column, TableAccessMethod, TableAm, TableEngine, TableSchema,
+    use crabgresql_storage_api::{
+        Column, ColumnProjection, TableAccessMethod, TableAm, TableEngine, TableSchema,
     };
     use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnFinalize};
     use crabgresql_types::{PgType, Value};

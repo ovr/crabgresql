@@ -899,13 +899,17 @@ impl BoundExpr {
         }
     }
 
-    /// [`Self::collect_column_refs`] over a slice. Every expression is walked
-    /// even after one refuses, so `out` still accumulates — but the `false`
-    /// result means the whole set must be discarded.
-    pub fn collect_all(exprs: &[BoundExpr], out: &mut BTreeSet<usize>) -> bool {
+    /// [`Self::collect_column_refs`] over a slice, with the same contract: a
+    /// `false` result leaves `out` in an unspecified state that the caller must
+    /// discard.
+    ///
+    /// How much of `out` is populated on refusal is deliberately not promised —
+    /// the sibling arms above short-circuit with `&&`, so a partial set is not
+    /// a usable lower bound and must never be read as one.
+    fn collect_all(exprs: &[BoundExpr], out: &mut BTreeSet<usize>) -> bool {
         exprs
             .iter()
-            .fold(true, |complete, expr| complete & expr.collect_column_refs(out))
+            .all(|expr| expr.collect_column_refs(out))
     }
 
     /// Add `delta` to every `ColumnRef` index, relocating this expression from
