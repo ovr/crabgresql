@@ -4,6 +4,7 @@
 //! to hold the layer boundary where index selection, join ordering and
 //! cost-based choices land later (docs/ARCHITECTURE.md §2).
 
+mod projection;
 mod pushdown;
 
 use std::sync::Arc;
@@ -13,7 +14,9 @@ use crabgresql_binder::{
     AggInput, BinOp, BoundAggregate, BoundExpr, DistinctKey, InsertSource, JoinExpr, JoinInput,
     JoinKind, LogicalPlan, OutputColumn, Returning, SortKey, TableFn,
 };
-use crabgresql_storage_api::{IndexConstraint, IndexMetadata, TableAm, TableSchema};
+use crabgresql_storage_api::{
+    ColumnProjection, IndexConstraint, IndexMetadata, TableAm, TableSchema,
+};
 use crabgresql_types::PgType;
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 
@@ -29,6 +32,9 @@ pub enum PhysicalPlan {
     },
     Select {
         table: Arc<dyn TableAm>,
+        /// The columns this scan's own expressions read, for engines that can
+        /// skip the rest (see [`projection`]). Rows stay full width regardless.
+        projection: ColumnProjection,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -44,6 +50,9 @@ pub enum PhysicalPlan {
     /// exactly as for [`Self::Select`].
     IndexScan {
         table: Arc<dyn TableAm>,
+        /// As for [`Self::Select`], and additionally always covering every
+        /// `key` column: the executor's scan fallback re-checks the key per row.
+        projection: ColumnProjection,
         index_name: String,
         /// One `(key column, equality value)` pair per index key column, in key
         /// order. The value expressions are row-constant and evaluated once.
@@ -103,6 +112,10 @@ pub enum PhysicalPlan {
     /// tail runs on top.
     Append {
         tables: Vec<Arc<dyn TableAm>>,
+        /// Shared by every leaf — they all carry the parent's column layout.
+        /// Supplied by the wrapping [`Self::Subquery`], which owns the
+        /// expressions that read these rows.
+        projection: ColumnProjection,
         columns: Vec<OutputColumn>,
     },
     /// A `UNION` / `UNION ALL`. Mirrors [`LogicalPlan::SetOp`]: the executor
@@ -173,7 +186,12 @@ pub enum PhysicalInsertSource {
 /// A join input, mirroring [`JoinInput`] but with the subplan already lowered
 /// to a [`PhysicalPlan`].
 pub enum PhysicalJoinInput {
-    Scan(Arc<dyn TableAm>),
+    Scan {
+        table: Arc<dyn TableAm>,
+        /// The columns this leaf's own row supplies to the join tree above it,
+        /// in the leaf's base-0 space (see [`projection`]).
+        projection: ColumnProjection,
+    },
     Subplan(Box<PhysicalPlan>),
     TableFunction { func: TableFn, args: Vec<BoundExpr> },
 }
@@ -239,15 +257,22 @@ impl PhysicalJoinExpr {
 
 /// The row source of a [`PhysicalPlan::Aggregate`], mirroring [`AggInput`].
 pub enum PhysicalAggInput {
-    Scan(Arc<dyn TableAm>),
+    Scan {
+        table: Arc<dyn TableAm>,
+        /// The columns the grouping keys, aggregate arguments and WHERE read.
+        projection: ColumnProjection,
+    },
     Join(PhysicalJoinExpr),
     SingleRow,
 }
 
 fn plan_join_input(input: JoinInput) -> PhysicalJoinInput {
     match input {
-        JoinInput::Scan(table) => PhysicalJoinInput::Scan(table),
-        JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(plan(*source))),
+        JoinInput::Scan(table) => PhysicalJoinInput::Scan {
+            table,
+            projection: ColumnProjection::All,
+        },
+        JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(lower(*source))),
         JoinInput::TableFunction { func, args } => PhysicalJoinInput::TableFunction { func, args },
     }
 }
@@ -474,6 +499,16 @@ fn ref_side(expr: &BoundExpr, left_width: usize) -> Option<Side> {
 }
 
 pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
+    let mut physical = lower(logical);
+    // Last, so every predicate has already been sunk to the leaf that will
+    // evaluate it and each scan's demand is analyzed where it actually applies.
+    projection::push_column_projections(&mut physical);
+    physical
+}
+
+/// Lower one logical node, recursing into subplans. Split from [`plan`] so the
+/// projection pass runs exactly once, over the finished tree.
+fn lower(logical: LogicalPlan) -> PhysicalPlan {
     match logical {
         LogicalPlan::Values {
             columns,
@@ -502,6 +537,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
                 residual,
             } => PhysicalPlan::IndexScan {
                 table,
+                projection: ColumnProjection::All,
                 index_name,
                 key,
                 columns,
@@ -512,6 +548,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             },
             AccessPath::Scan { predicate } => PhysicalPlan::Select {
                 table,
+                projection: ColumnProjection::All,
                 columns,
                 projections,
                 predicate,
@@ -519,7 +556,11 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
                 distinct,
             },
         },
-        LogicalPlan::Append { tables, columns } => PhysicalPlan::Append { tables, columns },
+        LogicalPlan::Append { tables, columns } => PhysicalPlan::Append {
+            tables,
+            projection: ColumnProjection::All,
+            columns,
+        },
         LogicalPlan::SetOp {
             arms,
             columns,
@@ -529,7 +570,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             arms: arms
                 .into_iter()
                 .map(|arm| PhysicalSetOpArm {
-                    plan: plan(arm.plan),
+                    plan: lower(arm.plan),
                     coercion: arm.coercion,
                 })
                 .collect(),
@@ -545,7 +586,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             sort,
             distinct,
         } => PhysicalPlan::Subquery {
-            source: Box::new(plan(*source)),
+            source: Box::new(lower(*source)),
             columns,
             projections,
             predicate,
@@ -602,7 +643,13 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             // an ungrouped one carries — so the extraction has to run on this path
             // too, or every aggregating join (most of TPC-H) misses it.
             let (input, predicate) = match input {
-                AggInput::Scan(table) => (PhysicalAggInput::Scan(table), predicate),
+                AggInput::Scan(table) => (
+                    PhysicalAggInput::Scan {
+                        table,
+                        projection: ColumnProjection::All,
+                    },
+                    predicate,
+                ),
                 AggInput::Join(mut source) => {
                     let predicate = pushdown::push_where_into_joins(&mut source, predicate);
                     (PhysicalAggInput::Join(plan_join_expr(source)), predicate)
@@ -626,7 +673,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             limit,
             offset,
         } => PhysicalPlan::Limit {
-            source: Box::new(plan(*source)),
+            source: Box::new(lower(*source)),
             limit,
             offset,
         },
@@ -640,7 +687,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
             source: match source {
                 InsertSource::Values(rows) => PhysicalInsertSource::Values(rows),
                 InsertSource::Query { input, projections } => PhysicalInsertSource::Query {
-                    input: Box::new(plan(*input)),
+                    input: Box::new(lower(*input)),
                     projections,
                 },
             },
@@ -1103,7 +1150,7 @@ fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<&str>> {
 fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<&str>> {
     match join {
         PhysicalJoinExpr::Input { input, width, .. } => match input {
-            PhysicalJoinInput::Scan(table) => schema_names(table.schema()),
+            PhysicalJoinInput::Scan { table, .. } => schema_names(table.schema()),
             // An `Append` here is one relation read from several physical
             // sources, not a genuine subquery: its columns are the relation's, so
             // an expression over them must still render by name. Without this a
@@ -1138,7 +1185,7 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
             input, predicate, ..
         } => {
             let mut lines = match input {
-                PhysicalJoinInput::Scan(table) => {
+                PhysicalJoinInput::Scan { table, .. } => {
                     vec![format!("Seq Scan on {}", table.schema().name)]
                 }
                 PhysicalJoinInput::TableFunction { .. } => vec!["Function Scan".to_string()],
@@ -1224,7 +1271,7 @@ mod tests {
     /// stores rows — the planner only reads schema/index metadata, so every
     /// row-touching method is `unimplemented!()`.
     #[derive(Default)]
-    struct MetaEngine {
+    pub(super) struct MetaEngine {
         tables: Mutex<HashMap<String, Arc<MetaTable>>>,
     }
 
@@ -1243,7 +1290,7 @@ mod tests {
         fn supports_index_scan(&self, _index_name: &str) -> bool {
             true
         }
-        fn scan(&self, _txn: &TxnContext) -> TupleStream {
+        fn scan(&self, _txn: &TxnContext, _projection: &ColumnProjection) -> TupleStream {
             unimplemented!("planner tests never scan")
         }
         fn fetch(
@@ -1317,7 +1364,7 @@ mod tests {
         }
     }
 
-    fn plan_sql(sql: &str) -> PhysicalPlan {
+    pub(super) fn plan_sql(sql: &str) -> PhysicalPlan {
         plan_sql_indexed(sql, None)
     }
 
@@ -2290,6 +2337,7 @@ mod tests {
         };
         let plan = PhysicalPlan::Append {
             tables: vec![leaf("sales_2023"), leaf("sales_2024")],
+            projection: ColumnProjection::All,
             columns: vec![OutputColumn::new("id", PgType::Int4)],
         };
         assert_eq!(
@@ -2400,5 +2448,293 @@ mod tests {
         let lines = explain_summary(Duration::from_nanos(999_600), Some(Duration::ZERO));
         assert_eq!(lines[0], "Planning Time: 1.000 ms");
         assert_eq!(lines[1], "Execution Time: 0.000 ms");
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    //! The column-projection pass: SQL in, the projection stamped on each scan
+    //! leaf out. The fixture table is `t(id int4, big int8, name text)`.
+
+    use super::tests::{MetaEngine, plan_sql};
+    use super::*;
+    use crabgresql_storage_api::{Column, TableEngine};
+
+    /// The stamped projection, as a plain `Vec` (`None` = every column).
+    fn cols(projection: &ColumnProjection) -> Option<Vec<usize>> {
+        match projection {
+            ColumnProjection::All => None,
+            ColumnProjection::Some(cols) => Some(cols.to_vec()),
+        }
+    }
+
+    fn select_projection(sql: &str) -> Option<Vec<usize>> {
+        match plan_sql(sql) {
+            PhysicalPlan::Select { projection, .. } => cols(&projection),
+            other => panic!("expected Select for `{sql}`, got {}", explain(&other)[0]),
+        }
+    }
+
+    #[test]
+    fn a_scan_reads_only_the_columns_its_projections_and_where_name() {
+        assert_eq!(
+            select_projection("SELECT id FROM t WHERE name = 'x'"),
+            Some(vec![0, 2])
+        );
+    }
+
+    #[test]
+    fn select_star_reads_every_column() {
+        assert_eq!(select_projection("SELECT * FROM t"), None);
+        // A set covering the width normalizes to `All`, not `Some([0,1,2])`.
+        assert_eq!(select_projection("SELECT id, big, name FROM t"), None);
+    }
+
+    /// A hidden ORDER BY column arrives as an extra projection, so it is
+    /// counted — `sort` itself indexes the projected tuple and must be ignored.
+    #[test]
+    fn an_order_by_column_outside_the_select_list_is_still_read() {
+        assert_eq!(
+            select_projection("SELECT id FROM t ORDER BY name"),
+            Some(vec![0, 2])
+        );
+    }
+
+    /// A correlated subquery hides its dependency on this row inside its body,
+    /// so the pass must fall back to reading everything.
+    #[test]
+    fn a_correlated_subquery_forces_every_column() {
+        assert_eq!(
+            select_projection(
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t x WHERE x.big = t.big)"
+            ),
+            None
+        );
+    }
+
+    fn agg_projection(sql: &str) -> Option<Vec<usize>> {
+        match plan_sql(sql) {
+            PhysicalPlan::Aggregate {
+                input: PhysicalAggInput::Scan { projection, .. },
+                ..
+            } => cols(&projection),
+            PhysicalPlan::Aggregate {
+                input: PhysicalAggInput::Join(source),
+                ..
+            } => match source {
+                PhysicalJoinExpr::Input {
+                    input: PhysicalJoinInput::Scan { projection, .. },
+                    ..
+                } => cols(&projection),
+                other => panic!("expected a single scan leaf, got {:?}", other.width()),
+            },
+            other => panic!("expected Aggregate for `{sql}`, got {}", explain(&other)[0]),
+        }
+    }
+
+    /// `count(*)` reads no column at all. Rather than a zero-column read, the
+    /// projection normalizes to the single narrowest one — `id`, the only
+    /// 4-byte fixed-width column — so the scan still pays for just one.
+    #[test]
+    fn count_star_reads_one_narrow_column() {
+        assert_eq!(agg_projection("SELECT count(*) FROM t"), Some(vec![0]));
+    }
+
+    #[test]
+    fn an_aggregate_reads_its_where_group_keys_and_arguments() {
+        assert_eq!(
+            agg_projection("SELECT count(*) FROM t WHERE big = 1"),
+            Some(vec![1])
+        );
+        assert_eq!(
+            agg_projection("SELECT name, sum(big) FROM t GROUP BY name"),
+            Some(vec![1, 2])
+        );
+    }
+
+    /// The join split: demand is expressed over the concatenated `left || right`
+    /// row, so the right side's indices have to be rebased by `left.width()`
+    /// before they reach the right subtree.
+    #[test]
+    fn a_join_splits_its_demand_across_the_width_boundary() {
+        // a.id=0 a.big=1 a.name=2 | b.id=3 b.big=4 b.name=5
+        // read: a.id (0), b.name (5); join key: a.big (1) = b.big (4)
+        let PhysicalPlan::Join { source, .. } =
+            plan_sql("SELECT a.id, b.name FROM t a JOIN t b ON a.big = b.big")
+        else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Join { left, right, .. } = source else {
+            panic!("expected a binary join");
+        };
+        let leaf = |node: PhysicalJoinExpr| match node {
+            PhysicalJoinExpr::Input {
+                input: PhysicalJoinInput::Scan { projection, .. },
+                ..
+            } => cols(&projection),
+            _ => panic!("expected a scan leaf"),
+        };
+        assert_eq!(leaf(*left), Some(vec![0, 1]), "left keeps its own indices");
+        assert_eq!(leaf(*right), Some(vec![1, 2]), "right rebases by left width");
+    }
+
+    /// Demand threads down through a derived table: the inner `SELECT *`
+    /// projects every column, but only the one the outer query reads is
+    /// actually needed from the table.
+    ///
+    /// This is the shape a view expands to, and the one an earlier version of
+    /// this pass could not see through — it matched a literal `Append` child and
+    /// so read all three columns here.
+    #[test]
+    fn demand_threads_through_a_derived_table() {
+        let plan = plan_sql("SELECT id FROM (SELECT * FROM t) s");
+        let PhysicalPlan::Subquery { source, .. } = plan else {
+            panic!("expected a Subquery over the derived table");
+        };
+        let PhysicalPlan::Select { projection, .. } = *source else {
+            panic!("expected the derived table to lower to a Select");
+        };
+        assert_eq!(cols(&projection), Some(vec![0]));
+    }
+
+    /// Two levels of nesting, and a predicate at the inner level that reads a
+    /// column the outer query never sees.
+    #[test]
+    fn demand_threads_through_nested_derived_tables() {
+        let plan = plan_sql("SELECT id FROM (SELECT * FROM (SELECT * FROM t WHERE big > 1) a) b");
+        let mut node = &plan;
+        loop {
+            match node {
+                PhysicalPlan::Subquery { source, .. } => node = source,
+                PhysicalPlan::Select { projection, .. } => {
+                    // `id` for the output, `big` for the inner WHERE.
+                    assert_eq!(cols(projection), Some(vec![0, 1]));
+                    return;
+                }
+                other => panic!("unexpected node {}", explain(other)[0]),
+            }
+        }
+    }
+
+    /// `LIMIT` has no projections of its own — its output row is its source
+    /// row — so demand passes straight through it.
+    #[test]
+    fn demand_threads_through_a_limit() {
+        let plan = plan_sql("SELECT id FROM (SELECT * FROM t LIMIT 5) s");
+        let mut node = &plan;
+        loop {
+            match node {
+                PhysicalPlan::Subquery { source, .. } => node = source,
+                PhysicalPlan::Limit { source, .. } => node = source,
+                PhysicalPlan::Select { projection, .. } => {
+                    assert_eq!(cols(projection), Some(vec![0]));
+                    return;
+                }
+                other => panic!("unexpected node {}", explain(other)[0]),
+            }
+        }
+    }
+
+    /// A hidden ORDER BY column lives in the inner node's `projections` past the
+    /// visible width. The outer demand does not name it, so it survives only
+    /// because `through_tail` folds the sort keys into the node's own demand.
+    #[test]
+    fn a_hidden_order_by_column_survives_threading() {
+        let plan = plan_sql("SELECT id FROM (SELECT * FROM t) s ORDER BY name");
+        let PhysicalPlan::Subquery { source, .. } = plan else {
+            panic!("expected a Subquery");
+        };
+        let PhysicalPlan::Select { projection, .. } = *source else {
+            panic!("expected a Select");
+        };
+        assert_eq!(
+            cols(&projection),
+            Some(vec![0, 2]),
+            "`name` is read for the sort even though it is not in the select list"
+        );
+    }
+
+    /// A set-operation arm still prunes from its **own** tail — it just does not
+    /// receive the consumer's demand, because a non-`ALL` `UNION` deduplicates
+    /// on every output column and an arm's coercion may hold a NULL constant
+    /// that references no source column.
+    #[test]
+    fn a_set_operation_arm_prunes_from_its_own_tail_only() {
+        let PhysicalPlan::SetOp { arms, .. } =
+            plan_sql("SELECT id FROM t UNION ALL SELECT big FROM t")
+        else {
+            panic!("expected a SetOp");
+        };
+        let projection = |arm: &PhysicalSetOpArm| match &arm.plan {
+            PhysicalPlan::Select { projection, .. } => cols(projection),
+            other => panic!("expected each arm to be a Select, got {}", explain(other)[0]),
+        };
+        assert_eq!(projection(&arms[0]), Some(vec![0]));
+        assert_eq!(projection(&arms[1]), Some(vec![1]));
+
+        // But an arm that selects everything is not narrowed by what the
+        // consumer of the set operation happens to read.
+        let PhysicalPlan::Subquery { source, .. } =
+            plan_sql("SELECT id FROM (SELECT * FROM t UNION ALL SELECT * FROM t) s")
+        else {
+            panic!("expected a Subquery over the set operation");
+        };
+        let PhysicalPlan::SetOp { arms, .. } = *source else {
+            panic!("expected a SetOp under the subquery");
+        };
+        assert_eq!(projection(&arms[0]), None);
+    }
+
+    /// An `Append` fans one projection out to every leaf, so leaves that do not
+    /// share a width must disable pruning rather than hand a leaf an ordinal
+    /// past its own end — which would panic inside the storage engine.
+    #[test]
+    fn append_leaves_of_differing_width_disable_pruning() {
+        let engine: Arc<dyn TableEngine> = Arc::new(MetaEngine::default());
+        let leaf = |name: &str, types: &[PgType]| {
+            engine
+                .create_table(TableSchema::in_namespace(
+                    name,
+                    "public",
+                    types
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ty)| Column::new(format!("c{i}"), *ty))
+                        .collect(),
+                ))
+                .expect("create leaf")
+        };
+        let wide = leaf("wide", &[PgType::Int4, PgType::Int4, PgType::Int4]);
+        let narrow = leaf("narrow", &[PgType::Int4, PgType::Int4]);
+
+        let mut plan = PhysicalPlan::Append {
+            tables: vec![wide, narrow],
+            projection: ColumnProjection::Some(vec![2].into()),
+            columns: vec![
+                OutputColumn::new("c0", PgType::Int4),
+                OutputColumn::new("c1", PgType::Int4),
+                OutputColumn::new("c2", PgType::Int4),
+            ],
+        };
+        projection::push_column_projections(&mut plan);
+        let PhysicalPlan::Append { projection, .. } = &plan else {
+            unreachable!()
+        };
+        assert_eq!(cols(projection), None);
+    }
+
+    /// DML reads whole rows: the row is rebuilt by ordinal and RETURNING may
+    /// name any column.
+    #[test]
+    fn dml_plans_read_every_column() {
+        for sql in [
+            "UPDATE t SET id = 1 WHERE big = 2",
+            "DELETE FROM t WHERE big = 2",
+        ] {
+            // Neither carries a scan-leaf projection field at all; planning them
+            // simply must not panic, and their scans stay unprojected by
+            // construction (the executor passes `All` explicitly).
+            let _ = plan_sql(sql);
+        }
     }
 }

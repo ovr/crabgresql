@@ -5,8 +5,8 @@
 //! is never reachable by a stale key), crash recovery, and file lifecycle.
 
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableAm, TableEngine,
-    TableSchema, Tid,
+    Column, ColumnProjection, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableAm,
+    TableEngine, TableSchema, Tid,
 };
 use crabgresql_txn::{CommandId, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -69,7 +69,7 @@ fn probe_ids(table: &dyn TableAm, txn: &TxnContext, key: i32) -> Vec<i32> {
 /// index probe must agree with.
 fn scan_ids(table: &dyn TableAm, txn: &TxnContext, key: i32) -> Vec<i32> {
     let mut v: Vec<i32> = table
-        .scan(txn)
+        .scan(txn, &ColumnProjection::All)
         .map(|row| row.unwrap_or_else(|error| panic!("scan failed: {error}")))
         .filter(|(_, t)| t[0] == Value::Int4(key))
         .map(|(_, t)| match &t[0] {
@@ -486,7 +486,7 @@ fn oversized_key_create_index_panics_without_freezing_the_table() -> anyhow::Res
     let x = tm.allocate_xid();
     table.insert(vec![Value::Text("small".into())], &tm.context(x, CommandId::FIRST))?;
     tm.commit(x)?;
-    assert_eq!(table.scan(&read(&tm)).count(), 2);
+    assert_eq!(table.scan(&read(&tm), &ColumnProjection::All).count(), 2);
     // The failed index was never published.
     assert!(!table.supports_index_scan("t_s_idx"));
     Ok(())

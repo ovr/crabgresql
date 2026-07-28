@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, RelPersistence, StorageError,
-    TableAm, TableEngine, TableSchema, Tid, Tuple,
+    Column, ColumnProjection, IndexConstraint, IndexKey, IndexMetadata, IndexMethod,
+    RelPersistence, StorageError, TableAm, TableEngine, TableSchema, Tid, Tuple,
 };
 use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnContext, TxnFinalize, Xid};
 use crabgresql_types::{PgType, Value};
@@ -75,7 +75,7 @@ fn read(tm: &TransactionManager) -> TxnContext {
 
 fn ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<i32> {
     table
-        .scan(&read(tm))
+        .scan(&read(tm), &ColumnProjection::All)
         .map(|row| match row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
             Value::Int4(v) => v,
             _ => unreachable!(),
@@ -151,7 +151,7 @@ fn temporary_table_truncate_swaps_in_ram() -> anyhow::Result<()> {
     let tx = h.tm.allocate_xid();
     t.truncate(&h.tm.context(tx, CommandId::FIRST))?;
     h.tm.commit(tx)?;
-    assert_eq!(t.scan(&read(&h.tm)).count(), 0);
+    assert_eq!(t.scan(&read(&h.tm), &ColumnProjection::All).count(), 0);
     insert_committed(&h.tm, &*t, vec![Value::Int4(3), Value::Null]);
     assert_eq!(ids(&h.tm, &*t), vec![3]);
     assert_eq!(base_file_count(&h), 0, "post-truncate rel is RAM-backed too");

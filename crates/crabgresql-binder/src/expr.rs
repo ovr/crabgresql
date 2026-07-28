@@ -9,6 +9,7 @@
 //! Clean-room (see AGENTS.md): the resolution rules, coercions, and error text
 //! reproduce PG's *observable* behavior, pinned by the regression corpus.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crabgresql_parser::{Span, ast};
@@ -823,6 +824,92 @@ impl BoundExpr {
         let mut acc = None;
         fold(self, &mut acc);
         acc
+    }
+
+    /// Collect the exact set of `ColumnRef` indices this expression reads into
+    /// `out`, returning whether the set is *complete*.
+    ///
+    /// `false` means the dependency could not be determined and the caller must
+    /// assume every column; `out` may hold a partial set and must be discarded.
+    /// This is the third member of the family with
+    /// [`Self::column_ref_bounds`] and [`Self::shift_column_refs`], and differs
+    /// from the first in a way that matters: bounds are an over-approximating
+    /// *hull*, safe for a containment test, whereas this is used to *discard*
+    /// columns, so it has to be exact or refuse.
+    ///
+    /// The subplan-carrying variants therefore refuse. A **correlated** subquery
+    /// records its dependency on this row inside its body, as an
+    /// `OuterColumnRef` filled in at execution — and the body is a `LogicalPlan`
+    /// no `BoundExpr` walk reaches. Pruning a column read only by a correlated
+    /// `EXISTS` would silently substitute NULL and return wrong rows. The same
+    /// reasoning is spelled out in `pushdown::is_relocatable`.
+    ///
+    /// The match is exhaustive on purpose: a new variant must fail to compile
+    /// here rather than silently prune a column it reads.
+    pub fn collect_column_refs(&self, out: &mut BTreeSet<usize>) -> bool {
+        match self {
+            BoundExpr::ColumnRef { index, .. } => {
+                out.insert(*index);
+                true
+            }
+            // An outer reference addresses an enclosing row, not this row's
+            // index space, so it contributes nothing — exactly as in
+            // `column_ref_bounds`. It is safe here only because every construct
+            // that can *carry* one (the subplan variants below) refuses.
+            BoundExpr::Const { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. } => true,
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.collect_column_refs(out),
+            BoundExpr::Binary { left, right, .. } => {
+                left.collect_column_refs(out) && right.collect_column_refs(out)
+            }
+            // A routine body has its own frame and can only see this row through
+            // its arguments.
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. }
+            | BoundExpr::Aggregate { args, .. } => Self::collect_all(args, out),
+            BoundExpr::ArrayCtor { elems, .. } => Self::collect_all(elems, out),
+            BoundExpr::Subscript { base, index, .. } => {
+                base.collect_column_refs(out) && index.collect_column_refs(out)
+            }
+            BoundExpr::Case { whens, else_, .. } => {
+                let mut complete = true;
+                for (cond, result) in whens {
+                    complete &= cond.collect_column_refs(out);
+                    complete &= result.collect_column_refs(out);
+                }
+                if let Some(else_) = else_ {
+                    complete &= else_.collect_column_refs(out);
+                }
+                complete
+            }
+            // No subplan: both operands are ordinary expressions over this row.
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.collect_column_refs(out) && cmp.collect_column_refs(out)
+            }
+            // Carries a subplan whose body may be correlated — see above.
+            BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::Exists { .. }
+            | BoundExpr::QuantifiedSubquery { .. } => false,
+        }
+    }
+
+    /// [`Self::collect_column_refs`] over a slice, with the same contract: a
+    /// `false` result leaves `out` in an unspecified state that the caller must
+    /// discard.
+    ///
+    /// How much of `out` is populated on refusal is deliberately not promised —
+    /// the sibling arms above short-circuit with `&&`, so a partial set is not
+    /// a usable lower bound and must never be read as one.
+    fn collect_all(exprs: &[BoundExpr], out: &mut BTreeSet<usize>) -> bool {
+        exprs
+            .iter()
+            .all(|expr| expr.collect_column_refs(out))
     }
 
     /// Add `delta` to every `ColumnRef` index, relocating this expression from
@@ -6489,4 +6576,128 @@ fn type_output_name(data_type: &ast::DataType) -> String {
             // PG does (`'red'::rainbow` → column "rainbow").
             custom_type_name(data_type).unwrap_or_else(|| "?column?".into())
         })
+}
+
+#[cfg(test)]
+mod collect_column_refs_tests {
+    use super::*;
+
+    fn col(index: usize) -> BoundExpr {
+        BoundExpr::ColumnRef {
+            index,
+            ty: PgType::Int4,
+        }
+    }
+
+    fn refs(expr: &BoundExpr) -> Option<Vec<usize>> {
+        let mut out = BTreeSet::new();
+        expr.collect_column_refs(&mut out)
+            .then(|| out.into_iter().collect())
+    }
+
+    /// A trivially empty subplan, enough to build the marker variants.
+    fn subplan() -> Subplan {
+        Subplan(Box::new(crate::plan::LogicalPlan::Values {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            predicate: None,
+            sort: Vec::new(),
+            distinct: None,
+        }))
+    }
+
+    #[test]
+    fn nested_expressions_report_every_column_they_read() {
+        // CASE WHEN c3 THEN f(c1, c0) ELSE c0 + 1 END
+        let expr = BoundExpr::Case {
+            whens: vec![(
+                col(3),
+                BoundExpr::FuncCall {
+                    func: ScalarFn::Power,
+                    ret: PgType::Int4,
+                    args: vec![col(1), col(0)],
+                },
+            )],
+            else_: Some(Box::new(BoundExpr::Binary {
+                op: BinOp::Add,
+                arg_ty: PgType::Int4,
+                collation: DEFAULT_COLLATION_OID,
+                left: Box::new(col(0)),
+                right: Box::new(BoundExpr::Const {
+                    value: Value::Int4(1),
+                    ty: PgType::Int4,
+                }),
+            })),
+            ty: PgType::Int4,
+        };
+        assert_eq!(refs(&expr), Some(vec![0, 1, 3]));
+    }
+
+    /// An outer reference addresses an *enclosing* row, so it contributes
+    /// nothing to this row's set — the same rule `column_ref_bounds` follows.
+    #[test]
+    fn an_outer_column_reference_contributes_nothing() {
+        let expr = BoundExpr::IsNull {
+            expr: Box::new(BoundExpr::OuterColumnRef {
+                level: 1,
+                index: 9,
+                ty: PgType::Int4,
+            }),
+            negated: false,
+        };
+        assert_eq!(refs(&expr), Some(Vec::new()));
+    }
+
+    /// The load-bearing refusal: a correlated subplan body records its
+    /// dependency on this row as an `OuterColumnRef` that no `BoundExpr` walk
+    /// reaches, so pruning on a partial set would read NULL. All three
+    /// subplan-carrying variants must decline.
+    #[test]
+    fn subplan_variants_refuse_to_report_a_set() {
+        for expr in [
+            BoundExpr::ScalarSubquery {
+                subplan: subplan(),
+                ty: PgType::Int4,
+            },
+            BoundExpr::Exists {
+                subplan: subplan(),
+                negated: false,
+            },
+            BoundExpr::QuantifiedSubquery {
+                subplan: subplan(),
+                all: false,
+                cmp: Box::new(col(2)),
+            },
+        ] {
+            assert_eq!(refs(&expr), None, "{expr:?} must refuse");
+        }
+    }
+
+    /// One refusal anywhere in a tree poisons the whole result.
+    #[test]
+    fn a_refusal_propagates_through_enclosing_expressions() {
+        let expr = BoundExpr::Binary {
+            op: BinOp::And,
+            arg_ty: PgType::Bool,
+            collation: DEFAULT_COLLATION_OID,
+            left: Box::new(col(4)),
+            right: Box::new(BoundExpr::Exists {
+                subplan: subplan(),
+                negated: false,
+            }),
+        };
+        assert_eq!(refs(&expr), None);
+    }
+
+    /// A quantified comparison over an *array* carries no subplan, so both of
+    /// its operands are ordinary expressions over this row.
+    #[test]
+    fn a_quantified_array_reports_both_operands() {
+        let expr = BoundExpr::QuantifiedArray {
+            array: Box::new(col(5)),
+            all: true,
+            cmp: Box::new(col(1)),
+        };
+        assert_eq!(refs(&expr), Some(vec![1, 5]));
+    }
 }

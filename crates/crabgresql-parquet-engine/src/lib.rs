@@ -39,12 +39,13 @@ use arrow_array::builder::{
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    RecordBatchReader, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats, RelfilenodeAllocator, StorageError,
-    TableAm, TableCapabilities, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
+    ColumnProjection, DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats,
+    RelfilenodeAllocator, StorageError, TableAm, TableCapabilities, TableSchema, Tid, Tuple,
+    TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     CommandId, Infomask, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, Xid,
@@ -52,6 +53,7 @@ use crabgresql_txn::{
 };
 use crabgresql_types::{Interval, PgType, TimeTz, Value};
 use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, Wal, WalError};
+use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
 };
@@ -547,17 +549,27 @@ fn decode_value(
     }
 }
 
+/// Decode one row of `batch` into a full-width tuple.
+///
+/// `positions` maps batch column → schema ordinal (see [`open_reader`]). Under a
+/// projection the batch is dense over the *selected* columns while the tuple
+/// stays as wide as the schema, so unselected slots keep the `Null` they were
+/// initialized with — values the scan contract leaves unspecified.
 fn decode_row(
     schema: &TableSchema,
+    positions: &[usize],
     batch: &RecordBatch,
     row: usize,
 ) -> Result<Tuple, StorageError> {
-    schema
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| decode_value(column, batch.column(index).as_ref(), row))
-        .collect()
+    let mut tuple = vec![Value::Null; schema.columns.len()];
+    for (batch_index, &schema_index) in positions.iter().enumerate() {
+        tuple[schema_index] = decode_value(
+            &schema.columns[schema_index],
+            batch.column(batch_index).as_ref(),
+            row,
+        )?;
+    }
+    Ok(tuple)
 }
 
 #[derive(Clone, Debug)]
@@ -695,11 +707,19 @@ fn metadata_map(
 /// created and removed, never renamed, so no footer has to be rewritten; the price
 /// is that passing the wrong generation's id reports perfectly good bytes as
 /// [`StorageError::CorruptData`].
+/// Opens `fragment` for reading, restricted to `projection`.
+///
+/// Returns the reader together with its **position map**: entry `i` is the
+/// schema ordinal that batch column `i` decodes into. For an unprojected read
+/// that is the identity; for a projected one it is the selected ordinals. The
+/// map is derived from the reader's own schema by field *name* rather than by
+/// assuming the mask preserves the requested order.
 fn open_reader(
     schema: &TableSchema,
     rel: u32,
     fragment: &Fragment,
-) -> Result<ParquetRecordBatchReader, StorageError> {
+    projection: &ColumnProjection,
+) -> Result<(ParquetRecordBatchReader, Arc<[usize]>), StorageError> {
     let file = open_fragment_file(fragment)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|error| corrupt(format!("read Parquet footer: {error}")))?;
@@ -725,18 +745,62 @@ fn open_reader(
             fragment.path.display()
         )));
     }
-    builder
+    // Built *after* the checks above, which read the file schema from the
+    // builder — `with_projection` narrows only the reader's output, so both
+    // the field-count check and the `META_SCHEMA` identity stay meaningful.
+    //
+    // `roots`, not `leaves`: `arrow_type` maps `timetz` and `interval` to a
+    // `Struct`, so those columns own several *leaf* descriptors but one root.
+    // Root indices are the top-level fields, which the writer lays out 1:1 with
+    // `schema.columns` — the invariant the field-count check just enforced.
+    let mask = match projection {
+        ColumnProjection::All => ProjectionMask::all(),
+        ColumnProjection::Some(cols) => {
+            ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied())
+        }
+    };
+    let reader = builder
         .with_batch_size(8_192)
+        .with_projection(mask)
         .build()
-        .map_err(|error| corrupt(format!("open Parquet row reader: {error}")))
+        .map_err(|error| corrupt(format!("open Parquet row reader: {error}")))?;
+
+    let positions: Arc<[usize]> = reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            schema
+                .columns
+                .iter()
+                .position(|column| column.name == *field.name())
+                .ok_or_else(|| {
+                    corrupt(format!(
+                        "Parquet fragment {} has column \"{}\", which the table schema does not",
+                        fragment.path.display(),
+                        field.name()
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into();
+
+    Ok((reader, positions))
 }
 
 struct ParquetScan {
     schema: TableSchema,
     rel: u32,
+    /// The columns to read off disk. Prunes work only: a mask never changes how
+    /// many rows a fragment yields or the order they arrive in, which is what
+    /// keeps the `Tid` ordinals below stable and `fetch` able to find them.
+    projection: ColumnProjection,
     fragments: Vec<Fragment>,
     fragment_index: usize,
     reader: Option<ParquetRecordBatchReader>,
+    /// Batch column → schema ordinal for the fragment currently open, rebuilt
+    /// each time `reader` is replaced.
+    positions: Arc<[usize]>,
     batch: Option<RecordBatch>,
     batch_row: usize,
     file_row: u32,
@@ -762,7 +826,7 @@ impl Iterator for ParquetScan {
                     return Some(Err(corrupt("Parquet fragment exceeds the TID row limit")));
                 }
                 return Some(
-                    decode_row(&self.schema, batch, row).map(|tuple| {
+                    decode_row(&self.schema, &self.positions, batch, row).map(|tuple| {
                         (
                             Tid {
                                 block: self.current_block,
@@ -792,8 +856,11 @@ impl Iterator for ParquetScan {
             self.fragment_index += 1;
             self.current_block = fragment.block;
             self.file_row = 0;
-            match open_reader(&self.schema, self.rel, &fragment) {
-                Ok(reader) => self.reader = Some(reader),
+            match open_reader(&self.schema, self.rel, &fragment, &self.projection) {
+                Ok((reader, positions)) => {
+                    self.reader = Some(reader);
+                    self.positions = positions;
+                }
                 Err(error) => return Some(Err(error)),
             }
         }
@@ -959,7 +1026,10 @@ impl ParquetTable {
         let visible = self.visible_fragments(rel, txn)?;
         let relpages = relpages_of(&visible);
         let mut rows = 0u64;
-        for row in self.scan_over(rel, visible, guard) {
+        // Only the rows are being counted, so read the narrowest column and skip
+        // the rest. The count is unchanged — a mask prunes columns, never rows.
+        let projection = ColumnProjection::of([], &self.schema);
+        for row in self.scan_over(rel, visible, guard, &projection) {
             row?;
             rows += 1;
         }
@@ -1300,23 +1370,35 @@ impl ParquetTable {
     /// transaction commits while we wait would leave a pre-lock id describing a
     /// directory that no longer exists — reporting the new directory's perfectly
     /// good fragments as corrupt.
-    fn scan_in(&self, txn: &TxnContext) -> Result<ParquetScan, StorageError> {
+    fn scan_in(
+        &self,
+        txn: &TxnContext,
+        projection: &ColumnProjection,
+    ) -> Result<ParquetScan, StorageError> {
         let guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         let fragments = self.visible_fragments(rel, txn)?;
-        Ok(self.scan_over(rel, fragments, guard))
+        Ok(self.scan_over(rel, fragments, guard, projection))
     }
 
     /// Scan an already-listed fragment set, taking over the caller's shared hold.
     /// Lets a caller that has both measured and listed (see [`ParquetTable::measure`])
     /// read exactly what it measured.
-    fn scan_over(&self, rel: u32, fragments: Vec<Fragment>, guard: SharedGuard) -> ParquetScan {
+    fn scan_over(
+        &self,
+        rel: u32,
+        fragments: Vec<Fragment>,
+        guard: SharedGuard,
+        projection: &ColumnProjection,
+    ) -> ParquetScan {
         ParquetScan {
             schema: self.schema.clone(),
             rel,
+            projection: projection.clone(),
             fragments,
             fragment_index: 0,
             reader: None,
+            positions: Arc::from(Vec::new()),
             batch: None,
             batch_row: 0,
             file_row: 0,
@@ -1553,8 +1635,8 @@ impl TableAm for ParquetTable {
         RelStats::from_pages(relpages, &self.schema)
     }
 
-    fn scan(&self, txn: &TxnContext) -> TupleStream {
-        match self.scan_in(txn) {
+    fn scan(&self, txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
+        match self.scan_in(txn, projection) {
             Ok(scan) => Box::new(scan),
             Err(error) => Box::new(std::iter::once(Err(error))),
         }
@@ -1570,13 +1652,16 @@ impl TableAm for ParquetTable {
         else {
             return Ok(None);
         };
-        let mut reader = open_reader(&self.schema, rel, &fragment)?;
+        // Always unprojected: `fetch` serves EvalPlanQual re-reads and index
+        // point lookups, both of which need the whole row.
+        let (mut reader, positions) =
+            open_reader(&self.schema, rel, &fragment, &ColumnProjection::All)?;
         let mut ordinal = 1u32;
         for batch in &mut reader {
             let batch = batch.map_err(|error| corrupt(format!("decode Parquet row group: {error}")))?;
             for row in 0..batch.num_rows() {
                 if ordinal == tid.offset as u32 {
-                    return decode_row(&self.schema, &batch, row).map(Some);
+                    return decode_row(&self.schema, &positions, &batch, row).map(Some);
                 }
                 ordinal += 1;
             }
@@ -1860,7 +1945,7 @@ mod tests {
     use std::sync::Arc;
 
     use crabgresql_storage_api::{
-        Column, StorageError, TableAccessMethod, TableAm, TableSchema, Tid, Tuple,
+        Column, ColumnProjection, StorageError, TableAccessMethod, TableAm, TableSchema, Tid, Tuple,
     };
     use crabgresql_txn::{
         Clog, CommandId, CommitSink, TransactionManager, Xid,
@@ -2018,19 +2103,19 @@ mod tests {
 
         assert_eq!(
             table
-                .scan(&tm.context(xid, CommandId::FIRST))
+                .scan(&tm.context(xid, CommandId::FIRST), &ColumnProjection::All)
                 .count(),
             0,
             "a statement cannot see its own inserts before the command counter advances"
         );
         let own_rows: Vec<Tuple> = table
-            .scan(&tm.context(xid, CommandId(1)))
+            .scan(&tm.context(xid, CommandId(1)), &ColumnProjection::All)
             .map(|result| result.map(|(_, tuple)| tuple))
             .collect::<Result<_, _>>()?;
         assert_eq!(own_rows, vec![row.clone(), nulls.clone()]);
         assert_eq!(
             table
-                .scan(&tm.context(Xid::INVALID, CommandId::FIRST))
+                .scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All)
                 .count(),
             0
         );
@@ -2038,7 +2123,7 @@ mod tests {
         tm.commit(xid)?;
         finish(&table, xid, true)?;
         let rows: Vec<Tuple> = table
-            .scan(&tm.context(Xid::INVALID, CommandId::FIRST))
+            .scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All)
             .map(|result| result.map(|(_, tuple)| tuple))
             .collect::<Result<_, _>>()?;
         assert_eq!(rows, vec![row, nulls]);
@@ -2113,7 +2198,7 @@ mod tests {
         assert!(parquet_files(dir.path(), 1)?.is_empty());
         assert_eq!(
             table
-                .scan(&tm.context(Xid::INVALID, CommandId::FIRST))
+                .scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All)
                 .count(),
             0
         );
@@ -2179,7 +2264,7 @@ mod tests {
 
         // Snapshot the fragment list (still `.pending`) before the rename lands,
         // exactly as a concurrent session's scan would.
-        let scan = table.scan(&tm.context(Xid::INVALID, CommandId::FIRST));
+        let scan = table.scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All);
         finish(&table, xid, true)?;
         let rows = scan.collect::<Result<Vec<_>, _>>()?;
         assert_eq!(rows.len(), 1);
@@ -2286,7 +2371,7 @@ mod tests {
         OpenOptions::new().write(true).open(file)?.set_len(10)?;
 
         let error = table
-            .scan(&tm.context(Xid::INVALID, CommandId::FIRST))
+            .scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All)
             .next()
             .ok_or_else(|| anyhow::anyhow!("corrupt scan returned no item"))?
             .expect_err("truncated fragment must return an error");
@@ -2312,7 +2397,7 @@ mod tests {
 
     fn scan_values(table: &ParquetTable, txn: &crabgresql_txn::TxnContext) -> Vec<i32> {
         let mut values: Vec<i32> = table
-            .scan(txn)
+            .scan(txn, &ColumnProjection::All)
             .map(|row| match row.expect("scan row").1.first() {
                 Some(Value::Int4(value)) => *value,
                 other => panic!("unexpected value {other:?}"),
@@ -2722,7 +2807,7 @@ mod tests {
         let own = tm.allocate_xid();
         let mut own_ctx = tm.context(own, CommandId::FIRST);
         own_ctx.lock_owner = LockOwner(42);
-        let cursor = table.scan(&own_ctx);
+        let cursor = table.scan(&own_ctx, &ColumnProjection::All);
         table.truncate(&own_ctx)?;
         drop(cursor);
         tm.abort(own);
@@ -2731,7 +2816,7 @@ mod tests {
         // Foreign owner: the TRUNCATE must wait for the scan to be dropped.
         let mut reader_ctx = tm.context(Xid::INVALID, CommandId::FIRST);
         reader_ctx.lock_owner = LockOwner(7);
-        let cursor = table.scan(&reader_ctx);
+        let cursor = table.scan(&reader_ctx, &ColumnProjection::All);
         let truncater = tm.allocate_xid();
         let mut truncate_ctx = tm.context(truncater, CommandId::FIRST);
         truncate_ctx.lock_owner = LockOwner(8);
@@ -2803,7 +2888,7 @@ mod tests {
             let table = Arc::clone(&table);
             std::thread::spawn(move || {
                 let rows: Vec<Result<(Tid, Tuple), StorageError>> =
-                    table.scan(&reader_ctx).collect();
+                    table.scan(&reader_ctx, &ColumnProjection::All).collect();
                 tx.send(()).expect("send");
                 rows
             })
@@ -2902,6 +2987,144 @@ mod tests {
             scan_values(&table, &tm.context(Xid::INVALID, CommandId::FIRST)),
             vec![1, 2]
         );
+        Ok(())
+    }
+
+    /// A relation whose columns span the two shapes that matter to a
+    /// `ProjectionMask`: plain scalars, and the `Struct`-backed `timetz` /
+    /// `interval` that own several *leaf* descriptors under one root.
+    fn struct_mixed_table(
+        dir: &Path,
+        wal: Arc<Wal>,
+    ) -> Result<(ParquetTable, Vec<Value>), StorageError> {
+        let schema = schema(
+            "mixed",
+            &[
+                PgType::Int4,
+                PgType::Interval,
+                PgType::Text,
+                PgType::TimeTz,
+                PgType::Bool,
+            ],
+        );
+        let row = vec![
+            Value::Int4(7),
+            Value::Interval(Interval {
+                months: 14,
+                days: -3,
+                usec: 777,
+            }),
+            Value::Text("payload".to_string()),
+            Value::TimeTz(TimeTz {
+                usec: 45_000_000,
+                zone: 3_600,
+            }),
+            Value::Bool(true),
+        ];
+        let table = open_table(dir, 1, schema, wal)?;
+        Ok((table, row))
+    }
+
+    /// Every column outside the projection reads back as `Null`, every one
+    /// inside keeps its real value, and the tuple stays as wide as the schema.
+    ///
+    /// Projecting *around* a `Struct` column (index 1 here) is the part that
+    /// would break under a naive positional decode: the batch is dense over the
+    /// selected columns, so batch position 1 is schema position 2.
+    #[test]
+    fn a_projected_scan_fills_only_the_selected_columns() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let (table, row) = struct_mixed_table(dir.path(), Arc::clone(&wal))?;
+
+        let xid = tm.allocate_xid();
+        table.insert(row.clone(), &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        finish(&table, xid, true)?;
+
+        let reader = tm.context(Xid::INVALID, CommandId::FIRST);
+        let projected: Vec<Tuple> = table
+            .scan(&reader, &ColumnProjection::of([0, 2], table.schema()))
+            .map(|result| result.map(|(_, tuple)| tuple))
+            .collect::<Result<_, _>>()?;
+
+        assert_eq!(projected, vec![vec![
+            row[0].clone(),
+            Value::Null,
+            row[2].clone(),
+            Value::Null,
+            Value::Null,
+        ]]);
+        Ok(())
+    }
+
+    /// `timetz` and `interval` map to an arrow `Struct`, so they occupy several
+    /// leaf descriptors under a single root. Building the mask from *leaf*
+    /// indices would select the wrong columns; this pins `roots`.
+    #[test]
+    fn a_projection_of_only_struct_columns_decodes_them() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let (table, row) = struct_mixed_table(dir.path(), Arc::clone(&wal))?;
+
+        let xid = tm.allocate_xid();
+        table.insert(row.clone(), &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        finish(&table, xid, true)?;
+
+        let reader = tm.context(Xid::INVALID, CommandId::FIRST);
+        for column in [1usize, 3] {
+            let rows: Vec<Tuple> = table
+                .scan(&reader, &ColumnProjection::of([column], table.schema()))
+                .map(|result| result.map(|(_, tuple)| tuple))
+                .collect::<Result<_, _>>()?;
+            let mut want = vec![Value::Null; row.len()];
+            want[column] = row[column].clone();
+            assert_eq!(rows, vec![want], "projecting only column {column}");
+        }
+        Ok(())
+    }
+
+    /// A mask prunes columns, never rows — so the tid sequence, and `fetch`'s
+    /// ability to find a row by it, must be identical to an unprojected scan.
+    /// Spans several fragments, since the ordinal restarts within each.
+    #[test]
+    fn a_projected_scan_yields_the_same_tids_as_a_full_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let (table, row) = struct_mixed_table(dir.path(), Arc::clone(&wal))?;
+
+        // Three fragments, two rows each: one `insert_many` per transaction.
+        for _ in 0..3 {
+            let xid = tm.allocate_xid();
+            table.insert_many(
+                vec![row.clone(), row.clone()],
+                &tm.context(xid, CommandId::FIRST),
+            )?;
+            tm.commit(xid)?;
+            finish(&table, xid, true)?;
+        }
+
+        let reader = tm.context(Xid::INVALID, CommandId::FIRST);
+        let tids = |projection: &ColumnProjection| -> Result<Vec<Tid>, StorageError> {
+            table
+                .scan(&reader, projection)
+                .map(|result| result.map(|(tid, _)| tid))
+                .collect()
+        };
+        let full = tids(&ColumnProjection::All)?;
+        assert_eq!(full.len(), 6);
+        assert_eq!(tids(&ColumnProjection::of([2], table.schema()))?, full);
+        // The empty set is the `count(*)` shape, normalized to one column.
+        assert_eq!(tids(&ColumnProjection::of([], table.schema()))?, full);
+
+        // `fetch` still resolves each tid to the whole row.
+        for tid in full {
+            assert_eq!(table.fetch(tid, &reader)?, Some(row.clone()));
+        }
         Ok(())
     }
 }

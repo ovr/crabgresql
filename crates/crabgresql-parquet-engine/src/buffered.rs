@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_buffer_engine::BufferTable;
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, RelStats, StorageError, TableAm, TableCapabilities, TableSchema,
-    Tid, Tuple, TupleStream, UpdateResult,
+    ColumnProjection, DeleteResult, IndexMetadata, RelStats, StorageError, TableAm,
+    TableCapabilities, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{Clog, LockOwner, TransactionManager, TxnContext, Xid};
 
@@ -298,11 +298,18 @@ impl TableAm for BufferedParquetTable {
         }
     }
 
-    fn scan(&self, txn: &TxnContext) -> TupleStream {
+    fn scan(&self, txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
         // Both leaves under one `TxnContext`, hence one snapshot — the condition
         // that makes the flush transaction's stamping yield every row exactly
         // once. `Append` gives the same guarantee for the planned path.
-        Box::new(self.chunks.scan(txn).chain(self.buffer.scan(txn)))
+        //
+        // The same projection reaches both leaves: they share this relation's
+        // schema, so a schema ordinal means the same column in either.
+        Box::new(
+            self.chunks
+                .scan(txn, projection)
+                .chain(self.buffer.scan(txn, projection)),
+        )
     }
 
     /// Route by the tid's own bit: a logical id belongs to the buffer, a physical
@@ -395,7 +402,9 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicU32;
 
-    use crabgresql_storage_api::{Column, RelfilenodeAllocator, TableAccessMethod};
+    use crabgresql_storage_api::{
+        Column, ColumnProjection, RelfilenodeAllocator, TableAccessMethod,
+    };
     use crabgresql_txn::{Clog, CommandId, CommitSink, IsolationLevel, TransactionManager};
     use crabgresql_types::{PgType, Value};
     use crabgresql_wal::Wal;
@@ -509,11 +518,11 @@ mod tests {
             (&leaves[0], &leaves[1])
         };
         let mut rows: Vec<(Tid, Tuple)> = a
-            .scan(txn)
+            .scan(txn, &ColumnProjection::All)
             .map(|row| row.expect("scan must not fail"))
             .collect();
         between();
-        rows.extend(b.scan(txn).map(|row| row.expect("scan must not fail")));
+        rows.extend(b.scan(txn, &ColumnProjection::All).map(|row| row.expect("scan must not fail")));
         ids_of(rows)
     }
 
@@ -565,7 +574,7 @@ mod tests {
         let older = read_only(&tm);
         assert_eq!(table.flush(&tm)?, 3);
         assert_eq!(
-            ids_of(table.scan(&older).map(|r| r.expect("scan")).collect()),
+            ids_of(table.scan(&older, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
             vec![1, 2, 3],
             "a snapshot older than the flush must still see every row exactly once"
         );
@@ -575,14 +584,14 @@ mod tests {
         // back empty — rows the user never deleted vanishing mid-transaction.
         assert_eq!(table.flush(&tm)?, 0);
         assert_eq!(
-            ids_of(table.scan(&older).map(|r| r.expect("scan")).collect()),
+            ids_of(table.scan(&older, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
             vec![1, 2, 3],
             "reclamation must not run past a live snapshot that holds no XID"
         );
 
         let newer = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&newer).map(|r| r.expect("scan")).collect()),
+            ids_of(table.scan(&newer, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
             vec![1, 2, 3],
             "a snapshot newer than the flush must read them from the chunk"
         );
@@ -609,7 +618,7 @@ mod tests {
 
         let reader = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&reader).map(|r| r.expect("scan")).collect()),
+            ids_of(table.scan(&reader, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
             vec![1, 2, 9],
             "the row that was in flight during the flush must still be readable"
         );
@@ -669,7 +678,7 @@ mod tests {
         assert_eq!(table.flush(&tm)?, 3);
         let reader = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&reader).map(|r| r.expect("scan")).collect()),
+            ids_of(table.scan(&reader, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
             vec![1, 2, 3],
             "no row may be duplicated by the declined flush"
         );
@@ -722,7 +731,7 @@ mod tests {
 
         let reader = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&reader).map(|r| r.expect("scan")).collect()),
+            ids_of(table.scan(&reader, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
             Vec::<i32>::new(),
             "a committed TRUNCATE must leave no row behind, whatever it could see"
         );
@@ -759,7 +768,7 @@ mod tests {
         );
         let reader = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&reader).map(|r| r.expect("scan")).collect()),
+            ids_of(table.scan(&reader, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
             (0..10).collect::<Vec<i32>>()
         );
         Ok(())

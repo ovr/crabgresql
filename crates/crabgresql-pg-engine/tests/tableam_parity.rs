@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::{
-    Column, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, StorageError,
-    TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
+    Column, ColumnProjection, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod,
+    StorageError, TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, CommandId, CommitSink, LockOwner, TransactionManager, TxnContext, TxnFinalize, Xid,
@@ -81,7 +81,7 @@ fn ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<Value> {
 
 fn scan_rows(table: &dyn TableAm, txn: &TxnContext) -> Vec<(Tid, Tuple)> {
     table
-        .scan(txn)
+        .scan(txn, &ColumnProjection::All)
         .collect::<Result<Vec<_>, StorageError>>()
         .unwrap_or_else(|error| panic!("table scan failed: {error}"))
 }
@@ -128,11 +128,11 @@ fn uncommitted_insert_is_invisible_until_commit() -> anyhow::Result<()> {
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
     table.insert(vec![Value::Int4(1), Value::Null], &txn)?;
-    assert_eq!(table.scan(&read(&h.tm)).count(), 0);
+    assert_eq!(table.scan(&read(&h.tm), &ColumnProjection::All).count(), 0);
     let self_read = h.tm.context(xid, CommandId(1));
-    assert_eq!(table.scan(&self_read).count(), 1);
+    assert_eq!(table.scan(&self_read, &ColumnProjection::All).count(), 1);
     h.tm.commit(xid)?;
-    assert_eq!(table.scan(&read(&h.tm)).count(), 1);
+    assert_eq!(table.scan(&read(&h.tm), &ColumnProjection::All).count(), 1);
 
     Ok(())
 }
@@ -145,7 +145,7 @@ fn aborted_insert_is_never_visible() -> anyhow::Result<()> {
     let txn = h.tm.context(xid, CommandId::FIRST);
     table.insert(vec![Value::Int4(1), Value::Null], &txn)?;
     h.tm.abort(xid);
-    assert_eq!(table.scan(&read(&h.tm)).count(), 0);
+    assert_eq!(table.scan(&read(&h.tm), &ColumnProjection::All).count(), 0);
 
     Ok(())
 }
@@ -349,7 +349,7 @@ fn delete_many_removes_batch_in_one_pass() -> anyhow::Result<()> {
     let txn = h.tm.context(xid, CommandId::FIRST);
     assert_eq!(table.delete_many(vec![a, b, c], &txn)?, 2);
     h.tm.commit(xid)?;
-    assert_eq!(table.scan(&read(&h.tm)).count(), 0);
+    assert_eq!(table.scan(&read(&h.tm), &ColumnProjection::All).count(), 0);
 
     Ok(())
 }
@@ -363,7 +363,7 @@ fn truncate_empties_table() -> anyhow::Result<()> {
     let tx = h.tm.allocate_xid();
     table.truncate(&h.tm.context(tx, CommandId::FIRST))?;
     h.tm.commit(tx)?;
-    assert_eq!(table.scan(&read(&h.tm)).count(), 0);
+    assert_eq!(table.scan(&read(&h.tm), &ColumnProjection::All).count(), 0);
     insert_committed(&h.tm, &*table, vec![Value::Int4(3), Value::Null]);
     assert_eq!(ids(&h.tm, &*table), vec![Value::Int4(3)]);
 
@@ -426,7 +426,7 @@ fn analyze_counts_visible_rows_exactly() -> anyhow::Result<()> {
         &h.tm.context(pending, CommandId::FIRST),
     )?;
     let gone = table
-        .scan(&read(&h.tm))
+        .scan(&read(&h.tm), &ColumnProjection::All)
         .next()
         .transpose()?
         .map(|(tid, _)| tid)
@@ -641,7 +641,7 @@ fn scan_is_stable_against_concurrent_writes() -> anyhow::Result<()> {
     let h = setup();
     let table = h.engine.create_table(schema("t"))?;
     let a = insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
-    let scan = table.scan(&read(&h.tm));
+    let scan = table.scan(&read(&h.tm), &ColumnProjection::All);
     insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Null]);
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
@@ -774,7 +774,7 @@ fn truncate_upgrades_over_the_same_owners_open_scan() -> anyhow::Result<()> {
         // cursor holds the scan's shared guard exactly like this).
         let mut scan_ctx = h.tm.context(Xid::INVALID, CommandId::FIRST);
         scan_ctx.lock_owner = LockOwner(42);
-        let mut scan = table.scan(&scan_ctx);
+        let mut scan = table.scan(&scan_ctx, &ColumnProjection::All);
         let _first = scan.next();
 
         // TRUNCATE under the SAME owner: must upgrade over its own shared hold.

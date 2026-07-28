@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, RelStats, StorageError, TableAm, TableSchema, Tid, Tuple,
-    TupleStream, UpdateResult,
+    ColumnProjection, DeleteResult, IndexMetadata, RelStats, StorageError, TableAm, TableSchema,
+    Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, XactStatus, Xid,
@@ -159,7 +159,7 @@ impl HeapTable {
             // Statistics are advisory: a size that cannot be read pairs a zero
             // with the real count rather than failing the statement.
             .unwrap_or(0);
-        let reltuples = self.scan(txn).count() as f64;
+        let reltuples = self.scan(txn, &ColumnProjection::All).count() as f64;
         (relpages, reltuples)
     }
 
@@ -578,7 +578,9 @@ impl TableAm for HeapTable {
         Some(Box::new(out.into_iter()))
     }
 
-    fn scan(&self, txn: &TxnContext) -> TupleStream {
+    /// The heap stores whole tuples per page, so reading fewer columns saves no
+    /// I/O: the projection is ignored, which the scan contract permits.
+    fn scan(&self, txn: &TxnContext, _projection: &ColumnProjection) -> TupleStream {
         // Hold a shared lock for the whole iterator life so a concurrent TRUNCATE
         // cannot unlink the file this scan is reading.
         let guard = self.lock.acquire_shared(txn.lock_owner);

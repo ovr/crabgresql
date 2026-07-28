@@ -45,9 +45,10 @@ use crabgresql_parquet_engine::{
     BufferedParquetTable, ParquetRedo, ParquetTable, RMGR_PARQUET, validate_schema,
 };
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, RelStats, RelationMetadata, RelfilenodeAllocator, SequenceAdvance,
-    SequenceDefinition, StorageError, TableAccessMethod, TableAm, TableCapabilities, TableEngine,
-    TableSchema, Tid, Tuple, TupleStream, UpdateResult, ViewDefinition,
+    ColumnProjection, DeleteResult, IndexMetadata, RelStats, RelationMetadata,
+    RelfilenodeAllocator, SequenceAdvance, SequenceDefinition, StorageError, TableAccessMethod,
+    TableAm, TableCapabilities, TableEngine, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
+    ViewDefinition,
 };
 use crabgresql_txn::{Clog, TransactionManager, TxnContext, TxnFinalize, Xid};
 use crabgresql_types::Value;
@@ -180,8 +181,8 @@ impl TableAm for ManagedTable {
         self.as_am().scan_label()
     }
 
-    fn scan(&self, txn: &TxnContext) -> TupleStream {
-        self.as_am().scan(txn)
+    fn scan(&self, txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
+        self.as_am().scan(txn, projection)
     }
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {

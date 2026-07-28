@@ -1955,7 +1955,13 @@ fn validate_unique_index_build(
 ) -> Result<(), PgError> {
     let schema = table.schema();
     let mut seen: Vec<crabgresql_storage_api::Tuple> = Vec::new();
-    for row in table.scan(txn) {
+    // Only the index's own key columns are ever read below — for the duplicate
+    // check, the error DETAIL and the `seen` comparisons alike.
+    let projection = crabgresql_storage_api::ColumnProjection::of(
+        index.keys.iter().map(|key| key.column),
+        schema,
+    );
+    for row in table.scan(txn, &projection) {
         let (_, tuple) = row?;
         if index.nulls_distinct
             && index

@@ -32,8 +32,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_storage_api::{
-    DeleteResult, IndexMetadata, MAX_ROW_ID, RelStats, StorageError, TableAm, TableSchema, Tid,
-    Tuple, TupleStream, UpdateResult,
+    ColumnProjection, DeleteResult, IndexMetadata, MAX_ROW_ID, RelStats, StorageError, TableAm,
+    TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, CommandId, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc,
@@ -262,7 +262,8 @@ impl BufferTable {
     /// rows an aborted transaction wrote. No separate seal state is needed —
     /// MVCC already answers the question.
     pub fn snapshot_rows(&self, txn: &TxnContext) -> Vec<(Tid, Tuple)> {
-        self.visible(txn)
+        // A flush rewrites whole rows into a fragment, so it needs every column.
+        self.visible(txn, &ColumnProjection::All)
     }
 
     /// Supply the commit log, so [`TableAm::statistics`] can tell a row deleted by
@@ -375,11 +376,35 @@ impl BufferTable {
     /// The rows are copied rather than streamed because the lock cannot be held
     /// across the iterator's life without blocking every writer for the duration
     /// of the caller's query.
-    fn visible(&self, txn: &TxnContext) -> Vec<(Tid, Tuple)> {
+    fn visible(&self, txn: &TxnContext, projection: &ColumnProjection) -> Vec<(Tid, Tuple)> {
+        let width = self.schema.columns.len();
         self.rows_read()
             .iter()
             .filter(|row| satisfies_mvcc(&row.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid))
-            .map(|row| (Tid::logical(row.row_id), row.values.clone()))
+            .map(|row| {
+                let values = match projection {
+                    ColumnProjection::All => row.values.clone(),
+                    // Rows live in RAM already, so there is no read to skip —
+                    // but cloning a `Value::Text` is not free, and a wide
+                    // relation scanned for two columns clones the rest for
+                    // nothing. Unselected slots stay `Null`, which the scan
+                    // contract leaves unspecified.
+                    ColumnProjection::Some(cols) => {
+                        let mut values = vec![Value::Null; width];
+                        for &index in cols.iter() {
+                            // Indexed defensively: the `All` arm above passes a
+                            // stored row through whatever its width, so a row
+                            // narrower than the schema must degrade here too
+                            // rather than panic inside a `TupleStream`.
+                            if let Some(value) = row.values.get(index) {
+                                values[index] = value.clone();
+                            }
+                        }
+                        values
+                    }
+                };
+                (Tid::logical(row.row_id), values)
+            })
             .collect()
     }
 
@@ -780,8 +805,8 @@ impl TableAm for BufferTable {
         RelStats::exact(live, &self.schema)
     }
 
-    fn scan(&self, txn: &TxnContext) -> TupleStream {
-        Box::new(self.visible(txn).into_iter().map(Ok))
+    fn scan(&self, txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
+        Box::new(self.visible(txn, projection).into_iter().map(Ok))
     }
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
@@ -909,7 +934,7 @@ mod tests {
     /// Every id a scan can see, sorted so assertions do not depend on row order.
     fn visible_ids(table: &BufferTable, txn: &TxnContext) -> Vec<i32> {
         let mut ids: Vec<i32> = table
-            .scan(txn)
+            .scan(txn, &ColumnProjection::All)
             .map(|row| match row.expect("scan must not fail").1[0] {
                 Value::Int4(id) => id,
                 ref other => panic!("unexpected id value {other:?}"),
@@ -1286,7 +1311,7 @@ mod tests {
             TransactionManager::new_recovered(Arc::new(NullSink), Arc::new(clog), result.next_xid);
         let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
         let mut got: Vec<Tuple> = table
-            .scan(&reader)
+            .scan(&reader, &ColumnProjection::All)
             .map(|row| row.expect("scan must not fail").1)
             .collect();
         assert_eq!(got.len(), expected.len());
