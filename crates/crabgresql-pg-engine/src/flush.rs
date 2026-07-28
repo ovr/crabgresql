@@ -210,7 +210,7 @@ fn sweep(
 
 #[cfg(test)]
 mod tests {
-    use crabgresql_storage_api::{
+    use crabgresql_storage_api::{ColumnProjection, 
         Column, TableAccessMethod, TableAm, TableEngine, TableSchema,
     };
     use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnFinalize};
@@ -297,7 +297,7 @@ mod tests {
 
         let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
         let mut ids: Vec<i32> = table
-            .scan(&reader)
+            .scan(&reader, &ColumnProjection::All)
             .map(|row| match row.expect("scan must not fail").1[0] {
                 Value::Int4(id) => id,
                 ref other => panic!("unexpected id {other:?}"),

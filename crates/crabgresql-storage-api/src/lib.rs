@@ -18,7 +18,9 @@ pub use crabgresql_txn as txn;
 mod stats;
 pub use stats::{ColStats, RelStats};
 
-/// A materialized row. Column order matches the table schema.
+/// A materialized row. Always as wide as the table schema, with column order
+/// matching it. A scan restricted by a [`ColumnProjection`] still returns a
+/// full-width tuple; only the values at unselected positions are unspecified.
 pub type Tuple = Vec<Value>;
 
 /// Row identity — PostgreSQL's `ctid`: the physical `(block, offset)` address of
@@ -598,6 +600,96 @@ pub type TupleStream = Box<
     dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send,
 >;
 
+/// Which of a relation's columns a scan actually needs.
+///
+/// A columnar engine reads only the selected columns off disk; a row store
+/// ignores the request entirely. Either is correct — see [`TableAm::scan`] for
+/// the contract that makes ignoring it free.
+///
+/// Tuples stay full width regardless: this narrows the *work*, never the row
+/// shape. The whole executor addresses columns by schema position
+/// (`ColumnRef { index }` indexes the row directly), so a narrowed row would
+/// invalidate every index above the scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColumnProjection {
+    /// Every column. The state of any scan whose needs could not be proven.
+    All,
+    /// Sorted, deduplicated schema ordinals. Never empty and never a complete
+    /// cover — [`ColumnProjection::of`] normalizes both cases away.
+    Some(Arc<[usize]>),
+}
+
+impl ColumnProjection {
+    pub const fn all() -> Self {
+        ColumnProjection::All
+    }
+
+    /// Build a projection from the schema ordinals a plan proved it reads.
+    ///
+    /// Normalizes two edge cases so consumers never have to:
+    ///
+    /// * A set covering every column becomes [`Self::All`], so engines take
+    ///   their unprojected fast path and equality against `All` is meaningful.
+    /// * An **empty** set (`SELECT count(*)`, which reads no column at all)
+    ///   becomes the single narrowest column rather than a zero-column read.
+    ///   Counting rows still only pays for one column — the entire win — while
+    ///   avoiding any dependence on how a storage format reports the row count
+    ///   of a batch with no columns.
+    pub fn of(columns: impl IntoIterator<Item = usize>, schema: &TableSchema) -> Self {
+        let width = schema.columns.len();
+        let mut wanted: Vec<usize> = columns.into_iter().filter(|&i| i < width).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        if wanted.len() >= width {
+            return ColumnProjection::All;
+        }
+        if wanted.is_empty() {
+            match narrowest_column(schema) {
+                Some(index) => wanted.push(index),
+                // A relation with no columns at all: nothing to prune.
+                None => return ColumnProjection::All,
+            }
+        }
+        ColumnProjection::Some(wanted.into())
+    }
+
+    /// Whether the scan needs the value at schema position `index`.
+    pub fn contains(&self, index: usize) -> bool {
+        match self {
+            ColumnProjection::All => true,
+            ColumnProjection::Some(cols) => cols.binary_search(&index).is_ok(),
+        }
+    }
+
+    /// The selected schema ordinals, ascending. `All` yields `0..width`.
+    pub fn indices(&self, width: usize) -> Box<dyn Iterator<Item = usize> + '_> {
+        match self {
+            ColumnProjection::All => Box::new(0..width),
+            ColumnProjection::Some(cols) => Box::new(cols.iter().copied()),
+        }
+    }
+}
+
+/// The column whose values are cheapest to read: the narrowest fixed-width one,
+/// else the first column. `typlen` follows PostgreSQL's convention — a positive
+/// byte width for a fixed-width type, negative for a variable-length one — so
+/// ordering by it puts a `bool` ahead of a `text`.
+fn narrowest_column(schema: &TableSchema) -> Option<usize> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.ty.typlen() > 0)
+        .min_by_key(|(_, column)| column.ty.typlen())
+        .map(|(index, _)| index)
+        .or(if schema.columns.is_empty() {
+            None
+        } else {
+            Some(0)
+        })
+}
+
 /// Table access: scans and modifications on one table, all judged against the
 /// caller's [`TxnContext`].
 pub trait TableAm: Send + Sync {
@@ -661,7 +753,19 @@ pub trait TableAm: Send + Sync {
     /// iterator captures the snapshot up front, so a DML statement never
     /// re-visits rows it modified itself (the reader's own new versions carry
     /// the reader's command id and stay invisible to the same command).
-    fn scan(&self, txn: &TxnContext) -> TupleStream;
+    ///
+    /// `projection` names the columns the caller will actually read. Every
+    /// tuple is still full width in schema order, but the values at positions
+    /// **outside** `projection` are *unspecified* — an engine may return the
+    /// real value or a placeholder, and callers must not read them. An engine
+    /// that cannot prune ignores the argument entirely; that is always correct,
+    /// which is why this is a performance hint rather than a contract on the
+    /// result. Pass [`ColumnProjection::All`] whenever the whole row is needed
+    /// — notably every DML path, which rebuilds full rows by ordinal.
+    ///
+    /// Pruning columns must never change the number, order, or [`Tid`] of the
+    /// rows produced: `fetch` addresses rows by position within a scan.
+    fn scan(&self, txn: &TxnContext, projection: &ColumnProjection) -> TupleStream;
 
     /// Fetch one version by tid if it is visible to `txn` — the re-read
     /// EvalPlanQual needs after a conflict, and a point lookup for indexes.
@@ -761,8 +865,10 @@ pub trait TableAm: Send + Sync {
     /// not keep tids reusable after a truncate. The default scans and deletes;
     /// engines should override with a whole-table reset.
     fn truncate(&self, txn: &TxnContext) -> Result<(), StorageError> {
-        let tids: Result<Vec<Tid>, StorageError> =
-            self.scan(txn).map(|row| row.map(|(tid, _)| tid)).collect();
+        let tids: Result<Vec<Tid>, StorageError> = self
+            .scan(txn, &ColumnProjection::All)
+            .map(|row| row.map(|(tid, _)| tid))
+            .collect();
         self.delete_many(tids?, txn)?;
         Ok(())
     }

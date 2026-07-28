@@ -8097,7 +8097,11 @@ mod tests {
         fn storage_leaves(&self) -> Option<Vec<Arc<dyn TableAm>>> {
             (!self.leaves.is_empty()).then(|| self.leaves.clone())
         }
-        fn scan(&self, _txn: &crabgresql_storage_api::txn::TxnContext) -> crabgresql_storage_api::TupleStream {
+        fn scan(
+            &self,
+            _txn: &crabgresql_storage_api::txn::TxnContext,
+            _projection: &crabgresql_storage_api::ColumnProjection,
+        ) -> crabgresql_storage_api::TupleStream {
             Box::new(std::iter::empty())
         }
         fn fetch(

@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use crabgresql_storage_api::{
-    DeleteResult, RelStats, StorageError, TableAm, TableSchema, Tid, Tuple, TupleStream,
-    UpdateResult, txn::TxnContext,
+    ColumnProjection, DeleteResult, RelStats, StorageError, TableAm, TableSchema, Tid, Tuple,
+    TupleStream, UpdateResult, txn::TxnContext,
 };
 use crabgresql_txn::Xid;
 
@@ -55,7 +55,9 @@ impl TableAm for StaticTable {
         RelStats::exact(self.rows.len(), &self.schema)
     }
 
-    fn scan(&self, _txn: &TxnContext) -> TupleStream {
+    /// Rows are already materialized in RAM, so there is no read to prune: the
+    /// projection is ignored, which the scan contract permits.
+    fn scan(&self, _txn: &TxnContext, _projection: &ColumnProjection) -> TupleStream {
         // Synthetic tids from the row index; catalog rows are always visible.
         let rows = self.rows.clone();
         Box::new(

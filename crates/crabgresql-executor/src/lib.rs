@@ -27,7 +27,8 @@ use crabgresql_planner::{
     PhysicalPlan,
 };
 use crabgresql_storage_api::{
-    IndexMetadata, PartitionBoundDatum, StorageError, TableAm, TableSchema, Tid, Tuple,
+    ColumnProjection, IndexMetadata, PartitionBoundDatum, StorageError, TableAm, TableSchema, Tid,
+    Tuple,
 };
 use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
@@ -396,13 +397,14 @@ pub fn execute(
         }
         PhysicalPlan::Select {
             table,
+            projection,
             columns,
             projections,
             predicate,
             sort,
             distinct,
         } => project_pipeline(
-            Box::new(SeqScan::new(&table, txn)),
+            Box::new(SeqScan::new(&table, txn, &projection)),
             projections,
             predicate,
             sort,
@@ -410,12 +412,16 @@ pub fn execute(
             columns,
             ctx,
         ),
-        PhysicalPlan::Append { tables, columns } => {
+        PhysicalPlan::Append {
+            tables,
+            projection,
+            columns,
+        } => {
             // A partitioned parent read: concatenate every leaf's scan. The
             // wrapping Subquery applies this level's projection/predicate/sort.
             Ok(Execution::Rows {
                 columns,
-                node: Box::new(Append::new(&tables, txn)),
+                node: Box::new(Append::new(&tables, txn, &projection)),
             })
         }
         PhysicalPlan::SetOp {
@@ -448,6 +454,7 @@ pub fn execute(
         }
         PhysicalPlan::IndexScan {
             table,
+            projection,
             index_name,
             key,
             columns,
@@ -456,7 +463,7 @@ pub fn execute(
             sort,
             distinct,
         } => {
-            let source = IndexScan::new(&table, &index_name, key, ctx, txn)?;
+            let source = IndexScan::new(&table, &index_name, key, ctx, txn, &projection)?;
             project_pipeline(
                 Box::new(source),
                 projections,
@@ -544,7 +551,9 @@ pub fn execute(
             // Source rows: a base table scan or the single virtual row of a
             // FROM-less aggregate.
             let source: Box<dyn ExecNode> = match input {
-                PhysicalAggInput::Scan(table) => Box::new(SeqScan::new(&table, txn)),
+                PhysicalAggInput::Scan { table, projection } => {
+                    Box::new(SeqScan::new(&table, txn, &projection))
+                }
                 PhysicalAggInput::Join(source) => build_join_expr(source, ctx, txn)?,
                 PhysicalAggInput::SingleRow => Box::new(Values::new(vec![vec![]], ctx.clone())),
             };
@@ -773,7 +782,7 @@ fn resolve_join(
             input, predicate, ..
         } => {
             match input {
-                PhysicalJoinInput::Scan(_) => {}
+                PhysicalJoinInput::Scan { .. } => {}
                 PhysicalJoinInput::Subplan(source) => resolve_subqueries(source, ctx, txn)?,
                 PhysicalJoinInput::TableFunction { args, .. } => resolve_exprs(args, ctx, txn)?,
             }
@@ -1451,7 +1460,9 @@ fn insert_direct(
     let has_unique = table.indexes().iter().any(|index| index.unique);
     let mut visible: Vec<Tuple> = if has_unique {
         table
-            .scan(txn)
+            // Unprojected: the UNIQUE check compares whichever columns each
+            // index covers, which is not known here.
+            .scan(txn, &ColumnProjection::All)
             .map(|row| row.map(|(_, tuple)| tuple))
             .collect::<Result<Vec<_>, _>>()?
     } else {
@@ -1505,7 +1516,8 @@ fn insert_routed(
         if has_unique && visible[leaf].is_none() {
             visible[leaf] = Some(
                 leaves[leaf]
-                    .scan(txn)
+                    // Unprojected, as above: the UNIQUE check needs index columns.
+                    .scan(txn, &ColumnProjection::All)
                     .map(|row| row.map(|(_, tuple)| tuple))
                     .collect::<Result<Vec<_>, _>>()?,
             );
@@ -1618,7 +1630,11 @@ fn update_direct(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    let original: Vec<(Tid, Tuple)> = table.scan(txn).collect::<Result<_, _>>()?;
+    // Unprojected: UPDATE rebuilds each row full width by ordinal, carrying the
+    // untouched columns through verbatim, and RETURNING may name any of them.
+    let original: Vec<(Tid, Tuple)> = table
+        .scan(txn, &ColumnProjection::All)
+        .collect::<Result<_, _>>()?;
     // `simulated` mirrors the post-update table so a UNIQUE check sees other
     // rows' new values; it is only needed when a unique index exists.
     let has_unique = table.indexes().iter().any(|index| index.unique);
@@ -1710,7 +1726,12 @@ fn update_routed(
     // set is fixed before any write (Halloween-safe).
     let scans: Vec<Vec<(Tid, Tuple)>> = leaves
         .iter()
-        .map(|leaf| leaf.scan(txn).collect::<Result<Vec<_>, _>>())
+        // Unprojected: rows are rebuilt full width, and cross-leaf row movement
+        // re-routes the whole tuple.
+        .map(|leaf| {
+            leaf.scan(txn, &ColumnProjection::All)
+                .collect::<Result<Vec<_>, _>>()
+        })
         .collect::<Result<_, _>>()?;
     // Per-leaf simulation of the leaf's live rows after this statement, used only
     // for UNIQUE checks; seeded from `scans` for leaves that carry a unique index,
@@ -2058,7 +2079,8 @@ fn delete_direct(
     let mut pending: Vec<Tid> = Vec::new();
     // RETURNING sees the deleted (OLD) rows; capture them alongside the tids.
     let mut deleted: Vec<Tuple> = Vec::new();
-    for row in table.scan(txn) {
+    // Unprojected: RETURNING may name any column of the deleted row.
+    for row in table.scan(txn, &ColumnProjection::All) {
         let (tid, tuple) = row?;
         if predicate_holds(predicate, &tuple, ctx)? {
             pending.push(tid);
@@ -2094,7 +2116,8 @@ fn delete_routed(
     // RETURNING sees the deleted (OLD) rows, in scan (leaf) order.
     let mut deleted: Vec<Tuple> = Vec::new();
     for (i, leaf) in leaves.iter().enumerate() {
-        for row in leaf.scan(txn) {
+        // Unprojected, as above: RETURNING sees the whole OLD row.
+        for row in leaf.scan(txn, &ColumnProjection::All) {
             let (tid, tuple) = row?;
             if predicate_holds(predicate, &tuple, ctx)? {
                 pending[i].push(tid);
@@ -2256,7 +2279,9 @@ fn build_join_source(
     txn: &TxnContext,
 ) -> Result<Box<dyn ExecNode>, ExecError> {
     Ok(match input {
-        PhysicalJoinInput::Scan(table) => Box::new(SeqScan::new(&table, txn)),
+        PhysicalJoinInput::Scan { table, projection } => {
+            Box::new(SeqScan::new(&table, txn, &projection))
+        }
         PhysicalJoinInput::TableFunction { func, args } => {
             Box::new(TableFunctionSource::new(func, args, ctx.clone()))
         }
@@ -3083,9 +3108,17 @@ pub struct SeqScan {
 }
 
 impl SeqScan {
-    pub fn new(table: &Arc<dyn TableAm>, txn: &TxnContext) -> Self {
+    pub fn new(
+        table: &Arc<dyn TableAm>,
+        txn: &TxnContext,
+        projection: &ColumnProjection,
+    ) -> Self {
         Self {
-            iter: Box::new(table.scan(txn).map(|row| row.map(|(_, tuple)| tuple))),
+            iter: Box::new(
+                table
+                    .scan(txn, projection)
+                    .map(|row| row.map(|(_, tuple)| tuple)),
+            ),
         }
     }
 }
@@ -3105,12 +3138,22 @@ pub struct Append {
 }
 
 impl Append {
-    pub fn new(tables: &[Arc<dyn TableAm>], txn: &TxnContext) -> Self {
+    pub fn new(
+        tables: &[Arc<dyn TableAm>],
+        txn: &TxnContext,
+        projection: &ColumnProjection,
+    ) -> Self {
+        // One projection for every leaf: the leaves of an `Append` all share the
+        // parent's column layout, so a schema ordinal means the same column in
+        // each.
         let scans: Vec<Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>> = tables
             .iter()
             .map(|table| {
-                Box::new(table.scan(txn).map(|row| row.map(|(_, tuple)| tuple)))
-                    as Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>
+                Box::new(
+                    table
+                        .scan(txn, projection)
+                        .map(|row| row.map(|(_, tuple)| tuple)),
+                ) as Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>
             })
             .collect();
         Self {
@@ -3174,6 +3217,7 @@ impl IndexScan {
         key: Vec<(usize, BoundExpr)>,
         ctx: &ExecContext,
         txn: &TxnContext,
+        projection: &ColumnProjection,
     ) -> Result<Self, ExecError> {
         // The key value expressions are row-constant (the planner guarantees
         // it), so they evaluate once against an empty row.
@@ -3192,7 +3236,9 @@ impl IndexScan {
                         .iter()
                         .map(|(column, _)| (*column, table.schema().columns[*column].ty))
                         .collect();
-                    Box::new(table.scan(txn).filter_map(move |row| match row {
+                    // The planner folds every key column into `projection`
+                    // precisely so this re-check can read them.
+                    Box::new(table.scan(txn, projection).filter_map(move |row| match row {
                         Ok((_, tuple)) => cols
                             .iter()
                             .zip(&key_values)
@@ -3763,6 +3809,7 @@ mod tests {
             vec![(0, int4(2))],
             &ExecContext::default(),
             &rtxn(),
+            &ColumnProjection::All,
         ));
         assert_eq!(
             collect(&mut node),
@@ -3781,6 +3828,7 @@ mod tests {
             vec![(0, int4(2))],
             &ExecContext::default(),
             &rtxn(),
+            &ColumnProjection::All,
         ));
         assert_eq!(
             collect(&mut node),
@@ -3797,6 +3845,7 @@ mod tests {
             vec![(0, int4(99))],
             &ExecContext::default(),
             &rtxn(),
+            &ColumnProjection::All,
         ));
         assert!(collect(&mut node).is_empty());
     }
@@ -3815,7 +3864,7 @@ mod tests {
             int4(2),
         );
         let mut node = Filter::new(
-            Box::new(SeqScan::new(&table, &rtxn())),
+            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
             predicate,
             ExecContext::default(),
         );
@@ -3835,7 +3884,7 @@ mod tests {
             },
         );
         let mut node = Filter::new(
-            Box::new(SeqScan::new(&table, &rtxn())),
+            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
             predicate,
             ExecContext::default(),
         );
@@ -3855,7 +3904,7 @@ mod tests {
             int4(10),
         )];
         let mut node = Projection::new(
-            Box::new(SeqScan::new(&table, &rtxn())),
+            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
             exprs,
             ExecContext::default(),
         );
@@ -3887,7 +3936,7 @@ mod tests {
             },
         ];
         let projection = Projection::new(
-            Box::new(SeqScan::new(&table, &rtxn())),
+            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
             exprs,
             ExecContext::default(),
         );
@@ -3917,7 +3966,7 @@ mod tests {
     /// Scan `t` (ids 1,2,3 in insertion order), keeping just the `id` column.
     fn id_scan(table: &Arc<dyn TableAm>) -> Box<dyn ExecNode> {
         Box::new(Projection::new(
-            Box::new(SeqScan::new(table, &rtxn())),
+            Box::new(SeqScan::new(table, &rtxn(), &ColumnProjection::All)),
             vec![BoundExpr::ColumnRef {
                 index: 0,
                 ty: PgType::Int4,
@@ -4097,7 +4146,7 @@ mod tests {
         };
         assert_eq!(n, 3);
         let ids: Vec<Value> = table
-            .scan(&rtxn())
+            .scan(&rtxn(), &ColumnProjection::All)
             .map(|row| {
                 row.unwrap_or_else(|error| panic!("scan failed: {error}"))
                     .1[0]
@@ -4146,7 +4195,7 @@ mod tests {
         };
         assert_eq!(e.code, "22012");
         let ids: Vec<Value> = table
-            .scan(&rtxn())
+            .scan(&rtxn(), &ColumnProjection::All)
             .map(|row| {
                 row.unwrap_or_else(|error| panic!("scan failed: {error}"))
                     .1[0]
@@ -4180,7 +4229,7 @@ mod tests {
             panic!("expected Deleted");
         };
         assert_eq!(n, 2);
-        assert_eq!(table.scan(&rtxn()).count(), 1);
+        assert_eq!(table.scan(&rtxn(), &ColumnProjection::All).count(), 1);
 
         Ok(())
     }
@@ -4257,7 +4306,7 @@ mod tests {
         );
         // The rows were actually persisted, not just projected.
         let table = test_ok(engine.open_table("t"));
-        assert_eq!(table.scan(&rtxn()).count(), 5);
+        assert_eq!(table.scan(&rtxn(), &ColumnProjection::All).count(), 5);
     }
 
     #[test]
@@ -4305,7 +4354,7 @@ mod tests {
         let inserted = run_insert(&engine, "INSERT INTO t (id, label) SELECT id, label FROM t");
         assert_eq!(inserted, 3);
         let table = test_ok(engine.open_table("t"));
-        assert_eq!(table.scan(&rtxn()).count(), 6);
+        assert_eq!(table.scan(&rtxn(), &ColumnProjection::All).count(), 6);
     }
 
     #[test]
@@ -4317,7 +4366,7 @@ mod tests {
         );
         assert_eq!(inserted, 1);
         let table = test_ok(engine.open_table("t"));
-        assert_eq!(table.scan(&rtxn()).count(), 4);
+        assert_eq!(table.scan(&rtxn(), &ColumnProjection::All).count(), 4);
     }
 
     #[test]
@@ -4326,7 +4375,7 @@ mod tests {
         let inserted = run_insert(&engine, "INSERT INTO t (id, label) TABLE t");
         assert_eq!(inserted, 3);
         let table = test_ok(engine.open_table("t"));
-        assert_eq!(table.scan(&rtxn()).count(), 6);
+        assert_eq!(table.scan(&rtxn(), &ColumnProjection::All).count(), 6);
     }
 
     #[test]
@@ -4379,7 +4428,7 @@ mod tests {
             ]
         );
         let table = test_ok(engine.open_table("t"));
-        assert_eq!(table.scan(&rtxn()).count(), 1);
+        assert_eq!(table.scan(&rtxn(), &ColumnProjection::All).count(), 1);
     }
 
     /// Parse → bind → plan → execute a query against a fresh engine.
