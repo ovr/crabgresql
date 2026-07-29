@@ -1261,3 +1261,126 @@ mod durable_clog_tests {
         Ok(())
     }
 }
+
+/// Throughput of [`Clog`] lookups and stamps at 1, 2, 4 and 8 threads.
+///
+/// [`Clog::status`] is the hot path of the whole system — [`satisfies_mvcc`] calls
+/// it up to twice per tuple per scan — so how it behaves under concurrency is a
+/// design constraint, not a detail. This measures exactly that and nothing else:
+/// the commit log in isolation, no parse, no plan, no storage.
+///
+/// `#[ignore]`d because it is a *measurement*, not an assertion. It asserts nothing
+/// about timing — a timing assertion is the classic CI flake — so it never runs in
+/// CI, and its numbers are machine-dependent. Run it explicitly:
+///
+/// ```text
+/// cargo test --release -p crabgresql-txn --lib clog_contention_bench \
+///     -- --ignored --nocapture --test-threads=1
+/// ```
+///
+/// `--release` is mandatory (a debug build measures lock bookkeeping and
+/// unoptimised atomics, not the design) and `--test-threads=1` stops the harness
+/// from running two thread counts concurrently and poisoning both.
+#[cfg(test)]
+mod clog_contention_bench {
+    use super::*;
+    use std::hint::black_box;
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
+    /// The XID window every thread walks. All of page 0, so the page fault is out
+    /// of the measurement and all threads contend on the same 8 KiB.
+    const LO: u64 = 3;
+    const HI: u64 = 32_000;
+    const SPAN: u64 = HI - LO;
+    /// Coprime with `SPAN` (= 7² · 653), so the walk sweeps the whole page instead
+    /// of cycling one cache line.
+    const STRIDE: u64 = 7_919;
+    const ITERS: u64 = 2_000_000;
+    const WARMUP: u64 = 100_000;
+
+    #[derive(Clone, Copy)]
+    enum Mix {
+        Read,
+        Write,
+        /// What a real workload looks like: nine visibility checks per stamp.
+        Mixed,
+    }
+
+    fn work(log: &Clog, mix: Mix, iters: u64, seed: u64) -> u64 {
+        let mut idx = seed % SPAN;
+        let mut acc = 0u64;
+        for i in 0..iters {
+            idx = (idx + STRIDE) % SPAN;
+            let xid = Xid(LO + idx);
+            let write = match mix {
+                Mix::Read => false,
+                Mix::Write => true,
+                Mix::Mixed => i % 10 == 0,
+            };
+            if write {
+                log.set_committed(xid);
+                acc += 1;
+            } else {
+                acc += u64::from(log.is_committed(xid));
+            }
+        }
+        acc
+    }
+
+    fn run(threads: usize, mix: Mix) -> Duration {
+        let log = Arc::new(Clog::new());
+        // Pre-stamp the window so every lookup is a hit and page 0 is resident.
+        for xid in LO..HI {
+            log.set_committed(Xid(xid));
+        }
+        let barrier = Arc::new(Barrier::new(threads + 1));
+        let mut handles = Vec::with_capacity(threads);
+        for t in 0..threads {
+            let log = Arc::clone(&log);
+            let barrier = Arc::clone(&barrier);
+            let seed = t as u64 * 977;
+            handles.push(std::thread::spawn(move || {
+                // Warm up before the barrier, so first-touch and branch-predictor
+                // effects sit outside the timed window.
+                black_box(work(&log, mix, WARMUP, seed));
+                barrier.wait();
+                let acc = work(&log, mix, ITERS, seed);
+                // Without this the optimiser is free to delete the whole loop.
+                assert!(black_box(acc) > 0, "the measured loop did no work");
+            }));
+        }
+        barrier.wait();
+        let started = Instant::now();
+        for handle in handles {
+            assert!(handle.join().is_ok(), "a bench worker panicked");
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    #[ignore = "measurement, not an assertion: prints throughput, asserts nothing about timing"]
+    fn clog_contention() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0);
+        eprintln!(
+            "clog contention: {ITERS} ops/thread over XIDs [{LO}, {HI}), available_parallelism={cores}"
+        );
+        eprintln!(
+            "{:>8}  {:>10}  {:>10}  {:>10}   (Mops/s, aggregate)",
+            "threads", "read", "write", "90/10"
+        );
+        for threads in [1usize, 2, 4, 8] {
+            let mut mops = [0f64; 3];
+            for (slot, mix) in mops.iter_mut().zip([Mix::Read, Mix::Write, Mix::Mixed]) {
+                let elapsed = run(threads, mix);
+                *slot = (ITERS * threads as u64) as f64 / elapsed.as_secs_f64() / 1e6;
+            }
+            eprintln!(
+                "{threads:>8}  {:>10.1}  {:>10.1}  {:>10.1}",
+                mops[0], mops[1], mops[2]
+            );
+        }
+    }
+}
