@@ -293,6 +293,16 @@ pub struct PgEngine {
     /// would ever be dropped — leaking the data directory's file handles and
     /// leaving the flush worker running against a directory nobody is using.
     txnmgr: std::sync::OnceLock<std::sync::Weak<TransactionManager>>,
+    /// The commit log, so the checkpoint can write its dirty pages back.
+    ///
+    /// Held **strongly**, unlike `txnmgr`: a [`Clog`] owns nothing and so closes
+    /// no cycle, and the checkpoint that matters most is the one at a clean
+    /// shutdown — by which point the transaction manager may already be gone,
+    /// taking the last chance to make the commit log durable with it.
+    ///
+    /// Absent for an engine built by hand in a test, which never checkpoints a
+    /// commit log it does not have.
+    clog: std::sync::OnceLock<Arc<Clog>>,
     /// The background flush thread, present once a transaction manager is
     /// attached. Tests that build an engine by hand never attach one, so they get
     /// no thread and stay deterministic.
@@ -426,6 +436,7 @@ impl PgEngine {
             parquet_redo,
             buffer_redo,
             txnmgr: std::sync::OnceLock::new(),
+            clog: std::sync::OnceLock::new(),
             flush_worker: Mutex::new(None),
             tables: RwLock::new(tables),
             last_next_xid: AtomicU64::new(0),
@@ -459,7 +470,12 @@ impl PgEngine {
             .unwrap_or(false);
         let mut registry = RmgrRegistry::new();
         let engine = Arc::new(PgEngine::new(data_dir, Arc::clone(&wal), &mut registry)?);
-        let clog = Arc::new(Clog::new());
+        // Load the durable commit log, then replay over it: the WAL is the
+        // authority, so a status it carries simply overwrites what was on disk.
+        // What the CLOG adds is the fates of transactions whose commit records
+        // sit *below* `redo` and are therefore never replayed.
+        let clog = Arc::new(Clog::open(data_dir)?);
+        engine.clog.get_or_init(|| Arc::clone(&clog));
         let res = recover(data_dir, &registry, &clog, redo).map_err(std::io::Error::other)?;
         // Clamp the WAL to the last valid record before any new append, discarding
         // a torn tail left by a crash.
@@ -539,6 +555,9 @@ impl PgEngine {
         if self.txnmgr.set(Arc::downgrade(&txnmgr)).is_err() {
             return;
         }
+        // Normally already set by `open_recovered`; this covers an engine wired up
+        // by another route, so the checkpoint always has a commit log to flush.
+        self.clog.get_or_init(|| Arc::clone(txnmgr.clog()));
         // Give every buffer the CLOG, so `statistics()` — which gets no
         // `TxnContext` — can tell a row deleted by a committed transaction from
         // one whose deleter aborted. `create_table` does the same for relations
@@ -629,6 +648,15 @@ impl PgEngine {
 
     fn write_control_file(&self, next_xid: Xid, clean_shutdown: bool) -> std::io::Result<()> {
         self.inner.bufpool.flush_all()?;
+        // Make the commit log durable before the control file advertises this
+        // checkpoint. The ordering is the whole point: a control file naming a
+        // checkpoint whose CLOG had not reached disk would let a later bounded
+        // replay start above the commit records it still needs, and every
+        // transaction below that point would come back InProgress — its rows
+        // silently invisible.
+        if let Some(clog) = self.clog.get() {
+            clog.flush()?;
+        }
         self.last_next_xid.store(next_xid.0, Ordering::Relaxed);
         write_control(
             &self.data_dir,

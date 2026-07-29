@@ -14,6 +14,7 @@
 //! and its deleter is not); it is written independently from PG's C source per
 //! the clean-room policy in `AGENTS.md`.
 
+pub mod clog;
 mod lock;
 
 pub use lock::{ExclusiveGuard, SharedGuard, TableLock};
@@ -68,6 +69,34 @@ pub enum XactStatus {
     SubCommitted,
 }
 
+impl XactStatus {
+    /// The on-disk encoding, two bits wide.
+    ///
+    /// `InProgress == 0` is load-bearing: a file hole, a never-written page and a
+    /// missing segment all read as zeros, and every one of them must mean
+    /// "unknown, so assume still running".
+    pub const fn to_bits(self) -> u8 {
+        match self {
+            XactStatus::InProgress => 0b00,
+            XactStatus::Committed => 0b01,
+            XactStatus::Aborted => 0b10,
+            XactStatus::SubCommitted => 0b11,
+        }
+    }
+
+    /// The inverse of [`XactStatus::to_bits`]. Total by construction: two bits
+    /// have four values and the enum has four variants, so there is no error path
+    /// and nothing to unwrap. Bits above the low two are ignored.
+    pub const fn from_bits(bits: u8) -> Self {
+        match bits & 0b11 {
+            0b00 => XactStatus::InProgress,
+            0b01 => XactStatus::Committed,
+            0b10 => XactStatus::Aborted,
+            _ => XactStatus::SubCommitted,
+        }
+    }
+}
+
 /// Hint bits cached on a version so visibility need not re-consult the CLOG once
 /// a transaction's fate is known. Correctness never depends on them — they are a
 /// cache the engine may set lazily — so the in-memory engine leaves them clear
@@ -116,31 +145,148 @@ impl TupleHeader {
     }
 }
 
-/// The commit log: the authoritative fate of every transaction. This first
-/// implementation is in-memory (lost on restart, like the memory engine);
-/// durability lands with WAL in P4. An XID absent from the map is treated as
-/// [`XactStatus::InProgress`].
+/// The resident page set, plus what still needs writing.
+#[derive(Debug)]
+struct ClogCache {
+    /// Resident pages, keyed by page number.
+    ///
+    /// There is no eviction. A page is 8 KiB per 32768 transactions — 256 KiB per
+    /// million — and evicting would mean writing a page outside a checkpoint,
+    /// which is precisely what the write-back model exists to avoid. Truncation
+    /// is the only thing that drops pages.
+    pages: std::collections::HashMap<u64, clog::ClogPage>,
+    /// Pages stamped since the last flush.
+    dirty: BTreeSet<u64>,
+    /// Every XID below this has been frozen out of every relation; its segment
+    /// may be gone. Zero until a freeze sweep advances it.
+    floor: Xid,
+    /// A read error with nowhere to go: [`Clog::status`] returns a bare
+    /// [`XactStatus`]. Latched here and surfaced by [`Clog::flush`], which does
+    /// have somewhere to put it. Never silently dropped.
+    failure: Option<std::io::Error>,
+}
+
+impl Default for ClogCache {
+    fn default() -> Self {
+        ClogCache {
+            pages: std::collections::HashMap::new(),
+            dirty: BTreeSet::new(),
+            // Xid has no Default, and shouldn't: INVALID is the meaningful zero
+            // here, not an arbitrary one.
+            floor: Xid::INVALID,
+            failure: None,
+        }
+    }
+}
+
+/// The commit log: the authoritative fate of every transaction.
+///
+/// Pages are cached in RAM and written back at checkpoint. Deliberately *not*
+/// written or fsynced per commit: [`TransactionManager::commit`] only calls
+/// [`Clog::set_committed`] after [`CommitSink::log_commit`] has fsynced the WAL
+/// commit record, so a crash between the two is repaired by replay. A CLOG fsync
+/// per commit would buy nothing and cost a synchronous write on the hottest path.
+///
+/// An XID with no bits recorded reads as [`XactStatus::InProgress`].
 #[derive(Debug, Default)]
 pub struct Clog {
-    // Sparse; a durable SLRU-style bitmap replaces this in P4.
-    status: Mutex<std::collections::HashMap<Xid, XactStatus>>,
+    /// `None` for an in-memory-only commit log — the memory engine and tests,
+    /// where nothing is ever written and the cache is simply the whole log.
+    dir: Option<std::path::PathBuf>,
+    cache: Mutex<ClogCache>,
 }
 
 impl Clog {
+    /// An in-memory commit log, lost on restart. Used by the memory engine and by
+    /// tests that have no data directory.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open the durable commit log under `<data_dir>/pg_xact`, creating it if
+    /// this is a fresh cluster.
+    ///
+    /// Pages are read lazily, so this only reads `meta`.
+    pub fn open(data_dir: &std::path::Path) -> std::io::Result<Self> {
+        let dir = data_dir.join(clog::CLOG_SUBDIR);
+        std::fs::create_dir_all(&dir)?;
+        // Absent meta is a fresh cluster, not an error; a meta we cannot parse is.
+        let floor = match clog::read_meta(&dir)? {
+            Some(meta) => meta.floor,
+            None => {
+                // Stamp the marker now rather than at the first floor advance.
+                // Its job is to let a future build recognise a layout it cannot
+                // address, and a cluster that never truncates would otherwise
+                // carry segments with nothing identifying their geometry.
+                let fresh = clog::ClogMeta {
+                    floor: Xid::INVALID,
+                };
+                clog::write_meta(&dir, &fresh)?;
+                fresh.floor
+            }
+        };
+        Ok(Clog {
+            dir: Some(dir),
+            cache: Mutex::new(ClogCache {
+                floor,
+                ..ClogCache::default()
+            }),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ClogCache> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+    }
+
+    /// Borrow the page holding `xid`, reading it in on a miss.
+    ///
+    /// A read failure latches the error and yields a zero page, so the caller
+    /// sees `InProgress` — the answer that renders a row invisible rather than
+    /// resurrecting it. The latch turns the next [`Clog::flush`] into an error.
+    fn with_page<R>(
+        cache: &mut ClogCache,
+        dir: Option<&std::path::Path>,
+        xid: Xid,
+        f: impl FnOnce(&mut clog::ClogPage) -> R,
+    ) -> R {
+        let pageno = clog::page_of(xid);
+        let page = match cache.pages.entry(pageno) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let page = match dir {
+                    Some(dir) => clog::read_page(dir, pageno).unwrap_or_else(|error| {
+                        cache.failure.get_or_insert(error);
+                        clog::ZERO_PAGE
+                    }),
+                    None => clog::ZERO_PAGE,
+                };
+                entry.insert(page)
+            }
+        };
+        f(page)
     }
 
     pub fn status(&self, xid: Xid) -> XactStatus {
         if xid == Xid::FROZEN {
             return XactStatus::Committed;
         }
-        self.status
-            .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"))
-            .get(&xid)
-            .copied()
-            .unwrap_or(XactStatus::InProgress)
+        let mut cache = self.lock();
+        if xid < cache.floor {
+            // Unreachable by construction: the floor only advances once every
+            // relation has been swept, so no surviving tuple names an XID below
+            // it. InProgress is the fail-safe answer if that ever breaks — it
+            // hides a row rather than resurrecting a deleted one.
+            debug_assert!(
+                !xid.is_valid(),
+                "status({xid:?}) below the CLOG floor {:?}",
+                cache.floor
+            );
+            return XactStatus::InProgress;
+        }
+        let dir = self.dir.as_deref();
+        Self::with_page(&mut cache, dir, xid, |page| clog::page_status(page, xid))
     }
 
     pub fn is_committed(&self, xid: Xid) -> bool {
@@ -148,17 +294,56 @@ impl Clog {
     }
 
     pub fn set_committed(&self, xid: Xid) {
-        self.status
-            .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"))
-            .insert(xid, XactStatus::Committed);
+        self.set_status(xid, XactStatus::Committed);
     }
 
     pub fn set_aborted(&self, xid: Xid) {
-        self.status
-            .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"))
-            .insert(xid, XactStatus::Aborted);
+        self.set_status(xid, XactStatus::Aborted);
+    }
+
+    fn set_status(&self, xid: Xid, status: XactStatus) {
+        let mut cache = self.lock();
+        let dir = self.dir.as_deref();
+        Self::with_page(&mut cache, dir, xid, |page| {
+            clog::set_page_status(page, xid, status);
+        });
+        cache.dirty.insert(clog::page_of(xid));
+    }
+
+    /// Write every dirty page and fsync the segments they landed in.
+    ///
+    /// Called from the checkpoint, which is the only place CLOG pages reach disk.
+    /// A no-op for an in-memory commit log.
+    pub fn flush(&self) -> std::io::Result<()> {
+        let mut cache = self.lock();
+        if let Some(error) = cache.failure.take() {
+            return Err(error);
+        }
+        let Some(dir) = self.dir.as_deref() else {
+            cache.dirty.clear();
+            return Ok(());
+        };
+        // Take the dirty set up front: on failure the pages stay dirty and the
+        // next checkpoint retries them.
+        let dirty = std::mem::take(&mut cache.dirty);
+        let mut segments = BTreeSet::new();
+        for pageno in &dirty {
+            let Some(page) = cache.pages.get(pageno) else {
+                continue;
+            };
+            if let Err(error) = clog::write_page(dir, *pageno, page) {
+                cache.dirty.extend(dirty.iter().copied());
+                return Err(error);
+            }
+            segments.insert(clog::segment_of_page(*pageno));
+        }
+        for segno in segments {
+            if let Err(error) = clog::sync_segment(dir, segno) {
+                cache.dirty.extend(dirty.iter().copied());
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -986,5 +1171,93 @@ mod tests {
             after.xid,
             after.cid
         ));
+    }
+}
+
+#[cfg(test)]
+mod durable_clog_tests {
+    use super::*;
+
+    #[test]
+    fn statuses_survive_a_reopen() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // XIDs spread across two segments and several pages, so the reopen has to
+        // find them through real addressing rather than one cached page.
+        let committed = [Xid(3), Xid(9_000), Xid(clog::XACTS_PER_SEGMENT + 17)];
+        let aborted = [Xid(4), Xid(clog::XACTS_PER_PAGE + 1)];
+        {
+            let log = Clog::open(dir.path())?;
+            for xid in committed {
+                log.set_committed(xid);
+            }
+            for xid in aborted {
+                log.set_aborted(xid);
+            }
+            // Before the flush nothing is on disk; the checkpoint is what publishes.
+            log.flush()?;
+        }
+        let log = Clog::open(dir.path())?;
+        for xid in committed {
+            assert_eq!(log.status(xid), XactStatus::Committed, "{xid:?}");
+        }
+        for xid in aborted {
+            assert_eq!(log.status(xid), XactStatus::Aborted, "{xid:?}");
+        }
+        // An XID nobody ever reported on is still running, not committed.
+        assert_eq!(log.status(Xid(12_345)), XactStatus::InProgress);
+        Ok(())
+    }
+
+    #[test]
+    fn unflushed_statuses_are_lost_but_the_wal_is_the_authority() -> anyhow::Result<()> {
+        // Dropping without a flush loses the bits — which is safe precisely
+        // because `commit` fsyncs the WAL commit record first, so replay puts
+        // them back. This pins the write-back contract: nothing reaches disk
+        // outside `flush`.
+        let dir = tempfile::tempdir()?;
+        {
+            let log = Clog::open(dir.path())?;
+            log.set_committed(Xid(7));
+        }
+        assert_eq!(
+            Clog::open(dir.path())?.status(Xid(7)),
+            XactStatus::InProgress
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn opening_a_fresh_cluster_stamps_the_version_marker() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let subdir = dir.path().join(clog::CLOG_SUBDIR);
+        assert_eq!(clog::read_meta(&subdir)?, None);
+        let _ = Clog::open(dir.path())?;
+        assert_eq!(
+            clog::read_meta(&subdir)?,
+            Some(clog::ClogMeta {
+                floor: Xid::INVALID
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_meta_refuses_to_open() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let subdir = dir.path().join(clog::CLOG_SUBDIR);
+        std::fs::create_dir_all(&subdir)?;
+        std::fs::write(subdir.join("meta"), b"not a clog meta at all")?;
+        // Guessing the geometry would silently misread every commit status.
+        assert!(Clog::open(dir.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn an_in_memory_clog_never_touches_the_filesystem() -> anyhow::Result<()> {
+        let log = Clog::new();
+        log.set_committed(Xid(5));
+        assert_eq!(log.status(Xid(5)), XactStatus::Committed);
+        log.flush()?; // a no-op, not an error
+        Ok(())
     }
 }

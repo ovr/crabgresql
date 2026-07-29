@@ -965,3 +965,62 @@ fn a_parquet_relation_that_cannot_be_rebound_reports_as_absent() -> anyhow::Resu
     engine.drop_table("public", "events")?;
     Ok(())
 }
+
+#[test]
+fn a_commit_below_the_redo_point_survives_a_bounded_replay() -> anyhow::Result<()> {
+    // The reason the durable CLOG exists. Recovery used to rebuild every
+    // transaction's fate solely from the XACT_COMMIT/XACT_ABORT records it
+    // replayed, so a transaction that committed *below* the redo point came back
+    // InProgress and every row it wrote turned invisible — indistinguishable from
+    // data loss. With the commit log on disk, replay no longer has to see the
+    // commit record to know the fate.
+    let dir = tempfile::tempdir()?;
+    let redo;
+    {
+        let (engine, tm, wal) =
+            common::open_from_with_wal(dir.path(), crabgresql_wal::Lsn::INVALID)?;
+        let table = engine.create_table(schema())?;
+
+        let committed = tm.allocate_xid();
+        insert(
+            &*table,
+            &tm.context(committed, CommandId::FIRST),
+            1,
+            "below",
+        );
+        insert(
+            &*table,
+            &tm.context(committed, CommandId::FIRST),
+            2,
+            "below",
+        );
+        tm.commit(committed)?;
+
+        // An aborted neighbour, to prove the CLOG carries the *fate* across the
+        // boundary rather than just making everything below it visible.
+        let aborted = tm.allocate_xid();
+        insert(&*table, &tm.context(aborted, CommandId::FIRST), 3, "gone");
+        tm.abort(aborted);
+
+        // Sample the redo point AFTER both transactions finished, then check
+        // point: the commit and abort records now sit below redo, and the
+        // checkpoint is what makes their CLOG bits durable.
+        redo = wal.redo_point()?;
+        engine.checkpoint(Xid(aborted.0 + 1))?;
+    }
+
+    // Destroy the WAL prefix below redo, so a replay that tried to read those
+    // commit records would fail rather than quietly succeed. Only the durable
+    // CLOG can answer now.
+    assert!(redo.is_valid(), "redo_point() never advanced");
+    common::scribble(&common::wal_file_path(dir.path()), 0, redo.0, 0xAB)?;
+
+    let (engine, tm) = common::open_from(dir.path(), redo)?;
+    let table = engine.open_table("t")?;
+    assert_eq!(
+        visible_ids(&tm, &*table),
+        vec![1, 2],
+        "committed rows below the redo point must survive, and aborted ones must not"
+    );
+    Ok(())
+}
