@@ -714,10 +714,11 @@ pub fn satisfies_mvcc(
         // complete as of our snapshot.
         //
         // The snapshot goes first deliberately. Both operands are pure, so the
-        // order is a free choice, and `Snapshot::in_progress` is a lock-free
-        // comparison against a sorted `Vec` while `Clog::is_committed` takes a lock
-        // and may fault a page in off disk. Vetoing on the snapshot first means an
-        // XID the reader could not see anyway never touches the commit log.
+        // order is a free choice, and `Snapshot::in_progress` searches a sorted
+        // `Vec` this reader already owns, touching no shared memory at all, while
+        // `Clog::is_committed` walks the shared page index and may fault a page in
+        // off disk. Vetoing on the snapshot first means an XID the reader could not
+        // have seen anyway never touches the commit log.
         if snap.in_progress(hdr.xmin) || !clog.is_committed(hdr.xmin) {
             return false;
         }
