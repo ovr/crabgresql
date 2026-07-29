@@ -12,6 +12,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::{XactStatus, Xid};
 
@@ -40,13 +41,14 @@ const BYTE_IN_PAGE_MASK: u64 = CLOG_PAGE_SIZE as u64 - 1;
 const XACTS_PER_BYTE_MASK: u64 = (8 / BITS_PER_XACT) - 1;
 const STATUS_MASK: u8 = (1 << BITS_PER_XACT) - 1;
 
-/// One CLOG page, held by value: 8 KiB is cheap to copy and this keeps the cache
-/// free of lifetimes.
-pub type ClogPage = [u8; CLOG_PAGE_SIZE];
+/// One CLOG page as it appears on disk, held by value: 8 KiB is cheap to copy and
+/// this keeps the I/O layer free of lifetimes. The resident, concurrently-mutable
+/// form is [`ClogPage`].
+pub type PageBytes = [u8; CLOG_PAGE_SIZE];
 
 /// An all-zero page. Zero is [`XactStatus::InProgress`], which is what a hole, a
 /// never-written page, and a missing segment must all read as.
-pub const ZERO_PAGE: ClogPage = [0u8; CLOG_PAGE_SIZE];
+pub const ZERO_BYTES: PageBytes = [0u8; CLOG_PAGE_SIZE];
 
 /// The page holding `xid`.
 pub const fn page_of(xid: Xid) -> u64 {
@@ -77,15 +79,170 @@ const fn shift_in_byte(xid: Xid) -> u32 {
 }
 
 /// Read `xid`'s status out of the page that holds it.
-pub fn page_status(page: &ClogPage, xid: Xid) -> XactStatus {
+pub fn page_status(page: &PageBytes, xid: Xid) -> XactStatus {
     XactStatus::from_bits((page[byte_in_page(xid)] >> shift_in_byte(xid)) & STATUS_MASK)
 }
 
 /// Stamp `xid`'s status into the page that holds it.
-pub fn set_page_status(page: &mut ClogPage, xid: Xid, status: XactStatus) {
+pub fn set_page_status(page: &mut PageBytes, xid: Xid, status: XactStatus) {
     let byte = &mut page[byte_in_page(xid)];
     let shift = shift_in_byte(xid);
     *byte = (*byte & !(STATUS_MASK << shift)) | (status.to_bits() << shift);
+}
+
+// ---------------------------------------------------------------------------
+// the resident page
+// ---------------------------------------------------------------------------
+
+/// A resident CLOG page: the same bit layout as [`PageBytes`], but readable and
+/// stampable through a shared reference, which is what lets [`crate::Clog`] serve
+/// both without a lock.
+///
+/// It lives here rather than beside [`crate::Clog`] so `byte_in_page`,
+/// `shift_in_byte` and `STATUS_MASK` stay private to this module: the addressing
+/// arithmetic exists exactly once, whichever representation is being addressed.
+pub struct ClogPage {
+    bits: [AtomicU8; CLOG_PAGE_SIZE],
+    /// Stamped since the last flush. See [`ClogPage::mark_dirty`] for why every
+    /// update of this flag must be a read-modify-write.
+    dirty: AtomicBool,
+    /// This page was faulted in from a *failed* read, so its bytes are zeros
+    /// rather than whatever the segment actually holds. Set once at construction
+    /// and never cleared — we never learn the real prior contents, so writing this
+    /// page back would erase up to 32767 other transactions' statuses.
+    poisoned: bool,
+}
+
+impl ClogPage {
+    /// A resident page holding `bytes`. `poisoned` marks bytes that are a zero-fill
+    /// standing in for a page that could not be read.
+    pub fn new(bytes: &PageBytes, poisoned: bool) -> Self {
+        let page = ClogPage {
+            bits: [const { AtomicU8::new(0) }; CLOG_PAGE_SIZE],
+            dirty: AtomicBool::new(false),
+            poisoned,
+        };
+        for (slot, byte) in page.bits.iter().zip(bytes) {
+            slot.store(*byte, Ordering::Relaxed);
+        }
+        page
+    }
+
+    /// Whether this page must never be written back.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// `xid`'s status.
+    ///
+    /// `Relaxed` is sufficient: a 2-bit slot is the entire payload, so nothing is
+    /// published through it. The page's *initial* contents are published by the
+    /// `OnceLock` [`crate::Clog`] installs it in and acquired by the load that finds
+    /// it there; per-slot updates after that need only coherence.
+    pub fn status(&self, xid: Xid) -> XactStatus {
+        let bits = self.bits[byte_in_page(xid)].load(Ordering::Relaxed) >> shift_in_byte(xid);
+        XactStatus::from_bits(bits & STATUS_MASK)
+    }
+
+    /// Stamp `xid`'s status, leaving the three XIDs sharing its byte alone.
+    ///
+    /// This is a masked read-modify-write and deliberately **not** a `fetch_or`.
+    /// `fetch_or` cannot clear a bit, and a slot genuinely does get overwritten
+    /// with a *different* terminal status: `Wal::log_commit` appends the commit
+    /// record and only then fsyncs, so on fsync failure `TransactionManager::commit`
+    /// aborts, appending an abort record after the commit one. Replay applies both,
+    /// and `Committed | Aborted` is the `SubCommitted` encoding — a status that is
+    /// neither committed nor aborted, which would make rows deleted by that XID
+    /// look permanently un-live. It is also the shape savepoints need in P6, where
+    /// `SubCommitted -> Committed` clears a bit on the ordinary path.
+    ///
+    /// The cost is irrelevant: this runs once per transaction, while
+    /// [`ClogPage::status`] runs once per tuple per scan.
+    pub fn set_status(&self, xid: Xid, status: XactStatus) {
+        let byte = &self.bits[byte_in_page(xid)];
+        let shift = shift_in_byte(xid);
+        let bits = status.to_bits() << shift;
+        let keep = !(STATUS_MASK << shift);
+        // Masked to this XID's own two bits, so concurrent stamps of the other
+        // three XIDs in the byte compose rather than clobber.
+        let _ = byte.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some((cur & keep) | bits)
+        });
+        self.mark_dirty();
+    }
+
+    /// Flag this page as needing a write-back.
+    ///
+    /// This must stay a read-modify-write, and every stamp must perform it. A
+    /// release *sequence* is continued only by same-thread modifications or by
+    /// RMWs from any thread, so if two writers used plain releasing stores the
+    /// flusher's acquiring [`ClogPage::claim_for_writeback`] would synchronise-with
+    /// only the later of them, and the earlier writer's bit would have no
+    /// happens-before with the image it takes. In particular, do **not** add the
+    /// tempting `if !dirty.load(Relaxed)` fast path: a writer that skips the RMW
+    /// contributes nothing to this flag's modification order and the hole reopens.
+    ///
+    /// It is not free, and it is the reason stamping does not scale the way reading
+    /// does: one flag per page means every transaction committing into the same
+    /// 32768-XID range contends for one cache line. On the contention bench,
+    /// removing this call raises eight-thread stamp throughput from ~13 to ~63
+    /// Mops/s. That is the right trade rather than a regression to fix: a stamp
+    /// happens once per *transaction*, behind [`crate::CommitSink::log_commit`]'s
+    /// fsync, so the achievable commit rate is orders of magnitude below even the
+    /// contended number, while [`ClogPage::status`] runs once per tuple per scan.
+    /// Sharding the flag within a page would trade correctness-critical simplicity
+    /// for throughput nothing needs.
+    pub fn mark_dirty(&self) {
+        self.dirty.fetch_or(true, Ordering::Release);
+    }
+
+    /// Whether this page holds stamps that have not reached disk.
+    ///
+    /// Does not claim the flag — [`ClogPage::claim_for_writeback`] is the claiming
+    /// form. This is for deciding whether a page the flusher *refuses* to write is
+    /// carrying anything, without clearing the flag that says so.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Claim this page for write-back: `Some(image)` if it was dirty, having
+    /// atomically cleared the flag first, or `None` if there was nothing to write.
+    ///
+    /// **The claim must come before the image, and this method exists so that the
+    /// two cannot be separated.** A stamp landing after the claim re-flags the page
+    /// and the next checkpoint writes it, so at worst it is written twice. Taking
+    /// the image *first* and clearing afterwards would instead drop any stamp in
+    /// that window into no file at all with the flag cleared — a permanently lost
+    /// commit. The window is only a few instructions wide, which makes it a bug no
+    /// timing test can be relied on to catch; keeping the order inside one
+    /// documented method is the guard instead.
+    ///
+    /// The image is not an atomic cut: it is 8192 individual loads, so a stamp
+    /// landing mid-scan may or may not appear in it. That is safe because each
+    /// 2-bit slot is independent — there is no cross-byte invariant — and because
+    /// any stamp it misses landed after the claim and has therefore re-flagged the
+    /// page.
+    pub fn claim_for_writeback(&self) -> Option<PageBytes> {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let mut bytes = ZERO_BYTES;
+        for (byte, slot) in bytes.iter_mut().zip(&self.bits) {
+            *byte = slot.load(Ordering::Relaxed);
+        }
+        Some(bytes)
+    }
+}
+
+impl std::fmt::Debug for ClogPage {
+    /// Hand-written: a derive would compile, but dumping 8192 atomics is useless
+    /// output and 8192 atomic loads to produce it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClogPage")
+            .field("dirty", &self.dirty.load(Ordering::Relaxed))
+            .field("poisoned", &self.poisoned)
+            .finish_non_exhaustive()
+    }
 }
 
 /// `<dir>/<16 hex digits>`. The full u64 segment number is zero-padded so
@@ -104,8 +261,8 @@ pub fn segment_path(dir: &Path, segno: u64) -> PathBuf {
 /// read past EOF is the normal case: segments are written sparsely, so a page
 /// that was never stamped simply is not there yet, and zero-fill is the correct
 /// answer rather than an error.
-pub fn read_page(dir: &Path, pageno: u64) -> std::io::Result<ClogPage> {
-    let mut page = ZERO_PAGE;
+pub fn read_page(dir: &Path, pageno: u64) -> std::io::Result<PageBytes> {
+    let mut page = ZERO_BYTES;
     let path = segment_path(dir, segment_of_page(pageno));
     let mut file = match File::open(&path) {
         Ok(file) => file,
@@ -135,7 +292,7 @@ pub fn read_page(dir: &Path, pageno: u64) -> std::io::Result<ClogPage> {
 /// and holes read back as zeros — which is exactly [`XactStatus::InProgress`].
 /// So a cluster that has only ever committed a high XID gets a segment with one
 /// real page in it, not a fully materialised 256 KiB file.
-pub fn write_page(dir: &Path, pageno: u64, page: &ClogPage) -> std::io::Result<()> {
+pub fn write_page(dir: &Path, pageno: u64, page: &PageBytes) -> std::io::Result<()> {
     let path = segment_path(dir, segment_of_page(pageno));
     // truncate(false): the segment's other pages must survive.
     let mut file = OpenOptions::new()
@@ -318,7 +475,7 @@ mod tests {
 
     #[test]
     fn neighbours_in_one_byte_do_not_disturb_each_other() {
-        let mut page = ZERO_PAGE;
+        let mut page = ZERO_BYTES;
         // Four XIDs sharing byte 0, each with a different status.
         set_page_status(&mut page, Xid(0), XactStatus::Committed);
         set_page_status(&mut page, Xid(1), XactStatus::Aborted);
@@ -337,9 +494,60 @@ mod tests {
     }
 
     #[test]
+    fn a_resident_page_encodes_exactly_like_the_bytes_it_will_be_written_as() {
+        // Two representations of one layout, so they have to agree. Anything that
+        // changed the atomic page's addressing without changing the byte array's
+        // would write files this build could not read back.
+        let page = ClogPage::new(&ZERO_BYTES, false);
+        let mut bytes = ZERO_BYTES;
+        for (xid, status) in [
+            (Xid(0), XactStatus::Committed),
+            (Xid(3), XactStatus::Aborted),
+            (Xid(9), XactStatus::SubCommitted),
+            (Xid(XACTS_PER_PAGE - 1), XactStatus::Committed),
+        ] {
+            page.set_status(xid, status);
+            set_page_status(&mut bytes, xid, status);
+            assert_eq!(page.status(xid), status, "{xid:?}");
+        }
+        assert_eq!(
+            page.claim_for_writeback(),
+            Some(bytes),
+            "the resident page and the byte array must encode identically"
+        );
+    }
+
+    #[test]
+    fn claiming_a_page_for_writeback_clears_it_and_a_later_stamp_reflags_it() {
+        // The write-back protocol. A checkpoint claims the flag and takes the image
+        // in one step; a stamp arriving afterwards must leave the page flagged, so
+        // the *next* checkpoint publishes it. If it did not, that stamp would be in
+        // RAM only, on a page nothing would ever write again.
+        let page = ClogPage::new(&ZERO_BYTES, false);
+        assert!(page.claim_for_writeback().is_none(), "nothing stamped yet");
+
+        page.set_status(Xid(3), XactStatus::Committed);
+        assert!(page.is_dirty());
+        let image = page.claim_for_writeback().expect("dirty");
+        assert_eq!(page_status(&image, Xid(3)), XactStatus::Committed);
+        assert!(!page.is_dirty(), "the claim clears the flag");
+        assert!(
+            page.claim_for_writeback().is_none(),
+            "a second claim has nothing to write"
+        );
+
+        // A stamp after the claim re-flags the page.
+        page.set_status(Xid(4), XactStatus::Aborted);
+        assert!(page.is_dirty(), "a post-claim stamp must re-flag the page");
+        let image = page.claim_for_writeback().expect("dirty again");
+        assert_eq!(page_status(&image, Xid(3)), XactStatus::Committed);
+        assert_eq!(page_status(&image, Xid(4)), XactStatus::Aborted);
+    }
+
+    #[test]
     fn a_page_survives_a_write_read_roundtrip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut page = ZERO_PAGE;
+        let mut page = ZERO_BYTES;
         set_page_status(&mut page, Xid(7), XactStatus::Committed);
         write_page(dir.path(), 0, &page)?;
         assert_eq!(
@@ -353,18 +561,18 @@ mod tests {
     fn absent_and_sparse_pages_read_as_in_progress() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         // No segment at all.
-        assert_eq!(read_page(dir.path(), 0)?, ZERO_PAGE);
+        assert_eq!(read_page(dir.path(), 0)?, ZERO_BYTES);
 
         // Write only the last page of segment 0, leaving a hole beneath it. The
         // short read past EOF that `read_exact` would reject is the normal case.
         let last = PAGES_PER_SEGMENT - 1;
-        let mut page = ZERO_PAGE;
+        let mut page = ZERO_BYTES;
         set_page_status(&mut page, Xid(1), XactStatus::Committed);
         write_page(dir.path(), last, &page)?;
-        assert_eq!(read_page(dir.path(), 0)?, ZERO_PAGE);
+        assert_eq!(read_page(dir.path(), 0)?, ZERO_BYTES);
         assert_eq!(read_page(dir.path(), last)?, page);
         // A page beyond everything written is still just zeros.
-        assert_eq!(read_page(dir.path(), last + 1)?, ZERO_PAGE);
+        assert_eq!(read_page(dir.path(), last + 1)?, ZERO_BYTES);
         Ok(())
     }
 
@@ -373,7 +581,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let xid = Xid(XACTS_PER_SEGMENT + 5);
         let pageno = page_of(xid);
-        let mut page = ZERO_PAGE;
+        let mut page = ZERO_BYTES;
         set_page_status(&mut page, xid, XactStatus::Aborted);
         write_page(dir.path(), pageno, &page)?;
 
