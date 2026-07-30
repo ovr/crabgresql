@@ -106,7 +106,11 @@ Contract with the core:
   each record through its rmgr's LSN-gated redo handler.
   A checkpoint samples a redo point, flushes pages and the commit log, and records
   the redo point in `pg_control` (and in a `CHECKPOINT` record); recovery resumes
-  there rather than at the head of the stream. A checkpoint declines to bound
+  there rather than at the head of the stream. Its fsync pass covers every relation
+  *written* since the last checkpoint, not the ones it happened to find dirty: the
+  buffer pool also writes pages back at eviction, and an evicted frame no longer
+  says what it held, so the storage manager keeps the pending-fsync queue (as
+  PostgreSQL's `md.c` does). A checkpoint declines to bound
   replay while any state's only durable trace is still a WAL record — rows in a RAM
   write buffer, or a committed TRUNCATE whose swap the catalog does not name yet —
   and records a whole-stream redo point instead.

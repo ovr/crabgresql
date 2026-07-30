@@ -37,7 +37,7 @@ mod tuple;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_buffer_engine::{BufferRedo, BufferTable, RMGR_BUFFER};
@@ -113,6 +113,21 @@ pub(crate) struct EngineInner {
     /// TRUNCATE swaps replayed from the WAL during recovery, applied after the
     /// CLOG is rebuilt (see [`PgEngine::apply_recovered_truncates`]).
     pub recovered_truncates: Mutex<Vec<RecoveredTruncate>>,
+}
+
+/// Why a checkpoint may not bound crash recovery. Each variant names state whose
+/// only durable trace is a WAL record below the redo point a checkpoint would
+/// otherwise publish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedoClamp {
+    /// No commit log to make durable, so no transaction's fate could be recovered.
+    /// Only an engine built by hand in a test reaches this.
+    NoCommitLog,
+    /// A TRUNCATE whose relfilenode swap the durable catalog does not name yet.
+    UnreconciledTruncate,
+    /// Rows in a RAM write buffer, which exist nowhere else until a flush writes
+    /// them into a fsynced fragment.
+    BufferedRows,
 }
 
 /// Exposes the relation catalog's relfilenode counter to an out-of-crate access
@@ -315,6 +330,9 @@ pub struct PgEngine {
     /// Absent for an engine built by hand in a test, which never checkpoints a
     /// commit log it does not have.
     clog: std::sync::OnceLock<Arc<Clog>>,
+    /// Whether the last checkpoint had to record a whole-stream redo point, so the
+    /// operator hears about the transition rather than every checkpoint.
+    clamped: AtomicBool,
     /// The background flush thread, present once a transaction manager is
     /// attached. Tests that build an engine by hand never attach one, so they get
     /// no thread and stay deterministic.
@@ -452,6 +470,7 @@ impl PgEngine {
             flush_worker: Mutex::new(None),
             tables: RwLock::new(tables),
             last_next_xid: AtomicU64::new(0),
+            clamped: AtomicBool::new(false),
         })
     }
 
@@ -689,15 +708,14 @@ impl PgEngine {
         self.write_control_file(next_xid, CHECKPOINT_ONLINE, false)
     }
 
-    /// The lowest LSN the published redo point may take, or `None` when nothing
-    /// constrains it.
+    /// Why this checkpoint may not bound crash recovery, or `None` if it may.
     ///
-    /// Every contributor here is state whose only durable trace is a WAL record, so
-    /// a redo point above it would skip the very record that rebuilds it. Each one
-    /// currently clamps all the way to [`Lsn::INVALID`] — replay the whole stream —
-    /// rather than to the record's own LSN: tracking a real per-item LSN is the
-    /// refinement (`docs/ARCHITECTURE.md`, the per-buffer min/max LSN paragraph),
-    /// and it is a change to this function's body and nothing else.
+    /// Every reason here is state whose only durable trace is a WAL record, so a
+    /// redo point above it would skip the very record that rebuilds it. Each one
+    /// currently costs a whole-stream replay rather than a clamp to the record's
+    /// own LSN: tracking a real per-item LSN is the refinement
+    /// (`docs/ARCHITECTURE.md`, the per-buffer min/max LSN paragraph), and it is a
+    /// change to this function's body and nothing else.
     ///
     /// Must be called only *after* [`Wal::redo_point`] has returned. It takes the
     /// table map, and a checkpointer holding the WAL's delay barrier while reaching
@@ -705,12 +723,12 @@ impl PgEngine {
     /// The ordering is also what makes the buffer check sound: a `BUFFER_INSERT`
     /// below the sample necessarily had its rows installed and counted before the
     /// sample was taken, because its writer held the barrier across both.
-    fn redo_floor(&self) -> Option<Lsn> {
+    fn redo_clamp(&self) -> Option<RedoClamp> {
         // No commit log to make durable means no way to record any transaction's
         // fate, so a bounded replay would come back with every one of them
         // `InProgress`. Only an engine built by hand in a test gets here.
         if self.clog.get().is_none() {
-            return Some(Lsn::INVALID);
+            return Some(RedoClamp::NoCommitLog);
         }
         for table in self
             .tables
@@ -722,16 +740,25 @@ impl PgEngine {
             // them into a fsynced Parquet fragment: `restore_buffers` rebuilds them
             // from replay alone. A Parquet relation's staged TRUNCATE is the same
             // story as the heap's, tracked on the table rather than in the engine.
-            let pinned = match table.as_ref() {
+            let reason = match table.as_ref() {
                 ManagedTable::Parquet(parquet) => {
-                    parquet.chunks().truncate_unreconciled()
-                        || parquet.buffer().resident_bytes() > 0
+                    if parquet.chunks().truncate_unreconciled() {
+                        Some(RedoClamp::UnreconciledTruncate)
+                    } else if parquet.buffer().resident_bytes() > 0 {
+                        Some(RedoClamp::BufferedRows)
+                    } else {
+                        None
+                    }
                 }
-                ManagedTable::Buffer(buffer) => buffer.resident_bytes() > 0,
-                ManagedTable::Heap(heap) => heap.truncate_unreconciled(),
+                ManagedTable::Buffer(buffer) => {
+                    (buffer.resident_bytes() > 0).then_some(RedoClamp::BufferedRows)
+                }
+                ManagedTable::Heap(heap) => heap
+                    .truncate_unreconciled()
+                    .then_some(RedoClamp::UnreconciledTruncate),
             };
-            if pinned {
-                return Some(Lsn::INVALID);
+            if let Some(reason) = reason {
+                return Some(reason);
             }
         }
         None
@@ -782,18 +809,26 @@ impl PgEngine {
             .wal
             .redo_point()
             .map_err(std::io::Error::other)?;
-        let redo = match self.redo_floor() {
-            Some(floor) => sampled.min(floor),
+        // Said out loud on purpose: a silently clamped redo point looks exactly
+        // like a working bounded replay from the outside, and the cost — every
+        // restart re-reading the whole stream — only shows up as slow startups.
+        // Logged on the transitions rather than every time, because a cluster with
+        // a resident buffer table clamps at every single checkpoint and a line per
+        // checkpoint would be noise nobody reads.
+        let clamp = self.redo_clamp();
+        let redo = match clamp {
+            Some(_) => Lsn::INVALID,
             None => sampled,
         };
-        if redo != sampled {
-            // Said out loud on purpose: a silently clamped redo point looks exactly
-            // like a working bounded replay from the outside, and the cost — every
-            // restart re-reading the whole stream — only shows up as slow startups.
-            tracing::debug!(
+        match (clamp, self.clamped.swap(clamp.is_some(), Ordering::Relaxed)) {
+            (Some(reason), false) => tracing::warn!(
                 %sampled,
-                "checkpoint cannot bound replay yet; recording a whole-stream redo point"
-            );
+                ?reason,
+                "checkpoint cannot bound crash recovery; recording a whole-stream \
+                 redo point, so every restart will replay the entire WAL"
+            ),
+            (None, true) => tracing::info!("checkpoint can bound crash recovery again"),
+            _ => {}
         }
         self.inner.bufpool.flush_all()?;
         // Make the commit log durable before the control file advertises this
@@ -1819,9 +1854,9 @@ mod tests {
     use crabgresql_storage_api::{Column, TableEngine, TableSchema};
     use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnFinalize, Xid};
     use crabgresql_types::{PgType, Value};
-    use crabgresql_wal::{Lsn, Wal, read_control};
+    use crabgresql_wal::{Wal, read_control};
 
-    use crate::PgEngine;
+    use crate::{PgEngine, RedoClamp};
 
     /// One test covering three things that must agree: the control file carries a
     /// real redo point, that LSN names a record boundary, and the record there is
@@ -1917,8 +1952,8 @@ mod tests {
         tm.commit(xid)?;
 
         assert_eq!(
-            engine.redo_floor(),
-            Some(Lsn::INVALID),
+            engine.redo_clamp(),
+            Some(RedoClamp::UnreconciledTruncate),
             "a staged TRUNCATE must pin replay"
         );
 
@@ -1936,8 +1971,8 @@ mod tests {
             heap.relfilenode()
         };
         assert_eq!(
-            engine.redo_floor(),
-            Some(Lsn::INVALID),
+            engine.redo_clamp(),
+            Some(RedoClamp::UnreconciledTruncate),
             "the swap is still only in memory: replay must stay unbounded"
         );
 
@@ -1954,7 +1989,7 @@ mod tests {
             heap.truncate_reconciled();
         }
         assert_eq!(
-            engine.redo_floor(),
+            engine.redo_clamp(),
             None,
             "once the catalog names the swap, replay may be bounded again"
         );
@@ -1977,7 +2012,7 @@ mod tests {
         let xid = tm.allocate_xid();
         unlogged.truncate(&tm.context(xid, CommandId::FIRST))?;
         assert_eq!(
-            engine.redo_floor(),
+            engine.redo_clamp(),
             None,
             "an unlogged TRUNCATE has no record to replay, so it must not clamp"
         );
@@ -1985,7 +2020,10 @@ mod tests {
         // The positive control: a logged one does clamp, so the assertion above
         // cannot be passing merely because the clamp is broken outright.
         logged.truncate(&tm.context(xid, CommandId::FIRST))?;
-        assert_eq!(engine.redo_floor(), Some(Lsn::INVALID));
+        assert_eq!(
+            engine.redo_clamp(),
+            Some(RedoClamp::UnreconciledTruncate)
+        );
 
         Ok(())
     }
@@ -2004,7 +2042,10 @@ mod tests {
         let xid = tm.allocate_xid();
         a.truncate(&tm.context(xid, CommandId::FIRST))?;
         b.truncate(&tm.context(xid, CommandId::FIRST))?;
-        assert_eq!(engine.redo_floor(), Some(Lsn::INVALID));
+        assert_eq!(
+            engine.redo_clamp(),
+            Some(RedoClamp::UnreconciledTruncate)
+        );
 
         // Reconciling one of them must not lift the clamp for the other.
         let tables = engine
@@ -2018,8 +2059,8 @@ mod tests {
         heap_a.truncate_reconciled();
         drop(tables);
         assert_eq!(
-            engine.redo_floor(),
-            Some(Lsn::INVALID),
+            engine.redo_clamp(),
+            Some(RedoClamp::UnreconciledTruncate),
             "b is still unreconciled, so replay must stay unbounded"
         );
 

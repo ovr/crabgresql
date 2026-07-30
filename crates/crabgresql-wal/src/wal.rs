@@ -81,7 +81,15 @@ pub struct Wal {
 /// * a transaction commit or abort, where the record is appended and only then is
 ///   the CLOG bit that decides its fate set (see [`CommitSink::delay_checkpoint`]);
 /// * a buffer-table install, where the record is appended and only then are the
-///   rows — whose sole durable trace it is — installed and counted.
+///   rows — whose sole durable trace it is — installed and counted;
+/// * a heap or Parquet TRUNCATE staging its swap, where the record is appended and
+///   only then does the relation start reporting that replay must reach it.
+///
+/// Note what is *not* on the list: the heap `INSERT`/`DELETE` path, and page
+/// write-back generally. Those are covered by the frame lock instead — the record
+/// and the page stamp happen inside one `modify` closure — and by the storage
+/// manager's pending-fsync queue, which remembers a page write the checkpoint
+/// itself did not make.
 ///
 /// The guard is **non-reentrant**: a thread holding one must not call
 /// [`Wal::redo_point`], which would wait for itself. A checkpointer must also
