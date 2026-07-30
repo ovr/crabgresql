@@ -508,6 +508,47 @@ fn parquet_table_dir(dir: &std::path::Path) -> std::path::PathBuf {
         .expect("the parquet table directory exists")
 }
 
+/// The layout sort key is catalog state, so it has to come back on the next
+/// boot — nothing recomputes it, and a relation that silently reopened with no
+/// order would claim one in `CREATE TABLE` and lose it on restart.
+#[test]
+fn a_sort_key_survives_a_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let key = vec![
+        crabgresql_storage_api::IndexKey {
+            column: 1,
+            descending: false,
+            nulls_first: false,
+        },
+        crabgresql_storage_api::IndexKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        },
+    ];
+    {
+        let (engine, _tm) = open(dir.path())?;
+        let mut schema = TableSchema::new(
+            "events",
+            vec![Column::new("id", PgType::Int4), Column::new("n", PgType::Int4)],
+        );
+        schema.access_method = crabgresql_storage_api::TableAccessMethod::Parquet;
+        schema.sort_key = key.clone();
+        engine.create_table(schema)?;
+        // A heap neighbour, so a decoder that zipped the tail onto the wrong
+        // relation would be caught rather than reading its own key back.
+        engine.create_table(TableSchema::new(
+            "plain",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+    }
+
+    let (engine, _tm) = open(dir.path())?;
+    assert_eq!(engine.open_table("events")?.schema().sort_key, key);
+    assert!(engine.open_table("plain")?.schema().sort_key.is_empty());
+    Ok(())
+}
+
 #[test]
 fn an_unopenable_parquet_relation_does_not_block_startup() -> anyhow::Result<()> {
     // A Parquet relation whose directory the engine cannot make sense of must

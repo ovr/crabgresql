@@ -473,6 +473,7 @@ mod tests {
         name: "multi",
         description: "",
         tables: &["region", "nation"],
+        sort_keys: &["id", "id"],
         schema_sql: "CREATE TABLE region (id INT);\nCREATE TABLE nation (id INT);\n",
         queries_sql: "-- Q1\nselect 1;\n",
         queries_format: QueryFormat::Numbered,

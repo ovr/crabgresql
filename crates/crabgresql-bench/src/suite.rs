@@ -13,6 +13,15 @@ pub struct Suite {
     /// `CREATE TABLE` DDL, one statement per table in `tables` and in the same
     /// order.
     pub schema_sql: &'static str,
+    /// The layout sort key each table gets under an engine-managed access
+    /// method, one entry per `tables` entry in the same order.
+    ///
+    /// It lives here rather than in `schema_sql` for two reasons. The DDL files
+    /// are the upstream benchmarks' own text and are worth keeping byte-identical
+    /// — see the splice guards in [`Suite::schema_statements`]. And the clause
+    /// has to follow `USING <am>`, which is spliced on at the end, so it could
+    /// not sit in the file even if we were willing to edit it.
+    pub sort_keys: &'static [&'static str],
     /// The queries, transcribed from the upstream benchmark, laid out as
     /// `queries_format` says.
     pub queries_sql: &'static str,
@@ -112,9 +121,18 @@ impl Suite {
                 statements.len(),
             );
         }
+        if self.sort_keys.len() != self.tables.len() {
+            bail!(
+                "{} declares {} tables but {} sort keys",
+                self.name,
+                self.tables.len(),
+                self.sort_keys.len(),
+            );
+        }
 
         let mut out = Vec::with_capacity(statements.len());
-        for (statement, table) in statements.iter().zip(self.tables) {
+        for ((statement, table), sort_key) in statements.iter().zip(self.tables).zip(self.sort_keys)
+        {
             // A leading comment is fine — it cannot swallow a clause appended
             // at the end — so look past it before matching.
             let body = strip_leading_comments(statement);
@@ -147,7 +165,11 @@ impl Suite {
                             self.name,
                         );
                     }
-                    out.push(format!("{statement} USING {am};"));
+                    // An engine-managed method refuses a table with no declared
+                    // order, and neither benchmark's upstream DDL has a PRIMARY
+                    // KEY to default from — so the key is spliced too, after the
+                    // access method, which is the order the parser expects.
+                    out.push(format!("{statement} USING {am} ORDER BY ({sort_key});"));
                 }
             }
         }
@@ -313,6 +335,7 @@ mod tests {
         name: "t",
         description: "",
         tables: &["hits"],
+        sort_keys: &["id"],
         schema_sql: "CREATE TABLE hits (id BIGINT);\n",
         queries_sql: "SELECT 1;\n\n-- comment\nSELECT 2;\n",
         queries_format: QueryFormat::OnePerLine,
@@ -337,13 +360,17 @@ mod tests {
 
     #[test]
     fn schema_splices_the_access_method_before_the_semicolon() -> Result<()> {
+        // A heap run carries no `ORDER BY` at all: heap rejects the clause.
         assert_eq!(
             SUITE.schema_statements(None)?,
             ["CREATE TABLE hits (id BIGINT);"]
         );
+        // The key follows the access method, because that is the only order the
+        // parser accepts — `USING` is read as a storage format before the
+        // `ORDER BY` clause is looked for.
         assert_eq!(
             SUITE.schema_statements(Some("parquet"))?,
-            ["CREATE TABLE hits (id BIGINT) USING parquet;"]
+            ["CREATE TABLE hits (id BIGINT) USING parquet ORDER BY (id);"]
         );
         Ok(())
     }
@@ -352,13 +379,32 @@ mod tests {
     fn schema_splices_every_statement_of_a_multi_table_suite() -> Result<()> {
         let suite = Suite {
             tables: &["a", "b"],
+            sort_keys: &["id", "id"],
             schema_sql: "CREATE TABLE a (id INT);\nCREATE TABLE b (id INT);\n",
             ..SUITE
         };
         let statements = suite.schema_statements(Some("parquet"))?;
         assert_eq!(statements.len(), 2);
-        assert!(statements.iter().all(|s| s.ends_with("USING parquet;")));
+        assert!(
+            statements
+                .iter()
+                .all(|s| s.ends_with("USING parquet ORDER BY (id);"))
+        );
         Ok(())
+    }
+
+    #[test]
+    fn schema_refuses_a_suite_whose_sort_keys_do_not_cover_its_tables() {
+        // Zipping would otherwise drop the uncovered table silently, and the run
+        // would benchmark fewer tables than the suite declares.
+        let short = Suite {
+            tables: &["a", "b"],
+            sort_keys: &["id"],
+            schema_sql: "CREATE TABLE a (id INT);\nCREATE TABLE b (id INT);\n",
+            ..SUITE
+        };
+        assert!(short.schema_statements(Some("parquet")).is_err());
+        assert!(short.schema_statements(None).is_err());
     }
 
     #[test]
@@ -377,7 +423,9 @@ mod tests {
         // it would reject an upstream file that merely carries an attribution
         // header.
         let headed = with_schema("-- upstream header\nCREATE TABLE hits (id BIGINT);\n");
-        assert!(headed.schema_statements(Some("parquet"))?[0].ends_with("USING parquet;"));
+        assert!(
+            headed.schema_statements(Some("parquet"))?[0].ends_with("USING parquet ORDER BY (id);")
+        );
         Ok(())
     }
 

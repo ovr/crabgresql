@@ -80,6 +80,13 @@ const STAT_MAGIC: &[u8; 4] = b"STA1";
 /// tail predates pluggable durable table storage and therefore decodes every
 /// relation as heap.
 const TAM_MAGIC: &[u8; 4] = b"TAM1";
+/// Marks the sort-key section, appended after the [`TAM_MAGIC`] block — an
+/// eleventh backward-compatible tail carrying each relation's layout sort key
+/// (the columns an engine-managed access method stores rows in order of). A
+/// reader that predates it stops above and decodes every relation with an empty
+/// key, which is what every relation written before this tail actually had:
+/// nothing recorded an order.
+const SORT_MAGIC: &[u8; 4] = b"SRT1";
 
 struct PersistCol {
     name: String,
@@ -118,6 +125,9 @@ struct PersistRel {
     partition_scheme: Option<PartitionScheme>,
     /// `Some` on a leaf partition: its parent and bound.
     partition_of: Option<PartitionOf>,
+    /// The relation's layout sort key, persisted in the [`SORT_MAGIC`] tail.
+    /// Empty for a heap relation and for one written before that tail existed.
+    sort_key: Vec<IndexKey>,
     /// What `ANALYZE` last measured, persisted in the [`STAT_MAGIC`] tail.
     /// `None` means never analyzed.
     stats: Option<PersistStats>,
@@ -239,6 +249,7 @@ impl RelCatalog {
                         access_method: r.access_method,
                         partition_scheme: r.partition_scheme.clone(),
                         partition_of: r.partition_of.clone(),
+                        sort_key: r.sort_key.clone(),
                     },
                     r.indexes
                         .iter()
@@ -290,6 +301,7 @@ impl RelCatalog {
             access_method: schema.access_method,
             partition_scheme: schema.partition_scheme.clone(),
             partition_of: schema.partition_of.clone(),
+            sort_key: schema.sort_key.clone(),
             // A brand-new relation has never been analyzed.
             stats: None,
         });
@@ -1110,6 +1122,19 @@ fn encode(state: &State) -> Vec<u8> {
             TableAccessMethod::Buffer => 2,
         });
     }
+    // Layout sort key: an eleventh backward-compatible tail, in the same
+    // `(column, descending, nulls_first)` shape the index keys above use.
+    // Older catalogs omitted it because no relation declared an order.
+    out.extend_from_slice(SORT_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        out.extend_from_slice(&(r.sort_key.len() as u32).to_le_bytes());
+        for key in &r.sort_key {
+            out.extend_from_slice(&(key.column as u32).to_le_bytes());
+            out.push(u8::from(key.descending));
+            out.push(u8::from(key.nulls_first));
+        }
+    }
     out
 }
 
@@ -1237,6 +1262,8 @@ fn decode(bytes: &[u8]) -> State {
             // Default to unpartitioned; overridden below from the PART1 tail.
             partition_scheme: None,
             partition_of: None,
+            // Default to no declared order; overridden below from the SRT1 tail.
+            sort_key: Vec::new(),
             // Default to never analyzed; overridden below from the STA1 tail.
             stats: None,
         });
@@ -1516,6 +1543,23 @@ fn decode(bytes: &[u8]) -> State {
             };
         }
     }
+    // Sort-key tail: absent means no relation declared an order, which is both
+    // the legacy state and the state of every heap relation.
+    if d.remaining().starts_with(SORT_MAGIC) {
+        d.p += SORT_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            let nkeys = d.u32();
+            r.sort_key = Vec::with_capacity(nkeys as usize);
+            for _ in 0..nkeys {
+                r.sort_key.push(IndexKey {
+                    column: d.u32() as usize,
+                    descending: d.byte() != 0,
+                    nulls_first: d.byte() != 0,
+                });
+            }
+        }
+    }
     State {
         next,
         rels,
@@ -1679,6 +1723,72 @@ mod tests {
                 schema.access_method,
                 TableAccessMethod::Heap,
                 "a catalog written before the tail existed must decode as heap ({name})"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sort_key_round_trips_and_legacy_catalog_defaults_to_no_order() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        let mut schema = TableSchema::new(
+            "events",
+            vec![
+                Column::new("id", PgType::Int4),
+                Column::new("at", PgType::Timestamp),
+            ],
+        );
+        schema.access_method = TableAccessMethod::Parquet;
+        // Deliberately not column order and not all-default flags: a codec that
+        // dropped a field or resorted the key would still pass on `[{0, …}]`.
+        schema.sort_key = vec![
+            IndexKey {
+                column: 1,
+                descending: true,
+                nulls_first: true,
+            },
+            IndexKey {
+                column: 0,
+                descending: false,
+                nulls_first: false,
+            },
+        ];
+        catalog.create(&schema)?;
+        catalog.create(&TableSchema::new(
+            "plain",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        drop(catalog);
+
+        let loaded = RelCatalog::load(dir.path())?;
+        let key = |name: &str| {
+            loaded
+                .schemas()
+                .into_iter()
+                .find(|(rel_name, _, _, _)| rel_name == name)
+                .map(|(_, _, schema, _)| schema.sort_key)
+        };
+        assert_eq!(key("events"), Some(schema.sort_key.clone()));
+        // A heap relation declares no order, and the tail must not borrow its
+        // neighbour's key when zipping by position.
+        assert_eq!(key("plain"), Some(Vec::new()));
+        drop(loaded);
+
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(SORT_MAGIC.len())
+            .position(|window| window == SORT_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("sort key marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        let schemas = legacy.schemas();
+        assert!(!schemas.is_empty(), "legacy catalog is empty");
+        for (name, _, schema, _) in schemas {
+            assert!(
+                schema.sort_key.is_empty(),
+                "a catalog written before the tail existed must decode with no order ({name})"
             );
         }
         Ok(())

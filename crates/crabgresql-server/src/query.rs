@@ -2457,6 +2457,14 @@ fn execute_create_table(
             "CREATE TABLE ... INHERITS is not supported yet",
         ));
     }
+    // Redshift's `SORTKEY (...)` parses ungated, and is a second spelling of the
+    // layout order `ORDER BY` now owns. Accepting it silently would let a table
+    // claim an order nothing recorded; `ORDER BY` is the spelling we implement.
+    if create.sortkey.is_some() {
+        return Err(PgError::feature_not_supported(
+            "CREATE TABLE ... SORTKEY is not supported; use ORDER BY (columns)",
+        ));
+    }
     // Declarative partitioning (initial slice: RANGE, DDL + catalog reflection).
     // A partitioned parent or a leaf partition may not be a memory table (TEMP or
     // UNLOGGED) in this slice: leaf partitions are always created Permanent, so a
@@ -2713,6 +2721,8 @@ fn execute_create_table(
         access_method,
         partition_scheme,
         partition_of: None,
+        // Resolved below, once the PRIMARY KEY's columns are known.
+        sort_key: Vec::new(),
     };
     let mut indexes = Vec::new();
     for p in pending {
@@ -2760,6 +2770,14 @@ fn execute_create_table(
             }
         }
     }
+    schema.sort_key = build_sort_key(
+        create.order_by.as_ref(),
+        access_method,
+        &schema,
+        indexes
+            .iter()
+            .find(|index| index.constraint == Some(IndexConstraint::PrimaryKey)),
+    )?;
     // Create the serial columns' owned sequences before the table. Names were
     // chosen unique above, so a failure here is unexpected; clean up on it.
     for def in &serial_defs {
@@ -2883,6 +2901,108 @@ fn build_partition_scheme(
         strategy: PartitionStrategy::Range,
         key_columns: vec![idx],
     })
+}
+
+/// Resolve a relation's layout sort key: the order an engine-managed access
+/// method stores its rows in.
+///
+/// PostgreSQL has no such clause, so the rule is ClickHouse MergeTree's — an
+/// explicit `ORDER BY (...)` wins, a `PRIMARY KEY` supplies the default, and a
+/// table declaring neither is refused. Refusing is the point: an unordered
+/// column store gives up range pruning, compression locality, and
+/// merge-friendly compaction, and handing one back silently would hide all
+/// three. Nor is it ever forced — every type these methods accept
+/// (`crabgresql_parquet_engine::supports_type`) is btree-orderable, so a table
+/// can always name a key.
+///
+/// A heap relation has no layout order to declare, so `ORDER BY` on one is an
+/// error rather than a clause quietly dropped.
+fn build_sort_key(
+    order_by: Option<&ast::OneOrManyWithParens<ast::Expr>>,
+    access_method: TableAccessMethod,
+    schema: &TableSchema,
+    primary_key: Option<&IndexMetadata>,
+) -> Result<Vec<IndexKey>, PgError> {
+    if !access_method.is_engine_managed() {
+        return match order_by {
+            Some(_) => Err(PgError::feature_not_supported(format!(
+                "table access method \"{}\" does not support ORDER BY",
+                access_method.as_str(),
+            ))),
+            None => Ok(Vec::new()),
+        };
+    }
+    let Some(order_by) = order_by else {
+        // The PRIMARY KEY's `IndexKey`s were already resolved and validated by
+        // the index-building loop, so the default costs no second resolution.
+        return match primary_key {
+            Some(pk) => Ok(pk.keys.clone()),
+            None => Err(PgError::new(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                format!(
+                    "table access method \"{}\" requires ORDER BY or PRIMARY KEY",
+                    access_method.as_str(),
+                ),
+            )
+            .with_hint("Add ORDER BY (columns) or a PRIMARY KEY to the CREATE TABLE.")),
+        };
+    };
+    let exprs: &[ast::Expr] = match order_by {
+        ast::OneOrManyWithParens::One(expr) => std::slice::from_ref(expr),
+        ast::OneOrManyWithParens::Many(exprs) => exprs,
+    };
+    // `ORDER BY ()` parses to an empty list — ClickHouse's `ORDER BY tuple()`,
+    // its opt-out from the same rule. We have no opt-out, and saying so here is
+    // clearer than reusing the "you declared nothing" message: the user did
+    // declare something, it was just empty.
+    if exprs.is_empty() {
+        return Err(PgError::new(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "ORDER BY must name at least one column",
+        ));
+    }
+    let mut keys: Vec<IndexKey> = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let ast::Expr::Identifier(ident) = expr else {
+            return Err(PgError::feature_not_supported(
+                "only simple column references are supported in ORDER BY",
+            ));
+        };
+        let name = normalize_ident(ident);
+        let column = schema.column_index(&name).ok_or_else(|| {
+            PgError::new(
+                sqlstate::UNDEFINED_COLUMN,
+                format!("column \"{name}\" named in sort key does not exist"),
+            )
+        })?;
+        // Storing rows in order means comparing them, so a sort-key column obeys
+        // the same btree-orderability rule an index key does.
+        let ty = schema.columns[column].ty;
+        if !ty.has_default_btree_opclass() {
+            return Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!(
+                    "data type {} has no default operator class for access method \"btree\"",
+                    ty.name()
+                ),
+            ));
+        }
+        if keys.iter().any(|key| key.column == column) {
+            return Err(PgError::new(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                format!("sort key column \"{name}\" appears more than once"),
+            ));
+        }
+        // The clause parses its elements as bare expressions, so `a DESC` does
+        // not parse and there is no direction or NULL ordering to carry yet.
+        // Ascending / NULLS LAST is PG's default for an unqualified key.
+        keys.push(IndexKey {
+            column,
+            descending: false,
+            nulls_first: false,
+        });
+    }
+    Ok(keys)
 }
 
 /// A single-dimension RANGE endpoint, ordered `NegInf < Finite(v) < PosInf`.
@@ -3110,6 +3230,8 @@ fn execute_create_partition(
                 to: vec![to_datum],
             },
         }),
+        // A leaf partition is always a heap, which declares no layout order.
+        sort_key: Vec::new(),
     };
     match engine.create_table(schema) {
         Ok(_) => Ok(QueryResult::command("CREATE TABLE")),
@@ -3244,7 +3366,12 @@ fn execute_create_table_as(
         access_method,
         partition_scheme: None,
         partition_of: None,
+        sort_key: Vec::new(),
     };
+    // CTAS declares no constraints (the guard above rejects them), so there is
+    // no PRIMARY KEY to fall back on: an engine-managed CTAS must spell its key.
+    let mut schema = schema;
+    schema.sort_key = build_sort_key(create.order_by.as_ref(), access_method, &schema, None)?;
 
     // Create the table first so a name collision short-circuits before the query
     // runs. IF NOT EXISTS on an existing relation runs nothing (PG NOTICE).

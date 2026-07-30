@@ -1095,6 +1095,13 @@ impl TableEngine for PgEngine {
                 )));
             }
             validate_schema(&schema)?;
+        } else if !schema.sort_key.is_empty() {
+            // Only an engine-managed method has a layout to order. A key on a
+            // heap relation would be recorded and never honored by anything.
+            return Err(StorageError::UnsupportedOperation(format!(
+                "table access method \"{}\" does not support ORDER BY",
+                schema.access_method.as_str()
+            )));
         }
         let namespace = schema.namespace.clone();
         let name = schema.name.clone();
