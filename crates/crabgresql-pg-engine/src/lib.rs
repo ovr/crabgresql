@@ -515,6 +515,19 @@ impl PgEngine {
         let res = recover(data_dir, &registry, &clog, redo).map_err(std::io::Error::other)?;
         // Clamp the WAL to the last valid record before any new append, discarding
         // a torn tail left by a crash.
+        if let Ok(meta) = std::fs::metadata(crabgresql_wal::wal_path(data_dir))
+            && meta.len() > res.end_of_wal.0
+        {
+            // Dropping a torn tail is routine; dropping a large one is the visible
+            // symptom of a redo point or a decode that went wrong, and it used to
+            // happen in complete silence.
+            tracing::warn!(
+                discarded = meta.len() - res.end_of_wal.0,
+                end_of_wal = %res.end_of_wal,
+                replayed_from = %res.replayed_from,
+                "discarding the tail of the write-ahead log"
+            );
+        }
         wal.reset_to(res.end_of_wal).map_err(std::io::Error::other)?;
         // Reconcile swap TRUNCATEs replayed from the WAL (apply committed, discard
         // the rest), reclaim orphaned staging files.

@@ -72,6 +72,21 @@ fn read_from(dir: &Path, start: Lsn) -> Result<Vec<u8>, WalError> {
     Ok(bytes)
 }
 
+/// The offset of the first record in `bytes` that both passes its CRC and agrees
+/// with where it was found — `rec_lsn == start + offset`. Offset 0 is skipped; the
+/// caller has already established that nothing decodes there.
+///
+/// That second condition is what makes this evidence rather than a guess: a false
+/// positive would need a CRC-32C collision *and* an eight-byte field that happens
+/// to equal the offset it was found at. `recover` leans on the same self-check
+/// when it validates the first record against `start`.
+fn first_valid_record_offset(bytes: &[u8], start: Lsn) -> Option<usize> {
+    (1..bytes.len()).find(|&offset| {
+        WalRecord::decode(&bytes[offset..])
+            .is_some_and(|(rec, _)| rec.rec_lsn == Lsn(start.0 + offset as u64))
+    })
+}
+
 /// Replay the WAL under `dir` from `start`, rebuilding `clog` from commit/abort
 /// records and dispatching every other record to its registered redo handler.
 /// Returns the end of the valid log and the next XID to hand out.
@@ -153,25 +168,48 @@ pub fn recover(
         pos += len;
     }
 
-    // Nothing decoded at a non-zero redo point, yet there are bytes there. Refuse
-    // rather than return `end_of_wal == start`, which the caller feeds to
-    // `Wal::reset_to` — that would `set_len(start)` and destroy every committed
-    // record above the checkpoint while reporting a clean start.
+    // Nothing decoded where we were told to resume, yet there are bytes there.
+    // Returning `end_of_wal == start` sends the caller into `Wal::reset_to`, which
+    // `set_len`s the stream to that point — so getting this wrong destroys every
+    // record above it while reporting a clean start.
     //
-    // This is not a torn tail. A redo point is always at or below the flushed
-    // LSN (see `Wal::redo_point`), and everything below the flush boundary is
-    // intact, so a record torn *at* the redo point cannot happen; a real torn
-    // tail sits above the last fsync, where the records before it decode and
-    // `pos` is therefore non-zero. Nothing decoding here means the redo point
-    // does not name a record boundary, which is unrecoverable without operator
-    // judgement. An empty region (`start == end-of-file`) is fine: that is a
-    // checkpoint with no activity after it.
-    if pos == 0 && start.is_valid() && !bytes.is_empty() {
-        return Err(WalError::Redo(format!(
-            "recovery resumed at {start} but no record decodes there \
-             ({} bytes follow); refusing to truncate the log to that point",
-            bytes.len()
-        )));
+    // Two situations reach it, and only one may truncate:
+    //
+    // * We were given a redo point and it is not a record boundary. Refuse. The
+    //   bytes below `start` were never read, so a record we are sitting in the
+    //   middle of is invisible from here — "nothing decodes ahead" does not mean
+    //   there is nothing to lose. (A redo point never exceeds the flush boundary,
+    //   see `Wal::redo_point`, so a record torn *at* one cannot happen either.)
+    // * We are replaying the whole stream and its head is damaged. Refuse only if
+    //   a valid record still decodes further on, since truncating would destroy
+    //   it. Otherwise there is genuinely nothing behind or ahead: a crash during
+    //   the very first `flush` leaves exactly this — `write_all_at` is a `pwrite`
+    //   loop, so a partial first record on disk is ordinary — and nothing in it
+    //   was ever acknowledged, because that flush never returned. Truncating is
+    //   *required* there, or an ordinary crash would leave a cluster that cannot
+    //   start at all.
+    //
+    // The second case is why this is no longer gated on `start.is_valid()` alone:
+    // whole-stream replay is a routine path now — any control file we cannot read
+    // falls back to it — and it is precisely the path on which a damaged head
+    // would otherwise erase every record behind it. An empty region is fine either
+    // way: that is a checkpoint with no activity after it.
+    if pos == 0 && !bytes.is_empty() {
+        if start.is_valid() {
+            return Err(WalError::Redo(format!(
+                "recovery resumed at {start} but no record decodes there \
+                 ({} bytes follow); refusing to truncate the log to that point",
+                bytes.len()
+            )));
+        }
+        if let Some(offset) = first_valid_record_offset(&bytes, start) {
+            return Err(WalError::Redo(format!(
+                "the log head does not decode, but a valid record starts at {} \
+                 ({} bytes follow); refusing to truncate the log past it",
+                Lsn(offset as u64),
+                bytes.len()
+            )));
+        }
     }
 
     Ok(RecoveryResult {
@@ -453,6 +491,98 @@ mod tests {
             err.to_string().contains("next-XID floor"),
             "unexpected error: {err}"
         );
+
+        Ok(())
+    }
+
+    /// A whole-stream replay whose *head* is damaged must not report a clean log:
+    /// the caller feeds `end_of_wal` to `Wal::reset_to`, so returning zero would
+    /// erase every record behind the damage. This is reachable in production now —
+    /// an unreadable control file falls back to a whole-stream replay, and bounded
+    /// replay is what lets damage accumulate in a prefix nothing reads.
+    #[test]
+    fn a_damaged_log_head_does_not_truncate_the_records_behind_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let second;
+        {
+            let wal = Wal::open(dir.path())?;
+            wal.append(RmgrId::HEAP, 7, Xid(3), b"damaged-head");
+            second = wal.append(RmgrId::HEAP, 7, Xid(4), b"still-good");
+            wal.flush(second.end)?;
+        }
+        // Corrupt the first record's payload, leaving its length intact so the
+        // second record stays where it is.
+        {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(wal_path(dir.path()))?;
+            file.write_all_at(&[0xAB; 4], WalRecord::HEADER_LEN as u64)?;
+            file.sync_all()?;
+        }
+
+        let reg = RmgrRegistry::new();
+        let clog = Clog::new();
+        let Err(err) = recover(dir.path(), &reg, &clog, Lsn::INVALID) else {
+            anyhow::bail!("a damaged head with valid records behind it must be refused");
+        };
+        assert!(
+            err.to_string().contains("refusing to truncate"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains(&second.start.to_string()),
+            "the error should name the record that survived: {err}"
+        );
+
+        Ok(())
+    }
+
+    /// The counterweight to the test above, and the reason the refusal cannot be
+    /// unconditional: a crash during the very first `flush` leaves a partial record
+    /// at offset 0 and nothing else. None of it was ever acknowledged — that flush
+    /// never returned — so recovery must truncate and start, not refuse.
+    #[test]
+    fn a_torn_first_record_on_a_fresh_cluster_still_starts_clean() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        {
+            let wal = Wal::open(dir.path())?;
+            let range = wal.append(RmgrId::HEAP, 7, Xid(3), b"never-acknowledged");
+            wal.flush(range.end)?;
+        }
+        // Keep only the first few bytes: the tail of the write never landed.
+        {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(wal_path(dir.path()))?;
+            file.set_len(12)?;
+            file.sync_all()?;
+        }
+
+        let reg = RmgrRegistry::new();
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, Lsn::INVALID)?;
+        assert_eq!(
+            res.end_of_wal,
+            Lsn::INVALID,
+            "a log with nothing recoverable in it truncates to empty"
+        );
+
+        Ok(())
+    }
+
+    /// A fresh cluster has a zero-length WAL, which is the exemption the guard
+    /// above leans on (`!bytes.is_empty()`).
+    #[test]
+    fn a_fresh_cluster_has_an_empty_log_and_recovers_cleanly() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        drop(Wal::open(dir.path())?);
+        assert_eq!(std::fs::metadata(wal_path(dir.path()))?.len(), 0);
+
+        let reg = RmgrRegistry::new();
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, Lsn::INVALID)?;
+        assert_eq!(res.end_of_wal, Lsn::INVALID);
 
         Ok(())
     }
