@@ -175,12 +175,26 @@ const INDEX_CHUNKS: usize = 2048;
 /// visibility check is plausible. Rejecting it answers [`XactStatus::InProgress`],
 /// which hides a row rather than resurrecting a deleted one.
 ///
-/// A cluster is nowhere near this. Reaching it legitimately would mean 2.7×10^11
-/// transactions of history, whose *pages* — never evicted, by design — would be
-/// some 67 TiB long before the index ran out. Resident page memory is the binding
-/// constraint, and bounding it is the eviction follow-up named in this design's
-/// notes; the index ceiling exists only to keep garbage from aborting the process.
+/// This is not comfortable headroom, and the numbers are worth stating plainly:
+/// 2^23 pages of 8 KiB is 64 GiB of resident pages, which is reachable on a large
+/// machine, and 2^38 XIDs is about a month at a sustained 100k commits/s. Resident
+/// page memory binds first, and bounding it is the eviction follow-up named in this
+/// design's notes — but a cluster that outruns either ceiling needs the truncation
+/// work (Rung D), not a bigger constant. Crossing it is at least not silent: a
+/// *stamp* above the ceiling latches an error that fails the next checkpoint (see
+/// [`Clog::set_status`]), rather than being dropped.
 const MAX_PAGENO: u64 = (INDEX_CHUNKS * PAGES_PER_CHUNK) as u64;
+
+/// Where an XID sits relative to the addressable range of the commit log.
+enum Reach {
+    /// Addressable: this is its page number.
+    Page(u64),
+    /// Frozen out of every relation and its segment possibly gone, so there are no
+    /// bits to read and none worth writing.
+    BelowFloor,
+    /// Past [`MAX_PAGENO`] — a garbage XID, not a real one.
+    AboveCeiling,
+}
 
 /// The commit log: the authoritative fate of every transaction.
 ///
@@ -200,7 +214,8 @@ const MAX_PAGENO: u64 = (INDEX_CHUNKS * PAGES_PER_CHUNK) as u64;
 /// read-modify-write on a single shared word, so every lookup bounces the same cache
 /// line between cores. Measured on this crate's contention bench, an
 /// `RwLock<Vec<..>>` index was *slower than the single `Mutex` it was meant to
-/// replace* at every thread count, and roughly 12× slower at eight.
+/// replace* at every thread count: 3.8 Mops/s at eight threads against the mutex's
+/// 20.4, the figure the bench records on the parent commit.
 ///
 /// So the index takes no lock at all. A lookup is two dependent acquire loads
 /// (spine slot, then page slot) and then one relaxed load of the status byte — no
@@ -298,42 +313,30 @@ impl Clog {
     /// Record an I/O error the caller has no way to return. The first one wins:
     /// the earliest failure is the one that explains the rest.
     fn latch(&self, error: std::io::Error) {
-        let mut failure = self
-            .failure
+        self.failure
             .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"));
-        if failure.is_none() {
-            *failure = Some(error);
-        }
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .get_or_insert(error);
     }
 
-    /// The page number holding `xid`, or `None` if the commit log cannot answer for
-    /// it.
-    ///
-    /// Both rejections lead to [`XactStatus::InProgress`], which is the fail-safe
-    /// direction: it hides a row rather than resurrecting a deleted one.
-    fn addressable(&self, xid: Xid) -> Option<u64> {
-        let floor = self.floor.load(Ordering::Acquire);
-        if xid.0 < floor {
-            // Unreachable by construction: the floor only advances once every
-            // relation has been swept, so no surviving tuple names an XID below it.
-            debug_assert!(
-                !xid.is_valid(),
-                "{xid:?} is below the CLOG floor {:?}",
-                Xid(floor)
-            );
-            return None;
+    /// How far `xid` is from the addressable range. The two rejections are *not*
+    /// interchangeable, which is why this is an enum rather than an `Option`: they
+    /// mean different things, and the read and write paths must treat them
+    /// differently.
+    fn reach(&self, xid: Xid) -> Reach {
+        // Relaxed: nothing is ever stored to `floor` after construction, so there is
+        // no release for an acquire to pair with, and this runs once or twice per
+        // tuple per scan. When a freeze sweep starts advancing it (Rung D) the
+        // ordering it needs is against dropping pages, not against this word, so
+        // this line will have to be revisited there rather than merely strengthened.
+        if xid.0 < self.floor.load(Ordering::Relaxed) {
+            return Reach::BelowFloor;
         }
         let pageno = clog::page_of(xid);
         if pageno >= MAX_PAGENO {
-            // Deliberately *not* a `debug_assert!`, unlike the floor above. A page
-            // number this high does not mean a bug in this crate — it means a
-            // garbage XID arrived from a corrupt tuple header, which is the case
-            // MAX_PAGENO exists for. Asserting would turn bad data into a crash;
-            // answering InProgress hides the row and keeps the cluster up.
-            return None;
+            return Reach::AboveCeiling;
         }
-        Some(pageno)
+        Reach::Page(pageno)
     }
 
     /// The resident page holding `pageno`, faulting it in on its first touch.
@@ -342,7 +345,7 @@ impl Clog {
     /// lock, and no read-modify-write on any shared word, which is the entire point
     /// (see the type's documentation).
     ///
-    /// `pageno` must have come from [`Clog::addressable`], which is what bounds both
+    /// `pageno` must have come from [`Clog::reach`], which is what bounds both
     /// indexes below.
     fn page(&self, pageno: u64) -> &clog::ClogPage {
         let index = pageno as usize;
@@ -362,10 +365,12 @@ impl Clog {
             let (bytes, poisoned) = match self.dir.as_deref() {
                 Some(dir) => match clog::read_page(dir, pageno) {
                     Ok(bytes) => (bytes, false),
-                    Err(error) => {
-                        self.latch(error);
-                        (clog::ZERO_BYTES, true)
-                    }
+                    // Deliberately not latched into `self.failure`: the poison flag
+                    // *is* the record of this failure, and [`Clog::flush`] re-derives
+                    // a current error from its own re-read attempt. Latching here as
+                    // well would leave a stale error behind that fails the very
+                    // checkpoint that healed the page.
+                    Err(_) => (clog::ZERO_BYTES, true),
                 },
                 None => (clog::ZERO_BYTES, false),
             };
@@ -377,9 +382,26 @@ impl Clog {
         if xid == Xid::FROZEN {
             return XactStatus::Committed;
         }
-        match self.addressable(xid) {
-            Some(pageno) => self.page(pageno).status(xid),
-            None => XactStatus::InProgress,
+        match self.reach(xid) {
+            Reach::Page(pageno) => self.page(pageno).status(xid),
+            Reach::BelowFloor => {
+                // Unreachable by construction: the floor only advances once every
+                // relation has been swept, so no surviving tuple names an XID below
+                // it. Asserting on the *read* path only — a stamp below the floor is
+                // a different situation, handled in `set_status`.
+                debug_assert!(
+                    !xid.is_valid(),
+                    "status({xid:?}) is below the CLOG floor {:?}",
+                    Xid(self.floor.load(Ordering::Relaxed))
+                );
+                XactStatus::InProgress
+            }
+            // A garbage XID out of a corrupt tuple header, which is what the ceiling
+            // exists for; deliberately not an assertion, since bad data must not
+            // crash a debug build. `InProgress` is the fail-safe answer for an
+            // *inserter* — it hides the row. Note it is not fail-safe for a deleter:
+            // there it makes a committed delete invisible, so the row reappears.
+            Reach::AboveCeiling => XactStatus::InProgress,
         }
     }
 
@@ -396,8 +418,19 @@ impl Clog {
     }
 
     fn set_status(&self, xid: Xid, status: XactStatus) {
-        if let Some(pageno) = self.addressable(xid) {
-            self.page(pageno).set_status(xid, status);
+        match self.reach(xid) {
+            Reach::Page(pageno) => self.page(pageno).set_status(xid, status),
+            // Not the fail-safe the read path gets: by the time a status is stamped
+            // the WAL has already fsynced this transaction's fate, so dropping it
+            // silently would leave a committed transaction's rows invisible forever
+            // with nothing to say why — and `TransactionManager::commit` has already
+            // returned `Ok` and run the engine's finalize hook. Latch it so the next
+            // checkpoint fails instead of publishing a control file over a status
+            // that was never recorded.
+            Reach::BelowFloor | Reach::AboveCeiling => self.latch(std::io::Error::other(format!(
+                "{xid:?} is outside the addressable commit-log range, so its \
+                 {status:?} status was not recorded"
+            ))),
         }
     }
 
@@ -427,7 +460,7 @@ impl Clog {
 
         let mut claimed: Vec<&clog::ClogPage> = Vec::new();
         let mut segments = BTreeSet::new();
-        let mut unwritable = false;
+        let mut heal_error: Option<std::io::Error> = None;
         let mut result = Ok(());
 
         // Walking the index needs no lock and holds no guard across the writes
@@ -442,15 +475,37 @@ impl Clog {
                 let Some(page) = page_slot.get() else {
                     continue;
                 };
+                // Cheap pre-check, before the claim's read-modify-write. Skipping it
+                // for a clean page is sound where skipping it in a *writer* would not
+                // be (see `ClogPage::mark_dirty`): reading `false` is indistinguishable
+                // from claiming immediately before a stamp lands, which the protocol
+                // already handles by leaving the page flagged for the next checkpoint.
+                // Without this, a checkpoint takes an exclusive cache line on every
+                // resident page — clean ones included — and invalidates it on every
+                // core currently committing into that page.
+                if !page.is_dirty() && !page.is_poisoned() {
+                    continue;
+                }
                 let pageno = (chunk_index * PAGES_PER_CHUNK + slot_index) as u64;
                 if page.is_poisoned() {
-                    // Refuse it: its bytes are a zero-fill, so writing them would
-                    // erase every other transaction's status in the page.
-                    // Deliberately checked *before* claiming the dirty flag —
-                    // clearing it would let a later checkpoint report success over
-                    // stamps that never reached disk.
-                    unwritable |= page.is_dirty();
-                    continue;
+                    // Try to heal it. The zero-fill standing in for the unreadable
+                    // page must never be written back — it would erase every other
+                    // transaction's status in the page — but a read that now succeeds
+                    // reconstructs the page exactly, because a zero slot is precisely
+                    // one nothing has stamped since the failure.
+                    match clog::read_page(dir, pageno) {
+                        Ok(disk) => page.absorb_unstamped(&disk),
+                        Err(error) => {
+                            // Still unreadable, so it still must not be written.
+                            // Deliberately kept out of `result` so the healthy pages
+                            // below are still written and fsynced — one bad page does
+                            // not hold the rest of the commit log hostage.
+                            if heal_error.is_none() {
+                                heal_error = Some(error);
+                            }
+                            continue;
+                        }
+                    }
                 }
                 let Some(image) = page.claim_for_writeback() else {
                     continue;
@@ -490,11 +545,18 @@ impl Clog {
             return Err(error);
         }
 
-        // Surface a latched read error last, so a checkpoint stopped by a write
-        // failure reports that failure rather than an older, unrelated one. A
-        // poisoned page carrying stamps keeps failing every flush: a checkpoint must
-        // not report success while a page it refused to write holds statuses that
-        // are nowhere on disk.
+        // A page still poisoned after the heal attempt fails the checkpoint, whether
+        // or not it is carrying stamps: it is answering `InProgress` for up to 32768
+        // XIDs it has no information about, so the commit log is not in a state worth
+        // certifying as durable. This is not the permanent wedge it would once have
+        // been — the next checkpoint re-reads it, and the first read that succeeds
+        // heals it outright.
+        if let Some(error) = heal_error {
+            return Err(error);
+        }
+
+        // Surface a latched error last, so a checkpoint stopped by a write failure
+        // reports that failure rather than an older, unrelated one.
         let latched = self
             .failure
             .lock()
@@ -502,9 +564,6 @@ impl Clog {
             .take();
         match latched {
             Some(error) => Err(error),
-            None if unwritable => Err(std::io::Error::other(
-                "pg_xact holds a page that could not be read, so it cannot be written back",
-            )),
             None => Ok(()),
         }
     }
@@ -1274,6 +1333,32 @@ mod tests {
         assert!(visible(&hdr, &snap, &clog, Xid(9), 0));
     }
 
+    /// The xmax case where the *snapshot* is the only thing keeping the row alive.
+    /// Its mirror on the xmin side is `commit_after_snapshot_is_not_visible`; without
+    /// it, dropping `snap.in_progress(hdr.xmax)` from the visibility rule turns every
+    /// concurrent committed delete into a non-repeatable read with a green suite.
+    #[test]
+    fn a_committed_delete_still_in_flight_at_snapshot_time_leaves_the_row_visible() {
+        let clog = Clog::new();
+        let inserter = Xid(3);
+        clog.set_committed(inserter);
+        // Committed in the commit log...
+        let deleter = Xid(4);
+        clog.set_committed(deleter);
+        // ...but still in flight as of this snapshot, so its delete is not ours to
+        // see: the row has to stay visible for the whole of this transaction.
+        let snap = Snapshot {
+            xmin: Xid(4),
+            xmax: Xid(5),
+            xip: vec![Xid(4)],
+        };
+        assert!(snap.in_progress(deleter), "the premise of this test");
+        assert!(clog.is_committed(deleter), "and the other half of it");
+        let mut hdr = TupleHeader::inserted(inserter, CommandId(0));
+        hdr.xmax = deleter;
+        assert!(visible(&hdr, &snap, &clog, Xid(9), 0));
+    }
+
     /// The xmax case where the CLOG is the *only* thing keeping the row alive:
     /// every other test here has the deleter either still in the snapshot's
     /// in-flight set or committed, so a visibility rule that consulted only the
@@ -1496,7 +1581,9 @@ mod durable_clog_tests {
         // Xid 9 => byte 2, shift 2, Aborted.
         assert_eq!(segment0[0x0002], 0x08, "Xid(9) aborted");
         assert!(
-            segment0[0x0003..clog::CLOG_PAGE_SIZE].iter().all(|b| *b == 0),
+            segment0[0x0003..clog::CLOG_PAGE_SIZE]
+                .iter()
+                .all(|b| *b == 0),
             "nothing else in page 0 was touched"
         );
         // The first XID of page 1 lands at the start of the second page.
@@ -1508,7 +1595,10 @@ mod durable_clog_tests {
 
         // A new segment file, its page at offset 0, Committed at shift 2.
         let segment1 = std::fs::read(subdir.join("0000000000000001"))?;
-        assert_eq!(segment1[0x0000], 0x04, "Xid(XACTS_PER_SEGMENT + 1) committed");
+        assert_eq!(
+            segment1[0x0000], 0x04,
+            "Xid(XACTS_PER_SEGMENT + 1) committed"
+        );
         Ok(())
     }
 
@@ -1532,6 +1622,136 @@ mod durable_clog_tests {
         }
         assert!(clog::segment_path(&subdir, 4).exists());
         assert_eq!(Clog::open(dir.path())?.status(xid), XactStatus::Committed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_above_the_first_index_chunk_round_trips_through_its_own_segment() -> anyhow::Result<()>
+    {
+        // `flush` reconstructs each page number from its (chunk, slot) position in
+        // the index. Every other durable test lives in chunk 0, where slot index and
+        // page number coincide and a wrong multiplier is invisible; this one does not.
+        let dir = tempfile::tempdir()?;
+        let pageno = PAGES_PER_CHUNK as u64 + 1; // chunk 1, slot 1
+        let xid = Xid(pageno * clog::XACTS_PER_PAGE + 5);
+        {
+            let log = Clog::open(dir.path())?;
+            log.set_committed(xid);
+            log.flush()?;
+        }
+        let subdir = dir.path().join(clog::CLOG_SUBDIR);
+        assert!(
+            clog::segment_path(&subdir, clog::segment_of_page(pageno)).exists(),
+            "the page must land in the segment its page number names"
+        );
+        assert_eq!(Clog::open(dir.path())?.status(xid), XactStatus::Committed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_page_dirty_for_the_next_checkpoint() -> anyhow::Result<()> {
+        // A checkpoint claims a page's dirty flag before writing it, so a write that
+        // then fails has to put the flag back or the stamp is lost: the next
+        // checkpoint would find nothing dirty and report success over it.
+        let dir = tempfile::tempdir()?;
+        let subdir = dir.path().join(clog::CLOG_SUBDIR);
+        let log = Clog::open(dir.path())?;
+        log.set_committed(Xid(3));
+        log.flush()?;
+
+        // Make the segment unwritable — but still readable, so this exercises the
+        // write path rather than the fault-in path — and stamp again.
+        let segment = clog::segment_path(&subdir, 0);
+        let readonly = |on: bool| -> std::io::Result<()> {
+            let mut perms = std::fs::metadata(&segment)?.permissions();
+            perms.set_readonly(on);
+            std::fs::set_permissions(&segment, perms)
+        };
+        readonly(true)?;
+        log.set_committed(Xid(9));
+        assert!(
+            log.flush().is_err(),
+            "an unwritable segment must fail the checkpoint"
+        );
+
+        // The stamp is still flagged, so the next checkpoint publishes it.
+        readonly(false)?;
+        log.flush()?;
+        drop(log);
+
+        let reopened = Clog::open(dir.path())?;
+        assert_eq!(reopened.status(Xid(3)), XactStatus::Committed);
+        assert_eq!(
+            reopened.status(Xid(9)),
+            XactStatus::Committed,
+            "a stamp whose first write failed must survive to the next checkpoint"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_that_could_not_be_read_heals_once_the_read_succeeds() -> anyhow::Result<()> {
+        // A transient read failure must not be terminal. While the segment is
+        // unreadable the page serves stamps out of RAM and refuses to be written
+        // back; once the segment can be read again the checkpoint reconstructs the
+        // page from it and publishes the whole thing, without erasing the statuses
+        // that were already on disk.
+        let dir = tempfile::tempdir()?;
+        let subdir = dir.path().join(clog::CLOG_SUBDIR);
+        let already = Xid(3);
+        {
+            let log = Clog::open(dir.path())?;
+            log.set_committed(already);
+            log.flush()?;
+        }
+
+        // Hide the real segment behind a directory of the same name, so the read
+        // fails where `File::open` still succeeds.
+        let segment = clog::segment_path(&subdir, 0);
+        let stash = dir.path().join("stashed-segment");
+        std::fs::rename(&segment, &stash)?;
+        std::fs::create_dir(&segment)?;
+
+        let log = Clog::open(dir.path())?;
+        let during = Xid(9);
+        log.set_committed(during);
+        assert_eq!(
+            log.status(during),
+            XactStatus::Committed,
+            "RAM still answers for what was stamped after the failure"
+        );
+        assert_eq!(
+            log.status(already),
+            XactStatus::InProgress,
+            "and what it could not read is unknown, not committed"
+        );
+        assert!(
+            log.flush().is_err(),
+            "a page it cannot read must not be written back"
+        );
+
+        // The disk recovers.
+        std::fs::remove_dir(&segment)?;
+        std::fs::rename(&stash, &segment)?;
+        log.flush()?;
+        assert_eq!(
+            log.status(already),
+            XactStatus::Committed,
+            "the checkpoint healed the page from disk"
+        );
+        drop(log);
+
+        let reopened = Clog::open(dir.path())?;
+        assert_eq!(
+            reopened.status(already),
+            XactStatus::Committed,
+            "the status already on disk was not erased"
+        );
+        assert_eq!(
+            reopened.status(during),
+            XactStatus::Committed,
+            "and the stamp taken while unreadable reached disk"
+        );
         Ok(())
     }
 
@@ -1561,7 +1781,10 @@ mod durable_clog_tests {
 
         // The checkpoint fails — and keeps failing, rather than reporting success
         // once the latched read error has been taken.
-        assert!(log.flush().is_err(), "first checkpoint must report the read");
+        assert!(
+            log.flush().is_err(),
+            "first checkpoint must report the read"
+        );
         assert!(log.flush().is_err(), "and must not later claim success");
 
         // A page in a healthy segment still reached disk: one bad page does not
@@ -1634,7 +1857,11 @@ mod concurrent_clog_tests {
         log.set_committed(high);
         log.set_aborted(low);
 
-        assert_eq!(log.status(high), XactStatus::Committed, "high page survived");
+        assert_eq!(
+            log.status(high),
+            XactStatus::Committed,
+            "high page survived"
+        );
         assert_eq!(log.status(low), XactStatus::Aborted);
     }
 
@@ -1720,11 +1947,17 @@ mod concurrent_clog_tests {
     }
 
     #[test]
-    fn the_reserved_xids_answer_without_touching_a_page() {
-        // FROZEN short-circuits ahead of every lookup. `satisfies_mvcc` has its own
-        // FROZEN branch for xmin, so losing this one would go unnoticed there — but
-        // `HeapTable`'s `is_live` and the buffer engine read `Clog::status`
+    fn the_reserved_xids_keep_their_meanings() {
+        // FROZEN short-circuits ahead of the index entirely. `satisfies_mvcc` has its
+        // own FROZEN branch for xmin, so losing this one would go unnoticed there —
+        // but `HeapTable`'s `is_live` and the buffer engine read `Clog::status`
         // directly, and a frozen xmax reading InProgress flips a dead row live.
+        //
+        // INVALID is not short-circuited: it goes through the index like any other
+        // XID and reads slot 0, which is InProgress because nothing has stamped it.
+        // Both call sites above guard on `xmax.is_valid()` before consulting the
+        // commit log, so that is sufficient — but it is not the same mechanism, and
+        // this test's name used to claim otherwise.
         let log = Clog::new();
         assert_eq!(log.status(Xid::FROZEN), XactStatus::Committed);
         assert!(log.is_committed(Xid::FROZEN));
@@ -1785,20 +2018,27 @@ mod concurrent_clog_tests {
     #[test]
     fn no_stamp_is_lost_to_a_concurrent_flush() -> anyhow::Result<()> {
         // Stamping and checkpointing at the same time, over pages that are also
-        // faulting in while the checkpoint walks the index. What this catches is the
-        // gross failures — a page dropped from the index, a claimed page not
-        // re-flagged after a failed write, a stamp that never reaches disk at all.
+        // faulting in while the checkpoint walks the index. What this catches is a
+        // page dropped from the index and a stamp that never reaches disk at all.
         //
-        // It does *not* pin the claim-before-image ordering: that window is a few
-        // instructions wide, and reversing it still passes here. The ordering is
-        // guarded instead by keeping it inside `ClogPage::claim_for_writeback`,
-        // whose own test is deterministic.
+        // Be precise about what it does *not* catch, because two plausible-sounding
+        // claims are both false. It does not pin the claim-before-image ordering:
+        // that window is a few instructions wide and reversing it still passes here
+        // — and `ClogPage::claim_for_writeback`'s own test does not catch it either,
+        // being single-threaded, so nothing in this crate does. Nor does it cover
+        // `flush`'s re-flag-on-failure path: no write ever fails here, so that is
+        // `a_failed_write_leaves_the_page_dirty_for_the_next_checkpoint`'s job.
         const WRITERS: u64 = 4;
         const PER_WRITER: u64 = 20_000;
         /// Checkpoints the writers must have overlapped before they may stop. The
         /// overlap *is* the thing under test, so without this the run could finish
         /// before the checkpoint thread was ever scheduled and prove nothing.
         const MIN_OVERLAPPED_FLUSHES: usize = 4;
+        /// Ceiling on the wait for those checkpoints. Without it, a `flush` that
+        /// fails every time — a full or read-only TMPDIR, an fsync error — would
+        /// leave every thread spinning forever, turning a diagnosable failure into a
+        /// wedged CI runner.
+        const MAX_WAIT_SPINS: usize = 2_000_000;
         let dir = tempfile::tempdir()?;
         let log = Clog::open(dir.path())?;
         let done = AtomicBool::new(false);
@@ -1807,12 +2047,14 @@ mod concurrent_clog_tests {
         // the second page faults in while the checkpoint is already walking.
         let xid = |writer: u64, i: u64| Xid(3 + writer * clog::XACTS_PER_PAGE / 2 + i);
 
+        let failures = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             let flusher = scope.spawn(|| {
                 while !done.load(Ordering::Relaxed) {
-                    if log.flush().is_ok() {
-                        flushes.fetch_add(1, Ordering::Relaxed);
-                    }
+                    match log.flush() {
+                        Ok(()) => flushes.fetch_add(1, Ordering::Relaxed),
+                        Err(_) => failures.fetch_add(1, Ordering::Relaxed),
+                    };
                     std::thread::yield_now();
                 }
             });
@@ -1830,26 +2072,38 @@ mod concurrent_clog_tests {
                             }
                         }
                         // Keep the page dirty-and-being-stamped until enough
-                        // checkpoints have gone by to have raced us.
-                        while flushes.load(Ordering::Relaxed) < MIN_OVERLAPPED_FLUSHES {
+                        // checkpoints have gone by to have raced us — but bounded, so
+                        // a persistently failing flush ends the test instead of
+                        // hanging it.
+                        let mut spins = 0;
+                        while flushes.load(Ordering::Relaxed) < MIN_OVERLAPPED_FLUSHES
+                            && spins < MAX_WAIT_SPINS
+                        {
                             log.set_committed(xid(writer, PER_WRITER - 1));
                             std::thread::yield_now();
+                            spins += 1;
                         }
                     })
                 })
                 .collect();
-            for writer in writers {
-                assert!(writer.join().is_ok(), "a writer panicked");
-            }
-            // Only now can the flusher stop; `scope` joins it before returning.
+            // Join every writer, then stop the flusher, and only then assert. If a
+            // writer panics its `join` returns `Err` rather than unwinding here, so
+            // `done` is always set and `scope` can never block joining a flusher
+            // that would otherwise loop forever.
+            let writer_results: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
             done.store(true, Ordering::Relaxed);
-            assert!(flusher.join().is_ok(), "the checkpoint thread panicked");
+            let flusher_result = flusher.join();
+            for result in writer_results {
+                assert!(result.is_ok(), "a writer panicked");
+            }
+            assert!(flusher_result.is_ok(), "the checkpoint thread panicked");
         });
 
         let overlapped = flushes.load(Ordering::Relaxed);
         assert!(
             overlapped >= MIN_OVERLAPPED_FLUSHES,
-            "only {overlapped} checkpoints ran, so this proved nothing"
+            "only {overlapped} checkpoints succeeded ({} failed), so this proved nothing",
+            failures.load(Ordering::Relaxed)
         );
         // The final checkpoint is the one that has to publish everything still
         // flagged from the concurrent ones.

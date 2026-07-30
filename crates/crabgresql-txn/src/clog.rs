@@ -101,36 +101,83 @@ pub fn set_page_status(page: &mut PageBytes, xid: Xid, status: XactStatus) {
 /// It lives here rather than beside [`crate::Clog`] so `byte_in_page`,
 /// `shift_in_byte` and `STATUS_MASK` stay private to this module: the addressing
 /// arithmetic exists exactly once, whichever representation is being addressed.
+///
+/// The layout is load-bearing. `#[repr(C, align(64))]` puts the two flags alone on
+/// the first cache line and starts `bits` at offset 64, so the flag that *every*
+/// stamp read-modify-writes ([`ClogPage::mark_dirty`]) shares no line with any XID's
+/// status byte. Laid out naturally the flags would instead follow `bits` at offset
+/// 8192 and share a line with the statuses of the page's last ~250 XIDs, so a
+/// scanner reading one of those would take a coherence miss on every concurrent
+/// commit anywhere in the page — reintroducing, for 1/128th of the XID space,
+/// exactly the serialisation this type exists to remove.
+#[repr(C, align(64))]
 pub struct ClogPage {
-    bits: [AtomicU8; CLOG_PAGE_SIZE],
     /// Stamped since the last flush. See [`ClogPage::mark_dirty`] for why every
     /// update of this flag must be a read-modify-write.
     dirty: AtomicBool,
-    /// This page was faulted in from a *failed* read, so its bytes are zeros
-    /// rather than whatever the segment actually holds. Set once at construction
-    /// and never cleared — we never learn the real prior contents, so writing this
-    /// page back would erase up to 32767 other transactions' statuses.
-    poisoned: bool,
+    /// This page was faulted in from a *failed* read, so its bytes are a zero-fill
+    /// rather than whatever the segment actually holds, and writing it back would
+    /// erase up to 32767 other transactions' statuses. Cleared by
+    /// [`ClogPage::absorb_unstamped`] once a later read succeeds — a transient read
+    /// error must not be terminal.
+    poisoned: AtomicBool,
+    /// Keeps the flags alone on their line. Never read.
+    _pad: [u8; 62],
+    bits: [AtomicU8; CLOG_PAGE_SIZE],
 }
 
 impl ClogPage {
     /// A resident page holding `bytes`. `poisoned` marks bytes that are a zero-fill
     /// standing in for a page that could not be read.
     pub fn new(bytes: &PageBytes, poisoned: bool) -> Self {
-        let page = ClogPage {
-            bits: [const { AtomicU8::new(0) }; CLOG_PAGE_SIZE],
+        ClogPage {
             dirty: AtomicBool::new(false),
-            poisoned,
-        };
-        for (slot, byte) in page.bits.iter().zip(bytes) {
-            slot.store(*byte, Ordering::Relaxed);
+            poisoned: AtomicBool::new(poisoned),
+            _pad: [0; 62],
+            // One pass, straight into place: a zero-fill followed by 8192 stores
+            // would touch the array twice for nothing.
+            bits: bytes.map(AtomicU8::new),
         }
-        page
     }
 
-    /// Whether this page must never be written back.
+    /// Whether this page's bytes are a zero-fill standing in for an unreadable
+    /// segment page, so it must not be written back as it stands.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Merge a freshly-read `disk` image into the slots nothing has stamped, and
+    /// clear the poison.
+    ///
+    /// This is what makes an unreadable page recoverable rather than terminal. A
+    /// poisoned page's bytes started as all zeros, and zero *is* the "no
+    /// information" encoding ([`XactStatus::InProgress`]), so a non-zero slot is
+    /// exactly one that has been stamped since the failed read and a zero slot is
+    /// one whose truth is still on disk. Filling only the zero slots therefore
+    /// reconstructs the whole page, after which it is authoritative and safe both to
+    /// write back and to keep serving.
+    ///
+    /// Concurrency-safe against stamps landing during the merge: each byte is a
+    /// masked `fetch_update` that fills only the slots still zero at that moment, so
+    /// a slot stamped concurrently is no longer zero and is left alone.
+    pub fn absorb_unstamped(&self, disk: &PageBytes) {
+        for (slot, byte) in self.bits.iter().zip(disk) {
+            if *byte == 0 {
+                continue; // nothing on disk to contribute
+            }
+            let disk_byte = *byte;
+            let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                // 0b11 in every 2-bit group that is still zero in `cur`. Folding
+                // bit 1 of each group down onto bit 0 marks the non-zero groups;
+                // the mask is the complement, expanded back across both bits.
+                let non_zero = (cur | (cur >> 1)) & 0b0101_0101;
+                let zeroes = (non_zero ^ 0b0101_0101) * 0b11;
+                Some(cur | (disk_byte & zeroes))
+            });
+        }
+        // Release: the merged bytes must be visible to anyone who observes the page
+        // as healthy.
+        self.poisoned.store(false, Ordering::Release);
     }
 
     /// `xid`'s status.
@@ -174,13 +221,16 @@ impl ClogPage {
     /// Flag this page as needing a write-back.
     ///
     /// This must stay a read-modify-write, and every stamp must perform it. A
-    /// release *sequence* is continued only by same-thread modifications or by
-    /// RMWs from any thread, so if two writers used plain releasing stores the
-    /// flusher's acquiring [`ClogPage::claim_for_writeback`] would synchronise-with
-    /// only the later of them, and the earlier writer's bit would have no
-    /// happens-before with the image it takes. In particular, do **not** add the
-    /// tempting `if !dirty.load(Relaxed)` fast path: a writer that skips the RMW
-    /// contributes nothing to this flag's modification order and the hole reopens.
+    /// release *sequence* is continued only by read-modify-writes — from any thread,
+    /// but only by RMWs (C++20 removed the same-thread-plain-store case, and Rust's
+    /// atomics follow C++20). So a plain releasing store here would truncate the
+    /// sequence headed by every earlier writer, leaving the acquiring
+    /// [`ClogPage::claim_for_writeback`] synchronised-with only the last of them and
+    /// the earlier writers' bits with no happens-before against the image it takes.
+    /// For the same reason, do **not** add the tempting `if !dirty.load(Relaxed)`
+    /// fast path: a writer that skips the RMW contributes nothing to this flag's
+    /// modification order at all, so there is nothing to continue the sequence with.
+    /// (A *reader* skipping the RMW is fine — see [`Clog::flush`]'s pre-check.)
     ///
     /// It is not free, and it is the reason stamping does not scale the way reading
     /// does: one flag per page means every transaction committing into the same
@@ -199,8 +249,8 @@ impl ClogPage {
     /// Whether this page holds stamps that have not reached disk.
     ///
     /// Does not claim the flag — [`ClogPage::claim_for_writeback`] is the claiming
-    /// form. This is for deciding whether a page the flusher *refuses* to write is
-    /// carrying anything, without clearing the flag that says so.
+    /// form. This is the flusher's cheap pre-check: a plain load, so walking a mostly
+    /// clean index costs no read-modify-writes at all.
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
     }
@@ -213,9 +263,13 @@ impl ClogPage {
     /// and the next checkpoint writes it, so at worst it is written twice. Taking
     /// the image *first* and clearing afterwards would instead drop any stamp in
     /// that window into no file at all with the flag cleared — a permanently lost
-    /// commit. The window is only a few instructions wide, which makes it a bug no
-    /// timing test can be relied on to catch; keeping the order inside one
-    /// documented method is the guard instead.
+    /// commit.
+    ///
+    /// Be clear about how weakly that is enforced: the window is a few instructions
+    /// wide, so **no test in this crate detects the reversal** — swapping the two
+    /// lines below leaves the whole suite green, including this method's own test,
+    /// which is single-threaded and cannot tell the orders apart. Co-locating them
+    /// here narrows the blast radius to one reviewed method; it is not a proof.
     ///
     /// The image is not an atomic cut: it is 8192 individual loads, so a stamp
     /// landing mid-scan may or may not appear in it. That is safe because each
@@ -231,17 +285,6 @@ impl ClogPage {
             *byte = slot.load(Ordering::Relaxed);
         }
         Some(bytes)
-    }
-}
-
-impl std::fmt::Debug for ClogPage {
-    /// Hand-written: a derive would compile, but dumping 8192 atomics is useless
-    /// output and 8192 atomic loads to produce it.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClogPage")
-            .field("dirty", &self.dirty.load(Ordering::Relaxed))
-            .field("poisoned", &self.poisoned)
-            .finish_non_exhaustive()
     }
 }
 
@@ -494,10 +537,28 @@ mod tests {
     }
 
     #[test]
+    fn the_dirty_flag_does_not_share_a_cache_line_with_any_status_byte() {
+        // Laid out naturally the flags would follow `bits` at offset 8192 and share a
+        // 64-byte line with the status bytes of the page's last ~250 XIDs, so every
+        // stamp anywhere in the page would invalidate that line for readers of those
+        // XIDs. `#[repr(C, align(64))]` plus the pad is what keeps them apart.
+        let page = ClogPage::new(&ZERO_BYTES, false);
+        let base = &page as *const _ as usize;
+        let dirty = &page.dirty as *const _ as usize - base;
+        let bits = &page.bits as *const _ as usize - base;
+        assert_eq!(dirty, 0, "the flags own the first line");
+        assert_eq!(bits, 64, "and no status byte shares it");
+        assert_eq!(bits % 64, 0, "status bytes stay cache-line aligned");
+        assert_eq!(align_of::<ClogPage>(), 64);
+    }
+
+    #[test]
     fn a_resident_page_encodes_exactly_like_the_bytes_it_will_be_written_as() {
-        // Two representations of one layout, so they have to agree. Anything that
-        // changed the atomic page's addressing without changing the byte array's
-        // would write files this build could not read back.
+        // Two representations of one layout, so they have to agree. Note the limit
+        // of this: both go through the same private `byte_in_page`/`shift_in_byte`,
+        // so it cannot catch an addressing change -- what it pins is the masking in
+        // `set_status` against `set_page_status`. The on-disk layout itself is
+        // guarded by `a_flushed_segment_matches_the_shipped_byte_layout`.
         let page = ClogPage::new(&ZERO_BYTES, false);
         let mut bytes = ZERO_BYTES;
         for (xid, status) in [
