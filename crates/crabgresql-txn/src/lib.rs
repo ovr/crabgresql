@@ -1158,15 +1158,29 @@ impl TransactionManager {
     /// reclaimed by the engine's orphan GC at the next startup.
     pub fn abort_without_finalize(&self, xid: Xid) {
         if xid.is_valid() {
-            // The barrier is safe to take mid-unwind: it guards only the WAL's own
-            // delay counter, which nothing holds across fallible work, so unlike
-            // the engine locks this function exists to avoid it cannot be poisoned.
-            let delay = self.sink.as_ref().and_then(|sink| sink.delay_checkpoint());
-            if let Some(sink) = &self.sink {
-                sink.log_abort(xid);
+            // Skip the sink entirely while unwinding, barrier included. Not just
+            // the barrier: `log_abort` reaches the WAL's `inner` lock, which
+            // panics on poison *by design* — `append` takes the staged buffer out
+            // and puts it back, so a poisoned `Inner` really can be torn and that
+            // must stay fatal. Panicking here, in a `Drop` that a panic already
+            // started, aborts the process — the outcome this whole function exists
+            // to avoid.
+            //
+            // The cost is one missing abort record: if the process then dies
+            // before the next checkpoint flushes the commit log, the XID comes
+            // back `InProgress` rather than `Aborted`. Every reader treats those
+            // the same, and an abort record is not fsynced anyway, so this is the
+            // cheaper half of the trade.
+            if !std::thread::panicking() {
+                let delay = self.sink.as_ref().and_then(|sink| sink.delay_checkpoint());
+                if let Some(sink) = &self.sink {
+                    sink.log_abort(xid);
+                }
+                self.clog.set_aborted(xid);
+                drop(delay);
+            } else {
+                self.clog.set_aborted(xid);
             }
-            self.clog.set_aborted(xid);
-            drop(delay);
             self.xids.complete(xid);
         }
     }

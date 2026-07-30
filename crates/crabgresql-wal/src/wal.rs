@@ -91,13 +91,41 @@ pub struct CheckpointDelay<'a> {
     wal: &'a Wal,
 }
 
-impl Drop for CheckpointDelay<'_> {
+/// Counts one checkpointer as waiting to sample, and stops counting it on drop.
+///
+/// RAII rather than a matching decrement so that a panic anywhere inside the
+/// barrier — `current_lsn()` on a poisoned `inner`, most plausibly — cannot leave
+/// `wanted` incremented. That count is what makes new writers queue behind a
+/// waiting checkpointer, so leaking it wedges every commit, abort, buffer install
+/// and B-tree split in the process.
+struct SamplerSlot<'a> {
+    wal: &'a Wal,
+}
+
+impl Drop for SamplerSlot<'_> {
     fn drop(&mut self) {
         let mut delay = self
             .wal
             .delay
             .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        delay.wanted -= 1;
+        self.wal.delay_cond.notify_all();
+    }
+}
+
+impl Drop for CheckpointDelay<'_> {
+    fn drop(&mut self) {
+        // Never panics on a poisoned lock. This `Drop` runs during unwinding by
+        // construction — any panic between taking the guard and here reaches it —
+        // and a panicking `Drop` mid-unwind aborts the process. `Delay` is two
+        // counters with no fallible step between reading and writing them, so a
+        // poisoned guard cannot be observing a torn value.
+        let mut delay = self
+            .wal
+            .delay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         delay.active -= 1;
         if delay.active == 0 {
             self.wal.delay_cond.notify_all();
@@ -147,14 +175,20 @@ impl Wal {
     /// steady stream of delay holders could starve the checkpointer forever.
     /// `wanted` is what makes the checkpointer's side win.
     pub fn delay_checkpoint(&self) -> CheckpointDelay<'_> {
+        // Non-poisoning for the same reason as `Drop for CheckpointDelay`: a
+        // transaction abort takes one of these while its session is already
+        // unwinding, and panicking there would turn one backend's failure into a
+        // process abort. Safe only because `wanted` is restored by RAII in
+        // `redo_point` — without that, a panic inside the barrier would leave it
+        // incremented and wedge every writer here forever.
         let mut delay = self
             .delay
             .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         while delay.wanted > 0 {
             delay = match self.delay_cond.wait(delay) {
                 Ok(delay) => delay,
-                Err(_) => panic!("WAL checkpoint-delay condition-variable mutex poisoned"),
+                Err(poisoned) => poisoned.into_inner(),
             };
         }
         delay.active += 1;
@@ -182,22 +216,26 @@ impl Wal {
     /// replayed.
     pub fn redo_point(&self) -> Result<Lsn, WalError> {
         let lsn = {
+            // `wanted` is restored by RAII, not by the line below, because
+            // `current_lsn()` locks `inner` and *does* panic on poison — by
+            // design, since `Inner` has a genuinely torn state. Decrementing by
+            // hand would leak the count on that path and block every future
+            // writer in `delay_checkpoint` forever.
+            let _slot = SamplerSlot { wal: self };
             let mut delay = self
                 .delay
                 .lock()
-                .unwrap_or_else(|_| panic!("mutex poisoned"));
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             delay.wanted += 1;
             while delay.active > 0 {
                 delay = match self.delay_cond.wait(delay) {
                     Ok(delay) => delay,
-                    Err(_) => panic!("WAL checkpoint-delay condition-variable mutex poisoned"),
+                    Err(poisoned) => poisoned.into_inner(),
                 };
             }
+            drop(delay);
             // Lock order delay -> inner; nothing takes them the other way round.
-            let lsn = self.current_lsn();
-            delay.wanted -= 1;
-            self.delay_cond.notify_all();
-            lsn
+            self.current_lsn()
         };
         // Outside the barrier: an fsync here would otherwise block every writer
         // taking a delay, for no benefit — the sample is already fixed.
@@ -738,6 +776,81 @@ mod tests {
             assert!(took_second.load(Ordering::SeqCst));
             Ok(())
         })?;
+
+        Ok(())
+    }
+
+    /// Poison the delay lock, then prove every path a dying session takes still
+    /// works. A panicking `Drop` during unwinding aborts the process, so the guard
+    /// released here is the one that matters most.
+    #[test]
+    fn a_poisoned_delay_lock_does_not_take_the_process_down() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+
+        // Poison `delay` the way `redo_point` would: panic while holding it.
+        let poisoning = {
+            let wal = Arc::clone(&wal);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = wal.delay.lock().unwrap_or_else(|e| e.into_inner());
+                panic!("poison the delay lock");
+            }))
+        };
+        assert!(poisoning.is_err(), "the helper was supposed to panic");
+        assert!(wal.delay.is_poisoned());
+
+        // All three must still work: take a guard, drop it, and sample.
+        let guard = wal.delay_checkpoint();
+        drop(guard);
+        let lsn = wal.redo_point()?;
+        assert_eq!(lsn, Lsn::INVALID);
+
+        Ok(())
+    }
+
+    /// A panic inside the barrier must not leave `wanted` incremented: that count
+    /// is what makes writers queue behind a waiting checkpointer, so leaking it
+    /// blocks every commit, abort and buffer install in the process forever.
+    #[test]
+    fn a_panic_inside_the_barrier_does_not_wedge_every_writer() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+
+        // Poison `inner`, which is what makes `redo_point` panic for real: it
+        // raises `wanted`, then calls `current_lsn()`, which locks `inner` and
+        // panics on poison by design. Driving the actual function matters — a test
+        // that built a `SamplerSlot` by hand would pass even if `redo_point`
+        // stopped using one.
+        let poisoning = {
+            let wal = Arc::clone(&wal);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = wal.inner.lock().unwrap_or_else(|e| e.into_inner());
+                panic!("poison the inner lock");
+            }))
+        };
+        assert!(poisoning.is_err(), "the helper was supposed to panic");
+
+        let panicking = {
+            let wal = Arc::clone(&wal);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || wal.redo_point()))
+        };
+        assert!(
+            panicking.is_err(),
+            "redo_point must still panic on a poisoned `inner` — that poison is real"
+        );
+
+        // Under a watchdog: the regression is that this blocks forever, not that
+        // it returns something wrong.
+        let took = {
+            let wal = Arc::clone(&wal);
+            within(2_000, move || {
+                drop(wal.delay_checkpoint());
+            })
+        };
+        assert!(
+            took.is_some(),
+            "a panic inside the barrier left `wanted` raised, so no writer can proceed"
+        );
 
         Ok(())
     }
