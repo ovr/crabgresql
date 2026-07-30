@@ -312,6 +312,18 @@ impl ExecError {
     }
 }
 
+/// A bind-time error raised from inside execution — the runtime type-name
+/// resolution behind `pg_input_is_valid` / `pg_input_error_info`. The cursor
+/// position is dropped: that type name arrived as a runtime string, so it has
+/// no place in the query text.
+impl From<crabgresql_binder::BindError> for ExecError {
+    fn from(e: crabgresql_binder::BindError) -> Self {
+        ExecError::new(e.code, e.message)
+            .with_detail(e.detail)
+            .with_hint(e.hint)
+    }
+}
+
 /// A Volcano execution node: `next()` pulls one tuple at a time.
 pub trait ExecNode: Send {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError>;
@@ -2275,7 +2287,7 @@ impl TableFunctionSource {
                 .collect::<Result<Vec<_>, _>>()?;
             self.state = Some(match self.func {
                 TableFn::PgInputErrorInfo => {
-                    TableFnState::Single(Some(pg_input_error_info_row(&values)))
+                    TableFnState::Single(Some(pg_input_error_info_row(&values)?))
                 }
                 TableFn::GenerateSeries(elem) => {
                     TableFnState::Series(Series::from_args(elem, &values)?)
@@ -2304,22 +2316,23 @@ impl ExecNode for TableFunctionSource {
 
 /// One row of `pg_input_error_info(value, type_name)`:
 /// `(message, detail, hint, sql_error_code)`. A valid input (or a NULL
-/// argument) yields all-NULL; an invalid one reports the message and SQLSTATE
-/// (detail/hint stay NULL for the types the corpus exercises).
-fn pg_input_error_info_row(args: &[Value]) -> Tuple {
+/// argument) yields all-NULL; an invalid one reports the input function's
+/// message, DETAIL, HINT and SQLSTATE. An unusable *type name* is not a row —
+/// it raises, as it does in PostgreSQL.
+fn pg_input_error_info_row(args: &[Value]) -> Result<Tuple, ExecError> {
     let all_null = || vec![Value::Null, Value::Null, Value::Null, Value::Null];
     let (Value::Text(value), Value::Text(type_name)) = (&args[0], &args[1]) else {
-        return all_null();
+        return Ok(all_null());
     };
-    match scalar_fns::soft_input(type_name, value) {
+    Ok(match crabgresql_binder::soft_input(type_name, value)? {
         Ok(()) => all_null(),
-        Err((sqlstate, message)) => vec![
-            Value::Text(message),
-            Value::Null,
-            Value::Null,
-            Value::Text(sqlstate.to_string()),
+        Err(e) => vec![
+            Value::Text(e.message),
+            e.detail.map_or(Value::Null, Value::Text),
+            e.hint.map_or(Value::Null, Value::Text),
+            Value::Text(e.code.to_string()),
         ],
-    }
+    })
 }
 
 /// Build the row source for one join input: a table scan, a set-returning

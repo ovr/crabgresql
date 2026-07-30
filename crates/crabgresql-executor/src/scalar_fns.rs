@@ -17,8 +17,8 @@ use crabgresql_types::json::Jsonb;
 use crabgresql_types::jsonpath;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, geo, interval, json, macaddr,
-    money, net, text, time, timestamp, timestamptz, timetz, to_char,
+    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, geo, interval, macaddr, money,
+    net, text, time, timestamp, timestamptz, timetz, to_char,
 };
 
 use crate::ExecError;
@@ -460,10 +460,13 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             let f = f8(&args[0]);
             return Ok(Value::Bytea(f.to_be_bytes().to_vec()));
         }
+        // A bad *value* is the answer; a bad *type name* still raises, as PG's
+        // `pg_input_is_valid` does.
         ScalarFn::PgInputIsValid => {
             let value = text(&args[0]);
             let type_name = text(&args[1]);
-            return Ok(Value::Bool(soft_input(type_name, value).is_ok()));
+            let outcome = crabgresql_binder::soft_input(type_name, value)?;
+            return Ok(Value::Bool(outcome.is_ok()));
         }
         ScalarFn::DatePart => {
             // `None` is SQL NULL (an oscillating field on ±infinity).
@@ -1365,62 +1368,6 @@ fn datan2d(y: f64, x: f64) -> f64 {
     }
     let atan_1_0 = black_box(1.0f64.atan());
     (black_box(y.atan2(x)) / atan_1_0) * 45.0
-}
-
-/// Non-throwing input validation for `pg_input_is_valid` / `pg_input_error_info`.
-pub fn soft_input(type_name: &str, value: &str) -> Result<(), (&'static str, String)> {
-    match type_name.trim().to_ascii_lowercase().as_str() {
-        "float4" | "real" => float::float4in(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "float8" | "double precision" => float::float8in(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "timestamptz" | "timestamp with time zone" => timestamptz::parse(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "date" => date::parse(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "time" | "time without time zone" => time::parse(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "timetz" | "time with time zone" => timetz::parse(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "money" => money::parse(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "macaddr" => macaddr::parse_macaddr(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "macaddr8" => macaddr::parse_macaddr8(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "point" => geo::parse_point(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "lseg" => geo::parse_lseg(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "tsvector" => crabgresql_types::tsvector::tsvector_in(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "tsquery" => crabgresql_types::tsquery::tsquery_in(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "json" => json::json_in(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "jsonb" => json::jsonb_in(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        "jsonpath" => crabgresql_types::jsonpath::jsonpath_in(value)
-            .map(|_| ())
-            .map_err(|e| (e.sqlstate, e.message)),
-        // Other types: not exercised; treat as valid.
-        _ => Ok(()),
-    }
 }
 
 fn f4(v: &Value) -> f32 {

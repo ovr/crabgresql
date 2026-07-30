@@ -3317,7 +3317,7 @@ fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
 
 /// The `(precision, scale)` of a `numeric(p[,s])` / `decimal(...)` type name,
 /// or `None` for an unconstrained `numeric`. A bare `numeric(p)` has scale 0.
-fn numeric_typmod(dt: &ast::DataType) -> Option<(i32, i32)> {
+pub(crate) fn numeric_typmod(dt: &ast::DataType) -> Option<(i32, i32)> {
     use ast::{DataType, ExactNumberInfo};
     let info = match dt {
         DataType::Numeric(i) | DataType::Decimal(i) => i,
@@ -6309,7 +6309,7 @@ pub(crate) fn resolve_unknown(
     Ok(BoundExpr::Const { value, ty })
 }
 
-fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
+pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
     let invalid = || {
         BindError::new(
             sqlstate::INVALID_TEXT_REPRESENTATION,
