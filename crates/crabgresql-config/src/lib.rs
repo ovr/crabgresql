@@ -46,19 +46,29 @@ const GB: usize = KB * KB * KB;
 
 /// One relation's buffered rows sit in RAM until they become a chunk, so past
 /// a couple of gigabytes for a single table this is a memory problem rather
-/// than a tuning choice.
+/// than a tuning choice. And the steady state is not the peak: flushing copies
+/// the visible rows, encodes them into Arrow, and holds the originals until a
+/// snapshot releases them, so a buffer this size costs several times this much
+/// while it drains.
 const MAX_TABLE_BUFFER_BYTES: usize = 2 * GB;
-/// The global ceiling covers every relation at once, so it is allowed to be
-/// far larger than any one buffer. `saturating_mul` because 16 GB is more than
-/// a 32-bit `usize` can hold, where the ceiling is the address space anyway.
+/// A backstop against a typo, not a supported setting: 16 GB of resident rows
+/// plus what flushing them transiently costs is more than most machines have.
+/// `saturating_mul` because 16 GB is more than a 32-bit `usize` can hold, where
+/// the address space is the ceiling anyway.
 const MAX_GLOBAL_BUFFER_BYTES: usize = GB.saturating_mul(16);
-/// One heap page. Below that a buffer would flush on essentially every row,
-/// which is the unbuffered behavior plus the bookkeeping.
-const MIN_BUFFER_BYTES: usize = 8 * KB;
+/// Below a megabyte a buffer flushes every few rows, which is the unbuffered
+/// behavior plus the bookkeeping. These bytes are a RAM footprint, not an
+/// encoded size, and one row of a wide analytics table already costs several
+/// kilobytes of it — a `Vec<Value>` pays `size_of::<Value>()` per column
+/// whatever that column holds.
+const MIN_BUFFER_BYTES: usize = MB;
 /// Anything shorter is a background thread that spends its life waking up.
 const MIN_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Per-relation buffered bytes that make one write buffer flush-eligible.
+///
+/// Resident bytes, not encoded ones: what the rows occupy in RAM, which for a
+/// wide table is several times what they would serialize to.
 pub const BUFFER_TABLE_SOFT_BYTES: SizeVar = SizeVar {
     name: "CRABGRESQL_BUFFER_TABLE_SOFT_BYTES",
     default: 32 * MB,
@@ -66,7 +76,8 @@ pub const BUFFER_TABLE_SOFT_BYTES: SizeVar = SizeVar {
     max: MAX_TABLE_BUFFER_BYTES,
     help: "per-relation buffered bytes that make one write buffer flush-eligible",
 };
-/// Buffered bytes across all relations that make *every* buffer eligible.
+/// Buffered bytes across all relations that make *every* buffer eligible, and
+/// past which a writer waits for the flush to catch up.
 pub const BUFFER_GLOBAL_HARD_BYTES: SizeVar = SizeVar {
     name: "CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES",
     default: 256 * MB,
@@ -320,11 +331,11 @@ mod tests {
     #[test]
     fn the_readme_table_says_what_the_knobs_enforce() {
         assert_eq!(BUFFER_TABLE_SOFT_BYTES.default.render(), "32MB");
-        assert_eq!(BUFFER_TABLE_SOFT_BYTES.min.render(), "8kB");
+        assert_eq!(BUFFER_TABLE_SOFT_BYTES.min.render(), "1MB");
         assert_eq!(BUFFER_TABLE_SOFT_BYTES.max.render(), "2GB");
 
         assert_eq!(BUFFER_GLOBAL_HARD_BYTES.default.render(), "256MB");
-        assert_eq!(BUFFER_GLOBAL_HARD_BYTES.min.render(), "8kB");
+        assert_eq!(BUFFER_GLOBAL_HARD_BYTES.min.render(), "1MB");
         assert_eq!(BUFFER_GLOBAL_HARD_BYTES.max.render(), "16GB");
 
         assert_eq!(BUFFER_MAX_AGE.default.render(), "1m");
