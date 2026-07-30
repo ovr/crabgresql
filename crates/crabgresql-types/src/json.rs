@@ -45,7 +45,7 @@ const MAX_DEPTH: usize = 200;
 /// canonical [`Numeric`]s. These invariants make structural equality (`PartialEq`)
 /// and [`Hash`](std::hash::Hash) coincide with jsonb equality, and let [`cmp`]
 /// implement PG's total order.
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 pub enum Jsonb {
     Null,
     Bool(bool),
@@ -545,30 +545,6 @@ fn canonicalize_object(mut pairs: Vec<(String, Jsonb)>) -> Vec<(String, Jsonb)> 
 /// order keys print in and are compared in.
 fn key_cmp(a: &str, b: &str) -> Ordering {
     a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes()))
-}
-
-/// What this tree owns on the heap, excluding the [`Jsonb`] itself — its holder
-/// already pays for that inline. A container charges its own buffer and then
-/// recurses, so a deeply nested document costs what it actually costs.
-pub fn heap_bytes(value: &Jsonb) -> usize {
-    match value {
-        Jsonb::Null | Jsonb::Bool(_) => 0,
-        Jsonb::Number(n) => crate::numeric::heap_bytes(n),
-        Jsonb::String(s) => crate::footprint::alloc_bytes(s.capacity()),
-        Jsonb::Array(items) => {
-            crate::footprint::slice_bytes::<Jsonb>(items.capacity())
-                + items.iter().map(heap_bytes).sum::<usize>()
-        }
-        Jsonb::Object(entries) => {
-            crate::footprint::slice_bytes::<(String, Jsonb)>(entries.capacity())
-                + entries
-                    .iter()
-                    .map(|(key, value)| {
-                        crate::footprint::alloc_bytes(key.capacity()) + heap_bytes(value)
-                    })
-                    .sum::<usize>()
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

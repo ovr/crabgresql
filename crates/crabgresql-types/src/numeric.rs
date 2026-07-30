@@ -28,7 +28,7 @@ const MAX_NBASE_WEIGHT: i64 = 0x7FFF;
 /// matching PG's `NUMERIC_MIN_SIG_DIGITS`.
 const MIN_SIG_DIGITS: i32 = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 enum Sign {
     Pos,
     Neg,
@@ -38,7 +38,7 @@ enum Sign {
 }
 
 /// A `numeric` value. See the module docs for the representation invariant.
-#[derive(Clone, Debug)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug)]
 pub struct Numeric {
     sign: Sign,
     /// Decimal weight of `digits[0]`; irrelevant (kept 0) when `digits` empty.
@@ -1173,13 +1173,6 @@ impl Numeric {
     fn is_zero_to_scale(&self, scale: i32) -> bool {
         self.is_zero() || self.weight < -scale
     }
-}
-
-/// What this value owns on the heap. Lives here rather than with the other
-/// footprint walks because `digits` is private, and widening it just to be
-/// measured would be a worse trade than one function.
-pub fn heap_bytes(value: &Numeric) -> usize {
-    crate::footprint::slice_bytes::<u8>(value.digits.capacity())
 }
 
 /// ln(10) to at least `guard` fractional digits. The common transcendental

@@ -66,7 +66,7 @@ impl TsError {
 
 /// One weighted position within a lexeme. `pos` is `1..=MAX_POS`; `weight` is
 /// `0..=3` ranking `D < C < B < A`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Pos {
     pub pos: u16,
     pub weight: u8,
@@ -74,7 +74,7 @@ pub struct Pos {
 
 /// One lexeme. `positions` is sorted ascending by `pos` with no duplicate `pos`;
 /// empty means "no position information" (a stripped lexeme).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Lexeme {
     pub word: String,
     pub positions: Vec<Pos>,
@@ -82,24 +82,9 @@ pub struct Lexeme {
 
 /// A `tsvector`. Invariant: `lexemes` is sorted by `word` byte order, with no
 /// duplicate words.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TsVector {
     pub lexemes: Vec<Lexeme>,
-}
-
-/// What this vector owns on the heap: the lexeme list, and per lexeme its word
-/// and its position list. Not to be confused with [`payload_size`], which models
-/// PostgreSQL's *on-disk* footprint because that is what orders two tsvectors.
-pub fn heap_bytes(tv: &TsVector) -> usize {
-    crate::footprint::slice_bytes::<Lexeme>(tv.lexemes.capacity())
-        + tv
-            .lexemes
-            .iter()
-            .map(|lexeme| {
-                crate::footprint::alloc_bytes(lexeme.word.capacity())
-                    + crate::footprint::slice_bytes::<Pos>(lexeme.positions.capacity())
-            })
-            .sum::<usize>()
 }
 
 /// The one weight-letter table. `D` is the weakest and `A` the strongest; every

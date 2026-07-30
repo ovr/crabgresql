@@ -40,7 +40,7 @@ const SINGLETON_JSON_ITEM_REQUIRED: &str = "22038";
 const MAX_DEPTH: usize = 200;
 
 /// A parsed `jsonpath` program: a mode flag plus the root expression.
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 pub struct JsonPath {
     strict: bool,
     expr: Node,
@@ -49,7 +49,7 @@ pub struct JsonPath {
 /// A node of the jsonpath expression tree. Value/path nodes evaluate to an
 /// SQL/JSON sequence; the boolean-predicate nodes (Compare/And/Or/Not/Exists/…)
 /// evaluate to a three-valued [`Ternary`].
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 enum Node {
     Root,
     Current,
@@ -94,7 +94,7 @@ enum Node {
     IsUnknown(Box<Node>),
 }
 
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 enum Accessor {
     /// `.key` or `."key"`.
     Key(String),
@@ -111,74 +111,13 @@ enum Accessor {
     Filter(Box<Node>),
 }
 
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 enum Subscript {
     Index(Node),
     Range(Node, Node),
 }
 
-/// What this program owns on the heap. Lives here rather than with the other
-/// footprint walks because the whole node tree is private to this module.
-///
-/// A jsonpath is never a column value in bulk, so this walk is written for
-/// exhaustiveness rather than speed: every variant is spelled out so that
-/// adding a node forces a decision here, the same way the parser and the
-/// formatter do.
-pub fn heap_bytes(path: &JsonPath) -> usize {
-    node_bytes(&path.expr)
-}
-
-/// The children of `node`. The node itself is inline in whatever holds it, so
-/// only boxes, strings and vectors are charged.
-fn node_bytes(node: &Node) -> usize {
-    match node {
-        Node::Root | Node::Current | Node::Last | Node::LitBool(_) | Node::LitNull => 0,
-        Node::Var(s) | Node::LitStr(s) => crate::footprint::alloc_bytes(s.capacity()),
-        Node::LitNum(n) => crate::numeric::heap_bytes(n),
-        Node::Accessor { base, step } => boxed_node_bytes(base) + accessor_bytes(step),
-        Node::Unary { operand, .. } => boxed_node_bytes(operand),
-        Node::Arith { left, right, .. }
-        | Node::And(left, right)
-        | Node::Or(left, right)
-        | Node::Compare { left, right, .. } => boxed_node_bytes(left) + boxed_node_bytes(right),
-        Node::Not(inner) | Node::Exists(inner) | Node::IsUnknown(inner) => boxed_node_bytes(inner),
-        Node::StartsWith { operand, prefix } => boxed_node_bytes(operand) + boxed_node_bytes(prefix),
-        Node::LikeRegex {
-            operand, pattern, ..
-        } => boxed_node_bytes(operand) + crate::footprint::alloc_bytes(pattern.capacity()),
-    }
-}
-
-/// A `Box<Node>` is an allocation the size of a whole node, plus that node's own
-/// children.
-fn boxed_node_bytes(node: &Node) -> usize {
-    crate::footprint::alloc_bytes(size_of::<Node>()) + node_bytes(node)
-}
-
-fn accessor_bytes(step: &Accessor) -> usize {
-    match step {
-        Accessor::WildcardMember
-        | Accessor::WildcardArray
-        | Accessor::Recursive(_, _)
-        | Accessor::Method(_) => 0,
-        Accessor::Key(key) => crate::footprint::alloc_bytes(key.capacity()),
-        Accessor::Subscript(subscripts) => {
-            crate::footprint::slice_bytes::<Subscript>(subscripts.capacity())
-                + subscripts
-                    .iter()
-                    .map(|subscript| match subscript {
-                        // Both hold nodes inline, so only the nodes' own
-                        // children are separate allocations.
-                        Subscript::Index(node) => node_bytes(node),
-                        Subscript::Range(lo, hi) => node_bytes(lo) + node_bytes(hi),
-                    })
-                    .sum::<usize>()
-        }
-        Accessor::Filter(predicate) => boxed_node_bytes(predicate),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Hash)]
 enum Method {
     Size,
     Type,
@@ -203,7 +142,7 @@ impl Method {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Hash)]
 enum ArithOp {
     Add,
     Sub,
@@ -224,7 +163,7 @@ impl ArithOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Hash)]
 enum CmpOp {
     Eq,
     Ne,

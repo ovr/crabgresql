@@ -12,7 +12,6 @@ pub mod collation;
 pub mod datum;
 pub mod date;
 pub mod float;
-pub mod footprint;
 pub mod geo;
 pub mod interval;
 pub mod json;
@@ -131,7 +130,7 @@ pub mod oid {
     pub const REGNAMESPACE_ARRAY: u32 = 4090;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PgType {
     Bool,
     Int2,
@@ -229,7 +228,7 @@ pub enum PgType {
 /// only the three crabgresql can actually resolve are modeled. `regproc` in
 /// particular needs a `pg_proc` this build does not have, so `pg_type.typinput`
 /// and friends stay `text` in the catalog.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegKind {
     /// `regclass`: names a relation (table, view, sequence, index).
     Class,
@@ -283,7 +282,7 @@ impl RegKind {
 /// through different paths (resolved by a cast, or read back from disk) must
 /// still compare equal. Ordering and hashing agree — see `compare_values` and
 /// `hash_key` in the executor.
-#[derive(Clone, Debug)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug)]
 pub struct Reg {
     pub kind: RegKind,
     pub oid: u32,
@@ -808,7 +807,7 @@ pub fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -933,66 +932,6 @@ impl Value {
             Value::Tsquery(_) => Some(PgType::Tsquery),
             Value::Enum { type_oid, .. } => Some(PgType::User(*type_oid)),
             Value::Array { elem, .. } => Some(PgType::Array(elem.oid())),
-        }
-    }
-
-    /// The bytes this value owns *outside* itself.
-    ///
-    /// Deliberately excludes the `size_of::<Value>()` the value occupies in
-    /// place. Whoever holds it — a `Vec<Value>` row, a jsonb object's entry
-    /// list — already paid for those bytes as part of its own allocation, so
-    /// counting them here would charge a wide row for its spine twice.
-    ///
-    /// Charged against `capacity`, not `len`: the point of the number is to
-    /// predict resident memory, and capacity is what the allocator was asked
-    /// for. A value built by a push loop can sit at twice its length.
-    ///
-    /// The match is exhaustive on purpose. A new variant that owns an
-    /// allocation must not be able to reach a buffer table's accounting through
-    /// a wildcard arm reporting zero — the same discipline [`Value::pg_type`]
-    /// and [`Value::encode_text_with`] enforce, which is why all three live
-    /// together.
-    pub fn heap_bytes(&self) -> usize {
-        match self {
-            // Everything inline: a fixed-width payload, or none at all. Listed
-            // in declaration order so this arm can be diffed against the enum
-            // by eye.
-            Value::Null
-            | Value::Bool(_)
-            | Value::Int2(_)
-            | Value::Int4(_)
-            | Value::Int8(_)
-            | Value::Float4(_)
-            | Value::Float8(_)
-            | Value::Money(_)
-            | Value::Oid(_)
-            | Value::Date(_)
-            | Value::Time(_)
-            | Value::TimeTz(_)
-            | Value::Timestamp(_)
-            | Value::TimestampTz(_)
-            | Value::Interval(_)
-            | Value::Uuid(_)
-            | Value::Inet(_)
-            | Value::Cidr(_)
-            | Value::Macaddr(_)
-            | Value::Macaddr8(_)
-            | Value::Point(_)
-            | Value::Lseg(_) => 0,
-            Value::Numeric(n) => numeric::heap_bytes(n),
-            Value::Reg(r) => footprint::alloc_bytes(r.name.capacity()),
-            Value::Text(s) | Value::Json(s) => footprint::alloc_bytes(s.capacity()),
-            Value::Bytea(b) => footprint::slice_bytes::<u8>(b.capacity()),
-            Value::Bit { data, .. } => footprint::slice_bytes::<u8>(data.capacity()),
-            Value::Jsonb(j) => json::heap_bytes(j),
-            Value::Jsonpath(p) => jsonpath::heap_bytes(p),
-            Value::Tsvector(tv) => tsvector::heap_bytes(tv),
-            Value::Tsquery(q) => tsquery::heap_bytes(q),
-            Value::Enum { label, .. } => footprint::alloc_bytes(label.capacity()),
-            Value::Array { elems, .. } => {
-                footprint::slice_bytes::<Value>(elems.capacity())
-                    + elems.iter().map(Value::heap_bytes).sum::<usize>()
-            }
         }
     }
 
@@ -1121,6 +1060,7 @@ impl std::error::Error for tz::ZoneError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deepsize::DeepSizeOf;
 
     #[test]
     fn bool_encodes_as_t_f() {
@@ -1128,12 +1068,13 @@ mod tests {
         assert_eq!(Value::Bool(false).encode_text().as_deref(), Some("f"));
     }
 
-    /// Pins the contract: `heap_bytes` reports what a value owns *elsewhere*,
-    /// never the bytes it occupies in place. A `size_of::<Value>()` added
-    /// inside — which reads like a helpful correction — fails right here,
-    /// because it would charge every column of a wide row for its spine twice.
+    /// Pins the derived [`DeepSizeOf`]: a variant with no allocation of its
+    /// own must report exactly the bytes it occupies in place. This is what
+    /// fails if a future variant smuggles in a `Vec`/`String`/`Box` without the
+    /// derive being able to see it, or if the derive is dropped from a payload
+    /// type and its heap silently stops being counted.
     #[test]
-    fn an_inline_value_owns_no_heap() {
+    fn an_inline_value_reports_only_itself() {
         let inline = [
             Value::Null,
             Value::Bool(true),
@@ -1157,15 +1098,19 @@ mod tests {
             Value::Lseg([1.0, 2.0, 3.0, 4.0]),
         ];
         for value in inline {
-            assert_eq!(value.heap_bytes(), 0, "{value:?} owns nothing");
+            assert_eq!(
+                value.deep_size_of(),
+                size_of::<Value>(),
+                "{value:?} owns nothing beyond itself"
+            );
         }
         // A heap-*capable* variant that has not allocated is in the same
         // position: an empty `Vec`/`String` never called the allocator.
-        assert_eq!(Value::Text(String::new()).heap_bytes(), 0);
-        assert_eq!(Value::Bytea(Vec::new()).heap_bytes(), 0);
+        assert_eq!(Value::Text(String::new()).deep_size_of(), size_of::<Value>());
+        assert_eq!(Value::Bytea(Vec::new()).deep_size_of(), size_of::<Value>());
         assert_eq!(
-            Value::Array { elem: PgType::Int4, elems: Vec::new() }.heap_bytes(),
-            0
+            Value::Array { elem: PgType::Int4, elems: Vec::new() }.deep_size_of(),
+            size_of::<Value>()
         );
     }
 
@@ -1221,37 +1166,39 @@ mod tests {
             ),
         ];
         for (value, least) in cases {
-            let charged = value.heap_bytes();
+            let charged = value.deep_size_of();
+            let floor = size_of::<Value>() + least;
             assert!(
-                charged >= least,
-                "{value:?} charged {charged}, below the {least} bytes it visibly holds"
+                charged >= floor,
+                "{value:?} charged {charged}, below the {floor} bytes it visibly holds"
             );
         }
     }
 
-    /// The property a lazily-written `=> 0` arm cannot fake. An arm that
-    /// returns a constant passes the lower bounds above; it cannot pass this.
+    /// The property a type missing its `DeepSizeOf` derive cannot fake. A
+    /// payload whose heap is not walked reports a constant, and a constant
+    /// cannot grow with the data.
     #[test]
     fn a_bigger_payload_is_charged_more() -> anyhow::Result<()> {
         let small = Value::Text("x".repeat(10));
         let big = Value::Text("x".repeat(1000));
-        assert!(big.heap_bytes() > small.heap_bytes());
+        assert!(big.deep_size_of() > small.deep_size_of());
 
         let scalar = Value::Jsonb(json::jsonb_in("1")?);
         let nested = Value::Jsonb(json::jsonb_in("{\"a\":[1,2,3],\"b\":{\"c\":\"d\"}}")?);
-        assert!(nested.heap_bytes() > scalar.heap_bytes());
+        assert!(nested.deep_size_of() > scalar.deep_size_of());
 
         let one_lexeme = Value::Tsvector(tsvector::tsvector_in("'a'")?);
         let many = Value::Tsvector(tsvector::tsvector_in("'a':1,2,3 'b' 'c' 'd' 'e'")?);
-        assert!(many.heap_bytes() > one_lexeme.heap_bytes());
+        assert!(many.deep_size_of() > one_lexeme.deep_size_of());
 
         let leaf = Value::Tsquery(tsquery::tsquery_in("'a'")?);
         let tree = Value::Tsquery(tsquery::tsquery_in("'a' & 'b' & ('c' | !'d')")?);
-        assert!(tree.heap_bytes() > leaf.heap_bytes());
+        assert!(tree.deep_size_of() > leaf.deep_size_of());
 
         let short_path = Value::Jsonpath(jsonpath::jsonpath_in("$")?);
         let long_path = Value::Jsonpath(jsonpath::jsonpath_in("$.a.b.c[*] ? (@.x > 3 && @.y < 4)")?);
-        assert!(long_path.heap_bytes() > short_path.heap_bytes());
+        assert!(long_path.deep_size_of() > short_path.deep_size_of());
 
         let one = Value::Array {
             elem: PgType::Int4,
@@ -1261,7 +1208,7 @@ mod tests {
             elem: PgType::Int4,
             elems: (0..100).map(Value::Int4).collect(),
         };
-        assert!(hundred.heap_bytes() > one.heap_bytes());
+        assert!(hundred.deep_size_of() > one.deep_size_of());
         Ok(())
     }
 

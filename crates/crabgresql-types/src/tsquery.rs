@@ -50,7 +50,7 @@ pub const W_C: u8 = 1 << 1;
 pub const W_D: u8 = 1 << 0;
 
 /// One node of the query tree.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Node {
     /// A lexeme, optionally a prefix match (`:*`) and/or weight-restricted
     /// (`:AB`). `weights == 0` means any weight.
@@ -71,31 +71,9 @@ pub enum Node {
 }
 
 /// A `tsquery`. An empty query (`''::tsquery`) has no root and matches nothing.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TsQuery {
     pub root: Option<Node>,
-}
-
-/// What this query owns on the heap. The root node is stored inline in the
-/// `Option`, so only its *children* — which are boxed — are separate
-/// allocations; each box costs a whole `Node` plus whatever that node owns.
-pub fn heap_bytes(q: &TsQuery) -> usize {
-    fn node_bytes(node: &Node) -> usize {
-        match node {
-            Node::Val { word, .. } => crate::footprint::alloc_bytes(word.capacity()),
-            Node::Not(inner) => boxed_bytes(inner),
-            Node::And(left, right) | Node::Or(left, right) => {
-                boxed_bytes(left) + boxed_bytes(right)
-            }
-            Node::Phrase { left, right, .. } => boxed_bytes(left) + boxed_bytes(right),
-        }
-    }
-
-    fn boxed_bytes(node: &Node) -> usize {
-        crate::footprint::alloc_bytes(size_of::<Node>()) + node_bytes(node)
-    }
-
-    q.root.as_ref().map_or(0, node_bytes)
 }
 
 /// PG's wording when its parser stack fills; ours reports the same thing when a

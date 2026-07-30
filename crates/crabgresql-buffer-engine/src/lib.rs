@@ -40,7 +40,7 @@ use crabgresql_txn::{
 };
 use crabgresql_types::Value;
 use crabgresql_types::datum::{decode_datum, encode_datum};
-use crabgresql_types::footprint;
+use deepsize::DeepSizeOf;
 use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, Wal, WalError};
 
 /// Resource manager for buffer-table records. 10 is the heap, 11 the B-tree,
@@ -90,14 +90,16 @@ impl BufferRow {
     /// The number feeds a memory budget an operator sets to bound RSS, so it
     /// may be imprecise but must never be systematically low: a threshold that
     /// admits several times the rows it was asked for is not a tuning
-    /// inaccuracy, it is a limit that does not limit. Three terms, and the
-    /// middle one is the one worth naming — `size_of::<Value>()` is charged per
-    /// *column*, however small that column's type, because that is what a
-    /// `Vec<Value>` costs.
+    /// inaccuracy, it is a limit that does not limit. The term worth naming is
+    /// the tuple's — `size_of::<Value>()` is charged per *column*, however small
+    /// that column's type, because that is what a `Vec<Value>` costs.
+    ///
+    /// It is a floor rather than an exact figure: [`DeepSizeOf`] sums the
+    /// capacities a program asked the allocator for, and an allocator rounds
+    /// every request up to a granule and refuses to go below a minimum block,
+    /// so a row of many small strings really costs somewhat more than this.
     fn new(row_id: u64, values: Tuple, hdr: TupleHeader) -> BufferRow {
-        let bytes = size_of::<BufferRow>()
-            + footprint::slice_bytes::<Value>(values.capacity())
-            + values.iter().map(Value::heap_bytes).sum::<usize>();
+        let bytes = size_of::<BufferRow>() + tuple_heap_bytes(&values);
         BufferRow {
             row_id,
             values,
@@ -105,6 +107,16 @@ impl BufferRow {
             bytes,
         }
     }
+}
+
+/// What a tuple owns beyond the `Vec` header that sits inline in its holder.
+///
+/// [`DeepSizeOf::deep_size_of`] reports the header too, and the only way to ask
+/// for children alone needs a `deepsize::Context` the crate does not let a
+/// caller construct — so the header is subtracted back off here rather than
+/// double-counted against the [`BufferRow`] that already contains it.
+fn tuple_heap_bytes(values: &Tuple) -> usize {
+    values.deep_size_of() - size_of::<Tuple>()
 }
 
 /// A row recovered from the WAL, before its transaction's fate is known.
@@ -1069,7 +1081,7 @@ mod tests {
         let hdr = TupleHeader::inserted(Xid::FIRST_NORMAL, CommandId::FIRST);
         let charged = BufferRow::new(0, values, hdr).bytes;
 
-        let base = size_of::<BufferRow>() + footprint::slice_bytes::<Value>(COLUMNS);
+        let base = size_of::<BufferRow>() + COLUMNS * size_of::<Value>();
         assert!(
             charged >= base + TEXTS * TEXT_LEN,
             "charged {charged}, below the {base} spine plus its text"
