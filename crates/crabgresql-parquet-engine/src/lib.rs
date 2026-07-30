@@ -897,6 +897,16 @@ pub struct ParquetTable {
     /// Cheap gate letting the read/write hot path skip the `pending` RwLock read
     /// entirely while no TRUNCATE is in flight — kept in sync with `pending`.
     has_pending: AtomicBool,
+    /// A `PARQUET_TRUNCATE` record is in the log whose swap the catalog does not
+    /// name yet, so replay must still be able to reach it.
+    ///
+    /// Deliberately NOT tied to `has_pending`, which `commit_truncate` clears
+    /// before this type has even finished its own directory work — and well before
+    /// the engine's `swap_relfilenode` makes the swap durable. A checkpoint
+    /// sampling in that window would publish a redo point above the record, and a
+    /// crash would leave the catalog naming a directory `remove_dir_all_ok` has
+    /// already deleted.
+    truncate_unreconciled: AtomicBool,
     /// Serializes TRUNCATE (exclusive) against readers/writers (shared).
     lock: Arc<TableLock>,
     wal: Arc<Wal>,
@@ -939,6 +949,7 @@ impl ParquetTable {
             live_rel: AtomicU32::new(rel),
             pending: RwLock::new(None),
             has_pending: AtomicBool::new(false),
+            truncate_unreconciled: AtomicBool::new(false),
             lock: Arc::new(TableLock::new()),
             wal,
             relfilenodes,
@@ -962,12 +973,16 @@ impl ParquetTable {
         self.dir_of(self.relfilenode())
     }
 
-    /// Whether a TRUNCATE has staged a directory that no commit or abort has
-    /// resolved yet. The checkpoint reads this: until the swap is resolved and
-    /// written to the catalog, the `PARQUET_TRUNCATE` record is its only durable
-    /// trace, so replay must keep reaching it.
-    pub fn has_pending_truncate(&self) -> bool {
-        self.has_pending.load(Ordering::Acquire)
+    /// Whether a TRUNCATE record of this relation still needs replay to reach it.
+    /// Read by the checkpoint; see the field's documentation.
+    pub fn truncate_unreconciled(&self) -> bool {
+        self.truncate_unreconciled.load(Ordering::Acquire)
+    }
+
+    /// The swap is now named by the durable catalog, so replay need not reach the
+    /// record any more.
+    pub fn truncate_reconciled(&self) {
+        self.truncate_unreconciled.store(false, Ordering::Release);
     }
 
     /// The relfilenode `xid` should read and write: the directory staged by its own
@@ -1238,6 +1253,10 @@ impl ParquetTable {
         let p = pending.take_if(|p| p.xid == xid)?;
         let old = self.live_rel.swap(p.new_rel, Ordering::Relaxed);
         self.has_pending.store(false, Ordering::Release);
+        // `truncate_unreconciled` is deliberately NOT cleared here — see its
+        // documentation. The caller still has directory work and a catalog write
+        // ahead of it, and the record is the swap's only durable trace until that
+        // write lands.
         // The measurement described the directory that just went away.
         self.forget_analyzed();
         Some(old)
@@ -1253,6 +1272,8 @@ impl ParquetTable {
         let Some(p) = pending.take_if(|p| p.xid == xid) else {
             return;
         };
+        // The swap never happened, so no replay is needed to reconcile it.
+        self.truncate_reconciled();
         self.has_pending.store(false, Ordering::Release);
         *self
             .next_block
@@ -1286,6 +1307,9 @@ impl ParquetTable {
             *pending = None;
             self.has_pending.store(false, Ordering::Release);
         }
+        // Recovery applied the swap and persisted the catalog: what the pin waited
+        // for.
+        self.truncate_reconciled();
         *self
             .next_block
             .lock()
@@ -1844,45 +1868,56 @@ impl ParquetTable {
         // now; and because it carries the XID, a transaction that only TRUNCATEs is
         // still observed by recovery's XID allocator without a separate
         // `PARQUET_XID_OBSERVED` record.
-        let lsn = self.wal.append(
-            RMGR_PARQUET,
-            PARQUET_TRUNCATE,
-            txn.xid,
-            &encode_truncate(&self.schema.namespace, &self.schema.name, old, new),
-        );
-        self.wal
-            .flush(lsn.end)
-            .map_err(|error| io_error("flush Parquet TRUNCATE WAL record", error))?;
-        self.staged_xids
-            .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"))
-            .insert(txn.xid);
-        let mut pending = self
-            .pending
-            .write()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let mut next = self
-            .next_block
-            .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"));
-        // A second TRUNCATE in one transaction keeps the FIRST saved counter: abort
-        // must restore what the transaction found, not what its own first TRUNCATE
-        // left behind (invariant P2).
-        let saved = pending
-            .as_ref()
-            .filter(|p| p.xid == txn.xid)
-            .map_or(*next, |p| p.saved_next_block);
-        let superseded = pending.replace(PendingTruncate {
-            xid: txn.xid,
-            new_rel: new,
-            owner: txn.lock_owner,
-            saved_next_block: saved,
-        });
-        self.has_pending.store(true, Ordering::Release);
-        // The staged directory is empty, so its fragments start from block 1 again.
-        *next = 1;
-        drop(next);
-        drop(pending);
+        // Held from the append through every piece of state a checkpoint reads, so
+        // a redo point cannot be sampled above a record whose relation still looks
+        // unpinned. A block expression, so it ends before the `remove_dir_all_ok`
+        // below rather than covering that file I/O too.
+        let superseded = {
+            let _delay = self.wal.delay_checkpoint();
+            let lsn = self.wal.append(
+                RMGR_PARQUET,
+                PARQUET_TRUNCATE,
+                txn.xid,
+                &encode_truncate(&self.schema.namespace, &self.schema.name, old, new),
+            );
+            self.wal
+                .flush(lsn.end)
+                .map_err(|error| io_error("flush Parquet TRUNCATE WAL record", error))?;
+            // Only once the record is durable: a failed flush must leave nothing
+            // pinned.
+            self.truncate_unreconciled.store(true, Ordering::Release);
+            self.staged_xids
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .insert(txn.xid);
+            let mut pending = self
+                .pending
+                .write()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            let mut next = self
+                .next_block
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"));
+            // A second TRUNCATE in one transaction keeps the FIRST saved counter: abort
+            // must restore what the transaction found, not what its own first TRUNCATE
+            // left behind (invariant P2).
+            let saved = pending
+                .as_ref()
+                .filter(|p| p.xid == txn.xid)
+                .map_or(*next, |p| p.saved_next_block);
+            let superseded = pending.replace(PendingTruncate {
+                xid: txn.xid,
+                new_rel: new,
+                owner: txn.lock_owner,
+                saved_next_block: saved,
+            });
+            self.has_pending.store(true, Ordering::Release);
+            // The staged directory is empty, so its fragments start from block 1 again.
+            *next = 1;
+            drop(next);
+            drop(pending);
+            superseded
+        };
         if let Some(superseded) = superseded {
             // Used only by this uncommitted transaction; reclaim it now.
             let _ = remove_dir_all_ok(&self.dir_of(superseded.new_rel));

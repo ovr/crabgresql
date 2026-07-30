@@ -103,60 +103,16 @@ pub(crate) struct EngineInner {
     /// every table for a matching pending XID on every commit, is O(tables). The
     /// commit/abort hook drains an XID's entry to apply or discard its swaps and
     /// release the table locks.
+    ///
+    /// Emphatically NOT a durability signal, though it looks like one: it is
+    /// drained at the *top* of the commit hook, before the swap it describes is
+    /// durable, and a `wal_skipped` relation registers here with no record for
+    /// replay to reach. Whether a checkpoint may bound replay is each table's own
+    /// `truncate_unreconciled`.
     pub pending_truncates: Mutex<HashMap<Xid, Vec<(String, String)>>>,
     /// TRUNCATE swaps replayed from the WAL during recovery, applied after the
     /// CLOG is rebuilt (see [`PgEngine::apply_recovered_truncates`]).
     pub recovered_truncates: Mutex<Vec<RecoveredTruncate>>,
-    /// Committed TRUNCATE swaps whose catalog write has not landed yet — the
-    /// window between `pending_truncates` being drained and
-    /// `RelCatalog::swap_relfilenode` returning.
-    ///
-    /// A checkpoint consults this (see [`PgEngine::redo_floor`]) because a swap in
-    /// that window has no durable trace but its WAL record: the catalog still
-    /// names the old file, and the repair both commit hooks promise — "reconciled
-    /// from the WAL at next recovery" — only happens if replay still reaches the
-    /// record. Counting it here rather than reading `pending_truncates` is the
-    /// whole point: that map is emptied *first*, so a clamp keyed on it would lift
-    /// exactly while the swap is least durable.
-    pub finalizing_truncates: AtomicU64,
-}
-
-impl EngineInner {
-    /// Hold the published redo point down while a committed TRUNCATE's swap is
-    /// being written to the catalog. Released on drop, or held for good by
-    /// [`TruncatePin::hold`].
-    fn pin_truncate(&self) -> TruncatePin<'_> {
-        self.finalizing_truncates.fetch_add(1, Ordering::SeqCst);
-        TruncatePin {
-            inner: self,
-            release: true,
-        }
-    }
-}
-
-/// Keeps a checkpoint from bounding replay above a TRUNCATE record whose swap the
-/// catalog does not name yet.
-struct TruncatePin<'a> {
-    inner: &'a EngineInner,
-    release: bool,
-}
-
-impl TruncatePin<'_> {
-    /// Never release: the catalog write failed, so the WAL record is the swap's
-    /// only trace and every future replay has to keep reaching it. Costs an
-    /// unbounded replay until an operator intervenes, which is the right trade
-    /// against losing a committed TRUNCATE.
-    fn hold(mut self) {
-        self.release = false;
-    }
-}
-
-impl Drop for TruncatePin<'_> {
-    fn drop(&mut self) {
-        if self.release {
-            self.inner.finalizing_truncates.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
 }
 
 /// Exposes the relation catalog's relfilenode counter to an out-of-crate access
@@ -383,7 +339,6 @@ impl PgEngine {
             wal: Arc::clone(&wal),
             catalog: Arc::clone(&catalog),
             pending_truncates: Mutex::new(HashMap::new()),
-            finalizing_truncates: AtomicU64::new(0),
             recovered_truncates: Mutex::new(Vec::new()),
         });
         registry.register(
@@ -744,18 +699,6 @@ impl PgEngine {
         if self.clog.get().is_none() {
             return Some(Lsn::INVALID);
         }
-        // A staged TRUNCATE, or one whose swap is mid-publication. See
-        // `EngineInner::finalizing_truncates`.
-        if !self
-            .inner
-            .pending_truncates
-            .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"))
-            .is_empty()
-            || self.inner.finalizing_truncates.load(Ordering::SeqCst) > 0
-        {
-            return Some(Lsn::INVALID);
-        }
         for table in self
             .tables
             .read()
@@ -768,11 +711,11 @@ impl PgEngine {
             // story as the heap's, tracked on the table rather than in the engine.
             let pinned = match table.as_ref() {
                 ManagedTable::Parquet(parquet) => {
-                    parquet.chunks().has_pending_truncate()
+                    parquet.chunks().truncate_unreconciled()
                         || parquet.buffer().resident_bytes() > 0
                 }
                 ManagedTable::Buffer(buffer) => buffer.resident_bytes() > 0,
-                ManagedTable::Heap(_) => false,
+                ManagedTable::Heap(heap) => heap.truncate_unreconciled(),
             };
             if pinned {
                 return Some(Lsn::INVALID);
@@ -1179,10 +1122,6 @@ impl TxnFinalize for PgEngine {
                 // The lock is held across the persist so a concurrent TRUNCATE that
                 // commits can't have its catalog write clobbered by a stale one.
                 if let Some((old, owner)) = t.commit_truncate(xid) {
-                    // Keep replay reaching the TRUNCATE record until the catalog
-                    // names the new file: between `commit_truncate` and the persist
-                    // below, the WAL record is the swap's only durable trace.
-                    let pin = self.inner.pin_truncate();
                     // The commit is already durable in the WAL, so a catalog persist
                     // failure is not fatal — recovery re-applies the swap from the
                     // WAL at the next boot; log and continue rather than panic. (A
@@ -1198,9 +1137,12 @@ impl TxnFinalize for PgEngine {
                             "TRUNCATE commit: catalog persist failed; \
                              will be reconciled from the WAL at next recovery"
                         );
-                        // That promise now depends on replay still reading the
-                        // record, so stop bounding it.
-                        pin.hold();
+                        // That promise depends on replay still reaching the record,
+                        // so leave the relation pinned: no checkpoint may bound
+                        // replay above it until a later persist succeeds.
+                    } else {
+                        // Only now is the swap durable.
+                        t.truncate_reconciled();
                     }
                     self.inner.discard_relfile(old);
                     t.release_truncate_lock(owner);
@@ -1220,9 +1162,6 @@ impl TxnFinalize for PgEngine {
                 // repairs it at the next recovery), but the hold is released either
                 // way or the table would be wedged for the process lifetime.
                 Ok(Some(swap)) => {
-                    // As in the heap arm: the record is the swap's only durable
-                    // trace until the catalog write lands.
-                    let pin = self.inner.pin_truncate();
                     if let Err(error) =
                         self.catalog
                             .swap_relfilenode(namespace, name, RelFileNode(swap.new_rel))
@@ -1233,7 +1172,9 @@ impl TxnFinalize for PgEngine {
                             "Parquet TRUNCATE commit: catalog persist failed; \
                              will be reconciled from the WAL at next recovery"
                         );
-                        pin.hold();
+                        // As in the heap arm: leave it pinned.
+                    } else {
+                        parquet.chunks().truncate_reconciled();
                     }
                     parquet.release_truncate_lock(swap.owner);
                 }
@@ -1865,7 +1806,7 @@ mod tests {
     use crabgresql_storage_api::{Column, TableEngine, TableSchema};
     use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnFinalize, Xid};
     use crabgresql_types::{PgType, Value};
-    use crabgresql_wal::{Wal, read_control};
+    use crabgresql_wal::{Lsn, Wal, read_control};
 
     use crate::PgEngine;
 
@@ -1920,6 +1861,154 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("the checkpoint payload did not decode"))?;
         assert_eq!(ckpt.redo_lsn, control.redo_lsn);
         assert_eq!(ckpt.next_xid, control.next_xid);
+
+        Ok(())
+    }
+
+    fn wired(
+        dir: &std::path::Path,
+    ) -> anyhow::Result<(Arc<PgEngine>, TransactionManager, Arc<Wal>)> {
+        let wal = Arc::new(Wal::open(dir)?);
+        let (engine, clog, next_xid) = PgEngine::open_recovered(dir, Arc::clone(&wal))?;
+        let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+        let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
+        tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
+        Ok((engine, tm, wal))
+    }
+
+    fn one_column(name: &str) -> TableSchema {
+        TableSchema::new(name, vec![Column::new("id", PgType::Int4)])
+    }
+
+    /// A committed TRUNCATE is repaired from its WAL record when the catalog write
+    /// has not landed, so replay must still be able to reach that record. The pin
+    /// therefore has to outlive `commit_truncate`, which only applies the swap in
+    /// memory — clearing it there would drop the pin exactly while the swap is
+    /// least durable.
+    #[test]
+    fn the_truncate_pin_holds_until_the_catalog_names_the_swap() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // No finalize hook: `commit` makes the record and the CLOG bit durable but
+        // never runs the swap, so this test drives the hook's steps by hand and can
+        // look between them.
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let (engine, clog, next_xid) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let tm = TransactionManager::new_recovered(
+            Arc::clone(&wal) as Arc<dyn CommitSink>,
+            clog,
+            next_xid,
+        );
+        let table = engine.create_table(one_column("t"))?;
+        let xid = tm.allocate_xid();
+        table.truncate(&tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+
+        assert_eq!(
+            engine.redo_floor(),
+            Some(Lsn::INVALID),
+            "a staged TRUNCATE must pin replay"
+        );
+
+        let swapped_to = {
+            let tables = engine
+                .tables
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            let heap = tables
+                .get(&("public".to_string(), "t".to_string()))
+                .and_then(|t| t.as_heap())
+                .ok_or_else(|| anyhow::anyhow!("t is not a heap table"))?;
+            heap.commit_truncate(xid)
+                .ok_or_else(|| anyhow::anyhow!("nothing was staged"))?;
+            heap.relfilenode()
+        };
+        assert_eq!(
+            engine.redo_floor(),
+            Some(Lsn::INVALID),
+            "the swap is still only in memory: replay must stay unbounded"
+        );
+
+        engine.catalog.swap_relfilenode("public", "t", swapped_to)?;
+        {
+            let tables = engine
+                .tables
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            let heap = tables
+                .get(&("public".to_string(), "t".to_string()))
+                .and_then(|t| t.as_heap())
+                .ok_or_else(|| anyhow::anyhow!("t is not a heap table"))?;
+            heap.truncate_reconciled();
+        }
+        assert_eq!(
+            engine.redo_floor(),
+            None,
+            "once the catalog names the swap, replay may be bounded again"
+        );
+
+        Ok(())
+    }
+
+    /// An `UNLOGGED` TRUNCATE writes no record, so there is nothing for replay to
+    /// reach and pinning the redo point for it would clamp the whole cluster to a
+    /// whole-stream replay for free.
+    #[test]
+    fn a_wal_skipped_truncate_does_not_clamp_the_cluster() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (engine, tm, _wal) = wired(dir.path())?;
+        let mut unlogged = one_column("u");
+        unlogged.persistence = crabgresql_storage_api::RelPersistence::Unlogged;
+        let unlogged = engine.create_table(unlogged)?;
+        let logged = engine.create_table(one_column("t"))?;
+
+        let xid = tm.allocate_xid();
+        unlogged.truncate(&tm.context(xid, CommandId::FIRST))?;
+        assert_eq!(
+            engine.redo_floor(),
+            None,
+            "an unlogged TRUNCATE has no record to replay, so it must not clamp"
+        );
+
+        // The positive control: a logged one does clamp, so the assertion above
+        // cannot be passing merely because the clamp is broken outright.
+        logged.truncate(&tm.context(xid, CommandId::FIRST))?;
+        assert_eq!(engine.redo_floor(), Some(Lsn::INVALID));
+
+        Ok(())
+    }
+
+    /// Every table a transaction truncated stays pinned until its *own* catalog
+    /// write lands. The pin used to be taken per table inside the commit hook,
+    /// after one drain had already cleared the state for all of them, so the tables
+    /// later in the list were covered by nothing.
+    #[test]
+    fn every_table_in_a_multi_table_truncate_stays_pinned() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (engine, tm, _wal) = wired(dir.path())?;
+        let a = engine.create_table(one_column("a"))?;
+        let b = engine.create_table(one_column("b"))?;
+
+        let xid = tm.allocate_xid();
+        a.truncate(&tm.context(xid, CommandId::FIRST))?;
+        b.truncate(&tm.context(xid, CommandId::FIRST))?;
+        assert_eq!(engine.redo_floor(), Some(Lsn::INVALID));
+
+        // Reconciling one of them must not lift the clamp for the other.
+        let tables = engine
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let heap_a = tables
+            .get(&("public".to_string(), "a".to_string()))
+            .and_then(|t| t.as_heap())
+            .ok_or_else(|| anyhow::anyhow!("a is not a heap table"))?;
+        heap_a.truncate_reconciled();
+        drop(tables);
+        assert_eq!(
+            engine.redo_floor(),
+            Some(Lsn::INVALID),
+            "b is still unreconciled, so replay must stay unbounded"
+        );
 
         Ok(())
     }

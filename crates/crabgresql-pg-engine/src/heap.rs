@@ -58,6 +58,22 @@ pub struct HeapTable {
     /// Cheap gate that lets the read/write hot path skip the `pending` RwLock read
     /// entirely while no TRUNCATE is in flight — kept in sync with `pending`.
     has_pending: AtomicBool,
+    /// A `HEAP_TRUNCATE` record is in the log whose swap the catalog does not name
+    /// yet, so replay must still be able to reach it.
+    ///
+    /// Deliberately NOT tied to `has_pending`, which is cleared the moment the
+    /// in-memory swap is applied — several statements before `swap_relfilenode`
+    /// makes it durable. A checkpoint sampling in between would publish a redo
+    /// point above the record whose replay is the only thing that repairs the
+    /// swap, and the committed TRUNCATE would silently revert.
+    ///
+    /// Set only when a record was actually appended: a `wal_skipped` relation has
+    /// nothing for replay to reach, so pinning the redo point for it would clamp
+    /// the whole cluster to a whole-stream replay for no reason.
+    ///
+    /// There is no `Drop` to clear it, on purpose: a panic between the append and
+    /// the catalog write leaves it set, which is the safe direction.
+    truncate_unreconciled: AtomicBool,
     /// Serializes TRUNCATE (exclusive) against readers/writers (shared).
     lock: Arc<TableLock>,
     /// Last block we inserted into — where the next insert tries first.
@@ -114,6 +130,7 @@ impl HeapTable {
             live_rel: AtomicU32::new(rel.0),
             pending: RwLock::new(None),
             has_pending: AtomicBool::new(false),
+            truncate_unreconciled: AtomicBool::new(false),
             lock: Arc::new(TableLock::new()),
             insert_hint: AtomicU32::new(0),
             indexes: RwLock::new(indexes),
@@ -340,6 +357,11 @@ impl HeapTable {
         let p = pending.take_if(|p| p.xid == xid)?;
         let old = self.live_rel.swap(p.new_rel, Ordering::Relaxed);
         self.has_pending.store(false, Ordering::Release);
+        // `truncate_unreconciled` is deliberately NOT cleared here. The swap is
+        // only in memory at this point; it becomes durable when the caller's
+        // `swap_relfilenode` returns, and `truncate_reconciled` is what says so.
+        // Clearing it next to `has_pending` is the mistake this comment exists to
+        // stop — it would drop the pin exactly while the swap is least durable.
         self.insert_hint.store(0, Ordering::Relaxed);
         // The measurement described the file that just went away, so drop it
         // rather than let it describe the empty one. Back to never-analyzed —
@@ -362,6 +384,8 @@ impl HeapTable {
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let p = pending.take_if(|p| p.xid == xid)?;
         self.has_pending.store(false, Ordering::Release);
+        // The swap never happened, so no replay is needed to reconcile it.
+        self.truncate_reconciled();
         Some((RelFileNode(p.new_rel), p.owner))
     }
 
@@ -388,8 +412,23 @@ impl HeapTable {
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned")) = None;
         self.has_pending.store(false, Ordering::Release);
+        // Recovery just applied the swap and persisted the catalog, which is
+        // exactly what the pin was waiting for.
+        self.truncate_reconciled();
         self.live_rel.store(new.0, Ordering::Relaxed);
         self.insert_hint.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether a TRUNCATE record of this relation still needs replay to reach it.
+    /// Read by the checkpoint; see the field's documentation.
+    pub(crate) fn truncate_unreconciled(&self) -> bool {
+        self.truncate_unreconciled.load(Ordering::Acquire)
+    }
+
+    /// The swap is now named by the durable catalog, so replay need not reach the
+    /// record any more.
+    pub(crate) fn truncate_reconciled(&self) {
+        self.truncate_unreconciled.store(false, Ordering::Release);
     }
 
     fn io<T>(r: std::io::Result<T>) -> T {
@@ -704,32 +743,58 @@ impl TableAm for HeapTable {
             self.engine.bufpool.smgr().register_memory(new);
         }
         Self::io(self.engine.bufpool.smgr().create_if_missing(new));
-        // WAL-log the swap intent {old, new, table} and flush it. Recovery applies
-        // the swap only for a committed XID, so the record is safe to write now. A
-        // WAL-skipped table (`Unlogged`/`Temporary`) writes no such record (an
-        // Unlogged table's data is reset on crash instead), but the swap still runs
-        // through the same commit/abort finalize path.
-        if !self.wal_skipped {
-            let lsn = self.engine.wal.append(
-                RmgrId::HEAP,
-                rec::HEAP_TRUNCATE,
-                txn.xid,
-                &rec::truncate(&self.schema.namespace, &self.schema.name, old, new),
-            );
-            Self::io(self.engine.wal.flush(lsn.end).map_err(std::io::Error::other));
-        }
-        // Double TRUNCATE in one transaction: the previously staged file is now
-        // superseded and, being used only by this uncommitted txn, is discarded.
-        let prev = self
-            .pending
-            .write()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .replace(PendingTruncate {
-                xid: txn.xid,
-                new_rel: new.0,
-                owner: txn.lock_owner,
-            });
-        self.has_pending.store(true, Ordering::Release);
+        // Everything from the append to the last piece of state a checkpoint reads
+        // runs under one barrier: this is a writer that logs a record and only
+        // afterwards publishes what decides whether the record must be replayed,
+        // which is precisely what `CheckpointDelay` exists for. Without it a
+        // checkpoint can sample a redo point above the record while
+        // `truncate_unreconciled` still reads false, and a crash after the commit
+        // then loses the swap.
+        //
+        // A block expression, not a function-scope `let _delay`: at function scope
+        // the barrier would also cover `discard_relfile` below, which does file
+        // I/O. `let _ = ...` would be worse still — it drops the guard immediately
+        // and silently disarms this.
+        //
+        // Deliberately started *after* `acquire_exclusive`, which can block until
+        // every foreign reader drains, and after the relfilenode allocation and
+        // `create_if_missing`: no record exists yet, and holding the barrier across
+        // an unbounded wait would stall the checkpointer for no benefit.
+        let prev = {
+            // WAL-log the swap intent {old, new, table} and flush it. Recovery
+            // applies the swap only for a committed XID, so the record is safe to
+            // write now. A WAL-skipped table (`Unlogged`/`Temporary`) writes no
+            // such record (an Unlogged table's data is reset on crash instead) and
+            // so needs neither the barrier nor the pin — the same `wal_skipped`
+            // gate `nbtree` uses.
+            let _delay = (!self.wal_skipped).then(|| self.engine.wal.delay_checkpoint());
+            if !self.wal_skipped {
+                let lsn = self.engine.wal.append(
+                    RmgrId::HEAP,
+                    rec::HEAP_TRUNCATE,
+                    txn.xid,
+                    &rec::truncate(&self.schema.namespace, &self.schema.name, old, new),
+                );
+                Self::io(self.engine.wal.flush(lsn.end).map_err(std::io::Error::other));
+                // Only now that the record is durable: a failed flush must leave
+                // nothing pinned.
+                self.truncate_unreconciled
+                    .store(true, Ordering::Release);
+            }
+            // Double TRUNCATE in one transaction: the previously staged file is now
+            // superseded and, being used only by this uncommitted txn, is discarded.
+            let prev = self
+                .pending
+                .write()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .replace(PendingTruncate {
+                    xid: txn.xid,
+                    new_rel: new.0,
+                    owner: txn.lock_owner,
+                });
+            self.has_pending.store(true, Ordering::Release);
+            prev
+        };
         self.insert_hint.store(0, Ordering::Relaxed);
         match prev {
             Some(prev) => {
