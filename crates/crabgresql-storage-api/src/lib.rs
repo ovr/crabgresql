@@ -1213,6 +1213,10 @@ pub struct RoutineSig {
     pub oid: u32,
     pub name: String,
     pub arg_types: Vec<PgType>,
+    /// The declared parameter names, positionally aligned with `arg_types`;
+    /// `None` where the declaration gave no name. A `LANGUAGE SQL` body may
+    /// refer to its arguments by these names as well as by `$n`.
+    pub arg_names: Vec<Option<String>>,
     /// `void` for a procedure, which declares no return type.
     pub return_type: PgType,
     pub kind: RoutineKind,

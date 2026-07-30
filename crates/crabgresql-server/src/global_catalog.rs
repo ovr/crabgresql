@@ -1161,10 +1161,19 @@ impl TypeCatalog for GlobalCatalog {
                     .map(|a| cat.pg_type_of(a))
                     .collect::<Option<Vec<_>>>()?;
                 let return_type = cat.pg_type_of(&f.ret)?;
+                // Same input-argument filter `create_function` uses to build the
+                // identity `f.args`, so names stay aligned with `arg_types`.
+                let arg_names = f
+                    .all_args
+                    .iter()
+                    .filter(|a| a.mode.is_input())
+                    .map(|a| a.name.clone())
+                    .collect();
                 Some(RoutineSig {
                     oid: f.oid,
                     name: f.name.clone(),
                     arg_types,
+                    arg_names,
                     return_type,
                     kind: match f.kind {
                         RoutineKind::Function => ApiRoutineKind::Function,

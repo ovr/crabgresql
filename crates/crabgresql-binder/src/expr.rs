@@ -1283,6 +1283,10 @@ pub struct Scope {
     /// unresolved name can fall through to the outer scope as an
     /// [`BoundExpr::OuterColumnRef`].
     outer: Vec<OuterLevel>,
+    /// The named-parameter namespace of the `LANGUAGE SQL` function body being
+    /// bound, if any. `None` for an ordinary statement, where a bare identifier
+    /// can only be a column.
+    func_params: Option<std::rc::Rc<FuncParams>>,
 }
 
 /// The handle a [`Scope`] carries so `bind_expr` can bind a nested query. Shared
@@ -1290,6 +1294,24 @@ pub struct Scope {
 pub(crate) struct SubqueryContext {
     engine: Arc<dyn TableEngine>,
     ctes: crate::plan::CteEnv,
+}
+
+/// The parameter namespace of a `LANGUAGE SQL` function body: the routine's own
+/// name (which qualifies a parameter, as in `f.value`) and each *named*
+/// parameter's 0-based `$n` slot. Arguments declared without a name are absent
+/// and stay reachable only as `$n`.
+pub(crate) struct FuncParams {
+    func_name: String,
+    params: Vec<(String, usize)>,
+}
+
+impl FuncParams {
+    fn slot(&self, name: &str) -> Option<usize> {
+        self.params
+            .iter()
+            .find(|(p, _)| p == name)
+            .map(|(_, index)| *index)
+    }
 }
 
 impl Scope {
@@ -1302,6 +1324,31 @@ impl Scope {
             params: params.clone(),
             subquery: None,
             outer: Vec::new(),
+            func_params: None,
+        }
+    }
+
+    /// The scope a `LANGUAGE SQL` function body binds against: no tables, but
+    /// the declared parameter names resolve to their `$n` slots, so a body may
+    /// say `value` (or `f.value`) where it could also say `$1`. `arg_names` is
+    /// positionally aligned with the seeded parameter types.
+    pub fn function_body(
+        catalog: &Arc<dyn TypeCatalog>,
+        params: &ParamCtx,
+        func_name: &str,
+        arg_names: &[Option<String>],
+    ) -> Scope {
+        let named = arg_names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| name.clone().map(|n| (n, index)))
+            .collect();
+        Scope {
+            func_params: Some(std::rc::Rc::new(FuncParams {
+                func_name: func_name.to_string(),
+                params: named,
+            })),
+            ..Scope::empty(catalog, params)
         }
     }
 
@@ -1322,6 +1369,7 @@ impl Scope {
             params: params.clone(),
             subquery: None,
             outer: Vec::new(),
+            func_params: None,
         }
     }
 
@@ -1364,6 +1412,7 @@ impl Scope {
             params: params.clone(),
             subquery: None,
             outer: Vec::new(),
+            func_params: None,
         }
     }
 
@@ -1429,8 +1478,29 @@ impl Scope {
                 sqlstate::AMBIGUOUS_COLUMN,
                 format!("column reference \"{name}\" is ambiguous"),
             )),
-            NameLookup::Missing => self.resolve_outer(name),
+            // A SQL function body's parameter names are consulted only after its
+            // relations, as in PG, where a column shadows a same-named parameter.
+            // Moot today: a function body is FROM-less, so `rels` is empty.
+            NameLookup::Missing => match self.func_param(name)? {
+                Some(expr) => Ok(expr),
+                None => self.resolve_outer(name),
+            },
         }
+    }
+
+    /// Bind `name` as a parameter of the SQL function body being bound, if it is
+    /// one. Registering the reference mirrors [`bind_placeholder`] so the
+    /// parameter context's bookkeeping is the same whichever spelling was used;
+    /// the type is always known, since the body's context is seeded with every
+    /// declared argument type.
+    fn func_param(&self, name: &str) -> Result<Option<BoundExpr>, BindError> {
+        let Some(index) = self.func_params.as_ref().and_then(|f| f.slot(name)) else {
+            return Ok(None);
+        };
+        let index = self.params.borrow_mut().reference(index + 1)?;
+        let ty = self.params.borrow().types[index]
+            .expect("SQL function body parameter types are seeded at bind");
+        Ok(Some(BoundExpr::Param { index, ty }))
     }
 
     /// Look a name up in this scope's own relations (or its merged-join `visible`
@@ -1512,6 +1582,17 @@ impl Scope {
     /// in scope at any level; `42703` if the relation is found but lacks the
     /// column.
     fn resolve_qualified(&self, qualifier: &str, column: &str) -> Result<BoundExpr, BindError> {
+        // Inside a SQL function body, the routine's own name qualifies its
+        // parameters (`f.value`). A member that is not a parameter falls through
+        // to the `42P01` below — what PG reports for `f.nosuchparam` too.
+        if self
+            .func_params
+            .as_ref()
+            .is_some_and(|f| f.func_name == qualifier)
+            && let Some(expr) = self.func_param(column)?
+        {
+            return Ok(expr);
+        }
         if let Some(rel) = self.rels.iter().find(|r| r.qualifier == qualifier) {
             let col = column_in_rel(rel, qualifier, column)?;
             return Ok(with_column_collation(
@@ -6114,7 +6195,9 @@ pub fn bind_column_default(
 
 /// Bind the body of a `CREATE FUNCTION ... LANGUAGE SQL` to a typed expression,
 /// with `$1..$n` seeded to the declared argument types and the result coerced to
-/// the declared return type. `body_sql` is the normalized `SELECT <expr>` the
+/// the declared return type. An argument declared with a name is also reachable
+/// under that name (`value`, or `func_name.value`), as in PG; `arg_names` is
+/// positionally aligned with `arg_types`. `body_sql` is the normalized `SELECT <expr>` the
 /// catalog stores; it must be a single FROM-less, single-column `SELECT` — any
 /// other shape (FROM, WHERE, GROUP BY, set-op, multiple columns, …) is rejected,
 /// since a scalar function is expanded inline and the engine has no per-row query
@@ -6125,7 +6208,9 @@ pub fn bind_column_default(
 /// for `$n`, which [`inline_params`] replaces with the argument expressions.
 pub fn bind_sql_function_body(
     catalog: &Arc<dyn TypeCatalog>,
+    func_name: &str,
     arg_types: &[PgType],
+    arg_names: &[Option<String>],
     return_type: PgType,
     body_sql: &str,
 ) -> Result<BoundExpr, BindError> {
@@ -6202,7 +6287,7 @@ pub fn bind_sql_function_body(
     // Seed `$1..$argcount` to the declared argument types; the capped context
     // rejects any larger `$n` at its reference site, naming the actual `n`.
     let params = param_ctx_capped(arg_types.iter().copied().map(Some).collect());
-    let scope = Scope::empty(catalog, &params);
+    let scope = Scope::function_body(catalog, &params, func_name, arg_names);
     let bound = bind_expr(expr, &scope)?;
     let bound = coerce_function_return(bound, return_type, catalog)?;
     if bound.contains_srf() {
