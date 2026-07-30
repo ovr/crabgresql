@@ -540,12 +540,22 @@ mod tests {
     #[test]
     fn flushing_past_the_end_of_the_stream_is_an_error_not_a_spin() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let wal = Wal::open(dir.path())?;
+        let wal = Arc::new(Wal::open(dir.path())?);
         let range = wal.append(RmgrId::HEAP, 0, Xid(3), b"only");
         wal.flush(range.end)?;
         wal.reset_to(Lsn::INVALID)?;
 
-        let Err(err) = wal.flush(range.end) else {
+        // Under a watchdog: without the guard this call does not return a wrong
+        // answer, it never returns at all, and a bare call here would hang the
+        // whole test binary instead of failing it.
+        let result = {
+            let wal = Arc::clone(&wal);
+            within(5_000, move || wal.flush(range.end))
+        };
+        let Some(outcome) = result else {
+            anyhow::bail!("flush spun instead of returning an error");
+        };
+        let Err(err) = outcome else {
             anyhow::bail!("flushing past the end of the stream must fail");
         };
         assert!(
@@ -607,6 +617,25 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         false
+    }
+
+    /// Run `f` with a watchdog: `Some(value)` if it finished inside `max_ms`,
+    /// `None` if it is still running.
+    ///
+    /// For the tests whose regression is *non-termination* — a lock that never
+    /// releases, a loop that never advances. `std::thread::spawn`, deliberately
+    /// not `thread::scope`: scope joins before returning, so it would inherit the
+    /// hang it exists to detect. The stuck thread is left detached and dies with
+    /// the test process; that only happens when the test is already failing.
+    fn within<T: Send + 'static>(
+        max_ms: u64,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_millis(max_ms)).ok()
     }
 
     #[test]
@@ -713,12 +742,20 @@ mod tests {
         Ok(())
     }
 
-    /// A [`CommitSink`] that parks in the middle of the commit window — after the
-    /// record is appended and fsynced, before the caller stamps the CLOG — so the
+    /// Which half of the transaction lifecycle a [`GateSink`] parks in.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum GateOp {
+        Commit,
+        Abort,
+    }
+
+    /// A [`CommitSink`] that parks in the middle of the commit (or abort) window —
+    /// after the record is appended, before the caller stamps the CLOG — so the
     /// checkpointer can be raced against that exact window with the ordering
     /// imposed by a gate rather than by a sleep.
     struct GateSink {
         wal: Arc<Wal>,
+        gate_on: GateOp,
         state: Mutex<GateState>,
         cond: Condvar,
     }
@@ -729,9 +766,10 @@ mod tests {
     }
 
     impl GateSink {
-        fn new(wal: Arc<Wal>) -> GateSink {
+        fn new(wal: Arc<Wal>, gate_on: GateOp) -> GateSink {
             GateSink {
                 wal,
+                gate_on,
                 state: Mutex::new(GateState {
                     entered: false,
                     release: false,
@@ -752,11 +790,9 @@ mod tests {
             self.lock().release = true;
             self.cond.notify_all();
         }
-    }
 
-    impl CommitSink for GateSink {
-        fn log_commit(&self, xid: Xid) -> std::io::Result<()> {
-            self.wal.log_commit(xid)?;
+        /// Block until [`GateSink::release`], announcing arrival first.
+        fn park(&self) {
             let mut state = self.lock();
             state.entered = true;
             self.cond.notify_all();
@@ -766,11 +802,38 @@ mod tests {
                     Err(_) => panic!("gate condition-variable mutex poisoned"),
                 };
             }
+        }
+    }
+
+    /// Releases its gate on drop, including while a panic unwinds.
+    ///
+    /// Not a convenience: a thread parked in [`GateSink::park`] is joined by
+    /// `thread::scope` *before* a panic propagates out of the scope, so an
+    /// `assert!` that fires while the gate is still shut turns a regression into
+    /// a hung test instead of a failing one. Holding one of these for the whole
+    /// scope means the assertions can be written in their natural order.
+    struct GateRelease<'a>(&'a GateSink);
+
+    impl Drop for GateRelease<'_> {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    impl CommitSink for GateSink {
+        fn log_commit(&self, xid: Xid) -> std::io::Result<()> {
+            self.wal.log_commit(xid)?;
+            if self.gate_on == GateOp::Commit {
+                self.park();
+            }
             Ok(())
         }
 
         fn log_abort(&self, xid: Xid) {
             self.wal.log_abort(xid);
+            if self.gate_on == GateOp::Abort {
+                self.park();
+            }
         }
 
         fn delay_checkpoint(&self) -> Option<Box<dyn Send + '_>> {
@@ -778,20 +841,25 @@ mod tests {
         }
     }
 
-    /// The reason the commit path takes a [`CheckpointDelay`]. A redo point
-    /// sampled between a commit record and its CLOG bit would be published
-    /// alongside a commit-log image that still reads `InProgress`; a bounded
-    /// replay from there never sees the commit record, so an acknowledged
-    /// transaction's rows are invisible forever.
-    #[test]
-    fn redo_point_cannot_sample_between_a_commit_record_and_its_clog_bit() -> anyhow::Result<()> {
+    /// Park a transaction inside its record-appended-but-fate-not-yet-stamped
+    /// window and race a redo-point sample against it. Returns whether the
+    /// sampler got through (it must not) and the LSN it eventually returned.
+    ///
+    /// Shared by the commit and abort cases, which differ only in which sink
+    /// method parks and how "the fate is not stamped yet" is spelled.
+    fn race_a_sample_against(
+        gate_on: GateOp,
+        drive: impl FnOnce(&Arc<crabgresql_txn::TransactionManager>, Xid) + Send,
+        fate_is_unstamped: impl Fn(&crabgresql_txn::Clog, Xid) -> bool,
+        fate_is_stamped: impl Fn(&crabgresql_txn::Clog, Xid) -> bool,
+    ) -> anyhow::Result<()> {
         use std::sync::atomic::AtomicBool;
 
         use crabgresql_txn::{Clog, TransactionManager};
 
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
-        let gate = Arc::new(GateSink::new(Arc::clone(&wal)));
+        let gate = Arc::new(GateSink::new(Arc::clone(&wal), gate_on));
         let clog = Arc::new(Clog::new());
         let txnmgr = Arc::new(TransactionManager::new_recovered(
             Arc::clone(&gate) as Arc<dyn CommitSink>,
@@ -802,22 +870,26 @@ mod tests {
 
         let sampled = Arc::new(AtomicBool::new(false));
         std::thread::scope(|s| -> anyhow::Result<()> {
-            let committer = {
+            // Held for the whole scope, so every assertion below can fail without
+            // leaving the driver parked forever. See `GateRelease`.
+            let _release = GateRelease(&gate);
+
+            let driver = {
                 let txnmgr = Arc::clone(&txnmgr);
-                s.spawn(move || txnmgr.commit(xid))
+                s.spawn(move || drive(&txnmgr, xid))
             };
             assert!(
                 eventually(2_000, || gate.entered()),
-                "the committer never reached the commit window"
+                "the transaction never reached its record/CLOG window"
             );
             // Pins that the gate really is inside the window. If it ever moved
             // after the CLOG stamp, this fails instead of the test passing
             // vacuously.
             assert!(
-                !clog.is_committed(xid),
+                fate_is_unstamped(&clog, xid),
                 "the gate must park before the CLOG bit is set"
             );
-            let commit_end = wal.current_lsn();
+            let record_end = wal.current_lsn();
 
             let checkpointer = {
                 let wal = Arc::clone(&wal);
@@ -828,36 +900,68 @@ mod tests {
                     lsn
                 })
             };
-            let raced = eventually(400, || sampled.load(Ordering::SeqCst));
+            assert!(
+                !eventually(400, || sampled.load(Ordering::SeqCst)),
+                "redo_point sampled inside the window: the published redo would \
+                 sit above a record whose fate is not durable"
+            );
 
-            // Released before the assertion, not after: the committer is parked on
-            // this gate, and `thread::scope` joins every spawned thread before it
-            // propagates a panic — so asserting first would turn a regression into
-            // a hung test instead of a failing one.
             gate.release();
-            committer
+            driver
                 .join()
-                .map_err(|_| anyhow::anyhow!("committer panicked"))??;
+                .map_err(|_| anyhow::anyhow!("transaction thread panicked"))?;
             let redo = checkpointer
                 .join()
                 .map_err(|_| anyhow::anyhow!("redo_point sampler panicked"))??;
-            assert!(
-                !raced,
-                "redo_point sampled inside the commit window: the published redo \
-                 would sit above a commit record whose fate is not durable"
-            );
 
-            // Once the barrier lifts, the sample may cover the commit record —
-            // and by then the bit that decides its fate is set, so the checkpoint
-            // about to flush the commit log will carry it.
-            assert!(clog.is_committed(xid));
+            // Once the barrier lifts, the sample may cover the record — and by
+            // then the bit deciding its fate is set, so the checkpoint about to
+            // flush the commit log will carry it.
+            assert!(fate_is_stamped(&clog, xid));
             assert!(
-                redo >= commit_end,
-                "the sample should cover the released window ({redo} < {commit_end})"
+                redo >= record_end,
+                "the sample should cover the released window ({redo} < {record_end})"
             );
             Ok(())
         })?;
 
         Ok(())
+    }
+
+    /// The reason the commit path takes a [`CheckpointDelay`]. A redo point
+    /// sampled between a commit record and its CLOG bit would be published
+    /// alongside a commit-log image that still reads `InProgress`; a bounded
+    /// replay from there never sees the commit record, so an acknowledged
+    /// transaction's rows are invisible forever.
+    #[test]
+    fn redo_point_cannot_sample_between_a_commit_record_and_its_clog_bit() -> anyhow::Result<()> {
+        race_a_sample_against(
+            GateOp::Commit,
+            |txnmgr, xid| {
+                txnmgr
+                    .commit(xid)
+                    .unwrap_or_else(|error| panic!("commit failed: {error}"));
+            },
+            |clog, xid| !clog.is_committed(xid),
+            |clog, xid| clog.is_committed(xid),
+        )
+    }
+
+    /// The same window on the abort path, with a quieter but still real symptom:
+    /// an abort whose `Aborted` bit misses the flushed commit-log image, with its
+    /// record below the published redo point, leaves the XID `InProgress`
+    /// forever — and a row it deleted keeps an in-progress `xmax` that no later
+    /// transaction can stamp, so it stays visible and can never be updated or
+    /// deleted again.
+    #[test]
+    fn redo_point_cannot_sample_between_an_abort_record_and_its_clog_bit() -> anyhow::Result<()> {
+        use crabgresql_txn::XactStatus;
+
+        race_a_sample_against(
+            GateOp::Abort,
+            |txnmgr, xid| txnmgr.abort(xid),
+            |clog, xid| clog.status(xid) != XactStatus::Aborted,
+            |clog, xid| clog.status(xid) == XactStatus::Aborted,
+        )
     }
 }
