@@ -391,6 +391,7 @@ dependencies = [
  "bytes",
  "clap",
  "crabgresql-server",
+ "crabgresql-storage-api",
  "futures-util",
  "tempfile",
  "tokio",

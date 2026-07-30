@@ -119,7 +119,7 @@ async fn a_committed_parquet_insert_is_durable_before_any_file_exists() -> anyho
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
         client
-            .simple_query("CREATE TABLE events (id int4, label text) USING parquet")
+            .simple_query("CREATE TABLE events (id int4 PRIMARY KEY, label text) USING parquet")
             .await?;
         for id in 1..=5 {
             client
@@ -188,7 +188,7 @@ async fn buffer_table_rows_survive_a_restart_through_the_wal_alone() -> anyhow::
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
         client
-            .simple_query("CREATE TABLE staging (id int4, label text) USING buffer")
+            .simple_query("CREATE TABLE staging (id int4, label text) USING buffer ORDER BY (id)")
             .await?;
         client
             .simple_query("INSERT INTO staging VALUES (1, 'committed'), (2, 'also committed')")
@@ -370,7 +370,7 @@ async fn parquet_commit_rollback_and_restart_are_durable() -> anyhow::Result<()>
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
         client
-            .simple_query("CREATE TABLE events (id int4, label text) USING parquet")
+            .simple_query("CREATE TABLE events (id int4 PRIMARY KEY, label text) USING parquet")
             .await?;
         client
             .simple_query("INSERT INTO events VALUES (1, 'committed')")
@@ -579,7 +579,7 @@ async fn parquet_truncate_is_durable_across_a_restart() -> anyhow::Result<()> {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
         client
-            .simple_query("CREATE TABLE events (id int4) USING parquet")
+            .simple_query("CREATE TABLE events (id int4) USING parquet ORDER BY (id)")
             .await?;
         client
             .simple_query("INSERT INTO events VALUES (1), (2)")

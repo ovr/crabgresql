@@ -124,9 +124,13 @@ take a slice with `--rows` until the engine grows out-of-core execution.
   that is only partly there is refused too, rather than half-loaded — the check
   is on rows, not on the tables merely existing, because they are all created
   before any of them is filled.
-- `--using AM` — create the tables with an access method (`parquet`, `buffer`),
-  instead of the default heap. Every report names the storage its numbers were
-  measured on.
+- `--using AM` — create the tables with an access method (`heap`, `parquet`,
+  `buffer`) instead of leaving it to the server's default. Every report names the
+  storage its numbers were measured on. `parquet` and `buffer` require a layout
+  sort key, which is spliced from the suite's `sort_keys`; `heap` has no layout
+  to order and gets the bare `USING heap`, so it also works against stock
+  PostgreSQL over `--url`. An unknown name is refused before any table is
+  dropped, so a typo cannot cost a loaded dataset.
 - `--url CONNINFO` — benchmark an external server (e.g. stock PostgreSQL) for
   a side-by-side number. The dataset is loaded there the same way. Point it at
   a scratch database: a suite owns its table names outright, and `tpch`'s are
@@ -153,6 +157,12 @@ transcription.
 - `tables` lists the tables in load order, one per `CREATE TABLE` in
   `create.sql`. More than one of them makes `--data` a directory of per-table
   files rather than a single file.
+- `sort_keys` gives each table its layout sort key, one entry per `tables` entry
+  and in the same order — `"a"` or `"a, b"`, naming columns that exist in that
+  table and never repeating one. It lives here rather than in `create.sql`
+  because the vendored DDL is kept byte-identical to upstream, and because the
+  clause has to follow `USING <am>`, which is spliced on at the end. Only an
+  engine-managed method uses it; a heap run ignores it.
 - `QueryFormat::OnePerLine` is how ClickBench publishes its queries, and keeps
   the numbering matched to the published results by position.
   `QueryFormat::Numbered` is for multi-line queries, each under a `-- Qn`
@@ -170,6 +180,6 @@ transcription.
 makes the split safe — a `;` inside a comment or a string literal cuts a
 statement in half, and the check catches the wreckage instead of executing it.
 It also catches a schema that has drifted from `tables`. `--using` then splices
-`USING <am>` onto each statement, and refuses if the statement ends in a
-comment, which would swallow the clause and leave the run quietly measuring the
-default heap.
+`USING <am>` onto each statement — followed by `ORDER BY (<sort key>)` when the
+method requires one — and refuses if the statement ends in a comment, which would
+swallow the clause and leave the run quietly measuring the default heap.

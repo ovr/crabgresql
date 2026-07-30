@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use crabgresql_storage_api::TableAccessMethod;
 use tokio::net::TcpListener;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
@@ -222,6 +223,14 @@ async fn load_if_needed(client: &Client, suite: &Suite, config: &RunConfig) -> R
             suite.name,
             suite.tables.len(),
         );
+    }
+    // Refuse an unknown access method here, before the DROP loop below empties a
+    // persistent --data-dir. The server would catch it too, but only after the
+    // existing tables are already gone, so a typo would cost the dataset.
+    if let Some(am) = &config.access_method
+        && TableAccessMethod::from_name(am).is_none()
+    {
+        bail!("unknown access method `{am}`: expected heap, parquet, or buffer");
     }
 
     // Probe rows, not mere existence. The tables are all created before any
@@ -473,6 +482,7 @@ mod tests {
         name: "multi",
         description: "",
         tables: &["region", "nation"],
+        sort_keys: &["id", "id"],
         schema_sql: "CREATE TABLE region (id INT);\nCREATE TABLE nation (id INT);\n",
         queries_sql: "-- Q1\nselect 1;\n",
         queries_format: QueryFormat::Numbered,

@@ -16,6 +16,7 @@ anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
 crabgresql-server.workspace = true
+crabgresql-storage-api.workspace = true
 futures-util.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

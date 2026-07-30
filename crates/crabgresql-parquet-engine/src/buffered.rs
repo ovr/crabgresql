@@ -207,6 +207,12 @@ impl BufferedParquetTable {
         // One `insert_many` for the whole batch, so the flush produces one
         // fragment rather than one per original transaction — which is the entire
         // reason the buffer exists.
+        //
+        // Rows go out in buffer order. `TableSchema::sort_key` is recorded at
+        // `CREATE TABLE` but nothing honors it yet: sorting here is ROADMAP's
+        // Parquet step 3, which needs the V2 fragment footer in the same change
+        // (the `Tid` offset caps a fragment at 65,535 rows today, so a sorted
+        // flush cannot reach its target chunk size).
         let staged = self
             .chunks
             .insert_many(values, &txn)

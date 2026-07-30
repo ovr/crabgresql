@@ -400,6 +400,17 @@ pub struct TableSchema {
     pub partition_scheme: Option<PartitionScheme>,
     /// `Some` on a leaf partition: the parent it attaches to and its bound.
     pub partition_of: Option<PartitionOf>,
+    /// The layout sort key: the order an engine-managed access method stores
+    /// rows in, from `ORDER BY (...)` or defaulted to the `PRIMARY KEY`. A heap
+    /// relation is always empty — `ORDER BY` on one is rejected at DDL time —
+    /// and so is a relation created before the key was recorded.
+    ///
+    /// Declaring it is not the same as honoring it: nothing sorts on this yet.
+    /// The sorted flush is `ROADMAP.md`'s Parquet step 3, which owns it together
+    /// with the V2 fragment footer. A standalone `USING buffer` relation never
+    /// will — it has nowhere to flush — and carries a key only so both
+    /// engine-managed methods answer the same DDL alike.
+    pub sort_key: Vec<IndexKey>,
 }
 
 impl TableSchema {
@@ -413,6 +424,7 @@ impl TableSchema {
             access_method: TableAccessMethod::Heap,
             partition_scheme: None,
             partition_of: None,
+            sort_key: Vec::new(),
         }
     }
 
@@ -430,6 +442,7 @@ impl TableSchema {
             access_method: TableAccessMethod::Heap,
             partition_scheme: None,
             partition_of: None,
+            sort_key: Vec::new(),
         }
     }
 }
@@ -929,6 +942,18 @@ pub trait TableEngine: Send + Sync {
     /// Whether a user schema by this name exists.
     fn schema_exists(&self, name: &str) -> bool {
         self.schemas().iter().any(|(n, _)| n == name)
+    }
+
+    /// Reject a schema the relation's access method cannot represent, before
+    /// any of the DDL layer's own per-column validation runs.
+    ///
+    /// [`TableEngine::create_table`] checks this anyway, but only at the very
+    /// end. A column of a type the method does not store would otherwise be
+    /// diagnosed by whichever earlier rule happened to trip on it — a `json`
+    /// column collects a complaint about B-tree operator classes long before
+    /// anything says the method cannot store `json` at all.
+    fn validate_schema(&self, _schema: &TableSchema) -> Result<(), StorageError> {
+        Ok(())
     }
 
     /// Register a semantic index on a table in `namespace` after the caller has

@@ -49,8 +49,10 @@ What exists today:
   API over a durable 8 KB heap (`crabgresql-pg-engine`), RAM-backed temporary
   and WAL-skipped unlogged tables, plus managed permanent append-only Snappy
   Parquet tables (`crabgresql-parquet-engine`) selected with
-  `CREATE TABLE ... USING parquet` — append-only per row, with a transactional
-  TRUNCATE that swaps in a fresh fragment directory.
+  `CREATE TABLE ... USING parquet ORDER BY (cols)` — append-only per row, with a
+  transactional TRUNCATE that swaps in a fresh fragment directory. The layout
+  order is mandatory (a `PRIMARY KEY` supplies it too), following ClickHouse
+  MergeTree rather than PostgreSQL, which has no such clause.
 
 Tests: `cargo test` — unit tests per crate plus end-to-end tests that drive a
 real driver (tokio-postgres) and raw-socket handshake checks.

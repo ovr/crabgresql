@@ -10,6 +10,10 @@ pub const CLICKBENCH: Suite = Suite {
     name: "clickbench",
     description: "ClickBench: 43 analytical queries over the 105-column `hits` table",
     tables: &["hits"],
+    // ClickBench's own ClickHouse variant declares exactly this `ORDER BY`; the
+    // `postgresql/` variant has no key to copy because PostgreSQL has nowhere to
+    // put one.
+    sort_keys: &["CounterID, EventDate, UserID, EventTime, WatchID"],
     schema_sql: include_str!("../suites/clickbench/create.sql"),
     queries_sql: include_str!("../suites/clickbench/queries.sql"),
     queries_format: QueryFormat::OnePerLine,
@@ -33,6 +37,19 @@ pub const TPCH: Suite = Suite {
     // Load order: referenced tables first, so the DDL could grow foreign keys.
     tables: &[
         "region", "nation", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
+    ],
+    // The specification's own primary keys, in `tables` order. The DDL does not
+    // declare them — TPC-H's schema clause leaves keys to the implementation —
+    // so they are named here instead.
+    sort_keys: &[
+        "r_regionkey",
+        "n_nationkey",
+        "p_partkey",
+        "s_suppkey",
+        "ps_partkey, ps_suppkey",
+        "c_custkey",
+        "o_orderkey",
+        "l_orderkey, l_linenumber",
     ],
     schema_sql: include_str!("../suites/tpch/create.sql"),
     queries_sql: include_str!("../suites/tpch/queries.sql"),
@@ -69,7 +86,9 @@ mod tests {
             105
         );
         // The vendored file must stay spliceable, or `--using` cannot work.
-        assert!(CLICKBENCH.schema_statements(Some("parquet"))?[0].ends_with("USING parquet;"));
+        assert!(CLICKBENCH.schema_statements(Some("parquet"))?[0].ends_with(
+            "USING parquet ORDER BY (CounterID, EventDate, UserID, EventTime, WatchID);"
+        ));
         Ok(())
     }
 
@@ -92,6 +111,69 @@ mod tests {
         }
         // Spliceable, which the old single-statement guard would have refused.
         assert!(TPCH.schema_statements(Some("parquet"))?.len() == 8);
+        Ok(())
+    }
+
+    /// The declared columns of one `CREATE TABLE <t> (...)`, lowercased.
+    ///
+    /// Reads the parenthesized body and takes the first token of each
+    /// comma-separated item, which is the column name in the plain DDL both
+    /// suites use. Deliberately not a substring match on the raw text: pinning
+    /// the vendored files' indentation would make a re-vendor that reflows them
+    /// fail a test about sort keys.
+    fn declared_columns(statement: &str) -> Vec<String> {
+        let body = match (statement.find('('), statement.rfind(')')) {
+            (Some(open), Some(close)) if open < close => &statement[open + 1..close],
+            _ => return Vec::new(),
+        };
+        body.split(',')
+            .filter_map(|item| item.split_whitespace().next())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    }
+
+    /// The sort keys live in this file while the columns they name live in the
+    /// vendored `.sql`, so nothing but this check couples them. A typo would
+    /// otherwise surface only as a `42703` in a `--using parquet` run, which
+    /// needs a dataset nobody has in CI.
+    ///
+    /// It also enforces what the server enforces: a key names at least one
+    /// column and never repeats one (`42P17`).
+    #[test]
+    fn every_sort_key_names_distinct_columns_of_its_table() -> anyhow::Result<()> {
+        for suite in ALL {
+            let statements = suite.schema_statements(None)?;
+            for ((statement, table), key) in
+                statements.iter().zip(suite.tables).zip(suite.sort_keys)
+            {
+                let declared = declared_columns(statement);
+                assert!(
+                    !declared.is_empty(),
+                    "{}: could not read `{table}`'s column list",
+                    suite.name,
+                );
+                let mut seen: Vec<String> = Vec::new();
+                for column in key.split(',').map(str::trim) {
+                    let column = column.to_ascii_lowercase();
+                    assert!(
+                        declared.contains(&column),
+                        "{}: `{table}` has no column `{column}`",
+                        suite.name,
+                    );
+                    assert!(
+                        !seen.contains(&column),
+                        "{}: `{table}`'s sort key repeats `{column}`",
+                        suite.name,
+                    );
+                    seen.push(column);
+                }
+                assert!(
+                    !seen.is_empty(),
+                    "{}: `{table}` declares an empty sort key",
+                    suite.name,
+                );
+            }
+        }
         Ok(())
     }
 

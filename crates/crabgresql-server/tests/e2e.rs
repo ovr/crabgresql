@@ -5100,7 +5100,9 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
     assert_eq!(sink.finish().await?, 2);
 
     client
-        .simple_query("CREATE TABLE p_copy USING parquet AS SELECT id, label FROM p")
+        // CTAS declares no constraints, so there is no PRIMARY KEY to default
+        // from and the key must be spelled out.
+        .simple_query("CREATE TABLE p_copy USING parquet ORDER BY (id) AS SELECT id, label FROM p")
         .await?;
     let copied = client
         .simple_query("SELECT count(*) FROM p_copy")
@@ -5148,12 +5150,14 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
         unknown.message(),
         "access method \"imaginary\" does not exist"
     );
+    // Each carries a sort key so the form under test is what fails: without one
+    // the `42P17` "requires ORDER BY or PRIMARY KEY" would mask it.
     for sql in [
-        "CREATE TEMP TABLE temp_p (id int) USING parquet",
-        "CREATE UNLOGGED TABLE unlogged_p (id int) USING parquet",
-        "CREATE TABLE partitioned_p (id int) USING parquet PARTITION BY RANGE (id)",
-        "CREATE TABLE unsupported_p (value jsonb) USING parquet",
-        "CREATE TABLE located_p (id int) USING parquet LOCATION '/tmp/data'",
+        "CREATE TEMP TABLE temp_p (id int) USING parquet ORDER BY (id)",
+        "CREATE UNLOGGED TABLE unlogged_p (id int) USING parquet ORDER BY (id)",
+        "CREATE TABLE partitioned_p (id int) USING parquet PARTITION BY RANGE (id) ORDER BY (id)",
+        "CREATE TABLE unsupported_p (value jsonb) USING parquet ORDER BY (value)",
+        "CREATE TABLE located_p (id int) USING parquet LOCATION '/tmp/data' ORDER BY (id)",
     ] {
         let error = client
             .simple_query(sql)
@@ -5172,6 +5176,250 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
     Ok(())
 }
 
+/// An engine-managed relation must declare the order it stores rows in: an
+/// explicit `ORDER BY (...)`, or a `PRIMARY KEY` to default from. This is
+/// ClickHouse MergeTree's rule, not PostgreSQL's — PostgreSQL has no such
+/// clause — and refusing the keyless table is the whole point of adopting it.
+#[tokio::test]
+async fn an_engine_managed_table_must_declare_its_sort_key() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // The accepted shapes: an explicit key (single and composite), a PRIMARY KEY
+    // to default from, and the same for the buffer method.
+    for sql in [
+        "CREATE TABLE k1 (id int4, at timestamp) USING parquet ORDER BY (id)",
+        "CREATE TABLE k2 (id int4, at timestamp) USING parquet ORDER BY (at, id)",
+        "CREATE TABLE k3 (id int4 PRIMARY KEY, at timestamp) USING parquet",
+        "CREATE TABLE k4 (a int4, b int4, PRIMARY KEY (a, b)) USING parquet",
+        "CREATE TABLE k5 (id int4) USING buffer ORDER BY (id)",
+        "CREATE TABLE k6 (id int4 PRIMARY KEY) USING buffer",
+        // A single column needs no parentheses. Two do — see the parse-error
+        // case below; the paren-free form does not generalize.
+        "CREATE TABLE k7 (id int4) USING parquet ORDER BY id",
+    ] {
+        client.simple_query(sql).await.with_context(|| sql.to_string())?;
+    }
+
+    let fails = async |sql: &str| -> anyhow::Result<(String, String, Option<String>)> {
+        let error = client
+            .simple_query(sql)
+            .await
+            .expect_err("invalid sort key must fail");
+        let error = error
+            .as_db_error()
+            .context("database error details are missing")?;
+        Ok((
+            error.code().code().to_string(),
+            error.message().to_string(),
+            error.hint().map(str::to_string),
+        ))
+    };
+
+    // Neither clause: refused. The HINT leads with ORDER BY and prices the
+    // PRIMARY KEY alternative, because a unique index on an engine-managed table
+    // makes every insert scan the relation — the two are not interchangeable.
+    let (code, message, hint) = fails("CREATE TABLE n1 (id int4) USING parquet").await?;
+    assert_eq!(code, "42P17");
+    assert_eq!(
+        message,
+        "table access method \"parquet\" requires ORDER BY or PRIMARY KEY"
+    );
+    assert_eq!(
+        hint.as_deref(),
+        Some(
+            "Add ORDER BY (columns) to the CREATE TABLE. A PRIMARY KEY supplies \
+             one too, at the cost of enforcing uniqueness on every insert."
+        )
+    );
+    // The buffer method names itself rather than borrowing parquet's wording.
+    let (code, message, _) = fails("CREATE TABLE n2 (id int4) USING buffer").await?;
+    assert_eq!(code, "42P17");
+    assert_eq!(
+        message,
+        "table access method \"buffer\" requires ORDER BY or PRIMARY KEY"
+    );
+
+    // `ORDER BY ()` is ClickHouse's opt-out (`ORDER BY tuple()`). We have none:
+    // an unordered column store gives up pruning, compression locality, and
+    // merge-friendly compaction. It gets its own message — the user did declare
+    // something, it was just empty.
+    let (code, message, _) = fails("CREATE TABLE n3 (id int4) USING parquet ORDER BY ()").await?;
+    assert_eq!(code, "42P17");
+    assert_eq!(message, "ORDER BY must name at least one column");
+
+    let (code, message, _) =
+        fails("CREATE TABLE n4 (id int4) USING parquet ORDER BY (nope)").await?;
+    assert_eq!(code, "42703");
+    assert_eq!(message, "column \"nope\" named in sort key does not exist");
+
+    let (code, message, _) =
+        fails("CREATE TABLE n5 (id int4) USING parquet ORDER BY (id, id)").await?;
+    assert_eq!(code, "42P17");
+    assert_eq!(message, "sort key column \"id\" appears more than once");
+
+    let (code, message, _) =
+        fails("CREATE TABLE n6 (id int4) USING parquet ORDER BY (id + 1)").await?;
+    assert_eq!(code, "0A000");
+    assert_eq!(
+        message,
+        "only simple column references are supported in ORDER BY"
+    );
+
+    // A heap has no layout order to declare, so the clause is refused rather
+    // than recorded and never honored.
+    let (code, message, _) = fails("CREATE TABLE n7 (id int4) ORDER BY (id)").await?;
+    assert_eq!(code, "0A000");
+    assert_eq!(
+        message,
+        "table access method \"heap\" does not support ORDER BY"
+    );
+
+    // Redshift's `SORTKEY` parses too, and would be a second spelling of the
+    // same thing; it is refused so only one spelling can ever be recorded.
+    let (code, message, _) = fails("CREATE TABLE n8 (id int4) USING parquet SORTKEY (id)").await?;
+    assert_eq!(code, "0A000");
+    assert_eq!(
+        message,
+        "CREATE TABLE ... SORTKEY is not supported; use ORDER BY (columns)"
+    );
+
+    // The paren-free form takes exactly one column; two is a parse error, so the
+    // single-column spelling accepted above must not be read as general.
+    assert!(
+        client
+            .simple_query("CREATE TABLE n9 (a int4, b int4) USING parquet ORDER BY a, b")
+            .await
+            .is_err()
+    );
+
+    // CTAS carries no constraints, so it can never default from a PRIMARY KEY.
+    client
+        .simple_query("CREATE TABLE src (id int4, label text)")
+        .await?;
+    let (code, _, _) = fails("CREATE TABLE c1 USING parquet AS SELECT id FROM src").await?;
+    assert_eq!(code, "42P17");
+    client
+        .simple_query("CREATE TABLE c2 USING parquet ORDER BY (id) AS SELECT id FROM src")
+        .await?;
+
+    // A trailing ORDER BY belongs to the query, not the table. Saying only
+    // "requires ORDER BY" to someone who just wrote one is useless, so the hint
+    // names the position.
+    let (code, _, hint) =
+        fails("CREATE TABLE c3 USING parquet AS SELECT id FROM src ORDER BY id").await?;
+    assert_eq!(code, "42P17");
+    assert_eq!(
+        hint.as_deref(),
+        Some(
+            "The trailing ORDER BY orders the query, not the table. Write \
+             ORDER BY (columns) before AS to declare the table's sort key."
+        )
+    );
+
+    // SORTKEY is refused on the CTAS path too — it reaches a different function,
+    // which is how it went on being silently dropped after the plain path closed.
+    let (code, message, _) = fails(
+        "CREATE TABLE c4 USING parquet ORDER BY (id) SORTKEY (label) AS SELECT id, label FROM src",
+    )
+    .await?;
+    assert_eq!(code, "0A000");
+    assert_eq!(
+        message,
+        "this CREATE TABLE ... AS form is not supported yet"
+    );
+
+    Ok(())
+}
+
+/// The sort-key rule must not fire on statements it has no business failing: an
+/// `IF NOT EXISTS` re-run, and a leaf partition that quietly swallowed the
+/// clause the plain heap path rejects.
+#[tokio::test]
+async fn the_sort_key_rule_does_not_reach_past_its_own_statements() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // An idempotent bootstrap script re-runs its DDL. A database written before
+    // sort keys existed is full of keyless engine-managed relations, so the
+    // second run must skip rather than demand a key for a table already there.
+    client
+        .simple_query("CREATE TABLE t (id int4) USING parquet ORDER BY (id)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE IF NOT EXISTS t (id int4) USING parquet")
+        .await?;
+    client
+        .simple_query("CREATE TABLE IF NOT EXISTS t USING parquet AS SELECT 1 AS id")
+        .await?;
+
+    // A leaf partition is a heap and declares no order; the clause is refused,
+    // not dropped, exactly as on a plain heap.
+    client
+        .simple_query("CREATE TABLE par (id int4) PARTITION BY RANGE (id)")
+        .await?;
+    let error = client
+        .simple_query(
+            "CREATE TABLE par_1 PARTITION OF par FOR VALUES FROM (1) TO (10) ORDER BY (id)",
+        )
+        .await
+        .expect_err("ORDER BY on a leaf partition must fail");
+    let error = error
+        .as_db_error()
+        .context("database error details are missing")?;
+    assert_eq!(error.code().code(), "0A000");
+    assert_eq!(
+        error.message(),
+        "table access method \"heap\" does not support ORDER BY"
+    );
+
+    // A PRIMARY KEY supplies the sort key verbatim, so anything it can express
+    // becomes a stored key. Both of these are PostgreSQL errors in their own
+    // right, and both would otherwise smuggle in a key `ORDER BY` cannot write.
+    for (sql, code, message) in [
+        (
+            "CREATE TABLE d1 (a int4, b int4, PRIMARY KEY (a, a)) USING parquet",
+            "42701",
+            "column \"a\" appears twice in primary key constraint",
+        ),
+        (
+            "CREATE TABLE d2 (a int4, PRIMARY KEY (a DESC)) USING parquet",
+            "42601",
+            "syntax error at or near \"DESC\"",
+        ),
+        (
+            "CREATE TABLE d3 (a int4, b int4, UNIQUE (b, b)) USING parquet ORDER BY (a)",
+            "42701",
+            "column \"b\" appears twice in unique constraint",
+        ),
+    ] {
+        let error = client
+            .simple_query(sql)
+            .await
+            .expect_err("an invalid constraint key must fail");
+        let error = error
+            .as_db_error()
+            .context("database error details are missing")?;
+        assert_eq!(error.code().code(), code, "{sql}");
+        assert_eq!(error.message(), message, "{sql}");
+    }
+
+    // The access method's own type whitelist wins over the sort key's B-tree
+    // rule, so the user is told the truth instead of being sent round a loop.
+    let error = client
+        .simple_query("CREATE TABLE j (v json) USING parquet ORDER BY (v)")
+        .await
+        .expect_err("an unsupported column type must fail");
+    let error = error
+        .as_db_error()
+        .context("database error details are missing")?;
+    assert_eq!(error.code().code(), "0A000");
+    assert_eq!(
+        error.message(),
+        "data type json is not supported by table access method \"parquet\""
+    );
+
+    Ok(())
+}
+
 /// A Parquet relation is physically two stores — the immutable chunks and its RAM
 /// write buffer — so it plans as an `Append` over both. The leaves are not
 /// catalog relations, so each labels itself and neither appears in `pg_class`.
@@ -5180,7 +5428,7 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves()
 -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
-        .simple_query("CREATE TABLE p (id int4, label text) USING parquet")
+        .simple_query("CREATE TABLE p (id int4, label text) USING parquet ORDER BY (id)")
         .await?;
     client.simple_query("INSERT INTO p VALUES (1, 'one')").await?;
 
@@ -5236,7 +5484,7 @@ async fn truncate_under_repeatable_read_leaves_no_rows_behind() -> anyhow::Resul
     let truncater = connect(port).await;
     let other = connect(port).await;
     truncater
-        .simple_query("CREATE TABLE p (id int4) USING parquet")
+        .simple_query("CREATE TABLE p (id int4) USING parquet ORDER BY (id)")
         .await?;
     truncater.simple_query("INSERT INTO p VALUES (1)").await?;
 
@@ -5369,7 +5617,7 @@ async fn vacuum_flushes_buffered_rows_without_changing_what_readers_see()
 -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
-        .simple_query("CREATE TABLE p (id int4, label text) USING parquet")
+        .simple_query("CREATE TABLE p (id int4, label text) USING parquet ORDER BY (id)")
         .await?;
     client.simple_query("CREATE TABLE h (id int4)").await?;
     client
@@ -5575,11 +5823,13 @@ async fn buffer_tables_are_fully_mutable_and_reflect_their_access_method()
 
     // A buffer table is WAL-logged and permanent by definition, so the forms that
     // ask for the opposite must be refused rather than quietly downgraded.
+    // Each carries a sort key so the form under test is what fails, not the
+    // missing-order rule.
     for sql in [
-        "CREATE TEMP TABLE temp_b (id int) USING buffer",
-        "CREATE UNLOGGED TABLE unlogged_b (id int) USING buffer",
-        "CREATE TABLE partitioned_b (id int) USING buffer PARTITION BY RANGE (id)",
-        "CREATE TABLE unsupported_b (value jsonb) USING buffer",
+        "CREATE TEMP TABLE temp_b (id int) USING buffer ORDER BY (id)",
+        "CREATE UNLOGGED TABLE unlogged_b (id int) USING buffer ORDER BY (id)",
+        "CREATE TABLE partitioned_b (id int) USING buffer PARTITION BY RANGE (id) ORDER BY (id)",
+        "CREATE TABLE unsupported_b (value jsonb) USING buffer ORDER BY (value)",
     ] {
         let error = client
             .simple_query(sql)
@@ -5601,7 +5851,7 @@ async fn buffer_tables_are_fully_mutable_and_reflect_their_access_method()
 async fn parquet_truncate_is_transactional_and_resets_statistics() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
-        .simple_query("CREATE TABLE p (id int4, label text) USING parquet")
+        .simple_query("CREATE TABLE p (id int4, label text) USING parquet ORDER BY (id)")
         .await?;
     client.simple_query("CREATE TABLE h (id int4)").await?;
     client

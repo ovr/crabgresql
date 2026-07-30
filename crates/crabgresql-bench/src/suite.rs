@@ -1,6 +1,7 @@
 //! What a benchmark *is*, independent of how it is run.
 
 use anyhow::{Result, bail};
+use crabgresql_storage_api::TableAccessMethod;
 
 /// One benchmark: the DDL, where its data comes from, and the queries to time.
 pub struct Suite {
@@ -13,6 +14,16 @@ pub struct Suite {
     /// `CREATE TABLE` DDL, one statement per table in `tables` and in the same
     /// order.
     pub schema_sql: &'static str,
+    /// The layout sort key each table gets under an engine-managed access
+    /// method, one entry per `tables` entry in the same order. Ignored for the
+    /// heap, which refuses the clause.
+    ///
+    /// It lives here rather than in `schema_sql` for two reasons. The DDL files
+    /// are the upstream benchmarks' own text and are worth keeping byte-identical
+    /// — see the splice guards in [`Suite::schema_statements`]. And the clause
+    /// has to follow `USING <am>`, which is spliced on at the end, so it could
+    /// not sit in the file even if we were willing to edit it.
+    pub sort_keys: &'static [&'static str],
     /// The queries, transcribed from the upstream benchmark, laid out as
     /// `queries_format` says.
     pub queries_sql: &'static str,
@@ -112,9 +123,18 @@ impl Suite {
                 statements.len(),
             );
         }
+        if self.sort_keys.len() != self.tables.len() {
+            bail!(
+                "{} declares {} tables but {} sort keys",
+                self.name,
+                self.tables.len(),
+                self.sort_keys.len(),
+            );
+        }
 
         let mut out = Vec::with_capacity(statements.len());
-        for (statement, table) in statements.iter().zip(self.tables) {
+        for ((statement, table), sort_key) in statements.iter().zip(self.tables).zip(self.sort_keys)
+        {
             // A leading comment is fine — it cannot swallow a clause appended
             // at the end — so look past it before matching.
             let body = strip_leading_comments(statement);
@@ -147,7 +167,22 @@ impl Suite {
                             self.name,
                         );
                     }
-                    out.push(format!("{statement} USING {am};"));
+                    // An engine-managed method refuses a table with no declared
+                    // order, and neither benchmark's upstream DDL has a PRIMARY
+                    // KEY to default from — so the key is spliced too, after the
+                    // access method, which is the order the parser expects. The
+                    // heap has no layout to order and rejects the clause, so it
+                    // gets the bare `USING heap` it accepted before sort keys
+                    // existed. An unknown name is left alone for the server to
+                    // diagnose, but `--using` is validated before any DROP runs
+                    // (see `runner::load_if_needed`).
+                    let ordered = TableAccessMethod::from_name(am)
+                        .is_some_and(TableAccessMethod::is_engine_managed);
+                    if ordered {
+                        out.push(format!("{statement} USING {am} ORDER BY ({sort_key});"));
+                    } else {
+                        out.push(format!("{statement} USING {am};"));
+                    }
                 }
             }
         }
@@ -313,6 +348,7 @@ mod tests {
         name: "t",
         description: "",
         tables: &["hits"],
+        sort_keys: &["id"],
         schema_sql: "CREATE TABLE hits (id BIGINT);\n",
         queries_sql: "SELECT 1;\n\n-- comment\nSELECT 2;\n",
         queries_format: QueryFormat::OnePerLine,
@@ -337,28 +373,83 @@ mod tests {
 
     #[test]
     fn schema_splices_the_access_method_before_the_semicolon() -> Result<()> {
+        // No access method requested: no clause at all.
         assert_eq!(
             SUITE.schema_statements(None)?,
             ["CREATE TABLE hits (id BIGINT);"]
         );
+        // The key follows the access method, because that is the only order the
+        // parser accepts — `USING` is read as a storage format before the
+        // `ORDER BY` clause is looked for.
         assert_eq!(
             SUITE.schema_statements(Some("parquet"))?,
-            ["CREATE TABLE hits (id BIGINT) USING parquet;"]
+            ["CREATE TABLE hits (id BIGINT) USING parquet ORDER BY (id);"]
+        );
+        assert_eq!(
+            SUITE.schema_statements(Some("buffer"))?,
+            ["CREATE TABLE hits (id BIGINT) USING buffer ORDER BY (id);"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_heap_run_carries_no_sort_key() -> Result<()> {
+        // `heap` is a nameable access method and the only one stock PostgreSQL
+        // also accepts, so `--using heap` has to keep working. It has no layout
+        // to order and rejects the clause, so it gets the bare `USING heap` —
+        // splicing a key here made the whole run fail at the first CREATE.
+        assert_eq!(
+            SUITE.schema_statements(Some("heap"))?,
+            ["CREATE TABLE hits (id BIGINT) USING heap;"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_access_method_is_left_for_the_server_to_reject() -> Result<()> {
+        // Splicing a key onto it would replace the server's precise "access
+        // method does not exist" with a confusing complaint about ORDER BY.
+        // `run` refuses the name before any DROP, so this is belt-and-braces.
+        assert_eq!(
+            SUITE.schema_statements(Some("imaginary"))?,
+            ["CREATE TABLE hits (id BIGINT) USING imaginary;"]
         );
         Ok(())
     }
 
     #[test]
     fn schema_splices_every_statement_of_a_multi_table_suite() -> Result<()> {
+        // Each table gets a DIFFERENT key, so a zip that pairs a statement with
+        // its neighbour's key is caught here rather than at load time in a
+        // `--using parquet` run nobody has a dataset for in CI.
         let suite = Suite {
             tables: &["a", "b"],
+            sort_keys: &["a_id", "b_id"],
+            schema_sql: "CREATE TABLE a (a_id INT);\nCREATE TABLE b (b_id INT);\n",
+            ..SUITE
+        };
+        assert_eq!(
+            suite.schema_statements(Some("parquet"))?,
+            [
+                "CREATE TABLE a (a_id INT) USING parquet ORDER BY (a_id);",
+                "CREATE TABLE b (b_id INT) USING parquet ORDER BY (b_id);",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_refuses_a_suite_whose_sort_keys_do_not_cover_its_tables() {
+        // Zipping would otherwise drop the uncovered table silently, and the run
+        // would benchmark fewer tables than the suite declares.
+        let short = Suite {
+            tables: &["a", "b"],
+            sort_keys: &["id"],
             schema_sql: "CREATE TABLE a (id INT);\nCREATE TABLE b (id INT);\n",
             ..SUITE
         };
-        let statements = suite.schema_statements(Some("parquet"))?;
-        assert_eq!(statements.len(), 2);
-        assert!(statements.iter().all(|s| s.ends_with("USING parquet;")));
-        Ok(())
+        assert!(short.schema_statements(Some("parquet")).is_err());
+        assert!(short.schema_statements(None).is_err());
     }
 
     #[test]
@@ -377,7 +468,9 @@ mod tests {
         // it would reject an upstream file that merely carries an attribution
         // header.
         let headed = with_schema("-- upstream header\nCREATE TABLE hits (id BIGINT);\n");
-        assert!(headed.schema_statements(Some("parquet"))?[0].ends_with("USING parquet;"));
+        assert!(
+            headed.schema_statements(Some("parquet"))?[0].ends_with("USING parquet ORDER BY (id);")
+        );
         Ok(())
     }
 
