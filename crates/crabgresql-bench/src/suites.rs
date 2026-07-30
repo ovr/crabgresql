@@ -114,25 +114,64 @@ mod tests {
         Ok(())
     }
 
+    /// The declared columns of one `CREATE TABLE <t> (...)`, lowercased.
+    ///
+    /// Reads the parenthesized body and takes the first token of each
+    /// comma-separated item, which is the column name in the plain DDL both
+    /// suites use. Deliberately not a substring match on the raw text: pinning
+    /// the vendored files' indentation would make a re-vendor that reflows them
+    /// fail a test about sort keys.
+    fn declared_columns(statement: &str) -> Vec<String> {
+        let body = match (statement.find('('), statement.rfind(')')) {
+            (Some(open), Some(close)) if open < close => &statement[open + 1..close],
+            _ => return Vec::new(),
+        };
+        body.split(',')
+            .filter_map(|item| item.split_whitespace().next())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    }
+
     /// The sort keys live in this file while the columns they name live in the
     /// vendored `.sql`, so nothing but this check couples them. A typo would
     /// otherwise surface only as a `42703` in a `--using parquet` run, which
     /// needs a dataset nobody has in CI.
+    ///
+    /// It also enforces what the server enforces: a key names at least one
+    /// column and never repeats one (`42P17`).
     #[test]
-    fn every_sort_key_names_a_column_of_its_table() -> anyhow::Result<()> {
+    fn every_sort_key_names_distinct_columns_of_its_table() -> anyhow::Result<()> {
         for suite in ALL {
             let statements = suite.schema_statements(None)?;
             for ((statement, table), key) in
                 statements.iter().zip(suite.tables).zip(suite.sort_keys)
             {
-                let ddl = statement.to_ascii_lowercase();
+                let declared = declared_columns(statement);
+                assert!(
+                    !declared.is_empty(),
+                    "{}: could not read `{table}`'s column list",
+                    suite.name,
+                );
+                let mut seen: Vec<String> = Vec::new();
                 for column in key.split(',').map(str::trim) {
+                    let column = column.to_ascii_lowercase();
                     assert!(
-                        ddl.contains(&format!("\n    {} ", column.to_ascii_lowercase())),
+                        declared.contains(&column),
                         "{}: `{table}` has no column `{column}`",
                         suite.name,
                     );
+                    assert!(
+                        !seen.contains(&column),
+                        "{}: `{table}`'s sort key repeats `{column}`",
+                        suite.name,
+                    );
+                    seen.push(column);
                 }
+                assert!(
+                    !seen.is_empty(),
+                    "{}: `{table}` declares an empty sort key",
+                    suite.name,
+                );
             }
         }
         Ok(())

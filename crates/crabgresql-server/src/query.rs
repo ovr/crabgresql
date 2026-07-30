@@ -2478,6 +2478,12 @@ fn execute_create_table(
             "{kind} partitioned tables are not supported yet"
         )));
     }
+    // Refuse `ORDER BY` on a method with no layout to order here, above the
+    // `PARTITION OF` dispatch: a leaf partition is always a heap, and letting it
+    // fall through would swallow the clause the plain heap path below rejects.
+    if create.order_by.is_some() {
+        reject_layout_order(access_method)?;
+    }
     // A leaf partition (`PARTITION OF parent`) inherits the parent's columns and
     // is created as an ordinary heap table carrying its bound; handle it whole.
     if let Some(parent) = &create.partition_of {
@@ -2724,6 +2730,10 @@ fn execute_create_table(
         // Resolved below, once the PRIMARY KEY's columns are known.
         sort_key: Vec::new(),
     };
+    // Ask the access method about the column types before any index or sort-key
+    // rule looks at them, so "this method cannot store `json`" wins over the
+    // B-tree-operator-class complaint that the same column would otherwise draw.
+    target.validate_schema(&schema)?;
     let mut indexes = Vec::new();
     for p in pending {
         reject_deferred_characteristics(p.characteristics)?;
@@ -2769,6 +2779,16 @@ fn execute_create_table(
                 schema.columns[key.column].nullable = false;
             }
         }
+    }
+    // `IF NOT EXISTS` on a relation that is already there is a no-op, so it must
+    // not trip over the sort-key rule: a database written before sort keys
+    // existed is full of keyless engine-managed relations, and re-running the
+    // DDL that created one is exactly what an idempotent bootstrap script does.
+    // Checked here rather than at the top of the function because that is the
+    // narrow fix — and it lands above the serial-sequence creation below, so the
+    // re-run also stops creating a throwaway `t_id_seq1` only to drop it again.
+    if create.if_not_exists && engine.resolve(Some(&namespace), &name).is_ok() {
+        return Ok(QueryResult::command("CREATE TABLE"));
     }
     schema.sort_key = build_sort_key(
         create.order_by.as_ref(),
@@ -2878,25 +2898,11 @@ fn build_partition_scheme(
             ));
         }
     };
-    let Some(idx) = columns.iter().position(|c| c.name == key) else {
-        return Err(PgError::new(
-            sqlstate::UNDEFINED_COLUMN,
-            format!("column \"{key}\" named in partition key does not exist"),
-        ));
-    };
     // A RANGE key must be a btree-orderable type; otherwise bound comparison
     // would later panic in `compare_values`. PG rejects the same at parent create.
     // (A user type can only reach here as an enum — non-enum user types are
     // rejected as column types upstream — and enums are orderable.)
-    if !crabgresql_executor::is_orderable(columns[idx].ty) {
-        return Err(PgError::new(
-            sqlstate::UNDEFINED_OBJECT,
-            format!(
-                "data type {} has no default operator class for access method \"btree\"",
-                columns[idx].ty.name()
-            ),
-        ));
-    }
+    let idx = resolve_orderable_column(columns, &key, "partition key", None)?;
     Ok(PartitionScheme {
         strategy: PartitionStrategy::Range,
         key_columns: vec![idx],
@@ -2911,12 +2917,94 @@ fn build_partition_scheme(
 /// table declaring neither is refused. Refusing is the point: an unordered
 /// column store gives up range pruning, compression locality, and
 /// merge-friendly compaction, and handing one back silently would hide all
-/// three. Nor is it ever forced — every type these methods accept
-/// (`crabgresql_parquet_engine::supports_type`) is btree-orderable, so a table
-/// can always name a key.
+/// three. Nor is it ever forced — every type these methods accept is
+/// btree-orderable, so a table can always name a key.
 ///
 /// A heap relation has no layout order to declare, so `ORDER BY` on one is an
 /// error rather than a clause quietly dropped.
+///
+/// A standalone `USING buffer` relation is the awkward case: it is RAM plus WAL
+/// with nowhere to flush, so its key is recorded and nothing will ever apply it.
+/// It is required all the same, so that the two engine-managed methods answer
+/// the same DDL identically — a `buffer` table that silently accepted what
+/// `parquet` refuses would be a worse surprise than a key that costs nothing.
+/// Resolve a column named in an *ordered* key — an index key, a layout sort key,
+/// or a RANGE partition key — and reject a type that has no B-tree ordering.
+///
+/// All three kinds compare their columns, so all three need the same check; it
+/// lives here so the message and the predicate cannot drift between them. What
+/// legitimately differs is spelled out by the arguments: `noun` names the key in
+/// the "does not exist" message, and `hint` carries PostgreSQL's operator-class
+/// advice, which only the index path gives because its wording ("for the index")
+/// is wrong for the other two.
+fn resolve_orderable_column(
+    columns: &[Column],
+    name: &str,
+    noun: &str,
+    hint: Option<&str>,
+) -> Result<usize, PgError> {
+    let Some(idx) = columns.iter().position(|c| c.name == name) else {
+        return Err(PgError::new(
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column \"{name}\" named in {noun} does not exist"),
+        ));
+    };
+    let ty = columns[idx].ty;
+    if !ty.has_default_btree_opclass() {
+        let error = PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!(
+                "data type {} has no default operator class for access method \"btree\"",
+                ty.name()
+            ),
+        );
+        return Err(match hint {
+            Some(hint) => error.with_hint(hint),
+            None => error,
+        });
+    }
+    Ok(idx)
+}
+
+/// PostgreSQL's advice on the missing-operator-class error, given only where it
+/// reads correctly: an index.
+const OPCLASS_HINT: &str = "You must specify an operator class for the index or \
+                            define a default operator class for the data type.";
+
+/// Refuse `ORDER BY` on an access method that has no layout to order. The one
+/// place this message lives, so the `PARTITION OF` dispatch and the plain
+/// CREATE TABLE / CTAS paths cannot drift apart on it.
+fn reject_layout_order(access_method: TableAccessMethod) -> Result<(), PgError> {
+    if access_method.is_engine_managed() {
+        return Ok(());
+    }
+    Err(PgError::feature_not_supported(format!(
+        "table access method \"{}\" does not support ORDER BY",
+        access_method.as_str(),
+    )))
+}
+
+/// Point a CTAS user at the clause position when their `ORDER BY` went to the
+/// query instead of the table.
+///
+/// `CREATE TABLE t USING parquet AS SELECT ... ORDER BY x` parses the trailing
+/// clause as the query's ordering — the table's own `ORDER BY` has to precede
+/// `AS` — so the bare missing-key error tells someone who *did* write `ORDER BY`
+/// to add one. Only reachable when the table declared no key of its own, which
+/// is the only way that error fires on this path.
+fn annotate_ctas_order_by(error: PgError, create: &ast::CreateTable) -> PgError {
+    if create.order_by.is_some() {
+        return error;
+    }
+    if !create.query.as_ref().is_some_and(|q| q.order_by.is_some()) {
+        return error;
+    }
+    error.with_hint(
+        "The trailing ORDER BY orders the query, not the table. Write \
+         ORDER BY (columns) before AS to declare the table's sort key.",
+    )
+}
+
 fn build_sort_key(
     order_by: Option<&ast::OneOrManyWithParens<ast::Expr>>,
     access_method: TableAccessMethod,
@@ -2924,13 +3012,10 @@ fn build_sort_key(
     primary_key: Option<&IndexMetadata>,
 ) -> Result<Vec<IndexKey>, PgError> {
     if !access_method.is_engine_managed() {
-        return match order_by {
-            Some(_) => Err(PgError::feature_not_supported(format!(
-                "table access method \"{}\" does not support ORDER BY",
-                access_method.as_str(),
-            ))),
-            None => Ok(Vec::new()),
-        };
+        if order_by.is_some() {
+            reject_layout_order(access_method)?;
+        }
+        return Ok(Vec::new());
     }
     let Some(order_by) = order_by else {
         // The PRIMARY KEY's `IndexKey`s were already resolved and validated by
@@ -2944,13 +3029,20 @@ fn build_sort_key(
                     access_method.as_str(),
                 ),
             )
-            .with_hint("Add ORDER BY (columns) or a PRIMARY KEY to the CREATE TABLE.")),
+            // `ORDER BY` first, deliberately. A PRIMARY KEY also supplies the
+            // key, but a unique index makes every INSERT scan the whole relation
+            // to enforce it (`insert_direct` has no B-tree to probe on an
+            // engine-managed table), which is ruinous at columnar scale. The two
+            // are not interchangeable and the hint must not imply they are.
+            .with_hint(
+                "Add ORDER BY (columns) to the CREATE TABLE. A PRIMARY KEY \
+                 supplies one too, at the cost of enforcing uniqueness on \
+                 every insert.",
+            )),
         };
     };
-    let exprs: &[ast::Expr] = match order_by {
-        ast::OneOrManyWithParens::One(expr) => std::slice::from_ref(expr),
-        ast::OneOrManyWithParens::Many(exprs) => exprs,
-    };
+    // `OneOrManyWithParens` derefs to a slice, which flattens both spellings.
+    let exprs: &[ast::Expr] = order_by;
     // `ORDER BY ()` parses to an empty list — ClickHouse's `ORDER BY tuple()`,
     // its opt-out from the same rule. We have no opt-out, and saying so here is
     // clearer than reusing the "you declared nothing" message: the user did
@@ -2969,24 +3061,11 @@ fn build_sort_key(
             ));
         };
         let name = normalize_ident(ident);
-        let column = schema.column_index(&name).ok_or_else(|| {
-            PgError::new(
-                sqlstate::UNDEFINED_COLUMN,
-                format!("column \"{name}\" named in sort key does not exist"),
-            )
-        })?;
-        // Storing rows in order means comparing them, so a sort-key column obeys
-        // the same btree-orderability rule an index key does.
-        let ty = schema.columns[column].ty;
-        if !ty.has_default_btree_opclass() {
-            return Err(PgError::new(
-                sqlstate::UNDEFINED_OBJECT,
-                format!(
-                    "data type {} has no default operator class for access method \"btree\"",
-                    ty.name()
-                ),
-            ));
-        }
+        // The orderability half is unreachable for today's methods — every
+        // unorderable type (`json`, `jsonpath`, `point`, `lseg`) is outside what
+        // Parquet stores, so `validate_schema` rejects the column first with the
+        // truer message — but it holds for the method that eventually stores one.
+        let column = resolve_orderable_column(&schema.columns, &name, "sort key", None)?;
         if keys.iter().any(|key| key.column == column) {
             return Err(PgError::new(
                 sqlstate::INVALID_OBJECT_DEFINITION,
@@ -3279,12 +3358,20 @@ fn execute_create_table_as(
     // Reject CTAS forms we don't implement rather than silently dropping them.
     // A table cannot be `OR REPLACE`d; ON COMMIT needs the M2 txn engine; table
     // constraints / LIKE / CLONE / storage options are not derived from a query.
+    // `PARTITION BY` and `INHERITS` are unimplemented on the plain path too, and
+    // the Redshift trio parses ungated — every one of them would otherwise be
+    // accepted here and thrown away, which is what the plain path refuses to do.
     if create.or_replace
         || create.on_commit.is_some()
         || !create.constraints.is_empty()
         || create.like.is_some()
         || create.clone.is_some()
         || !matches!(create.table_options, ast::CreateTableOptions::None)
+        || create.partition_by.is_some()
+        || create.inherits.is_some()
+        || create.sortkey.is_some()
+        || create.distkey.is_some()
+        || create.diststyle.is_some()
     {
         return Err(PgError::feature_not_supported(
             "this CREATE TABLE ... AS form is not supported yet",
@@ -3351,7 +3438,7 @@ fn execute_create_table_as(
     for c in &cols {
         reject_stored_reg_type(c.ty, &c.name)?;
     }
-    let schema = TableSchema {
+    let mut schema = TableSchema {
         name: name.clone(),
         namespace: namespace.clone(),
         columns: cols
@@ -3368,10 +3455,21 @@ fn execute_create_table_as(
         partition_of: None,
         sort_key: Vec::new(),
     };
+    // As on the plain path: an `IF NOT EXISTS` re-run against an existing
+    // relation is a no-op and must not trip over the sort-key rule.
+    if create.if_not_exists && engine.resolve(Some(&namespace), &name).is_ok() {
+        return Ok(QueryResult::Command {
+            tag: "CREATE TABLE AS".into(),
+            notices: vec![Notice::notice(
+                format!("relation \"{name}\" already exists, skipping"),
+                None,
+            )],
+        });
+    }
     // CTAS declares no constraints (the guard above rejects them), so there is
     // no PRIMARY KEY to fall back on: an engine-managed CTAS must spell its key.
-    let mut schema = schema;
-    schema.sort_key = build_sort_key(create.order_by.as_ref(), access_method, &schema, None)?;
+    schema.sort_key = build_sort_key(create.order_by.as_ref(), access_method, &schema, None)
+        .map_err(|e| annotate_ctas_order_by(e, create))?;
 
     // Create the table first so a name collision short-circuits before the query
     // runs. IF NOT EXISTS on an existing relation runs nothing (PG NOTICE).
@@ -3462,6 +3560,46 @@ fn reject_deferred_characteristics(
     Ok(())
 }
 
+/// The columns of a PRIMARY KEY / UNIQUE constraint are plain column names: no
+/// ordering, and no repeats.
+///
+/// PostgreSQL's grammar has no place for `ASC`/`DESC`/`NULLS` there at all — the
+/// vendored parser accepts them only because constraint columns share
+/// `CREATE INDEX`'s column parser, where they *are* legal — and it rejects a
+/// repeated column with 42701.
+///
+/// Enforcing it here also keeps the layout sort key honest: an engine-managed
+/// table with no `ORDER BY` inherits these columns verbatim, so anything this
+/// lets through becomes a stored key that `ORDER BY` itself could not express.
+fn reject_constraint_key_columns(columns: &[ast::IndexColumn], noun: &str) -> Result<(), PgError> {
+    let mut seen: Vec<String> = Vec::new();
+    for col in columns {
+        let options = &col.column.options;
+        if options.asc.is_some() || options.nulls_first.is_some() {
+            let token = match options.asc {
+                Some(true) => "ASC",
+                Some(false) => "DESC",
+                None => "NULLS",
+            };
+            return Err(PgError::syntax(format!("syntax error at or near \"{token}\"")));
+        }
+        // A non-identifier is an expression key; `simple_index_keys` rejects it
+        // with its own message, so leave it alone rather than guessing a name.
+        let ast::Expr::Identifier(ident) = &col.column.expr else {
+            continue;
+        };
+        let name = normalize_ident(ident);
+        if seen.contains(&name) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_COLUMN,
+                format!("column \"{name}\" appears twice in {noun} constraint"),
+            ));
+        }
+        seen.push(name);
+    }
+    Ok(())
+}
+
 fn reject_primary_key_options(constraint: &ast::PrimaryKeyConstraint) -> Result<(), PgError> {
     if constraint.index_name.is_some()
         || !constraint.index_options.is_empty()
@@ -3471,7 +3609,7 @@ fn reject_primary_key_options(constraint: &ast::PrimaryKeyConstraint) -> Result<
             "this PRIMARY KEY index form is not supported yet",
         ));
     }
-    Ok(())
+    reject_constraint_key_columns(&constraint.columns, "primary key")
 }
 
 fn reject_unique_options(constraint: &ast::UniqueConstraint) -> Result<(), PgError> {
@@ -3484,7 +3622,7 @@ fn reject_unique_options(constraint: &ast::UniqueConstraint) -> Result<(), PgErr
             "this UNIQUE index form is not supported yet",
         ));
     }
-    Ok(())
+    reject_constraint_key_columns(&constraint.columns, "unique")
 }
 
 fn simple_index_keys(
@@ -3506,30 +3644,11 @@ fn simple_index_keys(
                 ));
             }
         };
-        let column = schema.column_index(&ident).ok_or_else(|| {
-            PgError::new(
-                sqlstate::UNDEFINED_COLUMN,
-                format!("column \"{ident}\" named in key does not exist"),
-            )
-        })?;
         // A B-tree / UNIQUE index (and PRIMARY KEY) needs an ordering. Types with
         // no default B-tree operator class (`json`, `point`, `lseg`) are rejected
         // here, matching PostgreSQL — otherwise unique enforcement would later
         // call `compare_values` on an unorderable type and panic the backend.
-        let ty = schema.columns[column].ty;
-        if !ty.has_default_btree_opclass() {
-            return Err(PgError::new(
-                sqlstate::UNDEFINED_OBJECT,
-                format!(
-                    "data type {} has no default operator class for access method \"btree\"",
-                    ty.name()
-                ),
-            )
-            .with_hint(
-                "You must specify an operator class for the index or define a \
-                 default operator class for the data type.",
-            ));
-        }
+        let column = resolve_orderable_column(&schema.columns, &ident, "key", Some(OPCLASS_HINT))?;
         keys.push(IndexKey {
             column,
             descending: col.column.options.asc == Some(false),
@@ -5707,6 +5826,125 @@ fn execute_drop_cast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `build_sort_key` for the `ORDER BY` of a parsed `CREATE TABLE`, against a
+    /// two-column `(id int4, at timestamp)` relation.
+    ///
+    /// The key it returns has no SQL surface — nothing reflects it in
+    /// `pg_catalog`, `\d`, or EXPLAIN — so the DDL tests can only prove the
+    /// statement was accepted. These prove what was actually recorded.
+    fn sort_key_of(sql: &str, pk: Option<&IndexMetadata>) -> Result<Vec<IndexKey>, PgError> {
+        let stmts = crabgresql_parser::parse(sql).expect("parse");
+        let ast::Statement::CreateTable(create) = &stmts[0] else {
+            panic!("expected CREATE TABLE");
+        };
+        let mut schema = TableSchema::new(
+            "t",
+            vec![
+                Column::new("id", PgType::Int4),
+                Column::new("at", PgType::Timestamp),
+            ],
+        );
+        schema.access_method = TableAccessMethod::Parquet;
+        build_sort_key(
+            create.order_by.as_ref(),
+            TableAccessMethod::Parquet,
+            &schema,
+            pk,
+        )
+    }
+
+    /// [`sort_key_of`] for a statement expected to be accepted.
+    fn sort_key(sql: &str) -> Vec<IndexKey> {
+        sort_key_of(sql, None).unwrap_or_else(|e| panic!("{sql}: {}", e.message))
+    }
+
+    fn key(column: usize) -> IndexKey {
+        IndexKey {
+            column,
+            descending: false,
+            nulls_first: false,
+        }
+    }
+
+    #[test]
+    fn an_explicit_sort_key_records_column_indexes_in_clause_order() {
+        // `at` is column 1 and comes first, so a key that recorded clause
+        // positions instead of column indexes would read `[0, 1]` and pass every
+        // DDL-level test in the suite.
+        assert_eq!(
+            sort_key("CREATE TABLE t (id int4, at timestamp) ORDER BY (at, id)"),
+            vec![key(1), key(0)]
+        );
+        // One column, with and without parentheses, is the same key.
+        assert_eq!(
+            sort_key("CREATE TABLE t (id int4) ORDER BY (id)"),
+            vec![key(0)]
+        );
+        assert_eq!(
+            sort_key("CREATE TABLE t (id int4) ORDER BY id"),
+            vec![key(0)]
+        );
+    }
+
+    #[test]
+    fn the_primary_key_default_is_the_whole_key_in_its_own_order() {
+        let pk = IndexMetadata {
+            name: "t_pkey".to_string(),
+            method: IndexMethod::BTree,
+            keys: vec![key(1), key(0)],
+            unique: true,
+            nulls_distinct: true,
+            constraint: Some(IndexConstraint::PrimaryKey),
+        };
+        assert_eq!(
+            sort_key_of("CREATE TABLE t (id int4, at timestamp)", Some(&pk))
+                .expect("the PRIMARY KEY supplies the default"),
+            vec![key(1), key(0)]
+        );
+    }
+
+    #[test]
+    fn a_sort_key_that_cannot_be_honored_is_refused() {
+        let code = |sql: &str| {
+            sort_key_of(sql, None)
+                .expect_err("must be refused")
+                .code
+                .to_string()
+        };
+        // Declared nothing at all.
+        assert_eq!(code("CREATE TABLE t (id int4)"), "42P17");
+        // ClickHouse's `ORDER BY tuple()` opt-out, which we do not offer.
+        assert_eq!(code("CREATE TABLE t (id int4) ORDER BY ()"), "42P17");
+        assert_eq!(code("CREATE TABLE t (id int4) ORDER BY (id, id)"), "42P17");
+        assert_eq!(code("CREATE TABLE t (id int4) ORDER BY (nope)"), "42703");
+        assert_eq!(code("CREATE TABLE t (id int4) ORDER BY (id + 1)"), "0A000");
+    }
+
+    #[test]
+    fn a_method_with_no_layout_takes_no_key_and_refuses_the_clause() {
+        let stmts =
+            crabgresql_parser::parse("CREATE TABLE t (id int4) ORDER BY (id)").expect("parse");
+        let ast::Statement::CreateTable(create) = &stmts[0] else {
+            panic!("expected CREATE TABLE");
+        };
+        let schema = TableSchema::new("t", vec![Column::new("id", PgType::Int4)]);
+        // Heap with the clause: refused rather than recorded and never honored.
+        let err = build_sort_key(
+            create.order_by.as_ref(),
+            TableAccessMethod::Heap,
+            &schema,
+            None,
+        )
+        .expect_err("heap must refuse ORDER BY");
+        assert_eq!(err.code, "0A000");
+        // Heap without it: an empty key, not an error.
+        assert_eq!(
+            build_sort_key(None, TableAccessMethod::Heap, &schema, None)
+                .expect("heap needs no key"),
+            Vec::new()
+        );
+    }
 
     /// The referenced relations of the query in a `SELECT` statement.
     fn deps(sql: &str) -> Vec<String> {

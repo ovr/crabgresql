@@ -954,12 +954,7 @@ fn encode(state: &State) -> Vec<u8> {
                 Some(IndexConstraint::PrimaryKey) => 1,
                 Some(IndexConstraint::Unique) => 2,
             });
-            out.extend_from_slice(&(index.keys.len() as u32).to_le_bytes());
-            for key in &index.keys {
-                out.extend_from_slice(&(key.column as u32).to_le_bytes());
-                out.push(u8::from(key.descending));
-                out.push(u8::from(key.nulls_first));
-            }
+            put_index_keys(&mut out, &index.keys);
         }
     }
     // Views: a second backward-compatible tail after the metadata block. A reader
@@ -1128,14 +1123,24 @@ fn encode(state: &State) -> Vec<u8> {
     out.extend_from_slice(SORT_MAGIC);
     out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
     for r in &rels {
-        out.extend_from_slice(&(r.sort_key.len() as u32).to_le_bytes());
-        for key in &r.sort_key {
-            out.extend_from_slice(&(key.column as u32).to_le_bytes());
-            out.push(u8::from(key.descending));
-            out.push(u8::from(key.nulls_first));
-        }
+        put_index_keys(&mut out, &r.sort_key);
     }
     out
+}
+
+/// Write a length-prefixed run of [`IndexKey`]s.
+///
+/// Shared by the index metadata in the `CRM1` block and the layout sort key in
+/// the `SRT1` tail: same three fields, same order, one definition — so a field
+/// added to `IndexKey` cannot reach one writer and miss the other, which would
+/// desynchronize the byte stream for every tail that follows.
+fn put_index_keys(out: &mut Vec<u8>, keys: &[IndexKey]) {
+    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        out.extend_from_slice(&(key.column as u32).to_le_bytes());
+        out.push(u8::from(key.descending));
+        out.push(u8::from(key.nulls_first));
+    }
 }
 
 fn put_bound_datums(out: &mut Vec<u8>, datums: &[PartitionBoundDatum]) {
@@ -1191,13 +1196,39 @@ impl<'a> Dec<'a> {
         s
     }
     fn byte(&mut self) -> u8 {
-        let v = self.b[self.p];
+        // Same bounds check `array` carries: a short read names the file it came
+        // from rather than surfacing as a bare index panic.
+        let Some(&v) = self.b.get(self.p) else {
+            panic!("relation catalog is truncated");
+        };
         self.p += 1;
         v
     }
     fn opt_s(&mut self) -> Option<String> {
         (self.byte() != 0).then(|| self.s())
     }
+    /// Read a length-prefixed run of [`IndexKey`]s written by [`put_index_keys`].
+    ///
+    /// The two flag bytes are read in the order that function writes them, and
+    /// this is the only place that order exists on the read side — transposing
+    /// them would turn every stored `DESC NULLS LAST` into `ASC NULLS FIRST`.
+    ///
+    /// Deliberately grows rather than reserving `n` up front: `n` is raw on-disk
+    /// data, and a corrupt length would otherwise ask the allocator for
+    /// gigabytes and abort the process before a single key byte is checked.
+    fn index_keys(&mut self) -> Vec<IndexKey> {
+        let n = self.u32();
+        let mut keys = Vec::new();
+        for _ in 0..n {
+            keys.push(IndexKey {
+                column: self.u32() as usize,
+                descending: self.byte() != 0,
+                nulls_first: self.byte() != 0,
+            });
+        }
+        keys
+    }
+
     fn remaining(&self) -> &[u8] {
         &self.b[self.p..]
     }
@@ -1302,15 +1333,7 @@ fn decode(bytes: &[u8]) -> State {
                     2 => Some(IndexConstraint::Unique),
                     _ => None,
                 };
-                let nkeys = d.u32();
-                let mut keys = Vec::with_capacity(nkeys as usize);
-                for _ in 0..nkeys {
-                    keys.push(IndexKey {
-                        column: d.u32() as usize,
-                        descending: d.byte() != 0,
-                        nulls_first: d.byte() != 0,
-                    });
-                }
+                let keys = d.index_keys();
                 rels[relpos].indexes.push(PersistIndex {
                     meta: IndexMetadata {
                         name,
@@ -1549,15 +1572,7 @@ fn decode(bytes: &[u8]) -> State {
         d.p += SORT_MAGIC.len();
         let nrels = d.u32();
         for r in rels.iter_mut().take(nrels as usize) {
-            let nkeys = d.u32();
-            r.sort_key = Vec::with_capacity(nkeys as usize);
-            for _ in 0..nkeys {
-                r.sort_key.push(IndexKey {
-                    column: d.u32() as usize,
-                    descending: d.byte() != 0,
-                    nulls_first: d.byte() != 0,
-                });
-            }
+            r.sort_key = d.index_keys();
         }
     }
     State {
@@ -1742,16 +1757,19 @@ mod tests {
         schema.access_method = TableAccessMethod::Parquet;
         // Deliberately not column order and not all-default flags: a codec that
         // dropped a field or resorted the key would still pass on `[{0, …}]`.
+        // The first key's two flags DIFFER, which is what pins their order — the
+        // decoder reads them as two adjacent `d.byte()` calls, so a transposition
+        // is invisible to any fixture whose `descending` equals its `nulls_first`.
         schema.sort_key = vec![
             IndexKey {
                 column: 1,
                 descending: true,
-                nulls_first: true,
+                nulls_first: false,
             },
             IndexKey {
                 column: 0,
                 descending: false,
-                nulls_first: false,
+                nulls_first: true,
             },
         ];
         catalog.create(&schema)?;

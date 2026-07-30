@@ -254,6 +254,12 @@ mod tests {
 
         let mut schema = TableSchema::new("p", vec![Column::new("id", PgType::Int4)]);
         schema.access_method = TableAccessMethod::Parquet;
+        // The engine refuses an engine-managed relation with no declared order.
+        schema.sort_key = vec![crabgresql_storage_api::IndexKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }];
         let table = engine.create_table(schema)?;
         Ok((engine, tm, table))
     }

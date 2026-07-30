@@ -1079,6 +1079,13 @@ impl PgEngine {
 }
 
 impl TableEngine for PgEngine {
+    fn validate_schema(&self, schema: &TableSchema) -> Result<(), StorageError> {
+        if schema.access_method.is_engine_managed() {
+            validate_schema(schema)?;
+        }
+        Ok(())
+    }
+
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
         // The server rejects these at bind time for the message; re-asserting them
         // here makes them invariants of the engine rather than of one caller.
@@ -1092,6 +1099,29 @@ impl TableEngine for PgEngine {
             if schema.partition_scheme.is_some() || schema.partition_of.is_some() {
                 return Err(StorageError::UnsupportedOperation(format!(
                     "table access method \"{method}\" does not support partitioning"
+                )));
+            }
+            // The load-bearing half of the sort-key rule. Without it the rule is
+            // an invariant of `execute_create_table` alone, and any other caller
+            // could mint the keyless relation the eventual sorted flush would
+            // have no order for.
+            if schema.sort_key.is_empty() {
+                return Err(StorageError::UnsupportedOperation(format!(
+                    "table access method \"{method}\" requires a sort key"
+                )));
+            }
+            // A key indexes into `columns`, and it outlives the statement that
+            // built it: an out-of-range entry would be persisted verbatim and
+            // only panic later, in whatever finally consumes the key.
+            if let Some(key) = schema
+                .sort_key
+                .iter()
+                .find(|key| key.column >= schema.columns.len())
+            {
+                return Err(StorageError::UnsupportedOperation(format!(
+                    "sort key column {} is out of range for a {}-column relation",
+                    key.column,
+                    schema.columns.len()
                 )));
             }
             validate_schema(&schema)?;

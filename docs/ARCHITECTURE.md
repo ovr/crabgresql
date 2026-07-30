@@ -110,8 +110,9 @@ Contract with the core:
   WAL), full-page writes for torn-page protection beyond page checksums, and WAL
   segment recycling.
 - Syntactically, extensibility is exposed the standard PG way. Plain
-  `CREATE TABLE` remains heap; `CREATE TABLE ... USING parquet` explicitly
-  selects the columnar method. `default_table_access_method` is unchanged.
+  `CREATE TABLE` remains heap; `CREATE TABLE ... USING parquet ORDER BY (cols)`
+  explicitly selects the columnar method and declares its layout order.
+  `default_table_access_method` is unchanged.
 
 **`crabgresql-pg-engine`** — the reference engine, reproducing PG:
 
@@ -177,8 +178,9 @@ Components:
 The Parquet table access method is managed database storage, not an exporter
 that happens to write `.parquet` files. It owns transaction visibility, WAL
 recovery, physical layout, file publication, statistics, and garbage
-collection. Clients select it with `CREATE TABLE ... USING parquet`; its
-physical organization is not part of PostgreSQL's observable SQL contract.
+collection. Clients select it with `CREATE TABLE ... USING parquet ORDER BY
+(cols)`; its physical organization is not part of PostgreSQL's observable SQL
+contract.
 
 This section is the **target design**. The current V1 state and implementation
 sequence are tracked separately in
@@ -289,15 +291,29 @@ profiles may choose a larger default without changing the file format.
 The effective sort key always exists:
 
 1. the partition key is the prefix;
-2. an explicitly configured clustering key follows;
+2. the clustering key follows;
 3. the hidden logical row ID is the final tie-breaker.
 
-With no partition or clustering key, the row ID alone supplies deterministic
-order, although it provides little predicate pruning. Comparisons use
-CrabgreSQL/PostgreSQL semantics, including direction, NULL ordering, NaN
-behavior, and the recorded collation version. A collation-version change makes
-affected chunks candidates for a rewrite rather than silently changing their
-claimed order.
+The clustering key is **mandatory**, not optional: `CREATE TABLE ... USING
+parquet` (or `USING buffer`) must declare it with `ORDER BY (columns)`, or carry
+a `PRIMARY KEY` for it to default from, or the statement is refused with
+`42P17`. A relation with no key would give up range pruning, compression
+locality, and merge-friendly compaction all at once, and a store that silently
+accepted one would hide all three. Nothing forces the choice either: every type
+these methods store is B-tree-orderable, so a key can always be named. The row
+ID's job is narrower than "supply an order when nothing else does" — it breaks
+ties *within* equal keys, which is what makes the order total.
+
+Comparisons use CrabgreSQL/PostgreSQL semantics, including direction, NULL
+ordering, NaN behavior, and the recorded collation version. A collation-version
+change makes affected chunks candidates for a rewrite rather than silently
+changing their claimed order.
+
+Two gaps between this section and today's implementation, both deliberate: the
+recorded key carries no collation version yet, and it is stored as a field on the
+relation schema rather than inside a versioned `ParquetLayout`. Relations created
+before the key existed decode with an empty one, so the sorted flush must still
+cope with an unordered relation even though DDL can no longer create one.
 
 The manifest is the source of truth; directory listing is only a recovery and
 orphan-GC aid. Each chunk entry contains at least:
@@ -686,6 +702,17 @@ ourselves anything that is not visible through SQL:
 - page checksums on by default, CRC on WAL records;
 - no `postgresql.conf` legacy: we also read PG-format config; unknown GUCs are
   accepted and ignored with a warning (drivers love setting them).
+
+One deviation *is* visible through SQL, and is listed here because it is the
+exception to the paragraph above:
+
+- **`CREATE TABLE ... ORDER BY (columns)`** declares the layout sort key of an
+  engine-managed relation (§2.2). PostgreSQL has no such clause — the rule is
+  ClickHouse MergeTree's — and for `USING parquet`/`USING buffer` it is
+  mandatory, so a statement PostgreSQL accepts can be refused here with `42P17`.
+  It changes nothing for a heap table, which rejects the clause outright, so the
+  PostgreSQL-compatible surface is untouched: the divergence is reachable only
+  from a `USING` clause that already names a non-PostgreSQL access method.
 
 ## 7. Decisions made
 

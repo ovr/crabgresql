@@ -495,6 +495,13 @@ fn analyze_results_survive_a_crash_without_being_wal_logged() -> anyhow::Result<
 fn parquet_schema(name: &str) -> TableSchema {
     let mut schema = TableSchema::new(name, vec![Column::new("id", PgType::Int4)]);
     schema.access_method = crabgresql_storage_api::TableAccessMethod::Parquet;
+    // An engine-managed relation must declare the order it stores rows in; the
+    // engine refuses one that does not.
+    schema.sort_key = vec![crabgresql_storage_api::IndexKey {
+        column: 0,
+        descending: false,
+        nulls_first: false,
+    }];
     schema
 }
 
