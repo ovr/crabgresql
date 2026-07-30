@@ -25,12 +25,14 @@
 
 mod ckpt;
 mod control;
+mod fsutil;
 mod record;
 mod recovery;
 mod rmgr;
 mod wal;
 
 pub use ckpt::{CHECKPOINT_ONLINE, CHECKPOINT_SHUTDOWN, Checkpoint};
+pub use fsutil::sync_dir;
 pub use control::{ControlFile, control_path, read_control, write_control};
 pub use record::{Lsn, LsnRange, WalError, WalRecord};
 pub use recovery::{RecoveryResult, recover};

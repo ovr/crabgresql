@@ -152,11 +152,13 @@ pub fn write_control(dir: &Path, ctl: &ControlFile) -> Result<(), WalError> {
         f.sync_data()?;
     }
     std::fs::rename(&tmp, control_path(dir))?;
-    // fsync the directory so the rename survives a crash. Propagated rather than
-    // ignored: this file names the LSN recovery resumes from, so reporting
-    // success for a rename that a crash could still undo would leave the caller
-    // believing a checkpoint is published when it is not.
-    std::fs::File::open(&subdir)?.sync_all()?;
+    // fsync the directory so the rename survives a crash. Real errors propagate —
+    // this file names the LSN recovery resumes from, so reporting success for a
+    // rename a crash could still undo would leave the caller believing a
+    // checkpoint is published when it is not — but a filesystem that simply
+    // cannot fsync a directory is tolerated rather than fatal, or the server
+    // would refuse to start on it. See [`crate::sync_dir`].
+    crate::fsutil::sync_dir(&subdir)?;
     Ok(())
 }
 
