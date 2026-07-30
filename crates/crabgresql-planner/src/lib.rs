@@ -1176,9 +1176,6 @@ fn schema_names(schema: &TableSchema) -> Vec<Option<&str>> {
         .collect()
 }
 
-/// The column names of `plan`'s output row, for rendering an expression that
-/// indexes into it. Empty when the shape has no names to offer, which
-/// [`explain_expr`] renders as `$index`.
 /// This window step's 1-based position in its chain, counting from the bottom —
 /// the `N` in PG's `Window: wN AS (…)`, which numbers specs in evaluation order.
 fn window_number(plan: &PhysicalPlan) -> usize {
@@ -1237,6 +1234,9 @@ fn explain_window_spec(spec: &BoundWindowSpec, names: &[Option<&str>]) -> String
     parts.join(" ")
 }
 
+/// The column names of `plan`'s output row, for rendering an expression that
+/// indexes into it. Empty when the shape has no names to offer, which
+/// [`explain_expr`] renders as `$index`.
 fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<&str>> {
     match plan {
         PhysicalPlan::Append { columns, .. } => {
@@ -2745,10 +2745,6 @@ mod projection_tests {
         }
     }
 
-    /// A hidden ORDER BY column lives in the inner node's `projections` past the
-    /// visible width. The outer demand does not name it, so it survives only
-    /// because `through_tail` folds the sort keys into the node's own demand.
-    #[test]
     /// The window arm of the projection pass has to split the parent's demand at
     /// `input_width`: a demanded *slot* is computed by the window node, not read
     /// from below, so forwarding it would land past the source's own projection
@@ -2821,6 +2817,9 @@ mod projection_tests {
         );
     }
 
+    /// A hidden ORDER BY column lives in the inner node's `projections` past the
+    /// visible width. The outer demand does not name it, so it survives only
+    /// because `through_tail` folds the sort keys into the node's own demand.
     #[test]
     fn a_hidden_order_by_column_survives_threading() {
         let plan = plan_sql("SELECT id FROM (SELECT * FROM t) s ORDER BY name");

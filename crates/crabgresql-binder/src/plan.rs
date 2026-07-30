@@ -6734,21 +6734,18 @@ mod tests {
     /// have to be substituted — the window node's expressions are not reached by
     /// the projection walk.
     #[test]
-    fn substitute_params_reaches_into_a_window_spec() {
+    fn substitute_params_reaches_into_a_window_spec() -> anyhow::Result<()> {
         let engine = engine_with_table();
         let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         // Declared, as an extended-protocol Parse would: a bare `PARTITION BY $1`
         // gives the binder nothing to infer from, and PG rejects it too.
         let params = param_ctx_extended(vec![Some(PgType::Int4)]);
-        let stmts = crabgresql_parser::parse(
-            "SELECT rank() OVER (PARTITION BY $1 ORDER BY name) FROM t",
-        )
-        .expect("parse");
+        let stmts =
+            crabgresql_parser::parse("SELECT rank() OVER (PARTITION BY $1 ORDER BY name) FROM t")?;
         let ast::Statement::Query(query) = &stmts[0] else {
             panic!("expected a query");
         };
-        let mut plan = bind_query_with_params(&engine, &catalog, query, &params)
-            .expect("bind with params");
+        let mut plan = bind_query_with_params(&engine, &catalog, query, &params)?;
         substitute_params(&mut plan, &[Value::Int4(7)]);
         let LogicalPlan::Subquery { source, .. } = plan else {
             panic!("expected a Subquery wrapping the window chain");
@@ -6760,6 +6757,7 @@ mod tests {
             value: Value::Int4(7),
             ty: PgType::Int4
         }]);
+        Ok(())
     }
 
     #[test]

@@ -3307,18 +3307,13 @@ impl ExecNode for WindowAgg {
 /// Whether two rows are equal on every one of `keys` — the boundary test for
 /// both partitions and peer groups.
 ///
-/// NULLs compare equal, so they group together, and equality is bytewise for
-/// strings: every supported collation is deterministic, so a collated comparison
-/// can only tie where the bytes already do. An empty `keys` makes every row match.
+/// Defined as "the sort sees no difference" rather than as its own comparison
+/// ladder, so a boundary can never disagree with the order that produced it:
+/// NULLs group together because the sort places them together, and `asc` /
+/// `nulls_first` cannot matter because they only ever flip a non-`Equal`
+/// result. An empty `keys` makes every row match.
 fn rows_match(a: &Tuple, b: &Tuple, keys: &[SortKey]) -> bool {
-    keys.iter().all(|key| {
-        let (va, vb) = (&a[key.column], &b[key.column]);
-        match (va, vb) {
-            (Value::Null, Value::Null) => true,
-            (Value::Null, _) | (_, Value::Null) => false,
-            _ => compare_values(key.ty, va, vb) == Ordering::Equal,
-        }
-    })
+    compare_rows(a, b, keys) == Ordering::Equal
 }
 
 /// Streaming LIMIT/OFFSET. Discards the first `remaining_offset` child tuples,
