@@ -831,6 +831,11 @@ pub trait TableAm: Send + Sync {
     /// The default is `false`. The durable heap engine stores rows, so
     /// assembling batches from it would cost more than the vectorized operators
     /// above could win back; it stays on the row path deliberately.
+    ///
+    /// **A delegating wrapper must forward this and [`TableAm::scan_batches`].**
+    /// Both have defaults, so a wrapper that forgets them compiles cleanly and
+    /// silently reports "no batch path" for a leaf that has one — the feature
+    /// then does nothing, with no error to notice.
     fn supports_batch_scan(&self) -> bool {
         false
     }

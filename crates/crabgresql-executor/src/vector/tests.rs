@@ -59,7 +59,7 @@ fn columnar_filter(
     ];
     let filtered = FilterBatch::new(Box::new(Batches(batches.into_iter())), compiled);
 
-    let mut node = Shred::new(Box::new(filtered), layout);
+    let mut node = Shred::dense(Box::new(filtered), layout);
     let mut out = Vec::new();
     while let Some(row) = node.next()? {
         out.push(row);
@@ -282,7 +282,7 @@ fn types_whose_arrow_semantics_differ_are_refused() {
     let refused = [
         // Stored as Utf8, so Arrow would compare text: '9' > '10'.
         PgType::Numeric,
-        // PG: NaN = NaN. IEEE and Arrow: it is not.
+        // Arrow's `eq` is bitwise: `-0.0 = 0.0` is false, PG says true.
         PgType::Float4,
         PgType::Float8,
         // Compares with trailing blanks trimmed.
@@ -419,7 +419,7 @@ fn columnar_sort(
     let sorted = SortBatch::new(Box::new(project), keys, &projected, visible_width)?;
 
     let visible: BatchLayout = Arc::from(&projected[..visible_width]);
-    let mut node = Shred::new(Box::new(sorted), visible);
+    let mut node = Shred::dense(Box::new(sorted), visible);
     let mut out = Vec::new();
     while let Some(row) = node.next()? {
         out.push(row);
@@ -596,6 +596,216 @@ fn an_empty_input_sorts_to_nothing() {
     let sorted = columnar_sort(&schema, &[], &[sort_key(0, PgType::Int4, true, false)], 1)
         .expect("columnar sort");
     assert!(sorted.is_empty());
+}
+
+/// A predicate with no column reference evaluates against scalars, so it
+/// produces a mask describing ONE value. Every consumer assumes a mask is as
+/// tall as the batch, and both fail quietly if it is not: `filter_record_batch`
+/// truncates the batch to the mask's length, so `WHERE 1=1` returned one row
+/// per batch instead of every row.
+///
+/// `WHERE 1=1` is what ORMs and query builders emit for a dynamically-empty
+/// predicate, so this was reachable from ordinary SQL.
+#[test]
+fn a_constant_only_predicate_keeps_every_row() {
+    let schema = schema_of(&[PgType::Int4]);
+    let rows = int_rows();
+    let one = || constant(Value::Int4(1), PgType::Int4);
+
+    // `1 = 1` — true for every row.
+    let always = compare(BinOp::Eq, PgType::Int4, one(), one());
+    assert_same(&schema, &rows, &always);
+    assert_eq!(
+        columnar_filter(&schema, &rows, &always).expect("filter").len(),
+        rows.len(),
+        "a constant-true predicate must keep every row, not one per batch"
+    );
+
+    // `1 = 2` — false for every row.
+    let never = compare(
+        BinOp::Eq,
+        PgType::Int4,
+        one(),
+        constant(Value::Int4(2), PgType::Int4),
+    );
+    assert_same(&schema, &rows, &never);
+    assert!(columnar_filter(&schema, &rows, &never).expect("filter").is_empty());
+
+    // A bare `true`, and `NULL IS NULL` — the other two shapes with no column.
+    assert_same(&schema, &rows, &constant(Value::Bool(true), PgType::Bool));
+    assert_same(
+        &schema,
+        &rows,
+        &BoundExpr::IsNull {
+            expr: Box::new(constant(Value::Null, PgType::Int4)),
+            negated: false,
+        },
+    );
+}
+
+/// The other half of the same defect: a constant beside a column gives
+/// `and_kleene` a length-N and a length-1 operand, which it rejects outright —
+/// so `WHERE id = 1 AND true` failed the query rather than answering it.
+#[test]
+fn a_constant_beside_a_column_still_compares() {
+    let schema = schema_of(&[PgType::Int4]);
+    let rows = int_rows();
+    let eq_one = compare(
+        BinOp::Eq,
+        PgType::Int4,
+        column(0, PgType::Int4),
+        constant(Value::Int4(1), PgType::Int4),
+    );
+    for op in [BinOp::And, BinOp::Or] {
+        for literal in [Value::Bool(true), Value::Bool(false), Value::Null] {
+            assert_same(
+                &schema,
+                &rows,
+                &logic(op, eq_one.clone(), constant(literal.clone(), PgType::Bool)),
+            );
+        }
+    }
+}
+
+/// A zero-row batch is where a length-1 mask is *longer* than the data, which
+/// `filter_record_batch` does reject — so the empty relation errored where the
+/// row path returned nothing.
+#[test]
+fn a_constant_predicate_over_no_rows_yields_no_rows() {
+    let schema = schema_of(&[PgType::Int4]);
+    let always = compare(
+        BinOp::Eq,
+        PgType::Int4,
+        constant(Value::Int4(1), PgType::Int4),
+        constant(Value::Int4(1), PgType::Int4),
+    );
+    assert!(columnar_filter(&schema, &[], &always).expect("filter").is_empty());
+}
+
+/// A constant whose type has no Arrow encoding must be *declined* at compile
+/// time, not discovered on the first batch. `SELECT id, '{}'::json FROM p ORDER
+/// BY id` is legal on a relation that could never store a json column, and it
+/// used to fail with a storage error where the heap answered normally.
+#[test]
+fn a_projection_constant_arrow_cannot_hold_is_declined() {
+    let schema = schema_of(&[PgType::Int4]);
+    let layout = layout_of(&schema);
+    let id = column(0, PgType::Int4);
+
+    for (value, ty) in [
+        (Value::Json("{}".into()), PgType::Json),
+        (Value::Oid(1), PgType::Oid),
+        (Value::Money(1), PgType::Money),
+    ] {
+        let projections = vec![id.clone(), constant(value, ty)];
+        assert!(
+            ProjectBatch::compile(&projections, &layout).is_none(),
+            "{ty:?} has no Arrow encoding and must not compile"
+        );
+    }
+    // A representable constant still compiles, so the guard is not a blanket ban.
+    let ok = vec![id, constant(Value::Int4(7), PgType::Int4)];
+    assert!(ProjectBatch::compile(&ok, &layout).is_some());
+}
+
+/// The planner decides *whether* and the executor decides *how*, so the two
+/// must agree exactly: a shape the planner accepts and the executor declines
+/// makes EXPLAIN advertise work that never happens, and the reverse hides work
+/// that does. Nothing but this test enforces it — they are separate walks over
+/// `BoundExpr` in separate crates.
+#[test]
+fn the_planner_and_the_executor_agree_on_every_shape() {
+    let schema = schema_of(&[PgType::Int4, PgType::Text, PgType::Numeric]);
+    let layout = layout_of(&schema);
+    let int = || column(0, PgType::Int4);
+    let one = || constant(Value::Int4(1), PgType::Int4);
+
+    let shapes: Vec<BoundExpr> = vec![
+        // Accepted.
+        compare(BinOp::Eq, PgType::Int4, int(), one()),
+        compare(BinOp::Lt, PgType::Int4, int(), one()),
+        logic(
+            BinOp::And,
+            compare(BinOp::Eq, PgType::Int4, int(), one()),
+            compare(BinOp::Gt, PgType::Int4, int(), one()),
+        ),
+        BoundExpr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(compare(BinOp::Eq, PgType::Int4, int(), one())),
+        },
+        BoundExpr::IsNull {
+            expr: Box::new(int()),
+            negated: true,
+        },
+        compare(
+            BinOp::Eq,
+            PgType::Text,
+            column(1, PgType::Text),
+            constant(Value::Text("x".into()), PgType::Text),
+        ),
+        // Declined, each for its own reason.
+        compare(
+            BinOp::Eq,
+            PgType::Numeric,
+            column(2, PgType::Numeric),
+            one(),
+        ),
+        compare(BinOp::Eq, PgType::Int4, column(9, PgType::Int4), one()),
+        compare(
+            BinOp::Eq,
+            PgType::Int4,
+            int(),
+            BoundExpr::Param {
+                index: 0,
+                ty: PgType::Int4,
+            },
+        ),
+        compare(
+            BinOp::Eq,
+            PgType::Int4,
+            int(),
+            constant(Value::Json("{}".into()), PgType::Json),
+        ),
+        BoundExpr::IsNull {
+            expr: Box::new(constant(Value::Json("{}".into()), PgType::Json)),
+            negated: false,
+        },
+        constant(Value::Bool(true), PgType::Bool),
+    ];
+
+    for shape in shapes {
+        let planner = crabgresql_planner::vectorize::vectorizable_predicate(&shape, layout.len());
+        let executor = expr::compile_predicate(&shape, &layout).is_some();
+        assert_eq!(
+            planner, executor,
+            "planner says {planner}, executor says {executor} for {shape:?}"
+        );
+    }
+}
+
+/// `Shred` decodes only the columns a scan filled. A batch is full width so a
+/// schema ordinal is a batch ordinal, but the columns outside the projection
+/// are all-NULL padding — decoding those makes the per-row cost scale with the
+/// table rather than the query, and the row scan never did.
+#[test]
+fn shred_decodes_only_the_projected_columns() {
+    let schema = schema_of(&[PgType::Int4, PgType::Text, PgType::Int8]);
+    let rows = vec![vec![
+        Value::Int4(1),
+        Value::Text("x".into()),
+        Value::Int8(9),
+    ]];
+    let batch = build_scan_batch(&schema, &rows).expect("batch");
+
+    // Only column 2 was "projected"; the rest read back as Null, which is what
+    // the row scan promises for an unselected column.
+    let mut node = Shred::new(
+        Box::new(Batches(vec![batch].into_iter())),
+        layout_of(&schema),
+        vec![2],
+    );
+    let row = node.next().expect("shred").expect("a row");
+    assert_eq!(row, vec![Value::Null, Value::Null, Value::Int8(9)]);
 }
 
 /// A filter that rejects everything in a batch yields an empty batch, and the

@@ -1367,6 +1367,11 @@ enum Source {
     Batches {
         node: Box<dyn vector::BatchNode>,
         layout: vector::BatchLayout,
+        /// Which batch columns carry values. A scan's batch is full width, but
+        /// the columns outside its `ColumnProjection` are all-NULL padding, and
+        /// shredding those would undo the projection pushdown. An operator that
+        /// builds its own columns (a projection, a sort) makes this dense.
+        positions: Vec<usize>,
     },
 }
 
@@ -1375,25 +1380,43 @@ impl Source {
     fn into_rows(self) -> Box<dyn ExecNode> {
         match self {
             Source::Rows(node) => node,
-            Source::Batches { node, layout } => Box::new(vector::Shred::new(node, layout)),
+            Source::Batches {
+                node,
+                layout,
+                positions,
+            } => Box::new(vector::Shred::new(node, layout, positions)),
         }
     }
 
     /// Apply `predicate` columnar-side if it compiles, returning it unconsumed
     /// otherwise so the caller can build the row [`Filter`] instead.
     fn filter(self, predicate: BoundExpr) -> (Self, Option<BoundExpr>) {
-        let Source::Batches { node, layout } = self else {
+        let Source::Batches {
+            node,
+            layout,
+            positions,
+        } = self
+        else {
             return (self, Some(predicate));
         };
+        // A filter drops rows, never columns, so `positions` is unchanged.
         match vector::expr::compile_predicate(&predicate, &layout) {
             Some(compiled) => (
                 Source::Batches {
                     node: Box::new(vector::FilterBatch::new(node, compiled)),
                     layout,
+                    positions,
                 },
                 None,
             ),
-            None => (Source::Batches { node, layout }, Some(predicate)),
+            None => (
+                Source::Batches {
+                    node,
+                    layout,
+                    positions,
+                },
+                Some(predicate),
+            ),
         }
     }
 
@@ -1414,7 +1437,12 @@ impl Source {
         sort: &[SortKey],
         visible_width: usize,
     ) -> Result<(Self, bool), ExecError> {
-        let Source::Batches { node, layout } = self else {
+        let Source::Batches {
+            node,
+            layout,
+            positions,
+        } = self
+        else {
             return Ok((self, false));
         };
         let projected = vector::sort::ProjectBatch::layout(projections);
@@ -1426,7 +1454,16 @@ impl Source {
             {
                 takes
             }
-            _ => return Ok((Source::Batches { node, layout }, false)),
+            _ => {
+                return Ok((
+                    Source::Batches {
+                        node,
+                        layout,
+                        positions,
+                    },
+                    false,
+                ));
+            }
         };
         let project = vector::sort::ProjectBatch::new(node, takes, &projected);
         let sorted = vector::sort::SortBatch::new(Box::new(project), sort, &projected, visible_width)?;
@@ -1436,6 +1473,9 @@ impl Source {
                 // The sort dropped the hidden ORDER BY columns, so what remains
                 // above it is the visible prefix of the projected layout.
                 layout: Arc::from(&projected[..visible_width]),
+                // Every surviving column was built by the projection, so there
+                // is no NULL padding left to skip.
+                positions: (0..visible_width).collect(),
             },
             true,
         ))
@@ -1476,6 +1516,19 @@ fn subquery_source(
     Ok(Source::Rows(node))
 }
 
+/// The batch columns a scan under `projection` actually fills.
+///
+/// A batch is full width so a schema ordinal is a batch ordinal, but the
+/// columns outside the projection are all-NULL padding. Naming only the real
+/// ones keeps `Shred`'s per-row cost proportional to the query rather than to
+/// the table's width.
+fn scan_positions(projection: &ColumnProjection, width: usize) -> Vec<usize> {
+    match projection {
+        ColumnProjection::All => (0..width).collect(),
+        ColumnProjection::Some(cols) => cols.to_vec(),
+    }
+}
+
 /// The source for a single-table scan: columnar if the engine can hand up
 /// batches, the plain row scan otherwise.
 ///
@@ -1487,10 +1540,15 @@ fn scan_source(
     projection: &ColumnProjection,
 ) -> Source {
     match vector::BatchScan::open(table, txn, projection) {
-        Some(scan) => Source::Batches {
-            node: Box::new(scan),
-            layout: vector::layout_of(table.schema()),
-        },
+        Some(scan) => {
+            let layout = vector::layout_of(table.schema());
+            let positions = scan_positions(projection, layout.len());
+            Source::Batches {
+                node: Box::new(scan),
+                layout,
+                positions,
+            }
+        }
         None => Source::Rows(Box::new(SeqScan::new(table, txn, projection))),
     }
 }
@@ -1510,10 +1568,14 @@ fn append_source(
     // the batch. `Append` over zero leaves is not a shape the planner emits.
     let layout = tables.first().map(|table| vector::layout_of(table.schema()));
     match (vector::BatchAppend::open(tables, txn, projection), layout) {
-        (Some(append), Some(layout)) => Source::Batches {
-            node: Box::new(append),
-            layout,
-        },
+        (Some(append), Some(layout)) => {
+            let positions = scan_positions(projection, layout.len());
+            Source::Batches {
+                node: Box::new(append),
+                layout,
+                positions,
+            }
+        }
         _ => Source::Rows(Box::new(Append::new(tables, txn, projection))),
     }
 }
@@ -3968,6 +4030,30 @@ mod tests {
     use crabgresql_types::PgType;
     use crabgresql_types::collation::DEFAULT_COLLATION_OID;
     use eval::coerce_value;
+
+    /// The batch columns a scan fills, which is what `Shred` decodes.
+    ///
+    /// Worth its own test because the effect of getting it wrong is invisible
+    /// in results: an unprojected column is all-NULL padding, so decoding it
+    /// yields the same `Value::Null` that skipping it leaves behind. Only the
+    /// per-row cost changes — on a wide relation, by the ratio of the table's
+    /// width to the query's — so no assertion on rows can catch a regression
+    /// here and this has to pin the derivation directly.
+    #[test]
+    fn scan_positions_names_only_the_projected_columns() {
+        assert_eq!(scan_positions(&ColumnProjection::All, 3), vec![0, 1, 2]);
+
+        let schema = TableSchema::new(
+            "t",
+            vec![
+                Column::new("a", PgType::Int4),
+                Column::new("b", PgType::Int4),
+                Column::new("c", PgType::Int4),
+            ],
+        );
+        let narrowed = ColumnProjection::of([2], &schema);
+        assert_eq!(scan_positions(&narrowed, 3), vec![2]);
+    }
 
     #[track_caller]
     fn test_ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {

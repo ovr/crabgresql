@@ -143,7 +143,7 @@ impl Node {
 
     fn boolean(&self, batch: &RecordBatch) -> Result<BooleanArray, ExecError> {
         let operand = self.evaluate(batch)?;
-        operand
+        let mask = operand
             .array()
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -151,8 +151,38 @@ impl Node {
             // Unreachable: `compile` type-checks every boolean position. An
             // error rather than a panic, so a compiler bug fails the query
             // instead of the backend.
-            .ok_or_else(|| internal("vectorized predicate expected a boolean operand"))
+            .ok_or_else(|| internal("vectorized predicate expected a boolean operand"))?;
+        Ok(fit(mask, batch.num_rows()))
     }
+}
+
+/// Broadcast a mask that describes one value to the whole batch.
+///
+/// A predicate subtree with no column reference — `1 = 1`, `true`, `NULL IS
+/// NULL`, or a comparison of two constants — evaluates against `Scalar`
+/// operands and so yields a **length-1** mask. Every consumer of a mask assumes
+/// it is as tall as the batch, and both of them fail quietly rather than
+/// loudly if it is not:
+///
+/// - `filter_record_batch` only rejects a mask *longer* than the data, so a
+///   length-1 mask silently truncates the batch to its first row;
+/// - `and_kleene`/`or_kleene` reject unequal lengths outright, so a constant
+///   beside a column (`id = 1 AND true`) fails the query.
+///
+/// Fitting here rather than at either call site covers both, and covers the
+/// zero-row batch, where a length-1 mask is *longer* than the data. NULL-ness
+/// is carried through: `x AND NULL` must stay NULL, not collapse to false.
+fn fit(mask: BooleanArray, rows: usize) -> BooleanArray {
+    if mask.len() == rows {
+        return mask;
+    }
+    // Only a scalar can legitimately disagree with the batch height; anything
+    // else is a column, which Arrow already guarantees is batch-length.
+    if mask.len() != 1 {
+        return mask;
+    }
+    let value = mask.is_valid(0).then(|| mask.value(0));
+    std::iter::repeat_n(value, rows).collect()
 }
 
 fn boxed(array: BooleanArray) -> Operand {
@@ -169,7 +199,17 @@ fn kernel_error(error: ArrowError) -> ExecError {
 
 /// Compile `predicate` against a batch of `layout`, or `None` if any part of it
 /// falls outside the provable subset.
+///
+/// The planner's [`vectorize::vectorizable_predicate`] is the gate, and it is
+/// consulted **first** — so this can only ever accept a subset of what `EXPLAIN`
+/// advertised, never a superset. That direction is the one that matters: a plan
+/// annotated columnar which then runs on rows is misleading, but a plan that
+/// vectorizes work `EXPLAIN` called row-based is undetectable from the outside.
+/// A corpus test pins the two to exact agreement.
 pub fn compile_predicate(predicate: &BoundExpr, layout: &BatchLayout) -> Option<VectorPredicate> {
+    if !vectorize::vectorizable_predicate(predicate, layout.len()) {
+        return None;
+    }
     let root = compile_bool(predicate, layout)?;
     Some(VectorPredicate { root })
 }

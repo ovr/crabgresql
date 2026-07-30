@@ -66,9 +66,11 @@ impl Vectorization {
 ///
 /// - `numeric` has no Arrow type (arbitrary precision), so it is stored as text
 ///   and an Arrow comparison would compare text: `'9' > '10'`.
-/// - `float4`/`float8` — PostgreSQL defines `NaN = NaN` as true; IEEE, and so
-///   Arrow, says NaN equals nothing. (Floats *can* be sort keys — see
-///   [`sortable_key`] — because ordering is repairable where equality is not.)
+/// - `float4`/`float8` — Arrow's comparison kernels are not IEEE `==` but
+///   bitwise, i.e. IEEE's totalOrder predicate. So `-0.0 = 0.0` is false where
+///   PostgreSQL says true, and two NaNs of different bit patterns compare
+///   unequal where PostgreSQL calls every NaN one value. (Floats *can* be sort
+///   keys — see [`sortable_key`].)
 /// - `bpchar` compares with trailing blanks trimmed.
 /// - `timetz`/`interval` are structs whose PostgreSQL order is not
 ///   lexicographic over their fields.
@@ -98,7 +100,9 @@ pub fn comparable(ty: PgType, op: BinOp, collation: u32) -> bool {
 ///
 /// The float types are here although [`comparable`] excludes them: the executor
 /// canonicalizes `-0.0` to `0.0` and every NaN to one NaN before sorting, which
-/// makes the two orders coincide. No such repair exists for equality.
+/// makes the two orders coincide. The same rewrite would repair equality too,
+/// but a sort owns its key column and can rewrite it once, whereas a filter
+/// would have to rewrite both operands of every comparison it evaluates.
 pub fn sortable_key(key: &SortKey) -> bool {
     match key.ty {
         PgType::Bool
@@ -171,7 +175,13 @@ fn vectorizable_operand(expr: &BoundExpr, width: usize) -> bool {
         // Batches are full width in schema order, so a schema ordinal is a batch
         // ordinal — but only if it is actually in range.
         BoundExpr::ColumnRef { index, .. } => *index < width,
-        BoundExpr::Const { .. } => true,
+        // A constant is only usable if Arrow can hold its type. Roughly half of
+        // `PgType` cannot be encoded (json, inet, arrays, …), and such a
+        // constant is perfectly legal in a target list or a `WHERE` even on a
+        // relation that could never store one — `SELECT id, '{}'::json FROM p
+        // ORDER BY id`. Without this check the planner advertises a columnar
+        // plan the executor cannot build.
+        BoundExpr::Const { ty, .. } => crabgresql_storage_api::arrow::supports_type(*ty),
         _ => false,
     }
 }

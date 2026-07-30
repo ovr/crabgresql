@@ -54,6 +54,11 @@ pub const BUFFER_DELETE: u8 = 2;
 /// redo rejects a version it does not know rather than misparsing it.
 const PAYLOAD_FORMAT: u8 = 1;
 
+/// Rows per batch handed up by [`TableAm::scan_batches`], matching the Parquet
+/// reader's own batch size so both leaves of one relation stream at the same
+/// granularity.
+const BATCH_ROWS: usize = 8_192;
+
 fn corrupt(message: impl Into<String>) -> StorageError {
     StorageError::CorruptData(message.into())
 }
@@ -863,22 +868,39 @@ impl TableAm for BufferTable {
     ///
     /// The conversion is bounded by the flush policy, which is what keeps the
     /// buffer small relative to the fragments beside it.
+    ///
+    /// `projection` is honored exactly as the row path honors it: [`Self::visible`]
+    /// returns full-width tuples with `Null` in the unselected slots, which is
+    /// also what the [`BatchStream`] contract asks for, so the same call serves
+    /// both. Skipping it would clone every `Value::Text` in the buffer for
+    /// columns nobody asked for, and would make this leaf disagree with the
+    /// Parquet leaf beside it about what an unprojected slot holds.
     fn scan_batches(&self, txn: &TxnContext, projection: &ColumnProjection) -> Option<BatchStream> {
-        // Built full width regardless of `projection`: the rows are already in
-        // memory, so narrowing would save only the per-column encode, and the
-        // batch has to come back to full width before it leaves anyway.
-        let _ = projection;
+        let width = self.schema.columns.len();
         let rows: Vec<Tuple> = self
-            .visible(txn, &ColumnProjection::All)
+            .visible(txn, projection)
             .into_iter()
-            .map(|(_, tuple)| tuple)
+            .map(|(_, mut tuple)| {
+                // The `All` arm of `visible` passes a stored row through at
+                // whatever width it has. The row path degrades on a short row
+                // rather than panicking; pad here so the batch builder, which
+                // rejects a width mismatch outright, degrades the same way.
+                tuple.resize(width, Value::Null);
+                tuple
+            })
             .collect();
-        if rows.is_empty() {
-            return Some(Box::new(std::iter::empty()));
-        }
-        Some(Box::new(std::iter::once(
-            crabgresql_storage_api::arrow::build_scan_batch(&self.schema, &rows),
-        )))
+        // Chunked rather than one unbounded batch: a buffer at its soft
+        // threshold would otherwise be live twice over, as tuples and as one
+        // giant Arrow copy, before a single row reached the operator above.
+        let schema = self.schema.clone();
+        Some(Box::new(
+            rows.into_iter()
+                .collect::<Vec<_>>()
+                .chunks(BATCH_ROWS)
+                .map(|chunk| crabgresql_storage_api::arrow::build_scan_batch(&schema, chunk))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        ))
     }
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {

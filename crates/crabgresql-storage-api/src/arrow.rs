@@ -437,28 +437,37 @@ pub fn build_scan_batch(
 /// Widen a batch that a projection narrowed back to the table's full width,
 /// padding the columns the scan skipped with all-NULL arrays.
 ///
-/// `positions[i]` is the schema ordinal of the batch's `i`th column. The result
-/// is stamped with [`scan_schema`], so every batch stream speaks one schema
-/// regardless of which projection produced it.
+/// `positions[i]` is the schema ordinal of the batch's `i`th column. `stamp` is
+/// the relation's [`scan_schema`], passed in rather than derived: it is a pure
+/// function of the table and this runs once per batch, so rebuilding every
+/// `Field` and its metadata map here would cost more than the widening itself
+/// on a wide relation.
+///
+/// Padding is built **only** for the ordinals `positions` does not name.
+/// `new_null_array` is O(rows), so allocating one per schema column and then
+/// overwriting the projected ones would scale with the table's width rather
+/// than with what the scan skipped — the opposite of what a projection is for.
 pub fn widen(
     schema: &TableSchema,
+    stamp: &Arc<Schema>,
     positions: &[usize],
     batch: &RecordBatch,
 ) -> Result<RecordBatch, StorageError> {
     let rows = batch.num_rows();
-    let mut columns: Vec<ArrayRef> = schema
-        .columns
-        .iter()
-        .map(|column| null_array(column.ty, rows))
-        .collect();
+    let mut columns: Vec<Option<ArrayRef>> = vec![None; schema.columns.len()];
     for (batch_index, &schema_index) in positions.iter().enumerate() {
         let slot = columns
             .get_mut(schema_index)
             .ok_or_else(|| corrupt("projection names a column outside the table schema"))?;
-        *slot = Arc::clone(batch.column(batch_index));
+        *slot = Some(Arc::clone(batch.column(batch_index)));
     }
+    let columns: Vec<ArrayRef> = columns
+        .into_iter()
+        .zip(&schema.columns)
+        .map(|(array, column)| array.unwrap_or_else(|| null_array(column.ty, rows)))
+        .collect();
     let options = RecordBatchOptions::new().with_row_count(Some(rows));
-    RecordBatch::try_new_with_options(scan_schema(schema), columns, &options)
+    RecordBatch::try_new_with_options(Arc::clone(stamp), columns, &options)
         .map_err(|error| StorageError::Io(format!("widen Arrow record batch: {error}")))
 }
 
@@ -545,6 +554,35 @@ pub fn decode_value(column: &Column, array: &dyn Array, row: usize) -> Result<Va
             column.ty.name()
         ))),
     }
+}
+
+/// Decode a chosen subset of a **full-width** batch into a full-width tuple.
+///
+/// `indices` are ordinals in the batch *and* in the tuple, because the two have
+/// the same width — that is the difference from [`decode_row`], whose
+/// `positions` map a narrowed batch's `i`th column onto a schema ordinal. Use
+/// this when the batch has already been widened and the caller only wants to
+/// pay for the columns the query reads; the rest keep `Value::Null`, which is
+/// what the scan contract says an unprojected slot holds.
+pub fn decode_columns(
+    schema: &TableSchema,
+    indices: &[usize],
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<Tuple, StorageError> {
+    let mut tuple = vec![Value::Null; schema.columns.len()];
+    for &index in indices {
+        let column = schema
+            .columns
+            .get(index)
+            .ok_or_else(|| corrupt("decode names a column outside the table schema"))?;
+        let array = batch
+            .columns()
+            .get(index)
+            .ok_or_else(|| corrupt("decode names a column outside the batch"))?;
+        tuple[index] = decode_value(column, array.as_ref(), row)?;
+    }
+    Ok(tuple)
 }
 
 /// Decode one row of `batch` into a full-width tuple.
@@ -777,7 +815,7 @@ mod tests {
             .project(&[2])
             .map_err(|e| corrupt(e.to_string()))?;
 
-        let wide = widen(&schema, &[2], &narrowed)?;
+        let wide = widen(&schema, &scan_schema(&schema), &[2], &narrowed)?;
         assert_eq!(wide.num_columns(), 3);
         assert_eq!(wide.num_rows(), 1);
         assert_eq!(
@@ -800,7 +838,7 @@ mod tests {
             .project(&[1])
             .map_err(|e| corrupt(e.to_string()))?;
 
-        let wide = widen(&schema, &[1], &narrowed)?;
+        let wide = widen(&schema, &scan_schema(&schema), &[1], &narrowed)?;
         assert_eq!(
             decode_row(&schema, &[0, 1], &wide, 0)?,
             vec![Value::Null, Value::Int8(2)]
@@ -819,6 +857,7 @@ mod tests {
         let full = build_scan_batch(&schema, &[vec![Value::Int4(1), Value::Text("x".into())]])?;
         let widened = widen(
             &schema,
+            &scan_schema(&schema),
             &[1],
             &full.project(&[1]).map_err(|e| corrupt(e.to_string()))?,
         )?;

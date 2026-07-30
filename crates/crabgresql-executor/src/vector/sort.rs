@@ -14,12 +14,11 @@ use arrow_array::{
 use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_schema::{Field, Schema};
 use arrow_select::concat::concat_batches;
-use arrow_select::take::take;
+use arrow_select::take::take as take_kernel;
 use crabgresql_binder::{BoundExpr, SortKey};
 use crabgresql_storage_api::Column;
 use crabgresql_storage_api::arrow::{build_array, scan_schema};
 use crabgresql_planner::vectorize;
-use crabgresql_types::{PgType, Value};
 
 use super::{BatchLayout, BatchNode};
 use crate::ExecError;
@@ -28,8 +27,14 @@ use crate::ExecError;
 pub enum Take {
     /// Column `n` of the input batch, unchanged.
     Column(usize),
-    /// A constant, broadcast to the batch's length.
-    Const(Value, PgType),
+    /// A length-1 array, broadcast to the batch's height.
+    ///
+    /// Built once at compile time rather than per batch. That is not only
+    /// cheaper — it is what makes an unrepresentable constant *decline* instead
+    /// of failing mid-scan: roughly half of `PgType` (json, inet, arrays, …)
+    /// has no Arrow encoding, and a `Const` of such a type is perfectly legal
+    /// in a target list even on a relation that could never store one.
+    Const(ArrayRef),
 }
 
 /// Reorders, duplicates and drops columns — the take-only subset of
@@ -46,15 +51,29 @@ pub struct ProjectBatch {
 }
 
 impl ProjectBatch {
-    /// Compile `projections` to a take list, or `None` if any of them computes.
+    /// Compile `projections` to a take list, or `None` if any of them computes
+    /// or names a constant Arrow cannot hold.
+    ///
+    /// Gated on the planner's [`vectorize::vectorizable_projection`] first, so
+    /// this can only ever accept a subset of what `EXPLAIN` advertises.
     pub fn compile(projections: &[BoundExpr], layout: &BatchLayout) -> Option<Vec<Take>> {
+        if !vectorize::vectorizable_projection(projections, layout.len()) {
+            return None;
+        }
         projections
             .iter()
             .map(|expr| match unwrap_collate(expr) {
                 BoundExpr::ColumnRef { index, .. } => {
                     (*index < layout.len()).then_some(Take::Column(*index))
                 }
-                BoundExpr::Const { value, ty } => Some(Take::Const(value.clone(), *ty)),
+                // Built here, not per batch: `ok()?` turns a type with no Arrow
+                // encoding into a declined projection rather than a query that
+                // dies on its first batch.
+                BoundExpr::Const { value, ty } => {
+                    let column = Column::new("const", *ty);
+                    let row = [vec![value.clone()]];
+                    build_array(&column, &row, 0).ok().map(Take::Const)
+                }
                 _ => None,
             })
             .collect()
@@ -89,6 +108,10 @@ impl BatchNode for ProjectBatch {
             return Ok(None);
         };
         let rows = batch.num_rows();
+        // Index 0 repeated: `take` broadcasts the length-1 constant array to the
+        // batch's height in one allocation, the same trick `expr.rs` uses for a
+        // predicate literal.
+        let broadcast: UInt64Array = std::iter::repeat_n(0u64, rows).collect();
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.takes.len());
         for take in &self.takes {
             columns.push(match take {
@@ -97,11 +120,8 @@ impl BatchNode for ProjectBatch {
                     .get(*index)
                     .map(Arc::clone)
                     .ok_or_else(|| internal("projection names a missing column"))?,
-                Take::Const(value, ty) => {
-                    let column = Column::new("const", *ty);
-                    let rows = vec![vec![value.clone()]; rows];
-                    build_array(&column, &rows, 0).map_err(ExecError::from)?
-                }
+                Take::Const(array) => take_kernel(array.as_ref(), &broadcast, None)
+                    .map_err(|error| internal(&format!("constant broadcast failed: {error}")))?,
             });
         }
         let options = RecordBatchOptions::new().with_row_count(Some(rows));
@@ -196,6 +216,11 @@ impl SortBatch {
         }
         let all = concat_batches(&schema, &batches)
             .map_err(|error| internal(&format!("sort concat failed: {error}")))?;
+        // `concat_batches` copies, so the inputs are now a second full copy of
+        // the relation. Release them before the take allocates a third — this
+        // node already holds everything in memory, and holding it three times
+        // over turns a sort that fit into one that does not.
+        drop(batches);
 
         let mut columns: Vec<SortColumn> = keys
             .iter()
@@ -226,7 +251,7 @@ impl SortBatch {
             .columns()
             .iter()
             .take(visible_width)
-            .map(|column| take(column.as_ref(), &indices, None))
+            .map(|column| take_kernel(column.as_ref(), &indices, None))
             .collect::<Result<_, _>>()
             .map_err(|error| internal(&format!("sort take failed: {error}")))?;
 
@@ -236,7 +261,10 @@ impl SortBatch {
             .take(visible_width)
             .map(|field| field.as_ref().clone())
             .collect();
-        let options = RecordBatchOptions::new().with_row_count(Some(all.num_rows()));
+        let height = all.num_rows();
+        // The sorted copy is complete; the unsorted one is dead weight now.
+        drop(all);
+        let options = RecordBatchOptions::new().with_row_count(Some(height));
         let rows =
             RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), sorted, &options)
                 .map_err(|error| internal(&format!("sort rebuild failed: {error}")))?;

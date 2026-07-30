@@ -431,6 +431,10 @@ fn open_reader(
 /// that identity.
 struct ParquetBatchScan {
     schema: TableSchema,
+    /// The relation's `scan_schema`, built once. Every batch is stamped with it,
+    /// and deriving it per batch would rebuild a `Field` and a metadata map per
+    /// column — on a hundred-column relation that dwarfs the widening.
+    stamp: Arc<arrow_schema::Schema>,
     rel: u32,
     projection: ColumnProjection,
     fragments: Vec<Fragment>,
@@ -458,6 +462,7 @@ impl Iterator for ParquetBatchScan {
                         return Some(from_file_epoch(&batch).and_then(|batch| {
                             crabgresql_storage_api::arrow::widen(
                                 &self.schema,
+                                &self.stamp,
                                 &self.positions,
                                 &batch,
                             )
@@ -1126,6 +1131,7 @@ impl ParquetTable {
         let guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         Ok(ParquetBatchScan {
+            stamp: crabgresql_storage_api::arrow::scan_schema(&self.schema),
             schema: self.schema.clone(),
             rel,
             projection: projection.clone(),
@@ -1432,10 +1438,13 @@ impl TableAm for ParquetTable {
         let mut ordinal = 1u32;
         for batch in &mut reader {
             let batch = batch.map_err(|error| corrupt(format!("decode Parquet row group: {error}")))?;
-            let batch = from_file_epoch(&batch)?;
             for row in 0..batch.num_rows() {
                 if ordinal == tid.offset as u32 {
-                    return decode_row(&self.schema, &positions, &batch, row).map(Some);
+                    // Sliced first: this is a point lookup, so rebasing the
+                    // whole row group to return one tuple would scale the cost
+                    // of a `fetch` with the fragment rather than with the row.
+                    let one = from_file_epoch(&batch.slice(row, 1))?;
+                    return decode_row(&self.schema, &positions, &one, 0).map(Some);
                 }
                 ordinal += 1;
             }

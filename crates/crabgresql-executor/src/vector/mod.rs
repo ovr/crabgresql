@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_select::filter::filter_record_batch;
-use crabgresql_storage_api::arrow::decode_row;
+use crabgresql_storage_api::arrow::decode_columns;
 use crabgresql_storage_api::{
     BatchStream, Column, ColumnProjection, TableAm, TableSchema,
 };
@@ -185,26 +185,39 @@ impl BatchNode for FilterBatch {
 /// everything in one batch produces exactly that.
 pub struct Shred {
     child: Box<dyn BatchNode>,
-    /// The batch's column types, in the shape [`decode_row`] takes. Only its
-    /// `columns` are read; the relation name is never used.
+    /// The batch's column types, in the shape [`decode_columns`] takes. Only
+    /// its `columns` are read; the relation name is never used.
     schema: TableSchema,
-    /// Batch column → tuple position. Always the identity today (batches are
-    /// full width in schema order); kept explicit because [`decode_row`] takes
-    /// it and a narrowing operator above would need it to be something else.
+    /// Which batch columns actually carry values.
+    ///
+    /// A scan's batch is full width, but the columns outside its
+    /// [`ColumnProjection`] are all-NULL padding that only exists so a schema
+    /// ordinal is a batch ordinal. Decoding those would make the per-row cost
+    /// scale with the table's width instead of with the query's — on a
+    /// hundred-column relation read for two columns, fifty times the work the
+    /// row scan does. `decode_columns` leaves the slots it is not given as `Null`,
+    /// which is exactly the row scan's contract for an unprojected column.
     positions: Vec<usize>,
     batch: Option<RecordBatch>,
     row: usize,
 }
 
 impl Shred {
-    pub fn new(child: Box<dyn BatchNode>, layout: BatchLayout) -> Self {
+    pub fn new(child: Box<dyn BatchNode>, layout: BatchLayout, positions: Vec<usize>) -> Self {
         Shred {
             child,
             schema: TableSchema::new("", layout.to_vec()),
-            positions: (0..layout.len()).collect(),
+            positions,
             batch: None,
             row: 0,
         }
+    }
+
+    /// Every column of the batch carries a value — the shape an operator that
+    /// builds its own output columns (a projection, a sort) hands up.
+    pub fn dense(child: Box<dyn BatchNode>, layout: BatchLayout) -> Self {
+        let positions = (0..layout.len()).collect();
+        Shred::new(child, layout, positions)
     }
 }
 
@@ -216,7 +229,7 @@ impl ExecNode for Shred {
             {
                 let row = self.row;
                 self.row += 1;
-                return decode_row(&self.schema, &self.positions, batch, row)
+                return decode_columns(&self.schema, &self.positions, batch, row)
                     .map(Some)
                     .map_err(ExecError::from);
             }
