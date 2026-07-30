@@ -4946,6 +4946,95 @@ async fn drop_function_semantics() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// CREATE INDEX without a name derives one from the table and its key columns
+/// (`t_a_b_idx`), bumping the label on every kind of relation-name collision.
+#[tokio::test]
+async fn create_index_generates_name() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let index_names = async |table: &str| -> anyhow::Result<Vec<String>> {
+        let msgs = client
+            .simple_query(&format!(
+                "SELECT i.relname FROM pg_class i \
+                 JOIN pg_index x ON x.indexrelid = i.oid \
+                 JOIN pg_class t ON t.oid = x.indrelid \
+                 WHERE t.relname = '{table}' ORDER BY 1"
+            ))
+            .await?;
+        Ok(rows(&msgs)
+            .iter()
+            .map(|r| r.get(0).unwrap_or_default().to_string())
+            .collect())
+    };
+
+    client.batch_execute("CREATE TABLE t (a int, b int)").await?;
+    client.batch_execute("CREATE INDEX ON t (a)").await?;
+    assert_eq!(index_names("t").await?, ["t_a_idx"]);
+
+    // Every key column joins the name, in index order.
+    client.batch_execute("CREATE INDEX ON t (a, b)").await?;
+    assert_eq!(index_names("t").await?, ["t_a_b_idx", "t_a_idx"]);
+
+    // Repeats collide with the index just made, so the label is bumped. PG allows
+    // the duplicate index itself — only the *name* has to be fresh.
+    client.batch_execute("CREATE INDEX ON t (a)").await?;
+    client.batch_execute("CREATE INDEX ON t (a)").await?;
+    assert_eq!(
+        index_names("t").await?,
+        ["t_a_b_idx", "t_a_idx", "t_a_idx1", "t_a_idx2"]
+    );
+
+    // Indexes share the relation namespace, so a table (or view, or sequence) of
+    // the generated name pushes the index off it too.
+    client
+        .batch_execute("CREATE TABLE u (a int); CREATE TABLE u_a_idx (x int)")
+        .await?;
+    client.batch_execute("CREATE INDEX ON u (a)").await?;
+    assert_eq!(index_names("u").await?, ["u_a_idx1"]);
+
+    // UNIQUE uses the same label as a plain index, and still enforces the key.
+    client
+        .batch_execute("CREATE TABLE q (a int); CREATE UNIQUE INDEX ON q (a)")
+        .await?;
+    assert_eq!(index_names("q").await?, ["q_a_idx"]);
+    client.batch_execute("INSERT INTO q VALUES (1)").await?;
+    let e = client
+        .batch_execute("INSERT INTO q VALUES (1)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+    );
+
+    // A temp table's generated names must dodge the indexes in this session's
+    // temp schema, not the ones in `public`.
+    client
+        .batch_execute("CREATE TEMP TABLE tmp_t (a int)")
+        .await?;
+    client.batch_execute("CREATE INDEX ON tmp_t (a)").await?;
+    client.batch_execute("CREATE INDEX ON tmp_t (a)").await?;
+    let msgs = client
+        .simple_query(
+            "SELECT relname FROM pg_class WHERE relkind = 'i' \
+             AND relname LIKE 'tmp\\_t%' ORDER BY relname",
+        )
+        .await?;
+    let temp: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(temp, [Some("tmp_t_a_idx"), Some("tmp_t_a_idx1")]);
+
+    // The name is derived after the key columns resolve, so a bad column is
+    // reported as such rather than as a missing index name.
+    let e = client
+        .batch_execute("CREATE INDEX ON t (nope)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &tokio_postgres::error::SqlState::UNDEFINED_COLUMN
+    );
+    Ok(())
+}
+
 /// DROP INDEX honors the session temp store: an index on a TEMP table can be
 /// dropped, and a same-named temp table shadowing a permanent one does not cause
 /// the drop of the permanent index to be misrouted (and silently lost).

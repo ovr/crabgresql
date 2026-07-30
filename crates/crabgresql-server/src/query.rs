@@ -1937,13 +1937,18 @@ fn execute_create_index(
             "NULLS [NOT] DISTINCT requires a unique index",
         ));
     }
-    let index_name = create
+    let table_name = object_name_to_table_name(&create.table_name)?;
+    let explicit_name = create
         .name
         .as_ref()
-        .ok_or_else(|| PgError::syntax("CREATE INDEX requires an index name"))
-        .and_then(object_name_to_table_name)?;
-    let table_name = object_name_to_table_name(&create.table_name)?;
-    if engine.index_name_exists("public", &table_name, &index_name) {
+        .map(object_name_to_table_name)
+        .transpose()?;
+    // Only an explicitly named index can collide; a generated one dodges existing
+    // names by construction. Keeping this check ahead of opening the table also
+    // preserves the error ordering the named form has always had.
+    if let Some(index_name) = &explicit_name
+        && engine.index_name_exists("public", &table_name, index_name)
+    {
         if create.if_not_exists {
             let mut result = QueryResult::command("CREATE INDEX");
             if let QueryResult::Command { notices, .. } = &mut result {
@@ -1962,6 +1967,18 @@ fn execute_create_index(
     let table = engine.open_table(&table_name)?;
     reject_partitioned_parent(&table, &table_name)?;
     let keys = simple_index_keys(table.schema(), &create.columns)?;
+    // PG names an unnamed index after the table and every key column, e.g.
+    // `t_a_b_idx`, then bumps the label on collision (`t_a_b_idx1`).
+    let index_name = explicit_name.unwrap_or_else(|| {
+        let schema = table.schema();
+        let mut base = table_name.clone();
+        for key in &keys {
+            base.push('_');
+            base.push_str(&schema.columns[key.column].name);
+        }
+        base.push_str("_idx");
+        fresh_index_name(engine, &table_name, &base)
+    });
     let index = IndexMetadata {
         name: index_name.clone(),
         method,
@@ -3710,6 +3727,27 @@ fn fresh_relation_name(
     for suffix in 1_u64.. {
         let candidate = format!("{base}{suffix}");
         if !exists(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Pick a free name for an index PG would auto-name. Unlike `fresh_relation_name`
+/// this goes through `index_name_exists`, which resolves the table's *effective*
+/// namespace — so an index on a temp table dodges the other indexes in that
+/// session's `pg_temp_N` schema rather than the ones in `public`.
+fn fresh_index_name(engine: &Arc<dyn TableEngine>, table: &str, base: &str) -> String {
+    let taken = |candidate: &str| {
+        engine.index_name_exists("public", table, candidate)
+            || engine.resolve(Some("public"), candidate).is_ok()
+    };
+    if !taken(base) {
+        return base.to_string();
+    }
+    for suffix in 1_u64.. {
+        let candidate = format!("{base}{suffix}");
+        if !taken(&candidate) {
             return candidate;
         }
     }
