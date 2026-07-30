@@ -75,10 +75,13 @@ pub struct Wal {
 /// Most writers need nothing: the heap `INSERT`/`DELETE` path appends the record
 /// and stamps the page inside one buffer-pool `modify` closure, so both become
 /// visible under a single frame lock and no window exists. This guard is for the
-/// writers that genuinely cannot do that — currently only a B-tree split, which
-/// is one record over three separately locked pages. A transaction commit and a
-/// buffer-table install will join it as the durable-CLOG and checkpoint work
-/// lands.
+/// writers that genuinely cannot do that. There are three:
+///
+/// * a B-tree split — one record over three separately locked pages;
+/// * a transaction commit or abort, where the record is appended and only then is
+///   the CLOG bit that decides its fate set (see [`CommitSink::delay_checkpoint`]);
+/// * a buffer-table install, where the record is appended and only then are the
+///   rows — whose sole durable trace it is — installed and counted.
 ///
 /// The guard is **non-reentrant**: a thread holding one must not call
 /// [`Wal::redo_point`], which would wait for itself. A checkpointer must also
@@ -275,6 +278,20 @@ impl Wal {
             .inner
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
+        // Nothing can be made durable past what was appended, and saying so is not
+        // pedantry: the loop below can only advance `written` by draining staged
+        // bytes, so a target above `insert_lsn` would drain an empty buffer and
+        // recheck the same condition forever. Unreachable while a caller flushes an
+        // LSN `append` handed it — but a cached page whose `pd_lsn` predates a
+        // `reset_to` names an LSN the stream no longer has, and `reset_to` is the
+        // routine path now that recovery clamps a torn tail on every start. Fail
+        // where it can be diagnosed instead of hanging the checkpoint that hit it.
+        if up_to.0 > inner.insert_lsn {
+            return Err(WalError::FlushPastEnd {
+                target: up_to,
+                appended: inner.insert_lsn,
+            });
+        }
         loop {
             if self.flushed.load(Ordering::SeqCst) >= up_to.0 {
                 return Ok(());
@@ -350,6 +367,15 @@ impl CommitSink for Wal {
 
     fn log_abort(&self, xid: Xid) {
         self.append(RmgrId::XACT, XACT_ABORT, xid, &[]);
+    }
+
+    /// The commit path is one of the writers [`CheckpointDelay`] exists for: it
+    /// appends a record and only afterwards publishes the state that decides
+    /// whether that record must be replayed (the CLOG bit).
+    fn delay_checkpoint(&self) -> Option<Box<dyn Send + '_>> {
+        // `CheckpointDelay` borrows this `Wal`, and `Wal` is `Sync`, so the guard
+        // is `Send` and can cross to whatever thread drops it.
+        Some(Box::new(Wal::delay_checkpoint(self)))
     }
 }
 
@@ -507,6 +533,29 @@ mod tests {
         Ok(())
     }
 
+    /// A target above the insert position used to spin this loop forever: the
+    /// drain cannot advance `written` to bytes that were never staged. Reachable
+    /// after `reset_to` shrinks the stream while a cached page still carries an
+    /// older, higher `pd_lsn`.
+    #[test]
+    fn flushing_past_the_end_of_the_stream_is_an_error_not_a_spin() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        let range = wal.append(RmgrId::HEAP, 0, Xid(3), b"only");
+        wal.flush(range.end)?;
+        wal.reset_to(Lsn::INVALID)?;
+
+        let Err(err) = wal.flush(range.end) else {
+            anyhow::bail!("flushing past the end of the stream must fail");
+        };
+        assert!(
+            err.to_string().contains("only 0 bytes have been appended"),
+            "unexpected error: {err}"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn redo_point_is_the_insert_lsn_when_nothing_is_delayed() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -658,6 +707,154 @@ mod tests {
                 .join()
                 .map_err(|_| anyhow::anyhow!("delay waiter panicked"))?;
             assert!(took_second.load(Ordering::SeqCst));
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    /// A [`CommitSink`] that parks in the middle of the commit window — after the
+    /// record is appended and fsynced, before the caller stamps the CLOG — so the
+    /// checkpointer can be raced against that exact window with the ordering
+    /// imposed by a gate rather than by a sleep.
+    struct GateSink {
+        wal: Arc<Wal>,
+        state: Mutex<GateState>,
+        cond: Condvar,
+    }
+
+    struct GateState {
+        entered: bool,
+        release: bool,
+    }
+
+    impl GateSink {
+        fn new(wal: Arc<Wal>) -> GateSink {
+            GateSink {
+                wal,
+                state: Mutex::new(GateState {
+                    entered: false,
+                    release: false,
+                }),
+                cond: Condvar::new(),
+            }
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+            self.state.lock().unwrap_or_else(|_| panic!("gate poisoned"))
+        }
+
+        fn entered(&self) -> bool {
+            self.lock().entered
+        }
+
+        fn release(&self) {
+            self.lock().release = true;
+            self.cond.notify_all();
+        }
+    }
+
+    impl CommitSink for GateSink {
+        fn log_commit(&self, xid: Xid) -> std::io::Result<()> {
+            self.wal.log_commit(xid)?;
+            let mut state = self.lock();
+            state.entered = true;
+            self.cond.notify_all();
+            while !state.release {
+                state = match self.cond.wait(state) {
+                    Ok(state) => state,
+                    Err(_) => panic!("gate condition-variable mutex poisoned"),
+                };
+            }
+            Ok(())
+        }
+
+        fn log_abort(&self, xid: Xid) {
+            self.wal.log_abort(xid);
+        }
+
+        fn delay_checkpoint(&self) -> Option<Box<dyn Send + '_>> {
+            Some(Box::new(self.wal.delay_checkpoint()))
+        }
+    }
+
+    /// The reason the commit path takes a [`CheckpointDelay`]. A redo point
+    /// sampled between a commit record and its CLOG bit would be published
+    /// alongside a commit-log image that still reads `InProgress`; a bounded
+    /// replay from there never sees the commit record, so an acknowledged
+    /// transaction's rows are invisible forever.
+    #[test]
+    fn redo_point_cannot_sample_between_a_commit_record_and_its_clog_bit() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicBool;
+
+        use crabgresql_txn::{Clog, TransactionManager};
+
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let gate = Arc::new(GateSink::new(Arc::clone(&wal)));
+        let clog = Arc::new(Clog::new());
+        let txnmgr = Arc::new(TransactionManager::new_recovered(
+            Arc::clone(&gate) as Arc<dyn CommitSink>,
+            Arc::clone(&clog),
+            Xid::FIRST_NORMAL,
+        ));
+        let xid = txnmgr.allocate_xid();
+
+        let sampled = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|s| -> anyhow::Result<()> {
+            let committer = {
+                let txnmgr = Arc::clone(&txnmgr);
+                s.spawn(move || txnmgr.commit(xid))
+            };
+            assert!(
+                eventually(2_000, || gate.entered()),
+                "the committer never reached the commit window"
+            );
+            // Pins that the gate really is inside the window. If it ever moved
+            // after the CLOG stamp, this fails instead of the test passing
+            // vacuously.
+            assert!(
+                !clog.is_committed(xid),
+                "the gate must park before the CLOG bit is set"
+            );
+            let commit_end = wal.current_lsn();
+
+            let checkpointer = {
+                let wal = Arc::clone(&wal);
+                let sampled = Arc::clone(&sampled);
+                s.spawn(move || {
+                    let lsn = wal.redo_point();
+                    sampled.store(true, Ordering::SeqCst);
+                    lsn
+                })
+            };
+            let raced = eventually(400, || sampled.load(Ordering::SeqCst));
+
+            // Released before the assertion, not after: the committer is parked on
+            // this gate, and `thread::scope` joins every spawned thread before it
+            // propagates a panic — so asserting first would turn a regression into
+            // a hung test instead of a failing one.
+            gate.release();
+            committer
+                .join()
+                .map_err(|_| anyhow::anyhow!("committer panicked"))??;
+            let redo = checkpointer
+                .join()
+                .map_err(|_| anyhow::anyhow!("redo_point sampler panicked"))??;
+            assert!(
+                !raced,
+                "redo_point sampled inside the commit window: the published redo \
+                 would sit above a commit record whose fate is not durable"
+            );
+
+            // Once the barrier lifts, the sample may cover the commit record —
+            // and by then the bit that decides its fate is set, so the checkpoint
+            // about to flush the commit log will carry it.
+            assert!(clog.is_committed(xid));
+            assert!(
+                redo >= commit_end,
+                "the sample should cover the released window ({redo} < {commit_end})"
+            );
             Ok(())
         })?;
 

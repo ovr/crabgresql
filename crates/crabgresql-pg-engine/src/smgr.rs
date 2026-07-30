@@ -77,6 +77,9 @@ impl StorageManager {
             return Ok(Arc::clone(f));
         }
         let path = self.base.join(rel.0.to_string());
+        // Decided under the same lock that serializes creation, so a racing opener
+        // cannot make the fsync below be skipped.
+        let created = !path.try_exists()?;
         // truncate(false): a relation file's existing blocks must be preserved.
         let f = OpenOptions::new()
             .read(true)
@@ -84,6 +87,15 @@ impl StorageManager {
             .create(true)
             .truncate(false)
             .open(&path)?;
+        if created {
+            // fsync `base/` so the new directory entry is durable, not just the
+            // blocks written into it. Otherwise a crash can leave a relation whose
+            // pages reached disk but whose name did not, and the relation reads as
+            // empty. Whole-stream replay used to hide that — the file was recreated
+            // right here and refilled by redo — but a replay bounded at a redo point
+            // starts above those records and has nothing to refill it with.
+            File::open(&self.base)?.sync_all()?;
+        }
         let arc = Arc::new(Mutex::new(f));
         files.insert(rel.0, Arc::clone(&arc));
         Ok(arc)

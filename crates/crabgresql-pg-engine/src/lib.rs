@@ -53,7 +53,8 @@ use crabgresql_storage_api::{
 use crabgresql_txn::{Clog, TransactionManager, TxnContext, TxnFinalize, Xid};
 use crabgresql_types::Value;
 use crabgresql_wal::{
-    ControlFile, Lsn, RmgrId, RmgrRedo, RmgrRegistry, Wal, read_control, recover, write_control,
+    CHECKPOINT_ONLINE, CHECKPOINT_SHUTDOWN, Checkpoint, ControlFile, Lsn, RmgrId, RmgrRedo,
+    RmgrRegistry, Wal, read_control, recover, write_control,
 };
 
 use crate::btredo::BtreeRedo;
@@ -106,6 +107,56 @@ pub(crate) struct EngineInner {
     /// TRUNCATE swaps replayed from the WAL during recovery, applied after the
     /// CLOG is rebuilt (see [`PgEngine::apply_recovered_truncates`]).
     pub recovered_truncates: Mutex<Vec<RecoveredTruncate>>,
+    /// Committed TRUNCATE swaps whose catalog write has not landed yet — the
+    /// window between `pending_truncates` being drained and
+    /// `RelCatalog::swap_relfilenode` returning.
+    ///
+    /// A checkpoint consults this (see [`PgEngine::redo_floor`]) because a swap in
+    /// that window has no durable trace but its WAL record: the catalog still
+    /// names the old file, and the repair both commit hooks promise — "reconciled
+    /// from the WAL at next recovery" — only happens if replay still reaches the
+    /// record. Counting it here rather than reading `pending_truncates` is the
+    /// whole point: that map is emptied *first*, so a clamp keyed on it would lift
+    /// exactly while the swap is least durable.
+    pub finalizing_truncates: AtomicU64,
+}
+
+impl EngineInner {
+    /// Hold the published redo point down while a committed TRUNCATE's swap is
+    /// being written to the catalog. Released on drop, or held for good by
+    /// [`TruncatePin::hold`].
+    fn pin_truncate(&self) -> TruncatePin<'_> {
+        self.finalizing_truncates.fetch_add(1, Ordering::SeqCst);
+        TruncatePin {
+            inner: self,
+            release: true,
+        }
+    }
+}
+
+/// Keeps a checkpoint from bounding replay above a TRUNCATE record whose swap the
+/// catalog does not name yet.
+struct TruncatePin<'a> {
+    inner: &'a EngineInner,
+    release: bool,
+}
+
+impl TruncatePin<'_> {
+    /// Never release: the catalog write failed, so the WAL record is the swap's
+    /// only trace and every future replay has to keep reaching it. Costs an
+    /// unbounded replay until an operator intervenes, which is the right trade
+    /// against losing a committed TRUNCATE.
+    fn hold(mut self) {
+        self.release = false;
+    }
+}
+
+impl Drop for TruncatePin<'_> {
+    fn drop(&mut self) {
+        if self.release {
+            self.inner.finalizing_truncates.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Exposes the relation catalog's relfilenode counter to an out-of-crate access
@@ -276,9 +327,14 @@ pub struct PgEngine {
     /// in `public`; a heap TRUNCATE threads a bare name through the WAL and so is
     /// only ever reconciled for `public` (a Parquet record carries its namespace).
     tables: RwLock<HashMap<(String, String), Arc<ManagedTable>>>,
-    /// The `next_xid` recorded by the last checkpoint, reused as the control-file
-    /// floor at a clean shutdown (recovery recomputes the exact value from the WAL,
-    /// so this only needs to be a valid lower bound).
+    /// The `next_xid` recorded by the last checkpoint, reused as a *lower bound* for
+    /// the control-file floor at a clean shutdown.
+    ///
+    /// It is only a lower bound, and that used to be enough because recovery
+    /// recomputed the exact value by scanning every XID in the log. A bounded replay
+    /// does not see the XIDs below its redo point, so the recorded floor is the only
+    /// one left — `write_control_file` raises this to the allocator's live high-water
+    /// mark (`Clog::next_xid_floor`) before writing it.
     last_next_xid: AtomicU64,
     /// The transaction service, attached after construction.
     ///
@@ -327,6 +383,7 @@ impl PgEngine {
             wal: Arc::clone(&wal),
             catalog: Arc::clone(&catalog),
             pending_truncates: Mutex::new(HashMap::new()),
+            finalizing_truncates: AtomicU64::new(0),
             recovered_truncates: Mutex::new(Vec::new()),
         });
         registry.register(
@@ -452,22 +509,46 @@ impl PgEngine {
     /// returned `clog`/`next_xid` and wires the [`crabgresql_txn::TxnFinalize`]
     /// hook (this engine as `Arc<dyn TxnFinalize>`).
     ///
-    /// `redo` is the LSN replay resumes from. Production passes
-    /// [`Lsn::INVALID`] — the whole stream — because nothing writes a checkpoint
-    /// record to read a real redo point from yet; recovery tests use it to
-    /// exercise a bounded replay.
+    /// Replay resumes where the last checkpoint published, read from `pg_control`.
     pub fn open_recovered(
+        data_dir: &Path,
+        wal: Arc<Wal>,
+    ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
+        Self::open_recovered_at(data_dir, wal, None)
+    }
+
+    /// [`PgEngine::open_recovered`], but resuming at an explicit `redo` instead of
+    /// the one `pg_control` names.
+    ///
+    /// For tests that pin a bounded replay to an LSN they sampled themselves, and
+    /// for those that want a deterministic whole-stream replay ([`Lsn::INVALID`])
+    /// regardless of what the last checkpoint managed to bound. Production uses
+    /// [`PgEngine::open_recovered`], which is also why that one takes no LSN: a
+    /// caller cannot accidentally pass a redo point the checkpoint never published.
+    pub fn open_recovered_from(
         data_dir: &Path,
         wal: Arc<Wal>,
         redo: Lsn,
     ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
+        Self::open_recovered_at(data_dir, wal, Some(redo))
+    }
+
+    fn open_recovered_at(
+        data_dir: &Path,
+        wal: Arc<Wal>,
+        redo: Option<Lsn>,
+    ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
         // Read the pre-recovery control file: `clean_shutdown == false` (or absent)
         // means the last run crashed, so unlogged relations must be reset. Read it
         // BEFORE the startup checkpoint below overwrites it with a running marker.
-        let was_clean = read_control(data_dir)
-            .map_err(std::io::Error::other)?
-            .map(|c| c.clean_shutdown)
-            .unwrap_or(false);
+        // It also carries the redo point, so this is one read, not two.
+        let control = read_control(data_dir).map_err(std::io::Error::other)?;
+        let was_clean = control.map(|c| c.clean_shutdown).unwrap_or(false);
+        // No control file — a fresh cluster, or one whose control file we cannot
+        // vouch for — means the whole stream. That also keeps `recover`'s next-XID
+        // guard satisfied by construction: a redo point can only be non-zero here if
+        // it came from a control file that is readable.
+        let redo = redo.unwrap_or_else(|| control.map_or(Lsn::INVALID, |c| c.redo_lsn));
         let mut registry = RmgrRegistry::new();
         let engine = Arc::new(PgEngine::new(data_dir, Arc::clone(&wal), &mut registry)?);
         // Load the durable commit log, then replay over it: the WAL is the
@@ -637,7 +718,67 @@ impl PgEngine {
     }
 
     pub fn checkpoint(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
-        self.write_control_file(next_xid, false)
+        self.write_control_file(next_xid, CHECKPOINT_ONLINE, false)
+    }
+
+    /// The lowest LSN the published redo point may take, or `None` when nothing
+    /// constrains it.
+    ///
+    /// Every contributor here is state whose only durable trace is a WAL record, so
+    /// a redo point above it would skip the very record that rebuilds it. Each one
+    /// currently clamps all the way to [`Lsn::INVALID`] — replay the whole stream —
+    /// rather than to the record's own LSN: tracking a real per-item LSN is the
+    /// refinement (`docs/ARCHITECTURE.md`, the per-buffer min/max LSN paragraph),
+    /// and it is a change to this function's body and nothing else.
+    ///
+    /// Must be called only *after* [`Wal::redo_point`] has returned. It takes the
+    /// table map, and a checkpointer holding the WAL's delay barrier while reaching
+    /// for other locks is exactly what [`crabgresql_wal::CheckpointDelay`] forbids.
+    /// The ordering is also what makes the buffer check sound: a `BUFFER_INSERT`
+    /// below the sample necessarily had its rows installed and counted before the
+    /// sample was taken, because its writer held the barrier across both.
+    fn redo_floor(&self) -> Option<Lsn> {
+        // No commit log to make durable means no way to record any transaction's
+        // fate, so a bounded replay would come back with every one of them
+        // `InProgress`. Only an engine built by hand in a test gets here.
+        if self.clog.get().is_none() {
+            return Some(Lsn::INVALID);
+        }
+        // A staged TRUNCATE, or one whose swap is mid-publication. See
+        // `EngineInner::finalizing_truncates`.
+        if !self
+            .inner
+            .pending_truncates
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .is_empty()
+            || self.inner.finalizing_truncates.load(Ordering::SeqCst) > 0
+        {
+            return Some(Lsn::INVALID);
+        }
+        for table in self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .values()
+        {
+            // Rows in a RAM write buffer exist nowhere else until a flush writes
+            // them into a fsynced Parquet fragment: `restore_buffers` rebuilds them
+            // from replay alone. A Parquet relation's staged TRUNCATE is the same
+            // story as the heap's, tracked on the table rather than in the engine.
+            let pinned = match table.as_ref() {
+                ManagedTable::Parquet(parquet) => {
+                    parquet.chunks().has_pending_truncate()
+                        || parquet.buffer().resident_bytes() > 0
+                }
+                ManagedTable::Buffer(buffer) => buffer.resident_bytes() > 0,
+                ManagedTable::Heap(_) => false,
+            };
+            if pinned {
+                return Some(Lsn::INVALID);
+            }
+        }
+        None
     }
 
     /// The buffer pool, for white-box tests that assert checkpoint ordering.
@@ -646,7 +787,58 @@ impl PgEngine {
         &self.inner.bufpool
     }
 
-    fn write_control_file(&self, next_xid: Xid, clean_shutdown: bool) -> std::io::Result<()> {
+    /// Take a checkpoint and publish it.
+    ///
+    /// The statement order is the substance of this function, and each position is
+    /// forced:
+    ///
+    /// 1. Sample the redo point **first**, and let its barrier go before touching a
+    ///    page. Sampling after the flush pass would let a page dirtied *during* the
+    ///    pass carry an LSN below the redo point, leaving it neither written back
+    ///    nor replayed. The sample is also durable on return, which matters because
+    ///    recovery hard-errors on a start past end-of-file.
+    /// 2. Clamp it to whatever [`PgEngine::redo_floor`] still needs replayed —
+    ///    after the sample, never while holding the barrier.
+    /// 3. and 4. Pages, then the commit log: this is what turns "below the redo
+    ///    point" into "on disk".
+    /// 5. Append the record only now, so that a durable CHECKPOINT record implies
+    ///    that checkpoint's work completed — what a future WAL recycler needs.
+    /// 6. Write the control file last. Its rename is the atomic publish.
+    ///
+    /// Nothing can end up both un-written and un-replayed. A change whose record
+    /// ends at or below the redo point had its effect published before the sample
+    /// (writers whose append and publish are not atomic hold a
+    /// [`crabgresql_wal::CheckpointDelay`] across that window, and the sample waits
+    /// for those), so steps 3 and 4 saw it. A change above the redo point is in
+    /// `[redo, EOF)` and is replayed — records never straddle the redo point,
+    /// because it samples an insert position that only advances by whole records.
+    /// Every crash window here can only make the next replay *longer*: a crash
+    /// between 5 and 6 leaves the previous, lower redo point published, and redo is
+    /// idempotent under the per-page LSN gate.
+    fn write_control_file(
+        &self,
+        next_xid: Xid,
+        info: u8,
+        clean_shutdown: bool,
+    ) -> std::io::Result<()> {
+        let sampled = self
+            .inner
+            .wal
+            .redo_point()
+            .map_err(std::io::Error::other)?;
+        let redo = match self.redo_floor() {
+            Some(floor) => sampled.min(floor),
+            None => sampled,
+        };
+        if redo != sampled {
+            // Said out loud on purpose: a silently clamped redo point looks exactly
+            // like a working bounded replay from the outside, and the cost — every
+            // restart re-reading the whole stream — only shows up as slow startups.
+            tracing::debug!(
+                %sampled,
+                "checkpoint cannot bound replay yet; recording a whole-stream redo point"
+            );
+        }
         self.inner.bufpool.flush_all()?;
         // Make the commit log durable before the control file advertises this
         // checkpoint. The ordering is the whole point: a control file naming a
@@ -657,11 +849,34 @@ impl PgEngine {
         if let Some(clog) = self.clog.get() {
             clog.flush()?;
         }
+        // The caller's value is only a lower bound — `shutdown` reuses the last
+        // checkpoint's. The commit log carries the allocator's own high-water mark,
+        // and that is the one a bounded replay depends on: replay never sees the
+        // XIDs below its redo point, so too low a floor here means reissuing an XID
+        // already stamped on committed tuples.
+        let next_xid = match self.clog.get() {
+            Some(clog) => Xid(next_xid.0.max(clog.next_xid_floor().0)),
+            None => next_xid,
+        };
+        let ckpt = Checkpoint {
+            redo_lsn: redo,
+            next_xid,
+        };
+        let end = self
+            .inner
+            .wal
+            .append(RmgrId::CHECKPOINT, info, Xid::INVALID, &ckpt.encode())
+            .end;
+        self.inner
+            .wal
+            .flush(end)
+            .map_err(std::io::Error::other)?;
         self.last_next_xid.store(next_xid.0, Ordering::Relaxed);
         write_control(
             &self.data_dir,
             &ControlFile {
                 next_xid,
+                redo_lsn: redo,
                 clean_shutdown,
             },
         )
@@ -964,6 +1179,10 @@ impl TxnFinalize for PgEngine {
                 // The lock is held across the persist so a concurrent TRUNCATE that
                 // commits can't have its catalog write clobbered by a stale one.
                 if let Some((old, owner)) = t.commit_truncate(xid) {
+                    // Keep replay reaching the TRUNCATE record until the catalog
+                    // names the new file: between `commit_truncate` and the persist
+                    // below, the WAL record is the swap's only durable trace.
+                    let pin = self.inner.pin_truncate();
                     // The commit is already durable in the WAL, so a catalog persist
                     // failure is not fatal — recovery re-applies the swap from the
                     // WAL at the next boot; log and continue rather than panic. (A
@@ -979,6 +1198,9 @@ impl TxnFinalize for PgEngine {
                             "TRUNCATE commit: catalog persist failed; \
                              will be reconciled from the WAL at next recovery"
                         );
+                        // That promise now depends on replay still reading the
+                        // record, so stop bounding it.
+                        pin.hold();
                     }
                     self.inner.discard_relfile(old);
                     t.release_truncate_lock(owner);
@@ -998,6 +1220,9 @@ impl TxnFinalize for PgEngine {
                 // repairs it at the next recovery), but the hold is released either
                 // way or the table would be wedged for the process lifetime.
                 Ok(Some(swap)) => {
+                    // As in the heap arm: the record is the swap's only durable
+                    // trace until the catalog write lands.
+                    let pin = self.inner.pin_truncate();
                     if let Err(error) =
                         self.catalog
                             .swap_relfilenode(namespace, name, RelFileNode(swap.new_rel))
@@ -1008,6 +1233,7 @@ impl TxnFinalize for PgEngine {
                             "Parquet TRUNCATE commit: catalog persist failed; \
                              will be reconciled from the WAL at next recovery"
                         );
+                        pin.hold();
                     }
                     parquet.release_truncate_lock(swap.owner);
                 }
@@ -1283,10 +1509,18 @@ impl TableEngine for PgEngine {
             worker.stop_and_join();
         }
         // Flush everything and mark the control file clean, so the next startup
-        // keeps unlogged relations' data. Reuse the last checkpoint's next_xid — a
-        // valid floor; recovery recomputes the exact value from the WAL.
+        // keeps unlogged relations' data. The last checkpoint's next_xid is only a
+        // floor; `write_control_file` raises it to the allocator's own high-water
+        // mark, which is what a bounded replay depends on.
+        //
+        // On failure the *previous* control file is left in place rather than a
+        // patched-up one being written. That is the fail-safe direction: it names an
+        // older, lower redo point, so the next replay covers a superset, and redo is
+        // idempotent. Claiming a clean shutdown after a failed page flush would be
+        // the opposite — it suppresses the unlogged-relation reset for a run whose
+        // pages may be torn.
         let next_xid = Xid(self.last_next_xid.load(Ordering::Relaxed));
-        if let Err(e) = self.write_control_file(next_xid, true) {
+        if let Err(e) = self.write_control_file(next_xid, CHECKPOINT_SHUTDOWN, true) {
             tracing::error!(error = %e, "clean-shutdown flush failed");
         }
     }
@@ -1624,6 +1858,108 @@ impl TableEngine for PgEngine {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crabgresql_storage_api::{Column, TableEngine, TableSchema};
+    use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnFinalize, Xid};
+    use crabgresql_types::{PgType, Value};
+    use crabgresql_wal::{Wal, read_control};
+
+    use crate::PgEngine;
+
+    /// One test covering three things that must agree: the control file carries a
+    /// real redo point, that LSN names a record boundary, and the record there is
+    /// this checkpoint's own — with a payload matching what the control file says.
+    ///
+    /// The boundary property is not incidental. A checkpoint samples the insert
+    /// position and then appends its record, so on a quiet system the record starts
+    /// exactly at the redo point; that is what makes the published LSN safe to feed
+    /// to `recover`, which rejects a start that is not a record boundary.
+    ///
+    /// It also catches the failure mode that would otherwise be silent: get the
+    /// control file's CRC range wrong and every read returns `None`, which degrades
+    /// to a whole-stream replay — correct, so nothing else would notice.
+    #[test]
+    fn a_checkpoint_publishes_a_redo_point_naming_its_own_record() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let (engine, clog, next_xid) =
+            PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+        let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
+        tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
+
+        let table = engine.create_table(TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        let xid = tm.allocate_xid();
+        table.insert(vec![Value::Int4(1)], &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+
+        engine.checkpoint(tm.snapshot().xmax)?;
+
+        let control = read_control(dir.path())?.expect("a checkpoint publishes a control file");
+        assert!(
+            control.redo_lsn.is_valid(),
+            "a heap-only cluster has nothing to clamp for, so replay must be bounded"
+        );
+        let bytes = std::fs::read(crabgresql_wal::wal_path(dir.path()))?;
+        assert!(
+            control.redo_lsn.0 < bytes.len() as u64,
+            "the redo point must be backed by bytes on disk"
+        );
+        let (rec, _) = crabgresql_wal::WalRecord::decode(&bytes[control.redo_lsn.0 as usize..])
+            .ok_or_else(|| anyhow::anyhow!("no record decodes at the published redo point"))?;
+        assert_eq!(rec.rmgr, crabgresql_wal::RmgrId::CHECKPOINT.0);
+        assert_eq!(rec.info, crabgresql_wal::CHECKPOINT_ONLINE);
+        assert_eq!(rec.xid, Xid::INVALID, "a checkpoint owns no transaction");
+        let ckpt = crabgresql_wal::Checkpoint::decode(rec.payload)
+            .ok_or_else(|| anyhow::anyhow!("the checkpoint payload did not decode"))?;
+        assert_eq!(ckpt.redo_lsn, control.redo_lsn);
+        assert_eq!(ckpt.next_xid, control.next_xid);
+
+        Ok(())
+    }
+
+    /// The floor recorded for the XID allocator must be the *live* one. A stale
+    /// floor is invisible while replay covers the whole stream — it rederives the
+    /// value from the log — but once replay is bounded it is the only floor left,
+    /// and too low a one reissues an XID already stamped on committed tuples.
+    #[test]
+    fn a_checkpoint_records_the_live_xid_floor() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let (engine, clog, next_xid) =
+            PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+        let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
+        tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
+
+        // Startup already checkpointed. Burn XIDs *without* checkpointing again, so
+        // the only way the floor below can be right is by reading the allocator
+        // rather than replaying the argument the last checkpoint was given.
+        let mut highest = Xid::INVALID;
+        for _ in 0..5 {
+            highest = tm.allocate_xid();
+        }
+
+        // `shutdown` deliberately passes the *last* checkpoint's floor, which is the
+        // stale value; the checkpoint has to raise it for itself.
+        TableEngine::shutdown(engine.as_ref());
+        let control = read_control(dir.path())?.expect("shutdown publishes a control file");
+        assert!(
+            control.next_xid.0 > highest.0,
+            "recorded floor {} must sit above every XID allocated ({highest:?})",
+            control.next_xid.0
+        );
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "test-support")]
 mod test_support {
     use std::sync::Arc;
@@ -1672,7 +2008,7 @@ mod test_support {
         let dir = TempDir::new().expect("create temp data dir");
         let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
         let (engine, _clog, _next_xid) =
-            PgEngine::open_recovered(dir.path(), wal, crabgresql_wal::Lsn::INVALID)
+            PgEngine::open_recovered_from(dir.path(), wal, crabgresql_wal::Lsn::INVALID)
                 .expect("open engine");
         // Keep the data directory alive for the process lifetime; the OS reclaims
         // it when the (short-lived) test process exits.
@@ -1686,7 +2022,11 @@ mod test_support {
         let dir = TempDir::new().expect("create temp data dir");
         let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
         let (engine, clog, next_xid) =
-            PgEngine::open_recovered(dir.path(), Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)
+            PgEngine::open_recovered_from(
+            dir.path(),
+            Arc::clone(&wal),
+            crabgresql_wal::Lsn::INVALID,
+        )
                 .expect("open engine");
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut txnmgr = TransactionManager::new_recovered(sink, clog, next_xid);

@@ -962,6 +962,14 @@ impl ParquetTable {
         self.dir_of(self.relfilenode())
     }
 
+    /// Whether a TRUNCATE has staged a directory that no commit or abort has
+    /// resolved yet. The checkpoint reads this: until the swap is resolved and
+    /// written to the catalog, the `PARQUET_TRUNCATE` record is its only durable
+    /// trace, so replay must keep reaching it.
+    pub fn has_pending_truncate(&self) -> bool {
+        self.has_pending.load(Ordering::Acquire)
+    }
+
     /// The relfilenode `xid` should read and write: the directory staged by its own
     /// TRUNCATE, else the committed one.
     pub fn effective_rel(&self, xid: Xid) -> u32 {

@@ -464,6 +464,17 @@ impl BufferTable {
             });
         }
 
+        // Held from before the append until after `bytes` is published, because a
+        // buffered row's ONLY durable trace is its WAL record — until a flush
+        // writes it into a fsynced Parquet fragment, replay is what rebuilds it.
+        // A checkpoint therefore refuses to publish a redo point while any buffer
+        // holds rows, and it decides that by reading `bytes`. Without this guard a
+        // sampler could see `bytes == 0` between the append and the install below,
+        // publish a redo above the record, and lose the rows outright.
+        //
+        // The encoding above stays outside: it is the expensive step and touches
+        // nothing shared, and the barrier should span only in-memory work.
+        let _delay = self.wal.delay_checkpoint();
         for chunk in encode_insert(rel, txn.cid, &staged) {
             self.wal.append(RMGR_BUFFER, BUFFER_INSERT, txn.xid, &chunk);
         }
@@ -522,6 +533,10 @@ impl BufferTable {
                 stamped.push(*row_id);
             }
         }
+        // No checkpoint barrier here, unlike `install`: this mutates RAM *before*
+        // appending, so any redo point sampled mid-window is below the record and
+        // the record is replayed. It also never changes `bytes`, so the rows stay
+        // counted and a checkpoint keeps refusing to bound itself while they do.
         if !stamped.is_empty() {
             self.wal.append(
                 RMGR_BUFFER,

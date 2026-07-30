@@ -38,19 +38,25 @@ pub fn try_open(dir: &Path) -> std::io::Result<(Arc<PgEngine>, TransactionManage
 /// crash window between the commit fsync and the catalog write, which recovery has
 /// to repair from the WAL.
 pub fn open_without_finalize(dir: &Path) -> std::io::Result<(Arc<PgEngine>, TransactionManager)> {
-    open_from_without_finalize(dir, Lsn::INVALID)
+    let wal = Arc::new(Wal::open(dir).map_err(std::io::Error::other)?);
+    // Deliberately the no-LSN entry point, so these helpers keep matching what the
+    // server does: they resume from whatever redo point the last checkpoint
+    // published, rather than always replaying the whole stream.
+    let (engine, clog, next_xid) = PgEngine::open_recovered(dir, Arc::clone(&wal))?;
+    let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+    Ok((engine, TransactionManager::new_recovered(sink, clog, next_xid)))
 }
 
-/// [`open_without_finalize`], but resuming replay at `redo` instead of the start
-/// of the stream — the bounded recovery a real checkpoint will publish. Used to
-/// prove a writer's changes survive when the WAL prefix below `redo` is never
-/// read.
+/// [`open_without_finalize`], but resuming replay at an explicit `redo` instead of
+/// the one `pg_control` names. Used to prove a writer's changes survive when the
+/// WAL prefix below `redo` is never read, and — with [`Lsn::INVALID`] — to force a
+/// whole-stream replay regardless of what the last checkpoint managed to bound.
 pub fn open_from_without_finalize(
     dir: &Path,
     redo: Lsn,
 ) -> std::io::Result<(Arc<PgEngine>, TransactionManager)> {
     let wal = Arc::new(Wal::open(dir).map_err(std::io::Error::other)?);
-    let (engine, clog, next_xid) = PgEngine::open_recovered(dir, Arc::clone(&wal), redo)?;
+    let (engine, clog, next_xid) = PgEngine::open_recovered_from(dir, Arc::clone(&wal), redo)?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
     Ok((engine, TransactionManager::new_recovered(sink, clog, next_xid)))
 }
@@ -69,7 +75,7 @@ pub fn open_from_with_wal(
     redo: Lsn,
 ) -> std::io::Result<(Arc<PgEngine>, TransactionManager, Arc<Wal>)> {
     let wal = Arc::new(Wal::open(dir).map_err(std::io::Error::other)?);
-    let (engine, clog, next_xid) = PgEngine::open_recovered(dir, Arc::clone(&wal), redo)?;
+    let (engine, clog, next_xid) = PgEngine::open_recovered_from(dir, Arc::clone(&wal), redo)?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
     let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
     tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);

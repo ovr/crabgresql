@@ -6,13 +6,15 @@
 //!
 //! [`recover`] takes the LSN to resume from. Because an [`Lsn`] is literally a
 //! byte offset into the single stream file, that is a positioned read rather
-//! than a scan. Every production caller still passes [`Lsn::INVALID`] (`0`, the
-//! start of the stream): honouring a real redo point additionally needs a
-//! durable CLOG, to recover the fate of transactions that committed *before* the
-//! checkpoint, and a checkpoint record to read the redo point from — both
-//! deliberate follow-ups, see `docs/ARCHITECTURE.md §3`. The parameter exists
-//! now so that writers whose correctness depends on a bounded replay can be
-//! tested against one.
+//! than a scan.
+//!
+//! Production passes the redo point the last checkpoint recorded in `pg_control`.
+//! Two things had to exist first, and now do: a durable CLOG, to recover the fate
+//! of transactions that committed *below* the redo point, and something that
+//! writes the redo point down. [`Lsn::INVALID`] (`0`) still means the whole
+//! stream, and is what a fresh cluster — or one whose control file is unreadable —
+//! gets. Replaying more than necessary is always safe, because every redo handler
+//! is gated on the target page's LSN.
 
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -126,7 +128,16 @@ pub fn recover(
                     return Err(WalError::Redo(format!("unknown xact info byte {other:#x}")));
                 }
             },
-            RmgrId::CHECKPOINT => { /* metadata only; nothing to redo into a page */ }
+            // Nothing to redo into a page, but the payload carries an XID floor
+            // that no other record can supply: a transaction touching only
+            // `UNLOGGED`/`TEMP` relations never appears in the log, so the
+            // envelope scan above cannot see it. Raising the floor is a `max`,
+            // not a `+ 1` — unlike `rec.xid`, which names a *used* XID, this
+            // field is already the next one to hand out.
+            RmgrId::CHECKPOINT => {
+                let ckpt = crate::ckpt::replay(rec.info, rec.payload, rec.rec_lsn)?;
+                next_xid = next_xid.max(ckpt.next_xid.0);
+            }
             other => {
                 let handler = registry
                     .get(other.0)
@@ -185,6 +196,9 @@ mod tests {
             dir,
             &crate::control::ControlFile {
                 next_xid: Xid(next_xid),
+                // Irrelevant here: these tests pass the start LSN to `recover`
+                // directly rather than going through the control file.
+                redo_lsn: crate::record::Lsn::INVALID,
                 clean_shutdown: false,
             },
         )?;
@@ -438,6 +452,132 @@ mod tests {
         assert!(
             err.to_string().contains("next-XID floor"),
             "unexpected error: {err}"
+        );
+
+        Ok(())
+    }
+
+    /// The floor a checkpoint contributes is the payload's `next_xid` verbatim.
+    /// A transaction that only touched `UNLOGGED`/`TEMP` relations writes no
+    /// record at all, so scanning envelope XIDs cannot find it — which is why
+    /// this record exists — and the value is already a *next* XID, so raising the
+    /// floor past it would leak one XID per checkpoint.
+    #[test]
+    fn a_checkpoint_record_raises_the_next_xid_floor() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        {
+            let wal = Wal::open(dir.path())?;
+            wal.append(RmgrId::HEAP, 7, Xid(3), b"row");
+            let payload = crate::ckpt::Checkpoint {
+                redo_lsn: Lsn::INVALID,
+                next_xid: Xid(500),
+            }
+            .encode();
+            let end = wal
+                .append(
+                    RmgrId::CHECKPOINT,
+                    crate::ckpt::CHECKPOINT_ONLINE,
+                    Xid::INVALID,
+                    &payload,
+                )
+                .end;
+            wal.flush(end)?;
+        }
+        let mut reg = RmgrRegistry::new();
+        reg.register(
+            RmgrId::HEAP,
+            Arc::new(Collector(Arc::new(Mutex::new(Vec::new())))),
+        );
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, Lsn::INVALID)?;
+        assert_eq!(
+            res.next_xid,
+            Xid(500),
+            "the checkpoint's next_xid is the floor, exactly"
+        );
+
+        Ok(())
+    }
+
+    /// A checkpoint payload we cannot read must stop recovery, not be skipped:
+    /// it carries an XID floor, and continuing without it lets the allocator
+    /// reissue an XID already stamped on committed tuples.
+    #[test]
+    fn an_unreadable_checkpoint_record_fails_recovery() -> anyhow::Result<()> {
+        for (info, payload) in [
+            (crate::ckpt::CHECKPOINT_ONLINE, b"too short".to_vec()),
+            (
+                0x7F,
+                crate::ckpt::Checkpoint {
+                    redo_lsn: Lsn::INVALID,
+                    next_xid: Xid(9),
+                }
+                .encode(),
+            ),
+        ] {
+            let dir = tempfile::tempdir()?;
+            {
+                let wal = Wal::open(dir.path())?;
+                let end = wal
+                    .append(RmgrId::CHECKPOINT, info, Xid::INVALID, &payload)
+                    .end;
+                wal.flush(end)?;
+            }
+            let reg = RmgrRegistry::new();
+            let clog = Clog::new();
+            let Err(err) = recover(dir.path(), &reg, &clog, Lsn::INVALID) else {
+                anyhow::bail!("a checkpoint record with info {info:#x} should fail recovery");
+            };
+            assert!(
+                err.to_string().contains("checkpoint"),
+                "unexpected error: {err}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A redo point is always a record boundary, and a checkpoint record is one —
+    /// so resuming exactly at a checkpoint is the ordinary case, not an edge one.
+    #[test]
+    fn replay_can_resume_at_a_checkpoint_record() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ckpt_at;
+        {
+            let wal = Wal::open(dir.path())?;
+            wal.append(RmgrId::HEAP, 7, Xid(3), b"below-redo");
+            let payload = crate::ckpt::Checkpoint {
+                redo_lsn: Lsn::INVALID,
+                next_xid: Xid(7),
+            }
+            .encode();
+            ckpt_at = wal.append(
+                RmgrId::CHECKPOINT,
+                crate::ckpt::CHECKPOINT_ONLINE,
+                Xid::INVALID,
+                &payload,
+            );
+            wal.flush(ckpt_at.end)?;
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = RmgrRegistry::new();
+        reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::clone(&seen))));
+        write_floor(dir.path(), 5)?;
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, ckpt_at.start)?;
+
+        assert_eq!(res.replayed_from, ckpt_at.start);
+        assert_eq!(res.end_of_wal, ckpt_at.end);
+        assert_eq!(
+            res.next_xid,
+            Xid(7),
+            "the checkpoint's floor outranks the control file's"
+        );
+        assert!(
+            seen.lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .is_empty(),
+            "the heap record below the redo point must not be replayed"
         );
 
         Ok(())

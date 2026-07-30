@@ -24,8 +24,9 @@ use tokio::net::TcpListener;
 use crate::global_catalog::GlobalCatalog;
 
 /// Open the durable heap engine over a data directory and run crash recovery:
-/// replay the WAL, rebuild the commit log, seed the XID allocator above every
-/// recovered transaction, then checkpoint so the recovered pages are on disk.
+/// replay the WAL from the redo point the last checkpoint published, rebuild the
+/// commit log, seed the XID allocator above every recovered transaction, then
+/// checkpoint so the recovered pages are on disk.
 /// Returns the engine and a WAL-backed [`TransactionManager`] to hand to
 /// [`serve_with`].
 pub fn open_pg_engine(
@@ -34,8 +35,7 @@ pub fn open_pg_engine(
     let wal = Arc::new(Wal::open(data_dir).map_err(std::io::Error::other)?);
     // The full open + crash-recovery sequence lives in the engine so the server
     // and the recovery tests share exactly one code path.
-    let (engine, clog, next_xid) =
-        PgEngine::open_recovered(data_dir, Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)?;
+    let (engine, clog, next_xid) = PgEngine::open_recovered(data_dir, Arc::clone(&wal))?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
     let mut txnmgr = TransactionManager::new_recovered(sink, clog, next_xid);
     // Wire the engine's finalize hook so commit/abort apply or discard the swaps
