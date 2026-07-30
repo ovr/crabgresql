@@ -4115,6 +4115,27 @@ fn execute_create_function(
         }
     };
     let args = routine_args(catalog, create.args.as_deref().unwrap_or(&[]))?;
+    // A SQL/PL-pgSQL body refers to its arguments by these names, so a name may
+    // not be reused; PG rejects the declaration rather than the body.
+    let mut seen = std::collections::HashSet::new();
+    for arg in &args {
+        if let Some(argname) = &arg.name
+            && !seen.insert(argname)
+        {
+            return Err(PgError::new(
+                // 42P13 invalid_function_definition
+                "42P13",
+                format!("parameter name \"{argname}\" used more than once"),
+            ));
+        }
+    }
+    // Input arguments only, matching the identity the catalog registers, so the
+    // names stay positionally aligned with the argument types.
+    let arg_names: Vec<Option<String>> = args
+        .iter()
+        .filter(|a| a.mode.is_input())
+        .map(|a| a.name.clone())
+        .collect();
 
     let body = match lang.as_deref() {
         Some("internal") => FuncBody::Internal(function_internal_name(create)?),
@@ -4132,7 +4153,9 @@ fn execute_create_function(
             let return_type = pg_type_of_ref(type_catalog, &ret)?;
             crabgresql_binder::bind_sql_function_body(
                 type_catalog,
+                &name,
                 &arg_types,
+                &arg_names,
                 return_type,
                 &body_sql,
             )
@@ -4146,11 +4169,6 @@ fn execute_create_function(
             // shortcut: `create_function` registers the routine *after*
             // validating, so binding the body here would make every recursive
             // routine fail to create with 42883.
-            let arg_names: Vec<Option<String>> = args
-                .iter()
-                .filter(|a| a.mode.is_input())
-                .map(|a| a.name.clone())
-                .collect();
             crabgresql_plpgsql::compile(&body_sql, &arg_names)
                 .map_err(|e| compile_failure(&name, e))?;
             FuncBody::PlPgSql(body_sql)

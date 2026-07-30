@@ -5436,12 +5436,14 @@ impl<'a> Parser<'a> {
         if let Some(next_data_type) = self.maybe_parse(parse_data_type_no_default)? {
             let token = self.token_at(data_type_idx);
 
-            // We ensure that the token is a `Word` token, and not other special tokens.
-            if !matches!(token.token, Token::Word(_)) {
+            // We ensure that the token is a `Word` token, and not other special
+            // tokens. Rebuilding the identifier from the word (rather than the
+            // token's display form) keeps its quoting: `"Value"` is a
+            // case-preserving name, not a name spelled with quote characters.
+            let Token::Word(word) = &token.token else {
                 return self.expected("a name or type", token.clone());
-            }
-
-            name = Some(Ident::new(token.to_string()));
+            };
+            name = Some(word.to_ident(token.span));
             data_type = next_data_type;
         }
 

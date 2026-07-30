@@ -1,9 +1,10 @@
 --
 -- CREATE FUNCTION ... LANGUAGE SQL
 -- A LANGUAGE SQL function with a scalar, FROM-less body is expanded inline at
--- each call: `$1..$n` reference the arguments, the body may call other
--- functions, and the result is coerced to the declared return type. Overloading
--- is by argument type. Output hand-checked against PostgreSQL (psql -a -q).
+-- each call: the arguments are referenced by `$1..$n` or by their declared
+-- names, the body may call other functions, and the result is coerced to the
+-- declared return type. Overloading is by argument type. Output hand-checked
+-- against PostgreSQL (psql -a -q).
 -- (Error paths — return-type mismatch, duplicate signature — are covered by the
 -- server e2e tests, where PG emits a CONTEXT line this engine does not.)
 --
@@ -22,6 +23,13 @@ SELECT widen(5);
 CREATE FUNCTION same(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 * 10 $$;
 CREATE FUNCTION same(text) RETURNS text LANGUAGE SQL AS $$ SELECT $1 || '!' $$;
 SELECT same(4), same('hi');
+-- An argument declared with a name is reachable under that name as well as as
+-- `$n`, bare or qualified by the routine's own name. A quoted name keeps case.
+CREATE FUNCTION named(value int4, seed int8) RETURNS int8 LANGUAGE SQL AS $$ SELECT value + seed $$;
+CREATE FUNCTION qualified(value int4, seed int8) RETURNS int8 LANGUAGE SQL AS $$ SELECT qualified.value + qualified.seed $$;
+CREATE FUNCTION mixed(value int4, seed int8) RETURNS int8 LANGUAGE SQL AS $$ SELECT value + $2 $$;
+CREATE FUNCTION quoted("Value" int4) RETURNS int4 LANGUAGE SQL AS $$ SELECT "Value" * 2 $$;
+SELECT named(2, 40), qualified(2, 40), mixed(2, 40), quoted(21);
 -- A function applied per row over a table.
 CREATE TABLE t (a int, b int);
 INSERT INTO t VALUES (1, 2), (3, 4), (10, 20);

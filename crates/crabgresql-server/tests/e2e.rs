@@ -6207,6 +6207,105 @@ async fn create_function_language_sql_evaluates_and_composes() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn create_function_language_sql_body_resolves_argument_names() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    // A declared argument name refers to that argument, exactly as `$n` does.
+    client
+        .simple_query(
+            "CREATE FUNCTION f(value int4, seed int8) RETURNS int8 LANGUAGE SQL \
+             AS $$ SELECT value + seed $$",
+        )
+        .await?;
+    let out = client.simple_query("SELECT f(2, 40)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("42"));
+
+    // The routine's own name qualifies its parameters.
+    client
+        .simple_query(
+            "CREATE FUNCTION g(value int4, seed int8) RETURNS int8 LANGUAGE SQL \
+             AS $$ SELECT g.value + g.seed $$",
+        )
+        .await?;
+    let out = client.simple_query("SELECT g(2, 40)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("42"));
+
+    // Both spellings may be mixed in one body.
+    client
+        .simple_query(
+            "CREATE FUNCTION h(value int4, seed int8) RETURNS int8 LANGUAGE SQL \
+             AS $$ SELECT value + $2 $$",
+        )
+        .await?;
+    let out = client.simple_query("SELECT h(2, 40)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("42"));
+
+    // A quoted argument name keeps its case, and only that spelling matches.
+    client
+        .simple_query(
+            "CREATE FUNCTION q(\"Value\" int4) RETURNS int4 LANGUAGE SQL \
+             AS $$ SELECT \"Value\" * 2 $$",
+        )
+        .await?;
+    let out = client.simple_query("SELECT q(21)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("42"));
+    let err = client
+        .simple_query(
+            "CREATE FUNCTION q2(\"Value\" int4) RETURNS int4 LANGUAGE SQL \
+             AS $$ SELECT value * 2 $$",
+        )
+        .await
+        .unwrap_err();
+    let dberr = err.as_db_error().expect("database error");
+    assert_eq!(dberr.code(), &SqlState::UNDEFINED_COLUMN);
+    assert_eq!(dberr.message(), "column \"value\" does not exist");
+
+    // An argument declared without a name stays reachable only as `$n`.
+    client
+        .simple_query("CREATE FUNCTION unnamed(int4) RETURNS int4 LANGUAGE SQL AS $$ SELECT $1 + 1 $$")
+        .await?;
+    let out = client.simple_query("SELECT unnamed(41)").await?;
+    assert_eq!(rows(&out)[0].get(0), Some("42"));
+
+    // A name matching no argument is still an undefined column, and a member of
+    // the routine's qualifier that is not an argument is a missing FROM entry —
+    // both as PG reports them.
+    let err = client
+        .simple_query("CREATE FUNCTION bad(value int) RETURNS int LANGUAGE SQL AS $$ SELECT zz $$")
+        .await
+        .unwrap_err();
+    let dberr = err.as_db_error().expect("database error");
+    assert_eq!(dberr.code(), &SqlState::UNDEFINED_COLUMN);
+    assert_eq!(dberr.message(), "column \"zz\" does not exist");
+
+    let err = client
+        .simple_query(
+            "CREATE FUNCTION bad2(value int) RETURNS int LANGUAGE SQL AS $$ SELECT bad2.nope $$",
+        )
+        .await
+        .unwrap_err();
+    let dberr = err.as_db_error().expect("database error");
+    assert_eq!(dberr.code(), &SqlState::UNDEFINED_TABLE);
+    assert_eq!(
+        dberr.message(),
+        "missing FROM-clause entry for table \"bad2\""
+    );
+
+    // A body may not refer to two arguments by one name.
+    let err = client
+        .simple_query("CREATE FUNCTION dupname(a int, a int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 $$")
+        .await
+        .unwrap_err();
+    let dberr = err.as_db_error().expect("database error");
+    assert_eq!(dberr.code(), &SqlState::INVALID_FUNCTION_DEFINITION);
+    assert_eq!(dberr.message(), "parameter name \"a\" used more than once");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
 

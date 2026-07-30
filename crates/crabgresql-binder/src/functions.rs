@@ -2336,7 +2336,14 @@ fn resolve_user_routine_call(
     };
 
     let _guard = InlineGuard::enter()?;
-    let body = bind_sql_function_body(catalog, &sig.arg_types, sig.return_type, body)?;
+    let body = bind_sql_function_body(
+        catalog,
+        &sig.name,
+        &sig.arg_types,
+        &sig.arg_names,
+        sig.return_type,
+        body,
+    )?;
     // Inlining substitutes each argument into every `$n` occurrence, so a volatile
     // argument (e.g. `nextval`) referenced more than once would run its side
     // effect / re-roll its value once per occurrence — diverging from PG, which
