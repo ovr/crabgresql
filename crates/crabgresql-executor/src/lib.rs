@@ -32,7 +32,6 @@ use crabgresql_storage_api::{
     Tuple,
 };
 use crabgresql_txn::TxnContext;
-use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, Value};
 
 use eval::eval;
@@ -499,8 +498,8 @@ pub fn execute(
             source,
             spec,
             funcs,
-            input_width,
             output_width,
+            ..
         } => {
             let Execution::Rows { columns, node } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
@@ -513,14 +512,7 @@ pub fn execute(
             // supplies the real output columns — these are never surfaced.
             Ok(Execution::Rows {
                 columns,
-                node: Box::new(WindowAgg::new(
-                    node,
-                    spec,
-                    funcs,
-                    input_width,
-                    output_width,
-                    ctx,
-                )?),
+                node: Box::new(WindowAgg::new(node, spec, funcs, output_width, ctx)?),
             })
         }
         PhysicalPlan::TableFunction {
@@ -3134,7 +3126,6 @@ impl WindowAgg {
         mut child: Box<dyn ExecNode>,
         spec: BoundWindowSpec,
         funcs: Vec<BoundWindowFunc>,
-        input_width: usize,
         output_width: usize,
         ctx: &ExecContext,
     ) -> Result<Self, ExecError> {
@@ -3146,12 +3137,17 @@ impl WindowAgg {
         // Widen every row to the chain's full width. The bottom node of a chain
         // finds rows `input_width` wide and pads them; the ones above find the
         // padding already there and this is a no-op.
-        debug_assert!(
-            rows.iter()
-                .all(|row| row.len() == input_width || row.len() == output_width),
-            "a window step reads either the raw pre-window row or an already-widened one"
-        );
+        // `Vec::resize` shrinks as well as grows, so a row wider than the chain
+        // would be silently truncated — every `func.slot` write would then land
+        // on the wrong column. Check instead of asserting, so a release build
+        // reports the broken plan rather than computing a wrong answer.
         for row in &mut rows {
+            if row.len() > output_width {
+                return Err(ExecError::new(
+                    crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+                    "window input row is wider than the window chain's output row",
+                ));
+            }
             row.resize(output_width, Value::Null);
         }
 
@@ -3164,7 +3160,12 @@ impl WindowAgg {
             keys.push(SortKey {
                 column: output_width + offset,
                 ty: expr.ty(),
-                collation: DEFAULT_COLLATION_OID,
+                // Membership is bytewise whatever the collation (every supported
+                // one is deterministic), but the *order* partitions come out in
+                // is not — `PARTITION BY s COLLATE "en-US-x-icu"` must group in
+                // that locale's order. Derived from the expression exactly as
+                // the binder derives an ORDER BY key's collation.
+                collation: crabgresql_binder::expr_collation(expr).collation,
                 // Partitioning is grouping, not ordering: any consistent
                 // direction works, and ascending with NULLs last matches the
                 // order PG's partitions come out in.

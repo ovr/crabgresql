@@ -653,8 +653,12 @@ impl BoundExpr {
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_srf(),
             BoundExpr::Binary { left, right, .. } => left.contains_srf() || right.contains_srf(),
-            BoundExpr::FuncCall { args, .. } | BoundExpr::Routine { args, .. } => {
-                args.iter().any(BoundExpr::contains_srf)
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_srf),
+            BoundExpr::WindowFunc { kind, spec, .. } => {
+                kind.args().iter().any(BoundExpr::contains_srf)
+                    || spec.exprs().any(BoundExpr::contains_srf)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_srf),
             BoundExpr::Subscript { base, index, .. } => {
@@ -678,8 +682,6 @@ impl BoundExpr {
             | BoundExpr::ColumnRef { .. }
             | BoundExpr::Param { .. }
             | BoundExpr::OuterColumnRef { .. }
-            | BoundExpr::Aggregate { .. }
-            | BoundExpr::WindowFunc { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. } => false,
         }
@@ -831,6 +833,63 @@ impl BoundExpr {
             BoundExpr::QuantifiedArray { array, cmp, .. } => {
                 array.contains_window() || cmp.contains_window()
             }
+        }
+    }
+
+    /// The first aggregate or window marker in this tree in **source order**, or
+    /// `None` if it holds neither.
+    ///
+    /// PostgreSQL analyzes an expression tree in source order and blames the
+    /// first misplaced node it meets, so `count(*) + rank() OVER ()` in a WHERE
+    /// is an *aggregate* error while `rank() OVER () + count(*)` is a *window*
+    /// error. Reproducing that needs the first offender, not just "does it
+    /// contain one".
+    ///
+    /// A marker is returned without descending into it: `sum(x) OVER ()` is a
+    /// window call, not an aggregate one. Subquery bodies are a separate query
+    /// level and never propagate, exactly as in [`Self::contains_window`].
+    fn first_agg_or_window(&self) -> Option<&BoundExpr> {
+        fn first(exprs: &[BoundExpr]) -> Option<&BoundExpr> {
+            exprs.iter().find_map(BoundExpr::first_agg_or_window)
+        }
+        match self {
+            BoundExpr::Aggregate { .. } | BoundExpr::WindowFunc { .. } => Some(self),
+            BoundExpr::Const { .. }
+            | BoundExpr::ColumnRef { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. }
+            | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::Exists { .. } => None,
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.first_agg_or_window(),
+            BoundExpr::Binary { left, right, .. } => {
+                left.first_agg_or_window().or_else(|| right.first_agg_or_window())
+            }
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. } => first(args),
+            BoundExpr::ArrayCtor { elems, .. } => first(elems),
+            BoundExpr::Subscript { base, index, .. } => base
+                .first_agg_or_window()
+                .or_else(|| index.first_agg_or_window()),
+            BoundExpr::Case { whens, else_, .. } => {
+                for (cond, result) in whens {
+                    if let Some(found) = cond
+                        .first_agg_or_window()
+                        .or_else(|| result.first_agg_or_window())
+                    {
+                        return Some(found);
+                    }
+                }
+                else_.as_ref().and_then(|e| e.first_agg_or_window())
+            }
+            BoundExpr::QuantifiedSubquery { cmp, .. } => cmp.first_agg_or_window(),
+            BoundExpr::QuantifiedArray { array, cmp, .. } => array
+                .first_agg_or_window()
+                .or_else(|| cmp.first_agg_or_window()),
         }
     }
 
@@ -1355,6 +1414,48 @@ fn column_in_rel(
     })
 }
 
+/// A SELECT's `WINDOW w AS (…)` definitions, by normalized name.
+///
+/// Each stored spec is already **expanded**: a definition that names an earlier
+/// one (`WINDOW w2 AS (w1 ORDER BY x)`) has the base merged in at build time, so
+/// nothing downstream has to resolve a base recursively. Shared (`Rc`) because
+/// the same map is threaded into every clause scope of one SELECT.
+pub(crate) type NamedWindows = std::rc::Rc<std::collections::HashMap<String, ast::WindowSpec>>;
+
+/// Reject a window call in a clause that is evaluated before windows are, naming
+/// the clause the way PostgreSQL does.
+///
+/// Use this where aggregates are *legal* but windows are not — HAVING (which
+/// filters the grouped rows windows are computed over) and a window definition's
+/// own `PARTITION BY`/`ORDER BY`. Everywhere else, prefer
+/// [`reject_agg_or_window`], which also reports a misplaced aggregate.
+pub(crate) fn reject_window(expr: &BoundExpr, clause: &str) -> Result<(), BindError> {
+    if expr.contains_window() {
+        return Err(window_not_allowed(clause));
+    }
+    Ok(())
+}
+
+/// Reject an aggregate *or* a window call in a clause that allows neither,
+/// blaming whichever comes first in source order — as PostgreSQL does.
+pub(crate) fn reject_agg_or_window(expr: &BoundExpr, clause: &str) -> Result<(), BindError> {
+    match expr.first_agg_or_window() {
+        Some(BoundExpr::WindowFunc { .. }) => Err(window_not_allowed(clause)),
+        Some(_) => Err(BindError::new(
+            sqlstate::GROUPING_ERROR,
+            format!("aggregate functions are not allowed in {clause}"),
+        )),
+        None => Ok(()),
+    }
+}
+
+fn window_not_allowed(clause: &str) -> BindError {
+    BindError::new(
+        sqlstate::WINDOWING_ERROR,
+        format!("window functions are not allowed in {clause}"),
+    )
+}
+
 /// Rewrite every `ColumnRef` in `expr` into an `OuterColumnRef` at correlation
 /// `level`, cloning everything else. Used to turn a merged-join `visible`
 /// column's expression — a `ColumnRef` (inner/left/right join) or a full join's
@@ -1500,11 +1601,9 @@ pub struct Scope {
     /// bound, if any. `None` for an ordinary statement, where a bare identifier
     /// can only be a column.
     func_params: Option<std::rc::Rc<FuncParams>>,
-    /// The `WINDOW w AS (…)` definitions of the SELECT being bound, by name, so
-    /// `OVER w` resolves. Held unbound: a definition is only bound when a call
-    /// actually references it, and merging (`OVER (w ORDER BY x)`) happens at
-    /// the AST level. `None` where a `WINDOW` clause cannot appear.
-    named_windows: Option<std::rc::Rc<std::collections::HashMap<String, ast::WindowSpec>>>,
+    /// The `WINDOW w AS (…)` definitions of the SELECT being bound, so `OVER w`
+    /// resolves. `None` where a `WINDOW` clause cannot appear.
+    named_windows: Option<NamedWindows>,
 }
 
 /// The handle a [`Scope`] carries so `bind_expr` can bind a nested query. Shared
@@ -1665,10 +1764,7 @@ impl Scope {
     /// Attach the SELECT's `WINDOW w AS (…)` definitions so `OVER w` resolves.
     /// Set by the clause binders that bind a target list / ORDER BY, alongside
     /// [`Scope::with_subqueries`].
-    pub(crate) fn with_named_windows(
-        mut self,
-        windows: &std::rc::Rc<std::collections::HashMap<String, ast::WindowSpec>>,
-    ) -> Scope {
+    pub(crate) fn with_named_windows(mut self, windows: &NamedWindows) -> Scope {
         self.named_windows = Some(windows.clone());
         self
     }
@@ -6457,12 +6553,7 @@ pub fn bind_column_default(
             "set-returning functions are not allowed in DEFAULT expressions",
         ));
     }
-    if bound.contains_aggregate() {
-        return Err(BindError::new(
-            sqlstate::GROUPING_ERROR,
-            "aggregate functions are not allowed in DEFAULT expressions",
-        ));
-    }
+    reject_agg_or_window(&bound, "DEFAULT expressions")?;
     Ok(bound)
 }
 
@@ -6566,6 +6657,16 @@ pub fn bind_sql_function_body(
     if bound.contains_srf() {
         return Err(BindError::feature_not_supported(
             "set-returning functions are not supported in a SQL function body yet",
+        ));
+    }
+    // PG runs a function body as its own query, so `SELECT row_number() OVER ()`
+    // is a legal body that returns 1 for every call. This engine *inlines* the
+    // body into the caller's expression tree, where the marker would join the
+    // caller's window chain and number the caller's rows instead — so the body
+    // must be refused. A limitation, not an illegal construct, hence 0A000.
+    if bound.contains_window() {
+        return Err(BindError::feature_not_supported(
+            "window functions in a SQL function body are not supported yet",
         ));
     }
     // PG accepts a FROM-less aggregate (e.g. `SELECT sum(1)`) as a function body;

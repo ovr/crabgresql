@@ -106,6 +106,46 @@ SELECT rank() OVER () FROM empsalary WINDOW w AS (ORDER BY salary), w AS (ORDER 
 -- but `OVER w` is a reference, not a copy: it inherits the base's frame rather
 -- than being refused for having one, so it reaches the unimplemented frame path
 SELECT rank() OVER w FROM empsalary WINDOW w AS (ORDER BY salary ROWS UNBOUNDED PRECEDING);
+-- a WINDOW definition may name a *prior* one, and the copy inherits what the
+-- base contributes — so w2 ranks within each depname
+SELECT depname, empno, rank() OVER w2
+  FROM empsalary WINDOW w1 AS (PARTITION BY depname), w2 AS (w1 ORDER BY empno)
+  ORDER BY depname, empno;
+-- and `OVER (w2)` copies the *expanded* w2, not its unexpanded body
+SELECT depname, empno, rank() OVER (w2)
+  FROM empsalary WINDOW w1 AS (PARTITION BY depname), w2 AS (w1 ORDER BY empno)
+  ORDER BY depname, empno;
+-- the clause resolves left to right, so a self or forward reference names a
+-- window that does not exist yet, and the copy rules apply between definitions
+SELECT 1 FROM empsalary WINDOW w AS (w);
+SELECT rank() OVER w2 FROM empsalary WINDOW w2 AS (w1 ORDER BY empno), w1 AS (PARTITION BY depname);
+SELECT 1 FROM empsalary WINDOW w1 AS (ORDER BY empno ROWS UNBOUNDED PRECEDING), w2 AS (w1);
+SELECT 1 FROM empsalary WINDOW w1 AS (ORDER BY empno), w2 AS (w1 ORDER BY salary);
+-- three specs: PG orders the chain so a shorter key list follows the longer one
+-- it is a prefix of, sharing that sort; the last one evaluated decides row order
+SELECT empno, rank() OVER (ORDER BY empno) p, rank() OVER (ORDER BY empno, salary) q,
+       rank() OVER (ORDER BY salary) r
+  FROM empsalary ORDER BY empno;
+-- errors: every remaining clause evaluated before windows are
+SELECT e.empno FROM empsalary e LEFT JOIN empsalary f ON rank() OVER () > 0;
+SELECT empno FROM empsalary LIMIT rank() OVER ();
+SELECT empno FROM empsalary OFFSET rank() OVER ();
+VALUES (rank() OVER ());
+UPDATE empsalary SET empno = rank() OVER ();
+UPDATE empsalary SET empno = empno WHERE rank() OVER () > 0;
+DELETE FROM empsalary WHERE rank() OVER () > 0;
+UPDATE empsalary SET empno = empno RETURNING rank() OVER ();
+-- the same clauses reject a misplaced aggregate, and PG blames whichever of the
+-- two is written first
+UPDATE empsalary SET empno = count(*);
+SELECT empno FROM empsalary LIMIT count(*);
+SELECT 1 FROM empsalary WHERE count(*) > 0 AND rank() OVER () > 0;
+SELECT 1 FROM empsalary WHERE rank() OVER () > 0 AND count(*) > 0;
+-- `TABLE t` is `SELECT * FROM t`, so its ORDER BY may hold a window call
+CREATE TABLE wsmall (a integer);
+INSERT INTO wsmall VALUES (3), (1), (2);
+TABLE wsmall ORDER BY rank() OVER (ORDER BY a DESC);
+DROP TABLE wsmall;
 -- errors: explicit frames are not implemented yet
 SELECT sum(salary) OVER (ORDER BY empno ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM empsalary;
 SELECT sum(salary) OVER (ORDER BY empno RANGE UNBOUNDED PRECEDING EXCLUDE TIES) FROM empsalary;

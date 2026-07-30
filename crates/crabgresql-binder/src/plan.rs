@@ -18,10 +18,11 @@ use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
     BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, OuterLevel, ParamCtx, Scope,
-    VisibleColumn, VisibleLookup, WindowKind, WindowSortKey, bind_binary_op, bind_column_default,
+    NamedWindows, VisibleColumn, VisibleLookup, WindowKind, WindowSortKey, bind_binary_op,
+    bind_column_default,
     bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column, lookup_visible,
-    merge_types, normalize_ident, output_name, param_ctx_none, to_bool_operand,
-    unify_value_column,
+    merge_types, normalize_ident, output_name, param_ctx_none, reject_agg_or_window,
+    reject_window, to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -102,15 +103,9 @@ pub enum LogicalPlan {
     /// common types, named from the left arm).
     ///
     /// This node owns its whole tail rather than delegating to a wrapping
-    /// [`Self::Subquery`]. That matters for more than tidiness: a `Subquery` is a
-    /// *derived table*, i.e. its own query nesting level, so `subst_outer_plan`
-    /// descends into it with `depth + 1`. A set operation introduces no such
-    /// level — its arms bind in the enclosing query's scope — so wrapping one in
-    /// a Subquery would shift every arm's [`BoundExpr::OuterColumnRef`] out of
-    /// range and leave correlated references unsubstituted at execution.
-    ///
-    /// Each arm carries its own coercion onto `columns` for the same reason:
-    /// coercion must not introduce a nesting level either.
+    /// [`Self::Subquery`], so that an arm's projection and its coercion onto
+    /// `columns` stay in the arm's own index space — a wrapper would have to
+    /// re-derive both.
     ///
     /// The node is N-ary, and [`bind_set_operation`] flattens a chain of
     /// equivalent operations into one node (`a UNION b UNION c` is three arms,
@@ -129,6 +124,11 @@ pub enum LogicalPlan {
     /// SELECT over a subquery source in FROM: a derived table (`(SELECT ...) s`)
     /// or a CTE reference. `source` produces the input rows; the same
     /// projection/predicate/sort pipeline as `Query` runs on top.
+    ///
+    /// Also the binder's general **same-level projection wrapper**: it carries
+    /// the tail for a window chain ([`finish_windowed_select`]), a sorted
+    /// `Limit` ([`attach_sort`]) and a FROM-less SRF. So this variant does *not*
+    /// imply a query nesting level — see [`substitute_outer`].
     Subquery {
         source: Box<LogicalPlan>,
         columns: Vec<OutputColumn>,
@@ -199,8 +199,9 @@ pub enum LogicalPlan {
     /// Windows are evaluated after WHERE and after GROUP BY/HAVING, but before
     /// the query's own projection, ORDER BY and DISTINCT. So this carries no
     /// projection tail of its own — it is a bare row source, and the surrounding
-    /// SELECT is bound as a [`Self::Subquery`] wrapping the chain, exactly as a
-    /// partitioned-parent FROM item wraps an [`Self::Append`].
+    /// SELECT is bound as a [`Self::Subquery`] wrapping the chain. That wrapper
+    /// is *not* a query nesting level (unlike a derived table, which shares the
+    /// variant); see [`substitute_outer`].
     ///
     /// `source` is the query block the binder would have built anyway, but with
     /// identity projections and no sort/distinct, so this node's `spec` and
@@ -853,7 +854,18 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
 /// in place, before it executes for that row. `outer` is the immediate parent
 /// row (the one this subplan is correlated to). An [`BoundExpr::OuterColumnRef`]
 /// is resolved by comparing its `level` to its nesting `depth` within this
-/// subplan (1 at the top, +1 per nested expression-subquery): `level == depth`
+/// subplan.
+///
+/// **`depth` increments exactly where the binder pushes a correlation level**,
+/// which is one place: [`crate::Scope::as_outer_levels`], reached only when
+/// binding an expression-subquery marker (`(SELECT …)`, `EXISTS`, `IN (SELECT
+/// …)`, `ANY`/`ALL`). Nothing else is a level — not `Subquery`, which the binder
+/// also synthesizes as a same-level projection wrapper, and not `Limit`,
+/// `Window` or `SetOp`. Incrementing anywhere else strands a correlated
+/// reference in the `level < depth` branch below, where it is silently left
+/// alone and later filled from the wrong row (or reaches `eval` unsubstituted).
+///
+/// Comparing `level` to `depth`: `level == depth`
 /// names a column of `outer` and folds to a `Const`; `level > depth` belongs to
 /// a still-outer query and is decremented (to be filled at that boundary);
 /// `level < depth` names an intervening inner query and is left for it. The
@@ -895,8 +907,14 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
             predicate,
             ..
         } => {
-            // A derived table is its own query nesting level.
-            subst_outer_plan(source, outer, depth + 1);
+            // Same depth: a `Subquery` is not necessarily a derived table. The
+            // binder also synthesizes one as the projection wrapper over a
+            // window chain (`finish_windowed_select`), over a sorted `Limit`
+            // (`attach_sort`) and over a FROM-less SRF — none of which is a query
+            // level. A real derived table's source binds with an empty outer
+            // scope, so it holds no `OuterColumnRef` for the distinction to
+            // matter to; see `substitute_outer`.
+            subst_outer_plan(source, outer, depth);
             for e in projections.iter_mut() {
                 subst_outer_expr(e, outer, depth);
             }
@@ -954,8 +972,7 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
         // An Append holds only leaf table handles — no correlated exprs.
         LogicalPlan::Append { .. } => {}
         // A set operation is not its own query nesting level: its arms bound in
-        // the enclosing scope, so they keep this `depth` (contrast the Subquery
-        // arm above, a derived table, which descends with `depth + 1`).
+        // the enclosing scope, so they keep this `depth`.
         LogicalPlan::SetOp { arms, .. } => {
             for arm in arms.iter_mut() {
                 subst_outer_plan(&mut arm.plan, outer, depth);
@@ -1007,7 +1024,10 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                     }
                 }
                 InsertSource::Query { input, projections } => {
-                    subst_outer_plan(input, outer, depth + 1);
+                    // Same depth, per `substitute_outer`'s rule. Unreachable in
+                    // practice: `substitute_outer` only ever runs on an
+                    // expression-subquery body, which is always a SELECT.
+                    subst_outer_plan(input, outer, depth);
                     for e in projections.iter_mut() {
                         subst_outer_expr(e, outer, depth);
                     }
@@ -1058,7 +1078,12 @@ fn subst_outer_join(join: &mut JoinExpr, outer: &[Value], depth: usize) {
     match join {
         JoinExpr::Input { input, .. } => match input {
             JoinInput::Scan(_) => {}
-            JoinInput::Subplan(plan) => subst_outer_plan(plan, outer, depth + 1),
+            // Same depth. A FROM subquery binds with an empty outer scope, so
+            // it holds no `OuterColumnRef` at all — see the `debug_assert!` in
+            // `bind_from_item`'s Derived arm. LATERAL is the one future feature
+            // that would bind one against the enclosing scope and so need the
+            // `depth + 1` back here.
+            JoinInput::Subplan(plan) => subst_outer_plan(plan, outer, depth),
             JoinInput::TableFunction { args, .. } => {
                 for e in args.iter_mut() {
                     subst_outer_expr(e, outer, depth);
@@ -1503,7 +1528,7 @@ fn bind_query_body(
     // LIMIT/OFFSET wrap the bound body so they apply after its ORDER BY.
     match &query.limit_clause {
         Some(clause) => {
-            let (limit, offset) = bind_limit_offset(clause)?;
+            let (limit, offset) = bind_limit_offset(clause, catalog, params)?;
             Ok(LogicalPlan::Limit {
                 source: Box::new(inner),
                 limit,
@@ -1546,8 +1571,8 @@ fn apply_query_tail(
 /// A set operation owns its sort, so it takes the keys directly — including when
 /// it already has some, since an inner `ORDER BY` without a `LIMIT` does not
 /// survive an outer one (PG discards it too). Deliberately no wrapping in a
-/// `Subquery` here: that is a derived table, i.e. a query nesting level, and
-/// would strand any correlated reference inside the arms.
+/// `Subquery` here: the arms' projections and coercions index the arms' own
+/// rows, which a wrapper would have to re-derive.
 ///
 /// A `LIMIT` is the one boundary that must keep its own ordering — the bound
 /// applies to the rows the inner sort chose — so the outer sort goes above it.
@@ -2021,7 +2046,11 @@ fn all_column_distinct_keys(columns: &[OutputColumn]) -> Vec<DistinctKey> {
 /// `bigint` expressions; we support constant integers (the only form the tests
 /// and typical queries need). `LIMIT ALL`, a `NULL` count, or an absent clause
 /// all mean "no bound" (`None`). Negative counts are rejected with PG's wording.
-fn bind_limit_offset(clause: &ast::LimitClause) -> Result<(Option<i64>, Option<i64>), BindError> {
+fn bind_limit_offset(
+    clause: &ast::LimitClause,
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+) -> Result<(Option<i64>, Option<i64>), BindError> {
     let ast::LimitClause::LimitOffset {
         limit,
         offset,
@@ -2040,12 +2069,12 @@ fn bind_limit_offset(clause: &ast::LimitClause) -> Result<(Option<i64>, Option<i
     }
     let limit = limit
         .as_ref()
-        .map(|e| bind_count_expr(e, "LIMIT"))
+        .map(|e| bind_count_expr(e, "LIMIT", catalog, params))
         .transpose()?
         .flatten();
     let offset = offset
         .as_ref()
-        .map(|o| bind_count_expr(&o.value, "OFFSET"))
+        .map(|o| bind_count_expr(&o.value, "OFFSET", catalog, params))
         .transpose()?
         .flatten();
     Ok((limit, offset))
@@ -2054,7 +2083,12 @@ fn bind_limit_offset(clause: &ast::LimitClause) -> Result<(Option<i64>, Option<i
 /// Evaluate a single LIMIT/OFFSET count expression to a non-negative `i64`.
 /// Returns `None` for a `NULL` literal (PG: no limit / offset 0). Non-constant
 /// expressions are rejected as unsupported; negatives with PG's SQLSTATE.
-fn bind_count_expr(expr: &ast::Expr, clause: &str) -> Result<Option<i64>, BindError> {
+fn bind_count_expr(
+    expr: &ast::Expr,
+    clause: &str,
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+) -> Result<Option<i64>, BindError> {
     match const_i64(expr) {
         Some(Some(n)) if n < 0 => {
             let (code, kind) = if clause == "OFFSET" {
@@ -2068,9 +2102,20 @@ fn bind_count_expr(expr: &ast::Expr, clause: &str) -> Result<Option<i64>, BindEr
             Err(BindError::new(code, format!("{kind} must not be negative")))
         }
         Some(value) => Ok(value),
-        None => Err(BindError::feature_not_supported(format!(
-            "non-constant {clause} is not supported yet"
-        ))),
+        None => {
+            // PG analyzes LIMIT/OFFSET as an ordinary bigint expression, so a
+            // misplaced aggregate or window call there is rejected by
+            // *placement* before anything asks whether the value is constant.
+            // Bind in the empty scope purely to classify: any other bind failure
+            // is not the error to report, because this engine's real limitation
+            // is the constant-only count that the fallthrough describes.
+            if let Ok(bound) = bind_scalar(expr, &Scope::empty(catalog, params)) {
+                reject_agg_or_window(&bound, clause)?;
+            }
+            Err(BindError::feature_not_supported(format!(
+                "non-constant {clause} is not supported yet"
+            )))
+        }
     }
 }
 
@@ -2144,15 +2189,18 @@ fn bind_select(
     if select.from.is_empty() {
         return bind_values_select(engine, catalog, params, select, order_by, ctes, outer_scope);
     }
+    // Built before FROM so a join's `ON` can resolve `OVER w` too — it is the
+    // only scope inside a SELECT other than the body's that can see one.
+    let windows = named_windows(select)?;
     let BoundFrom {
         source,
         relations,
         visible,
-    } = bind_from_clause(engine, catalog, params, &select.from, ctes, outer_scope)?;
+    } = bind_from_clause(engine, catalog, params, &select.from, ctes, outer_scope, &windows)?;
     let scope = Scope::relations_with_visible(relations, visible, catalog, params)
         .with_subqueries(engine, ctes)
         .with_outer(outer_scope.to_vec())
-        .with_named_windows(&named_windows(select)?);
+        .with_named_windows(&windows);
     let body = bind_select_body(select, order_by, &scope)?;
     if body.windows.is_empty() {
         return Ok(build_query_block(
@@ -2258,10 +2306,19 @@ fn aggregate_identity_projection(agg: &Aggregation) -> Vec<BoundExpr> {
         .collect()
 }
 
-/// The SELECT's `WINDOW w AS (…)` definitions, by normalized name.
-fn named_windows(
-    select: &ast::Select,
-) -> Result<std::rc::Rc<std::collections::HashMap<String, ast::WindowSpec>>, BindError> {
+/// The SELECT's `WINDOW w AS (…)` definitions, by normalized name, each already
+/// merged with the base it names.
+///
+/// PG resolves the clause left to right, so a definition may name only an
+/// *earlier* one; expanding here means a self reference (`WINDOW w AS (w)`) and a
+/// forward reference both fall out as "window … does not exist", and nothing
+/// downstream has to chase a base. It also means the clause's own copy errors
+/// fire whether or not the definition is ever referenced, as in PG.
+///
+/// The bodies are still bound lazily, so an *unreferenced* definition's
+/// expressions are not column-checked — a deliberate gap, since eagerly binding
+/// one would reject frames PG accepts. See the window notes in the smoke suite.
+fn named_windows(select: &ast::Select) -> Result<NamedWindows, BindError> {
     let mut map = std::collections::HashMap::new();
     for ast::NamedWindowDefinition(name, definition) in &select.named_window {
         let key = normalize_ident(name);
@@ -2275,12 +2332,20 @@ fn named_windows(
                 )));
             }
         };
-        if map.insert(key.clone(), spec).is_some() {
+        // The duplicate check precedes expansion, as in PG: `WINDOW w AS (…),
+        // w AS (nosuchwin)` reports the duplicate, not the missing base.
+        if map.contains_key(&key) {
             return Err(BindError::new(
                 sqlstate::WINDOWING_ERROR,
                 format!("window \"{key}\" is already defined"),
             ));
         }
+        let spec = crate::functions::expand_window_base(
+            spec,
+            |base| map.get(base),
+            crate::functions::WindowCopyOrigin::Definition,
+        )?;
+        map.insert(key, spec);
     }
     Ok(std::rc::Rc::new(map))
 }
@@ -2365,13 +2430,42 @@ fn bind_table_query(
         projections.push(expr);
     }
     let sort = bind_order_by(order_by, &columns, &scope, &mut projections, true)?;
-    match source {
-        JoinExpr::Input { input, .. } => Ok(finish_single_select(
-            input, columns, projections, None, sort, None,
-        )),
+    // `TABLE t ORDER BY rank() OVER (…)` is legal — `TABLE t` is `SELECT * FROM
+    // t`, and its ORDER BY is bound with hidden columns just like a SELECT's, so
+    // it can hold a window call. Without extraction the marker would survive
+    // into the plan and fail at evaluation.
+    let input_width = scope.width();
+    let windows = extract_windows(&mut projections, input_width)?;
+    let JoinExpr::Input { input, .. } = source else {
         // A single relation reference never produces a join tree.
-        JoinExpr::Join { .. } => unreachable!("TABLE t binds a single relation"),
+        unreachable!("TABLE t binds a single relation");
+    };
+    if windows.is_empty() {
+        return Ok(finish_single_select(
+            input, columns, projections, None, sort, None,
+        ));
     }
+    // With a chain above, the block below it reproduces its input row unchanged
+    // and the tail rides the wrapping `Subquery` — as in `bind_select`. `TABLE t`
+    // has no WHERE, GROUP BY or DISTINCT, so nothing else interleaves.
+    let identity = scope.identity_projection();
+    let block = finish_single_select(
+        input,
+        internal_columns(&identity),
+        identity,
+        None,
+        Vec::new(),
+        None,
+    );
+    Ok(finish_windowed_select(
+        block,
+        windows,
+        input_width,
+        columns,
+        projections,
+        sort,
+        None,
+    ))
 }
 
 /// Convert a rowset's output columns into storage `Column`s for a [`Scope`].
@@ -2660,6 +2754,17 @@ fn bind_from_item(
             // A (non-LATERAL) subquery in FROM cannot see the enclosing query's
             // columns, so it binds with no outer scope.
             let inner = bind_query_scoped(engine, catalog, params, subquery, ctes, &[])?;
+            // That empty scope is load-bearing: `subst_outer_join` descends into
+            // this subplan at the *same* depth, which is only sound because no
+            // `OuterColumnRef` can be produced without a non-empty `Scope::outer`.
+            // Implementing LATERAL means binding this against the enclosing scope,
+            // and then the `depth + 1` has to come back — this assert is what will
+            // say so.
+            debug_assert!(
+                !plan_has_outer_refs(&inner),
+                "a FROM subquery binds with an empty outer scope; supporting LATERAL \
+                 means restoring the `depth + 1` in `subst_outer_join`"
+            );
             let mut columns = output_columns_of(&inner)?;
             apply_alias_columns(&mut columns, &alias.columns, &table_subject(&qualifier))?;
             Ok(BoundFromItem {
@@ -2705,6 +2810,7 @@ fn bind_from_clause(
     from: &[ast::TableWithJoins],
     ctes: &CteEnv,
     outer_scope: &[OuterLevel],
+    windows: &NamedWindows,
 ) -> Result<BoundFrom, BindError> {
     let mut combined: Option<JoinExpr> = None;
     let mut relations: Vec<(String, Vec<Column>)> = Vec::new();
@@ -2719,7 +2825,7 @@ fn bind_from_clause(
             source: group_source,
             relations: group_relations,
             visible: group_visible,
-        } = bind_table_with_joins(engine, catalog, params, table, ctes, outer_scope)?;
+        } = bind_table_with_joins(engine, catalog, params, table, ctes, outer_scope, windows)?;
         for (qualifier, _) in &group_relations {
             ensure_unique_qualifier(&mut seen, qualifier)?;
         }
@@ -2776,6 +2882,7 @@ fn bind_table_with_joins(
     table: &ast::TableWithJoins,
     ctes: &CteEnv,
     outer_scope: &[OuterLevel],
+    windows: &NamedWindows,
 ) -> Result<BoundFrom, BindError> {
     let mut bound =
         bind_from_item(engine, catalog, params, &table.relation, ctes)?.into_bound_from();
@@ -2824,13 +2931,11 @@ fn bind_table_with_joins(
                 let scope =
                     Scope::relations_with_visible(on_relations, on_visible, catalog, params)
                         .with_subqueries(engine, ctes)
-                        .with_outer(outer_scope.to_vec());
+                        .with_outer(outer_scope.to_vec())
+                        .with_named_windows(windows);
                 let binding = bind_expr(on, &scope)?;
-                if matches!(&binding, Binding::Typed(expr) if expr.contains_aggregate()) {
-                    return Err(BindError::new(
-                        sqlstate::GROUPING_ERROR,
-                        "aggregate functions are not allowed in JOIN conditions",
-                    ));
+                if let Binding::Typed(expr) = &binding {
+                    reject_agg_or_window(expr, "JOIN conditions")?;
                 }
                 if let Some(v) = &mut visible {
                     v.extend(default_visible(&right.relations, left_width));
@@ -3129,7 +3234,11 @@ fn bind_values_query(
             ));
         }
         for (col, expr) in row.content.iter().enumerate() {
-            columns_of_bindings[col].push(bind_expr(expr, &scope)?);
+            let binding = bind_expr(expr, &scope)?;
+            if let Binding::Typed(expr) = &binding {
+                reject_agg_or_window(expr, "VALUES")?;
+            }
+            columns_of_bindings[col].push(binding);
         }
     }
 
@@ -3688,7 +3797,7 @@ fn bind_values_select(
     }
     let predicate = bind_where(&select.selection, &scope)?;
     if let Some(predicate) = &predicate {
-        reject_window(predicate, "WHERE")?;
+        reject_agg_or_window(predicate, "WHERE")?;
     }
     // The empty scope means any hidden ORDER BY expression is column-free
     // (`ORDER BY random()`), so appending it to `row` stays safe against the
@@ -3883,12 +3992,7 @@ fn bind_returning(
     };
     let bound = bind_target_list(items, scope)?;
     for projection in &bound.projections {
-        if projection.contains_aggregate() {
-            return Err(BindError::new(
-                sqlstate::GROUPING_ERROR,
-                "aggregate functions are not allowed in RETURNING",
-            ));
-        }
+        reject_agg_or_window(projection, "RETURNING")?;
         if projection.contains_srf() {
             return Err(BindError::new(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3911,7 +4015,7 @@ fn bind_select_body(
 
     let predicate = bind_where(&select.selection, scope)?;
     if let Some(predicate) = &predicate {
-        reject_window(predicate, "WHERE")?;
+        reject_agg_or_window(predicate, "WHERE")?;
     }
     let sort = bind_order_by(order_by, &columns, scope, &mut projections, true)?;
     // DISTINCT is resolved before aggregation so any hidden `DISTINCT ON` column
@@ -4006,17 +4110,16 @@ fn bind_aggregation(
     projections: &mut [BoundExpr],
     predicate: &Option<BoundExpr>,
 ) -> Result<Option<Aggregation>, BindError> {
-    // An aggregate in WHERE is always an error — WHERE filters rows before
-    // grouping, so no aggregate value exists yet.
-    if predicate
-        .as_ref()
-        .is_some_and(BoundExpr::contains_aggregate)
-    {
-        return Err(BindError::new(
-            sqlstate::GROUPING_ERROR,
-            "aggregate functions are not allowed in WHERE",
-        ));
-    }
+    // An aggregate or window in WHERE was already rejected by the caller, which
+    // guards the predicate as soon as it is bound so the leftmost offender is
+    // the one reported.
+    debug_assert!(
+        !predicate
+            .as_ref()
+            .is_some_and(|p| p.contains_aggregate() || p.contains_window()),
+        "WHERE must be guarded by `reject_agg_or_window` before aggregation binds"
+    );
+    let _ = predicate;
 
     let group_exprs = bind_group_by(&select.group_by, scope, columns, projections)?;
     let having = select
@@ -4101,17 +4204,105 @@ fn extract_windows(
     Ok(groups)
 }
 
+/// One key of a spec's sort key list: the expression, plus the direction and
+/// NULL placement that decide whether two specs can share a sort.
+#[derive(PartialEq)]
+struct ChainKey<'a> {
+    expr: &'a BoundExpr,
+    asc: bool,
+    nulls_first: bool,
+}
+
+/// The keys a spec's step sorts by: its partition keys, then its `ORDER BY`
+/// keys. Partition keys sort ascending with NULLs last, which is what
+/// `WindowAgg` does — so this is exactly the sort the executor performs.
+fn sort_key_list(spec: &BoundWindowSpec) -> Vec<ChainKey<'_>> {
+    spec.partition_by
+        .iter()
+        .map(|expr| ChainKey {
+            expr,
+            asc: true,
+            nulls_first: false,
+        })
+        .chain(spec.order_by.iter().map(|key| ChainKey {
+            expr: &key.expr,
+            asc: key.asc,
+            nulls_first: key.nulls_first,
+        }))
+        .collect()
+}
+
+/// Whether `short` is a *proper* prefix of `long`, i.e. a step sorted by `long`
+/// leaves the rows already ordered for `short`.
+fn is_proper_prefix(short: &[ChainKey<'_>], long: &[ChainKey<'_>]) -> bool {
+    short.len() < long.len() && short.iter().zip(long).all(|(a, b)| a == b)
+}
+
 /// The order the chain evaluates `groups` in, as indices into it, deepest first.
 ///
-/// PG evaluates the spec with the most keys first, breaking ties in reverse
-/// order of appearance. The last spec evaluated leaves its sort in place, and
-/// that is the order a window query returns rows in when it has no ORDER BY of
-/// its own — so this reproduces observable behavior, not just a plan shape.
+/// PG orders the chain so consecutive steps can **share a sort**: a step sorted
+/// by `(a, b, c)` leaves the rows already ordered for `(a, b)`, so the shorter
+/// spec follows the longer one and needs no re-sort. The order is observable,
+/// not just a plan shape — the last step evaluated leaves its sort in place, and
+/// that is the order a window query returns rows in when it has no `ORDER BY` of
+/// its own.
+///
+/// Fitted from `EXPLAIN (costs off)` against PG 18.4, whose `Window: wN`
+/// numbering states the evaluation order directly (w1 is the bottom): every
+/// permutation of three specs with one prefix pair, of three independent
+/// singletons, and of a prefix *tree* (`(a)`, `(a,b)`, `(a,c)`), plus two
+/// independent prefix chains, the non-comparable case (`(a,b)` vs `(a,c)`, which
+/// do *not* share a sort) and the direction-mismatch case (`(a)` vs
+/// `(a DESC, b)`, likewise).
+///
+/// The rule those 24 observations agree on:
+///
+/// 1. Take the specs in reverse order of first appearance.
+/// 2. Build chains longest-first; a spec joins the chain whose current shortest
+///    member it is a proper prefix of, preferring the chain that sits latest in
+///    the reversed order when several would do.
+/// 3. Emit the chains ordered by their latest member's position in the reversed
+///    order, each chain longest key list first.
+///
+/// A spec whose `OVER` clause holds a subquery never chains, because `Subplan`
+/// compares unequal even to itself — conservative, since the only cost of not
+/// chaining is a sort that could have been reused.
 fn chain_order(groups: &[WindowGroup]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..groups.len()).collect();
-    let keys = |g: &WindowGroup| g.spec.partition_by.len() + g.spec.order_by.len();
-    order.sort_by(|&a, &b| keys(&groups[b]).cmp(&keys(&groups[a])).then(b.cmp(&a)));
-    order
+    let n = groups.len();
+    let keys: Vec<Vec<ChainKey<'_>>> = groups.iter().map(|g| sort_key_list(&g.spec)).collect();
+    // Position in reverse order of appearance: the last-written spec is 0.
+    let rev_pos: Vec<usize> = (0..n).map(|g| n - 1 - g).collect();
+
+    // Longest first, and among equals the one latest in the reversed order —
+    // that is the chain a shorter spec attaches to when several would fit.
+    let mut by_length: Vec<usize> = (0..n).collect();
+    by_length.sort_by(|&a, &b| {
+        keys[b]
+            .len()
+            .cmp(&keys[a].len())
+            .then(rev_pos[b].cmp(&rev_pos[a]))
+    });
+
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    for &group in &by_length {
+        // Each chain is built longest-first, so its shortest member is its last.
+        let attach = chains
+            .iter()
+            .enumerate()
+            .filter(|(_, chain)| {
+                let tail = *chain.last().expect("a chain is never empty");
+                is_proper_prefix(&keys[group], &keys[tail])
+            })
+            .max_by_key(|(_, chain)| rev_pos[*chain.last().expect("a chain is never empty")])
+            .map(|(index, _)| index);
+        match attach {
+            Some(index) => chains[index].push(group),
+            None => chains.push(vec![group]),
+        }
+    }
+
+    chains.sort_by_key(|chain| chain.iter().map(|&g| rev_pos[g]).max().unwrap_or(0));
+    chains.into_iter().flatten().collect()
 }
 
 /// Rewrite one expression tree, replacing each [`BoundExpr::WindowFunc`] marker
@@ -4279,18 +4470,6 @@ fn rewrite_all_over_window(
         .collect()
 }
 
-/// Reject a window call in a clause that is evaluated before windows are, naming
-/// the clause the way PG does.
-fn reject_window(expr: &BoundExpr, clause: &str) -> Result<(), BindError> {
-    if expr.contains_window() {
-        return Err(BindError::new(
-            sqlstate::WINDOWING_ERROR,
-            format!("window functions are not allowed in {clause}"),
-        ));
-    }
-    Ok(())
-}
-
 /// Bind the `GROUP BY` keys against the FROM `scope`. Supports plain expressions
 /// (including bare columns) and 1-based output-column ordinals (`GROUP BY 1`);
 /// grouping-set modifiers were already rejected. An aggregate inside a group key
@@ -4322,13 +4501,7 @@ fn bind_group_by(
         } else {
             bind_group_key(expr, scope, columns, projections)?
         };
-        reject_window(&bound, "GROUP BY")?;
-        if bound.contains_aggregate() {
-            return Err(BindError::new(
-                sqlstate::GROUPING_ERROR,
-                "aggregate functions are not allowed in GROUP BY",
-            ));
-        }
+        reject_agg_or_window(&bound, "GROUP BY")?;
         // The executor groups with `compare_values`, which cannot order every
         // type (`bit`, user types); reject such a key at bind time rather than
         // panicking mid-group.
@@ -4947,6 +5120,9 @@ pub fn bind_insert_with_params(
                     defaults[idx].clone()
                 } else {
                     let binding = bind_expr(expr, &scope)?;
+                    if let Binding::Typed(expr) = &binding {
+                        reject_agg_or_window(expr, "VALUES")?;
+                    }
                     coerce_to_column(binding, &schema.columns[idx], &scope)?
                 };
             }
@@ -5469,12 +5645,18 @@ pub fn bind_update_with_params(
             default_for_column(&schema.columns[idx], catalog)?
         } else {
             let binding = bind_expr(&assignment.value, &scope)?;
+            if let Binding::Typed(expr) = &binding {
+                reject_agg_or_window(expr, "UPDATE")?;
+            }
             coerce_to_column(binding, &schema.columns[idx], &scope)?
         };
         assignments.push((idx, value));
     }
 
     let predicate = bind_where(&update.selection, &scope)?;
+    if let Some(predicate) = &predicate {
+        reject_agg_or_window(predicate, "WHERE")?;
+    }
     // RETURNING references the NEW row (post-update), which the executor feeds
     // in schema order — the same scope the SET/WHERE clauses bound against.
     let returning = bind_returning(&update.returning, &scope)?;
@@ -5544,6 +5726,9 @@ pub fn bind_delete_with_params(
     let scope =
         Scope::table(&schema, qualifier, catalog, params).with_subqueries(engine, &CteEnv::new());
     let predicate = bind_where(&delete.selection, &scope)?;
+    if let Some(predicate) = &predicate {
+        reject_agg_or_window(predicate, "WHERE")?;
+    }
     // RETURNING references the deleted (OLD) row, which the executor feeds.
     let returning = bind_returning(&delete.returning, &scope)?;
     Ok(LogicalPlan::Delete {
@@ -6600,6 +6785,57 @@ mod tests {
                 "window functions are not allowed in WHERE",
             ),
             (
+                "SELECT a.id FROM t a LEFT JOIN t b ON rank() OVER () > 0",
+                "42P20",
+                "window functions are not allowed in JOIN conditions",
+            ),
+            (
+                "SELECT a.id FROM t a LEFT JOIN t b ON rank() OVER w = 1 \
+                 WINDOW w AS (ORDER BY a.id)",
+                "42P20",
+                "window functions are not allowed in JOIN conditions",
+            ),
+            (
+                "UPDATE t SET id = 1 RETURNING rank() OVER ()",
+                "42P20",
+                "window functions are not allowed in RETURNING",
+            ),
+            (
+                "UPDATE t SET id = rank() OVER ()",
+                "42P20",
+                "window functions are not allowed in UPDATE",
+            ),
+            (
+                "UPDATE t SET id = 1 WHERE rank() OVER () > 0",
+                "42P20",
+                "window functions are not allowed in WHERE",
+            ),
+            (
+                "DELETE FROM t WHERE rank() OVER () > 0",
+                "42P20",
+                "window functions are not allowed in WHERE",
+            ),
+            (
+                "INSERT INTO t VALUES (rank() OVER ())",
+                "42P20",
+                "window functions are not allowed in VALUES",
+            ),
+            (
+                "VALUES (rank() OVER ())",
+                "42P20",
+                "window functions are not allowed in VALUES",
+            ),
+            (
+                "SELECT id FROM t LIMIT rank() OVER ()",
+                "42P20",
+                "window functions are not allowed in LIMIT",
+            ),
+            (
+                "SELECT id FROM t OFFSET rank() OVER ()",
+                "42P20",
+                "window functions are not allowed in OFFSET",
+            ),
+            (
                 "SELECT id FROM t GROUP BY id HAVING rank() OVER () > 1",
                 "42P20",
                 "window functions are not allowed in HAVING",
@@ -6728,6 +6964,207 @@ mod tests {
         ] {
             assert!(matches!(bound(sql), LogicalPlan::Subquery { .. }), "for: {sql}");
         }
+    }
+
+    /// The clauses that reject a window also reject an aggregate, and had no
+    /// guard for either before the window work — these are the aggregate half.
+    #[test]
+    fn aggregate_misuse_in_dml_reports_pg_text_and_sqlstate() {
+        for (sql, clause) in [
+            ("UPDATE t SET id = count(*)", "UPDATE"),
+            ("UPDATE t SET id = 1 WHERE count(*) > 0", "WHERE"),
+            ("DELETE FROM t WHERE count(*) > 0", "WHERE"),
+            ("INSERT INTO t VALUES (count(*))", "VALUES"),
+            ("VALUES (count(*))", "VALUES"),
+            ("SELECT id FROM t LIMIT count(*)", "LIMIT"),
+            ("SELECT id FROM t OFFSET count(*)", "OFFSET"),
+        ] {
+            let error = bind_err(sql);
+            assert_eq!(error.code, "42803", "for: {sql}");
+            assert_eq!(
+                error.message,
+                format!("aggregate functions are not allowed in {clause}"),
+                "for: {sql}"
+            );
+        }
+    }
+
+    /// PG analyzes an expression in source order and blames the first misplaced
+    /// node it meets, so which of an aggregate and a window is reported depends
+    /// on which is written first.
+    #[test]
+    fn the_leftmost_offender_is_the_one_reported() {
+        for (sql, code, message) in [
+            (
+                "SELECT 1 FROM t WHERE count(*) > 0 AND rank() OVER () > 0",
+                "42803",
+                "aggregate functions are not allowed in WHERE",
+            ),
+            (
+                "SELECT 1 FROM t WHERE rank() OVER () > 0 AND count(*) > 0",
+                "42P20",
+                "window functions are not allowed in WHERE",
+            ),
+            (
+                "UPDATE t SET id = 1 RETURNING count(*) + rank() OVER ()",
+                "42803",
+                "aggregate functions are not allowed in RETURNING",
+            ),
+            (
+                "UPDATE t SET id = 1 RETURNING rank() OVER () + count(*)",
+                "42P20",
+                "window functions are not allowed in RETURNING",
+            ),
+        ] {
+            let error = bind_err(sql);
+            assert_eq!(error.code, code, "for: {sql}");
+            assert_eq!(error.message, message, "for: {sql}");
+        }
+    }
+
+    /// `TABLE t` is `SELECT * FROM t`, so its ORDER BY can hold a window call and
+    /// must go through the same extraction — otherwise the marker survives into
+    /// the plan and fails at evaluation.
+    #[test]
+    fn a_table_query_order_by_a_window_builds_a_window_chain() {
+        let LogicalPlan::Subquery {
+            source,
+            columns,
+            projections,
+            sort,
+            ..
+        } = bound("TABLE t ORDER BY rank() OVER (ORDER BY id DESC)")
+        else {
+            panic!("expected a Subquery wrapping the window chain");
+        };
+        assert!(matches!(*source, LogicalPlan::Window { .. }));
+        assert_eq!(columns.len(), 4, "t's own columns stay visible");
+        assert_eq!(projections.len(), 5, "plus the hidden sort column");
+        assert_eq!(sort[0].column, 4);
+        assert!(
+            !projections.iter().any(BoundExpr::contains_window),
+            "no marker survives extraction"
+        );
+    }
+
+    /// A `WINDOW` definition may name an *earlier* one, and the copy inherits
+    /// what the base contributes. Expanding at build time is also what makes a
+    /// self or forward reference report "does not exist", as PG does.
+    #[test]
+    fn a_named_window_expands_its_base_at_build_time() {
+        let LogicalPlan::Subquery { source, .. } = bound(
+            "SELECT rank() OVER w2 FROM t WINDOW w1 AS (PARTITION BY name), \
+             w2 AS (w1 ORDER BY id)",
+        ) else {
+            panic!("expected a Subquery wrapping the window chain");
+        };
+        let LogicalPlan::Window { spec, .. } = *source else {
+            panic!("expected a Window");
+        };
+        assert_eq!(spec.partition_by.len(), 1, "w1's PARTITION BY is inherited");
+        assert_eq!(spec.order_by.len(), 1);
+
+        for (sql, code, message) in [
+            (
+                "SELECT 1 FROM t WINDOW w AS (w)",
+                "42704",
+                "window \"w\" does not exist",
+            ),
+            (
+                "SELECT rank() OVER w2 FROM t \
+                 WINDOW w2 AS (w1 ORDER BY id), w1 AS (PARTITION BY name)",
+                "42704",
+                "window \"w1\" does not exist",
+            ),
+            (
+                "SELECT 1 FROM t WINDOW w AS (ORDER BY id), w AS (nosuchwin)",
+                "42P20",
+                "window \"w\" is already defined",
+            ),
+            (
+                "SELECT 1 FROM t WINDOW w1 AS (ORDER BY id ROWS UNBOUNDED PRECEDING), \
+                 w2 AS (w1)",
+                "42P20",
+                "cannot copy window \"w1\" because it has a frame clause",
+            ),
+            (
+                "SELECT 1 FROM t WINDOW w1 AS (ORDER BY id), w2 AS (w1 ORDER BY name)",
+                "42P20",
+                "cannot override ORDER BY clause of window \"w1\"",
+            ),
+        ] {
+            let error = bind_err(sql);
+            assert_eq!(error.code, code, "for: {sql}");
+            assert_eq!(error.message, message, "for: {sql}");
+        }
+    }
+
+    /// The name alone does not make a call a window call — PG resolves by name
+    /// *and* argument types, so only the zero-argument form is the builtin. The
+    /// user-function half needs a catalog and is covered end to end.
+    #[test]
+    fn only_a_zero_argument_call_resolves_to_a_window_function() {
+        let bare = bind_err("SELECT rank() FROM t");
+        assert_eq!(bare.code, "42809");
+        assert_eq!(bare.message, "window function rank requires an OVER clause");
+
+        let with_arg = bind_err("SELECT rank(1) FROM t");
+        assert_eq!(with_arg.code, "42883");
+        assert_eq!(with_arg.message, "function rank(integer) does not exist");
+    }
+
+    /// The subplan of the first expression-subquery marker in `sql`'s target
+    /// list, ready for [`substitute_outer`].
+    fn first_subplan(sql: &str) -> LogicalPlan {
+        fn find(exprs: &[BoundExpr]) -> Option<LogicalPlan> {
+            exprs.iter().find_map(|e| match e {
+                BoundExpr::ScalarSubquery { subplan, .. }
+                | BoundExpr::Exists { subplan, .. } => Some((*subplan.0).clone()),
+                _ => None,
+            })
+        }
+        let plan = bound(sql);
+        let (LogicalPlan::Query { projections, predicate, .. }
+        | LogicalPlan::Subquery { projections, predicate, .. }) = &plan
+        else {
+            panic!("expected a Query or Subquery for `{sql}`");
+        };
+        find(projections)
+            .or_else(|| predicate.as_ref().and_then(|p| find(std::slice::from_ref(p))))
+            .unwrap_or_else(|| panic!("no expression subquery in `{sql}`"))
+    }
+
+    /// `substitute_outer` must increment its depth exactly where the binder
+    /// pushed a correlation level — only at an expression-subquery marker. The
+    /// window chain's wrapping `Subquery` is *not* a level, so a correlated
+    /// reference below it is substituted at depth 1 like any other.
+    ///
+    /// Before the fix this left the reference stranded, which surfaced as an
+    /// internal "was not substituted" error at execution.
+    #[test]
+    fn a_correlated_reference_below_a_window_chain_is_substituted() {
+        let mut plan =
+            first_subplan("SELECT id, (SELECT sum(big + t.id) OVER () FROM t u) FROM t");
+        assert!(plan_has_outer_refs(&plan), "the subplan starts correlated");
+        substitute_outer(&mut plan, &[Value::Int4(7)]);
+        assert!(
+            !plan_has_outer_refs(&plan),
+            "the window chain's wrapper is not a query nesting level"
+        );
+    }
+
+    /// The same depth bug, reached without any window at all: `attach_sort`
+    /// wraps a sorted `LIMIT` in a synthetic `Subquery` too. Pre-existing, fixed
+    /// by the same change.
+    #[test]
+    fn a_correlated_reference_below_a_sorted_limit_is_substituted() {
+        let mut plan = first_subplan(
+            "SELECT id FROM t WHERE EXISTS ( (SELECT 1 FROM t u WHERE u.id = t.id LIMIT 1) \
+             ORDER BY 1 )",
+        );
+        assert!(plan_has_outer_refs(&plan), "the subplan starts correlated");
+        substitute_outer(&mut plan, &[Value::Int4(7)]);
+        assert!(!plan_has_outer_refs(&plan));
     }
 
     /// A `$n` can appear in an argument or in the OVER clause itself, and both

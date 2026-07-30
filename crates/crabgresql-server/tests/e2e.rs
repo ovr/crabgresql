@@ -1848,6 +1848,145 @@ async fn select_distinct_deduplicates_rows() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A correlated reference below a window chain resolves against the right outer
+/// row. The chain is wrapped in a synthetic `Subquery`, which is *not* a query
+/// nesting level — treating it as one stranded the reference. Same bug family as
+/// `correlated_reference_inside_a_union_arm_resolves`.
+///
+/// The two-level case is the one that mattered most: it failed *silently*,
+/// returning the first inner row's value for every outer row, so this asserts
+/// values rather than merely the absence of an error.
+#[tokio::test]
+async fn correlated_reference_below_a_window_chain_resolves() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE wide (a int, b int)").await?;
+    client
+        .simple_query("INSERT INTO wide VALUES (1,10),(2,20),(3,30),(4,40)")
+        .await?;
+
+    // sum(b) is 100 over the four rows, so each outer row adds 4 * p.a.
+    let one = client
+        .query(
+            "SELECT p.a, (SELECT sum(w.b + p.a) OVER () FROM wide w LIMIT 1) FROM wide p ORDER BY 1",
+            &[],
+        )
+        .await?;
+    let got: Vec<(i32, i64)> = one.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(got, vec![(1, 104), (2, 108), (3, 112), (4, 116)]);
+
+    // Two markers deep: the inner reference is level 2 and must be decremented
+    // at the outer boundary, not skipped.
+    let two = client
+        .query(
+            "SELECT p.a, (SELECT (SELECT sum(w.b + p.a) OVER () FROM wide w LIMIT 1) \
+             FROM wide m LIMIT 1) FROM wide p ORDER BY 1",
+            &[],
+        )
+        .await?;
+    let got: Vec<(i32, i64)> = two.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        got,
+        vec![(1, 104), (2, 108), (3, 112), (4, 116)],
+        "each outer row must see its own `a`, not the first one"
+    );
+
+    let exists = client
+        .query(
+            "SELECT p.a FROM wide p \
+             WHERE EXISTS (SELECT rank() OVER (ORDER BY w.b) FROM wide w WHERE w.a = p.a) \
+             ORDER BY 1",
+            &[],
+        )
+        .await?;
+    assert_eq!(exists.len(), 4);
+
+    // The same synthetic-wrapper bug without any window: `attach_sort` wraps a
+    // sorted LIMIT the same way.
+    let sorted_limit = client
+        .query(
+            "SELECT p.a FROM wide p \
+             WHERE EXISTS ( (SELECT 1 FROM wide w WHERE w.a = p.a LIMIT 1) ORDER BY 1 ) \
+             ORDER BY 1",
+            &[],
+        )
+        .await?;
+    assert_eq!(sorted_limit.len(), 4);
+
+    Ok(())
+}
+
+/// A user-defined function may share a window function's name: PG resolves by
+/// name *and* argument types, so `rank(int)` is the user's while the bare
+/// `rank()` is still the builtin. Needs the catalog, so it lives here.
+#[tokio::test]
+async fn a_user_function_may_shadow_a_window_function_name() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id int)").await?;
+    client.simple_query("INSERT INTO t VALUES (1), (2)").await?;
+    client
+        .simple_query("CREATE FUNCTION rank(x int) RETURNS int LANGUAGE SQL AS 'SELECT $1 + 1'")
+        .await?;
+
+    let rows = client.query("SELECT rank(41)", &[]).await?;
+    assert_eq!(rows[0].get::<_, i32>(0), 42, "the user's function is called");
+
+    let err = client.simple_query("SELECT rank() FROM t").await.unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(db.message(), "window function rank requires an OVER clause");
+
+    let windowed = client.query("SELECT rank() OVER () FROM t", &[]).await?;
+    assert_eq!(windowed.len(), 2);
+
+    Ok(())
+}
+
+/// A window call in a `LANGUAGE SQL` body is refused. PG accepts it and runs the
+/// body as its own query (every call returns 1); this engine *inlines* bodies, so
+/// the marker would join the caller's chain and number the caller's rows instead.
+/// Refusing is the honest answer until bodies stop being inlined.
+#[tokio::test]
+async fn a_window_call_in_a_sql_function_body_is_rejected() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    let err = client
+        .simple_query("CREATE FUNCTION wr() RETURNS bigint LANGUAGE SQL AS 'SELECT row_number() OVER ()'")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        db.message(),
+        "window functions in a SQL function body are not supported yet"
+    );
+
+    Ok(())
+}
+
+/// A window call in a column DEFAULT is refused at DDL time. Accepting it left a
+/// table whose every default-taking INSERT failed.
+#[tokio::test]
+async fn a_window_call_in_a_column_default_is_rejected() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    let err = client
+        .simple_query("CREATE TABLE d (a int DEFAULT rank() OVER (), b int)")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::WINDOWING_ERROR);
+    assert_eq!(
+        db.message(),
+        "window functions are not allowed in DEFAULT expressions"
+    );
+
+    Ok(())
+}
+
 /// Window functions over the wire: the values, and the types they are described
 /// as. `rank()` is `int8` and `sum(int4)` widens to `int8`, both of which a
 /// binary-format client decodes by the advertised OID — so getting one wrong is

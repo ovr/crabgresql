@@ -362,6 +362,108 @@ ERROR:  window "w" is already defined
 -- than being refused for having one, so it reaches the unimplemented frame path
 SELECT rank() OVER w FROM empsalary WINDOW w AS (ORDER BY salary ROWS UNBOUNDED PRECEDING);
 ERROR:  explicit window frames are not supported yet
+-- a WINDOW definition may name a *prior* one, and the copy inherits what the
+-- base contributes — so w2 ranks within each depname
+SELECT depname, empno, rank() OVER w2
+  FROM empsalary WINDOW w1 AS (PARTITION BY depname), w2 AS (w1 ORDER BY empno)
+  ORDER BY depname, empno;
+  depname  | empno | rank 
+-----------+-------+------
+ develop   |     7 |    1
+ develop   |     9 |    2
+ develop   |    10 |    3
+ develop   |    11 |    4
+ personnel |     2 |    1
+ personnel |     5 |    2
+ sales     |     1 |    1
+ sales     |     3 |    2
+ sales     |     4 |    3
+(9 rows)
+
+-- and `OVER (w2)` copies the *expanded* w2, not its unexpanded body
+SELECT depname, empno, rank() OVER (w2)
+  FROM empsalary WINDOW w1 AS (PARTITION BY depname), w2 AS (w1 ORDER BY empno)
+  ORDER BY depname, empno;
+  depname  | empno | rank 
+-----------+-------+------
+ develop   |     7 |    1
+ develop   |     9 |    2
+ develop   |    10 |    3
+ develop   |    11 |    4
+ personnel |     2 |    1
+ personnel |     5 |    2
+ sales     |     1 |    1
+ sales     |     3 |    2
+ sales     |     4 |    3
+(9 rows)
+
+-- the clause resolves left to right, so a self or forward reference names a
+-- window that does not exist yet, and the copy rules apply between definitions
+SELECT 1 FROM empsalary WINDOW w AS (w);
+ERROR:  window "w" does not exist
+SELECT rank() OVER w2 FROM empsalary WINDOW w2 AS (w1 ORDER BY empno), w1 AS (PARTITION BY depname);
+ERROR:  window "w1" does not exist
+SELECT 1 FROM empsalary WINDOW w1 AS (ORDER BY empno ROWS UNBOUNDED PRECEDING), w2 AS (w1);
+ERROR:  cannot copy window "w1" because it has a frame clause
+SELECT 1 FROM empsalary WINDOW w1 AS (ORDER BY empno), w2 AS (w1 ORDER BY salary);
+ERROR:  cannot override ORDER BY clause of window "w1"
+-- three specs: PG orders the chain so a shorter key list follows the longer one
+-- it is a prefix of, sharing that sort; the last one evaluated decides row order
+SELECT empno, rank() OVER (ORDER BY empno) p, rank() OVER (ORDER BY empno, salary) q,
+       rank() OVER (ORDER BY salary) r
+  FROM empsalary ORDER BY empno;
+ empno | p | q | r 
+-------+---+---+---
+     1 | 1 | 1 | 7
+     2 | 2 | 2 | 2
+     3 | 3 | 3 | 5
+     4 | 4 | 4 | 5
+     5 | 5 | 5 | 1
+     7 | 6 | 6 | 3
+     9 | 7 | 7 | 4
+    10 | 8 | 8 | 8
+    11 | 9 | 9 | 8
+(9 rows)
+
+-- errors: every remaining clause evaluated before windows are
+SELECT e.empno FROM empsalary e LEFT JOIN empsalary f ON rank() OVER () > 0;
+ERROR:  window functions are not allowed in JOIN conditions
+SELECT empno FROM empsalary LIMIT rank() OVER ();
+ERROR:  window functions are not allowed in LIMIT
+SELECT empno FROM empsalary OFFSET rank() OVER ();
+ERROR:  window functions are not allowed in OFFSET
+VALUES (rank() OVER ());
+ERROR:  window functions are not allowed in VALUES
+UPDATE empsalary SET empno = rank() OVER ();
+ERROR:  window functions are not allowed in UPDATE
+UPDATE empsalary SET empno = empno WHERE rank() OVER () > 0;
+ERROR:  window functions are not allowed in WHERE
+DELETE FROM empsalary WHERE rank() OVER () > 0;
+ERROR:  window functions are not allowed in WHERE
+UPDATE empsalary SET empno = empno RETURNING rank() OVER ();
+ERROR:  window functions are not allowed in RETURNING
+-- the same clauses reject a misplaced aggregate, and PG blames whichever of the
+-- two is written first
+UPDATE empsalary SET empno = count(*);
+ERROR:  aggregate functions are not allowed in UPDATE
+SELECT empno FROM empsalary LIMIT count(*);
+ERROR:  aggregate functions are not allowed in LIMIT
+SELECT 1 FROM empsalary WHERE count(*) > 0 AND rank() OVER () > 0;
+ERROR:  aggregate functions are not allowed in WHERE
+SELECT 1 FROM empsalary WHERE rank() OVER () > 0 AND count(*) > 0;
+ERROR:  window functions are not allowed in WHERE
+-- `TABLE t` is `SELECT * FROM t`, so its ORDER BY may hold a window call
+CREATE TABLE wsmall (a integer);
+INSERT INTO wsmall VALUES (3), (1), (2);
+TABLE wsmall ORDER BY rank() OVER (ORDER BY a DESC);
+ a 
+---
+ 3
+ 2
+ 1
+(3 rows)
+
+DROP TABLE wsmall;
 -- errors: explicit frames are not implemented yet
 SELECT sum(salary) OVER (ORDER BY empno ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM empsalary;
 ERROR:  explicit window frames are not supported yet
