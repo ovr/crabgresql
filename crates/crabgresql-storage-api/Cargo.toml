@@ -8,6 +8,8 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
 crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
 thiserror.workspace = true

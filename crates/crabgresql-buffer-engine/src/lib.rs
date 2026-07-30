@@ -32,8 +32,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, IndexMetadata, MAX_ROW_ID, RelStats, StorageError, TableAm,
-    TableSchema, Tid, Tuple, TupleStream, UpdateResult,
+    BatchStream, ColumnProjection, DeleteResult, IndexMetadata, MAX_ROW_ID, RelStats, StorageError,
+    TableAm, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{Clog, CommandId, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
 use crabgresql_types::Value;
@@ -850,6 +850,35 @@ impl TableAm for BufferTable {
 
     fn scan(&self, txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
         Box::new(self.visible(txn, projection).into_iter().map(Ok))
+    }
+
+    fn supports_batch_scan(&self) -> bool {
+        true
+    }
+
+    /// Unlike the Parquet chunk store, this leaf holds rows, so a batch here is
+    /// built rather than passed through. It is still worth doing: this table is
+    /// one half of a buffered Parquet relation, and a leaf that could only speak
+    /// rows would force the whole relation's scan back onto the row path.
+    ///
+    /// The conversion is bounded by the flush policy, which is what keeps the
+    /// buffer small relative to the fragments beside it.
+    fn scan_batches(&self, txn: &TxnContext, projection: &ColumnProjection) -> Option<BatchStream> {
+        // Built full width regardless of `projection`: the rows are already in
+        // memory, so narrowing would save only the per-column encode, and the
+        // batch has to come back to full width before it leaves anyway.
+        let _ = projection;
+        let rows: Vec<Tuple> = self
+            .visible(txn, &ColumnProjection::All)
+            .into_iter()
+            .map(|(_, tuple)| tuple)
+            .collect();
+        if rows.is_empty() {
+            return Some(Box::new(std::iter::empty()));
+        }
+        Some(Box::new(std::iter::once(
+            crabgresql_storage_api::arrow::build_scan_batch(&self.schema, &rows),
+        )))
     }
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {

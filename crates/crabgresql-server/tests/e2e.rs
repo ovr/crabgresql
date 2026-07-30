@@ -5890,7 +5890,10 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
     assert_eq!(
         lines,
         vec![
-            "Append".to_string(),
+            // Both leaves hand up Arrow batches, so the scan runs columnar and
+            // says so. Nothing else vectorizes here — there is no WHERE and no
+            // ORDER BY to vectorize.
+            "Append (columnar: scan)".to_string(),
             "  ->  Seq Scan on p".to_string(),
             "  ->  Buffer Scan on p".to_string(),
         ],
@@ -5906,13 +5909,38 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
     assert_eq!(
         lines,
         vec![
-            "Append".to_string(),
+            // `id = 1` is an integer equality against a constant, so it compiles
+            // to an Arrow filter and runs below the row boundary.
+            "Append (columnar: scan, filter)".to_string(),
             "  Filter: (id = 1)".to_string(),
             "  ->  Seq Scan on p".to_string(),
             "  ->  Buffer Scan on p".to_string(),
         ],
         "a WHERE on a split relation must still be rendered, and by column name"
     );
+    // The annotation must be earned, not assumed. A `LIKE` has no Arrow kernel
+    // here and `id + 1` is a computed sort key, so each declines its own step
+    // while the scan stays columnar — if either over-claimed, EXPLAIN would be
+    // reporting work that never happens.
+    for (query, expected) in [
+        ("EXPLAIN SELECT id FROM p ORDER BY id", "Append (columnar: scan, sort)"),
+        ("EXPLAIN SELECT id FROM p WHERE label LIKE 'a%'", "Append (columnar: scan)"),
+        ("EXPLAIN SELECT id FROM p ORDER BY id + 1", "Append (columnar: scan)"),
+    ] {
+        let lines = explain_lines(&client, query).await?;
+        assert_eq!(lines.first().map(String::as_str), Some(expected), "{query}");
+    }
+    // A heap relation has no batch path at all, so its plan is untouched — the
+    // divergence from PostgreSQL's EXPLAIN is confined to plans that vectorize.
+    client.simple_query("CREATE TABLE hh (id int4)").await?;
+    client.simple_query("INSERT INTO hh VALUES (1)").await?;
+    let lines = explain_lines(&client, "EXPLAIN SELECT id FROM hh WHERE id = 1").await?;
+    assert_eq!(
+        lines,
+        vec!["Seq Scan on hh".to_string(), "  Filter: (id = 1)".to_string()],
+        "a row-path plan must render exactly as it did before"
+    );
+
     let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p JOIN h ON p.id = h.id").await?;
     assert!(
         lines

@@ -12,6 +12,7 @@ mod md5;
 pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
+pub mod vector;
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -431,7 +432,7 @@ pub fn execute(
             sort,
             distinct,
         } => project_pipeline(
-            Box::new(SeqScan::new(&table, txn, &projection)),
+            scan_source(&table, txn, &projection),
             projections,
             predicate,
             sort,
@@ -448,7 +449,7 @@ pub fn execute(
             // wrapping Subquery applies this level's projection/predicate/sort.
             Ok(Execution::Rows {
                 columns,
-                node: Box::new(Append::new(&tables, txn, &projection)),
+                node: append_source(&tables, txn, &projection).into_rows(),
             })
         }
         PhysicalPlan::SetOp {
@@ -495,7 +496,7 @@ pub fn execute(
         } => {
             let source = IndexScan::new(&table, &index_name, key, ctx, txn, &projection)?;
             project_pipeline(
-                Box::new(source),
+                Source::Rows(Box::new(source)),
                 projections,
                 predicate,
                 sort,
@@ -515,13 +516,8 @@ pub fn execute(
             // Stream the source's rows straight into this level's pipeline. A
             // single FROM reference needs no materialization; buffering waits
             // for multi-reference CTEs and joins.
-            let Execution::Rows { node, .. } = execute(*source, ctx, txn)? else {
-                return Err(ExecError::new(
-                    "XX000",
-                    "subquery source did not produce a row set",
-                ));
-            };
-            project_pipeline(node, projections, predicate, sort, distinct, columns, ctx)
+            let source = subquery_source(*source, ctx, txn)?;
+            project_pipeline(source, projections, predicate, sort, distinct, columns, ctx)
         }
         PhysicalPlan::Window {
             source,
@@ -553,7 +549,7 @@ pub fn execute(
             sort,
             distinct,
         } => project_pipeline(
-            Box::new(TableFunctionSource::new(func, args, ctx.clone())),
+            Source::Rows(Box::new(TableFunctionSource::new(func, args, ctx.clone()))),
             projections,
             predicate,
             sort,
@@ -570,7 +566,7 @@ pub fn execute(
             distinct,
         } => {
             let joined = build_join_expr(source, ctx, txn)?;
-            project_pipeline(joined, projections, predicate, sort, distinct, columns, ctx)
+            project_pipeline(Source::Rows(joined), projections, predicate, sort, distinct, columns, ctx)
         }
         PhysicalPlan::Limit {
             source,
@@ -620,7 +616,7 @@ pub fn execute(
             }
             // The projection list and ORDER BY were rewritten to reference the
             // aggregate output row, so the standard tail finishes the job.
-            project_pipeline(node, projections, None, sort, distinct, columns, ctx)
+            project_pipeline(Source::Rows(node), projections, None, sort, distinct, columns, ctx)
         }
         PhysicalPlan::Insert {
             table,
@@ -1360,8 +1356,170 @@ fn substitute_hole(
 /// sources, and set-returning functions (every SELECT-shaped plan with a
 /// projection list).
 #[allow(clippy::too_many_arguments)]
+/// A pipeline's row source, before it is decided how far up the columnar
+/// segment reaches.
+///
+/// Holding the batch form rather than shredding at the scan is what lets a
+/// vectorizable operator be pushed *below* the shred; a source that never had a
+/// batch form stays [`Source::Rows`] and every such attempt simply declines.
+enum Source {
+    Rows(Box<dyn ExecNode>),
+    Batches {
+        node: Box<dyn vector::BatchNode>,
+        layout: vector::BatchLayout,
+    },
+}
+
+impl Source {
+    /// End the columnar segment, shredding back to tuples if it had begun.
+    fn into_rows(self) -> Box<dyn ExecNode> {
+        match self {
+            Source::Rows(node) => node,
+            Source::Batches { node, layout } => Box::new(vector::Shred::new(node, layout)),
+        }
+    }
+
+    /// Apply `predicate` columnar-side if it compiles, returning it unconsumed
+    /// otherwise so the caller can build the row [`Filter`] instead.
+    fn filter(self, predicate: BoundExpr) -> (Self, Option<BoundExpr>) {
+        let Source::Batches { node, layout } = self else {
+            return (self, Some(predicate));
+        };
+        match vector::expr::compile_predicate(&predicate, &layout) {
+            Some(compiled) => (
+                Source::Batches {
+                    node: Box::new(vector::FilterBatch::new(node, compiled)),
+                    layout,
+                },
+                None,
+            ),
+            None => (Source::Batches { node, layout }, Some(predicate)),
+        }
+    }
+
+    /// Apply the projection **and** the sort columnar-side, or neither.
+    ///
+    /// They are one decision because a [`SortKey`] indexes the projected tuple:
+    /// a columnar sort is unreachable unless the projection below it also stayed
+    /// columnar. The `bool` reports whether it happened; `false` hands the source
+    /// back untouched and the caller builds the row `Projection`/`Sort` pair as
+    /// it always did.
+    ///
+    /// `sort` must be non-empty — a columnar projection on its own gains
+    /// nothing, since the row `Projection` it would replace does exactly the
+    /// tuple-building work `Shred` would then have to do anyway.
+    fn project_and_sort(
+        self,
+        projections: &[BoundExpr],
+        sort: &[SortKey],
+        visible_width: usize,
+    ) -> Result<(Self, bool), ExecError> {
+        let Source::Batches { node, layout } = self else {
+            return Ok((self, false));
+        };
+        let projected = vector::sort::ProjectBatch::layout(projections);
+        let takes = vector::sort::ProjectBatch::compile(projections, &layout);
+        let takes = match takes {
+            Some(takes)
+                if vector::sort::SortBatch::compilable(sort, &projected)
+                    && visible_width <= projected.len() =>
+            {
+                takes
+            }
+            _ => return Ok((Source::Batches { node, layout }, false)),
+        };
+        let project = vector::sort::ProjectBatch::new(node, takes, &projected);
+        let sorted = vector::sort::SortBatch::new(Box::new(project), sort, &projected, visible_width)?;
+        Ok((
+            Source::Batches {
+                node: Box::new(sorted),
+                // The sort dropped the hidden ORDER BY columns, so what remains
+                // above it is the visible prefix of the projected layout.
+                layout: Arc::from(&projected[..visible_width]),
+            },
+            true,
+        ))
+    }
+}
+
+/// A `Subquery`'s child as a pipeline source, keeping the batch form when the
+/// child is a bare storage node with no tail of its own.
+///
+/// This is what lets an engine-managed relation vectorize its `WHERE`. Such a
+/// relation reads as an `Append` over its storage leaves wrapped in a
+/// `Subquery`, and the predicate lives on the **`Subquery`**, not on the
+/// `Append` (see the planner's reduced-EXPLAIN comment on that variant). Going
+/// through `execute` would shred at the `Append` and leave this level's filter
+/// with nothing but rows — the columnar filter would never fire for the very
+/// relations it exists to serve.
+///
+/// Only `Append` qualifies: it is the one variant that carries no
+/// predicate/projection/sort of its own, so nothing is skipped by building it
+/// directly. Every other child goes the ordinary way.
+fn subquery_source(
+    source: PhysicalPlan,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Source, ExecError> {
+    if let PhysicalPlan::Append {
+        tables, projection, ..
+    } = &source
+    {
+        return Ok(append_source(tables, txn, projection));
+    }
+    let Execution::Rows { node, .. } = execute(source, ctx, txn)? else {
+        return Err(ExecError::new(
+            "XX000",
+            "subquery source did not produce a row set",
+        ));
+    };
+    Ok(Source::Rows(node))
+}
+
+/// The source for a single-table scan: columnar if the engine can hand up
+/// batches, the plain row scan otherwise.
+///
+/// The choice is per-relation and invisible above the shred, so an engine
+/// gaining or losing a batch path can never change a query's answer.
+fn scan_source(
+    table: &Arc<dyn TableAm>,
+    txn: &TxnContext,
+    projection: &ColumnProjection,
+) -> Source {
+    match vector::BatchScan::open(table, txn, projection) {
+        Some(scan) => Source::Batches {
+            node: Box::new(scan),
+            layout: vector::layout_of(table.schema()),
+        },
+        None => Source::Rows(Box::new(SeqScan::new(table, txn, projection))),
+    }
+}
+
+/// The source for an `Append` over leaves — a partitioned parent, or the
+/// storage leaves of one engine-managed relation.
+///
+/// All leaves or none: [`vector::BatchAppend`] concatenates their outputs, so a
+/// single row-only leaf puts the whole node back on the row path rather than
+/// mixing representations.
+fn append_source(
+    tables: &[Arc<dyn TableAm>],
+    txn: &TxnContext,
+    projection: &ColumnProjection,
+) -> Source {
+    // Every leaf carries the parent's column layout, so any of them describes
+    // the batch. `Append` over zero leaves is not a shape the planner emits.
+    let layout = tables.first().map(|table| vector::layout_of(table.schema()));
+    match (vector::BatchAppend::open(tables, txn, projection), layout) {
+        (Some(append), Some(layout)) => Source::Batches {
+            node: Box::new(append),
+            layout,
+        },
+        _ => Source::Rows(Box::new(Append::new(tables, txn, projection))),
+    }
+}
+
 fn project_pipeline(
-    source: Box<dyn ExecNode>,
+    source: Source,
     projections: Vec<BoundExpr>,
     predicate: Option<BoundExpr>,
     sort: Vec<SortKey>,
@@ -1369,14 +1527,45 @@ fn project_pipeline(
     columns: Vec<OutputColumn>,
     ctx: &ExecContext,
 ) -> Result<Execution, ExecError> {
-    let mut node = source;
-    if let Some(predicate) = predicate {
-        node = Box::new(Filter::new(node, predicate, ctx.clone()));
-    }
+    // Offer the predicate to the columnar segment first: a filter that runs on
+    // batches removes rows before `Shred` ever builds a tuple for them, which is
+    // where vectorizing actually pays. Whatever it declines comes back to be
+    // applied by the row `Filter`, unchanged.
+    let (source, predicate) = match predicate {
+        Some(predicate) => source.filter(predicate),
+        None => (source, None),
+    };
     // The projected tuple width, including any hidden ORDER BY / DISTINCT ON
     // columns appended past the visible output — captured before `projections`
     // is consumed so a Distinct can keep those columns through the sort.
     let full_width = projections.len();
+
+    // Then the projection and sort, but only together, and only when three
+    // things hold:
+    //
+    // * `predicate` is gone. If the columnar filter declined it, it is still
+    //   waiting for the row `Filter` below — and that filter has to run *before*
+    //   the projection, or rows the WHERE excludes would be projected, sorted
+    //   and returned.
+    // * there is no DISTINCT, which is a row node and needs the hidden ORDER BY
+    //   columns that the sort would have dropped.
+    // * there is a sort at all; a columnar projection alone gains nothing.
+    let (source, sorted) = match predicate.is_none() && distinct.is_none() && !sort.is_empty() {
+        true => source.project_and_sort(&projections, &sort, columns.len())?,
+        false => (source, false),
+    };
+    if sorted {
+        // Projection and sort are both already done, columnar-side.
+        return Ok(Execution::Rows {
+            columns,
+            node: source.into_rows(),
+        });
+    }
+
+    let mut node = source.into_rows();
+    if let Some(predicate) = predicate {
+        node = Box::new(Filter::new(node, predicate, ctx.clone()));
+    }
     // A set-returning function in the target list turns one input row into many,
     // so it needs `ProjectSet` rather than the one-in/one-out `Projection`.
     node = if projections.iter().any(BoundExpr::is_srf) {

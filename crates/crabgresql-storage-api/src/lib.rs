@@ -10,10 +10,13 @@
 
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use crabgresql_txn::{Clog, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
 
 pub use crabgresql_txn as txn;
+
+pub mod arrow;
 
 mod stats;
 pub use stats::{ColStats, RelStats};
@@ -626,6 +629,23 @@ impl TableCapabilities {
 /// iterator items instead of being collapsed into an eager open result.
 pub type TupleStream = Box<dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send>;
 
+/// A fallible stream of Arrow batches — the columnar twin of [`TupleStream`],
+/// with the same reason for carrying errors as items.
+///
+/// Every batch is **full width** in schema order, exactly as a [`Tuple`] is:
+/// columns outside the scan's [`ColumnProjection`] are present as all-NULL
+/// arrays (see [`arrow::null_array`]). The executor addresses columns by schema
+/// position, so a batch that packed only the projected columns would invalidate
+/// every index above the scan — the same reasoning that keeps rows full width.
+///
+/// Values are in `Value` semantics, not Arrow's: see the invariant on
+/// [`arrow`]. Notably a `Date32` here holds PostgreSQL epoch days.
+///
+/// Unlike a tuple stream, no [`Tid`] accompanies a batch. A batch scan is for
+/// read-only pipelines that never address a row by identity; anything needing a
+/// tid (DML, EvalPlanQual re-reads, index lookups) uses [`TableAm::scan`].
+pub type BatchStream = Box<dyn Iterator<Item = Result<RecordBatch, StorageError>> + Send>;
+
 /// Which of a relation's columns a scan actually needs.
 ///
 /// A columnar engine reads only the selected columns off disk; a row store
@@ -801,6 +821,40 @@ pub trait TableAm: Send + Sync {
     /// Fetch one version by tid if it is visible to `txn` — the re-read
     /// EvalPlanQual needs after a conflict, and a point lookup for indexes.
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError>;
+
+    /// Whether the engine can serve [`TableAm::scan_batches`]. The planner
+    /// consults this to decide whether a read can run vectorized, so it must
+    /// agree with what `scan_batches` actually does — the same discipline
+    /// [`TableAm::supports_index_scan`] enforces for index scans, and for the
+    /// same reason: `EXPLAIN` advertises the choice.
+    ///
+    /// The default is `false`. The durable heap engine stores rows, so
+    /// assembling batches from it would cost more than the vectorized operators
+    /// above could win back; it stays on the row path deliberately.
+    fn supports_batch_scan(&self) -> bool {
+        false
+    }
+
+    /// Scan as Arrow batches instead of tuples, for a vectorized pipeline.
+    ///
+    /// Same visibility contract as [`TableAm::scan`]: the engine judges every
+    /// row against `txn`'s snapshot before it reaches a batch, so a batch
+    /// contains exactly the rows the row scan would have produced, in the same
+    /// order. `projection` is the same performance hint, with the same rule
+    /// that unselected columns hold unspecified values — here, NULLs.
+    ///
+    /// `None` means "no batch path": the caller falls back to [`TableAm::scan`],
+    /// so a vectorized plan stays correct on every engine. Returning `None` here
+    /// while reporting `true` from [`TableAm::supports_batch_scan`] is a bug in
+    /// the engine, not a case the caller must handle gracefully — but the
+    /// fallback keeps it from being a wrong-results bug.
+    fn scan_batches(
+        &self,
+        _txn: &TxnContext,
+        _projection: &ColumnProjection,
+    ) -> Option<BatchStream> {
+        None
+    }
 
     /// Whether the engine can physically serve an equality index scan on
     /// `index_name` — i.e. whether [`TableAm::index_lookup`] would return `Some`
