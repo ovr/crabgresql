@@ -50,7 +50,7 @@ pub const W_C: u8 = 1 << 1;
 pub const W_D: u8 = 1 << 0;
 
 /// One node of the query tree.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Node {
     /// A lexeme, optionally a prefix match (`:*`) and/or weight-restricted
     /// (`:AB`). `weights == 0` means any weight.
@@ -71,7 +71,7 @@ pub enum Node {
 }
 
 /// A `tsquery`. An empty query (`''::tsquery`) has no root and matches nothing.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TsQuery {
     pub root: Option<Node>,
 }

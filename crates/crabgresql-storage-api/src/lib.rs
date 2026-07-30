@@ -914,6 +914,21 @@ pub trait TableEngine: Send + Sync {
     /// server exit. The default is a no-op (engines with no durable state).
     fn shutdown(&self) {}
 
+    /// Block until the engine is willing to accept more writes.
+    ///
+    /// An engine that acknowledges writes into RAM before making them durable
+    /// needs somewhere to say "not yet": without it, a writer that outruns the
+    /// background flush is bounded by nothing but the machine's memory. The
+    /// default is a no-op — an engine that writes through has no such window.
+    ///
+    /// **Must be called before the statement's transaction is built**, with no
+    /// XID allocated and no snapshot registered. An engine's remedy for
+    /// pressure is to reclaim rows nothing can still see, and a caller waiting
+    /// here while holding either one is part of the horizon that decides what
+    /// "nothing can still see" means — it would be waiting for a condition its
+    /// own waiting prevents.
+    fn await_write_capacity(&self) {}
+
     /// Remove a table and all its data from `namespace`. `TableNotFound` if it
     /// doesn't exist.
     fn drop_table(&self, namespace: &str, name: &str) -> Result<(), StorageError>;

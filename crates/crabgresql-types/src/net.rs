@@ -23,7 +23,7 @@ const DATA_EXCEPTION: &str = "22000";
 
 /// An `inet`/`cidr` value: family, 16-byte address (IPv4 in bytes 0..4), and
 /// masklen in bits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inet {
     pub is_ipv6: bool,
     pub addr: [u8; 16],

@@ -38,7 +38,7 @@ const DAYS_PER_YEAR: f64 = 365.25;
 
 /// An interval value: `months` and `days` are calendar counts, `usec` is the
 /// sub-day time in microseconds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Interval {
     pub months: i32,
     pub days: i32,

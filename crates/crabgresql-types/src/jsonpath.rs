@@ -40,7 +40,7 @@ const SINGLETON_JSON_ITEM_REQUIRED: &str = "22038";
 const MAX_DEPTH: usize = 200;
 
 /// A parsed `jsonpath` program: a mode flag plus the root expression.
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 pub struct JsonPath {
     strict: bool,
     expr: Node,
@@ -49,7 +49,7 @@ pub struct JsonPath {
 /// A node of the jsonpath expression tree. Value/path nodes evaluate to an
 /// SQL/JSON sequence; the boolean-predicate nodes (Compare/And/Or/Not/Exists/…)
 /// evaluate to a three-valued [`Ternary`].
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 enum Node {
     Root,
     Current,
@@ -94,7 +94,7 @@ enum Node {
     IsUnknown(Box<Node>),
 }
 
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 enum Accessor {
     /// `.key` or `."key"`.
     Key(String),
@@ -111,13 +111,13 @@ enum Accessor {
     Filter(Box<Node>),
 }
 
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 enum Subscript {
     Index(Node),
     Range(Node, Node),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Hash)]
 enum Method {
     Size,
     Type,
@@ -142,7 +142,7 @@ impl Method {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Hash)]
 enum ArithOp {
     Add,
     Sub,
@@ -163,7 +163,7 @@ impl ArithOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Hash)]
 enum CmpOp {
     Eq,
     Ne,

@@ -40,6 +40,7 @@ use crabgresql_txn::{
 };
 use crabgresql_types::Value;
 use crabgresql_types::datum::{decode_datum, encode_datum};
+use deepsize::DeepSizeOf;
 use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, Wal, WalError};
 
 /// Resource manager for buffer-table records. 10 is the heap, 11 the B-tree,
@@ -54,11 +55,6 @@ pub const BUFFER_DELETE: u8 = 2;
 /// Payload format version. Bumping it is how a layout change stays readable:
 /// redo rejects a version it does not know rather than misparsing it.
 const PAYLOAD_FORMAT: u8 = 1;
-
-/// Rough per-row overhead charged to the memory accounting on top of the encoded
-/// values: the `BufferRow` itself plus its `Vec` headers. Approximate by design —
-/// this feeds a flush threshold, not a correctness decision.
-const ROW_OVERHEAD_BYTES: usize = 64;
 
 fn corrupt(message: impl Into<String>) -> StorageError {
     StorageError::CorruptData(message.into())
@@ -76,9 +72,51 @@ struct BufferRow {
     row_id: u64,
     values: Tuple,
     hdr: TupleHeader,
-    /// Encoded size, charged to the table's byte accounting. Cached because the
-    /// flush thresholds read it far more often than rows change.
+    /// What this row occupies in RAM, charged to the table's byte accounting.
+    /// Cached because the flush thresholds read it far more often than rows
+    /// change. See [`BufferRow::new`] for what goes into it.
     bytes: usize,
+}
+
+impl BufferRow {
+    /// A row with its memory footprint already charged.
+    ///
+    /// The only way to build one, so a row cannot enter the table uncounted or
+    /// counted by a formula that has drifted from the other call site's. Takes
+    /// the `Tuple` by value because the charge depends on its *capacity*, which
+    /// a slice cannot see — and capacity is what the allocator was actually
+    /// asked for.
+    ///
+    /// The number feeds a memory budget an operator sets to bound RSS, so it
+    /// may be imprecise but must never be systematically low: a threshold that
+    /// admits several times the rows it was asked for is not a tuning
+    /// inaccuracy, it is a limit that does not limit. The term worth naming is
+    /// the tuple's — `size_of::<Value>()` is charged per *column*, however small
+    /// that column's type, because that is what a `Vec<Value>` costs.
+    ///
+    /// It is a floor rather than an exact figure: [`DeepSizeOf`] sums the
+    /// capacities a program asked the allocator for, and an allocator rounds
+    /// every request up to a granule and refuses to go below a minimum block,
+    /// so a row of many small strings really costs somewhat more than this.
+    fn new(row_id: u64, values: Tuple, hdr: TupleHeader) -> BufferRow {
+        let bytes = size_of::<BufferRow>() + tuple_heap_bytes(&values);
+        BufferRow {
+            row_id,
+            values,
+            hdr,
+            bytes,
+        }
+    }
+}
+
+/// What a tuple owns beyond the `Vec` header that sits inline in its holder.
+///
+/// [`DeepSizeOf::deep_size_of`] reports the header too, and the only way to ask
+/// for children alone needs a `deepsize::Context` the crate does not let a
+/// caller construct — so the header is subtracted back off here rather than
+/// double-counted against the [`BufferRow`] that already contains it.
+fn tuple_heap_bytes(values: &Tuple) -> usize {
+    values.deep_size_of() - size_of::<Tuple>()
 }
 
 /// A row recovered from the WAL, before its transaction's fate is known.
@@ -121,8 +159,11 @@ pub struct BufferTable {
     /// which preserves the ordering.
     rows: RwLock<Vec<BufferRow>>,
     next_row_id: AtomicU64,
-    /// Live encoded bytes, maintained incrementally so a flush scheduler can read
-    /// it without walking the rows.
+    /// Live resident bytes, maintained incrementally so a flush scheduler can
+    /// read it without walking the rows. Deliberately excludes this `Vec`'s own
+    /// growth slack: that is bounded and small next to the rows, but it changes
+    /// on every reallocation, and a term that moves over a row's lifetime
+    /// cannot live in a per-row charge that `vacuum` later subtracts.
     bytes: AtomicUsize,
     wal: Arc<Wal>,
     indexes: RwLock<Vec<IndexMetadata>>,
@@ -296,7 +337,8 @@ impl BufferTable {
             .count()
     }
 
-    /// Live encoded bytes. Cheap enough for a scheduler to poll.
+    /// Live resident bytes — what these rows cost in RAM, not what they would
+    /// cost serialized. Cheap enough for a scheduler to poll.
     pub fn resident_bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
     }
@@ -350,18 +392,17 @@ impl BufferTable {
             if row.hdr.xmax.is_valid() && clog.status(row.hdr.xmax) == XactStatus::Committed {
                 continue;
             }
-            let size = row_bytes(&row.values);
-            bytes += size;
-            rows.push(BufferRow {
-                row_id: row.row_id,
-                values: row.values,
+            let restored = BufferRow::new(
+                row.row_id,
+                row.values,
                 // A surviving row is live: its deleter, if any, aborted.
-                hdr: TupleHeader {
+                TupleHeader {
                     xmax: Xid::INVALID,
                     ..row.hdr
                 },
-                bytes: size,
-            });
+            );
+            bytes += restored.bytes;
+            rows.push(restored);
         }
         rows.sort_by_key(|row| row.row_id);
         self.bytes.store(bytes, Ordering::Relaxed);
@@ -454,14 +495,9 @@ impl BufferTable {
         let mut staged = Vec::with_capacity(tuples.len());
         let mut total = 0usize;
         for (offset, values) in tuples.into_iter().enumerate() {
-            let size = row_bytes(&values);
-            total += size;
-            staged.push(BufferRow {
-                row_id: first_row_id + offset as u64,
-                values,
-                hdr,
-                bytes: size,
-            });
+            let row = BufferRow::new(first_row_id + offset as u64, values, hdr);
+            total += row.bytes;
+            staged.push(row);
         }
 
         // Held from before the append until after `bytes` is published, because a
@@ -514,6 +550,11 @@ impl BufferTable {
     /// aborted or in-flight deleter leaves it live. Doing the check and the stamp
     /// under one write lock is the serialization point, so two concurrent
     /// deleters of the same row cannot both succeed.
+    ///
+    /// Deliberately does **not** credit the byte accounting. A stamped row is
+    /// still in `rows` and still occupying every byte it did before, so a
+    /// number that reports resident memory has to keep counting it; only
+    /// [`TableAm::vacuum`], which actually drops it, may subtract.
     fn stamp_deleted(&self, rel: u32, row_ids: &[u64], txn: &TxnContext) -> Vec<u64> {
         let mut stamped = Vec::with_capacity(row_ids.len());
         {
@@ -547,17 +588,6 @@ impl BufferTable {
         }
         stamped
     }
-}
-
-/// The encoded size of one row's values, plus fixed per-row overhead.
-fn row_bytes(values: &[Value]) -> usize {
-    let mut buf = Vec::new();
-    for value in values {
-        if !matches!(value, Value::Null) {
-            encode_datum(value, &mut buf);
-        }
-    }
-    buf.len() + ROW_OVERHEAD_BYTES
 }
 
 /// The largest `BUFFER_INSERT` payload emitted in one record.
@@ -1010,6 +1040,59 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant the accounting used to violate. A row's charge cannot be
+    /// less than the `Vec<Value>` it holds, because that memory is resident
+    /// whether or not the values in it are large — `size_of::<Value>()` is paid
+    /// per column, not per byte of payload. Measuring the *encoded* row instead
+    /// under-reported a 105-column ClickBench row roughly sevenfold.
+    #[test]
+    fn a_rows_charge_covers_its_value_spine() {
+        let hdr = TupleHeader::inserted(Xid::FIRST_NORMAL, CommandId::FIRST);
+        let values = row(1, "one");
+        let columns = values.len();
+        let charged = BufferRow::new(0, values, hdr).bytes;
+
+        let spine = size_of::<BufferRow>() + columns * size_of::<Value>();
+        assert!(
+            charged >= spine,
+            "charged {charged} for {columns} columns, but the spine alone is {spine}"
+        );
+    }
+
+    /// The same invariant at the shape that exposed it, bracketed from both
+    /// sides. The lower bound catches a regression back toward encoded size;
+    /// the upper bound catches the opposite mistake — charging each value its
+    /// inline `size_of::<Value>()` on top of the spine that already holds it
+    /// would add 56 bytes a column and blow the allowance.
+    #[test]
+    fn a_wide_row_is_charged_at_the_hits_shape() {
+        const COLUMNS: usize = 105;
+        const TEXTS: usize = 40;
+        const TEXT_LEN: usize = 24;
+
+        let mut values: Tuple = Vec::with_capacity(COLUMNS);
+        for column in 0..COLUMNS {
+            if column < TEXTS {
+                values.push(Value::Text("x".repeat(TEXT_LEN)));
+            } else {
+                values.push(Value::Int4(column as i32));
+            }
+        }
+        let hdr = TupleHeader::inserted(Xid::FIRST_NORMAL, CommandId::FIRST);
+        let charged = BufferRow::new(0, values, hdr).bytes;
+
+        let base = size_of::<BufferRow>() + COLUMNS * size_of::<Value>();
+        assert!(
+            charged >= base + TEXTS * TEXT_LEN,
+            "charged {charged}, below the {base} spine plus its text"
+        );
+        assert!(
+            charged < base + TEXTS * (TEXT_LEN + 48),
+            "charged {charged}, too far above the {base} spine plus its text — \
+             the spine is likely being counted twice"
+        );
+    }
+
     #[test]
     fn an_aborted_inserts_rows_are_invisible_and_vacuum_reclaims_them()
     -> anyhow::Result<()> {
@@ -1117,6 +1200,51 @@ mod tests {
             table.fetch(Tid::new(1, 1), &reader),
             Err(StorageError::CorruptData(_))
         ));
+        Ok(())
+    }
+
+    /// A restart must not change what the same rows are reported to cost, or a
+    /// relation's flush schedule would silently shift the moment the server
+    /// came back up.
+    ///
+    /// Exactness is available here because both sides allocate minimally — the
+    /// test builds its tuples with an exact capacity and `decode_row` uses
+    /// `Vec::with_capacity(n_cols)`. It deliberately stays on `int4`/`text`:
+    /// `numeric`, `jsonb` and `tsvector` are reconstructed by re-parsing their
+    /// canonical text on decode, so their capacities are the parser's and need
+    /// not match the producer's.
+    #[test]
+    fn a_restored_row_is_charged_what_the_insert_charged() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let charged_when_inserted;
+        {
+            let (wal, table) = open(dir.path())?;
+            let tm = manager(&wal);
+            let xid = tm.allocate_xid();
+            table.insert_many(
+                vec![row(1, "one"), row(2, "two"), row(3, "a rather longer label")],
+                &tm.context(xid, CommandId::FIRST),
+            )?;
+            tm.commit(xid)?;
+            charged_when_inserted = table.resident_bytes();
+            wal.flush(wal.current_lsn())?;
+        }
+
+        let redo = Arc::new(BufferRedo::new());
+        let mut registry = RmgrRegistry::new();
+        registry.register(RMGR_BUFFER, Arc::clone(&redo) as Arc<dyn RmgrRedo>);
+        let clog = Clog::new();
+        recover(dir.path(), &registry, &clog, crabgresql_wal::Lsn::INVALID)?;
+
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let table = BufferTable::open(7, schema("b"), Vec::new(), wal);
+        table.restore(redo.take(7).expect("replay must recover the relation"), &clog);
+
+        assert_eq!(
+            table.resident_bytes(),
+            charged_when_inserted,
+            "the same rows must cost the same before and after a restart"
+        );
         Ok(())
     }
 

@@ -45,7 +45,7 @@ const MAX_DEPTH: usize = 200;
 /// canonical [`Numeric`]s. These invariants make structural equality (`PartialEq`)
 /// and [`Hash`](std::hash::Hash) coincide with jsonb equality, and let [`cmp`]
 /// implement PG's total order.
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq, Hash)]
 pub enum Jsonb {
     Null,
     Bool(bool),

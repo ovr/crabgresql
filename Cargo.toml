@@ -33,6 +33,7 @@ arrow-array = "59.1"
 arrow-schema = "59.1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
+deepsize = "0.2"
 icu_collator = "2"
 icu_locale_core = "2"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }

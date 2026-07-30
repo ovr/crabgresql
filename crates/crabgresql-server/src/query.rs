@@ -940,6 +940,9 @@ pub fn execute_statement(
     // really does enter the body, so it needs the same runtime a bare call gets.
     let (routines, command_counter) =
         statement_runtime(&catalog, &type_catalog, global_catalog, session);
+    if is_write {
+        await_write_capacity(engine, session);
+    }
     // Every statement that reads takes a snapshot, EXPLAIN included: PG pins the
     // transaction snapshot for it, so inside a REPEATABLE READ block a plain
     // EXPLAIN freezes the view the rest of the block sees. That is why this runs
@@ -1154,6 +1157,23 @@ fn materialize(exec: Execution) -> Result<Execution, PgError> {
 /// the first write and reused, and the snapshot policy follows the isolation
 /// level (fresh per statement for READ COMMITTED, frozen once for REPEATABLE
 /// READ and above).
+/// Let the engine hold this statement back if its write buffers are full.
+///
+/// Must run before [`build_txn`], which is where a write allocates its XID: the
+/// engine relieves pressure by reclaiming rows no snapshot can still see, and
+/// the reclamation horizon is bounded by the oldest XID in flight. A waiter
+/// holding one would be waiting for a flush that its own wait makes impossible.
+///
+/// Which is also why an explicit transaction block is exempt. Inside `BEGIN`
+/// the XID is already allocated and outlives the statement, so there is no
+/// point in the block at which waiting is safe; such a session writes through
+/// and the flush worker catches up afterwards.
+fn await_write_capacity(engine: &Arc<dyn TableEngine>, session: &Session) {
+    if session.xact.is_none() {
+        engine.await_write_capacity();
+    }
+}
+
 fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool) -> TxnContext {
     // The connection's session-stable table-lock owner, stamped onto every
     // context so a transaction can upgrade its own AccessShare hold (an open
@@ -1333,6 +1353,7 @@ pub fn run_copy_insert(
     // the sequence and updates this session's currval/lastval, as INSERT does,
     // and the catalog snapshot bound at prepare time for the same reason.
     let read_only = read_only_active(session);
+    await_write_capacity(engine, session);
     let txn = build_txn(txnmgr, session, true);
     let (routines, command_counter) = statement_runtime(
         &prepared.engine,

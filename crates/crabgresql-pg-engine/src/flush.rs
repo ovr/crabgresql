@@ -20,13 +20,20 @@ use crabgresql_config as config;
 use crate::PgEngine;
 
 /// When a relation's buffered rows should become a durable chunk.
+///
+/// Both sizes are what the rows occupy in RAM, not what they would serialize
+/// to: these are memory budgets, and a budget measured in encoded bytes admits
+/// several times the rows an operator asked for.
 #[derive(Clone, Copy, Debug)]
 pub struct BufferFlushPolicy {
-    /// Per-relation size that makes a buffer flush-eligible on its own.
+    /// Per-relation resident size that makes a buffer flush-eligible on its own.
     pub table_soft_bytes: usize,
-    /// Total buffered bytes across all relations that makes *every* buffer
-    /// eligible, regardless of its own size. The backstop against many small
-    /// relations adding up to a memory problem no single one would trigger.
+    /// Total resident bytes across all relations that makes *every* buffer
+    /// eligible, regardless of its own size, and past which a writer waits for
+    /// the flush to catch up. The backstop against many small relations adding
+    /// up to a memory problem no single one would trigger — and, because it
+    /// blocks, the only one of these that actually bounds anything when the
+    /// writer outruns the flush.
     pub global_hard_bytes: usize,
     /// How long a buffer may hold rows before being flushed anyway, so a
     /// low-volume relation still becomes durable-as-a-file in bounded time.
@@ -78,6 +85,90 @@ pub struct BufferedRelation {
     /// except across a TRUNCATE, which empties the buffer anyway.
     pub rel: u32,
     pub bytes: usize,
+    /// Whether flushing this relation can actually return its memory. A
+    /// standalone `USING buffer` table has nowhere to flush to, so its bytes
+    /// are held until a snapshot releases them and no amount of flushing helps.
+    /// It is still worth vacuuming on age, so it stays in the list — but it
+    /// must not count toward a global total whose only remedy is a flush.
+    pub flushable: bool,
+}
+
+/// How long a writer will wait for the flush worker to make room before giving
+/// up and proceeding anyway.
+///
+/// Backpressure that cannot be escaped is a hang: a flush that fails for a
+/// reason retrying will not fix — a full disk, a permission change — would
+/// otherwise wedge every writing session for the life of the process. Letting
+/// the statement through instead trades the memory bound for liveness, which is
+/// the right way round for a bound that exists to protect against a slow flush
+/// rather than a broken one. The wait is long enough that a healthy flush
+/// finishes well inside it, so reaching the end is a real complaint.
+const WRITE_CAPACITY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether buffered rows are over the global limit, and a place for writers to
+/// wait until they are not.
+///
+/// The flag is written only by the flush worker, at the end of each pass, since
+/// a pass is the only thing that can change the answer downward. Writers only
+/// ever read it.
+#[derive(Default)]
+pub struct BufferPressure {
+    over_limit: Mutex<bool>,
+    relieved: Condvar,
+}
+
+impl BufferPressure {
+    /// Record what the last sweep saw, waking every waiting writer when the
+    /// buffers have come back under the limit.
+    pub fn set(&self, over_limit: bool) {
+        let Ok(mut flag) = self.over_limit.lock() else {
+            return;
+        };
+        *flag = over_limit;
+        if !over_limit {
+            self.relieved.notify_all();
+        }
+    }
+
+    /// What the last sweep found. For tests and diagnostics; a writer uses
+    /// [`BufferPressure::wait`], which cannot race between the check and the
+    /// wait.
+    pub fn is_over_limit(&self) -> bool {
+        self.over_limit.lock().map(|flag| *flag).unwrap_or_default()
+    }
+
+    /// Block while the buffers are over the limit, for at most
+    /// [`WRITE_CAPACITY_TIMEOUT`].
+    ///
+    /// The caller must hold no XID and no snapshot; see
+    /// [`TableEngine::await_write_capacity`](crabgresql_storage_api::TableEngine::await_write_capacity)
+    /// for why that is a correctness requirement and not just good manners.
+    pub fn wait(&self) {
+        let Ok(flag) = self.over_limit.lock() else {
+            return;
+        };
+        if !*flag {
+            return;
+        }
+        let waited = Instant::now();
+        let Ok((flag, timeout)) = self
+            .relieved
+            .wait_timeout_while(flag, WRITE_CAPACITY_TIMEOUT, |over| *over)
+        else {
+            return;
+        };
+        // Drop the guard before logging: a warning is not worth holding the
+        // lock the flush worker needs to clear the flag.
+        let still_over = *flag;
+        drop(flag);
+        if timeout.timed_out() && still_over {
+            tracing::warn!(
+                waited_ms = waited.elapsed().as_millis(),
+                "buffered writes are over the global limit and the flush has not \
+                 caught up; letting the statement through anyway"
+            );
+        }
+    }
 }
 
 /// Signals the worker to stop and lets `stop_and_join` wait for it.
@@ -180,7 +271,7 @@ fn sweep(
     // age clock over the next time it fills.
     waiting_since.retain(|rel, _| buffered.iter().any(|r| r.rel == *rel));
 
-    let total: usize = buffered.iter().map(|r| r.bytes).sum();
+    let total = flushable_bytes(&buffered);
     let now = Instant::now();
     for relation in buffered {
         let since = *waiting_since.entry(relation.rel).or_insert(now);
@@ -213,6 +304,27 @@ fn sweep(
             }
         }
     }
+
+    // Recomputed rather than decremented: what the flushes above actually
+    // returned is the number a blocked writer is waiting on, and a flush frees
+    // nothing while an older snapshot can still read the rows it copied.
+    engine
+        .buffer_pressure()
+        .set(flushable_bytes(&engine.buffered_relations()) >= policy.global_hard_bytes);
+}
+
+/// Buffered bytes a flush could actually return.
+///
+/// A standalone `USING buffer` relation is excluded: it has nowhere to flush
+/// to, so counting it would let one such table hold the global limit true
+/// forever — every Parquet relation force-flushed on every tick, and every
+/// writer waiting on a condition no flush can clear.
+fn flushable_bytes(buffered: &[BufferedRelation]) -> usize {
+    buffered
+        .iter()
+        .filter(|relation| relation.flushable)
+        .map(|relation| relation.bytes)
+        .sum()
 }
 
 #[cfg(test)]
@@ -363,6 +475,164 @@ mod tests {
             1,
             "the rows must still be buffered"
         );
+        Ok(())
+    }
+
+    /// Over the global limit a writer waits, and the flush that brings the
+    /// buffers back under it is what lets the writer through. Without this the
+    /// "hard" limit only decides when a flush *starts*, which bounds nothing
+    /// when the writer outruns the flush.
+    #[test]
+    fn a_writer_waits_while_the_buffers_are_over_the_global_limit() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (engine, tm, table) = wired_engine(dir.path())?;
+
+        let xid = tm.allocate_xid();
+        table.insert_many(
+            (0..4).map(|id| vec![Value::Int4(id)]).collect(),
+            &tm.context(xid, CommandId::FIRST),
+        )?;
+        tm.commit(xid)?;
+
+        // Assert the wait directly rather than racing the worker: with the flag
+        // set and nobody to clear it, `await_write_capacity` must not return
+        // promptly, and clearing it must wake the waiter.
+        engine.buffer_pressure().set(true);
+        let waiter = Arc::clone(&engine);
+        let released = std::thread::spawn(move || {
+            let started = Instant::now();
+            waiter.await_write_capacity();
+            started.elapsed()
+        });
+
+        // Long enough to distinguish "waited" from "returned immediately", short
+        // enough not to slow the suite.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!released.is_finished(), "the writer must still be waiting");
+        engine.buffer_pressure().set(false);
+
+        let waited = released.join().unwrap_or_else(|_| panic!("waiter panicked"));
+        assert!(
+            waited >= Duration::from_millis(200),
+            "the writer returned after {waited:?}, so it never waited"
+        );
+        assert!(
+            waited < WRITE_CAPACITY_TIMEOUT,
+            "the writer rode out the timeout instead of being woken"
+        );
+        Ok(())
+    }
+
+    /// The worker is what raises and lowers the flag, and it does so from what
+    /// a flush actually returned rather than from what it copied. A reader that
+    /// predates the flush holds the buffer copies back, so the memory really is
+    /// still in use and a writer really should wait — and once that reader is
+    /// gone, the next sweep reclaims and lets the writer through.
+    #[test]
+    fn the_sweep_raises_pressure_while_a_flush_cannot_reclaim() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (engine, tm, table) = wired_engine(dir.path())?;
+
+        let xid = tm.allocate_xid();
+        table.insert_many(
+            (0..16).map(|id| vec![Value::Int4(id)]).collect(),
+            &tm.context(xid, CommandId::FIRST),
+        )?;
+        tm.commit(xid)?;
+
+        // A snapshot older than the flush: its rows may be copied into a
+        // fragment, but the buffer's copies cannot be dropped while it lives.
+        let reader = tm.context(crabgresql_txn::Xid::INVALID, CommandId::FIRST);
+
+        let worker = FlushWorker::spawn(
+            Arc::downgrade(&engine),
+            BufferFlushPolicy {
+                table_soft_bytes: 1,
+                global_hard_bytes: 1,
+                max_age: Duration::from_secs(3600),
+                tick: Duration::from_millis(5),
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !engine.buffer_pressure().is_over_limit() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.buffer_pressure().is_over_limit(),
+            "rows a flush could not reclaim must keep the limit shut"
+        );
+
+        drop(reader);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.buffer_pressure().is_over_limit() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !engine.buffer_pressure().is_over_limit(),
+            "once nothing can read the copies, the next sweep must let writers through"
+        );
+
+        worker.stop_and_join();
+        Ok(())
+    }
+
+    /// A relation with nowhere to flush to must not drive the global limit. Its
+    /// bytes are real, but no flush can return them, so counting them would
+    /// stall every writer on a condition that can never clear — the one way
+    /// backpressure turns into a hang.
+    #[test]
+    fn a_relation_that_cannot_flush_does_not_hold_the_limit_shut() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (engine, tm, _parquet) = wired_engine(dir.path())?;
+
+        let mut schema = TableSchema::new("b", vec![Column::new("id", PgType::Int4)]);
+        schema.access_method = TableAccessMethod::Buffer;
+        // Engine-managed relations must declare their order, `buffer` included.
+        schema.sort_key = vec![crabgresql_storage_api::IndexKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }];
+        let standalone = engine.create_table(schema)?;
+
+        let xid = tm.allocate_xid();
+        standalone.insert_many(
+            (0..64).map(|id| vec![Value::Int4(id)]).collect(),
+            &tm.context(xid, CommandId::FIRST),
+        )?;
+        tm.commit(xid)?;
+
+        let buffered = engine.buffered_relations();
+        assert!(
+            buffered.iter().any(|relation| relation.name == "b"),
+            "an unflushable relation still belongs in the list, so it is vacuumed on age"
+        );
+        assert_eq!(
+            flushable_bytes(&buffered),
+            0,
+            "its bytes must not count toward a limit only a flush can relieve"
+        );
+
+        // End to end: a worker whose limit is one byte must still leave writers
+        // alone, because the only buffered rows are ones it cannot flush.
+        let worker = FlushWorker::spawn(
+            Arc::downgrade(&engine),
+            BufferFlushPolicy {
+                table_soft_bytes: usize::MAX,
+                global_hard_bytes: 1,
+                max_age: Duration::from_secs(3600),
+                tick: Duration::from_millis(5),
+            },
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        engine.await_write_capacity();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a writer must not wait on a relation no flush can relieve"
+        );
+        worker.stop_and_join();
         Ok(())
     }
 

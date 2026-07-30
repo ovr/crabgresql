@@ -101,6 +101,15 @@ the CRC-32C / Castagnoli polynomial that PostgreSQL documents for its WAL):
 licensed under Apache-2.0 OR MIT. It is an ordinary Cargo dependency, not
 vendored; no PostgreSQL source is involved.
 
+This product depends on the `deepsize` crate and its `deepsize_derive` proc
+macro (used by crabgresql-types to measure what a `Value` owns on the heap, and
+by crabgresql-buffer-engine to charge a buffered row against the write-buffer
+memory limits):
+
+  Copyright (c) 2020 Aeledfyr (github.com/Aeledfyr/deepsize)
+
+licensed under MIT. They are ordinary Cargo dependencies, not vendored.
+
 This product depends on the Apache Arrow Rust and Apache Parquet Rust crates
 (`arrow-array`, `arrow-schema`, and `parquet`), used by
 crates/crabgresql-parquet-engine for managed columnar table storage:

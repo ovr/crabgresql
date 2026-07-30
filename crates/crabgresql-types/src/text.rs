@@ -852,7 +852,7 @@ pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<boo
 /// Held as a parsed set rather than the literal text because PG re-emits it in
 /// a fixed order with duplicates collapsed, so `flag "qmi"` prints as
 /// `flag "imq"`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LikeRegexFlags {
     /// `i` — case-insensitive.
     pub icase: bool,

@@ -337,6 +337,13 @@ pub struct PgEngine {
     /// attached. Tests that build an engine by hand never attach one, so they get
     /// no thread and stay deterministic.
     flush_worker: Mutex<Option<crate::flush::FlushWorker>>,
+    /// Where writers wait when buffered rows are over the global limit, and
+    /// where the flush worker reports whether they still are.
+    ///
+    /// Stays unset — and so never blocks anyone — for an engine with no flush
+    /// worker: nothing would ever clear it, and a limit no flush can relieve
+    /// must not be allowed to stop writes.
+    buffer_pressure: Arc<crate::flush::BufferPressure>,
 }
 
 impl PgEngine {
@@ -468,6 +475,7 @@ impl PgEngine {
             txnmgr: std::sync::OnceLock::new(),
             clog: std::sync::OnceLock::new(),
             flush_worker: Mutex::new(None),
+            buffer_pressure: Arc::default(),
             tables: RwLock::new(tables),
             last_next_xid: AtomicU64::new(0),
             clamped: AtomicBool::new(false),
@@ -673,12 +681,12 @@ impl PgEngine {
                 // flush to, but `vacuum_table` still reclaims its dead versions —
                 // and without that its memory only ever grows, which is the exact
                 // failure this worker exists to prevent.
-                let (rel, bytes) = match table.as_ref() {
+                let (rel, bytes, flushable) = match table.as_ref() {
                     ManagedTable::Parquet(parquet) => {
-                        (parquet.relfilenode(), parquet.buffer().resident_bytes())
+                        (parquet.relfilenode(), parquet.buffer().resident_bytes(), true)
                     }
                     ManagedTable::Buffer(buffer) => {
-                        (buffer.relfilenode(), buffer.resident_bytes())
+                        (buffer.relfilenode(), buffer.resident_bytes(), false)
                     }
                     ManagedTable::Heap(_) => return None,
                 };
@@ -687,9 +695,16 @@ impl PgEngine {
                     name: name.clone(),
                     rel,
                     bytes,
+                    flushable,
                 })
             })
             .collect()
+    }
+
+    /// Where the flush worker publishes whether buffered rows are over the
+    /// global limit, and where writers wait for them not to be.
+    pub fn buffer_pressure(&self) -> &Arc<crate::flush::BufferPressure> {
+        &self.buffer_pressure
     }
 
     /// Flush one relation's buffer, choosing the reclamation horizon itself.
@@ -1523,6 +1538,10 @@ impl TableEngine for PgEngine {
         }
     }
 
+    fn await_write_capacity(&self) {
+        self.buffer_pressure.wait();
+    }
+
     fn shutdown(&self) {
         // Stop the background worker first, so no flush is mid-write while the
         // control file is being marked clean.
@@ -1534,6 +1553,9 @@ impl TableEngine for PgEngine {
         {
             worker.stop_and_join();
         }
+        // With the worker gone nothing can clear the flag again, so any writer
+        // still waiting on it would sit out the whole timeout during shutdown.
+        self.buffer_pressure.set(false);
         // Flush everything and mark the control file clean, so the next startup
         // keeps unlogged relations' data. The last checkpoint's next_xid is only a
         // floor; `write_control_file` raises it to the allocator's own high-water

@@ -130,7 +130,7 @@ pub mod oid {
     pub const REGNAMESPACE_ARRAY: u32 = 4090;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PgType {
     Bool,
     Int2,
@@ -228,7 +228,7 @@ pub enum PgType {
 /// only the three crabgresql can actually resolve are modeled. `regproc` in
 /// particular needs a `pg_proc` this build does not have, so `pg_type.typinput`
 /// and friends stay `text` in the catalog.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegKind {
     /// `regclass`: names a relation (table, view, sequence, index).
     Class,
@@ -282,7 +282,7 @@ impl RegKind {
 /// through different paths (resolved by a cast, or read back from disk) must
 /// still compare equal. Ordering and hashing agree — see `compare_values` and
 /// `hash_key` in the executor.
-#[derive(Clone, Debug)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug)]
 pub struct Reg {
     pub kind: RegKind,
     pub oid: u32,
@@ -807,7 +807,7 @@ pub fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -1060,11 +1060,156 @@ impl std::error::Error for tz::ZoneError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deepsize::DeepSizeOf;
 
     #[test]
     fn bool_encodes_as_t_f() {
         assert_eq!(Value::Bool(true).encode_text().as_deref(), Some("t"));
         assert_eq!(Value::Bool(false).encode_text().as_deref(), Some("f"));
+    }
+
+    /// Pins the derived [`DeepSizeOf`]: a variant with no allocation of its
+    /// own must report exactly the bytes it occupies in place. This is what
+    /// fails if a future variant smuggles in a `Vec`/`String`/`Box` without the
+    /// derive being able to see it, or if the derive is dropped from a payload
+    /// type and its heap silently stops being counted.
+    #[test]
+    fn an_inline_value_reports_only_itself() {
+        let inline = [
+            Value::Null,
+            Value::Bool(true),
+            Value::Int2(-1),
+            Value::Int4(0),
+            Value::Int8(i64::MAX),
+            Value::Float4(1.5),
+            Value::Float8(-0.0),
+            Value::Money(12345),
+            Value::Oid(1259),
+            Value::Date(-5),
+            Value::Time(1),
+            Value::TimeTz(TimeTz { usec: 1, zone: -3600 }),
+            Value::Timestamp(0),
+            Value::TimestampTz(i64::MIN),
+            Value::Interval(Interval { months: -13, days: 2, usec: -999 }),
+            Value::Uuid([9u8; 16]),
+            Value::Macaddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]),
+            Value::Macaddr8([0u8; 8]),
+            Value::Point([5.1, 34.5]),
+            Value::Lseg([1.0, 2.0, 3.0, 4.0]),
+        ];
+        for value in inline {
+            assert_eq!(
+                value.deep_size_of(),
+                size_of::<Value>(),
+                "{value:?} owns nothing beyond itself"
+            );
+        }
+        // A heap-*capable* variant that has not allocated is in the same
+        // position: an empty `Vec`/`String` never called the allocator.
+        assert_eq!(Value::Text(String::new()).deep_size_of(), size_of::<Value>());
+        assert_eq!(Value::Bytea(Vec::new()).deep_size_of(), size_of::<Value>());
+        assert_eq!(
+            Value::Array { elem: PgType::Int4, elems: Vec::new() }.deep_size_of(),
+            size_of::<Value>()
+        );
+    }
+
+    #[test]
+    fn every_heap_owning_variant_charges_its_payload() {
+        let cases: Vec<(Value, usize)> = vec![
+            (Value::Text("héllo world".into()), 12),
+            (Value::Json("{\"b\": 1,  \"a\": 2}".into()), 17),
+            (Value::Bytea(vec![0, 1, 2, 255]), 4),
+            (Value::Bit { len: 1000, data: vec![0xA5; 125] }, 125),
+            (
+                Value::Reg(Reg { kind: RegKind::Class, oid: 1259, name: "pg_class".into() }),
+                8,
+            ),
+            (
+                Value::Enum { type_oid: 16384, ordinal: 0, label: "red".into() },
+                3,
+            ),
+            (
+                Value::Numeric(Numeric::parse("123.456").expect("valid numeric")),
+                6,
+            ),
+            (
+                json::jsonb_in("{\"b\":1,\"a\":[1,2,3],\"k\":\"v\"}")
+                    .map(Value::Jsonb)
+                    .expect("valid jsonb"),
+                3,
+            ),
+            (
+                jsonpath::jsonpath_in("$.a[*] ? (@ > 3)")
+                    .map(Value::Jsonpath)
+                    .expect("valid jsonpath"),
+                1,
+            ),
+            (
+                tsvector::tsvector_in("'a':1A,3B 'b' 'c':16383")
+                    .map(Value::Tsvector)
+                    .expect("valid tsvector"),
+                3,
+            ),
+            (
+                tsquery::tsquery_in("'a':*AB <2> ( 'b' | !'c' )")
+                    .map(Value::Tsquery)
+                    .expect("valid tsquery"),
+                3,
+            ),
+            (
+                Value::Array {
+                    elem: PgType::Text,
+                    elems: vec![Value::Text("a".into()), Value::Text("b,c".into())],
+                },
+                2,
+            ),
+        ];
+        for (value, least) in cases {
+            let charged = value.deep_size_of();
+            let floor = size_of::<Value>() + least;
+            assert!(
+                charged >= floor,
+                "{value:?} charged {charged}, below the {floor} bytes it visibly holds"
+            );
+        }
+    }
+
+    /// The property a type missing its `DeepSizeOf` derive cannot fake. A
+    /// payload whose heap is not walked reports a constant, and a constant
+    /// cannot grow with the data.
+    #[test]
+    fn a_bigger_payload_is_charged_more() -> anyhow::Result<()> {
+        let small = Value::Text("x".repeat(10));
+        let big = Value::Text("x".repeat(1000));
+        assert!(big.deep_size_of() > small.deep_size_of());
+
+        let scalar = Value::Jsonb(json::jsonb_in("1")?);
+        let nested = Value::Jsonb(json::jsonb_in("{\"a\":[1,2,3],\"b\":{\"c\":\"d\"}}")?);
+        assert!(nested.deep_size_of() > scalar.deep_size_of());
+
+        let one_lexeme = Value::Tsvector(tsvector::tsvector_in("'a'")?);
+        let many = Value::Tsvector(tsvector::tsvector_in("'a':1,2,3 'b' 'c' 'd' 'e'")?);
+        assert!(many.deep_size_of() > one_lexeme.deep_size_of());
+
+        let leaf = Value::Tsquery(tsquery::tsquery_in("'a'")?);
+        let tree = Value::Tsquery(tsquery::tsquery_in("'a' & 'b' & ('c' | !'d')")?);
+        assert!(tree.deep_size_of() > leaf.deep_size_of());
+
+        let short_path = Value::Jsonpath(jsonpath::jsonpath_in("$")?);
+        let long_path = Value::Jsonpath(jsonpath::jsonpath_in("$.a.b.c[*] ? (@.x > 3 && @.y < 4)")?);
+        assert!(long_path.deep_size_of() > short_path.deep_size_of());
+
+        let one = Value::Array {
+            elem: PgType::Int4,
+            elems: vec![Value::Int4(1)],
+        };
+        let hundred = Value::Array {
+            elem: PgType::Int4,
+            elems: (0..100).map(Value::Int4).collect(),
+        };
+        assert!(hundred.deep_size_of() > one.deep_size_of());
+        Ok(())
     }
 
     #[test]

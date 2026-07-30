@@ -28,7 +28,7 @@ const MAX_NBASE_WEIGHT: i64 = 0x7FFF;
 /// matching PG's `NUMERIC_MIN_SIG_DIGITS`.
 const MIN_SIG_DIGITS: i32 = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 enum Sign {
     Pos,
     Neg,
@@ -38,7 +38,7 @@ enum Sign {
 }
 
 /// A `numeric` value. See the module docs for the representation invariant.
-#[derive(Clone, Debug)]
+#[derive(deepsize::DeepSizeOf, Clone, Debug)]
 pub struct Numeric {
     sign: Sign,
     /// Decimal weight of `digits[0]`; irrelevant (kept 0) when `digits` empty.

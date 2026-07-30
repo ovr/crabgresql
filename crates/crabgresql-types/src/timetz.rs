@@ -32,7 +32,7 @@ const USECS_PER_SEC: i64 = 1_000_000;
 
 /// A `time with time zone` value: local time-of-day plus a UTC offset held as
 /// seconds **west** of UTC (so a `-07:00` display offset is `zone == 25200`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeTz {
     pub usec: i64,
     pub zone: i32,

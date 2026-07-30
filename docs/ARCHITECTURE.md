@@ -287,7 +287,7 @@ chunk target         64 MiB of encoded Parquet bytes
 compression          Snappy initially; versioned per chunk
 partition spec       version plus current bounds/buckets
 schema version       physical-to-logical column mapping
-buffer limits        per-table soft/hard bytes and maximum row age
+buffer limits        per-table soft bytes, a global hard limit, maximum row age
 ```
 
 The default chunk target is **64 MiB compressed**. It is a soft target, not a
@@ -393,6 +393,32 @@ Buffer memory is accounted both per relation and globally by a
 partition; the global hard limit applies backpressure to new Parquet writes
 until jobs release memory. A maximum row age seals low-volume partitions even
 when byte thresholds are not reached.
+
+**What is implemented is a per-relation accounting and a single background
+sweep, not a `BufferTableManager`.** The accounting is a resident-byte figure —
+what the rows occupy in RAM, including `size_of::<Value>()` per column and each
+value's own allocations — because a threshold measured in *encoded* bytes
+under-reports a wide row several-fold and so admits several times the rows it
+was set to admit.
+
+Backpressure at the global limit is real: past it an autocommit write blocks
+until a sweep brings the total back under. Two constraints shape where that
+block can live, and both are load-bearing:
+
+- It must happen **before the statement allocates its transaction ID**. The
+  remedy for pressure is reclaiming rows no snapshot can still see, and the
+  reclamation horizon is bounded by the oldest transaction in flight — so a
+  waiter holding one is waiting for a flush its own wait prevents. For the same
+  reason a write inside an explicit `BEGIN` block does not wait at all: the
+  block's ID outlives the statement, so no point inside it is safe.
+- Only relations a flush could actually relieve count toward the total. A
+  standalone `USING buffer` relation has nowhere to flush to, so counting it
+  would hold the limit shut permanently.
+
+The bound is on the buffer, not on peak RSS: a flush additionally copies the
+visible rows, encodes them into Arrow, and holds the originals until a snapshot
+releases them, so draining a buffer costs a multiple of its size. Removing that
+copy is a known follow-up.
 
 ### 2.4 Write path, MVCC, and WAL
 

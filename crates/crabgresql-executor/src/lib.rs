@@ -1409,6 +1409,13 @@ fn execute_insert(
 /// Evaluate an INSERT's source into fully-formed, schema-order tuples. No
 /// validation or writing happens here; the caller does both after the whole
 /// source is consumed.
+///
+/// Each tuple is pre-sized and filled by hand rather than `collect`ed. The
+/// fallible-iterator shunt behind `collect::<Result<Vec<_>, _>>()` reports a
+/// lower size hint of zero, so the `Vec` grows geometrically and lands on the
+/// next power of two — 128 slots for a 105-column row. At `size_of::<Value>()`
+/// a slot that is dead weight in every tuple the statement produces, and for a
+/// buffered relation it stays resident until the rows are flushed.
 fn collect_insert_tuples(
     source: PhysicalInsertSource,
     ctx: &ExecContext,
@@ -1418,11 +1425,11 @@ fn collect_insert_tuples(
     match source {
         PhysicalInsertSource::Values(rows) => {
             for row in &rows {
-                tuples.push(
-                    row.iter()
-                        .map(|expr| eval(expr, &[], ctx))
-                        .collect::<Result<_, _>>()?,
-                );
+                let mut tuple = Tuple::with_capacity(row.len());
+                for expr in row {
+                    tuple.push(eval(expr, &[], ctx)?);
+                }
+                tuples.push(tuple);
             }
         }
         PhysicalInsertSource::Query { input, projections } => {
@@ -1433,12 +1440,11 @@ fn collect_insert_tuples(
                 ));
             };
             while let Some(row) = node.next()? {
-                tuples.push(
-                    projections
-                        .iter()
-                        .map(|expr| eval(expr, &row, ctx))
-                        .collect::<Result<_, _>>()?,
-                );
+                let mut tuple = Tuple::with_capacity(projections.len());
+                for expr in &projections {
+                    tuple.push(eval(expr, &row, ctx)?);
+                }
+                tuples.push(tuple);
             }
         }
     }
