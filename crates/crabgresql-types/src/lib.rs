@@ -12,6 +12,7 @@ pub mod collation;
 pub mod datum;
 pub mod date;
 pub mod float;
+pub mod footprint;
 pub mod geo;
 pub mod interval;
 pub mod json;
@@ -935,6 +936,66 @@ impl Value {
         }
     }
 
+    /// The bytes this value owns *outside* itself.
+    ///
+    /// Deliberately excludes the `size_of::<Value>()` the value occupies in
+    /// place. Whoever holds it — a `Vec<Value>` row, a jsonb object's entry
+    /// list — already paid for those bytes as part of its own allocation, so
+    /// counting them here would charge a wide row for its spine twice.
+    ///
+    /// Charged against `capacity`, not `len`: the point of the number is to
+    /// predict resident memory, and capacity is what the allocator was asked
+    /// for. A value built by a push loop can sit at twice its length.
+    ///
+    /// The match is exhaustive on purpose. A new variant that owns an
+    /// allocation must not be able to reach a buffer table's accounting through
+    /// a wildcard arm reporting zero — the same discipline [`Value::pg_type`]
+    /// and [`Value::encode_text_with`] enforce, which is why all three live
+    /// together.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            // Everything inline: a fixed-width payload, or none at all. Listed
+            // in declaration order so this arm can be diffed against the enum
+            // by eye.
+            Value::Null
+            | Value::Bool(_)
+            | Value::Int2(_)
+            | Value::Int4(_)
+            | Value::Int8(_)
+            | Value::Float4(_)
+            | Value::Float8(_)
+            | Value::Money(_)
+            | Value::Oid(_)
+            | Value::Date(_)
+            | Value::Time(_)
+            | Value::TimeTz(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_)
+            | Value::Interval(_)
+            | Value::Uuid(_)
+            | Value::Inet(_)
+            | Value::Cidr(_)
+            | Value::Macaddr(_)
+            | Value::Macaddr8(_)
+            | Value::Point(_)
+            | Value::Lseg(_) => 0,
+            Value::Numeric(n) => numeric::heap_bytes(n),
+            Value::Reg(r) => footprint::alloc_bytes(r.name.capacity()),
+            Value::Text(s) | Value::Json(s) => footprint::alloc_bytes(s.capacity()),
+            Value::Bytea(b) => footprint::slice_bytes::<u8>(b.capacity()),
+            Value::Bit { data, .. } => footprint::slice_bytes::<u8>(data.capacity()),
+            Value::Jsonb(j) => json::heap_bytes(j),
+            Value::Jsonpath(p) => jsonpath::heap_bytes(p),
+            Value::Tsvector(tv) => tsvector::heap_bytes(tv),
+            Value::Tsquery(q) => tsquery::heap_bytes(q),
+            Value::Enum { label, .. } => footprint::alloc_bytes(label.capacity()),
+            Value::Array { elems, .. } => {
+                footprint::slice_bytes::<Value>(elems.capacity())
+                    + elems.iter().map(Value::heap_bytes).sum::<usize>()
+            }
+        }
+    }
+
     /// Text-format encoding at the default `extra_float_digits` (1).
     pub fn encode_text(&self) -> Option<String> {
         self.encode_text_with(1)
@@ -1065,6 +1126,143 @@ mod tests {
     fn bool_encodes_as_t_f() {
         assert_eq!(Value::Bool(true).encode_text().as_deref(), Some("t"));
         assert_eq!(Value::Bool(false).encode_text().as_deref(), Some("f"));
+    }
+
+    /// Pins the contract: `heap_bytes` reports what a value owns *elsewhere*,
+    /// never the bytes it occupies in place. A `size_of::<Value>()` added
+    /// inside — which reads like a helpful correction — fails right here,
+    /// because it would charge every column of a wide row for its spine twice.
+    #[test]
+    fn an_inline_value_owns_no_heap() {
+        let inline = [
+            Value::Null,
+            Value::Bool(true),
+            Value::Int2(-1),
+            Value::Int4(0),
+            Value::Int8(i64::MAX),
+            Value::Float4(1.5),
+            Value::Float8(-0.0),
+            Value::Money(12345),
+            Value::Oid(1259),
+            Value::Date(-5),
+            Value::Time(1),
+            Value::TimeTz(TimeTz { usec: 1, zone: -3600 }),
+            Value::Timestamp(0),
+            Value::TimestampTz(i64::MIN),
+            Value::Interval(Interval { months: -13, days: 2, usec: -999 }),
+            Value::Uuid([9u8; 16]),
+            Value::Macaddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]),
+            Value::Macaddr8([0u8; 8]),
+            Value::Point([5.1, 34.5]),
+            Value::Lseg([1.0, 2.0, 3.0, 4.0]),
+        ];
+        for value in inline {
+            assert_eq!(value.heap_bytes(), 0, "{value:?} owns nothing");
+        }
+        // A heap-*capable* variant that has not allocated is in the same
+        // position: an empty `Vec`/`String` never called the allocator.
+        assert_eq!(Value::Text(String::new()).heap_bytes(), 0);
+        assert_eq!(Value::Bytea(Vec::new()).heap_bytes(), 0);
+        assert_eq!(
+            Value::Array { elem: PgType::Int4, elems: Vec::new() }.heap_bytes(),
+            0
+        );
+    }
+
+    #[test]
+    fn every_heap_owning_variant_charges_its_payload() {
+        let cases: Vec<(Value, usize)> = vec![
+            (Value::Text("héllo world".into()), 12),
+            (Value::Json("{\"b\": 1,  \"a\": 2}".into()), 17),
+            (Value::Bytea(vec![0, 1, 2, 255]), 4),
+            (Value::Bit { len: 1000, data: vec![0xA5; 125] }, 125),
+            (
+                Value::Reg(Reg { kind: RegKind::Class, oid: 1259, name: "pg_class".into() }),
+                8,
+            ),
+            (
+                Value::Enum { type_oid: 16384, ordinal: 0, label: "red".into() },
+                3,
+            ),
+            (
+                Value::Numeric(Numeric::parse("123.456").expect("valid numeric")),
+                6,
+            ),
+            (
+                json::jsonb_in("{\"b\":1,\"a\":[1,2,3],\"k\":\"v\"}")
+                    .map(Value::Jsonb)
+                    .expect("valid jsonb"),
+                3,
+            ),
+            (
+                jsonpath::jsonpath_in("$.a[*] ? (@ > 3)")
+                    .map(Value::Jsonpath)
+                    .expect("valid jsonpath"),
+                1,
+            ),
+            (
+                tsvector::tsvector_in("'a':1A,3B 'b' 'c':16383")
+                    .map(Value::Tsvector)
+                    .expect("valid tsvector"),
+                3,
+            ),
+            (
+                tsquery::tsquery_in("'a':*AB <2> ( 'b' | !'c' )")
+                    .map(Value::Tsquery)
+                    .expect("valid tsquery"),
+                3,
+            ),
+            (
+                Value::Array {
+                    elem: PgType::Text,
+                    elems: vec![Value::Text("a".into()), Value::Text("b,c".into())],
+                },
+                2,
+            ),
+        ];
+        for (value, least) in cases {
+            let charged = value.heap_bytes();
+            assert!(
+                charged >= least,
+                "{value:?} charged {charged}, below the {least} bytes it visibly holds"
+            );
+        }
+    }
+
+    /// The property a lazily-written `=> 0` arm cannot fake. An arm that
+    /// returns a constant passes the lower bounds above; it cannot pass this.
+    #[test]
+    fn a_bigger_payload_is_charged_more() -> anyhow::Result<()> {
+        let small = Value::Text("x".repeat(10));
+        let big = Value::Text("x".repeat(1000));
+        assert!(big.heap_bytes() > small.heap_bytes());
+
+        let scalar = Value::Jsonb(json::jsonb_in("1")?);
+        let nested = Value::Jsonb(json::jsonb_in("{\"a\":[1,2,3],\"b\":{\"c\":\"d\"}}")?);
+        assert!(nested.heap_bytes() > scalar.heap_bytes());
+
+        let one_lexeme = Value::Tsvector(tsvector::tsvector_in("'a'")?);
+        let many = Value::Tsvector(tsvector::tsvector_in("'a':1,2,3 'b' 'c' 'd' 'e'")?);
+        assert!(many.heap_bytes() > one_lexeme.heap_bytes());
+
+        let leaf = Value::Tsquery(tsquery::tsquery_in("'a'")?);
+        let tree = Value::Tsquery(tsquery::tsquery_in("'a' & 'b' & ('c' | !'d')")?);
+        assert!(tree.heap_bytes() > leaf.heap_bytes());
+
+        let short_path = Value::Jsonpath(jsonpath::jsonpath_in("$")?);
+        let long_path = Value::Jsonpath(jsonpath::jsonpath_in("$.a.b.c[*] ? (@.x > 3 && @.y < 4)")?);
+        assert!(long_path.heap_bytes() > short_path.heap_bytes());
+
+        let one = Value::Array {
+            elem: PgType::Int4,
+            elems: vec![Value::Int4(1)],
+        };
+        let hundred = Value::Array {
+            elem: PgType::Int4,
+            elems: (0..100).map(Value::Int4).collect(),
+        };
+        assert!(hundred.heap_bytes() > one.heap_bytes());
+        Ok(())
     }
 
     #[test]

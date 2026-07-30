@@ -76,6 +76,28 @@ pub struct TsQuery {
     pub root: Option<Node>,
 }
 
+/// What this query owns on the heap. The root node is stored inline in the
+/// `Option`, so only its *children* — which are boxed — are separate
+/// allocations; each box costs a whole `Node` plus whatever that node owns.
+pub fn heap_bytes(q: &TsQuery) -> usize {
+    fn node_bytes(node: &Node) -> usize {
+        match node {
+            Node::Val { word, .. } => crate::footprint::alloc_bytes(word.capacity()),
+            Node::Not(inner) => boxed_bytes(inner),
+            Node::And(left, right) | Node::Or(left, right) => {
+                boxed_bytes(left) + boxed_bytes(right)
+            }
+            Node::Phrase { left, right, .. } => boxed_bytes(left) + boxed_bytes(right),
+        }
+    }
+
+    fn boxed_bytes(node: &Node) -> usize {
+        crate::footprint::alloc_bytes(size_of::<Node>()) + node_bytes(node)
+    }
+
+    q.root.as_ref().map_or(0, node_bytes)
+}
+
 /// PG's wording when its parser stack fills; ours reports the same thing when a
 /// query nests deeper than we can safely walk.
 fn too_deep() -> TsError {

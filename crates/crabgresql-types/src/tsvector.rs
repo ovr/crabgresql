@@ -87,6 +87,21 @@ pub struct TsVector {
     pub lexemes: Vec<Lexeme>,
 }
 
+/// What this vector owns on the heap: the lexeme list, and per lexeme its word
+/// and its position list. Not to be confused with [`payload_size`], which models
+/// PostgreSQL's *on-disk* footprint because that is what orders two tsvectors.
+pub fn heap_bytes(tv: &TsVector) -> usize {
+    crate::footprint::slice_bytes::<Lexeme>(tv.lexemes.capacity())
+        + tv
+            .lexemes
+            .iter()
+            .map(|lexeme| {
+                crate::footprint::alloc_bytes(lexeme.word.capacity())
+                    + crate::footprint::slice_bytes::<Pos>(lexeme.positions.capacity())
+            })
+            .sum::<usize>()
+}
+
 /// The one weight-letter table. `D` is the weakest and `A` the strongest; every
 /// other weight lookup in this module is a thin wrapper over this, so the
 /// spellings accepted by input, `setweight` and `ts_filter` cannot drift apart.

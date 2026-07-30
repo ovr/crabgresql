@@ -1175,6 +1175,13 @@ impl Numeric {
     }
 }
 
+/// What this value owns on the heap. Lives here rather than with the other
+/// footprint walks because `digits` is private, and widening it just to be
+/// measured would be a worse trade than one function.
+pub fn heap_bytes(value: &Numeric) -> usize {
+    crate::footprint::slice_bytes::<u8>(value.digits.capacity())
+}
+
 /// ln(10) to at least `guard` fractional digits. The common transcendental
 /// calls (log10, exp, and power's non-integer path) request a modest guard, so
 /// ln(10) is computed once at a generous scale and cached; only an unusually
