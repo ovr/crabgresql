@@ -197,6 +197,13 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             sqlstate::FEATURE_NOT_SUPPORTED,
             "aggregate function called in a context that cannot accept one",
         )),
+        // Likewise for window markers: the binder rewrites every one to a
+        // `ColumnRef` into its `Window` node's output row, so one reaching
+        // scalar evaluation is a binder bug.
+        BoundExpr::WindowFunc { .. } => Err(ExecError::new(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "window function called in a context that cannot accept one",
+        )),
         // A *non-correlated* subquery marker is folded to a constant/comparison by
         // `resolve_subqueries` before any node evaluates an expression, so it never
         // reaches here. A *correlated* one is left in place — its value depends on

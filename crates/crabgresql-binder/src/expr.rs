@@ -23,7 +23,7 @@ use crabgresql_types::{
 };
 
 use crate::BindError;
-use crate::functions::{AggFn, ScalarFn, TableFn, bind_function, bind_srf_projection};
+use crate::functions::{AggFn, ScalarFn, TableFn, WindowFn, bind_function, bind_srf_projection};
 
 /// Shared, mutable parameter-inference state for one statement. A `$n`
 /// occurrence anywhere in the statement — target list, WHERE, a subquery, a CTE
@@ -354,6 +354,20 @@ pub enum BoundExpr {
         /// The aggregate's result type (see `agg_return_type`).
         ret: PgType,
     },
+    /// A window-function call (`rank() OVER (…)`, `sum(x) OVER w`). A transient
+    /// marker, exactly like [`BoundExpr::Aggregate`]: it may appear anywhere in
+    /// a target-list / ORDER BY / DISTINCT ON expression, but the binder
+    /// extracts every one into a [`crate::LogicalPlan::Window`] and rewrites the
+    /// marker to a `ColumnRef` into that node's output row before planning.
+    /// Evaluating it as a scalar is a bug (see `executor::eval`).
+    ///
+    /// `spec` decides which `Window` node the call lands on: calls sharing a
+    /// spec are computed by one node, over one sort of the input.
+    WindowFunc {
+        kind: WindowKind,
+        spec: Box<BoundWindowSpec>,
+        ret: PgType,
+    },
     /// A scalar subquery `(SELECT …)`: `subplan` yields exactly one column. A
     /// transient marker for non-correlated subqueries — the executor's
     /// `resolve_subqueries` pass runs the subplan once and folds this node to a
@@ -417,6 +431,108 @@ pub struct BoundAggregate {
     /// database default for a non-collatable `input_ty` or an argument with
     /// no collation of its own. Every other aggregate ignores this.
     pub collation: u32,
+}
+
+/// What a window call actually computes, once its `OVER` clause is stripped off.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WindowKind {
+    /// A dedicated window function, which reads only the row's position within
+    /// its partition.
+    Builtin { func: WindowFn, args: Vec<BoundExpr> },
+    /// An ordinary aggregate used as a window function (`sum(x) OVER (…)`).
+    /// Deliberately carries a [`BoundAggregate`] so the executor drives it with
+    /// the same accumulators as a grouped aggregate — that is what makes
+    /// `sum(x) OVER (…)` inherit `sum(x)`'s exact numeric, overflow and NULL
+    /// behavior rather than reimplementing it.
+    Aggregate(BoundAggregate),
+}
+
+impl WindowKind {
+    /// The call's per-row argument expressions, evaluated against the window
+    /// node's input row. Empty for `row_number()` and for `count(*) OVER (…)`.
+    pub fn args(&self) -> &[BoundExpr] {
+        match self {
+            WindowKind::Builtin { args, .. } => args,
+            WindowKind::Aggregate(agg) => &agg.args,
+        }
+    }
+
+    /// [`Self::args`], mutably.
+    pub fn args_mut(&mut self) -> &mut Vec<BoundExpr> {
+        match self {
+            WindowKind::Builtin { args, .. } => args,
+            WindowKind::Aggregate(agg) => &mut agg.args,
+        }
+    }
+}
+
+impl BoundWindowSpec {
+    /// Every expression the spec evaluates against the window node's input row,
+    /// partition keys first. The order matches [`Self::exprs_mut`], so the two
+    /// can be zipped.
+    pub fn exprs(&self) -> impl Iterator<Item = &BoundExpr> {
+        self.partition_by
+            .iter()
+            .chain(self.order_by.iter().map(|key| &key.expr))
+    }
+
+    /// [`Self::exprs`], mutably.
+    pub fn exprs_mut(&mut self) -> impl Iterator<Item = &mut BoundExpr> {
+        self.partition_by
+            .iter_mut()
+            .chain(self.order_by.iter_mut().map(|key| &mut key.expr))
+    }
+}
+
+/// One window call extracted from a query's expressions, occupying one slot of
+/// its [`crate::LogicalPlan::Window`] node's output row (after the input row).
+/// Produced by the binder's window-extraction pass from a
+/// [`BoundExpr::WindowFunc`] marker, which is where the spec is left behind.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundWindowFunc {
+    pub kind: WindowKind,
+    pub ret: PgType,
+    /// This call's absolute index in the window node's output row.
+    ///
+    /// Slots are numbered in the order the calls appear in the query, while the
+    /// chain evaluates specs in a different order (fewest keys last, so that the
+    /// output row order matches PG's). One node's slots are therefore not
+    /// contiguous, and each call has to carry its own.
+    pub slot: usize,
+}
+
+/// A bound `OVER (…)` clause: how the input is divided and ordered before the
+/// window calls under it are evaluated.
+///
+/// Rung 1 supports only the default frame (`RANGE BETWEEN UNBOUNDED PRECEDING
+/// AND CURRENT ROW`), so no frame is carried: with an `ORDER BY` the frame runs
+/// from the partition start through the current row's last peer, and without
+/// one it is the whole partition. An explicit non-default frame is refused at
+/// bind time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundWindowSpec {
+    /// Evaluated against the pre-window row. Rows sharing these values form one
+    /// partition; NULLs compare equal, so they group together.
+    pub partition_by: Vec<BoundExpr>,
+    /// The window's own `ORDER BY`. Rows equal on these keys are *peers*, which
+    /// is what `rank`/`dense_rank` and the default frame are defined in terms of.
+    pub order_by: Vec<WindowSortKey>,
+}
+
+/// One `ORDER BY` key of a window spec.
+///
+/// [`crate::SortKey`] cannot be reused: its `column` indexes an already-projected
+/// tuple, whereas these are expressions evaluated against the window node's
+/// input row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowSortKey {
+    pub expr: BoundExpr,
+    /// `expr.ty()`, carried so the executor never re-derives it.
+    pub ty: PgType,
+    /// The collation ordering this key; only meaningful for a string `ty`.
+    pub collation: u32,
+    pub asc: bool,
+    pub nulls_first: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,6 +630,7 @@ impl BoundExpr {
             BoundExpr::Case { ty, .. } => *ty,
             BoundExpr::Srf { ret, .. } => *ret,
             BoundExpr::Aggregate { ret, .. } => *ret,
+            BoundExpr::WindowFunc { ret, .. } => *ret,
             BoundExpr::ScalarSubquery { ty, .. } => *ty,
             BoundExpr::Exists { .. }
             | BoundExpr::QuantifiedSubquery { .. }
@@ -562,6 +679,7 @@ impl BoundExpr {
             | BoundExpr::Param { .. }
             | BoundExpr::OuterColumnRef { .. }
             | BoundExpr::Aggregate { .. }
+            | BoundExpr::WindowFunc { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. } => false,
         }
@@ -585,6 +703,10 @@ impl BoundExpr {
                 args.iter().any(BoundExpr::contains_routine)
             }
             BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_routine),
+            BoundExpr::WindowFunc { kind, spec, .. } => {
+                kind.args().iter().any(BoundExpr::contains_routine)
+                    || spec.exprs().any(BoundExpr::contains_routine)
+            }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_routine),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_routine() || index.contains_routine()
@@ -644,6 +766,15 @@ impl BoundExpr {
                     .any(|(c, r)| c.contains_aggregate() || r.contains_aggregate())
                     || else_.as_ref().is_some_and(|e| e.contains_aggregate())
             }
+            // A window call is not itself an aggregate — `sum(x) OVER ()` does
+            // not make the query an aggregate query. But its arguments and its
+            // OVER clause are ordinary expressions of *this* query level, so an
+            // aggregate in one does: `sum(sum(x)) OVER ()` is a window sum over
+            // a grouped sum, and PG accepts it.
+            BoundExpr::WindowFunc { kind, spec, .. } => {
+                kind.args().iter().any(BoundExpr::contains_aggregate)
+                    || spec.exprs().any(BoundExpr::contains_aggregate)
+            }
             // The needle (in `cmp`) is an outer expression, so an aggregate there
             // propagates; a subquery's own body is a separate query and doesn't.
             BoundExpr::QuantifiedSubquery { cmp, .. } => cmp.contains_aggregate(),
@@ -651,6 +782,55 @@ impl BoundExpr {
                 array.contains_aggregate() || cmp.contains_aggregate()
             }
             BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => false,
+        }
+    }
+
+    /// Whether this node itself is a window-call marker.
+    pub fn is_window(&self) -> bool {
+        matches!(self, BoundExpr::WindowFunc { .. })
+    }
+
+    /// Whether this expression tree contains a window-call marker anywhere,
+    /// including inside another window call's arguments or `OVER` clause (which
+    /// is how nesting is detected).
+    ///
+    /// A subquery's body is a separate query level and does not propagate: a
+    /// window inside `(SELECT rank() OVER () …)` belongs to that subquery.
+    pub fn contains_window(&self) -> bool {
+        match self {
+            BoundExpr::WindowFunc { .. } => true,
+            BoundExpr::Const { .. }
+            | BoundExpr::ColumnRef { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. }
+            | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::Exists { .. } => false,
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.contains_window(),
+            BoundExpr::Binary { left, right, .. } => {
+                left.contains_window() || right.contains_window()
+            }
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. }
+            | BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_window),
+            BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_window),
+            BoundExpr::Subscript { base, index, .. } => {
+                base.contains_window() || index.contains_window()
+            }
+            BoundExpr::Case { whens, else_, .. } => {
+                whens
+                    .iter()
+                    .any(|(c, r)| c.contains_window() || r.contains_window())
+                    || else_.as_ref().is_some_and(|e| e.contains_window())
+            }
+            BoundExpr::QuantifiedSubquery { cmp, .. } => cmp.contains_window(),
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.contains_window() || cmp.contains_window()
+            }
         }
     }
 
@@ -672,6 +852,10 @@ impl BoundExpr {
             // routine to VOLATILE, so treat every call as volatile.
             BoundExpr::Routine { .. } => true,
             BoundExpr::Srf { args, .. } => args.iter().any(BoundExpr::contains_volatile_fn),
+            BoundExpr::WindowFunc { kind, spec, .. } => {
+                kind.args().iter().any(BoundExpr::contains_volatile_fn)
+                    || spec.exprs().any(BoundExpr::contains_volatile_fn)
+            }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_volatile_fn),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_volatile_fn() || index.contains_volatile_fn()
@@ -746,6 +930,13 @@ impl BoundExpr {
             BoundExpr::Aggregate { args, .. } => {
                 args.iter().map(|a| a.count_param_refs(index)).sum()
             }
+            BoundExpr::WindowFunc { kind, spec, .. } => {
+                kind.args()
+                    .iter()
+                    .chain(spec.exprs())
+                    .map(|a| a.count_param_refs(index))
+                    .sum()
+            }
             BoundExpr::QuantifiedSubquery { cmp, .. } => {
                 cmp.count_param_refs(index)
             }
@@ -808,6 +999,13 @@ impl BoundExpr {
                 }
                 BoundExpr::Aggregate { args, .. } => {
                     args.iter().for_each(|a| fold(a, acc));
+                }
+                // The arguments and the OVER clause both read this row, so both
+                // widen the hull. A marker that survives to a caller of this is
+                // a binder bug; reporting the true hull keeps that bug from
+                // becoming a *wrong* relocation decision on top of a loud one.
+                BoundExpr::WindowFunc { kind, spec, .. } => {
+                    kind.args().iter().chain(spec.exprs()).for_each(|a| fold(a, acc));
                 }
                 // Non-correlated subplans reference no outer column; only the IN
                 // needle (in `cmp`) can. Scalar/EXISTS contribute nothing.
@@ -893,9 +1091,15 @@ impl BoundExpr {
                 array.collect_column_refs(out) && cmp.collect_column_refs(out)
             }
             // Carries a subplan whose body may be correlated — see above.
+            //
+            // A window marker refuses for a different reason: it is transient,
+            // so reaching here at all means the extraction pass missed it. Its
+            // results also live in slots this row does not have yet, so any
+            // answer would be a lie about a row shape that no longer applies.
             BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. }
-            | BoundExpr::QuantifiedSubquery { .. } => false,
+            | BoundExpr::QuantifiedSubquery { .. }
+            | BoundExpr::WindowFunc { .. } => false,
         }
     }
 
@@ -951,6 +1155,14 @@ impl BoundExpr {
             | BoundExpr::Srf { args, .. }
             | BoundExpr::Aggregate { args, .. } => {
                 args.iter_mut().for_each(|a| a.shift_column_refs(delta));
+            }
+            // Mirrors `column_ref_bounds`: the arguments and the OVER clause
+            // both index this row, so both move with it.
+            BoundExpr::WindowFunc { kind, spec, .. } => {
+                kind.args_mut()
+                    .iter_mut()
+                    .chain(spec.exprs_mut())
+                    .for_each(|a| a.shift_column_refs(delta));
             }
             BoundExpr::ArrayCtor { elems, .. } => {
                 elems.iter_mut().for_each(|e| e.shift_column_refs(delta));
@@ -1246,6 +1458,7 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
         // COALESCE/CASE over ColumnRefs; these never appear, so clone defensively.
         BoundExpr::Srf { .. }
         | BoundExpr::Aggregate { .. }
+        | BoundExpr::WindowFunc { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::QuantifiedSubquery { .. }
@@ -1287,6 +1500,11 @@ pub struct Scope {
     /// bound, if any. `None` for an ordinary statement, where a bare identifier
     /// can only be a column.
     func_params: Option<std::rc::Rc<FuncParams>>,
+    /// The `WINDOW w AS (…)` definitions of the SELECT being bound, by name, so
+    /// `OVER w` resolves. Held unbound: a definition is only bound when a call
+    /// actually references it, and merging (`OVER (w ORDER BY x)`) happens at
+    /// the AST level. `None` where a `WINDOW` clause cannot appear.
+    named_windows: Option<std::rc::Rc<std::collections::HashMap<String, ast::WindowSpec>>>,
 }
 
 /// The handle a [`Scope`] carries so `bind_expr` can bind a nested query. Shared
@@ -1325,6 +1543,7 @@ impl Scope {
             subquery: None,
             outer: Vec::new(),
             func_params: None,
+            named_windows: None,
         }
     }
 
@@ -1370,6 +1589,7 @@ impl Scope {
             subquery: None,
             outer: Vec::new(),
             func_params: None,
+            named_windows: None,
         }
     }
 
@@ -1413,6 +1633,7 @@ impl Scope {
             subquery: None,
             outer: Vec::new(),
             func_params: None,
+            named_windows: None,
         }
     }
 
@@ -1439,6 +1660,58 @@ impl Scope {
     pub(crate) fn with_outer(mut self, outer: Vec<OuterLevel>) -> Scope {
         self.outer = outer;
         self
+    }
+
+    /// Attach the SELECT's `WINDOW w AS (…)` definitions so `OVER w` resolves.
+    /// Set by the clause binders that bind a target list / ORDER BY, alongside
+    /// [`Scope::with_subqueries`].
+    pub(crate) fn with_named_windows(
+        mut self,
+        windows: &std::rc::Rc<std::collections::HashMap<String, ast::WindowSpec>>,
+    ) -> Scope {
+        self.named_windows = Some(windows.clone());
+        self
+    }
+
+    /// The `WINDOW` definition named `name`, if this scope has one.
+    pub(crate) fn named_window(&self, name: &str) -> Option<&ast::WindowSpec> {
+        self.named_windows.as_ref()?.get(name)
+    }
+
+    /// The width of the row this scope's `ColumnRef` indices address — the
+    /// concatenation of every relation in FROM order. `0` for a FROM-less
+    /// SELECT.
+    ///
+    /// Equals `JoinExpr::width()` for the same FROM clause. A `USING`/`NATURAL`
+    /// join's merged `visible` view does not change it: merged columns are
+    /// expressions over both sides' `ColumnRef`s in this same index space, not
+    /// extra columns.
+    pub fn width(&self) -> usize {
+        self.rels
+            .last()
+            .map_or(0, |rel| rel.offset + rel.columns.len())
+    }
+
+    /// The projection list that reproduces this scope's row unchanged:
+    /// `ColumnRef(0), …, ColumnRef(width-1)`.
+    ///
+    /// Built from `rels` rather than [`Scope::expand_wildcard`] because that
+    /// honors the merged `visible` view and so would drop a `USING` join's
+    /// duplicate column — this must be the *raw* row, since the expressions
+    /// layered above it index that row positionally.
+    pub fn identity_projection(&self) -> Vec<BoundExpr> {
+        self.rels
+            .iter()
+            .flat_map(|rel| {
+                rel.columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| BoundExpr::ColumnRef {
+                        index: rel.offset + i,
+                        ty: col.ty,
+                    })
+            })
+            .collect()
     }
 
     /// The outer-level views a subquery bound against this scope should see:
@@ -6467,6 +6740,38 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
                 .map(|a| inline_params(a, args))
                 .collect(),
             input_ty,
+            ret,
+        },
+        // A SQL function body cannot contain a window call (there is no query
+        // level for one to belong to), so this arm is unreachable in practice —
+        // it recurses rather than cloning so that if that ever changes, a `$n`
+        // in an argument or an OVER clause is still substituted.
+        BoundExpr::WindowFunc { kind, spec, ret } => BoundExpr::WindowFunc {
+            kind: match kind {
+                WindowKind::Builtin { func, args: call } => WindowKind::Builtin {
+                    func,
+                    args: call.into_iter().map(|a| inline_params(a, args)).collect(),
+                },
+                WindowKind::Aggregate(agg) => WindowKind::Aggregate(BoundAggregate {
+                    args: agg.args.into_iter().map(|a| inline_params(a, args)).collect(),
+                    ..agg
+                }),
+            },
+            spec: Box::new(BoundWindowSpec {
+                partition_by: spec
+                    .partition_by
+                    .into_iter()
+                    .map(|a| inline_params(a, args))
+                    .collect(),
+                order_by: spec
+                    .order_by
+                    .into_iter()
+                    .map(|key| WindowSortKey {
+                        expr: inline_params(key.expr, args),
+                        ..key
+                    })
+                    .collect(),
+            }),
             ret,
         },
         BoundExpr::ArrayCtor { elem, ty, elems } => BoundExpr::ArrayCtor {

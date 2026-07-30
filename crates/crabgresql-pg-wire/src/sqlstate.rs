@@ -34,6 +34,11 @@ pub const DUPLICATE_FUNCTION: &str = "42723";
 pub const CANNOT_COERCE: &str = "42846";
 pub const DATATYPE_MISMATCH: &str = "42804";
 pub const GROUPING_ERROR: &str = "42803";
+/// `42P20` — a window construct is used where one is not allowed (a window
+/// function in WHERE/GROUP BY/HAVING, a nested window call), or a window
+/// definition is itself invalid (a frame whose bounds are ordered backwards, a
+/// duplicate `WINDOW` name). The window analogue of [`GROUPING_ERROR`].
+pub const WINDOWING_ERROR: &str = "42P20";
 /// `42P22` — no collation could be derived for an expression, because two
 /// explicit `COLLATE` clauses conflict or two differently-collated inputs meet
 /// with equal precedence.

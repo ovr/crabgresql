@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{
-    BoundAggregate, BoundExpr, DistinctKey, JoinKind, LogicalPlan, Returning, SortKey, TableFn,
+    BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, DistinctKey, JoinKind, LogicalPlan,
+    Returning, SortKey, TableFn, WindowFn, WindowKind,
 };
 use crabgresql_planner::{
     HashKey, PhysicalAggInput, PhysicalInsertSource, PhysicalJoinExpr, PhysicalJoinInput,
@@ -31,6 +32,7 @@ use crabgresql_storage_api::{
     Tuple,
 };
 use crabgresql_txn::TxnContext;
+use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, Value};
 
 use eval::eval;
@@ -493,6 +495,34 @@ pub fn execute(
             };
             project_pipeline(node, projections, predicate, sort, distinct, columns, ctx)
         }
+        PhysicalPlan::Window {
+            source,
+            spec,
+            funcs,
+            input_width,
+            output_width,
+        } => {
+            let Execution::Rows { columns, node } = execute(*source, ctx, txn)? else {
+                return Err(ExecError::new(
+                    "XX000",
+                    "window source did not produce a row set",
+                ));
+            };
+            // A bare row source: the query's projection, ORDER BY and DISTINCT
+            // live on the `Subquery` the binder wrapped this chain in, and it
+            // supplies the real output columns — these are never surfaced.
+            Ok(Execution::Rows {
+                columns,
+                node: Box::new(WindowAgg::new(
+                    node,
+                    spec,
+                    funcs,
+                    input_width,
+                    output_width,
+                    ctx,
+                )?),
+            })
+        }
         PhysicalPlan::TableFunction {
             func,
             args,
@@ -655,6 +685,20 @@ fn resolve_subqueries(
             resolve_subqueries(source, ctx, txn)?;
             resolve_exprs(projections, ctx, txn)?;
             resolve_opt(predicate, ctx, txn)?;
+        }
+        PhysicalPlan::Window {
+            source,
+            spec,
+            funcs,
+            ..
+        } => {
+            resolve_subqueries(source, ctx, txn)?;
+            for expr in spec.exprs_mut() {
+                resolve_expr(expr, ctx, txn)?;
+            }
+            for func in funcs {
+                resolve_exprs(func.kind.args_mut(), ctx, txn)?;
+            }
         }
         PhysicalPlan::TableFunction {
             args,
@@ -845,6 +889,15 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
         }
         BoundExpr::Aggregate { args, .. } => {
             for a in args {
+                resolve_expr(a, ctx, txn)?;
+            }
+        }
+        // A window marker is extracted before planning, so this is unreachable
+        // for a *bound* plan — but the same walk runs over a `Window` node's own
+        // expressions, so recursing keeps a subquery in an argument or an OVER
+        // clause foldable rather than silently skipped.
+        BoundExpr::WindowFunc { kind, spec, .. } => {
+            for a in kind.args_mut().iter_mut().chain(spec.exprs_mut()) {
                 resolve_expr(a, ctx, txn)?;
             }
         }
@@ -2801,39 +2854,7 @@ impl Sort {
         }
         // Stable sort preserves input order for equal keys, as PG does for a
         // sort with no tiebreak.
-        rows.sort_by(|a, b| {
-            for key in &keys {
-                let (va, vb) = (&a[key.column], &b[key.column]);
-                // NULL placement follows nulls_first directly; only the value
-                // comparison is reversed for DESC. (Reversing the null branch
-                // too would flip NULLS FIRST/LAST for descending sorts.)
-                let ord = match (matches!(va, Value::Null), matches!(vb, Value::Null)) {
-                    (true, true) => Ordering::Equal,
-                    (true, false) => {
-                        if key.nulls_first {
-                            Ordering::Less
-                        } else {
-                            Ordering::Greater
-                        }
-                    }
-                    (false, true) => {
-                        if key.nulls_first {
-                            Ordering::Greater
-                        } else {
-                            Ordering::Less
-                        }
-                    }
-                    (false, false) => {
-                        let cmp = compare_values_collated(key.ty, va, vb, key.collation);
-                        if key.asc { cmp } else { cmp.reverse() }
-                    }
-                };
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            Ordering::Equal
-        });
+        rows.sort_by(|a, b| compare_rows(a, b, &keys));
         // Drop hidden sort-only columns so downstream (the wire layer, an outer
         // subquery) sees exactly the visible output width. Comparison above
         // already read them; they are no longer needed.
@@ -2850,6 +2871,43 @@ impl ExecNode for Sort {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
         Ok(self.rows.next())
     }
+}
+
+/// Order two rows by `keys`, the comparison behind every `ORDER BY` in the
+/// engine. Shared by [`Sort`] and [`WindowAgg`] so the window sort and the
+/// query's own can never disagree about where NULLs go.
+fn compare_rows(a: &Tuple, b: &Tuple, keys: &[SortKey]) -> Ordering {
+    for key in keys {
+        let (va, vb) = (&a[key.column], &b[key.column]);
+        // NULL placement follows nulls_first directly; only the value
+        // comparison is reversed for DESC. (Reversing the null branch
+        // too would flip NULLS FIRST/LAST for descending sorts.)
+        let ord = match (matches!(va, Value::Null), matches!(vb, Value::Null)) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if key.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if key.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                let cmp = compare_values_collated(key.ty, va, vb, key.collation);
+                if key.asc { cmp } else { cmp.reverse() }
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Materializing de-duplication for `SELECT DISTINCT` / `DISTINCT ON`. On the
@@ -3012,37 +3070,22 @@ impl Aggregate {
                 .zip(group.accumulators.iter_mut())
                 .zip(group.distinct_values.iter_mut())
             {
-                if agg.args.is_empty() {
-                    // COUNT(*) counts every row, skipping no NULLs.
-                    acc.count_row();
-                } else {
-                    // Evaluated into a small stack buffer, sized to the largest
-                    // aggregate arity (2, for `string_agg`), so the common
-                    // single-argument aggregates (sum/avg/min/max/count(expr))
-                    // don't pay a per-row Vec allocation.
-                    debug_assert!(agg.args.len() <= 2, "widen ARG_BUF for a >2-arg aggregate");
-                    let mut buf = [Value::Null, Value::Null];
-                    for (slot, arg) in buf.iter_mut().zip(agg.args.iter()) {
-                        *slot = eval(arg, &row, &self.ctx)?;
-                    }
-                    let values = &buf[..agg.args.len()];
-                    // Every aggregate but COUNT(*) ignores rows whose value (the
-                    // first argument) is NULL.
-                    if !matches!(values[0], Value::Null) {
-                        if distinct_values
-                            .as_mut()
-                            .is_none_or(|seen| seen.insert(&values[0]))
-                        {
-                            acc.accumulate(values)?;
-                        }
-                    }
+                // Evaluated into a small stack buffer, sized to the largest
+                // aggregate arity (2, for `string_agg`), so the common
+                // single-argument aggregates (sum/avg/min/max/count(expr))
+                // don't pay a per-row Vec allocation.
+                debug_assert!(agg.args.len() <= 2, "widen ARG_BUF for a >2-arg aggregate");
+                let mut buf = [Value::Null, Value::Null];
+                for (slot, arg) in buf.iter_mut().zip(agg.args.iter()) {
+                    *slot = eval(arg, &row, &self.ctx)?;
                 }
+                agg::feed(acc, agg, &buf[..agg.args.len()], distinct_values.as_mut())?;
             }
         }
         let mut out = Vec::with_capacity(groups.len());
         for group in groups {
             let mut tuple = group.key;
-            for acc in group.accumulators {
+            for acc in &group.accumulators {
                 tuple.push(acc.finalize()?);
             }
             out.push(tuple);
@@ -3061,6 +3104,221 @@ impl ExecNode for Aggregate {
             None => panic!("aggregate output was not initialized"),
         }
     }
+}
+
+/// One step of window-function evaluation: partition the input, order each
+/// partition, and fill this step's results into the slots the binder assigned.
+///
+/// Eagerly materializing, like [`Sort`] rather than [`Aggregate`] — the node *is*
+/// a sort plus a forward pass, and draining the child in `new()` lets it (and its
+/// buffer) drop before the next link of a chain builds, so peak memory stays at
+/// roughly two buffers instead of one per link.
+///
+/// **Rows come out in window-sort order, not input order.** That is PG's
+/// behavior: a window query with no `ORDER BY` of its own returns rows in the
+/// order of the last spec evaluated. The query's own `ORDER BY`, when it has one,
+/// runs above this node and re-sorts.
+///
+/// Only the default frame (`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`)
+/// is supported, which needs just two evaluation strategies, both O(n) per
+/// partition: with no `ORDER BY` every row is a peer of every other, so an
+/// aggregate is the whole-partition total; with one, the frame runs through the
+/// current row's last *peer*, so it is a running total that only advances at a
+/// peer-group boundary. Explicit frames are refused at bind time.
+pub struct WindowAgg {
+    rows: std::vec::IntoIter<Tuple>,
+}
+
+impl WindowAgg {
+    pub fn new(
+        mut child: Box<dyn ExecNode>,
+        spec: BoundWindowSpec,
+        funcs: Vec<BoundWindowFunc>,
+        input_width: usize,
+        output_width: usize,
+        ctx: &ExecContext,
+    ) -> Result<Self, ExecError> {
+        let mut rows: Vec<Tuple> = Vec::new();
+        while let Some(row) = child.next()? {
+            rows.push(row);
+        }
+
+        // Widen every row to the chain's full width. The bottom node of a chain
+        // finds rows `input_width` wide and pads them; the ones above find the
+        // padding already there and this is a no-op.
+        debug_assert!(
+            rows.iter()
+                .all(|row| row.len() == input_width || row.len() == output_width),
+            "a window step reads either the raw pre-window row or an already-widened one"
+        );
+        for row in &mut rows {
+            row.resize(output_width, Value::Null);
+        }
+
+        // Evaluate the spec's keys into hidden columns past the chain's slots, so
+        // the sort can address them by index and reuse `compare_rows` — the same
+        // resjunk trick the binder uses for an ORDER BY expression that is not in
+        // the select list. They are truncated away before the rows are handed on.
+        let mut keys = Vec::with_capacity(spec.partition_by.len() + spec.order_by.len());
+        for (offset, expr) in spec.partition_by.iter().enumerate() {
+            keys.push(SortKey {
+                column: output_width + offset,
+                ty: expr.ty(),
+                collation: DEFAULT_COLLATION_OID,
+                // Partitioning is grouping, not ordering: any consistent
+                // direction works, and ascending with NULLs last matches the
+                // order PG's partitions come out in.
+                asc: true,
+                nulls_first: false,
+            });
+        }
+        for (offset, key) in spec.order_by.iter().enumerate() {
+            keys.push(SortKey {
+                column: output_width + spec.partition_by.len() + offset,
+                ty: key.ty,
+                collation: key.collation,
+                asc: key.asc,
+                nulls_first: key.nulls_first,
+            });
+        }
+        for row in &mut rows {
+            for expr in spec.partition_by.iter().chain(spec.order_by.iter().map(|k| &k.expr)) {
+                let value = eval(expr, row, ctx)?;
+                row.push(value);
+            }
+        }
+        // Stable, so rows that tie on every key keep input order.
+        rows.sort_by(|a, b| compare_rows(a, b, &keys));
+
+        let partition_keys = &keys[..spec.partition_by.len()];
+        let order_keys = &keys[spec.partition_by.len()..];
+        let mut start = 0;
+        while start < rows.len() {
+            // The rows are sorted on the partition keys, so a partition is a run
+            // of adjacent equal rows and one comparison per row finds its end —
+            // no hashing, unlike `Aggregate`, whose input is unordered.
+            let mut end = start + 1;
+            while end < rows.len() && rows_match(&rows[end - 1], &rows[end], partition_keys) {
+                end += 1;
+            }
+            Self::fill_partition(&mut rows[start..end], order_keys, &funcs, ctx)?;
+            start = end;
+        }
+
+        for row in &mut rows {
+            row.truncate(output_width);
+        }
+        Ok(Self {
+            rows: rows.into_iter(),
+        })
+    }
+
+    /// Compute every window call over one partition, already sorted.
+    fn fill_partition(
+        rows: &mut [Tuple],
+        order_keys: &[SortKey],
+        funcs: &[BoundWindowFunc],
+        ctx: &ExecContext,
+    ) -> Result<(), ExecError> {
+        // Peer groups: maximal runs equal on the window's ORDER BY keys. With no
+        // ORDER BY the key list is empty and `rows_match` is vacuously true, so
+        // the whole partition is one peer group — which is exactly why `rank()
+        // OVER ()` is 1 everywhere and `sum(x) OVER ()` is the partition total.
+        // `peer_start[i]` is the index of the first row of `i`'s group, and
+        // `peer_group[i]` that group's 0-based ordinal.
+        let mut peer_start = Vec::with_capacity(rows.len());
+        let mut peer_group = Vec::with_capacity(rows.len());
+        for i in 0..rows.len() {
+            if i > 0 && rows_match(&rows[i - 1], &rows[i], order_keys) {
+                peer_start.push(peer_start[i - 1]);
+                peer_group.push(peer_group[i - 1]);
+            } else {
+                peer_start.push(i);
+                peer_group.push(if i == 0 { 0 } else { peer_group[i - 1] + 1 });
+            }
+        }
+
+        for func in funcs {
+            match &func.kind {
+                WindowKind::Builtin { func: builtin, .. } => {
+                    for i in 0..rows.len() {
+                        let value = match builtin {
+                            WindowFn::RowNumber => i as i64 + 1,
+                            WindowFn::Rank => peer_start[i] as i64 + 1,
+                            WindowFn::DenseRank => peer_group[i] as i64 + 1,
+                        };
+                        rows[i][func.slot] = Value::Int8(value);
+                    }
+                }
+                WindowKind::Aggregate(agg) => {
+                    Self::fill_aggregate(rows, &peer_start, agg, func.slot, ctx)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Accumulate one window aggregate across a sorted partition.
+    ///
+    /// The default frame ends at the current row's *last peer*, so every row of a
+    /// peer group sees the same frame and therefore the same value. Feeding rows
+    /// in order and only reading the running total once a group is complete gives
+    /// that in a single pass.
+    fn fill_aggregate(
+        rows: &mut [Tuple],
+        peer_start: &[usize],
+        agg: &BoundAggregate,
+        slot: usize,
+        ctx: &ExecContext,
+    ) -> Result<(), ExecError> {
+        debug_assert!(agg.args.len() <= 2, "widen ARG_BUF for a >2-arg aggregate");
+        let mut acc = agg::Accumulator::new(agg);
+        let mut group_start = 0;
+        for i in 0..=rows.len() {
+            // At a peer-group boundary (and at the end), the accumulator holds
+            // every row through the group that just closed: publish it to all of
+            // that group's rows.
+            if i == rows.len() || peer_start[i] != group_start {
+                let value = acc.finalize()?;
+                for row in &mut rows[group_start..i] {
+                    row[slot] = value.clone();
+                }
+                if i == rows.len() {
+                    break;
+                }
+                group_start = peer_start[i];
+            }
+            let mut buf = [Value::Null, Value::Null];
+            for (dest, arg) in buf.iter_mut().zip(agg.args.iter()) {
+                *dest = eval(arg, &rows[i], ctx)?;
+            }
+            agg::feed(&mut acc, agg, &buf[..agg.args.len()], None)?;
+        }
+        Ok(())
+    }
+}
+
+impl ExecNode for WindowAgg {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        Ok(self.rows.next())
+    }
+}
+
+/// Whether two rows are equal on every one of `keys` — the boundary test for
+/// both partitions and peer groups.
+///
+/// NULLs compare equal, so they group together, and equality is bytewise for
+/// strings: every supported collation is deterministic, so a collated comparison
+/// can only tie where the bytes already do. An empty `keys` makes every row match.
+fn rows_match(a: &Tuple, b: &Tuple, keys: &[SortKey]) -> bool {
+    keys.iter().all(|key| {
+        let (va, vb) = (&a[key.column], &b[key.column]);
+        match (va, vb) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            _ => compare_values(key.ty, va, vb) == Ordering::Equal,
+        }
+    })
 }
 
 /// Streaming LIMIT/OFFSET. Discards the first `remaining_offset` child tuples,

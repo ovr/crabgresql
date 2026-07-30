@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crabgresql_binder::{
-    AggInput, BinOp, BoundAggregate, BoundExpr, DistinctKey, InsertSource, JoinExpr, JoinInput,
-    JoinKind, LogicalPlan, OutputColumn, Returning, SortKey, TableFn,
+    AggInput, BinOp, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, DistinctKey,
+    InsertSource, JoinExpr, JoinInput, JoinKind, LogicalPlan, OutputColumn, Returning, SortKey,
+    TableFn,
 };
 use crabgresql_storage_api::{
     ColumnProjection, IndexConstraint, IndexMetadata, TableAm, TableSchema,
@@ -126,6 +127,18 @@ pub enum PhysicalPlan {
         columns: Vec<OutputColumn>,
         sort: Vec<SortKey>,
         distinct: Option<Vec<DistinctKey>>,
+    },
+    /// One step of window-function evaluation. Mirrors [`LogicalPlan::Window`]:
+    /// the executor materializes `source`, sorts it by `spec`'s partition keys
+    /// then its ORDER BY keys, and fills each of `funcs` into the slot it names.
+    /// A window query is planned as a [`Self::Subquery`] wrapping the chain, so
+    /// the standard projection/sort tail runs on top.
+    Window {
+        source: Box<PhysicalPlan>,
+        spec: BoundWindowSpec,
+        funcs: Vec<BoundWindowFunc>,
+        input_width: usize,
+        output_width: usize,
     },
     /// LIMIT/OFFSET above a source plan (after its sort). Mirrors
     /// [`LogicalPlan::Limit`].
@@ -593,6 +606,19 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             sort,
             distinct,
         },
+        LogicalPlan::Window {
+            source,
+            spec,
+            funcs,
+            input_width,
+            output_width,
+        } => PhysicalPlan::Window {
+            source: Box::new(lower(*source)),
+            spec,
+            funcs,
+            input_width,
+            output_width,
+        },
         LogicalPlan::TableFunction {
             func,
             args,
@@ -886,7 +912,8 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
                 && else_.as_ref().map_or(true, |e| is_row_constant(e))
         }
         // ColumnRef/Param reference per-row/per-execution state; FuncCall/Srf and
-        // a user routine may be volatile; Aggregate never appears in a bindable WHERE key. A subquery
+        // a user routine may be volatile; Aggregate and WindowFunc never appear in a
+        // bindable WHERE key. A subquery
         // is still an unresolved subplan at plan time, so never hoist it as a key.
         // An outer (correlated) reference is only a `Const` after `substitute_outer`
         // rewrites it per outer row; unresolved here it must not be hoisted as a
@@ -898,6 +925,7 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
         | BoundExpr::Routine { .. }
         | BoundExpr::Srf { .. }
         | BoundExpr::Aggregate { .. }
+        | BoundExpr::WindowFunc { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::QuantifiedSubquery { .. }
@@ -1025,6 +1053,25 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             }
             _ => vec!["Aggregate".to_string()],
         },
+        // PG renders one `WindowAgg` per spec with a `Window: wN AS (…)`
+        // property, numbering the specs in *evaluation* order — so the bottom
+        // node of a chain is `w1`. Numbering here is by depth for the same
+        // reason: `window_number` counts the `Window` nodes below this one.
+        PhysicalPlan::Window {
+            source, spec, ..
+        } => {
+            let mut lines = nest_under("WindowAgg", explain(source));
+            let names = source_column_names(source);
+            push_root_property(
+                &mut lines,
+                format!(
+                    "Window: w{} AS ({})",
+                    window_number(plan),
+                    explain_window_spec(spec, &names)
+                ),
+            );
+            lines
+        }
         PhysicalPlan::Limit { source, .. } => {
             let mut lines = vec!["Limit".to_string()];
             lines.extend(explain(source).into_iter().map(|l| format!("  {l}")));
@@ -1132,6 +1179,64 @@ fn schema_names(schema: &TableSchema) -> Vec<Option<&str>> {
 /// The column names of `plan`'s output row, for rendering an expression that
 /// indexes into it. Empty when the shape has no names to offer, which
 /// [`explain_expr`] renders as `$index`.
+/// This window step's 1-based position in its chain, counting from the bottom —
+/// the `N` in PG's `Window: wN AS (…)`, which numbers specs in evaluation order.
+fn window_number(plan: &PhysicalPlan) -> usize {
+    let mut node = plan;
+    let mut depth = 1;
+    while let PhysicalPlan::Window { source, .. } = node {
+        node = source;
+        depth += 1;
+    }
+    // `node` is now the first non-window plan, and `depth` counted this node
+    // plus every window below it, one too many.
+    depth - 1
+}
+
+/// Render an `OVER (…)` clause the way PG's `Window:` property does, omitting a
+/// clause that is absent. The frame is never printed: only the default frame is
+/// supported, and PG omits that one too.
+fn explain_window_spec(spec: &BoundWindowSpec, names: &[Option<&str>]) -> String {
+    let mut parts = Vec::new();
+    if !spec.partition_by.is_empty() {
+        parts.push(format!(
+            "PARTITION BY {}",
+            spec.partition_by
+                .iter()
+                .map(|e| explain_expr(e, names))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !spec.order_by.is_empty() {
+        parts.push(format!(
+            "ORDER BY {}",
+            spec.order_by
+                .iter()
+                .map(|key| {
+                    let mut rendered = explain_expr(&key.expr, names);
+                    if !key.asc {
+                        rendered.push_str(" DESC");
+                    }
+                    // PG prints the NULLS clause only when it is not the default
+                    // for the direction — last for ASC, first for DESC — which
+                    // is exactly when the two flags agree.
+                    if key.nulls_first == key.asc {
+                        rendered.push_str(if key.nulls_first {
+                            " NULLS FIRST"
+                        } else {
+                            " NULLS LAST"
+                        });
+                    }
+                    rendered
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    parts.join(" ")
+}
+
 fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<&str>> {
     match plan {
         PhysicalPlan::Append { columns, .. } => {
@@ -1140,6 +1245,11 @@ fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<&str>> {
         PhysicalPlan::Select { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
             schema_names(table.schema())
         }
+        // A window step reproduces its input row and appends slots, so the
+        // names below it still apply — and every spec in a chain reads that
+        // same row, so seeing through is what lets the upper `Window:` lines
+        // name their columns instead of falling back to `$n`.
+        PhysicalPlan::Window { source, .. } => source_column_names(source),
         _ => Vec::new(),
     }
 }
@@ -2638,6 +2748,79 @@ mod projection_tests {
     /// A hidden ORDER BY column lives in the inner node's `projections` past the
     /// visible width. The outer demand does not name it, so it survives only
     /// because `through_tail` folds the sort keys into the node's own demand.
+    #[test]
+    /// The window arm of the projection pass has to split the parent's demand at
+    /// `input_width`: a demanded *slot* is computed by the window node, not read
+    /// from below, so forwarding it would land past the source's own projection
+    /// width and trip `through_tail`'s fail-safe — silently reverting every
+    /// window query to reading all columns.
+    #[test]
+    fn a_window_query_still_prunes_the_columns_it_does_not_read() {
+        let plan = plan_sql("SELECT id, rank() OVER (ORDER BY name) FROM t");
+        let PhysicalPlan::Subquery { source, .. } = plan else {
+            panic!("expected a Subquery wrapping the window chain");
+        };
+        let PhysicalPlan::Window { source, .. } = *source else {
+            panic!("expected a Window");
+        };
+        let PhysicalPlan::Select { projection, .. } = *source else {
+            panic!("expected a Select");
+        };
+        assert_eq!(
+            cols(&projection),
+            Some(vec![0, 2]),
+            "`big` is read by neither the target list nor the OVER clause"
+        );
+    }
+
+    /// A partition key that is never projected still decides the partitions, so
+    /// it must survive pruning — the same rule the `Aggregate` arm applies to a
+    /// group key.
+    #[test]
+    fn a_window_partition_key_is_read_even_when_it_is_not_projected() {
+        let plan = plan_sql("SELECT rank() OVER (PARTITION BY big ORDER BY name) FROM t");
+        let PhysicalPlan::Subquery { source, .. } = plan else {
+            panic!("expected a Subquery wrapping the window chain");
+        };
+        let PhysicalPlan::Window { source, .. } = *source else {
+            panic!("expected a Window");
+        };
+        let PhysicalPlan::Select { projection, .. } = *source else {
+            panic!("expected a Select");
+        };
+        assert_eq!(cols(&projection), Some(vec![1, 2]));
+    }
+
+    /// PG evaluates the spec with the most keys first and the fewest last, and
+    /// numbers them `w1`, `w2`, … in that order — so `w1` is the bottom of the
+    /// chain. The order is observable: the last spec's sort is what a window
+    /// query with no ORDER BY of its own returns rows in.
+    #[test]
+    fn explain_nests_one_window_agg_per_spec_in_evaluation_order() {
+        let plan = plan_sql(
+            "SELECT rank() OVER (ORDER BY name), \
+             sum(big) OVER (PARTITION BY id ORDER BY name) FROM t",
+        );
+        assert_eq!(explain(&plan), [
+            "WindowAgg".to_string(),
+            "  Window: w2 AS (ORDER BY name)".to_string(),
+            "  ->  WindowAgg".to_string(),
+            "        Window: w1 AS (PARTITION BY id ORDER BY name)".to_string(),
+            "        ->  Seq Scan on t".to_string(),
+        ]);
+    }
+
+    /// A direction and NULL placement are printed only when they are not the
+    /// default for that direction, as PG does.
+    #[test]
+    fn explain_prints_only_non_default_window_sort_options() {
+        let plan = plan_sql("SELECT rank() OVER (ORDER BY name DESC, id NULLS FIRST) FROM t");
+        assert_eq!(
+            explain(&plan)[1],
+            "  Window: w1 AS (ORDER BY name DESC, id NULLS FIRST)"
+        );
+    }
+
     #[test]
     fn a_hidden_order_by_column_survives_threading() {
         let plan = plan_sql("SELECT id FROM (SELECT * FROM t) s ORDER BY name");

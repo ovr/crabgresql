@@ -2353,6 +2353,9 @@ impl fmt::Display for WindowSpec {
             } else {
                 write!(f, "{} {}", window_frame.units, window_frame.start_bound)?;
             }
+            if let Some(exclude) = &window_frame.exclude {
+                write!(f, " {exclude}")?;
+            }
         }
         Ok(())
     }
@@ -2375,7 +2378,9 @@ pub struct WindowFrame {
     /// indicates the shorthand form (e.g. `ROWS 1 PRECEDING`), which must
     /// behave the same as `end_bound = WindowFrameBound::CurrentRow`.
     pub end_bound: Option<WindowFrameBound>,
-    // TBD: EXCLUDE
+    /// The frame-exclusion clause, e.g. `EXCLUDE CURRENT ROW`. `None` is the
+    /// shorthand for `EXCLUDE NO OTHERS`, which excludes nothing.
+    pub exclude: Option<WindowFrameExclusion>,
 }
 
 impl Default for WindowFrame {
@@ -2387,7 +2392,35 @@ impl Default for WindowFrame {
             units: WindowFrameUnits::Range,
             start_bound: WindowFrameBound::Preceding(None),
             end_bound: None,
+            exclude: None,
         }
+    }
+}
+
+/// Which rows a window frame drops around the current row, e.g. the
+/// `EXCLUDE TIES` in `ROWS UNBOUNDED PRECEDING EXCLUDE TIES`.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum WindowFrameExclusion {
+    /// `EXCLUDE CURRENT ROW`
+    CurrentRow,
+    /// `EXCLUDE GROUP` — the current row and all its peers.
+    Group,
+    /// `EXCLUDE TIES` — the current row's peers, but not the row itself.
+    Ties,
+    /// `EXCLUDE NO OTHERS` — the explicit spelling of the default.
+    NoOthers,
+}
+
+impl fmt::Display for WindowFrameExclusion {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            WindowFrameExclusion::CurrentRow => "EXCLUDE CURRENT ROW",
+            WindowFrameExclusion::Group => "EXCLUDE GROUP",
+            WindowFrameExclusion::Ties => "EXCLUDE TIES",
+            WindowFrameExclusion::NoOthers => "EXCLUDE NO OTHERS",
+        })
     }
 }
 

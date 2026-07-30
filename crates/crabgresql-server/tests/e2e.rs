@@ -1848,6 +1848,64 @@ async fn select_distinct_deduplicates_rows() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Window functions over the wire: the values, and the types they are described
+/// as. `rank()` is `int8` and `sum(int4)` widens to `int8`, both of which a
+/// binary-format client decodes by the advertised OID — so getting one wrong is
+/// a protocol bug, not just a display one.
+#[tokio::test]
+async fn window_functions_over_a_table() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE w (dep text, sal integer)")
+        .await?;
+    client
+        .simple_query(
+            "INSERT INTO w VALUES ('a', 100), ('a', 200), ('a', 200), ('b', 300), ('b', 400)",
+        )
+        .await?;
+
+    // Ranking over ties: rank skips, dense_rank does not, row_number never ties.
+    let rows = client
+        .query(
+            "SELECT rank() OVER w, dense_rank() OVER w, row_number() OVER w \
+             FROM w WINDOW w AS (PARTITION BY dep ORDER BY sal) ORDER BY 1, 2, 3",
+            &[],
+        )
+        .await?;
+    let ranks: Vec<(i64, i64, i64)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(ranks, vec![
+        (1, 1, 1),
+        (1, 1, 1),
+        (2, 2, 2),
+        (2, 2, 2),
+        (2, 2, 3)
+    ]);
+
+    // The default frame runs through the current row's last peer, so the two
+    // rows tied at 200 share a running total of 500 rather than 300 and 500.
+    let rows = client
+        .query(
+            "SELECT sal, sum(sal) OVER (PARTITION BY dep ORDER BY sal) \
+             FROM w WHERE dep = 'a' ORDER BY sal",
+            &[],
+        )
+        .await?;
+    let running: Vec<(i32, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(running, vec![(100, 100), (200, 500), (200, 500)]);
+
+    // The advertised types: both counting and summing an int4 yield int8.
+    let rows = client
+        .query("SELECT rank() OVER (ORDER BY sal), sum(sal) OVER () FROM w", &[])
+        .await?;
+    assert_eq!(rows[0].columns()[0].type_(), &tokio_postgres::types::Type::INT8);
+    assert_eq!(rows[0].columns()[1].type_(), &tokio_postgres::types::Type::INT8);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn aggregates_over_a_table() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;

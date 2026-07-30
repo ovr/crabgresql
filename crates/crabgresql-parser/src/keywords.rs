@@ -747,6 +747,7 @@ define_keywords!(
     ORDINALITY,
     ORGANIZATION,
     OTHER,
+    OTHERS,
     OTP,
     OUT,
     OUTER,

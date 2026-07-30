@@ -57,3 +57,4 @@ test: tsvector
 test: tsquery
 test: analyze
 test: plpgsql
+test: window
