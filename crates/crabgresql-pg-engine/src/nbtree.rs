@@ -650,7 +650,7 @@ mod tests {
     };
     use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnFinalize};
     use crabgresql_types::{PgType, Value};
-    use crabgresql_wal::{Lsn, Wal};
+    use crabgresql_wal::Wal;
 
     use super::*;
     use crate::PgEngine;
@@ -686,7 +686,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let (engine, clog, next_xid) =
-            PgEngine::open_recovered(dir.path(), Arc::clone(&wal), Lsn::INVALID)?;
+            PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);

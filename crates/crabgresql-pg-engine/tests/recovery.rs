@@ -321,26 +321,51 @@ fn truncate_crash_then_truncate_again_commit_is_consistent() -> anyhow::Result<(
 
 // --- Corruption & checkpoint interactions ---
 
+/// A replay that reads a page must reject a corrupt one — and *when* that happens
+/// moved once replay became bounded.
+///
+/// Before, startup replayed the whole stream, pinned the page to check its LSN
+/// gate, and refused to start. Now a recovery resuming at the last checkpoint's
+/// redo point has nothing to replay into that page, so it never pins it and
+/// startup succeeds; `StorageManager::read` rejects the page at the first actual
+/// read instead. That later rejection is not asserted here because the heap scan
+/// path surfaces an I/O error as a panic rather than a `Result` (`heap::io`) —
+/// pre-existing, and a separate thing to fix.
 #[test]
-fn corrupted_data_page_fails_recovery_loudly() {
-    let dir = tempfile::tempdir().unwrap();
+fn a_corrupt_data_page_is_rejected_by_any_replay_that_reads_it() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
+        let (engine, tm) = open(dir.path())?;
         let table = seed_three(&engine, &tm);
         let _ = table;
         // Flush the rows to disk so the page carries a checksum we can break.
-        engine.checkpoint(Xid::FIRST_NORMAL).unwrap();
+        engine.checkpoint(Xid::FIRST_NORMAL)?;
     }
     // The first (and only) user table is relfilenode 1.
     corrupt_page_byte(dir.path(), RelFileNode(1), 0);
-    let err = match try_open(dir.path()) {
-        Ok(_) => panic!("recovery must reject a corrupt page, not succeed"),
-        Err(e) => e,
+
+    // A replay that does reach the records touching the page pins it and fails at
+    // startup, exactly as it always has.
+    let Err(err) = common::open_from(dir.path(), crabgresql_wal::Lsn::INVALID) else {
+        anyhow::bail!("a whole-stream replay must reject a corrupt page");
     };
     assert!(
         err.to_string().contains("checksum"),
-        "expected a checksum error, got: {err}"
+        "expected a checksum error at startup, got: {err}"
     );
+
+    // Production resumes at the redo point, replays nothing, and so never touches
+    // the page: startup is clean. Pinned deliberately — it is the behaviour change,
+    // and a future reader comparing this against the assertion above should see
+    // that the difference is which records replay reads, not whether corruption is
+    // detected.
+    let (engine, _tm) = try_open(dir.path())?;
+    assert!(
+        engine.open_table("t").is_ok(),
+        "a bounded replay does not read the page, so startup must succeed"
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -1070,5 +1095,178 @@ fn a_commit_below_the_redo_point_survives_a_bounded_replay() -> anyhow::Result<(
         vec![1, 2],
         "committed rows below the redo point must survive, and aborted ones must not"
     );
+    Ok(())
+}
+
+// --- Bounded replay in production ---
+
+/// The whole point of the change: production startup resumes at the redo point the
+/// last checkpoint published, so the WAL prefix below it is never read.
+///
+/// Note what the row assertion alone would *not* prove. The rows are already on
+/// disk — the checkpoint flushed them — so they survive even a replay that reads
+/// the scribbled prefix, decodes nothing, and reports an empty log. What gives that
+/// away is the log itself: `end_of_wal` would come back as `0`, `reset_to` would
+/// truncate the whole stream, and the file would be left shorter than the redo point
+/// it was supposed to resume from. So both are asserted.
+#[test]
+fn production_startup_resumes_from_the_recorded_redo_point() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm);
+        let _ = table;
+        // A clean shutdown checkpoints, which is where the redo point comes from.
+        TableEngine::shutdown(engine.as_ref());
+    }
+
+    let control = crabgresql_wal::read_control(dir.path())?.expect("a control file");
+    assert!(
+        control.redo_lsn.is_valid(),
+        "a heap-only cluster must publish a bounded redo point"
+    );
+    common::scribble(&common::wal_file_path(dir.path()), 0, control.redo_lsn.0, 0xAB)?;
+
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
+    let wal_len = std::fs::metadata(common::wal_file_path(dir.path()))?.len();
+    assert!(
+        wal_len > control.redo_lsn.0,
+        "the log was truncated to {wal_len}, below the redo point {} it should have \
+         resumed at — recovery read the prefix instead of skipping it",
+        control.redo_lsn
+    );
+
+    Ok(())
+}
+
+/// A crash after a bounded recovery must still recover. This is the case where a
+/// redo point published too high would show up: the second startup depends on the
+/// first one's checkpoint having flushed everything below its own redo point.
+#[test]
+fn a_crash_after_a_bounded_recovery_still_recovers_everything() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm);
+        let _ = table;
+        TableEngine::shutdown(engine.as_ref());
+    }
+    let first = crabgresql_wal::read_control(dir.path())?.expect("a control file");
+    common::scribble(&common::wal_file_path(dir.path()), 0, first.redo_lsn.0, 0xAB)?;
+    {
+        // Bounded startup, then more work, then a crash: dropped without a
+        // checkpoint, so only replay can bring the new rows back.
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.open_table("t")?;
+        let x = tm.allocate_xid();
+        insert(&*table, &tm.context(x, CommandId::FIRST), 4, "d");
+        tm.commit(x)?;
+    }
+
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
+    assert_eq!(
+        visible_ids(&tm, &*table),
+        vec![1, 2, 3, 4],
+        "rows from before and after the bounded recovery must all survive"
+    );
+
+    Ok(())
+}
+
+/// A committed TRUNCATE whose catalog write never landed is repaired from its WAL
+/// record — so a checkpoint must not bound replay above that record while the
+/// repair is still outstanding. `open_without_finalize` is exactly that window:
+/// the commit fsyncs and the CLOG is stamped, but the swap is never applied.
+#[test]
+fn a_checkpoint_does_not_bound_replay_over_an_unresolved_truncate() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm);
+        let _ = table;
+        TableEngine::shutdown(engine.as_ref());
+    }
+    {
+        let (engine, tm) = common::open_without_finalize(dir.path())?;
+        let table = engine.open_table("t")?;
+        let x = tm.allocate_xid();
+        table.truncate(&tm.context(x, CommandId::FIRST))?;
+        tm.commit(x)?;
+        engine.checkpoint(tm.snapshot().xmax)?;
+
+        let control = crabgresql_wal::read_control(dir.path())?.expect("a control file");
+        assert_eq!(
+            control.redo_lsn,
+            crabgresql_wal::Lsn::INVALID,
+            "a TRUNCATE whose swap is not in the catalog must keep replay unbounded"
+        );
+    }
+
+    // And the repair still happens, because the record is still replayed.
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
+    assert_eq!(
+        visible_ids(&tm, &*table),
+        Vec::<i32>::new(),
+        "the committed TRUNCATE must be reapplied from the WAL"
+    );
+
+    Ok(())
+}
+
+/// An unreadable control file costs a whole-stream replay, never data: recovery
+/// treats it as absent and rebuilds every floor from the log.
+#[test]
+fn an_unreadable_control_file_falls_back_to_a_whole_stream_replay() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm);
+        let _ = table;
+        TableEngine::shutdown(engine.as_ref());
+    }
+    common::flip_byte(&crabgresql_wal::control_path(dir.path()), 8);
+    assert_eq!(crabgresql_wal::read_control(dir.path())?, None);
+
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
+
+    Ok(())
+}
+
+/// A redo point past the end of the log must be refused loudly. Recovery would
+/// otherwise hand back `end_of_wal == start`, which the caller feeds to `reset_to`
+/// — truncating away every record above it while reporting a clean start.
+#[test]
+fn a_redo_point_past_the_end_of_the_log_refuses_to_start() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm);
+        let _ = table;
+        TableEngine::shutdown(engine.as_ref());
+    }
+    let wal_len = std::fs::metadata(common::wal_file_path(dir.path()))?.len();
+    let control = crabgresql_wal::read_control(dir.path())?.expect("a control file");
+    crabgresql_wal::write_control(
+        dir.path(),
+        &crabgresql_wal::ControlFile {
+            redo_lsn: crabgresql_wal::Lsn(wal_len + 1),
+            ..control
+        },
+    )?;
+
+    let Err(err) = try_open(dir.path()) else {
+        anyhow::bail!("a redo point past the end of the log must not start");
+    };
+    assert!(
+        err.to_string().contains("bytes"),
+        "the error should name the log length: {err}"
+    );
+
     Ok(())
 }

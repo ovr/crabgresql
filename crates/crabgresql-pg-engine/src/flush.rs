@@ -117,6 +117,13 @@ impl FlushWorker {
     /// WAL-durable and are rebuilt at the next startup, so a shutdown flush would
     /// buy nothing while making a clean exit slow and able to fail — at the
     /// moment the transaction service is being torn down.
+    ///
+    /// "Rebuilt at the next startup" costs something now that replay is bounded:
+    /// those rows are reachable only by replaying their records, so a checkpoint
+    /// with rows still resident cannot bound replay at all (see
+    /// `PgEngine::redo_floor`). Leaving them is still the right call here — the
+    /// alternative is a flush transaction during teardown — but that is why this
+    /// runs *before* the shutdown checkpoint samples anything.
     pub fn stop_and_join(mut self) {
         let (flag, condvar) = &*self.stop;
         match flag.lock() {
@@ -243,7 +250,7 @@ mod tests {
     ) -> anyhow::Result<(Arc<PgEngine>, Arc<TransactionManager>, Arc<dyn TableAm>)> {
         let wal = Arc::new(Wal::open(dir)?);
         let (engine, clog, next_xid) =
-            PgEngine::open_recovered(dir, Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)?;
+            PgEngine::open_recovered_from(dir, Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
@@ -366,7 +373,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let (engine, _clog, _next) =
-            PgEngine::open_recovered(dir.path(), Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)?;
+            PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
         let weak = Arc::downgrade(&engine);
         let worker = FlushWorker::spawn(weak.clone(), BufferFlushPolicy {
             tick: Duration::from_millis(5),

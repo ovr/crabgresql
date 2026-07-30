@@ -130,10 +130,25 @@ impl BufferPool {
         Ok(PinnedPage { pool: self, idx })
     }
 
-    /// Write every dirty page to disk (obeying the write-ahead rule) and fsync
-    /// each touched relation. Used by checkpoint / clean shutdown.
+    /// Write every dirty page to disk (obeying the write-ahead rule), then fsync
+    /// everything written since the last checkpoint. Used by checkpoint / clean
+    /// shutdown.
+    ///
+    /// The fsync pass covers what was *written*, not what this pass wrote. Those
+    /// differ: the clock sweep writes pages back at eviction too, and an evicted
+    /// frame keeps no record of what it held, so a relation whose pages were all
+    /// evicted before the checkpoint has nothing dirty here and would never be
+    /// fsynced. `StorageManager` tracks it instead — see its `pending_fsync`.
+    ///
+    /// Why an eviction racing this pass is still safe: fix a frame, and every
+    /// writer and eviction section on it is totally ordered against the moment
+    /// this loop holds its lock. A section before that moment registered its
+    /// fsync before the drain below, so it is covered. A section after it must
+    /// have re-dirtied a frame this loop had just cleaned, which takes a writer
+    /// whose WAL append is also after the checkpoint's redo sample — so its
+    /// record is replayed instead. (The argument runs on the *frame* lock: the
+    /// eviction path holds `map` across its write but this loop never takes it.)
     pub fn flush_all(&self) -> std::io::Result<()> {
-        let mut synced: Vec<RelFileNode> = Vec::new();
         for frame in &self.frames {
             let mut fr = frame.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
             if fr.dirty
@@ -145,15 +160,9 @@ impl BufferPool {
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
                 self.smgr.write(tag.rel, tag.block, &fr.data)?;
                 fr.dirty = false;
-                if !synced.contains(&tag.rel) {
-                    synced.push(tag.rel);
-                }
             }
         }
-        for rel in synced {
-            self.smgr.sync(rel)?;
-        }
-        Ok(())
+        self.smgr.sync_pending()
     }
 
     /// `pd_lsn` of every frame that is currently dirty, skipping never-stamped
@@ -181,6 +190,10 @@ impl BufferPool {
     /// clean and unmapped, hence reusable. (TRUNCATE remains non-transactional,
     /// as documented — this only removes the crash/aliasing.)
     pub fn forget_relation(&self, rel: RelFileNode) {
+        // "Do not write these pages back" and "do not fsync on their behalf" are
+        // the same intent; every caller here goes on to unlink or truncate the
+        // file. Defence in depth — `unlink`/`truncate` clear it too.
+        self.smgr.forget_pending_fsync(rel);
         let mut map = self.map.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         for frame in &self.frames {
             let mut fr = frame.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
@@ -248,6 +261,45 @@ mod tests {
         let smgr = Arc::new(StorageManager::open(dir.path())?);
         let wal = Arc::new(Wal::open(dir.path())?);
         Ok((dir, BufferPool::new(nframes, smgr, wal)))
+    }
+
+    /// The failure this pass exists to prevent: a relation whose pages were all
+    /// written back by *eviction* has nothing dirty left for the checkpoint to
+    /// notice, so a checkpoint that fsynced only what it wrote would never force
+    /// it to disk. Under bounded replay those page-cache writes have no second
+    /// chance — the records that would rebuild them sit below the redo point.
+    #[test]
+    fn a_relation_evicted_before_the_checkpoint_is_still_fsynced() -> anyhow::Result<()> {
+        let (_d, bp) = pool(2)?;
+        let victim = RelFileNode(1);
+        // Dirty both frames with `victim`'s pages.
+        for block in 0..2 {
+            let page = bp.pin(victim, block)?;
+            page.modify(|p| page::add_item(p, b"row"))
+                .ok_or_else(|| anyhow::anyhow!("row did not fit"))?;
+        }
+        // Churn a second relation through both frames, evicting every trace of
+        // `victim`: its pages are written but only into the page cache.
+        for block in 0..4 {
+            let page = bp.pin(RelFileNode(2), block)?;
+            page.modify(|p| page::add_item(p, b"other"))
+                .ok_or_else(|| anyhow::anyhow!("row did not fit"))?;
+        }
+        assert!(
+            !bp.frames.iter().any(|f| {
+                let fr = f.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+                fr.dirty && fr.tag.map(|t| t.rel) == Some(victim)
+            }),
+            "the victim must have no dirty frame left, or the test proves nothing"
+        );
+
+        bp.flush_all()?;
+        assert!(
+            !bp.smgr.fsync_pending(victim),
+            "the evicted relation was never fsynced by the checkpoint"
+        );
+
+        Ok(())
     }
 
     #[test]

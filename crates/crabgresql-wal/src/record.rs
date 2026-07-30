@@ -48,6 +48,8 @@ pub enum WalError {
     UnknownRmgr(u8),
     #[error("wal redo failed: {0}")]
     Redo(String),
+    #[error("cannot flush the wal to {target}: only {appended} bytes have been appended")]
+    FlushPastEnd { target: Lsn, appended: u64 },
 }
 
 /// One decoded WAL record, borrowing its payload from the replay buffer.

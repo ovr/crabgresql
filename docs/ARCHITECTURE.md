@@ -104,11 +104,21 @@ Contract with the core:
   COMMIT fsyncs the WAL up to its commit record. Recovery is **redo-only** (no
   undo — uncommitted versions are simply invisible and later vacuumed), replaying
   each record through its rmgr's LSN-gated redo handler.
-  Implemented in `crabgresql-wal` (+ the heap engine's redo). Deferred from the
-  first cut, all correct-but-unbounded/unoptimized without them: a durable SLRU
-  CLOG and checkpoint-bounded recovery (recovery currently replays the whole
-  WAL), full-page writes for torn-page protection beyond page checksums, and WAL
-  segment recycling.
+  A checkpoint samples a redo point, flushes pages and the commit log, and records
+  the redo point in `pg_control` (and in a `CHECKPOINT` record); recovery resumes
+  there rather than at the head of the stream. Its fsync pass covers every relation
+  *written* since the last checkpoint, not the ones it happened to find dirty: the
+  buffer pool also writes pages back at eviction, and an evicted frame no longer
+  says what it held, so the storage manager keeps the pending-fsync queue (as
+  PostgreSQL's `md.c` does). A checkpoint declines to bound
+  replay while any state's only durable trace is still a WAL record — rows in a RAM
+  write buffer, or a committed TRUNCATE whose swap the catalog does not name yet —
+  and records a whole-stream redo point instead.
+  Implemented in `crabgresql-wal` (+ the heap engine's redo). Still deferred, all
+  correct-but-unoptimized without them: a periodic checkpointer (checkpoints happen
+  at startup and clean shutdown only, so a crash still replays everything since the
+  process started), full-page writes for torn-page protection beyond page
+  checksums, and WAL segment recycling.
 - Syntactically, extensibility is exposed the standard PG way. Plain
   `CREATE TABLE` remains heap; `CREATE TABLE ... USING parquet ORDER BY (cols)`
   explicitly selects the columnar method and declares its layout order.
@@ -430,6 +440,13 @@ and the manifest generation containing those chunks is durable. Recovery
 replays records newer than the durable table watermark, reconstructs the buffer
 table, consults CLOG for visibility, and discards aborted rows. Replay is
 idempotent by logical row ID, buffer-batch ID, and publication watermark.
+
+The implemented form of that rule is coarser: no per-buffer LSN is tracked, so a
+checkpoint records a whole-stream redo point whenever *any* buffer still holds
+rows, and a bounded one only once every buffer is empty (`PgEngine::redo_floor`).
+Per-buffer minimum-LSN tracking, which would let a cluster with resident buffered
+rows still bound replay, is the refinement — and it is a change to that one
+function's body.
 
 ### 2.5 Sorted flush and atomic publication
 

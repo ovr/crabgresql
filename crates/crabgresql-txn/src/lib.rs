@@ -235,6 +235,17 @@ pub struct Clog {
     /// Every XID below this has been frozen out of every relation; its segment
     /// may be gone. Zero until a freeze sweep advances it.
     floor: AtomicU64,
+    /// The next XID the allocator would hand out, as last observed.
+    ///
+    /// It lives here rather than being read back from the [`TransactionManager`]
+    /// for the same reason the engine holds this commit log *strongly*: the
+    /// checkpoint that most needs a current floor is the one at a clean shutdown,
+    /// by which point the manager may already be gone. A checkpoint that recorded
+    /// a stale floor would be worse than useless once replay is bounded — a
+    /// bounded replay never sees the XIDs below its redo point, so this value is
+    /// their only remaining floor, and too low a floor means reissuing an XID
+    /// already stamped on committed tuples.
+    next_xid: AtomicU64,
     /// The resident-page index: a fixed spine of lazily allocated [`Chunk`]s.
     ///
     /// Two levels rather than one flat array so that an empty commit log costs
@@ -265,6 +276,7 @@ impl Default for Clog {
             // Xid has no Default, and shouldn't: INVALID is the meaningful zero
             // here, not an arbitrary one.
             floor: AtomicU64::new(Xid::INVALID.0),
+            next_xid: AtomicU64::new(Xid::FIRST_NORMAL.0),
             spine: (0..INDEX_CHUNKS)
                 .map(|_| std::sync::OnceLock::new())
                 .collect(),
@@ -308,6 +320,17 @@ impl Clog {
             floor: AtomicU64::new(floor.0),
             ..Clog::default()
         })
+    }
+
+    /// Raise the recorded XID floor to `next`. Monotonic, so a late-arriving lower
+    /// observation cannot walk it back.
+    pub fn observe_next_xid(&self, next: Xid) {
+        self.next_xid.fetch_max(next.0, Ordering::Relaxed);
+    }
+
+    /// The next XID to hand out, for a checkpoint to record as its floor.
+    pub fn next_xid_floor(&self) -> Xid {
+        Xid(self.next_xid.load(Ordering::Relaxed))
     }
 
     /// Record an I/O error the caller has no way to return. The first one wins:
@@ -447,6 +470,12 @@ impl Clog {
     /// orders anything against [`CommitSink::log_commit`] returning, so a commit can
     /// always land in the commit log just after the checkpoint has read that byte,
     /// and replay is what covers it either way.
+    ///
+    /// "Replay covers it" is what [`CommitSink::delay_checkpoint`] keeps true now
+    /// that replay is bounded. A commit is either stamped before the checkpoint
+    /// sampled its redo point — so its bit is in this image — or its record sits
+    /// above that redo point and is replayed. The barrier is what excludes the third
+    /// case: sampled above the record, stamped after this walk read the byte.
     pub fn flush(&self) -> std::io::Result<()> {
         // Held for the whole call. See the field's documentation.
         let _flushing = self
@@ -817,6 +846,24 @@ pub fn satisfies_mvcc(
 pub trait CommitSink: Send + Sync {
     fn log_commit(&self, xid: Xid) -> std::io::Result<()>;
     fn log_abort(&self, xid: Xid);
+
+    /// Hold off anything that would sample a redo point until the returned token
+    /// is dropped, so a transaction's record and the [`Clog`] bit deciding its
+    /// fate become visible to that sample *together*.
+    ///
+    /// Without it, a checkpointer can sample a redo point above a commit record
+    /// whose CLOG bit has not been set yet, write a commit-log image that still
+    /// reads `InProgress`, and publish that pair. A bounded replay then starts
+    /// above the commit record and never learns the fate: an acknowledged
+    /// commit's rows are invisible forever.
+    ///
+    /// The token is opaque because the guard it wraps lives in `crabgresql-wal`,
+    /// which depends on this crate — the seam only has to carry "released on
+    /// drop", not the guard's identity. `None` when the sink has no checkpointer
+    /// to hold off, which is why this defaults: an in-memory sink needs nothing.
+    fn delay_checkpoint(&self) -> Option<Box<dyn Send + '_>> {
+        None
+    }
 }
 
 /// A callback the engine registers so it can apply deferred physical work when a
@@ -914,6 +961,10 @@ impl TransactionManager {
     /// [`CommitSink`], reuse the CLOG recovery rebuilt, and seed the XID
     /// allocator above every recovered transaction.
     pub fn new_recovered(sink: Arc<dyn CommitSink>, clog: Arc<Clog>, next_xid: Xid) -> Self {
+        // Seed the checkpoint's floor with the recovered one, so a cluster that
+        // starts and stops without allocating anything still records a floor no
+        // lower than the one it recovered.
+        clog.observe_next_xid(next_xid);
         TransactionManager {
             xids: XidManager::with_next(next_xid),
             clog,
@@ -946,7 +997,13 @@ impl TransactionManager {
     /// Assign a fresh XID and mark it running. Called on a transaction's first
     /// write.
     pub fn allocate_xid(&self) -> Xid {
-        self.xids.allocate()
+        let xid = self.xids.allocate();
+        // Publish the floor where a checkpoint can still reach it. At *allocation*,
+        // not at commit: an XID stamps tuples the moment its transaction writes, so
+        // one that crashed in flight must never be reissued either — the reissued
+        // XID would make the old transaction's rows visible the moment it commits.
+        self.clog.observe_next_xid(Xid(xid.0 + 1));
+        xid
     }
 
     /// Register `snapshot` as in use until the returned guard drops, pinning
@@ -1034,6 +1091,11 @@ impl TransactionManager {
     /// durable. Returns the I/O error if the WAL flush fails.
     pub fn commit(&self, xid: Xid) -> std::io::Result<()> {
         if xid.is_valid() {
+            // Taken BEFORE the append, not merely around the CLOG update: a redo
+            // point is sampled from the *staged* insert position, so a sampler can
+            // already be above a record that has not been flushed. Released once
+            // the CLOG carries the fate, below.
+            let delay = self.sink.as_ref().and_then(|sink| sink.delay_checkpoint());
             if let Some(sink) = &self.sink
                 && let Err(e) = sink.log_commit(xid)
             {
@@ -1041,10 +1103,15 @@ impl TransactionManager {
                 // transaction so its XID is retired (otherwise it stays in the
                 // in-flight set forever, pinning the snapshot xmin horizon) and
                 // its versions become dead. Then surface the I/O error.
+                drop(delay);
                 self.abort(xid);
                 return Err(e);
             }
             self.clog.set_committed(xid);
+            // The record and its fate are now inseparable to any sampler. Dropped
+            // before the steps below, which take engine locks and do file I/O — a
+            // checkpoint must not wait on those.
+            drop(delay);
             self.xids.complete(xid);
             // Fire the engine hook only after the fate is durable (the WAL commit
             // fsynced above) and recorded in the CLOG, so it can apply the
@@ -1062,10 +1129,18 @@ impl TransactionManager {
     /// from a crash before commit, and both leave the versions invisible.
     pub fn abort(&self, xid: Xid) {
         if xid.is_valid() {
+            // Same window as `commit`, milder symptom: an abort record below a
+            // published redo point whose `Aborted` bit missed the commit-log image
+            // leaves the XID `InProgress` forever. Rows it *wrote* are invisible
+            // either way, but a row it *deleted* keeps an in-progress `xmax`, which
+            // no later transaction can stamp — visible, and permanently immune to
+            // `UPDATE` and `DELETE`.
+            let delay = self.sink.as_ref().and_then(|sink| sink.delay_checkpoint());
             if let Some(sink) = &self.sink {
                 sink.log_abort(xid);
             }
             self.clog.set_aborted(xid);
+            drop(delay);
             self.xids.complete(xid);
             // Discard the transaction's uncommitted physical work (a pending
             // TRUNCATE's new file) and release any table lock it held.
@@ -1083,10 +1158,29 @@ impl TransactionManager {
     /// reclaimed by the engine's orphan GC at the next startup.
     pub fn abort_without_finalize(&self, xid: Xid) {
         if xid.is_valid() {
-            if let Some(sink) = &self.sink {
-                sink.log_abort(xid);
+            // Skip the sink entirely while unwinding, barrier included. Not just
+            // the barrier: `log_abort` reaches the WAL's `inner` lock, which
+            // panics on poison *by design* — `append` takes the staged buffer out
+            // and puts it back, so a poisoned `Inner` really can be torn and that
+            // must stay fatal. Panicking here, in a `Drop` that a panic already
+            // started, aborts the process — the outcome this whole function exists
+            // to avoid.
+            //
+            // The cost is one missing abort record: if the process then dies
+            // before the next checkpoint flushes the commit log, the XID comes
+            // back `InProgress` rather than `Aborted`. Every reader treats those
+            // the same, and an abort record is not fsynced anyway, so this is the
+            // cheaper half of the trade.
+            if !std::thread::panicking() {
+                let delay = self.sink.as_ref().and_then(|sink| sink.delay_checkpoint());
+                if let Some(sink) = &self.sink {
+                    sink.log_abort(xid);
+                }
+                self.clog.set_aborted(xid);
+                drop(delay);
+            } else {
+                self.clog.set_aborted(xid);
             }
-            self.clog.set_aborted(xid);
             self.xids.complete(xid);
         }
     }
