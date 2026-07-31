@@ -735,7 +735,7 @@ pub(crate) fn apply_comparison(
 /// a RANGE partition key) must gate on this to avoid a panic.
 pub fn is_orderable(ty: PgType) -> bool {
     match ty {
-        PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg => false,
+        PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg | PgType::Path => false,
         // An array is orderable iff its element type is (element-wise btree
         // comparison). Keep in sync with `PgType::has_default_btree_opclass`.
         PgType::Array(elem_oid) => PgType::from_oid(elem_oid).is_some_and(is_orderable),

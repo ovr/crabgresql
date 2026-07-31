@@ -117,14 +117,39 @@ SELECT path '[(0,0),(1,1)]' <-> path '[(3,0),(4,1)]' AS dist_pp,
 SELECT path '[(0,0),(2,0)]' ?# path '[(1,-1),(1,1)]' AS crosses,
        path '[(0,0),(2,0)]' ?# path '[(0,1),(2,1)]' AS misses;
 
--- containment: only a closed path encloses points, and its boundary counts
+-- containment: only a closed path encloses its interior, but `@>` is the
+-- commutator of `<@`, so a point ON an open path's outline is still contained
 SELECT path '((0,0),(4,0),(4,4),(0,4))' @> point '(1,1)' AS inside,
        path '((0,0),(4,0),(4,4),(0,4))' @> point '(0,2)' AS on_edge,
        path '((0,0),(4,0),(4,4),(0,4))' @> point '(9,9)' AS outside,
-       path '[(0,0),(4,0),(4,4),(0,4)]' @> point '(1,1)' AS open_encloses_nothing;
+       path '[(0,0),(4,0),(4,4),(0,4)]' @> point '(1,1)' AS open_encloses_nothing,
+       path '[(0,0),(4,0)]' @> point '(1,0)' AS open_outline_contains;
 SELECT point '(1,0)' <@ path '[(0,0),(2,0)]' AS on_outline,
        point '(1,1)' <@ path '[(0,0),(4,0),(4,4),(0,4)]' AS off_outline,
        point '(1,3)' <@ path '((0,0),(2,0),(2,6))' AS on_closing_seg;
+
+-- a one-point CLOSED path carries a degenerate segment, so it measures and can
+-- be landed on; a one-point OPEN path has no segment at all
+SELECT path '((0,0))' <-> path '((3,4))' AS closed1_dist,
+       path '[(0,0)]' <-> path '[(9,9)]' AS open1_dist,
+       point '(10,10)' <-> path '[(0,0)]' AS pt_to_open1,
+       point '(10,10)' <-> path '((0,0))' AS pt_to_closed1;
+SELECT point '(10,20)' <@ path '((10,20))' AS on_closed1,
+       point '(10,20)' <@ path '[(10,20)]' AS on_open1,
+       path '((0,0))' ?# path '((0,0),(1,1))' AS deg_meets_seg,
+       path '((0,0))' ?# path '((0,0))' AS deg_meets_deg;
+
+-- an untyped literal first mirrors the other operand's type: `<->` and `+` bind
+-- path-to-path (reading '(5,5)' as the one-point path), while the operators with
+-- no path/path overload fall back to the point candidate
+SELECT path '[(0,0),(1,1)]' <-> '(5,5)' AS unk_dist,
+       path '[(1,2),(3,4)]' + '(1,1)' AS unk_plus,
+       path '[(1,2),(3,4)]' - '(1,1)' AS unk_minus,
+       path '((0,0),(4,0),(4,4))' @> '(1,1)' AS unk_contains;
+
+-- a trailing separator is a syntax error for path, but lseg accepts it
+SELECT '[(1,2),(3,4),]'::lseg AS lseg_trailing;
+SELECT '[(1,2),(3,4),]'::path;
 
 -- path comparisons look at the number of points only, not the coordinates
 SELECT path '[(0,0),(1,1)]' = path '((5,5),(6,6))' AS eq,

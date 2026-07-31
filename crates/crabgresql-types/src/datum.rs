@@ -373,6 +373,15 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         T_PATH => {
             let closed = r.take(1)[0] != 0;
             let npts = r.u32() as usize;
+            // The count comes off the page, so bound it by the bytes actually
+            // left before reserving. `(0..npts)` is `TrustedLen`, so `collect`
+            // reserves `npts * 16` up front; on a corrupt count that would be a
+            // huge allocation (and an abort on failure) instead of the ordinary
+            // bounds panic every other varlena decode gets from `take`.
+            let need = npts.saturating_mul(16);
+            if need > r.buf.len().saturating_sub(r.pos) {
+                r.take(need); // diverges: same bounds panic as `var()`
+            }
             let pts = (0..npts)
                 .map(|_| [f64::from_bits(r.u64()), f64::from_bits(r.u64())])
                 .collect();
@@ -448,6 +457,26 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
 mod tests {
     use super::*;
     use crate::RegKind;
+
+    /// A corrupt vertex count must fail the ordinary bounds check rather than
+    /// trying to reserve `npts * 16` bytes (which for a bogus count is a huge
+    /// allocation, and an abort rather than a panic if it fails).
+    #[test]
+    #[should_panic(expected = "range end index")]
+    fn path_decode_rejects_a_bogus_vertex_count() {
+        let mut buf = Vec::new();
+        encode_datum(
+            &Value::Path(crate::geo::PathVal {
+                closed: false,
+                pts: vec![[1.0, 2.0], [3.0, 4.0]],
+            }),
+            &mut buf,
+        );
+        // Overwrite the count (tag byte + closed flag) with 0xFFFFFFFF.
+        buf[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut pos = 0;
+        decode_datum(&buf, &mut pos);
+    }
 
     fn roundtrip(v: Value) {
         let mut buf = Vec::new();

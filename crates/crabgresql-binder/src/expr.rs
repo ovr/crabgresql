@@ -4987,20 +4987,46 @@ fn resolve_geometric_op(
     lb: &Binding,
     rb: &Binding,
 ) -> Result<Option<Binding>, BindError> {
-    use crate::functions::GeoFn;
-    use ast::BinaryOperator as B;
     let lt = binding_typed_ty(lb);
     let rt = binding_typed_ty(rb);
     if !is_geo_ty(lt) && !is_geo_ty(rt) {
         return Ok(None);
     }
-    // An untyped literal mirrors the other (geometric) side's type.
-    let left_ty = lt.or(rt);
-    let right_ty = rt.or(lt);
-    // Both operands must land on a geometric type for any of these operators.
-    if !is_geo_ty(left_ty) || !is_geo_ty(right_ty) {
-        return Ok(None);
+    // An untyped literal first mirrors the other (geometric) side's type, which
+    // is what PG's "assume the unknown is the other operand's type" step does:
+    // `path <-> '(5,5)'` really does bind `path <-> path`, reading the literal as
+    // the one-point path `((5,5))`. Only when no operator exists for the mirrored
+    // combination does resolution fall back to the other candidate — every
+    // remaining geometric overload takes a `point` there (`path - point`,
+    // `path @> point`, `point <@ path`, ...).
+    for candidate in [lt.or(rt), Some(PgType::Point)] {
+        let (left_ty, right_ty) = (lt.or(candidate), rt.or(candidate));
+        // Both operands must land on a geometric type for any of these operators.
+        if !is_geo_ty(left_ty) || !is_geo_ty(right_ty) {
+            continue;
+        }
+        if let Some(bound) = resolve_geometric_combo(op, lb, rb, left_ty, right_ty)? {
+            return Ok(Some(bound));
+        }
+        // Mirroring only had a second chance to offer if a side was untyped.
+        if lt.is_some() && rt.is_some() {
+            break;
+        }
     }
+    Ok(None)
+}
+
+/// The geometric operator table for one fully-resolved operand-type pair.
+/// `Ok(None)` means this operator has no overload for that combination.
+fn resolve_geometric_combo(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+    left_ty: Option<PgType>,
+    right_ty: Option<PgType>,
+) -> Result<Option<Binding>, BindError> {
+    use crate::functions::GeoFn;
+    use ast::BinaryOperator as B;
     let l = |t: PgType| resolve_operand(lb, t);
     let r = |t: PgType| resolve_operand(rb, t);
     let call = |func, ret, args: Vec<BoundExpr>| {
