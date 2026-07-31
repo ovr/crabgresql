@@ -762,6 +762,11 @@ pub(crate) fn apply_comparison(
 pub fn is_orderable(ty: PgType) -> bool {
     match ty {
         PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg | PgType::Path => false,
+        // `xid` is the one type with a `compare_values` arm that is still not
+        // orderable: PG gives it a hash opclass but no btree one, so the
+        // ordering exists only to make `GROUP BY`/`DISTINCT` work through
+        // `keys_equal`. Nothing may sort by it. See `crabgresql_types::xid`.
+        PgType::Xid => false,
         // An array is orderable iff its element type is (element-wise btree
         // comparison). Keep in sync with `PgType::has_default_btree_opclass`.
         PgType::Array(elem_oid) => PgType::from_oid(elem_oid).is_some_and(is_orderable),
@@ -825,6 +830,17 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         PgType::Money => money::cmp(money_of(l), money_of(r)),
         // oid: unsigned 32-bit order (PG's `oidcmp`).
         PgType::Oid => oid_of(l).cmp(&oid_of(r)),
+        // tid: block first, then offset — PG's `tidcmp`, and the order the
+        // heap itself lays rows out in.
+        PgType::Tid => tid_of(l).cmp(&tid_of(r)),
+        // Both transaction id types order as plain unsigned integers. `xid` is
+        // reachable here only through equality and hashing — `is_orderable`
+        // above keeps it out of every sort — but the arm must exist, because
+        // `keys_equal` routes grouping equality through `compare_values`.
+        PgType::Xid => xid_of(l).cmp(&xid_of(r)),
+        PgType::Xid8 => xid8_of(l).cmp(&xid8_of(r)),
+        // pg_lsn: the natural unsigned order of the 64-bit counter.
+        PgType::PgLsn => lsn_of(l).cmp(&lsn_of(r)),
         // A reg* value orders by OID, never by the name it renders as — the
         // same rule its `PartialEq` and `hash_key` use.
         PgType::Reg(_) => reg_oid(l).cmp(&reg_oid(r)),
@@ -936,6 +952,34 @@ fn oid_of(v: &Value) -> u32 {
     match v {
         Value::Oid(v) => *v,
         other => unreachable!("expected oid, got {other:?}"),
+    }
+}
+
+fn tid_of(v: &Value) -> (u32, u16) {
+    match v {
+        Value::Tid { block, offset } => (*block, *offset),
+        other => unreachable!("expected tid, got {other:?}"),
+    }
+}
+
+fn xid_of(v: &Value) -> u32 {
+    match v {
+        Value::Xid(x) => *x,
+        other => unreachable!("expected xid, got {other:?}"),
+    }
+}
+
+fn xid8_of(v: &Value) -> u64 {
+    match v {
+        Value::Xid8(x) => *x,
+        other => unreachable!("expected xid8, got {other:?}"),
+    }
+}
+
+fn lsn_of(v: &Value) -> u64 {
+    match v {
+        Value::PgLsn(x) => *x,
+        other => unreachable!("expected pg_lsn, got {other:?}"),
     }
 }
 

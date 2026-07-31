@@ -20,7 +20,9 @@ pub mod macaddr;
 pub mod money;
 pub mod net;
 pub mod numeric;
+pub mod pg_lsn;
 pub mod text;
+pub mod tid;
 pub mod time;
 pub mod timestamp;
 pub mod timestamptz;
@@ -31,6 +33,7 @@ pub mod tsvector;
 pub mod tz;
 pub mod uuid;
 pub mod wire;
+pub mod xid;
 
 pub use interval::Interval;
 pub use net::Inet;
@@ -46,6 +49,15 @@ pub mod oid {
     /// `oid`: PostgreSQL's object-identifier type (unsigned 32-bit). Pervasive
     /// across `pg_catalog` (every `oid`/`reg*` column), so worth a real type.
     pub const OID: u32 = 26;
+    /// `tid`: a tuple identifier, the `(block, offset)` address of a row
+    /// version — the type of the `ctid` system column. See [`crate::tid`].
+    pub const TID: u32 = 27;
+    /// `xid`: a 32-bit transaction id. See [`crate::xid`].
+    pub const XID: u32 = 28;
+    /// `xid8`: a 64-bit transaction id. See [`crate::xid`].
+    pub const XID8: u32 = 5069;
+    /// `pg_lsn`: a WAL log sequence number. See [`crate::pg_lsn`].
+    pub const PG_LSN: u32 = 3220;
     pub const INT2: u32 = 21;
     pub const INT4: u32 = 23;
     pub const TEXT: u32 = 25;
@@ -108,6 +120,10 @@ pub mod oid {
     pub const FLOAT4_ARRAY: u32 = 1021;
     pub const FLOAT8_ARRAY: u32 = 1022;
     pub const OID_ARRAY: u32 = 1028;
+    pub const TID_ARRAY: u32 = 1010;
+    pub const XID_ARRAY: u32 = 1011;
+    pub const XID8_ARRAY: u32 = 271;
+    pub const PG_LSN_ARRAY: u32 = 3221;
     pub const MACADDR_ARRAY: u32 = 1040;
     pub const MACADDR8_ARRAY: u32 = 775;
     pub const INET_ARRAY: u32 = 1041;
@@ -156,6 +172,18 @@ pub enum PgType {
     /// `oid`: an unsigned 32-bit object identifier. Fixed 4-byte type; values
     /// print as unsigned decimals. Backs `pg_catalog` OID/`reg*` columns.
     Oid,
+    /// `tid`: the `(block, offset)` address of a row version, and the type of
+    /// the `ctid` system column. Fixed 6-byte type. See [`crate::tid`].
+    Tid,
+    /// `xid`: a 32-bit transaction id. Fixed 4-byte type. Has equality but no
+    /// ordering — see [`crate::xid`]. See also [`PgType::Xid8`].
+    Xid,
+    /// `xid8`: a 64-bit transaction id. Fixed 8-byte type, fully ordered.
+    /// See [`crate::xid`].
+    Xid8,
+    /// `pg_lsn`: a WAL log sequence number. Fixed 8-byte type, fully ordered,
+    /// with arithmetic against `numeric`. See [`crate::pg_lsn`].
+    PgLsn,
     Bytea,
     /// `bit(n)`: a fixed-length bit string. The declared length is enforced as a
     /// coercion; the runtime value carries its own length.
@@ -333,6 +361,10 @@ impl PgType {
             PgType::Bpchar => oid::BPCHAR,
             PgType::Name => oid::NAME,
             PgType::Oid => oid::OID,
+            PgType::Tid => oid::TID,
+            PgType::Xid => oid::XID,
+            PgType::Xid8 => oid::XID8,
+            PgType::PgLsn => oid::PG_LSN,
             PgType::Bytea => oid::BYTEA,
             PgType::Bit => oid::BIT,
             PgType::Varbit => oid::VARBIT,
@@ -392,6 +424,10 @@ impl PgType {
                 | PgType::Bpchar
                 | PgType::Name
                 | PgType::Oid
+                | PgType::Tid
+                | PgType::Xid
+                | PgType::Xid8
+                | PgType::PgLsn
                 | PgType::Bytea
                 | PgType::Date
                 | PgType::Time
@@ -441,6 +477,10 @@ impl PgType {
             oid::BPCHAR => PgType::Bpchar,
             oid::NAME => PgType::Name,
             oid::OID => PgType::Oid,
+            oid::TID => PgType::Tid,
+            oid::XID => PgType::Xid,
+            oid::XID8 => PgType::Xid8,
+            oid::PG_LSN => PgType::PgLsn,
             oid::BYTEA => PgType::Bytea,
             oid::BIT => PgType::Bit,
             oid::VARBIT => PgType::Varbit,
@@ -507,6 +547,10 @@ impl PgType {
             "bpchar" | "char" | "character" => PgType::Bpchar,
             "name" => PgType::Name,
             "oid" => PgType::Oid,
+            "tid" => PgType::Tid,
+            "xid" => PgType::Xid,
+            "xid8" => PgType::Xid8,
+            "pg_lsn" => PgType::PgLsn,
             "bytea" => PgType::Bytea,
             "bit" => PgType::Bit,
             "varbit" | "bit varying" => PgType::Varbit,
@@ -558,6 +602,11 @@ impl PgType {
             PgType::Reg(_) => 4,
             PgType::Macaddr => 6,
             PgType::Macaddr8 => 8,
+            // A `BlockNumber` (4) plus an `OffsetNumber` (2).
+            PgType::Tid => 6,
+            PgType::Xid => 4,
+            PgType::Xid8 => 8,
+            PgType::PgLsn => 8,
             PgType::Point => 16,
             PgType::Lseg => 32,
             // `name` is a fixed 64-byte type; the rest are varlena.
@@ -599,6 +648,10 @@ impl PgType {
             PgType::Bpchar => "character",
             PgType::Name => "name",
             PgType::Oid => "oid",
+            PgType::Tid => "tid",
+            PgType::Xid => "xid",
+            PgType::Xid8 => "xid8",
+            PgType::PgLsn => "pg_lsn",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
             PgType::Varbit => "bit varying",
@@ -644,6 +697,10 @@ impl PgType {
             PgType::Bpchar => "bpchar",
             PgType::Name => "name",
             PgType::Oid => "oid",
+            PgType::Tid => "tid",
+            PgType::Xid => "xid",
+            PgType::Xid8 => "xid8",
+            PgType::PgLsn => "pg_lsn",
             PgType::Bytea => "bytea",
             PgType::Bit => "bit",
             PgType::Varbit => "varbit",
@@ -689,12 +746,22 @@ impl PgType {
     /// `point`, and `lseg` have no default ordering in PostgreSQL (and the
     /// executor's `compare_values` has no arm for them); everything else,
     /// including user types (enums order by ordinal), does. Must stay in sync
-    /// with `crabgresql_executor::compare_values`.
+    /// with `crabgresql_executor::is_orderable`.
+    ///
+    /// `xid` is the one type whose `compare_values` arm exists even though this
+    /// returns `false`: the executor needs an ordering internally to make
+    /// `GROUP BY`/`DISTINCT` work through `keys_equal`, but no SQL surface
+    /// exposes it.
     pub fn has_default_btree_opclass(self) -> bool {
         match self {
             PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg | PgType::Path => {
                 false
             }
+            // `xid` is the one type here with equality but no ordering: PG gives
+            // it a hash opclass only, because transaction ids compare with
+            // modular arithmetic. `xid8` is an ordinary counter and does have a
+            // btree opclass. See `crate::xid`.
+            PgType::Xid => false,
             // An array is orderable iff its element type is (element-wise btree
             // comparison). An unknown element type (no `from_oid`) is treated as
             // non-orderable.
@@ -735,6 +802,10 @@ fn array_display_name(elem: u32) -> &'static str {
         Some(PgType::Bpchar) => "character[]",
         Some(PgType::Name) => "name[]",
         Some(PgType::Oid) => "oid[]",
+        Some(PgType::Tid) => "tid[]",
+        Some(PgType::Xid) => "xid[]",
+        Some(PgType::Xid8) => "xid8[]",
+        Some(PgType::PgLsn) => "pg_lsn[]",
         Some(PgType::Bytea) => "bytea[]",
         Some(PgType::Bit) => "bit[]",
         Some(PgType::Varbit) => "bit varying[]",
@@ -778,6 +849,10 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Bpchar) => "_bpchar",
         Some(PgType::Name) => "_name",
         Some(PgType::Oid) => "_oid",
+        Some(PgType::Tid) => "_tid",
+        Some(PgType::Xid) => "_xid",
+        Some(PgType::Xid8) => "_xid8",
+        Some(PgType::PgLsn) => "_pg_lsn",
         Some(PgType::Bytea) => "_bytea",
         Some(PgType::Bit) => "_bit",
         Some(PgType::Varbit) => "_varbit",
@@ -838,6 +913,17 @@ pub enum Value {
     /// `oid`: an unsigned 32-bit object identifier. Prints as an unsigned
     /// decimal; carries the referenced OID for `reg*`-style catalog columns.
     Oid(u32),
+    /// `tid`: the `(block, offset)` address of a row version. See [`crate::tid`].
+    Tid {
+        block: u32,
+        offset: u16,
+    },
+    /// `xid`: a 32-bit transaction id. See [`crate::xid`].
+    Xid(u32),
+    /// `xid8`: a 64-bit transaction id. See [`crate::xid`].
+    Xid8(u64),
+    /// `pg_lsn`: a WAL log sequence number. See [`crate::pg_lsn`].
+    PgLsn(u64),
     /// A `reg*` value: an OID that prints as the name of what it identifies.
     /// See [`Reg`] for why the name is carried rather than resolved at output.
     Reg(Reg),
@@ -926,6 +1012,10 @@ impl Value {
             Value::Numeric(_) => Some(PgType::Numeric),
             Value::Money(_) => Some(PgType::Money),
             Value::Oid(_) => Some(PgType::Oid),
+            Value::Tid { .. } => Some(PgType::Tid),
+            Value::Xid(_) => Some(PgType::Xid),
+            Value::Xid8(_) => Some(PgType::Xid8),
+            Value::PgLsn(_) => Some(PgType::PgLsn),
             Value::Reg(r) => Some(PgType::Reg(r.kind)),
             Value::Text(_) => Some(PgType::Text),
             Value::Bytea(_) => Some(PgType::Bytea),
@@ -973,6 +1063,11 @@ impl Value {
             Value::Numeric(n) => Some(n.to_display()),
             Value::Money(c) => Some(money::format(*c)),
             Value::Oid(v) => Some(v.to_string()),
+            Value::Tid { block, offset } => Some(tid::format(*block, *offset)),
+            // Both transaction id types print as unsigned decimals.
+            Value::Xid(v) => Some(v.to_string()),
+            Value::Xid8(v) => Some(v.to_string()),
+            Value::PgLsn(v) => Some(pg_lsn::format(*v)),
             // The name was resolved when the value was built; this is the whole
             // of the reg* output function.
             Value::Reg(r) => Some(r.name.clone()),
@@ -1046,11 +1141,14 @@ impl_message_error!(
     net::NetError,
     numeric::NumErr,
     text::TextError,
+    tid::TidError,
     time::TimeError,
     timestamp::TimestampError,
     timetz::TimeTzError,
     tsvector::TsError,
+    pg_lsn::PgLsnError,
     uuid::UuidError,
+    xid::XidError,
 );
 
 impl std::fmt::Display for numeric::ParseError {
@@ -1105,6 +1203,10 @@ mod tests {
             Value::Float8(-0.0),
             Value::Money(12345),
             Value::Oid(1259),
+            Value::Tid { block: 4294967295, offset: 65535 },
+            Value::Xid(4294967295),
+            Value::Xid8(u64::MAX),
+            Value::PgLsn(u64::MAX),
             Value::Date(-5),
             Value::Time(1),
             Value::TimeTz(TimeTz { usec: 1, zone: -3600 }),

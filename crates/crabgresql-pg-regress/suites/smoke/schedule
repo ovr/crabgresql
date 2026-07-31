@@ -34,6 +34,9 @@ test: join_pushdown
 test: generate_series
 test: string
 test: uuid
+test: tid
+test: xid
+test: pg_lsn
 test: geo
 test: json
 test: jsonb

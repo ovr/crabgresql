@@ -461,6 +461,40 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
                 message: e.message,
             }),
 
+        // ---- text → tid (tidin). The reverse is the generic → text arm. ----
+        (Value::Text(s), PgType::Tid) => crate::tid::parse(s)
+            .map(|(block, offset)| Value::Tid { block, offset })
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
+
+        // ---- text → xid / xid8 (xidin / xid8in) ----
+        (Value::Text(s), PgType::Xid) => crate::xid::xid_in(s)
+            .map(Value::Xid)
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
+        (Value::Text(s), PgType::Xid8) => crate::xid::xid8_in(s)
+            .map(Value::Xid8)
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
+
+        // ---- xid8 → xid: PG's only declared cast for either type. It
+        // truncates to the low 32 bits rather than range-checking. ----
+        (Value::Xid8(v), PgType::Xid) => Ok(Value::Xid(*v as u32)),
+
+        // ---- text → pg_lsn (pg_lsn_in) ----
+        (Value::Text(s), PgType::PgLsn) => crate::pg_lsn::parse(s)
+            .map(Value::PgLsn)
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
+
         // ---- text → point / lseg / path (point_in / lseg_in / path_in) ----
         (Value::Text(s), PgType::Point) => {
             crate::geo::parse_point(s)

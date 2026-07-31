@@ -360,6 +360,26 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     o.hash(&mut h);
                 }
             }
+            PgType::Tid => {
+                if let Value::Tid { block, offset } = v {
+                    (block, offset).hash(&mut h);
+                }
+            }
+            PgType::Xid => {
+                if let Value::Xid(x) = v {
+                    x.hash(&mut h);
+                }
+            }
+            PgType::Xid8 => {
+                if let Value::Xid8(x) = v {
+                    x.hash(&mut h);
+                }
+            }
+            PgType::PgLsn => {
+                if let Value::PgLsn(x) = v {
+                    x.hash(&mut h);
+                }
+            }
             // Only the OID: equality ignores the rendered name, so hashing it
             // would put two equal values in different buckets.
             PgType::Reg(_) => {
