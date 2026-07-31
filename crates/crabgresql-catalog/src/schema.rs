@@ -17,8 +17,8 @@ use crabgresql_storage_api::{
 use crabgresql_types::{PgType, Value};
 
 use crate::{
-    CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogUserType,
-    PG_CAST_ROWS, PG_TYPE_ROWS, RelKind,
+    CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine, CatalogSequence,
+    CatalogToast, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS, RelKind, TOAST_NAMESPACE,
 };
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
@@ -573,6 +573,7 @@ pub fn pg_class_rows(
     kinds: &[RelKind],
     stats: &[RelStats],
     indexes: &[CatalogIndex],
+    toasts: &[CatalogToast],
     namespace_oids: &HashMap<String, u32>,
 ) -> Vec<Vec<Value>> {
     // Resolve a relation's namespace OID, defaulting to `public` (2200) for any
@@ -629,8 +630,17 @@ pub fn pg_class_rows(
                 reltuples,
                 // relallvisible: no visibility map is kept.
                 Value::Int4(0),
-                // reltoastrelid: no TOAST relation.
-                Value::Oid(0),
+                // reltoastrelid: the relation's TOAST relation, or 0 when it has
+                // none. Zero is legitimate PostgreSQL state — it is what PG
+                // reports for a table with no out-of-line storage — and it is
+                // what a table of narrow columns keeps, since the TOAST relation
+                // is created only once a row first needs one.
+                Value::Oid(
+                    toasts
+                        .iter()
+                        .find(|t| t.table_oid == *oid)
+                        .map_or(0, |t| t.oid),
+                ),
                 Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
                 Value::Text(schema.persistence.as_char().to_string()),
                 Value::Text(relkind.to_string()),
@@ -684,8 +694,62 @@ pub fn pg_class_rows(
             Value::Null,
         ]
     }));
+    // TOAST relations, as `relkind = 't'` in the `pg_toast` namespace. Publishing
+    // the row is what makes a non-zero `reltoastrelid` safe: it is a foreign key
+    // into `pg_class.oid`, so an OID with no row here would be a dangling
+    // reference of exactly the kind upstream's `oidjoins` test exists to catch.
+    rows.extend(toasts.iter().map(|toast| {
+        vec![
+            Value::Oid(toast.oid),
+            Value::Text(toast.name.clone()),
+            Value::Oid(namespace_oids.get(TOAST_NAMESPACE).copied().unwrap_or(99)),
+            Value::Oid(0),
+            Value::Oid(0),
+            Value::Oid(BOOTSTRAP_ROLE_OID),
+            Value::Oid(HEAP_AM_OID),
+            Value::Oid(0),
+            Value::Int4(toast.stats.relpages as i32),
+            // reltuples: chunks are not rows, so a count here would invite being
+            // read as one. The never-analyzed sentinel is the honest answer.
+            Value::Float4(-1.0),
+            Value::Int4(0),
+            // A TOAST relation has no TOAST relation of its own.
+            Value::Oid(0),
+            // relhasindex: PostgreSQL indexes its TOAST relation on
+            // `(chunk_id, chunk_seq)`; ours chains chunks by ctid instead, so
+            // there is no `pg_toast_<oid>_index`, and claiming one would be the
+            // dangling reference this block exists to avoid.
+            Value::Bool(false),
+            Value::Text(toast.persistence.as_char().to_string()),
+            Value::Text("t".to_string()),
+            Value::Int2(TOAST_COLUMNS.len() as i16),
+            Value::Int2(0),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Text("n".to_string()),
+            Value::Bool(false),
+            Value::Null,
+        ]
+    }));
     rows
 }
+
+/// The columns PostgreSQL gives every TOAST relation, published so a `pg_class`
+/// row with `relnatts = 3` has matching `pg_attribute` rows to join against.
+///
+/// This presents PostgreSQL's TOAST schema, not our storage: our chunks carry no
+/// `chunk_id`/`chunk_seq` of their own, because the pointer names the first chunk
+/// directly and each chunk links to the next. `pg_attribute` is already a
+/// presentation layer in exactly this way — it describes every relation in
+/// PostgreSQL's terms while the heap stores self-describing datums that look
+/// nothing like `attlen`-driven layout.
+const TOAST_COLUMNS: [(&str, PgType); 3] = [
+    ("chunk_id", PgType::Oid),
+    ("chunk_seq", PgType::Int4),
+    ("chunk_data", PgType::Bytea),
+];
 
 /// `pg_catalog.pg_inherits` — the parent/child links of declarative partitions
 /// (and, in PG, table inheritance). One row per leaf partition.
@@ -841,6 +905,7 @@ fn attcollation_of(column: &Column) -> u32 {
 pub fn pg_attribute_rows(
     relations: &[(u32, TableSchema)],
     indexes: &[CatalogIndex],
+    toasts: &[CatalogToast],
 ) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
     for (oid, schema) in relations {
@@ -878,6 +943,26 @@ pub fn pg_attribute_rows(
                 Value::Text(String::new()),
                 Value::Bool(false),
                 Value::Oid(attcollation_of(column)),
+            ]);
+        }
+    }
+    // A TOAST relation's columns, so its `pg_class.relnatts` has rows to join.
+    for toast in toasts {
+        for (i, (name, ty)) in TOAST_COLUMNS.iter().enumerate() {
+            rows.push(vec![
+                Value::Oid(toast.oid),
+                Value::Text((*name).to_string()),
+                Value::Oid(ty.oid()),
+                Value::Int2(ty.typlen()),
+                Value::Int2((i + 1) as i16),
+                Value::Int4(-1),
+                // PostgreSQL marks all three NOT NULL.
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::Text(String::new()),
+                Value::Text(String::new()),
+                Value::Bool(false),
+                Value::Oid(0),
             ]);
         }
     }

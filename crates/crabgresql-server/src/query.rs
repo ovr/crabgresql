@@ -348,6 +348,11 @@ fn bind_catalogs(
                         );
                         relation.indexes = metadata.indexes;
                         relation.stats = metadata.stats;
+                        // A temp table toasts like any other, so its chunk store
+                        // must reach `pg_class` too — the constructor defaults
+                        // this to `None`, so it has to be carried across
+                        // explicitly like the two fields above.
+                        relation.toast = metadata.toast;
                         relation
                     }));
                     // Views reflect into pg_class as relkind='v' / pg_attribute

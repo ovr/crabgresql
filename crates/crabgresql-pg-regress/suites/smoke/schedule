@@ -66,3 +66,4 @@ test: pg_input
 test: escape_string
 test: cursor
 test: to_char
+test: toast

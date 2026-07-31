@@ -257,6 +257,19 @@ impl StorageManager {
         Ok((len / BLCKSZ as u64) as u32)
     }
 
+    /// The relation file's length in bytes. Separate from [`StorageManager::nblocks`]
+    /// so a read can tell "past the end" (a fresh page) from "short of the end"
+    /// (a truncated file) without rounding to whole blocks.
+    fn file_len(&self, rel: RelFileNode) -> std::io::Result<u64> {
+        let f = self.file(rel)?;
+        let len = f
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .metadata()?
+            .len();
+        Ok(len)
+    }
+
     /// Read one block. An all-zero block (a fresh or hole page) is returned as-is
     /// without a checksum check — the caller treats it as a new page; any other
     /// page must pass its checksum for `block`.
@@ -271,6 +284,23 @@ impl StorageManager {
             })
             .is_some()
         {
+            return Ok(());
+        }
+        // A block at or past the file's end reads as an all-zero page, the same
+        // answer the memory path gives above. Redo reaches this case: a relation
+        // whose file was created but never extended before the crash has zero
+        // blocks, and erroring there would abort recovery rather than hand back
+        // the fresh page the handler is about to overwrite.
+        //
+        // Deliberately gated on the *length*, not on a short read. Treating any
+        // `UnexpectedEof` as a fresh page would also swallow a genuinely truncated
+        // relation — a file whose tail was lost to an unfsynced extend, say —
+        // turning missing rows into silence. Past the end is expected; short of
+        // the end is corruption and still an error.
+        let block_end = (block as u64 + 1) * BLCKSZ as u64;
+        let len = self.file_len(rel)?;
+        if len < block_end {
+            buf.fill(0);
             return Ok(());
         }
         let f = self.file(rel)?;

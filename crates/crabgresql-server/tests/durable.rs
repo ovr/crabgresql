@@ -937,3 +937,58 @@ async fn analyze_statistics_are_nontransactional_and_survive_restart() -> anyhow
 
     Ok(())
 }
+
+#[tokio::test]
+async fn out_of_line_values_survive_a_restart() -> anyhow::Result<()> {
+    // The engine-level recovery suite proves replay of the chunk records; this
+    // proves the whole stack agrees afterwards — including that the chunk
+    // relfilenode comes back through the durable catalog rather than being
+    // unlinked by the startup orphan sweep.
+    let dir = tempfile::tempdir()?;
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE TABLE docs (id int, body text)")
+            .await?;
+        client
+            .simple_query("INSERT INTO docs VALUES (1, repeat('abcdefghij', 20000))")
+            .await?;
+        client
+            .simple_query("INSERT INTO docs VALUES (2, 'short')")
+            .await?;
+        shutdown(client, handle).await;
+    }
+    // Second boot: the value is intact, and md5 rather than a length so a chain
+    // reassembled short or out of order would show.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let msgs = client
+            .simple_query(
+                "SELECT length(body), md5(body) = md5(repeat('abcdefghij', 20000)) \
+                 FROM docs WHERE id = 1",
+            )
+            .await?;
+        assert_eq!(rows(&msgs)[0].get(0), Some("200000"));
+        assert_eq!(rows(&msgs)[0].get(1), Some("t"));
+        // reltoastrelid survived the restart and still resolves to a real row.
+        let msgs = client
+            .simple_query(
+                "SELECT t.relkind FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid \
+                 WHERE c.relname = 'docs'",
+            )
+            .await?;
+        assert_eq!(rows(&msgs)[0].get(0), Some("t"));
+        // And the table still takes new wide values on the recovered chunk store.
+        client
+            .simple_query("INSERT INTO docs VALUES (3, repeat('z', 90000))")
+            .await?;
+        let msgs = client
+            .simple_query("SELECT length(body) FROM docs WHERE id = 3")
+            .await?;
+        assert_eq!(rows(&msgs)[0].get(0), Some("90000"));
+        shutdown(client, handle).await;
+    }
+    Ok(())
+}

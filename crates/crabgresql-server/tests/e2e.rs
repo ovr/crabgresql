@@ -8080,3 +8080,87 @@ async fn cursor_names_fold_to_lowercase() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_large_value_round_trips_in_binary_over_the_extended_protocol() {
+    // The smoke suite drives the simple protocol in text; this covers the other
+    // half — a wide value both bound as a parameter and returned in binary.
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client
+        .simple_query("CREATE TABLE toast_wire (id int, b bytea, t text)")
+        .await
+        .expect("create");
+
+    let blob: Vec<u8> = (0..1_000_000).map(|i| (i % 251) as u8).collect();
+    let text: String = "abcdefghij".repeat(20_000);
+    client
+        .execute(
+            "INSERT INTO toast_wire VALUES ($1, $2, $3)",
+            &[&1i32, &blob, &text],
+        )
+        .await
+        .expect("insert a value far larger than a page through Bind");
+
+    let row = client
+        .query_one("SELECT b, t FROM toast_wire WHERE id = $1", &[&1i32])
+        .await
+        .expect("select");
+    let got_blob: Vec<u8> = row.get(0);
+    let got_text: String = row.get(1);
+    assert_eq!(got_blob, blob, "the bytea must come back byte for byte");
+    assert_eq!(got_text, text);
+
+    // And through RETURNING, which builds its rows on a different path.
+    let returned = client
+        .query_one(
+            "INSERT INTO toast_wire VALUES ($1, $2, $3) RETURNING t",
+            &[&2i32, &blob, &text],
+        )
+        .await
+        .expect("insert returning");
+    assert_eq!(returned.get::<_, String>(0), text);
+}
+
+#[tokio::test]
+async fn a_row_that_cannot_be_shrunk_reports_program_limit_exceeded() {
+    // Every column is fixed-width, so no amount of out-of-line storage helps.
+    // PostgreSQL raises 54000 here; the point of the test is that the session
+    // stays usable afterwards rather than the connection dying.
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    let columns: Vec<String> = (0..140).map(|i| format!("c{i} name")).collect();
+    client
+        .simple_query(&format!("CREATE TABLE toast_fixed ({})", columns.join(", ")))
+        .await
+        .expect("create");
+
+    let values: Vec<String> = (0..140).map(|_| "repeat('x', 63)".to_string()).collect();
+    let err = client
+        .simple_query(&format!(
+            "INSERT INTO toast_fixed SELECT {}",
+            values.join(", ")
+        ))
+        .await
+        .expect_err("a row of fixed-width columns cannot be made to fit");
+    let db_error = err.as_db_error().expect("database error");
+    assert_eq!(db_error.code(), &tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED);
+    assert!(
+        db_error.message().starts_with("row is too big: size "),
+        "unexpected message: {}",
+        db_error.message()
+    );
+    assert!(
+        db_error.message().ends_with(", maximum size 8160"),
+        "unexpected message: {}",
+        db_error.message()
+    );
+
+    // The connection survives: the failure is an ordinary SQL error, not a
+    // panic that unwinds the connection task.
+    let row = client
+        .query_one("SELECT count(*) FROM toast_fixed", &[])
+        .await
+        .expect("the session must still be usable");
+    assert_eq!(row.get::<_, i64>(0), 0);
+}

@@ -13,11 +13,15 @@
 //! `Temporary` (RAM-backed, WAL-skipped, gone on restart). Only the WAL and the
 //! backing store differ; visibility is identical.
 //!
+//! An attribute too wide to keep on a page is stored out of line in a per-table
+//! chunk relation ([`toast`]); compression is not implemented, so a value goes
+//! out of line where PostgreSQL would first try to compress it inline.
+//!
 //! Deliberately deferred to keep this first cut tractable (all documented in
-//! `docs/ARCHITECTURE.md §3`): TOAST (a tuple must fit one page), a durable SLRU
-//! CLOG and checkpoint-bounded recovery (recovery replays the whole WAL),
-//! full-page writes / torn-page protection beyond page checksums, WAL segment
-//! recycling, and a transactional relation catalog.
+//! `docs/ARCHITECTURE.md §3`): a durable SLRU CLOG and checkpoint-bounded
+//! recovery (recovery replays the whole WAL), full-page writes / torn-page
+//! protection beyond page checksums, WAL segment recycling, and a transactional
+//! relation catalog.
 
 mod analyze;
 mod btkey;
@@ -33,6 +37,7 @@ mod page;
 mod rec;
 mod redo;
 mod smgr;
+mod toast;
 mod tuple;
 
 use std::collections::HashMap;
@@ -45,7 +50,7 @@ use crabgresql_parquet_engine::{
     BufferedParquetTable, ParquetRedo, ParquetTable, RMGR_PARQUET, validate_schema,
 };
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, IndexMetadata, RelStats, RelationMetadata,
+    ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelStats, RelationMetadata,
     RelfilenodeAllocator, SequenceAdvance, SequenceDefinition, StorageError, TableAccessMethod,
     TableAm, TableCapabilities, TableEngine, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
     ViewDefinition,
@@ -195,6 +200,10 @@ impl TableAm for ManagedTable {
         self.as_am().statistics()
     }
 
+    fn toast_statistics(&self) -> Option<RelStats> {
+        self.as_am().toast_statistics()
+    }
+
     fn storage_leaves(&self) -> Option<Vec<Arc<dyn TableAm>>> {
         self.as_am().storage_leaves()
     }
@@ -220,7 +229,7 @@ impl TableAm for ManagedTable {
         index_name: &str,
         key: &[Value],
         txn: &TxnContext,
-    ) -> Option<Box<dyn Iterator<Item = (Tid, Tuple)> + Send>> {
+    ) -> Option<IndexProbe> {
         self.as_am().index_lookup(index_name, key, txn)
     }
 
@@ -389,7 +398,7 @@ impl PgEngine {
             Arc::new(CatalogAllocator(Arc::clone(&catalog)));
 
         let mut tables = HashMap::new();
-        for (name, rel, schema, indexes) in catalog.schemas() {
+        for (name, rel, toast_rel, schema, indexes) in catalog.schemas() {
             let namespace = schema.namespace.clone();
             let analyzed = catalog.stats_in(&namespace, &name);
             let table = match schema.access_method {
@@ -397,6 +406,7 @@ impl PgEngine {
                     let table = Arc::new(HeapTable::new(
                         Arc::clone(&inner),
                         rel,
+                        toast_rel,
                         schema,
                         indexes,
                     ));
@@ -897,13 +907,21 @@ impl PgEngine {
     /// inserts are needed. All WAL-silent — this is a startup-time bulk reset.
     pub fn reset_unlogged_relations(&self) -> std::io::Result<()> {
         let smgr = self.inner.bufpool.smgr();
-        for (heap_rel, index_rels) in self.catalog.unlogged_relfilenodes() {
+        for (heap_rel, index_rels, toast_rel) in self.catalog.unlogged_relfilenodes() {
             self.inner.bufpool.forget_relation(heap_rel);
             smgr.truncate(heap_rel)?;
             for irel in index_rels {
                 self.inner.bufpool.forget_relation(irel);
                 smgr.truncate(irel)?;
                 BTree::open(Arc::clone(&self.inner), irel, Arc::new(RwLock::new(())), true).create();
+            }
+            // A chunk store is a plain heap file: it wants emptying, never the
+            // B-tree initialization the index files above get. Conflating the two
+            // would leave a metapage at block 0 that the next chunk write appends
+            // onto.
+            if let Some(toast_rel) = toast_rel {
+                self.inner.bufpool.forget_relation(toast_rel);
+                smgr.truncate(toast_rel)?;
             }
         }
         Ok(())
@@ -1190,9 +1208,9 @@ impl TxnFinalize for PgEngine {
                     // WAL at the next boot; log and continue rather than panic. (A
                     // memory/temp table writes no WAL and its catalog row is not
                     // persisted, so the swap only updates in-memory state.)
-                    if let Err(e) = self
-                        .catalog
-                        .swap_relfilenode(&namespace, &name, t.relfilenode())
+                    if let Err(e) =
+                        self.catalog
+                            .swap_relfilenode(&namespace, &name, t.relfilenode())
                     {
                         tracing::error!(
                             table = %name,
@@ -1208,6 +1226,10 @@ impl TxnFinalize for PgEngine {
                         t.truncate_reconciled();
                     }
                     self.inner.discard_relfile(old);
+                    // The chunk store keeps its relfilenode, so nothing has to be
+                    // recorded or unlinked for it — only emptied, and only when
+                    // that is safe.
+                    t.reclaim_toast_after_truncate();
                     t.release_truncate_lock(owner);
                 }
             }
@@ -1384,9 +1406,12 @@ impl TableEngine for PgEngine {
             self.inner.bufpool.smgr().register_memory(rel);
         }
         let table = match schema.access_method {
+            // A fresh table has no chunk store; one is created lazily by the
+            // first row that needs to store an attribute out of line.
             TableAccessMethod::Heap => ManagedTable::Heap(Arc::new(HeapTable::new(
                 Arc::clone(&self.inner),
                 rel,
+                RelFileNode(0),
                 schema,
                 Vec::new(),
             ))),
@@ -1590,7 +1615,7 @@ impl TableEngine for PgEngine {
         // relation. The persistent catalog is the source of truth for existence:
         // a missing entry there is the 42P01 case.
         let key = (namespace.to_string(), name.to_string());
-        let (rel, dropped, staged) = {
+        let (rel, dropped, staged, toast) = {
             let mut tables = self
                 .tables
                 .write()
@@ -1613,8 +1638,15 @@ impl TableEngine for PgEngine {
                 .as_deref()
                 .and_then(ManagedTable::as_heap)
                 .and_then(HeapTable::staged_relfilenode);
+            // The chunk store goes with the table. `remove_in` has already
+            // dropped the catalog row that named it, so the startup sweep would
+            // reclaim it eventually — unlinking here just makes it immediate.
+            let toast = dropped
+                .as_deref()
+                .and_then(ManagedTable::as_heap)
+                .and_then(HeapTable::toast_relfilenode);
             tables.remove(&key);
-            (rel, dropped, staged)
+            (rel, dropped, staged, toast)
         };
         // Physical cleanup runs after the tables lock is released, so an IO error
         // unlinking the file panics only this statement rather than poisoning the
@@ -1634,6 +1666,9 @@ impl TableEngine for PgEngine {
         }
         if let Some(staged) = staged {
             self.inner.discard_relfile(staged);
+        }
+        if let Some(toast) = toast {
+            self.inner.discard_relfile(toast);
         }
         Ok(())
     }
@@ -1677,7 +1712,7 @@ impl TableEngine for PgEngine {
         // before the catalog write leaves only an orphan file, which the startup
         // GC reclaims (it is not yet in the catalog's live set).
         match target.as_ref() {
-            ManagedTable::Heap(heap) => heap.build_index(index.clone(), index_rel),
+            ManagedTable::Heap(heap) => heap.build_index(index.clone(), index_rel)?,
             ManagedTable::Parquet(parquet) => parquet.add_index(index.clone()),
             ManagedTable::Buffer(buffer) => buffer.add_index(index.clone()),
         }
@@ -1799,6 +1834,7 @@ impl TableEngine for PgEngine {
                 schema: t.schema().clone(),
                 indexes: t.indexes(),
                 stats: t.statistics(),
+                toast: t.toast_statistics(),
             })
             .collect()
     }

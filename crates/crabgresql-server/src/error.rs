@@ -114,6 +114,9 @@ impl From<StorageError> for PgError {
             }
             StorageError::Io(_) => sqlstate::IO_ERROR,
             StorageError::CorruptData(_) => "XX001",
+            StorageError::RowTooBig { .. } | StorageError::ValueTooBig { .. } => {
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            }
         };
         Self::new(code, e.to_string())
     }

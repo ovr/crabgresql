@@ -272,6 +272,7 @@ impl From<StorageError> for ExecError {
             StorageError::TableAlreadyExists(_) | StorageError::RelationAlreadyExists(_) => "42P07",
             StorageError::SchemaAlreadyExists(_) => "42P06",
             StorageError::SchemaNotFound(_) => "3F000",
+            StorageError::RowTooBig { .. } | StorageError::ValueTooBig { .. } => "54000",
         };
         Self::new(code, error.to_string())
     }
@@ -3516,7 +3517,7 @@ impl IndexScan {
             match table.index_lookup(index_name, &key_values, txn) {
                 // Exact path: the engine already returned only key-matching,
                 // MVCC-visible rows.
-                Some(rows) => Box::new(rows.map(|(_, tuple)| Ok(tuple))),
+                Some(rows) => Box::new(rows.map(|row| row.map(|(_, tuple)| tuple))),
                 // Fallback path: a full scan, so re-check the key per row.
                 None => {
                     let cols: Vec<(usize, PgType)> = key
