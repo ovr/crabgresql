@@ -74,7 +74,11 @@ SELECT name FROM grades
 -- error: a searched WHEN condition must be boolean
 SELECT CASE WHEN 1 THEN 'x' END;
 ERROR:  argument of CASE/WHEN must be type boolean, not type integer
--- error: incompatible concrete result types cannot be matched
+LINE 1: SELECT CASE WHEN 1 THEN 'x' END;
+                         ^
+-- error: incompatible concrete result types cannot be matched. Known gap: PG
+-- also prints a `LINE 1: ... ^` cursor under the offending result expression,
+-- which the result-type unifier does not carry a span for yet.
 SELECT CASE WHEN true THEN 1 ELSE true END;
 ERROR:  CASE types boolean and integer cannot be matched
 -- error: an untyped result literal that does not fit the resolved type

@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crabgresql_parser::ast::Spanned;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, EnumInfo, TableEngine, TableSchema, TypeCatalog, UserCast};
@@ -254,6 +255,16 @@ pub enum BoundExpr {
     },
     IsNull {
         expr: Box<BoundExpr>,
+        negated: bool,
+    },
+    /// `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN`. Total, unlike a
+    /// comparison: the operand equals exactly one of the three boolean values,
+    /// so the test is never itself NULL.
+    BoolTest {
+        expr: Box<BoundExpr>,
+        /// The boolean value the operand is tested against, in SQL's own
+        /// three-valued domain — `None` is `UNKNOWN`, i.e. NULL.
+        value: Option<bool>,
         negated: bool,
     },
     /// Runtime cast, evaluated by `executor::eval::coerce_value` via the shared
@@ -621,7 +632,7 @@ impl BoundExpr {
                     PgType::Bool
                 }
             }
-            BoundExpr::IsNull { .. } => PgType::Bool,
+            BoundExpr::IsNull { .. } | BoundExpr::BoolTest { .. } => PgType::Bool,
             BoundExpr::Coerce { ty, .. } => *ty,
             BoundExpr::Reinterpret { reported, .. } => *reported,
             BoundExpr::FuncCall { ret, .. } | BoundExpr::Routine { ret, .. } => *ret,
@@ -649,6 +660,7 @@ impl BoundExpr {
             BoundExpr::Srf { .. } => true,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_srf(),
@@ -695,6 +707,7 @@ impl BoundExpr {
             BoundExpr::Routine { .. } => true,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_routine(),
@@ -751,7 +764,9 @@ impl BoundExpr {
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_aggregate() || right.contains_aggregate()
             }
-            BoundExpr::IsNull { expr, .. } => expr.contains_aggregate(),
+            BoundExpr::IsNull { expr, .. } | BoundExpr::BoolTest { expr, .. } => {
+                expr.contains_aggregate()
+            }
             BoundExpr::Coerce { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Collate { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Reinterpret { expr, .. } => expr.contains_aggregate(),
@@ -809,6 +824,7 @@ impl BoundExpr {
             | BoundExpr::Exists { .. } => false,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_window(),
@@ -862,6 +878,7 @@ impl BoundExpr {
             | BoundExpr::Exists { .. } => None,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.first_agg_or_window(),
@@ -921,6 +938,7 @@ impl BoundExpr {
             }
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_volatile_fn(),
@@ -964,6 +982,7 @@ impl BoundExpr {
             | BoundExpr::OuterColumnRef { .. } => 0,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.count_param_refs(index),
@@ -1030,6 +1049,7 @@ impl BoundExpr {
                 | BoundExpr::OuterColumnRef { .. } => {}
                 BoundExpr::Unary { expr, .. }
                 | BoundExpr::IsNull { expr, .. }
+                | BoundExpr::BoolTest { expr, .. }
                 | BoundExpr::Coerce { expr, .. }
                 | BoundExpr::Collate { expr, .. }
                 | BoundExpr::Reinterpret { expr, .. } => fold(expr, acc),
@@ -1118,6 +1138,7 @@ impl BoundExpr {
             | BoundExpr::OuterColumnRef { .. } => true,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.collect_column_refs(out),
@@ -1201,6 +1222,7 @@ impl BoundExpr {
             | BoundExpr::Exists { .. } => {}
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.shift_column_refs(delta),
@@ -1499,6 +1521,15 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
         },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
             expr: Box::new(outerize_columns(expr, level)),
+            negated: *negated,
+        },
+        BoundExpr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => BoundExpr::BoolTest {
+            expr: Box::new(outerize_columns(expr, level)),
+            value: *value,
             negated: *negated,
         },
         BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {
@@ -2122,6 +2153,12 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         } => bind_binary(left, op, right, op_span.0, scope),
         ast::Expr::IsNull(inner) => bind_is_null(inner, scope, false),
         ast::Expr::IsNotNull(inner) => bind_is_null(inner, scope, true),
+        ast::Expr::IsTrue(i) => bind_bool_test(i, scope, Some(true), false),
+        ast::Expr::IsNotTrue(i) => bind_bool_test(i, scope, Some(true), true),
+        ast::Expr::IsFalse(i) => bind_bool_test(i, scope, Some(false), false),
+        ast::Expr::IsNotFalse(i) => bind_bool_test(i, scope, Some(false), true),
+        ast::Expr::IsUnknown(i) => bind_bool_test(i, scope, None, false),
+        ast::Expr::IsNotUnknown(i) => bind_bool_test(i, scope, None, true),
         ast::Expr::Cast {
             expr, data_type, ..
         } => bind_cast(expr, data_type, scope),
@@ -2632,7 +2669,14 @@ fn bind_hole_template(
         },
         _ => placeholder,
     });
-    let cmp = bind_binary_op(op, needle, hole, op_span, scope.catalog().as_ref())?;
+    let cmp = bind_binary_op(
+        op,
+        needle,
+        hole,
+        op_span,
+        (Span::empty(), Span::empty()),
+        scope.catalog().as_ref(),
+    )?;
     match cmp {
         Binding::Typed(cmp @ BoundExpr::Binary { .. }) => Ok(cmp),
         // Any other comparison that lowers to a `ScalarFn` likewise has no hole
@@ -3855,7 +3899,7 @@ fn bind_unary(
         ast::UnaryOperator::PGSquareRoot => bind_prefix_float8(UnaryOp::Sqrt, "|/", operand, scope),
         ast::UnaryOperator::PGCubeRoot => bind_prefix_float8(UnaryOp::Cbrt, "||/", operand, scope),
         ast::UnaryOperator::Not => {
-            let operand = to_bool_operand(bind_expr(operand, scope)?, "NOT")?;
+            let operand = to_bool_operand(bind_expr(operand, scope)?, "NOT", operand.span())?;
             Ok(Binding::Typed(BoundExpr::Unary {
                 op: UnaryOp::Not,
                 expr: Box::new(operand),
@@ -3964,6 +4008,41 @@ fn bind_is_null(inner: &ast::Expr, scope: &Scope, negated: bool) -> Result<Bindi
     }))
 }
 
+/// How a boolean test is spelled in SQL. This is the single source of truth for
+/// the six spellings: the binder puts it in the `42804` the way PG names the
+/// clause, and `explain_expr` prints it back into a plan.
+pub fn bool_test_clause(value: Option<bool>, negated: bool) -> &'static str {
+    match (value, negated) {
+        (Some(true), false) => "IS TRUE",
+        (Some(true), true) => "IS NOT TRUE",
+        (Some(false), false) => "IS FALSE",
+        (Some(false), true) => "IS NOT FALSE",
+        (None, false) => "IS UNKNOWN",
+        (None, true) => "IS NOT UNKNOWN",
+    }
+}
+
+/// `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN`. Unlike `IS NULL`,
+/// which accepts any type, these demand a boolean operand, and an untyped
+/// literal takes boolean from here.
+fn bind_bool_test(
+    inner: &ast::Expr,
+    scope: &Scope,
+    value: Option<bool>,
+    negated: bool,
+) -> Result<Binding, BindError> {
+    let expr = to_bool_operand(
+        bind_expr(inner, scope)?,
+        bool_test_clause(value, negated),
+        inner.span(),
+    )?;
+    Ok(Binding::Typed(BoundExpr::BoolTest {
+        expr: Box::new(expr),
+        value,
+        negated,
+    }))
+}
+
 /// `CASE`: both the searched form (`CASE WHEN cond THEN r ...`) and the simple
 /// form (`CASE operand WHEN v THEN r ...`, sugar for `CASE WHEN operand = v`).
 /// Conditions are forced to boolean; all `THEN`/`ELSE` results resolve to one
@@ -3999,10 +4078,21 @@ fn bind_case(
     let mut then_bindings = Vec::with_capacity(conditions.len());
     for when in conditions {
         let cond = match &operand {
-            None => to_bool_operand(bind_expr(&when.condition, scope)?, "CASE/WHEN")?,
+            None => to_bool_operand(
+                bind_expr(&when.condition, scope)?,
+                "CASE/WHEN",
+                when.condition.span(),
+            )?,
             Some(op) => {
                 let value = bind_expr(&when.condition, scope)?;
-                match bind_binary_op(BinOp::Eq, op.clone(), value, Span::empty(), scope.catalog().as_ref())? {
+                match bind_binary_op(
+                    BinOp::Eq,
+                    op.clone(),
+                    value,
+                    Span::empty(),
+                    (Span::empty(), Span::empty()),
+                    scope.catalog().as_ref(),
+                )? {
                     Binding::Typed(e) => e,
                     // `=` always resolves to a typed boolean expression.
                     Binding::Unknown { .. } => unreachable!("= yields a typed bool"),
@@ -4102,11 +4192,25 @@ fn bind_in_list(
             None => item.clone(),
         };
         let comparison =
-            bind_binary_op(cmp, left.clone(), right, Span::empty(), scope.catalog().as_ref())?;
+            bind_binary_op(
+                cmp,
+                left.clone(),
+                right,
+                Span::empty(),
+                (Span::empty(), Span::empty()),
+                scope.catalog().as_ref(),
+            )?;
         acc = Some(match acc {
             None => comparison,
             Some(prev) => {
-                bind_binary_op(chain, prev, comparison, Span::empty(), scope.catalog().as_ref())?
+                bind_binary_op(
+                    chain,
+                    prev,
+                    comparison,
+                    Span::empty(),
+                    (Span::empty(), Span::empty()),
+                    scope.catalog().as_ref(),
+                )?
             }
         });
     }
@@ -4145,10 +4249,31 @@ fn bind_between(
     let catalog = scope.catalog();
     let left = bind_expr(expr, scope)?;
     let low = bind_expr(low, scope)?;
-    let lo = bind_binary_op(cmp_lo, left.clone(), low, Span::empty(), catalog.as_ref())?;
+    let lo = bind_binary_op(
+        cmp_lo,
+        left.clone(),
+        low,
+        Span::empty(),
+        (Span::empty(), Span::empty()),
+        catalog.as_ref(),
+    )?;
     let high = bind_expr(high, scope)?;
-    let hi = bind_binary_op(cmp_hi, left, high, Span::empty(), catalog.as_ref())?;
-    bind_binary_op(chain, lo, hi, Span::empty(), catalog.as_ref())
+    let hi = bind_binary_op(
+        cmp_hi,
+        left,
+        high,
+        Span::empty(),
+        (Span::empty(), Span::empty()),
+        catalog.as_ref(),
+    )?;
+    bind_binary_op(
+        chain,
+        lo,
+        hi,
+        Span::empty(),
+        (Span::empty(), Span::empty()),
+        catalog.as_ref(),
+    )
 }
 
 /// How an `IN` list resolves to the element type of PG's `= ANY(ARRAY[...])`.
@@ -4355,7 +4480,14 @@ fn bind_binary(
     // The comparison spellings are shared with the quantified (`ANY`/`ALL`) path
     // so the two can never drift apart.
     if let Some(op) = binop_from_comparison(op) {
-        return bind_binary_op(op, lb, rb, op_span, scope.catalog().as_ref());
+        return bind_binary_op(
+            op,
+            lb,
+            rb,
+            op_span,
+            (left.span(), right.span()),
+            scope.catalog().as_ref(),
+        );
     }
     let op = match op {
         ast::BinaryOperator::And => BinOp::And,
@@ -4372,7 +4504,14 @@ fn bind_binary(
             )));
         }
     };
-    bind_binary_op(op, lb, rb, op_span, scope.catalog().as_ref())
+    bind_binary_op(
+        op,
+        lb,
+        rb,
+        op_span,
+        (left.span(), right.span()),
+        scope.catalog().as_ref(),
+    )
 }
 
 /// Resolve a binary operator over two already-bound operands. Split out from
@@ -4386,11 +4525,15 @@ pub(crate) fn bind_binary_op(
     lb: Binding,
     rb: Binding,
     op_span: Span,
+    operand_spans: (Span, Span),
     catalog: &dyn TypeCatalog,
 ) -> Result<Binding, BindError> {
     if op.is_logic() {
-        let left = to_bool_operand(lb, op.sql_symbol())?;
-        let right = to_bool_operand(rb, op.sql_symbol())?;
+        // `AND`/`OR` are also built by desugaring (BETWEEN, chained
+        // comparisons); those callers pass empty spans and so print no cursor,
+        // matching PG, which has no source position for them either.
+        let left = to_bool_operand(lb, op.sql_symbol(), operand_spans.0)?;
+        let right = to_bool_operand(rb, op.sql_symbol(), operand_spans.1)?;
         return Ok(Binding::Typed(BoundExpr::Binary {
             op,
             arg_ty: PgType::Bool,
@@ -6391,8 +6534,16 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
 }
 
 /// Force a binding to boolean for WHERE / AND / OR / NOT. `context` is the
-/// clause or operator name as PG prints it.
-pub(crate) fn to_bool_operand(binding: Binding, context: &str) -> Result<BoundExpr, BindError> {
+/// clause or operator name as PG prints it, and `span` locates the operand,
+/// which is where PG points the `LINE n: ... ^` cursor for every one of these
+/// clauses. Pass `Span::empty()` when the operand was synthesized rather than
+/// written (the cursor is then omitted, as it is for a `BETWEEN` desugared into
+/// `AND`) — see `bind_binary_op`, which has no operand spans to give.
+pub(crate) fn to_bool_operand(
+    binding: Binding,
+    context: &str,
+    span: Span,
+) -> Result<BoundExpr, BindError> {
     match binding {
         Binding::Typed(e) if e.ty() == PgType::Bool => Ok(e),
         Binding::Typed(e) => Err(BindError::new(
@@ -6401,7 +6552,10 @@ pub(crate) fn to_bool_operand(binding: Binding, context: &str) -> Result<BoundEx
                 "argument of {context} must be type boolean, not type {}",
                 e.ty().name()
             ),
-        )),
+        )
+        .at(span)),
+        // `resolve_unknown` reports the literal's own position, which is finer
+        // than the operand span, so leave its cursor alone.
         Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Bool),
     }
 }
@@ -6933,6 +7087,15 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
         },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
             expr: Box::new(inline_params(*expr, args)),
+            negated,
+        },
+        BoundExpr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => BoundExpr::BoolTest {
+            expr: Box::new(inline_params(*expr, args)),
+            value,
             negated,
         },
         BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {
