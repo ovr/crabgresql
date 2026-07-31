@@ -27,6 +27,13 @@ const MAX_NBASE_WEIGHT: i64 = 0x7FFF;
 /// Division/transcendental "give at least this many significant digits" floor,
 /// matching PG's `NUMERIC_MIN_SIG_DIGITS`.
 const MIN_SIG_DIGITS: i32 = 16;
+/// Ceiling on the display scale exp/ln/log/power pick for themselves. PG stops
+/// at 1000 fractional digits there, well short of [`MAX_DSCALE`]: `exp(-5000)`
+/// prints 1000 zeros, `exp(-2000)` the 884 its own estimate asks for.
+const MAX_RESULT_SCALE: i32 = 1000;
+/// Largest decimal weight a stored value can have, from [`MAX_NBASE_WEIGHT`];
+/// a result whose weight exceeds this overflows the numeric format.
+const MAX_DECIMAL_WEIGHT: f64 = ((MAX_NBASE_WEIGHT + 1) * 4) as f64;
 
 #[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 enum Sign {
@@ -632,6 +639,19 @@ impl Numeric {
         self.set_scale(s, true)
     }
 
+    /// Round to at most `prec` significant digits, dropping the display scale.
+    /// Unlike [`Numeric::round`], which fixes the number of digits *after* the
+    /// point, this bounds the total width — what an iterative computation needs
+    /// to keep its intermediates from growing without limit.
+    fn round_sig(&self, prec: i32) -> Numeric {
+        if self.is_special() || self.is_zero() || (self.digits.len() as i32) <= prec {
+            return self.clone();
+        }
+        let mut v = self.round(prec - 1 - self.weight);
+        v.dscale = 0;
+        v
+    }
+
     /// `trunc(x, s)`: truncate toward zero to `s` fractional digits.
     pub fn trunc(&self, s: i32) -> Numeric {
         if self.is_special() {
@@ -961,13 +981,31 @@ impl Numeric {
                 "a negative number raised to a non-integer power yields a complex result",
             ));
         }
-        // Result scale from the estimated result weight, `trunc(y * log10|x|)`.
-        // The estimate is done in f64 and may be ±infinite for an extreme base;
-        // `scale_from_estimate` clamps safely.
-        let rscale = scale_from_estimate((y.to_f64() * self.abs().to_f64().log10()).trunc());
+        // Result scale from the estimated result weight, `trunc(y * log10|x|)`,
+        // but never below either operand's own scale — `2.0 ^ 100` keeps the
+        // base's one fractional digit even though 16 significant digits are
+        // long spent. The estimate is done in f64 and may be ±infinite for an
+        // extreme base; `scale_from_estimate` clamps safely.
+        let weight_est = y.to_f64() * self.abs().to_f64().log10();
+        let rscale = scale_from_estimate(weight_est.trunc())
+            .max(self.dscale)
+            .max(y.dscale)
+            .min(MAX_RESULT_SCALE);
 
         if let Some(n) = y_int {
-            let mag = self.abs().int_power(n, rscale)?;
+            // Decide the extreme cases from the estimate instead of computing
+            // them: `117743296169.0 ^ 1000000000` overflows by ten orders of
+            // magnitude, and multiplying up to the limit first would take
+            // minutes. A few digits of margin leave anything borderline to the
+            // exact check inside `int_power`.
+            if weight_est > MAX_DECIMAL_WEIGHT + 4.0 {
+                return Err(NumErr::new("22003", "value overflows numeric format"));
+            }
+            if weight_est < -(rscale as f64) - 2.0 {
+                // Smaller than half an ulp at the result scale: a plain zero.
+                return Ok(Numeric::zero(rscale));
+            }
+            let mag = self.abs().int_power(n, rscale, weight_est)?;
             let neg = self.is_neg() && n % 2 != 0;
             return Ok(if neg { mag.neg() } else { mag });
         }
@@ -996,24 +1034,37 @@ impl Numeric {
 
     /// `|x|^n` for integer `n`, via repeated squaring, rounded to `rscale`.
     /// Negative `n` inverts. Overflow of the magnitude is a numeric-format error.
-    fn int_power(&self, n: i64, rscale: i32) -> Result<Numeric, NumErr> {
+    ///
+    /// The squaring runs at a bounded precision: exact squaring doubles the
+    /// digit count every step, so `1.000000000123 ^ 2147483648` would ask for
+    /// ~2^31 · 13 digits and never finish, even though its result is 1.0000000
+    /// to sixteen places. `weight_est` is the caller's estimate of the result's
+    /// decimal weight and sets how many significant digits that takes.
+    fn int_power(&self, n: i64, rscale: i32, weight_est: f64) -> Result<Numeric, NumErr> {
         if n == 0 {
             return Ok(Numeric::from_i128(1).round(rscale));
         }
+        // Digits the rounded result needs, plus guard digits: each rounding
+        // below costs a relative 10^-prec and there are under 2·64 of them.
+        let needed = (weight_est.abs() + rscale as f64).clamp(
+            MIN_SIG_DIGITS as f64,
+            MAX_DECIMAL_WEIGHT + MAX_RESULT_SCALE as f64,
+        );
+        let prec = needed as i32 + 24;
         let mut base = self.clone();
         base.dscale = 0;
         let mut exp = n.unsigned_abs();
         let mut acc = Numeric::from_i128(1);
         while exp > 0 {
             if exp & 1 == 1 {
-                acc = acc.mul(&base);
+                acc = acc.mul(&base).round_sig(prec);
                 if acc.nbase_weight() > MAX_NBASE_WEIGHT {
                     return Err(NumErr::new("22003", "value overflows numeric format"));
                 }
             }
             exp >>= 1;
             if exp > 0 {
-                base = base.mul(&base);
+                base = base.mul(&base).round_sig(prec);
                 if base.nbase_weight() > MAX_NBASE_WEIGHT {
                     return Err(NumErr::new("22003", "value overflows numeric format"));
                 }
@@ -1205,7 +1256,7 @@ fn scale_from_estimate(weight_est: f64) -> i32 {
     if weight_est.is_nan() {
         return 0;
     }
-    (MIN_SIG_DIGITS as f64 - weight_est).clamp(0.0, MAX_DSCALE as f64) as i32
+    (MIN_SIG_DIGITS as f64 - weight_est).clamp(0.0, MAX_RESULT_SCALE as f64) as i32
 }
 
 /// Result scale for `exp(x)`: from the estimated result weight `trunc(x·log10 e)`.
@@ -1881,6 +1932,40 @@ mod tests {
         assert_eq!(n("-2").power(&n("0.5")).unwrap_err().sqlstate, "2201F");
         assert_eq!(n("0").power(&n("0"))?.to_display(), "1");
 
+        Ok(())
+    }
+
+    /// Integer exponents big enough that exact repeated squaring would never
+    /// finish. Each of these used to run until it was killed; the estimate and
+    /// the bounded working precision decide them in constant time.
+    #[test]
+    fn extreme_integer_powers_terminate() -> anyhow::Result<()> {
+        // Overflows by ten orders of magnitude — decided without multiplying.
+        assert_eq!(
+            n("117743296169.0")
+                .power(&n("1000000000"))
+                .unwrap_err()
+                .sqlstate,
+            "22003"
+        );
+        assert_eq!(
+            n("10.0").power(&n("2147483647")).unwrap_err().sqlstate,
+            "22003"
+        );
+        // Underflows past the result scale, which PG caps at 1000 digits.
+        let tiny = n("10.0").power(&n("-2147483648"))?.to_display();
+        assert_eq!(tiny, format!("0.{}", "0".repeat(1000)));
+        // Neither extreme: a base so close to 1 that the result is ordinary,
+        // reached in 31 squarings held to a few dozen significant digits.
+        assert_eq!(
+            n("1.000000000123").power(&n("-2147483648"))?.to_display(),
+            "0.7678656556403084"
+        );
+        // Bounded precision must not cost exactness where the result is exact.
+        assert_eq!(
+            n("2.0").power(&n("100"))?.to_display(),
+            "1267650600228229401496703205376.0"
+        );
         Ok(())
     }
 
