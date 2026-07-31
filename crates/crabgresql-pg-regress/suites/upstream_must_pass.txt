@@ -10,3 +10,4 @@ macaddr8
 md5
 money
 time
+varchar
