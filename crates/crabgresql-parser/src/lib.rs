@@ -72,19 +72,61 @@ pub mod test_utils;
 pub use crate::tokenizer::{Location, Span};
 
 use crate::dialect::PostgreSqlDialect;
-use crate::parser::Parser;
+use crate::parser::{Parser, ParserError};
+
+/// The SQLSTATE a parse failure carries when it has no more specific one.
+pub const SYNTAX_ERROR: &str = tokenizer::DEFAULT_TOKENIZER_SQLSTATE;
 
 /// Error returned when a SQL string cannot be parsed.
+///
+/// Almost every parse failure is a plain `42601` syntax error whose message
+/// already carries its own position text. The exceptions are the escape
+/// sequences inside `E'…'` and `U&'…'`, which reproduce a specific PostgreSQL
+/// diagnostic: those set a different [`ParseError::sqlstate`], may add a
+/// [`ParseError::hint`], and report [`ParseError::location`] separately so the
+/// protocol layer can turn it into a `LINE n:` cursor.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct ParseError(String);
+#[error("{message}")]
+pub struct ParseError {
+    /// The text shown to the client, without a SQLSTATE or position prefix.
+    pub message: String,
+    /// 5-character SQLSTATE; [`SYNTAX_ERROR`] unless the failure reproduces a
+    /// more specific PostgreSQL condition.
+    pub sqlstate: &'static str,
+    /// Optional `HINT:` line.
+    pub hint: Option<String>,
+    /// 1-based (line, column) of the offending token, when PG reports a cursor
+    /// position for this condition.
+    pub location: Option<(u64, u64)>,
+}
+
+impl From<ParserError> for ParseError {
+    fn from(e: ParserError) -> Self {
+        match e {
+            ParserError::PgDiagnostic(d) => ParseError {
+                message: d.message,
+                sqlstate: d.sqlstate,
+                hint: d.hint,
+                // A zero location is how the tokenizer says "no cursor here" —
+                // PG omits the position on an encoding error, for instance.
+                location: (d.location.line != 0).then_some((d.location.line, d.location.column)),
+            },
+            other => ParseError {
+                message: other.to_string(),
+                sqlstate: SYNTAX_ERROR,
+                hint: None,
+                location: None,
+            },
+        }
+    }
+}
 
 /// Parse a query string into a list of statements.
 ///
 /// An empty (or comment-only) string yields an empty list, which the protocol
 /// layer must answer with `EmptyQueryResponse`.
 pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
-    Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|e| ParseError(e.to_string()))
+    Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(ParseError::from)
 }
 
 /// Parse a bare SQL type name, e.g. `numeric(10, 2)`, `text[]` or a
@@ -96,13 +138,11 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
 pub fn parse_data_type(sql: &str) -> Result<ast::DataType, ParseError> {
     let mut parser = Parser::new(&PostgreSqlDialect {})
         .try_with_sql(sql)
-        .map_err(|e| ParseError(e.to_string()))?;
-    let data_type = parser
-        .parse_data_type()
-        .map_err(|e| ParseError(e.to_string()))?;
+        .map_err(ParseError::from)?;
+    let data_type = parser.parse_data_type().map_err(ParseError::from)?;
     parser
         .expect_token(&tokenizer::Token::EOF)
-        .map_err(|e| ParseError(e.to_string()))?;
+        .map_err(ParseError::from)?;
     Ok(data_type)
 }
 

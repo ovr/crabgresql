@@ -828,8 +828,8 @@ impl Interpreter {
         ctx: &ExecContext,
         txn: &TxnContext,
     ) -> Result<Rows, ExecError> {
-        let mut statements = crabgresql_parser::parse(sql)
-            .map_err(|e| ExecError::new(sqlstate::SYNTAX_ERROR, e.to_string()))?;
+        let mut statements =
+            crabgresql_parser::parse(sql).map_err(|e| ExecError::new(e.sqlstate, e.message))?;
         if statements.len() != 1 {
             return Err(ExecError::new(
                 sqlstate::SYNTAX_ERROR,

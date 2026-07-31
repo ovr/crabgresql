@@ -776,17 +776,64 @@ impl fmt::Display for TokenWithSpan {
     }
 }
 
+/// The SQLSTATE a tokenizer error carries when it has no more specific one.
+/// Everything the lexer rejects is, by default, a syntax error.
+pub const DEFAULT_TOKENIZER_SQLSTATE: &str = "42601";
+
 /// An error reported by the tokenizer, with a human-readable `message` and a `location`.
+///
+/// Most lexer failures are generic syntax errors whose message only reads
+/// correctly with the location appended. A few — the escape sequences inside
+/// `E'…'` and `U&'…'` — reproduce a specific PostgreSQL diagnostic instead: they
+/// set `sqlstate` (and sometimes a `hint`), and their message is PG's wording
+/// verbatim, to be surfaced to the client as-is with the location reported
+/// separately as a cursor position.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TokenizerError {
     /// A descriptive error message.
     pub message: String,
     /// The `Location` where the error was detected.
     pub location: Location,
+    /// 5-character SQLSTATE when this error reproduces a specific PostgreSQL
+    /// diagnostic; `None` for a generic syntax error.
+    pub sqlstate: Option<&'static str>,
+    /// Optional `HINT:` line, for the diagnostics that PG pairs with one.
+    pub hint: Option<String>,
+}
+
+impl TokenizerError {
+    /// A generic syntax error: the message is only meaningful with the location
+    /// appended, which is what [`fmt::Display`] does.
+    pub fn new(message: impl Into<String>, location: Location) -> Self {
+        Self {
+            message: message.into(),
+            location,
+            sqlstate: None,
+            hint: None,
+        }
+    }
+
+    /// An error reproducing a specific PostgreSQL diagnostic.
+    pub fn pg(
+        sqlstate: &'static str,
+        message: impl Into<String>,
+        hint: Option<String>,
+        location: Location,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            location,
+            sqlstate: Some(sqlstate),
+            hint,
+        }
+    }
 }
 
 impl fmt::Display for TokenizerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.sqlstate.is_some() {
+            return f.write_str(&self.message);
+        }
         write!(f, "{}{}", self.message, self.location,)
     }
 }
@@ -2008,10 +2055,7 @@ impl<'a> Tokenizer<'a> {
         loc: Location,
         message: impl Into<String>,
     ) -> Result<R, TokenizerError> {
-        Err(TokenizerError {
-            message: message.into(),
-            location: loc,
-        })
+        Err(TokenizerError::new(message, loc))
     }
 
     // Consume characters until newline
@@ -2066,11 +2110,7 @@ impl<'a> Tokenizer<'a> {
         starting_loc: Location,
         chars: &mut State,
     ) -> Result<String, TokenizerError> {
-        if let Some(s) = unescape_single_quoted_string(chars) {
-            return Ok(s);
-        }
-
-        self.tokenizer_error(starting_loc, "Unterminated encoded string literal")
+        unescape_single_quoted_string(chars, starting_loc)
     }
 
     /// Reads a string literal quoted by a single or triple quote characters.
@@ -2415,10 +2455,23 @@ fn peeking_next_take_while(
     s
 }
 
-fn unescape_single_quoted_string(chars: &mut State<'_>) -> Option<String> {
-    Unescape::new(chars).unescape()
+/// PG's hint for a malformed `\u`/`\U` escape inside an `E'…'` literal.
+const ESCAPE_UNICODE_HINT: &str = r"Unicode escapes must be \uXXXX or \UXXXXXXXX.";
+
+fn unescape_single_quoted_string(
+    chars: &mut State<'_>,
+    starting_loc: Location,
+) -> Result<String, TokenizerError> {
+    Unescape::new(chars).unescape(starting_loc)
 }
 
+/// Decoder for the body of a PostgreSQL escape string constant, `E'…'`.
+///
+/// PostgreSQL decodes these escapes into **bytes** and only validates the result
+/// as UTF-8 once the whole literal is assembled, which is why `E'\xc3\xa9'` is
+/// the single character `é` while `E'\x80'` on its own is a 22021 encoding
+/// error. Decoding straight into a Rust `String` cannot express that, so the
+/// buffer here is a `Vec<u8>` and the UTF-8 check happens in `finish`.
 struct Unescape<'a: 'b, 'b> {
     chars: &'b mut State<'a>,
 }
@@ -2427,146 +2480,206 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
     fn new(chars: &'b mut State<'a>) -> Self {
         Self { chars }
     }
-    fn unescape(mut self) -> Option<String> {
-        let mut unescaped = String::new();
 
-        self.chars.next();
+    fn unescape(mut self, starting_loc: Location) -> Result<String, TokenizerError> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut scratch = [0u8; 4];
 
-        while let Some(c) = self.chars.next() {
+        self.chars.next(); // consume the opening quote
+
+        loop {
+            // Taken before the character is consumed, so it names that
+            // character's own column: PG's caret sits on the offending
+            // backslash, not on what follows it.
+            let esc_loc = self.chars.location();
+            let Some(c) = self.chars.next() else { break };
+
             if c == '\'' {
                 // case: ''''
-                if self.chars.peek().map(|c| *c == '\'').unwrap_or(false) {
+                if self.chars.peek() == Some(&'\'') {
                     self.chars.next();
-                    unescaped.push('\'');
+                    buf.push(b'\'');
                     continue;
                 }
-                return Some(unescaped);
+                return Self::finish(buf);
             }
 
             if c != '\\' {
-                unescaped.push(c);
+                buf.extend_from_slice(c.encode_utf8(&mut scratch).as_bytes());
                 continue;
             }
 
-            let c = match self.chars.next()? {
-                'b' => '\u{0008}',
-                'f' => '\u{000C}',
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                'u' => self.unescape_unicode_16()?,
-                'U' => self.unescape_unicode_32()?,
-                'x' => self.unescape_hex()?,
-                c if c.is_digit(8) => self.unescape_octal(c)?,
-                c => c,
-            };
-
-            unescaped.push(Self::check_null(c)?);
-        }
-
-        None
-    }
-
-    #[inline]
-    fn check_null(c: char) -> Option<char> {
-        if c == '\0' {
-            None
-        } else {
-            Some(c)
-        }
-    }
-
-    #[inline]
-    fn byte_to_char<const RADIX: u32>(s: &str) -> Option<char> {
-        // u32 is used here because Pg has an overflow operation rather than throwing an exception directly.
-        match u32::from_str_radix(s, RADIX) {
-            Err(_) => None,
-            Ok(n) => {
-                let n = n & 0xFF;
-                if n <= 127 {
-                    char::from_u32(n)
-                } else {
-                    None
+            let Some(esc) = self.chars.next() else { break };
+            match esc {
+                'b' => buf.push(0x08),
+                'f' => buf.push(0x0C),
+                'n' => buf.push(b'\n'),
+                'r' => buf.push(b'\r'),
+                't' => buf.push(b'\t'),
+                'u' | 'U' => {
+                    let c = self.unescape_unicode(esc == 'U', esc_loc)?;
+                    buf.extend_from_slice(c.encode_utf8(&mut scratch).as_bytes());
                 }
+                'x' => buf.push(self.unescape_hex()),
+                d if d.is_digit(8) => buf.push(self.unescape_octal(d)),
+                // Anything else stands for itself, including `\\`, `\'` and
+                // `\"`. PG silently drops the backslash: `E'\z'` is `z`.
+                other => buf.extend_from_slice(other.encode_utf8(&mut scratch).as_bytes()),
             }
+        }
+
+        Err(TokenizerError::new(
+            "Unterminated encoded string literal",
+            starting_loc,
+        ))
+    }
+
+    /// Validate the assembled bytes the way PostgreSQL validates a client
+    /// string: it must be well-formed in the server encoding (UTF-8 here), and
+    /// it may not contain a NUL — which `str::from_utf8` would happily accept,
+    /// so it is rejected separately.
+    fn finish(buf: Vec<u8>) -> Result<String, TokenizerError> {
+        let bad = match std::str::from_utf8(&buf) {
+            Ok(_) => buf.iter().position(|b| *b == 0),
+            // PG prints the whole malformed sequence for a truncated multi-byte
+            // character; naming its first byte matches every single-byte case
+            // and is close enough for the rest.
+            Err(e) => Some(e.valid_up_to()),
+        };
+        match bad {
+            None => Ok(String::from_utf8(buf).expect("validated just above")),
+            Some(i) => Err(TokenizerError::pg(
+                "22021",
+                format!(
+                    "invalid byte sequence for encoding \"UTF8\": 0x{:02x}",
+                    buf[i]
+                ),
+                None,
+                // PG reports an encoding error without a cursor position.
+                Location { line: 0, column: 0 },
+            )),
         }
     }
 
-    // Hexadecimal byte value. \xh, \xhh (h = 0–9, A–F)
-    fn unescape_hex(&mut self) -> Option<char> {
-        let mut s = String::new();
+    /// Hexadecimal byte value: `\xh`, `\xhh` (h = 0–9, A–F). With no hex digit
+    /// at all the `x` stands for itself, as in PG.
+    fn unescape_hex(&mut self) -> u8 {
+        let mut value: u32 = 0;
+        let mut digits = 0;
+        while digits < 2 {
+            let Some(d) = self.chars.peek().and_then(|c| c.to_digit(16)) else {
+                break;
+            };
+            self.chars.next();
+            value = value * 16 + d;
+            digits += 1;
+        }
+        if digits == 0 { b'x' } else { value as u8 }
+    }
 
+    /// Octal byte value: `\o`, `\oo`, `\ooo` (o = 0–7). PG truncates rather than
+    /// erroring on overflow, so `\400` is the byte `0x00`.
+    fn unescape_octal(&mut self, first: char) -> u8 {
+        let mut value: u32 = first.to_digit(8).expect("caller checked");
         for _ in 0..2 {
-            match self.next_hex_digit() {
-                Some(c) => s.push(c),
-                None => break,
-            }
+            let Some(d) = self.chars.peek().and_then(|c| c.to_digit(8)) else {
+                break;
+            };
+            self.chars.next();
+            value = value * 8 + d;
         }
-
-        if s.is_empty() {
-            return Some('x');
-        }
-
-        Self::byte_to_char::<16>(&s)
+        (value & 0xFF) as u8
     }
 
-    #[inline]
-    fn next_hex_digit(&mut self) -> Option<char> {
-        match self.chars.peek() {
-            Some(c) if c.is_ascii_hexdigit() => self.chars.next(),
-            _ => None,
+    /// `\uXXXX` (16-bit) or `\UXXXXXXXX` (32-bit) code point. A UTF-16 high
+    /// surrogate must be followed by a `\u` low surrogate; the pair combines
+    /// into one scalar, which is how `E'😄'` yields an emoji.
+    fn unescape_unicode(&mut self, wide: bool, esc_loc: Location) -> Result<char, TokenizerError> {
+        let invalid = || {
+            TokenizerError::pg(
+                "22025",
+                "invalid Unicode escape",
+                Some(ESCAPE_UNICODE_HINT.to_string()),
+                esc_loc,
+            )
+        };
+        let (value, text) = self.hex_escape(wide, &invalid)?;
+
+        // A low surrogate with no high half before it is reported on the escape
+        // itself; a high surrogate is reported on whatever failed to complete
+        // it, which is why the two cases pass different locations and tokens.
+        if (0xDC00..=0xDFFF).contains(&value) {
+            return Err(Self::bad_surrogate(esc_loc, &text));
         }
+        if !(0xD800..=0xDBFF).contains(&value) {
+            return char::from_u32(value).ok_or_else(invalid);
+        }
+
+        let after = self.chars.location();
+        let bad_low = |token: &str| Err(Self::bad_surrogate(after, token));
+        if self.chars.peek() != Some(&'\\') {
+            // Whatever stands where the low half should be — possibly the
+            // literal's own closing quote.
+            let token: String = self.chars.peek().into_iter().collect();
+            return bad_low(&token);
+        }
+        self.chars.next();
+        let low_wide = match self.chars.peek() {
+            Some('u') => false,
+            Some('U') => true,
+            _ => return bad_low("\\"),
+        };
+        self.chars.next();
+        let (low, low_text) = self.hex_escape(low_wide, &invalid)?;
+        if !(0xDC00..=0xDFFF).contains(&low) {
+            return bad_low(&low_text);
+        }
+        let combined = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
+        char::from_u32(combined).ok_or_else(invalid)
     }
 
-    // Octal byte value. \o, \oo, \ooo (o = 0–7)
-    fn unescape_octal(&mut self, c: char) -> Option<char> {
-        let mut s = String::new();
-
-        s.push(c);
-        for _ in 0..2 {
-            match self.next_octal_digest() {
-                Some(c) => s.push(c),
-                None => break,
-            }
+    /// Read the hex digits of a `\u`/`\U` escape, returning both the value and
+    /// the escape as written — PG quotes the source text in its error.
+    fn hex_escape(
+        &mut self,
+        wide: bool,
+        invalid: &dyn Fn() -> TokenizerError,
+    ) -> Result<(u32, String), TokenizerError> {
+        let mut value: u32 = 0;
+        let mut text = String::from(if wide { "\\U" } else { "\\u" });
+        for _ in 0..if wide { 8 } else { 4 } {
+            let c = *self.chars.peek().ok_or_else(invalid)?;
+            let d = c.to_digit(16).ok_or_else(invalid)?;
+            self.chars.next();
+            text.push(c);
+            value = value * 16 + d;
         }
-
-        Self::byte_to_char::<8>(&s)
+        Ok((value, text))
     }
 
-    #[inline]
-    fn next_octal_digest(&mut self) -> Option<char> {
-        match self.chars.peek() {
-            Some(c) if c.is_digit(8) => self.chars.next(),
-            _ => None,
-        }
-    }
-
-    // 16-bit hexadecimal Unicode character value. \uxxxx (x = 0–9, A–F)
-    fn unescape_unicode_16(&mut self) -> Option<char> {
-        self.unescape_unicode::<4>()
-    }
-
-    // 32-bit hexadecimal Unicode character value. \Uxxxxxxxx (x = 0–9, A–F)
-    fn unescape_unicode_32(&mut self) -> Option<char> {
-        self.unescape_unicode::<8>()
-    }
-
-    fn unescape_unicode<const NUM: usize>(&mut self) -> Option<char> {
-        let mut s = String::new();
-        for _ in 0..NUM {
-            s.push(self.chars.next()?);
-        }
-        match u32::from_str_radix(&s, 16) {
-            Err(_) => None,
-            Ok(n) => char::from_u32(n),
-        }
+    /// PG reports a half-formed surrogate pair as a plain syntax error rather
+    /// than as an invalid escape, offers no hint, and names the offending token.
+    fn bad_surrogate(loc: Location, token: &str) -> TokenizerError {
+        TokenizerError::pg(
+            DEFAULT_TOKENIZER_SQLSTATE,
+            format!("invalid Unicode surrogate pair at or near \"{token}\""),
+            None,
+            loc,
+        )
     }
 }
+
+/// PG's hint for a malformed escape in a `U&'…'` literal (`str_udeescape`).
+const UESCAPE_HINT: &str = r"Unicode escapes must be \XXXX or \+XXXXXX.";
 
 fn unescape_unicode_single_quoted_string(chars: &mut State<'_>) -> Result<String, TokenizerError> {
     let mut unescaped = String::new();
     chars.next(); // consume the opening quote
-    while let Some(c) = chars.next() {
+    loop {
+        // Taken before the character is consumed, so it names that character's
+        // own column — PG puts the caret on the offending backslash.
+        let esc_loc = chars.location();
+        let Some(c) = chars.next() else { break };
         match c {
             '\'' => {
                 if chars.peek() == Some(&'\'') {
@@ -2583,42 +2696,47 @@ fn unescape_unicode_single_quoted_string(chars: &mut State<'_>) -> Result<String
                 }
                 Some('+') => {
                     chars.next();
-                    unescaped.push(take_char_from_hex_digits(chars, 6)?);
+                    unescaped.push(take_char_from_hex_digits(chars, 6, esc_loc)?);
                 }
-                _ => unescaped.push(take_char_from_hex_digits(chars, 4)?),
+                _ => unescaped.push(take_char_from_hex_digits(chars, 4, esc_loc)?),
             },
             _ => {
                 unescaped.push(c);
             }
         }
     }
-    Err(TokenizerError {
-        message: "Unterminated unicode encoded string literal".to_string(),
-        location: chars.location(),
-    })
+    Err(TokenizerError::new(
+        "Unterminated unicode encoded string literal",
+        chars.location(),
+    ))
 }
 
+/// A `U&'…'` escape names a code point directly (not a byte), so anything that
+/// is not `max_digits` hex digits forming a valid scalar is PG's
+/// `invalid Unicode escape`, reported at the backslash that opened it.
 fn take_char_from_hex_digits(
     chars: &mut State<'_>,
     max_digits: usize,
+    esc_loc: Location,
 ) -> Result<char, TokenizerError> {
+    let invalid = || {
+        TokenizerError::pg(
+            DEFAULT_TOKENIZER_SQLSTATE,
+            "invalid Unicode escape",
+            Some(UESCAPE_HINT.to_string()),
+            esc_loc,
+        )
+    };
     let mut result = 0u32;
     for _ in 0..max_digits {
-        let next_char = chars.next().ok_or_else(|| TokenizerError {
-            message: "Unexpected EOF while parsing hex digit in escaped unicode string."
-                .to_string(),
-            location: chars.location(),
-        })?;
-        let digit = next_char.to_digit(16).ok_or_else(|| TokenizerError {
-            message: format!("Invalid hex digit in escaped unicode string: {next_char}"),
-            location: chars.location(),
-        })?;
+        let digit = chars
+            .peek()
+            .and_then(|c| c.to_digit(16))
+            .ok_or_else(invalid)?;
+        chars.next();
         result = result * 16 + digit;
     }
-    char::from_u32(result).ok_or_else(|| TokenizerError {
-        message: format!("Invalid unicode character: {result:x}"),
-        location: chars.location(),
-    })
+    char::from_u32(result).ok_or_else(invalid)
 }
 
 #[cfg(test)]
@@ -2630,15 +2748,25 @@ mod tests {
 
     #[test]
     fn tokenizer_error_impl() {
-        let err = TokenizerError {
-            message: "test".into(),
-            location: Location { line: 1, column: 1 },
-        };
+        let err = TokenizerError::new("test", Location { line: 1, column: 1 });
         {
             use core::error::Error;
             assert!(err.source().is_none());
         }
         assert_eq!(err.to_string(), "test at Line: 1, Column: 1");
+
+        // A PG diagnostic stands on its own: the location is reported as a
+        // cursor position instead of being appended to the message.
+        let pg = TokenizerError::pg(
+            "22025",
+            "invalid Unicode escape",
+            Some(ESCAPE_UNICODE_HINT.to_string()),
+            Location {
+                line: 1,
+                column: 10,
+            },
+        );
+        assert_eq!(pg.to_string(), "invalid Unicode escape");
     }
 
     #[test]
@@ -3052,10 +3180,10 @@ mod tests {
         let mut tokenizer = Tokenizer::new(&dialect, &sql);
         assert_eq!(
             tokenizer.tokenize(),
-            Err(TokenizerError {
-                message: "Unterminated string literal".to_string(),
-                location: Location { line: 1, column: 8 },
-            })
+            Err(TokenizerError::new(
+                "Unterminated string literal",
+                Location { line: 1, column: 8 }
+            ))
         );
     }
 
@@ -3067,13 +3195,13 @@ mod tests {
         let mut tokenizer = Tokenizer::new(&dialect, &sql);
         assert_eq!(
             tokenizer.tokenize(),
-            Err(TokenizerError {
-                message: "Unterminated string literal".to_string(),
-                location: Location {
+            Err(TokenizerError::new(
+                "Unterminated string literal",
+                Location {
                     line: 1,
                     column: 35
                 }
-            })
+            ))
         );
     }
 
@@ -3176,13 +3304,13 @@ mod tests {
         let dialect = GenericDialect {};
         assert_eq!(
             Tokenizer::new(&dialect, &sql).tokenize(),
-            Err(TokenizerError {
-                message: "Unterminated dollar-quoted, expected $".into(),
-                location: Location {
+            Err(TokenizerError::new(
+                "Unterminated dollar-quoted, expected $",
+                Location {
                     line: 1,
                     column: 91
                 }
-            })
+            ))
         );
     }
 
@@ -3192,13 +3320,13 @@ mod tests {
         let dialect = GenericDialect {};
         assert_eq!(
             Tokenizer::new(&dialect, &sql).tokenize(),
-            Err(TokenizerError {
-                message: "Unterminated dollar-quoted, expected $".into(),
-                location: Location {
+            Err(TokenizerError::new(
+                "Unterminated dollar-quoted, expected $",
+                Location {
                     line: 1,
                     column: 17
                 }
-            })
+            ))
         );
     }
 
@@ -3265,13 +3393,13 @@ mod tests {
         let dialect = GenericDialect {};
         assert_eq!(
             Tokenizer::new(&dialect, &sql).tokenize(),
-            Err(TokenizerError {
-                message: "Unterminated dollar-quoted string".into(),
-                location: Location {
+            Err(TokenizerError::new(
+                "Unterminated dollar-quoted string",
+                Location {
                     line: 1,
                     column: 86
                 }
-            })
+            ))
         );
     }
 
@@ -3510,10 +3638,10 @@ mod tests {
         let mut tokenizer = Tokenizer::new(&dialect, &sql);
         assert_eq!(
             tokenizer.tokenize(),
-            Err(TokenizerError {
-                message: "Expected close delimiter '\"' before EOF.".to_string(),
-                location: Location { line: 1, column: 1 },
-            })
+            Err(TokenizerError::new(
+                "Expected close delimiter '\"' before EOF.",
+                Location { line: 1, column: 1 },
+            ))
         );
     }
 
@@ -3712,18 +3840,30 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
-    fn check_unescape(s: &str, expected: Option<&str>) {
+    fn unescape_body(s: &str) -> Result<String, TokenizerError> {
         let s = format!("'{s}'");
         let mut state = State {
             peekable: s.chars().peekable(),
-            line: 0,
-            col: 0,
+            line: 1,
+            col: 1,
         };
+        unescape_single_quoted_string(&mut state, Location { line: 1, column: 1 })
+    }
 
+    /// `None` means "rejected" — which of the several rejections is asserted
+    /// separately by [`check_unescape_err`].
+    fn check_unescape(s: &str, expected: Option<&str>) {
         assert_eq!(
-            unescape_single_quoted_string(&mut state),
-            expected.map(|s| s.to_string())
+            unescape_body(s).ok(),
+            expected.map(|s| s.to_string()),
+            "input: {s}"
         );
+    }
+
+    fn check_unescape_err(s: &str, sqlstate: &str, message: &str) {
+        let err = unescape_body(s).expect_err("expected a rejection");
+        assert_eq!(err.sqlstate, Some(sqlstate), "input: {s}");
+        assert_eq!(err.message, message, "input: {s}");
     }
 
     #[test]
@@ -3780,6 +3920,91 @@ mod tests {
         );
         check_unescape(r"Hello\0", None);
         check_unescape(r"Hello\xCADRust", None);
+    }
+
+    /// Behaviour checked against PostgreSQL 18.4. `E'…'` escapes decode to
+    /// *bytes*, so several escapes above 0x7F combine into one character and a
+    /// lone one is an encoding error rather than a lexer quirk.
+    #[test]
+    fn test_unescape_byte_semantics() {
+        // Multi-byte characters spelled out one byte at a time.
+        check_unescape(r"\xc3\xa9", Some("é"));
+        check_unescape(r"\xe4\xb8\xad", Some("中"));
+        check_unescape(r"\303\251", Some("é"));
+        // …and written directly.
+        check_unescape("é", Some("é"));
+        check_unescape("😄", Some("😄"));
+
+        // UTF-16 surrogate pairs combine; `\U` reaches the same code point.
+        check_unescape(r"😄", Some("😄"));
+        check_unescape(r"\U0001F604", Some("😄"));
+
+        // A backslash before anything else simply drops out.
+        check_unescape(r"\z", Some("z"));
+        check_unescape(r"\'", Some("'"));
+
+        // A byte that cannot start (or complete) a UTF-8 sequence.
+        check_unescape_err(
+            r"\x80",
+            "22021",
+            "invalid byte sequence for encoding \"UTF8\": 0x80",
+        );
+        check_unescape_err(
+            r"\xc3",
+            "22021",
+            "invalid byte sequence for encoding \"UTF8\": 0xc3",
+        );
+        // NUL is valid UTF-8 but PG still refuses it, however it is spelled.
+        // `\400` overflows to 0x00 rather than erroring on the octal value.
+        for nul in [r"\0", r"\000", r"\400", r"\x00"] {
+            check_unescape_err(
+                nul,
+                "22021",
+                "invalid byte sequence for encoding \"UTF8\": 0x00",
+            );
+        }
+
+        // Malformed `\u`/`\U`.
+        for bad in [r"\uZZZZ", r"\u4c", r"\U00110000"] {
+            check_unescape_err(bad, "22025", "invalid Unicode escape");
+        }
+        // A surrogate half that is never completed. PG names the token that
+        // failed to complete the pair: for a high surrogate that is whatever
+        // follows it, for an unpaired low surrogate the escape itself.
+        for (bad, token) in [
+            (r"\ud83d", "'"),
+            (r"\ud83dxyz", "x"),
+            (r"\ud83dA", r"A"),
+            (r"\ud83d\ud83d", r"\ud83d"),
+            (r"\udc36", r"\udc36"),
+        ] {
+            check_unescape_err(
+                bad,
+                "42601",
+                &format!("invalid Unicode surrogate pair at or near \"{token}\""),
+            );
+        }
+    }
+
+    /// The caret PG prints sits on the backslash that opened the bad escape.
+    #[test]
+    fn test_unescape_error_location() {
+        let mut state = State {
+            peekable: r"'ab\uZZZZ'".chars().peekable(),
+            line: 1,
+            col: 8,
+        };
+        let err = unescape_single_quoted_string(&mut state, Location { line: 1, column: 8 })
+            .expect_err("invalid escape");
+        // `'` at column 8, `a` 9, `b` 10, `\` 11.
+        assert_eq!(
+            err.location,
+            Location {
+                line: 1,
+                column: 11
+            }
+        );
+        assert_eq!(err.hint.as_deref(), Some(ESCAPE_UNICODE_HINT));
     }
 
     #[test]

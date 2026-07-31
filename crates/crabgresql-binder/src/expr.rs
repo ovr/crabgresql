@@ -2851,14 +2851,21 @@ fn bind_value(value: &ast::ValueWithSpan, scope: &Scope) -> Result<Binding, Bind
     match &value.value {
         ast::Value::Placeholder(s) => bind_placeholder(s, value.span, scope),
         ast::Value::Number(n, _) => parse_number(n).map(Binding::Typed),
+        // All four quoting styles carry plain text by the time they reach the
+        // binder — the tokenizer has already decoded `E'…'`'s backslash escapes
+        // and `U&'…'`'s code points. They stay `Unknown` (rather than a typed
+        // `text` const) so `E'\t'::name` and context-driven typing keep working.
+        // `N'…'` is a plain string in PG too; the national-character prefix has
+        // no effect on a UTF-8 server.
         ast::Value::SingleQuotedString(s)
-        | ast::Value::DollarQuotedString(ast::DollarQuotedString { value: s, .. }) => {
-            Ok(Binding::Unknown {
-                lit: Some(s.clone()),
-                span: value.span,
-                param: None,
-            })
-        }
+        | ast::Value::DollarQuotedString(ast::DollarQuotedString { value: s, .. })
+        | ast::Value::EscapedStringLiteral(s)
+        | ast::Value::UnicodeStringLiteral(s)
+        | ast::Value::NationalStringLiteral(s) => Ok(Binding::Unknown {
+            lit: Some(s.clone()),
+            span: value.span,
+            param: None,
+        }),
         ast::Value::Boolean(b) => Ok(Binding::Typed(BoundExpr::Const {
             value: Value::Bool(*b),
             ty: PgType::Bool,

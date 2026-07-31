@@ -314,7 +314,9 @@ async fn run_simple_query(
     let statements = match crabgresql_parser::parse(sql) {
         Ok(statements) => statements,
         Err(e) => {
-            writer.error_response(sqlstate::SYNTAX_ERROR, &e.to_string());
+            let e = PgError::from(e);
+            let position = e.location.map(|(line, col)| char_position(sql, line, col));
+            writer.error_fields(e.to_fields(position));
             // A syntax error inside a block aborts it, as in PG.
             mark_transaction_failed(session);
             return Ok(());
@@ -659,8 +661,7 @@ fn handle_parse(
     query: &str,
     param_oids: &[u32],
 ) -> Result<(), PgError> {
-    let mut statements =
-        crabgresql_parser::parse(query).map_err(|e| PgError::syntax(e.to_string()))?;
+    let mut statements = crabgresql_parser::parse(query).map_err(PgError::from)?;
     if statements.len() > 1 {
         return Err(PgError::syntax(
             "cannot insert multiple commands into a prepared statement",
