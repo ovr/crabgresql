@@ -1563,9 +1563,18 @@ fn json_err(e: crabgresql_types::json::JsonError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
 }
 
-/// Evaluate a geometric (`point`/`lseg`) operator or function. Arguments arrive
-/// in the fixed order documented on each [`GeoFn`]; a geometric error (range /
-/// divide-by-zero) maps to its SQLSTATE. `#`'s no-intersection case is NULL.
+fn path_of(v: &Value) -> &geo::PathVal {
+    match v {
+        Value::Path(p) => p,
+        other => unreachable!("expected path arg, got {other:?}"),
+    }
+}
+
+/// Evaluate a geometric (`point`/`lseg`/`path`) operator or function. Arguments
+/// arrive in the fixed order documented on each [`GeoFn`]; a geometric error
+/// (range / divide-by-zero) maps to its SQLSTATE. The cases PG has no answer for
+/// — `#`'s non-intersection, `area` of an open path, concatenating a closed one,
+/// the distance between two segment-less paths — are NULL.
 fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
     let geo_err = |e: geo::GeoError| err(e.sqlstate, e.message);
     Ok(match g {
@@ -1649,6 +1658,62 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         },
         GeoFn::DistSegSeg => {
             Value::Float8(geo::dist_seg_seg(&lseg_of(&args[0]), &lseg_of(&args[1])))
+        }
+        GeoFn::PathIsOpen => Value::Bool(geo::path_isopen(path_of(&args[0]))),
+        GeoFn::PathIsClosed => Value::Bool(geo::path_isclosed(path_of(&args[0]))),
+        GeoFn::PathPopen => Value::Path(geo::path_popen(path_of(&args[0]))),
+        GeoFn::PathPclose => Value::Path(geo::path_pclose(path_of(&args[0]))),
+        GeoFn::PathNpoints => Value::Int4(geo::path_npoints(path_of(&args[0]))),
+        GeoFn::PathLength => Value::Float8(geo::path_length(path_of(&args[0]))),
+        GeoFn::PathArea => match geo::path_area(path_of(&args[0])) {
+            Some(a) => Value::Float8(a),
+            None => Value::Null,
+        },
+        GeoFn::PathConcat => match geo::path_concat(path_of(&args[0]), path_of(&args[1])) {
+            Some(p) => Value::Path(p),
+            None => Value::Null,
+        },
+        GeoFn::PathAddPt => {
+            Value::Path(geo::path_add_pt(path_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::PathSubPt => {
+            Value::Path(geo::path_sub_pt(path_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::PathMulPt => {
+            Value::Path(geo::path_mul_pt(path_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::PathDivPt => {
+            Value::Path(geo::path_div_pt(path_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::PathDist => match geo::path_distance(path_of(&args[0]), path_of(&args[1])) {
+            Some(d) => Value::Float8(d),
+            None => Value::Null,
+        },
+        GeoFn::DistPathPoint => Value::Float8(geo::dist_path_point(
+            path_of(&args[0]),
+            &point_of(&args[1]),
+        )),
+        GeoFn::OnPpath => Value::Bool(geo::on_ppath(&point_of(&args[0]), path_of(&args[1]))),
+        GeoFn::PathContainPt => Value::Bool(geo::path_contain_pt(
+            path_of(&args[0]),
+            &point_of(&args[1]),
+        )),
+        GeoFn::PathInter => Value::Bool(geo::path_inter(path_of(&args[0]), path_of(&args[1]))),
+        GeoFn::PathEq
+        | GeoFn::PathNe
+        | GeoFn::PathLt
+        | GeoFn::PathLe
+        | GeoFn::PathGt
+        | GeoFn::PathGe => {
+            let ord = geo::path_n_cmp(path_of(&args[0]), path_of(&args[1]));
+            Value::Bool(match g {
+                GeoFn::PathEq => ord.is_eq(),
+                GeoFn::PathNe => ord.is_ne(),
+                GeoFn::PathLt => ord.is_lt(),
+                GeoFn::PathLe => ord.is_le(),
+                GeoFn::PathGt => ord.is_gt(),
+                _ => ord.is_ge(),
+            })
         }
     })
 }

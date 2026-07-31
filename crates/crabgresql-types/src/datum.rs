@@ -57,6 +57,7 @@ const T_TSQUERY: u8 = 33;
 /// text had to be re-parsed on read; that tag is still decoded so pages written
 /// before the change keep working.
 const T_JSONPATH_TREE: u8 = 34;
+const T_PATH: u8 = 35;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -173,6 +174,18 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.push(T_LSEG);
             for c in l {
                 out.extend_from_slice(&c.to_bits().to_le_bytes());
+            }
+        }
+        // `path` is variable length: the open/closed flag, then the vertex count,
+        // then the coordinate pairs.
+        Value::Path(p) => {
+            out.push(T_PATH);
+            out.push(p.closed as u8);
+            out.extend_from_slice(&(p.pts.len() as u32).to_le_bytes());
+            for pt in &p.pts {
+                for c in pt {
+                    out.extend_from_slice(&c.to_bits().to_le_bytes());
+                }
             }
         }
         // A reg* value stores the OID *and* the name it renders as, because the
@@ -357,6 +370,14 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             f64::from_bits(r.u64()),
             f64::from_bits(r.u64()),
         ]),
+        T_PATH => {
+            let closed = r.take(1)[0] != 0;
+            let npts = r.u32() as usize;
+            let pts = (0..npts)
+                .map(|_| [f64::from_bits(r.u64()), f64::from_bits(r.u64())])
+                .collect();
+            Value::Path(crate::geo::PathVal { closed, pts })
+        }
         T_REG => {
             let kind_oid = r.u32();
             let PgType::Reg(kind) = PgType::from_oid(kind_oid)
@@ -523,6 +544,18 @@ mod tests {
         roundtrip(Value::Point([f64::INFINITY, -1e300]));
         roundtrip(Value::Lseg([1.0, 2.0, 3.0, 4.0]));
         roundtrip(Value::Lseg([-1e6, 200.0, 3e5, -40.0]));
+        roundtrip(Value::Path(crate::geo::PathVal {
+            closed: false,
+            pts: vec![[1.0, 2.0], [3.0, 4.0]],
+        }));
+        roundtrip(Value::Path(crate::geo::PathVal {
+            closed: true,
+            pts: vec![[0.0, 0.0], [3.0, 0.0], [4.0, 5.0], [1.0, 6.0]],
+        }));
+        roundtrip(Value::Path(crate::geo::PathVal {
+            closed: true,
+            pts: vec![[10.0, 20.0]],
+        }));
         roundtrip(Value::Enum { type_oid: 16384, ordinal: 0, label: "red".into() });
         roundtrip(Value::Enum { type_oid: 99999, ordinal: 42, label: String::new() });
         // `json` keeps its raw text; `jsonb` its canonical tree.

@@ -72,6 +72,8 @@ pub mod oid {
     pub const POINT: u32 = 600;
     /// `lseg`: a geometric line segment (two points). See [`crate::geo`].
     pub const LSEG: u32 = 601;
+    /// `path`: a geometric open or closed list of points. See [`crate::geo`].
+    pub const PATH: u32 = 602;
     /// `json`: JSON stored as validated text. See [`crate::json`].
     pub const JSON: u32 = 114;
     /// `jsonb`: JSON stored as a canonical binary tree. See [`crate::json`].
@@ -102,6 +104,7 @@ pub mod oid {
     pub const INT8_ARRAY: u32 = 1016;
     pub const POINT_ARRAY: u32 = 1017;
     pub const LSEG_ARRAY: u32 = 1018;
+    pub const PATH_ARRAY: u32 = 1019;
     pub const FLOAT4_ARRAY: u32 = 1021;
     pub const FLOAT8_ARRAY: u32 = 1022;
     pub const OID_ARRAY: u32 = 1028;
@@ -188,6 +191,9 @@ pub enum PgType {
     /// `lseg`: a geometric line segment (two points). Fixed 32-byte type.
     /// See [`crate::geo`].
     Lseg,
+    /// `path`: a geometric list of points, open (`[..]`) or closed (`(..)`).
+    /// Varlena; no default b-tree opclass. See [`crate::geo`].
+    Path,
     /// `json`: JSON kept as validated text (whitespace/key order/duplicate keys
     /// preserved). Varlena; no default equality. See [`crate::json`].
     Json,
@@ -343,6 +349,7 @@ impl PgType {
             PgType::Macaddr8 => oid::MACADDR8,
             PgType::Point => oid::POINT,
             PgType::Lseg => oid::LSEG,
+            PgType::Path => oid::PATH,
             PgType::Json => oid::JSON,
             PgType::Jsonb => oid::JSONB,
             PgType::Jsonpath => oid::JSONPATH,
@@ -450,6 +457,7 @@ impl PgType {
             oid::MACADDR8 => PgType::Macaddr8,
             oid::POINT => PgType::Point,
             oid::LSEG => PgType::Lseg,
+            oid::PATH => PgType::Path,
             oid::JSON => PgType::Json,
             oid::JSONB => PgType::Jsonb,
             oid::JSONPATH => PgType::Jsonpath,
@@ -515,6 +523,7 @@ impl PgType {
             "macaddr8" => PgType::Macaddr8,
             "point" => PgType::Point,
             "lseg" => PgType::Lseg,
+            "path" => PgType::Path,
             "json" => PgType::Json,
             "jsonb" => PgType::Jsonb,
             "jsonpath" => PgType::Jsonpath,
@@ -565,6 +574,7 @@ impl PgType {
             | PgType::Json
             | PgType::Jsonb
             | PgType::Jsonpath
+            | PgType::Path
             | PgType::Tsvector
             | PgType::Tsquery => -1,
             PgType::User(_) => -1,
@@ -605,6 +615,7 @@ impl PgType {
             PgType::Macaddr8 => "macaddr8",
             PgType::Point => "point",
             PgType::Lseg => "lseg",
+            PgType::Path => "path",
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
@@ -649,6 +660,7 @@ impl PgType {
             PgType::Macaddr8 => "macaddr8",
             PgType::Point => "point",
             PgType::Lseg => "lseg",
+            PgType::Path => "path",
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
@@ -680,7 +692,9 @@ impl PgType {
     /// with `crabgresql_executor::compare_values`.
     pub fn has_default_btree_opclass(self) -> bool {
         match self {
-            PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg => false,
+            PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg | PgType::Path => {
+                false
+            }
             // An array is orderable iff its element type is (element-wise btree
             // comparison). An unknown element type (no `from_oid`) is treated as
             // non-orderable.
@@ -737,6 +751,7 @@ fn array_display_name(elem: u32) -> &'static str {
         Some(PgType::Macaddr8) => "macaddr8[]",
         Some(PgType::Point) => "point[]",
         Some(PgType::Lseg) => "lseg[]",
+        Some(PgType::Path) => "path[]",
         Some(PgType::Json) => "json[]",
         Some(PgType::Jsonb) => "jsonb[]",
         Some(PgType::Jsonpath) => "jsonpath[]",
@@ -779,6 +794,7 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Macaddr8) => "_macaddr8",
         Some(PgType::Point) => "_point",
         Some(PgType::Lseg) => "_lseg",
+        Some(PgType::Path) => "_path",
         Some(PgType::Json) => "_json",
         Some(PgType::Jsonb) => "_jsonb",
         Some(PgType::Jsonpath) => "_jsonpath",
@@ -864,6 +880,8 @@ pub enum Value {
     Point([f64; 2]),
     /// `lseg`: a line segment `[(x1,y1),(x2,y2)]` of float8. See [`crate::geo`].
     Lseg([f64; 4]),
+    /// `path`: an open or closed list of points. See [`crate::geo`].
+    Path(geo::PathVal),
     /// `json`: validated JSON text, kept verbatim. See [`crate::json`].
     Json(String),
     /// `jsonb`: a canonical parsed JSON tree. See [`crate::json`].
@@ -925,6 +943,7 @@ impl Value {
             Value::Macaddr8(_) => Some(PgType::Macaddr8),
             Value::Point(_) => Some(PgType::Point),
             Value::Lseg(_) => Some(PgType::Lseg),
+            Value::Path(_) => Some(PgType::Path),
             Value::Json(_) => Some(PgType::Json),
             Value::Jsonb(_) => Some(PgType::Jsonb),
             Value::Jsonpath(_) => Some(PgType::Jsonpath),
@@ -980,6 +999,7 @@ impl Value {
             Value::Macaddr8(b) => Some(macaddr::format8(b)),
             Value::Point(p) => Some(geo::format_point(p, efd)),
             Value::Lseg(l) => Some(geo::format_lseg(l, efd)),
+            Value::Path(p) => Some(geo::format_path(p, efd)),
             // `json` prints its stored text verbatim; `jsonb` re-serializes its
             // canonical tree (`jsonb_out`).
             Value::Json(s) => Some(s.clone()),

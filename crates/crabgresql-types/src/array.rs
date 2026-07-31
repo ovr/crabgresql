@@ -74,6 +74,7 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::MONEY, oid::MONEY_ARRAY),
     (oid::POINT, oid::POINT_ARRAY),
     (oid::LSEG, oid::LSEG_ARRAY),
+    (oid::PATH, oid::PATH_ARRAY),
     (oid::MACADDR, oid::MACADDR_ARRAY),
     (oid::MACADDR8, oid::MACADDR8_ARRAY),
     (oid::INET, oid::INET_ARRAY),
