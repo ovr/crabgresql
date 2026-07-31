@@ -324,6 +324,17 @@ impl From<crabgresql_binder::BindError> for ExecError {
     }
 }
 
+/// A soft input failure, carried as an `ExecError` for its shape rather than to
+/// be raised: `pg_input_error_info` reports these fields as a row, and the
+/// `reg*` half of that path already produces `ExecError`s.
+impl From<crabgresql_binder::SoftError> for ExecError {
+    fn from(e: crabgresql_binder::SoftError) -> Self {
+        ExecError::new(e.code, e.message)
+            .with_detail(e.detail)
+            .with_hint(e.hint)
+    }
+}
+
 /// A Volcano execution node: `next()` pulls one tuple at a time.
 pub trait ExecNode: Send {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError>;
@@ -2287,7 +2298,7 @@ impl TableFunctionSource {
                 .collect::<Result<Vec<_>, _>>()?;
             self.state = Some(match self.func {
                 TableFn::PgInputErrorInfo => {
-                    TableFnState::Single(Some(pg_input_error_info_row(&values)?))
+                    TableFnState::Single(Some(pg_input_error_info_row(&values, &self.ctx)?))
                 }
                 TableFn::GenerateSeries(elem) => {
                     TableFnState::Series(Series::from_args(elem, &values)?)
@@ -2319,18 +2330,18 @@ impl ExecNode for TableFunctionSource {
 /// argument) yields all-NULL; an invalid one reports the input function's
 /// message, DETAIL, HINT and SQLSTATE. An unusable *type name* is not a row —
 /// it raises, as it does in PostgreSQL.
-fn pg_input_error_info_row(args: &[Value]) -> Result<Tuple, ExecError> {
+fn pg_input_error_info_row(args: &[Value], ctx: &ExecContext) -> Result<Tuple, ExecError> {
     let all_null = || vec![Value::Null, Value::Null, Value::Null, Value::Null];
     let (Value::Text(value), Value::Text(type_name)) = (&args[0], &args[1]) else {
         return Ok(all_null());
     };
-    Ok(match crabgresql_binder::soft_input(type_name, value)? {
-        Ok(()) => all_null(),
-        Err(e) => vec![
+    Ok(match eval::soft_input_in_ctx(type_name, value, ctx)? {
+        None => all_null(),
+        Some(e) => vec![
             Value::Text(e.message),
             e.detail.map_or(Value::Null, Value::Text),
             e.hint.map_or(Value::Null, Value::Text),
-            Value::Text(e.code.to_string()),
+            Value::Text(e.code.into_owned()),
         ],
     })
 }

@@ -3046,8 +3046,11 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         }
         // Type names the parser has no dedicated `DataType` for arrive here:
         // `bpchar`, `name`, `point`, and every built-in written with a
-        // `pg_catalog.` qualifier.
-        DataType::Custom(obj, mods) if mods.is_empty() => match builtin_custom_type(obj) {
+        // `pg_catalog.` qualifier. A modifier rides along in `mods` rather than
+        // in a typed field, so `bpchar(4)` and `pg_catalog.varchar(4)` name the
+        // same types as `char(4)` and `varchar(4)`; the three typmod readers
+        // below pick the length back out.
+        DataType::Custom(obj, _) => match builtin_custom_type(obj) {
             Some(t) => t,
             None => {
                 return Err(BindError::feature_not_supported(format!(
@@ -3072,7 +3075,7 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
 /// spelling. psql leans on the qualified form throughout `\d` (`::pg_catalog.text`,
 /// `pr.prattrs::pg_catalog.int2[]`), which `DataType::Array` picks up by
 /// recursing through here.
-fn builtin_custom_type(obj: &ast::ObjectName) -> Option<PgType> {
+pub(crate) fn builtin_custom_type(obj: &ast::ObjectName) -> Option<PgType> {
     let parts = obj
         .0
         .iter()
@@ -3321,6 +3324,15 @@ pub(crate) fn numeric_typmod(dt: &ast::DataType) -> Option<(i32, i32)> {
     use ast::{DataType, ExactNumberInfo};
     let info = match dt {
         DataType::Numeric(i) | DataType::Decimal(i) => i,
+        // `pg_catalog.numeric(5,2)`: the modifier arrives as raw token text.
+        DataType::Custom(obj, mods) => {
+            if builtin_custom_type(obj) != Some(PgType::Numeric) {
+                return None;
+            }
+            let precision = mods.first()?.parse().ok()?;
+            let scale = mods.get(1).map_or(Some(0), |s| s.parse().ok())?;
+            return Some((precision, scale));
+        }
         _ => return None,
     };
     match info {
@@ -3328,6 +3340,28 @@ pub(crate) fn numeric_typmod(dt: &ast::DataType) -> Option<(i32, i32)> {
         ExactNumberInfo::Precision(p) => Some((*p as i32, 0)),
         ExactNumberInfo::PrecisionAndScale(p, s) => Some((*p as i32, *s as i32)),
     }
+}
+
+/// [`numeric_typmod`] with PostgreSQL's declared-precision bounds enforced, for
+/// the same reason [`checked_length_typmod`] exists: `numeric(0)` and
+/// `numeric(1001)` are not merely odd, PostgreSQL rejects them outright while
+/// resolving the type name — before any value is looked at.
+pub(crate) fn checked_numeric_typmod(dt: &ast::DataType) -> Result<Option<(i32, i32)>, BindError> {
+    let Some((precision, scale)) = numeric_typmod(dt) else {
+        return Ok(None);
+    };
+    let invalid = |message: String| BindError::new(sqlstate::INVALID_PARAMETER_VALUE, message);
+    if !(1..=1000).contains(&precision) {
+        return Err(invalid(format!(
+            "NUMERIC precision {precision} must be between 1 and 1000"
+        )));
+    }
+    if !(-1000..=1000).contains(&scale) {
+        return Err(invalid(format!(
+            "NUMERIC scale {scale} must be between -1000 and 1000"
+        )));
+    }
+    Ok(Some((precision, scale)))
 }
 
 /// When `target` is `numeric` and `data_type` carries a `(p,s)` modifier, apply
@@ -3341,7 +3375,7 @@ fn apply_numeric_typmod_if_any(
     if target != PgType::Numeric {
         return Ok(expr);
     }
-    let Some((precision, scale)) = numeric_typmod(data_type) else {
+    let Some((precision, scale)) = checked_numeric_typmod(data_type)? else {
         return Ok(expr);
     };
     if let BoundExpr::Const {
@@ -3390,6 +3424,15 @@ pub fn length_typmod(dt: &ast::DataType) -> Option<i32> {
         // `bit(n)` defaults to `bit(1)`; `bit varying` with no length is unlimited.
         DataType::Bit(n) => Some(n.map(|n| n as i32).unwrap_or(1)),
         DataType::BitVarying(n) | DataType::VarBit(n) => n.map(|n| n as i32),
+        // `bpchar(4)` / `pg_catalog.varchar(4)`: same types, modifier as raw
+        // token text. A modifier-less `bpchar` is unlimited (unlike a bare
+        // `char`, which the grammar defaults to `char(1)`), so no `unwrap_or`.
+        DataType::Custom(obj, mods) => match builtin_custom_type(obj) {
+            Some(PgType::Bpchar | PgType::Varchar | PgType::Bit | PgType::Varbit) => {
+                mods.first()?.parse().ok()
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3423,6 +3466,19 @@ pub fn checked_length_typmod(dt: &ast::DataType) -> Result<Option<i32>, BindErro
         }
         DataType::Bit(n) => (*n, "bit", MAX_BIT_LENGTH),
         DataType::BitVarying(n) | DataType::VarBit(n) => (*n, "varbit", MAX_BIT_LENGTH),
+        // The `bpchar(4)` / `pg_catalog.varchar(4)` spellings, whose modifier
+        // is raw token text; the bound and the `typname` in the error follow
+        // the type the name resolves to.
+        DataType::Custom(obj, mods) => {
+            let declared = mods.first().and_then(|m| m.parse::<u64>().ok());
+            match builtin_custom_type(obj) {
+                Some(PgType::Bpchar) => (declared, "char", MAX_CHAR_LENGTH),
+                Some(PgType::Varchar) => (declared, "varchar", MAX_CHAR_LENGTH),
+                Some(PgType::Bit) => (declared, "bit", MAX_BIT_LENGTH),
+                Some(PgType::Varbit) => (declared, "varbit", MAX_BIT_LENGTH),
+                _ => return Ok(None),
+            }
+        }
         // No other type carries a length modifier here.
         _ => return Ok(None),
     };

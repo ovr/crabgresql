@@ -44,6 +44,27 @@ SELECT * FROM pg_input_error_info('1.2.3.4/24', 'cidr');
 SELECT pg_input_is_valid('42', 'pg_catalog.int4') AS ok,
        pg_input_is_valid('x', 'pg_catalog.int4') AS bad;
 
+-- an alias or qualified spelling carries its modifier just like char(4)
+SELECT pg_input_is_valid('abcd  ', 'bpchar(4)') AS ok, pg_input_is_valid('abcde', 'bpchar(4)') AS bad;
+SELECT * FROM pg_input_error_info('abcde', 'pg_catalog.varchar(4)');
+
+-- an array applies its element modifier to every element
+SELECT pg_input_is_valid('{abcd,ab}', 'varchar(4)[]') AS ok,
+       pg_input_is_valid('{abcde}', 'varchar(4)[]') AS bad;
+SELECT * FROM pg_input_error_info('{abcde}', 'varchar(4)[]');
+
+-- a reg* target fails softly when the object is missing: that is a value
+-- answer, not an error
+SELECT pg_input_is_valid('pg_class', 'regclass') AS ok,
+       pg_input_is_valid('no_such_table', 'regclass') AS bad;
+SELECT * FROM pg_input_error_info('no_such_table', 'regclass');
+
 -- a type name that denotes nothing is an error, not a row
 SELECT pg_input_is_valid('x', 'nosuchtype');
 SELECT * FROM pg_input_error_info('x', 'nosuchtype');
+
+-- so is a modifier the type could never accept: it describes the type spec,
+-- not the value
+SELECT pg_input_is_valid('abc', 'varchar(0)');
+SELECT pg_input_is_valid('1', 'numeric(0)');
+SELECT pg_input_is_valid('1', 'numeric(5,1001)');

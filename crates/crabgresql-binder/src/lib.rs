@@ -32,7 +32,7 @@ pub use plan::{
     bind_query_with_params, bind_update, bind_update_with_params, output_columns_of,
     plan_calls_routine, plan_has_outer_refs, substitute_outer, substitute_params,
 };
-pub use soft_input::{SoftError, soft_input};
+pub use soft_input::{SoftError, TypeSpec, soft_input};
 
 use crabgresql_parser::Span;
 use crabgresql_pg_wire::sqlstate;

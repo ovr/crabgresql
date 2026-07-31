@@ -460,13 +460,14 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
             let f = f8(&args[0]);
             return Ok(Value::Bytea(f.to_be_bytes().to_vec()));
         }
-        // A bad *value* is the answer; a bad *type name* still raises, as PG's
-        // `pg_input_is_valid` does.
+        // `pg_input_is_valid` is dispatched by `eval`, which holds the catalog a
+        // `reg*` target's input function needs; reaching the pure evaluator is
+        // an internal wiring error.
         ScalarFn::PgInputIsValid => {
-            let value = text(&args[0]);
-            let type_name = text(&args[1]);
-            let outcome = crabgresql_binder::soft_input(type_name, value)?;
-            return Ok(Value::Bool(outcome.is_ok()));
+            return Err(ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                "pg_input_is_valid reached the pure scalar evaluator",
+            ));
         }
         ScalarFn::DatePart => {
             // `None` is SQL NULL (an oscillating field on ±infinity).

@@ -1,27 +1,39 @@
-//! PostgreSQL's *soft* input path — `InputFunctionCallSafe` — behind
-//! `pg_input_is_valid(value, type)` and `pg_input_error_info(value, type)`.
+//! The *soft* input path behind `pg_input_is_valid(value, type)` and
+//! `pg_input_error_info(value, type)`: run a type's input function and report
+//! the failure as a value instead of raising it.
 //!
 //! Both take the target type as a *written type name*, so the work is the same
-//! a cast does: parse the type spec, resolve it, run the type's input function,
-//! then apply the typmod. Every one of those steps already exists for
-//! `expr::CAST`; this module reuses them and reports the failure as a value
-//! instead of raising it.
+//! a cast does — parse the type spec, resolve it, run the input function, apply
+//! the typmod — and every step already exists for `expr::CAST`.
 //!
-//! The one place it must not reuse the cast path is the typmod: an explicit
-//! cast truncates an over-long string, while the *input* function errors
-//! (`22001`). That is the difference between `'abcde'::varchar(4)` yielding
-//! `abcd` and `pg_input_is_valid('abcde', 'varchar(4)')` yielding false.
+//! Two boundaries have to hold, and both are observable:
 //!
-//! Only built-in types resolve here — the binder holds no catalog, so a user
-//! enum is indistinguishable from a name that denotes nothing. Both raise
-//! `42704`, which is PostgreSQL's answer for the latter.
+//! - **Typmod semantics.** An explicit cast truncates an over-long string while
+//!   the *input* function errors (`22001`), so `'abcde'::varchar(4)` is `abcd`
+//!   but `pg_input_is_valid('abcde', 'varchar(4)')` is false.
+//! - **Hard vs soft.** Only a bad *value* is an answer. Anything describing the
+//!   *type spec* still raises, as PostgreSQL does: an unparsable name (`42601`),
+//!   one that denotes nothing (`42704`), and a modifier `typmodin` rejects
+//!   (`22023` — `varchar(0)`, `numeric(1001)`). [`TypeSpec::resolve`] settles all
+//!   of those before [`TypeSpec::check`] ever looks at the value.
+//!
+//! The binder holds no catalog, so a user enum is indistinguishable from a name
+//! that denotes nothing and both raise `42704`; a type this build parses but
+//! does not model keeps its own `0A000` rather than being called nonexistent. A
+//! `reg*` name needs a catalog outright, so [`TypeSpec`] is public for the
+//! executor to finish that one itself.
+
+use std::rc::Rc;
 
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{PgType, Value};
 
 use crate::BindError;
-use crate::expr::{checked_length_typmod, map_data_type, numeric_typmod, parse_unknown};
+use crate::expr::{
+    builtin_custom_type, checked_length_typmod, checked_numeric_typmod, length_typmod,
+    map_data_type, normalize_ident, numeric_typmod, parse_unknown,
+};
 
 /// Why a soft input failed: the fields `pg_input_error_info` reports. This is
 /// a [`BindError`] minus the cursor position, which has no meaning for a value
@@ -53,27 +65,123 @@ impl From<BindError> for SoftError {
 ///
 /// - `Ok(Ok(()))` — the value is valid input for the type.
 /// - `Ok(Err(e))` — the value is not; `e` is what `pg_input_error_info` returns.
-/// - `Err(_)` — the type spec is unparsable (`42601`), names nothing this build
-///   knows (`42704`), or is a `reg*` type whose input needs the runtime catalog
-///   (`0A000`).
+/// - `Err(_)` — the type spec is unparsable (`42601`), names nothing (`42704`),
+///   names a type this build does not model yet (`0A000`), or carries a
+///   modifier `typmodin` would reject (`22023`).
 pub fn soft_input(type_spec: &str, value: &str) -> Result<Result<(), SoftError>, BindError> {
-    let data_type = crabgresql_parser::parse_data_type(type_spec)
-        .map_err(|e| BindError::new(sqlstate::SYNTAX_ERROR, e.to_string()))?;
-    let ty = map_data_type(&data_type).map_err(|_| {
+    let spec = TypeSpec::resolve(type_spec)?;
+    // A `reg*` input function is a catalog lookup, which this entry point has
+    // no handle for. Callers that do (the executor) go through `TypeSpec`.
+    if let PgType::Reg(_) = spec.ty {
+        return Err(BindError::feature_not_supported(
+            "soft input for a reg* type needs a catalog",
+        ));
+    }
+    Ok(spec.check(value))
+}
+
+/// A written type name, resolved. Separate from [`soft_input`] so a caller that
+/// holds a catalog can inspect [`TypeSpec::ty`] and take over the types the
+/// binder cannot resolve alone — a `reg*` name, whose input function is a
+/// catalog lookup.
+pub struct TypeSpec {
+    pub ty: PgType,
+    /// The written form, kept because the modifier lives here rather than in
+    /// `ty` (`PgType::Varchar` alone cannot say `varchar(4)`).
+    data_type: ast::DataType,
+}
+
+/// How many resolved type specs to keep per thread. `pg_input_is_valid` is a
+/// per-row scalar whose type argument is a constant at every realistic call
+/// site, so without this every row re-runs the SQL type-name parser — measured
+/// at ~250ns, an order of magnitude more than the rest of the call. The bound
+/// caps per-thread memory; the exact depth is not observable.
+const SPEC_CACHE_MAX: usize = 16;
+
+thread_local! {
+    /// Most-recently-used first. Only successful resolutions are cached: a
+    /// failure is a raise, so it happens once per statement, not once per row.
+    static SPEC_CACHE: std::cell::RefCell<Vec<(String, Rc<TypeSpec>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl TypeSpec {
+    /// Resolve a written type name the way PostgreSQL does before it ever looks
+    /// at the value: the name, then `typmodin`. Every failure is a hard error —
+    /// it describes the *type spec*, so it cannot be reported as a bad value.
+    ///
+    /// Memoized per thread on the written spelling — see [`SPEC_CACHE_MAX`].
+    pub fn resolve(type_spec: &str) -> Result<Rc<Self>, BindError> {
+        SPEC_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(idx) = cache.iter().position(|(s, _)| s == type_spec) {
+                // Promote to most-recently-used; an already-hot spec (the
+                // per-row case) needs no shuffling at all.
+                if idx != 0 {
+                    cache[..=idx].rotate_right(1);
+                }
+            } else {
+                let spec = Rc::new(Self::resolve_uncached(type_spec)?);
+                cache.insert(0, (type_spec.to_string(), spec));
+                cache.truncate(SPEC_CACHE_MAX);
+            }
+            Ok(Rc::clone(&cache[0].1))
+        })
+    }
+
+    fn resolve_uncached(type_spec: &str) -> Result<Self, BindError> {
+        let data_type = crabgresql_parser::parse_data_type(type_spec)
+            .map_err(|e| BindError::new(sqlstate::SYNTAX_ERROR, e.to_string()))?;
+        let ty = resolve_name(&data_type)?;
+        validate_typmod(&data_type, ty)?;
+        Ok(TypeSpec { ty, data_type })
+    }
+
+    /// Run the type's input function over `value` without raising.
+    pub fn check(&self, value: &str) -> Result<(), SoftError> {
+        soft(&self.data_type, self.ty, value)
+    }
+}
+
+/// The `PgType` a written name denotes, keeping PostgreSQL's two distinct
+/// failures apart: a bareword that names no built-in "does not exist" (42704),
+/// while a name this build parses but does not model keeps `map_data_type`'s
+/// own "is not supported yet" (0A000) — so a real PostgreSQL type is never
+/// reported as nonexistent, and the feature-gap signal survives.
+fn resolve_name(data_type: &ast::DataType) -> Result<PgType, BindError> {
+    map_data_type(data_type).map_err(|unsupported| {
+        let ast::DataType::Custom(obj, _) = data_type else {
+            return unsupported;
+        };
+        if builtin_custom_type(obj).is_some() {
+            return unsupported;
+        }
+        // PostgreSQL reports the *folded* name: an unquoted identifier
+        // downcases, a quoted one keeps its spelling.
+        let name = obj
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().map(normalize_ident))
+            .collect::<Vec<_>>()
+            .join(".");
         BindError::new(
             sqlstate::UNDEFINED_OBJECT,
-            format!("type \"{}\" does not exist", type_spec.trim()),
+            format!("type \"{name}\" does not exist"),
         )
-    })?;
-    // A `reg*` name resolves against the catalog, which the binder does not
-    // hold; `parse_unknown` would answer `XX000`. Say so honestly instead.
-    if let PgType::Reg(_) = ty {
-        return Err(BindError::feature_not_supported(format!(
-            "pg_input_is_valid on type \"{}\" is not supported yet",
-            type_spec.trim()
-        )));
+    })
+}
+
+/// Reject a modifier PostgreSQL's `typmodin` would reject (`varchar(0)`,
+/// `numeric(1001)`), recursing into an array's element type. This runs in the
+/// hard channel; the soft path below reads the modifier back with the
+/// *unchecked* readers, so a 22023 can never reach a `SoftError`.
+fn validate_typmod(data_type: &ast::DataType, ty: PgType) -> Result<(), BindError> {
+    checked_length_typmod(data_type)?;
+    checked_numeric_typmod(data_type)?;
+    if let Some((elem_ty, elem_dt)) = array_element(data_type, ty) {
+        validate_typmod(elem_dt, elem_ty)?;
     }
-    Ok(soft(&data_type, ty, value))
+    Ok(())
 }
 
 /// The fallible half: input function, then typmod. Split out so every early
@@ -84,10 +192,33 @@ fn soft(data_type: &ast::DataType, ty: PgType, value: &str) -> Result<(), SoftEr
     Ok(())
 }
 
+/// An array type's `(element type, element type name)`, or `None` when
+/// `data_type` is not a written array spec. Both halves are needed to carry a
+/// modifier like `varchar(4)[]` down to the elements.
+fn array_element(data_type: &ast::DataType, ty: PgType) -> Option<(PgType, &ast::DataType)> {
+    let PgType::Array(elem_oid) = ty else {
+        return None;
+    };
+    let ast::DataType::Array(def) = data_type else {
+        return None;
+    };
+    let inner = match def {
+        ast::ArrayElemTypeDef::SquareBracket(inner, _)
+        | ast::ArrayElemTypeDef::AngleBracket(inner)
+        | ast::ArrayElemTypeDef::Parenthesis(inner) => inner,
+        ast::ArrayElemTypeDef::None => return None,
+    };
+    Some((PgType::from_oid(elem_oid)?, inner))
+}
+
 /// Apply the type modifier the way an input function does — in *assignment*
 /// terms, `explicit = false`, so an over-long value errors instead of being
 /// truncated. Trailing blanks are still absorbed, which is why
 /// `pg_input_is_valid('abcd  ', 'char(4)')` is true while `'abcde'` is not.
+///
+/// Reads the modifier with the *unchecked* [`length_typmod`]/[`numeric_typmod`]
+/// — [`validate_typmod`] has already rejected an unusable one in the hard
+/// channel, so nothing here can report a bad type spec as a bad value.
 fn apply_input_typmod(
     value: &Value,
     ty: PgType,
@@ -108,8 +239,8 @@ fn apply_input_typmod(
                 return Ok(());
             };
             // A bare `varchar` is unlimited; a bare `char` is `char(1)`, which
-            // `checked_length_typmod` already supplies.
-            let Some(n) = checked_length_typmod(data_type)? else {
+            // `length_typmod` already supplies.
+            let Some(n) = length_typmod(data_type) else {
                 return Ok(());
             };
             if ty == PgType::Varchar {
@@ -122,11 +253,24 @@ fn apply_input_typmod(
             let Value::Bit { len, data } = value else {
                 return Ok(());
             };
-            let Some(n) = checked_length_typmod(data_type)? else {
+            let Some(n) = length_typmod(data_type) else {
                 return Ok(());
             };
             crabgresql_types::bit::coerce(*len, data, n, ty == PgType::Varbit, false)
                 .map_err(|e| BindError::new(e.sqlstate, e.message))?;
+        }
+        // `array_in` builds the elements without a modifier, so `varchar(4)[]`
+        // enforces its element length here — as PostgreSQL's `array_in` does,
+        // which passes the element typmod down to each element's input call.
+        PgType::Array(_) => {
+            let (Value::Array { elems, .. }, Some((elem_ty, elem_dt))) =
+                (value, array_element(data_type, ty))
+            else {
+                return Ok(());
+            };
+            for elem in elems {
+                apply_input_typmod(elem, elem_ty, elem_dt)?;
+            }
         }
         // `name` truncates to 63 characters and never fails; no other type
         // carries a modifier that can reject a value.
@@ -144,6 +288,12 @@ mod tests {
         soft_input(type_spec, value)
             .expect("type spec resolves")
             .err()
+    }
+
+    /// `"SQLSTATE: message"` for a *hard* error — an unusable type spec.
+    fn hard(type_spec: &str) -> String {
+        let e = soft_input(type_spec, "irrelevant").expect_err("expected a hard error");
+        format!("{}: {}", e.code, e.message)
     }
 
     /// `"SQLSTATE: message"` — one string, so the expectations below read as
@@ -227,20 +377,125 @@ mod tests {
 
     #[test]
     fn unknown_type_name_is_a_hard_error() {
-        let e = soft_input("nosuchtype", "x").expect_err("expected a hard error");
-        assert_eq!(e.code, "42704");
-        assert_eq!(e.message, "type \"nosuchtype\" does not exist");
+        assert_eq!(
+            hard("nosuchtype"),
+            "42704: type \"nosuchtype\" does not exist"
+        );
+    }
+
+    /// PostgreSQL reports the *folded* identifier: an unquoted name downcases,
+    /// a quoted one keeps its spelling.
+    #[test]
+    fn unknown_type_name_is_reported_folded() {
+        assert_eq!(
+            hard("NoSuchType"),
+            "42704: type \"nosuchtype\" does not exist"
+        );
+        assert_eq!(
+            hard("\"NoSuchType\""),
+            "42704: type \"NoSuchType\" does not exist"
+        );
+    }
+
+    /// A spec this build recognizes but does not model keeps `map_data_type`'s
+    /// own 0A000, rather than being relabelled as a type that does not exist —
+    /// so the feature-gap signal survives.
+    ///
+    /// A bare name the parser hands over as `Custom` (`box`, `xml`) cannot be
+    /// told apart from a typo without a catalog, and stays 42704.
+    #[test]
+    fn unmodelled_spec_keeps_its_not_supported_error() {
+        assert_eq!(
+            hard("int4[][]"),
+            "0A000: type \"INT4[][]\" is not supported yet"
+        );
+        assert_eq!(hard("box[]"), "0A000: type \"box\" is not supported yet");
     }
 
     #[test]
     fn unparsable_type_spec_is_a_hard_error() {
-        let e = soft_input("int4(", "x").expect_err("expected a hard error");
-        assert_eq!(e.code, "42601");
+        assert!(hard("int4(").starts_with("42601:"));
+    }
+
+    /// A modifier `typmodin` would reject describes the type spec, not the
+    /// value, so it raises rather than answering false.
+    #[test]
+    fn unusable_type_modifier_is_a_hard_error() {
+        assert_eq!(
+            hard("varchar(0)"),
+            "22023: length for type varchar must be at least 1"
+        );
+        assert_eq!(
+            hard("char(0)"),
+            "22023: length for type char must be at least 1"
+        );
+        assert_eq!(
+            hard("bit(0)"),
+            "22023: length for type bit must be at least 1"
+        );
+        assert_eq!(
+            hard("numeric(0)"),
+            "22023: NUMERIC precision 0 must be between 1 and 1000"
+        );
+        assert_eq!(
+            hard("numeric(1001)"),
+            "22023: NUMERIC precision 1001 must be between 1 and 1000"
+        );
+        assert_eq!(
+            hard("numeric(5,1001)"),
+            "22023: NUMERIC scale 1001 must be between -1000 and 1000"
+        );
     }
 
     #[test]
     fn qualified_builtin_resolves() {
         assert!(bad("pg_catalog.int4", "42").is_none());
         assert!(report("pg_catalog.int4", "x").starts_with("22P02:"));
+    }
+
+    /// `bpchar(4)` and `pg_catalog.varchar(4)` name the same types as
+    /// `char(4)` / `varchar(4)`; the parser hands their modifier over as raw
+    /// token text rather than in a typed field.
+    #[test]
+    fn aliased_and_qualified_names_carry_their_modifier() {
+        assert!(bad("bpchar(4)", "abcd  ").is_none());
+        assert_eq!(
+            report("bpchar(4)", "abcde"),
+            "22001: value too long for type character(4)"
+        );
+        assert_eq!(
+            report("pg_catalog.varchar(4)", "abcde"),
+            "22001: value too long for type character varying(4)"
+        );
+        assert!(report("pg_catalog.numeric(5,2)", "123456").starts_with("22003:"));
+        // A modifier-less `bpchar` is unlimited, unlike a bare `char`.
+        assert!(bad("bpchar", "abcde").is_none());
+    }
+
+    /// `array_in` builds elements without a modifier, so the element typmod is
+    /// applied per element afterwards.
+    #[test]
+    fn array_element_modifier_is_enforced() {
+        assert!(bad("varchar(4)[]", "{abcd,ab}").is_none());
+        assert_eq!(
+            report("varchar(4)[]", "{abcde}"),
+            "22001: value too long for type character varying(4)"
+        );
+        assert!(report("numeric(5,2)[]", "{123456}").starts_with("22003:"));
+        // The element's modifier is validated in the hard channel too.
+        assert_eq!(
+            hard("varchar(0)[]"),
+            "22023: length for type varchar must be at least 1"
+        );
+    }
+
+    /// A `reg*` input function is a catalog lookup, so this catalog-free entry
+    /// point declines rather than guessing; the executor drives it instead.
+    #[test]
+    fn reg_types_need_a_catalog() {
+        assert_eq!(
+            hard("regclass"),
+            "0A000: soft input for a reg* type needs a catalog"
+        );
     }
 }

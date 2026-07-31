@@ -83,6 +83,11 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             if let Some(result) = eval_deparse_fn(*func, &arg_values, ctx) {
                 return result;
             }
+            // `pg_input_is_valid` may need the catalog too (a `reg*` target),
+            // so it is dispatched here rather than in `eval_scalar`.
+            if let Some(result) = eval_soft_input_fn(*func, &arg_values, ctx) {
+                return result;
+            }
             // The catalog functions read the session's pg_catalog snapshot, which
             // the pure `eval_scalar` has no handle to.
             match eval_catalog_fn(*func, &arg_values, ctx) {
@@ -417,6 +422,50 @@ fn eval_catalog_fn(
         _ => unreachable!("guarded by the matches! above"),
     };
     Some(Ok(value))
+}
+
+/// `pg_input_is_valid`: a type's input function run without raising.
+/// Dispatched here rather than in the pure `eval_scalar` because a `reg*`
+/// input function *is* a catalog lookup, and only this layer holds the handle.
+fn eval_soft_input_fn(
+    func: ScalarFn,
+    args: &[Value],
+    ctx: &ExecContext,
+) -> Option<Result<Value, ExecError>> {
+    if !matches!(func, ScalarFn::PgInputIsValid) {
+        return None;
+    }
+    // STRICT, so a NULL type name is NULL rather than a resolution failure —
+    // `pg_input_is_valid(NULL, 'nosuchtype')` is NULL in PG, not an error.
+    let (Value::Text(value), Value::Text(type_name)) = (&args[0], &args[1]) else {
+        return Some(Ok(Value::Null));
+    };
+    Some(soft_input_in_ctx(type_name, value, ctx).map(|bad| Value::Bool(bad.is_none())))
+}
+
+/// Run `type_name`'s input function over `value` without raising, resolving a
+/// `reg*` name through the session's catalog. `Ok(None)` means valid; the
+/// `Ok(Some(_))` failure is carried as an [`ExecError`] purely for its shape
+/// (SQLSTATE + message + DETAIL/HINT) — it is a value to report, not a raise.
+/// Only an unusable *type spec* comes back as `Err`.
+pub(crate) fn soft_input_in_ctx(
+    type_name: &str,
+    value: &str,
+    ctx: &ExecContext,
+) -> Result<Option<ExecError>, ExecError> {
+    let spec = crabgresql_binder::TypeSpec::resolve(type_name)?;
+    // `regclassin` and friends fail softly when the object is missing, which is
+    // exactly what these functions are asked to report.
+    if let PgType::Reg(kind) = spec.ty {
+        let ops = ctx.catalog.as_deref().ok_or_else(|| {
+            ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                "soft input for a reg* type evaluated without a catalog context",
+            )
+        })?;
+        return Ok(crate::reg::from_text(kind, value, ops).err());
+    }
+    Ok(spec.check(value).err().map(ExecError::from))
 }
 
 /// Dispatch the type-formatting / node-tree deparse functions. Returns `None`

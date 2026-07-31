@@ -114,8 +114,58 @@ SELECT pg_input_is_valid('42', 'pg_catalog.int4') AS ok,
  t  | f
 (1 row)
 
+-- an alias or qualified spelling carries its modifier just like char(4)
+SELECT pg_input_is_valid('abcd  ', 'bpchar(4)') AS ok, pg_input_is_valid('abcde', 'bpchar(4)') AS bad;
+ ok | bad 
+----+-----
+ t  | f
+(1 row)
+
+SELECT * FROM pg_input_error_info('abcde', 'pg_catalog.varchar(4)');
+                   message                    | detail | hint | sql_error_code 
+----------------------------------------------+--------+------+----------------
+ value too long for type character varying(4) |        |      | 22001
+(1 row)
+
+-- an array applies its element modifier to every element
+SELECT pg_input_is_valid('{abcd,ab}', 'varchar(4)[]') AS ok,
+       pg_input_is_valid('{abcde}', 'varchar(4)[]') AS bad;
+ ok | bad 
+----+-----
+ t  | f
+(1 row)
+
+SELECT * FROM pg_input_error_info('{abcde}', 'varchar(4)[]');
+                   message                    | detail | hint | sql_error_code 
+----------------------------------------------+--------+------+----------------
+ value too long for type character varying(4) |        |      | 22001
+(1 row)
+
+-- a reg* target fails softly when the object is missing: that is a value
+-- answer, not an error
+SELECT pg_input_is_valid('pg_class', 'regclass') AS ok,
+       pg_input_is_valid('no_such_table', 'regclass') AS bad;
+ ok | bad 
+----+-----
+ t  | f
+(1 row)
+
+SELECT * FROM pg_input_error_info('no_such_table', 'regclass');
+                 message                 | detail | hint | sql_error_code 
+-----------------------------------------+--------+------+----------------
+ relation "no_such_table" does not exist |        |      | 42P01
+(1 row)
+
 -- a type name that denotes nothing is an error, not a row
 SELECT pg_input_is_valid('x', 'nosuchtype');
 ERROR:  type "nosuchtype" does not exist
 SELECT * FROM pg_input_error_info('x', 'nosuchtype');
 ERROR:  type "nosuchtype" does not exist
+-- so is a modifier the type could never accept: it describes the type spec,
+-- not the value
+SELECT pg_input_is_valid('abc', 'varchar(0)');
+ERROR:  length for type varchar must be at least 1
+SELECT pg_input_is_valid('1', 'numeric(0)');
+ERROR:  NUMERIC precision 0 must be between 1 and 1000
+SELECT pg_input_is_valid('1', 'numeric(5,1001)');
+ERROR:  NUMERIC scale 1001 must be between -1000 and 1000
