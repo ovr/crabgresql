@@ -3,6 +3,7 @@
 //! against `expected/<name>.out` (or its `_1` … `_9` variants, pg_regress
 //! style). Failures land as unified diffs in `<outdir>/regression.diffs`.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,6 +13,7 @@ use tokio::net::TcpListener;
 
 use crate::client::{Client, Field, QueryEvent};
 use crate::format;
+use crate::psql_var::{self, Variables};
 use crate::script::{ScriptItem, is_copy_from_stdin, lex};
 
 pub struct SuiteConfig {
@@ -25,6 +27,52 @@ pub struct SuiteConfig {
     /// Where `results/` and `regression.diffs` are written.
     pub outdir: PathBuf,
     pub statement_timeout: Duration,
+    /// The environment `\getenv` reads. Leave empty to take pg_regress's
+    /// defaults from [`regress_environment`].
+    pub env: BTreeMap<String, String>,
+}
+
+impl SuiteConfig {
+    /// The environment scripts see, with [`regress_environment`] filling in any
+    /// variable the caller did not set.
+    fn environment(&self) -> BTreeMap<String, String> {
+        let mut env = regress_environment(&self.regress_dir, &self.outdir);
+        env.extend(self.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        env
+    }
+}
+
+/// The four variables pg_regress passes to psql, which upstream scripts read
+/// with `\getenv` to locate their data files and the C test library. Real
+/// process environment entries win, so a caller can point a run elsewhere.
+///
+/// `PG_LIBDIR` has no meaningful value here — nothing loads C modules — so it
+/// defaults to empty; the `CREATE FUNCTION … LANGUAGE C` statements that use it
+/// fail either way.
+pub fn regress_environment(regress_dir: &Path, outdir: &Path) -> BTreeMap<String, String> {
+    let absolute = |path: &Path| {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let dlsuffix = if cfg!(target_os = "macos") {
+        ".dylib"
+    } else {
+        ".so"
+    };
+    [
+        ("PG_ABS_SRCDIR", absolute(regress_dir)),
+        ("PG_ABS_BUILDDIR", absolute(outdir)),
+        ("PG_LIBDIR", String::new()),
+        ("PG_DLSUFFIX", dlsuffix.to_string()),
+    ]
+    .into_iter()
+    .map(|(name, default)| {
+        let value = std::env::var(name).unwrap_or(default);
+        (name.to_string(), value)
+    })
+    .collect()
 }
 
 pub struct SuiteReport {
@@ -63,6 +111,7 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
     let diffs_path = config.outdir.join("regression.diffs");
     let mut diffs = String::new();
 
+    let environment = config.environment();
     let setup = config.setup.iter().map(|name| (name, false));
     let checked = config.tests.iter().map(|name| (name, true));
     let mut outcomes = Vec::new();
@@ -71,7 +120,7 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
         // Lossy: a few upstream scripts are deliberately not UTF-8 (encoding
         // tests); they can only fail, but they must not abort the run.
         let sql = String::from_utf8_lossy(&std::fs::read(&sql_path)?).into_owned();
-        let output = run_test(port, &sql, config.statement_timeout).await?;
+        let output = run_test(port, &sql, config.statement_timeout, &environment).await?;
         let result_path = results_dir.join(format!("{name}.out"));
         std::fs::write(&result_path, &output)?;
         if !check {
@@ -147,31 +196,42 @@ fn expected_candidates(regress_dir: &Path, name: &str) -> Vec<PathBuf> {
 /// Execute one script on a fresh connection, producing the text psql would
 /// print. A timeout or lost connection appends a deterministic marker and
 /// abandons the rest of the file, like a dying psql would.
-async fn run_test(port: u16, sql: &str, statement_timeout: Duration) -> io::Result<String> {
+async fn run_test(
+    port: u16,
+    sql: &str,
+    statement_timeout: Duration,
+    environment: &BTreeMap<String, String>,
+) -> io::Result<String> {
     let mut client = Client::connect(port).await?;
     let mut out = String::new();
     // psql starts with an empty NULL marker. `\pset null` updates this for the
     // lifetime of the current script/connection only.
     let mut null_display = String::new();
+    // `\set` variables, likewise scoped to this script.
+    let mut vars = Variables::new();
     // A `COPY … FROM STDIN` statement is held here until its `CopyData` payload
     // arrives (the data lines are lexed after the statement), then run together.
     let mut pending_copy: Option<String> = None;
     for item in lex(sql) {
         match item {
+            // Echoed verbatim: `psql -a` prints the source line, so a variable
+            // reference is visible unexpanded even though the statement sent to
+            // the server has it substituted.
             ScriptItem::Line(line) => {
                 out.push_str(&line);
                 out.push('\n');
             }
             ScriptItem::Metacommand(command) => {
-                match pset_null(&command) {
-                    PsetNull::Set(value) => null_display = value,
-                    // With no value, quiet psql leaves the setting unchanged
-                    // and emits nothing.
-                    PsetNull::Query => {}
-                    PsetNull::Other => out.push_str(&format::metacommand_stub(&command)),
-                }
+                run_metacommand(
+                    &command,
+                    environment,
+                    &mut vars,
+                    &mut null_display,
+                    &mut out,
+                );
             }
             ScriptItem::Statement(statement) => {
+                let statement = psql_var::substitute(&statement, &vars);
                 // Defer a COPY FROM STDIN: it runs once its data is collected.
                 if is_copy_from_stdin(&statement) {
                     pending_copy = Some(statement);
@@ -238,91 +298,169 @@ fn render_events(out: &mut String, events: &[QueryEvent], query: &str, null_disp
     }
 }
 
-/// What a metacommand means to the runner.
-enum PsetNull {
-    /// `\pset null <value>` — set the NULL marker.
-    Set(String),
-    /// `\pset null` — query the setting, which is silent under `-q`.
-    Query,
-    /// Any other metacommand; the runner does not implement it.
-    Other,
-}
-
-/// Recognize `\pset null [value]`.
-fn pset_null(command: &str) -> PsetNull {
-    let Some(rest) = strip_word(command, "pset").and_then(|rest| strip_word(rest, "null")) else {
-        return PsetNull::Other;
-    };
-    if rest.is_empty() {
-        PsetNull::Query
-    } else {
-        PsetNull::Set(parse_meta_argument(rest))
-    }
-}
-
-/// Strip `word` from the front of `s` if it is followed by a word boundary,
-/// returning the remainder with leading whitespace removed.
-fn strip_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
-    let rest = s.strip_prefix(word)?;
-    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim_start())
-}
-
-/// Parse the first argument of a psql metacommand, to the extent the corpus
-/// needs it: single quotes group and disappear, and `\` keeps the next
-/// character literally.
+/// Run one backslash command, appending whatever psql would print. The four
+/// implemented commands (`\set`, `\unset`, `\getenv`, `\pset null`) print
+/// nothing on success; everything else gets the "not supported" stub.
 ///
-/// This is deliberately narrower than psql, which also decodes C escapes
-/// (`\n`, `\t`, `\xNN`, octal) inside single quotes, leaves double quotes in
-/// the value, and treats an *unquoted* backslash as the start of the next
-/// metacommand rather than an escape. Every `\pset null` argument in the
-/// vendored corpus is a plain single-quoted literal, and the one that does
-/// contain a backslash (`'\\N'`, strings.sql) decodes the same under both
-/// rules — so the divergences are unreachable today. Widen this only
-/// alongside a test that needs it.
-fn parse_meta_argument(input: &str) -> String {
-    let mut out = String::new();
-    let mut chars = input.chars();
-    let mut quoted = false;
-    while let Some(c) = chars.next() {
-        // A backslash is never a quote character, so it means the same thing
-        // inside and outside one.
-        if c == '\\' {
-            out.extend(chars.next());
-        } else if c == '\'' {
-            quoted = !quoted;
-        } else if !quoted && c.is_whitespace() {
-            break;
-        } else {
-            out.push(c);
+/// A command may be followed by another on the same line, introduced by an
+/// unquoted `\` — the corpus uses `\\` purely to hang a trailing comment off a
+/// `\set` (`regproc.sql:108`). Chained commands are dispatched in turn, so the
+/// no-output `\\` stays silent instead of being mistaken for an argument.
+fn run_metacommand(
+    command: &str,
+    environment: &BTreeMap<String, String>,
+    vars: &mut Variables,
+    null_display: &mut String,
+    out: &mut String,
+) {
+    let mut command = command.to_string();
+    loop {
+        let (name, arguments) = split_command_name(&command);
+        // Arguments expand against the variables as they stand *before* this
+        // command runs, which is what makes `\set dobody :dobody '…'` append.
+        let parsed = psql_var::split_args(arguments, vars);
+        let args: Vec<&str> = parsed.args.iter().map(String::as_str).collect();
+        match (name, args.as_slice()) {
+            // `\set name [value …]` concatenates every value with no
+            // separator; with no value at all the variable becomes empty.
+            ("set", [variable, values @ ..]) => vars.set(variable, values.concat()),
+            ("unset", [variable, ..]) => vars.unset(variable),
+            // `\getenv name ENVVAR` leaves `name` unset when the environment
+            // has no such entry.
+            ("getenv", [variable, source, ..]) => match environment.get(*source) {
+                Some(value) => vars.set(variable, value.clone()),
+                None => vars.unset(variable),
+            },
+            ("pset", ["null", value, ..]) => *null_display = (*value).to_string(),
+            // `\pset null` with no value queries the setting, which is silent
+            // under `-q`.
+            ("pset", ["null"]) => {}
+            // `\\` ends the query buffer and swallows the rest of the line.
+            ("\\", _) => {}
+            _ => out.push_str(&format::metacommand_stub(&command)),
         }
+        if parsed.rest.is_empty() {
+            return;
+        }
+        // Drop the `\` that introduced the next command.
+        command = parsed.rest[1..].to_string();
     }
-    out
+}
+
+/// Split `set VERBOSITY terse` into `("set", "VERBOSITY terse")`. psql ends a
+/// command name at the first character that cannot be part of one, so
+/// `\pset null` splits on the space while a lone `\\` yields the name `\`.
+fn split_command_name(command: &str) -> (&str, &str) {
+    let end = command
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '?' && c != '!')
+        .unwrap_or(command.len());
+    if end == 0 {
+        // A non-alphanumeric command is a single character, e.g. `\\` or `\.`.
+        return command.split_at(1.min(command.len()));
+    }
+    let (name, rest) = command.split_at(end);
+    (name, rest.trim_start())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[track_caller]
-    fn assert_sets(command: &str, expected: &str) {
-        match pset_null(command) {
-            PsetNull::Set(value) => assert_eq!(value, expected),
-            _ => panic!("{command} did not set the NULL marker"),
+    /// Run a script's worth of metacommands, returning the printed output, the
+    /// resulting NULL marker and the variables.
+    fn run_all(commands: &[&str]) -> (String, String, Variables) {
+        let environment = BTreeMap::from([("PG_ABS_SRCDIR".to_string(), "/src".to_string())]);
+        let mut vars = Variables::new();
+        let mut null_display = String::new();
+        let mut out = String::new();
+        for command in commands {
+            run_metacommand(
+                command,
+                &environment,
+                &mut vars,
+                &mut null_display,
+                &mut out,
+            );
         }
+        (out, null_display, vars)
+    }
+
+    #[track_caller]
+    fn assert_null_marker(command: &str, expected: &str) {
+        let (out, null_display, _) = run_all(&[command]);
+        assert_eq!(out, "", "{command} printed something");
+        assert_eq!(null_display, expected);
     }
 
     #[test]
     fn parses_pset_null_values() {
-        assert_sets("pset null '(null)'", "(null)");
-        assert_sets("pset null ''", "");
-        assert_sets("pset null NULL", "NULL");
-        assert_sets(r"pset null '\\N'", r"\N");
+        assert_null_marker("pset null '(null)'", "(null)");
+        assert_null_marker("pset null ''", "");
+        assert_null_marker("pset null NULL", "NULL");
+        assert_null_marker(r"pset null '\\N'", r"\N");
         // psql keeps double quotes in the value of an option like `\pset`.
-        assert_sets(r#"pset null "(null)""#, r#""(null)""#);
-        assert!(matches!(pset_null("pset null"), PsetNull::Query));
-        assert!(matches!(pset_null("pset format aligned"), PsetNull::Other));
-        // `null` must be a whole word, and `pset` must be the whole command.
-        assert!(matches!(pset_null("pset nullx x"), PsetNull::Other));
-        assert!(matches!(pset_null("psetnull x"), PsetNull::Other));
+        assert_null_marker(r#"pset null "(null)""#, r#""(null)""#);
+        // Querying the setting is silent under `-q` and changes nothing.
+        assert_null_marker("pset null", "");
+    }
+
+    #[test]
+    fn unimplemented_metacommands_still_stub() {
+        let (out, _, _) = run_all(&["pset format aligned", "d crabs", "psetnull x"]);
+        assert_eq!(
+            out,
+            "\\pset: metacommand not supported by crabgresql regress runner\n\
+             \\d: metacommand not supported by crabgresql regress runner\n\
+             \\psetnull: metacommand not supported by crabgresql regress runner\n"
+        );
+    }
+
+    #[test]
+    fn set_concatenates_values_and_unset_removes_them() {
+        let (out, _, vars) = run_all(&["set filename /src '/data/onek.data'", "set empty"]);
+        assert_eq!(out, "");
+        assert_eq!(vars.get("filename"), Some("/src/data/onek.data"));
+        // `\set name` with no value makes the variable empty, not undefined.
+        assert_eq!(vars.get("empty"), Some(""));
+
+        let (_, _, vars) = run_all(&["set a 1", "unset a"]);
+        assert_eq!(vars.get("a"), None);
+    }
+
+    #[test]
+    fn getenv_reads_the_environment_and_unsets_when_missing() {
+        let (out, _, vars) = run_all(&[
+            "set libdir stale",
+            "getenv abs_srcdir PG_ABS_SRCDIR",
+            "getenv libdir PG_LIBDIR",
+        ]);
+        assert_eq!(out, "");
+        assert_eq!(vars.get("abs_srcdir"), Some("/src"));
+        assert_eq!(vars.get("libdir"), None);
+    }
+
+    #[test]
+    fn set_arguments_expand_earlier_variables() {
+        // largeobject.sql builds a DO body by appending to itself.
+        let (_, _, vars) = run_all(&[
+            "getenv abs_srcdir PG_ABS_SRCDIR",
+            "set filename :abs_srcdir '/data/onek.data'",
+            "set body 'lo_export(loid, ' :'filename' ');'",
+        ]);
+        assert_eq!(vars.get("filename"), Some("/src/data/onek.data"));
+        assert_eq!(
+            vars.get("body"),
+            Some("lo_export(loid, '/src/data/onek.data');")
+        );
+    }
+
+    #[test]
+    fn trailing_backslash_command_is_dispatched_separately() {
+        // regproc.sql:108 — `\\` ends the arguments and swallows the comment,
+        // printing nothing.
+        let (out, _, vars) =
+            run_all([r"set VERBOSITY sqlstate \\ -- encoding-dependent"].as_slice());
+        assert_eq!(out, "");
+        assert_eq!(vars.get("VERBOSITY"), Some("sqlstate"));
     }
 }

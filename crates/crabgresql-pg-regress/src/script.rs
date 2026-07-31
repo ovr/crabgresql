@@ -14,9 +14,11 @@ pub enum ScriptItem {
     Line(String),
     /// A complete SQL statement, including its terminating `;`.
     Statement(String),
-    /// A backslash metacommand: the line's text after `\`, e.g. `d tab`.
-    /// Any pending statement buffer is discarded (psql's `\g`-family would
-    /// execute it; the runner supports no metacommands at all).
+    /// A backslash metacommand: the line's text after `\`, e.g. `d tab`. This
+    /// is the whole rest of the line, so a chained command (`\set x y \\ …`)
+    /// arrives as one item for the runner to split. Any pending statement
+    /// buffer is discarded — psql's `\g`-family would execute it, but the
+    /// runner implements none of those.
     Metacommand(String),
     /// The inline data body of a preceding `COPY … FROM STDIN` statement: every
     /// physical line up to (but not including) the terminating `\.`, joined with
