@@ -156,10 +156,15 @@ fn may_descend_right(kind: JoinKind) -> bool {
 pub(crate) fn is_relocatable(expr: &BoundExpr) -> bool {
     fn opaque(expr: &BoundExpr) -> bool {
         match expr {
+            // A window marker is opaque for a different reason than the rest: a
+            // window is evaluated above the whole join, and a `WHERE` can never
+            // contain one, so reaching here means the extraction pass missed it.
+            // Refusing keeps that binder bug from also relocating the conjunct.
             BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. }
-            | BoundExpr::QuantifiedSubquery { .. } => true,
+            | BoundExpr::QuantifiedSubquery { .. }
+            | BoundExpr::WindowFunc { .. } => true,
             BoundExpr::ColumnRef { .. } | BoundExpr::Const { .. } | BoundExpr::Param { .. } => {
                 false
             }

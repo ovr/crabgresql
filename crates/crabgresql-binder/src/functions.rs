@@ -12,12 +12,14 @@ use std::sync::Arc;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{RoutineImpl, RoutineKind, RoutineSig, TypeCatalog};
+use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, RegKind};
 
 use crate::expr::{
-    Binding, BoundExpr, Scope, bind_expr, bind_sql_function_body, coerce_for_arg, inline_params,
+    Binding, BoundExpr, BoundWindowSpec, Scope, WindowKind, WindowSortKey, bind_expr,
+    bind_sql_function_body, coerce_for_arg, inline_params,
 };
-use crate::{BindError, OutputColumn};
+use crate::{BindError, BoundAggregate, OutputColumn};
 
 /// A scalar function the executor can evaluate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -727,6 +729,55 @@ impl AggFn {
             AggFn::Avg => "avg",
             AggFn::StringAgg => "string_agg",
         }
+    }
+}
+
+/// A dedicated window function — one that has no aggregate counterpart and is
+/// legal only with an `OVER` clause. Ordinary aggregates used as window
+/// functions (`sum(x) OVER (…)`) are *not* here; they keep their [`AggFn`] and
+/// reuse the same accumulators (see [`crate::WindowKind`]).
+///
+/// Every function in this set reads the current row's position within its
+/// partition — its peer group, or its ordinal — and so ignores the window
+/// frame entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowFn {
+    /// `row_number() -> int8`: the row's 1-based ordinal in the partition.
+    RowNumber,
+    /// `rank() -> int8`: 1 + the number of rows before this row's peer group,
+    /// so ranks skip after a tie.
+    Rank,
+    /// `dense_rank() -> int8`: the 1-based ordinal of this row's peer group,
+    /// so ranks do not skip after a tie.
+    DenseRank,
+}
+
+impl WindowFn {
+    /// The function's SQL name, as it appears in error messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            WindowFn::RowNumber => "row_number",
+            WindowFn::Rank => "rank",
+            WindowFn::DenseRank => "dense_rank",
+        }
+    }
+
+    /// The function's result type. All three count rows, so all three are
+    /// `int8`, as in PG.
+    pub fn return_type(self) -> PgType {
+        match self {
+            WindowFn::RowNumber | WindowFn::Rank | WindowFn::DenseRank => PgType::Int8,
+        }
+    }
+}
+
+/// Resolve a dedicated window function by (already lowercased) name.
+pub fn lookup_window_fn(name: &str) -> Option<WindowFn> {
+    match name {
+        "row_number" => Some(WindowFn::RowNumber),
+        "rank" => Some(WindowFn::Rank),
+        "dense_rank" => Some(WindowFn::DenseRank),
+        _ => None,
     }
 }
 
@@ -1963,11 +2014,7 @@ fn function_name(name: &ast::ObjectName) -> Option<String> {
 }
 
 pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Binding, BindError> {
-    if func.over.is_some()
-        || func.filter.is_some()
-        || !func.within_group.is_empty()
-        || func.null_treatment.is_some()
-    {
+    if func.filter.is_some() || !func.within_group.is_empty() || func.null_treatment.is_some() {
         return Err(BindError::feature_not_supported(
             "this function form is not supported yet",
         ));
@@ -1977,6 +2024,23 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
             "function is not supported yet: {func}"
         )));
     };
+    // An `OVER` clause makes this a window call whatever the name resolves to,
+    // so it is dispatched before the aggregate and scalar paths.
+    if let Some(over) = &func.over {
+        return bind_window_call(&name, func, over, scope);
+    }
+    // The dedicated window functions exist only in window position — but only
+    // when the call actually resolves to one. PG resolves by name and argument
+    // types first and reports the missing OVER clause about the *chosen*
+    // function, so `CREATE FUNCTION rank(int) …; SELECT rank(1)` calls the user's.
+    if let Some(win) = lookup_window_fn(&name)
+        && builtin_window_args_match(&func.args)
+    {
+        return Err(BindError::new(
+            sqlstate::WRONG_OBJECT_TYPE,
+            format!("window function {} requires an OVER clause", win.name()),
+        ));
+    }
     // Aggregates bind to a transient `Aggregate` marker (extracted into an
     // `Aggregate` plan node later), not to a scalar overload.
     if let Some(agg) = lookup_agg(&name) {
@@ -2021,6 +2085,282 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
     }
 
     resolve_call(&name, bindings, scope.catalog())
+}
+
+/// Bind a call carrying an `OVER` clause to a transient
+/// [`BoundExpr::WindowFunc`] marker. The binder's window-extraction pass later
+/// moves it into a [`crate::LogicalPlan::Window`] node and replaces the marker
+/// with a `ColumnRef`.
+///
+/// The name resolves in two namespaces: the dedicated window functions, and the
+/// ordinary aggregates, which `OVER` turns into window aggregates. Anything else
+/// is PG's "not a window function nor an aggregate function".
+fn bind_window_call(
+    name: &str,
+    func: &ast::Function,
+    over: &ast::WindowType,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let spec = resolve_over_clause(over, scope)?;
+    let spec = bind_window_spec(&spec, scope)?;
+    let kind = if let Some(win) = lookup_window_fn(name).filter(|_| {
+        builtin_window_args_match(&func.args)
+    }) {
+        WindowKind::Builtin {
+            func: win,
+            args: Vec::new(),
+        }
+    } else if let Some(agg) = lookup_agg(name) {
+        let Binding::Typed(BoundExpr::Aggregate {
+            func,
+            distinct,
+            args,
+            input_ty,
+            ret,
+        }) = bind_aggregate(agg, name, &func.args, scope)?
+        else {
+            return Err(BindError::new(
+                sqlstate::INTERNAL_ERROR,
+                "aggregate bound to a non-aggregate",
+            ));
+        };
+        // PG has never implemented this — the accumulators would need a
+        // per-frame distinct set — so it is a permanent 0A000, not a gap.
+        if distinct {
+            return Err(BindError::feature_not_supported(
+                "DISTINCT is not implemented for window functions",
+            ));
+        }
+        WindowKind::Aggregate(BoundAggregate {
+            func,
+            distinct: false,
+            collation: args
+                .first()
+                .map_or(DEFAULT_COLLATION_OID, |a| {
+                    crate::collation::expr_collation(a).collation
+                }),
+            args,
+            input_ty,
+            ret,
+        })
+    } else {
+        // Resolve the name first, so an outright typo still reports "function
+        // <name>(<types>) does not exist" rather than blaming the OVER clause.
+        let arg_exprs = positional_args(&func.args)?;
+        let bindings = arg_exprs
+            .iter()
+            .map(|e| bind_expr(e, scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        resolve_call(name, bindings, scope.catalog())?;
+        return Err(BindError::new(
+            sqlstate::WRONG_OBJECT_TYPE,
+            format!("OVER specified, but {name} is not a window function nor an aggregate function"),
+        ));
+    };
+    let ret = match &kind {
+        WindowKind::Builtin { func, .. } => func.return_type(),
+        WindowKind::Aggregate(agg) => agg.ret,
+    };
+    Ok(Binding::Typed(BoundExpr::WindowFunc {
+        kind,
+        spec: Box::new(spec),
+        ret,
+    }))
+}
+
+/// Bind the argument list of a dedicated window function. All three supported
+/// today take no arguments, so this only validates the arity.
+/// Whether a call site supplies exactly the arguments a dedicated window
+/// function takes. All three take none, so this is an empty `()`.
+///
+/// The name alone does not make a call a window call: PG resolves by name *and*
+/// argument types, so a user-defined `rank(int)` is an ordinary function and
+/// only the zero-argument `rank()` is the builtin.
+fn builtin_window_args_match(args: &ast::FunctionArguments) -> bool {
+    match args {
+        ast::FunctionArguments::List(list) => list.args.is_empty() && list.clauses.is_empty(),
+        // `row_number` with no parentheses is a column reference, not a call.
+        ast::FunctionArguments::None | ast::FunctionArguments::Subquery(_) => false,
+    }
+}
+
+/// Resolve an `OVER` clause to the window specification it denotes.
+///
+/// `OVER w` *is* the named window, frame and all. `OVER (w …)` **copies** it,
+/// and a copy is more restricted: it may add an `ORDER BY` only if the base has
+/// none, may never add a `PARTITION BY`, and — because a copy takes the base's
+/// rows but supplies its own frame — may not copy a base that has one. PG's hint
+/// on that last error points at the difference: dropping the parentheses turns
+/// the copy back into a reference, which is always allowed.
+fn resolve_over_clause(
+    over: &ast::WindowType,
+    scope: &Scope,
+) -> Result<ast::WindowSpec, BindError> {
+    match over {
+        // Every stored definition is already expanded, so a reference needs no
+        // further resolution — it *is* the window, frame and all.
+        ast::WindowType::NamedWindow(ident) => lookup_named_window(ident, scope).cloned(),
+        ast::WindowType::WindowSpec(spec) => expand_window_base(
+            spec.clone(),
+            |name| scope.named_window(name),
+            WindowCopyOrigin::Over,
+        ),
+    }
+}
+
+/// Where a window copy was written, which decides only whether PG's hint applies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowCopyOrigin {
+    /// `OVER (base …)` — the hint is "omit the parentheses", which turns the
+    /// copy back into a reference.
+    Over,
+    /// `WINDOW w AS (base …)`, where there are no parentheses to omit.
+    Definition,
+}
+
+/// Merge a window copy onto the base it names, or return it unchanged when it
+/// names none.
+///
+/// The copy restrictions are PG's, and are identical in both positions: a copy
+/// may add an `ORDER BY` only if the base has none, may never add a
+/// `PARTITION BY`, and — because a copy takes the base's rows but supplies its
+/// own frame — may not copy a base that has one.
+pub(crate) fn expand_window_base<'a>(
+    spec: ast::WindowSpec,
+    lookup: impl Fn(&str) -> Option<&'a ast::WindowSpec>,
+    origin: WindowCopyOrigin,
+) -> Result<ast::WindowSpec, BindError> {
+    let Some(base_name) = &spec.window_name else {
+        return Ok(spec);
+    };
+    let key = crate::expr::normalize_ident(base_name);
+    let Some(base) = lookup(&key) else {
+        return Err(BindError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("window \"{key}\" does not exist"),
+        ));
+    };
+    if !spec.partition_by.is_empty() {
+        return Err(BindError::new(
+            sqlstate::WINDOWING_ERROR,
+            format!("cannot override PARTITION BY clause of window \"{key}\""),
+        ));
+    }
+    if !spec.order_by.is_empty() && !base.order_by.is_empty() {
+        return Err(BindError::new(
+            sqlstate::WINDOWING_ERROR,
+            format!("cannot override ORDER BY clause of window \"{key}\""),
+        ));
+    }
+    if base.window_frame.is_some() {
+        // The hint only makes sense for a copy that adds nothing — that is the
+        // one that could have been written `OVER base` instead.
+        let bare = origin == WindowCopyOrigin::Over
+            && spec.order_by.is_empty()
+            && spec.window_frame.is_none();
+        return Err(BindError::new(
+            sqlstate::WINDOWING_ERROR,
+            format!("cannot copy window \"{key}\" because it has a frame clause"),
+        )
+        .with_hint(bare.then(|| "Omit the parentheses in this OVER clause.".to_string())));
+    }
+    Ok(ast::WindowSpec {
+        window_name: None,
+        partition_by: base.partition_by.clone(),
+        order_by: if spec.order_by.is_empty() {
+            base.order_by.clone()
+        } else {
+            spec.order_by
+        },
+        window_frame: spec.window_frame,
+    })
+}
+
+/// The `WINDOW` definition `name` refers to, or PG's "does not exist".
+fn lookup_named_window<'a>(
+    name: &ast::Ident,
+    scope: &'a Scope,
+) -> Result<&'a ast::WindowSpec, BindError> {
+    let key = crate::expr::normalize_ident(name);
+    scope.named_window(&key).ok_or_else(|| {
+        BindError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("window \"{key}\" does not exist"),
+        )
+    })
+}
+
+/// Bind a resolved `OVER (…)` specification against the pre-window row.
+pub(crate) fn bind_window_spec(
+    spec: &ast::WindowSpec,
+    scope: &Scope,
+) -> Result<BoundWindowSpec, BindError> {
+    if let Some(frame) = &spec.window_frame
+        && !is_default_frame(frame)
+    {
+        return Err(BindError::feature_not_supported(
+            "explicit window frames are not supported yet",
+        ));
+    }
+    let partition_by = spec
+        .partition_by
+        .iter()
+        .map(|expr| bind_window_key(expr, "PARTITION BY", scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    let order_by = spec
+        .order_by
+        .iter()
+        .map(|item| {
+            let expr = bind_window_key(&item.expr, "ORDER BY", scope)?;
+            let asc = item.options.asc.unwrap_or(true);
+            Ok(WindowSortKey {
+                ty: expr.ty(),
+                collation: crate::collation::expr_collation(&expr).collation,
+                expr,
+                asc,
+                nulls_first: item.options.nulls_first.unwrap_or(!asc),
+            })
+        })
+        .collect::<Result<Vec<_>, BindError>>()?;
+    Ok(BoundWindowSpec {
+        partition_by,
+        order_by,
+    })
+}
+
+/// Whether an explicitly written frame is exactly the one a spec gets by
+/// default, `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. Writing the
+/// default out longhand is common, and accepting it costs one comparison.
+fn is_default_frame(frame: &ast::WindowFrame) -> bool {
+    matches!(frame.units, ast::WindowFrameUnits::Range)
+        && matches!(frame.start_bound, ast::WindowFrameBound::Preceding(None))
+        && matches!(
+            frame.end_bound,
+            None | Some(ast::WindowFrameBound::CurrentRow)
+        )
+        && matches!(
+            frame.exclude,
+            None | Some(ast::WindowFrameExclusion::NoOthers)
+        )
+}
+
+/// Bind one `PARTITION BY` / `ORDER BY` expression of a window spec. Both are
+/// compared by the executor — for partition boundaries and for peer groups —
+/// so a type that cannot be ordered is refused here rather than reaching
+/// `compare_values` and panicking, exactly as `bind_order_by` does.
+fn bind_window_key(expr: &ast::Expr, clause: &str, scope: &Scope) -> Result<BoundExpr, BindError> {
+    let bound = crate::expr::bind_scalar(expr, scope)?;
+    // Aggregates are legal here (`WINDOW w AS (ORDER BY count(*))`), so this is
+    // the window-only guard. The clause name is fixed rather than `PARTITION BY`
+    // / `ORDER BY`, matching PG.
+    crate::expr::reject_window(&bound, "window definitions")?;
+    if !crate::expr::is_orderable(bound.ty(), scope.catalog().as_ref()) {
+        return Err(BindError::feature_not_supported(format!(
+            "window {clause} on type {} is not supported yet",
+            crate::expr::type_label(bound.ty(), scope.catalog().as_ref())
+        )));
+    }
+    Ok(bound)
 }
 
 /// Bind an aggregate call (`count(*)`, `min(x)`, `sum(a + b)`, …) to a transient

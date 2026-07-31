@@ -2333,11 +2333,35 @@ impl<'a> Parser<'a> {
         } else {
             (self.parse_window_frame_bound()?, None)
         };
+        let exclude = if self.parse_keyword(Keyword::EXCLUDE) {
+            Some(self.parse_window_frame_exclusion()?)
+        } else {
+            None
+        };
         Ok(WindowFrame {
             units,
             start_bound,
             end_bound,
+            exclude,
         })
+    }
+
+    /// Parse the frame-exclusion clause that follows `EXCLUDE`.
+    pub fn parse_window_frame_exclusion(&mut self) -> Result<WindowFrameExclusion, ParserError> {
+        if self.parse_keywords(&[Keyword::CURRENT, Keyword::ROW]) {
+            Ok(WindowFrameExclusion::CurrentRow)
+        } else if self.parse_keyword(Keyword::GROUP) {
+            Ok(WindowFrameExclusion::Group)
+        } else if self.parse_keyword(Keyword::TIES) {
+            Ok(WindowFrameExclusion::Ties)
+        } else if self.parse_keywords(&[Keyword::NO, Keyword::OTHERS]) {
+            Ok(WindowFrameExclusion::NoOthers)
+        } else {
+            self.expected_ref(
+                "CURRENT ROW, GROUP, TIES, or NO OTHERS",
+                self.peek_token_ref(),
+            )
+        }
     }
 
     /// Parse a window frame bound: `CURRENT ROW` or `<n> PRECEDING|FOLLOWING`.

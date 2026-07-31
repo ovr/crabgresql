@@ -37,7 +37,7 @@
 
 use std::collections::BTreeSet;
 
-use crabgresql_binder::{BoundAggregate, BoundExpr, DistinctKey, SortKey};
+use crabgresql_binder::{BoundAggregate, BoundExpr, BoundWindowFunc, DistinctKey, SortKey};
 use crabgresql_storage_api::{ColumnProjection, TableAm, TableSchema};
 
 use crate::{
@@ -113,6 +113,36 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
         }
         // Transparent: output row is the source row, no expressions of its own.
         PhysicalPlan::Limit { source, .. } => push(source, demand),
+        PhysicalPlan::Window {
+            source,
+            spec,
+            funcs,
+            input_width,
+            ..
+        } => {
+            // This node's output row is `[input row…, window slots…]`, so the
+            // parent's demand spans two index spaces. A demanded *slot* is
+            // computed here, not read from below, and must be dropped rather
+            // than forwarded: a source whose row is only `input_width` wide
+            // would see an index past its own width and trip `through_tail`'s
+            // fail-safe, turning pruning off for every window query.
+            let demand = demand.map(|wanted| {
+                wanted
+                    .into_iter()
+                    .filter(|index| *index < *input_width)
+                    .collect()
+            });
+            // The spec's own reads are added unconditionally, exactly as the
+            // `Aggregate` arm adds its group keys: a partition key that is never
+            // projected still decides the partitions.
+            let demand = add_exprs(demand, spec.exprs());
+            let demand = funcs
+                .iter()
+                .fold(demand, |demand, func: &BoundWindowFunc| {
+                    add_exprs(demand, func.kind.args().iter())
+                });
+            push(source, demand);
+        }
         // Also transparent, and the node that actually reaches storage: every
         // leaf carries the relation's own column layout, so the demand arrives
         // already in the leaves' index space.

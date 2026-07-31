@@ -219,38 +219,73 @@ impl Accumulator {
         Ok(())
     }
 
-    /// The final aggregate value for the group. A typed NULL for an empty group,
-    /// except `count`, which is `0`.
-    pub fn finalize(self) -> Result<Value, ExecError> {
-        Ok(match self.state {
-            AggState::Count(n) => Value::Int8(n),
-            AggState::Extreme { cur, .. } => cur.unwrap_or(Value::Null),
+    /// The aggregate value for everything accumulated so far. A typed NULL for
+    /// an empty group, except `count`, which is `0`.
+    ///
+    /// Takes `&self` rather than consuming: a *window* aggregate over the default
+    /// frame is a running total, so its accumulator is read once per row and must
+    /// survive. The three states that own a heap value clone it here; the rest
+    /// are copies or build a fresh value anyway.
+    pub fn finalize(&self) -> Result<Value, ExecError> {
+        Ok(match &self.state {
+            AggState::Count(n) => Value::Int8(*n),
+            AggState::Extreme { cur, .. } => cur.clone().unwrap_or(Value::Null),
             AggState::SumI64(acc) => acc.map(Value::Int8).unwrap_or(Value::Null),
             AggState::SumF4(acc) => acc.map(Value::Float4).unwrap_or(Value::Null),
             AggState::SumF8(acc) => acc.map(Value::Float8).unwrap_or(Value::Null),
-            AggState::SumNumeric(acc) => acc.map(Value::Numeric).unwrap_or(Value::Null),
+            AggState::SumNumeric(acc) => acc.clone().map(Value::Numeric).unwrap_or(Value::Null),
             AggState::AvgNumeric { sum, count } => {
-                if count == 0 {
+                if *count == 0 {
                     Value::Null
                 } else {
                     // count > 0, so the division never divides by zero.
                     Value::Numeric(
-                        sum.div(&Numeric::from_i128(count as i128)).map_err(|e| {
+                        sum.div(&Numeric::from_i128(*count as i128)).map_err(|e| {
                             ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
                         })?,
                     )
                 }
             }
             AggState::AvgFloat { sum, count } => {
-                if count == 0 {
+                if *count == 0 {
                     Value::Null
                 } else {
-                    Value::Float8(float::f8_div(sum, count as f64).map_err(float_error)?)
+                    Value::Float8(float::f8_div(*sum, *count as f64).map_err(float_error)?)
                 }
             }
-            AggState::StringAgg { cur } => cur.map(Value::Text).unwrap_or(Value::Null),
+            AggState::StringAgg { cur } => {
+                cur.clone().map(Value::Text).unwrap_or(Value::Null)
+            }
         })
     }
+}
+
+/// Fold one input row into `acc`, applying the rules every aggregate shares:
+/// `count(*)` (no argument expression) counts the row unconditionally, every
+/// other aggregate skips a row whose first argument is NULL, and a `DISTINCT`
+/// aggregate skips a value `seen` already holds.
+///
+/// `values` must already hold `agg.args.len()` evaluated arguments. Shared by the
+/// grouped and windowed drivers so the two cannot drift on NULL handling; the
+/// windowed one passes `seen: None`, since PG does not implement `DISTINCT` for
+/// window functions.
+pub fn feed(
+    acc: &mut Accumulator,
+    agg: &BoundAggregate,
+    values: &[Value],
+    seen: Option<&mut DistinctValues>,
+) -> Result<(), ExecError> {
+    if agg.args.is_empty() {
+        acc.count_row();
+        return Ok(());
+    }
+    if matches!(values[0], Value::Null) {
+        return Ok(());
+    }
+    if !seen.is_none_or(|seen| seen.insert(&values[0])) {
+        return Ok(());
+    }
+    acc.accumulate(values)
 }
 
 /// A hash of a group key that is *consistent with [`keys_equal`]*: two keys that

@@ -39,15 +39,16 @@ use super::{
     IfStatement, IlikeSelectItem, IndexColumn, Insert, Interpolate, InterpolateExpr, Join,
     JoinConstraint, JoinOperator, JsonPath, JsonPathElem, LateralView, LimitClause,
     MatchRecognizePattern, Measure, Merge, MergeAction, MergeClause, MergeInsertExpr,
-    MergeInsertKind, MergeUpdateExpr, NamedParenthesizedList, NamedWindowDefinition, ObjectName,
-    ObjectNamePart, Offset, OnConflict, OnConflictAction, OnInsert, OpenStatement, OrderBy,
+    MergeInsertKind, MergeUpdateExpr, NamedParenthesizedList, NamedWindowDefinition,
+    NamedWindowExpr, ObjectName, ObjectNamePart, Offset, OnConflict, OnConflictAction, OnInsert,
+    OpenStatement, OrderBy,
     OrderByExpr, OrderByKind, OutputClause, Parens, Partition, PartitionBoundValue,
     ProjectionSelect, Query, RaiseStatement, RaiseStatementValue, ReferentialAction,
     RenameSelectItem, ReplaceSelectElement, ReplaceSelectItem, Select, SelectInto, SelectItem,
     SetExpr, SqlOption, Statement, Subscript, SymbolDefinition, TableAlias, TableAliasColumnDef,
     TableConstraint, TableFactor, TableObject, TableOptionsClustered, TableWithJoins, Update,
-    UpdateTableFromKind, Values, ViewColumnDef, WhileStatement, WildcardAdditionalOptions, With,
-    WithFill,
+    UpdateTableFromKind, Values, ViewColumnDef, WhileStatement, WildcardAdditionalOptions,
+    WindowFrame, WindowFrameBound, WindowSpec, WindowType, With, WithFill,
 };
 
 /// Given an iterator of spans, return the [Span::union] of all spans.
@@ -1607,7 +1608,7 @@ impl Spanned for Function {
             args,
             filter,
             null_treatment: _, // enum
-            over: _,           // todo
+            over,
             within_group,
         } = self;
 
@@ -1618,8 +1619,79 @@ impl Spanned for Function {
                 .chain(iter::once(args.span()))
                 .chain(iter::once(parameters.span()))
                 .chain(filter.iter().map(|i| i.span()))
+                .chain(over.iter().map(|i| i.span()))
                 .chain(within_group.iter().map(|i| i.span())),
         )
+    }
+}
+
+impl Spanned for WindowType {
+    fn span(&self) -> Span {
+        match self {
+            WindowType::WindowSpec(spec) => spec.span(),
+            WindowType::NamedWindow(ident) => ident.span,
+        }
+    }
+}
+
+impl Spanned for WindowSpec {
+    fn span(&self) -> Span {
+        let WindowSpec {
+            window_name,
+            partition_by,
+            order_by,
+            window_frame,
+        } = self;
+
+        union_spans(
+            window_name
+                .iter()
+                .map(|i| i.span)
+                .chain(partition_by.iter().map(|i| i.span()))
+                .chain(order_by.iter().map(|i| i.span()))
+                .chain(window_frame.iter().map(|i| i.span())),
+        )
+    }
+}
+
+/// # partial span
+///
+/// The frame's units and its `EXCLUDE` clause are keywords, which carry no
+/// span of their own; only the bounds' expressions contribute.
+impl Spanned for WindowFrame {
+    fn span(&self) -> Span {
+        let WindowFrame {
+            units: _, // enum
+            start_bound,
+            end_bound,
+            exclude: _, // enum
+        } = self;
+
+        union_spans(iter::once(start_bound.span()).chain(end_bound.iter().map(|i| i.span())))
+    }
+}
+
+/// # partial span
+///
+/// The span of a bound with no offset expression (`CURRENT ROW`,
+/// `UNBOUNDED PRECEDING`) is empty.
+impl Spanned for WindowFrameBound {
+    fn span(&self) -> Span {
+        match self {
+            WindowFrameBound::CurrentRow => Span::empty(),
+            WindowFrameBound::Preceding(offset) | WindowFrameBound::Following(offset) => {
+                offset.as_ref().map_or(Span::empty(), |e| e.span())
+            }
+        }
+    }
+}
+
+impl Spanned for NamedWindowExpr {
+    fn span(&self) -> Span {
+        match self {
+            NamedWindowExpr::NamedWindow(ident) => ident.span,
+            NamedWindowExpr::WindowSpec(spec) => spec.span(),
+        }
     }
 }
 
@@ -2142,12 +2214,9 @@ impl Spanned for ConnectByKind {
 
 impl Spanned for NamedWindowDefinition {
     fn span(&self) -> Span {
-        let NamedWindowDefinition(
-            ident,
-            _, // todo: NamedWindowExpr
-        ) = self;
+        let NamedWindowDefinition(ident, expr) = self;
 
-        ident.span
+        union_spans([ident.span, expr.span()].into_iter())
     }
 }
 
