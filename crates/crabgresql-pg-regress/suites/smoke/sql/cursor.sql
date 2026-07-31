@@ -80,7 +80,31 @@ SELECT name FROM pg_cursors ORDER BY 1;
 COMMIT;
 CLOSE nosuch;
 --
--- NO SCROLL rejects backward movement, whichever keyword produced it.
+-- Names fold like every other unquoted identifier, and a quoted name is a
+-- different cursor.
+--
+BEGIN;
+DECLARE Mixed CURSOR FOR SELECT * FROM ten ORDER BY g;
+SELECT name FROM pg_cursors ORDER BY 1;
+FETCH 1 mixed;
+FETCH 1 MIXED;
+DECLARE MIXED CURSOR FOR SELECT 1;
+ROLLBACK;
+BEGIN;
+DECLARE Mixed CURSOR FOR SELECT * FROM ten;
+DECLARE "Mixed" CURSOR FOR SELECT * FROM ten;
+-- Two distinct cursors. Not ordered by name: the two spellings differ only in
+-- case, so the order would be the collation's business rather than the cursor
+-- code's.
+SELECT count(*) FROM pg_cursors;
+SELECT name FROM pg_cursors WHERE name = 'Mixed';
+CLOSE "Mixed";
+CLOSE MiXeD;
+SELECT count(*) FROM pg_cursors;
+COMMIT;
+--
+-- NO SCROLL refuses a rewind *request*, which is not the same as a move that
+-- happens to end up behind where it started.
 --
 BEGIN;
 DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
@@ -92,6 +116,41 @@ DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
 FETCH ABSOLUTE 2 ns;
 FETCH ABSOLUTE 3 ns;
 FETCH ABSOLUTE 1 ns;
+COMMIT;
+-- Backward at the very start moves nothing, and is still refused.
+BEGIN;
+DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
+FETCH BACKWARD 1 ns;
+COMMIT;
+BEGIN;
+DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
+FETCH BACKWARD ALL ns;
+COMMIT;
+-- A negative ABSOLUTE seeks from the end, so it rewinds even though it lands
+-- ahead of the cursor.
+BEGIN;
+DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
+FETCH ABSOLUTE -1 ns;
+COMMIT;
+-- A zero-distance re-fetch is a step back and forward again: allowed while the
+-- cursor rests in an end gap, refused once it is on a row.
+BEGIN;
+DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
+FETCH RELATIVE 0 ns;
+FETCH 0 ns;
+FETCH ABSOLUTE 0 ns;
+FETCH 1 ns;
+FETCH RELATIVE 0 ns;
+COMMIT;
+BEGIN;
+DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
+FETCH FIRST ns;
+FETCH FIRST ns;
+COMMIT;
+-- BACKWARD 0 names a direction, so it rewinds even where FETCH 0 does not.
+BEGIN;
+DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
+FETCH BACKWARD 0 ns;
 COMMIT;
 --
 -- WITH HOLD survives the commit of the block that declared it.
@@ -133,8 +192,35 @@ DECLARE snap CURSOR FOR SELECT * FROM ten ORDER BY g;
 INSERT INTO ten VALUES (11);
 FETCH ALL snap;
 ROLLBACK;
--- The count is an int, so the grammar rejects anything else.
+-- The count is a sign in front of an int, so the grammar rejects anything else.
+-- The literal it names never carries the sign, and -2147483648 is out of range
+-- even though the signed value would fit.
 FETCH 1.5 held;
 MOVE 2147483648 held;
+FETCH -2147483649 held;
+FETCH ABSOLUTE -2147483648 held;
+FETCH RELATIVE 2147483648 held;
+MOVE BACKWARD 1.5 held;
+FETCH $1 FROM held;
+CLOSE ALL;
+--
+-- CLOSE counts as a query for the "SET TRANSACTION before any query" rule,
+-- unlike FETCH and MOVE, which reuse the snapshot their DECLARE took.
+--
+BEGIN;
+CLOSE ALL;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ROLLBACK;
+BEGIN;
+DECLARE h2 CURSOR WITH HOLD FOR SELECT * FROM ten;
+COMMIT;
+BEGIN;
+FETCH 1 h2;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ROLLBACK;
+BEGIN;
+MOVE 1 h2;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ROLLBACK;
 CLOSE ALL;
 DROP TABLE ten;

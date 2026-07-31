@@ -149,9 +149,6 @@ pub struct Cursor {
     /// movement. `None` (unspecified) and `Some(true)` both allow it — every
     /// materialised cursor is trivially scrollable.
     pub scroll: Option<bool>,
-    /// `DECLARE … BINARY`. Reported by `pg_cursors.is_binary`; binary cursors
-    /// are otherwise unsupported, so this is always false today.
-    pub binary: bool,
     /// The `DECLARE` statement, re-rendered from its AST, for
     /// `pg_cursors.statement`.
     pub statement: String,
@@ -168,11 +165,38 @@ impl Cursor {
     /// `Err` is the `NO SCROLL` rejection; every other outcome is a legal move,
     /// including one that lands off either end and returns nothing.
     pub fn fetch(&mut self, movement: CursorMove) -> Result<Vec<Tuple>, PgError> {
+        let (from, to) = self.step(movement)?;
+        let (lo, hi, reverse) = self.delivered(from, to, movement);
+        // `1..=len` are the row positions; `0` and `len + 1` are the gaps at
+        // either end and index nothing, so the range is filtered, not clamped.
+        let mut rows: Vec<Tuple> = (lo..=hi).filter_map(|at| self.row_at(at)).collect();
+        if reverse {
+            rows.reverse();
+        }
+        Ok(rows)
+    }
+
+    /// [`Cursor::fetch`] without the rows: how many it *would* have returned,
+    /// which is the count `MOVE` reports.
+    ///
+    /// Counted from the traversed range rather than by building the rows —
+    /// `MOVE ALL` over a large cursor would otherwise clone the whole result set
+    /// only to read its length.
+    pub fn advance(&mut self, movement: CursorMove) -> Result<usize, PgError> {
+        let (from, to) = self.step(movement)?;
+        let (lo, hi, _) = self.delivered(from, to, movement);
+        // The end gaps hold no row, so intersect the range with the row band
+        // rather than counting the positions it nominally spans.
+        let (lo, hi) = (lo.max(1), hi.min(self.rows.len()));
+        Ok(hi.saturating_sub(lo) + usize::from(lo <= hi))
+    }
+
+    /// Apply `movement`: reject it if the cursor may not travel that way, else
+    /// move and report the positions travelled between.
+    fn step(&mut self, movement: CursorMove) -> Result<(usize, usize), PgError> {
         let from = self.pos;
         let to = self.target(movement);
-        // PG rejects any *movement* backward on a NO SCROLL cursor, not just the
-        // BACKWARD keyword — `FETCH ABSOLUTE 1` after `ABSOLUTE 2` fails too.
-        if to < from && self.scroll == Some(false) {
+        if self.scroll == Some(false) && self.rewinds(movement, from, to) {
             return Err(PgError::new(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "cursor can only scan forward",
@@ -180,13 +204,35 @@ impl Cursor {
             .with_hint("Declare it with SCROLL option to enable backward scan."));
         }
         self.pos = to;
-        Ok(self.traversed(from, to, movement))
+        Ok((from, to))
     }
 
-    /// [`Cursor::fetch`] without the rows: how many `FETCH` *would* have
-    /// returned, which is the count `MOVE` reports.
-    pub fn advance(&mut self, movement: CursorMove) -> Result<usize, PgError> {
-        self.fetch(movement).map(|rows| rows.len())
+    /// Whether `movement` asks the cursor to travel backward — the request a
+    /// `NO SCROLL` cursor refuses.
+    ///
+    /// This is a property of the *request*, not of where it happens to land, and
+    /// PostgreSQL draws three lines that the landing position alone does not:
+    ///
+    /// - `BACKWARD` always rewinds, even `BACKWARD 0` and even at the start,
+    ///   where the move is a no-op.
+    /// - `ABSOLUTE` with a negative count seeks from the end, so it rewinds even
+    ///   when the row it lands on is ahead of the cursor.
+    /// - A zero-distance re-fetch (`FETCH 0`, `RELATIVE 0`, `FORWARD 0`) is a
+    ///   step back and forward again, so it rewinds — but only while the cursor
+    ///   is *on* a row. Resting in either end gap it yields nothing and never
+    ///   moves, which is why PostgreSQL allows it there.
+    fn rewinds(&self, movement: CursorMove, from: usize, to: usize) -> bool {
+        let zero_distance = || (1..=self.rows.len()).contains(&from);
+        match movement {
+            CursorMove::Forward(None) => false,
+            CursorMove::Backward(None) => true,
+            CursorMove::Backward(Some(n)) => n >= 0,
+            CursorMove::Forward(Some(n)) | CursorMove::Relative(n) => {
+                n < 0 || (n == 0 && zero_distance())
+            }
+            CursorMove::Absolute(n) if n < 0 => true,
+            CursorMove::Absolute(_) => to < from || (to == from && zero_distance()),
+        }
     }
 
     /// The position `movement` lands on, clamped to `0..=rows.len() + 1`.
@@ -209,29 +255,24 @@ impl Cursor {
         landing.clamp(0, len + 1) as usize
     }
 
-    /// The rows a move from `from` to `to` delivers.
-    fn traversed(&self, from: usize, to: usize, movement: CursorMove) -> Vec<Tuple> {
+    /// The inclusive position range a move from `from` to `to` delivers, and
+    /// whether it comes out in reverse.
+    ///
+    /// `Absolute`/`Relative` land on one row and deliver only that one;
+    /// `Forward`/`Backward` deliver everything they pass over. That asymmetry is
+    /// PostgreSQL's, and it is why `FETCH 3` returns three rows while `FETCH
+    /// RELATIVE 3` returns one. A zero-distance move re-reads the row the cursor
+    /// already sits on.
+    fn delivered(&self, from: usize, to: usize, movement: CursorMove) -> (usize, usize, bool) {
         let single = matches!(movement, CursorMove::Absolute(_) | CursorMove::Relative(_));
-        // A zero-row move re-reads the row the cursor is already on: `FETCH 0`
-        // and `FETCH RELATIVE 0` both re-return the current row without moving.
-        if from == to {
-            return self.row_at(to).into_iter().collect();
+        if single || from == to {
+            return (to, to, false);
         }
-        if single {
-            return self.row_at(to).into_iter().collect();
+        match to > from {
+            true => (from + 1, to, false),
+            // `to < from` here, so `from` is at least 1 and cannot underflow.
+            false => (to, from - 1, true),
         }
-        // `1..=len` are the row positions; `0` and `len + 1` are the gaps at
-        // either end and index nothing.
-        let (lo, hi) = if to > from {
-            (from + 1, to)
-        } else {
-            (to, from - 1)
-        };
-        let mut rows: Vec<Tuple> = (lo..=hi).filter_map(|at| self.row_at(at)).collect();
-        if to < from {
-            rows.reverse();
-        }
-        rows
     }
 
     /// The row at a 1-based position, or `None` for the two end gaps.
@@ -682,18 +723,20 @@ mod cursor_tests {
             pos: 0,
             hold: false,
             scroll,
-            binary: false,
             statement: String::new(),
             in_block: true,
         }
     }
 
     /// The integers a fetch delivered, so expectations read as the rows do.
-    fn ints(rows: Vec<Tuple>) -> Vec<i32> {
+    fn ints(rows: Vec<Tuple>) -> Result<Vec<i32>, PgError> {
         rows.into_iter()
             .map(|row| match row.as_slice() {
-                [Value::Int4(n)] => *n,
-                other => panic!("unexpected row {other:?}"),
+                [Value::Int4(n)] => Ok(*n),
+                other => Err(PgError::new(
+                    sqlstate::INTERNAL_ERROR,
+                    format!("unexpected row {other:?}"),
+                )),
             })
             .collect()
     }
@@ -701,111 +744,173 @@ mod cursor_tests {
     /// The exact sequence probed against PostgreSQL 18.4: three forward, one
     /// back, a two-row MOVE, then the next row.
     #[test]
-    fn forward_backward_and_move_track_position() {
+    fn forward_backward_and_move_track_position() -> Result<(), PgError> {
         let mut c = cursor(None);
-        assert_eq!(
-            ints(c.fetch(CursorMove::Forward(Some(3))).unwrap()),
-            [1, 2, 3]
-        );
-        assert_eq!(ints(c.fetch(CursorMove::Backward(Some(1))).unwrap()), [2]);
-        assert_eq!(c.advance(CursorMove::Forward(Some(2))).unwrap(), 2);
-        assert_eq!(ints(c.fetch(CursorMove::Forward(Some(1))).unwrap()), [5]);
+        assert_eq!(ints(c.fetch(CursorMove::Forward(Some(3)))?)?, [1, 2, 3]);
+        assert_eq!(ints(c.fetch(CursorMove::Backward(Some(1)))?)?, [2]);
+        assert_eq!(c.advance(CursorMove::Forward(Some(2)))?, 2);
+        assert_eq!(ints(c.fetch(CursorMove::Forward(Some(1)))?)?, [5]);
+        Ok(())
     }
 
     /// `ALL` in both directions reports what it passed over, not the row count:
     /// from row 3 of 10, `MOVE ALL` is 7 and `MOVE BACKWARD ALL` is then 10.
     #[test]
-    fn all_moves_to_either_end() {
+    fn all_moves_to_either_end() -> Result<(), PgError> {
         let mut c = cursor(None);
-        assert_eq!(c.advance(CursorMove::Forward(Some(3))).unwrap(), 3);
-        assert_eq!(c.advance(CursorMove::Forward(None)).unwrap(), 7);
+        assert_eq!(c.advance(CursorMove::Forward(Some(3)))?, 3);
+        assert_eq!(c.advance(CursorMove::Forward(None))?, 7);
         assert_eq!(c.pos, 11);
-        assert_eq!(c.advance(CursorMove::Backward(None)).unwrap(), 10);
+        assert_eq!(c.advance(CursorMove::Backward(None))?, 10);
         assert_eq!(c.pos, 0);
+        Ok(())
+    }
+
+    /// `MOVE` counts exactly what the matching `FETCH` would have returned, for
+    /// every direction — it derives the count from the traversed range rather
+    /// than building the rows, so the two could drift apart.
+    #[test]
+    fn move_counts_match_what_fetch_would_deliver() -> Result<(), PgError> {
+        let movements = [
+            CursorMove::Forward(Some(3)),
+            CursorMove::Forward(None),
+            CursorMove::Backward(Some(4)),
+            CursorMove::Backward(None),
+            CursorMove::Absolute(6),
+            CursorMove::Absolute(-2),
+            CursorMove::Absolute(0),
+            CursorMove::Relative(0),
+            CursorMove::Relative(-3),
+            CursorMove::Forward(Some(0)),
+            CursorMove::Forward(Some(-2)),
+            CursorMove::Backward(Some(-1)),
+        ];
+        // Walk both cursors through the same sequence, so each comparison starts
+        // from a position the previous movements produced.
+        let (mut fetched, mut moved) = (cursor(None), cursor(None));
+        for movement in movements {
+            let rows = ints(fetched.fetch(movement)?)?;
+            assert_eq!(moved.advance(movement)?, rows.len(), "{movement:?}");
+            assert_eq!(moved.pos, fetched.pos, "{movement:?}");
+        }
+        Ok(())
     }
 
     /// `ABSOLUTE`/`RELATIVE` land on a single row however far they travel, and a
     /// negative `ABSOLUTE` counts from the end.
     #[test]
-    fn absolute_and_relative_deliver_one_row() {
+    fn absolute_and_relative_deliver_one_row() -> Result<(), PgError> {
         let mut c = cursor(None);
-        assert_eq!(ints(c.fetch(CursorMove::Absolute(4)).unwrap()), [4]);
-        assert_eq!(ints(c.fetch(CursorMove::Relative(-2)).unwrap()), [2]);
-        assert_eq!(ints(c.fetch(CursorMove::Absolute(1)).unwrap()), [1]);
-        assert_eq!(ints(c.fetch(CursorMove::Absolute(-1)).unwrap()), [10]);
+        assert_eq!(ints(c.fetch(CursorMove::Absolute(4))?)?, [4]);
+        assert_eq!(ints(c.fetch(CursorMove::Relative(-2))?)?, [2]);
+        assert_eq!(ints(c.fetch(CursorMove::Absolute(1))?)?, [1]);
+        assert_eq!(ints(c.fetch(CursorMove::Absolute(-1))?)?, [10]);
         // `ABSOLUTE 0` is the gap before the first row: legal, and empty.
-        assert!(c.fetch(CursorMove::Absolute(0)).unwrap().is_empty());
+        assert!(c.fetch(CursorMove::Absolute(0))?.is_empty());
         assert_eq!(c.pos, 0);
+        Ok(())
     }
 
     /// A zero-count move re-reads the row the cursor already sits on.
     #[test]
-    fn zero_count_refetches_the_current_row() {
+    fn zero_count_refetches_the_current_row() -> Result<(), PgError> {
         let mut c = cursor(None);
-        c.fetch(CursorMove::Forward(Some(2))).unwrap();
-        assert_eq!(ints(c.fetch(CursorMove::Forward(Some(0))).unwrap()), [2]);
-        assert_eq!(ints(c.fetch(CursorMove::Relative(0)).unwrap()), [2]);
+        c.fetch(CursorMove::Forward(Some(2)))?;
+        assert_eq!(ints(c.fetch(CursorMove::Forward(Some(0)))?)?, [2]);
+        assert_eq!(ints(c.fetch(CursorMove::Relative(0))?)?, [2]);
         assert_eq!(c.pos, 2);
+        Ok(())
     }
 
     /// Both ends are gaps the cursor rests in, so running off one and coming
     /// back returns the edge row rather than nothing.
     #[test]
-    fn ends_clamp_without_losing_the_edge_row() {
+    fn ends_clamp_without_losing_the_edge_row() -> Result<(), PgError> {
         let mut c = cursor(None);
-        assert_eq!(ints(c.fetch(CursorMove::Forward(None)).unwrap()).len(), 10);
-        assert!(c.fetch(CursorMove::Forward(Some(1))).unwrap().is_empty());
+        assert_eq!(ints(c.fetch(CursorMove::Forward(None))?)?.len(), 10);
+        assert!(c.fetch(CursorMove::Forward(Some(1)))?.is_empty());
         assert_eq!(c.pos, 11);
         // Parked after the last row, stepping back returns it — the gap is a
         // position, not a lost row.
-        assert_eq!(ints(c.fetch(CursorMove::Backward(Some(1))).unwrap()), [10]);
+        assert_eq!(ints(c.fetch(CursorMove::Backward(Some(1)))?)?, [10]);
         // Overshooting the near end is not an error: it delivers what is left
         // and parks in the gap before the first row.
-        assert_eq!(
-            ints(c.fetch(CursorMove::Backward(Some(99))).unwrap()).len(),
-            9
-        );
+        assert_eq!(ints(c.fetch(CursorMove::Backward(Some(99)))?)?.len(), 9);
         assert_eq!(c.pos, 0);
-        assert!(c.fetch(CursorMove::Backward(Some(1))).unwrap().is_empty());
+        assert!(c.fetch(CursorMove::Backward(Some(1)))?.is_empty());
+        Ok(())
     }
 
     /// A negative count reverses the direction word, as PostgreSQL's does.
     #[test]
-    fn negative_counts_reverse_direction() {
+    fn negative_counts_reverse_direction() -> Result<(), PgError> {
         let mut c = cursor(None);
-        c.fetch(CursorMove::Forward(Some(5))).unwrap();
-        assert_eq!(
-            ints(c.fetch(CursorMove::Forward(Some(-2))).unwrap()),
-            [4, 3]
-        );
-        assert_eq!(ints(c.fetch(CursorMove::Backward(Some(-1))).unwrap()), [4]);
+        c.fetch(CursorMove::Forward(Some(5)))?;
+        assert_eq!(ints(c.fetch(CursorMove::Forward(Some(-2)))?)?, [4, 3]);
+        assert_eq!(ints(c.fetch(CursorMove::Backward(Some(-1)))?)?, [4]);
+        Ok(())
     }
 
-    /// `NO SCROLL` rejects backward *movement*, whatever keyword produced it —
-    /// PostgreSQL fails `FETCH ABSOLUTE 1` after `ABSOLUTE 2` for this reason.
+    /// `NO SCROLL` refuses a *rewind request*, which is not the same as a move
+    /// that ends up behind where it started. Each case below was probed against
+    /// PostgreSQL 18.4 from the position named.
     #[test]
-    fn no_scroll_rejects_any_backward_movement() {
-        let mut c = cursor(Some(false));
-        assert_eq!(ints(c.fetch(CursorMove::Absolute(2)).unwrap()), [2]);
+    fn no_scroll_rejects_rewind_requests() -> Result<(), PgError> {
+        // From the gap before the first row, where every one of these is a
+        // no-op that still names a backward direction.
         for movement in [
             CursorMove::Backward(Some(1)),
-            CursorMove::Absolute(1),
-            CursorMove::Relative(-1),
+            CursorMove::Backward(None),
+            // `BACKWARD 0` rewinds even though it moves nothing, unlike the
+            // direction-less `FETCH 0`.
+            CursorMove::Backward(Some(0)),
+            // A negative ABSOLUTE seeks from the end, so it rewinds even though
+            // it lands ahead of the cursor.
+            CursorMove::Absolute(-1),
             CursorMove::Forward(Some(-1)),
+            CursorMove::Relative(-1),
         ] {
-            let err = c.fetch(movement).expect_err("backward on NO SCROLL");
-            assert_eq!(err.code, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+            let err = cursor(Some(false))
+                .fetch(movement)
+                .expect_err("rewind on NO SCROLL");
+            assert_eq!(
+                err.code,
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "{movement:?}"
+            );
         }
-        // The rejected moves left the position untouched.
+        // Resting in an end gap, a zero-distance re-fetch never moves, so
+        // PostgreSQL allows it.
+        let mut c = cursor(Some(false));
+        assert!(c.fetch(CursorMove::Relative(0))?.is_empty());
+        assert!(c.fetch(CursorMove::Absolute(0))?.is_empty());
+        assert!(c.fetch(CursorMove::Forward(Some(0)))?.is_empty());
+        // On a row it is a step back and forward again, so it is refused — as is
+        // re-landing on the row the cursor already occupies.
+        assert_eq!(ints(c.fetch(CursorMove::Absolute(2))?)?, [2]);
+        for movement in [
+            CursorMove::Relative(0),
+            CursorMove::Forward(Some(0)),
+            CursorMove::Absolute(2),
+            CursorMove::Absolute(1),
+        ] {
+            let err = c.fetch(movement).expect_err("rewind on NO SCROLL");
+            assert_eq!(
+                err.code,
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "{movement:?}"
+            );
+        }
+        // Every rejection left the position untouched, and forward still works.
         assert_eq!(c.pos, 2);
-        // Forward is still fine, and so is re-reading the current row.
-        assert_eq!(ints(c.fetch(CursorMove::Relative(0)).unwrap()), [2]);
-        assert_eq!(ints(c.fetch(CursorMove::Forward(Some(1))).unwrap()), [3]);
+        assert_eq!(ints(c.fetch(CursorMove::Forward(Some(1)))?)?, [3]);
+        assert_eq!(ints(c.fetch(CursorMove::Absolute(5))?)?, [5]);
+        Ok(())
     }
 
     /// An empty result set has only the two gaps, and they are the same gap.
     #[test]
-    fn empty_cursor_never_yields_a_row() {
+    fn empty_cursor_never_yields_a_row() -> Result<(), PgError> {
         let mut c = cursor(None);
         c.rows.clear();
         for movement in [
@@ -814,7 +919,9 @@ mod cursor_tests {
             CursorMove::Absolute(1),
             CursorMove::Absolute(-1),
         ] {
-            assert!(c.fetch(movement).unwrap().is_empty(), "{movement:?}");
+            assert!(c.fetch(movement)?.is_empty(), "{movement:?}");
+            assert_eq!(c.advance(movement)?, 0, "{movement:?}");
         }
+        Ok(())
     }
 }

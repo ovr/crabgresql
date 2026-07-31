@@ -319,7 +319,9 @@ fn bind_catalogs(
                 name: name.clone(),
                 statement: cursor.statement.clone(),
                 is_holdable: cursor.hold,
-                is_binary: cursor.binary,
+                // `DECLARE … BINARY` is rejected outright, so no open cursor is
+                // ever a binary one.
+                is_binary: false,
                 // Every materialised cursor can scan backward unless it was
                 // declared NO SCROLL.
                 is_scrollable: cursor.scroll != Some(false),
@@ -593,14 +595,32 @@ pub fn analyze_statement(
         // `FETCH` returns whatever its cursor holds, so Describe answers from the
         // open cursor rather than from a plan. An unknown name reports NoData and
         // leaves the 34000 to Execute — Parse must not fail for a cursor the
-        // client is about to declare.
+        // client is about to declare. `Describe` of a *portal* re-runs this
+        // rather than reading the prepared statement's cached shape, because the
+        // cursor may have been declared (or redeclared) since Parse.
         ast::Statement::Fetch { name, .. } => {
             return Ok(Analyzed {
                 param_types: Vec::new(),
-                result_columns: session
-                    .cursors
-                    .get(&name.value)
-                    .map(|cursor| cursor.columns.clone()),
+                result_columns: fetch_columns(session, name),
+            });
+        }
+        // A cursor body may carry `$n`, and PG resolves those at Bind like any
+        // other statement's — so DECLARE reports its parameter types here rather
+        // than falling through to the no-parameter utility arm.
+        ast::Statement::Declare { stmts } => {
+            let Some(query) = declared_cursor_query(stmts) else {
+                return Ok(Analyzed {
+                    param_types: Vec::new(),
+                    result_columns: None,
+                });
+            };
+            bind_query_with_params(&catalog, &type_catalog, query, &ctx)?;
+            require_all_resolved(&ctx)?;
+            return Ok(Analyzed {
+                param_types: param_types(&ctx).into_iter().flatten().collect(),
+                // DECLARE itself returns no rows; the cursor's shape is reported
+                // by the FETCH that reads it.
+                result_columns: None,
             });
         }
         // Utility statements (DDL/SET/transaction control) take no parameters and
@@ -627,6 +647,33 @@ pub fn analyze_statement(
         param_types,
         result_columns,
     })
+}
+
+/// The result shape a `FETCH` of `name` would produce, or `None` when no such
+/// cursor is open (`Describe` then answers `NoData` and leaves the 34000 to
+/// Execute).
+///
+/// Resolved from the live cursor every time it is asked. A cursor can be
+/// declared, closed and redeclared with a different shape while a prepared
+/// `FETCH` sits unchanged, so an answer cached at Parse would describe a result
+/// set that no longer exists.
+pub(crate) fn fetch_columns(session: &Session, name: &ast::Ident) -> Option<Vec<OutputColumn>> {
+    let name = crate::cursor::cursor_name(name);
+    session
+        .cursors
+        .get(&name)
+        .map(|cursor| cursor.columns.clone())
+}
+
+/// The body of a single `DECLARE … CURSOR FOR <query>`, or `None` for any other
+/// `DECLARE` shape (which this build does not support).
+fn declared_cursor_query(stmts: &[ast::Declare]) -> Option<&ast::Query> {
+    match stmts {
+        [single] if single.declare_type == Some(ast::DeclareType::Cursor) => {
+            single.for_query.as_deref()
+        }
+        _ => None,
+    }
 }
 
 pub fn execute_statement(
@@ -894,6 +941,7 @@ pub(crate) fn execute_statement_with(
                     stmt,
                     stmts,
                     session,
+                    params,
                 );
             }
             ast::Statement::Fetch {
@@ -1540,9 +1588,11 @@ fn read_only_active(session: &Session) -> bool {
 /// queries, DML, and DDL — does. Used to enforce the "SET TRANSACTION ISOLATION
 /// LEVEL before any query" rule uniformly across statement kinds.
 ///
-/// `FETCH`/`MOVE`/`CLOSE` read no table: they walk a cursor whose snapshot was
-/// taken back at its `DECLARE`. `DECLARE` itself is where the snapshot is taken,
-/// so it keeps the default.
+/// `FETCH`/`MOVE` read no table: they walk a cursor whose snapshot was taken
+/// back at its `DECLARE`. `DECLARE` is where that snapshot is taken, and `CLOSE`
+/// counts as a query in PostgreSQL — `PlannedStmtRequiresSnapshot` exempts
+/// `FetchStmt` but not `ClosePortalStmt`, so `BEGIN; CLOSE ALL; SET TRANSACTION
+/// ISOLATION LEVEL …` raises 25001 there. Both therefore keep the default.
 fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
     !matches!(
         stmt,
@@ -1553,7 +1603,6 @@ fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
             | ast::Statement::Reset(_)
             | ast::Statement::Fetch { .. }
             | ast::Statement::Move { .. }
-            | ast::Statement::Close { .. }
     )
 }
 

@@ -7343,14 +7343,27 @@ impl<'a> Parser<'a> {
     /// [`Self::parse_signed_number_value`], but `None` (consuming nothing) when
     /// the next token could not start a number.
     ///
-    /// PostgreSQL's `FETCH`/`MOVE` grammar takes a plain `int`, so a fractional
-    /// or out-of-range literal never reaches the executor — its scanner hands
-    /// the parser a numeric constant the rule cannot accept, and the result is a
-    /// syntax error naming the literal. Reproduced here, since the count would
-    /// otherwise be silently truncated.
+    /// PostgreSQL's `FETCH`/`MOVE` grammar takes `SignedIconst`: an optional
+    /// sign in front of an `Iconst`, which is a plain `int`. A fractional or
+    /// out-of-range literal therefore never reaches the executor — the scanner
+    /// hands the parser a numeric constant the rule cannot accept, and the
+    /// result is a syntax error naming the literal. Reproduced here, since the
+    /// count would otherwise be silently truncated.
+    ///
+    /// The range is checked against the *unsigned* literal, because that is what
+    /// `Iconst` covers: `-2147483648` is rejected even though the signed value
+    /// fits, since `2147483648` on its own does not.
     fn parse_optional_signed_number_value(&mut self) -> Result<Option<ValueWithSpan>, ParserError> {
+        // A `$n` placeholder is rejected rather than passed through:
+        // `SignedIconst` has no room for one, so `FETCH $1 FROM c` is a syntax
+        // error in PostgreSQL too, and naming it here keeps the message PG's
+        // instead of the generic "expected identifier" the fallthrough gives.
+        if let Token::Placeholder(name) = &self.peek_token_ref().token {
+            let name = name.clone();
+            return Err(self.pg_syntax_error(&name));
+        }
         let signed = match self.peek_token_ref().token {
-            Token::Number(..) | Token::Placeholder(_) => false,
+            Token::Number(..) => false,
             Token::Minus | Token::Plus => true,
             _ => return Ok(None),
         };
@@ -7360,21 +7373,33 @@ impl<'a> Parser<'a> {
         }
         let start = self.peek_token_ref().span.start;
         let mut value = self.parse_number_value()?;
-        if let Value::Number(digits, _) = &mut value.value {
-            if negative {
-                digits.insert(0, '-');
-            }
-            if digits.parse::<i32>().is_err() {
-                let literal = digits.trim_start_matches('-').to_string();
-                return Err(ParserError::PgDiagnostic(PgDiagnostic {
-                    sqlstate: crate::tokenizer::DEFAULT_TOKENIZER_SQLSTATE,
-                    message: format!("syntax error at or near \"{literal}\""),
-                    hint: None,
-                    location: start,
-                }));
-            }
+        let Value::Number(digits, _) = &mut value.value else {
+            return self.expected_ref("literal number", self.peek_token_ref());
+        };
+        if digits.parse::<i32>().is_err() {
+            let literal = digits.clone();
+            return Err(ParserError::PgDiagnostic(PgDiagnostic {
+                sqlstate: crate::tokenizer::DEFAULT_TOKENIZER_SQLSTATE,
+                message: format!("syntax error at or near \"{literal}\""),
+                hint: None,
+                location: start,
+            }));
+        }
+        if negative {
+            digits.insert(0, '-');
         }
         Ok(Some(value))
+    }
+
+    /// PostgreSQL's `syntax error at or near "…"`, pointing at the token the
+    /// cursor is on.
+    fn pg_syntax_error(&self, token: &str) -> ParserError {
+        ParserError::PgDiagnostic(PgDiagnostic {
+            sqlstate: crate::tokenizer::DEFAULT_TOKENIZER_SQLSTATE,
+            message: format!("syntax error at or near \"{token}\""),
+            hint: None,
+            location: self.peek_token_ref().span.start,
+        })
     }
 
     /// Parse a `DISCARD` statement.
@@ -18707,21 +18732,37 @@ mod tests {
         }
     }
 
-    /// PostgreSQL's `FETCH`/`MOVE` count is an `int`; anything its scanner turns
-    /// into a numeric constant instead fails the grammar, naming the literal.
+    /// PostgreSQL's `FETCH`/`MOVE` count is `SignedIconst` — a sign in front of
+    /// an `int`. Anything its scanner turns into a numeric constant instead
+    /// fails the grammar, naming the literal *without* the sign, because the
+    /// sign is not part of the constant. Every count position is covered: the
+    /// bare form and all four that take an explicit direction.
     #[test]
     fn parse_fetch_rejects_non_int_counts() {
-        for sql in ["FETCH 1.5 c", "MOVE 2147483648 c", "FETCH -2147483649 c"] {
-            let literal = sql.split(' ').nth(1).unwrap().trim_start_matches('-');
-            let e = parse_pg(sql).unwrap_err();
+        let cases = [
+            ("FETCH 1.5 c", "1.5"),
+            ("MOVE 2147483648 c", "2147483648"),
+            ("FETCH -2147483649 c", "2147483649"),
+            // -2147483648 fits an i32, but `Iconst` sees only the digits, and
+            // 2147483648 on its own is out of range — so PG rejects it too.
+            ("FETCH ABSOLUTE -2147483648 c", "2147483648"),
+            ("FETCH RELATIVE 2147483648 c", "2147483648"),
+            ("FETCH FORWARD 1.5 c", "1.5"),
+            ("MOVE BACKWARD 2147483648 c", "2147483648"),
+            // A placeholder is not a constant at all; PG has no slot for one.
+            ("FETCH $1 FROM c", "$1"),
+        ];
+        for (sql, literal) in cases {
+            let e = parse_pg(sql).expect_err(sql);
             assert_eq!(
                 e.to_string(),
                 format!("syntax error at or near \"{literal}\""),
                 "{sql}"
             );
         }
-        // The boundary itself is fine.
+        // Both boundaries themselves are fine.
         parse_pg("MOVE 2147483647 c").expect("parse");
+        parse_pg("FETCH ABSOLUTE -2147483647 c").expect("parse");
     }
 
     /// `DECLARE … CURSOR` renders back verbatim — `pg_cursors.statement` shows

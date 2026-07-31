@@ -19,7 +19,7 @@ use crate::error::PgError;
 use crate::global_catalog::GlobalCatalog;
 use crate::query::{
     Analyzed, BoundParams, Notice, QueryResult, RowTag, analyze_statement, execute_statement,
-    prepare_copy_from, run_copy_insert,
+    fetch_columns, prepare_copy_from, run_copy_insert,
 };
 use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedRows};
 
@@ -824,10 +824,20 @@ fn handle_describe(
                     "portal references a dropped prepared statement",
                 )
             })?;
-            match &prepared.result_columns {
+            // A portal's shape is resolved now, not read from the shape Parse
+            // recorded. `FETCH` is the case where the two differ: its columns
+            // come from a cursor that may have been declared — or closed and
+            // redeclared with different columns — since the statement was
+            // prepared, and PG re-derives the portal's descriptor at Bind for
+            // exactly this reason.
+            let columns = match &prepared.stmt {
+                Some(ast::Statement::Fetch { name, .. }) => fetch_columns(session, name),
+                _ => prepared.result_columns.clone(),
+            };
+            let formats = &session.portals[name].result_formats;
+            match &columns {
                 Some(cols) => writer.write(&BackendMessage::RowDescription(field_descriptions(
-                    cols,
-                    &portal.result_formats,
+                    cols, formats,
                 ))),
                 None => writer.write(&BackendMessage::NoData),
             }

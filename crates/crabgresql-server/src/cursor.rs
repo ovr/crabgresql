@@ -36,6 +36,7 @@ pub(crate) fn execute_declare(
     stmt: &ast::Statement,
     stmts: &[ast::Declare],
     session: &mut Session,
+    params: &BoundParams,
 ) -> Result<QueryResult, PgError> {
     // Other dialects let one DECLARE introduce several variables; PostgreSQL's
     // cursor form declares exactly one name.
@@ -50,11 +51,9 @@ pub(crate) fn execute_declare(
     let Some(query) = declare.for_query.as_ref() else {
         return Err(PgError::syntax("DECLARE CURSOR requires a FOR clause"));
     };
-    let name = declare
-        .names
-        .first()
-        .map(|n| n.value.clone())
-        .unwrap_or_default();
+    let Some(name) = declare.names.first().map(cursor_name) else {
+        return Err(PgError::syntax("DECLARE CURSOR requires a cursor name"));
+    };
     let hold = declare.hold.unwrap_or(false);
     if declare.binary == Some(true) {
         return Err(PgError::feature_not_supported(
@@ -79,16 +78,18 @@ pub(crate) fn execute_declare(
 
     let in_block = session.xact.is_some();
     let source = ast::Statement::Query(query.clone());
+    // The cursor body sees the parameters bound to the DECLARE, so a
+    // `DECLARE … FOR SELECT … $1` opens over the rows the client asked for.
     let result = execute_statement_with(
         engine,
         global_catalog,
         txnmgr,
         &source,
         session,
-        &BoundParams::none(),
+        params,
         true,
     )?;
-    let (columns, node, notices) = match result {
+    let (columns, mut node, notices) = match result {
         QueryResult::Rows {
             columns,
             node,
@@ -104,7 +105,6 @@ pub(crate) fn execute_declare(
     // Already materialised by `force_materialize`, so this only moves the rows
     // out of the node — nothing runs after the transaction closed.
     let mut rows = Vec::new();
-    let mut node = node;
     while let Some(row) = node.next()? {
         rows.push(row);
     }
@@ -117,7 +117,6 @@ pub(crate) fn execute_declare(
             pos: 0,
             hold,
             scroll: declare.scroll,
-            binary: false,
             // Divergence: PostgreSQL keeps the client's raw text. The parser
             // reports no span for DECLARE, so there is nothing to slice; the
             // AST's own rendering round-trips for canonical input.
@@ -144,7 +143,7 @@ pub(crate) fn execute_fetch(
         ));
     }
     let movement = movement_of(direction)?;
-    let cursor = lookup(session, &name.value)?;
+    let cursor = lookup(session, name)?;
     let columns = cursor.columns.clone();
     let rows = cursor.fetch(movement)?;
     Ok(QueryResult::Rows {
@@ -163,7 +162,7 @@ pub(crate) fn execute_move(
     session: &mut Session,
 ) -> Result<QueryResult, PgError> {
     let movement = movement_of(direction)?;
-    let moved = lookup(session, &name.value)?.advance(movement)?;
+    let moved = lookup(session, name)?.advance(movement)?;
     Ok(QueryResult::Command {
         tag: format!("MOVE {moved}"),
         notices: Vec::new(),
@@ -181,8 +180,9 @@ pub(crate) fn execute_close(
             "CLOSE CURSOR ALL"
         }
         ast::CloseCursor::Specific { name } => {
-            if session.cursors.remove(&name.value).is_none() {
-                return Err(not_found(&name.value));
+            let name = cursor_name(name);
+            if session.cursors.remove(&name).is_none() {
+                return Err(not_found(&name));
             }
             "CLOSE CURSOR"
         }
@@ -210,9 +210,20 @@ pub(crate) fn close_on_abort(session: &mut Session) {
     session.cursors.retain(|_, cursor| !cursor.in_block);
 }
 
+/// The name a cursor is filed under. Unquoted identifiers fold to lowercase, as
+/// everywhere else in the catalog — `DECLARE Foo` and `FETCH foo` are the same
+/// cursor, and `DECLARE "Foo"` is a different one.
+pub(crate) fn cursor_name(ident: &ast::Ident) -> String {
+    crate::query::normalize_ident(ident)
+}
+
 /// The named cursor, or PostgreSQL's 34000.
-fn lookup<'a>(session: &'a mut Session, name: &str) -> Result<&'a mut Cursor, PgError> {
-    session.cursors.get_mut(name).ok_or_else(|| not_found(name))
+fn lookup<'a>(session: &'a mut Session, name: &ast::Ident) -> Result<&'a mut Cursor, PgError> {
+    let name = cursor_name(name);
+    session
+        .cursors
+        .get_mut(&name)
+        .ok_or_else(|| not_found(&name))
 }
 
 fn not_found(name: &str) -> PgError {
@@ -255,16 +266,15 @@ fn movement_of(direction: &ast::FetchDirection) -> Result<CursorMove, PgError> {
     Ok(movement)
 }
 
-/// The integer a direction's count literal denotes. The parser already rejected
-/// anything outside `int`, so only a `$n` placeholder can reach the error —
-/// PostgreSQL's grammar has no room for one there either.
+/// The integer a direction's count literal denotes.
+///
+/// The parser accepts only PostgreSQL's `SignedIconst` here, so the literal is
+/// an `int` and this cannot fail in practice; the error path exists so a parser
+/// change cannot silently truncate a count instead.
 fn count(limit: &ast::ValueWithSpan) -> Result<i64, PgError> {
     match &limit.value {
-        ast::Value::Number(digits, _) => digits
-            .parse::<i64>()
-            .map_err(|_| PgError::syntax(format!("syntax error at or near \"{digits}\""))),
-        other => Err(PgError::syntax(format!(
-            "syntax error at or near \"{other}\""
-        ))),
+        ast::Value::Number(digits, _) => digits.parse::<i32>().map(i64::from).ok(),
+        _ => None,
     }
+    .ok_or_else(|| PgError::syntax(format!("syntax error at or near \"{}\"", limit.value)))
 }
