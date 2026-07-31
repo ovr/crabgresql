@@ -1900,21 +1900,17 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         GeoFn::BoxIntersect => geo::box_intersect(&box_of(&args[0]), &box_of(&args[1]))
             .map_or(Value::Null, Value::Box),
-        GeoFn::BoxEq
-        | GeoFn::BoxNe
-        | GeoFn::BoxLt
-        | GeoFn::BoxLe
-        | GeoFn::BoxGt
-        | GeoFn::BoxGe => {
+        // A `None` ordering means a NaN area, which every comparison answers
+        // false — including `<>`. (PG gives `box` no `<>` operator at all.)
+        GeoFn::BoxEq | GeoFn::BoxLt | GeoFn::BoxLe | GeoFn::BoxGt | GeoFn::BoxGe => {
             let ord = geo::box_area_cmp(&box_of(&args[0]), &box_of(&args[1]));
-            Value::Bool(match g {
-                GeoFn::BoxEq => ord.is_eq(),
-                GeoFn::BoxNe => ord.is_ne(),
-                GeoFn::BoxLt => ord.is_lt(),
-                GeoFn::BoxLe => ord.is_le(),
-                GeoFn::BoxGt => ord.is_gt(),
-                _ => ord.is_ge(),
-            })
+            Value::Bool(ord.is_some_and(|o| match g {
+                GeoFn::BoxEq => o.is_eq(),
+                GeoFn::BoxLt => o.is_lt(),
+                GeoFn::BoxLe => o.is_le(),
+                GeoFn::BoxGt => o.is_gt(),
+                _ => o.is_ge(),
+            }))
         }
         GeoFn::BoxAddPt => Value::Box(
             geo::box_add_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
@@ -2083,14 +2079,14 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         | GeoFn::CircleGt
         | GeoFn::CircleGe => {
             let ord = geo::circle_area_cmp(&circle_of(&args[0]), &circle_of(&args[1]));
-            Value::Bool(match g {
-                GeoFn::CircleEq => ord.is_eq(),
-                GeoFn::CircleNe => ord.is_ne(),
-                GeoFn::CircleLt => ord.is_lt(),
-                GeoFn::CircleLe => ord.is_le(),
-                GeoFn::CircleGt => ord.is_gt(),
-                _ => ord.is_ge(),
-            })
+            Value::Bool(ord.is_some_and(|o| match g {
+                GeoFn::CircleEq => o.is_eq(),
+                GeoFn::CircleNe => o.is_ne(),
+                GeoFn::CircleLt => o.is_lt(),
+                GeoFn::CircleLe => o.is_le(),
+                GeoFn::CircleGt => o.is_gt(),
+                _ => o.is_ge(),
+            }))
         }
         GeoFn::DistCircleCircle => Value::Float8(geo::dist_circle_circle(
             &circle_of(&args[0]),

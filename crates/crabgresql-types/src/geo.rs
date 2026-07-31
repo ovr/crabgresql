@@ -515,17 +515,22 @@ pub fn close_point_seg(p: &[f64; 2], l: &[f64; 4]) -> [f64; 2] {
     let (x1, y1, x2, y2) = (l[0], l[1], l[2], l[3]);
     let dx = x2 - x1;
     let dy = y2 - y1;
-    let denom = dx * dx + dy * dy;
-    if denom == 0.0 {
+    if dx == 0.0 && dy == 0.0 {
         return [x1, y1];
     }
-    let mut t = ((p[0] - x1) * dx + (p[1] - y1) * dy) / denom;
+    // Scale the direction by its larger component before squaring. The
+    // unscaled `dx*dx + dy*dy` overflows to `Infinity` for coordinates past
+    // ~1e154 — perfectly ordinary `float8` values — and the projection then
+    // comes out NaN. With the scaling, `point '(1e200,0)' ## lseg
+    // '[(0,0),(1e200,1e200)]'` lands on `(5e199,5e199)` as it does in PG.
+    let scale = dx.abs().max(dy.abs());
+    let (ux, uy) = (dx / scale, dy / scale);
+    let mut t = ((p[0] - x1) / scale * ux + (p[1] - y1) / scale * uy) / (ux * ux + uy * uy);
     if t.is_nan() {
-        // An infinite coordinate on `p` makes the projection indeterminate
-        // (`inf * 0` in the dot product). PG lands on an endpoint here, which
-        // keeps the resulting distance `Infinity` rather than NaN. Pick the
-        // nearer endpoint, and the *second* one when they tie — which they
-        // always do at infinity, and which is the one PG reports.
+        // Only a non-finite coordinate can still get here. PG degenerates to an
+        // endpoint too, which at least keeps the resulting distance `Infinity`
+        // rather than NaN; it picks the second when the two tie, as they always
+        // do at infinity.
         return if point_distance(p, &[x2, y2]) <= point_distance(p, &[x1, y1]) {
             [x2, y2]
         } else {
@@ -1045,17 +1050,28 @@ pub fn box_intersect(a: &[f64; 4], b: &[f64; 4]) -> Option<[f64; 4]> {
     ])
 }
 
-/// `= <> < <= > >=` on boxes compare **area**, so `'(0,0,2,2)' = '(1,1,3,3)'`
-/// is true. (Identity is `~=`.)
-pub fn box_area_cmp(a: &[f64; 4], b: &[f64; 4]) -> std::cmp::Ordering {
-    let (x, y) = (box_area(a), box_area(b));
-    if fp_eq(x, y) {
+/// Order two areas the way the `box`/`circle` comparison operators do: fuzzily
+/// equal areas compare equal, and a NaN area has **no** ordering at all — every
+/// one of `= <> < <= > >=` is false against it, as in PG. Returning an
+/// `Ordering` for NaN would make `>` and `>=` true, since NaN fails both the
+/// equality and the less-than test.
+fn area_cmp(x: f64, y: f64) -> Option<std::cmp::Ordering> {
+    if x.is_nan() || y.is_nan() {
+        return None;
+    }
+    Some(if fp_eq(x, y) {
         std::cmp::Ordering::Equal
     } else if x < y {
         std::cmp::Ordering::Less
     } else {
         std::cmp::Ordering::Greater
-    }
+    })
+}
+
+/// `= < <= > >=` on boxes compare **area**, so `'(0,0,2,2)' = '(1,1,3,3)'` is
+/// true. (Identity is `~=`; note PG gives `box` no `<>` at all.)
+pub fn box_area_cmp(a: &[f64; 4], b: &[f64; 4]) -> Option<std::cmp::Ordering> {
+    area_cmp(box_area(a), box_area(b))
 }
 
 /// `box <op> point` arithmetic: apply the point operation to both corners and
@@ -1216,10 +1232,21 @@ pub fn box_to_polygon(b: &[f64; 4]) -> PolygonVal {
 // A `line` is the infinite line `Ax + By + C = 0`, stored as `[A, B, C]`.
 
 const INVALID_PARAMETER_VALUE: &str = "22023";
+const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
 
-fn line_spec_error(detail: &str) -> GeoError {
+/// The largest vertex count `polygon(npts, circle)` accepts. PG caps the
+/// polygon at its 1 GB maximum allocation, which at 16 bytes per vertex plus
+/// the header lands here: `polygon(67108861, ...)` builds and
+/// `polygon(67108862, ...)` is rejected.
+const MAX_POLYGON_NPTS: i32 = 67_108_861;
+
+/// `invalid line specification: <detail>`. PG raises this with two different
+/// SQLSTATEs depending on where it comes from: `22P02` out of `line` input
+/// (it is a malformed literal) and `22023` out of the `line(point, point)`
+/// constructor (the literal was fine, the arguments were not).
+fn line_spec_error(detail: &str, sqlstate: &'static str) -> GeoError {
     GeoError {
-        sqlstate: INVALID_TEXT_REPRESENTATION,
+        sqlstate,
         message: format!("invalid line specification: {detail}"),
     }
 }
@@ -1252,12 +1279,19 @@ pub fn parse_line(orig: &str) -> Result<[f64; 3], GeoError> {
             return Err(syntax("line", orig));
         }
         if fp_eq(a, 0.0) && fp_eq(b, 0.0) {
-            return Err(line_spec_error("A and B cannot both be zero"));
+            return Err(line_spec_error(
+                "A and B cannot both be zero",
+                INVALID_TEXT_REPRESENTATION,
+            ));
         }
         return Ok([a, b, c]);
     }
     let (_open, pts) = path_decode(orig, true, 2, true, "line")?;
-    line_from_points(&pts[0], &pts[1])
+    line_from_points(&pts[0], &pts[1]).map_err(|mut e| {
+        // Reached from input, so the coincident-points case is a bad literal.
+        e.sqlstate = INVALID_TEXT_REPRESENTATION;
+        e
+    })
 }
 
 /// Format a `line` as `{A,B,C}`.
@@ -1275,7 +1309,10 @@ pub fn format_line(l: &[f64; 3], efd: i32) -> String {
 /// `{slope,-1,intercept}`.
 pub fn line_from_points(p1: &[f64; 2], p2: &[f64; 2]) -> Result<[f64; 3], GeoError> {
     if point_eq(p1, p2) {
-        return Err(line_spec_error("must be two distinct points"));
+        return Err(line_spec_error(
+            "must be two distinct points",
+            INVALID_PARAMETER_VALUE,
+        ));
     }
     if fp_eq(p1[0], p2[0]) {
         return Ok([-1.0, 0.0, p1[0]]);
@@ -1309,29 +1346,53 @@ pub fn line_eq(a: &[f64; 3], b: &[f64; 3]) -> bool {
     fp_eq(a[0], ratio * b[0]) && fp_eq(a[1], ratio * b[1]) && fp_eq(a[2], ratio * b[2])
 }
 
-/// The `(A,B)` normal vector's length; `0` only for a degenerate line, which
-/// input validation rejects.
+/// The `(A,B)` normal vector's length, which turns `Ax + By + C` into a signed
+/// distance. Only the "is this point *on* the line" tests want that scaling —
+/// the orientation predicates below deliberately do not (see their comment).
 fn line_norm(l: &[f64; 3]) -> f64 {
     hypot(l[0], l[1])
 }
 
+// The orientation predicates below all test the *raw* coefficients, never a
+// normalized copy. That is observable: `?- line '{1,1000000,0}'` is false in PG
+// even though the line is very nearly horizontal, because the test is
+// "is A within EPSILON of zero", not "is the direction within EPSILON of
+// horizontal". Scaling the coefficients first would answer true.
+
 /// `?- line` horizontal: the `x` coefficient vanishes.
 pub fn line_horizontal(l: &[f64; 3]) -> bool {
-    fp_eq(l[0] / line_norm(l), 0.0)
+    fp_eq(l[0], 0.0)
 }
 /// `?| line` vertical: the `y` coefficient vanishes.
 pub fn line_vertical(l: &[f64; 3]) -> bool {
-    fp_eq(l[1] / line_norm(l), 0.0)
+    fp_eq(l[1], 0.0)
 }
 
-/// `?||` parallel. Compared through the normalized cross product so the test is
-/// independent of how the coefficients are scaled.
+/// `?||` parallel: the cross product of the two normals vanishes. Two vertical
+/// lines are parallel; a vertical and a non-vertical one never are.
 pub fn line_parallel(a: &[f64; 3], b: &[f64; 3]) -> bool {
-    fp_eq((a[0] * b[1] - b[0] * a[1]) / (line_norm(a) * line_norm(b)), 0.0)
+    if line_vertical(a) {
+        return line_vertical(b);
+    }
+    if line_vertical(b) {
+        return false;
+    }
+    fp_eq(a[0] * b[1], b[0] * a[1])
 }
-/// `?-|` perpendicular, through the normalized dot product.
+/// `?-|` perpendicular: the slopes (`-A/B` each) multiply to `-1`. Compared as
+/// the *ratio* rather than as a dot product, which is what makes
+/// `{1000000,1000000,0} ?-| {1000000,-1000001,0}` true in PG — the slopes differ
+/// from exact perpendicularity by only 1e-6, while their raw dot product is 1e6.
+/// A horizontal line is perpendicular to a vertical one, which the ratio cannot
+/// express (it divides by zero), so those are handled first.
 pub fn line_perpendicular(a: &[f64; 3], b: &[f64; 3]) -> bool {
-    fp_eq((a[0] * b[0] + a[1] * b[1]) / (line_norm(a) * line_norm(b)), 0.0)
+    if line_horizontal(a) {
+        return line_vertical(b);
+    }
+    if line_horizontal(b) {
+        return line_vertical(a);
+    }
+    fp_eq((a[0] * b[0]) / (a[1] * b[1]), -1.0)
 }
 
 /// `#` the intersection point of two lines; NULL when they are parallel (which
@@ -1341,10 +1402,17 @@ pub fn line_interpt(a: &[f64; 3], b: &[f64; 3]) -> Option<[f64; 2]> {
         return None;
     }
     let det = a[0] * b[1] - b[0] * a[1];
+    // Normalize away a negative zero: these expressions produce `-0` for
+    // ordinary input (`'{1,-1,0}' # '{1,1,0}'`), and PG prints `(0,0)`.
     Some([
-        (a[1] * b[2] - b[1] * a[2]) / det,
-        (b[0] * a[2] - a[0] * b[2]) / det,
+        zero_norm((a[1] * b[2] - b[1] * a[2]) / det),
+        zero_norm((b[0] * a[2] - a[0] * b[2]) / det),
     ])
+}
+
+/// Collapse `-0.0` to `0.0`, leaving every other value alone.
+fn zero_norm(v: f64) -> f64 {
+    if v == 0.0 { 0.0 } else { v }
 }
 
 /// `?#` the two lines meet in exactly one point.
@@ -1372,8 +1440,13 @@ pub fn close_point_line(q: &[f64; 2], l: &[f64; 3]) -> [f64; 2] {
     if fp_eq(a, 0.0) {
         return [q[0], c / -b];
     }
-    let invm = -1.0 / a;
-    let perp = [invm, -1.0, q[1] - invm * q[0]];
+    // The perpendicular through `q`, built by rotating the normal `(A,B)` a
+    // quarter turn. Taking it unscaled matters twice: a `{A,B,C}` literal may
+    // have any `B` (only the two-point constructor normalizes it to -1), and a
+    // slope-based `-1/A` form would be perpendicular to the wrong line for
+    // every other `B`; and avoiding the extra division keeps the intersection
+    // exactly where PG puts it rather than an ulp away.
+    let perp = [b, -a, -(b * q[0] - a * q[1])];
     line_interpt(&perp, l).unwrap_or([f64::NAN, f64::NAN])
 }
 
@@ -1383,18 +1456,22 @@ pub fn point_on_line(q: &[f64; 2], l: &[f64; 3]) -> bool {
 }
 
 /// `line <-> line`: `0` unless they are parallel, in which case it is the
-/// constant separation.
+/// constant separation. Computed algebraically rather than by measuring from a
+/// point of `a` to `b` — the two differ in the last ulp, and this is the one PG
+/// reports (`'{1,-1,0}' <-> '{1,-1,5}'` is `3.5355339059327373`, i.e. exactly
+/// `5/sqrt(2)`, not `2.5*sqrt(2)`). Rescaling `b`'s constant by the coefficient
+/// ratio is what lets two differently-scaled spellings of the same pair of lines
+/// give the same answer.
 pub fn dist_line_line(a: &[f64; 3], b: &[f64; 3]) -> f64 {
     if !line_parallel(a, b) {
         return 0.0;
     }
-    // Any point of `a` will do; pick the one on whichever axis `a` crosses.
-    let p = if !fp_eq(a[1], 0.0) {
-        [0.0, -a[2] / a[1]]
+    let ratio = if line_horizontal(a) {
+        a[1] / b[1]
     } else {
-        [-a[2] / a[0], 0.0]
+        a[0] / b[0]
     };
-    dist_point_line(&p, b)
+    (a[2] - ratio * b[2]).abs() / hypot(a[0], a[1])
 }
 
 /// The line carrying a segment. `None` for a degenerate (zero-length) segment.
@@ -1451,10 +1528,11 @@ pub fn line_intersects_box(l: &[f64; 3], b: &[f64; 4]) -> bool {
         [b[2], b[1]],
         [b[2], b[3]],
     ];
+    let norm = line_norm(l);
     let mut neg = false;
     let mut pos = false;
     for c in corners {
-        let f = (l[0] * c[0] + l[1] * c[1] + l[2]) / line_norm(l);
+        let f = (l[0] * c[0] + l[1] * c[1] + l[2]) / norm;
         if fp_eq(f, 0.0) {
             return true;
         }
@@ -1559,11 +1637,6 @@ pub fn circle_to_box(c: &[f64; 3]) -> [f64; 4] {
     let half = c[2] / std::f64::consts::SQRT_2;
     [c[0] + half, c[1] + half, c[0] - half, c[1] - half]
 }
-/// `circle(box)`: the circumscribed circle of the box.
-pub fn circle_from_box(b: &[f64; 4]) -> [f64; 3] {
-    box_to_circle(b)
-}
-
 /// The vertex count `circle::polygon` uses when none is given.
 pub const CIRCLE_POLYGON_NPTS: i32 = 12;
 
@@ -1574,7 +1647,17 @@ pub fn circle_to_polygon(npts: i32, c: &[f64; 3]) -> Result<PolygonVal, GeoError
     if npts < 2 {
         return Err(GeoError {
             sqlstate: INVALID_PARAMETER_VALUE,
-            message: format!("must request at least 2 points, got {npts}"),
+            message: "must request at least 2 points".to_string(),
+        });
+    }
+    // `npts` is caller-supplied, and the vertex list is reserved up front, so
+    // without this an `int4` argument asks for a 34 GB allocation and the
+    // backend spins until it is killed. PG bounds the polygon by its 1 GB
+    // maximum allocation, which is what `MAX_POLYGON_NPTS` works out to.
+    if npts > MAX_POLYGON_NPTS {
+        return Err(GeoError {
+            sqlstate: PROGRAM_LIMIT_EXCEEDED,
+            message: "too many points requested".to_string(),
         });
     }
     let n = usize::try_from(npts).unwrap_or(0);
@@ -1653,15 +1736,8 @@ pub fn circle_contain_pt(c: &[f64; 3], q: &[f64; 2]) -> bool {
 }
 
 /// `= <> < <= > >=` on circles compare **area** (identity is `~=`).
-pub fn circle_area_cmp(a: &[f64; 3], b: &[f64; 3]) -> std::cmp::Ordering {
-    let (x, y) = (circle_area(a), circle_area(b));
-    if fp_eq(x, y) {
-        std::cmp::Ordering::Equal
-    } else if x < y {
-        std::cmp::Ordering::Less
-    } else {
-        std::cmp::Ordering::Greater
-    }
+pub fn circle_area_cmp(a: &[f64; 3], b: &[f64; 3]) -> Option<std::cmp::Ordering> {
+    area_cmp(circle_area(a), circle_area(b))
 }
 
 /// `circle <-> circle`: the gap between the outlines, `0` when they overlap.
@@ -1802,11 +1878,6 @@ pub fn path_to_polygon(p: &PathVal) -> Result<PolygonVal, GeoError> {
     })
 }
 
-/// `polygon(box)` / `box::polygon`.
-pub fn poly_from_box(b: &[f64; 4]) -> PolygonVal {
-    box_to_polygon(b)
-}
-
 /// `~=` same as: the same vertices in the same order.
 pub fn poly_same(a: &PolygonVal, b: &PolygonVal) -> bool {
     a.pts.len() == b.pts.len() && a.pts.iter().zip(b.pts.iter()).all(|(x, y)| point_eq(x, y))
@@ -1899,16 +1970,21 @@ pub fn dist_poly_point(p: &PolygonVal, q: &[f64; 2]) -> f64 {
 /// `polygon <-> polygon`: `0` when they overlap, otherwise the nearest approach
 /// between their outlines.
 pub fn dist_poly_poly(a: &PolygonVal, b: &PolygonVal) -> f64 {
-    if poly_overlap(a, b) {
-        return 0.0;
-    }
-    a.edges()
+    // The edge sweep already yields 0 wherever two edges cross, so it subsumes
+    // that half of `poly_overlap`; only the one-inside-the-other case needs a
+    // separate test, and it is O(n) rather than another O(n*m) pass.
+    let best = a
+        .edges()
         .map(|e1| {
             b.edges()
                 .map(|e2| dist_seg_seg(&e1, &e2))
                 .fold(f64::INFINITY, f64::min)
         })
-        .fold(f64::INFINITY, f64::min)
+        .fold(f64::INFINITY, f64::min);
+    if best == 0.0 || poly_contain_pt(a, &b.pts[0]) || poly_contain_pt(b, &a.pts[0]) {
+        return 0.0;
+    }
+    best
 }
 
 /// `polygon <-> circle` (and `circle <-> polygon`): the polygon's distance to
@@ -2397,8 +2473,8 @@ mod tests {
         assert_eq!(box_intersect(&a, &b), Some([2.0, 2.0, 1.0, 1.0]));
         assert_eq!(box_intersect(&a, &parse_box("(5,5,6,6)")?), None);
         // `=` is by *area*, so two differently placed boxes can compare equal.
-        assert_eq!(box_area_cmp(&a, &b), std::cmp::Ordering::Equal);
-        assert_eq!(box_area_cmp(&a, &parse_box("(0,0,3,3)")?), std::cmp::Ordering::Less);
+        assert_eq!(box_area_cmp(&a, &b), Some(std::cmp::Ordering::Equal));
+        assert_eq!(box_area_cmp(&a, &parse_box("(0,0,3,3)")?), Some(std::cmp::Ordering::Less));
         assert!(box_below_eq(&a, &parse_box("(0,5,2,7)")?));
         assert!(box_contain_pt(&a, &[1.0, 1.0]) && !box_contain_pt(&a, &[5.0, 5.0]));
         // `box <-> box` is measured **center to center**, not outline to outline.
@@ -2474,6 +2550,115 @@ mod tests {
         assert!(line_eq(&parse_line("{nan,1,nan}")?, &parse_line("{nan,1,nan}")?));
         assert!(!line_eq(&parse_line("{nan,1,nan}")?, &parse_line("{nan,2,nan}")?));
         assert!(!line_eq(&parse_line("{3,NaN,5}")?, &parse_line("{6,NaN,10}")?));
+        Ok(())
+    }
+
+    #[test]
+    fn line_predicates_use_raw_coefficients() -> anyhow::Result<()> {
+        // The orientation tests look at the coefficient itself, not at a
+        // normalized copy: `{1,1000000,0}` is very nearly horizontal but its A
+        // is 1, so PG (and this) call it not horizontal.
+        assert!(!line_horizontal(&parse_line("{1,1000000,0}")?));
+        assert!(line_horizontal(&parse_line("{1e-7,1,0}")?));
+        assert!(!line_vertical(&parse_line("{1000000,1,0}")?));
+        assert!(line_vertical(&parse_line("{1,1e-7,0}")?));
+        // Parallel compares the raw cross product, so scaling the coefficients
+        // up does not make two distinct lines parallel.
+        assert!(!line_parallel(
+            &parse_line("{1000000,1000000,0}")?,
+            &parse_line("{1000000,1000001,0}")?
+        ));
+        assert!(line_parallel(&parse_line("{1,-1,0}")?, &parse_line("{2,-2,5}")?));
+        assert!(line_parallel(&parse_line("{1,0,0}")?, &parse_line("{5,0,3}")?));
+        assert!(!line_parallel(&parse_line("{1,0,0}")?, &parse_line("{0,1,0}")?));
+        // Perpendicular compares the *slope product*, not the dot product — the
+        // two disagree exactly here, where the slopes are within EPSILON of
+        // perpendicular but the raw dot product is 1e6.
+        assert!(line_perpendicular(
+            &parse_line("{1000000,1000000,0}")?,
+            &parse_line("{1000000,-1000001,0}")?
+        ));
+        assert!(line_perpendicular(&parse_line("{2,4,6}")?, &parse_line("{4,-2,1}")?));
+        assert!(line_perpendicular(&parse_line("{0,1,0}")?, &parse_line("{1,0,0}")?));
+        Ok(())
+    }
+
+    #[test]
+    fn line_geometry_handles_any_b_coefficient() -> anyhow::Result<()> {
+        // Only the two-point constructor normalizes B to -1 or 0; a `{A,B,C}`
+        // literal can carry any B, and the perpendicular has to be built from
+        // the normal rather than from a `-1/A` slope.
+        let l = parse_line("{2,4,6}")?;
+        let closest = close_point_line(&[0.0, 0.0], &l);
+        assert!((closest[0] - -0.6).abs() < 1e-12, "{closest:?}");
+        assert!((closest[1] - -1.2).abs() < 1e-12, "{closest:?}");
+        assert!((dist_point_line(&[3.0, 4.0], &l) - 6.260_990_336_999_411).abs() < 1e-12);
+        // (-3,0) is exactly on 2x + 4y + 6 = 0.
+        assert!(point_on_line(&[-3.0, 0.0], &l));
+        Ok(())
+    }
+
+    #[test]
+    fn line_interpt_does_not_leak_negative_zero() -> anyhow::Result<()> {
+        // The determinant expressions produce -0 for ordinary input; PG prints
+        // `(0,0)`, and `-0` would render as `-0`.
+        let p = line_interpt(&parse_line("{1,-1,0}")?, &parse_line("{1,1,0}")?)
+            .expect("the lines cross");
+        assert!(p[0].is_sign_positive() && p[1].is_sign_positive(), "{p:?}");
+        assert_eq!(format_point(&p, 0), "(0,0)");
+        Ok(())
+    }
+
+    #[test]
+    fn area_comparisons_have_no_ordering_for_nan() -> anyhow::Result<()> {
+        // Every one of `= <> < <= > >=` is false against a NaN area. Returning
+        // an `Ordering` would make `>`/`>=` true, since NaN fails both the
+        // equality and the less-than test.
+        let nan_box = parse_box("(NaN,0,0,0)")?;
+        assert_eq!(box_area_cmp(&nan_box, &nan_box), None);
+        assert_eq!(box_area_cmp(&nan_box, &parse_box("(0,0,2,2)")?), None);
+        let nan_circle = parse_circle("<(0,0),NaN>")?;
+        assert_eq!(circle_area_cmp(&nan_circle, &parse_circle("<(0,0),1>")?), None);
+        Ok(())
+    }
+
+    #[test]
+    fn close_point_seg_survives_coordinates_that_overflow_when_squared() -> anyhow::Result<()> {
+        // `dx*dx + dy*dy` overflows past ~1e154, which used to make the
+        // projection NaN and fall through to an endpoint.
+        let l = parse_lseg("[(0,0),(1e200,1e200)]")?;
+        let c = close_point_seg(&[1e200, 0.0], &l);
+        assert!((c[0] - 5e199).abs() < 1e185, "{c:?}");
+        assert!((c[1] - 5e199).abs() < 1e185, "{c:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn circle_to_polygon_bounds_the_vertex_count() -> anyhow::Result<()> {
+        // `npts` reaches this straight from an int4 argument, so an unbounded
+        // count would reserve 34 GB and wedge the backend.
+        let c = parse_circle("<(0,0),2>")?;
+        let e = circle_to_polygon(i32::MAX, &c).expect_err("too many points");
+        assert_eq!(e.sqlstate, "54000");
+        assert_eq!(e.message, "too many points requested");
+        let e = circle_to_polygon(1, &c).expect_err("too few points");
+        assert_eq!(e.sqlstate, "22023");
+        assert_eq!(e.message, "must request at least 2 points");
+        assert_eq!(circle_to_polygon(2, &c)?.pts.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn line_spec_errors_differ_by_call_site() -> anyhow::Result<()> {
+        // The same wording, but a malformed literal is 22P02 while the
+        // constructor rejecting its arguments is 22023.
+        assert_eq!(parse_line("[(1,2),(1,2)]").expect_err("coincident").sqlstate, "22P02");
+        assert_eq!(
+            line_from_points(&[1.0, 1.0], &[1.0, 1.0])
+                .expect_err("coincident")
+                .sqlstate,
+            "22023"
+        );
         Ok(())
     }
 
@@ -2574,8 +2759,8 @@ mod tests {
         assert!(!circle_same(&a, &b) && circle_same(&a, &a));
         assert!(circle_contain_pt(&a, &[1.0, 1.0]) && !circle_contain_pt(&a, &[5.0, 5.0]));
         // `=` compares area, so any two same-radius circles are equal.
-        assert_eq!(circle_area_cmp(&a, &parse_circle("<(9,9),2>")?), std::cmp::Ordering::Equal);
-        assert_eq!(circle_area_cmp(&a, &b), std::cmp::Ordering::Greater);
+        assert_eq!(circle_area_cmp(&a, &parse_circle("<(9,9),2>")?), Some(std::cmp::Ordering::Equal));
+        assert_eq!(circle_area_cmp(&a, &b), Some(std::cmp::Ordering::Greater));
         // Distances measure outline to outline and clamp at 0.
         assert_eq!(dist_circle_circle(&a, &b), 0.0);
         assert!((dist_circle_circle(&a, &parse_circle("<(5,5),1>")?) - (50.0_f64.sqrt() - 3.0)).abs() < 1e-12);

@@ -393,3 +393,61 @@ SELECT pg_input_is_valid('{1, 1}', 'line') AS bad_line,
        pg_input_is_valid('<(1,2),3>', 'circle') AS ok_circle;
 SELECT * FROM pg_input_error_info('{0, 0, 0}', 'line');
 SELECT * FROM pg_input_error_info('((200,300),(500, xyz))', 'box');
+
+--
+-- Regression cases for the geometric edge conditions that the sections above
+-- do not reach. Each one differed from PostgreSQL at some point.
+--
+
+-- `line` orientation/relation predicates test the RAW coefficients: a line can
+-- be very nearly horizontal and still not be `?-`, and scaling the coefficients
+-- up must not make two distinct lines parallel. `?-|` is the exception — it
+-- compares the slope product, so the near-perpendicular pair below is true.
+SELECT ?- line '{1,1000000,0}' AS not_horiz, ?- line '{1e-7,1,0}' AS horiz,
+       ?| line '{1000000,1,0}' AS not_vert,  ?| line '{1,1e-7,0}' AS vert;
+SELECT line '{1000000,1000000,0}' ?|| line '{1000000,1000001,0}' AS not_parallel,
+       line '{1,-1,0}' ?|| line '{2,-2,5}' AS parallel_scaled,
+       line '{1000000,1000000,0}' ?-| line '{1000000,-1000001,0}' AS perp_slope,
+       line '{2,4,6}' ?-| line '{4,-2,1}' AS perp;
+
+-- Only the two-point constructor normalizes B to -1; a `{A,B,C}` literal can
+-- carry any B, and the perpendicular has to be built from the normal.
+SELECT point '(0,0)' ## line '{2,4,6}' AS closept,
+       point '(3,4)' <-> line '{2,4,6}' AS dist,
+       point '(-3,0)' <@ line '{2,4,6}' AS on_line;
+
+-- `#` must not leak a negative zero, and parallel `<->` is the algebraic
+-- separation (scaling one line must not change it).
+SELECT line '{1,-1,0}' # line '{1,1,0}' AS origin,
+       line '{1,-1,0}' ## lseg '[(0,0),(1,0)]' AS origin2,
+       line '{1,-1,0}' <-> line '{1,-1,5}' AS sep,
+       line '{1,-1,0}' <-> line '{2,-2,10}' AS sep_scaled;
+
+-- A NaN area has no ordering at all: every comparison is false, `<>` included.
+SELECT box '(NaN,0),(0,0)' > box '(NaN,0),(0,0)' AS gt,
+       box '(NaN,0),(0,0)' >= box '(0,0),(2,2)' AS ge,
+       circle '<(0,0),NaN>' <> circle '<(0,0),1>' AS ne,
+       circle '<(0,0),NaN>' = circle '<(0,0),1>' AS eq;
+
+-- Coordinates past ~1e154 overflow when squared, which must not derail the
+-- projection onto a segment.
+SELECT point '(1e200,0)' ## lseg '[(0,0),(1e200,1e200)]' AS big_closept;
+
+-- An untyped literal is resolved against every geometric type, not just point:
+-- this binds `line ## lseg`, whose overload takes an lseg on the right.
+SELECT line '{1,-1,0}' ## '[(0,0),(2,2)]' AS untyped_lseg;
+
+-- polygon(npts, circle) is bounded: npts arrives straight from an int4.
+SELECT polygon(2147483647, '<(0,0),2>'::circle);
+SELECT polygon(1, '<(0,0),2>'::circle);
+SELECT npoints(polygon(2, '<(0,0),2>'::circle)) AS two_points;
+
+-- The same wording, two SQLSTATEs: a malformed literal is 22P02, while the
+-- constructor rejecting its arguments is 22023.
+SELECT line(point '(1,1)', point '(1,1)');
+SELECT sql_error_code FROM pg_input_error_info('(1,1),(1,1)', 'line');
+
+-- PostgreSQL gives `box` no `<>` operator (unlike circle, lseg and point).
+-- The expected output drops PG's `LINE n: ... ^` caret here, which this build
+-- does not emit for `operator does not exist` (see the note in xid.sql).
+SELECT box '(1,1),(0,0)' <> box '(3,3),(2,2)';

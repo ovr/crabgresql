@@ -429,10 +429,10 @@ mod tests {
     }
 
     #[test]
-    fn box_arrays_use_a_semicolon_delimiter() {
+    fn box_arrays_use_a_semicolon_delimiter() -> Result<(), ArrayError> {
         // `box` is the one built-in with `typdelim = ';'`, because its own
         // output text contains commas.
-        let elems = array_in("{(1,1),(0,0);(3,3),(2,2)}", PgType::Box).unwrap();
+        let elems = array_in("{(1,1),(0,0);(3,3),(2,2)}", PgType::Box)?;
         assert_eq!(
             elems,
             vec![
@@ -446,6 +446,7 @@ mod tests {
             format(PgType::Box, &elems, 1),
             "{(1,1),(0,0);(3,3),(2,2)}"
         );
+        Ok(())
     }
 
     #[test]

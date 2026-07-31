@@ -782,10 +782,9 @@ pub enum GeoFn {
     BoxIntersects,
     /// `b1 # b2` intersection box (`-> box`, NULL if disjoint).
     BoxIntersect,
-    /// `b1 = b2` (by area — identity is `~=`).
+    /// `b1 = b2` (by area — identity is `~=`). PG gives `box` no `<>`
+    /// counterpart, so there is no `BoxNe`.
     BoxEq,
-    /// `b1 <> b2` (by area).
-    BoxNe,
     /// `b1 < b2` (by area).
     BoxLt,
     /// `b1 <= b2` (by area).

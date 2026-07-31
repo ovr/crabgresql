@@ -5329,8 +5329,20 @@ fn is_geo_ty(ty: Option<PgType>) -> bool {
     )
 }
 
-/// Geometric (`point`/`lseg`/`path`) binary operators lower to `ScalarFn::Geo` calls,
-/// as `resolve_network_op` does for the inet operators. Returns `Ok(None)` when
+/// Every geometric type, in the order an untyped operand is tried against them.
+/// `Point` leads because most mixed-type overloads pair a shape with a point.
+const GEO_TYPES: [PgType; 7] = [
+    PgType::Point,
+    PgType::Lseg,
+    PgType::Line,
+    PgType::Box,
+    PgType::Path,
+    PgType::Polygon,
+    PgType::Circle,
+];
+
+/// Geometric binary operators lower to `ScalarFn::Geo` calls, as
+/// `resolve_network_op` does for the inet operators. Returns `Ok(None)` when
 /// no geometric operand is present (so the generic path and its errors apply) or
 /// when the operator/operand-type combination has no geometric operator.
 fn resolve_geometric_op(
@@ -5343,25 +5355,23 @@ fn resolve_geometric_op(
     if !is_geo_ty(lt) && !is_geo_ty(rt) {
         return Ok(None);
     }
-    // An untyped literal first mirrors the other (geometric) side's type, which
-    // is what PG's "assume the unknown is the other operand's type" step does:
-    // `path <-> '(5,5)'` really does bind `path <-> path`, reading the literal as
-    // the one-point path `((5,5))`. Only when no operator exists for the mirrored
-    // combination does resolution fall back to the other candidate — every
-    // remaining geometric overload takes a `point` there (`path - point`,
-    // `path @> point`, `point <@ path`, ...).
-    for candidate in [lt.or(rt), Some(PgType::Point)] {
+    // Both sides typed: exactly one combination to try.
+    if lt.is_some() && rt.is_some() {
+        return resolve_geometric_combo(op, lb, rb, lt, rt);
+    }
+    // One side is an untyped literal. It first mirrors the other (geometric)
+    // side's type, which is what PG's "assume the unknown is the other operand's
+    // type" step does: `path <-> '(5,5)'` really does bind `path <-> path`,
+    // reading the literal as the one-point path `((5,5))`. If that combination
+    // has no operator, try the remaining geometric types — the overload may take
+    // any of them on the other side (`path @> point`, `line ## lseg`, ...), so
+    // hardcoding `point` as the only fallback would fail to bind operators that
+    // are implemented.
+    let mirrored = lt.or(rt);
+    for candidate in std::iter::once(mirrored).chain(GEO_TYPES.map(Some)) {
         let (left_ty, right_ty) = (lt.or(candidate), rt.or(candidate));
-        // Both operands must land on a geometric type for any of these operators.
-        if !is_geo_ty(left_ty) || !is_geo_ty(right_ty) {
-            continue;
-        }
         if let Some(bound) = resolve_geometric_combo(op, lb, rb, left_ty, right_ty)? {
             return Ok(Some(bound));
-        }
-        // Mirroring only had a second chance to offer if a side was untyped.
-        if lt.is_some() && rt.is_some() {
-            break;
         }
     }
     Ok(None)
@@ -5691,9 +5701,6 @@ fn resolve_geometric_combo(
         // same size compare equal; identity is `~=` above.
         B::Eq if combo == (PgType::Box, PgType::Box) => {
             call(geo(GeoFn::BoxEq), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::NotEq if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxNe), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
         }
         B::Lt if combo == (PgType::Box, PgType::Box) => {
             call(geo(GeoFn::BoxLt), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
