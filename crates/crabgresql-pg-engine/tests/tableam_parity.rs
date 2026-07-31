@@ -727,7 +727,7 @@ fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
     let hits: Vec<Tuple> = table
         .index_lookup("t_pkey", &[Value::Int4(2)], &read(&h.tm))
         .expect("the index serves the probe")
-        .map(|(_, t)| t)
+        .map(|row| row.expect("index probe failed").1)
         .collect();
     assert_eq!(hits, vec![vec![Value::Int4(2), Value::Text("b".into())]]);
 
@@ -743,7 +743,7 @@ fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
     let miss: Vec<Tuple> = table
         .index_lookup("t_pkey", &[Value::Int4(999)], &read(&h.tm))
         .expect("the index serves an absent key too")
-        .map(|(_, t)| t)
+        .map(|row| row.expect("index probe failed").1)
         .collect();
     assert!(miss.is_empty());
 
@@ -1067,24 +1067,28 @@ fn vacuum_reclaims_the_chunks_of_a_dead_row() -> anyhow::Result<()> {
 }
 
 #[test]
-fn a_committed_truncate_discards_the_chunk_store() -> anyhow::Result<()> {
+fn a_committed_truncate_empties_the_chunk_store_in_place() -> anyhow::Result<()> {
+    // The chunk store keeps its relfilenode across a TRUNCATE and is emptied
+    // instead. Swapping it would need a second relfilenode that no WAL record
+    // names and that the catalog only learns about at commit — so a crash in that
+    // window would leave a committed row pointing into a file the startup sweep
+    // unlinks. Emptying in place has no such window.
     let h = setup();
     let table = h.engine.create_table(schema("t"))?;
     insert_committed(&h.tm, &*table, vec![Value::Int4(1), big_text(80_000)]);
     let toast = h._dir.path().join("base").join("2");
     assert!(toast.exists(), "the chunk store should have been created");
+    assert!(relfile_len(&h, 2) > 0);
 
     let xid = h.tm.allocate_xid();
     table.truncate(&h.tm.context(xid, CommandId::FIRST))?;
     h.tm.commit(xid)?;
 
     assert_eq!(scan_rows(&*table, &read(&h.tm)).len(), 0);
-    assert!(
-        !toast.exists(),
-        "the empty post-truncate file points at nothing, so the old chunk store must go with it"
-    );
+    assert!(toast.exists(), "the chunk store keeps its relfilenode");
+    assert_eq!(relfile_len(&h, 2), 0, "but its space is reclaimed");
 
-    // The table works afterwards, on a chunk store created afresh.
+    // The table works afterwards, on the same chunk store.
     let big = big_text(90_000);
     insert_committed(&h.tm, &*table, vec![Value::Int4(2), big.clone()]);
     let rows = scan_rows(&*table, &read(&h.tm));
@@ -1095,27 +1099,59 @@ fn a_committed_truncate_discards_the_chunk_store() -> anyhow::Result<()> {
 #[test]
 fn a_rolled_back_truncate_keeps_the_chunk_store_and_its_values() -> anyhow::Result<()> {
     // The rollback restores the pre-truncate heap file, whose tuples point into
-    // the old chunk store — so that store must survive untouched, and anything
-    // the doomed transaction wrote out of line must not.
+    // the chunk store — so that store and everything in it must survive intact.
     let h = setup();
     let table = h.engine.create_table(schema("t"))?;
     let big = big_text(70_000);
     insert_committed(&h.tm, &*table, vec![Value::Int4(1), big.clone()]);
     let toast = h._dir.path().join("base").join("2");
-    let before = relfile_len(&h, 2);
 
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
     table.truncate(&txn)?;
-    // A big row written inside the doomed transaction goes to the staged store.
+    // A big row written inside the doomed transaction.
     table.insert(vec![Value::Int4(2), big_text(60_000)], &txn)?;
     h.tm.abort(xid);
 
-    assert!(toast.exists(), "the committed chunk store must survive a rollback");
-    assert_eq!(relfile_len(&h, 2), before, "it must be untouched");
+    assert!(toast.exists(), "the chunk store must survive a rollback");
     let rows = scan_rows(&*table, &read(&h.tm));
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1, vec![Value::Int4(1), big]);
+    Ok(())
+}
+
+#[test]
+fn vacuum_reclaims_the_chunks_of_a_rolled_back_insert() -> anyhow::Result<()> {
+    // A rolled-back wide INSERT leaves a tuple whose *inserter* aborted. Keying
+    // VACUUM's victim rule on `xmax` alone would never select it, so its whole
+    // out-of-line value would leak with no path to reclaim it — bounded before
+    // TOAST at one page-sized tuple, unbounded after.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    // 7000 bytes is four chunks, exactly one page, so reuse is observable
+    // without depending on block selection (there is no free space map).
+    let big = big_text(7_000);
+
+    let xid = h.tm.allocate_xid();
+    let txn = h.tm.context(xid, CommandId::FIRST);
+    table.insert(vec![Value::Int4(1), big.clone()], &txn)?;
+    h.tm.abort(xid);
+    assert_eq!(scan_rows(&*table, &read(&h.tm)).len(), 0);
+    let after_abort = relfile_len(&h, 2);
+    assert_eq!(after_abort, 8192, "the aborted value still occupies a page");
+
+    table.vacuum(h.tm.allocate_xid(), h.tm.clog());
+
+    // The reclaimed chunks are reused rather than the store being extended.
+    insert_committed(&h.tm, &*table, vec![Value::Int4(2), big.clone()]);
+    assert_eq!(
+        relfile_len(&h, 2),
+        after_abort,
+        "the aborted insert's chunks must be reclaimed, not leaked"
+    );
+    let rows = scan_rows(&*table, &read(&h.tm));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, vec![Value::Int4(2), big]);
     Ok(())
 }
 
@@ -1130,5 +1166,57 @@ fn drop_table_unlinks_the_chunk_store() -> anyhow::Result<()> {
 
     h.engine.drop_table("public", "t")?;
     assert!(!toast.exists(), "drop_table must unlink the chunk store too");
+    Ok(())
+}
+
+#[test]
+fn concurrent_first_wide_inserts_create_exactly_one_chunk_store() -> anyhow::Result<()> {
+    // Inserts hold only a shared table lock, so several can be inside
+    // `ensure_toast_rel` at once. Each store it creates is published to the
+    // catalog, which keeps one — so a second store would hold chunks the next
+    // startup's orphan sweep unlinks, permanently destroying the rows that
+    // toasted into it. Racing the *first* wide inserts into a fresh table is the
+    // window; a parallel bulk load hits it immediately.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|s| -> anyhow::Result<()> {
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let barrier = &barrier;
+            let table = &table;
+            let h = &h;
+            handles.push(s.spawn(move || -> anyhow::Result<()> {
+                let xid = h.tm.allocate_xid();
+                let txn = h.tm.context(xid, CommandId::FIRST);
+                // Line every writer up on the pre-creation read.
+                barrier.wait();
+                table.insert(vec![Value::Int4(i), big_text(50_000)], &txn)?;
+                h.tm.commit(xid)?;
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("insert worker panicked"))??;
+        }
+        Ok(())
+    })?;
+
+    // The heap is relfilenode 1; exactly one chunk store means exactly one more.
+    let mut files: Vec<String> = std::fs::read_dir(h._dir.path().join("base"))?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    files.sort();
+    assert_eq!(
+        files.len(),
+        2,
+        "every writer must share one chunk store, got {files:?}"
+    );
+    // And every value is intact and readable.
+    let rows = scan_rows(&*table, &read(&h.tm));
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|(_, t)| t[1] == big_text(50_000)));
     Ok(())
 }

@@ -202,7 +202,7 @@ fn temp_before_indexed_permanent_does_not_desync_index_tail() -> anyhow::Result<
     let rows: Vec<Value> = p2
         .index_lookup("p_idx", &[Value::Int4(2)], &read(&h2.tm))
         .expect("physical index should serve the probe")
-        .map(|(_, t)| t[1].clone())
+        .map(|row| row.expect("index probe failed").1[1].clone())
         .collect();
     assert_eq!(rows, vec![Value::Text("two".into())]);
     Ok(())
@@ -285,7 +285,7 @@ fn unlogged_index_is_physical_survives_clean_and_resets_on_crash() -> anyhow::Re
     let hit: Vec<Value> = u
         .index_lookup("u_idx", &[Value::Int4(2)], &read(&h2.tm))
         .expect("physical index after clean restart")
-        .map(|(_, t)| t[1].clone())
+        .map(|row| row.expect("index probe failed").1[1].clone())
         .collect();
     assert_eq!(hit, vec![Value::Text("two".into())]);
     drop(u);

@@ -1420,3 +1420,136 @@ fn a_corrupt_chunk_page_is_rejected_rather_than_silently_short() -> anyhow::Resu
     );
     Ok(())
 }
+
+/// Build a table with one toasted row, checkpoint it, then corrupt its chunk
+/// store — the shape every "a bad chunk page must not take the process down"
+/// test needs.
+fn table_with_a_corrupt_chunk_page(
+    dir: &std::path::Path,
+) -> anyhow::Result<(Arc<PgEngine>, TransactionManager)> {
+    {
+        let (engine, tm) = open(dir)?;
+        let table = engine.create_table(schema())?;
+        let xid = tm.allocate_xid();
+        let txn = tm.context(xid, CommandId::FIRST);
+        table.insert(vec![Value::Int4(1), big_text(50_000)], &txn)?;
+        tm.commit(xid)?;
+        // Flush so the chunk page carries a checksum, and so the bounded replay
+        // below never reads it.
+        engine.checkpoint(Xid::FIRST_NORMAL)?;
+    }
+    // The heap is relfilenode 1, so the chunk store is 2.
+    corrupt_page_byte(dir, RelFileNode(2), 0);
+    Ok(try_open(dir)?)
+}
+
+#[test]
+fn vacuum_reports_an_unreadable_chunk_store_instead_of_aborting() -> anyhow::Result<()> {
+    // VACUUM used to `panic!` here. Connection tasks have no `catch_unwind`, and
+    // this panic fired inside the buffer pool's frame guard, so a single bad page
+    // took the process down rather than one statement.
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = table_with_a_corrupt_chunk_page(dir.path())?;
+    let table = engine.open_table("t")?;
+    // Must return, not unwind. Vacuum reports nothing (the trait is infallible),
+    // so the assertion is that we get here at all — and that the engine is still
+    // usable afterwards.
+    table.vacuum(tm.allocate_xid(), &Clog::new());
+    let scanned = table
+        .scan(&read(&tm), &ColumnProjection::All)
+        .collect::<Result<Vec<_>, _>>();
+    assert!(scanned.is_err(), "the corrupt chain is still reported to readers");
+    Ok(())
+}
+
+#[test]
+fn create_index_reports_an_unreadable_chunk_store_instead_of_aborting() -> anyhow::Result<()> {
+    // Same panic, on the CREATE INDEX path: an index key over a toasted column
+    // has to be the value, so the build detoasts — and an unreadable store must
+    // fail the statement rather than the process.
+    let dir = tempfile::tempdir()?;
+    let (engine, _tm) = table_with_a_corrupt_chunk_page(dir.path())?;
+    let error = engine
+        .create_index(
+            "public",
+            "t",
+            crabgresql_storage_api::IndexMetadata {
+                name: "t_name_idx".to_string(),
+                method: crabgresql_storage_api::IndexMethod::BTree,
+                keys: vec![crabgresql_storage_api::IndexKey {
+                    column: 1,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: false,
+                nulls_distinct: true,
+                constraint: None,
+            },
+        )
+        .expect_err("a chunk store that cannot be read must fail CREATE INDEX");
+    // Either shape is right and both are recoverable: an unreadable page is
+    // `Io`, a chain that does not add up is `CorruptData`. What matters is that
+    // the statement fails rather than the process.
+    assert!(
+        matches!(
+            error,
+            crabgresql_storage_api::StorageError::Io(_)
+                | crabgresql_storage_api::StorageError::CorruptData(_)
+        ),
+        "expected a recoverable storage error, got {error:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_index_probe_surfaces_an_unreadable_chunk_store() -> anyhow::Result<()> {
+    // `index_lookup` used to drop a failed fetch on the floor, so an index scan
+    // silently returned fewer rows than a sequential scan of the same table —
+    // the same query answering differently depending on the chosen plan.
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(schema())?;
+        let xid = tm.allocate_xid();
+        let txn = tm.context(xid, CommandId::FIRST);
+        table.insert(vec![Value::Int4(1), big_text(50_000)], &txn)?;
+        tm.commit(xid)?;
+        engine.create_index(
+            "public",
+            "t",
+            crabgresql_storage_api::IndexMetadata {
+                name: "t_id_idx".to_string(),
+                method: crabgresql_storage_api::IndexMethod::BTree,
+                keys: vec![crabgresql_storage_api::IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: false,
+                nulls_distinct: true,
+                constraint: None,
+            },
+        )?;
+        engine.checkpoint(Xid::FIRST_NORMAL)?;
+    }
+    // The heap is 1 and the index is 2, so the chunk store — created before the
+    // index — is 2 and the index is 3. Corrupt the chunk store.
+    corrupt_page_byte(dir.path(), RelFileNode(2), 0);
+    let (engine, tm) = try_open(dir.path())?;
+    let table = engine.open_table("t")?;
+
+    let probe: Vec<_> = table
+        .index_lookup("t_id_idx", &[Value::Int4(1)], &read(&tm))
+        .expect("the index serves the probe")
+        .collect();
+    assert!(
+        probe.iter().any(|row| row.is_err()),
+        "the probe must report the unreadable value, not omit the row"
+    );
+    // And it agrees with the seq scan, which also errors.
+    let scanned = table
+        .scan(&read(&tm), &ColumnProjection::All)
+        .collect::<Result<Vec<_>, _>>();
+    assert!(scanned.is_err(), "a seq scan errors on the same table");
+    Ok(())
+}

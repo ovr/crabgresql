@@ -58,11 +58,15 @@ SELECT id, f1 FROM toasttest WHERE id = 1;
 -- relation outside the projection path.
 SELECT length(f1), count(*) FROM toasttest WHERE f1 IS NOT NULL GROUP BY length(f1) ORDER BY length(f1);
 SELECT id FROM toasttest ORDER BY f1 NULLS LAST LIMIT 3;
--- A rolled-back wide insert leaves nothing behind.
+-- A rolled-back wide insert leaves nothing behind, and VACUUM reclaims what it
+-- wrote out of line -- a tuple whose inserter aborted is a vacuum victim too,
+-- or a rolled-back wide INSERT would strand its whole value.
 BEGIN;
 INSERT INTO toasttest VALUES (8, repeat('r', 70000));
 SELECT count(*) FROM toasttest WHERE id = 8;
 ROLLBACK;
+SELECT count(*) FROM toasttest WHERE id = 8;
+VACUUM toasttest;
 SELECT count(*) FROM toasttest WHERE id = 8;
 -- DELETE then VACUUM reclaims the chunks; the survivors are untouched.
 DELETE FROM toasttest WHERE id = 5;
@@ -81,11 +85,23 @@ SELECT n.nspname, t.relkind, t.relnatts FROM pg_class c
  WHERE c.relname = 'toasttest';
 SELECT count(*) AS dangling FROM pg_class c WHERE c.reltoastrelid <> 0
    AND NOT EXISTS (SELECT 1 FROM pg_class t WHERE t.oid = c.reltoastrelid);
--- TRUNCATE takes the chunks with the rows that named them.
+-- TRUNCATE takes the chunks with the rows that named them. The chunk store keeps
+-- its relfilenode and is emptied in place, so nothing here changes identity.
 TRUNCATE toastwide;
 SELECT count(*) FROM toastwide;
 INSERT INTO toastwide VALUES (2, repeat('p', 30000), repeat('q', 30000));
 SELECT id, length(a), length(b) FROM toastwide;
+-- Many medium-width columns: each is too narrow to be worth externalizing on its
+-- own, but the row does not fit otherwise -- so they are moved out anyway rather
+-- than the row being refused, which is what PostgreSQL does.
+CREATE TABLE toastmedium (a text, b text, c text, d text, e text, f text, g text,
+                          h text, i text, j text, k text, l text);
+INSERT INTO toastmedium SELECT repeat('m', 700), repeat('m', 700), repeat('m', 700),
+       repeat('m', 700), repeat('m', 700), repeat('m', 700), repeat('m', 700),
+       repeat('m', 700), repeat('m', 700), repeat('m', 700), repeat('m', 700),
+       repeat('m', 700);
+SELECT length(a), length(l), md5(a) = md5(repeat('m', 700)) AS intact FROM toastmedium;
+DROP TABLE toastmedium;
 -- A row of fixed-width columns cannot be shrunk by moving anything out of line,
 -- so it is refused -- and the session survives to run the next statement.
 CREATE TABLE toastfixed (a name, b name, c name, d name, e name, f name, g name, h name,

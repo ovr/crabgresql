@@ -595,34 +595,18 @@ impl RelCatalog {
         self.persist(&state)
     }
 
-    /// Record that `table` has no chunk store — what a committed TRUNCATE leaves
-    /// behind, since the empty file it swaps in points at nothing.
+    /// Each `Unlogged` relation's `(heap relfilenode, physical index relfilenodes,
+    /// chunk store)`. The startup crash-reset
+    /// (`PgEngine::reset_unlogged_relations`) empties these files, since their
+    /// WAL-skipped pages were never protected against a torn crash.
     ///
-    /// A no-op when none was recorded, so the common TRUNCATE of a table that
-    /// never toasted anything costs no catalog rewrite.
-    pub fn clear_toast_rel(&self, namespace: &str, table: &str) -> std::io::Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let Some(r) = state
-            .rels
-            .iter_mut()
-            .find(|r| r.namespace == namespace && r.name == table)
-        else {
-            return Ok(());
-        };
-        if r.toast_rel == 0 {
-            return Ok(());
-        }
-        r.toast_rel = 0;
-        self.persist(&state)
-    }
-
-    /// Each `Unlogged` relation's `(heap relfilenode, physical index relfilenodes)`.
-    /// The startup crash-reset (`PgEngine::reset_unlogged_relations`) empties these
-    /// files, since their WAL-skipped pages were never protected against a torn crash.
-    pub fn unlogged_relfilenodes(&self) -> Vec<(RelFileNode, Vec<RelFileNode>)> {
+    /// The chunk store is a separate element rather than one more entry in the
+    /// index list: the caller re-initializes each index as a B-tree, which a plain
+    /// heap file must not be subjected to.
+    #[allow(clippy::type_complexity)]
+    pub fn unlogged_relfilenodes(
+        &self,
+    ) -> Vec<(RelFileNode, Vec<RelFileNode>, Option<RelFileNode>)> {
         let state = self
             .state
             .lock()
@@ -632,19 +616,18 @@ impl RelCatalog {
             .iter()
             .filter(|r| r.persistence.is_unlogged())
             .map(|r| {
-                // The chunk store rides along: its pages are WAL-skipped for the
-                // same reason the heap's are, so a crash leaves it just as
-                // untrustworthy and it must be emptied with the rows that named
-                // its chunks.
                 let indexes = r
                     .indexes
                     .iter()
                     .map(|i| i.rel)
-                    .chain(std::iter::once(r.toast_rel))
                     .filter(|&rel| rel != 0)
                     .map(RelFileNode)
                     .collect();
-                (RelFileNode(r.rel), indexes)
+                // The chunk store is WAL-skipped for the same reason the heap is,
+                // so a crash leaves it just as untrustworthy: it must be emptied
+                // alongside the rows that named its chunks.
+                let toast = (r.toast_rel != 0).then_some(RelFileNode(r.toast_rel));
+                (RelFileNode(r.rel), indexes, toast)
             })
             .collect()
     }

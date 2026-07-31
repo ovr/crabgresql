@@ -50,7 +50,7 @@ use crabgresql_parquet_engine::{
     BufferedParquetTable, ParquetRedo, ParquetTable, RMGR_PARQUET, validate_schema,
 };
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, IndexMetadata, RelStats, RelationMetadata,
+    ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelStats, RelationMetadata,
     RelfilenodeAllocator, SequenceAdvance, SequenceDefinition, StorageError, TableAccessMethod,
     TableAm, TableCapabilities, TableEngine, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
     ViewDefinition,
@@ -229,7 +229,7 @@ impl TableAm for ManagedTable {
         index_name: &str,
         key: &[Value],
         txn: &TxnContext,
-    ) -> Option<Box<dyn Iterator<Item = (Tid, Tuple)> + Send>> {
+    ) -> Option<IndexProbe> {
         self.as_am().index_lookup(index_name, key, txn)
     }
 
@@ -907,13 +907,21 @@ impl PgEngine {
     /// inserts are needed. All WAL-silent — this is a startup-time bulk reset.
     pub fn reset_unlogged_relations(&self) -> std::io::Result<()> {
         let smgr = self.inner.bufpool.smgr();
-        for (heap_rel, index_rels) in self.catalog.unlogged_relfilenodes() {
+        for (heap_rel, index_rels, toast_rel) in self.catalog.unlogged_relfilenodes() {
             self.inner.bufpool.forget_relation(heap_rel);
             smgr.truncate(heap_rel)?;
             for irel in index_rels {
                 self.inner.bufpool.forget_relation(irel);
                 smgr.truncate(irel)?;
                 BTree::open(Arc::clone(&self.inner), irel, Arc::new(RwLock::new(())), true).create();
+            }
+            // A chunk store is a plain heap file: it wants emptying, never the
+            // B-tree initialization the index files above get. Conflating the two
+            // would leave a metapage at block 0 that the next chunk write appends
+            // onto.
+            if let Some(toast_rel) = toast_rel {
+                self.inner.bufpool.forget_relation(toast_rel);
+                smgr.truncate(toast_rel)?;
             }
         }
         Ok(())
@@ -1194,23 +1202,15 @@ impl TxnFinalize for PgEngine {
                 // strand the lock and wedge the table for the process lifetime).
                 // The lock is held across the persist so a concurrent TRUNCATE that
                 // commits can't have its catalog write clobbered by a stale one.
-                if let Some((old, old_toast, owner)) = t.commit_truncate(xid) {
+                if let Some((old, owner)) = t.commit_truncate(xid) {
                     // The commit is already durable in the WAL, so a catalog persist
                     // failure is not fatal — recovery re-applies the swap from the
                     // WAL at the next boot; log and continue rather than panic. (A
                     // memory/temp table writes no WAL and its catalog row is not
                     // persisted, so the swap only updates in-memory state.)
-                    // Record the chunk store the swap published *before* the heap
-                    // swap, so the catalog never names a heap file whose chunk
-                    // store it has not yet recorded — the direction that would let
-                    // the startup sweep unlink a store the new file points into.
-                    let toast_persisted = match t.toast_relfilenode() {
-                        Some(rel) => self.catalog.set_toast_rel(&namespace, &name, rel),
-                        // Truncated back to no chunk store at all.
-                        None => self.catalog.clear_toast_rel(&namespace, &name),
-                    };
-                    if let Err(e) = toast_persisted
-                        .and_then(|()| self.catalog.swap_relfilenode(&namespace, &name, t.relfilenode()))
+                    if let Err(e) =
+                        self.catalog
+                            .swap_relfilenode(&namespace, &name, t.relfilenode())
                     {
                         tracing::error!(
                             table = %name,
@@ -1226,11 +1226,10 @@ impl TxnFinalize for PgEngine {
                         t.truncate_reconciled();
                     }
                     self.inner.discard_relfile(old);
-                    // The new heap file is empty, so nothing points into the old
-                    // chunk store any more.
-                    if old_toast.0 != 0 {
-                        self.inner.discard_relfile(old_toast);
-                    }
+                    // The chunk store keeps its relfilenode, so nothing has to be
+                    // recorded or unlinked for it — only emptied, and only when
+                    // that is safe.
+                    t.reclaim_toast_after_truncate();
                     t.release_truncate_lock(owner);
                 }
             }
@@ -1288,15 +1287,9 @@ impl TxnFinalize for PgEngine {
             if let Some(t) = handles
                 .get(&(namespace.clone(), name.clone()))
                 .and_then(|table| table.as_heap())
-                && let Some((new, new_toast, owner)) = t.abort_truncate(xid)
+                && let Some((new, owner)) = t.abort_truncate(xid)
             {
                 self.inner.discard_relfile(new);
-                // Anything the rolled-back transaction stored out of line went to
-                // the staged chunk store, so it goes away with the staged heap
-                // file. The committed store is untouched.
-                if new_toast.0 != 0 {
-                    self.inner.discard_relfile(new_toast);
-                }
                 t.release_truncate_lock(owner);
             }
         }
@@ -1719,7 +1712,7 @@ impl TableEngine for PgEngine {
         // before the catalog write leaves only an orphan file, which the startup
         // GC reclaims (it is not yet in the catalog's live set).
         match target.as_ref() {
-            ManagedTable::Heap(heap) => heap.build_index(index.clone(), index_rel),
+            ManagedTable::Heap(heap) => heap.build_index(index.clone(), index_rel)?,
             ManagedTable::Parquet(parquet) => parquet.add_index(index.clone()),
             ManagedTable::Buffer(buffer) => buffer.add_index(index.clone()),
         }

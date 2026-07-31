@@ -56,7 +56,7 @@ fn probe_ids(table: &dyn TableAm, txn: &TxnContext, key: i32) -> Vec<i32> {
     let mut v: Vec<i32> = table
         .index_lookup("t_id_idx", &[Value::Int4(key)], txn)
         .expect("index serves the probe")
-        .map(|(_, t)| match &t[0] {
+        .map(|row| match &row.expect("index probe failed").1[0] {
             Value::Int4(x) => *x,
             other => panic!("unexpected id value {other:?}"),
         })

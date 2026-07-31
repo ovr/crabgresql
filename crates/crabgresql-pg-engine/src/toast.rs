@@ -38,6 +38,19 @@
 //! Both are contained by the pointer's `format` byte: a future `chunk_id`
 //! layout is a new format value, and old pointers keep decoding.
 //!
+//! # The relfilenode never changes
+//!
+//! A table's chunk store keeps its relfilenode for the table's whole life. It is
+//! created lazily, on the first row that needs it, and from then on the durable
+//! catalog always names it — which is what makes the startup orphan sweep safe.
+//!
+//! That is why TRUNCATE *empties* the store rather than swapping it the way it
+//! swaps the heap file: a second relfilenode would be named by no WAL record and
+//! would reach the catalog only at commit, so a crash in that window would leave
+//! a committed row pointing into a file the sweep unlinks. Creation is serialized
+//! for the same reason — two writers each publishing a store would leave one of
+//! them unnamed, and unnamed means swept.
+//!
 //! # A chunk is an ordinary on-page tuple
 //!
 //! Chunks reuse [`crate::tuple`]'s 36-byte header verbatim, with `natts = 0` and
@@ -139,10 +152,20 @@ pub fn corrupt_chain(p: &ToastPointer, got: usize) -> StorageError {
 /// equivalent knob `TOAST_TUPLE_TARGET`.
 pub const TOAST_TUPLE_TARGET: usize = 2000;
 
-/// Below this width, moving an attribute out of line cannot pay for itself: it
-/// would trade `width` inline bytes for [`POINTER_LEN`] inline bytes plus a
-/// whole chunk item in another relation.
+/// Below this width, moving an attribute out of line does not pay for itself: it
+/// trades `width` inline bytes for [`POINTER_LEN`] inline bytes plus a whole
+/// chunk item in another relation.
+///
+/// A *preference*, not a limit. If honouring it would leave the row too big to
+/// store, [`plan`] drops to [`ABSOLUTE_MIN_TOAST_WIDTH`] and keeps going —
+/// otherwise a row of many medium-width attributes would be refused where
+/// PostgreSQL, which has no such floor, stores it.
 const MIN_TOAST_WIDTH: usize = POINTER_LEN + 128;
+
+/// The floor [`plan`] falls back to when the preferred one cannot make the row
+/// fit. Anything at or below the pointer's own width frees no space at all, so
+/// this is the point past which externalizing is genuinely pointless.
+const ABSOLUTE_MIN_TOAST_WIDTH: usize = POINTER_LEN + 1;
 
 /// Choose which attributes to store out of line.
 ///
@@ -166,7 +189,32 @@ pub fn plan(
     if full <= target {
         return Ok(Vec::new());
     }
-    let mut chosen = Vec::new();
+    // First pass at the preferred floor. If the row still does not fit, retry
+    // taking anything wider than the pointer that replaces it: a row PostgreSQL
+    // can store must not be refused just because our heuristic would rather not
+    // externalize something small.
+    let chosen = choose(widths, toastable, full, target, MIN_TOAST_WIDTH);
+    if base + remaining(widths, &chosen) <= max {
+        return Ok(chosen);
+    }
+    let chosen = choose(widths, toastable, full, target, ABSOLUTE_MIN_TOAST_WIDTH);
+    let total = base + remaining(widths, &chosen);
+    if total > max {
+        return Err(StorageError::RowTooBig { size: full, max });
+    }
+    Ok(chosen)
+}
+
+/// Attributes to externalize, widest first, taking only those at least `floor`
+/// bytes wide, until the tuple would fit `target`.
+fn choose(
+    widths: &[usize],
+    toastable: &[bool],
+    full: usize,
+    target: usize,
+    floor: usize,
+) -> Vec<usize> {
+    let mut chosen: Vec<usize> = Vec::new();
     let mut total = full;
     while total > target {
         // Widest eligible attribute; ties break on the lowest attribute number so
@@ -174,16 +222,22 @@ pub fn plan(
         let next = widths
             .iter()
             .enumerate()
-            .filter(|&(i, &w)| toastable[i] && w >= MIN_TOAST_WIDTH && !chosen.contains(&i))
+            .filter(|&(i, &w)| toastable[i] && w >= floor && !chosen.contains(&i))
             .max_by_key(|&(i, &w)| (w, std::cmp::Reverse(i)));
         let Some((i, &w)) = next else { break };
         chosen.push(i);
         total = total - w + POINTER_LEN;
     }
-    if total > max {
-        return Err(StorageError::RowTooBig { size: full, max });
-    }
-    Ok(chosen)
+    chosen
+}
+
+/// The inline bytes the attributes occupy once `chosen` are replaced by pointers.
+fn remaining(widths: &[usize], chosen: &[usize]) -> usize {
+    widths
+        .iter()
+        .enumerate()
+        .map(|(i, &w)| if chosen.contains(&i) { POINTER_LEN } else { w })
+        .sum()
 }
 
 #[cfg(test)]
@@ -307,15 +361,28 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_attribute_is_not_moved_out_to_no_purpose() {
-        // Many attributes just over the pointer width: moving one saves a handful
-        // of bytes and costs a whole chunk item, so none is eligible and the row
-        // is refused rather than shredded.
-        let widths = vec![20usize; 500];
-        let toastable = vec![true; 500];
-        assert!(matches!(
-            plan_at(&widths, &toastable, 36),
-            Err(StorageError::RowTooBig { .. })
-        ));
+    fn a_narrow_attribute_is_left_alone_when_the_row_already_fits() {
+        // Just over the target but under `max`: the preferred floor declines to
+        // shred the row into 60 chunks for no benefit, and nothing is moved.
+        let widths = vec![20usize; 120];
+        let toastable = vec![true; 120];
+        assert_eq!(plan_at(&widths, &toastable, 36).expect("fits"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn medium_attributes_are_externalized_rather_than_refusing_the_row() {
+        // 100 attributes of 135 bytes each is 13536 bytes — over `max`, and every
+        // attribute is under the preferred 144-byte floor. PostgreSQL has no such
+        // floor and stores this row, so the fallback pass must too.
+        let widths = vec![135usize; 100];
+        let toastable = vec![true; 100];
+        let chosen = plan_at(&widths, &toastable, 36).expect("must not refuse a storable row");
+        assert!(!chosen.is_empty());
+        let inline: usize = 36 + widths
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| if chosen.contains(&i) { POINTER_LEN } else { w })
+            .sum::<usize>();
+        assert!(inline <= 8160, "the row must end up storable, got {inline}");
     }
 }

@@ -18,6 +18,12 @@ pub use crabgresql_txn as txn;
 mod stats;
 pub use stats::{ColStats, RelStats};
 
+/// The rows an index probe yields: `(tid, tuple)` per match, or the error that
+/// stopped the probe. Fallible because a value may live out of line, and a read
+/// that cannot reassemble it must reach the caller rather than silently yield
+/// one row fewer than a sequential scan of the same table.
+pub type IndexProbe = Box<dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send>;
+
 /// A materialized row. Always as wide as the table schema, with column order
 /// matching it. A scan restricted by a [`ColumnProjection`] still returns a
 /// full-width tuple; only the values at unselected positions are unspecified.
@@ -566,6 +572,10 @@ pub enum StorageError {
     /// otherwise-empty page can hold.
     #[error("row is too big: size {size}, maximum size {max}")]
     RowTooBig { size: usize, max: usize },
+    /// A single value too large to store, independent of the row it sits in.
+    /// PostgreSQL caps a varlena at 1 GB and reports `54000` for it too.
+    #[error("value is too large: size {size}, maximum size {max}")]
+    ValueTooBig { size: usize, max: usize },
 }
 
 /// Outcome of `TableAm::update`.
@@ -823,7 +833,7 @@ pub trait TableAm: Send + Sync {
         _index_name: &str,
         _key: &[Value],
         _txn: &TxnContext,
-    ) -> Option<Box<dyn Iterator<Item = (Tid, Tuple)> + Send>> {
+    ) -> Option<IndexProbe> {
         None
     }
 

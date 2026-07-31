@@ -189,7 +189,12 @@ pub struct RawTuple {
 /// never touches another relation. Reassembling the chunks — which does — is
 /// [`RawTuple::resolve`]'s job, deliberately split out so the lock is released
 /// first.
-pub fn decode_raw(buf: &[u8]) -> RawTuple {
+///
+/// Returns [`StorageError::CorruptData`] rather than panicking on a malformed
+/// pointer. Panicking here would fire *inside* the buffer pool's frame guard,
+/// poisoning it and taking every later page fault down with it — so one bad page
+/// would stop the process rather than one query.
+pub fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
     let head = decode_header(buf);
     // The header is decoded again here rather than passed in: callers run the
     // visibility check on `decode_header` alone, so an invisible tuple never
@@ -206,7 +211,9 @@ pub fn decode_raw(buf: &[u8]) -> RawTuple {
             vals.push(Value::Null);
         } else if head.has_external && buf.get(pos) == Some(&T_EXTERNAL) {
             let Some(p) = toast::decode_pointer(buf, &mut pos) else {
-                panic!("corrupt toast pointer in attribute {i}");
+                return Err(StorageError::CorruptData(format!(
+                    "unreadable out-of-line pointer in attribute {i}"
+                )));
             };
             external.push((i, p));
             // A placeholder until `resolve` fills it in. Never observable: the
@@ -217,7 +224,7 @@ pub fn decode_raw(buf: &[u8]) -> RawTuple {
             vals.push(decode_datum(buf, &mut pos));
         }
     }
-    RawTuple { vals, external }
+    Ok(RawTuple { vals, external })
 }
 
 impl RawTuple {
@@ -269,13 +276,17 @@ pub fn encode_chunk(payload: &[u8], hdr: &TupleHeader, next: Tid) -> Vec<u8> {
     buf
 }
 
-/// Read a toast chunk: its chain link and its payload.
-pub fn decode_chunk(buf: &[u8]) -> (Tid, &[u8]) {
+/// Read a toast chunk: its chain link and its payload. `None` if the item is too
+/// short to be a chunk — corruption, which the caller reports rather than
+/// indexing past the end (this runs inside a page guard, where a panic would
+/// poison the frame).
+pub fn decode_chunk(buf: &[u8]) -> Option<(Tid, &[u8])> {
+    let payload = buf.get(TUPLE_HEADER_LEN..)?;
     let next = Tid {
         block: rd_u32(buf, OFF_CTID_BLOCK),
         offset: rd_u16(buf, OFF_CTID_OFF),
     };
-    (next, &buf[TUPLE_HEADER_LEN..])
+    Some((next, payload))
 }
 
 /// Stamp a delete onto an existing on-page tuple in place (same length): set the
@@ -302,7 +313,7 @@ mod tests {
     /// Decode a tuple that has nothing stored out of line.
     fn decode_inline(buf: &[u8]) -> (OnPageHeader, Tuple) {
         let head = decode_header(buf);
-        let raw = decode_raw(buf);
+        let raw = decode_raw(buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert!(raw.external().is_empty(), "expected no external attributes");
         let vals = raw
             .resolve(|_| unreachable!("no external attributes to detoast"))
@@ -362,7 +373,7 @@ mod tests {
             ctid,
         );
         let head = decode_header(&buf);
-        let raw = decode_raw(&buf);
+        let raw = decode_raw(&buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert!(head.has_external);
         assert_eq!(head.natts, 3);
         assert_eq!(raw.external(), &[(1, p)]);
@@ -401,7 +412,7 @@ mod tests {
             ctid,
         );
         let head = decode_header(&buf);
-        let raw = decode_raw(&buf);
+        let raw = decode_raw(&buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert!(head.has_null && head.has_external);
         assert_eq!(raw.external(), &[(1, p)]);
         let vals = raw
@@ -445,7 +456,7 @@ mod tests {
             },
         );
         let head = decode_header(&buf);
-        let raw = decode_raw(&buf);
+        let raw = decode_raw(&buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert_eq!(head.hdr.xmax, Xid(8));
         assert!(head.has_external);
         assert_eq!(raw.external(), &[(0, p)]);

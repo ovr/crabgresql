@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, IndexMetadata, RelStats, StorageError, TableAm, TableSchema,
-    Tid, Tuple, TupleStream, UpdateResult,
+    ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelStats, StorageError, TableAm,
+    TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, XactStatus, Xid,
@@ -39,20 +39,45 @@ use crate::tuple::{self, TUPLE_HEADER_LEN};
 /// rejects.
 const MAX_TUPLE: usize = crate::page::BLCKSZ - PAGE_HEADER_LEN - 8;
 
+/// Largest encoded datum that may be stored out of line. PostgreSQL caps a
+/// varlena at 1 GB and reports `invalid memory alloc request size`; the cap here
+/// exists for the same reason plus one of our own — a
+/// [`toast::ToastPointer`]'s `rawsize` is a `u32` and is what terminates the
+/// chain walk, so a value past 4 GiB would wrap and read back silently short.
+const MAX_TOASTED_VALUE: usize = 1024 * 1024 * 1024;
+
+/// The self-ctid a tuple carries until [`HeapTable::place_item`] patches it to
+/// the tid it actually landed on.
+const PLACEHOLDER_TID: Tid = Tid {
+    block: 0,
+    offset: 0,
+};
+
 /// An uncommitted relfilenode-swap TRUNCATE staged by one transaction. Because a
 /// TRUNCATE holds the table exclusively until it commits, at most one can exist
 /// on a table at a time — hence a single `Option`, not a map.
 struct PendingTruncate {
     xid: Xid,
     new_rel: u32,
-    /// The empty chunk store staged alongside `new_rel`, or `0` when the table
-    /// had none to replace. Staged rather than reset-to-lazy so the truncating
-    /// transaction's own oversized inserts go somewhere that a rollback can
-    /// throw away wholesale.
-    new_toast: u32,
     /// The lock owner that holds the table's exclusive lock — needed to release
     /// it from the commit/abort hook, which only receives the XID.
     owner: LockOwner,
+}
+
+/// What [`HeapTable::plan_tuple`] decided, before anything is written.
+///
+/// Splitting the decision from the writing is what lets `update` do both of the
+/// things it needs: reject an oversized row *before* stamping the old version
+/// deleted, and write chunks only *after* winning the race for it.
+enum Planned {
+    /// Fits inline; these are the final bytes.
+    Inline(Vec<u8>),
+    /// Needs out-of-line storage for the listed attributes, whose encoded datums
+    /// are carried so they are not encoded a third time.
+    Toast {
+        chosen: Vec<usize>,
+        encoded: Vec<Vec<u8>>,
+    },
 }
 
 pub struct HeapTable {
@@ -100,6 +125,13 @@ pub struct HeapTable {
     /// Insert hint for `toast_rel`, kept apart from `insert_hint` so chunk writes
     /// and heap writes do not knock each other back to a full block.
     toast_hint: AtomicU32,
+    /// Serializes chunk-store creation. Inserts hold only a *shared* table lock,
+    /// so without this two concurrent first-time toasting writers each allocate a
+    /// relfilenode and each persist it: the catalog keeps one, and the next
+    /// startup's orphan sweep unlinks the other — permanently destroying the rows
+    /// that toasted into it. Held across the whole allocate → create → persist →
+    /// publish sequence, which is short and runs at most once per table.
+    toast_create: std::sync::Mutex<()>,
     indexes: RwLock<Vec<IndexEntry>>,
     /// Whether this relation's mutations skip the WAL (`Unlogged`/`Temporary`).
     /// Cached from `schema.persistence` at construction. Note this is the WAL axis
@@ -160,6 +192,7 @@ impl HeapTable {
             insert_hint: AtomicU32::new(0),
             toast_rel: AtomicU32::new(toast.0),
             toast_hint: AtomicU32::new(0),
+            toast_create: std::sync::Mutex::new(()),
             indexes: RwLock::new(indexes),
             wal_skipped,
             analyzed: RwLock::new(None),
@@ -280,13 +313,20 @@ impl HeapTable {
         btkey::keys_indexable(&self.schema, &index.keys)
     }
 
-    pub fn build_index(&self, meta: IndexMetadata, rel: RelFileNode) {
+    /// `Err` when a row's out-of-line value cannot be read: CREATE INDEX is an
+    /// ordinary user command, so an unreadable chunk store must fail the statement
+    /// rather than the process.
+    pub fn build_index(
+        &self,
+        meta: IndexMetadata,
+        rel: RelFileNode,
+    ) -> Result<(), StorageError> {
         // A metadata-only index (relfilenode 0) has no physical B-tree to build;
         // just publish it. `rel == 0` is the single canonical encoding of
         // metadata-only (create_index allocates a relfilenode only when physical).
         if rel.0 == 0 {
             self.add_index(meta, rel);
-            return;
+            return Ok(());
         }
         // Exclude sessions AND vacuum (which runs as INTERNAL) during the build,
         // via an RAII guard so a panic mid-build cannot leak the exclusive hold.
@@ -306,7 +346,7 @@ impl HeapTable {
         let nblocks = Self::io(smgr.nblocks(heap_rel));
         for block in 0..nblocks {
             let page = Self::io(self.engine.bufpool.pin(heap_rel, block));
-            let rows: Vec<(Tid, tuple::RawTuple)> = page.read(|pg| {
+            let rows: Vec<(Tid, Result<tuple::RawTuple, StorageError>)> = page.read(|pg| {
                 let mut out = Vec::new();
                 for off in 1..=page::max_offset(pg) {
                     if let Some(bytes) = page::get_item(pg, off) {
@@ -318,10 +358,10 @@ impl HeapTable {
             for (tid, raw) in rows {
                 // An index key over a toasted column has to be the value itself,
                 // never the pointer standing in for it — so detoast, outside the
-                // page's frame lock.
-                let Ok(tuple) = raw.resolve(|p| detoast(&self.engine, p)) else {
-                    panic!("failed to detoast a row while building an index");
-                };
+                // page's frame lock. A chunk store that cannot be read fails the
+                // statement; it must not take the process down, since CREATE INDEX
+                // is an ordinary user command.
+                let tuple = raw.and_then(|raw| raw.resolve(|p| detoast(&self.engine, p)))?;
                 if let Some(key) = btkey::encode_row(&self.schema, &cols, &tuple) {
                     btree.insert(&key, tid);
                 }
@@ -341,6 +381,7 @@ impl HeapTable {
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .push(IndexEntry { meta, rel, latch });
         // `_guard` releases the exclusive hold here (or on an unwinding panic).
+        Ok(())
     }
 
     /// Add a `key -> tid` entry to every physical index for a newly placed
@@ -379,46 +420,20 @@ impl HeapTable {
         RelFileNode(self.live_rel.load(Ordering::Relaxed))
     }
 
-    /// The chunk store `xid` should write to: the staged one if `xid` is the
-    /// truncating transaction, else the committed one. `RelFileNode(0)` means
-    /// none exists yet and [`HeapTable::ensure_toast_rel`] must create it.
-    ///
-    /// Reads do not go through here — a [`toast::ToastPointer`] carries the
-    /// relfilenode it was written to, so a tuple in the pre-truncate file resolves
-    /// against the old chunk store no matter which one the table currently names.
-    fn effective_toast_rel(&self, xid: Xid) -> RelFileNode {
-        if self.has_pending.load(Ordering::Acquire)
-            && let Some(p) = self
-                .pending
-                .read()
-                .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .as_ref()
-            && p.xid == xid
-        {
-            return RelFileNode(p.new_toast);
-        }
-        RelFileNode(self.toast_rel.load(Ordering::Acquire))
-    }
-
     /// Commit a staged TRUNCATE: the new file becomes the committed one. Returns
-    /// the old heap relfilenode and old chunk store to unlink and the lock owner
-    /// to release, or `None` if nothing was pending for `xid`.
-    pub(crate) fn commit_truncate(
-        &self,
-        xid: Xid,
-    ) -> Option<(RelFileNode, RelFileNode, LockOwner)> {
+    /// the old heap relfilenode to unlink and the lock owner to release, or
+    /// `None` if nothing was pending for `xid`.
+    ///
+    /// The chunk store keeps its relfilenode across a TRUNCATE — see
+    /// [`HeapTable::reclaim_toast_after_truncate`] for why the space is reclaimed
+    /// by emptying that file rather than by swapping it.
+    pub(crate) fn commit_truncate(&self, xid: Xid) -> Option<(RelFileNode, LockOwner)> {
         let mut pending = self
             .pending
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let p = pending.take_if(|p| p.xid == xid)?;
         let old = self.live_rel.swap(p.new_rel, Ordering::Relaxed);
-        // The new heap file is empty, so nothing points into the old chunk store
-        // any more and it can go with it. Safe because TRUNCATE holds the table
-        // exclusively until this moment: no other transaction can be reading the
-        // file whose tuples named those chunks.
-        let old_toast = self.toast_rel.swap(p.new_toast, Ordering::Release);
-        self.toast_hint.store(0, Ordering::Relaxed);
         self.has_pending.store(false, Ordering::Release);
         // `truncate_unreconciled` is deliberately NOT cleared here. The swap is
         // only in memory at this point; it becomes durable when the caller's
@@ -434,16 +449,53 @@ impl HeapTable {
             .analyzed
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned")) = None;
-        Some((RelFileNode(old), RelFileNode(old_toast), p.owner))
+        Some((RelFileNode(old), p.owner))
     }
 
-    /// Discard a staged TRUNCATE on abort: the new files are dropped, the
-    /// committed ones stay. Returns the staged heap relfilenode and chunk store to
-    /// unlink and the lock owner to release, or `None`.
-    pub(crate) fn abort_truncate(
-        &self,
-        xid: Xid,
-    ) -> Option<(RelFileNode, RelFileNode, LockOwner)> {
+    /// Empty the chunk store after a committed TRUNCATE, if it is safe to.
+    ///
+    /// The store keeps its relfilenode rather than being swapped like the heap
+    /// file. Swapping it would need a second relfilenode that no WAL record names
+    /// and that the durable catalog only learns about at commit — so a crash in
+    /// that window would leave a committed row pointing into a file the startup
+    /// orphan sweep unlinks. Emptying in place needs neither: the relfilenode
+    /// never changes, so the catalog is always right.
+    ///
+    /// Only safe when the post-truncate heap file is empty, which is the ordinary
+    /// `TRUNCATE t;` case. A transaction that truncates and then inserts in the
+    /// same breath has live tuples pointing into this store, so its space is
+    /// carried over instead — a bounded leak that the next TRUNCATE reclaims.
+    ///
+    /// Runs after commit, so nothing can still reference the old chunks: TRUNCATE
+    /// held the table exclusively until this moment.
+    pub(crate) fn reclaim_toast_after_truncate(&self) {
+        let Some(toast) = self.toast_relfilenode() else {
+            return;
+        };
+        let smgr = self.engine.bufpool.smgr();
+        let heap_empty = matches!(smgr.nblocks(self.relfilenode()), Ok(0));
+        if !heap_empty {
+            return;
+        }
+        self.engine.bufpool.forget_relation(toast);
+        if let Err(error) = smgr.truncate(toast) {
+            // Advisory: failing to reclaim leaves unreferenced chunks, never
+            // unreadable ones, so it must not fail the commit.
+            tracing::warn!(
+                table = %self.schema.name,
+                %error,
+                "TRUNCATE: could not empty the chunk store; its space is retained"
+            );
+            return;
+        }
+        self.toast_hint.store(0, Ordering::Relaxed);
+    }
+
+    /// Discard a staged TRUNCATE on abort: the new file is dropped, the committed
+    /// one stays. Returns the staged heap relfilenode to unlink and the lock owner
+    /// to release, or `None`. The chunk store is untouched by a TRUNCATE until it
+    /// commits, so there is nothing to undo there.
+    pub(crate) fn abort_truncate(&self, xid: Xid) -> Option<(RelFileNode, LockOwner)> {
         let mut pending = self
             .pending
             .write()
@@ -452,7 +504,7 @@ impl HeapTable {
         self.has_pending.store(false, Ordering::Release);
         // The swap never happened, so no replay is needed to reconcile it.
         self.truncate_reconciled();
-        Some((RelFileNode(p.new_rel), RelFileNode(p.new_toast), p.owner))
+        Some((RelFileNode(p.new_rel), p.owner))
     }
 
     /// The relfilenode staged by an uncommitted TRUNCATE, if any. `drop_table`
@@ -518,10 +570,24 @@ impl HeapTable {
     /// or a crash would leave chunks in a file the next startup's orphan sweep
     /// unlinks. Crashing before the write leaves an empty orphan file instead,
     /// which that same sweep reclaims.
-    fn ensure_toast_rel(&self, txn: &TxnContext) -> Result<RelFileNode, StorageError> {
-        let existing = self.effective_toast_rel(txn.xid);
-        if existing.0 != 0 {
-            return Ok(existing);
+    ///
+    /// The whole sequence runs under `toast_create` because inserts hold only a
+    /// shared table lock: two writers racing here would each publish a store and
+    /// the catalog would keep only one, silently orphaning the other's chunks.
+    fn ensure_toast_rel(&self) -> Result<RelFileNode, StorageError> {
+        // Fast path: already created, no lock.
+        let existing = self.toast_rel.load(Ordering::Acquire);
+        if existing != 0 {
+            return Ok(RelFileNode(existing));
+        }
+        let _create = self
+            .toast_create
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        // Re-check: another writer may have created it while we waited.
+        let existing = self.toast_rel.load(Ordering::Acquire);
+        if existing != 0 {
+            return Ok(RelFileNode(existing));
         }
         let rel = self.engine.catalog.alloc_relfilenode();
         // A temporary table's chunks must live wherever its rows do.
@@ -529,13 +595,6 @@ impl HeapTable {
             self.engine.bufpool.smgr().register_memory(rel);
         }
         Self::io(self.engine.bufpool.smgr().create_if_missing(rel));
-
-        // Inside an uncommitted TRUNCATE the new store belongs to the staged
-        // swap, not to the table: it is published — and only then persisted — if
-        // that transaction commits, and unlinked if it rolls back.
-        if self.stage_toast_rel(txn.xid, rel) {
-            return Ok(rel);
-        }
         if self.schema.persistence.persists_catalog() {
             self.engine
                 .catalog
@@ -544,25 +603,6 @@ impl HeapTable {
         }
         self.toast_rel.store(rel.0, Ordering::Release);
         Ok(rel)
-    }
-
-    /// Attach `rel` to `xid`'s staged TRUNCATE, if it has one. `true` when it did,
-    /// meaning the caller must not publish `rel` as the table's chunk store yet.
-    fn stage_toast_rel(&self, xid: Xid, rel: RelFileNode) -> bool {
-        if !self.has_pending.load(Ordering::Acquire) {
-            return false;
-        }
-        let mut pending = self
-            .pending
-            .write()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        match pending.as_mut() {
-            Some(p) if p.xid == xid => {
-                p.new_toast = rel.0;
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Write `bytes` to `toast_rel` as a chain of chunks and return the first
@@ -593,27 +633,15 @@ impl HeapTable {
         next.unwrap_or_else(|| panic!("a toasted attribute always has at least one chunk"))
     }
 
-    /// Serialize `tuple` into the bytes `place` will store, moving attributes out
-    /// of line as needed and raising [`StorageError::RowTooBig`] for a row that
-    /// cannot be made to fit a page at all.
+    /// Decide how `tuple` will be stored, without touching a page.
     ///
-    /// Every mutator must call this **before** touching any page. `update`
-    /// depends on it: it stamps the old version deleted before placing the new
-    /// one, so a size failure raised later would leave the row with no live
-    /// successor and lose it on commit.
-    fn prepare_tuple(
-        &self,
-        tuple: &Tuple,
-        hdr: &TupleHeader,
-        txn: &TxnContext,
-    ) -> Result<Vec<u8>, StorageError> {
-        let placeholder = Tid {
-            block: 0,
-            offset: 0,
-        };
-        let bytes = tuple::encode_inline(tuple, hdr, placeholder);
+    /// Pure: it allocates nothing durable and writes nothing, so a caller may run
+    /// it before taking any lock or making any change, and discard the result.
+    /// [`StorageError::RowTooBig`] for a row that cannot be made to fit at all.
+    fn plan_tuple(&self, tuple: &Tuple, hdr: &TupleHeader) -> Result<Planned, StorageError> {
+        let bytes = tuple::encode_inline(tuple, hdr, PLACEHOLDER_TID);
         if bytes.len() <= toast::TOAST_TUPLE_TARGET {
-            return Ok(bytes);
+            return Ok(Planned::Inline(bytes));
         }
 
         // Re-derive each attribute's encoded width rather than measuring the
@@ -625,6 +653,16 @@ impl HeapTable {
             let mut buf = Vec::new();
             if !matches!(v, Value::Null) {
                 crabgresql_types::datum::encode_datum(v, &mut buf);
+            }
+            // An out-of-line datum's length has to fit the pointer's `rawsize`, and
+            // that field is the walk's termination condition — a wrapped length
+            // would silently read back a truncated value. PostgreSQL caps a varlena
+            // at 1 GB; this is the same guard one step later.
+            if buf.len() > MAX_TOASTED_VALUE {
+                return Err(StorageError::ValueTooBig {
+                    size: buf.len(),
+                    max: MAX_TOASTED_VALUE,
+                });
             }
             widths.push(buf.len());
             // Only a variable-length type can be wide enough to be worth moving;
@@ -642,29 +680,41 @@ impl HeapTable {
         )?;
         if chosen.is_empty() {
             // Nothing was worth moving and the row still fits: keep it inline.
-            return Ok(bytes);
+            return Ok(Planned::Inline(bytes));
         }
+        Ok(Planned::Toast { chosen, encoded })
+    }
 
-        let toast_rel = self.ensure_toast_rel(txn)?;
+    /// Carry out a [`Planned`]: write any chunk chains and return the bytes
+    /// `place` will store.
+    ///
+    /// This is the side-effecting half. `update` calls it only after it has won
+    /// the right to replace the row, so a lost race writes no chunks — chunks with
+    /// no heap tuple naming them are unreachable by VACUUM and would leak forever.
+    fn write_planned(
+        &self,
+        tuple: &Tuple,
+        hdr: &TupleHeader,
+        planned: Planned,
+        txn: &TxnContext,
+    ) -> Result<Vec<u8>, StorageError> {
+        let (chosen, encoded) = match planned {
+            Planned::Inline(bytes) => return Ok(bytes),
+            Planned::Toast { chosen, encoded } => (chosen, encoded),
+        };
+        let toast_rel = self.ensure_toast_rel()?;
         let mut attrs: Vec<tuple::Attr<'_>> = tuple.iter().map(tuple::Attr::Inline).collect();
-        let pointers: Vec<(usize, toast::ToastPointer)> = chosen
-            .into_iter()
-            .map(|i| {
-                let first = self.write_chain(toast_rel, &encoded[i], txn);
-                (
-                    i,
-                    toast::ToastPointer {
-                        rel: toast_rel,
-                        first,
-                        rawsize: encoded[i].len() as u32,
-                    },
-                )
-            })
-            .collect();
-        for (i, p) in pointers {
-            attrs[i] = tuple::Attr::External(p);
+        for i in chosen {
+            let first = self.write_chain(toast_rel, &encoded[i], txn);
+            attrs[i] = tuple::Attr::External(toast::ToastPointer {
+                rel: toast_rel,
+                first,
+                // Bounded by `MAX_TOASTED_VALUE` in `plan_tuple`, so the narrowing
+                // cannot wrap.
+                rawsize: encoded[i].len() as u32,
+            });
         }
-        let bytes = tuple::encode_tuple(&attrs, hdr, placeholder);
+        let bytes = tuple::encode_tuple(&attrs, hdr, PLACEHOLDER_TID);
         // `plan` computed this from the same widths, so a miss means the two
         // disagree — a bug here, not a user error.
         debug_assert!(bytes.len() <= MAX_TUPLE, "toasting did not shrink the tuple");
@@ -754,15 +804,26 @@ impl HeapTable {
         }
         let mut per_block: std::collections::HashMap<(u32, u32), Vec<u16>> =
             std::collections::HashMap::new();
+        let smgr = self.engine.bufpool.smgr();
         for p in chains {
+            // Same bounds check as `detoast`, and for the same reason: pinning an
+            // out-of-range block extends the relation to reach it.
+            let Ok(nblocks) = smgr.nblocks(p.rel) else {
+                continue;
+            };
             let mut at = p.first;
             let mut seen = 0usize;
             loop {
+                if at.block >= nblocks {
+                    break;
+                }
                 let Ok(page) = self.engine.bufpool.pin(p.rel, at.block) else {
                     break;
                 };
                 let Some(next) = page.read(|pg| {
-                    page::get_item(pg, at.offset).map(|bytes| tuple::decode_chunk(bytes).0)
+                    page::get_item(pg, at.offset).and_then(|bytes| {
+                        tuple::decode_chunk(bytes).map(|(next, _)| next)
+                    })
                 }) else {
                     break;
                 };
@@ -824,6 +885,22 @@ impl HeapTable {
     }
 }
 
+/// Whether a version is dead to every possible snapshot, so VACUUM may reclaim
+/// it and anything it owns out of line.
+///
+/// Two ways to be dead. A version a committed transaction *deleted* below the
+/// horizon is the ordinary case. A version whose *inserter* aborted below the
+/// horizon is the other, and it matters much more now than it did: before
+/// out-of-line storage an aborted insert wasted at most one page-sized tuple,
+/// whereas a rolled-back wide INSERT strands its whole value — so keying only on
+/// `xmax`, as this did, leaked unboundedly with no path to reclaim it.
+fn is_reclaimable(hdr: &TupleHeader, oldest: Xid, clog: &Clog) -> bool {
+    let deleted = hdr.xmax.is_valid() && hdr.xmax < oldest && clog.is_committed(hdr.xmax);
+    let never_born =
+        hdr.xmin.is_valid() && hdr.xmin < oldest && clog.status(hdr.xmin) == XactStatus::Aborted;
+    deleted || never_born
+}
+
 /// A version is still updatable/deletable unless a committed transaction deleted
 /// it (an aborted or in-flight deleter leaves it live).
 fn is_live(hdr: &TupleHeader, clog: &Clog) -> bool {
@@ -842,26 +919,44 @@ fn is_live(hdr: &TupleHeader, clog: &Clog) -> bool {
 /// walk stops as soon as it has collected the bytes it was promised, and
 /// disagreeing with that promise is an error rather than a short value.
 fn detoast(engine: &EngineInner, p: &toast::ToastPointer) -> Result<Vec<u8>, StorageError> {
+    let smgr = engine.bufpool.smgr();
+    let nblocks = smgr
+        .nblocks(p.rel)
+        .map_err(|e| StorageError::Io(e.to_string()))?;
     let mut out: Vec<u8> = Vec::with_capacity(p.rawsize as usize);
     let mut at = p.first;
+    // A chunk carries at least one payload byte, so a chain can never be longer
+    // than the value it holds. Bounding the hops as well as the bytes stops a
+    // cycle of empty chunks — which advances neither `out.len()` nor the walk —
+    // from spinning forever.
+    let mut hops = 0usize;
     loop {
+        // Bounds-check before pinning: `BufferPool::pin` *extends the relation*
+        // to cover an out-of-range block, so a garbage link would otherwise turn
+        // one read into an attempt to grow the file to that block.
+        if at.block >= nblocks {
+            return Err(toast::corrupt_chain(p, out.len()));
+        }
         let page = engine
             .bufpool
             .pin(p.rel, at.block)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let step = page.read(|pg| {
-            page::get_item(pg, at.offset).map(|bytes| {
-                let (next, payload) = tuple::decode_chunk(bytes);
-                (next, payload.to_vec())
-            })
+            page::get_item(pg, at.offset)
+                .and_then(tuple::decode_chunk)
+                .map(|(next, payload)| (next, payload.to_vec()))
         });
         let Some((next, payload)) = step else {
             return Err(toast::corrupt_chain(p, out.len()));
         };
         out.extend_from_slice(&payload);
+        hops += 1;
         // The last chunk links to itself.
         if next == at || out.len() >= p.rawsize as usize {
             break;
+        }
+        if hops > p.rawsize as usize {
+            return Err(toast::corrupt_chain(p, out.len()));
         }
         at = next;
     }
@@ -948,7 +1043,7 @@ impl TableAm for HeapTable {
         index_name: &str,
         key: &[Value],
         txn: &TxnContext,
-    ) -> Option<Box<dyn Iterator<Item = (Tid, Tuple)> + Send>> {
+    ) -> Option<IndexProbe> {
         let (rel, latch, cols) = {
             let indexes = self.indexes.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
             let entry = indexes.iter().find(|e| e.meta.name == index_name)?;
@@ -974,8 +1069,15 @@ impl TableAm for HeapTable {
         .search_equal(&kb);
         let mut out = Vec::new();
         for tid in tids {
-            if let Ok(Some(tuple)) = self.fetch(tid, txn) {
-                out.push((tid, tuple));
+            // `fetch` can fail now that a value may live out of line, and the
+            // failure must reach the caller: swallowing it here would make an
+            // index scan quietly return fewer rows than a sequential scan of the
+            // same table — the same query answering differently by plan.
+            match self.fetch(tid, txn) {
+                Ok(Some(tuple)) => out.push(Ok((tid, tuple))),
+                // Not visible to this snapshot: not an error.
+                Ok(None) => {}
+                Err(error) => out.push(Err(error)),
             }
         }
         Some(Box::new(out.into_iter()))
@@ -1019,7 +1121,7 @@ impl TableAm for HeapTable {
                 .then(|| tuple::decode_raw(bytes))
         });
         match raw {
-            Some(raw) => Ok(Some(raw.resolve(|p| detoast(&self.engine, p))?)),
+            Some(raw) => Ok(Some(raw?.resolve(|p| detoast(&self.engine, p))?)),
             None => Ok(None),
         }
     }
@@ -1028,7 +1130,8 @@ impl TableAm for HeapTable {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
-        let bytes = self.prepare_tuple(&tuple, &hdr, txn)?;
+        let planned = self.plan_tuple(&tuple, &hdr)?;
+        let bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
         let tid = self.place(rel, txn.xid, &bytes);
         self.maintain_insert(&tuple, tid);
         Ok(tid)
@@ -1042,12 +1145,21 @@ impl TableAm for HeapTable {
     ) -> Result<UpdateResult, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
-        // Serialize the new version BEFORE stamping the old one deleted. The
-        // stamp is not undoable within the statement, so a row whose new version
-        // is too big must fail with the old version still live — otherwise the
-        // update would delete the row and report an error, losing it on commit.
+        // DECIDE the new version's layout before stamping the old one deleted, but
+        // WRITE it only after. Both halves matter and they pull opposite ways:
+        //
+        //  - The stamp is not undoable within the statement, so a row whose new
+        //    version is too big must fail with the old version still live —
+        //    otherwise the update would delete the row and report an error, losing
+        //    it on commit. Hence the size check runs first.
+        //  - Chunks written before the stamp are orphaned when the stamp loses the
+        //    race: no heap tuple names them, and VACUUM only reaches chains through
+        //    a heap tuple, so they would leak permanently. Hence the write runs
+        //    after.
+        //
+        // `plan_tuple` is pure, so running it first costs nothing if we then lose.
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
-        let new_bytes = self.prepare_tuple(&tuple, &hdr, txn)?;
+        let planned = self.plan_tuple(&tuple, &hdr)?;
         // Stamp the old version deleted-by-us, atomically under its page lock
         // (`stamp_deleted` is the serialization point). Two concurrent updaters of
         // the same row therefore serialize: the loser sees xmax already set, gets
@@ -1064,6 +1176,7 @@ impl TableAm for HeapTable {
         // Index only the new version's key; the old version's entry stays and is
         // filtered by MVCC at probe time (reclaimed by vacuum), matching the
         // memory engine's append-only maintenance.
+        let new_bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
         let new_tid = self.place(rel, txn.xid, &new_bytes);
         self.maintain_insert(&tuple, new_tid);
         Ok(UpdateResult::Updated)
@@ -1149,10 +1262,6 @@ impl TableAm for HeapTable {
                 .replace(PendingTruncate {
                     xid: txn.xid,
                     new_rel: new.0,
-                    // No chunk store staged yet: the truncated table starts with
-                    // none, and `ensure_toast_rel` fills this in only if this
-                    // transaction goes on to store something out of line.
-                    new_toast: 0,
                     owner: txn.lock_owner,
                 });
             self.has_pending.store(true, Ordering::Release);
@@ -1208,14 +1317,14 @@ impl TableAm for HeapTable {
             let page = Self::io(self.engine.bufpool.pin(rel, block));
             // Collect the offsets to free and, when indexes exist, the version's
             // values so its index entries can be deleted.
-            let (freed, victims): (Vec<u16>, Vec<(Tid, tuple::RawTuple)>) = page.read(|pg| {
+            type Victim = (Tid, Result<tuple::RawTuple, StorageError>);
+            let (freed, victims): (Vec<u16>, Vec<Victim>) = page.read(|pg| {
                 let mut offs = Vec::new();
                 let mut victims = Vec::new();
                 for off in 1..=page::max_offset(pg) {
                     if let Some(bytes) = page::get_item(pg, off) {
                         let head = tuple::decode_header(bytes);
-                        let xmax = head.hdr.xmax;
-                        if xmax.is_valid() && xmax < oldest && clog.is_committed(xmax) {
+                        if is_reclaimable(&head.hdr, oldest, clog) {
                             offs.push(off);
                             // Decode when there are index entries to remove, or
                             // when the row owns chunks to reclaim. `has_external`
@@ -1232,19 +1341,40 @@ impl TableAm for HeapTable {
                 continue;
             }
             // The chains these dead rows own, collected before the tuples go away.
+            // Reading the pointers needs no chunk I/O at all.
             let dead_chains: Vec<toast::ToastPointer> = victims
                 .iter()
-                .flat_map(|(_, raw)| raw.external().iter().map(|(_, p)| *p))
+                .filter_map(|(_, raw)| raw.as_ref().ok())
+                .flat_map(|raw: &tuple::RawTuple| raw.external().iter().map(|(_, p)| *p))
                 .collect();
-            let victims: Vec<(Tid, Tuple)> = victims
-                .into_iter()
-                .map(|(tid, raw)| {
-                    let Ok(vals) = raw.resolve(|p| detoast(&self.engine, p)) else {
-                        panic!("failed to detoast a row while vacuuming");
-                    };
-                    (tid, vals)
-                })
-                .collect();
+            // Reassemble values ONLY to delete index entries. With no physical
+            // index there is nothing to delete, so a table of wide rows is
+            // vacuumed without reading a single chunk back.
+            let victims: Vec<(Tid, Tuple)> = if phys.is_empty() {
+                Vec::new()
+            } else {
+                victims
+                    .into_iter()
+                    .filter_map(|(tid, raw)| {
+                        match raw.and_then(|raw| raw.resolve(|p| detoast(&self.engine, p))) {
+                            Ok(vals) => Some((tid, vals)),
+                            // Vacuum is advisory maintenance and cannot report an
+                            // error to anyone, but it must not abort the process
+                            // either: skip this row's index cleanup and leave its
+                            // slot for a later pass.
+                            Err(error) => {
+                                tracing::warn!(
+                                    table = %self.schema.name,
+                                    %error,
+                                    "VACUUM: could not read a dead row; \
+                                     leaving its index entries for a later pass"
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            };
             // Remove each reclaimed version's index entries BEFORE freeing the heap
             // slots (PostgreSQL's two-pass order). If the slot were freed first, a
             // concurrent insert could reuse the offset before its stale `key -> tid`
@@ -1318,7 +1448,7 @@ impl Iterator for HeapScan {
             self.buffer.clear();
             self.buf_idx = 0;
             let page = HeapTable::io(self.engine.bufpool.pin(self.rel, block));
-            let raw: Vec<(Tid, tuple::RawTuple)> = page.read(|pg| {
+            let raw: Vec<(Tid, Result<tuple::RawTuple, StorageError>)> = page.read(|pg| {
                 let mut out = Vec::new();
                 for off in 1..=page::max_offset(pg) {
                     if let Some(bytes) = page::get_item(pg, off) {
@@ -1341,9 +1471,17 @@ impl Iterator for HeapScan {
             // Detoast only after the frame lock is released — the scan already
             // buffers a whole block before yielding, so this costs no extra pass.
             for (tid, t) in raw {
-                match t.resolve(|p| detoast(&self.engine, p)) {
+                match t.and_then(|t| t.resolve(|p| detoast(&self.engine, p))) {
                     Ok(vals) => self.buffer.push((tid, vals)),
-                    Err(e) => return Some(Err(e)),
+                    // Stop the scan rather than skipping the rest of the block: a
+                    // consumer that keeps polling must not silently receive a
+                    // partial relation.
+                    Err(e) => {
+                        self.cur_block = self.nblocks;
+                        self.buffer.clear();
+                        self.buf_idx = 0;
+                        return Some(Err(e));
+                    }
                 }
             }
         }
