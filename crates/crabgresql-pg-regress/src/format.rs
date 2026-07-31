@@ -45,7 +45,10 @@ pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>], null_display
     // Data: numeric-ish columns are right-aligned, and the last column drops
     // its trailing padding (so a NULL last cell leaves a lone space).
     for row in rows {
-        let last = fields.len() - 1;
+        // `saturating_sub`: a zero-column result still yields one row per
+        // tuple (`SELECT * FROM t` where `t` has no columns), and `0 - 1`
+        // would panic.
+        let last = fields.len().saturating_sub(1);
         let cells: Vec<String> = row
             .iter()
             .enumerate()
@@ -295,6 +298,16 @@ mod tests {
     fn zero_rows_footer() {
         let out = format_table(&[field("a", 23)], &[], "");
         assert_eq!(out, " a \n---\n(0 rows)\n\n");
+    }
+
+    /// `CREATE TABLE t(); INSERT INTO t DEFAULT VALUES; SELECT * FROM t;`
+    /// yields a row with no columns, which must not underflow the width index.
+    /// The rule line is still narrower than psql's `--`, but that is a diff
+    /// rather than a panic that takes the whole run down.
+    #[test]
+    fn zero_column_result_with_rows() {
+        let out = format_table(&[], &[vec![]], "");
+        assert_eq!(out, "\n\n\n(1 row)\n\n");
     }
 
     #[test]

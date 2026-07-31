@@ -35,7 +35,9 @@ use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
 
 use eval::eval;
-pub use eval::{coerce_value, compare_values, compare_values_collated, is_orderable};
+pub use eval::{
+    coerce_value, coerce_value_assign, compare_values, compare_values_collated, is_orderable,
+};
 use generate_series::Series;
 
 /// Side-effecting sequence operations (`nextval`/`currval`/`setval`/`lastval`),
@@ -4060,16 +4062,33 @@ mod tests {
         Ok(())
     }
 
+    /// The explicit int4 → bool cast accepts any integer, but PL/pgSQL assigns
+    /// through an I/O conversion, which only accepts what `boolin` does.
     #[test]
-    fn coerce_int4_to_bool_at_runtime() -> anyhow::Result<()> {
+    fn assigning_int4_to_bool_goes_through_boolin() -> anyhow::Result<()> {
         let ctx = &ExecContext::default();
+        for (n, expected) in [(0, false), (1, true)] {
+            assert_eq!(
+                coerce_value_assign(Value::Int4(n), PgType::Bool, ctx)?,
+                Value::Bool(expected)
+            );
+        }
+        for n in [2, -1, -42] {
+            let e = coerce_value_assign(Value::Int4(n), PgType::Bool, ctx).unwrap_err();
+            assert_eq!(e.code, "22P02");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type boolean: \"{n}\"")
+            );
+            // The explicit cast still accepts it, as `SELECT n::boolean` must.
+            assert_eq!(
+                coerce_value(Value::Int4(n), PgType::Bool, ctx)?,
+                Value::Bool(true)
+            );
+        }
         assert_eq!(
-            coerce_value(Value::Int4(0), PgType::Bool, ctx)?,
-            Value::Bool(false)
-        );
-        assert_eq!(
-            coerce_value(Value::Int4(-42), PgType::Bool, ctx)?,
-            Value::Bool(true)
+            coerce_value_assign(Value::Null, PgType::Bool, ctx)?,
+            Value::Null
         );
 
         Ok(())
