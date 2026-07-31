@@ -268,6 +268,76 @@ pub fn make_timestamptz(
     Ok(utc)
 }
 
+/// `to_timestamp(double precision)`: seconds since the Unix epoch. Infinities
+/// pass through to the sentinels; `NaN` is an error, as is a value outside the
+/// representable range.
+pub fn from_unix_epoch(seconds: f64) -> Result<i64, TimestampError> {
+    if seconds.is_nan() {
+        return Err(TimestampError {
+            sqlstate: DATETIME_FIELD_OVERFLOW,
+            message: "timestamp cannot be NaN".to_string(),
+        });
+    }
+    if seconds.is_infinite() {
+        return Ok(if seconds > 0.0 {
+            POS_INFINITY
+        } else {
+            NEG_INFINITY
+        });
+    }
+    let out_of_range = || TimestampError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        // PG builds this message with `%g`, i.e. six significant digits and a
+        // two-digit exponent — not `float8out`, which would print all fifteen.
+        message: format!("timestamp out of range: \"{}\"", format_g(seconds)),
+    };
+    // Shift to the PG epoch first, so the `i64` conversion sees the stored
+    // value; `rint` semantics (ties to even) match PG's rounding of the
+    // fractional second.
+    let micros = ((seconds - EPOCH_SECS) * USECS_PER_SEC as f64).round_ties_even();
+    if !micros.is_finite() || micros < i64::MIN as f64 || micros > i64::MAX as f64 {
+        return Err(out_of_range());
+    }
+    let micros = micros as i64;
+    if !in_range(micros) {
+        return Err(out_of_range());
+    }
+    Ok(micros)
+}
+
+/// Seconds from the Unix epoch (1970-01-01) to the PG epoch (2000-01-01).
+const EPOCH_SECS: f64 = 946_684_800.0;
+
+/// C's `%g`: six significant digits, trailing zeros trimmed, switching to
+/// exponent form when the exponent is below -4 or at least the precision.
+fn format_g(v: f64) -> String {
+    const SIG: usize = 6;
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let exp = v.abs().log10().floor() as i32;
+    if exp < -4 || exp >= SIG as i32 {
+        let mantissa = format!("{:.*}", SIG - 1, v / 10f64.powi(exp));
+        let mantissa = trim_zeros(&mantissa);
+        format!(
+            "{mantissa}e{}{:02}",
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
+    } else {
+        let decimals = (SIG as i32 - 1 - exp).max(0) as usize;
+        trim_zeros(&format!("{v:.decimals$}")).to_string()
+    }
+}
+
+fn trim_zeros(s: &str) -> &str {
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        s
+    }
+}
+
 /// `timestamptz AT TIME ZONE zone` (= `timezone(zone, timestamptz)`): the wall
 /// clock the instant shows in `zone`, as a zone-less `timestamp`. `±infinity`
 /// passes through.

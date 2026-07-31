@@ -157,6 +157,31 @@ pub enum ScalarFn {
     Age,
     /// `to_char(interval, text) -> text`.
     ToCharInterval,
+    /// `to_char(timestamp, text) -> text`.
+    ToCharTimestamp,
+    /// `to_char(timestamptz, text) -> text`.
+    ToCharTimestampTz,
+    /// `to_char(time, text) -> text`; PG reaches this through its implicit
+    /// `time -> interval` cast, so it renders with the interval codes.
+    ToCharTime,
+    /// `to_char(numeric, text) -> text`.
+    ToCharNumeric,
+    /// `to_char(int4, text) -> text`.
+    ToCharInt4,
+    /// `to_char(int8, text) -> text`.
+    ToCharInt8,
+    /// `to_char(float4, text) -> text`.
+    ToCharFloat4,
+    /// `to_char(float8, text) -> text`.
+    ToCharFloat8,
+    /// `to_date(text, text) -> date`.
+    ToDate,
+    /// `to_timestamp(text, text) -> timestamptz`.
+    ToTimestampFormat,
+    /// `to_timestamp(float8) -> timestamptz`: seconds since the Unix epoch.
+    ToTimestampUnix,
+    /// `to_number(text, text) -> numeric`.
+    ToNumber,
 
     // --- timestamptz operators/functions ---
     /// `date_part(text, timestamptz) -> float8`.
@@ -1300,6 +1325,7 @@ pub(crate) fn resolve_generate_series(
     Err(undefined_function("generate_series", bindings))
 }
 
+const F4: PgType = PgType::Float4;
 const F8: PgType = PgType::Float8;
 const TS: PgType = PgType::Timestamp;
 const TSTZ: PgType = PgType::TimestampTz;
@@ -1755,10 +1781,84 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[TS, TS],
             ret: IV,
         }],
-        "to_char" => &[Signature {
-            func: ScalarFn::ToCharInterval,
-            args: &[IV, TEXT],
-            ret: TEXT,
+        // PG has no `to_char(date)` and no `to_char(time)` overload: a `date`
+        // reaches the timestamptz form through the preferred-type rule
+        // (`to_char(date, 'TZ')` is `UTC`, not the empty string), and a `time`
+        // reaches the interval form through pg_cast's implicit
+        // `time -> interval`. We spell the `time` case as its own signature
+        // rather than adding that cast, which would also reshuffle operator
+        // resolution for `time`. Order is load-bearing for `resolve_call`'s
+        // best-coercible pass: TSTZ must lead TS so a `date` widens the way PG
+        // widens it, and I4 must lead the rest so an `int2` lands on int4.
+        "to_char" => &[
+            Signature {
+                func: ScalarFn::ToCharTimestampTz,
+                args: &[TSTZ, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharTimestamp,
+                args: &[TS, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharInterval,
+                args: &[IV, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharTime,
+                args: &[TIME, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharInt4,
+                args: &[I4, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharInt8,
+                args: &[I8, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharNumeric,
+                args: &[NUM, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharFloat8,
+                args: &[F8, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharFloat4,
+                args: &[F4, TEXT],
+                ret: TEXT,
+            },
+        ],
+        "to_date" => &[Signature {
+            func: ScalarFn::ToDate,
+            args: &[TEXT, TEXT],
+            ret: DATE,
+        }],
+        // The two forms differ in arity, so they never compete.
+        "to_timestamp" => &[
+            Signature {
+                func: ScalarFn::ToTimestampFormat,
+                args: &[TEXT, TEXT],
+                ret: TSTZ,
+            },
+            Signature {
+                func: ScalarFn::ToTimestampUnix,
+                args: &[F8],
+                ret: TSTZ,
+            },
+        ],
+        "to_number" => &[Signature {
+            func: ScalarFn::ToNumber,
+            args: &[TEXT, TEXT],
+            ret: NUM,
         }],
         "make_timestamptz" => &[
             Signature {
@@ -3187,18 +3287,41 @@ pub(crate) fn resolve_call(
     // so `power(numeric, int)` prefers `power(numeric, numeric)` over the float8
     // overload, as PG's preferred-type resolution does. Ties keep list order
     // (float8 listed first, the preferred numeric-category type).
-    for sig in sigs {
-        if sig.args.len() == bindings.len()
-            && let Some(args) = try_coerce_args(&bindings, sig.args, true)
-        {
+    // PG chooses an overload from the argument *types*, never from an untyped
+    // literal's contents, so the unknown-argument rule below considers every
+    // same-arity signature — not just the ones whose literal happens to parse.
+    let arity: Vec<&Signature> = sigs
+        .iter()
+        .filter(|sig| sig.args.len() == bindings.len())
+        .collect();
+    let candidates = if arity.len() > 1
+        && bindings
+            .iter()
+            .any(|b| matches!(b, Binding::Unknown { .. }))
+    {
+        // The typed arguments get the first and last word: PG discards the
+        // candidates they cannot reach and keeps the most exact matches among
+        // them (rules 4.a/4.b) *before* consulting the unknown positions (4.e).
+        // Running the unknown rule first would let the string-category
+        // preference throw away a signature the typed arguments had already
+        // singled out — `overlay(bit, unknown, int4)` would lose its `bit`
+        // overload to the `text` one.
+        let narrowed = narrow_by_typed_args(&bindings, arity);
+        if narrowed.len() > 1 {
+            narrow_by_unknown_category(name, &bindings, narrowed)?
+        } else {
+            narrowed
+        }
+    } else {
+        arity
+    };
+    for sig in &candidates {
+        if let Some(args) = try_coerce_args(&bindings, sig.args, true) {
             return finish_func_call(sig.func, sig.ret, args);
         }
     }
     let mut best: Option<(usize, &Signature, Vec<BoundExpr>)> = None;
-    for sig in sigs {
-        if sig.args.len() != bindings.len() {
-            continue;
-        }
+    for sig in &candidates {
         if let Some(args) = try_coerce_args(&bindings, sig.args, false) {
             let exact = bindings
                 .iter()
@@ -3492,8 +3615,201 @@ fn undefined_function(name: &str, bindings: &[Binding]) -> BindError {
     )
 }
 
-/// PG's `42725` for a call that matches two overloads equally well, with the same
-/// DETAIL/HINT PostgreSQL prints (see [`crate::expr`]'s operator-ambiguity error).
+/// PG's `pg_type.typcategory`, transcribed from `vendor/postgres/catalog/
+/// pg_type.dat`. Types sharing a category are interchangeable enough that an
+/// untyped literal can be steered between them; types in different categories
+/// are not, and an untyped argument spanning two of them is ambiguous.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Category {
+    /// `B`.
+    Boolean,
+    /// `S`.
+    String,
+    /// `N`.
+    Numeric,
+    /// `D`.
+    DateTime,
+    /// `T`.
+    Timespan,
+    /// `I`.
+    Network,
+    /// `V`.
+    BitString,
+    /// `G`.
+    Geometric,
+    /// `U`, PG's catch-all for types with no family of their own.
+    UserDefined,
+    /// A type not in the table above (currently the `reg*` family and arrays):
+    /// its own category, keyed by OID so unrelated types never look alike.
+    Other(u32),
+}
+
+fn category(ty: PgType) -> Category {
+    match ty {
+        PgType::Bool => Category::Boolean,
+        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => Category::String,
+        PgType::Int2
+        | PgType::Int4
+        | PgType::Int8
+        | PgType::Float4
+        | PgType::Float8
+        | PgType::Numeric
+        | PgType::Money
+        | PgType::Oid => Category::Numeric,
+        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+            Category::DateTime
+        }
+        PgType::Interval => Category::Timespan,
+        PgType::Inet | PgType::Cidr => Category::Network,
+        PgType::Bit | PgType::Varbit => Category::BitString,
+        PgType::Point
+        | PgType::Lseg
+        | PgType::Line
+        | PgType::Path
+        | PgType::Box
+        | PgType::Polygon
+        | PgType::Circle => Category::Geometric,
+        PgType::Bytea
+        | PgType::Uuid
+        | PgType::Json
+        | PgType::Jsonb
+        | PgType::Jsonpath
+        | PgType::Tsvector
+        | PgType::Tsquery
+        | PgType::Macaddr
+        | PgType::Macaddr8
+        | PgType::Tid
+        | PgType::Xid
+        | PgType::Xid8
+        | PgType::PgLsn => Category::UserDefined,
+        other => Category::Other(other.oid()),
+    }
+}
+
+/// `pg_type.typispreferred`, from the same source. A category can have more
+/// than one (`N` marks both `float8` and `oid`), and several have none.
+fn is_preferred(ty: PgType) -> bool {
+    matches!(
+        ty,
+        PgType::Bool
+            | PgType::Text
+            | PgType::Float8
+            | PgType::Oid
+            | PgType::TimestampTz
+            | PgType::Interval
+            | PgType::Inet
+            | PgType::Varbit
+    )
+}
+
+/// PG's rules 4.a and 4.b, restricted to the arguments whose type is already
+/// known: drop the candidates no typed argument can reach, then keep those with
+/// the most arguments already at their exact type. An empty result is left empty
+/// so the caller reports `42883` rather than a misleading ambiguity.
+fn narrow_by_typed_args<'a>(
+    bindings: &[Binding],
+    candidates: Vec<&'a Signature>,
+) -> Vec<&'a Signature> {
+    let reachable = |sig: &&Signature| {
+        bindings
+            .iter()
+            .zip(sig.args)
+            .all(|(binding, target)| match binding {
+                // An untyped literal reaches anything; it is the unknown-argument
+                // rule's job to choose between the candidates it leaves standing.
+                Binding::Unknown { .. } => true,
+                Binding::Typed(e) => {
+                    e.ty() == *target || crate::expr::implicit_castable(e.ty(), *target)
+                }
+            })
+    };
+    let exact_matches = |sig: &&Signature| {
+        bindings
+            .iter()
+            .zip(sig.args)
+            .filter(|(binding, target)| matches!(binding, Binding::Typed(e) if e.ty() == **target))
+            .count()
+    };
+    // PG's 4.d: among the arguments that still need converting, prefer the
+    // candidates taking their category's preferred type. This is what makes
+    // `to_char(date, unknown)` the timestamptz overload rather than a tie with
+    // the timestamp one.
+    let preferred_conversions = |sig: &&Signature| {
+        bindings
+            .iter()
+            .zip(sig.args)
+            .filter(|(binding, target)| match binding {
+                Binding::Unknown { .. } => false,
+                Binding::Typed(e) => {
+                    e.ty() != **target
+                        && is_preferred(**target)
+                        && category(**target) == category(e.ty())
+                }
+            })
+            .count()
+    };
+    let mut kept: Vec<&Signature> = candidates.into_iter().filter(reachable).collect();
+    let best = kept.iter().map(exact_matches).max().unwrap_or(0);
+    kept.retain(|sig| exact_matches(&sig) == best);
+    let best = kept.iter().map(preferred_conversions).max().unwrap_or(0);
+    kept.retain(|sig| preferred_conversions(&sig) == best);
+    kept
+}
+
+/// PG's unknown-argument rule. When several overloads all match exactly, the
+/// only thing separating them is what an untyped literal should become: at each
+/// unknown position prefer the string category (an unknown literal *looks* like
+/// a string), else require every candidate to agree on one category, else give
+/// up with `42725`. Within the chosen category the preferred type wins.
+///
+/// This is what makes `substring('abcdef','2')` pick the regex form (a `text`
+/// candidate exists at position 2) while `to_char('x','y')` is ambiguous (its
+/// candidates span the datetime, timespan and numeric categories).
+fn narrow_by_unknown_category<'a>(
+    name: &str,
+    bindings: &[Binding],
+    mut candidates: Vec<&'a Signature>,
+) -> Result<Vec<&'a Signature>, BindError> {
+    for (i, binding) in bindings.iter().enumerate() {
+        if candidates.len() < 2 {
+            break;
+        }
+        if !matches!(binding, Binding::Unknown { .. }) {
+            continue;
+        }
+        let mut cats = candidates.iter().map(|sig| category(sig.args[i]));
+        let first = match cats.next() {
+            Some(c) => c,
+            None => break,
+        };
+        let chosen = if candidates
+            .iter()
+            .any(|sig| category(sig.args[i]) == Category::String)
+        {
+            Category::String
+        } else if cats.all(|c| c == first) {
+            first
+        } else {
+            return Err(ambiguous_function(name, bindings));
+        };
+        candidates.retain(|sig| category(sig.args[i]) == chosen);
+        if candidates.iter().any(|sig| is_preferred(sig.args[i])) {
+            candidates.retain(|sig| is_preferred(sig.args[i]));
+        }
+    }
+    // Nothing is left to separate the survivors: the category agreed and no
+    // preferred type broke the tie, so PG gives up rather than picking one.
+    // Categories with no preferred type at all — `G`, `U` — always land here,
+    // which is why `area('((0,0),(2,2))')` is ambiguous in PG.
+    if candidates.len() > 1 {
+        return Err(ambiguous_function(name, bindings));
+    }
+    Ok(candidates)
+}
+
+/// PG's `42725` for a call that matches two overloads equally well. Unlike the
+/// operator-ambiguity error in [`crate::expr`], which splits its advice across
+/// DETAIL and HINT, PG puts the whole sentence in the function form's HINT.
 fn ambiguous_function(name: &str, bindings: &[Binding]) -> BindError {
     BindError::new(
         sqlstate::AMBIGUOUS_FUNCTION,
@@ -3502,11 +3818,9 @@ fn ambiguous_function(name: &str, bindings: &[Binding]) -> BindError {
             call_type_list(bindings)
         ),
     )
-    .with_detail(Some(
-        "Could not choose a best candidate function.".to_string(),
-    ))
     .with_hint(Some(
-        "You might need to add explicit type casts.".to_string(),
+        "Could not choose a best candidate function. You might need to add explicit type casts."
+            .to_string(),
     ))
 }
 
