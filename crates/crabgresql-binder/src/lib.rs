@@ -22,7 +22,7 @@ pub use expr::{
     param_types, require_all_resolved, resolve_data_type,
 };
 pub use functions::{
-    AggFn, GeoFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,
+    AggFn, GeoFn, JsonFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,
 };
 pub use plan::{
     AggInput, CopyFormat, CopyFromPlan, DistinctKey, InsertSource, JoinExpr, JoinInput, JoinKind,

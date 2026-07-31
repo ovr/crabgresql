@@ -10,9 +10,11 @@
 use std::hint::black_box;
 
 use crabgresql_binder::GeoFn;
+use crabgresql_binder::JsonFn;
 use crabgresql_binder::JsonPathFn;
 use crabgresql_binder::ScalarFn;
 use crabgresql_binder::TsFn;
+use crabgresql_types::json;
 use crabgresql_types::json::Jsonb;
 use crabgresql_types::jsonpath;
 use crabgresql_pg_wire::sqlstate;
@@ -151,6 +153,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         // --- jsonpath (STRICT: any NULL arg already short-circuited to NULL) ---
         ScalarFn::JsonPath(f) => return eval_jsonpath(f, args),
+        // --- json/jsonb extraction (STRICT on the target and key) ---
+        ScalarFn::Json(f) => return eval_json(f, args),
         ScalarFn::Ts(f) => return eval_ts(f, args),
         // --- array containment / size (STRICT) ---
         ScalarFn::ArrayContains => return Ok(Value::Bool(array_contains(&args[0], &args[1]))),
@@ -1560,7 +1564,78 @@ fn eval_ts<'a>(f: TsFn, args: &'a [Value]) -> Result<Value, ExecError> {
 }
 
 fn json_err(e: crabgresql_types::json::JsonError) -> ExecError {
-    ExecError::new(e.sqlstate, e.message)
+    // JSON errors carry PG's DETAIL (the `\u0000` cast message, the parse
+    // diagnostics); keep it rather than reporting the bare primary message.
+    ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
+}
+
+/// The `->` / `->>` / `#>` / `#>>` extraction operators, over both `json` and
+/// `jsonb`. The blanket STRICT check upstream already turned a NULL target or
+/// key into NULL, so `args` holds no top-level NULLs — but a NULL *element*
+/// inside a `#>` path array is still possible and also yields NULL.
+///
+/// Every miss (absent key, wrong container kind, out-of-range subscript) is
+/// NULL rather than an error; only a `\u0000` on a `->>` path can fail.
+fn eval_json(f: JsonFn, args: &[Value]) -> Result<Value, ExecError> {
+    use JsonFn::{
+        ArrayElement, ArrayElementText, ExtractPath, ExtractPathText, ObjectField, ObjectFieldText,
+    };
+    // `#>`/`#>>` take a `text[]`; a NULL anywhere in it makes the whole result
+    // NULL, as PG's non-STRICT-on-elements behavior does.
+    let path: Vec<&str> = match f {
+        ExtractPath | ExtractPathText => {
+            let elems = array_elems(&args[1]);
+            if elems.iter().any(|e| matches!(e, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            elems.iter().map(text).collect()
+        }
+        _ => Vec::new(),
+    };
+    match &args[0] {
+        Value::Jsonb(doc) => {
+            let found = match f {
+                ObjectField | ObjectFieldText => json::jsonb_object_field(doc, text(&args[1])),
+                ArrayElement | ArrayElementText => {
+                    json::jsonb_array_element(doc, i4(&args[1]) as i64)
+                }
+                ExtractPath | ExtractPathText => json::jsonb_extract_path(doc, &path),
+            };
+            Ok(match found {
+                None => Value::Null,
+                Some(v) if json_returns_text(f) => {
+                    json::jsonb_as_text(v).map_or(Value::Null, Value::Text)
+                }
+                Some(v) => Value::Jsonb(v.clone()),
+            })
+        }
+        Value::Json(doc) => {
+            let found = match f {
+                ObjectField | ObjectFieldText => json::json_object_field(doc, text(&args[1])),
+                ArrayElement | ArrayElementText => {
+                    json::json_array_element(doc, i4(&args[1]) as i64)
+                }
+                ExtractPath | ExtractPathText => json::json_extract_path(doc, &path),
+            };
+            Ok(match found {
+                None => Value::Null,
+                Some(raw) if json_returns_text(f) => json::json_as_text(raw)
+                    .map_err(json_err)?
+                    .map_or(Value::Null, Value::Text),
+                // The `json` operators return the verbatim source substring.
+                Some(raw) => Value::Json(raw.to_string()),
+            })
+        }
+        other => unreachable!("expected json/jsonb target, got {other:?}"),
+    }
+}
+
+/// Whether the operator is one of the `->>`/`#>>` spellings, which return `text`.
+fn json_returns_text(f: JsonFn) -> bool {
+    matches!(
+        f,
+        JsonFn::ObjectFieldText | JsonFn::ArrayElementText | JsonFn::ExtractPathText
+    )
 }
 
 fn path_of(v: &Value) -> &geo::PathVal {

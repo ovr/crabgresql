@@ -458,6 +458,12 @@ pub enum ScalarFn {
     /// `[jsonb, jsonpath]` optionally followed by `[vars jsonb, silent bool]`;
     /// the `@?`/`@@` operators pass a `silent = true` 4th arg.
     JsonPath(JsonPathFn),
+    // --- json / jsonb extraction operators ---
+    /// A `->` / `->>` / `#>` / `#>>` extraction. Args are `[json|jsonb, key]`,
+    /// where the key is `text` (object field), `int4` (array element) or
+    /// `text[]` (path). The `json` vs `jsonb` behavior is selected at eval time
+    /// from the target's `Value` variant.
+    Json(JsonFn),
     // --- text search (tsvector / tsquery) ---
     /// A `tsvector`/`tsquery` operation; the specific operation is the payload.
     Ts(TsFn),
@@ -514,6 +520,29 @@ pub enum JsonPathFn {
     ExistsOp,
     /// `jsonb @@ jsonpath` (`-> boolean`; silent form of `Match`).
     MatchOp,
+}
+
+/// A JSON extraction operator. Each applies to both `json` and `jsonb`; the
+/// target's `Value` variant picks the behavior, so one set of variants covers
+/// both types. The `*Text` forms are the `->>`/`#>>` spellings, which return
+/// `text` (a JSON string unquoted, a JSON `null` as SQL NULL).
+///
+/// Named after PG's underlying functions so registering the SQL spellings
+/// (`jsonb_extract_path`, ...) later is a lookup-table entry and nothing more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonFn {
+    /// `json -> text` — an object field.
+    ObjectField,
+    /// `json ->> text` — an object field, as text.
+    ObjectFieldText,
+    /// `json -> int4` — an array element; a negative subscript counts from the end.
+    ArrayElement,
+    /// `json ->> int4` — an array element, as text.
+    ArrayElementText,
+    /// `json #> text[]` — the value at a path.
+    ExtractPath,
+    /// `json #>> text[]` — the value at a path, as text.
+    ExtractPathText,
 }
 
 /// A text-search operation over `tsvector`/`tsquery`. Operators lower to these
