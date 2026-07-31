@@ -275,6 +275,19 @@ pub fn coerce_value(value: Value, ty: PgType, ctx: &ExecContext) -> Result<Value
         .map_err(|e| ExecError::new(e.sqlstate, e.message))
 }
 
+/// Assignment-context sibling of [`coerce_value`], for PL/pgSQL's `:=`,
+/// `SELECT … INTO` and `RETURN`. Unlike a bind-time `Coerce`, these are not
+/// gated by the binder's explicit-cast rules, so they must not reach a cast
+/// PostgreSQL only offers explicitly. See [`cast::cast_value_assign`].
+pub fn coerce_value_assign(
+    value: Value,
+    ty: PgType,
+    ctx: &ExecContext,
+) -> Result<Value, ExecError> {
+    cast::cast_value_assign(value, ty, ctx.extra_float_digits)
+        .map_err(|e| ExecError::new(e.sqlstate, e.message))
+}
+
 /// Dispatch the non-strict array constructor functions (`array_cat`,
 /// `array_append`, `array_prepend`), which build a [`Value::Array`] of `ret`'s
 /// element type. Returns `None` for any other function so the caller falls

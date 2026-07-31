@@ -246,7 +246,7 @@ impl Interpreter {
         };
         match flow {
             Flow::Return(value) => match def.ret {
-                Some(ty) => crabgresql_executor::coerce_value(value, ty, ctx),
+                Some(ty) => crabgresql_executor::coerce_value_assign(value, ty, ctx),
                 None => Ok(Value::Null),
             },
             // Falling off the end of a function without RETURN is an error;
@@ -626,7 +626,7 @@ impl Interpreter {
                 }
                 for (target, value) in targets.iter().zip(row.iter()) {
                     let ty = frame.type_of(*target).unwrap_or(PgType::Text);
-                    let value = crabgresql_executor::coerce_value(value.clone(), ty, ctx)?;
+                    let value = crabgresql_executor::coerce_value_assign(value.clone(), ty, ctx)?;
                     frame.assign(*target, value)?;
                 }
                 frame.set_found(true);
@@ -769,7 +769,7 @@ impl Interpreter {
             .and_then(|row| row.first())
             .cloned()
             .unwrap_or(Value::Null);
-        crabgresql_executor::coerce_value(value, ty, ctx)
+        crabgresql_executor::coerce_value_assign(value, ty, ctx)
     }
 
     /// Evaluate a fragment as a boolean condition. A NULL condition is false,

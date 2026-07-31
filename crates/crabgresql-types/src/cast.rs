@@ -90,6 +90,33 @@ fn float_to_int_bounds(v: f64, lo: f64, hi: f64, ty: PgType) -> Result<f64, Cast
     Ok(r)
 }
 
+/// Pairs PostgreSQL marks explicit-only (`pg_cast.castcontext = 'e'`): they are
+/// reachable from `CAST`/`::` but never from an assignment.
+fn is_explicit_only(from: PgType, to: PgType) -> bool {
+    matches!((from, to), (PgType::Int4, PgType::Bool))
+}
+
+/// Cast `v` to `to` in PostgreSQL's *assignment* context — PL/pgSQL `:=`,
+/// `SELECT … INTO`, and coercing a `RETURN` value to the declared type.
+///
+/// An explicit-only pair is unavailable here, so PostgreSQL falls back to an
+/// I/O conversion: render the source with its output function, then feed that
+/// text to the target's input function. The fallback accepts strictly less
+/// than the explicit cast, which is the observable difference — `b := 1`
+/// yields true, but `b := 2` raises `22P02` even though `2::boolean` is true.
+pub fn cast_value_assign(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
+    let Some(from) = v.pg_type() else {
+        return Ok(v); // NULL assigns to any type.
+    };
+    if from != to && is_explicit_only(from, to) {
+        let text = v
+            .encode_text_with(efd)
+            .expect("non-null value has a text encoding");
+        return cast_value(Value::Text(text), to, efd);
+    }
+    cast_value(v, to, efd)
+}
+
 /// Cast `v` to `to`. `efd` (extra_float_digits) only affects float→text.
 pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
     if matches!(v, Value::Null) {
@@ -113,6 +140,11 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Int8(n), PgType::Int4) => i32::try_from(*n)
             .map(Value::Int4)
             .map_err(|_| out_of_range(PgType::Int4)),
+
+        // PostgreSQL exposes an explicit int4 -> boolean cast: zero is false,
+        // every other value is true. There is deliberately no int2/int8 arm.
+        // Explicit-only, so assignments must go through `cast_value_assign`.
+        (Value::Int4(n), PgType::Bool) => Ok(Value::Bool(*n != 0)),
 
         // ---- integer → float ----
         (Value::Int2(n), PgType::Float4) => Ok(Value::Float4(*n as f32)),
@@ -1073,6 +1105,54 @@ mod tests {
         let e = cast(Value::Text("x".into()), PgType::Bool).unwrap_err();
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(e.message, "invalid input syntax for type boolean: \"x\"");
+
+        Ok(())
+    }
+
+    #[test]
+    fn only_int4_casts_to_bool() -> anyhow::Result<()> {
+        assert_eq!(cast(Value::Int4(0), PgType::Bool)?, Value::Bool(false));
+        assert_eq!(cast(Value::Int4(1), PgType::Bool)?, Value::Bool(true));
+        assert_eq!(cast(Value::Int4(2), PgType::Bool)?, Value::Bool(true));
+        assert_eq!(cast(Value::Int4(-1), PgType::Bool)?, Value::Bool(true));
+
+        for value in [Value::Int2(1), Value::Int8(1)] {
+            let error = cast(value, PgType::Bool).unwrap_err();
+            assert_eq!(error.sqlstate, "42846");
+        }
+
+        Ok(())
+    }
+
+    /// int4 → bool is explicit-only, so an assignment falls back to the I/O
+    /// conversion and accepts only what `boolin` accepts.
+    #[test]
+    fn assigning_int4_to_bool_is_narrower_than_casting() -> anyhow::Result<()> {
+        assert_eq!(
+            cast_value_assign(Value::Int4(0), PgType::Bool, 1)?,
+            Value::Bool(false)
+        );
+        assert_eq!(
+            cast_value_assign(Value::Int4(1), PgType::Bool, 1)?,
+            Value::Bool(true)
+        );
+        for n in [2, -1] {
+            let e = cast_value_assign(Value::Int4(n), PgType::Bool, 1).unwrap_err();
+            assert_eq!(e.sqlstate, "22P02");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type boolean: \"{n}\"")
+            );
+        }
+        // Every other pair is unaffected: assignment matches the plain cast.
+        assert_eq!(
+            cast_value_assign(Value::Int8(7), PgType::Int4, 1)?,
+            Value::Int4(7)
+        );
+        assert_eq!(
+            cast_value_assign(Value::Null, PgType::Bool, 1)?,
+            Value::Null
+        );
 
         Ok(())
     }
