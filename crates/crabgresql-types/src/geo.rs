@@ -1,9 +1,10 @@
-//! Geometric types: `point` and `lseg` (line segment).
+//! Geometric types: `point`, `lseg` (line segment) and `path` (point list).
 //!
 //! Clean-room reproduction of PostgreSQL's observable behavior (I/O text, error
 //! text, SQLSTATE) for the geometric family. This module holds pure parse /
 //! format / operator helpers; the runtime `Value` representations live in
-//! [`crate`] (`Value::Point([f64; 2])`, `Value::Lseg([f64; 4])`).
+//! [`crate`] (`Value::Point([f64; 2])`, `Value::Lseg([f64; 4])`,
+//! `Value::Path(`[`PathVal`]`)`).
 //!
 //! Coordinates are `float8`, parsed with [`crate::float::float8in`] (so bad
 //! numbers get PG's `22P02`/`22003`) and formatted with
@@ -205,10 +206,15 @@ fn pair_decode(cur: &mut Cur, type_name: &str, orig: &str) -> Result<[f64; 2], G
 /// "open" path (only if `opentype`); a leading `(` immediately followed by
 /// another `(` is a grouping paren; otherwise each point carries its own `()`.
 /// Returns `(is_open, points)`. Requires the whole string to be consumed.
+///
+/// `trailing_sep` says whether a separator is tolerated *after* the final point.
+/// The two callers differ here, matching PG: `lseg '[(1,2),(3,4),]'` is accepted
+/// but `path '[(1,2),(3,4),]'` is a syntax error.
 fn path_decode(
     orig: &str,
     opentype: bool,
     npts: usize,
+    trailing_sep: bool,
     type_name: &str,
 ) -> Result<(bool, Vec<[f64; 2]>), GeoError> {
     let mut cur = Cur::new(orig);
@@ -224,24 +230,32 @@ fn path_decode(
         cur.i += 1;
     } else if cur.peek() == Some(b'(') {
         // Look past the '(' and any whitespace: another '(' means this is a
-        // grouping paren around the whole list.
+        // grouping paren around the whole list (`((1,2),(3,4))`). So does being
+        // the *last* '(' in the string, which is how a bare coordinate list
+        // wrapped in one pair of parens (`(1,2,3,4)`) is spelled. Otherwise
+        // this '(' belongs to the first point and each point carries its own.
         let mut j = cur.i + 1;
         let b = orig.as_bytes();
         while j < b.len() && b[j].is_ascii_whitespace() {
             j += 1;
         }
-        if j < b.len() && b[j] == b'(' {
+        let grouping = (j < b.len() && b[j] == b'(') || !orig[cur.i + 1..].contains('(');
+        if grouping {
             depth += 1;
             cur.i += 1;
         }
     }
 
     let mut pts = Vec::with_capacity(npts);
-    for _ in 0..npts {
+    for i in 0..npts {
         let p = pair_decode(&mut cur, type_name, orig)?;
         pts.push(p);
         cur.skip_ws();
-        cur.eat(b',');
+        // The separator between two points is optional (`(1,2)(3,4)` parses);
+        // the one after the last point is only eaten where the type allows it.
+        if i + 1 < npts || trailing_sep {
+            cur.eat(b',');
+        }
     }
 
     while depth > 0 {
@@ -292,7 +306,7 @@ pub fn format_point(p: &[f64; 2], efd: i32) -> String {
 /// Parse an `lseg`: `[(x1,y1),(x2,y2)]` and the other accepted spellings
 /// (`((..),(..))`, `(..),(..)`, `x1,y1,x2,y2`, `[x1,y1,x2,y2]`).
 pub fn parse_lseg(orig: &str) -> Result<[f64; 4], GeoError> {
-    let (_open, pts) = path_decode(orig, true, 2, "lseg")?;
+    let (_open, pts) = path_decode(orig, true, 2, true, "lseg")?;
     Ok([pts[0][0], pts[0][1], pts[1][0], pts[1][1]])
 }
 
@@ -498,6 +512,23 @@ pub fn point_on_seg(p: &[f64; 2], l: &[f64; 4]) -> bool {
 /// Intersection point of two segments, if they meet in exactly one point that
 /// lies on both. Backs `#`; parallel / non-touching segments yield `None`.
 pub fn lseg_interpt(a: &[f64; 4], b: &[f64; 4]) -> Option<[f64; 2]> {
+    // Zero-length segments — which a one-point closed `path` contributes — have
+    // no direction, so the cross product below degenerates. Such a segment meets
+    // another exactly where its single point lies on it; two zero-length
+    // segments never meet, not even coincident ones, matching PG.
+    let a_deg = point_eq(&lseg_p0(a), &lseg_p1(a));
+    let b_deg = point_eq(&lseg_p0(b), &lseg_p1(b));
+    if a_deg || b_deg {
+        if a_deg && b_deg {
+            return None;
+        }
+        let (pt, seg) = if a_deg {
+            (lseg_p0(a), b)
+        } else {
+            (lseg_p0(b), a)
+        };
+        return point_on_seg(&pt, seg).then_some(pt);
+    }
     let (x1, y1, x2, y2) = (a[0], a[1], a[2], a[3]);
     let (x3, y3, x4, y4) = (b[0], b[1], b[2], b[3]);
     let d = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3);
@@ -550,6 +581,267 @@ pub fn lseg_from_points(p1: &[f64; 2], p2: &[f64; 2]) -> [f64; 4] {
     [p1[0], p1[1], p2[0], p2[1]]
 }
 
+// ---------------------------------------------------------------------------
+// path
+// ---------------------------------------------------------------------------
+
+/// A `path`: a non-empty list of points, either *open* (rendered
+/// `[(x,y),...]`) or *closed* (rendered `((x,y),...)`). A closed path carries an
+/// implicit final segment from the last point back to the first.
+///
+/// Unlike `point`/`lseg` this is variable length, so it is the first geometric
+/// value that is not `Copy`.
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq)]
+pub struct PathVal {
+    /// Whether the last point connects back to the first.
+    pub closed: bool,
+    /// The vertices, in order. Always at least one.
+    pub pts: Vec<[f64; 2]>,
+}
+
+impl PathVal {
+    /// The segments of the path: the segment ending at each vertex, where the
+    /// one ending at the first vertex exists only for a closed path (it comes
+    /// from the last vertex). So a one-point *closed* path has a single
+    /// degenerate zero-length segment — PG treats it as a real segment, and
+    /// `<->`/`<@`/`?#` all depend on it — while a one-point *open* path has none.
+    fn segments(&self) -> impl Iterator<Item = [f64; 4]> + '_ {
+        let n = self.pts.len();
+        let closed = self.closed;
+        (0..n).filter_map(move |i| {
+            let prev = if i > 0 {
+                i - 1
+            } else if closed {
+                n - 1
+            } else {
+                return None;
+            };
+            let a = self.pts[prev];
+            let b = self.pts[i];
+            Some([a[0], a[1], b[0], b[1]])
+        })
+    }
+}
+
+/// Number of points PG reads out of a path literal: half the comma count,
+/// rounding up. The decode pass then insists on consuming exactly that many
+/// points and nothing more, so a malformed list still fails.
+fn pair_count(s: &str) -> usize {
+    let ndelim = s.bytes().filter(|&c| c == b',').count();
+    ndelim.div_ceil(2)
+}
+
+/// Parse a `path`: `[(x1,y1),...]` (open), `((x1,y1),...)` (closed), and the
+/// unbracketed / bare-coordinate spellings (`(1,2),(3,4)`, `1,2,3,4`).
+pub fn parse_path(orig: &str) -> Result<PathVal, GeoError> {
+    let npts = pair_count(orig);
+    if npts == 0 {
+        return Err(syntax("path", orig));
+    }
+    let (is_open, pts) = path_decode(orig, true, npts, false, "path")?;
+    Ok(PathVal {
+        closed: !is_open,
+        pts,
+    })
+}
+
+/// Format a `path`: `[(x,y),...]` when open, `((x,y),...)` when closed.
+pub fn format_path(p: &PathVal, efd: i32) -> String {
+    let (open, close) = if p.closed { ('(', ')') } else { ('[', ']') };
+    let mut out = String::new();
+    out.push(open);
+    for (i, pt) in p.pts.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format_point(pt, efd));
+    }
+    out.push(close);
+    out
+}
+
+/// `isopen(path)`.
+pub fn path_isopen(p: &PathVal) -> bool {
+    !p.closed
+}
+/// `isclosed(path)`.
+pub fn path_isclosed(p: &PathVal) -> bool {
+    p.closed
+}
+/// `popen(path)`: the same vertices, marked open.
+pub fn path_popen(p: &PathVal) -> PathVal {
+    PathVal {
+        closed: false,
+        pts: p.pts.clone(),
+    }
+}
+/// `pclose(path)`: the same vertices, marked closed.
+pub fn path_pclose(p: &PathVal) -> PathVal {
+    PathVal {
+        closed: true,
+        pts: p.pts.clone(),
+    }
+}
+/// `# path` / `npoints(path)`.
+pub fn path_npoints(p: &PathVal) -> i32 {
+    // A path is built from a parsed literal or from other paths, so the vertex
+    // count always fits an int4 in practice; saturate rather than wrap.
+    i32::try_from(p.pts.len()).unwrap_or(i32::MAX)
+}
+
+/// `@-@ path` / `length(path)`: the total segment length, including the closing
+/// segment of a closed path. A one-point path has length 0.
+pub fn path_length(p: &PathVal) -> f64 {
+    // Folded from `0.0` rather than summed: `f64`'s `Sum` identity is `-0.0`, so
+    // a segment-less path would otherwise print as `-0`.
+    p.segments().fold(0.0, |acc, s| acc + lseg_length(&s))
+}
+
+/// `area(path)`: the enclosed area of a closed path (the shoelace formula,
+/// sign-independent). An open path has no area — PG returns NULL, so does this.
+pub fn path_area(p: &PathVal) -> Option<f64> {
+    if !p.closed {
+        return None;
+    }
+    let n = p.pts.len();
+    let mut area = 0.0;
+    for i in 0..n {
+        let a = p.pts[i];
+        let b = p.pts[(i + 1) % n];
+        area += a[0] * b[1] - a[1] * b[0];
+    }
+    Some((area / 2.0).abs())
+}
+
+/// `path + path`: concatenation. Only open paths can be concatenated; if either
+/// operand is closed the result is NULL, matching PG.
+pub fn path_concat(a: &PathVal, b: &PathVal) -> Option<PathVal> {
+    if a.closed || b.closed {
+        return None;
+    }
+    let mut pts = a.pts.clone();
+    pts.extend_from_slice(&b.pts);
+    Some(PathVal { closed: false, pts })
+}
+
+/// One of the checked point arithmetic operations (`point_add` and friends).
+type PointOp = fn(&[f64; 2], &[f64; 2]) -> Result<[f64; 2], GeoError>;
+
+/// Apply a per-vertex point operation, preserving open/closed. Backs
+/// `path + point`, `- point`, `* point` and `/ point`.
+fn path_map_pt(p: &PathVal, q: &[f64; 2], f: PointOp) -> Result<PathVal, GeoError> {
+    let pts = p.pts.iter().map(|v| f(v, q)).collect::<Result<_, _>>()?;
+    Ok(PathVal {
+        closed: p.closed,
+        pts,
+    })
+}
+
+/// `path + point`: translate.
+pub fn path_add_pt(p: &PathVal, q: &[f64; 2]) -> Result<PathVal, GeoError> {
+    path_map_pt(p, q, point_add)
+}
+/// `path - point`: translate by the negated point.
+pub fn path_sub_pt(p: &PathVal, q: &[f64; 2]) -> Result<PathVal, GeoError> {
+    path_map_pt(p, q, point_sub)
+}
+/// `path * point`: rotate / scale (complex multiply each vertex).
+pub fn path_mul_pt(p: &PathVal, q: &[f64; 2]) -> Result<PathVal, GeoError> {
+    path_map_pt(p, q, point_mul)
+}
+/// `path / point`: rotate / scale (complex divide each vertex). Dividing by
+/// `(0,0)` raises `division by zero`.
+pub fn path_div_pt(p: &PathVal, q: &[f64; 2]) -> Result<PathVal, GeoError> {
+    path_map_pt(p, q, point_div)
+}
+
+/// `path <-> path`: the shortest distance between any segment of one and any
+/// segment of the other. Two paths with no segments at all (one-point open
+/// paths) have no distance, so the result is NULL like PG's.
+pub fn path_distance(a: &PathVal, b: &PathVal) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for s1 in a.segments() {
+        for s2 in b.segments() {
+            let d = dist_seg_seg(&s1, &s2);
+            best = Some(best.map_or(d, |m: f64| m.min(d)));
+        }
+    }
+    best
+}
+
+/// `path <-> point` (and `point <-> path`): the shortest distance from the point
+/// to any segment. A path with no segments at all (a one-point *open* path) has
+/// no candidate to measure against and PG reports `0` — note this differs from
+/// `path <-> path`, which is NULL in the same situation.
+pub fn dist_path_point(p: &PathVal, q: &[f64; 2]) -> f64 {
+    p.segments()
+        .map(|s| dist_point_seg(q, &s))
+        .fold(None, |best: Option<f64>, d| {
+            Some(best.map_or(d, |m| m.min(d)))
+        })
+        .unwrap_or(0.0)
+}
+
+/// Whether a point lies on the boundary of the path (any segment, including the
+/// closing one).
+fn point_on_path_boundary(q: &[f64; 2], p: &PathVal) -> bool {
+    p.segments().any(|s| point_on_seg(q, &s))
+}
+
+/// Whether a point lies inside or on the boundary of the polygon formed by the
+/// vertex list, by winding number. Self-intersecting outlines therefore follow
+/// the nonzero rule, matching PG's crossing-count behavior.
+fn point_inside(q: &[f64; 2], pts: &[[f64; 2]]) -> bool {
+    let n = pts.len();
+    // `is_left > 0` when `q` lies left of the directed edge a -> b.
+    let is_left = |a: &[f64; 2], b: &[f64; 2]| {
+        (b[0] - a[0]) * (q[1] - a[1]) - (q[0] - a[0]) * (b[1] - a[1])
+    };
+    let mut wn = 0i64;
+    for i in 0..n {
+        let a = &pts[i];
+        let b = &pts[(i + 1) % n];
+        if a[1] <= q[1] {
+            if b[1] > q[1] && is_left(a, b) > 0.0 {
+                wn += 1;
+            }
+        } else if b[1] <= q[1] && is_left(a, b) < 0.0 {
+            wn -= 1;
+        }
+    }
+    wn != 0
+}
+
+/// `point <@ path`: for an open path, the point lies on one of the segments;
+/// for a closed path, PG treats the vertex list as a region, so it is an
+/// inside-or-on-the-boundary test.
+pub fn on_ppath(q: &[f64; 2], p: &PathVal) -> bool {
+    if !p.closed {
+        return point_on_path_boundary(q, p);
+    }
+    point_on_path_boundary(q, p) || point_inside(q, &p.pts)
+}
+
+/// `path @> point`. PG defines this as exactly the commutator of `point <@ path`
+/// with no open/closed distinction, so an *open* path does contain the points
+/// lying on its outline.
+pub fn path_contain_pt(p: &PathVal, q: &[f64; 2]) -> bool {
+    on_ppath(q, p)
+}
+
+/// `path ?# path`: any segment of one crosses any segment of the other.
+pub fn path_inter(a: &PathVal, b: &PathVal) -> bool {
+    a.segments()
+        .any(|s1| b.segments().any(|s2| lseg_interpt(&s1, &s2).is_some()))
+}
+
+/// `= <> < <= > >=` on paths compare the *number of points* only — PG's b-tree
+/// ordering for `path` is by vertex count, so `'[(0,0),(1,1)]' = '((5,5),(6,6))'`
+/// is true.
+pub fn path_n_cmp(a: &PathVal, b: &PathVal) -> std::cmp::Ordering {
+    a.pts.len().cmp(&b.pts.len())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -588,6 +880,10 @@ mod tests {
             [-1_000_000.0, 200.0, 300_000.0, -40.0]
         );
         assert_eq!(parse_lseg("((0,0),(1,0))")?, [0.0, 0.0, 1.0, 0.0]);
+        // A bare coordinate list inside a single pair of parens: the leading
+        // '(' is a grouping paren because it is the last '(' in the string.
+        assert_eq!(parse_lseg("(1,2,3,4)")?, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(parse_lseg("( 11,12,13,14) ")?, [11.0, 12.0, 13.0, 14.0]);
         assert_eq!(format_lseg(&[1.0, 2.0, 3.0, 4.0], 0), "[(1,2),(3,4)]");
 
         Ok(())
@@ -695,5 +991,273 @@ mod tests {
             &[0.0, 0.0, 0.0, 5.0],
             &[0.0, 0.0, 5.0, 0.0]
         ));
+    }
+
+    /// Round-trip a path literal through parse + format at `extra_float_digits`
+    /// 0, which is how the type renders on the wire by default.
+    fn path_io(s: &str) -> Result<String, GeoError> {
+        Ok(format_path(&parse_path(s)?, 0))
+    }
+
+    #[test]
+    fn path_forms_and_format() -> anyhow::Result<()> {
+        // Every spelling upstream's path.sql feeds the type.
+        assert_eq!(path_io("[(1,2),(3,4)]")?, "[(1,2),(3,4)]");
+        assert_eq!(path_io(" ( ( 1 , 2 ) , ( 3 , 4 ) ) ")?, "((1,2),(3,4))");
+        assert_eq!(
+            path_io("[ (0,0),(3,0),(4,5),(1,6) ]")?,
+            "[(0,0),(3,0),(4,5),(1,6)]"
+        );
+        assert_eq!(path_io("((1,2) ,(3,4 ))")?, "((1,2),(3,4))");
+        assert_eq!(path_io("1,2 ,3,4 ")?, "((1,2),(3,4))");
+        assert_eq!(path_io(" [1,2,3, 4] ")?, "[(1,2),(3,4)]");
+        assert_eq!(path_io("((10,20))")?, "((10,20))");
+        assert_eq!(path_io("[ 11,12,13,14 ]")?, "[(11,12),(13,14)]");
+        assert_eq!(path_io("( 11,12,13,14) ")?, "((11,12),(13,14))");
+
+        Ok(())
+    }
+
+    /// A trailing separator before the closing delimiter is a syntax error for
+    /// `path` but accepted for `lseg` — the two types genuinely differ here.
+    #[test]
+    fn trailing_separator_differs_between_path_and_lseg() -> anyhow::Result<()> {
+        for lenient in ["[(1,2),(3,4),]", "((1,2),(3,4),)", "(1,2,3,4,)", "[1,2,3,4,]"] {
+            assert_eq!(parse_lseg(lenient)?, [1.0, 2.0, 3.0, 4.0], "{lenient}");
+            assert_eq!(
+                parse_path(lenient).unwrap_err().sqlstate,
+                "22P02",
+                "path must reject {lenient}"
+            );
+        }
+        // Both reject a separator outside the closing delimiter, and lseg still
+        // rejects a list that runs out of points.
+        assert_eq!(parse_lseg("[(1,2),(3,4)],").unwrap_err().sqlstate, "22P02");
+        assert_eq!(parse_path("[(1,2),(3,4)],").unwrap_err().sqlstate, "22P02");
+        assert_eq!(parse_lseg("[(1,2),]").unwrap_err().sqlstate, "22P02");
+
+        Ok(())
+    }
+
+    /// A one-point *closed* path carries a degenerate zero-length segment; a
+    /// one-point *open* path has no segments at all.
+    #[test]
+    fn one_point_paths() -> anyhow::Result<()> {
+        let closed1 = parse_path("((10,20))")?;
+        let open1 = parse_path("[(10,20)]")?;
+        assert!(on_ppath(&[10.0, 20.0], &closed1));
+        assert!(path_contain_pt(&closed1, &[10.0, 20.0]));
+        // An open one-point path has no segment, so nothing lies on it.
+        assert!(!on_ppath(&[10.0, 20.0], &open1));
+        assert!(!on_ppath(&[0.0, 0.0], &closed1));
+        // Its degenerate segment meets a real segment running through it, but
+        // never another degenerate segment — even the identical one.
+        assert!(path_inter(
+            &parse_path("((0,0))")?,
+            &parse_path("((0,0),(1,1))")?
+        ));
+        assert!(path_inter(
+            &parse_path("((1,1))")?,
+            &parse_path("((0,0),(2,2))")?
+        ));
+        assert!(!path_inter(
+            &parse_path("((5,5))")?,
+            &parse_path("((0,0),(1,1))")?
+        ));
+        assert!(!path_inter(&closed1, &closed1));
+        assert!(!path_inter(&open1, &open1));
+        // Length and area stay 0 (and +0, not -0).
+        assert_eq!(path_length(&closed1), 0.0);
+        assert!(path_length(&closed1).is_sign_positive());
+        assert_eq!(path_area(&closed1), Some(0.0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_bad_input() {
+        for bad in [
+            "[]",
+            "[(,2),(3,4)]",
+            "[(1,2),(3,4)",
+            "(1,2,3,4",
+            "(1,2),(3,4)]",
+            "[(1,2),(3)]",
+            "[(1,2,6),(3,4,6)]",
+        ] {
+            let e = parse_path(bad).unwrap_err();
+            assert_eq!(e.sqlstate, "22P02", "{bad}");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type path: \"{bad}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn path_predicates_and_conversions() -> anyhow::Result<()> {
+        let open = parse_path("[(1,2),(3,4)]")?;
+        let closed = parse_path("((1,2),(3,4))")?;
+        assert!(path_isopen(&open) && !path_isclosed(&open));
+        assert!(path_isclosed(&closed) && !path_isopen(&closed));
+        assert_eq!(format_path(&path_pclose(&open), 0), "((1,2),(3,4))");
+        assert_eq!(format_path(&path_popen(&closed), 0), "[(1,2),(3,4)]");
+        // A single-point path converts both ways too.
+        assert_eq!(format_path(&path_popen(&parse_path("((10,20))")?), 0), "[(10,20)]");
+        assert_eq!(path_npoints(&parse_path("[(0,0),(3,0),(4,5),(1,6)]")?), 4);
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_length_and_area() -> anyhow::Result<()> {
+        // A closed path adds the segment from the last vertex back to the first.
+        assert_eq!(path_length(&parse_path("[(0,0),(3,0),(3,4)]")?), 7.0);
+        assert_eq!(path_length(&parse_path("((0,0),(3,0),(3,4))")?), 12.0);
+        // A path with no segments is +0, not -0: the sign reaches the output.
+        let len1 = path_length(&parse_path("[(1,2)]")?);
+        assert_eq!(len1, 0.0);
+        assert!(len1.is_sign_positive(), "one-point path length must be +0");
+        assert!(path_length(&parse_path("((1,2))")?).is_sign_positive());
+
+        assert_eq!(path_area(&parse_path("((0,0),(4,0),(4,3))")?), Some(6.0));
+        // The shoelace sign depends on winding; the area does not.
+        assert_eq!(
+            path_area(&parse_path("((0,0),(0,3),(4,3),(4,0))")?),
+            Some(12.0)
+        );
+        assert_eq!(path_area(&parse_path("((1,2))")?), Some(0.0));
+        assert_eq!(path_area(&parse_path("[(0,0),(4,0),(4,3)]")?), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_arithmetic() -> anyhow::Result<()> {
+        let p = parse_path("[(1,2),(3,4)]")?;
+        assert_eq!(
+            format_path(&path_add_pt(&p, &[1.0, 1.0])?, 0),
+            "[(2,3),(4,5)]"
+        );
+        assert_eq!(
+            format_path(&path_sub_pt(&p, &[1.0, 1.0])?, 0),
+            "[(0,1),(2,3)]"
+        );
+        assert_eq!(
+            format_path(&path_mul_pt(&p, &[2.0, 0.0])?, 0),
+            "[(2,4),(6,8)]"
+        );
+        assert_eq!(
+            format_path(&path_div_pt(&p, &[2.0, 0.0])?, 0),
+            "[(0.5,1),(1.5,2)]"
+        );
+        assert_eq!(path_div_pt(&p, &[0.0, 0.0]).unwrap_err().sqlstate, "22012");
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_concat_requires_open_operands() -> anyhow::Result<()> {
+        let open = parse_path("[(0,0),(1,0)]")?;
+        let closed = parse_path("((2,2),(3,3))")?;
+        let other = parse_path("[(2,2),(3,3)]")?;
+        assert_eq!(
+            path_concat(&open, &other).map(|p| format_path(&p, 0)),
+            Some("[(0,0),(1,0),(2,2),(3,3)]".to_string())
+        );
+        assert_eq!(path_concat(&open, &closed), None);
+        assert_eq!(path_concat(&closed, &open), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_distance_and_intersection() -> anyhow::Result<()> {
+        let a = parse_path("[(0,0),(1,1)]")?;
+        let b = parse_path("[(3,0),(4,1)]")?;
+        assert_eq!(path_distance(&a, &b), Some(5f64.sqrt()));
+        assert_eq!(
+            path_distance(
+                &parse_path("((0,0),(1,0),(1,1))")?,
+                &parse_path("((5,0),(6,0))")?
+            ),
+            Some(4.0)
+        );
+        // No segments at all on one side: no distance, like PG's NULL. A closed
+        // one-point path DOES have a (degenerate) segment, so it measures.
+        assert_eq!(
+            path_distance(&parse_path("[(0,0)]")?, &parse_path("[(9,9)]")?),
+            None
+        );
+        assert_eq!(
+            path_distance(&parse_path("[(0,0)]")?, &parse_path("((9,9))")?),
+            None
+        );
+        assert_eq!(
+            path_distance(&parse_path("((0,0))")?, &parse_path("((3,4))")?),
+            Some(5.0)
+        );
+
+        assert_eq!(dist_path_point(&a, &[2.0, 0.0]), 2f64.sqrt());
+        // A one-point OPEN path has no segment to measure against: PG says 0.
+        // A one-point CLOSED path measures against its degenerate segment.
+        assert_eq!(dist_path_point(&parse_path("[(0,0)]")?, &[3.0, 4.0]), 0.0);
+        assert_eq!(dist_path_point(&parse_path("((0,0))")?, &[3.0, 4.0]), 5.0);
+
+        assert!(path_inter(
+            &parse_path("[(0,0),(2,0)]")?,
+            &parse_path("[(1,-1),(1,1)]")?
+        ));
+        assert!(!path_inter(
+            &parse_path("[(0,0),(2,0)]")?,
+            &parse_path("[(0,1),(2,1)]")?
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_containment() -> anyhow::Result<()> {
+        let closed_square = parse_path("((0,0),(4,0),(4,4),(0,4))")?;
+        let open_square = parse_path("[(0,0),(4,0),(4,4),(0,4)]")?;
+        assert!(path_contain_pt(&closed_square, &[1.0, 1.0]));
+        // Boundary and vertex points count as contained.
+        assert!(path_contain_pt(&closed_square, &[0.0, 2.0]));
+        assert!(path_contain_pt(&closed_square, &[4.0, 4.0]));
+        assert!(!path_contain_pt(&closed_square, &[5.0, 5.0]));
+        // An open path does not enclose its interior...
+        assert!(!path_contain_pt(&open_square, &[1.0, 1.0]));
+        // ...but `@>` is the commutator of `<@`, so points ON an open path's
+        // outline ARE contained.
+        assert!(path_contain_pt(&open_square, &[2.0, 0.0]));
+        assert!(path_contain_pt(&parse_path("[(0,0),(4,0)]")?, &[1.0, 0.0]));
+        // The two spellings must agree for every pair.
+        for p in [&closed_square, &open_square] {
+            for q in [[1.0, 1.0], [2.0, 0.0], [5.0, 5.0], [0.0, 2.0]] {
+                assert_eq!(path_contain_pt(p, &q), on_ppath(&q, p), "{p:?} vs {q:?}");
+            }
+        }
+
+        // `<@` on an open path is an on-the-outline test...
+        assert!(on_ppath(&[1.0, 0.0], &parse_path("[(0,0),(2,0)]")?));
+        assert!(!on_ppath(&[1.0, 1.0], &open_square));
+        // ...but on a closed path it is the same region test as `@>`.
+        assert!(on_ppath(&[1.0, 3.0], &parse_path("((0,0),(2,0),(2,6))")?));
+        assert!(on_ppath(&[1.0, 1.0], &closed_square));
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_comparisons_use_the_point_count() -> anyhow::Result<()> {
+        use std::cmp::Ordering;
+        let two_open = parse_path("[(0,0),(1,1)]")?;
+        let two_closed = parse_path("((5,5),(6,6))")?;
+        let three = parse_path("[(0,0),(1,1),(2,2)]")?;
+        assert_eq!(path_n_cmp(&two_open, &two_closed), Ordering::Equal);
+        assert_eq!(path_n_cmp(&three, &two_closed), Ordering::Greater);
+        assert_eq!(path_n_cmp(&two_open, &three), Ordering::Less);
+
+        Ok(())
     }
 }

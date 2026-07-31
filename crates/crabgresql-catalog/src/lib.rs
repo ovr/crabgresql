@@ -978,6 +978,7 @@ mod tests {
             ("cidr", PgType::Cidr),
             ("point", PgType::Point),
             ("lseg", PgType::Lseg),
+            ("path", PgType::Path),
             ("json", PgType::Json),
             ("jsonb", PgType::Jsonb),
             ("jsonpath", PgType::Jsonpath),

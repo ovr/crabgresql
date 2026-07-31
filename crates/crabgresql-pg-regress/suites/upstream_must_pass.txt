@@ -9,5 +9,6 @@ macaddr
 macaddr8
 md5
 money
+path
 time
 varchar

@@ -461,7 +461,7 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
                 message: e.message,
             }),
 
-        // ---- text → point / lseg (point_in / lseg_in) ----
+        // ---- text → point / lseg / path (point_in / lseg_in / path_in) ----
         (Value::Text(s), PgType::Point) => {
             crate::geo::parse_point(s)
                 .map(Value::Point)
@@ -473,6 +473,14 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Text(s), PgType::Lseg) => {
             crate::geo::parse_lseg(s)
                 .map(Value::Lseg)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        (Value::Text(s), PgType::Path) => {
+            crate::geo::parse_path(s)
+                .map(Value::Path)
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,

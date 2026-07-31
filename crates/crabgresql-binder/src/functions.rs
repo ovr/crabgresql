@@ -564,7 +564,7 @@ pub enum TsFn {
     QueryPhraseDist,
 }
 
-/// A geometric (`point` / `lseg`) operation. Operators lower to these via
+/// A geometric (`point` / `lseg` / `path`) operation. Operators lower to these via
 /// `resolve_geometric_op`/`resolve_geometric_unary`; named functions register
 /// them in [`lookup`]. Argument order is fixed per variant (see each doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -635,6 +635,53 @@ pub enum GeoFn {
     CloseSegSeg,
     /// `l1 <-> l2` segment distance (`-> float8`).
     DistSegSeg,
+    /// `isopen(path) -> bool`.
+    PathIsOpen,
+    /// `isclosed(path) -> bool`.
+    PathIsClosed,
+    /// `popen(path) -> path`.
+    PathPopen,
+    /// `pclose(path) -> path`.
+    PathPclose,
+    /// `# path` / `npoints(path) -> int4`.
+    PathNpoints,
+    /// `@-@ path` / `length(path) -> float8`.
+    PathLength,
+    /// `area(path) -> float8` (NULL for an open path).
+    PathArea,
+    /// `p1 + p2` path concatenation (`-> path`, NULL if either is closed).
+    PathConcat,
+    /// `path + point` translate (`-> path`).
+    PathAddPt,
+    /// `path - point` translate (`-> path`).
+    PathSubPt,
+    /// `path * point` rotate / scale (`-> path`).
+    PathMulPt,
+    /// `path / point` rotate / scale (`-> path`).
+    PathDivPt,
+    /// `p1 <-> p2` path distance (`-> float8`, NULL if neither has a segment).
+    PathDist,
+    /// `path <-> point` distance (`-> float8`); args are `[path, point]`.
+    DistPathPoint,
+    /// `point <@ path` (on the outline, or inside a closed path); args are
+    /// `[point, path]`.
+    OnPpath,
+    /// `path @> point` (inside or on a closed path); args are `[path, point]`.
+    PathContainPt,
+    /// `p1 ?# p2` (their outlines cross).
+    PathInter,
+    /// `p1 = p2` (equal point counts).
+    PathEq,
+    /// `p1 <> p2`.
+    PathNe,
+    /// `p1 < p2` (by point count).
+    PathLt,
+    /// `p1 <= p2` (by point count).
+    PathLe,
+    /// `p1 > p2` (by point count).
+    PathGt,
+    /// `p1 >= p2` (by point count).
+    PathGe,
 }
 
 struct Signature {
@@ -973,6 +1020,7 @@ const MACADDR: PgType = PgType::Macaddr;
 const MACADDR8: PgType = PgType::Macaddr8;
 const POINT: PgType = PgType::Point;
 const LSEG: PgType = PgType::Lseg;
+const PATH: PgType = PgType::Path;
 const JSONB: PgType = PgType::Jsonb;
 const JSONPATH: PgType = PgType::Jsonpath;
 const TSVECTOR: PgType = PgType::Tsvector;
@@ -1458,6 +1506,12 @@ fn lookup(name: &str) -> &'static [Signature] {
                 args: &[TSVECTOR],
                 ret: I4,
             },
+            // `length(path)` is the total segment length, not a count.
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PathLength),
+                args: &[PATH],
+                ret: F8,
+            },
         ],
         "char_length" | "character_length" => &[Signature {
             func: ScalarFn::Length,
@@ -1925,6 +1979,36 @@ fn lookup(name: &str) -> &'static [Signature] {
             func: ScalarFn::Geo(GeoFn::PointVert),
             args: &[POINT, POINT],
             ret: BOOL,
+        }],
+        "isopen" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PathIsOpen),
+            args: &[PATH],
+            ret: BOOL,
+        }],
+        "isclosed" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PathIsClosed),
+            args: &[PATH],
+            ret: BOOL,
+        }],
+        "popen" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PathPopen),
+            args: &[PATH],
+            ret: PATH,
+        }],
+        "pclose" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PathPclose),
+            args: &[PATH],
+            ret: PATH,
+        }],
+        "npoints" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PathNpoints),
+            args: &[PATH],
+            ret: I4,
+        }],
+        "area" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PathArea),
+            args: &[PATH],
+            ret: F8,
         }],
         // --- jsonpath query functions: each has the 2-arg form plus the
         // optional `vars jsonb` / `silent bool` arguments PG's DEFAULTs add ---

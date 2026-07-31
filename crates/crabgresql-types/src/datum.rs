@@ -57,6 +57,7 @@ const T_TSQUERY: u8 = 33;
 /// text had to be re-parsed on read; that tag is still decoded so pages written
 /// before the change keep working.
 const T_JSONPATH_TREE: u8 = 34;
+const T_PATH: u8 = 35;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -173,6 +174,18 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.push(T_LSEG);
             for c in l {
                 out.extend_from_slice(&c.to_bits().to_le_bytes());
+            }
+        }
+        // `path` is variable length: the open/closed flag, then the vertex count,
+        // then the coordinate pairs.
+        Value::Path(p) => {
+            out.push(T_PATH);
+            out.push(p.closed as u8);
+            out.extend_from_slice(&(p.pts.len() as u32).to_le_bytes());
+            for pt in &p.pts {
+                for c in pt {
+                    out.extend_from_slice(&c.to_bits().to_le_bytes());
+                }
             }
         }
         // A reg* value stores the OID *and* the name it renders as, because the
@@ -357,6 +370,23 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             f64::from_bits(r.u64()),
             f64::from_bits(r.u64()),
         ]),
+        T_PATH => {
+            let closed = r.take(1)[0] != 0;
+            let npts = r.u32() as usize;
+            // The count comes off the page, so bound it by the bytes actually
+            // left before reserving. `(0..npts)` is `TrustedLen`, so `collect`
+            // reserves `npts * 16` up front; on a corrupt count that would be a
+            // huge allocation (and an abort on failure) instead of the ordinary
+            // bounds panic every other varlena decode gets from `take`.
+            let need = npts.saturating_mul(16);
+            if need > r.buf.len().saturating_sub(r.pos) {
+                r.take(need); // diverges: same bounds panic as `var()`
+            }
+            let pts = (0..npts)
+                .map(|_| [f64::from_bits(r.u64()), f64::from_bits(r.u64())])
+                .collect();
+            Value::Path(crate::geo::PathVal { closed, pts })
+        }
         T_REG => {
             let kind_oid = r.u32();
             let PgType::Reg(kind) = PgType::from_oid(kind_oid)
@@ -427,6 +457,26 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
 mod tests {
     use super::*;
     use crate::RegKind;
+
+    /// A corrupt vertex count must fail the ordinary bounds check rather than
+    /// trying to reserve `npts * 16` bytes (which for a bogus count is a huge
+    /// allocation, and an abort rather than a panic if it fails).
+    #[test]
+    #[should_panic(expected = "range end index")]
+    fn path_decode_rejects_a_bogus_vertex_count() {
+        let mut buf = Vec::new();
+        encode_datum(
+            &Value::Path(crate::geo::PathVal {
+                closed: false,
+                pts: vec![[1.0, 2.0], [3.0, 4.0]],
+            }),
+            &mut buf,
+        );
+        // Overwrite the count (tag byte + closed flag) with 0xFFFFFFFF.
+        buf[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut pos = 0;
+        decode_datum(&buf, &mut pos);
+    }
 
     fn roundtrip(v: Value) {
         let mut buf = Vec::new();
@@ -523,6 +573,18 @@ mod tests {
         roundtrip(Value::Point([f64::INFINITY, -1e300]));
         roundtrip(Value::Lseg([1.0, 2.0, 3.0, 4.0]));
         roundtrip(Value::Lseg([-1e6, 200.0, 3e5, -40.0]));
+        roundtrip(Value::Path(crate::geo::PathVal {
+            closed: false,
+            pts: vec![[1.0, 2.0], [3.0, 4.0]],
+        }));
+        roundtrip(Value::Path(crate::geo::PathVal {
+            closed: true,
+            pts: vec![[0.0, 0.0], [3.0, 0.0], [4.0, 5.0], [1.0, 6.0]],
+        }));
+        roundtrip(Value::Path(crate::geo::PathVal {
+            closed: true,
+            pts: vec![[10.0, 20.0]],
+        }));
         roundtrip(Value::Enum { type_oid: 16384, ordinal: 0, label: "red".into() });
         roundtrip(Value::Enum { type_oid: 99999, ordinal: 42, label: String::new() });
         // `json` keeps its raw text; `jsonb` its canonical tree.
