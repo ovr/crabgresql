@@ -95,7 +95,9 @@ fn encode_one(ty: PgType, v: &Value, out: &mut Vec<u8>) -> Option<()> {
     match (ty, v) {
         (_, Value::Null) => return None,
         (PgType::Bool, Value::Bool(b)) => out.push(u8::from(*b)),
-        (PgType::Int2, Value::Int2(x)) => out.extend_from_slice(&(*x as u16 ^ 0x8000).to_be_bytes()),
+        (PgType::Int2, Value::Int2(x)) => {
+            out.extend_from_slice(&(*x as u16 ^ 0x8000).to_be_bytes())
+        }
         (PgType::Int4, Value::Int4(x)) => {
             out.extend_from_slice(&(*x as u32 ^ 0x8000_0000).to_be_bytes())
         }
@@ -257,9 +259,11 @@ mod tests {
         );
         assert_order_preserved(
             PgType::Uuid,
-            &[[0u8; 16], [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [
-                0xff; 16
-            ]]
+            &[
+                [0u8; 16],
+                [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0xff; 16],
+            ]
             .map(Value::Uuid)
             .to_vec(),
         );

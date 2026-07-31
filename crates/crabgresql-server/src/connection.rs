@@ -343,7 +343,8 @@ async fn run_simple_query(
             }
             continue;
         }
-        let outcome = execute_statement(engine, catalog, txnmgr, stmt, session, &BoundParams::none());
+        let outcome =
+            execute_statement(engine, catalog, txnmgr, stmt, session, &BoundParams::none());
         // Diagnostics a routine raised belong to this statement whether it
         // succeeded or failed. Handlers fold them into their own result, but
         // draining again here is what makes stranding them impossible: a path

@@ -46,7 +46,10 @@ fn read(tm: &TransactionManager) -> TxnContext {
 
 fn insert_committed(tm: &TransactionManager, table: &dyn TableAm, id: i32, name: &str) -> Tid {
     let x = tm.allocate_xid();
-    let tid = table.insert(vec![Value::Int4(id), Value::Text(name.into())], &tm.context(x, CommandId::FIRST));
+    let tid = table.insert(
+        vec![Value::Int4(id), Value::Text(name.into())],
+        &tm.context(x, CommandId::FIRST),
+    );
     tm.commit(x).expect("commit");
     tid.unwrap_or_else(|error| panic!("insert failed: {error}"))
 }
@@ -101,7 +104,10 @@ fn builds_and_probes_and_maintains_on_later_insert() -> anyhow::Result<()> {
     // A missing key is served as empty, and the probe agrees with a scan.
     assert!(probe_ids(&*table, &read(&tm), 99).is_empty());
     for k in [1, 2, 3, 99] {
-        assert_eq!(probe_ids(&*table, &read(&tm), k), scan_ids(&*table, &read(&tm), k));
+        assert_eq!(
+            probe_ids(&*table, &read(&tm), k),
+            scan_ids(&*table, &read(&tm), k)
+        );
     }
     Ok(())
 }
@@ -182,7 +188,11 @@ fn update_moves_key_and_old_snapshot_still_sees_old_version() -> anyhow::Result<
 
     // Update the key column 1 -> 2, committed.
     let xu = tm.allocate_xid();
-    table.update(tid, vec![Value::Int4(2), Value::Text("a2".into())], &tm.context(xu, CommandId::FIRST))?;
+    table.update(
+        tid,
+        vec![Value::Int4(2), Value::Text("a2".into())],
+        &tm.context(xu, CommandId::FIRST),
+    )?;
     tm.commit(xu)?;
 
     // Under the pre-update snapshot: key 1 still finds the old version, key 2 is
@@ -225,8 +235,14 @@ fn null_key_is_not_indexed_and_probing_null_is_empty() -> anyhow::Result<()> {
     engine.create_index("public", "t", idx_on_id())?;
     // Row whose key column is NULL: not indexed (NULL never satisfies equality).
     let x = tm.allocate_xid();
-    table.insert(vec![Value::Null, Value::Text("null-key".into())], &tm.context(x, CommandId::FIRST))?;
-    table.insert(vec![Value::Int4(1), Value::Text("one".into())], &tm.context(x, CommandId::FIRST))?;
+    table.insert(
+        vec![Value::Null, Value::Text("null-key".into())],
+        &tm.context(x, CommandId::FIRST),
+    )?;
+    table.insert(
+        vec![Value::Int4(1), Value::Text("one".into())],
+        &tm.context(x, CommandId::FIRST),
+    )?;
     tm.commit(x)?;
 
     // A NULL probe is served (the index is physical) but matches nothing.
@@ -256,7 +272,11 @@ fn un_indexable_key_type_falls_back_to_scan() -> anyhow::Result<()> {
         IndexMetadata {
             name: "t_id_idx".into(),
             method: IndexMethod::BTree,
-            keys: vec![IndexKey { column: 0, descending: false, nulls_first: false }],
+            keys: vec![IndexKey {
+                column: 0,
+                descending: false,
+                nulls_first: false,
+            }],
             unique: false,
             nulls_distinct: true,
             constraint: None,
@@ -294,7 +314,10 @@ fn vacuum_removes_the_index_entry_so_a_reused_slot_is_not_found() -> anyhow::Res
 
     // Probing the OLD key must not surface the new row: vacuum removed the stale
     // (key 1 -> tid) entry. Probing the new key finds the new row.
-    assert!(probe_ids(&*table, &read(&tm), 1).is_empty(), "stale key is gone");
+    assert!(
+        probe_ids(&*table, &read(&tm), 1).is_empty(),
+        "stale key is gone"
+    );
     assert_eq!(probe_ids(&*table, &read(&tm), 2), vec![2]);
     Ok(())
 }
@@ -380,7 +403,10 @@ fn a_bounded_replay_after_a_checkpoint_keeps_every_split_reachable() -> anyhow::
 
     // --- lifetime 2: destroy the prefix below redo, then replay from redo. ---
     let redo = crabgresql_wal::Lsn(redo.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(redo.is_valid(), "the checkpointer never sampled a redo point");
+    assert!(
+        redo.is_valid(),
+        "the checkpointer never sampled a redo point"
+    );
     common::scribble(&common::wal_file_path(dir.path()), 0, redo.0, 0xAB)?;
     {
         let (engine, tm) = common::open_from(dir.path(), redo)?;
@@ -433,7 +459,11 @@ fn index_survives_a_crash_and_serves_probes_after_recovery() -> anyhow::Result<(
         // serves probes reconstructed purely from replayed WAL.
         assert!(table.supports_index_scan("t_id_idx"));
         for k in [1, 2, 3, 400, 799] {
-            assert_eq!(probe_ids(&*table, &read(&tm), k), vec![k], "post-recovery probe {k}");
+            assert_eq!(
+                probe_ids(&*table, &read(&tm), k),
+                vec![k],
+                "post-recovery probe {k}"
+            );
         }
         assert!(probe_ids(&*table, &read(&tm), 5000).is_empty());
         // The recovered index keeps working for new rows.
@@ -547,7 +577,10 @@ fn metadata_only_index_allocates_no_file_and_no_relfilenode() -> anyhow::Result<
     let dir = tempfile::tempdir()?;
     let (engine, tm) = open(dir.path())?;
     // float8 is not order-preserving-encodable → metadata-only index.
-    let table = engine.create_table(TableSchema::new("t", vec![Column::new("f", PgType::Float8)]))?;
+    let table = engine.create_table(TableSchema::new(
+        "t",
+        vec![Column::new("f", PgType::Float8)],
+    ))?;
     let x = tm.allocate_xid();
     table.insert(vec![Value::Float8(1.5)], &tm.context(x, CommandId::FIRST))?;
     tm.commit(x)?;
@@ -559,7 +592,11 @@ fn metadata_only_index_allocates_no_file_and_no_relfilenode() -> anyhow::Result<
         IndexMetadata {
             name: "t_f_idx".into(),
             method: IndexMethod::BTree,
-            keys: vec![IndexKey { column: 0, descending: false, nulls_first: false }],
+            keys: vec![IndexKey {
+                column: 0,
+                descending: false,
+                nulls_first: false,
+            }],
             unique: false,
             nulls_distinct: true,
             constraint: None,
@@ -567,7 +604,11 @@ fn metadata_only_index_allocates_no_file_and_no_relfilenode() -> anyhow::Result<
     )?;
 
     // No physical file was created for a metadata-only index (relfilenode 0).
-    assert_eq!(base_files(dir.path()), before, "metadata-only index creates no file");
+    assert_eq!(
+        base_files(dir.path()),
+        before,
+        "metadata-only index creates no file"
+    );
     assert!(!table.supports_index_scan("t_f_idx"));
     Ok(())
 }
@@ -579,7 +620,10 @@ fn oversized_key_create_index_panics_without_freezing_the_table() -> anyhow::Res
     let table = engine.create_table(TableSchema::new("t", vec![Column::new("s", PgType::Text)]))?;
     // A value whose encoded key exceeds the B-tree item cap.
     let x = tm.allocate_xid();
-    table.insert(vec![Value::Text("z".repeat(4000))], &tm.context(x, CommandId::FIRST))?;
+    table.insert(
+        vec![Value::Text("z".repeat(4000))],
+        &tm.context(x, CommandId::FIRST),
+    )?;
     tm.commit(x)?;
 
     // CREATE INDEX panics building the tree (index row size exceeds btree maximum).
@@ -591,7 +635,10 @@ fn oversized_key_create_index_panics_without_freezing_the_table() -> anyhow::Res
     // The table's exclusive lock was released by the RAII guard during unwind, so
     // the table is still usable (this would hang/deadlock if the lock leaked).
     let x = tm.allocate_xid();
-    table.insert(vec![Value::Text("small".into())], &tm.context(x, CommandId::FIRST))?;
+    table.insert(
+        vec![Value::Text("small".into())],
+        &tm.context(x, CommandId::FIRST),
+    )?;
     tm.commit(x)?;
     assert_eq!(table.scan(&read(&tm), &ColumnProjection::All).count(), 2);
     // The failed index was never published.

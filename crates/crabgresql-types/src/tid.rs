@@ -192,8 +192,7 @@ mod tests {
     #[test]
     fn rejects_malformed() {
         for bad in [
-            "",
-            "(0)",     // missing offset
+            "", "(0)",     // missing offset
             "(,1)",    // empty block
             "(0,)",    // empty offset
             "0,1",     // unparenthesized

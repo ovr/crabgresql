@@ -2684,7 +2684,11 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
             value = value * 16 + d;
             digits += 1;
         }
-        if digits == 0 { b'x' } else { value as u8 }
+        if digits == 0 {
+            b'x'
+        } else {
+            value as u8
+        }
     }
 
     /// Octal byte value: `\o`, `\oo`, `\ooo` (o = 0–7). PG truncates rather than

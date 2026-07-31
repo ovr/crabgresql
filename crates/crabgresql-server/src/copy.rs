@@ -329,8 +329,7 @@ fn finish_csv_field(
 /// Whether `bytes[i..]` begins a lone `\.` end-of-data line.
 fn is_eod_line(bytes: &[u8], i: usize) -> bool {
     let rest = &bytes[i..];
-    rest.starts_with(b"\\.")
-        && matches!(rest.get(2), None | Some(b'\n') | Some(b'\r'))
+    rest.starts_with(b"\\.") && matches!(rest.get(2), None | Some(b'\n') | Some(b'\r'))
 }
 
 fn force_not_null_at(format: &CopyFormat, field_index: usize) -> bool {
@@ -392,10 +391,7 @@ mod tests {
         // The three UTF-8 bytes of 日 written as octal, and é as hex — each must
         // round-trip to the single character (byte-oriented decode), not mojibake.
         let rows = decode(&text_format(), b"\\346\\227\\245\t\\xc3\\xa9\n").unwrap();
-        assert_eq!(
-            rows,
-            vec![vec![Some("日".into()), Some("é".into())]]
-        );
+        assert_eq!(rows, vec![vec![Some("日".into()), Some("é".into())]]);
     }
 
     #[test]

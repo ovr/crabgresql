@@ -12,8 +12,7 @@ use std::sync::Mutex;
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
     PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
-    SequenceAdvance, SequenceDefinition, TableSchema, ViewDefinition,
-    TableAccessMethod,
+    SequenceAdvance, SequenceDefinition, TableAccessMethod, TableSchema, ViewDefinition,
 };
 use crabgresql_types::PgType;
 
@@ -893,7 +892,10 @@ impl RelCatalog {
         };
         let advance = {
             let def = persist_sequence_to_definition(&state.sequences[seq]);
-            def.next_value(state.sequences[seq].last_value, state.sequences[seq].is_called)
+            def.next_value(
+                state.sequences[seq].last_value,
+                state.sequences[seq].is_called,
+            )
         };
         if let SequenceAdvance::Value(v) = advance {
             state.sequences[seq].last_value = v;
@@ -1700,8 +1702,7 @@ fn persist_view_to_definition(v: &PersistView) -> ViewDefinition {
             .cols
             .iter()
             .map(|c| {
-                let mut col =
-                    Column::with_typmod(c.name.clone(), pgtype_from_oid(c.oid), c.typmod);
+                let mut col = Column::with_typmod(c.name.clone(), pgtype_from_oid(c.oid), c.typmod);
                 col.nullable = c.nullable;
                 col.not_null_constraint = c.not_null_constraint.clone();
                 col.default = c.default.clone();
@@ -1902,8 +1903,8 @@ mod tests {
     }
 
     #[test]
-    fn toast_relfilenode_survives_and_a_pre_toast_catalog_decodes_with_none()
-    -> anyhow::Result<()> {
+    fn toast_relfilenode_survives_and_a_pre_toast_catalog_decodes_with_none() -> anyhow::Result<()>
+    {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
         catalog.create(&TableSchema::new(
@@ -1962,7 +1963,10 @@ mod tests {
     -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new("t", vec![Column::new("id", PgType::Int4)]))?;
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
         let index_rel = catalog.alloc_relfilenode();
         catalog.add_index_in(
             "public",
@@ -2003,7 +2007,10 @@ mod tests {
         // A pre-B-tree catalog (truncated at the IXR1 marker) keeps the index
         // metadata but decodes it as metadata-only (rel == 0).
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new("u", vec![Column::new("id", PgType::Int4)]))?;
+        catalog.create(&TableSchema::new(
+            "u",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
         let u_index_rel = catalog.alloc_relfilenode();
         catalog.add_index_in(
             "public",
@@ -2047,7 +2054,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
         // A table plus two views, one depending on the other.
-        catalog.create(&TableSchema::new("t", vec![Column::new("id", PgType::Int4)]))?;
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
         assert!(catalog.create_view(&ViewDefinition {
             name: "v".to_string(),
             namespace: "public".to_string(),
@@ -2131,8 +2141,14 @@ mod tests {
         // A duplicate is rejected without persisting.
         assert!(!catalog.create_sequence(&seq("s"))?);
         // Advance a few times: first nextval yields start (1), then +increment.
-        assert_eq!(catalog.advance_sequence_in("public", "s")?, SequenceAdvance::Value(1));
-        assert_eq!(catalog.advance_sequence_in("public", "s")?, SequenceAdvance::Value(2));
+        assert_eq!(
+            catalog.advance_sequence_in("public", "s")?,
+            SequenceAdvance::Value(1)
+        );
+        assert_eq!(
+            catalog.advance_sequence_in("public", "s")?,
+            SequenceAdvance::Value(2)
+        );
         assert_eq!(
             catalog.advance_sequence_in("public", "missing")?,
             SequenceAdvance::NotFound
@@ -2146,13 +2162,19 @@ mod tests {
         assert_eq!(seqs[0].name, "s");
         assert_eq!(seqs[0].data_type, PgType::Int8);
         // nextval continues past the persisted counter, not from start again.
-        assert_eq!(loaded.advance_sequence_in("public", "s")?, SequenceAdvance::Value(3));
+        assert_eq!(
+            loaded.advance_sequence_in("public", "s")?,
+            SequenceAdvance::Value(3)
+        );
         // setval resets it; the following nextval reflects is_called.
         assert_eq!(
             loaded.set_sequence_in("public", "s", 10, true)?,
             SequenceAdvance::Value(10)
         );
-        assert_eq!(loaded.advance_sequence_in("public", "s")?, SequenceAdvance::Value(11));
+        assert_eq!(
+            loaded.advance_sequence_in("public", "s")?,
+            SequenceAdvance::Value(11)
+        );
         assert!(loaded.remove_sequence_in("public", "s")?);
         assert!(!loaded.remove_sequence_in("public", "s")?);
         drop(loaded);
@@ -2162,7 +2184,10 @@ mod tests {
         // A pre-sequence catalog file (truncated at the sequence marker) still
         // loads, with no sequences.
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new("t", vec![Column::new("id", PgType::Int4)]))?;
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
         catalog.create_sequence(&seq("s2"))?;
         drop(catalog);
         let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
@@ -2223,7 +2248,10 @@ mod tests {
         let (_, _, _, parent_schema, _) = &schemas[0];
         assert_eq!(parent_schema.name, "m");
         assert_eq!(
-            parent_schema.partition_scheme.as_ref().map(|s| &s.key_columns),
+            parent_schema
+                .partition_scheme
+                .as_ref()
+                .map(|s| &s.key_columns),
             Some(&vec![1])
         );
         assert!(parent_schema.partition_of.is_none());
@@ -2280,7 +2308,10 @@ mod tests {
             "app",
             vec![Column::new("id", PgType::Int4)],
         ))?;
-        catalog.create(&TableSchema::new("item", vec![Column::new("id", PgType::Int4)]))?;
+        catalog.create(&TableSchema::new(
+            "item",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
         drop(catalog);
 
         // Reload: the schema, its OID, and each table's namespace all survive.
@@ -2332,8 +2363,8 @@ mod tests {
     }
 
     #[test]
-    fn statistics_round_trip_and_a_pre_stats_catalog_reports_never_analyzed()
-    -> anyhow::Result<()> {
+    fn statistics_round_trip_and_a_pre_stats_catalog_reports_never_analyzed() -> anyhow::Result<()>
+    {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
         catalog.create(&TableSchema::new(

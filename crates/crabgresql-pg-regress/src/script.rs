@@ -458,9 +458,7 @@ mod tests {
     fn is_copy_from_stdin_recognizes_forms() {
         assert!(is_copy_from_stdin("COPY t FROM stdin;"));
         assert!(is_copy_from_stdin("COPY t (a, b) FROM STDIN"));
-        assert!(is_copy_from_stdin(
-            "COPY t FROM stdin WITH (FORMAT csv)"
-        ));
+        assert!(is_copy_from_stdin("COPY t FROM stdin WITH (FORMAT csv)"));
         assert!(!is_copy_from_stdin("COPY t TO stdout;"));
         assert!(!is_copy_from_stdin("COPY t FROM '/tmp/f';"));
         assert!(!is_copy_from_stdin("SELECT 1;"));

@@ -169,18 +169,18 @@ mod tests {
     fn rejects_malformed() {
         for bad in [
             "",
-            "G/0",           // not hex
-            "-1/0",          // no sign
-            " 0/12345678",   // no surrounding whitespace
-            "0/12345678 ",   //
-            "ABCD/",         // empty low half
-            "/ABCD",         // empty high half
-            "16AE7F7",       // no slash
-            "0//1",          // empty half between two slashes
-            "0/1/2",         // a second slash lands in the low half
-            "000000000/1",   // nine digits
-            "0/000000001",   //
-            "+1/0",          // `from_str_radix` would take this; PG does not
+            "G/0",         // not hex
+            "-1/0",        // no sign
+            " 0/12345678", // no surrounding whitespace
+            "0/12345678 ", //
+            "ABCD/",       // empty low half
+            "/ABCD",       // empty high half
+            "16AE7F7",     // no slash
+            "0//1",        // empty half between two slashes
+            "0/1/2",       // a second slash lands in the low half
+            "000000000/1", // nine digits
+            "0/000000001", //
+            "+1/0",        // `from_str_radix` would take this; PG does not
         ] {
             let e = parse(bad).unwrap_err();
             assert_eq!(e.sqlstate, "22P02", "input {bad:?}");
@@ -193,8 +193,14 @@ mod tests {
 
     #[test]
     fn subtracting_two_lsns_is_an_exact_signed_distance() -> anyhow::Result<()> {
-        assert_eq!(sub(parse("0/16AE7F7")?, parse("0/16AE7F8")?).to_display(), "-1");
-        assert_eq!(sub(parse("0/16AE7F8")?, parse("0/16AE7F7")?).to_display(), "1");
+        assert_eq!(
+            sub(parse("0/16AE7F7")?, parse("0/16AE7F8")?).to_display(),
+            "-1"
+        );
+        assert_eq!(
+            sub(parse("0/16AE7F8")?, parse("0/16AE7F7")?).to_display(),
+            "1"
+        );
         // The full span does not fit `i64`, which is why the result is numeric.
         assert_eq!(sub(u64::MAX, 0).to_display(), "18446744073709551615");
 
@@ -233,9 +239,15 @@ mod tests {
         // Each of the three specials names its own operation.
         for (e, message) in [
             (add_numeric(1, &num("NaN")), "cannot add NaN to pg_lsn"),
-            (sub_numeric(1, &num("NaN")), "cannot subtract NaN from pg_lsn"),
+            (
+                sub_numeric(1, &num("NaN")),
+                "cannot subtract NaN from pg_lsn",
+            ),
             (from_numeric(&num("NaN")), "cannot convert NaN to pg_lsn"),
-            (add_numeric(1, &num("Infinity")), "cannot convert infinity to pg_lsn"),
+            (
+                add_numeric(1, &num("Infinity")),
+                "cannot convert infinity to pg_lsn",
+            ),
         ] {
             let e = e.unwrap_err();
             assert_eq!(e.sqlstate, "0A000", "{message}");

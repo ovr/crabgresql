@@ -256,9 +256,7 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             } => Ok(Value::Null),
             _ => match eval(array, row, ctx)? {
                 Value::Null => Ok(Value::Null),
-                Value::Array { elems, .. } => {
-                    crate::eval_quantified(cmp, &elems, *all, row, ctx)
-                }
+                Value::Array { elems, .. } => crate::eval_quantified(cmp, &elems, *all, row, ctx),
                 other => Err(ExecError::new(
                     sqlstate::INTERNAL_ERROR,
                     format!("ANY/ALL right operand is not an array: {other:?}"),
@@ -292,7 +290,11 @@ pub fn coerce_value_assign(
 /// `array_append`, `array_prepend`), which build a [`Value::Array`] of `ret`'s
 /// element type. Returns `None` for any other function so the caller falls
 /// through to the pure `eval_scalar`.
-fn eval_array_ctor_fn(func: ScalarFn, ret: PgType, args: &[Value]) -> Option<Result<Value, ExecError>> {
+fn eval_array_ctor_fn(
+    func: ScalarFn,
+    ret: PgType,
+    args: &[Value],
+) -> Option<Result<Value, ExecError>> {
     let elem = match func {
         ScalarFn::ArrayCat | ScalarFn::ArrayAppend | ScalarFn::ArrayPrepend => match ret {
             PgType::Array(elem_oid) => PgType::from_oid(elem_oid),
@@ -893,8 +895,16 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         // NULL unwrap or recursive redispatch through `PgType::User`.
         PgType::User(_) => match (l, r) {
             (
-                Value::Enum { type_oid: a_ty, ordinal: a, .. },
-                Value::Enum { type_oid: b_ty, ordinal: b, .. },
+                Value::Enum {
+                    type_oid: a_ty,
+                    ordinal: a,
+                    ..
+                },
+                Value::Enum {
+                    type_oid: b_ty,
+                    ordinal: b,
+                    ..
+                },
             ) => a_ty.cmp(b_ty).then_with(|| a.cmp(b)),
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Null, _) => Ordering::Less,
@@ -1460,16 +1470,31 @@ mod enum_cmp_tests {
     fn enum_orders_by_definition_ordinal_not_label() {
         let ty = PgType::User(16384);
         // 'red'(0) < 'green'(3), even though "green" < "red" alphabetically.
-        assert_eq!(compare_values(ty, &e(0, "red"), &e(3, "green")), Ordering::Less);
-        assert_eq!(compare_values(ty, &e(3, "green"), &e(0, "red")), Ordering::Greater);
-        assert_eq!(compare_values(ty, &e(2, "yellow"), &e(2, "yellow")), Ordering::Equal);
+        assert_eq!(
+            compare_values(ty, &e(0, "red"), &e(3, "green")),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(ty, &e(3, "green"), &e(0, "red")),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_values(ty, &e(2, "yellow"), &e(2, "yellow")),
+            Ordering::Equal
+        );
     }
 
     #[test]
     fn malformed_user_comparisons_are_total() {
         let ty = PgType::User(16384);
-        assert_eq!(compare_values(ty, &Value::Null, &e(0, "red")), Ordering::Less);
-        assert_eq!(compare_values(ty, &e(0, "red"), &Value::Int4(1)), Ordering::Greater);
+        assert_eq!(
+            compare_values(ty, &Value::Null, &e(0, "red")),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(ty, &e(0, "red"), &Value::Int4(1)),
+            Ordering::Greater
+        );
         assert_eq!(
             compare_values(
                 ty,

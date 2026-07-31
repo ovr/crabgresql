@@ -226,6 +226,9 @@ mod tests {
         let JoinExpr::Join { predicate, .. } = join else {
             panic!("expected Join node");
         };
-        assert!(predicate.is_none(), "the conjunct was not placed or dropped");
+        assert!(
+            predicate.is_none(),
+            "the conjunct was not placed or dropped"
+        );
     }
 }

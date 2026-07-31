@@ -151,9 +151,9 @@ impl BufferPressure {
             return;
         }
         let waited = Instant::now();
-        let Ok((flag, timeout)) = self
-            .relieved
-            .wait_timeout_while(flag, WRITE_CAPACITY_TIMEOUT, |over| *over)
+        let Ok((flag, timeout)) =
+            self.relieved
+                .wait_timeout_while(flag, WRITE_CAPACITY_TIMEOUT, |over| *over)
         else {
             return;
         };
@@ -347,9 +347,7 @@ mod tests {
             .flatten()
             .filter_map(|entry| std::fs::read_dir(entry.path()).ok())
             .flat_map(|inner| inner.flatten())
-            .filter(|file| {
-                file.path().extension().and_then(|x| x.to_str()) == Some("parquet")
-            })
+            .filter(|file| file.path().extension().and_then(|x| x.to_str()) == Some("parquet"))
             .count()
     }
 
@@ -430,7 +428,11 @@ mod tests {
             })
             .collect();
         ids.sort_unstable();
-        assert_eq!(ids, vec![0, 1, 2, 3], "a background flush must not lose a row");
+        assert_eq!(
+            ids,
+            vec![0, 1, 2, 3],
+            "a background flush must not lose a row"
+        );
 
         worker.stop_and_join();
         Ok(())
@@ -511,7 +513,9 @@ mod tests {
         assert!(!released.is_finished(), "the writer must still be waiting");
         engine.buffer_pressure().set(false);
 
-        let waited = released.join().unwrap_or_else(|_| panic!("waiter panicked"));
+        let waited = released
+            .join()
+            .unwrap_or_else(|_| panic!("waiter panicked"));
         assert!(
             waited >= Duration::from_millis(200),
             "the writer returned after {waited:?}, so it never waited"
@@ -642,13 +646,15 @@ mod tests {
     fn the_worker_exits_when_the_engine_is_dropped() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
-        let (engine, _clog, _next) =
-            PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let (engine, _clog, _next) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
         let weak = Arc::downgrade(&engine);
-        let worker = FlushWorker::spawn(weak.clone(), BufferFlushPolicy {
-            tick: Duration::from_millis(5),
-            ..BufferFlushPolicy::default()
-        });
+        let worker = FlushWorker::spawn(
+            weak.clone(),
+            BufferFlushPolicy {
+                tick: Duration::from_millis(5),
+                ..BufferFlushPolicy::default()
+            },
+        );
         drop(engine);
 
         let deadline = Instant::now() + Duration::from_secs(10);

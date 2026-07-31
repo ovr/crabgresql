@@ -1825,8 +1825,7 @@ fn execute_truncate(
             "TRUNCATE ... ON CLUSTER is not supported yet",
         ));
     }
-    let mut named: Vec<(String, Arc<dyn TableAm>)> =
-        Vec::with_capacity(truncate.table_names.len());
+    let mut named: Vec<(String, Arc<dyn TableAm>)> = Vec::with_capacity(truncate.table_names.len());
     for target in &truncate.table_names {
         if target.only || target.has_asterisk {
             return Err(PgError::feature_not_supported(
@@ -2027,7 +2026,10 @@ fn execute_vacuum(
         }
     }
     if flushed > 0 {
-        tracing::debug!(rows = flushed, "VACUUM flushed buffered rows to durable storage");
+        tracing::debug!(
+            rows = flushed,
+            "VACUUM flushed buffered rows to durable storage"
+        );
     }
     // `VACUUM ANALYZE` is one statement that does both, as in PostgreSQL.
     if vacuum.analyze {
@@ -2487,9 +2489,7 @@ fn object_name_to_table_name(name: &ast::ObjectName) -> Result<String, PgError> 
     single_object_name(name, "relation")
 }
 
-fn create_table_access_method(
-    create: &ast::CreateTable,
-) -> Result<TableAccessMethod, PgError> {
+fn create_table_access_method(create: &ast::CreateTable) -> Result<TableAccessMethod, PgError> {
     if create.external {
         return Err(PgError::feature_not_supported(
             "external tables are not supported",
@@ -2498,9 +2498,7 @@ fn create_table_access_method(
     let Some(format) = &create.hive_formats else {
         return Ok(TableAccessMethod::Heap);
     };
-    if format.row_format.is_some()
-        || format.serde_properties.is_some()
-        || format.location.is_some()
+    if format.row_format.is_some() || format.serde_properties.is_some() || format.location.is_some()
     {
         return Err(PgError::feature_not_supported(
             "external table storage options and LOCATION are not supported",
@@ -2657,7 +2655,11 @@ fn execute_create_table(
     if (create.partition_by.is_some() || create.partition_of.is_some())
         && (create.temporary || create.unlogged)
     {
-        let kind = if create.temporary { "temporary" } else { "unlogged" };
+        let kind = if create.temporary {
+            "temporary"
+        } else {
+            "unlogged"
+        };
         return Err(PgError::feature_not_supported(format!(
             "{kind} partitioned tables are not supported yet"
         )));
@@ -3283,9 +3285,7 @@ fn endpoint_cmp(a: &Endpoint, b: &Endpoint, ty: PgType) -> std::cmp::Ordering {
         }
         (Endpoint::NegInf, _) | (_, Endpoint::PosInf) => Ordering::Less,
         (Endpoint::PosInf, _) | (_, Endpoint::NegInf) => Ordering::Greater,
-        (Endpoint::Finite(x), Endpoint::Finite(y)) => {
-            crabgresql_executor::compare_values(ty, x, y)
-        }
+        (Endpoint::Finite(x), Endpoint::Finite(y)) => crabgresql_executor::compare_values(ty, x, y),
     }
 }
 
@@ -3384,9 +3384,7 @@ fn execute_create_partition(
             if is_non_table_relation {
                 PgError::new(
                     sqlstate::WRONG_OBJECT_TYPE,
-                    format!(
-                        "inherited relation \"{parent_name}\" is not a table or foreign table"
-                    ),
+                    format!("inherited relation \"{parent_name}\" is not a table or foreign table"),
                 )
             } else {
                 PgError::new(
@@ -3765,7 +3763,9 @@ fn reject_constraint_key_columns(columns: &[ast::IndexColumn], noun: &str) -> Re
                 Some(false) => "DESC",
                 None => "NULLS",
             };
-            return Err(PgError::syntax(format!("syntax error at or near \"{token}\"")));
+            return Err(PgError::syntax(format!(
+                "syntax error at or near \"{token}\""
+            )));
         }
         // A non-identifier is an expression key; `simple_index_keys` rejects it
         // with its own message, so leave it alone rather than guessing a name.
@@ -4146,7 +4146,8 @@ fn execute_create_type(
 /// spelling (e.g. `integer`, not `int4`) when known.
 fn reject_non_enum_builtin(name: &str) -> Result<(), PgError> {
     if crabgresql_catalog::is_builtin_type_name(name) {
-        let display = builtin_type_by_name(name).map_or_else(|| name.to_string(), |t| t.name().to_string());
+        let display =
+            builtin_type_by_name(name).map_or_else(|| name.to_string(), |t| t.name().to_string());
         return Err(PgError::new(
             sqlstate::WRONG_OBJECT_TYPE,
             format!("{display} is not an enum"),
@@ -4885,7 +4886,10 @@ fn referenced_relations(query: &ast::Query) -> Vec<String> {
     let mut scope: Vec<String> = Vec::new();
     collect_query_relations(query, &mut names, &mut scope);
     let mut seen = HashSet::new();
-    names.into_iter().filter(|n| seen.insert(n.clone())).collect()
+    names
+        .into_iter()
+        .filter(|n| seen.insert(n.clone()))
+        .collect()
 }
 
 fn collect_query_relations(query: &ast::Query, names: &mut Vec<String>, scope: &mut Vec<String>) {
@@ -4904,7 +4908,11 @@ fn collect_query_relations(query: &ast::Query, names: &mut Vec<String>, scope: &
     scope.truncate(scope.len() - pushed);
 }
 
-fn collect_setexpr_relations(body: &ast::SetExpr, names: &mut Vec<String>, scope: &mut Vec<String>) {
+fn collect_setexpr_relations(
+    body: &ast::SetExpr,
+    names: &mut Vec<String>,
+    scope: &mut Vec<String>,
+) {
     match body {
         ast::SetExpr::Select(select) => {
             for twj in &select.from {
@@ -4938,7 +4946,11 @@ fn collect_factor_relations(
             name, args: None, ..
         } => {
             let parts = &name.0;
-            if let Some(rel) = parts.last().and_then(|part| part.as_ident()).map(normalize_ident) {
+            if let Some(rel) = parts
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(normalize_ident)
+            {
                 // A CTE name is always unqualified, so it shadows only a bare
                 // reference of the same name.
                 let schema = (parts.len() >= 2)
@@ -6182,7 +6194,10 @@ mod tests {
     fn referenced_relations_excludes_cte_names_but_keeps_their_bodies() {
         // A CTE name is not a dependency; the base table inside its body is.
         // Dependencies are recorded as qualified `namespace.name` keys.
-        assert_eq!(deps("WITH c AS (SELECT 1) SELECT * FROM c"), Vec::<String>::new());
+        assert_eq!(
+            deps("WITH c AS (SELECT 1) SELECT * FROM c"),
+            Vec::<String>::new()
+        );
         assert_eq!(
             deps("WITH c AS (SELECT * FROM t) SELECT * FROM c"),
             vec!["public.t"]

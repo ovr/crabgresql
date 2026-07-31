@@ -7,8 +7,8 @@
 //!
 //! Every rendering below was probed against PostgreSQL 18.4.
 
-use crabgresql_types::{PgType, Reg, RegKind, text::quote_ident};
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_types::{PgType, Reg, RegKind, text::quote_ident};
 
 use crate::{CatalogOps, ExecError};
 

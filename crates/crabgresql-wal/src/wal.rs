@@ -459,7 +459,9 @@ mod tests {
             for i in 0..8u64 {
                 let wal = Arc::clone(&wal);
                 handles.push(s.spawn(move || -> Result<Lsn, WalError> {
-                    let lsn = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3 + i), &[i as u8; 16]).end;
+                    let lsn = wal
+                        .append(RmgrId::XACT, XACT_COMMIT, Xid(3 + i), &[i as u8; 16])
+                        .end;
                     wal.flush(lsn)?;
                     Ok(lsn)
                 }));
@@ -673,15 +675,13 @@ mod tests {
     /// not `thread::scope`: scope joins before returning, so it would inherit the
     /// hang it exists to detect. The stuck thread is left detached and dies with
     /// the test process; that only happens when the test is already failing.
-    fn within<T: Send + 'static>(
-        max_ms: u64,
-        f: impl FnOnce() -> T + Send + 'static,
-    ) -> Option<T> {
+    fn within<T: Send + 'static>(max_ms: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
-        rx.recv_timeout(std::time::Duration::from_millis(max_ms)).ok()
+        rx.recv_timeout(std::time::Duration::from_millis(max_ms))
+            .ok()
     }
 
     #[test]
@@ -900,7 +900,9 @@ mod tests {
         }
 
         fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
-            self.state.lock().unwrap_or_else(|_| panic!("gate poisoned"))
+            self.state
+                .lock()
+                .unwrap_or_else(|_| panic!("gate poisoned"))
         }
 
         fn entered(&self) -> bool {

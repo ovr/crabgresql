@@ -1246,7 +1246,10 @@ pub(crate) fn bind_table_fn_call(
         return Ok((TableFn::GenerateSeries(elem), args));
     }
     if name == "jsonb_path_query" {
-        return Ok((TableFn::JsonbPathQuery, resolve_jsonb_path_query(&bindings)?));
+        return Ok((
+            TableFn::JsonbPathQuery,
+            resolve_jsonb_path_query(&bindings)?,
+        ));
     }
     if name == "unnest" {
         let (elem, args) = resolve_unnest(&bindings)?;
@@ -1460,8 +1463,16 @@ fn lookup(name: &str) -> &'static [Signature] {
     macro_rules! json_path_sigs {
         ($f:expr, $ret:expr) => {
             &[
-                Signature { func: ScalarFn::JsonPath($f), args: &[JSONB, JSONPATH], ret: $ret },
-                Signature { func: ScalarFn::JsonPath($f), args: &[JSONB, JSONPATH, JSONB], ret: $ret },
+                Signature {
+                    func: ScalarFn::JsonPath($f),
+                    args: &[JSONB, JSONPATH],
+                    ret: $ret,
+                },
+                Signature {
+                    func: ScalarFn::JsonPath($f),
+                    args: &[JSONB, JSONPATH, JSONB],
+                    ret: $ret,
+                },
                 Signature {
                     func: ScalarFn::JsonPath($f),
                     args: &[JSONB, JSONPATH, JSONB, BOOL],
@@ -2430,12 +2441,11 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: BOX,
             },
         ],
-        "line" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::LineConstruct),
-                args: &[POINT, POINT],
-                ret: LINE,
-            },
-        ],
+        "line" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::LineConstruct),
+            args: &[POINT, POINT],
+            ret: LINE,
+        }],
         "circle" => &[
             Signature {
                 func: ScalarFn::Geo(GeoFn::CircleConstruct),
@@ -2475,12 +2485,11 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: POLYGON,
             },
         ],
-        "path" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::PolyToPath),
-                args: &[POLYGON],
-                ret: PATH,
-            },
-        ],
+        "path" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PolyToPath),
+            args: &[POLYGON],
+            ret: PATH,
+        }],
         "center" => &[
             Signature {
                 func: ScalarFn::Geo(GeoFn::BoxCenter),
@@ -2493,66 +2502,56 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: POINT,
             },
         ],
-        "diagonal" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::BoxDiagonal),
-                args: &[BOX],
-                ret: LSEG,
-            },
-        ],
-        "width" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::BoxWidth),
-                args: &[BOX],
-                ret: F8,
-            },
-        ],
-        "height" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::BoxHeight),
-                args: &[BOX],
-                ret: F8,
-            },
-        ],
-        "bound_box" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::BoundBox),
-                args: &[BOX, BOX],
-                ret: BOX,
-            },
-        ],
-        "radius" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::CircleRadius),
-                args: &[CIRCLE],
-                ret: F8,
-            },
-        ],
-        "diameter" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::CircleDiameter),
-                args: &[CIRCLE],
-                ret: F8,
-            },
-        ],
-        "isparallel" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::LineParallel),
-                args: &[LINE, LINE],
-                ret: BOOL,
-            },
-        ],
-        "isperp" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::LinePerpendicular),
-                args: &[LINE, LINE],
-                ret: BOOL,
-            },
-        ],
-        "pt_contained_circle" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::CircleContainPtSwapped),
-                args: &[POINT, CIRCLE],
-                ret: BOOL,
-            },
-        ],
-        "pt_contained_poly" => &[            Signature {
-                func: ScalarFn::Geo(GeoFn::PolyContainPtSwapped),
-                args: &[POINT, POLYGON],
-                ret: BOOL,
-            },
-        ],
+        "diagonal" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::BoxDiagonal),
+            args: &[BOX],
+            ret: LSEG,
+        }],
+        "width" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::BoxWidth),
+            args: &[BOX],
+            ret: F8,
+        }],
+        "height" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::BoxHeight),
+            args: &[BOX],
+            ret: F8,
+        }],
+        "bound_box" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::BoundBox),
+            args: &[BOX, BOX],
+            ret: BOX,
+        }],
+        "radius" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::CircleRadius),
+            args: &[CIRCLE],
+            ret: F8,
+        }],
+        "diameter" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::CircleDiameter),
+            args: &[CIRCLE],
+            ret: F8,
+        }],
+        "isparallel" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::LineParallel),
+            args: &[LINE, LINE],
+            ret: BOOL,
+        }],
+        "isperp" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::LinePerpendicular),
+            args: &[LINE, LINE],
+            ret: BOOL,
+        }],
+        "pt_contained_circle" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::CircleContainPtSwapped),
+            args: &[POINT, CIRCLE],
+            ret: BOOL,
+        }],
+        "pt_contained_poly" => &[Signature {
+            func: ScalarFn::Geo(GeoFn::PolyContainPtSwapped),
+            args: &[POINT, POLYGON],
+            ret: BOOL,
+        }],
         "slope" => &[Signature {
             func: ScalarFn::Geo(GeoFn::PointSlope),
             args: &[POINT, POINT],
@@ -2830,9 +2829,9 @@ fn bind_window_call(
 ) -> Result<Binding, BindError> {
     let spec = resolve_over_clause(over, scope)?;
     let spec = bind_window_spec(&spec, scope)?;
-    let kind = if let Some(win) = lookup_window_fn(name).filter(|_| {
-        builtin_window_args_match(&func.args)
-    }) {
+    let kind = if let Some(win) =
+        lookup_window_fn(name).filter(|_| builtin_window_args_match(&func.args))
+    {
         WindowKind::Builtin {
             func: win,
             args: Vec::new(),
@@ -2861,11 +2860,9 @@ fn bind_window_call(
         WindowKind::Aggregate(BoundAggregate {
             func,
             distinct: false,
-            collation: args
-                .first()
-                .map_or(DEFAULT_COLLATION_OID, |a| {
-                    crate::collation::expr_collation(a).collation
-                }),
+            collation: args.first().map_or(DEFAULT_COLLATION_OID, |a| {
+                crate::collation::expr_collation(a).collation
+            }),
             args,
             input_ty,
             ret,
@@ -2881,7 +2878,9 @@ fn bind_window_call(
         resolve_call(name, bindings, scope.catalog())?;
         return Err(BindError::new(
             sqlstate::WRONG_OBJECT_TYPE,
-            format!("OVER specified, but {name} is not a window function nor an aggregate function"),
+            format!(
+                "OVER specified, but {name} is not a window function nor an aggregate function"
+            ),
         ));
     };
     let ret = match &kind {
@@ -3262,7 +3261,11 @@ fn bind_aggregate(
 /// clauses among `args` first (`concat('a' COLLATE x, 'b' COLLATE y)` is
 /// `42P22` the same way `a COLLATE x = b COLLATE y` is). Shared by every
 /// `FuncCall` construction site so the check isn't duplicated at each one.
-fn finish_func_call(func: ScalarFn, ret: PgType, args: Vec<BoundExpr>) -> Result<Binding, BindError> {
+fn finish_func_call(
+    func: ScalarFn,
+    ret: PgType,
+    args: Vec<BoundExpr>,
+) -> Result<Binding, BindError> {
     if ret.is_collatable() || args.iter().any(|a| a.ty().is_collatable()) {
         crate::collation::check_explicit_conflict(
             args.iter().map(crate::collation::expr_collation),

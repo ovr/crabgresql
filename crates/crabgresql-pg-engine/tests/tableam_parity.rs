@@ -436,7 +436,8 @@ fn analyze_counts_visible_rows_exactly() -> anyhow::Result<()> {
     h.tm.commit(del)?;
 
     let xid = h.tm.allocate_xid();
-    h.engine.analyze("public", "t", &h.tm.context(xid, CommandId::FIRST))?;
+    h.engine
+        .analyze("public", "t", &h.tm.context(xid, CommandId::FIRST))?;
     h.tm.commit(xid)?;
 
     let stats = table.statistics();
@@ -647,8 +648,7 @@ fn scan_is_stable_against_concurrent_writes() -> anyhow::Result<()> {
     let txn = h.tm.context(xid, CommandId::FIRST);
     table.update(a, vec![Value::Int4(99), Value::Null], &txn)?;
     h.tm.commit(xid)?;
-    let rows: Vec<_> = scan
-        .collect::<Result<Vec<_>, StorageError>>()?;
+    let rows: Vec<_> = scan.collect::<Result<Vec<_>, StorageError>>()?;
     assert_eq!(rows, vec![(a, vec![Value::Int4(1), Value::Null])]);
 
     Ok(())
@@ -716,8 +716,16 @@ fn pk_on_id() -> IndexMetadata {
 fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
     let h = setup();
     let table = h.engine.create_table(schema("t"))?;
-    insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Text("a".into())]);
-    insert_committed(&h.tm, &*table, vec![Value::Int4(2), Value::Text("b".into())]);
+    insert_committed(
+        &h.tm,
+        &*table,
+        vec![Value::Int4(1), Value::Text("a".into())],
+    );
+    insert_committed(
+        &h.tm,
+        &*table,
+        vec![Value::Int4(2), Value::Text("b".into())],
+    );
     h.engine.create_index("public", "t", pk_on_id())?;
 
     // The durable heap engine now builds a physical B-tree: it reports index-scan
@@ -810,7 +818,10 @@ fn drop_table_reclaims_a_pending_truncate_file() -> anyhow::Result<()> {
     let tx = h.tm.allocate_xid();
     table.truncate(&h.tm.context(tx, CommandId::FIRST))?;
     let staged = h._dir.path().join("base").join("2");
-    assert!(staged.exists(), "staged TRUNCATE file should exist before the drop");
+    assert!(
+        staged.exists(),
+        "staged TRUNCATE file should exist before the drop"
+    );
 
     h.engine.drop_table("public", "t")?;
     assert!(
@@ -889,7 +900,11 @@ fn an_update_rejected_for_size_leaves_the_old_row_visible() -> anyhow::Result<()
     h.tm.commit(xid)?;
 
     let rows = scan_rows(&*table, &read(&h.tm));
-    assert_eq!(rows.len(), 1, "the pre-image must survive a rejected update");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the pre-image must survive a rejected update"
+    );
     assert_eq!(rows[0].1, small);
     Ok(())
 }
@@ -928,11 +943,7 @@ fn values_spanning_one_two_and_many_chunks_round_trip() -> anyhow::Result<()> {
     let table = h.engine.create_table(schema("t"))?;
     let sizes = [2_001, 2_002, 2_003, 4_004, 4_005, 500_000];
     for (i, n) in sizes.iter().enumerate() {
-        insert_committed(
-            &h.tm,
-            &*table,
-            vec![Value::Int4(i as i32), big_text(*n)],
-        );
+        insert_committed(&h.tm, &*table, vec![Value::Int4(i as i32), big_text(*n)]);
     }
     let rows = scan_rows(&*table, &read(&h.tm));
     assert_eq!(rows.len(), sizes.len());
@@ -959,9 +970,8 @@ fn a_bytea_and_a_jsonb_are_toasted_by_the_same_path() -> anyhow::Result<()> {
         ],
     ))?;
     let blob = Value::Bytea((0..60_000).map(|i| i as u8).collect());
-    let json = crabgresql_types::Value::Jsonb(crabgresql_types::json::Jsonb::String(
-        "x".repeat(40_000),
-    ));
+    let json =
+        crabgresql_types::Value::Jsonb(crabgresql_types::json::Jsonb::String("x".repeat(40_000)));
     insert_committed(&h.tm, &*table, vec![blob.clone(), json.clone()]);
     let rows = scan_rows(&*table, &read(&h.tm));
     assert_eq!(rows[0].1, vec![blob, json]);
@@ -1042,7 +1052,10 @@ fn vacuum_reclaims_the_chunks_of_a_dead_row() -> anyhow::Result<()> {
     let tid = insert_committed(&h.tm, &*table, vec![Value::Int4(1), big.clone()]);
     // The heap is relfilenode 1, so the chunk store is 2.
     let after_first = relfile_len(&h, 2);
-    assert_eq!(after_first, 8192, "four chunks should occupy exactly one page");
+    assert_eq!(
+        after_first, 8192,
+        "four chunks should occupy exactly one page"
+    );
 
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
@@ -1165,7 +1178,10 @@ fn drop_table_unlinks_the_chunk_store() -> anyhow::Result<()> {
     drop(table);
 
     h.engine.drop_table("public", "t")?;
-    assert!(!toast.exists(), "drop_table must unlink the chunk store too");
+    assert!(
+        !toast.exists(),
+        "drop_table must unlink the chunk store too"
+    );
     Ok(())
 }
 

@@ -253,9 +253,7 @@ impl Accumulator {
                     Value::Float8(float::f8_div(*sum, *count as f64).map_err(float_error)?)
                 }
             }
-            AggState::StringAgg { cur } => {
-                cur.clone().map(Value::Text).unwrap_or(Value::Null)
-            }
+            AggState::StringAgg { cur } => cur.clone().map(Value::Text).unwrap_or(Value::Null),
         })
     }
 }
@@ -415,7 +413,11 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                 }
             }
             PgType::User(type_oid) => {
-                if let Value::Enum { type_oid: value_oid, ordinal, .. } = v
+                if let Value::Enum {
+                    type_oid: value_oid,
+                    ordinal,
+                    ..
+                } = v
                     && value_oid == type_oid
                 {
                     type_oid.hash(&mut h);
@@ -509,14 +511,22 @@ mod tests {
     #[test]
     fn enum_hash_uses_definition_ordinal() {
         let ty = [PgType::User(16384)];
-        let value = |ordinal: u32, label: &str| [Value::Enum {
-            type_oid: 16384,
-            ordinal,
-            label: label.to_string(),
-        }];
+        let value = |ordinal: u32, label: &str| {
+            [Value::Enum {
+                type_oid: 16384,
+                ordinal,
+                label: label.to_string(),
+            }]
+        };
 
-        assert_ne!(hash_key(&ty, &value(0, "red")), hash_key(&ty, &value(1, "green")));
-        assert_eq!(hash_key(&ty, &value(0, "red")), hash_key(&ty, &value(0, "red")));
+        assert_ne!(
+            hash_key(&ty, &value(0, "red")),
+            hash_key(&ty, &value(1, "green"))
+        );
+        assert_eq!(
+            hash_key(&ty, &value(0, "red")),
+            hash_key(&ty, &value(0, "red"))
+        );
     }
 }
 

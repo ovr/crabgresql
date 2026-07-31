@@ -136,11 +136,9 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             // `Aggregate` arm adds its group keys: a partition key that is never
             // projected still decides the partitions.
             let demand = add_exprs(demand, spec.exprs());
-            let demand = funcs
-                .iter()
-                .fold(demand, |demand, func: &BoundWindowFunc| {
-                    add_exprs(demand, func.kind.args().iter())
-                });
+            let demand = funcs.iter().fold(demand, |demand, func: &BoundWindowFunc| {
+                add_exprs(demand, func.kind.args().iter())
+            });
             push(source, demand);
         }
         // Also transparent, and the node that actually reaches storage: every

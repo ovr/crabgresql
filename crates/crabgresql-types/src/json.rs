@@ -106,7 +106,10 @@ fn parse_tree(s: &str, type_name: &str) -> Result<Jsonb, JsonError> {
     };
     p.skip_ws();
     if p.pos >= p.bytes.len() {
-        return Err(JsonError::syntax(type_name, "The input string ended unexpectedly."));
+        return Err(JsonError::syntax(
+            type_name,
+            "The input string ended unexpectedly.",
+        ));
     }
     let value = p.parse_value()?;
     p.skip_ws();
@@ -269,7 +272,10 @@ impl Parser<'_> {
                 Some(_) => {
                     return Err(JsonError::syntax(
                         self.type_name,
-                        format!("Expected \",\" or \"]\", but found \"{}\".", self.token_at()),
+                        format!(
+                            "Expected \",\" or \"]\", but found \"{}\".",
+                            self.token_at()
+                        ),
                     ));
                 }
             }
@@ -294,7 +300,10 @@ impl Parser<'_> {
                 let detail = if self.peek().is_none() {
                     "The input string ended unexpectedly.".to_string()
                 } else if first {
-                    format!("Expected string or \"}}\", but found \"{}\".", self.token_at())
+                    format!(
+                        "Expected string or \"}}\", but found \"{}\".",
+                        self.token_at()
+                    )
                 } else {
                     format!("Expected string, but found \"{}\".", self.token_at())
                 };
@@ -327,7 +336,10 @@ impl Parser<'_> {
                 Some(_) => {
                     return Err(JsonError::syntax(
                         self.type_name,
-                        format!("Expected \",\" or \"}}\", but found \"{}\".", self.token_at()),
+                        format!(
+                            "Expected \",\" or \"}}\", but found \"{}\".",
+                            self.token_at()
+                        ),
                     ));
                 }
             }
@@ -559,7 +571,9 @@ fn canonicalize_object(mut pairs: Vec<(String, Jsonb)>) -> Vec<(String, Jsonb)> 
 /// is PG's storage order (`lengthCompareJsonbStringValue`), which is also the
 /// order keys print in and are compared in.
 fn key_cmp(a: &str, b: &str) -> Ordering {
-    a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+    a.len()
+        .cmp(&b.len())
+        .then_with(|| a.as_bytes().cmp(b.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,7 +1164,10 @@ mod tests {
         assert_eq!(jb("\"a\\nb\"")?, Jsonb::String("a\nb".to_string()));
         assert_eq!(jb("\"\\u0041\"")?, Jsonb::String("A".to_string()));
         // Surrogate pair for U+1F600.
-        assert_eq!(jb("\"\\ud83d\\ude00\"")?, Jsonb::String("\u{1f600}".to_string()));
+        assert_eq!(
+            jb("\"\\ud83d\\ude00\"")?,
+            Jsonb::String("\u{1f600}".to_string())
+        );
         Ok(())
     }
 
@@ -1182,7 +1199,10 @@ mod tests {
         let err = jsonb_in("\"\\u0000\"").unwrap_err();
         assert_eq!(err.sqlstate, UNTRANSLATABLE_CHARACTER);
         assert_eq!(err.message, "unsupported Unicode escape sequence");
-        assert_eq!(err.detail.as_deref(), Some("\\u0000 cannot be converted to text."));
+        assert_eq!(
+            err.detail.as_deref(),
+            Some("\\u0000 cannot be converted to text.")
+        );
         // `json` preserves the raw text verbatim.
         assert_eq!(json_in("\"\\u0000\"").unwrap(), "\"\\u0000\"");
     }
@@ -1198,13 +1218,22 @@ mod tests {
     fn object_error_detail_matches_pg_position() {
         // After a comma only a key is valid (no "or }").
         let err = jsonb_in("{\"a\":1,}").unwrap_err();
-        assert_eq!(err.detail.as_deref(), Some("Expected string, but found \"}\"."));
+        assert_eq!(
+            err.detail.as_deref(),
+            Some("Expected string, but found \"}\".")
+        );
         // At the first key, "}" is offered as an alternative.
         let err = jsonb_in("{,}").unwrap_err();
-        assert_eq!(err.detail.as_deref(), Some("Expected string or \"}\", but found \",\"."));
+        assert_eq!(
+            err.detail.as_deref(),
+            Some("Expected string or \"}\", but found \",\".")
+        );
         // Two high surrogates in a row is a distinct message.
         let err = jsonb_in("\"\\ud800\\ud800\"").unwrap_err();
-        assert_eq!(err.detail.as_deref(), Some("Unicode high surrogate must not follow a high surrogate."));
+        assert_eq!(
+            err.detail.as_deref(),
+            Some("Unicode high surrogate must not follow a high surrogate.")
+        );
     }
 
     #[test]
@@ -1225,7 +1254,10 @@ mod tests {
         assert_eq!(json_object_field(doc, "a"), Some("[ 1,2 ]"));
         assert_eq!(json_object_field(doc, "b"), Some("2"));
         // A nested object is not re-rendered (jsonb would print `{"b": 1}`).
-        assert_eq!(json_extract_path("{\"a\":{\"b\":1}}", &["a"]), Some("{\"b\":1}"));
+        assert_eq!(
+            json_extract_path("{\"a\":{\"b\":1}}", &["a"]),
+            Some("{\"b\":1}")
+        );
         // Numbers keep their written form rather than normalizing through numeric.
         assert_eq!(json_object_field("{\"a\":1e2}", "a"), Some("1e2"));
         assert_eq!(json_object_field("{\"a\":1.500}", "a"), Some("1.500"));
@@ -1236,7 +1268,10 @@ mod tests {
         // `json` preserves duplicate keys, and PG's operator returns the last --
         // so the lookup cannot stop at the first match.
         assert_eq!(json_object_field("{\"a\": 1,  \"a\": 2}", "a"), Some("2"));
-        assert_eq!(json_object_field("{\"a\":1,\"b\":2,\"a\":3}", "a"), Some("3"));
+        assert_eq!(
+            json_object_field("{\"a\":1,\"b\":2,\"a\":3}", "a"),
+            Some("3")
+        );
     }
 
     #[test]
@@ -1284,7 +1319,10 @@ mod tests {
     fn json_extract_path_trims_on_an_empty_path() {
         // PG drops the outer whitespace the `json` input preserved.
         assert_eq!(json_extract_path("  {\"a\":1}  ", &[]), Some("{\"a\":1}"));
-        assert_eq!(json_extract_path("{\"a\":{\"b\":[1,2]}}", &["a", "b", "1"]), Some("2"));
+        assert_eq!(
+            json_extract_path("{\"a\":{\"b\":[1,2]}}", &["a", "b", "1"]),
+            Some("2")
+        );
     }
 
     #[test]
@@ -1303,7 +1341,10 @@ mod tests {
         // A NUL cannot become a `text` datum, even though `json_in` accepts it.
         let err = json_as_text("\"\\u0000\"").unwrap_err();
         assert_eq!(err.sqlstate, UNTRANSLATABLE_CHARACTER);
-        assert_eq!(err.detail.as_deref(), Some("\\u0000 cannot be converted to text."));
+        assert_eq!(
+            err.detail.as_deref(),
+            Some("\\u0000 cannot be converted to text.")
+        );
         Ok(())
     }
 
@@ -1318,12 +1359,30 @@ mod tests {
         let controls: Vec<String> = (0u8..=0x20)
             .flat_map(|c| {
                 let c = c as char;
-                [format!("[{c}]"), format!("{{\"a\":{c}}}"), format!("{{\"a\":{c}1}}"), format!("[1,{c}2]")]
+                [
+                    format!("[{c}]"),
+                    format!("{{\"a\":{c}}}"),
+                    format!("{{\"a\":{c}1}}"),
+                    format!("[1,{c}2]"),
+                ]
             })
             .collect();
         let fixed = [
-            "", "{", "}", "[", "{\"a\"", "{\"a\":", "{\"a\":[1,2", "[1,2", "\"unterminated",
-            "{\"a\":1,", "{,}", "[,]", "{\"a\" 1}", "\\", "{\"a\":\"\\",
+            "",
+            "{",
+            "}",
+            "[",
+            "{\"a\"",
+            "{\"a\":",
+            "{\"a\":[1,2",
+            "[1,2",
+            "\"unterminated",
+            "{\"a\":1,",
+            "{,}",
+            "[,]",
+            "{\"a\" 1}",
+            "\\",
+            "{\"a\":\"\\",
         ];
         for doc in fixed.iter().map(|s| s.to_string()).chain(controls) {
             let doc = doc.as_str();
@@ -1372,8 +1431,14 @@ mod tests {
         assert_eq!(jsonb_array_element(&arr, -4), None);
         // Paths walk both container kinds; an empty path is the value itself.
         let doc = jb("{\"a\":{\"b\":[\"c\",\"d\"]}}")?;
-        assert_eq!(shown(jsonb_extract_path(&doc, &["a", "b", "1"])).as_deref(), Some("\"d\""));
-        assert_eq!(shown(jsonb_extract_path(&doc, &["a", "b", "-1"])).as_deref(), Some("\"d\""));
+        assert_eq!(
+            shown(jsonb_extract_path(&doc, &["a", "b", "1"])).as_deref(),
+            Some("\"d\"")
+        );
+        assert_eq!(
+            shown(jsonb_extract_path(&doc, &["a", "b", "-1"])).as_deref(),
+            Some("\"d\"")
+        );
         assert_eq!(jsonb_extract_path(&doc, &[]), Some(&doc));
         assert_eq!(jsonb_extract_path(&doc, &["a", "zz"]), None);
         Ok(())

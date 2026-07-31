@@ -172,7 +172,9 @@ pub fn output_collation(expr: &BoundExpr) -> (Option<u32>, Strength) {
 /// rule for combining more than one collatable input (function arguments,
 /// `CASE` branches, `ARRAY` elements, a `UNION`'s arms), generalized from the
 /// pairwise check a binary comparison does in [`collation_for_comparison`].
-pub fn check_explicit_conflict(derived: impl IntoIterator<Item = Derived>) -> Result<(), BindError> {
+pub fn check_explicit_conflict(
+    derived: impl IntoIterator<Item = Derived>,
+) -> Result<(), BindError> {
     let mut explicit: Option<u32> = None;
     for d in derived {
         if d.strength != Strength::Explicit {

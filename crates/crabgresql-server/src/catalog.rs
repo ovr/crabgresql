@@ -327,12 +327,7 @@ impl TableEngine for SessionCatalog {
     /// Same namespace resolution as [`SessionCatalog::analyze`]: an unqualified
     /// name may be this session's temp table, and another session's temp schema
     /// is not reachable at all.
-    fn vacuum_table(
-        &self,
-        namespace: &str,
-        name: &str,
-        oldest: Xid,
-    ) -> Result<u64, StorageError> {
+    fn vacuum_table(&self, namespace: &str, name: &str, oldest: Xid) -> Result<u64, StorageError> {
         if namespace == "public" && self.temp_has(name) {
             self.global.vacuum_table(&self.temp_schema, name, oldest)
         } else if self.is_foreign_temp(namespace) {
@@ -402,7 +397,8 @@ impl TableEngine for SessionCatalog {
         value: i64,
         is_called: bool,
     ) -> SequenceAdvance {
-        self.global.sequence_setval(namespace, name, value, is_called)
+        self.global
+            .sequence_setval(namespace, name, value, is_called)
     }
 }
 

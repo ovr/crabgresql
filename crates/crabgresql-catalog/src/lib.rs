@@ -676,13 +676,16 @@ impl SystemCatalog {
                     .cmp(&b.namespace)
                     .then_with(|| a.schema.name.cmp(&b.schema.name))
             });
-            let first_toast_oid = FIRST_REL_OID + relations.len() as u32 + self.index_oids().len() as u32;
+            let first_toast_oid =
+                FIRST_REL_OID + relations.len() as u32 + self.index_oids().len() as u32;
             relations
                 .into_iter()
                 .enumerate()
                 .filter_map(|(position, relation)| {
                     let table_oid = FIRST_REL_OID + position as u32;
-                    relation.toast.map(|stats| (table_oid, relation.schema, stats))
+                    relation
+                        .toast
+                        .map(|stats| (table_oid, relation.schema, stats))
                 })
                 .enumerate()
                 .map(|(slot, (table_oid, schema, stats))| CatalogToast {
@@ -730,8 +733,7 @@ impl SystemCatalog {
         let offset = oid.checked_sub(FIRST_REL_OID)? as usize;
         let relations = self.relation_oids();
         if let Some((stored, schema)) = relations.get(offset) {
-            return (*stored == oid)
-                .then_some((schema.namespace.as_str(), schema.name.as_str()));
+            return (*stored == oid).then_some((schema.namespace.as_str(), schema.name.as_str()));
         }
         let indexes = self.index_oids();
         if let Some(index) = indexes.get(offset - relations.len()) {
@@ -1694,9 +1696,7 @@ mod tests {
     /// then indexes) stay as wide as the schema.
     #[test]
     fn pg_class_size_columns_report_the_never_analyzed_sentinel() -> anyhow::Result<()> {
-        use crabgresql_storage_api::{
-            Column, IndexKey, IndexMethod, RelStats, TableSchema,
-        };
+        use crabgresql_storage_api::{Column, IndexKey, IndexMethod, RelStats, TableSchema};
         use crabgresql_types::PgType;
 
         let table = TableSchema::new("tbl", vec![Column::new("a", PgType::Int4)]);
@@ -1726,10 +1726,7 @@ mod tests {
             vec![
                 measured,
                 indexed,
-                CatalogRelation::view(TableSchema::new(
-                    "vw",
-                    vec![Column::new("a", PgType::Int4)],
-                )),
+                CatalogRelation::view(TableSchema::new("vw", vec![Column::new("a", PgType::Int4)])),
                 CatalogRelation::sequence(
                     "sq",
                     "public",
@@ -1823,7 +1820,9 @@ mod tests {
 
         // The OID resolves to a real row, in `pg_toast`, named after its parent.
         let toast_row = required(
-            rows.iter().find(|r| r[oid] == Value::Oid(toast_oid)).cloned(),
+            rows.iter()
+                .find(|r| r[oid] == Value::Oid(toast_oid))
+                .cloned(),
             "the toast relation has no pg_class row",
         )?;
         let Value::Oid(parent_oid) = toasted[oid] else {
@@ -1852,8 +1851,10 @@ mod tests {
         assert_eq!(oids.len(), total, "pg_class OIDs must be unique");
 
         // Its columns join, so `relnatts` is not a claim without rows behind it.
-        let (aschema, arows) =
-            required(cat.build_pg_catalog("pg_attribute"), "pg_attribute is missing")?;
+        let (aschema, arows) = required(
+            cat.build_pg_catalog("pg_attribute"),
+            "pg_attribute is missing",
+        )?;
         let attrelid = required(aschema.column_index("attrelid"), "attrelid")?;
         let attname = required(aschema.column_index("attname"), "attname")?;
         let names: Vec<String> = arows

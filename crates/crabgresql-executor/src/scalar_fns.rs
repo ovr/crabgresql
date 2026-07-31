@@ -14,10 +14,10 @@ use crabgresql_binder::JsonFn;
 use crabgresql_binder::JsonPathFn;
 use crabgresql_binder::ScalarFn;
 use crabgresql_binder::TsFn;
+use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::json;
 use crabgresql_types::json::Jsonb;
 use crabgresql_types::jsonpath;
-use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
     Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, formatting, formatting_num,
     geo, interval, macaddr, money, net, pg_lsn, text, time, timestamp, timestamptz, timetz,
@@ -1196,13 +1196,11 @@ fn escape_char(arg: Option<&Value>) -> Result<Option<char>, ExecError> {
         Some(v) => {
             let s = text(v);
             if s.chars().count() > 1 {
-                return Err(err(
-                    sqlstate::INVALID_ESCAPE_SEQUENCE,
-                    "invalid escape string",
-                )
-                .with_hint(Some(
-                    "Escape string must be empty or one character.".to_string(),
-                )));
+                return Err(
+                    err(sqlstate::INVALID_ESCAPE_SEQUENCE, "invalid escape string").with_hint(
+                        Some("Escape string must be empty or one character.".to_string()),
+                    ),
+                );
             }
             Ok(s.chars().next())
         }
@@ -1547,17 +1545,25 @@ fn eval_jsonpath(f: JsonPathFn, args: &[Value]) -> Result<Value, ExecError> {
     };
     let opt_bool = |o: Option<bool>| o.map(Value::Bool).unwrap_or(Value::Null);
     match f {
-        JsonPathFn::Exists | JsonPathFn::ExistsOp => {
-            jsonpath::exists(path, target, vars, silent).map(opt_bool).map_err(json_err)
-        }
+        JsonPathFn::Exists | JsonPathFn::ExistsOp => jsonpath::exists(path, target, vars, silent)
+            .map(opt_bool)
+            .map_err(json_err),
         JsonPathFn::Match | JsonPathFn::MatchOp => {
-            jsonpath::match_predicate(path, target, vars, silent).map(opt_bool).map_err(json_err)
+            jsonpath::match_predicate(path, target, vars, silent)
+                .map(opt_bool)
+                .map_err(json_err)
         }
         JsonPathFn::QueryArray => jsonpath::query(path, target, vars, silent)
             .map(|items| Value::Jsonb(Jsonb::Array(items)))
             .map_err(json_err),
         JsonPathFn::QueryFirst => jsonpath::query(path, target, vars, silent)
-            .map(|items| items.into_iter().next().map(Value::Jsonb).unwrap_or(Value::Null))
+            .map(|items| {
+                items
+                    .into_iter()
+                    .next()
+                    .map(Value::Jsonb)
+                    .unwrap_or(Value::Null)
+            })
             .map_err(json_err),
     }
 }
@@ -1598,9 +1604,7 @@ fn eval_ts<'a>(f: TsFn, args: &'a [Value]) -> Result<Value, ExecError> {
 
     Ok(match f {
         TsFn::Match => Value::Bool(tsquery::matches(vector(&args[0]), query(&args[1]))),
-        TsFn::VectorConcat => {
-            Value::Tsvector(tsvector::concat(vector(&args[0]), vector(&args[1])))
-        }
+        TsFn::VectorConcat => Value::Tsvector(tsvector::concat(vector(&args[0]), vector(&args[1]))),
         TsFn::Strip => Value::Tsvector(tsvector::strip(vector(&args[0]))),
         TsFn::VectorLength => Value::Int4(tsvector::length(vector(&args[0]))),
         TsFn::SetWeight | TsFn::SetWeightLexemes => {
@@ -1670,9 +1674,7 @@ fn eval_ts<'a>(f: TsFn, args: &'a [Value]) -> Result<Value, ExecError> {
                         "distance in phrase operator must be an integer value between zero and 16384 inclusive",
                     )
                 })?;
-            Value::Tsquery(
-                tsquery::phrase(query(&args[0]), query(&args[1]), dist).map_err(ts_err)?,
-            )
+            Value::Tsquery(tsquery::phrase(query(&args[0]), query(&args[1]), dist).map_err(ts_err)?)
         }
     })
 }
@@ -1906,15 +1908,13 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
             Some(d) => Value::Float8(d),
             None => Value::Null,
         },
-        GeoFn::DistPathPoint => Value::Float8(geo::dist_path_point(
-            path_of(&args[0]),
-            &point_of(&args[1]),
-        )),
+        GeoFn::DistPathPoint => {
+            Value::Float8(geo::dist_path_point(path_of(&args[0]), &point_of(&args[1])))
+        }
         GeoFn::OnPpath => Value::Bool(geo::on_ppath(&point_of(&args[0]), path_of(&args[1]))),
-        GeoFn::PathContainPt => Value::Bool(geo::path_contain_pt(
-            path_of(&args[0]),
-            &point_of(&args[1]),
-        )),
+        GeoFn::PathContainPt => {
+            Value::Bool(geo::path_contain_pt(path_of(&args[0]), &point_of(&args[1])))
+        }
         GeoFn::PathInter => Value::Bool(geo::path_inter(path_of(&args[0]), path_of(&args[1]))),
         GeoFn::PathEq
         | GeoFn::PathNe
@@ -1948,9 +1948,7 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::BoxOverlap => Value::Bool(geo::box_overlap(&box_of(&args[0]), &box_of(&args[1]))),
         GeoFn::BoxLeft => Value::Bool(geo::box_left(&box_of(&args[0]), &box_of(&args[1]))),
         GeoFn::BoxRight => Value::Bool(geo::box_right(&box_of(&args[0]), &box_of(&args[1]))),
-        GeoFn::BoxOverLeft => {
-            Value::Bool(geo::box_over_left(&box_of(&args[0]), &box_of(&args[1])))
-        }
+        GeoFn::BoxOverLeft => Value::Bool(geo::box_over_left(&box_of(&args[0]), &box_of(&args[1]))),
         GeoFn::BoxOverRight => {
             Value::Bool(geo::box_over_right(&box_of(&args[0]), &box_of(&args[1])))
         }
@@ -1962,12 +1960,8 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::BoxOverAbove => {
             Value::Bool(geo::box_over_above(&box_of(&args[0]), &box_of(&args[1])))
         }
-        GeoFn::BoxBelowEq => {
-            Value::Bool(geo::box_below_eq(&box_of(&args[0]), &box_of(&args[1])))
-        }
-        GeoFn::BoxAboveEq => {
-            Value::Bool(geo::box_above_eq(&box_of(&args[0]), &box_of(&args[1])))
-        }
+        GeoFn::BoxBelowEq => Value::Bool(geo::box_below_eq(&box_of(&args[0]), &box_of(&args[1]))),
+        GeoFn::BoxAboveEq => Value::Bool(geo::box_above_eq(&box_of(&args[0]), &box_of(&args[1]))),
         GeoFn::BoxContain => Value::Bool(geo::box_contain(&box_of(&args[0]), &box_of(&args[1]))),
         GeoFn::BoxContained => {
             Value::Bool(geo::box_contained(&box_of(&args[0]), &box_of(&args[1])))
@@ -1976,8 +1970,9 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::BoxIntersects => {
             Value::Bool(geo::box_intersects(&box_of(&args[0]), &box_of(&args[1])))
         }
-        GeoFn::BoxIntersect => geo::box_intersect(&box_of(&args[0]), &box_of(&args[1]))
-            .map_or(Value::Null, Value::Box),
+        GeoFn::BoxIntersect => {
+            geo::box_intersect(&box_of(&args[0]), &box_of(&args[1])).map_or(Value::Null, Value::Box)
+        }
         // A `None` ordering means a NaN area, which every comparison answers
         // false — including `<>`. (PG gives `box` no `<>` operator at all.)
         GeoFn::BoxEq | GeoFn::BoxLt | GeoFn::BoxLe | GeoFn::BoxGt | GeoFn::BoxGe => {
@@ -1990,18 +1985,18 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
                 _ => o.is_ge(),
             }))
         }
-        GeoFn::BoxAddPt => Value::Box(
-            geo::box_add_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
-        ),
-        GeoFn::BoxSubPt => Value::Box(
-            geo::box_sub_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
-        ),
-        GeoFn::BoxMulPt => Value::Box(
-            geo::box_mul_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
-        ),
-        GeoFn::BoxDivPt => Value::Box(
-            geo::box_div_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
-        ),
+        GeoFn::BoxAddPt => {
+            Value::Box(geo::box_add_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::BoxSubPt => {
+            Value::Box(geo::box_sub_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::BoxMulPt => {
+            Value::Box(geo::box_mul_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
+        GeoFn::BoxDivPt => {
+            Value::Box(geo::box_div_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?)
+        }
         GeoFn::BoxContainPt => {
             Value::Bool(geo::box_contain_pt(&box_of(&args[0]), &point_of(&args[1])))
         }
@@ -2024,9 +2019,7 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::CloseLsegBox => {
             Value::Point(geo::close_lseg_box(&lseg_of(&args[0]), &box_of(&args[1])))
         }
-        GeoFn::DistBoxBox => {
-            Value::Float8(geo::dist_box_box(&box_of(&args[0]), &box_of(&args[1])))
-        }
+        GeoFn::DistBoxBox => Value::Float8(geo::dist_box_box(&box_of(&args[0]), &box_of(&args[1]))),
         GeoFn::BoxToCircle => Value::Circle(geo::box_to_circle(&box_of(&args[0]))),
         GeoFn::BoxToPolygon => Value::Polygon(geo::box_to_polygon(&box_of(&args[0]))),
 
@@ -2052,9 +2045,10 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::DistLineLine => {
             Value::Float8(geo::dist_line_line(&line_of(&args[0]), &line_of(&args[1])))
         }
-        GeoFn::DistPointLine => {
-            Value::Float8(geo::dist_point_line(&point_of(&args[0]), &line_of(&args[1])))
-        }
+        GeoFn::DistPointLine => Value::Float8(geo::dist_point_line(
+            &point_of(&args[0]),
+            &line_of(&args[1]),
+        )),
         GeoFn::ClosePointLine => Value::Point(geo::close_point_line(
             &point_of(&args[0]),
             &line_of(&args[1]),
@@ -2062,9 +2056,7 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::PointOnLine => {
             Value::Bool(geo::point_on_line(&point_of(&args[0]), &line_of(&args[1])))
         }
-        GeoFn::LsegOnLine => {
-            Value::Bool(geo::lseg_on_line(&lseg_of(&args[0]), &line_of(&args[1])))
-        }
+        GeoFn::LsegOnLine => Value::Bool(geo::lseg_on_line(&lseg_of(&args[0]), &line_of(&args[1]))),
         GeoFn::LsegIntersectsLine => Value::Bool(geo::lseg_intersects_line(
             &lseg_of(&args[0]),
             &line_of(&args[1]),
@@ -2089,9 +2081,7 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::CircleDiameter => Value::Float8(geo::circle_diameter(&circle_of(&args[0]))),
         GeoFn::CircleArea => Value::Float8(geo::circle_area(&circle_of(&args[0]))),
         GeoFn::CircleToBox => Value::Box(geo::circle_to_box(&circle_of(&args[0]))),
-        GeoFn::CircleFromPolygon => {
-            Value::Circle(geo::circle_from_polygon(polygon_of(&args[0])))
-        }
+        GeoFn::CircleFromPolygon => Value::Circle(geo::circle_from_polygon(polygon_of(&args[0]))),
         GeoFn::CircleToPolygon => Value::Polygon(
             geo::circle_to_polygon(geo::CIRCLE_POLYGON_NPTS, &circle_of(&args[0]))
                 .map_err(geo_err)?,
@@ -2109,9 +2099,10 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::CircleLeft => {
             Value::Bool(geo::circle_left(&circle_of(&args[0]), &circle_of(&args[1])))
         }
-        GeoFn::CircleRight => {
-            Value::Bool(geo::circle_right(&circle_of(&args[0]), &circle_of(&args[1])))
-        }
+        GeoFn::CircleRight => Value::Bool(geo::circle_right(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
         GeoFn::CircleOverLeft => Value::Bool(geo::circle_over_left(
             &circle_of(&args[0]),
             &circle_of(&args[1]),
@@ -2120,12 +2111,14 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
             &circle_of(&args[0]),
             &circle_of(&args[1]),
         )),
-        GeoFn::CircleBelow => {
-            Value::Bool(geo::circle_below(&circle_of(&args[0]), &circle_of(&args[1])))
-        }
-        GeoFn::CircleAbove => {
-            Value::Bool(geo::circle_above(&circle_of(&args[0]), &circle_of(&args[1])))
-        }
+        GeoFn::CircleBelow => Value::Bool(geo::circle_below(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::CircleAbove => Value::Bool(geo::circle_above(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
         GeoFn::CircleOverBelow => Value::Bool(geo::circle_over_below(
             &circle_of(&args[0]),
             &circle_of(&args[1]),
@@ -2195,21 +2188,19 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
         GeoFn::PathToPolygon => {
             Value::Polygon(geo::path_to_polygon(path_of(&args[0])).map_err(geo_err)?)
         }
-        GeoFn::PolySame => {
-            Value::Bool(geo::poly_same(polygon_of(&args[0]), polygon_of(&args[1])))
-        }
-        GeoFn::PolyOverlap => {
-            Value::Bool(geo::poly_overlap(polygon_of(&args[0]), polygon_of(&args[1])))
-        }
-        GeoFn::PolyLeft => {
-            Value::Bool(geo::poly_left(polygon_of(&args[0]), polygon_of(&args[1])))
-        }
+        GeoFn::PolySame => Value::Bool(geo::poly_same(polygon_of(&args[0]), polygon_of(&args[1]))),
+        GeoFn::PolyOverlap => Value::Bool(geo::poly_overlap(
+            polygon_of(&args[0]),
+            polygon_of(&args[1]),
+        )),
+        GeoFn::PolyLeft => Value::Bool(geo::poly_left(polygon_of(&args[0]), polygon_of(&args[1]))),
         GeoFn::PolyRight => {
             Value::Bool(geo::poly_right(polygon_of(&args[0]), polygon_of(&args[1])))
         }
-        GeoFn::PolyOverLeft => {
-            Value::Bool(geo::poly_over_left(polygon_of(&args[0]), polygon_of(&args[1])))
-        }
+        GeoFn::PolyOverLeft => Value::Bool(geo::poly_over_left(
+            polygon_of(&args[0]),
+            polygon_of(&args[1]),
+        )),
         GeoFn::PolyOverRight => Value::Bool(geo::poly_over_right(
             polygon_of(&args[0]),
             polygon_of(&args[1]),
@@ -2228,9 +2219,10 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
             polygon_of(&args[0]),
             polygon_of(&args[1]),
         )),
-        GeoFn::PolyContain => {
-            Value::Bool(geo::poly_contain(polygon_of(&args[0]), polygon_of(&args[1])))
-        }
+        GeoFn::PolyContain => Value::Bool(geo::poly_contain(
+            polygon_of(&args[0]),
+            polygon_of(&args[1]),
+        )),
         GeoFn::PolyContained => Value::Bool(geo::poly_contained(
             polygon_of(&args[0]),
             polygon_of(&args[1]),
@@ -2390,8 +2382,7 @@ fn array_contains(a: &Value, b: &Value) -> bool {
         _ => unreachable!("array_contains left is not an array"),
     };
     let (ae, be) = (array_elems(a), array_elems(b));
-    be.iter()
-        .all(|y| ae.iter().any(|x| elem_eq(elem, x, y)))
+    be.iter().all(|y| ae.iter().any(|x| elem_eq(elem, x, y)))
 }
 
 /// `a && b`: the arrays share at least one (non-NULL) element.
@@ -2401,9 +2392,8 @@ fn array_overlap(a: &Value, b: &Value) -> bool {
         _ => unreachable!("array_overlap left is not an array"),
     };
     let (ae, be) = (array_elems(a), array_elems(b));
-    ae.iter().any(|x| {
-        !matches!(x, Value::Null) && be.iter().any(|y| elem_eq(elem, x, y))
-    })
+    ae.iter()
+        .any(|x| !matches!(x, Value::Null) && be.iter().any(|y| elem_eq(elem, x, y)))
 }
 
 fn cash_err(e: crabgresql_types::money::MoneyError) -> ExecError {

@@ -990,9 +990,11 @@ fn phrase_eval(tv: &TsVector, node: &Node) -> PosSet {
         },
         Node::And(l, r) => intersect(phrase_eval(tv, l), phrase_eval(tv, r)),
         Node::Or(l, r) => union(phrase_eval(tv, l), phrase_eval(tv, r)),
-        Node::Phrase { dist, left, right } => {
-            join(phrase_eval(tv, left), phrase_eval(tv, right), i32::from(*dist))
-        }
+        Node::Phrase { dist, left, right } => join(
+            phrase_eval(tv, left),
+            phrase_eval(tv, right),
+            i32::from(*dist),
+        ),
     }
 }
 
@@ -1185,7 +1187,10 @@ fn union(a: PosSet, b: PosSet) -> PosSet {
         ) if we == wf => PosSet::Cofinite {
             // A cofinite member needs only one side, so it is excluded only when
             // both exclude it.
-            except: e.into_iter().filter(|p| f.binary_search(p).is_ok()).collect(),
+            except: e
+                .into_iter()
+                .filter(|p| f.binary_search(p).is_ok())
+                .collect(),
             width: we,
             extra: norm_spans(ex.into_iter().chain(fy).collect()),
         },
@@ -1628,7 +1633,10 @@ mod tests {
         // has to place a point somewhere in that span.
         assert!(!m("x:3A,1A,7", "x <2> !(!x & (!a <3> !b))")?);
         // A negated phrase between two negations, one level shallower, agrees.
-        assert!(m("y:5 b:8B z:2B,7A", "(!(!z <-> !c) <-> (!x <3> z:*)) <-> !z:*")?);
+        assert!(m(
+            "y:5 b:8B z:2B,7A",
+            "(!(!z <-> !c) <-> (!x <3> z:*)) <-> !z:*"
+        )?);
         // Everything one level simpler agrees -- a single negation under a
         // phrase, and a negated phrase over plain lexemes, are both exact.
         assert!(m("a:1", "!b <-> a")?);

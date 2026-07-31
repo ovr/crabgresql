@@ -316,11 +316,7 @@ impl HeapTable {
     /// `Err` when a row's out-of-line value cannot be read: CREATE INDEX is an
     /// ordinary user command, so an unreadable chunk store must fail the statement
     /// rather than the process.
-    pub fn build_index(
-        &self,
-        meta: IndexMetadata,
-        rel: RelFileNode,
-    ) -> Result<(), StorageError> {
+    pub fn build_index(&self, meta: IndexMetadata, rel: RelFileNode) -> Result<(), StorageError> {
         // A metadata-only index (relfilenode 0) has no physical B-tree to build;
         // just publish it. `rel == 0` is the single canonical encoding of
         // metadata-only (create_index allocates a relfilenode only when physical).
@@ -388,7 +384,10 @@ impl HeapTable {
     /// version. A row whose key column is NULL or an un-indexable value is simply
     /// not indexed (its key never satisfies equality), matching the memory engine.
     fn maintain_insert(&self, tuple: &Tuple, tid: Tid) {
-        let indexes = self.indexes.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let indexes = self
+            .indexes
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         for entry in indexes.iter() {
             if !entry.is_physical(&self.schema) {
                 continue;
@@ -622,13 +621,8 @@ impl HeapTable {
                 offset: 0,
             });
             let chunk = tuple::encode_chunk(payload, &hdr, link);
-            next = Some(self.place_item(
-                toast_rel,
-                txn.xid,
-                &chunk,
-                &self.toast_hint,
-                next.is_none(),
-            ));
+            next =
+                Some(self.place_item(toast_rel, txn.xid, &chunk, &self.toast_hint, next.is_none()));
         }
         next.unwrap_or_else(|| panic!("a toasted attribute always has at least one chunk"))
     }
@@ -667,7 +661,12 @@ impl HeapTable {
             widths.push(buf.len());
             // Only a variable-length type can be wide enough to be worth moving;
             // `typlen == -1` is exactly PostgreSQL's varlena predicate.
-            toastable.push(self.schema.columns.get(i).is_some_and(|c| c.ty.typlen() == -1));
+            toastable.push(
+                self.schema
+                    .columns
+                    .get(i)
+                    .is_some_and(|c| c.ty.typlen() == -1),
+            );
             encoded.push(buf);
         }
         let base = bytes.len() - widths.iter().sum::<usize>();
@@ -717,7 +716,10 @@ impl HeapTable {
         let bytes = tuple::encode_tuple(&attrs, hdr, PLACEHOLDER_TID);
         // `plan` computed this from the same widths, so a miss means the two
         // disagree — a bug here, not a user error.
-        debug_assert!(bytes.len() <= MAX_TUPLE, "toasting did not shrink the tuple");
+        debug_assert!(
+            bytes.len() <= MAX_TUPLE,
+            "toasting did not shrink the tuple"
+        );
         if bytes.len() > MAX_TUPLE {
             return Err(StorageError::RowTooBig {
                 size: bytes.len(),
@@ -821,13 +823,15 @@ impl HeapTable {
                     break;
                 };
                 let Some(next) = page.read(|pg| {
-                    page::get_item(pg, at.offset).and_then(|bytes| {
-                        tuple::decode_chunk(bytes).map(|(next, _)| next)
-                    })
+                    page::get_item(pg, at.offset)
+                        .and_then(|bytes| tuple::decode_chunk(bytes).map(|(next, _)| next))
                 }) else {
                     break;
                 };
-                per_block.entry((p.rel.0, at.block)).or_default().push(at.offset);
+                per_block
+                    .entry((p.rel.0, at.block))
+                    .or_default()
+                    .push(at.offset);
                 seen += 1;
                 // Self-link terminates the chain. The count is a backstop against
                 // a corrupt link cycling forever: no value has more chunks than
@@ -850,7 +854,11 @@ impl HeapTable {
                     page::set_flags(pg, off, page::LP_UNUSED);
                 }
                 page::compact(pg);
-                let lsn = self.log(rec::HEAP_VACUUM, Xid::INVALID, &rec::vacuum(rel, block, &offs));
+                let lsn = self.log(
+                    rec::HEAP_VACUUM,
+                    Xid::INVALID,
+                    &rec::vacuum(rel, block, &offs),
+                );
                 page::set_lsn(pg, lsn.0);
             });
         }
@@ -1045,7 +1053,10 @@ impl TableAm for HeapTable {
         txn: &TxnContext,
     ) -> Option<IndexProbe> {
         let (rel, latch, cols) = {
-            let indexes = self.indexes.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
+            let indexes = self
+                .indexes
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
             let entry = indexes.iter().find(|e| e.meta.name == index_name)?;
             if !entry.is_physical(&self.schema) {
                 return None;
@@ -1182,11 +1193,7 @@ impl TableAm for HeapTable {
         Ok(UpdateResult::Updated)
     }
 
-    fn delete(
-        &self,
-        tid: Tid,
-        txn: &TxnContext,
-    ) -> Result<DeleteResult, StorageError> {
+    fn delete(&self, tid: Tid, txn: &TxnContext) -> Result<DeleteResult, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         if self.stamp_deleted(rel, tid, txn) {
@@ -1247,11 +1254,15 @@ impl TableAm for HeapTable {
                     txn.xid,
                     &rec::truncate(&self.schema.namespace, &self.schema.name, old, new),
                 );
-                Self::io(self.engine.wal.flush(lsn.end).map_err(std::io::Error::other));
+                Self::io(
+                    self.engine
+                        .wal
+                        .flush(lsn.end)
+                        .map_err(std::io::Error::other),
+                );
                 // Only now that the record is durable: a failed flush must leave
                 // nothing pinned.
-                self.truncate_unreconciled
-                    .store(true, Ordering::Release);
+                self.truncate_unreconciled.store(true, Ordering::Release);
             }
             // Double TRUNCATE in one transaction: the previously staged file is now
             // superseded and, being used only by this uncommitted txn, is discarded.
@@ -1330,7 +1341,8 @@ impl TableAm for HeapTable {
                             // when the row owns chunks to reclaim. `has_external`
                             // keeps the common case free.
                             if !phys.is_empty() || head.has_external {
-                                victims.push((Tid { block, offset: off }, tuple::decode_raw(bytes)));
+                                victims
+                                    .push((Tid { block, offset: off }, tuple::decode_raw(bytes)));
                             }
                         }
                     }
@@ -1398,7 +1410,11 @@ impl TableAm for HeapTable {
                     page::set_flags(pg, off, page::LP_UNUSED);
                 }
                 page::compact(pg);
-                let lsn = self.log(rec::HEAP_VACUUM, Xid::INVALID, &rec::vacuum(rel, block, &freed));
+                let lsn = self.log(
+                    rec::HEAP_VACUUM,
+                    Xid::INVALID,
+                    &rec::vacuum(rel, block, &freed),
+                );
                 page::set_lsn(pg, lsn.0);
             });
             // Reclaim the chunks those rows owned — strictly AFTER the heap slots

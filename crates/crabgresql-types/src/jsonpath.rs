@@ -18,7 +18,7 @@
 //!   the same errors at the top level — but never a missing-variable error
 //!   (`42704`), matching PG.
 
-use crate::json::{Jsonb, JsonError};
+use crate::json::{JsonError, Jsonb};
 use crate::numeric::Numeric;
 use std::cmp::Ordering;
 
@@ -191,7 +191,11 @@ impl CmpOp {
 // ---------------------------------------------------------------------------
 
 fn err(sqlstate: &'static str, message: impl Into<String>) -> JsonError {
-    JsonError { sqlstate, message: message.into(), detail: None }
+    JsonError {
+        sqlstate,
+        message: message.into(),
+        detail: None,
+    }
 }
 
 fn syntax(message: impl Into<String>) -> JsonError {
@@ -262,7 +266,10 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(s: &'a str) -> Self {
-        Lexer { b: s.as_bytes(), i: 0 }
+        Lexer {
+            b: s.as_bytes(),
+            i: 0,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -435,7 +442,9 @@ impl<'a> Lexer<'a> {
             end += 1;
         }
         let tok = String::from_utf8_lossy(&self.b[start..end.max(start + 1).min(self.b.len())]);
-        syntax(format!("syntax error at or near \"{tok}\" of jsonpath input"))
+        syntax(format!(
+            "syntax error at or near \"{tok}\" of jsonpath input"
+        ))
     }
 
     fn lex_bareword(&mut self) -> String {
@@ -615,7 +624,11 @@ impl Parser {
     }
 
     fn expect(&mut self, t: &Tok) -> Result<(), JsonError> {
-        if self.eat(t) { Ok(()) } else { Err(self.err_here()) }
+        if self.eat(t) {
+            Ok(())
+        } else {
+            Err(self.err_here())
+        }
     }
 
     fn enter(&mut self) -> Result<(), JsonError> {
@@ -668,14 +681,21 @@ impl Parser {
         let node = if let Some(op) = self.peek_cmp() {
             self.pos += 1;
             let right = self.parse_add()?;
-            Node::Compare { op, left: Box::new(left), right: Box::new(right) }
+            Node::Compare {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            }
         } else if self.peek_ident_ci("starts") {
             self.pos += 1;
             if !self.eat_ident_ci("with") {
                 return Err(self.err_here());
             }
             let prefix = self.parse_add()?;
-            Node::StartsWith { operand: Box::new(left), prefix: Box::new(prefix) }
+            Node::StartsWith {
+                operand: Box::new(left),
+                prefix: Box::new(prefix),
+            }
         } else if self.eat_ident_ci("like_regex") {
             let pattern = match self.next() {
                 Some(Tok::Str(s)) => s,
@@ -708,7 +728,11 @@ impl Parser {
                 ));
             }
             crate::text::like_regex_compile(&pattern, flags).map_err(text_err)?;
-            Node::LikeRegex { operand: Box::new(left), pattern, flags }
+            Node::LikeRegex {
+                operand: Box::new(left),
+                pattern,
+                flags,
+            }
         } else {
             left
         };
@@ -733,7 +757,11 @@ impl Parser {
             };
             self.pos += 1;
             let right = self.parse_mul()?;
-            left = Node::Arith { op, left: Box::new(left), right: Box::new(right) };
+            left = Node::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok(left)
     }
@@ -749,7 +777,11 @@ impl Parser {
             };
             self.pos += 1;
             let right = self.parse_unary()?;
-            left = Node::Arith { op, left: Box::new(left), right: Box::new(right) };
+            left = Node::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok(left)
     }
@@ -760,7 +792,10 @@ impl Parser {
         }
         if self.eat(&Tok::Minus) {
             let operand = self.parse_unary()?;
-            return Ok(Node::Unary { neg: true, operand: Box::new(operand) });
+            return Ok(Node::Unary {
+                neg: true,
+                operand: Box::new(operand),
+            });
         }
         self.parse_postfix()
     }
@@ -826,7 +861,10 @@ impl Parser {
             }
             _ => return Err(self.err_here()),
         };
-        Ok(Node::Accessor { base: Box::new(base), step })
+        Ok(Node::Accessor {
+            base: Box::new(base),
+            step,
+        })
     }
 
     /// The optional `{lo}` / `{lo to hi}` level range after `.**`.
@@ -835,7 +873,11 @@ impl Parser {
             return Ok((None, None));
         }
         let lo = self.parse_u32()?;
-        let hi = if self.eat_ident_ci("to") { Some(self.parse_u32()?) } else { Some(lo) };
+        let hi = if self.eat_ident_ci("to") {
+            Some(self.parse_u32()?)
+        } else {
+            Some(lo)
+        };
         self.expect(&Tok::RBrace)?;
         Ok((Some(lo), hi))
     }
@@ -855,7 +897,10 @@ impl Parser {
         self.expect(&Tok::LBracket)?;
         if self.eat(&Tok::Star) {
             self.expect(&Tok::RBracket)?;
-            return Ok(Node::Accessor { base: Box::new(base), step: Accessor::WildcardArray });
+            return Ok(Node::Accessor {
+                base: Box::new(base),
+                step: Accessor::WildcardArray,
+            });
         }
         let mut subs = Vec::new();
         loop {
@@ -876,7 +921,10 @@ impl Parser {
             break;
         }
         self.expect(&Tok::RBracket)?;
-        Ok(Node::Accessor { base: Box::new(base), step: Accessor::Subscript(subs) })
+        Ok(Node::Accessor {
+            base: Box::new(base),
+            step: Accessor::Subscript(subs),
+        })
     }
 
     fn parse_primary(&mut self) -> Result<Node, JsonError> {
@@ -1027,7 +1075,11 @@ fn tok_text(t: &Tok) -> String {
 /// `jsonpath_in`: parse a `jsonpath` text literal into a [`JsonPath`] program.
 pub fn jsonpath_in(s: &str) -> Result<JsonPath, JsonError> {
     let toks = Lexer::new(s).tokenize()?;
-    let mut p = Parser { toks, pos: 0, depth: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        depth: 0,
+    };
     // Optional leading `strict` / `lax` mode word (default lax).
     let strict = if p.eat_ident_ci("strict") {
         true
@@ -1437,8 +1489,14 @@ fn prio(node: &Node) -> u8 {
         Node::Or(..) => 0,
         Node::And(..) => 1,
         Node::Not(_) => 2,
-        Node::Compare { .. } | Node::StartsWith { .. } | Node::LikeRegex { .. } | Node::IsUnknown(_) => 3,
-        Node::Arith { op: ArithOp::Add | ArithOp::Sub, .. } => 4,
+        Node::Compare { .. }
+        | Node::StartsWith { .. }
+        | Node::LikeRegex { .. }
+        | Node::IsUnknown(_) => 3,
+        Node::Arith {
+            op: ArithOp::Add | ArithOp::Sub,
+            ..
+        } => 4,
         Node::Arith { .. } => 5,
         Node::Unary { .. } => 6,
         _ => 7,
@@ -1514,7 +1572,11 @@ fn write_node(out: &mut String, node: &Node, brackets: bool) {
                 out.push(')');
             }
         }
-        Node::LikeRegex { operand, pattern, flags } => {
+        Node::LikeRegex {
+            operand,
+            pattern,
+            flags,
+        } => {
             let sp = prio(node);
             if brackets {
                 out.push('(');
@@ -1540,7 +1602,14 @@ fn write_node(out: &mut String, node: &Node, brackets: bool) {
     }
 }
 
-fn write_binary(out: &mut String, brackets: bool, left: &Node, sym: &str, right: &Node, self_prio: u8) {
+fn write_binary(
+    out: &mut String,
+    brackets: bool,
+    left: &Node,
+    sym: &str,
+    right: &Node,
+    self_prio: u8,
+) {
     if brackets {
         out.push('(');
     }
@@ -1651,7 +1720,12 @@ struct Eval<'a> {
 impl Eval<'_> {
     /// Evaluate a value/path node against `current` (`@`), producing a sequence.
     /// `last` is the index of the final array element when inside a subscript.
-    fn seq(&self, node: &Node, current: &Jsonb, last: Option<i64>) -> Result<Vec<Jsonb>, JsonError> {
+    fn seq(
+        &self,
+        node: &Node,
+        current: &Jsonb,
+        last: Option<i64>,
+    ) -> Result<Vec<Jsonb>, JsonError> {
         match node {
             Node::Root => Ok(vec![self.root.clone()]),
             Node::Current => Ok(vec![current.clone()]),
@@ -1680,7 +1754,9 @@ impl Eval<'_> {
                     let Jsonb::Number(n) = &it else {
                         return Err(err(
                             SQL_JSON_NUMBER_NOT_FOUND,
-                            format!("operand of unary jsonpath operator {sym} is not a numeric value"),
+                            format!(
+                                "operand of unary jsonpath operator {sym} is not a numeric value"
+                            ),
                         ));
                     };
                     out.push(Jsonb::Number(if *neg { n.neg() } else { n.clone() }));
@@ -1753,13 +1829,24 @@ impl Eval<'_> {
     }
 
     /// Apply one accessor `step` to a single `item`, pushing results onto `out`.
-    fn apply_step(&self, step: &Accessor, item: &Jsonb, out: &mut Vec<Jsonb>) -> Result<(), JsonError> {
+    fn apply_step(
+        &self,
+        step: &Accessor,
+        item: &Jsonb,
+        out: &mut Vec<Jsonb>,
+    ) -> Result<(), JsonError> {
         match step {
             Accessor::Key(k) => self.apply_key(k, item, out),
             Accessor::WildcardMember => self.apply_wildcard_member(item, out),
             Accessor::WildcardArray => self.apply_wildcard_array(item, out),
             Accessor::Recursive(lo, hi) => {
-                self.apply_recursive(item, lo.unwrap_or(0), hi.map(|h| h as i64).unwrap_or(i64::MAX), 0, out);
+                self.apply_recursive(
+                    item,
+                    lo.unwrap_or(0),
+                    hi.map(|h| h as i64).unwrap_or(i64::MAX),
+                    0,
+                    out,
+                );
                 Ok(())
             }
             Accessor::Subscript(subs) => self.apply_subscript(subs, item, out),
@@ -1858,7 +1945,12 @@ impl Eval<'_> {
         }
     }
 
-    fn apply_subscript(&self, subs: &[Subscript], item: &Jsonb, out: &mut Vec<Jsonb>) -> Result<(), JsonError> {
+    fn apply_subscript(
+        &self,
+        subs: &[Subscript],
+        item: &Jsonb,
+        out: &mut Vec<Jsonb>,
+    ) -> Result<(), JsonError> {
         // Determine the array to index (lax wraps a non-array).
         let arr: Vec<Jsonb> = match item {
             Jsonb::Array(a) => a.clone(),
@@ -1895,7 +1987,10 @@ impl Eval<'_> {
             out.push(arr[idx as usize].clone());
             Ok(())
         } else if self.strict {
-            Err(err(SQL_JSON_ARRAY_NOT_FOUND, "jsonpath array subscript is out of bounds"))
+            Err(err(
+                SQL_JSON_ARRAY_NOT_FOUND,
+                "jsonpath array subscript is out of bounds",
+            ))
         } else {
             Ok(())
         }
@@ -1903,14 +1998,20 @@ impl Eval<'_> {
 
     /// Evaluate a subscript index expression to a single integer (floor of a
     /// numeric), with `@` bound to the array's containing item and `last` set.
-    fn single_index(&self, node: &Node, current: &Jsonb, last: Option<i64>) -> Result<i64, JsonError> {
+    fn single_index(
+        &self,
+        node: &Node,
+        current: &Jsonb,
+        last: Option<i64>,
+    ) -> Result<i64, JsonError> {
         let items = self.seq(node, current, last)?;
         match items.as_slice() {
-            [Jsonb::Number(n)] => n
-                .floor()
-                .to_i128()
-                .map(|v| v as i64)
-                .ok_or_else(|| err(SQL_JSON_ARRAY_NOT_FOUND, "jsonpath array subscript is out of integer range")),
+            [Jsonb::Number(n)] => n.floor().to_i128().map(|v| v as i64).ok_or_else(|| {
+                err(
+                    SQL_JSON_ARRAY_NOT_FOUND,
+                    "jsonpath array subscript is out of integer range",
+                )
+            }),
             _ => Err(err(
                 SQL_JSON_ARRAY_NOT_FOUND,
                 "jsonpath array subscript is not a single numeric value",
@@ -1938,7 +2039,12 @@ impl Eval<'_> {
     }
 
     /// Apply an item method to a single (already-unwrapped) item.
-    fn apply_method_scalar(&self, m: Method, item: &Jsonb, out: &mut Vec<Jsonb>) -> Result<(), JsonError> {
+    fn apply_method_scalar(
+        &self,
+        m: Method,
+        item: &Jsonb,
+        out: &mut Vec<Jsonb>,
+    ) -> Result<(), JsonError> {
         match m {
             Method::Size => {
                 let n = match item {
@@ -2032,7 +2138,12 @@ impl Eval<'_> {
         }
     }
 
-    fn apply_filter(&self, pred: &Node, item: &Jsonb, out: &mut Vec<Jsonb>) -> Result<(), JsonError> {
+    fn apply_filter(
+        &self,
+        pred: &Node,
+        item: &Jsonb,
+        out: &mut Vec<Jsonb>,
+    ) -> Result<(), JsonError> {
         // lax: a filter unwraps an array operand, applying to each element.
         let candidates: Vec<&Jsonb> = match item {
             Jsonb::Array(a) if !self.strict => a.iter().collect(),
@@ -2080,7 +2191,11 @@ impl Eval<'_> {
             }),
             Node::Compare { op, left, right } => self.compare(*op, left, right, current),
             Node::StartsWith { operand, prefix } => self.starts_with(operand, prefix, current),
-            Node::LikeRegex { operand, pattern, flags } => self.like_regex(operand, pattern, *flags, current),
+            Node::LikeRegex {
+                operand,
+                pattern,
+                flags,
+            } => self.like_regex(operand, pattern, *flags, current),
             Node::Exists(inner) => {
                 // exists() suppresses structural errors → Unknown.
                 match self.seq(inner, current, None) {
@@ -2097,15 +2212,27 @@ impl Eval<'_> {
                 };
                 Ok(Ternary::from_bool(t == Ternary::Unknown))
             }
-            _ => Err(err(SINGLETON_JSON_ITEM_REQUIRED, "single boolean result is expected")),
+            _ => Err(err(
+                SINGLETON_JSON_ITEM_REQUIRED,
+                "single boolean result is expected",
+            )),
         }
     }
 
     /// Existential comparison: true if any (lhs, rhs) pair satisfies `op`; a
     /// type-incompatible pair contributes Unknown; a structural error while
     /// evaluating an operand is suppressed to Unknown.
-    fn compare(&self, op: CmpOp, left: &Node, right: &Node, current: &Jsonb) -> Result<Ternary, JsonError> {
-        let (ls, rs) = match (self.seq(left, current, None), self.seq(right, current, None)) {
+    fn compare(
+        &self,
+        op: CmpOp,
+        left: &Node,
+        right: &Node,
+        current: &Jsonb,
+    ) -> Result<Ternary, JsonError> {
+        let (ls, rs) = match (
+            self.seq(left, current, None),
+            self.seq(right, current, None),
+        ) {
             (Ok(l), Ok(r)) => (l, r),
             (Err(e), _) | (_, Err(e)) if suppressible(&e) => return Ok(Ternary::Unknown),
             (Err(e), _) | (_, Err(e)) => return Err(e),
@@ -2122,10 +2249,19 @@ impl Eval<'_> {
                 }
             }
         }
-        Ok(if unknown { Ternary::Unknown } else { Ternary::False })
+        Ok(if unknown {
+            Ternary::Unknown
+        } else {
+            Ternary::False
+        })
     }
 
-    fn starts_with(&self, operand: &Node, prefix: &Node, current: &Jsonb) -> Result<Ternary, JsonError> {
+    fn starts_with(
+        &self,
+        operand: &Node,
+        prefix: &Node,
+        current: &Jsonb,
+    ) -> Result<Ternary, JsonError> {
         let ls = self.pred_operand(operand, current)?;
         let ps = self.pred_operand(prefix, current)?;
         let mut unknown = false;
@@ -2141,7 +2277,11 @@ impl Eval<'_> {
                 }
             }
         }
-        Ok(if unknown { Ternary::Unknown } else { Ternary::False })
+        Ok(if unknown {
+            Ternary::Unknown
+        } else {
+            Ternary::False
+        })
     }
 
     fn like_regex(
@@ -2169,7 +2309,11 @@ impl Eval<'_> {
                 _ => unknown = true,
             }
         }
-        Ok(if unknown { Ternary::Unknown } else { Ternary::False })
+        Ok(if unknown {
+            Ternary::Unknown
+        } else {
+            Ternary::False
+        })
     }
 
     /// Evaluate a predicate operand to a sequence, suppressing structural errors
@@ -2217,8 +2361,12 @@ fn arith(op: ArithOp, a: &Numeric, b: &Numeric) -> Result<Numeric, JsonError> {
         ArithOp::Add => a.add(b),
         ArithOp::Sub => a.sub(b),
         ArithOp::Mul => a.mul(b),
-        ArithOp::Div => a.div(b).map_err(|_| err(DIVISION_BY_ZERO, "division by zero"))?,
-        ArithOp::Mod => a.modulo(b).map_err(|_| err(DIVISION_BY_ZERO, "division by zero"))?,
+        ArithOp::Div => a
+            .div(b)
+            .map_err(|_| err(DIVISION_BY_ZERO, "division by zero"))?,
+        ArithOp::Mod => a
+            .modulo(b)
+            .map_err(|_| err(DIVISION_BY_ZERO, "division by zero"))?,
     })
 }
 
@@ -2275,7 +2423,11 @@ pub fn query(
     vars: Option<&Jsonb>,
     silent: bool,
 ) -> Result<Vec<Jsonb>, JsonError> {
-    let ev = Eval { root: target, vars, strict: p.strict };
+    let ev = Eval {
+        root: target,
+        vars,
+        strict: p.strict,
+    };
     match ev.seq(&p.expr, target, None) {
         Ok(items) => Ok(items),
         Err(e) if silent && suppressible(&e) => Ok(Vec::new()),
@@ -2291,7 +2443,11 @@ pub fn exists(
     vars: Option<&Jsonb>,
     silent: bool,
 ) -> Result<Option<bool>, JsonError> {
-    let ev = Eval { root: target, vars, strict: p.strict };
+    let ev = Eval {
+        root: target,
+        vars,
+        strict: p.strict,
+    };
     match ev.seq(&p.expr, target, None) {
         Ok(items) => Ok(Some(!items.is_empty())),
         Err(e) if silent && suppressible(&e) => Ok(None),
@@ -2308,7 +2464,11 @@ pub fn match_predicate(
     vars: Option<&Jsonb>,
     silent: bool,
 ) -> Result<Option<bool>, JsonError> {
-    let ev = Eval { root: target, vars, strict: p.strict };
+    let ev = Eval {
+        root: target,
+        vars,
+        strict: p.strict,
+    };
     let result = if is_predicate(&p.expr) {
         ev.pred(&p.expr, target)
     } else {
@@ -2317,7 +2477,10 @@ pub fn match_predicate(
             Ok(items) => match items.as_slice() {
                 [Jsonb::Bool(b)] => Ok(Ternary::from_bool(*b)),
                 [Jsonb::Null] => Ok(Ternary::Unknown),
-                _ => Err(err(SINGLETON_JSON_ITEM_REQUIRED, "single boolean result is expected")),
+                _ => Err(err(
+                    SINGLETON_JSON_ITEM_REQUIRED,
+                    "single boolean result is expected",
+                )),
             },
             Err(e) => Err(e),
         }
@@ -2401,15 +2564,37 @@ mod tests {
     #[test]
     fn like_regex_evaluates_under_flags() -> Result<()> {
         // `q` matches the literal text, including regex metacharacters.
-        assert_eq!(q("{\"a\":\"a(\"}", "$.a ? (@ like_regex \"a(\" flag \"q\")")?, ["\"a(\""]);
+        assert_eq!(
+            q("{\"a\":\"a(\"}", "$.a ? (@ like_regex \"a(\" flag \"q\")")?,
+            ["\"a(\""]
+        );
         // `x` is inert: it survives parsing only with `q`, which already made
         // the pattern literal, so the spaces still have to match.
-        assert_eq!(q("{\"a\":\"a b\"}", "$.a ? (@ like_regex \"a b\" flag \"xq\")")?, ["\"a b\""]);
+        assert_eq!(
+            q(
+                "{\"a\":\"a b\"}",
+                "$.a ? (@ like_regex \"a b\" flag \"xq\")"
+            )?,
+            ["\"a b\""]
+        );
         assert!(q("{\"a\":\"ab\"}", "$.a ? (@ like_regex \"a b\" flag \"xq\")")?.is_empty());
         // `i` composes with `q`.
-        assert_eq!(q("{\"a\":\"A.C\"}", "$.a ? (@ like_regex \"a.c\" flag \"qi\")")?, ["\"A.C\""]);
+        assert_eq!(
+            q(
+                "{\"a\":\"A.C\"}",
+                "$.a ? (@ like_regex \"a.c\" flag \"qi\")"
+            )?,
+            ["\"A.C\""]
+        );
         // `s` lets `.` span a newline; without it, it must not.
-        assert_eq!(q("{\"a\":\"a\\nb\"}", "$.a ? (@ like_regex \"a.b\" flag \"s\")")?.len(), 1);
+        assert_eq!(
+            q(
+                "{\"a\":\"a\\nb\"}",
+                "$.a ? (@ like_regex \"a.b\" flag \"s\")"
+            )?
+            .len(),
+            1
+        );
         assert!(q("{\"a\":\"a\\nb\"}", "$.a ? (@ like_regex \"a.b\")")?.is_empty());
 
         Ok(())
@@ -2418,20 +2603,50 @@ mod tests {
     #[test]
     fn output_canonical_form() -> Result<()> {
         assert_eq!(out("$.a.b[*] ? (@ > 3)")?, "$.\"a\".\"b\"[*]?(@ > 3)");
-        assert_eq!(out("lax $.\"a b\"[1 to 3, 5].size()")?, "$.\"a b\"[1 to 3,5].size()");
-        assert_eq!(out("strict $.a.**{2 to 4}.c")?, "strict $.\"a\".**{2 to 4}.\"c\"");
-        assert_eq!(out("$.a + $.b * 2 - (-3)")?, "(($.\"a\" + $.\"b\" * 2) - -3)");
-        assert_eq!(out("$ ? (@ like_regex \"ab.*c\" flag \"i\")")?, "$?(@ like_regex \"ab.*c\" flag \"i\")");
+        assert_eq!(
+            out("lax $.\"a b\"[1 to 3, 5].size()")?,
+            "$.\"a b\"[1 to 3,5].size()"
+        );
+        assert_eq!(
+            out("strict $.a.**{2 to 4}.c")?,
+            "strict $.\"a\".**{2 to 4}.\"c\""
+        );
+        assert_eq!(
+            out("$.a + $.b * 2 - (-3)")?,
+            "(($.\"a\" + $.\"b\" * 2) - -3)"
+        );
+        assert_eq!(
+            out("$ ? (@ like_regex \"ab.*c\" flag \"i\")")?,
+            "$?(@ like_regex \"ab.*c\" flag \"i\")"
+        );
         // Flags are re-emitted from the parsed set: fixed order, deduplicated,
         // and omitted entirely when empty.
-        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"qmi\")")?, "$?(@ like_regex \"a\" flag \"imq\")");
-        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"ii\")")?, "$?(@ like_regex \"a\" flag \"i\")");
-        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"\")")?, "$?(@ like_regex \"a\")");
-        assert_eq!(out("$ ? (@ like_regex \"a\" flag \"xq\")")?, "$?(@ like_regex \"a\" flag \"xq\")");
+        assert_eq!(
+            out("$ ? (@ like_regex \"a\" flag \"qmi\")")?,
+            "$?(@ like_regex \"a\" flag \"imq\")"
+        );
+        assert_eq!(
+            out("$ ? (@ like_regex \"a\" flag \"ii\")")?,
+            "$?(@ like_regex \"a\" flag \"i\")"
+        );
+        assert_eq!(
+            out("$ ? (@ like_regex \"a\" flag \"\")")?,
+            "$?(@ like_regex \"a\")"
+        );
+        assert_eq!(
+            out("$ ? (@ like_regex \"a\" flag \"xq\")")?,
+            "$?(@ like_regex \"a\" flag \"xq\")"
+        );
         // Canonical output must re-parse: `x` is emitted before the `q` that
         // makes it legal.
-        assert_eq!(out(&out("$ ? (@ like_regex \"a\" flag \"qx\")")?)?, "$?(@ like_regex \"a\" flag \"xq\")");
-        assert_eq!(out("$ ? (@.name starts with \"Jo\")")?, "$?(@.\"name\" starts with \"Jo\")");
+        assert_eq!(
+            out(&out("$ ? (@ like_regex \"a\" flag \"qx\")")?)?,
+            "$?(@ like_regex \"a\" flag \"xq\")"
+        );
+        assert_eq!(
+            out("$ ? (@.name starts with \"Jo\")")?,
+            "$?(@.\"name\" starts with \"Jo\")"
+        );
         assert_eq!(out("$ ? (exists (@.x))")?, "$?(exists (@.\"x\"))");
         assert_eq!(out("$ ? ((@ > 1) is unknown)")?, "$?((@ > 1) is unknown)");
         assert_eq!(out("$[last]")?, "$[last]");
@@ -2444,23 +2659,43 @@ mod tests {
     fn navigation_and_filters() -> Result<()> {
         assert_eq!(q("{\"a\":[1,2,3]}", "$.a[*] ? (@ > 1)")?, vec!["2", "3"]);
         assert_eq!(q("{\"a\":[1,2,3]}", "$.a ? (@ >= 2)")?, vec!["2", "3"]);
-        assert_eq!(q("[{\"x\":1},{\"x\":9}]", "$ ? (@.x > 5)")?, vec!["{\"x\": 9}"]);
-        assert_eq!(q("{\"a\":{\"b\":1,\"c\":{\"b\":2}}}", "$.**.b")?, vec!["1", "2"]);
+        assert_eq!(
+            q("[{\"x\":1},{\"x\":9}]", "$ ? (@.x > 5)")?,
+            vec!["{\"x\": 9}"]
+        );
+        assert_eq!(
+            q("{\"a\":{\"b\":1,\"c\":{\"b\":2}}}", "$.**.b")?,
+            vec!["1", "2"]
+        );
         Ok(())
     }
 
     #[test]
     fn methods() -> Result<()> {
-        assert_eq!(q("[1,\"x\",true,null,{},[2]]", "$[*].type()")?,
-            vec!["\"number\"", "\"string\"", "\"boolean\"", "\"null\"", "\"object\"", "\"array\""]);
+        assert_eq!(
+            q("[1,\"x\",true,null,{},[2]]", "$[*].type()")?,
+            vec![
+                "\"number\"",
+                "\"string\"",
+                "\"boolean\"",
+                "\"null\"",
+                "\"object\"",
+                "\"array\""
+            ]
+        );
         assert_eq!(q("5", "$.size()")?, vec!["1"]);
         assert_eq!(q("[1,2,3]", "$.size()")?, vec!["3"]);
         assert_eq!(q("\"1.5\"", "$.double()")?, vec!["1.5"]);
         assert_eq!(q("-2.3", "$.abs()")?, vec!["2.3"]);
         assert_eq!(q("2.3", "$.floor()")?, vec!["2"]);
         assert_eq!(q("2.3", "$.ceiling()")?, vec!["3"]);
-        assert_eq!(q("{\"a\":1,\"b\":2}", "$.keyvalue()")?,
-            vec!["{\"id\": 0, \"key\": \"a\", \"value\": 1}", "{\"id\": 0, \"key\": \"b\", \"value\": 2}"]);
+        assert_eq!(
+            q("{\"a\":1,\"b\":2}", "$.keyvalue()")?,
+            vec![
+                "{\"id\": 0, \"key\": \"a\", \"value\": 1}",
+                "{\"id\": 0, \"key\": \"b\", \"value\": 2}"
+            ]
+        );
         Ok(())
     }
 
@@ -2500,7 +2735,10 @@ mod tests {
         // strict `.size()` on a non-array errors; lax returns 1.
         let e = qerr("5", "strict $.size()");
         assert_eq!(e.sqlstate, SQL_JSON_ARRAY_NOT_FOUND);
-        assert_eq!(e.message, "jsonpath item method .size() can only be applied to an array");
+        assert_eq!(
+            e.message,
+            "jsonpath item method .size() can only be applied to an array"
+        );
     }
 
     #[test]
@@ -2508,7 +2746,10 @@ mod tests {
         // The "single numeric value" error names the actual operator (22038).
         let e = qerr("[1,2]", "$[*] * 1");
         assert_eq!(e.sqlstate, SINGLETON_JSON_ITEM_REQUIRED);
-        assert_eq!(e.message, "left operand of jsonpath operator * is not a single numeric value");
+        assert_eq!(
+            e.message,
+            "left operand of jsonpath operator * is not a single numeric value"
+        );
         assert_eq!(
             qerr("[1,2]", "1 - $[*]").message,
             "right operand of jsonpath operator - is not a single numeric value"
@@ -2516,20 +2757,38 @@ mod tests {
         // Unary has its own message/SQLSTATE (2203B).
         let u = qerr("{\"a\":\"x\"}", "- $.a");
         assert_eq!(u.sqlstate, SQL_JSON_NUMBER_NOT_FOUND);
-        assert_eq!(u.message, "operand of unary jsonpath operator - is not a numeric value");
+        assert_eq!(
+            u.message,
+            "operand of unary jsonpath operator - is not a numeric value"
+        );
     }
 
     #[test]
     fn predicates_and_matching() -> Result<()> {
-        assert_eq!(match_predicate(&parse("$.a == 1")?, &jb("{\"a\":1}"), None, false).unwrap(), Some(true));
-        assert_eq!(match_predicate(&parse("$.a == 2")?, &jb("{\"a\":1}"), None, false).unwrap(), Some(false));
+        assert_eq!(
+            match_predicate(&parse("$.a == 1")?, &jb("{\"a\":1}"), None, false).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            match_predicate(&parse("$.a == 2")?, &jb("{\"a\":1}"), None, false).unwrap(),
+            Some(false)
+        );
         // Type-mismatch comparison → Unknown → SQL NULL.
-        assert_eq!(match_predicate(&parse("$.a > 1")?, &jb("{\"a\":\"x\"}"), None, false).unwrap(), None);
+        assert_eq!(
+            match_predicate(&parse("$.a > 1")?, &jb("{\"a\":\"x\"}"), None, false).unwrap(),
+            None
+        );
         // Predicate query yields one boolean item.
         assert_eq!(q("{\"a\":1}", "$.a > 0")?, vec!["true"]);
         assert_eq!(q("{\"a\":\"x\"}", "$.a > 1")?, vec!["null"]);
-        assert_eq!(q("{\"a\":\"hello\"}", "$.a ? (@ starts with \"he\")")?, vec!["\"hello\""]);
-        assert_eq!(q("{\"a\":\"hello\"}", "$.a ? (@ like_regex \"^h.*o$\")")?, vec!["\"hello\""]);
+        assert_eq!(
+            q("{\"a\":\"hello\"}", "$.a ? (@ starts with \"he\")")?,
+            vec!["\"hello\""]
+        );
+        assert_eq!(
+            q("{\"a\":\"hello\"}", "$.a ? (@ like_regex \"^h.*o$\")")?,
+            vec!["\"hello\""]
+        );
         Ok(())
     }
 
@@ -2541,10 +2800,18 @@ mod tests {
         let e = query(&parse("strict $.b")?, &jb("{\"a\":1}"), None, false).unwrap_err();
         assert_eq!(e.message, "JSON object does not contain key \"b\"");
         // silent suppresses it.
-        assert!(query(&parse("strict $.b")?, &jb("{\"a\":1}"), None, true).unwrap().is_empty());
+        assert!(
+            query(&parse("strict $.b")?, &jb("{\"a\":1}"), None, true)
+                .unwrap()
+                .is_empty()
+        );
         // out-of-range subscript: strict errors, lax skips.
-        assert_eq!(query(&parse("strict $[5]")?, &jb("[1,2]"), None, false).unwrap_err().message,
-            "jsonpath array subscript is out of bounds");
+        assert_eq!(
+            query(&parse("strict $[5]")?, &jb("[1,2]"), None, false)
+                .unwrap_err()
+                .message,
+            "jsonpath array subscript is out of bounds"
+        );
         assert!(q("[1,2]", "$[5]")?.is_empty());
         Ok(())
     }
@@ -2569,9 +2836,17 @@ mod tests {
 
     #[test]
     fn parse_errors() {
-        assert_eq!(jsonpath_in("$.").unwrap_err().message, "syntax error at end of jsonpath input");
+        assert_eq!(
+            jsonpath_in("$.").unwrap_err().message,
+            "syntax error at end of jsonpath input"
+        );
         assert_eq!(jsonpath_in("foo").unwrap_err().sqlstate, SYNTAX_ERROR);
-        assert!(jsonpath_in("5.double()").unwrap_err().message.contains("trailing junk after numeric literal"));
+        assert!(
+            jsonpath_in("5.double()")
+                .unwrap_err()
+                .message
+                .contains("trailing junk after numeric literal")
+        );
         // `.**` requires the dot.
         assert!(jsonpath_in("$**.a").is_err());
     }

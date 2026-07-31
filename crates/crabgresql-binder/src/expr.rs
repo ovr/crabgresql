@@ -449,7 +449,10 @@ pub struct BoundAggregate {
 pub enum WindowKind {
     /// A dedicated window function, which reads only the row's position within
     /// its partition.
-    Builtin { func: WindowFn, args: Vec<BoundExpr> },
+    Builtin {
+        func: WindowFn,
+        args: Vec<BoundExpr>,
+    },
     /// An ordinary aggregate used as a window function (`sum(x) OVER (…)`).
     /// Deliberately carries a [`BoundAggregate`] so the executor drives it with
     /// the same accumulators as a grouped aggregate — that is what makes
@@ -673,9 +676,7 @@ impl BoundExpr {
                     || spec.exprs().any(BoundExpr::contains_srf)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_srf),
-            BoundExpr::Subscript { base, index, .. } => {
-                base.contains_srf() || index.contains_srf()
-            }
+            BoundExpr::Subscript { base, index, .. } => base.contains_srf() || index.contains_srf(),
             BoundExpr::Case { whens, else_, .. } => {
                 whens
                     .iter()
@@ -684,9 +685,7 @@ impl BoundExpr {
             }
             // A subquery's own SRFs stay inside its subplan; nothing propagates
             // out to the enclosing projection.
-            BoundExpr::QuantifiedSubquery { cmp, .. } => {
-                cmp.contains_srf()
-            }
+            BoundExpr::QuantifiedSubquery { cmp, .. } => cmp.contains_srf(),
             BoundExpr::QuantifiedArray { array, cmp, .. } => {
                 array.contains_srf() || cmp.contains_srf()
             }
@@ -882,9 +881,9 @@ impl BoundExpr {
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.first_agg_or_window(),
-            BoundExpr::Binary { left, right, .. } => {
-                left.first_agg_or_window().or_else(|| right.first_agg_or_window())
-            }
+            BoundExpr::Binary { left, right, .. } => left
+                .first_agg_or_window()
+                .or_else(|| right.first_agg_or_window()),
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. } => first(args),
@@ -951,14 +950,10 @@ impl BoundExpr {
                     .any(|(c, r)| c.contains_volatile_fn() || r.contains_volatile_fn())
                     || else_.as_ref().is_some_and(|e| e.contains_volatile_fn())
             }
-            BoundExpr::Aggregate { args, .. } => {
-                args.iter().any(|a| a.contains_volatile_fn())
-            }
+            BoundExpr::Aggregate { args, .. } => args.iter().any(|a| a.contains_volatile_fn()),
             // A subquery's own body runs as a separate plan; only the outer needle
             // of an IN-subquery propagates to the enclosing expression.
-            BoundExpr::QuantifiedSubquery { cmp, .. } => {
-                cmp.contains_volatile_fn()
-            }
+            BoundExpr::QuantifiedSubquery { cmp, .. } => cmp.contains_volatile_fn(),
             BoundExpr::QuantifiedArray { array, cmp, .. } => {
                 array.contains_volatile_fn() || cmp.contains_volatile_fn()
             }
@@ -1008,16 +1003,13 @@ impl BoundExpr {
             BoundExpr::Aggregate { args, .. } => {
                 args.iter().map(|a| a.count_param_refs(index)).sum()
             }
-            BoundExpr::WindowFunc { kind, spec, .. } => {
-                kind.args()
-                    .iter()
-                    .chain(spec.exprs())
-                    .map(|a| a.count_param_refs(index))
-                    .sum()
-            }
-            BoundExpr::QuantifiedSubquery { cmp, .. } => {
-                cmp.count_param_refs(index)
-            }
+            BoundExpr::WindowFunc { kind, spec, .. } => kind
+                .args()
+                .iter()
+                .chain(spec.exprs())
+                .map(|a| a.count_param_refs(index))
+                .sum(),
+            BoundExpr::QuantifiedSubquery { cmp, .. } => cmp.count_param_refs(index),
             BoundExpr::QuantifiedArray { array, cmp, .. } => {
                 array.count_param_refs(index) + cmp.count_param_refs(index)
             }
@@ -1084,13 +1076,14 @@ impl BoundExpr {
                 // a binder bug; reporting the true hull keeps that bug from
                 // becoming a *wrong* relocation decision on top of a loud one.
                 BoundExpr::WindowFunc { kind, spec, .. } => {
-                    kind.args().iter().chain(spec.exprs()).for_each(|a| fold(a, acc));
+                    kind.args()
+                        .iter()
+                        .chain(spec.exprs())
+                        .for_each(|a| fold(a, acc));
                 }
                 // Non-correlated subplans reference no outer column; only the IN
                 // needle (in `cmp`) can. Scalar/EXISTS contribute nothing.
-                BoundExpr::QuantifiedSubquery { cmp, .. } => {
-                    fold(cmp, acc)
-                }
+                BoundExpr::QuantifiedSubquery { cmp, .. } => fold(cmp, acc),
                 BoundExpr::QuantifiedArray { array, cmp, .. } => {
                     fold(array, acc);
                     fold(cmp, acc);
@@ -1191,9 +1184,7 @@ impl BoundExpr {
     /// the sibling arms above short-circuit with `&&`, so a partial set is not
     /// a usable lower bound and must never be read as one.
     fn collect_all(exprs: &[BoundExpr], out: &mut BTreeSet<usize>) -> bool {
-        exprs
-            .iter()
-            .all(|expr| expr.collect_column_refs(out))
+        exprs.iter().all(|expr| expr.collect_column_refs(out))
     }
 
     /// Add `delta` to every `ColumnRef` index, relocating this expression from
@@ -1581,9 +1572,7 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
                 .iter()
                 .map(|(c, r)| (outerize_columns(c, level), outerize_columns(r, level)))
                 .collect(),
-            else_: else_
-                .as_ref()
-                .map(|e| Box::new(outerize_columns(e, level))),
+            else_: else_.as_ref().map(|e| Box::new(outerize_columns(e, level))),
             ty: *ty,
         },
         // A merged-join visible column expression is only ever a ColumnRef or a
@@ -2351,14 +2340,11 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
     // explicit cast; `ARRAY[]::t[]` is intercepted in `bind_cast` and never
     // reaches here empty.
     if elems.is_empty() {
-        return Err(BindError::new(
-            "42P18",
-            "cannot determine type of empty array",
-        )
-        .with_hint(Some(
-            "Explicitly cast to the desired type, for example ARRAY[]::integer[]."
-                .to_string(),
-        )));
+        return Err(
+            BindError::new("42P18", "cannot determine type of empty array").with_hint(Some(
+                "Explicitly cast to the desired type, for example ARRAY[]::integer[].".to_string(),
+            )),
+        );
     }
     let bindings = elems
         .iter()
@@ -3334,10 +3320,13 @@ fn coerce_user_cast(
         && let Some(info) = catalog.enum_info(oid)
     {
         return match expr {
-            BoundExpr::Const { value: Value::Text(s), .. } => {
-                enum_const(oid, &info, Some(s), Span::empty())
-            }
-            BoundExpr::Const { value: Value::Null, .. } => Ok(BoundExpr::Const {
+            BoundExpr::Const {
+                value: Value::Text(s),
+                ..
+            } => enum_const(oid, &info, Some(s), Span::empty()),
+            BoundExpr::Const {
+                value: Value::Null, ..
+            } => Ok(BoundExpr::Const {
                 value: Value::Null,
                 ty: target,
             }),
@@ -3348,7 +3337,9 @@ fn coerce_user_cast(
     }
 
     match catalog.find_cast(source, target) {
-        Some(UserCast { without_function: true }) => Ok(BoundExpr::Reinterpret {
+        Some(UserCast {
+            without_function: true,
+        }) => Ok(BoundExpr::Reinterpret {
             expr: Box::new(expr),
             reported: target,
             rep: scope.catalog().backing_rep(target),
@@ -4161,7 +4152,11 @@ fn bind_case(
             else_
                 .iter()
                 .map(|e| crate::collation::expr_collation(e))
-                .chain(whens.iter().map(|(_, r)| crate::collation::expr_collation(r))),
+                .chain(
+                    whens
+                        .iter()
+                        .map(|(_, r)| crate::collation::expr_collation(r)),
+                ),
         )?;
     }
 
@@ -4225,27 +4220,24 @@ fn bind_in_list(
             Some(ty) => Binding::Typed(resolve_operand(item, ty)?),
             None => item.clone(),
         };
-        let comparison =
-            bind_binary_op(
-                cmp,
-                left.clone(),
-                right,
+        let comparison = bind_binary_op(
+            cmp,
+            left.clone(),
+            right,
+            Span::empty(),
+            (Span::empty(), Span::empty()),
+            scope.catalog().as_ref(),
+        )?;
+        acc = Some(match acc {
+            None => comparison,
+            Some(prev) => bind_binary_op(
+                chain,
+                prev,
+                comparison,
                 Span::empty(),
                 (Span::empty(), Span::empty()),
                 scope.catalog().as_ref(),
-            )?;
-        acc = Some(match acc {
-            None => comparison,
-            Some(prev) => {
-                bind_binary_op(
-                    chain,
-                    prev,
-                    comparison,
-                    Span::empty(),
-                    (Span::empty(), Span::empty()),
-                    scope.catalog().as_ref(),
-                )?
-            }
+            )?,
         });
     }
     Ok(acc.expect("non-empty list yields at least one comparison"))
@@ -4657,9 +4649,7 @@ pub(crate) fn bind_binary_op(
             if op.is_arithmetic() {
                 // Every numeric type offers the operator; unknown operands
                 // cannot pick one — PG reports ambiguity.
-                return Err(
-                    ambiguous_operator("unknown", op.sql_symbol(), "unknown").at(op_span)
-                );
+                return Err(ambiguous_operator("unknown", op.sql_symbol(), "unknown").at(op_span));
             }
             // Comparing two untyped literals: PG falls back to text.
             (
@@ -5158,11 +5148,7 @@ fn operand_name(b: &Binding) -> &'static str {
 /// `>>`, ... Shared so a mis-typed operand reports a missing operator instead of
 /// a cast failure from inside `coerce_expr`. Carries PG's HINT, as
 /// `custom_op_undefined` does for the `OPERATOR(...)` spelling.
-fn undefined_binary_operator(
-    lb: &Binding,
-    op: &ast::BinaryOperator,
-    rb: &Binding,
-) -> BindError {
+fn undefined_binary_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> BindError {
     BindError::new(
         sqlstate::UNDEFINED_FUNCTION,
         format!(
@@ -5442,24 +5428,96 @@ fn resolve_geometric_combo(
                 PgType::Float8,
                 vec![r(Path)?, l(Point)?],
             ),
-            (PgType::Box, PgType::Box) => call(geo(GeoFn::DistBoxBox), PgType::Float8, vec![l(PgType::Box)?, r(PgType::Box)?]),
-            (Point, PgType::Box) => call(geo(GeoFn::DistPointBox), PgType::Float8, vec![l(Point)?, r(PgType::Box)?]),
-            (PgType::Box, Point) => call(geo(GeoFn::DistPointBox), PgType::Float8, vec![r(Point)?, l(PgType::Box)?]),
-            (Lseg, PgType::Box) => call(geo(GeoFn::DistLsegBox), PgType::Float8, vec![l(Lseg)?, r(PgType::Box)?]),
-            (PgType::Box, Lseg) => call(geo(GeoFn::DistLsegBox), PgType::Float8, vec![r(Lseg)?, l(PgType::Box)?]),
-            (PgType::Line, PgType::Line) => call(geo(GeoFn::DistLineLine), PgType::Float8, vec![l(PgType::Line)?, r(PgType::Line)?]),
-            (Point, PgType::Line) => call(geo(GeoFn::DistPointLine), PgType::Float8, vec![l(Point)?, r(PgType::Line)?]),
-            (PgType::Line, Point) => call(geo(GeoFn::DistPointLine), PgType::Float8, vec![r(Point)?, l(PgType::Line)?]),
-            (Lseg, PgType::Line) => call(geo(GeoFn::DistLsegLine), PgType::Float8, vec![l(Lseg)?, r(PgType::Line)?]),
-            (PgType::Line, Lseg) => call(geo(GeoFn::DistLsegLine), PgType::Float8, vec![r(Lseg)?, l(PgType::Line)?]),
-            (PgType::Circle, PgType::Circle) => call(geo(GeoFn::DistCircleCircle), PgType::Float8, vec![l(PgType::Circle)?, r(PgType::Circle)?]),
-            (Point, PgType::Circle) => call(geo(GeoFn::DistPointCircle), PgType::Float8, vec![l(Point)?, r(PgType::Circle)?]),
-            (PgType::Circle, Point) => call(geo(GeoFn::DistPointCircle), PgType::Float8, vec![r(Point)?, l(PgType::Circle)?]),
-            (PgType::Polygon, PgType::Polygon) => call(geo(GeoFn::DistPolyPoly), PgType::Float8, vec![l(PgType::Polygon)?, r(PgType::Polygon)?]),
-            (PgType::Polygon, Point) => call(geo(GeoFn::DistPolyPoint), PgType::Float8, vec![l(PgType::Polygon)?, r(Point)?]),
-            (Point, PgType::Polygon) => call(geo(GeoFn::DistPolyPoint), PgType::Float8, vec![r(PgType::Polygon)?, l(Point)?]),
-            (PgType::Polygon, PgType::Circle) => call(geo(GeoFn::DistPolyCircle), PgType::Float8, vec![l(PgType::Polygon)?, r(PgType::Circle)?]),
-            (PgType::Circle, PgType::Polygon) => call(geo(GeoFn::DistPolyCircle), PgType::Float8, vec![r(PgType::Polygon)?, l(PgType::Circle)?]),
+            (PgType::Box, PgType::Box) => call(
+                geo(GeoFn::DistBoxBox),
+                PgType::Float8,
+                vec![l(PgType::Box)?, r(PgType::Box)?],
+            ),
+            (Point, PgType::Box) => call(
+                geo(GeoFn::DistPointBox),
+                PgType::Float8,
+                vec![l(Point)?, r(PgType::Box)?],
+            ),
+            (PgType::Box, Point) => call(
+                geo(GeoFn::DistPointBox),
+                PgType::Float8,
+                vec![r(Point)?, l(PgType::Box)?],
+            ),
+            (Lseg, PgType::Box) => call(
+                geo(GeoFn::DistLsegBox),
+                PgType::Float8,
+                vec![l(Lseg)?, r(PgType::Box)?],
+            ),
+            (PgType::Box, Lseg) => call(
+                geo(GeoFn::DistLsegBox),
+                PgType::Float8,
+                vec![r(Lseg)?, l(PgType::Box)?],
+            ),
+            (PgType::Line, PgType::Line) => call(
+                geo(GeoFn::DistLineLine),
+                PgType::Float8,
+                vec![l(PgType::Line)?, r(PgType::Line)?],
+            ),
+            (Point, PgType::Line) => call(
+                geo(GeoFn::DistPointLine),
+                PgType::Float8,
+                vec![l(Point)?, r(PgType::Line)?],
+            ),
+            (PgType::Line, Point) => call(
+                geo(GeoFn::DistPointLine),
+                PgType::Float8,
+                vec![r(Point)?, l(PgType::Line)?],
+            ),
+            (Lseg, PgType::Line) => call(
+                geo(GeoFn::DistLsegLine),
+                PgType::Float8,
+                vec![l(Lseg)?, r(PgType::Line)?],
+            ),
+            (PgType::Line, Lseg) => call(
+                geo(GeoFn::DistLsegLine),
+                PgType::Float8,
+                vec![r(Lseg)?, l(PgType::Line)?],
+            ),
+            (PgType::Circle, PgType::Circle) => call(
+                geo(GeoFn::DistCircleCircle),
+                PgType::Float8,
+                vec![l(PgType::Circle)?, r(PgType::Circle)?],
+            ),
+            (Point, PgType::Circle) => call(
+                geo(GeoFn::DistPointCircle),
+                PgType::Float8,
+                vec![l(Point)?, r(PgType::Circle)?],
+            ),
+            (PgType::Circle, Point) => call(
+                geo(GeoFn::DistPointCircle),
+                PgType::Float8,
+                vec![r(Point)?, l(PgType::Circle)?],
+            ),
+            (PgType::Polygon, PgType::Polygon) => call(
+                geo(GeoFn::DistPolyPoly),
+                PgType::Float8,
+                vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+            ),
+            (PgType::Polygon, Point) => call(
+                geo(GeoFn::DistPolyPoint),
+                PgType::Float8,
+                vec![l(PgType::Polygon)?, r(Point)?],
+            ),
+            (Point, PgType::Polygon) => call(
+                geo(GeoFn::DistPolyPoint),
+                PgType::Float8,
+                vec![r(PgType::Polygon)?, l(Point)?],
+            ),
+            (PgType::Polygon, PgType::Circle) => call(
+                geo(GeoFn::DistPolyCircle),
+                PgType::Float8,
+                vec![l(PgType::Polygon)?, r(PgType::Circle)?],
+            ),
+            (PgType::Circle, PgType::Polygon) => call(
+                geo(GeoFn::DistPolyCircle),
+                PgType::Float8,
+                vec![r(PgType::Polygon)?, l(PgType::Circle)?],
+            ),
             _ => Ok(None),
         },
         // Point positional / same-as / horizontal / vertical predicates.
@@ -5542,20 +5600,20 @@ fn resolve_geometric_combo(
             PgType::Bool,
             vec![l(Point)?, r(Lseg)?],
         ),
-        B::ArrowAt if combo == (Point, Path) => call(
-            geo(GeoFn::OnPpath),
-            PgType::Bool,
-            vec![l(Point)?, r(Path)?],
-        ),
+        B::ArrowAt if combo == (Point, Path) => {
+            call(geo(GeoFn::OnPpath), PgType::Bool, vec![l(Point)?, r(Path)?])
+        }
         B::AtArrow if combo == (Path, Point) => call(
             geo(GeoFn::PathContainPt),
             PgType::Bool,
             vec![l(Path)?, r(Point)?],
         ),
         // `path ?# path`: the two outlines cross.
-        B::QuestionHash if combo == (Path, Path) => {
-            call(geo(GeoFn::PathInter), PgType::Bool, vec![l(Path)?, r(Path)?])
-        }
+        B::QuestionHash if combo == (Path, Path) => call(
+            geo(GeoFn::PathInter),
+            PgType::Bool,
+            vec![l(Path)?, r(Path)?],
+        ),
         // `##` closest point: the result lies on the 2nd operand, except for
         // `line ## lseg`, where it lies on the segment.
         B::DoubleHash => match combo {
@@ -5648,246 +5706,398 @@ fn resolve_geometric_combo(
             call(geo(GeoFn::PathGe), PgType::Bool, vec![l(Path)?, r(Path)?])
         }
         // `box` positional / containment / identity predicates (all box × box).
-        B::PGOverlap if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxOverlap), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::AndLt if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxOverLeft), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::AndGt if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxOverRight), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::AndLtPipe if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxOverBelow), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::PipeAndGt if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxOverAbove), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::PGBitwiseShiftLeft if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxLeft), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::PGBitwiseShiftRight if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxRight), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::LtLtPipe if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxBelow), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::PipeGtGt if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxAbove), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::LtCaret if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxBelowEq), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::GtCaret if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxAboveEq), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::ArrowAt if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxContained), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::AtArrow if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxContain), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::TildeEq if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxSame), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::QuestionHash if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxIntersects), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
+        B::PGOverlap if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxOverlap),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::AndLt if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxOverLeft),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::AndGt if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxOverRight),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::AndLtPipe if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxOverBelow),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::PipeAndGt if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxOverAbove),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::PGBitwiseShiftLeft if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxLeft),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::PGBitwiseShiftRight if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxRight),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::LtLtPipe if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxBelow),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::PipeGtGt if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxAbove),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::LtCaret if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxBelowEq),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::GtCaret if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxAboveEq),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::ArrowAt if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxContained),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::AtArrow if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxContain),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::TildeEq if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxSame),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::QuestionHash if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxIntersects),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
         // `b1 # b2` is the intersection box (NULL when they are disjoint).
-        B::PGBitwiseXor if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxIntersect), PgType::Box, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
+        B::PGBitwiseXor if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxIntersect),
+            PgType::Box,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
         // `box` comparisons are by **area**, so two differently placed boxes of the
         // same size compare equal; identity is `~=` above.
-        B::Eq if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxEq), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::Lt if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxLt), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::LtEq if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxLe), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::Gt if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxGt), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
-        B::GtEq if combo == (PgType::Box, PgType::Box) => {
-            call(geo(GeoFn::BoxGe), PgType::Bool, vec![l(PgType::Box)?, r(PgType::Box)?])
-        }
+        B::Eq if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxEq),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::Lt if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxLt),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::LtEq if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxLe),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::Gt if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxGt),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
+        B::GtEq if combo == (PgType::Box, PgType::Box) => call(
+            geo(GeoFn::BoxGe),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(PgType::Box)?],
+        ),
         // `box <op> point`: move / rotate / scale both corners.
-        B::Plus if combo == (PgType::Box, Point) => {
-            call(geo(GeoFn::BoxAddPt), PgType::Box, vec![l(PgType::Box)?, r(Point)?])
-        }
-        B::Minus if combo == (PgType::Box, Point) => {
-            call(geo(GeoFn::BoxSubPt), PgType::Box, vec![l(PgType::Box)?, r(Point)?])
-        }
-        B::Multiply if combo == (PgType::Box, Point) => {
-            call(geo(GeoFn::BoxMulPt), PgType::Box, vec![l(PgType::Box)?, r(Point)?])
-        }
-        B::Divide if combo == (PgType::Box, Point) => {
-            call(geo(GeoFn::BoxDivPt), PgType::Box, vec![l(PgType::Box)?, r(Point)?])
-        }
+        B::Plus if combo == (PgType::Box, Point) => call(
+            geo(GeoFn::BoxAddPt),
+            PgType::Box,
+            vec![l(PgType::Box)?, r(Point)?],
+        ),
+        B::Minus if combo == (PgType::Box, Point) => call(
+            geo(GeoFn::BoxSubPt),
+            PgType::Box,
+            vec![l(PgType::Box)?, r(Point)?],
+        ),
+        B::Multiply if combo == (PgType::Box, Point) => call(
+            geo(GeoFn::BoxMulPt),
+            PgType::Box,
+            vec![l(PgType::Box)?, r(Point)?],
+        ),
+        B::Divide if combo == (PgType::Box, Point) => call(
+            geo(GeoFn::BoxDivPt),
+            PgType::Box,
+            vec![l(PgType::Box)?, r(Point)?],
+        ),
         // `box @> point` / `point <@ box`, and the point/segment × box geometry.
-        B::AtArrow if combo == (PgType::Box, Point) => {
-            call(geo(GeoFn::BoxContainPt), PgType::Bool, vec![l(PgType::Box)?, r(Point)?])
-        }
-        B::ArrowAt if combo == (Point, PgType::Box) => {
-            call(geo(GeoFn::BoxContainPt), PgType::Bool, vec![r(PgType::Box)?, l(Point)?])
-        }
-        B::ArrowAt if combo == (Lseg, PgType::Box) => {
-            call(geo(GeoFn::LsegInsideBox), PgType::Bool, vec![l(Lseg)?, r(PgType::Box)?])
-        }
-        B::QuestionHash if combo == (Lseg, PgType::Box) => {
-            call(geo(GeoFn::LsegIntersectsBox), PgType::Bool, vec![l(Lseg)?, r(PgType::Box)?])
-        }
+        B::AtArrow if combo == (PgType::Box, Point) => call(
+            geo(GeoFn::BoxContainPt),
+            PgType::Bool,
+            vec![l(PgType::Box)?, r(Point)?],
+        ),
+        B::ArrowAt if combo == (Point, PgType::Box) => call(
+            geo(GeoFn::BoxContainPt),
+            PgType::Bool,
+            vec![r(PgType::Box)?, l(Point)?],
+        ),
+        B::ArrowAt if combo == (Lseg, PgType::Box) => call(
+            geo(GeoFn::LsegInsideBox),
+            PgType::Bool,
+            vec![l(Lseg)?, r(PgType::Box)?],
+        ),
+        B::QuestionHash if combo == (Lseg, PgType::Box) => call(
+            geo(GeoFn::LsegIntersectsBox),
+            PgType::Bool,
+            vec![l(Lseg)?, r(PgType::Box)?],
+        ),
         // `line`: equality is scale invariant; `?#`/`?-|`/`?||` are the relations.
-        B::Eq if combo == (PgType::Line, PgType::Line) => {
-            call(geo(GeoFn::LineEq), PgType::Bool, vec![l(PgType::Line)?, r(PgType::Line)?])
-        }
-        B::QuestionHash if combo == (PgType::Line, PgType::Line) => {
-            call(geo(GeoFn::LineIntersects), PgType::Bool, vec![l(PgType::Line)?, r(PgType::Line)?])
-        }
-        B::QuestionDashPipe if combo == (PgType::Line, PgType::Line) => {
-            call(geo(GeoFn::LinePerpendicular), PgType::Bool, vec![l(PgType::Line)?, r(PgType::Line)?])
-        }
-        B::QuestionDoublePipe if combo == (PgType::Line, PgType::Line) => {
-            call(geo(GeoFn::LineParallel), PgType::Bool, vec![l(PgType::Line)?, r(PgType::Line)?])
-        }
-        B::PGBitwiseXor if combo == (PgType::Line, PgType::Line) => {
-            call(geo(GeoFn::LineInterpt), PgType::Point, vec![l(PgType::Line)?, r(PgType::Line)?])
-        }
+        B::Eq if combo == (PgType::Line, PgType::Line) => call(
+            geo(GeoFn::LineEq),
+            PgType::Bool,
+            vec![l(PgType::Line)?, r(PgType::Line)?],
+        ),
+        B::QuestionHash if combo == (PgType::Line, PgType::Line) => call(
+            geo(GeoFn::LineIntersects),
+            PgType::Bool,
+            vec![l(PgType::Line)?, r(PgType::Line)?],
+        ),
+        B::QuestionDashPipe if combo == (PgType::Line, PgType::Line) => call(
+            geo(GeoFn::LinePerpendicular),
+            PgType::Bool,
+            vec![l(PgType::Line)?, r(PgType::Line)?],
+        ),
+        B::QuestionDoublePipe if combo == (PgType::Line, PgType::Line) => call(
+            geo(GeoFn::LineParallel),
+            PgType::Bool,
+            vec![l(PgType::Line)?, r(PgType::Line)?],
+        ),
+        B::PGBitwiseXor if combo == (PgType::Line, PgType::Line) => call(
+            geo(GeoFn::LineInterpt),
+            PgType::Point,
+            vec![l(PgType::Line)?, r(PgType::Line)?],
+        ),
         // point / lseg / box against a line.
-        B::ArrowAt if combo == (Point, PgType::Line) => {
-            call(geo(GeoFn::PointOnLine), PgType::Bool, vec![l(Point)?, r(PgType::Line)?])
-        }
-        B::ArrowAt if combo == (Lseg, PgType::Line) => {
-            call(geo(GeoFn::LsegOnLine), PgType::Bool, vec![l(Lseg)?, r(PgType::Line)?])
-        }
-        B::QuestionHash if combo == (Lseg, PgType::Line) => {
-            call(geo(GeoFn::LsegIntersectsLine), PgType::Bool, vec![l(Lseg)?, r(PgType::Line)?])
-        }
-        B::QuestionHash if combo == (PgType::Line, PgType::Box) => {
-            call(geo(GeoFn::LineIntersectsBox), PgType::Bool, vec![l(PgType::Line)?, r(PgType::Box)?])
-        }
+        B::ArrowAt if combo == (Point, PgType::Line) => call(
+            geo(GeoFn::PointOnLine),
+            PgType::Bool,
+            vec![l(Point)?, r(PgType::Line)?],
+        ),
+        B::ArrowAt if combo == (Lseg, PgType::Line) => call(
+            geo(GeoFn::LsegOnLine),
+            PgType::Bool,
+            vec![l(Lseg)?, r(PgType::Line)?],
+        ),
+        B::QuestionHash if combo == (Lseg, PgType::Line) => call(
+            geo(GeoFn::LsegIntersectsLine),
+            PgType::Bool,
+            vec![l(Lseg)?, r(PgType::Line)?],
+        ),
+        B::QuestionHash if combo == (PgType::Line, PgType::Box) => call(
+            geo(GeoFn::LineIntersectsBox),
+            PgType::Bool,
+            vec![l(PgType::Line)?, r(PgType::Box)?],
+        ),
         // `circle` positional / containment / identity predicates.
-        B::PGOverlap if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleOverlap), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::AndLt if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleOverLeft), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::AndGt if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleOverRight), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::AndLtPipe if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleOverBelow), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::PipeAndGt if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleOverAbove), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::PGBitwiseShiftLeft if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleLeft), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::PGBitwiseShiftRight if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleRight), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::LtLtPipe if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleBelow), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::PipeGtGt if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleAbove), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::ArrowAt if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleContained), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::AtArrow if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleContain), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::TildeEq if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleSame), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
+        B::PGOverlap if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleOverlap),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::AndLt if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleOverLeft),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::AndGt if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleOverRight),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::AndLtPipe if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleOverBelow),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::PipeAndGt if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleOverAbove),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::PGBitwiseShiftLeft if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleLeft),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::PGBitwiseShiftRight if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleRight),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::LtLtPipe if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleBelow),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::PipeGtGt if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleAbove),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::ArrowAt if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleContained),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::AtArrow if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleContain),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::TildeEq if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleSame),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
         // `circle` comparisons are by area, like `box`.
-        B::Eq if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleEq), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::NotEq if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleNe), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::Lt if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleLt), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::LtEq if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleLe), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::Gt if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleGt), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
-        B::GtEq if combo == (PgType::Circle, PgType::Circle) => {
-            call(geo(GeoFn::CircleGe), PgType::Bool, vec![l(PgType::Circle)?, r(PgType::Circle)?])
-        }
+        B::Eq if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleEq),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::NotEq if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleNe),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::Lt if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleLt),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::LtEq if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleLe),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::Gt if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleGt),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
+        B::GtEq if combo == (PgType::Circle, PgType::Circle) => call(
+            geo(GeoFn::CircleGe),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(PgType::Circle)?],
+        ),
         // `circle <op> point`: move the center; `*` and `/` also scale the radius.
-        B::Plus if combo == (PgType::Circle, Point) => {
-            call(geo(GeoFn::CircleAddPt), PgType::Circle, vec![l(PgType::Circle)?, r(Point)?])
-        }
-        B::Minus if combo == (PgType::Circle, Point) => {
-            call(geo(GeoFn::CircleSubPt), PgType::Circle, vec![l(PgType::Circle)?, r(Point)?])
-        }
-        B::Multiply if combo == (PgType::Circle, Point) => {
-            call(geo(GeoFn::CircleMulPt), PgType::Circle, vec![l(PgType::Circle)?, r(Point)?])
-        }
-        B::Divide if combo == (PgType::Circle, Point) => {
-            call(geo(GeoFn::CircleDivPt), PgType::Circle, vec![l(PgType::Circle)?, r(Point)?])
-        }
-        B::AtArrow if combo == (PgType::Circle, Point) => {
-            call(geo(GeoFn::CircleContainPt), PgType::Bool, vec![l(PgType::Circle)?, r(Point)?])
-        }
-        B::ArrowAt if combo == (Point, PgType::Circle) => {
-            call(geo(GeoFn::CircleContainPt), PgType::Bool, vec![r(PgType::Circle)?, l(Point)?])
-        }
+        B::Plus if combo == (PgType::Circle, Point) => call(
+            geo(GeoFn::CircleAddPt),
+            PgType::Circle,
+            vec![l(PgType::Circle)?, r(Point)?],
+        ),
+        B::Minus if combo == (PgType::Circle, Point) => call(
+            geo(GeoFn::CircleSubPt),
+            PgType::Circle,
+            vec![l(PgType::Circle)?, r(Point)?],
+        ),
+        B::Multiply if combo == (PgType::Circle, Point) => call(
+            geo(GeoFn::CircleMulPt),
+            PgType::Circle,
+            vec![l(PgType::Circle)?, r(Point)?],
+        ),
+        B::Divide if combo == (PgType::Circle, Point) => call(
+            geo(GeoFn::CircleDivPt),
+            PgType::Circle,
+            vec![l(PgType::Circle)?, r(Point)?],
+        ),
+        B::AtArrow if combo == (PgType::Circle, Point) => call(
+            geo(GeoFn::CircleContainPt),
+            PgType::Bool,
+            vec![l(PgType::Circle)?, r(Point)?],
+        ),
+        B::ArrowAt if combo == (Point, PgType::Circle) => call(
+            geo(GeoFn::CircleContainPt),
+            PgType::Bool,
+            vec![r(PgType::Circle)?, l(Point)?],
+        ),
         // `polygon` positional predicates compare bounding boxes; `@>`/`<@`/`&&`/`~=`
         // are real geometry.
-        B::PGOverlap if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyOverlap), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::AndLt if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyOverLeft), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::AndGt if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyOverRight), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::AndLtPipe if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyOverBelow), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::PipeAndGt if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyOverAbove), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::PGBitwiseShiftLeft if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyLeft), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::PGBitwiseShiftRight if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyRight), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::LtLtPipe if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyBelow), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::PipeGtGt if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyAbove), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::ArrowAt if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyContained), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::AtArrow if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolyContain), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::TildeEq if combo == (PgType::Polygon, PgType::Polygon) => {
-            call(geo(GeoFn::PolySame), PgType::Bool, vec![l(PgType::Polygon)?, r(PgType::Polygon)?])
-        }
-        B::AtArrow if combo == (PgType::Polygon, Point) => {
-            call(geo(GeoFn::PolyContainPt), PgType::Bool, vec![l(PgType::Polygon)?, r(Point)?])
-        }
-        B::ArrowAt if combo == (Point, PgType::Polygon) => {
-            call(geo(GeoFn::PolyContainPt), PgType::Bool, vec![r(PgType::Polygon)?, l(Point)?])
-        }
+        B::PGOverlap if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyOverlap),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::AndLt if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyOverLeft),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::AndGt if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyOverRight),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::AndLtPipe if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyOverBelow),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::PipeAndGt if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyOverAbove),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::PGBitwiseShiftLeft if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyLeft),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::PGBitwiseShiftRight if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyRight),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::LtLtPipe if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyBelow),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::PipeGtGt if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyAbove),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::ArrowAt if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyContained),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::AtArrow if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolyContain),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::TildeEq if combo == (PgType::Polygon, PgType::Polygon) => call(
+            geo(GeoFn::PolySame),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(PgType::Polygon)?],
+        ),
+        B::AtArrow if combo == (PgType::Polygon, Point) => call(
+            geo(GeoFn::PolyContainPt),
+            PgType::Bool,
+            vec![l(PgType::Polygon)?, r(Point)?],
+        ),
+        B::ArrowAt if combo == (Point, PgType::Polygon) => call(
+            geo(GeoFn::PolyContainPt),
+            PgType::Bool,
+            vec![r(PgType::Polygon)?, l(Point)?],
+        ),
         _ => Ok(None),
     }
 }
@@ -6115,7 +6325,11 @@ fn bind_array_concat(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
                 }))
             }
             Some(rty) => {
-                let arr = PgType::Array(merge_types(elem, rty).ok_or_else(|| mismatch(&lb, &rb))?.oid());
+                let arr = PgType::Array(
+                    merge_types(elem, rty)
+                        .ok_or_else(|| mismatch(&lb, &rb))?
+                        .oid(),
+                );
                 let elem = arr.array_element().expect("array element resolves");
                 let left = resolve_operand(&lb, arr)?;
                 let right = resolve_operand(&rb, elem)?;
@@ -6138,7 +6352,11 @@ fn bind_array_concat(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
                 }))
             }
             Some(lty) => {
-                let arr = PgType::Array(merge_types(elem, lty).ok_or_else(|| mismatch(&lb, &rb))?.oid());
+                let arr = PgType::Array(
+                    merge_types(elem, lty)
+                        .ok_or_else(|| mismatch(&lb, &rb))?
+                        .oid(),
+                );
                 let elem = arr.array_element().expect("array element resolves");
                 let left = resolve_operand(&lb, elem)?;
                 let right = resolve_operand(&rb, arr)?;
@@ -6177,29 +6395,51 @@ pub(crate) fn bind_array_function(
             ),
         )
     };
-    let call = |func, ret, args| Ok(Some(Binding::Typed(BoundExpr::FuncCall { func, ret, args })));
+    let call = |func, ret, args| {
+        Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret,
+            args,
+        })))
+    };
     match name {
         "cardinality" => {
-            let [b] = bindings else { return Err(undefined()) };
+            let [b] = bindings else {
+                return Err(undefined());
+            };
             let (arr_ty, _) = array_arg_type(b).ok_or_else(undefined)?;
-            call(ScalarFn::Cardinality, PgType::Int4, vec![resolve_operand(b, arr_ty)?])
+            call(
+                ScalarFn::Cardinality,
+                PgType::Int4,
+                vec![resolve_operand(b, arr_ty)?],
+            )
         }
         "array_length" => {
-            let [a, dim] = bindings else { return Err(undefined()) };
+            let [a, dim] = bindings else {
+                return Err(undefined());
+            };
             let (arr_ty, _) = array_arg_type(a).ok_or_else(undefined)?;
             call(
                 ScalarFn::ArrayLength,
                 PgType::Int4,
-                vec![resolve_operand(a, arr_ty)?, resolve_operand(dim, PgType::Int4)?],
+                vec![
+                    resolve_operand(a, arr_ty)?,
+                    resolve_operand(dim, PgType::Int4)?,
+                ],
             )
         }
         "array_upper" => {
-            let [a, dim] = bindings else { return Err(undefined()) };
+            let [a, dim] = bindings else {
+                return Err(undefined());
+            };
             let (arr_ty, _) = array_arg_type(a).ok_or_else(undefined)?;
             call(
                 ScalarFn::ArrayUpper,
                 PgType::Int4,
-                vec![resolve_operand(a, arr_ty)?, resolve_operand(dim, PgType::Int4)?],
+                vec![
+                    resolve_operand(a, arr_ty)?,
+                    resolve_operand(dim, PgType::Int4)?,
+                ],
             )
         }
         // `array_to_string(anyarray, text [, text])` renders the array's elements
@@ -6224,9 +6464,12 @@ pub(crate) fn bind_array_function(
         // `array_append(anyarray, elem)` promotes the array/element to their
         // common element type (PG's `anycompatiblearray`/`anycompatible`).
         "array_append" => {
-            let [a, e] = bindings else { return Err(undefined()) };
+            let [a, e] = bindings else {
+                return Err(undefined());
+            };
             let (_, elem) = array_arg_type(a).ok_or_else(undefined)?;
-            let common = merge_types(elem, binding_typed_ty(e).unwrap_or(elem)).ok_or_else(undefined)?;
+            let common =
+                merge_types(elem, binding_typed_ty(e).unwrap_or(elem)).ok_or_else(undefined)?;
             let arr = PgType::Array(common.oid());
             call(
                 ScalarFn::ArrayAppend,
@@ -6235,9 +6478,12 @@ pub(crate) fn bind_array_function(
             )
         }
         "array_prepend" => {
-            let [e, a] = bindings else { return Err(undefined()) };
+            let [e, a] = bindings else {
+                return Err(undefined());
+            };
             let (_, elem) = array_arg_type(a).ok_or_else(undefined)?;
-            let common = merge_types(elem, binding_typed_ty(e).unwrap_or(elem)).ok_or_else(undefined)?;
+            let common =
+                merge_types(elem, binding_typed_ty(e).unwrap_or(elem)).ok_or_else(undefined)?;
             let arr = PgType::Array(common.oid());
             call(
                 ScalarFn::ArrayPrepend,
@@ -6247,11 +6493,15 @@ pub(crate) fn bind_array_function(
         }
         // `array_cat(anyarray, anyarray)` unifies the two element types.
         "array_cat" => {
-            let [a, b] = bindings else { return Err(undefined()) };
+            let [a, b] = bindings else {
+                return Err(undefined());
+            };
             let ae = array_arg_type(a).map(|(_, e)| e);
             let be = array_arg_type(b).map(|(_, e)| e);
             let arr = match (ae, be) {
-                (Some(ae), Some(be)) => PgType::Array(merge_types(ae, be).ok_or_else(undefined)?.oid()),
+                (Some(ae), Some(be)) => {
+                    PgType::Array(merge_types(ae, be).ok_or_else(undefined)?.oid())
+                }
                 (Some(ae), None) => PgType::Array(ae.oid()),
                 (None, Some(be)) => PgType::Array(be.oid()),
                 (None, None) => return Err(undefined()),
@@ -6372,7 +6622,10 @@ fn resolve_json_op(
 ) -> Result<Option<Binding>, BindError> {
     use crate::functions::JsonFn;
     use ast::BinaryOperator as B;
-    if !matches!(op, B::Arrow | B::LongArrow | B::HashArrow | B::HashLongArrow) {
+    if !matches!(
+        op,
+        B::Arrow | B::LongArrow | B::HashArrow | B::HashLongArrow
+    ) {
         return Ok(None);
     }
     // Both error paths point at the operator, as PG's `LINE n: ... ^` does.
@@ -6387,12 +6640,9 @@ fn resolve_json_op(
         Some(t @ (PgType::Json | PgType::Jsonb)) => t,
         Some(_) => return Err(undefined()),
         None => {
-            return Err(ambiguous_operator(
-                operand_name(lb),
-                &op.to_string(),
-                operand_name(rb),
-            )
-            .at(op_span));
+            return Err(
+                ambiguous_operator(operand_name(lb), &op.to_string(), operand_name(rb)).at(op_span),
+            );
         }
     };
     let text_out = matches!(op, B::LongArrow | B::HashLongArrow);
@@ -6404,12 +6654,20 @@ fn resolve_json_op(
             // the subscript one.
             if rt.is_none_or(is_text_family) {
                 (
-                    if text_out { JsonFn::ObjectFieldText } else { JsonFn::ObjectField },
+                    if text_out {
+                        JsonFn::ObjectFieldText
+                    } else {
+                        JsonFn::ObjectField
+                    },
                     resolve_operand(rb, PgType::Text)?,
                 )
             } else if matches!(rt, Some(PgType::Int2 | PgType::Int4)) {
                 (
-                    if text_out { JsonFn::ArrayElementText } else { JsonFn::ArrayElement },
+                    if text_out {
+                        JsonFn::ArrayElementText
+                    } else {
+                        JsonFn::ArrayElement
+                    },
                     resolve_operand(rb, PgType::Int4)?,
                 )
             } else {
@@ -6425,12 +6683,16 @@ fn resolve_json_op(
             // rather than be silently coerced, so `jsonb #> integer[]` is 42883.
             match binding_typed_ty(rb) {
                 None => {}
-                Some(PgType::Array(elem))
-                    if PgType::from_oid(elem).is_some_and(is_text_family) => {}
+                Some(PgType::Array(elem)) if PgType::from_oid(elem).is_some_and(is_text_family) => {
+                }
                 Some(_) => return Err(undefined()),
             }
             (
-                if text_out { JsonFn::ExtractPathText } else { JsonFn::ExtractPath },
+                if text_out {
+                    JsonFn::ExtractPathText
+                } else {
+                    JsonFn::ExtractPath
+                },
                 resolve_operand(rb, text_arr)?,
             )
         }
@@ -6916,8 +7178,7 @@ fn bind_similar_to(
 
 /// The HINT PG attaches to every `operator does not exist` (42883). Shared by
 /// all three constructors below so they cannot drift apart.
-const NO_OPERATOR_HINT: &str =
-    "No operator matches the given name and argument types. \
+const NO_OPERATOR_HINT: &str = "No operator matches the given name and argument types. \
      You might need to add explicit type casts.";
 
 fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
@@ -6936,7 +7197,9 @@ fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
 /// no candidate exists at all. Every 42725 site shares the same DETAIL/HINT.
 fn ambiguous_operator_msg(message: String) -> BindError {
     BindError::new(sqlstate::AMBIGUOUS_FUNCTION, message)
-        .with_detail(Some("Could not choose a best candidate operator.".to_string()))
+        .with_detail(Some(
+            "Could not choose a best candidate operator.".to_string(),
+        ))
         .with_hint(Some(
             "You might need to add explicit type casts.".to_string(),
         ))
@@ -6973,7 +7236,11 @@ fn unify_types(
     if implicit_castable(rty, lty) {
         return Ok((left, coerce_expr(right, lty)?, lty));
     }
-    Err(no_operator(&type_label(lty, catalog), op, &type_label(rty, catalog)))
+    Err(no_operator(
+        &type_label(lty, catalog),
+        op,
+        &type_label(rty, catalog),
+    ))
 }
 
 /// Display a user type by its catalog name instead of the generic
@@ -7704,7 +7971,10 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             name,
             arg_types,
             strict,
-            args: call_args.into_iter().map(|a| inline_params(a, args)).collect(),
+            args: call_args
+                .into_iter()
+                .map(|a| inline_params(a, args))
+                .collect(),
             ret,
         },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
@@ -7792,7 +8062,11 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
                     args: call.into_iter().map(|a| inline_params(a, args)).collect(),
                 },
                 WindowKind::Aggregate(agg) => WindowKind::Aggregate(BoundAggregate {
-                    args: agg.args.into_iter().map(|a| inline_params(a, args)).collect(),
+                    args: agg
+                        .args
+                        .into_iter()
+                        .map(|a| inline_params(a, args))
+                        .collect(),
                     ..agg
                 }),
             },
@@ -7949,7 +8223,11 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         // String special-syntax expressions are named after the function they
         // desugar to (`TRIM` → its ltrim/rtrim/btrim variant).
         ast::Expr::Substring { shorthand, .. } => {
-            if *shorthand { "substr".into() } else { "substring".into() }
+            if *shorthand {
+                "substr".into()
+            } else {
+                "substring".into()
+            }
         }
         ast::Expr::Position { .. } => "position".into(),
         ast::Expr::Overlay { .. } => "overlay".into(),

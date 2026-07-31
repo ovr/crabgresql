@@ -60,10 +60,7 @@ impl TableAm for StaticTable {
     fn scan(&self, _txn: &TxnContext, _projection: &ColumnProjection) -> TupleStream {
         // Synthetic tids from the row index; catalog rows are always visible.
         let rows = self.rows.clone();
-        Box::new(
-            (0..rows.len())
-                .map(move |i| Ok((Tid::from_packed(i as u64), rows[i].clone()))),
-        )
+        Box::new((0..rows.len()).map(move |i| Ok((Tid::from_packed(i as u64), rows[i].clone()))))
     }
 
     fn fetch(&self, tid: Tid, _txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
@@ -83,11 +80,7 @@ impl TableAm for StaticTable {
         self.read_only()
     }
 
-    fn delete(
-        &self,
-        _tid: Tid,
-        _txn: &TxnContext,
-    ) -> Result<DeleteResult, StorageError> {
+    fn delete(&self, _tid: Tid, _txn: &TxnContext) -> Result<DeleteResult, StorageError> {
         self.read_only()
     }
 

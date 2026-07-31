@@ -44,7 +44,10 @@ pub fn open_without_finalize(dir: &Path) -> std::io::Result<(Arc<PgEngine>, Tran
     // published, rather than always replaying the whole stream.
     let (engine, clog, next_xid) = PgEngine::open_recovered(dir, Arc::clone(&wal))?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
-    Ok((engine, TransactionManager::new_recovered(sink, clog, next_xid)))
+    Ok((
+        engine,
+        TransactionManager::new_recovered(sink, clog, next_xid),
+    ))
 }
 
 /// [`open_without_finalize`], but resuming replay at an explicit `redo` instead of
@@ -58,7 +61,10 @@ pub fn open_from_without_finalize(
     let wal = Arc::new(Wal::open(dir).map_err(std::io::Error::other)?);
     let (engine, clog, next_xid) = PgEngine::open_recovered_from(dir, Arc::clone(&wal), redo)?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
-    Ok((engine, TransactionManager::new_recovered(sink, clog, next_xid)))
+    Ok((
+        engine,
+        TransactionManager::new_recovered(sink, clog, next_xid),
+    ))
 }
 
 /// [`open`], but resuming replay at `redo`.

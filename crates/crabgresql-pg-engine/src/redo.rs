@@ -91,9 +91,8 @@ impl RmgrRedo for HeapRedo {
                 // contents are LSN-gated inserts that must survive replay.
                 let old = r.rel();
                 let new = r.rel();
-                let namespace = String::from_utf8(r.bytes().to_vec()).map_err(|e| {
-                    WalError::Redo(format!("truncate record: bad namespace: {e}"))
-                })?;
+                let namespace = String::from_utf8(r.bytes().to_vec())
+                    .map_err(|e| WalError::Redo(format!("truncate record: bad namespace: {e}")))?;
                 let table = String::from_utf8(r.bytes().to_vec())
                     .map_err(|e| WalError::Redo(format!("truncate record: bad table name: {e}")))?;
                 self.engine.bufpool.smgr().create_if_missing(new)?;

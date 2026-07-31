@@ -383,10 +383,7 @@ impl TableAccessMethod {
     /// CREATE TABLE, CTAS, and engine-side guards from drifting apart as methods
     /// are added.
     pub fn is_engine_managed(self) -> bool {
-        matches!(
-            self,
-            TableAccessMethod::Parquet | TableAccessMethod::Buffer
-        )
+        matches!(self, TableAccessMethod::Parquet | TableAccessMethod::Buffer)
     }
 }
 
@@ -520,9 +517,7 @@ impl SequenceDefinition {
             Some(next) if !ascending && next >= self.min => SequenceAdvance::Value(next),
             // Out of range (or i64 wrap): cycle wraps to the far bound, otherwise
             // it is a hard overflow/underflow.
-            _ if self.cycle => {
-                SequenceAdvance::Value(if ascending { self.min } else { self.max })
-            }
+            _ if self.cycle => SequenceAdvance::Value(if ascending { self.min } else { self.max }),
             _ if ascending => SequenceAdvance::Overflow,
             _ => SequenceAdvance::Underflow,
         }
@@ -629,9 +624,7 @@ impl TableCapabilities {
 /// A fallible tuple stream. Storage failures can occur after a scan has begun
 /// (for example while opening the next Parquet fragment), so errors travel as
 /// iterator items instead of being collapsed into an eager open result.
-pub type TupleStream = Box<
-    dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send,
->;
+pub type TupleStream = Box<dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send>;
 
 /// Which of a relation's columns a scan actually needs.
 ///
@@ -845,11 +838,7 @@ pub trait TableAm: Send + Sync {
     /// Insert a statement's complete tuple batch. Engines with a columnar write
     /// path override this to build one or more fragments rather than one file per
     /// tuple.
-    fn insert_many(
-        &self,
-        tuples: Vec<Tuple>,
-        txn: &TxnContext,
-    ) -> Result<Vec<Tid>, StorageError> {
+    fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
         tuples
             .into_iter()
             .map(|tuple| self.insert(tuple, txn))
@@ -1078,12 +1067,7 @@ pub trait TableEngine: Send + Sync {
     ///
     /// The default reports that the engine cannot analyze; only engines with
     /// real storage override it.
-    fn analyze(
-        &self,
-        _namespace: &str,
-        name: &str,
-        _txn: &TxnContext,
-    ) -> Result<(), StorageError> {
+    fn analyze(&self, _namespace: &str, name: &str, _txn: &TxnContext) -> Result<(), StorageError> {
         Err(StorageError::TableNotFound(name.to_string()))
     }
 
@@ -1435,7 +1419,10 @@ mod column_projection_tests {
 
         let single = schema(&[PgType::Int4]);
         assert_eq!(ColumnProjection::of([], &single), ColumnProjection::All);
-        assert_eq!(ColumnProjection::of([], &schema(&[])), ColumnProjection::All);
+        assert_eq!(
+            ColumnProjection::of([], &schema(&[])),
+            ColumnProjection::All
+        );
     }
 
     /// The load-bearing direction: an ordinal outside the schema means the

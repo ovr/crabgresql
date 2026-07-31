@@ -32,8 +32,8 @@ mod rmgr;
 mod wal;
 
 pub use ckpt::{CHECKPOINT_ONLINE, CHECKPOINT_SHUTDOWN, Checkpoint};
-pub use fsutil::sync_dir;
 pub use control::{ControlFile, control_path, read_control, write_control};
+pub use fsutil::sync_dir;
 pub use record::{Lsn, LsnRange, WalError, WalRecord};
 pub use recovery::{RecoveryResult, recover};
 pub use rmgr::{RedoContext, RmgrId, RmgrRedo, RmgrRegistry, XACT_ABORT, XACT_COMMIT};

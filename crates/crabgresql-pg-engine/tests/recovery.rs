@@ -31,10 +31,12 @@ fn read(tm: &TransactionManager) -> TxnContext {
 fn visible_ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<i32> {
     let mut v: Vec<i32> = table
         .scan(&read(tm), &ColumnProjection::All)
-        .map(|row| match row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
-            Value::Int4(x) => x,
-            _ => unreachable!(),
-        })
+        .map(
+            |row| match row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
+                Value::Int4(x) => x,
+                _ => unreachable!(),
+            },
+        )
         .collect();
     v.sort();
     v
@@ -235,11 +237,15 @@ fn truncate_uncommitted_then_crash_restores_rows() -> anyhow::Result<()> {
         // Read-your-own-truncate: the truncater sees its own now-empty table
         // (reading under its OWN xid; a concurrent reader would block on the
         // AccessExclusive lock until this transaction ends).
-        let own: Vec<i32> = table.scan(&ctx, &ColumnProjection::All).map(|row| match row
-            .unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
-            Value::Int4(x) => x,
-            _ => unreachable!(),
-        }).collect();
+        let own: Vec<i32> = table
+            .scan(&ctx, &ColumnProjection::All)
+            .map(
+                |row| match row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
+                    Value::Int4(x) => x,
+                    _ => unreachable!(),
+                },
+            )
+            .collect();
         assert_eq!(own, Vec::<i32>::new());
         // Never commits: crash (drop) with the swap still pending.
     }
@@ -412,7 +418,11 @@ fn interleaved_committed_and_in_flight_txns_recover_committed_only() -> anyhow::
         insert(&*table, &ca, 2, "a-ins");
         insert(&*table, &cb, 3, "b-ins");
         // xa updates the base row (delete old + insert new); xb does not touch it.
-        table.update(base_tid, vec![Value::Int4(10), Value::Text("a-upd".into())], &ca)?;
+        table.update(
+            base_tid,
+            vec![Value::Int4(10), Value::Text("a-upd".into())],
+            &ca,
+        )?;
         // Commit xa; leave xb in flight, then commit an unrelated row to force
         // xb's records durable, so recovery must reason about them explicitly.
         tm.commit(xa).unwrap();
@@ -562,7 +572,10 @@ fn a_sort_key_survives_a_restart() -> anyhow::Result<()> {
         let (engine, _tm) = open(dir.path())?;
         let mut schema = TableSchema::new(
             "events",
-            vec![Column::new("id", PgType::Int4), Column::new("n", PgType::Int4)],
+            vec![
+                Column::new("id", PgType::Int4),
+                Column::new("n", PgType::Int4),
+            ],
         );
         schema.access_method = crabgresql_storage_api::TableAccessMethod::Parquet;
         schema.sort_key = key.clone();
@@ -653,7 +666,13 @@ fn an_orphaned_parquet_directory_is_reclaimed_at_startup() -> anyhow::Result<()>
     );
     // The live relation is left alone.
     assert!(live_dir.exists());
-    assert_eq!(engine.open_table("events")?.scan(&read(&tm), &ColumnProjection::All).count(), 1);
+    assert_eq!(
+        engine
+            .open_table("events")?
+            .scan(&read(&tm), &ColumnProjection::All)
+            .count(),
+        1
+    );
     Ok(())
 }
 
@@ -671,10 +690,7 @@ fn parquet_dirs(dir: &std::path::Path) -> Vec<u32> {
 }
 
 /// Seed rows 1,2,3 into a fresh Parquet table in one committed transaction.
-fn seed_parquet(
-    engine: &PgEngine,
-    tm: &TransactionManager,
-) -> anyhow::Result<Arc<dyn TableAm>> {
+fn seed_parquet(engine: &PgEngine, tm: &TransactionManager) -> anyhow::Result<Arc<dyn TableAm>> {
     let table = engine.create_table(parquet_schema("events"))?;
     let xid = tm.allocate_xid();
     let ctx = tm.context(xid, CommandId::FIRST);
@@ -1125,7 +1141,12 @@ fn production_startup_resumes_from_the_recorded_redo_point() -> anyhow::Result<(
         control.redo_lsn.is_valid(),
         "a heap-only cluster must publish a bounded redo point"
     );
-    common::scribble(&common::wal_file_path(dir.path()), 0, control.redo_lsn.0, 0xAB)?;
+    common::scribble(
+        &common::wal_file_path(dir.path()),
+        0,
+        control.redo_lsn.0,
+        0xAB,
+    )?;
 
     let (engine, tm) = open(dir.path())?;
     let table = engine.open_table("t")?;
@@ -1154,7 +1175,12 @@ fn a_crash_after_a_bounded_recovery_still_recovers_everything() -> anyhow::Resul
         TableEngine::shutdown(engine.as_ref());
     }
     let first = crabgresql_wal::read_control(dir.path())?.expect("a control file");
-    common::scribble(&common::wal_file_path(dir.path()), 0, first.redo_lsn.0, 0xAB)?;
+    common::scribble(
+        &common::wal_file_path(dir.path()),
+        0,
+        first.redo_lsn.0,
+        0xAB,
+    )?;
     {
         // Bounded startup, then more work, then a crash: dropped without a
         // checkpoint, so only replay can bring the new rows back.
@@ -1315,7 +1341,11 @@ fn out_of_line_attributes_survive_a_crash() -> anyhow::Result<()> {
     let (engine, tm) = open(dir.path())?;
     let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![1]);
-    assert_eq!(big_of(&tm, &*table, 1), big, "the value must survive intact");
+    assert_eq!(
+        big_of(&tm, &*table, 1),
+        big,
+        "the value must survive intact"
+    );
     Ok(())
 }
 
@@ -1361,7 +1391,10 @@ fn the_chunk_relation_survives_the_startup_orphan_sweep() -> anyhow::Result<()> 
         tm.commit(xid)?;
         // The heap is relfilenode 1, so the chunk store — allocated next — is 2.
         toast_file = dir.path().join("base").join("2");
-        assert!(toast_file.exists(), "the chunk store should have been created");
+        assert!(
+            toast_file.exists(),
+            "the chunk store should have been created"
+        );
     }
     // Two restarts: the first proves the sweep spares it, the second proves the
     // catalog tail that names it round-trips through a rewrite.
@@ -1458,7 +1491,10 @@ fn vacuum_reports_an_unreadable_chunk_store_instead_of_aborting() -> anyhow::Res
     let scanned = table
         .scan(&read(&tm), &ColumnProjection::All)
         .collect::<Result<Vec<_>, _>>();
-    assert!(scanned.is_err(), "the corrupt chain is still reported to readers");
+    assert!(
+        scanned.is_err(),
+        "the corrupt chain is still reported to readers"
+    );
     Ok(())
 }
 

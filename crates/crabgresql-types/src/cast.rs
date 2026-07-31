@@ -502,30 +502,36 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             }),
 
         // ---- text → xid / xid8 (xidin / xid8in) ----
-        (Value::Text(s), PgType::Xid) => crate::xid::xid_in(s)
-            .map(Value::Xid)
-            .map_err(|e| CastError {
-                sqlstate: e.sqlstate,
-                message: e.message,
-            }),
-        (Value::Text(s), PgType::Xid8) => crate::xid::xid8_in(s)
-            .map(Value::Xid8)
-            .map_err(|e| CastError {
-                sqlstate: e.sqlstate,
-                message: e.message,
-            }),
+        (Value::Text(s), PgType::Xid) => {
+            crate::xid::xid_in(s)
+                .map(Value::Xid)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        (Value::Text(s), PgType::Xid8) => {
+            crate::xid::xid8_in(s)
+                .map(Value::Xid8)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
 
         // ---- xid8 → xid: PG's only declared cast for either type. It
         // truncates to the low 32 bits rather than range-checking. ----
         (Value::Xid8(v), PgType::Xid) => Ok(Value::Xid(*v as u32)),
 
         // ---- text → pg_lsn (pg_lsn_in) ----
-        (Value::Text(s), PgType::PgLsn) => crate::pg_lsn::parse(s)
-            .map(Value::PgLsn)
-            .map_err(|e| CastError {
-                sqlstate: e.sqlstate,
-                message: e.message,
-            }),
+        (Value::Text(s), PgType::PgLsn) => {
+            crate::pg_lsn::parse(s)
+                .map(Value::PgLsn)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
 
         // ---- text → point / lseg / path (point_in / lseg_in / path_in) ----
         (Value::Text(s), PgType::Point) => {
@@ -577,14 +583,12 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
                     message: e.message,
                 })
         }
-        (Value::Text(s), PgType::Polygon) => {
-            crate::geo::parse_polygon(s)
-                .map(Value::Polygon)
-                .map_err(|e| CastError {
-                    sqlstate: e.sqlstate,
-                    message: e.message,
-                })
-        }
+        (Value::Text(s), PgType::Polygon) => crate::geo::parse_polygon(s)
+            .map(Value::Polygon)
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
 
         // ---- intra-family geometric casts (all explicit in PG's pg_cast) ----
         // `lseg → point` is the segment's midpoint; the rest follow the same
@@ -637,9 +641,9 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         (Value::Text(s), PgType::Jsonb) => json::jsonb_in(s).map(Value::Jsonb).map_err(json_err),
         // `text` → `jsonpath`: parse the SQL/JSON path language. jsonpath → text
         // is handled by the generic any-to-text arm (via `encode_text_with`).
-        (Value::Text(s), PgType::Jsonpath) => {
-            jsonpath::jsonpath_in(s).map(Value::Jsonpath).map_err(json_err)
-        }
+        (Value::Text(s), PgType::Jsonpath) => jsonpath::jsonpath_in(s)
+            .map(Value::Jsonpath)
+            .map_err(json_err),
         // `json` → `jsonb`: re-parse the raw text into the canonical tree.
         (Value::Json(s), PgType::Jsonb) => json::jsonb_in(s).map(Value::Jsonb).map_err(json_err),
         // `jsonb` → `json`: the canonical serialization is always valid JSON.
@@ -684,7 +688,10 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
                 .iter()
                 .map(|e| cast_value(e.clone(), elem, efd))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Value::Array { elem, elems: recast })
+            Ok(Value::Array {
+                elem,
+                elems: recast,
+            })
         }
 
         _ => Err(cannot_coerce(from, to)),

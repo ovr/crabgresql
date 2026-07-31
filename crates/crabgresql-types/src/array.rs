@@ -41,7 +41,11 @@ const DETAIL_SEMICOLON: &str = "Unexpected \";\" character.";
 
 /// The DETAIL naming whichever delimiter this element type uses.
 const fn detail_delim(delim: char) -> &'static str {
-    if delim == ';' { DETAIL_SEMICOLON } else { DETAIL_COMMA }
+    if delim == ';' {
+        DETAIL_SEMICOLON
+    } else {
+        DETAIL_COMMA
+    }
 }
 const DETAIL_RBRACE: &str = "Unexpected \"}\" character.";
 const DETAIL_LBRACE: &str = "Unexpected \"{\" character.";
@@ -322,10 +326,7 @@ mod tests {
     #[test]
     fn round_trips_int_array() {
         let elems = array_in("{1,2,3}", PgType::Int4).unwrap();
-        assert_eq!(
-            elems,
-            vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]
-        );
+        assert_eq!(elems, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
         assert_eq!(format(PgType::Int4, &elems, 1), "{1,2,3}");
     }
 
@@ -349,7 +350,10 @@ mod tests {
             ]
         );
         // Round-trip: the delimiter/empty/NULL-lookalike elements are quoted.
-        assert_eq!(format(PgType::Text, &elems, 1), r#"{a,"b,c",NULL,"NULL",""}"#);
+        assert_eq!(
+            format(PgType::Text, &elems, 1),
+            r#"{a,"b,c",NULL,"NULL",""}"#
+        );
     }
 
     #[test]
@@ -442,10 +446,7 @@ mod tests {
         );
         // Round-trips unquoted: a comma is no longer the delimiter, so the
         // element text does not need quoting.
-        assert_eq!(
-            format(PgType::Box, &elems, 1),
-            "{(1,1),(0,0);(3,3),(2,2)}"
-        );
+        assert_eq!(format(PgType::Box, &elems, 1), "{(1,1),(0,0);(3,3),(2,2)}");
         Ok(())
     }
 

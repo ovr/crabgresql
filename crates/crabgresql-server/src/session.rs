@@ -485,13 +485,10 @@ impl SessionSequences {
     fn limit_error(&self, namespace: Option<&str>, name: &str, ascending: bool) -> ExecError {
         let ns = Self::resolve_ns(namespace);
         let display = Self::display(namespace, name);
-        let bound = self.engine.sequence(ns, name).map(|def| {
-            if ascending {
-                def.max
-            } else {
-                def.min
-            }
-        });
+        let bound = self
+            .engine
+            .sequence(ns, name)
+            .map(|def| if ascending { def.max } else { def.min });
         let (edge, value) = if ascending {
             ("maximum", bound.unwrap_or(i64::MAX))
         } else {
@@ -512,7 +509,10 @@ impl SequenceOps for SessionSequences {
         let ns = Self::resolve_ns(namespace);
         match self.engine.sequence_nextval(ns, name) {
             SequenceAdvance::Value(v) => {
-                let mut state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|_| panic!("mutex poisoned"));
                 state.currval.insert(Self::state_key(namespace, name), v);
                 state.lastval = Some(v);
                 Ok(v)
@@ -531,7 +531,10 @@ impl SequenceOps for SessionSequences {
         if self.engine.sequence(ns, name).is_none() {
             return Err(self.not_found(namespace, name));
         }
-        let state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         match state.currval.get(&Self::state_key(namespace, name)) {
             Some(v) => Ok(*v),
             None => Err(ExecError::new(
@@ -571,7 +574,10 @@ impl SequenceOps for SessionSequences {
         }
         match self.engine.sequence_setval(ns, name, value, is_called) {
             SequenceAdvance::Value(v) => {
-                let mut state = self.state.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|_| panic!("mutex poisoned"));
                 state.currval.insert(Self::state_key(namespace, name), v);
                 // setval does NOT define lastval: PG's lastval reflects only the
                 // most recent nextval in the session.

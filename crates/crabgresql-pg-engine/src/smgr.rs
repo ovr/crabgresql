@@ -103,7 +103,10 @@ impl StorageManager {
     /// return `None` (so the caller falls through to the on-disk file path). Holds
     /// only a shared read lock on the membership map plus the relation's own lock.
     fn with_mem<R>(&self, rel: RelFileNode, f: impl FnOnce(&mut Vec<Page>) -> R) -> Option<R> {
-        let map = self.mem.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let map = self
+            .mem
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let pages = map.get(&rel.0)?;
         let mut pages = pages.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         Some(f(&mut pages))
@@ -537,7 +540,8 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
-        rx.recv_timeout(std::time::Duration::from_millis(max_ms)).ok()
+        rx.recv_timeout(std::time::Duration::from_millis(max_ms))
+            .ok()
     }
 
     /// A page write is what queues the fsync, not the checkpoint noticing a dirty
@@ -656,7 +660,10 @@ mod tests {
             }));
         }
 
-        assert!(smgr.file(RelFileNode(1)).is_err(), "the injected failure must surface");
+        assert!(
+            smgr.file(RelFileNode(1)).is_err(),
+            "the injected failure must surface"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // The handle is cached now, so this is a map HIT — the path that used to
@@ -680,8 +687,7 @@ mod tests {
     /// every page read and write: one relation being created would otherwise stall
     /// I/O on every other relation for the length of an fsync.
     #[test]
-    fn opening_a_cached_relation_does_not_block_behind_a_directory_fsync()
-    -> anyhow::Result<()> {
+    fn opening_a_cached_relation_does_not_block_behind_a_directory_fsync() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let smgr = Arc::new(StorageManager::open(dir.path())?);
         // Cache a handle for relation 1 before the hook is armed.

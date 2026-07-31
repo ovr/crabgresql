@@ -111,6 +111,8 @@ fn decode_rejects_garbage_without_panicking() {
     assert_eq!(jsonpath::decode(&[]), None);
     assert_eq!(jsonpath::decode(&[0, 250]), None);
     // A deeply nested tree must be refused rather than overflow the stack.
-    let deep: Vec<u8> = std::iter::once(0u8).chain(std::iter::repeat_n(13, 5000)).collect();
+    let deep: Vec<u8> = std::iter::once(0u8)
+        .chain(std::iter::repeat_n(13, 5000))
+        .collect();
     assert_eq!(jsonpath::decode(&deep), None);
 }

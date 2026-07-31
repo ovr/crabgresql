@@ -26,11 +26,7 @@ struct H {
 fn open(dir: tempfile::TempDir) -> H {
     let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
     let (engine, clog, next_xid) =
-        PgEngine::open_recovered_from(
-            dir.path(),
-            Arc::clone(&wal),
-            crabgresql_wal::Lsn::INVALID,
-        )
+        PgEngine::open_recovered_from(dir.path(), Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)
             .expect("open engine");
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
     let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
@@ -81,10 +77,12 @@ fn read(tm: &TransactionManager) -> TxnContext {
 fn ids(tm: &TransactionManager, table: &dyn TableAm) -> Vec<i32> {
     table
         .scan(&read(tm), &ColumnProjection::All)
-        .map(|row| match row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
-            Value::Int4(v) => v,
-            _ => unreachable!(),
-        })
+        .map(
+            |row| match row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0] {
+                Value::Int4(v) => v,
+                _ => unreachable!(),
+            },
+        )
         .collect()
 }
 
@@ -116,21 +114,35 @@ fn base_file_count(h: &H) -> usize {
 #[test]
 fn temporary_table_is_ram_backed_no_file() -> anyhow::Result<()> {
     let h = setup();
-    let t = h.engine.create_table(schema("t", RelPersistence::Temporary))?;
+    let t = h
+        .engine
+        .create_table(schema("t", RelPersistence::Temporary))?;
     // Enough rows to span several 8 KB pages (forcing extends into RAM).
     for i in 0..500 {
-        insert_committed(&h.tm, &*t, vec![Value::Int4(i), Value::Text("x".repeat(40))]);
+        insert_committed(
+            &h.tm,
+            &*t,
+            vec![Value::Int4(i), Value::Text("x".repeat(40))],
+        );
     }
     assert_eq!(ids(&h.tm, &*t), (0..500).collect::<Vec<_>>());
-    assert_eq!(base_file_count(&h), 0, "a Temporary table must not touch disk");
+    assert_eq!(
+        base_file_count(&h),
+        0,
+        "a Temporary table must not touch disk"
+    );
     Ok(())
 }
 
 #[test]
 fn temporary_table_gone_after_restart() -> anyhow::Result<()> {
     let h = setup();
-    let t = h.engine.create_table(schema("t", RelPersistence::Temporary))?;
-    let p = h.engine.create_table(schema("p", RelPersistence::Permanent))?;
+    let t = h
+        .engine
+        .create_table(schema("t", RelPersistence::Temporary))?;
+    let p = h
+        .engine
+        .create_table(schema("p", RelPersistence::Permanent))?;
     insert_committed(&h.tm, &*t, vec![Value::Int4(1), Value::Text("temp".into())]);
     insert_committed(&h.tm, &*p, vec![Value::Int4(2), Value::Text("perm".into())]);
     drop(t);
@@ -150,7 +162,9 @@ fn temporary_table_gone_after_restart() -> anyhow::Result<()> {
 #[test]
 fn temporary_table_truncate_swaps_in_ram() -> anyhow::Result<()> {
     let h = setup();
-    let t = h.engine.create_table(schema("t", RelPersistence::Temporary))?;
+    let t = h
+        .engine
+        .create_table(schema("t", RelPersistence::Temporary))?;
     insert_committed(&h.tm, &*t, vec![Value::Int4(1), Value::Null]);
     insert_committed(&h.tm, &*t, vec![Value::Int4(2), Value::Null]);
     let tx = h.tm.allocate_xid();
@@ -159,20 +173,33 @@ fn temporary_table_truncate_swaps_in_ram() -> anyhow::Result<()> {
     assert_eq!(t.scan(&read(&h.tm), &ColumnProjection::All).count(), 0);
     insert_committed(&h.tm, &*t, vec![Value::Int4(3), Value::Null]);
     assert_eq!(ids(&h.tm, &*t), vec![3]);
-    assert_eq!(base_file_count(&h), 0, "post-truncate rel is RAM-backed too");
+    assert_eq!(
+        base_file_count(&h),
+        0,
+        "post-truncate rel is RAM-backed too"
+    );
     Ok(())
 }
 
 #[test]
 fn temporary_index_is_metadata_only() -> anyhow::Result<()> {
     let h = setup();
-    let t = h.engine.create_table(schema("t", RelPersistence::Temporary))?;
+    let t = h
+        .engine
+        .create_table(schema("t", RelPersistence::Temporary))?;
     insert_committed(&h.tm, &*t, vec![Value::Int4(1), Value::Text("one".into())]);
     h.engine.create_index("public", "t", idx("t_idx"))?;
     // No physical B-tree: probe returns None (executor falls back to a scan).
     assert!(!t.supports_index_scan("t_idx"));
-    assert!(t.index_lookup("t_idx", &[Value::Int4(1)], &read(&h.tm)).is_none());
-    assert_eq!(base_file_count(&h), 0, "a Temporary index must not write a file");
+    assert!(
+        t.index_lookup("t_idx", &[Value::Int4(1)], &read(&h.tm))
+            .is_none()
+    );
+    assert_eq!(
+        base_file_count(&h),
+        0,
+        "a Temporary index must not write a file"
+    );
     Ok(())
 }
 
@@ -184,8 +211,12 @@ fn temporary_index_is_metadata_only() -> anyhow::Result<()> {
 fn temp_before_indexed_permanent_does_not_desync_index_tail() -> anyhow::Result<()> {
     let h = setup();
     // The temp table is created FIRST — it is the one dropped from `encode`.
-    let _t = h.engine.create_table(schema("t", RelPersistence::Temporary))?;
-    let p = h.engine.create_table(schema("p", RelPersistence::Permanent))?;
+    let _t = h
+        .engine
+        .create_table(schema("t", RelPersistence::Temporary))?;
+    let p = h
+        .engine
+        .create_table(schema("p", RelPersistence::Permanent))?;
     insert_committed(&h.tm, &*p, vec![Value::Int4(1), Value::Text("one".into())]);
     insert_committed(&h.tm, &*p, vec![Value::Int4(2), Value::Text("two".into())]);
     h.engine.create_index("public", "p", idx("p_idx"))?;
@@ -213,18 +244,27 @@ fn temp_before_indexed_permanent_does_not_desync_index_tail() -> anyhow::Result<
 #[test]
 fn unlogged_table_is_on_disk() -> anyhow::Result<()> {
     let h = setup();
-    let u = h.engine.create_table(schema("u", RelPersistence::Unlogged))?;
+    let u = h
+        .engine
+        .create_table(schema("u", RelPersistence::Unlogged))?;
     insert_committed(&h.tm, &*u, vec![Value::Int4(1), Value::Text("one".into())]);
     // Unlogged is file-backed (unlike Temporary): a heap file exists under base/.
-    assert!(base_file_count(&h) >= 1, "an Unlogged table must be on disk");
+    assert!(
+        base_file_count(&h) >= 1,
+        "an Unlogged table must be on disk"
+    );
     Ok(())
 }
 
 #[test]
 fn unlogged_survives_clean_restart() -> anyhow::Result<()> {
     let h = setup();
-    let u = h.engine.create_table(schema("u", RelPersistence::Unlogged))?;
-    let p = h.engine.create_table(schema("p", RelPersistence::Permanent))?;
+    let u = h
+        .engine
+        .create_table(schema("u", RelPersistence::Unlogged))?;
+    let p = h
+        .engine
+        .create_table(schema("p", RelPersistence::Permanent))?;
     insert_committed(&h.tm, &*u, vec![Value::Int4(1), Value::Null]);
     insert_committed(&h.tm, &*u, vec![Value::Int4(2), Value::Null]);
     insert_committed(&h.tm, &*p, vec![Value::Int4(9), Value::Null]);
@@ -243,8 +283,12 @@ fn unlogged_survives_clean_restart() -> anyhow::Result<()> {
 #[test]
 fn unlogged_truncated_after_crash() -> anyhow::Result<()> {
     let h = setup();
-    let u = h.engine.create_table(schema("u", RelPersistence::Unlogged))?;
-    let p = h.engine.create_table(schema("p", RelPersistence::Permanent))?;
+    let u = h
+        .engine
+        .create_table(schema("u", RelPersistence::Unlogged))?;
+    let p = h
+        .engine
+        .create_table(schema("p", RelPersistence::Permanent))?;
     insert_committed(&h.tm, &*u, vec![Value::Int4(1), Value::Null]);
     insert_committed(&h.tm, &*p, vec![Value::Int4(9), Value::Null]);
     // Flush the Unlogged rows to their file (a running checkpoint keeps the control
@@ -257,7 +301,11 @@ fn unlogged_truncated_after_crash() -> anyhow::Result<()> {
     let h2 = reopen(h, false); // crash: no clean shutdown
     // The Unlogged table's DEFINITION survives, but its data is reset to empty.
     let u = h2.engine.open_table("u")?;
-    assert_eq!(ids(&h2.tm, &*u), Vec::<i32>::new(), "Unlogged data reset on crash");
+    assert_eq!(
+        ids(&h2.tm, &*u),
+        Vec::<i32>::new(),
+        "Unlogged data reset on crash"
+    );
     // The permanent table's committed row is recovered from the WAL.
     let p = h2.engine.open_table("p")?;
     assert_eq!(ids(&h2.tm, &*p), vec![9]);
@@ -267,12 +315,17 @@ fn unlogged_truncated_after_crash() -> anyhow::Result<()> {
 #[test]
 fn unlogged_index_is_physical_survives_clean_and_resets_on_crash() -> anyhow::Result<()> {
     let h = setup();
-    let u = h.engine.create_table(schema("u", RelPersistence::Unlogged))?;
+    let u = h
+        .engine
+        .create_table(schema("u", RelPersistence::Unlogged))?;
     insert_committed(&h.tm, &*u, vec![Value::Int4(1), Value::Text("one".into())]);
     insert_committed(&h.tm, &*u, vec![Value::Int4(2), Value::Text("two".into())]);
     h.engine.create_index("public", "u", idx("u_idx"))?;
     // An Unlogged table gets a real physical B-tree (unlike Temporary).
-    assert!(u.supports_index_scan("u_idx"), "Unlogged index should be physical");
+    assert!(
+        u.supports_index_scan("u_idx"),
+        "Unlogged index should be physical"
+    );
     // Flush heap + index to disk so both the clean-restart and crash-reset paths
     // operate on real on-disk state.
     h.engine.checkpoint(h.tm.allocate_xid())?;

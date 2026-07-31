@@ -123,7 +123,10 @@ impl BTree {
     /// Build an empty tree: meta page (block 0) pointing at an empty root leaf
     /// (block 1). Both pages are WAL-logged, so recovery reconstructs them.
     pub fn create(&self) {
-        let _w = self.latch.write().unwrap_or_else(|_| panic!("btree latch poisoned"));
+        let _w = self
+            .latch
+            .write()
+            .unwrap_or_else(|_| panic!("btree latch poisoned"));
         // Root leaf first (block 1), then the meta pointing at it.
         self.write_page_image(
             1,
@@ -141,10 +144,12 @@ impl BTree {
     /// The `(root_block, level)` recorded on the meta page.
     fn read_meta(&self) -> (u32, u32) {
         let page = io(self.engine.bufpool.pin(self.rel, META_BLOCK));
-        page.read(|pg| match page::get_item(pg, 1).and_then(btrec::decode_meta) {
-            Some(rl) => rl,
-            None => panic!("btree meta page is not initialized"),
-        })
+        page.read(
+            |pg| match page::get_item(pg, 1).and_then(btrec::decode_meta) {
+                Some(rl) => rl,
+                None => panic!("btree meta page is not initialized"),
+            },
+        )
     }
 
     fn write_meta(&self, root: u32, level: u32) {
@@ -244,7 +249,10 @@ impl BTree {
     /// Every heap `Tid` whose key equals `key`, in `(key, tid)` order, spanning
     /// leaf pages via right-links when a run of duplicates was split apart.
     pub fn search_equal(&self, key: &[u8]) -> Vec<Tid> {
-        let _r = self.latch.read().unwrap_or_else(|_| panic!("btree latch poisoned"));
+        let _r = self
+            .latch
+            .read()
+            .unwrap_or_else(|_| panic!("btree latch poisoned"));
         let s = (key, 0u64); // tid 0 sorts below every real entry (offsets are 1-based)
         let mut blk = {
             let mut stack = Vec::new();
@@ -289,7 +297,10 @@ impl BTree {
     /// total). Panics if the encoded item exceeds the page item limit, matching
     /// PostgreSQL's "index row size exceeds btree maximum".
     pub fn insert(&self, key: &[u8], tid: Tid) {
-        let _w = self.latch.write().unwrap_or_else(|_| panic!("btree latch poisoned"));
+        let _w = self
+            .latch
+            .write()
+            .unwrap_or_else(|_| panic!("btree latch poisoned"));
         let item = btkey::make_leaf_item(tid, key);
         assert!(
             item.len() <= BT_MAX_ITEM,
@@ -414,8 +425,14 @@ impl BTree {
         // Both halves (data + high key) must fit the page; the choose_split sizing
         // proof guarantees this, so a failure here is a sizing-invariant regression
         // (which would otherwise silently overflow the page in `put_item_at`).
-        debug_assert!(page_bytes(&left_items) <= USABLE, "btree split: left half overflows");
-        debug_assert!(page_bytes(&right_items) <= USABLE, "btree split: right half overflows");
+        debug_assert!(
+            page_bytes(&left_items) <= USABLE,
+            "btree split: left half overflows"
+        );
+        debug_assert!(
+            page_bytes(&right_items) <= USABLE,
+            "btree split: right half overflows"
+        );
 
         let leaf_bit = if leaf { BTP_LEAF } else { 0 };
         let left_opaque = BtOpaque {
@@ -525,7 +542,10 @@ impl BTree {
     /// stale key). No page merging — the slot is removed and the array stays
     /// contiguous; empty pages linger until a future milestone reclaims them.
     pub fn delete(&self, key: &[u8], tid: Tid) {
-        let _w = self.latch.write().unwrap_or_else(|_| panic!("btree latch poisoned"));
+        let _w = self
+            .latch
+            .write()
+            .unwrap_or_else(|_| panic!("btree latch poisoned"));
         let s = (key, tid.packed());
         let mut stack = Vec::new();
         let mut blk = self.descend(s, &mut stack);
@@ -592,7 +612,11 @@ fn read_page_items(pg: &page::Page) -> PageItems {
     let high = if btpage::is_rightmost(pg) {
         None
     } else {
-        Some(page::get_item(pg, 1).expect("non-rightmost page has a high key").to_vec())
+        Some(
+            page::get_item(pg, 1)
+                .expect("non-rightmost page has a high key")
+                .to_vec(),
+        )
     };
     let start = btpage::first_data_off(pg);
     let maxoff = page::max_offset(pg);
@@ -685,16 +709,13 @@ mod tests {
     fn no_page_stays_dirty_at_or_below_a_sampled_redo_point() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
-        let (engine, clog, next_xid) =
-            PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let (engine, clog, next_xid) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
 
-        let table = engine.create_table(TableSchema::new(
-            "t",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        let table =
+            engine.create_table(TableSchema::new("t", vec![Column::new("id", PgType::Int4)]))?;
         engine.create_index(
             "public",
             "t",

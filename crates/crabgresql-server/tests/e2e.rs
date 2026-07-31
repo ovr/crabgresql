@@ -21,8 +21,7 @@ async fn spawn_server() -> u16 {
     // isolated. The dir is leaked to keep it alive for the spawned server's whole
     // lifetime (the OS reclaims it after the test process exits).
     let dir = tempfile::tempdir().expect("create temp data dir");
-    let (engine, txnmgr) =
-        crabgresql_server::open_pg_engine(dir.path()).expect("open test engine");
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path()).expect("open test engine");
     std::mem::forget(dir);
     tokio::spawn(crabgresql_server::serve_with(listener, engine, txnmgr));
     port
@@ -56,7 +55,10 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
         .simple_query("CREATE TABLE shell_table (value shell_only)")
         .await
         .unwrap_err();
-    assert_eq!(err.as_db_error().expect("database error").code(), &SqlState::UNDEFINED_OBJECT);
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_OBJECT
+    );
     assert_eq!(
         err.as_db_error().expect("database error").message(),
         "type \"shell_only\" is only a shell"
@@ -66,7 +68,10 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
         .simple_query("CREATE TYPE int4 AS ENUM ('shadow')")
         .await
         .unwrap_err();
-    assert_eq!(err.as_db_error().expect("database error").code(), &SqlState::DUPLICATE_OBJECT);
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::DUPLICATE_OBJECT
+    );
 
     // A built-in type the catalog knows about but this build does not model is
     // `0A000`, not the `42704` a nonexistent type would get. (`xml` is the stand-in
@@ -98,28 +103,34 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
     for target in ["varchar", "name", "bpchar"] {
         let sql = format!("SELECT 'red'::rainbow::{target}");
         let err = client.simple_query(&sql).await.unwrap_err();
-        assert_eq!(err.as_db_error().expect("database error").code(), &SqlState::CANNOT_COERCE);
+        assert_eq!(
+            err.as_db_error().expect("database error").code(),
+            &SqlState::CANNOT_COERCE
+        );
     }
-    client
-        .simple_query("SELECT 'red'::rainbow::text")
-        .await?;
+    client.simple_query("SELECT 'red'::rainbow::text").await?;
 
     let err = client
         .simple_query("SELECT 'red'::rainbow > 1")
         .await
         .unwrap_err();
-    assert_eq!(err.as_db_error().expect("database error").code(), &SqlState::UNDEFINED_FUNCTION);
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_FUNCTION
+    );
     assert_eq!(
         err.as_db_error().expect("database error").message(),
         "operator does not exist: rainbow > integer"
     );
 
-    client.simple_query("CREATE TYPE zeta AS ENUM ('z')").await?;
-    client.simple_query("CREATE TYPE alpha AS ENUM ('a')").await?;
+    client
+        .simple_query("CREATE TYPE zeta AS ENUM ('z')")
+        .await?;
+    client
+        .simple_query("CREATE TYPE alpha AS ENUM ('a')")
+        .await?;
     let ordered = client
-        .simple_query(
-            "SELECT typname FROM pg_type WHERE typname = 'zeta' OR typname = 'alpha'",
-        )
+        .simple_query("SELECT typname FROM pg_type WHERE typname = 'zeta' OR typname = 'alpha'")
         .await?;
     let ordered = rows(&ordered);
     assert_eq!(ordered[0].get(0), Some("zeta"));
@@ -138,7 +149,10 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
         .simple_query("SELECT 1::int8::xbase > 0::int8::xbase")
         .await
         .unwrap_err();
-    assert_eq!(err.as_db_error().expect("database error").code(), &SqlState::UNDEFINED_FUNCTION);
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_FUNCTION
+    );
     assert_eq!(
         err.as_db_error().expect("database error").message(),
         "operator does not exist: xbase > xbase"
@@ -266,8 +280,10 @@ async fn dml_returning_streams_affected_rows() -> anyhow::Result<()> {
     let messages = client
         .simple_query("DELETE FROM crabs RETURNING name, id")
         .await?;
-    let mut deleted: Vec<(Option<&str>, Option<&str>)> =
-        rows(&messages).iter().map(|r| (r.get(0), r.get(1))).collect();
+    let mut deleted: Vec<(Option<&str>, Option<&str>)> = rows(&messages)
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
     deleted.sort();
     assert_eq!(
         deleted,
@@ -298,7 +314,10 @@ async fn dml_returning_faulting_expression_rolls_back_the_mutation() -> anyhow::
         .simple_query("INSERT INTO t (id) VALUES (0) RETURNING 100/id")
         .await
         .expect_err("expected a division-by-zero error");
-    assert_eq!(err.code(), Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO));
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO)
+    );
     let after_insert = client.simple_query("SELECT id FROM t").await?;
     assert_eq!(
         rows(&after_insert).len(),
@@ -705,7 +724,9 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
         .await?;
     assert_eq!(rows(&ns)[0].get(0), Some("app"));
     let schemata = client
-        .simple_query("SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'app'")
+        .simple_query(
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'app'",
+        )
         .await?;
     assert_eq!(rows(&schemata)[0].get(0), Some("app"));
 
@@ -715,10 +736,15 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
         err.as_db_error().expect("database error").code(),
         &SqlState::from_code("42P06")
     );
-    client.simple_query("CREATE SCHEMA IF NOT EXISTS app").await?;
+    client
+        .simple_query("CREATE SCHEMA IF NOT EXISTS app")
+        .await?;
 
     // A `pg_`-prefixed name is reserved (42939).
-    let err = client.simple_query("CREATE SCHEMA pg_evil").await.unwrap_err();
+    let err = client
+        .simple_query("CREATE SCHEMA pg_evil")
+        .await
+        .unwrap_err();
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::from_code("42939")
@@ -726,7 +752,9 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
 
     // A schema-qualified table coexists with a same-named public table, and its
     // pg_class.relnamespace resolves to the schema's pg_namespace.oid.
-    client.simple_query("CREATE TABLE app.item (id int, label text)").await?;
+    client
+        .simple_query("CREATE TABLE app.item (id int, label text)")
+        .await?;
     client.simple_query("CREATE TABLE item (id int)").await?;
     client
         .simple_query("INSERT INTO app.item VALUES (1, 'a'), (2, 'b')")
@@ -763,7 +791,9 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
     let ids = rows(&ids);
     assert_eq!(ids[0].get(0), Some("1"));
     assert_eq!(ids[1].get(0), Some("2"));
-    let nv = client.simple_query("SELECT nextval('app.counter_id_seq')").await?;
+    let nv = client
+        .simple_query("SELECT nextval('app.counter_id_seq')")
+        .await?;
     assert_eq!(rows(&nv)[0].get(0), Some("3"));
 
     // CREATE TABLE in a missing schema → 3F000.
@@ -953,18 +983,24 @@ async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
 
     let client = connect(spawn_server().await).await;
-    client.simple_query("CREATE TABLE t1 (a int, b int)").await?;
+    client
+        .simple_query("CREATE TABLE t1 (a int, b int)")
+        .await?;
     client
         .simple_query("INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30)")
         .await?;
-    client.simple_query("CREATE TABLE t2 (a int, c int)").await?;
+    client
+        .simple_query("CREATE TABLE t2 (a int, c int)")
+        .await?;
     client
         .simple_query("INSERT INTO t2 VALUES (1, 100), (1, 200), (2, 20), (2, 50), (4, 400)")
         .await?;
 
     // Correlated EXISTS (Q4-shape): keep outer rows with a matching t2 row.
     let msgs = client
-        .simple_query("SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) ORDER BY a")
+        .simple_query(
+            "SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) ORDER BY a",
+        )
         .await?;
     let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("a")).collect();
     assert_eq!(got, vec![Some("1"), Some("2")]);
@@ -1010,9 +1046,7 @@ async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
     // Correlated IN: the candidate set depends on the outer row. Only a=2 has a
     // t2.c (20) equal to its b (20).
     let msgs = client
-        .simple_query(
-            "SELECT a FROM t1 WHERE b IN (SELECT c FROM t2 WHERE t2.a = t1.a) ORDER BY a",
-        )
+        .simple_query("SELECT a FROM t1 WHERE b IN (SELECT c FROM t2 WHERE t2.a = t1.a) ORDER BY a")
         .await?;
     let got: Vec<_> = rows(&msgs).iter().map(|r| r.get("a")).collect();
     assert_eq!(got, vec![Some("2")]);
@@ -1118,17 +1152,23 @@ async fn any_all_quantified_comparisons_match_pg() -> anyhow::Result<()> {
     };
 
     let msgs = client
-        .simple_query("SELECT id FROM sq WHERE val = ANY(SELECT val FROM sq WHERE val <> 20) ORDER BY id")
+        .simple_query(
+            "SELECT id FROM sq WHERE val = ANY(SELECT val FROM sq WHERE val <> 20) ORDER BY id",
+        )
         .await?;
     assert_eq!(ids(&msgs), vec!["1", "3"]);
 
     let msgs = client
-        .simple_query("SELECT id FROM sq WHERE val <> ALL(SELECT val FROM sq WHERE val = 20) ORDER BY id")
+        .simple_query(
+            "SELECT id FROM sq WHERE val <> ALL(SELECT val FROM sq WHERE val = 20) ORDER BY id",
+        )
         .await?;
     assert_eq!(ids(&msgs), vec!["1", "3"]);
 
     let msgs = client
-        .simple_query("SELECT id FROM sq WHERE val > ALL(SELECT val FROM sq WHERE val < 30) ORDER BY id")
+        .simple_query(
+            "SELECT id FROM sq WHERE val > ALL(SELECT val FROM sq WHERE val < 30) ORDER BY id",
+        )
         .await?;
     assert_eq!(ids(&msgs), vec!["3"]);
 
@@ -1168,8 +1208,14 @@ async fn any_all_quantified_comparisons_match_pg() -> anyhow::Result<()> {
     let err = client.simple_query("SELECT 1 = ANY(2)").await.unwrap_err();
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
-    assert_eq!(db.message(), "op ANY/ALL (array) requires array on right side");
-    assert_eq!(db.position(), Some(&tokio_postgres::error::ErrorPosition::Original(10)));
+    assert_eq!(
+        db.message(),
+        "op ANY/ALL (array) requires array on right side"
+    );
+    assert_eq!(
+        db.position(),
+        Some(&tokio_postgres::error::ErrorPosition::Original(10))
+    );
 
     Ok(())
 }
@@ -1835,9 +1881,18 @@ async fn select_distinct_deduplicates_rows() -> anyhow::Result<()> {
         .await?;
     let deduped = rows(&messages);
     assert_eq!(deduped.len(), 3);
-    assert_eq!((deduped[0].get(0), deduped[0].get(1)), (Some("1"), Some("10")));
-    assert_eq!((deduped[1].get(0), deduped[1].get(1)), (Some("2"), Some("20")));
-    assert_eq!((deduped[2].get(0), deduped[2].get(1)), (Some("2"), Some("30")));
+    assert_eq!(
+        (deduped[0].get(0), deduped[0].get(1)),
+        (Some("1"), Some("10"))
+    );
+    assert_eq!(
+        (deduped[1].get(0), deduped[1].get(1)),
+        (Some("2"), Some("20"))
+    );
+    assert_eq!(
+        (deduped[2].get(0), deduped[2].get(1)),
+        (Some("2"), Some("30"))
+    );
 
     // DISTINCT ON (a) keeps the first row per group in ORDER BY order.
     let messages = client
@@ -1862,7 +1917,9 @@ async fn select_distinct_deduplicates_rows() -> anyhow::Result<()> {
 #[tokio::test]
 async fn correlated_reference_below_a_window_chain_resolves() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
-    client.simple_query("CREATE TABLE wide (a int, b int)").await?;
+    client
+        .simple_query("CREATE TABLE wide (a int, b int)")
+        .await?;
     client
         .simple_query("INSERT INTO wide VALUES (1,10),(2,20),(3,30),(4,40)")
         .await?;
@@ -1933,9 +1990,16 @@ async fn a_user_function_may_shadow_a_window_function_name() -> anyhow::Result<(
         .await?;
 
     let rows = client.query("SELECT rank(41)", &[]).await?;
-    assert_eq!(rows[0].get::<_, i32>(0), 42, "the user's function is called");
+    assert_eq!(
+        rows[0].get::<_, i32>(0),
+        42,
+        "the user's function is called"
+    );
 
-    let err = client.simple_query("SELECT rank() FROM t").await.unwrap_err();
+    let err = client
+        .simple_query("SELECT rank() FROM t")
+        .await
+        .unwrap_err();
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
     assert_eq!(db.message(), "window function rank requires an OVER clause");
@@ -1956,7 +2020,9 @@ async fn a_window_call_in_a_sql_function_body_is_rejected() -> anyhow::Result<()
 
     let client = connect(spawn_server().await).await;
     let err = client
-        .simple_query("CREATE FUNCTION wr() RETURNS bigint LANGUAGE SQL AS 'SELECT row_number() OVER ()'")
+        .simple_query(
+            "CREATE FUNCTION wr() RETURNS bigint LANGUAGE SQL AS 'SELECT row_number() OVER ()'",
+        )
         .await
         .unwrap_err();
     let db = err.as_db_error().expect("db error");
@@ -2018,13 +2084,10 @@ async fn window_functions_over_a_table() -> anyhow::Result<()> {
         .iter()
         .map(|r| (r.get(0), r.get(1), r.get(2)))
         .collect();
-    assert_eq!(ranks, vec![
-        (1, 1, 1),
-        (1, 1, 1),
-        (2, 2, 2),
-        (2, 2, 2),
-        (2, 2, 3)
-    ]);
+    assert_eq!(
+        ranks,
+        vec![(1, 1, 1), (1, 1, 1), (2, 2, 2), (2, 2, 2), (2, 2, 3)]
+    );
 
     // The default frame runs through the current row's last peer, so the two
     // rows tied at 200 share a running total of 500 rather than 300 and 500.
@@ -2040,10 +2103,19 @@ async fn window_functions_over_a_table() -> anyhow::Result<()> {
 
     // The advertised types: both counting and summing an int4 yield int8.
     let rows = client
-        .query("SELECT rank() OVER (ORDER BY sal), sum(sal) OVER () FROM w", &[])
+        .query(
+            "SELECT rank() OVER (ORDER BY sal), sum(sal) OVER () FROM w",
+            &[],
+        )
         .await?;
-    assert_eq!(rows[0].columns()[0].type_(), &tokio_postgres::types::Type::INT8);
-    assert_eq!(rows[0].columns()[1].type_(), &tokio_postgres::types::Type::INT8);
+    assert_eq!(
+        rows[0].columns()[0].type_(),
+        &tokio_postgres::types::Type::INT8
+    );
+    assert_eq!(
+        rows[0].columns()[1].type_(),
+        &tokio_postgres::types::Type::INT8
+    );
 
     Ok(())
 }
@@ -4122,7 +4194,10 @@ async fn explain_analyze_reports_planning_and_execution_time() -> anyhow::Result
     // Without ANALYZE there is no execution to time, so PG reports planning alone.
     let lines = explain_lines(&client, "EXPLAIN (SUMMARY ON) SELECT * FROM t").await?;
     assert_eq!(lines[0], "Seq Scan on t");
-    assert!(lines[1].starts_with("Planning Time: "), "plan was {lines:?}");
+    assert!(
+        lines[1].starts_with("Planning Time: "),
+        "plan was {lines:?}"
+    );
     assert_eq!(lines.len(), 2, "plan was {lines:?}");
 
     Ok(())
@@ -4142,7 +4217,10 @@ async fn explain_analyze_runs_dml_and_plain_explain_does_not() -> anyhow::Result
     // `INSERT 0 1`.
     let lines = explain_lines(&client, "EXPLAIN ANALYZE INSERT INTO t VALUES (1)").await?;
     assert_eq!(lines[0], "Insert on t");
-    assert!(lines[1].starts_with("Planning Time: "), "plan was {lines:?}");
+    assert!(
+        lines[1].starts_with("Planning Time: "),
+        "plan was {lines:?}"
+    );
     assert_eq!(row_count(&client, "t").await, 1);
 
     // UPDATE and DELETE apply too.
@@ -4430,7 +4508,10 @@ async fn explain_analyze_resolves_bind_parameters_in_extended_protocol() -> anyh
     // where PG raises its own option errors — Parse and Describe stay clean, so a
     // driver that only prepares the statement does not abort its transaction block.
     let err = client
-        .query("EXPLAIN (FORMAT JSON) SELECT * FROM t WHERE id = $1", &[&2i32])
+        .query(
+            "EXPLAIN (FORMAT JSON) SELECT * FROM t WHERE id = $1",
+            &[&2i32],
+        )
         .await
         .expect_err("FORMAT JSON should be rejected");
     assert_eq!(
@@ -4467,7 +4548,11 @@ async fn temp_table_reflects_its_own_namespace() -> anyhow::Result<()> {
     let listed = client
         .simple_query("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'pg_temp_%'")
         .await?;
-    assert_eq!(rows(&listed).len(), 1, "pg_namespace should list the temp schema");
+    assert_eq!(
+        rows(&listed).len(),
+        1,
+        "pg_namespace should list the temp schema"
+    );
 
     Ok(())
 }
@@ -4484,7 +4569,9 @@ async fn temp_tables_are_not_reachable_across_sessions() -> anyhow::Result<()> {
     a.simple_query("INSERT INTO secret VALUES (42)").await?;
     // Learn A's temp namespace (pg_temp_N) from information_schema.
     let ns = a
-        .simple_query("SELECT table_schema FROM information_schema.tables WHERE table_name = 'secret'")
+        .simple_query(
+            "SELECT table_schema FROM information_schema.tables WHERE table_name = 'secret'",
+        )
         .await?;
     let a_temp_schema = rows(&ns)[0].get("table_schema").unwrap().to_string();
     assert!(a_temp_schema.starts_with("pg_temp_"));
@@ -4516,7 +4603,9 @@ async fn temp_tables_are_not_reachable_across_sessions() -> anyhow::Result<()> {
 async fn unlogged_create_table_as_is_unlogged() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client.simple_query("CREATE TABLE src (id int4)").await?;
-    client.simple_query("INSERT INTO src VALUES (1), (2)").await?;
+    client
+        .simple_query("INSERT INTO src VALUES (1), (2)")
+        .await?;
     client
         .simple_query("CREATE UNLOGGED TABLE u AS SELECT * FROM src")
         .await?;
@@ -4562,7 +4651,9 @@ async fn unlogged_table_crud_reflection_and_cross_session() -> anyhow::Result<()
     // An UNLOGGED table is shared: a second session sees it and its rows (a TEMP
     // table would be invisible cross-session).
     let other = connect(port).await;
-    let seen = other.simple_query("SELECT label FROM u ORDER BY id").await?;
+    let seen = other
+        .simple_query("SELECT label FROM u ORDER BY id")
+        .await?;
     assert_eq!(rows(&seen)[0].get("label"), Some("one"));
 
     Ok(())
@@ -4604,8 +4695,14 @@ async fn time_plus_time_reports_ambiguous_operator_over_the_wire() -> anyhow::Re
         db.message(),
         "operator is not unique: time without time zone + time without time zone"
     );
-    assert_eq!(db.detail(), Some("Could not choose a best candidate operator."));
-    assert_eq!(db.hint(), Some("You might need to add explicit type casts."));
+    assert_eq!(
+        db.detail(),
+        Some("Could not choose a best candidate operator.")
+    );
+    assert_eq!(
+        db.hint(),
+        Some("You might need to add explicit type casts.")
+    );
     // Cursor points at the `+` (1-based character 21).
     assert!(matches!(db.position(), Some(ErrorPosition::Original(21))));
 
@@ -4658,9 +4755,7 @@ async fn views_expand_and_reflect_into_catalog() -> anyhow::Result<()> {
         .await?;
     assert_eq!(rows(&messages)[0].get("relkind"), Some("v"));
     let messages = client
-        .simple_query(
-            "SELECT table_type FROM information_schema.tables WHERE table_name = 'v'",
-        )
+        .simple_query("SELECT table_type FROM information_schema.tables WHERE table_name = 'v'")
         .await?;
     assert_eq!(rows(&messages)[0].get("table_type"), Some("VIEW"));
 
@@ -4846,7 +4941,9 @@ async fn create_view_accepts_fewer_column_names() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
 
     let client = connect(spawn_server().await).await;
-    client.simple_query("CREATE TABLE t (a int4, b int4)").await?;
+    client
+        .simple_query("CREATE TABLE t (a int4, b int4)")
+        .await?;
     client.simple_query("INSERT INTO t VALUES (1, 2)").await?;
     // One name for a two-column query: `a` is renamed to `x`, `b` keeps its name.
     client
@@ -4864,7 +4961,10 @@ async fn create_view_accepts_fewer_column_names() -> anyhow::Result<()> {
         .unwrap_err();
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::SYNTAX_ERROR);
-    assert_eq!(db.message(), "CREATE VIEW specifies more column names than columns");
+    assert_eq!(
+        db.message(),
+        "CREATE VIEW specifies more column names than columns"
+    );
     Ok(())
 }
 
@@ -4873,7 +4973,9 @@ async fn create_view_accepts_fewer_column_names() -> anyhow::Result<()> {
 #[tokio::test]
 async fn temp_table_shadows_same_named_view() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
-    client.simple_query("CREATE VIEW x AS SELECT 1 AS a").await?;
+    client
+        .simple_query("CREATE VIEW x AS SELECT 1 AS a")
+        .await?;
     client.simple_query("CREATE TEMP TABLE x (b int4)").await?;
     client.simple_query("INSERT INTO x VALUES (5)").await?;
     // The temp table wins; the row (and column name `b`) come from it, not the view.
@@ -4896,7 +4998,9 @@ async fn serial_column_and_sequence_reflection() -> anyhow::Result<()> {
     client
         .simple_query("INSERT INTO t (name) VALUES ('a'), ('b')")
         .await?;
-    client.simple_query("INSERT INTO t (name) VALUES ('c')").await?;
+    client
+        .simple_query("INSERT INTO t (name) VALUES ('c')")
+        .await?;
     let id_msgs = client.simple_query("SELECT id FROM t ORDER BY id").await?;
     let ids: Vec<Option<&str>> = rows(&id_msgs).iter().map(|r| r.get("id")).collect();
     assert_eq!(ids, vec![Some("1"), Some("2"), Some("3")]);
@@ -4916,7 +5020,10 @@ async fn serial_column_and_sequence_reflection() -> anyhow::Result<()> {
 
     // currval before nextval in a session is 55000.
     client.simple_query("CREATE SEQUENCE s").await?;
-    let err = client.simple_query("SELECT currval('s')").await.unwrap_err();
+    let err = client
+        .simple_query("SELECT currval('s')")
+        .await
+        .unwrap_err();
     assert_eq!(
         err.as_db_error().expect("db error").code(),
         &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
@@ -4938,22 +5045,37 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     client
         .batch_execute("CREATE SEQUENCE a; CREATE SEQUENCE b MINVALUE 1 MAXVALUE 10")
         .await?;
-    let n = client.query_one("SELECT nextval('a') AS v", &[]).await?.get::<_, i64>("v");
+    let n = client
+        .query_one("SELECT nextval('a') AS v", &[])
+        .await?
+        .get::<_, i64>("v");
     client.query_one("SELECT setval('b', 7) AS v", &[]).await?; // must not touch lastval
     assert_eq!(
-        client.query_one("SELECT lastval() AS v", &[]).await?.get::<_, i64>("v"),
+        client
+            .query_one("SELECT lastval() AS v", &[])
+            .await?
+            .get::<_, i64>("v"),
         n,
         "lastval must reflect the nextval on a, not the setval on b"
     );
     // ...but setval DOES define currval for its sequence.
     assert_eq!(
-        client.query_one("SELECT currval('b') AS v", &[]).await?.get::<_, i64>("v"),
+        client
+            .query_one("SELECT currval('b') AS v", &[])
+            .await?
+            .get::<_, i64>("v"),
         7
     );
 
     // setval out of the sequence's own [min,max] is 22003.
-    let e = client.query_one("SELECT setval('b', 999)", &[]).await.unwrap_err();
-    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::NUMERIC_VALUE_OUT_OF_RANGE);
+    let e = client
+        .query_one("SELECT setval('b', 999)", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().unwrap().code(),
+        &SqlState::NUMERIC_VALUE_OUT_OF_RANGE
+    );
 
     // setval with a NULL third argument is a NULL no-op (no side effect).
     let is_null: bool = client
@@ -4963,7 +5085,10 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     assert!(is_null);
     // currval still 7 (the NULL setval did nothing).
     assert_eq!(
-        client.query_one("SELECT currval('b') AS v", &[]).await?.get::<_, i64>("v"),
+        client
+            .query_one("SELECT currval('b') AS v", &[])
+            .await?
+            .get::<_, i64>("v"),
         7
     );
 
@@ -4972,18 +5097,30 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
         .batch_execute("CREATE SEQUENCE toobig AS smallint MAXVALUE 100000")
         .await
         .unwrap_err();
-    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::INVALID_PARAMETER_VALUE);
+    assert_eq!(
+        e.as_db_error().unwrap().code(),
+        &SqlState::INVALID_PARAMETER_VALUE
+    );
 
     // nextval on a table (existing non-sequence relation) is 42809, not 42P01.
     client.batch_execute("CREATE TABLE tab (id int)").await?;
-    let e = client.query_one("SELECT nextval('tab')", &[]).await.unwrap_err();
-    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::WRONG_OBJECT_TYPE);
+    let e = client
+        .query_one("SELECT nextval('tab')", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().unwrap().code(),
+        &SqlState::WRONG_OBJECT_TYPE
+    );
 
     // currval after DROP errors 42P01 (no stale cached value).
     client.batch_execute("CREATE SEQUENCE gone; ").await?;
     client.query_one("SELECT nextval('gone') AS v", &[]).await?;
     client.batch_execute("DROP SEQUENCE gone").await?;
-    let e = client.query_one("SELECT currval('gone')", &[]).await.unwrap_err();
+    let e = client
+        .query_one("SELECT currval('gone')", &[])
+        .await
+        .unwrap_err();
     assert_eq!(e.as_db_error().unwrap().code(), &SqlState::UNDEFINED_TABLE);
 
     // An index cannot take a sequence's name (shared relation namespace).
@@ -4995,13 +5132,18 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
 
     // DROP SEQUENCE of a serial-owned sequence is blocked under RESTRICT (2BP01).
     client.batch_execute("CREATE TABLE ser (id serial)").await?;
-    let e = client.batch_execute("DROP SEQUENCE ser_id_seq").await.unwrap_err();
+    let e = client
+        .batch_execute("DROP SEQUENCE ser_id_seq")
+        .await
+        .unwrap_err();
     assert_eq!(
         e.as_db_error().unwrap().code(),
         &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
     );
     // CASCADE drops it.
-    client.batch_execute("DROP SEQUENCE ser_id_seq CASCADE").await?;
+    client
+        .batch_execute("DROP SEQUENCE ser_id_seq CASCADE")
+        .await?;
     Ok(())
 }
 
@@ -5087,7 +5229,10 @@ async fn drop_function_semantics() -> anyhow::Result<()> {
         .await?;
 
     // A bare name with two overloads is ambiguous (42725).
-    let e = client.batch_execute("DROP FUNCTION f_in").await.unwrap_err();
+    let e = client
+        .batch_execute("DROP FUNCTION f_in")
+        .await
+        .unwrap_err();
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::AMBIGUOUS_FUNCTION
@@ -5140,7 +5285,9 @@ async fn drop_function_semantics() -> anyhow::Result<()> {
     // signature: OUT params are not part of a function's identity (CREATE and
     // DROP agree on excluding them).
     client
-        .batch_execute("CREATE FUNCTION f_out(int8, OUT int4) RETURNS int4 AS 'int8out' LANGUAGE internal")
+        .batch_execute(
+            "CREATE FUNCTION f_out(int8, OUT int4) RETURNS int4 AS 'int8out' LANGUAGE internal",
+        )
         .await?;
     client.batch_execute("DROP FUNCTION f_out(int8)").await?;
     Ok(())
@@ -5166,7 +5313,9 @@ async fn create_index_generates_name() -> anyhow::Result<()> {
             .collect())
     };
 
-    client.batch_execute("CREATE TABLE t (a int, b int)").await?;
+    client
+        .batch_execute("CREATE TABLE t (a int, b int)")
+        .await?;
     client.batch_execute("CREATE INDEX ON t (a)").await?;
     assert_eq!(index_names("t").await?, ["t_a_idx"]);
 
@@ -5286,7 +5435,10 @@ async fn sequence_write_rejected_read_only() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client.batch_execute("CREATE SEQUENCE s").await?;
     client.batch_execute("BEGIN TRANSACTION READ ONLY").await?;
-    let e = client.query_one("SELECT nextval('s')", &[]).await.unwrap_err();
+    let e = client
+        .query_one("SELECT nextval('s')", &[])
+        .await
+        .unwrap_err();
     assert_eq!(
         e.as_db_error().unwrap().code(),
         &SqlState::READ_ONLY_SQL_TRANSACTION
@@ -5294,7 +5446,10 @@ async fn sequence_write_rejected_read_only() -> anyhow::Result<()> {
     client.batch_execute("ROLLBACK").await?;
     // The counter did not advance despite the rejected nextval.
     assert_eq!(
-        client.query_one("SELECT nextval('s') AS v", &[]).await?.get::<_, i64>("v"),
+        client
+            .query_one("SELECT nextval('s') AS v", &[])
+            .await?
+            .get::<_, i64>("v"),
         1
     );
     Ok(())
@@ -5353,9 +5508,7 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
         )
         .await?;
     client
-        .simple_query(
-            "INSERT INTO p VALUES (1, 'one', '\\x0102'), (2, NULL, NULL)",
-        )
+        .simple_query("INSERT INTO p VALUES (1, 'one', '\\x0102'), (2, NULL, NULL)")
         .await?;
 
     let messages = client
@@ -5385,7 +5538,8 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
 
     let sink = client.copy_in("COPY p (id, label) FROM STDIN").await?;
     futures_util::pin_mut!(sink);
-    sink.send(Bytes::from_static(b"3\tthree\n4\tfour\n")).await?;
+    sink.send(Bytes::from_static(b"3\tthree\n4\tfour\n"))
+        .await?;
     assert_eq!(sink.finish().await?, 2);
 
     client
@@ -5393,9 +5547,7 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
         // from and the key must be spelled out.
         .simple_query("CREATE TABLE p_copy USING parquet ORDER BY (id) AS SELECT id, label FROM p")
         .await?;
-    let copied = client
-        .simple_query("SELECT count(*) FROM p_copy")
-        .await?;
+    let copied = client.simple_query("SELECT count(*) FROM p_copy").await?;
     assert_eq!(rows(&copied)[0].get(0), Some("4"));
 
     let duplicate = client
@@ -5453,11 +5605,7 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
             .await
             .expect_err("unsupported Parquet table form must fail");
         assert_eq!(
-            error
-                .as_db_error()
-                .expect("database error")
-                .code()
-                .code(),
+            error.as_db_error().expect("database error").code().code(),
             "0A000",
             "{sql}"
         );
@@ -5486,7 +5634,10 @@ async fn an_engine_managed_table_must_declare_its_sort_key() -> anyhow::Result<(
         // case below; the paren-free form does not generalize.
         "CREATE TABLE k7 (id int4) USING parquet ORDER BY id",
     ] {
-        client.simple_query(sql).await.with_context(|| sql.to_string())?;
+        client
+            .simple_query(sql)
+            .await
+            .with_context(|| sql.to_string())?;
     }
 
     let fails = async |sql: &str| -> anyhow::Result<(String, String, Option<String>)> {
@@ -5713,13 +5864,14 @@ async fn the_sort_key_rule_does_not_reach_past_its_own_statements() -> anyhow::R
 /// write buffer — so it plans as an `Append` over both. The leaves are not
 /// catalog relations, so each labels itself and neither appears in `pg_class`.
 #[tokio::test]
-async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves()
--> anyhow::Result<()> {
+async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
         .simple_query("CREATE TABLE p (id int4, label text) USING parquet ORDER BY (id)")
         .await?;
-    client.simple_query("INSERT INTO p VALUES (1, 'one')").await?;
+    client
+        .simple_query("INSERT INTO p VALUES (1, 'one')")
+        .await?;
 
     let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p").await?;
     assert_eq!(
@@ -5734,7 +5886,9 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves()
 
     // Splitting the relation across leaves must not cost the plan its predicate
     // or its column names — both live on nodes above the Append.
-    client.simple_query("CREATE TABLE h (id int4, label text)").await?;
+    client
+        .simple_query("CREATE TABLE h (id int4, label text)")
+        .await?;
     let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p WHERE id = 1").await?;
     assert_eq!(
         lines,
@@ -5748,7 +5902,9 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves()
     );
     let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p JOIN h ON p.id = h.id").await?;
     assert!(
-        lines.iter().any(|line| line.contains("Hash Cond: (id = id)")),
+        lines
+            .iter()
+            .any(|line| line.contains("Hash Cond: (id = id)")),
         "join keys over a split relation must render by name, not as $n: {lines:?}"
     );
 
@@ -5804,8 +5960,7 @@ async fn truncate_under_repeatable_read_leaves_no_rows_behind() -> anyhow::Resul
 /// only thing standing between it and the vacuumer. Choosing the wrong floor here
 /// deletes the row out from under a `REPEATABLE READ` session mid-transaction.
 #[tokio::test]
-async fn vacuum_does_not_reclaim_below_a_read_only_repeatable_read_reader()
--> anyhow::Result<()> {
+async fn vacuum_does_not_reclaim_below_a_read_only_repeatable_read_reader() -> anyhow::Result<()> {
     let port = spawn_server().await;
     let reader = connect(port).await;
     let vacuumer = connect(port).await;
@@ -5860,8 +6015,8 @@ async fn vacuum_does_not_reclaim_below_a_read_only_repeatable_read_reader()
 /// precisely the versions the reader is entitled to keep reading. The two agree
 /// whenever `xip` is empty, so only a concurrent writer tells them apart.
 #[tokio::test]
-async fn vacuum_respects_a_reader_that_captured_around_an_in_flight_deleter()
--> anyhow::Result<()> {
+async fn vacuum_respects_a_reader_that_captured_around_an_in_flight_deleter() -> anyhow::Result<()>
+{
     let port = spawn_server().await;
     let reader = connect(port).await;
     let deleter = connect(port).await;
@@ -5902,8 +6057,7 @@ async fn vacuum_respects_a_reader_that_captured_around_an_in_flight_deleter()
 /// rows into durable storage without changing what any reader sees, works on a
 /// heap table and bare, and refuses the forms it cannot honor.
 #[tokio::test]
-async fn vacuum_flushes_buffered_rows_without_changing_what_readers_see()
--> anyhow::Result<()> {
+async fn vacuum_flushes_buffered_rows_without_changing_what_readers_see() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
         .simple_query("CREATE TABLE p (id int4, label text) USING parquet ORDER BY (id)")
@@ -5939,7 +6093,9 @@ async fn vacuum_flushes_buffered_rows_without_changing_what_readers_see()
     // A second flush has nothing to move, and further inserts still land and read
     // back alongside the already-flushed rows.
     client.simple_query("VACUUM p").await?;
-    client.simple_query("INSERT INTO p VALUES (4, 'four')").await?;
+    client
+        .simple_query("INSERT INTO p VALUES (4, 'four')")
+        .await?;
     let messages = client.simple_query("SELECT id FROM p ORDER BY id").await?;
     assert_eq!(
         rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
@@ -5958,7 +6114,11 @@ async fn vacuum_flushes_buffered_rows_without_changing_what_readers_see()
         .await
         .expect_err("VACUUM inside a transaction block must fail");
     assert_eq!(
-        in_block.as_db_error().expect("database error").code().code(),
+        in_block
+            .as_db_error()
+            .expect("database error")
+            .code()
+            .code(),
         "25001"
     );
     client.simple_query("ROLLBACK").await?;
@@ -6028,8 +6188,7 @@ async fn vacuum_flushes_buffered_rows_without_changing_what_readers_see()
 /// `pg_class.relam`, and rejects the forms that contradict "permanent, engine
 /// managed".
 #[tokio::test]
-async fn buffer_tables_are_fully_mutable_and_reflect_their_access_method()
--> anyhow::Result<()> {
+async fn buffer_tables_are_fully_mutable_and_reflect_their_access_method() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
         .simple_query("CREATE TABLE b (id int4 PRIMARY KEY, label text) USING buffer")
@@ -6064,7 +6223,11 @@ async fn buffer_tables_are_fully_mutable_and_reflect_their_access_method()
         .await
         .expect_err("a duplicate key must be rejected");
     assert_eq!(
-        duplicate.as_db_error().expect("database error").code().code(),
+        duplicate
+            .as_db_error()
+            .expect("database error")
+            .code()
+            .code(),
         "23505"
     );
 
@@ -6202,9 +6365,13 @@ async fn parquet_truncate_is_transactional_and_resets_statistics() -> anyhow::Re
     // truncate's directory are the only ones that survive.
     client.simple_query("BEGIN").await?;
     client.simple_query("TRUNCATE p").await?;
-    client.simple_query("INSERT INTO p VALUES (4, 'four')").await?;
+    client
+        .simple_query("INSERT INTO p VALUES (4, 'four')")
+        .await?;
     client.simple_query("TRUNCATE p").await?;
-    client.simple_query("INSERT INTO p VALUES (5, 'five')").await?;
+    client
+        .simple_query("INSERT INTO p VALUES (5, 'five')")
+        .await?;
     client.simple_query("COMMIT").await?;
     let doubled = client.simple_query("SELECT id FROM p ORDER BY id").await?;
     assert_eq!(rows(&doubled).len(), 1);
@@ -6233,7 +6400,9 @@ async fn copy_in_csv_with_header_and_quotes() -> anyhow::Result<()> {
     use futures_util::SinkExt;
 
     let client = connect(spawn_server().await).await;
-    client.simple_query("CREATE TABLE c (a int4, b text)").await?;
+    client
+        .simple_query("CREATE TABLE c (a int4, b text)")
+        .await?;
 
     let sink = client
         .copy_in("COPY c FROM STDIN WITH (FORMAT csv, HEADER)")
@@ -6347,14 +6516,20 @@ async fn copy_in_csv_concatenates_quote_after_content() -> anyhow::Result<()> {
     use futures_util::SinkExt;
 
     let client = connect(spawn_server().await).await;
-    client.simple_query("CREATE TABLE c (a int4, b text)").await?;
-    let sink = client.copy_in("COPY c FROM STDIN WITH (FORMAT csv)").await?;
+    client
+        .simple_query("CREATE TABLE c (a int4, b text)")
+        .await?;
+    let sink = client
+        .copy_in("COPY c FROM STDIN WITH (FORMAT csv)")
+        .await?;
     futures_util::pin_mut!(sink);
     // `1, "two"` -> b = ' two' (space + quoted run), as PG concatenates.
     sink.send(Bytes::from_static(b"1, \"two\"\n")).await?;
     assert_eq!(sink.finish().await?, 1);
 
-    let messages = client.simple_query("SELECT '['||b||']' AS b FROM c").await?;
+    let messages = client
+        .simple_query("SELECT '['||b||']' AS b FROM c")
+        .await?;
     assert_eq!(rows(&messages)[0].get("b"), Some("[ two]"));
     Ok(())
 }
@@ -6365,7 +6540,9 @@ async fn copy_multibyte_delimiter_rejected() -> anyhow::Result<()> {
     // and the binder's single-byte check backs it up) rather than silently
     // splitting on a multi-byte character, matching PG.
     let client = connect(spawn_server().await).await;
-    client.simple_query("CREATE TABLE c (a int4, b text)").await?;
+    client
+        .simple_query("CREATE TABLE c (a int4, b text)")
+        .await?;
     let result: Result<tokio_postgres::CopyInSink<bytes::Bytes>, _> = client
         .copy_in("COPY c FROM STDIN WITH (FORMAT csv, DELIMITER 'é')")
         .await;
@@ -6437,14 +6614,18 @@ async fn create_function_language_sql_evaluates_and_composes() -> anyhow::Result
 
     // The `AS $$ SELECT ... $$` body form and a direct call.
     client
-        .simple_query("CREATE FUNCTION add(int, int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + $2 $$")
+        .simple_query(
+            "CREATE FUNCTION add(int, int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + $2 $$",
+        )
         .await?;
     let out = client.simple_query("SELECT add(1, 2)").await?;
     assert_eq!(rows(&out)[0].get(0), Some("3"));
 
     // The extended protocol: the outer statement's `$1`/`$2` are the call
     // arguments, distinct from the body's own (now inlined) parameters.
-    let row = client.query_one("SELECT add($1, $2)", &[&5i32, &7i32]).await?;
+    let row = client
+        .query_one("SELECT add($1, $2)", &[&5i32, &7i32])
+        .await?;
     assert_eq!(row.get::<_, i32>(0), 12);
 
     // The `RETURN <expr>` body form.
@@ -6457,9 +6638,13 @@ async fn create_function_language_sql_evaluates_and_composes() -> anyhow::Result
     // Functions compose: a body may call another SQL function, and arguments are
     // arbitrary expressions evaluated in the caller.
     client
-        .simple_query("CREATE FUNCTION double_inc(int) RETURNS int LANGUAGE SQL AS $$ SELECT inc(inc($1)) $$")
+        .simple_query(
+            "CREATE FUNCTION double_inc(int) RETURNS int LANGUAGE SQL AS $$ SELECT inc(inc($1)) $$",
+        )
         .await?;
-    let out = client.simple_query("SELECT double_inc(40), add(inc(1), 5)").await?;
+    let out = client
+        .simple_query("SELECT double_inc(40), add(inc(1), 5)")
+        .await?;
     assert_eq!(rows(&out)[0].get(0), Some("42"));
     assert_eq!(rows(&out)[0].get(1), Some("7"));
 
@@ -6475,7 +6660,9 @@ async fn create_function_language_sql_evaluates_and_composes() -> anyhow::Result
         .simple_query("CREATE FUNCTION same(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 * 10 $$")
         .await?;
     client
-        .simple_query("CREATE FUNCTION same(text) RETURNS text LANGUAGE SQL AS $$ SELECT $1 || '!' $$")
+        .simple_query(
+            "CREATE FUNCTION same(text) RETURNS text LANGUAGE SQL AS $$ SELECT $1 || '!' $$",
+        )
         .await?;
     let out = client.simple_query("SELECT same(4), same('hi')").await?;
     assert_eq!(rows(&out)[0].get(0), Some("40"));
@@ -6483,7 +6670,9 @@ async fn create_function_language_sql_evaluates_and_composes() -> anyhow::Result
 
     // A function used per row over a table.
     client.simple_query("CREATE TABLE t (a int, b int)").await?;
-    client.simple_query("INSERT INTO t VALUES (1, 2), (3, 4), (10, 20)").await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 2), (3, 4), (10, 20)")
+        .await?;
     let out = client
         .simple_query("SELECT add(a, b) AS s FROM t ORDER BY a")
         .await?;
@@ -6553,7 +6742,9 @@ async fn create_function_language_sql_body_resolves_argument_names() -> anyhow::
 
     // An argument declared without a name stays reachable only as `$n`.
     client
-        .simple_query("CREATE FUNCTION unnamed(int4) RETURNS int4 LANGUAGE SQL AS $$ SELECT $1 + 1 $$")
+        .simple_query(
+            "CREATE FUNCTION unnamed(int4) RETURNS int4 LANGUAGE SQL AS $$ SELECT $1 + 1 $$",
+        )
         .await?;
     let out = client.simple_query("SELECT unnamed(41)").await?;
     assert_eq!(rows(&out)[0].get(0), Some("42"));
@@ -6584,7 +6775,9 @@ async fn create_function_language_sql_body_resolves_argument_names() -> anyhow::
 
     // A body may not refer to two arguments by one name.
     let err = client
-        .simple_query("CREATE FUNCTION dupname(a int, a int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 $$")
+        .simple_query(
+            "CREATE FUNCTION dupname(a int, a int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 $$",
+        )
         .await
         .unwrap_err();
     let dberr = err.as_db_error().expect("database error");
@@ -6625,7 +6818,9 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
 
     // An unknown function referenced in a body is rejected at CREATE time.
     let err = client
-        .simple_query("CREATE FUNCTION nested(int) RETURNS int LANGUAGE SQL AS $$ SELECT nope($1) $$")
+        .simple_query(
+            "CREATE FUNCTION nested(int) RETURNS int LANGUAGE SQL AS $$ SELECT nope($1) $$",
+        )
         .await
         .unwrap_err();
     assert_eq!(
@@ -6720,7 +6915,9 @@ async fn create_function_language_sql_resolution_and_volatility_match_pg() -> an
     // the operator form splits it across DETAIL and HINT.
     assert_eq!(
         dberr.hint(),
-        Some("Could not choose a best candidate function. You might need to add explicit type casts.")
+        Some(
+            "Could not choose a best candidate function. You might need to add explicit type casts."
+        )
     );
 
     // An aggregate body is a scalar-inlining limitation, reported as unsupported
@@ -6754,9 +6951,7 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
 
     // Reflection: parent is relkind='p', partition is relispartition='t'.
     let msgs = client
-        .simple_query(
-            "SELECT relkind, relispartition FROM pg_class WHERE relname = 'm'",
-        )
+        .simple_query("SELECT relkind, relispartition FROM pg_class WHERE relname = 'm'")
         .await?;
     assert_eq!(
         (rows(&msgs)[0].get(0), rows(&msgs)[0].get(1)),
@@ -6779,7 +6974,9 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
     client
         .simple_query("INSERT INTO m VALUES (2, '2024-07-01')")
         .await?;
-    let msgs = client.simple_query("SELECT id FROM m_2024 ORDER BY id").await?;
+    let msgs = client
+        .simple_query("SELECT id FROM m_2024 ORDER BY id")
+        .await?;
     let leaf_ids: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
     assert_eq!(leaf_ids, vec![Some("1"), Some("2")]);
 
@@ -6806,7 +7003,10 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
         err.as_db_error().expect("database error").code(),
         &SqlState::CHECK_VIOLATION
     );
-    assert_eq!(rows(&client.simple_query("SELECT count(*) FROM m").await?)[0].get(0), Some("2"));
+    assert_eq!(
+        rows(&client.simple_query("SELECT count(*) FROM m").await?)[0].get(0),
+        Some("2")
+    );
 
     // DELETE through the parent removes the matching row from whichever leaf
     // holds it (id = 1 lived in m_2024), leaving id = 2 behind.
@@ -6869,7 +7069,10 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
         err.as_db_error().expect("database error").code(),
         &SqlState::from_code("42P17")
     );
-    assert_eq!(rows(&client.simple_query("SELECT 1").await?)[0].get(0), Some("1"));
+    assert_eq!(
+        rows(&client.simple_query("SELECT 1").await?)[0].get(0),
+        Some("1")
+    );
 
     // A non-orderable RANGE key (json) is rejected at parent create (42704), not a crash.
     let err = client
@@ -6880,15 +7083,22 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_OBJECT
     );
-    assert_eq!(rows(&client.simple_query("SELECT 2").await?)[0].get(0), Some("2"));
+    assert_eq!(
+        rows(&client.simple_query("SELECT 2").await?)[0].get(0),
+        Some("2")
+    );
 
     // A duplicate partition name is 'relation already exists' (42P07), not a self-overlap;
     // IF NOT EXISTS is a no-op.
     client
-        .simple_query("CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')")
+        .simple_query(
+            "CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+        )
         .await?;
     let err = client
-        .simple_query("CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')")
+        .simple_query(
+            "CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+        )
         .await
         .unwrap_err();
     assert_eq!(
@@ -6916,7 +7126,9 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
     );
 
     // PARTITION OF a view reports wrong-object-type (42809), not 'does not exist'.
-    client.simple_query("CREATE VIEW vv AS SELECT 1 AS x").await?;
+    client
+        .simple_query("CREATE VIEW vv AS SELECT 1 AS x")
+        .await?;
     let err = client
         .simple_query("CREATE TABLE cv PARTITION OF vv FOR VALUES FROM (1) TO (2)")
         .await
@@ -7191,7 +7403,12 @@ async fn range_partitioning_routed_update_delete_copy() -> anyhow::Result<()> {
     );
     // The row stayed in m_2023.
     assert_eq!(
-        rows(&client.simple_query("SELECT d FROM m_2023 WHERE id = 1").await?)[0].get(0),
+        rows(
+            &client
+                .simple_query("SELECT d FROM m_2023 WHERE id = 1")
+                .await?
+        )[0]
+        .get(0),
         Some("2023-09-01")
     );
 
@@ -7204,7 +7421,9 @@ async fn range_partitioning_routed_update_delete_copy() -> anyhow::Result<()> {
         rows(&client.simple_query("SELECT id FROM m_2023").await?).is_empty(),
         "m_2023 should be empty after the row moved out"
     );
-    let msgs = client.simple_query("SELECT id FROM m_2024 ORDER BY id").await?;
+    let msgs = client
+        .simple_query("SELECT id FROM m_2024 ORDER BY id")
+        .await?;
     let moved: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
     assert_eq!(moved, vec![Some("1"), Some("2")]);
 
@@ -7289,7 +7508,9 @@ async fn range_partitioning_row_movement_respects_leaf_unique() -> anyhow::Resul
     client
         .simple_query("UPDATE m SET id = 2, d = '2024-03-01' WHERE id = 1 AND d = '2023-06-01'")
         .await?;
-    let msgs = client.simple_query("SELECT id FROM m_2024 ORDER BY id").await?;
+    let msgs = client
+        .simple_query("SELECT id FROM m_2024 ORDER BY id")
+        .await?;
     let moved: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
     assert_eq!(moved, vec![Some("1"), Some("2")]);
     assert!(
@@ -7346,10 +7567,13 @@ async fn correlated_reference_inside_a_union_arm_resolves() -> anyhow::Result<()
             _ => None,
         })
         .collect();
-    assert_eq!(pairs, vec![
-        ("1".to_string(), "1".to_string()),
-        ("2".to_string(), "2".to_string())
-    ]);
+    assert_eq!(
+        pairs,
+        vec![
+            ("1".to_string(), "1".to_string()),
+            ("2".to_string(), "2".to_string())
+        ]
+    );
     Ok(())
 }
 
@@ -7361,7 +7585,9 @@ async fn correlated_reference_inside_a_union_arm_resolves() -> anyhow::Result<()
 async fn reg_columns_advertise_their_postgresql_type_oids() -> anyhow::Result<()> {
     let port = spawn_server().await;
     let client = connect(port).await;
-    client.simple_query("CREATE TABLE regwire (a integer)").await?;
+    client
+        .simple_query("CREATE TABLE regwire (a integer)")
+        .await?;
 
     let typed = client
         .query(
@@ -7384,9 +7610,7 @@ async fn reg_columns_advertise_their_postgresql_type_oids() -> anyhow::Result<()
     assert_eq!(row[0].get("ty"), Some("integer"));
 
     let same = client
-        .simple_query(
-            "SELECT 'regwire'::regclass::oid = 'REGWIRE'::regclass::oid AS eq",
-        )
+        .simple_query("SELECT 'regwire'::regclass::oid = 'REGWIRE'::regclass::oid AS eq")
         .await?;
     assert_eq!(rows(&same)[0].get("eq"), Some("t"));
     Ok(())
@@ -7399,7 +7623,9 @@ async fn analyze_measures_relations_and_reports_its_limits() -> anyhow::Result<(
     let port = spawn_server().await;
     let client = connect(port).await;
     client.simple_query("CREATE TABLE a1 (id int)").await?;
-    client.simple_query("INSERT INTO a1 VALUES (1), (2)").await?;
+    client
+        .simple_query("INSERT INTO a1 VALUES (1), (2)")
+        .await?;
     client.simple_query("CREATE TEMP TABLE a2 (id int)").await?;
     client.simple_query("INSERT INTO a2 VALUES (1)").await?;
 
@@ -7873,13 +8099,19 @@ async fn read_only_rejects_dml_that_calls_a_routine() -> anyhow::Result<()> {
     // A bare SELECT of the same routine is still allowed: nothing writes.
     client.batch_execute("BEGIN READ ONLY").await?;
     assert_eq!(
-        client.query_one("SELECT pure(7)", &[]).await?.get::<_, i32>(0),
+        client
+            .query_one("SELECT pure(7)", &[])
+            .await?
+            .get::<_, i32>(0),
         7
     );
     client.batch_execute("ROLLBACK").await?;
 
     assert_eq!(
-        client.query_one("SELECT count(*) FROM t", &[]).await?.get::<_, i64>(0),
+        client
+            .query_one("SELECT count(*) FROM t", &[])
+            .await?
+            .get::<_, i64>(0),
         0
     );
     Ok(())
@@ -7905,12 +8137,18 @@ async fn routine_error_while_draining_rolls_its_writes_back() -> anyhow::Result<
     // The body's insert is rolled back, and the connection is still usable —
     // an XID left in flight would also block this row from being written.
     assert_eq!(
-        client.query_one("SELECT count(*) FROM t", &[]).await?.get::<_, i64>(0),
+        client
+            .query_one("SELECT count(*) FROM t", &[])
+            .await?
+            .get::<_, i64>(0),
         0
     );
     client.batch_execute("INSERT INTO t VALUES (2)").await?;
     assert_eq!(
-        client.query_one("SELECT count(*) FROM t", &[]).await?.get::<_, i64>(0),
+        client
+            .query_one("SELECT count(*) FROM t", &[])
+            .await?
+            .get::<_, i64>(0),
         1
     );
     Ok(())
@@ -7937,7 +8175,10 @@ async fn call_arguments_may_themselves_call_routines() -> anyhow::Result<()> {
 
     client.batch_execute("CALL keep(inc(1))").await?;
     assert_eq!(
-        client.query_one("SELECT n FROM t", &[]).await?.get::<_, i32>(0),
+        client
+            .query_one("SELECT n FROM t", &[])
+            .await?
+            .get::<_, i32>(0),
         2
     );
     Ok(())
@@ -7997,7 +8238,9 @@ async fn fetch_reports_its_columns_over_the_extended_protocol() -> anyhow::Resul
 async fn prepared_fetch_follows_the_cursor_it_names() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client.batch_execute("CREATE TABLE t (id integer)").await?;
-    client.batch_execute("INSERT INTO t VALUES (1), (2)").await?;
+    client
+        .batch_execute("INSERT INTO t VALUES (1), (2)")
+        .await?;
 
     // Parsed before the cursor exists: the 34000 belongs to Execute, not Parse,
     // so the statement itself must prepare cleanly.
@@ -8034,7 +8277,9 @@ async fn declare_cursor_binds_its_parameters() -> anyhow::Result<()> {
         .await?;
     let rows = client.query("FETCH ALL c", &[]).await?;
     assert_eq!(
-        rows.iter().map(|r| r.get::<_, i32>("g")).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|r| r.get::<_, i32>("g"))
+            .collect::<Vec<_>>(),
         [4, 5]
     );
     Ok(())
@@ -8131,7 +8376,10 @@ async fn a_row_that_cannot_be_shrunk_reports_program_limit_exceeded() {
     let client = connect(port).await;
     let columns: Vec<String> = (0..140).map(|i| format!("c{i} name")).collect();
     client
-        .simple_query(&format!("CREATE TABLE toast_fixed ({})", columns.join(", ")))
+        .simple_query(&format!(
+            "CREATE TABLE toast_fixed ({})",
+            columns.join(", ")
+        ))
         .await
         .expect("create");
 
@@ -8144,7 +8392,10 @@ async fn a_row_that_cannot_be_shrunk_reports_program_limit_exceeded() {
         .await
         .expect_err("a row of fixed-width columns cannot be made to fit");
     let db_error = err.as_db_error().expect("database error");
-    assert_eq!(db_error.code(), &tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED);
+    assert_eq!(
+        db_error.code(),
+        &tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED
+    );
     assert!(
         db_error.message().starts_with("row is too big: size "),
         "unexpected message: {}",

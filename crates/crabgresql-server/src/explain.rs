@@ -131,7 +131,8 @@ impl ExplainOptions {
         // Then the cross-checks: `EXPLAIN (TIMING ON)` reports the dependency, not
         // a missing feature. PG picks WAL over TIMING over SERIALIZE.
         if !analyze {
-            for (requested, option) in [(wal, "WAL"), (timing, "TIMING"), (serialize, "SERIALIZE")] {
+            for (requested, option) in [(wal, "WAL"), (timing, "TIMING"), (serialize, "SERIALIZE")]
+            {
                 if requested {
                     return Err(PgError::new(
                         sqlstate::INVALID_PARAMETER_VALUE,
@@ -205,7 +206,10 @@ fn option_text(option: &ast::UtilityOption, name: &str) -> Result<String, PgErro
     // An argument that is not a word or a scalar literal — `-1`, `NULL`, `1+1` —
     // names no value, and PG echoes it as the unrecognized value it is.
     option_value(option).ok_or_else(|| {
-        let written = option.arg.as_ref().map_or(String::new(), ToString::to_string);
+        let written = option
+            .arg
+            .as_ref()
+            .map_or(String::new(), ToString::to_string);
         unrecognized_value(name, &written)
     })
 }
@@ -232,7 +236,11 @@ fn option_flag(option: &ast::UtilityOption, name: &str) -> Result<bool, PgError>
             format!("{name} requires a Boolean value"),
         )
     };
-    match option_value(option).ok_or_else(invalid)?.to_ascii_lowercase().as_str() {
+    match option_value(option)
+        .ok_or_else(invalid)?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "on" | "true" | "1" => Ok(true),
         "off" | "false" | "0" => Ok(false),
         _ => Err(invalid()),

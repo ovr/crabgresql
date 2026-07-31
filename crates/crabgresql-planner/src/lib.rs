@@ -206,7 +206,10 @@ pub enum PhysicalJoinInput {
         projection: ColumnProjection,
     },
     Subplan(Box<PhysicalPlan>),
-    TableFunction { func: TableFn, args: Vec<BoundExpr> },
+    TableFunction {
+        func: TableFn,
+        args: Vec<BoundExpr>,
+    },
 }
 
 /// One equi-join key of a hash join: a pair of expressions, one addressing the
@@ -903,9 +906,7 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
         | BoundExpr::Reinterpret { expr, .. } => is_row_constant(expr),
         BoundExpr::Binary { left, right, .. } => is_row_constant(left) && is_row_constant(right),
         BoundExpr::ArrayCtor { elems, .. } => elems.iter().all(is_row_constant),
-        BoundExpr::Subscript { base, index, .. } => {
-            is_row_constant(base) && is_row_constant(index)
-        }
+        BoundExpr::Subscript { base, index, .. } => is_row_constant(base) && is_row_constant(index),
         BoundExpr::Case { whens, else_, .. } => {
             whens
                 .iter()
@@ -1058,9 +1059,7 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
         // property, numbering the specs in *evaluation* order — so the bottom
         // node of a chain is `w1`. Numbering here is by depth for the same
         // reason: `window_number` counts the `Window` nodes below this one.
-        PhysicalPlan::Window {
-            source, spec, ..
-        } => {
+        PhysicalPlan::Window { source, spec, .. } => {
             let mut lines = nest_under("WindowAgg", explain(source));
             let names = source_column_names(source);
             push_root_property(
@@ -1436,11 +1435,7 @@ mod tests {
         fn scan(&self, _txn: &TxnContext, _projection: &ColumnProjection) -> TupleStream {
             unimplemented!("planner tests never scan")
         }
-        fn fetch(
-            &self,
-            _tid: Tid,
-            _txn: &TxnContext,
-        ) -> Result<Option<Tuple>, StorageError> {
+        fn fetch(&self, _tid: Tid, _txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
             unimplemented!("planner tests never fetch")
         }
         fn insert(&self, _tuple: Tuple, _txn: &TxnContext) -> Result<Tid, StorageError> {
@@ -1454,11 +1449,7 @@ mod tests {
         ) -> Result<UpdateResult, StorageError> {
             unimplemented!("planner tests never update")
         }
-        fn delete(
-            &self,
-            _tid: Tid,
-            _txn: &TxnContext,
-        ) -> Result<DeleteResult, StorageError> {
+        fn delete(&self, _tid: Tid, _txn: &TxnContext) -> Result<DeleteResult, StorageError> {
             unimplemented!("planner tests never delete")
         }
     }
@@ -2580,15 +2571,18 @@ mod tests {
             asc: true,
             nulls_first: false,
         }];
-        assert_eq!(explain(&setop_plan(Vec::new(), distinct.clone()))[0..2], [
-            "HashAggregate".to_string(),
-            "  ->  Append".to_string()
-        ]);
-        assert_eq!(explain(&setop_plan(sort, distinct))[0..3], [
-            "Sort".to_string(),
-            "  ->  HashAggregate".to_string(),
-            "        ->  Append".to_string()
-        ]);
+        assert_eq!(
+            explain(&setop_plan(Vec::new(), distinct.clone()))[0..2],
+            ["HashAggregate".to_string(), "  ->  Append".to_string()]
+        );
+        assert_eq!(
+            explain(&setop_plan(sort, distinct))[0..3],
+            [
+                "Sort".to_string(),
+                "  ->  HashAggregate".to_string(),
+                "        ->  Append".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2763,7 +2757,11 @@ mod projection_tests {
             _ => panic!("expected a scan leaf"),
         };
         assert_eq!(leaf(*left), Some(vec![0, 1]), "left keeps its own indices");
-        assert_eq!(leaf(*right), Some(vec![1, 2]), "right rebases by left width");
+        assert_eq!(
+            leaf(*right),
+            Some(vec![1, 2]),
+            "right rebases by left width"
+        );
     }
 
     /// Demand threads down through a derived table: the inner `SELECT *`
@@ -2875,13 +2873,16 @@ mod projection_tests {
             "SELECT rank() OVER (ORDER BY name), \
              sum(big) OVER (PARTITION BY id ORDER BY name) FROM t",
         );
-        assert_eq!(explain(&plan), [
-            "WindowAgg".to_string(),
-            "  Window: w2 AS (ORDER BY name)".to_string(),
-            "  ->  WindowAgg".to_string(),
-            "        Window: w1 AS (PARTITION BY id ORDER BY name)".to_string(),
-            "        ->  Seq Scan on t".to_string(),
-        ]);
+        assert_eq!(
+            explain(&plan),
+            [
+                "WindowAgg".to_string(),
+                "  Window: w2 AS (ORDER BY name)".to_string(),
+                "  ->  WindowAgg".to_string(),
+                "        Window: w1 AS (PARTITION BY id ORDER BY name)".to_string(),
+                "        ->  Seq Scan on t".to_string(),
+            ]
+        );
     }
 
     /// A direction and NULL placement are printed only when they are not the
@@ -2927,7 +2928,10 @@ mod projection_tests {
         };
         let projection = |arm: &PhysicalSetOpArm| match &arm.plan {
             PhysicalPlan::Select { projection, .. } => cols(projection),
-            other => panic!("expected each arm to be a Select, got {}", explain(other)[0]),
+            other => panic!(
+                "expected each arm to be a Select, got {}",
+                explain(other)[0]
+            ),
         };
         assert_eq!(projection(&arms[0]), Some(vec![0]));
         assert_eq!(projection(&arms[1]), Some(vec![1]));

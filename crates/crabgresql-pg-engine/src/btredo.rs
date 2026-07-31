@@ -103,7 +103,11 @@ impl RmgrRedo for BtreeRedo {
                     })?;
                 }
             }
-            other => return Err(WalError::Redo(format!("unknown btree info byte {other:#x}"))),
+            other => {
+                return Err(WalError::Redo(format!(
+                    "unknown btree info byte {other:#x}"
+                )));
+            }
         }
         Ok(())
     }

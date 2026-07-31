@@ -117,7 +117,9 @@ pub fn decode_pointer(buf: &[u8], pos: &mut usize) -> Option<ToastPointer> {
     if bytes[0] != T_EXTERNAL || bytes[1] != FORMAT_PLAIN {
         return None;
     }
-    let u32_at = |off: usize| u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+    let u32_at = |off: usize| {
+        u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+    };
     let p = ToastPointer {
         rel: RelFileNode(u32_at(2)),
         first: Tid {
@@ -313,8 +315,15 @@ mod tests {
         ] {
             let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
             let got: Vec<&[u8]> = chunks_last_first(&bytes).collect();
-            assert_eq!(got.len(), len.div_ceil(TOAST_MAX_CHUNK), "chunk count for {len}");
-            assert!(got.iter().all(|c| !c.is_empty() && c.len() <= TOAST_MAX_CHUNK));
+            assert_eq!(
+                got.len(),
+                len.div_ceil(TOAST_MAX_CHUNK),
+                "chunk count for {len}"
+            );
+            assert!(
+                got.iter()
+                    .all(|c| !c.is_empty() && c.len() <= TOAST_MAX_CHUNK)
+            );
             // Reversing the walk reassembles the original.
             let rejoined: Vec<u8> = got.iter().rev().flat_map(|c| c.iter().copied()).collect();
             assert_eq!(rejoined, bytes, "chunks must reassemble in reverse order");
@@ -322,13 +331,20 @@ mod tests {
     }
 
     /// `plan` with the production thresholds.
-    fn plan_at(widths: &[usize], toastable: &[bool], base: usize) -> Result<Vec<usize>, StorageError> {
+    fn plan_at(
+        widths: &[usize],
+        toastable: &[bool],
+        base: usize,
+    ) -> Result<Vec<usize>, StorageError> {
         plan(widths, toastable, base, TOAST_TUPLE_TARGET, 8160)
     }
 
     #[test]
     fn a_tuple_within_the_target_is_left_alone() {
-        assert_eq!(plan_at(&[500, 500], &[true, true], 36).expect("fits"), Vec::<usize>::new());
+        assert_eq!(
+            plan_at(&[500, 500], &[true, true], 36).expect("fits"),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]
@@ -366,7 +382,10 @@ mod tests {
         // shred the row into 60 chunks for no benefit, and nothing is moved.
         let widths = vec![20usize; 120];
         let toastable = vec![true; 120];
-        assert_eq!(plan_at(&widths, &toastable, 36).expect("fits"), Vec::<usize>::new());
+        assert_eq!(
+            plan_at(&widths, &toastable, 36).expect("fits"),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]
@@ -378,11 +397,12 @@ mod tests {
         let toastable = vec![true; 100];
         let chosen = plan_at(&widths, &toastable, 36).expect("must not refuse a storable row");
         assert!(!chosen.is_empty());
-        let inline: usize = 36 + widths
-            .iter()
-            .enumerate()
-            .map(|(i, &w)| if chosen.contains(&i) { POINTER_LEN } else { w })
-            .sum::<usize>();
+        let inline: usize = 36
+            + widths
+                .iter()
+                .enumerate()
+                .map(|(i, &w)| if chosen.contains(&i) { POINTER_LEN } else { w })
+                .sum::<usize>();
         assert!(inline <= 8160, "the row must end up storable, got {inline}");
     }
 }

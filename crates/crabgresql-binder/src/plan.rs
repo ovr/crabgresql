@@ -11,19 +11,17 @@ use crabgresql_parser::ast::Spanned;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
-    Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog,
-    ViewDefinition,
+    Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
-    BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, OuterLevel, ParamCtx, Scope,
-    NamedWindows, VisibleColumn, VisibleLookup, WindowKind, WindowSortKey, bind_binary_op,
-    bind_column_default,
-    bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column, lookup_visible,
-    merge_types, normalize_ident, output_name, param_ctx_none, reject_agg_or_window,
-    reject_window, to_bool_operand, unify_value_column,
+    BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, NamedWindows, OuterLevel,
+    ParamCtx, Scope, VisibleColumn, VisibleLookup, WindowKind, WindowSortKey, bind_binary_op,
+    bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column,
+    lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none,
+    reject_agg_or_window, reject_window, to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -437,7 +435,9 @@ fn resolve_write_table(
         // "relation does not exist": crabgresql has no auto-updatable-view or
         // INSTEAD OF trigger support yet.
         if matches!(e, StorageError::TableNotFound(_))
-            && engine.resolve_view(schema.as_deref(), &table_name).is_some()
+            && engine
+                .resolve_view(schema.as_deref(), &table_name)
+                .is_some()
         {
             return non_updatable_view(verb, &table_name);
         }
@@ -523,7 +523,10 @@ fn partition_leaves(
             engine.resolve(Some(&namespace), &name).map_err(|e| {
                 BindError::new(
                     sqlstate::INTERNAL_ERROR,
-                    format!("partition \"{name}\" of \"{}\" is unreadable: {e}", parent.name),
+                    format!(
+                        "partition \"{name}\" of \"{}\" is unreadable: {e}",
+                        parent.name
+                    ),
                 )
             })
         })
@@ -793,8 +796,9 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         }
         // Outer references belong to an enclosing query, not this statement's
         // `$n` list; `substitute_outer` fills them per outer row at execution.
-        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::OuterColumnRef { .. } => {
-        }
+        BoundExpr::Const { .. }
+        | BoundExpr::ColumnRef { .. }
+        | BoundExpr::OuterColumnRef { .. } => {}
         BoundExpr::Unary { expr, .. } => subst_expr(expr, params),
         BoundExpr::Binary { left, right, .. } => {
             subst_expr(left, params);
@@ -1533,7 +1537,15 @@ fn bind_query_body(
     let inner = match query.body.as_ref() {
         ast::SetExpr::Select(select) => {
             reject_unsupported_select_clauses(select)?;
-            bind_select(engine, catalog, params, select, &query.order_by, ctes, outer_scope)
+            bind_select(
+                engine,
+                catalog,
+                params,
+                select,
+                &query.order_by,
+                ctes,
+                outer_scope,
+            )
         }
         ast::SetExpr::Values(values) => {
             bind_values_query(catalog, params, values, &query.order_by, outer_scope)
@@ -1825,7 +1837,9 @@ fn bind_set_tree(
         ast::SetExpr::Values(values) => {
             bind_values_query(catalog, params, values, &None, outer_scope)?
         }
-        ast::SetExpr::Table(table) => bind_table_query(engine, catalog, params, table, &None, ctes)?,
+        ast::SetExpr::Table(table) => {
+            bind_table_query(engine, catalog, params, table, &None, ctes)?
+        }
         ast::SetExpr::SetOperation {
             left,
             op,
@@ -1928,10 +1942,7 @@ fn unify_set_columns(
         let (collation, strength) = match derived.filter(|_| merged_ty.is_collatable()) {
             Some(d) => {
                 let default = crabgresql_types::collation::type_collation(merged_ty);
-                (
-                    (d.collation != default).then_some(d.collation),
-                    d.strength,
-                )
+                ((d.collation != default).then_some(d.collation), d.strength)
             }
             None => (None, crate::collation::Strength::None),
         };
@@ -1950,12 +1961,20 @@ fn unify_set_columns(
 /// so a set operation lets the other arms decide the column type, as PG does.
 /// NULL casts to anything, so adopting that type is always safe.
 fn is_null_literal_column(plan: &LogicalPlan, index: usize) -> bool {
-    let is_null_const = |e: &BoundExpr| matches!(e, BoundExpr::Const { value: Value::Null, .. });
+    let is_null_const = |e: &BoundExpr| {
+        matches!(
+            e,
+            BoundExpr::Const {
+                value: Value::Null,
+                ..
+            }
+        )
+    };
     match plan {
         // `SELECT NULL` / `VALUES (NULL)`: every row must be NULL in this column.
-        LogicalPlan::Values { rows, .. } => {
-            rows.iter().all(|row| row.get(index).is_some_and(is_null_const))
-        }
+        LogicalPlan::Values { rows, .. } => rows
+            .iter()
+            .all(|row| row.get(index).is_some_and(is_null_const)),
         LogicalPlan::Query { projections, .. }
         | LogicalPlan::Subquery { projections, .. }
         | LogicalPlan::TableFunction { projections, .. }
@@ -2248,7 +2267,15 @@ fn bind_select(
         source,
         relations,
         visible,
-    } = bind_from_clause(engine, catalog, params, &select.from, ctes, outer_scope, &windows)?;
+    } = bind_from_clause(
+        engine,
+        catalog,
+        params,
+        &select.from,
+        ctes,
+        outer_scope,
+        &windows,
+    )?;
     let scope = Scope::relations_with_visible(relations, visible, catalog, params)
         .with_subqueries(engine, ctes)
         .with_outer(outer_scope.to_vec())
@@ -2494,7 +2521,12 @@ fn bind_table_query(
     };
     if windows.is_empty() {
         return Ok(finish_single_select(
-            input, columns, projections, None, sort, None,
+            input,
+            columns,
+            projections,
+            None,
+            sort,
+            None,
         ));
     }
     // With a chain above, the block below it reproduces its input row unchanged
@@ -2620,7 +2652,10 @@ fn bind_view_query(
     let stmts = crabgresql_parser::parse(&view.sql).map_err(|e| {
         BindError::new(
             sqlstate::INTERNAL_ERROR,
-            format!("could not parse stored definition of view \"{}\": {e}", view.name),
+            format!(
+                "could not parse stored definition of view \"{}\": {e}",
+                view.name
+            ),
         )
     })?;
     let query = match stmts.as_slice() {
@@ -2628,11 +2663,21 @@ fn bind_view_query(
         _ => {
             return Err(BindError::new(
                 sqlstate::INTERNAL_ERROR,
-                format!("stored definition of view \"{}\" is not a single query", view.name),
+                format!(
+                    "stored definition of view \"{}\" is not a single query",
+                    view.name
+                ),
             ));
         }
     };
-    bind_query_scoped(engine, catalog, &param_ctx_none(), query, &CteEnv::new(), &[])
+    bind_query_scoped(
+        engine,
+        catalog,
+        &param_ctx_none(),
+        query,
+        &CteEnv::new(),
+        &[],
+    )
 }
 
 /// The output columns a view reference exposes: the stored column names (which
@@ -4033,10 +4078,7 @@ struct Aggregation {
 /// Bind a target list (a SELECT projection or a `RETURNING` list) against
 /// `scope`, expanding `*`/`t.*` and naming each output column by its alias or
 /// derived name. Shared by SELECT and RETURNING, which have identical shape.
-fn bind_target_list(
-    items: &[ast::SelectItem],
-    scope: &Scope,
-) -> Result<Returning, BindError> {
+fn bind_target_list(items: &[ast::SelectItem], scope: &Scope) -> Result<Returning, BindError> {
     let mut columns = Vec::new();
     let mut projections = Vec::new();
     for item in items {
@@ -4436,7 +4478,10 @@ fn rewrite_over_window(
                 }
             };
             group.funcs.push(BoundWindowFunc { kind, ret, slot });
-            Ok(BoundExpr::ColumnRef { index: slot, ty: ret })
+            Ok(BoundExpr::ColumnRef {
+                index: slot,
+                ty: ret,
+            })
         }
         // Leaves, and the subplan markers: a window inside a subquery body
         // belongs to that query level and is extracted when it is bound.
@@ -4716,9 +4761,9 @@ fn rewrite_over_aggregate(
                 ));
             }
             let index = group_exprs.len() + aggregates.len();
-            let collation = args
-                .first()
-                .map_or(DEFAULT_COLLATION_OID, |a| crate::collation::expr_collation(a).collation);
+            let collation = args.first().map_or(DEFAULT_COLLATION_OID, |a| {
+                crate::collation::expr_collation(a).collation
+            });
             aggregates.push(BoundAggregate {
                 func,
                 distinct,
@@ -4764,12 +4809,7 @@ fn rewrite_over_aggregate(
                     .into_iter()
                     .map(|key| {
                         Ok(WindowSortKey {
-                            expr: rewrite_over_aggregate(
-                                key.expr,
-                                group_exprs,
-                                aggregates,
-                                scope,
-                            )?,
+                            expr: rewrite_over_aggregate(key.expr, group_exprs, aggregates, scope)?,
                             ..key
                         })
                     })
@@ -4922,7 +4962,12 @@ fn rewrite_over_aggregate(
             Ok(BoundExpr::ArrayCtor { elem, ty, elems })
         }
         BoundExpr::Subscript { base, index, ty } => Ok(BoundExpr::Subscript {
-            base: Box::new(rewrite_over_aggregate(*base, group_exprs, aggregates, scope)?),
+            base: Box::new(rewrite_over_aggregate(
+                *base,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
             index: Box::new(rewrite_over_aggregate(
                 *index,
                 group_exprs,
@@ -4969,16 +5014,31 @@ fn rewrite_over_aggregate(
             Ok(BoundExpr::QuantifiedSubquery {
                 subplan,
                 all,
-                cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
+                cmp: Box::new(rewrite_over_aggregate(
+                    *cmp,
+                    group_exprs,
+                    aggregates,
+                    scope,
+                )?),
             })
         }
         // `x op ANY/ALL(array)` has no subplan; rewrite both operands so any
         // aggregate/group-key reference inside them is redirected to the
         // aggregate node's output row.
         BoundExpr::QuantifiedArray { array, all, cmp } => Ok(BoundExpr::QuantifiedArray {
-            array: Box::new(rewrite_over_aggregate(*array, group_exprs, aggregates, scope)?),
+            array: Box::new(rewrite_over_aggregate(
+                *array,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
             all,
-            cmp: Box::new(rewrite_over_aggregate(*cmp, group_exprs, aggregates, scope)?),
+            cmp: Box::new(rewrite_over_aggregate(
+                *cmp,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
         }),
     }
 }
@@ -5571,12 +5631,15 @@ fn resolve_copy_format(
                     format!("column \"{col}\" of relation \"{relname}\" does not exist"),
                 )
             })?;
-            let pos = target_indices.iter().position(|&i| i == sidx).ok_or_else(|| {
-                BindError::new(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    format!("FORCE_NOT_NULL column \"{col}\" not referenced by COPY"),
-                )
-            })?;
+            let pos = target_indices
+                .iter()
+                .position(|&i| i == sidx)
+                .ok_or_else(|| {
+                    BindError::new(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        format!("FORCE_NOT_NULL column \"{col}\" not referenced by COPY"),
+                    )
+                })?;
             out.push(pos);
         }
         Ok(out)
@@ -5722,7 +5785,8 @@ pub fn bind_update_with_params(
         )));
     }
 
-    let (table, qualifier) = open_write_relation(engine, &update.table.relation, WriteVerb::Update)?;
+    let (table, qualifier) =
+        open_write_relation(engine, &update.table.relation, WriteVerb::Update)?;
     let schema = table.schema().clone();
     let table_name = schema.name.clone();
     // A partitioned parent routes each updated row to a leaf (moving it across
@@ -6479,14 +6543,8 @@ mod tests {
         else {
             panic!("expected OR of two comparisons");
         };
-        assert!(matches!(
-            *left,
-            BoundExpr::Binary { op: BinOp::Lt, .. }
-        ));
-        assert!(matches!(
-            *right,
-            BoundExpr::Binary { op: BinOp::Gt, .. }
-        ));
+        assert!(matches!(*left, BoundExpr::Binary { op: BinOp::Lt, .. }));
+        assert!(matches!(*right, BoundExpr::Binary { op: BinOp::Gt, .. }));
 
         Ok(())
     }
@@ -6499,7 +6557,10 @@ mod tests {
         // undefined-column 42703 the high bound would otherwise raise.
         let e = bind_err("SELECT id FROM t WHERE id BETWEEN 'notint' AND missingcol");
         assert_eq!(e.code, "22P02");
-        assert_eq!(e.message, "invalid input syntax for type integer: \"notint\"");
+        assert_eq!(
+            e.message,
+            "invalid input syntax for type integer: \"notint\""
+        );
     }
 
     #[test]
@@ -6781,16 +6842,19 @@ mod tests {
             panic!("expected a Subquery wrapping the window chain");
         };
         // `t` is four columns wide, so the single window slot is index 4.
-        assert_eq!(projections, vec![
-            BoundExpr::ColumnRef {
-                index: 0,
-                ty: PgType::Int4
-            },
-            BoundExpr::ColumnRef {
-                index: 4,
-                ty: PgType::Int8
-            },
-        ]);
+        assert_eq!(
+            projections,
+            vec![
+                BoundExpr::ColumnRef {
+                    index: 0,
+                    ty: PgType::Int4
+                },
+                BoundExpr::ColumnRef {
+                    index: 4,
+                    ty: PgType::Int8
+                },
+            ]
+        );
         let LogicalPlan::Window {
             funcs,
             input_width,
@@ -6845,7 +6909,11 @@ mod tests {
         let LogicalPlan::Window { spec, .. } = *source else {
             panic!("expected a second Window below the first");
         };
-        assert_eq!(spec.partition_by.len(), 1, "the 2-key spec is at the bottom");
+        assert_eq!(
+            spec.partition_by.len(),
+            1,
+            "the 2-key spec is at the bottom"
+        );
     }
 
     /// Windows are extracted after aggregation, so by then the inner `sum(x)` is
@@ -6888,10 +6956,13 @@ mod tests {
         assert_eq!(projections.len(), 2, "plus one hidden sort column");
         assert_eq!(sort.len(), 1);
         assert_eq!(sort[0].column, 1, "the sort keys on the hidden column");
-        assert_eq!(projections[1], BoundExpr::ColumnRef {
-            index: 4,
-            ty: PgType::Int8
-        });
+        assert_eq!(
+            projections[1],
+            BoundExpr::ColumnRef {
+                index: 4,
+                ty: PgType::Int8
+            }
+        );
     }
 
     /// Every clause evaluated before windows are, plus the forms PG rejects
@@ -7067,7 +7138,10 @@ mod tests {
         ] {
             let error = bind_err(sql);
             assert_eq!(error.code, "0A000", "for: {sql}");
-            assert_eq!(error.message, "explicit window frames are not supported yet");
+            assert_eq!(
+                error.message,
+                "explicit window frames are not supported yet"
+            );
         }
     }
 
@@ -7082,7 +7156,10 @@ mod tests {
             "SELECT sum(big) OVER (ORDER BY id \
              RANGE UNBOUNDED PRECEDING EXCLUDE NO OTHERS) FROM t",
         ] {
-            assert!(matches!(bound(sql), LogicalPlan::Subquery { .. }), "for: {sql}");
+            assert!(
+                matches!(bound(sql), LogicalPlan::Subquery { .. }),
+                "for: {sql}"
+            );
         }
     }
 
@@ -7305,19 +7382,32 @@ mod tests {
     fn first_subplan(sql: &str) -> LogicalPlan {
         fn find(exprs: &[BoundExpr]) -> Option<LogicalPlan> {
             exprs.iter().find_map(|e| match e {
-                BoundExpr::ScalarSubquery { subplan, .. }
-                | BoundExpr::Exists { subplan, .. } => Some((*subplan.0).clone()),
+                BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
+                    Some((*subplan.0).clone())
+                }
                 _ => None,
             })
         }
         let plan = bound(sql);
-        let (LogicalPlan::Query { projections, predicate, .. }
-        | LogicalPlan::Subquery { projections, predicate, .. }) = &plan
+        let (LogicalPlan::Query {
+            projections,
+            predicate,
+            ..
+        }
+        | LogicalPlan::Subquery {
+            projections,
+            predicate,
+            ..
+        }) = &plan
         else {
             panic!("expected a Query or Subquery for `{sql}`");
         };
         find(projections)
-            .or_else(|| predicate.as_ref().and_then(|p| find(std::slice::from_ref(p))))
+            .or_else(|| {
+                predicate
+                    .as_ref()
+                    .and_then(|p| find(std::slice::from_ref(p)))
+            })
             .unwrap_or_else(|| panic!("no expression subquery in `{sql}`"))
     }
 
@@ -7330,8 +7420,7 @@ mod tests {
     /// internal "was not substituted" error at execution.
     #[test]
     fn a_correlated_reference_below_a_window_chain_is_substituted() {
-        let mut plan =
-            first_subplan("SELECT id, (SELECT sum(big + t.id) OVER () FROM t u) FROM t");
+        let mut plan = first_subplan("SELECT id, (SELECT sum(big + t.id) OVER () FROM t u) FROM t");
         assert!(plan_has_outer_refs(&plan), "the subplan starts correlated");
         substitute_outer(&mut plan, &[Value::Int4(7)]);
         assert!(
@@ -7377,10 +7466,13 @@ mod tests {
         let LogicalPlan::Window { spec, .. } = *source else {
             panic!("expected a Window");
         };
-        assert_eq!(spec.partition_by, vec![BoundExpr::Const {
-            value: Value::Int4(7),
-            ty: PgType::Int4
-        }]);
+        assert_eq!(
+            spec.partition_by,
+            vec![BoundExpr::Const {
+                value: Value::Int4(7),
+                ty: PgType::Int4
+            }]
+        );
         Ok(())
     }
 
@@ -7411,9 +7503,15 @@ mod tests {
     #[test]
     fn insert_select_arity_mismatches_match_pg() {
         let too_many = bind_err("INSERT INTO t (id) SELECT id, name FROM t");
-        assert_eq!(too_many.message, "INSERT has more expressions than target columns");
+        assert_eq!(
+            too_many.message,
+            "INSERT has more expressions than target columns"
+        );
         let too_few = bind_err("INSERT INTO t (id, name) SELECT id FROM t");
-        assert_eq!(too_few.message, "INSERT has more target columns than expressions");
+        assert_eq!(
+            too_few.message,
+            "INSERT has more target columns than expressions"
+        );
     }
 
     #[test]
@@ -7453,9 +7551,10 @@ mod tests {
         // quoting, exactly as `SELECT * FROM "MixedCase"` does; an unquoted name
         // folds to lower case and does not resolve (matching PostgreSQL).
         let engine = crabgresql_pg_engine::ephemeral_engine();
-        if let Err(error) =
-            engine.create_table(TableSchema::new("MixedCase", vec![Column::new("id", PgType::Int4)]))
-        {
+        if let Err(error) = engine.create_table(TableSchema::new(
+            "MixedCase",
+            vec![Column::new("id", PgType::Int4)],
+        )) {
             panic!("failed to create test table: {error}");
         }
         let engine: Arc<dyn TableEngine> = engine;
@@ -8220,7 +8319,13 @@ mod tests {
             panic!("expected QuantifiedSubquery predicate");
         };
         assert!(all);
-        assert!(matches!(*cmp, BoundExpr::Binary { op: BinOp::NotEq, .. }));
+        assert!(matches!(
+            *cmp,
+            BoundExpr::Binary {
+                op: BinOp::NotEq,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -9515,7 +9620,14 @@ mod tests {
     }
 
     /// The arms of a bound set operation, panicking if it is not one.
-    fn setop_of(sql: &str) -> (Vec<SetOpArm>, Vec<OutputColumn>, Vec<SortKey>, Option<Vec<DistinctKey>>) {
+    fn setop_of(
+        sql: &str,
+    ) -> (
+        Vec<SetOpArm>,
+        Vec<OutputColumn>,
+        Vec<SortKey>,
+        Option<Vec<DistinctKey>>,
+    ) {
         match bound(sql) {
             LogicalPlan::SetOp {
                 arms,
@@ -9601,9 +9713,8 @@ mod tests {
     fn equivalent_union_chain_flattens_into_one_node() {
         // `a UNION b UNION c` is one three-armed node with a single dedup, not
         // nested pairs that would deduplicate at every level.
-        let (arms, _, sort, distinct) = setop_of(
-            "SELECT id FROM t UNION SELECT id FROM t UNION SELECT id FROM t ORDER BY 1",
-        );
+        let (arms, _, sort, distinct) =
+            setop_of("SELECT id FROM t UNION SELECT id FROM t UNION SELECT id FROM t ORDER BY 1");
         assert_eq!(arms.len(), 3);
         assert!(arms.iter().all(|a| plan_name(&a.plan) == "Query"));
         assert!(distinct.is_some());
@@ -9614,9 +9725,8 @@ mod tests {
     fn union_all_over_a_distinct_arm_keeps_the_inner_dedup() {
         // Flattening must not absorb a DISTINCT child into an ALL parent: the
         // inner deduplication happens first and would otherwise be lost.
-        let (arms, _, _, distinct) = setop_of(
-            "(SELECT id FROM t UNION SELECT id FROM t) UNION ALL SELECT id FROM t",
-        );
+        let (arms, _, _, distinct) =
+            setop_of("(SELECT id FROM t UNION SELECT id FROM t) UNION ALL SELECT id FROM t");
         assert!(distinct.is_none(), "the outer UNION ALL keeps duplicates");
         assert_eq!(arms.len(), 2);
         assert_eq!(
@@ -9685,7 +9795,10 @@ mod tests {
     fn union_order_by_expression_is_42p10() {
         let err = bind_err("SELECT id FROM t UNION SELECT id FROM t ORDER BY id + 1");
         assert_eq!(err.code, sqlstate::INVALID_COLUMN_REFERENCE);
-        assert_eq!(err.message, "invalid UNION/INTERSECT/EXCEPT ORDER BY clause");
+        assert_eq!(
+            err.message,
+            "invalid UNION/INTERSECT/EXCEPT ORDER BY clause"
+        );
         assert!(err.hint.is_some(), "PG hints at result column names");
     }
 

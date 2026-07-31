@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{
-    BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, DistinctKey, JoinKind, LogicalPlan,
-    Returning, SortKey, TableFn, WindowFn, WindowKind,
+    BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, DistinctKey, JoinKind,
+    LogicalPlan, Returning, SortKey, TableFn, WindowFn, WindowKind,
 };
 use crabgresql_planner::{
     HashKey, PhysicalAggInput, PhysicalInsertSource, PhysicalJoinExpr, PhysicalJoinInput,
@@ -463,7 +463,10 @@ pub fn execute(
             let mut children: Vec<Box<dyn ExecNode>> = Vec::with_capacity(arms.len());
             for arm in arms {
                 let Execution::Rows { node, .. } = execute(arm.plan, ctx, txn)? else {
-                    return Err(ExecError::new("XX000", "UNION arm did not produce a row set"));
+                    return Err(ExecError::new(
+                        "XX000",
+                        "UNION arm did not produce a row set",
+                    ));
                 };
                 children.push(match arm.coercion {
                     Some(projections) => Box::new(Projection::new(node, projections, ctx.clone())),
@@ -631,7 +634,15 @@ pub fn execute(
             assignments,
             returning,
             routing,
-        } => execute_update(&table, &predicate, &assignments, returning, routing, ctx, txn),
+        } => execute_update(
+            &table,
+            &predicate,
+            &assignments,
+            returning,
+            routing,
+            ctx,
+            txn,
+        ),
         PhysicalPlan::Delete {
             table,
             predicate,
@@ -871,7 +882,11 @@ fn resolve_join(
 
 /// Recurse an expression tree, resolving nested subqueries bottom-up, then fold
 /// this node if it is itself a subquery marker.
-fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Result<(), ExecError> {
+fn resolve_expr(
+    expr: &mut BoundExpr,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<(), ExecError> {
     match expr {
         BoundExpr::Const { .. }
         | BoundExpr::ColumnRef { .. }
@@ -922,9 +937,7 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
         }
         // The IN / ANY / ALL needle (in `cmp`) may itself hold a subquery; fold
         // those first.
-        BoundExpr::QuantifiedSubquery { cmp, .. } => {
-            resolve_expr(cmp, ctx, txn)?
-        }
+        BoundExpr::QuantifiedSubquery { cmp, .. } => resolve_expr(cmp, ctx, txn)?,
         // `x op ANY/ALL(array)` is an ordinary expression, not a foldable marker;
         // recurse into both operands so any nested subqueries fold.
         BoundExpr::QuantifiedArray { array, cmp, .. } => {
@@ -1439,7 +1452,12 @@ fn project_returning<'a>(
 ) -> Result<Vec<Tuple>, ExecError> {
     affected
         .into_iter()
-        .map(|row| projections.iter().map(|expr| eval(expr, row, ctx)).collect())
+        .map(|row| {
+            projections
+                .iter()
+                .map(|expr| eval(expr, row, ctx))
+                .collect()
+        })
         .collect()
 }
 
@@ -1687,9 +1705,7 @@ fn execute_update(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     match routing {
-        Some(leaves) => {
-            update_routed(table, &leaves, predicate, assignments, returning, ctx, txn)
-        }
+        Some(leaves) => update_routed(table, &leaves, predicate, assignments, returning, ctx, txn),
         None => update_direct(table, predicate, assignments, returning, ctx, txn),
     }
 }
@@ -1756,8 +1772,11 @@ fn update_direct(
     // statement before any row is written.
     match returning {
         Some(returning) => {
-            let output =
-                project_returning(pending.iter().map(|(_, new)| new), &returning.projections, ctx)?;
+            let output = project_returning(
+                pending.iter().map(|(_, new)| new),
+                &returning.projections,
+                ctx,
+            )?;
             table.update_many(pending, txn)?;
             Ok(returning_rows(output, returning.columns, DmlVerb::Update))
         }
@@ -1912,7 +1931,11 @@ fn update_routed(
     // Project RETURNING over every NEW row before any write, so a faulting
     // expression aborts the statement with nothing written.
     let output = match &returning {
-        Some(returning) => Some(project_returning(new_rows.iter(), &returning.projections, ctx)?),
+        Some(returning) => Some(project_returning(
+            new_rows.iter(),
+            &returning.projections,
+            ctx,
+        )?),
         None => None,
     };
     // Apply per leaf. A moved row is counted once (via its source-leaf delete);
@@ -2307,9 +2330,7 @@ impl TableFunctionSource {
                 TableFn::GenerateSeries(elem) => {
                     TableFnState::Series(Series::from_args(elem, &values)?)
                 }
-                TableFn::JsonbPathQuery => {
-                    TableFnState::Series(jsonb_path_query_series(&values)?)
-                }
+                TableFn::JsonbPathQuery => TableFnState::Series(jsonb_path_query_series(&values)?),
                 TableFn::Unnest(_) => TableFnState::Series(unnest_series(&values)),
             });
         }
@@ -2958,8 +2979,7 @@ impl Distinct {
             let key: Vec<Value> = keys.iter().map(|k| row[k.column].clone()).collect();
             let bucket = lookup.entry(agg::hash_key(&key_tys, &key)).or_default();
             let seen = bucket.iter().copied().any(|i| {
-                let existing: Vec<Value> =
-                    keys.iter().map(|k| out[i][k.column].clone()).collect();
+                let existing: Vec<Value> = keys.iter().map(|k| out[i][k.column].clone()).collect();
                 agg::keys_equal(&key_tys, &existing, &key)
             });
             if !seen {
@@ -3211,7 +3231,11 @@ impl WindowAgg {
             });
         }
         for row in &mut rows {
-            for expr in spec.partition_by.iter().chain(spec.order_by.iter().map(|k| &k.expr)) {
+            for expr in spec
+                .partition_by
+                .iter()
+                .chain(spec.order_by.iter().map(|k| &k.expr))
+            {
                 let value = eval(expr, row, ctx)?;
                 row.push(value);
             }
@@ -3396,11 +3420,7 @@ pub struct SeqScan {
 }
 
 impl SeqScan {
-    pub fn new(
-        table: &Arc<dyn TableAm>,
-        txn: &TxnContext,
-        projection: &ColumnProjection,
-    ) -> Self {
+    pub fn new(table: &Arc<dyn TableAm>, txn: &TxnContext, projection: &ColumnProjection) -> Self {
         Self {
             iter: Box::new(
                 table
@@ -3526,18 +3546,20 @@ impl IndexScan {
                         .collect();
                     // The planner folds every key column into `projection`
                     // precisely so this re-check can read them.
-                    Box::new(table.scan(txn, projection).filter_map(move |row| match row {
-                        Ok((_, tuple)) => cols
-                            .iter()
-                            .zip(&key_values)
-                            .all(|(&(column, ty), want)| {
-                                let cell = &tuple[column];
-                                !matches!(cell, Value::Null)
-                                    && !matches!(want, Value::Null)
-                                    && compare_values(ty, cell, want) == Ordering::Equal
-                            })
-                            .then_some(Ok(tuple)),
-                        Err(error) => Some(Err(error)),
+                    Box::new(table.scan(txn, projection).filter_map(move |row| {
+                        match row {
+                            Ok((_, tuple)) => cols
+                                .iter()
+                                .zip(&key_values)
+                                .all(|(&(column, ty), want)| {
+                                    let cell = &tuple[column];
+                                    !matches!(cell, Value::Null)
+                                        && !matches!(want, Value::Null)
+                                        && compare_values(ty, cell, want) == Ordering::Equal
+                                })
+                                .then_some(Ok(tuple)),
+                            Err(error) => Some(Err(error)),
+                        }
                     }))
                 }
             };
@@ -4501,11 +4523,7 @@ mod tests {
         assert_eq!(n, 3);
         let ids: Vec<Value> = table
             .scan(&rtxn(), &ColumnProjection::All)
-            .map(|row| {
-                row.unwrap_or_else(|error| panic!("scan failed: {error}"))
-                    .1[0]
-                    .clone()
-            })
+            .map(|row| row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0].clone())
             .collect();
         assert_eq!(ids, vec![Value::Int4(2), Value::Int4(3), Value::Int4(4)]);
 
@@ -4550,11 +4568,7 @@ mod tests {
         assert_eq!(e.code, "22012");
         let ids: Vec<Value> = table
             .scan(&rtxn(), &ColumnProjection::All)
-            .map(|row| {
-                row.unwrap_or_else(|error| panic!("scan failed: {error}"))
-                    .1[0]
-                    .clone()
-            })
+            .map(|row| row.unwrap_or_else(|error| panic!("scan failed: {error}")).1[0].clone())
             .collect();
         assert_eq!(ids, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
     }
@@ -4910,7 +4924,11 @@ mod tests {
         // keep that column through the sort (not trim to the visible width) so
         // Distinct can read it. Regression: previously truncated → out-of-bounds.
         let (columns, rows) = run_rows("SELECT DISTINCT ON (1 + 1) 5 ORDER BY 1 + 1");
-        assert_eq!(columns.len(), 1, "the hidden ON column never reaches output");
+        assert_eq!(
+            columns.len(),
+            1,
+            "the hidden ON column never reaches output"
+        );
         assert_eq!(rows, vec![vec![Value::Int4(5)]]);
     }
 
@@ -5527,7 +5545,8 @@ mod tests {
     #[test]
     fn aggregate_over_set_returning_function() {
         // count/sum over generate_series() as a FROM set-returning function.
-        let (_c, rows) = run_rows("SELECT count(*), sum(generate_series) FROM generate_series(1, 3)");
+        let (_c, rows) =
+            run_rows("SELECT count(*), sum(generate_series) FROM generate_series(1, 3)");
         assert_eq!(rows, vec![vec![Value::Int8(3), Value::Int8(6)]]);
     }
 

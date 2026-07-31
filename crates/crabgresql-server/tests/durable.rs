@@ -155,7 +155,11 @@ async fn a_committed_parquet_insert_is_durable_before_any_file_exists() -> anyho
 
         // Flushing again has nothing left to move.
         client.simple_query("VACUUM events").await?;
-        assert_eq!(parquet_files().len(), 1, "an empty flush must write no file");
+        assert_eq!(
+            parquet_files().len(),
+            1,
+            "an empty flush must write no file"
+        );
         shutdown(client, handle).await;
     }
 
@@ -194,7 +198,9 @@ async fn buffer_table_rows_survive_a_restart_through_the_wal_alone() -> anyhow::
             .simple_query("INSERT INTO staging VALUES (1, 'committed'), (2, 'also committed')")
             .await?;
         // A committed delete must stay deleted across the restart.
-        client.simple_query("DELETE FROM staging WHERE id = 2").await?;
+        client
+            .simple_query("DELETE FROM staging WHERE id = 2")
+            .await?;
         client.simple_query("BEGIN").await?;
         client
             .simple_query("INSERT INTO staging VALUES (3, 'rolled back')")
@@ -210,7 +216,11 @@ async fn buffer_table_rows_survive_a_restart_through_the_wal_alone() -> anyhow::
             .simple_query("SELECT id, label FROM staging ORDER BY id")
             .await?;
         let result = rows(&messages);
-        assert_eq!(result.len(), 1, "only the committed, undeleted row may return");
+        assert_eq!(
+            result.len(),
+            1,
+            "only the committed, undeleted row may return"
+        );
         assert_eq!(
             (result[0].get(0), result[0].get(1)),
             (Some("1"), Some("committed"))
@@ -256,11 +266,16 @@ async fn index_scan_over_the_wire_and_survives_restart() -> anyhow::Result<()> {
             .simple_query("CREATE TABLE t (id int, label text)")
             .await?;
         // Enough rows to exercise a multi-page tree after CREATE INDEX.
-        let values: String = (1..=500).map(|i| format!("({i},'r{i}')")).collect::<Vec<_>>().join(",");
+        let values: String = (1..=500)
+            .map(|i| format!("({i},'r{i}')"))
+            .collect::<Vec<_>>()
+            .join(",");
         client
             .simple_query(&format!("INSERT INTO t VALUES {values}"))
             .await?;
-        client.simple_query("CREATE INDEX t_id_idx ON t(id)").await?;
+        client
+            .simple_query("CREATE INDEX t_id_idx ON t(id)")
+            .await?;
 
         // EXPLAIN now plans an Index Scan on the durable engine (it did a Seq Scan
         // before physical B-trees).
@@ -272,7 +287,10 @@ async fn index_scan_over_the_wire_and_survives_restart() -> anyhow::Result<()> {
             .filter_map(|r| r.get(0).map(str::to_string))
             .collect();
         assert_eq!(lines[0], "Index Scan using t_id_idx on t");
-        assert!(lines.iter().any(|l| l.contains("Index Cond: (id = 250)")), "plan: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("Index Cond: (id = 250)")),
+            "plan: {lines:?}"
+        );
 
         // The index scan returns the correct row.
         let msgs = client
@@ -506,7 +524,10 @@ async fn truncate_rolled_back_across_a_restart_keeps_rows() {
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        client.simple_query("CREATE TABLE t (id int)").await.unwrap();
+        client
+            .simple_query("CREATE TABLE t (id int)")
+            .await
+            .unwrap();
         client
             .simple_query("INSERT INTO t VALUES (1), (2), (3)")
             .await
@@ -519,7 +540,10 @@ async fn truncate_rolled_back_across_a_restart_keeps_rows() {
         assert_eq!(rows(&msgs).len(), 0);
         client.simple_query("ROLLBACK").await.unwrap();
         // After rollback the rows are back.
-        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await.unwrap();
+        let msgs = client
+            .simple_query("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
         assert_eq!(rows(&msgs).len(), 3);
         shutdown(client, handle).await;
     }
@@ -527,7 +551,10 @@ async fn truncate_rolled_back_across_a_restart_keeps_rows() {
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await.unwrap();
+        let msgs = client
+            .simple_query("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
         let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
         assert_eq!(got, vec![Some("1"), Some("2"), Some("3")]);
         shutdown(client, handle).await;
@@ -540,18 +567,30 @@ async fn truncate_committed_across_a_restart_stays_empty() {
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        client.simple_query("CREATE TABLE t (id int)").await.unwrap();
-        client.simple_query("INSERT INTO t VALUES (1), (2)").await.unwrap();
+        client
+            .simple_query("CREATE TABLE t (id int)")
+            .await
+            .unwrap();
+        client
+            .simple_query("INSERT INTO t VALUES (1), (2)")
+            .await
+            .unwrap();
         client.simple_query("BEGIN").await.unwrap();
         client.simple_query("TRUNCATE t").await.unwrap();
         client.simple_query("COMMIT").await.unwrap();
-        client.simple_query("INSERT INTO t VALUES (9)").await.unwrap();
+        client
+            .simple_query("INSERT INTO t VALUES (9)")
+            .await
+            .unwrap();
         shutdown(client, handle).await;
     }
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await.unwrap();
+        let msgs = client
+            .simple_query("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
         let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
         assert_eq!(got, vec![Some("9")]);
         shutdown(client, handle).await;
@@ -640,8 +679,14 @@ async fn dropped_table_stays_dropped_across_a_restart() {
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        client.simple_query("CREATE TABLE t (id int)").await.unwrap();
-        client.simple_query("INSERT INTO t VALUES (1), (2)").await.unwrap();
+        client
+            .simple_query("CREATE TABLE t (id int)")
+            .await
+            .unwrap();
+        client
+            .simple_query("INSERT INTO t VALUES (1), (2)")
+            .await
+            .unwrap();
         client.simple_query("DROP TABLE t").await.unwrap();
         shutdown(client, handle).await;
     }
@@ -652,10 +697,20 @@ async fn dropped_table_stays_dropped_across_a_restart() {
         let err = client.simple_query("SELECT id FROM t").await.unwrap_err();
         let db = err.as_db_error().expect("expected a database error");
         assert_eq!(db.code(), &tokio_postgres::error::SqlState::UNDEFINED_TABLE);
-        assert!(db.message().contains("does not exist"), "got: {}", db.message());
+        assert!(
+            db.message().contains("does not exist"),
+            "got: {}",
+            db.message()
+        );
         // ...and a new table gets a fresh relfilenode with no data-file collision.
-        client.simple_query("CREATE TABLE t2 (id int)").await.unwrap();
-        client.simple_query("INSERT INTO t2 VALUES (7)").await.unwrap();
+        client
+            .simple_query("CREATE TABLE t2 (id int)")
+            .await
+            .unwrap();
+        client
+            .simple_query("INSERT INTO t2 VALUES (7)")
+            .await
+            .unwrap();
         let msgs = client.simple_query("SELECT id FROM t2").await.unwrap();
         let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
         assert_eq!(got, vec![Some("7")]);
@@ -680,8 +735,11 @@ async fn schema_and_qualified_table_survive_restart() -> anyhow::Result<()> {
         client
             .simple_query("INSERT INTO app.item VALUES (1, 'a'), (2, 'b')")
             .await?;
-        let oid = rows(&client.simple_query("SELECT oid FROM pg_namespace WHERE nspname = 'app'").await?)
-            [0]
+        let oid = rows(
+            &client
+                .simple_query("SELECT oid FROM pg_namespace WHERE nspname = 'app'")
+                .await?,
+        )[0]
         .get(0)
         .map(str::to_string);
         shutdown(client, handle).await;
@@ -880,8 +938,7 @@ async fn analyze_statistics_are_nontransactional_and_survive_restart() -> anyhow
     let reltuples = |messages: &[SimpleQueryMessage]| -> Option<String> {
         rows(messages).first()?.get(0).map(str::to_string)
     };
-    const SIZE: &str =
-        "SELECT reltuples::int FROM pg_class WHERE relname = 'meas'";
+    const SIZE: &str = "SELECT reltuples::int FROM pg_class WHERE relname = 'meas'";
 
     {
         let (port, handle) = spawn_pg(dir.path()).await;

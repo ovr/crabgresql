@@ -840,9 +840,8 @@ fn point_on_path_boundary(q: &[f64; 2], p: &PathVal) -> bool {
 fn point_inside(q: &[f64; 2], pts: &[[f64; 2]]) -> bool {
     let n = pts.len();
     // `is_left > 0` when `q` lies left of the directed edge a -> b.
-    let is_left = |a: &[f64; 2], b: &[f64; 2]| {
-        (b[0] - a[0]) * (q[1] - a[1]) - (q[0] - a[0]) * (b[1] - a[1])
-    };
+    let is_left =
+        |a: &[f64; 2], b: &[f64; 2]| (b[0] - a[0]) * (q[1] - a[1]) - (q[0] - a[0]) * (b[1] - a[1]);
     let mut wn = 0i64;
     for i in 0..n {
         let a = &pts[i];
@@ -921,9 +920,7 @@ fn box_normalize(mut b: [f64; 4]) -> [f64; 4] {
 /// rejected, and the corners are normalized on input.
 pub fn parse_box(orig: &str) -> Result<[f64; 4], GeoError> {
     let (_open, pts) = path_decode(orig, false, 2, true, "box")?;
-    Ok(box_normalize([
-        pts[0][0], pts[0][1], pts[1][0], pts[1][1],
-    ]))
+    Ok(box_normalize([pts[0][0], pts[0][1], pts[1][0], pts[1][1]]))
 }
 
 /// Format a `box` as `(hx,hy),(lx,ly)` — note PG prints no grouping parens.
@@ -1522,12 +1519,7 @@ pub fn close_line_lseg(l: &[f64; 3], s: &[f64; 4]) -> Option<[f64; 2]> {
 /// `line ?# box`: the line passes through the box. True unless all four corners
 /// sit strictly on the same side of it.
 pub fn line_intersects_box(l: &[f64; 3], b: &[f64; 4]) -> bool {
-    let corners = [
-        [b[0], b[1]],
-        [b[0], b[3]],
-        [b[2], b[1]],
-        [b[2], b[3]],
-    ];
+    let corners = [[b[0], b[1]], [b[0], b[3]], [b[2], b[1]], [b[2], b[3]]];
     let norm = line_norm(l);
     let mut neg = false;
     let mut pos = false;
@@ -1873,9 +1865,7 @@ pub fn path_to_polygon(p: &PathVal) -> Result<PolygonVal, GeoError> {
             message: "open path cannot be converted to polygon".to_string(),
         });
     }
-    Ok(PolygonVal {
-        pts: p.pts.clone(),
-    })
+    Ok(PolygonVal { pts: p.pts.clone() })
 }
 
 /// `~=` same as: the same vertices in the same order.
@@ -1895,8 +1885,7 @@ pub fn poly_overlap(a: &PolygonVal, b: &PolygonVal) -> bool {
     if !box_overlap(&poly_bbox(a), &poly_bbox(b)) {
         return false;
     }
-    if a
-        .edges()
+    if a.edges()
         .any(|e1| b.edges().any(|e2| lseg_interpt(&e1, &e2).is_some()))
     {
         return true;
@@ -2173,7 +2162,12 @@ mod tests {
     /// `path` but accepted for `lseg` — the two types genuinely differ here.
     #[test]
     fn trailing_separator_differs_between_path_and_lseg() -> anyhow::Result<()> {
-        for lenient in ["[(1,2),(3,4),]", "((1,2),(3,4),)", "(1,2,3,4,)", "[1,2,3,4,]"] {
+        for lenient in [
+            "[(1,2),(3,4),]",
+            "((1,2),(3,4),)",
+            "(1,2,3,4,)",
+            "[1,2,3,4,]",
+        ] {
             assert_eq!(parse_lseg(lenient)?, [1.0, 2.0, 3.0, 4.0], "{lenient}");
             assert_eq!(
                 parse_path(lenient).unwrap_err().sqlstate,
@@ -2254,7 +2248,10 @@ mod tests {
         assert_eq!(format_path(&path_pclose(&open), 0), "((1,2),(3,4))");
         assert_eq!(format_path(&path_popen(&closed), 0), "[(1,2),(3,4)]");
         // A single-point path converts both ways too.
-        assert_eq!(format_path(&path_popen(&parse_path("((10,20))")?), 0), "[(10,20)]");
+        assert_eq!(
+            format_path(&path_popen(&parse_path("((10,20))")?), 0),
+            "[(10,20)]"
+        );
         assert_eq!(path_npoints(&parse_path("[(0,0),(3,0),(4,5),(1,6)]")?), 4);
 
         Ok(())
@@ -2423,7 +2420,10 @@ mod tests {
         }
         // The swap is per coordinate, so a "mixed" corner pair normalizes too.
         assert_eq!(parse_box("(0,2,2,0)")?, [2.0, 2.0, 0.0, 0.0]);
-        assert_eq!(parse_box(" ( ( 1 , 2 ) , ( 3 , 4 ) ) ")?, [3.0, 4.0, 1.0, 2.0]);
+        assert_eq!(
+            parse_box(" ( ( 1 , 2 ) , ( 3 , 4 ) ) ")?,
+            [3.0, 4.0, 1.0, 2.0]
+        );
         // Unlike `lseg`, a trailing separator is tolerated but `[...]` is not.
         assert_eq!(parse_box("(1,2),(3,4),")?, [3.0, 4.0, 1.0, 2.0]);
         assert_eq!(format_box(&[3.0, 4.0, 1.0, 2.0], 0), "(3,4),(1,2)");
@@ -2432,10 +2432,19 @@ mod tests {
 
     #[test]
     fn box_bad_input() {
-        for s in ["[1, 2, 3, 4)", "(1, 2, 3, 4]", "(2.3, 4.5)", "(1, 2, 3, 4) x", "asdfasdf(ad"] {
+        for s in [
+            "[1, 2, 3, 4)",
+            "(1, 2, 3, 4]",
+            "(2.3, 4.5)",
+            "(1, 2, 3, 4) x",
+            "asdfasdf(ad",
+        ] {
             let e = parse_box(s).expect_err(s);
             assert_eq!(e.sqlstate, "22P02", "{s}");
-            assert_eq!(e.message, format!("invalid input syntax for type box: \"{s}\""));
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type box: \"{s}\"")
+            );
         }
     }
 
@@ -2448,7 +2457,10 @@ mod tests {
         assert_eq!(box_center(&b), [1.0, 1.5]);
         // `diagonal` / `::lseg` run high corner to low corner.
         assert_eq!(box_diagonal(&b), [2.0, 3.0, 0.0, 0.0]);
-        assert_eq!(bound_box(&parse_box("(0,0,1,1)")?, &parse_box("(5,5,6,6)")?), [6.0, 6.0, 0.0, 0.0]);
+        assert_eq!(
+            bound_box(&parse_box("(0,0,1,1)")?, &parse_box("(5,5,6,6)")?),
+            [6.0, 6.0, 0.0, 0.0]
+        );
         // The circumscribed circle, and back to the inscribed box.
         let c = box_to_circle(&parse_box("(0,0,2,2)")?);
         assert_eq!(c[0..2], [1.0, 1.0]);
@@ -2474,7 +2486,10 @@ mod tests {
         assert_eq!(box_intersect(&a, &parse_box("(5,5,6,6)")?), None);
         // `=` is by *area*, so two differently placed boxes can compare equal.
         assert_eq!(box_area_cmp(&a, &b), Some(std::cmp::Ordering::Equal));
-        assert_eq!(box_area_cmp(&a, &parse_box("(0,0,3,3)")?), Some(std::cmp::Ordering::Less));
+        assert_eq!(
+            box_area_cmp(&a, &parse_box("(0,0,3,3)")?),
+            Some(std::cmp::Ordering::Less)
+        );
         assert!(box_below_eq(&a, &parse_box("(0,5,2,7)")?));
         assert!(box_contain_pt(&a, &[1.0, 1.0]) && !box_contain_pt(&a, &[5.0, 5.0]));
         // `box <-> box` is measured **center to center**, not outline to outline.
@@ -2495,13 +2510,28 @@ mod tests {
         // When the segment meets the box, `##` reports the point of the
         // *segment* nearest the box center — including when it is clamped to an
         // endpoint.
-        assert_eq!(close_lseg_box(&parse_lseg("[(1,1),(2,2)]")?, &b), [2.0, 2.0]);
-        assert_eq!(close_lseg_box(&parse_lseg("[(9,3),(9.5,3.5)]")?, &b), [9.0, 3.0]);
-        assert_eq!(close_lseg_box(&parse_lseg("[(-5,2),(15,2)]")?, &b), [5.0, 2.0]);
+        assert_eq!(
+            close_lseg_box(&parse_lseg("[(1,1),(2,2)]")?, &b),
+            [2.0, 2.0]
+        );
+        assert_eq!(
+            close_lseg_box(&parse_lseg("[(9,3),(9.5,3.5)]")?, &b),
+            [9.0, 3.0]
+        );
+        assert_eq!(
+            close_lseg_box(&parse_lseg("[(-5,2),(15,2)]")?, &b),
+            [5.0, 2.0]
+        );
         // Otherwise it is the point of the box outline nearest the segment.
         let small = parse_box("(0,0,2,2)")?;
-        assert_eq!(close_lseg_box(&parse_lseg("[(3,1),(4,1)]")?, &small), [2.0, 1.0]);
-        assert_eq!(close_lseg_box(&parse_lseg("[(5,5),(6,6)]")?, &small), [2.0, 2.0]);
+        assert_eq!(
+            close_lseg_box(&parse_lseg("[(3,1),(4,1)]")?, &small),
+            [2.0, 1.0]
+        );
+        assert_eq!(
+            close_lseg_box(&parse_lseg("[(5,5),(6,6)]")?, &small),
+            [2.0, 2.0]
+        );
         assert_eq!(dist_lseg_box(&parse_lseg("[(1,1),(2,2)]")?, &b), 0.0);
         Ok(())
     }
@@ -2517,17 +2547,32 @@ mod tests {
         assert_eq!(parse_line("10,-10 ,-5,-4")?, [-0.4, -1.0, -6.0]);
         // Horizontal and vertical get PG's canonical `{0,-1,y}` / `{-1,0,x}`.
         assert_eq!(parse_line("[(1,3),(2,3)]")?, [0.0, -1.0, 3.0]);
-        assert_eq!(line_from_points(&[3.0, 1.0], &[3.0, 2.0])?, [-1.0, 0.0, 3.0]);
+        assert_eq!(
+            line_from_points(&[3.0, 1.0], &[3.0, 2.0])?,
+            [-1.0, 0.0, 3.0]
+        );
         assert_eq!(format_line(&[0.0, -1.0, 5.0], 0), "{0,-1,5}");
         Ok(())
     }
 
     #[test]
     fn line_bad_input() {
-        for s in ["{}", "{0", "{0,0}", "{0,0,1", "{0,0,1} x", "(3asdf,2 ,3,4r2)", "[1,2,3, 4"] {
+        for s in [
+            "{}",
+            "{0",
+            "{0,0}",
+            "{0,0,1",
+            "{0,0,1} x",
+            "(3asdf,2 ,3,4r2)",
+            "[1,2,3, 4",
+        ] {
             let e = parse_line(s).expect_err(s);
             assert_eq!(e.sqlstate, "22P02", "{s}");
-            assert_eq!(e.message, format!("invalid input syntax for type line: \"{s}\""), "{s}");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type line: \"{s}\""),
+                "{s}"
+            );
         }
         // The two spec errors carry their own wording, not the generic one.
         assert_eq!(
@@ -2547,9 +2592,18 @@ mod tests {
         assert!(!line_eq(&parse_line("{1,2,3}")?, &parse_line("{1,2,4}")?));
         // With a NaN anywhere, PG drops the ratio test and insists on exact
         // equality (with `NaN = NaN`), so scaling no longer preserves equality.
-        assert!(line_eq(&parse_line("{nan,1,nan}")?, &parse_line("{nan,1,nan}")?));
-        assert!(!line_eq(&parse_line("{nan,1,nan}")?, &parse_line("{nan,2,nan}")?));
-        assert!(!line_eq(&parse_line("{3,NaN,5}")?, &parse_line("{6,NaN,10}")?));
+        assert!(line_eq(
+            &parse_line("{nan,1,nan}")?,
+            &parse_line("{nan,1,nan}")?
+        ));
+        assert!(!line_eq(
+            &parse_line("{nan,1,nan}")?,
+            &parse_line("{nan,2,nan}")?
+        ));
+        assert!(!line_eq(
+            &parse_line("{3,NaN,5}")?,
+            &parse_line("{6,NaN,10}")?
+        ));
         Ok(())
     }
 
@@ -2568,9 +2622,18 @@ mod tests {
             &parse_line("{1000000,1000000,0}")?,
             &parse_line("{1000000,1000001,0}")?
         ));
-        assert!(line_parallel(&parse_line("{1,-1,0}")?, &parse_line("{2,-2,5}")?));
-        assert!(line_parallel(&parse_line("{1,0,0}")?, &parse_line("{5,0,3}")?));
-        assert!(!line_parallel(&parse_line("{1,0,0}")?, &parse_line("{0,1,0}")?));
+        assert!(line_parallel(
+            &parse_line("{1,-1,0}")?,
+            &parse_line("{2,-2,5}")?
+        ));
+        assert!(line_parallel(
+            &parse_line("{1,0,0}")?,
+            &parse_line("{5,0,3}")?
+        ));
+        assert!(!line_parallel(
+            &parse_line("{1,0,0}")?,
+            &parse_line("{0,1,0}")?
+        ));
         // Perpendicular compares the *slope product*, not the dot product — the
         // two disagree exactly here, where the slopes are within EPSILON of
         // perpendicular but the raw dot product is 1e6.
@@ -2578,8 +2641,14 @@ mod tests {
             &parse_line("{1000000,1000000,0}")?,
             &parse_line("{1000000,-1000001,0}")?
         ));
-        assert!(line_perpendicular(&parse_line("{2,4,6}")?, &parse_line("{4,-2,1}")?));
-        assert!(line_perpendicular(&parse_line("{0,1,0}")?, &parse_line("{1,0,0}")?));
+        assert!(line_perpendicular(
+            &parse_line("{2,4,6}")?,
+            &parse_line("{4,-2,1}")?
+        ));
+        assert!(line_perpendicular(
+            &parse_line("{0,1,0}")?,
+            &parse_line("{1,0,0}")?
+        ));
         Ok(())
     }
 
@@ -2618,7 +2687,10 @@ mod tests {
         assert_eq!(box_area_cmp(&nan_box, &nan_box), None);
         assert_eq!(box_area_cmp(&nan_box, &parse_box("(0,0,2,2)")?), None);
         let nan_circle = parse_circle("<(0,0),NaN>")?;
-        assert_eq!(circle_area_cmp(&nan_circle, &parse_circle("<(0,0),1>")?), None);
+        assert_eq!(
+            circle_area_cmp(&nan_circle, &parse_circle("<(0,0),1>")?),
+            None
+        );
         Ok(())
     }
 
@@ -2652,7 +2724,12 @@ mod tests {
     fn line_spec_errors_differ_by_call_site() -> anyhow::Result<()> {
         // The same wording, but a malformed literal is 22P02 while the
         // constructor rejecting its arguments is 22023.
-        assert_eq!(parse_line("[(1,2),(1,2)]").expect_err("coincident").sqlstate, "22P02");
+        assert_eq!(
+            parse_line("[(1,2),(1,2)]")
+                .expect_err("coincident")
+                .sqlstate,
+            "22P02"
+        );
         assert_eq!(
             line_from_points(&[1.0, 1.0], &[1.0, 1.0])
                 .expect_err("coincident")
@@ -2680,9 +2757,14 @@ mod tests {
         assert!((dist_point_line(&[0.0, 5.0], &diag) - 5.0 / 2.0_f64.sqrt()).abs() < 1e-12);
         // Distance is 0 unless the lines are parallel.
         assert_eq!(dist_line_line(&diag, &anti), 0.0);
-        assert!((dist_line_line(&diag, &parse_line("{1,-1,5}")?) - 5.0 / 2.0_f64.sqrt()).abs() < 1e-12);
+        assert!(
+            (dist_line_line(&diag, &parse_line("{1,-1,5}")?) - 5.0 / 2.0_f64.sqrt()).abs() < 1e-12
+        );
         assert!(line_intersects_box(&diag, &parse_box("(0,0,2,2)")?));
-        assert!(!line_intersects_box(&parse_line("{1,-1,-10}")?, &parse_box("(0,0,2,2)")?));
+        assert!(!line_intersects_box(
+            &parse_line("{1,-1,-10}")?,
+            &parse_box("(0,0,2,2)")?
+        ));
         Ok(())
     }
 
@@ -2690,12 +2772,24 @@ mod tests {
     fn line_lseg_interaction() -> anyhow::Result<()> {
         let diag = parse_line("{1,-1,0}")?;
         assert!(lseg_on_line(&parse_lseg("[(0,0),(1,1)]")?, &diag));
-        assert!(lseg_intersects_line(&parse_lseg("[(0,0),(1,1)]")?, &parse_line("{1,1,-2}")?));
-        assert!(!lseg_intersects_line(&parse_lseg("[(0,0),(1,1)]")?, &parse_line("{1,-1,5}")?));
+        assert!(lseg_intersects_line(
+            &parse_lseg("[(0,0),(1,1)]")?,
+            &parse_line("{1,1,-2}")?
+        ));
+        assert!(!lseg_intersects_line(
+            &parse_lseg("[(0,0),(1,1)]")?,
+            &parse_line("{1,-1,5}")?
+        ));
         // `line ## lseg` picks the point of the segment closest to the line —
         // the crossing when there is one, else the nearer endpoint.
-        assert_eq!(close_line_lseg(&diag, &parse_lseg("[(0,5),(5,5)]")?), Some([5.0, 5.0]));
-        assert_eq!(close_line_lseg(&diag, &parse_lseg("[(3,0),(4,0)]")?), Some([3.0, 0.0]));
+        assert_eq!(
+            close_line_lseg(&diag, &parse_lseg("[(0,5),(5,5)]")?),
+            Some([5.0, 5.0])
+        );
+        assert_eq!(
+            close_line_lseg(&diag, &parse_lseg("[(3,0),(4,0)]")?),
+            Some([3.0, 0.0])
+        );
         // A segment running parallel to the line (including lying on it) has no
         // single closest point.
         assert_eq!(close_line_lseg(&diag, &parse_lseg("[(0,0),(1,1)]")?), None);
@@ -2707,7 +2801,13 @@ mod tests {
 
     #[test]
     fn circle_forms_and_format() -> anyhow::Result<()> {
-        for s in ["<(1,2),3>", "((1,2),3)", "(1,2),3", "1,2,3", " < ( 1 , 2 ) , 3 > "] {
+        for s in [
+            "<(1,2),3>",
+            "((1,2),3)",
+            "(1,2),3",
+            "1,2,3",
+            " < ( 1 , 2 ) , 3 > ",
+        ] {
             assert_eq!(parse_circle(s)?, [1.0, 2.0, 3.0], "{s}");
         }
         // Zero and NaN radii are accepted; a negative one is not.
@@ -2719,10 +2819,20 @@ mod tests {
 
     #[test]
     fn circle_bad_input() {
-        for s in ["<(-100,0),-100>", "<(100,200),10", "<(100,200),10> x", "1abc,3,5", "(3,(1,2),3)"] {
+        for s in [
+            "<(-100,0),-100>",
+            "<(100,200),10",
+            "<(100,200),10> x",
+            "1abc,3,5",
+            "(3,(1,2),3)",
+        ] {
             let e = parse_circle(s).expect_err(s);
             assert_eq!(e.sqlstate, "22P02", "{s}");
-            assert_eq!(e.message, format!("invalid input syntax for type circle: \"{s}\""), "{s}");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type circle: \"{s}\""),
+                "{s}"
+            );
         }
     }
 
@@ -2738,7 +2848,12 @@ mod tests {
         assert_eq!(quad.pts.len(), 4);
         assert_eq!(quad.pts[0], [-1.0, 0.0]);
         assert!((quad.pts[1][1] - 1.0).abs() < 1e-12);
-        assert_eq!(circle_to_polygon(1, &[0.0, 0.0, 1.0]).expect_err("too few").sqlstate, "22023");
+        assert_eq!(
+            circle_to_polygon(1, &[0.0, 0.0, 1.0])
+                .expect_err("too few")
+                .sqlstate,
+            "22023"
+        );
         // `circle(polygon)`: vertex centroid, mean vertex distance.
         let sq = parse_polygon("((0,0),(2,0),(2,2),(0,2))")?;
         let cc = circle_from_polygon(&sq);
@@ -2759,11 +2874,17 @@ mod tests {
         assert!(!circle_same(&a, &b) && circle_same(&a, &a));
         assert!(circle_contain_pt(&a, &[1.0, 1.0]) && !circle_contain_pt(&a, &[5.0, 5.0]));
         // `=` compares area, so any two same-radius circles are equal.
-        assert_eq!(circle_area_cmp(&a, &parse_circle("<(9,9),2>")?), Some(std::cmp::Ordering::Equal));
+        assert_eq!(
+            circle_area_cmp(&a, &parse_circle("<(9,9),2>")?),
+            Some(std::cmp::Ordering::Equal)
+        );
         assert_eq!(circle_area_cmp(&a, &b), Some(std::cmp::Ordering::Greater));
         // Distances measure outline to outline and clamp at 0.
         assert_eq!(dist_circle_circle(&a, &b), 0.0);
-        assert!((dist_circle_circle(&a, &parse_circle("<(5,5),1>")?) - (50.0_f64.sqrt() - 3.0)).abs() < 1e-12);
+        assert!(
+            (dist_circle_circle(&a, &parse_circle("<(5,5),1>")?) - (50.0_f64.sqrt() - 3.0)).abs()
+                < 1e-12
+        );
         assert_eq!(dist_point_circle(&[1.0, 1.0], &a), 0.0);
         // Arithmetic moves the center; `*` and `/` also scale the radius.
         assert_eq!(circle_add_pt(&a, &[1.0, 1.0])?, [1.0, 1.0, 2.0]);
@@ -2777,7 +2898,11 @@ mod tests {
     #[test]
     fn polygon_forms_and_format() -> anyhow::Result<()> {
         for s in ["((0,0),(2,0),(2,2))", "(0,0),(2,0),(2,2)", "0,0,2,0,2,2"] {
-            assert_eq!(parse_polygon(s)?.pts, vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0]], "{s}");
+            assert_eq!(
+                parse_polygon(s)?.pts,
+                vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0]],
+                "{s}"
+            );
         }
         assert_eq!(parse_polygon("(0,0)")?.pts, vec![[0.0, 0.0]]);
         assert_eq!(
@@ -2788,7 +2913,11 @@ mod tests {
         for s in ["[(0,0),(1,1)]", "((0,0)"] {
             let e = parse_polygon(s).expect_err(s);
             assert_eq!(e.sqlstate, "22P02", "{s}");
-            assert_eq!(e.message, format!("invalid input syntax for type polygon: \"{s}\""), "{s}");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type polygon: \"{s}\""),
+                "{s}"
+            );
         }
         Ok(())
     }
@@ -2799,10 +2928,18 @@ mod tests {
         assert_eq!(poly_npoints(&sq), 4);
         assert_eq!(poly_center(&sq), [1.0, 1.0]);
         assert_eq!(poly_bbox(&sq), [2.0, 2.0, 0.0, 0.0]);
-        assert_eq!(poly_center(&parse_polygon("((0,0),(4,0),(4,4))")?)[0], 8.0 / 3.0);
+        assert_eq!(
+            poly_center(&parse_polygon("((0,0),(4,0),(4,4))")?)[0],
+            8.0 / 3.0
+        );
         // `polygon::path` is always *closed*; only a closed path converts back.
         assert!(poly_to_path(&sq).closed);
-        assert_eq!(path_to_polygon(&parse_path("((0,0),(1,1),(2,0))")?)?.pts.len(), 3);
+        assert_eq!(
+            path_to_polygon(&parse_path("((0,0),(1,1),(2,0))")?)?
+                .pts
+                .len(),
+            3
+        );
         let e = path_to_polygon(&parse_path("[(0,0),(1,1),(2,0)]")?).expect_err("open");
         assert_eq!(e.sqlstate, "22023");
         assert_eq!(e.message, "open path cannot be converted to polygon");
@@ -2816,7 +2953,10 @@ mod tests {
         assert!(poly_contain(&outer, &inner) && poly_contained(&inner, &outer));
         assert!(poly_contain(&outer, &outer));
         // Sharing the bounding box but poking outside it is not containment.
-        assert!(!poly_contain(&outer, &parse_polygon("((-1,-1),(5,0),(4,4))")?));
+        assert!(!poly_contain(
+            &outer,
+            &parse_polygon("((-1,-1),(5,0),(4,4))")?
+        ));
         assert!(poly_contain(&outer, &parse_polygon("((0,0),(4,0),(4,4))")?));
         assert!(poly_same(&outer, &outer) && !poly_same(&outer, &inner));
         assert!(poly_overlap(&outer, &inner));
@@ -2825,13 +2965,20 @@ mod tests {
             &parse_polygon("((3,3),(2,3),(3,2))")?
         ));
         assert!(poly_contain_pt(&outer, &[1.0, 1.0]) && !poly_contain_pt(&outer, &[5.0, 5.0]));
-        assert!(poly_left(&parse_polygon("((0,0),(1,0),(1,1))")?, &parse_polygon("((5,0),(6,0),(6,1))")?));
+        assert!(poly_left(
+            &parse_polygon("((0,0),(1,0),(1,1))")?,
+            &parse_polygon("((5,0),(6,0),(6,1))")?
+        ));
         assert_eq!(dist_poly_point(&outer, &[2.0, 2.0]), 0.0);
         let far = parse_polygon("((5,5),(6,5),(6,6))")?;
         let two_sq = parse_polygon("((0,0),(2,0),(2,2),(0,2))")?;
         assert!((dist_poly_point(&two_sq, &[5.0, 5.0]) - 18.0_f64.sqrt()).abs() < 1e-12);
         assert!((dist_poly_poly(&two_sq, &far) - 18.0_f64.sqrt()).abs() < 1e-12);
-        assert!((dist_poly_circle(&two_sq, &parse_circle("<(5,5),1>")?) - (18.0_f64.sqrt() - 1.0)).abs() < 1e-12);
+        assert!(
+            (dist_poly_circle(&two_sq, &parse_circle("<(5,5),1>")?) - (18.0_f64.sqrt() - 1.0))
+                .abs()
+                < 1e-12
+        );
         assert_eq!(dist_poly_poly(&outer, &inner), 0.0);
         Ok(())
     }

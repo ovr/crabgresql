@@ -172,7 +172,10 @@ mod tests {
 
     #[test]
     fn a_zero_page_relation_estimates_no_rows() {
-        assert_eq!(RelStats::from_pages(0, &schema(&[PgType::Int4])).reltuples, 0.0);
+        assert_eq!(
+            RelStats::from_pages(0, &schema(&[PgType::Int4])).reltuples,
+            0.0
+        );
     }
 
     #[test]

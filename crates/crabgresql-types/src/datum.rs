@@ -268,7 +268,11 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&reg.oid.to_le_bytes());
             put_var(out, reg.name.as_bytes());
         }
-        Value::Enum { type_oid, ordinal, label } => {
+        Value::Enum {
+            type_oid,
+            ordinal,
+            label,
+        } => {
             out.push(T_ENUM);
             out.extend_from_slice(&type_oid.to_le_bytes());
             out.extend_from_slice(&ordinal.to_le_bytes());
@@ -426,7 +430,10 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             let block = r.u32();
             let mut b = [0u8; 2];
             b.copy_from_slice(r.take(2));
-            Value::Tid { block, offset: u16::from_le_bytes(b) }
+            Value::Tid {
+                block,
+                offset: u16::from_le_bytes(b),
+            }
         }
         T_XID => Value::Xid(r.u32()),
         T_XID8 => Value::Xid8(r.u64()),
@@ -495,8 +502,8 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         }
         T_REG => {
             let kind_oid = r.u32();
-            let PgType::Reg(kind) = PgType::from_oid(kind_oid)
-                .expect("stored reg* type re-resolves")
+            let PgType::Reg(kind) =
+                PgType::from_oid(kind_oid).expect("stored reg* type re-resolves")
             else {
                 panic!("reg datum tagged with a non-reg type oid {kind_oid}")
             };
@@ -508,7 +515,11 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
             let type_oid = r.u32();
             let ordinal = r.u32();
             let label = String::from_utf8(r.var().to_vec()).expect("enum label is valid utf-8");
-            Value::Enum { type_oid, ordinal, label }
+            Value::Enum {
+                type_oid,
+                ordinal,
+                label,
+            }
         }
         T_JSON => {
             Value::Json(String::from_utf8(r.var().to_vec()).expect("json text is valid utf-8"))
@@ -527,13 +538,11 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         }
         T_TSVECTOR => {
             let s = std::str::from_utf8(r.var()).expect("tsvector text is valid utf-8");
-            Value::Tsvector(
-                crate::tsvector::tsvector_in(s).expect("stored tsvector re-parses"),
-            )
+            Value::Tsvector(crate::tsvector::tsvector_in(s).expect("stored tsvector re-parses"))
         }
-        T_TSQUERY => Value::Tsquery(
-            crate::tsquery::decode(r.var()).expect("stored tsquery decodes"),
-        ),
+        T_TSQUERY => {
+            Value::Tsquery(crate::tsquery::decode(r.var()).expect("stored tsquery decodes"))
+        }
         T_ARRAY => {
             let elem_oid = r.u32();
             let elem = PgType::from_oid(elem_oid).expect("stored array element type re-resolves");
@@ -690,8 +699,14 @@ mod tests {
         roundtrip(Value::Uuid([9u8; 16]));
         roundtrip(Value::Money(i64::MIN));
         roundtrip(Value::Money(12345));
-        roundtrip(Value::Tid { block: 0, offset: 0 });
-        roundtrip(Value::Tid { block: u32::MAX, offset: u16::MAX });
+        roundtrip(Value::Tid {
+            block: 0,
+            offset: 0,
+        });
+        roundtrip(Value::Tid {
+            block: u32::MAX,
+            offset: u16::MAX,
+        });
         roundtrip(Value::Xid(0));
         roundtrip(Value::Xid(u32::MAX));
         roundtrip(Value::Xid8(u64::MAX));
@@ -728,15 +743,33 @@ mod tests {
         roundtrip(Value::Polygon(crate::geo::PolygonVal {
             pts: vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]],
         }));
-        roundtrip(Value::Polygon(crate::geo::PolygonVal { pts: vec![[7.0, 8.0]] }));
-        roundtrip(Value::Enum { type_oid: 16384, ordinal: 0, label: "red".into() });
-        roundtrip(Value::Enum { type_oid: 99999, ordinal: 42, label: String::new() });
+        roundtrip(Value::Polygon(crate::geo::PolygonVal {
+            pts: vec![[7.0, 8.0]],
+        }));
+        roundtrip(Value::Enum {
+            type_oid: 16384,
+            ordinal: 0,
+            label: "red".into(),
+        });
+        roundtrip(Value::Enum {
+            type_oid: 99999,
+            ordinal: 42,
+            label: String::new(),
+        });
         // `json` keeps its raw text; `jsonb` its canonical tree.
         roundtrip(Value::Json("{\"b\": 1,  \"a\": 2}".into()));
         roundtrip(Value::Json("null".into()));
-        roundtrip(json::jsonb_in("{\"b\":1,\"a\":[1,2,3],\"k\":\"v\"}").map(Value::Jsonb).expect("valid jsonb"));
+        roundtrip(
+            json::jsonb_in("{\"b\":1,\"a\":[1,2,3],\"k\":\"v\"}")
+                .map(Value::Jsonb)
+                .expect("valid jsonb"),
+        );
         roundtrip(json::jsonb_in("[]").map(Value::Jsonb).expect("valid jsonb"));
-        roundtrip(json::jsonb_in("1.50").map(Value::Jsonb).expect("valid jsonb"));
+        roundtrip(
+            json::jsonb_in("1.50")
+                .map(Value::Jsonb)
+                .expect("valid jsonb"),
+        );
         // `jsonpath` stores its canonical text form.
         roundtrip(
             crate::jsonpath::jsonpath_in("$.a[*] ? (@ > 3)")
@@ -755,7 +788,13 @@ mod tests {
         }
         // The last two print identically but are distinct values, so they pin
         // that storage keeps the tree shape rather than the canonical text.
-        for tq in ["'a':*AB <2> ( 'b' | !'c' )", "!!'x'", "", "1|2|4", "1|(2|4)"] {
+        for tq in [
+            "'a':*AB <2> ( 'b' | !'c' )",
+            "!!'x'",
+            "",
+            "1|2|4",
+            "1|(2|4)",
+        ] {
             roundtrip(
                 crate::tsquery::tsquery_in(tq)
                     .map(Value::Tsquery)

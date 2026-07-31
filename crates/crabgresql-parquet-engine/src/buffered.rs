@@ -338,9 +338,9 @@ impl TableAm for BufferedParquetTable {
     /// still quote the relation's schema.
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
         let tids = self.insert_many(vec![tuple], txn)?;
-        tids.into_iter().next().ok_or_else(|| {
-            StorageError::CorruptData("buffered insert produced no tid".to_string())
-        })
+        tids.into_iter()
+            .next()
+            .ok_or_else(|| StorageError::CorruptData("buffered insert produced no tid".to_string()))
     }
 
     fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
@@ -517,7 +517,9 @@ mod tests {
         first_buffer: bool,
         between: impl FnOnce(),
     ) -> Vec<i32> {
-        let leaves = table.storage_leaves().expect("a Parquet relation has leaves");
+        let leaves = table
+            .storage_leaves()
+            .expect("a Parquet relation has leaves");
         let (a, b) = if first_buffer {
             (&leaves[1], &leaves[0])
         } else {
@@ -528,7 +530,10 @@ mod tests {
             .map(|row| row.expect("scan must not fail"))
             .collect();
         between();
-        rows.extend(b.scan(txn, &ColumnProjection::All).map(|row| row.expect("scan must not fail")));
+        rows.extend(
+            b.scan(txn, &ColumnProjection::All)
+                .map(|row| row.expect("scan must not fail")),
+        );
         ids_of(rows)
     }
 
@@ -542,8 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn a_flush_between_the_two_leaf_scans_yields_every_row_exactly_once()
-    -> anyhow::Result<()> {
+    fn a_flush_between_the_two_leaf_scans_yields_every_row_exactly_once() -> anyhow::Result<()> {
         // Both orderings: a flush landing between the leaf scans must not
         // duplicate a row (chunk read after publication, buffer read before) nor
         // drop one (the reverse).
@@ -554,9 +558,7 @@ mod tests {
 
             let reader = read_only(&tm);
             let ids = append_scan_with(&table, &reader, first_buffer, || {
-                let flushed = table
-                    .flush(&tm)
-                    .expect("flush must succeed");
+                let flushed = table.flush(&tm).expect("flush must succeed");
                 assert_eq!(flushed, 5);
             });
             assert_eq!(
@@ -580,7 +582,12 @@ mod tests {
         let older = read_only(&tm);
         assert_eq!(table.flush(&tm)?, 3);
         assert_eq!(
-            ids_of(table.scan(&older, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
+            ids_of(
+                table
+                    .scan(&older, &ColumnProjection::All)
+                    .map(|r| r.expect("scan"))
+                    .collect()
+            ),
             vec![1, 2, 3],
             "a snapshot older than the flush must still see every row exactly once"
         );
@@ -590,14 +597,24 @@ mod tests {
         // back empty — rows the user never deleted vanishing mid-transaction.
         assert_eq!(table.flush(&tm)?, 0);
         assert_eq!(
-            ids_of(table.scan(&older, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
+            ids_of(
+                table
+                    .scan(&older, &ColumnProjection::All)
+                    .map(|r| r.expect("scan"))
+                    .collect()
+            ),
             vec![1, 2, 3],
             "reclamation must not run past a live snapshot that holds no XID"
         );
 
         let newer = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&newer, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
+            ids_of(
+                table
+                    .scan(&newer, &ColumnProjection::All)
+                    .map(|r| r.expect("scan"))
+                    .collect()
+            ),
             vec![1, 2, 3],
             "a snapshot newer than the flush must read them from the chunk"
         );
@@ -615,16 +632,17 @@ mod tests {
         let open_txn = tm.context(open_xid, CommandId::FIRST);
         table.insert_many(vec![vec![Value::Int4(9)]], &open_txn)?;
 
-        assert_eq!(
-            table.flush(&tm)?,
-            2,
-            "only committed rows may be flushed"
-        );
+        assert_eq!(table.flush(&tm)?, 2, "only committed rows may be flushed");
         tm.commit(open_xid)?;
 
         let reader = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&reader, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
+            ids_of(
+                table
+                    .scan(&reader, &ColumnProjection::All)
+                    .map(|r| r.expect("scan"))
+                    .collect()
+            ),
             vec![1, 2, 9],
             "the row that was in flight during the flush must still be readable"
         );
@@ -684,7 +702,12 @@ mod tests {
         assert_eq!(table.flush(&tm)?, 3);
         let reader = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&reader, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
+            ids_of(
+                table
+                    .scan(&reader, &ColumnProjection::All)
+                    .map(|r| r.expect("scan"))
+                    .collect()
+            ),
             vec![1, 2, 3],
             "no row may be duplicated by the declined flush"
         );
@@ -710,7 +733,11 @@ mod tests {
         );
         table.chunks.lock.release_exclusive(LockOwner(4_242));
 
-        assert_eq!(table.flush(&tm)?, 3, "and succeed once the lock is released");
+        assert_eq!(
+            table.flush(&tm)?,
+            3,
+            "and succeed once the lock is released"
+        );
         Ok(())
     }
 
@@ -718,8 +745,7 @@ mod tests {
     /// truncater's snapshot would leave a row another session committed after
     /// that snapshot was taken, so a committed TRUNCATE would not truncate.
     #[test]
-    fn truncate_removes_rows_committed_after_the_truncaters_snapshot()
-    -> anyhow::Result<()> {
+    fn truncate_removes_rows_committed_after_the_truncaters_snapshot() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let (table, tm) = open_wired(dir.path())?;
         seed(&table, &tm, &[1]);
@@ -730,14 +756,23 @@ mod tests {
         seed(&table, &tm, &[999]);
 
         let xid = tm.allocate_xid();
-        let truncater =
-            tm.context_with(xid, CommandId::FIRST, snapshot, IsolationLevel::RepeatableRead);
+        let truncater = tm.context_with(
+            xid,
+            CommandId::FIRST,
+            snapshot,
+            IsolationLevel::RepeatableRead,
+        );
         table.truncate(&truncater)?;
         tm.commit(xid)?;
 
         let reader = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&reader, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
+            ids_of(
+                table
+                    .scan(&reader, &ColumnProjection::All)
+                    .map(|r| r.expect("scan"))
+                    .collect()
+            ),
             Vec::<i32>::new(),
             "a committed TRUNCATE must leave no row behind, whatever it could see"
         );
@@ -774,7 +809,12 @@ mod tests {
         );
         let reader = read_only(&tm);
         assert_eq!(
-            ids_of(table.scan(&reader, &ColumnProjection::All).map(|r| r.expect("scan")).collect()),
+            ids_of(
+                table
+                    .scan(&reader, &ColumnProjection::All)
+                    .map(|r| r.expect("scan"))
+                    .collect()
+            ),
             (0..10).collect::<Vec<i32>>()
         );
         Ok(())

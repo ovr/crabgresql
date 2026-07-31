@@ -1205,7 +1205,8 @@ impl GlobalCatalog {
             .inner
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let mut types: Vec<_> = cat.types
+        let mut types: Vec<_> = cat
+            .types
             .iter()
             .filter(|(_, e)| e.defined)
             .map(|(name, e)| UserTypeInfo {

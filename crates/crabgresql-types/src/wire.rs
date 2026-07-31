@@ -158,11 +158,7 @@ mod tests {
     fn tid_xid_and_pg_lsn_binary_round_trip() -> anyhow::Result<()> {
         let cases = [
             (Value::Xid(4294967295), PgType::Xid, vec![0xff; 4]),
-            (
-                Value::Xid8(1),
-                PgType::Xid8,
-                vec![0, 0, 0, 0, 0, 0, 0, 1],
-            ),
+            (Value::Xid8(1), PgType::Xid8, vec![0, 0, 0, 0, 0, 0, 0, 1]),
             (
                 Value::PgLsn(0x0000_0001_016A_E7F8),
                 PgType::PgLsn,

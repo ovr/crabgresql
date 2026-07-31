@@ -90,7 +90,10 @@ impl TableLock {
     /// that is the truncater reading its own new file); otherwise waits until the
     /// exclusive holder finishes. The returned guard releases the hold on drop.
     pub fn acquire_shared(self: &Arc<Self>, owner: LockOwner) -> SharedGuard {
-        let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         loop {
             match inner.exclusive {
                 None => break,
@@ -118,7 +121,10 @@ impl TableLock {
     /// waiting for it — and would then refuse to join at shutdown. Returning
     /// `None` lets the caller skip this relation and retry on its next pass.
     pub fn try_acquire_shared(self: &Arc<Self>, owner: LockOwner) -> Option<SharedGuard> {
-        let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         match inner.exclusive {
             None => {}
             Some(holder) if holder == owner => {}
@@ -138,7 +144,10 @@ impl TableLock {
     /// [`TableLock::release_exclusive`] (called by the commit or abort hook).
     /// Re-entrant: a second TRUNCATE by the same owner re-acquires trivially.
     pub fn acquire_exclusive(&self, owner: LockOwner) {
-        let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         loop {
             let exclusive_ok = match inner.exclusive {
                 None => true,
@@ -171,7 +180,10 @@ impl TableLock {
 
     /// Release `owner`'s exclusive hold, if it holds one. Wakes any waiters.
     pub fn release_exclusive(&self, owner: LockOwner) {
-        let mut inner = self.inner.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         if inner.exclusive == Some(owner) {
             inner.exclusive = None;
             self.cond.notify_all();
@@ -231,7 +243,15 @@ mod tests {
         let lock = Arc::new(TableLock::new());
         let a = lock.acquire_shared(owner(3));
         let b = lock.acquire_shared(owner(4));
-        assert_eq!(lock.inner.lock().expect("mutex poisoned").shared.values().sum::<u32>(), 2);
+        assert_eq!(
+            lock.inner
+                .lock()
+                .expect("mutex poisoned")
+                .shared
+                .values()
+                .sum::<u32>(),
+            2
+        );
         drop(a);
         drop(b);
         assert!(lock.inner.lock().expect("mutex poisoned").shared.is_empty());
@@ -241,7 +261,10 @@ mod tests {
     fn exclusive_excludes_and_releases() {
         let lock = Arc::new(TableLock::new());
         lock.acquire_exclusive(owner(3));
-        assert_eq!(lock.inner.lock().expect("mutex poisoned").exclusive, Some(owner(3)));
+        assert_eq!(
+            lock.inner.lock().expect("mutex poisoned").exclusive,
+            Some(owner(3))
+        );
         // The holder may still take shared holds (read-your-own-truncate).
         let g = lock.acquire_shared(owner(3));
         drop(g);
@@ -264,7 +287,10 @@ mod tests {
         let lock = Arc::new(TableLock::new());
         let _cursor = lock.acquire_shared(owner(7));
         lock.acquire_exclusive(owner(7)); // same owner: granted despite the shared hold
-        assert_eq!(lock.inner.lock().expect("mutex poisoned").exclusive, Some(owner(7)));
+        assert_eq!(
+            lock.inner.lock().expect("mutex poisoned").exclusive,
+            Some(owner(7))
+        );
         lock.release_exclusive(owner(7));
     }
 

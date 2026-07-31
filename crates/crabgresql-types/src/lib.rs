@@ -9,8 +9,8 @@ pub mod array;
 pub mod bit;
 pub mod cast;
 pub mod collation;
-pub mod datum;
 pub mod date;
+pub mod datum;
 pub mod float;
 pub mod formatting;
 pub mod formatting_num;
@@ -822,9 +822,7 @@ impl PgType {
             | PgType::Box
             | PgType::Polygon
             | PgType::Line
-            | PgType::Circle => {
-                false
-            }
+            | PgType::Circle => false,
             // `xid` is the one type here with equality but no ordering: PG gives
             // it a hash opclass only, because transaction ids compare with
             // modular arithmetic. `xid8` is an ordinary counter and does have a
@@ -1297,16 +1295,26 @@ mod tests {
             Value::Float8(-0.0),
             Value::Money(12345),
             Value::Oid(1259),
-            Value::Tid { block: 4294967295, offset: 65535 },
+            Value::Tid {
+                block: 4294967295,
+                offset: 65535,
+            },
             Value::Xid(4294967295),
             Value::Xid8(u64::MAX),
             Value::PgLsn(u64::MAX),
             Value::Date(-5),
             Value::Time(1),
-            Value::TimeTz(TimeTz { usec: 1, zone: -3600 }),
+            Value::TimeTz(TimeTz {
+                usec: 1,
+                zone: -3600,
+            }),
             Value::Timestamp(0),
             Value::TimestampTz(i64::MIN),
-            Value::Interval(Interval { months: -13, days: 2, usec: -999 }),
+            Value::Interval(Interval {
+                months: -13,
+                days: 2,
+                usec: -999,
+            }),
             Value::Uuid([9u8; 16]),
             Value::Macaddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]),
             Value::Macaddr8([0u8; 8]),
@@ -1322,10 +1330,17 @@ mod tests {
         }
         // A heap-*capable* variant that has not allocated is in the same
         // position: an empty `Vec`/`String` never called the allocator.
-        assert_eq!(Value::Text(String::new()).deep_size_of(), size_of::<Value>());
+        assert_eq!(
+            Value::Text(String::new()).deep_size_of(),
+            size_of::<Value>()
+        );
         assert_eq!(Value::Bytea(Vec::new()).deep_size_of(), size_of::<Value>());
         assert_eq!(
-            Value::Array { elem: PgType::Int4, elems: Vec::new() }.deep_size_of(),
+            Value::Array {
+                elem: PgType::Int4,
+                elems: Vec::new()
+            }
+            .deep_size_of(),
             size_of::<Value>()
         );
     }
@@ -1336,13 +1351,27 @@ mod tests {
             (Value::Text("héllo world".into()), 12),
             (Value::Json("{\"b\": 1,  \"a\": 2}".into()), 17),
             (Value::Bytea(vec![0, 1, 2, 255]), 4),
-            (Value::Bit { len: 1000, data: vec![0xA5; 125] }, 125),
             (
-                Value::Reg(Reg { kind: RegKind::Class, oid: 1259, name: "pg_class".into() }),
+                Value::Bit {
+                    len: 1000,
+                    data: vec![0xA5; 125],
+                },
+                125,
+            ),
+            (
+                Value::Reg(Reg {
+                    kind: RegKind::Class,
+                    oid: 1259,
+                    name: "pg_class".into(),
+                }),
                 8,
             ),
             (
-                Value::Enum { type_oid: 16384, ordinal: 0, label: "red".into() },
+                Value::Enum {
+                    type_oid: 16384,
+                    ordinal: 0,
+                    label: "red".into(),
+                },
                 3,
             ),
             (
@@ -1413,7 +1442,8 @@ mod tests {
         assert!(tree.deep_size_of() > leaf.deep_size_of());
 
         let short_path = Value::Jsonpath(jsonpath::jsonpath_in("$")?);
-        let long_path = Value::Jsonpath(jsonpath::jsonpath_in("$.a.b.c[*] ? (@.x > 3 && @.y < 4)")?);
+        let long_path =
+            Value::Jsonpath(jsonpath::jsonpath_in("$.a.b.c[*] ? (@.x > 3 && @.y < 4)")?);
         assert!(long_path.deep_size_of() > short_path.deep_size_of());
 
         let one = Value::Array {

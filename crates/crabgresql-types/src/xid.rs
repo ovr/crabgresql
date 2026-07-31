@@ -90,9 +90,7 @@ fn scan(input: &str) -> Result<u64, ScanError> {
 
     let mut magnitude: u64 = 0;
     for byte in digits.bytes() {
-        let digit = char::from(byte)
-            .to_digit(radix)
-            .ok_or(ScanError::Syntax)?;
+        let digit = char::from(byte).to_digit(radix).ok_or(ScanError::Syntax)?;
         magnitude = magnitude
             .checked_mul(u64::from(radix))
             .and_then(|m| m.checked_add(u64::from(digit)))

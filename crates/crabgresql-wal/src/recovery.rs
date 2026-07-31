@@ -463,7 +463,11 @@ mod tests {
         let clog = Clog::new();
         let res = recover(dir.path(), &reg, &clog, end)?;
         assert_eq!(res.end_of_wal, end);
-        assert_eq!(res.next_xid, Xid(100), "the control file supplies the floor");
+        assert_eq!(
+            res.next_xid,
+            Xid(100),
+            "the control file supplies the floor"
+        );
 
         Ok(())
     }

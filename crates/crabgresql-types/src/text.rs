@@ -2291,7 +2291,10 @@ mod tests {
         assert_eq!(regexp_substr("abc", "$", 1, 2, "", 0)?, None);
         // Multi-byte input: `start` counts characters, and the empty-match step
         // has to move a whole character or it would split a codepoint.
-        assert_eq!(regexp_substr("äöü", ".", 2, 1, "", 0)?.as_deref(), Some("ö"));
+        assert_eq!(
+            regexp_substr("äöü", ".", 2, 1, "", 0)?.as_deref(),
+            Some("ö")
+        );
         assert_eq!(regexp_count("äöü", "", 1, "")?, 4);
         assert_eq!(regexp_count("äöüä", "ä", 2, "")?, 1);
 
@@ -2476,7 +2479,10 @@ mod tests {
             assert_eq!(e.sqlstate, "0A000", "for {pattern:?}");
         }
         // A genuinely malformed pattern still reports a syntax error.
-        assert_eq!(regex_match("aa", "a(", false).unwrap_err().sqlstate, "2201B");
+        assert_eq!(
+            regex_match("aa", "a(", false).unwrap_err().sqlstate,
+            "2201B"
+        );
     }
 
     /// jsonpath's `like_regex` is XQuery-flavored: `.` does not span a newline
@@ -2712,8 +2718,14 @@ mod tests {
             substring_similar("foobar", "%#\"o+#\"%", esc)?.as_deref(),
             Some("oo")
         );
-        assert_eq!(substring_similar("abc", "%#\"_#\"%", esc)?.as_deref(), Some("a"));
-        assert_eq!(substring_similar("abc", "%#\"%", esc)?.as_deref(), Some("abc"));
+        assert_eq!(
+            substring_similar("abc", "%#\"_#\"%", esc)?.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            substring_similar("abc", "%#\"%", esc)?.as_deref(),
+            Some("abc")
+        );
         // The preference has to reach a bound and a user-written quantifier too.
         assert_eq!(
             substring_similar("aaa", "a{1,2}#\"%#\"%", esc)?.as_deref(),
@@ -2725,7 +2737,10 @@ mod tests {
         );
         // Alternation must not bind across a separator boundary: emitting the
         // separator in place would build `^(?:(a)|b)$`, which cannot match "ab".
-        assert_eq!(substring_similar("ab", "#\"a#\"|b", esc)?.as_deref(), Some("a"));
+        assert_eq!(
+            substring_similar("ab", "#\"a#\"|b", esc)?.as_deref(),
+            Some("a")
+        );
         // The extracted segment prefers the longest match, overriding a lazy
         // marker the user wrote inside it (PG's `{1,1}` wrapper).
         assert_eq!(
@@ -2734,7 +2749,10 @@ mod tests {
         );
         // ...and a user marker in the prefix is consumed, never doubled into the
         // `a*???` the regex compiler would choke on.
-        assert_eq!(substring_similar("ab", "%?#\"a#\"%", esc)?.as_deref(), Some("a"));
+        assert_eq!(
+            substring_similar("ab", "%?#\"a#\"%", esc)?.as_deref(),
+            Some("a")
+        );
         assert_eq!(
             substring_similar("x\u{65e5}y", "%#\"\u{65e5}#\"%", esc)?.as_deref(),
             Some("\u{65e5}")
@@ -2743,11 +2761,15 @@ mod tests {
         // A quantifier straight after the closing separator has no operand, so
         // the suffix `(?:{3})` is rejected like PG's `quantifier operand invalid`.
         assert_eq!(
-            substring_similar("aaa", "#\"a#\"{3}", esc).unwrap_err().sqlstate,
+            substring_similar("aaa", "#\"a#\"{3}", esc)
+                .unwrap_err()
+                .sqlstate,
             "2201B"
         );
         assert_eq!(
-            similar_to_match("aaa", "#\"a#\"{3}", esc).unwrap_err().sqlstate,
+            similar_to_match("aaa", "#\"a#\"{3}", esc)
+                .unwrap_err()
+                .sqlstate,
             "2201B"
         );
         // Digits after `{` commit PG to reading a bound, so leaving it unclosed
@@ -2762,7 +2784,10 @@ mod tests {
         // Empty segments in every position.
         assert_eq!(substring_similar("X", "X#\"#\"", esc)?.as_deref(), Some(""));
         assert_eq!(substring_similar("", "#\"#\"", esc)?.as_deref(), Some(""));
-        assert_eq!(substring_similar("ab", "#\"%#\"", esc)?.as_deref(), Some("ab"));
+        assert_eq!(
+            substring_similar("ab", "#\"%#\"", esc)?.as_deref(),
+            Some("ab")
+        );
 
         Ok(())
     }

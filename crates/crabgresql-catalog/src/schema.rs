@@ -17,8 +17,8 @@ use crabgresql_storage_api::{
 use crabgresql_types::{PgType, Value};
 
 use crate::{
-    CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine, CatalogSequence,
-    CatalogToast, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS, RelKind, TOAST_NAMESPACE,
+    CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogToast,
+    CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS, RelKind, TOAST_NAMESPACE,
 };
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the

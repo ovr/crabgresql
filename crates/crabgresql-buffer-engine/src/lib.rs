@@ -35,13 +35,11 @@ use crabgresql_storage_api::{
     ColumnProjection, DeleteResult, IndexMetadata, MAX_ROW_ID, RelStats, StorageError, TableAm,
     TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
-use crabgresql_txn::{
-    Clog, CommandId, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc,
-};
+use crabgresql_txn::{Clog, CommandId, TupleHeader, TxnContext, XactStatus, Xid, satisfies_mvcc};
 use crabgresql_types::Value;
 use crabgresql_types::datum::{decode_datum, encode_datum};
-use deepsize::DeepSizeOf;
 use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, Wal, WalError};
+use deepsize::DeepSizeOf;
 
 /// Resource manager for buffer-table records. 10 is the heap, 11 the B-tree,
 /// 12 Parquet.
@@ -253,17 +251,12 @@ impl BufferTable {
     /// Deliberately not snapshot-scoped: this backs `TRUNCATE`, which empties the
     /// relation outright. The caller must hold the relation's exclusive lock, so
     /// no other transaction can be adding rows while this runs.
-    pub fn delete_all_live_in(
-        &self,
-        rel: u32,
-        txn: &TxnContext,
-    ) -> Result<u64, StorageError> {
+    pub fn delete_all_live_in(&self, rel: u32, txn: &TxnContext) -> Result<u64, StorageError> {
         let live: Vec<u64> = {
             let rows = self.rows_read();
             rows.iter()
                 .filter(|row| {
-                    !row.hdr.xmax.is_valid()
-                        || txn.clog.status(row.hdr.xmax) == XactStatus::Aborted
+                    !row.hdr.xmax.is_valid() || txn.clog.status(row.hdr.xmax) == XactStatus::Aborted
                 })
                 .map(|row| row.row_id)
                 .collect()
@@ -467,7 +460,12 @@ impl BufferTable {
     /// record is the durability boundary, and because the WAL is one ordered
     /// stream, flushing at commit makes every earlier append durable for free —
     /// with group commit amortizing the fsync across sessions.
-    fn append(&self, rel: u32, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+    fn append(
+        &self,
+        rel: u32,
+        tuples: Vec<Tuple>,
+        txn: &TxnContext,
+    ) -> Result<Vec<Tid>, StorageError> {
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
@@ -866,15 +864,17 @@ impl TableAm for BufferTable {
             return Ok(None);
         };
         let row = &rows[index];
-        Ok(satisfies_mvcc(&row.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid)
-            .then(|| row.values.clone()))
+        Ok(
+            satisfies_mvcc(&row.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid)
+                .then(|| row.values.clone()),
+        )
     }
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
         let tids = self.append(self.relfilenode(), vec![tuple], txn)?;
-        tids.into_iter().next().ok_or_else(|| {
-            corrupt("buffer table insert produced no tid".to_string())
-        })
+        tids.into_iter()
+            .next()
+            .ok_or_else(|| corrupt("buffer table insert produced no tid".to_string()))
     }
 
     fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
@@ -884,7 +884,12 @@ impl TableAm for BufferTable {
     /// Update is delete-then-insert, as in the heap: the old version is stamped
     /// first, so two concurrent updaters serialize and the loser adds no second
     /// successor.
-    fn update(&self, tid: Tid, tuple: Tuple, txn: &TxnContext) -> Result<UpdateResult, StorageError> {
+    fn update(
+        &self,
+        tid: Tid,
+        tuple: Tuple,
+        txn: &TxnContext,
+    ) -> Result<UpdateResult, StorageError> {
         let Some(row_id) = tid.row_id() else {
             return Err(corrupt(format!(
                 "buffer table \"{}\" was handed a physical tid",
@@ -906,7 +911,10 @@ impl TableAm for BufferTable {
                 self.schema.name
             )));
         };
-        if self.stamp_deleted(self.relfilenode(), &[row_id], txn).is_empty() {
+        if self
+            .stamp_deleted(self.relfilenode(), &[row_id], txn)
+            .is_empty()
+        {
             return Ok(DeleteResult::NotFound);
         }
         Ok(DeleteResult::Deleted)
@@ -996,8 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn a_row_is_invisible_to_its_own_command_and_visible_to_the_next()
-    -> anyhow::Result<()> {
+    fn a_row_is_invisible_to_its_own_command_and_visible_to_the_next() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let (wal, table) = open(dir.path())?;
         let tm = manager(&wal);
@@ -1094,14 +1101,16 @@ mod tests {
     }
 
     #[test]
-    fn an_aborted_inserts_rows_are_invisible_and_vacuum_reclaims_them()
-    -> anyhow::Result<()> {
+    fn an_aborted_inserts_rows_are_invisible_and_vacuum_reclaims_them() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let (wal, table) = open(dir.path())?;
         let tm = manager(&wal);
 
         let xid = tm.allocate_xid();
-        table.insert_many(vec![row(1, "one"), row(2, "two")], &tm.context(xid, CommandId::FIRST))?;
+        table.insert_many(
+            vec![row(1, "one"), row(2, "two")],
+            &tm.context(xid, CommandId::FIRST),
+        )?;
         let charged = table.resident_bytes();
         assert!(charged > 0, "rows must be charged to the byte accounting");
         tm.abort(xid);
@@ -1119,15 +1128,16 @@ mod tests {
     }
 
     #[test]
-    fn a_committed_delete_is_retained_for_older_snapshots_then_vacuumed()
-    -> anyhow::Result<()> {
+    fn a_committed_delete_is_retained_for_older_snapshots_then_vacuumed() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let (wal, table) = open(dir.path())?;
         let tm = manager(&wal);
 
         let writer = tm.allocate_xid();
-        let tids =
-            table.insert_many(vec![row(1, "one"), row(2, "two")], &tm.context(writer, CommandId::FIRST))?;
+        let tids = table.insert_many(
+            vec![row(1, "one"), row(2, "two")],
+            &tm.context(writer, CommandId::FIRST),
+        )?;
         tm.commit(writer)?;
 
         // An open snapshot that predates the delete.
@@ -1170,9 +1180,15 @@ mod tests {
 
         let updater = tm.allocate_xid();
         let txn = tm.context(updater, CommandId::FIRST);
-        assert_eq!(table.update(tids[0], row(9, "nine"), &txn)?, UpdateResult::Updated);
+        assert_eq!(
+            table.update(tids[0], row(9, "nine"), &txn)?,
+            UpdateResult::Updated
+        );
         // A second update of the same version finds it already stamped.
-        assert_eq!(table.update(tids[0], row(8, "eight"), &txn)?, UpdateResult::NotFound);
+        assert_eq!(
+            table.update(tids[0], row(8, "eight"), &txn)?,
+            UpdateResult::NotFound
+        );
         tm.commit(updater)?;
 
         let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
@@ -1189,7 +1205,10 @@ mod tests {
         let writer = tm.allocate_xid();
         let tids = table.insert_many(vec![row(1, "one")], &tm.context(writer, CommandId::FIRST))?;
         tm.commit(writer)?;
-        assert!(tids[0].is_logical(), "a buffer table must mint logical tids");
+        assert!(
+            tids[0].is_logical(),
+            "a buffer table must mint logical tids"
+        );
 
         let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
         assert_eq!(table.fetch(tids[0], &reader)?, Some(row(1, "one")));
@@ -1222,7 +1241,11 @@ mod tests {
             let tm = manager(&wal);
             let xid = tm.allocate_xid();
             table.insert_many(
-                vec![row(1, "one"), row(2, "two"), row(3, "a rather longer label")],
+                vec![
+                    row(1, "one"),
+                    row(2, "two"),
+                    row(3, "a rather longer label"),
+                ],
                 &tm.context(xid, CommandId::FIRST),
             )?;
             tm.commit(xid)?;
@@ -1238,7 +1261,10 @@ mod tests {
 
         let wal = Arc::new(Wal::open(dir.path())?);
         let table = BufferTable::open(7, schema("b"), Vec::new(), wal);
-        table.restore(redo.take(7).expect("replay must recover the relation"), &clog);
+        table.restore(
+            redo.take(7).expect("replay must recover the relation"),
+            &clog,
+        );
 
         assert_eq!(
             table.resident_bytes(),
@@ -1249,8 +1275,8 @@ mod tests {
     }
 
     #[test]
-    fn committed_rows_are_rebuilt_from_the_wal_and_uncommitted_ones_are_not()
-    -> anyhow::Result<()> {
+    fn committed_rows_are_rebuilt_from_the_wal_and_uncommitted_ones_are_not() -> anyhow::Result<()>
+    {
         let dir = tempfile::tempdir()?;
         {
             let (wal, table) = open(dir.path())?;
@@ -1266,7 +1292,10 @@ mod tests {
             tm.commit(kept)?;
 
             let rolled_back = tm.allocate_xid();
-            table.insert_many(vec![row(4, "four")], &tm.context(rolled_back, CommandId::FIRST))?;
+            table.insert_many(
+                vec![row(4, "four")],
+                &tm.context(rolled_back, CommandId::FIRST),
+            )?;
             tm.abort(rolled_back);
 
             // Never resolved — the crash happens here. Force the record to disk
@@ -1290,11 +1319,8 @@ mod tests {
         let restored = redo.take(7).expect("replay must recover the relation");
         table.restore(restored, &clog);
 
-        let tm = TransactionManager::new_recovered(
-            Arc::new(NullSink),
-            Arc::new(clog),
-            result.next_xid,
-        );
+        let tm =
+            TransactionManager::new_recovered(Arc::new(NullSink), Arc::new(clog), result.next_xid);
         let reader = tm.context(tm.allocate_xid(), CommandId::FIRST);
         assert_eq!(
             visible_ids(&table, &reader),
@@ -1304,7 +1330,8 @@ mod tests {
         // A new insert must not reuse a recovered row id, or a replayed delete
         // would later hit the wrong row.
         let writer = tm.allocate_xid();
-        let fresh = table.insert_many(vec![row(6, "six")], &tm.context(writer, CommandId::FIRST))?;
+        let fresh =
+            table.insert_many(vec![row(6, "six")], &tm.context(writer, CommandId::FIRST))?;
         assert!(
             fresh[0].row_id().expect("logical tid") >= 5,
             "row ids must resume above every id the log mentions"
@@ -1474,8 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn a_large_batch_splits_into_several_wal_records_and_still_round_trips()
-    -> anyhow::Result<()> {
+    fn a_large_batch_splits_into_several_wal_records_and_still_round_trips() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         // Each row carries ~4 KiB of text, so 512 rows comfortably exceed the
         // 1 MiB record cap and force the split path.

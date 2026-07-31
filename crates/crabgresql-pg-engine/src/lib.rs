@@ -63,10 +63,10 @@ use crabgresql_wal::{
 };
 
 use crate::btredo::BtreeRedo;
-use crate::nbtree::BTree;
 use crate::bufpool::BufferPool;
 use crate::catalog::RelCatalog;
 use crate::heap::HeapTable;
+use crate::nbtree::BTree;
 use crate::redo::HeapRedo;
 use crate::smgr::StorageManager;
 
@@ -237,11 +237,7 @@ impl TableAm for ManagedTable {
         self.as_am().insert(tuple, txn)
     }
 
-    fn insert_many(
-        &self,
-        tuples: Vec<Tuple>,
-        txn: &TxnContext,
-    ) -> Result<Vec<Tid>, StorageError> {
+    fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
         self.as_am().insert_many(tuples, txn)
     }
 
@@ -565,7 +561,8 @@ impl PgEngine {
                 "discarding the tail of the write-ahead log"
             );
         }
-        wal.reset_to(res.end_of_wal).map_err(std::io::Error::other)?;
+        wal.reset_to(res.end_of_wal)
+            .map_err(std::io::Error::other)?;
         // Reconcile swap TRUNCATEs replayed from the WAL (apply committed, discard
         // the rest), reclaim orphaned staging files.
         engine.apply_recovered_truncates(&clog);
@@ -656,10 +653,8 @@ impl PgEngine {
         {
             Self::attach_clog_to(table, txnmgr.clog());
         }
-        let worker = crate::flush::FlushWorker::spawn(
-            Arc::downgrade(self),
-            BufferFlushPolicy::from_env(),
-        );
+        let worker =
+            crate::flush::FlushWorker::spawn(Arc::downgrade(self), BufferFlushPolicy::from_env());
         *self
             .flush_worker
             .lock()
@@ -692,9 +687,11 @@ impl PgEngine {
                 // and without that its memory only ever grows, which is the exact
                 // failure this worker exists to prevent.
                 let (rel, bytes, flushable) = match table.as_ref() {
-                    ManagedTable::Parquet(parquet) => {
-                        (parquet.relfilenode(), parquet.buffer().resident_bytes(), true)
-                    }
+                    ManagedTable::Parquet(parquet) => (
+                        parquet.relfilenode(),
+                        parquet.buffer().resident_bytes(),
+                        true,
+                    ),
                     ManagedTable::Buffer(buffer) => {
                         (buffer.relfilenode(), buffer.resident_bytes(), false)
                     }
@@ -829,11 +826,7 @@ impl PgEngine {
         info: u8,
         clean_shutdown: bool,
     ) -> std::io::Result<()> {
-        let sampled = self
-            .inner
-            .wal
-            .redo_point()
-            .map_err(std::io::Error::other)?;
+        let sampled = self.inner.wal.redo_point().map_err(std::io::Error::other)?;
         // Said out loud on purpose: a silently clamped redo point looks exactly
         // like a working bounded replay from the outside, and the cost — every
         // restart re-reading the whole stream — only shows up as slow startups.
@@ -883,10 +876,7 @@ impl PgEngine {
             .wal
             .append(RmgrId::CHECKPOINT, info, Xid::INVALID, &ckpt.encode())
             .end;
-        self.inner
-            .wal
-            .flush(end)
-            .map_err(std::io::Error::other)?;
+        self.inner.wal.flush(end).map_err(std::io::Error::other)?;
         self.last_next_xid.store(next_xid.0, Ordering::Relaxed);
         write_control(
             &self.data_dir,
@@ -913,7 +903,13 @@ impl PgEngine {
             for irel in index_rels {
                 self.inner.bufpool.forget_relation(irel);
                 smgr.truncate(irel)?;
-                BTree::open(Arc::clone(&self.inner), irel, Arc::new(RwLock::new(())), true).create();
+                BTree::open(
+                    Arc::clone(&self.inner),
+                    irel,
+                    Arc::new(RwLock::new(())),
+                    true,
+                )
+                .create();
             }
             // A chunk store is a plain heap file: it wants emptying, never the
             // B-tree initialization the index files above get. Conflating the two
@@ -1190,7 +1186,10 @@ impl TxnFinalize for PgEngine {
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"))
             .remove(&xid);
-        let handles = self.tables.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let handles = self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         for (namespace, name) in truncate_tables.into_iter().flatten() {
             if let Some(t) = handles
                 .get(&(namespace.clone(), name.clone()))
@@ -1282,7 +1281,10 @@ impl TxnFinalize for PgEngine {
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"))
             .remove(&xid);
-        let handles = self.tables.read().unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let handles = self
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         for (namespace, name) in truncate_tables.into_iter().flatten() {
             if let Some(t) = handles
                 .get(&(namespace.clone(), name.clone()))
@@ -1521,12 +1523,7 @@ impl TableEngine for PgEngine {
         Ok(())
     }
 
-    fn vacuum_table(
-        &self,
-        namespace: &str,
-        name: &str,
-        oldest: Xid,
-    ) -> Result<u64, StorageError> {
+    fn vacuum_table(&self, namespace: &str, name: &str, oldest: Xid) -> Result<u64, StorageError> {
         let Some(txnmgr) = self.txnmgr.get().and_then(std::sync::Weak::upgrade) else {
             return Err(StorageError::UnsupportedOperation(
                 "VACUUM is unavailable: this engine has no transaction service".to_string(),
@@ -1969,16 +1966,13 @@ mod tests {
     fn a_checkpoint_publishes_a_redo_point_naming_its_own_record() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
-        let (engine, clog, next_xid) =
-            PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let (engine, clog, next_xid) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
 
-        let table = engine.create_table(TableSchema::new(
-            "t",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        let table =
+            engine.create_table(TableSchema::new("t", vec![Column::new("id", PgType::Int4)]))?;
         let xid = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(xid, CommandId::FIRST))?;
         tm.commit(xid)?;
@@ -2115,10 +2109,7 @@ mod tests {
         // The positive control: a logged one does clamp, so the assertion above
         // cannot be passing merely because the clamp is broken outright.
         logged.truncate(&tm.context(xid, CommandId::FIRST))?;
-        assert_eq!(
-            engine.redo_clamp(),
-            Some(RedoClamp::UnreconciledTruncate)
-        );
+        assert_eq!(engine.redo_clamp(), Some(RedoClamp::UnreconciledTruncate));
 
         Ok(())
     }
@@ -2137,10 +2128,7 @@ mod tests {
         let xid = tm.allocate_xid();
         a.truncate(&tm.context(xid, CommandId::FIRST))?;
         b.truncate(&tm.context(xid, CommandId::FIRST))?;
-        assert_eq!(
-            engine.redo_clamp(),
-            Some(RedoClamp::UnreconciledTruncate)
-        );
+        assert_eq!(engine.redo_clamp(), Some(RedoClamp::UnreconciledTruncate));
 
         // Reconciling one of them must not lift the clamp for the other.
         let tables = engine
@@ -2170,8 +2158,7 @@ mod tests {
     fn a_checkpoint_records_the_live_xid_floor() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
-        let (engine, clog, next_xid) =
-            PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let (engine, clog, next_xid) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
@@ -2259,13 +2246,12 @@ mod test_support {
     pub fn ephemeral() -> Ephemeral {
         let dir = TempDir::new().expect("create temp data dir");
         let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
-        let (engine, clog, next_xid) =
-            PgEngine::open_recovered_from(
+        let (engine, clog, next_xid) = PgEngine::open_recovered_from(
             dir.path(),
             Arc::clone(&wal),
             crabgresql_wal::Lsn::INVALID,
         )
-                .expect("open engine");
+        .expect("open engine");
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut txnmgr = TransactionManager::new_recovered(sink, clog, next_xid);
         txnmgr.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
