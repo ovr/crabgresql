@@ -897,6 +897,7 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
         BoundExpr::Const { .. } => true,
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
         | BoundExpr::Reinterpret { expr, .. } => is_row_constant(expr),
@@ -1155,6 +1156,25 @@ fn explain_expr(expr: &BoundExpr, names: &[Option<&str>]) -> String {
         BoundExpr::Coerce { expr, .. } | BoundExpr::Reinterpret { expr, .. } => {
             explain_expr(expr, names)
         }
+        BoundExpr::IsNull { expr, negated } => format!(
+            "{} IS {}NULL",
+            explain_expr(expr, names),
+            if *negated { "NOT " } else { "" }
+        ),
+        BoundExpr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => format!(
+            "{} IS {}{}",
+            explain_expr(expr, names),
+            if *negated { "NOT " } else { "" },
+            match value {
+                Some(true) => "TRUE",
+                Some(false) => "FALSE",
+                None => "UNKNOWN",
+            }
+        ),
         BoundExpr::Binary {
             op, left, right, ..
         } => format!(
@@ -2410,7 +2430,7 @@ mod tests {
         ));
         assert_eq!(lines[0], "Hash Join");
         assert_eq!(lines[1], "  Hash Cond: (id = id)");
-        assert_eq!(lines[2], "  Filter: (…)");
+        assert_eq!(lines[2], "  Filter: (big IS NULL)");
     }
 
     #[test]

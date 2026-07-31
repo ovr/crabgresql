@@ -170,6 +170,7 @@ pub(crate) fn is_relocatable(expr: &BoundExpr) -> bool {
             }
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => opaque(expr),

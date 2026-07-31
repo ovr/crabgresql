@@ -24,6 +24,7 @@ test: timestamp
 test: timestamptz
 test: interval
 test: case
+test: bool_test
 test: in
 test: between
 test: transactions

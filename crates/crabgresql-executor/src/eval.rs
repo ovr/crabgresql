@@ -55,6 +55,20 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             let is_null = matches!(eval(expr, row, ctx)?, Value::Null);
             Ok(Value::Bool(is_null != *negated))
         }
+        // Also total: the operand is exactly one of true/false/unknown, so
+        // every test against it answers yes or no.
+        BoundExpr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => {
+            let operand = eval(expr, row, ctx)?;
+            let hit = match value {
+                Some(want) => matches!(operand, Value::Bool(b) if b == *want),
+                None => matches!(operand, Value::Null),
+            };
+            Ok(Value::Bool(hit != *negated))
+        }
         BoundExpr::Coerce { expr, ty } => coerce_value(eval(expr, row, ctx)?, *ty, ctx),
         BoundExpr::Reinterpret { expr, rep, .. } => {
             cast::reinterpret_value(eval(expr, row, ctx)?, *rep)

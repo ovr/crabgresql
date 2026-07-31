@@ -853,6 +853,7 @@ fn resolve_expr(expr: &mut BoundExpr, ctx: &ExecContext, txn: &TxnContext) -> Re
         | BoundExpr::OuterColumnRef { .. } => {}
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
         | BoundExpr::Reinterpret { expr, .. } => resolve_expr(expr, ctx, txn)?,
@@ -3862,6 +3863,43 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(eval_const(&is_null(Value::Null, true))?, Value::Bool(false));
+
+        Ok(())
+    }
+
+    #[test]
+    fn bool_test_is_never_null() -> anyhow::Result<()> {
+        let test = |operand: Option<bool>, value, negated| BoundExpr::BoolTest {
+            expr: Box::new(BoundExpr::Const {
+                value: operand.map_or(Value::Null, Value::Bool),
+                ty: PgType::Bool,
+            }),
+            value,
+            negated,
+        };
+        // The full truth table, matching PG: each operand is exactly one of the
+        // three values, so exactly one un-negated test holds for it.
+        //             operand      IS TRUE  IS FALSE  IS UNKNOWN
+        let expected = [
+            (Some(true), [true, false, false]),
+            (Some(false), [false, true, false]),
+            (None, [false, false, true]),
+        ];
+        for (operand, [is_t, is_f, is_unk]) in expected {
+            for (value, want) in [(Some(true), is_t), (Some(false), is_f), (None, is_unk)] {
+                assert_eq!(
+                    eval_const(&test(operand, value, false))?,
+                    Value::Bool(want),
+                    "{operand:?} IS {value:?}"
+                );
+                // The negated spelling is the exact complement — never NULL.
+                assert_eq!(
+                    eval_const(&test(operand, value, true))?,
+                    Value::Bool(!want),
+                    "{operand:?} IS NOT {value:?}"
+                );
+            }
+        }
 
         Ok(())
     }

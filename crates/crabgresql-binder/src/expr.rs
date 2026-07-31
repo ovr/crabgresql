@@ -256,6 +256,16 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         negated: bool,
     },
+    /// `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN`. Total, unlike a
+    /// comparison: the operand equals exactly one of the three boolean values,
+    /// so the test is never itself NULL.
+    BoolTest {
+        expr: Box<BoundExpr>,
+        /// The boolean value the operand is tested against, in SQL's own
+        /// three-valued domain — `None` is `UNKNOWN`, i.e. NULL.
+        value: Option<bool>,
+        negated: bool,
+    },
     /// Runtime cast, evaluated by `executor::eval::coerce_value` via the shared
     /// `crabgresql_types::cast::cast_value`.
     Coerce {
@@ -621,7 +631,7 @@ impl BoundExpr {
                     PgType::Bool
                 }
             }
-            BoundExpr::IsNull { .. } => PgType::Bool,
+            BoundExpr::IsNull { .. } | BoundExpr::BoolTest { .. } => PgType::Bool,
             BoundExpr::Coerce { ty, .. } => *ty,
             BoundExpr::Reinterpret { reported, .. } => *reported,
             BoundExpr::FuncCall { ret, .. } | BoundExpr::Routine { ret, .. } => *ret,
@@ -649,6 +659,7 @@ impl BoundExpr {
             BoundExpr::Srf { .. } => true,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_srf(),
@@ -695,6 +706,7 @@ impl BoundExpr {
             BoundExpr::Routine { .. } => true,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_routine(),
@@ -751,7 +763,9 @@ impl BoundExpr {
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_aggregate() || right.contains_aggregate()
             }
-            BoundExpr::IsNull { expr, .. } => expr.contains_aggregate(),
+            BoundExpr::IsNull { expr, .. } | BoundExpr::BoolTest { expr, .. } => {
+                expr.contains_aggregate()
+            }
             BoundExpr::Coerce { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Collate { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Reinterpret { expr, .. } => expr.contains_aggregate(),
@@ -809,6 +823,7 @@ impl BoundExpr {
             | BoundExpr::Exists { .. } => false,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_window(),
@@ -862,6 +877,7 @@ impl BoundExpr {
             | BoundExpr::Exists { .. } => None,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.first_agg_or_window(),
@@ -921,6 +937,7 @@ impl BoundExpr {
             }
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.contains_volatile_fn(),
@@ -964,6 +981,7 @@ impl BoundExpr {
             | BoundExpr::OuterColumnRef { .. } => 0,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.count_param_refs(index),
@@ -1030,6 +1048,7 @@ impl BoundExpr {
                 | BoundExpr::OuterColumnRef { .. } => {}
                 BoundExpr::Unary { expr, .. }
                 | BoundExpr::IsNull { expr, .. }
+                | BoundExpr::BoolTest { expr, .. }
                 | BoundExpr::Coerce { expr, .. }
                 | BoundExpr::Collate { expr, .. }
                 | BoundExpr::Reinterpret { expr, .. } => fold(expr, acc),
@@ -1118,6 +1137,7 @@ impl BoundExpr {
             | BoundExpr::OuterColumnRef { .. } => true,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.collect_column_refs(out),
@@ -1201,6 +1221,7 @@ impl BoundExpr {
             | BoundExpr::Exists { .. } => {}
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
             | BoundExpr::Reinterpret { expr, .. } => expr.shift_column_refs(delta),
@@ -1499,6 +1520,15 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
         },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
             expr: Box::new(outerize_columns(expr, level)),
+            negated: *negated,
+        },
+        BoundExpr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => BoundExpr::BoolTest {
+            expr: Box::new(outerize_columns(expr, level)),
+            value: *value,
             negated: *negated,
         },
         BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {
@@ -2122,6 +2152,12 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         } => bind_binary(left, op, right, op_span.0, scope),
         ast::Expr::IsNull(inner) => bind_is_null(inner, scope, false),
         ast::Expr::IsNotNull(inner) => bind_is_null(inner, scope, true),
+        ast::Expr::IsTrue(i) => bind_bool_test(i, scope, Some(true), false, "IS TRUE"),
+        ast::Expr::IsNotTrue(i) => bind_bool_test(i, scope, Some(true), true, "IS NOT TRUE"),
+        ast::Expr::IsFalse(i) => bind_bool_test(i, scope, Some(false), false, "IS FALSE"),
+        ast::Expr::IsNotFalse(i) => bind_bool_test(i, scope, Some(false), true, "IS NOT FALSE"),
+        ast::Expr::IsUnknown(i) => bind_bool_test(i, scope, None, false, "IS UNKNOWN"),
+        ast::Expr::IsNotUnknown(i) => bind_bool_test(i, scope, None, true, "IS NOT UNKNOWN"),
         ast::Expr::Cast {
             expr, data_type, ..
         } => bind_cast(expr, data_type, scope),
@@ -3902,6 +3938,28 @@ fn bind_is_null(inner: &ast::Expr, scope: &Scope, negated: bool) -> Result<Bindi
     };
     Ok(Binding::Typed(BoundExpr::IsNull {
         expr: Box::new(expr),
+        negated,
+    }))
+}
+
+/// `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN`. Unlike `IS NULL`,
+/// which accepts any type, these demand a boolean operand — `context` is the
+/// clause spelling PG puts in the `42804`, and it also points its cursor at the
+/// operand, so stamp the span `to_bool_operand` has no way to know. An untyped
+/// literal takes boolean from here.
+fn bind_bool_test(
+    inner: &ast::Expr,
+    scope: &Scope,
+    value: Option<bool>,
+    negated: bool,
+    context: &str,
+) -> Result<Binding, BindError> {
+    use crabgresql_parser::ast::Spanned;
+    let expr =
+        to_bool_operand(bind_expr(inner, scope)?, context).map_err(|e| e.at(inner.span()))?;
+    Ok(Binding::Typed(BoundExpr::BoolTest {
+        expr: Box::new(expr),
+        value,
         negated,
     }))
 }
@@ -6780,6 +6838,15 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
         },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
             expr: Box::new(inline_params(*expr, args)),
+            negated,
+        },
+        BoundExpr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => BoundExpr::BoolTest {
+            expr: Box::new(inline_params(*expr, args)),
+            value,
             negated,
         },
         BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {

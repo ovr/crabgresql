@@ -799,7 +799,9 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
             subst_expr(left, params);
             subst_expr(right, params);
         }
-        BoundExpr::IsNull { expr, .. } => subst_expr(expr, params),
+        BoundExpr::IsNull { expr, .. } | BoundExpr::BoolTest { expr, .. } => {
+            subst_expr(expr, params)
+        }
         BoundExpr::Coerce { expr, .. } => subst_expr(expr, params),
         BoundExpr::Collate { expr, .. } => subst_expr(expr, params),
         BoundExpr::Reinterpret { expr, .. } => subst_expr(expr, params),
@@ -1123,6 +1125,7 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => {}
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
         | BoundExpr::Reinterpret { expr, .. } => subst_outer_expr(expr, outer, depth),
@@ -1391,6 +1394,7 @@ fn expr_has_outer_ref(expr: &BoundExpr) -> bool {
         BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => false,
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
         | BoundExpr::Reinterpret { expr, .. } => expr_has_outer_ref(expr),
@@ -4381,6 +4385,15 @@ fn rewrite_over_window(
             expr: Box::new(rewrite_over_window(*expr, input_width, groups)?),
             negated,
         }),
+        BoundExpr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => Ok(BoundExpr::BoolTest {
+            expr: Box::new(rewrite_over_window(*expr, input_width, groups)?),
+            value,
+            negated,
+        }),
         BoundExpr::Coerce { expr, ty } => Ok(BoundExpr::Coerce {
             expr: Box::new(rewrite_over_window(*expr, input_width, groups)?),
             ty,
@@ -4741,6 +4754,20 @@ fn rewrite_over_aggregate(
                 aggregates,
                 scope,
             )?),
+            negated,
+        }),
+        BoundExpr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => Ok(BoundExpr::BoolTest {
+            expr: Box::new(rewrite_over_aggregate(
+                *expr,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
+            value,
             negated,
         }),
         BoundExpr::Coerce { expr, ty } => Ok(BoundExpr::Coerce {
@@ -8265,6 +8292,71 @@ mod tests {
             e.message,
             "argument of CASE/WHEN must be type boolean, not type integer"
         );
+    }
+
+    /// The first projected expression of a bound `SELECT`.
+    fn first_projection(sql: &str) -> BoundExpr {
+        let LogicalPlan::Query { projections, .. } = bound(sql) else {
+            panic!("expected Query");
+        };
+        projections.into_iter().next().expect("no projections")
+    }
+
+    #[test]
+    fn boolean_test_operand_must_be_boolean() {
+        // PG names the clause after the spelling that was used, so each form
+        // reports itself.
+        for (sql, context) in [
+            ("SELECT id IS TRUE FROM t", "IS TRUE"),
+            ("SELECT id IS NOT TRUE FROM t", "IS NOT TRUE"),
+            ("SELECT id IS FALSE FROM t", "IS FALSE"),
+            ("SELECT id IS NOT FALSE FROM t", "IS NOT FALSE"),
+            ("SELECT id IS UNKNOWN FROM t", "IS UNKNOWN"),
+            ("SELECT id IS NOT UNKNOWN FROM t", "IS NOT UNKNOWN"),
+        ] {
+            let e = bind_err(sql);
+            assert_eq!(e.code, "42804", "{sql}");
+            assert_eq!(
+                e.message,
+                format!("argument of {context} must be type boolean, not type integer"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_test_takes_an_untyped_literal_as_boolean() {
+        // Unlike IS NULL, which defaults an unknown to text, the boolean tests
+        // give it boolean from context — so 'true' parses rather than failing.
+        assert!(matches!(
+            first_projection("SELECT 'true' IS TRUE FROM t"),
+            BoundExpr::BoolTest { .. }
+        ));
+        let e = bind_err("SELECT 'a' IS TRUE FROM t");
+        assert_eq!(e.message, "invalid input syntax for type boolean: \"a\"");
+    }
+
+    #[test]
+    fn is_unknown_is_a_bool_test_against_null() {
+        // UNKNOWN is the third boolean value, so it rides the same node rather
+        // than collapsing into IsNull — which would lose the spelling EXPLAIN
+        // has to print back.
+        assert!(matches!(
+            first_projection("SELECT flag IS UNKNOWN FROM t"),
+            BoundExpr::BoolTest {
+                value: None,
+                negated: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            first_projection("SELECT flag IS NOT UNKNOWN FROM t"),
+            BoundExpr::BoolTest {
+                value: None,
+                negated: true,
+                ..
+            }
+        ));
     }
 
     #[test]
