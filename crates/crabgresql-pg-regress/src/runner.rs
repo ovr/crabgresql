@@ -150,6 +150,9 @@ fn expected_candidates(regress_dir: &Path, name: &str) -> Vec<PathBuf> {
 async fn run_test(port: u16, sql: &str, statement_timeout: Duration) -> io::Result<String> {
     let mut client = Client::connect(port).await?;
     let mut out = String::new();
+    // psql starts with an empty NULL marker. `\pset null` updates this for the
+    // lifetime of the current script/connection only.
+    let mut null_display = String::new();
     // A `COPY … FROM STDIN` statement is held here until its `CopyData` payload
     // arrives (the data lines are lexed after the statement), then run together.
     let mut pending_copy: Option<String> = None;
@@ -160,7 +163,13 @@ async fn run_test(port: u16, sql: &str, statement_timeout: Duration) -> io::Resu
                 out.push('\n');
             }
             ScriptItem::Metacommand(command) => {
-                out.push_str(&format::metacommand_stub(&command));
+                match pset_null_value(&command) {
+                    Some(Some(value)) => null_display = value,
+                    // With no value, quiet psql leaves the setting unchanged
+                    // and emits nothing.
+                    Some(None) => {}
+                    None => out.push_str(&format::metacommand_stub(&command)),
+                }
             }
             ScriptItem::Statement(statement) => {
                 // Defer a COPY FROM STDIN: it runs once its data is collected.
@@ -170,7 +179,7 @@ async fn run_test(port: u16, sql: &str, statement_timeout: Duration) -> io::Resu
                 }
                 match tokio::time::timeout(statement_timeout, client.simple_query(&statement)).await
                 {
-                    Ok(Ok(events)) => render_events(&mut out, &events, &statement),
+                    Ok(Ok(events)) => render_events(&mut out, &events, &statement, &null_display),
                     Ok(Err(_)) => {
                         out.push_str("connection to server was lost\n");
                         break;
@@ -188,7 +197,7 @@ async fn run_test(port: u16, sql: &str, statement_timeout: Duration) -> io::Resu
                 match tokio::time::timeout(statement_timeout, client.copy_in(&statement, &data))
                     .await
                 {
-                    Ok(Ok(events)) => render_events(&mut out, &events, &statement),
+                    Ok(Ok(events)) => render_events(&mut out, &events, &statement, &null_display),
                     Ok(Err(_)) => {
                         out.push_str("connection to server was lost\n");
                         break;
@@ -206,7 +215,7 @@ async fn run_test(port: u16, sql: &str, statement_timeout: Duration) -> io::Resu
 
 /// Print a statement's responses: result tables, errors and notices. Command
 /// tags are suppressed, as under `psql -q`.
-fn render_events(out: &mut String, events: &[QueryEvent], query: &str) {
+fn render_events(out: &mut String, events: &[QueryEvent], query: &str, null_display: &str) {
     let mut fields: Option<Vec<Field>> = None;
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
     for event in events {
@@ -218,7 +227,7 @@ fn render_events(out: &mut String, events: &[QueryEvent], query: &str) {
             QueryEvent::Row(row) => rows.push(row.clone()),
             QueryEvent::CommandComplete(_tag) => {
                 if let Some(fields) = fields.take() {
-                    out.push_str(&format::format_table(&fields, &rows));
+                    out.push_str(&format::format_table(&fields, &rows, null_display));
                     rows.clear();
                 }
             }
@@ -226,5 +235,75 @@ fn render_events(out: &mut String, events: &[QueryEvent], query: &str) {
             QueryEvent::Error(error) => out.push_str(&format::format_error(error, query)),
             QueryEvent::Notice(notice) => out.push_str(&format::format_notice(notice, query)),
         }
+    }
+}
+
+/// Recognize `\pset null [value]`. The outer `Option` distinguishes this one
+/// supported metacommand from every other command; the inner one distinguishes
+/// no value (query the setting, silent under `-q`) from an explicitly empty
+/// value (`''`).
+fn pset_null_value(command: &str) -> Option<Option<String>> {
+    let rest = command.strip_prefix("pset")?;
+    if rest.chars().next().is_some_and(|c| !c.is_whitespace()) {
+        return None;
+    }
+    let rest = rest.trim_start().strip_prefix("null")?;
+    if rest.chars().next().is_some_and(|c| !c.is_whitespace()) {
+        return None;
+    }
+    let value = rest.trim_start();
+    if value.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(parse_meta_argument(value)))
+    }
+}
+
+/// Parse the first psql metacommand argument. Quotes group and disappear;
+/// backslash quotes the following character both inside and outside quotes.
+fn parse_meta_argument(input: &str) -> String {
+    let mut out = String::new();
+    let mut chars = input.chars();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) if c == '\\' => {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            Some(_) => out.push(c),
+            None if matches!(c, '\'' | '"') => quote = Some(c),
+            None if c == '\\' => {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            None if c.is_whitespace() => break,
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pset_null_values() {
+        assert_eq!(
+            pset_null_value("pset null '(null)'"),
+            Some(Some("(null)".into()))
+        );
+        assert_eq!(pset_null_value("pset null ''"), Some(Some(String::new())));
+        assert_eq!(pset_null_value("pset null NULL"), Some(Some("NULL".into())));
+        assert_eq!(
+            pset_null_value(r"pset null '\\N'"),
+            Some(Some(r"\N".into()))
+        );
+        assert_eq!(pset_null_value("pset null"), Some(None));
+        assert_eq!(pset_null_value("pset format aligned"), None);
     }
 }

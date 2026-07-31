@@ -24,6 +24,10 @@ use crate::{BindError, BoundAggregate, OutputColumn};
 /// A scalar function the executor can evaluate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarFn {
+    /// `booleq(boolean, boolean) -> boolean`.
+    BoolEq,
+    /// `boolne(boolean, boolean) -> boolean`.
+    BoolNe,
     Trunc,
     Round,
     Ceil,
@@ -1450,6 +1454,16 @@ fn lookup(name: &str) -> &'static [Signature] {
         };
     }
     match name {
+        "booleq" => &[Signature {
+            func: ScalarFn::BoolEq,
+            args: &[BOOL, BOOL],
+            ret: BOOL,
+        }],
+        "boolne" => &[Signature {
+            func: ScalarFn::BoolNe,
+            args: &[BOOL, BOOL],
+            ret: BOOL,
+        }],
         "trunc" => &[
             Signature {
                 func: ScalarFn::Trunc,

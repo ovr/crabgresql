@@ -13,13 +13,13 @@ use crate::client::{ErrorFields, Field};
 /// xid, cid, float4, float8, money, numeric, xid8.
 const RIGHT_ALIGNED_OIDS: &[u32] = &[20, 21, 23, 26, 28, 29, 700, 701, 790, 1700, 5069];
 
-pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>]) -> String {
+pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>], null_display: &str) -> String {
     let widths: Vec<usize> = fields
         .iter()
         .enumerate()
         .map(|(i, field)| {
             rows.iter()
-                .map(|row| row[i].as_deref().map_or(0, |v| v.chars().count()))
+                .map(|row| row[i].as_deref().unwrap_or(null_display).chars().count())
                 .max()
                 .unwrap_or(0)
                 .max(field.name.chars().count())
@@ -50,7 +50,7 @@ pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>]) -> String {
             .iter()
             .enumerate()
             .map(|(i, value)| {
-                let value = value.as_deref().unwrap_or("");
+                let value = value.as_deref().unwrap_or(null_display);
                 let pad = " ".repeat(widths[i] - value.chars().count());
                 match (RIGHT_ALIGNED_OIDS.contains(&fields[i].type_oid), i == last) {
                     (true, false) => format!(" {pad}{value} "),
@@ -233,19 +233,19 @@ mod tests {
 
     #[test]
     fn int_column_right_aligns_and_header_pads() {
-        let out = format_table(&[field("one", 23)], &[vec![text("1")]]);
+        let out = format_table(&[field("one", 23)], &[vec![text("1")]], "");
         assert_eq!(out, " one \n-----\n   1\n(1 row)\n\n");
     }
 
     #[test]
     fn bool_column_left_aligns() {
-        let out = format_table(&[field("true", 16)], &[vec![text("t")]]);
+        let out = format_table(&[field("true", 16)], &[vec![text("t")]], "");
         assert_eq!(out, " true \n------\n t\n(1 row)\n\n");
     }
 
     #[test]
     fn default_column_name_width() {
-        let out = format_table(&[field("?column?", 23)], &[vec![text("1")]]);
+        let out = format_table(&[field("?column?", 23)], &[vec![text("1")]], "");
         assert_eq!(out, " ?column? \n----------\n        1\n(1 row)\n\n");
     }
 
@@ -257,6 +257,7 @@ mod tests {
                 vec![text("true "), text("t")],
                 vec![text("false"), text("f")],
             ],
+            "",
         );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "   d   | istrue ");
@@ -268,7 +269,11 @@ mod tests {
 
     #[test]
     fn null_renders_empty_and_last_column_keeps_lone_space() {
-        let out = format_table(&[field("a", 23), field("b", 25)], &[vec![text("1"), None]]);
+        let out = format_table(
+            &[field("a", 23), field("b", 25)],
+            &[vec![text("1"), None]],
+            "",
+        );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[2], " 1 | ");
     }
@@ -278,6 +283,7 @@ mod tests {
         let out = format_table(
             &[field("id", 23), field("name", 25)],
             &[vec![text("1"), text("ferris")]],
+            "",
         );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], " id |  name  ");
@@ -287,8 +293,14 @@ mod tests {
 
     #[test]
     fn zero_rows_footer() {
-        let out = format_table(&[field("a", 23)], &[]);
+        let out = format_table(&[field("a", 23)], &[], "");
         assert_eq!(out, " a \n---\n(0 rows)\n\n");
+    }
+
+    #[test]
+    fn configured_null_marker_affects_width_but_not_empty_strings() {
+        let out = format_table(&[field("a", 25)], &[vec![None], vec![text("")]], "(null)");
+        assert_eq!(out, "   a    \n--------\n (null)\n \n(2 rows)\n\n");
     }
 
     #[test]

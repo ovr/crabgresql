@@ -114,6 +114,10 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             .map(Value::Int4)
             .map_err(|_| out_of_range(PgType::Int4)),
 
+        // PostgreSQL exposes an explicit int4 -> boolean cast: zero is false,
+        // every other value is true. There is deliberately no int2/int8 arm.
+        (Value::Int4(n), PgType::Bool) => Ok(Value::Bool(*n != 0)),
+
         // ---- integer → float ----
         (Value::Int2(n), PgType::Float4) => Ok(Value::Float4(*n as f32)),
         (Value::Int2(n), PgType::Float8) => Ok(Value::Float8(*n as f64)),
@@ -1073,6 +1077,21 @@ mod tests {
         let e = cast(Value::Text("x".into()), PgType::Bool).unwrap_err();
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(e.message, "invalid input syntax for type boolean: \"x\"");
+
+        Ok(())
+    }
+
+    #[test]
+    fn only_int4_casts_to_bool() -> anyhow::Result<()> {
+        assert_eq!(cast(Value::Int4(0), PgType::Bool)?, Value::Bool(false));
+        assert_eq!(cast(Value::Int4(1), PgType::Bool)?, Value::Bool(true));
+        assert_eq!(cast(Value::Int4(2), PgType::Bool)?, Value::Bool(true));
+        assert_eq!(cast(Value::Int4(-1), PgType::Bool)?, Value::Bool(true));
+
+        for value in [Value::Int2(1), Value::Int8(1)] {
+            let error = cast(value, PgType::Bool).unwrap_err();
+            assert_eq!(error.sqlstate, "42846");
+        }
 
         Ok(())
     }

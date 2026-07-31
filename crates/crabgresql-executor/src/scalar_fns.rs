@@ -124,6 +124,17 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         return Ok(Value::Null);
     }
     match func {
+        ScalarFn::BoolEq | ScalarFn::BoolNe => {
+            let (Value::Bool(left), Value::Bool(right)) = (&args[0], &args[1]) else {
+                unreachable!("boolean comparison received non-boolean arguments")
+            };
+            let equal = left == right;
+            return Ok(Value::Bool(if matches!(func, ScalarFn::BoolEq) {
+                equal
+            } else {
+                !equal
+            }));
+        }
         // --- geometric (point / lseg) ---
         ScalarFn::Geo(g) => return eval_geo(g, args),
         // Sequence functions are side-effecting and are dispatched by `eval`
@@ -2362,6 +2373,28 @@ fn num_err(e: crabgresql_types::numeric::NumErr) -> ExecError {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boolean_equality_functions_are_strict() -> anyhow::Result<()> {
+        for (left, right, equal) in [
+            (false, false, true),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let args = [Value::Bool(left), Value::Bool(right)];
+            assert_eq!(eval_scalar(ScalarFn::BoolEq, &args)?, Value::Bool(equal));
+            assert_eq!(eval_scalar(ScalarFn::BoolNe, &args)?, Value::Bool(!equal));
+        }
+        for func in [ScalarFn::BoolEq, ScalarFn::BoolNe] {
+            assert_eq!(
+                eval_scalar(func, &[Value::Bool(true), Value::Null])?,
+                Value::Null
+            );
+        }
+
+        Ok(())
+    }
 
     fn call(f: ScalarFn, x: f64) -> f64 {
         let result = match eval_scalar(f, &[Value::Float8(x)]) {

@@ -4060,6 +4060,21 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn coerce_int4_to_bool_at_runtime() -> anyhow::Result<()> {
+        let ctx = &ExecContext::default();
+        assert_eq!(
+            coerce_value(Value::Int4(0), PgType::Bool, ctx)?,
+            Value::Bool(false)
+        );
+        assert_eq!(
+            coerce_value(Value::Int4(-42), PgType::Bool, ctx)?,
+            Value::Bool(true)
+        );
+
+        Ok(())
+    }
+
     fn test_table() -> Arc<dyn TableAm> {
         let engine = crabgresql_pg_engine::ephemeral_engine();
         let table = test_ok(engine.create_table(TableSchema::in_namespace(
