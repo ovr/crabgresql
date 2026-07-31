@@ -3285,7 +3285,19 @@ pub(crate) fn resolve_call(
             .iter()
             .any(|b| matches!(b, Binding::Unknown { .. }))
     {
-        narrow_by_unknown_category(name, &bindings, arity)?
+        // The typed arguments get the first and last word: PG discards the
+        // candidates they cannot reach and keeps the most exact matches among
+        // them (rules 4.a/4.b) *before* consulting the unknown positions (4.e).
+        // Running the unknown rule first would let the string-category
+        // preference throw away a signature the typed arguments had already
+        // singled out — `overlay(bit, unknown, int4)` would lose its `bit`
+        // overload to the `text` one.
+        let narrowed = narrow_by_typed_args(&bindings, arity);
+        if narrowed.len() > 1 {
+            narrow_by_unknown_category(name, &bindings, narrowed)?
+        } else {
+            narrowed
+        }
     } else {
         arity
     };
@@ -3589,21 +3601,38 @@ fn undefined_function(name: &str, bindings: &[Binding]) -> BindError {
     )
 }
 
-/// PG's type categories, only as far as overload resolution needs them.
+/// PG's `pg_type.typcategory`, transcribed from `vendor/postgres/catalog/
+/// pg_type.dat`. Types sharing a category are interchangeable enough that an
+/// untyped literal can be steered between them; types in different categories
+/// are not, and an untyped argument spanning two of them is ambiguous.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Category {
-    String,
-    Numeric,
-    DateTime,
-    Timespan,
+    /// `B`.
     Boolean,
-    /// Everything else: each type is its own category, keyed by its OID so
-    /// unrelated types never look interchangeable.
+    /// `S`.
+    String,
+    /// `N`.
+    Numeric,
+    /// `D`.
+    DateTime,
+    /// `T`.
+    Timespan,
+    /// `I`.
+    Network,
+    /// `V`.
+    BitString,
+    /// `G`.
+    Geometric,
+    /// `U`, PG's catch-all for types with no family of their own.
+    UserDefined,
+    /// A type not in the table above (currently the `reg*` family and arrays):
+    /// its own category, keyed by OID so unrelated types never look alike.
     Other(u32),
 }
 
 fn category(ty: PgType) -> Category {
     match ty {
+        PgType::Bool => Category::Boolean,
         PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => Category::String,
         PgType::Int2
         | PgType::Int4
@@ -3611,22 +3640,80 @@ fn category(ty: PgType) -> Category {
         | PgType::Float4
         | PgType::Float8
         | PgType::Numeric
+        | PgType::Money
         | PgType::Oid => Category::Numeric,
         PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
             Category::DateTime
         }
         PgType::Interval => Category::Timespan,
-        PgType::Bool => Category::Boolean,
+        PgType::Inet | PgType::Cidr => Category::Network,
+        PgType::Bit | PgType::Varbit => Category::BitString,
+        PgType::Point | PgType::Lseg | PgType::Path => Category::Geometric,
+        PgType::Bytea
+        | PgType::Uuid
+        | PgType::Json
+        | PgType::Jsonb
+        | PgType::Jsonpath
+        | PgType::Tsvector
+        | PgType::Tsquery
+        | PgType::Macaddr
+        | PgType::Macaddr8
+        | PgType::Tid
+        | PgType::Xid
+        | PgType::Xid8
+        | PgType::PgLsn => Category::UserDefined,
         other => Category::Other(other.oid()),
     }
 }
 
-/// The one preferred type per category, which wins a tie among candidates.
+/// `pg_type.typispreferred`, from the same source. A category can have more
+/// than one (`N` marks both `float8` and `oid`), and several have none.
 fn is_preferred(ty: PgType) -> bool {
     matches!(
         ty,
-        PgType::Text | PgType::Float8 | PgType::TimestampTz | PgType::Interval | PgType::Bool
+        PgType::Bool
+            | PgType::Text
+            | PgType::Float8
+            | PgType::Oid
+            | PgType::TimestampTz
+            | PgType::Interval
+            | PgType::Inet
+            | PgType::Varbit
     )
+}
+
+/// PG's rules 4.a and 4.b, restricted to the arguments whose type is already
+/// known: drop the candidates no typed argument can reach, then keep those with
+/// the most arguments already at their exact type. An empty result is left empty
+/// so the caller reports `42883` rather than a misleading ambiguity.
+fn narrow_by_typed_args<'a>(
+    bindings: &[Binding],
+    candidates: Vec<&'a Signature>,
+) -> Vec<&'a Signature> {
+    let reachable = |sig: &&Signature| {
+        bindings
+            .iter()
+            .zip(sig.args)
+            .all(|(binding, target)| match binding {
+                // An untyped literal reaches anything; it is the unknown-argument
+                // rule's job to choose between the candidates it leaves standing.
+                Binding::Unknown { .. } => true,
+                Binding::Typed(e) => {
+                    e.ty() == *target || crate::expr::implicit_castable(e.ty(), *target)
+                }
+            })
+    };
+    let exact_matches = |sig: &&Signature| {
+        bindings
+            .iter()
+            .zip(sig.args)
+            .filter(|(binding, target)| matches!(binding, Binding::Typed(e) if e.ty() == **target))
+            .count()
+    };
+    let mut kept: Vec<&Signature> = candidates.into_iter().filter(reachable).collect();
+    let best = kept.iter().map(exact_matches).max().unwrap_or(0);
+    kept.retain(|sig| exact_matches(&sig) == best);
+    kept
 }
 
 /// PG's unknown-argument rule. When several overloads all match exactly, the

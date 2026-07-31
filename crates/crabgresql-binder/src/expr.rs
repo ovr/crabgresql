@@ -6684,7 +6684,7 @@ pub(crate) fn coerce_for_arg(
 /// Whether `from` implicitly casts to `to` in a function-argument (or operator)
 /// context — the numeric-widening casts PG marks implicit, including int→float4
 /// (so e.g. `float4send(1)` resolves).
-fn implicit_castable(from: PgType, to: PgType) -> bool {
+pub(crate) fn implicit_castable(from: PgType, to: PgType) -> bool {
     use PgType::*;
     from == to
         || matches!(

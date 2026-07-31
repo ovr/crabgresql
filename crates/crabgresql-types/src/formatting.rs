@@ -92,6 +92,17 @@ fn twelve_hour(hour: i64) -> FormatError {
     .with_hint("Use the 24-hour clock, or give an hour between 1 and 12.")
 }
 
+/// PG bounds every numeric field it scans to the `int` range as it reads the
+/// digits, so an absurdly long run is rejected here rather than overflowing the
+/// calendar arithmetic downstream.
+fn value_out_of_range(code: &str) -> FormatError {
+    FormatError::new(
+        DATETIME_FIELD_OVERFLOW,
+        format!("value for \"{code}\" in source string is out of range"),
+    )
+    .with_detail("Value must be in the range -2147483648 to 2147483647.")
+}
+
 fn field_out_of_range(input: &str) -> FormatError {
     FormatError::new(
         DATETIME_FIELD_OVERFLOW,
@@ -317,6 +328,10 @@ fn parse_picture(fmt: &str) -> Vec<Node> {
                 i += 1;
             }
             i += 1; // skip the closing quote (absent at end of string)
+            // `FM` binds to the node that directly follows it, literal text
+            // included, so it is spent here rather than reaching a later field:
+            // `FM"a"HH24` is `a04`, not `a4`.
+            fm = false;
             continue;
         }
         // `FM` is a prefix, not a field: it sets fill mode for the next field.
@@ -350,7 +365,10 @@ fn parse_picture(fmt: &str) -> Vec<Node> {
             fm = false;
             continue;
         }
+        // Passthrough text is a node too, so it also consumes a pending `FM`:
+        // `to_char(interval '1 day', 'FM YYYY')` still zero-pads the year.
         literal.push(chars[i]);
+        fm = false;
         i += 1;
     }
     if !literal.is_empty() {
@@ -530,8 +548,14 @@ fn render_interval(code: Code, f: &IvFields, fm: bool) -> (String, i64) {
         Code::Milli => (num(f.fsec / 1000, 3, fm), f.fsec / 1000),
         Code::Micro => (num(f.fsec, 6, fm), f.fsec),
         Code::Meridiem { dotted, upper } => (meridiem(f.hour.rem_euclid(24), dotted, upper), 0),
-        // Rejected before we get here.
-        _ => (String::new(), 0),
+        // Listed rather than wildcarded so a new calendar-bound code has to be
+        // classified in `valid_for_interval` before this will compile.
+        Code::MonthName(_)
+        | Code::MonthAbbr(_)
+        | Code::DayName(_)
+        | Code::DayAbbr(_)
+        | Code::TzAbbr { .. }
+        | Code::TzOffset => (String::new(), 0),
     }
 }
 
@@ -628,7 +652,7 @@ fn recase(name: &str, case: Case) -> String {
 
 /// The English ordinal suffix for `value`, uppercased when the picture spelled
 /// the suffix `TH` rather than `th`.
-fn ordinal(value: i64, upper: bool) -> &'static str {
+pub(crate) fn ordinal(value: i64, upper: bool) -> &'static str {
     let v = value.unsigned_abs();
     let suffix = if (11..=13).contains(&(v % 100)) {
         "th"
@@ -712,16 +736,13 @@ pub fn from_char_timestamptz(input: &str, fmt: &str) -> Result<i64, FormatError>
 pub fn from_char_date(input: &str, fmt: &str) -> Result<i32, FormatError> {
     let (t, _) = from_char(input, fmt)?;
     let jd = timestamp::date2j(t.year, t.month, t.day);
-    if !(0..=JULIAN_MAX).contains(&jd) {
+    if !(0..i64::from(crate::date::JULIAN_MAX)).contains(&jd) {
         return Err(date_out_of_range(input));
     }
     timestamp::validate_fields(&t, input).map_err(|e| FormatError::new(e.sqlstate, e.message))?;
     let days = jd - timestamp::POSTGRES_EPOCH_JDATE;
     i32::try_from(days).map_err(|_| date_out_of_range(input))
 }
-
-/// The largest Julian day a `date` can hold (`5874897-12-31`).
-const JULIAN_MAX: i64 = 2_147_483_494;
 
 /// Scan `input` against `fmt`, returning the assembled calendar time and the
 /// zone offset (seconds east of UTC) if the picture carried one.
@@ -733,7 +754,19 @@ fn from_char(input: &str, fmt: &str) -> Result<(Tm, i32), FormatError> {
 
     for (idx, node) in nodes.iter().enumerate() {
         match node {
-            Node::Literal(s) => scan_literal(s, &chars, &mut pos),
+            Node::Literal(s) => {
+                // A separator must not eat the `+`/`-` the following `OF` field
+                // needs as its own sign, or `'… HH24:MI:SS OF'` can never match
+                // an offset like `-05`.
+                let next_takes_sign = matches!(
+                    nodes.get(idx + 1),
+                    Some(Node::Field {
+                        code: Code::TzOffset,
+                        ..
+                    })
+                );
+                scan_literal(s, &chars, &mut pos, next_takes_sign);
+            }
             Node::Field {
                 code,
                 spell,
@@ -753,18 +786,28 @@ fn from_char(input: &str, fmt: &str) -> Result<(Tm, i32), FormatError> {
         }
     }
 
-    assemble(&p)
+    let (t, offset) = assemble(&p)?;
+    // `validate_fields` bounds the calendar fields but not the fraction, and a
+    // `US`/`MS` value inside the int range can still exceed a second.
+    if !(0..1_000_000).contains(&t.usec) {
+        return Err(field_out_of_range(input));
+    }
+    Ok((t, offset))
 }
 
 /// Literal picture text only skips input: whitespace is consumed freely, and
 /// each non-alphanumeric picture character eats one non-alphanumeric input
 /// character if present. This is what lets `'2024/03/05'` match `'YYYY-MM-DD'`.
-fn scan_literal(s: &str, chars: &[char], pos: &mut usize) {
+fn scan_literal(s: &str, chars: &[char], pos: &mut usize, next_takes_sign: bool) {
     for c in s.chars() {
         while chars.get(*pos).is_some_and(|c| c.is_whitespace()) {
             *pos += 1;
         }
-        if !c.is_alphanumeric() && chars.get(*pos).is_some_and(|c| !c.is_alphanumeric()) {
+        let reserved_sign = next_takes_sign && matches!(chars.get(*pos), Some('+') | Some('-'));
+        if !c.is_alphanumeric()
+            && !reserved_sign
+            && chars.get(*pos).is_some_and(|c| !c.is_alphanumeric())
+        {
             *pos += 1;
         }
     }
@@ -937,7 +980,13 @@ fn take_number(
         *pos += 1;
     }
     match take_digits(chars, pos, width) {
-        Some((value, digits)) => Ok((if negative { -value } else { value }, digits)),
+        Some((value, digits)) => {
+            let signed = if negative { -value } else { value };
+            if signed > i64::from(i32::MAX) || signed < i64::from(i32::MIN) {
+                return Err(value_out_of_range(spell));
+            }
+            Ok((signed, digits))
+        }
         None => {
             // PG quotes the raw input slice, truncated to the field's width.
             let raw: String = chars
@@ -957,9 +1006,12 @@ fn take_digits(chars: &[char], pos: &mut usize, width: Option<usize>) -> Option<
     while *pos < limit {
         match chars.get(*pos) {
             Some(c) if c.is_ascii_digit() => {
+                // Saturate rather than bail: the digit run still has to be
+                // consumed, and `take_number` reports the overflow as PG's
+                // "value ... is out of range" once it sees the total.
                 value = value
-                    .checked_mul(10)?
-                    .checked_add(i64::from(*c as u8 - b'0'))?;
+                    .saturating_mul(10)
+                    .saturating_add(i64::from(*c as u8 - b'0'));
                 *pos += 1;
             }
             _ => break,
@@ -1361,6 +1413,69 @@ mod tests {
             to_ts("2024 123456", "YYYY US"),
             "2024-01-01 00:00:00.123456+00"
         );
+    }
+
+    #[test]
+    fn oversized_fields_are_rejected_not_overflowed() {
+        // A digit run past the int range is PG's "out of range", not a panic in
+        // the calendar arithmetic downstream.
+        for (input, fmt, code) in [
+            ("100000000000000000", "YYYY", "YYYY"),
+            ("294276 9223372036854775807", "YYYY US", "US"),
+            ("2024 999999999999999999", "YYYY US", "US"),
+        ] {
+            let e = expect_err(from_char_timestamptz(input, fmt));
+            assert_eq!(e.sqlstate, "22008", "{input}");
+            assert_eq!(
+                e.message,
+                format!("value for \"{code}\" in source string is out of range")
+            );
+            assert!(e.detail.is_some());
+        }
+        assert_eq!(
+            expect_err(from_char_date("100000000000000000", "YYYY")).message,
+            "value for \"YYYY\" in source string is out of range"
+        );
+        // In range for an int, but still more than a second of fraction.
+        let e = expect_err(from_char_timestamptz("2024 9999999", "YYYY US"));
+        assert_eq!(e.sqlstate, "22008");
+        assert_eq!(
+            e.message,
+            "date/time field value out of range: \"2024 9999999\""
+        );
+    }
+
+    #[test]
+    fn date_range_upper_bound_is_exclusive() {
+        assert_eq!(to_date("5874897-12-31", "YYYY-MM-DD"), "5874897-12-31");
+        assert_eq!(
+            expect_err(from_char_date("5874898", "YYYY")).message,
+            "date out of range: \"5874898\""
+        );
+    }
+
+    #[test]
+    fn a_separator_leaves_the_offset_its_sign() {
+        // The space before `OF` must not eat the `-` the offset needs.
+        assert_eq!(
+            to_ts("2024-03-05 10:00:00 -05", "YYYY-MM-DD HH24:MI:SS OF"),
+            "2024-03-05 15:00:00+00"
+        );
+        assert_eq!(
+            to_ts("2024-03-05 10:00:00-05", "YYYY-MM-DD HH24:MI:SSOF"),
+            "2024-03-05 15:00:00+00"
+        );
+        // A separator still swallows one for an ordinary numeric field.
+        assert_eq!(to_date("2024 -03", "YYYY MM"), "2024-03-01");
+    }
+
+    #[test]
+    fn fm_binds_to_the_next_node_whatever_it_is() {
+        // Quoted text and passthrough are nodes too, so they consume the FM.
+        assert_eq!(ts(STAMP, "FM\"a\"HH24"), "a14");
+        assert_eq!(ts("2024-03-05 04:00:00", "FM\"a\"HH24"), "a04");
+        assert_eq!(iv("1 day", "TH FM YYYY th"), "TH  0000 th");
+        assert_eq!(ts(STAMP, "FMHH24"), "14");
     }
 
     #[test]

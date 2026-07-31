@@ -255,6 +255,45 @@ SELECT to_timestamp('NaN'::float8);
 ERROR:  timestamp cannot be NaN
 SELECT to_timestamp(1e18);
 ERROR:  timestamp out of range: "1e+18"
+-- a separator must leave the offset its sign, and FM binds to the very next
+-- node -- quoted text and passthrough included
+SELECT to_timestamp('2024-03-05 10:00:00 -05', 'YYYY-MM-DD HH24:MI:SS OF') AS spaced_of,
+       to_timestamp('2024-03-05 10:00:00-05', 'YYYY-MM-DD HH24:MI:SSOF') AS tight_of,
+       to_date('2024 -03', 'YYYY MM') AS separator_eats_one;
+       spaced_of        |        tight_of        | separator_eats_one 
+------------------------+------------------------+--------------------
+ 2024-03-05 15:00:00+00 | 2024-03-05 15:00:00+00 | 2024-03-01
+(1 row)
+
+SELECT to_char(timestamp '2024-03-05 04:00:00', 'FM"a"HH24') AS fm_then_quote,
+       to_char(interval '1 day', 'TH FM YYYY th') AS fm_then_space;
+ fm_then_quote | fm_then_space 
+---------------+---------------
+ a04           | TH  0000 th
+(1 row)
+
+-- the date range's upper bound is exclusive
+SELECT to_date('5874897-12-31', 'YYYY-MM-DD') AS max_date;
+   max_date    
+---------------
+ 5874897-12-31
+(1 row)
+
+SELECT to_date('5874898', 'YYYY');
+ERROR:  date out of range: "5874898"
+SELECT '5874898-01-01'::date;
+ERROR:  date out of range: "5874898-01-01"
+LINE 1: SELECT '5874898-01-01'::date;
+               ^
+-- an oversized field is reported, not overflowed into the calendar arithmetic
+SELECT to_date('100000000000000000', 'YYYY');
+ERROR:  value for "YYYY" in source string is out of range
+DETAIL:  Value must be in the range -2147483648 to 2147483647.
+SELECT to_timestamp('2024 999999999999999999', 'YYYY US');
+ERROR:  value for "US" in source string is out of range
+DETAIL:  Value must be in the range -2147483648 to 2147483647.
+SELECT to_timestamp('2024 9999999', 'YYYY US');
+ERROR:  date/time field value out of range: "2024 9999999"
 -- datetime parse errors
 SELECT to_date('2024-XX-05', 'YYYY-MM-DD');
 ERROR:  invalid value "XX" for "MM"
@@ -365,6 +404,20 @@ SELECT '[' || to_char('NaN'::numeric, '999') || '][' || to_char('NaN'::numeric, 
       nan      |        inf         
 ---------------+--------------------
  [ NaN][  NaN] | [ ####.##][<####>]
+(1 row)
+
+-- an infinity has no exponent form either, so EEEE overflows too
+SELECT '[' || to_char('Infinity'::numeric, '9.99EEEE') || '][' || to_char('-Infinity'::numeric, '9.99EEEE') || ']' AS inf_sci;
+        inf_sci         
+------------------------
+ [ #.######][ #.######]
+(1 row)
+
+-- more digit positions than an i64 holds, for the TH accumulator
+SELECT '[' || to_char(99999999999999999999999::numeric, '99999999999999999999999TH') || ']' AS wide_th;
+           wide_th            
+------------------------------
+ [ 99999999999999999999999TH]
 (1 row)
 
 -- V shifts the value, TH suffixes it, RN spells it out

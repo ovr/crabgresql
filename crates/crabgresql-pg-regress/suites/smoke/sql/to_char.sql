@@ -120,6 +120,24 @@ SELECT to_timestamp('infinity'::float8) AS inf;
 SELECT to_timestamp('NaN'::float8);
 SELECT to_timestamp(1e18);
 
+-- a separator must leave the offset its sign, and FM binds to the very next
+-- node -- quoted text and passthrough included
+SELECT to_timestamp('2024-03-05 10:00:00 -05', 'YYYY-MM-DD HH24:MI:SS OF') AS spaced_of,
+       to_timestamp('2024-03-05 10:00:00-05', 'YYYY-MM-DD HH24:MI:SSOF') AS tight_of,
+       to_date('2024 -03', 'YYYY MM') AS separator_eats_one;
+SELECT to_char(timestamp '2024-03-05 04:00:00', 'FM"a"HH24') AS fm_then_quote,
+       to_char(interval '1 day', 'TH FM YYYY th') AS fm_then_space;
+
+-- the date range's upper bound is exclusive
+SELECT to_date('5874897-12-31', 'YYYY-MM-DD') AS max_date;
+SELECT to_date('5874898', 'YYYY');
+SELECT '5874898-01-01'::date;
+
+-- an oversized field is reported, not overflowed into the calendar arithmetic
+SELECT to_date('100000000000000000', 'YYYY');
+SELECT to_timestamp('2024 999999999999999999', 'YYYY US');
+SELECT to_timestamp('2024 9999999', 'YYYY US');
+
 -- datetime parse errors
 SELECT to_date('2024-XX-05', 'YYYY-MM-DD');
 SELECT to_date('garbage', 'YYYY-MM-DD');
@@ -177,6 +195,10 @@ SELECT '[' || to_char(1, 'FM9') || '][' || to_char(1.5, 'FM99.999') || ']' AS fm
 -- NaN and the infinities
 SELECT '[' || to_char('NaN'::numeric, '999') || '][' || to_char('NaN'::numeric, '9999.99') || ']' AS nan,
        '[' || to_char('Infinity'::numeric, '9999.99') || '][' || to_char('-Infinity'::numeric, '9999PR') || ']' AS inf;
+-- an infinity has no exponent form either, so EEEE overflows too
+SELECT '[' || to_char('Infinity'::numeric, '9.99EEEE') || '][' || to_char('-Infinity'::numeric, '9.99EEEE') || ']' AS inf_sci;
+-- more digit positions than an i64 holds, for the TH accumulator
+SELECT '[' || to_char(99999999999999999999999::numeric, '99999999999999999999999TH') || ']' AS wide_th;
 
 -- V shifts the value, TH suffixes it, RN spells it out
 SELECT '[' || to_char(1234, '999V9') || '][' || to_char(1.2, '99V9') || ']' AS v,

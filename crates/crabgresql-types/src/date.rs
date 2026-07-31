@@ -38,9 +38,12 @@ pub const NEG_INFINITY: i32 = i32::MIN;
 pub const POS_INFINITY: i32 = i32::MAX;
 
 /// PG's finite `date` range, expressed in days since 2000-01-01:
-/// `4714-11-24 BC` (Julian day 0) .. `5874897-12-31`.
+/// `4714-11-24 BC` (Julian day 0) ..= `5874897-12-31`.
 const DATE_MINVAL: i32 = -(POSTGRES_EPOCH_JDATE as i32); // Julian day 0
-const JULIAN_MAX: i32 = 2_147_483_494;
+/// One past the last Julian day a `date` can hold — `5874897-12-31` is
+/// `JULIAN_MAX - 1`. PG's `IS_VALID_DATE` compares against it exclusively, so
+/// every bound built from it must too.
+pub(crate) const JULIAN_MAX: i32 = 2_147_483_494;
 const DATE_MAXVAL: i32 = JULIAN_MAX - POSTGRES_EPOCH_JDATE as i32;
 
 /// Days from the Unix epoch (1970-01-01) to the PG epoch, as a date value; the
@@ -137,12 +140,26 @@ pub fn parse(input: &str) -> Result<i32, DateError> {
         return Err(field_out_of_range(input));
     }
     let jd = date2j(tm.year, tm.month, tm.day) - POSTGRES_EPOCH_JDATE;
-    to_date_value(jd).ok_or_else(|| field_out_of_range(input))
+    // A well-formed calendar date that simply lies outside the type's range is
+    // "date out of range"; a bad *field* was already reported just above.
+    to_date_value(jd).ok_or_else(|| out_of_range_input(input))
+}
+
+/// The input-quoting form, for a value that parsed cleanly but lies outside the
+/// type's range. The arithmetic paths use the bare [`out_of_range`] instead,
+/// having no source text to quote.
+fn out_of_range_input(input: &str) -> DateError {
+    DateError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        message: format!("date out of range: \"{input}\""),
+    }
 }
 
 /// Range-check a Julian-relative day count and narrow it to the `i32` date value.
+/// `DATE_MAXVAL` is the first *invalid* day, so the upper bound is exclusive —
+/// `5874898-01-01` is out of range even though `5874897-12-31` is not.
 fn to_date_value(jd: i64) -> Option<i32> {
-    if jd < DATE_MINVAL as i64 || jd > DATE_MAXVAL as i64 {
+    if jd < DATE_MINVAL as i64 || jd >= DATE_MAXVAL as i64 {
         return None;
     }
     Some(jd as i32)

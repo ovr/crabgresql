@@ -287,10 +287,9 @@ pub fn from_unix_epoch(seconds: f64) -> Result<i64, TimestampError> {
     }
     let out_of_range = || TimestampError {
         sqlstate: DATETIME_FIELD_OVERFLOW,
-        message: format!(
-            "timestamp out of range: \"{}\"",
-            crate::float::fmt_f64(seconds, 0)
-        ),
+        // PG builds this message with `%g`, i.e. six significant digits and a
+        // two-digit exponent — not `float8out`, which would print all fifteen.
+        message: format!("timestamp out of range: \"{}\"", format_g(seconds)),
     };
     // Shift to the PG epoch first, so the `i64` conversion sees the stored
     // value; `rint` semantics (ties to even) match PG's rounding of the
@@ -308,6 +307,36 @@ pub fn from_unix_epoch(seconds: f64) -> Result<i64, TimestampError> {
 
 /// Seconds from the Unix epoch (1970-01-01) to the PG epoch (2000-01-01).
 const EPOCH_SECS: f64 = 946_684_800.0;
+
+/// C's `%g`: six significant digits, trailing zeros trimmed, switching to
+/// exponent form when the exponent is below -4 or at least the precision.
+fn format_g(v: f64) -> String {
+    const SIG: usize = 6;
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let exp = v.abs().log10().floor() as i32;
+    if exp < -4 || exp >= SIG as i32 {
+        let mantissa = format!("{:.*}", SIG - 1, v / 10f64.powi(exp));
+        let mantissa = trim_zeros(&mantissa);
+        format!(
+            "{mantissa}e{}{:02}",
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
+    } else {
+        let decimals = (SIG as i32 - 1 - exp).max(0) as usize;
+        trim_zeros(&format!("{v:.decimals$}")).to_string()
+    }
+}
+
+fn trim_zeros(s: &str) -> &str {
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        s
+    }
+}
 
 /// `timestamptz AT TIME ZONE zone` (= `timezone(zone, timestamptz)`): the wall
 /// clock the instant shows in `zone`, as a zone-less `timestamp`. `±infinity`

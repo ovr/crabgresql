@@ -16,7 +16,7 @@
 //! [`render`] fills it and finally slides the sign next to the leading digit.
 
 use crate::Numeric;
-use crate::formatting::FormatError;
+use crate::formatting::{FormatError, ordinal};
 
 const SYNTAX_ERROR: &str = "42601";
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
@@ -425,7 +425,9 @@ fn render(n: &Numeric, fmt: &str, sig_cap: Option<usize>) -> Result<String, Form
                     let ch = int_digits.as_bytes()[idx - first] as char;
                     cells.push(Cell::plain(ch));
                     printed_int = true;
-                    last_value = last_value * 10 + i64::from(ch as u8 - b'0');
+                    // Only the last two digits matter to `ordinal`, and a
+                    // picture may hold more digit positions than an i64 does.
+                    last_value = (last_value * 10 + i64::from(ch as u8 - b'0')) % 100;
                 } else if forced {
                     cells.push(Cell::plain('0'));
                     printed_int = true;
@@ -534,6 +536,22 @@ fn pow10(n: u32) -> Numeric {
     Numeric::parse(&s).unwrap_or_else(|_| Numeric::from_i128(1))
 }
 
+/// The `EEEE` field with every column filled with `#` — PG's rendering for a
+/// value no exponent can express. The exponent's own four columns fill too.
+fn sci_overflow_field(f: &NumFormat) -> String {
+    let mut out = String::new();
+    if f.sign_slot {
+        out.push(' ');
+    }
+    out.push_str(&"#".repeat(f.pre));
+    if f.has_dec {
+        out.push('.');
+    }
+    out.push_str(&"#".repeat(f.post));
+    out.push_str("####");
+    out
+}
+
 /// PG right-aligns `NaN` in the sign slot plus the integer positions, and keeps
 /// a `PR` pair's trailing column.
 fn nan_field(f: &NumFormat) -> String {
@@ -553,6 +571,11 @@ fn nan_field(f: &NumFormat) -> String {
 fn scientific(n: &Numeric, f: &NumFormat) -> String {
     if n.is_nan() {
         return nan_field(f);
+    }
+    if n.is_infinite() {
+        // No exponent can represent an infinity, so the field overflows just as
+        // it does on the ordinary path: every digit position becomes `#`.
+        return sci_overflow_field(f);
     }
     let display = n.to_display();
     let negative = display.starts_with('-');
@@ -632,30 +655,6 @@ fn roman(n: &Numeric, upper: bool, fm: bool) -> String {
         out
     } else {
         format!("{out:>ROMAN_WIDTH$}")
-    }
-}
-
-fn ordinal(value: i64, upper: bool) -> &'static str {
-    let v = value.unsigned_abs();
-    let suffix = if (11..=13).contains(&(v % 100)) {
-        "th"
-    } else {
-        match v % 10 {
-            1 => "st",
-            2 => "nd",
-            3 => "rd",
-            _ => "th",
-        }
-    };
-    if upper {
-        match suffix {
-            "st" => "ST",
-            "nd" => "ND",
-            "rd" => "RD",
-            _ => "TH",
-        }
-    } else {
-        suffix
     }
 }
 
@@ -858,6 +857,21 @@ mod tests {
         assert_eq!(num("Infinity", "999"), " ###");
         assert_eq!(num("Infinity", "9999.99"), " ####.##");
         assert_eq!(num("-Infinity", "9999PR"), "<####>");
+    }
+
+    #[test]
+    fn infinities_overflow_the_eeee_field() {
+        assert_eq!(num("Infinity", "9.99EEEE"), " #.######");
+        assert_eq!(num("-Infinity", "9.99EEEE"), " #.######");
+    }
+
+    #[test]
+    fn ordinal_survives_more_digits_than_an_i64() {
+        // 23 digit positions: the ordinal accumulator must not overflow.
+        assert_eq!(
+            num("99999999999999999999999", "99999999999999999999999TH"),
+            " 99999999999999999999999TH"
+        );
     }
 
     #[test]
