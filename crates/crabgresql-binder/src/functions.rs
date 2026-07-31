@@ -153,6 +153,31 @@ pub enum ScalarFn {
     Age,
     /// `to_char(interval, text) -> text`.
     ToCharInterval,
+    /// `to_char(timestamp, text) -> text`.
+    ToCharTimestamp,
+    /// `to_char(timestamptz, text) -> text`.
+    ToCharTimestampTz,
+    /// `to_char(time, text) -> text`; PG reaches this through its implicit
+    /// `time -> interval` cast, so it renders with the interval codes.
+    ToCharTime,
+    /// `to_char(numeric, text) -> text`.
+    ToCharNumeric,
+    /// `to_char(int4, text) -> text`.
+    ToCharInt4,
+    /// `to_char(int8, text) -> text`.
+    ToCharInt8,
+    /// `to_char(float4, text) -> text`.
+    ToCharFloat4,
+    /// `to_char(float8, text) -> text`.
+    ToCharFloat8,
+    /// `to_date(text, text) -> date`.
+    ToDate,
+    /// `to_timestamp(text, text) -> timestamptz`.
+    ToTimestampFormat,
+    /// `to_timestamp(float8) -> timestamptz`: seconds since the Unix epoch.
+    ToTimestampUnix,
+    /// `to_number(text, text) -> numeric`.
+    ToNumber,
 
     // --- timestamptz operators/functions ---
     /// `date_part(text, timestamptz) -> float8`.
@@ -1296,6 +1321,7 @@ pub(crate) fn resolve_generate_series(
     Err(undefined_function("generate_series", bindings))
 }
 
+const F4: PgType = PgType::Float4;
 const F8: PgType = PgType::Float8;
 const TS: PgType = PgType::Timestamp;
 const TSTZ: PgType = PgType::TimestampTz;
@@ -1741,10 +1767,84 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[TS, TS],
             ret: IV,
         }],
-        "to_char" => &[Signature {
-            func: ScalarFn::ToCharInterval,
-            args: &[IV, TEXT],
-            ret: TEXT,
+        // PG has no `to_char(date)` and no `to_char(time)` overload: a `date`
+        // reaches the timestamptz form through the preferred-type rule
+        // (`to_char(date, 'TZ')` is `UTC`, not the empty string), and a `time`
+        // reaches the interval form through pg_cast's implicit
+        // `time -> interval`. We spell the `time` case as its own signature
+        // rather than adding that cast, which would also reshuffle operator
+        // resolution for `time`. Order is load-bearing for `resolve_call`'s
+        // best-coercible pass: TSTZ must lead TS so a `date` widens the way PG
+        // widens it, and I4 must lead the rest so an `int2` lands on int4.
+        "to_char" => &[
+            Signature {
+                func: ScalarFn::ToCharTimestampTz,
+                args: &[TSTZ, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharTimestamp,
+                args: &[TS, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharInterval,
+                args: &[IV, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharTime,
+                args: &[TIME, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharInt4,
+                args: &[I4, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharInt8,
+                args: &[I8, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharNumeric,
+                args: &[NUM, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharFloat8,
+                args: &[F8, TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ToCharFloat4,
+                args: &[F4, TEXT],
+                ret: TEXT,
+            },
+        ],
+        "to_date" => &[Signature {
+            func: ScalarFn::ToDate,
+            args: &[TEXT, TEXT],
+            ret: DATE,
+        }],
+        // The two forms differ in arity, so they never compete.
+        "to_timestamp" => &[
+            Signature {
+                func: ScalarFn::ToTimestampFormat,
+                args: &[TEXT, TEXT],
+                ret: TSTZ,
+            },
+            Signature {
+                func: ScalarFn::ToTimestampUnix,
+                args: &[F8],
+                ret: TSTZ,
+            },
+        ],
+        "to_number" => &[Signature {
+            func: ScalarFn::ToNumber,
+            args: &[TEXT, TEXT],
+            ret: NUM,
         }],
         "make_timestamptz" => &[
             Signature {
@@ -3173,18 +3273,29 @@ pub(crate) fn resolve_call(
     // so `power(numeric, int)` prefers `power(numeric, numeric)` over the float8
     // overload, as PG's preferred-type resolution does. Ties keep list order
     // (float8 listed first, the preferred numeric-category type).
-    for sig in sigs {
-        if sig.args.len() == bindings.len()
-            && let Some(args) = try_coerce_args(&bindings, sig.args, true)
-        {
+    // PG chooses an overload from the argument *types*, never from an untyped
+    // literal's contents, so the unknown-argument rule below considers every
+    // same-arity signature — not just the ones whose literal happens to parse.
+    let arity: Vec<&Signature> = sigs
+        .iter()
+        .filter(|sig| sig.args.len() == bindings.len())
+        .collect();
+    let candidates = if arity.len() > 1
+        && bindings
+            .iter()
+            .any(|b| matches!(b, Binding::Unknown { .. }))
+    {
+        narrow_by_unknown_category(name, &bindings, arity)?
+    } else {
+        arity
+    };
+    for sig in &candidates {
+        if let Some(args) = try_coerce_args(&bindings, sig.args, true) {
             return finish_func_call(sig.func, sig.ret, args);
         }
     }
     let mut best: Option<(usize, &Signature, Vec<BoundExpr>)> = None;
-    for sig in sigs {
-        if sig.args.len() != bindings.len() {
-            continue;
-        }
+    for sig in &candidates {
         if let Some(args) = try_coerce_args(&bindings, sig.args, false) {
             let exact = bindings
                 .iter()
@@ -3478,8 +3589,93 @@ fn undefined_function(name: &str, bindings: &[Binding]) -> BindError {
     )
 }
 
-/// PG's `42725` for a call that matches two overloads equally well, with the same
-/// DETAIL/HINT PostgreSQL prints (see [`crate::expr`]'s operator-ambiguity error).
+/// PG's type categories, only as far as overload resolution needs them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Category {
+    String,
+    Numeric,
+    DateTime,
+    Timespan,
+    Boolean,
+    /// Everything else: each type is its own category, keyed by its OID so
+    /// unrelated types never look interchangeable.
+    Other(u32),
+}
+
+fn category(ty: PgType) -> Category {
+    match ty {
+        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => Category::String,
+        PgType::Int2
+        | PgType::Int4
+        | PgType::Int8
+        | PgType::Float4
+        | PgType::Float8
+        | PgType::Numeric
+        | PgType::Oid => Category::Numeric,
+        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+            Category::DateTime
+        }
+        PgType::Interval => Category::Timespan,
+        PgType::Bool => Category::Boolean,
+        other => Category::Other(other.oid()),
+    }
+}
+
+/// The one preferred type per category, which wins a tie among candidates.
+fn is_preferred(ty: PgType) -> bool {
+    matches!(
+        ty,
+        PgType::Text | PgType::Float8 | PgType::TimestampTz | PgType::Interval | PgType::Bool
+    )
+}
+
+/// PG's unknown-argument rule. When several overloads all match exactly, the
+/// only thing separating them is what an untyped literal should become: at each
+/// unknown position prefer the string category (an unknown literal *looks* like
+/// a string), else require every candidate to agree on one category, else give
+/// up with `42725`. Within the chosen category the preferred type wins.
+///
+/// This is what makes `substring('abcdef','2')` pick the regex form (a `text`
+/// candidate exists at position 2) while `to_char('x','y')` is ambiguous (its
+/// candidates span the datetime, timespan and numeric categories).
+fn narrow_by_unknown_category<'a>(
+    name: &str,
+    bindings: &[Binding],
+    mut candidates: Vec<&'a Signature>,
+) -> Result<Vec<&'a Signature>, BindError> {
+    for (i, binding) in bindings.iter().enumerate() {
+        if candidates.len() < 2 {
+            break;
+        }
+        if !matches!(binding, Binding::Unknown { .. }) {
+            continue;
+        }
+        let mut cats = candidates.iter().map(|sig| category(sig.args[i]));
+        let first = match cats.next() {
+            Some(c) => c,
+            None => break,
+        };
+        let chosen = if candidates
+            .iter()
+            .any(|sig| category(sig.args[i]) == Category::String)
+        {
+            Category::String
+        } else if cats.all(|c| c == first) {
+            first
+        } else {
+            return Err(ambiguous_function(name, bindings));
+        };
+        candidates.retain(|sig| category(sig.args[i]) == chosen);
+        if candidates.iter().any(|sig| is_preferred(sig.args[i])) {
+            candidates.retain(|sig| is_preferred(sig.args[i]));
+        }
+    }
+    Ok(candidates)
+}
+
+/// PG's `42725` for a call that matches two overloads equally well. Unlike the
+/// operator-ambiguity error in [`crate::expr`], which splits its advice across
+/// DETAIL and HINT, PG puts the whole sentence in the function form's HINT.
 fn ambiguous_function(name: &str, bindings: &[Binding]) -> BindError {
     BindError::new(
         sqlstate::AMBIGUOUS_FUNCTION,
@@ -3488,11 +3684,9 @@ fn ambiguous_function(name: &str, bindings: &[Binding]) -> BindError {
             call_type_list(bindings)
         ),
     )
-    .with_detail(Some(
-        "Could not choose a best candidate function.".to_string(),
-    ))
     .with_hint(Some(
-        "You might need to add explicit type casts.".to_string(),
+        "Could not choose a best candidate function. You might need to add explicit type casts."
+            .to_string(),
     ))
 }
 

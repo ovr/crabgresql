@@ -19,8 +19,8 @@ use crabgresql_types::json::Jsonb;
 use crabgresql_types::jsonpath;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
-    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, geo, interval, macaddr, money,
-    net, pg_lsn, text, time, timestamp, timestamptz, timetz, to_char,
+    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, formatting, formatting_num,
+    geo, interval, macaddr, money, net, pg_lsn, text, time, timestamp, timestamptz, timetz,
 };
 
 use crate::ExecError;
@@ -864,12 +864,79 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 .map(Value::Interval)
                 .map_err(ts_err);
         }
+        // A non-finite interval or timestamp yields NULL, matching PG.
         ScalarFn::ToCharInterval => {
-            // A non-finite interval yields NULL, matching PG.
-            return Ok(match to_char::interval(iv(&args[0]), text(&args[1])) {
-                Some(s) => Value::Text(s),
-                None => Value::Null,
-            });
+            return formatting::to_char_interval(iv(&args[0]), text(&args[1]))
+                .map(null_or_text)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToCharTime => {
+            // PG routes `to_char(time, …)` through its implicit
+            // `time -> interval` cast, so the interval codes apply.
+            let as_interval = Interval {
+                months: 0,
+                days: 0,
+                usec: tm(&args[0]),
+            };
+            return formatting::to_char_interval(as_interval, text(&args[1]))
+                .map(null_or_text)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToCharTimestamp => {
+            return formatting::to_char_timestamp(ts(&args[0]), text(&args[1]))
+                .map(null_or_text)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToCharTimestampTz => {
+            return formatting::to_char_timestamptz(tstz(&args[0]), text(&args[1]))
+                .map(null_or_text)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToDate => {
+            return formatting::from_char_date(text(&args[0]), text(&args[1]))
+                .map(Value::Date)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToTimestampFormat => {
+            return formatting::from_char_timestamptz(text(&args[0]), text(&args[1]))
+                .map(Value::TimestampTz)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToCharNumeric => {
+            return formatting_num::numeric(num(&args[0]), text(&args[1]))
+                .map(Value::Text)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToCharInt4 => {
+            return formatting_num::int8(i64::from(i4(&args[0])), text(&args[1]))
+                .map(Value::Text)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToCharInt8 => {
+            return formatting_num::int8(i8(&args[0]), text(&args[1]))
+                .map(Value::Text)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToCharFloat8 => {
+            return formatting_num::float8(f8(&args[0]), text(&args[1]))
+                .map(Value::Text)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToCharFloat4 => {
+            return formatting_num::float4(f4(&args[0]), text(&args[1]))
+                .map(Value::Text)
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToNumber => {
+            // An empty picture yields NULL, matching PG.
+            return formatting_num::to_number(text(&args[0]), text(&args[1]))
+                .map(|n| n.map_or(Value::Null, Value::Numeric))
+                .map_err(fmt_err);
+        }
+        ScalarFn::ToTimestampUnix => {
+            return timestamptz::from_unix_epoch(f8(&args[0]))
+                .map(Value::TimestampTz)
+                .map_err(ts_err);
         }
 
         // --- date operators/functions ---
@@ -2203,6 +2270,20 @@ fn iv(v: &Value) -> Interval {
 
 fn iv_err(e: crabgresql_types::interval::IntervalError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
+}
+
+/// `FormatError` carries the DETAIL/HINT lines PG prints for a `to_char` /
+/// `to_date` / `to_timestamp` failure, which `DateError` and `TimestampError`
+/// have no room for.
+fn fmt_err(e: crabgresql_types::formatting::FormatError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message)
+        .with_detail(e.detail)
+        .with_hint(e.hint)
+}
+
+/// `to_char` returns SQL NULL for the values PG declines to render.
+fn null_or_text(rendered: Option<String>) -> Value {
+    rendered.map_or(Value::Null, Value::Text)
 }
 
 fn tstz(v: &Value) -> i64 {

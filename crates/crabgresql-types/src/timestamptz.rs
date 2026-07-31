@@ -268,6 +268,47 @@ pub fn make_timestamptz(
     Ok(utc)
 }
 
+/// `to_timestamp(double precision)`: seconds since the Unix epoch. Infinities
+/// pass through to the sentinels; `NaN` is an error, as is a value outside the
+/// representable range.
+pub fn from_unix_epoch(seconds: f64) -> Result<i64, TimestampError> {
+    if seconds.is_nan() {
+        return Err(TimestampError {
+            sqlstate: DATETIME_FIELD_OVERFLOW,
+            message: "timestamp cannot be NaN".to_string(),
+        });
+    }
+    if seconds.is_infinite() {
+        return Ok(if seconds > 0.0 {
+            POS_INFINITY
+        } else {
+            NEG_INFINITY
+        });
+    }
+    let out_of_range = || TimestampError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        message: format!(
+            "timestamp out of range: \"{}\"",
+            crate::float::fmt_f64(seconds, 0)
+        ),
+    };
+    // Shift to the PG epoch first, so the `i64` conversion sees the stored
+    // value; `rint` semantics (ties to even) match PG's rounding of the
+    // fractional second.
+    let micros = ((seconds - EPOCH_SECS) * USECS_PER_SEC as f64).round_ties_even();
+    if !micros.is_finite() || micros < i64::MIN as f64 || micros > i64::MAX as f64 {
+        return Err(out_of_range());
+    }
+    let micros = micros as i64;
+    if !in_range(micros) {
+        return Err(out_of_range());
+    }
+    Ok(micros)
+}
+
+/// Seconds from the Unix epoch (1970-01-01) to the PG epoch (2000-01-01).
+const EPOCH_SECS: f64 = 946_684_800.0;
+
 /// `timestamptz AT TIME ZONE zone` (= `timezone(zone, timestamptz)`): the wall
 /// clock the instant shows in `zone`, as a zone-less `timestamp`. `±infinity`
 /// passes through.

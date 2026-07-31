@@ -6716,9 +6716,11 @@ async fn create_function_language_sql_resolution_and_volatility_match_pg() -> an
     let dberr = err.as_db_error().expect("database error");
     assert_eq!(dberr.code(), &SqlState::AMBIGUOUS_FUNCTION);
     assert_eq!(dberr.message(), "function g(integer) is not unique");
+    // PG puts the whole sentence in the HINT for an ambiguous *function*, where
+    // the operator form splits it across DETAIL and HINT.
     assert_eq!(
         dberr.hint(),
-        Some("You might need to add explicit type casts.")
+        Some("Could not choose a best candidate function. You might need to add explicit type casts.")
     );
 
     // An aggregate body is a scalar-inlining limitation, reported as unsupported
