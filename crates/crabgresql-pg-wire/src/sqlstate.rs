@@ -68,6 +68,8 @@ pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
 pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
 /// `34000` — an Execute/Describe names a portal (cursor) that does not exist.
 pub const INVALID_CURSOR_NAME: &str = "34000";
+/// `42P03` — `DECLARE` names a cursor that is already open in this session.
+pub const DUPLICATE_CURSOR: &str = "42P03";
 /// `42P02` — a `$n` placeholder with no such parameter (e.g. in a simple query).
 pub const UNDEFINED_PARAMETER: &str = "42P02";
 /// `42P18` — a parameter's type could not be determined / is inconsistent.

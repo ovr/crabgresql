@@ -3913,10 +3913,26 @@ pub enum Statement {
         name: Ident,
         /// The fetch direction (e.g., `FORWARD`, `BACKWARD`).
         direction: FetchDirection,
-        /// The fetch position (e.g., `ALL`, `NEXT`, `ABSOLUTE`).
-        position: FetchPosition,
+        /// The `FROM`/`IN` noise word before the cursor name. PostgreSQL makes it
+        /// optional (`FETCH 1 c`), so this is `None` when it was omitted.
+        position: Option<FetchPosition>,
         /// Optional target table to fetch rows into.
         into: Option<ObjectName>,
+    },
+    /// ```sql
+    /// MOVE
+    /// ```
+    /// Reposition a cursor without retrieving any rows.
+    ///
+    /// Note: this is a PostgreSQL-specific statement.
+    /// <https://www.postgresql.org/docs/current/sql-move.html>
+    Move {
+        /// Cursor name
+        name: Ident,
+        /// The direction to move in, spelled exactly as `FETCH` spells it.
+        direction: FetchDirection,
+        /// The `FROM`/`IN` noise word before the cursor name, if written.
+        position: Option<FetchPosition>,
     },
     /// ```sql
     /// DISCARD [ ALL | PLANS | SEQUENCES | TEMPORARY | TEMP ]
@@ -4536,13 +4552,28 @@ impl fmt::Display for Statement {
                 position,
                 into,
             } => {
-                write!(f, "FETCH {direction} {position} {name}")?;
+                write!(f, "FETCH {direction}")?;
+                if let Some(position) = position {
+                    write!(f, " {position}")?;
+                }
+                write!(f, " {name}")?;
 
                 if let Some(into) = into {
                     write!(f, " INTO {into}")?;
                 }
 
                 Ok(())
+            }
+            Statement::Move {
+                name,
+                direction,
+                position,
+            } => {
+                write!(f, "MOVE {direction}")?;
+                if let Some(position) = position {
+                    write!(f, " {position}")?;
+                }
+                write!(f, " {name}")
             }
             Statement::Truncate(truncate) => truncate.fmt(f),
             Statement::Case(stmt) => {

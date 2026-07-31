@@ -7937,3 +7937,141 @@ async fn call_arguments_may_themselves_call_routines() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A `FETCH` driven over the extended protocol. `Describe` has to answer with
+/// the cursor's column shape rather than `NoData` — a client that is told there
+/// are no columns and then handed DataRows treats it as a protocol violation,
+/// which is exactly what `tokio_postgres::query` does here.
+#[tokio::test]
+async fn fetch_reports_its_columns_over_the_extended_protocol() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (id integer, label text)")
+        .await?;
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .await?;
+    // The cursor has to outlive the statement that declares it, and each
+    // extended-protocol statement here is its own implicit transaction — so it
+    // must be holdable.
+    client
+        .batch_execute("DECLARE c SCROLL CURSOR WITH HOLD FOR SELECT id, label FROM t ORDER BY id")
+        .await?;
+
+    let first = client.query("FETCH 2 FROM c", &[]).await?;
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].get::<_, i32>("id"), 1);
+    assert_eq!(first[1].get::<_, &str>("label"), "two");
+
+    // The cursor keeps its position across statements.
+    let next = client.query("FETCH BACKWARD ALL FROM c", &[]).await?;
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].get::<_, i32>("id"), 1);
+
+    // An exhausted fetch still describes its columns, so a zero-row result is a
+    // result and not an error.
+    client.batch_execute("MOVE ALL c").await?;
+    assert!(client.query("FETCH ALL c", &[]).await?.is_empty());
+
+    client.batch_execute("CLOSE c").await?;
+    let err = client.query("FETCH 1 c", &[]).await.expect_err("closed");
+    assert_eq!(err.code().map(|c| c.code()), Some("34000"));
+    Ok(())
+}
+
+/// A `FETCH` describes the cursor it names *now*, not the one that existed when
+/// it was parsed. A prepared FETCH may be parsed before its cursor is declared,
+/// and it has to start reporting the right shape once it is.
+///
+/// Only the shape resolved at Describe time is a server-side guarantee: a client
+/// that caches the description it got from Parse keeps decoding against that
+/// one, and PostgreSQL behaves the same way (its statement-level Describe of a
+/// FETCH also reads the live cursor). The smoke suite covers the redeclared-with-
+/// different-columns case, where psql re-describes each time.
+#[tokio::test]
+async fn prepared_fetch_follows_the_cursor_it_names() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (id integer)").await?;
+    client.batch_execute("INSERT INTO t VALUES (1), (2)").await?;
+
+    // Parsed before the cursor exists: the 34000 belongs to Execute, not Parse,
+    // so the statement itself must prepare cleanly.
+    let err = client
+        .query("FETCH ALL FROM c", &[])
+        .await
+        .expect_err("no cursor yet");
+    assert_eq!(err.code().map(|c| c.code()), Some("34000"));
+
+    // Declaring it afterwards makes the same text work, with its columns.
+    client
+        .batch_execute("DECLARE c CURSOR WITH HOLD FOR SELECT id FROM t ORDER BY id")
+        .await?;
+    let rows = client.query("FETCH ALL FROM c", &[]).await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>("id"), 1);
+    Ok(())
+}
+
+/// A cursor body may carry `$n`, and the value bound to the `DECLARE` has to
+/// reach it — the cursor opens over the rows the client asked for.
+#[tokio::test]
+async fn declare_cursor_binds_its_parameters() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (g integer)").await?;
+    client
+        .batch_execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        .await?;
+    client
+        .execute(
+            "DECLARE c CURSOR WITH HOLD FOR SELECT g FROM t WHERE g > $1 ORDER BY g",
+            &[&3i32],
+        )
+        .await?;
+    let rows = client.query("FETCH ALL c", &[]).await?;
+    assert_eq!(
+        rows.iter().map(|r| r.get::<_, i32>("g")).collect::<Vec<_>>(),
+        [4, 5]
+    );
+    Ok(())
+}
+
+/// Cursor names fold like every other unquoted identifier, so the case a client
+/// happens to type never changes which cursor it means.
+#[tokio::test]
+async fn cursor_names_fold_to_lowercase() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("DECLARE Foo CURSOR WITH HOLD FOR SELECT 1 AS n")
+        .await?;
+    assert_eq!(
+        client
+            .query_one("SELECT name FROM pg_cursors", &[])
+            .await?
+            .get::<_, &str>("name"),
+        "foo"
+    );
+    // The same cursor under any spelling, and a second DECLARE is a duplicate.
+    assert_eq!(
+        client.query("FETCH 1 FOO", &[]).await?[0].get::<_, i32>("n"),
+        1
+    );
+    let err = client
+        .batch_execute("DECLARE fOo CURSOR WITH HOLD FOR SELECT 2")
+        .await
+        .expect_err("duplicate");
+    assert_eq!(err.code().map(|c| c.code()), Some("42P03"));
+    // A quoted name is a different cursor, as in PG.
+    client
+        .batch_execute("DECLARE \"Foo\" CURSOR WITH HOLD FOR SELECT 2 AS n")
+        .await?;
+    client.batch_execute("CLOSE \"Foo\"").await?;
+    client.batch_execute("CLOSE fOO").await?;
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) AS n FROM pg_cursors", &[])
+            .await?
+            .get::<_, i64>("n"),
+        0
+    );
+    Ok(())
+}

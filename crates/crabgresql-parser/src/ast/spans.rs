@@ -265,6 +265,7 @@ impl Spanned for Values {
 /// - [Statement::CreateCollation]
 /// - [Statement::AlterCollation]
 /// - [Statement::Fetch]
+/// - [Statement::Move]
 /// - [Statement::Discard]
 /// - [Statement::Set]
 /// - [Statement::ShowVariable]
@@ -361,6 +362,7 @@ impl Spanned for Statement {
             Statement::DropProcedure { .. } => Span::empty(),
             Statement::Declare { .. } => Span::empty(),
             Statement::Fetch { .. } => Span::empty(),
+            Statement::Move { .. } => Span::empty(),
             Statement::Discard { .. } => Span::empty(),
             Statement::Set(_) => Span::empty(),
             Statement::ShowVariable { .. } => Span::empty(),

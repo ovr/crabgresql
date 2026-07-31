@@ -672,6 +672,7 @@ impl<'a> Parser<'a> {
                 Keyword::DISCARD => self.parse_discard(),
                 Keyword::DECLARE => self.parse_declare(),
                 Keyword::FETCH => self.parse_fetch_statement(),
+                Keyword::MOVE => self.parse_move_statement(),
                 Keyword::DELETE => self.parse_delete(next_token),
                 Keyword::INSERT => self.parse_insert(next_token),
                 Keyword::UPDATE => self.parse_update(next_token),
@@ -7232,60 +7233,15 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse `FETCH [direction] { FROM | IN } cursor INTO target;` statement.
+    /// Parse `FETCH [direction] [ { FROM | IN } ] cursor [ INTO target ];`.
+    ///
+    /// PostgreSQL's grammar makes both the direction and the `FROM`/`IN` noise
+    /// word optional, so `FETCH c`, `FETCH 1 c` and `FETCH NEXT FROM c` are all
+    /// legal and mean the same thing as `FETCH NEXT FROM c` / `FETCH FORWARD 1
+    /// FROM c`.
     pub fn parse_fetch_statement(&mut self) -> Result<Statement, ParserError> {
-        let direction = if self.parse_keyword(Keyword::NEXT) {
-            FetchDirection::Next
-        } else if self.parse_keyword(Keyword::PRIOR) {
-            FetchDirection::Prior
-        } else if self.parse_keyword(Keyword::FIRST) {
-            FetchDirection::First
-        } else if self.parse_keyword(Keyword::LAST) {
-            FetchDirection::Last
-        } else if self.parse_keyword(Keyword::ABSOLUTE) {
-            FetchDirection::Absolute {
-                limit: self.parse_number_value()?,
-            }
-        } else if self.parse_keyword(Keyword::RELATIVE) {
-            FetchDirection::Relative {
-                limit: self.parse_number_value()?,
-            }
-        } else if self.parse_keyword(Keyword::FORWARD) {
-            if self.parse_keyword(Keyword::ALL) {
-                FetchDirection::ForwardAll
-            } else {
-                FetchDirection::Forward {
-                    // TODO: Support optional
-                    limit: Some(self.parse_number_value()?),
-                }
-            }
-        } else if self.parse_keyword(Keyword::BACKWARD) {
-            if self.parse_keyword(Keyword::ALL) {
-                FetchDirection::BackwardAll
-            } else {
-                FetchDirection::Backward {
-                    // TODO: Support optional
-                    limit: Some(self.parse_number_value()?),
-                }
-            }
-        } else if self.parse_keyword(Keyword::ALL) {
-            FetchDirection::All
-        } else {
-            FetchDirection::Count {
-                limit: self.parse_number_value()?,
-            }
-        };
-
-        let position = if self.peek_keyword(Keyword::FROM) {
-            self.expect_keyword(Keyword::FROM)?;
-            FetchPosition::From
-        } else if self.peek_keyword(Keyword::IN) {
-            self.expect_keyword(Keyword::IN)?;
-            FetchPosition::In
-        } else {
-            return parser_err!("Expected FROM or IN", self.peek_token_ref().span.start);
-        };
-
+        let direction = self.parse_fetch_direction()?;
+        let position = self.parse_fetch_position();
         let name = self.parse_identifier()?;
 
         let into = if self.parse_keyword(Keyword::INTO) {
@@ -7299,6 +7255,150 @@ impl<'a> Parser<'a> {
             direction,
             position,
             into,
+        })
+    }
+
+    /// Parse `MOVE [direction] [ { FROM | IN } ] cursor;`. `MOVE` is `FETCH`
+    /// without the rows, and shares its direction grammar exactly.
+    pub fn parse_move_statement(&mut self) -> Result<Statement, ParserError> {
+        let direction = self.parse_fetch_direction()?;
+        let position = self.parse_fetch_position();
+        let name = self.parse_identifier()?;
+
+        Ok(Statement::Move {
+            name,
+            direction,
+            position,
+        })
+    }
+
+    /// The direction clause shared by `FETCH` and `MOVE`. A bare cursor name
+    /// (nothing between the verb and the name) means `NEXT`.
+    fn parse_fetch_direction(&mut self) -> Result<FetchDirection, ParserError> {
+        let direction = if self.parse_keyword(Keyword::NEXT) {
+            FetchDirection::Next
+        } else if self.parse_keyword(Keyword::PRIOR) {
+            FetchDirection::Prior
+        } else if self.parse_keyword(Keyword::FIRST) {
+            FetchDirection::First
+        } else if self.parse_keyword(Keyword::LAST) {
+            FetchDirection::Last
+        } else if self.parse_keyword(Keyword::ABSOLUTE) {
+            FetchDirection::Absolute {
+                limit: self.parse_signed_number_value()?,
+            }
+        } else if self.parse_keyword(Keyword::RELATIVE) {
+            FetchDirection::Relative {
+                limit: self.parse_signed_number_value()?,
+            }
+        } else if self.parse_keyword(Keyword::FORWARD) {
+            if self.parse_keyword(Keyword::ALL) {
+                FetchDirection::ForwardAll
+            } else {
+                FetchDirection::Forward {
+                    limit: self.parse_optional_signed_number_value()?,
+                }
+            }
+        } else if self.parse_keyword(Keyword::BACKWARD) {
+            if self.parse_keyword(Keyword::ALL) {
+                FetchDirection::BackwardAll
+            } else {
+                FetchDirection::Backward {
+                    limit: self.parse_optional_signed_number_value()?,
+                }
+            }
+        } else if self.parse_keyword(Keyword::ALL) {
+            FetchDirection::All
+        } else {
+            match self.parse_optional_signed_number_value()? {
+                Some(limit) => FetchDirection::Count { limit },
+                // `FETCH cursor` / `FETCH FROM cursor`: no direction at all.
+                None => FetchDirection::Next,
+            }
+        };
+        Ok(direction)
+    }
+
+    /// The optional `FROM`/`IN` noise word before a cursor name.
+    fn parse_fetch_position(&mut self) -> Option<FetchPosition> {
+        if self.parse_keyword(Keyword::FROM) {
+            Some(FetchPosition::From)
+        } else if self.parse_keyword(Keyword::IN) {
+            Some(FetchPosition::In)
+        } else {
+            None
+        }
+    }
+
+    /// A count with an optional leading sign, as `FETCH`/`MOVE` allow
+    /// (`FETCH -3 c`, `FETCH ABSOLUTE -1 c`). The sign is folded into the
+    /// literal so downstream sees one number.
+    fn parse_signed_number_value(&mut self) -> Result<ValueWithSpan, ParserError> {
+        match self.parse_optional_signed_number_value()? {
+            Some(value) => Ok(value),
+            None => self.expected_ref("literal number", self.peek_token_ref()),
+        }
+    }
+
+    /// [`Self::parse_signed_number_value`], but `None` (consuming nothing) when
+    /// the next token could not start a number.
+    ///
+    /// PostgreSQL's `FETCH`/`MOVE` grammar takes `SignedIconst`: an optional
+    /// sign in front of an `Iconst`, which is a plain `int`. A fractional or
+    /// out-of-range literal therefore never reaches the executor — the scanner
+    /// hands the parser a numeric constant the rule cannot accept, and the
+    /// result is a syntax error naming the literal. Reproduced here, since the
+    /// count would otherwise be silently truncated.
+    ///
+    /// The range is checked against the *unsigned* literal, because that is what
+    /// `Iconst` covers: `-2147483648` is rejected even though the signed value
+    /// fits, since `2147483648` on its own does not.
+    fn parse_optional_signed_number_value(&mut self) -> Result<Option<ValueWithSpan>, ParserError> {
+        // A `$n` placeholder is rejected rather than passed through:
+        // `SignedIconst` has no room for one, so `FETCH $1 FROM c` is a syntax
+        // error in PostgreSQL too, and naming it here keeps the message PG's
+        // instead of the generic "expected identifier" the fallthrough gives.
+        if let Token::Placeholder(name) = &self.peek_token_ref().token {
+            let name = name.clone();
+            return Err(self.pg_syntax_error(&name));
+        }
+        let signed = match self.peek_token_ref().token {
+            Token::Number(..) => false,
+            Token::Minus | Token::Plus => true,
+            _ => return Ok(None),
+        };
+        let negative = signed && matches!(self.peek_token_ref().token, Token::Minus);
+        if signed {
+            self.next_token();
+        }
+        let start = self.peek_token_ref().span.start;
+        let mut value = self.parse_number_value()?;
+        let Value::Number(digits, _) = &mut value.value else {
+            return self.expected_ref("literal number", self.peek_token_ref());
+        };
+        if digits.parse::<i32>().is_err() {
+            let literal = digits.clone();
+            return Err(ParserError::PgDiagnostic(PgDiagnostic {
+                sqlstate: crate::tokenizer::DEFAULT_TOKENIZER_SQLSTATE,
+                message: format!("syntax error at or near \"{literal}\""),
+                hint: None,
+                location: start,
+            }));
+        }
+        if negative {
+            digits.insert(0, '-');
+        }
+        Ok(Some(value))
+    }
+
+    /// PostgreSQL's `syntax error at or near "…"`, pointing at the token the
+    /// cursor is on.
+    fn pg_syntax_error(&self, token: &str) -> ParserError {
+        ParserError::PgDiagnostic(PgDiagnostic {
+            sqlstate: crate::tokenizer::DEFAULT_TOKENIZER_SQLSTATE,
+            message: format!("syntax error at or near \"{token}\""),
+            hint: None,
+            location: self.peek_token_ref().span.start,
         })
     }
 
@@ -18495,5 +18595,190 @@ mod tests {
         let dialects = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
         dialects.verified_stmt("CREATE PROCEDURE p(a INT) LANGUAGE plpgsql AS $$ BEGIN END $$");
         dialects.verified_stmt("CREATE OR REPLACE PROCEDURE p() LANGUAGE sql AS 'SELECT 1'");
+    }
+
+    /// The direction of a `FETCH`/`MOVE`, for the grammar tests below.
+    fn fetch_parts(sql: &str) -> (FetchDirection, Option<FetchPosition>, String) {
+        match parse_pg(sql).expect("parse").pop() {
+            Some(Statement::Fetch {
+                direction,
+                position,
+                name,
+                into: None,
+            }) => (direction, position, name.value),
+            Some(Statement::Move {
+                direction,
+                position,
+                name,
+            }) => (direction, position, name.value),
+            other => panic!("expected FETCH/MOVE, got {other:?}"),
+        }
+    }
+
+    fn count(n: &str) -> FetchDirection {
+        FetchDirection::Count {
+            limit: Value::Number(n.to_string(), false).into(),
+        }
+    }
+
+    /// PostgreSQL's `FETCH` grammar makes both the direction and the `FROM`/`IN`
+    /// noise word optional, and accepts a signed count. Every spelling below
+    /// appears in the upstream `portals` regression test.
+    #[test]
+    fn parse_fetch_direction_spellings() {
+        let cases: Vec<(&str, FetchDirection, Option<FetchPosition>)> = vec![
+            ("FETCH c", FetchDirection::Next, None),
+            (
+                "FETCH FROM c",
+                FetchDirection::Next,
+                Some(FetchPosition::From),
+            ),
+            ("FETCH IN c", FetchDirection::Next, Some(FetchPosition::In)),
+            ("FETCH 1 c", count("1"), None),
+            ("FETCH 23 IN c", count("23"), Some(FetchPosition::In)),
+            ("FETCH -3 FROM c", count("-3"), Some(FetchPosition::From)),
+            ("FETCH NEXT c", FetchDirection::Next, None),
+            (
+                "FETCH PRIOR FROM c",
+                FetchDirection::Prior,
+                Some(FetchPosition::From),
+            ),
+            ("FETCH FIRST c", FetchDirection::First, None),
+            ("FETCH LAST c", FetchDirection::Last, None),
+            ("FETCH ALL c", FetchDirection::All, None),
+            (
+                "FETCH FORWARD c",
+                FetchDirection::Forward { limit: None },
+                None,
+            ),
+            (
+                "FETCH FORWARD 5 c",
+                FetchDirection::Forward {
+                    limit: Some(Value::Number("5".to_string(), false).into()),
+                },
+                None,
+            ),
+            ("FETCH FORWARD ALL c", FetchDirection::ForwardAll, None),
+            (
+                "FETCH BACKWARD c",
+                FetchDirection::Backward { limit: None },
+                None,
+            ),
+            (
+                "FETCH BACKWARD 2 IN c",
+                FetchDirection::Backward {
+                    limit: Some(Value::Number("2".to_string(), false).into()),
+                },
+                Some(FetchPosition::In),
+            ),
+            ("FETCH BACKWARD ALL c", FetchDirection::BackwardAll, None),
+            (
+                "FETCH ABSOLUTE -1 c",
+                FetchDirection::Absolute {
+                    limit: Value::Number("-1".to_string(), false).into(),
+                },
+                None,
+            ),
+            (
+                "FETCH RELATIVE -2 FROM c",
+                FetchDirection::Relative {
+                    limit: Value::Number("-2".to_string(), false).into(),
+                },
+                Some(FetchPosition::From),
+            ),
+        ];
+        for (sql, direction, position) in cases {
+            let (got_direction, got_position, name) = fetch_parts(sql);
+            assert_eq!(got_direction, direction, "{sql}");
+            assert_eq!(got_position, position, "{sql}");
+            assert_eq!(name, "c", "{sql}");
+        }
+    }
+
+    /// `MOVE` shares `FETCH`'s direction grammar and renders back the same way.
+    #[test]
+    fn parse_move_round_trips() {
+        let dialects = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
+        for sql in [
+            "MOVE NEXT c",
+            "MOVE 3 c",
+            "MOVE ALL IN c",
+            "MOVE BACKWARD ALL FROM c",
+            "MOVE RELATIVE -1 c",
+            "MOVE FORWARD c",
+        ] {
+            dialects.verified_stmt(sql);
+        }
+        assert_eq!(fetch_parts("MOVE c").0, FetchDirection::Next);
+    }
+
+    /// The rendered form has to survive a re-parse, or `pg_cursors.statement`
+    /// (which is built from `Display`) would drift from what was written.
+    #[test]
+    fn parse_fetch_round_trips() {
+        let dialects = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
+        for sql in [
+            "FETCH NEXT c",
+            "FETCH 1 FROM c",
+            "FETCH -3 IN c",
+            "FETCH FORWARD c",
+            "FETCH FORWARD ALL FROM c",
+            "FETCH BACKWARD 2 c",
+            "FETCH ABSOLUTE -1 c",
+            "FETCH RELATIVE 0 FROM c",
+            "FETCH ALL c INTO t",
+        ] {
+            dialects.verified_stmt(sql);
+        }
+    }
+
+    /// PostgreSQL's `FETCH`/`MOVE` count is `SignedIconst` — a sign in front of
+    /// an `int`. Anything its scanner turns into a numeric constant instead
+    /// fails the grammar, naming the literal *without* the sign, because the
+    /// sign is not part of the constant. Every count position is covered: the
+    /// bare form and all four that take an explicit direction.
+    #[test]
+    fn parse_fetch_rejects_non_int_counts() {
+        let cases = [
+            ("FETCH 1.5 c", "1.5"),
+            ("MOVE 2147483648 c", "2147483648"),
+            ("FETCH -2147483649 c", "2147483649"),
+            // -2147483648 fits an i32, but `Iconst` sees only the digits, and
+            // 2147483648 on its own is out of range — so PG rejects it too.
+            ("FETCH ABSOLUTE -2147483648 c", "2147483648"),
+            ("FETCH RELATIVE 2147483648 c", "2147483648"),
+            ("FETCH FORWARD 1.5 c", "1.5"),
+            ("MOVE BACKWARD 2147483648 c", "2147483648"),
+            // A placeholder is not a constant at all; PG has no slot for one.
+            ("FETCH $1 FROM c", "$1"),
+        ];
+        for (sql, literal) in cases {
+            let e = parse_pg(sql).expect_err(sql);
+            assert_eq!(
+                e.to_string(),
+                format!("syntax error at or near \"{literal}\""),
+                "{sql}"
+            );
+        }
+        // Both boundaries themselves are fine.
+        parse_pg("MOVE 2147483647 c").expect("parse");
+        parse_pg("FETCH ABSOLUTE -2147483647 c").expect("parse");
+    }
+
+    /// `DECLARE … CURSOR` renders back verbatim — `pg_cursors.statement` shows
+    /// this text, so a lost `SCROLL`/`WITH HOLD` would be visible to clients.
+    #[test]
+    fn parse_declare_cursor_round_trips() {
+        let dialects = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
+        for sql in [
+            "DECLARE c CURSOR FOR SELECT 1",
+            "DECLARE c SCROLL CURSOR FOR SELECT * FROM t ORDER BY a",
+            "DECLARE c NO SCROLL CURSOR FOR SELECT 1",
+            "DECLARE c SCROLL CURSOR WITH HOLD FOR SELECT 1",
+            "DECLARE c CURSOR WITHOUT HOLD FOR SELECT 1",
+            "DECLARE c BINARY INSENSITIVE SCROLL CURSOR FOR SELECT 1",
+        ] {
+            dialects.verified_stmt(sql);
+        }
     }
 }
