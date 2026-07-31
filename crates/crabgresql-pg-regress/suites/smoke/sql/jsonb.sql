@@ -54,3 +54,40 @@ INSERT INTO btest VALUES
 SELECT id, doc FROM btest ORDER BY id;
 SELECT doc, count(*) AS n FROM btest GROUP BY doc ORDER BY doc;
 DROP TABLE btest;
+-- extraction returns a canonicalized value, unlike the verbatim json operators
+SELECT '{"a":{"b" :1}}'::jsonb -> 'a' AS canonical;
+-- ->> yields text: a string loses its quotes, other values render canonically
+-- (numeric scale is kept, but the exponent form is normalized)
+SELECT '{"a":"x"}'::jsonb ->> 'a' AS str, '{"a": 1.500}'::jsonb ->> 'a' AS scale,
+       '{"a": 1e2}'::jsonb ->> 'a' AS exponent;
+-- a JSON null is SQL NULL through ->>
+SELECT '{"a": null}'::jsonb -> 'a' AS raw, '{"a": null}'::jsonb ->> 'a' AS as_text;
+-- array subscripts are 0-based and count from the end when negative
+SELECT '[10,20,30]'::jsonb -> 1 AS second, '[10,20,30]'::jsonb -> -1 AS last,
+       '[10,20,30]'::jsonb -> 9 AS past_end;
+-- a missing key or a wrong container kind is NULL, not an error
+SELECT '{"a":1}'::jsonb -> 'zz' AS missing, '1'::jsonb -> 'a' AS scalar,
+       '[1,2]'::jsonb -> 'a' AS array_by_key, '{"a":1}'::jsonb -> 0 AS object_by_index;
+-- #> / #>> walk a text[] path; the empty path returns the whole value
+SELECT '{"a":{"b":["c","d"]}}'::jsonb #> '{a,b,1}' AS path,
+       '{"a":{"b":["c","d"]}}'::jsonb #>> '{a,b,1}' AS path_text,
+       '{"a":1}'::jsonb #> '{}' AS empty_path;
+-- a path element indexes an array only when it parses as an integer; a NULL
+-- element, or a path running past the end, makes the whole result NULL
+SELECT '[1,2,3]'::jsonb #> '{-1}' AS neg_step, '[1,2]'::jsonb #> '{xx}' AS bad_step,
+       '{"a":1}'::jsonb #> '{a,b}' AS too_deep,
+       '{"a":1}'::jsonb #> ARRAY['a', NULL] AS null_step;
+-- a NULL key propagates (the operators are strict in both arguments)
+SELECT '{"a":1}'::jsonb -> NULL::text AS null_key;
+-- int2 widens to the int4 subscript operator, and varchar[] to the text[] path
+SELECT '[1,2]'::jsonb -> 1::smallint AS int2_ok,
+       '{"a":1}'::jsonb #> ARRAY['a']::varchar[] AS varchar_path;
+-- no operator for other right-hand types: the subscript operator is on integer,
+-- so bigint and integer[] find no candidate
+SELECT '{"a":1}'::jsonb -> 1.5;
+SELECT '[1,2]'::jsonb -> 1::bigint;
+SELECT '{"a":1}'::jsonb #> ARRAY[1];
+-- nor for a non-json left operand
+SELECT 'x'::text -> 'a';
+-- with both operands untyped every candidate applies equally (42725, not 42883)
+SELECT '{"a":1}' -> 'a';

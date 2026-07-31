@@ -4345,6 +4345,12 @@ fn bind_binary(
         return Ok(binding);
     }
 
+    // The `json`/`jsonb` extraction operators (`-> ->> #> #>>`). Nothing else in
+    // the chain claims these spellings, so this resolver owns their errors too.
+    if let Some(binding) = resolve_json_op(op, &lb, &rb, op_span)? {
+        return Ok(binding);
+    }
+
     // Array containment / overlap (`@>` `<@` `&&`) on array operands.
     if let Some(binding) = resolve_array_op(op, &lb, &rb, scope.catalog().as_ref())? {
         return Ok(binding);
@@ -5618,6 +5624,93 @@ fn resolve_jsonb_op(
     Ok(Some(Binding::Typed(BoundExpr::FuncCall {
         func: ScalarFn::JsonPath(jf),
         ret: PgType::Bool,
+        args: vec![left, right],
+    })))
+}
+
+/// The JSON extraction operators `-> ->> #> #>>`, for both `json` and `jsonb`.
+///
+/// `->`/`->>` are overloaded on the right operand: a text-family key selects the
+/// object-field form, an `int2`/`int4` subscript the array-element form. PG's
+/// operator is declared on `integer`, and `int8 -> int4` is only an *assignment*
+/// cast, so `jsonb -> 1::bigint` is `operator does not exist` — as is
+/// `jsonb #> integer[]`, since only `text[]`/`varchar[]` reach `text[]`
+/// implicitly.
+///
+/// Returns `Ok(None)` only when the operator is not one of the four. A bad
+/// operand errors here rather than falling through, because no later resolver
+/// claims these spellings and the generic mapping would report the wrong
+/// "operator is not supported yet" (0A000) instead of PG's 42883.
+fn resolve_json_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+    op_span: Span,
+) -> Result<Option<Binding>, BindError> {
+    use crate::functions::JsonFn;
+    use ast::BinaryOperator as B;
+    if !matches!(op, B::Arrow | B::LongArrow | B::HashArrow | B::HashLongArrow) {
+        return Ok(None);
+    }
+    // Both error paths point at the operator, as PG's `LINE n: ... ^` does.
+    let undefined = || undefined_binary_operator(lb, op, rb).at(op_span);
+    // The container type also decides `->`/`#>`'s return type. An untyped left
+    // operand leaves all four candidate operators (json/jsonb × text/int4)
+    // equally applicable, which is PG's 42725 rather than a missing operator.
+    let container = match binding_typed_ty(lb) {
+        Some(t @ (PgType::Json | PgType::Jsonb)) => t,
+        Some(_) => return Err(undefined()),
+        None => {
+            return Err(ambiguous_operator(
+                operand_name(lb),
+                &op.to_string(),
+                operand_name(rb),
+            )
+            .at(op_span));
+        }
+    };
+    let text_out = matches!(op, B::LongArrow | B::HashLongArrow);
+    let (func, right) = match op {
+        B::Arrow | B::LongArrow => {
+            let rt = binding_typed_ty(rb);
+            // An untyped literal takes `text`, the string category's preferred
+            // type, so `jsonb -> 'a'` is the object-field operator rather than
+            // the subscript one.
+            if rt.is_none_or(is_text_family) {
+                (
+                    if text_out { JsonFn::ObjectFieldText } else { JsonFn::ObjectField },
+                    resolve_operand(rb, PgType::Text)?,
+                )
+            } else if matches!(rt, Some(PgType::Int2 | PgType::Int4)) {
+                (
+                    if text_out { JsonFn::ArrayElementText } else { JsonFn::ArrayElement },
+                    resolve_operand(rb, PgType::Int4)?,
+                )
+            } else {
+                return Err(undefined());
+            }
+        }
+        _ => {
+            let text_arr = PgType::Array(PgType::Text.oid());
+            // Only a `text[]`/`varchar[]` argument (or an untyped literal, which
+            // parses as `text[]`) is accepted; anything else must report a
+            // missing operator rather than be silently coerced.
+            match binding_typed_ty(rb) {
+                None => {}
+                Some(PgType::Array(elem))
+                    if elem == PgType::Text.oid() || elem == PgType::Varchar.oid() => {}
+                Some(_) => return Err(undefined()),
+            }
+            (
+                if text_out { JsonFn::ExtractPathText } else { JsonFn::ExtractPath },
+                resolve_operand(rb, text_arr)?,
+            )
+        }
+    };
+    let left = resolve_operand(lb, container)?;
+    Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+        func: ScalarFn::Json(func),
+        ret: if text_out { PgType::Text } else { container },
         args: vec![left, right],
     })))
 }
