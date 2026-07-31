@@ -62,6 +62,10 @@ const T_TID: u8 = 36;
 const T_XID: u8 = 37;
 const T_XID8: u8 = 38;
 const T_PG_LSN: u8 = 39;
+const T_BOX: u8 = 40;
+const T_LINE: u8 = 41;
+const T_CIRCLE: u8 = 42;
+const T_POLYGON: u8 = 43;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -202,6 +206,34 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         Value::Path(p) => {
             out.push(T_PATH);
             out.push(p.closed as u8);
+            out.extend_from_slice(&(p.pts.len() as u32).to_le_bytes());
+            for pt in &p.pts {
+                for c in pt {
+                    out.extend_from_slice(&c.to_bits().to_le_bytes());
+                }
+            }
+        }
+        Value::Box(b) => {
+            out.push(T_BOX);
+            for c in b {
+                out.extend_from_slice(&c.to_bits().to_le_bytes());
+            }
+        }
+        Value::Line(l) => {
+            out.push(T_LINE);
+            for c in l {
+                out.extend_from_slice(&c.to_bits().to_le_bytes());
+            }
+        }
+        Value::Circle(c) => {
+            out.push(T_CIRCLE);
+            for v in c {
+                out.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+        }
+        // `polygon` is variable length: the vertex count, then the coordinates.
+        Value::Polygon(p) => {
+            out.push(T_POLYGON);
             out.extend_from_slice(&(p.pts.len() as u32).to_le_bytes());
             for pt in &p.pts {
                 for c in pt {
@@ -417,6 +449,34 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
                 .collect();
             Value::Path(crate::geo::PathVal { closed, pts })
         }
+        T_BOX => Value::Box([
+            f64::from_bits(r.u64()),
+            f64::from_bits(r.u64()),
+            f64::from_bits(r.u64()),
+            f64::from_bits(r.u64()),
+        ]),
+        T_LINE => Value::Line([
+            f64::from_bits(r.u64()),
+            f64::from_bits(r.u64()),
+            f64::from_bits(r.u64()),
+        ]),
+        T_CIRCLE => Value::Circle([
+            f64::from_bits(r.u64()),
+            f64::from_bits(r.u64()),
+            f64::from_bits(r.u64()),
+        ]),
+        T_POLYGON => {
+            // Same bound-the-count-first guard as `T_PATH` above.
+            let npts = r.u32() as usize;
+            let need = npts.saturating_mul(16);
+            if need > r.buf.len().saturating_sub(r.pos) {
+                r.take(need); // diverges: same bounds panic as `var()`
+            }
+            let pts = (0..npts)
+                .map(|_| [f64::from_bits(r.u64()), f64::from_bits(r.u64())])
+                .collect();
+            Value::Polygon(crate::geo::PolygonVal { pts })
+        }
         T_REG => {
             let kind_oid = r.u32();
             let PgType::Reg(kind) = PgType::from_oid(kind_oid)
@@ -504,6 +564,25 @@ mod tests {
         );
         // Overwrite the count (tag byte + closed flag) with 0xFFFFFFFF.
         buf[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut pos = 0;
+        decode_datum(&buf, &mut pos);
+    }
+
+    /// The same corrupt-count guard as `path`, for the other varlena geometric
+    /// type. `polygon` has no open/closed flag, so the count starts one byte
+    /// earlier.
+    #[test]
+    #[should_panic(expected = "range end index")]
+    fn polygon_decode_rejects_a_bogus_vertex_count() {
+        let mut buf = Vec::new();
+        encode_datum(
+            &Value::Polygon(crate::geo::PolygonVal {
+                pts: vec![[1.0, 2.0], [3.0, 4.0]],
+            }),
+            &mut buf,
+        );
+        // Overwrite the count (which follows the tag byte) with 0xFFFFFFFF.
+        buf[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
         let mut pos = 0;
         decode_datum(&buf, &mut pos);
     }
@@ -622,6 +701,18 @@ mod tests {
             closed: true,
             pts: vec![[10.0, 20.0]],
         }));
+        roundtrip(Value::Box([2.0, 2.0, 0.0, 0.0]));
+        roundtrip(Value::Box([f64::INFINITY, 1.0, -1e300, f64::NEG_INFINITY]));
+        roundtrip(Value::Line([1.0, -1.0, 0.0]));
+        // A NaN coefficient (which `line` input accepts) cannot go through
+        // `roundtrip`: `Value`'s `PartialEq` is IEEE, so `NaN != NaN`.
+        roundtrip(Value::Line([-0.4, -1.0, -6.0]));
+        roundtrip(Value::Circle([5.0, 1.0, 3.0]));
+        roundtrip(Value::Circle([-1e300, 0.0, 0.0]));
+        roundtrip(Value::Polygon(crate::geo::PolygonVal {
+            pts: vec![[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]],
+        }));
+        roundtrip(Value::Polygon(crate::geo::PolygonVal { pts: vec![[7.0, 8.0]] }));
         roundtrip(Value::Enum { type_oid: 16384, ordinal: 0, label: "red".into() });
         roundtrip(Value::Enum { type_oid: 99999, ordinal: 42, label: String::new() });
         // `json` keeps its raw text; `jsonb` its canonical tree.

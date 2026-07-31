@@ -34,6 +34,15 @@ const DETAIL_START: &str = "Array value must start with \"{\" or dimension infor
 const DETAIL_EOF: &str = "Unexpected end of input.";
 const DETAIL_JUNK: &str = "Junk after closing right brace.";
 const DETAIL_COMMA: &str = "Unexpected \",\" character.";
+/// `box` is the one built-in whose `typdelim` is `;` rather than `,`; its
+/// element text (`(1,1),(0,0)`) is full of commas, so the array delimiter has
+/// to differ. PG's DETAIL then names `;` instead.
+const DETAIL_SEMICOLON: &str = "Unexpected \";\" character.";
+
+/// The DETAIL naming whichever delimiter this element type uses.
+const fn detail_delim(delim: char) -> &'static str {
+    if delim == ';' { DETAIL_SEMICOLON } else { DETAIL_COMMA }
+}
 const DETAIL_RBRACE: &str = "Unexpected \"}\" character.";
 const DETAIL_LBRACE: &str = "Unexpected \"{\" character.";
 
@@ -79,6 +88,10 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::POINT, oid::POINT_ARRAY),
     (oid::LSEG, oid::LSEG_ARRAY),
     (oid::PATH, oid::PATH_ARRAY),
+    (oid::BOX, oid::BOX_ARRAY),
+    (oid::POLYGON, oid::POLYGON_ARRAY),
+    (oid::LINE, oid::LINE_ARRAY),
+    (oid::CIRCLE, oid::CIRCLE_ARRAY),
     (oid::MACADDR, oid::MACADDR_ARRAY),
     (oid::MACADDR8, oid::MACADDR8_ARRAY),
     (oid::INET, oid::INET_ARRAY),
@@ -106,17 +119,18 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
 /// unquoted `NULL`; any other element is rendered with its own output function
 /// and double-quoted when it is empty, equals `NULL` case-insensitively, or
 /// contains a delimiter, brace, quote, backslash, or whitespace.
-pub fn format(elems: &[Value], efd: i32) -> String {
+pub fn format(elem: PgType, elems: &[Value], efd: i32) -> String {
+    let delim = elem.typdelim();
     let mut out = String::from("{");
     for (i, v) in elems.iter().enumerate() {
         if i > 0 {
-            out.push(',');
+            out.push(delim);
         }
         match v {
             Value::Null => out.push_str("NULL"),
             _ => {
                 let s = v.encode_text_with(efd).unwrap_or_default();
-                if needs_quote(&s) {
+                if needs_quote(&s, delim) {
                     push_quoted(&mut out, &s);
                 } else {
                     out.push_str(&s);
@@ -135,11 +149,11 @@ fn is_array_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
 }
 
-fn needs_quote(s: &str) -> bool {
+fn needs_quote(s: &str, delim: char) -> bool {
     s.is_empty()
         || s.eq_ignore_ascii_case("null")
         || s.chars()
-            .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || is_array_space(c))
+            .any(|c| c == delim || matches!(c, '{' | '}' | '"' | '\\') || is_array_space(c))
 }
 
 fn push_quoted(out: &mut String, s: &str) {
@@ -158,6 +172,7 @@ fn push_quoted(out: &mut String, s: &str) {
 /// parses exactly like the same scalar literal). An unquoted, case-insensitive
 /// `NULL` token is a NULL element; a quoted `"NULL"` is the text "NULL".
 pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
+    let delim = elem.typdelim();
     let trimmed = input.trim();
     let mut chars = trimmed.chars().peekable();
     if chars.next() != Some('{') {
@@ -175,7 +190,7 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
         return Ok(elems);
     }
     loop {
-        let (token, quoted) = read_element(&mut chars, input)?;
+        let (token, quoted) = read_element(&mut chars, input, delim)?;
         // An empty, unquoted, unescaped token (`{a,,c}`, `{1,}`, `{,1}`) is a
         // missing element, which PG rejects as malformed. A quoted `""` is a
         // legitimate empty-string element and keeps `quoted = true`. PG's DETAIL
@@ -183,7 +198,7 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
         if !quoted && token.is_empty() {
             let detail = match chars.peek() {
                 Some('}') => DETAIL_RBRACE,
-                Some(',') => DETAIL_COMMA,
+                Some(&c) if c == delim => detail_delim(delim),
                 _ => DETAIL_EOF,
             };
             return Err(malformed(input, detail));
@@ -200,13 +215,13 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
         }
         skip_ws(&mut chars);
         match chars.next() {
-            Some(',') => {
+            Some(c) if c == delim => {
                 skip_ws(&mut chars);
             }
             Some('}') => break,
             // EOF before a closing brace, or any other stray character.
             None => return Err(malformed(input, DETAIL_EOF)),
-            Some(_) => return Err(malformed(input, DETAIL_COMMA)),
+            Some(_) => return Err(malformed(input, detail_delim(delim))),
         }
     }
     skip_ws(&mut chars);
@@ -230,6 +245,7 @@ fn skip_ws(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 fn read_element(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     input: &str,
+    delim: char,
 ) -> Result<(String, bool), ArrayError> {
     if chars.peek() == Some(&'"') {
         chars.next();
@@ -255,7 +271,8 @@ fn read_element(
     let mut last_sig = 0usize;
     loop {
         match chars.peek() {
-            Some(',') | Some('}') | None => break,
+            Some(&c) if c == delim => break,
+            Some('}') | None => break,
             Some('{') => return Err(malformed(input, DETAIL_LBRACE)),
             Some('\\') => {
                 chars.next();
@@ -309,13 +326,13 @@ mod tests {
             elems,
             vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]
         );
-        assert_eq!(format(&elems, 1), "{1,2,3}");
+        assert_eq!(format(PgType::Int4, &elems, 1), "{1,2,3}");
     }
 
     #[test]
     fn empty_array() {
         assert_eq!(array_in("{}", PgType::Int4).unwrap(), vec![]);
-        assert_eq!(format(&[], 1), "{}");
+        assert_eq!(format(PgType::Int4, &[], 1), "{}");
     }
 
     #[test]
@@ -332,7 +349,7 @@ mod tests {
             ]
         );
         // Round-trip: the delimiter/empty/NULL-lookalike elements are quoted.
-        assert_eq!(format(&elems, 1), r#"{a,"b,c",NULL,"NULL",""}"#);
+        assert_eq!(format(PgType::Text, &elems, 1), r#"{a,"b,c",NULL,"NULL",""}"#);
     }
 
     #[test]
@@ -405,7 +422,30 @@ mod tests {
     fn non_ascii_whitespace_element_is_not_quoted() {
         // PG's array_out only treats ASCII whitespace as needing quotes; a
         // non-breaking space (U+00A0) is left bare.
-        assert_eq!(format(&[Value::Text("a\u{00A0}b".into())], 1), "{a\u{00A0}b}");
+        assert_eq!(
+            format(PgType::Text, &[Value::Text("a\u{00A0}b".into())], 1),
+            "{a\u{00A0}b}"
+        );
+    }
+
+    #[test]
+    fn box_arrays_use_a_semicolon_delimiter() {
+        // `box` is the one built-in with `typdelim = ';'`, because its own
+        // output text contains commas.
+        let elems = array_in("{(1,1),(0,0);(3,3),(2,2)}", PgType::Box).unwrap();
+        assert_eq!(
+            elems,
+            vec![
+                Value::Box([1.0, 1.0, 0.0, 0.0]),
+                Value::Box([3.0, 3.0, 2.0, 2.0]),
+            ]
+        );
+        // Round-trips unquoted: a comma is no longer the delimiter, so the
+        // element text does not need quoting.
+        assert_eq!(
+            format(PgType::Box, &elems, 1),
+            "{(1,1),(0,0);(3,3),(2,2)}"
+        );
     }
 
     #[test]

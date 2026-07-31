@@ -409,7 +409,7 @@ mod tests {
             hard("int4[][]"),
             "0A000: type \"INT4[][]\" is not supported yet"
         );
-        assert_eq!(hard("box[]"), "0A000: type \"box\" is not supported yet");
+        assert_eq!(hard("xml[]"), "0A000: type \"xml\" is not supported yet");
     }
 
     #[test]

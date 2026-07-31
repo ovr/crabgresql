@@ -68,8 +68,11 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
         .unwrap_err();
     assert_eq!(err.as_db_error().expect("database error").code(), &SqlState::DUPLICATE_OBJECT);
 
+    // A built-in type the catalog knows about but this build does not model is
+    // `0A000`, not the `42704` a nonexistent type would get. (`xml` is the stand-in
+    // here; it used to be `box`, which is now a real type.)
     let err = client
-        .simple_query("CREATE TABLE unsupported (value box)")
+        .simple_query("CREATE TABLE unsupported (value xml)")
         .await
         .unwrap_err();
     assert_eq!(
