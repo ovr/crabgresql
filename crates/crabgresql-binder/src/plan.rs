@@ -2571,13 +2571,21 @@ impl BoundFromItem {
 /// Whether `start` can reach itself through view→view dependency edges — i.e.
 /// expanding it would recurse forever. Follows only names that are themselves
 /// views (a dependency on a table is a leaf); a `visited` set bounds the walk.
-fn view_is_recursive(engine: &Arc<dyn TableEngine>, start: &str) -> bool {
+/// Dependency edges use namespace-qualified relation keys, so graph nodes must
+/// use that form too: views with the same name in distinct schemas are distinct.
+fn view_is_recursive(engine: &Arc<dyn TableEngine>, start: &ViewDefinition) -> bool {
     let views = engine.views();
-    let deps: HashMap<&str, &[String]> = views
+    let deps: HashMap<String, &[String]> = views
         .iter()
-        .map(|v| (v.name.as_str(), v.depends_on.as_slice()))
+        .map(|v| {
+            (
+                relation_dependency_key(&v.namespace, &v.name),
+                v.depends_on.as_slice(),
+            )
+        })
         .collect();
-    let Some(first) = deps.get(start) else {
+    let start = relation_dependency_key(&start.namespace, &start.name);
+    let Some(first) = deps.get(&start) else {
         return false;
     };
     let mut stack: Vec<&str> = first.iter().map(String::as_str).collect();
@@ -2594,6 +2602,10 @@ fn view_is_recursive(engine: &Arc<dyn TableEngine>, start: &str) -> bool {
         }
     }
     false
+}
+
+fn relation_dependency_key(namespace: &str, name: &str) -> String {
+    format!("{namespace}.{name}")
 }
 
 /// Bind a stored view's query into a logical plan. The SQL text is re-parsed and
@@ -2766,7 +2778,7 @@ fn bind_from_item(
                         // recurse forever when expanded. PG allows creating such a
                         // view but errors when it is used; detect the cycle from the
                         // stored dependency graph before expanding.
-                        if view_is_recursive(engine, &view.name) {
+                        if view_is_recursive(engine, &view) {
                             return Err(BindError::new(
                                 sqlstate::INVALID_OBJECT_DEFINITION,
                                 format!(
