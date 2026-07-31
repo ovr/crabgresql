@@ -1158,7 +1158,7 @@ fn explain_expr(expr: &BoundExpr, names: &[Option<&str>]) -> String {
         }
         BoundExpr::IsNull { expr, negated } => format!(
             "{} IS {}NULL",
-            explain_expr(expr, names),
+            explain_operand(expr, names),
             if *negated { "NOT " } else { "" }
         ),
         BoundExpr::BoolTest {
@@ -1166,24 +1166,37 @@ fn explain_expr(expr: &BoundExpr, names: &[Option<&str>]) -> String {
             value,
             negated,
         } => format!(
-            "{} IS {}{}",
-            explain_expr(expr, names),
-            if *negated { "NOT " } else { "" },
-            match value {
-                Some(true) => "TRUE",
-                Some(false) => "FALSE",
-                None => "UNKNOWN",
-            }
+            "{} {}",
+            explain_operand(expr, names),
+            crabgresql_binder::bool_test_clause(*value, *negated)
         ),
         BoundExpr::Binary {
             op, left, right, ..
         } => format!(
             "{} {} {}",
-            explain_expr(left, names),
+            explain_operand(left, names),
             op.sql_symbol(),
-            explain_expr(right, names)
+            explain_operand(right, names)
         ),
         _ => "…".to_string(),
+    }
+}
+
+/// Render `expr` where a larger expression uses it as an operand. PG's
+/// ruleutils parenthesizes anything that is not a bare column, constant, or
+/// parameter, so `x IS NULL` under an `IS TRUE` prints as `(x IS NULL) IS TRUE`.
+fn explain_operand(expr: &BoundExpr, names: &[Option<&str>]) -> String {
+    // A cast is invisible in this output, so its operand decides.
+    let bare = match expr {
+        BoundExpr::Coerce { expr, .. } | BoundExpr::Reinterpret { expr, .. } => expr,
+        other => other,
+    };
+    match bare {
+        BoundExpr::IsNull { .. } | BoundExpr::BoolTest { .. } | BoundExpr::Binary { .. } => {
+            format!("({})", explain_expr(expr, names))
+        }
+        // Leaves, and the `…` placeholder, read better unwrapped.
+        _ => explain_expr(expr, names),
     }
 }
 
@@ -2431,6 +2444,51 @@ mod tests {
         assert_eq!(lines[0], "Hash Join");
         assert_eq!(lines[1], "  Hash Cond: (id = id)");
         assert_eq!(lines[2], "  Filter: (big IS NULL)");
+    }
+
+    /// The `Filter:` line of the plan for `sql`.
+    fn filter_line(sql: &str) -> String {
+        explain(&plan_sql(sql))
+            .into_iter()
+            .find(|l| l.contains("Filter:"))
+            .expect("no Filter line")
+    }
+
+    #[test]
+    fn explain_parenthesizes_a_composite_operand() {
+        // PG's ruleutils wraps anything that is not a bare column, constant or
+        // parameter, so a test over a test nests rather than running together.
+        // `big IS NULL IS TRUE` would be a different (and unreadable) tree.
+        assert_eq!(
+            filter_line("SELECT * FROM t WHERE (big IS NULL) IS TRUE"),
+            "  Filter: ((big IS NULL) IS TRUE)"
+        );
+        assert_eq!(
+            filter_line("SELECT * FROM t WHERE (id = 1) IS NOT FALSE"),
+            "  Filter: ((id = 1) IS NOT FALSE)"
+        );
+        // A leaf operand stays bare.
+        assert_eq!(
+            filter_line("SELECT * FROM t WHERE name IS NULL"),
+            "  Filter: (name IS NULL)"
+        );
+    }
+
+    #[test]
+    fn explain_spells_every_boolean_test() {
+        for spelling in [
+            "IS TRUE",
+            "IS NOT TRUE",
+            "IS FALSE",
+            "IS NOT FALSE",
+            "IS UNKNOWN",
+            "IS NOT UNKNOWN",
+        ] {
+            assert_eq!(
+                filter_line(&format!("SELECT * FROM t WHERE (id = 1) {spelling}")),
+                format!("  Filter: ((id = 1) {spelling})")
+            );
+        }
     }
 
     #[test]

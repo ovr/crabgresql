@@ -15,7 +15,8 @@ pub use collation::{
 pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, ParamCtx,
     ParamState, Scope, Subplan, UnaryOp, WindowKind, WindowSortKey, bind_column_default, bind_expr,
-    bind_scalar, bind_sql_function_body, checked_length_typmod, coerce_to_column, inline_params,
+    bind_scalar, bind_sql_function_body, bool_test_clause, checked_length_typmod,
+    coerce_to_column, inline_params,
     length_typmod, map_data_type, param_ctx_capped, param_ctx_extended, param_ctx_none,
     param_types, require_all_resolved, resolve_data_type,
 };

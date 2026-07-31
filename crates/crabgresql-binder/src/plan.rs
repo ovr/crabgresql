@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crabgresql_parser::ast::Spanned;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
@@ -582,7 +583,7 @@ fn bind_where(
 ) -> Result<Option<BoundExpr>, BindError> {
     selection
         .as_ref()
-        .map(|expr| to_bool_operand(bind_expr(expr, scope)?, "WHERE"))
+        .map(|expr| to_bool_operand(bind_expr(expr, scope)?, "WHERE", expr.span()))
         .transpose()
 }
 
@@ -2944,7 +2945,7 @@ fn bind_table_with_joins(
                 if let Some(v) = &mut visible {
                     v.extend(default_visible(&right.relations, left_width));
                 }
-                (kind, Some(to_bool_operand(binding, "JOIN/ON")?))
+                (kind, Some(to_bool_operand(binding, "JOIN/ON", on.span())?))
             }
             JoinBinding::Using(kind, names) => {
                 let left_view = visible
@@ -3073,6 +3074,7 @@ fn build_merged_join(
             Binding::Typed(left_expr.clone()),
             Binding::Typed(right_expr.clone()),
             crabgresql_parser::Span::empty(),
+            (Span::empty(), Span::empty()),
             catalog.as_ref(),
         )?;
         let Binding::Typed(eq_expr) = eq else {
@@ -4129,7 +4131,7 @@ fn bind_aggregation(
     let having = select
         .having
         .as_ref()
-        .map(|h| bind_expr(h, scope).and_then(|b| to_bool_operand(b, "HAVING")))
+        .map(|h| bind_expr(h, scope).and_then(|b| to_bool_operand(b, "HAVING", h.span())))
         .transpose()?;
     // HAVING filters the grouped rows, which windows are only computed *over*,
     // so a window call here has no value yet — as in WHERE and GROUP BY.
@@ -8321,6 +8323,35 @@ mod tests {
                 format!("argument of {context} must be type boolean, not type integer"),
                 "{sql}"
             );
+        }
+    }
+
+    #[test]
+    fn every_boolean_context_points_its_cursor_at_the_operand() {
+        // PG prints `LINE n: ... ^` under the non-boolean operand for all of
+        // these, so `to_bool_operand` takes the operand span rather than each
+        // caller remembering to stamp one. `operand` is the token the cursor
+        // must land on; its 1-based column is derived so the case cannot claim
+        // a position the SQL does not have.
+        for (sql, context, operand) in [
+            ("SELECT 1 FROM t WHERE id", "WHERE", "id"),
+            ("SELECT CASE WHEN id THEN 1 END FROM t", "CASE/WHEN", "id"),
+            ("SELECT NOT id FROM t", "NOT", "id"),
+            ("SELECT 1 FROM t GROUP BY id HAVING id", "HAVING", "id"),
+            ("SELECT 1 FROM t a JOIN t b ON a.id", "JOIN/ON", "a.id"),
+            ("SELECT 1 FROM t WHERE flag AND id", "AND", "id"),
+            ("SELECT id IS TRUE FROM t", "IS TRUE", "id"),
+        ] {
+            // The offending operand is the last such token in every fixture.
+            let col = sql.rfind(operand).expect("operand not in fixture") + 1;
+            let e = bind_err(sql);
+            assert_eq!(e.code, "42804", "{sql}");
+            assert_eq!(
+                e.message,
+                format!("argument of {context} must be type boolean, not type integer"),
+                "{sql}"
+            );
+            assert_eq!(e.location, Some((1, col as u64)), "{sql}");
         }
     }
 

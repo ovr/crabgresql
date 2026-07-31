@@ -29,7 +29,9 @@ SELECT name FROM grades
  WHERE CASE WHEN score IS NULL THEN false ELSE score >= 70 END;
 -- error: a searched WHEN condition must be boolean
 SELECT CASE WHEN 1 THEN 'x' END;
--- error: incompatible concrete result types cannot be matched
+-- error: incompatible concrete result types cannot be matched. Known gap: PG
+-- also prints a `LINE 1: ... ^` cursor under the offending result expression,
+-- which the result-type unifier does not carry a span for yet.
 SELECT CASE WHEN true THEN 1 ELSE true END;
 -- error: an untyped result literal that does not fit the resolved type
 SELECT CASE WHEN true THEN 1 ELSE 'x' END;

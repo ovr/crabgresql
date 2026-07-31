@@ -56,16 +56,28 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             Ok(Value::Bool(is_null != *negated))
         }
         // Also total: the operand is exactly one of true/false/unknown, so
-        // every test against it answers yes or no.
+        // every test against it answers yes or no. That relies on the binder's
+        // `to_bool_operand` gate — a non-boolean here would make `IS TRUE`,
+        // `IS FALSE` and `IS UNKNOWN` all answer false at once, so say so
+        // loudly rather than silently returning a fourth truth value.
         BoundExpr::BoolTest {
             expr,
             value,
             negated,
         } => {
-            let operand = eval(expr, row, ctx)?;
-            let hit = match value {
-                Some(want) => matches!(operand, Value::Bool(b) if b == *want),
-                None => matches!(operand, Value::Null),
+            let hit = match (eval(expr, row, ctx)?, value) {
+                (Value::Bool(b), Some(want)) => b == *want,
+                (Value::Null, None) => true,
+                (Value::Bool(_), None) | (Value::Null, Some(_)) => false,
+                (other, _) => {
+                    return Err(ExecError::new(
+                        sqlstate::INTERNAL_ERROR,
+                        format!(
+                            "boolean test operand evaluated to {}, which is not boolean",
+                            other.pg_type().map_or("unknown", PgType::name)
+                        ),
+                    ));
+                }
             };
             Ok(Value::Bool(hit != *negated))
         }

@@ -28,14 +28,23 @@ SELECT name FROM flags WHERE ok <> true ORDER BY name;
 SELECT name FROM flags WHERE ok IS UNKNOWN;
 -- a comparison is itself a boolean, so the tests compose with one
 SELECT name FROM flags WHERE (ok = true) IS NOT TRUE ORDER BY name;
--- negation and chaining still parse: IS binds tighter than NOT
-SELECT NOT true IS FALSE AS chained;
--- EXPLAIN prints the spelling back; IS UNKNOWN does not collapse to IS NULL
+-- IS binds tighter than NOT. Only a NULL operand tells the two parses apart:
+-- NOT (NULL IS FALSE) is true, whereas (NOT NULL) IS FALSE is false.
+SELECT NOT NULL::boolean IS FALSE AS chained;
+-- EXPLAIN prints every spelling back, and IS UNKNOWN does not become IS NULL
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS TRUE;
 EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS NOT TRUE;
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS FALSE;
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS NOT FALSE;
 EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS UNKNOWN;
--- error: the operand must be boolean
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS NOT UNKNOWN;
+-- a composite operand is parenthesized, and IS NULL renders alongside
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE (name IS NULL) IS TRUE;
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE name IS NOT NULL;
+-- error: the operand must be boolean, and the cursor points at the operand
 SELECT 1 IS TRUE;
 SELECT 1 IS UNKNOWN;
+SELECT 1 IS NOT FALSE;
 -- error: an untyped literal that is not a valid boolean
 SELECT 'a' IS TRUE;
 DROP TABLE flags;

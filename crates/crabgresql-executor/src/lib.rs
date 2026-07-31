@@ -3869,11 +3869,8 @@ mod tests {
 
     #[test]
     fn bool_test_is_never_null() -> anyhow::Result<()> {
-        let test = |operand: Option<bool>, value, negated| BoundExpr::BoolTest {
-            expr: Box::new(BoundExpr::Const {
-                value: operand.map_or(Value::Null, Value::Bool),
-                ty: PgType::Bool,
-            }),
+        let test = |operand, value, negated| BoundExpr::BoolTest {
+            expr: Box::new(boolean(operand)),
             value,
             negated,
         };
