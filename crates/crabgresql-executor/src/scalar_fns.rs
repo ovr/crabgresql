@@ -1681,7 +1681,35 @@ fn path_of(v: &Value) -> &geo::PathVal {
     }
 }
 
-/// Evaluate a geometric (`point`/`lseg`/`path`) operator or function. Arguments
+fn box_of(v: &Value) -> [f64; 4] {
+    match v {
+        Value::Box(b) => *b,
+        other => unreachable!("expected box arg, got {other:?}"),
+    }
+}
+
+fn line_of(v: &Value) -> [f64; 3] {
+    match v {
+        Value::Line(l) => *l,
+        other => unreachable!("expected line arg, got {other:?}"),
+    }
+}
+
+fn circle_of(v: &Value) -> [f64; 3] {
+    match v {
+        Value::Circle(c) => *c,
+        other => unreachable!("expected circle arg, got {other:?}"),
+    }
+}
+
+fn polygon_of(v: &Value) -> &geo::PolygonVal {
+    match v {
+        Value::Polygon(p) => p,
+        other => unreachable!("expected polygon arg, got {other:?}"),
+    }
+}
+
+/// Evaluate a geometric operator or function. Arguments
 /// arrive in the fixed order documented on each [`GeoFn`]; a geometric error
 /// (range / divide-by-zero) maps to its SQLSTATE. The cases PG has no answer for
 /// — `#`'s non-intersection, `area` of an open path, concatenating a closed one,
@@ -1826,6 +1854,329 @@ fn eval_geo(g: GeoFn, args: &[Value]) -> Result<Value, ExecError> {
                 _ => ord.is_ge(),
             })
         }
+
+        // -- box -----------------------------------------------------------
+        GeoFn::BoxFromPoint => Value::Box(geo::box_from_point(&point_of(&args[0]))),
+        GeoFn::BoxConstruct => Value::Box(geo::box_from_points(
+            &point_of(&args[0]),
+            &point_of(&args[1]),
+        )),
+        GeoFn::BoxArea => Value::Float8(geo::box_area(&box_of(&args[0]))),
+        GeoFn::BoxWidth => Value::Float8(geo::box_width(&box_of(&args[0]))),
+        GeoFn::BoxHeight => Value::Float8(geo::box_height(&box_of(&args[0]))),
+        GeoFn::BoxCenter => Value::Point(geo::box_center(&box_of(&args[0]))),
+        GeoFn::BoxDiagonal => Value::Lseg(geo::box_diagonal(&box_of(&args[0]))),
+        GeoFn::BoundBox => Value::Box(geo::bound_box(&box_of(&args[0]), &box_of(&args[1]))),
+        GeoFn::BoxOverlap => Value::Bool(geo::box_overlap(&box_of(&args[0]), &box_of(&args[1]))),
+        GeoFn::BoxLeft => Value::Bool(geo::box_left(&box_of(&args[0]), &box_of(&args[1]))),
+        GeoFn::BoxRight => Value::Bool(geo::box_right(&box_of(&args[0]), &box_of(&args[1]))),
+        GeoFn::BoxOverLeft => {
+            Value::Bool(geo::box_over_left(&box_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::BoxOverRight => {
+            Value::Bool(geo::box_over_right(&box_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::BoxBelow => Value::Bool(geo::box_below(&box_of(&args[0]), &box_of(&args[1]))),
+        GeoFn::BoxAbove => Value::Bool(geo::box_above(&box_of(&args[0]), &box_of(&args[1]))),
+        GeoFn::BoxOverBelow => {
+            Value::Bool(geo::box_over_below(&box_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::BoxOverAbove => {
+            Value::Bool(geo::box_over_above(&box_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::BoxBelowEq => {
+            Value::Bool(geo::box_below_eq(&box_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::BoxAboveEq => {
+            Value::Bool(geo::box_above_eq(&box_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::BoxContain => Value::Bool(geo::box_contain(&box_of(&args[0]), &box_of(&args[1]))),
+        GeoFn::BoxContained => {
+            Value::Bool(geo::box_contained(&box_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::BoxSame => Value::Bool(geo::box_same(&box_of(&args[0]), &box_of(&args[1]))),
+        GeoFn::BoxIntersects => {
+            Value::Bool(geo::box_intersects(&box_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::BoxIntersect => geo::box_intersect(&box_of(&args[0]), &box_of(&args[1]))
+            .map_or(Value::Null, Value::Box),
+        // A `None` ordering means a NaN area, which every comparison answers
+        // false — including `<>`. (PG gives `box` no `<>` operator at all.)
+        GeoFn::BoxEq | GeoFn::BoxLt | GeoFn::BoxLe | GeoFn::BoxGt | GeoFn::BoxGe => {
+            let ord = geo::box_area_cmp(&box_of(&args[0]), &box_of(&args[1]));
+            Value::Bool(ord.is_some_and(|o| match g {
+                GeoFn::BoxEq => o.is_eq(),
+                GeoFn::BoxLt => o.is_lt(),
+                GeoFn::BoxLe => o.is_le(),
+                GeoFn::BoxGt => o.is_gt(),
+                _ => o.is_ge(),
+            }))
+        }
+        GeoFn::BoxAddPt => Value::Box(
+            geo::box_add_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
+        ),
+        GeoFn::BoxSubPt => Value::Box(
+            geo::box_sub_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
+        ),
+        GeoFn::BoxMulPt => Value::Box(
+            geo::box_mul_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
+        ),
+        GeoFn::BoxDivPt => Value::Box(
+            geo::box_div_pt(&box_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
+        ),
+        GeoFn::BoxContainPt => {
+            Value::Bool(geo::box_contain_pt(&box_of(&args[0]), &point_of(&args[1])))
+        }
+        GeoFn::ClosePointBox => {
+            Value::Point(geo::close_point_box(&point_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::DistPointBox => {
+            Value::Float8(geo::dist_point_box(&point_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::LsegInsideBox => {
+            Value::Bool(geo::lseg_inside_box(&lseg_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::LsegIntersectsBox => Value::Bool(geo::lseg_intersects_box(
+            &lseg_of(&args[0]),
+            &box_of(&args[1]),
+        )),
+        GeoFn::DistLsegBox => {
+            Value::Float8(geo::dist_lseg_box(&lseg_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::CloseLsegBox => {
+            Value::Point(geo::close_lseg_box(&lseg_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::DistBoxBox => {
+            Value::Float8(geo::dist_box_box(&box_of(&args[0]), &box_of(&args[1])))
+        }
+        GeoFn::BoxToCircle => Value::Circle(geo::box_to_circle(&box_of(&args[0]))),
+        GeoFn::BoxToPolygon => Value::Polygon(geo::box_to_polygon(&box_of(&args[0]))),
+
+        // -- line ----------------------------------------------------------
+        GeoFn::LineConstruct => Value::Line(
+            geo::line_from_points(&point_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
+        ),
+        GeoFn::LineEq => Value::Bool(geo::line_eq(&line_of(&args[0]), &line_of(&args[1]))),
+        GeoFn::LineHoriz => Value::Bool(geo::line_horizontal(&line_of(&args[0]))),
+        GeoFn::LineVert => Value::Bool(geo::line_vertical(&line_of(&args[0]))),
+        GeoFn::LineParallel => {
+            Value::Bool(geo::line_parallel(&line_of(&args[0]), &line_of(&args[1])))
+        }
+        GeoFn::LinePerpendicular => Value::Bool(geo::line_perpendicular(
+            &line_of(&args[0]),
+            &line_of(&args[1]),
+        )),
+        GeoFn::LineInterpt => geo::line_interpt(&line_of(&args[0]), &line_of(&args[1]))
+            .map_or(Value::Null, Value::Point),
+        GeoFn::LineIntersects => {
+            Value::Bool(geo::line_intersects(&line_of(&args[0]), &line_of(&args[1])))
+        }
+        GeoFn::DistLineLine => {
+            Value::Float8(geo::dist_line_line(&line_of(&args[0]), &line_of(&args[1])))
+        }
+        GeoFn::DistPointLine => {
+            Value::Float8(geo::dist_point_line(&point_of(&args[0]), &line_of(&args[1])))
+        }
+        GeoFn::ClosePointLine => Value::Point(geo::close_point_line(
+            &point_of(&args[0]),
+            &line_of(&args[1]),
+        )),
+        GeoFn::PointOnLine => {
+            Value::Bool(geo::point_on_line(&point_of(&args[0]), &line_of(&args[1])))
+        }
+        GeoFn::LsegOnLine => {
+            Value::Bool(geo::lseg_on_line(&lseg_of(&args[0]), &line_of(&args[1])))
+        }
+        GeoFn::LsegIntersectsLine => Value::Bool(geo::lseg_intersects_line(
+            &lseg_of(&args[0]),
+            &line_of(&args[1]),
+        )),
+        GeoFn::DistLsegLine => {
+            Value::Float8(geo::dist_lseg_line(&lseg_of(&args[0]), &line_of(&args[1])))
+        }
+        GeoFn::CloseLineLseg => geo::close_line_lseg(&line_of(&args[0]), &lseg_of(&args[1]))
+            .map_or(Value::Null, Value::Point),
+        GeoFn::LineIntersectsBox => Value::Bool(geo::line_intersects_box(
+            &line_of(&args[0]),
+            &box_of(&args[1]),
+        )),
+
+        // -- circle --------------------------------------------------------
+        GeoFn::CircleConstruct => Value::Circle(geo::circle_from_point_radius(
+            &point_of(&args[0]),
+            f8(&args[1]),
+        )),
+        GeoFn::CircleCenter => Value::Point(geo::circle_center(&circle_of(&args[0]))),
+        GeoFn::CircleRadius => Value::Float8(geo::circle_radius(&circle_of(&args[0]))),
+        GeoFn::CircleDiameter => Value::Float8(geo::circle_diameter(&circle_of(&args[0]))),
+        GeoFn::CircleArea => Value::Float8(geo::circle_area(&circle_of(&args[0]))),
+        GeoFn::CircleToBox => Value::Box(geo::circle_to_box(&circle_of(&args[0]))),
+        GeoFn::CircleFromPolygon => {
+            Value::Circle(geo::circle_from_polygon(polygon_of(&args[0])))
+        }
+        GeoFn::CircleToPolygon => Value::Polygon(
+            geo::circle_to_polygon(geo::CIRCLE_POLYGON_NPTS, &circle_of(&args[0]))
+                .map_err(geo_err)?,
+        ),
+        GeoFn::CircleToPolygonN => Value::Polygon(
+            geo::circle_to_polygon(i4(&args[0]), &circle_of(&args[1])).map_err(geo_err)?,
+        ),
+        GeoFn::CircleSame => {
+            Value::Bool(geo::circle_same(&circle_of(&args[0]), &circle_of(&args[1])))
+        }
+        GeoFn::CircleOverlap => Value::Bool(geo::circle_overlap(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::CircleLeft => {
+            Value::Bool(geo::circle_left(&circle_of(&args[0]), &circle_of(&args[1])))
+        }
+        GeoFn::CircleRight => {
+            Value::Bool(geo::circle_right(&circle_of(&args[0]), &circle_of(&args[1])))
+        }
+        GeoFn::CircleOverLeft => Value::Bool(geo::circle_over_left(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::CircleOverRight => Value::Bool(geo::circle_over_right(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::CircleBelow => {
+            Value::Bool(geo::circle_below(&circle_of(&args[0]), &circle_of(&args[1])))
+        }
+        GeoFn::CircleAbove => {
+            Value::Bool(geo::circle_above(&circle_of(&args[0]), &circle_of(&args[1])))
+        }
+        GeoFn::CircleOverBelow => Value::Bool(geo::circle_over_below(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::CircleOverAbove => Value::Bool(geo::circle_over_above(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::CircleContain => Value::Bool(geo::circle_contain(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::CircleContained => Value::Bool(geo::circle_contained(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::CircleContainPt => Value::Bool(geo::circle_contain_pt(
+            &circle_of(&args[0]),
+            &point_of(&args[1]),
+        )),
+        GeoFn::CircleContainPtSwapped => Value::Bool(geo::circle_contain_pt(
+            &circle_of(&args[1]),
+            &point_of(&args[0]),
+        )),
+        GeoFn::CircleEq
+        | GeoFn::CircleNe
+        | GeoFn::CircleLt
+        | GeoFn::CircleLe
+        | GeoFn::CircleGt
+        | GeoFn::CircleGe => {
+            let ord = geo::circle_area_cmp(&circle_of(&args[0]), &circle_of(&args[1]));
+            Value::Bool(ord.is_some_and(|o| match g {
+                GeoFn::CircleEq => o.is_eq(),
+                GeoFn::CircleNe => o.is_ne(),
+                GeoFn::CircleLt => o.is_lt(),
+                GeoFn::CircleLe => o.is_le(),
+                GeoFn::CircleGt => o.is_gt(),
+                _ => o.is_ge(),
+            }))
+        }
+        GeoFn::DistCircleCircle => Value::Float8(geo::dist_circle_circle(
+            &circle_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::DistPointCircle => Value::Float8(geo::dist_point_circle(
+            &point_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
+        GeoFn::CircleAddPt => Value::Circle(
+            geo::circle_add_pt(&circle_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
+        ),
+        GeoFn::CircleSubPt => Value::Circle(
+            geo::circle_sub_pt(&circle_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
+        ),
+        GeoFn::CircleMulPt => Value::Circle(
+            geo::circle_mul_pt(&circle_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
+        ),
+        GeoFn::CircleDivPt => Value::Circle(
+            geo::circle_div_pt(&circle_of(&args[0]), &point_of(&args[1])).map_err(geo_err)?,
+        ),
+
+        // -- polygon -------------------------------------------------------
+        GeoFn::PolyNpoints => Value::Int4(geo::poly_npoints(polygon_of(&args[0]))),
+        GeoFn::PolyCenter => Value::Point(geo::poly_center(polygon_of(&args[0]))),
+        GeoFn::PolyToBox => Value::Box(geo::poly_bbox(polygon_of(&args[0]))),
+        GeoFn::PolyToPath => Value::Path(geo::poly_to_path(polygon_of(&args[0]))),
+        GeoFn::PathToPolygon => {
+            Value::Polygon(geo::path_to_polygon(path_of(&args[0])).map_err(geo_err)?)
+        }
+        GeoFn::PolySame => {
+            Value::Bool(geo::poly_same(polygon_of(&args[0]), polygon_of(&args[1])))
+        }
+        GeoFn::PolyOverlap => {
+            Value::Bool(geo::poly_overlap(polygon_of(&args[0]), polygon_of(&args[1])))
+        }
+        GeoFn::PolyLeft => {
+            Value::Bool(geo::poly_left(polygon_of(&args[0]), polygon_of(&args[1])))
+        }
+        GeoFn::PolyRight => {
+            Value::Bool(geo::poly_right(polygon_of(&args[0]), polygon_of(&args[1])))
+        }
+        GeoFn::PolyOverLeft => {
+            Value::Bool(geo::poly_over_left(polygon_of(&args[0]), polygon_of(&args[1])))
+        }
+        GeoFn::PolyOverRight => Value::Bool(geo::poly_over_right(
+            polygon_of(&args[0]),
+            polygon_of(&args[1]),
+        )),
+        GeoFn::PolyBelow => {
+            Value::Bool(geo::poly_below(polygon_of(&args[0]), polygon_of(&args[1])))
+        }
+        GeoFn::PolyAbove => {
+            Value::Bool(geo::poly_above(polygon_of(&args[0]), polygon_of(&args[1])))
+        }
+        GeoFn::PolyOverBelow => Value::Bool(geo::poly_over_below(
+            polygon_of(&args[0]),
+            polygon_of(&args[1]),
+        )),
+        GeoFn::PolyOverAbove => Value::Bool(geo::poly_over_above(
+            polygon_of(&args[0]),
+            polygon_of(&args[1]),
+        )),
+        GeoFn::PolyContain => {
+            Value::Bool(geo::poly_contain(polygon_of(&args[0]), polygon_of(&args[1])))
+        }
+        GeoFn::PolyContained => Value::Bool(geo::poly_contained(
+            polygon_of(&args[0]),
+            polygon_of(&args[1]),
+        )),
+        GeoFn::PolyContainPt => Value::Bool(geo::poly_contain_pt(
+            polygon_of(&args[0]),
+            &point_of(&args[1]),
+        )),
+        GeoFn::PolyContainPtSwapped => Value::Bool(geo::poly_contain_pt(
+            polygon_of(&args[1]),
+            &point_of(&args[0]),
+        )),
+        GeoFn::DistPolyPoly => Value::Float8(geo::dist_poly_poly(
+            polygon_of(&args[0]),
+            polygon_of(&args[1]),
+        )),
+        GeoFn::DistPolyPoint => Value::Float8(geo::dist_poly_point(
+            polygon_of(&args[0]),
+            &point_of(&args[1]),
+        )),
+        GeoFn::DistPolyCircle => Value::Float8(geo::dist_poly_circle(
+            polygon_of(&args[0]),
+            &circle_of(&args[1]),
+        )),
     })
 }
 

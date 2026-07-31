@@ -613,7 +613,8 @@ pub enum TsFn {
     QueryPhraseDist,
 }
 
-/// A geometric (`point` / `lseg` / `path`) operation. Operators lower to these via
+/// A geometric (`point` / `lseg` / `path` / `box` / `line` / `circle` /
+/// `polygon`) operation. Operators lower to these via
 /// `resolve_geometric_op`/`resolve_geometric_unary`; named functions register
 /// them in [`lookup`]. Argument order is fixed per variant (see each doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -731,6 +732,254 @@ pub enum GeoFn {
     PathGt,
     /// `p1 >= p2` (by point count).
     PathGe,
+
+    // -- box ---------------------------------------------------------------
+    /// `box(point) -> box` / `point::box` (a degenerate box).
+    BoxFromPoint,
+    /// `box(point, point) -> box`.
+    BoxConstruct,
+    /// `area(box) -> float8`.
+    BoxArea,
+    /// `width(box) -> float8`.
+    BoxWidth,
+    /// `height(box) -> float8`.
+    BoxHeight,
+    /// `@@ box` / `center(box)` / `box::point` (`-> point`).
+    BoxCenter,
+    /// `diagonal(box)` / `lseg(box)` / `box::lseg` (`-> lseg`).
+    BoxDiagonal,
+    /// `bound_box(box, box) -> box`.
+    BoundBox,
+    /// `b1 && b2` overlap.
+    BoxOverlap,
+    /// `b1 << b2` (strictly left).
+    BoxLeft,
+    /// `b1 >> b2` (strictly right).
+    BoxRight,
+    /// `b1 &< b2` (does not extend right of).
+    BoxOverLeft,
+    /// `b1 &> b2` (does not extend left of).
+    BoxOverRight,
+    /// `b1 <<| b2` (strictly below).
+    BoxBelow,
+    /// `b1 |>> b2` (strictly above).
+    BoxAbove,
+    /// `b1 &<| b2` (does not extend above).
+    BoxOverBelow,
+    /// `b1 |&> b2` (does not extend below).
+    BoxOverAbove,
+    /// `b1 <^ b2` (is below, touching allowed).
+    BoxBelowEq,
+    /// `b1 >^ b2` (is above, touching allowed).
+    BoxAboveEq,
+    /// `b1 @> b2` contains.
+    BoxContain,
+    /// `b1 <@ b2` contained in.
+    BoxContained,
+    /// `b1 ~= b2` same as (identical corners).
+    BoxSame,
+    /// `b1 ?# b2` (they share a point).
+    BoxIntersects,
+    /// `b1 # b2` intersection box (`-> box`, NULL if disjoint).
+    BoxIntersect,
+    /// `b1 = b2` (by area — identity is `~=`). PG gives `box` no `<>`
+    /// counterpart, so there is no `BoxNe`.
+    BoxEq,
+    /// `b1 < b2` (by area).
+    BoxLt,
+    /// `b1 <= b2` (by area).
+    BoxLe,
+    /// `b1 > b2` (by area).
+    BoxGt,
+    /// `b1 >= b2` (by area).
+    BoxGe,
+    /// `box + point` (`-> box`).
+    BoxAddPt,
+    /// `box - point` (`-> box`).
+    BoxSubPt,
+    /// `box * point` (`-> box`).
+    BoxMulPt,
+    /// `box / point` (`-> box`).
+    BoxDivPt,
+    /// `box @> point` / `point <@ box`; args are `[box, point]`.
+    BoxContainPt,
+    /// `point ## box` closest point (`-> point`); args are `[point, box]`.
+    ClosePointBox,
+    /// `point <-> box` distance (`-> float8`); args are `[point, box]`.
+    DistPointBox,
+    /// `lseg <@ box`; args are `[lseg, box]`.
+    LsegInsideBox,
+    /// `lseg ?# box`; args are `[lseg, box]`.
+    LsegIntersectsBox,
+    /// `lseg <-> box` distance (`-> float8`); args are `[lseg, box]`.
+    DistLsegBox,
+    /// `lseg ## box` closest point (`-> point`); args are `[lseg, box]`.
+    CloseLsegBox,
+    /// `b1 <-> b2` box distance — **center to center** (`-> float8`).
+    DistBoxBox,
+    /// `box::circle` / `circle(box)` (`-> circle`).
+    BoxToCircle,
+    /// `box::polygon` / `polygon(box)` (`-> polygon`).
+    BoxToPolygon,
+
+    // -- line --------------------------------------------------------------
+    /// `line(point, point) -> line`.
+    LineConstruct,
+    /// `l1 = l2` (scale invariant, NaN-exact).
+    LineEq,
+    /// `?- line` / `ishorizontal(line)`.
+    LineHoriz,
+    /// `?| line` / `isvertical(line)`.
+    LineVert,
+    /// `l1 ?|| l2` / `isparallel(line, line)`.
+    LineParallel,
+    /// `l1 ?-| l2` / `isperp(line, line)`.
+    LinePerpendicular,
+    /// `l1 # l2` intersection point (`-> point`, NULL if parallel).
+    LineInterpt,
+    /// `l1 ?# l2` (they meet in one point).
+    LineIntersects,
+    /// `l1 <-> l2` distance (`-> float8`).
+    DistLineLine,
+    /// `point <-> line` distance (`-> float8`); args are `[point, line]`.
+    DistPointLine,
+    /// `point ## line` foot of the perpendicular (`-> point`); args are
+    /// `[point, line]`.
+    ClosePointLine,
+    /// `point <@ line`; args are `[point, line]`.
+    PointOnLine,
+    /// `lseg <@ line`; args are `[lseg, line]`.
+    LsegOnLine,
+    /// `lseg ?# line`; args are `[lseg, line]`.
+    LsegIntersectsLine,
+    /// `lseg <-> line` distance (`-> float8`); args are `[lseg, line]`.
+    DistLsegLine,
+    /// `line ## lseg` closest point on the segment (`-> point`, NULL if
+    /// parallel); args are `[line, lseg]`.
+    CloseLineLseg,
+    /// `line ?# box`; args are `[line, box]`.
+    LineIntersectsBox,
+
+    // -- circle ------------------------------------------------------------
+    /// `circle(point, float8) -> circle`.
+    CircleConstruct,
+    /// `@@ circle` / `center(circle)` / `point(circle)` / `circle::point`.
+    CircleCenter,
+    /// `radius(circle) -> float8`.
+    CircleRadius,
+    /// `diameter(circle) -> float8`.
+    CircleDiameter,
+    /// `area(circle) -> float8`.
+    CircleArea,
+    /// `circle::box` / `box(circle)` (`-> box`).
+    CircleToBox,
+    /// `circle(polygon) -> circle`.
+    CircleFromPolygon,
+    /// `circle::polygon` / `polygon(circle)` (`-> polygon`, 12 points).
+    CircleToPolygon,
+    /// `polygon(int4, circle) -> polygon`; args are `[int4, circle]`.
+    CircleToPolygonN,
+    /// `c1 ~= c2` same as.
+    CircleSame,
+    /// `c1 && c2` overlap.
+    CircleOverlap,
+    /// `c1 << c2` (strictly left).
+    CircleLeft,
+    /// `c1 >> c2` (strictly right).
+    CircleRight,
+    /// `c1 &< c2` (does not extend right of).
+    CircleOverLeft,
+    /// `c1 &> c2` (does not extend left of).
+    CircleOverRight,
+    /// `c1 <<| c2` (strictly below).
+    CircleBelow,
+    /// `c1 |>> c2` (strictly above).
+    CircleAbove,
+    /// `c1 &<| c2` (does not extend above).
+    CircleOverBelow,
+    /// `c1 |&> c2` (does not extend below).
+    CircleOverAbove,
+    /// `c1 @> c2` contains.
+    CircleContain,
+    /// `c1 <@ c2` contained in.
+    CircleContained,
+    /// `circle @> point` / `point <@ circle`; args are `[circle, point]`.
+    CircleContainPt,
+    /// `pt_contained_circle(point, circle)` — the same test with the arguments
+    /// in the other order, which is how PG spells the function.
+    CircleContainPtSwapped,
+    /// `c1 = c2` (by area — identity is `~=`).
+    CircleEq,
+    /// `c1 <> c2` (by area).
+    CircleNe,
+    /// `c1 < c2` (by area).
+    CircleLt,
+    /// `c1 <= c2` (by area).
+    CircleLe,
+    /// `c1 > c2` (by area).
+    CircleGt,
+    /// `c1 >= c2` (by area).
+    CircleGe,
+    /// `c1 <-> c2` distance (`-> float8`).
+    DistCircleCircle,
+    /// `point <-> circle` distance (`-> float8`); args are `[point, circle]`.
+    DistPointCircle,
+    /// `circle + point` (`-> circle`).
+    CircleAddPt,
+    /// `circle - point` (`-> circle`).
+    CircleSubPt,
+    /// `circle * point` (`-> circle`).
+    CircleMulPt,
+    /// `circle / point` (`-> circle`).
+    CircleDivPt,
+
+    // -- polygon -----------------------------------------------------------
+    /// `# polygon` / `npoints(polygon) -> int4`.
+    PolyNpoints,
+    /// `@@ polygon` / `point(polygon)` / `polygon::point` (`-> point`).
+    PolyCenter,
+    /// `polygon::box` / `box(polygon)` (`-> box`).
+    PolyToBox,
+    /// `polygon::path` / `path(polygon)` (`-> path`, always closed).
+    PolyToPath,
+    /// `path::polygon` / `polygon(path)` (`-> polygon`; an open path errors).
+    PathToPolygon,
+    /// `p1 ~= p2` same as.
+    PolySame,
+    /// `p1 && p2` overlap.
+    PolyOverlap,
+    /// `p1 << p2` (strictly left).
+    PolyLeft,
+    /// `p1 >> p2` (strictly right).
+    PolyRight,
+    /// `p1 &< p2` (does not extend right of).
+    PolyOverLeft,
+    /// `p1 &> p2` (does not extend left of).
+    PolyOverRight,
+    /// `p1 <<| p2` (strictly below).
+    PolyBelow,
+    /// `p1 |>> p2` (strictly above).
+    PolyAbove,
+    /// `p1 &<| p2` (does not extend above).
+    PolyOverBelow,
+    /// `p1 |&> p2` (does not extend below).
+    PolyOverAbove,
+    /// `p1 @> p2` contains.
+    PolyContain,
+    /// `p1 <@ p2` contained in.
+    PolyContained,
+    /// `polygon @> point` / `point <@ polygon`; args are `[polygon, point]`.
+    PolyContainPt,
+    /// `pt_contained_poly(point, polygon)` — the same test with the arguments
+    /// in the other order.
+    PolyContainPtSwapped,
+    /// `p1 <-> p2` polygon distance (`-> float8`).
+    DistPolyPoly,
+    /// `polygon <-> point` distance (`-> float8`); args are `[polygon, point]`.
+    DistPolyPoint,
+    /// `polygon <-> circle` distance (`-> float8`); args are
+    /// `[polygon, circle]`.
+    DistPolyCircle,
 }
 
 struct Signature {
@@ -1070,6 +1319,10 @@ const MACADDR8: PgType = PgType::Macaddr8;
 const POINT: PgType = PgType::Point;
 const LSEG: PgType = PgType::Lseg;
 const PATH: PgType = PgType::Path;
+const BOX: PgType = PgType::Box;
+const LINE: PgType = PgType::Line;
+const CIRCLE: PgType = PgType::Circle;
+const POLYGON: PgType = PgType::Polygon;
 const JSONB: PgType = PgType::Jsonb;
 const JSONPATH: PgType = PgType::Jsonpath;
 const TSVECTOR: PgType = PgType::Tsvector;
@@ -2007,31 +2260,214 @@ fn lookup(name: &str) -> &'static [Signature] {
             },
         ],
         // --- geometric constructors / accessors ---
-        "point" => &[Signature {
-            func: ScalarFn::Geo(GeoFn::PointConstruct),
-            args: &[F8, F8],
-            ret: POINT,
-        }],
-        "lseg" => &[Signature {
-            func: ScalarFn::Geo(GeoFn::LsegConstruct),
-            args: &[POINT, POINT],
-            ret: LSEG,
-        }],
+        "point" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PointConstruct),
+                args: &[F8, F8],
+                ret: POINT,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxCenter),
+                args: &[BOX],
+                ret: POINT,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleCenter),
+                args: &[CIRCLE],
+                ret: POINT,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PolyCenter),
+                args: &[POLYGON],
+                ret: POINT,
+            },
+        ],
+        "lseg" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::LsegConstruct),
+                args: &[POINT, POINT],
+                ret: LSEG,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxDiagonal),
+                args: &[BOX],
+                ret: LSEG,
+            },
+        ],
+        "box" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxFromPoint),
+                args: &[POINT],
+                ret: BOX,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxConstruct),
+                args: &[POINT, POINT],
+                ret: BOX,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleToBox),
+                args: &[CIRCLE],
+                ret: BOX,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PolyToBox),
+                args: &[POLYGON],
+                ret: BOX,
+            },
+        ],
+        "line" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::LineConstruct),
+                args: &[POINT, POINT],
+                ret: LINE,
+            },
+        ],
+        "circle" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleConstruct),
+                args: &[POINT, F8],
+                ret: CIRCLE,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxToCircle),
+                args: &[BOX],
+                ret: CIRCLE,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleFromPolygon),
+                args: &[POLYGON],
+                ret: CIRCLE,
+            },
+        ],
+        "polygon" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxToPolygon),
+                args: &[BOX],
+                ret: POLYGON,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleToPolygon),
+                args: &[CIRCLE],
+                ret: POLYGON,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleToPolygonN),
+                args: &[I4, CIRCLE],
+                ret: POLYGON,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PathToPolygon),
+                args: &[PATH],
+                ret: POLYGON,
+            },
+        ],
+        "path" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::PolyToPath),
+                args: &[POLYGON],
+                ret: PATH,
+            },
+        ],
+        "center" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxCenter),
+                args: &[BOX],
+                ret: POINT,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleCenter),
+                args: &[CIRCLE],
+                ret: POINT,
+            },
+        ],
+        "diagonal" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxDiagonal),
+                args: &[BOX],
+                ret: LSEG,
+            },
+        ],
+        "width" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxWidth),
+                args: &[BOX],
+                ret: F8,
+            },
+        ],
+        "height" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxHeight),
+                args: &[BOX],
+                ret: F8,
+            },
+        ],
+        "bound_box" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::BoundBox),
+                args: &[BOX, BOX],
+                ret: BOX,
+            },
+        ],
+        "radius" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleRadius),
+                args: &[CIRCLE],
+                ret: F8,
+            },
+        ],
+        "diameter" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleDiameter),
+                args: &[CIRCLE],
+                ret: F8,
+            },
+        ],
+        "isparallel" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::LineParallel),
+                args: &[LINE, LINE],
+                ret: BOOL,
+            },
+        ],
+        "isperp" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::LinePerpendicular),
+                args: &[LINE, LINE],
+                ret: BOOL,
+            },
+        ],
+        "pt_contained_circle" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleContainPtSwapped),
+                args: &[POINT, CIRCLE],
+                ret: BOOL,
+            },
+        ],
+        "pt_contained_poly" => &[            Signature {
+                func: ScalarFn::Geo(GeoFn::PolyContainPtSwapped),
+                args: &[POINT, POLYGON],
+                ret: BOOL,
+            },
+        ],
         "slope" => &[Signature {
             func: ScalarFn::Geo(GeoFn::PointSlope),
             args: &[POINT, POINT],
             ret: F8,
         }],
-        "ishorizontal" => &[Signature {
-            func: ScalarFn::Geo(GeoFn::PointHoriz),
-            args: &[POINT, POINT],
-            ret: BOOL,
-        }],
-        "isvertical" => &[Signature {
-            func: ScalarFn::Geo(GeoFn::PointVert),
-            args: &[POINT, POINT],
-            ret: BOOL,
-        }],
+        "ishorizontal" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PointHoriz),
+                args: &[POINT, POINT],
+                ret: BOOL,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::LineHoriz),
+                args: &[LINE],
+                ret: BOOL,
+            },
+        ],
+        "isvertical" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PointVert),
+                args: &[POINT, POINT],
+                ret: BOOL,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::LineVert),
+                args: &[LINE],
+                ret: BOOL,
+            },
+        ],
         "isopen" => &[Signature {
             func: ScalarFn::Geo(GeoFn::PathIsOpen),
             args: &[PATH],
@@ -2074,16 +2510,35 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[XID8, XID8],
             ret: I4,
         }],
-        "npoints" => &[Signature {
-            func: ScalarFn::Geo(GeoFn::PathNpoints),
-            args: &[PATH],
-            ret: I4,
-        }],
-        "area" => &[Signature {
-            func: ScalarFn::Geo(GeoFn::PathArea),
-            args: &[PATH],
-            ret: F8,
-        }],
+        "npoints" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PathNpoints),
+                args: &[PATH],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PolyNpoints),
+                args: &[POLYGON],
+                ret: I4,
+            },
+        ],
+        "area" => &[
+            Signature {
+                func: ScalarFn::Geo(GeoFn::PathArea),
+                args: &[PATH],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::BoxArea),
+                args: &[BOX],
+                ret: F8,
+            },
+            Signature {
+                func: ScalarFn::Geo(GeoFn::CircleArea),
+                args: &[CIRCLE],
+                ret: F8,
+            },
+        ],
         // --- jsonpath query functions: each has the 2-arg form plus the
         // optional `vars jsonb` / `silent bool` arguments PG's DEFAULTs add ---
         // --- text search (tsvector / tsquery) ---

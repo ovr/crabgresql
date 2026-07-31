@@ -521,8 +521,70 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
                 })
         }
 
-        // ---- lseg → point (lseg_center): the segment's midpoint ----
+        (Value::Text(s), PgType::Box) => {
+            crate::geo::parse_box(s)
+                .map(Value::Box)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        (Value::Text(s), PgType::Line) => {
+            crate::geo::parse_line(s)
+                .map(Value::Line)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        (Value::Text(s), PgType::Circle) => {
+            crate::geo::parse_circle(s)
+                .map(Value::Circle)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        (Value::Text(s), PgType::Polygon) => {
+            crate::geo::parse_polygon(s)
+                .map(Value::Polygon)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+
+        // ---- intra-family geometric casts (all explicit in PG's pg_cast) ----
+        // `lseg → point` is the segment's midpoint; the rest follow the same
+        // "collapse to the natural summary shape" pattern.
         (Value::Lseg(l), PgType::Point) => Ok(Value::Point(crate::geo::lseg_center(l))),
+        (Value::Point(p), PgType::Box) => Ok(Value::Box(crate::geo::box_from_point(p))),
+        (Value::Box(b), PgType::Point) => Ok(Value::Point(crate::geo::box_center(b))),
+        (Value::Box(b), PgType::Lseg) => Ok(Value::Lseg(crate::geo::box_diagonal(b))),
+        (Value::Box(b), PgType::Circle) => Ok(Value::Circle(crate::geo::box_to_circle(b))),
+        (Value::Box(b), PgType::Polygon) => Ok(Value::Polygon(crate::geo::box_to_polygon(b))),
+        (Value::Circle(c), PgType::Point) => Ok(Value::Point(crate::geo::circle_center(c))),
+        (Value::Circle(c), PgType::Box) => Ok(Value::Box(crate::geo::circle_to_box(c))),
+        (Value::Circle(c), PgType::Polygon) => {
+            crate::geo::circle_to_polygon(crate::geo::CIRCLE_POLYGON_NPTS, c)
+                .map(Value::Polygon)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
+        }
+        (Value::Polygon(p), PgType::Point) => Ok(Value::Point(crate::geo::poly_center(p))),
+        (Value::Polygon(p), PgType::Box) => Ok(Value::Box(crate::geo::poly_bbox(p))),
+        (Value::Polygon(p), PgType::Path) => Ok(Value::Path(crate::geo::poly_to_path(p))),
+        (Value::Polygon(p), PgType::Circle) => {
+            Ok(Value::Circle(crate::geo::circle_from_polygon(p)))
+        }
+        (Value::Path(p), PgType::Polygon) => crate::geo::path_to_polygon(p)
+            .map(Value::Polygon)
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
 
         // ---- tsvector / tsquery input ----
         // The reverse direction (→ text/varchar/...) is handled by the generic

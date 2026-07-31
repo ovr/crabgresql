@@ -86,6 +86,16 @@ pub mod oid {
     pub const LSEG: u32 = 601;
     /// `path`: a geometric open or closed list of points. See [`crate::geo`].
     pub const PATH: u32 = 602;
+    /// `box`: a geometric rectangle given by two opposite corners.
+    /// See [`crate::geo`].
+    pub const BOX: u32 = 603;
+    /// `polygon`: a geometric closed vertex list with an interior.
+    /// See [`crate::geo`].
+    pub const POLYGON: u32 = 604;
+    /// `line`: an infinite geometric line `Ax + By + C = 0`. See [`crate::geo`].
+    pub const LINE: u32 = 628;
+    /// `circle`: a geometric center point plus a radius. See [`crate::geo`].
+    pub const CIRCLE: u32 = 718;
     /// `json`: JSON stored as validated text. See [`crate::json`].
     pub const JSON: u32 = 114;
     /// `jsonb`: JSON stored as a canonical binary tree. See [`crate::json`].
@@ -117,6 +127,10 @@ pub mod oid {
     pub const POINT_ARRAY: u32 = 1017;
     pub const LSEG_ARRAY: u32 = 1018;
     pub const PATH_ARRAY: u32 = 1019;
+    pub const BOX_ARRAY: u32 = 1020;
+    pub const POLYGON_ARRAY: u32 = 1027;
+    pub const LINE_ARRAY: u32 = 629;
+    pub const CIRCLE_ARRAY: u32 = 719;
     pub const FLOAT4_ARRAY: u32 = 1021;
     pub const FLOAT8_ARRAY: u32 = 1022;
     pub const OID_ARRAY: u32 = 1028;
@@ -222,6 +236,17 @@ pub enum PgType {
     /// `path`: a geometric list of points, open (`[..]`) or closed (`(..)`).
     /// Varlena; no default b-tree opclass. See [`crate::geo`].
     Path,
+    /// `box`: a geometric rectangle, stored with its corners normalized. Fixed
+    /// 32-byte type; `=` compares area, not identity. See [`crate::geo`].
+    Box,
+    /// `polygon`: a geometric closed vertex list. Varlena. See [`crate::geo`].
+    Polygon,
+    /// `line`: an infinite geometric line `Ax + By + C = 0`. Fixed 24-byte type.
+    /// See [`crate::geo`].
+    Line,
+    /// `circle`: a geometric center plus radius. Fixed 24-byte type; `=`
+    /// compares area, not identity. See [`crate::geo`].
+    Circle,
     /// `json`: JSON kept as validated text (whitespace/key order/duplicate keys
     /// preserved). Varlena; no default equality. See [`crate::json`].
     Json,
@@ -382,6 +407,10 @@ impl PgType {
             PgType::Point => oid::POINT,
             PgType::Lseg => oid::LSEG,
             PgType::Path => oid::PATH,
+            PgType::Box => oid::BOX,
+            PgType::Polygon => oid::POLYGON,
+            PgType::Line => oid::LINE,
+            PgType::Circle => oid::CIRCLE,
             PgType::Json => oid::JSON,
             PgType::Jsonb => oid::JSONB,
             PgType::Jsonpath => oid::JSONPATH,
@@ -498,6 +527,10 @@ impl PgType {
             oid::POINT => PgType::Point,
             oid::LSEG => PgType::Lseg,
             oid::PATH => PgType::Path,
+            oid::BOX => PgType::Box,
+            oid::POLYGON => PgType::Polygon,
+            oid::LINE => PgType::Line,
+            oid::CIRCLE => PgType::Circle,
             oid::JSON => PgType::Json,
             oid::JSONB => PgType::Jsonb,
             oid::JSONPATH => PgType::Jsonpath,
@@ -568,6 +601,10 @@ impl PgType {
             "point" => PgType::Point,
             "lseg" => PgType::Lseg,
             "path" => PgType::Path,
+            "box" => PgType::Box,
+            "polygon" => PgType::Polygon,
+            "line" => PgType::Line,
+            "circle" => PgType::Circle,
             "json" => PgType::Json,
             "jsonb" => PgType::Jsonb,
             "jsonpath" => PgType::Jsonpath,
@@ -609,6 +646,9 @@ impl PgType {
             PgType::PgLsn => 8,
             PgType::Point => 16,
             PgType::Lseg => 32,
+            PgType::Box => 32,
+            PgType::Line => 24,
+            PgType::Circle => 24,
             // `name` is a fixed 64-byte type; the rest are varlena.
             PgType::Name => 64,
             PgType::Numeric
@@ -624,6 +664,7 @@ impl PgType {
             | PgType::Jsonb
             | PgType::Jsonpath
             | PgType::Path
+            | PgType::Polygon
             | PgType::Tsvector
             | PgType::Tsquery => -1,
             PgType::User(_) => -1,
@@ -669,6 +710,10 @@ impl PgType {
             PgType::Point => "point",
             PgType::Lseg => "lseg",
             PgType::Path => "path",
+            PgType::Box => "box",
+            PgType::Polygon => "polygon",
+            PgType::Line => "line",
+            PgType::Circle => "circle",
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
@@ -718,6 +763,10 @@ impl PgType {
             PgType::Point => "point",
             PgType::Lseg => "lseg",
             PgType::Path => "path",
+            PgType::Box => "box",
+            PgType::Polygon => "polygon",
+            PgType::Line => "line",
+            PgType::Circle => "circle",
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
@@ -741,9 +790,19 @@ impl PgType {
         )
     }
 
+    /// `pg_type.typdelim`: the character separating elements of an array of
+    /// this type. Every built-in uses `,` except `box`, whose own output text is
+    /// full of commas (`(1,1),(0,0)`), so PG gives it `;`.
+    pub const fn typdelim(self) -> char {
+        match self {
+            PgType::Box => ';',
+            _ => ',',
+        }
+    }
+
     /// Whether this type has a default B-tree operator class — i.e. it can be
-    /// ordered, so it may key a B-tree / UNIQUE index or a PRIMARY KEY. `json`,
-    /// `point`, and `lseg` have no default ordering in PostgreSQL (and the
+    /// ordered, so it may key a B-tree / UNIQUE index or a PRIMARY KEY. `json`
+    /// and the geometric types have no default ordering in PostgreSQL (and the
     /// executor's `compare_values` has no arm for them); everything else,
     /// including user types (enums order by ordinal), does. Must stay in sync
     /// with `crabgresql_executor::is_orderable`.
@@ -754,7 +813,15 @@ impl PgType {
     /// exposes it.
     pub fn has_default_btree_opclass(self) -> bool {
         match self {
-            PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg | PgType::Path => {
+            PgType::Json
+            | PgType::Jsonpath
+            | PgType::Point
+            | PgType::Lseg
+            | PgType::Path
+            | PgType::Box
+            | PgType::Polygon
+            | PgType::Line
+            | PgType::Circle => {
                 false
             }
             // `xid` is the one type here with equality but no ordering: PG gives
@@ -823,6 +890,10 @@ fn array_display_name(elem: u32) -> &'static str {
         Some(PgType::Point) => "point[]",
         Some(PgType::Lseg) => "lseg[]",
         Some(PgType::Path) => "path[]",
+        Some(PgType::Box) => "box[]",
+        Some(PgType::Polygon) => "polygon[]",
+        Some(PgType::Line) => "line[]",
+        Some(PgType::Circle) => "circle[]",
         Some(PgType::Json) => "json[]",
         Some(PgType::Jsonb) => "jsonb[]",
         Some(PgType::Jsonpath) => "jsonpath[]",
@@ -870,6 +941,10 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Point) => "_point",
         Some(PgType::Lseg) => "_lseg",
         Some(PgType::Path) => "_path",
+        Some(PgType::Box) => "_box",
+        Some(PgType::Polygon) => "_polygon",
+        Some(PgType::Line) => "_line",
+        Some(PgType::Circle) => "_circle",
         Some(PgType::Json) => "_json",
         Some(PgType::Jsonb) => "_jsonb",
         Some(PgType::Jsonpath) => "_jsonpath",
@@ -968,6 +1043,16 @@ pub enum Value {
     Lseg([f64; 4]),
     /// `path`: an open or closed list of points. See [`crate::geo`].
     Path(geo::PathVal),
+    /// `box`: `[high.x, high.y, low.x, low.y]`, kept in PG's normal form where
+    /// `high` is componentwise >= `low`. See [`crate::geo`].
+    Box([f64; 4]),
+    /// `polygon`: a closed vertex list with an interior. See [`crate::geo`].
+    Polygon(geo::PolygonVal),
+    /// `line`: the coefficients `[A, B, C]` of `Ax + By + C = 0`.
+    /// See [`crate::geo`].
+    Line([f64; 3]),
+    /// `circle`: `[center.x, center.y, radius]`. See [`crate::geo`].
+    Circle([f64; 3]),
     /// `json`: validated JSON text, kept verbatim. See [`crate::json`].
     Json(String),
     /// `jsonb`: a canonical parsed JSON tree. See [`crate::json`].
@@ -1034,6 +1119,10 @@ impl Value {
             Value::Point(_) => Some(PgType::Point),
             Value::Lseg(_) => Some(PgType::Lseg),
             Value::Path(_) => Some(PgType::Path),
+            Value::Box(_) => Some(PgType::Box),
+            Value::Polygon(_) => Some(PgType::Polygon),
+            Value::Line(_) => Some(PgType::Line),
+            Value::Circle(_) => Some(PgType::Circle),
             Value::Json(_) => Some(PgType::Json),
             Value::Jsonb(_) => Some(PgType::Jsonb),
             Value::Jsonpath(_) => Some(PgType::Jsonpath),
@@ -1095,6 +1184,10 @@ impl Value {
             Value::Point(p) => Some(geo::format_point(p, efd)),
             Value::Lseg(l) => Some(geo::format_lseg(l, efd)),
             Value::Path(p) => Some(geo::format_path(p, efd)),
+            Value::Box(b) => Some(geo::format_box(b, efd)),
+            Value::Polygon(p) => Some(geo::format_polygon(p, efd)),
+            Value::Line(l) => Some(geo::format_line(l, efd)),
+            Value::Circle(c) => Some(geo::format_circle(c, efd)),
             // `json` prints its stored text verbatim; `jsonb` re-serializes its
             // canonical tree (`jsonb_out`).
             Value::Json(s) => Some(s.clone()),
@@ -1107,7 +1200,7 @@ impl Value {
             // An enum prints as its label (PG's `enum_out`).
             Value::Enum { label, .. } => Some(label.clone()),
             // An array prints in PG's `{...}` form (`array_out`).
-            Value::Array { elems, .. } => Some(array::format(elems, efd)),
+            Value::Array { elem, elems } => Some(array::format(*elem, elems, efd)),
         }
     }
 }

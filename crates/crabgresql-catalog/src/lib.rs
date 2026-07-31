@@ -94,7 +94,7 @@ include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 
 /// Whether `name` is the catalog name of a PostgreSQL built-in type, including
 /// types crabgresql recognizes but does not implement yet (for example
-/// `point`). This distinguishes an unsupported built-in from a nonexistent
+/// `xml`). This distinguishes an unsupported built-in from a nonexistent
 /// user type without maintaining a second hand-written name list.
 pub fn is_builtin_type_name(name: &str) -> bool {
     PG_TYPE_ROWS.iter().any(|row| row.typname == name)
@@ -1025,6 +1025,10 @@ mod tests {
             ("point", PgType::Point),
             ("lseg", PgType::Lseg),
             ("path", PgType::Path),
+            ("box", PgType::Box),
+            ("polygon", PgType::Polygon),
+            ("line", PgType::Line),
+            ("circle", PgType::Circle),
             ("json", PgType::Json),
             ("jsonb", PgType::Jsonb),
             ("jsonpath", PgType::Jsonpath),

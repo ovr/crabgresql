@@ -166,3 +166,288 @@ SELECT '[]'::path;
 -- the non-error-throwing input API
 SELECT pg_input_is_valid('(1,2)', 'point') AS ok, pg_input_is_valid('1,y', 'point') AS bad;
 SELECT * FROM pg_input_error_info('1,y', 'point');
+
+--
+-- box / line / circle / polygon. The upstream box.sql and polygon.sql stop at
+-- their SP-GiST sections and geometry.sql needs point subscripting (`f1[0]`),
+-- so none of the three can be promoted; the operator and function surface they
+-- cover up to that point is reproduced here instead.
+--
+
+-- box input: the four accepted spellings, all normalizing the corners so the
+-- high one prints first
+SELECT '(1,2,3,4)'::box AS a,
+       '((1,2),(3,4))'::box AS b,
+       '(1,2),(3,4)'::box AS c,
+       '1,2,3,4'::box AS d;
+SELECT '(0,2,2,0)'::box AS mixed_corners, ' ( ( 1 , 2 ) , ( 3 , 4 ) ) '::box AS spaced;
+SELECT '(0,100)(0,infinity)'::box AS inf_corner;
+
+-- box measures and the shapes it converts to
+SELECT area(box '(0,0,2,3)') AS area,
+       width(box '(0,0,2,3)') AS width,
+       height(box '(0,0,2,3)') AS height;
+SELECT center(box '(0,0,2,3)') AS center,
+       @@ box '(0,0,2,3)' AS at_at,
+       diagonal(box '(0,0,2,3)') AS diagonal,
+       lseg(box '(0,0,2,3)') AS lseg;
+SELECT box(point '(1,2)') AS from_point,
+       box(point '(1,2)', point '(3,4)') AS from_points,
+       bound_box(box '(0,0,1,1)', box '(5,5,6,6)') AS bound;
+SELECT box '(0,0,2,3)'::point AS pt,
+       box '(0,0,2,2)'::circle AS circ,
+       box '(0,0,2,3)'::polygon AS poly,
+       point '(1,2)'::box AS degenerate;
+
+-- box predicates: positional, containment, identity, and the `#` intersection
+SELECT box '(0,0,2,2)' && box '(1,1,3,3)' AS overlap,
+       box '(0,0,2,2)' &< box '(1,1,3,3)' AS overleft,
+       box '(0,0,2,2)' &> box '(1,1,3,3)' AS overright,
+       box '(0,0,2,2)' << box '(3,3,5,5)' AS left,
+       box '(3,3,5,5)' >> box '(0,0,2,2)' AS right,
+       box '(0,0,2,2)' <^ box '(0,5,2,7)' AS below,
+       box '(0,5,2,7)' >^ box '(0,0,2,2)' AS above;
+SELECT box '(0,0,3,3)' @> box '(1,1,2,2)' AS contains,
+       box '(1,1,2,2)' <@ box '(0,0,3,3)' AS contained,
+       box '(1,1,3,3)' ~= box '(1,1,3,3)' AS same,
+       box '(0,0,2,2)' ?# box '(2,2,3,3)' AS touches;
+SELECT box '(0,0,2,2)' # box '(1,1,3,3)' AS isect,
+       box '(0,0,1,1)' # box '(5,5,6,6)' AS no_isect;
+
+-- box comparisons are by AREA, so two differently placed boxes can be equal;
+-- identity is `~=` above
+SELECT box '(0,0,2,2)' = box '(1,1,3,3)' AS eq_by_area,
+       box '(0,0,2,2)' < box '(0,0,3,3)' AS lt,
+       box '(0,0,2,2)' >= box '(1,1,3,3)' AS ge;
+
+-- box arithmetic moves / rotates / scales both corners
+SELECT box '(0,0,2,2)' + point '(1,1)' AS plus,
+       box '(0,0,2,2)' - point '(1,1)' AS minus,
+       box '(0,0,2,2)' * point '(2,0)' AS mul,
+       box '(0,0,2,2)' / point '(2,0)' AS div;
+
+-- point / lseg against a box. `box <-> box` is measured CENTER TO CENTER, so
+-- two disjoint boxes never report 0; the others are true outline distances.
+SELECT box '(0,0,2,2)' <-> box '(10,0,12,2)' AS bb_centers,
+       point '(5,5)' <-> box '(0,0,2,2)' AS pb,
+       lseg '[(5,5),(6,6)]' <-> box '(0,0,2,2)' AS sb;
+SELECT box '(0,0,2,2)' @> point '(1,1)' AS contains_pt,
+       point '(1,1)' <@ box '(0,0,2,2)' AS pt_inside,
+       point '(5,5)' <@ box '(0,0,2,2)' AS pt_outside;
+SELECT point '(5,5)' ## box '(0,0,2,2)' AS close_pb,
+       point '(1,1)' ## box '(0,0,2,2)' AS close_pb_inside,
+       lseg '[(3,1),(4,1)]' ## box '(0,0,2,2)' AS close_sb;
+SELECT lseg '[(0.5,0.5),(1,1)]' <@ box '(0,0,2,2)' AS seg_inside,
+       lseg '[(0,0),(5,5)]' <@ box '(0,0,2,2)' AS seg_not_inside,
+       lseg '[(0,0),(5,5)]' ?# box '(0,0,2,2)' AS seg_meets;
+
+-- bad box input
+SELECT '[1, 2, 3, 4)'::box;
+SELECT '(2.3, 4.5)'::box;
+SELECT '(1, 2, 3, 4) x'::box;
+
+-- line input: the `{A,B,C}` coefficient form and the two-point spellings, which
+-- normalize to `{0,-1,y}` horizontal / `{-1,0,x}` vertical / `{m,-1,b}`
+SELECT '{0,-1,5}'::line AS a, '{3,NaN,5}'::line AS nan;
+SELECT ' (0,0), (6,6)'::line AS diag,
+       '10,-10 ,-5,-4'::line AS bare,
+       '[(1,3),(2,3)]'::line AS horiz,
+       line(point '(3,1)', point '(3,2)') AS vert;
+
+-- line equality is scale invariant, but a NaN coefficient forces exact matching
+SELECT line '{1,2,3}' = line '{2,4,6}' AS scaled,
+       line '{1,2,3}' = line '{-1,-2,-3}' AS negated,
+       line '{nan,1,nan}' = line '{nan,1,nan}' AS nan_self,
+       line '{nan,1,nan}' = line '{nan,2,nan}' AS nan_other;
+
+-- line relations and the unary orientation tests
+SELECT ?- line '{0,-1,5}' AS horiz, ?| line '{1,0,-5}' AS vert,
+       ishorizontal(line '{0,-1,5}') AS ishoriz,
+       isvertical(line '{1,0,-5}') AS isvert;
+SELECT line '{1,-1,0}' ?|| line '{1,-1,5}' AS parallel,
+       line '{1,-1,0}' ?-| line '{1,1,-2}' AS perp,
+       isparallel(line '{1,-1,0}', line '{1,-1,5}') AS isparallel,
+       isperp(line '{1,-1,0}', line '{1,1,-2}') AS isperp;
+SELECT line '{1,-1,0}' # line '{1,1,-2}' AS meet,
+       line '{1,-1,0}' # line '{2,-2,0}' AS same_line,
+       line '{1,-1,0}' ?# line '{1,1,0}' AS crosses,
+       line '{1,-1,0}' ?# line '{1,-1,5}' AS never;
+
+-- point / lseg / box against a line
+SELECT line '{1,-1,0}' <-> line '{1,-1,5}' AS ll,
+       point '(0,5)' <-> line '{1,-1,0}' AS pl,
+       lseg '[(0,5),(1,5)]' <-> line '{1,-1,0}' AS sl;
+SELECT point '(0,5)' ## line '{1,-1,0}' AS close_pl,
+       line '{1,-1,0}' ## lseg '[(0,5),(5,5)]' AS close_ls,
+       line '{1,-1,0}' ## lseg '[(0,0),(1,1)]' AS collinear;
+SELECT point '(1,1)' <@ line '{1,-1,0}' AS on_line,
+       lseg '[(0,0),(1,1)]' <@ line '{1,-1,0}' AS seg_on_line,
+       lseg '[(0,0),(1,1)]' ?# line '{1,1,-2}' AS seg_crosses,
+       line '{1,-1,0}' ?# box '(0,0,2,2)' AS line_hits_box;
+
+-- bad line input: a bare syntax error, and the two specification errors
+SELECT '{}'::line;
+SELECT '{0,0,1}'::line;
+SELECT '[(1,2),(1,2)]'::line;
+
+-- circle input: angled, parenthesized, bare, and whitespace tolerant
+SELECT '<(5,1),3>'::circle AS a, '((1,2),100)'::circle AS b,
+       ' 1 , 3 , 5 '::circle AS c, ' < ( 100 , 1 ) , 115 > '::circle AS d;
+SELECT '<(3,5),0>'::circle AS zero_radius, '<(3,5),NaN>'::circle AS nan_radius;
+
+-- circle measures and conversions
+SELECT center(circle '<(5,1),3>') AS center,
+       @@ circle '<(5,1),3>' AS at_at,
+       radius(circle '<(5,1),3>') AS radius,
+       diameter(circle '<(5,1),3>') AS diameter;
+SELECT area(circle '<(5,1),3>') AS area;
+SELECT circle(point '(1,2)', 3.0) AS from_pt,
+       circle(box '(0,0,2,2)') AS from_box,
+       circle(polygon '((0,0),(2,0),(2,2),(0,2))') AS from_poly;
+SELECT circle '<(5,1),3>'::point AS pt, circle '<(0,0),2>'::box AS bx;
+SELECT polygon(4, circle '<(0,0),1>') AS quad;
+
+-- circle predicates
+SELECT circle '<(0,0),2>' && circle '<(1,1),1>' AS overlap,
+       circle '<(0,0),2>' &< circle '<(1,1),1>' AS overleft,
+       circle '<(0,0),2>' &> circle '<(1,1),1>' AS overright,
+       circle '<(0,0),1>' << circle '<(9,0),1>' AS left,
+       circle '<(9,0),1>' >> circle '<(0,0),1>' AS right;
+SELECT circle '<(0,0),2>' @> circle '<(0,0),1>' AS contains,
+       circle '<(0,0),1>' <@ circle '<(0,0),2>' AS contained,
+       circle '<(5,1),3>' ~= circle '<(5,1),3>' AS same,
+       circle '<(0,0),2>' @> point '(1,1)' AS contains_pt,
+       point '(1,1)' <@ circle '<(0,0),2>' AS pt_inside,
+       pt_contained_circle(point '(1,1)', circle '<(0,0),2>') AS fn;
+
+-- circle comparisons are by area, like box
+SELECT circle '<(1,2),3>' = circle '<(9,9),3>' AS eq_by_area,
+       circle '<(0,0),1>' < circle '<(0,0),2>' AS lt,
+       circle '<(0,0),2>' > circle '<(1,1),1>' AS gt;
+
+-- circle distances clamp at 0, and arithmetic moves the center (scaling the
+-- radius for `*` and `/`)
+SELECT circle '<(0,0),2>' <-> circle '<(5,5),1>' AS cc,
+       circle '<(0,0),2>' <-> circle '<(1,1),1>' AS overlapping,
+       point '(5,5)' <-> circle '<(0,0),2>' AS pc,
+       polygon '((5,5),(6,5),(6,6))' <-> circle '<(0,0),2>' AS gc;
+SELECT circle '<(0,0),2>' + point '(1,1)' AS plus,
+       circle '<(0,0),2>' - point '(1,1)' AS minus,
+       circle '<(0,0),2>' * point '(2,0)' AS mul,
+       circle '<(0,0),2>' / point '(2,0)' AS div;
+
+-- bad circle input: a negative radius, an unterminated value, trailing junk
+SELECT '<(-100,0),-100>'::circle;
+SELECT '<(100,200),10'::circle;
+SELECT '(3,(1,2),3)'::circle;
+
+-- polygon input: the closed spellings only (the `[...]` open form is rejected)
+SELECT '((0,0),(2,0),(2,2))'::polygon AS a,
+       '(0,0),(2,0),(2,2)'::polygon AS b,
+       '0,0,2,0,2,2'::polygon AS c,
+       '(0,0)'::polygon AS one_point;
+
+-- polygon measures and conversions. There is no `area(polygon)` or
+-- `center(polygon)` in PG — the centroid is `@@` / `point()`.
+SELECT npoints(polygon '((0,0),(2,0),(2,2))') AS n,
+       # polygon '((0,0),(2,0),(2,2))' AS hash_n,
+       @@ polygon '((0,0),(4,0),(4,4))' AS centroid;
+SELECT polygon '((0,0),(2,0),(2,2),(0,2))'::point AS pt,
+       polygon '((0,0),(2,0),(2,2),(0,2))'::box AS bx,
+       polygon '((0,0),(2,0),(2,2),(0,2))'::path AS pa,
+       polygon '((0,0),(2,0),(2,2),(0,2))'::circle AS ci;
+SELECT box(polygon '((0,0),(2,0),(2,2),(0,2))') AS bx,
+       path(polygon '((0,0),(2,0))') AS pa,
+       polygon(box '(0,0,2,2)') AS from_box,
+       polygon(path '((0,0),(1,1),(2,0))') AS from_closed_path;
+
+-- polygon predicates: `<<`-style positional tests use the bounding box, while
+-- `&&`/`@>`/`<@`/`~=` are real geometry
+SELECT polygon '((0,0),(1,0),(1,1))' << polygon '((5,0),(6,0),(6,1))' AS left,
+       polygon '((0,0),(1,0),(1,1))' &< polygon '((0.5,0),(6,0),(6,1))' AS overleft,
+       polygon '((0,0),(1,0),(1,1))' <<| polygon '((0,5),(1,5),(1,6))' AS below;
+SELECT polygon '((0,0),(4,0),(4,4),(0,4))' @> polygon '((1,1),(2,1),(2,2),(1,2))' AS contains,
+       polygon '((1,1),(2,1),(2,2),(1,2))' <@ polygon '((0,0),(4,0),(4,4),(0,4))' AS contained,
+       polygon '((0,0),(4,0),(4,4))' ~= polygon '((0,0),(4,0),(4,4))' AS same,
+       polygon '((0,0),(2,0),(2,2),(0,2))' && polygon '((1,1),(3,1),(3,3),(1,3))' AS overlap,
+       polygon '((0,0),(1,0),(0,1))' && polygon '((3,3),(2,3),(3,2))' AS disjoint;
+SELECT polygon '((0,0),(4,0),(4,4),(0,4))' @> point '(1,1)' AS contains_pt,
+       point '(1,1)' <@ polygon '((0,0),(4,0),(4,4),(0,4))' AS pt_inside,
+       pt_contained_poly(point '(1,1)', polygon '((0,0),(4,0),(4,4),(0,4))') AS fn;
+SELECT polygon '((0,0),(2,0),(2,2),(0,2))' <-> polygon '((5,5),(6,5),(6,6))' AS pp,
+       polygon '((0,0),(2,0),(2,2),(0,2))' <-> polygon '((1,1),(3,1),(3,3),(1,3))' AS overlapping,
+       polygon '((0,0),(2,0),(2,2),(0,2))' <-> point '(5,5)' AS pgpt;
+
+-- bad polygon input, and the open-path conversion PG refuses
+SELECT '[(0,0),(1,1)]'::polygon;
+SELECT '((0,0)'::polygon;
+SELECT polygon(path '[(0,0),(1,1),(2,0)]');
+
+-- box/polygon arrays: `box` is the one built-in whose array delimiter is `;`
+SELECT '{(1,1),(0,0);(3,3),(2,2)}'::box[] AS boxes,
+       '{"((0,0),(1,0),(1,1))","((5,5),(6,5),(6,6))"}'::polygon[] AS polys;
+
+-- the non-error-throwing input API over the new types
+SELECT pg_input_is_valid('{1, 1}', 'line') AS bad_line,
+       pg_input_is_valid('200', 'box') AS bad_box,
+       pg_input_is_valid('<(1,2),3>', 'circle') AS ok_circle;
+SELECT * FROM pg_input_error_info('{0, 0, 0}', 'line');
+SELECT * FROM pg_input_error_info('((200,300),(500, xyz))', 'box');
+
+--
+-- Regression cases for the geometric edge conditions that the sections above
+-- do not reach. Each one differed from PostgreSQL at some point.
+--
+
+-- `line` orientation/relation predicates test the RAW coefficients: a line can
+-- be very nearly horizontal and still not be `?-`, and scaling the coefficients
+-- up must not make two distinct lines parallel. `?-|` is the exception — it
+-- compares the slope product, so the near-perpendicular pair below is true.
+SELECT ?- line '{1,1000000,0}' AS not_horiz, ?- line '{1e-7,1,0}' AS horiz,
+       ?| line '{1000000,1,0}' AS not_vert,  ?| line '{1,1e-7,0}' AS vert;
+SELECT line '{1000000,1000000,0}' ?|| line '{1000000,1000001,0}' AS not_parallel,
+       line '{1,-1,0}' ?|| line '{2,-2,5}' AS parallel_scaled,
+       line '{1000000,1000000,0}' ?-| line '{1000000,-1000001,0}' AS perp_slope,
+       line '{2,4,6}' ?-| line '{4,-2,1}' AS perp;
+
+-- Only the two-point constructor normalizes B to -1; a `{A,B,C}` literal can
+-- carry any B, and the perpendicular has to be built from the normal.
+SELECT point '(0,0)' ## line '{2,4,6}' AS closept,
+       point '(3,4)' <-> line '{2,4,6}' AS dist,
+       point '(-3,0)' <@ line '{2,4,6}' AS on_line;
+
+-- `#` must not leak a negative zero, and parallel `<->` is the algebraic
+-- separation (scaling one line must not change it).
+SELECT line '{1,-1,0}' # line '{1,1,0}' AS origin,
+       line '{1,-1,0}' ## lseg '[(0,0),(1,0)]' AS origin2,
+       line '{1,-1,0}' <-> line '{1,-1,5}' AS sep,
+       line '{1,-1,0}' <-> line '{2,-2,10}' AS sep_scaled;
+
+-- A NaN area has no ordering at all: every comparison is false, `<>` included.
+SELECT box '(NaN,0),(0,0)' > box '(NaN,0),(0,0)' AS gt,
+       box '(NaN,0),(0,0)' >= box '(0,0),(2,2)' AS ge,
+       circle '<(0,0),NaN>' <> circle '<(0,0),1>' AS ne,
+       circle '<(0,0),NaN>' = circle '<(0,0),1>' AS eq;
+
+-- Coordinates past ~1e154 overflow when squared, which must not derail the
+-- projection onto a segment.
+SELECT point '(1e200,0)' ## lseg '[(0,0),(1e200,1e200)]' AS big_closept;
+
+-- An untyped literal is resolved against every geometric type, not just point:
+-- this binds `line ## lseg`, whose overload takes an lseg on the right.
+SELECT line '{1,-1,0}' ## '[(0,0),(2,2)]' AS untyped_lseg;
+
+-- polygon(npts, circle) is bounded: npts arrives straight from an int4.
+SELECT polygon(2147483647, '<(0,0),2>'::circle);
+SELECT polygon(1, '<(0,0),2>'::circle);
+SELECT npoints(polygon(2, '<(0,0),2>'::circle)) AS two_points;
+
+-- The same wording, two SQLSTATEs: a malformed literal is 22P02, while the
+-- constructor rejecting its arguments is 22023.
+SELECT line(point '(1,1)', point '(1,1)');
+SELECT sql_error_code FROM pg_input_error_info('(1,1),(1,1)', 'line');
+
+-- PostgreSQL gives `box` no `<>` operator (unlike circle, lseg and point).
+-- The expected output drops PG's `LINE n: ... ^` caret here, which this build
+-- does not emit for `operator does not exist` (see the note in xid.sql).
+SELECT box '(1,1),(0,0)' <> box '(3,3),(2,2)';
