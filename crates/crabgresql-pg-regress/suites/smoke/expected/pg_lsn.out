@@ -188,11 +188,50 @@ SELECT '0/16AE7F7'::pg_lsn - 'NaN'::numeric;
 ERROR:  cannot subtract NaN from pg_lsn
 SELECT '0/16AE7F7'::pg_lsn + 'Infinity'::numeric;
 ERROR:  cannot convert infinity to pg_lsn
+-- an untyped literal resolves per operator: to pg_lsn under `-` (the only
+-- operator with a pg_lsn on both sides) and to numeric under `+`
+SELECT '0/16AE7F8'::pg_lsn - '0/16AE7F7';
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT '0/16AE7F8' - '0/16AE7F7'::pg_lsn;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT '0/1'::pg_lsn + '16';
+  ?column?  
+------------
+ 0/00000011
+(1 row)
+
+SELECT '16' + '0/1'::pg_lsn;
+  ?column?  
+------------
+ 0/00000011
+(1 row)
+
+-- float8 -> numeric is an assignment cast, not an implicit one, so there is no
+-- operator for a float operand
+SELECT '0/16AE7F7'::pg_lsn + 1.5::float8;
+ERROR:  operator does not exist: pg_lsn + double precision
+SELECT '0/16AE7F7'::pg_lsn - 1.5::float8;
+ERROR:  operator does not exist: pg_lsn - double precision
+-- an operand too wide for the internal accumulator is out of range, not a crash
+SELECT '0/1'::pg_lsn + 170141183460469231731687303715884105727;
+ERROR:  pg_lsn out of range
+SELECT '0/2'::pg_lsn - (-170141183460469231731687303715884105728);
+ERROR:  pg_lsn out of range
 -- the combinations with no operator at all
 SELECT '0/1'::pg_lsn * '0/1'::pg_lsn;
 ERROR:  operator does not exist: pg_lsn * pg_lsn
 SELECT '0/1'::pg_lsn / '0/1'::pg_lsn;
 ERROR:  operator does not exist: pg_lsn / pg_lsn
+SELECT 16::numeric - '0/1'::pg_lsn;
+ERROR:  operator does not exist: numeric - pg_lsn
 -- pg_lsn(numeric)
 SELECT pg_lsn(23783416::numeric);
    pg_lsn   
@@ -246,7 +285,21 @@ SELECT DISTINCT l FROM lsn_tbl ORDER BY l;
  1/00000000
 (3 rows)
 
+-- the index is physical, not metadata-only: this must plan as an Index Scan
 CREATE INDEX lsn_tbl_ix ON lsn_tbl(l);
+EXPLAIN SELECT l FROM lsn_tbl WHERE l = '0/2'::pg_lsn;
+               QUERY PLAN               
+----------------------------------------
+ Index Scan using lsn_tbl_ix on lsn_tbl
+   Index Cond: (l = 0/00000002)
+(2 rows)
+
+SELECT l FROM lsn_tbl WHERE l = '0/2'::pg_lsn;
+     l      
+------------
+ 0/00000002
+(1 row)
+
 SELECT l::text FROM lsn_tbl ORDER BY 1;
      l      
 ------------

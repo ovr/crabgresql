@@ -754,24 +754,21 @@ pub(crate) fn apply_comparison(
     }
 }
 
-/// Whether [`compare_values`] defines an ordering for `ty` — i.e. the type has a
-/// default btree operator class. The non-orderable types are exactly those that
-/// fall through to the `unreachable!` arm of [`compare_values`]; keep the two in
-/// sync. Callers that would otherwise reach `compare_values` on user input (e.g.
-/// a RANGE partition key) must gate on this to avoid a panic.
+/// Whether `ty` has a default btree operator class, and so may be sorted or key
+/// an index. Callers that would otherwise reach [`compare_values`] on user input
+/// (e.g. a RANGE partition key) must gate on this.
+///
+/// This is [`PgType::has_default_btree_opclass`] — kept as a re-export here
+/// because that is the name the executor's callers know it by, but delegating
+/// rather than restating the list, so the two cannot drift.
+///
+/// Note it is *narrower* than the set [`compare_values`] handles: `xid` has a
+/// `compare_values` arm (needed so `keys_equal` can settle grouping equality)
+/// yet returns `false` here, because PG gives it a hash opclass and no btree
+/// one. So `false` no longer implies "`compare_values` would panic" — it means
+/// "nothing may sort by this".
 pub fn is_orderable(ty: PgType) -> bool {
-    match ty {
-        PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg | PgType::Path => false,
-        // `xid` is the one type with a `compare_values` arm that is still not
-        // orderable: PG gives it a hash opclass but no btree one, so the
-        // ordering exists only to make `GROUP BY`/`DISTINCT` work through
-        // `keys_equal`. Nothing may sort by it. See `crabgresql_types::xid`.
-        PgType::Xid => false,
-        // An array is orderable iff its element type is (element-wise btree
-        // comparison). Keep in sync with `PgType::has_default_btree_opclass`.
-        PgType::Array(elem_oid) => PgType::from_oid(elem_oid).is_some_and(is_orderable),
-        _ => true,
-    }
+    ty.has_default_btree_opclass()
 }
 
 /// Total-order comparison of two non-null values of type `ty` under the

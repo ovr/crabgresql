@@ -185,8 +185,22 @@ SELECT min(t), max(t) FROM tid_tbl;
  (1,42) | (2,3)
 (1 row)
 
--- tid has a default btree opclass, so it may key an index
+-- tid has a default btree opclass, so it may key an index -- and the index is
+-- physical, so an equality probe plans as an Index Scan
 CREATE INDEX tid_tbl_ix ON tid_tbl(t);
+EXPLAIN SELECT t FROM tid_tbl WHERE t = '(2,1)'::tid;
+               QUERY PLAN               
+----------------------------------------
+ Index Scan using tid_tbl_ix on tid_tbl
+   Index Cond: (t = (2,1))
+(2 rows)
+
+SELECT t FROM tid_tbl WHERE t = '(2,1)'::tid;
+   t   
+-------
+ (2,1)
+(1 row)
+
 -- output through the generic tid -> text cast, and as an array element
 SELECT t::text FROM tid_tbl ORDER BY 1;
    t    

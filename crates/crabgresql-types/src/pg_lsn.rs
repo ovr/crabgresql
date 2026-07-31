@@ -117,13 +117,25 @@ fn from_i128(v: i128) -> Result<u64, PgLsnError> {
 }
 
 /// `pg_lsn + numeric -> pg_lsn` (and the commuted `numeric + pg_lsn`).
+///
+/// The addition is checked: [`integral`] admits the whole `i128` range, so a
+/// large enough operand overflows the intermediate *before* [`from_i128`] gets
+/// to range-check it.
 pub fn add_numeric(lsn: u64, n: &Numeric) -> Result<u64, PgLsnError> {
-    from_i128(i128::from(lsn) + integral(n, "cannot add NaN to pg_lsn")?)
+    let n = integral(n, "cannot add NaN to pg_lsn")?;
+    i128::from(lsn)
+        .checked_add(n)
+        .ok_or_else(out_of_range)
+        .and_then(from_i128)
 }
 
-/// `pg_lsn - numeric -> pg_lsn`.
+/// `pg_lsn - numeric -> pg_lsn`. Checked for the same reason as [`add_numeric`].
 pub fn sub_numeric(lsn: u64, n: &Numeric) -> Result<u64, PgLsnError> {
-    from_i128(i128::from(lsn) - integral(n, "cannot subtract NaN from pg_lsn")?)
+    let n = integral(n, "cannot subtract NaN from pg_lsn")?;
+    i128::from(lsn)
+        .checked_sub(n)
+        .ok_or_else(out_of_range)
+        .and_then(from_i128)
 }
 
 /// `pg_lsn(numeric) -> pg_lsn`: the explicit conversion function.
@@ -236,5 +248,25 @@ mod tests {
         assert_eq!(from_numeric(&num("23783416"))?, 23783416);
 
         Ok(())
+    }
+
+    /// `integral` admits the whole `i128` range, so an operand near its
+    /// extremes overflows the intermediate before the `u64` range check runs.
+    /// These panicked (debug) / wrapped to a wrong LSN (release) until the
+    /// arithmetic was made checked.
+    #[test]
+    fn an_operand_too_wide_for_the_intermediate_is_out_of_range() {
+        let huge = num("170141183460469231731687303715884105727"); // i128::MAX
+        let tiny = num("-170141183460469231731687303715884105728"); // i128::MIN
+
+        for e in [
+            add_numeric(1, &huge).unwrap_err(),
+            add_numeric(u64::MAX, &huge).unwrap_err(),
+            sub_numeric(2, &tiny).unwrap_err(),
+            sub_numeric(u64::MAX, &tiny).unwrap_err(),
+        ] {
+            assert_eq!(e.sqlstate, "22023");
+            assert_eq!(e.message, "pg_lsn out of range");
+        }
     }
 }

@@ -71,9 +71,26 @@ SELECT '0/16AE7F7'::pg_lsn + 'NaN'::numeric;
 SELECT '0/16AE7F7'::pg_lsn - 'NaN'::numeric;
 SELECT '0/16AE7F7'::pg_lsn + 'Infinity'::numeric;
 
+-- an untyped literal resolves per operator: to pg_lsn under `-` (the only
+-- operator with a pg_lsn on both sides) and to numeric under `+`
+SELECT '0/16AE7F8'::pg_lsn - '0/16AE7F7';
+SELECT '0/16AE7F8' - '0/16AE7F7'::pg_lsn;
+SELECT '0/1'::pg_lsn + '16';
+SELECT '16' + '0/1'::pg_lsn;
+
+-- float8 -> numeric is an assignment cast, not an implicit one, so there is no
+-- operator for a float operand
+SELECT '0/16AE7F7'::pg_lsn + 1.5::float8;
+SELECT '0/16AE7F7'::pg_lsn - 1.5::float8;
+
+-- an operand too wide for the internal accumulator is out of range, not a crash
+SELECT '0/1'::pg_lsn + 170141183460469231731687303715884105727;
+SELECT '0/2'::pg_lsn - (-170141183460469231731687303715884105728);
+
 -- the combinations with no operator at all
 SELECT '0/1'::pg_lsn * '0/1'::pg_lsn;
 SELECT '0/1'::pg_lsn / '0/1'::pg_lsn;
+SELECT 16::numeric - '0/1'::pg_lsn;
 
 -- pg_lsn(numeric)
 SELECT pg_lsn(23783416::numeric);
@@ -89,7 +106,10 @@ INSERT INTO lsn_tbl VALUES ('0/2'), ('0/1'), ('1/0'), ('0/1');
 SELECT l FROM lsn_tbl ORDER BY l;
 SELECT l, count(*) FROM lsn_tbl GROUP BY l ORDER BY l;
 SELECT DISTINCT l FROM lsn_tbl ORDER BY l;
+-- the index is physical, not metadata-only: this must plan as an Index Scan
 CREATE INDEX lsn_tbl_ix ON lsn_tbl(l);
+EXPLAIN SELECT l FROM lsn_tbl WHERE l = '0/2'::pg_lsn;
+SELECT l FROM lsn_tbl WHERE l = '0/2'::pg_lsn;
 SELECT l::text FROM lsn_tbl ORDER BY 1;
 SELECT ARRAY['0/1'::pg_lsn, '2/3'::pg_lsn] AS arr;
 DROP TABLE lsn_tbl;

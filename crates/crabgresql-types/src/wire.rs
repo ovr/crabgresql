@@ -60,6 +60,19 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
         PgType::Int4 => Value::Int4(i32::from_be_bytes(fixed(b, ty)?)),
         PgType::Int8 => Value::Int8(i64::from_be_bytes(fixed(b, ty)?)),
         PgType::Oid => Value::Oid(u32::from_be_bytes(fixed(b, ty)?)),
+        // Transaction ids and LSNs are bare unsigned counters on the wire.
+        PgType::Xid => Value::Xid(u32::from_be_bytes(fixed(b, ty)?)),
+        PgType::Xid8 => Value::Xid8(u64::from_be_bytes(fixed(b, ty)?)),
+        PgType::PgLsn => Value::PgLsn(u64::from_be_bytes(fixed(b, ty)?)),
+        // `tid` is the only composite here: a 4-byte block then a 2-byte
+        // offset, six bytes with no padding.
+        PgType::Tid => {
+            let raw: [u8; 6] = fixed(b, ty)?;
+            Value::Tid {
+                block: u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+                offset: u16::from_be_bytes([raw[4], raw[5]]),
+            }
+        }
         // PG's `regclassrecv` and friends send only the OID, so a value arriving
         // over the binary protocol has no name yet and renders like an
         // unresolved one. Clients send reg* parameters this way only rarely;
@@ -97,6 +110,16 @@ impl Value {
             Value::Int4(v) => v.to_be_bytes().to_vec(),
             Value::Int8(v) => v.to_be_bytes().to_vec(),
             Value::Oid(v) => v.to_be_bytes().to_vec(),
+            Value::Xid(v) => v.to_be_bytes().to_vec(),
+            Value::Xid8(v) => v.to_be_bytes().to_vec(),
+            Value::PgLsn(v) => v.to_be_bytes().to_vec(),
+            // Block then offset, six bytes (PG's `tidsend`).
+            Value::Tid { block, offset } => {
+                let mut out = Vec::with_capacity(6);
+                out.extend_from_slice(&block.to_be_bytes());
+                out.extend_from_slice(&offset.to_be_bytes());
+                out
+            }
             // Like PG's `regclasssend`: the OID alone goes on the wire, never
             // the name.
             Value::Reg(r) => r.oid.to_be_bytes().to_vec(),
@@ -124,6 +147,50 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("int4 encoded as NULL"))?;
         assert_eq!(bytes, (-12345i32).to_be_bytes());
         assert_eq!(decode_binary(PgType::Int4, &bytes)?, Value::Int4(-12345));
+
+        Ok(())
+    }
+
+    /// The four fixed-width types added alongside `tid`. Each asserts the exact
+    /// wire layout as well as the round trip, since the byte order is what a
+    /// driver depends on — a round trip alone would pass on little-endian too.
+    #[test]
+    fn tid_xid_and_pg_lsn_binary_round_trip() -> anyhow::Result<()> {
+        let cases = [
+            (Value::Xid(4294967295), PgType::Xid, vec![0xff; 4]),
+            (
+                Value::Xid8(1),
+                PgType::Xid8,
+                vec![0, 0, 0, 0, 0, 0, 0, 1],
+            ),
+            (
+                Value::PgLsn(0x0000_0001_016A_E7F8),
+                PgType::PgLsn,
+                vec![0, 0, 0, 1, 0x01, 0x6A, 0xE7, 0xF8],
+            ),
+            (
+                Value::Tid {
+                    block: 42,
+                    offset: 7,
+                },
+                PgType::Tid,
+                vec![0, 0, 0, 42, 0, 7],
+            ),
+        ];
+        for (value, ty, expected) in cases {
+            let bytes = value
+                .encode_binary()?
+                .ok_or_else(|| anyhow::anyhow!("{ty:?} encoded as NULL"))?;
+            assert_eq!(bytes, expected, "{ty:?} wire layout");
+            assert_eq!(decode_binary(ty, &bytes)?, value, "{ty:?} round trip");
+        }
+        // A short or long payload is a 22P03, not a panic.
+        assert_eq!(
+            decode_binary(PgType::Tid, &[0, 0, 0, 42, 0])
+                .expect_err("5 bytes is not a tid")
+                .sqlstate,
+            "22P03"
+        );
 
         Ok(())
     }

@@ -835,6 +835,13 @@ pub fn reinterpret_value(v: Value, rep: PgType) -> Result<Value, CastError> {
         (Value::Null, _) => Ok(Value::Null),
         (Value::Int4(n), PgType::Float4) => Ok(Value::Float4(f32::from_bits(n as u32))),
         (Value::Float4(f), PgType::Int4) => Ok(Value::Int4(f.to_bits() as i32)),
+        // `int4 -> xid` is the coercion PG's `xideqint4` operator performs on
+        // its right operand: the int's bits are reinterpreted, not
+        // range-checked, so `'4294967295'::xid = -1` is true. It lives here
+        // rather than in `cast_value` precisely because it must NOT be
+        // reachable as a user-written cast — PG rejects `1::xid` with
+        // `cannot cast type integer to xid`. Emitted only by `resolve_xid_op`.
+        (Value::Int4(n), PgType::Xid) => Ok(Value::Xid(n as u32)),
         (Value::Int8(n), PgType::Float8) => Ok(Value::Float8(f64::from_bits(n as u64))),
         (Value::Float8(f), PgType::Int8) => Ok(Value::Int8(f.to_bits() as i64)),
         // Already the target representation (identical backing rep): relabel only.

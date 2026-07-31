@@ -68,8 +68,11 @@ SELECT t, count(*) FROM tid_tbl GROUP BY t ORDER BY t;
 SELECT DISTINCT t FROM tid_tbl ORDER BY t;
 SELECT min(t), max(t) FROM tid_tbl;
 
--- tid has a default btree opclass, so it may key an index
+-- tid has a default btree opclass, so it may key an index -- and the index is
+-- physical, so an equality probe plans as an Index Scan
 CREATE INDEX tid_tbl_ix ON tid_tbl(t);
+EXPLAIN SELECT t FROM tid_tbl WHERE t = '(2,1)'::tid;
+SELECT t FROM tid_tbl WHERE t = '(2,1)'::tid;
 
 -- output through the generic tid -> text cast, and as an array element
 SELECT t::text FROM tid_tbl ORDER BY 1;
