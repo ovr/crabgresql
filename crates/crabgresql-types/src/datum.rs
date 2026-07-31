@@ -58,6 +58,10 @@ const T_TSQUERY: u8 = 33;
 /// before the change keep working.
 const T_JSONPATH_TREE: u8 = 34;
 const T_PATH: u8 = 35;
+const T_TID: u8 = 36;
+const T_XID: u8 = 37;
+const T_XID8: u8 = 38;
+const T_PG_LSN: u8 = 39;
 
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -155,6 +159,23 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         Value::Money(c) => {
             out.push(T_MONEY);
             out.extend_from_slice(&c.to_le_bytes());
+        }
+        Value::Tid { block, offset } => {
+            out.push(T_TID);
+            out.extend_from_slice(&block.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+        Value::Xid(v) => {
+            out.push(T_XID);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Xid8(v) => {
+            out.push(T_XID8);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::PgLsn(v) => {
+            out.push(T_PG_LSN);
+            out.extend_from_slice(&v.to_le_bytes());
         }
         Value::Macaddr(b) => {
             out.push(T_MACADDR);
@@ -353,6 +374,15 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         T_INET => r.net(false),
         T_CIDR => r.net(true),
         T_MONEY => Value::Money(r.i64()),
+        T_TID => {
+            let block = r.u32();
+            let mut b = [0u8; 2];
+            b.copy_from_slice(r.take(2));
+            Value::Tid { block, offset: u16::from_le_bytes(b) }
+        }
+        T_XID => Value::Xid(r.u32()),
+        T_XID8 => Value::Xid8(r.u64()),
+        T_PG_LSN => Value::PgLsn(r.u64()),
         T_MACADDR => {
             let mut b = [0u8; 6];
             b.copy_from_slice(r.take(6));
@@ -565,6 +595,13 @@ mod tests {
         roundtrip(Value::Uuid([9u8; 16]));
         roundtrip(Value::Money(i64::MIN));
         roundtrip(Value::Money(12345));
+        roundtrip(Value::Tid { block: 0, offset: 0 });
+        roundtrip(Value::Tid { block: u32::MAX, offset: u16::MAX });
+        roundtrip(Value::Xid(0));
+        roundtrip(Value::Xid(u32::MAX));
+        roundtrip(Value::Xid8(u64::MAX));
+        roundtrip(Value::PgLsn(0));
+        roundtrip(Value::PgLsn(u64::MAX));
         roundtrip(Value::Macaddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]));
         roundtrip(Value::Macaddr8([
             0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03,

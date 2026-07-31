@@ -2867,6 +2867,11 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             | PgType::Bpchar
             | PgType::Name
             | PgType::Oid
+            | PgType::Tid
+            // `xid8` is an ordinary unsigned counter and orders normally.
+            // `xid` is deliberately absent — see `has_equality` below.
+            | PgType::Xid8
+            | PgType::PgLsn
             // A reg* value compares by the OID it holds, never by the name it
             // renders as — see `compare_values` in the executor.
             | PgType::Reg(_)
@@ -2890,6 +2895,22 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             | PgType::Tsvector
             | PgType::Tsquery
     ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
+}
+
+/// Types with a default *equality* operator — a superset of the orderable ones,
+/// and the right gate for `=`/`<>` and for every dedup (GROUP BY, DISTINCT,
+/// UNION), which need equality but never an ordering.
+///
+/// `xid` is the only type in the gap. PostgreSQL gives it a hash operator class
+/// but deliberately no btree one, because transaction ids compare with modular
+/// arithmetic — so `'1'::xid = '1'::xid` binds while `'1'::xid < '2'::xid` must
+/// still fail with `operator does not exist`, and ORDER BY / `min` / `max` on an
+/// `xid` must fail too. Those all stay gated on [`is_orderable`].
+pub(crate) fn has_equality(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
+    if let PgType::Array(elem) = ty {
+        return PgType::from_oid(elem).is_some_and(|e| has_equality(e, catalog));
+    }
+    matches!(ty, PgType::Xid) || is_orderable(ty, catalog)
 }
 
 fn bind_value(value: &ast::ValueWithSpan, scope: &Scope) -> Result<Binding, BindError> {
@@ -4581,6 +4602,19 @@ pub(crate) fn bind_binary_op(
         return Ok(binding);
     }
 
+    // `pg_lsn` arithmetic is likewise off the generic numeric path. Every
+    // combination that *has* an operator is intercepted here; the rest (`lsn *
+    // lsn`, `lsn / 2`) falls through to the arithmetic whitelist below, which
+    // rejects them with `operator does not exist`.
+    if let Some(binding) = resolve_pg_lsn_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
+    // `xid = int4` / `xid <> int4`, which have no shared type to unify on.
+    if let Some(binding) = resolve_xid_op(op, &lb, &rb)? {
+        return Ok(binding);
+    }
+
     // Comparison or arithmetic: settle both operands on one type. For
     // arithmetic, the typed side must offer the operator BEFORE the unknown
     // side is parsed as that type — PG reports `operator does not exist:
@@ -4651,6 +4685,11 @@ pub(crate) fn bind_binary_op(
                 PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Numeric
             );
         numeric_arith && mod_ok
+    } else if matches!(op, BinOp::Eq | BinOp::NotEq) {
+        // Equality reaches one type more than ordering does — `xid`, which has a
+        // hash opclass but no btree one. Every other comparison stays on
+        // `is_orderable`, so `'1'::xid < '2'::xid` still has no operator.
+        has_equality(arg_ty, catalog)
     } else {
         is_orderable(arg_ty, catalog)
     };
@@ -4870,6 +4909,142 @@ fn binding_typed_ty(b: &Binding) -> Option<PgType> {
     }
 }
 
+/// Resolve `xid = int4` / `xid <> int4` (PG's `xideqint4` / `xidneqint4`), or
+/// `Ok(None)` to leave the pair to the generic path.
+///
+/// This needs its own resolver rather than an `implicit_castable` entry because
+/// PG's operator catalog for it is deliberately narrow — all four properties
+/// below were probed against PostgreSQL 18.4:
+///
+/// * only `=` and `<>`; `'1'::xid < 2` is `operator does not exist`;
+/// * only with the `xid` on the **left**; `1 = '1'::xid` has no operator, so an
+///   `implicit_castable` entry (which unifies symmetrically) would be wrong;
+/// * only `int4` — `xid = 1::int8` has no operator, though `int2` reaches it by
+///   the usual widening to `int4`;
+/// * the int is compared as a raw bit pattern, not by value:
+///   `'4294967295'::xid = -1` is **true**. That is why the operand is wrapped in
+///   a [`BoundExpr::Reinterpret`] rather than a [`BoundExpr::Coerce`] — the bit
+///   reinterpretation must not become reachable as a user-written cast, since
+///   PG rejects `1::xid` with `cannot cast type integer to xid`.
+///
+/// An untyped literal opposite an `xid` already resolves through the ordinary
+/// `xid = xid` path, so it is not handled here.
+fn resolve_xid_op(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Binding>, BindError> {
+    if !matches!(op, BinOp::Eq | BinOp::NotEq) {
+        return Ok(None);
+    }
+    if binding_typed_ty(lb) != Some(PgType::Xid)
+        || !matches!(binding_typed_ty(rb), Some(PgType::Int2 | PgType::Int4))
+    {
+        return Ok(None);
+    }
+    let (Binding::Typed(left), Binding::Typed(right)) = (lb, rb) else {
+        unreachable!("both sides are typed");
+    };
+    // `int2` reaches the operator by first widening to `int4`, as in PG; the
+    // reinterpretation itself is defined on the 32-bit value only.
+    let right = coerce_expr(right.clone(), PgType::Int4)?;
+    Ok(Some(Binding::Typed(BoundExpr::Binary {
+        op,
+        arg_ty: PgType::Xid,
+        collation: DEFAULT_COLLATION_OID,
+        left: Box::new(left.clone()),
+        right: Box::new(BoundExpr::Reinterpret {
+            expr: Box::new(right),
+            reported: PgType::Xid,
+            rep: PgType::Xid,
+        }),
+    })))
+}
+
+/// Lower `pg_lsn` arithmetic to a [`ScalarFn`] call, or `Ok(None)` to leave the
+/// operands to the generic path (every comparison, and every combination with
+/// no operator at all).
+///
+/// PG defines exactly four: `lsn - lsn -> numeric`, and `lsn ± numeric ->
+/// pg_lsn` with `numeric + lsn` commuted. Two consequences that are easy to get
+/// wrong, both probed against PostgreSQL 18.4:
+///
+/// * **An untyped literal resolves differently per operator.** `-` is the only
+///   one with a `pg_lsn` on both sides, so a literal opposite a `pg_lsn` takes
+///   `pg_lsn` there (`'0/2'::pg_lsn - '0/1'` is 1, not a numeric-input error)
+///   but `numeric` under `+`, which has no `lsn + lsn` (`… + 16` works uncast).
+/// * **A float operand has no operator at all.** `float8 -> numeric` is an
+///   *assignment* cast, not an implicit one, so `pg_lsn + 1.5::float8` is
+///   `operator does not exist` in PG. Only the exact numeric types coerce —
+///   the same split `resolve_money_op` makes between its int and float cases.
+///
+/// Every call puts the `pg_lsn` operand first, so the executor's arms can read
+/// `args[0]` as the LSN and `args[1]` as the numeric without re-checking.
+fn resolve_pg_lsn_op(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Binding>, BindError> {
+    use PgType::PgLsn as L;
+    let lt = binding_typed_ty(lb);
+    let rt = binding_typed_ty(rb);
+    if lt != Some(L) && rt != Some(L) {
+        return Ok(None);
+    }
+    // The types with an implicit cast to `numeric`. Deliberately excludes the
+    // floats — see the doc comment.
+    let exact_numeric = |t: PgType| {
+        matches!(
+            t,
+            PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Numeric
+        )
+    };
+    // For `+`, an untyped literal joins them; for `-` it is handled separately.
+    let counts_as_numeric = |t: Option<PgType>| t.is_none_or(exact_numeric);
+    let typed = |b: &Binding| match b {
+        Binding::Typed(e) => e.clone(),
+        Binding::Unknown { .. } => unreachable!("typed side is Typed"),
+    };
+    let call = |func, ret, a: BoundExpr, b: BoundExpr| {
+        Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret,
+            args: vec![a, b],
+        })))
+    };
+    match op {
+        // The `lsn - lsn` forms are matched before `lsn - numeric`, so the
+        // result stays the exact signed distance rather than treating one side
+        // as a count. An untyped literal on either side lands here.
+        BinOp::Sub if lt == Some(L) && rt == Some(L) => {
+            call(ScalarFn::PgLsnMi, PgType::Numeric, typed(lb), typed(rb))
+        }
+        BinOp::Sub if lt == Some(L) && rt.is_none() => call(
+            ScalarFn::PgLsnMi,
+            PgType::Numeric,
+            typed(lb),
+            resolve_operand(rb, L)?,
+        ),
+        BinOp::Sub if rt == Some(L) && lt.is_none() => call(
+            ScalarFn::PgLsnMi,
+            PgType::Numeric,
+            resolve_operand(lb, L)?,
+            typed(rb),
+        ),
+        BinOp::Sub if lt == Some(L) && rt.is_some_and(exact_numeric) => call(
+            ScalarFn::PgLsnMii,
+            L,
+            typed(lb),
+            resolve_operand(rb, PgType::Numeric)?,
+        ),
+        BinOp::Add if lt == Some(L) && counts_as_numeric(rt) => call(
+            ScalarFn::PgLsnPli,
+            L,
+            typed(lb),
+            resolve_operand(rb, PgType::Numeric)?,
+        ),
+        BinOp::Add if rt == Some(L) && counts_as_numeric(lt) => call(
+            ScalarFn::PgLsnPli,
+            L,
+            typed(rb),
+            resolve_operand(lb, PgType::Numeric)?,
+        ),
+        _ => Ok(None),
+    }
+}
+
 /// Money arithmetic. `money` is deliberately not `is_numeric`, so it never
 /// reaches the generic numeric path; its operators lower to `ScalarFn` calls
 /// here, as `resolve_temporal`/`resolve_network_op` do for their types:
@@ -4879,6 +5054,7 @@ fn binding_typed_ty(b: &Binding) -> Option<PgType> {
 /// money or the op/operand pair has no money operator, so the generic path (and
 /// its comparisons and "operator does not exist" error) still applies. Every
 /// call puts the money operand first and the factor/divisor second.
+
 fn resolve_money_op(op: BinOp, lb: &Binding, rb: &Binding) -> Result<Option<Binding>, BindError> {
     use PgType::Money as M;
     let lt = binding_typed_ty(lb);
@@ -5575,7 +5751,7 @@ fn resolve_array_op(
     // has no default equality operator (PG's error), and `compare_values` has no
     // arm for it — so gate here to keep it off the panic path.
     let elem = arr_ty.array_element();
-    if !elem.is_some_and(|e| is_orderable(e, catalog)) {
+    if !elem.is_some_and(|e| has_equality(e, catalog)) {
         let name = elem.map_or_else(|| arr_ty.name().to_string(), |e| type_label(e, catalog));
         return Err(BindError::new(
             sqlstate::UNDEFINED_FUNCTION,
@@ -6784,6 +6960,18 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Uuid => crabgresql_types::uuid::parse(s)
             .map(Value::Uuid)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Tid => crabgresql_types::tid::parse(s)
+            .map(|(block, offset)| Value::Tid { block, offset })
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Xid => crabgresql_types::xid::xid_in(s)
+            .map(Value::Xid)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Xid8 => crabgresql_types::xid::xid8_in(s)
+            .map(Value::Xid8)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::PgLsn => crabgresql_types::pg_lsn::parse(s)
+            .map(Value::PgLsn)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Inet => crabgresql_types::net::inet_in(s)
             .map(Value::Inet)

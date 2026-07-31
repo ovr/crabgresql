@@ -754,19 +754,21 @@ pub(crate) fn apply_comparison(
     }
 }
 
-/// Whether [`compare_values`] defines an ordering for `ty` — i.e. the type has a
-/// default btree operator class. The non-orderable types are exactly those that
-/// fall through to the `unreachable!` arm of [`compare_values`]; keep the two in
-/// sync. Callers that would otherwise reach `compare_values` on user input (e.g.
-/// a RANGE partition key) must gate on this to avoid a panic.
+/// Whether `ty` has a default btree operator class, and so may be sorted or key
+/// an index. Callers that would otherwise reach [`compare_values`] on user input
+/// (e.g. a RANGE partition key) must gate on this.
+///
+/// This is [`PgType::has_default_btree_opclass`] — kept as a re-export here
+/// because that is the name the executor's callers know it by, but delegating
+/// rather than restating the list, so the two cannot drift.
+///
+/// Note it is *narrower* than the set [`compare_values`] handles: `xid` has a
+/// `compare_values` arm (needed so `keys_equal` can settle grouping equality)
+/// yet returns `false` here, because PG gives it a hash opclass and no btree
+/// one. So `false` no longer implies "`compare_values` would panic" — it means
+/// "nothing may sort by this".
 pub fn is_orderable(ty: PgType) -> bool {
-    match ty {
-        PgType::Json | PgType::Jsonpath | PgType::Point | PgType::Lseg | PgType::Path => false,
-        // An array is orderable iff its element type is (element-wise btree
-        // comparison). Keep in sync with `PgType::has_default_btree_opclass`.
-        PgType::Array(elem_oid) => PgType::from_oid(elem_oid).is_some_and(is_orderable),
-        _ => true,
-    }
+    ty.has_default_btree_opclass()
 }
 
 /// Total-order comparison of two non-null values of type `ty` under the
@@ -825,6 +827,17 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         PgType::Money => money::cmp(money_of(l), money_of(r)),
         // oid: unsigned 32-bit order (PG's `oidcmp`).
         PgType::Oid => oid_of(l).cmp(&oid_of(r)),
+        // tid: block first, then offset — PG's `tidcmp`, and the order the
+        // heap itself lays rows out in.
+        PgType::Tid => tid_of(l).cmp(&tid_of(r)),
+        // Both transaction id types order as plain unsigned integers. `xid` is
+        // reachable here only through equality and hashing — `is_orderable`
+        // above keeps it out of every sort — but the arm must exist, because
+        // `keys_equal` routes grouping equality through `compare_values`.
+        PgType::Xid => xid_of(l).cmp(&xid_of(r)),
+        PgType::Xid8 => xid8_of(l).cmp(&xid8_of(r)),
+        // pg_lsn: the natural unsigned order of the 64-bit counter.
+        PgType::PgLsn => lsn_of(l).cmp(&lsn_of(r)),
         // A reg* value orders by OID, never by the name it renders as — the
         // same rule its `PartialEq` and `hash_key` use.
         PgType::Reg(_) => reg_oid(l).cmp(&reg_oid(r)),
@@ -936,6 +949,34 @@ fn oid_of(v: &Value) -> u32 {
     match v {
         Value::Oid(v) => *v,
         other => unreachable!("expected oid, got {other:?}"),
+    }
+}
+
+fn tid_of(v: &Value) -> (u32, u16) {
+    match v {
+        Value::Tid { block, offset } => (*block, *offset),
+        other => unreachable!("expected tid, got {other:?}"),
+    }
+}
+
+fn xid_of(v: &Value) -> u32 {
+    match v {
+        Value::Xid(x) => *x,
+        other => unreachable!("expected xid, got {other:?}"),
+    }
+}
+
+fn xid8_of(v: &Value) -> u64 {
+    match v {
+        Value::Xid8(x) => *x,
+        other => unreachable!("expected xid8, got {other:?}"),
+    }
+}
+
+fn lsn_of(v: &Value) -> u64 {
+    match v {
+        Value::PgLsn(x) => *x,
+        other => unreachable!("expected pg_lsn, got {other:?}"),
     }
 }
 

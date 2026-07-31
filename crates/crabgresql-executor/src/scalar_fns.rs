@@ -20,7 +20,7 @@ use crabgresql_types::jsonpath;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::{
     Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, geo, interval, macaddr, money,
-    net, text, time, timestamp, timestamptz, timetz, to_char,
+    net, pg_lsn, text, time, timestamp, timestamptz, timetz, to_char,
 };
 
 use crate::ExecError;
@@ -150,6 +150,42 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 sqlstate::INTERNAL_ERROR,
                 "deparse function reached the pure scalar evaluator",
             ));
+        }
+        // --- tid accessors (STRICT) ---
+        ScalarFn::TidBlock => {
+            let (block, _) = tid(&args[0]);
+            return Ok(Value::Int8(i64::from(block)));
+        }
+        ScalarFn::TidOffset => {
+            let (_, offset) = tid(&args[0]);
+            return Ok(Value::Int4(i32::from(offset)));
+        }
+        ScalarFn::Xid8Cmp => {
+            let (l, r) = (xid8(&args[0]), xid8(&args[1]));
+            return Ok(Value::Int4(match l.cmp(&r) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }));
+        }
+        // --- pg_lsn arithmetic (STRICT). The binder always puts the LSN first. ---
+        ScalarFn::PgLsnMi => {
+            return Ok(Value::Numeric(pg_lsn::sub(lsn(&args[0]), lsn(&args[1]))));
+        }
+        ScalarFn::PgLsnPli => {
+            return pg_lsn::add_numeric(lsn(&args[0]), num(&args[1]))
+                .map(Value::PgLsn)
+                .map_err(|e| ExecError::new(e.sqlstate, e.message));
+        }
+        ScalarFn::PgLsnMii => {
+            return pg_lsn::sub_numeric(lsn(&args[0]), num(&args[1]))
+                .map(Value::PgLsn)
+                .map_err(|e| ExecError::new(e.sqlstate, e.message));
+        }
+        ScalarFn::NumericPgLsn => {
+            return pg_lsn::from_numeric(num(&args[0]))
+                .map(Value::PgLsn)
+                .map_err(|e| ExecError::new(e.sqlstate, e.message));
         }
         // --- jsonpath (STRICT: any NULL arg already short-circuited to NULL) ---
         ScalarFn::JsonPath(f) => return eval_jsonpath(f, args),
@@ -1862,6 +1898,27 @@ fn i4(v: &Value) -> i32 {
     match v {
         Value::Int4(n) => *n,
         other => unreachable!("expected int4 arg, got {other:?}"),
+    }
+}
+
+fn tid(v: &Value) -> (u32, u16) {
+    match v {
+        Value::Tid { block, offset } => (*block, *offset),
+        other => unreachable!("expected tid arg, got {other:?}"),
+    }
+}
+
+fn xid8(v: &Value) -> u64 {
+    match v {
+        Value::Xid8(x) => *x,
+        other => unreachable!("expected xid8 arg, got {other:?}"),
+    }
+}
+
+fn lsn(v: &Value) -> u64 {
+    match v {
+        Value::PgLsn(x) => *x,
+        other => unreachable!("expected pg_lsn arg, got {other:?}"),
     }
 }
 

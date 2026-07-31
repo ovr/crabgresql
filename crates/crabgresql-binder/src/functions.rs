@@ -417,6 +417,26 @@ pub enum ScalarFn {
     // --- geometric (point / lseg) ---
     /// A geometric operator/function; the specific operation is the payload.
     Geo(GeoFn),
+    // --- tid ---
+    /// `tid_block(tid) -> int8`: the block number half of a tuple identifier.
+    /// `int8`, not `int4`, because a `BlockNumber` is an unsigned 32-bit value.
+    TidBlock,
+    /// `tid_offset(tid) -> int4`: the offset half of a tuple identifier.
+    TidOffset,
+    // --- xid8 ---
+    /// `xid8cmp(xid8, xid8) -> int4`: the btree three-way comparison, exposed
+    /// as an ordinary function. `xid` has no counterpart — it has no btree
+    /// opclass at all.
+    Xid8Cmp,
+    // --- pg_lsn (args are always `[pg_lsn, numeric]`, LSN first) ---
+    /// `pg_lsn - pg_lsn -> numeric`: the exact signed byte distance.
+    PgLsnMi,
+    /// `pg_lsn + numeric -> pg_lsn` (and the commuted `numeric + pg_lsn`).
+    PgLsnPli,
+    /// `pg_lsn - numeric -> pg_lsn`.
+    PgLsnMii,
+    /// `pg_lsn(numeric) -> pg_lsn`: the explicit conversion function.
+    NumericPgLsn,
     // --- sequences (side-effecting; dispatched via the executor's SequenceOps,
     // not the pure `eval_scalar`) ---
     /// `nextval(regclass) -> int8`: advance a sequence and return its new value.
@@ -1056,6 +1076,9 @@ const TSVECTOR: PgType = PgType::Tsvector;
 const TSQUERY: PgType = PgType::Tsquery;
 const TEXTARR: PgType = PgType::Array(crabgresql_types::oid::TEXT);
 const OID: PgType = PgType::Oid;
+const TID: PgType = PgType::Tid;
+const XID8: PgType = PgType::Xid8;
+const PGLSN: PgType = PgType::PgLsn;
 const REGCLASS: PgType = PgType::Reg(RegKind::Class);
 const NAME: PgType = PgType::Name;
 
@@ -2029,6 +2052,28 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[PATH],
             ret: PATH,
         }],
+        // A `BlockNumber` is unsigned 32-bit, so it needs `int8` to render
+        // without wrapping; an `OffsetNumber` fits `int4`.
+        "tid_block" => &[Signature {
+            func: ScalarFn::TidBlock,
+            args: &[TID],
+            ret: I8,
+        }],
+        "tid_offset" => &[Signature {
+            func: ScalarFn::TidOffset,
+            args: &[TID],
+            ret: I4,
+        }],
+        "pg_lsn" => &[Signature {
+            func: ScalarFn::NumericPgLsn,
+            args: &[NUM],
+            ret: PGLSN,
+        }],
+        "xid8cmp" => &[Signature {
+            func: ScalarFn::Xid8Cmp,
+            args: &[XID8, XID8],
+            ret: I4,
+        }],
         "npoints" => &[Signature {
             func: ScalarFn::Geo(GeoFn::PathNpoints),
             args: &[PATH],
@@ -2622,7 +2667,7 @@ fn bind_aggregate(
     // A DISTINCT aggregate must compare its inputs for equality; a type with no
     // usable equality (e.g. `point`/`lseg`, which are not orderable) reports
     // PG's error rather than reaching the executor's comparison and panicking.
-    if distinct && !crate::expr::is_orderable(input_ty, scope.catalog().as_ref()) {
+    if distinct && !crate::expr::has_equality(input_ty, scope.catalog().as_ref()) {
         return Err(BindError::new(
             sqlstate::UNDEFINED_FUNCTION,
             format!(

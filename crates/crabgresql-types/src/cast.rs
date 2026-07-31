@@ -461,6 +461,40 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
                 message: e.message,
             }),
 
+        // ---- text → tid (tidin). The reverse is the generic → text arm. ----
+        (Value::Text(s), PgType::Tid) => crate::tid::parse(s)
+            .map(|(block, offset)| Value::Tid { block, offset })
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
+
+        // ---- text → xid / xid8 (xidin / xid8in) ----
+        (Value::Text(s), PgType::Xid) => crate::xid::xid_in(s)
+            .map(Value::Xid)
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
+        (Value::Text(s), PgType::Xid8) => crate::xid::xid8_in(s)
+            .map(Value::Xid8)
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
+
+        // ---- xid8 → xid: PG's only declared cast for either type. It
+        // truncates to the low 32 bits rather than range-checking. ----
+        (Value::Xid8(v), PgType::Xid) => Ok(Value::Xid(*v as u32)),
+
+        // ---- text → pg_lsn (pg_lsn_in) ----
+        (Value::Text(s), PgType::PgLsn) => crate::pg_lsn::parse(s)
+            .map(Value::PgLsn)
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
+
         // ---- text → point / lseg / path (point_in / lseg_in / path_in) ----
         (Value::Text(s), PgType::Point) => {
             crate::geo::parse_point(s)
@@ -801,6 +835,13 @@ pub fn reinterpret_value(v: Value, rep: PgType) -> Result<Value, CastError> {
         (Value::Null, _) => Ok(Value::Null),
         (Value::Int4(n), PgType::Float4) => Ok(Value::Float4(f32::from_bits(n as u32))),
         (Value::Float4(f), PgType::Int4) => Ok(Value::Int4(f.to_bits() as i32)),
+        // `int4 -> xid` is the coercion PG's `xideqint4` operator performs on
+        // its right operand: the int's bits are reinterpreted, not
+        // range-checked, so `'4294967295'::xid = -1` is true. It lives here
+        // rather than in `cast_value` precisely because it must NOT be
+        // reachable as a user-written cast — PG rejects `1::xid` with
+        // `cannot cast type integer to xid`. Emitted only by `resolve_xid_op`.
+        (Value::Int4(n), PgType::Xid) => Ok(Value::Xid(n as u32)),
         (Value::Int8(n), PgType::Float8) => Ok(Value::Float8(f64::from_bits(n as u64))),
         (Value::Float8(f), PgType::Int8) => Ok(Value::Int8(f.to_bits() as i64)),
         // Already the target representation (identical backing rep): relabel only.

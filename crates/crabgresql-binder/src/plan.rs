@@ -1956,14 +1956,16 @@ fn set_arm_coercion(
 }
 
 /// Reject an output column a `UNION` cannot deduplicate on. PG needs an equality
-/// operator for every column; the executor's dedup compares with the same
-/// ordering-based helpers `DISTINCT` uses, so the check mirrors that capability.
+/// operator for every column, and so does the executor's dedup — which reaches
+/// equality through `compare_values`. That is exactly `has_equality`, so a type
+/// with a hash opclass but no btree one (`xid`) deduplicates fine here even
+/// though it cannot be sorted.
 fn reject_undedupable_columns(
     columns: &[OutputColumn],
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(), BindError> {
     for col in columns {
-        if !crate::expr::is_orderable(col.ty, catalog.as_ref()) {
+        if !crate::expr::has_equality(col.ty, catalog.as_ref()) {
             return Err(BindError::new(
                 sqlstate::UNDEFINED_FUNCTION,
                 format!(
@@ -3541,9 +3543,22 @@ fn bind_order_by(
         // on a type it can't order. Reject such a key at bind time rather than
         // aborting mid-sort.
         if !crate::expr::is_orderable(ty, scope.catalog().as_ref()) {
+            let name = crate::expr::type_label(ty, scope.catalog().as_ref());
+            // A type that has equality but no ordering is not a gap in this
+            // build — PostgreSQL has no ordering operator for it either (`xid`
+            // is the only one), so report what PG reports rather than claiming
+            // the feature is merely missing.
+            if crate::expr::has_equality(ty, scope.catalog().as_ref()) {
+                return Err(BindError::new(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    format!("could not identify an ordering operator for type {name}"),
+                )
+                .with_hint(Some(
+                    "Use an explicit ordering operator or modify the query.".to_string(),
+                )));
+            }
             return Err(BindError::feature_not_supported(format!(
-                "ORDER BY on type {} is not supported yet",
-                crate::expr::type_label(ty, scope.catalog().as_ref())
+                "ORDER BY on type {name} is not supported yet"
             )));
         }
         let asc = oe.options.asc.unwrap_or(true);
@@ -3710,9 +3725,10 @@ fn bind_distinct(
     };
     // The executor deduplicates via `keys_equal`, which compares with
     // `compare_values` and panics on a type it cannot order. Reject such a key
-    // at bind time, mirroring `bind_order_by`.
+    // at bind time. Unlike `bind_order_by` this needs only equality, so `xid`
+    // is admitted here and rejected there.
     for key in &keys {
-        if !crate::expr::is_orderable(key.ty, scope.catalog().as_ref()) {
+        if !crate::expr::has_equality(key.ty, scope.catalog().as_ref()) {
             return Err(BindError::feature_not_supported(format!(
                 "DISTINCT on type {} is not supported yet",
                 crate::expr::type_label(key.ty, scope.catalog().as_ref())
@@ -4519,8 +4535,9 @@ fn bind_group_by(
         reject_agg_or_window(&bound, "GROUP BY")?;
         // The executor groups with `compare_values`, which cannot order every
         // type (`bit`, user types); reject such a key at bind time rather than
-        // panicking mid-group.
-        if !crate::expr::is_orderable(bound.ty(), scope.catalog().as_ref()) {
+        // panicking mid-group. Grouping needs only equality, so this admits
+        // `xid` -- which has a hash opclass but no btree one.
+        if !crate::expr::has_equality(bound.ty(), scope.catalog().as_ref()) {
             return Err(BindError::feature_not_supported(format!(
                 "GROUP BY on type {} is not supported yet",
                 crate::expr::type_label(bound.ty(), scope.catalog().as_ref())

@@ -34,6 +34,9 @@ pub fn type_indexable(ty: PgType) -> bool {
             | PgType::Name
             | PgType::Uuid
             | PgType::Date
+            | PgType::Tid
+            | PgType::Xid8
+            | PgType::PgLsn
     )
 }
 
@@ -106,6 +109,17 @@ fn encode_one(ty: PgType, v: &Value, out: &mut Vec<u8>) -> Option<()> {
             out.extend_from_slice(&(*x as u32 ^ 0x8000_0000).to_be_bytes())
         }
         (PgType::Oid, Value::Oid(x)) => out.extend_from_slice(&x.to_be_bytes()),
+        // Unsigned counters: plain big-endian already matches `compare_values`.
+        // `xid` is deliberately absent — it has no btree opclass at all, so a
+        // key of that type is rejected before it reaches any index.
+        (PgType::Xid8, Value::Xid8(x)) => out.extend_from_slice(&x.to_be_bytes()),
+        (PgType::PgLsn, Value::PgLsn(x)) => out.extend_from_slice(&x.to_be_bytes()),
+        // tid orders by block then offset, so concatenating the two big-endian
+        // fields reproduces that lexicographic order bytewise.
+        (PgType::Tid, Value::Tid { block, offset }) => {
+            out.extend_from_slice(&block.to_be_bytes());
+            out.extend_from_slice(&offset.to_be_bytes());
+        }
         (PgType::Text | PgType::Varchar | PgType::Name, Value::Text(s)) => {
             encode_text(s.as_bytes(), out)
         }
@@ -247,6 +261,36 @@ mod tests {
                 0xff; 16
             ]]
             .map(Value::Uuid)
+            .to_vec(),
+        );
+    }
+
+    #[test]
+    fn tid_xid8_and_pg_lsn_are_order_preserving() {
+        assert_order_preserved(
+            PgType::Xid8,
+            &[0u64, 1, 42, i64::MAX as u64, u64::MAX]
+                .map(Value::Xid8)
+                .to_vec(),
+        );
+        assert_order_preserved(
+            PgType::PgLsn,
+            &[0u64, 1, 0x1_0000_0000, 0xFFFF_FFFF_FFFF_FFFF]
+                .map(Value::PgLsn)
+                .to_vec(),
+        );
+        // The block field must dominate the offset: `(1,0)` sorts after
+        // `(0,65535)` even though its offset is smaller.
+        assert_order_preserved(
+            PgType::Tid,
+            &[
+                (0u32, 0u16),
+                (0, 1),
+                (0, u16::MAX),
+                (1, 0),
+                (u32::MAX, u16::MAX),
+            ]
+            .map(|(block, offset)| Value::Tid { block, offset })
             .to_vec(),
         );
     }
