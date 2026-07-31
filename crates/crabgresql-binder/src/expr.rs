@@ -4236,6 +4236,10 @@ fn bind_binary(
             "#" => ast::BinaryOperator::PGBitwiseXor,
             "@@" => ast::BinaryOperator::AtAt,
             "@?" => ast::BinaryOperator::AtQuestion,
+            "->" => ast::BinaryOperator::Arrow,
+            "->>" => ast::BinaryOperator::LongArrow,
+            "#>" => ast::BinaryOperator::HashArrow,
+            "#>>" => ast::BinaryOperator::HashLongArrow,
             _ => return Err(custom_op_undefined(left, op, right, scope)),
         };
         return bind_binary(left, &native, right, op_span, scope);
@@ -4833,11 +4837,7 @@ fn undefined_binary_operator(
             operand_name(rb)
         ),
     )
-    .with_hint(Some(
-        "No operator matches the given name and argument types. \
-         You might need to add explicit type casts."
-            .to_string(),
-    ))
+    .with_hint(Some(NO_OPERATOR_HINT.to_string()))
 }
 
 /// 42883 for an `OPERATOR(schema.op)` spelling that names no built-in operator
@@ -4873,11 +4873,7 @@ fn custom_op_undefined(
             operand_name(&rb)
         ),
     )
-    .with_hint(Some(
-        "No operator matches the given name and argument types. \
-         You might need to add explicit type casts."
-            .to_string(),
-    ))
+    .with_hint(Some(NO_OPERATOR_HINT.to_string()))
 }
 
 /// Materialize a network operand: a typed inet/cidr as is (both read through
@@ -5653,6 +5649,9 @@ fn resolve_json_op(
         return Ok(None);
     }
     // Both error paths point at the operator, as PG's `LINE n: ... ^` does.
+    // Positioning is per-error, not chain-wide: PG leaves other resolver errors
+    // (e.g. array's `could not identify an equality operator`) unpositioned even
+    // though they share this SQLSTATE.
     let undefined = || undefined_binary_operator(lb, op, rb).at(op_span);
     // The container type also decides `->`/`#>`'s return type. An untyped left
     // operand leaves all four candidate operators (json/jsonb × text/int4)
@@ -5692,13 +5691,15 @@ fn resolve_json_op(
         }
         _ => {
             let text_arr = PgType::Array(PgType::Text.oid());
-            // Only a `text[]`/`varchar[]` argument (or an untyped literal, which
-            // parses as `text[]`) is accepted; anything else must report a
-            // missing operator rather than be silently coerced.
+            // An array over any text-family element (or an untyped literal, which
+            // parses as `text[]`) is accepted, since each of those elements casts
+            // to `text` implicitly — the same rule the scalar arm above applies
+            // via `is_text_family`. Anything else must report a missing operator
+            // rather than be silently coerced, so `jsonb #> integer[]` is 42883.
             match binding_typed_ty(rb) {
                 None => {}
                 Some(PgType::Array(elem))
-                    if elem == PgType::Text.oid() || elem == PgType::Varchar.oid() => {}
+                    if PgType::from_oid(elem).is_some_and(is_text_family) => {}
                 Some(_) => return Err(undefined()),
             }
             (
@@ -6185,6 +6186,12 @@ fn bind_similar_to(
     Ok(Binding::Typed(expr))
 }
 
+/// The HINT PG attaches to every `operator does not exist` (42883). Shared by
+/// all three constructors below so they cannot drift apart.
+const NO_OPERATOR_HINT: &str =
+    "No operator matches the given name and argument types. \
+     You might need to add explicit type casts.";
+
 fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
     BindError::new(
         sqlstate::UNDEFINED_FUNCTION,
@@ -6193,6 +6200,7 @@ fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
             op.sql_symbol()
         ),
     )
+    .with_hint(Some(NO_OPERATOR_HINT.to_string()))
 }
 
 /// PG reports 42725 (with DETAIL/HINT) when more than one candidate operator

@@ -220,6 +220,7 @@ ERROR:  date out of range
 -- there is no date + bigint operator
 SELECT date '2000-01-01' + 5::int8;
 ERROR:  operator does not exist: date + bigint
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
 SELECT extract(hour from date '2020-08-11');
 ERROR:  unit "hour" not supported for type date
 SELECT extract(fortnight from date '2020-08-11');

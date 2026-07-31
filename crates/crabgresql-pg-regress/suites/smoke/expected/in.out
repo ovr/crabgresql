@@ -128,9 +128,11 @@ SELECT label FROM nums WHERE id NOT IN (2, NULL) ORDER BY label;
 -- error: no common type for the list falls back to per-pair equality
 SELECT 1 IN (1, 'foo'::text);
 ERROR:  operator does not exist: integer = text
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
 -- error: NOT IN takes the same fallback, chaining <> instead of =
 SELECT 1 NOT IN (1, 'foo'::text);
 ERROR:  operator does not exist: integer <> text
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
 -- error: an untyped list literal that does not fit the resolved type
 SELECT 1 IN (2, 'x');
 ERROR:  invalid input syntax for type integer: "x"

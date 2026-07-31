@@ -91,3 +91,16 @@ SELECT '{"a":1}'::jsonb #> ARRAY[1];
 SELECT 'x'::text -> 'a';
 -- with both operands untyped every candidate applies equally (42725, not 42883)
 SELECT '{"a":1}' -> 'a';
+-- every text-family element type reaches the text[] path operator implicitly,
+-- matching what the scalar key accepts
+SELECT '{"a":1}'::jsonb #> ARRAY['a']::name[] AS name_path,
+       '{"a":1}'::jsonb #> ARRAY['a']::char(3)[] AS bpchar_path,
+       '{"a":1}'::jsonb -> 'a'::name AS name_key;
+-- the schema-qualified operator spelling resolves to the same operator
+SELECT '{"a":1}'::jsonb OPERATOR(pg_catalog.->) 'a' AS qualified_arrow,
+       '{"a":{"b":2}}'::jsonb OPERATOR(pg_catalog.#>>) '{a,b}' AS qualified_hash;
+-- a path element is a subscript only if strtol accepts it whole: C whitespace
+-- (here a tab) is skipped, but a Unicode space is not whitespace to strtol and
+-- makes the element a non-number, hence NULL
+SELECT '[1,2,3]'::jsonb #> ARRAY[chr(9) || '1'] AS c_whitespace_step,
+       '[1,2,3]'::jsonb #> ARRAY[chr(12288) || '1'] AS unicode_space_step;

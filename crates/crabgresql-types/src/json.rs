@@ -747,11 +747,21 @@ fn resolve_index(idx: i64, len: usize) -> Option<usize> {
 }
 
 /// A `#>` path element used as an array subscript. PG's `strtoint` skips leading
-/// whitespace, accepts a leading sign, and rejects trailing characters — which
-/// is exactly Rust's `parse::<i64>` after a `trim_start`. A value that does not
-/// fit an `i64` yields `None`, i.e. SQL NULL, as PG does.
+/// whitespace, accepts a leading sign, and rejects trailing characters, which is
+/// Rust's `parse::<i64>` once the leading whitespace is gone. A value that does
+/// not fit an `i64` yields `None`, i.e. SQL NULL, as PG does.
+///
+/// The skip is the C `isspace` set, which is neither of the obvious candidates:
+/// `str::trim_start` also strips the Unicode `White_Space` set (U+00A0,
+/// U+2000..200A, U+3000, ...) that `strtol` does not recognize, while Rust's
+/// `is_ascii_whitespace` omits the vertical tab that it does. Both were verified
+/// against PostgreSQL — `#> ARRAY[e'\v1']` extracts, `#> ARRAY['<U+3000>1']` is
+/// NULL. This is a wider set than [`is_json_ws`] on purpose: it describes what
+/// `strtol` accepts, not what the JSON grammar calls whitespace.
 fn path_index(step: &str) -> Option<i64> {
-    step.trim_start().parse::<i64>().ok()
+    step.trim_start_matches([' ', '\t', '\n', '\u{0b}', '\u{0c}', '\r'])
+        .parse::<i64>()
+        .ok()
 }
 
 /// The value of `key` in the jsonb object `value`. `None` if `value` is not an
@@ -803,9 +813,20 @@ pub fn jsonb_as_text(value: &Jsonb) -> Option<String> {
     }
 }
 
+/// The four characters JSON counts as insignificant whitespace.
+///
+/// Deliberately **not** `u8::is_ascii_whitespace`, which also accepts a form feed
+/// (0x0C). Mixing the two definitions is a liveness bug, not a cosmetic one: if
+/// [`raw_skip_value`]'s scalar-token loop treats a byte as whitespace while its
+/// `match` does not, the cursor stops advancing and the scan spins forever. Every
+/// whitespace test in the raw scanner goes through here so the two can't drift.
+fn is_json_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
 /// Skip whitespace from `i`, returning the offset of the next other byte.
 fn raw_skip_ws(b: &[u8], mut i: usize) -> usize {
-    while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+    while matches!(b.get(i), Some(&c) if is_json_ws(c)) {
         i += 1;
     }
     i
@@ -833,6 +854,12 @@ fn raw_skip_string(b: &[u8], mut i: usize) -> Option<usize> {
 /// is also **total**: any malformed input yields `None` rather than a panic or a
 /// hang, which matters because `Value::Json` is reconstructed from a heap tuple
 /// without being re-validated.
+///
+/// Totality rests on every arm advancing `i` by at least one byte. The `_` arm is
+/// the delicate one: it is reached only for a byte that is neither `"`, nor
+/// [`is_structural`], nor [`is_json_ws`] — exactly the bytes its loop condition
+/// consumes — so it always makes progress. Widening either predicate without
+/// widening the other reintroduces a spin.
 fn raw_skip_value(b: &[u8], mut i: usize) -> Option<usize> {
     let mut depth = 0usize;
     loop {
@@ -854,15 +881,14 @@ fn raw_skip_value(b: &[u8], mut i: usize) -> Option<usize> {
                 i += 1;
                 continue;
             }
-            b' ' | b'\t' | b'\n' | b'\r' => {
+            c if is_json_ws(c) => {
                 i += 1;
                 continue;
             }
             // A scalar token (number / true / false / null) runs to the next
             // structural character or whitespace.
             _ => {
-                while matches!(b.get(i), Some(&c) if !is_structural(c) && !c.is_ascii_whitespace())
-                {
+                while matches!(b.get(i), Some(&c) if !is_structural(c) && !is_json_ws(c)) {
                     i += 1;
                 }
             }
@@ -1002,10 +1028,20 @@ fn json_trim(doc: &str) -> Option<&str> {
 /// text of the value it lands on. An empty path returns the whole value, trimmed
 /// — PG drops the outer whitespace that the `json` input preserved.
 pub fn json_extract_path<'a>(doc: &'a str, path: &[&str]) -> Option<&'a str> {
-    let mut cur = json_trim(doc)?;
+    // Only the empty path needs the trim, and only for its own sake — it is the
+    // one case that returns `doc` itself. Trimming unconditionally would scan the
+    // whole document on every call just to throw the span away, doubling the cost
+    // of `#>` against the equivalent `->`.
+    if path.is_empty() {
+        return json_trim(doc);
+    }
+    let mut cur = doc;
     for step in path {
+        // The accessors skip their own leading whitespace and hand back trimmed
+        // spans, so only the first step can see any — an O(whitespace) skip, not
+        // an O(document) one.
         let b = cur.as_bytes();
-        cur = match *b.first()? {
+        cur = match *b.get(raw_skip_ws(b, 0))? {
             b'{' => json_object_field(cur, step)?,
             b'[' => json_array_element(cur, path_index(step)?)?,
             _ => return None,
@@ -1030,10 +1066,15 @@ pub fn json_as_text(value: &str) -> Result<Option<String>, JsonError> {
         // `\u0000` is rejected here even though `json_in` accepted it.
         return Parser::at(b, i, "json", true).parse_string().map(Some);
     }
-    if value.trim() == "null" {
+    // Trim with the JSON whitespace set, not `str::trim`'s Unicode one: an
+    // NBSP or U+2028 is an ordinary character here and must survive into the
+    // `text` result.
+    let end = raw_skip_value(b, i).unwrap_or(b.len());
+    let trimmed = &value[i..end];
+    if trimmed == "null" {
         return Ok(None);
     }
-    Ok(Some(value.trim().to_string()))
+    Ok(Some(trimmed.to_string()))
 }
 
 #[cfg(test)]
@@ -1270,14 +1311,27 @@ mod tests {
     fn json_scanner_is_total_on_malformed_input() {
         // `Value::Json` is rebuilt from a heap tuple without re-validation, so
         // the scanner must never panic or hang on text that is not valid JSON.
-        for doc in [
+        // Every control byte is included: a form feed (0x0C) once spun forever,
+        // because `is_ascii_whitespace` accepts it while the JSON whitespace set
+        // does not, so the scalar-token loop consumed nothing and the cursor
+        // stopped advancing. See `is_json_ws`.
+        let controls: Vec<String> = (0u8..=0x20)
+            .flat_map(|c| {
+                let c = c as char;
+                [format!("[{c}]"), format!("{{\"a\":{c}}}"), format!("{{\"a\":{c}1}}"), format!("[1,{c}2]")]
+            })
+            .collect();
+        let fixed = [
             "", "{", "}", "[", "{\"a\"", "{\"a\":", "{\"a\":[1,2", "[1,2", "\"unterminated",
             "{\"a\":1,", "{,}", "[,]", "{\"a\" 1}", "\\", "{\"a\":\"\\",
-        ] {
+        ];
+        for doc in fixed.iter().map(|s| s.to_string()).chain(controls) {
+            let doc = doc.as_str();
             let _ = json_object_field(doc, "a");
             let _ = json_array_element(doc, 0);
             let _ = json_array_element(doc, -1);
             let _ = json_extract_path(doc, &["a"]);
+            let _ = json_extract_path(doc, &["0"]);
             let _ = json_extract_path(doc, &[]);
             let _ = json_as_text(doc);
         }
@@ -1352,5 +1406,17 @@ mod tests {
         assert_eq!(path_index(""), None);
         // Out of i64 range yields NULL rather than wrapping.
         assert_eq!(path_index("99999999999999999999"), None);
+        // Only ASCII whitespace is skipped. PG's C-locale `strtol` does not
+        // recognize the Unicode spaces, so a step prefixed with one is not a
+        // number and must be NULL -- `str::trim_start` would wrongly accept it.
+        assert_eq!(path_index("\u{3000}1"), None);
+        assert_eq!(path_index("\u{00a0}1"), None);
+        assert_eq!(path_index("\u{2003}1"), None);
+        // ...but every character C's `isspace` accepts is, including the
+        // vertical tab that Rust's `is_ascii_whitespace` leaves out. Verified
+        // against PostgreSQL: `'[1,2,3]'::json #> ARRAY[e'\v1']` yields 2.
+        for c in [' ', '\t', '\n', '\u{0b}', '\u{0c}', '\r'] {
+            assert_eq!(path_index(&format!("{c}1")), Some(1), "C isspace {:?}", c);
+        }
     }
 }
