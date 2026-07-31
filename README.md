@@ -113,9 +113,13 @@ server, emulating `psql -a -q` output, and diffs against `expected/*.out`:
 ```console
 $ cargo run -p crabgresql-pg-regress --bin regress            # full schedule (compat %)
 $ cargo run -p crabgresql-pg-regress --bin regress -- --tests boolean,int4
-14 of 245 tests passed (5%).
+15 of 245 tests passed (6%).
 See target/regress/regression.diffs for details.
 ```
+
+The `lock` test currently aborts the runner process (a stack overflow), which
+ends the run early; the score above is from a sweep that skips it, counting it
+as a failure. Fixing that crash is tracked separately.
 
 The score is the compatibility dashboard, so a near-zero percentage at M0 is
 expected and honest. Regression protection lives in `cargo test`: the

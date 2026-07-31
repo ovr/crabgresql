@@ -6608,6 +6608,171 @@ async fn copy_in_fills_serial_default_from_sequence() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// COPY ... FROM '<file>' — the server reads the file itself
+// ---------------------------------------------------------------------------
+
+/// Write `contents` to a file inside `dir` and hand back its absolute path,
+/// which is the only form `COPY … FROM` accepts.
+fn fixture_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> anyhow::Result<String> {
+    let path = dir.path().join(name);
+    std::fs::write(&path, contents)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// The upstream fixture pattern: an absolute path in the statement, text format,
+/// loaded by the server without a copy-in sub-protocol.
+#[tokio::test]
+async fn copy_from_file_loads_text_format() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let dir = tempfile::tempdir()?;
+    let path = fixture_file(&dir, "t.data", b"1\talice\n2\t\\N\n3\tbob\n")?;
+
+    client
+        .simple_query("CREATE TABLE t (a int4, b text)")
+        .await?;
+    let messages = client
+        .simple_query(&format!("COPY t FROM '{path}'"))
+        .await?;
+    assert!(
+        matches!(&messages[0], SimpleQueryMessage::CommandComplete(n) if *n == 3),
+        "COPY should report 3 rows"
+    );
+
+    let messages = client.simple_query("SELECT a, b FROM t ORDER BY a").await?;
+    let rows = rows(&messages);
+    assert_eq!(rows[0].get("b"), Some("alice"));
+    assert_eq!(rows[1].get("b"), None);
+    assert_eq!(rows[2].get("b"), Some("bob"));
+    Ok(())
+}
+
+/// The `WITH (…)` options resolve the same way for a file as for stdin, and a
+/// quoted field spanning a newline survives the chunked read.
+#[tokio::test]
+async fn copy_from_file_loads_csv_with_options() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let dir = tempfile::tempdir()?;
+    let path = fixture_file(&dir, "c.csv", b"a,b\n1,\"line1\nline2\"\n2,\"x\"\"y\"\n")?;
+
+    client
+        .simple_query("CREATE TABLE c (a int4, b text)")
+        .await?;
+    let messages = client
+        .simple_query(&format!("COPY c FROM '{path}' WITH (FORMAT csv, HEADER)"))
+        .await?;
+    assert!(
+        matches!(&messages[0], SimpleQueryMessage::CommandComplete(n) if *n == 2),
+        "the header line must not be loaded as a row"
+    );
+
+    let messages = client.simple_query("SELECT b FROM c ORDER BY a").await?;
+    let rows = rows(&messages);
+    assert_eq!(rows[0].get("b"), Some("line1\nline2"));
+    assert_eq!(rows[1].get("b"), Some("x\"y"));
+    Ok(())
+}
+
+/// More rows than one insert batch, so the whole file passes through the
+/// batching loop rather than a single pass.
+#[tokio::test]
+async fn copy_from_file_loads_more_rows_than_one_batch() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let dir = tempfile::tempdir()?;
+    let data: String = (1..=2500).map(|i| format!("{i}\tv{i}\n")).collect();
+    let path = fixture_file(&dir, "big.data", data.as_bytes())?;
+
+    client
+        .simple_query("CREATE TABLE b (a int4, v text)")
+        .await?;
+    let messages = client
+        .simple_query(&format!("COPY b FROM '{path}'"))
+        .await?;
+    assert!(matches!(&messages[0], SimpleQueryMessage::CommandComplete(n) if *n == 2500));
+
+    let messages = client
+        .simple_query("SELECT count(*) AS n, max(a) AS m FROM b")
+        .await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("2500"));
+    assert_eq!(rows(&messages)[0].get("m"), Some("2500"));
+    Ok(())
+}
+
+/// A bad row in the file's tail must leave none of its head behind: every batch
+/// runs in one transaction, so the whole COPY rolls back.
+#[tokio::test]
+async fn copy_from_file_bad_value_late_in_file_aborts_whole_load() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    let dir = tempfile::tempdir()?;
+    // The failing row sits past the first insert batch.
+    let mut data: String = (1..=2000).map(|i| format!("{i}\n")).collect();
+    data.push_str("not_an_int\n");
+    let path = fixture_file(&dir, "bad.data", data.as_bytes())?;
+
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+    let err = client
+        .simple_query(&format!("COPY t FROM '{path}'"))
+        .await
+        .expect_err("a malformed value must abort the COPY");
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::INVALID_TEXT_REPRESENTATION
+    );
+
+    let messages = client.simple_query("SELECT count(*) AS n FROM t").await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// A file the server cannot open reports PG's 58P01 wording.
+#[tokio::test]
+async fn copy_from_missing_file_errors() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    let err = client
+        .simple_query("COPY t FROM '/nonexistent/crabgresql-copy.data'")
+        .await
+        .expect_err("a missing file must error");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code().code(), "58P01");
+    assert_eq!(
+        db.message(),
+        "could not open file \"/nonexistent/crabgresql-copy.data\" for reading: \
+         No such file or directory"
+    );
+    Ok(())
+}
+
+/// The two COPY FROM forms still not implemented keep their own 0A000 messages:
+/// a relative path (PG would resolve it against the data directory) and PROGRAM.
+#[tokio::test]
+async fn copy_from_relative_path_and_program_are_unsupported() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    for (sql, expected) in [
+        (
+            "COPY t FROM 'relative.data'",
+            "COPY from a relative path is not supported yet: \"relative.data\"",
+        ),
+        (
+            "COPY t FROM PROGRAM 'echo 1'",
+            "COPY from a program is not supported yet",
+        ),
+    ] {
+        let err = client.simple_query(sql).await.expect_err(sql);
+        let db = err.as_db_error().expect("db error");
+        assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED, "{sql}");
+        assert_eq!(db.message(), expected);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn create_function_language_sql_evaluates_and_composes() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;

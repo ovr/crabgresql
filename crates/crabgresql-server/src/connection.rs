@@ -472,7 +472,7 @@ async fn copy_in_stream(
         Ok(rows) => rows,
         Err(e) => return Ok(CopyOutcome::Failed(e)),
     };
-    match run_copy_insert(engine, txnmgr, session, &prepared, rows) {
+    match run_copy_insert(engine, txnmgr, session, &prepared, rows.rows) {
         Ok(n) => Ok(CopyOutcome::Loaded(n)),
         Err(e) => Ok(CopyOutcome::Failed(e)),
     }

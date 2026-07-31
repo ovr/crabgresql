@@ -51,3 +51,12 @@ COPY ch FROM stdin;
 ab
 \.
 SELECT octet_length(a) AS len FROM ch;
+
+-- Server-side COPY FROM a file, addressed the way the upstream corpus does:
+-- the harness exports PG_ABS_SRCDIR, `\set` concatenates it with the relative
+-- data path, and `:'filename'` interpolates the result as a quoted literal.
+\getenv abs_srcdir PG_ABS_SRCDIR
+\set filename :abs_srcdir '/data/copy_file.data'
+CREATE TABLE cf (a integer, b text);
+COPY cf FROM :'filename';
+SELECT a, b FROM cf ORDER BY a;

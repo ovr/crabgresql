@@ -40,9 +40,11 @@ used byte-for-byte unmodified.
 ## Notes on the corpus
 
 - Since PostgreSQL 16 there is no `input//output/` `.source` template
-  machinery; COPY-family tests use `\getenv abs_srcdir` psql metacommands
-  instead. The CrabgreSQL runner does not implement metacommands, so those
-  tests emit a deterministic stub line and cannot pass yet.
+  machinery; COPY-family tests locate `data/` with `\getenv abs_srcdir` and
+  `COPY … FROM :'filename'` instead. The runner implements `\getenv`, `\set`,
+  `\unset` and `:var` / `:'var'` / `:"var"` interpolation, and the server reads
+  the named file itself; other metacommands still emit a deterministic stub
+  line, so tests that need them cannot pass yet.
 - `serial_schedule` was removed upstream in PostgreSQL 14; `parallel_schedule`
   is the only schedule, and our runner executes its groups serially in file
   order (as `pg_regress` itself supports).

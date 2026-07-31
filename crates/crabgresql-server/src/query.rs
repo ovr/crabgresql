@@ -11,10 +11,10 @@ use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use crabgresql_binder::{
-    BoundExpr, CopyFromPlan, InsertSource, LogicalPlan, bind_copy_from, bind_delete_with_params,
-    bind_insert_with_params, bind_query, bind_query_with_params, bind_update_with_params,
-    output_columns_of, param_ctx_extended, param_ctx_none, param_types, require_all_resolved,
-    substitute_params,
+    BoundExpr, CopyFromPlan, CopyFromSource, InsertSource, LogicalPlan, bind_copy_from,
+    bind_delete_with_params, bind_insert_with_params, bind_query, bind_query_with_params,
+    bind_update_with_params, output_columns_of, param_ctx_extended, param_ctx_none, param_types,
+    require_all_resolved, substitute_params,
 };
 use crabgresql_executor::{
     CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, MaterializedRows, OutputColumn,
@@ -1002,6 +1002,13 @@ pub(crate) fn execute_statement_with(
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
             }
+            // `COPY … FROM '<file>'` needs no wire sub-protocol: the server reads
+            // the file itself, so it runs on the ordinary execute path. The STDIN
+            // form never reaches here — the connection intercepts it before
+            // execution (see `is_copy_from_stdin`).
+            ast::Statement::Copy { .. } => {
+                return execute_copy_from_file(engine, global_catalog, txnmgr, session, stmt);
+            }
             other => {
                 return Err(PgError::feature_not_supported(format!(
                     "statement is not supported yet: {}",
@@ -1481,9 +1488,29 @@ pub fn run_copy_insert(
     prepared: &PreparedCopy,
     rows: Vec<Vec<Option<String>>>,
 ) -> Result<u64, PgError> {
-    // Turn the decoded rows into an INSERT ... VALUES plan (each field parses via
-    // its column's input function against the type catalog bound at prepare time).
-    let logical = prepared.plan.build_insert(&prepared.catalog, rows)?;
+    run_copy_rows(engine, txnmgr, session, prepared, |insert| {
+        insert(rows).map(|_| ())
+    })
+}
+
+/// Load a COPY's rows, however many batches they arrive in, as **one**
+/// transaction: `produce` is handed an inserter it may call repeatedly, and
+/// every batch lands under the same XID and command id. That is what makes a
+/// server-side file COPY atomic — a row the file's tail cannot parse must leave
+/// none of its head visible.
+///
+/// The write context (capacity wait, XID, routine runtime, execution context) is
+/// built once here rather than per batch, and the statement is finalized once:
+/// committed if `produce` and every batch succeeded, aborted otherwise.
+pub fn run_copy_rows(
+    engine: &Arc<dyn TableEngine>,
+    txnmgr: &Arc<TransactionManager>,
+    session: &mut Session,
+    prepared: &PreparedCopy,
+    produce: impl FnOnce(
+        &mut dyn FnMut(Vec<Vec<Option<String>>>) -> Result<u64, PgError>,
+    ) -> Result<(), PgError>,
+) -> Result<u64, PgError> {
     // A COPY is a write (read-only was rejected at prepare time); its context
     // carries a sequence handle so a `serial`/`nextval()` column default advances
     // the sequence and updates this session's currval/lastval, as INSERT does,
@@ -1504,23 +1531,66 @@ pub fn run_copy_insert(
         Arc::clone(&command_counter),
         read_only,
     );
-    let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
-        Ok(exec) => exec,
-        Err(e) => {
-            let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
-            return Err(e.into());
+
+    let mut loaded = 0u64;
+    let outcome = produce(&mut |rows| {
+        // Turn the decoded rows into an INSERT ... VALUES plan (each field parses
+        // via its column's input function against the type catalog bound at
+        // prepare time).
+        let logical = prepared.plan.build_insert(&prepared.catalog, rows)?;
+        match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn)? {
+            Execution::Inserted(n) => {
+                loaded += n;
+                Ok(n)
+            }
+            _ => Err(PgError::new(
+                sqlstate::INTERNAL_ERROR,
+                "COPY produced an unexpected execution result",
+            )),
         }
-    };
+    });
+    if let Err(e) = outcome {
+        let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
+        return Err(e);
+    }
     // A column default can call a routine, whose body advances the counter, so
     // the block's command id has to be read back rather than merely bumped.
     finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter))?;
-    match exec {
-        Execution::Inserted(n) => Ok(n),
-        _ => Err(PgError::new(
-            sqlstate::INTERNAL_ERROR,
-            "COPY produced an unexpected execution result",
-        )),
-    }
+    Ok(loaded)
+}
+
+/// Run `COPY <table> [(cols)] FROM '<file>'`: bind it like the STDIN form, then
+/// stream the file through the shared text/CSV decoder, inserting in batches
+/// inside one transaction.
+///
+/// A `COPY … FROM STDIN` reaching here is a routing bug rather than a user
+/// error, so it reports the wire-level requirement instead of silently loading
+/// nothing.
+fn execute_copy_from_file(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    session: &mut Session,
+    stmt: &ast::Statement,
+) -> Result<QueryResult, PgError> {
+    let prepared = prepare_copy_from(engine, global_catalog, stmt, session)?;
+    let path = match &prepared.plan.source {
+        CopyFromSource::File(path) => path.clone(),
+        CopyFromSource::Stdin => {
+            return Err(PgError::new(
+                sqlstate::PROTOCOL_VIOLATION,
+                "COPY FROM STDIN must be driven by the copy-in protocol",
+            ));
+        }
+    };
+    let format = prepared.plan.format.clone();
+    let rows = run_copy_rows(engine, txnmgr, session, &prepared, |insert| {
+        crate::copy::read_file_rows(&path, &format, |batch| insert(batch).map(|_| ()))
+    })?;
+    Ok(QueryResult::Command {
+        tag: format!("COPY {rows}"),
+        notices: Vec::new(),
+    })
 }
 
 /// Map a WAL/commit I/O failure to a SQLSTATE 58030 system error.

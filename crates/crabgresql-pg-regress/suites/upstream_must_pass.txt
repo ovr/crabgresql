@@ -13,5 +13,6 @@ macaddr8
 md5
 money
 path
+portals_p2
 time
 varchar
