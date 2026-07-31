@@ -289,6 +289,8 @@ pub struct CompileError {
     pub message: String,
     /// 1-based line within the routine body.
     pub line: u32,
+    /// Optional `HINT:` line, for the diagnostics PG pairs with one.
+    pub hint: Option<String>,
 }
 
 impl CompileError {
@@ -297,23 +299,25 @@ impl CompileError {
             code,
             message: message.into(),
             line,
+            hint: None,
         }
     }
 
     pub fn syntax(message: impl Into<String>, line: u32) -> Self {
-        Self {
-            code: crabgresql_pg_wire::sqlstate::SYNTAX_ERROR,
-            message: message.into(),
-            line,
-        }
+        Self::new(crabgresql_pg_wire::sqlstate::SYNTAX_ERROR, message, line)
     }
 
     pub fn unsupported(message: impl Into<String>, line: u32) -> Self {
-        Self {
-            code: crabgresql_pg_wire::sqlstate::FEATURE_NOT_SUPPORTED,
-            message: message.into(),
+        Self::new(
+            crabgresql_pg_wire::sqlstate::FEATURE_NOT_SUPPORTED,
+            message,
             line,
-        }
+        )
+    }
+
+    pub fn with_hint(mut self, hint: Option<String>) -> Self {
+        self.hint = hint;
+        self
     }
 
     pub fn at_span(mut self, span: Span) -> Self {

@@ -2231,11 +2231,9 @@ fn set_value_to_string(exprs: &[ast::Expr]) -> Option<String> {
     };
     match expr {
         ast::Expr::Value(v) => match &v.value {
-            ast::Value::SingleQuotedString(s) => Some(s.clone()),
-            ast::Value::DollarQuotedString(d) => Some(d.value.clone()),
             ast::Value::Number(n, _) => Some(n.clone()),
             ast::Value::Boolean(b) => Some(b.to_string()),
-            _ => None,
+            other => other.as_pg_string().map(str::to_string),
         },
         ast::Expr::Identifier(ident) => Some(ident.value.clone()),
         _ => None,
@@ -2290,8 +2288,7 @@ fn parse_i32_expr(expr: &ast::Expr) -> Option<i32> {
     match expr {
         ast::Expr::Value(v) => match &v.value {
             ast::Value::Number(n, _) => n.parse().ok(),
-            ast::Value::SingleQuotedString(s) => s.trim().parse().ok(),
-            _ => None,
+            other => other.as_pg_string()?.trim().parse().ok(),
         },
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Minus,
@@ -4110,14 +4107,14 @@ fn pg_type_of_ref(
     }
 }
 
-/// Extract a single-quoted (or dollar-quoted) string literal expression.
+/// Extract a string literal expression, in any of PG's quoting styles.
 fn string_literal(expr: &ast::Expr) -> Result<String, PgError> {
     match expr {
-        ast::Expr::Value(v) => match &v.value {
-            ast::Value::SingleQuotedString(s) => Ok(s.clone()),
-            ast::Value::DollarQuotedString(d) => Ok(d.value.clone()),
-            other => Err(PgError::syntax(format!(
-                "expected a string literal, found: {other}"
+        ast::Expr::Value(v) => match v.value.as_pg_string() {
+            Some(s) => Ok(s.to_string()),
+            None => Err(PgError::syntax(format!(
+                "expected a string literal, found: {}",
+                v.value
             ))),
         },
         other => Err(PgError::syntax(format!(
@@ -4356,6 +4353,7 @@ fn execute_create_procedure(
 fn compile_failure(name: &str, e: crabgresql_plpgsql::CompileError) -> PgError {
     let line = e.line;
     let mut err = PgError::new(e.code, e.message);
+    err.hint = e.hint;
     err.context.push(format!(
         "compilation of PL/pgSQL function \"{name}\" near line {line}"
     ));
@@ -5124,8 +5122,7 @@ fn parse_i64_expr(expr: &ast::Expr) -> Option<i64> {
     match expr {
         ast::Expr::Value(v) => match &v.value {
             ast::Value::Number(n, _) => n.parse().ok(),
-            ast::Value::SingleQuotedString(s) => s.trim().parse().ok(),
-            _ => None,
+            other => other.as_pg_string()?.trim().parse().ok(),
         },
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Minus,

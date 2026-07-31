@@ -37,23 +37,45 @@ SELECT E'A' AS letter_a,
 SELECT E'abc'::name AS as_name, length(E'a\tb') AS len;
 -- U&'...' escapes are code points, with \+XXXXXX for the six-digit form
 SELECT U&'d\0061t\+000061' AS unicode_data;
--- N'...' is a plain string literal on a UTF-8 server
-SELECT N'abc' AS national;
--- a lone continuation byte is not valid UTF-8
+-- and pair surrogates just as E'...' does
+SELECT U&'\D83D\DE04' = U&'\+01F604' AS u_surrogate_pair;
+-- N'...' is a plain string literal on a UTF-8 server, doubled quotes and all
+SELECT N'abc' AS national, N'it''s' AS national_quote;
+-- every spelling is the same kind of constant, so all are accepted wherever
+-- one is: as an ESCAPE character, and as a typed or interval literal
+SELECT 'a_b' LIKE 'a\_b' ESCAPE E'\\' AS like_escape,
+       'a_b' SIMILAR TO 'a\_b' ESCAPE E'\\' AS similar_escape;
+SELECT DATE E'2024-01-01' AS typed_literal, INTERVAL E'1 day' AS interval_literal;
+-- a lone continuation byte is not valid UTF-8. The reported bytes are the
+-- length the lead byte promises, clipped to what is actually present
 SELECT E'\x80';
 -- neither is a truncated two-byte sequence
 SELECT E'\xc3';
+SELECT E'\xe4\xb8';
+-- \xCA promises two bytes, so the offending trailing byte is named too
+SELECT E'\xCAD';
 -- NUL is valid UTF-8 but PG rejects it however it is spelled
 SELECT E'\0';
 SELECT E'\000';
 -- \400 truncates to 0x00, so it is the same rejection
 SELECT E'\400';
--- a \u escape that is not four hex digits
+-- a \u escape that is not four hex digits is a *malformed* escape, and is the
+-- only one of these conditions that carries a hint
 SELECT E'\uZZZZ';
+-- whereas a well-formed escape naming something that is not a code point is an
+-- escape *value* error: past the last code point, or zero
+SELECT E'\U00110000';
+SELECT U&'\+110000';
+-- a code point escape naming zero is rejected before any byte is produced, so
+-- it is this error rather than the encoding one \0 above gives
+SELECT U&'\0000';
 -- a high surrogate that nothing completes is reported on what followed it
 SELECT E'\ud83d';
 SELECT E'\ud83dxyz';
 -- an unpaired low surrogate is reported on the escape itself
 SELECT E'\udc36';
+-- the same rules hold for U&'...', which does not quote the offending escape
+SELECT U&'\D83D';
+SELECT U&'\DE04';
 -- a U&'...' escape has its own hint, naming the \XXXX forms
 SELECT U&'\ZZZZ';

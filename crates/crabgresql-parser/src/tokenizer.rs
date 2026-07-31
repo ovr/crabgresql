@@ -2458,6 +2458,123 @@ fn peeking_next_take_while(
 /// PG's hint for a malformed `\u`/`\U` escape inside an `E'…'` literal.
 const ESCAPE_UNICODE_HINT: &str = r"Unicode escapes must be \uXXXX or \UXXXXXXXX.";
 
+/// PG's hint for a malformed escape in a `U&'…'` literal.
+const UESCAPE_HINT: &str = r"Unicode escapes must be \XXXX or \+XXXXXX.";
+
+/// The number of bytes PostgreSQL prints for a malformed UTF-8 sequence: the
+/// length the lead byte promises, clipped to what is actually there. So a bare
+/// `0x80` (not a lead byte) prints one byte, `0xca 0x44` prints two even though
+/// only the `0xca` is meaningful, and a truncated `0xf0 0x9f 0x98` prints three.
+fn utf8_report_len(bytes: &[u8]) -> usize {
+    let promised = match bytes.first() {
+        Some(b) if b & 0xE0 == 0xC0 => 2,
+        Some(b) if b & 0xF0 == 0xE0 => 3,
+        Some(b) if b & 0xF8 == 0xF0 => 4,
+        _ => 1,
+    };
+    promised.min(bytes.len())
+}
+
+/// PG's encoding error, naming the offending bytes as `0xNN` separated by
+/// spaces. It carries no cursor position.
+fn invalid_encoding(bytes: &[u8]) -> TokenizerError {
+    let mut hex = String::new();
+    for b in bytes {
+        if !hex.is_empty() {
+            hex.push(' ');
+        }
+        hex.push_str(&format!("0x{b:02x}"));
+    }
+    TokenizerError::pg(
+        "22021",
+        format!("invalid byte sequence for encoding \"UTF8\": {hex}"),
+        None,
+        Location::empty(),
+    )
+}
+
+/// How PostgreSQL words the diagnostics for the two Unicode-escape syntaxes it
+/// accepts in string literals: `\uXXXX`/`\UXXXXXXXX` inside `E'…'`, and
+/// `\XXXX`/`\+XXXXXX` inside `U&'…'`.
+///
+/// The rules for the *value* an escape names are identical in both — zero and
+/// anything above U+10FFFF are rejected, and a UTF-16 surrogate is only legal
+/// as half of a pair — but the wording differs, so it lives here while the
+/// digit readers stay with their own syntax.
+struct UnicodeEscapeDiag {
+    /// SQLSTATE for a malformed escape (a bad or missing hex digit). PG raises
+    /// a data exception inside `E'…'` but a syntax error inside `U&'…'`.
+    malformed_sqlstate: &'static str,
+    hint: &'static str,
+    /// `E'…'` diagnostics quote the offending escape; `U&'…'` ones do not.
+    names_token: bool,
+}
+
+impl UnicodeEscapeDiag {
+    const ESCAPE_STRING: Self = Self {
+        malformed_sqlstate: "22025",
+        hint: ESCAPE_UNICODE_HINT,
+        names_token: true,
+    };
+    const UNICODE_STRING: Self = Self {
+        malformed_sqlstate: DEFAULT_TOKENIZER_SQLSTATE,
+        hint: UESCAPE_HINT,
+        names_token: false,
+    };
+
+    /// Too few hex digits, or a non-hex digit where one was required.
+    fn malformed(&self, loc: Location) -> TokenizerError {
+        TokenizerError::pg(
+            self.malformed_sqlstate,
+            "invalid Unicode escape",
+            Some(self.hint.to_string()),
+            loc,
+        )
+    }
+
+    fn worded(&self, message: &str, token: &str) -> String {
+        if self.names_token {
+            format!("{message} at or near \"{token}\"")
+        } else {
+            message.to_string()
+        }
+    }
+
+    /// A well-formed escape naming something that is not a usable code point.
+    /// PG accepts `0 < value <= 0x10FFFF`; surrogates pass here and are paired
+    /// by the caller.
+    fn check_value(&self, value: u32, loc: Location, token: &str) -> Result<(), TokenizerError> {
+        if value == 0 || value > 0x10FFFF {
+            return Err(TokenizerError::pg(
+                DEFAULT_TOKENIZER_SQLSTATE,
+                self.worded("invalid Unicode escape value", token),
+                None,
+                loc,
+            ));
+        }
+        Ok(())
+    }
+
+    /// A surrogate half that nothing completes.
+    fn surrogate(&self, loc: Location, token: &str) -> TokenizerError {
+        TokenizerError::pg(
+            DEFAULT_TOKENIZER_SQLSTATE,
+            self.worded("invalid Unicode surrogate pair", token),
+            None,
+            loc,
+        )
+    }
+}
+
+const HIGH_SURROGATE: std::ops::RangeInclusive<u32> = 0xD800..=0xDBFF;
+const LOW_SURROGATE: std::ops::RangeInclusive<u32> = 0xDC00..=0xDFFF;
+
+/// Combine a validated high/low surrogate pair into the code point it encodes.
+fn combine_surrogates(high: u32, low: u32) -> char {
+    let scalar = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+    char::from_u32(scalar).expect("a paired surrogate always names a scalar")
+}
+
 fn unescape_single_quoted_string(
     chars: &mut State<'_>,
     starting_loc: Location,
@@ -2539,25 +2656,18 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
     /// it may not contain a NUL — which `str::from_utf8` would happily accept,
     /// so it is rejected separately.
     fn finish(buf: Vec<u8>) -> Result<String, TokenizerError> {
-        let bad = match std::str::from_utf8(&buf) {
-            Ok(_) => buf.iter().position(|b| *b == 0),
-            // PG prints the whole malformed sequence for a truncated multi-byte
-            // character; naming its first byte matches every single-byte case
-            // and is close enough for the rest.
-            Err(e) => Some(e.valid_up_to()),
-        };
-        match bad {
-            None => Ok(String::from_utf8(buf).expect("validated just above")),
-            Some(i) => Err(TokenizerError::pg(
-                "22021",
-                format!(
-                    "invalid byte sequence for encoding \"UTF8\": 0x{:02x}",
-                    buf[i]
-                ),
-                None,
-                // PG reports an encoding error without a cursor position.
-                Location { line: 0, column: 0 },
-            )),
+        match String::from_utf8(buf) {
+            Ok(s) => match s.bytes().position(|b| b == 0) {
+                None => Ok(s),
+                Some(i) => Err(invalid_encoding(&s.as_bytes()[i..=i])),
+            },
+            Err(e) => {
+                let start = e.utf8_error().valid_up_to();
+                let bytes = e.as_bytes();
+                Err(invalid_encoding(
+                    &bytes[start..][..utf8_report_len(&bytes[start..])],
+                ))
+            }
         }
     }
 
@@ -2595,47 +2705,39 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
     /// surrogate must be followed by a `\u` low surrogate; the pair combines
     /// into one scalar, which is how `E'😄'` yields an emoji.
     fn unescape_unicode(&mut self, wide: bool, esc_loc: Location) -> Result<char, TokenizerError> {
-        let invalid = || {
-            TokenizerError::pg(
-                "22025",
-                "invalid Unicode escape",
-                Some(ESCAPE_UNICODE_HINT.to_string()),
-                esc_loc,
-            )
-        };
-        let (value, text) = self.hex_escape(wide, &invalid)?;
+        const DIAG: UnicodeEscapeDiag = UnicodeEscapeDiag::ESCAPE_STRING;
+        let (value, text) = self.hex_escape(wide, esc_loc)?;
 
         // A low surrogate with no high half before it is reported on the escape
         // itself; a high surrogate is reported on whatever failed to complete
         // it, which is why the two cases pass different locations and tokens.
-        if (0xDC00..=0xDFFF).contains(&value) {
-            return Err(Self::bad_surrogate(esc_loc, &text));
+        if LOW_SURROGATE.contains(&value) {
+            return Err(DIAG.surrogate(esc_loc, &text));
         }
-        if !(0xD800..=0xDBFF).contains(&value) {
-            return char::from_u32(value).ok_or_else(invalid);
+        if !HIGH_SURROGATE.contains(&value) {
+            DIAG.check_value(value, esc_loc, &text)?;
+            return char::from_u32(value).ok_or_else(|| DIAG.malformed(esc_loc));
         }
 
         let after = self.chars.location();
-        let bad_low = |token: &str| Err(Self::bad_surrogate(after, token));
         if self.chars.peek() != Some(&'\\') {
             // Whatever stands where the low half should be — possibly the
             // literal's own closing quote.
             let token: String = self.chars.peek().into_iter().collect();
-            return bad_low(&token);
+            return Err(DIAG.surrogate(after, &token));
         }
         self.chars.next();
         let low_wide = match self.chars.peek() {
             Some('u') => false,
             Some('U') => true,
-            _ => return bad_low("\\"),
+            _ => return Err(DIAG.surrogate(after, "\\")),
         };
         self.chars.next();
-        let (low, low_text) = self.hex_escape(low_wide, &invalid)?;
-        if !(0xDC00..=0xDFFF).contains(&low) {
-            return bad_low(&low_text);
+        let (low, low_text) = self.hex_escape(low_wide, esc_loc)?;
+        if !LOW_SURROGATE.contains(&low) {
+            return Err(DIAG.surrogate(after, &low_text));
         }
-        let combined = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
-        char::from_u32(combined).ok_or_else(invalid)
+        Ok(combine_surrogates(value, low))
     }
 
     /// Read the hex digits of a `\u`/`\U` escape, returning both the value and
@@ -2643,34 +2745,25 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
     fn hex_escape(
         &mut self,
         wide: bool,
-        invalid: &dyn Fn() -> TokenizerError,
+        esc_loc: Location,
     ) -> Result<(u32, String), TokenizerError> {
         let mut value: u32 = 0;
         let mut text = String::from(if wide { "\\U" } else { "\\u" });
         for _ in 0..if wide { 8 } else { 4 } {
-            let c = *self.chars.peek().ok_or_else(invalid)?;
-            let d = c.to_digit(16).ok_or_else(invalid)?;
+            let c = *self
+                .chars
+                .peek()
+                .ok_or_else(|| UnicodeEscapeDiag::ESCAPE_STRING.malformed(esc_loc))?;
+            let d = c
+                .to_digit(16)
+                .ok_or_else(|| UnicodeEscapeDiag::ESCAPE_STRING.malformed(esc_loc))?;
             self.chars.next();
             text.push(c);
             value = value * 16 + d;
         }
         Ok((value, text))
     }
-
-    /// PG reports a half-formed surrogate pair as a plain syntax error rather
-    /// than as an invalid escape, offers no hint, and names the offending token.
-    fn bad_surrogate(loc: Location, token: &str) -> TokenizerError {
-        TokenizerError::pg(
-            DEFAULT_TOKENIZER_SQLSTATE,
-            format!("invalid Unicode surrogate pair at or near \"{token}\""),
-            None,
-            loc,
-        )
-    }
 }
-
-/// PG's hint for a malformed escape in a `U&'…'` literal (`str_udeescape`).
-const UESCAPE_HINT: &str = r"Unicode escapes must be \XXXX or \+XXXXXX.";
 
 fn unescape_unicode_single_quoted_string(chars: &mut State<'_>) -> Result<String, TokenizerError> {
     let mut unescaped = String::new();
@@ -2689,17 +2782,11 @@ fn unescape_unicode_single_quoted_string(chars: &mut State<'_>) -> Result<String
                     return Ok(unescaped);
                 }
             }
-            '\\' => match chars.peek() {
-                Some('\\') => {
-                    chars.next();
-                    unescaped.push('\\');
-                }
-                Some('+') => {
-                    chars.next();
-                    unescaped.push(take_char_from_hex_digits(chars, 6, esc_loc)?);
-                }
-                _ => unescaped.push(take_char_from_hex_digits(chars, 4, esc_loc)?),
-            },
+            '\\' if chars.peek() == Some(&'\\') => {
+                chars.next();
+                unescaped.push('\\');
+            }
+            '\\' => unescaped.push(take_char_from_hex_digits(chars, esc_loc)?),
             _ => {
                 unescaped.push(c);
             }
@@ -2711,32 +2798,61 @@ fn unescape_unicode_single_quoted_string(chars: &mut State<'_>) -> Result<String
     ))
 }
 
-/// A `U&'…'` escape names a code point directly (not a byte), so anything that
-/// is not `max_digits` hex digits forming a valid scalar is PG's
-/// `invalid Unicode escape`, reported at the backslash that opened it.
+/// Read one `U&'…'` escape — `\XXXX`, or `\+XXXXXX` for the six-digit form —
+/// starting just after its backslash, which `esc_loc` names.
+///
+/// These escapes name a code point directly rather than a byte, and carry the
+/// same value rules as their `E'…'` counterparts: zero and anything above
+/// U+10FFFF are rejected, and a UTF-16 surrogate is legal only as half of a
+/// pair, so `U&'\D83D\DE04'` is one character.
 fn take_char_from_hex_digits(
     chars: &mut State<'_>,
-    max_digits: usize,
     esc_loc: Location,
 ) -> Result<char, TokenizerError> {
-    let invalid = || {
-        TokenizerError::pg(
-            DEFAULT_TOKENIZER_SQLSTATE,
-            "invalid Unicode escape",
-            Some(UESCAPE_HINT.to_string()),
-            esc_loc,
-        )
+    const DIAG: UnicodeEscapeDiag = UnicodeEscapeDiag::UNICODE_STRING;
+    let value = read_uescape_digits(chars, esc_loc)?;
+
+    if LOW_SURROGATE.contains(&value) {
+        return Err(DIAG.surrogate(esc_loc, ""));
+    }
+    if !HIGH_SURROGATE.contains(&value) {
+        DIAG.check_value(value, esc_loc, "")?;
+        return char::from_u32(value).ok_or_else(|| DIAG.malformed(esc_loc));
+    }
+
+    // A high surrogate is reported on whatever failed to complete it, so the
+    // low half's own location is what the caret points at.
+    let after = chars.location();
+    if chars.peek() != Some(&'\\') {
+        return Err(DIAG.surrogate(after, ""));
+    }
+    chars.next();
+    let low = read_uescape_digits(chars, after)?;
+    if !LOW_SURROGATE.contains(&low) {
+        return Err(DIAG.surrogate(after, ""));
+    }
+    Ok(combine_surrogates(value, low))
+}
+
+/// The digits of one `U&'…'` escape: `\+` selects the six-digit form, anything
+/// else is four digits.
+fn read_uescape_digits(chars: &mut State<'_>, esc_loc: Location) -> Result<u32, TokenizerError> {
+    let digits = if chars.peek() == Some(&'+') {
+        chars.next();
+        6
+    } else {
+        4
     };
-    let mut result = 0u32;
-    for _ in 0..max_digits {
+    let mut value = 0u32;
+    for _ in 0..digits {
         let digit = chars
             .peek()
             .and_then(|c| c.to_digit(16))
-            .ok_or_else(invalid)?;
+            .ok_or_else(|| UnicodeEscapeDiag::UNICODE_STRING.malformed(esc_loc))?;
         chars.next();
-        result = result * 16 + digit;
+        value = value * 16 + digit;
     }
-    char::from_u32(result).ok_or_else(invalid)
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -3943,19 +4059,25 @@ mod tests {
         check_unescape(r"\z", Some("z"));
         check_unescape(r"\'", Some("'"));
 
-        // A byte that cannot start (or complete) a UTF-8 sequence.
-        check_unescape_err(
-            r"\x80",
-            "22021",
-            "invalid byte sequence for encoding \"UTF8\": 0x80",
-        );
-        check_unescape_err(
-            r"\xc3",
-            "22021",
-            "invalid byte sequence for encoding \"UTF8\": 0xc3",
-        );
-        // NUL is valid UTF-8 but PG still refuses it, however it is spelled.
-        // `\400` overflows to 0x00 rather than erroring on the octal value.
+        // An encoding error names the bytes PG names: the length the lead byte
+        // promises, clipped to what is actually present.
+        for (bad, bytes) in [
+            (r"\x80", "0x80"),
+            (r"\xc3", "0xc3"),
+            (r"\xCAD", "0xca 0x44"),
+            (r"\xe4\xb8", "0xe4 0xb8"),
+            (r"\xe4\xb8\x41", "0xe4 0xb8 0x41"),
+            (r"\xf0\x9f\x98", "0xf0 0x9f 0x98"),
+        ] {
+            check_unescape_err(
+                bad,
+                "22021",
+                &format!("invalid byte sequence for encoding \"UTF8\": {bytes}"),
+            );
+        }
+        // NUL is valid UTF-8 but PG still refuses it. A *byte* escape that
+        // yields zero is an encoding error — `\400` overflows to 0x00 rather
+        // than erroring on the octal value…
         for nul in [r"\0", r"\000", r"\400", r"\x00"] {
             check_unescape_err(
                 nul,
@@ -3963,11 +4085,27 @@ mod tests {
                 "invalid byte sequence for encoding \"UTF8\": 0x00",
             );
         }
+        // …whereas a *code point* escape naming zero is rejected as a bad
+        // escape value, before any byte is produced.
+        for (bad, token) in [(r"\u0000", r"\u0000"), (r"\U00000000", r"\U00000000")] {
+            check_unescape_err(
+                bad,
+                "42601",
+                &format!("invalid Unicode escape value at or near \"{token}\""),
+            );
+        }
 
-        // Malformed `\u`/`\U`.
-        for bad in [r"\uZZZZ", r"\u4c", r"\U00110000"] {
+        // Malformed `\u`/`\U`: too few hex digits, or a non-hex digit.
+        for bad in [r"\uZZZZ", r"\u4c", r"\U0011"] {
             check_unescape_err(bad, "22025", "invalid Unicode escape");
         }
+        // A well-formed escape naming something past the last code point is a
+        // different condition from a malformed one, and carries no hint.
+        check_unescape_err(
+            r"\U00110000",
+            "42601",
+            "invalid Unicode escape value at or near \"\\U00110000\"",
+        );
         // A surrogate half that is never completed. PG names the token that
         // failed to complete the pair: for a high surrogate that is whatever
         // follows it, for an unpaired low surrogate the escape itself.
@@ -3983,6 +4121,50 @@ mod tests {
                 "42601",
                 &format!("invalid Unicode surrogate pair at or near \"{token}\""),
             );
+        }
+    }
+
+    fn uescape_body(s: &str) -> Result<String, TokenizerError> {
+        let s = format!("'{s}'");
+        let mut state = State {
+            peekable: s.chars().peekable(),
+            line: 1,
+            col: 1,
+        };
+        unescape_unicode_single_quoted_string(&mut state)
+    }
+
+    /// `U&'…'` escapes name code points, not bytes, but carry the same value
+    /// rules as their `E'…'` counterparts. Checked against PostgreSQL 18.4 —
+    /// note PG does *not* quote the offending escape in these messages, unlike
+    /// the `E'…'` ones.
+    #[test]
+    fn test_uescape_values() {
+        assert_eq!(uescape_body(r"d\0061t\+000061").as_deref(), Ok("data"));
+        // A surrogate pair combines, exactly as in E'…'.
+        assert_eq!(uescape_body(r"\D83D\DE04").as_deref(), Ok("😄"));
+        assert_eq!(uescape_body(r"\+01F604").as_deref(), Ok("😄"));
+
+        let err = |s: &str| uescape_body(s).expect_err("expected a rejection");
+        // Zero and out-of-range are escape *value* errors, and in particular a
+        // NUL must never reach the resulting text.
+        for bad in [r"\0000", r"a\0000b", r"\+110000"] {
+            let e = err(bad);
+            assert_eq!(e.message, "invalid Unicode escape value", "input: {bad}");
+            assert_eq!(e.sqlstate, Some("42601"), "input: {bad}");
+            assert_eq!(e.hint, None, "input: {bad}");
+        }
+        // A surrogate half that nothing completes.
+        for bad in [r"\D83D", r"\D83DA", r"\DE04", r"\D83D\0041"] {
+            let e = err(bad);
+            assert_eq!(e.message, "invalid Unicode surrogate pair", "input: {bad}");
+            assert_eq!(e.sqlstate, Some("42601"), "input: {bad}");
+        }
+        // A malformed escape keeps its own hint, naming the U& forms.
+        for bad in [r"\ZZZZ", r"\00"] {
+            let e = err(bad);
+            assert_eq!(e.message, "invalid Unicode escape", "input: {bad}");
+            assert_eq!(e.hint.as_deref(), Some(UESCAPE_HINT), "input: {bad}");
         }
     }
 

@@ -38,7 +38,14 @@ impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Result<Self, CompileError> {
         let raw = Tokenizer::new(&PostgreSqlDialect {}, src)
             .tokenize_with_location()
-            .map_err(|e| CompileError::syntax(e.message, e.location.line.max(1) as u32))?;
+            .map_err(|e| {
+                // A lexer error that reproduces a PG diagnostic of its own keeps
+                // that SQLSTATE and hint; anything else is a plain syntax error.
+                let code = e
+                    .sqlstate
+                    .unwrap_or(crabgresql_pg_wire::sqlstate::SYNTAX_ERROR);
+                CompileError::new(code, e.message, e.location.line.max(1) as u32).with_hint(e.hint)
+            })?;
         let mut line_starts = vec![0usize];
         line_starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
 

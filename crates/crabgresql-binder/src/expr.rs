@@ -2743,14 +2743,15 @@ fn bind_like_node(
     let lb = bind_expr(expr, scope)?;
     let rb = bind_expr(pattern, scope)?;
     let escape = match escape_char {
-        Some(v) => match &v.value {
-            ast::Value::SingleQuotedString(s) => Some(Binding::Typed(BoundExpr::Const {
-                value: Value::Text(s.clone()),
+        Some(v) => match v.value.as_pg_string() {
+            Some(s) => Some(Binding::Typed(BoundExpr::Const {
+                value: Value::Text(s.to_string()),
                 ty: PgType::Text,
             })),
-            other => {
+            None => {
                 return Err(BindError::syntax(format!(
-                    "invalid ESCAPE literal: {other}"
+                    "invalid ESCAPE literal: {}",
+                    v.value
                 )));
             }
         },
@@ -2848,24 +2849,20 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
 }
 
 fn bind_value(value: &ast::ValueWithSpan, scope: &Scope) -> Result<Binding, BindError> {
+    // Every character string constant carries plain text by the time it reaches
+    // the binder — the tokenizer has already decoded `E'…'`'s backslash escapes
+    // and `U&'…'`'s code points. They stay `Unknown` (rather than a typed `text`
+    // const) so `E'\t'::name` and context-driven typing keep working.
+    if let Some(s) = value.value.as_pg_string() {
+        return Ok(Binding::Unknown {
+            lit: Some(s.to_string()),
+            span: value.span,
+            param: None,
+        });
+    }
     match &value.value {
         ast::Value::Placeholder(s) => bind_placeholder(s, value.span, scope),
         ast::Value::Number(n, _) => parse_number(n).map(Binding::Typed),
-        // All four quoting styles carry plain text by the time they reach the
-        // binder — the tokenizer has already decoded `E'…'`'s backslash escapes
-        // and `U&'…'`'s code points. They stay `Unknown` (rather than a typed
-        // `text` const) so `E'\t'::name` and context-driven typing keep working.
-        // `N'…'` is a plain string in PG too; the national-character prefix has
-        // no effect on a UTF-8 server.
-        ast::Value::SingleQuotedString(s)
-        | ast::Value::DollarQuotedString(ast::DollarQuotedString { value: s, .. })
-        | ast::Value::EscapedStringLiteral(s)
-        | ast::Value::UnicodeStringLiteral(s)
-        | ast::Value::NationalStringLiteral(s) => Ok(Binding::Unknown {
-            lit: Some(s.clone()),
-            span: value.span,
-            param: None,
-        }),
         ast::Value::Boolean(b) => Ok(Binding::Typed(BoundExpr::Const {
             value: Value::Bool(*b),
             ty: PgType::Bool,
@@ -3310,10 +3307,13 @@ fn coerce_user_cast(
 
 fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
     let target = map_data_type(&ts.data_type)?;
-    let (lit, span) = match &ts.value.value {
-        ast::Value::SingleQuotedString(s) => (Some(s.clone()), ts.value.span),
-        other => {
-            return Err(BindError::syntax(format!("invalid typed literal: {other}")));
+    let (lit, span) = match ts.value.value.as_pg_string() {
+        Some(s) => (Some(s.to_string()), ts.value.span),
+        None => {
+            return Err(BindError::syntax(format!(
+                "invalid typed literal: {}",
+                ts.value.value
+            )));
         }
     };
     let expr = resolve_unknown(lit, span, None, target)?;
@@ -3596,11 +3596,12 @@ pub(crate) fn apply_length_typmod_if_any(
 /// DAY`) sets the default unit for a bare number, and any precision is ignored.
 fn bind_interval(node: &ast::Interval) -> Result<Binding, BindError> {
     let (s, span) = match &*node.value {
-        ast::Expr::Value(v) => match &v.value {
-            ast::Value::SingleQuotedString(s) => (s.clone(), v.span),
-            other => {
+        ast::Expr::Value(v) => match v.value.as_pg_string() {
+            Some(s) => (s.to_string(), v.span),
+            None => {
                 return Err(BindError::syntax(format!(
-                    "invalid interval literal: {other}"
+                    "invalid interval literal: {}",
+                    v.value
                 )));
             }
         },
@@ -6063,16 +6064,17 @@ fn bind_similar_to(
         to_text_operand(bind_expr(pattern, scope)?)?,
     ];
     if let Some(v) = escape_char {
-        match &v.value {
-            ast::Value::SingleQuotedString(s) => {
+        match v.value.as_pg_string() {
+            Some(s) => {
                 args.push(BoundExpr::Const {
-                    value: Value::Text(s.clone()),
+                    value: Value::Text(s.to_string()),
                     ty: PgType::Text,
                 });
             }
-            other => {
+            None => {
                 return Err(BindError::syntax(format!(
-                    "invalid ESCAPE literal: {other}"
+                    "invalid ESCAPE literal: {}",
+                    v.value
                 )));
             }
         }

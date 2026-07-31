@@ -250,10 +250,8 @@ fn option_value(option: &ast::UtilityOption) -> Option<String> {
         ast::Expr::Identifier(ident) => Some(normalize_ident(ident)),
         ast::Expr::Value(value) => match &value.value {
             ast::Value::Number(n, _) => Some(n.to_string()),
-            ast::Value::SingleQuotedString(s) => Some(s.clone()),
-            ast::Value::DollarQuotedString(s) => Some(s.value.clone()),
             ast::Value::Boolean(b) => Some(b.to_string()),
-            _ => None,
+            other => other.as_pg_string().map(str::to_string),
         },
         _ => None,
     }
