@@ -4812,7 +4812,8 @@ fn operand_name(b: &Binding) -> &'static str {
 /// `operator does not exist: <left> <op> <right>` (42883) for the operator
 /// spellings that have no [`BinOp`] — the family resolvers' `@@`, `&&`, `<->`,
 /// `>>`, ... Shared so a mis-typed operand reports a missing operator instead of
-/// a cast failure from inside `coerce_expr`.
+/// a cast failure from inside `coerce_expr`. Carries PG's HINT, as
+/// `custom_op_undefined` does for the `OPERATOR(...)` spelling.
 fn undefined_binary_operator(
     lb: &Binding,
     op: &ast::BinaryOperator,
@@ -4826,6 +4827,11 @@ fn undefined_binary_operator(
             operand_name(rb)
         ),
     )
+    .with_hint(Some(
+        "No operator matches the given name and argument types. \
+         You might need to add explicit type casts."
+            .to_string(),
+    ))
 }
 
 /// 42883 for an `OPERATOR(schema.op)` spelling that names no built-in operator
