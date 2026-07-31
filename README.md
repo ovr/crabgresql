@@ -46,7 +46,11 @@ What exists today:
   and limits — plus buffered (statement-atomic) INSERT/UPDATE/DELETE with
   NOT NULL and immediate composite-uniqueness validation.
 - **Storage** (`crabgresql-storage-api`): the pluggable `TableEngine`/`TableAm`
-  API over a durable 8 KB heap (`crabgresql-pg-engine`), RAM-backed temporary
+  API over a durable 8 KB heap (`crabgresql-pg-engine`) with TOAST — an
+  attribute too wide for a page is stored out of line in a per-table chunk
+  relation and reassembled transparently, so a value of any size round-trips
+  (no compression yet, so a value goes out of line where PostgreSQL would first
+  try to compress it inline) — RAM-backed temporary
   and WAL-skipped unlogged tables, plus managed permanent append-only Snappy
   Parquet tables (`crabgresql-parquet-engine`) selected with
   `CREATE TABLE ... USING parquet ORDER BY (cols)` — append-only per row, with a

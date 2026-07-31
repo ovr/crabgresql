@@ -28,6 +28,12 @@ impl HeapRedo {
         lsn: Lsn,
         f: impl FnOnce(&mut Page),
     ) -> Result<(), WalError> {
+        // Keep the catalog's relfilenode counter above any file this replay
+        // recreates, so a relfilenode issued after recovery can never alias one.
+        // It matters most for a toast relation: created lazily mid-statement, its
+        // id may be above anything the durable catalog names if the crash landed
+        // between the two. The B-tree handler does the same, for the same reason.
+        self.engine.catalog.observe_relfilenode(rel);
         let page = self.engine.bufpool.pin(rel, block)?;
         page.modify(|pg| {
             if page::get_lsn(pg) < lsn.0 {

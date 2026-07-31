@@ -21,7 +21,15 @@ use crate::smgr::RelFileNode;
 
 /// One relation as reflected at startup: its name, heap relfilenode, schema, and
 /// each index paired with the relfilenode of its physical B-tree.
-type ReflectedRelation = (String, RelFileNode, TableSchema, Vec<(IndexMetadata, RelFileNode)>);
+/// A relation as the engine reopens it: its name, heap relfilenode, out-of-line
+/// chunk relfilenode (`RelFileNode(0)` for none), schema, and physical indexes.
+type ReflectedRelation = (
+    String,
+    RelFileNode,
+    RelFileNode,
+    TableSchema,
+    Vec<(IndexMetadata, RelFileNode)>,
+);
 
 const CATALOG_SUBDIR: &str = "global";
 const CATALOG_FILE: &str = "relcatalog";
@@ -87,6 +95,13 @@ const TAM_MAGIC: &[u8; 4] = b"TAM1";
 /// key, which is what every relation written before this tail actually had:
 /// nothing recorded an order.
 const SORT_MAGIC: &[u8; 4] = b"SRT1";
+/// Marks the toast-relation section, appended after the [`SORT_MAGIC`] block — a
+/// twelfth backward-compatible tail carrying the relfilenode of each relation's
+/// out-of-line chunk store (`0` = none). A reader that predates TOAST stops
+/// above and decodes every relation with no toast relation, which is exactly
+/// what every relation written before this tail had: nothing was ever stored out
+/// of line.
+const TOAST_MAGIC: &[u8; 4] = b"TOA1";
 
 struct PersistCol {
     name: String,
@@ -131,6 +146,11 @@ struct PersistRel {
     /// What `ANALYZE` last measured, persisted in the [`STAT_MAGIC`] tail.
     /// `None` means never analyzed.
     stats: Option<PersistStats>,
+    /// The relfilenode of this relation's out-of-line chunk store, persisted in
+    /// the [`TOAST_MAGIC`] tail. `0` means the relation has never needed one —
+    /// the same sentinel `PersistIndex::rel` uses, safe because relfilenodes
+    /// start at 1.
+    toast_rel: u32,
 }
 
 /// A persisted `ANALYZE` result. Relation-level only for now; `ncols` is written
@@ -241,6 +261,7 @@ impl RelCatalog {
                 (
                     r.name.clone(),
                     RelFileNode(r.rel),
+                    RelFileNode(r.toast_rel),
                     TableSchema {
                         name: r.name.clone(),
                         namespace: r.namespace.clone(),
@@ -302,6 +323,8 @@ impl RelCatalog {
             partition_scheme: schema.partition_scheme.clone(),
             partition_of: schema.partition_of.clone(),
             sort_key: schema.sort_key.clone(),
+            // No chunk store until a row needs one.
+            toast_rel: 0,
             // A brand-new relation has never been analyzed.
             stats: None,
         });
@@ -518,10 +541,12 @@ impl RelCatalog {
             .map(|r| RelFileNode(r.rel))
     }
 
-    /// Every live relfilenode in the catalog — each table's heap file **and**
-    /// each index's physical B-tree file — for the startup orphan-file GC. Index
-    /// files must be included or `gc_orphan_relfiles` would delete them on the
-    /// next restart.
+    /// Every live relfilenode in the catalog — each table's heap file, each
+    /// index's physical B-tree file, **and** each table's out-of-line chunk store
+    /// — for the startup orphan-file GC. Every one of those must be included or
+    /// `gc_orphan_relfiles` would delete it on the next restart: for a toast
+    /// relation that would leave every out-of-line attribute in the table
+    /// pointing at a file that no longer exists.
     pub fn live_relfilenodes(&self) -> Vec<u32> {
         let state = self
             .state
@@ -532,9 +557,66 @@ impl RelCatalog {
             .iter()
             .flat_map(|r| {
                 std::iter::once(r.rel)
-                    .chain(r.indexes.iter().map(|i| i.rel).filter(|&rel| rel != 0))
+                    .chain(std::iter::once(r.toast_rel))
+                    .chain(r.indexes.iter().map(|i| i.rel))
+                    .filter(|&rel| rel != 0)
             })
             .collect()
+    }
+
+    /// Record `rel` as `table`'s out-of-line chunk store and persist the catalog.
+    ///
+    /// The persist is the durability commit point for the toast relation: the
+    /// caller must complete it *before* writing any chunk, or a crash would leave
+    /// chunks in a file the next startup's orphan sweep unlinks. Keeps `next`
+    /// above `rel` so the relfilenode is never reused.
+    pub fn set_toast_rel(
+        &self,
+        namespace: &str,
+        table: &str,
+        rel: RelFileNode,
+    ) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state.next = state.next.max(rel.0.saturating_add(1));
+        let Some(r) = state
+            .rels
+            .iter_mut()
+            .find(|r| r.namespace == namespace && r.name == table)
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("relation \"{namespace}.{table}\" does not exist"),
+            ));
+        };
+        r.toast_rel = rel.0;
+        self.persist(&state)
+    }
+
+    /// Record that `table` has no chunk store — what a committed TRUNCATE leaves
+    /// behind, since the empty file it swaps in points at nothing.
+    ///
+    /// A no-op when none was recorded, so the common TRUNCATE of a table that
+    /// never toasted anything costs no catalog rewrite.
+    pub fn clear_toast_rel(&self, namespace: &str, table: &str) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(r) = state
+            .rels
+            .iter_mut()
+            .find(|r| r.namespace == namespace && r.name == table)
+        else {
+            return Ok(());
+        };
+        if r.toast_rel == 0 {
+            return Ok(());
+        }
+        r.toast_rel = 0;
+        self.persist(&state)
     }
 
     /// Each `Unlogged` relation's `(heap relfilenode, physical index relfilenodes)`.
@@ -550,10 +632,15 @@ impl RelCatalog {
             .iter()
             .filter(|r| r.persistence.is_unlogged())
             .map(|r| {
+                // The chunk store rides along: its pages are WAL-skipped for the
+                // same reason the heap's are, so a crash leaves it just as
+                // untrustworthy and it must be emptied with the rows that named
+                // its chunks.
                 let indexes = r
                     .indexes
                     .iter()
                     .map(|i| i.rel)
+                    .chain(std::iter::once(r.toast_rel))
                     .filter(|&rel| rel != 0)
                     .map(RelFileNode)
                     .collect();
@@ -1125,6 +1212,14 @@ fn encode(state: &State) -> Vec<u8> {
     for r in &rels {
         put_index_keys(&mut out, &r.sort_key);
     }
+    // Toast relfilenodes: a twelfth backward-compatible tail. Absent in a
+    // pre-TOAST file, where every relation decodes with `0` — no chunk store,
+    // which is what those relations actually have.
+    out.extend_from_slice(TOAST_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        out.extend_from_slice(&r.toast_rel.to_le_bytes());
+    }
     out
 }
 
@@ -1297,6 +1392,8 @@ fn decode(bytes: &[u8]) -> State {
             sort_key: Vec::new(),
             // Default to never analyzed; overridden below from the STA1 tail.
             stats: None,
+            // Default to no chunk store; overridden below from the TOA1 tail.
+            toast_rel: 0,
         });
     }
     if d.remaining().starts_with(META_MAGIC) {
@@ -1575,6 +1672,15 @@ fn decode(bytes: &[u8]) -> State {
             r.sort_key = d.index_keys();
         }
     }
+    // Toast-relation tail: absent means nothing was ever stored out of line,
+    // which is both the legacy state and the state of a table of narrow columns.
+    if d.remaining().starts_with(TOAST_MAGIC) {
+        d.p += TOAST_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            r.toast_rel = d.u32();
+        }
+    }
     State {
         next,
         rels,
@@ -1666,7 +1772,7 @@ mod tests {
         drop(catalog);
 
         let loaded = RelCatalog::load(dir.path())?;
-        let (_, _, schema, indexes) = loaded
+        let (_, _, _, schema, indexes) = loaded
             .schemas()
             .pop()
             .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
@@ -1685,7 +1791,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("metadata marker is missing"))?;
         std::fs::write(&path, &bytes[..tail])?;
         let legacy = RelCatalog::load(dir.path())?;
-        let (_, _, schema, indexes) = legacy
+        let (_, _, _, schema, indexes) = legacy
             .schemas()
             .pop()
             .ok_or_else(|| anyhow::anyhow!("legacy catalog is empty"))?;
@@ -1713,8 +1819,8 @@ mod tests {
             loaded
                 .schemas()
                 .into_iter()
-                .find(|(rel_name, _, _, _)| rel_name == name)
-                .map(|(_, _, schema, _)| schema.access_method)
+                .find(|(rel_name, _, _, _, _)| rel_name == name)
+                .map(|(_, _, _, schema, _)| schema.access_method)
         };
         // Every method must survive the round trip, not just the first one added:
         // the tail is one byte per relation, so a missed discriminant would
@@ -1733,7 +1839,7 @@ mod tests {
         let legacy = RelCatalog::load(dir.path())?;
         let schemas = legacy.schemas();
         assert!(!schemas.is_empty(), "legacy catalog is empty");
-        for (name, _, schema, _) in schemas {
+        for (name, _, _, schema, _) in schemas {
             assert_eq!(
                 schema.access_method,
                 TableAccessMethod::Heap,
@@ -1784,8 +1890,8 @@ mod tests {
             loaded
                 .schemas()
                 .into_iter()
-                .find(|(rel_name, _, _, _)| rel_name == name)
-                .map(|(_, _, schema, _)| schema.sort_key)
+                .find(|(rel_name, _, _, _, _)| rel_name == name)
+                .map(|(_, _, _, schema, _)| schema.sort_key)
         };
         assert_eq!(key("events"), Some(schema.sort_key.clone()));
         // A heap relation declares no order, and the tail must not borrow its
@@ -1803,12 +1909,68 @@ mod tests {
         let legacy = RelCatalog::load(dir.path())?;
         let schemas = legacy.schemas();
         assert!(!schemas.is_empty(), "legacy catalog is empty");
-        for (name, _, schema, _) in schemas {
+        for (name, _, _, schema, _) in schemas {
             assert!(
                 schema.sort_key.is_empty(),
                 "a catalog written before the tail existed must decode with no order ({name})"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn toast_relfilenode_survives_and_a_pre_toast_catalog_decodes_with_none()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new(
+            "wide",
+            vec![Column::new("body", PgType::Text)],
+        ))?;
+        catalog.create(&TableSchema::new(
+            "narrow",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        catalog.set_toast_rel("public", "wide", RelFileNode(77))?;
+        drop(catalog);
+
+        let loaded = RelCatalog::load(dir.path())?;
+        let toast = |name: &str| {
+            loaded
+                .schemas()
+                .into_iter()
+                .find(|(rel_name, _, _, _, _)| rel_name == name)
+                .map(|(_, _, toast, _, _)| toast)
+        };
+        assert_eq!(toast("wide"), Some(RelFileNode(77)));
+        // A table that never toasted anything must not borrow its neighbour's
+        // relfilenode when the tail is zipped back on by position.
+        assert_eq!(toast("narrow"), Some(RelFileNode(0)));
+        // The chunk store must be visible to the startup orphan sweep, or the
+        // next restart unlinks it and every pointer into it dangles.
+        assert!(loaded.live_relfilenodes().contains(&77));
+        drop(loaded);
+
+        // Truncate the file at the tail marker to stand in for a catalog written
+        // before TOAST existed: it must still load, with no chunk store anywhere.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(TOAST_MAGIC.len())
+            .position(|window| window == TOAST_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("toast marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        let schemas = legacy.schemas();
+        assert!(!schemas.is_empty(), "legacy catalog is empty");
+        for (name, _, toast, _, _) in schemas {
+            assert_eq!(
+                toast,
+                RelFileNode(0),
+                "a catalog written before the tail existed must decode with no chunk store ({name})"
+            );
+        }
+        assert!(!legacy.live_relfilenodes().contains(&0));
         Ok(())
     }
 
@@ -1842,7 +2004,7 @@ mod tests {
 
         // Reload: the relfilenode round-trips through the IXR1 tail.
         let loaded = RelCatalog::load(dir.path())?;
-        let (_, _, _, indexes) = loaded
+        let (_, _, _, _, indexes) = loaded
             .schemas()
             .pop()
             .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
@@ -1886,7 +2048,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("index-relfilenode marker is missing"))?;
         std::fs::write(&path, &bytes[..tail])?;
         let legacy = RelCatalog::load(dir.path())?;
-        let (_, _, _, indexes) = legacy
+        let (_, _, _, _, indexes) = legacy
             .schemas()
             .into_iter()
             .find(|(name, ..)| name == "u")
@@ -2075,14 +2237,14 @@ mod tests {
         let loaded = RelCatalog::load(dir.path())?;
         let mut schemas = loaded.schemas();
         schemas.sort_by(|a, b| a.0.cmp(&b.0));
-        let (_, _, parent_schema, _) = &schemas[0];
+        let (_, _, _, parent_schema, _) = &schemas[0];
         assert_eq!(parent_schema.name, "m");
         assert_eq!(
             parent_schema.partition_scheme.as_ref().map(|s| &s.key_columns),
             Some(&vec![1])
         );
         assert!(parent_schema.partition_of.is_none());
-        let (_, _, child_schema, _) = &schemas[1];
+        let (_, _, _, child_schema, _) = &schemas[1];
         assert_eq!(child_schema.name, "m_2024");
         assert!(child_schema.partition_scheme.is_none());
         let part = child_schema
@@ -2112,7 +2274,7 @@ mod tests {
             legacy
                 .schemas()
                 .iter()
-                .all(|(_, _, schema, _)| schema.partition_scheme.is_none()
+                .all(|(_, _, _, schema, _)| schema.partition_scheme.is_none()
                     && schema.partition_of.is_none())
         );
 
@@ -2144,7 +2306,7 @@ mod tests {
         let mut namespaces: Vec<(String, String)> = loaded
             .schemas()
             .into_iter()
-            .map(|(name, _, schema, _)| (schema.namespace, name))
+            .map(|(name, _, _, schema, _)| (schema.namespace, name))
             .collect();
         namespaces.sort();
         assert_eq!(
@@ -2180,7 +2342,7 @@ mod tests {
             legacy
                 .schemas()
                 .iter()
-                .all(|(_, _, schema, _)| schema.namespace == "public")
+                .all(|(_, _, _, schema, _)| schema.namespace == "public")
         );
 
         Ok(())

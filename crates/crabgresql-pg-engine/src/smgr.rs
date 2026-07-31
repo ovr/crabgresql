@@ -276,7 +276,21 @@ impl StorageManager {
         let f = self.file(rel)?;
         let mut f = f.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         f.seek(SeekFrom::Start(block as u64 * BLCKSZ as u64))?;
-        f.read_exact(buf)?;
+        // A block at or past the file's end reads as an all-zero page, the same
+        // answer the memory path gives above. Redo reaches this case: a relation
+        // whose file was created but never extended before the crash has zero
+        // blocks, and a `read_exact` there would abort recovery rather than hand
+        // back the fresh page the handler is about to overwrite.
+        buf.fill(0);
+        if let Err(e) = f.read_exact(buf) {
+            if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                return Err(e);
+            }
+            // `read_exact` leaves the buffer unspecified on a short read, so a
+            // partially-filled block cannot be trusted; report the fresh page.
+            buf.fill(0);
+            return Ok(());
+        }
         if buf.iter().all(|&b| b == 0) {
             return Ok(());
         }

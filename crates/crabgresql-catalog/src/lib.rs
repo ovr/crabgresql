@@ -30,8 +30,8 @@ mod static_table;
 use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::{
-    Column, IndexMetadata, RelStats, RelationMetadata, StorageError, TableAm, TableEngine,
-    TableSchema,
+    Column, IndexMetadata, RelPersistence, RelStats, RelationMetadata, StorageError, TableAm,
+    TableEngine, TableSchema,
 };
 use crabgresql_types::{PgType, Value};
 
@@ -43,12 +43,35 @@ pub use static_table::StaticTable;
 /// This preserves catalog-wide uniqueness in every reflected snapshot.
 const FIRST_REL_OID: u32 = 0x4000_0000;
 
+/// The namespace PostgreSQL keeps TOAST relations in. Never on the search path,
+/// so nothing here is reachable by an unqualified name.
+const TOAST_NAMESPACE: &str = "pg_toast";
+
 #[derive(Clone)]
 struct CatalogIndex {
     oid: u32,
     table_oid: u32,
     table_schema: TableSchema,
     metadata: IndexMetadata,
+}
+
+/// A table's out-of-line ("TOAST") relation, as `pg_class` publishes it.
+///
+/// PostgreSQL puts one of these in the `pg_toast` namespace for every table with
+/// a varlena column and points the table's `reltoastrelid` at it. Ours is
+/// created lazily — only once a row actually needs it — so a table of narrow
+/// columns keeps `reltoastrelid = 0`, which is also legitimate PostgreSQL state
+/// (it is what `\d` reports for a table with no TOAST relation).
+struct CatalogToast {
+    oid: u32,
+    /// The `pg_class` OID of the table this belongs to, whose `reltoastrelid`
+    /// names `oid`.
+    table_oid: u32,
+    /// PostgreSQL's name for it: `pg_toast_<parent oid>`.
+    name: String,
+    /// Mirrors the parent's, as PostgreSQL's does.
+    persistence: RelPersistence,
+    stats: RelStats,
 }
 
 /// A built-in `pg_type` row, generated from `pg_type.dat`. Field types mirror
@@ -196,6 +219,10 @@ pub struct CatalogRelation {
     /// [`RelStats::unknown`], which renders as PostgreSQL's never-analyzed
     /// sentinel; sequences are reported from their fixed shape instead.
     pub stats: RelStats,
+    /// The size of this relation's out-of-line ("TOAST") storage, or `None` if it
+    /// has none. `Some` is what gives the relation a `pg_toast.pg_toast_<oid>`
+    /// row and a non-zero `pg_class.reltoastrelid`.
+    pub toast: Option<RelStats>,
 }
 
 /// The relkind of a stored user relation: a partitioned parent (carrying a
@@ -223,6 +250,7 @@ impl CatalogRelation {
             kind,
             sequence: None,
             stats,
+            toast: None,
         }
     }
 
@@ -237,6 +265,7 @@ impl CatalogRelation {
             kind,
             sequence: None,
             stats: metadata.stats,
+            toast: metadata.toast,
         }
     }
 
@@ -251,6 +280,7 @@ impl CatalogRelation {
             kind,
             sequence: None,
             stats,
+            toast: None,
         }
     }
 
@@ -266,6 +296,7 @@ impl CatalogRelation {
             kind: RelKind::View,
             sequence: None,
             stats,
+            toast: None,
         }
     }
 
@@ -296,6 +327,7 @@ impl CatalogRelation {
             kind: RelKind::Sequence,
             sequence: Some(params),
             stats,
+            toast: None,
         }
     }
 }
@@ -395,6 +427,7 @@ pub struct SystemCatalog {
     kinds: OnceLock<Vec<RelKind>>,
     stats: OnceLock<Vec<RelStats>>,
     index_oids: OnceLock<Vec<CatalogIndex>>,
+    toast_oids: OnceLock<Vec<CatalogToast>>,
     user_types: OnceLock<Vec<CatalogUserType>>,
     routines: OnceLock<Vec<CatalogRoutine>>,
     user_schemas: OnceLock<Vec<(String, u32)>>,
@@ -447,6 +480,7 @@ impl SystemCatalog {
             kinds: OnceLock::new(),
             stats: OnceLock::new(),
             index_oids: OnceLock::new(),
+            toast_oids: OnceLock::new(),
             user_types: OnceLock::new(),
             routines: OnceLock::new(),
             user_schemas: OnceLock::new(),
@@ -521,7 +555,7 @@ impl SystemCatalog {
     fn namespace_oids(&self) -> std::collections::HashMap<String, u32> {
         let mut map = std::collections::HashMap::new();
         map.insert("pg_catalog".to_string(), 11);
-        map.insert("pg_toast".to_string(), 99);
+        map.insert(TOAST_NAMESPACE.to_string(), 99);
         map.insert("public".to_string(), 2200);
         for (name, oid) in self.user_schemas() {
             map.insert(name.clone(), *oid);
@@ -624,6 +658,45 @@ impl SystemCatalog {
         })
     }
 
+    /// The TOAST relations of this snapshot, assigned OIDs from a **third block**
+    /// that begins after the index block.
+    ///
+    /// Ordering matters: relations occupy `[FIRST_REL_OID, +nrels)` and indexes
+    /// the range straight after, both keyed by position in a sorted list. Putting
+    /// TOAST relations last means adding them shifted no OID that already
+    /// existed. They are deliberately absent from
+    /// [`SystemCatalog::live_relations`], so they never enter unqualified name
+    /// resolution or `pg_table_is_visible` — matching PostgreSQL, where
+    /// `pg_toast` is never on the search path.
+    fn toast_oids(&self) -> &[CatalogToast] {
+        self.toast_oids.get_or_init(|| {
+            let mut relations = self.live_relations().to_vec();
+            relations.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            let first_toast_oid = FIRST_REL_OID + relations.len() as u32 + self.index_oids().len() as u32;
+            relations
+                .into_iter()
+                .enumerate()
+                .filter_map(|(position, relation)| {
+                    let table_oid = FIRST_REL_OID + position as u32;
+                    relation.toast.map(|stats| (table_oid, relation.schema, stats))
+                })
+                .enumerate()
+                .map(|(slot, (table_oid, schema, stats))| CatalogToast {
+                    oid: first_toast_oid + slot as u32,
+                    table_oid,
+                    // PostgreSQL names it after the parent's OID.
+                    name: format!("pg_toast_{table_oid}"),
+                    persistence: schema.persistence,
+                    stats,
+                })
+                .collect()
+        })
+    }
+
     /// The name of the role `oid` identifies, or `None` if no role has that OID.
     /// Every catalog row reports [`schema::BOOTSTRAP_ROLE_OID`] as its owner
     /// (crabgresql has no role catalog), so exactly one OID resolves — to this
@@ -660,11 +733,17 @@ impl SystemCatalog {
             return (*stored == oid)
                 .then_some((schema.namespace.as_str(), schema.name.as_str()));
         }
-        let index = self.index_oids().get(offset - relations.len())?;
-        (index.oid == oid).then_some((
-            index.table_schema.namespace.as_str(),
-            index.metadata.name.as_str(),
-        ))
+        let indexes = self.index_oids();
+        if let Some(index) = indexes.get(offset - relations.len()) {
+            return (index.oid == oid).then_some((
+                index.table_schema.namespace.as_str(),
+                index.metadata.name.as_str(),
+            ));
+        }
+        let toast = self
+            .toast_oids()
+            .get(offset - relations.len() - indexes.len())?;
+        (toast.oid == oid).then_some((TOAST_NAMESPACE, toast.name.as_str()))
     }
 
     /// The OID of `namespace.name` in this snapshot, or `None` if it holds no
@@ -752,12 +831,17 @@ impl SystemCatalog {
                     self.relation_kinds(),
                     self.relation_stats(),
                     self.index_oids(),
+                    self.toast_oids(),
                     &self.namespace_oids(),
                 ),
             )),
             "pg_attribute" => Some((
                 schema::pg_attribute_schema(),
-                schema::pg_attribute_rows(self.relation_oids(), self.index_oids()),
+                schema::pg_attribute_rows(
+                    self.relation_oids(),
+                    self.index_oids(),
+                    self.toast_oids(),
+                ),
             )),
             "pg_attrdef" => Some((
                 schema::pg_attrdef_schema(),
@@ -1221,8 +1305,9 @@ mod tests {
             )
         };
 
-        // No CHECK constraints, triggers, row security, typed tables, TOAST, or
-        // non-default tablespace exist here — but each column still answers.
+        // No CHECK constraints, triggers, row security, typed tables, or
+        // non-default tablespace exist here, and nothing has been stored out of
+        // line — but each column still answers.
         for col in [
             "relchecks",
             "relhastriggers",
@@ -1693,6 +1778,101 @@ mod tests {
         // No visibility map is kept, so nothing is ever all-visible.
         assert_eq!(cell("measured", "relallvisible")?, Value::Int4(0));
 
+        Ok(())
+    }
+
+    #[test]
+    fn a_toast_relation_is_published_and_its_parent_points_at_it() -> anyhow::Result<()> {
+        // `reltoastrelid` is a foreign key into `pg_class.oid`, so publishing the
+        // row is what makes a non-zero value safe rather than a dangling
+        // reference. A table that has never stored anything out of line keeps 0,
+        // which is what PostgreSQL reports for a table with no TOAST relation.
+        fn plain(name: &str) -> TableSchema {
+            TableSchema::new(name, vec![Column::new("id", PgType::Int4)])
+        }
+        let cat = SystemCatalog::with_catalog_relations_fn("db", "owner", move || {
+            let mut toasted = CatalogRelation::permanent(plain("toasted"));
+            toasted.toast = Some(RelStats {
+                relpages: 7,
+                reltuples: 0.0,
+                analyzed: false,
+                columns: Vec::new(),
+            });
+            vec![CatalogRelation::permanent(plain("bare")), toasted]
+        });
+
+        let (schema, rows) = required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?;
+        let col = |name: &str| required(schema.column_index(name), name);
+        let (relname, oid, toastrel) = (col("relname")?, col("oid")?, col("reltoastrelid")?);
+        let row = |name: &str| {
+            rows.iter()
+                .find(|r| r[relname] == Value::Text(name.to_string()))
+                .cloned()
+        };
+
+        let toasted = required(row("toasted"), "toasted")?;
+        let Value::Oid(toast_oid) = toasted[toastrel] else {
+            anyhow::bail!("reltoastrelid is not an OID");
+        };
+        assert_ne!(toast_oid, 0, "a relation with out-of-line storage names it");
+        assert_eq!(
+            required(row("bare"), "bare")?[toastrel],
+            Value::Oid(0),
+            "a relation with none must not borrow its neighbour's"
+        );
+
+        // The OID resolves to a real row, in `pg_toast`, named after its parent.
+        let toast_row = required(
+            rows.iter().find(|r| r[oid] == Value::Oid(toast_oid)).cloned(),
+            "the toast relation has no pg_class row",
+        )?;
+        let Value::Oid(parent_oid) = toasted[oid] else {
+            anyhow::bail!("oid is not an OID");
+        };
+        assert_eq!(
+            toast_row[relname],
+            Value::Text(format!("pg_toast_{parent_oid}"))
+        );
+        assert_eq!(toast_row[col("relkind")?], Value::Text("t".to_string()));
+        assert_eq!(toast_row[col("relnamespace")?], Value::Oid(99));
+        assert_eq!(toast_row[col("relpages")?], Value::Int4(7));
+        // We chain chunks by ctid rather than indexing them, so claiming an index
+        // would be the dangling reference this row exists to avoid.
+        assert_eq!(toast_row[col("relhasindex")?], Value::Bool(false));
+
+        // Every OID is distinct: the toast block sits after the index block, so
+        // it can neither collide with nor shift an existing assignment.
+        let mut oids: Vec<&Value> = rows.iter().map(|r| &r[oid]).collect();
+        let total = oids.len();
+        oids.sort_by_key(|v| match v {
+            Value::Oid(o) => *o,
+            _ => 0,
+        });
+        oids.dedup();
+        assert_eq!(oids.len(), total, "pg_class OIDs must be unique");
+
+        // Its columns join, so `relnatts` is not a claim without rows behind it.
+        let (aschema, arows) =
+            required(cat.build_pg_catalog("pg_attribute"), "pg_attribute is missing")?;
+        let attrelid = required(aschema.column_index("attrelid"), "attrelid")?;
+        let attname = required(aschema.column_index("attname"), "attname")?;
+        let names: Vec<String> = arows
+            .iter()
+            .filter(|r| r[attrelid] == Value::Oid(toast_oid))
+            .map(|r| match &r[attname] {
+                Value::Text(s) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["chunk_id", "chunk_seq", "chunk_data"]);
+
+        // A toast relation is not a user relation: it must not be reachable by an
+        // unqualified name, which is why it never enters `live_relations`.
+        assert_eq!(cat.relation_oid_in("public", "pg_toast_1"), None);
+        assert_eq!(
+            cat.relation_ref(toast_oid),
+            Some(("pg_toast", format!("pg_toast_{parent_oid}").as_str()))
+        );
         Ok(())
     }
 }

@@ -173,6 +173,7 @@ impl From<StorageError> for BindError {
             }
             StorageError::Io(_) => sqlstate::IO_ERROR,
             StorageError::CorruptData(_) => "XX001",
+            StorageError::RowTooBig { .. } => sqlstate::PROGRAM_LIMIT_EXCEEDED,
         };
         Self::new(code, e.to_string())
     }

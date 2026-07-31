@@ -67,6 +67,22 @@ const T_LINE: u8 = 41;
 const T_CIRCLE: u8 = 42;
 const T_POLYGON: u8 = 43;
 
+// Tags at 200 and above are NOT value kinds. They are storage-layer markers that
+// an access method resolves before this codec is reached, and they live in their
+// own range so the sequential block above stays free for real types — a marker
+// sitting in that block collides with the next type someone adds.
+/// Reserved for the heap access method's out-of-line ("toasted") attribute
+/// pointer. Deliberately **never produced by [`encode_datum`] and never accepted
+/// by [`decode_datum`]**: reassembling one needs a buffer pool this module has
+/// no access to, and the two other consumers of this codec — the relation
+/// catalog's partition bounds and the buffer engine's WAL rows — have no way to
+/// resolve it. The heap's tuple codec recognises the tag itself, before handing
+/// the remaining bytes here.
+///
+/// Reserving it here rather than in the heap keeps this tag registry the single
+/// place a new on-disk kind is claimed, so nothing can reuse 200 by accident.
+pub const T_EXTERNAL: u8 = 200;
+
 fn put_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);

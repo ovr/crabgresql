@@ -272,6 +272,7 @@ impl From<StorageError> for ExecError {
             StorageError::TableAlreadyExists(_) | StorageError::RelationAlreadyExists(_) => "42P07",
             StorageError::SchemaAlreadyExists(_) => "42P06",
             StorageError::SchemaNotFound(_) => "3F000",
+            StorageError::RowTooBig { .. } => "54000",
         };
         Self::new(code, error.to_string())
     }

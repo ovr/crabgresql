@@ -668,6 +668,59 @@ The implementation sequence for this design lives in
                     └────────────────────────────────────────┘
 ```
 
+### 3.0 Out-of-line attribute storage (TOAST)
+
+The heap requires a tuple to fit one 8 KB page. An attribute too wide for that
+is written to a **chunk relation** — a second relfilenode owned by the table —
+and replaced in the tuple by a fixed-width pointer under a datum tag the value
+codec never emits. `crabgresql-pg-engine/src/toast.rs` holds the format; the
+seam is `tuple::decode_raw` (inline datums, safe under the page's frame lock)
+followed by `RawTuple::resolve` (reassembly, deliberately after the lock drops).
+
+What is stored out of line is exactly the bytes an inline datum would have been,
+so detoasting is `concat(chunks)` then an ordinary decode — `text`, `bytea`,
+`json`, `jsonb`, arrays and `tsvector` all take one path with no per-type logic.
+
+Three choices worth knowing, all reproducing PostgreSQL's *behavior* rather than
+its implementation:
+
+- **Chunks are chained, not indexed.** PostgreSQL gives each value a `chunk_id`
+  and indexes the chunk relation on `(chunk_id, chunk_seq)`. We put the first
+  chunk's tid in the pointer and link each chunk to its successor through the
+  on-page `ctid` field, which needs no sequence, no index and no index
+  maintenance. The cost is that reads are strictly sequential — a slice read
+  cannot skip ahead — and that the chunk relation cannot be vacuumed on its own.
+  The pointer's `format` byte is the versioning seam if that trade stops paying.
+- **A chunk is an ordinary on-page tuple**, with `natts = 0` and the `ctid` field
+  repurposed as the chain link. So chunk writes reuse the heap's placement path
+  and log `HEAP_INSERT`, reclamation logs `HEAP_VACUUM`, and crash recovery needs
+  no new code: the heap's redo handler applies those records to a page without
+  caring which relfilenode it belongs to. No new resource manager exists.
+- **Reclamation is driven from the heap side.** Nothing is freed eagerly — not on
+  UPDATE, not on DELETE, not on abort — because a chain must stay readable for as
+  long as any snapshot can reach the tuple naming it. `VACUUM` frees the heap
+  slots first and the chunks second; a crash in that gap leaks chunks nothing
+  references, where the other order would free chunks a later write had reused.
+
+Ordering that makes it crash-safe: the chunk relfilenode reaches the durable
+catalog before any chunk reaches the log (or the startup orphan sweep would
+unlink the file), and the chunks are logged before the tuple pointing at them
+(the WAL's total order then guarantees a pointer can never become durable ahead
+of its target — no extra fsync involved).
+
+Not implemented: **compression**. PostgreSQL compresses before externalizing, so
+a few-KB value stays inline there and goes out of line here. Also not
+implemented: per-attribute `attstorage` / `ALTER TABLE ... SET STORAGE`. And the
+chunk relation is created lazily, on the first row that needs it, where
+PostgreSQL creates one at `CREATE TABLE` for any table with a variable-length
+column — so `pg_class.reltoastrelid` stays 0 for longer than PostgreSQL's does
+(0 is itself legitimate PostgreSQL state, reported for a table with no TOAST
+relation).
+
+A row that still does not fit once everything eligible has been moved out —
+one whose columns are all fixed-width — raises `54000 program_limit_exceeded`,
+`row is too big: size N, maximum size 8160`.
+
 ### 3.1 Catalog
 
 - `pg_catalog` — real tables (pg_class, pg_attribute, pg_type, pg_proc,

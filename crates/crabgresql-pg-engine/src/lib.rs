@@ -13,11 +13,15 @@
 //! `Temporary` (RAM-backed, WAL-skipped, gone on restart). Only the WAL and the
 //! backing store differ; visibility is identical.
 //!
+//! An attribute too wide to keep on a page is stored out of line in a per-table
+//! chunk relation ([`toast`]); compression is not implemented, so a value goes
+//! out of line where PostgreSQL would first try to compress it inline.
+//!
 //! Deliberately deferred to keep this first cut tractable (all documented in
-//! `docs/ARCHITECTURE.md §3`): TOAST (a tuple must fit one page), a durable SLRU
-//! CLOG and checkpoint-bounded recovery (recovery replays the whole WAL),
-//! full-page writes / torn-page protection beyond page checksums, WAL segment
-//! recycling, and a transactional relation catalog.
+//! `docs/ARCHITECTURE.md §3`): a durable SLRU CLOG and checkpoint-bounded
+//! recovery (recovery replays the whole WAL), full-page writes / torn-page
+//! protection beyond page checksums, WAL segment recycling, and a transactional
+//! relation catalog.
 
 mod analyze;
 mod btkey;
@@ -33,6 +37,7 @@ mod page;
 mod rec;
 mod redo;
 mod smgr;
+mod toast;
 mod tuple;
 
 use std::collections::HashMap;
@@ -193,6 +198,10 @@ impl TableAm for ManagedTable {
 
     fn statistics(&self) -> RelStats {
         self.as_am().statistics()
+    }
+
+    fn toast_statistics(&self) -> Option<RelStats> {
+        self.as_am().toast_statistics()
     }
 
     fn storage_leaves(&self) -> Option<Vec<Arc<dyn TableAm>>> {
@@ -389,7 +398,7 @@ impl PgEngine {
             Arc::new(CatalogAllocator(Arc::clone(&catalog)));
 
         let mut tables = HashMap::new();
-        for (name, rel, schema, indexes) in catalog.schemas() {
+        for (name, rel, toast_rel, schema, indexes) in catalog.schemas() {
             let namespace = schema.namespace.clone();
             let analyzed = catalog.stats_in(&namespace, &name);
             let table = match schema.access_method {
@@ -397,6 +406,7 @@ impl PgEngine {
                     let table = Arc::new(HeapTable::new(
                         Arc::clone(&inner),
                         rel,
+                        toast_rel,
                         schema,
                         indexes,
                     ));
@@ -1184,15 +1194,23 @@ impl TxnFinalize for PgEngine {
                 // strand the lock and wedge the table for the process lifetime).
                 // The lock is held across the persist so a concurrent TRUNCATE that
                 // commits can't have its catalog write clobbered by a stale one.
-                if let Some((old, owner)) = t.commit_truncate(xid) {
+                if let Some((old, old_toast, owner)) = t.commit_truncate(xid) {
                     // The commit is already durable in the WAL, so a catalog persist
                     // failure is not fatal — recovery re-applies the swap from the
                     // WAL at the next boot; log and continue rather than panic. (A
                     // memory/temp table writes no WAL and its catalog row is not
                     // persisted, so the swap only updates in-memory state.)
-                    if let Err(e) = self
-                        .catalog
-                        .swap_relfilenode(&namespace, &name, t.relfilenode())
+                    // Record the chunk store the swap published *before* the heap
+                    // swap, so the catalog never names a heap file whose chunk
+                    // store it has not yet recorded — the direction that would let
+                    // the startup sweep unlink a store the new file points into.
+                    let toast_persisted = match t.toast_relfilenode() {
+                        Some(rel) => self.catalog.set_toast_rel(&namespace, &name, rel),
+                        // Truncated back to no chunk store at all.
+                        None => self.catalog.clear_toast_rel(&namespace, &name),
+                    };
+                    if let Err(e) = toast_persisted
+                        .and_then(|()| self.catalog.swap_relfilenode(&namespace, &name, t.relfilenode()))
                     {
                         tracing::error!(
                             table = %name,
@@ -1208,6 +1226,11 @@ impl TxnFinalize for PgEngine {
                         t.truncate_reconciled();
                     }
                     self.inner.discard_relfile(old);
+                    // The new heap file is empty, so nothing points into the old
+                    // chunk store any more.
+                    if old_toast.0 != 0 {
+                        self.inner.discard_relfile(old_toast);
+                    }
                     t.release_truncate_lock(owner);
                 }
             }
@@ -1265,9 +1288,15 @@ impl TxnFinalize for PgEngine {
             if let Some(t) = handles
                 .get(&(namespace.clone(), name.clone()))
                 .and_then(|table| table.as_heap())
-                && let Some((new, owner)) = t.abort_truncate(xid)
+                && let Some((new, new_toast, owner)) = t.abort_truncate(xid)
             {
                 self.inner.discard_relfile(new);
+                // Anything the rolled-back transaction stored out of line went to
+                // the staged chunk store, so it goes away with the staged heap
+                // file. The committed store is untouched.
+                if new_toast.0 != 0 {
+                    self.inner.discard_relfile(new_toast);
+                }
                 t.release_truncate_lock(owner);
             }
         }
@@ -1384,9 +1413,12 @@ impl TableEngine for PgEngine {
             self.inner.bufpool.smgr().register_memory(rel);
         }
         let table = match schema.access_method {
+            // A fresh table has no chunk store; one is created lazily by the
+            // first row that needs to store an attribute out of line.
             TableAccessMethod::Heap => ManagedTable::Heap(Arc::new(HeapTable::new(
                 Arc::clone(&self.inner),
                 rel,
+                RelFileNode(0),
                 schema,
                 Vec::new(),
             ))),
@@ -1590,7 +1622,7 @@ impl TableEngine for PgEngine {
         // relation. The persistent catalog is the source of truth for existence:
         // a missing entry there is the 42P01 case.
         let key = (namespace.to_string(), name.to_string());
-        let (rel, dropped, staged) = {
+        let (rel, dropped, staged, toast) = {
             let mut tables = self
                 .tables
                 .write()
@@ -1613,8 +1645,15 @@ impl TableEngine for PgEngine {
                 .as_deref()
                 .and_then(ManagedTable::as_heap)
                 .and_then(HeapTable::staged_relfilenode);
+            // The chunk store goes with the table. `remove_in` has already
+            // dropped the catalog row that named it, so the startup sweep would
+            // reclaim it eventually — unlinking here just makes it immediate.
+            let toast = dropped
+                .as_deref()
+                .and_then(ManagedTable::as_heap)
+                .and_then(HeapTable::toast_relfilenode);
             tables.remove(&key);
-            (rel, dropped, staged)
+            (rel, dropped, staged, toast)
         };
         // Physical cleanup runs after the tables lock is released, so an IO error
         // unlinking the file panics only this statement rather than poisoning the
@@ -1634,6 +1673,9 @@ impl TableEngine for PgEngine {
         }
         if let Some(staged) = staged {
             self.inner.discard_relfile(staged);
+        }
+        if let Some(toast) = toast {
+            self.inner.discard_relfile(toast);
         }
         Ok(())
     }
@@ -1799,6 +1841,7 @@ impl TableEngine for PgEngine {
                 schema: t.schema().clone(),
                 indexes: t.indexes(),
                 stats: t.statistics(),
+                toast: t.toast_statistics(),
             })
             .collect()
     }

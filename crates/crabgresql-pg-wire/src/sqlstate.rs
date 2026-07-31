@@ -57,6 +57,9 @@ pub const RESERVED_NAME: &str = "42939";
 /// that renames, drops, or retypes an existing view column).
 pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
+/// `54000` — an implementation limit was reached, e.g. a row too big to store
+/// on one page.
+pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
 /// `54001` — a statement nests too deeply to bind or execute safely (PG reports
 /// this as "stack depth limit exceeded").
 pub const STATEMENT_TOO_COMPLEX: &str = "54001";

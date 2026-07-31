@@ -1,0 +1,140 @@
+--
+-- TOAST
+-- An attribute too wide to keep inline is stored out of line in a per-table
+-- chunk relation and reassembled transparently on read, so a value far larger
+-- than one 8 KB page round-trips byte for byte. A row that cannot be made to
+-- fit even so -- one whose columns are all fixed-width -- raises
+-- 54000 program_limit_exceeded, "row is too big". pg_class.reltoastrelid names
+-- the chunk relation, or is 0 for a table that has never needed one, which is
+-- what PostgreSQL reports for a table with no TOAST relation. Output
+-- hand-checked against PostgreSQL (psql -a -q).
+--
+-- Two deliberate divergences from PostgreSQL, both checked against a live
+-- PostgreSQL 18 and both about bookkeeping rather than stored data:
+--
+--  * PostgreSQL creates the TOAST relation eagerly, at CREATE TABLE, for any
+--    table with a variable-length column; we create it on the first row that
+--    actually needs one. So a table with a text column but no wide values
+--    reports reltoastrelid = 0 where PostgreSQL reports non-zero. The cases
+--    below are chosen so this timing difference does not show.
+--  * The byte count in "row is too big" reflects the on-page encoding, and ours
+--    is wider than PostgreSQL's (a 36-byte tuple header against 23, and a
+--    length-prefixed tag per datum). The SQLSTATE, the wording and the maximum
+--    are identical; the size is ours.
+--
+CREATE TABLE toasttest (id int, f1 text);
+-- Well past a page: md5 rather than a prefix, since a prefix check would pass
+-- on a value whose tail was lost.
+INSERT INTO toasttest VALUES (1, repeat('1234567890', 10000));
+SELECT id, length(f1), md5(f1) = md5(repeat('1234567890', 10000)) AS intact FROM toasttest WHERE id = 1;
+-- Both ends, so a chain reassembled in the wrong order would show.
+SELECT substr(f1, 1, 10), substr(f1, 99991, 10) FROM toasttest WHERE id = 1;
+-- Straddle the inline limit: 8126 bytes is the width upstream's insert test
+-- uses, and the two either side of it must behave identically to the reader.
+INSERT INTO toasttest VALUES (2, repeat('a', 8126));
+INSERT INTO toasttest VALUES (3, repeat('b', 8160));
+INSERT INTO toasttest VALUES (4, repeat('c', 8161));
+SELECT id, length(f1) FROM toasttest WHERE id IN (2, 3, 4) ORDER BY id;
+-- A small value in the same column stays readable alongside them.
+INSERT INTO toasttest VALUES (5, 'small');
+INSERT INTO toasttest VALUES (6, '');
+INSERT INTO toasttest VALUES (7, NULL);
+SELECT id, length(f1) FROM toasttest ORDER BY id;
+-- Out-of-line storage is type-agnostic: the chunks hold exactly what an inline
+-- datum would, so bytea travels the same path as text.
+CREATE TABLE toastbytea (id int, b bytea);
+INSERT INTO toastbytea VALUES (1, decode(repeat('deadbeef', 8000), 'hex'));
+SELECT id, b = decode(repeat('deadbeef', 8000), 'hex') AS intact FROM toastbytea;
+-- Two wide columns in one row.
+CREATE TABLE toastwide (id int, a text, b text);
+INSERT INTO toastwide VALUES (1, repeat('x', 40000), repeat('y', 40000));
+SELECT id, length(a), length(b), left(a, 1), left(b, 1) FROM toastwide;
+-- UPDATE small -> big and big -> small.
+UPDATE toasttest SET f1 = repeat('z', 120000) WHERE id = 5;
+SELECT id, length(f1), md5(f1) = md5(repeat('z', 120000)) AS intact FROM toasttest WHERE id = 5;
+UPDATE toasttest SET f1 = 'tiny' WHERE id = 1;
+SELECT id, f1 FROM toasttest WHERE id = 1;
+-- Grouping and ordering on a wide column force the value out of the chunk
+-- relation outside the projection path.
+SELECT length(f1), count(*) FROM toasttest WHERE f1 IS NOT NULL GROUP BY length(f1) ORDER BY length(f1);
+SELECT id FROM toasttest ORDER BY f1 NULLS LAST LIMIT 3;
+-- A rolled-back wide insert leaves nothing behind.
+BEGIN;
+INSERT INTO toasttest VALUES (8, repeat('r', 70000));
+SELECT count(*) FROM toasttest WHERE id = 8;
+ROLLBACK;
+SELECT count(*) FROM toasttest WHERE id = 8;
+-- DELETE then VACUUM reclaims the chunks; the survivors are untouched.
+DELETE FROM toasttest WHERE id = 5;
+VACUUM toasttest;
+SELECT id, length(f1) FROM toasttest ORDER BY id;
+-- reltoastrelid resolves to a real pg_class row in pg_toast once a row has
+-- needed one. Nothing in toastnarrow can ever be stored out of line, so
+-- PostgreSQL builds no TOAST relation for it either and both report 0.
+CREATE TABLE toastnarrow (id int, n int);
+INSERT INTO toastnarrow VALUES (1, 2);
+SELECT relname, reltoastrelid <> 0 AS has_toast FROM pg_class
+ WHERE relname IN ('toastnarrow', 'toasttest') ORDER BY relname;
+SELECT n.nspname, t.relkind, t.relnatts FROM pg_class c
+  JOIN pg_class t ON t.oid = c.reltoastrelid
+  JOIN pg_namespace n ON n.oid = t.relnamespace
+ WHERE c.relname = 'toasttest';
+SELECT count(*) AS dangling FROM pg_class c WHERE c.reltoastrelid <> 0
+   AND NOT EXISTS (SELECT 1 FROM pg_class t WHERE t.oid = c.reltoastrelid);
+-- TRUNCATE takes the chunks with the rows that named them.
+TRUNCATE toastwide;
+SELECT count(*) FROM toastwide;
+INSERT INTO toastwide VALUES (2, repeat('p', 30000), repeat('q', 30000));
+SELECT id, length(a), length(b) FROM toastwide;
+-- A row of fixed-width columns cannot be shrunk by moving anything out of line,
+-- so it is refused -- and the session survives to run the next statement.
+CREATE TABLE toastfixed (a name, b name, c name, d name, e name, f name, g name, h name,
+                         i name, j name, k name, l name, m name, n name, o name, p name,
+                         q name, r name, s name, t name, u name, v name, w name, x name,
+                         y name, z name, a2 name, b2 name, c2 name, d2 name, e2 name, f2 name,
+                         g2 name, h2 name, i2 name, j2 name, k2 name, l2 name, m2 name, n2 name,
+                         o2 name, p2 name, q2 name, r2 name, s2 name, t2 name, u2 name, v2 name,
+                         w2 name, x2 name, y2 name, z2 name, a3 name, b3 name, c3 name, d3 name,
+                         e3 name, f3 name, g3 name, h3 name, i3 name, j3 name, k3 name, l3 name,
+                         m3 name, n3 name, o3 name, p3 name, q3 name, r3 name, s3 name, t3 name,
+                         u3 name, v3 name, w3 name, x3 name, y3 name, z3 name, a4 name, b4 name,
+                         c4 name, d4 name, e4 name, f4 name, g4 name, h4 name, i4 name, j4 name,
+                         k4 name, l4 name, m4 name, n4 name, o4 name, p4 name, q4 name, r4 name,
+                         s4 name, t4 name, u4 name, v4 name, w4 name, x4 name, y4 name, z4 name,
+                         a5 name, b5 name, c5 name, d5 name, e5 name, f5 name, g5 name, h5 name,
+                         i5 name, j5 name, k5 name, l5 name, m5 name, n5 name, o5 name, p5 name,
+                         q5 name, r5 name, s5 name, t5 name, u5 name, v5 name, w5 name, x5 name,
+                         y5 name, z5 name, a6 name, b6 name);
+INSERT INTO toastfixed SELECT repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63), repeat('x', 63),
+       repeat('x', 63), repeat('x', 63);
+SELECT count(*) FROM toastfixed;
+DROP TABLE toastfixed;
+DROP TABLE toastnarrow;
+DROP TABLE toastwide;
+DROP TABLE toastbytea;
+DROP TABLE toasttest;
