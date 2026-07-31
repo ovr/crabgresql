@@ -1082,10 +1082,14 @@ fn subst_outer_join(join: &mut JoinExpr, outer: &[Value], depth: usize) {
         JoinExpr::Input { input, .. } => match input {
             JoinInput::Scan(_) => {}
             // Same depth. A FROM subquery binds with an empty outer scope, so
-            // it holds no `OuterColumnRef` at all — see the `debug_assert!` in
-            // `bind_from_item`'s Derived arm. LATERAL is the one future feature
-            // that would bind one against the enclosing scope and so need the
-            // `depth + 1` back here.
+            // no `OuterColumnRef` inside it can *escape* it — see the
+            // `debug_assert!` in `bind_from_item`'s Derived arm. (It may well
+            // hold references of its own, correlating one of its nested
+            // subqueries to its own relations; those sit below a marker, so
+            // they are visited at a deeper `depth` than their `level` and left
+            // alone.) LATERAL is the one future feature that would bind a FROM
+            // subquery against the enclosing scope and so need the `depth + 1`
+            // back here.
             JoinInput::Subplan(plan) => subst_outer_plan(plan, outer, depth),
             JoinInput::TableFunction { args, .. } => {
                 for e in args.iter_mut() {
@@ -1187,14 +1191,31 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
     }
 }
 
-/// Whether a bound plan contains any correlated outer reference
-/// ([`BoundExpr::OuterColumnRef`]) — a subplan that cannot be folded once before
-/// execution because its value depends on an enclosing row. The executor uses
-/// this to leave such subqueries for per-outer-row evaluation.
+/// Whether a bound plan holds a correlated outer reference
+/// ([`BoundExpr::OuterColumnRef`]) that *escapes* it — one bound to a query
+/// enclosing `plan`, which therefore has to be filled by [`substitute_outer`] at
+/// a boundary above. Such a plan cannot be folded once before execution because
+/// its value depends on an enclosing row; the executor uses this to leave those
+/// subqueries for per-outer-row evaluation.
+///
+/// "Escapes" is the whole point, and the reason this walk carries a depth. A
+/// plan routinely contains outer references that are entirely its own business:
+/// `(SELECT a, (SELECT max(b) FROM u WHERE u.k = s.a) FROM s)` holds an
+/// `OuterColumnRef { level: 1 }` naming `s`, but `s` is inside the plan, so
+/// nothing above it has a row to fill that reference from. The depth arithmetic
+/// here mirrors [`subst_outer_plan`] exactly — same base of 1, incremented at
+/// the same single boundary — so that a reference counts as escaping precisely
+/// when `substitute_outer` would act on it: `level >= depth`.
 pub fn plan_has_outer_refs(plan: &LogicalPlan) -> bool {
+    plan_has_outer_refs_at(plan, 1)
+}
+
+/// [`plan_has_outer_refs`] for a plan reached at correlation `depth` rather than
+/// at the top of the walk.
+fn plan_has_outer_refs_at(plan: &LogicalPlan, depth: usize) -> bool {
     let mut found = false;
-    for_each_plan_expr(plan, &mut |e| {
-        if expr_has_outer_ref(e) {
+    for_each_plan_expr(plan, depth, &mut |e, depth| {
+        if expr_has_outer_ref(e, depth) {
             found = true;
         }
     });
@@ -1209,7 +1230,9 @@ pub fn plan_has_outer_refs(plan: &LogicalPlan) -> bool {
 /// before the transaction is finalized rather than streamed after it.
 pub fn plan_calls_routine(plan: &LogicalPlan) -> bool {
     let mut found = false;
-    for_each_plan_expr(plan, &mut |e| {
+    // A routine anywhere makes the statement a write, however deeply nested, so
+    // this visitor ignores the depth.
+    for_each_plan_expr(plan, 1, &mut |e, _| {
         if e.contains_routine() {
             found = true;
         }
@@ -1218,16 +1241,21 @@ pub fn plan_calls_routine(plan: &LogicalPlan) -> bool {
 }
 
 /// Visit every top-level expression of `plan`, recursing through structural
-/// sub-plans (derived tables, join inputs, DML sources). Does not descend into
-/// expression-subquery markers — `expr_has_outer_ref` handles those.
-fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
+/// sub-plans (derived tables, join inputs, DML sources) and passing each
+/// expression the correlation `depth` it sits at. Does not descend into
+/// expression-subquery markers — the per-expression walk handles those, and it
+/// is the only place `depth` increments.
+///
+/// Depth moves exactly as it does in [`subst_outer_plan`]; see that function's
+/// comment for why none of the structural nodes below is a query nesting level.
+fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&BoundExpr, usize)) {
     match plan {
         LogicalPlan::Values {
             rows, predicate, ..
         } => {
-            rows.iter().flatten().for_each(&mut *f);
+            rows.iter().flatten().for_each(|e| f(e, depth));
             if let Some(p) = predicate {
-                f(p);
+                f(p, depth);
             }
         }
         LogicalPlan::Query {
@@ -1235,9 +1263,9 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
             predicate,
             ..
         } => {
-            projections.iter().for_each(&mut *f);
+            projections.iter().for_each(|e| f(e, depth));
             if let Some(p) = predicate {
-                f(p);
+                f(p, depth);
             }
         }
         LogicalPlan::Subquery {
@@ -1246,10 +1274,10 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
             predicate,
             ..
         } => {
-            for_each_plan_expr(source, &mut *f);
-            projections.iter().for_each(&mut *f);
+            for_each_plan_expr(source, depth, &mut *f);
+            projections.iter().for_each(|e| f(e, depth));
             if let Some(p) = predicate {
-                f(p);
+                f(p, depth);
             }
         }
         LogicalPlan::Window {
@@ -1258,9 +1286,12 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
             funcs,
             ..
         } => {
-            for_each_plan_expr(source, &mut *f);
-            spec.exprs().for_each(&mut *f);
-            funcs.iter().flat_map(|w| w.kind.args()).for_each(&mut *f);
+            for_each_plan_expr(source, depth, &mut *f);
+            spec.exprs().for_each(|e| f(e, depth));
+            funcs
+                .iter()
+                .flat_map(|w| w.kind.args())
+                .for_each(|e| f(e, depth));
         }
         LogicalPlan::TableFunction {
             args,
@@ -1268,9 +1299,11 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
             predicate,
             ..
         } => {
-            args.iter().chain(projections.iter()).for_each(&mut *f);
+            args.iter()
+                .chain(projections.iter())
+                .for_each(|e| f(e, depth));
             if let Some(p) = predicate {
-                f(p);
+                f(p, depth);
             }
         }
         LogicalPlan::Join {
@@ -1279,21 +1312,21 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
             predicate,
             ..
         } => {
-            for_each_join_expr(source, &mut *f);
-            projections.iter().for_each(&mut *f);
+            for_each_join_expr(source, depth, &mut *f);
+            projections.iter().for_each(|e| f(e, depth));
             if let Some(p) = predicate {
-                f(p);
+                f(p, depth);
             }
         }
         // An Append exposes no expressions of its own.
         LogicalPlan::Append { .. } => {}
         LogicalPlan::SetOp { arms, .. } => {
             for arm in arms {
-                for_each_plan_expr(&arm.plan, &mut *f);
-                arm.coercion.iter().flatten().for_each(&mut *f);
+                for_each_plan_expr(&arm.plan, depth, &mut *f);
+                arm.coercion.iter().flatten().for_each(|e| f(e, depth));
             }
         }
-        LogicalPlan::Limit { source, .. } => for_each_plan_expr(source, &mut *f),
+        LogicalPlan::Limit { source, .. } => for_each_plan_expr(source, depth, &mut *f),
         LogicalPlan::Aggregate {
             input,
             predicate,
@@ -1304,34 +1337,34 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
             ..
         } => {
             if let AggInput::Join(join) = input {
-                for_each_join_expr(join, &mut *f);
+                for_each_join_expr(join, depth, &mut *f);
             }
             if let Some(p) = predicate {
-                f(p);
+                f(p, depth);
             }
-            group_exprs.iter().for_each(&mut *f);
+            group_exprs.iter().for_each(|e| f(e, depth));
             for agg in aggregates {
                 for arg in agg.args.iter() {
-                    f(arg);
+                    f(arg, depth);
                 }
             }
             if let Some(h) = having {
-                f(h);
+                f(h, depth);
             }
-            projections.iter().for_each(&mut *f);
+            projections.iter().for_each(|e| f(e, depth));
         }
         LogicalPlan::Insert {
             source, returning, ..
         } => {
             match source {
-                InsertSource::Values(rows) => rows.iter().flatten().for_each(&mut *f),
+                InsertSource::Values(rows) => rows.iter().flatten().for_each(|e| f(e, depth)),
                 InsertSource::Query { input, projections } => {
-                    for_each_plan_expr(input, &mut *f);
-                    projections.iter().for_each(&mut *f);
+                    for_each_plan_expr(input, depth, &mut *f);
+                    projections.iter().for_each(|e| f(e, depth));
                 }
             }
             if let Some(r) = returning {
-                r.projections.iter().for_each(&mut *f);
+                r.projections.iter().for_each(|e| f(e, depth));
             }
         }
         LogicalPlan::Update {
@@ -1341,13 +1374,13 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
             ..
         } => {
             if let Some(p) = predicate {
-                f(p);
+                f(p, depth);
             }
             for (_, e) in assignments {
-                f(e);
+                f(e, depth);
             }
             if let Some(r) = returning {
-                r.projections.iter().for_each(&mut *f);
+                r.projections.iter().for_each(|e| f(e, depth));
             }
         }
         LogicalPlan::Delete {
@@ -1356,21 +1389,21 @@ fn for_each_plan_expr(plan: &LogicalPlan, f: &mut impl FnMut(&BoundExpr)) {
             ..
         } => {
             if let Some(p) = predicate {
-                f(p);
+                f(p, depth);
             }
             if let Some(r) = returning {
-                r.projections.iter().for_each(&mut *f);
+                r.projections.iter().for_each(|e| f(e, depth));
             }
         }
     }
 }
 
-fn for_each_join_expr(join: &JoinExpr, f: &mut impl FnMut(&BoundExpr)) {
+fn for_each_join_expr(join: &JoinExpr, depth: usize, f: &mut impl FnMut(&BoundExpr, usize)) {
     match join {
         JoinExpr::Input { input, .. } => match input {
             JoinInput::Scan(_) => {}
-            JoinInput::Subplan(plan) => for_each_plan_expr(plan, &mut *f),
-            JoinInput::TableFunction { args, .. } => args.iter().for_each(&mut *f),
+            JoinInput::Subplan(plan) => for_each_plan_expr(plan, depth, &mut *f),
+            JoinInput::TableFunction { args, .. } => args.iter().for_each(|e| f(e, depth)),
         },
         JoinExpr::Join {
             left,
@@ -1378,55 +1411,67 @@ fn for_each_join_expr(join: &JoinExpr, f: &mut impl FnMut(&BoundExpr)) {
             predicate,
             ..
         } => {
-            for_each_join_expr(left, &mut *f);
-            for_each_join_expr(right, &mut *f);
+            for_each_join_expr(left, depth, &mut *f);
+            for_each_join_expr(right, depth, &mut *f);
             if let Some(p) = predicate {
-                f(p);
+                f(p, depth);
             }
         }
     }
 }
 
-/// Whether an expression tree contains an [`BoundExpr::OuterColumnRef`],
-/// including inside nested expression-subquery subplans.
-fn expr_has_outer_ref(expr: &BoundExpr) -> bool {
+/// Whether an expression tree holds an [`BoundExpr::OuterColumnRef`] that
+/// escapes the plan this walk started at, given the correlation `depth` this
+/// expression sits at. Descends into nested expression-subquery subplans, which
+/// is the one boundary that pushes a level — see [`plan_has_outer_refs`].
+fn expr_has_outer_ref(expr: &BoundExpr, depth: usize) -> bool {
     match expr {
-        BoundExpr::OuterColumnRef { .. } => true,
+        // Mirrors `subst_outer_expr`: `level == depth` names the immediate
+        // parent row and `level > depth` a still-outer one — both are filled
+        // from above, so both escape. `level < depth` names an intervening
+        // inner query and stays entirely within this plan.
+        BoundExpr::OuterColumnRef { level, .. } => *level >= depth,
         BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => false,
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => expr_has_outer_ref(expr),
+        | BoundExpr::Reinterpret { expr, .. } => expr_has_outer_ref(expr, depth),
         BoundExpr::Binary { left, right, .. } => {
-            expr_has_outer_ref(left) || expr_has_outer_ref(right)
+            expr_has_outer_ref(left, depth) || expr_has_outer_ref(right, depth)
         }
         BoundExpr::FuncCall { args, .. }
         | BoundExpr::Routine { args, .. }
-        | BoundExpr::Srf { args, .. } => args.iter().any(expr_has_outer_ref),
-        BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(expr_has_outer_ref),
+        | BoundExpr::Srf { args, .. } => args.iter().any(|e| expr_has_outer_ref(e, depth)),
+        BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(|e| expr_has_outer_ref(e, depth)),
         BoundExpr::Subscript { base, index, .. } => {
-            expr_has_outer_ref(base) || expr_has_outer_ref(index)
+            expr_has_outer_ref(base, depth) || expr_has_outer_ref(index, depth)
         }
         BoundExpr::Case { whens, else_, .. } => {
             whens
                 .iter()
-                .any(|(c, r)| expr_has_outer_ref(c) || expr_has_outer_ref(r))
-                || else_.as_deref().is_some_and(expr_has_outer_ref)
+                .any(|(c, r)| expr_has_outer_ref(c, depth) || expr_has_outer_ref(r, depth))
+                || else_
+                    .as_deref()
+                    .is_some_and(|e| expr_has_outer_ref(e, depth))
         }
-        BoundExpr::Aggregate { args, .. } => args.iter().any(expr_has_outer_ref),
-        BoundExpr::WindowFunc { kind, spec, .. } => {
-            kind.args().iter().chain(spec.exprs()).any(expr_has_outer_ref)
-        }
+        BoundExpr::Aggregate { args, .. } => args.iter().any(|e| expr_has_outer_ref(e, depth)),
+        BoundExpr::WindowFunc { kind, spec, .. } => kind
+            .args()
+            .iter()
+            .chain(spec.exprs())
+            .any(|e| expr_has_outer_ref(e, depth)),
+        // A nested expression-subquery is one query level deeper — the same
+        // `depth + 1` `subst_outer_expr` applies.
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
-            plan_has_outer_refs(&subplan.0)
+            plan_has_outer_refs_at(&subplan.0, depth + 1)
         }
         BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
-            plan_has_outer_refs(&subplan.0) || expr_has_outer_ref(cmp)
+            plan_has_outer_refs_at(&subplan.0, depth + 1) || expr_has_outer_ref(cmp, depth)
         }
         BoundExpr::QuantifiedArray { array, cmp, .. } => {
-            expr_has_outer_ref(array) || expr_has_outer_ref(cmp)
+            expr_has_outer_ref(array, depth) || expr_has_outer_ref(cmp, depth)
         }
     }
 }
@@ -2749,8 +2794,20 @@ fn bind_from_item(
             }
         }
         ast::TableFactor::Derived {
-            subquery, alias, ..
+            lateral,
+            subquery,
+            alias,
+            ..
         } => {
+            // Everything below binds the body with an empty outer scope, which
+            // is exactly what LATERAL is not. Left to fall through, `LATERAL
+            // (SELECT o.x …)` would fail with a misleading `42703 column "o.x"
+            // does not exist`; say what is actually missing instead.
+            if *lateral {
+                return Err(BindError::feature_not_supported(
+                    "LATERAL is not supported yet",
+                ));
+            }
             let Some(alias) = alias else {
                 return Err(BindError::new(
                     sqlstate::SYNTAX_ERROR,
@@ -2763,14 +2820,19 @@ fn bind_from_item(
             let inner = bind_query_scoped(engine, catalog, params, subquery, ctes, &[])?;
             // That empty scope is load-bearing: `subst_outer_join` descends into
             // this subplan at the *same* depth, which is only sound because no
-            // `OuterColumnRef` can be produced without a non-empty `Scope::outer`.
+            // `OuterColumnRef` can *escape* it — an escaping one needs a
+            // non-empty `Scope::outer` at this bind. (References that stay
+            // inside, correlating a nested subquery of the body to the body's
+            // own relations, are both legal and common; `plan_has_outer_refs`
+            // is depth-aware precisely so they do not read as escaping.)
             // Implementing LATERAL means binding this against the enclosing scope,
             // and then the `depth + 1` has to come back — this assert is what will
             // say so.
             debug_assert!(
                 !plan_has_outer_refs(&inner),
-                "a FROM subquery binds with an empty outer scope; supporting LATERAL \
-                 means restoring the `depth + 1` in `subst_outer_join`"
+                "no outer reference can escape a FROM subquery bound with an empty outer \
+                 scope; supporting LATERAL means restoring the `depth + 1` in \
+                 `subst_outer_join`"
             );
             let mut columns = output_columns_of(&inner)?;
             apply_alias_columns(&mut columns, &alias.columns, &table_subject(&qualifier))?;
@@ -7157,6 +7219,73 @@ mod tests {
         let with_arg = bind_err("SELECT rank(1) FROM t");
         assert_eq!(with_arg.code, "42883");
         assert_eq!(with_arg.message, "function rank(integer) does not exist");
+    }
+
+    /// A derived table whose *body* correlates one of its own subqueries to its
+    /// own relations is ordinary SQL, not a LATERAL: nothing in it reaches the
+    /// enclosing query. `plan_has_outer_refs` used to answer "contains an
+    /// `OuterColumnRef` anywhere" rather than "contains one that escapes", so
+    /// the `debug_assert!` in `bind_from_item`'s Derived arm fired on it and
+    /// debug builds panicked — on `subselect`, `join` and `with` among others.
+    #[test]
+    fn a_derived_table_may_correlate_a_subquery_to_its_own_relations() {
+        let plan = bound(
+            "SELECT * FROM (SELECT id, (SELECT max(u.big) FROM t u WHERE u.id = s.id) AS m \
+             FROM t s) d",
+        );
+        assert!(
+            !plan_has_outer_refs(&plan),
+            "the correlation is internal to the derived table, so nothing escapes"
+        );
+    }
+
+    /// The other half of the same predicate: a genuinely correlated subplan
+    /// must still report `true`. Guards against fixing the false positive by
+    /// making the comparison too strict.
+    #[test]
+    fn a_reference_to_the_immediate_parent_still_counts_as_escaping() {
+        let plan =
+            first_subplan("SELECT id, (SELECT max(u.big) FROM t u WHERE u.id = t.id) FROM t");
+        assert!(plan_has_outer_refs(&plan));
+    }
+
+    /// A reference that skips a level — bound in the innermost query but naming
+    /// the outermost one — escapes both of the queries it passes through, so it
+    /// is still visible from the middle subplan.
+    #[test]
+    fn a_reference_two_levels_out_escapes_the_intervening_query() {
+        let plan = first_subplan(
+            "SELECT id FROM t WHERE EXISTS ( \
+               SELECT 1 FROM t u WHERE EXISTS (SELECT 1 FROM t v WHERE v.id = t.id))",
+        );
+        assert!(
+            plan_has_outer_refs(&plan),
+            "the inner `t.id` names the top query, two levels out"
+        );
+    }
+
+    /// A grouped query may carry a *non*-correlated subquery in its target list
+    /// even when that subquery nests a correlated one of its own — the indices
+    /// that `rewrite_over_aggregate` cannot line up are only the ones bound
+    /// against the aggregating query. The depth-blind predicate rejected this
+    /// with a spurious `0A000` in release builds too.
+    #[test]
+    fn a_self_contained_subquery_over_an_aggregate_is_not_rejected() {
+        let _ = bound(
+            "SELECT count(*), (SELECT max(u.big) FROM t u \
+             WHERE EXISTS (SELECT 1 FROM t v WHERE v.id = u.id)) FROM t",
+        );
+    }
+
+    /// LATERAL parses but the binder still binds a FROM subquery with an empty
+    /// outer scope, so it cannot mean what it says. Report the missing feature
+    /// rather than the `42703` that falls out of binding it as a plain derived
+    /// table.
+    #[test]
+    fn lateral_is_reported_as_unsupported() {
+        let error = bind_err("SELECT * FROM t, LATERAL (SELECT t.id) x");
+        assert_eq!(error.code, "0A000");
+        assert_eq!(error.message, "LATERAL is not supported yet");
     }
 
     /// The subplan of the first expression-subquery marker in `sql`'s target
