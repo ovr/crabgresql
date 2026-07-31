@@ -60,3 +60,4 @@ test: analyze
 test: plpgsql
 test: window
 test: pg_input
+test: escape_string

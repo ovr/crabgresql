@@ -241,6 +241,27 @@ impl Value {
         }
     }
 
+    /// The text of a PostgreSQL *character string constant*, whichever way it
+    /// was quoted: `'…'`, `$$…$$`, `E'…'`, `U&'…'` or `N'…'`. All five are the
+    /// same kind of constant to PG and are interchangeable everywhere one is
+    /// accepted — `ESCAPE E'\\'`, `DATE E'2024-01-01'`, and so on.
+    ///
+    /// Returns `None` for the bit-string forms `B'…'`/`X'…'`, which are not
+    /// text, and for the non-PostgreSQL quoting styles the vendored parser
+    /// carries for other dialects. Prefer this over matching
+    /// [`Value::SingleQuotedString`] alone, which silently rejects the other
+    /// four spellings.
+    pub fn as_pg_string(&self) -> Option<&str> {
+        match self {
+            Value::SingleQuotedString(s)
+            | Value::EscapedStringLiteral(s)
+            | Value::UnicodeStringLiteral(s)
+            | Value::NationalStringLiteral(s) => Some(s),
+            Value::DollarQuotedString(s) => Some(&s.value),
+            _ => None,
+        }
+    }
+
     /// Attach the provided `span` to this `Value` and return `ValueWithSpan`.
     pub fn with_span(self, span: Span) -> ValueWithSpan {
         ValueWithSpan { value: self, span }
@@ -273,7 +294,10 @@ impl fmt::Display for Value {
             Value::DollarQuotedString(v) => write!(f, "{v}"),
             Value::EscapedStringLiteral(v) => write!(f, "E'{}'", escape_escaped_string(v)),
             Value::UnicodeStringLiteral(v) => write!(f, "U&'{}'", escape_unicode_string(v)),
-            Value::NationalStringLiteral(v) => write!(f, "N'{v}'"),
+            // The tokenizer collapses `''` in an `N'…'` body just as it does in
+            // a plain literal, so re-emitting has to double the quotes back or
+            // the round trip produces SQL that no longer parses.
+            Value::NationalStringLiteral(v) => write!(f, "N'{}'", escape_single_quote_string(v)),
             Value::QuoteDelimitedStringLiteral(v) => v.fmt(f),
             Value::NationalQuoteDelimitedStringLiteral(v) => write!(f, "N{v}"),
             Value::HexStringLiteral(v) => write!(f, "X'{v}'"),

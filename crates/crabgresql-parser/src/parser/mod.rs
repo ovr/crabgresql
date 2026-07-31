@@ -42,6 +42,21 @@ use crate::keywords::{Keyword, ALL_KEYWORDS};
 use crate::tokenizer::*;
 use sqlparser::parser::ParserState::ColumnDefinition;
 
+/// A lexer error that reproduces a specific PostgreSQL diagnostic rather than a
+/// generic syntax error — see [`TokenizerError`]. Kept whole so the message,
+/// SQLSTATE, hint and cursor position all survive to the protocol layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgDiagnostic {
+    /// 5-character SQLSTATE.
+    pub sqlstate: &'static str,
+    /// PostgreSQL's wording, to be shown to the client verbatim.
+    pub message: String,
+    /// Optional `HINT:` line.
+    pub hint: Option<String>,
+    /// Where the offending token starts; a zero line means "no cursor here".
+    pub location: Location,
+}
+
 /// Errors produced by the SQL parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParserError {
@@ -51,6 +66,8 @@ pub enum ParserError {
     ParserError(String),
     /// Raised when a recursion depth limit is exceeded.
     RecursionLimitExceeded,
+    /// A tokenizer error carrying PostgreSQL's own diagnostic.
+    PgDiagnostic(PgDiagnostic),
 }
 
 // Use `Parser::expected` instead, if possible
@@ -180,21 +197,31 @@ pub enum WildcardExpr {
 
 impl From<TokenizerError> for ParserError {
     fn from(e: TokenizerError) -> Self {
-        ParserError::TokenizerError(e.to_string())
+        match e.sqlstate {
+            Some(sqlstate) => ParserError::PgDiagnostic(PgDiagnostic {
+                sqlstate,
+                message: e.message,
+                hint: e.hint,
+                location: e.location,
+            }),
+            None => ParserError::TokenizerError(e.to_string()),
+        }
     }
 }
 
 impl fmt::Display for ParserError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "sql parser error: {}",
-            match self {
-                ParserError::TokenizerError(s) => s,
-                ParserError::ParserError(s) => s,
-                ParserError::RecursionLimitExceeded => "recursion limit exceeded",
+        match self {
+            // A PG diagnostic is PG's own wording; wrapping it in `sql parser
+            // error:` would corrupt a message the client must see verbatim.
+            ParserError::PgDiagnostic(d) => f.write_str(&d.message),
+            ParserError::TokenizerError(s) | ParserError::ParserError(s) => {
+                write!(f, "sql parser error: {s}")
             }
-        )
+            ParserError::RecursionLimitExceeded => {
+                f.write_str("sql parser error: recursion limit exceeded")
+            }
+        }
     }
 }
 

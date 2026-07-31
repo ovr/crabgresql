@@ -85,6 +85,19 @@ impl PgError {
     }
 }
 
+impl From<crabgresql_parser::ParseError> for PgError {
+    fn from(e: crabgresql_parser::ParseError) -> Self {
+        Self {
+            code: Cow::Borrowed(e.sqlstate),
+            message: e.message,
+            detail: None,
+            hint: e.hint,
+            location: e.location,
+            context: Vec::new(),
+        }
+    }
+}
+
 impl From<StorageError> for PgError {
     fn from(e: StorageError) -> Self {
         let code = match &e {
