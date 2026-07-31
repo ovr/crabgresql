@@ -162,6 +162,15 @@ SELECT to_char(1, '999') AS int4,
 SELECT to_char('2024-01-01', 'YYYY');
 SELECT to_char('x'::text, 'y');
 
+-- the same rule, on other names: a category with no preferred type can never
+-- break the tie, while a typed argument that needs converting is steered to its
+-- category's preferred type (date -> timestamptz, so TZ is UTC not empty)
+SELECT area('((0,0),(2,2))');
+SELECT mod('5', '3');
+SELECT to_hex('255');
+SELECT area(box '((0,0),(2,2))') AS typed_box,
+       to_char(date '2024-03-05', 'YYYY-MM-DD|TZ') AS date_to_tstz;
+
 -- sign placement: the default sign and S float, MI/PL/SG/PR are anchored
 SELECT '[' || to_char(1, '99') || '][' || to_char(-1, '99') || ']' AS plain,
        '[' || to_char(1, 'S99') || '][' || to_char(-1, 'S99') || ']' AS lead_s,

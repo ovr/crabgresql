@@ -3648,7 +3648,13 @@ fn category(ty: PgType) -> Category {
         PgType::Interval => Category::Timespan,
         PgType::Inet | PgType::Cidr => Category::Network,
         PgType::Bit | PgType::Varbit => Category::BitString,
-        PgType::Point | PgType::Lseg | PgType::Path => Category::Geometric,
+        PgType::Point
+        | PgType::Lseg
+        | PgType::Line
+        | PgType::Path
+        | PgType::Box
+        | PgType::Polygon
+        | PgType::Circle => Category::Geometric,
         PgType::Bytea
         | PgType::Uuid
         | PgType::Json
@@ -3710,9 +3716,29 @@ fn narrow_by_typed_args<'a>(
             .filter(|(binding, target)| matches!(binding, Binding::Typed(e) if e.ty() == **target))
             .count()
     };
+    // PG's 4.d: among the arguments that still need converting, prefer the
+    // candidates taking their category's preferred type. This is what makes
+    // `to_char(date, unknown)` the timestamptz overload rather than a tie with
+    // the timestamp one.
+    let preferred_conversions = |sig: &&Signature| {
+        bindings
+            .iter()
+            .zip(sig.args)
+            .filter(|(binding, target)| match binding {
+                Binding::Unknown { .. } => false,
+                Binding::Typed(e) => {
+                    e.ty() != **target
+                        && is_preferred(**target)
+                        && category(**target) == category(e.ty())
+                }
+            })
+            .count()
+    };
     let mut kept: Vec<&Signature> = candidates.into_iter().filter(reachable).collect();
     let best = kept.iter().map(exact_matches).max().unwrap_or(0);
     kept.retain(|sig| exact_matches(&sig) == best);
+    let best = kept.iter().map(preferred_conversions).max().unwrap_or(0);
+    kept.retain(|sig| preferred_conversions(&sig) == best);
     kept
 }
 
@@ -3756,6 +3782,13 @@ fn narrow_by_unknown_category<'a>(
         if candidates.iter().any(|sig| is_preferred(sig.args[i])) {
             candidates.retain(|sig| is_preferred(sig.args[i]));
         }
+    }
+    // Nothing is left to separate the survivors: the category agreed and no
+    // preferred type broke the tie, so PG gives up rather than picking one.
+    // Categories with no preferred type at all — `G`, `U` — always land here,
+    // which is why `area('((0,0),(2,2))')` is ambiguous in PG.
+    if candidates.len() > 1 {
+        return Err(ambiguous_function(name, bindings));
     }
     Ok(candidates)
 }

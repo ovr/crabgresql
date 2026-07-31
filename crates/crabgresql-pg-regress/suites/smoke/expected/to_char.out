@@ -333,6 +333,25 @@ ERROR:  function to_char(unknown, unknown) is not unique
 HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
 SELECT to_char('x'::text, 'y');
 ERROR:  function to_char(text, unknown) does not exist
+-- the same rule, on other names: a category with no preferred type can never
+-- break the tie, while a typed argument that needs converting is steered to its
+-- category's preferred type (date -> timestamptz, so TZ is UTC not empty)
+SELECT area('((0,0),(2,2))');
+ERROR:  function area(unknown) is not unique
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+SELECT mod('5', '3');
+ERROR:  function mod(unknown, unknown) is not unique
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+SELECT to_hex('255');
+ERROR:  function to_hex(unknown) is not unique
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+SELECT area(box '((0,0),(2,2))') AS typed_box,
+       to_char(date '2024-03-05', 'YYYY-MM-DD|TZ') AS date_to_tstz;
+ typed_box |  date_to_tstz  
+-----------+----------------
+         4 | 2024-03-05|UTC
+(1 row)
+
 -- sign placement: the default sign and S float, MI/PL/SG/PR are anchored
 SELECT '[' || to_char(1, '99') || '][' || to_char(-1, '99') || ']' AS plain,
        '[' || to_char(1, 'S99') || '][' || to_char(-1, 'S99') || ']' AS lead_s,
