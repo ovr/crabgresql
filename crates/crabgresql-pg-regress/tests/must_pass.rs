@@ -3,6 +3,7 @@
 //! `suites/upstream_must_pass.txt`. All other upstream failures are
 //! informational only — see the `regress` binary.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,6 +40,7 @@ async fn smoke_suite_passes() -> anyhow::Result<()> {
         tests: parse_schedule(&schedule),
         outdir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("smoke"),
         statement_timeout: Duration::from_secs(30),
+        env: BTreeMap::new(),
     };
     assert_suite_passes(&config).await?;
 
@@ -71,6 +73,7 @@ async fn upstream_must_pass() -> anyhow::Result<()> {
         tests,
         outdir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("upstream"),
         statement_timeout: Duration::from_secs(30),
+        env: BTreeMap::new(),
     };
     assert_suite_passes(&config).await?;
 

@@ -1,0 +1,115 @@
+--
+-- PSQL_VARS --- \set, \unset, \getenv and :var substitution
+--
+-- Note the echoed lines below show the *unsubstituted* source, as psql -a
+-- always echoes what it read; only the statement sent to the server is
+-- expanded.
+--
+\set greeting hello
+SELECT :'greeting' AS plain_literal;
+ plain_literal 
+---------------
+ hello
+(1 row)
+
+SELECT 1 AS :"greeting";
+ hello 
+-------
+     1
+(1 row)
+
+\set expr 1 + 2
+SELECT :expr AS plain_value;
+ plain_value 
+-------------
+           3
+(1 row)
+
+-- values concatenate with no separator, and quotes group without appearing
+\set path /tmp '/data' '/onek.data'
+SELECT :'path' AS concatenated;
+    concatenated     
+---------------------
+ /tmp/data/onek.data
+(1 row)
+
+-- an argument may reference an earlier variable, including its quoted form
+\set nested 'prefix ' :'path' ' suffix'
+SELECT :'nested' AS built_up;
+              built_up               
+-------------------------------------
+ prefix '/tmp/data/onek.data' suffix
+(1 row)
+
+-- quoting rules: embedded quotes double, a backslash forces the E'' form
+\set apostrophe 'it''s'
+SELECT :'apostrophe' AS doubled_quote;
+ doubled_quote 
+---------------
+ it's
+(1 row)
+
+\set double_quoted 'he"re'
+SELECT 1 AS :"double_quoted";
+ he"re 
+-------
+     1
+(1 row)
+
+\set backslash 'a\\b'
+SELECT :'backslash' AS escape_string;
+ escape_string 
+---------------
+ a\b
+(1 row)
+
+\set empty ''
+SELECT :'empty' AS empty_literal;
+ empty_literal 
+---------------
+ 
+(1 row)
+
+-- no substitution inside literals, identifiers, dollar quotes or comments
+SELECT ':greeting' AS in_literal;
+ in_literal 
+------------
+ :greeting
+(1 row)
+
+SELECT $$:greeting$$ AS in_dollar_quote;
+ in_dollar_quote 
+-----------------
+ :greeting
+(1 row)
+
+SELECT 1 AS "col:greeting";
+ col:greeting 
+--------------
+            1
+(1 row)
+
+SELECT 1 AS after_comment; -- :greeting
+ after_comment 
+---------------
+             1
+(1 row)
+
+-- `::` is a cast even when a variable shares the type's name
+\set int4 boom
+SELECT 1::int4 AS still_a_cast;
+ still_a_cast 
+--------------
+            1
+(1 row)
+
+-- An undefined variable is left in the text verbatim, so the server sees the
+-- colon and rejects it. PostgreSQL words this as `syntax error at or near ":"`;
+-- the message below is crabgresql's own parser talking.
+\unset greeting
+SELECT :'greeting' AS undefined;
+ERROR:  sql parser error: Expected: placeholder, found: 'greeting' at Line: 1, Column: 9
+-- \getenv leaves the variable unset when the environment has no such entry
+\getenv absent CRABGRESQL_NO_SUCH_ENV_VAR
+SELECT :'absent' AS from_missing_env;
+ERROR:  sql parser error: Expected: placeholder, found: 'absent' at Line: 1, Column: 9

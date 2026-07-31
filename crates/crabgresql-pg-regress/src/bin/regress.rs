@@ -4,6 +4,7 @@
 //! Exit codes: 0 — all tests passed, 1 — at least one failed, 2 — bad usage
 //! or an infrastructure error (missing files, I/O).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -86,6 +87,7 @@ async fn main() -> ExitCode {
         tests,
         outdir: args.outdir,
         statement_timeout: Duration::from_secs(args.statement_timeout),
+        env: BTreeMap::new(),
     };
     let report = match run_suite(&config).await {
         Ok(report) => report,
