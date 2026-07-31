@@ -663,6 +663,7 @@ define_keywords!(
     MONITOR,
     MONTH,
     MONTHS,
+    MOVE,
     MSCK,
     MULTIRANGE_TYPE_NAME,
     MULTISET,

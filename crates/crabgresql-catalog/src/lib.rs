@@ -129,6 +129,10 @@ const BUILTIN_RELATION_OIDS: &[(&str, u32)] = &[
     ("pg_partitioned_table", 3350),
     ("pg_collation", 3456),
     ("pg_enum", 3501),
+    // A view defined by initdb rather than a bootstrap catalog, so its OID comes
+    // from the auto-assigned band. Deterministic for a given major version, and
+    // probed from the same 18.4 as the rest.
+    ("pg_cursors", 12077),
 ];
 
 /// The fixed OID of the `pg_catalog` relation `name`, if this build serves one.
@@ -358,6 +362,22 @@ type RoutinesFn = Box<dyn Fn() -> Vec<CatalogRoutine> + Send + Sync>;
 /// like [`RelationsFn`].
 type SchemasFn = Box<dyn Fn() -> Vec<(String, u32)> + Send + Sync>;
 
+/// Produces the session's open SQL cursors, to reflect into `pg_cursors`. Boxed
+/// and lazy like [`RelationsFn`].
+type CursorsFn = Box<dyn Fn() -> Vec<CatalogCursor> + Send + Sync>;
+
+/// One open cursor, as `pg_cursors` shows it. Cursors are session-local in
+/// PostgreSQL too, so this is never shared between connections.
+#[derive(Clone, Debug)]
+pub struct CatalogCursor {
+    pub name: String,
+    /// The `DECLARE` statement text.
+    pub statement: String,
+    pub is_holdable: bool,
+    pub is_binary: bool,
+    pub is_scrollable: bool,
+}
+
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so
 /// its rows reflect current server state; live user relations are supplied by a
 /// closure that is invoked at most once (and only when `pg_class`/`pg_attribute`
@@ -367,6 +387,7 @@ pub struct SystemCatalog {
     user_types_fn: UserTypesFn,
     routines_fn: RoutinesFn,
     schemas_fn: SchemasFn,
+    cursors_fn: CursorsFn,
     database: String,
     owner: String,
     live_relations: OnceLock<Vec<CatalogRelation>>,
@@ -377,6 +398,7 @@ pub struct SystemCatalog {
     user_types: OnceLock<Vec<CatalogUserType>>,
     routines: OnceLock<Vec<CatalogRoutine>>,
     user_schemas: OnceLock<Vec<(String, u32)>>,
+    cursors: OnceLock<Vec<CatalogCursor>>,
 }
 
 impl Default for SystemCatalog {
@@ -417,6 +439,7 @@ impl SystemCatalog {
             user_types_fn: Box::new(Vec::new),
             routines_fn: Box::new(Vec::new),
             schemas_fn: Box::new(Vec::new),
+            cursors_fn: Box::new(Vec::new),
             database: database.into(),
             owner: owner.into(),
             live_relations: OnceLock::new(),
@@ -427,6 +450,7 @@ impl SystemCatalog {
             user_types: OnceLock::new(),
             routines: OnceLock::new(),
             user_schemas: OnceLock::new(),
+            cursors: OnceLock::new(),
         }
     }
 
@@ -461,6 +485,16 @@ impl SystemCatalog {
         self
     }
 
+    /// Attach a provider of the session's open SQL cursors to reflect into
+    /// `pg_cursors` (invoked at most once, only if that relation is opened).
+    pub fn with_cursors_fn(
+        mut self,
+        f: impl Fn() -> Vec<CatalogCursor> + Send + Sync + 'static,
+    ) -> Self {
+        self.cursors_fn = Box::new(f);
+        self
+    }
+
     fn live_relations(&self) -> &[CatalogRelation] {
         self.live_relations.get_or_init(|| (self.relations)())
     }
@@ -475,6 +509,10 @@ impl SystemCatalog {
 
     fn user_schemas(&self) -> &[(String, u32)] {
         self.user_schemas.get_or_init(|| (self.schemas_fn)())
+    }
+
+    fn cursors(&self) -> &[CatalogCursor] {
+        self.cursors.get_or_init(|| (self.cursors_fn)())
     }
 
     /// Map every namespace name to its OID: the built-in namespaces plus each
@@ -738,6 +776,10 @@ impl SystemCatalog {
                 schema::pg_index_rows(self.index_oids()),
             )),
             "pg_am" => Some((schema::pg_am_schema(), schema::pg_am_rows())),
+            "pg_cursors" => Some((
+                schema::pg_cursors_schema(),
+                schema::pg_cursors_rows(self.cursors()),
+            )),
             "pg_language" => Some((schema::pg_language_schema(), schema::pg_language_rows())),
             "pg_proc" => Some((
                 schema::pg_proc_schema(),

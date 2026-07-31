@@ -5,6 +5,7 @@
 mod catalog;
 mod connection;
 mod copy;
+mod cursor;
 mod error;
 mod explain;
 mod global_catalog;

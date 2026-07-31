@@ -7937,3 +7937,44 @@ async fn call_arguments_may_themselves_call_routines() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A `FETCH` driven over the extended protocol. `Describe` has to answer with
+/// the cursor's column shape rather than `NoData` — a client that is told there
+/// are no columns and then handed DataRows treats it as a protocol violation,
+/// which is exactly what `tokio_postgres::query` does here.
+#[tokio::test]
+async fn fetch_reports_its_columns_over_the_extended_protocol() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (id integer, label text)")
+        .await?;
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .await?;
+    // The cursor has to outlive the statement that declares it, and each
+    // extended-protocol statement here is its own implicit transaction — so it
+    // must be holdable.
+    client
+        .batch_execute("DECLARE c SCROLL CURSOR WITH HOLD FOR SELECT id, label FROM t ORDER BY id")
+        .await?;
+
+    let first = client.query("FETCH 2 FROM c", &[]).await?;
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].get::<_, i32>("id"), 1);
+    assert_eq!(first[1].get::<_, &str>("label"), "two");
+
+    // The cursor keeps its position across statements.
+    let next = client.query("FETCH BACKWARD ALL FROM c", &[]).await?;
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].get::<_, i32>("id"), 1);
+
+    // An exhausted fetch still describes its columns, so a zero-row result is a
+    // result and not an error.
+    client.batch_execute("MOVE ALL c").await?;
+    assert!(client.query("FETCH ALL c", &[]).await?.is_empty());
+
+    client.batch_execute("CLOSE c").await?;
+    let err = client.query("FETCH 1 c", &[]).await.expect_err("closed");
+    assert_eq!(err.code().map(|c| c.code()), Some("34000"));
+    Ok(())
+}

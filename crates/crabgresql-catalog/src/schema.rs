@@ -17,8 +17,8 @@ use crabgresql_storage_api::{
 use crabgresql_types::{PgType, Value};
 
 use crate::{
-    CatalogIndex, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogUserType, PG_CAST_ROWS,
-    PG_TYPE_ROWS, RelKind,
+    CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogUserType,
+    PG_CAST_ROWS, PG_TYPE_ROWS, RelKind,
 };
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
@@ -391,6 +391,47 @@ pub fn pg_am_rows() -> Vec<Vec<Value>> {
         row(PARQUET_AM_OID, "parquet", "parquet_tableam_handler", "t"),
         row(BUFFER_AM_OID, "buffer", "buffer_tableam_handler", "t"),
     ]
+}
+
+/// `pg_catalog.pg_cursors` — the session's open `DECLARE … CURSOR` cursors.
+///
+/// A view over `pg_cursor()` in PostgreSQL; served here as a relation whose rows
+/// the session supplies, which is indistinguishable to a client reading it.
+///
+/// Divergence: `creation_time` is always NULL. It is a `timestamptz` of when the
+/// cursor was declared, and crabgresql has no wall clock in the executor yet —
+/// no `now()`/`current_timestamp`. The column is kept so `SELECT *` has
+/// PostgreSQL's shape.
+pub fn pg_cursors_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_cursors",
+        "pg_catalog",
+        vec![
+            col("name", PgType::Text),
+            col("statement", PgType::Text),
+            col("is_holdable", PgType::Bool),
+            col("is_binary", PgType::Bool),
+            col("is_scrollable", PgType::Bool),
+            col("creation_time", PgType::TimestampTz),
+        ],
+    )
+}
+
+/// One row per open cursor, in the order the session enumerated them.
+pub fn pg_cursors_rows(cursors: &[CatalogCursor]) -> Vec<Vec<Value>> {
+    cursors
+        .iter()
+        .map(|cursor| {
+            vec![
+                Value::Text(cursor.name.clone()),
+                Value::Text(cursor.statement.clone()),
+                Value::Bool(cursor.is_holdable),
+                Value::Bool(cursor.is_binary),
+                Value::Bool(cursor.is_scrollable),
+                Value::Null,
+            ]
+        })
+        .collect()
 }
 
 /// `pg_catalog.pg_class` — a curated subset of columns for user relations, in

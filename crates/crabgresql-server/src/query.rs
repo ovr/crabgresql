@@ -157,6 +157,9 @@ pub enum RowTag {
     /// `EXPLAIN`, whose tag carries no count — the plan's line count is not a row
     /// count, and a driver that reads the trailing integer would report it as one.
     Explain,
+    /// `FETCH`, whose count is the rows this fetch returned — not the cursor's
+    /// size and not its position.
+    Fetch,
 }
 
 impl RowTag {
@@ -168,6 +171,7 @@ impl RowTag {
             RowTag::Update => format!("UPDATE {count}"),
             RowTag::Delete => format!("DELETE {count}"),
             RowTag::Explain => "EXPLAIN".to_string(),
+            RowTag::Fetch => format!("FETCH {count}"),
         }
     }
 }
@@ -303,6 +307,25 @@ fn bind_catalogs(
         // User-defined types are reflected into pg_type/pg_enum on demand.
         let types = global_catalog.clone();
         let routines = global_catalog.clone();
+        // Cursors can't be enumerated lazily like the rest: the closure outlives
+        // this borrow of the session, so their metadata is snapshotted here. Only
+        // the names and statement texts are copied — never the rows — and a
+        // session with no open cursor copies nothing. Sorted so `SELECT * FROM
+        // pg_cursors` is stable across runs, where PG's hash order is not.
+        let mut cursors: Vec<_> = session
+            .cursors
+            .iter()
+            .map(|(name, cursor)| crabgresql_catalog::CatalogCursor {
+                name: name.clone(),
+                statement: cursor.statement.clone(),
+                is_holdable: cursor.hold,
+                is_binary: cursor.binary,
+                // Every materialised cursor can scan backward unless it was
+                // declared NO SCROLL.
+                is_scrollable: cursor.scroll != Some(false),
+            })
+            .collect();
+        cursors.sort_by(|a, b| a.name.cmp(&b.name));
         Arc::new(
             crabgresql_catalog::SystemCatalog::with_catalog_relations_fn(
                 database,
@@ -380,7 +403,8 @@ fn bind_catalogs(
                     schemas.push((temp_schema_for_nsp.clone(), temp_namespace_oid));
                 }
                 schemas
-            }),
+            })
+            .with_cursors_fn(move || cursors.clone()),
         )
     };
     let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
@@ -566,6 +590,19 @@ pub fn analyze_statement(
                 result_columns: Some(explain_columns()),
             });
         }
+        // `FETCH` returns whatever its cursor holds, so Describe answers from the
+        // open cursor rather than from a plan. An unknown name reports NoData and
+        // leaves the 34000 to Execute — Parse must not fail for a cursor the
+        // client is about to declare.
+        ast::Statement::Fetch { name, .. } => {
+            return Ok(Analyzed {
+                param_types: Vec::new(),
+                result_columns: session
+                    .cursors
+                    .get(&name.value)
+                    .map(|cursor| cursor.columns.clone()),
+            });
+        }
         // Utility statements (DDL/SET/transaction control) take no parameters and
         // return no rows; their errors surface at Execute, as in PG.
         _ => {
@@ -599,6 +636,24 @@ pub fn execute_statement(
     stmt: &ast::Statement,
     session: &mut Session,
     params: &BoundParams,
+) -> Result<QueryResult, PgError> {
+    execute_statement_with(engine, global_catalog, txnmgr, stmt, session, params, false)
+}
+
+/// [`execute_statement`], plus the one knob `DECLARE … CURSOR` needs.
+///
+/// `force_materialize` drains a streamed result set inside the statement's own
+/// transaction instead of handing back a live iterator — the treatment a plan
+/// that calls a routine already gets. `DECLARE` needs it because the rows
+/// outlive the statement that produced them.
+pub(crate) fn execute_statement_with(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    stmt: &ast::Statement,
+    session: &mut Session,
+    params: &BoundParams,
+    force_materialize: bool,
 ) -> Result<QueryResult, PgError> {
     // In an aborted transaction block, PG rejects everything but COMMIT/ROLLBACK
     // until the block ends.
@@ -831,6 +886,30 @@ pub fn execute_statement(
             ast::Statement::Call(call) => {
                 return execute_call(engine, global_catalog, txnmgr, call, session);
             }
+            ast::Statement::Declare { stmts } => {
+                return crate::cursor::execute_declare(
+                    engine,
+                    global_catalog,
+                    txnmgr,
+                    stmt,
+                    stmts,
+                    session,
+                );
+            }
+            ast::Statement::Fetch {
+                name,
+                direction,
+                into,
+                ..
+            } => {
+                return crate::cursor::execute_fetch(name, direction, into.as_ref(), session);
+            }
+            ast::Statement::Move {
+                name, direction, ..
+            } => return crate::cursor::execute_move(name, direction, session),
+            ast::Statement::Close { cursor } => {
+                return crate::cursor::execute_close(cursor, session);
+            }
             ast::Statement::Set(set) => return apply_set(set, session),
             ast::Statement::Reset(reset) => return apply_reset(reset, session),
             ast::Statement::StartTransaction {
@@ -1033,11 +1112,15 @@ pub fn execute_statement(
     // transaction lifetimes; until then the cost is the result set's memory,
     // paid only by statements that call a routine.
     //
+    // `force_materialize` is the same need from the other direction: `DECLARE …
+    // CURSOR` keeps its rows past the end of this statement, so they have to be
+    // read while the transaction is still open.
+    //
     // Draining is where a routine body actually runs, so it is also where a
     // `RAISE EXCEPTION` surfaces — it needs the same abort path `execute` has
     // above, or the statement's XID is never marked aborted and stays in the
     // in-flight set, pinning the snapshot horizon for the life of the process.
-    let exec = if calls_routine {
+    let exec = if calls_routine || force_materialize {
         match materialize(exec) {
             Ok(exec) => exec,
             Err(e) => {
@@ -1456,6 +1539,10 @@ fn read_only_active(session: &Session) -> bool {
 /// Transaction control and `SET`/`RESET` take none; every other statement —
 /// queries, DML, and DDL — does. Used to enforce the "SET TRANSACTION ISOLATION
 /// LEVEL before any query" rule uniformly across statement kinds.
+///
+/// `FETCH`/`MOVE`/`CLOSE` read no table: they walk a cursor whose snapshot was
+/// taken back at its `DECLARE`. `DECLARE` itself is where the snapshot is taken,
+/// so it keeps the default.
 fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
     !matches!(
         stmt,
@@ -1464,6 +1551,9 @@ fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
             | ast::Statement::Rollback { .. }
             | ast::Statement::Set(_)
             | ast::Statement::Reset(_)
+            | ast::Statement::Fetch { .. }
+            | ast::Statement::Move { .. }
+            | ast::Statement::Close { .. }
     )
 }
 
@@ -1593,6 +1683,8 @@ fn commit_transaction(
                     .commit(active.xid.unwrap_or(Xid::INVALID))
                     .map_err(commit_io_error)?;
             }
+            // The block's cursors end with it, except the holdable ones.
+            crate::cursor::close_on_commit(session);
             "COMMIT"
         }
     };
@@ -1641,6 +1733,9 @@ fn abort_active(txnmgr: &TransactionManager, session: &mut Session) {
     if let Some(active) = session.xact.take() {
         txnmgr.abort(active.xid.unwrap_or(Xid::INVALID));
     }
+    // A rollback closes every cursor the block declared, holdable ones included
+    // — a holdable cursor only earns its reprieve by committing.
+    crate::cursor::close_on_abort(session);
 }
 
 /// `TRUNCATE [TABLE] name [, ...]` (bare form only). All named tables are

@@ -1,0 +1,408 @@
+--
+-- CURSOR
+-- DECLARE / FETCH / MOVE / CLOSE: every FETCH direction, the transaction
+-- scoping rules (block-scoped vs WITH HOLD), NO SCROLL, and pg_cursors.
+--
+CREATE TABLE ten (g integer);
+INSERT INTO ten VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+-- A cursor with no WITH HOLD would not survive the statement that made it, so
+-- PostgreSQL refuses to open one outside a block.
+DECLARE nope CURSOR FOR SELECT * FROM ten;
+ERROR:  DECLARE CURSOR can only be used in transaction blocks
+FETCH 1 FROM nope;
+ERROR:  cursor "nope" does not exist
+-- Directional fetches deliver every row they pass over.
+BEGIN;
+DECLARE c SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
+FETCH 3 c;
+ g 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+FETCH BACKWARD 1 c;
+ g 
+---
+ 2
+(1 row)
+
+FETCH NEXT c;
+ g 
+---
+ 3
+(1 row)
+
+FETCH PRIOR FROM c;
+ g 
+---
+ 2
+(1 row)
+
+FETCH FORWARD 2 IN c;
+ g 
+---
+ 3
+ 4
+(2 rows)
+
+FETCH FORWARD c;
+ g 
+---
+ 5
+(1 row)
+
+FETCH BACKWARD c;
+ g 
+---
+ 4
+(1 row)
+
+-- Omitting the direction means NEXT; FROM/IN are noise words.
+FETCH c;
+ g 
+---
+ 5
+(1 row)
+
+FETCH FROM c;
+ g 
+---
+ 6
+(1 row)
+
+-- ABSOLUTE / RELATIVE land on a single row however far they travel, and a
+-- negative count reads from the end.
+FETCH ABSOLUTE 4 c;
+ g 
+---
+ 4
+(1 row)
+
+FETCH RELATIVE -2 c;
+ g 
+---
+ 2
+(1 row)
+
+FETCH ABSOLUTE -1 c;
+ g  
+----
+ 10
+(1 row)
+
+FETCH FIRST c;
+ g 
+---
+ 1
+(1 row)
+
+FETCH LAST c;
+ g  
+----
+ 10
+(1 row)
+
+-- A zero count re-reads the row the cursor is already on.
+FETCH RELATIVE 0 c;
+ g  
+----
+ 10
+(1 row)
+
+FETCH 0 c;
+ g  
+----
+ 10
+(1 row)
+
+-- ABSOLUTE 0 is the gap before the first row: legal, and empty.
+FETCH ABSOLUTE 0 c;
+ g 
+---
+(0 rows)
+
+-- ALL drains from wherever the cursor stands; a second one is empty.
+FETCH ALL c;
+ g  
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+FETCH ALL c;
+ g 
+---
+(0 rows)
+
+-- Both ends are positions, not lost rows.
+FETCH PRIOR c;
+ g  
+----
+ 10
+(1 row)
+
+FETCH BACKWARD ALL c;
+ g 
+---
+ 9
+ 8
+ 7
+ 6
+ 5
+ 4
+ 3
+ 2
+ 1
+(9 rows)
+
+FETCH BACKWARD 1 c;
+ g 
+---
+(0 rows)
+
+-- A negative count reverses the direction word.
+FETCH 3 c;
+ g 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+FETCH -2 c;
+ g 
+---
+ 2
+ 1
+(2 rows)
+
+FETCH BACKWARD -1 c;
+ g 
+---
+ 2
+(1 row)
+
+-- MOVE is FETCH without the rows. The harness does not echo command tags, so
+-- each move is pinned by the row the next FETCH lands on.
+MOVE ABSOLUTE 0 c;
+MOVE 3 c;
+FETCH c;
+ g 
+---
+ 4
+(1 row)
+
+MOVE ALL c;
+FETCH c;
+ g 
+---
+(0 rows)
+
+FETCH PRIOR c;
+ g  
+----
+ 10
+(1 row)
+
+MOVE BACKWARD ALL c;
+FETCH c;
+ g 
+---
+ 1
+(1 row)
+
+MOVE FORWARD 5 IN c;
+FETCH c;
+ g 
+---
+ 7
+(1 row)
+
+MOVE c;
+FETCH c;
+ g 
+---
+ 9
+(1 row)
+
+MOVE BACKWARD 2 c;
+FETCH c;
+ g 
+---
+ 8
+(1 row)
+
+COMMIT;
+-- The block's cursors went with it.
+FETCH 1 c;
+ERROR:  cursor "c" does not exist
+-- A name is unique per session, and the clash aborts the block.
+BEGIN;
+DECLARE c CURSOR FOR SELECT * FROM ten;
+DECLARE c CURSOR FOR SELECT * FROM ten;
+ERROR:  cursor "c" already exists
+ROLLBACK;
+-- CLOSE takes one cursor or all of them, and a missing name is an error.
+BEGIN;
+DECLARE c1 CURSOR FOR SELECT * FROM ten;
+DECLARE c2 CURSOR FOR SELECT * FROM ten;
+CLOSE c1;
+SELECT name FROM pg_cursors ORDER BY 1;
+ name 
+------
+ c2
+(1 row)
+
+CLOSE ALL;
+SELECT name FROM pg_cursors ORDER BY 1;
+ name 
+------
+(0 rows)
+
+COMMIT;
+CLOSE nosuch;
+ERROR:  cursor "nosuch" does not exist
+--
+-- NO SCROLL rejects backward movement, whichever keyword produced it.
+--
+BEGIN;
+DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
+FETCH 2 ns;
+ g 
+---
+ 1
+ 2
+(2 rows)
+
+FETCH BACKWARD 1 ns;
+ERROR:  cursor can only scan forward
+HINT:  Declare it with SCROLL option to enable backward scan.
+COMMIT;
+BEGIN;
+DECLARE ns NO SCROLL CURSOR FOR SELECT * FROM ten ORDER BY g;
+FETCH ABSOLUTE 2 ns;
+ g 
+---
+ 2
+(1 row)
+
+FETCH ABSOLUTE 3 ns;
+ g 
+---
+ 3
+(1 row)
+
+FETCH ABSOLUTE 1 ns;
+ERROR:  cursor can only scan forward
+HINT:  Declare it with SCROLL option to enable backward scan.
+COMMIT;
+--
+-- WITH HOLD survives the commit of the block that declared it.
+--
+BEGIN;
+DECLARE held SCROLL CURSOR WITH HOLD FOR SELECT * FROM ten ORDER BY g;
+DECLARE plain CURSOR FOR SELECT * FROM ten ORDER BY g;
+COMMIT;
+FETCH 2 held;
+ g 
+---
+ 1
+ 2
+(2 rows)
+
+FETCH 1 plain;
+ERROR:  cursor "plain" does not exist
+-- A later, unrelated rollback does not touch it: it belongs to no block now.
+BEGIN;
+ROLLBACK;
+FETCH 1 held;
+ g 
+---
+ 3
+(1 row)
+
+-- But a rollback does close everything the aborting block declared, holdable
+-- or not.
+BEGIN;
+DECLARE doomed CURSOR WITH HOLD FOR SELECT * FROM ten;
+ROLLBACK;
+FETCH 1 doomed;
+ERROR:  cursor "doomed" does not exist
+--
+-- pg_cursors reflects the session's open cursors.
+--
+SELECT name, statement, is_holdable, is_binary, is_scrollable FROM pg_cursors ORDER BY 1;
+ name |                               statement                                | is_holdable | is_binary | is_scrollable 
+------+------------------------------------------------------------------------+-------------+-----------+---------------
+ held | DECLARE held SCROLL CURSOR WITH HOLD FOR SELECT * FROM ten ORDER BY g; | t           | f         | t
+(1 row)
+
+BEGIN;
+DECLARE scr SCROLL CURSOR FOR SELECT * FROM ten;
+DECLARE nsc NO SCROLL CURSOR FOR SELECT * FROM ten;
+SELECT name, statement, is_holdable, is_binary, is_scrollable FROM pg_cursors ORDER BY 1;
+ name |                               statement                                | is_holdable | is_binary | is_scrollable 
+------+------------------------------------------------------------------------+-------------+-----------+---------------
+ held | DECLARE held SCROLL CURSOR WITH HOLD FOR SELECT * FROM ten ORDER BY g; | t           | f         | t
+ nsc  | DECLARE nsc NO SCROLL CURSOR FOR SELECT * FROM ten;                    | f           | f         | f
+ scr  | DECLARE scr SCROLL CURSOR FOR SELECT * FROM ten;                       | f           | f         | t
+(3 rows)
+
+COMMIT;
+SELECT name, is_holdable, is_scrollable FROM pg_cursors ORDER BY 1;
+ name | is_holdable | is_scrollable 
+------+-------------+---------------
+ held | t           | t
+(1 row)
+
+CLOSE ALL;
+SELECT count(*) FROM pg_cursors;
+ count 
+-------
+     0
+(1 row)
+
+--
+-- A cursor reads the snapshot its DECLARE took, not the one its FETCH runs
+-- under.
+--
+BEGIN;
+DECLARE snap CURSOR FOR SELECT * FROM ten ORDER BY g;
+INSERT INTO ten VALUES (11);
+FETCH ALL snap;
+ g  
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+ROLLBACK;
+-- The count is an int, so the grammar rejects anything else.
+FETCH 1.5 held;
+ERROR:  syntax error at or near "1.5"
+LINE 1: FETCH 1.5 held;
+              ^
+MOVE 2147483648 held;
+ERROR:  syntax error at or near "2147483648"
+LINE 1: MOVE 2147483648 held;
+             ^
+CLOSE ALL;
+DROP TABLE ten;
