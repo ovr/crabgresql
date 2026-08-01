@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_buffer_engine::BufferTable;
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, IndexMetadata, RelStats, StorageError, TableAm,
+    BatchStream, ColumnProjection, DeleteResult, IndexMetadata, RelStats, StorageError, TableAm,
     TableCapabilities, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{Clog, LockOwner, TransactionManager, TxnContext, Xid};
@@ -318,6 +318,24 @@ impl TableAm for BufferedParquetTable {
         )
     }
 
+    fn supports_batch_scan(&self) -> bool {
+        self.chunks.supports_batch_scan() && self.buffer.supports_batch_scan()
+    }
+
+    /// Both leaves, chained, exactly as [`Self::scan`] chains their rows — and
+    /// under one `TxnContext` for the same exactly-once reason.
+    ///
+    /// The two produce batches by different means (the chunk store passes the
+    /// reader's own through; the buffer builds them from rows), so they only
+    /// concatenate because both stamp
+    /// [`scan_schema`](crabgresql_storage_api::arrow::scan_schema) rather than
+    /// whatever shape their own storage happens to have.
+    fn scan_batches(&self, txn: &TxnContext, projection: &ColumnProjection) -> Option<BatchStream> {
+        let chunks = self.chunks.scan_batches(txn, projection)?;
+        let buffer = self.buffer.scan_batches(txn, projection)?;
+        Some(Box::new(chunks.chain(buffer)))
+    }
+
     /// Route by the tid's own bit: a logical id belongs to the buffer, a physical
     /// `(block, offset)` to a fragment. No side table, and it stays correct when a
     /// row moves between them, because a flushed row keeps its logical id.
@@ -432,15 +450,23 @@ mod tests {
     }
 
     fn open_table(root: &Path, wal: Arc<Wal>) -> Result<BufferedParquetTable, StorageError> {
+        open_table_of(root, wal, schema())
+    }
+
+    fn open_table_of(
+        root: &Path,
+        wal: Arc<Wal>,
+        schema: TableSchema,
+    ) -> Result<BufferedParquetTable, StorageError> {
         let chunks = ParquetTable::open(
             root,
             1,
-            schema(),
+            schema.clone(),
             Vec::new(),
             Arc::clone(&wal),
             Arc::new(Counter(AtomicU32::new(1_000))),
         )?;
-        let buffer = BufferTable::open(1, schema(), Vec::new(), wal).as_write_buffer_of("p");
+        let buffer = BufferTable::open(1, schema, Vec::new(), wal).as_write_buffer_of("p");
         Ok(BufferedParquetTable::open(chunks, buffer, Vec::new()))
     }
 
@@ -544,6 +570,87 @@ mod tests {
             .insert_many(ids.iter().map(|id| vec![Value::Int4(*id)]).collect(), &txn)
             .expect("insert must succeed");
         tm.commit(xid).expect("commit must succeed");
+    }
+
+    /// The two leaves must agree on *values*, not just on row count.
+    ///
+    /// This is the two-leaf hazard the batch path introduces. A fragment stores
+    /// temporal columns in Arrow's epoch; the RAM buffer holds `Value`s in
+    /// PostgreSQL's. If only one leaf converted, the same `DATE` would read back
+    /// differently depending on which half of the table it happened to be in —
+    /// about thirty years apart, with no error anywhere. Half the rows are
+    /// flushed and half are not, so both leaves are non-empty in one scan.
+    #[test]
+    fn both_leaves_agree_on_temporal_values_in_batches() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let mut temporal = TableSchema::new(
+            "p",
+            vec![
+                Column::new("id", PgType::Int4),
+                Column::new("d", PgType::Date),
+            ],
+        );
+        temporal.access_method = TableAccessMethod::Parquet;
+
+        let table = Arc::new(open_table_of(dir.path(), Arc::clone(&wal), temporal)?);
+        let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+        let mut tm =
+            TransactionManager::new_recovered(sink, Arc::new(Clog::new()), Xid::FIRST_NORMAL);
+        tm.set_finalize(Arc::new(Finalize(Arc::clone(&table))));
+
+        let insert = |ids: &[i32]| {
+            let xid = tm.allocate_xid();
+            table
+                .insert_many(
+                    ids.iter()
+                        .map(|id| vec![Value::Int4(*id), Value::Date(*id * 1_000)])
+                        .collect(),
+                    &tm.context(xid, CommandId::FIRST),
+                )
+                .expect("insert must succeed");
+            tm.commit(xid).expect("commit must succeed");
+        };
+
+        insert(&[1, 2, 3]);
+        // Only these three reach a fragment; the next three stay in RAM.
+        assert_eq!(table.flush(&tm)?, 3);
+        insert(&[4, 5, 6]);
+
+        let reader = read_only(&tm);
+        let mut from_rows: Vec<Tuple> = table
+            .scan(&reader, &ColumnProjection::All)
+            .map(|row| row.map(|(_, tuple)| tuple))
+            .collect::<Result<_, _>>()?;
+
+        let schema = table.schema().clone();
+        let positions: Vec<usize> = (0..schema.columns.len()).collect();
+        let mut from_batches: Vec<Tuple> = Vec::new();
+        for batch in table
+            .scan_batches(&reader, &ColumnProjection::All)
+            .ok_or_else(|| anyhow::anyhow!("a buffered Parquet relation must offer batches"))?
+        {
+            let batch = batch?;
+            for row in 0..batch.num_rows() {
+                from_batches.push(crabgresql_storage_api::arrow::decode_row(
+                    &schema, &positions, &batch, row,
+                )?);
+            }
+        }
+
+        let key = |t: &Tuple| match t[0] {
+            Value::Int4(id) => id,
+            ref other => panic!("unexpected id {other:?}"),
+        };
+        from_rows.sort_by_key(key);
+        from_batches.sort_by_key(key);
+
+        assert_eq!(from_batches, from_rows);
+        assert_eq!(from_batches.len(), 6, "both leaves contributed");
+        for tuple in &from_batches {
+            assert_eq!(tuple[1], Value::Date(key(tuple) * 1_000));
+        }
+        Ok(())
     }
 
     #[test]

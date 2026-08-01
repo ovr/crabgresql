@@ -58,6 +58,44 @@ termination, per-row triggers. Therefore:
 - **v2**: vectorized fast paths for read-only plans without volatile functions
   (morally like JIT in PG: enabled only when it is safe).
 
+v2 has begun. Columnar nodes live in `crabgresql-executor`'s `vector` module
+**beside** the row nodes, never replacing them: a scan, an append, a filter, a
+take-only projection and a sort. A columnar *segment* starts at a scan whose
+engine offers `TableAm::scan_batches` and runs as far up as every operator has a
+vectorized form; `Shred` turns batches back into tuples wherever it stops, so
+the row executor above is unchanged and remains correct on its own.
+
+Four rules keep this honest:
+
+- **No knob.** The path is chosen automatically per node, when the engine can
+  produce batches (`USING parquet`, `USING buffer`) and the expressions involved
+  are provably equivalent. The heap engine is untouched, so the whole regression
+  corpus keeps exercising the row path.
+- **The planner decides, once.** `crabgresql_planner::vectorize` owns every
+  eligibility rule, for the same reason `uses_hash_join` lives there: `EXPLAIN`
+  and the executor must not drift. The executor decides only *how*.
+- **Declining is free.** Anything outside the provable subset falls back to the
+  row node silently. A fallback is never an error.
+- **`EXPLAIN` says so.** A vectorized node renders a `(columnar: scan, filter,
+  sort)` suffix — a deliberate divergence from PG's output, on the grounds that
+  a plan which runs on a different engine than it appears to is worth less than
+  the compatibility it costs. Row-path plans render exactly as before.
+
+Where Arrow's semantics differ from PostgreSQL's, the type is excluded rather
+than approximated: `numeric` (stored as text, so Arrow would compare `'9' >
+'10'`), floats under equality (PG defines `NaN = NaN` as true), `bpchar`
+(blank-trimmed comparison), `timetz`/`interval` (structs with their own orders),
+and text ordering under an ICU collation. Floats *are* usable as sort keys,
+because canonicalizing `-0.0` and NaN makes Arrow's total order coincide with
+PG's — ordering is repairable where equality is not. `AND`/`OR` use Arrow's
+Kleene kernels; the plain ones return NULL for `false AND NULL` and would
+silently drop rows.
+
+Arrow batches carry **`Value` semantics, not Arrow's** — a `Date32` holds
+PostgreSQL epoch days. A format whose file layout is defined in Arrow's epoch
+converts at its own boundary and nowhere else, so a relation's storage leaves
+cannot disagree about what a date means.
+
 ### 1.3 Storage: pluggable engines (storage engine API)
 
 Storage is not a single implementation but an **extension point**. The core

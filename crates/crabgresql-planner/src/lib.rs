@@ -6,6 +6,7 @@
 
 mod projection;
 mod pushdown;
+pub mod vectorize;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -954,7 +955,11 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
         } => {
             let schema = table.schema();
             let names = schema_names(schema);
-            let mut lines = vec![format!("Seq Scan on {}", schema.name)];
+            let mut lines = vec![format!(
+                "Seq Scan on {}{}",
+                schema.name,
+                plan.vectorization().suffix().unwrap_or_default()
+            )];
             if let Some(predicate) = predicate {
                 lines.push(format!("  Filter: ({})", explain_expr(predicate, &names)));
             }
@@ -997,6 +1002,10 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             // `Seq Scan on <leaf>`, while an engine-internal storage leaf can
             // distinguish itself, so an Append over one relation's leaves is not
             // the same line repeated.
+            // Not annotated here: an engine-managed relation always renders
+            // through the `Subquery` that owns its tail, and that wrapper adds
+            // the annotation to this very line. Doing it in both places would
+            // print the suffix twice.
             let mut lines = vec!["Append".to_string()];
             for table in tables {
                 lines.push(format!("  ->  {}", table.scan_label()));
@@ -1028,6 +1037,15 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             source, predicate, ..
         } => {
             let mut lines = explain(source);
+            // The tail on this wrapper is what vectorizes, but the node the user
+            // sees is the child's root line — an engine-managed relation renders
+            // as `Append`, with no line of its own for the Subquery. So the
+            // annotation is attached there, describing the work as one node.
+            if let Some(suffix) = plan.vectorization().suffix()
+                && let Some(first) = lines.first_mut()
+            {
+                first.push_str(&suffix);
+            }
             // A subplan's WHERE lives here, not on the child, so rendering only
             // the child would drop the predicate from the plan entirely. Names
             // come from the SOURCE row (what the predicate indexes into), not the

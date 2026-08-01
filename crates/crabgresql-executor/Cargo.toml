@@ -8,6 +8,11 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+arrow-arith.workspace = true
+arrow-array.workspace = true
+arrow-ord.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
 crabgresql-binder.workspace = true
 crabgresql-planner.workspace = true
 crabgresql-pg-wire.workspace = true

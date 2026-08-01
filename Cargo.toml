@@ -29,8 +29,11 @@ pg-ryu = { path = "vendor/ryu" }
 
 # external
 bytes = "1"
+arrow-arith = "59.1"
 arrow-array = "59.1"
+arrow-ord = "59.1"
 arrow-schema = "59.1"
+arrow-select = "59.1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
 deepsize = "0.2"

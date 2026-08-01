@@ -286,6 +286,17 @@ static ICU_COLLATORS: LazyLock<HashMap<u32, CollatorBorrowed<'static>>> = LazyLo
         .collect()
 });
 
+/// Whether `oid` orders strings by their bytes — `C`, `POSIX`, `ucs_basic`, the
+/// database default, and any OID the registry does not know.
+///
+/// Derived from the same lookup [`compare_str`] uses, so the two can never
+/// disagree about which collations are byte order. A caller that can only
+/// reproduce byte order (a vectorized comparison, an index on raw bytes) asks
+/// this before taking that path.
+pub fn is_byte_order(oid: u32) -> bool {
+    !lookup_by_oid(oid).is_some_and(|def| def.is_icu())
+}
+
 /// Compare two strings under the collation `oid`, as a total order.
 ///
 /// An unknown OID compares by bytes, so a collation dropped from the registry

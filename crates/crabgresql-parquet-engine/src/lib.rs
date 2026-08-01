@@ -31,19 +31,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder,
-    Int16Builder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
-};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
-    RecordBatchReader, StringArray, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    Array, ArrayRef, Date32Array, RecordBatch, RecordBatchOptions, RecordBatchReader,
+    TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+use arrow_schema::{DataType, TimeUnit};
+use crabgresql_storage_api::arrow::{build_batch, decode_row};
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats,
+    BatchStream, ColumnProjection, DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats,
     RelfilenodeAllocator, StorageError, TableAm, TableCapabilities, TableSchema, Tid, Tuple,
     TupleStream, UpdateResult,
 };
@@ -51,7 +46,7 @@ use crabgresql_txn::{
     CommandId, Infomask, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, Xid,
     satisfies_mvcc,
 };
-use crabgresql_types::{Interval, PgType, TimeTz, Value};
+use crabgresql_types::PgType;
 use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, Wal, WalError};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
@@ -97,29 +92,12 @@ fn schema_identity(schema: &TableSchema) -> String {
         .join("|")
 }
 
+/// Whether a fragment can represent this type. The whitelist is the shared
+/// columnar one — a Parquet file is just the durable form of a batch, so a type
+/// this engine accepts is exactly a type [`crabgresql_storage_api::arrow`] can
+/// encode.
 pub fn supports_type(ty: PgType) -> bool {
-    matches!(
-        ty,
-        PgType::Bool
-            | PgType::Int2
-            | PgType::Int4
-            | PgType::Int8
-            | PgType::Float4
-            | PgType::Float8
-            | PgType::Numeric
-            | PgType::Text
-            | PgType::Varchar
-            | PgType::Bpchar
-            | PgType::Name
-            | PgType::Bytea
-            | PgType::Uuid
-            | PgType::Date
-            | PgType::Time
-            | PgType::TimeTz
-            | PgType::Timestamp
-            | PgType::TimestampTz
-            | PgType::Interval
-    )
+    crabgresql_storage_api::arrow::supports_type(ty)
 }
 
 /// Reject a schema this format cannot represent.
@@ -144,302 +122,80 @@ pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn arrow_type(ty: PgType) -> DataType {
-    match ty {
-        PgType::Bool => DataType::Boolean,
-        PgType::Int2 => DataType::Int16,
-        PgType::Int4 => DataType::Int32,
-        PgType::Int8 => DataType::Int64,
-        PgType::Float4 => DataType::Float32,
-        PgType::Float8 => DataType::Float64,
-        PgType::Numeric | PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
-            DataType::Utf8
-        }
-        PgType::Bytea => DataType::Binary,
-        PgType::Uuid => DataType::FixedSizeBinary(16),
-        PgType::Date => DataType::Date32,
-        PgType::Time => DataType::Time64(TimeUnit::Microsecond),
-        PgType::TimeTz => DataType::Struct(Fields::from(vec![
-            Field::new("time_us", DataType::Int64, false),
-            Field::new("offset_seconds", DataType::Int32, false),
-        ])),
-        PgType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
-        PgType::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        PgType::Interval => DataType::Struct(Fields::from(vec![
-            Field::new("months", DataType::Int32, false),
-            Field::new("days", DataType::Int32, false),
-            Field::new("micros", DataType::Int64, false),
-        ])),
-        _ => DataType::Binary,
-    }
-}
-
-fn arrow_schema(schema: &TableSchema) -> Arc<Schema> {
-    Arc::new(Schema::new(
-        schema
-            .columns
-            .iter()
-            .map(|column| {
-                let metadata = HashMap::from([
-                    (
-                        "crabgresql.pg_type_oid".to_string(),
-                        column.ty.oid().to_string(),
-                    ),
-                    ("crabgresql.typmod".to_string(), column.typmod.to_string()),
-                ]);
-                Field::new(&column.name, arrow_type(column.ty), column.nullable)
-                    .with_metadata(metadata)
-            })
-            .collect::<Vec<_>>(),
-    ))
-}
-
-fn value_mismatch(column: &str, ty: PgType) -> StorageError {
-    corrupt(format!(
-        "Parquet conversion for column \"{column}\" expected {}",
-        ty.name()
-    ))
-}
-
-fn build_array(
-    column: &crabgresql_storage_api::Column,
-    tuples: &[Tuple],
-    index: usize,
-) -> Result<ArrayRef, StorageError> {
-    macro_rules! primitive {
-        ($builder:ty, $variant:path) => {{
-            let mut builder = <$builder>::with_capacity(tuples.len());
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => builder.append_null(),
-                    $variant(value) => builder.append_value(*value),
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
-            }
-            Ok(Arc::new(builder.finish()) as ArrayRef)
-        }};
-    }
-
-    match column.ty {
-        PgType::Bool => primitive!(BooleanBuilder, Value::Bool),
-        PgType::Int2 => primitive!(Int16Builder, Value::Int2),
-        PgType::Int4 => primitive!(Int32Builder, Value::Int4),
-        PgType::Int8 => primitive!(Int64Builder, Value::Int8),
-        PgType::Float4 => primitive!(Float32Builder, Value::Float4),
-        PgType::Float8 => primitive!(Float64Builder, Value::Float8),
-        PgType::Numeric => {
-            let mut builder = StringBuilder::new();
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => builder.append_null(),
-                    Value::Numeric(value) => builder.append_value(value.to_display()),
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
-            let mut builder = StringBuilder::new();
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => builder.append_null(),
-                    Value::Text(value) => builder.append_value(value),
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        PgType::Bytea => {
-            let mut builder = BinaryBuilder::new();
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => builder.append_null(),
-                    Value::Bytea(value) => builder.append_value(value),
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        PgType::Uuid => {
-            let mut builder = FixedSizeBinaryBuilder::with_capacity(tuples.len(), 16);
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => builder.append_null(),
-                    Value::Uuid(value) => builder
-                        .append_value(value)
-                        .map_err(|error| io_error("encode UUID", error))?,
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        PgType::Date => {
-            let mut builder = arrow_array::builder::Date32Builder::with_capacity(tuples.len());
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => builder.append_null(),
-                    Value::Date(value) if *value == i32::MIN || *value == i32::MAX => {
-                        builder.append_value(*value)
-                    }
-                    Value::Date(value) => builder.append_value(
+/// Rebase the temporal columns of `batch` between PostgreSQL's epoch and the
+/// Unix epoch Parquet's `Date32`/`Timestamp` logical types are defined in.
+///
+/// This is the **only** place the two epochs meet. Everywhere above it —
+/// including every [`RecordBatch`] handed to the executor — a date is PG days
+/// and a timestamp is PG microseconds, per the invariant documented on
+/// [`crabgresql_storage_api::arrow`]. Keeping the shift at the file boundary is
+/// what stops a relation's two storage leaves from disagreeing: the RAM buffer
+/// never sees a file, so if the shift lived anywhere else, half a table's rows
+/// would come back displaced by `PG_UNIX_EPOCH_DAYS` (about thirty years) with
+/// no error to notice.
+///
+/// `delta` is added to every non-sentinel value; pass it negated to invert.
+/// `i32::MIN`/`i32::MAX` and `i64::MIN`/`i64::MAX` are the ±infinity sentinels
+/// and are ordinary bit patterns rather than instants, so they pass through
+/// untouched — shifting them would both overflow and turn infinity into a date.
+fn rebase_epoch(batch: &RecordBatch, days: i32, micros: i64) -> Result<RecordBatch, StorageError> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut changed = false;
+    for column in batch.columns() {
+        match column.data_type() {
+            DataType::Date32 => {
+                let values = required_array::<Date32Array>(column.as_ref(), "date")?;
+                let shifted: Date32Array = values.try_unary(|value| {
+                    if value == i32::MIN || value == i32::MAX {
+                        Ok(value)
+                    } else {
                         value
-                            .checked_add(PG_UNIX_EPOCH_DAYS)
-                            .ok_or_else(|| corrupt("date epoch conversion overflow"))?,
-                    ),
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        PgType::Time => {
-            let mut builder = Time64MicrosecondBuilder::with_capacity(tuples.len());
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => builder.append_null(),
-                    Value::Time(value) => builder.append_value(*value),
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        PgType::TimeTz => {
-            let fields = match arrow_type(PgType::TimeTz) {
-                DataType::Struct(fields) => fields,
-                _ => return Err(corrupt("invalid timetz Arrow schema")),
-            };
-            let mut builder = StructBuilder::new(
-                fields,
-                vec![Box::new(Int64Builder::new()), Box::new(Int32Builder::new())],
-            );
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => {
-                        builder
-                            .field_builder::<Int64Builder>(0)
-                            .ok_or_else(|| corrupt("timetz time builder is missing"))?
-                            .append_null();
-                        builder
-                            .field_builder::<Int32Builder>(1)
-                            .ok_or_else(|| corrupt("timetz zone builder is missing"))?
-                            .append_null();
-                        builder.append(false);
+                            .checked_add(days)
+                            .ok_or_else(|| corrupt("date epoch conversion overflow"))
                     }
-                    Value::TimeTz(value) => {
-                        builder
-                            .field_builder::<Int64Builder>(0)
-                            .ok_or_else(|| corrupt("timetz time builder is missing"))?
-                            .append_value(value.usec);
-                        builder
-                            .field_builder::<Int32Builder>(1)
-                            .ok_or_else(|| corrupt("timetz zone builder is missing"))?
-                            .append_value(value.zone);
-                        builder.append(true);
-                    }
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
+                })?;
+                columns.push(Arc::new(shifted));
+                changed = true;
             }
-            Ok(Arc::new(builder.finish()))
+            DataType::Timestamp(TimeUnit::Microsecond, zone) => {
+                let values =
+                    required_array::<TimestampMicrosecondArray>(column.as_ref(), "timestamp")?;
+                let shifted: TimestampMicrosecondArray = values.try_unary(|value| {
+                    if value == i64::MIN || value == i64::MAX {
+                        Ok(value)
+                    } else {
+                        value
+                            .checked_add(micros)
+                            .ok_or_else(|| corrupt("timestamp epoch conversion overflow"))
+                    }
+                })?;
+                // `try_unary` drops the zone, and it is what distinguishes
+                // `timestamptz` from `timestamp` in the file schema.
+                columns.push(match zone {
+                    Some(zone) => Arc::new(shifted.with_timezone(zone.clone())) as ArrayRef,
+                    None => Arc::new(shifted) as ArrayRef,
+                });
+                changed = true;
+            }
+            _ => columns.push(Arc::clone(column)),
         }
-        PgType::Timestamp | PgType::TimestampTz => {
-            let mut builder = TimestampMicrosecondBuilder::with_capacity(tuples.len());
-            for tuple in tuples {
-                let value = match (&tuple[index], column.ty) {
-                    (Value::Null, _) => {
-                        builder.append_null();
-                        continue;
-                    }
-                    (Value::Timestamp(value), PgType::Timestamp)
-                    | (Value::TimestampTz(value), PgType::TimestampTz) => *value,
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                };
-                let unix = if value == i64::MIN || value == i64::MAX {
-                    value
-                } else {
-                    value
-                        .checked_add(PG_UNIX_EPOCH_MICROS)
-                        .ok_or_else(|| corrupt("timestamp epoch conversion overflow"))?
-                };
-                builder.append_value(unix);
-            }
-            let array = builder.finish();
-            if column.ty == PgType::TimestampTz {
-                Ok(Arc::new(array.with_timezone("UTC")))
-            } else {
-                Ok(Arc::new(array))
-            }
-        }
-        PgType::Interval => {
-            let fields = match arrow_type(PgType::Interval) {
-                DataType::Struct(fields) => fields,
-                _ => return Err(corrupt("invalid interval Arrow schema")),
-            };
-            let mut builder = StructBuilder::new(
-                fields,
-                vec![
-                    Box::new(Int32Builder::new()),
-                    Box::new(Int32Builder::new()),
-                    Box::new(Int64Builder::new()),
-                ],
-            );
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => {
-                        builder
-                            .field_builder::<Int32Builder>(0)
-                            .ok_or_else(|| corrupt("interval month builder is missing"))?
-                            .append_null();
-                        builder
-                            .field_builder::<Int32Builder>(1)
-                            .ok_or_else(|| corrupt("interval day builder is missing"))?
-                            .append_null();
-                        builder
-                            .field_builder::<Int64Builder>(2)
-                            .ok_or_else(|| corrupt("interval time builder is missing"))?
-                            .append_null();
-                        builder.append(false);
-                    }
-                    Value::Interval(value) => {
-                        builder
-                            .field_builder::<Int32Builder>(0)
-                            .ok_or_else(|| corrupt("interval month builder is missing"))?
-                            .append_value(value.months);
-                        builder
-                            .field_builder::<Int32Builder>(1)
-                            .ok_or_else(|| corrupt("interval day builder is missing"))?
-                            .append_value(value.days);
-                        builder
-                            .field_builder::<Int64Builder>(2)
-                            .ok_or_else(|| corrupt("interval time builder is missing"))?
-                            .append_value(value.usec);
-                        builder.append(true);
-                    }
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        _ => Err(StorageError::UnsupportedType(format!(
-            "data type {} is not supported by table access method \"parquet\"",
-            column.ty.name()
-        ))),
     }
+    if !changed {
+        return Ok(batch.clone());
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(batch.schema(), columns, &options)
+        .map_err(|error| io_error("rebase Arrow record batch", error))
 }
 
-fn build_batch(schema: &TableSchema, tuples: &[Tuple]) -> Result<RecordBatch, StorageError> {
-    for tuple in tuples {
-        if tuple.len() != schema.columns.len() {
-            return Err(corrupt("tuple width does not match Parquet table schema"));
-        }
-    }
-    let arrays = schema
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| build_array(column, tuples, index))
-        .collect::<Result<Vec<_>, _>>()?;
-    let options = RecordBatchOptions::new().with_row_count(Some(tuples.len()));
-    RecordBatch::try_new_with_options(arrow_schema(schema), arrays, &options)
-        .map_err(|error| io_error("build Arrow record batch", error))
+/// PG epoch -> Unix epoch, on the way into a fragment.
+fn to_file_epoch(batch: &RecordBatch) -> Result<RecordBatch, StorageError> {
+    rebase_epoch(batch, PG_UNIX_EPOCH_DAYS, PG_UNIX_EPOCH_MICROS)
+}
+
+/// Unix epoch -> PG epoch, on the way out of a fragment.
+fn from_file_epoch(batch: &RecordBatch) -> Result<RecordBatch, StorageError> {
+    rebase_epoch(batch, -PG_UNIX_EPOCH_DAYS, -PG_UNIX_EPOCH_MICROS)
 }
 
 fn required_array<'a, T: 'static>(
@@ -451,127 +207,6 @@ fn required_array<'a, T: 'static>(
             "Parquet column \"{column}\" has an unexpected type"
         ))
     })
-}
-
-fn decode_value(
-    column: &crabgresql_storage_api::Column,
-    array: &dyn Array,
-    row: usize,
-) -> Result<Value, StorageError> {
-    if array.is_null(row) {
-        return Ok(Value::Null);
-    }
-    macro_rules! primitive {
-        ($array:ty, $variant:path) => {{
-            let values = required_array::<$array>(array, &column.name)?;
-            Ok($variant(values.value(row)))
-        }};
-    }
-    match column.ty {
-        PgType::Bool => primitive!(BooleanArray, Value::Bool),
-        PgType::Int2 => primitive!(Int16Array, Value::Int2),
-        PgType::Int4 => primitive!(Int32Array, Value::Int4),
-        PgType::Int8 => primitive!(Int64Array, Value::Int8),
-        PgType::Float4 => primitive!(Float32Array, Value::Float4),
-        PgType::Float8 => primitive!(Float64Array, Value::Float8),
-        PgType::Numeric => {
-            let values = required_array::<StringArray>(array, &column.name)?;
-            crabgresql_types::numeric::Numeric::parse(values.value(row))
-                .map(Value::Numeric)
-                .map_err(|_| corrupt(format!("invalid numeric in column \"{}\"", column.name)))
-        }
-        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
-            let values = required_array::<StringArray>(array, &column.name)?;
-            Ok(Value::Text(values.value(row).to_string()))
-        }
-        PgType::Bytea => {
-            let values = required_array::<BinaryArray>(array, &column.name)?;
-            Ok(Value::Bytea(values.value(row).to_vec()))
-        }
-        PgType::Uuid => {
-            let values = required_array::<FixedSizeBinaryArray>(array, &column.name)?;
-            let bytes: [u8; 16] = values
-                .value(row)
-                .try_into()
-                .map_err(|_| corrupt(format!("invalid UUID in column \"{}\"", column.name)))?;
-            Ok(Value::Uuid(bytes))
-        }
-        PgType::Date => {
-            let values = required_array::<Date32Array>(array, &column.name)?;
-            let value = values.value(row);
-            Ok(Value::Date(if value == i32::MIN || value == i32::MAX {
-                value
-            } else {
-                value
-                    .checked_sub(PG_UNIX_EPOCH_DAYS)
-                    .ok_or_else(|| corrupt("date epoch conversion overflow"))?
-            }))
-        }
-        PgType::Time => primitive!(Time64MicrosecondArray, Value::Time),
-        PgType::TimeTz => {
-            let values = required_array::<StructArray>(array, &column.name)?;
-            let time = required_array::<Int64Array>(values.column(0).as_ref(), &column.name)?;
-            let zone = required_array::<Int32Array>(values.column(1).as_ref(), &column.name)?;
-            Ok(Value::TimeTz(TimeTz {
-                usec: time.value(row),
-                zone: zone.value(row),
-            }))
-        }
-        PgType::Timestamp | PgType::TimestampTz => {
-            let values = required_array::<TimestampMicrosecondArray>(array, &column.name)?;
-            let value = values.value(row);
-            let pg = if value == i64::MIN || value == i64::MAX {
-                value
-            } else {
-                value
-                    .checked_sub(PG_UNIX_EPOCH_MICROS)
-                    .ok_or_else(|| corrupt("timestamp epoch conversion overflow"))?
-            };
-            Ok(if column.ty == PgType::Timestamp {
-                Value::Timestamp(pg)
-            } else {
-                Value::TimestampTz(pg)
-            })
-        }
-        PgType::Interval => {
-            let values = required_array::<StructArray>(array, &column.name)?;
-            let months = required_array::<Int32Array>(values.column(0).as_ref(), &column.name)?;
-            let days = required_array::<Int32Array>(values.column(1).as_ref(), &column.name)?;
-            let micros = required_array::<Int64Array>(values.column(2).as_ref(), &column.name)?;
-            Ok(Value::Interval(Interval {
-                months: months.value(row),
-                days: days.value(row),
-                usec: micros.value(row),
-            }))
-        }
-        _ => Err(corrupt(format!(
-            "unsupported type {} in Parquet catalog",
-            column.ty.name()
-        ))),
-    }
-}
-
-/// Decode one row of `batch` into a full-width tuple.
-///
-/// `positions` maps batch column → schema ordinal (see [`open_reader`]). Under a
-/// projection the batch is dense over the *selected* columns while the tuple
-/// stays as wide as the schema, so unselected slots keep the `Null` they were
-/// initialized with — values the scan contract leaves unspecified.
-fn decode_row(
-    schema: &TableSchema,
-    positions: &[usize],
-    batch: &RecordBatch,
-    row: usize,
-) -> Result<Tuple, StorageError> {
-    let mut tuple = vec![Value::Null; schema.columns.len()];
-    for (batch_index, &schema_index) in positions.iter().enumerate() {
-        tuple[schema_index] = decode_value(
-            &schema.columns[schema_index],
-            batch.column(batch_index).as_ref(),
-            row,
-        )?;
-    }
-    Ok(tuple)
 }
 
 #[derive(Clone, Debug)]
@@ -793,6 +428,75 @@ fn open_reader(
     Ok((reader, positions))
 }
 
+/// The columnar twin of [`ParquetScan`]: the same fragments, in the same order,
+/// handed up as batches instead of shredded into rows.
+///
+/// This is the whole point of the batch path — [`ParquetScan`] holds exactly
+/// this `RecordBatch` and takes it apart one cell at a time, so a vectorized
+/// consumer would otherwise pay to rebuild what the reader already had.
+///
+/// No [`Tid`] accompanies a batch, which is why this cannot replace the row
+/// scan: `fetch` addresses rows by their ordinal *within a scan*, and DML needs
+/// that identity.
+struct ParquetBatchScan {
+    schema: TableSchema,
+    /// The relation's `scan_schema`, built once. Every batch is stamped with it,
+    /// and deriving it per batch would rebuild a `Field` and a metadata map per
+    /// column — on a hundred-column relation that dwarfs the widening.
+    stamp: Arc<arrow_schema::Schema>,
+    rel: u32,
+    projection: ColumnProjection,
+    fragments: Vec<Fragment>,
+    fragment_index: usize,
+    reader: Option<ParquetRecordBatchReader>,
+    /// Batch column → schema ordinal for the fragment currently open, rebuilt
+    /// each time `reader` is replaced.
+    positions: Arc<[usize]>,
+    /// As in [`ParquetScan`]: held for the whole iterator life so a concurrent
+    /// TRUNCATE cannot remove the directory being read.
+    _guard: SharedGuard,
+}
+
+impl Iterator for ParquetBatchScan {
+    type Item = Result<RecordBatch, StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(reader) = &mut self.reader {
+                match reader.next() {
+                    Some(Ok(batch)) => {
+                        // Two conversions, both once per batch rather than once
+                        // per row: out of the file's epoch, and back to the
+                        // table's full width.
+                        return Some(from_file_epoch(&batch).and_then(|batch| {
+                            crabgresql_storage_api::arrow::widen(
+                                &self.schema,
+                                &self.stamp,
+                                &self.positions,
+                                &batch,
+                            )
+                        }));
+                    }
+                    Some(Err(error)) => {
+                        self.reader = None;
+                        return Some(Err(corrupt(format!("decode Parquet row group: {error}"))));
+                    }
+                    None => self.reader = None,
+                }
+            }
+            let fragment = self.fragments.get(self.fragment_index)?;
+            self.fragment_index += 1;
+            match open_reader(&self.schema, self.rel, fragment, &self.projection) {
+                Ok((reader, positions)) => {
+                    self.reader = Some(reader);
+                    self.positions = positions;
+                }
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+}
+
 struct ParquetScan {
     schema: TableSchema,
     rel: u32,
@@ -845,11 +549,19 @@ impl Iterator for ParquetScan {
             self.batch = None;
             if let Some(reader) = &mut self.reader {
                 match reader.next() {
-                    Some(Ok(batch)) => {
-                        self.batch = Some(batch);
-                        self.batch_row = 0;
-                        continue;
-                    }
+                    // One vectorized rebase per batch, at the file boundary and
+                    // nowhere else — see [`rebase_epoch`].
+                    Some(Ok(batch)) => match from_file_epoch(&batch) {
+                        Ok(batch) => {
+                            self.batch = Some(batch);
+                            self.batch_row = 0;
+                            continue;
+                        }
+                        Err(error) => {
+                            self.reader = None;
+                            return Some(Err(error));
+                        }
+                    },
                     Some(Err(error)) => {
                         self.reader = None;
                         return Some(Err(corrupt(format!("decode Parquet row group: {error}"))));
@@ -1418,6 +1130,28 @@ impl ParquetTable {
         Ok(self.scan_over(rel, fragments, guard, projection))
     }
 
+    /// The batch-shaped twin of [`ParquetTable::scan_in`], listing the same
+    /// fragments under the same shared hold.
+    fn batch_scan_in(
+        &self,
+        txn: &TxnContext,
+        projection: &ColumnProjection,
+    ) -> Result<ParquetBatchScan, StorageError> {
+        let guard = self.lock.acquire_shared(txn.lock_owner);
+        let rel = self.effective_rel(txn.xid);
+        Ok(ParquetBatchScan {
+            stamp: crabgresql_storage_api::arrow::scan_schema(&self.schema),
+            schema: self.schema.clone(),
+            rel,
+            projection: projection.clone(),
+            fragments: self.visible_fragments(rel, txn)?,
+            fragment_index: 0,
+            reader: None,
+            positions: Arc::from(Vec::new()),
+            _guard: guard,
+        })
+    }
+
     /// Scan an already-listed fragment set, taking over the caller's shared hold.
     /// Lets a caller that has both measured and listed (see [`ParquetTable::measure`])
     /// read exactly what it measured.
@@ -1499,7 +1233,9 @@ impl ParquetTable {
             .set_max_row_group_row_count(Some(MAX_FRAGMENT_ROWS))
             .set_key_value_metadata(Some(metadata))
             .build();
-        let batch = build_batch(&self.schema, tuples)?;
+        // Built in PG semantics, then shifted once into the epoch the file
+        // format is defined in — see [`rebase_epoch`].
+        let batch = to_file_epoch(&build_batch(&self.schema, tuples)?)?;
         let mut writer = ArrowWriter::try_new(writer_file, batch.schema(), Some(properties))
             .map_err(|error| io_error("create Parquet writer", error))?;
         writer
@@ -1675,6 +1411,17 @@ impl TableAm for ParquetTable {
         }
     }
 
+    fn supports_batch_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_batches(&self, txn: &TxnContext, projection: &ColumnProjection) -> Option<BatchStream> {
+        Some(match self.batch_scan_in(txn, projection) {
+            Ok(scan) => Box::new(scan),
+            Err(error) => Box::new(std::iter::once(Err(error))),
+        })
+    }
+
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
@@ -1695,7 +1442,11 @@ impl TableAm for ParquetTable {
                 batch.map_err(|error| corrupt(format!("decode Parquet row group: {error}")))?;
             for row in 0..batch.num_rows() {
                 if ordinal == tid.offset as u32 {
-                    return decode_row(&self.schema, &positions, &batch, row).map(Some);
+                    // Sliced first: this is a point lookup, so rebasing the
+                    // whole row group to return one tuple would scale the cost
+                    // of a `fetch` with the fragment rather than with the row.
+                    let one = from_file_epoch(&batch.slice(row, 1))?;
+                    return decode_row(&self.schema, &positions, &one, 0).map(Some);
                 }
                 ordinal += 1;
             }
@@ -1985,14 +1736,14 @@ mod tests {
     use crabgresql_storage_api::{
         Column, ColumnProjection, StorageError, TableAccessMethod, TableAm, TableSchema, Tid, Tuple,
     };
-    use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, Xid};
+    use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, TxnContext, Xid};
     use crabgresql_types::numeric::Numeric;
     use crabgresql_types::{Interval, PgType, TimeTz, Value};
     use crabgresql_wal::{RmgrRegistry, Wal, recover};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::basic::Compression;
 
-    use super::{ParquetTable, RelfilenodeAllocator};
+    use super::{ParquetTable, RelfilenodeAllocator, corrupt};
 
     /// A relfilenode counter for tests. It starts far above the ids the tests
     /// assign by hand, so a directory staged by a TRUNCATE can never collide with
@@ -3269,6 +3020,205 @@ mod tests {
     /// A mask prunes columns, never rows — so the tid sequence, and `fetch`'s
     /// ability to find a row by it, must be identical to an unprojected scan.
     /// Spans several fragments, since the ordinal restarts within each.
+    /// The bytes in a fragment are in **Arrow's** epoch, not PostgreSQL's.
+    ///
+    /// A fragment is a persisted format, so this is a compatibility boundary
+    /// rather than an internal detail: fragments written before the conversion
+    /// moved out of the per-row decode must still read back correctly. Every
+    /// other temporal test round-trips through both directions at once and would
+    /// pass just as happily if the shift were dropped or inverted on both sides,
+    /// so this is the only place the actual on-disk value is pinned.
+    #[test]
+    fn a_fragment_stores_temporal_columns_in_the_unix_epoch() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("temporal", &[PgType::Date, PgType::Timestamp]),
+            Arc::clone(&wal),
+        )?;
+
+        // 2000-01-01, PostgreSQL's epoch: day 0 and microsecond 0 to us, and
+        // exactly PG_UNIX_EPOCH_DAYS / _MICROS to Arrow.
+        let xid = tm.allocate_xid();
+        table.insert_many(
+            vec![
+                vec![Value::Date(0), Value::Timestamp(0)],
+                vec![Value::Date(i32::MAX), Value::Timestamp(i64::MIN)],
+            ],
+            &tm.context(xid, CommandId::FIRST),
+        )?;
+        tm.commit(xid)?;
+        finish(&table, xid, true)?;
+
+        let files = parquet_files(dir.path(), 1)?;
+        let mut reader =
+            ParquetRecordBatchReaderBuilder::try_new(File::open(&files[0])?)?.build()?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("fragment has no batch"))??;
+
+        let dates = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .ok_or_else(|| anyhow::anyhow!("column 0 is not a Date32"))?;
+        let stamps = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .ok_or_else(|| anyhow::anyhow!("column 1 is not a TimestampMicrosecond"))?;
+
+        assert_eq!(dates.value(0), super::PG_UNIX_EPOCH_DAYS);
+        assert_eq!(stamps.value(0), super::PG_UNIX_EPOCH_MICROS);
+        // The ±infinity sentinels are stored verbatim: shifting them would both
+        // overflow and turn infinity into an ordinary instant.
+        assert_eq!(dates.value(1), i32::MAX);
+        assert_eq!(stamps.value(1), i64::MIN);
+        Ok(())
+    }
+
+    /// Drain a batch scan back into rows, so it can be compared against the row
+    /// scan value for value.
+    fn batch_scan_rows(
+        table: &ParquetTable,
+        txn: &TxnContext,
+        projection: &ColumnProjection,
+    ) -> Result<Vec<Tuple>, StorageError> {
+        let schema = table.schema().clone();
+        let positions: Vec<usize> = (0..schema.columns.len()).collect();
+        let mut rows = Vec::new();
+        for batch in table
+            .scan_batches(txn, projection)
+            .ok_or_else(|| corrupt("engine reported batch support but returned none"))?
+        {
+            let batch = batch?;
+            for row in 0..batch.num_rows() {
+                rows.push(crabgresql_storage_api::arrow::decode_row(
+                    &schema, &positions, &batch, row,
+                )?);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The batch scan and the row scan are the same scan. Every supported type
+    /// is present, so this is also where a temporal column that forgot to leave
+    /// the file's epoch shows up — a `Date` would come back shifted by
+    /// `PG_UNIX_EPOCH_DAYS` and the comparison against the row scan would fail.
+    #[test]
+    fn a_batch_scan_yields_exactly_what_the_row_scan_does() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let schema = schema(
+            "types",
+            &[
+                PgType::Bool,
+                PgType::Int4,
+                PgType::Numeric,
+                PgType::Text,
+                PgType::Uuid,
+                PgType::Date,
+                PgType::Time,
+                PgType::TimeTz,
+                PgType::Timestamp,
+                PgType::TimestampTz,
+                PgType::Interval,
+            ],
+        );
+        let table = open_table(dir.path(), 1, schema, Arc::clone(&wal))?;
+        let row = |n: i32| {
+            Ok::<Tuple, anyhow::Error>(vec![
+                Value::Bool(n % 2 == 0),
+                Value::Int4(n),
+                Value::Numeric(Numeric::parse("1234567890.012300")?),
+                Value::Text(format!("row {n}")),
+                Value::Uuid([n as u8; 16]),
+                // Either side of both epochs, plus the ±infinity sentinels.
+                Value::Date(n * 4_000 - 8_000),
+                Value::Time(12_345_678),
+                Value::TimeTz(TimeTz {
+                    usec: 45_000_000,
+                    zone: 3_600,
+                }),
+                Value::Timestamp(i64::from(n) * 1_000_000_000 - 2_000_000_000),
+                Value::TimestampTz(-987_654_321),
+                Value::Interval(Interval {
+                    months: 14,
+                    days: -3,
+                    usec: 777,
+                }),
+            ])
+        };
+        let mut expected: Vec<Tuple> = (0..4).map(row).collect::<Result<_, _>>()?;
+        // The sentinels are ordinary bit patterns to Arrow; a rebase that did
+        // not exempt them would overflow or turn infinity into a date.
+        let mut infinities = row(0)?;
+        infinities[5] = Value::Date(i32::MAX);
+        infinities[8] = Value::Timestamp(i64::MIN);
+        expected.push(infinities);
+        expected.push(vec![Value::Null; 11]);
+
+        // Two fragments, so the batch scan has to cross a fragment boundary.
+        for chunk in expected.chunks(3) {
+            let xid = tm.allocate_xid();
+            table.insert_many(chunk.to_vec(), &tm.context(xid, CommandId::FIRST))?;
+            tm.commit(xid)?;
+            finish(&table, xid, true)?;
+        }
+
+        let reader = tm.context(Xid::INVALID, CommandId::FIRST);
+        let row_scan: Vec<Tuple> = table
+            .scan(&reader, &ColumnProjection::All)
+            .map(|result| result.map(|(_, tuple)| tuple))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(row_scan, expected);
+        assert_eq!(
+            batch_scan_rows(&table, &reader, &ColumnProjection::All)?,
+            expected
+        );
+        Ok(())
+    }
+
+    /// A projected batch comes back at full width, with the skipped columns
+    /// NULL — the same contract the row scan has, so the two still agree.
+    #[test]
+    fn a_projected_batch_scan_stays_full_width() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let (table, row) = struct_mixed_table(dir.path(), Arc::clone(&wal))?;
+
+        let xid = tm.allocate_xid();
+        table.insert_many(vec![row.clone()], &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        finish(&table, xid, true)?;
+
+        let reader = tm.context(Xid::INVALID, CommandId::FIRST);
+        // Project around the `Interval` struct column, the case a naive
+        // positional decode gets wrong.
+        let projection = ColumnProjection::of([2], table.schema());
+        let batched = batch_scan_rows(&table, &reader, &projection)?;
+        let scanned: Vec<Tuple> = table
+            .scan(&reader, &projection)
+            .map(|result| result.map(|(_, tuple)| tuple))
+            .collect::<Result<_, _>>()?;
+
+        assert_eq!(batched.len(), 1);
+        assert_eq!(
+            batched[0].len(),
+            row.len(),
+            "width is the schema's, not the projection's"
+        );
+        assert_eq!(batched[0][2], row[2]);
+        assert_eq!(batched, scanned);
+        Ok(())
+    }
+
+    #[test]
     #[test]
     fn a_projected_scan_yields_the_same_tids_as_a_full_one() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;

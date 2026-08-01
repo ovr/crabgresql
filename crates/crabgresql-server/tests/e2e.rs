@@ -5874,6 +5874,98 @@ async fn the_sort_key_rule_does_not_reach_past_its_own_statements() -> anyhow::R
 }
 
 /// A Parquet relation is physically two stores — the immutable chunks and its RAM
+/// A columnar plan must answer exactly what the row plan answers.
+///
+/// Each case here is a bug the columnar path shipped with: a predicate with no
+/// column reference produced a mask describing one value, and Arrow's filter
+/// truncates the batch to the mask rather than rejecting it, so `WHERE 1=1`
+/// returned one row per batch; a constant of a type Arrow cannot encode was
+/// accepted by the projection compiler and only failed once a batch arrived.
+/// Both were invisible to the unit tests, which drive the operators directly.
+#[tokio::test]
+async fn a_columnar_plan_answers_what_the_row_plan_answers() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE p (id int4, label text) USING parquet ORDER BY (id)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE h (id int4, label text)")
+        .await?;
+    for table in ["p", "h"] {
+        client
+            .simple_query(&format!(
+                "INSERT INTO {table} VALUES (1,'a'),(2,'b'),(3,'c'),(4,NULL),(5,'e')"
+            ))
+            .await?;
+    }
+
+    let ids = |messages: &Vec<tokio_postgres::SimpleQueryMessage>| {
+        rows(messages)
+            .iter()
+            .filter_map(|r| r.get(0).map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    for tail in [
+        // Constant-only predicates: every row, or none, never one per batch.
+        "WHERE 1=1 ORDER BY id",
+        "WHERE true ORDER BY id",
+        "WHERE NULL IS NULL ORDER BY id",
+        "WHERE 1=2 ORDER BY id",
+        // A constant beside a column: the operands have different lengths, and
+        // Arrow's Kleene kernels reject that outright.
+        "WHERE id = 1 AND true ORDER BY id",
+        "WHERE id > 3 OR false ORDER BY id",
+        // A predicate the columnar filter declines, combined with a sort it
+        // accepts: the row Filter must still run, and run first.
+        "WHERE label LIKE 'a%' ORDER BY id",
+    ] {
+        let columnar = client
+            .simple_query(&format!("SELECT id FROM p {tail}"))
+            .await?;
+        let row = client
+            .simple_query(&format!("SELECT id FROM h {tail}"))
+            .await?;
+        assert_eq!(ids(&columnar), ids(&row), "disagreement on: {tail}");
+    }
+
+    // A constant whose type has no Arrow encoding is legal in a target list
+    // even on a relation that could never store one.
+    for literal in ["'{}'::json", "'{}'::jsonb", "'1.2.3.4'::inet", "42"] {
+        let columnar = client
+            .simple_query(&format!("SELECT {literal} AS c, id FROM p ORDER BY id"))
+            .await?;
+        let row = client
+            .simple_query(&format!("SELECT {literal} AS c, id FROM h ORDER BY id"))
+            .await?;
+        assert_eq!(ids(&columnar), ids(&row), "disagreement on: {literal}");
+    }
+    Ok(())
+}
+
+/// A standalone `USING buffer` relation reaches the columnar path too.
+///
+/// It only does so because `ManagedTable` forwards the batch-scan methods; both
+/// have trait defaults, so a wrapper that drops them compiles cleanly and
+/// silently reports "no batch path" for a leaf that has one.
+#[tokio::test]
+async fn a_buffer_relation_vectorizes() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE b (id int4) USING buffer ORDER BY (id)")
+        .await?;
+    client
+        .simple_query("INSERT INTO b VALUES (3),(1),(2)")
+        .await?;
+
+    let lines = explain_lines(&client, "EXPLAIN SELECT id FROM b WHERE id > 1 ORDER BY id").await?;
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("Seq Scan on b (columnar: scan, filter, sort)"),
+        "{lines:?}"
+    );
+    Ok(())
+}
+
 /// write buffer — so it plans as an `Append` over both. The leaves are not
 /// catalog relations, so each labels itself and neither appears in `pg_class`.
 #[tokio::test]
@@ -5890,7 +5982,10 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
     assert_eq!(
         lines,
         vec![
-            "Append".to_string(),
+            // Both leaves hand up Arrow batches, so the scan runs columnar and
+            // says so. Nothing else vectorizes here — there is no WHERE and no
+            // ORDER BY to vectorize.
+            "Append (columnar: scan)".to_string(),
             "  ->  Seq Scan on p".to_string(),
             "  ->  Buffer Scan on p".to_string(),
         ],
@@ -5906,13 +6001,50 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
     assert_eq!(
         lines,
         vec![
-            "Append".to_string(),
+            // `id = 1` is an integer equality against a constant, so it compiles
+            // to an Arrow filter and runs below the row boundary.
+            "Append (columnar: scan, filter)".to_string(),
             "  Filter: (id = 1)".to_string(),
             "  ->  Seq Scan on p".to_string(),
             "  ->  Buffer Scan on p".to_string(),
         ],
         "a WHERE on a split relation must still be rendered, and by column name"
     );
+    // The annotation must be earned, not assumed. A `LIKE` has no Arrow kernel
+    // here and `id + 1` is a computed sort key, so each declines its own step
+    // while the scan stays columnar — if either over-claimed, EXPLAIN would be
+    // reporting work that never happens.
+    for (query, expected) in [
+        (
+            "EXPLAIN SELECT id FROM p ORDER BY id",
+            "Append (columnar: scan, sort)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p WHERE label LIKE 'a%'",
+            "Append (columnar: scan)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p ORDER BY id + 1",
+            "Append (columnar: scan)",
+        ),
+    ] {
+        let lines = explain_lines(&client, query).await?;
+        assert_eq!(lines.first().map(String::as_str), Some(expected), "{query}");
+    }
+    // A heap relation has no batch path at all, so its plan is untouched — the
+    // divergence from PostgreSQL's EXPLAIN is confined to plans that vectorize.
+    client.simple_query("CREATE TABLE hh (id int4)").await?;
+    client.simple_query("INSERT INTO hh VALUES (1)").await?;
+    let lines = explain_lines(&client, "EXPLAIN SELECT id FROM hh WHERE id = 1").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Seq Scan on hh".to_string(),
+            "  Filter: (id = 1)".to_string()
+        ],
+        "a row-path plan must render exactly as it did before"
+    );
+
     let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p JOIN h ON p.id = h.id").await?;
     assert!(
         lines
