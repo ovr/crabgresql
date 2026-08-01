@@ -10,6 +10,7 @@ mod cursor;
 mod error;
 mod explain;
 mod global_catalog;
+mod guc;
 mod query;
 mod routines;
 mod session;

@@ -1,9 +1,10 @@
 --
 -- TIMESTAMPTZ
 -- timestamp with time zone: input parsing (offsets, named zones, abbreviations),
--- UTC output (+00), comparisons, casts, the field functions, make_timestamptz,
--- and AT TIME ZONE. The display zone is UTC, so output always shows a +00
--- offset. Output hand-checked against PostgreSQL's aligned format.
+-- output, comparisons, casts, the field functions, make_timestamptz, and
+-- AT TIME ZONE. Most of the file pins the session zone to UTC so the output is
+-- deterministic; the final section exercises a real display zone. Output
+-- hand-checked against PostgreSQL's aligned format.
 --
 -- Render everything in UTC so the output is deterministic.
 SET timezone = 'UTC';
@@ -118,3 +119,59 @@ SELECT timestamptz '2001-02-16+garbage';
 SELECT date_part('bogus', timestamptz '2001-02-16+00');
 SELECT make_timestamptz(2013, 7, 15, 8, 15, 23, 'Nowhere/Nozone');
 SELECT 'still alive' AS status;
+
+--
+-- the session display zone (SET TimeZone). Everything below is pinned against
+-- PostgreSQL 18.4.
+--
+SET TimeZone = 'America/New_York';
+SHOW TimeZone;
+-- a zone-less literal is read in the session zone; an explicit token is not
+SELECT timestamptz '2024-06-01 12:00:00' AS summer;
+SELECT timestamptz '2024-01-15 12:00:00' AS winter;
+SELECT timestamptz '2024-06-01 12:00:00+00' AS explicit_token;
+-- the conversions that are an identity only under UTC
+SELECT timestamp '2024-06-01 12:00:00'::timestamptz AS ts_to_tstz;
+SELECT timestamptz '2024-06-01 12:00:00+00'::timestamp AS tstz_to_ts;
+SELECT date '2024-06-01'::timestamptz AS date_to_tstz;
+SELECT timestamptz '2024-06-01 02:00:00+00'::date AS tstz_to_date;
+SELECT make_timestamptz(2024, 6, 1, 12, 0, 0) AS make_without_zone;
+-- date_trunc re-resolves the offset, so it lands on local midnight across DST
+SELECT date_trunc('day', timestamptz '2024-03-10 15:00:00-04') AS spring_forward;
+-- offset fields report the zone; ordinary fields read the local clock; epoch does not
+SELECT date_part('timezone', timestamptz '2024-01-15 12:00:00-05') AS tz,
+       date_part('timezone_hour', timestamptz '2024-01-15 12:00:00-05') AS tz_hour;
+SELECT date_part('day', timestamptz '2024-01-01 02:00:00+00') AS local_day,
+       date_part('epoch', timestamptz '2024-01-01 02:00:00+00') AS epoch;
+-- to_char's TZ/OF report the session zone
+SELECT to_char(timestamptz '2024-01-15 12:00:00-05', 'HH24:MI TZ OF') AS tochar;
+-- a sub-hour zone widens the printed offset
+SET TimeZone = 'Asia/Kolkata';
+SELECT timestamptz '2024-06-01 12:00:00' AS kolkata;
+SELECT to_char(timestamptz '2024-01-15 12:00:00+05:30', 'TZ OF') AS tochar_kolkata;
+-- a bare numeric GUC value is POSIX-signed: '+05:30' means UTC-5:30
+SET TimeZone = '+05:30';
+SHOW TimeZone;
+SELECT timestamptz '2024-06-01 12:00:00+00' AS posix_signed;
+-- the numeric statement forms count east instead, and show PG's POSIX spec
+SET TIME ZONE 7;
+SHOW TimeZone;
+SELECT timestamptz '2024-06-01 12:00:00+00' AS east_seven;
+-- back to UTC explicitly: `RESET` restores the *boot* value, which is UTC here
+-- and the host zone in stock PostgreSQL, so it is not comparable across the two.
+SET TimeZone = 'UTC';
+SHOW TimeZone;
+SELECT timestamptz '2024-06-01 12:00:00' AS back_to_utc;
+-- date_trunc: `day` and coarser re-resolve the offset (landing on local
+-- midnight across DST), while `hour` and finer keep the input's — which matters
+-- inside the fall-back fold, where the truncated clock is ambiguous.
+SET TimeZone = 'America/New_York';
+SELECT date_trunc('hour', timestamptz '2024-11-03 01:30:00-04') AS fold_hour;
+SELECT date_trunc('minute', timestamptz '2024-11-03 01:30:00-04') AS fold_minute;
+SELECT date_trunc('day', timestamptz '2024-11-03 01:30:00-04') AS fold_day;
+SELECT date_trunc('day', timestamptz '2024-03-10 15:00:00-04') AS spring_forward_day;
+-- to_char's OF never widens to seconds, where timestamptz output does
+SELECT to_char(timestamptz '1875-06-01 12:00:00', 'OF') AS of_lmt;
+SELECT timestamptz '1875-06-01 12:00:00' AS out_lmt;
+SET TimeZone = 'UTC';
+

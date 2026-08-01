@@ -12,6 +12,7 @@ pub mod collation;
 pub mod date;
 pub mod datum;
 pub mod float;
+pub mod fmt;
 pub mod formatting;
 pub mod formatting_num;
 pub mod geo;
@@ -36,6 +37,7 @@ pub mod uuid;
 pub mod wire;
 pub mod xid;
 
+pub use fmt::FmtCtx;
 pub use interval::Interval;
 pub use net::Inet;
 pub use timetz::TimeTz;
@@ -1132,14 +1134,17 @@ impl Value {
         }
     }
 
-    /// Text-format encoding at the default `extra_float_digits` (1).
-    pub fn encode_text(&self) -> Option<String> {
-        self.encode_text_with(1)
+    /// Text-format encoding in the UTC display zone at the default
+    /// `extra_float_digits` (1) — for callers with no session behind them.
+    pub fn encode_text_utc(&self) -> Option<String> {
+        self.encode_text_with(&FmtCtx::utc_default())
     }
 
     /// Text-format encoding as sent in `DataRow`; `None` encodes SQL NULL.
-    /// `efd` is `extra_float_digits`, affecting only float output.
-    pub fn encode_text_with(&self, efd: i32) -> Option<String> {
+    /// `fmt` carries `extra_float_digits` (float output) and the session
+    /// display zone (`timestamptz` output).
+    pub fn encode_text_with(&self, fmt: &FmtCtx) -> Option<String> {
+        let efd = fmt.efd;
         match self {
             Value::Null => None,
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
@@ -1173,7 +1178,7 @@ impl Value {
             Value::Time(usec) => Some(time::format(*usec)),
             Value::TimeTz(v) => Some(timetz::format(*v)),
             Value::Timestamp(micros) => Some(timestamp::format(*micros)),
-            Value::TimestampTz(micros) => Some(timestamptz::format(*micros)),
+            Value::TimestampTz(micros) => Some(timestamptz::format(*micros, &fmt.zone)),
             Value::Interval(iv) => Some(interval::format(*iv)),
             Value::Uuid(b) => Some(uuid::format(b)),
             Value::Inet(v) => Some(net::inet_out(v)),
@@ -1199,7 +1204,7 @@ impl Value {
             // An enum prints as its label (PG's `enum_out`).
             Value::Enum { label, .. } => Some(label.clone()),
             // An array prints in PG's `{...}` form (`array_out`).
-            Value::Array { elem, elems } => Some(array::format(*elem, elems, efd)),
+            Value::Array { elem, elems } => Some(array::format(*elem, elems, fmt)),
         }
     }
 }
@@ -1274,8 +1279,8 @@ mod tests {
 
     #[test]
     fn bool_encodes_as_t_f() {
-        assert_eq!(Value::Bool(true).encode_text().as_deref(), Some("t"));
-        assert_eq!(Value::Bool(false).encode_text().as_deref(), Some("f"));
+        assert_eq!(Value::Bool(true).encode_text_utc().as_deref(), Some("t"));
+        assert_eq!(Value::Bool(false).encode_text_utc().as_deref(), Some("f"));
     }
 
     /// Pins the derived [`DeepSizeOf`]: a variant with no allocation of its
@@ -1460,7 +1465,7 @@ mod tests {
 
     #[test]
     fn null_encodes_as_none() {
-        assert_eq!(Value::Null.encode_text(), None);
+        assert_eq!(Value::Null.encode_text_utc(), None);
     }
 
     #[test]
@@ -1478,10 +1483,10 @@ mod tests {
 
     #[test]
     fn oid_encodes_as_unsigned_decimal() {
-        assert_eq!(Value::Oid(2200).encode_text().as_deref(), Some("2200"));
+        assert_eq!(Value::Oid(2200).encode_text_utc().as_deref(), Some("2200"));
         // Past i32::MAX: an oid is unsigned, so it must not print negative.
         assert_eq!(
-            Value::Oid(u32::MAX).encode_text().as_deref(),
+            Value::Oid(u32::MAX).encode_text_utc().as_deref(),
             Some("4294967295")
         );
         assert_eq!(PgType::Oid.typname(), "oid");
@@ -1492,7 +1497,7 @@ mod tests {
     fn bytea_hex_encoding() {
         assert_eq!(
             Value::Bytea(vec![0x00, 0x10, 0x00])
-                .encode_text()
+                .encode_text_utc()
                 .as_deref(),
             Some("\\x001000")
         );

@@ -658,7 +658,7 @@ impl Interpreter {
             let value = self.scalar(frag, PgType::Text, frame, ctx, txn, def, "RAISE")?;
             Ok(match value {
                 Value::Null => None,
-                other => Some(other.encode_text().unwrap_or_default()),
+                other => Some(other.encode_text_with(&ctx.fmt).unwrap_or_default()),
             })
         };
 

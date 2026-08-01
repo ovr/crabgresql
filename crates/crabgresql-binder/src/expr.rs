@@ -17,9 +17,10 @@ use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, EnumInfo, TableEngine, TableSchema, TypeCatalog, UserCast};
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
+use crabgresql_types::tz::SessionZone;
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
-    Numeric, PgType, RegKind, Value, cast, date, float, interval, money, parse_bool, time,
+    FmtCtx, Numeric, PgType, RegKind, Value, cast, date, float, interval, money, parse_bool, time,
     timestamp, timestamptz, timetz,
 };
 
@@ -7409,8 +7410,9 @@ fn common_numeric(a: PgType, b: PgType) -> Option<PgType> {
 }
 
 /// Coerce an expression to `ty`. Constant operands fold (and range-check) at
-/// bind time, as PG's planner does; non-constants (and any cast to text, which
-/// needs the session `extra_float_digits`) get a runtime `Coerce`.
+/// bind time, as PG's planner does; non-constants — and any conversion whose
+/// result depends on session state — get a runtime `Coerce`. See
+/// [`fold_needs_session`].
 pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, BindError> {
     if expr.ty() == ty {
         return Ok(expr);
@@ -7437,8 +7439,10 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
         });
     }
     match expr {
-        BoundExpr::Const { value, .. } if ty != PgType::Text => {
-            let value = cast::cast_value(value, ty, 1)
+        BoundExpr::Const { value, .. } if !fold_needs_session(value.pg_type(), ty) => {
+            // Safe to fold: `FmtCtx::utc` cannot change the outcome, because
+            // `fold_needs_session` has already excluded every pair it could.
+            let value = cast::cast_value(value, ty, &FmtCtx::utc_default())
                 .map_err(|e| BindError::new(e.sqlstate, e.message))?;
             Ok(BoundExpr::Const { value, ty })
         }
@@ -7446,6 +7450,61 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
             expr: Box::new(expr),
             ty,
         }),
+    }
+}
+
+/// Whether converting `from` to `to` reads session state, and so must be left
+/// to a runtime `Coerce` instead of folded at bind time. The binder holds no
+/// session, and folding one of these would freeze the *binding* session's
+/// answer into the plan — visibly wrong for a prepared statement re-executed
+/// after a `SET`.
+///
+/// Two GUCs reach this far:
+///
+/// * `extra_float_digits`, for any conversion to a string type. (The old guard
+///   here tested only `Text`, so `1.5::float8::varchar` folded at the default
+///   precision and silently ignored the session's setting.)
+/// * `TimeZone`, for every `timestamptz` conversion — the zone is what relates
+///   an instant to a wall clock, in both directions.
+///
+/// **Known divergence.** PostgreSQL folds a `timestamptz` literal during parse
+/// analysis using the parsing session's zone, so the instant is frozen; we defer
+/// it and recompute per execution. That is visible for a prepared statement
+/// re-executed after a `SET TimeZone` (pinned by
+/// `prepared_statement_diverges_from_pg_on_a_later_set_timezone`), and it means
+/// a stored `timestamptz` column DEFAULT resolves in the *inserting* session's
+/// zone rather than the one that defined it. Closing it means giving the binder
+/// the session's `FmtCtx` so this function can fold instead of defer.
+fn fold_needs_session(from: Option<PgType>, to: PgType) -> bool {
+    if matches!(
+        to,
+        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name
+    ) {
+        return true;
+    }
+    depends_on_session_zone(to) || from.is_some_and(depends_on_session_zone)
+}
+
+/// Parse a zone-dependent literal for its *diagnostics only*, discarding the
+/// value — see the call site in [`resolve_unknown`].
+fn validate_zone_dependent_literal(s: &str, ty: PgType) -> Result<(), BindError> {
+    match ty {
+        PgType::TimestampTz => timestamptz::parse(s, &SessionZone::utc())
+            .map(|_| ())
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Array(_) => parse_unknown(s, ty).map(|_| ()),
+        _ => Ok(()),
+    }
+}
+
+/// Whether values of `ty` are read or rendered relative to the session zone —
+/// `timestamptz` and, since `array_in`/`array_out` delegate to the element's own
+/// I/O functions, an array of it.
+fn depends_on_session_zone(ty: PgType) -> bool {
+    match ty {
+        PgType::TimestampTz => true,
+        PgType::Array(elem) => elem == crabgresql_types::oid::TIMESTAMPTZ,
+        _ => false,
     }
 }
 
@@ -7522,6 +7581,32 @@ pub(crate) fn resolve_unknown(
             args: vec![arg],
         });
     }
+    // A `timestamptz` literal cannot be *folded*: with no zone token its text
+    // means a different instant in every session zone, and the binder has no
+    // session. Emit the same runtime coercion `'…'::timestamptz` lowers to.
+    //
+    // It is still parsed here, and the result thrown away, purely to keep PG's
+    // parse-analysis diagnostics: a bad literal must report the `LINE n: … ^`
+    // cursor at its own position, which a runtime error has no span for.
+    // Validating against UTC is sound for this because the zone can only change
+    // the verdict for a value within a zone's offset of the representable
+    // boundary — a syntax error is a syntax error in every zone.
+    if depends_on_session_zone(ty) {
+        let text = match lit {
+            None => Value::Null,
+            Some(s) => {
+                validate_zone_dependent_literal(&s, ty).map_err(|e| e.at(span))?;
+                Value::Text(s)
+            }
+        };
+        return Ok(BoundExpr::Coerce {
+            expr: Box::new(BoundExpr::Const {
+                value: text,
+                ty: PgType::Text,
+            }),
+            ty,
+        });
+    }
     let value = match lit {
         None => Value::Null,
         Some(s) => parse_unknown(&s, ty).map_err(|e| e.at(span))?,
@@ -7575,7 +7660,12 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Interval => interval::parse(s)
             .map(Value::Interval)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
-        PgType::TimestampTz => timestamptz::parse(s)
+        // Unreachable from `resolve_unknown`, which defers every zone-dependent
+        // type to runtime; this serves only `pg_input_is_valid`, which asks
+        // whether the *syntax* is acceptable. Validity is zone-independent
+        // except within a few hours of the representable range, so UTC answers
+        // it correctly for every input a caller can realistically ask about.
+        PgType::TimestampTz => timestamptz::parse(s, &SessionZone::utc())
             .map(Value::TimestampTz)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         // bytea input (byteain) is shared with the executor's text→bytea cast.
@@ -7664,7 +7754,7 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         // element type. Carry PG's DETAIL through (`'{a,,c}'::int[]`).
         PgType::Array(elem_oid) => {
             let elem = PgType::from_oid(elem_oid).ok_or_else(invalid)?;
-            crabgresql_types::array::array_in(s, elem)
+            crabgresql_types::array::array_in(s, elem, &FmtCtx::utc_default())
                 .map(|elems| Value::Array { elem, elems })
                 .map_err(|e| {
                     BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))

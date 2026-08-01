@@ -12,10 +12,11 @@ use crabgresql_pg_wire::{
 use crabgresql_storage_api::TableEngine;
 use crabgresql_txn::TransactionManager;
 use crabgresql_types::cast::CastError;
-use crabgresql_types::{PgType, Value, wire};
+use crabgresql_types::{FmtCtx, PgType, Value, wire};
 use tokio::net::TcpStream;
 
 use crate::error::PgError;
+use crate::guc;
 use crate::global_catalog::GlobalCatalog;
 use crate::query::{
     Analyzed, BoundParams, Notice, QueryResult, RowTag, analyze_statement, execute_statement,
@@ -26,19 +27,6 @@ use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedR
 /// Fake backend pids for BackendKeyData: every connection needs a distinct
 /// one, but there are no processes to kill yet (cancel lands with M1+).
 static NEXT_BACKEND_ID: AtomicI32 = AtomicI32::new(1);
-
-/// GUCs reported at startup. Drivers parse `server_version` and rely on
-/// `client_encoding` / `standard_conforming_strings` to pick quoting rules.
-const STARTUP_PARAMETERS: &[(&str, &str)] = &[
-    ("server_version", "19.0 (CrabgreSQL 0.1.0)"),
-    ("server_encoding", "UTF8"),
-    ("client_encoding", "UTF8"),
-    ("DateStyle", "ISO, MDY"),
-    ("TimeZone", "UTC"),
-    ("integer_datetimes", "on"),
-    ("standard_conforming_strings", "on"),
-    ("is_superuser", "on"),
-];
 
 pub async fn handle_connection(
     socket: TcpStream,
@@ -75,16 +63,11 @@ pub async fn handle_connection(
 
     // Trust auth for M0; SCRAM-SHA-256 is on the roadmap.
     writer.authentication_ok();
-    for (name, value) in STARTUP_PARAMETERS {
-        writer.parameter_status(name, value);
-    }
-    let backend_id = NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed);
-    writer.backend_key_data(backend_id, 0);
-    writer.ready_for_query(TransactionStatus::Idle);
-    writer.flush().await?;
 
     // Per-connection session state (GUCs). A fresh connection resets them,
-    // matching how the regression runner gives each test its own session.
+    // matching how the regression runner gives each test its own session. Built
+    // before the ParameterStatus burst below, which reports its values.
+    let backend_id = NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed);
     let user = params
         .get("user")
         .cloned()
@@ -101,6 +84,13 @@ pub async fn handle_connection(
         format!("pg_temp_{backend_id}"),
         crate::session::TEMP_NAMESPACE_OID_BASE + backend_id as u32,
     );
+
+    for (name, value) in guc::report_values(&session) {
+        writer.parameter_status(&name, &value);
+    }
+    writer.backend_key_data(backend_id, 0);
+    writer.ready_for_query(TransactionStatus::Idle);
+    writer.flush().await?;
 
     // After an error on an extended-protocol message, PG discards everything
     // until Sync and only then sends ReadyForQuery — one error, one RFQ per
@@ -327,7 +317,13 @@ async fn run_simple_query(
         return Ok(());
     }
     for stmt in &statements {
-        let efd = session.extra_float_digits;
+        let fmt = session.fmt_ctx();
+        // PG echoes a GUC_REPORT parameter to the client whenever its value
+        // changes. Diffing around the statement — rather than having each
+        // handler announce its own change — is what makes that impossible to
+        // forget, and covers `RESET ALL` and the transactional restore at
+        // COMMIT/ROLLBACK without either knowing about the protocol.
+        let reported = statement_may_change_gucs(stmt).then(|| guc::report_values(session));
         // COPY FROM STDIN drives the copy sub-protocol on the socket rather than
         // returning a QueryResult, so it is handled inline here.
         if is_copy_from_stdin(stmt) {
@@ -354,7 +350,10 @@ async fn run_simple_query(
         match outcome {
             Ok(mut result) => {
                 result.prepend_notices(stranded);
-                if write_result(writer, result, efd, sql).await? == WriteOutcome::Errored {
+                if let Some(before) = &reported {
+                    emit_changed_params(writer, before, session);
+                }
+                if write_result(writer, result, &fmt, sql).await? == WriteOutcome::Errored {
                     mark_transaction_failed(session);
                     return Ok(());
                 }
@@ -516,7 +515,7 @@ enum WriteOutcome {
 async fn write_result(
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
     result: QueryResult,
-    efd: i32,
+    fmt: &FmtCtx,
     sql: &str,
 ) -> Result<WriteOutcome, ProtocolError> {
     match result {
@@ -545,7 +544,7 @@ async fn write_result(
                 match node.next() {
                     Ok(Some(row)) => {
                         let cols: Vec<Option<String>> =
-                            row.iter().map(|v| v.encode_text_with(efd)).collect();
+                            row.iter().map(|v| v.encode_text_with(fmt)).collect();
                         writer.data_row(&cols);
                         count += 1;
                         if writer.buffered() >= STREAM_FLUSH_BYTES {
@@ -567,6 +566,31 @@ async fn write_result(
         }
     }
     Ok(WriteOutcome::Completed)
+}
+
+/// Whether a statement could change a configuration parameter, and so is worth
+/// diffing the reported set around. `SET`/`RESET` change them directly;
+/// `COMMIT`/`ROLLBACK` can revert an earlier change (see
+/// `Session::restore_gucs_at_transaction_end`).
+fn statement_may_change_gucs(stmt: &crabgresql_parser::ast::Statement) -> bool {
+    use crabgresql_parser::ast::Statement;
+    matches!(
+        stmt,
+        Statement::Set(_) | Statement::Reset(_) | Statement::Commit { .. } | Statement::Rollback { .. }
+    )
+}
+
+/// Send a `ParameterStatus` for every reported parameter whose value differs
+/// from `before`. Emitted after the statement's notices and before its
+/// CommandComplete, which is PG's order.
+fn emit_changed_params(
+    writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+    before: &[(String, String)],
+    session: &Session,
+) {
+    for (name, value) in guc::changed(before, session) {
+        writer.parameter_status(&name, &value);
+    }
 }
 
 /// Emit any NOTICE/WARNING messages that precede a command's CommandComplete, in
@@ -641,12 +665,12 @@ fn field_descriptions(cols: &[OutputColumn], formats: &[Format]) -> Vec<FieldDes
 fn encode_row(
     row: &[Value],
     formats: &[Format],
-    efd: i32,
+    fmt: &FmtCtx,
 ) -> Result<Vec<Option<Vec<u8>>>, PgError> {
     row.iter()
         .enumerate()
         .map(|(i, v)| match format_at(formats, i) {
-            Format::Text => Ok(v.encode_text_with(efd).map(String::into_bytes)),
+            Format::Text => Ok(v.encode_text_with(fmt).map(String::into_bytes)),
             Format::Binary => v.encode_binary().map_err(cast_error),
         })
         .collect()
@@ -753,6 +777,9 @@ fn handle_bind(
     check_format_count(param_formats.len(), params.len(), "parameter")?;
     let result_columns = prepared.result_columns.as_ref().map_or(0, Vec::len);
     check_format_count(result_formats.len(), result_columns, "result")?;
+    // Text parameters are decoded with the session's context, so a zone-less
+    // `$1::timestamptz` means the same instant as the identical SQL literal.
+    let fmt = session.fmt_ctx();
     let mut values = Vec::with_capacity(params.len());
     for (i, bytes) in params.iter().enumerate() {
         let ty = prepared.param_types[i];
@@ -766,7 +793,7 @@ fn handle_bind(
                             "invalid byte sequence for encoding \"UTF8\"",
                         )
                     })?;
-                    wire::decode_text(ty, text).map_err(cast_error)?
+                    wire::decode_text(ty, text, &fmt).map_err(cast_error)?
                 }
                 Format::Binary => wire::decode_binary(ty, bytes).map_err(cast_error)?,
             },
@@ -910,12 +937,13 @@ fn handle_execute(
         writer.write(&BackendMessage::EmptyQueryResponse);
         return Ok(());
     };
-    let efd = session.extra_float_digits;
+    let fmt = session.fmt_ctx();
     let params = BoundParams {
         types: param_types,
         values: param_values,
         extended: true,
     };
+    let reported = statement_may_change_gucs(&stmt).then(|| guc::report_values(session));
     let outcome = execute_statement(engine, global_catalog, txnmgr, &stmt, session, &params);
     // Drained on both arms — see the simple-query path for why this cannot be
     // left to the statement handlers alone.
@@ -929,13 +957,16 @@ fn handle_execute(
         }
     };
     result.prepend_notices(stranded);
+    if let Some(before) = &reported {
+        emit_changed_params(writer, before, session);
+    }
     stream_execute(
         session,
         writer,
         portal_name,
         result,
         &result_formats,
-        efd,
+        &fmt,
         max_rows,
     )
 }
@@ -949,7 +980,7 @@ fn stream_execute(
     portal_name: &str,
     result: QueryResult,
     formats: &[Format],
-    efd: i32,
+    fmt: &FmtCtx,
     max_rows: i32,
 ) -> Result<(), PgError> {
     match result {
@@ -973,7 +1004,7 @@ fn stream_execute(
             loop {
                 match node.next() {
                     Ok(Some(row)) => {
-                        writer.write(&BackendMessage::DataRow(encode_row(&row, formats, efd)?));
+                        writer.write(&BackendMessage::DataRow(encode_row(&row, formats, fmt)?));
                         count += 1;
                         if limit == Some(count) {
                             // Row budget reached, result not yet exhausted: keep
@@ -1013,7 +1044,7 @@ fn resume_portal(
     portal_name: &str,
     max_rows: i32,
 ) -> Result<(), PgError> {
-    let efd = session.extra_float_digits;
+    let fmt = session.fmt_ctx();
     let formats = session.portals[portal_name].result_formats.clone();
     let limit = if max_rows > 0 {
         max_rows as usize
@@ -1038,7 +1069,7 @@ fn resume_portal(
         }
         match sus.node.next() {
             Ok(Some(row)) => {
-                writer.write(&BackendMessage::DataRow(encode_row(&row, &formats, efd)?));
+                writer.write(&BackendMessage::DataRow(encode_row(&row, &formats, &fmt)?));
                 sus.delivered += 1;
                 served += 1;
             }

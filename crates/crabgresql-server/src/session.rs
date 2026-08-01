@@ -13,6 +13,7 @@ use crabgresql_executor::{
 use crabgresql_plpgsql::RoutineCache;
 
 use crate::error::PgError;
+use crate::guc;
 use crate::query::RowTag;
 use crate::routines::SessionNotices;
 use crabgresql_parser::ast;
@@ -21,7 +22,8 @@ use crabgresql_storage_api::{SequenceAdvance, TableEngine, Tuple};
 use crabgresql_txn::{
     CommandId, IsolationLevel, LockOwner, Snapshot, SnapshotGuard, TransactionManager, Xid,
 };
-use crabgresql_types::{PgType, Value};
+use crabgresql_types::tz::SessionZone;
+use crabgresql_types::{FmtCtx, PgType, Value};
 
 /// Base for a session's synthetic `pg_temp_N` namespace OID. A high reserved band
 /// disjoint from the built-in namespace OIDs (`pg_catalog`=11, `pg_toast`=99,
@@ -328,6 +330,16 @@ impl ActiveTxn {
     }
 }
 
+/// A configuration parameter's value from before the current transaction block
+/// changed it, captured verbatim (see [`guc::SavedValue`] for why it is not the
+/// rendered form).
+struct SavedGuc {
+    def: &'static guc::GucDef,
+    /// Set by `SET LOCAL`, which reverts on commit as well as rollback.
+    local: bool,
+    value: guc::SavedValue,
+}
+
 pub struct Session {
     /// Database and role accepted during startup. The server currently has one
     /// physical database, but these are still the current connection identity
@@ -344,6 +356,10 @@ pub struct Session {
     pub temp_namespace_oid: u32,
     /// `extra_float_digits` GUC — controls float→text output precision.
     pub extra_float_digits: i32,
+    /// `TimeZone` GUC — the display zone every `timestamptz` is read and
+    /// rendered in. Behind an `Arc` because it is cloned into the formatting
+    /// context of every statement and every plan node.
+    pub timezone: Arc<SessionZone>,
     /// `default_transaction_isolation` GUC — the isolation level a new block
     /// inherits when it names none. Set by `SET SESSION CHARACTERISTICS AS
     /// TRANSACTION …` or a plain `SET default_transaction_isolation = …`.
@@ -351,6 +367,10 @@ pub struct Session {
     /// `default_transaction_read_only` GUC — the access mode a new block inherits
     /// when it names none.
     pub default_read_only: bool,
+    /// Configuration parameters changed inside the current transaction block,
+    /// with the value each held before the *first* change — see
+    /// [`Session::save_guc_for_transaction`].
+    saved_gucs: Vec<SavedGuc>,
     /// Current transaction state, reported in every `ReadyForQuery`. `Idle`
     /// outside a block, `InTransaction` after `BEGIN`, `Failed` once a statement
     /// errors inside a block (only `COMMIT`/`ROLLBACK` clear it).
@@ -619,6 +639,10 @@ impl Session {
             temp_schema: temp_schema.into(),
             temp_namespace_oid,
             extra_float_digits: 1,
+            // PG's boot value is the host zone; ours is UTC, which keeps every
+            // expected output in the test suites stable.
+            timezone: Arc::new(SessionZone::utc()),
+            saved_gucs: Vec::new(),
             default_iso: IsolationLevel::ReadCommitted,
             default_read_only: false,
             tx_status: TransactionStatus::Idle,
@@ -637,9 +661,54 @@ impl Session {
 
     /// The execution context with no sequence or catalog handle — for utility
     /// paths (e.g. `EXPLAIN`'s `Values` node) that never call either family.
+    /// Record a parameter's pre-change value so the transaction can put it back.
+    ///
+    /// PostgreSQL's configuration parameters are transactional. A plain `SET`
+    /// inside a block is undone by `ROLLBACK` but survives `COMMIT`; a
+    /// `SET LOCAL` is undone by *either*. Both are the same save-stack with
+    /// different restore predicates, which is what `local` records.
+    ///
+    /// Only the first change to a given parameter in a block is saved — later
+    /// ones would overwrite the original with an already-modified value. Called
+    /// before the setter runs, and a no-op outside a block, where there is
+    /// nothing to restore to.
+    pub fn save_guc_for_transaction(&mut self, def: &'static guc::GucDef, local: bool) {
+        if self.tx_status == TransactionStatus::Idle {
+            return;
+        }
+        if let Some(saved) = self.saved_gucs.iter_mut().find(|s| s.def.key == def.key) {
+            // Already saved. A later `SET LOCAL` over a plain `SET` still has to
+            // revert at commit, so the flag is sticky once set.
+            saved.local |= local;
+            return;
+        }
+        // Nothing to restore for a parameter whose value cannot change.
+        let Some(value) = def.capture(self) else {
+            return;
+        };
+        self.saved_gucs.push(SavedGuc { def, local, value });
+    }
+
+    /// Undo the block's parameter changes as it ends: everything on `ROLLBACK`,
+    /// only the `SET LOCAL`s on `COMMIT`.
+    pub fn restore_gucs_at_transaction_end(&mut self, committed: bool) {
+        for saved in std::mem::take(&mut self.saved_gucs) {
+            if committed && !saved.local {
+                continue;
+            }
+            saved.def.restore(self, saved.value);
+        }
+    }
+
+    /// The formatting context for this session: `extra_float_digits` and the
+    /// display zone, as the value layer wants them.
+    pub fn fmt_ctx(&self) -> FmtCtx {
+        FmtCtx::new(self.extra_float_digits, Arc::clone(&self.timezone))
+    }
+
     pub fn exec_context(&self) -> ExecContext {
         ExecContext {
-            extra_float_digits: self.extra_float_digits,
+            fmt: self.fmt_ctx(),
             sequences: None,
             catalog: None,
             txn: None,
@@ -662,7 +731,7 @@ impl Session {
         read_only: bool,
     ) -> ExecContext {
         ExecContext {
-            extra_float_digits: self.extra_float_digits,
+            fmt: self.fmt_ctx(),
             sequences: Some(Arc::new(SessionSequences::new(
                 Arc::clone(engine),
                 Arc::clone(&self.seq_state),

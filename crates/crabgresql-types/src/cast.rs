@@ -3,6 +3,7 @@
 //! reproduces PG's *observable* cast results — including the SQLSTATE/message on
 //! range errors — as pinned by the regression corpus, implemented independently.
 
+use crate::fmt::FmtCtx;
 use crate::numeric::ParseError;
 use crate::{
     Interval, Numeric, PgType, TimeTz, Value, date, float, interval, json, jsonpath, money,
@@ -104,21 +105,31 @@ fn is_explicit_only(from: PgType, to: PgType) -> bool {
 /// text to the target's input function. The fallback accepts strictly less
 /// than the explicit cast, which is the observable difference — `b := 1`
 /// yields true, but `b := 2` raises `22P02` even though `2::boolean` is true.
-pub fn cast_value_assign(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
+/// Re-label a `timestamp`-family error as a cast failure. Both carry a
+/// SQLSTATE and a message; only the type differs.
+fn cast_err(e: crate::timestamp::TimestampError) -> CastError {
+    CastError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+    }
+}
+
+pub fn cast_value_assign(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError> {
     let Some(from) = v.pg_type() else {
         return Ok(v); // NULL assigns to any type.
     };
     if from != to && is_explicit_only(from, to) {
         let text = v
-            .encode_text_with(efd)
+            .encode_text_with(fmt)
             .expect("non-null value has a text encoding");
-        return cast_value(Value::Text(text), to, efd);
+        return cast_value(Value::Text(text), to, fmt);
     }
-    cast_value(v, to, efd)
+    cast_value(v, to, fmt)
 }
 
-/// Cast `v` to `to`. `efd` (extra_float_digits) only affects float→text.
-pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
+/// Cast `v` to `to`. `fmt` supplies `extra_float_digits` (float→text) and the
+/// session display zone (every `timestamptz` conversion).
+pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError> {
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
@@ -229,7 +240,7 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // `bpchar -> text` trim is handled in the binder, not here, because a
         // padded `bpchar` value is indistinguishable from `text` at this layer.
         (_, PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name) => {
-            Ok(Value::Text(v.encode_text_with(efd).unwrap_or_default()))
+            Ok(Value::Text(v.encode_text_with(fmt).unwrap_or_default()))
         }
 
         // ---- text → scalar (input functions) ----
@@ -286,7 +297,7 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         }
 
         // ---- text → timestamptz (timestamptz_in) ----
-        (Value::Text(s), PgType::TimestampTz) => timestamptz::parse(s)
+        (Value::Text(s), PgType::TimestampTz) => timestamptz::parse(s, &fmt.zone)
             .map(Value::TimestampTz)
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
@@ -294,14 +305,19 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             }),
 
         // ---- timestamp ↔ timestamptz ----
-        // With the session zone fixed to UTC these are an identity on the raw
-        // microseconds (the wall clock equals the UTC instant), infinities
-        // included. WARNING: this is correct ONLY because the session/display
-        // zone is always UTC. When a real `TimeZone` GUC is added these arms
-        // must convert using it — they will NOT fail on their own, so revisit
-        // here (and `timestamptz::{parse,format,make_timestamptz}`) at that time.
-        (Value::Timestamp(m), PgType::TimestampTz) => Ok(Value::TimestampTz(*m)),
-        (Value::TimestampTz(m), PgType::Timestamp) => Ok(Value::Timestamp(*m)),
+        // Not an identity: a zone-less `timestamp` is a wall clock, a
+        // `timestamptz` is an instant, and the session zone is what relates
+        // them. Both directions are exactly `AT TIME ZONE <session zone>`.
+        (Value::Timestamp(m), PgType::TimestampTz) => {
+            timestamptz::timestamp_at_session_zone(*m, &fmt.zone)
+                .map(Value::TimestampTz)
+                .map_err(cast_err)
+        }
+        (Value::TimestampTz(m), PgType::Timestamp) => {
+            timestamptz::session_zone_wall_clock(*m, &fmt.zone)
+                .map(Value::Timestamp)
+                .map_err(cast_err)
+        }
 
         // ---- text → date / time / timetz (input functions) ----
         (Value::Text(s), PgType::Date) => date::parse(s).map(Value::Date).map_err(|e| CastError {
@@ -320,8 +336,10 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         }
 
         // ---- date ↔ timestamp / timestamptz ----
-        // A date widens to midnight; the UTC identity (session zone is UTC)
-        // carries it to timestamptz too. The reverse takes the calendar date.
+        // A date widens to midnight. For `timestamptz` that is midnight *in the
+        // session zone*, and the reverse takes the calendar date of the local
+        // wall clock — `'2024-06-01 02:00:00+00'::timestamptz::date` is
+        // 2024-05-31 in New York.
         (Value::Date(d), PgType::Timestamp) => date::to_timestamp_micros(*d)
             .map(Value::Timestamp)
             .map_err(|e| CastError {
@@ -329,13 +347,20 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
                 message: e.message,
             }),
         (Value::Date(d), PgType::TimestampTz) => date::to_timestamp_micros(*d)
-            .map(Value::TimestampTz)
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+            })
+            .and_then(|midnight| {
+                timestamptz::timestamp_at_session_zone(midnight, &fmt.zone)
+                    .map(Value::TimestampTz)
+                    .map_err(cast_err)
             }),
         (Value::Timestamp(m), PgType::Date) => Ok(Value::Date(date::from_timestamp_micros(*m))),
-        (Value::TimestampTz(m), PgType::Date) => Ok(Value::Date(date::from_timestamp_micros(*m))),
+        (Value::TimestampTz(m), PgType::Date) => {
+            let wall = timestamptz::session_zone_wall_clock(*m, &fmt.zone).map_err(cast_err)?;
+            Ok(Value::Date(date::from_timestamp_micros(wall)))
+        }
 
         // ---- time ↔ interval ----
         // time → interval keeps the microseconds as the time-of-day span;
@@ -663,7 +688,7 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             | PgType::Float4
             | PgType::Float8,
         ) => match j {
-            json::Jsonb::Number(n) => cast_value(Value::Numeric(n.clone()), to, efd),
+            json::Jsonb::Number(n) => cast_value(Value::Numeric(n.clone()), to, fmt),
             _ => Err(json_err(json::cannot_cast(j, to.name()))),
         },
 
@@ -673,7 +698,7 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
         // handled by the generic any-to-text arm above (via `encode_text_with`).
         (Value::Text(s), PgType::Array(elem_oid)) => {
             let elem = PgType::from_oid(elem_oid).ok_or_else(|| cannot_coerce(from, to))?;
-            crate::array::array_in(s, elem)
+            crate::array::array_in(s, elem, fmt)
                 .map(|elems| Value::Array { elem, elems })
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
@@ -686,7 +711,7 @@ pub fn cast_value(v: Value, to: PgType, efd: i32) -> Result<Value, CastError> {
             let elem = PgType::from_oid(elem_oid).ok_or_else(|| cannot_coerce(from, to))?;
             let recast = elems
                 .iter()
-                .map(|e| cast_value(e.clone(), elem, efd))
+                .map(|e| cast_value(e.clone(), elem, fmt))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Array {
                 elem,
@@ -984,24 +1009,24 @@ mod tests {
     #[test]
     fn float_to_int_edges() -> anyhow::Result<()> {
         assert_eq!(
-            cast_value(Value::Float4(32767.4), PgType::Int2, 1)?,
+            cast_value(Value::Float4(32767.4), PgType::Int2, &FmtCtx::utc(1))?,
             Value::Int2(32767)
         );
         assert_eq!(
-            cast_value(Value::Float4(32767.6), PgType::Int2, 1)
+            cast_value(Value::Float4(32767.6), PgType::Int2, &FmtCtx::utc(1))
                 .unwrap_err()
                 .message,
             "smallint out of range"
         );
         // f32 of 2147483647 rounds up to 2^31, out of int4 range.
         assert_eq!(
-            cast_value(Value::Float4(2147483647.0), PgType::Int4, 1)
+            cast_value(Value::Float4(2147483647.0), PgType::Int4, &FmtCtx::utc(1))
                 .unwrap_err()
                 .sqlstate,
             "22003"
         );
         assert_eq!(
-            cast_value(Value::Float8(-9223372036854775808.5), PgType::Int8, 1)?,
+            cast_value(Value::Float8(-9223372036854775808.5), PgType::Int8, &FmtCtx::utc(1))?,
             Value::Int8(i64::MIN)
         );
 
@@ -1011,13 +1036,13 @@ mod tests {
     #[test]
     fn float8_to_float4_range() {
         assert_eq!(
-            cast_value(Value::Float8(1e70), PgType::Float4, 1)
+            cast_value(Value::Float8(1e70), PgType::Float4, &FmtCtx::utc(1))
                 .unwrap_err()
                 .message,
             "value out of range: overflow"
         );
         assert_eq!(
-            cast_value(Value::Float8(1e-70), PgType::Float4, 1)
+            cast_value(Value::Float8(1e-70), PgType::Float4, &FmtCtx::utc(1))
                 .unwrap_err()
                 .message,
             "value out of range: underflow"
@@ -1026,23 +1051,23 @@ mod tests {
 
     #[test]
     fn numeric_nan_to_float() -> anyhow::Result<()> {
-        let n = cast_value(Value::Text("nan".into()), PgType::Numeric, 1)?;
-        let f = cast_value(n, PgType::Float4, 1)?;
-        assert_eq!(f.encode_text_with(1).as_deref(), Some("NaN"));
+        let n = cast_value(Value::Text("nan".into()), PgType::Numeric, &FmtCtx::utc_default())?;
+        let f = cast_value(n, PgType::Float4, &FmtCtx::utc(1))?;
+        assert_eq!(f.encode_text_with(&FmtCtx::utc_default()).as_deref(), Some("NaN"));
 
         Ok(())
     }
 
     #[test]
     fn numeric_rejects_garbage() {
-        let e = cast_value(Value::Text("abc".into()), PgType::Numeric, 1).unwrap_err();
+        let e = cast_value(Value::Text("abc".into()), PgType::Numeric, &FmtCtx::utc_default()).unwrap_err();
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(e.message, "invalid input syntax for type numeric: \"abc\"");
-        assert!(cast_value(Value::Text("1.5".into()), PgType::Numeric, 1).is_ok());
+        assert!(cast_value(Value::Text("1.5".into()), PgType::Numeric, &FmtCtx::utc_default()).is_ok());
     }
 
     fn cast(v: Value, to: PgType) -> Result<Value, CastError> {
-        cast_value(v, to, 1)
+        cast_value(v, to, &FmtCtx::utc(1))
     }
 
     /// PG's `bool -> text` cast spells the value out, even though the type's
@@ -1059,7 +1084,7 @@ mod tests {
             cast(Value::Bool(true), PgType::Name)?,
             Value::Text("t".into())
         );
-        assert_eq!(Value::Bool(true).encode_text().as_deref(), Some("t"));
+        assert_eq!(Value::Bool(true).encode_text_utc().as_deref(), Some("t"));
 
         Ok(())
     }
@@ -1136,15 +1161,15 @@ mod tests {
     #[test]
     fn assigning_int4_to_bool_is_narrower_than_casting() -> anyhow::Result<()> {
         assert_eq!(
-            cast_value_assign(Value::Int4(0), PgType::Bool, 1)?,
+            cast_value_assign(Value::Int4(0), PgType::Bool, &FmtCtx::utc(1))?,
             Value::Bool(false)
         );
         assert_eq!(
-            cast_value_assign(Value::Int4(1), PgType::Bool, 1)?,
+            cast_value_assign(Value::Int4(1), PgType::Bool, &FmtCtx::utc(1))?,
             Value::Bool(true)
         );
         for n in [2, -1] {
-            let e = cast_value_assign(Value::Int4(n), PgType::Bool, 1).unwrap_err();
+            let e = cast_value_assign(Value::Int4(n), PgType::Bool, &FmtCtx::utc(1)).unwrap_err();
             assert_eq!(e.sqlstate, "22P02");
             assert_eq!(
                 e.message,
@@ -1153,11 +1178,11 @@ mod tests {
         }
         // Every other pair is unaffected: assignment matches the plain cast.
         assert_eq!(
-            cast_value_assign(Value::Int8(7), PgType::Int4, 1)?,
+            cast_value_assign(Value::Int8(7), PgType::Int4, &FmtCtx::utc(1))?,
             Value::Int4(7)
         );
         assert_eq!(
-            cast_value_assign(Value::Null, PgType::Bool, 1)?,
+            cast_value_assign(Value::Null, PgType::Bool, &FmtCtx::utc(1))?,
             Value::Null
         );
 
@@ -1183,7 +1208,7 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("numeric test cast failed: {error:?}"),
         };
-        match value.encode_text_with(1) {
+        match value.encode_text_with(&FmtCtx::utc_default()) {
             Some(text) => text,
             None => panic!("numeric test value has no text encoding"),
         }
@@ -1385,6 +1410,86 @@ mod tests {
         // Non-numeric is 22P02.
         assert_eq!(text_to_oid("abc").unwrap_err().sqlstate, "22P02");
 
+        Ok(())
+    }
+
+    // --- session display zone (pinned against PostgreSQL 18.4) -------------
+
+    fn ny() -> FmtCtx {
+        FmtCtx::new(
+            1,
+            std::sync::Arc::new(
+                crate::tz::SessionZone::resolve("America/New_York").expect("real zone"),
+            ),
+        )
+    }
+
+    fn text_to(s: &str, ty: PgType, fmt: &FmtCtx) -> anyhow::Result<String> {
+        Ok(cast_value(Value::Text(s.to_string()), ty, fmt)?
+            .encode_text_with(fmt)
+            .ok_or_else(|| anyhow::anyhow!("cast produced NULL"))?)
+    }
+
+    /// Cast `v` to `ty` and render it, for the zone-aware cast assertions below.
+    fn cast_to(v: Value, ty: PgType, fmt: &FmtCtx) -> anyhow::Result<String> {
+        Ok(cast_value(v, ty, fmt)?
+            .encode_text_with(fmt)
+            .ok_or_else(|| anyhow::anyhow!("cast produced NULL"))?)
+    }
+
+    #[test]
+    fn timestamp_and_timestamptz_convert_through_the_session_zone() -> anyhow::Result<()> {
+        let ny = ny();
+        // A zone-less wall clock is read in the session zone, not as UTC.
+        let ts = cast_value(
+            Value::Text("2024-06-01 12:00:00".into()),
+            PgType::Timestamp,
+            &ny,
+        )?;
+        assert_eq!(
+            cast_to(ts.clone(), PgType::TimestampTz, &ny)?,
+            "2024-06-01 12:00:00-04"
+        );
+
+        // ... and an instant renders as the local wall clock.
+        let tstz = cast_value(
+            Value::Text("2024-06-01 12:00:00+00".into()),
+            PgType::TimestampTz,
+            &ny,
+        )?;
+        assert_eq!(
+            cast_to(tstz, PgType::Timestamp, &ny)?,
+            "2024-06-01 08:00:00"
+        );
+
+        // Under UTC both directions stay the identity they always were.
+        let utc = FmtCtx::utc_default();
+        assert_eq!(
+            cast_to(ts, PgType::TimestampTz, &utc)?,
+            "2024-06-01 12:00:00+00"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn date_and_timestamptz_convert_through_the_session_zone() -> anyhow::Result<()> {
+        let ny = ny();
+        // A date widens to midnight *local*, so its UTC instant is 04:00.
+        assert_eq!(text_to("2024-06-01", PgType::Date, &ny)?, "2024-06-01");
+        let d = cast_value(Value::Text("2024-06-01".into()), PgType::Date, &ny)?;
+        assert_eq!(
+            cast_to(d, PgType::TimestampTz, &ny)?,
+            "2024-06-01 00:00:00-04"
+        );
+
+        // The reverse takes the calendar date of the *local* clock: 02:00 UTC
+        // on the 1st is still the 31st in New York.
+        let v = cast_value(
+            Value::Text("2024-06-01 02:00:00+00".into()),
+            PgType::TimestampTz,
+            &ny,
+        )?;
+        assert_eq!(cast_to(v, PgType::Date, &ny)?, "2024-05-31");
         Ok(())
     }
 }

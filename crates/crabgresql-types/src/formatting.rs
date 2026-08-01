@@ -15,12 +15,13 @@
 //!
 //! * The codes `Q W WW IW IYYY IDDD DDD J SSSS RM CC BC AD SP TM D` are not
 //!   implemented and pass through as literal text rather than being expanded.
-//! * The session display zone is hardcoded to UTC (see `timestamptz::format`),
-//!   so `TZ` is always `UTC` and `OF` always `+00`. Under `SET timezone='UTC'`
-//!   this is identical to PG.
+//! * `to_timestamp`'s `TZ` code resolves a parsed abbreviation's offset at the
+//!   2000 epoch rather than at the instant being parsed, so a DST-varying
+//!   abbreviation can come back one hour off for dates far from 2000.
 
 use crate::interval::{self, Interval};
 use crate::timestamp::{self, Tm, tm};
+use crate::tz::SessionZone;
 
 // SQLSTATEs (kept as literals; the types crate does not depend on the protocol
 // crate — the binder/executor map these to `sqlstate::*`).
@@ -436,7 +437,8 @@ impl IvFields {
 
 /// A timestamp's fields plus its display zone. `zone` is `None` for a plain
 /// `timestamp`, where PG renders `TZ` as the empty string but still renders
-/// `OF` as `+00`.
+/// `OF` as `+00`. For a `timestamptz` the fields are the *local* wall clock and
+/// `zone` carries what the session zone shows at that instant.
 struct DtFields {
     /// The *displayed* year: 1-based BC, so astronomical 0 shows as 1.
     year: i64,
@@ -448,11 +450,18 @@ struct DtFields {
     usec: i64,
     /// 0 = Sunday.
     dow: usize,
-    zone: Option<&'static str>,
+    zone: Option<ZoneDisplay>,
+}
+
+/// What the `TZ` and `OF` codes print for a `timestamptz`: the zone's
+/// abbreviation at this instant (empty for a bare numeric zone) and its offset.
+struct ZoneDisplay {
+    abbrev: String,
+    offset_secs: i32,
 }
 
 impl DtFields {
-    fn of(micros: i64, zone: Option<&'static str>) -> DtFields {
+    fn of(micros: i64, zone: Option<ZoneDisplay>) -> DtFields {
         let t = timestamp::decode(micros);
         DtFields {
             year: if t.year <= 0 { 1 - t.year } else { t.year },
@@ -498,15 +507,32 @@ pub fn to_char_timestamp(micros: i64, fmt: &str) -> Result<Option<String>, Forma
     to_char_dt(micros, fmt, None)
 }
 
-/// `to_char(timestamptz, fmt)`. The display zone is UTC (see the module header).
-pub fn to_char_timestamptz(micros: i64, fmt: &str) -> Result<Option<String>, FormatError> {
-    to_char_dt(micros, fmt, Some("UTC"))
+/// `to_char(timestamptz, fmt)`: the fields come from the wall clock the session
+/// zone shows, and `TZ`/`OF` report that zone.
+pub fn to_char_timestamptz(
+    micros: i64,
+    fmt: &str,
+    session: &SessionZone,
+) -> Result<Option<String>, FormatError> {
+    if !timestamp::is_finite(micros) {
+        return Ok(None);
+    }
+    let offset_secs = session.offset_at(micros);
+    let local = micros.saturating_add(offset_secs as i64 * 1_000_000);
+    to_char_dt(
+        local,
+        fmt,
+        Some(ZoneDisplay {
+            abbrev: session.abbrev_at(micros),
+            offset_secs,
+        }),
+    )
 }
 
 fn to_char_dt(
     micros: i64,
     fmt: &str,
-    zone: Option<&'static str>,
+    zone: Option<ZoneDisplay>,
 ) -> Result<Option<String>, FormatError> {
     if !timestamp::is_finite(micros) {
         return Ok(None);
@@ -583,7 +609,7 @@ fn render_dt(code: Code, f: &DtFields, fm: bool) -> (String, i64) {
         Code::DayAbbr(case) => (abbr(DAY_NAMES[f.dow], case), f.dow as i64),
         Code::Meridiem { dotted, upper } => (meridiem(f.hour, dotted, upper), 0),
         Code::TzAbbr { upper } => {
-            let z = f.zone.unwrap_or("");
+            let z = f.zone.as_ref().map_or("", |z| z.abbrev.as_str());
             (
                 if upper {
                     z.to_ascii_uppercase()
@@ -593,7 +619,11 @@ fn render_dt(code: Code, f: &DtFields, fm: bool) -> (String, i64) {
                 0,
             )
         }
-        Code::TzOffset => ("+00".to_string(), 0),
+        // A plain `timestamp` has no zone but still renders `OF` as `+00`.
+        Code::TzOffset => (
+            crate::tz::format_offset_hours_minutes(f.zone.as_ref().map_or(0, |z| z.offset_secs)),
+            0,
+        ),
     }
 }
 
@@ -719,8 +749,13 @@ struct Parsed {
     offset: Option<i32>,
 }
 
-/// `to_timestamp(text, text)` → microseconds since 2000-01-01 UTC.
-pub fn from_char_timestamptz(input: &str, fmt: &str) -> Result<i64, FormatError> {
+/// `to_timestamp(text, text)` → microseconds since 2000-01-01 UTC. An input
+/// carrying no `TZ`/`OF` field is read in the session zone, as PG does.
+pub fn from_char_timestamptz(
+    input: &str,
+    fmt: &str,
+    session: &SessionZone,
+) -> Result<i64, FormatError> {
     let (t, offset) = from_char(input, fmt)?;
     // PG's timestamp range, 4713 BC .. 294276 AD. Checked before the field
     // ranges, as `timestamp::parse` does.
@@ -728,7 +763,19 @@ pub fn from_char_timestamptz(input: &str, fmt: &str) -> Result<i64, FormatError>
         return Err(field_out_of_range(input));
     }
     timestamp::validate_fields(&t, input).map_err(|e| FormatError::new(e.sqlstate, e.message))?;
-    Ok(timestamp::encode(t) - i64::from(offset) * 1_000_000)
+    let civil = timestamp::encode(t);
+    let offset = match offset {
+        Some(secs) => secs,
+        None => session.offset_for_wall(crate::tz::TmLite {
+            year: t.year,
+            month: t.month,
+            day: t.day,
+            hour: t.hour,
+            min: t.min,
+            sec: t.sec,
+        }),
+    };
+    Ok(civil - i64::from(offset) * 1_000_000)
 }
 
 /// `to_date(text, text)` → days since 2000-01-01. The `date` range runs far
@@ -746,7 +793,7 @@ pub fn from_char_date(input: &str, fmt: &str) -> Result<i32, FormatError> {
 
 /// Scan `input` against `fmt`, returning the assembled calendar time and the
 /// zone offset (seconds east of UTC) if the picture carried one.
-fn from_char(input: &str, fmt: &str) -> Result<(Tm, i32), FormatError> {
+fn from_char(input: &str, fmt: &str) -> Result<(Tm, Option<i32>), FormatError> {
     let nodes = parse_picture(fmt);
     let chars: Vec<char> = input.chars().collect();
     let mut pos = 0usize;
@@ -1077,7 +1124,7 @@ fn complete_year(value: i64, digits: u32, code_width: u8) -> i64 {
     base + (value - base).rem_euclid(unit)
 }
 
-fn assemble(p: &Parsed) -> Result<(Tm, i32), FormatError> {
+fn assemble(p: &Parsed) -> Result<(Tm, Option<i32>), FormatError> {
     // PG's default is astronomical year 0, i.e. 1 BC.
     let year = p.year.unwrap_or(0);
     let hour = match (p.hour24, p.hour12) {
@@ -1100,7 +1147,7 @@ fn assemble(p: &Parsed) -> Result<(Tm, i32), FormatError> {
         p.sec.unwrap_or(0),
         p.usec.unwrap_or(0),
     );
-    Ok((t, p.offset.unwrap_or(0)))
+    Ok((t, p.offset))
 }
 
 #[cfg(test)]
@@ -1136,7 +1183,7 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("invalid timestamp test fixture `{s}`: {error:?}"),
         };
-        match to_char_timestamptz(value, fmt) {
+        match to_char_timestamptz(value, fmt, &SessionZone::utc()) {
             Ok(Some(output)) => output,
             other => panic!("unexpected to_char(timestamptz) result for `{fmt}`: {other:?}"),
         }
@@ -1229,7 +1276,7 @@ mod tests {
         );
         assert_eq!(to_char_timestamp(timestamp::POS_INFINITY, "YYYY"), Ok(None));
         assert_eq!(
-            to_char_timestamptz(timestamp::NEG_INFINITY, "YYYY"),
+            to_char_timestamptz(timestamp::NEG_INFINITY, "YYYY", &SessionZone::utc()),
             Ok(None)
         );
     }
@@ -1324,8 +1371,8 @@ mod tests {
     }
 
     fn to_ts(input: &str, fmt: &str) -> String {
-        match from_char_timestamptz(input, fmt) {
-            Ok(m) => crate::timestamptz::format(m),
+        match from_char_timestamptz(input, fmt, &SessionZone::utc()) {
+            Ok(m) => crate::timestamptz::format(m, &SessionZone::utc()),
             Err(e) => panic!("unexpected to_timestamp error for `{input}`/`{fmt}`: {e:?}"),
         }
     }
@@ -1424,7 +1471,7 @@ mod tests {
             ("294276 9223372036854775807", "YYYY US", "US"),
             ("2024 999999999999999999", "YYYY US", "US"),
         ] {
-            let e = expect_err(from_char_timestamptz(input, fmt));
+            let e = expect_err(from_char_timestamptz(input, fmt, &SessionZone::utc()));
             assert_eq!(e.sqlstate, "22008", "{input}");
             assert_eq!(
                 e.message,
@@ -1437,7 +1484,7 @@ mod tests {
             "value for \"YYYY\" in source string is out of range"
         );
         // In range for an int, but still more than a second of fraction.
-        let e = expect_err(from_char_timestamptz("2024 9999999", "YYYY US"));
+        let e = expect_err(from_char_timestamptz("2024 9999999", "YYYY US", &SessionZone::utc()));
         assert_eq!(e.sqlstate, "22008");
         assert_eq!(
             e.message,
@@ -1488,7 +1535,7 @@ mod tests {
         let e = expect_err(from_char_date("garbage", "YYYY-MM-DD"));
         assert_eq!(e.message, "invalid value \"garb\" for \"YYYY\"");
 
-        let e = expect_err(from_char_timestamptz("abc", "Mon"));
+        let e = expect_err(from_char_timestamptz("abc", "Mon", &SessionZone::utc()));
         assert_eq!(e.sqlstate, "22007");
         assert_eq!(e.message, "invalid value \"abc\" for \"Mon\"");
         assert_eq!(
@@ -1499,6 +1546,7 @@ mod tests {
         let e = expect_err(from_char_timestamptz(
             "2024-03-05 13:00 PM",
             "YYYY-MM-DD HH12:MI AM",
+            &SessionZone::utc(),
         ));
         assert_eq!(e.sqlstate, "22007");
         assert_eq!(e.message, "hour \"13\" is invalid for the 12-hour clock");
@@ -1507,6 +1555,7 @@ mod tests {
         let e = expect_err(from_char_timestamptz(
             "2024-03-05 25:00",
             "YYYY-MM-DD HH24:MI",
+            &SessionZone::utc(),
         ));
         assert_eq!(e.sqlstate, "22008");
         assert_eq!(
@@ -1516,5 +1565,69 @@ mod tests {
 
         let e = expect_err(from_char_date("2024-02-30", "YYYY-MM-DD"));
         assert_eq!(e.sqlstate, "22008");
+    }
+
+    /// `TZ` and `OF` report the session zone, not a hardcoded UTC.
+    /// Pinned against PostgreSQL 18.4.
+    /// `FormatError` is a plain message struct, not a `std::error::Error`, so
+    /// `?` needs an explicit mapper.
+    fn fe(e: FormatError) -> anyhow::Error {
+        anyhow::anyhow!("{}: {}", e.sqlstate, e.message)
+    }
+
+    #[test]
+    fn to_char_renders_the_session_zone() -> anyhow::Result<()> {
+        let z = |n: &str| SessionZone::resolve(n).expect("real zone");
+        let ny = z("America/New_York");
+        let v = crate::timestamptz::parse("2024-01-15 12:00:00-05", &ny).map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(
+            to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &ny).map_err(fe)?,
+            Some("2024-01-15 12:00:00 EST -05".to_string())
+        );
+
+        // A sub-hour zone widens `OF`, and the abbreviation comes from tzdb.
+        let kolkata = z("Asia/Kolkata");
+        let v = crate::timestamptz::parse("2024-01-15 12:00:00+05:30", &kolkata).map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(
+            to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &kolkata).map_err(fe)?,
+            Some("2024-01-15 12:00:00 IST +05:30".to_string())
+        );
+
+        // `OF` never widens to seconds, even where `timestamptz_out` does:
+        // pre-1883 New York ran at -04:56:02, which PG's `OF` prints as -04:56.
+        let lmt = crate::timestamptz::parse("1875-06-01 12:00:00", &ny).map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(
+            to_char_timestamptz(lmt, "OF", &ny).map_err(fe)?,
+            Some("-04:56".to_string())
+        );
+        assert_eq!(
+            crate::timestamptz::format(lmt, &ny),
+            "1875-06-01 12:00:00-04:56:02"
+        );
+
+        // A plain `timestamp` still has no `TZ` and a `+00` `OF`.
+        let ts = crate::timestamp::parse("2024-01-15 12:00:00")
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(
+            to_char_timestamp(ts, "HH24:MI TZ OF").map_err(fe)?,
+            Some("12:00  +00".to_string())
+        );
+        Ok(())
+    }
+
+    /// `to_timestamp` reads a zone-less input in the session zone; an input
+    /// carrying its own `OF` is unaffected.
+    #[test]
+    fn from_char_defaults_to_the_session_zone() -> anyhow::Result<()> {
+        let ny = SessionZone::resolve("America/New_York").expect("real zone");
+        let v = from_char_timestamptz("2024-06-01 12:00:00", "YYYY-MM-DD HH24:MI:SS", &ny).map_err(fe)?;
+        assert_eq!(crate::timestamptz::format(v, &ny), "2024-06-01 12:00:00-04");
+        let explicit =
+            from_char_timestamptz("2024-06-01 12:00:00 +00", "YYYY-MM-DD HH24:MI:SS OF", &ny).map_err(fe)?;
+        assert_eq!(
+            crate::timestamptz::format(explicit, &ny),
+            "2024-06-01 08:00:00-04"
+        );
+        Ok(())
     }
 }

@@ -33,7 +33,7 @@ use crabgresql_storage_api::{
     Tuple,
 };
 use crabgresql_txn::TxnContext;
-use crabgresql_types::{PgType, Value};
+use crabgresql_types::{FmtCtx, PgType, Value};
 
 use eval::eval;
 pub use eval::{
@@ -174,12 +174,15 @@ pub trait RoutineOps: Send + Sync {
     ) -> Result<(), ExecError>;
 }
 
-/// Session state that runtime evaluation depends on: `extra_float_digits`
-/// (float→text output precision) and, when present, the handles the
-/// side-effecting sequence functions and the catalog functions dispatch through.
+/// Session state that runtime evaluation depends on: the value-formatting
+/// context (`extra_float_digits` and the display `TimeZone`) and, when present,
+/// the handles the side-effecting sequence functions and the catalog functions
+/// dispatch through.
 #[derive(Clone)]
 pub struct ExecContext {
-    pub extra_float_digits: i32,
+    /// `extra_float_digits` and the session display zone — everything value
+    /// rendering, parsing, and casting needs from the session.
+    pub fmt: FmtCtx,
     /// `None` in contexts that never call a sequence function (e.g. `EXPLAIN`'s
     /// `Values` node); a sequence function reaching a `None` context is an
     /// internal wiring error, reported as 5-char `XX000`.
@@ -221,7 +224,7 @@ impl Default for ExecContext {
     fn default() -> Self {
         // PG's default since v12.
         Self {
-            extra_float_digits: 1,
+            fmt: FmtCtx::utc_default(),
             sequences: None,
             catalog: None,
             txn: None,
@@ -393,7 +396,7 @@ pub fn execute(
     // `..ctx.clone()`, which would clone the old `txn` Snapshot (a `Vec<Xid>`)
     // only to overwrite it. One `txn.clone()` per execute, none wasted.
     let ctx = &ExecContext {
-        extra_float_digits: ctx.extra_float_digits,
+        fmt: ctx.fmt.clone(),
         sequences: ctx.sequences.clone(),
         catalog: ctx.catalog.clone(),
         txn: Some(txn.clone()),
@@ -2392,7 +2395,7 @@ fn unique_keys_equal(
 
 fn display_value(value: &Value, ctx: &ExecContext) -> String {
     value
-        .encode_text_with(ctx.extra_float_digits)
+        .encode_text_with(&ctx.fmt)
         .unwrap_or_else(|| "null".to_string())
 }
 
@@ -5540,7 +5543,7 @@ mod tests {
     /// The single generate_series column, rendered as PG-formatted text.
     fn series_text(rows: &[Tuple]) -> Vec<String> {
         rows.iter()
-            .map(|r| r[0].encode_text_with(1).unwrap_or_default())
+            .map(|r| r[0].encode_text_with(&FmtCtx::utc_default()).unwrap_or_default())
             .collect()
     }
 

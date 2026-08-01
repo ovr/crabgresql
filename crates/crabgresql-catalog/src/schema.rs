@@ -514,7 +514,7 @@ fn deparse_partbound(part: &PartitionOf) -> String {
             if let Value::Bool(b) = v {
                 return if *b { "true" } else { "false" }.to_string();
             }
-            let text = v.encode_text().unwrap_or_default();
+            let text = v.encode_text_utc().unwrap_or_default();
             let bare = match v {
                 Value::Int2(_) | Value::Int4(_) | Value::Int8(_) => !text.starts_with('-'),
                 _ => false,
