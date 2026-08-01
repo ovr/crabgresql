@@ -5070,12 +5070,13 @@ async fn repeated_view_references_are_not_recursion() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The expansion state is ambient for the whole bind, so it must be unwound on
-/// the error path too: a failed statement must not leave an entry behind that
-/// makes the next statement's use of the same view look recursive.
+/// A cycle detected several levels down reports the *repeating* view, not the
+/// one the statement named, and reports it identically every time.
 ///
-/// A cycle aborts the bind mid-expansion, leaving entries on the stack that only
-/// `Drop` removes — so `bad` must stay usable as a *component* afterwards.
+/// This does not pin the guard's `Drop` — expansion state lives on the
+/// statement's bind context, so it cannot outlive a failed statement even if the
+/// pop were removed. `repeated_view_references_are_not_recursion` is what pins
+/// the pop, via two sibling references within one statement.
 #[tokio::test]
 async fn a_recursion_error_does_not_poison_later_statements() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -5085,8 +5086,8 @@ async fn a_recursion_error_does_not_poison_later_statements() -> anyhow::Result<
     client
         .simple_query("CREATE VIEW ok AS SELECT a FROM t")
         .await?;
-    // outer -> mid -> bad, with bad self-referential: the failed bind unwinds
-    // three guards, so a missing pop would strand `mid`/`bad` on the stack.
+    // outer_v -> mid -> bad, with bad self-referential: the cycle is three levels
+    // below the view the statement names.
     client
         .simple_query("CREATE VIEW bad AS SELECT a FROM t")
         .await?;
