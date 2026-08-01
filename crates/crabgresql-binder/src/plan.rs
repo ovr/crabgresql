@@ -2770,23 +2770,39 @@ fn bind_from_item(
             let arg_exprs = positional_arg_exprs(&fn_args.args)?;
             let (func, args) =
                 bind_table_fn_call(&fname, &arg_exprs, &Scope::empty(catalog, params))?;
-            let qualifier = relation_qualifier(alias, &fname);
-            let mut columns: Vec<OutputColumn> = func
-                .columns()
-                .into_iter()
-                .map(|c| OutputColumn {
-                    name: c.name,
-                    ty: c.ty,
-                    collation: c.collation,
-                    strength: c.strength,
-                })
-                .collect();
-            apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
-            Ok(BoundFromItem {
-                qualifier,
-                columns,
-                input: JoinInput::TableFunction { func, args },
-            })
+            bound_table_fn_item(func, args, &fname, alias)
+        }
+        // `unnest(array)` in FROM. Under the PostgreSQL dialect the parser gives
+        // this its own factor rather than a `Table` with call arguments, but it
+        // binds to the same `TableFn::Unnest` rowset.
+        ast::TableFactor::UNNEST {
+            alias,
+            array_exprs,
+            with_offset,
+            with_offset_alias,
+            with_ordinality,
+        } => {
+            if *with_ordinality {
+                return Err(BindError::feature_not_supported(
+                    "WITH ORDINALITY is not supported yet",
+                ));
+            }
+            // `WITH OFFSET` is BigQuery syntax, not PostgreSQL's.
+            if *with_offset || with_offset_alias.is_some() {
+                return Err(BindError::feature_not_supported(
+                    "WITH OFFSET is not supported yet",
+                ));
+            }
+            // Multiple arrays unnest side by side (padded to the longest); only
+            // the single-array form is supported, matching `resolve_unnest`.
+            if array_exprs.len() != 1 {
+                return Err(BindError::feature_not_supported(
+                    "unnest with multiple arrays is not supported yet",
+                ));
+            }
+            let (func, args) =
+                bind_table_fn_call("unnest", array_exprs, &Scope::empty(catalog, params))?;
+            bound_table_fn_item(func, args, "unnest", alias)
         }
         // A bare name may resolve to a CTE (which shadows a real table).
         ast::TableFactor::Table {
@@ -3584,6 +3600,44 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
         // WITH: leave as-is; the executor's first-row check is still correct.
         other => other,
     }
+}
+
+/// Assemble the FROM item for an already-resolved table function. `default_name`
+/// is the function's own name, used as the qualifier when there is no alias.
+///
+/// PG names a *scalar* function's single output column after a bare alias, so
+/// `generate_series(1, 10) i` exposes a column `i` and not `generate_series`. An
+/// explicit alias column list (`s(g)`) still wins over the bare alias, and a
+/// composite-returning function keeps its row type's column names.
+fn bound_table_fn_item(
+    func: TableFn,
+    args: Vec<BoundExpr>,
+    default_name: &str,
+    alias: &Option<ast::TableAlias>,
+) -> Result<BoundFromItem, BindError> {
+    let qualifier = relation_qualifier(alias, default_name);
+    let mut columns: Vec<OutputColumn> = func
+        .columns()
+        .into_iter()
+        .map(|c| OutputColumn {
+            name: c.name,
+            ty: c.ty,
+            collation: c.collation,
+            strength: c.strength,
+        })
+        .collect();
+    if func.returns_scalar()
+        && let Some(alias) = alias
+        && let [col] = columns.as_mut_slice()
+    {
+        col.name = normalize_ident(&alias.name);
+    }
+    apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
+    Ok(BoundFromItem {
+        qualifier,
+        columns,
+        input: JoinInput::TableFunction { func, args },
+    })
 }
 
 /// The qualifier a FROM item's columns are addressed by: its alias, else its
@@ -8104,6 +8158,108 @@ mod tests {
     fn generate_series_wrong_arity_is_42883() {
         let e = bind_err("SELECT * FROM generate_series(1)");
         assert_eq!(e.code, "42883");
+    }
+
+    #[test]
+    fn table_fn_bare_alias_names_the_output_column() -> anyhow::Result<()> {
+        // PG names a scalar function's single output column after the alias, so
+        // `i` is both the relation qualifier and the column name. The `AS` is
+        // optional; both spellings must behave the same.
+        for sql in [
+            "SELECT i FROM generate_series(1, 5) AS i",
+            "SELECT i FROM generate_series(1, 5) i",
+        ] {
+            let LogicalPlan::TableFunction { columns, .. } = bind_one(sql)? else {
+                panic!("expected TableFunction for `{sql}`");
+            };
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns[0].name, "i");
+            assert_eq!(columns[0].ty, PgType::Int4);
+        }
+        // The qualified spelling still resolves through the same alias.
+        bound("SELECT i.i FROM generate_series(1, 5) AS i");
+
+        Ok(())
+    }
+
+    #[test]
+    fn table_fn_alias_column_list_wins_over_bare_alias() -> anyhow::Result<()> {
+        let LogicalPlan::TableFunction { columns, .. } =
+            bind_one("SELECT g FROM generate_series(1, 3) AS s(g)")?
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(columns[0].name, "g");
+        // A list longer than the rowset is still 42P10.
+        let e = bind_err("SELECT * FROM generate_series(1, 3) AS s(a, b)");
+        assert_eq!(e.code, "42P10");
+
+        Ok(())
+    }
+
+    #[test]
+    fn composite_table_fn_bare_alias_does_not_rename() -> anyhow::Result<()> {
+        // `pg_input_error_info` returns a record: the alias names the relation
+        // only, and the row type's column names survive.
+        let LogicalPlan::TableFunction { columns, .. } =
+            bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4') AS e")?
+        else {
+            panic!("expected TableFunction");
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn base_table_bare_alias_does_not_rename_columns() -> anyhow::Result<()> {
+        // The rename is specific to scalar function FROM items — a bare alias on
+        // a real relation names the relation and nothing else.
+        let LogicalPlan::Query { columns, .. } = bind_one("SELECT * FROM t AS x")? else {
+            panic!("expected Query");
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "big", "name", "flag"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn unnest_in_from_binds_element_column() -> anyhow::Result<()> {
+        let LogicalPlan::TableFunction { func, columns, .. } =
+            bind_one("SELECT * FROM unnest(ARRAY[1, 2, 3])")?
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(func, crate::TableFn::Unnest(PgType::Int4));
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "unnest");
+        assert_eq!(columns[0].ty, PgType::Int4);
+
+        // And the alias renames it, like any other scalar SRF.
+        let LogicalPlan::TableFunction { columns, .. } =
+            bind_one("SELECT u FROM unnest(ARRAY['a', 'b']) AS u")?
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(columns[0].name, "u");
+
+        Ok(())
+    }
+
+    #[test]
+    fn unnest_in_from_rejects_unsupported_forms() {
+        assert_eq!(
+            bind_err("SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY").message,
+            "WITH ORDINALITY is not supported yet"
+        );
+        assert_eq!(
+            bind_err("SELECT * FROM unnest(ARRAY[1, 2], ARRAY[3, 4])").message,
+            "unnest with multiple arrays is not supported yet"
+        );
+        // A non-array argument is still resolved by `resolve_unnest`.
+        assert_eq!(bind_err("SELECT * FROM unnest(1)").code, "42883");
     }
 
     #[test]

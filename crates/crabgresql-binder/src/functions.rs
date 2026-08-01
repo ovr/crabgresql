@@ -1067,6 +1067,19 @@ impl TableFn {
             TableFn::Unnest(elem) => vec![OutputColumn::new("unnest", elem)],
         }
     }
+
+    /// Whether the function returns a bare scalar rather than a composite row.
+    /// PG names a scalar function's single output column after the FROM-item
+    /// alias when one is given (`generate_series(1, 10) i` yields column `i`);
+    /// a composite-returning function takes its column names from its row type,
+    /// and a bare alias there names only the relation.
+    pub fn returns_scalar(self) -> bool {
+        match self {
+            // `pg_input_error_info` returns `record`.
+            TableFn::PgInputErrorInfo => false,
+            TableFn::GenerateSeries(_) | TableFn::JsonbPathQuery | TableFn::Unnest(_) => true,
+        }
+    }
 }
 
 /// Resolve a set-returning function by (already lowercased) name.

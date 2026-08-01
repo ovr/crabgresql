@@ -66,6 +66,12 @@ SELECT array_append(ARRAY[1, 2], 3) AS appended,
 -- unnest expands an array to a set of rows
 SELECT unnest(ARRAY[10, 20, 30]);
 SELECT unnest(ARRAY['a', 'b']) AS u;
+-- in FROM position, where the alias names the output column
+SELECT * FROM unnest(ARRAY[10, 20, 30]);
+SELECT u FROM unnest(ARRAY[10, 20, 30]) AS u ORDER BY u DESC;
+SELECT e FROM unnest(ARRAY[1, 2]) AS t(e) ORDER BY 1;
+-- NULL elements come through as rows
+SELECT u FROM unnest(ARRAY[1, NULL, 3]) AS u;
 
 DROP TABLE arr;
 
