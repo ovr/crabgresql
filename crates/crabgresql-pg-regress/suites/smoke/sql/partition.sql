@@ -81,7 +81,7 @@ CREATE TABLE sales_empty PARTITION OF sales FOR VALUES FROM ('2025-01-01') TO ('
 CREATE TABLE sales_null PARTITION OF sales FOR VALUES FROM (NULL) TO ('2027-01-01');
 -- A duplicate partition name is a name collision (42P07), not a self-overlap.
 CREATE TABLE sales_2024 PARTITION OF sales FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
--- IF NOT EXISTS on an existing partition is a no-op.
+-- IF NOT EXISTS on an existing partition is a no-op, with PG's skip notice.
 CREATE TABLE IF NOT EXISTS sales_2024 PARTITION OF sales FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 -- A partitioned parent has no storage of its own: TRUNCATE and CREATE INDEX on
 -- it are not supported yet (0A000); they are not silently no-ops.

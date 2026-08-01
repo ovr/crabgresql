@@ -2939,6 +2939,21 @@ fn execute_create_table(
     } else {
         resolve_create_namespace(engine, schema_qual.as_deref(), &name)?
     };
+    // `IF NOT EXISTS` on a relation that is already there is a no-op, and PG
+    // decides that *before* it analyzes anything else. Checking it here rather
+    // than after the columns are resolved is what makes the no-op total: the
+    // rest of this function raises notices (the inheritance merge, the datetime
+    // clamp) and errors (a type conflict, a missing parent, the sort-key rule)
+    // that all describe a table this statement is not going to touch.
+    if create.if_not_exists && engine.resolve(Some(&namespace), &name).is_ok() {
+        return Ok(QueryResult::Command {
+            tag: "CREATE TABLE".into(),
+            notices: vec![Notice::notice(
+                format!("relation \"{name}\" already exists, skipping"),
+                None,
+            )],
+        });
+    }
     // Temp and UNLOGGED tables are memory tables (RAM-backed, WAL-skipping); a
     // plain table is a durable heap. All of them live in the one shared engine now.
     let persistence = if create.temporary {
@@ -3383,23 +3398,6 @@ fn execute_create_table(
                 schema.columns[key.column].nullable = false;
             }
         }
-    }
-    // `IF NOT EXISTS` on a relation that is already there is a no-op, so it must
-    // not trip over the sort-key rule: a database written before sort keys
-    // existed is full of keyless engine-managed relations, and re-running the
-    // DDL that created one is exactly what an idempotent bootstrap script does.
-    // Checked here rather than at the top of the function because that is the
-    // narrow fix — and it lands above the serial-sequence creation below, so the
-    // re-run also stops creating a throwaway `t_id_seq1` only to drop it again.
-    if create.if_not_exists && engine.resolve(Some(&namespace), &name).is_ok() {
-        return Ok(QueryResult::Command {
-            tag: "CREATE TABLE".into(),
-            // The merge notices describe a table this statement did not touch.
-            notices: vec![Notice::notice(
-                format!("relation \"{name}\" already exists, skipping"),
-                None,
-            )],
-        });
     }
     schema.sort_key = build_sort_key(
         create.order_by.as_ref(),
@@ -6613,14 +6611,6 @@ fn execute_drop_schema(
             .filter(|(kind, _)| *kind == "table" || *kind == "view")
             .map(|(_, obj)| (name.clone(), obj.clone()))
             .collect();
-        // The noun for a target of one of those edges, so an outside view over
-        // `s.v` is told it depends on a *view*, not a table.
-        let target_noun = |obj: &str| {
-            contents
-                .iter()
-                .find(|(_, o)| o == obj)
-                .map_or("table", |(kind, _)| *kind)
-        };
         let external: Vec<Dependent> = drop_dependents(&graph, &in_schema)
             .into_iter()
             .filter(|(_, ns, _)| ns != name)
@@ -6632,23 +6622,27 @@ fn execute_drop_schema(
                 // an outside dependent depends on the particular relation it
                 // names, and PG says which — so report the real edge rather
                 // than re-attributing it to the schema.
-                let mut detail: Vec<String> = contents
-                    .iter()
-                    .map(|(kind, obj)| format!("{kind} {name}.{obj} depends on schema {name}"))
-                    .collect();
-                detail.extend(dependency_edges(&graph, &in_schema).into_iter().filter_map(
-                    |((kind, dns, dn), (tns, tn))| {
-                        (dns != *name).then(|| {
-                            format!(
+                //
+                // Interleaved, not grouped: PG lists each of the schema's own
+                // objects followed immediately by whatever depends on *that*
+                // object, so `s.p` is followed by the child of `s.p` rather than
+                // by the schema's next content.
+                let edges = dependency_edges(&graph, &in_schema);
+                let mut detail: Vec<String> = Vec::new();
+                for (kind, obj) in &contents {
+                    detail.push(format!("{kind} {name}.{obj} depends on schema {name}"));
+                    for ((dkind, dns, dn), (_, tn)) in &edges {
+                        if dns != name && tn == obj {
+                            detail.push(format!(
                                 "{} {} depends on {} {}",
-                                kind.noun(),
-                                dep_display(&dns, &dn),
-                                target_noun(&tn),
-                                dep_display(&tns, &tn)
-                            )
-                        })
-                    },
-                ));
+                                dkind.noun(),
+                                dep_display(dns, dn),
+                                kind,
+                                dep_display(name, tn)
+                            ));
+                        }
+                    }
+                }
                 return Err(PgError::new(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                     format!("cannot drop schema {name} because other objects depend on it"),
@@ -6658,13 +6652,35 @@ fn execute_drop_schema(
             }
             // CASCADE: PG's `drop cascades to ...` NOTICE over the schema's own
             // contents and every outside dependent, then the drops.
-            let mut lines: Vec<String> = contents
-                .iter()
-                .map(|(kind, obj)| format!("drop cascades to {kind} {name}.{obj}"))
-                .collect();
-            lines.extend(external.iter().map(|(kind, ns, obj)| {
-                format!("drop cascades to {} {}", kind.noun(), dep_display(ns, obj))
-            }));
+            // Same interleaving as the RESTRICT DETAIL above: each of the
+            // schema's own objects, then whatever depended on that one.
+            let edges = dependency_edges(&graph, &in_schema);
+            let mut lines: Vec<String> = Vec::new();
+            let mut listed: Vec<&Dependent> = Vec::new();
+            for (kind, obj) in &contents {
+                lines.push(format!("drop cascades to {kind} {name}.{obj}"));
+                for (dep, (_, tn)) in &edges {
+                    if dep.1 != *name && tn == obj && !listed.contains(&dep) {
+                        lines.push(format!(
+                            "drop cascades to {} {}",
+                            dep.0.noun(),
+                            dep_display(&dep.1, &dep.2)
+                        ));
+                        listed.push(dep);
+                    }
+                }
+            }
+            // Anything reached only transitively (a view over a cascaded child)
+            // has no direct edge into the schema, so it follows.
+            for dep in &external {
+                if !listed.contains(&dep) {
+                    lines.push(format!(
+                        "drop cascades to {} {}",
+                        dep.0.noun(),
+                        dep_display(&dep.1, &dep.2)
+                    ));
+                }
+            }
             notices.push(if lines.len() == 1 {
                 Notice::notice(lines[0].clone(), None)
             } else {
@@ -6804,7 +6820,15 @@ fn dependency_graph(catalog: &Arc<dyn TableEngine>) -> Vec<(Dependent, Vec<Strin
     }
     // `inheritance_links` rather than `relation_metadata`: a DROP should not
     // clone (and stat) the whole catalog to read a usually-empty list.
-    for (child, parent) in catalog.inheritance_links() {
+    //
+    // Sorted, because the engine reads them out of a `HashMap` and so hands them
+    // over in an order that varies between processes. Everything downstream —
+    // the DETAIL lines, the `drop cascades to` list — is user-visible output
+    // that must not depend on that. (PostgreSQL orders by OID, i.e. creation
+    // order; by name is a deliberate divergence, since nothing here has OIDs.)
+    let mut links = catalog.inheritance_links();
+    links.sort();
+    for (child, parent) in links {
         graph.push((
             (DependentKind::Table, child.0, child.1),
             vec![dep_key(&parent.0, &parent.1)],

@@ -10151,6 +10151,30 @@ async fn table_inheritance_reports_merges_and_conflicts_like_pg() -> anyhow::Res
         notices(&msgs),
         ["merging column \"name\" with inherited definition"]
     );
+
+    // PG raises the merge NOTICE and *then* the conflict that stopped it. The
+    // notices go to the session sink for exactly that reason: a `Result`'s `Ok`
+    // half cannot carry them past the error, and `PgError` has nowhere to put
+    // them. Asserting the *order* of the wire messages, not just their presence.
+    let msgs = simple_query_raw(
+        &mut socket,
+        "CREATE TABLE conflicted (name int4) INHERITS (person)",
+    )
+    .await;
+    let kinds: Vec<u8> = msgs
+        .iter()
+        .map(|(tag, _)| *tag)
+        .filter(|tag| *tag == b'N' || *tag == b'E')
+        .collect();
+    assert_eq!(kinds, [b'N', b'E'], "the NOTICE must precede the ERROR");
+    assert_eq!(
+        notices(&msgs),
+        ["merging column \"name\" with inherited definition"]
+    );
+    let e = fields(msgs.iter().find(|(tag, _)| *tag == b'E').expect("an ERROR"));
+    assert_eq!(e.message(), "column \"name\" has a type conflict");
+    assert_eq!(e.get(b'D'), Some("text versus integer"));
+
     // A child that declares an inherited column somewhere other than its
     // inherited position is told the column moved — PG's other wording.
     let msgs = simple_query_raw(
@@ -10198,6 +10222,36 @@ async fn table_inheritance_reports_merges_and_conflicts_like_pg() -> anyhow::Res
     assert_eq!(db.code(), &SqlState::DATATYPE_MISMATCH);
     assert_eq!(db.message(), "column \"age\" has a type conflict");
     assert_eq!(db.detail(), Some("integer versus text"));
+
+    // A conflict the merge can only see because the column records its type
+    // *modifier*, not just its type. This is what the inheritance check needs
+    // from `Column::typmod`, and the encoding it goes through is not the one
+    // stored (`bpchar` has no header, `char(5)` does), so both spellings are
+    // pinned.
+    for (parent, child, detail) in [
+        ("numeric(10,4)", "numeric(10,7)", "numeric(10,4) versus numeric(10,7)"),
+        (
+            "timestamp(2)",
+            "timestamp(4)",
+            "timestamp(2) without time zone versus timestamp(4) without time zone",
+        ),
+        ("bpchar", "char(5)", "bpchar versus character(5)"),
+    ] {
+        client
+            .simple_query(&format!("CREATE TABLE tp_{} (v {parent})", detail.len()))
+            .await?;
+        let e = client
+            .simple_query(&format!(
+                "CREATE TABLE tc_{} (v {child}) INHERITS (tp_{})",
+                detail.len(),
+                detail.len()
+            ))
+            .await
+            .expect_err("a differing type modifier is a conflict");
+        let db = e.as_db_error().expect("database error");
+        assert_eq!(db.code(), &SqlState::DATATYPE_MISMATCH);
+        assert_eq!(db.detail(), Some(detail), "for {parent} vs {child}");
+    }
 
     // Two parents disagreeing — a different message, same SQLSTATE.
     client
