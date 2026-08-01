@@ -26,12 +26,20 @@ use crabgresql_types::{
 use crate::BindError;
 use crate::functions::{AggFn, ScalarFn, TableFn, WindowFn, bind_function, bind_srf_projection};
 
-/// Shared, mutable parameter-inference state for one statement. A `$n`
-/// occurrence anywhere in the statement — target list, WHERE, a subquery, a CTE
-/// — refers to the same slot here, so a type deduced at one site is visible at
-/// every other. Held behind `Rc<RefCell<…>>` because the binder threads a single
-/// context through the whole tree (see [`Scope`]) while several sites borrow it.
+/// Shared, mutable bind-time state for one statement: `$n` inference plus the
+/// stack of views currently being expanded. A `$n` occurrence anywhere in the
+/// statement — target list, WHERE, a subquery, a CTE — refers to the same slot
+/// here, so a type deduced at one site is visible at every other. Held behind
+/// `Rc<RefCell<…>>` because the binder threads a single context through the whole
+/// tree (see [`Scope`]) while several sites borrow it.
 pub type ParamCtx = std::rc::Rc<std::cell::RefCell<ParamState>>;
+
+/// A view's identity while it is being expanded: `(namespace, name)`. Both come
+/// from the *resolved* [`ViewDefinition`], not from how the reference was
+/// spelled, so the key is unambiguous across schemas.
+///
+/// [`ViewDefinition`]: crabgresql_storage_api::ViewDefinition
+pub(crate) type ViewKey = (String, String);
 
 /// Per-statement bind-parameter types, indexed by parameter number minus one.
 /// `None` in a slot means the type is not yet known; the extended protocol may
@@ -47,6 +55,12 @@ pub struct ParamState {
     /// (a SQL function body has exactly `$1..$max` for its declared arguments).
     /// `None` leaves the wire-protocol bound (`MAX_PARAMS`) as the only cap.
     max: Option<usize>,
+    /// The views whose bodies are currently being bound, outermost first. A view
+    /// reference whose key is already on this stack would expand forever, which
+    /// is PG's `42P17` "infinite recursion detected in rules for relation". Held
+    /// behind its own `Rc` so a nested view body can share *this* while getting
+    /// a fresh `$n` namespace (see [`param_ctx_view_body`]).
+    views: std::rc::Rc<std::cell::RefCell<Vec<ViewKey>>>,
 }
 
 /// Upper bound on a parameter number `$n`. The Bind message carries the values
@@ -119,6 +133,7 @@ pub fn param_ctx_extended(declared: Vec<Option<PgType>>) -> ParamCtx {
         types: declared,
         allow: true,
         max: None,
+        views: Default::default(),
     }))
 }
 
@@ -131,6 +146,7 @@ pub fn param_ctx_capped(declared: Vec<Option<PgType>>) -> ParamCtx {
         types: declared,
         allow: true,
         max,
+        views: Default::default(),
     }))
 }
 
@@ -141,7 +157,30 @@ pub fn param_ctx_none() -> ParamCtx {
         types: Vec::new(),
         allow: false,
         max: None,
+        views: Default::default(),
     }))
+}
+
+/// A parameter context for a stored view's body. The body references none of the
+/// enclosing statement's `$n` (it is standalone SQL text), so parameter state
+/// starts empty and disallowed — but the view-expansion stack is *shared* with
+/// the parent, since that is what makes a cycle through nested view bodies
+/// visible at the point it would recurse.
+pub(crate) fn param_ctx_view_body(parent: &ParamCtx) -> ParamCtx {
+    let views = std::rc::Rc::clone(&parent.borrow().views);
+    std::rc::Rc::new(std::cell::RefCell::new(ParamState {
+        types: Vec::new(),
+        allow: false,
+        max: None,
+        views,
+    }))
+}
+
+/// The stack of views currently being expanded, as a handle that can outlive any
+/// borrow of the `ParamState` itself — callers must not hold a `ParamCtx` borrow
+/// across a nested bind.
+pub(crate) fn view_stack(ctx: &ParamCtx) -> std::rc::Rc<std::cell::RefCell<Vec<ViewKey>>> {
+    std::rc::Rc::clone(&ctx.borrow().views)
 }
 
 /// The current inferred/declared parameter types (index = parameter number − 1).
@@ -1602,9 +1641,10 @@ pub struct Scope {
     /// User-defined type/cast view, so an expression cast to/from a `CREATE TYPE`
     /// name resolves and a `WITHOUT FUNCTION` cast can be applied.
     catalog: Arc<dyn TypeCatalog>,
-    /// The statement's shared bind-parameter context. The same handle flows into
-    /// every nested scope (subqueries, CTEs, derived tables) so a `$n` unifies
-    /// its type across the whole statement.
+    /// The statement's shared bind context. The same handle flows into every
+    /// nested scope (subqueries, CTEs, derived tables) so a `$n` unifies its type
+    /// across the whole statement — and so the view-expansion stack it carries
+    /// reaches a view reference nested inside an expression subquery.
     params: ParamCtx,
     /// What an expression subquery (`(SELECT …)`, `EXISTS`, `IN (SELECT …)`)
     /// needs to bind its body: the table engine (to resolve scans) and the CTEs

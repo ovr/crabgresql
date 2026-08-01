@@ -4,7 +4,9 @@
 //! silently dropping a clause would return wrong results instead of an honest
 //! error.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crabgresql_parser::ast::Spanned;
@@ -18,10 +20,11 @@ use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
     BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, NamedWindows, OuterLevel,
-    ParamCtx, Scope, VisibleColumn, VisibleLookup, WindowKind, WindowSortKey, bind_binary_op,
-    bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column,
-    lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none,
-    reject_agg_or_window, reject_window, to_bool_operand, unify_value_column,
+    ParamCtx, Scope, ViewKey, VisibleColumn, VisibleLookup, WindowKind, WindowSortKey,
+    bind_binary_op, bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr,
+    coerce_to_column, lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none,
+    param_ctx_view_body, reject_agg_or_window, reject_window, to_bool_operand, unify_value_column,
+    view_stack,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -2600,53 +2603,55 @@ impl BoundFromItem {
     }
 }
 
-/// Whether `start` can reach itself through view→view dependency edges — i.e.
-/// expanding it would recurse forever. Follows only names that are themselves
-/// views (a dependency on a table is a leaf); a `visited` set bounds the walk.
-/// Dependency edges use namespace-qualified relation keys, so graph nodes must
-/// use that form too: views with the same name in distinct schemas are distinct.
-fn view_is_recursive(engine: &Arc<dyn TableEngine>, start: &ViewDefinition) -> bool {
-    let views = engine.views();
-    let deps: HashMap<String, &[String]> = views
-        .iter()
-        .map(|v| {
-            (
-                relation_dependency_key(&v.namespace, &v.name),
-                v.depends_on.as_slice(),
-            )
-        })
-        .collect();
-    let start = relation_dependency_key(&start.namespace, &start.name);
-    let Some(first) = deps.get(&start) else {
-        return false;
-    };
-    let mut stack: Vec<&str> = first.iter().map(String::as_str).collect();
-    let mut visited = HashSet::new();
-    while let Some(name) = stack.pop() {
-        if name == start {
-            return true;
-        }
-        if !visited.insert(name) {
-            continue;
-        }
-        if let Some(next) = deps.get(name) {
-            stack.extend(next.iter().map(String::as_str));
-        }
-    }
-    false
+/// Marks one view as "currently being expanded" for as long as it is alive.
+///
+/// [`Self::enter`] is where recursion is detected: a view already on the stack
+/// is one whose body we are still binding, so expanding it again would never
+/// terminate. Popping happens in `Drop` so a `?` anywhere inside the body — not
+/// just the happy path — leaves the stack as it found it. That matters because a
+/// single context outlives one statement: PL/pgSQL binds every statement of a
+/// routine against the same context.
+struct ViewExpansionGuard {
+    stack: Rc<RefCell<Vec<ViewKey>>>,
 }
 
-fn relation_dependency_key(namespace: &str, name: &str) -> String {
-    format!("{namespace}.{name}")
+impl ViewExpansionGuard {
+    fn enter(params: &ParamCtx, view: &ViewDefinition) -> Result<Self, BindError> {
+        let stack = view_stack(params);
+        let key = (view.namespace.clone(), view.name.clone());
+        // The borrow must end before `bind_view_query` runs, so the membership
+        // test and the push are statements, not `if`-condition temporaries.
+        let recursing = stack.borrow().contains(&key);
+        if recursing {
+            return Err(BindError::new(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                format!(
+                    "infinite recursion detected in rules for relation \"{}\"",
+                    view.name
+                ),
+            ));
+        }
+        stack.borrow_mut().push(key);
+        Ok(Self { stack })
+    }
+}
+
+impl Drop for ViewExpansionGuard {
+    fn drop(&mut self) {
+        self.stack.borrow_mut().pop();
+    }
 }
 
 /// Bind a stored view's query into a logical plan. The SQL text is re-parsed and
 /// bound in a fresh scope (no outer CTEs, no outer `$n` parameters — a view body
-/// references neither). A parse/shape failure is an internal invariant violation
-/// (the text was validated at `CREATE VIEW`), reported as `XX000`.
+/// references neither). `params` is threaded in only to carry the view-expansion
+/// stack into the body: the child context shares that stack while starting from
+/// empty parameter state. A parse/shape failure is an internal invariant
+/// violation (the text was validated at `CREATE VIEW`), reported as `XX000`.
 fn bind_view_query(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
     view: &ViewDefinition,
 ) -> Result<LogicalPlan, BindError> {
     let stmts = crabgresql_parser::parse(&view.sql).map_err(|e| {
@@ -2673,7 +2678,7 @@ fn bind_view_query(
     bind_query_scoped(
         engine,
         catalog,
-        &param_ctx_none(),
+        &param_ctx_view_body(params),
         query,
         &CteEnv::new(),
         &[],
@@ -2821,18 +2826,12 @@ fn bind_from_item(
                     {
                         // A view whose definition (transitively) reads itself would
                         // recurse forever when expanded. PG allows creating such a
-                        // view but errors when it is used; detect the cycle from the
-                        // stored dependency graph before expanding.
-                        if view_is_recursive(engine, &view) {
-                            return Err(BindError::new(
-                                sqlstate::INVALID_OBJECT_DEFINITION,
-                                format!(
-                                    "infinite recursion detected in rules for relation \"{}\"",
-                                    view.name
-                                ),
-                            ));
-                        }
-                        let inner = bind_view_query(engine, catalog, &view)?;
+                        // view but errors when it is used. The guard pushes this
+                        // view onto the shared expansion stack and errors if it is
+                        // already there — exact by construction, so a cycle closed
+                        // through an expression subquery is caught too.
+                        let _guard = ViewExpansionGuard::enter(params, &view)?;
+                        let inner = bind_view_query(engine, catalog, params, &view)?;
                         let qualifier = relation_qualifier(alias, &tname);
                         let mut columns = view_output_columns(&inner, &view)?;
                         apply_relation_alias_columns(

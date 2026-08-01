@@ -4947,6 +4947,225 @@ async fn recursive_view_definition_errors_on_use_not_creation() -> anyhow::Resul
     Ok(())
 }
 
+/// The shortest cycle: a view that reads itself. Detected at the same point as
+/// a longer chain, and the error names that one view.
+#[tokio::test]
+async fn a_self_referencing_view_is_detected() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+    client
+        .simple_query("CREATE VIEW v AS SELECT a FROM t")
+        .await?;
+    client
+        .simple_query("CREATE OR REPLACE VIEW v AS SELECT a FROM v")
+        .await?;
+
+    let err = client.simple_query("SELECT a FROM v").await.unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::INVALID_OBJECT_DEFINITION);
+    assert_eq!(
+        db.message(),
+        "infinite recursion detected in rules for relation \"v\""
+    );
+    Ok(())
+}
+
+/// A cycle closed through a subquery in an *expression* — a scalar subquery in
+/// the target list, or an `IN (SELECT …)` in WHERE — rather than through FROM.
+/// The expansion stack sees these because every expression subquery re-enters
+/// query binding with the same bind context.
+#[tokio::test]
+async fn a_view_cycle_through_an_expression_subquery_is_detected() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let expect_recursion = |err: tokio_postgres::Error, relation: &str| {
+        let db = err.as_db_error().expect("db error");
+        assert_eq!(db.code(), &SqlState::INVALID_OBJECT_DEFINITION);
+        assert_eq!(
+            db.message(),
+            format!("infinite recursion detected in rules for relation \"{relation}\"")
+        );
+    };
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+    client
+        .simple_query("CREATE VIEW v2 AS SELECT a FROM t")
+        .await?;
+    client
+        .simple_query("CREATE VIEW v3 AS SELECT a FROM v2")
+        .await?;
+
+    // Scalar subquery in the target list: v2 -> v3 -> v2.
+    client
+        .simple_query("CREATE OR REPLACE VIEW v2 AS SELECT (SELECT a FROM v3 LIMIT 1) AS a")
+        .await?;
+    expect_recursion(
+        client.simple_query("SELECT a FROM v2").await.unwrap_err(),
+        "v2",
+    );
+
+    // Same cycle, closed through an IN (SELECT …) in WHERE instead. v2 has to go
+    // back to reading the table first: redefining it while it is recursive would
+    // itself fail to bind (see `creating_a_view_over_a_recursive_view_errors_unlike_pg`).
+    client
+        .simple_query("CREATE OR REPLACE VIEW v2 AS SELECT a FROM t")
+        .await?;
+    client
+        .simple_query("CREATE OR REPLACE VIEW v2 AS SELECT a FROM t WHERE a IN (SELECT a FROM v3)")
+        .await?;
+    expect_recursion(
+        client.simple_query("SELECT a FROM v2").await.unwrap_err(),
+        "v2",
+    );
+    Ok(())
+}
+
+/// Two same-named views in different schemas are distinct nodes: a cycle that
+/// runs through both is detected, and (crucially) a chain that merely mentions
+/// the name twice is not mistaken for one.
+#[tokio::test]
+async fn view_recursion_is_detected_across_schemas() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+    client.simple_query("CREATE SCHEMA s").await?;
+    client
+        .simple_query("CREATE VIEW s.v AS SELECT a FROM t")
+        .await?;
+    client
+        .simple_query("CREATE VIEW public.v AS SELECT a FROM s.v")
+        .await?;
+    // public.v -> s.v is fine while s.v still reads the table.
+    let rows = client.query("SELECT a FROM public.v", &[]).await?;
+    assert!(rows.is_empty());
+
+    // Close the loop: s.v -> public.v -> s.v.
+    client
+        .simple_query("CREATE OR REPLACE VIEW s.v AS SELECT a FROM public.v")
+        .await?;
+    let err = client.simple_query("SELECT a FROM s.v").await.unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::INVALID_OBJECT_DEFINITION);
+    assert_eq!(
+        db.message(),
+        "infinite recursion detected in rules for relation \"v\""
+    );
+    Ok(())
+}
+
+/// Referencing the same view more than once is not recursion: a diamond, and a
+/// self-join of one view, both expand fine. This is what makes the expansion
+/// state a stack rather than a set of everything ever seen.
+#[tokio::test]
+async fn repeated_view_references_are_not_recursion() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (a int4); INSERT INTO t VALUES (1), (2)")
+        .await?;
+    client
+        .simple_query("CREATE VIEW leaf AS SELECT a FROM t")
+        .await?;
+    // A diamond: mid reads leaf twice, top reads mid.
+    client
+        .simple_query("CREATE VIEW mid AS SELECT l1.a FROM leaf l1 JOIN leaf l2 ON l1.a = l2.a")
+        .await?;
+    client
+        .simple_query("CREATE VIEW top AS SELECT a FROM mid")
+        .await?;
+
+    let rows = client.query("SELECT a FROM top ORDER BY a", &[]).await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+
+    // Two references to one view in a single query, as siblings.
+    let rows = client
+        .query("SELECT x.a FROM leaf, leaf x WHERE x.a = 1", &[])
+        .await?;
+    assert_eq!(rows.len(), 2);
+    Ok(())
+}
+
+/// The expansion stack is unwound on the error path, so a failed statement does
+/// not poison later ones — on the session, and within one PL/pgSQL routine,
+/// whose statements all bind against a single shared context.
+#[tokio::test]
+async fn a_recursion_error_does_not_poison_later_statements() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (a int4); INSERT INTO t VALUES (7)")
+        .await?;
+    client
+        .simple_query("CREATE VIEW ok AS SELECT a FROM t")
+        .await?;
+    client
+        .simple_query("CREATE VIEW bad AS SELECT a FROM t")
+        .await?;
+    client
+        .simple_query("CREATE OR REPLACE VIEW bad AS SELECT a FROM bad")
+        .await?;
+
+    client.simple_query("SELECT a FROM bad").await.unwrap_err();
+    // The next statement on the same session binds against a clean stack.
+    let row = client.query_one("SELECT a FROM ok", &[]).await?;
+    assert_eq!(row.get::<_, i32>(0), 7);
+
+    // A PL/pgSQL routine binds every statement of its body against one shared
+    // context, so a guard that never popped would make the *second* read of the
+    // same view look like recursion.
+    client
+        .batch_execute(
+            "CREATE FUNCTION probe() RETURNS int LANGUAGE plpgsql AS $$
+             DECLARE r int; s int;
+             BEGIN
+               SELECT a INTO r FROM ok;
+               SELECT a INTO s FROM ok;
+               RETURN r + s;
+             END $$",
+        )
+        .await?;
+    let row = client.query_one("SELECT probe()", &[]).await?;
+    assert_eq!(row.get::<_, i32>(0), 14);
+    Ok(())
+}
+
+/// Documented divergence: we bind a view's defining query at CREATE VIEW to
+/// derive its columns, so defining a view *over* an already-recursive one is an
+/// error here. PG accepts it (rules are only expanded at rewrite time, and the
+/// column list comes from the catalog) — see vendor/postgres/regress/sql/lock.sql,
+/// which creates `lock_view7` over the self-referential `lock_view2`.
+#[tokio::test]
+async fn creating_a_view_over_a_recursive_view_errors_unlike_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+    client
+        .simple_query("CREATE VIEW v2 AS SELECT a FROM t")
+        .await?;
+    client
+        .simple_query("CREATE VIEW v3 AS SELECT a FROM v2")
+        .await?;
+    client
+        .simple_query("CREATE OR REPLACE VIEW v2 AS SELECT a FROM v3")
+        .await?;
+
+    let err = client
+        .simple_query("CREATE VIEW v7 AS SELECT a FROM v2")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::INVALID_OBJECT_DEFINITION);
+    assert_eq!(
+        db.message(),
+        "infinite recursion detected in rules for relation \"v2\""
+    );
+    Ok(())
+}
+
 /// PG accepts a CREATE VIEW column list shorter than the query's output (the
 /// trailing columns keep their derived names); only a longer list is an error.
 #[tokio::test]
