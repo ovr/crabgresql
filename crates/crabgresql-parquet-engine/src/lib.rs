@@ -1836,6 +1836,7 @@ mod tests {
                 PgType::Text,
                 PgType::Varchar,
                 PgType::Bpchar,
+                PgType::Char,
                 PgType::Name,
                 PgType::Bytea,
                 PgType::Uuid,
@@ -1859,6 +1860,9 @@ mod tests {
             Value::Text("hello".to_string()),
             Value::Text("varchar".to_string()),
             Value::Text("bpchar".to_string()),
+            // High-bit: proves the raw byte survives a real Parquet file rather
+            // than being smuggled through a UTF-8 column.
+            Value::Char(0xFF),
             Value::Text("name".to_string()),
             Value::Bytea(vec![0, 1, 255]),
             Value::Uuid([0x42; 16]),

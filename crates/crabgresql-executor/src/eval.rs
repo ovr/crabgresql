@@ -828,6 +828,11 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
             text(l).trim_end_matches(' '),
             text(r).trim_end_matches(' '),
         ),
+        // `"char"` is a byte, not a string: no collation, and deliberately
+        // **unsigned**, so `'\377' > 'a'`. PG's `btcharcmp` casts to `uint8` for
+        // exactly this reason. Note the asymmetry with the `int4` conversion,
+        // which reads the same byte as signed — see `crabgresql_types::char`.
+        PgType::Char => char_of(l).cmp(&char_of(r)),
         PgType::Bytea => bytea(l).cmp(bytea(r)),
         // false < true, as in PG.
         PgType::Bool => bool_of(l).cmp(&bool_of(r)),
@@ -1122,6 +1127,13 @@ fn bool_of(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
         other => unreachable!("expected bool, got {other:?}"),
+    }
+}
+
+fn char_of(v: &Value) -> u8 {
+    match v {
+        Value::Char(c) => *c,
+        other => unreachable!("expected \"char\", got {other:?}"),
     }
 }
 

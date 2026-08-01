@@ -80,6 +80,7 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::TEXT, oid::TEXT_ARRAY),
     (oid::VARCHAR, oid::VARCHAR_ARRAY),
     (oid::BPCHAR, oid::BPCHAR_ARRAY),
+    (oid::CHAR, oid::CHAR_ARRAY),
     (oid::OID, oid::OID_ARRAY),
     (oid::TID, oid::TID_ARRAY),
     (oid::XID, oid::XID_ARRAY),

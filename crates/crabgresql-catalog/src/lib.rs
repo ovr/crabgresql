@@ -1092,6 +1092,7 @@ mod tests {
             ("text", PgType::Text),
             ("varchar", PgType::Varchar),
             ("bpchar", PgType::Bpchar),
+            ("char", PgType::Char),
             ("name", PgType::Name),
             ("oid", PgType::Oid),
             ("tid", PgType::Tid),

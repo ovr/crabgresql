@@ -8,6 +8,7 @@
 pub mod array;
 pub mod bit;
 pub mod cast;
+pub mod char;
 pub mod collation;
 pub mod date;
 pub mod datum;
@@ -49,6 +50,8 @@ pub use vector::VectorKind;
 pub mod oid {
     pub const BOOL: u32 = 16;
     pub const BYTEA: u32 = 17;
+    /// `"char"`: PG's ad-hoc one-byte type, *not* `bpchar`. See [`crate::char`].
+    pub const CHAR: u32 = 18;
     pub const NAME: u32 = 19;
     pub const INT8: u32 = 20;
     /// `oid`: PostgreSQL's object-identifier type (unsigned 32-bit). Pervasive
@@ -128,6 +131,8 @@ pub mod oid {
     // mapping lives in [`crate::array`].
     pub const BOOL_ARRAY: u32 = 1000;
     pub const BYTEA_ARRAY: u32 = 1001;
+    /// `"char"[]`. Note it is 1002, *not* adjacent to `BPCHAR_ARRAY` (1014).
+    pub const CHAR_ARRAY: u32 = 1002;
     pub const NAME_ARRAY: u32 = 1003;
     pub const INT2_ARRAY: u32 = 1005;
     pub const INT4_ARRAY: u32 = 1007;
@@ -194,6 +199,11 @@ pub enum PgType {
     /// `character` / `char` / `bpchar`. Values are blank-padded to their
     /// declared length at coercion time.
     Bpchar,
+    /// `"char"`: PG's ad-hoc one-*byte* type, distinct from [`PgType::Bpchar`]
+    /// and reachable only through the quoted spelling. Holds a raw byte that
+    /// need not be valid UTF-8, so it does not share the `text` representation.
+    /// See [`crate::char`].
+    Char,
     /// `name`: a 63-character identifier type backed by `text`.
     Name,
     /// `oid`: an unsigned 32-bit object identifier. Fixed 4-byte type; values
@@ -408,6 +418,7 @@ impl PgType {
             PgType::Text => oid::TEXT,
             PgType::Varchar => oid::VARCHAR,
             PgType::Bpchar => oid::BPCHAR,
+            PgType::Char => oid::CHAR,
             PgType::Name => oid::NAME,
             PgType::Oid => oid::OID,
             PgType::Tid => oid::TID,
@@ -476,6 +487,7 @@ impl PgType {
                 | PgType::Text
                 | PgType::Varchar
                 | PgType::Bpchar
+                | PgType::Char
                 | PgType::Name
                 | PgType::Oid
                 | PgType::Tid
@@ -533,6 +545,7 @@ impl PgType {
             oid::TEXT => PgType::Text,
             oid::VARCHAR => PgType::Varchar,
             oid::BPCHAR => PgType::Bpchar,
+            oid::CHAR => PgType::Char,
             oid::NAME => PgType::Name,
             oid::OID => PgType::Oid,
             oid::TID => PgType::Tid,
@@ -606,9 +619,18 @@ impl PgType {
             "money" => PgType::Money,
             "text" => PgType::Text,
             "varchar" | "character varying" => PgType::Varchar,
-            // Unlike PG, `"char"` (the quoted 1-byte type) is not modeled
-            // separately; it and `char`/`character` all resolve to `bpchar`.
-            "bpchar" | "char" | "character" => PgType::Bpchar,
+            "bpchar" | "character" => PgType::Bpchar,
+            // This table maps a *catalog typname*, and `pg_type.typname` for oid
+            // 18 is `char` — so that is what the bare string resolves to here.
+            //
+            // It is NOT the SQL type-name grammar, where an unquoted `char` is
+            // the `char(1)` keyword (`bpchar`) and only a quoted `"char"` is oid
+            // 18. Callers holding user-written type *syntax* must apply that
+            // grammar themselves before falling back here, because quoting is
+            // already lost by the time a plain `&str` arrives: see
+            // `builtin_type_oid_from_syntax` in the executor's `reg` module and
+            // the `LIKE` arm of the server's `type_shape_from_options`.
+            "char" => PgType::Char,
             "name" => PgType::Name,
             "oid" => PgType::Oid,
             "tid" => PgType::Tid,
@@ -654,6 +676,7 @@ impl PgType {
     pub fn typlen(self) -> i16 {
         match self {
             PgType::Bool => 1,
+            PgType::Char => 1,
             PgType::Int2 => 2,
             PgType::Int4 => 4,
             PgType::Int8 => 8,
@@ -721,6 +744,10 @@ impl PgType {
             PgType::Numeric => "numeric",
             PgType::Money => "money",
             PgType::Text => "text",
+            // PG quotes it everywhere it renders a type name, to keep it
+            // distinct from the `char` keyword that means `bpchar`:
+            // `format_type(18, null)` is `"char"`.
+            PgType::Char => "\"char\"",
             PgType::Varchar => "character varying",
             PgType::Bpchar => "character",
             PgType::Name => "name",
@@ -776,6 +803,7 @@ impl PgType {
             PgType::Numeric => "numeric",
             PgType::Money => "money",
             PgType::Text => "text",
+            PgType::Char => "char",
             PgType::Varchar => "varchar",
             PgType::Bpchar => "bpchar",
             PgType::Name => "name",
@@ -904,6 +932,7 @@ fn array_display_name(elem: u32) -> &'static str {
         Some(PgType::Text) => "text[]",
         Some(PgType::Varchar) => "character varying[]",
         Some(PgType::Bpchar) => "character[]",
+        Some(PgType::Char) => "\"char\"[]",
         Some(PgType::Name) => "name[]",
         Some(PgType::Oid) => "oid[]",
         Some(PgType::Tid) => "tid[]",
@@ -957,6 +986,7 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Text) => "_text",
         Some(PgType::Varchar) => "_varchar",
         Some(PgType::Bpchar) => "_bpchar",
+        Some(PgType::Char) => "_char",
         Some(PgType::Name) => "_name",
         Some(PgType::Oid) => "_oid",
         Some(PgType::Tid) => "_tid",
@@ -1044,6 +1074,11 @@ pub enum Value {
     /// See [`Reg`] for why the name is carried rather than resolved at output.
     Reg(Reg),
     Text(String),
+    /// A `"char"` value: one raw byte, which need not be valid UTF-8 — hence a
+    /// `u8` rather than a one-character [`Value::Text`]. Ordering and hashing
+    /// treat it as unsigned; only the `int4` conversion reads it as signed.
+    /// See [`crate::char`].
+    Char(u8),
     Bytea(Vec<u8>),
     /// A `bit`/`bit varying` value: `len` bits packed most-significant-bit-first
     /// in `data` (`ceil(len/8)` bytes, trailing pad bits zero). See [`crate::bit`].
@@ -1137,6 +1172,7 @@ impl Value {
         match self {
             Value::Null => None,
             Value::Bool(_) => Some(PgType::Bool),
+            Value::Char(_) => Some(PgType::Char),
             Value::Int2(_) => Some(PgType::Int2),
             Value::Int4(_) => Some(PgType::Int4),
             Value::Int8(_) => Some(PgType::Int8),
@@ -1196,6 +1232,10 @@ impl Value {
         match self {
             Value::Null => None,
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
+            // This is also the `"char" -> text` cast: PG's `char_text` and
+            // `charout` produce the same string, so the generic
+            // `(_, PgType::Text)` arm in `cast.rs` needs no `Char` case.
+            Value::Char(c) => Some(crate::char::char_out(*c)),
             Value::Int2(v) => Some(v.to_string()),
             Value::Int4(v) => Some(v.to_string()),
             Value::Int8(v) => Some(v.to_string()),

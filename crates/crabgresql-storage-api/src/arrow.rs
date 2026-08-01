@@ -37,12 +37,12 @@ use std::sync::Arc;
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder,
     Float64Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, UInt8Builder,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, Time64MicrosecondArray, TimestampMicrosecondArray, new_null_array,
+    StructArray, Time64MicrosecondArray, TimestampMicrosecondArray, UInt8Array, new_null_array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use crabgresql_types::{Interval, PgType, TimeTz, Value};
@@ -69,6 +69,7 @@ pub fn supports_type(ty: PgType) -> bool {
     matches!(
         ty,
         PgType::Bool
+            | PgType::Char
             | PgType::Int2
             | PgType::Int4
             | PgType::Int8
@@ -107,6 +108,11 @@ pub fn supports_type(ty: PgType) -> bool {
 pub fn arrow_type(ty: PgType) -> DataType {
     match ty {
         PgType::Bool => DataType::Boolean,
+        // `"char"` is `UInt8`, not `Utf8` or `Int8`. `Utf8` cannot hold a
+        // high-bit byte at all, and `Int8` would sort 0xFF *below* 0x00, which
+        // contradicts the type's unsigned order and would quietly give a
+        // vectorized sort the wrong answer.
+        PgType::Char => DataType::UInt8,
         PgType::Int2 => DataType::Int16,
         PgType::Int4 => DataType::Int32,
         PgType::Int8 => DataType::Int64,
@@ -216,6 +222,7 @@ pub fn build_array(
 
     match column.ty {
         PgType::Bool => primitive!(BooleanBuilder, Value::Bool),
+        PgType::Char => primitive!(UInt8Builder, Value::Char),
         PgType::Int2 => primitive!(Int16Builder, Value::Int2),
         PgType::Int4 => primitive!(Int32Builder, Value::Int4),
         PgType::Int8 => primitive!(Int64Builder, Value::Int8),
@@ -498,6 +505,7 @@ pub fn decode_value(column: &Column, array: &dyn Array, row: usize) -> Result<Va
     }
     match column.ty {
         PgType::Bool => primitive!(BooleanArray, Value::Bool),
+        PgType::Char => primitive!(UInt8Array, Value::Char),
         PgType::Int2 => primitive!(Int16Array, Value::Int2),
         PgType::Int4 => primitive!(Int32Array, Value::Int4),
         PgType::Int8 => primitive!(Int64Array, Value::Int8),
@@ -688,6 +696,17 @@ mod tests {
 
     #[test]
     fn binary_round_trips() -> Result<(), StorageError> {
+        // `"char"` belongs here rather than with the strings: it is a raw byte,
+        // and 0x00/0xFF are exactly the values a `Utf8` mapping could not hold.
+        round_trip(
+            PgType::Char,
+            vec![
+                Value::Char(0),
+                Value::Char(b'a'),
+                Value::Char(0x7F),
+                Value::Char(0xFF),
+            ],
+        )?;
         round_trip(
             PgType::Bytea,
             vec![Value::Bytea(vec![]), Value::Bytea(vec![0, 255, 128])],
