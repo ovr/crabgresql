@@ -25,7 +25,7 @@ const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 /// PG's timezone-displacement limit for a zone token inside a value —
 /// a `timestamptz` literal, `AT TIME ZONE`, `make_timestamptz`: magnitudes of
 /// `±15:59:59` are accepted, `±16:00:00` and beyond are "out of range".
-const MAX_TZ_DISPLACEMENT_SECS: i32 = 16 * 3600 - 1;
+pub(crate) const MAX_TZ_DISPLACEMENT_SECS: i32 = 16 * 3600 - 1;
 
 /// The limit on the numeric `TimeZone` **GUC** forms (`SET TIME ZONE 7`,
 /// `SET TIME ZONE INTERVAL '…'`), which is far wider than the in-value limit
@@ -72,17 +72,26 @@ pub struct SessionZone {
     name: String,
     abbrev: Option<String>,
     zone: Zone,
+    /// Cached [`SessionZone::standard_offset`] — see [`resolve_standard_offset`].
+    standard_offset: i32,
 }
 
 impl SessionZone {
+    /// The one place a `SessionZone` is built, so the cached standard offset
+    /// cannot be forgotten by a new constructor.
+    fn new(name: String, abbrev: Option<String>, zone: Zone) -> SessionZone {
+        SessionZone {
+            standard_offset: resolve_standard_offset(&zone),
+            name,
+            abbrev,
+            zone,
+        }
+    }
+
     /// The boot value. PG's default is the host zone; ours is UTC, which keeps
     /// every expected output in the test suites stable.
     pub fn utc() -> SessionZone {
-        SessionZone {
-            name: "UTC".to_string(),
-            abbrev: Some("UTC".to_string()),
-            zone: Zone::Fixed(0),
-        }
+        SessionZone::new("UTC".to_string(), Some("UTC".to_string()), Zone::Fixed(0))
     }
 
     /// Resolve a `SET TimeZone = '<spec>'` value.
@@ -106,11 +115,7 @@ impl SessionZone {
         // The UTC synonyms, reported in PG's canonical upper case.
         if token.eq_ignore_ascii_case("utc") || token.eq_ignore_ascii_case("gmt") {
             let name = token.to_ascii_uppercase();
-            return Ok(SessionZone {
-                abbrev: Some(name.clone()),
-                name,
-                zone: Zone::Fixed(0),
-            });
+            return Ok(SessionZone::new(name.clone(), Some(name), Zone::Fixed(0)));
         }
         if token.eq_ignore_ascii_case("z") || token.eq_ignore_ascii_case("zulu") {
             return Err(not_recognized());
@@ -120,11 +125,7 @@ impl SessionZone {
         // (PG's `TZ` renders empty for one). The name is echoed back as typed.
         if let Some(res) = parse_fixed(token) {
             let east = -res?;
-            return Ok(SessionZone {
-                name: token.to_string(),
-                abbrev: None,
-                zone: Zone::Fixed(east),
-            });
+            return Ok(SessionZone::new(token.to_string(), None, Zone::Fixed(east)));
         }
 
         // A curated abbreviation keeps its (upper-cased) spelling as both name
@@ -135,22 +136,15 @@ impl SessionZone {
                 Abbrev::Fixed(secs) => Zone::Fixed(*secs),
                 Abbrev::Zone(zone) => TimeZone::get(zone).map(Zone::Named).map_err(|_| not_recognized())?,
             };
-            return Ok(SessionZone {
-                name: upper.clone(),
-                abbrev: Some(upper),
-                zone,
-            });
+            return Ok(SessionZone::new(upper.clone(), Some(upper), zone));
         }
 
         // A full IANA zone. `jiff`'s lookup is case-insensitive; report the
         // canonical spelling back, as PG does (`america/new_york` shows as
         // `America/New_York`).
         let tz = TimeZone::get(token).map_err(|_| not_recognized())?;
-        Ok(SessionZone {
-            name: tz.iana_name().unwrap_or(token).to_string(),
-            abbrev: None,
-            zone: Zone::Named(tz),
-        })
+        let name = tz.iana_name().unwrap_or(token).to_string();
+        Ok(SessionZone::new(name, None, Zone::Named(tz)))
     }
 
     /// A fixed zone `secs` east of UTC, named with the POSIX spec PG reports for
@@ -162,11 +156,8 @@ impl SessionZone {
             return Err(ZoneError::DisplacementOutOfRange(format_offset(secs)));
         }
         let abbrev = format_offset(secs);
-        Ok(SessionZone {
-            name: format!("<{abbrev}>{}", format_offset(-secs)),
-            abbrev: Some(abbrev),
-            zone: Zone::Fixed(secs),
-        })
+        let name = format!("<{abbrev}>{}", format_offset(-secs));
+        Ok(SessionZone::new(name, Some(abbrev), Zone::Fixed(secs)))
     }
 
     /// The name `SHOW TimeZone` and `ParameterStatus` report.
@@ -190,33 +181,19 @@ impl SessionZone {
     }
 
     /// The zone's **standard-time** offset (seconds east), used by the
-    /// `time -> timetz` cast.
+    /// `time -> timetz` cast. Resolved once at construction, since the zone is
+    /// immutable and the answer cannot vary between rows.
     ///
     /// Documented divergence: PG's `time_timetz` attaches the offset in effect
     /// on the *current date*, so the same cast yields `-04` in a New York
     /// summer and `-05` in winter. This engine has no clock at all — there is
     /// no `now()`/`current_timestamp` — so it cannot ask that question. We take
-    /// the zone's non-DST offset instead, which is stable and agrees with PG
-    /// for the (majority) part of the year when DST is not in effect. Probing
-    /// two instants six months apart finds it in either hemisphere.
+    /// the zone's standard offset instead, which is stable and agrees with PG
+    /// for the part of the year when DST is not in effect. Where it is,
+    /// we are an hour off (New York in July, Dublin and Casablanca, whose
+    /// year-round `+01` tzdb encodes as DST over a `+00` base).
     pub fn standard_offset(&self) -> i32 {
-        let tz = match &self.zone {
-            Zone::Fixed(secs) => return *secs,
-            Zone::Named(tz) => tz,
-        };
-        // January 1st and July 1st of the PG epoch year, as our micros-since-2000.
-        const JAN: i64 = 0;
-        const JUL: i64 = 182 * 86_400_000_000;
-        let jan = tz.to_offset_info(instant(JAN));
-        if !jan.dst().is_dst() {
-            return jan.offset().seconds();
-        }
-        let jul = tz.to_offset_info(instant(JUL));
-        if !jul.dst().is_dst() {
-            return jul.offset().seconds();
-        }
-        // Permanent-DST zones have no standard offset to find; take January's.
-        jan.offset().seconds()
+        self.standard_offset
     }
 
     /// `to_char`'s `TZ` code at an instant. Empty when the zone has no
@@ -328,6 +305,42 @@ pub fn offset_for_local(zone: &Zone, tm: TmLite) -> i32 {
             }
         }
     }
+}
+
+/// The zone's standard-time (non-DST) offset in seconds east — see
+/// [`SessionZone::standard_offset`], which caches this.
+///
+/// The two probes are deliberately in the **far future**, not at a fixed real
+/// date. A real date has to be picked, goes stale, and is then wrong by however
+/// much the zone's standard offset has moved since: probing the 2000 epoch put
+/// `Pacific/Apia` at `-11` instead of `+13` (the 2011 dateline move) and
+/// `Europe/Istanbul` at `+02` instead of `+03`. Past the last recorded
+/// transition, `jiff` answers from the zone's POSIX extrapolation rule — its
+/// *current* standard time and DST rule projected forward — which is the thing
+/// we actually want and which follows a tzdb update for free. `civil_datetime`
+/// leans on the same property for out-of-range years.
+///
+/// Two probes six months apart because the hemispheres put their DST in
+/// opposite halves of the year.
+fn resolve_standard_offset(zone: &Zone) -> i32 {
+    let tz = match zone {
+        Zone::Fixed(secs) => return *secs,
+        Zone::Named(tz) => tz,
+    };
+    // ~2100-01-01 and ~2100-07-01, as our micros-since-2000. Well past every
+    // recorded transition and well inside `jiff`'s ±9999 range.
+    const WINTERISH: i64 = 36_525 * 86_400_000_000;
+    const SUMMERISH: i64 = WINTERISH + 182 * 86_400_000_000;
+    let a = tz.to_offset_info(instant(WINTERISH));
+    if !a.dst().is_dst() {
+        return a.offset().seconds();
+    }
+    let b = tz.to_offset_info(instant(SUMMERISH));
+    if !b.dst().is_dst() {
+        return b.offset().seconds();
+    }
+    // A zone tzdb models as DST all year round has no standard offset to find.
+    a.offset().seconds()
 }
 
 /// The UTC offset (seconds east) in effect in `zone` at the given UTC instant
@@ -647,26 +660,26 @@ mod tests {
 
     #[test]
     fn standard_offset_ignores_dst_in_either_hemisphere() -> anyhow::Result<()> {
+        let off =
+            |n: &str| -> anyhow::Result<i32> { Ok(SessionZone::resolve(n)?.standard_offset()) };
         assert_eq!(SessionZone::utc().standard_offset(), 0);
         assert_eq!(
             SessionZone::from_offset_east(7 * 3600)?.standard_offset(),
             7 * 3600
         );
-        // Northern: the January probe is already standard time.
-        assert_eq!(
-            SessionZone::resolve("America/New_York")?.standard_offset(),
-            -5 * 3600
-        );
-        // Southern: January is DST there, so the July probe is what answers.
-        assert_eq!(
-            SessionZone::resolve("Australia/Sydney")?.standard_offset(),
-            10 * 3600
-        );
+        // Northern: the winter probe is already standard time.
+        assert_eq!(off("America/New_York")?, -5 * 3600);
+        // Southern: our winter is their DST, so the second probe answers.
+        assert_eq!(off("Australia/Sydney")?, 10 * 3600);
         // A zone that never observes DST, and a sub-hour one.
-        assert_eq!(
-            SessionZone::resolve("Asia/Kolkata")?.standard_offset(),
-            5 * 3600 + 1800
-        );
+        assert_eq!(off("Asia/Kolkata")?, 5 * 3600 + 1800);
+
+        // Zones whose *standard* offset moved after 2000. Probing a fixed real
+        // date rather than the zone's extrapolated rule got all three wrong —
+        // Apia by a full day, since it jumped the dateline in 2011.
+        assert_eq!(off("Pacific/Apia")?, 13 * 3600);
+        assert_eq!(off("Europe/Istanbul")?, 3 * 3600);
+        assert_eq!(off("America/Sao_Paulo")?, -3 * 3600);
         Ok(())
     }
 }

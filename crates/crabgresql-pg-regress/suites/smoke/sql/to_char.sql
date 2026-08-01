@@ -133,6 +133,17 @@ SELECT to_timestamp('2024-03-05 10:00:00 -05', 'YYYY-MM-DD HH24:MI:SS OF') AS sp
 -- TZH keeps its own sign the same way, and TZM takes it; both spacings work
 SELECT to_timestamp('2024-03-05 10:00:00 -05:30', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') AS spaced_tzh,
        to_timestamp('2024-03-05 10:00:00+0530', 'YYYY-MM-DD HH24:MI:SSTZHTZM') AS tight_tzh;
+
+-- TZ, OF, TZH and TZM are one field type: a repetition that agrees is fine,
+-- one that contradicts is an error naming the code that noticed
+SELECT to_timestamp('2024-03-05 10:00:00 -05 -05', 'YYYY-MM-DD HH24:MI:SS OF TZH') AS agreeing;
+SELECT to_timestamp('2024-03-05 10:00:00 -05 +07', 'YYYY-MM-DD HH24:MI:SS OF TZH');
+SELECT to_timestamp('2024-03-05 10:00:00 -05 +07', 'YYYY-MM-DD HH24:MI:SS TZH OF');
+-- and the scanned displacement is bounded like one inside a literal
+SELECT to_timestamp('2024-03-05 10:00 +15:59', 'YYYY-MM-DD HH24:MI TZH:TZM') AS in_range;
+SELECT to_timestamp('2024-03-05 10:00 +16:00', 'YYYY-MM-DD HH24:MI TZH:TZM');
+SELECT to_timestamp('2024-03-05 10:00 +99', 'YYYY-MM-DD HH24:MI OF');
+SELECT to_date('2024-03-05 +99', 'YYYY-MM-DD TZH');
 SELECT to_char(timestamp '2024-03-05 04:00:00', 'FM"a"HH24') AS fm_then_quote,
        to_char(interval '1 day', 'TH FM YYYY th') AS fm_then_space;
 

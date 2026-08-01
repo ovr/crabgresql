@@ -123,12 +123,11 @@ fn cast_err(e: crate::timestamp::TimestampError) -> CastError {
     }
 }
 
-/// The time-of-day part of a timestamp's microseconds, i.e. the offset into the
-/// day of the wall clock it denotes. `rem_euclid` so a BC timestamp (negative
-/// micros) still yields a forward-running time, matching PG's `time_t = ts %
-/// USECS_PER_DAY` normalization.
+/// The time-of-day part of a microsecond count, i.e. the offset into the day of
+/// the wall clock it denotes. `rem_euclid` so a BC timestamp (negative micros)
+/// still yields a forward-running time, matching PG's time-of-day normalization.
 fn time_of_day(micros: i64) -> i64 {
-    micros.rem_euclid(86_400_000_000)
+    micros.rem_euclid(time::USECS_PER_DAY)
 }
 
 /// Cast `v` to `to` in PostgreSQL's *assignment* context — PL/pgSQL `:=`,
@@ -388,10 +387,12 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             message: e.message,
         }),
         (Value::Text(s), PgType::TimeTz) => {
-            timetz::parse(s).map(Value::TimeTz).map_err(|e| CastError {
-                sqlstate: e.sqlstate,
-                message: e.message,
-            })
+            timetz::parse(s, &fmt.zone)
+                .map(Value::TimeTz)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                })
         }
 
         // ---- date ↔ timestamp / timestamptz ----
@@ -459,7 +460,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             days: 0,
             usec: *usec,
         })),
-        (Value::Interval(iv), PgType::Time) => Ok(Value::Time(iv.usec.rem_euclid(86_400_000_000))),
+        (Value::Interval(iv), PgType::Time) => Ok(Value::Time(time_of_day(iv.usec))),
 
         // ---- time ↔ timetz ----
         // time → timetz attaches the session zone; timetz → time drops it.

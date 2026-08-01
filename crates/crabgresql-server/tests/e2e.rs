@@ -9423,6 +9423,14 @@ async fn timezone_guc_drives_casts_and_field_functions() -> anyhow::Result<()> {
         // `time -> timetz` attaches the zone's *standard* offset; PG uses the
         // current date's, which this engine has no clock to ask for.
         ("SELECT '03:30:45.5'::time::timetz", "03:30:45.5-05"),
+        // Every route to a zone-less `timetz` must agree, or the same value
+        // compares unequal to itself: the literal, the text cast and the
+        // `time` widening all take the session zone, scalars and arrays alike.
+        ("SELECT '03:30:45.5'::timetz", "03:30:45.5-05"),
+        ("SELECT '03:30:45.5'::text::timetz", "03:30:45.5-05"),
+        ("SELECT '03:30:45.5'::timetz = '03:30:45.5'::time::timetz", "t"),
+        ("SELECT '{03:30}'::time[]::timetz[]", "{03:30:00-05}"),
+        ("SELECT ARRAY['03:30'::time]::timetz[]", "{03:30:00-05}"),
     ];
     for (sql, want) in cases {
         assert_eq!(scalar(&client, sql).await, want, "for `{sql}`");

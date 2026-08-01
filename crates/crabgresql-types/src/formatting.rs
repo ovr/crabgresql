@@ -28,6 +28,7 @@ use crate::tz::SessionZone;
 // crate — the binder/executor map these to `sqlstate::*`).
 const INVALID_DATETIME_FORMAT: &str = "22007";
 const DATETIME_FIELD_OVERFLOW: &str = "22008";
+use crate::timestamp::INVALID_TIME_ZONE_DISPLACEMENT;
 
 /// A `to_char` / `to_date` / `to_timestamp` failure. Unlike `DateError` and
 /// `TimestampError` this carries the optional DETAIL and HINT lines PG prints
@@ -84,6 +85,25 @@ fn no_match(raw: &str, code: &str) -> FormatError {
         format!("invalid value \"{raw}\" for \"{code}\""),
     )
     .with_detail("The given value did not match any of the allowed values for this field.")
+}
+
+/// A picture that sets the same zone component twice with different values.
+/// PG treats `TZ`, `OF`, `TZH` and `TZM` as one field type, so a *repetition*
+/// is fine (`'OF TZH'` against `'-05 -05'` parses) but a contradiction is not.
+fn conflicting_value(code: &str) -> FormatError {
+    FormatError::new(
+        INVALID_DATETIME_FORMAT,
+        format!("conflicting values for \"{code}\" field in formatting string"),
+    )
+    .with_detail("This value contradicts a previous setting for the same field type.")
+}
+
+/// A zone displacement outside PG's `±15:59:59` acceptance band.
+fn displacement_out_of_range(input: &str) -> FormatError {
+    FormatError::new(
+        INVALID_TIME_ZONE_DISPLACEMENT,
+        format!("time zone displacement out of range: \"{input}\""),
+    )
 }
 
 fn twelve_hour(hour: i64) -> FormatError {
@@ -779,13 +799,59 @@ struct Parsed {
     sec: Option<i64>,
     /// Already scaled to microseconds.
     usec: Option<i64>,
-    /// Seconds east of UTC, from `TZ`/`OF`.
-    offset: Option<i32>,
-    /// `TZH`/`TZM`, kept apart from `offset` because they arrive separately and
-    /// `TZM` carries no sign of its own — it takes the one `TZH` scanned.
-    tz_sign: Option<i32>,
-    tz_hour: Option<i32>,
-    tz_min: Option<i32>,
+    /// The zone displacement, held as separate components because `TZH` and
+    /// `TZM` arrive separately — see [`ZoneFields`].
+    zone: ZoneFields,
+}
+
+/// The zone displacement a picture scanned, kept per component.
+///
+/// `TZ` and `OF` fill all of them at once; `TZH` fills the sign and hours,
+/// `TZM` the minutes. PG treats all four codes as **one field type**, so a
+/// second code that repeats a component is accepted and one that contradicts it
+/// is `22007` — which is why the components are tracked individually rather
+/// than as a single combined offset.
+#[derive(Default)]
+struct ZoneFields {
+    /// `1` or `-1`. Only `TZM` leaves it unset, taking `+` by default.
+    sign: Option<i32>,
+    hour: Option<i32>,
+    min: Option<i32>,
+    /// A named zone can sit at a sub-minute LMT offset; the numeric codes
+    /// cannot express one, so only `TZ` ever sets this.
+    sec: Option<i32>,
+}
+
+impl ZoneFields {
+    /// Record one component, rejecting a value that contradicts an earlier one.
+    fn set(slot: &mut Option<i32>, value: i32, spell: &str) -> Result<(), FormatError> {
+        match slot {
+            Some(prev) if *prev != value => Err(conflicting_value(spell)),
+            _ => {
+                *slot = Some(value);
+                Ok(())
+            }
+        }
+    }
+
+    /// Record a whole signed displacement, as `TZ` and `OF` supply it.
+    fn set_offset(&mut self, secs: i32, spell: &str) -> Result<(), FormatError> {
+        let abs = secs.unsigned_abs() as i32;
+        Self::set(&mut self.sign, if secs < 0 { -1 } else { 1 }, spell)?;
+        Self::set(&mut self.hour, abs / 3600, spell)?;
+        Self::set(&mut self.min, abs % 3600 / 60, spell)?;
+        Self::set(&mut self.sec, abs % 60, spell)
+    }
+
+    /// The displacement in seconds east, or `None` if the picture named no zone.
+    fn offset(&self) -> Option<i32> {
+        if self.sign.is_none() && self.hour.is_none() && self.min.is_none() {
+            return None;
+        }
+        let magnitude =
+            self.hour.unwrap_or(0) * 3600 + self.min.unwrap_or(0) * 60 + self.sec.unwrap_or(0);
+        Some(self.sign.unwrap_or(1) * magnitude)
+    }
 }
 
 /// `to_timestamp(text, text)` → microseconds since 2000-01-01 UTC. An input
@@ -878,6 +944,14 @@ fn from_char(input: &str, fmt: &str) -> Result<(Tm, Option<i32>), FormatError> {
     if !(0..1_000_000).contains(&t.usec) {
         return Err(field_out_of_range(input));
     }
+    // A scanned displacement is bounded the same way one inside a literal is:
+    // `+15:59` is accepted, `+16:00` is not. Checked here rather than in the
+    // scanners because `TZH` and `TZM` are only out of range together, and
+    // because `to_date` rejects an out-of-range zone too even though it then
+    // discards it.
+    if offset.is_some_and(|s| s.abs() > crate::tz::MAX_TZ_DISPLACEMENT_SECS) {
+        return Err(displacement_out_of_range(input));
+    }
     Ok((t, offset))
 }
 
@@ -965,10 +1039,12 @@ fn scan_field(
         Code::TzAbbr { .. } => {
             let word = take_alpha(chars, pos);
             let zone = crate::tz::resolve_zone(&word).map_err(|_| no_match(&word, spell))?;
-            p.offset = Some(crate::tz::offset_for_instant(&zone, 0));
+            p.zone
+                .set_offset(crate::tz::offset_for_instant(&zone, 0), spell)?;
         }
         Code::TzOffset => {
-            p.offset = Some(take_offset(chars, pos).ok_or_else(|| no_match("", spell))?);
+            let secs = take_offset(chars, pos).ok_or_else(|| no_match("", spell))?;
+            p.zone.set_offset(secs, spell)?;
         }
         // `TZH` owns the sign, which is optional (`'+05'`, `'-05'`, `'05'`).
         // `TZM` is bare digits — the separator between them, if the picture has
@@ -983,12 +1059,12 @@ fn scan_field(
                 *pos += 1;
             }
             let (hours, _) = take_digits(chars, pos, Some(2)).ok_or_else(|| no_match("", spell))?;
-            p.tz_sign = Some(if sign == 0 { 1 } else { sign });
-            p.tz_hour = Some(hours as i32);
+            ZoneFields::set(&mut p.zone.sign, if sign == 0 { 1 } else { sign }, spell)?;
+            ZoneFields::set(&mut p.zone.hour, hours as i32, spell)?;
         }
         Code::TzMinute => {
             let (mins, _) = take_digits(chars, pos, Some(2)).ok_or_else(|| no_match("", spell))?;
-            p.tz_min = Some(mins as i32);
+            ZoneFields::set(&mut p.zone.min, mins as i32, spell)?;
         }
         _ => {
             let width = if capped {
@@ -1206,13 +1282,7 @@ fn assemble(p: &Parsed) -> Result<(Tm, Option<i32>), FormatError> {
         p.sec.unwrap_or(0),
         p.usec.unwrap_or(0),
     );
-    // An explicit `OF`/`TZ` wins; otherwise `TZH`/`TZM` combine, both taking
-    // the sign `TZH` scanned.
-    let offset = p.offset.or_else(|| match (p.tz_hour, p.tz_min) {
-        (None, None) => None,
-        (h, m) => Some(p.tz_sign.unwrap_or(1) * (h.unwrap_or(0) * 3600 + m.unwrap_or(0) * 60)),
-    });
-    Ok((t, offset))
+    Ok((t, p.zone.offset()))
 }
 
 #[cfg(test)]
@@ -1739,6 +1809,57 @@ mod tests {
             crate::timestamptz::format(explicit, &ny),
             "2024-06-01 08:00:00-04"
         );
+        Ok(())
+    }
+
+    /// `TZ`, `OF`, `TZH` and `TZM` are one field type: a repetition that agrees
+    /// parses, one that contradicts is `22007`, and the combined displacement is
+    /// bounded the same way one inside a literal is.
+    #[test]
+    fn zone_codes_conflict_and_bound() -> anyhow::Result<()> {
+        let utc = SessionZone::utc();
+        let at = |input: &str, fmt: &str| from_char_timestamptz(input, fmt, &utc);
+
+        // Agreeing repetitions are fine, in either code order.
+        assert!(at("2024-03-05 10:00:00 -05 -05", "YYYY-MM-DD HH24:MI:SS OF TZH").is_ok());
+        assert!(at("2024-03-05 10:00:00 -05 -05", "YYYY-MM-DD HH24:MI:SS TZH OF").is_ok());
+
+        // Contradictions name the code that noticed, i.e. the second one.
+        for (fmt, code) in [
+            ("YYYY-MM-DD HH24:MI:SS OF TZH", "TZH"),
+            ("YYYY-MM-DD HH24:MI:SS TZH OF", "OF"),
+            ("YYYY-MM-DD HH24:MI:SS TZH TZH", "TZH"),
+        ] {
+            let e = expect_err(at("2024-03-05 10:00:00 -05 +07", fmt));
+            assert_eq!(e.sqlstate, "22007");
+            assert_eq!(
+                e.message,
+                format!("conflicting values for \"{code}\" field in formatting string")
+            );
+            assert_eq!(
+                e.detail.as_deref(),
+                Some("This value contradicts a previous setting for the same field type.")
+            );
+        }
+
+        // ±15:59 is in range, ±16:00 is not — for `TZH`/`TZM` and for `OF`.
+        assert!(at("2024-03-05 10:00 +15:59", "YYYY-MM-DD HH24:MI TZH:TZM").is_ok());
+        for (input, fmt) in [
+            ("2024-03-05 10:00 +16:00", "YYYY-MM-DD HH24:MI TZH:TZM"),
+            ("2024-03-05 10:00 -16", "YYYY-MM-DD HH24:MI TZH"),
+            ("2024-03-05 10:00 +99", "YYYY-MM-DD HH24:MI TZH"),
+            ("2024-03-05 10:00 +99", "YYYY-MM-DD HH24:MI OF"),
+        ] {
+            let e = expect_err(at(input, fmt));
+            assert_eq!(e.sqlstate, "22009");
+            assert_eq!(
+                e.message,
+                format!("time zone displacement out of range: \"{input}\"")
+            );
+        }
+        // `to_date` rejects one too, even though it discards the zone.
+        let e = expect_err(from_char_date("2024-03-05 +99", "YYYY-MM-DD TZH"));
+        assert_eq!(e.sqlstate, "22009");
         Ok(())
     }
 
