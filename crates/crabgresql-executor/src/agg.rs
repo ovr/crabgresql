@@ -16,7 +16,7 @@ use crabgresql_binder::{AggFn, BoundAggregate};
 use crabgresql_types::{Numeric, PgType, Value, float};
 
 use crate::ExecError;
-use crate::eval::{compare_values, compare_values_collated};
+use crate::eval::{compare_values, compare_values_for_aggregate};
 
 /// The non-NULL input values already accepted by one `DISTINCT` aggregate in
 /// one group. It uses the same type-aware equality and compatible hash as
@@ -145,7 +145,10 @@ impl Accumulator {
                 let replace = match cur {
                     None => true,
                     Some(c) => {
-                        let ord = compare_values_collated(*ty, &v, c, *collation);
+                        // Not `compare_values_collated`: `min`/`max` on `oidvector`
+                        // compare element-wise while ORDER BY compares the element
+                        // count first, as in PG.
+                        let ord = compare_values_for_aggregate(*ty, &v, c, *collation);
                         if *want_max {
                             ord == Ordering::Greater
                         } else {
@@ -410,6 +413,21 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
             PgType::Tsvector => {
                 if let Value::Tsvector(t) = v {
                     t.hash(&mut h);
+                }
+            }
+            // A vector's equality is element-wise over `oid`/`int2`, both of
+            // which hash by their raw representation. The length is folded in
+            // so `'1 2'` and `'12'` cannot collide by concatenation.
+            PgType::Vector(_) => {
+                if let Value::Vector { elems, .. } = v {
+                    elems.len().hash(&mut h);
+                    for e in elems {
+                        match e {
+                            Value::Oid(o) => o.hash(&mut h),
+                            Value::Int2(i) => i.hash(&mut h),
+                            _ => {}
+                        }
+                    }
                 }
             }
             PgType::User(type_oid) => {

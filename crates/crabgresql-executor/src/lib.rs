@@ -4012,7 +4012,11 @@ fn build_series(func: TableFn, values: &[Value]) -> Result<Series, ExecError> {
 /// included). A NULL array argument yields no rows, as PG's `unnest` does.
 fn unnest_series(values: &[Value]) -> Series {
     match values.first() {
-        Some(Value::Array { elems, .. }) => Series::Materialized(elems.clone().into_iter()),
+        // `unnest` expands a vector into its elements too, so
+        // `unnest('11 22 33'::oidvector)` yields three `oid` rows.
+        Some(Value::Array { elems, .. } | Value::Vector { elems, .. }) => {
+            Series::Materialized(elems.clone().into_iter())
+        }
         _ => Series::Empty,
     }
 }

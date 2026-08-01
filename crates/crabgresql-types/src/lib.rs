@@ -34,6 +34,7 @@ pub mod tsquery;
 pub mod tsvector;
 pub mod tz;
 pub mod uuid;
+pub mod vector;
 pub mod wire;
 pub mod xid;
 
@@ -41,6 +42,7 @@ pub use fmt::FmtCtx;
 pub use interval::Interval;
 pub use net::Inet;
 pub use timetz::TimeTz;
+pub use vector::VectorKind;
 
 /// OIDs of built-in types. Must match PostgreSQL's `pg_type.dat` — drivers
 /// hardcode these.
@@ -62,7 +64,13 @@ pub mod oid {
     /// `pg_lsn`: a WAL log sequence number. See [`crate::pg_lsn`].
     pub const PG_LSN: u32 = 3220;
     pub const INT2: u32 = 21;
+    /// `int2vector`: a vector of `int2`, used by `pg_index.indkey` and friends.
+    /// See [`crate::vector`].
+    pub const INT2VECTOR: u32 = 22;
     pub const INT4: u32 = 23;
+    /// `oidvector`: a vector of `oid`, used by `pg_proc.proargtypes`.
+    /// See [`crate::vector`].
+    pub const OIDVECTOR: u32 = 30;
     pub const TEXT: u32 = 25;
     pub const BPCHAR: u32 = 1042;
     pub const VARCHAR: u32 = 1043;
@@ -164,6 +172,8 @@ pub mod oid {
     pub const REGCLASS_ARRAY: u32 = 2210;
     pub const REGTYPE_ARRAY: u32 = 2211;
     pub const REGNAMESPACE_ARRAY: u32 = 4090;
+    pub const INT2VECTOR_ARRAY: u32 = 1006;
+    pub const OIDVECTOR_ARRAY: u32 = 1013;
 }
 
 #[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +281,17 @@ pub enum PgType {
     /// `tsquery`: a text-search query tree ([`Value::Tsquery`]). Varlena;
     /// ordered and hashable. See [`crate::tsquery`].
     Tsquery,
+    /// `oidvector` or `int2vector` ([`Value::Vector`]): a vector of a fixed
+    /// element type, used by PG's own catalogs. Varlena; ordered and hashable.
+    /// The two PG types share one variant because they differ only in the
+    /// element type — see [`VectorKind`].
+    ///
+    /// Deliberately **not** an array type: `is_array` is false and
+    /// [`PgType::array_element`] returns `None`, so `ARRAY[v]` builds an
+    /// `oidvector[]` rather than flattening, matching PG. Subscripting and
+    /// `unnest` reach the element type through [`VectorKind::element`].
+    /// See [`crate::vector`].
+    Vector(VectorKind),
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -420,6 +441,7 @@ impl PgType {
             PgType::Reg(kind) => kind.oid(),
             PgType::Tsvector => oid::TSVECTOR,
             PgType::Tsquery => oid::TSQUERY,
+            PgType::Vector(kind) => kind.oid(),
             PgType::User(oid) => oid,
             PgType::Array(elem) => array::array_oid_for_elem(elem).unwrap_or(0),
         }
@@ -481,6 +503,10 @@ impl PgType {
                 // PG's does), which the derived `Hash` cannot, so hashing it
                 // would split groups `keys_equal` calls equal.
                 | PgType::Tsvector
+                // A vector's elements are `oid`/`int2`, both of which hash
+                // distinctly, and its equality is element-wise — so hashing the
+                // element sequence agrees with `keys_equal`.
+                | PgType::Vector(_)
         )
     }
 
@@ -542,6 +568,8 @@ impl PgType {
             oid::REGNAMESPACE => PgType::Reg(RegKind::Namespace),
             oid::TSVECTOR => PgType::Tsvector,
             oid::TSQUERY => PgType::Tsquery,
+            oid::OIDVECTOR => PgType::Vector(VectorKind::Oid),
+            oid::INT2VECTOR => PgType::Vector(VectorKind::Int2),
             // Array type OIDs (`_int4`, `_text`, ...) decode to `Array(elem)`.
             other => match array::elem_oid_for_array(other) {
                 Some(elem) => PgType::Array(elem),
@@ -616,6 +644,8 @@ impl PgType {
             "regclass" => PgType::Reg(RegKind::Class),
             "regtype" => PgType::Reg(RegKind::Type),
             "regnamespace" => PgType::Reg(RegKind::Namespace),
+            "oidvector" => PgType::Vector(VectorKind::Oid),
+            "int2vector" => PgType::Vector(VectorKind::Int2),
             _ => return None,
         })
     }
@@ -669,7 +699,10 @@ impl PgType {
             | PgType::Path
             | PgType::Polygon
             | PgType::Tsvector
-            | PgType::Tsquery => -1,
+            | PgType::Tsquery
+            // Both vectors are varlena: PG stores them in the array layout,
+            // whose length is the element count.
+            | PgType::Vector(_) => -1,
             PgType::User(_) => -1,
             // Arrays are varlena.
             PgType::Array(_) => -1,
@@ -723,6 +756,8 @@ impl PgType {
             PgType::Reg(kind) => kind.typname(),
             PgType::Tsvector => "tsvector",
             PgType::Tsquery => "tsquery",
+            // Neither vector has a separate SQL spelling.
+            PgType::Vector(kind) => kind.typname(),
             PgType::User(_) => "user-defined",
             PgType::Array(elem) => array_display_name(elem),
         }
@@ -776,6 +811,7 @@ impl PgType {
             PgType::Reg(kind) => kind.typname(),
             PgType::Tsvector => "tsvector",
             PgType::Tsquery => "tsquery",
+            PgType::Vector(kind) => kind.typname(),
             PgType::User(_) => "user-defined",
             PgType::Array(elem) => array_typname(elem),
         }
@@ -900,6 +936,8 @@ fn array_display_name(elem: u32) -> &'static str {
         Some(PgType::Jsonpath) => "jsonpath[]",
         Some(PgType::Tsvector) => "tsvector[]",
         Some(PgType::Tsquery) => "tsquery[]",
+        Some(PgType::Vector(VectorKind::Oid)) => "oidvector[]",
+        Some(PgType::Vector(VectorKind::Int2)) => "int2vector[]",
         _ => "array",
     }
 }
@@ -951,6 +989,8 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Jsonpath) => "_jsonpath",
         Some(PgType::Tsvector) => "_tsvector",
         Some(PgType::Tsquery) => "_tsquery",
+        Some(PgType::Vector(VectorKind::Oid)) => "_oidvector",
+        Some(PgType::Vector(VectorKind::Int2)) => "_int2vector",
         _ => "array",
     }
 }
@@ -1083,6 +1123,13 @@ pub enum Value {
         elem: PgType,
         elems: Vec<Value>,
     },
+    /// An `oidvector`/`int2vector`. `elems` are [`Value::Oid`]/[`Value::Int2`]
+    /// per `kind` and are never [`Value::Null`] — neither input function has a
+    /// spelling for one. See [`crate::vector`].
+    Vector {
+        kind: VectorKind,
+        elems: Vec<Value>,
+    },
 }
 
 impl Value {
@@ -1131,6 +1178,7 @@ impl Value {
             Value::Tsquery(_) => Some(PgType::Tsquery),
             Value::Enum { type_oid, .. } => Some(PgType::User(*type_oid)),
             Value::Array { elem, .. } => Some(PgType::Array(elem.oid())),
+            Value::Vector { kind, .. } => Some(PgType::Vector(*kind)),
         }
     }
 
@@ -1205,6 +1253,9 @@ impl Value {
             Value::Enum { label, .. } => Some(label.clone()),
             // An array prints in PG's `{...}` form (`array_out`).
             Value::Array { elem, elems } => Some(array::format(*elem, elems, fmt)),
+            // A vector prints space-separated and unbraced (`oidvectorout`).
+            // Zone-independent: its elements are `oid`/`int2`.
+            Value::Vector { elems, .. } => Some(vector::format(elems)),
         }
     }
 }

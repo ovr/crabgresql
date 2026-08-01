@@ -8,6 +8,50 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
+/// The OIDs of an `oidvector` column, decoded from the binary wire payload.
+///
+/// `tokio-postgres` has no built-in `FromSql` for `oidvector`, so without this
+/// every test read of a vector column would have to go through a server-side
+/// `::text` cast — which exercises the *text* output function and leaves
+/// `Value::encode_binary` unverified over a real socket. This decodes the array
+/// binary layout PostgreSQL uses for these types (`ndim`, has-nulls, element
+/// OID, then per dimension a length and a lower bound, then each element as a
+/// 4-byte length plus payload), asserting the parts that must be fixed.
+#[derive(Debug)]
+struct OidVectorBinary(Vec<u32>);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for OidVectorBinary {
+    fn from_sql(
+        _ty: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let be = |s: &[u8]| i32::from_be_bytes([s[0], s[1], s[2], s[3]]);
+        if raw.len() < 20 {
+            return Err("oidvector payload shorter than its header".into());
+        }
+        assert_eq!(be(&raw[0..4]), 1, "ndim");
+        assert_eq!(be(&raw[4..8]), 0, "has nulls");
+        assert_eq!(be(&raw[8..12]), 26, "element type is oid");
+        // A vector's lower bound is 0, which is what makes it 0-subscripted.
+        assert_eq!(be(&raw[16..20]), 0, "lower bound");
+        let count = be(&raw[12..16]) as usize;
+        assert_eq!(raw.len(), 20 + count * 8, "payload length");
+        Ok(OidVectorBinary(
+            (0..count)
+                .map(|i| {
+                    let at = 20 + i * 8;
+                    assert_eq!(be(&raw[at..at + 4]), 4, "element length");
+                    be(&raw[at + 4..at + 8]) as u32
+                })
+                .collect(),
+        ))
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        ty.oid() == 30
+    }
+}
+
 async fn spawn_server() -> u16 {
     spawn_server_reading(&[]).await
 }
@@ -2662,6 +2706,23 @@ async fn defaults_constraints_and_semantic_indexes() -> anyhow::Result<()> {
         indexes.len(),
         4,
         "PK, UNIQUE constraints, and explicit index are reflected"
+    );
+    // `indkey`/`indoption` are real `int2vector`s (PG's type OID 22), not text.
+    let indkey_row = client
+        .query_one(
+            "SELECT indkey, indoption FROM pg_index ORDER BY indexrelid LIMIT 1",
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        indkey_row.columns()[0].type_().oid(),
+        22,
+        "indkey is int2vector"
+    );
+    assert_eq!(
+        indkey_row.columns()[1].type_().oid(),
+        22,
+        "indoption is int2vector"
     );
     let constraint_messages = client
         .simple_query("SELECT count(*) FROM pg_constraint")
@@ -8834,7 +8895,8 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
     let row = client
         .query_one(
             "SELECT p.proname, l.lanname, p.prokind, p.provolatile, p.proisstrict, \
-                    p.pronargs, p.proargtypes, p.prosrc, n.nspname, \
+                    p.pronargs, p.proargtypes, p.proargtypes::text AS argtypes_text, \
+                    (p.proargtypes)[0] AS argtype0, p.prosrc, n.nspname, \
                     array_to_string(p.proargnames, ',') AS argnames \
              FROM pg_catalog.pg_proc p \
              JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
@@ -8850,8 +8912,17 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
     assert_eq!(row.get::<_, &str>("provolatile"), "i");
     assert!(row.get::<_, bool>("proisstrict"));
     assert_eq!(row.get::<_, i16>("pronargs"), 2);
-    // `proargtypes` renders as oidvectorout does: the OIDs, space-separated.
-    assert_eq!(row.get::<_, &str>("proargtypes"), "23 25");
+    // `proargtypes` is a real `oidvector`, not text: it must advertise PG's
+    // type OID 30, render as `oidvectorout` does (the OIDs, space-separated),
+    // and subscript 0-based.
+    assert_eq!(row.columns()[6].type_().oid(), 30);
+    assert_eq!(row.get::<_, &str>("argtypes_text"), "23 25");
+    // Decoded from the *binary* payload the server sent, not from the `::text`
+    // rendering above — `tokio-postgres` requests binary for every column, so
+    // this is the only assertion that exercises `Value::encode_binary` for a
+    // vector end to end. See `OidVectorBinary`.
+    assert_eq!(row.get::<_, OidVectorBinary>("proargtypes").0, vec![23, 25]);
+    assert_eq!(row.get::<_, u32>("argtype0"), 23);
     // Read through array_to_string: arrays have no binary wire format yet.
     assert_eq!(row.get::<_, &str>("argnames"), "a,b");
     assert!(row.get::<_, &str>("prosrc").contains("RETURN 1;"));

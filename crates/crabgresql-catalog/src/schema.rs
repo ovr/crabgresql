@@ -14,7 +14,7 @@ use crabgresql_storage_api::{
     Column, IndexConstraint, IndexMethod, PartitionBoundDatum, PartitionOf, PartitionStrategy,
     RelStats, TableAccessMethod, TableSchema,
 };
-use crabgresql_types::{PgType, Value};
+use crabgresql_types::{PgType, Value, VectorKind};
 
 use crate::{
     CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogToast,
@@ -804,9 +804,8 @@ pub fn pg_partitioned_table_schema() -> TableSchema {
             col("partstrat", CHARLIKE),
             col("partnatts", PgType::Int2),
             col("partdefid", PgType::Oid),
-            // PG types this `int2vector`; we render the 1-based key attnums as the
-            // same space-separated text `int2vectorout` produces.
-            col("partattrs", PgType::Text),
+            // The 1-based key attnums.
+            col("partattrs", INT2VECTOR),
         ],
     )
 }
@@ -819,18 +818,13 @@ pub fn pg_partitioned_table_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Va
             let strat = match scheme.strategy {
                 PartitionStrategy::Range => "r",
             };
-            let attrs = scheme
-                .key_columns
-                .iter()
-                .map(|i| (i + 1).to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
+            let attrs = attnum_vector(scheme.key_columns.iter().copied());
             rows.push(vec![
                 Value::Oid(*oid),
                 Value::Text(strat.to_string()),
                 Value::Int2(scheme.key_columns.len() as i16),
                 Value::Oid(0),
-                Value::Text(attrs),
+                attrs,
             ]);
         }
     }
@@ -1114,8 +1108,8 @@ pub fn pg_index_schema() -> TableSchema {
             col("indisprimary", PgType::Bool),
             col("indimmediate", PgType::Bool),
             col("indisvalid", PgType::Bool),
-            col("indkey", PgType::Text),
-            col("indoption", PgType::Text),
+            col("indkey", INT2VECTOR),
+            col("indoption", INT2VECTOR),
         ],
     )
 }
@@ -1124,29 +1118,18 @@ pub fn pg_index_rows(indexes: &[CatalogIndex]) -> Vec<Vec<Value>> {
     indexes
         .iter()
         .map(|index| {
-            let indkey = index
-                .metadata
-                .keys
-                .iter()
-                .map(|key| (key.column + 1).to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let indoption = index
-                .metadata
-                .keys
-                .iter()
-                .map(|key| {
-                    let mut option = 0;
-                    if key.descending {
-                        option |= 1;
-                    }
-                    if key.nulls_first {
-                        option |= 2;
-                    }
-                    option.to_string()
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            // 1-based key attnums, as PG's `indkey` holds.
+            let indkey = attnum_vector(index.metadata.keys.iter().map(|key| key.column));
+            let indoption = int2vector(index.metadata.keys.iter().map(|key| {
+                let mut option = 0;
+                if key.descending {
+                    option |= 1;
+                }
+                if key.nulls_first {
+                    option |= 2;
+                }
+                option
+            }));
             vec![
                 Value::Oid(index.oid),
                 Value::Oid(index.table_oid),
@@ -1157,8 +1140,8 @@ pub fn pg_index_rows(indexes: &[CatalogIndex]) -> Vec<Vec<Value>> {
                 Value::Bool(index.metadata.constraint == Some(IndexConstraint::PrimaryKey)),
                 Value::Bool(true),
                 Value::Bool(true),
-                Value::Text(indkey),
-                Value::Text(indoption),
+                indkey,
+                indoption,
             ]
         })
         .collect()
@@ -1478,12 +1461,45 @@ pub fn information_schema_columns_rows(
         .collect()
 }
 
-/// An `oidvector` column, rendered as the space-separated text `oidvectorout`
-/// prints. `oidvector` does not exist in this build's type system; the *output*
-/// is byte-identical to PostgreSQL's, so the only thing lost is subscripting
-/// (`proargtypes[0]`), which nothing in psql's `\df` uses. Named so the
-/// deviation is greppable, like [`CHARLIKE`].
-const OIDVECTORLIKE: PgType = PgType::Text;
+/// The `oidvector` and `int2vector` catalog column types. See
+/// [`crabgresql_types::vector`].
+const OIDVECTOR: PgType = PgType::Vector(VectorKind::Oid);
+const INT2VECTOR: PgType = PgType::Vector(VectorKind::Int2);
+
+/// Build an [`OIDVECTOR`] value from a sequence of OIDs.
+fn oidvector(elems: impl IntoIterator<Item = u32>) -> Value {
+    Value::Vector {
+        kind: VectorKind::Oid,
+        elems: elems.into_iter().map(Value::Oid).collect(),
+    }
+}
+
+/// Build an [`INT2VECTOR`] value from a sequence of `int2`s.
+fn int2vector(elems: impl IntoIterator<Item = i16>) -> Value {
+    Value::Vector {
+        kind: VectorKind::Int2,
+        elems: elems.into_iter().map(Value::Int2).collect(),
+    }
+}
+
+/// Build an [`INT2VECTOR`] of 1-based attribute numbers from 0-based column
+/// indexes — the shape of `pg_index.indkey` and
+/// `pg_partitioned_table.partattrs`.
+///
+/// `attnum` is an `int2` in PostgreSQL, which caps a relation at 32767 columns;
+/// PostgreSQL never reaches that because it rejects a table past 1600 columns,
+/// but this build has no such limit. A column index that does not fit is
+/// reported as `0`, which is already PostgreSQL's `indkey` sentinel for "this
+/// key is not a plain column reference" — the closest honest rendering. It must
+/// not be a bare `as i16`: that panics on overflow in a debug build and wraps to
+/// a negative attnum in a release one.
+fn attnum_vector(columns: impl IntoIterator<Item = usize>) -> Value {
+    int2vector(
+        columns
+            .into_iter()
+            .map(|c| i16::try_from(c.saturating_add(1)).unwrap_or(0)),
+    )
+}
 
 /// `pg_catalog.pg_language`.
 pub fn pg_language_schema() -> TableSchema {
@@ -1562,7 +1578,7 @@ pub fn pg_proc_schema() -> TableSchema {
             col("pronargs", PgType::Int2),
             col("pronargdefaults", PgType::Int2),
             col("prorettype", PgType::Oid),
-            col("proargtypes", OIDVECTORLIKE),
+            col("proargtypes", OIDVECTOR),
             col("proallargtypes", PgType::Array(crabgresql_types::oid::OID)),
             col("proargmodes", PgType::Array(crabgresql_types::oid::TEXT)),
             col("proargnames", PgType::Array(crabgresql_types::oid::TEXT)),
@@ -1625,14 +1641,7 @@ pub fn pg_proc_rows(
                 Value::Int2(r.arg_types.len() as i16),
                 Value::Int2(0),
                 Value::Oid(r.ret_type),
-                // `oidvectorout` prints the OIDs space-separated.
-                Value::Text(
-                    r.arg_types
-                        .iter()
-                        .map(u32::to_string)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                ),
+                oidvector(r.arg_types.iter().copied()),
                 optional_array(
                     PgType::Oid,
                     r.all_arg_types.iter().map(|t| Value::Oid(*t)).collect(),

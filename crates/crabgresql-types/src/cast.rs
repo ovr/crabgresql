@@ -54,7 +54,7 @@ fn cannot_coerce(from: PgType, to: PgType) -> CastError {
 }
 
 /// `22P02` — an input function rejected the text (`'abc'::int4`).
-fn invalid_input(ty: PgType, s: &str) -> CastError {
+pub(crate) fn invalid_input(ty: PgType, s: &str) -> CastError {
     CastError {
         sqlstate: INVALID_TEXT_REPRESENTATION,
         message: format!("invalid input syntax for type {}: \"{s}\"", ty.name()),
@@ -63,7 +63,7 @@ fn invalid_input(ty: PgType, s: &str) -> CastError {
 
 /// `22003` on the text→int path, which prints the offending literal (unlike the
 /// bare `out_of_range` PG uses for arithmetic and numeric→int overflow).
-fn value_out_of_range(ty: PgType, s: &str) -> CastError {
+pub(crate) fn value_out_of_range(ty: PgType, s: &str) -> CastError {
     CastError {
         sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
         message: format!("value \"{s}\" is out of range for type {}", ty.name()),
@@ -91,20 +91,22 @@ fn float_to_int_bounds(v: f64, lo: f64, hi: f64, ty: PgType) -> Result<f64, Cast
     Ok(r)
 }
 
-/// Pairs PostgreSQL marks explicit-only (`pg_cast.castcontext = 'e'`): they are
-/// reachable from `CAST`/`::` but never from an assignment.
-fn is_explicit_only(from: PgType, to: PgType) -> bool {
-    matches!((from, to), (PgType::Int4, PgType::Bool))
+/// Pairs where an assignment cannot use the ordinary cast and PostgreSQL falls
+/// back to an I/O conversion. Two distinct reasons land here:
+///
+/// * the pair is marked explicit-only (`pg_cast.castcontext = 'e'`), so it is
+///   reachable from `CAST`/`::` but never from an assignment — `int4 -> bool`;
+/// * there is no `pg_cast` entry between the two types *at all*, which is the
+///   case for `oidvector` and `int2vector` in either direction. PostgreSQL still
+///   accepts `x := y` between them by rendering and re-parsing, so
+///   `DECLARE x oidvector; y int2vector := '1 2'; x := y` yields `1 2`.
+fn needs_io_fallback_on_assign(from: PgType, to: PgType) -> bool {
+    matches!(
+        (from, to),
+        (PgType::Int4, PgType::Bool) | (PgType::Vector(_), PgType::Vector(_))
+    )
 }
 
-/// Cast `v` to `to` in PostgreSQL's *assignment* context — PL/pgSQL `:=`,
-/// `SELECT … INTO`, and coercing a `RETURN` value to the declared type.
-///
-/// An explicit-only pair is unavailable here, so PostgreSQL falls back to an
-/// I/O conversion: render the source with its output function, then feed that
-/// text to the target's input function. The fallback accepts strictly less
-/// than the explicit cast, which is the observable difference — `b := 1`
-/// yields true, but `b := 2` raises `22P02` even though `2::boolean` is true.
 /// Re-label a `timestamp`-family error as a cast failure. Both carry a
 /// SQLSTATE and a message; only the type differs.
 fn cast_err(e: crate::timestamp::TimestampError) -> CastError {
@@ -114,11 +116,22 @@ fn cast_err(e: crate::timestamp::TimestampError) -> CastError {
     }
 }
 
+/// Cast `v` to `to` in PostgreSQL's *assignment* context — PL/pgSQL `:=`,
+/// `SELECT … INTO`, and coercing a `RETURN` value to the declared type.
+///
+/// When no assignment cast exists, PostgreSQL falls back to an I/O conversion:
+/// render the source with its output function, then feed that text to the
+/// target's input function. The fallback accepts strictly less than the explicit
+/// cast, which is the observable difference — `b := 1` yields true, but `b := 2`
+/// raises `22P02` even though `2::boolean` is true. Going through the target's
+/// input function is also what makes an out-of-range element report the element
+/// type's `22003` rather than a blanket `cannot cast` (see
+/// [`needs_io_fallback_on_assign`]).
 pub fn cast_value_assign(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError> {
     let Some(from) = v.pg_type() else {
         return Ok(v); // NULL assigns to any type.
     };
-    if from != to && is_explicit_only(from, to) {
+    if from != to && needs_io_fallback_on_assign(from, to) {
         let text = v
             .encode_text_with(fmt)
             .expect("non-null value has a text encoding");
@@ -719,6 +732,18 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             })
         }
 
+        // ---- vector I/O ----
+        // `text` → `oidvector`/`int2vector` (`oidvectorin`/`int2vectorin`).
+        // vector → text goes through the generic any-to-text arm above.
+        //
+        // There is deliberately no `oid[]` conversion in either direction:
+        // `oid[]::oidvector` is `cannot cast type oid[] to oidvector` in PG too,
+        // and `oidvector::oid[]` yields a 0-based array this build cannot
+        // represent — both fall through to `cannot_coerce`. See `crate::vector`.
+        (Value::Text(s), PgType::Vector(kind)) => {
+            crate::vector::vector_in(s, kind).map(|elems| Value::Vector { kind, elems })
+        }
+
         _ => Err(cannot_coerce(from, to)),
     }
 }
@@ -871,28 +896,30 @@ pub fn text_to_int(s: &str, ty: PgType) -> Result<Value, CastError> {
     }
 }
 
-/// `oidin`: parse an object identifier from text. Like PG's input function, an
-/// optional leading sign is accepted and a negative wraps into the unsigned
-/// range (`'-1'::oid` = 4294967295), while a magnitude past 32 bits is `22003`
-/// (`value "…" is out of range for type oid`) and any non-numeric text is
-/// `22P02`. Shared by the binder's `parse_unknown` so `'42'::oid` and an untyped
-/// literal in an oid context never drift.
+/// `oidin`: parse an object identifier from text.
+///
+/// PG's `oidin` is `strtoul(s, &end, 0)` followed by a range check, so it is the
+/// *same* acceptor as `xidin` under a different type name — hex and octal
+/// spellings convert (`'0x1f'` is 31, `'010'` is 8), a negative wraps into the
+/// unsigned range (`'-1'` is 4294967295), a magnitude outside
+/// [`crate::xid::wraps_into_u32`]'s band is `22003`, and a trailing character or
+/// an empty digit run is `22P02`.
+///
+/// Shared by the binder's `parse_unknown`, so `'42'::oid` and an untyped literal
+/// in an oid context never drift — and by construction it now agrees with each
+/// `oidvector` element, which scans through the same two functions.
 pub fn text_to_oid(s: &str) -> Result<Value, CastError> {
-    use std::num::IntErrorKind;
     let t = s.trim();
-    match t.parse::<i64>() {
-        Ok(n) if oid_in_range(n) => Ok(Value::Oid(n as u32)),
-        // Parsed as a number but too large/small to be a 32-bit oid.
-        Ok(_) => Err(value_out_of_range(PgType::Oid, s)),
-        Err(e)
-            if matches!(
-                e.kind(),
-                IntErrorKind::PosOverflow | IntErrorKind::NegOverflow
-            ) =>
-        {
-            Err(value_out_of_range(PgType::Oid, s))
-        }
-        Err(_) => Err(invalid_input(PgType::Oid, s)),
+    let (scanned, stop) = crate::xid::scan_prefix(t);
+    match scanned {
+        // A trailing character means the scan stopped early (`'1abc'`, `'08x'`),
+        // which PG reports as a syntax error rather than a partial parse.
+        Ok(_) if stop != t.len() => Err(invalid_input(PgType::Oid, s)),
+        Ok(v) => crate::xid::wraps_into_u32(v)
+            .map(Value::Oid)
+            .ok_or_else(|| value_out_of_range(PgType::Oid, s)),
+        Err(crate::xid::ScanError::Range) => Err(value_out_of_range(PgType::Oid, s)),
+        Err(crate::xid::ScanError::Syntax) => Err(invalid_input(PgType::Oid, s)),
     }
 }
 
@@ -1409,6 +1436,53 @@ mod tests {
         assert_eq!(text_to_oid("4294967296").unwrap_err().sqlstate, "22003");
         // Non-numeric is 22P02.
         assert_eq!(text_to_oid("abc").unwrap_err().sqlstate, "22P02");
+
+        // `oidin` is `strtoul(base 0)`, so hex and octal convert — and each of
+        // these must agree with the same text as an `oidvector` element, which
+        // scans through the same `xid::scan_prefix`. All probed against PG 18.4.
+        assert_eq!(text_to_oid("0x1f")?, Value::Oid(31));
+        assert_eq!(text_to_oid("0X1F")?, Value::Oid(31));
+        assert_eq!(text_to_oid("010")?, Value::Oid(8));
+        assert_eq!(text_to_oid("-2147483648")?, Value::Oid(2147483648));
+        assert_eq!(text_to_oid("18446744073709551615")?, Value::Oid(u32::MAX));
+        // The gap between the two accepted bands is out of range...
+        assert_eq!(text_to_oid("-2147483649").unwrap_err().sqlstate, "22003");
+        assert_eq!(text_to_oid("-4294967295").unwrap_err().sqlstate, "22003");
+        // ...while a trailing character is a syntax error, not a partial parse.
+        for bad in ["1abc", "08x", "1,2", "", "-", "0b11"] {
+            assert_eq!(
+                text_to_oid(bad).unwrap_err().sqlstate,
+                "22P02",
+                "input {bad:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// `'x'::oid` and `'x'::oidvector` must accept exactly the same element
+    /// text: both route through `xid::scan_prefix` and `xid::wraps_into_u32`,
+    /// and this pins that they cannot drift apart.
+    #[test]
+    fn oid_and_oidvector_elements_agree() -> anyhow::Result<()> {
+        for text in [
+            "42",
+            "0x1f",
+            "010",
+            "-1",
+            "-2147483648",
+            "18446744073709551615",
+            "0",
+        ] {
+            let direct = text_to_oid(text)?;
+            let via_vector = crate::vector::vector_in(text, crate::VectorKind::Oid)?;
+            assert_eq!(via_vector, vec![direct.clone()], "input {text:?}");
+        }
+        for bad in ["-2147483649", "4294967296", "abc", "-"] {
+            let direct = text_to_oid(bad).unwrap_err();
+            let via_vector = crate::vector::vector_in(bad, crate::VectorKind::Oid).unwrap_err();
+            assert_eq!(direct.sqlstate, via_vector.sqlstate, "input {bad:?}");
+        }
 
         Ok(())
     }

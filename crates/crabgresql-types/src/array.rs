@@ -117,6 +117,10 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::REGCLASS, oid::REGCLASS_ARRAY),
     (oid::REGTYPE, oid::REGTYPE_ARRAY),
     (oid::REGNAMESPACE, oid::REGNAMESPACE_ARRAY),
+    // PG treats the vectors as scalars for array construction, so `oidvector[]`
+    // is an array *of vectors*, not a flattened `oid[]`.
+    (oid::OIDVECTOR, oid::OIDVECTOR_ARRAY),
+    (oid::INT2VECTOR, oid::INT2VECTOR_ARRAY),
 ];
 
 /// `array_out`: render a 1-D array as `{e1,e2,...}`. A NULL element prints as an
@@ -146,10 +150,14 @@ pub fn format(elem: PgType, elems: &[Value], fmt: &FmtCtx) -> String {
     out
 }
 
-/// PG's `array_isspace`: the six ASCII whitespace characters array I/O treats as
-/// whitespace. Deliberately not Rust's Unicode-aware `char::is_whitespace`, which
-/// would over-quote elements containing e.g. a non-breaking space.
-fn is_array_space(c: char) -> bool {
+/// C's `isspace` over ASCII — the six characters PG's `array_isspace` and
+/// `oidvectorin` both treat as whitespace.
+///
+/// Deliberately neither Rust's Unicode-aware `char::is_whitespace` (which would
+/// over-quote an element containing e.g. a non-breaking space) nor
+/// `is_ascii_whitespace` (which omits vertical tab, `0x0B`, and so would split
+/// `E'11\x0b22'::oidvector` into one element instead of two).
+pub(crate) fn is_c_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
 }
 
@@ -157,7 +165,7 @@ fn needs_quote(s: &str, delim: char) -> bool {
     s.is_empty()
         || s.eq_ignore_ascii_case("null")
         || s.chars()
-            .any(|c| c == delim || matches!(c, '{' | '}' | '"' | '\\') || is_array_space(c))
+            .any(|c| c == delim || matches!(c, '{' | '}' | '"' | '\\') || is_c_space(c))
 }
 
 fn push_quoted(out: &mut String, s: &str) {
@@ -236,7 +244,7 @@ pub fn array_in(input: &str, elem: PgType, fmt: &FmtCtx) -> Result<Vec<Value>, A
 }
 
 fn skip_ws(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    while matches!(chars.peek(), Some(&c) if is_array_space(c)) {
+    while matches!(chars.peek(), Some(&c) if is_c_space(c)) {
         chars.next();
     }
 }
@@ -308,7 +316,7 @@ fn read_element(
             Some(&c) => {
                 chars.next();
                 s.push(c);
-                if !is_array_space(c) {
+                if !is_c_space(c) {
                     last_sig = s.len();
                 }
             }

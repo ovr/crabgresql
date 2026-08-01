@@ -12,6 +12,7 @@ macaddr
 macaddr8
 md5
 money
+oid
 path
 portals_p2
 time

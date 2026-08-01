@@ -2450,6 +2450,10 @@ fn bind_subscript(
         PgType::Array(elem_oid) => PgType::from_oid(elem_oid).ok_or_else(|| {
             BindError::feature_not_supported("subscripting this array type is not supported yet")
         })?,
+        // `oidvector`/`int2vector` subscript to their element type. Their lower
+        // bound is 0 rather than 1, which the executor's `Subscript` evaluation
+        // handles — nothing here depends on it.
+        PgType::Vector(kind) => kind.element(),
         other => {
             return Err(BindError::new(
                 sqlstate::DATATYPE_MISMATCH,
@@ -2932,6 +2936,12 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             // Both text-search types have a default btree opclass in PG.
             | PgType::Tsvector
             | PgType::Tsquery
+            // Both vectors are orderable, but by different rules — `oidvector`
+            // via its own `btoidvectorcmp` opclass (element count first),
+            // `int2vector` via the polymorphic array ordering (element-wise).
+            // See `compare_values_collated`. Their elements are always
+            // `oid`/`int2`, both orderable, so there is no element check here.
+            | PgType::Vector(_)
     ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
 }
 
@@ -7760,6 +7770,11 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
                     BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))
                 })
         }
+        // Both vector errors name the *element* type (`oid`/`smallint`), so the
+        // message comes from `vector_in` rather than the `invalid` helper above.
+        PgType::Vector(kind) => crabgresql_types::vector::vector_in(s, kind)
+            .map(|elems| Value::Vector { kind, elems })
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         // Never reached: `resolve_unknown` intercepts a reg* literal and lowers
         // it to the runtime `RegIn` resolution, because only the catalog can
         // turn an object name into an OID and the binder holds none.

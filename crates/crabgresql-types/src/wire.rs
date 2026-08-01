@@ -9,7 +9,7 @@
 //! documented binary formats (network byte order), not PG's C source.
 
 use crate::cast::{self, CastError};
-use crate::{FmtCtx, PgType, Value};
+use crate::{FmtCtx, PgType, Value, VectorKind};
 
 /// `22P03` invalid_binary_representation — a binary value the type's `recv`
 /// function would reject (wrong length, out-of-domain byte).
@@ -93,8 +93,54 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
             }
         }
         PgType::Bytea => Value::Bytea(b.to_vec()),
+        PgType::Vector(kind) => Value::Vector {
+            kind,
+            elems: decode_vector(b, kind)?,
+        },
         other => return Err(no_binary(other)),
     })
+}
+
+/// `oidvectorrecv`/`int2vectorrecv`: PG sends these in the ordinary array binary
+/// layout — `ndim`, a has-nulls flag, the element type OID, then per dimension a
+/// length and a lower bound, then each element as a 4-byte length plus payload.
+/// A vector is always 1-D with **lower bound 0** (the reason its subscripts are
+/// 0-based), and never has nulls. Probed against PostgreSQL 18.4; the exact byte
+/// layout is pinned by `vector_binary_layout_matches_pg` below.
+fn decode_vector(b: &[u8], kind: VectorKind) -> Result<Vec<Value>, CastError> {
+    let ty = PgType::Vector(kind);
+    let be = |s: &[u8]| i32::from_be_bytes([s[0], s[1], s[2], s[3]]);
+    if b.len() < 20 {
+        return Err(invalid_binary(ty));
+    }
+    let (ndim, elem_oid, count, lower) =
+        (be(&b[0..4]), be(&b[8..12]), be(&b[12..16]), be(&b[16..20]));
+    // Derived from the element type, as the encoder does, so the two cannot
+    // disagree about the stride if a third VectorKind is ever added.
+    let width = kind.element().typlen() as usize;
+    // Reject anything that is not the shape PG sends, rather than guessing:
+    // a wrong element type or lower bound would silently change the value.
+    if ndim != 1 || lower != 0 || count < 0 || elem_oid != kind.element().oid() as i32 {
+        return Err(invalid_binary(ty));
+    }
+    let count = count as usize;
+    if b.len() != 20 + count * (4 + width) {
+        return Err(invalid_binary(ty));
+    }
+    let mut elems = Vec::with_capacity(count);
+    let mut pos = 20;
+    for _ in 0..count {
+        if be(&b[pos..pos + 4]) != width as i32 {
+            return Err(invalid_binary(ty));
+        }
+        pos += 4;
+        elems.push(match kind {
+            VectorKind::Oid => Value::Oid(u32::from_be_bytes(fixed(&b[pos..pos + 4], ty)?)),
+            VectorKind::Int2 => Value::Int2(i16::from_be_bytes(fixed(&b[pos..pos + 2], ty)?)),
+        });
+        pos += width;
+    }
+    Ok(elems)
 }
 
 impl Value {
@@ -127,6 +173,27 @@ impl Value {
             Value::Float8(v) => v.to_bits().to_be_bytes().to_vec(),
             Value::Text(s) => s.as_bytes().to_vec(),
             Value::Bytea(b) => b.clone(),
+            // `oidvectorsend`/`int2vectorsend` — see `decode_vector` for the
+            // layout. `ndim` stays 1 even for an empty vector.
+            Value::Vector { kind, elems } => {
+                let elem = kind.element();
+                let width = elem.typlen() as i32;
+                let mut out = Vec::with_capacity(20 + elems.len() * (4 + width as usize));
+                out.extend_from_slice(&1i32.to_be_bytes()); // ndim
+                out.extend_from_slice(&0i32.to_be_bytes()); // has nulls
+                out.extend_from_slice(&elem.oid().to_be_bytes());
+                out.extend_from_slice(&(elems.len() as i32).to_be_bytes());
+                out.extend_from_slice(&0i32.to_be_bytes()); // lower bound
+                for e in elems {
+                    out.extend_from_slice(&width.to_be_bytes());
+                    match e {
+                        Value::Oid(v) => out.extend_from_slice(&v.to_be_bytes()),
+                        Value::Int2(v) => out.extend_from_slice(&v.to_be_bytes()),
+                        other => unreachable!("vector element is not oid/int2: {other:?}"),
+                    }
+                }
+                out
+            }
             other => {
                 let ty = other.pg_type().unwrap_or(PgType::Text);
                 return Err(no_binary(ty));
@@ -187,6 +254,76 @@ mod tests {
                 .sqlstate,
             "22P03"
         );
+
+        Ok(())
+    }
+
+    /// The expected bytes here were captured from PostgreSQL 18.4 with
+    /// `COPY (SELECT '11 22'::oidvector) TO ... WITH (FORMAT binary)`, so this
+    /// pins the real layout rather than just a self-consistent round trip. Note
+    /// `ndim` stays 1 for an empty vector, and the lower bound is 0 — the same
+    /// 0 that makes vector subscripts 0-based.
+    #[test]
+    fn vector_binary_layout_matches_pg() -> anyhow::Result<()> {
+        #[rustfmt::skip]
+        let cases = [
+            (
+                Value::Vector { kind: VectorKind::Oid, elems: vec![Value::Oid(11), Value::Oid(22)] },
+                PgType::Vector(VectorKind::Oid),
+                vec![
+                    0, 0, 0, 1,     // ndim
+                    0, 0, 0, 0,     // has nulls
+                    0, 0, 0, 26,    // element type = oid
+                    0, 0, 0, 2,     // dim[0]
+                    0, 0, 0, 0,     // lower bound
+                    0, 0, 0, 4, 0, 0, 0, 11,
+                    0, 0, 0, 4, 0, 0, 0, 22,
+                ],
+            ),
+            (
+                Value::Vector { kind: VectorKind::Oid, elems: vec![] },
+                PgType::Vector(VectorKind::Oid),
+                vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                Value::Vector { kind: VectorKind::Int2, elems: vec![Value::Int2(-5), Value::Int2(7)] },
+                PgType::Vector(VectorKind::Int2),
+                vec![
+                    0, 0, 0, 1,
+                    0, 0, 0, 0,
+                    0, 0, 0, 21,    // element type = int2
+                    0, 0, 0, 2,
+                    0, 0, 0, 0,
+                    0, 0, 0, 2, 0xff, 0xfb,
+                    0, 0, 0, 2, 0x00, 0x07,
+                ],
+            ),
+        ];
+        for (value, ty, expected) in cases {
+            let bytes = value
+                .encode_binary()?
+                .ok_or_else(|| anyhow::anyhow!("{ty:?} encoded as NULL"))?;
+            assert_eq!(bytes, expected, "{ty:?} wire layout");
+            assert_eq!(decode_binary(ty, &bytes)?, value, "{ty:?} round trip");
+        }
+
+        // A truncated payload, and a shape PG never sends, are both 22P03
+        // rather than a panic or a silently different value.
+        let ov = PgType::Vector(VectorKind::Oid);
+        for bad in [
+            vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 26, 0, 0, 0, 1, 0, 0, 0, 0], // count 1, no element
+            vec![0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0, 0], // ndim 2
+            vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0, 1], // lower bound 1
+            vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0, 0], // element type int4
+            vec![0, 0, 0, 1],                                                  // short header
+        ] {
+            assert_eq!(
+                decode_binary(ov, &bad)
+                    .expect_err("not a valid oidvector payload")
+                    .sqlstate,
+                "22P03"
+            );
+        }
 
         Ok(())
     }

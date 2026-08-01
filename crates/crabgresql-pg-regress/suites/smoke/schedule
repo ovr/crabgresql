@@ -68,3 +68,4 @@ test: cursor
 test: to_char
 test: toast
 test: psql_vars
+test: oidvector
