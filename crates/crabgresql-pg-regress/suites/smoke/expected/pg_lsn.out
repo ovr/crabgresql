@@ -5,13 +5,12 @@
 --
 -- Ported from vendor/postgres/regress/sql/pg_lsn.sql. Every `pg_lsn`-specific
 -- result there is reproduced exactly; upstream `pg_lsn` is nonetheless not on
--- the promotion list in suites/upstream_must_pass.txt, because three things
+-- the promotion list in suites/upstream_must_pass.txt, because two things
 -- unrelated to this type still block it:
 --   1. `pg_lsn '0/16AE7F7'` -- the parser rejects the `type 'literal'` spelling
 --      for any bareword type name (only `xml` is excepted).
 --   2. `EXPLAIN (COSTS OFF)`, whose plan text this planner does not reproduce.
---   3. `FROM generate_series(1, 10) i` where `i` then names the output column.
--- The first two are dropped below; the third is replaced by a table.
+-- Both are dropped below.
 --
 -- NOTE ON OUTPUT FORMAT: the low half is zero-padded to eight hex digits
 -- (`0/00000000`), which is what the vendored 19devel corpus expects and what
@@ -321,3 +320,115 @@ SELECT ARRAY['0/1'::pg_lsn, '2/3'::pg_lsn] AS arr;
 (1 row)
 
 DROP TABLE lsn_tbl;
+-- Check btree and hash opclasses (upstream's generate_series form: each FROM
+-- item's alias names its single output column)
+SELECT DISTINCT (i || '/' || j)::pg_lsn f
+  FROM generate_series(1, 10) i,
+       generate_series(1, 10) j,
+       generate_series(1, 5) k
+  WHERE i <= 10 AND j > 0 AND j <= 10
+  ORDER BY f;
+      f      
+-------------
+ 1/00000001
+ 1/00000002
+ 1/00000003
+ 1/00000004
+ 1/00000005
+ 1/00000006
+ 1/00000007
+ 1/00000008
+ 1/00000009
+ 1/00000010
+ 2/00000001
+ 2/00000002
+ 2/00000003
+ 2/00000004
+ 2/00000005
+ 2/00000006
+ 2/00000007
+ 2/00000008
+ 2/00000009
+ 2/00000010
+ 3/00000001
+ 3/00000002
+ 3/00000003
+ 3/00000004
+ 3/00000005
+ 3/00000006
+ 3/00000007
+ 3/00000008
+ 3/00000009
+ 3/00000010
+ 4/00000001
+ 4/00000002
+ 4/00000003
+ 4/00000004
+ 4/00000005
+ 4/00000006
+ 4/00000007
+ 4/00000008
+ 4/00000009
+ 4/00000010
+ 5/00000001
+ 5/00000002
+ 5/00000003
+ 5/00000004
+ 5/00000005
+ 5/00000006
+ 5/00000007
+ 5/00000008
+ 5/00000009
+ 5/00000010
+ 6/00000001
+ 6/00000002
+ 6/00000003
+ 6/00000004
+ 6/00000005
+ 6/00000006
+ 6/00000007
+ 6/00000008
+ 6/00000009
+ 6/00000010
+ 7/00000001
+ 7/00000002
+ 7/00000003
+ 7/00000004
+ 7/00000005
+ 7/00000006
+ 7/00000007
+ 7/00000008
+ 7/00000009
+ 7/00000010
+ 8/00000001
+ 8/00000002
+ 8/00000003
+ 8/00000004
+ 8/00000005
+ 8/00000006
+ 8/00000007
+ 8/00000008
+ 8/00000009
+ 8/00000010
+ 9/00000001
+ 9/00000002
+ 9/00000003
+ 9/00000004
+ 9/00000005
+ 9/00000006
+ 9/00000007
+ 9/00000008
+ 9/00000009
+ 9/00000010
+ 10/00000001
+ 10/00000002
+ 10/00000003
+ 10/00000004
+ 10/00000005
+ 10/00000006
+ 10/00000007
+ 10/00000008
+ 10/00000009
+ 10/00000010
+(100 rows)
+

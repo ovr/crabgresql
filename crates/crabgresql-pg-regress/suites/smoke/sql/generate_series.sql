@@ -26,6 +26,16 @@ SELECT generate_series FROM generate_series(1, 6) WHERE generate_series % 2 = 0;
 SELECT * FROM generate_series(1, 4) ORDER BY 1 DESC;
 -- a column-list alias in FROM renames the single output column
 SELECT g FROM generate_series(1, 3) AS s(g) ORDER BY 1;
+-- a bare alias renames it too: the alias names both the relation and, because
+-- the function returns a scalar, its one column. The AS is optional.
+SELECT i FROM generate_series(1, 3) AS i ORDER BY 1;
+SELECT i FROM generate_series(1, 3) i ORDER BY 1;
+SELECT * FROM generate_series(1, 3) AS i;
+-- the qualified spelling still works, and two aliased series can be joined
+SELECT i.i FROM generate_series(1, 2) AS i ORDER BY 1;
+SELECT x, y FROM generate_series(1, 2) x, generate_series(1, 2) y ORDER BY x, y;
+-- a column list still wins over the bare alias
+SELECT g FROM generate_series(1, 3) AS i(g) ORDER BY 1;
 -- more column aliases than the function produces is an error
 SELECT * FROM generate_series(1, 3) AS s(a, b);
 -- numeric overload: a fractional step; the start keeps its scale

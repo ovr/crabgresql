@@ -5,13 +5,12 @@
 --
 -- Ported from vendor/postgres/regress/sql/pg_lsn.sql. Every `pg_lsn`-specific
 -- result there is reproduced exactly; upstream `pg_lsn` is nonetheless not on
--- the promotion list in suites/upstream_must_pass.txt, because three things
+-- the promotion list in suites/upstream_must_pass.txt, because two things
 -- unrelated to this type still block it:
 --   1. `pg_lsn '0/16AE7F7'` -- the parser rejects the `type 'literal'` spelling
 --      for any bareword type name (only `xml` is excepted).
 --   2. `EXPLAIN (COSTS OFF)`, whose plan text this planner does not reproduce.
---   3. `FROM generate_series(1, 10) i` where `i` then names the output column.
--- The first two are dropped below; the third is replaced by a table.
+-- Both are dropped below.
 --
 -- NOTE ON OUTPUT FORMAT: the low half is zero-padded to eight hex digits
 -- (`0/00000000`), which is what the vendored 19devel corpus expects and what
@@ -113,3 +112,12 @@ SELECT l FROM lsn_tbl WHERE l = '0/2'::pg_lsn;
 SELECT l::text FROM lsn_tbl ORDER BY 1;
 SELECT ARRAY['0/1'::pg_lsn, '2/3'::pg_lsn] AS arr;
 DROP TABLE lsn_tbl;
+
+-- Check btree and hash opclasses (upstream's generate_series form: each FROM
+-- item's alias names its single output column)
+SELECT DISTINCT (i || '/' || j)::pg_lsn f
+  FROM generate_series(1, 10) i,
+       generate_series(1, 10) j,
+       generate_series(1, 5) k
+  WHERE i <= 10 AND j > 0 AND j <= 10
+  ORDER BY f;

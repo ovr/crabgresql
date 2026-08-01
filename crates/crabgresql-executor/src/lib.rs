@@ -5485,6 +5485,29 @@ mod tests {
     }
 
     #[test]
+    fn from_alias_names_the_series_column() {
+        // The alias is both the relation qualifier and the output column name,
+        // so `SELECT i` resolves and the result header says `i`.
+        let (columns, rows) = run_rows("SELECT i FROM generate_series(1, 3) AS i");
+        assert_eq!(columns[0].name, "i");
+        assert_eq!(columns[0].ty, PgType::Int4);
+        assert_eq!(
+            series_col(&rows),
+            (1..=3).map(Value::Int4).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unnest_in_from_yields_elements() {
+        let (columns, rows) = run_rows("SELECT u FROM unnest(ARRAY['a', 'b']) AS u");
+        assert_eq!(columns[0].name, "u");
+        assert_eq!(
+            series_col(&rows),
+            vec![Value::Text("a".into()), Value::Text("b".into())]
+        );
+    }
+
+    #[test]
     fn generate_series_target_list_yields_rows() {
         let (columns, rows) = run_rows("SELECT generate_series(1, 5)");
         assert_eq!(columns[0].name, "generate_series");

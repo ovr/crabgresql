@@ -104,6 +104,58 @@ SELECT g FROM generate_series(1, 3) AS s(g) ORDER BY 1;
  3
 (3 rows)
 
+-- a bare alias renames it too: the alias names both the relation and, because
+-- the function returns a scalar, its one column. The AS is optional.
+SELECT i FROM generate_series(1, 3) AS i ORDER BY 1;
+ i 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+SELECT i FROM generate_series(1, 3) i ORDER BY 1;
+ i 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+SELECT * FROM generate_series(1, 3) AS i;
+ i 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+-- the qualified spelling still works, and two aliased series can be joined
+SELECT i.i FROM generate_series(1, 2) AS i ORDER BY 1;
+ i 
+---
+ 1
+ 2
+(2 rows)
+
+SELECT x, y FROM generate_series(1, 2) x, generate_series(1, 2) y ORDER BY x, y;
+ x | y 
+---+---
+ 1 | 1
+ 1 | 2
+ 2 | 1
+ 2 | 2
+(4 rows)
+
+-- a column list still wins over the bare alias
+SELECT g FROM generate_series(1, 3) AS i(g) ORDER BY 1;
+ g 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
 -- more column aliases than the function produces is an error
 SELECT * FROM generate_series(1, 3) AS s(a, b);
 ERROR:  table "s" has 1 columns available but 2 columns specified

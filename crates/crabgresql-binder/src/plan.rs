@@ -2501,7 +2501,7 @@ fn bind_table_query(
         source,
         relations,
         visible,
-    } = bind_from_item(engine, catalog, params, &relation, ctes)?.into_bound_from();
+    } = bind_from_item(engine, catalog, params, &relation, ctes, &[])?.into_bound_from();
     let scope = Scope::relations_with_visible(relations, visible, catalog, params);
     let mut columns = Vec::new();
     let mut projections = Vec::new();
@@ -2737,12 +2737,16 @@ fn view_output_columns(
 
 /// Resolve one FROM item to a [`BoundFromItem`], producing a bare row source
 /// (no projection pipeline) so several can be combined into a join tree.
+/// `siblings` are the FROM items already bound to this item's left, used only to
+/// tell an implicitly-lateral table-function argument from a genuinely unknown
+/// column (see [`bind_table_fn_args`]); it is empty for the leftmost item.
 fn bind_from_item(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
     params: &ParamCtx,
     relation: &ast::TableFactor,
     ctes: &CteEnv,
+    siblings: &[(String, Vec<Column>)],
 ) -> Result<BoundFromItem, BindError> {
     match relation {
         // A `Table` factor carrying call arguments is a set-returning function.
@@ -2758,36 +2762,49 @@ fn bind_from_item(
                     "table function SETTINGS are not supported yet",
                 ));
             }
-            // `WITH ORDINALITY` adds a trailing bigint column; unsupported for now
-            // — reject rather than silently drop it (which would return the wrong
-            // number of columns).
-            if *with_ordinality {
-                return Err(BindError::feature_not_supported(
-                    "WITH ORDINALITY is not supported yet",
-                ));
-            }
+            reject_with_ordinality(*with_ordinality)?;
             let fname = object_name_to_table_name(name)?;
             let arg_exprs = positional_arg_exprs(&fn_args.args)?;
-            let (func, args) =
-                bind_table_fn_call(&fname, &arg_exprs, &Scope::empty(catalog, params))?;
-            let qualifier = relation_qualifier(alias, &fname);
-            let mut columns: Vec<OutputColumn> = func
-                .columns()
-                .into_iter()
-                .map(|c| OutputColumn {
-                    name: c.name,
-                    ty: c.ty,
-                    collation: c.collation,
-                    strength: c.strength,
-                })
-                .collect();
-            apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
-            Ok(BoundFromItem {
-                qualifier,
-                columns,
-                input: JoinInput::TableFunction { func, args },
-            })
+            let (func, args) = bind_table_fn_args(&fname, &arg_exprs, catalog, params, siblings)?;
+            bound_table_fn_item(func, args, &fname, alias)
         }
+        // `unnest(array)` in FROM. Under the PostgreSQL dialect the parser gives
+        // this its own factor rather than a `Table` with call arguments, but it
+        // binds to the same `TableFn::Unnest` rowset.
+        ast::TableFactor::UNNEST {
+            alias,
+            array_exprs,
+            with_offset,
+            with_offset_alias: _,
+            with_ordinality,
+        } => {
+            reject_with_ordinality(*with_ordinality)?;
+            // `WITH OFFSET` is BigQuery syntax, not PostgreSQL's. The parser only
+            // fills `with_offset_alias` when the flag is set, so the flag alone
+            // decides.
+            if *with_offset {
+                return Err(BindError::feature_not_supported(
+                    "WITH OFFSET is not supported yet",
+                ));
+            }
+            // Multiple arrays unnest side by side (padded to the longest); only
+            // the single-array form is supported, matching `resolve_unnest`. The
+            // parser requires at least one argument, so this is the `> 1` case.
+            if array_exprs.len() > 1 {
+                return Err(BindError::feature_not_supported(
+                    "unnest with multiple arrays is not supported yet",
+                ));
+            }
+            let (func, args) =
+                bind_table_fn_args("unnest", array_exprs, catalog, params, siblings)?;
+            bound_table_fn_item(func, args, "unnest", alias)
+        }
+        // `LATERAL f(…)` gets its own factor. Say what is actually missing, the
+        // way the derived-table arm below does, instead of falling through to the
+        // catch-all's opaque "FROM item is not supported yet".
+        ast::TableFactor::Function { lateral: true, .. } => Err(BindError::feature_not_supported(
+            "LATERAL is not supported yet",
+        )),
         // A bare name may resolve to a CTE (which shadows a real table).
         ast::TableFactor::Table {
             name,
@@ -2985,7 +3002,16 @@ fn bind_from_clause(
             source: group_source,
             relations: group_relations,
             visible: group_visible,
-        } = bind_table_with_joins(engine, catalog, params, table, ctes, outer_scope, windows)?;
+        } = bind_table_with_joins(
+            engine,
+            catalog,
+            params,
+            table,
+            ctes,
+            outer_scope,
+            windows,
+            &relations,
+        )?;
         for (qualifier, _) in &group_relations {
             ensure_unique_qualifier(&mut seen, qualifier)?;
         }
@@ -3043,9 +3069,10 @@ fn bind_table_with_joins(
     ctes: &CteEnv,
     outer_scope: &[OuterLevel],
     windows: &NamedWindows,
+    siblings: &[(String, Vec<Column>)],
 ) -> Result<BoundFrom, BindError> {
     let mut bound =
-        bind_from_item(engine, catalog, params, &table.relation, ctes)?.into_bound_from();
+        bind_from_item(engine, catalog, params, &table.relation, ctes, siblings)?.into_bound_from();
     let mut seen: HashSet<String> = bound
         .relations
         .iter()
@@ -3058,6 +3085,15 @@ fn bind_table_with_joins(
     // group's combined row (base 0). Materialized only once a USING/NATURAL join
     // needs it; an all-`ON`/`CROSS` chain leaves it `None` and allocates nothing.
     let mut visible: Option<Vec<VisibleColumn>> = None;
+    // Everything already joined to this item's left — what an implicitly-lateral
+    // table-function argument could legally reference. Grown in place as the
+    // chain is bound, so an N-way join does not re-clone the accumulated columns
+    // N times.
+    let mut left_relations: Vec<(String, Vec<Column>)> = Vec::new();
+    if !table.joins.is_empty() {
+        left_relations.extend(siblings.iter().cloned());
+        left_relations.extend(bound.relations.iter().cloned());
+    }
 
     for join in &table.joins {
         if join.global {
@@ -3065,8 +3101,16 @@ fn bind_table_with_joins(
                 "GLOBAL JOIN is not supported yet",
             ));
         }
-        let right =
-            bind_from_item(engine, catalog, params, &join.relation, ctes)?.into_bound_from();
+        let right = bind_from_item(
+            engine,
+            catalog,
+            params,
+            &join.relation,
+            ctes,
+            &left_relations,
+        )?
+        .into_bound_from();
+        left_relations.extend(right.relations.iter().cloned());
         let right_qualifier = &right.relations[0].0;
         ensure_unique_qualifier(&mut seen, right_qualifier)?;
         let right_width = right.source.width();
@@ -3584,6 +3628,96 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
         // WITH: leave as-is; the executor's first-row check is still correct.
         other => other,
     }
+}
+
+/// `WITH ORDINALITY` adds a trailing bigint column; unsupported for now — reject
+/// rather than silently drop it (which would return the wrong number of columns,
+/// and would quietly defeat the single-column rename in [`bound_table_fn_item`]).
+/// Shared so every function-in-FROM spelling rejects it identically.
+fn reject_with_ordinality(with_ordinality: bool) -> Result<(), BindError> {
+    if with_ordinality {
+        return Err(BindError::feature_not_supported(
+            "WITH ORDINALITY is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+/// Bind a table function's arguments for a FROM item.
+///
+/// The arguments bind in an empty scope, which is exactly what a *lateral*
+/// reference is not: in PostgreSQL a function FROM item is implicitly LATERAL, so
+/// `FROM t, unnest(t.arr)` is legal there and resolves `t`. Left to fall through,
+/// that query would fail with a misleading `42P01 missing FROM-clause entry for
+/// table "t"` — blaming the user for a FROM clause that plainly lists `t`. So on
+/// failure, retry against the FROM items already bound to this side.
+///
+/// The retry asks whether the *arguments* resolve there, not whether the whole
+/// call does, so the two gaps stay distinct: `unnest(t.arr)` resolves completely
+/// and the only thing missing is LATERAL itself, while `unnest(t.name)` on a text
+/// column reports the `42883` PostgreSQL reports. A name that resolves nowhere
+/// keeps its original 42703/42P01, also matching PostgreSQL.
+fn bind_table_fn_args(
+    name: &str,
+    arg_exprs: &[ast::Expr],
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+    siblings: &[(String, Vec<Column>)],
+) -> Result<(TableFn, Vec<BoundExpr>), BindError> {
+    let error = match bind_table_fn_call(name, arg_exprs, &Scope::empty(catalog, params)) {
+        Ok(bound) => return Ok(bound),
+        Err(error) => error,
+    };
+    if !siblings.is_empty() {
+        let lateral = Scope::relations(siblings.to_vec(), catalog, params);
+        if arg_exprs.iter().all(|e| bind_expr(e, &lateral).is_ok()) {
+            return Err(match bind_table_fn_call(name, arg_exprs, &lateral) {
+                Ok(_) => BindError::feature_not_supported("LATERAL is not supported yet"),
+                Err(call_error) => call_error,
+            });
+        }
+    }
+    Err(error)
+}
+
+/// Assemble the FROM item for an already-resolved table function. `default_name`
+/// is the function's own name, used as the qualifier when there is no alias.
+///
+/// PG names a *scalar* function's single output column after a bare alias, so
+/// `generate_series(1, 10) i` exposes a column `i` and not `generate_series`. An
+/// explicit alias column list (`s(g)`) still wins over the bare alias, and a
+/// composite-returning function keeps its row type's column names.
+fn bound_table_fn_item(
+    func: TableFn,
+    args: Vec<BoundExpr>,
+    default_name: &str,
+    alias: &Option<ast::TableAlias>,
+) -> Result<BoundFromItem, BindError> {
+    let qualifier = relation_qualifier(alias, default_name);
+    let mut columns = func.columns();
+    if func.returns_scalar() && alias.is_some() {
+        // Every scalar function's rowset is exactly one column, so the rename
+        // below is total. `WITH ORDINALITY` would append a second column and
+        // silently turn the slice pattern into a no-op — assert rather than let
+        // that land as a wrong column name (it is rejected up front today, see
+        // `reject_with_ordinality`).
+        debug_assert_eq!(
+            columns.len(),
+            1,
+            "a scalar table function must expose exactly one column"
+        );
+        if let [col] = columns.as_mut_slice() {
+            // Same normalization `relation_qualifier` just applied, so the
+            // column and its qualifier can never disagree on spelling.
+            col.name.clone_from(&qualifier);
+        }
+    }
+    apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
+    Ok(BoundFromItem {
+        qualifier,
+        columns,
+        input: JoinInput::TableFunction { func, args },
+    })
 }
 
 /// The qualifier a FROM item's columns are addressed by: its alias, else its
@@ -8104,6 +8238,154 @@ mod tests {
     fn generate_series_wrong_arity_is_42883() {
         let e = bind_err("SELECT * FROM generate_series(1)");
         assert_eq!(e.code, "42883");
+    }
+
+    #[test]
+    fn table_fn_bare_alias_names_the_output_column() -> anyhow::Result<()> {
+        // PG names a scalar function's single output column after the alias, so
+        // `i` is both the relation qualifier and the column name. The `AS` is
+        // optional; both spellings must behave the same.
+        for sql in [
+            "SELECT i FROM generate_series(1, 5) AS i",
+            "SELECT i FROM generate_series(1, 5) i",
+        ] {
+            let LogicalPlan::TableFunction { columns, .. } = bind_one(sql)? else {
+                panic!("expected TableFunction for `{sql}`");
+            };
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns[0].name, "i");
+            assert_eq!(columns[0].ty, PgType::Int4);
+        }
+        // The qualified spelling still resolves through the same alias.
+        bound("SELECT i.i FROM generate_series(1, 5) AS i");
+
+        Ok(())
+    }
+
+    #[test]
+    fn table_fn_alias_column_list_wins_over_bare_alias() -> anyhow::Result<()> {
+        let LogicalPlan::TableFunction { columns, .. } =
+            bind_one("SELECT g FROM generate_series(1, 3) AS s(g)")?
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(columns[0].name, "g");
+        // A list longer than the rowset is still 42P10.
+        let e = bind_err("SELECT * FROM generate_series(1, 3) AS s(a, b)");
+        assert_eq!(e.code, "42P10");
+
+        Ok(())
+    }
+
+    #[test]
+    fn composite_table_fn_bare_alias_does_not_rename() -> anyhow::Result<()> {
+        // `pg_input_error_info` returns a record: the alias names the relation
+        // only, and the row type's column names survive.
+        let LogicalPlan::TableFunction { columns, .. } =
+            bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4') AS e")?
+        else {
+            panic!("expected TableFunction");
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn base_table_bare_alias_does_not_rename_columns() -> anyhow::Result<()> {
+        // The rename is specific to scalar function FROM items — a bare alias on
+        // a real relation names the relation and nothing else.
+        let LogicalPlan::Query { columns, .. } = bind_one("SELECT * FROM t AS x")? else {
+            panic!("expected Query");
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "big", "name", "flag"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn unnest_in_from_binds_element_column() -> anyhow::Result<()> {
+        let LogicalPlan::TableFunction { func, columns, .. } =
+            bind_one("SELECT * FROM unnest(ARRAY[1, 2, 3])")?
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(func, crate::TableFn::Unnest(PgType::Int4));
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "unnest");
+        assert_eq!(columns[0].ty, PgType::Int4);
+
+        // And the alias renames it, like any other scalar SRF.
+        let LogicalPlan::TableFunction { columns, .. } =
+            bind_one("SELECT u FROM unnest(ARRAY['a', 'b']) AS u")?
+        else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(columns[0].name, "u");
+
+        Ok(())
+    }
+
+    #[test]
+    fn lateral_table_fn_argument_reports_lateral_not_a_missing_column() {
+        // A function FROM item is implicitly LATERAL in PG, so all of these are
+        // legal there. Bound in an empty scope they would fail with a misleading
+        // 42P01/42703 blaming a FROM clause that plainly lists `t`; say what is
+        // actually missing instead, exactly as the derived-table arm does.
+        for sql in [
+            "SELECT * FROM t, generate_series(1, t.id) g",
+            "SELECT * FROM t, generate_series(1, id) g",
+            "SELECT * FROM t CROSS JOIN generate_series(1, t.id) g",
+            "SELECT * FROM t JOIN generate_series(1, t.id) g ON true",
+            "SELECT * FROM t CROSS JOIN LATERAL unnest(t.name) u",
+        ] {
+            let e = bind_err(sql);
+            assert_eq!(e.code, "0A000", "for `{sql}`");
+            assert_eq!(e.message, "LATERAL is not supported yet", "for `{sql}`");
+        }
+    }
+
+    #[test]
+    fn lateral_argument_that_resolves_but_has_no_overload_reports_the_overload() {
+        // `t.name` is text, so even with LATERAL there is no `unnest(text)`. The
+        // argument resolves against the left side, so the misleading 42P01 is
+        // gone, but the honest answer is PG's 42883 — not a LATERAL gap.
+        let e = bind_err("SELECT * FROM t, unnest(t.name) u");
+        assert_eq!(e.code, "42883");
+        assert_eq!(e.message, "function unnest(text) does not exist");
+    }
+
+    #[test]
+    fn table_fn_argument_that_resolves_nowhere_keeps_its_own_error() {
+        // The LATERAL rewrite above must not swallow a genuinely unknown column:
+        // PG reports `column "nosuchcol" does not exist` for both of these.
+        for sql in [
+            "SELECT * FROM generate_series(1, nosuchcol)",
+            "SELECT * FROM t, generate_series(1, nosuchcol) g",
+        ] {
+            let e = bind_err(sql);
+            assert_eq!(e.code, "42703", "for `{sql}`");
+            assert_eq!(
+                e.message, "column \"nosuchcol\" does not exist",
+                "for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn unnest_in_from_rejects_unsupported_forms() {
+        assert_eq!(
+            bind_err("SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY").message,
+            "WITH ORDINALITY is not supported yet"
+        );
+        assert_eq!(
+            bind_err("SELECT * FROM unnest(ARRAY[1, 2], ARRAY[3, 4])").message,
+            "unnest with multiple arrays is not supported yet"
+        );
+        // A non-array argument is still resolved by `resolve_unnest`.
+        assert_eq!(bind_err("SELECT * FROM unnest(1)").code, "42883");
     }
 
     #[test]
