@@ -1162,9 +1162,14 @@ fn push_root_property(lines: &mut Vec<String>, property: String) {
 fn explain_expr(expr: &BoundExpr, names: &[Option<&str>]) -> String {
     match expr {
         // Divergence: rendered in UTC at the default `extra_float_digits`,
-        // because `EXPLAIN` output is built without a session context. A
-        // `timestamptz` constant in a condition therefore prints its UTC wall
-        // clock where PG would print the session zone's.
+        // because `EXPLAIN` output is built without a session context, so a
+        // `float8` constant ignores the session's precision setting.
+        //
+        // A `timestamptz` literal is further off: it is still an unevaluated
+        // `Coerce` of its source text at this point (see the binder's
+        // `resolve_unknown`), and the `Coerce` arm below recurses to the inner
+        // `Const`, so `EXPLAIN … WHERE ts > '2024-01-01'` prints the bare
+        // `2024-01-01` rather than a rendered timestamp.
         BoundExpr::Const { value, .. } => value
             .encode_text_utc()
             .unwrap_or_else(|| "NULL".to_string()),

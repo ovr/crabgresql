@@ -621,7 +621,7 @@ fn render_dt(code: Code, f: &DtFields, fm: bool) -> (String, i64) {
         }
         // A plain `timestamp` has no zone but still renders `OF` as `+00`.
         Code::TzOffset => (
-            crate::tz::format_offset(f.zone.as_ref().map_or(0, |z| z.offset_secs)),
+            crate::tz::format_offset_hours_minutes(f.zone.as_ref().map_or(0, |z| z.offset_secs)),
             0,
         ),
     }
@@ -1569,48 +1569,65 @@ mod tests {
 
     /// `TZ` and `OF` report the session zone, not a hardcoded UTC.
     /// Pinned against PostgreSQL 18.4.
+    /// `FormatError` is a plain message struct, not a `std::error::Error`, so
+    /// `?` needs an explicit mapper.
+    fn fe(e: FormatError) -> anyhow::Error {
+        anyhow::anyhow!("{}: {}", e.sqlstate, e.message)
+    }
+
     #[test]
-    fn to_char_renders_the_session_zone() {
+    fn to_char_renders_the_session_zone() -> anyhow::Result<()> {
         let z = |n: &str| SessionZone::resolve(n).expect("real zone");
         let ny = z("America/New_York");
-        let v = crate::timestamptz::parse("2024-01-15 12:00:00-05", &ny).unwrap();
+        let v = crate::timestamptz::parse("2024-01-15 12:00:00-05", &ny).map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
-            to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &ny).unwrap(),
+            to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &ny).map_err(fe)?,
             Some("2024-01-15 12:00:00 EST -05".to_string())
         );
 
         // A sub-hour zone widens `OF`, and the abbreviation comes from tzdb.
         let kolkata = z("Asia/Kolkata");
-        let v = crate::timestamptz::parse("2024-01-15 12:00:00+05:30", &kolkata).unwrap();
+        let v = crate::timestamptz::parse("2024-01-15 12:00:00+05:30", &kolkata).map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
-            to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &kolkata).unwrap(),
+            to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &kolkata).map_err(fe)?,
             Some("2024-01-15 12:00:00 IST +05:30".to_string())
         );
 
-        // A plain `timestamp` still has no `TZ` and a `+00` `OF`.
-        let ts = crate::timestamp::parse("2024-01-15 12:00:00").unwrap();
+        // `OF` never widens to seconds, even where `timestamptz_out` does:
+        // pre-1883 New York ran at -04:56:02, which PG's `OF` prints as -04:56.
+        let lmt = crate::timestamptz::parse("1875-06-01 12:00:00", &ny).map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
-            to_char_timestamp(ts, "HH24:MI TZ OF").unwrap(),
+            to_char_timestamptz(lmt, "OF", &ny).map_err(fe)?,
+            Some("-04:56".to_string())
+        );
+        assert_eq!(
+            crate::timestamptz::format(lmt, &ny),
+            "1875-06-01 12:00:00-04:56:02"
+        );
+
+        // A plain `timestamp` still has no `TZ` and a `+00` `OF`.
+        let ts = crate::timestamp::parse("2024-01-15 12:00:00")
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(
+            to_char_timestamp(ts, "HH24:MI TZ OF").map_err(fe)?,
             Some("12:00  +00".to_string())
         );
+        Ok(())
     }
 
     /// `to_timestamp` reads a zone-less input in the session zone; an input
     /// carrying its own `OF` is unaffected.
     #[test]
-    fn from_char_defaults_to_the_session_zone() {
+    fn from_char_defaults_to_the_session_zone() -> anyhow::Result<()> {
         let ny = SessionZone::resolve("America/New_York").expect("real zone");
-        let v = from_char_timestamptz("2024-06-01 12:00:00", "YYYY-MM-DD HH24:MI:SS", &ny).unwrap();
-        assert_eq!(
-            crate::timestamptz::format(v, &ny),
-            "2024-06-01 12:00:00-04"
-        );
+        let v = from_char_timestamptz("2024-06-01 12:00:00", "YYYY-MM-DD HH24:MI:SS", &ny).map_err(fe)?;
+        assert_eq!(crate::timestamptz::format(v, &ny), "2024-06-01 12:00:00-04");
         let explicit =
-            from_char_timestamptz("2024-06-01 12:00:00 +00", "YYYY-MM-DD HH24:MI:SS OF", &ny)
-                .unwrap();
+            from_char_timestamptz("2024-06-01 12:00:00 +00", "YYYY-MM-DD HH24:MI:SS OF", &ny).map_err(fe)?;
         assert_eq!(
             crate::timestamptz::format(explicit, &ny),
             "2024-06-01 08:00:00-04"
         );
+        Ok(())
     }
 }

@@ -1424,28 +1424,30 @@ mod tests {
         )
     }
 
-    fn text_to(s: &str, ty: PgType, fmt: &FmtCtx) -> String {
-        cast_value(Value::Text(s.to_string()), ty, fmt)
-            .expect("cast succeeds")
+    fn text_to(s: &str, ty: PgType, fmt: &FmtCtx) -> anyhow::Result<String> {
+        Ok(cast_value(Value::Text(s.to_string()), ty, fmt)?
             .encode_text_with(fmt)
-            .expect("non-null")
+            .ok_or_else(|| anyhow::anyhow!("cast produced NULL"))?)
+    }
+
+    /// Cast `v` to `ty` and render it, for the zone-aware cast assertions below.
+    fn cast_to(v: Value, ty: PgType, fmt: &FmtCtx) -> anyhow::Result<String> {
+        Ok(cast_value(v, ty, fmt)?
+            .encode_text_with(fmt)
+            .ok_or_else(|| anyhow::anyhow!("cast produced NULL"))?)
     }
 
     #[test]
-    fn timestamp_and_timestamptz_convert_through_the_session_zone() {
+    fn timestamp_and_timestamptz_convert_through_the_session_zone() -> anyhow::Result<()> {
         let ny = ny();
         // A zone-less wall clock is read in the session zone, not as UTC.
         let ts = cast_value(
             Value::Text("2024-06-01 12:00:00".into()),
             PgType::Timestamp,
             &ny,
-        )
-        .unwrap();
+        )?;
         assert_eq!(
-            cast_value(ts.clone(), PgType::TimestampTz, &ny)
-                .unwrap()
-                .encode_text_with(&ny)
-                .unwrap(),
+            cast_to(ts.clone(), PgType::TimestampTz, &ny)?,
             "2024-06-01 12:00:00-04"
         );
 
@@ -1454,36 +1456,29 @@ mod tests {
             Value::Text("2024-06-01 12:00:00+00".into()),
             PgType::TimestampTz,
             &ny,
-        )
-        .unwrap();
+        )?;
         assert_eq!(
-            cast_value(tstz.clone(), PgType::Timestamp, &ny)
-                .unwrap()
-                .encode_text_with(&ny)
-                .unwrap(),
+            cast_to(tstz, PgType::Timestamp, &ny)?,
             "2024-06-01 08:00:00"
         );
 
         // Under UTC both directions stay the identity they always were.
         let utc = FmtCtx::utc_default();
-        assert_eq!(cast_value(ts.clone(), PgType::TimestampTz, &utc).unwrap().encode_text_with(&utc).unwrap(),
-                   "2024-06-01 12:00:00+00");
+        assert_eq!(
+            cast_to(ts, PgType::TimestampTz, &utc)?,
+            "2024-06-01 12:00:00+00"
+        );
+        Ok(())
     }
 
     #[test]
-    fn date_and_timestamptz_convert_through_the_session_zone() {
+    fn date_and_timestamptz_convert_through_the_session_zone() -> anyhow::Result<()> {
         let ny = ny();
         // A date widens to midnight *local*, so its UTC instant is 04:00.
+        assert_eq!(text_to("2024-06-01", PgType::Date, &ny)?, "2024-06-01");
+        let d = cast_value(Value::Text("2024-06-01".into()), PgType::Date, &ny)?;
         assert_eq!(
-            text_to("2024-06-01", PgType::Date, &ny),
-            "2024-06-01"
-        );
-        let d = cast_value(Value::Text("2024-06-01".into()), PgType::Date, &ny).unwrap();
-        assert_eq!(
-            cast_value(d, PgType::TimestampTz, &ny)
-                .unwrap()
-                .encode_text_with(&ny)
-                .unwrap(),
+            cast_to(d, PgType::TimestampTz, &ny)?,
             "2024-06-01 00:00:00-04"
         );
 
@@ -1493,14 +1488,8 @@ mod tests {
             Value::Text("2024-06-01 02:00:00+00".into()),
             PgType::TimestampTz,
             &ny,
-        )
-        .unwrap();
-        assert_eq!(
-            cast_value(v, PgType::Date, &ny)
-                .unwrap()
-                .encode_text_with(&ny)
-                .unwrap(),
-            "2024-05-31"
-        );
+        )?;
+        assert_eq!(cast_to(v, PgType::Date, &ny)?, "2024-05-31");
+        Ok(())
     }
 }

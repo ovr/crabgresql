@@ -18,6 +18,10 @@
 //!   `search_path`, `client_min_messages` — and erroring would break them.
 //!   `SHOW` does raise `42704`, since there is no value to invent.
 //! * `SHOW ALL` lists only the parameters below, not PG's several hundred.
+//!
+//! A recognized name we do not model is [`GucKind::AcceptedAndIgnored`] for the
+//! same reason: `SET client_encoding = 'UTF8'` opens every `pg_dump` file, and
+//! rejecting it would break restores that worked before this table existed.
 
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::tz::SessionZone;
@@ -39,6 +43,41 @@ pub enum GucValue {
     OffsetSecondsEast(i32),
 }
 
+/// A parameter's previous value, captured verbatim from the session.
+///
+/// Typed rather than rendered: `SHOW TimeZone` on a zone built by
+/// `SET TIME ZONE 7` prints the POSIX spec `<+07>-07`, which is a *display*
+/// form that no setter can parse back. Round-tripping through it lost the zone
+/// on rollback, silently. Keeping the value makes the restore infallible.
+#[derive(Clone)]
+pub enum SavedValue {
+    TimeZone(std::sync::Arc<SessionZone>),
+    ExtraFloatDigits(i32),
+    DefaultIsolation(IsolationLevel),
+    DefaultReadOnly(bool),
+}
+
+/// How a parameter responds to `SET` and `RESET`.
+pub enum GucKind {
+    /// Backed by session state: `set` applies a new value, and the
+    /// `capture`/`restore` pair snapshots and reinstates the old one for the
+    /// transactional save stack.
+    Settable {
+        set: fn(&mut Session, GucValue) -> Result<(), PgError>,
+        capture: fn(&Session) -> SavedValue,
+        restore: fn(&mut Session, SavedValue),
+    },
+    /// Accepted and ignored. These are `PGC_USERSET` in PostgreSQL and appear in
+    /// every `pg_dump` preamble (`SET client_encoding = 'UTF8';`), but we model
+    /// only the one value we implement, so assigning them is a no-op rather than
+    /// an error — matching the blanket acceptance this table replaced.
+    /// `SHOW` keeps reporting the implemented value.
+    AcceptedAndIgnored,
+    /// Truly read-only (PG's `PGC_INTERNAL`): `SET` and `RESET <name>` both
+    /// raise `55P02`.
+    ReadOnly,
+}
+
 /// One configuration parameter.
 pub struct GucDef {
     /// Lower-cased lookup key. GUC names are case-insensitive in PG.
@@ -50,17 +89,55 @@ pub struct GucDef {
     /// PG's `GUC_REPORT`: a change is echoed to the client as `ParameterStatus`.
     pub report: bool,
     pub show: fn(&Session) -> String,
-    /// `None` for a read-only parameter, which `SET` rejects with `55P02`.
-    pub set: Option<fn(&mut Session, GucValue) -> Result<(), PgError>>,
+    pub kind: GucKind,
 }
 
 impl GucDef {
-    /// `RESET` is `SET … = DEFAULT`; a read-only parameter has nothing to do.
-    pub fn reset(&self, session: &mut Session) -> Result<(), PgError> {
-        match self.set {
-            Some(set) => set(session, GucValue::Default),
-            None => Ok(()),
+    /// Apply a `SET`.
+    pub fn set(&self, session: &mut Session, value: GucValue) -> Result<(), PgError> {
+        match self.kind {
+            GucKind::Settable { set, .. } => set(session, value),
+            GucKind::AcceptedAndIgnored => Ok(()),
+            GucKind::ReadOnly => Err(cannot_be_changed(self.name)),
         }
+    }
+
+    /// Snapshot the current value, for the transactional save stack.
+    pub fn capture(&self, session: &Session) -> Option<SavedValue> {
+        match self.kind {
+            GucKind::Settable { capture, .. } => Some(capture(session)),
+            _ => None,
+        }
+    }
+
+    /// Reinstate a value from [`GucDef::capture`]. Infallible by construction.
+    pub fn restore(&self, session: &mut Session, value: SavedValue) {
+        if let GucKind::Settable { restore, .. } = self.kind {
+            restore(session, value);
+        }
+    }
+
+    /// Apply a `RESET <name>`, which is `SET … = DEFAULT`. A read-only parameter
+    /// raises here, as in PG — unlike `RESET ALL`, which skips it (see
+    /// [`GucDef::reset_in_all`]).
+    pub fn reset(&self, session: &mut Session) -> Result<(), PgError> {
+        self.set(session, GucValue::Default)
+    }
+
+    /// `RESET ALL` restores every parameter it can and silently skips the rest,
+    /// where `RESET <name>` on the same parameter would error.
+    pub fn reset_in_all(&self, session: &mut Session) -> Result<(), PgError> {
+        match self.kind {
+            GucKind::ReadOnly => Ok(()),
+            _ => self.reset(session),
+        }
+    }
+
+    /// Whether this parameter's value can ever change, and so is worth
+    /// snapshotting for the transactional save stack and the ParameterStatus
+    /// diff.
+    pub fn is_mutable(&self) -> bool {
+        matches!(self.kind, GucKind::Settable { .. })
     }
 }
 
@@ -71,7 +148,11 @@ pub static GUCS: &[GucDef] = &[
         description: "Sets the time zone for displaying and interpreting time stamps.",
         report: true,
         show: |s| s.timezone.name().to_string(),
-        set: Some(set_timezone),
+        kind: GucKind::Settable {
+            set: set_timezone,
+            capture: |s| SavedValue::TimeZone(std::sync::Arc::clone(&s.timezone)),
+            restore: |s, v| { if let SavedValue::TimeZone(z) = v { s.timezone = z; } },
+        },
     },
     GucDef {
         key: "extra_float_digits",
@@ -79,7 +160,11 @@ pub static GUCS: &[GucDef] = &[
         description: "Sets the number of digits displayed for floating-point values.",
         report: false,
         show: |s| s.extra_float_digits.to_string(),
-        set: Some(set_extra_float_digits),
+        kind: GucKind::Settable {
+            set: set_extra_float_digits,
+            capture: |s| SavedValue::ExtraFloatDigits(s.extra_float_digits),
+            restore: |s, v| { if let SavedValue::ExtraFloatDigits(n) = v { s.extra_float_digits = n; } },
+        },
     },
     GucDef {
         key: "default_transaction_isolation",
@@ -87,7 +172,11 @@ pub static GUCS: &[GucDef] = &[
         description: "Sets the transaction isolation level of each new transaction.",
         report: false,
         show: |s| isolation_name(s.default_iso).to_string(),
-        set: Some(set_default_isolation),
+        kind: GucKind::Settable {
+            set: set_default_isolation,
+            capture: |s| SavedValue::DefaultIsolation(s.default_iso),
+            restore: |s, v| { if let SavedValue::DefaultIsolation(l) = v { s.default_iso = l; } },
+        },
     },
     GucDef {
         key: "default_transaction_read_only",
@@ -95,7 +184,11 @@ pub static GUCS: &[GucDef] = &[
         description: "Sets the default read-only status of new transactions.",
         report: false,
         show: |s| on_off(s.default_read_only),
-        set: Some(set_default_read_only),
+        kind: GucKind::Settable {
+            set: set_default_read_only,
+            capture: |s| SavedValue::DefaultReadOnly(s.default_read_only),
+            restore: |s, v| { if let SavedValue::DefaultReadOnly(b) = v { s.default_read_only = b; } },
+        },
     },
     // --- reported constants -------------------------------------------------
     // Read-only here, and all `GUC_REPORT` in PG: drivers parse `server_version`
@@ -107,7 +200,7 @@ pub static GUCS: &[GucDef] = &[
         description: "Shows the server version.",
         report: true,
         show: |_| "19.0 (CrabgreSQL 0.1.0)".to_string(),
-        set: None,
+        kind: GucKind::ReadOnly,
     },
     GucDef {
         key: "server_encoding",
@@ -115,7 +208,7 @@ pub static GUCS: &[GucDef] = &[
         description: "Sets the server (database) character set encoding.",
         report: true,
         show: |_| "UTF8".to_string(),
-        set: None,
+        kind: GucKind::ReadOnly,
     },
     GucDef {
         key: "client_encoding",
@@ -123,7 +216,7 @@ pub static GUCS: &[GucDef] = &[
         description: "Sets the client's character set encoding.",
         report: true,
         show: |_| "UTF8".to_string(),
-        set: None,
+        kind: GucKind::AcceptedAndIgnored,
     },
     GucDef {
         key: "datestyle",
@@ -131,7 +224,7 @@ pub static GUCS: &[GucDef] = &[
         description: "Sets the display format for date and time values.",
         report: true,
         show: |_| "ISO, MDY".to_string(),
-        set: None,
+        kind: GucKind::AcceptedAndIgnored,
     },
     GucDef {
         key: "integer_datetimes",
@@ -139,7 +232,7 @@ pub static GUCS: &[GucDef] = &[
         description: "Shows whether datetimes are integer based.",
         report: true,
         show: |_| "on".to_string(),
-        set: None,
+        kind: GucKind::ReadOnly,
     },
     GucDef {
         key: "standard_conforming_strings",
@@ -147,7 +240,7 @@ pub static GUCS: &[GucDef] = &[
         description: "Causes '...' strings to treat backslashes literally.",
         report: true,
         show: |_| "on".to_string(),
-        set: None,
+        kind: GucKind::AcceptedAndIgnored,
     },
     GucDef {
         key: "is_superuser",
@@ -155,7 +248,7 @@ pub static GUCS: &[GucDef] = &[
         description: "Shows whether the current user is a superuser.",
         report: true,
         show: |_| "on".to_string(),
-        set: None,
+        kind: GucKind::ReadOnly,
     },
 ];
 
@@ -295,9 +388,8 @@ fn set_default_read_only(session: &mut Session, value: GucValue) -> Result<(), P
         GucValue::OffsetSecondsEast(_) => {
             return Err(requires_boolean("default_transaction_read_only"));
         }
-        GucValue::Str(s) => {
-            parse_bool(&s).ok_or_else(|| requires_boolean("default_transaction_read_only"))?
-        }
+        GucValue::Str(s) => crabgresql_types::parse_bool(&s)
+            .ok_or_else(|| requires_boolean("default_transaction_read_only"))?,
     };
     Ok(())
 }
@@ -309,11 +401,3 @@ fn requires_boolean(param: &str) -> PgError {
     )
 }
 
-/// PG's boolean GUC spellings.
-fn parse_bool(s: &str) -> Option<bool> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "on" | "true" | "t" | "yes" | "y" | "1" => Some(true),
-        "off" | "false" | "f" | "no" | "n" | "0" => Some(false),
-        _ => None,
-    }
-}

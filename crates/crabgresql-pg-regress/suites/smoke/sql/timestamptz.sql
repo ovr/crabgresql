@@ -162,3 +162,16 @@ SELECT timestamptz '2024-06-01 12:00:00+00' AS east_seven;
 SET TimeZone = 'UTC';
 SHOW TimeZone;
 SELECT timestamptz '2024-06-01 12:00:00' AS back_to_utc;
+-- date_trunc: `day` and coarser re-resolve the offset (landing on local
+-- midnight across DST), while `hour` and finer keep the input's — which matters
+-- inside the fall-back fold, where the truncated clock is ambiguous.
+SET TimeZone = 'America/New_York';
+SELECT date_trunc('hour', timestamptz '2024-11-03 01:30:00-04') AS fold_hour;
+SELECT date_trunc('minute', timestamptz '2024-11-03 01:30:00-04') AS fold_minute;
+SELECT date_trunc('day', timestamptz '2024-11-03 01:30:00-04') AS fold_day;
+SELECT date_trunc('day', timestamptz '2024-03-10 15:00:00-04') AS spring_forward_day;
+-- to_char's OF never widens to seconds, where timestamptz output does
+SELECT to_char(timestamptz '1875-06-01 12:00:00', 'OF') AS of_lmt;
+SELECT timestamptz '1875-06-01 12:00:00' AS out_lmt;
+SET TimeZone = 'UTC';
+

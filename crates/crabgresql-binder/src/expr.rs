@@ -7466,6 +7466,15 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
 ///   precision and silently ignored the session's setting.)
 /// * `TimeZone`, for every `timestamptz` conversion — the zone is what relates
 ///   an instant to a wall clock, in both directions.
+///
+/// **Known divergence.** PostgreSQL folds a `timestamptz` literal during parse
+/// analysis using the parsing session's zone, so the instant is frozen; we defer
+/// it and recompute per execution. That is visible for a prepared statement
+/// re-executed after a `SET TimeZone` (pinned by
+/// `prepared_statement_diverges_from_pg_on_a_later_set_timezone`), and it means
+/// a stored `timestamptz` column DEFAULT resolves in the *inserting* session's
+/// zone rather than the one that defined it. Closing it means giving the binder
+/// the session's `FmtCtx` so this function can fold instead of defer.
 fn fold_needs_session(from: Option<PgType>, to: PgType) -> bool {
     if matches!(
         to,

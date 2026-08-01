@@ -331,13 +331,13 @@ impl ActiveTxn {
 }
 
 /// A configuration parameter's value from before the current transaction block
-/// changed it. `value` is the rendered form, which every setter accepts back —
-/// cheaper than a per-parameter value enum, and it cannot drift from `show`.
+/// changed it, captured verbatim (see [`guc::SavedValue`] for why it is not the
+/// rendered form).
 struct SavedGuc {
     def: &'static guc::GucDef,
     /// Set by `SET LOCAL`, which reverts on commit as well as rollback.
     local: bool,
-    value: String,
+    value: guc::SavedValue,
 }
 
 pub struct Session {
@@ -682,11 +682,11 @@ impl Session {
             saved.local |= local;
             return;
         }
-        self.saved_gucs.push(SavedGuc {
-            def,
-            local,
-            value: (def.show)(self),
-        });
+        // Nothing to restore for a parameter whose value cannot change.
+        let Some(value) = def.capture(self) else {
+            return;
+        };
+        self.saved_gucs.push(SavedGuc { def, local, value });
     }
 
     /// Undo the block's parameter changes as it ends: everything on `ROLLBACK`,
@@ -696,12 +696,7 @@ impl Session {
             if committed && !saved.local {
                 continue;
             }
-            if let Some(set) = saved.def.set {
-                // Restoring a value this session itself produced cannot fail;
-                // if it somehow does, keeping the current value is strictly
-                // better than aborting the COMMIT that is already done.
-                let _ = set(self, guc::GucValue::Str(saved.value));
-            }
+            saved.def.restore(self, saved.value);
         }
     }
 

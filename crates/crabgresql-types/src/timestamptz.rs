@@ -300,25 +300,52 @@ fn local_for_field(unit: &str, micros: i64, session: &SessionZone) -> i64 {
 /// `date_trunc(text, timestamptz) -> timestamptz`: truncate the **local** wall
 /// clock, then convert back.
 ///
-/// The offset is deliberately re-resolved from the *truncated* wall clock
-/// rather than reused from the input. That is what makes `date_trunc('day', …)`
-/// land on real local midnight on a DST-transition day: on 2024-03-10 in
-/// `America/New_York` the input is at `-04` but midnight that morning is at
-/// `-05`, and PG returns `2024-03-10 00:00:00-05`.
+/// Which offset converts back depends on the unit, matching PG's `redotz` flag:
+///
+/// * `day` and coarser **re-resolve** the offset from the truncated wall clock,
+///   which is what makes `date_trunc('day', …)` land on real local midnight on
+///   a DST-transition day — on 2024-03-10 in `America/New_York` the input is at
+///   `-04` but midnight that morning is at `-05`, and PG returns
+///   `2024-03-10 00:00:00-05`.
+/// * `hour` and finer **reuse the input's** offset. Re-resolving them would be
+///   wrong inside a fall-back fold, where the truncated wall clock is ambiguous:
+///   `date_trunc('hour', '2024-11-03 01:30:00-04')` must stay at `-04`, and
+///   re-resolving picks the after-transition `-05`, moving the result an hour
+///   *later* than the value it truncated.
 pub fn date_trunc(
     unit: &str,
     micros: i64,
     session: &SessionZone,
 ) -> Result<i64, TimestampError> {
+    // The unit is validated even on the infinities, where there is no wall clock
+    // to truncate — `timestamp::date_trunc` checks it before its own finiteness
+    // short-circuit, and the two types must agree.
+    let offset = session.offset_at(micros);
+    let truncated = timestamp::date_trunc(unit, to_wall_clock(micros, session))
+        .map_err(relabel_units)?;
     if !is_finite(micros) {
         return Ok(micros);
     }
-    let truncated = timestamp::date_trunc(unit, to_wall_clock(micros, session)).map_err(relabel_units)?;
-    let utc = truncated - session.offset_for_wall(tmlite(truncated)) as i64 * USECS_PER_SEC;
+    let offset = if redo_zone(unit) {
+        session.offset_for_wall(tmlite(truncated))
+    } else {
+        offset
+    };
+    let utc = truncated - offset as i64 * USECS_PER_SEC;
     if !in_range(utc) {
         return Err(out_of_range_bare());
     }
     Ok(utc)
+}
+
+/// Whether truncating to `unit` re-resolves the zone offset from the truncated
+/// wall clock (PG's `redotz`): true for `day` and coarser, false for the
+/// sub-day units, which keep the input's offset.
+fn redo_zone(unit: &str) -> bool {
+    !matches!(
+        unit.trim().to_ascii_lowercase().as_str(),
+        "microseconds" | "milliseconds" | "second" | "minute" | "hour"
+    )
 }
 
 /// `isfinite(timestamptz) -> bool`.
@@ -810,6 +837,45 @@ mod tests {
             "2024-03-01 00:00:00-05"
         );
         Ok(())
+    }
+
+    /// The sub-day units keep the *input's* offset. Re-resolving them from the
+    /// truncated wall clock is wrong inside a fall-back fold, where that clock
+    /// is ambiguous — it would move the result an hour later than the value it
+    /// truncated. Pinned against PG 18.4.
+    #[test]
+    fn date_trunc_sub_day_units_keep_the_input_offset() -> anyhow::Result<()> {
+        let ny = zone("America/New_York");
+        // 01:30-04 is the *first* pass through 01:30 on fall-back day.
+        let v = parse("2024-11-03 01:30:00-04", &ny)?;
+        assert_eq!(
+            format(date_trunc("hour", v, &ny)?, &ny),
+            "2024-11-03 01:00:00-04"
+        );
+        assert_eq!(
+            format(date_trunc("minute", v, &ny)?, &ny),
+            "2024-11-03 01:30:00-04"
+        );
+        // `day` and coarser still re-resolve, which is what lands them on local
+        // midnight.
+        assert_eq!(
+            format(date_trunc("day", v, &ny)?, &ny),
+            "2024-11-03 00:00:00-04"
+        );
+        Ok(())
+    }
+
+    /// The unit is validated even on the infinities, where there is no wall
+    /// clock — `timestamp` does the same, and the two types must agree.
+    #[test]
+    fn date_trunc_validates_the_unit_on_infinity() {
+        let ny = zone("America/New_York");
+        let e = date_trunc("bogus", POS_INFINITY, &ny).expect_err("unknown unit");
+        assert_eq!(e.sqlstate, INVALID_PARAMETER_VALUE);
+        assert_eq!(
+            date_trunc("day", POS_INFINITY, &ny).expect("infinity truncates"),
+            POS_INFINITY
+        );
     }
 
     #[test]

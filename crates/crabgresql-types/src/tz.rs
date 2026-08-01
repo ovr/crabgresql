@@ -22,9 +22,16 @@ use jiff::tz::{AmbiguousOffset, TimeZone};
 /// (2000-01-01): 10957 days.
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 
-/// PG's timezone-displacement limit: magnitudes of `±15:59:59` are accepted,
-/// `±16:00:00` and beyond are "out of range" (matches `make_timestamptz(..,'+16')`).
+/// PG's timezone-displacement limit for a zone token inside a value —
+/// a `timestamptz` literal, `AT TIME ZONE`, `make_timestamptz`: magnitudes of
+/// `±15:59:59` are accepted, `±16:00:00` and beyond are "out of range".
 const MAX_TZ_DISPLACEMENT_SECS: i32 = 16 * 3600 - 1;
+
+/// The limit on the numeric `TimeZone` **GUC** forms (`SET TIME ZONE 7`,
+/// `SET TIME ZONE INTERVAL '…'`), which is far wider than the in-value limit
+/// above: PG accepts up to `±167:59:59` (one hour short of seven days) and
+/// rejects `168` with "UTC timezone offset is out of range."
+const MAX_GUC_OFFSET_SECS: i32 = 168 * 3600 - 1;
 
 /// A plain broken-down civil time crossing the module boundary — no `jiff`
 /// types leak out. Fields are already range-validated by the caller.
@@ -151,7 +158,7 @@ impl SessionZone {
     /// `SET TIME ZONE 7` shows as `<+07>-07`. Note these forms are *east*-signed,
     /// unlike the string form [`SessionZone::resolve`] handles.
     pub fn from_offset_east(secs: i32) -> Result<SessionZone, ZoneError> {
-        if secs.abs() > MAX_TZ_DISPLACEMENT_SECS {
+        if secs.abs() > MAX_GUC_OFFSET_SECS {
             return Err(ZoneError::DisplacementOutOfRange(format_offset(secs)));
         }
         let abbrev = format_offset(secs);
@@ -195,10 +202,9 @@ impl SessionZone {
     }
 }
 
-/// Render a UTC offset the way `timestamptz_out` and `to_char`'s `OF` do:
-/// `±HH`, widening to `±HH:MM` when the minutes are non-zero and to
-/// `±HH:MM:SS` when the seconds are (the LMT-era zones, e.g. `America/New_York`
-/// before 1883 at `-04:56:02`).
+/// Render a UTC offset the way `timestamptz_out` does: `±HH`, widening to
+/// `±HH:MM` when the minutes are non-zero and to `±HH:MM:SS` when the seconds
+/// are (the LMT-era zones, e.g. `America/New_York` before 1883 at `-04:56:02`).
 pub fn format_offset(secs: i32) -> String {
     let sign = if secs < 0 { '-' } else { '+' };
     let abs = secs.unsigned_abs();
@@ -206,6 +212,21 @@ pub fn format_offset(secs: i32) -> String {
     if s != 0 {
         format!("{sign}{h:02}:{m:02}:{s:02}")
     } else if m != 0 {
+        format!("{sign}{h:02}:{m:02}")
+    } else {
+        format!("{sign}{h:02}")
+    }
+}
+
+/// Render a UTC offset the way `to_char`'s `OF` code does, which — unlike
+/// [`format_offset`] — never emits a seconds field: PG's `DCH_OF` prints the
+/// hours and, only when the offset is not a whole hour, the minutes. So an
+/// LMT-era offset that `timestamptz_out` shows as `-04:56:02` is `-04:56` here.
+pub fn format_offset_hours_minutes(secs: i32) -> String {
+    let sign = if secs < 0 { '-' } else { '+' };
+    let abs = secs.unsigned_abs();
+    let (h, m) = (abs / 3600, (abs % 3600) / 60);
+    if m != 0 {
         format!("{sign}{h:02}:{m:02}")
     } else {
         format!("{sign}{h:02}")
