@@ -5383,12 +5383,28 @@ impl CopyFormat {
     }
 }
 
-/// A bound `COPY <table> [(cols)] FROM STDIN`: the resolved write target, the
-/// data-column → schema-column mapping, per-column defaults for columns absent
-/// from the column list, and the text/CSV format. The row bytes arrive later
-/// over the wire, so binding is split: this resolves everything the server needs
-/// before sending `CopyInResponse`, and [`build_insert`](Self::build_insert)
-/// turns the decoded field rows into an ordinary [`LogicalPlan::Insert`].
+/// Where a bound COPY reads its row bytes from.
+///
+/// PostgreSQL restricts the file form to superusers (or `pg_read_server_files`);
+/// this project has no role system yet, so the read is unconditional — a
+/// deliberate, documented divergence. Relative paths, which PG resolves against
+/// the data directory, are rejected instead (see the server's file reader).
+#[derive(Clone, Debug)]
+pub enum CopyFromSource {
+    /// `FROM STDIN`: the bytes stream in over the wire's copy-in sub-protocol.
+    Stdin,
+    /// `FROM '<file>'`: the server reads the file itself. Holds the path exactly
+    /// as written in the statement, because that is what PG's error text quotes.
+    File(String),
+}
+
+/// A bound `COPY <table> [(cols)] FROM {STDIN | '<file>'}`: the resolved write
+/// target, the data-column → schema-column mapping, per-column defaults for
+/// columns absent from the column list, and the text/CSV format. The row bytes
+/// arrive later, so binding is split: this resolves everything the server needs
+/// before sending `CopyInResponse` (or opening the file), and
+/// [`build_insert`](Self::build_insert) turns the decoded field rows into an
+/// ordinary [`LogicalPlan::Insert`].
 pub struct CopyFromPlan {
     table: Arc<dyn TableAm>,
     table_name: String,
@@ -5398,6 +5414,8 @@ pub struct CopyFromPlan {
     /// Default expression per schema column (used for columns not in the list).
     defaults: Vec<BoundExpr>,
     pub format: CopyFormat,
+    /// Where the row bytes come from: the wire, or a server-side file.
+    pub source: CopyFromSource,
     /// Leaf partitions when `table` is a partitioned parent, so each decoded row
     /// routes to the leaf whose RANGE bound admits it (reusing the executor's
     /// INSERT routing); `None` for an ordinary table.
@@ -5482,10 +5500,11 @@ impl CopyFromPlan {
     }
 }
 
-/// Bind `COPY <table> [(cols)] FROM STDIN [WITH (…)]`. Rejects the forms not yet
-/// supported (`COPY TO`, a query source, file/program targets, binary format)
-/// with the matching error, resolves the write target and column list the same
-/// way INSERT does, and resolves the text/CSV options into a [`CopyFormat`].
+/// Bind `COPY <table> [(cols)] FROM {STDIN | '<file>'} [WITH (…)]`. Rejects the
+/// forms not yet supported (`COPY TO`, a query source, `FROM PROGRAM`, binary
+/// format) with the matching error, resolves the write target and column list
+/// the same way INSERT does, and resolves the text/CSV options into a
+/// [`CopyFormat`].
 pub fn bind_copy_from(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -5511,11 +5530,21 @@ pub fn bind_copy_from(
             ));
         }
     };
-    if !matches!(target, ast::CopyTarget::Stdin) {
-        return Err(BindError::feature_not_supported(
-            "COPY from a file or program is not supported yet; use COPY ... FROM STDIN",
-        ));
-    }
+    let copy_source = match target {
+        ast::CopyTarget::Stdin => CopyFromSource::Stdin,
+        ast::CopyTarget::File { filename } => CopyFromSource::File(filename.clone()),
+        ast::CopyTarget::Program { .. } => {
+            return Err(BindError::feature_not_supported(
+                "COPY from a program is not supported yet",
+            ));
+        }
+        // `COPY … FROM STDOUT` is not accepted by the parser's FROM branch.
+        ast::CopyTarget::Stdout => {
+            return Err(BindError::feature_not_supported(
+                "COPY from STDOUT is not supported",
+            ));
+        }
+    };
 
     let (table, name) = resolve_write_table(engine, table_name, WriteVerb::Insert)?;
     let schema = table.schema().clone();
@@ -5565,6 +5594,7 @@ pub fn bind_copy_from(
         target_indices,
         defaults,
         format,
+        source: copy_source,
         routing,
     })
 }

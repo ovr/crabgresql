@@ -71,6 +71,7 @@ not parse falls back to its default rather than failing startup.
 | --- | --- | --- | --- |
 | `CRABGRESQL_PORT` | `5433` | | TCP port to listen on (also `--port`) |
 | `PGDATA` | `./pgdata` | | data directory the durable heap engine is opened in (also `--data-dir`) |
+| `CRABGRESQL_COPY_ALLOW_PATHS` | *(empty)* | | extra directories a server-side `COPY … FROM '<file>'` may read, colon-separated (also repeatable `--copy-allow-path`). The data directory is always readable and is where a relative path resolves; nothing else is, because the read runs with the server's privileges |
 | `RUST_LOG` | `info` | | tracing filter directives |
 | `CRABGRESQL_BUFFER_TABLE_SOFT_BYTES` | `32MB` | `1MB`–`2GB` | per-relation buffered bytes that make one write buffer flush-eligible |
 | `CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES` | `256MB` | `1MB`–`16GB` | buffered bytes across all relations that make every buffer eligible |
@@ -113,7 +114,7 @@ server, emulating `psql -a -q` output, and diffs against `expected/*.out`:
 ```console
 $ cargo run -p crabgresql-pg-regress --bin regress            # full schedule (compat %)
 $ cargo run -p crabgresql-pg-regress --bin regress -- --tests boolean,int4
-14 of 245 tests passed (5%).
+15 of 245 tests passed (6%).
 See target/regress/regression.diffs for details.
 ```
 

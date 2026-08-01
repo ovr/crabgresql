@@ -373,7 +373,9 @@ async fn run_simple_query(
 }
 
 /// Whether a statement is `COPY <table> [(cols)] FROM STDIN` — the only COPY
-/// form the server drives (COPY TO / file / program are rejected at bind time).
+/// form that needs the wire's copy-in sub-protocol, and so the only one routed
+/// here. `COPY … FROM '<file>'` runs on the ordinary execute path (the server
+/// reads the file itself); COPY TO and FROM PROGRAM are rejected at bind time.
 fn is_copy_from_stdin(stmt: &ast::Statement) -> bool {
     matches!(
         stmt,

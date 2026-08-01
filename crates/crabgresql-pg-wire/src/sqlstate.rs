@@ -100,3 +100,6 @@ pub const BAD_COPY_FILE_FORMAT: &str = "22P04";
 pub const QUERY_CANCELED: &str = "57014";
 /// Class 58 — system error: a WAL/data-file I/O failure (e.g. commit fsync).
 pub const IO_ERROR: &str = "58030";
+/// `58P01` — a file named by a statement could not be opened or read
+/// (`COPY … FROM '<file>'`).
+pub const UNDEFINED_FILE: &str = "58P01";

@@ -9,6 +9,13 @@ use tokio::net::TcpListener;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 async fn spawn_server() -> u16 {
+    spawn_server_reading(&[]).await
+}
+
+/// A server that may also read COPY source files under `copy_roots`, on top of
+/// its own data directory. Server-side `COPY … FROM '<file>'` is confined by
+/// path, and test fixtures live outside the data directory.
+async fn spawn_server_reading(copy_roots: &[&std::path::Path]) -> u16 {
     let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
         Ok(listener) => listener,
         Err(error) => panic!("failed to bind test server: {error}"),
@@ -22,8 +29,14 @@ async fn spawn_server() -> u16 {
     // lifetime (the OS reclaims it after the test process exits).
     let dir = tempfile::tempdir().expect("create temp data dir");
     let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path()).expect("open test engine");
+    let copy_files = copy_roots.iter().fold(
+        crabgresql_server::CopyFileAccess::confined_to(dir.path()),
+        |access, root| access.allowing(root),
+    );
     std::mem::forget(dir);
-    tokio::spawn(crabgresql_server::serve_with(listener, engine, txnmgr));
+    tokio::spawn(crabgresql_server::serve_with(
+        listener, engine, txnmgr, copy_files,
+    ));
     port
 }
 
@@ -6605,6 +6618,417 @@ async fn copy_in_fills_serial_default_from_sequence() -> anyhow::Result<()> {
     assert_eq!(rows[0].get("name"), Some("alice"));
     assert_eq!(rows[1].get("id"), Some("2"));
     assert_eq!(rows[1].get("name"), Some("bob"));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// COPY ... FROM '<file>' — the server reads the file itself
+// ---------------------------------------------------------------------------
+
+/// Write `contents` to a file inside `dir` and hand back its absolute path,
+/// which is the only form `COPY … FROM` accepts.
+fn fixture_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> anyhow::Result<String> {
+    let path = dir.path().join(name);
+    std::fs::write(&path, contents)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// The upstream fixture pattern: an absolute path in the statement, text format,
+/// loaded by the server without a copy-in sub-protocol.
+#[tokio::test]
+async fn copy_from_file_loads_text_format() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = connect(spawn_server_reading(&[dir.path()]).await).await;
+    let path = fixture_file(&dir, "t.data", b"1\talice\n2\t\\N\n3\tbob\n")?;
+
+    client
+        .simple_query("CREATE TABLE t (a int4, b text)")
+        .await?;
+    let messages = client
+        .simple_query(&format!("COPY t FROM '{path}'"))
+        .await?;
+    assert!(
+        matches!(&messages[0], SimpleQueryMessage::CommandComplete(n) if *n == 3),
+        "COPY should report 3 rows"
+    );
+
+    let messages = client.simple_query("SELECT a, b FROM t ORDER BY a").await?;
+    let rows = rows(&messages);
+    assert_eq!(rows[0].get("b"), Some("alice"));
+    assert_eq!(rows[1].get("b"), None);
+    assert_eq!(rows[2].get("b"), Some("bob"));
+    Ok(())
+}
+
+/// The `WITH (…)` options resolve the same way for a file as for stdin, and a
+/// quoted field spanning a newline survives the chunked read.
+#[tokio::test]
+async fn copy_from_file_loads_csv_with_options() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = connect(spawn_server_reading(&[dir.path()]).await).await;
+    let path = fixture_file(&dir, "c.csv", b"a,b\n1,\"line1\nline2\"\n2,\"x\"\"y\"\n")?;
+
+    client
+        .simple_query("CREATE TABLE c (a int4, b text)")
+        .await?;
+    let messages = client
+        .simple_query(&format!("COPY c FROM '{path}' WITH (FORMAT csv, HEADER)"))
+        .await?;
+    assert!(
+        matches!(&messages[0], SimpleQueryMessage::CommandComplete(n) if *n == 2),
+        "the header line must not be loaded as a row"
+    );
+
+    let messages = client.simple_query("SELECT b FROM c ORDER BY a").await?;
+    let rows = rows(&messages);
+    assert_eq!(rows[0].get("b"), Some("line1\nline2"));
+    assert_eq!(rows[1].get("b"), Some("x\"y"));
+    Ok(())
+}
+
+/// More rows than one insert batch, so the whole file passes through the
+/// batching loop rather than a single pass.
+#[tokio::test]
+async fn copy_from_file_loads_more_rows_than_one_batch() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = connect(spawn_server_reading(&[dir.path()]).await).await;
+    let data: String = (1..=2500).map(|i| format!("{i}\tv{i}\n")).collect();
+    let path = fixture_file(&dir, "big.data", data.as_bytes())?;
+
+    client
+        .simple_query("CREATE TABLE b (a int4, v text)")
+        .await?;
+    let messages = client
+        .simple_query(&format!("COPY b FROM '{path}'"))
+        .await?;
+    assert!(matches!(&messages[0], SimpleQueryMessage::CommandComplete(n) if *n == 2500));
+
+    let messages = client
+        .simple_query("SELECT count(*) AS n, max(a) AS m FROM b")
+        .await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("2500"));
+    assert_eq!(rows(&messages)[0].get("m"), Some("2500"));
+    Ok(())
+}
+
+/// A UNIQUE index must be enforced across the whole file, not per insert batch.
+///
+/// Each batch runs at its own command id so it can see the rows the earlier
+/// batches wrote; sharing one command id made the duplicate check blind past a
+/// batch boundary and silently admitted a key that already existed.
+#[tokio::test]
+async fn copy_from_file_enforces_unique_across_batches() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let dir = tempfile::tempdir()?;
+    let client = connect(spawn_server_reading(&[dir.path()]).await).await;
+    // The duplicate of line 1 sits well past the first batch boundary.
+    let data: String = (1..=2500)
+        .map(|i| {
+            if i == 2000 {
+                "1\n".to_string()
+            } else {
+                format!("{i}\n")
+            }
+        })
+        .collect();
+    let path = fixture_file(&dir, "dup.data", data.as_bytes())?;
+
+    client
+        .simple_query("CREATE TABLE u (a int4 PRIMARY KEY)")
+        .await?;
+    let err = client
+        .simple_query(&format!("COPY u FROM '{path}'"))
+        .await
+        .expect_err("a duplicate key must abort the COPY");
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+
+    let messages = client.simple_query("SELECT count(*) AS n FROM u").await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// The control for [`copy_from_file_enforces_unique_across_batches`]: a
+/// duplicate *within* one batch, and the same data over STDIN, were already
+/// rejected — so a future regression localizes to the batch boundary.
+#[tokio::test]
+async fn copy_unique_violation_within_one_batch_and_over_stdin() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio_postgres::error::SqlState;
+
+    let dir = tempfile::tempdir()?;
+    let client = connect(spawn_server_reading(&[dir.path()]).await).await;
+    // Fewer rows than one batch, duplicate in the middle.
+    let data: String = (1..=899)
+        .map(|i| {
+            if i == 500 {
+                "1\n".to_string()
+            } else {
+                format!("{i}\n")
+            }
+        })
+        .collect();
+    let path = fixture_file(&dir, "dup_small.data", data.as_bytes())?;
+
+    client
+        .simple_query("CREATE TABLE u (a int4 PRIMARY KEY)")
+        .await?;
+    let err = client
+        .simple_query(&format!("COPY u FROM '{path}'"))
+        .await
+        .expect_err("a duplicate within one batch must abort the COPY");
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+
+    client
+        .simple_query("CREATE TABLE s (a int4 PRIMARY KEY)")
+        .await?;
+    let sink = client.copy_in("COPY s FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from(data)).await?;
+    let err = sink
+        .finish()
+        .await
+        .expect_err("a duplicate over stdin must abort the COPY");
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+
+    let messages = client
+        .simple_query("SELECT (SELECT count(*) FROM u) + (SELECT count(*) FROM s) AS n")
+        .await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// A bad row in the file's tail must leave none of its head behind: every batch
+/// runs in one transaction, so the whole COPY rolls back.
+#[tokio::test]
+async fn copy_from_file_bad_value_late_in_file_aborts_whole_load() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let dir = tempfile::tempdir()?;
+    let client = connect(spawn_server_reading(&[dir.path()]).await).await;
+    // The failing row sits past the first insert batch.
+    let mut data: String = (1..=2000).map(|i| format!("{i}\n")).collect();
+    data.push_str("not_an_int\n");
+    let path = fixture_file(&dir, "bad.data", data.as_bytes())?;
+
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+    let err = client
+        .simple_query(&format!("COPY t FROM '{path}'"))
+        .await
+        .expect_err("a malformed value must abort the COPY");
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::INVALID_TEXT_REPRESENTATION
+    );
+
+    let messages = client.simple_query("SELECT count(*) AS n FROM t").await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// A file missing from a directory the server *may* read reports PG's 58P01
+/// wording, quoting the path as the statement wrote it.
+#[tokio::test]
+async fn copy_from_missing_file_errors() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = connect(spawn_server_reading(&[dir.path()]).await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    let path = dir.path().join("absent.data");
+    let path = path.to_string_lossy();
+    let err = client
+        .simple_query(&format!("COPY t FROM '{path}'"))
+        .await
+        .expect_err("a missing file must error");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code().code(), "58P01");
+    assert_eq!(
+        db.message(),
+        format!("could not open file \"{path}\" for reading: No such file or directory")
+    );
+    Ok(())
+}
+
+/// A relative path resolves against the data directory, as it does in PG, where
+/// the backend's working directory is PGDATA. It is not an error in itself — it
+/// simply names a file that is not there.
+#[tokio::test]
+async fn copy_from_relative_path_resolves_against_the_data_dir() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    let err = client
+        .simple_query("COPY t FROM 'relative.data'")
+        .await
+        .expect_err("the file does not exist under the data directory");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code().code(), "58P01");
+    assert_eq!(
+        db.message(),
+        "could not open file \"relative.data\" for reading: No such file or directory"
+    );
+    Ok(())
+}
+
+/// The server reads with its own privileges, so a path outside the directories
+/// it was configured for is refused — and refused identically whether or not the
+/// file exists, so the error cannot be used to probe the filesystem.
+#[tokio::test]
+async fn copy_from_outside_the_allowed_roots_is_denied() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let outside = tempfile::tempdir()?;
+    let present = outside.path().join("present.data");
+    std::fs::write(&present, b"1\n")?;
+    let absent = outside.path().join("absent.data");
+
+    // Note: the server is NOT told about `outside`.
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    let mut seen = Vec::new();
+    for path in [present.to_string_lossy(), absent.to_string_lossy()] {
+        let err = client
+            .simple_query(&format!("COPY t FROM '{path}'"))
+            .await
+            .expect_err("a path outside the allowed roots must be refused");
+        let db = err.as_db_error().expect("db error");
+        assert_eq!(db.code(), &SqlState::INSUFFICIENT_PRIVILEGE);
+        seen.push(db.message().to_string());
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "an existing and a missing out-of-bounds file must be indistinguishable"
+    );
+    assert_eq!(seen[0], "absolute path not allowed");
+
+    // A `..` cannot walk out of the data directory either.
+    let err = client
+        .simple_query("COPY t FROM '../../etc/passwd'")
+        .await
+        .expect_err("`..` must not escape the data directory");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::INSUFFICIENT_PRIVILEGE);
+    assert_eq!(
+        db.message(),
+        "path must be in or below the current directory"
+    );
+    Ok(())
+}
+
+/// PG rejects a directory with the wrong-object-type class before it reads;
+/// anything else that is not a regular file we refuse too, because a read that
+/// never returns (a FIFO with no writer) cannot be cancelled here.
+#[tokio::test]
+async fn copy_from_a_directory_or_fifo_errors_rather_than_hanging() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = connect(spawn_server_reading(&[dir.path()]).await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    let path = dir.path().to_string_lossy().into_owned();
+    let err = client
+        .simple_query(&format!("COPY t FROM '{path}'"))
+        .await
+        .expect_err("a directory is not a COPY source");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code().code(), "42809");
+    assert_eq!(db.message(), format!("\"{path}\" is a directory"));
+
+    #[cfg(unix)]
+    {
+        // No writer will ever open this, so opening it to read would block for
+        // good; the check happens before the open.
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+        assert!(made.success(), "mkfifo failed: {made}");
+
+        let fifo = fifo.to_string_lossy().into_owned();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.simple_query(&format!("COPY t FROM '{fifo}'")),
+        )
+        .await
+        .expect("COPY from a FIFO must not block the server")
+        .expect_err("a FIFO is not a regular file");
+        let db = err.as_db_error().expect("db error");
+        assert_eq!(db.code().code(), "42809");
+        assert_eq!(db.message(), format!("\"{fifo}\" is not a regular file"));
+    }
+    Ok(())
+}
+
+/// A bad path aborts an open block, as any statement error does in PG, and the
+/// session recovers on ROLLBACK. (Internally the statement is rejected before it
+/// takes a transaction, so it burns no XID — not observable from here, but it is
+/// why the resolve/open happen outside `run_copy_rows`.)
+#[tokio::test]
+async fn copy_from_bad_path_aborts_the_block_and_recovers() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("COPY t FROM '/etc/passwd'")
+        .await
+        .expect_err("outside the allowed roots");
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect_err("PG aborts the whole block on any statement error");
+    client.simple_query("ROLLBACK").await?;
+
+    let messages = client.simple_query("SELECT 1 AS n").await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("1"));
+    Ok(())
+}
+
+/// PG's 58P01 for an unopenable COPY source carries a HINT pointing at psql's
+/// client-side `\copy`, which is usually what the user actually wanted.
+#[tokio::test]
+async fn copy_from_missing_file_carries_pgs_hint() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    let err = client
+        .simple_query("COPY t FROM 'absent.data'")
+        .await
+        .expect_err("a missing file must error");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(
+        db.hint(),
+        Some(
+            "COPY FROM instructs the PostgreSQL server process to read a file. \
+             You may want a client-side facility such as psql's \\copy."
+        )
+    );
+    Ok(())
+}
+
+/// `COPY … FROM PROGRAM` is still unimplemented, and keeps its own 0A000.
+#[tokio::test]
+async fn copy_from_program_is_unsupported() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+
+    let err = client
+        .simple_query("COPY t FROM PROGRAM 'echo 1'")
+        .await
+        .expect_err("PROGRAM is not supported");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(db.message(), "COPY from a program is not supported yet");
     Ok(())
 }
 

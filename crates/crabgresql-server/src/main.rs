@@ -17,6 +17,19 @@ struct Cli {
     /// recovery runs at startup. Defaults to `./pgdata` when omitted.
     #[arg(long = "data-dir", short = 'D', env = config::DATA_DIR, default_value = config::DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
+
+    /// Extra directory a server-side `COPY … FROM '<file>'` may read. Repeatable,
+    /// or colon-separated in the environment. The data directory is always
+    /// allowed and is where a relative path resolves; by default nothing else
+    /// is, because the read runs with the server's privileges.
+    #[arg(
+        long = "copy-allow-path",
+        value_name = "PATH",
+        env = config::COPY_ALLOW_PATHS,
+        value_delimiter = ':',
+        num_args = 1
+    )]
+    copy_allow_path: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -35,6 +48,18 @@ async fn main() -> std::io::Result<()> {
         cli.data_dir.display()
     );
     let (engine, txnmgr) = crabgresql_server::open_pg_engine(&cli.data_dir)?;
+
+    let copy_files = cli.copy_allow_path.iter().fold(
+        crabgresql_server::CopyFileAccess::confined_to(&cli.data_dir),
+        |access, root| access.allowing(root),
+    );
+    // A confinement policy nobody can see is a support ticket.
+    tracing::info!(
+        "server-side COPY may read {} and {} extra path(s): {:?}",
+        cli.data_dir.display(),
+        cli.copy_allow_path.len(),
+        cli.copy_allow_path
+    );
     // Keep a handle to flush + mark a clean shutdown on Ctrl-C / SIGTERM, so
     // unlogged tables' data is kept across the restart (a crash would leave the
     // control file dirty and reset them).
@@ -48,7 +73,7 @@ async fn main() -> std::io::Result<()> {
     );
 
     tokio::select! {
-        result = crabgresql_server::serve_with(listener, engine, txnmgr) => result,
+        result = crabgresql_server::serve_with(listener, engine, txnmgr, copy_files) => result,
         () = shutdown_signal() => {
             tracing::info!("received shutdown signal; flushing for a clean shutdown");
             engine_for_shutdown.shutdown();

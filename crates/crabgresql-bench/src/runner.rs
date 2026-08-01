@@ -463,7 +463,11 @@ async fn start_target(config: &RunConfig) -> Result<Target> {
     };
     let (engine, txnmgr) = crabgresql_server::open_pg_engine(&path)
         .with_context(|| format!("opening the engine over {}", path.display()))?;
-    let server = tokio::spawn(crabgresql_server::serve_with(listener, engine, txnmgr));
+    // Benchmarks load from their own generated data directory only.
+    let copy_files = crabgresql_server::CopyFileAccess::confined_to(&path);
+    let server = tokio::spawn(crabgresql_server::serve_with(
+        listener, engine, txnmgr, copy_files,
+    ));
 
     Ok(Target {
         conninfo: format!("host=127.0.0.1 port={port} user=postgres dbname=bench"),

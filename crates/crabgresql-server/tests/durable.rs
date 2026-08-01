@@ -24,7 +24,11 @@ async fn spawn_pg(dir: &Path) -> (u16, JoinHandle<std::io::Result<()>>) {
         Ok(address) => address.port(),
         Err(error) => panic!("failed to read durable test server address: {error}"),
     };
-    let handle = tokio::spawn(crabgresql_server::serve_with(listener, engine, txnmgr));
+    // Nothing here loads a server-side COPY file; the data dir is enough.
+    let copy_files = crabgresql_server::CopyFileAccess::confined_to(dir);
+    let handle = tokio::spawn(crabgresql_server::serve_with(
+        listener, engine, txnmgr, copy_files,
+    ));
     (port, handle)
 }
 

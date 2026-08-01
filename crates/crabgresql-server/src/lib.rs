@@ -5,6 +5,7 @@
 mod catalog;
 mod connection;
 mod copy;
+mod copy_access;
 mod cursor;
 mod error;
 mod explain;
@@ -22,6 +23,7 @@ use crabgresql_txn::{CommitSink, TransactionManager, TxnFinalize};
 use crabgresql_wal::Wal;
 use tokio::net::TcpListener;
 
+pub use crate::copy_access::CopyFileAccess;
 use crate::global_catalog::GlobalCatalog;
 
 /// Open the durable heap engine over a data directory and run crash recovery:
@@ -54,7 +56,14 @@ pub fn open_pg_engine(
 /// (no WAL) — the entry point the memory-engine tests and the in-memory default
 /// use. Durable deployments call [`serve_with`] with a WAL-backed manager.
 pub async fn serve(listener: TcpListener, engine: Arc<dyn TableEngine>) -> std::io::Result<()> {
-    serve_with(listener, engine, Arc::new(TransactionManager::new())).await
+    // No data directory, so no server-side COPY file read can be anchored.
+    serve_with(
+        listener,
+        engine,
+        Arc::new(TransactionManager::new()),
+        CopyFileAccess::deny_all(),
+    )
+    .await
 }
 
 /// Accept connections forever, one tokio task per session, using the supplied
@@ -63,12 +72,17 @@ pub async fn serve(listener: TcpListener, engine: Arc<dyn TableEngine>) -> std::
 /// Both the user-object catalog (types/functions/casts) and the manager (XID
 /// allocator + commit log) are shared across every connection for the life of
 /// the server, matching PG's persistent catalog.
+///
+/// `copy_files` is passed explicitly rather than defaulted: it decides which
+/// files a client can make the server read, and a silent default is exactly the
+/// kind of security setting that rots unnoticed.
 pub async fn serve_with(
     listener: TcpListener,
     engine: Arc<dyn TableEngine>,
     txnmgr: Arc<TransactionManager>,
+    copy_files: CopyFileAccess,
 ) -> std::io::Result<()> {
-    let catalog = Arc::new(GlobalCatalog::new());
+    let catalog = Arc::new(GlobalCatalog::with_copy_files(copy_files));
     loop {
         let (socket, peer) = listener.accept().await?;
         let engine = engine.clone();

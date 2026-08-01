@@ -14,6 +14,23 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Pin `PG_ABS_SRCDIR` to the suite's own directory.
+///
+/// `regress_environment` lets a real process variable win, so a run can be
+/// pointed elsewhere — useful for the `regress` binary, but not here: these two
+/// tests are the regression gate, and a shell that happens to export
+/// `PG_ABS_SRCDIR` (a PostgreSQL build shell does) would redirect every
+/// `COPY … FROM :'filename'` and redden the gate for unrelated reasons.
+fn pinned_srcdir(suite_dir: &PathBuf) -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        "PG_ABS_SRCDIR".to_string(),
+        std::fs::canonicalize(suite_dir)
+            .unwrap_or_else(|_| suite_dir.clone())
+            .to_string_lossy()
+            .into_owned(),
+    )])
+}
+
 async fn assert_suite_passes(config: &SuiteConfig) -> anyhow::Result<()> {
     let report = run_suite(config).await?;
     if !report.all_passed() {
@@ -34,13 +51,14 @@ async fn assert_suite_passes(config: &SuiteConfig) -> anyhow::Result<()> {
 async fn smoke_suite_passes() -> anyhow::Result<()> {
     let suite_dir = manifest_dir().join("suites/smoke");
     let schedule = std::fs::read_to_string(suite_dir.join("schedule"))?;
+    let env = pinned_srcdir(&suite_dir);
     let config = SuiteConfig {
         regress_dir: suite_dir,
         setup: vec![],
         tests: parse_schedule(&schedule),
         outdir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("smoke"),
         statement_timeout: Duration::from_secs(30),
-        env: BTreeMap::new(),
+        env,
     };
     assert_suite_passes(&config).await?;
 
@@ -67,13 +85,14 @@ async fn upstream_must_pass() -> anyhow::Result<()> {
     if tests.is_empty() {
         return Ok(());
     }
+    let env = pinned_srcdir(&regress_dir);
     let config = SuiteConfig {
         regress_dir,
         setup: vec!["test_setup".to_string()],
         tests,
         outdir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("upstream"),
         statement_timeout: Duration::from_secs(30),
-        env: BTreeMap::new(),
+        env,
     };
     assert_suite_passes(&config).await?;
 

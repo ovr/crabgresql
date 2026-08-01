@@ -104,7 +104,14 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
     // directory (kept alive until this function returns, past `server.abort()`).
     let data_dir = tempfile::tempdir()?;
     let (engine, txnmgr) = crabgresql_server::open_pg_engine(data_dir.path())?;
-    let server = tokio::spawn(crabgresql_server::serve_with(listener, engine, txnmgr));
+    // Scripts load fixtures with `COPY … FROM :'abs_srcdir/data/x.data'`, which
+    // is the suite's source tree, not the throwaway PGDATA — so the server has
+    // to be told that tree is readable.
+    let copy_files = crabgresql_server::CopyFileAccess::confined_to(data_dir.path())
+        .allowing(&config.regress_dir);
+    let server = tokio::spawn(crabgresql_server::serve_with(
+        listener, engine, txnmgr, copy_files,
+    ));
 
     let results_dir = config.outdir.join("results");
     std::fs::create_dir_all(&results_dir)?;

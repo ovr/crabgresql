@@ -774,6 +774,26 @@ pub struct TxnContext {
     pub lock_owner: LockOwner,
 }
 
+impl TxnContext {
+    /// The same transaction at a later command.
+    ///
+    /// Everything that identifies the transaction is carried over — the XID, the
+    /// snapshot and its reservation, the isolation level, the lock owner — so
+    /// only the command id moves. That is what lets one statement run several
+    /// plans in sequence and have plan *k+1* see the rows plan *k* wrote:
+    /// [`satisfies_mvcc`] hides a version whose `cmin` is at or after the
+    /// reader's `cid`.
+    ///
+    /// Callers take the new id from the statement's shared command counter, not
+    /// by adding one, so ids consumed here are not handed out twice.
+    pub fn with_cid(&self, cid: CommandId) -> TxnContext {
+        TxnContext {
+            cid,
+            ..self.clone()
+        }
+    }
+}
+
 /// The one MVCC visibility rule. A version described by `hdr` is visible to a
 /// reader identified by `(my_xid, my_cid)` under snapshot `snap` (consulting
 /// `clog` for other transactions' fates) exactly when its inserter counts as
