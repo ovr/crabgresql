@@ -9,7 +9,7 @@
 //! documented binary formats (network byte order), not PG's C source.
 
 use crate::cast::{self, CastError};
-use crate::{PgType, Value};
+use crate::{FmtCtx, PgType, Value};
 
 /// `22P03` invalid_binary_representation — a binary value the type's `recv`
 /// function would reject (wrong length, out-of-domain byte).
@@ -38,7 +38,7 @@ fn fixed<const N: usize>(b: &[u8], ty: PgType) -> Result<[u8; N], CastError> {
 /// Decode a Bind parameter delivered in **text** format into a `Value` of `ty`.
 /// Reuses the type's SQL input function, so a text parameter and the equivalent
 /// literal fail and succeed identically.
-pub fn decode_text(ty: PgType, s: &str) -> Result<Value, CastError> {
+pub fn decode_text(ty: PgType, s: &str, fmt: &FmtCtx) -> Result<Value, CastError> {
     match ty {
         // `name` truncates to 63 characters (`namein`), as PG does.
         PgType::Name => Ok(Value::Text(crate::text::name_input(s))),
@@ -46,7 +46,7 @@ pub fn decode_text(ty: PgType, s: &str) -> Result<Value, CastError> {
         // carries no typmod, so there is no length to enforce here (as in PG,
         // where an untyped `$1::bpchar` is not blank-padded).
         PgType::Text | PgType::Varchar | PgType::Bpchar => Ok(Value::Text(s.to_string())),
-        _ => cast::cast_value(Value::Text(s.to_string()), ty, 1),
+        _ => cast::cast_value(Value::Text(s.to_string()), ty, fmt),
     }
 }
 
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn name_param_truncates_to_63_chars() -> anyhow::Result<()> {
         let long = "x".repeat(100);
-        let Value::Text(t) = decode_text(PgType::Name, &long)? else {
+        let Value::Text(t) = decode_text(PgType::Name, &long, &FmtCtx::utc_default())? else {
             panic!("name decodes to text");
         };
         assert_eq!(t.chars().count(), 63);
@@ -226,9 +226,9 @@ mod tests {
 
     #[test]
     fn text_param_matches_literal_input() -> anyhow::Result<()> {
-        assert_eq!(decode_text(PgType::Int4, " 42 ")?, Value::Int4(42));
-        assert_eq!(decode_text(PgType::Bool, "t")?, Value::Bool(true));
-        assert_eq!(decode_text(PgType::Text, "hi")?, Value::Text("hi".into()));
+        assert_eq!(decode_text(PgType::Int4, " 42 ", &FmtCtx::utc_default())?, Value::Int4(42));
+        assert_eq!(decode_text(PgType::Bool, "t", &FmtCtx::utc_default())?, Value::Bool(true));
+        assert_eq!(decode_text(PgType::Text, "hi", &FmtCtx::utc_default())?, Value::Text("hi".into()));
 
         Ok(())
     }

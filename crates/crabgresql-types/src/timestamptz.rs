@@ -4,11 +4,16 @@
 //! Clean-room (see AGENTS.md): reproduces PostgreSQL's *observable* behavior,
 //! pinned by differential tests. The value is stored exactly like `timestamp` —
 //! `i64` microseconds since 2000-01-01, with `i64::MIN`/`MAX` as the
-//! `-infinity`/`infinity` sentinels — but the instant is in **UTC**. On input a
-//! zone token (offset, abbreviation, or IANA name) is resolved to a UTC offset
-//! and subtracted; on output the value is rendered in UTC (there is no session
-//! `TimeZone` yet), so the offset is always `+00`. Zone resolution and DST live
-//! in [`crate::tz`]; the calendar core is shared with [`crate::timestamp`].
+//! `-infinity`/`infinity` sentinels — but the instant is in **UTC**.
+//!
+//! Everything user-visible is relative to the session's display zone (the
+//! `TimeZone` GUC, threaded in as a [`SessionZone`]). On input an explicit zone
+//! token wins and a missing one means the session zone; on output the instant is
+//! rotated into the session zone and the offset printed alongside. The field
+//! functions and `date_trunc` likewise operate on the *local* wall clock — only
+//! `epoch` and the ordering of the stored value are zone-independent. Zone
+//! resolution and DST live in [`crate::tz`]; the calendar core is shared with
+//! [`crate::timestamp`].
 
 use crate::Numeric;
 use crate::timestamp::{
@@ -16,7 +21,7 @@ use crate::timestamp::{
     INVALID_TIME_ZONE_DISPLACEMENT, NEG_INFINITY, POS_INFINITY, Parsed, TimestampError, decode,
     encode, format_parts, is_finite, validate_fields,
 };
-use crate::tz::{self, TmLite, ZoneError};
+use crate::tz::{self, SessionZone, TmLite, ZoneError};
 
 const USECS_PER_SEC: i64 = 1_000_000;
 
@@ -117,10 +122,10 @@ fn tmlite(micros: i64) -> TmLite {
 }
 
 /// `timestamptz_in`. Interprets any trailing zone token to convert the wall
-/// clock to UTC (no zone token means UTC, the session zone); `infinity`/`epoch`
-/// pass through. Syntax errors are `22007`, out-of-range results `22008`, an
-/// unknown zone `22023`, a bad numeric offset `22009`.
-pub fn parse(input: &str) -> Result<i64, TimestampError> {
+/// clock to UTC; **a missing zone token means the session zone**, not UTC.
+/// `infinity`/`epoch` pass through. Syntax errors are `22007`, out-of-range
+/// results `22008`, an unknown zone `22023`, a bad numeric offset `22009`.
+pub fn parse(input: &str, session: &SessionZone) -> Result<i64, TimestampError> {
     let parsed = timestamp::parse_parts(input).map_err(|e| relabel_syntax(e, input))?;
     let (tm, zone) = match parsed {
         // infinity/-infinity/epoch are zone-independent.
@@ -142,21 +147,19 @@ pub fn parse(input: &str) -> Result<i64, TimestampError> {
         return Err(out_of_range(input));
     }
     let civil = encode(tm);
+    let wall = TmLite {
+        year: tm.year,
+        month: tm.month,
+        day: tm.day,
+        hour: tm.hour,
+        min: tm.min,
+        sec: tm.sec,
+    };
     let off_secs = match zone {
-        None => 0,
+        None => session.offset_for_wall(wall),
         Some(tok) => {
             let zone = tz::resolve_zone(&tok).map_err(zone_error)?;
-            tz::offset_for_local(
-                &zone,
-                TmLite {
-                    year: tm.year,
-                    month: tm.month,
-                    day: tm.day,
-                    hour: tm.hour,
-                    min: tm.min,
-                    sec: tm.sec,
-                },
-            )
+            tz::offset_for_local(&zone, wall)
         }
     };
     let utc = civil - off_secs as i64 * USECS_PER_SEC;
@@ -176,63 +179,146 @@ fn relabel_syntax(e: TimestampError, input: &str) -> TimestampError {
     }
 }
 
-/// `timestamptz_out`, rendered in UTC. The offset is `+00`, spliced before any
-/// ` BC` suffix (matching PG's `… 4714+00 BC` ordering).
-pub fn format(micros: i64) -> String {
+/// `timestamptz_out`: the instant rendered as the wall clock the session zone
+/// shows, followed by that zone's offset — `±HH`, widening to `±HH:MM` or
+/// `±HH:MM:SS` (see [`tz::format_offset`]). The offset is spliced before any
+/// ` BC` suffix, matching PG's `… 4714-04:56:02 BC` ordering.
+///
+/// Divergence: rotating an instant at the very edge of the representable range
+/// into a non-UTC zone would leave it, and an output function has no way to
+/// raise. We saturate and render the clamped wall clock rather than panicking;
+/// PG applies the offset in a wider internal type. Only the two synthetic
+/// boundary values can reach this.
+pub fn format(micros: i64, session: &SessionZone) -> String {
     if micros == POS_INFINITY {
         return "infinity".to_string();
     }
     if micros == NEG_INFINITY {
         return "-infinity".to_string();
     }
-    let (body, bc) = format_parts(micros);
+    let off_secs = session.offset_at(micros);
+    let local = micros.saturating_add(off_secs as i64 * USECS_PER_SEC);
+    let (body, bc) = format_parts(local);
+    let offset = tz::format_offset(off_secs);
     if bc {
-        format!("{body}+00 BC")
+        format!("{body}{offset} BC")
     } else {
-        format!("{body}+00")
+        format!("{body}{offset}")
     }
+}
+
+/// The local wall clock this instant shows in `session`, as a stored
+/// `timestamp` value. Saturating for the same reason [`format`] is.
+fn to_wall_clock(micros: i64, session: &SessionZone) -> i64 {
+    micros.saturating_add(session.offset_at(micros) as i64 * USECS_PER_SEC)
 }
 
 // --- field functions -------------------------------------------------------
 //
-// Under a UTC display zone the stored value *is* the UTC wall clock, so every
-// field except the timezone group is identical to `timestamp`. We intercept the
-// `timezone`/`timezone_hour`/`timezone_minute` fields (always 0 here) and defer
-// the rest.
+// Three groups. The `timezone*` fields report the session zone's offset. `epoch`
+// is the instant itself and so zone-independent. Everything else — `year`,
+// `day`, `hour`, `dow`, `week`, … — is a property of the *local* wall clock, so
+// the instant is rotated into the session zone before deferring to `timestamp`.
+// (Under a UTC session zone the rotation is a no-op, which is why deferring
+// unconditionally used to look correct.)
 
-fn is_tz_field(unit: &str) -> bool {
-    matches!(
-        unit.trim().to_ascii_lowercase().as_str(),
-        "timezone" | "timezone_hour" | "timezone_minute"
-    )
+/// The offset fields, in the spellings PG's `timestamptz` accepts.
+fn tz_field(unit: &str) -> Option<TzField> {
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "timezone" => Some(TzField::Seconds),
+        "timezone_hour" => Some(TzField::Hour),
+        "timezone_minute" => Some(TzField::Minute),
+        _ => None,
+    }
+}
+
+enum TzField {
+    Seconds,
+    Hour,
+    Minute,
+}
+
+/// The value of an offset field. Both the hour and the minute carry the
+/// offset's sign, as in PG: `America/St_Johns` reports `-3` and `-30`.
+fn tz_field_value(field: TzField, off_secs: i32) -> i64 {
+    match field {
+        TzField::Seconds => off_secs as i64,
+        TzField::Hour => (off_secs / 3600) as i64,
+        TzField::Minute => ((off_secs % 3600) / 60) as i64,
+    }
+}
+
+/// Whether a unit names the instant rather than the wall clock, and so must not
+/// be rotated into the session zone.
+fn is_epoch_unit(unit: &str) -> bool {
+    unit.trim().eq_ignore_ascii_case("epoch")
 }
 
 /// `date_part(text, timestamptz) -> float8`. `Ok(None)` is SQL NULL.
-pub fn date_part(unit: &str, micros: i64) -> Result<Option<f64>, TimestampError> {
-    if is_tz_field(unit) {
-        // The offset in the UTC session zone is 0 for every finite value; on
-        // ±infinity the field is NULL (an oscillating field).
-        return Ok(if is_finite(micros) { Some(0.0) } else { None });
+pub fn date_part(
+    unit: &str,
+    micros: i64,
+    session: &SessionZone,
+) -> Result<Option<f64>, TimestampError> {
+    if let Some(field) = tz_field(unit) {
+        // On ±infinity an offset field is NULL (it oscillates).
+        if !is_finite(micros) {
+            return Ok(None);
+        }
+        let value = tz_field_value(field, session.offset_at(micros));
+        return Ok(Some(value as f64));
     }
-    timestamp::date_part(unit, micros).map_err(relabel_units)
+    timestamp::date_part(unit, local_for_field(unit, micros, session)).map_err(relabel_units)
 }
 
 /// `EXTRACT(field FROM timestamptz) -> numeric`. `Ok(None)` is SQL NULL.
-pub fn extract(unit: &str, micros: i64) -> Result<Option<Numeric>, TimestampError> {
-    if is_tz_field(unit) {
-        return Ok(if is_finite(micros) {
-            Some(Numeric::from_i128(0))
-        } else {
-            None
-        });
+pub fn extract(
+    unit: &str,
+    micros: i64,
+    session: &SessionZone,
+) -> Result<Option<Numeric>, TimestampError> {
+    if let Some(field) = tz_field(unit) {
+        if !is_finite(micros) {
+            return Ok(None);
+        }
+        let value = tz_field_value(field, session.offset_at(micros));
+        return Ok(Some(Numeric::from_i128(value as i128)));
     }
-    timestamp::extract(unit, micros).map_err(relabel_units)
+    timestamp::extract(unit, local_for_field(unit, micros, session)).map_err(relabel_units)
 }
 
-/// `date_trunc(text, timestamptz) -> timestamptz`. Under UTC this truncates the
-/// UTC wall clock, so it defers to the `timestamp` implementation.
-pub fn date_trunc(unit: &str, micros: i64) -> Result<i64, TimestampError> {
-    timestamp::date_trunc(unit, micros).map_err(relabel_units)
+/// The value a non-offset field is read from: the local wall clock, except for
+/// `epoch` (the instant) and the infinities (which have no wall clock).
+fn local_for_field(unit: &str, micros: i64, session: &SessionZone) -> i64 {
+    if is_epoch_unit(unit) || !is_finite(micros) {
+        micros
+    } else {
+        to_wall_clock(micros, session)
+    }
+}
+
+/// `date_trunc(text, timestamptz) -> timestamptz`: truncate the **local** wall
+/// clock, then convert back.
+///
+/// The offset is deliberately re-resolved from the *truncated* wall clock
+/// rather than reused from the input. That is what makes `date_trunc('day', …)`
+/// land on real local midnight on a DST-transition day: on 2024-03-10 in
+/// `America/New_York` the input is at `-04` but midnight that morning is at
+/// `-05`, and PG returns `2024-03-10 00:00:00-05`.
+pub fn date_trunc(
+    unit: &str,
+    micros: i64,
+    session: &SessionZone,
+) -> Result<i64, TimestampError> {
+    if !is_finite(micros) {
+        return Ok(micros);
+    }
+    let truncated = timestamp::date_trunc(unit, to_wall_clock(micros, session)).map_err(relabel_units)?;
+    let utc = truncated - session.offset_for_wall(tmlite(truncated)) as i64 * USECS_PER_SEC;
+    if !in_range(utc) {
+        return Err(out_of_range_bare());
+    }
+    Ok(utc)
 }
 
 /// `isfinite(timestamptz) -> bool`.
@@ -240,8 +326,8 @@ pub fn is_finite_tstz(micros: i64) -> bool {
     is_finite(micros)
 }
 
-/// `make_timestamptz(year, month, mday, hour, min, sec[, zone])`. Without a
-/// zone the fields are taken as UTC (the session zone).
+/// `make_timestamptz(year, month, mday, hour, min, sec[, zone])`. Without an
+/// explicit zone the fields are read in the session zone.
 pub fn make_timestamptz(
     year: i64,
     month: i64,
@@ -250,10 +336,11 @@ pub fn make_timestamptz(
     min: i64,
     sec: f64,
     zone: Option<&str>,
+    session: &SessionZone,
 ) -> Result<i64, TimestampError> {
     let civil = timestamp::make_timestamp(year, month, mday, hour, min, sec)?;
     let off_secs = match zone {
-        None => 0,
+        None => session.offset_for_wall(tmlite(civil)),
         Some(tok) => {
             let zone = tz::resolve_zone(tok).map_err(zone_error)?;
             tz::offset_for_local(&zone, tmlite(civil))
@@ -342,11 +429,26 @@ fn trim_zeros(s: &str) -> &str {
 /// clock the instant shows in `zone`, as a zone-less `timestamp`. `±infinity`
 /// passes through.
 pub fn at_zone_to_timestamp(zone: &str, micros: i64) -> Result<i64, TimestampError> {
+    let zone = tz::resolve_zone(zone).map_err(zone_error)?;
+    instant_to_wall(micros, &zone)
+}
+
+/// The `timestamptz → timestamp` cast: the wall clock the instant shows in the
+/// **session** zone. Same operation as `AT TIME ZONE <session zone>`.
+pub fn session_zone_wall_clock(
+    micros: i64,
+    session: &SessionZone,
+) -> Result<i64, TimestampError> {
+    instant_to_wall(micros, session.zone())
+}
+
+/// Shared core: rotate a UTC instant into `zone`'s wall clock. `±infinity`
+/// passes through; a result outside the timestamp range is `22008`, as in PG.
+fn instant_to_wall(micros: i64, zone: &tz::Zone) -> Result<i64, TimestampError> {
     if !is_finite(micros) {
         return Ok(micros);
     }
-    let zone = tz::resolve_zone(zone).map_err(zone_error)?;
-    let off_secs = tz::offset_for_instant(&zone, micros);
+    let off_secs = tz::offset_for_instant(zone, micros);
     let wall = micros + off_secs as i64 * USECS_PER_SEC;
     if !in_range(wall) {
         return Err(out_of_range_bare());
@@ -358,11 +460,25 @@ pub fn at_zone_to_timestamp(zone: &str, micros: i64) -> Result<i64, TimestampErr
 /// zone-less wall clock as being in `zone`, yielding the UTC `timestamptz`
 /// instant. `±infinity` passes through.
 pub fn timestamp_at_zone(zone: &str, micros: i64) -> Result<i64, TimestampError> {
+    let zone = tz::resolve_zone(zone).map_err(zone_error)?;
+    wall_to_instant(micros, &zone)
+}
+
+/// The `timestamp → timestamptz` cast: read the zone-less wall clock in the
+/// **session** zone. Same operation as `AT TIME ZONE <session zone>`.
+pub fn timestamp_at_session_zone(
+    micros: i64,
+    session: &SessionZone,
+) -> Result<i64, TimestampError> {
+    wall_to_instant(micros, session.zone())
+}
+
+/// Shared core: read a wall clock as being in `zone`, yielding the UTC instant.
+fn wall_to_instant(micros: i64, zone: &tz::Zone) -> Result<i64, TimestampError> {
     if !is_finite(micros) {
         return Ok(micros);
     }
-    let zone = tz::resolve_zone(zone).map_err(zone_error)?;
-    let off_secs = tz::offset_for_local(&zone, tmlite(micros));
+    let off_secs = tz::offset_for_local(zone, tmlite(micros));
     let utc = micros - off_secs as i64 * USECS_PER_SEC;
     if !in_range(utc) {
         return Err(out_of_range_bare());
@@ -375,8 +491,13 @@ pub fn timestamp_at_zone(zone: &str, micros: i64) -> Result<i64, TimestampError>
 mod tests {
     use super::*;
 
+    /// The zone every pre-existing case in this module is written against.
+    fn utc() -> SessionZone {
+        SessionZone::utc()
+    }
+
     fn p(s: &str) -> i64 {
-        match parse(s) {
+        match parse(s, &utc()) {
             Ok(value) => value,
             Err(error) => panic!("invalid timestamptz test fixture `{s}`: {error:?}"),
         }
@@ -386,21 +507,21 @@ mod tests {
     fn offset_normalizes_to_utc() {
         // -08:00 shifts the wall clock forward 8h to UTC.
         assert_eq!(
-            format(p("1997-02-10 17:32:01-08")),
+            format(p("1997-02-10 17:32:01-08"), &utc()),
             "1997-02-11 01:32:01+00"
         );
         assert_eq!(
-            format(p("1997-02-10 17:32:01-0800")),
+            format(p("1997-02-10 17:32:01-0800"), &utc()),
             "1997-02-11 01:32:01+00"
         );
         assert_eq!(
-            format(p("1997-02-10 17:32:01 -08:00")),
+            format(p("1997-02-10 17:32:01 -08:00"), &utc()),
             "1997-02-11 01:32:01+00"
         );
         // No zone token -> already UTC.
-        assert_eq!(format(p("2001-02-16 20:38:40")), "2001-02-16 20:38:40+00");
+        assert_eq!(format(p("2001-02-16 20:38:40"), &utc()), "2001-02-16 20:38:40+00");
         assert_eq!(
-            format(p("2001-02-16 20:38:40+00")),
+            format(p("2001-02-16 20:38:40+00"), &utc()),
             "2001-02-16 20:38:40+00"
         );
     }
@@ -409,29 +530,29 @@ mod tests {
     fn named_zone_and_abbrev_input() {
         // America/New_York in February is EST (-05:00).
         assert_eq!(
-            format(p("1997-02-10 17:32:01 America/New_York")),
+            format(p("1997-02-10 17:32:01 America/New_York"), &utc()),
             "1997-02-10 22:32:01+00"
         );
         // PST is a fixed -08:00.
         assert_eq!(
-            format(p("1997-02-10 17:32:01 PST")),
+            format(p("1997-02-10 17:32:01 PST"), &utc()),
             "1997-02-11 01:32:01+00"
         );
         // UTC / Z synonyms.
         assert_eq!(
-            format(p("1997-02-10 17:32:01 UTC")),
+            format(p("1997-02-10 17:32:01 UTC"), &utc()),
             "1997-02-10 17:32:01+00"
         );
-        assert_eq!(format(p("2001-09-22T18:19:20Z")), "2001-09-22 18:19:20+00");
+        assert_eq!(format(p("2001-09-22T18:19:20Z"), &utc()), "2001-09-22 18:19:20+00");
     }
 
     #[test]
     fn specials_and_fractions() {
-        assert_eq!(format(p("infinity")), "infinity");
-        assert_eq!(format(p("-infinity")), "-infinity");
-        assert_eq!(format(p("epoch")), "1970-01-01 00:00:00+00");
+        assert_eq!(format(p("infinity"), &utc()), "infinity");
+        assert_eq!(format(p("-infinity"), &utc()), "-infinity");
+        assert_eq!(format(p("epoch"), &utc()), "1970-01-01 00:00:00+00");
         assert_eq!(
-            format(p("2001-02-16 20:38:40.5+00")),
+            format(p("2001-02-16 20:38:40.5+00"), &utc()),
             "2001-02-16 20:38:40.5+00"
         );
     }
@@ -439,33 +560,33 @@ mod tests {
     #[test]
     fn bc_and_boundaries() {
         assert_eq!(
-            format(p("0097-02-16 20:00:00+00 BC")),
+            format(p("0097-02-16 20:00:00+00 BC"), &utc()),
             "0097-02-16 20:00:00+00 BC"
         );
         // Lower boundary: 4714-11-24 00:00:00 UTC BC is valid.
-        assert!(parse("4714-11-24 00:00:00+00 BC").is_ok());
-        assert!(parse("4714-11-23 16:00:00-08 BC").is_ok()); // == the same instant
+        assert!(parse("4714-11-24 00:00:00+00 BC", &utc()).is_ok());
+        assert!(parse("4714-11-23 16:00:00-08 BC", &utc()).is_ok()); // == the same instant
         // One second earlier is out of range.
-        let e = parse("4714-11-23 23:59:59+00 BC").unwrap_err();
+        let e = parse("4714-11-23 23:59:59+00 BC", &utc()).unwrap_err();
         assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW);
         // Upper boundary.
-        assert!(parse("294276-12-31 23:59:59+00").is_ok());
+        assert!(parse("294276-12-31 23:59:59+00", &utc()).is_ok());
         assert_eq!(
-            parse("294277-01-01 00:00:00+00").unwrap_err().sqlstate,
+            parse("294277-01-01 00:00:00+00", &utc()).unwrap_err().sqlstate,
             DATETIME_FIELD_OVERFLOW
         );
     }
 
     #[test]
     fn errors() {
-        let e = parse("garbage").unwrap_err();
+        let e = parse("garbage", &utc()).unwrap_err();
         assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT);
         assert_eq!(
             e.message,
             "invalid input syntax for type timestamp with time zone: \"garbage\""
         );
         assert_eq!(
-            parse("2001-01-01 00:00 Nowhere/Nozone")
+            parse("2001-01-01 00:00 Nowhere/Nozone", &utc())
                 .unwrap_err()
                 .sqlstate,
             INVALID_PARAMETER_VALUE
@@ -475,12 +596,12 @@ mod tests {
     #[test]
     fn at_time_zone_round_trip() -> anyhow::Result<()> {
         // A UTC instant shown in New York (EST -5h) reads 5h earlier.
-        let utc = p("2001-02-16 20:38:40+00");
-        let wall = at_zone_to_timestamp("America/New_York", utc)?;
+        let instant = p("2001-02-16 20:38:40+00");
+        let wall = at_zone_to_timestamp("America/New_York", instant)?;
         assert_eq!(timestamp::format(wall), "2001-02-16 15:38:40");
         // Interpreting that wall clock back in New York returns the UTC instant.
         let back = timestamp_at_zone("America/New_York", wall)?;
-        assert_eq!(back, utc);
+        assert_eq!(back, instant);
 
         Ok(())
     }
@@ -489,27 +610,22 @@ mod tests {
     fn make_and_fields() -> anyhow::Result<()> {
         // 6-arg is UTC.
         assert_eq!(
-            format(make_timestamptz(2013, 7, 15, 8, 15, 23.5, None)?),
+            format(make_timestamptz(2013, 7, 15, 8, 15, 23.5, None, &utc())?, &utc()),
             "2013-07-15 08:15:23.5+00"
         );
         // 7-arg with a summer EDT zone (-04:00) shifts +4h to UTC.
         assert_eq!(
-            format(make_timestamptz(
-                2013,
-                7,
-                15,
-                17,
-                15,
-                23.0,
-                Some("America/New_York")
-            )?),
+            format(
+                make_timestamptz(2013, 7, 15, 17, 15, 23.0, Some("America/New_York"), &utc())?,
+                &utc()
+            ),
             "2013-07-15 21:15:23+00"
         );
         // timezone* fields are 0 under the UTC session zone.
         let v = p("2001-02-16 20:38:40+00");
-        assert_eq!(date_part("timezone", v)?, Some(0.0));
-        assert_eq!(date_part("timezone_hour", v)?, Some(0.0));
-        assert_eq!(date_part("hour", v)?, Some(20.0));
+        assert_eq!(date_part("timezone", v, &utc())?, Some(0.0));
+        assert_eq!(date_part("timezone_hour", v, &utc())?, Some(0.0));
+        assert_eq!(date_part("hour", v, &utc())?, Some(20.0));
 
         Ok(())
     }
@@ -521,7 +637,7 @@ mod tests {
     fn huge_year_does_not_overflow() {
         // In i32 field range but past the timestamp range: "timestamp out of range".
         for input in ["999999-01-01", "300000-01-01 00:00:00+00"] {
-            let e = parse(input).expect_err(input);
+            let e = parse(input, &utc()).expect_err(input);
             assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW, "{input}");
             assert_eq!(
                 e.message,
@@ -532,7 +648,7 @@ mod tests {
         // Beyond the i32 field range: "date/time field value out of range"
         // (must not overflow i64 in `encode`). Both signs.
         for input in ["5000000000-01-01", "5000000000-01-01 BC"] {
-            let e = parse(input).expect_err(input);
+            let e = parse(input, &utc()).expect_err(input);
             assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW, "{input}");
             assert_eq!(
                 e.message,
@@ -552,7 +668,7 @@ mod tests {
             "2001-01-01 12:00:00 -600000:00",
             "2001-01-01 12:00:00 +99:00",
         ] {
-            let e = parse(input).expect_err(input);
+            let e = parse(input, &utc()).expect_err(input);
             assert_eq!(
                 e.sqlstate,
                 crate::timestamp::INVALID_TIME_ZONE_DISPLACEMENT,
@@ -568,7 +684,7 @@ mod tests {
         // make_timestamptz: civil is in range, but the -10h zone pushes it past
         // the upper boundary.
         assert_eq!(
-            make_timestamptz(294276, 12, 31, 23, 0, 0.0, Some("-10"))
+            make_timestamptz(294276, 12, 31, 23, 0, 0.0, Some("-10"), &utc())
                 .unwrap_err()
                 .sqlstate,
             DATETIME_FIELD_OVERFLOW
@@ -589,8 +705,145 @@ mod tests {
     // numeric offset; `+garbage` is a syntax error (matches PG), not a value.
     #[test]
     fn glued_date_zone_requires_numeric_offset() {
-        assert_eq!(format(p("2001-02-16+00")), "2001-02-16 00:00:00+00");
-        let e = parse("2001-02-16+garbage").unwrap_err();
+        assert_eq!(format(p("2001-02-16+00"), &utc()), "2001-02-16 00:00:00+00");
+        let e = parse("2001-02-16+garbage", &utc()).unwrap_err();
         assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT);
+    }
+
+    // --- session display zone ---------------------------------------------
+    //
+    // Every expectation below is pinned against PostgreSQL 18.4.
+
+    fn zone(name: &str) -> SessionZone {
+        SessionZone::resolve(name).expect("test fixture names a real zone")
+    }
+
+    /// Parse in `z`, then render in `z`.
+    fn round(s: &str, z: &SessionZone) -> String {
+        match parse(s, z) {
+            Ok(v) => format(v, z),
+            Err(e) => panic!("invalid timestamptz test fixture `{s}`: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn zone_less_input_is_read_in_the_session_zone() {
+        let ny = zone("America/New_York");
+        // The same text is a different instant in a different zone, and comes
+        // back with that zone's offset rather than `+00`.
+        assert_eq!(round("2024-06-01 12:00:00", &ny), "2024-06-01 12:00:00-04");
+        assert_eq!(round("2024-01-15 12:00:00", &ny), "2024-01-15 12:00:00-05");
+        // An explicit zone token still wins; only the rendering follows the
+        // session.
+        assert_eq!(
+            format(parse("2024-06-01 12:00:00+00", &ny).unwrap(), &ny),
+            "2024-06-01 08:00:00-04"
+        );
+    }
+
+    #[test]
+    fn output_offset_widens_for_sub_hour_zones() {
+        assert_eq!(
+            round("2024-06-01 12:00:00", &zone("Asia/Kolkata")),
+            "2024-06-01 12:00:00+05:30"
+        );
+        assert_eq!(
+            round("2024-06-01 12:00:00", &zone("Pacific/Chatham")),
+            "2024-06-01 12:00:00+12:45"
+        );
+        // Pre-1883 New York ran on local mean time, which PG prints to the
+        // second.
+        assert_eq!(
+            round("1875-06-01 12:00:00", &zone("America/New_York")),
+            "1875-06-01 12:00:00-04:56:02"
+        );
+    }
+
+    #[test]
+    fn fields_read_the_local_wall_clock() -> anyhow::Result<()> {
+        let ny = zone("America/New_York");
+        // 02:00 UTC on Jan 1 is still December 31st in New York.
+        let v = parse("2024-01-01 02:00:00+00", &ny)?;
+        assert_eq!(date_part("day", v, &ny)?, Some(31.0));
+        assert_eq!(date_part("month", v, &ny)?, Some(12.0));
+        assert_eq!(date_part("year", v, &ny)?, Some(2023.0));
+        // `epoch` names the instant, not the wall clock, so the zone cannot
+        // move it.
+        assert_eq!(date_part("epoch", v, &ny)?, Some(1_704_074_400.0));
+        assert_eq!(date_part("epoch", v, &utc())?, Some(1_704_074_400.0));
+        Ok(())
+    }
+
+    #[test]
+    fn timezone_fields_report_the_session_offset() -> anyhow::Result<()> {
+        let ny = zone("America/New_York");
+        let v = parse("2024-01-15 12:00:00-05", &ny)?;
+        assert_eq!(date_part("timezone", v, &ny)?, Some(-18000.0));
+        assert_eq!(date_part("timezone_hour", v, &ny)?, Some(-5.0));
+        assert_eq!(date_part("timezone_minute", v, &ny)?, Some(0.0));
+        assert_eq!(extract("timezone", v, &ny)?, Some(Numeric::from_i128(-18000)));
+
+        // A half-hour zone west of UTC: the sign is carried on *both* fields.
+        let stj = zone("America/St_Johns");
+        let v = parse("2024-01-15 12:00:00-03:30", &stj)?;
+        assert_eq!(date_part("timezone_hour", v, &stj)?, Some(-3.0));
+        assert_eq!(date_part("timezone_minute", v, &stj)?, Some(-30.0));
+
+        // Still NULL on the infinities, which have no offset.
+        assert_eq!(date_part("timezone", POS_INFINITY, &ny)?, None);
+        Ok(())
+    }
+
+    /// `date_trunc` must re-resolve the offset from the *truncated* wall clock,
+    /// not reuse the input's. On a spring-forward day the input is at `-04` but
+    /// local midnight that morning was still at `-05`.
+    #[test]
+    fn date_trunc_lands_on_local_midnight_across_dst() -> anyhow::Result<()> {
+        let ny = zone("America/New_York");
+        let v = parse("2024-03-10 15:00:00-04", &ny)?;
+        assert_eq!(
+            format(date_trunc("day", v, &ny)?, &ny),
+            "2024-03-10 00:00:00-05"
+        );
+        assert_eq!(
+            format(date_trunc("month", v, &ny)?, &ny),
+            "2024-03-01 00:00:00-05"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn make_timestamptz_without_a_zone_uses_the_session() -> anyhow::Result<()> {
+        let ny = zone("America/New_York");
+        assert_eq!(
+            format(make_timestamptz(2024, 6, 1, 12, 0, 0.0, None, &ny)?, &ny),
+            "2024-06-01 12:00:00-04"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_zone_conversions_are_not_an_identity() -> anyhow::Result<()> {
+        let ny = zone("America/New_York");
+        // timestamp -> timestamptz reads the wall clock in the session zone.
+        let wall = timestamp::parse("2024-06-01 12:00:00")
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(
+            format(timestamp_at_session_zone(wall, &ny)?, &ny),
+            "2024-06-01 12:00:00-04"
+        );
+        // ... and back the other way.
+        let instant = parse("2024-06-01 12:00:00+00", &ny)?;
+        assert_eq!(
+            timestamp::format(session_zone_wall_clock(instant, &ny)?),
+            "2024-06-01 08:00:00"
+        );
+        // Both are an identity under UTC, which is why this used to look right.
+        assert_eq!(timestamp_at_session_zone(wall, &utc())?, wall);
+        assert_eq!(session_zone_wall_clock(wall, &utc())?, wall);
+        // The infinities are zone-independent.
+        assert_eq!(timestamp_at_session_zone(POS_INFINITY, &ny)?, POS_INFINITY);
+        assert_eq!(session_zone_wall_clock(NEG_INFINITY, &ny)?, NEG_INFINITY);
+        Ok(())
     }
 }

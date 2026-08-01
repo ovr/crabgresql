@@ -29,10 +29,11 @@ use crabgresql_storage_api::{
     TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
-use crabgresql_types::{PgType, Value};
+use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::catalog::{SessionCatalog, SessionCatalogOps};
 use crate::error::PgError;
+use crate::guc;
 use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
 use crate::global_catalog::{
     ArgMode, CatalogNotice, FuncBody, FuncDropSpec, FuncInfo, GlobalCatalog, RoutineArg,
@@ -160,6 +161,9 @@ pub enum RowTag {
     /// `FETCH`, whose count is the rows this fetch returned — not the cursor's
     /// size and not its position.
     Fetch,
+    /// `SHOW`, whose tag carries no count — as with `EXPLAIN`, a driver reading
+    /// a trailing integer would report it as a row count.
+    Show,
 }
 
 impl RowTag {
@@ -172,6 +176,7 @@ impl RowTag {
             RowTag::Delete => format!("DELETE {count}"),
             RowTag::Explain => "EXPLAIN".to_string(),
             RowTag::Fetch => format!("FETCH {count}"),
+            RowTag::Show => "SHOW".to_string(),
         }
     }
 }
@@ -964,6 +969,9 @@ pub(crate) fn execute_statement_with(
                 return crate::cursor::execute_close(cursor, session);
             }
             ast::Statement::Set(set) => return apply_set(set, session),
+            ast::Statement::ShowVariable { variable } => {
+                return execute_show(variable, session);
+            }
             ast::Statement::Reset(reset) => return apply_reset(reset, session),
             ast::Statement::StartTransaction {
                 modes,
@@ -1796,6 +1804,9 @@ fn commit_transaction(
         ));
     }
     let mut notices = Vec::new();
+    // A COMMIT of a failed block is a rollback, so its plain `SET`s revert too.
+    let committed = session.tx_status != TransactionStatus::Failed;
+    session.restore_gucs_at_transaction_end(committed);
     let tag = match session.tx_status {
         // A COMMIT of a failed block rolls back: abort the block's XID so its
         // writes become dead.
@@ -1854,6 +1865,7 @@ fn rollback_transaction(
     }
     // Abort the block's XID: every version it wrote becomes dead, with no undo.
     abort_active(txnmgr, session);
+    session.restore_gucs_at_transaction_end(false);
     session.tx_status = TransactionStatus::Idle;
     Ok(QueryResult::Command {
         tag: "ROLLBACK".into(),
@@ -2219,7 +2231,7 @@ fn execute_create_index(
     };
     if create.unique {
         let txn = build_txn(txnmgr, session, false);
-        validate_unique_index_build(&table, &index, &txn)?;
+        validate_unique_index_build(&table, &index, &txn, &session.fmt_ctx())?;
     }
     engine.create_index("public", &table_name, index)?;
     Ok(QueryResult::command("CREATE INDEX"))
@@ -2229,6 +2241,7 @@ fn validate_unique_index_build(
     table: &Arc<dyn TableAm>,
     index: &IndexMetadata,
     txn: &TxnContext,
+    fmt: &FmtCtx,
 ) -> Result<(), PgError> {
     let schema = table.schema();
     let mut seen: Vec<crabgresql_storage_api::Tuple> = Vec::new();
@@ -2263,7 +2276,7 @@ fn validate_unique_index_build(
                 .iter()
                 .map(|key| {
                     tuple[key.column]
-                        .encode_text()
+                        .encode_text_with(fmt)
                         .unwrap_or_else(|| "null".to_string())
                 })
                 .collect::<Vec<_>>()
@@ -2297,11 +2310,16 @@ fn index_rows_equal(
     })
 }
 
-/// `SET`: honors `extra_float_digits`, `default_transaction_isolation`,
-/// `default_transaction_read_only`, and the `SET TRANSACTION` family; other GUCs
-/// are accepted and ignored (driver compatibility), as before.
+/// `SET`. Parameters are resolved through the [`crate::guc`] table; the
+/// `SET TRANSACTION` family is handled separately, and an unrecognized name is
+/// accepted and ignored for driver compatibility (see the `guc` module header).
+///
+/// The parser produces *two* shapes for the zone: `SET TIME ZONE 'x'` becomes
+/// [`ast::Set::SetTimeZone`], while `SET timezone TO 'x'` and
+/// `SET TIME ZONE = 'x'` are rewritten into a [`ast::Set::SingleAssignment`]
+/// whose variable is the literal string `TIMEZONE`. Both must be handled.
 fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgError> {
-    match set {
+    let (name, value, scope) = match set {
         ast::Set::SetTransaction {
             modes,
             snapshot,
@@ -2310,45 +2328,128 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
             return apply_set_transaction(session, modes, snapshot.is_some(), *is_session);
         }
         ast::Set::SingleAssignment {
-            variable, values, ..
-        } => match single_ident_lower(variable).as_deref() {
-            // `SET x = DEFAULT` restores each GUC's boot value (PG accepts it and
-            // resets rather than erroring on the "DEFAULT" token).
-            Some("extra_float_digits") => {
-                session.extra_float_digits = if is_set_default(values) {
-                    1
-                } else {
-                    let v = set_value_to_i32(values)?;
-                    if !(-15..=3).contains(&v) {
-                        return Err(PgError::new(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            format!(
-                                "{v} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)"
-                            ),
-                        ));
-                    }
-                    v
-                };
-            }
-            Some("default_transaction_isolation") => {
-                session.default_iso = if is_set_default(values) {
-                    IsolationLevel::ReadCommitted
-                } else {
-                    parse_default_isolation(values)?
-                };
-            }
-            Some("default_transaction_read_only") => {
-                session.default_read_only = if is_set_default(values) {
-                    false
-                } else {
-                    parse_set_bool(values, "default_transaction_read_only")?
-                };
-            }
-            _ => {}
-        },
-        _ => {}
+            variable,
+            values,
+            scope,
+            ..
+        } => {
+            let Some(name) = single_ident_lower(variable) else {
+                // A qualified name (`plpgsql.variable_conflict`) names no
+                // parameter we model; accept and ignore.
+                return Ok(QueryResult::command("SET"));
+            };
+            let Some(value) = set_value(values) else {
+                return Ok(QueryResult::command("SET"));
+            };
+            (name, value, *scope)
+        }
+        ast::Set::SetTimeZone { local, value } => {
+            let scope = local.then_some(ast::ContextModifier::Local);
+            (
+                "timezone".to_string(),
+                timezone_value(value)?,
+                scope,
+            )
+        }
+        // SET ROLE / SET NAMES / SESSION AUTHORIZATION: accepted and ignored.
+        _ => return Ok(QueryResult::command("SET")),
+    };
+
+    let Some(def) = guc::lookup(&name) else {
+        return Ok(QueryResult::command("SET"));
+    };
+    let Some(setter) = def.set else {
+        return Err(guc::cannot_be_changed(def.name));
+    };
+
+    let local = scope == Some(ast::ContextModifier::Local);
+    let mut notices = Vec::new();
+    if local && session.tx_status == TransactionStatus::Idle {
+        // PG warns and does nothing: there is no transaction for the setting to
+        // be local to.
+        notices.push(Notice::warning(
+            sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+            "SET LOCAL can only be used in transaction blocks",
+        ));
+        return Ok(QueryResult::Command {
+            tag: "SET".into(),
+            notices,
+        });
     }
-    Ok(QueryResult::command("SET"))
+    session.save_guc_for_transaction(def, local);
+    setter(session, value)?;
+    Ok(QueryResult::Command {
+        tag: "SET".into(),
+        notices,
+    })
+}
+
+/// Reduce a `SET x = <value>` operand list to a [`guc::GucValue`]. `DEFAULT`
+/// (the bare keyword) means the boot value.
+fn set_value(values: &[ast::Expr]) -> Option<guc::GucValue> {
+    if is_set_default(values) {
+        return Some(guc::GucValue::Default);
+    }
+    set_value_to_string(values).map(guc::GucValue::Str)
+}
+
+/// Reduce a `SET TIME ZONE <expr>` operand.
+///
+/// `DEFAULT` and `LOCAL` both restore the boot value. A bare number is an
+/// east-signed hour offset — the opposite convention from the string form, which
+/// is POSIX (see [`guc`]) — so it is kept as a distinct variant rather than
+/// stringified. `INTERVAL` is not reduced yet.
+fn timezone_value(value: &ast::Expr) -> Result<guc::GucValue, PgError> {
+    match value {
+        ast::Expr::Identifier(ident)
+            if ident.quote_style.is_none()
+                && (ident.value.eq_ignore_ascii_case("default")
+                    || ident.value.eq_ignore_ascii_case("local")) =>
+        {
+            Ok(guc::GucValue::Default)
+        }
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::Number(n, _) => hours_east(n, false),
+            other => other
+                .as_pg_string()
+                .map(|s| guc::GucValue::Str(s.to_string()))
+                .ok_or_else(|| unsupported_timezone_value()),
+        },
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            ast::Expr::Value(v) => match &v.value {
+                ast::Value::Number(n, _) => hours_east(n, true),
+                _ => Err(unsupported_timezone_value()),
+            },
+            _ => Err(unsupported_timezone_value()),
+        },
+        ast::Expr::Identifier(ident) => Ok(guc::GucValue::Str(ident.value.clone())),
+        _ => Err(unsupported_timezone_value()),
+    }
+}
+
+/// `SET TIME ZONE <n>`: `n` hours east of UTC.
+fn hours_east(digits: &str, negative: bool) -> Result<guc::GucValue, PgError> {
+    let hours: f64 = digits.parse().map_err(|_| unsupported_timezone_value())?;
+    let secs = (hours * 3600.0).round();
+    if !(-16.0 * 3600.0..=16.0 * 3600.0).contains(&secs) {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("invalid value for parameter \"TimeZone\": \"{digits}\""),
+        ));
+    }
+    let secs = secs as i32;
+    Ok(guc::GucValue::OffsetSecondsEast(if negative {
+        -secs
+    } else {
+        secs
+    }))
+}
+
+fn unsupported_timezone_value() -> PgError {
+    PgError::feature_not_supported("this SET TIME ZONE value form is not supported yet")
 }
 
 /// `SET TRANSACTION …` (the current transaction) or `SET SESSION CHARACTERISTICS
@@ -2407,42 +2508,6 @@ fn apply_set_transaction(
     Ok(QueryResult::command("SET"))
 }
 
-/// Parse the value of `default_transaction_isolation`. Accepts PG's spellings
-/// (`read committed`/`repeatable read`/`serializable`, `read uncommitted` as an
-/// alias); an unrecognized value is an invalid-parameter error (22023).
-fn parse_default_isolation(values: &[ast::Expr]) -> Result<IsolationLevel, PgError> {
-    let raw = set_value_to_string(values);
-    match raw.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
-        Some(ref s) if s == "read uncommitted" || s == "read committed" => {
-            Ok(IsolationLevel::ReadCommitted)
-        }
-        Some(ref s) if s == "repeatable read" => Ok(IsolationLevel::RepeatableRead),
-        Some(ref s) if s == "serializable" => Ok(IsolationLevel::Serializable),
-        _ => Err(PgError::new(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            format!(
-                "invalid value for parameter \"default_transaction_isolation\": \"{}\"",
-                raw.unwrap_or_default()
-            ),
-        )),
-    }
-}
-
-/// Parse a Boolean GUC value using PG's boolean spellings (any unambiguous
-/// prefix of true/false/yes/no/off, `on`, `1`/`0`). An unrecognized value is an
-/// invalid-parameter error (22023).
-fn parse_set_bool(values: &[ast::Expr], param: &str) -> Result<bool, PgError> {
-    set_value_to_string(values)
-        .as_deref()
-        .and_then(crabgresql_types::parse_bool)
-        .ok_or_else(|| {
-            PgError::new(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                format!("parameter \"{param}\" requires a Boolean value"),
-            )
-        })
-}
-
 /// Whether a `SET var = value` names the literal `DEFAULT` keyword, which resets
 /// the GUC to its boot value.
 fn is_set_default(values: &[ast::Expr]) -> bool {
@@ -2466,29 +2531,95 @@ fn set_value_to_string(exprs: &[ast::Expr]) -> Option<String> {
             other => other.as_pg_string().map(str::to_string),
         },
         ast::Expr::Identifier(ident) => Some(ident.value.clone()),
+        // A negative number parses as a unary minus over the digits, not as a
+        // `Number` token — `SET extra_float_digits = -1` and the `TO -3` form
+        // both arrive this way, and dropping them silently ignores the SET.
+        ast::Expr::UnaryOp {
+            op: op @ (ast::UnaryOperator::Minus | ast::UnaryOperator::Plus),
+            expr,
+        } => {
+            let inner = set_value_to_string(std::slice::from_ref(expr.as_ref()))?;
+            Some(if matches!(op, ast::UnaryOperator::Minus) {
+                format!("-{inner}")
+            } else {
+                inner
+            })
+        }
         _ => None,
     }
 }
 
-/// `RESET <param>` / `RESET ALL` restore the session defaults:
-/// `extra_float_digits`=1, `default_transaction_isolation`=READ COMMITTED,
-/// `default_transaction_read_only`=off.
+/// `RESET <param>` / `RESET ALL`: restore boot values through the [`crate::guc`]
+/// table. An unrecognized name is accepted and ignored, as `SET` does.
 fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<QueryResult, PgError> {
-    let (all, name) = match &reset.reset {
-        ast::Reset::ALL => (true, None),
-        ast::Reset::ConfigurationParameter(name) => (false, single_ident_lower(name)),
-    };
-    let hit = |param: &str| all || name.as_deref() == Some(param);
-    if hit("extra_float_digits") {
-        session.extra_float_digits = 1;
-    }
-    if hit("default_transaction_isolation") {
-        session.default_iso = IsolationLevel::ReadCommitted;
-    }
-    if hit("default_transaction_read_only") {
-        session.default_read_only = false;
+    match &reset.reset {
+        ast::Reset::ALL => {
+            for def in guc::GUCS {
+                session.save_guc_for_transaction(def, false);
+                def.reset(session)?;
+            }
+        }
+        ast::Reset::ConfigurationParameter(name) => {
+            let Some(def) = single_ident_lower(name).and_then(|n| guc::lookup(&n)) else {
+                return Ok(QueryResult::command("RESET"));
+            };
+            session.save_guc_for_transaction(def, false);
+            def.reset(session)?;
+        }
     }
     Ok(QueryResult::command("RESET"))
+}
+
+/// `SHOW <name>` / `SHOW ALL`.
+///
+/// `SHOW TIME ZONE` reaches here as two identifiers (`TIME`, `ZONE`), so the
+/// parts are joined before lookup — that is also how `SHOW TRANSACTION
+/// ISOLATION LEVEL`-style multi-word names would resolve. Unlike `SET`, an
+/// unrecognized name is an error: there is no value to invent.
+fn execute_show(variable: &[ast::Ident], session: &Session) -> Result<QueryResult, PgError> {
+    let joined = variable
+        .iter()
+        .map(|i| i.value.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    if variable.len() == 1 && variable[0].value.eq_ignore_ascii_case("all") {
+        let rows = guc::GUCS
+            .iter()
+            .map(|def| {
+                vec![
+                    Value::Text(def.name.to_string()),
+                    Value::Text((def.show)(session)),
+                    Value::Text(def.description.to_string()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        return Ok(show_result(
+            &["name", "setting", "description"],
+            rows,
+        ));
+    }
+    let Some(def) = guc::lookup(&joined) else {
+        return Err(guc::unrecognized(&joined.to_ascii_lowercase()));
+    };
+    Ok(show_result(
+        &[def.name],
+        vec![vec![Value::Text((def.show)(session))]],
+    ))
+}
+
+/// A materialized `SHOW` result set. Every column is `text`, and the command tag
+/// is the bare `SHOW` — not `SELECT n`, whose trailing integer a driver would
+/// report as a row count.
+fn show_result(names: &[&str], rows: Vec<Vec<Value>>) -> QueryResult {
+    QueryResult::Rows {
+        columns: names
+            .iter()
+            .map(|name| OutputColumn::new((*name).to_string(), PgType::Text))
+            .collect(),
+        node: Box::new(MaterializedRows::new(rows)),
+        tag: RowTag::Show,
+        notices: Vec::new(),
+    }
 }
 
 /// A single-part object name, lowercased (GUC names are case-insensitive).
@@ -2497,39 +2628,6 @@ fn single_ident_lower(name: &ast::ObjectName) -> Option<String> {
         return None;
     }
     name.0[0].as_ident().map(normalize_ident)
-}
-
-fn set_value_to_i32(exprs: &[ast::Expr]) -> Result<i32, PgError> {
-    let [expr] = exprs else {
-        return Err(PgError::new(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "parameter \"extra_float_digits\" requires an integer value",
-        ));
-    };
-    parse_i32_expr(expr).ok_or_else(|| {
-        PgError::new(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "parameter \"extra_float_digits\" requires an integer value",
-        )
-    })
-}
-
-fn parse_i32_expr(expr: &ast::Expr) -> Option<i32> {
-    match expr {
-        ast::Expr::Value(v) => match &v.value {
-            ast::Value::Number(n, _) => n.parse().ok(),
-            other => other.as_pg_string()?.trim().parse().ok(),
-        },
-        ast::Expr::UnaryOp {
-            op: ast::UnaryOperator::Minus,
-            expr,
-        } => parse_i32_expr(expr).map(|v| -v),
-        ast::Expr::UnaryOp {
-            op: ast::UnaryOperator::Plus,
-            expr,
-        } => parse_i32_expr(expr),
-        _ => None,
-    }
 }
 
 fn statement_kind(stmt: &ast::Statement) -> String {

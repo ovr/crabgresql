@@ -25,6 +25,8 @@ pub const UNDEFINED_COLUMN: &str = "42703";
 pub const AMBIGUOUS_COLUMN: &str = "42702";
 pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
 pub const UNDEFINED_OBJECT: &str = "42704";
+/// A configuration parameter exists but cannot be assigned.
+pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
 pub const UNDEFINED_FUNCTION: &str = "42883";
 pub const AMBIGUOUS_FUNCTION: &str = "42725";
 pub const WRONG_OBJECT_TYPE: &str = "42809";

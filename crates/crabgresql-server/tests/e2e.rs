@@ -9235,3 +9235,353 @@ async fn a_row_that_cannot_be_shrunk_reports_program_limit_exceeded() {
         .expect("the session must still be usable");
     assert_eq!(row.get::<_, i64>(0), 0);
 }
+
+// --- session TimeZone GUC -------------------------------------------------
+//
+// Every expected value below is pinned against PostgreSQL 18.4.
+
+/// The single value of a one-row, one-column simple query.
+async fn scalar(client: &tokio_postgres::Client, sql: &str) -> String {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("`{sql}` should succeed: {e}"))
+        .iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("`{sql}` should return a row"))
+}
+
+#[tokio::test]
+async fn timezone_guc_drives_timestamptz_input_and_output() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // The boot value is UTC (PG's is the host zone; ours keeps test output
+    // stable), and `SHOW TIME ZONE` is the same parameter under a two-word
+    // spelling.
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "UTC");
+    assert_eq!(scalar(&client, "SHOW TIME ZONE").await, "UTC");
+    assert_eq!(scalar(&client, "SHOW timezone").await, "UTC");
+
+    client.simple_query("SET TIME ZONE 'America/New_York'").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "America/New_York");
+
+    // A zone-less literal is read in the session zone; one carrying a zone
+    // token keeps its instant and is merely rendered in the session zone.
+    assert_eq!(
+        scalar(&client, "SELECT '2024-06-01 12:00:00'::timestamptz").await,
+        "2024-06-01 12:00:00-04"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT '2024-01-15 12:00:00'::timestamptz").await,
+        "2024-01-15 12:00:00-05"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT '2024-06-01 12:00:00+00'::timestamptz").await,
+        "2024-06-01 08:00:00-04"
+    );
+
+    // The other spelling reaches the same parameter, and a sub-hour zone
+    // widens the printed offset.
+    client.simple_query("SET timezone TO 'Asia/Kolkata'").await?;
+    assert_eq!(
+        scalar(&client, "SELECT '2024-06-01 12:00:00'::timestamptz").await,
+        "2024-06-01 12:00:00+05:30"
+    );
+
+    client.simple_query("RESET TimeZone").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "UTC");
+    assert_eq!(
+        scalar(&client, "SELECT '2024-06-01 12:00:00'::timestamptz").await,
+        "2024-06-01 12:00:00+00"
+    );
+    Ok(())
+}
+
+/// The conversions that were an identity only because the zone was UTC.
+#[tokio::test]
+async fn timezone_guc_drives_casts_and_field_functions() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'America/New_York'").await?;
+
+    let cases = [
+        // A wall clock read in the session zone, and an instant shown as one.
+        ("SELECT '2024-06-01 12:00:00'::timestamp::timestamptz", "2024-06-01 12:00:00-04"),
+        ("SELECT '2024-06-01 12:00:00+00'::timestamptz::timestamp", "2024-06-01 08:00:00"),
+        // A date widens to *local* midnight, and back to the local date.
+        ("SELECT '2024-06-01'::date::timestamptz", "2024-06-01 00:00:00-04"),
+        ("SELECT '2024-06-01 02:00:00+00'::timestamptz::date", "2024-05-31"),
+        ("SELECT make_timestamptz(2024, 6, 1, 12, 0, 0)", "2024-06-01 12:00:00-04"),
+        // `date_trunc` re-resolves the offset from the truncated wall clock, so
+        // it lands on real local midnight on a spring-forward day.
+        (
+            "SELECT date_trunc('day', '2024-03-10 15:00:00-04'::timestamptz)",
+            "2024-03-10 00:00:00-05",
+        ),
+        // Offset fields report the session zone rather than a constant 0.
+        ("SELECT extract(timezone from '2024-01-15 12:00:00-05'::timestamptz)", "-18000"),
+        ("SELECT extract(timezone_hour from '2024-01-15 12:00:00-05'::timestamptz)", "-5"),
+        // Ordinary fields read the local clock — 02:00 UTC on the 1st is still
+        // the 31st in New York — but `epoch` names the instant, so it does not.
+        ("SELECT extract(day from '2024-01-01 02:00:00+00'::timestamptz)", "31"),
+        (
+            "SELECT extract(epoch from '2024-01-01 02:00:00+00'::timestamptz)",
+            "1704074400.000000",
+        ),
+        // `to_char`'s TZ/OF report the zone, not a hardcoded UTC.
+        (
+            "SELECT to_char('2024-01-15 12:00:00-05'::timestamptz, 'HH24:MI TZ OF')",
+            "12:00 EST -05",
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(scalar(&client, sql).await, want, "for `{sql}`");
+    }
+    Ok(())
+}
+
+/// A `timestamptz` literal must not be folded into the plan at bind time: the
+/// binder has no session, so a statement prepared before a `SET TimeZone` would
+/// otherwise keep answering in the old zone.
+#[tokio::test]
+async fn prepared_statement_follows_a_later_set_timezone() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+    // `prepare` uses the extended protocol, so the statement is parsed once.
+    // Rendered as text because `timestamptz` has no binary output routine yet,
+    // which tokio-postgres would otherwise request.
+    let stmt = client
+        .prepare("SELECT ('2024-06-01 12:00:00'::timestamptz)::text")
+        .await?;
+
+    let before: String = client.query_one(&stmt, &[]).await?.get(0);
+    assert_eq!(before, "2024-06-01 12:00:00+00");
+
+    client.simple_query("SET TIME ZONE 'America/New_York'").await?;
+    let after: String = client.query_one(&stmt, &[]).await?.get(0);
+    assert_eq!(after, "2024-06-01 12:00:00-04");
+    Ok(())
+}
+
+/// A text bind parameter and an array literal must read their elements in the
+/// session zone too — both go through input functions the scalar literal shares.
+#[tokio::test]
+async fn parameters_and_arrays_use_the_session_zone() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'America/New_York'").await?;
+
+    let stmt = client.prepare("SELECT ($1::text)::timestamptz::text").await?;
+    let value: String = client
+        .query_one(&stmt, &[&"2024-06-01 12:00:00"])
+        .await?
+        .get(0);
+    assert_eq!(value, "2024-06-01 12:00:00-04");
+
+    assert_eq!(
+        scalar(&client, "SELECT '{2024-06-01 12:00:00}'::timestamptz[]").await,
+        "{\"2024-06-01 12:00:00-04\"}"
+    );
+    Ok(())
+}
+
+/// Configuration parameters are transactional in PG. A plain `SET` inside a
+/// block survives COMMIT but is undone by ROLLBACK; `SET LOCAL` is undone by
+/// either.
+#[tokio::test]
+async fn set_local_and_set_are_transactional() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client.simple_query("BEGIN").await?;
+    client.simple_query("SET LOCAL TimeZone = 'Asia/Tokyo'").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "Asia/Tokyo");
+    client.simple_query("COMMIT").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "UTC");
+
+    client.simple_query("BEGIN").await?;
+    client.simple_query("SET LOCAL TimeZone = 'Asia/Tokyo'").await?;
+    client.simple_query("ROLLBACK").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "UTC");
+
+    // A plain SET is kept by COMMIT ...
+    client.simple_query("BEGIN").await?;
+    client.simple_query("SET TimeZone = 'Asia/Tokyo'").await?;
+    client.simple_query("COMMIT").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "Asia/Tokyo");
+
+    // ... and undone by ROLLBACK.
+    client.simple_query("BEGIN").await?;
+    client.simple_query("SET TimeZone = 'Europe/Paris'").await?;
+    client.simple_query("ROLLBACK").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "Asia/Tokyo");
+    Ok(())
+}
+
+/// Outside a block there is nothing for a `SET LOCAL` to be local to, so PG
+/// warns and does nothing.
+#[tokio::test]
+async fn set_local_outside_a_transaction_warns() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET LOCAL TimeZone = 'Asia/Tokyo'").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "UTC");
+    Ok(())
+}
+
+#[tokio::test]
+async fn guc_errors_match_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    let err = client
+        .simple_query("SET TimeZone = 'Nowhere/Nozone'")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::INVALID_PARAMETER_VALUE);
+    assert_eq!(
+        db.message(),
+        "invalid value for parameter \"TimeZone\": \"Nowhere/Nozone\""
+    );
+    // The failed SET left the old value in place.
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "UTC");
+
+    let err = client.simple_query("SHOW bogus_param").await.unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::UNDEFINED_OBJECT);
+    assert_eq!(
+        db.message(),
+        "unrecognized configuration parameter \"bogus_param\""
+    );
+
+    let err = client
+        .simple_query("SET server_version = '1'")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::CANT_CHANGE_RUNTIME_PARAM);
+    assert_eq!(db.message(), "parameter \"server_version\" cannot be changed");
+
+    // Divergence, on purpose: an unrecognized *name* is accepted by SET (PG
+    // raises 42704). Drivers set parameters we do not model.
+    client.simple_query("SET application_name = 'x'").await?;
+    Ok(())
+}
+
+/// The numeric `SET TIME ZONE` forms count *east*, while a bare numeric string
+/// is POSIX and counts west — opposite conventions for the same digits.
+#[tokio::test]
+async fn timezone_numeric_forms_follow_pg_sign_conventions() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client.simple_query("SET TIME ZONE 7").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "<+07>-07");
+    assert_eq!(
+        scalar(&client, "SELECT '2024-06-01 12:00:00+00'::timestamptz").await,
+        "2024-06-01 19:00:00+07"
+    );
+
+    client.simple_query("SET TIME ZONE -5").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "<-05>+05");
+
+    // The string form is POSIX: `'+05:30'` puts the session at UTC-5:30.
+    client.simple_query("SET TimeZone = '+05:30'").await?;
+    assert_eq!(
+        scalar(&client, "SELECT '2024-06-01 12:00:00+00'::timestamptz").await,
+        "2024-06-01 06:30:00-05:30"
+    );
+
+    // Both `LOCAL` and `DEFAULT` restore the boot value.
+    client.simple_query("SET TIME ZONE LOCAL").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "UTC");
+
+    // Names are canonicalized to the tzdb spelling.
+    client.simple_query("SET TimeZone = 'america/new_york'").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "America/New_York");
+    Ok(())
+}
+
+/// `TimeZone` is `GUC_REPORT`: the server echoes a `ParameterStatus` whenever
+/// the value actually changes, including when a transaction reverts it.
+/// tokio-postgres hides these, so this drives a raw socket.
+#[tokio::test]
+async fn timezone_changes_emit_parameter_status() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    /// Run one simple query, returning the `ParameterStatus` pairs it emitted.
+    async fn query(
+        socket: &mut tokio::net::TcpStream,
+        sql: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        socket.write_all(&frontend_message(b'Q', &body)).await?;
+        Ok(read_until_ready(socket)
+            .await
+            .into_iter()
+            .filter(|(tag, _)| *tag == b'S')
+            .map(|(_, body)| {
+                let mut parts = body.split(|b| *b == 0);
+                let name = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                let value = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                (name, value)
+            })
+            .collect())
+    }
+
+    assert_eq!(
+        query(&mut socket, "SET TimeZone = 'Asia/Tokyo'").await?,
+        vec![("TimeZone".to_string(), "Asia/Tokyo".to_string())]
+    );
+    // Setting the same value again reports nothing: PG echoes changes, not SETs.
+    assert_eq!(query(&mut socket, "SET TimeZone = 'Asia/Tokyo'").await?, vec![]);
+    // A parameter that is not GUC_REPORT is never echoed.
+    assert_eq!(query(&mut socket, "SET extra_float_digits = 0").await?, vec![]);
+    assert_eq!(
+        query(&mut socket, "RESET TimeZone").await?,
+        vec![("TimeZone".to_string(), "UTC".to_string())]
+    );
+
+    // The revert at the end of a block is a change too, and must be reported —
+    // the case a design where each SET announces itself would miss.
+    query(&mut socket, "BEGIN").await?;
+    assert_eq!(
+        query(&mut socket, "SET LOCAL TimeZone = 'Europe/Paris'").await?,
+        vec![("TimeZone".to_string(), "Europe/Paris".to_string())]
+    );
+    assert_eq!(
+        query(&mut socket, "COMMIT").await?,
+        vec![("TimeZone".to_string(), "UTC".to_string())]
+    );
+
+    // An ordinary statement carries none.
+    assert_eq!(query(&mut socket, "SELECT 1").await?, vec![]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn show_all_lists_the_known_parameters() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let rows = client.simple_query("SHOW ALL").await?;
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(row) => row.get("name").map(str::to_string),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"TimeZone".to_string()), "got {names:?}");
+    assert!(names.contains(&"server_version".to_string()), "got {names:?}");
+    // Three columns: name, setting, description.
+    let first = rows
+        .iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(row) => Some(row.len()),
+            _ => None,
+        })
+        .expect("at least one row");
+    assert_eq!(first, 3);
+    Ok(())
+}
+

@@ -6,7 +6,7 @@
 //! case-insensitive unquoted `NULL` element — implemented independently. Only
 //! 1-D arrays are handled; a nested `{` is rejected as unsupported.
 
-use crate::{PgType, Value, cast, oid};
+use crate::{FmtCtx, PgType, Value, cast, oid};
 
 /// SQLSTATE + message (+ optional DETAIL) for a failed array input (`array_in`).
 /// The DETAIL mirrors PG's `array_in` (e.g. `Unexpected "," character.`); like
@@ -123,7 +123,7 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
 /// unquoted `NULL`; any other element is rendered with its own output function
 /// and double-quoted when it is empty, equals `NULL` case-insensitively, or
 /// contains a delimiter, brace, quote, backslash, or whitespace.
-pub fn format(elem: PgType, elems: &[Value], efd: i32) -> String {
+pub fn format(elem: PgType, elems: &[Value], fmt: &FmtCtx) -> String {
     let delim = elem.typdelim();
     let mut out = String::from("{");
     for (i, v) in elems.iter().enumerate() {
@@ -133,7 +133,7 @@ pub fn format(elem: PgType, elems: &[Value], efd: i32) -> String {
         match v {
             Value::Null => out.push_str("NULL"),
             _ => {
-                let s = v.encode_text_with(efd).unwrap_or_default();
+                let s = v.encode_text_with(fmt).unwrap_or_default();
                 if needs_quote(&s, delim) {
                     push_quoted(&mut out, &s);
                 } else {
@@ -175,7 +175,7 @@ fn push_quoted(out: &mut String, s: &str) {
 /// each element token to `elem` through the shared cast machinery (so an element
 /// parses exactly like the same scalar literal). An unquoted, case-insensitive
 /// `NULL` token is a NULL element; a quoted `"NULL"` is the text "NULL".
-pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
+pub fn array_in(input: &str, elem: PgType, fmt: &FmtCtx) -> Result<Vec<Value>, ArrayError> {
     let delim = elem.typdelim();
     let trimmed = input.trim();
     let mut chars = trimmed.chars().peekable();
@@ -210,7 +210,7 @@ pub fn array_in(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
         if !quoted && token.eq_ignore_ascii_case("null") {
             elems.push(Value::Null);
         } else {
-            let v = cast::cast_value(Value::Text(token), elem, 1).map_err(|e| ArrayError {
+            let v = cast::cast_value(Value::Text(token), elem, fmt).map_err(|e| ArrayError {
                 sqlstate: e.sqlstate,
                 message: e.message,
                 detail: None,
@@ -325,20 +325,20 @@ mod tests {
 
     #[test]
     fn round_trips_int_array() {
-        let elems = array_in("{1,2,3}", PgType::Int4).unwrap();
+        let elems = array_in("{1,2,3}", PgType::Int4, &FmtCtx::utc_default()).unwrap();
         assert_eq!(elems, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
-        assert_eq!(format(PgType::Int4, &elems, 1), "{1,2,3}");
+        assert_eq!(format(PgType::Int4, &elems, &FmtCtx::utc_default()), "{1,2,3}");
     }
 
     #[test]
     fn empty_array() {
-        assert_eq!(array_in("{}", PgType::Int4).unwrap(), vec![]);
-        assert_eq!(format(PgType::Int4, &[], 1), "{}");
+        assert_eq!(array_in("{}", PgType::Int4, &FmtCtx::utc_default()).unwrap(), vec![]);
+        assert_eq!(format(PgType::Int4, &[], &FmtCtx::utc_default()), "{}");
     }
 
     #[test]
     fn null_and_quoting() {
-        let elems = array_in(r#"{a,"b,c",NULL,"NULL",""}"#, PgType::Text).unwrap();
+        let elems = array_in(r#"{a,"b,c",NULL,"NULL",""}"#, PgType::Text, &FmtCtx::utc_default()).unwrap();
         assert_eq!(
             elems,
             vec![
@@ -351,20 +351,20 @@ mod tests {
         );
         // Round-trip: the delimiter/empty/NULL-lookalike elements are quoted.
         assert_eq!(
-            format(PgType::Text, &elems, 1),
+            format(PgType::Text, &elems, &FmtCtx::utc_default()),
             r#"{a,"b,c",NULL,"NULL",""}"#
         );
     }
 
     #[test]
     fn whitespace_between_elements_is_trimmed() {
-        let elems = array_in("{ 1 , 2 , 3 }", PgType::Int4).unwrap();
+        let elems = array_in("{ 1 , 2 , 3 }", PgType::Int4, &FmtCtx::utc_default()).unwrap();
         assert_eq!(elems, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
     }
 
     #[test]
     fn backslash_escape_in_quotes() {
-        let elems = array_in(r#"{"a\"b","c\\d"}"#, PgType::Text).unwrap();
+        let elems = array_in(r#"{"a\"b","c\\d"}"#, PgType::Text, &FmtCtx::utc_default()).unwrap();
         assert_eq!(
             elems,
             vec![Value::Text("a\"b".into()), Value::Text("c\\d".into())]
@@ -373,14 +373,14 @@ mod tests {
 
     #[test]
     fn malformed_missing_braces() {
-        assert!(array_in("1,2,3", PgType::Int4).is_err());
-        assert!(array_in("{1,2", PgType::Int4).is_err());
+        assert!(array_in("1,2,3", PgType::Int4, &FmtCtx::utc_default()).is_err());
+        assert!(array_in("{1,2", PgType::Int4, &FmtCtx::utc_default()).is_err());
     }
 
     #[test]
     fn malformed_detail_matches_pg() {
         // DETAIL strings verified against PostgreSQL's array_in.
-        let d = |s: &str| array_in(s, PgType::Text).unwrap_err().detail.unwrap();
+        let d = |s: &str| array_in(s, PgType::Text, &FmtCtx::utc_default()).unwrap_err().detail.unwrap();
         assert_eq!(d("1,2,3"), DETAIL_START);
         assert_eq!(d("abc"), DETAIL_START);
         assert_eq!(d("{1,2"), DETAIL_EOF);
@@ -395,11 +395,11 @@ mod tests {
     fn empty_unquoted_element_is_malformed() {
         // A missing element between/around commas is malformed, but a quoted
         // empty string is a legitimate element.
-        assert!(array_in("{a,,c}", PgType::Text).is_err());
-        assert!(array_in("{1,}", PgType::Text).is_err());
-        assert!(array_in("{,1}", PgType::Text).is_err());
+        assert!(array_in("{a,,c}", PgType::Text, &FmtCtx::utc_default()).is_err());
+        assert!(array_in("{1,}", PgType::Text, &FmtCtx::utc_default()).is_err());
+        assert!(array_in("{,1}", PgType::Text, &FmtCtx::utc_default()).is_err());
         assert_eq!(
-            array_in(r#"{a,"",c}"#, PgType::Text).unwrap(),
+            array_in(r#"{a,"",c}"#, PgType::Text, &FmtCtx::utc_default()).unwrap(),
             vec![
                 Value::Text("a".into()),
                 Value::Text(String::new()),
@@ -413,11 +413,11 @@ mod tests {
         // A backslash-escaped trailing space is significant and must survive the
         // unquoted trailing-whitespace trim; an unescaped one is dropped.
         assert_eq!(
-            array_in("{a\\ }", PgType::Text).unwrap(),
+            array_in("{a\\ }", PgType::Text, &FmtCtx::utc_default()).unwrap(),
             vec![Value::Text("a ".into())]
         );
         assert_eq!(
-            array_in("{a }", PgType::Text).unwrap(),
+            array_in("{a }", PgType::Text, &FmtCtx::utc_default()).unwrap(),
             vec![Value::Text("a".into())]
         );
     }
@@ -427,7 +427,7 @@ mod tests {
         // PG's array_out only treats ASCII whitespace as needing quotes; a
         // non-breaking space (U+00A0) is left bare.
         assert_eq!(
-            format(PgType::Text, &[Value::Text("a\u{00A0}b".into())], 1),
+            format(PgType::Text, &[Value::Text("a\u{00A0}b".into())], &FmtCtx::utc_default()),
             "{a\u{00A0}b}"
         );
     }
@@ -436,7 +436,7 @@ mod tests {
     fn box_arrays_use_a_semicolon_delimiter() -> Result<(), ArrayError> {
         // `box` is the one built-in with `typdelim = ';'`, because its own
         // output text contains commas.
-        let elems = array_in("{(1,1),(0,0);(3,3),(2,2)}", PgType::Box)?;
+        let elems = array_in("{(1,1),(0,0);(3,3),(2,2)}", PgType::Box, &FmtCtx::utc_default())?;
         assert_eq!(
             elems,
             vec![
@@ -446,7 +446,7 @@ mod tests {
         );
         // Round-trips unquoted: a comma is no longer the delimiter, so the
         // element text does not need quoting.
-        assert_eq!(format(PgType::Box, &elems, 1), "{(1,1),(0,0);(3,3),(2,2)}");
+        assert_eq!(format(PgType::Box, &elems, &FmtCtx::utc_default()), "{(1,1),(0,0);(3,3),(2,2)}");
         Ok(())
     }
 

@@ -19,7 +19,8 @@ use crabgresql_types::json;
 use crabgresql_types::json::Jsonb;
 use crabgresql_types::jsonpath;
 use crabgresql_types::{
-    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, formatting, formatting_num,
+    FmtCtx, Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, formatting,
+    formatting_num,
     geo, interval, macaddr, money, net, pg_lsn, text, time, timestamp, timestamptz, timetz,
 };
 
@@ -55,14 +56,20 @@ fn out_of_range_input() -> ExecError {
 
 /// Evaluate a scalar function. All functions are STRICT: a NULL argument yields
 /// NULL without invoking the function.
-pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
+///
+/// Still a pure function — `fmt` is session *state*, not a handle to anything
+/// side-effecting. It is threaded in because rendering a value to text
+/// (`concat`, `format`, `… ::text`) and every `timestamptz` operation depend on
+/// `extra_float_digits` and the session `TimeZone`. Functions needing a real
+/// handle (sequences, the catalog) are dispatched ahead of this in `eval.rs`.
+pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value, ExecError> {
     // Non-strict string functions run even when arguments are NULL, so they are
     // handled before the STRICT NULL short-circuit below.
     match func {
         ScalarFn::Concat => {
             let mut out = String::new();
             for a in args {
-                if let Some(s) = a.encode_text() {
+                if let Some(s) = a.encode_text_with(fmt) {
                     out.push_str(&s);
                 }
             }
@@ -70,27 +77,27 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         ScalarFn::ConcatWs => {
             // A NULL separator yields NULL; the remaining NULL args are skipped.
-            let Some(sep) = args.first().and_then(|a| a.encode_text()) else {
+            let Some(sep) = args.first().and_then(|a| a.encode_text_with(fmt)) else {
                 return Ok(Value::Null);
             };
-            let parts: Vec<String> = args[1..].iter().filter_map(|a| a.encode_text()).collect();
+            let parts: Vec<String> = args[1..].iter().filter_map(|a| a.encode_text_with(fmt)).collect();
             return Ok(Value::Text(parts.join(&sep)));
         }
         ScalarFn::Format => {
             // A NULL format string yields NULL.
-            let Some(fmt) = args.first().and_then(|a| a.encode_text()) else {
+            let Some(picture) = args.first().and_then(|a| a.encode_text_with(fmt)) else {
                 return Ok(Value::Null);
             };
             let fmt_args: Vec<text::FormatArg> =
-                args[1..].iter().map(|a| a.encode_text()).collect();
-            return text::format(&fmt, &fmt_args)
+                args[1..].iter().map(|a| a.encode_text_with(fmt)).collect();
+            return text::format(&picture, &fmt_args)
                 .map(Value::Text)
                 .map_err(text_err);
         }
         // quote_nullable is non-strict: a NULL argument becomes the text `NULL`.
         ScalarFn::QuoteNullable => {
             return Ok(Value::Text(text::quote_nullable(
-                args[0].encode_text().as_deref(),
+                args[0].encode_text_with(fmt).as_deref(),
             )));
         }
         // array_to_string is strict on the array and delimiter, but not on the
@@ -113,7 +120,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                             parts.push(ns.to_string());
                         }
                     }
-                    _ => parts.push(v.encode_text().unwrap_or_default()),
+                    _ => parts.push(v.encode_text_with(fmt).unwrap_or_default()),
                 }
             }
             return Ok(Value::Text(parts.join(delim)));
@@ -559,7 +566,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         ScalarFn::DatePartTz => {
             return Ok(
-                match timestamptz::date_part(text(&args[0]), tstz(&args[1])).map_err(ts_err)? {
+                match timestamptz::date_part(text(&args[0]), tstz(&args[1]), &fmt.zone).map_err(ts_err)? {
                     Some(v) => Value::Float8(v),
                     None => Value::Null,
                 },
@@ -567,14 +574,14 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
         }
         ScalarFn::ExtractTz => {
             return Ok(
-                match timestamptz::extract(text(&args[0]), tstz(&args[1])).map_err(ts_err)? {
+                match timestamptz::extract(text(&args[0]), tstz(&args[1]), &fmt.zone).map_err(ts_err)? {
                     Some(n) => Value::Numeric(n),
                     None => Value::Null,
                 },
             );
         }
         ScalarFn::DateTruncTz => {
-            return timestamptz::date_trunc(text(&args[0]), tstz(&args[1]))
+            return timestamptz::date_trunc(text(&args[0]), tstz(&args[1]), &fmt.zone)
                 .map(Value::TimestampTz)
                 .map_err(ts_err);
         }
@@ -592,6 +599,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 i4(&args[4]) as i64,
                 f8(&args[5]),
                 zone,
+                &fmt.zone,
             )
             .map(Value::TimestampTz)
             .map_err(ts_err);
@@ -899,7 +907,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 .map_err(fmt_err);
         }
         ScalarFn::ToCharTimestampTz => {
-            return formatting::to_char_timestamptz(tstz(&args[0]), text(&args[1]))
+            return formatting::to_char_timestamptz(tstz(&args[0]), text(&args[1]), &fmt.zone)
                 .map(null_or_text)
                 .map_err(fmt_err);
         }
@@ -909,7 +917,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value]) -> Result<Value, ExecError> {
                 .map_err(fmt_err);
         }
         ScalarFn::ToTimestampFormat => {
-            return formatting::from_char_timestamptz(text(&args[0]), text(&args[1]))
+            return formatting::from_char_timestamptz(text(&args[0]), text(&args[1]), &fmt.zone)
                 .map(Value::TimestampTz)
                 .map_err(fmt_err);
         }
@@ -2454,12 +2462,12 @@ mod tests {
             (true, true, true),
         ] {
             let args = [Value::Bool(left), Value::Bool(right)];
-            assert_eq!(eval_scalar(ScalarFn::BoolEq, &args)?, Value::Bool(equal));
-            assert_eq!(eval_scalar(ScalarFn::BoolNe, &args)?, Value::Bool(!equal));
+            assert_eq!(eval_scalar(ScalarFn::BoolEq, &args, &FmtCtx::utc_default())?, Value::Bool(equal));
+            assert_eq!(eval_scalar(ScalarFn::BoolNe, &args, &FmtCtx::utc_default())?, Value::Bool(!equal));
         }
         for func in [ScalarFn::BoolEq, ScalarFn::BoolNe] {
             assert_eq!(
-                eval_scalar(func, &[Value::Bool(true), Value::Null])?,
+                eval_scalar(func, &[Value::Bool(true), Value::Null], &FmtCtx::utc_default())?,
                 Value::Null
             );
         }
@@ -2468,7 +2476,7 @@ mod tests {
     }
 
     fn call(f: ScalarFn, x: f64) -> f64 {
-        let result = match eval_scalar(f, &[Value::Float8(x)]) {
+        let result = match eval_scalar(f, &[Value::Float8(x)], &FmtCtx::utc_default()) {
             Ok(value) => value,
             Err(error) => panic!("scalar-function test fixture failed: {error}"),
         };
@@ -2503,7 +2511,7 @@ mod tests {
     fn atanh_and_sign_preserve_nan() {
         assert!(call(ScalarFn::Atanh, f64::NAN).is_nan());
         assert_eq!(
-            eval_scalar(ScalarFn::Atanh, &[Value::Float8(2.0)])
+            eval_scalar(ScalarFn::Atanh, &[Value::Float8(2.0)], &FmtCtx::utc_default())
                 .unwrap_err()
                 .code,
             "22003"

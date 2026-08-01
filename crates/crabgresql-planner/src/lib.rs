@@ -1161,8 +1161,12 @@ fn push_root_property(lines: &mut Vec<String>, property: String) {
 /// references render by name against `schema`.
 fn explain_expr(expr: &BoundExpr, names: &[Option<&str>]) -> String {
     match expr {
+        // Divergence: rendered in UTC at the default `extra_float_digits`,
+        // because `EXPLAIN` output is built without a session context. A
+        // `timestamptz` constant in a condition therefore prints its UTC wall
+        // clock where PG would print the session zone's.
         BoundExpr::Const { value, .. } => value
-            .encode_text_with(1)
+            .encode_text_utc()
             .unwrap_or_else(|| "NULL".to_string()),
         BoundExpr::ColumnRef { index, .. } => names
             .get(*index)
