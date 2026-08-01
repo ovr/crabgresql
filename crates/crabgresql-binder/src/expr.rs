@@ -7525,7 +7525,8 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
 ///   here tested only `Text`, so `1.5::float8::varchar` folded at the default
 ///   precision and silently ignored the session's setting.)
 /// * `TimeZone`, for every `timestamptz` conversion — the zone is what relates
-///   an instant to a wall clock, in both directions.
+///   an instant to a wall clock, in both directions — and for `time -> timetz`,
+///   which attaches the zone's offset.
 ///
 /// **Known divergence.** PostgreSQL folds a `timestamptz` literal during parse
 /// analysis using the parsing session's zone, so the instant is frozen; we defer
@@ -7540,6 +7541,11 @@ fn fold_needs_session(from: Option<PgType>, to: PgType) -> bool {
         to,
         PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name
     ) {
+        return true;
+    }
+    // `time -> timetz` attaches the session zone's standard offset, so it has
+    // to be deferred too even though neither type's own I/O consults the zone.
+    if from == Some(PgType::Time) && to == PgType::TimeTz {
         return true;
     }
     depends_on_session_zone(to) || from.is_some_and(depends_on_session_zone)

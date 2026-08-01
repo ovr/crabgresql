@@ -173,5 +173,19 @@ SELECT date_trunc('day', timestamptz '2024-03-10 15:00:00-04') AS spring_forward
 -- to_char's OF never widens to seconds, where timestamptz output does
 SELECT to_char(timestamptz '1875-06-01 12:00:00', 'OF') AS of_lmt;
 SELECT timestamptz '1875-06-01 12:00:00' AS out_lmt;
+-- TZH/TZM split the same offset OF renders: the sign rides on the hours, the
+-- minutes are the bare magnitude, and neither widens to seconds
+SELECT to_char(timestamptz '2024-06-15 03:30:45+00', 'TZH:TZM|OF|TZ|tz') AS tzh_tzm;
+SELECT to_char(timestamptz '1875-06-01 12:00:00', 'TZH:TZM') AS tzh_lmt;
+-- casts down to the time-of-day types: a timestamptz is rotated into the
+-- session zone first, so a 03:30 UTC instant is the previous evening here, and
+-- timetz keeps the offset in effect at that instant
+SELECT timestamptz '2024-06-15 03:30:45.5+00'::time AS tstz_time,
+       timestamptz '2024-06-15 03:30:45.5+00'::timetz AS tstz_timetz,
+       timestamp '2024-06-15 03:30:45.5'::time AS ts_time;
+SELECT timestamptz '2024-01-15 03:30:45+00'::timetz AS winter_timetz;
+-- an infinite input casts to NULL rather than erroring
+SELECT timestamptz 'infinity'::time IS NULL AS inf_time_is_null,
+       timestamp '-infinity'::time IS NULL AS neg_inf_time_is_null;
 SET TimeZone = 'UTC';
 

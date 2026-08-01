@@ -9406,6 +9406,23 @@ async fn timezone_guc_drives_casts_and_field_functions() -> anyhow::Result<()> {
             "SELECT to_char('2024-01-15 12:00:00-05'::timestamptz, 'HH24:MI TZ OF')",
             "12:00 EST -05",
         ),
+        // TZH/TZM split that same offset — the sign on the hours, the bare
+        // magnitude on the minutes.
+        (
+            "SELECT to_char('2024-01-15 12:00:00-05'::timestamptz, 'TZH:TZM')",
+            "-05:00",
+        ),
+        // The time-of-day casts rotate into the session zone first, and
+        // `timetz` keeps the offset in effect at that instant.
+        ("SELECT '2024-06-15 03:30:45.5+00'::timestamptz::time", "23:30:45.5"),
+        (
+            "SELECT '2024-06-15 03:30:45.5+00'::timestamptz::timetz",
+            "23:30:45.5-04",
+        ),
+        ("SELECT '2024-06-15 03:30:45.5'::timestamp::time", "03:30:45.5"),
+        // `time -> timetz` attaches the zone's *standard* offset; PG uses the
+        // current date's, which this engine has no clock to ask for.
+        ("SELECT '03:30:45.5'::time::timetz", "03:30:45.5-05"),
     ];
     for (sql, want) in cases {
         assert_eq!(scalar(&client, sql).await, want, "for `{sql}`");

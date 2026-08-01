@@ -189,6 +189,36 @@ impl SessionZone {
         offset_for_local(&self.zone, tm)
     }
 
+    /// The zone's **standard-time** offset (seconds east), used by the
+    /// `time -> timetz` cast.
+    ///
+    /// Documented divergence: PG's `time_timetz` attaches the offset in effect
+    /// on the *current date*, so the same cast yields `-04` in a New York
+    /// summer and `-05` in winter. This engine has no clock at all — there is
+    /// no `now()`/`current_timestamp` — so it cannot ask that question. We take
+    /// the zone's non-DST offset instead, which is stable and agrees with PG
+    /// for the (majority) part of the year when DST is not in effect. Probing
+    /// two instants six months apart finds it in either hemisphere.
+    pub fn standard_offset(&self) -> i32 {
+        let tz = match &self.zone {
+            Zone::Fixed(secs) => return *secs,
+            Zone::Named(tz) => tz,
+        };
+        // January 1st and July 1st of the PG epoch year, as our micros-since-2000.
+        const JAN: i64 = 0;
+        const JUL: i64 = 182 * 86_400_000_000;
+        let jan = tz.to_offset_info(instant(JAN));
+        if !jan.dst().is_dst() {
+            return jan.offset().seconds();
+        }
+        let jul = tz.to_offset_info(instant(JUL));
+        if !jul.dst().is_dst() {
+            return jul.offset().seconds();
+        }
+        // Permanent-DST zones have no standard offset to find; take January's.
+        jan.offset().seconds()
+    }
+
     /// `to_char`'s `TZ` code at an instant. Empty when the zone has no
     /// abbreviation (a bare numeric GUC value), matching PG.
     pub fn abbrev_at(&self, micros: i64) -> String {
@@ -612,6 +642,31 @@ mod tests {
         let jul_micros = (995_315_920i64 - 946_684_800) * 1_000_000;
         assert_eq!(ny.abbrev_at(feb_micros), "EST");
         assert_eq!(ny.abbrev_at(jul_micros), "EDT");
+        Ok(())
+    }
+
+    #[test]
+    fn standard_offset_ignores_dst_in_either_hemisphere() -> anyhow::Result<()> {
+        assert_eq!(SessionZone::utc().standard_offset(), 0);
+        assert_eq!(
+            SessionZone::from_offset_east(7 * 3600)?.standard_offset(),
+            7 * 3600
+        );
+        // Northern: the January probe is already standard time.
+        assert_eq!(
+            SessionZone::resolve("America/New_York")?.standard_offset(),
+            -5 * 3600
+        );
+        // Southern: January is DST there, so the July probe is what answers.
+        assert_eq!(
+            SessionZone::resolve("Australia/Sydney")?.standard_offset(),
+            10 * 3600
+        );
+        // A zone that never observes DST, and a sub-hour one.
+        assert_eq!(
+            SessionZone::resolve("Asia/Kolkata")?.standard_offset(),
+            5 * 3600 + 1800
+        );
         Ok(())
     }
 }

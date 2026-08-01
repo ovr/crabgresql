@@ -54,6 +54,10 @@ SELECT to_char(timestamp '2024-03-05 14:00:00', '\HH24 "q"" YYYY"') AS quoted;
 SELECT to_char(timestamptz '2024-03-05 14:00:00+00', 'TZ|tz|OF') AS with_zone;
 SELECT '[' || to_char(timestamp '2024-03-05', 'TZ') || ']['
             || to_char(timestamp '2024-03-05', 'OF') || ']' AS without_zone;
+-- TZH/TZM take exactly the two spellings TZ does; a mixed-case TzH is literal,
+-- and neither honors FM
+SELECT to_char(timestamptz '2024-03-05 14:00:00+00', 'TZH|TZM|tzh|tzm|TzH|FMTZH') AS tzh_tzm;
+SELECT '[' || to_char(timestamp '2024-03-05', 'TZH:TZM') || ']' AS tzh_without_zone;
 
 -- NULL input and non-finite values yield NULL
 SELECT to_char(timestamp 'infinity', 'YYYY') IS NULL AS inf_is_null,
@@ -73,6 +77,7 @@ SELECT to_char(interval '1 year 2 mons 3 days 04:05:06',
 -- the calendar codes are not meaningful for an interval
 SELECT to_char(interval '1 day', 'Month');
 SELECT to_char(interval '1 day', 'TZ');
+SELECT to_char(interval '1 day', 'TZH');
 
 -- to_date / to_timestamp: defaults, separators, trailing garbage
 SELECT to_date('2024', 'YYYY') AS year_only,
@@ -125,6 +130,9 @@ SELECT to_timestamp(1e18);
 SELECT to_timestamp('2024-03-05 10:00:00 -05', 'YYYY-MM-DD HH24:MI:SS OF') AS spaced_of,
        to_timestamp('2024-03-05 10:00:00-05', 'YYYY-MM-DD HH24:MI:SSOF') AS tight_of,
        to_date('2024 -03', 'YYYY MM') AS separator_eats_one;
+-- TZH keeps its own sign the same way, and TZM takes it; both spacings work
+SELECT to_timestamp('2024-03-05 10:00:00 -05:30', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') AS spaced_tzh,
+       to_timestamp('2024-03-05 10:00:00+0530', 'YYYY-MM-DD HH24:MI:SSTZHTZM') AS tight_tzh;
 SELECT to_char(timestamp '2024-03-05 04:00:00', 'FM"a"HH24') AS fm_then_quote,
        to_char(interval '1 day', 'TH FM YYYY th') AS fm_then_space;
 

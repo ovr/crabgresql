@@ -7,7 +7,8 @@
 //!
 //! Supported codes: `YYYY YYY YY Y`, `MM`, `DD`, `HH HH12 HH24`, `MI`, `SS`,
 //! `MS`, `US`, `AM/PM/A.M./P.M.` and their lowercase spellings, `Month/MONTH/
-//! month`, `Mon/MON/mon`, `Day/DAY/day`, `Dy/DY/dy`, `TZ/tz`, `OF`, the `FM`
+//! month`, `Mon/MON/mon`, `Day/DAY/day`, `Dy/DY/dy`, `TZ/tz`, `TZH/tzh`,
+//! `TZM/tzm`, `OF`, the `FM`
 //! fill-mode prefix, the `TH`/`th` ordinal suffix, `"quoted"` literal text, and
 //! passthrough of anything else.
 //!
@@ -157,6 +158,11 @@ enum Code {
     },
     /// `OF`.
     TzOffset,
+    /// `TZH`/`tzh` — the signed hours of the offset. Renders the same either
+    /// way, so unlike `TzAbbr` there is no case to carry.
+    TzHour,
+    /// `TZM`/`tzm` — the unsigned minutes of the offset.
+    TzMinute,
 }
 
 impl Code {
@@ -171,6 +177,8 @@ impl Code {
                 | Code::DayAbbr(_)
                 | Code::TzAbbr { .. }
                 | Code::TzOffset
+                | Code::TzHour
+                | Code::TzMinute
         )
     }
 
@@ -269,6 +277,13 @@ const EXACT_CODES: &[(&str, Code)] = &[
             upper: false,
         },
     ),
+    // Ahead of `TZ`/`tz`, which are a prefix of these. Like `TZ`, PG matches
+    // them case-sensitively in exactly the two spellings — `TzH` is literal
+    // text, not a code.
+    ("TZH", Code::TzHour),
+    ("tzh", Code::TzHour),
+    ("TZM", Code::TzMinute),
+    ("tzm", Code::TzMinute),
     ("TZ", Code::TzAbbr { upper: true }),
     ("tz", Code::TzAbbr { upper: false }),
 ];
@@ -581,7 +596,9 @@ fn render_interval(code: Code, f: &IvFields, fm: bool) -> (String, i64) {
         | Code::DayName(_)
         | Code::DayAbbr(_)
         | Code::TzAbbr { .. }
-        | Code::TzOffset => (String::new(), 0),
+        | Code::TzOffset
+        | Code::TzHour
+        | Code::TzMinute => (String::new(), 0),
     }
 }
 
@@ -624,6 +641,23 @@ fn render_dt(code: Code, f: &DtFields, fm: bool) -> (String, i64) {
             crate::tz::format_offset_hours_minutes(f.zone.as_ref().map_or(0, |z| z.offset_secs)),
             0,
         ),
+        // `TZH`/`TZM` split the same offset `OF` renders, and drop the seconds
+        // the same way: the LMT-era `America/New_York` at `-04:56:02` is
+        // `-04` and `56`. The sign lives on the hours; the minutes are the
+        // magnitude, so `-03:30` is `-03` and `30`.
+        // `FM` does not reach either of them: PG prints both at a fixed width,
+        // so `to_char(…, 'FMTZH:TZM')` is still `-04:00`.
+        Code::TzHour => {
+            let secs = f.zone.as_ref().map_or(0, |z| z.offset_secs);
+            let sign = if secs < 0 { '-' } else { '+' };
+            let hours = secs.unsigned_abs() / 3600;
+            (format!("{sign}{hours:02}"), i64::from(hours))
+        }
+        Code::TzMinute => {
+            let secs = f.zone.as_ref().map_or(0, |z| z.offset_secs);
+            let mins = secs.unsigned_abs() % 3600 / 60;
+            (format!("{mins:02}"), i64::from(mins))
+        }
     }
 }
 
@@ -747,6 +781,11 @@ struct Parsed {
     usec: Option<i64>,
     /// Seconds east of UTC, from `TZ`/`OF`.
     offset: Option<i32>,
+    /// `TZH`/`TZM`, kept apart from `offset` because they arrive separately and
+    /// `TZM` carries no sign of its own — it takes the one `TZH` scanned.
+    tz_sign: Option<i32>,
+    tz_hour: Option<i32>,
+    tz_min: Option<i32>,
 }
 
 /// `to_timestamp(text, text)` → microseconds since 2000-01-01 UTC. An input
@@ -808,7 +847,7 @@ fn from_char(input: &str, fmt: &str) -> Result<(Tm, Option<i32>), FormatError> {
                 let next_takes_sign = matches!(
                     nodes.get(idx + 1),
                     Some(Node::Field {
-                        code: Code::TzOffset,
+                        code: Code::TzOffset | Code::TzHour,
                         ..
                     })
                 );
@@ -930,6 +969,26 @@ fn scan_field(
         }
         Code::TzOffset => {
             p.offset = Some(take_offset(chars, pos).ok_or_else(|| no_match("", spell))?);
+        }
+        // `TZH` owns the sign, which is optional (`'+05'`, `'-05'`, `'05'`).
+        // `TZM` is bare digits — the separator between them, if the picture has
+        // one, is eaten by the intervening literal.
+        Code::TzHour => {
+            let sign = match chars.get(*pos) {
+                Some('+') => 1,
+                Some('-') => -1,
+                _ => 0,
+            };
+            if sign != 0 {
+                *pos += 1;
+            }
+            let (hours, _) = take_digits(chars, pos, Some(2)).ok_or_else(|| no_match("", spell))?;
+            p.tz_sign = Some(if sign == 0 { 1 } else { sign });
+            p.tz_hour = Some(hours as i32);
+        }
+        Code::TzMinute => {
+            let (mins, _) = take_digits(chars, pos, Some(2)).ok_or_else(|| no_match("", spell))?;
+            p.tz_min = Some(mins as i32);
         }
         _ => {
             let width = if capped {
@@ -1147,7 +1206,13 @@ fn assemble(p: &Parsed) -> Result<(Tm, Option<i32>), FormatError> {
         p.sec.unwrap_or(0),
         p.usec.unwrap_or(0),
     );
-    Ok((t, p.offset))
+    // An explicit `OF`/`TZ` wins; otherwise `TZH`/`TZM` combine, both taking
+    // the sign `TZH` scanned.
+    let offset = p.offset.or_else(|| match (p.tz_hour, p.tz_min) {
+        (None, None) => None,
+        (h, m) => Some(p.tz_sign.unwrap_or(1) * (h.unwrap_or(0) * 3600 + m.unwrap_or(0) * 60)),
+    });
+    Ok((t, offset))
 }
 
 #[cfg(test)]
@@ -1245,7 +1310,8 @@ mod tests {
     #[test]
     fn interval_rejects_calendar_codes() {
         for fmt in [
-            "Month", "MONTH", "Mon", "MON", "Day", "DAY", "Dy", "DY", "TZ", "tz", "OF",
+            "Month", "MONTH", "Mon", "MON", "Day", "DAY", "Dy", "DY", "TZ", "tz", "OF", "TZH",
+            "TZM", "tzh", "tzm",
         ] {
             let zero = Interval {
                 months: 0,
@@ -1354,6 +1420,11 @@ mod tests {
         assert_eq!(tstz(STAMP, "TZ|tz|OF"), "UTC|utc|+00");
         // A plain timestamp has no zone abbreviation, but still reports +00.
         assert_eq!(ts(STAMP, "[TZ][OF]"), "[][+00]");
+        // `TZH`/`TZM` split the same offset, and like `TZ` match in exactly
+        // two spellings — a mixed-case `TzH` is literal text.
+        assert_eq!(tstz(STAMP, "TZH|TZM|tzh|tzm"), "+00|00|+00|00");
+        assert_eq!(tstz(STAMP, "TzH|TzM"), "TzH|TzM");
+        assert_eq!(ts(STAMP, "[TZH:TZM]"), "[+00:00]");
     }
 
     #[test]
@@ -1615,6 +1686,46 @@ mod tests {
         Ok(())
     }
 
+    /// `TZH`/`TZM` against the same zones, where the split matters: the sign
+    /// rides on the hours, and the minutes are the bare magnitude.
+    #[test]
+    fn to_char_splits_the_offset_into_tzh_tzm() -> anyhow::Result<()> {
+        let z = |n: &str| SessionZone::resolve(n).expect("real zone");
+        let at = |zone: &SessionZone, s: &str, fmt: &str| -> anyhow::Result<String> {
+            let v = crate::timestamptz::parse(s, zone).map_err(|e| anyhow::anyhow!(e.message))?;
+            Ok(to_char_timestamptz(v, fmt, zone)
+                .map_err(fe)?
+                .unwrap_or_default())
+        };
+
+        // A negative sub-hour offset: St. John's runs at -03:30 in January.
+        let stj = z("America/St_Johns");
+        assert_eq!(
+            at(&stj, "2024-01-15 12:00:00", "TZH TZM OF")?,
+            "-03 30 -03:30"
+        );
+        // And a positive one, Kathmandu at +05:45.
+        let ktm = z("Asia/Kathmandu");
+        assert_eq!(at(&ktm, "2024-01-15 12:00:00", "TZH TZM")?, "+05 45");
+
+        // Seconds are dropped, exactly as `OF` drops them: pre-1883 New York
+        // ran at -04:56:02.
+        let ny = z("America/New_York");
+        assert_eq!(at(&ny, "1875-06-01 12:00:00", "TZH:TZM OF")?, "-04:56 -04:56");
+
+        // `FM` does not reach either code — both keep their fixed width.
+        assert_eq!(at(&ny, "2024-06-01 12:00:00", "FMTZH:TZM")?, "-04:00");
+
+        // A plain `timestamp` has no zone and reads as +00:00, as `OF` does.
+        let ts = crate::timestamp::parse("2024-01-15 12:00:00")
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(
+            to_char_timestamp(ts, "TZH:TZM|OF|TZ").map_err(fe)?,
+            Some("+00:00|+00|".to_string())
+        );
+        Ok(())
+    }
+
     /// `to_timestamp` reads a zone-less input in the session zone; an input
     /// carrying its own `OF` is unaffected.
     #[test]
@@ -1627,6 +1738,28 @@ mod tests {
         assert_eq!(
             crate::timestamptz::format(explicit, &ny),
             "2024-06-01 08:00:00-04"
+        );
+        Ok(())
+    }
+
+    /// `TZH`/`TZM` on input, in both the separated and the glued spelling. The
+    /// leading literal must leave `TZH` its sign, the same hazard `OF` has.
+    #[test]
+    fn from_char_reads_tzh_tzm() -> anyhow::Result<()> {
+        let ny = SessionZone::resolve("America/New_York").expect("real zone");
+        let sep =
+            from_char_timestamptz("2024-06-15 10:00 -05:30", "YYYY-MM-DD HH24:MI TZH:TZM", &ny)
+                .map_err(fe)?;
+        assert_eq!(
+            crate::timestamptz::format(sep, &ny),
+            "2024-06-15 11:30:00-04"
+        );
+        let glued =
+            from_char_timestamptz("2024-06-15 10:00 +0530", "YYYY-MM-DD HH24:MI TZHTZM", &ny)
+                .map_err(fe)?;
+        assert_eq!(
+            crate::timestamptz::format(glued, &ny),
+            "2024-06-15 00:30:00-04"
         );
         Ok(())
     }

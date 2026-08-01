@@ -123,6 +123,14 @@ fn cast_err(e: crate::timestamp::TimestampError) -> CastError {
     }
 }
 
+/// The time-of-day part of a timestamp's microseconds, i.e. the offset into the
+/// day of the wall clock it denotes. `rem_euclid` so a BC timestamp (negative
+/// micros) still yields a forward-running time, matching PG's `time_t = ts %
+/// USECS_PER_DAY` normalization.
+fn time_of_day(micros: i64) -> i64 {
+    micros.rem_euclid(86_400_000_000)
+}
+
 /// Cast `v` to `to` in PostgreSQL's *assignment* context — PL/pgSQL `:=`,
 /// `SELECT … INTO`, and coercing a `RETURN` value to the declared type.
 ///
@@ -413,6 +421,36 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             Ok(Value::Date(date::from_timestamp_micros(wall)))
         }
 
+        // ---- timestamp / timestamptz → time / timetz ----
+        // The time-of-day of the wall clock, which for a `timestamptz` means
+        // the wall clock *in the session zone*. `timetz` additionally keeps
+        // that zone's offset at the instant. An infinite input is not an
+        // error: PG's `timestamp_time`/`timestamptz_time`/`timestamptz_timetz`
+        // all return NULL there.
+        (Value::Timestamp(m), PgType::Time) => Ok(if timestamp::is_finite(*m) {
+            Value::Time(time_of_day(*m))
+        } else {
+            Value::Null
+        }),
+        (Value::TimestampTz(m), PgType::Time) => {
+            if !timestamp::is_finite(*m) {
+                return Ok(Value::Null);
+            }
+            let wall = timestamptz::session_zone_wall_clock(*m, &fmt.zone).map_err(cast_err)?;
+            Ok(Value::Time(time_of_day(wall)))
+        }
+        (Value::TimestampTz(m), PgType::TimeTz) => {
+            if !timestamp::is_finite(*m) {
+                return Ok(Value::Null);
+            }
+            let wall = timestamptz::session_zone_wall_clock(*m, &fmt.zone).map_err(cast_err)?;
+            Ok(Value::TimeTz(TimeTz {
+                usec: time_of_day(wall),
+                // `TimeTz::zone` is seconds *west*, `offset_at` is east.
+                zone: -fmt.zone.offset_at(*m),
+            }))
+        }
+
         // ---- time ↔ interval ----
         // time → interval keeps the microseconds as the time-of-day span;
         // interval → time takes the time-of-day part (mod one day).
@@ -424,10 +462,12 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
         (Value::Interval(iv), PgType::Time) => Ok(Value::Time(iv.usec.rem_euclid(86_400_000_000))),
 
         // ---- time ↔ timetz ----
-        // time → timetz attaches the session zone (UTC); timetz → time drops it.
+        // time → timetz attaches the session zone; timetz → time drops it.
         (Value::Time(usec), PgType::TimeTz) => Ok(Value::TimeTz(TimeTz {
             usec: *usec,
-            zone: 0,
+            // Seconds *west*, and see `standard_offset` for why it is the
+            // standard-time offset rather than PG's current-date one.
+            zone: -fmt.zone.standard_offset(),
         })),
         (Value::TimeTz(v), PgType::Time) => Ok(Value::Time(v.usec)),
 
@@ -1602,6 +1642,72 @@ mod tests {
             &ny,
         )?;
         assert_eq!(cast_to(v, PgType::Date, &ny)?, "2024-05-31");
+        Ok(())
+    }
+
+    /// The time-of-day casts, pinned against PostgreSQL 18.4 under
+    /// `SET TimeZone = 'America/New_York'`.
+    #[test]
+    fn timestamp_casts_to_time_and_timetz() -> anyhow::Result<()> {
+        let ny = ny();
+        // A `timestamp` keeps its wall clock; a `timestamptz` is first rotated
+        // into the session zone, so an 03:30 UTC instant is 23:30 the day before.
+        let ts = cast_value(
+            Value::Text("2024-06-15 03:30:45.5".into()),
+            PgType::Timestamp,
+            &ny,
+        )?;
+        assert_eq!(cast_to(ts, PgType::Time, &ny)?, "03:30:45.5");
+
+        let tstz = cast_value(
+            Value::Text("2024-06-15 03:30:45.5+00".into()),
+            PgType::TimestampTz,
+            &ny,
+        )?;
+        assert_eq!(cast_to(tstz.clone(), PgType::Time, &ny)?, "23:30:45.5");
+        assert_eq!(cast_to(tstz, PgType::TimeTz, &ny)?, "23:30:45.5-04");
+
+        // The offset is the one in effect *at that instant*, so the same clock
+        // reading in January carries -05.
+        let winter = cast_value(
+            Value::Text("2024-01-15 03:30:45+00".into()),
+            PgType::TimestampTz,
+            &ny,
+        )?;
+        assert_eq!(cast_to(winter, PgType::TimeTz, &ny)?, "22:30:45-05");
+
+        // A BC timestamp still yields a forward-running time.
+        let bc = cast_value(
+            Value::Text("0044-03-15 10:20:30 BC".into()),
+            PgType::Timestamp,
+            &ny,
+        )?;
+        assert_eq!(cast_to(bc, PgType::Time, &ny)?, "10:20:30");
+
+        // An infinite input is NULL, not an error — as PG's `timestamp_time`
+        // and friends are.
+        for (text, ty, to) in [
+            ("infinity", PgType::Timestamp, PgType::Time),
+            ("-infinity", PgType::TimestampTz, PgType::Time),
+            ("infinity", PgType::TimestampTz, PgType::TimeTz),
+        ] {
+            let v = cast_value(Value::Text(text.into()), ty, &ny)?;
+            assert_eq!(cast_value(v, to, &ny)?, Value::Null);
+        }
+        Ok(())
+    }
+
+    /// `time -> timetz` attaches the session zone's standard offset. PG uses
+    /// the current date's offset instead; see `SessionZone::standard_offset`.
+    #[test]
+    fn time_to_timetz_attaches_the_session_zone() -> anyhow::Result<()> {
+        let ny = ny();
+        let t = cast_value(Value::Text("03:30:45.5".into()), PgType::Time, &ny)?;
+        assert_eq!(cast_to(t, PgType::TimeTz, &ny)?, "03:30:45.5-05");
+        // The default UTC session zone is unchanged.
+        let utc = FmtCtx::utc(1);
+        let t = cast_value(Value::Text("03:30:45.5".into()), PgType::Time, &utc)?;
+        assert_eq!(cast_to(t, PgType::TimeTz, &utc)?, "03:30:45.5+00");
         Ok(())
     }
 }
