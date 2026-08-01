@@ -203,23 +203,27 @@ SELECT '{"a":1}'::jsonb -> 1.5;
 ERROR:  operator does not exist: jsonb -> numeric
 LINE 1: SELECT '{"a":1}'::jsonb -> 1.5;
                                 ^
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 SELECT '[1,2]'::jsonb -> 1::bigint;
 ERROR:  operator does not exist: jsonb -> bigint
 LINE 1: SELECT '[1,2]'::jsonb -> 1::bigint;
                               ^
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 SELECT '{"a":1}'::jsonb #> ARRAY[1];
 ERROR:  operator does not exist: jsonb #> integer[]
 LINE 1: SELECT '{"a":1}'::jsonb #> ARRAY[1];
                                 ^
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 -- nor for a non-json left operand
 SELECT 'x'::text -> 'a';
 ERROR:  operator does not exist: text -> unknown
 LINE 1: SELECT 'x'::text -> 'a';
                          ^
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 -- with both operands untyped every candidate applies equally (42725, not 42883)
 SELECT '{"a":1}' -> 'a';
 ERROR:  operator is not unique: unknown -> unknown

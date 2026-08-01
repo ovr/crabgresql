@@ -10,6 +10,7 @@ pub mod eval;
 mod generate_series;
 mod md5;
 pub mod reg;
+pub mod ruleutils;
 pub mod scalar_fns;
 mod special_fns;
 pub mod vector;
@@ -70,6 +71,19 @@ pub trait SequenceOps: Send + Sync {
     fn lastval(&self) -> Result<i64, ExecError>;
 }
 
+/// Read access to the session's GUC table, which the pure expression evaluator
+/// has no handle to. Backs `current_setting()`; the server supplies an
+/// implementation through [`ExecContext::gucs`].
+///
+/// The single method deliberately mirrors `SHOW`: both must render a setting the
+/// same way, and routing them through one implementation is what keeps them from
+/// drifting.
+pub trait GucOps: Send + Sync {
+    /// The setting's value as `SHOW` would render it, or `None` if the session
+    /// has no GUC by that (case-insensitive) name.
+    fn show(&self, name: &str) -> Option<String>;
+}
+
 /// Catalog lookups the pure expression evaluator cannot express: they read the
 /// session's `pg_catalog` snapshot, which `eval_scalar(func, &[Value])` has no
 /// handle to. The server supplies an implementation through
@@ -101,6 +115,13 @@ pub trait CatalogOps: Send + Sync {
     /// `PgType::from_name`), so these see only `CREATE TYPE` names.
     fn user_type_name(&self, oid: u32) -> Option<(String, String)>;
     fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
+    /// The SQL text stored for the view `namespace.name` and its column names,
+    /// or `None` if there is no such view. Handed back verbatim; re-parsing and
+    /// re-rendering it in PostgreSQL's canonical shape is [`crate::ruleutils`]'s
+    /// job, so an implementation never learns the SQL surface. The columns are
+    /// what a `SELECT *` in the body expands to, frozen at `CREATE VIEW` time.
+    /// Backs `pg_get_viewdef`.
+    fn view_sql(&self, namespace: Option<&str>, name: &str) -> Option<(String, Vec<String>)>;
 }
 
 /// Severity of a diagnostic produced during execution. `Debug` and `Log` reach
@@ -191,6 +212,10 @@ pub struct ExecContext {
     /// `pg_table_is_visible`) resolve against. `None` in the same non-executing
     /// contexts as `sequences`, and an internal `XX000` if one reaches it.
     pub catalog: Option<Arc<dyn CatalogOps>>,
+    /// The session's GUC table, for `current_setting()`. `None` in the same
+    /// non-executing contexts as `sequences`, and an internal `XX000` if one
+    /// reaches it.
+    pub gucs: Option<Arc<dyn GucOps>>,
     /// The transaction a correlated subquery re-executes against, per outer row.
     /// Injected by [`execute`] once, at the top of the statement, and cloned into
     /// every node so `eval` can run a correlated subplan when it reaches one.
@@ -227,6 +252,7 @@ impl Default for ExecContext {
             fmt: FmtCtx::utc_default(),
             sequences: None,
             catalog: None,
+            gucs: None,
             txn: None,
             routines: None,
             notices: None,
@@ -399,6 +425,7 @@ pub fn execute(
         fmt: ctx.fmt.clone(),
         sequences: ctx.sequences.clone(),
         catalog: ctx.catalog.clone(),
+        gucs: ctx.gucs.clone(),
         txn: Some(txn.clone()),
         routines: ctx.routines.clone(),
         notices: ctx.notices.clone(),

@@ -8,7 +8,8 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
 use crabgresql_executor::{
-    CatalogOps, ExecContext, ExecError, ExecNode, NoticeSink, OutputColumn, RoutineOps, SequenceOps,
+    CatalogOps, ExecContext, ExecError, ExecNode, GucOps, NoticeSink, OutputColumn, RoutineOps,
+    SequenceOps,
 };
 use crabgresql_plpgsql::RoutineCache;
 
@@ -521,6 +522,16 @@ impl SessionSequences {
     }
 }
 
+/// The statement's GUC values, frozen at the start of execution. See
+/// [`crate::guc::snapshot`] for why a snapshot is enough.
+struct GucSnapshot(std::collections::HashMap<String, String>);
+
+impl GucOps for GucSnapshot {
+    fn show(&self, name: &str) -> Option<String> {
+        self.0.get(&name.to_ascii_lowercase()).cloned()
+    }
+}
+
 impl SequenceOps for SessionSequences {
     fn nextval(&self, namespace: Option<&str>, name: &str) -> Result<i64, ExecError> {
         if self.read_only {
@@ -706,11 +717,16 @@ impl Session {
         FmtCtx::new(self.extra_float_digits, Arc::clone(&self.timezone))
     }
 
+    /// A context for evaluation outside a statement's normal execution path —
+    /// `EXPLAIN`'s constant rendering, a folded partition bound. It carries the
+    /// session's formatting *and* its GUC values, so a `current_setting()` in
+    /// one of those positions answers rather than raising an internal error.
     pub fn exec_context(&self) -> ExecContext {
         ExecContext {
             fmt: self.fmt_ctx(),
             sequences: None,
             catalog: None,
+            gucs: Some(Arc::new(GucSnapshot(crate::guc::snapshot(self)))),
             txn: None,
             ..ExecContext::default()
         }
@@ -738,6 +754,7 @@ impl Session {
                 read_only,
             ))),
             catalog: Some(Arc::clone(catalog)),
+            gucs: Some(Arc::new(GucSnapshot(crate::guc::snapshot(self)))),
             txn: None,
             routines: Some(routines),
             notices: Some(Arc::clone(&self.notices) as Arc<dyn NoticeSink>),

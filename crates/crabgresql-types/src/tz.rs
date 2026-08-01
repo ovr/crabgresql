@@ -128,23 +128,31 @@ impl SessionZone {
             return Ok(SessionZone::new(token.to_string(), None, Zone::Fixed(east)));
         }
 
-        // A curated abbreviation keeps its (upper-cased) spelling as both name
-        // and abbreviation.
-        let upper = token.to_ascii_uppercase();
-        if let Some(kind) = ABBREVS.iter().find(|(a, _)| *a == upper).map(|(_, k)| k) {
-            let zone = match kind {
-                Abbrev::Fixed(secs) => Zone::Fixed(*secs),
-                Abbrev::Zone(zone) => TimeZone::get(zone).map(Zone::Named).map_err(|_| not_recognized())?,
-            };
-            return Ok(SessionZone::new(upper.clone(), Some(upper), zone));
-        }
+        // Note what is *not* here: [`DATETIME_ABBREVS`]. The GUC namespace is
+        // narrower than the literal one — PG rejects `SET TimeZone = 'PDT'` and
+        // `SET TimeZone = 'MSK'`, while accepting both inside a datetime value.
+        // `EST`/`MST`/`HST` keep working below because they are IANA zone names
+        // in their own right, not because they are abbreviations.
 
         // A full IANA zone. `jiff`'s lookup is case-insensitive; report the
         // canonical spelling back, as PG does (`america/new_york` shows as
         // `America/New_York`).
-        let tz = TimeZone::get(token).map_err(|_| not_recognized())?;
-        let name = tz.iana_name().unwrap_or(token).to_string();
-        Ok(SessionZone::new(name, None, Zone::Named(tz)))
+        if let Ok(tz) = TimeZone::get(token) {
+            let name = tz.iana_name().unwrap_or(token).to_string();
+            return Ok(SessionZone::new(name, None, Zone::Named(tz)));
+        }
+
+        // The POSIX `<letters><±offset>` form, which — unlike the abbreviation
+        // table above — the GUC *does* accept: PG takes `SET TimeZone = 'UTC+5'`
+        // and echoes it back verbatim from `SHOW`. Same west-counting sign as in
+        // a value, so this is the one spelling that means the same in both
+        // namespaces.
+        let east = parse_abbrev_prefix_offset(token).ok_or_else(not_recognized)?;
+        Ok(SessionZone::new(
+            token.to_string(),
+            None,
+            Zone::Fixed(east),
+        ))
     }
 
     /// A fixed zone `secs` east of UTC, named with the POSIX spec PG reports for
@@ -273,8 +281,7 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
     // the tests exercise. Some are fixed offsets; the DST-varying ones map to a
     // reference IANA zone (e.g. MSK -> Europe/Moscow) so their offset tracks
     // that zone's history, matching PG.
-    let upper = token.to_ascii_uppercase();
-    if let Some(kind) = ABBREVS.iter().find(|(a, _)| *a == upper).map(|(_, k)| k) {
+    if let Some(kind) = lookup_abbrev(token) {
         return match kind {
             Abbrev::Fixed(secs) => Ok(Zone::Fixed(*secs)),
             Abbrev::Zone(zone) => TimeZone::get(zone)
@@ -284,9 +291,69 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
     }
 
     // A full IANA zone name.
-    TimeZone::get(token)
-        .map(Zone::Named)
-        .map_err(|_| ZoneError::NotRecognized(name.to_string()))
+    if let Ok(tz) = TimeZone::get(token) {
+        return Ok(Zone::Named(tz));
+    }
+
+    // Last resort: PG's abbreviation-prefix form, `<alpha><POSIX offset>` —
+    // `UTC+10`, `GMT+5`, and (verified against PG 18) `PDT+5` and even `XYZ+5`,
+    // which all mean the same thing. The prefix is *entirely ignored*; only the
+    // offset counts, and it is POSIX-signed (hours **west**), so `UTC+10` is
+    // UTC−10 — the opposite of the bare `+10` handled by `parse_fixed` above.
+    parse_abbrev_prefix_offset(token)
+        .map(Zone::Fixed)
+        .ok_or_else(|| ZoneError::NotRecognized(name.to_string()))
+}
+
+/// PG's `<abbrev><POSIX offset>` zone form. Returns seconds **east** of UTC.
+///
+/// The leading run of ASCII letters is discarded — PG does not check it against
+/// the abbreviation table, so `XYZ+5` resolves exactly like `UTC+5` (verified
+/// against PG 18). The remainder is a POSIX displacement, which counts hours
+/// *west*, so `UTC+10` is UTC−10 — the opposite of the bare `+10` that
+/// [`parse_fixed`] handles.
+///
+/// The accepted range is the wide [`MAX_GUC_OFFSET_SECS`] band, not the
+/// in-value [`MAX_TZ_DISPLACEMENT_SECS`] one: PG reads `UTC+167` but rejects
+/// both `UTC+168` and a bare `+16`. A fractional hour is truncated toward zero
+/// (`UTC+5.5` is UTC−5), as PG's POSIX reader does.
+fn parse_abbrev_prefix_offset(token: &str) -> Option<i32> {
+    let split = token.find(['+', '-'])?;
+    let (prefix, body) = token.split_at(split);
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let sign: i64 = if body.starts_with('-') { -1 } else { 1 };
+    let mut parts = body[1..].split(':');
+    // The hour is unbounded in digits (`UTC+167` is legal), so parse it as i64
+    // and let the range check below reject an over-large one rather than
+    // overflowing. A fractional part is dropped.
+    let hh = parts.next()?;
+    let hh = hh.split_once('.').map_or(hh, |(int, _)| int);
+    if hh.is_empty() || !hh.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut secs: i64 = hh.parse::<i64>().ok()?.checked_mul(3600)?;
+    for (i, part) in parts.enumerate() {
+        // One or two digits, as PG accepts (`UTC+5:3` is five hours three minutes).
+        if part.is_empty() || part.len() > 2 || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let v: i64 = part.parse().ok()?;
+        if v > 59 {
+            return None;
+        }
+        match i {
+            0 => secs += v * 60,
+            1 => secs += v,
+            _ => return None,
+        }
+    }
+    if secs > MAX_GUC_OFFSET_SECS as i64 {
+        return None;
+    }
+    // POSIX counts west; our `Zone::Fixed` counts east.
+    Some((-sign * secs) as i32)
 }
 
 /// The UTC offset (seconds east) to apply to a civil wall clock interpreted in
@@ -350,6 +417,19 @@ pub fn offset_for_instant(zone: &Zone, micros: i64) -> i32 {
     match zone {
         Zone::Fixed(secs) => *secs,
         Zone::Named(tz) => tz.to_offset(instant(micros)).seconds(),
+    }
+}
+
+/// The UTC offset (seconds east) in effect in `zone` **right now**.
+///
+/// Reading the clock inside an otherwise-pure resolution path is deliberate, not
+/// an oversight: PG's `timetz_zone` does the same, because a `timetz` carries no
+/// date and a named zone cannot name an offset without one. Callers that do have
+/// a date should use [`offset_for_local`] instead.
+pub fn offset_now(zone: &Zone) -> i32 {
+    match zone {
+        Zone::Fixed(secs) => *secs,
+        Zone::Named(tz) => tz.to_offset(Timestamp::now()).seconds(),
     }
 }
 
@@ -446,7 +526,13 @@ fn parse_fixed(token: &str) -> Option<Result<i32, ZoneError>> {
 }
 
 /// How an abbreviation resolves.
-enum Abbrev {
+///
+/// The distinction is not cosmetic: it is exactly PG's *static* versus
+/// *dynamic* split, and it decides whether an abbreviation can be used without
+/// a date. A [`Abbrev::Fixed`] entry names one offset for all time, so
+/// `'00:01 PDT'` is meaningful on its own; a [`Abbrev::Zone`] entry only means
+/// something at an instant, so `'15:36:39 MSK'` with no date is an error.
+pub(crate) enum Abbrev {
     /// A constant offset (seconds east of UTC).
     Fixed(i32),
     /// A DST-varying abbreviation: resolve through this reference IANA zone so
@@ -454,16 +540,44 @@ enum Abbrev {
     Zone(&'static str),
 }
 
-/// Curated timezone abbreviations, taken from PG's `src/timezone/tznames/Default`
-/// for the entries the smoke suite exercises (extend as differential tests
-/// demand — never guess). `PST`/`EST` are fixed standard-time offsets; `MSK`
-/// tracks Moscow's DST history (it moved +1h in Mar 2011 and back in Oct 2014),
-/// so it maps to the zone rather than a constant.
-static ABBREVS: &[(&str, Abbrev)] = &[
-    ("PST", Abbrev::Fixed(-8 * 3600)),
+/// Curated timezone abbreviations for **datetime literals**, taken from PG's
+/// `src/timezone/tznames/Default` for the entries our suites exercise (extend as
+/// differential tests demand — never guess).
+///
+/// This is deliberately *not* the same namespace as the `TimeZone` GUC accepts.
+/// PG rejects `SET TimeZone = 'PDT'` while happily reading `timestamptz
+/// '2020-06-01 12:00 PDT'`; `SET TimeZone = 'EST'` works only because `EST` also
+/// happens to be an IANA zone name. So [`SessionZone::resolve`] does not consult
+/// this table at all — see its doc comment.
+static DATETIME_ABBREVS: &[(&str, Abbrev)] = &[
+    // North America, standard and daylight.
+    ("AST", Abbrev::Fixed(-4 * 3600)),
+    ("ADT", Abbrev::Fixed(-3 * 3600)),
     ("EST", Abbrev::Fixed(-5 * 3600)),
+    ("EDT", Abbrev::Fixed(-4 * 3600)),
+    ("CST", Abbrev::Fixed(-6 * 3600)),
+    ("CDT", Abbrev::Fixed(-5 * 3600)),
+    ("MST", Abbrev::Fixed(-7 * 3600)),
+    ("MDT", Abbrev::Fixed(-6 * 3600)),
+    ("PST", Abbrev::Fixed(-8 * 3600)),
+    ("PDT", Abbrev::Fixed(-7 * 3600)),
+    ("AKST", Abbrev::Fixed(-9 * 3600)),
+    ("AKDT", Abbrev::Fixed(-8 * 3600)),
+    ("HST", Abbrev::Fixed(-10 * 3600)),
+    // `MSK` tracks Moscow's DST history (it moved +1h in Mar 2011 and back in
+    // Oct 2014), so it maps to the zone rather than a constant — and therefore
+    // needs a date.
     ("MSK", Abbrev::Zone("Europe/Moscow")),
 ];
+
+/// Look up a datetime-literal abbreviation, case-insensitively.
+pub(crate) fn lookup_abbrev(token: &str) -> Option<&'static Abbrev> {
+    let upper = token.to_ascii_uppercase();
+    DATETIME_ABBREVS
+        .iter()
+        .find(|(a, _)| *a == upper)
+        .map(|(_, k)| k)
+}
 
 #[cfg(test)]
 mod tests {

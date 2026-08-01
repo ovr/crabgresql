@@ -17,4 +17,5 @@ oid
 path
 portals_p2
 time
+timetz
 varchar

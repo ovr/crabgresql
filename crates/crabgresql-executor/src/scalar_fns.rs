@@ -616,6 +616,58 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 .map(Value::Timestamp)
                 .map_err(ts_err);
         }
+        ScalarFn::TimezoneIntervalToTz => {
+            // timezone(interval, timestamp) -> timestamptz.
+            let off = timestamptz::interval_zone_offset(iv(&args[0])).map_err(ts_err)?;
+            return timestamptz::timestamp_at_offset(off, ts(&args[1]))
+                .map(Value::TimestampTz)
+                .map_err(ts_err);
+        }
+        ScalarFn::TimezoneIntervalToTs => {
+            // timezone(interval, timestamptz) -> timestamp.
+            let off = timestamptz::interval_zone_offset(iv(&args[0])).map_err(ts_err)?;
+            return timestamptz::at_offset_to_timestamp(off, tstz(&args[1]))
+                .map(Value::Timestamp)
+                .map_err(ts_err);
+        }
+        ScalarFn::TimezoneLocalToTz => {
+            // timestamp AT LOCAL -> timestamptz.
+            return timestamptz::timestamp_at_session_zone(ts(&args[0]), &fmt.zone)
+                .map(Value::TimestampTz)
+                .map_err(ts_err);
+        }
+        ScalarFn::TimezoneLocalToTs => {
+            // timestamptz AT LOCAL -> timestamp.
+            return timestamptz::session_zone_wall_clock(tstz(&args[0]), &fmt.zone)
+                .map(Value::Timestamp)
+                .map_err(ts_err);
+        }
+        ScalarFn::TimezoneTimeTz => {
+            // timezone(zone, timetz) -> timetz.
+            return timetz::at_zone_named(ttz(&args[1]), text(&args[0]))
+                .map(Value::TimeTz)
+                .map_err(timetz_err);
+        }
+        ScalarFn::TimezoneIntervalTimeTz => {
+            // timezone(interval, timetz) -> timetz.
+            let off = timestamptz::interval_zone_offset(iv(&args[0])).map_err(ts_err)?;
+            return Ok(Value::TimeTz(timetz::at_zone(ttz(&args[1]), off)));
+        }
+        ScalarFn::TimezoneLocalTimeTz => {
+            // timetz AT LOCAL -> timetz.
+            //
+            // The session zone is read through `standard_offset`, the same
+            // accessor `timetz_in` and the `time -> timetz` cast use for a value
+            // with no zone of its own. Reading it any other way here would make
+            // `AT LOCAL` shift a zone-less literal instead of leaving it alone:
+            // under a DST session zone the value would be built at the standard
+            // offset and then rotated to the current one, inventing an hour of
+            // wall clock. The residual divergence from PG — that both use the
+            // standard offset rather than today's — is the one
+            // `SessionZone::standard_offset` documents.
+            let off = fmt.zone.standard_offset();
+            return Ok(Value::TimeTz(timetz::at_zone(ttz(&args[0]), off)));
+        }
         // Numeric-typed math: the argument(s) and result are `numeric`.
         ScalarFn::NumRound => {
             let s = args.get(1).map(i4).unwrap_or(0);

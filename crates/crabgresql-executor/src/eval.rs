@@ -114,6 +114,11 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             if let Some(result) = eval_soft_input_fn(*func, &arg_values, ctx) {
                 return result;
             }
+            // `current_setting` reads the session GUC table, which the pure
+            // `eval_scalar` has no handle to.
+            if let Some(result) = eval_guc_fn(*func, &arg_values, ctx) {
+                return result;
+            }
             // The catalog functions read the session's pg_catalog snapshot, which
             // the pure `eval_scalar` has no handle to.
             match eval_catalog_fn(*func, &arg_values, ctx) {
@@ -413,6 +418,39 @@ fn eval_sequence_fn(
     Some(result)
 }
 
+/// Dispatch `current_setting`, which reads the session GUC table through the
+/// [`GucOps`] handle. Returns `None` for any other function.
+///
+/// A NULL name is NULL. An unknown parameter is `42704`, unless the optional
+/// `missing_ok` argument is true, in which case the answer is NULL — PG's rule.
+fn eval_guc_fn(
+    func: ScalarFn,
+    args: &[Value],
+    ctx: &ExecContext,
+) -> Option<Result<Value, ExecError>> {
+    if func != ScalarFn::CurrentSetting {
+        return None;
+    }
+    let Value::Text(name) = &args[0] else {
+        return Some(Ok(Value::Null));
+    };
+    let missing_ok = matches!(args.get(1), Some(Value::Bool(true)));
+    let Some(ops) = ctx.gucs.as_deref() else {
+        return Some(Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "current_setting evaluated without a GUC context",
+        )));
+    };
+    Some(match ops.show(name) {
+        Some(v) => Ok(Value::Text(v)),
+        None if missing_ok => Ok(Value::Null),
+        None => Err(ExecError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("unrecognized configuration parameter \"{name}\""),
+        )),
+    })
+}
+
 /// Dispatch the catalog-reading functions. Returns `None` for any other function
 /// (the caller falls back to the pure `eval_scalar`), `Some(result)` for a
 /// catalog function — including a wiring error if the context supplied no
@@ -537,9 +575,60 @@ fn eval_deparse_fn(
         // PostgreSQL prints `nextval('s'::regclass)`, and `'x'` where PostgreSQL
         // prints `'x'::text`. A NULL node yields NULL, as in PG.
         ScalarFn::PgGetExpr => Some(Ok(args[0].clone())),
+        ScalarFn::PgGetViewdef => Some(eval_pg_get_viewdef(args, ctx)),
         _ => None,
     }
 }
+
+/// `pg_get_viewdef(name[, pretty])`. Three outcomes, all PostgreSQL's: a name no
+/// relation answers to is `42P01`; a relation that is not a view is the empty
+/// string; a view is its `SELECT`, re-rendered by [`crate::ruleutils`].
+fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    let Value::Text(name) = &args[0] else {
+        return Ok(Value::Null);
+    };
+    // PG's `pretty` is `PRETTYFLAG_PAREN`: it drops the parentheses that only
+    // restate precedence. Absent or NULL means false, as in PG.
+    let pretty = matches!(args.get(1), Some(Value::Bool(true)));
+    let Some(catalog) = ctx.catalog.as_deref() else {
+        return Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "pg_get_viewdef evaluated without a catalog context",
+        ));
+    };
+    // The same identifier rules every other name-taking catalog function uses:
+    // an unquoted part folds to lower case, a `"quoted"` one keeps its spelling.
+    let Some((namespace, relation)) = crate::reg::split_qualified_name(name) else {
+        return Err(ExecError::new(
+            sqlstate::UNDEFINED_TABLE,
+            format!("relation \"{name}\" does not exist"),
+        ));
+    };
+    let (namespace, relation) = (namespace.as_deref(), relation.as_str());
+    if catalog.rel_oid(namespace, relation).is_none() {
+        return Err(ExecError::new(
+            sqlstate::UNDEFINED_TABLE,
+            format!("relation \"{name}\" does not exist"),
+        ));
+    }
+    let Some((sql, columns)) = catalog.view_sql(namespace, relation) else {
+        // The relation exists but is not a view — PG answers with the empty
+        // string rather than an error.
+        return Ok(Value::Text(String::new()));
+    };
+    // A view whose body the deparser cannot render must *not* also answer with
+    // the empty string: that is the "not a view" answer, and returning it here
+    // would let a dump silently drop the view body. Say so instead.
+    crate::ruleutils::view_definition(&sql, pretty, &columns)
+        .map(Value::Text)
+        .ok_or_else(|| {
+            ExecError::new(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format!("pg_get_viewdef cannot deparse the definition of view \"{name}\""),
+            )
+        })
+}
+
 
 /// `format_type(oid, typmod)`. A NULL oid yields NULL; oid `0` is `-`; an oid
 /// nothing in the catalog claims is `???`. The modifier is decoded in
@@ -1482,6 +1571,13 @@ mod format_type_tests {
                 (oid == 16_384).then(|| ("public".to_string(), "mood".to_string()))
             }
             fn user_type_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
+                None
+            }
+            fn view_sql(
+                &self,
+                _namespace: Option<&str>,
+                _name: &str,
+            ) -> Option<(String, Vec<String>)> {
                 None
             }
         }

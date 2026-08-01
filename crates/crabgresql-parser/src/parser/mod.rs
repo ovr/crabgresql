@@ -3748,6 +3748,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Keyword::AT => {
+                    // `AT LOCAL` is `AT TIME ZONE <session zone>` spelled short.
+                    if self.parse_keyword(Keyword::LOCAL) {
+                        return Ok(Expr::AtLocal {
+                            timestamp: Box::new(expr),
+                        });
+                    }
                     self.expect_keywords(&[Keyword::TIME, Keyword::ZONE])?;
                     Ok(Expr::AtTimeZone {
                         timestamp: Box::new(expr),

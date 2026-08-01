@@ -448,6 +448,4 @@ SELECT line(point '(1,1)', point '(1,1)');
 SELECT sql_error_code FROM pg_input_error_info('(1,1),(1,1)', 'line');
 
 -- PostgreSQL gives `box` no `<>` operator (unlike circle, lseg and point).
--- The expected output drops PG's `LINE n: ... ^` caret here, which this build
--- does not emit for `operator does not exist` (see the note in xid.sql).
 SELECT box '(1,1),(0,0)' <> box '(3,3),(2,2)';

@@ -460,6 +460,12 @@ pub fn at_zone_to_timestamp(zone: &str, micros: i64) -> Result<i64, TimestampErr
     instant_to_wall(micros, &zone)
 }
 
+/// `timestamptz AT TIME ZONE INTERVAL '…'`: the same, with the zone given as a
+/// fixed displacement (seconds east) rather than a name.
+pub fn at_offset_to_timestamp(off_east: i32, micros: i64) -> Result<i64, TimestampError> {
+    instant_to_wall(micros, &tz::Zone::Fixed(off_east))
+}
+
 /// The `timestamptz → timestamp` cast: the wall clock the instant shows in the
 /// **session** zone. Same operation as `AT TIME ZONE <session zone>`.
 pub fn session_zone_wall_clock(
@@ -489,6 +495,28 @@ fn instant_to_wall(micros: i64, zone: &tz::Zone) -> Result<i64, TimestampError> 
 pub fn timestamp_at_zone(zone: &str, micros: i64) -> Result<i64, TimestampError> {
     let zone = tz::resolve_zone(zone).map_err(zone_error)?;
     wall_to_instant(micros, &zone)
+}
+
+/// `timestamp AT TIME ZONE INTERVAL '…'`: the same, with the zone given as a
+/// fixed displacement (seconds east) rather than a name.
+pub fn timestamp_at_offset(off_east: i32, micros: i64) -> Result<i64, TimestampError> {
+    wall_to_instant(micros, &tz::Zone::Fixed(off_east))
+}
+
+/// An `INTERVAL` used in a zone position, as seconds east of UTC. PG rejects one
+/// carrying months or days — those are not a fixed displacement — quoting the
+/// interval as it renders.
+pub fn interval_zone_offset(iv: crate::interval::Interval) -> Result<i32, TimestampError> {
+    if iv.months != 0 || iv.days != 0 {
+        return Err(TimestampError {
+            sqlstate: INVALID_PARAMETER_VALUE,
+            message: format!(
+                "interval time zone \"{}\" must not include months or days",
+                crate::interval::format(iv)
+            ),
+        });
+    }
+    Ok((iv.usec / USECS_PER_SEC) as i32)
 }
 
 /// The `timestamp → timestamptz` cast: read the zone-less wall clock in the
