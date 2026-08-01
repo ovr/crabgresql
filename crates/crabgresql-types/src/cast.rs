@@ -21,6 +21,9 @@ const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 const CANNOT_COERCE: &str = "42846";
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 const FEATURE_NOT_SUPPORTED: &str = "0A000";
+/// `22021` — see the `"char" -> bpchar` arm in [`cast_value`] for the one place
+/// this engine raises it that PostgreSQL does not.
+const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
 
 fn out_of_range(ty: PgType) -> CastError {
     CastError {
@@ -95,7 +98,8 @@ fn float_to_int_bounds(v: f64, lo: f64, hi: f64, ty: PgType) -> Result<f64, Cast
 /// back to an I/O conversion. Two distinct reasons land here:
 ///
 /// * the pair is marked explicit-only (`pg_cast.castcontext = 'e'`), so it is
-///   reachable from `CAST`/`::` but never from an assignment — `int4 -> bool`;
+///   reachable from `CAST`/`::` but never from an assignment — `int4 -> bool`,
+///   and both `int4 <-> "char"` directions;
 /// * there is no `pg_cast` entry between the two types *at all*, which is the
 ///   case for `oidvector` and `int2vector` in either direction. PostgreSQL still
 ///   accepts `x := y` between them by rendering and re-parsing, so
@@ -103,7 +107,10 @@ fn float_to_int_bounds(v: f64, lo: f64, hi: f64, ty: PgType) -> Result<f64, Cast
 fn needs_io_fallback_on_assign(from: PgType, to: PgType) -> bool {
     matches!(
         (from, to),
-        (PgType::Int4, PgType::Bool) | (PgType::Vector(_), PgType::Vector(_))
+        (PgType::Int4, PgType::Bool)
+            | (PgType::Vector(_), PgType::Vector(_))
+            | (PgType::Int4, PgType::Char)
+            | (PgType::Char, PgType::Int4)
     )
 }
 
@@ -247,6 +254,25 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             Ok(Value::Text(crate::net::inet_text(v)))
         }
 
+        // ---- "char" → bpchar ----
+        // The one string target that does *not* go through `charout`. PG's
+        // `char_bpchar` copies the raw byte, so `'\377'::"char"::bpchar` is one
+        // byte wide while `::text`, `::varchar` and `::name` are all the
+        // four-character `\377`. A high-bit byte therefore has no UTF-8 image,
+        // and this engine — unlike PG, which lets the invalid byte through —
+        // refuses it rather than fabricating one.
+        (Value::Char(c), PgType::Bpchar) => {
+            if *c & 0x80 != 0 {
+                return Err(CastError {
+                    sqlstate: CHARACTER_NOT_IN_REPERTOIRE,
+                    message: format!(
+                        "byte sequence 0x{c:02x} in \"char\" has no character in encoding \"UTF8\""
+                    ),
+                });
+            }
+            Ok(Value::Text(crate::char::char_out(*c)))
+        }
+
         // ---- anything → text / varchar / bpchar / name (float uses efd) ----
         // These four share the `text` value representation; any length limit for
         // varchar/bpchar is applied separately as a typmod coercion. A
@@ -257,6 +283,24 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
         }
 
         // ---- text → scalar (input functions) ----
+        // `text_char`, which PG routes through the same rule as `charin`, so
+        // `'\377'::text::"char"` is the byte 0xFF and `''::text::"char"` is the
+        // zero byte. Never fails. The reverse direction needs no arm: the
+        // generic any-to-text arm above renders via `encode_text_with`, which
+        // is `charout` — and `char_text` produces the same string.
+        (Value::Text(s), PgType::Char) => Ok(Value::Char(crate::char::char_in(s))),
+        // `chartoi4` reads the byte as *signed*, so `'\377'::"char"::int4` is
+        // -1 — the opposite convention from the unsigned ordering in
+        // `compare_values`. Both are PG's; see `crate::char`.
+        (Value::Char(c), PgType::Int4) => Ok(Value::Int4(i32::from(*c as i8))),
+        // `i4tochar` range-checks rather than truncating.
+        (Value::Int4(x), PgType::Char) => match i8::try_from(*x) {
+            Ok(c) => Ok(Value::Char(c as u8)),
+            Err(_) => Err(CastError {
+                sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
+                message: "\"char\" out of range".to_string(),
+            }),
+        },
         (Value::Text(s), PgType::Float4) => {
             float::float4in(s)
                 .map(Value::Float4)

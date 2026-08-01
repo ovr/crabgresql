@@ -1416,6 +1416,8 @@ fn is_known_internal(name: &str) -> bool {
             | "textin" | "textout"
             | "varcharin" | "varcharout"
             | "bpcharin" | "bpcharout"
+            // `"char"` (oid 18), the one-byte type — not `bpchar`.
+            | "charin" | "charout"
             | "namein" | "nameout"
             | "bit_in" | "bit_out"
             // date / time

@@ -2907,6 +2907,9 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             | PgType::Text
             | PgType::Varchar
             | PgType::Bpchar
+            // `"char"` has a default btree opclass (`btcharcmp`); it orders
+            // *unsigned*, which `compare_values` implements.
+            | PgType::Char
             | PgType::Name
             | PgType::Oid
             | PgType::Tid
@@ -7041,6 +7044,9 @@ pub(crate) fn implicit_castable(from: PgType, to: PgType) -> bool {
                 | (Varchar, Text)
                 | (Bpchar, Text)
                 | (Name, Text)
+                // `"char" -> text` is implicit in PG (`pg_cast` context 'i'),
+                // but the reverse is assignment-only, so it is not listed here.
+                | (Char, Text)
                 // `cidr -> inet` is an implicit cast in PG, so the inet
                 // functions/operators accept a cidr argument.
                 | (Cidr, Inet)
@@ -7638,6 +7644,10 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
             Ok(Value::Text(s.to_string()))
         }
+        // `"char"` gets its own arm rather than joining the text family: it is
+        // one raw byte, and `charin` decodes an octal escape on the way in.
+        // Never fails.
+        PgType::Char => Ok(Value::Char(crabgresql_types::char::char_in(s))),
         // Integer input (trim, base-10, 22003 overflow vs 22P02 malformed) is
         // the same acceptor the executor's text→int cast uses; share it so the
         // two never drift. resolve_unknown attaches the cursor position.

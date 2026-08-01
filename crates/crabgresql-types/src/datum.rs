@@ -67,6 +67,7 @@ const T_LINE: u8 = 41;
 const T_CIRCLE: u8 = 42;
 const T_POLYGON: u8 = 43;
 const T_VECTOR: u8 = 44;
+const T_CHAR: u8 = 45;
 
 // Tags at 200 and above are NOT value kinds. They are storage-layer markers that
 // an access method resolves before this codec is reached, and they live in their
@@ -96,6 +97,12 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         Value::Bool(b) => {
             out.push(T_BOOL);
             out.push(*b as u8);
+        }
+        // Fixed one-byte payload, not `put_var` — a length prefix would
+        // quadruple the on-page size of a `typlen = 1` type.
+        Value::Char(c) => {
+            out.push(T_CHAR);
+            out.push(*c);
         }
         Value::Int2(x) => {
             out.push(T_INT2);
@@ -406,6 +413,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
     let tag = r.take(1)[0];
     let v = match tag {
         T_BOOL => Value::Bool(r.take(1)[0] != 0),
+        T_CHAR => Value::Char(r.take(1)[0]),
         T_INT2 => Value::Int2(i16::from_le_bytes(r.array())),
         T_INT4 => Value::Int4(r.i32()),
         T_OID => Value::Oid(r.u32()),
@@ -704,6 +712,11 @@ mod tests {
         roundtrip(Value::Reg(Reg::unresolved(RegKind::Class, 999_999)));
         roundtrip(Value::Bool(true));
         roundtrip(Value::Bool(false));
+        roundtrip(Value::Char(b'a'));
+        // The two values a text-backed representation could not carry, and so
+        // the ones that prove `T_CHAR` is not quietly a `T_TEXT`.
+        roundtrip(Value::Char(0));
+        roundtrip(Value::Char(0xFF));
         roundtrip(Value::Int2(i16::MIN));
         roundtrip(Value::Int4(i32::MAX));
         roundtrip(Value::Int8(i64::MIN));

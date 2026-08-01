@@ -56,6 +56,9 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
     Ok(match ty {
         // PG's `boolrecv` treats any nonzero byte as true, not only 1.
         PgType::Bool => Value::Bool(fixed::<1>(b, ty)?[0] != 0),
+        // `charrecv` takes the byte as-is — no octal decoding, which applies
+        // only to the *text* input function.
+        PgType::Char => Value::Char(fixed::<1>(b, ty)?[0]),
         PgType::Int2 => Value::Int2(i16::from_be_bytes(fixed(b, ty)?)),
         PgType::Int4 => Value::Int4(i32::from_be_bytes(fixed(b, ty)?)),
         PgType::Int8 => Value::Int8(i64::from_be_bytes(fixed(b, ty)?)),
@@ -152,6 +155,8 @@ impl Value {
         Ok(Some(match self {
             Value::Null => return Ok(None),
             Value::Bool(v) => vec![*v as u8],
+            // `charsend`: the raw byte, unescaped.
+            Value::Char(c) => vec![*c],
             Value::Int2(v) => v.to_be_bytes().to_vec(),
             Value::Int4(v) => v.to_be_bytes().to_vec(),
             Value::Int8(v) => v.to_be_bytes().to_vec(),

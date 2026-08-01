@@ -25,6 +25,7 @@ pub fn type_indexable(ty: PgType) -> bool {
     matches!(
         ty,
         PgType::Bool
+            | PgType::Char
             | PgType::Int2
             | PgType::Int4
             | PgType::Int8
@@ -95,6 +96,10 @@ fn encode_one(ty: PgType, v: &Value, out: &mut Vec<u8>) -> Option<()> {
     match (ty, v) {
         (_, Value::Null) => return None,
         (PgType::Bool, Value::Bool(b)) => out.push(u8::from(*b)),
+        // `"char"` orders unsigned, so the raw byte is already order-preserving.
+        // Fixed width means it needs no escaping or terminator to stay
+        // composite-safe, unlike the text family below.
+        (PgType::Char, Value::Char(c)) => out.push(*c),
         (PgType::Int2, Value::Int2(x)) => {
             out.extend_from_slice(&(*x as u16 ^ 0x8000).to_be_bytes())
         }
@@ -251,6 +256,14 @@ mod tests {
             &[0u32, 1, 16384, u32::MAX].map(Value::Oid).to_vec(),
         );
         assert_order_preserved(PgType::Bool, &[Value::Bool(false), Value::Bool(true)]);
+        // `"char"` orders unsigned: 0x7F/0x80/0xFF are the samples that fail if
+        // either this encoding or `compare_values` ever reads the byte signed.
+        assert_order_preserved(
+            PgType::Char,
+            &[0u8, 1, b'A', b'a', 0x7F, 0x80, 0xFF]
+                .map(Value::Char)
+                .to_vec(),
+        );
         assert_order_preserved(
             PgType::Date,
             &[i32::MIN, -1, 0, 1, 8766, i32::MAX]

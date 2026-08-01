@@ -27,6 +27,16 @@ const FIRST_ENUM_OID: u32 = 0x8000_0000;
 
 /// A `"char"`/`regproc` column: a single- or short-name catalog column we render
 /// as `text` for now. Kept as a named alias so the deviation is greppable.
+///
+/// `"char"` is now a real [`PgType::Char`], but this alias cannot simply point
+/// at it, because it conflates two upstream types. Most uses (`typtype`,
+/// `typcategory`, `relkind`, `provolatile`, `castcontext`, …) really are
+/// `"char"`; six — `typinput`/`typoutput`/`typreceive`/`typsend`, `amhandler`
+/// and `prosupport` — are `regproc`, and hold multi-character function names
+/// that a one-byte type would truncate. Splitting this into `CHARLIKE` (→
+/// `PgType::Char`) and a `REGPROCLIKE` (→ `text`) is therefore a separate
+/// change, and one that shifts the reported type OID of `relkind` and friends
+/// from 25 to 18 — which eight smoke expected-files pin.
 const CHARLIKE: PgType = PgType::Text;
 
 fn col(name: &str, ty: PgType) -> Column {

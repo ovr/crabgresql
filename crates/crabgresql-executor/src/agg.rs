@@ -313,6 +313,11 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     b.hash(&mut h);
                 }
             }
+            PgType::Char => {
+                if let Value::Char(c) = v {
+                    c.hash(&mut h);
+                }
+            }
             PgType::Int2 | PgType::Int4 | PgType::Int8 => as_i64(v).hash(&mut h),
             PgType::Float4 | PgType::Float8 => canonical_f64(as_f64(v)).to_bits().hash(&mut h),
             PgType::Numeric => canonical_f64(as_numeric(v).to_f64()).to_bits().hash(&mut h),
