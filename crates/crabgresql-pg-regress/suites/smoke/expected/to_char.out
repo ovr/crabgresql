@@ -119,6 +119,20 @@ SELECT '[' || to_char(timestamp '2024-03-05', 'TZ') || ']['
  [][+00]
 (1 row)
 
+-- TZH/TZM take exactly the two spellings TZ does; a mixed-case TzH is literal,
+-- and neither honors FM
+SELECT to_char(timestamptz '2024-03-05 14:00:00+00', 'TZH|TZM|tzh|tzm|TzH|FMTZH') AS tzh_tzm;
+        tzh_tzm        
+-----------------------
+ +00|00|+00|00|TzH|+00
+(1 row)
+
+SELECT '[' || to_char(timestamp '2024-03-05', 'TZH:TZM') || ']' AS tzh_without_zone;
+ tzh_without_zone 
+------------------
+ [+00:00]
+(1 row)
+
 -- NULL input and non-finite values yield NULL
 SELECT to_char(timestamp 'infinity', 'YYYY') IS NULL AS inf_is_null,
        to_char(timestamp '2024-03-05', NULL) IS NULL AS null_fmt,
@@ -156,6 +170,9 @@ SELECT to_char(interval '1 day', 'Month');
 ERROR:  invalid format specification for an interval value
 HINT:  Intervals are not tied to specific calendar dates.
 SELECT to_char(interval '1 day', 'TZ');
+ERROR:  invalid format specification for an interval value
+HINT:  Intervals are not tied to specific calendar dates.
+SELECT to_char(interval '1 day', 'TZH');
 ERROR:  invalid format specification for an interval value
 HINT:  Intervals are not tied to specific calendar dates.
 -- to_date / to_timestamp: defaults, separators, trailing garbage
@@ -265,6 +282,41 @@ SELECT to_timestamp('2024-03-05 10:00:00 -05', 'YYYY-MM-DD HH24:MI:SS OF') AS sp
  2024-03-05 15:00:00+00 | 2024-03-05 15:00:00+00 | 2024-03-01
 (1 row)
 
+-- TZH keeps its own sign the same way, and TZM takes it; both spacings work
+SELECT to_timestamp('2024-03-05 10:00:00 -05:30', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') AS spaced_tzh,
+       to_timestamp('2024-03-05 10:00:00+0530', 'YYYY-MM-DD HH24:MI:SSTZHTZM') AS tight_tzh;
+       spaced_tzh       |       tight_tzh        
+------------------------+------------------------
+ 2024-03-05 15:30:00+00 | 2024-03-05 04:30:00+00
+(1 row)
+
+-- TZ, OF, TZH and TZM are one field type: a repetition that agrees is fine,
+-- one that contradicts is an error naming the code that noticed
+SELECT to_timestamp('2024-03-05 10:00:00 -05 -05', 'YYYY-MM-DD HH24:MI:SS OF TZH') AS agreeing;
+        agreeing        
+------------------------
+ 2024-03-05 15:00:00+00
+(1 row)
+
+SELECT to_timestamp('2024-03-05 10:00:00 -05 +07', 'YYYY-MM-DD HH24:MI:SS OF TZH');
+ERROR:  conflicting values for "TZH" field in formatting string
+DETAIL:  This value contradicts a previous setting for the same field type.
+SELECT to_timestamp('2024-03-05 10:00:00 -05 +07', 'YYYY-MM-DD HH24:MI:SS TZH OF');
+ERROR:  conflicting values for "OF" field in formatting string
+DETAIL:  This value contradicts a previous setting for the same field type.
+-- and the scanned displacement is bounded like one inside a literal
+SELECT to_timestamp('2024-03-05 10:00 +15:59', 'YYYY-MM-DD HH24:MI TZH:TZM') AS in_range;
+        in_range        
+------------------------
+ 2024-03-04 18:01:00+00
+(1 row)
+
+SELECT to_timestamp('2024-03-05 10:00 +16:00', 'YYYY-MM-DD HH24:MI TZH:TZM');
+ERROR:  time zone displacement out of range: "2024-03-05 10:00 +16:00"
+SELECT to_timestamp('2024-03-05 10:00 +99', 'YYYY-MM-DD HH24:MI OF');
+ERROR:  time zone displacement out of range: "2024-03-05 10:00 +99"
+SELECT to_date('2024-03-05 +99', 'YYYY-MM-DD TZH');
+ERROR:  time zone displacement out of range: "2024-03-05 +99"
 SELECT to_char(timestamp '2024-03-05 04:00:00', 'FM"a"HH24') AS fm_then_quote,
        to_char(interval '1 day', 'TH FM YYYY th') AS fm_then_space;
  fm_then_quote | fm_then_space 

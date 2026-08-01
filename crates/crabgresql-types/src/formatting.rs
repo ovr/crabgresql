@@ -7,7 +7,8 @@
 //!
 //! Supported codes: `YYYY YYY YY Y`, `MM`, `DD`, `HH HH12 HH24`, `MI`, `SS`,
 //! `MS`, `US`, `AM/PM/A.M./P.M.` and their lowercase spellings, `Month/MONTH/
-//! month`, `Mon/MON/mon`, `Day/DAY/day`, `Dy/DY/dy`, `TZ/tz`, `OF`, the `FM`
+//! month`, `Mon/MON/mon`, `Day/DAY/day`, `Dy/DY/dy`, `TZ/tz`, `TZH/tzh`,
+//! `TZM/tzm`, `OF`, the `FM`
 //! fill-mode prefix, the `TH`/`th` ordinal suffix, `"quoted"` literal text, and
 //! passthrough of anything else.
 //!
@@ -27,6 +28,7 @@ use crate::tz::SessionZone;
 // crate — the binder/executor map these to `sqlstate::*`).
 const INVALID_DATETIME_FORMAT: &str = "22007";
 const DATETIME_FIELD_OVERFLOW: &str = "22008";
+use crate::timestamp::INVALID_TIME_ZONE_DISPLACEMENT;
 
 /// A `to_char` / `to_date` / `to_timestamp` failure. Unlike `DateError` and
 /// `TimestampError` this carries the optional DETAIL and HINT lines PG prints
@@ -83,6 +85,25 @@ fn no_match(raw: &str, code: &str) -> FormatError {
         format!("invalid value \"{raw}\" for \"{code}\""),
     )
     .with_detail("The given value did not match any of the allowed values for this field.")
+}
+
+/// A picture that sets the same zone component twice with different values.
+/// PG treats `TZ`, `OF`, `TZH` and `TZM` as one field type, so a *repetition*
+/// is fine (`'OF TZH'` against `'-05 -05'` parses) but a contradiction is not.
+fn conflicting_value(code: &str) -> FormatError {
+    FormatError::new(
+        INVALID_DATETIME_FORMAT,
+        format!("conflicting values for \"{code}\" field in formatting string"),
+    )
+    .with_detail("This value contradicts a previous setting for the same field type.")
+}
+
+/// A zone displacement outside PG's `±15:59:59` acceptance band.
+fn displacement_out_of_range(input: &str) -> FormatError {
+    FormatError::new(
+        INVALID_TIME_ZONE_DISPLACEMENT,
+        format!("time zone displacement out of range: \"{input}\""),
+    )
 }
 
 fn twelve_hour(hour: i64) -> FormatError {
@@ -157,6 +178,11 @@ enum Code {
     },
     /// `OF`.
     TzOffset,
+    /// `TZH`/`tzh` — the signed hours of the offset. Renders the same either
+    /// way, so unlike `TzAbbr` there is no case to carry.
+    TzHour,
+    /// `TZM`/`tzm` — the unsigned minutes of the offset.
+    TzMinute,
 }
 
 impl Code {
@@ -171,6 +197,8 @@ impl Code {
                 | Code::DayAbbr(_)
                 | Code::TzAbbr { .. }
                 | Code::TzOffset
+                | Code::TzHour
+                | Code::TzMinute
         )
     }
 
@@ -269,6 +297,13 @@ const EXACT_CODES: &[(&str, Code)] = &[
             upper: false,
         },
     ),
+    // Ahead of `TZ`/`tz`, which are a prefix of these. Like `TZ`, PG matches
+    // them case-sensitively in exactly the two spellings — `TzH` is literal
+    // text, not a code.
+    ("TZH", Code::TzHour),
+    ("tzh", Code::TzHour),
+    ("TZM", Code::TzMinute),
+    ("tzm", Code::TzMinute),
     ("TZ", Code::TzAbbr { upper: true }),
     ("tz", Code::TzAbbr { upper: false }),
 ];
@@ -581,7 +616,9 @@ fn render_interval(code: Code, f: &IvFields, fm: bool) -> (String, i64) {
         | Code::DayName(_)
         | Code::DayAbbr(_)
         | Code::TzAbbr { .. }
-        | Code::TzOffset => (String::new(), 0),
+        | Code::TzOffset
+        | Code::TzHour
+        | Code::TzMinute => (String::new(), 0),
     }
 }
 
@@ -624,6 +661,23 @@ fn render_dt(code: Code, f: &DtFields, fm: bool) -> (String, i64) {
             crate::tz::format_offset_hours_minutes(f.zone.as_ref().map_or(0, |z| z.offset_secs)),
             0,
         ),
+        // `TZH`/`TZM` split the same offset `OF` renders, and drop the seconds
+        // the same way: the LMT-era `America/New_York` at `-04:56:02` is
+        // `-04` and `56`. The sign lives on the hours; the minutes are the
+        // magnitude, so `-03:30` is `-03` and `30`.
+        // `FM` does not reach either of them: PG prints both at a fixed width,
+        // so `to_char(…, 'FMTZH:TZM')` is still `-04:00`.
+        Code::TzHour => {
+            let secs = f.zone.as_ref().map_or(0, |z| z.offset_secs);
+            let sign = if secs < 0 { '-' } else { '+' };
+            let hours = secs.unsigned_abs() / 3600;
+            (format!("{sign}{hours:02}"), i64::from(hours))
+        }
+        Code::TzMinute => {
+            let secs = f.zone.as_ref().map_or(0, |z| z.offset_secs);
+            let mins = secs.unsigned_abs() % 3600 / 60;
+            (format!("{mins:02}"), i64::from(mins))
+        }
     }
 }
 
@@ -745,8 +799,59 @@ struct Parsed {
     sec: Option<i64>,
     /// Already scaled to microseconds.
     usec: Option<i64>,
-    /// Seconds east of UTC, from `TZ`/`OF`.
-    offset: Option<i32>,
+    /// The zone displacement, held as separate components because `TZH` and
+    /// `TZM` arrive separately — see [`ZoneFields`].
+    zone: ZoneFields,
+}
+
+/// The zone displacement a picture scanned, kept per component.
+///
+/// `TZ` and `OF` fill all of them at once; `TZH` fills the sign and hours,
+/// `TZM` the minutes. PG treats all four codes as **one field type**, so a
+/// second code that repeats a component is accepted and one that contradicts it
+/// is `22007` — which is why the components are tracked individually rather
+/// than as a single combined offset.
+#[derive(Default)]
+struct ZoneFields {
+    /// `1` or `-1`. Only `TZM` leaves it unset, taking `+` by default.
+    sign: Option<i32>,
+    hour: Option<i32>,
+    min: Option<i32>,
+    /// A named zone can sit at a sub-minute LMT offset; the numeric codes
+    /// cannot express one, so only `TZ` ever sets this.
+    sec: Option<i32>,
+}
+
+impl ZoneFields {
+    /// Record one component, rejecting a value that contradicts an earlier one.
+    fn set(slot: &mut Option<i32>, value: i32, spell: &str) -> Result<(), FormatError> {
+        match slot {
+            Some(prev) if *prev != value => Err(conflicting_value(spell)),
+            _ => {
+                *slot = Some(value);
+                Ok(())
+            }
+        }
+    }
+
+    /// Record a whole signed displacement, as `TZ` and `OF` supply it.
+    fn set_offset(&mut self, secs: i32, spell: &str) -> Result<(), FormatError> {
+        let abs = secs.unsigned_abs() as i32;
+        Self::set(&mut self.sign, if secs < 0 { -1 } else { 1 }, spell)?;
+        Self::set(&mut self.hour, abs / 3600, spell)?;
+        Self::set(&mut self.min, abs % 3600 / 60, spell)?;
+        Self::set(&mut self.sec, abs % 60, spell)
+    }
+
+    /// The displacement in seconds east, or `None` if the picture named no zone.
+    fn offset(&self) -> Option<i32> {
+        if self.sign.is_none() && self.hour.is_none() && self.min.is_none() {
+            return None;
+        }
+        let magnitude =
+            self.hour.unwrap_or(0) * 3600 + self.min.unwrap_or(0) * 60 + self.sec.unwrap_or(0);
+        Some(self.sign.unwrap_or(1) * magnitude)
+    }
 }
 
 /// `to_timestamp(text, text)` → microseconds since 2000-01-01 UTC. An input
@@ -808,7 +913,7 @@ fn from_char(input: &str, fmt: &str) -> Result<(Tm, Option<i32>), FormatError> {
                 let next_takes_sign = matches!(
                     nodes.get(idx + 1),
                     Some(Node::Field {
-                        code: Code::TzOffset,
+                        code: Code::TzOffset | Code::TzHour,
                         ..
                     })
                 );
@@ -838,6 +943,14 @@ fn from_char(input: &str, fmt: &str) -> Result<(Tm, Option<i32>), FormatError> {
     // `US`/`MS` value inside the int range can still exceed a second.
     if !(0..1_000_000).contains(&t.usec) {
         return Err(field_out_of_range(input));
+    }
+    // A scanned displacement is bounded the same way one inside a literal is:
+    // `+15:59` is accepted, `+16:00` is not. Checked here rather than in the
+    // scanners because `TZH` and `TZM` are only out of range together, and
+    // because `to_date` rejects an out-of-range zone too even though it then
+    // discards it.
+    if offset.is_some_and(|s| s.abs() > crate::tz::MAX_TZ_DISPLACEMENT_SECS) {
+        return Err(displacement_out_of_range(input));
     }
     Ok((t, offset))
 }
@@ -926,10 +1039,32 @@ fn scan_field(
         Code::TzAbbr { .. } => {
             let word = take_alpha(chars, pos);
             let zone = crate::tz::resolve_zone(&word).map_err(|_| no_match(&word, spell))?;
-            p.offset = Some(crate::tz::offset_for_instant(&zone, 0));
+            p.zone
+                .set_offset(crate::tz::offset_for_instant(&zone, 0), spell)?;
         }
         Code::TzOffset => {
-            p.offset = Some(take_offset(chars, pos).ok_or_else(|| no_match("", spell))?);
+            let secs = take_offset(chars, pos).ok_or_else(|| no_match("", spell))?;
+            p.zone.set_offset(secs, spell)?;
+        }
+        // `TZH` owns the sign, which is optional (`'+05'`, `'-05'`, `'05'`).
+        // `TZM` is bare digits — the separator between them, if the picture has
+        // one, is eaten by the intervening literal.
+        Code::TzHour => {
+            let sign = match chars.get(*pos) {
+                Some('+') => 1,
+                Some('-') => -1,
+                _ => 0,
+            };
+            if sign != 0 {
+                *pos += 1;
+            }
+            let (hours, _) = take_digits(chars, pos, Some(2)).ok_or_else(|| no_match("", spell))?;
+            ZoneFields::set(&mut p.zone.sign, if sign == 0 { 1 } else { sign }, spell)?;
+            ZoneFields::set(&mut p.zone.hour, hours as i32, spell)?;
+        }
+        Code::TzMinute => {
+            let (mins, _) = take_digits(chars, pos, Some(2)).ok_or_else(|| no_match("", spell))?;
+            ZoneFields::set(&mut p.zone.min, mins as i32, spell)?;
         }
         _ => {
             let width = if capped {
@@ -1147,7 +1282,7 @@ fn assemble(p: &Parsed) -> Result<(Tm, Option<i32>), FormatError> {
         p.sec.unwrap_or(0),
         p.usec.unwrap_or(0),
     );
-    Ok((t, p.offset))
+    Ok((t, p.zone.offset()))
 }
 
 #[cfg(test)]
@@ -1245,7 +1380,8 @@ mod tests {
     #[test]
     fn interval_rejects_calendar_codes() {
         for fmt in [
-            "Month", "MONTH", "Mon", "MON", "Day", "DAY", "Dy", "DY", "TZ", "tz", "OF",
+            "Month", "MONTH", "Mon", "MON", "Day", "DAY", "Dy", "DY", "TZ", "tz", "OF", "TZH",
+            "TZM", "tzh", "tzm",
         ] {
             let zero = Interval {
                 months: 0,
@@ -1354,6 +1490,11 @@ mod tests {
         assert_eq!(tstz(STAMP, "TZ|tz|OF"), "UTC|utc|+00");
         // A plain timestamp has no zone abbreviation, but still reports +00.
         assert_eq!(ts(STAMP, "[TZ][OF]"), "[][+00]");
+        // `TZH`/`TZM` split the same offset, and like `TZ` match in exactly
+        // two spellings — a mixed-case `TzH` is literal text.
+        assert_eq!(tstz(STAMP, "TZH|TZM|tzh|tzm"), "+00|00|+00|00");
+        assert_eq!(tstz(STAMP, "TzH|TzM"), "TzH|TzM");
+        assert_eq!(ts(STAMP, "[TZH:TZM]"), "[+00:00]");
     }
 
     #[test]
@@ -1615,6 +1756,46 @@ mod tests {
         Ok(())
     }
 
+    /// `TZH`/`TZM` against the same zones, where the split matters: the sign
+    /// rides on the hours, and the minutes are the bare magnitude.
+    #[test]
+    fn to_char_splits_the_offset_into_tzh_tzm() -> anyhow::Result<()> {
+        let z = |n: &str| SessionZone::resolve(n).expect("real zone");
+        let at = |zone: &SessionZone, s: &str, fmt: &str| -> anyhow::Result<String> {
+            let v = crate::timestamptz::parse(s, zone).map_err(|e| anyhow::anyhow!(e.message))?;
+            Ok(to_char_timestamptz(v, fmt, zone)
+                .map_err(fe)?
+                .unwrap_or_default())
+        };
+
+        // A negative sub-hour offset: St. John's runs at -03:30 in January.
+        let stj = z("America/St_Johns");
+        assert_eq!(
+            at(&stj, "2024-01-15 12:00:00", "TZH TZM OF")?,
+            "-03 30 -03:30"
+        );
+        // And a positive one, Kathmandu at +05:45.
+        let ktm = z("Asia/Kathmandu");
+        assert_eq!(at(&ktm, "2024-01-15 12:00:00", "TZH TZM")?, "+05 45");
+
+        // Seconds are dropped, exactly as `OF` drops them: pre-1883 New York
+        // ran at -04:56:02.
+        let ny = z("America/New_York");
+        assert_eq!(at(&ny, "1875-06-01 12:00:00", "TZH:TZM OF")?, "-04:56 -04:56");
+
+        // `FM` does not reach either code — both keep their fixed width.
+        assert_eq!(at(&ny, "2024-06-01 12:00:00", "FMTZH:TZM")?, "-04:00");
+
+        // A plain `timestamp` has no zone and reads as +00:00, as `OF` does.
+        let ts = crate::timestamp::parse("2024-01-15 12:00:00")
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(
+            to_char_timestamp(ts, "TZH:TZM|OF|TZ").map_err(fe)?,
+            Some("+00:00|+00|".to_string())
+        );
+        Ok(())
+    }
+
     /// `to_timestamp` reads a zone-less input in the session zone; an input
     /// carrying its own `OF` is unaffected.
     #[test]
@@ -1627,6 +1808,79 @@ mod tests {
         assert_eq!(
             crate::timestamptz::format(explicit, &ny),
             "2024-06-01 08:00:00-04"
+        );
+        Ok(())
+    }
+
+    /// `TZ`, `OF`, `TZH` and `TZM` are one field type: a repetition that agrees
+    /// parses, one that contradicts is `22007`, and the combined displacement is
+    /// bounded the same way one inside a literal is.
+    #[test]
+    fn zone_codes_conflict_and_bound() -> anyhow::Result<()> {
+        let utc = SessionZone::utc();
+        let at = |input: &str, fmt: &str| from_char_timestamptz(input, fmt, &utc);
+
+        // Agreeing repetitions are fine, in either code order.
+        assert!(at("2024-03-05 10:00:00 -05 -05", "YYYY-MM-DD HH24:MI:SS OF TZH").is_ok());
+        assert!(at("2024-03-05 10:00:00 -05 -05", "YYYY-MM-DD HH24:MI:SS TZH OF").is_ok());
+
+        // Contradictions name the code that noticed, i.e. the second one.
+        for (fmt, code) in [
+            ("YYYY-MM-DD HH24:MI:SS OF TZH", "TZH"),
+            ("YYYY-MM-DD HH24:MI:SS TZH OF", "OF"),
+            ("YYYY-MM-DD HH24:MI:SS TZH TZH", "TZH"),
+        ] {
+            let e = expect_err(at("2024-03-05 10:00:00 -05 +07", fmt));
+            assert_eq!(e.sqlstate, "22007");
+            assert_eq!(
+                e.message,
+                format!("conflicting values for \"{code}\" field in formatting string")
+            );
+            assert_eq!(
+                e.detail.as_deref(),
+                Some("This value contradicts a previous setting for the same field type.")
+            );
+        }
+
+        // ±15:59 is in range, ±16:00 is not — for `TZH`/`TZM` and for `OF`.
+        assert!(at("2024-03-05 10:00 +15:59", "YYYY-MM-DD HH24:MI TZH:TZM").is_ok());
+        for (input, fmt) in [
+            ("2024-03-05 10:00 +16:00", "YYYY-MM-DD HH24:MI TZH:TZM"),
+            ("2024-03-05 10:00 -16", "YYYY-MM-DD HH24:MI TZH"),
+            ("2024-03-05 10:00 +99", "YYYY-MM-DD HH24:MI TZH"),
+            ("2024-03-05 10:00 +99", "YYYY-MM-DD HH24:MI OF"),
+        ] {
+            let e = expect_err(at(input, fmt));
+            assert_eq!(e.sqlstate, "22009");
+            assert_eq!(
+                e.message,
+                format!("time zone displacement out of range: \"{input}\"")
+            );
+        }
+        // `to_date` rejects one too, even though it discards the zone.
+        let e = expect_err(from_char_date("2024-03-05 +99", "YYYY-MM-DD TZH"));
+        assert_eq!(e.sqlstate, "22009");
+        Ok(())
+    }
+
+    /// `TZH`/`TZM` on input, in both the separated and the glued spelling. The
+    /// leading literal must leave `TZH` its sign, the same hazard `OF` has.
+    #[test]
+    fn from_char_reads_tzh_tzm() -> anyhow::Result<()> {
+        let ny = SessionZone::resolve("America/New_York").expect("real zone");
+        let sep =
+            from_char_timestamptz("2024-06-15 10:00 -05:30", "YYYY-MM-DD HH24:MI TZH:TZM", &ny)
+                .map_err(fe)?;
+        assert_eq!(
+            crate::timestamptz::format(sep, &ny),
+            "2024-06-15 11:30:00-04"
+        );
+        let glued =
+            from_char_timestamptz("2024-06-15 10:00 +0530", "YYYY-MM-DD HH24:MI TZHTZM", &ny)
+                .map_err(fe)?;
+        assert_eq!(
+            crate::timestamptz::format(glued, &ny),
+            "2024-06-15 00:30:00-04"
         );
         Ok(())
     }

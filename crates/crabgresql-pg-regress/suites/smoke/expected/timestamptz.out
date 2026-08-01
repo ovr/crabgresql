@@ -475,4 +475,43 @@ SELECT timestamptz '1875-06-01 12:00:00' AS out_lmt;
  1875-06-01 12:00:00-04:56:02
 (1 row)
 
+-- TZH/TZM split the same offset OF renders: the sign rides on the hours, the
+-- minutes are the bare magnitude, and neither widens to seconds
+SELECT to_char(timestamptz '2024-06-15 03:30:45+00', 'TZH:TZM|OF|TZ|tz') AS tzh_tzm;
+      tzh_tzm       
+--------------------
+ -04:00|-04|EDT|edt
+(1 row)
+
+SELECT to_char(timestamptz '1875-06-01 12:00:00', 'TZH:TZM') AS tzh_lmt;
+ tzh_lmt 
+---------
+ -04:56
+(1 row)
+
+-- casts down to the time-of-day types: a timestamptz is rotated into the
+-- session zone first, so a 03:30 UTC instant is the previous evening here, and
+-- timetz keeps the offset in effect at that instant
+SELECT timestamptz '2024-06-15 03:30:45.5+00'::time AS tstz_time,
+       timestamptz '2024-06-15 03:30:45.5+00'::timetz AS tstz_timetz,
+       timestamp '2024-06-15 03:30:45.5'::time AS ts_time;
+ tstz_time  |  tstz_timetz  |  ts_time   
+------------+---------------+------------
+ 23:30:45.5 | 23:30:45.5-04 | 03:30:45.5
+(1 row)
+
+SELECT timestamptz '2024-01-15 03:30:45+00'::timetz AS winter_timetz;
+ winter_timetz 
+---------------
+ 22:30:45-05
+(1 row)
+
+-- an infinite input casts to NULL rather than erroring
+SELECT timestamptz 'infinity'::time IS NULL AS inf_time_is_null,
+       timestamp '-infinity'::time IS NULL AS neg_inf_time_is_null;
+ inf_time_is_null | neg_inf_time_is_null 
+------------------+----------------------
+ t                | t
+(1 row)
+
 SET TimeZone = 'UTC';

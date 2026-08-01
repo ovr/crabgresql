@@ -7525,7 +7525,8 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
 ///   here tested only `Text`, so `1.5::float8::varchar` folded at the default
 ///   precision and silently ignored the session's setting.)
 /// * `TimeZone`, for every `timestamptz` conversion — the zone is what relates
-///   an instant to a wall clock, in both directions.
+///   an instant to a wall clock, in both directions — and for every conversion
+///   to `timetz`, which attaches the zone's offset when the value carries none.
 ///
 /// **Known divergence.** PostgreSQL folds a `timestamptz` literal during parse
 /// analysis using the parsing session's zone, so the instant is frozen; we defer
@@ -7552,18 +7553,31 @@ fn validate_zone_dependent_literal(s: &str, ty: PgType) -> Result<(), BindError>
         PgType::TimestampTz => timestamptz::parse(s, &SessionZone::utc())
             .map(|_| ())
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::TimeTz => timetz::parse(s, &SessionZone::utc())
+            .map(|_| ())
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Array(_) => parse_unknown(s, ty).map(|_| ()),
         _ => Ok(()),
     }
 }
 
-/// Whether values of `ty` are read or rendered relative to the session zone —
-/// `timestamptz` and, since `array_in`/`array_out` delegate to the element's own
-/// I/O functions, an array of it.
+/// Whether values of `ty` are read or rendered relative to the session zone.
+///
+/// `timestamptz` in both directions, and `timetz` on the way *in*: a `timetz`
+/// renders the offset it stores, but a literal that carries no offset takes the
+/// session's, so `'03:30'::timetz` is as zone-dependent as `'03:30'::time`
+/// widening to one. That is also what makes every conversion *to* `timetz`
+/// deferred, which is what a `time -> timetz` cast needs — the fact lives on
+/// the type rather than in a list of cast pairs, so a new arm in `cast.rs`
+/// cannot silently miss it.
+///
+/// Arrays follow their element, since `array_in`/`array_out` delegate to the
+/// element's own I/O functions.
 fn depends_on_session_zone(ty: PgType) -> bool {
+    use crabgresql_types::oid;
     match ty {
-        PgType::TimestampTz => true,
-        PgType::Array(elem) => elem == crabgresql_types::oid::TIMESTAMPTZ,
+        PgType::TimestampTz | PgType::TimeTz => true,
+        PgType::Array(elem) => elem == oid::TIMESTAMPTZ || elem == oid::TIMETZ,
         _ => false,
     }
 }
@@ -7715,7 +7729,10 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         PgType::Time => time::parse(s)
             .map(Value::Time)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
-        PgType::TimeTz => timetz::parse(s)
+        // Zone-dependent, so unreachable from `resolve_unknown` for the same
+        // reason `TimestampTz` below is; UTC serves `pg_input_is_valid`, which
+        // asks only whether the syntax is acceptable.
+        PgType::TimeTz => timetz::parse(s, &SessionZone::utc())
             .map(Value::TimeTz)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Timestamp => timestamp::parse(s)

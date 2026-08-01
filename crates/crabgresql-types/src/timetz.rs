@@ -14,12 +14,15 @@
 //! Deviations from PG, acceptable while no passing test needs them: a numeric
 //! offset (`-07`, `+05:30`) is honored, but resolving a named zone or dynamic
 //! abbreviation (which needs a date and the zone database) is not — those
-//! inputs are rejected. A missing zone defaults to UTC.
+//! inputs are rejected. A missing zone takes the session zone's standard
+//! offset, with the divergence [`crate::tz::SessionZone::standard_offset`]
+//! documents.
 
 use crate::Numeric;
 use crate::interval::Interval;
 use crate::time;
 use crate::timestamp::fixed_point;
+use crate::tz::SessionZone;
 
 const INVALID_DATETIME_FORMAT: &str = "22007";
 const DATETIME_FIELD_OVERFLOW: &str = "22008";
@@ -98,9 +101,14 @@ fn format_offset(zone_west: i32) -> String {
 
 /// `timetz_in`. Accepts `HH:MM[:SS[.ffffff]]` with an optional `AM`/`PM`, an
 /// optional leading date (ignored), and a numeric UTC offset (`-07`, `+05:30`,
-/// or glued to the time). A missing offset defaults to UTC. A named zone or
-/// dynamic abbreviation is rejected (no date/zone database here).
-pub fn parse(input: &str) -> Result<TimeTz, TimeTzError> {
+/// or glued to the time). A named zone or dynamic abbreviation is rejected (no
+/// date here to resolve one against).
+///
+/// A missing offset takes `session`'s, so `'03:30'::timetz` and
+/// `'03:30'::time::timetz` agree — PG resolves both through the session zone
+/// too, and having only one of them do it made the same value compare unequal
+/// to itself.
+pub fn parse(input: &str, session: &SessionZone) -> Result<TimeTz, TimeTzError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(invalid_syntax(input));
@@ -158,7 +166,7 @@ pub fn parse(input: &str) -> Result<TimeTz, TimeTzError> {
             invalid_syntax(input)
         }
     })?;
-    let zone = -gmtoff.unwrap_or(0); // stored west-of-UTC
+    let zone = -gmtoff.unwrap_or_else(|| session.standard_offset()); // stored west-of-UTC
     Ok(TimeTz { usec, zone })
 }
 
@@ -328,7 +336,7 @@ mod tests {
     use super::*;
 
     fn v(s: &str) -> TimeTz {
-        match parse(s) {
+        match parse(s, &SessionZone::utc()) {
             Ok(value) => value,
             Err(error) => panic!("invalid timetz test fixture `{s}`: {error:?}"),
         }
@@ -339,10 +347,21 @@ mod tests {
         assert_eq!(format(v("13:30:25.575401-04")), "13:30:25.575401-04");
         assert_eq!(format(v("05:06:07-07")), "05:06:07-07");
         assert_eq!(format(v("12:00:00+05:30")), "12:00:00+05:30");
-        assert_eq!(format(v("12:00")), "12:00:00+00"); // default UTC
+        assert_eq!(format(v("12:00")), "12:00:00+00"); // no offset: the session's
         assert_eq!(format(v("23:59:60 -07")), "24:00:00-07"); // rounds up
-        assert!(parse("24:00:00.01 -07").is_err());
-        assert!(parse("15:36:39 America/New_York").is_err());
+        assert!(parse("24:00:00.01 -07", &SessionZone::utc()).is_err());
+        assert!(parse("15:36:39 America/New_York", &SessionZone::utc()).is_err());
+    }
+
+    /// An input with no offset of its own takes the session zone's, so it
+    /// agrees with what `'12:00'::time::timetz` produces.
+    #[test]
+    fn a_missing_offset_takes_the_session_zone() -> anyhow::Result<()> {
+        let ny = SessionZone::resolve("America/New_York")?;
+        assert_eq!(format(parse("12:00", &ny)?), "12:00:00-05");
+        // An explicit offset still wins.
+        assert_eq!(format(parse("12:00+05:30", &ny)?), "12:00:00+05:30");
+        Ok(())
     }
 
     #[test]
