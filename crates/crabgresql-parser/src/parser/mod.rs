@@ -14312,7 +14312,17 @@ impl<'a> Parser<'a> {
             self.prev_token();
             self.parse_xml_table_factor()
         } else {
+            // PostgreSQL inheritance qualifiers. `ONLY t` and `ONLY (t)` exclude
+            // the descendants of `t`; a trailing `t*` asks for them explicitly,
+            // which is already the default, so it is consumed and dropped.
+            let only = self.parse_keyword(Keyword::ONLY);
+            let parenthesized_only = only && self.consume_token(&Token::LParen);
             let name = self.parse_object_name(true)?;
+            if parenthesized_only {
+                self.expect_token(&Token::RParen)?;
+            } else if !only {
+                let _ = self.consume_token(&Token::Mul);
+            }
 
             let json_path = match &self.peek_token_ref().token {
                 Token::LBracket if self.dialect.supports_partiql() => Some(self.parse_json_path()?),
@@ -14375,6 +14385,7 @@ impl<'a> Parser<'a> {
 
             let table = TableFactor::Table {
                 name,
+                only,
                 alias,
                 args,
                 with_hints,

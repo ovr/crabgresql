@@ -732,6 +732,52 @@ impl PgType {
         }
     }
 
+    /// Display name carrying a type modifier, as `format_type` renders it
+    /// (`character varying(10)`, `numeric(4,2)`, `timestamp(3) with time zone`).
+    ///
+    /// Each type prints its modifier only above its own threshold, matching the
+    /// `typmodout` functions (probed against PostgreSQL 18.4): the character
+    /// types need more than the four-byte varlena header they reserve, `numeric`
+    /// needs at least that header, and the rest need only a non-negative value.
+    /// Below the threshold PostgreSQL prints the bare type name rather than a
+    /// nonsensical `character varying(-2)`.
+    ///
+    /// `interval` is a deliberate gap: its modifier packs range bits and is
+    /// printed bare rather than decoded. Arrays and non-built-in types are the
+    /// caller's problem — they need a catalog this crate does not have.
+    pub fn name_with_typmod(self, typmod: i32) -> String {
+        // VARHDRSZ: character types encode `length + 4`; the storage layer's
+        // `Column::atttypmod` is what produces that encoding.
+        const VARHDRSZ: i32 = 4;
+        let m = typmod;
+        match self {
+            PgType::Numeric if m >= VARHDRSZ => {
+                let m = m - VARHDRSZ;
+                // The scale is an 11-bit *signed* field, so `numeric(4,-2)`
+                // round trips; the precision is masked to the 16 bits above it.
+                let precision = (m >> 16) & 0xffff;
+                let scale = (((m & 0x7ff) ^ 1024) - 1024) as i16;
+                format!("numeric({precision},{scale})")
+            }
+            PgType::Varchar if m > VARHDRSZ => format!("character varying({})", m - VARHDRSZ),
+            PgType::Bpchar if m > VARHDRSZ => format!("character({})", m - VARHDRSZ),
+            // `bpchar` is the one type that reports which spelling it was asked
+            // about: given a modifier it cannot print, it is `bpchar`; given none
+            // at all it is `character`. An unmodified `bpchar` column stores -1,
+            // so this is the arm `\d` takes for one.
+            PgType::Bpchar => "bpchar".to_string(),
+            PgType::Bit if m >= 0 => format!("bit({m})"),
+            PgType::Varbit if m >= 0 => format!("bit varying({m})"),
+            // The precision goes *before* the "with[out] time zone" suffix.
+            PgType::Time if m >= 0 => format!("time({m}) without time zone"),
+            PgType::TimeTz if m >= 0 => format!("time({m}) with time zone"),
+            PgType::Timestamp if m >= 0 => format!("timestamp({m}) without time zone"),
+            PgType::TimestampTz if m >= 0 => format!("timestamp({m}) with time zone"),
+            // Below its type's threshold a modifier prints nothing at all.
+            _ => self.name().to_string(),
+        }
+    }
+
     /// Display name as it appears in error messages (`double precision`, ...).
     pub fn name(self) -> &'static str {
         match self {

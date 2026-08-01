@@ -1887,6 +1887,7 @@ impl Spanned for TableFactor {
         match self {
             TableFactor::Table {
                 name,
+                only: _,
                 alias,
                 args: _,
                 with_hints: _,

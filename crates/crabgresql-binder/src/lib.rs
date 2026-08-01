@@ -28,10 +28,11 @@ pub use functions::{
 };
 pub use plan::{
     AggInput, CopyFormat, CopyFromPlan, CopyFromSource, DistinctKey, InsertSource, JoinExpr,
-    JoinInput, JoinKind, LogicalPlan, Returning, SortKey, bind_copy_from, bind_delete,
-    bind_delete_with_params, bind_insert, bind_insert_with_params, bind_query,
-    bind_query_with_params, bind_update, bind_update_with_params, output_columns_of,
-    plan_calls_routine, plan_has_outer_refs, substitute_outer, substitute_params,
+    JoinInput, JoinKind, LogicalPlan, MappedRelation, Returning, SortKey, bind_copy_from,
+    bind_delete, bind_delete_with_params, bind_insert, bind_insert_with_params, bind_query,
+    bind_query_with_params, bind_update, bind_update_with_params, inheritance_descendants,
+    output_columns_of, plan_calls_routine, plan_has_outer_refs, substitute_outer,
+    substitute_params,
 };
 pub use soft_input::{SoftError, TypeSpec, soft_input};
 

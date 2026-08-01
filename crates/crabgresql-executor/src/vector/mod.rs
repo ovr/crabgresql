@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_select::filter::filter_record_batch;
+use crabgresql_planner::PhysicalAppendArm;
 use crabgresql_storage_api::arrow::decode_columns;
 use crabgresql_storage_api::{BatchStream, Column, ColumnProjection, TableAm, TableSchema};
 use crabgresql_txn::TxnContext;
@@ -96,8 +97,8 @@ impl BatchNode for BatchScan {
 /// batches would be shredded at the leaves and nothing above could vectorize,
 /// so this is load-bearing rather than an extra.
 ///
-/// [`BatchAppend::open`] is all-or-nothing: one row-only leaf puts the whole
-/// relation back on the row path, because the leaves' outputs are concatenated
+/// [`BatchAppend::open`] is all-or-nothing: one row-only arm puts the whole
+/// relation back on the row path, because the arms' outputs are concatenated
 /// and must share one representation.
 pub struct BatchAppend {
     children: Vec<Box<dyn BatchNode>>,
@@ -105,15 +106,21 @@ pub struct BatchAppend {
 }
 
 impl BatchAppend {
-    pub fn open(
-        tables: &[Arc<dyn TableAm>],
-        txn: &TxnContext,
-        projection: &ColumnProjection,
-    ) -> Option<Self> {
-        let children = tables
+    /// `None` — stay on the row path — if any arm cannot hand up batches, or if
+    /// any arm carries a column remap. A batch is in its own relation's column
+    /// order and there is nowhere here to permute one, so a remapped arm would
+    /// concatenate mis-ordered columns rather than fail loudly. No arm that
+    /// remaps can produce batches today (an inheritance child is a heap
+    /// relation), so the check is a guard for the day one can; the planner's
+    /// `arms_batch` makes the same call so `EXPLAIN` agrees.
+    pub fn open(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Option<Self> {
+        let children = arms
             .iter()
-            .map(|table| {
-                BatchScan::open(table, txn, projection)
+            .map(|arm| {
+                if arm.relation.map.is_some() {
+                    return None;
+                }
+                BatchScan::open(&arm.relation.table, txn, &arm.projection)
                     .map(|scan| Box::new(scan) as Box<dyn BatchNode>)
             })
             .collect::<Option<Vec<_>>>()?;

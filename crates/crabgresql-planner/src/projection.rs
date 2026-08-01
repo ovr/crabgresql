@@ -38,12 +38,12 @@
 use std::collections::BTreeSet;
 
 use crabgresql_binder::{BoundAggregate, BoundExpr, BoundWindowFunc, DistinctKey, SortKey};
-use crabgresql_storage_api::{ColumnProjection, TableAm, TableSchema};
+use crabgresql_storage_api::{ColumnProjection, TableSchema};
 
 use crate::{
-    PhysicalAggInput, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan, PhysicalSetOpArm,
+    PhysicalAggInput, PhysicalAppendArm, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan,
+    PhysicalSetOpArm,
 };
-use std::sync::Arc;
 
 /// The columns a node's consumers read, in that node's own base-0 index space.
 /// `None` means "could not be determined — assume all of them".
@@ -141,15 +141,11 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             });
             push(source, demand);
         }
-        // Also transparent, and the node that actually reaches storage: every
-        // leaf carries the relation's own column layout, so the demand arrives
-        // already in the leaves' index space.
-        PhysicalPlan::Append {
-            tables,
-            projection,
-            columns,
-        } => {
-            *projection = append_projection(demand, tables, columns.len());
+        // Also transparent, and the node that actually reaches storage. The
+        // demand arrives in the *named* relation's index space, which an
+        // identity arm shares and a remapped one does not.
+        PhysicalPlan::Append { arms, columns } => {
+            prune_append(arms, demand, columns.len());
         }
         PhysicalPlan::Join {
             source,
@@ -260,29 +256,54 @@ fn through_tail(
     add_exprs(out, predicate)
 }
 
-/// Resolve one projection to share across an [`PhysicalPlan::Append`]'s leaves.
+/// Stamp a projection on each arm of an [`PhysicalPlan::Append`], translating
+/// the node's demand — which is in the *named* relation's index space — into
+/// each arm's own ordinals.
 ///
-/// The leaves of an `Append` are a partitioned parent's partitions or a
-/// relation's storage leaves, so they all carry the relation's column layout and
-/// one projection serves them all. That invariant spans the binder, the engines
-/// and DDL, so it is checked rather than assumed: an ordinal valid for one leaf
-/// but past the end of another would panic inside `ProjectionMask::roots` or
-/// `BufferTable::visible` rather than merely reading the wrong column.
-fn append_projection(
-    demand: Demand,
-    tables: &[Arc<dyn TableAm>],
-    columns: usize,
-) -> ColumnProjection {
-    let Some(first) = tables.first() else {
-        return ColumnProjection::All;
+/// An **identity arm** — a partition, or a storage leaf of the named relation —
+/// carries the named layout verbatim, so the demand passes through untranslated.
+/// That invariant spans the binder, the engines and DDL, so it is checked rather
+/// than assumed, and checked across *all* identity arms at once: an ordinal
+/// valid for one leaf but past the end of another would panic inside
+/// `ProjectionMask::roots` or `BufferTable::visible` rather than merely reading
+/// the wrong column, so one mismatched leaf disarms the whole optimization
+/// rather than only its own arm.
+///
+/// A **remapped arm** — an inheritance descendant — is wider, and `map` is
+/// exactly the translation, so it is unaffected by that check. `map` is total
+/// over the named relation's columns by construction, and an ordinal it somehow
+/// did not cover is forwarded out of range so [`ColumnProjection::of`]'s own
+/// fail-safe answers `All` — a broken map costs a wide read, never a column the
+/// query asked for and did not get.
+fn prune_append(arms: &mut [PhysicalAppendArm], demand: Demand, columns: usize) {
+    let Some(demand) = demand else {
+        for arm in arms.iter_mut() {
+            arm.projection = ColumnProjection::All;
+        }
+        return;
     };
-    if tables
+    let identity_layouts_agree = arms
         .iter()
-        .any(|table| table.schema().columns.len() != columns)
-    {
-        return ColumnProjection::All;
+        .filter(|arm| arm.relation.map.is_none())
+        .all(|arm| arm.relation.table.schema().columns.len() == columns);
+    for arm in arms.iter_mut() {
+        let schema = arm.relation.table.schema();
+        arm.projection = match &arm.relation.map {
+            None if !identity_layouts_agree => ColumnProjection::All,
+            None => ColumnProjection::of(demand.iter().copied(), schema),
+            // A demand ordinal the map does not cover is forwarded out of range
+            // rather than dropped, so `of`'s own fail-safe turns it into `All`.
+            // Dropping it would instead narrow the scan past what the query
+            // reads, and the missing column would come back as a placeholder —
+            // a wrong answer where this pass promises only a wide read.
+            Some(map) => ColumnProjection::of(
+                demand
+                    .iter()
+                    .map(|i| map.get(*i).copied().unwrap_or(usize::MAX)),
+                schema,
+            ),
+        };
     }
-    resolve(demand, first.schema())
 }
 
 /// Push `demand` — expressed in `node`'s own base-0 index space — down to the

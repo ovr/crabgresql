@@ -1053,3 +1053,98 @@ async fn out_of_line_values_survive_a_restart() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn inheritance_hierarchy_survives_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // First boot: a three-level hierarchy whose bottom relation has two parents,
+    // so both the *set* of links and their *order* have something to lose.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE TABLE person (name text, age int4)")
+            .await?;
+        client
+            .simple_query("CREATE TABLE emp (salary int4) INHERITS (person)")
+            .await?;
+        client
+            .simple_query("CREATE TABLE student (gpa float8) INHERITS (person)")
+            .await?;
+        client
+            .simple_query("CREATE TABLE stud_emp (percent int4) INHERITS (emp, student)")
+            .await?;
+        client
+            .simple_query(
+                "INSERT INTO person VALUES ('pp', 10); \
+                 INSERT INTO stud_emp VALUES ('se', 40, 200, 4.0, 50)",
+            )
+            .await?;
+        shutdown(client, handle).await;
+    }
+
+    // Second boot: the merged layout, the parent links with their `inhseqno`, and
+    // the read fan-out all come back.
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+
+        let msgs = client
+            .simple_query(
+                "SELECT a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+                 WHERE c.relname = 'stud_emp' AND a.attnum > 0 ORDER BY a.attnum",
+            )
+            .await?;
+        let layout: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+        assert_eq!(
+            layout,
+            vec![
+                Some("name"),
+                Some("age"),
+                Some("salary"),
+                Some("gpa"),
+                Some("percent")
+            ]
+        );
+
+        let msgs = client
+            .simple_query(
+                "SELECT c.relname, p.relname, i.inhseqno FROM pg_inherits i \
+                 JOIN pg_class c ON c.oid = i.inhrelid \
+                 JOIN pg_class p ON p.oid = i.inhparent \
+                 ORDER BY c.relname, i.inhseqno",
+            )
+            .await?;
+        let links: Vec<_> = rows(&msgs)
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                (Some("emp"), Some("person"), Some("1")),
+                (Some("stud_emp"), Some("emp"), Some("1")),
+                (Some("stud_emp"), Some("student"), Some("2")),
+                (Some("student"), Some("person"), Some("1")),
+            ]
+        );
+
+        // The fan-out is rebuilt from those links, including the remap that reads
+        // `stud_emp`'s `gpa` (ordinal 4) as `student`'s (ordinal 3).
+        let msgs = client
+            .simple_query("SELECT name FROM person ORDER BY name")
+            .await?;
+        let names: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+        assert_eq!(names, vec![Some("pp"), Some("se")]);
+        let msgs = client.simple_query("SELECT name, gpa FROM student").await?;
+        assert_eq!(
+            (rows(&msgs)[0].get(0), rows(&msgs)[0].get(1)),
+            (Some("se"), Some("4"))
+        );
+
+        shutdown(client, handle).await;
+    }
+
+    Ok(())
+}

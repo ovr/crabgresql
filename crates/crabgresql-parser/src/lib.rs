@@ -159,6 +159,52 @@ mod wrapper_tests {
         Ok(())
     }
 
+    /// PostgreSQL's inheritance qualifiers on a FROM item. `ONLY t` and
+    /// `ONLY (t)` are the same thing; `t*` is the default spelled out, so it
+    /// parses to `only = false` and renders back as the bare name.
+    #[test]
+    fn parses_inheritance_qualifiers_on_a_from_item() -> anyhow::Result<()> {
+        let only_of = |sql: &str| -> anyhow::Result<(bool, String)> {
+            let stmts = parse(sql)?;
+            let ast::Statement::Query(query) = &stmts[0] else {
+                anyhow::bail!("expected a query");
+            };
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                anyhow::bail!("expected a SELECT");
+            };
+            let ast::TableFactor::Table { only, name, .. } = &select.from[0].relation else {
+                anyhow::bail!("expected a table factor");
+            };
+            Ok((*only, name.to_string()))
+        };
+        assert_eq!(only_of("SELECT * FROM ONLY road")?, (true, "road".into()));
+        assert_eq!(only_of("SELECT * FROM ONLY (road)")?, (true, "road".into()));
+        assert_eq!(only_of("SELECT * FROM road")?, (false, "road".into()));
+        assert_eq!(only_of("SELECT * FROM road*")?, (false, "road".into()));
+        assert_eq!(
+            only_of("SELECT * FROM ONLY public.road r")?,
+            (true, "public.road".into())
+        );
+        // `ONLY` survives a round trip through Display.
+        assert_eq!(
+            parse("SELECT * FROM ONLY road")?[0].to_string(),
+            "SELECT * FROM ONLY road"
+        );
+        // UPDATE and DELETE take it on their target too.
+        let stmts = parse("DELETE FROM ONLY road WHERE name = 'x'")?;
+        let ast::Statement::Delete(delete) = &stmts[0] else {
+            anyhow::bail!("expected a DELETE");
+        };
+        let (ast::FromTable::WithFromKeyword(from) | ast::FromTable::WithoutKeyword(from)) =
+            &delete.from;
+        assert!(matches!(
+            from[0].relation,
+            ast::TableFactor::Table { only: true, .. }
+        ));
+
+        Ok(())
+    }
+
     #[test]
     fn parses_multiple_statements() -> anyhow::Result<()> {
         let stmts = parse("SELECT 1; SELECT 2;")?;

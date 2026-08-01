@@ -14,13 +14,10 @@
 //! Everything is a pure function of the plan, so no Arrow dependency is needed
 //! at this layer.
 
-use std::sync::Arc;
-
 use crabgresql_binder::{BinOp, BoundExpr, DistinctKey, SortKey, UnaryOp};
-use crabgresql_storage_api::TableAm;
 use crabgresql_types::{PgType, collation};
 
-use crate::PhysicalPlan;
+use crate::{PhysicalAppendArm, PhysicalPlan};
 
 /// Which parts of one plan node run columnar. Rendered by
 /// [`explain`](crate::explain) and consulted by the executor as it builds.
@@ -237,10 +234,20 @@ fn tail_vectorization(scan: bool, width: usize, tail: Tail<'_>) -> Vectorization
     Vectorization { scan, filter, sort }
 }
 
-/// Whether every leaf of an `Append` can hand up batches. All or none: their
+/// Whether every arm of an `Append` can hand up batches. All or none: their
 /// outputs are concatenated, so they must share one representation.
-fn leaves_batch(tables: &[Arc<dyn TableAm>]) -> bool {
-    !tables.is_empty() && tables.iter().all(|table| table.supports_batch_scan())
+///
+/// A remapped arm disqualifies the whole node. Batches carry the arm's own
+/// column order, and the batch path has nowhere to apply a permutation — it
+/// would concatenate mis-ordered columns rather than fail. No arm that remaps
+/// can produce batches today (an inheritance child is a heap relation, and a
+/// heap has no batch scan), so this costs nothing; it is here so that stays true
+/// if a columnar relation ever becomes one.
+fn arms_batch(arms: &[PhysicalAppendArm]) -> bool {
+    !arms.is_empty()
+        && arms
+            .iter()
+            .all(|arm| arm.relation.map.is_none() && arm.relation.table.supports_batch_scan())
 }
 
 impl PhysicalPlan {
@@ -281,15 +288,18 @@ impl PhysicalPlan {
                 sort,
                 distinct,
             } => {
-                let PhysicalPlan::Append { tables, .. } = source.as_ref() else {
+                let PhysicalPlan::Append {
+                    arms,
+                    columns: append_columns,
+                } = source.as_ref()
+                else {
                     return Vectorization::default();
                 };
-                let width = tables
-                    .first()
-                    .map_or(0, |table| table.schema().columns.len());
                 tail_vectorization(
-                    leaves_batch(tables),
-                    width,
+                    arms_batch(arms),
+                    // The Append's output width is the *named* relation's, which
+                    // an arm's own width equals only when it does not remap.
+                    append_columns.len(),
                     Tail {
                         predicate: predicate.as_ref(),
                         projections,
@@ -299,8 +309,8 @@ impl PhysicalPlan {
                     },
                 )
             }
-            PhysicalPlan::Append { tables, .. } => Vectorization {
-                scan: leaves_batch(tables),
+            PhysicalPlan::Append { arms, .. } => Vectorization {
+                scan: arms_batch(arms),
                 ..Vectorization::default()
             },
             _ => Vectorization::default(),

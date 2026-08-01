@@ -397,6 +397,7 @@ pub fn table_alias(explicit: bool, name: impl Into<String>) -> Option<TableAlias
 pub fn table(name: impl Into<String>) -> TableFactor {
     TableFactor::Table {
         name: ObjectName::from(vec![Ident::new(name.into())]),
+        only: false,
         alias: None,
         args: None,
         with_hints: vec![],
@@ -412,6 +413,7 @@ pub fn table(name: impl Into<String>) -> TableFactor {
 pub fn table_from_name(name: ObjectName) -> TableFactor {
     TableFactor::Table {
         name,
+        only: false,
         alias: None,
         args: None,
         with_hints: vec![],
@@ -431,6 +433,7 @@ pub fn table_with_alias(
 ) -> TableFactor {
     TableFactor::Table {
         name: ObjectName::from(vec![Ident::new(name)]),
+        only: false,
         alias: table_alias(with_as_keyword, alias),
         args: None,
         with_hints: vec![],

@@ -22,11 +22,11 @@ use std::sync::Arc;
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{
     BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, DistinctKey, JoinKind,
-    LogicalPlan, Returning, SortKey, TableFn, WindowFn, WindowKind,
+    LogicalPlan, MappedRelation, Returning, SortKey, TableFn, WindowFn, WindowKind,
 };
 use crabgresql_planner::{
-    HashKey, PhysicalAggInput, PhysicalInsertSource, PhysicalJoinExpr, PhysicalJoinInput,
-    PhysicalPlan,
+    HashKey, PhysicalAggInput, PhysicalAppendArm, PhysicalInsertSource, PhysicalJoinExpr,
+    PhysicalJoinInput, PhysicalPlan,
 };
 use crabgresql_storage_api::{
     ColumnProjection, IndexMetadata, PartitionBoundDatum, StorageError, TableAm, TableSchema, Tid,
@@ -469,16 +469,12 @@ pub fn execute(
             columns,
             ctx,
         ),
-        PhysicalPlan::Append {
-            tables,
-            projection,
-            columns,
-        } => {
-            // A partitioned parent read: concatenate every leaf's scan. The
+        PhysicalPlan::Append { arms, columns } => {
+            // A fanned-out relation read: concatenate every arm's scan. The
             // wrapping Subquery applies this level's projection/predicate/sort.
             Ok(Execution::Rows {
                 columns,
-                node: append_source(&tables, txn, &projection).into_rows(),
+                node: append_source(&arms, txn).into_rows(),
             })
         }
         PhysicalPlan::SetOp {
@@ -675,12 +671,14 @@ pub fn execute(
             assignments,
             returning,
             routing,
+            inherited,
         } => execute_update(
             &table,
             &predicate,
             &assignments,
             returning,
             routing,
+            inherited,
             ctx,
             txn,
         ),
@@ -689,7 +687,8 @@ pub fn execute(
             predicate,
             returning,
             routing,
-        } => execute_delete(&table, &predicate, returning, routing, ctx, txn),
+            inherited,
+        } => execute_delete(&table, &predicate, returning, routing, inherited, ctx, txn),
     }
 }
 
@@ -1547,11 +1546,8 @@ fn subquery_source(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Source, ExecError> {
-    if let PhysicalPlan::Append {
-        tables, projection, ..
-    } = &source
-    {
-        return Ok(append_source(tables, txn, projection));
+    if let PhysicalPlan::Append { arms, .. } = &source {
+        return Ok(append_source(arms, txn));
     }
     let Execution::Rows { node, .. } = execute(source, ctx, txn)? else {
         return Err(ExecError::new(
@@ -1599,32 +1595,33 @@ fn scan_source(
     }
 }
 
-/// The source for an `Append` over leaves — a partitioned parent, or the
-/// storage leaves of one engine-managed relation.
+/// The source for an `Append` over its arms — a partitioned parent, an
+/// inheritance parent with its descendants, or the storage leaves of one
+/// engine-managed relation.
 ///
-/// All leaves or none: [`vector::BatchAppend`] concatenates their outputs, so a
-/// single row-only leaf puts the whole node back on the row path rather than
-/// mixing representations.
-fn append_source(
-    tables: &[Arc<dyn TableAm>],
-    txn: &TxnContext,
-    projection: &ColumnProjection,
-) -> Source {
-    // Every leaf carries the parent's column layout, so any of them describes
-    // the batch. `Append` over zero leaves is not a shape the planner emits.
-    let layout = tables
-        .first()
-        .map(|table| vector::layout_of(table.schema()));
-    match (vector::BatchAppend::open(tables, txn, projection), layout) {
+/// All arms or none: [`vector::BatchAppend`] concatenates their outputs, so a
+/// single row-only arm puts the whole node back on the row path rather than
+/// mixing representations. An arm that remaps disqualifies the batch path
+/// outright — see [`vector::BatchAppend::open`].
+fn append_source(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Source {
+    // Only identity arms reach the batch path, and they all share the named
+    // relation's layout, so any of them describes the batch. `Append` over zero
+    // arms is not a shape the planner emits.
+    let first = arms.first();
+    let layout = first.map(|arm| vector::layout_of(arm.relation.table.schema()));
+    match (vector::BatchAppend::open(arms, txn), layout) {
         (Some(append), Some(layout)) => {
-            let positions = scan_positions(projection, layout.len());
+            let positions = scan_positions(
+                &first.expect("layout implies an arm").projection,
+                layout.len(),
+            );
             Source::Batches {
                 node: Box::new(append),
                 layout,
                 positions,
             }
         }
-        _ => Source::Rows(Box::new(Append::new(tables, txn, projection))),
+        _ => Source::Rows(Box::new(Append::new(arms, txn))),
     }
 }
 
@@ -2000,12 +1997,142 @@ fn execute_update(
     assignments: &[(usize, BoundExpr)],
     returning: Option<Returning>,
     routing: Option<Vec<Arc<dyn TableAm>>>,
+    inherited: Vec<MappedRelation>,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     match routing {
         Some(leaves) => update_routed(table, &leaves, predicate, assignments, returning, ctx, txn),
+        None if !inherited.is_empty() => {
+            update_inherited(&inherited, predicate, assignments, returning, ctx, txn)
+        }
         None => update_direct(table, predicate, assignments, returning, ctx, txn),
+    }
+}
+
+/// UPDATE through an inheritance parent: every descendant is updated **in
+/// place**. Nothing is routed and nothing moves — that is the whole difference
+/// from [`update_routed`], and the reason the two are separate functions rather
+/// than one with a flag.
+///
+/// Each target's rows are read through its
+/// [`view`](MappedRelation::view) as rows of the *named* relation, so the bound
+/// predicate, SET targets and RETURNING projections all keep the named
+/// relation's index space and are never rewritten. The NEW named-relation row is
+/// then [`scatter`](MappedRelation::scatter)ed back over the columns it came
+/// from, leaving a wider child's own extra columns untouched.
+///
+/// Constraints are validated against the full child tuple, so a child's own NOT
+/// NULL or UNIQUE applies and its error text names the child — which is what PG
+/// reports.
+fn update_inherited(
+    targets: &[MappedRelation],
+    predicate: &Option<BoundExpr>,
+    assignments: &[(usize, BoundExpr)],
+    returning: Option<Returning>,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Execution, ExecError> {
+    // Scan every target once up front, so the match set is fixed before any
+    // write (Halloween-safe) and RETURNING can fault with nothing written.
+    let scans: Vec<Vec<(Tid, Tuple)>> = targets
+        .iter()
+        // Unprojected: the row is rebuilt full width and RETURNING may name any
+        // column of the named relation.
+        .map(|target| {
+            target
+                .table
+                .scan(txn, &ColumnProjection::All)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+    let has_unique: Vec<bool> = targets
+        .iter()
+        .map(|target| target.table.indexes().iter().any(|index| index.unique))
+        .collect();
+    // Per-target simulation of its live rows after this statement, for UNIQUE
+    // checks only. Each target's uniqueness is its own — inheritance does not
+    // make a parent's unique index span its children, in PG or here.
+    let mut simulated: Vec<Vec<(Tid, Tuple)>> = scans
+        .iter()
+        .zip(&has_unique)
+        .map(
+            |(rows, unique)| {
+                if *unique { rows.clone() } else { Vec::new() }
+            },
+        )
+        .collect();
+
+    let mut pending: Vec<Vec<(Tid, Tuple)>> = vec![Vec::new(); targets.len()];
+    let mut new_rows: Vec<Tuple> = Vec::new();
+    for (i, rows) in scans.iter().enumerate() {
+        let target = &targets[i];
+        for (tid, old) in rows {
+            let old_view = target.view(old);
+            if !predicate_holds(predicate, &old_view, ctx)? {
+                continue;
+            }
+            // Every SET expression sees the OLD row: `SET a = b, b = a` swaps.
+            let mut new_view = old_view.to_vec();
+            for (index, expr) in assignments {
+                new_view[*index] = eval(expr, &old_view, ctx)?;
+            }
+            let mut new = old.clone();
+            target.scatter(&mut new, &new_view);
+
+            if has_unique[i] {
+                // Mirror `update_direct`: a tid absent from the simulation is a
+                // row that vanished under us — skip it rather than update it.
+                let Some(pos) = simulated[i]
+                    .iter()
+                    .position(|(candidate, _)| candidate == tid)
+                else {
+                    continue;
+                };
+                let removed = simulated[i].remove(pos);
+                if let Err(error) = validate_constraints(
+                    &target.table,
+                    &new,
+                    simulated[i].iter().map(|(_, t)| t),
+                    ctx,
+                ) {
+                    simulated[i].insert(pos, removed);
+                    return Err(error);
+                }
+                simulated[i].insert(pos, (*tid, new.clone()));
+            } else {
+                validate_constraints(&target.table, &new, std::iter::empty(), ctx)?;
+            }
+            if returning.is_some() {
+                // RETURNING is bound against the named relation, so it sees the
+                // NEW row in that shape, not the child's wider one.
+                new_rows.push(new_view);
+            }
+            pending[i].push((*tid, new));
+        }
+    }
+
+    // Project RETURNING over every NEW row before any write, so a faulting
+    // expression aborts the statement with nothing written.
+    let output = match &returning {
+        Some(returning) => Some(project_returning(
+            new_rows.iter(),
+            &returning.projections,
+            ctx,
+        )?),
+        None => None,
+    };
+    let mut affected = 0u64;
+    for (i, target) in targets.iter().enumerate() {
+        affected += target
+            .table
+            .update_many(std::mem::take(&mut pending[i]), txn)?;
+    }
+    match (returning, output) {
+        (Some(returning), Some(output)) => {
+            Ok(returning_rows(output, returning.columns, DmlVerb::Update))
+        }
+        _ => Ok(Execution::Updated(affected)),
     }
 }
 
@@ -2460,12 +2587,67 @@ fn execute_delete(
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
     routing: Option<Vec<Arc<dyn TableAm>>>,
+    inherited: Vec<MappedRelation>,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     match routing {
         Some(leaves) => delete_routed(&leaves, predicate, returning, ctx, txn),
+        None if !inherited.is_empty() => {
+            delete_inherited(&inherited, predicate, returning, ctx, txn)
+        }
         None => delete_direct(table, predicate, returning, ctx, txn),
+    }
+}
+
+/// DELETE through an inheritance parent: each matching row is removed from
+/// whichever descendant holds it. As in [`update_inherited`], rows are matched
+/// through each target's [`view`](MappedRelation::view), so the predicate and
+/// RETURNING stay in the named relation's index space; and as in
+/// [`delete_direct`], RETURNING is projected before anything is removed.
+fn delete_inherited(
+    targets: &[MappedRelation],
+    predicate: &Option<BoundExpr>,
+    returning: Option<Returning>,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Execution, ExecError> {
+    let mut pending: Vec<Vec<Tid>> = vec![Vec::new(); targets.len()];
+    // RETURNING sees the deleted (OLD) rows as rows of the named relation, in
+    // scan (target) order.
+    let mut deleted: Vec<Tuple> = Vec::new();
+    for (i, target) in targets.iter().enumerate() {
+        // Unprojected: RETURNING may name any column of the named relation.
+        for row in target.table.scan(txn, &ColumnProjection::All) {
+            let (tid, tuple) = row?;
+            let view = target.view(&tuple);
+            if predicate_holds(predicate, &view, ctx)? {
+                pending[i].push(tid);
+                if returning.is_some() {
+                    deleted.push(view.into_owned());
+                }
+            }
+        }
+    }
+    let output = match &returning {
+        Some(returning) => Some(project_returning(
+            deleted.iter(),
+            &returning.projections,
+            ctx,
+        )?),
+        None => None,
+    };
+    let mut affected = 0u64;
+    for (i, target) in targets.iter().enumerate() {
+        affected += target
+            .table
+            .delete_many(std::mem::take(&mut pending[i]), txn)?;
+    }
+    match (returning, output) {
+        (Some(returning), Some(output)) => {
+            Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
+        }
+        _ => Ok(Execution::Deleted(affected)),
     }
 }
 
@@ -3736,33 +3918,42 @@ impl ExecNode for SeqScan {
     }
 }
 
-/// Union scan over a partitioned parent's leaf partitions: concatenates each
-/// leaf's snapshot scan into one row stream, in leaf order (see
-/// [`PhysicalPlan::Append`](crabgresql_planner::PhysicalPlan::Append)). Each
-/// leaf captures its own MVCC snapshot up front, exactly as [`SeqScan`] does.
+/// Union scan over the relations one FROM item named: concatenates each arm's
+/// snapshot scan into one row stream, in arm order (see
+/// [`PhysicalPlan::Append`](crabgresql_planner::PhysicalPlan::Append)). Each arm
+/// captures its own MVCC snapshot up front, exactly as [`SeqScan`] does.
 pub struct Append {
     iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
 }
 
 impl Append {
-    pub fn new(
-        tables: &[Arc<dyn TableAm>],
-        txn: &TxnContext,
-        projection: &ColumnProjection,
-    ) -> Self {
-        // One projection for every leaf: the leaves of an `Append` all share the
-        // parent's column layout, so a schema ordinal means the same column in
-        // each.
-        let scans: Vec<Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>> = tables
-            .iter()
-            .map(|table| {
-                Box::new(
-                    table
-                        .scan(txn, projection)
-                        .map(|row| row.map(|(_, tuple)| tuple)),
-                ) as Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>
-            })
-            .collect();
+    pub fn new(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Self {
+        let scans: Vec<Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>> =
+            arms.iter()
+                .map(|arm| {
+                    let scan = arm
+                        .relation
+                        .table
+                        .scan(txn, &arm.projection)
+                        .map(|row| row.map(|(_, tuple)| tuple));
+                    match &arm.relation.map {
+                        // The arm already carries the named relation's layout, so
+                        // its tuples pass through untouched.
+                        None => Box::new(scan)
+                            as Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
+                        // A wider arm reads through the same `view` the write paths
+                        // use. The scan's projection was translated through this
+                        // same map, so a slot the projection skipped is a
+                        // placeholder in both spaces and stays one here.
+                        Some(_) => {
+                            let relation = arm.relation.clone();
+                            Box::new(scan.map(move |row| {
+                                row.map(|tuple| relation.view(&tuple).into_owned())
+                            }))
+                        }
+                    }
+                })
+                .collect();
         Self {
             iter: Box::new(scans.into_iter().flatten()),
         }
@@ -4841,6 +5032,7 @@ mod tests {
             &assignments,
             None,
             None,
+            Vec::new(),
             &ExecContext::default(),
             &wtxn(),
         )?
@@ -4887,6 +5079,7 @@ mod tests {
             &assignments,
             None,
             None,
+            Vec::new(),
             &ExecContext::default(),
             &wtxn(),
         ) else {
@@ -4917,6 +5110,7 @@ mod tests {
             &predicate,
             None,
             None,
+            Vec::new(),
             &ExecContext::default(),
             &wtxn(),
         )?

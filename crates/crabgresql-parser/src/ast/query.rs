@@ -1401,6 +1401,10 @@ pub enum TableFactor {
         #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
         /// Table or relation name.
         name: ObjectName,
+        /// PostgreSQL `ONLY`: read the named table itself, excluding the tables
+        /// that inherit from it. The opposite spelling, `name*`, is the default
+        /// and parses to `false` — the two are indistinguishable here.
+        only: bool,
         /// Optional alias for the table (e.g. `table AS t`).
         alias: Option<TableAlias>,
         /// Arguments of a table-valued function, as supported by Postgres
@@ -1961,6 +1965,7 @@ impl fmt::Display for TableFactor {
         match self {
             TableFactor::Table {
                 name,
+                only,
                 alias,
                 args,
                 with_hints,
@@ -1971,6 +1976,9 @@ impl fmt::Display for TableFactor {
                 sample,
                 index_hints,
             } => {
+                if *only {
+                    write!(f, "ONLY ")?;
+                }
                 name.fmt(f)?;
                 if let Some(json_path) = json_path {
                     json_path.fmt(f)?;

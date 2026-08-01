@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
+    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent, PartitionBound,
     PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
     SequenceAdvance, SequenceDefinition, TableAccessMethod, TableSchema, ViewDefinition,
 };
@@ -101,6 +101,13 @@ const SORT_MAGIC: &[u8; 4] = b"SRT1";
 /// what every relation written before this tail had: nothing was ever stored out
 /// of line.
 const TOAST_MAGIC: &[u8; 4] = b"TOA1";
+/// Marks the table-inheritance section, appended after the [`TOAST_MAGIC`] block
+/// — a thirteenth backward-compatible tail carrying each relation's
+/// `INHERITS (...)` parents in declaration order (the order `inhseqno` counts).
+/// A reader that predates table inheritance stops above and decodes every
+/// relation with no parents, which is what every relation written before this
+/// tail had.
+const INHERIT_MAGIC: &[u8; 4] = b"INH1";
 
 struct PersistCol {
     name: String,
@@ -139,6 +146,10 @@ struct PersistRel {
     partition_scheme: Option<PartitionScheme>,
     /// `Some` on a leaf partition: its parent and bound.
     partition_of: Option<PartitionOf>,
+    /// The relation's `INHERITS (...)` parents, persisted in the
+    /// [`INHERIT_MAGIC`] tail. Empty for a relation that inherits from nothing
+    /// and for one written before that tail existed.
+    inherits: Vec<InheritParent>,
     /// The relation's layout sort key, persisted in the [`SORT_MAGIC`] tail.
     /// Empty for a heap relation and for one written before that tail existed.
     sort_key: Vec<IndexKey>,
@@ -269,6 +280,7 @@ impl RelCatalog {
                         access_method: r.access_method,
                         partition_scheme: r.partition_scheme.clone(),
                         partition_of: r.partition_of.clone(),
+                        inherits: r.inherits.clone(),
                         sort_key: r.sort_key.clone(),
                     },
                     r.indexes
@@ -321,6 +333,7 @@ impl RelCatalog {
             access_method: schema.access_method,
             partition_scheme: schema.partition_scheme.clone(),
             partition_of: schema.partition_of.clone(),
+            inherits: schema.inherits.clone(),
             sort_key: schema.sort_key.clone(),
             // No chunk store until a row needs one.
             toast_rel: 0,
@@ -1205,6 +1218,18 @@ fn encode(state: &State) -> Vec<u8> {
     for r in &rels {
         out.extend_from_slice(&r.toast_rel.to_le_bytes());
     }
+    // Inheritance parents: a thirteenth backward-compatible tail, a
+    // length-prefixed run of `(namespace, name)` pairs per relation. Absent in a
+    // pre-inheritance file, where every relation decodes with no parents.
+    out.extend_from_slice(INHERIT_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        out.extend_from_slice(&(r.inherits.len() as u32).to_le_bytes());
+        for parent in &r.inherits {
+            put_str(&mut out, &parent.namespace);
+            put_str(&mut out, &parent.name);
+        }
+    }
     out
 }
 
@@ -1373,6 +1398,8 @@ fn decode(bytes: &[u8]) -> State {
             // Default to unpartitioned; overridden below from the PART1 tail.
             partition_scheme: None,
             partition_of: None,
+            // Default to no parents; overridden below from the INH1 tail.
+            inherits: Vec::new(),
             // Default to no declared order; overridden below from the SRT1 tail.
             sort_key: Vec::new(),
             // Default to never analyzed; overridden below from the STA1 tail.
@@ -1664,6 +1691,23 @@ fn decode(bytes: &[u8]) -> State {
         let nrels = d.u32();
         for r in rels.iter_mut().take(nrels as usize) {
             r.toast_rel = d.u32();
+        }
+    }
+    // Inheritance tail: absent means no relation inherits from another, which is
+    // both the legacy state and the state of every plain `CREATE TABLE`.
+    if d.remaining().starts_with(INHERIT_MAGIC) {
+        d.p += INHERIT_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            let nparents = d.u32();
+            r.inherits = (0..nparents)
+                .map(|_| {
+                    // Read in the order `encode` wrote, not field order.
+                    let namespace = d.s();
+                    let name = d.s();
+                    InheritParent { namespace, name }
+                })
+                .collect();
         }
     }
     State {
@@ -2287,6 +2331,78 @@ mod tests {
                 .iter()
                 .all(|(_, _, _, schema, _)| schema.partition_scheme.is_none()
                     && schema.partition_of.is_none())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn inheritance_parents_round_trip_and_legacy_catalog_has_none() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        // Two roots and a child of both, so the *order* of the parent list — the
+        // thing `inhseqno` is derived from — has something to be wrong about.
+        catalog.create(&TableSchema::new(
+            "person",
+            vec![Column::new("name", PgType::Text)],
+        ))?;
+        catalog.create(&TableSchema::in_namespace(
+            "student",
+            "app",
+            vec![Column::new("gpa", PgType::Float8)],
+        ))?;
+        let mut child = TableSchema::new(
+            "stud_emp",
+            vec![
+                Column::new("name", PgType::Text),
+                Column::new("gpa", PgType::Float8),
+            ],
+        );
+        child.inherits = vec![
+            InheritParent {
+                namespace: "public".to_string(),
+                name: "person".to_string(),
+            },
+            InheritParent {
+                namespace: "app".to_string(),
+                name: "student".to_string(),
+            },
+        ];
+        catalog.create(&child)?;
+        drop(catalog);
+
+        let loaded = RelCatalog::load(dir.path())?;
+        let schemas = loaded.schemas();
+        let reloaded = schemas
+            .iter()
+            .find(|(name, ..)| name == "stud_emp")
+            .ok_or_else(|| anyhow::anyhow!("child is missing"))?;
+        assert_eq!(reloaded.3.inherits, child.inherits);
+        assert!(
+            schemas
+                .iter()
+                .filter(|(name, ..)| name != "stud_emp")
+                .all(|(_, _, _, schema, _)| schema.inherits.is_empty()),
+            "a root must not acquire parents"
+        );
+        drop(loaded);
+
+        // A pre-inheritance catalog file (truncated at the marker) still loads:
+        // every relation decodes with no parents, which is what every relation
+        // written before this tail actually had.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(INHERIT_MAGIC.len())
+            .position(|w| w == INHERIT_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("inheritance marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        assert!(
+            legacy
+                .schemas()
+                .iter()
+                .all(|(_, _, _, schema, _)| schema.inherits.is_empty())
         );
 
         Ok(())

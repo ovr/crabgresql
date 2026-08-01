@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use crabgresql_binder::{
     AggInput, BinOp, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, DistinctKey,
-    InsertSource, JoinExpr, JoinInput, JoinKind, LogicalPlan, OutputColumn, Returning, SortKey,
-    TableFn,
+    InsertSource, JoinExpr, JoinInput, JoinKind, LogicalPlan, MappedRelation, OutputColumn,
+    Returning, SortKey, TableFn,
 };
 use crabgresql_storage_api::{
     ColumnProjection, IndexConstraint, IndexMetadata, TableAm, TableSchema,
@@ -107,17 +107,12 @@ pub enum PhysicalPlan {
         sort: Vec<SortKey>,
         distinct: Option<Vec<DistinctKey>>,
     },
-    /// Union scan over the leaf partitions of a partitioned parent. Mirrors
-    /// [`LogicalPlan::Append`]: the executor concatenates each leaf's scan into
-    /// one row stream. A partitioned-parent FROM item is planned as a
-    /// [`Self::Subquery`] wrapping this, so the standard projection/predicate/sort
-    /// tail runs on top.
+    /// Union scan over the several relations one FROM item names. Mirrors
+    /// [`LogicalPlan::Append`]: the executor concatenates each arm's scan into
+    /// one row stream. Such a FROM item is planned as a [`Self::Subquery`]
+    /// wrapping this, so the standard projection/predicate/sort tail runs on top.
     Append {
-        tables: Vec<Arc<dyn TableAm>>,
-        /// Shared by every leaf — they all carry the parent's column layout.
-        /// Supplied by the wrapping [`Self::Subquery`], which owns the
-        /// expressions that read these rows.
-        projection: ColumnProjection,
+        arms: Vec<PhysicalAppendArm>,
         columns: Vec<OutputColumn>,
     },
     /// A `UNION` / `UNION ALL`. Mirrors [`LogicalPlan::SetOp`]: the executor
@@ -164,6 +159,9 @@ pub enum PhysicalPlan {
         /// Leaf partitions for tuple routing when `table` is a partitioned parent
         /// (see [`LogicalPlan::Update`]); `None` for an ordinary table.
         routing: Option<Vec<Arc<dyn TableAm>>>,
+        /// `table` and its inheritance descendants, each with its column map
+        /// (see [`LogicalPlan::Update`]); empty for a table with no children.
+        inherited: Vec<MappedRelation>,
     },
     Delete {
         table: Arc<dyn TableAm>,
@@ -172,7 +170,28 @@ pub enum PhysicalPlan {
         /// Leaf partitions for tuple routing when `table` is a partitioned parent
         /// (see [`LogicalPlan::Delete`]); `None` for an ordinary table.
         routing: Option<Vec<Arc<dyn TableAm>>>,
+        /// `table` and its inheritance descendants, each with its column map
+        /// (see [`LogicalPlan::Delete`]); empty for a table with no children.
+        inherited: Vec<MappedRelation>,
     },
+}
+
+/// One arm of a [`PhysicalPlan::Append`]: a [`MappedRelation`] plus the columns
+/// its scan must materialize.
+///
+/// The relation is embedded rather than flattened so the permutation has one
+/// definition — the executor reads a row through [`MappedRelation::view`]
+/// instead of open-coding the same indexing a second time.
+///
+/// The projection is per-arm rather than shared: with a remap in play, an
+/// ordinal in one arm's schema names a different column in another's, so a
+/// single [`ColumnProjection`] could not be right for both.
+pub struct PhysicalAppendArm {
+    pub relation: MappedRelation,
+    /// Which of this arm's own columns the scan must materialize. Supplied by
+    /// the wrapping [`PhysicalPlan::Subquery`], which owns the expressions that
+    /// read these rows, translated through the map into this arm's ordinals.
+    pub projection: ColumnProjection,
 }
 
 /// One arm of a [`PhysicalPlan::SetOp`], mirroring [`SetOpArm`].
@@ -573,9 +592,16 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 distinct,
             },
         },
-        LogicalPlan::Append { tables, columns } => PhysicalPlan::Append {
-            tables,
-            projection: ColumnProjection::All,
+        LogicalPlan::Append { arms, columns } => PhysicalPlan::Append {
+            arms: arms
+                .into_iter()
+                .map(|relation| PhysicalAppendArm {
+                    relation,
+                    // Narrowed by the projection-pushdown pass, once the
+                    // wrapping Subquery's demand is known.
+                    projection: ColumnProjection::All,
+                })
+                .collect(),
             columns,
         },
         LogicalPlan::SetOp {
@@ -730,23 +756,27 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             assignments,
             returning,
             routing,
+            inherited,
         } => PhysicalPlan::Update {
             table,
             predicate,
             assignments,
             returning,
             routing,
+            inherited,
         },
         LogicalPlan::Delete {
             table,
             predicate,
             returning,
             routing,
+            inherited,
         } => PhysicalPlan::Delete {
             table,
             predicate,
             returning,
             routing,
+            inherited,
         },
     }
 }
@@ -993,22 +1023,24 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             lines
         }
         PhysicalPlan::Values { .. } => vec!["Values Scan".to_string()],
-        PhysicalPlan::Append { tables, .. } => {
-            // PG's Append over the partitions: one child scan per leaf, in scan
-            // order. A WHERE predicate lives on the wrapping Subquery in this
-            // pipeline, so it is not re-rendered per child (reduced EXPLAIN).
+        PhysicalPlan::Append { arms, .. } => {
+            // PG's Append: one child scan per arm, in scan order. A WHERE
+            // predicate lives on the wrapping Subquery in this pipeline, so it is
+            // not re-rendered per child (reduced EXPLAIN).
             //
-            // Each leaf names its own line: a SQL partition renders as the usual
-            // `Seq Scan on <leaf>`, while an engine-internal storage leaf can
-            // distinguish itself, so an Append over one relation's leaves is not
-            // the same line repeated.
+            // Each arm names its own line: a SQL partition or inheritance child
+            // renders as the usual `Seq Scan on <rel>`, while an engine-internal
+            // storage leaf can distinguish itself, so an Append over one
+            // relation's leaves is not the same line repeated. The remap an
+            // inheritance arm carries is deliberately invisible — PG prints no
+            // such annotation either.
             // Not annotated here: an engine-managed relation always renders
             // through the `Subquery` that owns its tail, and that wrapper adds
             // the annotation to this very line. Doing it in both places would
             // print the suffix twice.
             let mut lines = vec!["Append".to_string()];
-            for table in tables {
-                lines.push(format!("  ->  {}", table.scan_label()));
+            for arm in arms {
+                lines.push(format!("  ->  {}", arm.relation.table.scan_label()));
             }
             lines
         }
@@ -1433,6 +1465,15 @@ mod tests {
     };
     use crabgresql_txn::TxnContext;
     use crabgresql_types::{PgType, Value};
+
+    /// An `Append` arm carrying the named relation's layout verbatim — what a
+    /// partition or a storage leaf produces.
+    pub(super) fn identity_arm(table: Arc<dyn TableAm>) -> PhysicalAppendArm {
+        PhysicalAppendArm {
+            relation: MappedRelation { table, map: None },
+            projection: ColumnProjection::All,
+        }
+    }
 
     /// A metadata-only engine for planner tests: it holds table schemas and their
     /// index metadata and reports `supports_index_scan = true`, so the planner's
@@ -2542,8 +2583,10 @@ mod tests {
                 .expect("create leaf")
         };
         let plan = PhysicalPlan::Append {
-            tables: vec![leaf("sales_2023"), leaf("sales_2024")],
-            projection: ColumnProjection::All,
+            arms: [leaf("sales_2023"), leaf("sales_2024")]
+                .into_iter()
+                .map(identity_arm)
+                .collect(),
             columns: vec![OutputColumn::new("id", PgType::Int4)],
         };
         assert_eq!(
@@ -2665,7 +2708,7 @@ mod projection_tests {
     //! The column-projection pass: SQL in, the projection stamped on each scan
     //! leaf out. The fixture table is `t(id int4, big int8, name text)`.
 
-    use super::tests::{MetaEngine, plan_sql};
+    use super::tests::{MetaEngine, identity_arm, plan_sql};
     use super::*;
     use crabgresql_storage_api::{Column, TableEngine};
 
@@ -2999,8 +3042,7 @@ mod projection_tests {
         let narrow = leaf("narrow", &[PgType::Int4, PgType::Int4]);
 
         let mut plan = PhysicalPlan::Append {
-            tables: vec![wide, narrow],
-            projection: ColumnProjection::Some(vec![2].into()),
+            arms: [wide, narrow].into_iter().map(identity_arm).collect(),
             columns: vec![
                 OutputColumn::new("c0", PgType::Int4),
                 OutputColumn::new("c1", PgType::Int4),
@@ -3008,10 +3050,12 @@ mod projection_tests {
             ],
         };
         projection::push_column_projections(&mut plan);
-        let PhysicalPlan::Append { projection, .. } = &plan else {
+        let PhysicalPlan::Append { arms, .. } = &plan else {
             unreachable!()
         };
-        assert_eq!(cols(projection), None);
+        for arm in arms {
+            assert_eq!(cols(&arm.projection), None);
+        }
     }
 
     /// DML reads whole rows: the row is rebuilt by ordinal and RETURNING may

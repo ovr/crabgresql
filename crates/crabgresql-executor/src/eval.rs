@@ -649,8 +649,9 @@ fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecE
 
 /// `format_type(oid, typmod)`. A NULL oid yields NULL; oid `0` is `-`; an oid
 /// nothing in the catalog claims is `???`. The modifier is decoded in
-/// PostgreSQL's `atttypmod` encoding (see `crabgresql_catalog`'s
-/// `atttypmod_of`), so this is the inverse that reproduces PG's `\d` strings.
+/// PostgreSQL's `atttypmod` encoding (see
+/// [`Column::atttypmod`](crabgresql_storage_api::Column::atttypmod)), so this is
+/// the inverse that reproduces PG's `\d` strings.
 ///
 /// A NULL modifier and the `-1` modifier are *not* the same input: PostgreSQL
 /// tracks whether one was given at all, and `bpchar` reports itself differently

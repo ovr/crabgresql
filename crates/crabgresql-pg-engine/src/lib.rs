@@ -1841,6 +1841,30 @@ impl TableEngine for PgEngine {
             .collect()
     }
 
+    fn inheritance_links(&self) -> Vec<((String, String), (String, String))> {
+        // Read only the links under the lock — no schema deep-clone and no
+        // `statistics()` call — because the binder asks this of every relation
+        // every statement names, and the answer is almost always nothing.
+        self.tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .values()
+            .flat_map(|t| {
+                let schema = t.schema();
+                schema
+                    .inherits
+                    .iter()
+                    .map(|parent| {
+                        (
+                            (schema.namespace.clone(), schema.name.clone()),
+                            (parent.namespace.clone(), parent.name.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn relation_names_in(&self, namespace: &str) -> Vec<String> {
         // Read the table map's keys under the lock and clone only the names — no
         // schema deep-clone — so a session's disconnect teardown is O(its temp
