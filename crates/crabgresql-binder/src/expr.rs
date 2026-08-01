@@ -26,17 +26,31 @@ use crabgresql_types::{
 use crate::BindError;
 use crate::functions::{AggFn, ScalarFn, TableFn, WindowFn, bind_function, bind_srf_projection};
 
-/// Shared, mutable parameter-inference state for one statement. A `$n`
-/// occurrence anywhere in the statement — target list, WHERE, a subquery, a CTE
-/// — refers to the same slot here, so a type deduced at one site is visible at
-/// every other. Held behind `Rc<RefCell<…>>` because the binder threads a single
-/// context through the whole tree (see [`Scope`]) while several sites borrow it.
+/// Shared, mutable bind state for one statement. A `$n` occurrence anywhere in
+/// the statement — target list, WHERE, a subquery, a CTE — refers to the same
+/// slot here, so a type deduced at one site is visible at every other. Held
+/// behind `Rc<RefCell<…>>` because the binder threads a single context through
+/// the whole tree (see [`Scope`]) while several sites borrow it. That reach is
+/// also why the view-expansion state rides along: it has to be visible at every
+/// relation reference, including one nested inside an expression subquery.
 pub type ParamCtx = std::rc::Rc<std::cell::RefCell<ParamState>>;
+
+/// A view's identity while it is being expanded: `(namespace, name)`. Both come
+/// from the *resolved* view definition, not from how the reference was spelled,
+/// so the key is unambiguous across schemas.
+pub(crate) type ViewKey = (String, String);
+
+/// The views whose bodies are currently being bound (outermost first) and how
+/// many expansions this statement has done. Behind its own `Rc` so a nested view
+/// body can share *this* while getting a fresh `$n` namespace — see
+/// [`param_ctx_view_body`]. The binder's `ViewExpansionGuard` owns the policy.
+pub(crate) type ViewExpansion = std::rc::Rc<std::cell::RefCell<(Vec<ViewKey>, usize)>>;
 
 /// Per-statement bind-parameter types, indexed by parameter number minus one.
 /// `None` in a slot means the type is not yet known; the extended protocol may
 /// seed some slots from the client's declared OID list.
-#[derive(Clone, Debug, PartialEq)]
+///
+#[derive(Debug)]
 pub struct ParamState {
     /// `types[i]` is the type of `$(i+1)`; `None` until inferred/declared.
     types: Vec<Option<PgType>>,
@@ -47,6 +61,18 @@ pub struct ParamState {
     /// (a SQL function body has exactly `$1..$max` for its declared arguments).
     /// `None` leaves the wire-protocol bound (`MAX_PARAMS`) as the only cap.
     max: Option<usize>,
+    /// View expansion in progress, shared with any nested view body.
+    views: ViewExpansion,
+}
+
+/// Two parameter contexts are equal when they describe the same `$n` types. The
+/// view-expansion state is transient bookkeeping for an in-flight bind, not part
+/// of a context's identity — and comparing it would borrow a cell the binder may
+/// be holding mutably at the time.
+impl PartialEq for ParamState {
+    fn eq(&self, other: &Self) -> bool {
+        self.types == other.types && self.allow == other.allow && self.max == other.max
+    }
 }
 
 /// Upper bound on a parameter number `$n`. The Bind message carries the values
@@ -119,6 +145,7 @@ pub fn param_ctx_extended(declared: Vec<Option<PgType>>) -> ParamCtx {
         types: declared,
         allow: true,
         max: None,
+        views: Default::default(),
     }))
 }
 
@@ -131,6 +158,7 @@ pub fn param_ctx_capped(declared: Vec<Option<PgType>>) -> ParamCtx {
         types: declared,
         allow: true,
         max,
+        views: Default::default(),
     }))
 }
 
@@ -141,7 +169,30 @@ pub fn param_ctx_none() -> ParamCtx {
         types: Vec::new(),
         allow: false,
         max: None,
+        views: Default::default(),
     }))
+}
+
+/// A parameter context for a stored view's body. The body references none of the
+/// enclosing statement's `$n` (it is standalone SQL text), so parameter state
+/// starts empty and disallowed — but the view-expansion state is *shared* with
+/// the parent, since that is what lets a cycle be seen at the point it would
+/// recurse.
+pub(crate) fn param_ctx_view_body(parent: &ParamCtx) -> ParamCtx {
+    let views = std::rc::Rc::clone(&parent.borrow().views);
+    std::rc::Rc::new(std::cell::RefCell::new(ParamState {
+        types: Vec::new(),
+        allow: false,
+        max: None,
+        views,
+    }))
+}
+
+/// The view-expansion state, as a handle that outlives any borrow of the
+/// `ParamState` itself — so a caller never holds a `ParamCtx` borrow across the
+/// nested bind it is guarding.
+pub(crate) fn view_expansion(ctx: &ParamCtx) -> ViewExpansion {
+    std::rc::Rc::clone(&ctx.borrow().views)
 }
 
 /// The current inferred/declared parameter types (index = parameter number − 1).
