@@ -47,61 +47,104 @@ fn out_of_range(input: &str, type_name: &str) -> XidError {
 }
 
 /// Which way a scan failed, so the caller can attach the right type name.
-enum ScanError {
+pub(crate) enum ScanError {
     Syntax,
     Range,
 }
 
-/// Read one transaction id the way C's `strtoul(s, &end, 0)` does, which is
-/// what PG's input functions are observed to accept:
+/// Read the longest prefix of `s` that C's `strtoul(s, &end, 0)` would convert,
+/// returning the value alongside the byte offset C would leave in `end`. This is
+/// what PG's `xidin`, `xid8in` and `oidin` are all observed to accept:
 ///
-/// * surrounding whitespace is trimmed, and an optional `+`/`-` sign follows;
+/// * leading whitespace is skipped, and an optional `+`/`-` sign follows;
 /// * `0x`/`0X` introduces hex, a bare leading `0` introduces octal, and
-///   anything else is decimal — so `'010'` is 8 while `'08'` and `'0b11'` are
-///   syntax errors (the run stops at the invalid digit, leaving a trailing
-///   character that PG rejects);
+///   anything else is decimal — so `'010'` is 8, `'0x1f'` is 31, and `'08'`
+///   converts just the `0`, stopping at the `8`;
 /// * the magnitude must fit `u64`, and a negative one is negated *within*
 ///   `u64`. That wrap is observable: `'-1'::xid8` prints as
 ///   `18446744073709551615`.
-fn scan(input: &str) -> Result<u64, ScanError> {
-    let text = input.trim_matches(|c: char| c.is_ascii_whitespace());
-    let (negative, rest) = match text.as_bytes().first() {
-        Some(b'-') => (true, &text[1..]),
-        Some(b'+') => (false, &text[1..]),
-        _ => (false, text),
-    };
-
-    let (radix, digits) = match rest.as_bytes() {
-        // `0x` with no hex digit after it is not a hex prefix at all; it falls
-        // through to the octal branch, where the `x` is the invalid digit.
-        [b'0', b'x' | b'X', tail @ ..] if !tail.is_empty() => (16, &rest[2..]),
-        [b'0', ..] => (8, &rest[1..]),
-        _ => (10, rest),
-    };
-
-    // A bare `0` leaves no octal digits, and is the one empty run that is legal.
-    if digits.is_empty() {
-        return if radix == 8 {
-            Ok(0)
-        } else {
-            Err(ScanError::Syntax)
-        };
+///
+/// When no conversion happens at all (`""`, `"-"`, `"abc"`) the offset is `0`,
+/// as C leaves `end == nptr`. On overflow the digit run is still consumed in
+/// full, so the offset points past it — PG reports those as out of range, not
+/// as a syntax error.
+///
+/// [`crate::vector::vector_in`] needs the offset to reproduce `oidvectorin`'s
+/// error text, which quotes the input from wherever the scan stopped.
+pub(crate) fn scan_prefix(s: &str) -> (Result<u64, ScanError>, usize) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
     }
+    let negative = match bytes.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+
+    // `0x` is a hex prefix only when a hex digit actually follows; otherwise the
+    // `0` converts on its own and the scan stops at the `x`.
+    let (radix, mut consumed) = match (bytes.get(i), bytes.get(i + 1), bytes.get(i + 2)) {
+        (Some(b'0'), Some(b'x' | b'X'), Some(c)) if c.is_ascii_hexdigit() => {
+            i += 2;
+            (16u32, 0usize)
+        }
+        // The leading `0` is itself the first octal digit consumed, which is why
+        // a bare `0` is legal while a bare sign is not.
+        (Some(b'0'), _, _) => {
+            i += 1;
+            (8u32, 1usize)
+        }
+        _ => (10u32, 0usize),
+    };
 
     let mut magnitude: u64 = 0;
-    for byte in digits.bytes() {
-        let digit = char::from(byte).to_digit(radix).ok_or(ScanError::Syntax)?;
-        magnitude = magnitude
+    let mut overflowed = false;
+    while let Some(digit) = bytes.get(i).and_then(|b| char::from(*b).to_digit(radix)) {
+        i += 1;
+        consumed += 1;
+        match magnitude
             .checked_mul(u64::from(radix))
             .and_then(|m| m.checked_add(u64::from(digit)))
-            .ok_or(ScanError::Range)?;
+        {
+            Some(m) => magnitude = m,
+            // Keep eating digits so `end` lands past the whole run, as C does.
+            None => overflowed = true,
+        }
     }
 
-    Ok(if negative {
+    if consumed == 0 {
+        return (Err(ScanError::Syntax), 0);
+    }
+    if overflowed {
+        return (Err(ScanError::Range), i);
+    }
+    let value = if negative {
         magnitude.wrapping_neg()
     } else {
         magnitude
-    })
+    };
+    (Ok(value), i)
+}
+
+/// [`scan_prefix`] over a whole string: the trimmed input must convert in full,
+/// so a trailing character is a syntax error (`'1abc'`, `'08'`, `'0b11'`).
+fn scan(input: &str) -> Result<u64, ScanError> {
+    let text = input.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (result, stop) = scan_prefix(text);
+    let value = result?;
+    if stop == text.len() {
+        Ok(value)
+    } else {
+        Err(ScanError::Syntax)
+    }
 }
 
 /// `xidin`: a 32-bit transaction id.

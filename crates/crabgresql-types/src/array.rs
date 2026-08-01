@@ -117,6 +117,10 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::REGCLASS, oid::REGCLASS_ARRAY),
     (oid::REGTYPE, oid::REGTYPE_ARRAY),
     (oid::REGNAMESPACE, oid::REGNAMESPACE_ARRAY),
+    // PG treats the vectors as scalars for array construction, so `oidvector[]`
+    // is an array *of vectors*, not a flattened `oid[]`.
+    (oid::OIDVECTOR, oid::OIDVECTOR_ARRAY),
+    (oid::INT2VECTOR, oid::INT2VECTOR_ARRAY),
 ];
 
 /// `array_out`: render a 1-D array as `{e1,e2,...}`. A NULL element prints as an

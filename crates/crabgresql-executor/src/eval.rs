@@ -13,8 +13,8 @@ use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::text::quote_ident;
 use crabgresql_types::{
-    Inet, Interval, Numeric, PgType, TimeTz, Value, bit, cast, collation, date, float, interval,
-    json, money, net, time, timetz, tsquery, tsvector,
+    Inet, Interval, Numeric, PgType, TimeTz, Value, VectorKind, bit, cast, collation, date, float,
+    interval, json, money, net, time, timetz, tsquery, tsvector,
 };
 
 use crate::{CatalogOps, ExecContext, ExecError};
@@ -167,14 +167,21 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                 elems: values,
             })
         }
-        // `a[i]`: 1-based element access. A NULL array or NULL/out-of-range
-        // subscript yields NULL (PG semantics), never an error.
+        // `a[i]`: element access. A NULL base or NULL/out-of-range subscript
+        // yields NULL (PG semantics), never an error.
         BoundExpr::Subscript { base, index, .. } => {
             let base = eval(base, row, ctx)?;
+            // Evaluated before the base is inspected, so a NULL base still
+            // raises whatever the subscript expression raises:
+            // `(NULL::int[])[1/0]` is a division-by-zero error, not NULL.
             let idx = eval(index, row, ctx)?;
-            let elems = match &base {
-                Value::Array { elems, .. } => elems,
-                // NULL array → NULL element.
+            // An array's lower bound is 1, but `oidvector`/`int2vector` are
+            // stored with a lower bound of 0, so `('11 22 33'::oidvector)[0]` is
+            // `11` where `(array[11,22,33])[0]` is NULL. See `types::vector`.
+            let (elems, lower) = match &base {
+                Value::Array { elems, .. } => (elems, 1i32),
+                Value::Vector { elems, .. } => (elems, 0i32),
+                // NULL base → NULL element.
                 Value::Null => return Ok(Value::Null),
                 other => {
                     return Err(ExecError::new(
@@ -193,11 +200,13 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                     ));
                 }
             };
-            // PG arrays are 1-based; a subscript outside `[1, len]` is NULL.
-            if i < 1 || (i as usize) > elems.len() {
+            // Outside `[lower, lower + len)` is NULL. The offset is computed in
+            // i64 so a subscript near `i32::MIN`/`MAX` cannot wrap into range.
+            let offset = i64::from(i) - i64::from(lower);
+            if offset < 0 || offset >= elems.len() as i64 {
                 Ok(Value::Null)
             } else {
-                Ok(elems[(i - 1) as usize].clone())
+                Ok(elems[offset as usize].clone())
             }
         }
         // CASE tests conditions top-to-bottom and evaluates only the winning
@@ -889,6 +898,29 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
             }
             la.len().cmp(&lb.len())
         }
+        // The two vectors order *differently*, which is observable and was
+        // confirmed against PG 18.4:
+        //
+        // * `oidvector` has its own operator class (`btoidvectorcmp`), which
+        //   compares the element **count** first — so `'2' < '1 1'` is true.
+        // * `int2vector` has none, so it falls back to the polymorphic array
+        //   ordering: element-wise, with the shorter one first only on a
+        //   common prefix — so `'2' < '1 1'` is false.
+        //
+        // No NULL case either way: a vector's elements are never NULL.
+        PgType::Vector(kind) => {
+            let (la, lb) = (vector_elems(l), vector_elems(r));
+            if matches!(kind, VectorKind::Oid) && la.len() != lb.len() {
+                return la.len().cmp(&lb.len());
+            }
+            for (x, y) in la.iter().zip(lb.iter()) {
+                let ord = compare_values(kind.element(), x, y);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            la.len().cmp(&lb.len())
+        }
         // Query-time user-type ordering is currently defined only for enums.
         // Keep this total for defensive callers: malformed/mixed values use
         // their actual non-user representation or type OID, never an unchecked
@@ -958,6 +990,13 @@ pub(crate) fn array_elems(v: &Value) -> &[Value] {
     match v {
         Value::Array { elems, .. } => elems,
         other => unreachable!("expected array, got {other:?}"),
+    }
+}
+
+pub(crate) fn vector_elems(v: &Value) -> &[Value] {
+    match v {
+        Value::Vector { elems, .. } => elems,
+        other => unreachable!("expected vector, got {other:?}"),
     }
 }
 
@@ -1449,6 +1488,78 @@ mod format_type_tests {
             eval_format_type(&[Value::Oid(oid::VARCHAR), Value::Int4(24)], &ctx),
             Value::Text("character varying(20)".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod vector_cmp_tests {
+    use super::compare_values;
+    use crabgresql_types::{PgType, Value, VectorKind};
+    use std::cmp::Ordering;
+
+    fn v(kind: VectorKind, elems: &[i64]) -> Value {
+        Value::Vector {
+            kind,
+            elems: elems
+                .iter()
+                .map(|n| match kind {
+                    VectorKind::Oid => Value::Oid(*n as u32),
+                    VectorKind::Int2 => Value::Int2(*n as i16),
+                })
+                .collect(),
+        }
+    }
+
+    /// `oidvector` has its own operator class and compares the element count
+    /// before any element; `int2vector` has none and compares element-wise.
+    /// Both probed against PostgreSQL 18.4 — `'2' < '1 1'` is true for
+    /// `oidvector` and false for `int2vector`.
+    #[test]
+    fn the_two_kinds_order_differently_on_unequal_lengths() {
+        let (oid, int2) = (VectorKind::Oid, VectorKind::Int2);
+        let ov = PgType::Vector(oid);
+        let iv = PgType::Vector(int2);
+
+        assert_eq!(
+            compare_values(ov, &v(oid, &[2]), &v(oid, &[1, 1])),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(iv, &v(int2, &[2]), &v(int2, &[1, 1])),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_values(ov, &v(oid, &[1, 5]), &v(oid, &[1, 1, 1])),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(iv, &v(int2, &[9, 8]), &v(int2, &[1, 1, 1])),
+            Ordering::Greater
+        );
+    }
+
+    /// At equal length both kinds compare element-wise, and a shorter prefix
+    /// still sorts first — `'1' < '1 2'` either way.
+    #[test]
+    fn equal_lengths_and_common_prefixes_agree() {
+        for kind in [VectorKind::Oid, VectorKind::Int2] {
+            let ty = PgType::Vector(kind);
+            assert_eq!(
+                compare_values(ty, &v(kind, &[2, 0]), &v(kind, &[1, 9])),
+                Ordering::Greater,
+                "{kind:?}"
+            );
+            assert_eq!(
+                compare_values(ty, &v(kind, &[1]), &v(kind, &[1, 2])),
+                Ordering::Less,
+                "{kind:?}"
+            );
+            assert_eq!(
+                compare_values(ty, &v(kind, &[1, 2]), &v(kind, &[1, 2])),
+                Ordering::Equal,
+                "{kind:?}"
+            );
+        }
     }
 }
 

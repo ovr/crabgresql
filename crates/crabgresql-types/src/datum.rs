@@ -17,7 +17,7 @@
 //! The tag bytes below are an on-disk format shared by all of those. Adding a
 //! kind appends a tag; renumbering one silently misreads every existing file.
 
-use crate::{Inet, Interval, Numeric, PgType, Reg, TimeTz, Value, json};
+use crate::{Inet, Interval, Numeric, PgType, Reg, TimeTz, Value, VectorKind, json};
 
 // Type tags. Never reordered — they are an on-disk format.
 const T_BOOL: u8 = 1;
@@ -66,6 +66,7 @@ const T_BOX: u8 = 40;
 const T_LINE: u8 = 41;
 const T_CIRCLE: u8 = 42;
 const T_POLYGON: u8 = 43;
+const T_VECTOR: u8 = 44;
 
 // Tags at 200 and above are NOT value kinds. They are storage-layer markers that
 // an access method resolves before this codec is reached, and they live in their
@@ -324,6 +325,25 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
                 }
             }
         }
+        // An `oidvector`/`int2vector`: kind byte, element count, then the raw
+        // fixed-width elements. Unlike an array these need no per-element tag or
+        // presence byte — every element is of the kind's own type and none can
+        // be NULL, which `vector_in` and the catalog both guarantee.
+        Value::Vector { kind, elems } => {
+            out.push(T_VECTOR);
+            out.push(match kind {
+                VectorKind::Oid => 0,
+                VectorKind::Int2 => 1,
+            });
+            out.extend_from_slice(&(elems.len() as u32).to_le_bytes());
+            for e in elems {
+                match e {
+                    Value::Oid(x) => out.extend_from_slice(&x.to_le_bytes()),
+                    Value::Int2(x) => out.extend_from_slice(&x.to_le_bytes()),
+                    other => unreachable!("vector element is not oid/int2: {other:?}"),
+                }
+            }
+        }
     }
 }
 
@@ -561,6 +581,30 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
                 }
             }
             Value::Array { elem, elems }
+        }
+        T_VECTOR => {
+            let kind = match r.take(1)[0] {
+                0 => VectorKind::Oid,
+                1 => VectorKind::Int2,
+                other => panic!("corrupt vector kind {other}"),
+            };
+            let count = r.u32() as usize;
+            let width = match kind {
+                VectorKind::Oid => 4,
+                VectorKind::Int2 => 2,
+            };
+            // Cap the up-front reservation at what the remaining bytes could
+            // possibly hold, so a corrupt count cannot request a huge
+            // allocation; `take` still fails loudly if the data is short.
+            let remaining = (buf.len().saturating_sub(r.pos)) / width;
+            let mut elems = Vec::with_capacity(count.min(remaining));
+            for _ in 0..count {
+                elems.push(match kind {
+                    VectorKind::Oid => Value::Oid(r.u32()),
+                    VectorKind::Int2 => Value::Int2(i16::from_le_bytes(r.array())),
+                });
+            }
+            Value::Vector { kind, elems }
         }
         other => panic!("corrupt datum tag {other}"),
     };
@@ -817,6 +861,18 @@ mod tests {
         roundtrip(Value::Array {
             elem: PgType::Text,
             elems: vec![Value::Text("a".into()), Value::Text("b,c".into())],
+        });
+        roundtrip(Value::Vector {
+            kind: VectorKind::Oid,
+            elems: vec![Value::Oid(23), Value::Oid(u32::MAX)],
+        });
+        roundtrip(Value::Vector {
+            kind: VectorKind::Oid,
+            elems: vec![],
+        });
+        roundtrip(Value::Vector {
+            kind: VectorKind::Int2,
+            elems: vec![Value::Int2(1), Value::Int2(-32768), Value::Int2(32767)],
         });
     }
 

@@ -54,7 +54,7 @@ fn cannot_coerce(from: PgType, to: PgType) -> CastError {
 }
 
 /// `22P02` — an input function rejected the text (`'abc'::int4`).
-fn invalid_input(ty: PgType, s: &str) -> CastError {
+pub(crate) fn invalid_input(ty: PgType, s: &str) -> CastError {
     CastError {
         sqlstate: INVALID_TEXT_REPRESENTATION,
         message: format!("invalid input syntax for type {}: \"{s}\"", ty.name()),
@@ -63,7 +63,7 @@ fn invalid_input(ty: PgType, s: &str) -> CastError {
 
 /// `22003` on the text→int path, which prints the offending literal (unlike the
 /// bare `out_of_range` PG uses for arithmetic and numeric→int overflow).
-fn value_out_of_range(ty: PgType, s: &str) -> CastError {
+pub(crate) fn value_out_of_range(ty: PgType, s: &str) -> CastError {
     CastError {
         sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
         message: format!("value \"{s}\" is out of range for type {}", ty.name()),
@@ -717,6 +717,18 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 elem,
                 elems: recast,
             })
+        }
+
+        // ---- vector I/O ----
+        // `text` → `oidvector`/`int2vector` (`oidvectorin`/`int2vectorin`).
+        // vector → text goes through the generic any-to-text arm above.
+        //
+        // There is deliberately no `oid[]` conversion in either direction:
+        // `oid[]::oidvector` is `cannot cast type oid[] to oidvector` in PG too,
+        // and `oidvector::oid[]` yields a 0-based array this build cannot
+        // represent — both fall through to `cannot_coerce`. See `crate::vector`.
+        (Value::Text(s), PgType::Vector(kind)) => {
+            crate::vector::vector_in(s, kind).map(|elems| Value::Vector { kind, elems })
         }
 
         _ => Err(cannot_coerce(from, to)),

@@ -1120,6 +1120,14 @@ mod tests {
             ("jsonpath", PgType::Jsonpath),
             ("tsvector", PgType::Tsvector),
             ("tsquery", PgType::Tsquery),
+            (
+                "oidvector",
+                PgType::Vector(crabgresql_types::VectorKind::Oid),
+            ),
+            (
+                "int2vector",
+                PgType::Vector(crabgresql_types::VectorKind::Int2),
+            ),
         ];
         for (typname, ty) in modeled {
             let row = PG_TYPE_ROWS

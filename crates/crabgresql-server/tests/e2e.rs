@@ -2663,6 +2663,23 @@ async fn defaults_constraints_and_semantic_indexes() -> anyhow::Result<()> {
         4,
         "PK, UNIQUE constraints, and explicit index are reflected"
     );
+    // `indkey`/`indoption` are real `int2vector`s (PG's type OID 22), not text.
+    let indkey_row = client
+        .query_one(
+            "SELECT indkey, indoption FROM pg_index ORDER BY indexrelid LIMIT 1",
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        indkey_row.columns()[0].type_().oid(),
+        22,
+        "indkey is int2vector"
+    );
+    assert_eq!(
+        indkey_row.columns()[1].type_().oid(),
+        22,
+        "indoption is int2vector"
+    );
     let constraint_messages = client
         .simple_query("SELECT count(*) FROM pg_constraint")
         .await?;
@@ -8834,7 +8851,8 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
     let row = client
         .query_one(
             "SELECT p.proname, l.lanname, p.prokind, p.provolatile, p.proisstrict, \
-                    p.pronargs, p.proargtypes, p.prosrc, n.nspname, \
+                    p.pronargs, p.proargtypes, p.proargtypes::text AS argtypes_text, \
+                    (p.proargtypes)[0] AS argtype0, p.prosrc, n.nspname, \
                     array_to_string(p.proargnames, ',') AS argnames \
              FROM pg_catalog.pg_proc p \
              JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
@@ -8850,8 +8868,13 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
     assert_eq!(row.get::<_, &str>("provolatile"), "i");
     assert!(row.get::<_, bool>("proisstrict"));
     assert_eq!(row.get::<_, i16>("pronargs"), 2);
-    // `proargtypes` renders as oidvectorout does: the OIDs, space-separated.
-    assert_eq!(row.get::<_, &str>("proargtypes"), "23 25");
+    // `proargtypes` is a real `oidvector`, not text: it must advertise PG's
+    // type OID 30, render as `oidvectorout` does (the OIDs, space-separated),
+    // and subscript 0-based. Read through a `::text` cast because
+    // `tokio-postgres` has no `FromSql` for `oidvector`.
+    assert_eq!(row.columns()[6].type_().oid(), 30);
+    assert_eq!(row.get::<_, &str>("argtypes_text"), "23 25");
+    assert_eq!(row.get::<_, u32>("argtype0"), 23);
     // Read through array_to_string: arrays have no binary wire format yet.
     assert_eq!(row.get::<_, &str>("argnames"), "a,b");
     assert!(row.get::<_, &str>("prosrc").contains("RETURN 1;"));

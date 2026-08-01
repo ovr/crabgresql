@@ -412,6 +412,21 @@ pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
                     t.hash(&mut h);
                 }
             }
+            // A vector's equality is element-wise over `oid`/`int2`, both of
+            // which hash by their raw representation. The length is folded in
+            // so `'1 2'` and `'12'` cannot collide by concatenation.
+            PgType::Vector(_) => {
+                if let Value::Vector { elems, .. } = v {
+                    elems.len().hash(&mut h);
+                    for e in elems {
+                        match e {
+                            Value::Oid(o) => o.hash(&mut h),
+                            Value::Int2(i) => i.hash(&mut h),
+                            _ => {}
+                        }
+                    }
+                }
+            }
             PgType::User(type_oid) => {
                 if let Value::Enum {
                     type_oid: value_oid,

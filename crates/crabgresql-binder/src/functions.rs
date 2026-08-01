@@ -1275,11 +1275,17 @@ pub(crate) fn bind_table_fn_call(
 /// the single-array 1-D form is supported; anything else is `42883`. Shared by
 /// FROM-position and target-list binding.
 pub(crate) fn resolve_unnest(bindings: &[Binding]) -> Result<(PgType, Vec<BoundExpr>), BindError> {
-    if let [Binding::Typed(e)] = bindings
-        && let PgType::Array(elem_oid) = e.ty()
-        && let Some(elem) = PgType::from_oid(elem_oid)
-    {
-        return Ok((elem, vec![e.clone()]));
+    if let [Binding::Typed(e)] = bindings {
+        // `oidvector`/`int2vector` unnest to their element type as well, even
+        // though they are not array types here — PG gives them `typelem`.
+        let elem = match e.ty() {
+            PgType::Array(elem_oid) => PgType::from_oid(elem_oid),
+            PgType::Vector(kind) => Some(kind.element()),
+            _ => None,
+        };
+        if let Some(elem) = elem {
+            return Ok((elem, vec![e.clone()]));
+        }
     }
     Err(undefined_function("unnest", bindings))
 }
