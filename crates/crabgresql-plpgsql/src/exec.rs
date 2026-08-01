@@ -870,13 +870,9 @@ impl Interpreter {
         // sees the rows statement k wrote. The counter is shared with the
         // session, which reads it back when the top-level statement finishes.
         let txn = match &ctx.command_counter {
-            Some(counter) => {
-                let mut txn = txn.clone();
-                txn.cid = crabgresql_txn::CommandId(
-                    counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1,
-                );
-                txn
-            }
+            Some(counter) => txn.with_cid(crabgresql_txn::CommandId(
+                counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1,
+            )),
             None => txn.clone(),
         };
 

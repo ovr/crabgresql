@@ -29,6 +29,11 @@ pub const PORT: &str = "CRABGRESQL_PORT";
 /// Data directory the durable heap engine is opened in. Spelled `PGDATA` to
 /// match PostgreSQL, since the same directory serves the same purpose.
 pub const DATA_DIR: &str = "PGDATA";
+/// Directories a server-side `COPY … FROM '<file>'` may read, beyond the data
+/// directory. Colon-separated, like `PATH`. Empty means the data directory and
+/// nothing else — the read runs with the server's privileges, so it is confined
+/// by default.
+pub const COPY_ALLOW_PATHS: &str = "CRABGRESQL_COPY_ALLOW_PATHS";
 /// `tracing` filter directives. Read by `tracing_subscriber`'s `EnvFilter`
 /// rather than by this crate, so the name is here only to be documented.
 pub const LOG_FILTER: &str = "RUST_LOG";

@@ -1538,7 +1538,14 @@ pub fn run_copy_rows(
         // via its column's input function against the type catalog bound at
         // prepare time).
         let logical = prepared.plan.build_insert(&prepared.catalog, rows)?;
-        match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn)? {
+        // Each batch runs at its own command id so it can see the rows the
+        // previous batches wrote. Without this a UNIQUE index is only enforced
+        // *within* a batch, because the duplicate check scans the table through
+        // this context and `satisfies_mvcc` hides same-command inserts.
+        let batch_txn = txn.with_cid(CommandId(
+            command_counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1,
+        ));
+        match execute(crabgresql_planner::plan(logical), &exec_ctx, &batch_txn)? {
             Execution::Inserted(n) => {
                 loaded += n;
                 Ok(n)
@@ -1563,6 +1570,10 @@ pub fn run_copy_rows(
 /// stream the file through the shared text/CSV decoder, inserting in batches
 /// inside one transaction.
 ///
+/// The file is resolved, authorized and opened *before* [`run_copy_rows`] takes
+/// a transaction, so a path that can never work — outside the permitted roots,
+/// missing, a directory — costs no XID and leaves an open block usable.
+///
 /// A `COPY … FROM STDIN` reaching here is a routing bug rather than a user
 /// error, so it reports the wire-level requirement instead of silently loading
 /// nothing.
@@ -1583,14 +1594,12 @@ fn execute_copy_from_file(
             ));
         }
     };
+    let file = crate::copy::open_source_file(global_catalog.copy_files(), &path)?;
     let format = prepared.plan.format.clone();
     let rows = run_copy_rows(engine, txnmgr, session, &prepared, |insert| {
-        crate::copy::read_file_rows(&path, &format, |batch| insert(batch).map(|_| ()))
+        crate::copy::read_file_rows(file, &path, &format, |batch| insert(batch).map(|_| ()))
     })?;
-    Ok(QueryResult::Command {
-        tag: format!("COPY {rows}"),
-        notices: Vec::new(),
-    })
+    Ok(command_with(format!("COPY {rows}"), Vec::new()))
 }
 
 /// Map a WAL/commit I/O failure to a SQLSTATE 58030 system error.

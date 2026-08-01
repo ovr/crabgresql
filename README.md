@@ -71,6 +71,7 @@ not parse falls back to its default rather than failing startup.
 | --- | --- | --- | --- |
 | `CRABGRESQL_PORT` | `5433` | | TCP port to listen on (also `--port`) |
 | `PGDATA` | `./pgdata` | | data directory the durable heap engine is opened in (also `--data-dir`) |
+| `CRABGRESQL_COPY_ALLOW_PATHS` | *(empty)* | | extra directories a server-side `COPY … FROM '<file>'` may read, colon-separated (also repeatable `--copy-allow-path`). The data directory is always readable and is where a relative path resolves; nothing else is, because the read runs with the server's privileges |
 | `RUST_LOG` | `info` | | tracing filter directives |
 | `CRABGRESQL_BUFFER_TABLE_SOFT_BYTES` | `32MB` | `1MB`–`2GB` | per-relation buffered bytes that make one write buffer flush-eligible |
 | `CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES` | `256MB` | `1MB`–`16GB` | buffered bytes across all relations that make every buffer eligible |
@@ -116,10 +117,6 @@ $ cargo run -p crabgresql-pg-regress --bin regress -- --tests boolean,int4
 15 of 245 tests passed (6%).
 See target/regress/regression.diffs for details.
 ```
-
-The `lock` test currently aborts the runner process (a stack overflow), which
-ends the run early; the score above is from a sweep that skips it, counting it
-as a failure. Fixing that crash is tracked separately.
 
 The score is the compatibility dashboard, so a near-zero percentage at M0 is
 expected and honest. Regression protection lives in `cargo test`: the

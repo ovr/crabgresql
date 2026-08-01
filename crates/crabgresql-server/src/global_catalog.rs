@@ -18,6 +18,7 @@ use crabgresql_storage_api::{
 };
 use crabgresql_types::PgType;
 
+use crate::copy_access::CopyFileAccess;
 use crate::error::PgError;
 
 /// User-created objects get OIDs at or above 16384; lower values are reserved
@@ -469,6 +470,11 @@ fn enum_labels_mut<'a>(
 /// The shared user-object catalog. Cloned (as an `Arc`) into every connection.
 pub struct GlobalCatalog {
     inner: RwLock<CatalogInner>,
+    /// Which files a server-side `COPY … FROM '<file>'` may read. Fixed for the
+    /// server's life, so it needs no lock. It rides here because this is already
+    /// the server-lifetime object every statement can reach; PG likewise reaches
+    /// its data directory through a global rather than a statement argument.
+    copy_files: CopyFileAccess,
 }
 
 impl Default for GlobalCatalog {
@@ -478,13 +484,26 @@ impl Default for GlobalCatalog {
 }
 
 impl GlobalCatalog {
+    /// A catalog that refuses every server-side COPY file read. Servers call
+    /// [`Self::with_copy_files`]; this is for tests and for the in-memory entry
+    /// point, which has no data directory to anchor a policy on.
     pub fn new() -> Self {
+        Self::with_copy_files(CopyFileAccess::deny_all())
+    }
+
+    pub fn with_copy_files(copy_files: CopyFileAccess) -> Self {
         Self {
             inner: RwLock::new(CatalogInner {
                 next_oid: FIRST_USER_OID,
                 ..Default::default()
             }),
+            copy_files,
         }
+    }
+
+    /// The server's COPY file-access policy.
+    pub fn copy_files(&self) -> &CopyFileAccess {
+        &self.copy_files
     }
 
     /// Whether `name` (lowercased) resolves to a user-defined type — used to
