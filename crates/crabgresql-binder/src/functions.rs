@@ -3236,8 +3236,17 @@ fn bind_aggregate(
     if bound.len() != 1 {
         return Err(undefined_arity());
     }
-    let arg = bound.pop().expect("exactly one argument");
-    let input_ty = arg.ty();
+    let mut arg = bound.pop().expect("exactly one argument");
+    let mut input_ty = arg.ty();
+    // PG has no min/max aggregate for `"char"` (oid 18 appears in no `pg_proc`
+    // min/max signature), so the argument resolves through the implicit
+    // `"char" -> text` cast and both the ordering and the result type are
+    // text's. Left as a byte, `max()` would order unsigned and return a
+    // *different row's* value than PG — `'\377'` rather than `'Z'`.
+    if matches!(agg, AggFn::Min | AggFn::Max) && input_ty == PgType::Char {
+        arg = crate::expr::coerce_expr(arg, PgType::Text)?;
+        input_ty = PgType::Text;
+    }
     // A DISTINCT aggregate must compare its inputs for equality; a type with no
     // usable equality (e.g. `point`/`lseg`, which are not orderable) reports
     // PG's error rather than reaching the executor's comparison and panicking.

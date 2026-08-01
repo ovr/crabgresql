@@ -254,24 +254,20 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             Ok(Value::Text(crate::net::inet_text(v)))
         }
 
-        // ---- "char" → bpchar ----
-        // The one string target that does *not* go through `charout`. PG's
-        // `char_bpchar` copies the raw byte, so `'\377'::"char"::bpchar` is one
-        // byte wide while `::text`, `::varchar` and `::name` are all the
-        // four-character `\377`. A high-bit byte therefore has no UTF-8 image,
-        // and this engine — unlike PG, which lets the invalid byte through —
-        // refuses it rather than fabricating one.
-        (Value::Char(c), PgType::Bpchar) => {
-            if *c & 0x80 != 0 {
-                return Err(CastError {
-                    sqlstate: CHARACTER_NOT_IN_REPERTOIRE,
-                    message: format!(
-                        "byte sequence 0x{c:02x} in \"char\" has no character in encoding \"UTF8\""
-                    ),
-                });
-            }
-            Ok(Value::Text(crate::char::char_out(*c)))
-        }
+        // ---- "char" → bpchar, high-bit byte only ----
+        // PG's `char_bpchar` copies the raw byte, so `'\377'::"char"::bpchar` is
+        // one byte wide while `::text`, `::varchar` and `::name` are all the
+        // four-character `\377`. That raw byte has no UTF-8 image and so cannot
+        // live in `Value::Text`, and this engine refuses it rather than
+        // fabricating one — a divergence, since PG lets the byte through.
+        //
+        // Only the high-bit case is special: an ASCII byte falls through to the
+        // generic any-to-text arm below, which renders it via `charout` and
+        // agrees with `char_bpchar` there.
+        (Value::Char(c), PgType::Bpchar) if *c & 0x80 != 0 => Err(CastError {
+            sqlstate: CHARACTER_NOT_IN_REPERTOIRE,
+            message: format!("invalid byte sequence for encoding \"UTF8\": 0x{c:02x}"),
+        }),
 
         // ---- anything → text / varchar / bpchar / name (float uses efd) ----
         // These four share the `text` value representation; any length limit for
@@ -293,14 +289,12 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
         // -1 — the opposite convention from the unsigned ordering in
         // `compare_values`. Both are PG's; see `crate::char`.
         (Value::Char(c), PgType::Int4) => Ok(Value::Int4(i32::from(*c as i8))),
-        // `i4tochar` range-checks rather than truncating.
-        (Value::Int4(x), PgType::Char) => match i8::try_from(*x) {
-            Ok(c) => Ok(Value::Char(c as u8)),
-            Err(_) => Err(CastError {
-                sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
-                message: "\"char\" out of range".to_string(),
-            }),
-        },
+        // `i4tochar` range-checks rather than truncating. `out_of_range` renders
+        // `PgType::Char.name()`, which is already the quoted `"char"`, so this
+        // is PG's exact `"char" out of range`.
+        (Value::Int4(x), PgType::Char) => i8::try_from(*x)
+            .map(|c| Value::Char(c as u8))
+            .map_err(|_| out_of_range(PgType::Char)),
         (Value::Text(s), PgType::Float4) => {
             float::float4in(s)
                 .map(Value::Float4)

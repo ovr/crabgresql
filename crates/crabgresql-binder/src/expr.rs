@@ -3076,6 +3076,20 @@ fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
 
 /// Map a SQL type name to a `PgType`. Shared by cast/typed-string binding and
 /// server-side CREATE TABLE.
+/// The built-in a type *spelling* denotes under PG's type-name grammar, or
+/// `None` if it names no built-in.
+///
+/// This is the resolution `regtypein`, a `CAST` target and a `CREATE TYPE ...
+/// LIKE` target all use, and it is not the same as [`PgType::from_name`], which
+/// maps a catalog `typname`. Quoting is what separates them: unquoted `char` is
+/// the `char(1)` keyword (`bpchar`), while quoted `"char"` is the one-byte type
+/// (oid 18). Any caller holding user-written syntax must come through here,
+/// since a bare `&str` has already lost the quotes.
+pub fn builtin_type_from_syntax(s: &str) -> Option<PgType> {
+    let dt = crabgresql_parser::parse_data_type(s).ok()?;
+    map_data_type(&dt).ok()
+}
+
 pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
     use ast::DataType;
     Ok(match dt {
@@ -3604,6 +3618,15 @@ pub fn checked_length_typmod(dt: &ast::DataType) -> Result<Option<i32>, BindErro
                 Some(PgType::Varchar) => (declared, "varchar", MAX_CHAR_LENGTH),
                 Some(PgType::Bit) => (declared, "bit", MAX_BIT_LENGTH),
                 Some(PgType::Varbit) => (declared, "varbit", MAX_BIT_LENGTH),
+                // `"char"` takes no modifier at all, and PG rejects one rather
+                // than ignoring it — so this cannot fall through to `Ok(None)`
+                // the way a genuinely modifier-less type does.
+                Some(PgType::Char) if !mods.is_empty() => {
+                    return Err(BindError::new(
+                        sqlstate::SYNTAX_ERROR,
+                        "type modifier is not allowed for type \"char\"".to_string(),
+                    ));
+                }
                 _ => return Ok(None),
             }
         }
@@ -3652,6 +3675,14 @@ pub(crate) fn apply_length_typmod_if_any(
         },
         // `name` always truncates to 63 characters, independent of any modifier.
         PgType::Name => (ScalarFn::NameInput, None),
+        // `"char"` takes no modifier and PG rejects one rather than ignoring
+        // it, so this target still has to run the check even though it never
+        // yields a typmod — the DDL path reaches `checked_length_typmod`
+        // directly, but a cast only gets here.
+        PgType::Char => {
+            checked_length_typmod(data_type)?;
+            return Ok(expr);
+        }
         _ => return Ok(expr),
     };
     // Fold a constant value now (explicit-cast semantics: truncate/pad).
@@ -7304,6 +7335,19 @@ fn unify_types(
     if implicit_castable(rty, lty) {
         return Ok((left, coerce_expr(right, lty)?, lty));
     }
+    // Neither side casts to the other, but both may still reach a common third
+    // type. PG resolves an operator by picking a candidate and implicitly
+    // coercing both operands to its argument type, so `varchar = bpchar` binds
+    // via `texteq` even though neither casts to the other directly. This is
+    // deliberately *not* `select_common_type` (see `merge_types`): that one
+    // requires a shared type category, which is why `"char"` unifies with
+    // `varchar` for an operator but a UNION over the two still fails — exactly
+    // as in PG, where `"char"` is category `Z` and `varchar` is `S`.
+    if implicit_castable(lty, PgType::Text) && implicit_castable(rty, PgType::Text) {
+        let left = coerce_expr(left, PgType::Text)?;
+        let right = coerce_expr(right, PgType::Text)?;
+        return Ok((left, right, PgType::Text));
+    }
     Err(no_operator(
         &type_label(lty, catalog),
         op,
@@ -7880,8 +7924,20 @@ pub fn coerce_to_column(
             // timestamptz` cast and its assignment-only reverse (both are plain
             // microsecond reinterprets under the UTC session zone), so inserting
             // a `timestamp` expression into a `timestamptz` column works, as in PG.
+            // ... and the pairs `pg_cast` marks assignment-only. `"char"` needs
+            // them spelled out because it is category `Z`, not `S`: PG's
+            // I/O-coercion shortcut for string-category targets does not apply,
+            // so `text`/`varchar`/`bpchar` assign into a `"char"` column
+            // (truncating to the first byte) while `name`, `int4` and every
+            // other source are rejected there too.
             } else if implicit_castable(ty, column.ty)
-                || matches!((ty, column.ty), (PgType::TimestampTz, PgType::Timestamp))
+                || matches!(
+                    (ty, column.ty),
+                    (PgType::TimestampTz, PgType::Timestamp)
+                        | (PgType::Text, PgType::Char)
+                        | (PgType::Varchar, PgType::Char)
+                        | (PgType::Bpchar, PgType::Char)
+                )
             {
                 coerce_expr(e, column.ty)?
             } else {

@@ -65,7 +65,8 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
     let (namespace, name) = split_qualified_name(trimmed).ok_or_else(|| not_found(kind, s))?;
     let oid = match kind {
         RegKind::Class => ops.rel_oid(namespace.as_deref(), &name),
-        RegKind::Type => builtin_type_oid(namespace.as_deref(), &name)
+        RegKind::Type => builtin_type_oid_from_syntax(trimmed)
+            .or_else(|| builtin_type_oid(namespace.as_deref(), &name))
             .or_else(|| ops.user_type_oid(namespace.as_deref(), &name)),
         // A schema name is never itself qualified.
         RegKind::Namespace => match namespace {
@@ -75,6 +76,20 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
     }
     .ok_or_else(|| not_found(kind, s))?;
     Ok(from_oid(kind, oid, ops))
+}
+
+/// The OID a type *spelling* denotes under PG's type-name grammar, which is how
+/// `regtypein` resolves its argument — not by catalog lookup. Quoting is
+/// therefore significant, and [`split_qualified_name`] has already discarded it
+/// by the time [`builtin_type_oid`] runs: bare `char` is the `char(1)` keyword
+/// (`bpchar`, oid 1042) while `"char"` is the one-byte type (oid 18). Running
+/// the grammar on the raw input keeps the two apart, and also picks up the
+/// spellings a bare catalog-name lookup misses, like `int4[]` and `varchar(10)`.
+///
+/// `None` for anything that is not a built-in spelling, so a user type still
+/// falls through to the catalog.
+fn builtin_type_oid_from_syntax(s: &str) -> Option<u32> {
+    crabgresql_binder::builtin_type_from_syntax(s).map(|t| t.oid())
 }
 
 /// The OID of the built-in `namespace.name` names. Built-ins live in
@@ -162,6 +177,34 @@ fn take_ident(s: &str) -> Option<(String, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `regtypein` resolves with the type-name grammar, so quoting decides
+    /// which of PG's two char types a spelling means. Resolving through
+    /// `PgType::from_name` instead would make both spellings oid 18, because
+    /// `split_qualified_name` has already dropped the quotes.
+    #[test]
+    fn regtype_distinguishes_quoted_char_from_the_keyword() {
+        use crabgresql_types::oid;
+        assert_eq!(builtin_type_oid_from_syntax("char"), Some(oid::BPCHAR));
+        assert_eq!(builtin_type_oid_from_syntax("character"), Some(oid::BPCHAR));
+        assert_eq!(builtin_type_oid_from_syntax("char(3)"), Some(oid::BPCHAR));
+        assert_eq!(builtin_type_oid_from_syntax("\"char\""), Some(oid::CHAR));
+        assert_eq!(
+            builtin_type_oid_from_syntax("pg_catalog.char"),
+            Some(oid::CHAR)
+        );
+        // Spellings a bare catalog-name lookup would miss.
+        assert_eq!(
+            builtin_type_oid_from_syntax("int4[]"),
+            Some(oid::INT4_ARRAY)
+        );
+        assert_eq!(
+            builtin_type_oid_from_syntax("varchar(10)"),
+            Some(oid::VARCHAR)
+        );
+        // A user type is not a built-in and must fall through to the catalog.
+        assert_eq!(builtin_type_oid_from_syntax("nosuchtype"), None);
+    }
 
     #[test]
     fn unquoted_names_fold_and_quoted_names_do_not() {

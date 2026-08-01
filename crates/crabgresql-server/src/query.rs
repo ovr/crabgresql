@@ -4369,11 +4369,21 @@ fn type_shape_from_options(
                 // namespaces, so a schema-qualified target never names a
                 // builtin/user type (cf. `single_object_name`, which likewise
                 // rejects qualified names for the type being created).
-                let n = match name.0.as_slice() {
-                    [part] => part.as_ident().map(normalize_ident),
+                let ident = match name.0.as_slice() {
+                    [part] => part.as_ident(),
                     _ => None,
                 };
-                if let Some(t) = n.as_deref().and_then(builtin_type_by_name) {
+                let n = ident.map(normalize_ident);
+                // A `LIKE` target is a type *name as written*, so quoting is
+                // significant exactly as it is for a cast: unquoted `char` is
+                // the `char(1)` keyword (`bpchar`), quoted `"char"` is the
+                // one-byte type. `PgType::from_name` is a catalog-typname
+                // lookup and cannot see the difference, so ask the grammar.
+                let builtin = ident.and_then(|i| match i.quote_style {
+                    None => crabgresql_binder::builtin_type_from_syntax(&i.value),
+                    Some(_) => n.as_deref().and_then(builtin_type_by_name),
+                });
+                if let Some(t) = builtin {
                     typlen = t.typlen() as i32;
                     backing = Some(t);
                 } else if let Some(len) = n.as_deref().and_then(|n| catalog.user_type_typlen(n)) {

@@ -131,6 +131,8 @@ pub mod oid {
     // mapping lives in [`crate::array`].
     pub const BOOL_ARRAY: u32 = 1000;
     pub const BYTEA_ARRAY: u32 = 1001;
+    /// `"char"[]`. Note it is 1002, *not* adjacent to `BPCHAR_ARRAY` (1014).
+    pub const CHAR_ARRAY: u32 = 1002;
     pub const NAME_ARRAY: u32 = 1003;
     pub const INT2_ARRAY: u32 = 1005;
     pub const INT4_ARRAY: u32 = 1007;
@@ -618,12 +620,16 @@ impl PgType {
             "text" => PgType::Text,
             "varchar" | "character varying" => PgType::Varchar,
             "bpchar" | "character" => PgType::Bpchar,
-            // As in PG, the bare name `char` is the one-byte type, not `bpchar`
-            // — only the *keyword* `char`/`character(n)` means `bpchar`, and
-            // that path never reaches here (the parser yields `DataType::Char`,
-            // which the binder maps directly). What does reach here is the
-            // quoted `"char"` and the qualified `pg_catalog.char`, both of
-            // which are oid 18.
+            // This table maps a *catalog typname*, and `pg_type.typname` for oid
+            // 18 is `char` — so that is what the bare string resolves to here.
+            //
+            // It is NOT the SQL type-name grammar, where an unquoted `char` is
+            // the `char(1)` keyword (`bpchar`) and only a quoted `"char"` is oid
+            // 18. Callers holding user-written type *syntax* must apply that
+            // grammar themselves before falling back here, because quoting is
+            // already lost by the time a plain `&str` arrives: see
+            // `builtin_type_oid_from_syntax` in the executor's `reg` module and
+            // the `LIKE` arm of the server's `type_shape_from_options`.
             "char" => PgType::Char,
             "name" => PgType::Name,
             "oid" => PgType::Oid,
@@ -926,6 +932,7 @@ fn array_display_name(elem: u32) -> &'static str {
         Some(PgType::Text) => "text[]",
         Some(PgType::Varchar) => "character varying[]",
         Some(PgType::Bpchar) => "character[]",
+        Some(PgType::Char) => "\"char\"[]",
         Some(PgType::Name) => "name[]",
         Some(PgType::Oid) => "oid[]",
         Some(PgType::Tid) => "tid[]",
@@ -979,6 +986,7 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Text) => "_text",
         Some(PgType::Varchar) => "_varchar",
         Some(PgType::Bpchar) => "_bpchar",
+        Some(PgType::Char) => "_char",
         Some(PgType::Name) => "_name",
         Some(PgType::Oid) => "_oid",
         Some(PgType::Tid) => "_tid",

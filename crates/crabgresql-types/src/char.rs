@@ -49,7 +49,8 @@ pub fn char_in(s: &str) -> u8 {
 /// other byte, control characters included, is emitted raw.
 pub fn char_out(c: u8) -> String {
     if c & 0x80 != 0 {
-        format!("\\{}{}{}", (c >> 6) & 3, (c >> 3) & 7, c & 7)
+        // Always exactly three octal digits here, since c >= 0o200.
+        format!("\\{c:03o}")
     } else if c == 0 {
         String::new()
     } else {
