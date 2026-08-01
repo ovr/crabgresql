@@ -6,7 +6,6 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crabgresql_parser::ast::Spanned;
@@ -20,11 +19,10 @@ use crabgresql_types::{PgType, Value};
 
 use crate::expr::{
     BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, NamedWindows, OuterLevel,
-    ParamCtx, Scope, ViewKey, VisibleColumn, VisibleLookup, WindowKind, WindowSortKey,
-    bind_binary_op, bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr,
-    coerce_to_column, lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none,
-    param_ctx_view_body, reject_agg_or_window, reject_window, to_bool_operand, unify_value_column,
-    view_stack,
+    ParamCtx, Scope, VisibleColumn, VisibleLookup, WindowKind, WindowSortKey, bind_binary_op,
+    bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column,
+    lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none,
+    reject_agg_or_window, reject_window, to_bool_operand, unify_value_column,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -2603,57 +2601,114 @@ impl BoundFromItem {
     }
 }
 
-/// Marks one view as "currently being expanded" for as long as it is alive.
-///
-/// [`Self::enter`] is where recursion is detected: a view already on the stack
-/// is one whose body we are still binding, so expanding it again would never
-/// terminate. Popping happens in `Drop` so a `?` anywhere inside the body — not
-/// just the happy path — leaves the stack as it found it. That matters because a
-/// single context outlives one statement: PL/pgSQL binds every statement of a
-/// routine against the same context.
-struct ViewExpansionGuard {
-    stack: Rc<RefCell<Vec<ViewKey>>>,
+/// A view's identity while it is being expanded: `(namespace, name)`. Both come
+/// from the *resolved* [`ViewDefinition`], not from how the reference was
+/// spelled, so the key is unambiguous across schemas — the bare-vs-qualified
+/// mismatch that made the previous dependency-graph check silently pass.
+type ViewKey = (String, String);
+
+/// Maximum depth of nested view expansion. A cycle is caught by identity before
+/// this trips, so the cap exists for the acyclic case: each level costs a full
+/// `bind_view_query` → `bind_from_item` frame chain, and the native stack runs
+/// out around 45 levels — an abort that takes the whole server with it.
+const MAX_VIEW_EXPANSION_DEPTH: usize = 32;
+
+/// Maximum number of view expansions in one statement bind. Depth alone does not
+/// bound the *work*: a view referencing another twice doubles the expansions per
+/// level, so 30 shallow levels is 2^30 re-parses of the same bodies. Legitimate
+/// queries expand a handful of views; this only fires on the pathological shape.
+const MAX_VIEW_EXPANSIONS: usize = 1000;
+
+thread_local! {
+    /// The views whose bodies are currently being bound on this (single-threaded)
+    /// bind, outermost first, plus how many expansions this statement has done.
+    /// Ambient rather than threaded through the binder, following `InlineGuard`
+    /// in `functions.rs` — the sibling mechanism for `LANGUAGE SQL` inlining.
+    /// Being ambient is also what makes it total: any future expansion site, and
+    /// any nested bind that mints its own parameter context, is covered without
+    /// having to remember to pass anything.
+    static VIEW_EXPANSION: RefCell<(Vec<ViewKey>, usize)> =
+        const { RefCell::new((Vec::new(), 0)) };
 }
 
+/// Marks one view as "currently being expanded" for as long as it is alive.
+///
+/// [`Self::enter`] is where recursion is detected: a view already on the stack is
+/// one whose body we are still binding, so expanding it again would never
+/// terminate. Popping happens in `Drop` so a `?` anywhere inside the body — not
+/// just the happy path — leaves the stack as it found it. That matters within a
+/// *single* statement: `FROM v, v x` expands `v` twice as siblings, and the
+/// second must not see the first's entry. The expansion counter resets when the
+/// stack drains, which is the end of the outermost expansion in that statement.
+struct ViewExpansionGuard;
+
 impl ViewExpansionGuard {
-    fn enter(params: &ParamCtx, view: &ViewDefinition) -> Result<Self, BindError> {
-        let stack = view_stack(params);
+    fn enter(view: &ViewDefinition) -> Result<Self, BindError> {
         let key = (view.namespace.clone(), view.name.clone());
-        // The borrow must end before `bind_view_query` runs, so the membership
-        // test and the push are statements, not `if`-condition temporaries.
-        let recursing = stack.borrow().contains(&key);
-        if recursing {
-            return Err(BindError::new(
-                sqlstate::INVALID_OBJECT_DEFINITION,
-                format!(
-                    "infinite recursion detected in rules for relation \"{}\"",
-                    view.name
-                ),
-            ));
-        }
-        stack.borrow_mut().push(key);
-        Ok(Self { stack })
+        VIEW_EXPANSION.with(|cell| {
+            let (stack, expansions) = &mut *cell.borrow_mut();
+            if stack.contains(&key) {
+                return Err(BindError::new(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    format!(
+                        "infinite recursion detected in rules for relation \"{}\"",
+                        view.name
+                    ),
+                ));
+            }
+            // PG's ERRCODE_STATEMENT_TOO_COMPLEX ("stack depth limit exceeded"),
+            // as raised for over-nested set operations and SQL-function inlining.
+            if stack.len() >= MAX_VIEW_EXPANSION_DEPTH {
+                return Err(BindError::new(
+                    sqlstate::STATEMENT_TOO_COMPLEX,
+                    "views nested too deeply",
+                ));
+            }
+            if *expansions >= MAX_VIEW_EXPANSIONS {
+                return Err(BindError::new(
+                    sqlstate::STATEMENT_TOO_COMPLEX,
+                    "too many view expansions in one statement",
+                ));
+            }
+            // Counter and stack move together, so "the stack is empty" always
+            // implies "the counter is zero" — the reset in `Drop` depends on it.
+            stack.push(key);
+            *expansions += 1;
+            Ok(Self)
+        })
     }
 }
 
 impl Drop for ViewExpansionGuard {
     fn drop(&mut self) {
-        self.stack.borrow_mut().pop();
+        VIEW_EXPANSION.with(|cell| {
+            let (stack, expansions) = &mut *cell.borrow_mut();
+            stack.pop();
+            // The outermost expansion just finished, so the next one belongs to a
+            // different statement and starts from a clean budget. An error path
+            // unwinds through here too, which is what keeps the count honest
+            // after a failed bind.
+            if stack.is_empty() {
+                *expansions = 0;
+            }
+        });
     }
 }
 
 /// Bind a stored view's query into a logical plan. The SQL text is re-parsed and
 /// bound in a fresh scope (no outer CTEs, no outer `$n` parameters — a view body
-/// references neither). `params` is threaded in only to carry the view-expansion
-/// stack into the body: the child context shares that stack while starting from
-/// empty parameter state. A parse/shape failure is an internal invariant
-/// violation (the text was validated at `CREATE VIEW`), reported as `XX000`.
+/// references neither). A parse/shape failure is an internal invariant violation
+/// (the text was validated at `CREATE VIEW`), reported as `XX000`.
+///
+/// Entering the recursion guard is part of expanding a view, so it happens here
+/// rather than at the call site: a second expansion site added later cannot
+/// forget it and reintroduce the unbounded recursion.
 fn bind_view_query(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
-    params: &ParamCtx,
     view: &ViewDefinition,
 ) -> Result<LogicalPlan, BindError> {
+    let _guard = ViewExpansionGuard::enter(view)?;
     let stmts = crabgresql_parser::parse(&view.sql).map_err(|e| {
         BindError::new(
             sqlstate::INTERNAL_ERROR,
@@ -2678,7 +2733,7 @@ fn bind_view_query(
     bind_query_scoped(
         engine,
         catalog,
-        &param_ctx_view_body(params),
+        &param_ctx_none(),
         query,
         &CteEnv::new(),
         &[],
@@ -2826,12 +2881,11 @@ fn bind_from_item(
                     {
                         // A view whose definition (transitively) reads itself would
                         // recurse forever when expanded. PG allows creating such a
-                        // view but errors when it is used. The guard pushes this
-                        // view onto the shared expansion stack and errors if it is
-                        // already there — exact by construction, so a cycle closed
-                        // through an expression subquery is caught too.
-                        let _guard = ViewExpansionGuard::enter(params, &view)?;
-                        let inner = bind_view_query(engine, catalog, params, &view)?;
+                        // view but errors when it is used. `bind_view_query` marks
+                        // the view as in-progress and errors if it already was —
+                        // exact by construction, so a cycle closed through an
+                        // expression subquery is caught too.
+                        let inner = bind_view_query(engine, catalog, &view)?;
                         let qualifier = relation_qualifier(alias, &tname);
                         let mut columns = view_output_columns(&inner, &view)?;
                         apply_relation_alias_columns(
