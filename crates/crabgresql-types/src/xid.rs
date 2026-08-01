@@ -147,17 +147,26 @@ fn scan(input: &str) -> Result<u64, ScanError> {
     }
 }
 
-/// `xidin`: a 32-bit transaction id.
+/// The acceptance band `xidin` and `oidin` share: a scanned `u64` is in range
+/// when it either fits `u32` or sign-extends from `i32` — exactly the values
+/// C's `strtoul`-into-a-32-bit-id round-trips. So `'-1'` is `4294967295` and
+/// `'18446744073709551614'` is `4294967294` (the same wrapped value spelled the
+/// other way), while `'4294967296'` and `'-2147483649'` fall in the gap between
+/// the two bands and are rejected.
 ///
-/// The scanned `u64` is accepted when it either fits `u32` or sign-extends from
-/// `i32` — exactly the values C's `strtoul`-into-`TransactionId` round-trips.
-/// So `'-1'` is `4294967295` and `'18446744073709551614'` is `4294967294`
-/// (the same wrapped value spelled the other way), while `'4294967296'` and
-/// `'-2147483649'` fall in the gap between the two bands and are rejected.
+/// Kept here as the single definition because three input functions share it —
+/// `xid`, `oid` ([`crate::cast::text_to_oid`]) and each `oidvector` element
+/// ([`crate::vector`]) — and a copy that drifted would let `'x'::oid` and
+/// `'x'::oidvector` accept different literals.
+pub(crate) fn wraps_into_u32(v: u64) -> Option<u32> {
+    (v <= u64::from(u32::MAX) || v >= MIN_WRAPPED_XID).then_some(v as u32)
+}
+
+/// `xidin`: a 32-bit transaction id, accepted over [`wraps_into_u32`]'s band.
 pub fn xid_in(input: &str) -> Result<u32, XidError> {
     match scan(input) {
-        Ok(v) if v <= u64::from(u32::MAX) || v >= MIN_WRAPPED_XID => Ok(v as u32),
-        Ok(_) | Err(ScanError::Range) => Err(out_of_range(input, "xid")),
+        Ok(v) => wraps_into_u32(v).ok_or_else(|| out_of_range(input, "xid")),
+        Err(ScanError::Range) => Err(out_of_range(input, "xid")),
         Err(ScanError::Syntax) => Err(invalid_syntax(input, "xid")),
     }
 }

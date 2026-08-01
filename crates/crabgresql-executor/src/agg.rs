@@ -16,7 +16,7 @@ use crabgresql_binder::{AggFn, BoundAggregate};
 use crabgresql_types::{Numeric, PgType, Value, float};
 
 use crate::ExecError;
-use crate::eval::{compare_values, compare_values_collated};
+use crate::eval::{compare_values, compare_values_for_aggregate};
 
 /// The non-NULL input values already accepted by one `DISTINCT` aggregate in
 /// one group. It uses the same type-aware equality and compatible hash as
@@ -145,7 +145,10 @@ impl Accumulator {
                 let replace = match cur {
                     None => true,
                     Some(c) => {
-                        let ord = compare_values_collated(*ty, &v, c, *collation);
+                        // Not `compare_values_collated`: `min`/`max` on `oidvector`
+                        // compare element-wise while ORDER BY compares the element
+                        // count first, as in PG.
+                        let ord = compare_values_for_aggregate(*ty, &v, c, *collation);
                         if *want_max {
                             ord == Ordering::Greater
                         } else {

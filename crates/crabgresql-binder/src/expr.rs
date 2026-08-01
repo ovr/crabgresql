@@ -2936,9 +2936,11 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             // Both text-search types have a default btree opclass in PG.
             | PgType::Tsvector
             | PgType::Tsquery
-            // `oidvector`/`int2vector` order element-wise (PG's
-            // `btoidvectorcmp`); their elements are always `oid`/`int2`, both
-            // orderable, so there is no element check to make here.
+            // Both vectors are orderable, but by different rules — `oidvector`
+            // via its own `btoidvectorcmp` opclass (element count first),
+            // `int2vector` via the polymorphic array ordering (element-wise).
+            // See `compare_values_collated`. Their elements are always
+            // `oid`/`int2`, both orderable, so there is no element check here.
             | PgType::Vector(_)
     ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
 }

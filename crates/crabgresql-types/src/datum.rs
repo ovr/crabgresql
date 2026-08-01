@@ -589,10 +589,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
                 other => panic!("corrupt vector kind {other}"),
             };
             let count = r.u32() as usize;
-            let width = match kind {
-                VectorKind::Oid => 4,
-                VectorKind::Int2 => 2,
-            };
+            let width = kind.element().typlen() as usize;
             // Cap the up-front reservation at what the remaining bytes could
             // possibly hold, so a corrupt count cannot request a huge
             // allocation; `take` still fails loudly if the data is short.

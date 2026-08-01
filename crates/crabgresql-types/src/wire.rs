@@ -115,11 +115,9 @@ fn decode_vector(b: &[u8], kind: VectorKind) -> Result<Vec<Value>, CastError> {
     }
     let (ndim, elem_oid, count, lower) =
         (be(&b[0..4]), be(&b[8..12]), be(&b[12..16]), be(&b[16..20]));
-    let width = if matches!(kind, VectorKind::Oid) {
-        4
-    } else {
-        2
-    };
+    // Derived from the element type, as the encoder does, so the two cannot
+    // disagree about the stride if a third VectorKind is ever added.
+    let width = kind.element().typlen() as usize;
     // Reject anything that is not the shape PG sends, rather than guessing:
     // a wrong element type or lower bound would silently change the value.
     if ndim != 1 || lower != 0 || count < 0 || elem_oid != kind.element().oid() as i32 {

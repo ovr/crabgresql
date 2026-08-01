@@ -818,7 +818,7 @@ pub fn pg_partitioned_table_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Va
             let strat = match scheme.strategy {
                 PartitionStrategy::Range => "r",
             };
-            let attrs = int2vector(scheme.key_columns.iter().map(|i| *i as i16 + 1));
+            let attrs = attnum_vector(scheme.key_columns.iter().copied());
             rows.push(vec![
                 Value::Oid(*oid),
                 Value::Text(strat.to_string()),
@@ -1119,7 +1119,7 @@ pub fn pg_index_rows(indexes: &[CatalogIndex]) -> Vec<Vec<Value>> {
         .iter()
         .map(|index| {
             // 1-based key attnums, as PG's `indkey` holds.
-            let indkey = int2vector(index.metadata.keys.iter().map(|key| key.column as i16 + 1));
+            let indkey = attnum_vector(index.metadata.keys.iter().map(|key| key.column));
             let indoption = int2vector(index.metadata.keys.iter().map(|key| {
                 let mut option = 0;
                 if key.descending {
@@ -1480,6 +1480,25 @@ fn int2vector(elems: impl IntoIterator<Item = i16>) -> Value {
         kind: VectorKind::Int2,
         elems: elems.into_iter().map(Value::Int2).collect(),
     }
+}
+
+/// Build an [`INT2VECTOR`] of 1-based attribute numbers from 0-based column
+/// indexes — the shape of `pg_index.indkey` and
+/// `pg_partitioned_table.partattrs`.
+///
+/// `attnum` is an `int2` in PostgreSQL, which caps a relation at 32767 columns;
+/// PostgreSQL never reaches that because it rejects a table past 1600 columns,
+/// but this build has no such limit. A column index that does not fit is
+/// reported as `0`, which is already PostgreSQL's `indkey` sentinel for "this
+/// key is not a plain column reference" — the closest honest rendering. It must
+/// not be a bare `as i16`: that panics on overflow in a debug build and wraps to
+/// a negative attnum in a release one.
+fn attnum_vector(columns: impl IntoIterator<Item = usize>) -> Value {
+    int2vector(
+        columns
+            .into_iter()
+            .map(|c| i16::try_from(c.saturating_add(1)).unwrap_or(0)),
+    )
 }
 
 /// `pg_catalog.pg_language`.

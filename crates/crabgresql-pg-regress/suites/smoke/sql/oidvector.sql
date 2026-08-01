@@ -75,8 +75,19 @@ SELECT '1 ,2 3'::oidvector;                     -- error
 SELECT '1 5x 7'::int2vector;                    -- error
 
 -- Out-of-range elements are 22003, quoted from the element's first character.
+-- int2vector scans the digit run and reports the range error BEFORE it looks at
+-- any trailing garbage, so '99999abc' is 22003 while the in-range '5abc' is
+-- still 22P02.
 SELECT '01 9999999999'::oidvector;              -- error
 SELECT '1 -32769'::int2vector;                  -- error
+SELECT '1 99999abc'::int2vector;                -- error
+SELECT '1 5abc'::int2vector;                    -- error
+
+-- `oidin` is the same strtoul(base 0) acceptor as an oidvector element, so
+-- these must agree with the single-element casts above.
+SELECT '010'::oid, '0x1f'::oid, '-2147483648'::oid;
+SELECT '-2147483649'::oid;                      -- error
+SELECT '1abc'::oid;                             -- error
 
 -- Soft input validation (ported from upstream oid.sql).
 SELECT pg_input_is_valid(' 1 2  4 ', 'oidvector');
@@ -118,6 +129,12 @@ SELECT v FROM (VALUES ('9 8'::oidvector), ('1 1 1'::oidvector), ('7'::oidvector)
   ORDER BY v;
 SELECT v FROM (VALUES ('9 8'::int2vector), ('1 1 1'::int2vector), ('7'::int2vector)) t(v)
   ORDER BY v;
+
+-- min/max do NOT use the btree ordering: PG resolves them through the
+-- polymorphic min(anyarray)/max(anyarray), which compare element-wise, so for
+-- oidvector the aggregates and ORDER BY deliberately disagree.
+SELECT max(v), min(v) FROM (VALUES ('9 8'::oidvector), ('1 1 1'::oidvector)) t(v);
+SELECT max(v), min(v) FROM (VALUES ('9 8'::int2vector), ('1 1 1'::int2vector)) t(v);
 
 -- Treated as a scalar for array construction: this is an array *of vectors*,
 -- not a flattened oid[] (ported from upstream arrays.sql).

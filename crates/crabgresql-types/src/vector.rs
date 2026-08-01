@@ -44,8 +44,9 @@
 //! `('11 22 33'::oidvector)[0]` is `11`. That is handled in the executor's
 //! `Subscript` evaluation, not here.
 
+use crate::array::is_c_space;
 use crate::cast::{CastError, invalid_input, value_out_of_range};
-use crate::xid::{ScanError, scan_prefix};
+use crate::xid::{ScanError, scan_prefix, wraps_into_u32};
 use crate::{PgType, Value};
 
 /// Which element type a vector holds. Each variant is a distinct PostgreSQL
@@ -116,13 +117,6 @@ pub fn vector_in(input: &str, kind: VectorKind) -> Result<Vec<Value>, CastError>
     }
 }
 
-/// C's `isspace` over ASCII. Rust's `is_ascii_whitespace` is *not* the same
-/// set — it omits vertical tab (0x0B), which `oidvectorin` does treat as a
-/// separator: `E'11\x0b22'::oidvector` is `11 22`.
-fn is_c_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
-}
-
 /// `oidvectorin`: repeatedly skip separators and scan one `strtoul(s, &end, 0)`
 /// element, resuming wherever the previous scan stopped.
 ///
@@ -141,24 +135,28 @@ fn oidvector_in(input: &str) -> Result<Vec<Value>, CastError> {
     let mut elems = Vec::new();
     let mut i = 0;
     loop {
-        while i < bytes.len() && is_c_space(bytes[i]) {
+        while i < bytes.len() && is_c_space(bytes[i] as char) {
             i += 1;
         }
         if i == bytes.len() {
             return Ok(elems);
         }
         let (scanned, consumed) = scan_prefix(&input[i..]);
-        match scanned {
-            Ok(v) if v <= u64::from(u32::MAX) || v >= (i32::MIN as i64) as u64 => {
-                elems.push(Value::Oid(v as u32));
-                // `consumed` is at least 1 on the `Ok` path, so this always
-                // advances and the loop cannot spin.
+        match scanned.as_ref().ok().copied().and_then(wraps_into_u32) {
+            Some(v) => {
+                elems.push(Value::Oid(v));
+                // `consumed` is at least 1 whenever the scan succeeded, so this
+                // always advances and the loop cannot spin.
                 i += consumed;
             }
-            Ok(_) | Err(ScanError::Range) => {
-                return Err(value_out_of_range(PgType::Oid, &input[i..]));
+            // A scan that converted nothing is a syntax error; one that
+            // converted an out-of-band magnitude is a range error.
+            None => {
+                return Err(match scanned {
+                    Err(ScanError::Syntax) => invalid_input(PgType::Oid, &input[i..]),
+                    _ => value_out_of_range(PgType::Oid, &input[i..]),
+                });
             }
-            Err(ScanError::Syntax) => return Err(invalid_input(PgType::Oid, &input[i..])),
         }
     }
 }
@@ -183,14 +181,28 @@ fn int2vector_in(input: &str) -> Result<Vec<Value>, CastError> {
         let rest = &input[i..];
         let end = rest.find(' ').unwrap_or(rest.len());
         let token = &rest[..end];
-        let digits = token.strip_prefix(['+', '-']).unwrap_or(token);
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        // PG runs `strtol` over the leading digit run and reports ERANGE before
+        // it ever looks at what follows, so an element that both overflows and
+        // has trailing garbage is `22003`, not `22P02`: `'99999abc'` reports
+        // `value "99999abc" is out of range for type smallint`. Checking the
+        // whole token for digits first would get that backwards.
+        let sign_len = usize::from(token.starts_with(['+', '-']));
+        let run_len = sign_len
+            + token[sign_len..]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+        if run_len == sign_len {
             return Err(invalid_input(PgType::Int2, rest));
         }
-        match token.parse::<i16>() {
-            Ok(v) => elems.push(Value::Int2(v)),
-            Err(_) => return Err(value_out_of_range(PgType::Int2, rest)),
+        let Ok(v) = token[..run_len].parse::<i16>() else {
+            return Err(value_out_of_range(PgType::Int2, rest));
+        };
+        // In range, so any trailing character is the syntax error PG reports.
+        if run_len != token.len() {
+            return Err(invalid_input(PgType::Int2, rest));
         }
+        elems.push(Value::Int2(v));
         i += end;
     }
 }
@@ -349,7 +361,14 @@ mod tests {
                 format!("value \"{quoted}\" is out of range for type oid")
             );
         }
-        for (input, quoted) in [("1 99999 3", "99999 3"), ("1 -32769", "-32769")] {
+        // PG scans the digit run and reports ERANGE *before* it looks at what
+        // follows, so an element that both overflows and has trailing garbage
+        // is a range error, not a syntax error.
+        for (input, quoted) in [
+            ("1 99999 3", "99999 3"),
+            ("1 -32769", "-32769"),
+            ("1 99999abc", "99999abc"),
+        ] {
             let e = vector_in(input, VectorKind::Int2).unwrap_err();
             assert_eq!(e.sqlstate, "22003", "input {input:?}");
             assert_eq!(
@@ -357,5 +376,10 @@ mod tests {
                 format!("value \"{quoted}\" is out of range for type smallint")
             );
         }
+        // An in-range run with trailing garbage stays a syntax error.
+        assert_eq!(
+            vector_in("1 5abc", VectorKind::Int2).unwrap_err().sqlstate,
+            "22P02"
+        );
     }
 }

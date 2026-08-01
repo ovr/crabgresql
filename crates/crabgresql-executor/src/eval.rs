@@ -884,42 +884,23 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         // non-NULL (NULLS-LAST), matching the default btree order.
         PgType::Array(elem_oid) => {
             let elem = PgType::from_oid(elem_oid).expect("orderable array element type resolves");
-            let (la, lb) = (array_elems(l), array_elems(r));
-            for (x, y) in la.iter().zip(lb.iter()) {
-                let ord = match (x, y) {
-                    (Value::Null, Value::Null) => Ordering::Equal,
-                    (Value::Null, _) => Ordering::Greater,
-                    (_, Value::Null) => Ordering::Less,
-                    _ => compare_values(elem, x, y),
-                };
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            la.len().cmp(&lb.len())
+            compare_elementwise(elem, array_elems(l), array_elems(r))
         }
-        // The two vectors order *differently*, which is observable and was
-        // confirmed against PG 18.4:
+        // `oidvector` is the one type whose *sort* order is not its element-wise
+        // order: PG gives it its own operator class (`btoidvectorcmp`), which
+        // compares the element **count** first, so `'2' < '1 1'` is true.
+        // `int2vector` has no opclass of its own and falls back to the
+        // polymorphic array ordering, so for it `'2' > '1 1'`.
         //
-        // * `oidvector` has its own operator class (`btoidvectorcmp`), which
-        //   compares the element **count** first — so `'2' < '1 1'` is true.
-        // * `int2vector` has none, so it falls back to the polymorphic array
-        //   ordering: element-wise, with the shorter one first only on a
-        //   common prefix — so `'2' < '1 1'` is false.
-        //
-        // No NULL case either way: a vector's elements are never NULL.
+        // This is the *btree* order — what ORDER BY, `<` and indexes use.
+        // `min`/`max` deliberately do NOT use it; see
+        // [`compare_values_for_aggregate`].
         PgType::Vector(kind) => {
             let (la, lb) = (vector_elems(l), vector_elems(r));
             if matches!(kind, VectorKind::Oid) && la.len() != lb.len() {
                 return la.len().cmp(&lb.len());
             }
-            for (x, y) in la.iter().zip(lb.iter()) {
-                let ord = compare_values(kind.element(), x, y);
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            la.len().cmp(&lb.len())
+            compare_elementwise(kind.element(), la, lb)
         }
         // Query-time user-type ordering is currently defined only for enums.
         // Keep this total for defensive callers: malformed/mixed values use
@@ -990,6 +971,45 @@ pub(crate) fn array_elems(v: &Value) -> &[Value] {
     match v {
         Value::Array { elems, .. } => elems,
         other => unreachable!("expected array, got {other:?}"),
+    }
+}
+
+/// Compare two element sequences the way PG's `array_cmp` does: element-wise,
+/// then the shorter one first on a common prefix. A NULL element sorts after
+/// any non-NULL (NULLS-LAST), matching the default btree order; vectors never
+/// contain NULLs, so that arm is only reachable from arrays.
+fn compare_elementwise(elem: PgType, la: &[Value], lb: &[Value]) -> Ordering {
+    for (x, y) in la.iter().zip(lb.iter()) {
+        let ord = match (x, y) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Greater,
+            (_, Value::Null) => Ordering::Less,
+            _ => compare_values(elem, x, y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    la.len().cmp(&lb.len())
+}
+
+/// The ordering `min`/`max` use, which is **not** always the btree ordering.
+///
+/// PostgreSQL resolves `min`/`max` on `oidvector` through the polymorphic
+/// `min(anyarray)`/`max(anyarray)` aggregates rather than through the type's own
+/// operator class, so the aggregates compare element-wise even though `ORDER BY`
+/// compares the element count first. The two deliberately disagree in PG, and
+/// reproducing that is the only way `max()` returns the row PG returns:
+/// `max(VALUES '9 8'::oidvector, '1 1 1')` is `9 8`, not `1 1 1`.
+///
+/// Every other type — including `int2vector`, which has no opclass to diverge
+/// from — orders identically here and in [`compare_values_collated`].
+pub fn compare_values_for_aggregate(ty: PgType, l: &Value, r: &Value, collation: u32) -> Ordering {
+    match ty {
+        PgType::Vector(kind) => {
+            compare_elementwise(kind.element(), vector_elems(l), vector_elems(r))
+        }
+        _ => compare_values_collated(ty, l, r, collation),
     }
 }
 
