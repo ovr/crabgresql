@@ -16,9 +16,9 @@ use arrow_schema::{Field, Schema};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take as take_kernel;
 use crabgresql_binder::{BoundExpr, SortKey};
+use crabgresql_planner::vectorize;
 use crabgresql_storage_api::Column;
 use crabgresql_storage_api::arrow::{build_array, scan_schema};
-use crabgresql_planner::vectorize;
 
 use super::{BatchLayout, BatchNode};
 use crate::ExecError;

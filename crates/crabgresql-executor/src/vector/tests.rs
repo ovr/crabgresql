@@ -115,10 +115,19 @@ fn logic(op: BinOp, left: BoundExpr, right: BoundExpr) -> BoundExpr {
 }
 
 fn int_rows() -> Vec<Tuple> {
-    [Some(-3), Some(0), Some(1), None, Some(7), Some(42), None, Some(1)]
-        .into_iter()
-        .map(|v| vec![v.map_or(Value::Null, Value::Int4)])
-        .collect()
+    [
+        Some(-3),
+        Some(0),
+        Some(1),
+        None,
+        Some(7),
+        Some(42),
+        None,
+        Some(1),
+    ]
+    .into_iter()
+    .map(|v| vec![v.map_or(Value::Null, Value::Int4)])
+    .collect()
 }
 
 #[test]
@@ -237,7 +246,11 @@ fn a_null_constant_drops_every_row() {
         constant(Value::Null, PgType::Int4),
     );
     assert_same(&schema, &rows, &predicate);
-    assert!(columnar_filter(&schema, &rows, &predicate).expect("filter").is_empty());
+    assert!(
+        columnar_filter(&schema, &rows, &predicate)
+            .expect("filter")
+            .is_empty()
+    );
 }
 
 /// Every type on the comparison whitelist really is comparable by Arrow. A type
@@ -358,7 +371,10 @@ fn uncompilable_expressions_decline() {
         BinOp::Eq,
         PgType::Int4,
         column(0, PgType::Int4),
-        BoundExpr::Param { index: 0, ty: PgType::Int4 },
+        BoundExpr::Param {
+            index: 0,
+            ty: PgType::Int4,
+        },
     );
     assert!(expr::compile_predicate(&param, &layout).is_none());
 
@@ -375,8 +391,8 @@ fn uncompilable_expressions_decline() {
 // ---------------------------------------------------------------- sort
 
 use super::sort::{ProjectBatch, SortBatch};
-use crabgresql_binder::SortKey;
 use crate::Sort as RowSort;
+use crabgresql_binder::SortKey;
 
 fn sort_key(column: usize, ty: PgType, asc: bool, nulls_first: bool) -> SortKey {
     SortKey {
@@ -411,11 +427,7 @@ fn columnar_sort(
         build_scan_batch(schema, &rows[..split])?,
         build_scan_batch(schema, &rows[split..])?,
     ];
-    let project = ProjectBatch::new(
-        Box::new(Batches(batches.into_iter())),
-        takes,
-        &projected,
-    );
+    let project = ProjectBatch::new(Box::new(Batches(batches.into_iter())), takes, &projected);
     let sorted = SortBatch::new(Box::new(project), keys, &projected, visible_width)?;
 
     let visible: BatchLayout = Arc::from(&projected[..visible_width]);
@@ -428,7 +440,11 @@ fn columnar_sort(
 }
 
 /// Sort the same rows with the row `Sort`, the node this stands in for.
-fn row_sort(rows: &[Tuple], keys: &[SortKey], visible_width: usize) -> Result<Vec<Tuple>, ExecError> {
+fn row_sort(
+    rows: &[Tuple],
+    keys: &[SortKey],
+    visible_width: usize,
+) -> Result<Vec<Tuple>, ExecError> {
     let source = crate::MaterializedRows::new(rows.to_vec());
     let mut node = RowSort::new(Box::new(source), keys.to_vec(), visible_width)?;
     let mut out = Vec::new();
@@ -511,7 +527,12 @@ fn float_zero_and_nan_sort_as_postgresql_does() {
     .map(|(f, i)| vec![Value::Float8(f), Value::Int4(i)])
     .collect();
     for asc in [true, false] {
-        assert_same_order(&schema, &rows, &[sort_key(0, PgType::Float8, asc, false)], 2);
+        assert_same_order(
+            &schema,
+            &rows,
+            &[sort_key(0, PgType::Float8, asc, false)],
+            2,
+        );
     }
 }
 
@@ -574,7 +595,12 @@ fn hidden_sort_columns_are_dropped_after_ordering() {
 /// sort `'10'` before `'9'` without any error.
 #[test]
 fn unsortable_key_types_are_refused() {
-    for ty in [PgType::Numeric, PgType::Bpchar, PgType::Interval, PgType::TimeTz] {
+    for ty in [
+        PgType::Numeric,
+        PgType::Bpchar,
+        PgType::Interval,
+        PgType::TimeTz,
+    ] {
         let schema = schema_of(&[ty]);
         assert!(
             !SortBatch::compilable(&[sort_key(0, ty, true, false)], &layout_of(&schema)),
@@ -616,7 +642,9 @@ fn a_constant_only_predicate_keeps_every_row() {
     let always = compare(BinOp::Eq, PgType::Int4, one(), one());
     assert_same(&schema, &rows, &always);
     assert_eq!(
-        columnar_filter(&schema, &rows, &always).expect("filter").len(),
+        columnar_filter(&schema, &rows, &always)
+            .expect("filter")
+            .len(),
         rows.len(),
         "a constant-true predicate must keep every row, not one per batch"
     );
@@ -629,7 +657,11 @@ fn a_constant_only_predicate_keeps_every_row() {
         constant(Value::Int4(2), PgType::Int4),
     );
     assert_same(&schema, &rows, &never);
-    assert!(columnar_filter(&schema, &rows, &never).expect("filter").is_empty());
+    assert!(
+        columnar_filter(&schema, &rows, &never)
+            .expect("filter")
+            .is_empty()
+    );
 
     // A bare `true`, and `NULL IS NULL` — the other two shapes with no column.
     assert_same(&schema, &rows, &constant(Value::Bool(true), PgType::Bool));
@@ -679,7 +711,11 @@ fn a_constant_predicate_over_no_rows_yields_no_rows() {
         constant(Value::Int4(1), PgType::Int4),
         constant(Value::Int4(1), PgType::Int4),
     );
-    assert!(columnar_filter(&schema, &[], &always).expect("filter").is_empty());
+    assert!(
+        columnar_filter(&schema, &[], &always)
+            .expect("filter")
+            .is_empty()
+    );
 }
 
 /// A constant whose type has no Arrow encoding must be *declined* at compile

@@ -586,7 +586,10 @@ mod tests {
         let wal = Arc::new(Wal::open(dir.path())?);
         let mut temporal = TableSchema::new(
             "p",
-            vec![Column::new("id", PgType::Int4), Column::new("d", PgType::Date)],
+            vec![
+                Column::new("id", PgType::Int4),
+                Column::new("d", PgType::Date),
+            ],
         );
         temporal.access_method = TableAccessMethod::Parquet;
 

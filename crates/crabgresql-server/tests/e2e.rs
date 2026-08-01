@@ -5888,7 +5888,9 @@ async fn a_columnar_plan_answers_what_the_row_plan_answers() -> anyhow::Result<(
     client
         .simple_query("CREATE TABLE p (id int4, label text) USING parquet ORDER BY (id)")
         .await?;
-    client.simple_query("CREATE TABLE h (id int4, label text)").await?;
+    client
+        .simple_query("CREATE TABLE h (id int4, label text)")
+        .await?;
     for table in ["p", "h"] {
         client
             .simple_query(&format!(
@@ -5917,8 +5919,12 @@ async fn a_columnar_plan_answers_what_the_row_plan_answers() -> anyhow::Result<(
         // accepts: the row Filter must still run, and run first.
         "WHERE label LIKE 'a%' ORDER BY id",
     ] {
-        let columnar = client.simple_query(&format!("SELECT id FROM p {tail}")).await?;
-        let row = client.simple_query(&format!("SELECT id FROM h {tail}")).await?;
+        let columnar = client
+            .simple_query(&format!("SELECT id FROM p {tail}"))
+            .await?;
+        let row = client
+            .simple_query(&format!("SELECT id FROM h {tail}"))
+            .await?;
         assert_eq!(ids(&columnar), ids(&row), "disagreement on: {tail}");
     }
 
@@ -5947,7 +5953,9 @@ async fn a_buffer_relation_vectorizes() -> anyhow::Result<()> {
     client
         .simple_query("CREATE TABLE b (id int4) USING buffer ORDER BY (id)")
         .await?;
-    client.simple_query("INSERT INTO b VALUES (3),(1),(2)").await?;
+    client
+        .simple_query("INSERT INTO b VALUES (3),(1),(2)")
+        .await?;
 
     let lines = explain_lines(&client, "EXPLAIN SELECT id FROM b WHERE id > 1 ORDER BY id").await?;
     assert_eq!(
@@ -6007,9 +6015,18 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
     // while the scan stays columnar — if either over-claimed, EXPLAIN would be
     // reporting work that never happens.
     for (query, expected) in [
-        ("EXPLAIN SELECT id FROM p ORDER BY id", "Append (columnar: scan, sort)"),
-        ("EXPLAIN SELECT id FROM p WHERE label LIKE 'a%'", "Append (columnar: scan)"),
-        ("EXPLAIN SELECT id FROM p ORDER BY id + 1", "Append (columnar: scan)"),
+        (
+            "EXPLAIN SELECT id FROM p ORDER BY id",
+            "Append (columnar: scan, sort)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p WHERE label LIKE 'a%'",
+            "Append (columnar: scan)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p ORDER BY id + 1",
+            "Append (columnar: scan)",
+        ),
     ] {
         let lines = explain_lines(&client, query).await?;
         assert_eq!(lines.first().map(String::as_str), Some(expected), "{query}");
@@ -6021,7 +6038,10 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
     let lines = explain_lines(&client, "EXPLAIN SELECT id FROM hh WHERE id = 1").await?;
     assert_eq!(
         lines,
-        vec!["Seq Scan on hh".to_string(), "  Filter: (id = 1)".to_string()],
+        vec![
+            "Seq Scan on hh".to_string(),
+            "  Filter: (id = 1)".to_string()
+        ],
         "a row-path plan must render exactly as it did before"
     );
 

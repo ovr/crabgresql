@@ -37,9 +37,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_select::filter::filter_record_batch;
 use crabgresql_storage_api::arrow::decode_columns;
-use crabgresql_storage_api::{
-    BatchStream, Column, ColumnProjection, TableAm, TableSchema,
-};
+use crabgresql_storage_api::{BatchStream, Column, ColumnProjection, TableAm, TableSchema};
 use crabgresql_txn::TxnContext;
 
 use crate::{ExecError, ExecNode, Tuple};

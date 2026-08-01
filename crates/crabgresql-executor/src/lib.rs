@@ -566,7 +566,15 @@ pub fn execute(
             distinct,
         } => {
             let joined = build_join_expr(source, ctx, txn)?;
-            project_pipeline(Source::Rows(joined), projections, predicate, sort, distinct, columns, ctx)
+            project_pipeline(
+                Source::Rows(joined),
+                projections,
+                predicate,
+                sort,
+                distinct,
+                columns,
+                ctx,
+            )
         }
         PhysicalPlan::Limit {
             source,
@@ -616,7 +624,15 @@ pub fn execute(
             }
             // The projection list and ORDER BY were rewritten to reference the
             // aggregate output row, so the standard tail finishes the job.
-            project_pipeline(Source::Rows(node), projections, None, sort, distinct, columns, ctx)
+            project_pipeline(
+                Source::Rows(node),
+                projections,
+                None,
+                sort,
+                distinct,
+                columns,
+                ctx,
+            )
         }
         PhysicalPlan::Insert {
             table,
@@ -1466,7 +1482,8 @@ impl Source {
             }
         };
         let project = vector::sort::ProjectBatch::new(node, takes, &projected);
-        let sorted = vector::sort::SortBatch::new(Box::new(project), sort, &projected, visible_width)?;
+        let sorted =
+            vector::sort::SortBatch::new(Box::new(project), sort, &projected, visible_width)?;
         Ok((
             Source::Batches {
                 node: Box::new(sorted),
@@ -1566,7 +1583,9 @@ fn append_source(
 ) -> Source {
     // Every leaf carries the parent's column layout, so any of them describes
     // the batch. `Append` over zero leaves is not a shape the planner emits.
-    let layout = tables.first().map(|table| vector::layout_of(table.schema()));
+    let layout = tables
+        .first()
+        .map(|table| vector::layout_of(table.schema()));
     match (vector::BatchAppend::open(tables, txn, projection), layout) {
         (Some(append), Some(layout)) => {
             let positions = scan_positions(projection, layout.len());

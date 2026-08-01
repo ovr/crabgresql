@@ -195,7 +195,11 @@ pub fn null_array(ty: PgType, len: usize) -> ArrayRef {
 }
 
 /// Build one column's array from the `index`th field of each tuple.
-pub fn build_array(column: &Column, tuples: &[Tuple], index: usize) -> Result<ArrayRef, StorageError> {
+pub fn build_array(
+    column: &Column,
+    tuples: &[Tuple],
+    index: usize,
+) -> Result<ArrayRef, StorageError> {
     macro_rules! primitive {
         ($builder:ty, $variant:path) => {{
             let mut builder = <$builder>::with_capacity(tuples.len());
@@ -471,7 +475,10 @@ pub fn widen(
         .map_err(|error| StorageError::Io(format!("widen Arrow record batch: {error}")))
 }
 
-fn required_array<'a, T: 'static>(array: &'a dyn Array, column: &str) -> Result<&'a T, StorageError> {
+fn required_array<'a, T: 'static>(
+    array: &'a dyn Array,
+    column: &str,
+) -> Result<&'a T, StorageError> {
     array
         .as_any()
         .downcast_ref::<T>()
@@ -685,7 +692,10 @@ mod tests {
             PgType::Bytea,
             vec![Value::Bytea(vec![]), Value::Bytea(vec![0, 255, 128])],
         )?;
-        round_trip(PgType::Uuid, vec![Value::Uuid([7; 16]), Value::Uuid([0; 16])])?;
+        round_trip(
+            PgType::Uuid,
+            vec![Value::Uuid([7; 16]), Value::Uuid([0; 16])],
+        )?;
         Ok(())
     }
 
@@ -720,7 +730,10 @@ mod tests {
                 Value::TimestampTz(i64::MAX),
             ],
         )?;
-        round_trip(PgType::Time, vec![Value::Time(0), Value::Time(86_399_999_999)])?;
+        round_trip(
+            PgType::Time,
+            vec![Value::Time(0), Value::Time(86_399_999_999)],
+        )?;
         Ok(())
     }
 

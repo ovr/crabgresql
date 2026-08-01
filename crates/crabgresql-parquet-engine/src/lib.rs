@@ -49,9 +49,7 @@ use crabgresql_txn::{
 use crabgresql_types::PgType;
 use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, Wal, WalError};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{
-    ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
-};
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::metadata::KeyValue;
@@ -110,7 +108,11 @@ pub fn supports_type(ty: PgType) -> bool {
 /// `INSERT` that should have been rejected. One whitelist keeps that true, and
 /// naming the relation's own method keeps the message honest.
 pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
-    if let Some(column) = schema.columns.iter().find(|column| !supports_type(column.ty)) {
+    if let Some(column) = schema
+        .columns
+        .iter()
+        .find(|column| !supports_type(column.ty))
+    {
         return Err(StorageError::UnsupportedType(format!(
             "data type {} is not supported by table access method \"{}\"",
             column.ty.name(),
@@ -196,11 +198,15 @@ fn from_file_epoch(batch: &RecordBatch) -> Result<RecordBatch, StorageError> {
     rebase_epoch(batch, -PG_UNIX_EPOCH_DAYS, -PG_UNIX_EPOCH_MICROS)
 }
 
-fn required_array<'a, T: 'static>(array: &'a dyn Array, column: &str) -> Result<&'a T, StorageError> {
-    array
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| corrupt(format!("Parquet column \"{column}\" has an unexpected type")))
+fn required_array<'a, T: 'static>(
+    array: &'a dyn Array,
+    column: &str,
+) -> Result<&'a T, StorageError> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        corrupt(format!(
+            "Parquet column \"{column}\" has an unexpected type"
+        ))
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -280,7 +286,9 @@ fn parse_fragment(path: PathBuf) -> Result<Option<Fragment>, StorageError> {
         .map(CommandId)
         .ok_or_else(|| corrupt(format!("invalid Parquet fragment filename \"{name}\"")))?;
     if parts.next().is_some() {
-        return Err(corrupt(format!("invalid Parquet fragment filename \"{name}\"")));
+        return Err(corrupt(format!(
+            "invalid Parquet fragment filename \"{name}\""
+        )));
     }
     Ok(Some(Fragment {
         path,
@@ -296,8 +304,7 @@ fn parse_fragment(path: PathBuf) -> Result<Option<Fragment>, StorageError> {
 /// back as "no rows". Paths that legitimately race with a directory being reclaimed
 /// use [`remove_dir_all_ok`] or create the directory first.
 fn fragments(dir: &Path) -> Result<Vec<Fragment>, StorageError> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|error| io_error("read Parquet table", error))?;
+    let entries = std::fs::read_dir(dir).map_err(|error| io_error("read Parquet table", error))?;
     let mut out = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| io_error("read Parquet table entry", error))?;
@@ -319,13 +326,15 @@ fn header(fragment: &Fragment) -> TupleHeader {
     }
 }
 
-fn metadata_map(
-    metadata: Option<&Vec<KeyValue>>,
-) -> HashMap<&str, &str> {
+fn metadata_map(metadata: Option<&Vec<KeyValue>>) -> HashMap<&str, &str> {
     metadata
         .into_iter()
         .flatten()
-        .filter_map(|item| item.value.as_deref().map(|value| (item.key.as_str(), value)))
+        .filter_map(|item| {
+            item.value
+                .as_deref()
+                .map(|value| (item.key.as_str(), value))
+        })
         .collect()
 }
 
@@ -1172,11 +1181,7 @@ impl ParquetTable {
     /// The fragments of `rel`'s directory visible to `txn`. `rel` is passed in
     /// rather than re-derived so the caller's id and the listed directory are
     /// guaranteed to be the same generation (invariant P1).
-    fn visible_fragments(
-        &self,
-        rel: u32,
-        txn: &TxnContext,
-    ) -> Result<Vec<Fragment>, StorageError> {
+    fn visible_fragments(&self, rel: u32, txn: &TxnContext) -> Result<Vec<Fragment>, StorageError> {
         Ok(fragments(&self.dir_of(rel))?
             .into_iter()
             .filter(|fragment| {
@@ -1410,11 +1415,7 @@ impl TableAm for ParquetTable {
         true
     }
 
-    fn scan_batches(
-        &self,
-        txn: &TxnContext,
-        projection: &ColumnProjection,
-    ) -> Option<BatchStream> {
+    fn scan_batches(&self, txn: &TxnContext, projection: &ColumnProjection) -> Option<BatchStream> {
         Some(match self.batch_scan_in(txn, projection) {
             Ok(scan) => Box::new(scan),
             Err(error) => Box::new(std::iter::once(Err(error))),
@@ -1437,7 +1438,8 @@ impl TableAm for ParquetTable {
             open_reader(&self.schema, rel, &fragment, &ColumnProjection::All)?;
         let mut ordinal = 1u32;
         for batch in &mut reader {
-            let batch = batch.map_err(|error| corrupt(format!("decode Parquet row group: {error}")))?;
+            let batch =
+                batch.map_err(|error| corrupt(format!("decode Parquet row group: {error}")))?;
             for row in 0..batch.num_rows() {
                 if ordinal == tid.offset as u32 {
                     // Sliced first: this is a point lookup, so rebasing the
@@ -1458,11 +1460,7 @@ impl TableAm for ParquetTable {
             .ok_or_else(|| corrupt("Parquet insert produced no tuple identifier"))
     }
 
-    fn insert_many(
-        &self,
-        tuples: Vec<Tuple>,
-        txn: &TxnContext,
-    ) -> Result<Vec<Tid>, StorageError> {
+    fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
@@ -1558,11 +1556,7 @@ impl TableAm for ParquetTable {
         ))
     }
 
-    fn delete(
-        &self,
-        _tid: Tid,
-        _txn: &TxnContext,
-    ) -> Result<DeleteResult, StorageError> {
+    fn delete(&self, _tid: Tid, _txn: &TxnContext) -> Result<DeleteResult, StorageError> {
         Err(unsupported(
             "table access method \"parquet\" does not support DELETE",
         ))
@@ -1742,9 +1736,7 @@ mod tests {
     use crabgresql_storage_api::{
         Column, ColumnProjection, StorageError, TableAccessMethod, TableAm, TableSchema, Tid, Tuple,
     };
-    use crabgresql_txn::{
-        Clog, CommandId, CommitSink, TransactionManager, TxnContext, Xid,
-    };
+    use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, TxnContext, Xid};
     use crabgresql_types::numeric::Numeric;
     use crabgresql_types::{Interval, PgType, TimeTz, Value};
     use crabgresql_wal::{RmgrRegistry, Wal, recover};
@@ -1797,11 +1789,7 @@ mod tests {
 
     fn manager(wal: &Arc<Wal>) -> TransactionManager {
         let sink: Arc<dyn CommitSink> = Arc::clone(wal) as Arc<dyn CommitSink>;
-        TransactionManager::new_recovered(
-            sink,
-            Arc::new(Clog::new()),
-            Xid::FIRST_NORMAL,
-        )
+        TransactionManager::new_recovered(sink, Arc::new(Clog::new()), Xid::FIRST_NORMAL)
     }
 
     fn schema(name: &str, types: &[PgType]) -> TableSchema {
@@ -1910,7 +1898,10 @@ mod tests {
         assert_eq!(own_rows, vec![row.clone(), nulls.clone()]);
         assert_eq!(
             table
-                .scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All)
+                .scan(
+                    &tm.context(Xid::INVALID, CommandId::FIRST),
+                    &ColumnProjection::All
+                )
                 .count(),
             0
         );
@@ -1918,7 +1909,10 @@ mod tests {
         tm.commit(xid)?;
         finish(&table, xid, true)?;
         let rows: Vec<Tuple> = table
-            .scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All)
+            .scan(
+                &tm.context(Xid::INVALID, CommandId::FIRST),
+                &ColumnProjection::All,
+            )
             .map(|result| result.map(|(_, tuple)| tuple))
             .collect::<Result<_, _>>()?;
         assert_eq!(rows, vec![row, nulls]);
@@ -1957,7 +1951,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("many", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("many", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let xid = tm.allocate_xid();
         let tuples = (0..=u16::MAX as i32)
             .map(|value| vec![Value::Int4(value)])
@@ -1971,10 +1970,7 @@ mod tests {
         finish(&table, xid, true)?;
         assert_eq!(parquet_files(dir.path(), 1)?.len(), 2);
         assert_eq!(
-            table.fetch(
-                Tid::new(2, 1),
-                &tm.context(Xid::INVALID, CommandId::FIRST)
-            )?,
+            table.fetch(Tid::new(2, 1), &tm.context(Xid::INVALID, CommandId::FIRST))?,
             Some(vec![Value::Int4(u16::MAX as i32)])
         );
         Ok(())
@@ -1985,7 +1981,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("aborted", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("aborted", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let xid = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(xid, CommandId::FIRST))?;
         tm.abort(xid);
@@ -1993,7 +1994,10 @@ mod tests {
         assert!(parquet_files(dir.path(), 1)?.is_empty());
         assert_eq!(
             table
-                .scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All)
+                .scan(
+                    &tm.context(Xid::INVALID, CommandId::FIRST),
+                    &ColumnProjection::All
+                )
                 .count(),
             0
         );
@@ -2005,7 +2009,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let committed = open_table(dir.path(), 1, schema("committed", &[PgType::Int4]), Arc::clone(&wal))?;
+        let committed = open_table(
+            dir.path(),
+            1,
+            schema("committed", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let committed_xid = tm.allocate_xid();
         committed.insert(
             vec![Value::Int4(1)],
@@ -2013,7 +2022,12 @@ mod tests {
         )?;
         tm.commit(committed_xid)?;
 
-        let interrupted = open_table(dir.path(), 2, schema("interrupted", &[PgType::Int4]), Arc::clone(&wal))?;
+        let interrupted = open_table(
+            dir.path(),
+            2,
+            schema("interrupted", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let interrupted_xid = tm.allocate_xid();
         interrupted.insert(
             vec![Value::Int4(2)],
@@ -2034,9 +2048,19 @@ mod tests {
         let result = recover(dir.path(), &registry, &clog, crabgresql_wal::Lsn::INVALID)?;
         assert!(result.next_xid > interrupted_xid);
 
-        let committed = open_table(dir.path(), 1, schema("committed", &[PgType::Int4]), Arc::clone(&recovered_wal))?;
+        let committed = open_table(
+            dir.path(),
+            1,
+            schema("committed", &[PgType::Int4]),
+            Arc::clone(&recovered_wal),
+        )?;
         committed.recover(&clog)?;
-        let interrupted = open_table(dir.path(), 2, schema("interrupted", &[PgType::Int4]), recovered_wal)?;
+        let interrupted = open_table(
+            dir.path(),
+            2,
+            schema("interrupted", &[PgType::Int4]),
+            recovered_wal,
+        )?;
         interrupted.recover(&clog)?;
         assert_eq!(parquet_files(dir.path(), 1)?.len(), 1);
         assert!(parquet_files(dir.path(), 2)?.is_empty());
@@ -2052,14 +2076,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("promoted", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("promoted", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let xid = tm.allocate_xid();
         table.insert(vec![Value::Int4(7)], &tm.context(xid, CommandId::FIRST))?;
         tm.commit(xid)?;
 
         // Snapshot the fragment list (still `.pending`) before the rename lands,
         // exactly as a concurrent session's scan would.
-        let scan = table.scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All);
+        let scan = table.scan(
+            &tm.context(Xid::INVALID, CommandId::FIRST),
+            &ColumnProjection::All,
+        );
         finish(&table, xid, true)?;
         let rows = scan.collect::<Result<Vec<_>, _>>()?;
         assert_eq!(rows.len(), 1);
@@ -2075,16 +2107,18 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("interleaved", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("interleaved", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         // Interleave several fragments from two transactions, leaving all of
         // them `.pending` as an interrupted run would.
         let (first, second) = (tm.allocate_xid(), tm.allocate_xid());
         for value in 0..8 {
             let xid = if value % 2 == 0 { first } else { second };
-            table.insert(
-                vec![Value::Int4(value)],
-                &tm.context(xid, CommandId::FIRST),
-            )?;
+            table.insert(vec![Value::Int4(value)], &tm.context(xid, CommandId::FIRST))?;
         }
         assert!(parquet_files(dir.path(), 1)?.is_empty());
 
@@ -2099,9 +2133,9 @@ mod tests {
         let table_dir = dir.path().join("parquet").join("1");
         let pending = std::fs::read_dir(&table_dir)?
             .filter(|entry| {
-                entry.as_ref().is_ok_and(|entry| {
-                    entry.file_name().to_string_lossy().ends_with(".pending")
-                })
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name().to_string_lossy().ends_with(".pending"))
             })
             .count();
         assert_eq!(pending, 0);
@@ -2117,7 +2151,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("untouched", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("untouched", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         std::fs::remove_dir_all(dir.path().join("parquet").join("1"))?;
         let xid = tm.allocate_xid();
         finish(&table, xid, true)?;
@@ -2133,7 +2172,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("stats", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("stats", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let xid = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(xid, CommandId::FIRST))?;
         tm.commit(xid)?;
@@ -2141,7 +2185,11 @@ mod tests {
 
         let measured = table.measure_relpages()?;
         table.set_analyzed(9_999, 1.0);
-        assert_eq!(table.statistics().relpages, 9_999, "cache serves statistics");
+        assert_eq!(
+            table.statistics().relpages,
+            9_999,
+            "cache serves statistics"
+        );
         assert_eq!(
             table.measure_relpages()?,
             measured,
@@ -2166,7 +2214,10 @@ mod tests {
         OpenOptions::new().write(true).open(file)?.set_len(10)?;
 
         let error = table
-            .scan(&tm.context(Xid::INVALID, CommandId::FIRST), &ColumnProjection::All)
+            .scan(
+                &tm.context(Xid::INVALID, CommandId::FIRST),
+                &ColumnProjection::All,
+            )
             .next()
             .ok_or_else(|| anyhow::anyhow!("corrupt scan returned no item"))?
             .expect_err("truncated fragment must return an error");
@@ -2207,7 +2258,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let loader = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(loader, CommandId::FIRST))?;
         tm.commit(loader)?;
@@ -2220,11 +2276,16 @@ mod tests {
         // AccessShare hold waits for the AccessExclusive one, as in PostgreSQL.)
         assert!(scan_values(&table, &tm.context(truncater, CommandId::FIRST)).is_empty());
         tm.commit(truncater)?;
-        let swapped = finish(&table, truncater, true)?
-            .ok_or_else(|| anyhow::anyhow!("a committed TRUNCATE must report its new relfilenode"))?;
+        let swapped = finish(&table, truncater, true)?.ok_or_else(|| {
+            anyhow::anyhow!("a committed TRUNCATE must report its new relfilenode")
+        })?;
 
         assert_eq!(table.relfilenode(), swapped);
-        assert_eq!(fragment_dirs(dir.path())?, vec![swapped], "old directory gone");
+        assert_eq!(
+            fragment_dirs(dir.path())?,
+            vec![swapped],
+            "old directory gone"
+        );
         assert!(scan_values(&table, &tm.context(Xid::INVALID, CommandId::FIRST)).is_empty());
         Ok(())
     }
@@ -2234,7 +2295,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let loader = tm.allocate_xid();
         table.insert_many(
             vec![vec![Value::Int4(1)], vec![Value::Int4(2)]],
@@ -2265,7 +2331,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let loader = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(loader, CommandId::FIRST))?;
         tm.commit(loader)?;
@@ -2277,8 +2348,7 @@ mod tests {
         // Visible to its own transaction from the staged directory, before commit.
         assert_eq!(scan_values(&table, &tm.context(xid, CommandId(2))), vec![7]);
         tm.commit(xid)?;
-        let swapped = finish(&table, xid, true)?
-            .ok_or_else(|| anyhow::anyhow!("missing swap"))?;
+        let swapped = finish(&table, xid, true)?.ok_or_else(|| anyhow::anyhow!("missing swap"))?;
 
         let file = parquet_files(dir.path(), swapped)?
             .pop()
@@ -2313,7 +2383,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let loader = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(loader, CommandId::FIRST))?;
         table.insert(vec![Value::Int4(2)], &tm.context(loader, CommandId(1)))?;
@@ -2347,7 +2422,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let xid = tm.allocate_xid();
         table.truncate(&tm.context(xid, CommandId::FIRST))?;
         assert_eq!(
@@ -2380,7 +2460,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let loader = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(loader, CommandId::FIRST))?;
         tm.commit(loader)?;
@@ -2409,12 +2494,17 @@ mod tests {
     /// A superseded staged directory is reclaimed as soon as the next TRUNCATE in
     /// the same transaction replaces it.
     #[test]
-    fn double_truncate_in_one_transaction_reclaims_the_superseded_directory()
-    -> anyhow::Result<()> {
+    fn double_truncate_in_one_transaction_reclaims_the_superseded_directory() -> anyhow::Result<()>
+    {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let xid = tm.allocate_xid();
         table.truncate(&tm.context(xid, CommandId::FIRST))?;
         let first_staged = fragment_dirs(dir.path())?;
@@ -2424,8 +2514,7 @@ mod tests {
         assert_eq!(second_staged.len(), 2, "the superseded directory is gone");
         assert_ne!(first_staged, second_staged);
         tm.commit(xid)?;
-        let swapped = finish(&table, xid, true)?
-            .ok_or_else(|| anyhow::anyhow!("missing swap"))?;
+        let swapped = finish(&table, xid, true)?.ok_or_else(|| anyhow::anyhow!("missing swap"))?;
         assert_eq!(fragment_dirs(dir.path())?, vec![swapped]);
         Ok(())
     }
@@ -2435,7 +2524,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let loader = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(loader, CommandId::FIRST))?;
         tm.commit(loader)?;
@@ -2454,7 +2548,10 @@ mod tests {
         tm.commit(committed)?;
         finish(&table, committed, true)?;
         let stats = table.statistics();
-        assert!(!stats.analyzed, "back to never-analyzed, as PostgreSQL reports");
+        assert!(
+            !stats.analyzed,
+            "back to never-analyzed, as PostgreSQL reports"
+        );
         assert_eq!(stats.relpages, 0);
         Ok(())
     }
@@ -2468,7 +2565,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
 
         let xid = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(xid, CommandId::FIRST))?;
@@ -2496,7 +2598,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let loader = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(loader, CommandId::FIRST))?;
         tm.commit(loader)?;
@@ -2533,17 +2640,23 @@ mod tests {
     /// the staged directory's row count with the old one's page count would persist
     /// statistics describing a relation that never existed.
     #[test]
-    fn measure_inside_an_uncommitted_truncate_sees_only_the_staged_directory()
-    -> anyhow::Result<()> {
+    fn measure_inside_an_uncommitted_truncate_sees_only_the_staged_directory() -> anyhow::Result<()>
+    {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let loader = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(loader, CommandId::FIRST))?;
         tm.commit(loader)?;
         finish(&table, loader, true)?;
-        let (loaded_pages, loaded_rows) = table.measure(&tm.context(Xid::INVALID, CommandId::FIRST))?;
+        let (loaded_pages, loaded_rows) =
+            table.measure(&tm.context(Xid::INVALID, CommandId::FIRST))?;
         assert!(loaded_pages > 0);
         assert_eq!(loaded_rows, 1.0);
 
@@ -2566,7 +2679,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let xid = tm.allocate_xid();
         table.truncate(&tm.context(xid, CommandId::FIRST))?;
         assert_eq!(fragment_dirs(dir.path())?.len(), 2);
@@ -2578,8 +2696,7 @@ mod tests {
     /// The same owner may TRUNCATE a table it is already scanning (lock upgrade),
     /// while another owner's in-flight scan blocks the TRUNCATE until it finishes.
     #[test]
-    fn truncate_upgrades_over_its_own_scan_and_waits_for_a_foreign_one()
-    -> anyhow::Result<()> {
+    fn truncate_upgrades_over_its_own_scan_and_waits_for_a_foreign_one() -> anyhow::Result<()> {
         use crabgresql_txn::LockOwner;
         use std::sync::mpsc;
         use std::time::Duration;
@@ -2641,8 +2758,7 @@ mod tests {
     /// relfilenode before the lock made a plain scan of healthy data fail with
     /// `CorruptData`, because the footer stamp belongs to the new generation.
     #[test]
-    fn a_scan_that_waits_for_a_truncate_reads_the_swapped_in_directory()
-    -> anyhow::Result<()> {
+    fn a_scan_that_waits_for_a_truncate_reads_the_swapped_in_directory() -> anyhow::Result<()> {
         use crabgresql_txn::LockOwner;
         use std::sync::mpsc;
         use std::time::Duration;
@@ -2699,10 +2815,12 @@ mod tests {
         let rows = reader.join().expect("reader panicked");
         let values: Vec<i32> = rows
             .into_iter()
-            .map(|row| match row.expect("a waiting scan must not report corruption").1[0] {
-                Value::Int4(value) => value,
-                ref other => panic!("unexpected value {other:?}"),
-            })
+            .map(
+                |row| match row.expect("a waiting scan must not report corruption").1[0] {
+                    Value::Int4(value) => value,
+                    ref other => panic!("unexpected value {other:?}"),
+                },
+            )
             .collect();
         assert_eq!(values, vec![7]);
         Ok(())
@@ -2719,7 +2837,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         // Occupy the path the allocator will hand out with a regular file, so
         // `create_dir_all` for the staged directory fails.
         std::fs::write(dir.path().join("parquet").join("1000"), b"not a directory")?;
@@ -2758,7 +2881,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        let table = open_table(dir.path(), 1, schema("t", &[PgType::Int4]), Arc::clone(&wal))?;
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("t", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
         let loader = tm.allocate_xid();
         table.insert(vec![Value::Int4(1)], &tm.context(loader, CommandId::FIRST))?;
         tm.commit(loader)?;
@@ -2769,7 +2897,11 @@ mod tests {
         table
             .rebind(77)
             .expect_err("rebind must fail when the directory cannot be created");
-        assert_eq!(table.relfilenode(), 1, "the table stays on its old directory");
+        assert_eq!(
+            table.relfilenode(),
+            1,
+            "the table stays on its old directory"
+        );
 
         // And the block counter still describes that directory: the next insert does
         // not collide with the existing fragment.
@@ -2844,13 +2976,16 @@ mod tests {
             .map(|result| result.map(|(_, tuple)| tuple))
             .collect::<Result<_, _>>()?;
 
-        assert_eq!(projected, vec![vec![
-            row[0].clone(),
-            Value::Null,
-            row[2].clone(),
-            Value::Null,
-            Value::Null,
-        ]]);
+        assert_eq!(
+            projected,
+            vec![vec![
+                row[0].clone(),
+                Value::Null,
+                row[2].clone(),
+                Value::Null,
+                Value::Null,
+            ]]
+        );
         Ok(())
     }
 
@@ -2919,7 +3054,8 @@ mod tests {
         finish(&table, xid, true)?;
 
         let files = parquet_files(dir.path(), 1)?;
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&files[0])?)?.build()?;
+        let mut reader =
+            ParquetRecordBatchReaderBuilder::try_new(File::open(&files[0])?)?.build()?;
         let batch = reader
             .next()
             .ok_or_else(|| anyhow::anyhow!("fragment has no batch"))??;
@@ -3040,7 +3176,10 @@ mod tests {
             .map(|result| result.map(|(_, tuple)| tuple))
             .collect::<Result<_, _>>()?;
         assert_eq!(row_scan, expected);
-        assert_eq!(batch_scan_rows(&table, &reader, &ColumnProjection::All)?, expected);
+        assert_eq!(
+            batch_scan_rows(&table, &reader, &ColumnProjection::All)?,
+            expected
+        );
         Ok(())
     }
 
@@ -3069,7 +3208,11 @@ mod tests {
             .collect::<Result<_, _>>()?;
 
         assert_eq!(batched.len(), 1);
-        assert_eq!(batched[0].len(), row.len(), "width is the schema's, not the projection's");
+        assert_eq!(
+            batched[0].len(),
+            row.len(),
+            "width is the schema's, not the projection's"
+        );
         assert_eq!(batched[0][2], row[2]);
         assert_eq!(batched, scanned);
         Ok(())

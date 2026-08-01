@@ -43,9 +43,9 @@ use arrow_array::{Array, ArrayRef, BooleanArray, Datum, RecordBatch, Scalar};
 use arrow_ord::cmp;
 use arrow_schema::ArrowError;
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
+use crabgresql_planner::vectorize;
 use crabgresql_storage_api::Column;
 use crabgresql_storage_api::arrow::build_array;
-use crabgresql_planner::vectorize;
 use crabgresql_types::PgType;
 
 use super::BatchLayout;
@@ -73,8 +73,15 @@ enum Node {
     And(Box<Node>, Box<Node>),
     Or(Box<Node>, Box<Node>),
     Not(Box<Node>),
-    IsNull { operand: Box<Node>, negated: bool },
-    Compare { op: BinOp, left: Box<Node>, right: Box<Node> },
+    IsNull {
+        operand: Box<Node>,
+        negated: bool,
+    },
+    Compare {
+        op: BinOp,
+        left: Box<Node>,
+        right: Box<Node>,
+    },
 }
 
 /// An evaluated operand. The distinction is not cosmetic: Arrow broadcasts a
@@ -116,11 +123,17 @@ impl Node {
                 let (left, right) = (left.boolean(batch)?, right.boolean(batch)?);
                 or_kleene(&left, &right).map(boxed).map_err(kernel_error)
             }
-            Node::Not(operand) => not(&operand.boolean(batch)?).map(boxed).map_err(kernel_error),
+            Node::Not(operand) => not(&operand.boolean(batch)?)
+                .map(boxed)
+                .map_err(kernel_error),
             Node::IsNull { operand, negated } => {
                 let operand = operand.evaluate(batch)?;
                 let array = operand.array();
-                let mask = if *negated { is_not_null(array) } else { is_null(array) };
+                let mask = if *negated {
+                    is_not_null(array)
+                } else {
+                    is_null(array)
+                };
                 mask.map(boxed).map_err(kernel_error)
             }
             Node::Compare { op, left, right } => {
@@ -220,26 +233,42 @@ fn compile_bool(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
         // Value-transparent: a collation only decides how a *comparison* below
         // orders, and that is read from the comparison's own `collation`.
         BoundExpr::Collate { expr, .. } => compile_bool(expr, layout),
-        BoundExpr::Binary { op: BinOp::And, left, right, .. } => Some(Node::And(
+        BoundExpr::Binary {
+            op: BinOp::And,
+            left,
+            right,
+            ..
+        } => Some(Node::And(
             Box::new(compile_bool(left, layout)?),
             Box::new(compile_bool(right, layout)?),
         )),
-        BoundExpr::Binary { op: BinOp::Or, left, right, .. } => Some(Node::Or(
+        BoundExpr::Binary {
+            op: BinOp::Or,
+            left,
+            right,
+            ..
+        } => Some(Node::Or(
             Box::new(compile_bool(left, layout)?),
             Box::new(compile_bool(right, layout)?),
         )),
-        BoundExpr::Unary { op: UnaryOp::Not, expr } => {
-            Some(Node::Not(Box::new(compile_bool(expr, layout)?)))
-        }
+        BoundExpr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => Some(Node::Not(Box::new(compile_bool(expr, layout)?))),
         BoundExpr::IsNull { expr, negated } => Some(Node::IsNull {
             operand: Box::new(compile_operand(expr, layout)?),
             negated: *negated,
         }),
-        BoundExpr::Binary { op, arg_ty, collation, left, right }
-            if matches!(
-                op,
-                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
-            ) =>
+        BoundExpr::Binary {
+            op,
+            arg_ty,
+            collation,
+            left,
+            right,
+        } if matches!(
+            op,
+            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+        ) =>
         {
             vectorize::comparable(*arg_ty, *op, *collation).then_some(())?;
             Some(Node::Compare {
@@ -249,9 +278,12 @@ fn compile_bool(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
             })
         }
         // A bare boolean column or constant is a legal `WHERE` on its own.
-        BoundExpr::ColumnRef { ty: PgType::Bool, .. } | BoundExpr::Const { ty: PgType::Bool, .. } => {
-            compile_operand(expr, layout)
+        BoundExpr::ColumnRef {
+            ty: PgType::Bool, ..
         }
+        | BoundExpr::Const {
+            ty: PgType::Bool, ..
+        } => compile_operand(expr, layout),
         _ => None,
     }
 }

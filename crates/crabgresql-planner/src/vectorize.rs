@@ -49,11 +49,15 @@ impl Vectorization {
         if !self.any() {
             return None;
         }
-        let parts = [(self.scan, "scan"), (self.filter, "filter"), (self.sort, "sort")]
-            .into_iter()
-            .filter_map(|(on, name)| on.then_some(name))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let parts = [
+            (self.scan, "scan"),
+            (self.filter, "filter"),
+            (self.sort, "sort"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect::<Vec<_>>()
+        .join(", ");
         Some(format!(" (columnar: {parts})"))
     }
 }
@@ -156,8 +160,12 @@ pub fn vectorizable_predicate(predicate: &BoundExpr, width: usize) -> bool {
                 && vectorizable_operand(right, width)
         }
         // A bare boolean column or constant is a legal WHERE on its own.
-        BoundExpr::ColumnRef { ty: PgType::Bool, .. }
-        | BoundExpr::Const { ty: PgType::Bool, .. } => vectorizable_operand(predicate, width),
+        BoundExpr::ColumnRef {
+            ty: PgType::Bool, ..
+        }
+        | BoundExpr::Const {
+            ty: PgType::Bool, ..
+        } => vectorizable_operand(predicate, width),
         _ => false,
     }
 }
@@ -232,14 +240,11 @@ fn tail_vectorization(scan: bool, width: usize, tail: Tail<'_>) -> Vectorization
         && !tail.sort.is_empty()
         && tail.visible <= tail.projections.len()
         && vectorizable_projection(tail.projections, width)
-        && tail.sort.iter().all(|key| {
-            key.column < tail.projections.len() && sortable_key(key)
-        });
-    Vectorization {
-        scan,
-        filter,
-        sort,
-    }
+        && tail
+            .sort
+            .iter()
+            .all(|key| key.column < tail.projections.len() && sortable_key(key));
+    Vectorization { scan, filter, sort }
 }
 
 /// Whether every leaf of an `Append` can hand up batches. All or none: their
