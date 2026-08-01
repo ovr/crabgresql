@@ -2077,8 +2077,12 @@ fn update_inherited(
             for (index, expr) in assignments {
                 new_view[*index] = eval(expr, &old_view, ctx)?;
             }
-            let mut new = old.clone();
-            target.scatter(&mut new, &new_view);
+            // RETURNING is bound against the named relation, so it sees the NEW
+            // row in that shape, not the child's wider one — kept aside because
+            // `rebuild` consumes the view. Nothing is cloned without a RETURNING
+            // clause to read it.
+            let returned = returning.is_some().then(|| new_view.clone());
+            let new = target.rebuild(old, new_view);
 
             if has_unique[i] {
                 // Mirror `update_direct`: a tid absent from the simulation is a
@@ -2103,10 +2107,8 @@ fn update_inherited(
             } else {
                 validate_constraints(&target.table, &new, std::iter::empty(), ctx)?;
             }
-            if returning.is_some() {
-                // RETURNING is bound against the named relation, so it sees the
-                // NEW row in that shape, not the child's wider one.
-                new_rows.push(new_view);
+            if let Some(view) = returned {
+                new_rows.push(view);
             }
             pending[i].push((*tid, new));
         }

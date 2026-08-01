@@ -762,9 +762,12 @@ impl PgType {
             PgType::Varchar if m > VARHDRSZ => format!("character varying({})", m - VARHDRSZ),
             PgType::Bpchar if m > VARHDRSZ => format!("character({})", m - VARHDRSZ),
             // `bpchar` is the one type that reports which spelling it was asked
-            // about: given a modifier it cannot print, it is `bpchar`; given none
-            // at all it is `character`. An unmodified `bpchar` column stores -1,
-            // so this is the arm `\d` takes for one.
+            // about. This arm is the "asked with a modifier I cannot print" case
+            // — which includes `-1`, the modifier `pg_attribute` stores for an
+            // unmodified column, so it is the arm `\d` takes for one. The other
+            // case, "asked with no modifier at all", cannot arrive here: it is an
+            // absent `Option` that callers resolve to [`Self::name`] before
+            // reaching this function.
             PgType::Bpchar => "bpchar".to_string(),
             PgType::Bit if m >= 0 => format!("bit({m})"),
             PgType::Varbit if m >= 0 => format!("bit varying({m})"),

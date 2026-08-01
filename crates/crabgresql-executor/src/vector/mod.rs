@@ -109,10 +109,12 @@ impl BatchAppend {
     /// `None` — stay on the row path — if any arm cannot hand up batches, or if
     /// any arm carries a column remap. A batch is in its own relation's column
     /// order and there is nowhere here to permute one, so a remapped arm would
-    /// concatenate mis-ordered columns rather than fail loudly. No arm that
-    /// remaps can produce batches today (an inheritance child is a heap
-    /// relation), so the check is a guard for the day one can; the planner's
-    /// `arms_batch` makes the same call so `EXPLAIN` agrees.
+    /// concatenate mis-ordered columns rather than fail loudly.
+    ///
+    /// Unreachable today: DDL refuses an engine-managed relation on either side
+    /// of an inheritance link, so no remapped arm can be batch-capable. The
+    /// planner's `arms_batch` makes the same call, so `EXPLAIN` agrees with what
+    /// runs.
     pub fn open(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Option<Self> {
         let children = arms
             .iter()

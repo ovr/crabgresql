@@ -10234,6 +10234,44 @@ async fn table_inheritance_reports_merges_and_conflicts_like_pg() -> anyhow::Res
         "relation \"person\" would be inherited from more than once"
     );
 
+    // A temporary relation anywhere in a hierarchy is refused, and the message
+    // says so rather than borrowing the permanent-child wording. Naming a temp
+    // parent unqualified must find it: DDL runs against the raw engine, which
+    // resolves `public` only, so before the temp probe this reported that a
+    // relation plainly present "does not exist".
+    client.simple_query("CREATE TEMP TABLE tp (a int4)").await?;
+    for sql in [
+        "CREATE TEMP TABLE tc1 () INHERITS (tp)",
+        "CREATE TEMP TABLE tc2 () INHERITS (person)",
+    ] {
+        let e = err(sql).await;
+        let db = e.as_db_error().expect("database error");
+        assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+        assert_eq!(
+            db.message(),
+            "temporary tables in an inheritance hierarchy are not supported yet"
+        );
+    }
+    // A permanent child of a temp parent keeps PG's own wording, verbatim.
+    let e = err("CREATE TABLE pc () INHERITS (tp)").await;
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(db.message(), "cannot inherit from temporary relation \"tp\"");
+
+    // An engine-managed relation is refused on *either* side of the link. The
+    // child side was already guarded; a parquet parent was not, and it would
+    // have taken every read of the parent off the batch path.
+    client
+        .simple_query("CREATE TABLE pq (a int4) USING parquet ORDER BY (a)")
+        .await?;
+    let e = err("CREATE TABLE pqc () INHERITS (pq)").await;
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        db.message(),
+        "table access method \"parquet\" does not support inheritance"
+    );
+
     client
         .simple_query("CREATE VIEW v AS SELECT 1 AS x")
         .await?;

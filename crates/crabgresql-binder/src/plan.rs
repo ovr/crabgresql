@@ -123,6 +123,24 @@ impl MappedRelation {
             }
         }
     }
+
+    /// The full tuple to store, given the row it was read from and the
+    /// named-relation tuple an UPDATE produced from it.
+    ///
+    /// For an identity relation the new view *is* the new tuple, so it moves
+    /// through untouched — no clone of `old`, no copy back over it. That is the
+    /// common case twice over: the parent of every inheritance fan-out is an
+    /// identity relation, and so is every child declared `() INHERITS (p)`.
+    pub fn rebuild(&self, old: &[Value], view: Vec<Value>) -> Vec<Value> {
+        match &self.map {
+            None => view,
+            Some(_) => {
+                let mut tuple = old.to_vec();
+                self.scatter(&mut tuple, &view);
+                tuple
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -730,13 +748,30 @@ pub fn inheritance_descendants(
         );
         frontier = next;
     }
-    order
-        .into_iter()
+    resolve_all(engine, &order, "child", &parent.name)
+}
+
+/// Resolve a catalog-derived list of `(namespace, name)` relations to storage
+/// handles.
+///
+/// Every name came out of the catalog moments earlier, so a miss is a torn
+/// catalog rather than anything the user did — reported as an internal error
+/// naming `noun` (`"child"`, `"partition"`) and the relation it hangs off.
+/// Shared by the two callers so that framing, and the SQLSTATE, cannot drift
+/// apart between them.
+fn resolve_all(
+    engine: &Arc<dyn TableEngine>,
+    relations: &[(String, String)],
+    noun: &str,
+    parent_name: &str,
+) -> Result<Vec<Arc<dyn TableAm>>, BindError> {
+    relations
+        .iter()
         .map(|(namespace, name)| {
-            engine.resolve(Some(&namespace), &name).map_err(|e| {
+            engine.resolve(Some(namespace), name).map_err(|e| {
                 BindError::new(
                     sqlstate::INTERNAL_ERROR,
-                    format!("child \"{name}\" of \"{}\" is unreadable: {e}", parent.name),
+                    format!("{noun} \"{name}\" of \"{parent_name}\" is unreadable: {e}"),
                 )
             })
         })
@@ -764,20 +799,7 @@ fn partition_leaves(
         })
         .collect();
     leaves.sort();
-    leaves
-        .into_iter()
-        .map(|(namespace, name)| {
-            engine.resolve(Some(&namespace), &name).map_err(|e| {
-                BindError::new(
-                    sqlstate::INTERNAL_ERROR,
-                    format!(
-                        "partition \"{name}\" of \"{}\" is unreadable: {e}",
-                        parent.name
-                    ),
-                )
-            })
-        })
-        .collect()
+    resolve_all(engine, &leaves, "partition", &parent.name)
 }
 
 /// Which DML verb is writing, for the non-updatable-view error text.

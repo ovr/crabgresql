@@ -237,12 +237,16 @@ fn tail_vectorization(scan: bool, width: usize, tail: Tail<'_>) -> Vectorization
 /// Whether every arm of an `Append` can hand up batches. All or none: their
 /// outputs are concatenated, so they must share one representation.
 ///
-/// A remapped arm disqualifies the whole node. Batches carry the arm's own
-/// column order, and the batch path has nowhere to apply a permutation — it
-/// would concatenate mis-ordered columns rather than fail. No arm that remaps
-/// can produce batches today (an inheritance child is a heap relation, and a
-/// heap has no batch scan), so this costs nothing; it is here so that stays true
-/// if a columnar relation ever becomes one.
+/// A remapped arm disqualifies the whole node — including the arms that could
+/// have handed up batches, since the outputs are concatenated and must share one
+/// representation. Batches carry the arm's own column order and the batch path
+/// has nowhere to apply a permutation, so it would concatenate mis-ordered
+/// columns rather than fail.
+///
+/// Nothing pays for this today because DDL refuses an engine-managed relation on
+/// *either* side of an inheritance link, so no hierarchy can contain a
+/// batch-capable relation at all. That is what makes the all-or-none rule free
+/// rather than a silent de-optimization of the parent.
 fn arms_batch(arms: &[PhysicalAppendArm]) -> bool {
     !arms.is_empty()
         && arms

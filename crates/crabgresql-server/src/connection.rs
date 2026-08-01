@@ -331,6 +331,10 @@ async fn run_simple_query(
                 CopyOutcome::Loaded(n) => writer.command_complete(&format!("COPY {n}")),
                 CopyOutcome::ConnectionClosed => return Ok(()),
                 CopyOutcome::Failed(e) => {
+                    // PG order, as on the two paths below: notices raised before
+                    // the failure, then the error. Without this drain they stay
+                    // buffered and surface against whatever statement runs next.
+                    emit_notices(writer, &session.notices.drain(), Some(sql));
                     let position = e.location.map(|(line, col)| char_position(sql, line, col));
                     writer.error_fields(e.to_fields(position));
                     mark_transaction_failed(session);
