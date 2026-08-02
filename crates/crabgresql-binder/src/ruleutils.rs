@@ -174,7 +174,7 @@ fn zoned_constant(inner: &ast::Expr, data_type: &ast::DataType, cx: Cx) -> Optio
     let ast::Value::SingleQuotedString(text) = &v.value else {
         return None;
     };
-    let micros = timestamptz::parse(text, &fmt.zone).ok()?;
+    let micros = timestamptz::parse(text, fmt).ok()?;
     Some(format!(
         "'{}'::timestamp with time zone",
         timestamptz::format(micros, &fmt.zone)
@@ -429,6 +429,13 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
 }
 
 fn function(f: &ast::Function, cx: Cx) -> String {
+    // The `CURRENT_TIMESTAMP` family reaches the parser as a keyword, and PG
+    // prints it back as one: upper case, and unparenthesized unless it carries
+    // a precision. The generic path below would render `CURRENT_DATE` as
+    // `current_date()`, which is neither.
+    if let Some(rendered) = keyword_datetime(f) {
+        return rendered;
+    }
     // An argument's type comes from the signature the binder resolved, not from
     // the literal's own syntax — that is the whole difference between
     // `nextval('s'::regclass)` and `nextval('s'::text)`.
@@ -462,6 +469,33 @@ fn function(f: &ast::Function, cx: Cx) -> String {
         other => return format!("{}{other}", object_name(&f.name)),
     };
     format!("{}({args})", object_name(&f.name))
+}
+
+/// `CURRENT_DATE`, `CURRENT_TIME[(p)]`, `CURRENT_TIMESTAMP[(p)]`,
+/// `LOCALTIME[(p)]`, `LOCALTIMESTAMP[(p)]` — how PostgreSQL prints them back.
+/// `None` for any other call, including `now()` and `clock_timestamp()`, which
+/// are real functions and print lower case with their parentheses.
+fn keyword_datetime(f: &ast::Function) -> Option<String> {
+    let name = f.name.0.last()?.as_ident()?.value.to_ascii_lowercase();
+    if !matches!(
+        name.as_str(),
+        "current_date" | "current_time" | "current_timestamp" | "localtime" | "localtimestamp"
+    ) {
+        return None;
+    }
+    let upper = name.to_ascii_uppercase();
+    match &f.args {
+        ast::FunctionArguments::None => Some(upper),
+        ast::FunctionArguments::List(list) => match list.args.as_slice() {
+            [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(p))] => {
+                Some(format!("{upper}({p})"))
+            }
+            // The grammar admits nothing else, so this cannot be reached from
+            // SQL; fall back to the generic rendering rather than assert.
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The literal an expression is, if it is one — the only place a resolved type

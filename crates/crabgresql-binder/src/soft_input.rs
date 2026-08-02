@@ -27,6 +27,7 @@ use std::rc::Rc;
 
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_types::FmtCtx;
 use crabgresql_types::{PgType, Value};
 
 use crate::BindError;
@@ -68,7 +69,11 @@ impl From<BindError> for SoftError {
 /// - `Err(_)` — the type spec is unparsable (`42601`), names nothing (`42704`),
 ///   names a type this build does not model yet (`0A000`), or carries a
 ///   modifier `typmodin` would reject (`22023`).
-pub fn soft_input(type_spec: &str, value: &str) -> Result<Result<(), SoftError>, BindError> {
+pub fn soft_input(
+    type_spec: &str,
+    value: &str,
+    fmt: &FmtCtx,
+) -> Result<Result<(), SoftError>, BindError> {
     let spec = TypeSpec::resolve(type_spec)?;
     // A `reg*` input function is a catalog lookup, which this entry point has
     // no handle for. Callers that do (the executor) go through `TypeSpec`.
@@ -77,7 +82,7 @@ pub fn soft_input(type_spec: &str, value: &str) -> Result<Result<(), SoftError>,
             "soft input for a reg* type needs a catalog",
         ));
     }
-    Ok(spec.check(value))
+    Ok(spec.check(value, fmt))
 }
 
 /// A written type name, resolved. Separate from [`soft_input`] so a caller that
@@ -138,8 +143,8 @@ impl TypeSpec {
     }
 
     /// Run the type's input function over `value` without raising.
-    pub fn check(&self, value: &str) -> Result<(), SoftError> {
-        soft(&self.data_type, self.ty, value)
+    pub fn check(&self, value: &str, fmt: &FmtCtx) -> Result<(), SoftError> {
+        soft(&self.data_type, self.ty, value, fmt)
     }
 }
 
@@ -186,8 +191,8 @@ fn validate_typmod(data_type: &ast::DataType, ty: PgType) -> Result<(), BindErro
 
 /// The fallible half: input function, then typmod. Split out so every early
 /// `?` here lands in the *soft* result rather than the hard one.
-fn soft(data_type: &ast::DataType, ty: PgType, value: &str) -> Result<(), SoftError> {
-    let parsed = parse_unknown(value, ty)?;
+fn soft(data_type: &ast::DataType, ty: PgType, value: &str, fmt: &FmtCtx) -> Result<(), SoftError> {
+    let parsed = parse_unknown(value, ty, fmt)?;
     apply_input_typmod(&parsed, ty, data_type)?;
     Ok(())
 }
@@ -285,14 +290,15 @@ mod tests {
 
     /// The soft error for `value` as `type_spec`, or `None` if it is valid.
     fn bad(type_spec: &str, value: &str) -> Option<SoftError> {
-        soft_input(type_spec, value)
+        soft_input(type_spec, value, &FmtCtx::utc_default())
             .expect("type spec resolves")
             .err()
     }
 
     /// `"SQLSTATE: message"` for a *hard* error — an unusable type spec.
     fn hard(type_spec: &str) -> String {
-        let e = soft_input(type_spec, "irrelevant").expect_err("expected a hard error");
+        let e = soft_input(type_spec, "irrelevant", &FmtCtx::utc_default())
+            .expect_err("expected a hard error");
         format!("{}: {}", e.code, e.message)
     }
 

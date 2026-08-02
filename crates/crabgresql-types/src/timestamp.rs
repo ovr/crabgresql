@@ -14,14 +14,14 @@
 //! sorts them correctly (they compare less/greater than every finite value).
 //!
 //! Deviations from PG, acceptable while no passing test needs them: a precision
-//! modifier above 6 is clamped silently where PG also warns, and the input
-//! grammar covers ISO 8601, the traditional
-//! `Mon DD HH:MM:SS YYYY` form, and the `infinity`/`epoch` specials — a trailing
-//! time zone is accepted and ignored (this type has no zone), but the
-//! current-relative specials (`now`/`today`/...) need a transaction clock and
-//! are not supported.
+//! modifier above 6 is clamped silently where PG also warns. The input grammar
+//! covers ISO 8601, the traditional `Mon DD HH:MM:SS YYYY` form, the
+//! `infinity`/`epoch` specials and the current-relative ones (`now`, `today`,
+//! `tomorrow`, `yesterday`) — a trailing time zone is accepted and ignored
+//! (this type has no zone).
 
 use crate::Numeric;
+use crate::fmt::FmtCtx;
 use crate::interval::{self, Interval};
 
 // SQLSTATEs, kept as literals here (the types crate does not depend on the
@@ -292,6 +292,10 @@ const WEEKDAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 pub(crate) enum Parsed {
     /// A special value (`infinity`/`-infinity`/`epoch`), already in micros.
     Micros(i64),
+    /// The `now` special. Left unresolved here because each type reads the
+    /// transaction timestamp in its own units, and `timestamptz` must take the
+    /// instant *directly* rather than round-tripping through a wall clock.
+    Now,
     /// A calendar time with an astronomical year (BC already folded), plus the
     /// trailing zone token if one was present. Field ranges are validated by
     /// [`validate_fields`]; the year range is not checked here.
@@ -300,17 +304,23 @@ pub(crate) enum Parsed {
 
 /// The shared scan behind `timestamp::parse` and `timestamptz::parse`. Accepts
 /// the ISO 8601 forms, the traditional `[Dow] Mon DD [HH:MM:SS[.f]] YYYY [zone]`
-/// form, `YYYYMMDD` compact dates, and the `infinity`/`-infinity`/`epoch`
+/// form, `YYYYMMDD` compact dates, and the `infinity`/`-infinity`/`epoch`/`now`
 /// specials. A trailing time-zone token (a `±HH[:MM]` offset, an attached `Z`,
 /// or a bare abbreviation / IANA name) is returned in `zone` rather than
 /// discarded. Syntactically unparseable input is `22007`.
-pub(crate) fn parse_parts(input: &str) -> Result<Parsed, TimestampError> {
+///
+/// `now` is a whole-value special and refuses company (`'now 10:00'` is an
+/// error), but `today`/`tomorrow`/`yesterday` are *date field* tokens: they fix
+/// the calendar date exactly as `2001-02-16` would, so `'today 10:00'` and
+/// `'today EST'` parse while `'today today'` and `'2020-01-01 today'` conflict.
+pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, TimestampError> {
     let trimmed = input.trim();
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
         "infinity" | "+infinity" => return Ok(Parsed::Micros(POS_INFINITY)),
         "-infinity" => return Ok(Parsed::Micros(NEG_INFINITY)),
         "epoch" => return Ok(Parsed::Micros(EPOCH_MINUS_PG_DAYS * USECS_PER_DAY)),
+        "now" => return Ok(Parsed::Now),
         _ => {}
     }
 
@@ -345,6 +355,12 @@ pub(crate) fn parse_parts(input: &str) -> Result<Parsed, TimestampError> {
     // Bare numeric fields (verbose form), as (value, digit count), resolved to
     // day/year after the scan so their order does not matter.
     let mut nums: Vec<(i64, usize)> = Vec::new();
+    // The day offset of a `today`/`tomorrow`/`yesterday` token, resolved after
+    // the scan. Deferring it keeps the clock out of inputs that are going to be
+    // rejected anyway — `'today today'` is a duplicate-date error, and must
+    // stay one even in a context that holds no clock, or it loses the cursor
+    // position that a bind-time diagnostic carries.
+    let mut relative: Option<i64> = None;
 
     for field in &fields {
         let fl = field.to_ascii_lowercase();
@@ -385,6 +401,14 @@ pub(crate) fn parse_parts(input: &str) -> Result<Parsed, TimestampError> {
             if z.is_some() {
                 zone = z;
             }
+            continue;
+        }
+        if let Some(shift) = relative_day(&fl) {
+            if have_date {
+                return Err(invalid_syntax(input));
+            }
+            relative = Some(shift);
+            have_date = true;
             continue;
         }
         if let Some((y, m, d)) = parse_date_token(field) {
@@ -445,6 +469,15 @@ pub(crate) fn parse_parts(input: &str) -> Result<Parsed, TimestampError> {
         }
     }
 
+    // Now that the scan has accepted every field, a relative date token can
+    // read the clock.
+    if let Some(shift) = relative {
+        let (y, m, d) = session_today(fmt, shift)?;
+        year = Some(y);
+        month = Some(m);
+        day = Some(d);
+    }
+
     // A resolved calendar date is required; this rejects pure garbage.
     let (Some(mut y), Some(m), Some(d)) = (year, month, day) else {
         return Err(invalid_syntax(input));
@@ -470,6 +503,39 @@ pub(crate) fn parse_parts(input: &str) -> Result<Parsed, TimestampError> {
     })
 }
 
+/// The day offset a relative date token names, or `None` if the token is not
+/// one. PG accepts exactly these three; there is no `'the day after tomorrow'`.
+fn relative_day(field: &str) -> Option<i64> {
+    match field {
+        "today" => Some(0),
+        "tomorrow" => Some(1),
+        "yesterday" => Some(-1),
+        _ => None,
+    }
+}
+
+/// The transaction timestamp read as a wall clock in the session zone. This is
+/// the instant every relative special is measured from — `'today'` is today in
+/// the *session's* zone, not in UTC.
+pub(crate) fn session_wall_clock(fmt: &FmtCtx) -> Result<i64, TimestampError> {
+    let now = fmt.xact_start().map_err(clock_unavailable)?;
+    crate::timestamptz::session_zone_wall_clock(now, &fmt.zone)
+}
+
+/// The session's current calendar date, shifted by `days`.
+fn session_today(fmt: &FmtCtx, days: i64) -> Result<(i64, i64, i64), TimestampError> {
+    let tm = decode(session_wall_clock(fmt)?);
+    let jd = date2j(tm.year, tm.month, tm.day) + days;
+    Ok(j2date(jd))
+}
+
+fn clock_unavailable(e: crate::fmt::ClockError) -> TimestampError {
+    TimestampError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+    }
+}
+
 /// Range-check the calendar fields (month/day/hour/min/sec) of a scanned time.
 /// Shared by both types; the year range is checked separately by the caller.
 pub(crate) fn validate_fields(tm: &Tm, input: &str) -> Result<(), TimestampError> {
@@ -485,9 +551,12 @@ pub(crate) fn validate_fields(tm: &Tm, input: &str) -> Result<(), TimestampError
 /// `timestamp_in`. A trailing time zone is accepted and ignored (this type
 /// carries no zone). Syntactically unparseable input is `22007`; a well-formed
 /// value with an out-of-range field is `22008`.
-pub fn parse(input: &str) -> Result<i64, TimestampError> {
-    match parse_parts(input)? {
+pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimestampError> {
+    match parse_parts(input, fmt)? {
         Parsed::Micros(m) => Ok(m),
+        // A `timestamp` is a wall clock, so `'now'` is the transaction
+        // timestamp read in the session zone.
+        Parsed::Now => session_wall_clock(fmt),
         Parsed::Calendar { tm, .. } => {
             // Bound the year to PG's timestamp range (4713 BC .. 294276 AD).
             // This both matches PG's out-of-range error and keeps `encode`
@@ -1344,7 +1413,7 @@ mod tests {
     use super::*;
 
     fn ts(s: &str) -> i64 {
-        match parse(s) {
+        match parse(s, &FmtCtx::utc_default()) {
             Ok(value) => value,
             Err(error) => panic!("invalid timestamp test fixture `{s}`: {error:?}"),
         }
@@ -1492,7 +1561,9 @@ mod tests {
         // But a bogus glued suffix is a syntax error, not a silently-ignored
         // zone (PG rejects `2001-02-16+garbage`).
         assert_eq!(
-            parse("2001-02-16+garbage").unwrap_err().sqlstate,
+            parse("2001-02-16+garbage", &FmtCtx::utc_default())
+                .unwrap_err()
+                .sqlstate,
             INVALID_DATETIME_FORMAT
         );
     }
@@ -1523,9 +1594,24 @@ mod tests {
 
     #[test]
     fn syntax_and_range_errors() {
-        assert_eq!(parse("garbage").unwrap_err().sqlstate, "22007");
-        assert_eq!(parse("2001-13-01").unwrap_err().sqlstate, "22008");
-        assert_eq!(parse("2001-02-30").unwrap_err().sqlstate, "22008");
+        assert_eq!(
+            parse("garbage", &FmtCtx::utc_default())
+                .unwrap_err()
+                .sqlstate,
+            "22007"
+        );
+        assert_eq!(
+            parse("2001-13-01", &FmtCtx::utc_default())
+                .unwrap_err()
+                .sqlstate,
+            "22008"
+        );
+        assert_eq!(
+            parse("2001-02-30", &FmtCtx::utc_default())
+                .unwrap_err()
+                .sqlstate,
+            "22008"
+        );
     }
 
     #[test]
@@ -1653,11 +1739,26 @@ mod tests {
         );
         // A full English month name works; a word merely prefixed by one does not.
         assert_eq!(format(ts("February 10 1997")), "1997-02-10 00:00:00");
-        assert_eq!(parse("marble 5 2001").unwrap_err().sqlstate, "22007");
+        assert_eq!(
+            parse("marble 5 2001", &FmtCtx::utc_default())
+                .unwrap_err()
+                .sqlstate,
+            "22007"
+        );
         // Non-ASCII input must error, not panic (regression for &name[..3]).
-        assert_eq!(parse("aa\u{e9} 2001").unwrap_err().sqlstate, "22007");
+        assert_eq!(
+            parse("aa\u{e9} 2001", &FmtCtx::utc_default())
+                .unwrap_err()
+                .sqlstate,
+            "22007"
+        );
         // Out-of-range years error instead of overflowing i64.
-        assert_eq!(parse("5000000000-01-01").unwrap_err().sqlstate, "22008");
+        assert_eq!(
+            parse("5000000000-01-01", &FmtCtx::utc_default())
+                .unwrap_err()
+                .sqlstate,
+            "22008"
+        );
     }
 
     #[test]
@@ -1887,5 +1988,75 @@ mod tests {
         assert!(make_timestamp(2013, 13, 15, 8, 15, 23.0).is_err());
 
         Ok(())
+    }
+
+    // --- the relative input specials -------------------------------------
+    //
+    // Every expectation is pinned against PostgreSQL 18.4. The clock is frozen
+    // through `FmtCtx::utc_at`, so these assert exact values rather than
+    // properties — and the chosen instant, `2024-03-15 23:30:00.123456 UTC`,
+    // falls on a different calendar day in the two zones below, which is what
+    // pins "today is today in the *session* zone, not in UTC".
+    const FROZEN: i64 = 763_860_600_123_456;
+
+    fn at(zone: &str) -> FmtCtx {
+        FmtCtx::utc_at(1, FROZEN, FROZEN).with_zone(std::sync::Arc::new(
+            crate::tz::SessionZone::resolve(zone).expect("real zone"),
+        ))
+    }
+
+    fn rel(input: &str, zone: &str) -> String {
+        match parse(input, &at(zone)) {
+            Ok(v) => format(v),
+            Err(e) => panic!("{input:?} in {zone}: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn now_is_the_transaction_timestamp_as_a_wall_clock() {
+        assert_eq!(rel("now", "UTC"), "2024-03-15 23:30:00.123456");
+        // The same instant, read in two zones that straddle the date line at it.
+        assert_eq!(rel("now", "America/New_York"), "2024-03-15 19:30:00.123456");
+        assert_eq!(rel("now", "Asia/Kolkata"), "2024-03-16 05:00:00.123456");
+        // Case and surrounding space are insignificant, as for every special.
+        assert_eq!(rel("  NOW  ", "UTC"), "2024-03-15 23:30:00.123456");
+    }
+
+    #[test]
+    fn the_date_tokens_are_midnight_of_the_sessions_day() {
+        assert_eq!(rel("today", "UTC"), "2024-03-15 00:00:00");
+        assert_eq!(rel("tomorrow", "UTC"), "2024-03-16 00:00:00");
+        assert_eq!(rel("yesterday", "UTC"), "2024-03-14 00:00:00");
+        // Kolkata is already on the 16th at this instant, so its whole triple
+        // shifts by a day.
+        assert_eq!(rel("today", "Asia/Kolkata"), "2024-03-16 00:00:00");
+        assert_eq!(rel("tomorrow", "Asia/Kolkata"), "2024-03-17 00:00:00");
+        assert_eq!(rel("yesterday", "Asia/Kolkata"), "2024-03-15 00:00:00");
+        assert_eq!(rel("ToDaY", "UTC"), "2024-03-15 00:00:00");
+    }
+
+    /// `today`/`tomorrow`/`yesterday` are date *fields*, not whole values: they
+    /// combine with a time in either order, exactly as `2024-03-15` would.
+    /// `now` is the opposite — a whole value that refuses company.
+    #[test]
+    fn the_date_tokens_take_a_time_but_now_does_not() {
+        assert_eq!(rel("today 10:00", "UTC"), "2024-03-15 10:00:00");
+        assert_eq!(rel("10:00 today", "UTC"), "2024-03-15 10:00:00");
+        assert_eq!(rel("yesterday 23:59:59.5", "UTC"), "2024-03-14 23:59:59.5");
+        assert_eq!(rel("tomorrow 00:00:01", "UTC"), "2024-03-16 00:00:01");
+        for bad in ["now 10:00", "now EST", "today today", "2020-01-01 today"] {
+            let e = parse(bad, &at("UTC")).expect_err(bad);
+            assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{bad}");
+        }
+    }
+
+    /// Reaching a relative special with no session behind it is a wiring bug,
+    /// and says so — an invented instant would hide it.
+    #[test]
+    fn a_relative_special_without_a_clock_is_an_internal_error() {
+        for input in ["now", "today", "tomorrow 10:00"] {
+            let e = parse(input, &FmtCtx::utc_default()).expect_err(input);
+            assert_eq!(e.sqlstate, "XX000", "{input}");
+        }
     }
 }

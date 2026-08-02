@@ -17,6 +17,7 @@
 //! (as PG does).
 
 use crate::Numeric;
+use crate::fmt::FmtCtx;
 use crate::interval::Interval;
 use crate::timestamp::{self, fixed_point};
 
@@ -91,10 +92,26 @@ pub fn format(usec: i64) -> String {
 /// optional leading date and/or trailing zone (both ignored). A 7th fractional
 /// digit rounds half-up (carrying into the day, so `23:59:59.9999999` becomes
 /// `24:00:00`). Unparseable input is `22007`; an out-of-range value is `22008`.
-pub fn parse(input: &str) -> Result<i64, TimeError> {
+///
+/// Two whole-value specials, and only two: `now` (the transaction timestamp's
+/// time of day, in the session zone) and `allballs` (midnight). A `time` has no
+/// date, so the date-shaped specials PG accepts for `timestamp` and `date` —
+/// `today`, `tomorrow`, `yesterday`, `epoch`, `infinity` — are all `22007` here.
+pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimeError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(invalid_syntax(input));
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "now" => {
+            let wall = timestamp::session_wall_clock(fmt).map_err(|e| TimeError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            })?;
+            return Ok(wall.rem_euclid(USECS_PER_DAY));
+        }
+        "allballs" => return Ok(0),
+        _ => {}
     }
     let mut time_tok: Option<&str> = None;
     let mut ampm: Option<&str> = None;
@@ -350,7 +367,7 @@ mod tests {
     use super::*;
 
     fn t(s: &str) -> i64 {
-        match parse(s) {
+        match parse(s, &FmtCtx::utc_default()) {
             Ok(value) => value,
             Err(error) => panic!("invalid time test fixture `{s}`: {error:?}"),
         }
@@ -365,9 +382,9 @@ mod tests {
         assert_eq!(format(t("23:59:60")), "24:00:00"); // rounds up
         assert_eq!(format(t("24:00:00")), "24:00:00");
         assert_eq!(format(t("02:03 PST")), "02:03:00"); // abbrev ignored
-        assert!(parse("24:00:00.01").is_err());
-        assert!(parse("25:00:00").is_err());
-        assert!(parse("15:36:39 America/New_York").is_err());
+        assert!(parse("24:00:00.01", &FmtCtx::utc_default()).is_err());
+        assert!(parse("25:00:00", &FmtCtx::utc_default()).is_err());
+        assert!(parse("15:36:39 America/New_York", &FmtCtx::utc_default()).is_err());
     }
 
     #[test]
@@ -421,5 +438,62 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("invalid interval test fixture `{s}`: {error:?}"),
         }
+    }
+
+    // --- the whole-value specials (pinned against PostgreSQL 18.4) ---------
+
+    fn at(zone: &str) -> FmtCtx {
+        FmtCtx::utc_at(1, 763_860_600_123_456, 763_860_600_123_456).with_zone(std::sync::Arc::new(
+            crate::tz::SessionZone::resolve(zone).expect("real zone"),
+        ))
+    }
+
+    fn rel(input: &str, zone: &str) -> String {
+        match parse(input, &at(zone)) {
+            Ok(v) => format(v),
+            Err(e) => panic!("{input:?} in {zone}: {e:?}"),
+        }
+    }
+
+    /// `time` accepts exactly two specials. `now` is the transaction
+    /// timestamp's time of day in the session zone; `allballs` is midnight.
+    #[test]
+    fn now_and_allballs_are_the_only_specials() {
+        assert_eq!(rel("now", "UTC"), "23:30:00.123456");
+        assert_eq!(rel("now", "America/New_York"), "19:30:00.123456");
+        assert_eq!(rel("allballs", "UTC"), "00:00:00");
+        assert_eq!(rel("ALLBALLS", "UTC"), "00:00:00");
+    }
+
+    /// The date-shaped specials have no time of day to name, so PG rejects
+    /// every one of them for this type — including `epoch` and `infinity`,
+    /// which `timestamp` and `date` do accept.
+    #[test]
+    fn the_date_shaped_specials_are_rejected() {
+        for bad in [
+            "today",
+            "tomorrow",
+            "yesterday",
+            "epoch",
+            "infinity",
+            "-infinity",
+        ] {
+            let e = parse(bad, &at("UTC")).expect_err(bad);
+            assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{bad}");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type time: \"{bad}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn now_without_a_clock_is_an_internal_error() {
+        assert_eq!(
+            parse("now", &FmtCtx::utc_default())
+                .expect_err("now")
+                .sqlstate,
+            "XX000"
+        );
     }
 }

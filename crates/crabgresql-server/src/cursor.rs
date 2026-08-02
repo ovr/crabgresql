@@ -55,6 +55,14 @@ pub(crate) fn execute_declare(
         return Err(PgError::syntax("DECLARE CURSOR requires a cursor name"));
     };
     let hold = declare.hold.unwrap_or(false);
+    // The *statement* timestamp, not the transaction's — probed against
+    // PostgreSQL 18.4, where a cursor declared mid-block reports an instant
+    // strictly after that block's `now()`. Stamped before the query runs, so it
+    // is this DECLARE's own.
+    let creation_time = session
+        .fmt_ctx()
+        .stmt_start()
+        .map_err(|e| PgError::new(e.sqlstate, e.message))?;
     if declare.binary == Some(true) {
         return Err(PgError::feature_not_supported(
             "DECLARE ... BINARY CURSOR is not supported yet",
@@ -122,6 +130,7 @@ pub(crate) fn execute_declare(
             // AST's own rendering round-trips for canonical input.
             statement: format!("{stmt};"),
             in_block,
+            creation_time,
         },
     );
     Ok(QueryResult::Command {

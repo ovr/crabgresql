@@ -1299,15 +1299,18 @@ impl<'a> Parser<'a> {
                     within_group: vec![],
                 })))
             }
+            // `CURRENT_DATE` is the one form with no fractional-second
+            // precision to give, so a `(` after it is a syntax error rather
+            // than an argument list — as in PostgreSQL.
             Keyword::CURRENT_TIMESTAMP
             | Keyword::CURRENT_TIME
-            | Keyword::CURRENT_DATE
             | Keyword::LOCALTIME
-            | Keyword::LOCALTIMESTAMP => {
-                Ok(Some(self.parse_time_functions(ObjectName::from(vec![
-                    w.to_ident(w_span),
-                ]))?))
-            }
+            | Keyword::LOCALTIMESTAMP => Ok(Some(
+                self.parse_time_functions(ObjectName::from(vec![w.to_ident(w_span)]), true)?,
+            )),
+            Keyword::CURRENT_DATE => Ok(Some(
+                self.parse_time_functions(ObjectName::from(vec![w.to_ident(w_span)]), false)?,
+            )),
             Keyword::CASE => Ok(Some(self.parse_case_expr()?)),
             Keyword::CONVERT => Ok(Some(self.parse_convert_expr(false)?)),
             Keyword::TRY_CONVERT if self.dialect.supports_try_convert() => {
@@ -2317,10 +2320,48 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse time-related function `name` possibly followed by `(...)` arguments.
-    pub fn parse_time_functions(&mut self, name: ObjectName) -> Result<Expr, ParserError> {
-        let args = if self.consume_token(&Token::LParen) {
-            FunctionArguments::List(self.parse_function_argument_list()?)
+    /// Parse a `CURRENT_TIMESTAMP`-family keyword, optionally followed by its
+    /// fractional-second precision.
+    ///
+    /// These are grammar keywords, not functions, and PostgreSQL's grammar
+    /// admits exactly one thing in the parentheses: an unsigned integer
+    /// literal. `current_timestamp(1+1)` and `current_timestamp(3::int)` are
+    /// syntax errors there, so parsing them as a general argument list — and
+    /// leaving the binder to complain about the wrong thing, or not at all —
+    /// would put the error in the wrong place. `precision_allowed` is false for
+    /// `CURRENT_DATE`, which takes no parentheses at all.
+    pub fn parse_time_functions(
+        &mut self,
+        name: ObjectName,
+        precision_allowed: bool,
+    ) -> Result<Expr, ParserError> {
+        let args = if self.peek_token_ref().token == Token::LParen {
+            if !precision_allowed {
+                return Err(self.pg_syntax_error("("));
+            }
+            self.expect_token(&Token::LParen)?;
+            // PostgreSQL blames the first token that cannot be part of the
+            // modifier — `-` in `(-1)`, `+` in `(1+1)`, `::` in `(3::int)` —
+            // not the parenthesis, so each check reports where it stands.
+            let Token::Number(digits, long) = self.peek_token_ref().token.clone() else {
+                return Err(self.pg_syntax_error(&self.peek_token().to_string()));
+            };
+            self.advance_token();
+            if self.peek_token_ref().token != Token::RParen {
+                return Err(self.pg_syntax_error(&self.peek_token().to_string()));
+            }
+            self.advance_token();
+            let arg = ValueWithSpan {
+                value: Value::Number(digits, long),
+                span: Span::empty(),
+            };
+            FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                    arg,
+                )))],
+                clauses: vec![],
+            })
         } else {
             FunctionArguments::None
         };

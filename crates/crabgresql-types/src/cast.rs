@@ -335,14 +335,12 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .ok_or_else(|| invalid_input(PgType::Bool, s)),
 
         // ---- text → timestamp (timestamp_in) ----
-        (Value::Text(s), PgType::Timestamp) => {
-            timestamp::parse(s)
-                .map(Value::Timestamp)
-                .map_err(|e| CastError {
-                    sqlstate: e.sqlstate,
-                    message: e.message,
-                })
-        }
+        (Value::Text(s), PgType::Timestamp) => timestamp::parse(s, fmt)
+            .map(Value::Timestamp)
+            .map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }),
 
         // ---- text → interval (interval_in) ----
         (Value::Text(s), PgType::Interval) => {
@@ -355,7 +353,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
         }
 
         // ---- text → timestamptz (timestamptz_in) ----
-        (Value::Text(s), PgType::TimestampTz) => timestamptz::parse(s, &fmt.zone)
+        (Value::Text(s), PgType::TimestampTz) => timestamptz::parse(s, fmt)
             .map(Value::TimestampTz)
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
@@ -378,16 +376,20 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
         }
 
         // ---- text → date / time / timetz (input functions) ----
-        (Value::Text(s), PgType::Date) => date::parse(s).map(Value::Date).map_err(|e| CastError {
-            sqlstate: e.sqlstate,
-            message: e.message,
-        }),
-        (Value::Text(s), PgType::Time) => time::parse(s).map(Value::Time).map_err(|e| CastError {
-            sqlstate: e.sqlstate,
-            message: e.message,
-        }),
+        (Value::Text(s), PgType::Date) => {
+            date::parse(s, fmt).map(Value::Date).map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            })
+        }
+        (Value::Text(s), PgType::Time) => {
+            time::parse(s, fmt).map(Value::Time).map_err(|e| CastError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            })
+        }
         (Value::Text(s), PgType::TimeTz) => {
-            timetz::parse(s, &fmt.zone)
+            timetz::parse(s, fmt)
                 .map(Value::TimeTz)
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
@@ -466,9 +468,9 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
         // time → timetz attaches the session zone; timetz → time drops it.
         (Value::Time(usec), PgType::TimeTz) => Ok(Value::TimeTz(TimeTz {
             usec: *usec,
-            // Seconds *west*, and see `standard_offset` for why it is the
-            // standard-time offset rather than PG's current-date one.
-            zone: -fmt.zone.standard_offset(),
+            // Seconds *west*; the offset the zone is at today — see
+            // `FmtCtx::zone_offset_today`.
+            zone: -fmt.zone_offset_today(),
         })),
         (Value::TimeTz(v), PgType::Time) => Ok(Value::Time(v.usec)),
 
@@ -1569,12 +1571,9 @@ mod tests {
     // --- session display zone (pinned against PostgreSQL 18.4) -------------
 
     fn ny() -> FmtCtx {
-        FmtCtx::new(
-            1,
-            std::sync::Arc::new(
-                crate::tz::SessionZone::resolve("America/New_York").expect("real zone"),
-            ),
-        )
+        FmtCtx::utc_default().with_zone(std::sync::Arc::new(
+            crate::tz::SessionZone::resolve("America/New_York").expect("real zone"),
+        ))
     }
 
     fn text_to(s: &str, ty: PgType, fmt: &FmtCtx) -> anyhow::Result<String> {
@@ -1698,8 +1697,10 @@ mod tests {
         Ok(())
     }
 
-    /// `time -> timetz` attaches the session zone's standard offset. PG uses
-    /// the current date's offset instead; see `SessionZone::standard_offset`.
+    /// `time -> timetz` attaches the session zone's offset. With no session
+    /// clock — as here — that is the standard-time offset, the documented
+    /// fallback in `FmtCtx::zone_offset_today`; a real session gives today's,
+    /// which is what PG does (pinned over the wire in `e2e.rs`).
     #[test]
     fn time_to_timetz_attaches_the_session_zone() -> anyhow::Result<()> {
         let ny = ny();

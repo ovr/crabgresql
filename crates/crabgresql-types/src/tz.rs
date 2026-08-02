@@ -188,18 +188,15 @@ impl SessionZone {
         offset_for_local(&self.zone, tm)
     }
 
-    /// The zone's **standard-time** offset (seconds east), used by the
-    /// `time -> timetz` cast. Resolved once at construction, since the zone is
-    /// immutable and the answer cannot vary between rows.
+    /// The zone's **standard-time** offset (seconds east). Resolved once at
+    /// construction, since the zone is immutable and the answer cannot vary
+    /// between rows.
     ///
-    /// Documented divergence: PG's `time_timetz` attaches the offset in effect
-    /// on the *current date*, so the same cast yields `-04` in a New York
-    /// summer and `-05` in winter. This engine has no clock at all — there is
-    /// no `now()`/`current_timestamp` — so it cannot ask that question. We take
-    /// the zone's standard offset instead, which is stable and agrees with PG
-    /// for the part of the year when DST is not in effect. Where it is,
-    /// we are an hour off (New York in July, Dublin and Casablanca, whose
-    /// year-round `+01` tzdb encodes as DST over a `+00` base).
+    /// The clock-free fallback for [`crate::FmtCtx::zone_offset_today`], which
+    /// is what a date-less value (`time -> timetz`, `timetz_in` with no zone
+    /// token) actually attaches. It agrees with today's offset for a
+    /// fixed-offset zone and for any zone outside its DST window; where DST is
+    /// in effect it is an hour out.
     pub fn standard_offset(&self) -> i32 {
         self.standard_offset
     }
@@ -420,17 +417,15 @@ pub fn offset_for_instant(zone: &Zone, micros: i64) -> i32 {
     }
 }
 
-/// The UTC offset (seconds east) in effect in `zone` **right now**.
+/// The wall clock, as our microseconds since the 2000 epoch.
 ///
-/// Reading the clock inside an otherwise-pure resolution path is deliberate, not
-/// an oversight: PG's `timetz_zone` does the same, because a `timetz` carries no
-/// date and a named zone cannot name an offset without one. Callers that do have
-/// a date should use [`offset_for_local`] instead.
-pub fn offset_now(zone: &Zone) -> i32 {
-    match zone {
-        Zone::Fixed(secs) => *secs,
-        Zone::Named(tz) => tz.to_offset(Timestamp::now()).seconds(),
-    }
+/// The one place in the engine that reads real time. Everything time-dependent
+/// above this layer takes its instant from the session's clock
+/// ([`crate::fmt::Clock`]) so that a value is stable for as long as PostgreSQL
+/// says it is; only `clock_timestamp()`, which is volatile by definition, and
+/// the session stamping that fills that clock in call this.
+pub fn now_micros() -> i64 {
+    Timestamp::now().as_microsecond() - PG_EPOCH_UNIX_MICROS
 }
 
 /// Build a `jiff` civil datetime, clamping a year beyond `jiff`'s `±9999` range
