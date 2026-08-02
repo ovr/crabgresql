@@ -3496,6 +3496,52 @@ fn annotate_ctas_order_by(error: PgError, create: &ast::CreateTable) -> PgError 
     )
 }
 
+/// Refuse a sort key the storage layer could not actually store rows in.
+///
+/// A columnar engine orders a fragment with Arrow's kernels, and for a handful
+/// of types Arrow's total order is not PostgreSQL's: `numeric` is stored as
+/// text, `timetz` and `interval` as structs, and a text column under an ICU
+/// collation orders by locale rather than by bytes. Such a key would be
+/// accepted, persisted, and then quietly ignored on every write — so it is
+/// rejected here instead, where the user can still choose another column.
+///
+/// `defaulted` distinguishes the key the user wrote from the one inherited from
+/// the PRIMARY KEY, because the remedy differs.
+fn reject_unsortable_key(
+    schema: &TableSchema,
+    keys: &[IndexKey],
+    defaulted: bool,
+) -> Result<(), PgError> {
+    let Some(column) = keys
+        .iter()
+        .filter_map(|key| schema.columns.get(key.column))
+        .find(|column| {
+            !crabgresql_storage_api::sort::sortable(
+                column.ty,
+                column
+                    .collation
+                    .unwrap_or(crabgresql_types::collation::DEFAULT_COLLATION_OID),
+            )
+        })
+    else {
+        return Ok(());
+    };
+    let error = PgError::new(
+        sqlstate::INVALID_OBJECT_DEFINITION,
+        format!(
+            "column \"{}\" of type {} cannot be used in a sort key",
+            column.name,
+            column.ty.name()
+        ),
+    );
+    Err(error.with_hint(if defaulted {
+        "The PRIMARY KEY supplies the sort key. Add an explicit \
+         ORDER BY (columns) naming a column the storage layer can order."
+    } else {
+        "Name a column the storage layer can order."
+    }))
+}
+
 fn build_sort_key(
     order_by: Option<&ast::OneOrManyWithParens<ast::Expr>>,
     access_method: TableAccessMethod,
@@ -3512,7 +3558,10 @@ fn build_sort_key(
         // The PRIMARY KEY's `IndexKey`s were already resolved and validated by
         // the index-building loop, so the default costs no second resolution.
         return match primary_key {
-            Some(pk) => Ok(pk.keys.clone()),
+            Some(pk) => {
+                reject_unsortable_key(schema, &pk.keys, true)?;
+                Ok(pk.keys.clone())
+            }
             None => Err(PgError::new(
                 sqlstate::INVALID_OBJECT_DEFINITION,
                 format!(
@@ -3572,6 +3621,7 @@ fn build_sort_key(
             nulls_first: false,
         });
     }
+    reject_unsortable_key(schema, &keys, false)?;
     Ok(keys)
 }
 

@@ -1386,6 +1386,18 @@ impl TableEngine for PgEngine {
                     schema.columns.len()
                 )));
             }
+            // The other half of the same argument: a key the columnar sort
+            // cannot order would be persisted and then ignored on every write,
+            // leaving a relation that claims an order it does not have. The SQL
+            // layer rejects this with a hint; this is the guard for every other
+            // caller. Only `create_table` — reloading the catalog accepts
+            // whatever is already on disk, and the write path falls back to
+            // insertion order for it.
+            if !crabgresql_storage_api::sort::sortable_layout(&schema) {
+                return Err(StorageError::UnsupportedOperation(format!(
+                    "table access method \"{method}\" cannot order the sort key's columns"
+                )));
+            }
             validate_schema(&schema)?;
         } else if !schema.sort_key.is_empty() {
             // Only an engine-managed method has a layout to order. A key on a

@@ -17,6 +17,7 @@ use crabgresql_types::{PgType, Value};
 pub use crabgresql_txn as txn;
 
 pub mod arrow;
+pub mod sort;
 
 mod stats;
 pub use stats::{ColStats, RelStats};
@@ -415,11 +416,16 @@ pub struct TableSchema {
     /// relation is always empty — `ORDER BY` on one is rejected at DDL time —
     /// and so is a relation created before the key was recorded.
     ///
-    /// Declaring it is not the same as honoring it: nothing sorts on this yet.
-    /// The sorted flush is `ROADMAP.md`'s Parquet step 3, which owns it together
-    /// with the V2 fragment footer. A standalone `USING buffer` relation never
-    /// will — it has nowhere to flush — and carries a key only so both
-    /// engine-managed methods answer the same DDL alike.
+    /// The Parquet engine honors it on every write: a batch is sorted whole
+    /// before it is cut into fragments, so their key ranges are disjoint. What
+    /// remains of `ROADMAP.md`'s Parquet step 3 is the 64 MiB target chunk size,
+    /// which needs the V2 fragment footer. A standalone `USING buffer` relation
+    /// never orders anything — it has nowhere to flush — and carries a key only
+    /// so both engine-managed methods answer the same DDL alike.
+    ///
+    /// Only a key [`sort::sortable_layout`] accepts is honored. DDL rejects the
+    /// rest, but a relation created before that check is stored in insertion
+    /// order rather than failing its writes forever.
     pub sort_key: Vec<IndexKey>,
 }
 

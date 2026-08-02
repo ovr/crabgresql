@@ -8,17 +8,14 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, RecordBatch, RecordBatchOptions, UInt64Array,
-};
-use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow_schema::{Field, Schema};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take as take_kernel;
 use crabgresql_binder::{BoundExpr, SortKey};
 use crabgresql_planner::vectorize;
-use crabgresql_storage_api::Column;
 use crabgresql_storage_api::arrow::{build_array, scan_schema};
+use crabgresql_storage_api::{Column, IndexKey, sort};
 
 use super::{BatchLayout, BatchNode};
 use crate::ExecError;
@@ -131,57 +128,14 @@ impl BatchNode for ProjectBatch {
     }
 }
 
-/// Make a float column sort the way PostgreSQL does.
-///
-/// Two divergences, both real and both silent:
-///
-/// - PostgreSQL treats `-0.0` and `0.0` as **equal** (`float8_cmp`), while
-///   Arrow's total order ranks `-0.0` below `0.0`.
-/// - PostgreSQL treats all NaNs as one value, greater than everything. Arrow's
-///   total order also puts NaN last, but orders distinct NaN *bit patterns*
-///   against each other, so two NaNs that PostgreSQL calls equal would get a
-///   defined relative order — and a stable sort would report it.
-///
-/// Mapping `-0.0` to `0.0` and every NaN to one canonical NaN makes Arrow's
-/// total order coincide with PostgreSQL's exactly. Only the sort *key* is
-/// rewritten; the value the query returns is taken from the untouched column.
-fn canonicalize(array: &ArrayRef) -> ArrayRef {
-    if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
-        let fixed: Float64Array = values.unary(|v: f64| {
-            if v.is_nan() {
-                f64::NAN
-            } else if v == 0.0 {
-                0.0
-            } else {
-                v
-            }
-        });
-        return Arc::new(fixed);
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
-        let fixed: Float32Array = values.unary(|v: f32| {
-            if v.is_nan() {
-                f32::NAN
-            } else if v == 0.0 {
-                0.0
-            } else {
-                v
-            }
-        });
-        return Arc::new(fixed);
-    }
-    Arc::clone(array)
-}
-
 /// Materializing sort — the columnar [`crate::Sort`].
 ///
 /// Same memory model as the row node: everything is buffered before the first
 /// row comes out, so this changes the representation, not the contract.
 ///
-/// **Stability.** The row `Sort` is a stable sort, which PostgreSQL's is too for
-/// keys with no tiebreak. `lexsort_to_indices` is not stable, so a final
-/// `UInt64` position key is appended: ties then resolve by input position, which
-/// *is* stability, expressed as a comparison.
+/// The ordering itself belongs to [`crabgresql_storage_api::sort`], which the
+/// columnar write path shares: PostgreSQL's `-0.0`/NaN key rewrite and the
+/// stability tiebreak are stated once, there.
 pub struct SortBatch {
     rows: Option<RecordBatch>,
     emitted: bool,
@@ -222,38 +176,19 @@ impl SortBatch {
         // over turns a sort that fit into one that does not.
         drop(batches);
 
-        let mut columns: Vec<SortColumn> = keys
+        // A `SortKey` is an `IndexKey` with the direction spelled the other way
+        // round; everything else about the two is the same column-and-flags
+        // triple the sort kernel wants.
+        let index_keys: Vec<IndexKey> = keys
             .iter()
-            .map(|key| SortColumn {
-                values: canonicalize(all.column(key.column)),
-                options: Some(SortOptions {
-                    descending: !key.asc,
-                    // PostgreSQL's NULLS FIRST/LAST is independent of ASC/DESC;
-                    // Arrow's `nulls_first` is too, so it maps straight across.
-                    nulls_first: key.nulls_first,
-                }),
+            .map(|key| IndexKey {
+                column: key.column,
+                descending: !key.asc,
+                nulls_first: key.nulls_first,
             })
             .collect();
-        // The stability tiebreak. Ascending with no nulls, so it only ever
-        // decides between rows every real key called equal.
-        let positions: UInt64Array = (0..all.num_rows() as u64).collect::<Vec<_>>().into();
-        columns.push(SortColumn {
-            values: Arc::new(positions),
-            options: Some(SortOptions {
-                descending: false,
-                nulls_first: false,
-            }),
-        });
-
-        let indices = lexsort_to_indices(&columns, None)
-            .map_err(|error| internal(&format!("sort failed: {error}")))?;
-        let sorted: Vec<ArrayRef> = all
-            .columns()
-            .iter()
-            .take(visible_width)
-            .map(|column| take_kernel(column.as_ref(), &indices, None))
-            .collect::<Result<_, _>>()
-            .map_err(|error| internal(&format!("sort take failed: {error}")))?;
+        let indices = sort::sort_permutation(&all, &index_keys)?;
+        let sorted = sort::take_columns(&all, &indices, visible_width)?;
 
         let fields: Vec<Field> = schema
             .fields()

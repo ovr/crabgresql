@@ -208,11 +208,15 @@ impl BufferedParquetTable {
         // fragment rather than one per original transaction — which is the entire
         // reason the buffer exists.
         //
-        // Rows go out in buffer order. `TableSchema::sort_key` is recorded at
-        // `CREATE TABLE` but nothing honors it yet: sorting here is ROADMAP's
-        // Parquet step 3, which needs the V2 fragment footer in the same change
-        // (the `Tid` offset caps a fragment at 65,535 rows today, so a sorted
-        // flush cannot reach its target chunk size).
+        // `insert_many` applies the relation's layout sort key to the whole
+        // batch, so a flush lands as key-ordered fragments with disjoint ranges
+        // rather than as a slice of insertion order. The tids it returns are
+        // discarded here anyway — the tombstones below are keyed by *buffer*
+        // tid — so the permutation is invisible to this side.
+        //
+        // What remains of ROADMAP's Parquet step 3 is the other half: the
+        // `Tid` offset caps a fragment at 65,535 rows, so a flush still cannot
+        // reach the 64 MiB target chunk size without the V2 fragment footer.
         let staged = self
             .chunks
             .insert_many(values, &txn)
@@ -924,6 +928,43 @@ mod tests {
             ),
             (0..10).collect::<Vec<i32>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_flush_writes_its_rows_in_sort_key_order() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let mut sorted = schema();
+        sorted.sort_key = vec![crabgresql_storage_api::IndexKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }];
+        let table = Arc::new(open_table_of(dir.path(), Arc::clone(&wal), sorted)?);
+        let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+        let mut tm =
+            TransactionManager::new_recovered(sink, Arc::new(Clog::new()), Xid::FIRST_NORMAL);
+        tm.set_finalize(Arc::new(Finalize(Arc::clone(&table))));
+
+        // The buffer holds rows in insertion order; the flush is where the
+        // relation's declared order finally becomes the storage order.
+        seed(&table, &tm, &[5, 1, 4]);
+        seed(&table, &tm, &[3, 2]);
+        assert_eq!(table.flush(&tm)?, 5);
+
+        // The chunk leaf alone: the buffer is empty now, and scanning through
+        // the relation would say nothing about what the file holds.
+        let reader = read_only(&tm);
+        let stored: Vec<i32> = table
+            .chunks()
+            .scan(&reader, &ColumnProjection::All)
+            .map(|row| match row.expect("scan").1[0] {
+                Value::Int4(id) => id,
+                ref other => panic!("unexpected id value {other:?}"),
+            })
+            .collect();
+        assert_eq!(stored, vec![1, 2, 3, 4, 5]);
         Ok(())
     }
 }
