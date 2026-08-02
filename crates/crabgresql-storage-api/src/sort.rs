@@ -19,19 +19,23 @@ use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_select::take::take;
 use crabgresql_types::{PgType, collation};
 
-use crate::{IndexKey, StorageError, TableSchema};
+use crate::{Column, IndexKey, StorageError, TableSchema};
 
 /// Whether Arrow's total order over a column of `ty` under `collation` is
 /// PostgreSQL's order.
 ///
 /// The float types are included although Arrow's raw order differs from
 /// PostgreSQL's: [`sort_permutation`] canonicalizes the key column first, which
-/// makes the two coincide. `numeric` is not, and cannot be — [`crate::arrow`]
-/// stores it as `Utf8`, so an Arrow comparison on it is a string comparison.
-/// `timetz` and `interval` are `Struct`s, which no ordering kernel accepts.
+/// makes the two coincide. `"char"` is included because [`crate::arrow`] stores
+/// it as `UInt8` precisely so that Arrow's order is the type's own unsigned
+/// one. `numeric` is excluded and cannot be included — it is stored as `Utf8`,
+/// so an Arrow comparison on it is a string comparison; `bpchar` ignores
+/// trailing blanks, which byte order does not; `timetz` and `interval` are
+/// `Struct`s, which no ordering kernel accepts.
 pub fn sortable(ty: PgType, collation: u32) -> bool {
     match ty {
         PgType::Bool
+        | PgType::Char
         | PgType::Int2
         | PgType::Int4
         | PgType::Int8
@@ -48,20 +52,36 @@ pub fn sortable(ty: PgType, collation: u32) -> bool {
     }
 }
 
+/// The first column `keys` names that this module cannot order, or `None` when
+/// every key column is fine.
+///
+/// The one place that walks a key deciding this, so the DDL gate that reports
+/// the offending column and the write path that falls back to insertion order
+/// can never disagree about which keys are honored. It takes the columns and
+/// the keys separately because DDL asks before the key is on the schema.
+///
+/// A key index out of range yields `None` — that is the range check's error to
+/// report, not this function's, and [`sortable_layout`] still calls such a
+/// layout unsortable.
+pub fn unsortable_column<'a>(columns: &'a [Column], keys: &[IndexKey]) -> Option<&'a Column> {
+    keys.iter().find_map(|key| {
+        let column = columns.get(key.column)?;
+        let collation = column.collation.unwrap_or(collation::DEFAULT_COLLATION_OID);
+        (!sortable(column.ty, collation)).then_some(column)
+    })
+}
+
 /// Whether `schema`'s layout sort key names only columns this module can sort.
 ///
-/// A key that fails here is not an error: the relation is stored in insertion
-/// order instead. DDL rejects such a key going forward, but a relation created
-/// before that check still has to accept writes.
+/// A key that fails here is not an error at write time: the relation is stored
+/// in insertion order instead. DDL rejects such a key going forward, but a
+/// relation created before that check still has to accept writes.
 pub fn sortable_layout(schema: &TableSchema) -> bool {
-    schema.sort_key.iter().all(|key| {
-        schema.columns.get(key.column).is_some_and(|column| {
-            sortable(
-                column.ty,
-                column.collation.unwrap_or(collation::DEFAULT_COLLATION_OID),
-            )
-        })
-    })
+    schema
+        .sort_key
+        .iter()
+        .all(|key| key.column < schema.columns.len())
+        && unsortable_column(&schema.columns, &schema.sort_key).is_none()
 }
 
 /// The permutation that puts `batch` in `keys` order: entry `p` is the index of
@@ -188,7 +208,6 @@ mod tests {
     use crabgresql_types::Value;
 
     use super::*;
-    use crate::Column;
 
     fn schema(columns: Vec<Column>, sort_key: Vec<IndexKey>) -> TableSchema {
         let mut schema = TableSchema::new("t", columns);
@@ -216,6 +235,8 @@ mod tests {
     fn every_arrow_ordered_type_is_sortable_and_the_rest_is_not() {
         for ty in [
             PgType::Bool,
+            // `UInt8` in the Arrow mapping, chosen for exactly this reason.
+            PgType::Char,
             PgType::Int2,
             PgType::Int4,
             PgType::Int8,
@@ -262,6 +283,7 @@ mod tests {
             vec![key(0)],
         );
         assert!(sortable_layout(&sortable_schema));
+        assert!(unsortable_column(&sortable_schema.columns, &sortable_schema.sort_key).is_none());
 
         let numeric_key = schema(
             vec![
@@ -271,11 +293,20 @@ mod tests {
             vec![key(0), key(1)],
         );
         assert!(!sortable_layout(&numeric_key));
+        // The offending column is named, so the DDL gate reports the same one
+        // the write path would have refused to order.
+        assert_eq!(
+            unsortable_column(&numeric_key.columns, &numeric_key.sort_key)
+                .map(|column| column.name.as_str()),
+            Some("b")
+        );
 
         // An out-of-range key is as unusable as an unsortable type, and takes
-        // the same insertion-order path rather than panicking on a write.
+        // the same insertion-order path rather than panicking on a write — but
+        // it names no column, because reporting it is the range check's job.
         let out_of_range = schema(vec![Column::new("a", PgType::Int4)], vec![key(7)]);
         assert!(!sortable_layout(&out_of_range));
+        assert!(unsortable_column(&out_of_range.columns, &out_of_range.sort_key).is_none());
     }
 
     #[test]

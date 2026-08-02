@@ -71,16 +71,6 @@ const META_REL: &str = "crabgresql.relfilenode";
 const META_XMIN: &str = "crabgresql.xmin";
 const META_CMIN: &str = "crabgresql.cmin";
 const META_SCHEMA: &str = "crabgresql.schema";
-/// The layout sort key the fragment's rows are actually stored in, as
-/// `column:direction:nulls` triples — `0:asc:nulls_last,3:desc:nulls_first`.
-///
-/// Written **only** when the sort ran, so its presence means "this file is
-/// clustered" rather than "this table declares a key": a relation whose key
-/// names a column Arrow cannot order is stored in insertion order, and must not
-/// claim otherwise. Purely additive — [`open_reader`] does not check it, so
-/// fragments written before it existed stay readable and [`FORMAT_VERSION`]
-/// does not move.
-const META_SORT_KEY: &str = "crabgresql.sort_key";
 
 fn io_error(context: &str, error: impl std::fmt::Display) -> StorageError {
     StorageError::Io(format!("{context}: {error}"))
@@ -103,28 +93,14 @@ fn schema_identity(schema: &TableSchema) -> String {
         .join("|")
 }
 
-/// The layout sort key rendered for [`META_SORT_KEY`].
-fn sort_key_identity(schema: &TableSchema) -> String {
-    schema
-        .sort_key
-        .iter()
-        .map(|key| {
-            format!(
-                "{}:{}:{}",
-                key.column,
-                if key.descending { "desc" } else { "asc" },
-                if key.nulls_first {
-                    "nulls_first"
-                } else {
-                    "nulls_last"
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The layout sort key as Parquet row-group metadata.
+/// The layout sort key as Parquet row-group metadata — the *only* record a
+/// fragment keeps of how its rows are ordered.
+///
+/// Written only when the sort actually ran, so its presence means "this file is
+/// clustered" rather than "this table declares a key". Nothing in this engine
+/// reads it back yet; it is the standard field an outside reader and the
+/// eventual pruning/compaction pass will look at, which is why the claim is
+/// made in Parquet's own vocabulary rather than in a private footer key.
 ///
 /// `SortingColumn::column_idx` is a **leaf** index, not the ordinal of a
 /// top-level field. [`crabgresql_storage_api::arrow::arrow_type`] maps `timetz`
@@ -132,6 +108,15 @@ fn sort_key_identity(schema: &TableSchema) -> String {
 /// the leaf numbering away from the column position an `IndexKey` carries —
 /// which would publish confidently wrong metadata. Ask the converted schema
 /// instead, and take a key's first leaf.
+///
+/// **Float keys order by PostgreSQL's rules, which are Parquet's and not
+/// Arrow's.** The sort canonicalizes `-0.0` to `0.0` and every NaN payload to
+/// one NaN before comparing, so a fragment can hold `+0.0` before `-0.0`, or
+/// two NaN bit patterns in input order. That is non-decreasing under the IEEE
+/// comparison Parquet defines for `FLOAT`/`DOUBLE` (which calls the zeros equal
+/// and leaves NaN undefined), so the declaration is honest — but a reader that
+/// merges or binary-searches under Arrow's *total* order must canonicalize the
+/// same way before trusting it.
 fn sorting_columns(schema: &TableSchema) -> Result<Vec<SortingColumn>, StorageError> {
     let descriptor = ArrowSchemaConverter::new()
         .convert(&arrow_schema(schema))
@@ -1271,7 +1256,7 @@ impl ParquetTable {
     ///
     /// `sorting` is `Some` exactly when `batch`'s rows are in the relation's
     /// layout sort key order, and is what puts that on the record — both in
-    /// Parquet's own row-group metadata and in [`META_SORT_KEY`].
+    /// Parquet's own row-group metadata — see [`sorting_columns`].
     fn write_fragment(
         &self,
         rel: u32,
@@ -1292,19 +1277,13 @@ impl ParquetTable {
         let writer_file = file
             .try_clone()
             .map_err(|error| io_error("clone Parquet fragment handle", error))?;
-        let mut metadata = vec![
+        let metadata = vec![
             KeyValue::new(META_VERSION.to_string(), Some(FORMAT_VERSION.to_string())),
             KeyValue::new(META_REL.to_string(), Some(rel.to_string())),
             KeyValue::new(META_XMIN.to_string(), Some(txn.xid.0.to_string())),
             KeyValue::new(META_CMIN.to_string(), Some(txn.cid.0.to_string())),
             KeyValue::new(META_SCHEMA.to_string(), Some(schema_identity(&self.schema))),
         ];
-        if sorting.is_some() {
-            metadata.push(KeyValue::new(
-                META_SORT_KEY.to_string(),
-                Some(sort_key_identity(&self.schema)),
-            ));
-        }
         let properties = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .set_max_row_group_row_count(Some(MAX_FRAGMENT_ROWS))
@@ -1564,8 +1543,8 @@ impl TableAm for ParquetTable {
         let rows = tuples.len();
         let batch = build_batch(&self.schema, &tuples)?;
         // Load-bearing, not tidiness: a `Tuple` is a `Vec<Value>` per row, which
-        // outweighs both Arrow copies below on every schema this engine stores.
-        // Releasing it here is what keeps the sorted path's peak at or under the
+        // outweighs the Arrow image on every schema this engine stores, so
+        // releasing it here keeps the sorted path's peak at or under the
         // unsorted one's — the same argument the executor's `SortBatch` makes.
         drop(tuples);
         // Sorting is best-effort by design. A key naming a column Arrow cannot
@@ -1575,21 +1554,22 @@ impl TableAm for ParquetTable {
         // created before that check still has to accept writes, and a flush
         // that failed forever would grow the buffer without bound and surface
         // as backpressure on unrelated inserts. Nothing is lost silently — the
-        // footer's sort metadata is written only when the sort actually ran.
+        // row-group sort metadata is written only when the sort actually ran.
         //
-        // The whole insert is sorted, not each fragment: only that makes the
-        // fragments' key ranges disjoint, which is the point of sorting at all.
-        let order = (!self.schema.sort_key.is_empty() && sortable_layout(&self.schema))
-            .then(|| sort_permutation(&batch, &self.schema.sort_key))
-            .transpose()?;
-        let batch = match &order {
-            Some(indices) => take_batch(&batch, indices)?,
-            None => batch,
+        // The permutation and the metadata are decided together, in one `if`:
+        // a fragment claiming an order it was not written in is the failure
+        // this whole change exists to avoid, and two conditions could drift.
+        // Note also that the *whole* insert is permuted, not each fragment —
+        // only that makes one write's fragments cover disjoint key ranges.
+        let (order, sorting) = if !self.schema.sort_key.is_empty() && sortable_layout(&self.schema)
+        {
+            (
+                Some(sort_permutation(&batch, &self.schema.sort_key)?),
+                Some(sorting_columns(&self.schema)?),
+            )
+        } else {
+            (None, None)
         };
-        let sorting = order
-            .is_some()
-            .then(|| sorting_columns(&self.schema))
-            .transpose()?;
         let mut next = self
             .next_block
             .lock()
@@ -1612,21 +1592,36 @@ impl TableAm for ParquetTable {
                 .checked_add(1)
                 .filter(|next| *next <= MAX_PHYSICAL_BLOCK)
                 .ok_or_else(|| io_error("allocate Parquet fragment", "fragment id exhausted"))?;
-            // Zero-copy: a slice is an offset and a length over the same buffers.
-            let fragment = batch.slice(start, len);
-            let (temp, pending) =
-                match self.write_fragment(rel, &dir, block, &fragment, sorting.as_deref(), txn) {
-                    Ok(paths) => paths,
-                    Err(error) => {
-                        let base = format!("{block:08x}-{}-{}", txn.xid.0, txn.cid.0);
-                        let _ = std::fs::remove_file(dir.join(format!("{base}.tmp")));
-                        for (temp, pending) in &staged {
-                            let _ = std::fs::remove_file(temp);
-                            let _ = std::fs::remove_file(pending);
-                        }
-                        return Err(error);
+            // Gathered one fragment at a time rather than taking the whole
+            // permutation up front: the sorted copy then never exceeds a
+            // fragment, where a whole-batch `take` would hold a second full
+            // image of the insert across every compression and fsync below.
+            // Same elements, same order — `order` holds global input positions,
+            // and `take` is elementwise. The unsorted path slices instead,
+            // which is free: an offset and a length over the same buffers.
+            //
+            // Chained rather than `?`-ed so a failed gather unwinds through the
+            // same cleanup as a failed write: either way this transaction's
+            // half-written fragments must not survive the error.
+            let written = match &order {
+                Some(indices) => take_batch(&batch, &indices.slice(start, len)),
+                None => Ok(batch.slice(start, len)),
+            }
+            .and_then(|fragment| {
+                self.write_fragment(rel, &dir, block, &fragment, sorting.as_deref(), txn)
+            });
+            let (temp, pending) = match written {
+                Ok(paths) => paths,
+                Err(error) => {
+                    let base = format!("{block:08x}-{}-{}", txn.xid.0, txn.cid.0);
+                    let _ = std::fs::remove_file(dir.join(format!("{base}.tmp")));
+                    for (temp, pending) in &staged {
+                        let _ = std::fs::remove_file(temp);
+                        let _ = std::fs::remove_file(pending);
                     }
-                };
+                    return Err(error);
+                }
+            };
             staged.push((temp, pending));
             // A tid is a physical address, so it is assigned in the order rows
             // were written — but the caller indexes the result by *input*
@@ -3425,16 +3420,19 @@ mod tests {
         Ok(rows)
     }
 
-    fn footer_value(path: &Path, key: &str) -> anyhow::Result<Option<String>> {
+    /// The sort key a fragment declares, as `(leaf, descending, nulls_first)`,
+    /// or `None` when it claims no order at all.
+    fn declared_sort(path: &Path) -> anyhow::Result<Option<Vec<(i32, bool, bool)>>> {
         let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
         Ok(reader
             .metadata()
-            .file_metadata()
-            .key_value_metadata()
-            .and_then(|kv| {
-                kv.iter()
-                    .find(|item| item.key == key)
-                    .and_then(|item| item.value.clone())
+            .row_group(0)
+            .sorting_columns()
+            .map(|columns| {
+                columns
+                    .iter()
+                    .map(|column| (column.column_idx, column.descending, column.nulls_first))
+                    .collect()
             }))
     }
 
@@ -3476,10 +3474,7 @@ mod tests {
         let file = parquet_files(dir.path(), 1)?
             .pop()
             .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
-        assert_eq!(
-            footer_value(&file, super::META_SORT_KEY)?.as_deref(),
-            Some("0:asc:nulls_last")
-        );
+        assert_eq!(declared_sort(&file)?, Some(vec![(0, false, false)]));
         Ok(())
     }
 
@@ -3577,7 +3572,7 @@ mod tests {
         let file = parquet_files(dir.path(), 1)?
             .pop()
             .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
-        assert_eq!(footer_value(&file, super::META_SORT_KEY)?, None);
+        assert_eq!(declared_sort(&file)?, None);
         Ok(())
     }
 
@@ -3603,12 +3598,10 @@ mod tests {
             .pop()
             .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
         assert_eq!(
-            footer_value(&file, super::META_SORT_KEY)?,
+            declared_sort(&file)?,
             None,
             "an unsorted fragment must not claim to be clustered"
         );
-        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&file)?)?;
-        assert_eq!(reader.metadata().row_group(0).sorting_columns(), None);
         Ok(())
     }
 
@@ -3640,16 +3633,7 @@ mod tests {
         let file = parquet_files(dir.path(), 1)?
             .pop()
             .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&file)?)?;
-        let sorting = reader
-            .metadata()
-            .row_group(0)
-            .sorting_columns()
-            .ok_or_else(|| anyhow::anyhow!("fragment records no sorting columns"))?;
-        assert_eq!(sorting.len(), 1);
-        assert_eq!(sorting[0].column_idx, 2);
-        assert!(!sorting[0].descending);
-        assert!(!sorting[0].nulls_first);
+        assert_eq!(declared_sort(&file)?, Some(vec![(2, false, false)]));
         Ok(())
     }
 
@@ -3687,10 +3671,7 @@ mod tests {
         let file = parquet_files(dir.path(), 1)?
             .pop()
             .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
-        assert_eq!(
-            footer_value(&file, super::META_SORT_KEY)?.as_deref(),
-            Some("0:desc:nulls_first")
-        );
+        assert_eq!(declared_sort(&file)?, Some(vec![(0, true, true)]));
         Ok(())
     }
 
@@ -3721,6 +3702,43 @@ mod tests {
             tags,
             [4, 1, 3, 0, 2].map(Value::Int4).to_vec(),
             "-1.0 < (0.0, -0.0 in input order) < (NaN, NaN in input order)"
+        );
+
+        // The fragment still declares itself sorted, and that declaration is
+        // honest under the IEEE comparison Parquet defines for DOUBLE: the two
+        // zeros compare equal and NaN's placement is left undefined. Only a
+        // reader using Arrow's *total* order would call `+0.0, -0.0` a descent,
+        // which is why `sorting_columns`' doc spells the caveat out.
+        let file = parquet_files(dir.path(), 1)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
+        assert_eq!(declared_sort(&file)?, Some(vec![(0, false, false)]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_char_key_sorts_by_its_unsigned_byte() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        // `"char"` is stored as `UInt8` for exactly this reason: a high-bit byte
+        // must sort *above* an ASCII one, as PostgreSQL's unsigned comparison
+        // says, and would sort below it under a signed encoding.
+        let schema = sorted_schema("chars", &[PgType::Char], &[0]);
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+
+        let rows: Vec<Tuple> = [0xFF, 0x41, 0x00, 0x80]
+            .into_iter()
+            .map(|byte| vec![Value::Char(byte)])
+            .collect();
+        insert_committed(&table, &tm, rows)?;
+
+        assert_eq!(
+            stored_rows(dir.path(), 1, &schema)?,
+            [0x00, 0x41, 0x80, 0xFF]
+                .into_iter()
+                .map(|byte| vec![Value::Char(byte)])
+                .collect::<Vec<_>>()
         );
         Ok(())
     }

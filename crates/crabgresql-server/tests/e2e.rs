@@ -6081,6 +6081,24 @@ async fn an_engine_managed_table_must_declare_its_sort_key() -> anyhow::Result<(
         )
     );
 
+    // The rule is asked of the method, not of every engine-managed one. A
+    // standalone `USING buffer` relation stores nothing in key order to begin
+    // with, so refusing one of its key columns would guard a promise it never
+    // makes — and would break DDL that worked before the rule existed.
+    for sql in [
+        "CREATE TABLE k8 (n numeric) USING buffer ORDER BY (n)",
+        "CREATE TABLE k9 (n numeric PRIMARY KEY) USING buffer",
+        // `"char"` is stored as `UInt8` precisely so Arrow's order is its own
+        // unsigned one, so parquet can honor it and must not refuse it.
+        "CREATE TABLE k10 (c \"char\") USING parquet ORDER BY (c)",
+        "CREATE TABLE k11 (c \"char\" PRIMARY KEY) USING parquet",
+    ] {
+        client
+            .simple_query(sql)
+            .await
+            .with_context(|| sql.to_string())?;
+    }
+
     // A heap has no layout order to declare, so the clause is refused rather
     // than recorded and never honored.
     let (code, message, _) = fails("CREATE TABLE n7 (id int4) ORDER BY (id)").await?;

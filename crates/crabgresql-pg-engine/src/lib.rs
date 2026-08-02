@@ -1393,9 +1393,21 @@ impl TableEngine for PgEngine {
             // caller. Only `create_table` — reloading the catalog accepts
             // whatever is already on disk, and the write path falls back to
             // insertion order for it.
-            if !crabgresql_storage_api::sort::sortable_layout(&schema) {
+            //
+            // Asked of the method, not of `is_engine_managed`: a standalone
+            // `USING buffer` relation stores nothing in key order to begin
+            // with, so refusing one key there while accepting another would
+            // protect a promise that method never makes.
+            if schema.access_method.honors_sort_key()
+                && let Some(column) = crabgresql_storage_api::sort::unsortable_column(
+                    &schema.columns,
+                    &schema.sort_key,
+                )
+            {
                 return Err(StorageError::UnsupportedOperation(format!(
-                    "table access method \"{method}\" cannot order the sort key's columns"
+                    "table access method \"{method}\" cannot order column \"{}\" of type {}",
+                    column.name,
+                    column.ty.name()
                 )));
             }
             validate_schema(&schema)?;

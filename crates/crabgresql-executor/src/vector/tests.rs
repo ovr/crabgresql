@@ -590,6 +590,30 @@ fn hidden_sort_columns_are_dropped_after_ordering() {
     assert_same_order(&schema, &rows, &keys, 1);
 }
 
+/// `"char"` sorts columnar, and by its *unsigned* byte. It is stored as
+/// `UInt8` for exactly that reason — under a signed encoding `0xFF` would sort
+/// below `0x00` and contradict the type — so the columnar node must agree with
+/// the row node on a high-bit byte.
+#[test]
+fn a_char_column_sorts_columnar_by_its_unsigned_byte() {
+    let schema = schema_of(&[PgType::Char]);
+    let rows: Vec<Tuple> = [0xFF, 0x41, 0x00, 0x80]
+        .into_iter()
+        .map(|byte| vec![Value::Char(byte)])
+        .collect();
+    let keys = [sort_key(0, PgType::Char, true, false)];
+    assert!(SortBatch::compilable(&keys, &layout_of(&schema)));
+    let sorted = columnar_sort(&schema, &rows, &keys, 1).expect("columnar sort");
+    assert_eq!(
+        sorted,
+        [0x00, 0x41, 0x80, 0xFF]
+            .into_iter()
+            .map(|byte| vec![Value::Char(byte)])
+            .collect::<Vec<_>>()
+    );
+    assert_same_order(&schema, &rows, &keys, 1);
+}
+
 /// Sort keys whose Arrow order is not PostgreSQL's are refused, so the row
 /// `Sort` keeps them. `numeric` is the dangerous one: stored as text, it would
 /// sort `'10'` before `'9'` without any error.

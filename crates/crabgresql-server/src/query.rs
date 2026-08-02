@@ -3505,24 +3505,25 @@ fn annotate_ctas_order_by(error: PgError, create: &ast::CreateTable) -> PgError 
 /// accepted, persisted, and then quietly ignored on every write — so it is
 /// rejected here instead, where the user can still choose another column.
 ///
+/// Asked only of a method that [honors a
+/// key](TableAccessMethod::honors_sort_key): a standalone `USING buffer`
+/// relation stores nothing in key order anyway, so it has no promise to keep
+/// and no reason to refuse one column while accepting another.
+///
 /// `defaulted` distinguishes the key the user wrote from the one inherited from
 /// the PRIMARY KEY, because the remedy differs.
 fn reject_unsortable_key(
+    access_method: TableAccessMethod,
     schema: &TableSchema,
     keys: &[IndexKey],
     defaulted: bool,
 ) -> Result<(), PgError> {
-    let Some(column) = keys
-        .iter()
-        .filter_map(|key| schema.columns.get(key.column))
-        .find(|column| {
-            !crabgresql_storage_api::sort::sortable(
-                column.ty,
-                column
-                    .collation
-                    .unwrap_or(crabgresql_types::collation::DEFAULT_COLLATION_OID),
-            )
-        })
+    if !access_method.honors_sort_key() {
+        return Ok(());
+    }
+    // The same walk the write path uses to decide what it will honor, so the
+    // two cannot disagree about which keys are real.
+    let Some(column) = crabgresql_storage_api::sort::unsortable_column(&schema.columns, keys)
     else {
         return Ok(());
     };
@@ -3559,7 +3560,7 @@ fn build_sort_key(
         // the index-building loop, so the default costs no second resolution.
         return match primary_key {
             Some(pk) => {
-                reject_unsortable_key(schema, &pk.keys, true)?;
+                reject_unsortable_key(access_method, schema, &pk.keys, true)?;
                 Ok(pk.keys.clone())
             }
             None => Err(PgError::new(
@@ -3621,7 +3622,7 @@ fn build_sort_key(
             nulls_first: false,
         });
     }
-    reject_unsortable_key(schema, &keys, false)?;
+    reject_unsortable_key(access_method, schema, &keys, false)?;
     Ok(keys)
 }
 
