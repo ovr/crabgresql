@@ -156,3 +156,55 @@ NOTICE:  sequence "sq_missing" does not exist, skipping
 -- Clean up (this suite shares one database across tests).
 DROP SEQUENCE sq_a;
 DROP SEQUENCE sq_b;
+-- `nextval`/`currval`/`setval` take a `regclass`, not text, so an unquoted name
+-- in the literal is normalized the way the parser would normalize it: folded to
+-- lower case, surrounding whitespace ignored. A double-quoted name inside the
+-- literal keeps its case.
+CREATE SEQUENCE sq_reg;
+CREATE SEQUENCE "sqCase";
+SELECT nextval('sq_reg'), nextval('SQ_REG'), nextval('  sq_reg  ');
+ nextval | nextval | nextval 
+---------+---------+---------
+       1 |       2 |       3
+(1 row)
+
+SELECT currval('SQ_REG');
+ currval 
+---------
+       3
+(1 row)
+
+SELECT setval('SQ_REG', 10);
+ setval 
+--------
+     10
+(1 row)
+
+SELECT nextval('"sqCase"');
+ nextval 
+---------
+       1
+(1 row)
+
+-- a serial column's default is stored already deparsed, carrying the cast that
+-- `nextval`'s argument type needs
+CREATE TABLE sq_serial (id serial, b int);
+SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)
+  FROM pg_catalog.pg_attrdef d
+ WHERE d.adrelid = 'sq_serial'::regclass;
+              pg_get_expr              
+---------------------------------------
+ nextval('sq_serial_id_seq'::regclass)
+(1 row)
+
+INSERT INTO sq_serial (b) VALUES (1), (2);
+SELECT id, b FROM sq_serial ORDER BY id;
+ id | b 
+----+---
+  1 | 1
+  2 | 2
+(2 rows)
+
+DROP TABLE sq_serial;
+DROP SEQUENCE "sqCase";
+DROP SEQUENCE sq_reg;

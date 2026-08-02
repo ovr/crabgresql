@@ -3044,7 +3044,10 @@ fn execute_create_table(
             } else {
                 format!("{namespace}.{seq_name}")
             };
-            column.default = Some(format!("nextval('{seq_ref}')"));
+            // Written the way PG's deparse prints it — `nextval` takes a
+            // `regclass`, and the cast is what a re-parse of this text needs to
+            // resolve the name.
+            column.default = Some(format!("nextval('{seq_ref}'::regclass)"));
             serial_defs.push(SequenceDefinition {
                 name: seq_name,
                 namespace: namespace.clone(),
