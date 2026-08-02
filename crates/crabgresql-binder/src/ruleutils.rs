@@ -539,6 +539,7 @@ fn type_name(ty: &ast::DataType) -> String {
         PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
             crate::datetime_precision(ty)
         }
+        PgType::Interval => crate::interval_typmod(ty),
         _ => crate::checked_length_typmod(ty).ok().flatten(),
     };
     t.format_type(Some(typmod.unwrap_or(-1)))

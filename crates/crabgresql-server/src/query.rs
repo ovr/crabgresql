@@ -29,7 +29,7 @@ use crabgresql_storage_api::{
     TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
-use crabgresql_types::{FmtCtx, Numeric, PgType, Value};
+use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::catalog::{SessionCatalog, SessionCatalogOps};
 use crate::error::PgError;
@@ -3041,19 +3041,7 @@ fn execute_create_table(
             None => resolve_column_type(type_catalog, &col.data_type)?,
         };
         reject_stored_reg_type(ty, &column_name)?;
-        // Checked, not the bare readers: an out-of-range modifier would be
-        // stored on the column and later overflow `pg_attribute.atttypmod`.
-        // `numeric` packs two numbers into the one `Column::typmod` slot; every
-        // other modifier is a bare length or fractional-second precision.
-        let typmod = match ty {
-            PgType::Numeric => crabgresql_binder::checked_numeric_typmod(&col.data_type)?
-                .map(|(p, s)| Numeric::pack_typmod(p, s)),
-            PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
-                crabgresql_binder::datetime_precision(&col.data_type)
-            }
-            _ => crabgresql_binder::checked_length_typmod(&col.data_type)?,
-        }
-        .unwrap_or(-1);
+        let typmod = crabgresql_binder::declared_typmod(ty, &col.data_type)?.unwrap_or(-1);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
         if let Some(base) = serial_base {
             // Name the sequence `t_col_seq`, dodging existing relations and any
@@ -4055,7 +4043,7 @@ fn execute_create_table_as(
         columns: cols
             .iter()
             .map(|c| {
-                let mut col = Column::new(c.name.clone(), c.ty);
+                let mut col = Column::with_typmod(c.name.clone(), c.ty, c.typmod);
                 col.collation = c.collation;
                 col
             })
@@ -5229,9 +5217,16 @@ fn execute_create_view(
         }
     }
 
+    // A view's columns describe themselves exactly as the query's output does,
+    // modifier and collation included — that is what makes `\d v` print
+    // `character varying(20)` rather than a bare `character varying`.
     let view_columns: Vec<Column> = columns
         .iter()
-        .map(|c| Column::new(c.name.clone(), c.ty))
+        .map(|c| {
+            let mut col = Column::with_typmod(c.name.clone(), c.ty, c.typmod);
+            col.collation = c.collation;
+            col
+        })
         .collect();
     let depends_on = referenced_relations(&create.query);
     let sql = create.query.to_string();

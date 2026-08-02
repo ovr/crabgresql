@@ -1467,6 +1467,22 @@ mod format_type_tests {
         assert_eq!(ft(oid::TIMESTAMPTZ, Some(3)), "timestamp(3) with time zone");
         assert_eq!(ft(oid::TIME, Some(3)), "time(3) without time zone");
         assert_eq!(ft(oid::TIMETZ, Some(3)), "time(3) with time zone");
+        // `interval` is the one modifier that carries two things: the fields it
+        // admits and the precision. Every value here is the `atttypmod`
+        // PostgreSQL 18.4 stores for a column declared that way.
+        assert_eq!(ft(oid::INTERVAL, Some(-1)), "interval");
+        assert_eq!(ft(oid::INTERVAL, Some(2147418115)), "interval(3)");
+        assert_eq!(ft(oid::INTERVAL, Some(327679)), "interval year");
+        assert_eq!(ft(oid::INTERVAL, Some(458751)), "interval year to month");
+        assert_eq!(ft(oid::INTERVAL, Some(268435458)), "interval second(2)");
+        assert_eq!(
+            ft(oid::INTERVAL, Some(470286340)),
+            "interval day to second(4)"
+        );
+        assert_eq!(
+            ft(oid::INTERVAL, Some(402653184)),
+            "interval minute to second(0)"
+        );
         // A `reg*` type spells as its own name.
         assert_eq!(ft(oid::REGCLASS, None), "regclass");
         // An array formats its element type, carrying the modifier, plus `[]`.

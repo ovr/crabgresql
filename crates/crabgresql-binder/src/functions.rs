@@ -301,6 +301,10 @@ pub enum ScalarFn {
     /// serves all four because they round the same way and differ only in which
     /// `Value` carries the microseconds.
     TimeApplyTypmod,
+    /// Apply an `interval` type modifier at run time. Args are `(interval, int4
+    /// typmod)` — the *packed* modifier, since an interval's admitted fields and
+    /// its precision travel together.
+    IntervalTypmod,
     /// `abs(float8) -> float8`.
     AbsF8,
     /// `log(float8) -> float8` (base 10).

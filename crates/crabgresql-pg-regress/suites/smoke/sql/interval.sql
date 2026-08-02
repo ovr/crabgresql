@@ -93,6 +93,41 @@ SELECT interval '-infinity' < interval '1 day' AS lt, interval 'infinity' > inte
 SELECT date_part('epoch', interval 'infinity') AS epoch, date_part('month', interval 'infinity') AS oscillating;
 SELECT timestamp '2020-01-01' + interval 'infinity' AS ts_inf;
 
+-- type modifier: the admitted fields and the precision pack into one atttypmod,
+-- which format_type decodes back to the spelling that was written
+CREATE TABLE interval_typmod_tbl(
+  a interval, b interval(3), c interval year, d interval month, e interval day,
+  f interval hour, g interval minute, h interval second, i interval second(2),
+  j interval year to month, k interval day to hour, l interval day to minute,
+  m interval day to second, n interval day to second(4), o interval hour to minute,
+  p interval hour to second, q interval hour to second(1), r interval minute to second,
+  s interval minute to second(0));
+SELECT attname, atttypmod, format_type(atttypid, atttypmod) AS spelling
+  FROM pg_attribute WHERE attrelid = 'interval_typmod_tbl'::regclass AND attnum > 0
+  ORDER BY attnum;
+-- information_schema names the fields separately from the precision
+SELECT column_name, interval_type, datetime_precision, interval_precision
+  FROM information_schema.columns WHERE table_name = 'interval_typmod_tbl'
+  ORDER BY ordinal_position;
+
+-- casting applies the modifier: the lowest admitted field decides what survives,
+-- the fields above it are untouched, and a range reaching SECOND rounds
+SELECT (interval '1 year 2 months 3 days 4:05:06.789')::interval year AS y,
+       (interval '1 year 2 months 3 days 4:05:06.789')::interval month AS mo,
+       (interval '1 year 2 months 3 days 4:05:06.789')::interval day AS d;
+SELECT (interval '1 year 2 months 3 days 4:05:06.789')::interval hour AS h,
+       (interval '1 year 2 months 3 days 4:05:06.789')::interval minute AS mi,
+       (interval '1 year 2 months 3 days 4:05:06.789')::interval second(1) AS s1;
+-- rounding is half away from zero, truncation is toward zero
+SELECT (interval '0.005 sec')::interval second(2) AS pos,
+       (interval '-0.005 sec')::interval second(2) AS neg,
+       (interval '-1 day -2:30:00')::interval hour AS neg_trunc;
+-- assignment into a column applies the same modifier
+INSERT INTO interval_typmod_tbl(c, f, i)
+  VALUES (interval '14 months 3 days', interval '1 day 2:30:45.6789', interval '1 day 2:30:45.6789');
+SELECT c, f, i FROM interval_typmod_tbl;
+DROP TABLE interval_typmod_tbl;
+
 -- errors: unparseable input is 22007, an unknown unit is 22023; recovery works
 SELECT interval 'garbage';
 SELECT date_part('bogus', interval '1 day');

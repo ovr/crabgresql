@@ -19,7 +19,8 @@ pub use expr::{
     ParamCtx, ParamState, Scope, Subplan, UnaryOp, WindowKind, WindowSortKey, bind_column_default,
     bind_expr, bind_scalar, bind_sql_function_body, bool_test_clause, builtin_type_from_syntax,
     checked_length_typmod, checked_numeric_typmod, coerce_to_column, datetime_precision,
-    deparse_literal_default, inline_params, length_typmod, map_data_type, param_ctx_capped,
+    declared_typmod, deparse_literal_default, inline_params, interval_typmod, length_typmod,
+    map_data_type, param_ctx_capped,
     param_ctx_extended, param_ctx_none, param_types, require_all_resolved, resolve_data_type,
 };
 pub use functions::{
@@ -58,17 +59,32 @@ pub struct OutputColumn {
     /// `collation` alone can't: an implicit collation can equal the type
     /// default and still round-trip as `None`.
     pub strength: Strength,
+    /// The type modifier this column carries, in the same *raw* encoding as
+    /// [`crabgresql_storage_api::Column::typmod`] (`-1` for none). Only a
+    /// reference to a modifier-bearing column, or an explicit coercion to one,
+    /// produces a non-`-1` value; everything computed loses it, exactly as
+    /// PostgreSQL's `exprTypmod` does. `CREATE VIEW` reads it so a view's
+    /// columns describe themselves as `character varying(20)` rather than as a
+    /// bare `character varying`.
+    pub typmod: i32,
 }
 
 impl OutputColumn {
-    /// A column on its type's default collation.
+    /// A column on its type's default collation, with no type modifier.
     pub fn new(name: impl Into<String>, ty: PgType) -> Self {
         OutputColumn {
             name: name.into(),
             ty,
             collation: None,
             strength: Strength::None,
+            typmod: -1,
         }
+    }
+
+    /// The same column carrying a type modifier.
+    pub fn with_typmod(mut self, typmod: i32) -> Self {
+        self.typmod = typmod;
+        self
     }
 }
 
