@@ -7,6 +7,7 @@
 //! the curated suites that gate `cargo test`.
 
 pub mod client;
+pub mod describe;
 pub mod format;
 pub mod psql_var;
 pub mod runner;

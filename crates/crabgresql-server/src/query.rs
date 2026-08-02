@@ -3089,7 +3089,13 @@ fn execute_create_table(
                         )));
                     }
                     crabgresql_binder::bind_column_default(expr, &column, type_catalog)?;
-                    column.default = Some(expr.to_string());
+                    // A literal is stored in its deparsed form, so `pg_get_expr`
+                    // (which echoes this text) prints what PostgreSQL's `\d`
+                    // does; anything else keeps its source text.
+                    column.default = Some(
+                        crabgresql_binder::deparse_literal_default(expr, &column, type_catalog)?
+                            .unwrap_or_else(|| expr.to_string()),
+                    );
                 }
                 ast::ColumnOption::PrimaryKey(pk) => {
                     reject_primary_key_options(pk)?;

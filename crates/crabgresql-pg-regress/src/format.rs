@@ -14,6 +14,34 @@ use crate::client::{ErrorFields, Field};
 const RIGHT_ALIGNED_OIDS: &[u32] = &[20, 21, 23, 26, 28, 29, 700, 701, 790, 1700, 5069];
 
 pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>], null_display: &str) -> String {
+    let mut out = aligned_table(None, fields, rows, null_display);
+    let n = rows.len();
+    out.push_str(&format!("({n} row{})\n\n", if n == 1 { "" } else { "s" }));
+    out
+}
+
+/// psql's `\d` output for one relation: the same aligned table, under a centered
+/// title and with a blank line where a query result would print `(N rows)`.
+/// Every column is text, so none is right-aligned.
+pub fn format_describe(title: &str, headers: &[&str], rows: &[Vec<Option<String>>]) -> String {
+    let fields: Vec<Field> = headers
+        .iter()
+        .map(|name| Field {
+            name: (*name).to_string(),
+            type_oid: 25,
+        })
+        .collect();
+    let mut out = aligned_table(Some(title), &fields, rows, "");
+    out.push('\n');
+    out
+}
+
+fn aligned_table(
+    title: Option<&str>,
+    fields: &[Field],
+    rows: &[Vec<Option<String>>],
+    null_display: &str,
+) -> String {
     // A cell containing newlines occupies one output line per line of content,
     // so a column is as wide as its widest *line* — not its widest value.
     let widths: Vec<usize> = fields
@@ -35,6 +63,18 @@ pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>], null_display
         .collect();
 
     let mut out = String::new();
+
+    // A title is centered over the whole table — every column plus the space on
+    // each side of it, plus one character per `|` separator — and, unlike the
+    // header, keeps no padding to its right.
+    if let Some(title) = title {
+        let width: usize =
+            widths.iter().map(|w| w + 2).sum::<usize>() + widths.len().saturating_sub(1);
+        let indent = width.saturating_sub(title.chars().count()) / 2;
+        out.push_str(&" ".repeat(indent));
+        out.push_str(title);
+        out.push('\n');
+    }
 
     // Header: names centered (extra space to the right), every cell padded —
     // hence the trailing whitespace psql expected files are known for.
@@ -108,8 +148,6 @@ pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>], null_display
         }
     }
 
-    let n = rows.len();
-    out.push_str(&format!("({n} row{})\n\n", if n == 1 { "" } else { "s" }));
     out
 }
 
@@ -258,6 +296,34 @@ mod tests {
 
     fn text(s: &str) -> Option<String> {
         Some(s.into())
+    }
+
+    /// psql's `\d` shape, byte for byte against PostgreSQL 18.4's output for
+    /// `CREATE TABLE bit_defaults (b1 bit(4) DEFAULT '1001', …)`: the title
+    /// centered over the 70-column table with no padding after it, and a blank
+    /// line where a query result prints `(N rows)`.
+    #[test]
+    fn describe_centers_its_title_and_ends_with_a_blank_line() {
+        let row = |name: &str, ty: &str, default: &str| {
+            vec![text(name), text(ty), text(""), text(""), text(default)]
+        };
+        let out = format_describe(
+            "Table \"public.bit_defaults\"",
+            &["Column", "Type", "Collation", "Nullable", "Default"],
+            &[
+                row("b1", "bit(4)", "'1001'::\"bit\""),
+                row("b3", "bit varying(5)", "'1001'::bit varying"),
+            ],
+        );
+        assert_eq!(
+            out,
+            "                     Table \"public.bit_defaults\"\n\
+             \x20Column |      Type      | Collation | Nullable |       Default       \n\
+             --------+----------------+-----------+----------+---------------------\n\
+             \x20b1     | bit(4)         |           |          | '1001'::\"bit\"\n\
+             \x20b3     | bit varying(5) |           |          | '1001'::bit varying\n\
+             \n"
+        );
     }
 
     fn error_fields(pairs: &[(u8, &str)]) -> ErrorFields {

@@ -12,6 +12,7 @@ use similar::TextDiff;
 use tokio::net::TcpListener;
 
 use crate::client::{Client, Field, QueryEvent};
+use crate::describe;
 use crate::format;
 use crate::psql_var::{self, Variables};
 use crate::script::{ScriptItem, is_copy_from_stdin, lex};
@@ -228,14 +229,35 @@ async fn run_test(
                 out.push_str(&line);
                 out.push('\n');
             }
+            // `\d <relation>` is the one metacommand that has to talk to the
+            // server, so it is dispatched here rather than in the sync
+            // `run_metacommand`. It declines far more often than it succeeds
+            // (see `describe`), and a declined one falls through to the stub.
             ScriptItem::Metacommand(command) => {
-                run_metacommand(
-                    &command,
-                    environment,
-                    &mut vars,
-                    &mut null_display,
-                    &mut out,
-                );
+                let described = match describe_pattern(&command) {
+                    Some(pattern) => {
+                        match describe::describe(&mut client, pattern, statement_timeout).await {
+                            Ok(described) => described,
+                            // Same handling as a statement that loses the
+                            // connection: mark it and abandon the file.
+                            Err(_) => {
+                                out.push_str("connection to server was lost\n");
+                                break;
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                match described {
+                    Some(text) => out.push_str(&text),
+                    None => run_metacommand(
+                        &command,
+                        environment,
+                        &mut vars,
+                        &mut null_display,
+                        &mut out,
+                    ),
+                }
             }
             ScriptItem::Statement(statement) => {
                 let statement = psql_var::substitute(&statement, &vars);
@@ -303,6 +325,17 @@ fn render_events(out: &mut String, events: &[QueryEvent], query: &str, null_disp
             QueryEvent::Notice(notice) => out.push_str(&format::format_notice(notice, query)),
         }
     }
+}
+
+/// The relation `\d <name>` describes, or `None` for any other metacommand —
+/// including `\d` with no argument (which lists relations), `\d+`, and a `\d`
+/// with several arguments or another command chained onto it.
+fn describe_pattern(command: &str) -> Option<&str> {
+    let (name, arguments) = split_command_name(command);
+    if name != "d" || arguments.is_empty() {
+        return None;
+    }
+    (!arguments.contains(char::is_whitespace) && !arguments.contains('\\')).then_some(arguments)
 }
 
 /// Run one backslash command, appending whatever psql would print. The four
@@ -409,6 +442,19 @@ mod tests {
         assert_null_marker(r#"pset null "(null)""#, r#""(null)""#);
         // Querying the setting is silent under `-q` and changes nothing.
         assert_null_marker("pset null", "");
+    }
+
+    /// `\d <name>` is dispatched to the server (see `describe`); every other
+    /// spelling — the bare listing, `\d+`, a pattern with a wildcard or a
+    /// chained command — is left to the stub.
+    #[test]
+    fn only_a_plain_relation_name_is_described() {
+        assert_eq!(describe_pattern("d bit_defaults"), Some("bit_defaults"));
+        assert_eq!(describe_pattern("d"), None);
+        assert_eq!(describe_pattern("d+ t"), None);
+        assert_eq!(describe_pattern("dt"), None);
+        assert_eq!(describe_pattern("d a b"), None);
+        assert_eq!(describe_pattern(r"d t \\ trailing"), None);
     }
 
     #[test]

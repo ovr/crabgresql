@@ -185,3 +185,39 @@ DROP TABLE dfmt_p;
 DROP VIEW dfmt_v;
 DROP TABLE dfmt_d;
 DROP TABLE dfmt_t;
+-- `bit` is the one type besides `bpchar` whose spelling depends on *whether* a
+-- modifier was given: with one it prints `bit(4)`, with the -1 that means "none"
+-- it is quoted, and that quoted form is what a deparsed constant's label uses.
+SELECT pg_catalog.format_type(1560, -1) AS "bit -1",
+       pg_catalog.format_type(1560, NULL) AS "bit none",
+       pg_catalog.format_type(1562, -1) AS "varbit -1";
+-- A literal column default is stored already deparsed, so `\d` prints what
+-- PostgreSQL prints. The type label is the *literal's* own type with no
+-- modifier, so an untyped '1001' takes the column's type while B'0101' stays
+-- `bit` even in a `bit varying` column; int4 and a fractional numeric print
+-- bare, a negative one does not; and the value is re-rendered by the type's
+-- output function ('007' -> 7, and 'x' stays unpadded in a char(4)).
+-- (`n1` is an unmodified numeric because crabgresql does not yet store a
+-- numeric(p,s) modifier on the column, so `\d` would print the bare name.)
+-- Non-literal defaults are not rewritten and print as written, which is a known
+-- divergence (PostgreSQL deparses the node), so none appears here.
+CREATE TABLE dfmt_def (
+  b1 bit(4) DEFAULT '1001',
+  b2 bit(4) DEFAULT B'0101',
+  b3 bit varying(5) DEFAULT '1001',
+  b4 bit varying(5) DEFAULT B'0101',
+  i1 integer DEFAULT 42,
+  i2 integer DEFAULT -1,
+  i3 bigint DEFAULT 42,
+  n1 numeric DEFAULT 1.5,
+  n2 numeric DEFAULT -1.5,
+  t1 text DEFAULT 'it''s',
+  c1 char(4) DEFAULT 'x',
+  bo boolean DEFAULT true,
+  d1 date DEFAULT '2020-01-02',
+  i4 integer DEFAULT '007',
+  nn text NOT NULL,
+  co text COLLATE "de-x-icu"
+);
+\d dfmt_def
+DROP TABLE dfmt_def;

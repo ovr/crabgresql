@@ -8122,6 +8122,117 @@ pub fn bind_column_default(
     Ok(bound)
 }
 
+/// The text PostgreSQL's `pg_get_expr(adbin, adrelid, true)` prints for a column
+/// default that is a bare *literal*, or `None` when this expression is not one —
+/// in which case the caller keeps the statement's own source text.
+///
+/// PostgreSQL stores the default as a node tree coerced to the column's type and
+/// deparses it on demand, so `b bit(4) DEFAULT '1001'` comes back as
+/// `'1001'::"bit"`, not as written. crabgresql stores SQL text (see
+/// [`Column::default`]), so the canonical form has to be produced here, once, at
+/// DDL time. The rules below were probed against PostgreSQL 18.4:
+///
+/// * The type label is the **literal's own** type, never the column's: psql
+///   passes `pretty`, which hides the implicit coercion to the column type. So
+///   `'1001'` — an untyped constant, typed from context — labels itself with the
+///   column's type (`"bit"` in a `bit(4)` column, `bit varying` in a `bit
+///   varying(5)` one), while `B'0101'` is already `bit` and stays `'0101'::"bit"`
+///   in *both*. Same reason `i bigint DEFAULT 42` prints a bare `42` (the
+///   literal is `int4`) and `n numeric DEFAULT -1` prints `'-1'::integer`.
+/// * The label never carries a modifier, so it is `format_type(oid, -1)` — which
+///   is where `bit`'s quoted spelling comes from ([`PgType::format_type`]).
+/// * The value is the literal put through the type's input function *without*
+///   the modifier: `'007'` on an `integer` prints `7`, and `'x'` on a `char(4)`
+///   prints `'x'::bpchar` — unpadded, because the padding is the modifier's work.
+/// * `int4` prints bare unless negative (`'-1'::integer`, so a re-parse sees a
+///   constant and not a unary minus); `numeric` prints bare only when
+///   non-negative and unambiguously fractional (`1.5`, but `'1000'::numeric`,
+///   which would otherwise re-parse as `int4`); `boolean` prints the `true`/
+///   `false` keywords; everything else is quoted and labelled.
+///
+/// Deliberately left alone, each keeping the source text it has always stored:
+///
+/// * **Non-literals.** `DEFAULT (1 + 2)` must not be folded to `3`, and PG's
+///   deparse of an operator expression (`'a'::text || 'b'::text`) is a whole
+///   node-tree printer this does not attempt. An explicit cast is excluded too:
+///   PG keeps the modifier there (`'1001'::bit(4)`), which is the opposite of the
+///   rule above.
+/// * **`DEFAULT NULL`.** PG discards it outright for a type needing no coercion
+///   (`atthasdef` stays false) but keeps it as `NULL::"bit"` for one that does;
+///   crabgresql records a default either way, so rewriting the text would only
+///   dress up a divergence that lives in `atthasdef`.
+/// * **`timestamptz`/`timetz` literals**, whose text depends on the session zone
+///   at *display* time. PG re-renders from the stored node; a value baked here
+///   would freeze the DDL session's zone into the catalog.
+pub fn deparse_literal_default(
+    expr: &ast::Expr,
+    column: &Column,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Option<String>, BindError> {
+    // PG's grammar folds a sign into a numeric literal, so `-1` is a constant
+    // (see `bind_unary`); `+1` is not, and stays an operator expression.
+    let literal = match expr {
+        ast::Expr::Value(v) => !matches!(v.value, ast::Value::Null | ast::Value::Placeholder(_)),
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => {
+            matches!(expr.as_ref(), ast::Expr::Value(v) if matches!(v.value, ast::Value::Number(..)))
+        }
+        _ => false,
+    };
+    if !literal {
+        return Ok(None);
+    }
+    let params = param_ctx_none();
+    let scope = Scope::empty(catalog, &params);
+    let bound = match bind_expr(expr, &scope)? {
+        // An untyped constant takes the column's type, as PG's unknown-Const
+        // resolution does.
+        Binding::Unknown { lit, span, param } => {
+            if matches!(column.ty, PgType::TimestampTz | PgType::TimeTz) {
+                return Ok(None);
+            }
+            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, column.ty)?
+        }
+        Binding::Typed(e) => e,
+    };
+    let BoundExpr::Const { value, ty } = bound else {
+        // A literal that does not fold to a constant — a `reg*` name, say, whose
+        // resolution needs the running catalog.
+        return Ok(None);
+    };
+    Ok(deparse_const(&value, ty))
+}
+
+/// Render one constant the way PG's deparse does — see
+/// [`deparse_literal_default`] for where each rule comes from. `None` for a NULL
+/// value, which no caller produces.
+fn deparse_const(value: &Value, ty: PgType) -> Option<String> {
+    // `true`/`false` are SQL keywords, not the `t`/`f` of the wire encoding,
+    // which would not even re-parse as a boolean default.
+    if let Value::Bool(b) = value {
+        return Some(if *b { "true" } else { "false" }.to_string());
+    }
+    let text = value.encode_text_utc()?;
+    let bare = match ty {
+        PgType::Int4 => !text.starts_with('-'),
+        PgType::Numeric => {
+            !text.starts_with('-')
+                && text.contains('.')
+                && text.chars().all(|c| c.is_ascii_digit() || c == '.')
+        }
+        _ => false,
+    };
+    if bare {
+        return Some(text);
+    }
+    let label = ty
+        .format_type(Some(-1))
+        .unwrap_or_else(|| ty.name().to_string());
+    Some(format!("'{}'::{label}", text.replace('\'', "''")))
+}
+
 /// Bind the body of a `CREATE FUNCTION ... LANGUAGE SQL` to a typed expression,
 /// with `$1..$n` seeded to the declared argument types and the result coerced to
 /// the declared return type. An argument declared with a name is also reachable

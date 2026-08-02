@@ -568,12 +568,13 @@ fn eval_deparse_fn(
     match func {
         ScalarFn::FormatType => Some(Ok(eval_format_type(args, ctx))),
         // `pg_get_expr` echoes the SQL text crabgresql stores in place of a
-        // `pg_node_tree`: a partition's `relpartbound` is deparsed when the row
-        // is built (see `crabgresql_catalog`'s `deparse_partbound`). A column
-        // default's `adbin` is the statement's own expression text rather than a
-        // canonical deparse, so it prints as written — `nextval('s')` where
-        // PostgreSQL prints `nextval('s'::regclass)`, and `'x'` where PostgreSQL
-        // prints `'x'::text`. A NULL node yields NULL, as in PG.
+        // `pg_node_tree`, deparsed when the row is written rather than when it
+        // is read: a partition's `relpartbound` by `crabgresql_catalog`'s
+        // `deparse_partbound`, a literal column default by the binder's
+        // `deparse_literal_default`. A default that is *not* a literal keeps the
+        // statement's own text and so prints as written — `nextval('s')` where
+        // PostgreSQL prints `nextval('s'::regclass)`, and `(1 + 2)` where
+        // PostgreSQL prints `1 + 2`. A NULL node yields NULL, as in PG.
         ScalarFn::PgGetExpr => Some(Ok(args[0].clone())),
         ScalarFn::PgGetViewdef => Some(eval_pg_get_viewdef(args, ctx)),
         _ => None,
@@ -652,25 +653,10 @@ fn eval_format_type(args: &[Value], ctx: &ExecContext) -> Value {
 }
 
 /// The body of `format_type`: PostgreSQL's SQL spelling of type `oid` with
-/// `typmod` applied. `typmod` is `None` when no modifier was given at all and
-/// `Some(m)` for one that was — including `Some(-1)`, the "no modifier" value
-/// `pg_attribute` stores, which PostgreSQL still distinguishes from `None`.
-///
-/// Each type prints its modifier only above its own threshold, matching the
-/// `typmodout` functions (probed against PostgreSQL 18.4): the character types
-/// need more than the four-byte varlena header they reserve, `numeric` needs at
-/// least that header, and the rest need only a non-negative value. Below the
-/// threshold PostgreSQL prints the bare type name rather than a nonsensical
-/// `character varying(-2)`.
-///
-/// Two deliberate gaps, neither reachable from a crabgresql catalog row (both
-/// need a modifier this build never stores): `interval`'s modifier packs range
-/// bits and is printed bare rather than decoded, and PostgreSQL's generic
-/// fallback for a type with no `typmodout` (`format_type(25, 5)` → `text(5)`)
-/// is not reproduced.
+/// `typmod` applied. Resolves the oid, then defers the per-type spelling to
+/// [`PgType::format_type`] (which the binder shares, so a deparsed constant's
+/// type label and `\d`'s Type column cannot drift apart).
 fn format_type_text(oid: u32, typmod: Option<i32>, catalog: Option<&dyn CatalogOps>) -> String {
-    // VARHDRSZ: character types encode `length + 4` (see `atttypmod_of`).
-    const VARHDRSZ: i32 = 4;
     if oid == 0 {
         return "-".to_string();
     }
@@ -682,40 +668,14 @@ fn format_type_text(oid: u32, typmod: Option<i32>, catalog: Option<&dyn CatalogO
             .and_then(|ops| ops.user_type_name(oid))
             .map_or_else(|| "???".to_string(), |(_, name)| quote_ident(&name));
     };
-    // An array formats its element type (carrying the modifier) with `[]`.
+    // An array formats its element type (carrying the modifier) with `[]`; a
+    // user-defined type needs the catalog. Both are the cases `format_type`
+    // declines, and both recurse through the oid path above.
     if let PgType::Array(elem) = ty {
         return format!("{}[]", format_type_text(elem, typmod, catalog));
     }
-    let name = ty.name();
-    let Some(m) = typmod else {
-        return name.to_string();
-    };
-    match ty {
-        PgType::Numeric if m >= VARHDRSZ => {
-            let m = m - VARHDRSZ;
-            // The scale is an 11-bit *signed* field, so `numeric(4,-2)` round
-            // trips; the precision is masked to the 16 bits above it.
-            let precision = (m >> 16) & 0xffff;
-            let scale = (((m & 0x7ff) ^ 1024) - 1024) as i16;
-            format!("numeric({precision},{scale})")
-        }
-        PgType::Varchar if m > VARHDRSZ => format!("character varying({})", m - VARHDRSZ),
-        PgType::Bpchar if m > VARHDRSZ => format!("character({})", m - VARHDRSZ),
-        // `bpchar` is the one type that reports which spelling it was asked
-        // about: given a modifier it cannot print, it is `bpchar`; given none at
-        // all it is `character`. An unmodified `bpchar` column stores -1, so
-        // this is the arm `\d` takes for one.
-        PgType::Bpchar => "bpchar".to_string(),
-        PgType::Bit if m >= 0 => format!("bit({m})"),
-        PgType::Varbit if m >= 0 => format!("bit varying({m})"),
-        // The precision goes *before* the "with[out] time zone" suffix.
-        PgType::Time if m >= 0 => format!("time({m}) without time zone"),
-        PgType::TimeTz if m >= 0 => format!("time({m}) with time zone"),
-        PgType::Timestamp if m >= 0 => format!("timestamp({m}) without time zone"),
-        PgType::TimestampTz if m >= 0 => format!("timestamp({m}) with time zone"),
-        // Below its type's threshold a modifier prints nothing at all.
-        _ => name.to_string(),
-    }
+    ty.format_type(typmod)
+        .unwrap_or_else(|| ty.name().to_string())
 }
 
 /// Split a `nextval`/`currval`/`setval` text argument into `(namespace, name)`:
