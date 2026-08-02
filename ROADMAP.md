@@ -61,10 +61,16 @@ The target design should land in compatibility-preserving slices:
    backpressure: there is one buffer per relation, and memory is bounded by the
    flush policy rather than by blocking writers.
 3. Switch foreground file creation to sorted background flush with the 64 MiB
-   target and V2 per-row engine metadata. The flush is background already, but
-   output is unsorted and still capped at 65,535 rows per fragment by the `Tid`
-   offset — the 64 MiB target is unreachable until the V2 footer lands, so the
-   two are one change.
+   target and V2 per-row engine metadata. The flush is background already, and
+   each write is now sorted on the relation's `ORDER BY` key: a write is sorted
+   whole before it is cut into fragments, so the fragments *of that write* have
+   disjoint key ranges, and each says so in its row-group `sorting_columns`.
+   Two things remain. **Size**: a fragment is still capped at 65,535 rows by the
+   `Tid` offset, so the 64 MiB target is unreachable until the V2 footer lands.
+   **Clustering across writes**: every write is its own sorted run and the runs
+   overlap freely, so a relation loaded by many flushes is still unclustered as
+   a whole — pruning can exclude fragments only within a run until step 4's
+   compaction merges the runs.
 4. Add manifest-pinned scans, pruning/pushdown, retired-file GC, and leveled
    compaction.
 5. Add internal partition split/merge and online repartitioning.

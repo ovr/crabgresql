@@ -36,7 +36,8 @@ use arrow_array::{
     TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
-use crabgresql_storage_api::arrow::{build_batch, decode_row};
+use crabgresql_storage_api::arrow::{arrow_schema, build_batch, decode_row};
+use crabgresql_storage_api::sort::{sort_permutation, sortable_layout, take_batch};
 use crabgresql_storage_api::{
     BatchStream, ColumnProjection, DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats,
     RelfilenodeAllocator, StorageError, TableAm, TableCapabilities, TableSchema, Tid, Tuple,
@@ -48,11 +49,11 @@ use crabgresql_txn::{
 };
 use crabgresql_types::PgType;
 use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, Wal, WalError};
-use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::arrow::{ArrowSchemaConverter, ProjectionMask};
 use parquet::basic::Compression;
-use parquet::file::metadata::KeyValue;
+use parquet::file::metadata::{KeyValue, SortingColumn};
 use parquet::file::properties::WriterProperties;
 
 pub const RMGR_PARQUET: RmgrId = RmgrId(12);
@@ -90,6 +91,56 @@ fn schema_identity(schema: &TableSchema) -> String {
         .map(|column| format!("{}:{}:{}", column.name, column.ty.oid(), column.typmod))
         .collect::<Vec<_>>()
         .join("|")
+}
+
+/// The layout sort key as Parquet row-group metadata — the *only* record a
+/// fragment keeps of how its rows are ordered.
+///
+/// Written only when the sort actually ran, so its presence means "this file is
+/// clustered" rather than "this table declares a key". Nothing in this engine
+/// reads it back yet; it is the standard field an outside reader and the
+/// eventual pruning/compaction pass will look at, which is why the claim is
+/// made in Parquet's own vocabulary rather than in a private footer key.
+///
+/// `SortingColumn::column_idx` is a **leaf** index, not the ordinal of a
+/// top-level field. [`crabgresql_storage_api::arrow::arrow_type`] maps `timetz`
+/// and `interval` to `Struct`s, so either of those ahead of a key column shifts
+/// the leaf numbering away from the column position an `IndexKey` carries —
+/// which would publish confidently wrong metadata. Ask the converted schema
+/// instead, and take a key's first leaf.
+///
+/// **Float keys order by PostgreSQL's rules, which are Parquet's and not
+/// Arrow's.** The sort canonicalizes `-0.0` to `0.0` and every NaN payload to
+/// one NaN before comparing, so a fragment can hold `+0.0` before `-0.0`, or
+/// two NaN bit patterns in input order. That is non-decreasing under the IEEE
+/// comparison Parquet defines for `FLOAT`/`DOUBLE` (which calls the zeros equal
+/// and leaves NaN undefined), so the declaration is honest — but a reader that
+/// merges or binary-searches under Arrow's *total* order must canonicalize the
+/// same way before trusting it.
+fn sorting_columns(schema: &TableSchema) -> Result<Vec<SortingColumn>, StorageError> {
+    let descriptor = ArrowSchemaConverter::new()
+        .convert(&arrow_schema(schema))
+        .map_err(|error| io_error("describe Parquet sort key", error))?;
+    schema
+        .sort_key
+        .iter()
+        .map(|key| {
+            (0..descriptor.num_columns())
+                .find(|leaf| descriptor.get_column_root_idx(*leaf) == key.column)
+                .map(|leaf| SortingColumn {
+                    column_idx: leaf as i32,
+                    descending: key.descending,
+                    nulls_first: key.nulls_first,
+                })
+                .ok_or_else(|| {
+                    corrupt(format!(
+                        "sort key names column {} of a {}-column relation",
+                        key.column,
+                        schema.columns.len()
+                    ))
+                })
+        })
+        .collect()
 }
 
 /// Whether a fragment can represent this type. The whitelist is the shared
@@ -1202,12 +1253,17 @@ impl ParquetTable {
     /// `rel` must be the relfilenode that names `dir` (invariant P1) — it is
     /// stamped into the footer and re-checked on every later read, so a
     /// post-TRUNCATE insert has to carry the *staged* directory's id.
+    ///
+    /// `sorting` is `Some` exactly when `batch`'s rows are in the relation's
+    /// layout sort key order, and is what puts that on the record — both in
+    /// Parquet's own row-group metadata — see [`sorting_columns`].
     fn write_fragment(
         &self,
         rel: u32,
         dir: &Path,
         block: u32,
-        tuples: &[Tuple],
+        batch: &RecordBatch,
+        sorting: Option<&[SortingColumn]>,
         txn: &TxnContext,
     ) -> Result<(PathBuf, PathBuf), StorageError> {
         let base = format!("{block:08x}-{}-{}", txn.xid.0, txn.cid.0);
@@ -1232,10 +1288,15 @@ impl ParquetTable {
             .set_compression(Compression::SNAPPY)
             .set_max_row_group_row_count(Some(MAX_FRAGMENT_ROWS))
             .set_key_value_metadata(Some(metadata))
+            .set_sorting_columns(sorting.map(<[SortingColumn]>::to_vec))
             .build();
-        // Built in PG semantics, then shifted once into the epoch the file
-        // format is defined in — see [`rebase_epoch`].
-        let batch = to_file_epoch(&build_batch(&self.schema, tuples)?)?;
+        // Arrives in PG semantics, and is shifted here — once, per fragment —
+        // into the epoch the file format is defined in (see [`rebase_epoch`]).
+        // The caller may already have sorted it: `rebase_epoch` adds a constant
+        // to every non-sentinel and leaves the ±infinity sentinels at the
+        // extremes of Arrow's order, so the shift preserves the order and the
+        // sort can happen on either side of it.
+        let batch = to_file_epoch(batch)?;
         let mut writer = ArrowWriter::try_new(writer_file, batch.schema(), Some(properties))
             .map_err(|error| io_error("create Parquet writer", error))?;
         writer
@@ -1479,13 +1540,50 @@ impl TableAm for ParquetTable {
         // fsync all have to describe the same directory (invariant P1).
         let rel = self.effective_rel(txn.xid);
         let dir = self.dir_of(rel);
+        let rows = tuples.len();
+        let batch = build_batch(&self.schema, &tuples)?;
+        // Load-bearing, not tidiness: a `Tuple` is a `Vec<Value>` per row, which
+        // outweighs the Arrow image on every schema this engine stores, so
+        // releasing it here keeps the sorted path's peak at or under the
+        // unsorted one's — the same argument the executor's `SortBatch` makes.
+        drop(tuples);
+        // Sorting is best-effort by design. A key naming a column Arrow cannot
+        // order the way PostgreSQL does (`numeric` is stored as text, `timetz`
+        // and `interval` as structs) leaves the rows in insertion order instead
+        // of failing: DDL rejects such a key going forward, but a relation
+        // created before that check still has to accept writes, and a flush
+        // that failed forever would grow the buffer without bound and surface
+        // as backpressure on unrelated inserts. Nothing is lost silently — the
+        // row-group sort metadata is written only when the sort actually ran.
+        //
+        // The permutation and the metadata are decided together, in one `if`:
+        // a fragment claiming an order it was not written in is the failure
+        // this whole change exists to avoid, and two conditions could drift.
+        // Note also that the *whole* insert is permuted, not each fragment —
+        // only that makes one write's fragments cover disjoint key ranges.
+        let (order, sorting) = if !self.schema.sort_key.is_empty() && sortable_layout(&self.schema)
+        {
+            (
+                Some(sort_permutation(&batch, &self.schema.sort_key)?),
+                Some(sorting_columns(&self.schema)?),
+            )
+        } else {
+            (None, None)
+        };
         let mut next = self
             .next_block
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
         let mut staged = Vec::new();
-        let mut tids = Vec::with_capacity(tuples.len());
-        for chunk in tuples.chunks(MAX_FRAGMENT_ROWS) {
+        let mut tids = vec![
+            Tid {
+                block: 0,
+                offset: 0
+            };
+            rows
+        ];
+        for start in (0..rows).step_by(MAX_FRAGMENT_ROWS) {
+            let len = MAX_FRAGMENT_ROWS.min(rows - start);
             let block = *next;
             // A fragment block is a physical address, so it must stay below the
             // logical-tid flag (see `TID_LOGICAL_FLAG`) — past it, a fragment tid
@@ -1494,7 +1592,25 @@ impl TableAm for ParquetTable {
                 .checked_add(1)
                 .filter(|next| *next <= MAX_PHYSICAL_BLOCK)
                 .ok_or_else(|| io_error("allocate Parquet fragment", "fragment id exhausted"))?;
-            let (temp, pending) = match self.write_fragment(rel, &dir, block, chunk, txn) {
+            // Gathered one fragment at a time rather than taking the whole
+            // permutation up front: the sorted copy then never exceeds a
+            // fragment, where a whole-batch `take` would hold a second full
+            // image of the insert across every compression and fsync below.
+            // Same elements, same order — `order` holds global input positions,
+            // and `take` is elementwise. The unsorted path slices instead,
+            // which is free: an offset and a length over the same buffers.
+            //
+            // Chained rather than `?`-ed so a failed gather unwinds through the
+            // same cleanup as a failed write: either way this transaction's
+            // half-written fragments must not survive the error.
+            let written = match &order {
+                Some(indices) => take_batch(&batch, &indices.slice(start, len)),
+                None => Ok(batch.slice(start, len)),
+            }
+            .and_then(|fragment| {
+                self.write_fragment(rel, &dir, block, &fragment, sorting.as_deref(), txn)
+            });
+            let (temp, pending) = match written {
                 Ok(paths) => paths,
                 Err(error) => {
                     let base = format!("{block:08x}-{}-{}", txn.xid.0, txn.cid.0);
@@ -1507,10 +1623,20 @@ impl TableAm for ParquetTable {
                 }
             };
             staged.push((temp, pending));
-            tids.extend((1..=chunk.len()).map(|offset| Tid {
-                block,
-                offset: offset as u16,
-            }));
+            // A tid is a physical address, so it is assigned in the order rows
+            // were written — but the caller indexes the result by *input*
+            // position, so the permutation has to be undone here. `order` is a
+            // bijection, so every slot is filled exactly once.
+            for row in 0..len {
+                let input = match &order {
+                    Some(indices) => indices.value(start + row) as usize,
+                    None => start + row,
+                };
+                tids[input] = Tid {
+                    block,
+                    offset: (row + 1) as u16,
+                };
+            }
         }
         for (temp, pending) in &staged {
             if let Err(error) = std::fs::rename(temp, pending) {
@@ -1733,8 +1859,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use crabgresql_storage_api::arrow::decode_row;
     use crabgresql_storage_api::{
-        Column, ColumnProjection, StorageError, TableAccessMethod, TableAm, TableSchema, Tid, Tuple,
+        Column, ColumnProjection, IndexKey, StorageError, TableAccessMethod, TableAm, TableSchema,
+        Tid, Tuple,
     };
     use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, TxnContext, Xid};
     use crabgresql_types::numeric::Numeric;
@@ -3258,6 +3386,360 @@ mod tests {
         for tid in full {
             assert_eq!(table.fetch(tid, &reader)?, Some(row.clone()));
         }
+        Ok(())
+    }
+
+    /// [`schema`] plus a layout sort key over `key`, ascending / NULLS LAST —
+    /// the only shape DDL can spell today.
+    fn sorted_schema(name: &str, types: &[PgType], key: &[usize]) -> TableSchema {
+        let mut schema = schema(name, types);
+        schema.sort_key = key
+            .iter()
+            .map(|column| IndexKey {
+                column: *column,
+                descending: false,
+                nulls_first: false,
+            })
+            .collect();
+        schema
+    }
+
+    /// Every row of `rel`'s fragments, in the order the files store them.
+    fn stored_rows(dir: &Path, rel: u32, schema: &TableSchema) -> anyhow::Result<Vec<Tuple>> {
+        let positions: Vec<usize> = (0..schema.columns.len()).collect();
+        let mut rows = Vec::new();
+        for file in parquet_files(dir, rel)? {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&file)?)?.build()?;
+            for batch in reader {
+                let batch = super::from_file_epoch(&batch?)?;
+                for row in 0..batch.num_rows() {
+                    rows.push(decode_row(schema, &positions, &batch, row)?);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The sort key a fragment declares, as `(leaf, descending, nulls_first)`,
+    /// or `None` when it claims no order at all.
+    fn declared_sort(path: &Path) -> anyhow::Result<Option<Vec<(i32, bool, bool)>>> {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+        Ok(reader
+            .metadata()
+            .row_group(0)
+            .sorting_columns()
+            .map(|columns| {
+                columns
+                    .iter()
+                    .map(|column| (column.column_idx, column.descending, column.nulls_first))
+                    .collect()
+            }))
+    }
+
+    /// Insert `rows` in one transaction and commit it.
+    fn insert_committed(
+        table: &ParquetTable,
+        tm: &TransactionManager,
+        rows: Vec<Tuple>,
+    ) -> anyhow::Result<Vec<Tid>> {
+        let xid = tm.allocate_xid();
+        let tids = table.insert_many(rows, &tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+        finish(table, xid, true)?;
+        Ok(tids)
+    }
+
+    #[test]
+    fn a_fragment_stores_its_rows_in_the_layout_sort_key_order() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let schema = sorted_schema("sorted", &[PgType::Int4, PgType::Text], &[0]);
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+
+        let rows: Vec<Tuple> = [5, 1, 4, 2, 3]
+            .into_iter()
+            .map(|n| vec![Value::Int4(n), Value::Text(format!("row{n}"))])
+            .collect();
+        insert_committed(&table, &tm, rows)?;
+
+        let stored = stored_rows(dir.path(), 1, &schema)?;
+        let keys: Vec<Value> = stored.into_iter().map(|row| row[0].clone()).collect();
+        assert_eq!(
+            keys,
+            (1..=5).map(Value::Int4).collect::<Vec<_>>(),
+            "the file must hold the rows in key order, not insertion order"
+        );
+
+        let file = parquet_files(dir.path(), 1)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
+        assert_eq!(declared_sort(&file)?, Some(vec![(0, false, false)]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_sorted_insert_returns_tids_that_still_name_their_own_rows() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let schema = sorted_schema("sorted", &[PgType::Int4, PgType::Text], &[0]);
+        let table = open_table(dir.path(), 1, schema, Arc::clone(&wal))?;
+
+        // The caller indexes the returned tids by *input* position, so a
+        // permutation applied in the wrong direction shows up here and nowhere
+        // else: the rows would all be present and all be reachable, just under
+        // each other's addresses.
+        let rows: Vec<Tuple> = [7, 3, 9, 1, 5, 2]
+            .into_iter()
+            .map(|n| vec![Value::Int4(n), Value::Text(format!("row{n}"))])
+            .collect();
+        let tids = insert_committed(&table, &tm, rows.clone())?;
+
+        let reader = tm.context(Xid::INVALID, CommandId::FIRST);
+        for (tid, row) in tids.iter().zip(&rows) {
+            assert_eq!(table.fetch(*tid, &reader)?.as_ref(), Some(row));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_sorted_insert_spanning_fragments_does_not_interleave_them() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let schema = sorted_schema("wide", &[PgType::Int4], &[0]);
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+
+        // Descending input across the fragment boundary: sorting each chunk on
+        // its own would produce two sorted files whose ranges cover everything,
+        // which prunes exactly as badly as no sort at all.
+        let rows: Vec<Tuple> = (0..super::MAX_FRAGMENT_ROWS as i32 + 100)
+            .rev()
+            .map(|n| vec![Value::Int4(n)])
+            .collect();
+        let tids = insert_committed(&table, &tm, rows.clone())?;
+
+        let files = parquet_files(dir.path(), 1)?;
+        assert_eq!(files.len(), 2);
+        let mut previous_max: Option<i32> = None;
+        for file in &files {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(file)?)?.build()?;
+            let mut min = i32::MAX;
+            let mut max = i32::MIN;
+            for batch in reader {
+                let batch = batch?;
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .ok_or_else(|| anyhow::anyhow!("column 0 is not an Int32"))?;
+                min = min.min(values.iter().flatten().min().unwrap_or(i32::MAX));
+                max = max.max(values.iter().flatten().max().unwrap_or(i32::MIN));
+            }
+            if let Some(previous) = previous_max {
+                assert!(previous <= min, "fragment key ranges overlap");
+            }
+            previous_max = Some(max);
+        }
+
+        // The tid permutation has to survive the fragment split too.
+        let reader = tm.context(Xid::INVALID, CommandId::FIRST);
+        for index in [0, 1, super::MAX_FRAGMENT_ROWS - 1, rows.len() - 1] {
+            assert_eq!(
+                table.fetch(tids[index], &reader)?.as_ref(),
+                Some(&rows[index])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_relation_with_no_sort_key_keeps_insertion_order() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let schema = schema("unsorted", &[PgType::Int4]);
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+
+        let rows: Vec<Tuple> = [5, 1, 4]
+            .into_iter()
+            .map(|n| vec![Value::Int4(n)])
+            .collect();
+        insert_committed(&table, &tm, rows.clone())?;
+
+        assert_eq!(stored_rows(dir.path(), 1, &schema)?, rows);
+        let file = parquet_files(dir.path(), 1)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
+        assert_eq!(declared_sort(&file)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unsortable_sort_key_writes_unsorted_rather_than_failing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        // `numeric` is stored as text, so Arrow's order over it is a string
+        // order. DDL rejects such a key today, but a relation created before
+        // that check still has to accept writes — unsorted, and saying so.
+        let schema = sorted_schema("legacy", &[PgType::Numeric], &[0]);
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+
+        let rows: Vec<Tuple> = ["10", "9", "100"]
+            .into_iter()
+            .map(|n| Ok(vec![Value::Numeric(Numeric::parse(n)?)]))
+            .collect::<anyhow::Result<_>>()?;
+        insert_committed(&table, &tm, rows.clone())?;
+
+        assert_eq!(stored_rows(dir.path(), 1, &schema)?, rows);
+        let file = parquet_files(dir.path(), 1)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
+        assert_eq!(
+            declared_sort(&file)?,
+            None,
+            "an unsorted fragment must not claim to be clustered"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_sorted_fragment_records_its_sorting_columns() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        // `timetz` maps to a two-field `Struct`, so it owns two *leaf*
+        // descriptors: the key at column 1 is leaf 2, not leaf 1. A schema of
+        // scalars alone would pass with the naive `column_idx = key.column`.
+        let schema = sorted_schema("leaves", &[PgType::TimeTz, PgType::Int4], &[1]);
+        let table = open_table(dir.path(), 1, schema, Arc::clone(&wal))?;
+
+        let rows: Vec<Tuple> = [2, 1]
+            .into_iter()
+            .map(|n| {
+                vec![
+                    Value::TimeTz(TimeTz {
+                        usec: 1,
+                        zone: 3_600,
+                    }),
+                    Value::Int4(n),
+                ]
+            })
+            .collect();
+        insert_committed(&table, &tm, rows)?;
+
+        let file = parquet_files(dir.path(), 1)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
+        assert_eq!(declared_sort(&file)?, Some(vec![(2, false, false)]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_descending_nulls_first_key_is_honored() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        // Built by hand: the clause parses bare expressions, so DDL cannot spell
+        // a direction yet, but the key is persisted with both flags and the
+        // write path has to honor whatever it finds.
+        let mut schema = schema("descending", &[PgType::Int4]);
+        schema.sort_key = vec![IndexKey {
+            column: 0,
+            descending: true,
+            nulls_first: true,
+        }];
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+
+        let rows: Vec<Tuple> = vec![
+            vec![Value::Int4(1)],
+            vec![Value::Null],
+            vec![Value::Int4(3)],
+        ];
+        insert_committed(&table, &tm, rows)?;
+
+        assert_eq!(
+            stored_rows(dir.path(), 1, &schema)?,
+            vec![
+                vec![Value::Null],
+                vec![Value::Int4(3)],
+                vec![Value::Int4(1)],
+            ]
+        );
+        let file = parquet_files(dir.path(), 1)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
+        assert_eq!(declared_sort(&file)?, Some(vec![(0, true, true)]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_sorted_fragment_orders_floats_as_postgresql_does() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let schema = sorted_schema("floats", &[PgType::Float8, PgType::Int4], &[0]);
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+
+        // `-0.0` ties with `0.0` and the two NaN bit patterns tie with each
+        // other, so the stability tiebreak decides both — that the *write* path
+        // reaches the shared canonicalization is what this pins down.
+        let other_nan = f64::from_bits(f64::NAN.to_bits() | 1);
+        let rows: Vec<Tuple> = [other_nan, 0.0, f64::NAN, -0.0, -1.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| vec![Value::Float8(value), Value::Int4(index as i32)])
+            .collect();
+        insert_committed(&table, &tm, rows)?;
+
+        let tags: Vec<Value> = stored_rows(dir.path(), 1, &schema)?
+            .into_iter()
+            .map(|row| row[1].clone())
+            .collect();
+        assert_eq!(
+            tags,
+            [4, 1, 3, 0, 2].map(Value::Int4).to_vec(),
+            "-1.0 < (0.0, -0.0 in input order) < (NaN, NaN in input order)"
+        );
+
+        // The fragment still declares itself sorted, and that declaration is
+        // honest under the IEEE comparison Parquet defines for DOUBLE: the two
+        // zeros compare equal and NaN's placement is left undefined. Only a
+        // reader using Arrow's *total* order would call `+0.0, -0.0` a descent,
+        // which is why `sorting_columns`' doc spells the caveat out.
+        let file = parquet_files(dir.path(), 1)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
+        assert_eq!(declared_sort(&file)?, Some(vec![(0, false, false)]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_char_key_sorts_by_its_unsigned_byte() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        // `"char"` is stored as `UInt8` for exactly this reason: a high-bit byte
+        // must sort *above* an ASCII one, as PostgreSQL's unsigned comparison
+        // says, and would sort below it under a signed encoding.
+        let schema = sorted_schema("chars", &[PgType::Char], &[0]);
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+
+        let rows: Vec<Tuple> = [0xFF, 0x41, 0x00, 0x80]
+            .into_iter()
+            .map(|byte| vec![Value::Char(byte)])
+            .collect();
+        insert_committed(&table, &tm, rows)?;
+
+        assert_eq!(
+            stored_rows(dir.path(), 1, &schema)?,
+            [0x00, 0x41, 0x80, 0xFF]
+                .into_iter()
+                .map(|byte| vec![Value::Char(byte)])
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 }

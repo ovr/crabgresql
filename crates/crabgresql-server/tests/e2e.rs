@@ -6043,6 +6043,62 @@ async fn an_engine_managed_table_must_declare_its_sort_key() -> anyhow::Result<(
         "only simple column references are supported in ORDER BY"
     );
 
+    // A key the storage layer cannot order is refused rather than recorded and
+    // ignored: `numeric` is stored as text in a fragment, so Arrow's order over
+    // it is a string order, and `timetz` is a struct no kernel orders at all.
+    let (code, message, hint) =
+        fails("CREATE TABLE n10 (n numeric) USING parquet ORDER BY (n)").await?;
+    assert_eq!(code, "42P17");
+    assert_eq!(
+        message,
+        "column \"n\" of type numeric cannot be used in a sort key"
+    );
+    assert_eq!(
+        hint.as_deref(),
+        Some("Name a column the storage layer can order.")
+    );
+    let (code, message, _) =
+        fails("CREATE TABLE n11 (t timetz, id int4) USING parquet ORDER BY (t)").await?;
+    assert_eq!(code, "42P17");
+    assert_eq!(
+        message,
+        "column \"t\" of type time with time zone cannot be used in a sort key"
+    );
+    // Inherited from the PRIMARY KEY, so the remedy is a different clause
+    // rather than a different column in the one they wrote.
+    let (code, message, hint) =
+        fails("CREATE TABLE n12 (n numeric PRIMARY KEY) USING parquet").await?;
+    assert_eq!(code, "42P17");
+    assert_eq!(
+        message,
+        "column \"n\" of type numeric cannot be used in a sort key"
+    );
+    assert_eq!(
+        hint.as_deref(),
+        Some(
+            "The PRIMARY KEY supplies the sort key. Add an explicit ORDER BY \
+             (columns) naming a column the storage layer can order."
+        )
+    );
+
+    // The rule is asked of the method, not of every engine-managed one. A
+    // standalone `USING buffer` relation stores nothing in key order to begin
+    // with, so refusing one of its key columns would guard a promise it never
+    // makes — and would break DDL that worked before the rule existed.
+    for sql in [
+        "CREATE TABLE k8 (n numeric) USING buffer ORDER BY (n)",
+        "CREATE TABLE k9 (n numeric PRIMARY KEY) USING buffer",
+        // `"char"` is stored as `UInt8` precisely so Arrow's order is its own
+        // unsigned one, so parquet can honor it and must not refuse it.
+        "CREATE TABLE k10 (c \"char\") USING parquet ORDER BY (c)",
+        "CREATE TABLE k11 (c \"char\" PRIMARY KEY) USING parquet",
+    ] {
+        client
+            .simple_query(sql)
+            .await
+            .with_context(|| sql.to_string())?;
+    }
+
     // A heap has no layout order to declare, so the clause is refused rather
     // than recorded and never honored.
     let (code, message, _) = fails("CREATE TABLE n7 (id int4) ORDER BY (id)").await?;
@@ -6571,6 +6627,32 @@ async fn vacuum_flushes_buffered_rows_without_changing_what_readers_see() -> any
         rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
         vec![Some("1"), Some("2"), Some("3"), Some("4")],
         "a chunk and the buffer must read as one relation"
+    );
+
+    // What the sort key buys, stated end to end: the flush wrote the rows in key
+    // order, so an unordered SELECT — which reads the fragment in storage order —
+    // comes back ascending. The last row is still buffered and reads after them,
+    // which is also storage order.
+    client
+        .simple_query("CREATE TABLE s (id int4) USING parquet ORDER BY (id)")
+        .await?;
+    client
+        .simple_query("INSERT INTO s VALUES (5), (1), (4), (2), (3)")
+        .await?;
+    client.simple_query("VACUUM s").await?;
+    client.simple_query("INSERT INTO s VALUES (0)").await?;
+    let messages = client.simple_query("SELECT id FROM s").await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![
+            Some("1"),
+            Some("2"),
+            Some("3"),
+            Some("4"),
+            Some("5"),
+            Some("0")
+        ],
+        "a flushed fragment must hold its rows in sort key order"
     );
 
     // Heap relations and the bare form are accepted; neither has anything to flush.

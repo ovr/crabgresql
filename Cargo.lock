@@ -617,7 +617,9 @@ name = "crabgresql-storage-api"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-ord",
  "arrow-schema",
+ "arrow-select",
  "crabgresql-txn",
  "crabgresql-types",
  "thiserror",

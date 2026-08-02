@@ -1386,6 +1386,30 @@ impl TableEngine for PgEngine {
                     schema.columns.len()
                 )));
             }
+            // The other half of the same argument: a key the columnar sort
+            // cannot order would be persisted and then ignored on every write,
+            // leaving a relation that claims an order it does not have. The SQL
+            // layer rejects this with a hint; this is the guard for every other
+            // caller. Only `create_table` — reloading the catalog accepts
+            // whatever is already on disk, and the write path falls back to
+            // insertion order for it.
+            //
+            // Asked of the method, not of `is_engine_managed`: a standalone
+            // `USING buffer` relation stores nothing in key order to begin
+            // with, so refusing one key there while accepting another would
+            // protect a promise that method never makes.
+            if schema.access_method.honors_sort_key()
+                && let Some(column) = crabgresql_storage_api::sort::unsortable_column(
+                    &schema.columns,
+                    &schema.sort_key,
+                )
+            {
+                return Err(StorageError::UnsupportedOperation(format!(
+                    "table access method \"{method}\" cannot order column \"{}\" of type {}",
+                    column.name,
+                    column.ty.name()
+                )));
+            }
             validate_schema(&schema)?;
         } else if !schema.sort_key.is_empty() {
             // Only an engine-managed method has a layout to order. A key on a

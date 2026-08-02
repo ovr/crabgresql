@@ -9,7 +9,9 @@ workspace = true
 
 [dependencies]
 arrow-array.workspace = true
+arrow-ord.workspace = true
 arrow-schema.workspace = true
+arrow-select.workspace = true
 crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
 thiserror.workspace = true

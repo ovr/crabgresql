@@ -102,28 +102,18 @@ pub fn comparable(ty: PgType, op: BinOp, collation: u32) -> bool {
 
 /// Whether Arrow's total order over a sort key is PostgreSQL's order.
 ///
-/// The float types are here although [`comparable`] excludes them: the executor
-/// canonicalizes `-0.0` to `0.0` and every NaN to one NaN before sorting, which
-/// makes the two orders coincide. The same rewrite would repair equality too,
-/// but a sort owns its key column and can rewrite it once, whereas a filter
-/// would have to rewrite both operands of every comparison it evaluates.
+/// The float types qualify although [`comparable`] excludes them: the sort
+/// canonicalizes `-0.0` to `0.0` and every NaN to one NaN before ordering,
+/// which makes the two orders coincide. The same rewrite would repair equality
+/// too, but a sort owns its key column and can rewrite it once, whereas a
+/// filter would have to rewrite both operands of every comparison it evaluates.
+///
+/// The set itself lives with the sort that relies on it
+/// ([`crabgresql_storage_api::sort::sortable`]), because the columnar engines'
+/// write path asks the same question of a stored column and the two answers
+/// must be one answer.
 pub fn sortable_key(key: &SortKey) -> bool {
-    match key.ty {
-        PgType::Bool
-        | PgType::Int2
-        | PgType::Int4
-        | PgType::Int8
-        | PgType::Float4
-        | PgType::Float8
-        | PgType::Date
-        | PgType::Time
-        | PgType::Timestamp
-        | PgType::TimestampTz
-        | PgType::Bytea
-        | PgType::Uuid => true,
-        PgType::Text | PgType::Varchar | PgType::Name => collation::is_byte_order(key.collation),
-        _ => false,
-    }
+    crabgresql_storage_api::sort::sortable(key.ty, key.collation)
 }
 
 /// Whether `predicate` can run as an Arrow filter over a batch `width` columns

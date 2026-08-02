@@ -17,6 +17,7 @@ use crabgresql_types::{PgType, Value};
 pub use crabgresql_txn as txn;
 
 pub mod arrow;
+pub mod sort;
 
 mod stats;
 pub use stats::{ColStats, RelStats};
@@ -388,6 +389,20 @@ impl TableAccessMethod {
     pub fn is_engine_managed(self) -> bool {
         matches!(self, TableAccessMethod::Parquet | TableAccessMethod::Buffer)
     }
+
+    /// Whether this method actually stores rows in [`TableSchema::sort_key`]
+    /// order.
+    ///
+    /// Narrower than [`is_engine_managed`](Self::is_engine_managed), and
+    /// deliberately so: a standalone `USING buffer` relation declares a key only
+    /// to answer the same DDL as its sibling, but it is a RAM row store with
+    /// nowhere to flush and orders nothing. Rules that exist to keep a declared
+    /// order truthful — refusing a key the columnar sort cannot honor, say —
+    /// have nothing to protect there, so they ask this rather than assuming
+    /// every engine-managed method sorts.
+    pub fn honors_sort_key(self) -> bool {
+        matches!(self, TableAccessMethod::Parquet)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -415,11 +430,22 @@ pub struct TableSchema {
     /// relation is always empty — `ORDER BY` on one is rejected at DDL time —
     /// and so is a relation created before the key was recorded.
     ///
-    /// Declaring it is not the same as honoring it: nothing sorts on this yet.
-    /// The sorted flush is `ROADMAP.md`'s Parquet step 3, which owns it together
-    /// with the V2 fragment footer. A standalone `USING buffer` relation never
-    /// will — it has nowhere to flush — and carries a key only so both
-    /// engine-managed methods answer the same DDL alike.
+    /// The Parquet engine honors it per write: each write is sorted whole
+    /// before it is cut into fragments, so the fragments *of one write* have
+    /// disjoint key ranges. The relation as a whole is **not** clustered — two
+    /// writes produce two sorted runs that overlap freely — so a reader may
+    /// prune within a write's fragments and nothing more until compaction lands
+    /// (`ROADMAP.md` step 4). Step 3 still owes the 64 MiB target chunk size,
+    /// which needs the V2 fragment footer. A method that does not
+    /// [`honor a key`](TableAccessMethod::honors_sort_key) — a standalone
+    /// `USING buffer` relation — carries one only so both engine-managed
+    /// methods answer the same DDL alike.
+    ///
+    /// Only a key [`sort::sortable_layout`] accepts is honored. DDL rejects the
+    /// rest, but a relation created before that check is stored in insertion
+    /// order rather than failing its writes forever — so such a relation keeps
+    /// working while its own `CREATE TABLE` no longer replays, which a
+    /// dump/restore of one has to reckon with.
     pub sort_key: Vec<IndexKey>,
 }
 
