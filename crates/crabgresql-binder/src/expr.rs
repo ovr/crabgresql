@@ -3666,6 +3666,59 @@ pub fn checked_length_typmod(dt: &ast::DataType) -> Result<Option<i32>, BindErro
     Ok(length_typmod(dt))
 }
 
+/// The fractional-second precision of a `time(p)`/`timestamp(p)` type name,
+/// clamped to what any datetime type can hold.
+///
+/// PostgreSQL warns and clamps rather than rejecting a larger modifier
+/// (`TIMESTAMP(7) precision reduced to maximum allowed, 6`), and since the
+/// clamped value is what it then stores, the only divergence here is the missing
+/// warning. A negative modifier never reaches this: the grammar rejects it.
+pub fn datetime_precision(dt: &ast::DataType) -> Option<i32> {
+    use ast::DataType;
+    let p = match dt {
+        DataType::Time(p, _) | DataType::Timestamp(p, _) => (*p)?,
+        _ => return None,
+    };
+    Some((p as i32).min(crabgresql_types::timestamp::MAX_PRECISION))
+}
+
+/// Round `expr` to a datetime type's fractional-second precision, folding a
+/// constant at bind time. Cast and assignment context round identically, so this
+/// serves both.
+fn apply_datetime_precision(expr: BoundExpr, precision: i32) -> Result<BoundExpr, BindError> {
+    let rounded = match &expr {
+        BoundExpr::Const { value, ty } => match value {
+            Value::Time(usec) => Some(Value::Time(time::apply_typmod(*usec, precision))),
+            Value::TimeTz(t) => Some(Value::TimeTz(crabgresql_types::TimeTz {
+                usec: time::apply_typmod(t.usec, precision),
+                zone: t.zone,
+            })),
+            Value::Timestamp(usec) => {
+                Some(Value::Timestamp(timestamp::apply_typmod(*usec, precision)))
+            }
+            Value::TimestampTz(usec) => Some(Value::TimestampTz(timestamp::apply_typmod(
+                *usec, precision,
+            ))),
+            // NULL, or a constant of some other type that a coercion above will
+            // still convert.
+            _ => None,
+        }
+        .map(|value| BoundExpr::Const { value, ty: *ty }),
+        _ => None,
+    };
+    Ok(rounded.unwrap_or_else(|| BoundExpr::FuncCall {
+        func: ScalarFn::TimeApplyTypmod,
+        ret: expr.ty(),
+        args: vec![
+            expr,
+            BoundExpr::Const {
+                value: Value::Int4(precision),
+                ty: PgType::Int4,
+            },
+        ],
+    }))
+}
+
 /// Apply a `varchar(n)`/`char(n)` length coercion, or a `name` truncation, when
 /// the target is one of those types. Constant inputs fold at bind time.
 pub(crate) fn apply_length_typmod_if_any(
@@ -3692,6 +3745,12 @@ pub(crate) fn apply_length_typmod_if_any(
         },
         // `name` always truncates to 63 characters, independent of any modifier.
         PgType::Name => (ScalarFn::NameInput, None),
+        PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+            match datetime_precision(data_type) {
+                Some(p) => return apply_datetime_precision(expr, p),
+                None => return Ok(expr),
+            }
+        }
         // `"char"` takes no modifier and PG rejects one rather than ignoring
         // it, so this target still has to run the check even though it never
         // yields a typmod — the DDL path reaches `checked_length_typmod`
@@ -8610,11 +8669,19 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
 /// Apply a column's `varchar(n)`/`char(n)`/`name` length coercion in assignment
 /// context (an over-long varchar/char errors unless the excess is blank).
 fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr, BindError> {
-    // `numeric` rounds rather than truncating, and shares its whole
-    // implementation with the cast path.
-    if column.ty == PgType::Numeric && column.typmod >= 0 {
-        let (precision, scale) = Numeric::unpack_typmod(column.typmod);
-        return apply_numeric_typmod(expr, precision, scale);
+    // `numeric` and the datetime types round rather than truncating, and share
+    // their whole implementation with the cast path.
+    if column.typmod >= 0 {
+        match column.ty {
+            PgType::Numeric => {
+                let (precision, scale) = Numeric::unpack_typmod(column.typmod);
+                return apply_numeric_typmod(expr, precision, scale);
+            }
+            PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+                return apply_datetime_precision(expr, column.typmod);
+            }
+            _ => {}
+        }
     }
     let func = match column.ty {
         PgType::Varchar if column.typmod >= 0 => ScalarFn::VarcharTypmod,

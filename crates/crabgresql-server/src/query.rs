@@ -3016,10 +3016,13 @@ fn execute_create_table(
         // Checked, not the bare readers: an out-of-range modifier would be
         // stored on the column and later overflow `pg_attribute.atttypmod`.
         // `numeric` packs two numbers into the one `Column::typmod` slot; every
-        // other modifier is a bare length or precision.
+        // other modifier is a bare length or fractional-second precision.
         let typmod = match ty {
             PgType::Numeric => crabgresql_binder::checked_numeric_typmod(&col.data_type)?
                 .map(|(p, s)| Numeric::pack_typmod(p, s)),
+            PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+                crabgresql_binder::datetime_precision(&col.data_type)
+            }
             _ => crabgresql_binder::checked_length_typmod(&col.data_type)?,
         }
         .unwrap_or(-1);

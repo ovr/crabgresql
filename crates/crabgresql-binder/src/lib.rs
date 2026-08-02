@@ -17,9 +17,9 @@ pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, ParamCtx,
     ParamState, Scope, Subplan, UnaryOp, WindowKind, WindowSortKey, bind_column_default, bind_expr,
     bind_scalar, bind_sql_function_body, bool_test_clause, builtin_type_from_syntax,
-    checked_length_typmod, checked_numeric_typmod, coerce_to_column, deparse_literal_default,
-    inline_params, length_typmod, map_data_type, param_ctx_capped, param_ctx_extended,
-    param_ctx_none, param_types, require_all_resolved, resolve_data_type,
+    checked_length_typmod, checked_numeric_typmod, coerce_to_column, datetime_precision,
+    deparse_literal_default, inline_params, length_typmod, map_data_type, param_ctx_capped,
+    param_ctx_extended, param_ctx_none, param_types, require_all_resolved, resolve_data_type,
 };
 pub use functions::{
     AggFn, GeoFn, JsonFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,

@@ -296,6 +296,11 @@ pub enum ScalarFn {
     /// `(numeric, int4 precision, int4 scale)`; the length coercion PG inserts
     /// for `x::numeric(p,s)`.
     NumApplyTypmod,
+    /// Apply a fractional-second precision modifier at run time. Args are
+    /// `(time|timetz|timestamp|timestamptz, int4 precision)`; one function
+    /// serves all four because they round the same way and differ only in which
+    /// `Value` carries the microseconds.
+    TimeApplyTypmod,
     /// `abs(float8) -> float8`.
     AbsF8,
     /// `log(float8) -> float8` (base 10).
