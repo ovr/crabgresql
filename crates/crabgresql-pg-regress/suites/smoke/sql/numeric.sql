@@ -126,5 +126,25 @@ SELECT 1 IN (2, NULL) AS null_no_match, 1 IN (1, NULL) AS match_with_null,
 -- non-integer text errors like a plain `1 = 'abc'`
 SELECT 1 IN ('abc');
 
+-- A `numeric(p,s)` *column* rounds and range-checks on the way in, exactly as a
+-- cast to the same type does: PostgreSQL applies the modifier in assignment
+-- context too, so there is no truncate-vs-error distinction here (unlike the
+-- character and bit types). A negative scale rounds to a power of ten, and a
+-- bare `numeric(p)` means scale 0.
+CREATE TABLE num_col (a numeric(5,2), b numeric(4,-2), c numeric(3));
+INSERT INTO num_col (a) VALUES (1.005), (1.004), (-1.005), (123.456);
+INSERT INTO num_col (b) VALUES (1234), (-1250);
+INSERT INTO num_col (c) VALUES (1.7);
+SELECT a, b, c FROM num_col ORDER BY a NULLS LAST, b NULLS LAST, c NULLS LAST;
+-- the integer part must still fit `precision - scale` digits after rounding
+INSERT INTO num_col (a) VALUES (1234.5);
+UPDATE num_col SET a = 9.999 WHERE a = 1.00;
+SELECT a FROM num_col WHERE a IS NOT NULL ORDER BY a;
+-- NaN passes any modifier; infinity cannot be stored in a constrained numeric
+INSERT INTO num_col (a) VALUES ('NaN');
+INSERT INTO num_col (a) VALUES ('Infinity');
+SELECT count(*) AS nan_stored FROM num_col WHERE a = 'NaN';
+DROP TABLE num_col;
+
 -- recovery after the errors above still works
 SELECT 'still alive' AS status;

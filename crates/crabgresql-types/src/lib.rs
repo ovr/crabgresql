@@ -825,11 +825,7 @@ impl PgType {
         };
         Some(match self {
             PgType::Numeric if m >= VARHDRSZ => {
-                let m = m - VARHDRSZ;
-                // The scale is an 11-bit *signed* field, so `numeric(4,-2)`
-                // round trips; the precision is masked to the 16 bits above it.
-                let precision = (m >> 16) & 0xffff;
-                let scale = (((m & 0x7ff) ^ 1024) - 1024) as i16;
+                let (precision, scale) = Numeric::unpack_typmod(m - VARHDRSZ);
                 format!("numeric({precision},{scale})")
             }
             PgType::Varchar if m > VARHDRSZ => format!("character varying({})", m - VARHDRSZ),

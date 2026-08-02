@@ -29,7 +29,7 @@ use crabgresql_storage_api::{
     TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
-use crabgresql_types::{FmtCtx, PgType, Value};
+use crabgresql_types::{FmtCtx, Numeric, PgType, Value};
 
 use crate::catalog::{SessionCatalog, SessionCatalogOps};
 use crate::error::PgError;
@@ -3013,9 +3013,16 @@ fn execute_create_table(
             None => resolve_column_type(type_catalog, &col.data_type)?,
         };
         reject_stored_reg_type(ty, &column_name)?;
-        // Checked, not bare `length_typmod`: an out-of-range length would be
+        // Checked, not the bare readers: an out-of-range modifier would be
         // stored on the column and later overflow `pg_attribute.atttypmod`.
-        let typmod = crabgresql_binder::checked_length_typmod(&col.data_type)?.unwrap_or(-1);
+        // `numeric` packs two numbers into the one `Column::typmod` slot; every
+        // other modifier is a bare length or precision.
+        let typmod = match ty {
+            PgType::Numeric => crabgresql_binder::checked_numeric_typmod(&col.data_type)?
+                .map(|(p, s)| Numeric::pack_typmod(p, s)),
+            _ => crabgresql_binder::checked_length_typmod(&col.data_type)?,
+        }
+        .unwrap_or(-1);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
         if let Some(base) = serial_base {
             // Name the sequence `t_col_seq`, dodging existing relations and any

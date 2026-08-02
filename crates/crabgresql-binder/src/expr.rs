@@ -3489,7 +3489,7 @@ pub(crate) fn numeric_typmod(dt: &ast::DataType) -> Option<(i32, i32)> {
 /// the same reason [`checked_length_typmod`] exists: `numeric(0)` and
 /// `numeric(1001)` are not merely odd, PostgreSQL rejects them outright while
 /// resolving the type name — before any value is looked at.
-pub(crate) fn checked_numeric_typmod(dt: &ast::DataType) -> Result<Option<(i32, i32)>, BindError> {
+pub fn checked_numeric_typmod(dt: &ast::DataType) -> Result<Option<(i32, i32)>, BindError> {
     let Some((precision, scale)) = numeric_typmod(dt) else {
         return Ok(None);
     };
@@ -3521,6 +3521,22 @@ fn apply_numeric_typmod_if_any(
     let Some((precision, scale)) = checked_numeric_typmod(data_type)? else {
         return Ok(expr);
     };
+    apply_numeric_typmod(expr, precision, scale)
+}
+
+/// Round `expr` to a `numeric(precision, scale)`, folding a constant at bind time
+/// and emitting a runtime coercion otherwise.
+///
+/// PostgreSQL applies the same rounding in cast and assignment context — both
+/// round to the scale and both raise `22003` when the integer part no longer
+/// fits — so unlike the character and bit types this needs no
+/// truncate-vs-error flag, and the cast path ([`apply_numeric_typmod_if_any`])
+/// and the column path ([`apply_length_to_column`]) share it.
+pub(crate) fn apply_numeric_typmod(
+    expr: BoundExpr,
+    precision: i32,
+    scale: i32,
+) -> Result<BoundExpr, BindError> {
     if let BoundExpr::Const {
         value: Value::Numeric(n),
         ..
@@ -8594,6 +8610,12 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
 /// Apply a column's `varchar(n)`/`char(n)`/`name` length coercion in assignment
 /// context (an over-long varchar/char errors unless the excess is blank).
 fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr, BindError> {
+    // `numeric` rounds rather than truncating, and shares its whole
+    // implementation with the cast path.
+    if column.ty == PgType::Numeric && column.typmod >= 0 {
+        let (precision, scale) = Numeric::unpack_typmod(column.typmod);
+        return apply_numeric_typmod(expr, precision, scale);
+    }
     let func = match column.ty {
         PgType::Varchar if column.typmod >= 0 => ScalarFn::VarcharTypmod,
         PgType::Bpchar if column.typmod >= 0 => ScalarFn::BpcharTypmod,

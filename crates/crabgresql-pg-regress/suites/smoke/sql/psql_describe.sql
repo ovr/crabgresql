@@ -197,8 +197,6 @@ SELECT pg_catalog.format_type(1560, -1) AS "bit -1",
 -- `bit` even in a `bit varying` column; int4 and a fractional numeric print
 -- bare, a negative one does not; and the value is re-rendered by the type's
 -- output function ('007' -> 7, and 'x' stays unpadded in a char(4)).
--- (`n1` is an unmodified numeric because crabgresql does not yet store a
--- numeric(p,s) modifier on the column, so `\d` would print the bare name.)
 -- Non-literal defaults are not rewritten and print as written, which is a known
 -- divergence (PostgreSQL deparses the node), so none appears here.
 CREATE TABLE dfmt_def (
@@ -209,7 +207,7 @@ CREATE TABLE dfmt_def (
   i1 integer DEFAULT 42,
   i2 integer DEFAULT -1,
   i3 bigint DEFAULT 42,
-  n1 numeric DEFAULT 1.5,
+  n1 numeric(5,2) DEFAULT 1.5,
   n2 numeric DEFAULT -1.5,
   t1 text DEFAULT 'it''s',
   c1 char(4) DEFAULT 'x',

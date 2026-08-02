@@ -711,6 +711,27 @@ impl Numeric {
 
     // ---- typmod -----------------------------------------------------------
 
+    /// Pack `(precision, scale)` into PostgreSQL's single-integer `numeric`
+    /// modifier, without the four-byte varlena header `pg_attribute.atttypmod`
+    /// adds on top (see the catalog's `atttypmod_of`).
+    ///
+    /// The scale occupies the low 11 bits as a *signed* field, so
+    /// `numeric(4,-2)` round trips; the precision sits in the 16 bits above it.
+    /// Verified against PostgreSQL 18.4: `numeric(5,2)`, `numeric(4,-2)` and
+    /// `numeric(3)` store `atttypmod` 327686, 264194 and 196612 — this value
+    /// plus 4 in each case.
+    pub fn pack_typmod(precision: i32, scale: i32) -> i32 {
+        (precision << 16) | (scale & 0x7ff)
+    }
+
+    /// Inverse of [`Numeric::pack_typmod`].
+    pub fn unpack_typmod(typmod: i32) -> (i32, i32) {
+        let precision = (typmod >> 16) & 0xffff;
+        // Sign-extend the 11-bit scale.
+        let scale = ((typmod & 0x7ff) ^ 1024) - 1024;
+        (precision, scale)
+    }
+
     /// Apply a `numeric(precision, scale)` type modifier: round to `scale`
     /// fractional digits and verify the integer part fits `precision - scale`
     /// digits, else `22003 numeric field overflow` (with PG's DETAIL). NaN is
